@@ -1421,51 +1421,6 @@ impl OperatorProgram {
         self.execute_at(inputs, bands, &vec![1.0; self.declarations.parameters])
     }
 
-    /// Training-time native labels below supplied boundary values. Reuse the
-    /// ordinary evaluator and original interfaces, but never evaluate a supplied
-    /// boundary's producer or unrelated nodes. Callers that require a closed
-    /// local function must separately rule out ambient inputs (including those
-    /// inside called rules). Attention retains the original family layout.
-    pub(crate) fn execute_clamped_outputs(
-        &self,
-        inputs: &FamilyInputs,
-        patches: &BTreeMap<usize, Array2<f64>>,
-        outputs: &[usize],
-    ) -> Result<Vec<Array2<f64>>, ProgramError> {
-        self.check_inputs(inputs)?;
-        let interfaces = self.interfaces()?;
-        let mut needed = vec![false; self.nodes.len()];
-        let mut pending = outputs.to_vec();
-        while let Some(index) = pending.pop() {
-            let node = self.nodes.get(index).ok_or(ProgramError::Reference {
-                what: "clamped output/dependency", index,
-            })?;
-            if needed[index] { continue; }
-            needed[index] = true;
-            if !patches.contains_key(&index) { pending.extend(node.arguments()); }
-        }
-        let ones = vec![1.0; self.declarations.parameters];
-        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
-        // Empty placeholders preserve original node indices without allocating
-        // activation buffers for nodes outside the dependency slice.
-        let mut top = Vec::with_capacity(self.nodes.len());
-        for (index, node) in self.nodes.iter().enumerate() {
-            let value = if !needed[index] {
-                Array2::zeros((0, 0))
-            } else if let Some(value) = patches.get(&index) {
-                if value.dim() != (inputs.rows, interfaces[index].width()) {
-                    return Err(ProgramError::Input(format!("clamped boundary {index} has wrong shape")));
-                }
-                value.clone()
-            } else {
-                let values = Layered { base: &[], top: &top, from: 0, patch: None };
-                self.evaluate_node(index, node, inputs, &values, None, &interfaces, &frame)?.0
-            };
-            top.push(value);
-        }
-        Ok(outputs.iter().map(|&index| top[index].clone()).collect())
-    }
-
     fn execute_range(&self, inputs: &FamilyInputs, trace: &mut Trace, from: usize, parameters: &[f64]) -> Result<(), ProgramError> {
         self.check_inputs(inputs)?;
         trace.values.truncate(from);
@@ -3010,15 +2965,6 @@ fn operator_bits(operator: &Operator) -> Result<(u64, u64), ProgramError> {
     }
 }
 
-fn basis_bits(basis: &Basis, domains: usize) -> Result<u64, ProgramError> {
-    let Basis::Indicator { domain } = basis;
-    if *domain >= domains {
-        return Err(ProgramError::Code("basis domain outside declarations".into()));
-    }
-    // Keep the legacy two-kind discriminator even though only Indicator executes.
-    Ok(u64::from(fixed_index_len_bits(2)?) + u64::from(fixed_index_len_bits(domains)?))
-}
-
 /// What a node's code references: the alphabets its fixed indices are drawn from.
 struct NodeCode<'a> {
     operators: usize,
@@ -3864,83 +3810,6 @@ fn decode_operator_with(reader: &mut BitReader<'_>, index: u64, starts: Option<&
     }))
 }
 impl OperatorProgram {
-
-    /// Independent numeric literals in ordinary nodes and stored rule bodies, and
-    /// their exact wire payload (real precision fields or arithmetic integer fields).
-    /// The lattice count field remains structural. A shared body is traversed once,
-    /// independently of its call count. This account changes neither the exact codec
-    /// nor native architecture constants such as an RMSNorm epsilon.
-    pub(crate) fn frame_literal_payload(&self) -> Result<(u64, u64), ProgramError> {
-        fn scalar(value: f64) -> Result<(u64, u64), ProgramError> {
-            let wire = lattice_bits(&[value], exact_precision([value])?)?;
-            Ok((1, wire - prefix_integer_len_bits(2)?))
-        }
-        fn coefficient(value: &Coefficient) -> Result<(u64, u64), ProgramError> {
-            match value {
-                Coefficient::Parameter(_) => Ok((0, 0)),
-                Coefficient::Number(value) => scalar(*value),
-                Coefficient::Sum(terms) | Coefficient::Product(terms) => {
-                    terms.iter().try_fold((0, 0), |(count, bits), term| {
-                        let (literals, payload) = coefficient(term)?;
-                        Ok((count + literals, bits + payload))
-                    })
-                }
-            }
-        }
-        fn scale(value: &Scale) -> Result<(u64, u64), ProgramError> {
-            match value {
-                Scale::One => Ok((0, 0)),
-                // The existing variant stores a freely specified arithmetic
-                // argument, not a reference to a dimension. Even if it equals
-                // head width, equality alone is not an explicit derivation.
-                Scale::InverseSqrt(n) => Ok((1, prefix_integer_len_bits(u64::from(*n))?)),
-            }
-        }
-        self.nodes.iter().chain(self.rules.iter().flat_map(|rule| &rule.nodes)).try_fold((0, 0), |(count, bits), node| {
-            let (literals, payload) = match node {
-                Node::Gain { coefficient: value, .. } => coefficient(value)?,
-                Node::RmsNorm { epsilon, .. } => scalar(*epsilon)?,
-                Node::Bilinear { scale: value, .. } => scale(value)?,
-                Node::Attend { scale: value, rotary, .. } => {
-                    let (count, payload) = scale(value)?;
-                    match rotary {
-                        None => (count, payload),
-                        Some(rotary) => (count + 1, payload + prefix_integer_len_bits(u64::from(rotary.base))?),
-                    }
-                }
-                Node::Feature { .. } | Node::Raw { .. } | Node::Constant { .. } | Node::Affine { .. }
-                | Node::Softmax { .. } | Node::Mix { .. } | Node::Pointwise { .. }
-                | Node::Hadamard { .. } | Node::Readout { .. } | Node::Outer { .. } | Node::Concat { .. }
-                | Node::Param { .. } | Node::Call { .. } | Node::Transposed { .. } => (0, 0),
-            };
-            Ok((count + literals, bits + payload))
-        })
-    }
-
-    /// The message's parts other than the operators: header, bases, rules and nodes.
-    pub(crate) fn frame_bits(&self) -> Result<(u64, Vec<u64>, u64, u64), ProgramError> {
-        let interfaces = self.interfaces()?;
-        let header_bits = prefix_integer_len_bits(self.bases.len() as u64 + 1)?
-            + prefix_integer_len_bits(self.operators.len() as u64 + 1)?
-            + prefix_integer_len_bits(self.nodes.len() as u64)?
-            + u64::from(fixed_index_len_bits(self.nodes.len())?);
-        let basis_bits = self
-            .bases
-            .iter()
-            .map(|basis| basis_bits(basis, self.declarations.domains.len()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut rules = BitString::new();
-        encode_rules(&mut rules, self)?;
-        let rule_bits = rules.len_bits();
-        let rule_inputs: Vec<usize> = self.rules.iter().map(|r| r.inputs.len()).collect();
-        let code = self.top_code(&rule_inputs);
-        let mut nodes = BitString::new();
-        for (index, node) in self.nodes.iter().enumerate() {
-            encode_node(&mut nodes, node, index, &code, &interfaces)?;
-        }
-        Ok((header_bits, basis_bits, rule_bits, nodes.len_bits()))
-    }
-
     fn top_code<'a>(&self, rule_inputs: &'a [usize]) -> NodeCode<'a> {
         NodeCode {
             operators: self.operators.len(),

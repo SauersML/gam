@@ -73,8 +73,7 @@
 //! with forward-error bands and differentiates (`derivatives::vjp`) like any other.
 
 use super::codec::{
-    BitReader, BitString, CodecError, decode_fixed_index, decode_prefix_integer, encode_fixed_index, encode_prefix_integer, fixed_index_len_bits,
-    prefix_integer_len_bits,
+    BitReader, BitString, CodecError, decode_fixed_index, decode_prefix_integer, encode_fixed_index, encode_prefix_integer,
 };
 use super::operator_program::{
     Coefficient, Declarations, FamilyInputs, Interface, Node, Operator, OperatorBody, OperatorProgram, ProgramError, Provenance, Rule, SlotValues, Trace,
@@ -499,53 +498,6 @@ pub fn has_f32_reals(op: &Operator) -> bool {
     }
 }
 
-/// `program` with every rule application replaced by a copy of the rule's body, its parameters
-/// bound to the call's arguments: the same function, node for node, with no rules.
-pub fn inlined(program: &OperatorProgram) -> Result<OperatorProgram, String> {
-    let (operators, bases, rules) = (identity(program.operators.len()), identity(program.bases.len()), identity(program.rules.len()));
-    let mut nodes: Vec<Node> = Vec::new();
-    // Appends `body`'s nodes with `Param { i }` bound to `arguments[i]`; returns the output's index.
-    fn expand(
-        program: &OperatorProgram,
-        body: &[Node],
-        output: usize,
-        arguments: &[usize],
-        nodes: &mut Vec<Node>,
-        maps: (&[usize], &[usize], &[usize]),
-    ) -> Result<usize, String> {
-        let mut map: Vec<usize> = Vec::with_capacity(body.len());
-        for node in body {
-            let index = match node {
-                Node::Param { index } => {
-                    *arguments.get(*index).ok_or_else(|| format!("a rule parameter {index} with {} arguments", arguments.len()))?
-                }
-                Node::Call { rule, arguments: call } => {
-                    let rule = program.rules.get(*rule).ok_or_else(|| format!("no rule {rule}"))?;
-                    let bound: Vec<usize> = call.iter().map(|a| map[*a]).collect();
-                    expand(program, &rule.nodes, rule.output, &bound, nodes, maps)?
-                }
-                other => {
-                    let mut copy = other.clone();
-                    remap_node(&mut copy, &map, maps.0, maps.1, maps.2);
-                    nodes.push(copy);
-                    nodes.len() - 1
-                }
-            };
-            map.push(index);
-        }
-        Ok(map[output])
-    }
-    let output = expand(program, &program.nodes, program.output, &[], &mut nodes, (&operators, &bases, &rules))?;
-    Ok(OperatorProgram {
-        declarations: program.declarations.clone(),
-        bases: program.bases.clone(),
-        operators: program.operators.clone(),
-        rules: Vec::new(),
-        nodes,
-        output,
-    })
-}
-
 /// Per row of `inputs`, its causal context (module note on [`Exception`]).
 pub fn contexts(inputs: &FamilyInputs) -> Vec<Vec<u32>> {
     let token_slots: Vec<&Vec<u32>> = inputs
@@ -718,13 +670,6 @@ impl Artifact {
             }
         }
         Ok(bodies)
-    }
-
-    /// Derived scales/residuals plus each shared explicit body's coefficients once.
-    pub fn derived_literals(&self) -> Result<u64, String> {
-        let mut literals = self.derived.iter().map(Derived::literals).sum();
-        for (_, body) in self.matrix_rules()? { literals += body.cost()?.literals; }
-        Ok(literals)
     }
 
     /// This artifact with the native block from `native_reads` to `native_write` declared replaced,
@@ -1330,58 +1275,6 @@ impl Artifact {
         Ok((Self { program: out, native_nodes: self.native_nodes, blocks: Vec::new(), places: Vec::new(), exceptions, derived: Vec::new(), controls: Vec::new(), owners: Vec::new() }, columns, writes))
     }
 
-    /// Numeric-free blocks, places, exceptions and derivation structure, excluding
-    /// diagnostic names. Exception values, derived scales and residual values are
-    /// independently priced at 32 bits each by C32, outside this binding remainder.
-    pub fn binding_bits(&self) -> Result<u64, String> {
-        crate::native_control::validate_shape(self)?;
-        let bodies = self.matrix_rules()?;
-        let versioned = !bodies.is_empty() || !self.controls.is_empty();
-        let version = if self.controls.is_empty() { MATRIX_ARTIFACT_VERSION } else { CONTROL_ARTIFACT_VERSION };
-        let nodes = self.program.nodes.len();
-        let fixed = |alphabet: usize| -> Result<u64, String> { Ok(u64::from(fixed_index_len_bits(alphabet).map_err(codec)?)) };
-        let prefix = |value: u64| prefix_integer_len_bits(value).map_err(codec);
-        let mut bits = prefix(self.blocks.len() as u64 + 1)?;
-        for block in &self.blocks {
-            bits += prefix(block.reads.len() as u64 + 1)? + (block.reads.len() as u64 + 1) * (fixed(self.native_nodes)? + fixed(nodes)?);
-        }
-        bits += prefix(self.places.len() as u64 + 1)? + self.places.len() as u64 * (fixed(self.native_nodes)? + fixed(nodes)?);
-        bits += prefix(self.exceptions.len() as u64 + 1)?;
-        let interfaces = self.program.interfaces().map_err(|e| e.to_string())?;
-        for exception in &self.exceptions {
-            bits += prefix(exception.context.len() as u64 + 1)?;
-            for token in &exception.context {
-                bits += prefix(u64::from(*token) + 1)?;
-            }
-            bits += fixed(nodes)? + fixed(interfaces[exception.node].width())?;
-        }
-        // The derived operators less their literals' 32 bits each (charged as literals).
-        let operators = self.program.operators.len();
-        if versioned {
-            // Internal dispatch marker, explicit format version and body-pool framing.
-            bits += prefix(1)? + prefix(version)? + prefix(bodies.len() as u64 + 1)?;
-            for (message, body) in &bodies { bits += prefix(message.len_bits() + 1)? + body.cost()?.structure_bits; }
-        }
-        bits += prefix(self.derived.len() as u64 + 1)?;
-        for d in &self.derived {
-            bits += fixed(operators)? + fixed(if versioned { MATRIX_LAWS } else { LAWS })? + d.law.sources().len() as u64 * fixed(operators)?;
-            if matches!(d.law, OperatorLaw::Expression { .. }) { bits += fixed(bodies.len())?; }
-            for integer in d.law.integers() {
-                bits += prefix(integer + 1)?;
-            }
-            bits += prefix(d.residual.len() as u64 + 1)? + d.residual.len() as u64 * fixed(self.program.operators[d.operator].rows.width())?;
-        }
-        if !self.controls.is_empty() {
-            crate::native_control::validate_shape(self)?;
-            bits += prefix(self.controls.len() as u64 + 1)?;
-            for c in &self.controls {
-                bits += prefix(1)? + 2 * fixed(self.native_nodes)? + fixed(nodes)?
-                    + prefix((c.width as u64).checked_add(1).ok_or("control width overflow")?)?;
-            }
-        }
-        Ok(bits)
-    }
-
     fn encode_using(&self, cache: Option<&crate::operator_program::NativeOperatorCodec>) -> Result<BitString, String> {
         crate::native_control::validate_shape(self)?;
         let bodies = self.matrix_rules()?;
@@ -1630,11 +1523,6 @@ impl Artifact {
         self.to_bytes_using(None)
     }
 
-    /// Identical standalone bytes; immutable native codewords avoid recoding their values.
-    pub fn to_bytes_with_native_codec(&self, cache: &crate::operator_program::NativeOperatorCodec) -> Result<Vec<u8>, String> {
-        self.to_bytes_using(Some(cache))
-    }
-
     fn to_bytes_using(&self, cache: Option<&crate::operator_program::NativeOperatorCodec>) -> Result<Vec<u8>, String> {
         if !self.owners.is_empty() {
             let plain = Self { owners: Vec::new(), ..self.clone() }.to_bytes_using(cache)?;
@@ -1662,11 +1550,6 @@ impl Artifact {
     /// The artifact [`Artifact::to_bytes`] wrote, given the declarations alone.
     pub fn from_bytes(bytes: &[u8], declarations: &Declarations) -> Result<Self, String> {
         Self::from_bytes_using(bytes, declarations, None)
-    }
-
-    /// Ordinary envelope validation; cached bodies require an exact codeword at the original index.
-    pub fn from_bytes_with_native_codec(bytes: &[u8], declarations: &Declarations, cache: &crate::operator_program::NativeOperatorCodec) -> Result<Self, String> {
-        Self::from_bytes_using(bytes, declarations, Some(cache))
     }
 
     fn from_bytes_using(bytes: &[u8], declarations: &Declarations, cache: Option<&crate::operator_program::NativeOperatorCodec>) -> Result<Self, String> {
@@ -1706,14 +1589,6 @@ impl Artifact {
         Self::decode_using(&message, declarations, cache)
     }
 }
-
-#[cfg(test)]
-#[path = "matrix_artifact_tests.rs"]
-mod matrix_artifact_tests;
-
-#[cfg(test)]
-#[path = "control_artifact_tests.rs"]
-mod control_artifact_tests;
 
 #[cfg(test)]
 #[path = "function_graft_tests.rs"]

@@ -1,10 +1,5 @@
 //! Device execution of decoded artifacts, preserving root-node identity and exception order.
-use crate::artifact::{Artifact, contexts};
-use crate::device_program::{DeviceProgram, DeviceTrace};
-use crate::operator_program::{FamilyInputs, Node, Operator, OperatorProgram, remap_node};
-use gam_gpu::tensor::{Device, Tensor};
-use ndarray::Array2;
-use std::collections::BTreeMap;
+use crate::operator_program::{Node, Operator, OperatorProgram, remap_node};
 use std::sync::Arc;
 
 /// Each old root node has a distinct materialized value, including identity-call outputs.
@@ -116,137 +111,14 @@ pub fn mapped_inlined_observed(
     Ok((flat, map, observed))
 }
 
-pub struct Resident {
-    artifact: Artifact,
-    /// Root old -> flat. Internal rule nodes have no root edit identity.
-    map: Vec<usize>,
-    roots: BTreeMap<usize, usize>,
-    program: DeviceProgram,
-    output: usize,
-}
-impl Resident {
-    /// Execute an already decoded artifact's actual value output, including a
-    /// multi-term affine or Concat. No synthetic head or additional arithmetic.
-    /// Refuses unsupported device nodes and host fallback explicitly.
-    pub fn from_decoded_values(device: &Device, candidate: &Artifact) -> Result<Self, String> {
-        if device.is_host() || !device.float64() {
-            return Err("artifact device needs a float64 accelerator".into());
-        }
-        Self::compile_decoded_mode(device, candidate, None, true)
-    }
-    /// Value execution sharing only exact operator Arcs in identical roles.
-    pub fn from_decoded_values_sharing(from: &Self, candidate: &Artifact) -> Result<Self, String> {
-        if from.program.device().is_host() || !from.program.device().float64() {
-            return Err("artifact device needs a float64 accelerator".into());
-        }
-        Self::compile_decoded_mode(from.program.device(), candidate, Some(from), true)
-    }
-    fn compile_decoded_mode(device: &Device, candidate: &Artifact, from: Option<&Self>, values: bool) -> Result<Self, String> {
-        Self::compile_decoded_mode_bounded(device, candidate, from, values, None)
-    }
-    fn compile_decoded_mode_bounded(device: &Device, candidate: &Artifact, from: Option<&Self>, values: bool, numeric_bytes_limit: Option<usize>) -> Result<Self, String> {
-        candidate.program.interfaces().map_err(|e| e.to_string())?;
-        let artifact = candidate.clone();
-        let (flat, map) = mapped_inlined(&artifact.program)?;
-        let output = flat.output;
-        for exception in &artifact.exceptions {
-            let node = artifact.program.nodes.get(exception.node).ok_or("exception node outside artifact")?;
-            let width = artifact.program.node_interface(exception.node).map_err(|e| e.to_string())?.width();
-            if exception.column >= width || !exception.value.is_finite() {
-                return Err("invalid exception column or nonfinite value".into());
-            }
-            if matches!(node, Node::Feature { .. }) {
-                return Err("artifact feature-node exceptions need unsupported token-basis materialization".into());
-            }
-        }
-        let program = if values {
-            match (from, numeric_bytes_limit) {
-                (Some(base), Some(limit)) => DeviceProgram::compile_values_sharing_bounded(&base.program, &flat, limit)?,
-                (Some(base), None) => DeviceProgram::compile_values_sharing(&base.program, &flat)?,
-                (None, Some(limit)) => DeviceProgram::compile_values_bounded(device, &flat, limit)?,
-                (None, None) => DeviceProgram::compile_values(device, &flat)?,
-            }
-        } else {
-            match from {
-                Some(base) => DeviceProgram::compile_sharing(&base.program, &flat)?,
-                None => DeviceProgram::compile(device, &flat)?,
-            }
-        };
-        let roots = map.iter().enumerate().map(|(old, &new)| (new, old)).collect();
-        Ok(Self { artifact, map, roots, program, output })
-    }
-    /// Incomplete resident-value memory estimate. Excludes attention workspaces, weights,
-    /// exception tensors and allocation overhead. The caller chooses and limits batch rows.
-    pub fn estimated_resident_bytes(&self, rows: usize) -> Result<usize, String> {
-        rows.checked_mul(self.program.edited_bytes_per_row()).ok_or("edited batch size overflow".into())
-    }
-    /// Add exceptions, then invoke root-node edits. Edits return a fresh replacement tensor;
-    /// they cannot mutate an aliased upstream value. DeviceTrace indices here are expanded.
-    pub fn forward_edited(
-        &self,
-        family: &FamilyInputs,
-        edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
-    ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(family, true, edit)
-    }
-    fn forward_hooks(
-        &self,
-        family: &FamilyInputs,
-        materialize_head: bool,
-        mut edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
-    ) -> Result<DeviceTrace, String> {
-        let d = self.program.device();
-        // Each addition must round against the live value in serialized exception
-        // order. Summing overlapping additions first changes cancellation semantics.
-        let mut tensors: BTreeMap<usize, Vec<Tensor>> = BTreeMap::new();
-        let row_contexts = contexts(family);
-        for exception in &self.artifact.exceptions {
-            let node = self.map[exception.node];
-            let width = self.artifact.program.node_interface(exception.node).map_err(|e| e.to_string())?.width();
-            let mut values = Array2::zeros((family.rows, width));
-            let mut matched = false;
-            for (row, context) in row_contexts.iter().enumerate() {
-                if *context == exception.context {
-                    values[[row, exception.column]] = f64::from(exception.value);
-                    matched = true;
-                }
-            }
-            if matched {
-                tensors.entry(node).or_default().push(d.upload(values.view()).map_err(|e| e.to_string())?);
-            }
-        }
-        // Two hooks are required: exception addition is visible in the trace before edit runs.
-        let before = |node, value: &mut Tensor| {
-            for add in tensors.get(&node).map_or(&[][..], Vec::as_slice) {
-                d.axpy(value, 1.0, add).map_err(|e| e.to_string())?;
-            }
-            Ok(())
-        };
-        let after = |node, trace: &DeviceTrace| match self.roots.get(&node) {
-            Some(&root) => edit(root, trace),
-            None => Ok(None),
-        };
-        let excepted: std::collections::BTreeSet<usize> = tensors.keys().copied().collect();
-        if materialize_head {
-            self.program.forward_edited(family, BTreeMap::new(), &excepted, before, after)
-        } else {
-            self.program.forward_edited_intermediates(family, &excepted, before, after)
-        }
-    }
-
-    /// Borrow a materialized output for resident reductions without copying its
-    /// device buffer. The trace owns the buffer for the duration of the borrow.
-    pub fn output_ref<'a>(&self, trace: &'a DeviceTrace) -> Result<&'a Tensor, String> {
-        trace.value(self.output)
-    }
-
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
+    use crate::device_program::DeviceProgram;
+    use gam_gpu::tensor::Device;
+    use ndarray::Array2;
+    use std::collections::BTreeMap;
+
     #[test]
     fn four_layer_terminal_readout_materializes_after_logit_exception_before_readout_edit() {
         let dir = crate::test_support::tiny_export("artifact_device_readout", 4);

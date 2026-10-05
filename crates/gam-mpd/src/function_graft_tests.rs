@@ -103,9 +103,6 @@ fn distinct_native_uses_retain_one_shared_numeric_body() {
     let duplicated = first.replace_function("second independent", &second_function, 2, 3).unwrap();
     assert_eq!(duplicated.program.real_count(), 12);
     assert_eq!(duplicated.program.execute(&family, false).unwrap().values[duplicated.program.output], values);
-    let mut cache = crate::acceptance::CostCache::default();
-    assert!(crate::acceptance::structural_cost(&shared, &mut cache).unwrap().total()
-        < crate::acceptance::structural_cost(&duplicated, &mut cache).unwrap().total());
 }
 
 #[test]

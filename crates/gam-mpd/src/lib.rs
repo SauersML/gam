@@ -5,11 +5,9 @@
 //! small learned functions per block (`library_mdl`), fitted end to end by one bits-back code
 //! length over interchange experiments of causal abstraction (`interchange`).
 //!
-//! The program search (`program_structure_search`, `program_learned_dag`, `composed_rule_search`
-//! and the region modules) explains a model by an [`artifact::Artifact`]: an executable program of
-//! priced rules bound to the model's places, sent in one message (`codec`, `precision`) and priced
-//! by `acceptance`. Derivatives are analytic (`derivatives`); finite differences belong in tests
-//! only.
+//! An explanation is held as an [`artifact::Artifact`]: an executable program bound to the model's
+//! places, sent in one message (`codec`, `precision`). Derivatives are analytic (`derivatives`);
+//! finite differences belong in tests only.
 
 // Shared test fixtures.
 #[cfg(test)]
@@ -39,17 +37,11 @@ pub mod matrix_rule;
 pub mod artifact;
 pub mod artifact_device;
 
-// The structural cost C(P) and the local disagreement D_local(P) of an explanation.
-pub mod acceptance;
-
-#[cfg(test)]
-mod acceptance_tests;
 
 // The site nodes of an imported language model.
 pub mod run_check;
 
 // Device fitters of rules and replacements through the model's own forward.
-pub mod resident_rule_fit;
 pub mod resident_causal_fit;
 // The explanation as a library of learned functions, fitted end to end by variational MDL.
 pub mod library_mdl;
@@ -66,20 +58,10 @@ pub mod library_compensation;
 pub mod library_removal;
 // Its posterior resident on the device: sample, Adam step and group divergences without transfers.
 pub mod device_posterior;
-pub mod composed_rule_search;
-pub mod program_regions;
-pub mod program_joint_regions;
-pub mod program_learned_dag;
-pub mod program_expression_search;
-pub mod program_structure_search;
-pub mod parameter_response_program;
 
 // Rules of attention heads: one body read through what the decoder holds (a match through an
 // earlier head's output-value circuit, a copy through the norm gains), bound per head by a scale.
 pub mod rules;
-
-#[cfg(test)]
-mod rules_tests;
 
 // Exact directional derivatives of operator programs.
 pub mod derivatives;
@@ -102,14 +84,6 @@ pub mod safetensors;
 // Explicit native intervention-response bindings, validated against native graph laws.
 pub mod native_control;
 
-// Linear coefficient fits of program nodes.
-pub mod linear_coefficient_fit;
-pub mod program_linear_fit;
-pub mod native_local_supervision;
-
-/// Fixed activation and shared-operator controls in ordinary differentiable IR.
-pub mod intervention_program;
-
 // Interchange experiments of causal abstraction on the device: cuts, read and complement patches.
 pub mod interchange;
 // Interchange experiments' blocks as fixed decoder computations with fused kernels.
@@ -118,17 +92,5 @@ pub mod explanation_battery;
 #[cfg(test)]
 mod interchange_tests;
 
-/// Declared rank-one native down-weight perturbations as a full augmented program.
-pub mod down_edit_family;
-pub mod native_parameter_edit;
 /// Measured interventions on native models for an investigator (#2951).
 pub mod oracle;
-
-/// Exact native primitive-unary capacity-control initialization.
-pub mod native_mlp_initialization;
-
-#[cfg(test)]
-mod parameter_response_program_tests;
-
-// Ordinary standalone artifact replay with immutable native codeword reuse.
-pub mod canonical_artifact;
