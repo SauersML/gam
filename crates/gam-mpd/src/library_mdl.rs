@@ -72,7 +72,7 @@ use crate::{
     resident_causal_fit::fixed_head_target::{Head, ResidentHead, Target},
     run_check::LayerNodes,
 };
-use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
+use gam_gpu::tensor::{Arithmetic, Device, Op, Storage, Tensor};
 use ndarray::Array2;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
@@ -84,6 +84,14 @@ const LITERAL_NATS: f64 = crate::acceptance::LITERAL_BITS as f64 * std::f64::con
 
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+
+/// The arithmetic of a device's products: its storage's own (f32 storage is for fitting).
+fn arithmetic(device: &Device) -> Arithmetic {
+    match device.storage() {
+        Storage::F64 => Arithmetic::F64,
+        Storage::F32 => Arithmetic::F32,
+    }
 }
 
 /// Entries of one trainable operator: `rows × cols`.
@@ -621,7 +629,8 @@ impl Teacher {
     fn new(device: &Device, native: &OperatorProgram, numeric_bytes: usize, tile_rows: usize) -> Result<Self, String> {
         let (flat, _) = mapped_inlined(native)?;
         let head = Arc::new(Head::of(&flat)?);
-        let prefix = DeviceProgram::compile_values_bounded(device, &head.prefix(&flat), numeric_bytes)?;
+        let mut prefix = DeviceProgram::compile_values_bounded(device, &head.prefix(&flat), numeric_bytes)?;
+        prefix.set_arithmetic(arithmetic(device));
         let embedding = device.upload(head.embedding.view()).map_err(error)?;
         Ok(Self { prefix, head, embedding, tile_rows })
     }
@@ -637,10 +646,10 @@ impl Teacher {
             let n = self.tile_rows.min(rows - start);
             let h = d.rows_of(hidden, start, n).map_err(error)?;
             let mut probabilities = d.zeros(n, classes).map_err(error)?;
-            d.gemm(&mut probabilities, 1.0, &h, Op::N, &self.embedding, Op::T, 0.0, Arithmetic::F64).map_err(error)?;
+            d.gemm(&mut probabilities, 1.0, &h, Op::N, &self.embedding, Op::T, 0.0, self.prefix.arithmetic()).map_err(error)?;
             let stats = d.softmax_stats_rows(&mut probabilities, None).map_err(error)?;
             let mut projected = d.zeros(n, width).map_err(error)?;
-            d.gemm(&mut projected, 1.0, &probabilities, Op::N, &self.embedding, Op::N, 0.0, Arithmetic::F64).map_err(error)?;
+            d.gemm(&mut projected, 1.0, &probabilities, Op::N, &self.embedding, Op::N, 0.0, self.prefix.arithmetic()).map_err(error)?;
             d.set_rows(&mut mu, start, &projected).map_err(error)?;
             entropy.extend(stats.into_iter().map(|s| s[1]));
         }
@@ -660,6 +669,7 @@ impl Student {
         let (flat, _) = mapped_inlined(&artifact.program)?;
         let head = Head::of(&flat)?;
         let mut program = DeviceProgram::compile_values_bounded(device, &head.prefix(&flat), numeric_bytes)?;
+        program.set_arithmetic(arithmetic(device));
         program.prepare_dense_parameters(trainable)?;
         Ok(Self { head: ResidentHead::new(device, &head, tile_rows)?, program, trainable: trainable.to_vec() })
     }
