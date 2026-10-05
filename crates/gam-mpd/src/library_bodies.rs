@@ -16,7 +16,11 @@
 //! groups of `library_mdl`'s code length: per unit its gate row with its bias, its up row with its
 //! bias, and its output column, paid once however many calls apply the body; per call each row of
 //! `R` and each column of `W`. The fit's removal step removes any of them whose information does
-//! not pay for itself, so a body's units and widths and a call's widths are chosen by `F`.
+//! not pay for itself, so a body's units and widths and a call's widths are chosen by `F`. The
+//! discrete structure is priced in `Explanation::fixed_nats`: per call which of its MLP's functions
+//! it replaces (the enumerative subset code) and which body it applies (each call names one of the
+//! bodies earlier calls apply, or a new one: `ln(b + 1)` nats with `b` bodies so far), and per body
+//! its widths `k` and `k′` (Elias δ).
 //!
 //! # Region rewrite
 //!
@@ -178,6 +182,37 @@ fn next_call(program: &OperatorProgram) -> usize {
         .map(|c| c + 1)
         .max()
         .unwrap_or(0)
+}
+
+/// The nats of which body each call applies, in the order of the calls' numbers: each call names
+/// one of the bodies the calls before it apply or a new one, `ln(b + 1)` nats with `b` bodies so
+/// far (a code of the partition of the calls by their bodies).
+fn assignment_nats(program: &OperatorProgram) -> Result<f64, String> {
+    let mut calls: Vec<(usize, usize)> = Vec::new();
+    for rule in &program.rules {
+        for (n, node) in rule.nodes.iter().enumerate() {
+            let Node::Call { rule: body, arguments } = node else { continue };
+            if !program.rules.get(*body).is_some_and(|b| b.name.starts_with("library.body")) {
+                continue;
+            }
+            let read = match arguments.first().and_then(|z| rule.nodes.get(*z)) {
+                Some(Node::Affine { terms, .. }) if terms.len() == 1 => terms[0].1,
+                other => return Err(format!("{}: call {n}'s argument is {other:?}", rule.name)),
+            };
+            let number = program.operators[read].name.split_once(".call").and_then(|(_, r)| r.strip_suffix(".read")?.parse::<usize>().ok()).ok_or("a call's read binding's name")?;
+            calls.push((number, *body));
+        }
+    }
+    calls.sort_unstable();
+    let mut seen: Vec<usize> = Vec::new();
+    let mut nats = 0.0;
+    for (_, body) in calls {
+        nats += ((seen.len() + 1) as f64).ln();
+        if !seen.contains(&body) {
+            seen.push(body);
+        }
+    }
+    Ok(nats)
 }
 
 /// `program` with `rule` inserted as rule 0 (a rule calls only the rules before it), every call's
@@ -382,6 +417,11 @@ pub fn rewrite(explanation: &Explanation, layer: usize, functions: &[usize]) -> 
     }
     rewritten.trainable.extend(base..program.operators.len());
     rewritten.trainable.sort_unstable();
+    // The rewrite's choices: which of the MLP's functions the call replaces (the enumerative subset
+    // code), the body's widths `k` and `k′` (Elias δ), and which body the call applies.
+    let widths = crate::codec::elias_delta_len_bits(k as u64).map_err(error)? + crate::codec::elias_delta_len_bits(k_out as u64).map_err(error)?;
+    let subset = crate::codec::subset_code_len_bits(known.len(), n).map_err(error)?;
+    rewritten.fixed_nats += (subset + widths) as f64 * std::f64::consts::LN_2 + assignment_nats(program)? - assignment_nats(&explanation.artifact.program)?;
     rewritten.removed.extend(retired);
     rewritten.removed.sort_unstable();
     let replaced = functions.iter().enumerate().map(|(j, i)| (*i, Some(j))).collect();
@@ -1002,6 +1042,11 @@ pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, 
     merged.groups = groups;
     merged.removed = removed;
     merged.trainable.retain(|op| !retired.contains(op));
+    // The calls' choice of body changes; `from`'s widths are no longer sent.
+    let program = &merged.artifact.program;
+    let from_widths = crate::codec::elias_delta_len_bits(explanation.artifact.program.operators[from_ops.gate].cols.width() as u64).map_err(error)?
+        + crate::codec::elias_delta_len_bits(explanation.artifact.program.operators[from_ops.out].rows.width() as u64).map_err(error)?;
+    merged.fixed_nats += assignment_nats(program)? - assignment_nats(&explanation.artifact.program)? - from_widths as f64 * std::f64::consts::LN_2;
     // Owners of `from`'s blocks now own `onto`'s block of the matched unit at the same call, whose
     // bindings took the gauge (`g_i = g_j A`, so `a_i = g_j (A R)`; `u_i = C u_j`, so `W u_i =
     // (W C) u_j`), and for a gated law the unit's up scale `α` (`b_i = α b_j A`, `u_i = C u_j / α`),
@@ -1745,6 +1790,11 @@ mod tests {
             let (merged, calls) = merge(&two, &calls, &second.body, &first.body, &alignment).unwrap();
             close(&outputs(&start, &family), &outputs(&merged, &family), 1e-9);
             assert!(calls.iter().all(|c| c.body == first.body));
+            // The merge no longer sends the second body's widths (two coordinates in and out: Elias δ
+            // of 2 is 4 bits each); the calls' choice of body costs the same ln 2.
+            let ln2 = std::f64::consts::LN_2;
+            assert!((two.fixed_nats - one.fixed_nats - (crate::codec::subset_code_len_bits(16, 4).unwrap() + 8) as f64 * ln2 - 2_f64.ln()).abs() < 1e-12);
+            assert!((two.fixed_nats - merged.fixed_nats - 8.0 * ln2).abs() < 1e-12, "{} against {}", merged.fixed_nats, two.fixed_nats);
             let program = &merged.artifact.program;
             assert_eq!(program.rules.iter().filter(|r| r.name.starts_with("library.body")).count(), 1);
             assert_eq!(sites(program, rule_index(program, &first.body).unwrap()).unwrap().len(), 2, "one body, two calls");
