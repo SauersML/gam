@@ -15,8 +15,10 @@ pre-update model's choice, which only the organisms' scorer holds), items split 
 changed (the updated model chooses otherwise) and the others; no reader sees it.
 
 Readers and score. A frozen reader (reader.py, kind "response") returns q over an item's replies given
-documents: none (the item alone), an arm's rule, or a wrong-relationship ablation of that rule
-(ablate.py; every passed kind is a condition, and a report's ablated score is their mean). The score of
+documents: none (the item alone), an arm's rule, a wrong-relationship ablation of that rule (ablate.py;
+every passed kind is a condition, and a report's ablated score is their mean), and with --transcripts
+the arm's investigation transcript (its commands, the measurements returned and its notes) in place of
+the rule, which asks whether the frozen rule tells the reader more than the evidence it came from. The score of
 q on an item is sum_k p_k ln q_k in nats. Per arm and item: uplift = score(rule) - score(none);
 ablated uplift = score(ablated rule) - score(none); relation = score(rule) - score(ablated rule).
 
@@ -222,18 +224,23 @@ def passed_ablations(run: Path) -> dict[str, dict[str, str]]:
 
 
 def conditions(run: Path, organism: str) -> list[tuple[str, list[str]]]:
-    """(condition, documents) for one organism's items: none, then per arm its rule and each passed ablation."""
+    """(condition, documents) for one organism's items: none, then per arm its rule, each passed
+    ablation, and (when the run reads transcripts) the arm's investigation transcript as text."""
     abl = passed_ablations(run)
+    config = json.loads((run / "config.json").read_text()) if (run / "config.json").exists() else {}
     out = [("none", [])]
     for r in by_organism(staged(run))[organism]:
-        rule = E.load(r["episode"])["report"]["content"]["rule"]
-        out.append((f"report:{r['arm']}", [rule]))
+        episode = E.load(r["episode"])
+        out.append((f"report:{r['arm']}", [episode["report"]["content"]["rule"]]))
         for kind, text in sorted(abl.get(r["report_sha256"], {}).items()):
             out.append((f"ablated:{r['arm']}:{kind}", [text]))
+        if config.get("transcripts") and episode["investigator"].get("transcript"):
+            out.append((f"transcript:{r['arm']}", [E.transcript_text(episode["investigator"]["transcript"])]))
     return out
 
 
-def tests(run: Path):
+def tests(run: Path, transcripts: bool):
+    (run / "config.json").write_text(json.dumps({"transcripts": transcripts}))
     rows = []
     for organism in by_organism(staged(run)):
         drawn = read_jsonl(run / "items" / f"{organism}.jsonl")
@@ -292,7 +299,10 @@ def analyze(run: Path, read_path: Path):
             ablated_keys = [c for c in score if c.startswith(f"ablated:{arm}:")]
             ablated = np.mean([score[c] for c in ablated_keys], axis=0) if ablated_keys else None
             uplift = score[f"report:{arm}"] - score["none"]
-            entry = per.setdefault((r["set"], arm), {"uplift": [], "ablated": [], "relation": [], "accuracy_gain": [], "accuracy_rule": [], "accuracy_alone": [], "changed": [], "organisms": []})
+            transcript = score.get(f"transcript:{arm}")
+            entry = per.setdefault((r["set"], arm), {"uplift": [], "ablated": [], "relation": [], "transcript_uplift": [], "rule_over_transcript": [], "accuracy_gain": [], "accuracy_rule": [], "accuracy_alone": [], "changed": [], "organisms": []})
+            entry["transcript_uplift"].append(transcript - score["none"] if transcript is not None else np.array([]))
+            entry["rule_over_transcript"].append(score[f"report:{arm}"] - transcript if transcript is not None else np.array([]))
             entry["uplift"].append(uplift)
             entry["accuracy_gain"].append(hit[f"report:{arm}"] - hit["none"])
             entry["accuracy_rule"].append(hit[f"report:{arm}"])
@@ -317,8 +327,8 @@ def analyze(run: Path, read_path: Path):
             reader = results[f"{organism}|0|none"]["reader"]
             # Stored under the episode store's condition names (episodes.documents_for): none, report
             # (this episode's own rule), ablated:<kind>.
-            for condition in ["none", f"report:{arm}", *ablated_keys]:
-                name = "report" if condition == f"report:{arm}" else ("ablated:" + condition.split(":")[2] if condition.startswith("ablated:") else condition)
+            for condition in ["none", f"report:{arm}", *ablated_keys, *([f"transcript:{arm}"] if transcript is not None else [])]:
+                name = "report" if condition == f"report:{arm}" else ("ablated:" + condition.split(":")[2] if condition.startswith("ablated:") else condition.split(":")[0])
                 key = f"{reader['backend']}:{reader['model']}:{name}"
                 episode["scores"][key] = {
                     "reader": reader, "documents": name,
@@ -328,7 +338,7 @@ def analyze(run: Path, read_path: Path):
             E.save(episode)
     for (set_, arm), entry in sorted(per.items()):
         row = {"set": set_, "arm": arm, "organisms": entry["organisms"], "items": int(sum(len(u) for u in entry["uplift"]))}
-        for name in ("uplift", "ablated", "relation", "accuracy_gain", "accuracy_rule", "accuracy_alone"):
+        for name in ("uplift", "ablated", "relation", "transcript_uplift", "rule_over_transcript", "accuracy_gain", "accuracy_rule", "accuracy_alone"):
             values = entry[name]
             strata = [("all", lambda c, n: np.ones(n, dtype=bool))]
             if all(c is not None for c in entry["changed"]):
@@ -413,6 +423,7 @@ def main():
     ap.add_argument("--length-factor", type=float, default=1.25)
     ap.add_argument("--count", type=int)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--transcripts", action="store_true", help="tests: also read each arm's investigation transcript as the reader's document")
     ap.add_argument("--command", dest="item_command", help="items: a shell command with {organism} {count} {seed} {out}")
     ap.add_argument("--read", help="analyze: the reader's output (default RUN/read.jsonl)")
     args = ap.parse_args()
@@ -429,7 +440,7 @@ def main():
     elif args.command == "measure":
         measure(run)
     elif args.command == "tests":
-        tests(run)
+        tests(run, args.transcripts)
     elif args.command == "analyze":
         analyze(run, Path(args.read) if args.read else run / "read.jsonl")
     elif args.command == "calibration":
