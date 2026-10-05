@@ -1,0 +1,1 @@
+{"export_sha256": "1de210e36728dbb52bc53920f40cbc3e3d8a3f70352e9785221d7e36ff632fe1", "context": 512, "held_out": [1024, 1056], "half": 64, "sequences": 16, "targets": 4, "batch": 8, "numeric_bytes": 4000000000, "tile_rows": 1024, "seed": 0, "previous": "L1.H1", "induction": "L2.H4", "copy": "L3.H5"}
