@@ -100,7 +100,7 @@ struct Settings {
     context: usize,
     /// Host label cache plus numeric native forward buffers; excludes library/allocator overhead.
     teacher_numeric_bytes: usize,
-    /// Optional compact labels; currently structural mode only.
+    /// Optional compact labels for structural search or finite down-weight response mode.
     #[serde(default)]
     fixed_head_targets: Option<FixedHeadSettings>,
     /// Immutable native codewords and decoded buffers only; zero disables cache.
@@ -235,6 +235,188 @@ impl CausalEpisodes {
             tile_rows: config.tile_rows,
             target_metadata: json!({"backend":"fixed_head","tile_rows":config.tile_rows,"resident_mu_numeric_bytes":bytes,"host_entropy_numeric_bytes":entropy_bytes,"full_logit_target_bytes":0,"teacher_numeric_bytes_limit":teacher_bytes,"scope":"Immutable bias-free dense head sufficient statistics; full candidate vocabulary normalization retained. Operational arithmetic, not certified acceptance."}),
         })
+    }
+    // Rebind only candidate-owned inputs; immutable native labels are shared.
+    fn rebind(
+        teacher: Option<&Self>,
+        lowered: &intervention_program::Compiled,
+        source: &OperatorProgram,
+        controls: &[Control],
+        family: &FamilyInputs,
+        cases: &[Case],
+        labels: &[Array2<f64>],
+        down: Option<&DownFamily>,
+    ) -> Result<Self, String> {
+        if let Some((teacher, targets)) =
+            teacher.and_then(|t| t.compact.as_ref().map(|targets| (t, targets)))
+        {
+            if targets.len() != cases.len() || !labels.is_empty() {
+                return Err("compact case count differs or full logits supplied".into());
+            }
+            let mut metadata = Vec::new();
+            let mut compact = Vec::new();
+            for (case, teacher) in cases.iter().zip(targets) {
+                if teacher.label != case.label || teacher.group != case.group {
+                    return Err("compact target case identity differs".into());
+                }
+                let inputs = lowered.family(
+                    &episode_family(family, case, down)?,
+                    &values(source, controls, family.rows, case)?,
+                )?;
+                metadata.push(ResponseEpisode {
+                    label: case.label.clone(),
+                    inputs: inputs.clone(),
+                    scored: None,
+                    endpoint_bytes: teacher
+                        .target
+                        .numeric_bytes()
+                        .checked_add(
+                            teacher
+                                .target
+                                .rows()
+                                .checked_mul(8)
+                                .ok_or("entropy bytes overflow")?,
+                        )
+                        .ok_or("endpoint bytes overflow")?,
+                });
+                compact.push(resident_causal_fit::FixedHeadEpisode {
+                    label: case.label.clone(),
+                    group: case.group.clone(),
+                    inputs,
+                    target: teacher.target.clone(),
+                });
+            }
+            Ok(Self {
+                metadata,
+                full: None,
+                compact: Some(compact),
+                tile_rows: teacher.tile_rows,
+                target_metadata: teacher.target_metadata.clone(),
+            })
+        } else {
+            let full = episodes(lowered, source, controls, family, cases, labels, down)?;
+            Ok(Self {
+                metadata: response_metadata(&full),
+                full: Some(full),
+                compact: None,
+                tile_rows: 0,
+                target_metadata: json!({"backend":"full_logits"}),
+            })
+        }
+    }
+    fn standalone(
+        d: &Device,
+        lowered: &intervention_program::Compiled,
+        source: &OperatorProgram,
+        controls: &[Control],
+        family: &FamilyInputs,
+        cases: &[Case],
+        labels: &[Array2<f64>],
+        config: Option<&FixedHeadSettings>,
+        teacher_bytes: usize,
+        down: Option<&DownFamily>,
+        original_layers: &[LayerNodes],
+        specs: &[NativeControl],
+    ) -> Result<Self, String> {
+        let Some(down) = down else {
+            return Self::from_family(
+                d,
+                lowered,
+                source,
+                controls,
+                family,
+                cases,
+                labels,
+                config,
+                teacher_bytes,
+            );
+        };
+        let Some(config) = config else {
+            let full = episodes(lowered, source, controls, family, cases, labels, Some(down))?;
+            return Ok(Self {
+                metadata: response_metadata(&full),
+                full: Some(full),
+                compact: None,
+                tile_rows: 0,
+                target_metadata: json!({"backend":"full_logits"}),
+            });
+        };
+        if config.tile_rows == 0 || !labels.is_empty() {
+            return Err("invalid compact down targets".into());
+        }
+        let mut compact: Vec<resident_causal_fit::FixedHeadEpisode> = Vec::new();
+        let mut mu_bytes = 0usize;
+        let mut entropy_bytes = 0usize;
+        for case in cases {
+            // Literal checkpoint matrix edits, never candidate response branches.
+            let edited = down.literal_native(&case.down_amplitudes)?;
+            let native = Artifact::native(&edited)?;
+            let mapped = crate::controls(&native, &edited, original_layers, specs)?;
+            let teacher_graph = intervention_program::compile(&edited, &mapped)?;
+            let retained = mu_bytes
+                .checked_add(entropy_bytes)
+                .ok_or("compact cache overflow")?;
+            let teacher = resident_causal_fit::fixed_head_target::Teacher::new(
+                d,
+                &teacher_graph.program,
+                config.tile_rows,
+                teacher_bytes
+                    .checked_sub(retained)
+                    .ok_or("compact cache exceeds budget")?,
+            )?;
+            let inputs =
+                teacher_graph.family(family, &values(&edited, &mapped, family.rows, case)?)?;
+            let target = teacher.target(&inputs, None)?;
+            let target = if let Some(reference) = compact.first() {
+                target.with_shared_head(&reference.target)?
+            } else {
+                target
+            };
+            mu_bytes = mu_bytes
+                .checked_add(target.numeric_bytes())
+                .ok_or("compact cache overflow")?;
+            entropy_bytes = entropy_bytes
+                .checked_add(target.rows().checked_mul(8).ok_or("entropy overflow")?)
+                .ok_or("entropy cache overflow")?;
+            compact.push(resident_causal_fit::FixedHeadEpisode {
+                label: case.label.clone(),
+                group: case.group.clone(),
+                inputs,
+                target,
+            });
+        }
+        let teacher = Self {
+            metadata: Vec::new(),
+            full: None,
+            compact: Some(compact),
+            tile_rows: config.tile_rows,
+            target_metadata: json!({"backend":"fixed_head","tile_rows":config.tile_rows,
+                "resident_mu_numeric_bytes":mu_bytes,"host_entropy_numeric_bytes":entropy_bytes,
+                "full_logit_target_bytes":0,"teacher_numeric_bytes_limit":teacher_bytes,
+                "scope":"Literal edited native checkpoint teachers; immutable head sufficient statistics; candidate-owned augmented response inputs. Operational arithmetic, not certified acceptance."}),
+        };
+        Self::rebind(
+            Some(&teacher),
+            lowered,
+            source,
+            controls,
+            family,
+            cases,
+            labels,
+            Some(down),
+        )
+    }
+    fn response_capture_budget(&self, limit: usize) -> Result<usize, String> {
+        if self.compact.is_none() {
+            return Ok(limit);
+        }
+        let bytes = self.metadata.iter().try_fold(0usize, |sum, e| {
+            sum.checked_add(e.endpoint_bytes)
+                .ok_or("compact endpoint cache overflow")
+        })?;
+        limit
+            .checked_sub(bytes)
+            .ok_or_else(|| "compact endpoint cache exceeds response capture budget".into())
     }
     fn fit(
         &self,
@@ -985,15 +1167,24 @@ fn down_response_targets(
     }
     let paths: Vec<_> = down.response_nodes.iter().map(|n| vec![*n]).collect();
     let teacher = intervention_program::compile_observed(&down.program, native_controls, &paths)?;
-    let teacher_episodes = episodes(
-        &teacher,
-        &down.program,
-        native_controls,
-        family,
-        cases,
-        logits,
-        Some(down),
-    )?;
+    if !logits.is_empty() && logits.len() != cases.len() {
+        return Err("response label count differs".into());
+    }
+    let teacher_episodes = cases
+        .iter()
+        .enumerate()
+        .map(|(index, case)| {
+            Ok(ResponseEpisode {
+                label: case.label.clone(),
+                inputs: teacher.family(
+                    &episode_family(family, case, Some(down))?,
+                    &values(&down.program, native_controls, family.rows, case)?,
+                )?,
+                scored: None,
+                endpoint_bytes: logits.get(index).map_or(0, |x| x.len() * 8),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let map = teacher
         .observed_nodes
         .iter()
@@ -1004,7 +1195,7 @@ fn down_response_targets(
         d,
         &teacher.program,
         &map,
-        &response_metadata(&teacher_episodes),
+        &teacher_episodes,
         weight,
         limit,
     )?;
@@ -2011,8 +2202,11 @@ fn run() -> Result<(), String> {
     {
         return Err("fixed_head_targets tile_rows must be positive".into());
     }
-    if settings.fixed_head_targets.is_some() && settings.structural_search.is_none() {
-        return Err("fixed_head_targets currently requires structural_search; fixed-expression/down modes use full-logit targets".into());
+    if settings.fixed_head_targets.is_some()
+        && settings.structural_search.is_none()
+        && settings.down_edit_family.is_none()
+    {
+        return Err("fixed_head_targets requires structural_search or down_edit_family".into());
     }
     let started = Instant::now();
     let imported = import_language_model(export, settings.sequences, settings.context)?;
@@ -2189,26 +2383,40 @@ fn run() -> Result<(), String> {
     let native_cost = structural_cost(&saved_native, &mut costs)?.total();
     let saved_native_graph =
         intervention_program::compile(&saved_native.program, &target_controls)?;
-    let native_episodes = episodes(
+    let native_episodes = CausalEpisodes::standalone(
+        &d,
         &saved_native_graph,
         &saved_native.program,
         &target_controls,
         family,
         &settings.cases,
         &targets,
+        settings.fixed_head_targets.as_ref(),
+        settings.teacher_numeric_bytes,
         down.as_ref(),
+        &original_layers,
+        &settings.controls,
     )?;
-    let native_measure = resident_causal_fit::measure(
+    save(
+        &out.join("TEACHER_TARGETS.json"),
+        &native_episodes.target_metadata,
+    )?;
+    let native_measure = native_episodes.measure(
         &d,
         &saved_native_graph.program,
-        &native_episodes,
+        None,
         settings.fit.numeric_bytes,
     )?;
     save(
         &out.join("NATIVE_TRAIN.json"),
         &serde_json::to_value(&native_measure).map_err(|e| e.to_string())?,
     )?;
-    drop(native_episodes);
+
+    let native_teacher_cache = if native_episodes.compact.is_some() {
+        Some(native_episodes)
+    } else {
+        None
+    };
     let mut journal =
         std::fs::File::create(out.join("journal.jsonl")).map_err(|e| e.to_string())?;
     let mut rows = vec![
@@ -2365,7 +2573,8 @@ fn run() -> Result<(), String> {
                     &mapped,
                     &response_paths,
                 )?;
-                let training = episodes(
+                let training = CausalEpisodes::rebind(
+                    native_teacher_cache.as_ref(),
                     &lowered,
                     &candidate.program,
                     &mapped,
@@ -2387,27 +2596,20 @@ fn run() -> Result<(), String> {
                         &targets,
                         &lowered.observed_nodes,
                         config.response_weight,
-                        settings.fit.numeric_bytes,
+                        training.response_capture_budget(settings.fit.numeric_bytes)?,
                     )?;
                     save(&root.join("RESPONSE_TARGETS.json"), &provenance)?;
-                    let fitted = resident_causal_fit::fit_with_native(
+                    let fitted = training.fit(
                         &d,
                         &lowered.program,
-                        &training,
-                        &response_targets,
+                        Some(&response_targets),
                         &trainable,
                         settings.fit.clone(),
                     )?;
                     retained_response_targets = Some((response_targets, provenance));
                     fitted
                 } else {
-                    resident_causal_fit::fit(
-                        &d,
-                        &lowered.program,
-                        &training,
-                        &trainable,
-                        settings.fit.clone(),
-                    )?
+                    training.fit(&d, &lowered.program, None, &trainable, settings.fit.clone())?
                 };
                 save(
                     &root.join("FIT.json"),
@@ -2464,7 +2666,8 @@ fn run() -> Result<(), String> {
                 };
                 let saved_lowered =
                     intervention_program::compile_observed(&saved.program, &mapped, &saved_paths)?;
-                let training = episodes(
+                let training = CausalEpisodes::rebind(
+                    native_teacher_cache.as_ref(),
                     &saved_lowered,
                     &saved.program,
                     &mapped,
@@ -2473,10 +2676,10 @@ fn run() -> Result<(), String> {
                     &targets,
                     down.as_ref(),
                 )?;
-                let measured = resident_causal_fit::measure(
+                let measured = training.measure(
                     &d,
                     &saved_lowered.program,
-                    &training,
+                    None,
                     settings.fit.numeric_bytes,
                 )?;
                 save(
@@ -2500,11 +2703,10 @@ fn run() -> Result<(), String> {
                                 .ok_or("saved response observation missing")?;
                         }
                     }
-                    let supervised = resident_causal_fit::measure_with_native(
+                    let supervised = training.measure(
                         &d,
                         &saved_lowered.program,
-                        &training,
-                        &responses,
+                        Some(&responses),
                         settings.fit.numeric_bytes,
                     )?;
                     save(
@@ -2570,7 +2772,7 @@ fn run() -> Result<(), String> {
     let mut heldout_provenance = Value::Null;
     if let Some(evaluation) = &settings.evaluation {
         let heldout_started = Instant::now();
-        let prepared = (|| -> Result<(FamilyInputs, Vec<Array2<f64>>), String> {
+        let prepared = (|| -> Result<(FamilyInputs, Vec<Array2<f64>>, CausalEpisodes), String> {
             let heldout_export = Path::new(&args[4]);
             if sha256(&heldout_export.join("export.json"))? != evaluation.export_sha256 {
                 return Err("heldout export SHA mismatch".into());
@@ -2583,20 +2785,42 @@ fn run() -> Result<(), String> {
             }
             disjoint_token_sequences(family, &imported_heldout.contract.family, settings.context)?;
             let eval_cases = evaluation.cases.as_deref().unwrap_or(&settings.cases);
-            let (labels, planned) = family_teacher_targets(
-                &d,
-                &original_native,
-                &original_layers,
-                &settings.controls,
-                &imported_heldout.contract.family,
-                eval_cases,
-                down.as_ref(),
-                settings.fit.numeric_bytes,
-                settings.teacher_numeric_bytes,
-            )?;
+            let (labels, planned) = if settings.fixed_head_targets.is_some() {
+                (Vec::new(), 0)
+            } else {
+                family_teacher_targets(
+                    &d,
+                    &original_native,
+                    &original_layers,
+                    &settings.controls,
+                    &imported_heldout.contract.family,
+                    eval_cases,
+                    down.as_ref(),
+                    settings.fit.numeric_bytes,
+                    settings.teacher_numeric_bytes,
+                )?
+            };
             heldout_provenance = json!({"native":imported_heldout.record,"export_sha256":evaluation.export_sha256,"rows_per_episode":imported_heldout.contract.family.rows,"teacher_planned_numeric_bytes":planned,"model_identity":"same original graph/interfaces and numerical weight bits; wire-omitted provenance ignored","sequence_overlap":"all heldout fixed-context token sequences checked absent from training","scope":"previously project-seen, fit-disjoint panel; not untouched confirmation. No updates/reselection, operational F64 KL only"});
             save(&out.join("HELDOUT_PROVENANCE.json"), &heldout_provenance)?;
-            Ok((imported_heldout.contract.family, labels))
+            let panel = CausalEpisodes::standalone(
+                &d,
+                &saved_native_graph,
+                &saved_native.program,
+                &target_controls,
+                &imported_heldout.contract.family,
+                eval_cases,
+                &labels,
+                settings.fixed_head_targets.as_ref(),
+                settings.teacher_numeric_bytes,
+                down.as_ref(),
+                &original_layers,
+                &settings.controls,
+            )?;
+            save(
+                &out.join("HELDOUT_TEACHER_TARGETS.json"),
+                &panel.target_metadata,
+            )?;
+            Ok((imported_heldout.contract.family, labels, panel))
         })();
         stage_seconds.insert(
             "heldout_load_and_teachers".into(),
@@ -2605,7 +2829,8 @@ fn run() -> Result<(), String> {
         let heldout_eval_started = Instant::now();
         for id in &frozen {
             let attempt = (|| -> Result<Value, String> {
-                let (eval_family, labels) = prepared.as_ref().map_err(Clone::clone)?;
+                let (eval_family, labels, teacher_panel) =
+                    prepared.as_ref().map_err(Clone::clone)?;
                 let training = rows
                     .iter()
                     .find(|v| v["id"].as_str() == Some(id))
@@ -2686,7 +2911,8 @@ fn run() -> Result<(), String> {
                 };
                 let lowered =
                     intervention_program::compile_observed(&artifact.program, &mapped, &paths)?;
-                let eval_episodes = episodes(
+                let eval_episodes = CausalEpisodes::rebind(
+                    Some(teacher_panel),
                     &lowered,
                     &artifact.program,
                     &mapped,
@@ -2695,10 +2921,10 @@ fn run() -> Result<(), String> {
                     labels,
                     down.as_ref(),
                 )?;
-                let measured = resident_causal_fit::measure(
+                let measured = eval_episodes.measure(
                     &d,
                     &lowered.program,
-                    &eval_episodes,
+                    None,
                     settings.fit.numeric_bytes,
                 )?;
                 let supervised = if id != "native" {
@@ -2712,7 +2938,7 @@ fn run() -> Result<(), String> {
                             labels,
                             &lowered.observed_nodes,
                             config.response_weight,
-                            settings.fit.numeric_bytes,
+                            eval_episodes.response_capture_budget(settings.fit.numeric_bytes)?,
                         )?;
                         let training_provenance: Value = serde_json::from_slice(
                             &std::fs::read(out.join(id).join("RESPONSE_TARGETS.json"))
@@ -2741,7 +2967,7 @@ fn run() -> Result<(), String> {
                             "Frozen training scales; heldout values do not redefine normalization."
                         );
                         Some(
-                            json!({"measurement":resident_causal_fit::measure_with_native(&d,&lowered.program,&eval_episodes,&responses,settings.fit.numeric_bytes)?,"targets":provenance}),
+                            json!({"measurement":eval_episodes.measure(&d,&lowered.program,Some(&responses),settings.fit.numeric_bytes)?,"targets":provenance}),
                         )
                     } else {
                         None
@@ -3461,6 +3687,16 @@ mod tests {
             operators: vec![
                 dense(array![[1., 0.5], [-0.25, 1.]]),
                 Arc::new(grouped_writer),
+                {
+                    let mut head = (*dense(array![[1., -0.25], [0.25, 0.75], [-0.5, 0.5]])).clone();
+                    head.cols =
+                        Interface::uniform(2, 1, gam_mpd::operator_program::LabelKind::Unit, 0)
+                            .expect("head native groups");
+                    if let OperatorBody::Dense { present, .. } = &mut head.body {
+                        *present = Array2::from_elem((1, 2), true);
+                    }
+                    Arc::new(head)
+                },
             ],
             nodes: vec![
                 Node::Raw { slot: 0 },
@@ -3476,8 +3712,12 @@ mod tests {
                     terms: vec![(2, 1)],
                     bias: None,
                 },
+                Node::Affine {
+                    terms: vec![(3, 2)],
+                    bias: None,
+                },
             ],
-            output: 3,
+            output: 4,
         };
         let down = down_edit_family::build(
             &original,
@@ -3527,6 +3767,32 @@ mod tests {
             1_000_000,
         )
         .expect("literal teachers");
+        let native_lowered =
+            intervention_program::compile(&down.program, &[]).expect("native lowering");
+        let compact_teachers = CausalEpisodes::standalone(
+            &device,
+            &native_lowered,
+            &down.program,
+            &[],
+            &base,
+            &cases,
+            &[],
+            Some(&FixedHeadSettings { tile_rows: 1 }),
+            1_000_000,
+            Some(&down),
+            &[],
+            &[],
+        )
+        .expect("literal compact teachers");
+        assert!(compact_teachers.full.is_none());
+        assert_eq!(
+            compact_teachers.target_metadata["full_logit_target_bytes"],
+            0
+        );
+        assert_eq!(
+            compact_teachers.target_metadata["resident_mu_numeric_bytes"],
+            2 * 2 * 3 * 8
+        );
         for (case, target) in cases.iter().zip(&targets) {
             let literal = down.literal_native(&case.down_amplitudes).expect("literal");
             let expected = literal
@@ -3628,6 +3894,53 @@ mod tests {
             .expect("independent scalar labels");
             assert_eq!(responses["clean"].len(), 1);
             assert!(provenance["native_rms_and_fixed_scale"].is_object());
+            let compact_panels = CausalEpisodes::rebind(
+                Some(&compact_teachers),
+                &lowered,
+                &candidate.program,
+                &[],
+                &base,
+                &cases,
+                &[],
+                Some(&down),
+            )
+            .expect("candidate compact signed inputs");
+            let (compact_responses, _) = down_response_targets(
+                &device,
+                &down,
+                &[],
+                &base,
+                &cases,
+                &[],
+                &lowered.observed_nodes,
+                1.,
+                compact_panels
+                    .response_capture_budget(1_000_000)
+                    .expect("label reserve"),
+            )
+            .expect("scalar labels without any full logits");
+            for (label, targets) in &responses {
+                for (a, b) in targets.iter().zip(&compact_responses[label]) {
+                    assert_eq!(a.values, b.values);
+                    assert_eq!(a.scale.to_bits(), b.scale.to_bits());
+                }
+            }
+            let compact_fit = compact_panels
+                .fit(
+                    &device,
+                    &lowered.program,
+                    Some(&compact_responses),
+                    &trainable,
+                    FitSettings {
+                        iterations: 2,
+                        learning_rate: 0.01,
+                        beta1: 0.9,
+                        beta2: 0.999,
+                        epsilon: 1e-8,
+                        numeric_bytes: 1_000_000,
+                    },
+                )
+                .expect("compact joint fit");
             let fit = resident_causal_fit::fit_with_native(
                 &device,
                 &lowered.program,
@@ -3644,6 +3957,11 @@ mod tests {
                 },
             )
             .expect("joint causal fit");
+            for id in &trainable {
+                let a = fit.program.operators[*id].matrix();
+                let b = compact_fit.program.operators[*id].matrix();
+                assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-9));
+            }
             let mut result = candidate.clone();
             result.program = lowered.restore(&fit.program).expect("source graph restore");
             let (saved, bytes) = canonical(&result).expect("saved F32");
@@ -3689,7 +4007,118 @@ mod tests {
             )
             .expect("saved direct coefficient metrics");
             assert!(supervised.objective.is_finite());
+            let compact_saved = CausalEpisodes::rebind(
+                Some(&compact_teachers),
+                &replay,
+                &saved.program,
+                &[],
+                &base,
+                &cases,
+                &[],
+                Some(&down),
+            )
+            .expect("decoded compact inputs");
+            let compact_kl = compact_saved
+                .measure(&device, &replay.program, None, 1_000_000)
+                .expect("decoded compact KL");
+            let compact_joint = compact_saved
+                .measure(&device, &replay.program, Some(&responses), 1_000_000)
+                .expect("decoded compact responses");
+            assert!((measured.objective - compact_kl.objective).abs() < 1e-10);
+            assert!((supervised.objective - compact_joint.objective).abs() < 1e-10);
         }
+    }
+    #[test]
+    fn compact_down_teacher_refuses_edits_to_final_readout_head() {
+        use gam_mpd::operator_program::exact_precision;
+        use gam_mpd::operator_program::{Declarations, Interface, Law, Operator, Slot};
+        use ndarray::array;
+        let dense = |name: &str| {
+            Arc::new(
+                Operator::dense(
+                    name,
+                    Interface::native(2).expect("rows"),
+                    Interface::native(2).expect("cols"),
+                    Array2::eye(2),
+                    exact_precision([0., 1.]).expect("exact"),
+                    Default::default(),
+                )
+                .expect("dense"),
+            )
+        };
+        let source = OperatorProgram {
+            declarations: Declarations {
+                domains: vec![],
+                slots: vec![Slot::Raw { width: 2 }],
+                parameters: 0,
+            },
+            bases: vec![],
+            rules: vec![],
+            operators: vec![dense("reader"), dense("head")],
+            nodes: vec![
+                Node::Raw { slot: 0 },
+                Node::Affine {
+                    terms: vec![(0, 0)],
+                    bias: None,
+                },
+                Node::Pointwise {
+                    input: 1,
+                    laws: vec![Law::Relu],
+                },
+                Node::Affine {
+                    terms: vec![(2, 1)],
+                    bias: None,
+                },
+            ],
+            output: 3,
+        };
+        let down = down_edit_family::build(
+            &source,
+            0,
+            3,
+            &[Direction {
+                output: array![1., 0.],
+                hidden: array![1., 0.],
+            }],
+        )
+        .expect("finite head edit family");
+        let lowered = intervention_program::compile(&down.program, &[]).expect("lowered");
+        let family = FamilyInputs {
+            rows: 1,
+            slots: vec![SlotValues::Raw(array![[1., 0.5]])],
+            layout: None,
+        };
+        let cases = [
+            Case {
+                label: "clean".into(),
+                group: "clean".into(),
+                gains: vec![],
+                down_amplitudes: vec![0.],
+            },
+            Case {
+                label: "edited".into(),
+                group: "edits".into(),
+                gains: vec![],
+                down_amplitudes: vec![0.5],
+            },
+        ];
+        let error = CausalEpisodes::standalone(
+            &Device::host(),
+            &lowered,
+            &down.program,
+            &[],
+            &family,
+            &cases,
+            &[],
+            Some(&FixedHeadSettings { tile_rows: 1 }),
+            1_000_000,
+            Some(&down),
+            &[],
+            &[],
+        )
+        .err()
+        .expect("fixed-head backend cannot represent changed readout");
+        assert!(error.contains("incompatible immutable heads"));
     }
     #[test]
     fn optional_native_codec_preserves_exact_saved_bytes_cost_and_full_measurements() {
@@ -4629,8 +5058,7 @@ mod tests {
                         && a["mutation"]["region"]["native_writes"]
                             .as_array()
                             .is_some_and(|w| {
-                                w.len() == 2
-                                    && expected.iter().all(|n| w.contains(&json!(n)))
+                                w.len() == 2 && expected.iter().all(|n| w.contains(&json!(n)))
                             })
                 })
                 .expect("joint equation admission");

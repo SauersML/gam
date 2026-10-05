@@ -96,6 +96,16 @@ pub struct Target {
     pub(crate) scored: Option<Vec<bool>>,
 }
 impl Target {
+    /// Share exactly identical immutable head storage across independently generated labels.
+    /// The projected labels and entropy remain unchanged; incompatible heads are refused.
+    pub fn with_shared_head(&self, reference: &Self) -> Result<Self, String> {
+        if !self.head.same(&reference.head) {
+            return Err("compact targets have incompatible immutable heads".into());
+        }
+        let mut target = self.clone();
+        target.head = reference.head.clone();
+        Ok(target)
+    }
     pub fn rows(&self) -> usize {
         self.mu.rows()
     }
@@ -459,9 +469,47 @@ impl ResidentHead {
 mod tests {
     use super::*;
     use crate::{
-        composed_rule_search::{Expr, Unary, UseSpec, compile},
+        composed_rule_search::{compile, Expr, Unary, UseSpec},
         operator_program::{Scale, SequenceLayout, SlotValues},
     };
+    #[test]
+    fn target_head_sharing_preserves_labels_and_rejects_incompatible_head() {
+        let device = Device::host();
+        let first = Target {
+            mu: Arc::new(device.zeros(2, 2).expect("mu")),
+            entropy: vec![0., 0.],
+            head: Arc::new(Head {
+                hidden: 0,
+                operator: 0,
+                embedding: Array2::eye(2),
+            }),
+            scored: None,
+        };
+        let independent = Target {
+            head: Arc::new(Head {
+                hidden: 4,
+                operator: 3,
+                embedding: Array2::eye(2),
+            }),
+            ..first.clone()
+        };
+        assert!(!Arc::ptr_eq(&first.head, &independent.head));
+        let shared = independent
+            .with_shared_head(&first)
+            .expect("identical numeric head");
+        assert!(Arc::ptr_eq(&first.head, &shared.head));
+        assert!(Arc::ptr_eq(&independent.mu, &shared.mu));
+        assert_eq!(shared.entropy, independent.entropy);
+        let incompatible = Target {
+            head: Arc::new(Head {
+                hidden: 0,
+                operator: 0,
+                embedding: Array2::zeros((2, 2)),
+            }),
+            ..first.clone()
+        };
+        assert!(incompatible.with_shared_head(&first).is_err());
+    }
     #[test]
     fn teacher_refuses_quadratic_attention_workspace_before_forward() {
         let expression = Expr::Unary(Unary::GeluTanh, Box::new(Expr::Argument(0)));
