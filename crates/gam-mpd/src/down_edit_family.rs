@@ -119,6 +119,15 @@ impl Family {
         &self,
         artifact: &mut Artifact,
     ) -> Result<Vec<(usize, usize)>, String> {
+        self.retain_directions_excluding(artifact, &std::collections::BTreeSet::new())
+    }
+    /// Never alias fixed family literals to independently fitted parameters, even
+    /// when their current arrays happen to be equal.
+    pub fn retain_directions_excluding(
+        &self,
+        artifact: &mut Artifact,
+        trainable: &std::collections::BTreeSet<usize>,
+    ) -> Result<Vec<(usize, usize)>, String> {
         if artifact.program.declarations != self.program.declarations {
             return Err("wrong augmented declarations".into());
         }
@@ -126,18 +135,28 @@ impl Family {
         for &(u, v) in &self.direction_operators {
             let mut retain = |source: usize| {
                 let direction = &self.program.operators[source];
-                let existing = artifact.program.operators.iter().position(|op| {
-                    op.rows == direction.rows
-                        && op.cols == direction.cols
-                        && op.body == direction.body
-                        && match (&op.body, &direction.body) {
-                            (
-                                OperatorBody::Dense { values: a, .. },
-                                OperatorBody::Dense { values: b, .. },
-                            ) => a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits()),
-                            _ => false,
-                        }
-                });
+                let existing =
+                    artifact
+                        .program
+                        .operators
+                        .iter()
+                        .enumerate()
+                        .find_map(|(id, op)| {
+                            if trainable.contains(&id) {
+                                return None;
+                            }
+                            let matches = op.rows == direction.rows
+                                && op.cols == direction.cols
+                                && op.body == direction.body
+                                && match (&op.body, &direction.body) {
+                                    (
+                                        OperatorBody::Dense { values: a, .. },
+                                        OperatorBody::Dense { values: b, .. },
+                                    ) => a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits()),
+                                    _ => false,
+                                };
+                            matches.then_some(id)
+                        });
                 if let Some(id) = existing {
                     id
                 } else {
@@ -572,5 +591,33 @@ mod tests {
         external.nodes[1] = Node::Raw { slot: 0 };
         assert!(build(&external, 0, 3, std::slice::from_ref(&d)).is_err());
         assert!(build(&native(), 0, 3, &[]).is_err());
+    }
+    #[test]
+    fn fixed_direction_never_aliases_equal_independently_fitted_writer() {
+        let f = family();
+        let source_v = f.direction_operators[0].1;
+        let mut p = f.program.clone();
+        p.nodes = vec![Node::Raw { slot: 0 }];
+        p.output = 0;
+        p.rules.clear();
+        p.operators = vec![f.program.operators[source_v].clone()];
+        let mut candidate = Artifact::native(&p).expect("stored learned writer");
+        let fixed = f
+            .retain_directions_excluding(&mut candidate, &std::collections::BTreeSet::from([0]))
+            .expect("fixed family literals");
+        assert_ne!(fixed[0].1, 0);
+        let before = candidate.program.operators[fixed[0].1].clone();
+        let mut learned = (*candidate.program.operators[0]).clone();
+        let OperatorBody::Dense { values, .. } = &mut learned.body else {
+            panic!("dense test writer")
+        };
+        values.fill(0.);
+        candidate.program.operators[0] = Arc::new(learned);
+        assert_eq!(candidate.program.operators[fixed[0].1], before);
+        assert_eq!(
+            f.retain_directions_excluding(&mut candidate, &std::collections::BTreeSet::from([0]))
+                .expect("stable retention"),
+            fixed
+        );
     }
 }
