@@ -52,6 +52,9 @@ pub(crate) struct Heads {
     pub norms: Option<Norms>,
     /// The attend nodes in the queries' order, and the output operator each is read through.
     pub attends: Vec<(usize, usize)>,
+    /// Per attend, the identity node between it and the output when there is one (an inlined
+    /// rule's output barrier, `artifact_device::mapped_inlined`): the same value, the same block.
+    pub barriers: Vec<Option<usize>>,
     /// The output node's other terms, in their order.
     pub rest: Vec<(usize, usize)>,
     /// The output node's bias.
@@ -91,7 +94,7 @@ impl Heads {
     /// Every node whose value is a column block of a fused buffer.
     pub fn members(&self) -> impl Iterator<Item = usize> + '_ {
         let norms = self.norms.iter().flat_map(|n| n.nodes.iter().flat_map(|(norm, gain, _)| [*norm, *gain]));
-        self.projections.iter().copied().chain(norms).chain(self.attends.iter().map(|(a, _)| *a))
+        self.projections.iter().copied().chain(norms).chain(self.attends.iter().map(|(a, _)| *a)).chain(self.barriers.iter().flatten().copied())
     }
 
     /// Query heads per key head.
@@ -127,7 +130,7 @@ impl Heads {
             (Buffer::Projections, _) => self.projections.clone(),
             (Buffer::Normed, Some(n)) => n.nodes.iter().map(|x| x.0).collect(),
             (Buffer::Gained, Some(n)) => n.nodes.iter().map(|x| x.1).collect(),
-            (Buffer::Reads, _) => self.attends.iter().map(|(a, _)| *a).collect(),
+            (Buffer::Reads, _) => self.attends.iter().map(|(a, _)| *a).chain(self.barriers.iter().flatten().copied()).collect(),
             (_, None) => Vec::new(),
         };
         nodes.sort_unstable();
@@ -148,7 +151,7 @@ impl Heads {
                 return Some((Buffer::Gained, at(i)));
             }
         }
-        self.attends.iter().position(|(a, _)| *a == n).map(|i| (Buffer::Reads, at(i)))
+        self.attends.iter().zip(&self.barriers).position(|((a, _), b)| *a == n || *b == Some(n)).map(|i| (Buffer::Reads, at(i)))
     }
 }
 
@@ -197,15 +200,28 @@ fn matched(program: &OperatorProgram, readers: &[Vec<usize>], widths: &[usize], 
             && projection(p).is_some();
         normed.then_some((p, Some((m, n, gain, epsilon.to_bits()))))
     };
-    // Heads: attends read once, only by this node, through a dense operator, on projections of one input.
+    // An inlined rule's output barrier: an identity node read only by this node, reading an attend
+    // read only by it.
+    let barrier = |n: usize| -> Option<usize> {
+        let Node::Affine { terms, bias: None } = &program.nodes[n] else { return None };
+        let [(a, op)] = terms[..] else { return None };
+        let identity = matches!(program.operators[op].body, OperatorBody::Identity);
+        (identity && !excluded.contains(&n) && readers[n] == [output] && readers[a] == [n] && matches!(program.nodes[a], Node::Attend { .. })).then_some(a)
+    };
+    // Heads: attends read once, only by this node (or through a barrier), through a dense operator,
+    // on projections of one input.
     let mut first = None;
-    let mut keys: Vec<((usize, usize), Vec<(usize, usize, usize)>)> = Vec::new();
-    for &(attend, through) in terms {
+    let mut keys: Vec<((usize, usize), Vec<(usize, usize, usize, Option<usize>)>)> = Vec::new();
+    for &(term, through) in terms {
+        let (attend, between) = match barrier(term) {
+            Some(a) => (a, Some(term)),
+            None => (term, None),
+        };
         let Node::Attend { query, key, value, scale, rotary, causal } = program.nodes[attend] else { continue };
         let (Some((q, q_norm)), Some((k, k_norm)), Some((v, _))) = (read(query), read(key), projection(value).map(|_| (value, ()))) else { continue };
         let inputs: Option<Vec<usize>> = [q, k, v].iter().map(|n| projection(*n).map(|p| p.0)).collect();
         let head = !excluded.contains(&attend)
-            && readers[attend] == [output]
+            && (between.is_some() || readers[attend] == [output])
             && readers[query] == [attend]
             && dense(program, through) == Some((widths[output], widths[attend]))
             && inputs.as_ref().is_some_and(|i| i.iter().all(|x| *x == i[0]));
@@ -218,9 +234,9 @@ fn matched(program: &OperatorProgram, readers: &[Vec<usize>], widths: &[usize], 
             continue;
         }
         match keys.iter_mut().find(|(pair, _)| pair.0 == key || pair.1 == value) {
-            Some((pair, queries)) if *pair == (key, value) => queries.push((query, attend, through)),
+            Some((pair, queries)) if *pair == (key, value) => queries.push((query, attend, through, between)),
             Some(_) => return None,
-            None => keys.push(((key, value), vec![(query, attend, through)])),
+            None => keys.push(((key, value), vec![(query, attend, through, between)])),
         }
     }
     // A key head whose key or value another node reads stays node by node, with its queries.
@@ -228,7 +244,7 @@ fn matched(program: &OperatorProgram, readers: &[Vec<usize>], widths: &[usize], 
     keys.retain(|((key, value), _)| [*key, *value].iter().all(|n| readers[*n].iter().all(|r| fused.contains(r))));
     let (input, scale, rotary, causal, q_epsilon, k_epsilon) = first?;
     let group = keys.first()?.1.len();
-    let queries: Vec<(usize, usize, usize)> = keys.iter().flat_map(|(_, q)| q.iter().copied()).collect();
+    let queries: Vec<(usize, usize, usize, Option<usize>)> = keys.iter().flat_map(|(_, q)| q.iter().copied()).collect();
     // The nodes the attends read as queries and keys, then the values, in `P`'s order.
     let reads: Vec<usize> = queries.iter().map(|q| q.0).chain(keys.iter().map(|(p, _)| p.0)).collect();
     let resolved: Vec<(usize, Option<Norm>)> = reads.iter().map(|&n| read(n)).collect::<Option<_>>()?;
@@ -250,14 +266,17 @@ fn matched(program: &OperatorProgram, readers: &[Vec<usize>], widths: &[usize], 
         epsilon: f64::from_bits(q_epsilon.unwrap_or_default()),
     });
     let attends: Vec<(usize, usize)> = queries.iter().map(|q| (q.1, q.2)).collect();
+    let barriers: Vec<Option<usize>> = queries.iter().map(|q| q.3).collect();
+    let read_terms: Vec<usize> = queries.iter().map(|q| q.3.unwrap_or(q.1)).collect();
     Some(Heads {
         input: input?,
         output,
         projection_operators: projections.iter().map(|&p| projection(p).map(|(_, op, b)| (op, b))).collect::<Option<Vec<_>>>()?,
         projections,
         norms,
-        rest: terms.iter().copied().filter(|(a, _)| !attends.iter().any(|(b, _)| a == b)).collect(),
+        rest: terms.iter().copied().filter(|(a, _)| !read_terms.contains(a)).collect(),
         attends,
+        barriers,
         bias: *bias,
         heads: queries.len(),
         keys: keys.len(),

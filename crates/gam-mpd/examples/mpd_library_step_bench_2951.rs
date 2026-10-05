@@ -229,8 +229,21 @@ impl HostPosterior {
 
 fn main() -> Result<(), String> {
     log_to_stderr();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS [LAYERS]]";
+    // `products=f32|tf32|bf16` (f32 by default) sets the arithmetic of both programs' products.
+    let (settings, args): (Vec<String>, Vec<String>) = std::env::args().skip(1).partition(|a| a.contains('='));
+    // `host=false` skips the host path (its float64 posterior does not fit beside a large model).
+    let (mut products, mut host_path) = (gam_gpu::tensor::Arithmetic::F32, true);
+    for setting in &settings {
+        match setting.as_str() {
+            "products=f32" => products = gam_gpu::tensor::Arithmetic::F32,
+            "products=tf32" => products = gam_gpu::tensor::Arithmetic::Tf32,
+            "products=bf16" => products = gam_gpu::tensor::Arithmetic::Bf16,
+            "host=false" => host_path = false,
+            "host=true" => host_path = true,
+            other => return Err(format!("unknown setting {other}")),
+        }
+    }
+    let usage = "MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS [LAYERS]] [products=f32|tf32|bf16] [host=true|false]";
     let (model, rest) = args.split_first().ok_or(usage)?;
     let [sequences, context, reps, out, windows @ ..] = rest else {
         return Err(usage.into());
@@ -303,9 +316,9 @@ fn main() -> Result<(), String> {
     let (m_flat, m_streams, m_reads) = interchange::sites(&Artifact::native(&native)?, &layers)?;
     let (p_flat, p_streams, p_reads) = interchange::sites(&artifact, &layers)?;
     let mut m_program = DeviceProgram::compile_values_bounded(&device, &interchange::prefix(&m_flat)?, usize::MAX)?;
-    m_program.set_arithmetic(gam_gpu::tensor::Arithmetic::F32);
+    m_program.set_arithmetic(products);
     let mut p_program = DeviceProgram::compile_values_bounded(&device, &interchange::prefix(&p_flat)?, usize::MAX)?;
-    p_program.set_arithmetic(gam_gpu::tensor::Arithmetic::F32);
+    p_program.set_arithmetic(products);
     p_program.prepare_dense_parameters(&trainable)?;
     // Where the experiments cannot be scored (a head the compact targets do not take), the posterior
     // parts are timed alone, from a zero gradient on the device.
@@ -328,7 +341,7 @@ fn main() -> Result<(), String> {
 
     // The host path.
     let mut host_seconds: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
-    {
+    if host_path {
         let mut host = HostPosterior {
             mean: start.mean.clone(),
             log_sd: start.log_sd.clone(),
@@ -392,6 +405,8 @@ fn main() -> Result<(), String> {
     let report = json!({
         "model": model.display().to_string(),
         "explanation": kind,
+        "products": format!("{products:?}"),
+        "fused_head_groups": [m_program.fused_groups(), p_program.fused_groups()],
         "scored": scoring.is_some(),
         "device": device.name(),
         "sequences": sequences,
@@ -402,7 +417,7 @@ fn main() -> Result<(), String> {
         "parameters": parameters,
         "groups": start.count,
         "reps": reps,
-        "host_posterior_seconds": medians(&host_seconds),
+        "host_posterior_seconds": if host_path { medians(&host_seconds) } else { Value::Null },
         "device_posterior_seconds": medians(&device_seconds),
     });
     println!("{report}");

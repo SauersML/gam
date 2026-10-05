@@ -1721,7 +1721,7 @@ impl DeviceProgram {
                 }
             }
         }
-        self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()))
+        self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut BTreeMap::new())
     }
 
     /// Reverse resident-value expressions from explicitly declared node seeds.
@@ -1738,7 +1738,7 @@ impl DeviceProgram {
         if self.head.operator.is_some() {
             return Err("device: values VJP requires resident-value compilation".into());
         }
-        self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()))
+        self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut BTreeMap::new())
     }
 
     /// The reverse pass from `seeds` down to the lowest node of `keep`; at each node of `edited`,
@@ -1752,6 +1752,7 @@ impl DeviceProgram {
         arithmetic: Arithmetic,
         edited: &BTreeSet<usize>,
         hook: &mut dyn FnMut(usize, &mut Tensor) -> Result<(), String>,
+        parameters: &mut BTreeMap<usize, Tensor>,
     ) -> Result<BTreeMap<usize, Tensor>, String> {
         if keep
             .iter()
@@ -1813,7 +1814,7 @@ impl DeviceProgram {
                 break;
             }
             if let Some(group) = self.grouped[index].filter(|f| fused[*f] && self.fused[*f].heads.output == index) {
-                self.heads_reverse(trace, group, &cot, (&mut g, &needed), arithmetic)?;
+                self.heads_reverse(trace, group, &cot, (&mut g, &needed), arithmetic, parameters)?;
                 if keep.contains(&index) {
                     kept.insert(index, cot);
                 }
@@ -1940,9 +1941,18 @@ impl DeviceProgram {
     }
 
     /// Group `g`'s reverse rule from its output node's cotangent `cot`: the other terms as an
-    /// affine node's, then `A`'s cotangent `cot O`, the heads backwards to `P`'s, and the input's
-    /// `g_P W`.
-    fn heads_reverse(&self, trace: &DeviceTrace, g: usize, cot: &Tensor, (grads, needed): (&mut [Option<Tensor>], &[bool]), arithmetic: Arithmetic) -> Result<(), String> {
+    /// affine node's, then `A`'s cotangent `cot O`, the heads backwards to `P`'s, the input's
+    /// `g_P W`, and for every projection operator `parameters` holds a gradient of, its rows of
+    /// `g_Pᵀ x` added to it (one product for the whole group).
+    fn heads_reverse(
+        &self,
+        trace: &DeviceTrace,
+        g: usize,
+        cot: &Tensor,
+        (grads, needed): (&mut [Option<Tensor>], &[bool]),
+        arithmetic: Arithmetic,
+        parameters: &mut BTreeMap<usize, Tensor>,
+    ) -> Result<(), String> {
         let d = &self.device;
         let group = &self.fused[g];
         let heads = &group.heads;
@@ -1950,7 +1960,8 @@ impl DeviceProgram {
         for (argument, operator) in &heads.rest {
             self.pull_term((&mut *grads, needed), trace.rows, cot, *argument, *operator, arithmetic)?;
         }
-        if !needed[heads.input] {
+        let wanted: Vec<(usize, usize)> = heads.projection_operators.iter().enumerate().filter(|(_, (op, _))| parameters.contains_key(op)).map(|(i, (op, _))| (i, *op)).collect();
+        if !needed[heads.input] && wanted.is_empty() {
             return Ok(());
         }
         let mut g_a = d.zeros(trace.rows, heads.heads * heads.width).map_err(error)?;
@@ -1958,6 +1969,19 @@ impl DeviceProgram {
         let turn = turn(&trace.rotations, heads.rotary)?;
         let gained = buffers.normed.map(|(_, gained)| &trace.buffers[gained]);
         let g_p = device_heads::backward(d, (heads, &group.stacked), (&trace.buffers[buffers.projections], gained), &g_a, trace.blocks, turn, (self.arithmetic, arithmetic)).map_err(error)?;
+        if !wanted.is_empty() {
+            let x = trace.value(heads.input)?;
+            let mut stacked = d.zeros(heads.columns(), x.cols()).map_err(error)?;
+            d.gemm(&mut stacked, 1.0, &g_p, Op::T, x, Op::N, 0.0, arithmetic).map_err(error)?;
+            for (i, op) in wanted {
+                let rows = d.rows_of(&stacked, i * heads.width, heads.width).map_err(error)?;
+                let gradient = parameters.get_mut(&op).ok_or("device: a projection's gradient slot")?;
+                d.axpy(gradient, 1.0, &rows).map_err(error)?;
+            }
+        }
+        if !needed[heads.input] {
+            return Ok(());
+        }
         if grads[heads.input].is_none() {
             grads[heads.input] = Some(d.zeros(trace.rows, self.widths[heads.input]).map_err(error)?);
         }
@@ -2023,8 +2047,32 @@ impl DeviceProgram {
             // their parameter space still contains every matrix entry.
             gradients.insert(op, self.device.zeros(held.source.rows.width(), held.source.cols.width()).map_err(error)?);
         }
+        // A group that ran fused, none of whose members is kept, seeded or edited and none of whose
+        // projection biases is trainable, reverses fused and adds its projections' gradients itself
+        // (`heads_reverse`): its projection nodes keep no cotangent, and the reverse reaches its
+        // input.
+        let packed: Vec<usize> = (0..self.fused.len())
+            .filter(|&i| {
+                let f = &self.fused[i];
+                f.live
+                    && trace.fused.get(i).is_some_and(Option::is_some)
+                    && f.heads.members().all(|m| !keep.contains(&m) && !seeds.contains_key(&m) && !edited.contains(&m))
+                    && f.heads.projection_operators.iter().all(|(_, bias)| bias.is_none_or(|b| !requested.contains(&b)))
+                    && f.heads.projection_operators.iter().any(|(op, _)| requested.contains(op))
+            })
+            .collect();
+        let packed_projections: BTreeSet<usize> = packed.iter().flat_map(|&i| self.fused[i].heads.projections.iter().copied()).collect();
         let mut retained = keep.to_vec();
+        for &i in &packed {
+            let input = self.fused[i].heads.input;
+            if !retained.contains(&input) {
+                retained.push(input);
+            }
+        }
         for (node, step) in self.steps.iter().enumerate() {
+            if packed_projections.contains(&node) {
+                continue;
+            }
             let uses = match step {
                 Step::Affine { terms, bias } => terms.iter().any(|(_, op)| requested.contains(op))
                     || bias.is_some_and(|op| requested.contains(&op)),
@@ -2038,7 +2086,7 @@ impl DeviceProgram {
                 retained.push(node);
             }
         }
-        let mut nodes = self.reverse_seeds(trace, seeds, &retained, arithmetic, edited, hook)?;
+        let mut nodes = self.reverse_seeds(trace, seeds, &retained, arithmetic, edited, hook, &mut gradients)?;
         // One scalar constant is uploaded; all reductions and gradient arrays stay
         // on the device. Reuse the same broadcast across every column occurrence.
         let has_columns = requested.iter().any(|op| self.operators.contains_key(&(*op, Role::Column)));
