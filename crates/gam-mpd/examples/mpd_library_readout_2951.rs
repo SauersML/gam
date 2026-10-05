@@ -4,6 +4,7 @@
 //!
 //! EXPORT TOKENIZER SETTINGS.json OUT.json [ARTIFACT]
 //! relp EXPORT PROMPTS.json OUT_DIR [ARTIFACT]
+//! costs EXPORT CHECKPOINT OUT.json [READOUT.json]
 //!
 //! The `relp` mode attributes each prompt's metric to every function at every position
 //! (`Library::attributions`). `PROMPTS.json` is `{export_sha256, numeric_bytes, tile_rows,
@@ -23,13 +24,13 @@ use gam_mpd::{
     engine::{log_to_stderr, sha256},
     import::import_language_model,
     library_mdl,
-    library_readout::{self, Library, Vocabulary},
+    library_readout::{self, Kind, Library, Vocabulary},
     operator_program::{OperatorProgram, SlotValues},
     run_check::{LayerNodes, layer_nodes, split_sites},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{path::Path, time::Instant};
+use std::{collections::BTreeMap, path::Path, time::Instant};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,6 +114,67 @@ fn relp(args: &[String]) -> Result<(), String> {
     std::fs::write(out.join("attributions.json"), serde_json::to_vec(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
+/// Where a fit checkpoint's code length goes: per function its bits, summed per layer and kind,
+/// and the most expensive functions with, from a read-out of the same explanation, their
+/// frequency, importance and top contexts.
+fn costs(args: &[String]) -> Result<(), String> {
+    let (export, checkpoint, out, readout) = match args {
+        [e, c, o] => (e, c, o, None),
+        [e, c, o, r] => (e, c, o, Some(Path::new(r))),
+        _ => return Err("costs EXPORT CHECKPOINT OUT.json [READOUT.json]".into()),
+    };
+    let imported = import_language_model(Path::new(export), 1, 1)?;
+    let layer_count = imported.record["config"]["n_layers"].as_u64().ok_or("config.n_layers")? as usize;
+    let native = split_sites(&imported.program)?;
+    drop(imported);
+    let layers = layer_nodes(&native, layer_count)?;
+    let explanation = library_mdl::explanation(&native, &layers)?;
+    let posterior = library_readout::checkpoint_posterior(&explanation, Path::new(checkpoint))?;
+    let costs = library_readout::function_costs(&explanation, &posterior);
+    let total: f64 = costs.iter().map(|c| c.bits).sum();
+    let mut by_layer: BTreeMap<String, f64> = BTreeMap::new();
+    for c in &costs {
+        let kind = match c.kind {
+            Kind::Head => "heads",
+            Kind::Mlp => "mlp",
+        };
+        *by_layer.entry(format!("L{}.{kind}", c.layer)).or_insert(0.0) += c.bits;
+    }
+    let readout: Option<Value> = readout.map(|p| serde_json::from_slice(&std::fs::read(p).map_err(|e| e.to_string())?).map_err(|e| e.to_string())).transpose()?;
+    let by_name: BTreeMap<String, &Value> =
+        readout.as_ref().and_then(|r| r["functions"].as_array()).into_iter().flatten().filter_map(|f| Some((f["name"].as_str()?.to_string(), f))).collect();
+    let mut order: Vec<usize> = (0..costs.len()).collect();
+    order.sort_by(|a, b| costs[*b].bits.total_cmp(&costs[*a].bits));
+    let expensive: Vec<Value> = order
+        .iter()
+        .take(20)
+        .map(|i| {
+            let c = &costs[*i];
+            let f = by_name.get(&c.name);
+            json!({
+                "name": c.name, "bits": c.bits, "parts": c.parts,
+                "frequency": f.map(|f| f["frequency"].clone()), "importance": f.map(|f| f["importance"].clone()),
+                "contexts": f.map(|f| f["contexts"].as_array().map(|a| a.iter().take(3).map(|c| json!({"before": c["before"], "token": c["token"]})).collect::<Vec<_>>())),
+            })
+        })
+        .collect();
+    let report = json!({
+        "export": export,
+        "checkpoint": checkpoint,
+        "checkpoint_sha256": sha256(Path::new(checkpoint))?,
+        "readout": readout.as_ref().map(|_| args[3].clone()),
+        "source_revision": option_env!("GAM_BUILD_GIT_SHA"),
+        "active_groups": posterior.active.iter().filter(|a| **a).count(),
+        "groups": posterior.active.len(),
+        "bits": total,
+        "divergence_bits": costs.iter().map(|c| c.divergence_bits).sum::<f64>(),
+        "by_layer_and_kind": by_layer,
+        "most_expensive": expensive,
+        "functions": costs,
+    });
+    std::fs::write(out, serde_json::to_vec(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
@@ -130,6 +192,9 @@ fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "relp") {
         return relp(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "costs") {
+        return costs(&args[1..]);
     }
     let (export, tokenizer, settings_path, out, artifact_path) = match &args[..] {
         [e, t, s, o] => (e, t, s, o, None),

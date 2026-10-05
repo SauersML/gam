@@ -48,7 +48,7 @@ use crate::{
     artifact::Artifact,
     artifact_device::mapped_inlined_observed,
     device_program::DeviceProgram,
-    library_mdl::sequence_family,
+    library_mdl::{Explanation, Posterior, sequence_family},
     operator_program::{Node, OperatorProgram, Rotary, Rule, rms_scale},
     resident_causal_fit::fixed_head_target::Head,
     run_check::LayerNodes,
@@ -1244,4 +1244,89 @@ impl Vocabulary {
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| self.pieces.get(*t as usize).cloned().unwrap_or_else(|| format!("<{t}>").into_bytes())).collect();
         String::from_utf8_lossy(&bytes).into_owned()
     }
+}
+
+// ------------------------------------------------------------------------------ where the bits go
+
+/// What one function's parameters cost in the code length `F`: its prior groups' `KL(q_G ‖ p_G)`
+/// and, with each group variance's `½ log2 |G|`, its total, in bits, and the total per part (a
+/// head's query-key planes and value coordinates; an MLP function's gate, up direction and
+/// output).
+#[derive(Clone, Debug, Serialize)]
+pub struct FunctionCost {
+    pub name: String,
+    pub layer: usize,
+    pub kind: Kind,
+    /// Whether any of its groups is still in the explanation.
+    pub active: bool,
+    pub divergence_bits: f64,
+    pub bits: f64,
+    pub parts: BTreeMap<String, f64>,
+}
+
+/// The posterior of a `library_mdl` fit checkpoint of `explanation`: the checkpoint is the fit's
+/// progress as JSON after its length, then per trainable operator its `μ`, `ln σ` and four
+/// optimizer arrays as little-endian float64.
+pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Posterior, String> {
+    let bytes = std::fs::read(path).map_err(error)?;
+    let length = u64::from_le_bytes(bytes.get(..8).ok_or("a truncated checkpoint")?.try_into().map_err(error)?) as usize;
+    let header: serde_json::Value = serde_json::from_slice(bytes.get(8..8 + length).ok_or("a truncated checkpoint")?).map_err(error)?;
+    let tokens = header["tokens"].as_u64().ok_or("a checkpoint without its tokens")? as usize;
+    let mut posterior = Posterior::new(explanation, tokens)?;
+    let shapes: Vec<(usize, usize)> = serde_json::from_value(header["shapes"].clone()).map_err(error)?;
+    let active: Vec<bool> = serde_json::from_value(header["active"].clone()).map_err(error)?;
+    if shapes != posterior.mean.iter().map(Array2::dim).collect::<Vec<_>>() || active.len() != posterior.active.len() {
+        return Err(format!("{}: a checkpoint of another explanation", path.display()));
+    }
+    let count: usize = shapes.iter().map(|(r, c)| r * c * 6).sum();
+    if bytes.len() != 8 + length + count * 8 {
+        return Err(format!("{}: a checkpoint of the wrong size", path.display()));
+    }
+    let mut at = 8 + length;
+    let mut next = |dim: (usize, usize)| {
+        let n = dim.0 * dim.1;
+        let values: Vec<f64> = bytes[at..at + 8 * n].chunks_exact(8).map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])).collect();
+        at += 8 * n;
+        Array2::from_shape_vec(dim, values).map_err(error)
+    };
+    for (i, dim) in shapes.iter().enumerate() {
+        posterior.mean[i] = next(*dim)?;
+        posterior.log_sd[i] = next(*dim)?;
+        for _ in 0..4 {
+            next(*dim)?;
+        }
+    }
+    posterior.active = active;
+    Ok(posterior)
+}
+
+/// Per function of `explanation` (per layer its heads, then its MLP functions), what `posterior`'s
+/// groups of it cost (`library_mdl::Posterior::divergences` and `costs`).
+#[must_use]
+pub fn function_costs(explanation: &Explanation, posterior: &Posterior) -> Vec<FunctionCost> {
+    const BITS: f64 = std::f64::consts::LOG2_E;
+    let (divergences, costs) = (posterior.divergences(), posterior.costs());
+    let function = |name: String, layer: usize, kind: Kind, parts: Vec<(String, &[usize])>| {
+        let groups: Vec<usize> = parts.iter().flat_map(|(_, g)| g.iter().copied()).collect();
+        FunctionCost {
+            name,
+            layer,
+            kind,
+            active: groups.iter().any(|g| posterior.active[*g]),
+            divergence_bits: groups.iter().map(|g| divergences[*g] * BITS).sum(),
+            bits: groups.iter().map(|g| costs[*g] * BITS).sum(),
+            parts: parts.into_iter().map(|(part, g)| (part, g.iter().map(|g| costs[*g] * BITS).sum())).collect(),
+        }
+    };
+    let mut out = Vec::new();
+    for (l, layer) in explanation.layers.iter().enumerate() {
+        for (h, (planes, values)) in layer.heads.iter().enumerate() {
+            out.push(function(format!("L{l}.H{h}"), l, Kind::Head, vec![("query-key planes".into(), planes), ("values".into(), values)]));
+        }
+        for (i, groups) in layer.functions.iter().enumerate() {
+            let parts = groups.iter().map(|g| (explanation.groups[*g].name.rsplit('.').next().unwrap_or("").to_string(), std::slice::from_ref(g))).collect();
+            out.push(function(format!("L{l}.M{i}"), l, Kind::Mlp, parts));
+        }
+    }
+    out
 }
