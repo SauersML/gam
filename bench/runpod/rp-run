@@ -373,6 +373,8 @@ trap 'exit 129' HUP
 launch() {
     local cloud spot price r code b st left
     POD="" IP="" PORT=""
+    # The first pod must be in stock now; a replacement waits for stock while time remains.
+    until [ -n "$POD" ]; do
     while read -r cloud spot price; do
         left=$(( ${DEADLINE:-$(( $(date +%s) + CAP_SECONDS ))} - $(date +%s) ))
         (( left > 0 )) || { say "no time left under the HOURS cap"; exit 1; }
@@ -400,7 +402,12 @@ launch() {
         fi
         say "no $cloud$( [ "$spot" = true ] && echo " spot" || true) pod ($code): $(body_of "$r" | head -c 200)"
     done <<< "$OFFERS"
-    [ -n "$POD" ] || { say "no $GPU_ID in stock"; exit 1; }
+    if [ -z "$POD" ]; then
+        [ -n "$DEADLINE" ] || { say "no $GPU_ID in stock"; exit 1; }
+        (( $(date +%s) + 600 < DEADLINE )) || { say "no $GPU_ID in stock and less than 10 minutes left"; exit 1; }
+        sleep 60
+    fi
+    done
     # SSH, once the pod has a public address. A pod not reachable within 20 minutes (an image pull
     # that stalls, a host that never reports) is given up.
     until [ -n "$IP" ]; do
@@ -597,8 +604,9 @@ run_command() {
 attempt=1
 until launch && setup && run_command; do
     # Lost or never usable: release it, then a new pod while time remains.
-    [ -n "$IP" ] && on_pod -O exit > /dev/null 2>&1
-    [ -n "$POD" ] && { reap "$POD" || exit 1; }
+    # The lost pod's shared connection is gone too: closing it fails, harmlessly.
+    [ -z "$IP" ] || on_pod -O exit > /dev/null 2>&1 || true
+    [ -z "$POD" ] || reap "$POD" || exit 1
     POD="" IP=""
     attempt=$(( attempt + 1 ))
     if [ -n "$DEADLINE" ] && (( $(date +%s) + 600 > DEADLINE )); then
