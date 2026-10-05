@@ -3,7 +3,6 @@
 #
 #   rp-run NAME GPU_TYPE[,GPU_TYPE...] HOURS -- COMMAND...      run COMMAND on one pod
 #   rp-run dev NAME [GPU_TYPE[,GPU_TYPE...] [HOURS]] [-- PATH...] a pod held for development
-#   rp-run adopt NAME POD_ID HOURS SSH_KEY                        put a pod made elsewhere under the runner
 #   rp-run extend NAME HOURS                                      extend a held pod's cap by HOURS
 #   rp-run stop NAME                                              end a run or a held pod now
 #   rp-run batch SPEC                                             launch every run SPEC lists, at once
@@ -73,9 +72,7 @@
 # (/workspace/warm.log). The runner holds it until `rp-run stop NAME`, its cap, or an interrupt,
 # then deletes it. ~/mpd-data/runpod/NAME/ssh [COMMAND] logs in; `rsync -e ~/mpd-data/runpod/NAME/rsh
 # SRC "$(cat ~/mpd-data/runpod/NAME/host):DEST"` copies files. `rp-run extend NAME HOURS` moves both
-# caps (only on request: the budget check runs again). `adopt` holds a pod made outside the runner
-# the same way: the ledger counts it from its creation, and its own deletion timer is armed over SSH
-# with SSH_KEY.
+# caps (only on request: the budget check runs again).
 #
 # Money. The API key is read from the macOS Keychain (service runpod-api-key) at each request and
 # handed to curl on a file descriptor: never in argv, the environment, a file or a log. The $150 cap
@@ -85,7 +82,7 @@
 # start names); a launch or extension whose estimate (the dearest offer x HOURS) would pass it is
 # refused unless RP_ALLOW_OVER=1. Each pod appends (date, name, gpu, cloud, hours, dollars, pod) to
 # ~/mpd-data/runpod/LEDGER.tsv, dollars = the pod's price per hour x hours from creation to
-# deletion; cloud is COMMUNITY, SECURE:no-community-stock, SECURE:dev or ADOPTED; then the seconds
+# deletion; cloud is COMMUNITY, SECURE:cheapest-per-token, SECURE:no-community-stock, SECURE:dev or CPU; then the seconds
 # the pod spent uploading inputs, building data, and from its creation to the command's start (the
 # first two overlap each other and the Rust build, so the third is the paid waiting). One run at a time
 # unless RP_PARALLEL=1 (held pods do not count). After deleting its pod the runner checks through
@@ -107,7 +104,7 @@
 # $MPD_BIN/test-TEST) a run needs and the cache lacks are built first on a 32-vCPU CPU pod, one build
 # per set of Rust sources at a time, and a command that compiles (cargo ...) runs only on a CPU pod.
 # A run whose GPU averages under 20% over 15 minutes once its command has run that long is stopped as
-# idle-stopped (dev and adopted pods are held, not stopped). rp-run stop NAME ends a run (its runner
+# idle-stopped (dev pods are held, not stopped). rp-run stop NAME ends a run (its runner
 # deletes the pod and enters it in the ledger; a runner that does not end within a minute is killed
 # and the pod deleted) as it ends a held pod.
 #
@@ -121,6 +118,10 @@ set -Eeuo pipefail
 REST=https://rest.runpod.io/v1 GRAPHQL=https://api.runpod.io/graphql
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
 MAC_GAM=/Users/user/gam MAC_DATA=/Users/user/mpd-data HF_HUB=/Users/user/.cache/huggingface/hub
+# test_ownership.sh runs the runner against a mock API in a scratch data directory.
+if [ -n "${RP_TEST_ROOT:-}" ]; then
+    MAC_DATA=$RP_TEST_ROOT REST=$RP_TEST_API/v1 GRAPHQL=$RP_TEST_API/graphql
+fi
 RP=$MAC_DATA/runpod LEDGER=$MAC_DATA/runpod/LEDGER.tsv ACTIVE=$MAC_DATA/runpod/active
 # CUDA 12.4 devel: NVRTC and the CUDA libraries the device code loads at run time.
 IMAGE=runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
@@ -129,6 +130,9 @@ IMAGE=runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 TOOLKIT=$(sed -nE 's/.*-cuda([0-9]+[.][0-9]+).*/\1/p' <<< "$IMAGE")
 CUDA_OK=$(jq -nc --arg t "$TOOLKIT" '["11.8","12.0","12.1","12.2","12.3","12.4","12.5","12.6","12.7","12.8","12.9","13.0"]
     | map(select((split(".") | map(tonumber)) >= ($t | split(".") | map(tonumber))))')
+# A run replaces a pod its host lost at most RELAUNCHES times, and discards at most DISCARDS pods on
+# hosts that fail its checks (no SSH, no CUDA, recorded as failing) before it gives up.
+RELAUNCHES=3 DISCARDS=5
 # The budget: at most $150 of the team account's credit, which stood at $750 on 2026-10-05 11:10.
 # A pod made outside the runner has no cap it knows; it is counted as running 4 h more, the default
 # cap of a dev pod.
@@ -136,6 +140,11 @@ CAP_DOLLARS=150 START_BALANCE=750 UNCAPPED_HOURS=4
 # The benchmark table GPU_TYPE auto ranks cards by (gpu_bench_table.py's output for the latest
 # gpu_bench.sh runs).
 TABLE=$MAC_DATA/runpod/gpu_bench.tsv
+# The team account is shared with other MATS users. The runner stops, deletes or extends only pods it
+# created itself: named mpd2951-... and listed in REGISTRY (every pod id it creates, appended at
+# creation, never rewritten; the ids in LEDGER.tsv count too). Any other pod is listed by status as
+# "not ours" and never acted on, even when a record in active/ names it.
+REGISTRY=$MAC_DATA/runpod/created.tsv
 # Hosts (RunPod machine ids) whose pods did not come up or could not start CUDA.
 BAD_HOSTS=$MAC_DATA/runpod/bad_hosts
 # The runner's own files in the outputs directory: never synced from or restored to a pod.
@@ -153,17 +162,41 @@ mkdir -p "$RP" "$ACTIVE"
 api() {
     local args=(-sS -X "$1" --max-time 60 -w '\n%{http_code}' -H 'Content-Type: application/json')
     [ -n "${3:-}" ] && args+=(--data-binary "$3")
+    if [ -n "${RP_TEST_ROOT:-}" ]; then
+        curl "${args[@]}" "$2" || printf '\n000'
+        return
+    fi
     curl "${args[@]}" -H @<(printf 'Authorization: Bearer %s\n' "$(security find-generic-password -s runpod-api-key -w)") "$2" || printf '\n000'
 }
 status_of() { printf '%s' "${1##*$'\n'}"; }
 body_of() { printf '%s' "${1%$'\n'*}"; }
 gql() { api POST "$GRAPHQL" "$(jq -nc --arg q "$1" '{query: $q}')"; }
 
+# Whether POD is ours: its id in REGISTRY (or LEDGER.tsv), and, when the API still knows it, its
+# name mpd2951-... .
+registered() { grep -q "^$1	" "$REGISTRY" 2> /dev/null || cut -f7 "$LEDGER" 2> /dev/null | grep -qx "$1"; }
+owned() {
+    local r
+    registered "$1" || return 1
+    r=$(api GET "$REST/pods/$1")
+    case $(status_of "$r") in
+        404) return 0 ;;
+        200) jq -e '(.name // "") | startswith("mpd2951-")' <<< "$(body_of "$r")" > /dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
 # Delete POD (recorded in active/POD), confirm through the API that it is gone, and enter its
-# cost in the ledger once. Safe to run twice at once (the run's exit and its watcher).
+# cost in the ledger once. Safe to run twice at once (the run's exit and its watcher). A pod that is
+# not ours is never deleted: its record is dropped and the refusal printed.
 reap() {
     local pod=$1 rec=$ACTIVE/$1 r code tries=0 gone=0
     [ -f "$rec" ] || return 0
+    if ! owned "$pod"; then
+        echo "rp-run: pod $pod is not ours (not named mpd2951- or not created by rp-run); not deleting it, dropping its record" >&2
+        rm -f "$rec" "$ACTIVE/.$pod".*
+        return 0
+    fi
     local name gpu cloud price created ended upload_s data_s wait_s end
     read -r name gpu cloud price created _ _ _ upload_s data_s wait_s < "$rec"
     end=$(cat "$ACTIVE/.$pod.end" 2> /dev/null || echo deleted)
@@ -266,7 +299,7 @@ budget() {  # ESTIMATE WHAT
             left=$(awk -v e="$est" -v p="$price" -v t="$(( now - created ))" 'BEGIN { s = (p > 0 ? e / p * 3600 - t : 0); printf "%d", s }')
         else
             left=$(( UNCAPPED_HOURS * 3600 ))
-            echo "rp-run: pod $id ($name, \$$price/h) is not under rp-run; counted as running $UNCAPPED_HOURS h more" >&2
+            echo "rp-run: pod $id ($name, \$$price/h) is not ours (another user of the team account, or made outside rp-run); counted as running $UNCAPPED_HOURS h more" >&2
         fi
         running=$(awk -v a="$running" -v p="$price" -v t="$left" 'BEGIN { printf "%.2f", a + (t > 0 ? p * t / 3600 : 0) }')
     done <<< "$pods"
@@ -291,7 +324,7 @@ held() {
 # Launch approval (lead only): a run starts, or a lost pod is replaced, only while ~/mpd-data/runpod/APPROVED.txt
 # lists a prefix of its NAME. Paid GPUs serve goal-producing runs only; the lead grants and withdraws approval.
 approved() {
-    local f="$HOME/mpd-data/runpod/APPROVED.txt" p
+    local f="$RP/APPROVED.txt" p
     [ -f "$f" ] || return 1
     while IFS= read -r p; do
         case "$p" in ''|'#'*) continue ;; esac
@@ -336,7 +369,8 @@ case ${1:-} in
         idle_rate=0
         while IFS=$'\t' read -r id pname price gpu created _; do
             [ -n "$id" ] || continue
-            rec=$ACTIVE/$id name=${pname#mpd2951-} owner="not rp-run" kind="" mode="" left=- last="" flag="" util=$(cat "$utils/$id" 2> /dev/null || true)
+            rec=$ACTIVE/$id name=${pname#mpd2951-} owner="not ours" kind="" mode="" left=- last="" flag="" util=$(cat "$utils/$id" 2> /dev/null || true)
+            [[ $pname == mpd2951-* ]] && registered "$id" && owner="ours, unheld"
             if [ -f "$rec" ]; then
                 read -r name _ kind _ c _ _ mode _ < "$rec"
                 owner=$(cat "$ACTIVE/.$id.owner" 2> /dev/null || echo -)
@@ -362,7 +396,7 @@ case ${1:-} in
         r=$(gql 'query { myself { clientBalance currentSpendPerHr } }')
         jq -r --arg s "$START_BALANCE" --arg c "$CAP_DOLLARS" --arg idle "$idle_rate" '.data.myself
             | (($s | tonumber) - .clientBalance) as $spent
-            | "account: $\($spent * 100 | round / 100) spent since $\($s), $\(.currentSpendPerHr)/h now ($\($idle | tonumber * 100 | round / 100)/h on GPUs under 20%); at this rate the $\($c) cap is \(if .currentSpendPerHr > 0 then ((($c | tonumber) - $spent) / .currentSpendPerHr * 10 | round / 10 | tostring) + " h" else "never" end) away"' <<< "$(body_of "$r")"
+            | "account (shared with other MATS users; the $150 check counts all of it): $\($spent * 100 | round / 100) spent since $\($s), $\(.currentSpendPerHr)/h now ($\($idle | tonumber * 100 | round / 100)/h on GPUs under 20%); at this rate the $\($c) cap is \(if .currentSpendPerHr > 0 then ((($c | tonumber) - $spent) / .currentSpendPerHr * 10 | round / 10 | tostring) + " h" else "never" end) away"' <<< "$(body_of "$r")"
         exit 0 ;;
     batch)
         [ $# -eq 2 ] && [ -f "$2" ] || usage
@@ -440,11 +474,6 @@ for line in open(sys.argv[1]):
         [ $# -gt 0 ] && [ "$1" != -- ] && { GPU=$1; shift; }
         [ $# -gt 0 ] && [ "$1" != -- ] && { HOURS=$1; shift; }
         [ $# -eq 0 ] || { [ "$1" = -- ] || usage; shift; } ;;
-    adopt)
-        MODE=adopt
-        [ $# -eq 5 ] || usage
-        NAME=$2 ADOPT=$3 HOURS=$4 ADOPT_KEY=$5 GPU=""
-        set -- ;;
     *)
         [ $# -ge 5 ] && [ "$4" = -- ] || usage
         NAME=$1 GPU=$2 HOURS=$3
@@ -469,7 +498,7 @@ if [ "$GPU" = cpu ]; then
     (( ${RP_MIN_RAM_GB:-0} > 128 )) && flavor=cpu3m mult=8
     (( ${RP_MIN_RAM_GB:-0} <= 256 )) || { echo "rp-run: no CPU pod holds ${RP_MIN_RAM_GB} GB" >&2; exit 2; }
     OFFERS="CPU|$(awk -v m="$mult" 'BEGIN { printf "%.2f", 0.96 * m / 2 }')|$flavor"
-elif [ "$MODE" != adopt ]; then
+else
     r=$(gql 'query { gpuTypes { id displayName memoryInGb securePrice communityPrice } }')
     [ "$(status_of "$r")" = 200 ] || { echo "rp-run: price query failed: $(body_of "$r" | head -c 300)" >&2; exit 1; }
     prices=$(body_of "$r")
@@ -521,18 +550,8 @@ elif [ "$MODE" != adopt ]; then
     fi
 fi
 
-if [ "$MODE" = adopt ]; then
-    r=$(api GET "$REST/pods/$ADOPT?includeMachine=true")
-    [ "$(status_of "$r")" = 200 ] || { echo "rp-run: no pod $ADOPT: $(body_of "$r" | head -c 200)" >&2; exit 2; }
-    ADOPTED=$(body_of "$r")
-    [ "$(jq -r .desiredStatus <<< "$ADOPTED")" = RUNNING ] || { echo "rp-run: pod $ADOPT is not running" >&2; exit 2; }
-    [ ! -f "$ACTIVE/$ADOPT" ] || { echo "rp-run: pod $ADOPT is already held" >&2; exit 2; }
-    [ -r "$ADOPT_KEY" ] || { echo "rp-run: SSH_KEY $ADOPT_KEY is not readable" >&2; exit 2; }
-    PRICE_MAX=$(jq -r '.costPerHr // .adjustedCostPerHr' <<< "$ADOPTED")
-    GPU=$(jq -r '.machine.gpuTypeId // .gpu.id // "unknown"' <<< "$ADOPTED")
-else
-    PRICE_MAX=$(awk -F'|' '$2 > m { m = $2 } END { print m }' <<< "$OFFERS")
-fi
+PRICE_MAX=$(awk -F'|' '$2 > m { m = $2 } END { print m }' <<< "$OFFERS")
+
 ESTIMATE=$(awk -v p="$PRICE_MAX" -v h="$HOURS" 'BEGIN { printf "%.2f", p * h }')
 
 # Runs left by a process that is gone (its watcher killed too) are reaped; live runs counted.
@@ -554,7 +573,7 @@ fi
 
 # The commit.
 C=""
-if [ "$MODE" != adopt ]; then
+if :; then
     git -C "$MAC_GAM" fetch -q origin main
     C=$(git -C "$MAC_GAM" rev-parse "${RP_REF:-origin/main}^{commit}")
     git -C "$MAC_GAM" merge-base --is-ancestor "$C" origin/main || { echo "rp-run: ${C:0:12} is not on origin/main; push it or set RP_REF to a published commit" >&2; exit 2; }
@@ -764,7 +783,7 @@ if [ -n "${RP_ESTIMATE_ONLY:-}" ]; then
     exit 0
 fi
 [ -n "${RP_BATCH:-}" ] || budget "$ESTIMATE" "this $MODE's estimate for $HOURS h"
-[ "$MODE" = adopt ] || echo "rp-run: $MODE $NAME; offers $(awk -F'|' '{ printf "%s%s %s $%s/h", (NR > 1 ? ", " : ""), $3, $1, $2 }' <<< "$OFFERS"); estimate \$$ESTIMATE for $HOURS h" >&2
+echo "rp-run: $MODE $NAME; offers $(awk -F'|' '{ printf "%s%s %s $%s/h", (NR > 1 ? ", " : ""), $3, $1, $2 }' <<< "$OFFERS"); estimate \$$ESTIMATE for $HOURS h" >&2
 if [ -n "${RP_DRY:-}" ]; then
     echo "commit:   ${C:-none}"
     echo "uploads:  ${uploads[*]:-none} (${#files[@]} files, $(( upload_kb / 1024 )) MB)"
@@ -776,7 +795,7 @@ if [ -n "${RP_DRY:-}" ]; then
     echo "examples: $(for x in "${examples[@]}"; do printf '%s (%s, %s) ' "$x" "${package_of[$x]}" "$( [ -x "$CACHE/$x" ] && echo cached || echo "to build on a CPU pod")"; done) rust ${CHANNEL:-none}"
     echo "tests:    $(for x in "${tests[@]}"; do printf 'test-%s (%s, %s) ' "${x#*:}" "${x%%:*}" "$( [ -x "$CACHE/test-${x#*:}" ] && echo cached || echo "to build on a CPU pod")"; done)"
     echo "command:  ${cmd:-none}"
-    [ "$MODE" = adopt ] || echo "request:  $(IFS='|' read -r k p g <<< "$(head -n 1 <<< "$OFFERS")"; create_body "$k" "$g" "$CAP_SECONDS" '<run key> <~/.ssh/runpod_ed25519.pub>')"
+    echo "request:  $(IFS='|' read -r k p g <<< "$(head -n 1 <<< "$OFFERS")"; create_body "$k" "$g" "$CAP_SECONDS" '<run key> <~/.ssh/runpod_ed25519.pub>')"
     exit 0
 fi
 
@@ -786,11 +805,7 @@ LOG=$OUT/run.log
 rm -f "$OUT/data.log"
 say() { echo "rp-run: $*" >&2; echo "$(date '+%F %T') $*" >> "$OUT/rp-run.log"; }
 TMP=$(mktemp -d /tmp/rp-run.XXXXXX)
-if [ "$MODE" = adopt ]; then
-    cp "$ADOPT_KEY" "$TMP/key"
-else
-    ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$TMP/key"
-fi
+ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$TMP/key"
 chmod 600 "$TMP/key"
 KEYS="$( [ -f "$TMP/key.pub" ] && cat "$TMP/key.pub")"$'\n'"$(cat ~/.ssh/runpod_ed25519.pub)"
 POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED=""
@@ -813,14 +828,14 @@ finish() {
     fi
     if [ -n "$IP" ]; then on_pod -O exit > /dev/null 2>&1; fi
     if [ -z "$POD" ] && (( ATTEMPTED )); then
-        # A create that failed on the way back (a timeout) may still have made the pod.
+        # A create whose answer was lost (a timeout) may still have made a pod. Its id never reached
+        # the registry, so the runner does not touch it: it is named for a person to check.
         local r id
         r=$(api GET "$REST/pods")
         while read -r id; do
-            [ -n "$id" ] || continue
-            say "adopting $id, made by a create whose answer was lost"
-            printf '%s %s %s %s %s %s %s %s\n' "$NAME" unknown unknown "$PRICE_MAX" "$ATTEMPTED" "$$" "$ESTIMATE" "$MODE" > "$ACTIVE/$id"
-            POD=$id
+            [ -n "$id" ] && ! registered "$id" || continue
+            say "POD $id is named mpd2951-$NAME but its creation was not recorded; check it at https://console.runpod.io/pods"
+            rc=1
         done < <(jq -r --arg n "mpd2951-$NAME" '.[]? | select(.name == $n) | select(.desiredStatus == "RUNNING") | .id' <<< "$(body_of "$r")" 2> /dev/null)
     fi
     if [ -n "$POD" ]; then
@@ -833,8 +848,8 @@ finish() {
             while read -r id pname st; do
                 if [ -f "$ACTIVE/$id" ]; then
                     say "pod $id ($pname, $st) belongs to a run in progress"
-                else
-                    say "POD $id ($pname, $st) REMAINS and no run of this Mac owns it"
+                elif registered "$id"; then
+                    say "POD $id ($pname, $st) is ours, REMAINS, and no run of this Mac holds it"
                     rc=1
                 fi
             done < <(jq -r '.[] | select(.name | startswith("mpd2951-")) | select(.desiredStatus == "RUNNING") | "\(.id) \(.name) \(.desiredStatus)"' <<< "$(body_of "$r")")
@@ -855,10 +870,23 @@ trap 'exit 129' HUP
 
 # Records POD in active/ (name gpu cloud price created owner estimate mode) and starts its watcher.
 record() {  # GPU_ID KIND
+    printf '%s\t%s\t%s\n' "$POD" "$NAME" "$(date '+%F %T')" >> "$REGISTRY"
     printf '%s %s %s %s %s %s %s %s\n' "$NAME" "${1// /_}" "$2" "$PRICE" "$CREATED" "$$" "$ESTIMATE" "$MODE" > "$ACTIVE/$POD"
     echo "${RP_OWNER:--}" > "$ACTIVE/.$POD.owner"
     echo "$DEADLINE" > "$ACTIVE/.$POD.deadline"
     nohup "$SELF" --watch "$POD" "$$" "$DEADLINE" >> "$OUT/watch.log" 2>&1 &
+}
+
+# Whether POD was deleted (the API no longer knows it, or records a termination) rather than lost
+# by its host (exited by RunPod, or running but unreachable).
+deleted() {
+    local r
+    r=$(api GET "$REST/pods/$1")
+    case $(status_of "$r") in
+        404) return 0 ;;
+        200) jq -e '(.desiredStatus == "TERMINATED") or ((.lastStatusChange // "") | startswith("Terminated"))' <<< "$(body_of "$r")" > /dev/null ;;
+        *) return 1 ;;
+    esac
 }
 
 # Waits for SSH to POD: 5 minutes. Of the pods so far every one that came up did so within 45 s,
@@ -937,8 +965,11 @@ launch() {
             break
         fi
         [ -z "$IP" ] || on_pod -O exit > /dev/null 2>&1 || true
+        echo discarded > "$ACTIVE/.$POD.end"
         reap "$POD" || exit 1
         POD="" IP="" PORT=""
+        DISCARDED=$(( ${DISCARDED:-0} + 1 ))
+        (( DISCARDED <= DISCARDS )) || { say "$DISCARDS pods discarded on failing hosts; giving up"; exit 1; }
     done 3<<< "$OFFERS"
     if [ -z "$POD" ]; then
         [ -n "$DEADLINE" ] || { say "none of $GPU in stock on a working host"; exit 1; }
@@ -1453,10 +1484,11 @@ run_command() {
                 *) RC=$state; break ;;
             esac
         fi
-        # The connection dropped, or the pod is gone (taken back, its cap, deleted elsewhere).
+        # The connection dropped, or the pod is gone: deleted (the run ends) or lost by its host
+        # (the run relaunches).
         r=$(api GET "$REST/pods/$POD")
         if [ "$(status_of "$r")" != 200 ] || [ "$(jq -r .desiredStatus <<< "$(body_of "$r")")" != RUNNING ]; then
-            say "pod $POD lost ($(body_of "$r" | jq -r '.lastStatusChange // .error // ""' 2> /dev/null))"
+            say "pod $POD gone ($(body_of "$r" | jq -r '.lastStatusChange // .error // ""' 2> /dev/null))"
             break
         fi
         misses=$(( misses + 1 ))
@@ -1528,18 +1560,24 @@ case $MODE in
         attempt=1
         until launch && setup && run_command; do
             [ ! -f "$OUT/STOP" ] || exit 1
-            # Lost or never usable: release it, then a new pod while time remains.
+            # A pod deleted by anyone but this runner (an API delete, rp-run stop, its own cap) ends
+            # the run; only a pod its host lost (exited by RunPod, or unreachable) is replaced.
+            if [ -n "$POD" ] && deleted "$POD"; then
+                [ -f "$ACTIVE/.$POD.end" ] || echo deleted-elsewhere > "$ACTIVE/.$POD.end"
+                say "pod $POD was deleted outside this runner; the run ends"
+                exit 1
+            fi
             # The lost pod's shared connection is gone too: closing it fails, harmlessly.
             [ -z "$IP" ] || on_pod -O exit > /dev/null 2>&1 || true
-            [ -z "$POD" ] || reap "$POD" || exit 1
+            [ -z "$POD" ] || { echo lost > "$ACTIVE/.$POD.end"; reap "$POD" || exit 1; }
             POD="" IP=""
             attempt=$(( attempt + 1 ))
             if [ -n "$DEADLINE" ] && (( $(date +%s) + 600 > DEADLINE )); then
                 say "less than 10 minutes left under the HOURS cap; not relaunching"
                 exit 1
             fi
-            (( attempt <= 5 )) || { say "five pods failed; giving up"; exit 1; }
-            say "attempt $attempt"
+            (( attempt - 1 <= RELAUNCHES )) || { say "the run lost $RELAUNCHES pods already; giving up"; exit 1; }
+            say "relaunch $(( attempt - 1 )) of at most $RELAUNCHES"
         done
         say "command exited $RC after $(( $(date +%s) - CREATED )) s on pod $POD"
         sync_outputs || on_pod "cd /workspace/mpd-data/runpod/$NAME && tar -cf - . | gzip -1" | gzip -dc | tar -x -C "$OUT"
@@ -1561,28 +1599,6 @@ case $MODE in
         } | on_pod 'cat > /workspace/env.sh && sed -i "1i . /workspace/env.sh" ~/.bashrc && echo "cd /workspace/src" >> ~/.bashrc' || exit 1
         access
         say "dev pod $POD ready: $OUT/ssh; source /workspace/src at ${C:0:12}; rust $CHANNEL; warm build in /workspace/warm.log"
-        hold || exit 1
-        exit 0 ;;
-    adopt)
-        IP=$(jq -r '.publicIp // empty' <<< "$ADOPTED")
-        PORT=$(jq -r '.portMappings["22"] // empty' <<< "$ADOPTED")
-        [ -n "$IP" ] && [ -n "$PORT" ] || { IP=""; say "pod $ADOPT has no public SSH port"; exit 2; }
-        PRICE=$PRICE_MAX
-        # The ledger counts the pod from its own creation.
-        created=$(jq -r '.createdAt // .lastStartedAt' <<< "$ADOPTED")
-        CREATED=$(date -j -u -f '%Y-%m-%d %H:%M:%S' "${created:0:19}" +%s)
-        DEADLINE=$(( $(date +%s) + CAP_SECONDS ))
-        # The pod's own timer first: a pod that cannot be capped is left as it was, unrecorded.
-        arm "$CAP_SECONDS" || { say "could not arm pod $ADOPT's own deletion timer over SSH with $ADOPT_KEY; the pod is left as it was"; exit 1; }
-        trap '' INT TERM HUP
-        POD=$ADOPT
-        record "$GPU" ADOPTED
-        trap 'exit 130' INT
-        trap 'exit 143' TERM
-        trap 'exit 129' HUP
-        jq 'del(.env)' <<< "$ADOPTED" >> "$OUT/pod.json"
-        say "adopted pod $POD ($(jq -r .name <<< "$ADOPTED"), $GPU at \$$PRICE/h, created $(date -r "$CREATED" '+%F %T')); it deletes itself at $(date -r "$DEADLINE" '+%F %T')"
-        access
         hold || exit 1
         exit 0 ;;
 esac
