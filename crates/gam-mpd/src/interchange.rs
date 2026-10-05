@@ -1150,7 +1150,10 @@ impl Interchange {
         let (p_flat, p_streams, p_reads) = sites(explanation, layers)?;
         let mut m = DeviceProgram::compile_values_bounded(device, &prefix(&m_flat)?, numeric_bytes)?;
         m.set_arithmetic(arithmetic);
-        let mut p = DeviceProgram::compile_values_bounded(device, &prefix(&p_flat)?, numeric_bytes)?;
+        // Inherited frozen operators retain their native Arc identity through
+        // inlining. Reuse their resident buffers; prepare_dense_parameters below
+        // detaches every trainable owner before any posterior update can run.
+        let mut p = DeviceProgram::compile_values_sharing_bounded(&m, &prefix(&p_flat)?, numeric_bytes)?;
         p.set_arithmetic(arithmetic);
         p.prepare_dense_parameters(trainable)?;
         let head = FixedHead::new(device, &m_flat, &p_flat, tile_rows)?;

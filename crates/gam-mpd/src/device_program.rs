@@ -2334,6 +2334,45 @@ mod value_sharing_tests {
     use crate::operator_program::{Declarations, Interface, Slot, exact_precision};
     use ndarray::array;
     #[test]
+    fn training_detaches_selected_owners_but_keeps_frozen_native_buffers_shared() {
+        let interface = Interface::native(2).unwrap();
+        let op = |name, values: Array2<f64>| Arc::new(Operator::dense(
+            name, interface.clone(), interface.clone(), values.clone(),
+            exact_precision(values.iter().copied()).unwrap(), Default::default(),
+        ).unwrap());
+        let program = OperatorProgram {
+            declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: 2 }], parameters: 0 },
+            bases: vec![], rules: vec![],
+            operators: vec![op("frozen", array![[1.0, 0.5], [-0.25, 2.0]]), op("trained", array![[2.0, 0.5], [1.0, 3.0]])],
+            nodes: vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None }, Node::Affine { terms: vec![(1, 1)], bias: None }],
+            output: 2,
+        };
+        let device = Device::host();
+        let native = DeviceProgram::compile_values_bounded(&device, &program, 64).unwrap();
+        let mut candidate = DeviceProgram::compile_values_sharing_bounded(&native, &program, 64).unwrap();
+        let mut separate = DeviceProgram::compile_values_bounded(&device, &program, 64).unwrap();
+        for owner in 0..2 {
+            assert!(Arc::ptr_eq(&native.operators[&(owner, Role::Product)].held, &candidate.operators[&(owner, Role::Product)].held));
+        }
+        candidate.prepare_dense_parameters(&[1]).unwrap();
+        separate.prepare_dense_parameters(&[1]).unwrap();
+        assert!(Arc::ptr_eq(&native.operators[&(0, Role::Product)].held, &candidate.operators[&(0, Role::Product)].held));
+        assert!(!Arc::ptr_eq(&native.operators[&(1, Role::Product)].held, &candidate.operators[&(1, Role::Product)].held));
+        let family = FamilyInputs { rows: 2, slots: vec![SlotValues::Raw(array![[1.0, 2.0], [-1.0, 0.5]])], layout: None };
+        let evaluate = |p: &DeviceProgram| device.download(p.forward(&family).unwrap().value(p.hidden()).unwrap()).unwrap();
+        let original = evaluate(&native);
+        assert_eq!(evaluate(&candidate), original);
+        let changed = array![[-2.0, 1.0], [0.5, 4.0]];
+        for p in [&mut candidate, &mut separate] {
+            p.replace_dense_parameter(1, device.upload(changed.view()).unwrap()).unwrap();
+            assert!(p.dense_mut(1).is_ok());
+        }
+        assert_ne!(evaluate(&candidate), original);
+        assert_eq!(evaluate(&candidate), evaluate(&separate));
+        assert_eq!(evaluate(&native), original);
+        assert!(Arc::ptr_eq(&native.operators[&(0, Role::Product)].held, &candidate.operators[&(0, Role::Product)].held));
+    }
+    #[test]
     fn value_sharing_preserves_native_f64_and_index_shifted_parameter_buffers() {
         let interface = Interface::native(2).unwrap();
         let values = array![[1.0 + 2.0_f64.powi(-40), 1.0], [0.0, 2.0]];

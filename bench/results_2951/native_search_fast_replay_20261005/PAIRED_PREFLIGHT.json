@@ -1,0 +1,19 @@
+{
+  "cached_seconds": 101.687158125,
+  "uncached_seconds": 394.361820667,
+  "speedup": 3.878187058607997,
+  "callbacks": 128,
+  "all_non_timing_report_fields_equal": true,
+  "excluded_report_fields": [
+    "native_codec_usage",
+    "seconds",
+    "settings_sha256"
+  ],
+  "scope": "Exact public structural-search initial-parent schedule, applied proposals and canonical replay on the main driver's controlled native graph. No model forward, fitting, KL, Local, heldout reading, or discovery evidence. All callbacks deliberately return an unmeasured sentinel, so callback_failures count inspection stops, not failed fits; no child is admitted and deeper-parent coverage is unknown. Identity-baseline error records are omitted and must not be read as measurements. preserve_native_places retain the main driver's controlled-node interpretation.",
+  "limitations": [
+    "Single sequential run per arm; concurrent machine activity was not controlled.",
+    "No model forward, fitting, intervention-response measurement, or mechanism discovery."
+  ],
+  "binary_sha256": "ce12282bf2f222cddaa2fd6505a7f15da4c7951face3ee50dd72b5263d127944",
+  "main_commit": "159619342af8fc924760296370179dc70118d2bc"
+}

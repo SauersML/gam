@@ -123,7 +123,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     f64::consts::LN_2,
-    io::Write,
+    io::{BufReader, Read, Write},
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
@@ -1346,16 +1346,32 @@ pub fn identity(export: &str, native: &OperatorProgram, explanation: &Explanatio
     }
 }
 
+/// Read only the length-delimited JSON header. Neither identity checks nor restoration need a
+/// second, checkpoint-sized byte buffer beside the posterior and its optimizer state.
+fn checkpoint_header<T: serde::de::DeserializeOwned>(path: &Path) -> Result<(T, BufReader<std::fs::File>, u64), String> {
+    let file = std::fs::File::open(path).map_err(error)?;
+    let file_bytes = file.metadata().map_err(error)?.len();
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut prefix = [0_u8; 8];
+    reader
+        .read_exact(&mut prefix)
+        .map_err(|e| if e.kind() == std::io::ErrorKind::UnexpectedEof { "a truncated checkpoint".to_string() } else { error(e) })?;
+    let header_bytes = u64::from_le_bytes(prefix);
+    let payload_start = header_bytes.checked_add(8).filter(|end| *end <= file_bytes).ok_or("a truncated checkpoint")?;
+    // `take` prevents a malformed JSON header from consuming binary coefficient bytes. JSON
+    // decoding allocates its actual fields, not the advertised header or payload byte count.
+    let header = serde_json::from_reader((&mut reader).take(header_bytes)).map_err(error)?;
+    Ok((header, reader, file_bytes - payload_start))
+}
+
 /// The checkpoint at `path`'s identity.
 fn checkpoint_identity(path: &Path) -> Result<Identity, String> {
     #[derive(Deserialize)]
     struct Header {
         identity: Identity,
     }
-    let bytes = std::fs::read(path).map_err(error)?;
-    let length = u64::from_le_bytes(bytes.get(..8).ok_or("a truncated checkpoint")?.try_into().map_err(error)?) as usize;
-    let header: Header = serde_json::from_slice(bytes.get(8..8 + length).ok_or("a truncated checkpoint")?)
-        .map_err(|e| format!("{}: a checkpoint without this fit's identity: {e}", path.display()))?;
+    let (header, _, _): (Header, _, _) =
+        checkpoint_header(path).map_err(|e| format!("{}: a checkpoint without this fit's identity: {e}", path.display()))?;
     Ok(header.identity)
 }
 
@@ -1366,6 +1382,10 @@ pub fn check_checkpoint(path: &Path, identity: &Identity) -> Result<(), String> 
         return Ok(());
     }
     let found = checkpoint_identity(path)?;
+    check_checkpoint_identity(path, &found, identity)
+}
+
+fn check_checkpoint_identity(path: &Path, found: &Identity, identity: &Identity) -> Result<(), String> {
     let differing: Vec<&str> = [
         ("export", found.export == identity.export),
         ("tokens", found.tokens == identity.tokens),
@@ -1382,6 +1402,31 @@ pub fn check_checkpoint(path: &Path, identity: &Identity) -> Result<(), String> 
     } else {
         Err(format!("{}: a checkpoint of another fit (its {} differ)", path.display(), differing.join(", ")))
     }
+}
+
+/// Six f64 arrays per operator: mean, log standard deviation, then their four Adam moments.
+fn checkpoint_payload_bytes(shapes: &[(usize, usize)]) -> Option<u64> {
+    shapes.iter().try_fold(0_u64, |total, &(rows, cols)| {
+        let cells = u64::try_from(rows).ok()?.checked_mul(u64::try_from(cols).ok()?)?;
+        total.checked_add(cells.checked_mul(6 * 8)?)
+    })
+}
+
+/// Decode in fixed-size byte tiles directly into the destination, including nonstandard array
+/// layouts. The wire order remains ndarray's logical iteration order used by the writer.
+fn read_checkpoint_array(reader: &mut impl Read, array: &mut Array2<f64>) -> Result<(), String> {
+    let mut bytes = [0_u8; 64 * 1024];
+    let mut remaining = array.len();
+    let mut values = array.iter_mut();
+    while remaining != 0 {
+        let count = remaining.min(bytes.len() / 8);
+        reader.read_exact(&mut bytes[..count * 8]).map_err(error)?;
+        for (value, encoded) in values.by_ref().take(count).zip(bytes[..count * 8].chunks_exact(8)) {
+            *value = f64::from_le_bytes(encoded.try_into().expect("eight bytes"));
+        }
+        remaining -= count;
+    }
+    Ok(())
 }
 
 /// Write the checkpoint atomically: the progress as JSON after its length, then every array's
@@ -1413,27 +1458,38 @@ fn save_checkpoint(path: &Path, progress: &Progress, posterior: &DevicePosterior
 /// Restore a checkpoint of this fit into `posterior`, with Adam's moments per operator, or refuse
 /// one of another fit.
 fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) -> Result<(Progress, Vec<[Array2<f64>; 4]>), String> {
-    let bytes = std::fs::read(path).map_err(error)?;
-    let length = u64::from_le_bytes(bytes.get(..8).ok_or("a truncated checkpoint")?.try_into().map_err(error)?) as usize;
-    let header = bytes.get(8..8 + length).ok_or("a truncated checkpoint")?;
-    check_checkpoint(path, &expected.identity)?;
-    let progress: Progress = serde_json::from_slice(header).map_err(error)?;
-    let same_settings = serde_json::to_value(&progress.settings).map_err(error)? == serde_json::to_value(&expected.settings).map_err(error)?;
-    if !same_settings || progress.tokens != expected.tokens || progress.shapes != expected.shapes || progress.active.len() != expected.active.len() {
+    let (progress, mut reader, payload_bytes): (Progress, _, _) = checkpoint_header(path)?;
+    check_checkpoint_identity(path, &progress.identity, &expected.identity)?;
+    let same_settings =
+        serde_json::to_value(&progress.settings).map_err(error)? == serde_json::to_value(&expected.settings).map_err(error)?;
+    if !same_settings
+        || progress.tokens != expected.tokens
+        || progress.shapes != expected.shapes
+        || progress.active.len() != expected.active.len()
+    {
         return Err(format!("{}: a checkpoint of another fit", path.display()));
     }
-    let count: usize = progress.shapes.iter().map(|(r, c)| r * c * 6).sum();
-    if bytes.len() - 8 - length != count * 8 {
+    if checkpoint_payload_bytes(&progress.shapes) != Some(payload_bytes)
+        || posterior.mean.len() != progress.shapes.len()
+        || posterior.log_sd.len() != progress.shapes.len()
+        || posterior.mean.iter().zip(&progress.shapes).any(|(array, shape)| array.dim() != *shape)
+        || posterior.log_sd.iter().zip(&progress.shapes).any(|(array, shape)| array.dim() != *shape)
+    {
         return Err(format!("{}: a checkpoint of the wrong size", path.display()));
     }
-    let mut values = bytes[8 + length..].chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().expect("eight bytes")));
     let mut moments = Vec::with_capacity(posterior.mean.len());
     for i in 0..posterior.mean.len() {
         let dim = posterior.mean[i].dim();
-        let mut next = || Array2::from_shape_simple_fn(dim, || values.next().expect("counted values"));
-        posterior.mean[i] = next();
-        posterior.log_sd[i] = next();
-        moments.push([next(), next(), next(), next()]);
+        read_checkpoint_array(&mut reader, &mut posterior.mean[i])?;
+        read_checkpoint_array(&mut reader, &mut posterior.log_sd[i])?;
+        let mut next = std::array::from_fn(|_| Array2::zeros(dim));
+        for array in &mut next {
+            read_checkpoint_array(&mut reader, array)?;
+        }
+        moments.push(next);
+    }
+    if reader.read(&mut [0_u8; 1]).map_err(error)? != 0 {
+        return Err(format!("{}: a checkpoint of the wrong size", path.display()));
     }
     posterior.active = progress.active.clone();
     Ok((progress, moments))
@@ -2266,6 +2322,146 @@ mod tests {
         assert!(divergences[1] > 0.0);
         let size: usize = group.cells.iter().map(|c| c.rows.len() * c.cols.len()).sum();
         assert!((posterior.costs()[0] - 0.5 * (size as f64).ln()).abs() < 1e-12, "its variance costs ½ ln |G|");
+    }
+
+    #[test]
+    fn checkpoint_array_decoding_is_tiled_and_preserves_logical_order_and_bits() {
+        let bits: Vec<u64> = (0..18_003)
+            .map(|i| match i % 4 {
+                0 => (-0.0_f64).to_bits(),
+                1 => f64::INFINITY.to_bits(),
+                2 => 0x7ff8_0000_0000_0123,
+                _ => (i as f64 / 7.0).to_bits(),
+            })
+            .collect();
+        let bytes: Vec<u8> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut reader = std::io::Cursor::new(&bytes);
+        let mut output = Array2::zeros((6001, 3)).reversed_axes();
+        assert!(!output.is_standard_layout());
+        read_checkpoint_array(&mut reader, &mut output).unwrap();
+        assert_eq!(reader.position(), bytes.len() as u64);
+        assert_eq!(output.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), bits);
+        assert!(read_checkpoint_array(&mut &bytes[..bytes.len() - 1], &mut output).is_err());
+    }
+
+    fn checkpoint_fixture() -> (Progress, Posterior, Vec<u8>) {
+        let shapes = vec![(2, 3), (0, 2), (3, 1)];
+        let posterior = Posterior {
+            mean: shapes.iter().map(|&dim| Array2::from_elem(dim, -7.0)).collect(),
+            log_sd: shapes.iter().map(|&dim| Array2::from_elem(dim, -8.0)).collect(),
+            active: vec![true, true],
+            membership: Vec::new(),
+            spans: Vec::new(),
+        };
+        let progress = Progress {
+            identity: Identity {
+                export: "export".into(),
+                tokens: "tokens".into(),
+                program: "program".into(),
+                groups: "groups".into(),
+                sharing: "sharing".into(),
+            },
+            settings: settings(),
+            tokens: 23,
+            shapes,
+            start: None,
+            epoch: 4,
+            step: 17,
+            epochs: Vec::new(),
+            removals: Vec::new(),
+            previous: Some(vec![1.0, 2.0]),
+            active: vec![false, true],
+            done: false,
+            seconds: 5.0,
+            training_seconds: 3.0,
+            evaluation_seconds: 2.0,
+            full_seconds: 1.0,
+        };
+        // The existing wire format: length-prefixed JSON, then six row-major f64 arrays per
+        // operator. This fixture is independent of the streaming decoder and requires no GPU.
+        let header = serde_json::to_vec(&progress).unwrap();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        for (i, &(rows, cols)) in progress.shapes.iter().enumerate() {
+            for field in 0..6 {
+                for cell in 0..rows * cols {
+                    bytes.extend(((100 * i + 10 * field + cell) as f64 + 0.25).to_le_bytes());
+                }
+            }
+        }
+        (progress, posterior, bytes)
+    }
+
+    #[test]
+    fn checkpoint_streaming_restores_the_legacy_payload_without_replacing_posterior_arrays() {
+        let (expected, mut posterior, bytes) = checkpoint_fixture();
+        let path = std::env::temp_dir().join(format!("library_checkpoint_stream_{}.bin", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let pointers: Vec<_> = posterior.mean.iter().chain(&posterior.log_sd).map(|array| array.as_ptr()).collect();
+        let (progress, moments) = load_checkpoint(&path, &expected, &mut posterior).unwrap();
+        assert_eq!(serde_json::to_value(&progress).unwrap(), serde_json::to_value(&expected).unwrap());
+        assert_eq!(posterior.active, expected.active);
+        assert_eq!(pointers, posterior.mean.iter().chain(&posterior.log_sd).map(|array| array.as_ptr()).collect::<Vec<_>>());
+        for i in 0..progress.shapes.len() {
+            for (field, array) in [&posterior.mean[i], &posterior.log_sd[i]].into_iter().chain(&moments[i]).enumerate() {
+                for (cell, value) in array.iter().enumerate() {
+                    assert_eq!(*value, (100 * i + 10 * field + cell) as f64 + 0.25);
+                }
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_streaming_refuses_truncation_trailing_bytes_and_overflow_before_mutating() {
+        let (expected, posterior, bytes) = checkpoint_fixture();
+        let path = std::env::temp_dir().join(format!("library_checkpoint_bad_{}.bin", std::process::id()));
+        let mut trailing = bytes.clone();
+        trailing.push(1);
+        let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        for broken in [
+            Vec::new(),
+            bytes[..7].to_vec(),
+            u64::MAX.to_le_bytes().to_vec(),
+            bytes[..8 + header_len - 1].to_vec(),
+            bytes[..bytes.len() - 1].to_vec(),
+            trailing,
+        ] {
+            std::fs::write(&path, broken).unwrap();
+            let mut unchanged = posterior.clone();
+            assert!(load_checkpoint(&path, &expected, &mut unchanged).is_err());
+            assert_eq!(unchanged.mean, posterior.mean);
+            assert_eq!(unchanged.log_sd, posterior.log_sd);
+            assert_eq!(unchanged.active, posterior.active);
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let mut other = expected.clone();
+        other.identity.groups.push('x');
+        let message = load_checkpoint(&path, &other, &mut posterior.clone()).unwrap_err();
+        assert!(message.contains("groups"), "{message}");
+        other = expected.clone();
+        other.tokens += 1;
+        assert!(load_checkpoint(&path, &other, &mut posterior.clone()).unwrap_err().contains("another fit"));
+        other = expected.clone();
+        other.settings.seed += 1;
+        assert!(load_checkpoint(&path, &other, &mut posterior.clone()).unwrap_err().contains("another fit"));
+        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)]), Some(9 * 48));
+        assert_eq!(checkpoint_payload_bytes(&[(usize::MAX, usize::MAX)]), None);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_identity_reads_a_bounded_prefix_without_loading_the_payload() {
+        let (expected, _, bytes) = checkpoint_fixture();
+        let path = std::env::temp_dir().join(format!("library_checkpoint_identity_{}.bin", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        // A sparse payload makes the bytes read observable independently of posterior size.
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(8 * 1024 * 1024).unwrap();
+        check_checkpoint(&path, &expected.identity).unwrap();
+        let (progress, mut reader, _): (Progress, _, _) = checkpoint_header(&path).unwrap();
+        assert_eq!(progress.identity, expected.identity);
+        assert!(std::io::Seek::stream_position(reader.get_mut()).unwrap() <= 64 * 1024);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

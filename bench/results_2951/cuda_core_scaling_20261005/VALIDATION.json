@@ -1,0 +1,22 @@
+{
+  "source_commit": "a21ff63db690da4c5a73f93ad4267901c54e61b4",
+  "mac": {
+    "library_tests": 227,
+    "driver_tests": 27,
+    "status": "passed"
+  },
+  "mats": {
+    "job": 16402,
+    "library_tests": 227,
+    "driver_tests": 27,
+    "inventory_build": "passed",
+    "status": "passed"
+  },
+  "gpu": "Throughput and larger-model jobs queued; no speedup claim.",
+  "changes": [
+    "Share inherited frozen device buffers; detach trainable owners.",
+    "Reuse exactly identical TRAIN/validation resident panels.",
+    "Read checkpoint headers and coefficient payloads through bounded buffers."
+  ],
+  "scope": "Memory reductions preserve objective, intervention semantics and saved checkpoint format. No claim of recovered mechanisms or demonstrated big-model scalability."
+}

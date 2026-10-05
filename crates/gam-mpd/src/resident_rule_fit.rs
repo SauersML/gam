@@ -131,6 +131,9 @@ pub struct GroupReport {
     pub trainable: Vec<usize>,
     pub training_rows: usize,
     pub validation_rows: usize,
+    /// True only when both input-slice and target references are identical to TRAIN.
+    /// Diagnostic scans still run; one resident panel supplies both roles.
+    pub validation_reuses_training_panel: bool,
     pub training_scales: Vec<GroupScale>,
     pub validation_scales: Vec<GroupScale>,
     pub initial_training_max: f64,
@@ -509,6 +512,8 @@ fn fitting_program(source: &OperatorProgram, widths: &[usize]) -> Result<Operato
 /// Batched smooth normalized squared-error proposal optimization. Complete TRAIN maximum
 /// scans alone select snapshots; validation never selects updates or snapshots. No claim that
 /// a minibatch smooth objective bounds the full-panel maximum. Legacy fit_grouped is unchanged.
+/// Identical TRAIN/validation references reuse resident storage; equal shapes or values alone
+/// never enable reuse. Both diagnostic validation scans and normalizations are preserved.
 pub fn fit_grouped_batched(
     d: &Device,
     source: &OperatorProgram,
@@ -570,6 +575,8 @@ fn fit_grouped_internal(
     output_groups(groups, output)?;
     let training_scales = panel_groups(train_inputs, train_y, &widths, groups)?;
     let validation_scales = panel_groups(valid_inputs, valid_y, &widths, groups)?;
+    let validation_reuses_training_panel = std::ptr::eq(train_inputs, valid_inputs)
+        && std::ptr::eq(train_y, valid_y);
     let unique: BTreeSet<_> = trainable.iter().copied().collect();
     if unique.len() != trainable.len() || trainable.is_empty() {
         return Err("empty/duplicate trainable indices".into());
@@ -598,14 +605,14 @@ fn fit_grouped_internal(
     let parameters = checked_bytes(parameter_elements)?;
     let input_elements = train_inputs
         .iter()
-        .chain(valid_inputs)
+        .chain(valid_inputs.iter().filter(|_| !validation_reuses_training_panel))
         .try_fold(0usize, |n, x| {
             n.checked_add(x.len()).ok_or("input panel size overflow")
         })?;
     let panels = checked_bytes(
         input_elements
             .checked_add(train_y.len())
-            .and_then(|n| n.checked_add(valid_y.len()))
+            .and_then(|n| n.checked_add(if validation_reuses_training_panel { 0 } else { valid_y.len() }))
             .ok_or("panel size overflow")?,
     )?;
     let max_rows = settings
@@ -656,7 +663,14 @@ fn fit_grouped_internal(
     }
     program.prepare_dense_parameters(trainable)?;
     let training = Panel::new_grouped(d, train_inputs, train_y, training_scales.clone())?;
-    let validation = Panel::new_grouped(d, valid_inputs, valid_y, validation_scales.clone())?;
+    // Use exactly the same identity condition as the numeric plan. Validation remains a
+    // separate diagnostic scan even when its immutable resident storage is shared.
+    let separate_validation = if validation_reuses_training_panel {
+        None
+    } else {
+        Some(Panel::new_grouped(d, valid_inputs, valid_y, validation_scales.clone())?)
+    };
+    let validation = separate_validation.as_ref().unwrap_or(&training);
     let mut moments: BTreeMap<usize, (Tensor, Tensor)> = trainable
         .iter()
         .map(|i| {
@@ -915,6 +929,7 @@ fn fit_grouped_internal(
             trainable: trainable.to_vec(),
             training_rows: train_y.nrows(),
             validation_rows: valid_y.nrows(),
+            validation_reuses_training_panel,
             training_scales,
             validation_scales,
             initial_training_max,
@@ -1131,6 +1146,83 @@ mod tests {
             backtracking: None,
         }
     }
+    #[test]
+    fn identical_panel_references_save_storage_without_changing_fit_or_diagnostics() {
+        let device = Device::host();
+        let source = model(0.6, 0.1);
+        let inputs = vec![ndarray::array![[-1.], [0.2], [0.8], [2.]]];
+        let targets = target(&model(1.2, -0.2), &inputs[0]);
+        let separate_inputs = inputs.clone();
+        let separate_targets = targets.clone();
+        let schedule = BatchSchedule {
+            ordinary_rows: 2, hard_rows: 1, scan_every: 2, temperature: 0.1,
+            objective: BatchObjective::GlobalSmoothMaximum,
+        };
+        let mut config = settings();
+        config.iterations = 4;
+        let run = |valid_inputs: &[Array2<f64>], valid_y: &Array2<f64>, config: Settings| {
+            fit_grouped_batched(&device, &source, &inputs, &targets, valid_inputs, valid_y,
+                &groups(), &[0, 1], config, schedule.clone())
+        };
+        let shared = run(&inputs, &targets, config.clone()).expect("shared TRAIN diagnostics");
+        let separate = run(&separate_inputs, &separate_targets, config.clone())
+            .expect("equal values in separately allocated validation");
+        assert!(shared.report.validation_reuses_training_panel);
+        assert!(!separate.report.validation_reuses_training_panel);
+        let panel_bytes = 8 * (inputs.iter().map(Array2::len).sum::<usize>() + targets.len());
+        assert_eq!(separate.report.planned_numeric_bytes - shared.report.planned_numeric_bytes,
+            panel_bytes, "the plan removes exactly one input/target panel");
+        for (left, right) in shared.program.operators.iter().zip(&separate.program.operators) {
+            assert_eq!(left.matrix(), right.matrix());
+        }
+        let diagnostics = |report: &GroupReport| {
+            let mut value = serde_json::to_value(report).expect("report");
+            let fields = value.as_object_mut().expect("report fields");
+            for field in ["seconds", "backtracking_seconds", "planned_numeric_bytes",
+                "validation_reuses_training_panel"] {
+                fields.remove(field);
+            }
+            value
+        };
+        assert_eq!(diagnostics(&shared.report), diagnostics(&separate.report),
+            "normalizations, scans, updates and snapshot selection must be unchanged");
+        config.numeric_bytes = shared.report.planned_numeric_bytes;
+        run(&inputs, &targets, config.clone()).expect("one-panel budget admits reuse");
+        let error = run(&separate_inputs, &separate_targets, config).err()
+            .expect("two panels must not fit the one-panel plan");
+        assert!(error.contains("resident fitter numeric plan"), "{error}");
+    }
+
+    #[test]
+    fn same_shape_validation_remains_distinct_if_either_reference_differs() {
+        let device = Device::host();
+        let source = model(0.6, 0.1);
+        let inputs = vec![ndarray::array![[-1.], [0.2], [0.8], [2.]]];
+        let targets = target(&model(1.2, -0.2), &inputs[0]);
+        let other_inputs = vec![inputs[0].mapv(|x| x + 0.5)];
+        let other_targets = targets.mapv(|y| y + 0.7);
+        let schedule = BatchSchedule {
+            ordinary_rows: 2, hard_rows: 1, scan_every: 2, temperature: 0.1,
+            objective: BatchObjective::GlobalSmoothMaximum,
+        };
+        let mut config = settings();
+        config.iterations = 2;
+        for (valid_inputs, valid_y) in [(&inputs, &other_targets), (&other_inputs, &targets)] {
+            let fit = fit_grouped_batched(&device, &source, &inputs, &targets,
+                valid_inputs, valid_y, &groups(), &[0, 1], config.clone(), schedule.clone())
+                .expect("distinct validation");
+            assert!(!fit.report.validation_reuses_training_panel);
+            let expected = measure_grouped(&device, &fit.program, valid_inputs, valid_y,
+                &groups(), config.numeric_bytes, config.forward_rows).expect("independent validation");
+            assert_eq!(serde_json::to_value(&fit.report.final_validation).unwrap(),
+                serde_json::to_value(&expected).unwrap());
+            let training = measure_grouped(&device, &fit.program, &inputs, &targets,
+                &groups(), config.numeric_bytes, config.forward_rows).expect("training measurement");
+            assert_ne!(fit.report.final_validation.maximum, training.maximum,
+                "same dimensions must never substitute TRAIN for distinct validation data");
+        }
+    }
+
     #[test]
     fn batch_realizable_generated_interior_teacher_fits_full_maps_and_shared_body() {
         use crate::composed_rule_search::{compile, Expr, Unary, UseSpec};
