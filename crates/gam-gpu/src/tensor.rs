@@ -2988,10 +2988,6 @@ fn philox(key: u64, stream: u64, index: u64) -> [u32; 4] {
     c
 }
 
-/// The standard normal draw `index` of `(key, stream)`: Box–Muller in f32 on the first two words of
-/// [`philox`], `√(−2 ln u₁) cos(2π u₂)` with `u₁ = (w₀ + ½) 2⁻³²` and `u₂ = w₁ 2⁻³²`. Every backend
-/// computes it alike (up to its f32 `log` and `cos`), so a draw is regenerated from its counter.
-#[must_use]
 /// Where [`Device::sample_terms`] places a sample's bfloat16 terms.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TermLayout {
@@ -3025,6 +3021,10 @@ fn bf16_terms(x: f32, count: usize) -> Vec<f64> {
         .collect()
 }
 
+/// The standard normal draw `index` of `(key, stream)`: Box–Muller in f32 on the first two words of
+/// `philox`, `√(−2 ln u₁) cos(2π u₂)` with `u₁ = (w₀ + ½) 2⁻³²` and `u₂ = w₁ 2⁻³²`. Every backend
+/// computes it alike (up to its f32 `log` and `cos`), so a draw is regenerated from its counter.
+#[must_use]
 pub fn posterior_normal(key: u64, stream: u64, index: u64) -> f32 {
     let w = philox(key, stream, index);
     let scale = 2.328_306_4e-10_f32;

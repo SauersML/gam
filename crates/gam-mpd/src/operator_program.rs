@@ -52,10 +52,9 @@
 //! # The code
 //!
 //! [`OperatorProgram::encode`] writes one self-delimiting message through `codec`'s integer codes
-//! and `precision`'s lattice codes, and [`OperatorProgram::decode`] reads it back given the
-//! [`Declarations`] (the contract's input domains and slots, which the decoder already knows and
-//! which are never sent). [`OperatorProgram::code_bits`] is the length
-//! of that message, computed without writing it, and a test holds the two equal. The message is:
+//! and `precision`'s lattice codes, and the decoder reads it back given the [`Declarations`] (the
+//! contract's input domains and slots, which the decoder already knows and which are never sent).
+//! The message is:
 //!
 //! 1. the counts `#bases + 1`, `#operators + 1`, `#nodes` in the prefix code;
 //! 2. each basis: its domain as a fixed index into the declared domains;
@@ -1121,8 +1120,7 @@ pub(crate) fn sparse_abt(x: &Array2<f64>, a: &Array2<f64>) -> Array2<f64> {
 /// `|e_box| ≤ bands` entrywise and `‖e_ball‖₂ ≤ balls` (one radius per row). The local rounding of
 /// each node stays entrywise (a box); an error that an operator carries forward from its input is
 /// propagated in `ℓ₂` through a proven spectral-norm bound of the operator (a ball), so it grows by
-/// the operator's norm, not by its row `ℓ₁` norms layer after layer. [`Trace::band`] is the
-/// enclosure as one box.
+/// the operator's norm, not by its row `ℓ₁` norms layer after layer.
 #[derive(Clone, Debug)]
 pub struct Trace {
     pub values: Vec<Array2<f64>>,
