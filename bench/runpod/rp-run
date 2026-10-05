@@ -5,12 +5,15 @@
 #   rp-run dev NAME [GPU_TYPE[,GPU_TYPE...] [HOURS]] [-- PATH...] a pod held for development
 #   rp-run adopt NAME POD_ID HOURS SSH_KEY                        put a pod made elsewhere under the runner
 #   rp-run extend NAME HOURS                                      extend a held pod's cap by HOURS
-#   rp-run stop NAME                                              delete a held pod now
+#   rp-run stop NAME                                              end a run or a held pod now
 #   rp-run batch SPEC                                             launch every run SPEC lists, at once
 #   rp-run status                                                 one line per running pod
 #
 # GPU_TYPE is a RunPod GPU id ("NVIDIA RTX A5000") or its display name ("RTX A5000"); a list gives
-# the types in order of preference. A run takes community cloud for every listed type before secure
+# the types in order of preference; auto ranks the cards of the benchmark table (gpu_bench.tsv) by
+# their measured $ per scored token at community prices, keeping those with RP_MIN_VRAM_GB of memory,
+# and prints the choice; cpu is a 32-vCPU CPU pod (with RP_MIN_RAM_GB of memory, at most 256), for
+# work that does not use a GPU, such as a float64 reference. A run takes community cloud for every listed type before secure
 # cloud, which it takes only when no community pod is in stock (RunPod no longer offers spot pods:
 # "Spot pods are no longer offered", 2026-10-05). It runs COMMAND on the source of a published
 # commit, the outputs come back, and the pod is deleted. HOURS (fractional) caps the run: the Mac
@@ -95,8 +98,18 @@
 # ~/mpd-data/runpod/NAME/console.log. The call returns once all are launched.
 #
 # Status: every pod running on the team account, one line each: pod, run NAME, who started it
-# (RP_OWNER=AGENT when the run was launched), GPU and cloud, $/h, hours up, $ so far, hours left to
-# its cap, and the last line of its run's log; then the account's spend and hourly rate.
+# (RP_OWNER=AGENT when the run was launched), GPU and cloud, $/h, the GPU's mean utilization over the
+# last 10 minutes, hours up, $ so far, hours left to its cap, flags (IDLE: GPU under 20%; FLAT: a
+# run's log unchanged for 15 minutes) and the last line of its run's log; then the account's spend,
+# its rate, the rate paid for GPUs under 20%, and the hours until the $150 cap at that rate.
+#
+# GPU pods never compile: the examples and test binaries (RP_TESTS="PACKAGE:TEST ...", run as
+# $MPD_BIN/test-TEST) a run needs and the cache lacks are built first on a 32-vCPU CPU pod, one build
+# per set of Rust sources at a time, and a command that compiles (cargo ...) runs only on a CPU pod.
+# A run whose GPU averages under 20% over 15 minutes once its command has run that long is stopped as
+# idle-stopped (dev and adopted pods are held, not stopped). rp-run stop NAME ends a run (its runner
+# deletes the pod and enters it in the ledger; a runner that does not end within a minute is killed
+# and the pod deleted) as it ends a held pod.
 #
 # SSH uses a key made for the run (deleted with it); ~/.ssh/runpod_ed25519.pub is also authorized,
 # for a look by hand. RP_DRY=1 prints the translation, uploads, builds, offers and the pod request,
@@ -120,10 +133,13 @@ CUDA_OK=$(jq -nc --arg t "$TOOLKIT" '["11.8","12.0","12.1","12.2","12.3","12.4",
 # A pod made outside the runner has no cap it knows; it is counted as running 4 h more, the default
 # cap of a dev pod.
 CAP_DOLLARS=150 START_BALANCE=750 UNCAPPED_HOURS=4
+# The benchmark table GPU_TYPE auto ranks cards by (gpu_bench_table.py's output for the latest
+# gpu_bench.sh runs).
+TABLE=$MAC_DATA/runpod/gpu_bench.tsv
 # Hosts (RunPod machine ids) whose pods did not come up or could not start CUDA.
 BAD_HOSTS=$MAC_DATA/runpod/bad_hosts
 # The runner's own files in the outputs directory: never synced from or restored to a pod.
-OWN=(run.log rp-run.log pod.json pod.txt build.log data.log watch.log cost.txt ssh rsh host STOP EXTEND)
+OWN=(run.log rp-run.log console.log pod.json pod.txt build.log data.log watch.log cost.txt ssh rsh host STOP EXTEND)
 # Never synced either: a file still being written (library_mdl writes NAME.partial, then renames it),
 # and library_mdl's cache of M's targets beside its checkpoint (tens of GB on Qwen3, rebuilt when
 # missing; moving it through the Mac's uplink would take longer than rebuilding it).
@@ -148,8 +164,9 @@ gql() { api POST "$GRAPHQL" "$(jq -nc --arg q "$1" '{query: $q}')"; }
 reap() {
     local pod=$1 rec=$ACTIVE/$1 r code tries=0 gone=0
     [ -f "$rec" ] || return 0
-    local name gpu cloud price created ended upload_s data_s wait_s
+    local name gpu cloud price created ended upload_s data_s wait_s end
     read -r name gpu cloud price created _ _ _ upload_s data_s wait_s < "$rec"
+    end=$(cat "$ACTIVE/.$pod.end" 2> /dev/null || echo deleted)
     gpu=${gpu//_/ }
     while (( tries < 20 )); do
         r=$(api DELETE "$REST/pods/$pod")
@@ -182,19 +199,22 @@ reap() {
         sleep 1
     done
     if [ -f "$rec" ]; then
-        [ -f "$LEDGER" ] || printf 'date\tname\tgpu\tcloud\thours\tdollars\tpod\tupload_s\tdata_s\twait_s\n' > "$LEDGER"
+        [ -f "$LEDGER" ] || printf 'date\tname\tgpu\tcloud\thours\tdollars\tpod\tupload_s\tdata_s\twait_s\tend\n' > "$LEDGER"
         # Seconds the pod spent on the inputs' upload, on building data from public sources, and
         # from its creation to the command's start (the two overlap each other and the build).
         head -n 1 "$LEDGER" | grep -q wait_s || sed -i '' '1s/$/\tupload_s\tdata_s\twait_s/' "$LEDGER"
+        # How the pod's run ended: exit N (its command's status), lost, stopped (rp-run stop),
+        # idle-stopped (under 20% GPU for 15 minutes), cap (its HOURS), or deleted (no run on it).
+        head -n 1 "$LEDGER" | grep -q $'\tend$' || sed -i '' '1s/$/\tend/' "$LEDGER"
         local hours dollars total line
         hours=$(awk -v a="$created" -v b="$ended" 'BEGIN { printf "%.4f", (b - a) / 3600 }')
         dollars=$(awk -v h="$hours" -v p="$price" 'BEGIN { printf "%.4f", h * p }')
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$name" "$gpu" "$cloud" "$hours" "$dollars" "$pod" "${upload_s:--}" "${data_s:--}" "${wait_s:--}" >> "$LEDGER"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$name" "$gpu" "$cloud" "$hours" "$dollars" "$pod" "${upload_s:--}" "${data_s:--}" "${wait_s:--}" "$end" >> "$LEDGER"
         total=$(awk -F'\t' 'NR > 1 { s += $6 } END { printf "%.2f", s }' "$LEDGER")
         line="pod $pod deleted (confirmed). $gpu ($cloud) at \$$price/h x $hours h = \$$dollars; ledger total \$$total"
         echo "rp-run: $line" >&2
         [ -d "$RP/$name" ] && echo "$(date '+%F %T') $line" >> "$RP/$name/cost.txt"
-        rm -f "$rec" "$ACTIVE/.$pod.deadline" "$ACTIVE/.$pod.owner"
+        rm -f "$rec" "$ACTIVE/.$pod.deadline" "$ACTIVE/.$pod.owner" "$ACTIVE/.$pod.ssh" "$ACTIVE/.$pod.end"
     fi
     rmdir "$RP/.ledger.lock"
 }
@@ -206,7 +226,10 @@ if [ "${1:-}" = --watch ]; then
     trap '' INT HUP
     due() { cat "$ACTIVE/.$pod.deadline" 2> /dev/null || echo "$deadline"; }
     while kill -0 "$parent" 2> /dev/null && [ -f "$ACTIVE/$pod" ] && (( $(date +%s) < $(due) )); do sleep 10; done
-    (( $(date +%s) >= $(due) )) && echo "rp-run: $pod reached its HOURS cap; deleting it" >&2
+    if (( $(date +%s) >= $(due) )); then
+        echo "rp-run: $pod reached its HOURS cap; deleting it" >&2
+        [ -f "$ACTIVE/.$pod.end" ] || echo cap > "$ACTIVE/.$pod.end"
+    fi
     reap "$pod"
     exit
 fi
@@ -271,28 +294,63 @@ case ${1:-} in
         [ $# -eq 1 ] || usage
         r=$(api GET "$REST/pods?includeMachine=true")
         [ "$(status_of "$r")" = 200 ] || { echo "rp-run: pod list failed: $(body_of "$r" | head -c 200)" >&2; exit 1; }
+        pods=$(jq -r '.[] | select(.desiredStatus == "RUNNING") | [.id, .name, (.costPerHr // 0), (.machine.gpuTypeId // .gpu.id // .cpuFlavorId // "?"), (.createdAt // ""), (.publicIp // "-"), (.portMappings["22"] // "-")] | @tsv' <<< "$(body_of "$r")")
         now=$(date +%s)
-        printf '%-15s %-22s %-10s %-24s %6s %6s %7s %6s  %s\n' POD NAME OWNER GPU '$/h' 'UP h' '$ SO FAR' 'LEFT h' 'LAST LOG LINE'
-        while IFS=$'\t' read -r id pname price gpu created; do
+        # Each held GPU pod's mean GPU utilization over the last 10 minutes, read from its own samples
+        # through its runner's SSH key, all pods at once. A pod held by a runner from before the
+        # samples (no .ssh record) is read now, over 5 s, with whichever run key reaches it ("*").
+        utils=$(mktemp -d)
+        while IFS=$'\t' read -r id _ _ _ _ pip pport; do
+            [ -n "$id" ] && [ -f "$ACTIVE/$id" ] || continue
+            if [ -f "$ACTIVE/.$id.ssh" ]; then
+                read -r ip port tmp < "$ACTIVE/.$id.ssh"
+                ssh -F none -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$tmp/known_hosts" -o StrictHostKeyChecking=accept-new \
+                    -o ConnectTimeout=8 -o LogLevel=ERROR -p "$port" "root@$ip" \
+                    "awk -v t=\$(( \$(date +%s) - 600 )) '\$1 >= t && NF == 2 { s += \$2; n++ } END { if (n) printf \"%d\", s / n }' /workspace/gpu-util.log 2> /dev/null" \
+                    > "$utils/$id" 2> /dev/null < /dev/null &
+            elif [ "$pip" != - ] && [ "$pport" != - ]; then
+                (
+                    for key in /tmp/rp-run.*/key; do
+                        u=$(ssh -F none -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
+                            -o ConnectTimeout=5 -o LogLevel=ERROR -p "$pport" "root@$pip" \
+                            'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -l 1 & p=$!; sleep 5; kill $p' 2> /dev/null < /dev/null |
+                            awk '{ s += $1; n++ } END { if (n) printf "%d*", s / n }') && [ -n "$u" ] && { echo "$u"; break; }
+                    done > "$utils/$id"
+                ) &
+            fi
+        done <<< "$pods"
+        wait
+        printf '%-15s %-22s %-9s %-22s %6s %5s %5s %7s %6s %-9s %s\n' POD NAME OWNER GPU '$/h' 'GPU%' 'UP h' '$ SO FAR' 'LEFT h' FLAG 'LAST LOG LINE'
+        idle_rate=0
+        while IFS=$'\t' read -r id pname price gpu created _; do
             [ -n "$id" ] || continue
-            rec=$ACTIVE/$id name=${pname#mpd2951-} owner="not rp-run" kind="" left=- last=""
+            rec=$ACTIVE/$id name=${pname#mpd2951-} owner="not rp-run" kind="" mode="" left=- last="" flag="" util=$(cat "$utils/$id" 2> /dev/null || true)
             if [ -f "$rec" ]; then
-                read -r name _ kind _ c _ < "$rec"
+                read -r name _ kind _ c _ _ mode _ < "$rec"
                 owner=$(cat "$ACTIVE/.$id.owner" 2> /dev/null || echo -)
                 [ -f "$ACTIVE/.$id.deadline" ] && left=$(awk -v d="$(cat "$ACTIVE/.$id.deadline")" -v n="$now" 'BEGIN { printf "%.1f", (d - n) / 3600 }')
                 for f in "$RP/$name/run.log" "$RP/$name/rp-run.log"; do
-                    last=$(grep -v '^[[:space:]]*$' "$f" 2> /dev/null | tail -n 1 | cut -c1-100 || true)
+                    last=$(grep -v '^[[:space:]]*$' "$f" 2> /dev/null | tail -n 1 | cut -c1-90 || true)
                     [ -n "$last" ] && break
                 done
+                # A run whose log has not grown for 15 minutes (a dev pod's has no command).
+                if [ "${mode:-run}" = run ] && [ -f "$RP/$name/run.log" ] && (( now - $(stat -f %m "$RP/$name/run.log") > 900 )); then flag+="FLAT "; fi
+            fi
+            if [ "${kind%%:*}" != CPU ] && [ -n "$util" ] && (( ${util%\*} < 20 )); then
+                flag+="IDLE "
+                idle_rate=$(awk -v a="$idle_rate" -v p="$price" 'BEGIN { print a + p }')
             fi
             # The pod's own creation time, which the account bills from.
             start=$(date -j -u -f '%Y-%m-%d %H:%M:%S' "${created:0:19}" +%s 2> /dev/null || echo "$now")
             up=$(awk -v a="$start" -v n="$now" 'BEGIN { printf "%.2f", (n - a) / 3600 }')
-            printf '%-15s %-22s %-10s %-24s %6s %6s %7s %6s  %s\n' "$id" "${name:0:22}" "${owner:0:10}" "$(cut -c1-24 <<< "${gpu#NVIDIA } ${kind%%:*}")" "$price" "$up" \
-                "$(awk -v p="$price" -v u="$up" 'BEGIN { printf "%.2f", p * u }')" "$left" "$last"
-        done < <(jq -r '.[] | select(.desiredStatus == "RUNNING") | [.id, .name, (.costPerHr // 0), (.machine.gpuTypeId // .gpu.id // "?"), (.createdAt // "")] | @tsv' <<< "$(body_of "$r")")
+            printf '%-15s %-22s %-9s %-22s %6s %5s %5s %7s %6s %-9s %s\n' "$id" "${name:0:22}" "${owner:0:9}" "$(cut -c1-22 <<< "${gpu#NVIDIA } ${kind%%:*}")" "$price" "${util:--}" "$up" \
+                "$(awk -v p="$price" -v u="$up" 'BEGIN { printf "%.2f", p * u }')" "$left" "${flag:--}" "$last"
+        done <<< "$pods"
+        rm -rf "$utils"
         r=$(gql 'query { myself { clientBalance currentSpendPerHr } }')
-        jq -r --arg s "$START_BALANCE" '.data.myself | "account: $\(($s | tonumber) - .clientBalance | . * 100 | round / 100) spent since $\($s), $\(.currentSpendPerHr)/h now"' <<< "$(body_of "$r")"
+        jq -r --arg s "$START_BALANCE" --arg c "$CAP_DOLLARS" --arg idle "$idle_rate" '.data.myself
+            | (($s | tonumber) - .clientBalance) as $spent
+            | "account: $\($spent * 100 | round / 100) spent since $\($s), $\(.currentSpendPerHr)/h now ($\($idle | tonumber * 100 | round / 100)/h on GPUs under 20%); at this rate the $\($c) cap is \(if .currentSpendPerHr > 0 then ((($c | tonumber) - $spent) / .currentSpendPerHr * 10 | round / 10 | tostring) + " h" else "never" end) away"' <<< "$(body_of "$r")"
         exit 0 ;;
     batch)
         [ $# -eq 2 ] && [ -f "$2" ] || usage
@@ -330,15 +388,25 @@ for line in open(sys.argv[1]):
         [ $# -eq 2 ] || usage
         h=$(held "$2") || { echo "rp-run: no pod held for $2" >&2; exit 2; }
         read -r pod _ owner <<< "$h"
+        echo stopped > "$ACTIVE/.$pod.end"
         if kill -0 "$owner" 2> /dev/null; then
+            # A held pod's holder sees STOP within seconds; a run's runner ends on TERM (its exit
+            # deletes the pod and enters it in the ledger); a runner that does not end within a
+            # minute is killed and the pod deleted here.
             touch "$RP/$2/STOP"
-            # A holder still setting the pod up does not see STOP: its exit deletes the pod.
-            for i in $(seq 15); do [ -f "$ACTIVE/$pod" ] || break; sleep 2; done
+            for i in $(seq 10); do [ -f "$ACTIVE/$pod" ] || break; sleep 1; done
             [ ! -f "$ACTIVE/$pod" ] || kill -TERM "$owner" 2> /dev/null || true
-            while [ -f "$ACTIVE/$pod" ]; do sleep 2; done
+            for i in $(seq 60); do [ -f "$ACTIVE/$pod" ] || break; sleep 1; done
+            if [ -f "$ACTIVE/$pod" ]; then
+                echo "rp-run: the runner of $2 (process $owner) did not end; killing it and deleting pod $pod" >&2
+                kill -KILL "$owner" 2> /dev/null || true
+                reap "$pod"
+            fi
         else
             reap "$pod"
         fi
+        rm -f "$RP/$2/STOP"
+        echo "rp-run: $2 stopped; pod $pod deleted ($(grep "$pod" "$LEDGER" | tail -n 1 | cut -f5,6 | awk '{ printf "%s h, $%s", $1, $2 }'))" >&2
         exit 0 ;;
     extend)
         [ $# -eq 3 ] || usage
@@ -377,11 +445,49 @@ OUT=$RP/$NAME
 
 # The offers, one per line "KIND|PRICE|GPU id": a run takes community for every type before secure;
 # a dev pod takes the types in order, community before secure for each.
-OFFERS=""
-if [ "$MODE" != adopt ]; then
-    r=$(gql 'query { gpuTypes { id displayName securePrice communityPrice } }')
+OFFERS="" COMPUTE=GPU
+if [ "$GPU" = cpu ]; then
+    # A CPU pod: 32 vCPUs of the flavor with the least memory per vCPU that holds RP_MIN_RAM_GB
+    # (2, 4 or 8 GB per vCPU). Its price is known once it exists; until then it is estimated from
+    # the compute flavor's $0.96/h (measured 2026-10-05), in proportion to memory.
+    COMPUTE=CPU
+    flavor=cpu3c mult=2
+    (( ${RP_MIN_RAM_GB:-0} > 64 )) && flavor=cpu3g mult=4
+    (( ${RP_MIN_RAM_GB:-0} > 128 )) && flavor=cpu3m mult=8
+    (( ${RP_MIN_RAM_GB:-0} <= 256 )) || { echo "rp-run: no CPU pod holds ${RP_MIN_RAM_GB} GB" >&2; exit 2; }
+    OFFERS="CPU|$(awk -v m="$mult" 'BEGIN { printf "%.2f", 0.96 * m / 2 }')|$flavor"
+elif [ "$MODE" != adopt ]; then
+    r=$(gql 'query { gpuTypes { id displayName memoryInGb securePrice communityPrice } }')
     [ "$(status_of "$r")" = 200 ] || { echo "rp-run: price query failed: $(body_of "$r" | head -c 300)" >&2; exit 1; }
     prices=$(body_of "$r")
+    if [ "$GPU" = auto ]; then
+        # Every offer (card and cloud) of the measured cards with the memory the run asks
+        # (RP_MIN_VRAM_GB), cheapest per scored token first, community before secure at equal cost:
+        # on the Qwen3-0.6B step when the run needs more than 24 GB, else vpd4l's bf16 step at 32
+        # sequences. A secure offer comes before a community one only when it costs less per token
+        # (a secure RTX 4090 before a community L40S). Cards the table has not measured are offered
+        # only when no measured card has the memory, cheapest per hour first.
+        [ -f "$TABLE" ] || { echo "rp-run: GPU_TYPE auto needs the benchmark table $TABLE" >&2; exit 2; }
+        metric="vpd4l bf16 s32 tok/s"
+        (( ${RP_MIN_VRAM_GB:-0} > 24 )) && metric="qwen3 bf16 s8 tok/s"
+        OFFERS=$(awk -F'\t' -v m="$metric" 'NR == 1 { for (i = 1; i <= NF; i++) { if ($i == "card") c = i; if ($i == m) t = i }; next }
+                 t && $t != "-" && $t + 0 > 0 { print $c "\t" $t }' "$TABLE" |
+            jq -Rrs --argjson types "$(jq -c '.data.gpuTypes' <<< "$prices")" --argjson need "${RP_MIN_VRAM_GB:-0}" '
+                (split("\n") | map(select(length > 0) | split("\t") | {id: .[0], rate: (.[1] | tonumber)})) as $measured
+                | ($types | map({key: .id, value: .}) | from_entries) as $byid
+                | def offers($t): [{k: "COMMUNITY", c: 0, p: $t.communityPrice}, {k: "SECURE:cheapest-per-token", c: 1, p: $t.securePrice}] | map(select((.p // 0) > 0));
+                  [$measured[] | select($byid[.id] != null) | .rate as $r | $byid[.id] as $t | select(($t.memoryInGb // 0) >= $need)
+                   | offers($t)[] | . + {g: $t.id, per: (.p / ($r * 3600 / 1e6))}]
+                | if length > 0 then sort_by([.per, .c])
+                  else [$types[] | select((.memoryInGb // 0) >= $need) | select(.id | test("A40|A6000|L40|A100|H100|H200"))
+                        | . as $t | offers($t)[] | . + {g: $t.id, per: null}] | sort_by([.c, .p]) end
+                | .[] | "\(.k)|\(.p)|\(.g)|\(.per // "-")"')
+        [ -n "$OFFERS" ] || { echo "rp-run: no card has ${RP_MIN_VRAM_GB:-0} GB" >&2; exit 2; }
+        echo "rp-run: auto, cheapest per scored token on the $metric workload (from $TABLE):" >&2
+        awk -F'|' '{ printf "rp-run:   %s %s $%s/h, %s\n", $3, $1, $2, ($4 == "-" ? "not measured" : sprintf("$%.4f per million scored tokens", $4)) }' <<< "$OFFERS" >&2
+        OFFERS=$(cut -d'|' -f1-3 <<< "$OFFERS")
+        GPU=$(cut -d'|' -f3 <<< "$OFFERS" | awk '!seen[$0]++' | paste -sd, -)
+    else
     rows=()
     IFS=, read -r -a types <<< "$GPU"
     for g in "${types[@]}"; do
@@ -399,6 +505,7 @@ if [ "$MODE" != adopt ]; then
         | (if $mode == "dev" then sort_by([.i, .c]) else sort_by([.c, .i]) end)
         | .[] | "\(.k)|\(.p)|\(.g)"')
     [ -n "$OFFERS" ] || { echo "rp-run: RunPod offers none of $GPU" >&2; exit 2; }
+    fi
 fi
 
 if [ "$MODE" = adopt ]; then
@@ -456,7 +563,13 @@ if [ "$MODE" = run ] && [ "$1" = cargo ] && [ "${2:-}" = run ]; then
 fi
 NEED_RUST=0
 [ "$MODE" = dev ] && NEED_RUST=1
-[ "$MODE" = run ] && [ "$1" = cargo ] && NEED_RUST=1
+if [ "$MODE" = run ] && [ "$1" = cargo ]; then
+    [ "$COMPUTE" = CPU ] || { echo "rp-run: a GPU pod does not compile: name test binaries in RP_TESTS=PACKAGE:TEST and run \$MPD_BIN/test-TEST" >&2; exit 2; }
+    NEED_RUST=1
+fi
+# Test binaries the command runs through $MPD_BIN (test-NAME), built like the examples.
+read -r -a tests <<< "${RP_TESTS:-}"
+for x in "${tests[@]}"; do [[ $x =~ ^[A-Za-z0-9_-]+:[A-Za-z0-9_]+$ ]] || { echo "rp-run: RP_TESTS takes PACKAGE:TEST words, not $x" >&2; exit 2; }; done
 
 uploads=() hf=() srcpaths=() examples=() words=() fineweb=() pile=()
 [ -z "$C" ] || ! git -C "$MAC_GAM" cat-file -e "$C:bench/runpod" 2> /dev/null || srcpaths+=(bench/runpod)
@@ -612,8 +725,16 @@ if [ -n "${RP_DISK_GB:-}" ]; then
 fi
 
 # The pod deletes itself at the run's deadline by its own clock, then starts as the image would.
-create_body() {  # CLOUD GPU_ID SECONDS_LEFT PUBLIC_KEYS
+create_body() {  # CLOUD GPU_ID SECONDS_LEFT PUBLIC_KEYS (CLOUD CPU: GPU_ID is the CPU flavor)
     local start="(echo \$BASHPID > /rp-watchdog.pid; sleep $3; runpodctl remove pod \"\$RUNPOD_POD_ID\" || runpodctl pod delete \"\$RUNPOD_POD_ID\") > /rp-watchdog.log 2>&1 & exec /start.sh"
+    if [ "$1" = CPU ]; then
+        jq -nc --arg name "mpd2951-${POD_NAME:-$NAME}" --arg image "$IMAGE" --arg flavor "$2" --arg keys "$4" \
+            --argjson disk "$DISK" --arg start "$start" \
+            '{name: $name, imageName: $image, computeType: "CPU", cpuFlavorIds: [$flavor], vcpuCount: 32,
+              containerDiskInGb: $disk, ports: ["22/tcp"], supportPublicIp: true,
+              env: {PUBLIC_KEY: $keys}, dockerStartCmd: ["bash", "-c", $start]}'
+        return
+    fi
     # Rust builds and the host half of a step want more than the default 2 vCPUs and 8 GB per GPU.
     jq -nc --arg name "mpd2951-$NAME" --arg image "$IMAGE" --arg gpu "$2" --arg cloud "${1%%:*}" \
         --arg keys "$4" --argjson disk "$DISK" --arg start "$start" --argjson cuda "$CUDA_OK" --argjson ram "${RP_MIN_RAM_GB:-32}" \
@@ -639,7 +760,8 @@ if [ -n "${RP_DRY:-}" ]; then
              for e in "${pile_plan[@]}"; do read -r x b m <<< "$e"; printf 'engine/%s (from %s and %s Pile train rows) ' "$x" "$b" "$m"; done )
     echo "built:    ${built:-none}"
     echo "source:   crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md ${srcpaths[*]:-}"
-    echo "examples: $(for x in "${examples[@]}"; do printf '%s (%s, %s) ' "$x" "${package_of[$x]}" "$( [ -x "$CACHE/$x" ] && echo cached || echo built)"; done) rust ${CHANNEL:-none}"
+    echo "examples: $(for x in "${examples[@]}"; do printf '%s (%s, %s) ' "$x" "${package_of[$x]}" "$( [ -x "$CACHE/$x" ] && echo cached || echo "to build on a CPU pod")"; done) rust ${CHANNEL:-none}"
+    echo "tests:    $(for x in "${tests[@]}"; do printf 'test-%s (%s, %s) ' "${x#*:}" "${x%%:*}" "$( [ -x "$CACHE/test-${x#*:}" ] && echo cached || echo "to build on a CPU pod")"; done)"
     echo "command:  ${cmd:-none}"
     [ "$MODE" = adopt ] || echo "request:  $(IFS='|' read -r k p g <<< "$(head -n 1 <<< "$OFFERS")"; create_body "$k" "$g" "$CAP_SECONDS" '<run key> <~/.ssh/runpod_ed25519.pub>')"
     exit 0
@@ -671,6 +793,11 @@ finish() {
     trap - EXIT INT TERM HUP
     set +e
     [ -n "$SYNC" ] && kill $SYNC 2> /dev/null
+    # The log stream, the idle check and other helpers end with the run.
+    kill $(jobs -p) 2> /dev/null
+    if [ -n "$POD" ] && [ ! -f "$ACTIVE/.$POD.end" ]; then
+        if [ -f "$OUT/STOP" ]; then echo stopped; elif [ -n "${RC:-}" ]; then echo "exit $RC"; else echo "exit $rc"; fi > "$ACTIVE/.$POD.end"
+    fi
     if [ -n "$IP" ]; then on_pod -O exit > /dev/null 2>&1; fi
     if [ -z "$POD" ] && (( ATTEMPTED )); then
         # A create that failed on the way back (a timeout) may still have made the pod.
@@ -789,7 +916,7 @@ launch() {
             say "host $host recorded as failing; deleting pod $POD"
         elif ! on_pod 'kill -0 "$(cat /rp-watchdog.pid)" && command -v runpodctl > /dev/null' < /dev/null; then
             say "the pod's own deletion timer is not running (no runpodctl or watchdog); deleting pod $POD"
-        elif ! on_pod 'python3 -c "import torch; torch.ones(1, device=\"cuda\").sum().item()"' < /dev/null > /dev/null 2>&1; then
+        elif [ "$kind" != CPU ] && ! on_pod 'python3 -c "import torch; torch.ones(1, device=\"cuda\").sum().item()"' < /dev/null > /dev/null 2>&1; then
             echo "$host" >> "$BAD_HOSTS"
             say "CUDA does not initialize on host $host ($(on_pod 'nvidia-smi --query-gpu=driver_version --format=csv,noheader' < /dev/null 2> /dev/null)); recorded as failing; deleting pod $POD"
         else
@@ -805,7 +932,15 @@ launch() {
         sleep 60
     fi
     done
+    # How status and the idle check reach the pod.
+    echo "$IP $PORT $TMP" > "$ACTIVE/.$POD.ssh"
+    if [ "$COMPUTE" = CPU ]; then
+        on_pod 'echo "CPU pod, $(nproc) vCPUs, $(free -g | awk "/Mem/ { print \$2 }") GB"' < /dev/null | sed "s/^/$POD /" | tee -a "$OUT/pod.txt" >&2
+        return 0
+    fi
     on_pod 'nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader; nvidia-smi | grep -o "CUDA Version: [0-9.]*"' < /dev/null | paste -sd ' ' - | sed "s/^/$POD /; s/\$/, $VCPU vCPUs/" | tee -a "$OUT/pod.txt" >&2
+    # The GPU's utilization every 10 s ("seconds percent"), for status and the idle check.
+    on_pod 'setsid nohup bash -c "while :; do echo \"\$(date +%s) \$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -n 1)\"; sleep 10; done" >> /workspace/gpu-util.log 2>&1 < /dev/null &' < /dev/null || true
 }
 
 # (Re)arms the pod's own deletion timer: the pod deletes itself SECONDS from now. The old timer's
@@ -1012,6 +1147,87 @@ note_times() {
     printf '%s %s %s %s %s %s %s %s %s %s %s\n' "$n" "$g" "$k" "$p" "$c" "$o" "$e" "$m" "$up" "$data" "$(( $(date +%s) - CREATED ))" > "$rec"
 }
 
+# Builds examples and test binaries ("test:PACKAGE:NAME") on the current pod from /workspace/src,
+# into /workspace/bin (a test as test-NAME) and the cache. A build error ends the run; a lost
+# connection returns 1.
+compile_on_pod() {
+    local x pkg flags name ex=() ts=() made=()
+    for x; do case $x in test:*) ts+=("${x#test:}") ;; *) ex+=("$x") ;; esac; done
+    for pkg in $(for x in "${ex[@]}"; do echo "${package_of[$x]}"; done | sort -u); do
+        flags=""
+        for x in "${ex[@]}"; do [ "${package_of[$x]}" = "$pkg" ] && flags+=" --example $x"; done
+        say "building$flags (-p $pkg) at ${C:0:12} with ${VCPU:-all} jobs"
+        on_pod "source ~/.cargo/env && cd /workspace/src && cargo build -q --release ${VCPU:+-j $VCPU} -p $pkg$flags" 2>&1 | tee -a "$OUT/build.log" >&2
+        case ${PIPESTATUS[0]} in
+            0) ;;
+            255) return 1 ;;
+            *) say "the build failed (build.log)"; exit 1 ;;
+        esac
+    done
+    if [ ${#ex[@]} -gt 0 ]; then
+        on_pod "cd /workspace/src/target/release/examples && cp ${ex[*]} /workspace/bin/" || return 1
+        made+=("${ex[@]}")
+    fi
+    for x in "${ts[@]}"; do
+        pkg=${x%%:*} name=${x#*:}
+        say "building test $name (-p $pkg) at ${C:0:12}"
+        # The test executable cargo reports for the target, copied as test-NAME.
+        on_pod "source ~/.cargo/env && cd /workspace/src && cargo test -q -p $pkg --test $name --no-run --message-format=json ${VCPU:+-j $VCPU} 2>> /workspace/build.log |
+            python3 -c 'import json, sys; [print(m[\"executable\"]) for m in map(json.loads, sys.stdin) if m.get(\"reason\") == \"compiler-artifact\" and m.get(\"executable\") and m[\"target\"][\"name\"] == sys.argv[1]]' $name |
+            tail -n 1 | xargs -r -I{} cp {} /workspace/bin/test-$name && [ -x /workspace/bin/test-$name ]"
+        case $? in
+            0) made+=("test-$name") ;;
+            255) return 1 ;;
+            *) on_pod 'tail -n 30 /workspace/build.log' >> "$OUT/build.log" 2>&1; say "the test build failed (build.log)"; exit 1 ;;
+        esac
+    done
+    mkdir -p "$CACHE"
+    on_pod "tar -C /workspace/bin -cf - ${made[*]} | gzip -1" | gzip -dc | tar -x -C "$CACHE" || return 1
+    say "built and cached ${made[*]} ($KEY)"
+}
+
+# The build server: a GPU run's binaries come from the cache, and what the cache lacks is built
+# first on a CPU pod (32 vCPUs, about $0.96/h), never on a GPU pod, whose GPU would idle while it
+# compiles. One build per set of Rust sources (KEY) at a time: a run that finds another building
+# them waits for that build, then takes what it made.
+build_binaries() {
+    [ "$COMPUTE" = GPU ] || return 0
+    local need=() x holder saved_offers=$OFFERS saved_deadline=$DEADLINE saved_disk=$DISK
+    missing() {
+        need=()
+        for x in "${examples[@]}"; do [ -x "$CACHE/$x" ] || need+=("$x"); done
+        for x in "${tests[@]}"; do [ -x "$CACHE/test-${x#*:}" ] || need+=("test:$x"); done
+    }
+    missing
+    [ ${#need[@]} -gt 0 ] || return 0
+    mkdir -p "$RP/_bin"
+    until mkdir "$CACHE.lock" 2> /dev/null; do
+        holder=$(cat "$CACHE.lock/pid" 2> /dev/null || echo 0)
+        if ! kill -0 "$holder" 2> /dev/null; then rm -rf "$CACHE.lock"; continue; fi
+        say "waiting for run $(cat "$CACHE.lock/name" 2> /dev/null) to finish building $KEY's binaries"
+        sleep 15
+    done
+    echo $$ > "$CACHE.lock/pid"
+    echo "$NAME" > "$CACHE.lock/name"
+    missing
+    if [ ${#need[@]} -gt 0 ]; then
+        say "building ${need[*]} on a CPU pod"
+        OFFERS="CPU|0.96|cpu3c" DEADLINE=$(( $(date +%s) + 3600 )) DISK=60 COMPUTE=CPU POD_NAME=build-${KEY}
+        launch || { rm -rf "$CACHE.lock"; exit 1; }
+        git -C "$MAC_GAM" archive "$C" crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md |
+            gzip -1 | on_pod 'mkdir -p /workspace/src /workspace/bin && gzip -dc | tar -x -C /workspace/src' || { rm -rf "$CACHE.lock"; exit 1; }
+        on_pod "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain $CHANNEL" > /dev/null ||
+            { rm -rf "$CACHE.lock"; exit 1; }
+        compile_on_pod "${need[@]}" || { rm -rf "$CACHE.lock"; exit 1; }
+        echo built > "$ACTIVE/.$POD.end"
+        on_pod -O exit > /dev/null 2>&1 || true
+        reap "$POD" || exit 1
+        POD="" IP="" PORT="" VCPU="" POD_NAME=""
+        OFFERS=$saved_offers DEADLINE=$saved_deadline DISK=$saved_disk COMPUTE=GPU
+    fi
+    rm -rf "$CACHE.lock"
+}
+
 # The source, binaries, inputs, data, models and the outputs synced so far, on the current pod.
 setup() {
     local started=$(date +%s) x pkg flags build=() cached=() jobs=()
@@ -1029,6 +1245,13 @@ setup() {
     for x in "${examples[@]}"; do
         if [ -x "$CACHE/$x" ]; then cached+=("$x"); else build+=("$x"); fi
     done
+    for x in "${tests[@]}"; do
+        if [ -x "$CACHE/test-${x#*:}" ]; then cached+=("test-${x#*:}"); else build+=("test:$x"); fi
+    done
+    if [ ${#build[@]} -gt 0 ] && [ "$COMPUTE" = GPU ] && [ "$MODE" = run ]; then
+        say "${build[*]} not built: a GPU pod does not compile (build_binaries builds on a CPU pod first)"
+        exit 1
+    fi
     if (( NEED_RUST )) || [ ${#build[@]} -gt 0 ]; then
         on_pod "[ -x ~/.cargo/bin/cargo ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain $CHANNEL" > /dev/null || return 1
     fi
@@ -1037,21 +1260,7 @@ setup() {
         say "${cached[*]} from the cache ($KEY)"
     fi
     if [ ${#build[@]} -gt 0 ]; then
-        for pkg in $(for x in "${build[@]}"; do echo "${package_of[$x]}"; done | sort -u); do
-            flags=""
-            for x in "${build[@]}"; do [ "${package_of[$x]}" = "$pkg" ] && flags+=" --example $x"; done
-            say "building$flags (-p $pkg) at ${C:0:12} with ${VCPU:-all} jobs"
-            on_pod "source ~/.cargo/env && cd /workspace/src && cargo build -q --release ${VCPU:+-j $VCPU} -p $pkg$flags" 2>&1 | tee -a "$OUT/build.log" >&2
-            case ${PIPESTATUS[0]} in
-                0) ;;
-                255) return 1 ;;
-                *) say "the build failed (build.log)"; exit 1 ;;
-            esac
-        done
-        on_pod "cd /workspace/src/target/release/examples && cp ${build[*]} /workspace/bin/" || return 1
-        mkdir -p "$CACHE"
-        on_pod "tar -C /workspace/bin -cf - ${build[*]} | gzip -1" | gzip -dc | tar -x -C "$CACHE" || return 1
-        say "built and cached ${build[*]} ($KEY)"
+        compile_on_pod "${build[@]}" || return 1
     fi
     local failed=0
     for x in "${jobs[@]}"; do wait "$x" || failed=1; done
@@ -1081,7 +1290,9 @@ setup() {
         times=$(cd "$OUT" && find . -type f $(printf '! -name %s ' "${OWN[@]}") -exec stat -f %m {} + | sort -n)
         send=$(( kb / 1536 ))
         work=$(( $(tail -n 1 <<< "$times") - ${FIRST_START:-$(head -n 1 <<< "$times")} ))
-        if (( send < work )); then
+        if (( kb == 0 )); then
+            :
+        elif (( send < work )); then
             rsync -a "${RSYNC_EXCLUDE[@]}" -e "${SSH[*]} -o ControlPath=none -p $PORT" "$OUT/" "root@$IP:/workspace/mpd-data/runpod/$NAME/" || return 1
             say "restored the outputs synced so far ($(( kb / 1024 )) MB, about $send s up, against $work s of work)"
         else
@@ -1164,6 +1375,28 @@ sync_loop() {  # checkpoints | rest
     done
 }
 
+# The idle check: once the command has run 15 minutes, a GPU averaging under 20% over the last 15
+# minutes (the pod's own samples, every 10 s) ends the run as idle-stopped: it pays for a GPU it does
+# not use (put CPU-only work on a CPU pod).
+idle_check() {
+    local started=$(date +%s) mean i
+    while :; do
+        for (( i = 0; i < 12; i++ )); do
+            [ ! -f "$TMP/stop-sync" ] && kill -0 $$ 2> /dev/null || return 0
+            sleep 5
+        done
+        (( $(date +%s) - started >= 900 )) || continue
+        mean=$(on_pod "awk -v t=\$(( \$(date +%s) - 900 )) '\$1 >= t && NF == 2 { s += \$2; n++ } END { if (n) printf \"%d\", s / n }' /workspace/gpu-util.log" < /dev/null 2> /dev/null || true)
+        if [ -n "$mean" ] && (( mean < 20 )); then
+            say "GPU at $mean% over the last 15 minutes: stopping the run as idle"
+            echo idle-stopped > "$ACTIVE/.$POD.end"
+            touch "$OUT/STOP"
+            kill -TERM $$
+            return
+        fi
+    done
+}
+
 # Starts COMMAND detached on the pod (a dropped connection does not end it) and streams its log.
 # Sets RC to its exit status; returns 1 when the pod is lost first.
 run_command() {
@@ -1171,7 +1404,11 @@ run_command() {
         echo 'export PATH=/root/.cargo/bin:/workspace/bin:/usr/local/cuda/bin:$PATH'
         echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
         echo 'export MPD_BIN=/workspace/bin'
-        echo 'echo "# $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader), $(nvidia-smi | grep -o "CUDA Version: [0-9.]*")"'
+        if [ "$COMPUTE" = CPU ]; then
+            echo 'echo "# CPU pod, $(nproc) vCPUs"'
+        else
+            echo 'echo "# $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader), $(nvidia-smi | grep -o "CUDA Version: [0-9.]*")"'
+        fi
         echo "cd /workspace/src"
         echo "$cmd"
     } | on_pod 'cat > /workspace/run.sh' || return 1
@@ -1185,11 +1422,15 @@ run_command() {
     SYNC=$!
     sync_loop checkpoints &
     SYNC="$SYNC $!"
+    [ "$COMPUTE" = CPU ] || { idle_check & SYNC="$SYNC $!"; }
     local base misses=0 state r
     base=$(wc -c < "$LOG" | tr -d ' ')
     RC=""
     while :; do
-        on_pod "tail -c +$(( $(wc -c < "$LOG" | tr -d ' ') - base + 1 )) -f --pid=\$(cat /workspace/run.pid) /workspace/run.log" | tee -a "$LOG" || true
+        # In the background, waited for: a signal (rp-run stop, the idle check) ends the wait at once,
+        # where a command in the foreground would hold it until the stream ends.
+        on_pod "tail -c +$(( $(wc -c < "$LOG" | tr -d ' ') - base + 1 )) -f --pid=\$(cat /workspace/run.pid) /workspace/run.log" | tee -a "$LOG" &
+        wait $! || true
         if state=$(on_pod 'cat /workspace/run.exit 2> /dev/null || { kill -0 "$(cat /workspace/run.pid)" 2> /dev/null && echo alive; } || echo vanished'); then
             misses=0
             case $state in
@@ -1269,8 +1510,10 @@ hold() {
 
 case $MODE in
     run)
+        build_binaries
         attempt=1
         until launch && setup && run_command; do
+            [ ! -f "$OUT/STOP" ] || exit 1
             # Lost or never usable: release it, then a new pod while time remains.
             # The lost pod's shared connection is gone too: closing it fails, harmlessly.
             [ -z "$IP" ] || on_pod -O exit > /dev/null 2>&1 || true

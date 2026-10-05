@@ -60,8 +60,8 @@ def step(run, part):
 
 
 def tests(run):
-    path = run / "gpu_tests.out"
-    found = re.findall(r"test result: \w+\. (\d+) passed; (\d+) failed", path.read_text() if path.exists() else "")
+    text = "".join(p.read_text() for p in sorted(run.glob("gpu_tests.out")) + sorted(run.glob("test_*.out")))
+    found = re.findall(r"test result: \w+\. (\d+) passed; (\d+) failed", text)
     if not found:
         return "not run"
     return f"{sum(int(p) for p, _ in found)} passed, {sum(int(f) for _, f in found)} failed"
