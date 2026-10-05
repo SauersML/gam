@@ -101,8 +101,8 @@ fn main() -> Result<(), String> {
         "base_objective_bits": fits[0].objective_bits,
         "shared_objective_bits": fits[1].objective_bits,
         "accepted": fits[1].objective_bits < fits[0].objective_bits,
-        "base_held_out": fits[0].epochs.last().map(|e| &e.held_out),
-        "shared_held_out": fits[1].epochs.last().map(|e| &e.held_out),
+        "base_held_out": &fits[0].end,
+        "shared_held_out": &fits[1].end,
     });
     log::info!("sharing summary: {summary}");
     save(&out.join("SUMMARY.json"), &summary)

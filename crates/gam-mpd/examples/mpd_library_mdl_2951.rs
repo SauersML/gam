@@ -109,7 +109,7 @@ fn main() -> Result<(), String> {
         "epochs": fit.report.epochs.len(),
         "removals": fit.report.removals.iter().map(|r| r.removed).collect::<Vec<_>>(),
         "start": fit.report.start,
-        "held_out": fit.report.epochs.last().map(|e| &e.held_out),
+        "held_out": fit.report.end,
         "seconds": started.elapsed().as_secs_f64(),
     });
     log::info!("library summary: {summary}");

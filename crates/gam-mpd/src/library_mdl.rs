@@ -84,8 +84,11 @@
 //!
 //! # Evaluation
 //!
-//! After every epoch the held-out sequences are scored ([`HeldOut`]): per base, at every cut, one
-//! clean and one patched experiment (sources among the held-out sequences). `F` per token is the
+//! After every epoch a fixed subset of the held-out sequences (the first batch of them) is scored
+//! ([`HeldOut`]), and all of them only while the per-epoch evaluations so far, with the last full
+//! evaluation's time, stay within [`EVALUATION_SHARE`] of the training time so far; the fit ends
+//! with a full evaluation. Per base, at every hybrid size, one clean and one patched experiment
+//! (sources among the held-out sequences). `F` per token is the
 //! held-out data term at one weight sample per batch plus the description spread over the training
 //! experiments' scored tokens; the divergences per experiment kind are taken at the posterior mean.
 //! Per layer it counts the surviving heads and MLP functions and, per token, the functions whose
@@ -764,6 +767,10 @@ pub struct HeldOut {
     pub layers: Vec<LayerCount>,
 }
 
+/// The largest share of the fit's training time its per-epoch held-out evaluations may take: the
+/// full held-out set is scored after an epoch only while the evaluations stay within it.
+pub const EVALUATION_SHARE: f64 = 0.1;
+
 /// One epoch of the continuous fit.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Epoch {
@@ -781,9 +788,12 @@ pub struct Epoch {
     /// training experiments, in bits.
     pub clean_bits_per_token: f64,
     pub patched_bits_per_token: f64,
+    /// The epoch's training seconds.
     pub seconds: f64,
-    /// The held-out evaluation after the epoch's steps.
+    /// The held-out evaluation after the epoch's steps on the fixed subset, and on every held-out
+    /// sequence when the schedule ran it (module note).
     pub held_out: HeldOut,
+    pub held_out_full: Option<HeldOut>,
 }
 
 /// One removal step.
@@ -809,8 +819,10 @@ pub struct Report {
     pub families: BTreeMap<String, usize>,
     pub groups: usize,
     pub parameters: usize,
-    /// The held-out evaluation at the starting point.
+    /// The held-out evaluation at the starting point and of the finished fit, on every held-out
+    /// sequence.
     pub start: HeldOut,
+    pub end: HeldOut,
     pub epochs: Vec<Epoch>,
     pub removals: Vec<Removal>,
     pub active_groups: usize,
@@ -1231,6 +1243,14 @@ struct Progress {
     active: Vec<bool>,
     done: bool,
     seconds: f64,
+    /// The training and the per-epoch evaluation seconds so far, and the last full held-out
+    /// evaluation's seconds (the schedule's inputs).
+    #[serde(default)]
+    training_seconds: f64,
+    #[serde(default)]
+    evaluation_seconds: f64,
+    #[serde(default)]
+    full_seconds: f64,
 }
 
 /// What a checkpoint belongs to: a fit resumes from it only when every field agrees, so a
@@ -1457,7 +1477,13 @@ pub fn fit(
         active: posterior.active.clone(),
         done: false,
         seconds: 0.0,
+        training_seconds: 0.0,
+        evaluation_seconds: 0.0,
+        full_seconds: 0.0,
     };
+    // The fixed held-out subset: the first batch of held-out bases (at least the two a source
+    // needs).
+    let subset = &held[..settings.batch_sequences.clamp(2, held.len())];
     if let Some(path) = checkpoint.filter(|p| p.exists()) {
         progress = load_checkpoint(path, &progress, &mut posterior, &mut mean_moments, &mut log_sd_moments)?;
         log::info!("library fit resumed at epoch {} from {}", progress.epoch, path.display());
@@ -1475,7 +1501,9 @@ pub fn fit(
         std::fs::rename(&partial, path.with_extension("artifact.bin")).map_err(error)
     };
     if progress.start.is_none() {
+        let timed = Instant::now();
         let start = held_out(&mut scorer, explanation, &posterior, held, settings, tokens)?;
+        progress.full_seconds = timed.elapsed().as_secs_f64();
         log::info!("library start: {start:?}");
         progress.start = Some(start);
         save(&mut progress, &posterior, &mean_moments, &log_sd_moments)?;
@@ -1547,7 +1575,22 @@ pub fn fit(
             clean_bits_per_token: clean.mean().unwrap_or(f64::NAN),
             patched_bits_per_token: patched.mean().unwrap_or(f64::NAN),
             seconds: epoch_started.elapsed().as_secs_f64(),
-            held_out: held_out(&mut scorer, explanation, &posterior, held, settings, tokens)?,
+            held_out: {
+                progress.training_seconds += epoch_started.elapsed().as_secs_f64();
+                let timed = Instant::now();
+                let evaluation = held_out(&mut scorer, explanation, &posterior, subset, settings, tokens)?;
+                progress.evaluation_seconds += timed.elapsed().as_secs_f64();
+                evaluation
+            },
+            held_out_full: if progress.evaluation_seconds + progress.full_seconds <= EVALUATION_SHARE * progress.training_seconds {
+                let timed = Instant::now();
+                let evaluation = held_out(&mut scorer, explanation, &posterior, held, settings, tokens)?;
+                progress.full_seconds = timed.elapsed().as_secs_f64();
+                progress.evaluation_seconds += progress.full_seconds;
+                Some(evaluation)
+            } else {
+                None
+            },
         };
         log::info!("library fit epoch {epoch}: {record:?}");
         progress.epochs.push(record);
@@ -1565,6 +1608,8 @@ pub fn fit(
         save(&mut progress, &posterior, &mean_moments, &log_sd_moments)?;
     }
     let objective_bits = progress.removals.last().map_or(f64::NAN, |r| r.after_bits);
+    let end = held_out(&mut scorer, explanation, &posterior, held, settings, tokens)?;
+    log::info!("library end: {end:?}");
     Ok(Fit {
         report: Report {
             settings: settings.clone(),
@@ -1574,6 +1619,7 @@ pub fn fit(
             groups: explanation.groups.len(),
             parameters,
             start: progress.start.ok_or("no starting evaluation")?,
+            end,
             active_groups: posterior.active.iter().filter(|a| **a).count(),
             objective_bits,
             seconds: resumed_seconds + started.elapsed().as_secs_f64(),
