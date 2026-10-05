@@ -341,13 +341,13 @@ fn the_gradient_matches_central_differences() {
 #[test]
 fn sampling_draws_each_family_with_its_stated_weight() {
     // Six blocks of three read variables each. Per base: P alone with probability 1/2; the block
-    // uniform; then one variable (probability 1/2) or a joint patch of each variable with
-    // probability 1/2, drawn again when empty.
+    // uniform; then one variable (probability 1/2) or a joint patch of a subset whose size is
+    // uniform in 1..=3.
     let variables: Vec<ReadVariable> = (0..6).flat_map(|b| (0..3).map(move |i| ReadVariable { block: b, parts: vec![(b, i..i + 1)] })).collect();
     let n = 6000;
     let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(11), n, &variables, 6, 9).expect("sample");
     assert_eq!(experiments.len(), 2 * n);
-    let mut joint_sizes = 0;
+    let mut joint_sizes = [0usize; 4];
     for (i, pair) in experiments.chunks(2).enumerate() {
         assert_eq!((pair[0].base, pair[1].base, pair[1].source), (i, i, i));
         assert!(pair[0].patch.is_none() && pair[1].patch.is_some());
@@ -358,7 +358,7 @@ fn sampling_draws_each_family_with_its_stated_weight() {
         if let Some(Patch::Reads { variables: chosen }) = &pair[1].patch {
             let block = variables[chosen[0]].block;
             assert!(!chosen.is_empty() && chosen.windows(2).all(|w| w[0] < w[1]) && chosen.iter().all(|v| variables[*v].block == block));
-            joint_sizes += chosen.len();
+            joint_sizes[chosen.len()] += 1;
         }
     }
     // Each count within five standard deviations of its binomial expectation.
@@ -373,12 +373,12 @@ fn sampling_draws_each_family_with_its_stated_weight() {
     within(counts["read_mlp"] as f64, n as f64, 0.25);
     within(counts["read_joint"] as f64, n as f64, 0.5);
     assert_eq!(counts["complement"], 0);
-    // A joint subset of three, each in with probability 1/2 and drawn again when empty: mean size
-    // (3/2) / (1 - 1/8) = 12/7, each size's count within five standard deviations.
+    // A joint subset of three: each size 1, 2, 3 with probability 1/3.
     let joints = counts["read_joint"] as f64;
-    let mean = joint_sizes as f64 / joints;
-    let variance = (3.0 * 4.0 + 3.0 * 1.0 + 1.0 * 9.0) / 7.0 - (12.0 / 7.0) * (12.0 / 7.0);
-    assert!((mean - 12.0 / 7.0).abs() <= 5.0 * (variance / joints).sqrt(), "mean joint size {mean}");
+    assert_eq!(joint_sizes[0], 0);
+    for size in 1..=3 {
+        within(joint_sizes[size] as f64, joints, 1.0 / 3.0);
+    }
     // Every size 1..=6 appears, and a non-prefix set does: the hybrids are not only cuts.
     let sizes: std::collections::BTreeSet<usize> = experiments.iter().map(|e| e.explained.iter().filter(|x| **x).count()).collect();
     assert_eq!(sizes, (1..=6).collect());

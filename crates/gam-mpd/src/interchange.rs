@@ -297,8 +297,8 @@ pub fn hybrid_of(rng: &mut impl RngExt, blocks: usize, k: usize) -> Vec<bool> {
 ///   explanation as delivered), else a hybrid drawn by [`hybrid`] (`P`'s parts in `M`'s place);
 /// * the patched experiment, under the same hybrid: its block uniform over the `blocks` blocks;
 ///   with probability ½ a read patch of one of the block's `variables`, uniform among them, else
-///   a joint read patch of a random subset of them, each included with probability ½ (drawn again
-///   when empty); its position uniform over the `length` positions.
+///   a joint read patch of a random subset of them ([`subset`]); its position uniform over the
+///   `length` positions.
 ///
 /// A uniform draw over all variables would make nearly every patch an MLP reader's (they are
 /// almost all of the variables). The variables are fixed (`M`'s reads), so the joint subsets test
@@ -318,17 +318,21 @@ pub fn sample(rng: &mut impl RngExt, sequences: usize, variables: &[ReadVariable
         let patch = if rng.random_range(0..2) == 0 {
             Patch::Read { variable: candidates[rng.random_range(0..candidates.len())] }
         } else {
-            let mut chosen = Vec::new();
-            while chosen.is_empty() {
-                chosen = candidates.iter().copied().filter(|_| rng.random_range(0..2) == 0).collect();
-            }
-            Patch::Reads { variables: chosen }
+            Patch::Reads { variables: subset(rng, candidates) }
         };
         let position = rng.random_range(0..length);
         out.push(Experiment { base: n, source: n, explained: explained.clone(), patch: None, position: 0 });
         out.push(Experiment { base: n, source: n, explained, patch: Some(patch), position });
     }
     Ok(out)
+}
+
+/// A random nonempty subset of `candidates` (ascending): its size `k` uniform in
+/// `1..=candidates.len()`, then a uniform set of `k`, as for hybrids. Small and partial subsets
+/// mix the base's and the source's reads; large ones, spanning the stream, swap the whole read.
+pub fn subset(rng: &mut impl RngExt, candidates: &[usize]) -> Vec<usize> {
+    let k = rng.random_range(1..=candidates.len());
+    hybrid_of(rng, candidates.len(), k).iter().zip(candidates).filter(|(chosen, _)| **chosen).map(|(_, v)| *v).collect()
 }
 
 /// The realized count of each family among `experiments`: clean with `P` alone, clean under a

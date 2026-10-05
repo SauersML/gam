@@ -18,7 +18,7 @@
 //!   variables drawn uniformly, with `M`'s own directions (the library's start, the fit's fixed
 //!   questions: `read`) and with `P`'s current reads of the same rows (adaptive questions:
 //!   `read_adaptive`); a joint read patch, with `M`'s directions, of a random subset of the variables
-//!   at that variable's block, each included with probability ½ (`read_joint`); the complement patch of every block and the joint complement patch at a
+//!   at that variable's block, its size uniform (`read_joint`); the complement patch of every block and the joint complement patch at a
 //!   uniformly drawn set of at least two blocks (its size uniform in `2..=2L`, where cancellation
 //!   between blocks shows), both of `P`'s current reads, since `M`'s reads span every block's whole
 //!   stream and leave no complement. Each with the source a sequence shared across the whole batch
@@ -298,11 +298,7 @@ fn main() -> Result<(), String> {
         .iter()
         .map(|&v| {
             let at: Vec<usize> = (0..variables.len()).filter(|i| variables[*i].block == variables[v].block).collect();
-            let mut chosen = Vec::new();
-            while chosen.is_empty() {
-                chosen = at.iter().copied().filter(|_| rng.random_range(0..2) == 0).collect();
-            }
-            chosen
+            interchange::subset(&mut rng, &at)
         })
         .collect();
     let joint_of: Vec<Vec<usize>> = (0..bases.len())
