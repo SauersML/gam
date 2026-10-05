@@ -1,5 +1,5 @@
-//! Time of one library-fit training step (#2951), its posterior on the host as the fit kept it
-//! before (`library_mdl`'s `Posterior`) against resident on the device (`device_posterior`).
+//! Time of one library-fit training step (#2951), its posterior resident on the device
+//! (`device_posterior`).
 //!
 //! `mpd_library_step_bench_2951 MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS [LAYERS]]`
 //!
@@ -16,17 +16,15 @@
 //! A step, as the fit takes it: the patch directions at the posterior mean (the means written into
 //! `P`, `interchange::design`), the weight sample written into `P`, `M`'s clean runs
 //! (`interchange::targets`), the experiments with the gradient (`interchange::evaluate`), the
-//! description `Σ_G KL_G`, and Adam's step in `(μ, ln σ)`. On the host path the means and the
-//! sample are drawn and uploaded from float64 host arrays, the gradient downloaded, and the
-//! derivatives, Adam's step and the description computed on the host (rayon), as `library_mdl`
-//! does; on the device path none of the parameters leave the device. Each path's step runs `REPS`
-//! times after one warm-up, each part timed to a device synchronization. One JSON object goes to
-//! `OUT/library_step_bench.json` and stdout: per path and part the median seconds.
+//! description `Σ_G KL_G`, and the IVON step (`Device::posterior_ivon`); none of the parameters
+//! leave the device. The step runs `REPS` times after one warm-up, each part timed to a device
+//! synchronization. One JSON object goes to `OUT/library_step_bench.json` and stdout: per part the
+//! median seconds.
 
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     artifact::Artifact,
-    device_posterior::{Adam, DevicePosterior, Parts},
+    device_posterior::{DevicePosterior, Ivon, Parts},
     device_program::DeviceProgram,
     engine::log_to_stderr,
     import::{hugging_face_language_model, import_language_model},
@@ -35,9 +33,8 @@ use gam_mpd::{
     operator_program::{OperatorProgram, SlotValues},
     run_check::{layer_nodes, split_sites},
 };
-use ndarray::{Array2, Zip};
-use rand::{RngExt, SeedableRng, rngs::StdRng};
-use rayon::prelude::*;
+use ndarray::Array2;
+use rand::{SeedableRng, rngs::StdRng};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, time::Instant};
 
@@ -118,132 +115,20 @@ fn medians(seconds: &BTreeMap<&'static str, Vec<f64>>) -> Value {
     Value::Object(out)
 }
 
-/// Load host arrays into `P`'s trainable operators (`Interchange::load`).
-fn load(program: &mut DeviceProgram, trainable: &[usize], values: &[Array2<f64>]) -> Result<(), String> {
-    for (&op, value) in trainable.iter().zip(values) {
-        let tensor = program.device().upload(value.view()).map_err(error)?;
-        program.replace_dense_parameter(op, tensor)?;
-    }
-    Ok(())
-}
-
-/// The host posterior's weight sample and noise from `seed` (`library_mdl::Posterior::sample`).
-fn host_sample(mean: &[Array2<f64>], log_sd: &[Array2<f64>], seed: u64) -> (Vec<Array2<f64>>, Vec<Array2<f64>>) {
-    (0..mean.len())
-        .into_par_iter()
-        .map(|i| {
-            let mut rng = StdRng::seed_from_u64(seed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let n = mean[i].len();
-            let mut values = Vec::with_capacity(n + 1);
-            while values.len() < n {
-                let u = 1.0 - rng.random::<f64>();
-                let angle = std::f64::consts::TAU * rng.random::<f64>();
-                let radius = (-2.0 * u.ln()).sqrt();
-                values.push(radius * angle.cos());
-                values.push(radius * angle.sin());
-            }
-            values.truncate(n);
-            let noise = Array2::from_shape_vec(mean[i].dim(), values).expect("shape of the drawn values");
-            let mut theta = mean[i].clone();
-            Zip::from(&mut theta).and(&noise).and(&log_sd[i]).for_each(|t, e, s| *t += s.exp() * e);
-            (theta, noise)
-        })
-        .unzip()
-}
-
-/// The host posterior's group moments `(n, Σ μ² + σ², Σ 2s)` (`library_mdl::Posterior::moments`).
-fn host_moments(mean: &[Array2<f64>], log_sd: &[Array2<f64>], groups: &[Vec<u32>], count: usize) -> Vec<[f64; 3]> {
-    let partial: Vec<Vec<[f64; 3]>> = (0..mean.len())
-        .into_par_iter()
-        .map(|i| {
-            let mut local = vec![[0.0; 3]; count];
-            for ((mu, s), g) in mean[i].iter().zip(log_sd[i].iter()).zip(&groups[i]) {
-                let m = &mut local[*g as usize];
-                m[0] += 1.0;
-                m[1] += mu * mu + (2.0 * s).exp();
-                m[2] += 2.0 * s;
-            }
-            local
-        })
-        .collect();
-    let mut out = vec![[0.0; 3]; count];
-    for local in partial {
-        for (o, l) in out.iter_mut().zip(local) {
-            o[0] += l[0];
-            o[1] += l[1];
-            o[2] += l[2];
-        }
-    }
-    out
-}
-
-/// The host posterior as `library_mdl` keeps it: per operator `μ`, `ln σ`, Adam's moments and each
-/// entry's group.
-struct HostPosterior {
-    mean: Vec<Array2<f64>>,
-    log_sd: Vec<Array2<f64>>,
-    moments: Vec<[Array2<f64>; 4]>,
-    groups: Vec<Array2<u32>>,
-    count: usize,
-}
-
-/// One Adam step of `value` (`library_mdl`'s `Moment::step`).
-fn adam_step(value: &mut Array2<f64>, gradient: &Array2<f64>, (first, second): (&mut Array2<f64>, &mut Array2<f64>), rate: f64, adam: &Adam, step: i32) {
-    let (c1, c2) = (1.0 - adam.beta1.powi(step), 1.0 - adam.beta2.powi(step));
-    Zip::from(value).and(gradient).and(first).and(second).for_each(|w, g, m, v| {
-        *m = adam.beta1 * *m + (1.0 - adam.beta1) * g;
-        *v = adam.beta2 * *v + (1.0 - adam.beta2) * g * g;
-        *w -= rate * (*m / c1) / ((*v / c2).sqrt() + adam.epsilon);
-    });
-}
-
-impl HostPosterior {
-    /// The description `Σ_G KL_G` in nats, then the derivatives and Adam's step
-    /// (`library_mdl::Posterior::description`, `derivatives`, `Moment::step`).
-    fn step(&mut self, gradients: &[Array2<f64>], noise: &[Array2<f64>], adam: &Adam, step: i32) -> f64 {
-        let flat: Vec<Vec<u32>> = self.groups.iter().map(|g| g.iter().copied().collect()).collect();
-        let sums = host_moments(&self.mean, &self.log_sd, &flat, self.count);
-        let description: f64 = sums.iter().filter(|m| m[0] > 0.0).map(|m| 0.5 * (m[0] * (m[1] / m[0]).ln() - m[2])).sum();
-        let variance: Vec<f64> = host_moments(&self.mean, &self.log_sd, &flat, self.count).iter().map(|m| if m[0] > 0.0 { m[1] / m[0] } else { 0.0 }).collect();
-        let derivatives: Vec<(Array2<f64>, Array2<f64>)> = (0..gradients.len())
-            .into_par_iter()
-            .map(|i| {
-                let (mut gm, mut gs) = (gradients[i].clone(), Array2::zeros(gradients[i].dim()));
-                Zip::from(&mut gm).and(&mut gs).and(&noise[i]).and(&self.mean[i]).and(&self.log_sd[i]).and(&self.groups[i]).for_each(|gm, gs, e, mu, s, g| {
-                    let v = variance[*g as usize];
-                    let sd = s.exp();
-                    *gs = *gm * e * sd + sd * sd / v - 1.0;
-                    *gm += mu / v;
-                });
-                (gm, gs)
-            })
-            .collect();
-        self.mean.par_iter_mut().zip(self.log_sd.par_iter_mut()).zip(self.moments.par_iter_mut()).zip(derivatives.par_iter()).for_each(|(((mean, log_sd), moments), (gm, gs))| {
-            let [m0, m1, m2, m3] = moments;
-            adam_step(mean, gm, (m0, m1), adam.mean_rate, adam, step);
-            adam_step(log_sd, gs, (m2, m3), adam.log_sd_rate, adam, step);
-        });
-        description
-    }
-}
-
 fn main() -> Result<(), String> {
     log_to_stderr();
     // `products=f32|tf32|bf16` (f32 by default) sets the arithmetic of both programs' products.
     let (settings, args): (Vec<String>, Vec<String>) = std::env::args().skip(1).partition(|a| a.contains('='));
-    // `host=false` skips the host path (its float64 posterior does not fit beside a large model).
-    let (mut products, mut host_path) = (gam_gpu::tensor::Arithmetic::F32, true);
+    let mut products = gam_gpu::tensor::Arithmetic::F32;
     for setting in &settings {
         match setting.as_str() {
             "products=f32" => products = gam_gpu::tensor::Arithmetic::F32,
             "products=tf32" => products = gam_gpu::tensor::Arithmetic::Tf32,
             "products=bf16" => products = gam_gpu::tensor::Arithmetic::Bf16,
-            "host=false" => host_path = false,
-            "host=true" => host_path = true,
             other => return Err(format!("unknown setting {other}")),
         }
     }
-    let usage = "MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS [LAYERS]] [products=f32|tf32|bf16] [host=true|false]";
+    let usage = "MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS [LAYERS]] [products=f32|tf32|bf16]";
     let (model, rest) = args.split_first().ok_or(usage)?;
     let [sequences, context, reps, out, windows @ ..] = rest else {
         return Err(usage.into());
@@ -337,52 +222,14 @@ fn main() -> Result<(), String> {
     let zeros: BTreeMap<usize, gam_gpu::tensor::Tensor> =
         trainable.iter().zip(&start.mean).map(|(op, m)| Ok((*op, device.zeros(m.nrows(), m.ncols()).map_err(error)?))).collect::<Result<_, String>>()?;
     let experiments = interchange::sample(&mut StdRng::seed_from_u64(1), sequences, &variables, 2 * layer_count, context)?;
-    let adam = Adam { mean_rate: 5e-5, log_sd_rate: 1e-2, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 };
-    let scale = tokens as f64 / (experiments.len() * context) as f64 * std::f64::consts::LN_2;
+    let ivon = Ivon { rate: 0.1, beta1: 0.9, beta2: 0.999 };
+    // The gradient of the data term per scored token, in nats.
+    let scale = std::f64::consts::LN_2 / (experiments.len() * context) as f64;
     fn p_model<'a>(program: &'a DeviceProgram, (flat, streams, reads, trainable): (&OperatorProgram, &[usize], &[usize], &[usize])) -> Result<Model<'a>, String> {
         Model::new(program, flat, streams.to_vec(), reads.to_vec(), trainable)
     }
     let sites = (&p_flat, &p_streams[..], &p_reads[..], &trainable[..]);
 
-    // The host path.
-    let mut host_seconds: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
-    if host_path {
-        let mut host = HostPosterior {
-            mean: start.mean.clone(),
-            log_sd: start.log_sd.clone(),
-            moments: start.mean.iter().map(|m| std::array::from_fn(|_| Array2::zeros(m.dim()))).collect(),
-            groups: start.groups.iter().zip(&start.mean).map(|(g, m)| Array2::from_shape_vec(m.dim(), g.clone()).map_err(error)).collect::<Result<_, _>>()?,
-            count: start.count,
-        };
-        for step in 0..=reps {
-            let s = &mut host_seconds;
-            timed(&device, s, "means_loaded", || load(&mut p_program, &trainable, &host.mean))?;
-            let design = match &scoring {
-                Some(_) => Some(timed(&device, s, "design", || interchange::design(&p_model(&p_program, sites)?, &variables, &experiments))?),
-                None => None,
-            };
-            let (theta, noise) = timed(&device, s, "sample", || Ok(host_sample(&host.mean, &host.log_sd, step as u64)))?;
-            timed(&device, s, "sample_loaded", || load(&mut p_program, &trainable, &theta))?;
-            let evaluation = match (&scoring, &design) {
-                (Some((head, m)), Some(design)) => {
-                    let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments, design))?;
-                    timed(&device, s, "evaluate", || interchange::evaluate(m, &p_model(&p_program, sites)?, head, &batch, &targets, &experiments, design, true))?.gradient
-                }
-                _ => zeros.iter().map(|(op, z)| Ok((*op, device.copy(z).map_err(error)?))).collect::<Result<BTreeMap<_, _>, String>>()?,
-            };
-            let gradients = timed(&device, s, "gradient_downloaded", || {
-                trainable
-                    .iter()
-                    .zip(&host.mean)
-                    .map(|(op, values)| match evaluation.get(op) {
-                        Some(g) => Ok(device.download(g).map_err(error)? * scale),
-                        None => Ok(Array2::zeros(values.dim())),
-                    })
-                    .collect::<Result<Vec<_>, String>>()
-            })?;
-            timed(&device, s, "posterior_step", || Ok(host.step(&gradients, &noise, &adam, step as i32 + 1)))?;
-        }
-    }
     // The device path.
     let mut device_seconds: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
     // The last step's mean KL(M_e ‖ P_e) per scored token, in bits (a check that the products'
@@ -390,7 +237,7 @@ fn main() -> Result<(), String> {
     let mut mean_bits = None;
     {
         let parts = Parts { operators: &trainable, mean: &start.mean, log_sd: &start.log_sd, groups: &start.groups, count: start.count };
-        let mut posterior = DevicePosterior::from_parts(&device, &parts, None, 0)?;
+        let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens as f64, None, 0)?;
         for step in 0..=reps {
             let s = &mut device_seconds;
             timed(&device, s, "means_loaded", || posterior.mean_into(&mut p_program))?;
@@ -410,7 +257,7 @@ fn main() -> Result<(), String> {
                 _ => zeros.iter().map(|(op, z)| Ok((*op, device.copy(z).map_err(error)?))).collect::<Result<BTreeMap<_, _>, String>>()?,
             };
             timed(&device, s, "description", || Ok(posterior.divergences()?.iter().sum::<f64>()))?;
-            timed(&device, s, "posterior_step", || posterior.step(&gradient, scale, &adam, step as u64))?;
+            timed(&device, s, "posterior_step", || posterior.step(&gradient, scale, &ivon, step as u64))?;
         }
     }
     let report = json!({
@@ -429,7 +276,6 @@ fn main() -> Result<(), String> {
         "parameters": parameters,
         "groups": start.count,
         "reps": reps,
-        "host_posterior_seconds": if host_path { medians(&host_seconds) } else { Value::Null },
         "device_posterior_seconds": medians(&device_seconds),
     });
     println!("{report}");

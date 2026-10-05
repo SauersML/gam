@@ -83,36 +83,10 @@ fn error(e: impl std::fmt::Display) -> String {
 /// explanation's artifact, with the posterior's `KL(q ‖ p)` and description in bits and the fit's
 /// last held-out evaluation.
 fn checkpoint_mean(path: &Path, explanation: &library_mdl::Explanation) -> Result<(Artifact, Value), String> {
-    let bytes = std::fs::read(path).map_err(error)?;
-    let length = u64::from_le_bytes(bytes.get(..8).ok_or("a truncated checkpoint")?.try_into().map_err(error)?) as usize;
-    let header: Value = serde_json::from_slice(bytes.get(8..8 + length).ok_or("a truncated checkpoint")?).map_err(error)?;
+    let posterior = library_mdl::checkpoint_posterior(explanation, path)?;
+    // The fit's progress, which the fit writes beside the checkpoint at every save.
+    let header: Value = serde_json::from_slice(&std::fs::read(path.with_extension("json")).map_err(error)?).map_err(error)?;
     let tokens = header["tokens"].as_u64().ok_or("checkpoint tokens")? as usize;
-    let mut posterior = library_mdl::Posterior::new(explanation, tokens)?;
-    let mut at = 8 + length;
-    let mut take = |rows: usize, cols: usize| -> Result<Array2<f64>, String> {
-        let raw = bytes.get(at..at + 8 * rows * cols).ok_or("a truncated checkpoint")?;
-        at += 8 * rows * cols;
-        let values = raw.chunks_exact(8).map(|c| c.try_into().map(f64::from_le_bytes).map_err(error)).collect::<Result<Vec<_>, _>>()?;
-        Array2::from_shape_vec((rows, cols), values).map_err(error)
-    };
-    for i in 0..posterior.mean.len() {
-        let (rows, cols) = posterior.mean[i].dim();
-        posterior.mean[i] = take(rows, cols)?;
-        posterior.log_sd[i] = take(rows, cols)?;
-        for _ in 0..4 {
-            take(rows, cols)?;
-        }
-    }
-    if at != bytes.len() {
-        return Err("the checkpoint's arrays do not match the explanation".into());
-    }
-    let active = header["active"].as_array().ok_or("checkpoint active")?;
-    if active.len() != posterior.active.len() {
-        return Err("the checkpoint's groups do not match the explanation".into());
-    }
-    for (a, v) in posterior.active.iter_mut().zip(active) {
-        *a = v.as_bool().ok_or("checkpoint active")?;
-    }
     let divergence: f64 = posterior.divergences().iter().sum();
     let size = json!({
         "epoch": header["epoch"],

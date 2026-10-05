@@ -17,7 +17,7 @@ use gam_mpd::{
     artifact::Artifact,
     engine::{log_to_stderr, sha256},
     import::import_language_model,
-    library_mdl, library_mixture, library_readout, library_sharing,
+    library_mdl, library_mixture, library_sharing,
     operator_program::SlotValues,
     run_check::{layer_nodes, split_sites},
 };
@@ -79,7 +79,7 @@ fn main() -> Result<(), String> {
         None if from == "native" => start,
         Some(("artifact", path)) => library_sharing::warm(&start, &Artifact::from_bytes(&std::fs::read(path).map_err(|e| e.to_string())?, &native.declarations)?)?,
         Some(("checkpoint", path)) => {
-            let posterior = library_readout::checkpoint_posterior(&start, Path::new(path))?;
+            let posterior = library_mdl::checkpoint_posterior(&start, Path::new(path))?;
             let mut base = library_sharing::warm(&start, &library_mdl::posterior_mean(&start, &posterior)?)?;
             base.removed = (0..posterior.active.len()).filter(|g| !posterior.active[*g]).collect();
             base
@@ -88,7 +88,7 @@ fn main() -> Result<(), String> {
     };
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     let fit = &settings.fit;
-    let steps = library_mixture::Steps { rate: fit.log_sd_step, beta1: fit.beta1, beta2: fit.beta2, epsilon: fit.epsilon };
+    let steps = library_mixture::Steps { rate: 0.05, beta1: fit.beta1, beta2: 0.999, epsilon: 1e-8 };
     let mut mixture = library_mixture::Mixture::new(&base, width, steps)?;
     let dir = out.join("soft");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;

@@ -68,11 +68,17 @@
 //! # The fit
 //!
 //! Each step draws one weight sample `θ = μ + σ ⊙ ε` (`ε` standard normal), runs a batch's
-//! experiments, and takes one Adam step in `(μ, ln σ)` on the batch estimate
-//! `(N/n) D_batch(θ) + Σ_G KL_G`, `N` the scored tokens of every training experiment and `n` the
-//! batch's. The posterior stays on the device through an epoch (`device_posterior`): the sample is
-//! written into the explanation's program, the gradient stays where the reverse pass left it, and
-//! Adam's step and the groups' divergences run there; the host holds it between epochs, for the
+//! experiments, and takes one step of the improved variational online Newton method (IVON; Shen et
+//! al., ICML 2024) on `F / N = E_q[ℓ] + KL(q ‖ p) / N`, `ℓ` the data term per scored token and `N`
+//! the scored tokens of every training experiment: the batch's gradient `g` of `ℓ` at the sample
+//! gives the curvature estimate `ĥ = g ε / σ`, whose average over the last epoch's batches is `h`
+//! (`β₂ = 1 − 1/B` for `B` training batches); the posterior's standard deviation is then
+//! `σ = 1 / √(N (h + δ))` with `δ = 1 / (N v_G)` the group prior's precision per token, the value
+//! at which `F` is stationary in `σ`, so `σ` has no step size; the mean takes the preconditioned
+//! step `α (m + δ μ) / (h + δ)` along the gradient's momentum `m`. The posterior stays on the
+//! device through an epoch (`device_posterior`): the sample is written into the explanation's
+//! program, the gradient stays where the reverse pass left it, and the IVON step and the groups'
+//! divergences run there; the host holds it between epochs, for the
 //! held-out evaluation, the checkpoint and the removal step. An epoch visits every training batch
 //! once, in a fixed order. The continuous fit
 //! has converged when an epoch's mean improvement of the per-batch objective estimate over the
@@ -106,7 +112,7 @@
 
 use crate::{
     artifact::{Argument, Artifact, Callee},
-    device_posterior::{Adam, DevicePosterior},
+    device_posterior::{DevicePosterior, Ivon},
     interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable, Targets},
     operator_program::{
         FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, Provenance, Rule, SequenceLayout, SlotValues,
@@ -706,12 +712,11 @@ fn standard_normal(rng: &mut StdRng, dim: (usize, usize)) -> Array2<f64> {
 pub struct Settings {
     /// Base sequences per step.
     pub batch_sequences: usize,
-    /// Adam step sizes in `μ` and in `ln σ`.
-    pub mean_step: f64,
-    pub log_sd_step: f64,
+    /// IVON's step in `μ` as a fraction of the Newton step `(m + δ μ) / (h + δ)`, and the decay of
+    /// the gradient's momentum `m`. The curvature estimate averages over one epoch's batches and
+    /// sets `σ` (module note).
+    pub rate: f64,
     pub beta1: f64,
-    pub beta2: f64,
-    pub epsilon: f64,
     /// The seed of the weight noise and of the experiments' draws.
     pub seed: u64,
     /// The device's numeric buffers for operators (each of the native and the explanation).
@@ -724,11 +729,8 @@ impl Settings {
     fn validate(&self) -> Result<(), String> {
         let positive = |x: f64| x.is_finite() && x > 0.0;
         if self.batch_sequences == 0
-            || !positive(self.mean_step)
-            || !positive(self.log_sd_step)
-            || !positive(self.epsilon)
+            || !positive(self.rate)
             || !(0.0..1.0).contains(&self.beta1)
-            || !(0.0..1.0).contains(&self.beta2)
             || self.numeric_bytes == 0
             || self.head_tile_rows == 0
         {
@@ -1469,11 +1471,15 @@ fn check_checkpoint_identity(path: &Path, found: &Identity, identity: &Identity)
     }
 }
 
-/// Six f64 arrays per operator: mean, log standard deviation, then their four Adam moments.
+/// The arrays a checkpoint holds per trainable operator: `μ`, `ln σ` and IVON's state (the
+/// gradient's momentum and the curvature estimate), each as little-endian float64.
+const CHECKPOINT_ARRAYS: usize = 4;
+
+/// The payload bytes of a checkpoint of operators of `shapes`.
 fn checkpoint_payload_bytes(shapes: &[(usize, usize)]) -> Option<u64> {
     shapes.iter().try_fold(0_u64, |total, &(rows, cols)| {
         let cells = u64::try_from(rows).ok()?.checked_mul(u64::try_from(cols).ok()?)?;
-        total.checked_add(cells.checked_mul(6 * 8)?)
+        total.checked_add(cells.checked_mul(CHECKPOINT_ARRAYS as u64 * 8)?)
     })
 }
 
@@ -1503,8 +1509,8 @@ fn save_checkpoint(path: &Path, progress: &Progress, posterior: &DevicePosterior
     let mut file = std::io::BufWriter::new(std::fs::File::create(&partial).map_err(error)?);
     file.write_all(&(header.len() as u64).to_le_bytes()).map_err(error)?;
     file.write_all(&header).map_err(error)?;
-    // Per trainable operator `μ`, `ln σ` and Adam's moments (`μ`'s first and second, then
-    // `ln σ`'s), one operator on the host at a time.
+    // Per trainable operator `μ`, `ln σ` and IVON's state (the gradient's momentum and the
+    // curvature estimate), one operator on the host at a time.
     for i in 0..progress.shapes.len() {
         let (mean, log_sd, moments) = posterior.operator(i)?;
         for array in [&mean, &log_sd].into_iter().chain(&moments) {
@@ -1520,9 +1526,9 @@ fn save_checkpoint(path: &Path, progress: &Progress, posterior: &DevicePosterior
     std::fs::rename(&partial, path.with_extension("json")).map_err(error)
 }
 
-/// Restore a checkpoint of this fit into `posterior`, with Adam's moments per operator, or refuse
-/// one of another fit.
-fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) -> Result<(Progress, Vec<[Array2<f64>; 4]>), String> {
+/// Restore a checkpoint of this fit into `posterior`, with IVON's state per operator, or refuse one
+/// of another fit.
+fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) -> Result<(Progress, Vec<[Array2<f64>; 2]>), String> {
     let (progress, mut reader, payload_bytes): (Progress, _, _) = checkpoint_header(path)?;
     check_checkpoint_identity(path, &progress.identity, &expected.identity)?;
     let same_settings =
@@ -1558,6 +1564,35 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) 
     }
     posterior.active = progress.active.clone();
     Ok((progress, moments))
+}
+
+/// The posterior of a fit checkpoint of `explanation` (`OUT/checkpoint.bin`, [`fit`]): its means,
+/// log standard deviations and active groups, for reading a fit that is still running.
+pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Posterior, String> {
+    #[derive(Deserialize)]
+    struct Header {
+        tokens: usize,
+        shapes: Vec<(usize, usize)>,
+        active: Vec<bool>,
+    }
+    let (header, mut reader, payload_bytes): (Header, _, _) = checkpoint_header(path)?;
+    let mut posterior = Posterior::new(explanation, header.tokens)?;
+    if header.shapes != posterior.mean.iter().map(Array2::dim).collect::<Vec<_>>() || header.active.len() != posterior.active.len() {
+        return Err(format!("{}: a checkpoint of another explanation", path.display()));
+    }
+    if checkpoint_payload_bytes(&header.shapes) != Some(payload_bytes) {
+        return Err(format!("{}: a checkpoint of the wrong size", path.display()));
+    }
+    for i in 0..header.shapes.len() {
+        read_checkpoint_array(&mut reader, &mut posterior.mean[i])?;
+        read_checkpoint_array(&mut reader, &mut posterior.log_sd[i])?;
+        let mut state = Array2::zeros(header.shapes[i]);
+        for _ in 2..CHECKPOINT_ARRAYS {
+            read_checkpoint_array(&mut reader, &mut state)?;
+        }
+    }
+    posterior.active = header.active;
+    Ok(posterior)
 }
 
 /// Fit the library explanation of `native` to its interchange experiments on the training
@@ -1635,9 +1670,10 @@ pub fn fit(
         log::info!("library fit resumed at epoch {} from {}", progress.epoch, path.display());
     }
     let resumed_seconds = progress.seconds;
-    let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, resumed.as_deref(), u64::try_from(progress.step).map_err(error)?)?;
+    let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, resumed.as_deref(), u64::try_from(progress.step).map_err(error)?)?;
     drop(resumed);
-    let adam = Adam { mean_rate: settings.mean_step, log_sd_rate: settings.log_sd_step, beta1: settings.beta1, beta2: settings.beta2, epsilon: settings.epsilon };
+    // The curvature estimate averages over one epoch's batches: each batch weighs about once.
+    let ivon = Ivon { rate: settings.rate, beta1: settings.beta1, beta2: 1.0 - 1.0 / draws.len() as f64 };
     // Each group's size, whose `½ ln |G|` an active group's variance costs.
     let sizes: Vec<f64> = explanation.groups.iter().map(|g| g.cells.iter().map(|c| (c.rows.len() * c.cols.len()) as f64).sum()).collect();
     // After every save, the posterior-mean artifact goes next to the checkpoint (extension
@@ -1732,7 +1768,7 @@ pub fn fit(
             data_sum += data;
             description_sum += description;
             progress.step += 1;
-            device_posterior.step(&gradients, scale * LN_2, &adam, key)?;
+            device_posterior.step(&gradients, LN_2 / scored as f64, &ivon, key)?;
             log::info!(
                 "library step {epoch}.{b}: {:.6} bits per scored token, F estimate {:.6e} bits, {:.2} s",
                 bits.iter().flatten().sum::<f64>() / scored as f64,
@@ -1964,33 +2000,6 @@ mod tests {
         run_check::{layer_nodes, split_sites},
     };
 
-    /// Adam's moments for one parameter array: the host reference of the device step
-    /// (`Device::posterior_adam`).
-    #[derive(Clone)]
-    struct Moment {
-        first: Array2<f64>,
-        second: Array2<f64>,
-    }
-
-    impl Moment {
-        fn zeros(dim: (usize, usize)) -> Self {
-            Self { first: Array2::zeros(dim), second: Array2::zeros(dim) }
-        }
-
-        /// One Adam step of `value` along `gradient` (entries of removed groups are left alone).
-        fn step(&mut self, value: &mut Array2<f64>, gradient: &Array2<f64>, membership: &Array2<u32>, active: &[bool], rate: f64, settings: &Settings, step: i32) {
-            let (b1, b2) = (settings.beta1, settings.beta2);
-            let (c1, c2) = (1.0 - b1.powi(step), 1.0 - b2.powi(step));
-            ndarray::Zip::from(value).and(gradient).and(&mut self.first).and(&mut self.second).and(membership).for_each(|w, g, m, v, group| {
-                if active[*group as usize] {
-                    *m = b1 * *m + (1.0 - b1) * g;
-                    *v = b2 * *v + (1.0 - b2) * g * g;
-                    *w -= rate * (*m / c1) / ((*v / c2).sqrt() + settings.epsilon);
-                }
-            });
-        }
-    }
-
     /// The derivatives in `μ` and in `ln σ` of `data(θ) + Σ_G KL_G`, per trainable operator, from
     /// `data`'s gradient at the sample `θ = μ + σ ⊙ noise` (zero in removed groups); the host
     /// reference of the device step.
@@ -2138,7 +2147,7 @@ mod tests {
         assert_eq!(cells, posterior.mean.iter().map(Array2::len).sum::<usize>(), "the groups partition the parameters");
         let settings = settings();
         let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, None).unwrap();
-        let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, None, 0).unwrap();
+        let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 72.0, None, 0).unwrap();
         let evaluation = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
         for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
             let bits = bits.expect("every cut and the read patches are drawn");
@@ -2187,7 +2196,7 @@ mod tests {
         let settings = settings();
         let posterior = Posterior::new(&explanation, 72).unwrap();
         let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, None).unwrap();
-        let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, None, 0).unwrap();
+        let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 72.0, None, 0).unwrap();
         let without = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
         explanation.fixed_nats = 1000_f64.ln();
         let with = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
@@ -2255,11 +2264,8 @@ mod tests {
     fn settings() -> Settings {
         Settings {
             batch_sequences: 2,
-            mean_step: 0.01,
-            log_sd_step: 0.05,
+            rate: 0.1,
             beta1: 0.9,
-            beta2: 0.999,
-            epsilon: 1e-8,
             seed: 3,
             numeric_bytes: 1 << 26,
             head_tile_rows: 64,
@@ -2304,7 +2310,7 @@ mod tests {
         let device = Device::host();
         let posterior = Posterior::new(&explanation, 72).unwrap();
         let mut scorer = Scorer::new(&device, &native, &explanation, &settings, None).unwrap();
-        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, None, 0).unwrap();
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
         let evaluation = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
         for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
             let bits = bits.expect("every cut and the read patches are drawn");
@@ -2421,30 +2427,35 @@ mod tests {
         for log_sd in &mut posterior.log_sd {
             log_sd.mapv_inplace(|s| s + 0.6 * (rng.random::<f64>() - 0.5));
         }
-        let mut device_posterior = DevicePosterior::new(&device, &explanation, &posterior, None, 0).unwrap();
+        let tokens = 72.0;
+        let mut device_posterior = DevicePosterior::new(&device, &explanation, &posterior, tokens, None, 0).unwrap();
         // A data gradient per operator, weighted by `scale`, at the sample whose noise the device
         // regenerates from `key` (stream `i` for operator `i`).
         let (key, scale) = (99, 3.0);
         let gradients: Vec<Array2<f64>> = posterior.mean.iter().map(|m| m.mapv(|_| rng.random::<f64>() - 0.5)).collect();
-        let noise: Vec<Array2<f64>> = posterior
-            .mean
-            .iter()
-            .enumerate()
-            .map(|(i, m)| Array2::from_shape_fn(m.dim(), |(r, c)| f64::from(posterior_normal(key, i as u64, (r * m.ncols() + c) as u64))))
-            .collect();
         let uploaded: BTreeMap<usize, Tensor> = explanation.trainable.iter().zip(&gradients).map(|(op, g)| (*op, device.upload(g.view()).unwrap())).collect();
-        let adam = Adam { mean_rate: settings.mean_step, log_sd_rate: settings.log_sd_step, beta1: settings.beta1, beta2: settings.beta2, epsilon: settings.epsilon };
-        device_posterior.step(&uploaded, scale, &adam, key).unwrap();
+        let ivon = Ivon { rate: settings.rate, beta1: settings.beta1, beta2: 0.75 };
+        device_posterior.step(&uploaded, scale, &ivon, key).unwrap();
         let mut stepped = posterior.clone();
         device_posterior.download(&mut stepped).unwrap();
-        let weighted: Vec<Array2<f64>> = gradients.iter().map(|g| g * scale).collect();
-        let derivatives = derivatives(&posterior, &weighted, &noise);
+        // The host reference: IVON's first step from momentum zero and the curvature at which the
+        // posterior's standard deviations are IVON's.
+        let variance: Vec<f64> = posterior.moments().iter().map(|m| m.second / m.count).collect();
         let mut reference = posterior.clone();
-        let active = reference.active.clone();
-        for (i, (mean, log_sd)) in derivatives.iter().enumerate() {
-            let (dim, membership) = (reference.mean[i].dim(), reference.membership[i].clone());
-            Moment::zeros(dim).step(&mut reference.mean[i], mean, &membership, &active, settings.mean_step, &settings, 1);
-            Moment::zeros(dim).step(&mut reference.log_sd[i], log_sd, &membership, &active, settings.log_sd_step, &settings, 1);
+        for i in 0..reference.mean.len() {
+            let cols = reference.mean[i].ncols();
+            for ((r, c), mu) in reference.mean[i].indexed_iter_mut() {
+                let delta = 1.0 / (tokens * variance[posterior.membership[i][[r, c]] as usize]);
+                let sd = posterior.log_sd[i][[r, c]].exp();
+                let e = f64::from(posterior_normal(key, i as u64, (r * cols + c) as u64));
+                let g = scale * gradients[i][[r, c]];
+                let h0 = (1.0 / (tokens * sd * sd) - delta).max(0.0);
+                let d = g * e / sd - h0;
+                let h = (h0 + (1.0 - ivon.beta2) * d + 0.5 * (1.0 - ivon.beta2).powi(2) * d * d / (h0 + delta)).max(0.0);
+                let momentum = (1.0 - ivon.beta1) * g;
+                *mu -= ivon.rate * (momentum / (1.0 - ivon.beta1) + delta * *mu) / (h + delta);
+                reference.log_sd[i][[r, c]] = -0.5 * (tokens * (h + delta)).ln();
+            }
         }
         for (field, (device_values, host_values)) in [("μ", (&stepped.mean, &reference.mean)), ("ln σ", (&stepped.log_sd, &reference.log_sd))] {
             for (a, b) in device_values.iter().zip(host_values) {
@@ -2531,13 +2542,13 @@ mod tests {
             full_seconds: 1.0,
             prior: None,
         };
-        // The existing wire format: length-prefixed JSON, then six row-major f64 arrays per
+        // The wire format: length-prefixed JSON, then `CHECKPOINT_ARRAYS` row-major f64 arrays per
         // operator. This fixture is independent of the streaming decoder and requires no GPU.
         let header = serde_json::to_vec(&progress).unwrap();
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
         bytes.extend(header);
         for (i, &(rows, cols)) in progress.shapes.iter().enumerate() {
-            for field in 0..6 {
+            for field in 0..CHECKPOINT_ARRAYS {
                 for cell in 0..rows * cols {
                     bytes.extend(((100 * i + 10 * field + cell) as f64 + 0.25).to_le_bytes());
                 }
@@ -2599,7 +2610,7 @@ mod tests {
         other = expected.clone();
         other.settings.seed += 1;
         assert!(load_checkpoint(&path, &other, &mut posterior.clone()).unwrap_err().contains("another fit"));
-        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)]), Some(9 * 48));
+        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)]), Some(9 * 32));
         assert_eq!(checkpoint_payload_bytes(&[(usize::MAX, usize::MAX)]), None);
         std::fs::remove_file(path).unwrap();
     }

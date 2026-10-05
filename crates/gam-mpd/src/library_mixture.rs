@@ -776,8 +776,8 @@ mod tests {
             let values = program.operators[from].matrix();
             replace(program, to, values);
         }
-        let settings = Settings { batch_sequences: 2, mean_step: 0.01, log_sd_step: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8, seed: 3, numeric_bytes: 1 << 26, head_tile_rows: 64 };
-        let mut mixture = Mixture::new(&start, 2, Steps { rate: settings.log_sd_step, beta1: settings.beta1, beta2: settings.beta2, epsilon: settings.epsilon }).unwrap();
+        let settings = Settings { batch_sequences: 2, rate: 0.1, beta1: 0.9, seed: 3, numeric_bytes: 1 << 26, head_tile_rows: 64 };
+        let mut mixture = Mixture::new(&start, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
         let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
         let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
         let (train, held) = sequences.split_at(4);
