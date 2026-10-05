@@ -17,8 +17,7 @@
 //! * Interchange (`interchange`) with `P` alone: per base one read patch of one of `M`'s read
 //!   variables drawn uniformly, with `M`'s own directions (the library's start, the fit's fixed
 //!   questions: `read`) and with `P`'s current reads of the same rows (adaptive questions:
-//!   `read_adaptive`); a joint read patch, with `M`'s directions, of a random subset of the variables
-//!   at that variable's block, each included with probability ½ (`read_joint`); the complement patch of every block and the joint complement patch at a
+//!   `read_adaptive`); the complement patch of every block and the joint complement patch at a
 //!   uniformly drawn set of at least two blocks (its size uniform in `2..=2L`, where cancellation
 //!   between blocks shows), both of `P`'s current reads, since `M`'s reads span every block's whole
 //!   stream and leave no complement. Each with the source a sequence shared across the whole batch
@@ -112,13 +111,55 @@ fn checkpoint_mean(path: &Path, explanation: &library_mdl::Explanation) -> Resul
     Ok((library_mdl::posterior_mean(explanation, &posterior)?.f32_literals()?, size))
 }
 
+/// The circuit curves (`explanation_battery::circuit_curve`) of `M`'s MLP neurons on each task of
+/// `pairs` (`bench/vpd_2951/sva_export.py`), and their mean over the tasks.
+fn circuits(device: &Device, export: &Path, native: &gam_mpd::operator_program::OperatorProgram, layers: &[gam_mpd::run_check::LayerNodes], pairs: &Path, decomposition: Option<&Path>, settings: &Settings) -> Result<Value, String> {
+    #[derive(Deserialize)]
+    struct Task {
+        train: Vec<battery::Pair>,
+        test: Vec<battery::Pair>,
+    }
+    let record: Value = serde_json::from_slice(&std::fs::read(pairs).map_err(error)?).map_err(error)?;
+    let tasks: BTreeMap<String, Task> = serde_json::from_value(record["tasks"].clone()).map_err(error)?;
+    if decomposition.is_some() {
+        return Err("VPD's subcomponents as a circuit basis are not yet attributed".into());
+    }
+    let (model, unembedding) = battery::model(export, None)?;
+    let m = Side::of_model(device, &model, &unembedding, settings.numeric_bytes)?;
+    let none = |_: usize| -> Result<BTreeMap<usize, gam_gpu::tensor::Tensor>, String> { Ok(BTreeMap::new()) };
+    let count = layers.len();
+    let down = |l: usize| model.layout.inputs[battery::KINDS.len() * l + 5];
+    let neurons = battery::NodeBasis { side: &m, groups: (0..count).map(down).collect(), given: &none, unembedding: &unembedding };
+    let start = library_mdl::explanation(native, layers)?.artifact;
+    let library = gam_mpd::library_readout::Library::new(device, device, native, layers, &start, settings.numeric_bytes, settings.head_tile_rows)?;
+    let mut out = serde_json::Map::new();
+    let mut curves = Vec::new();
+    for (name, task) in &tasks {
+        let attribution = battery::neuron_attributions(&library, &task.train, count)?;
+        let curve = battery::circuit_curve(&neurons, &attribution, &task.train, &task.test)?;
+        log::info!("circuits: {name} neurons done");
+        curves.push(curve.clone());
+        out.insert(name.clone(), json!({"train": task.train.len(), "test": task.test.len(), "neurons": curve}));
+    }
+    if curves.is_empty() {
+        return Err("no tasks".into());
+    }
+    let mean = |key: &str| -> Vec<f64> {
+        let n = curves[0][key].as_array().map_or(0, Vec::len);
+        (0..n).map(|i| curves.iter().filter_map(|c| c[key][i].as_f64()).sum::<f64>() / curves.len() as f64).collect()
+    };
+    out.insert("mean".into(), json!({"neurons": {"k": curves[0]["k"], "faithfulness": mean("faithfulness"), "completeness": mean("completeness")}}));
+    Ok(Value::Object(out))
+}
+
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION";
-    let (export, settings_path, out, mode, kind, extra) = match &args[..] {
-        [e, s, o, m, k] => (e, s, o, m, k.as_str(), None),
-        [e, s, o, m, k, a] => (e, s, o, m, k.as_str(), Some(Path::new(a))),
+    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json";
+    let (export, settings_path, out, mode, kind, extra, more) = match &args[..] {
+        [e, s, o, m, k] => (e, s, o, m, k.as_str(), None, None),
+        [e, s, o, m, k, a] => (e, s, o, m, k.as_str(), Some(Path::new(a)), None),
+        [e, s, o, m, k, a, b] => (e, s, o, m, k.as_str(), Some(Path::new(a)), Some(Path::new(b))),
         _ => return Err(usage.into()),
     };
     let (export, settings_path) = (Path::new(export), Path::new(settings_path));
@@ -173,7 +214,14 @@ fn main() -> Result<(), String> {
         log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
         return Ok(());
     }
-    if kind != "library" {
+    if kind == "circuits" {
+        report["circuits"] = circuits(&device, export, &native, &layers, extra.ok_or(usage)?, more, &settings)?;
+        report["seconds"] = json!(started.elapsed().as_secs_f64());
+        save(&report)?;
+        log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
+        return Ok(());
+    }
+    if kind != "library" || more.is_some() {
         return Err(usage.into());
     }
     let artifact_path = extra;
@@ -224,27 +272,15 @@ fn main() -> Result<(), String> {
     let interchange = Interchange::new(&device, &native, &layers, &artifact, &explanation.trainable, variables.clone(), settings.numeric_bytes, settings.head_tile_rows)?;
     let read_of: Vec<usize> = (0..bases.len()).map(|_| rng.random_range(0..variables.len())).collect();
     let position_of: Vec<usize> = (0..bases.len()).map(|_| rng.random_range(0..bases[0].len())).collect();
-    let subset_of: Vec<Vec<usize>> = read_of
-        .iter()
-        .map(|&v| {
-            let at: Vec<usize> = (0..variables.len()).filter(|i| variables[*i].block == variables[v].block).collect();
-            let mut chosen = Vec::new();
-            while chosen.is_empty() {
-                chosen = at.iter().copied().filter(|_| rng.random_range(0..2) == 0).collect();
-            }
-            chosen
-        })
-        .collect();
     let joint_of: Vec<Vec<usize>> = (0..bases.len())
         .map(|_| {
             let k = rng.random_range(2..=blocks);
             interchange::hybrid_of(&mut rng, blocks, k).iter().enumerate().filter(|(_, x)| **x).map(|(b, _)| b).collect()
         })
         .collect();
-    // Per family (the read patch at M's directions, at P's, each block's complement, the joint
-    // complement, then the joint read patch) per source: bits and tokens over every base, and
-    // every token's bits.
-    let families = 4 + blocks;
+    // Per family (the read patch at M's directions, at P's, each block's complement, then the joint
+    // complement) per source: bits and tokens over every base, and every token's bits.
+    let families = 3 + blocks;
     let mut per_source = vec![vec![(0.0f64, 0usize); sources.len()]; families];
     let mut all: Vec<Tokens> = (0..families).map(|_| Tokens::default()).collect();
     let mut clean = Tokens::default();
@@ -262,7 +298,6 @@ fn main() -> Result<(), String> {
                 };
                 let read = at(Some(Patch::Read { variable: read_of[c * settings.batch_sequences + b] }));
                 fixed.push(read.clone());
-                fixed.push(at(Some(Patch::Reads { variables: subset_of[c * settings.batch_sequences + b].clone() })));
                 adaptive.push(read);
                 adaptive.extend((0..blocks).map(|block| at(Some(Patch::Complement { blocks: vec![block] }))));
                 adaptive.push(at(Some(Patch::Complement { blocks: joint_of[c * settings.batch_sequences + b].clone() })));
@@ -281,7 +316,6 @@ fn main() -> Result<(), String> {
                             continue;
                         }
                         Some(Patch::Read { .. }) => *read_family,
-                        Some(Patch::Reads { .. }) => 3 + blocks,
                         Some(Patch::Complement { blocks: one }) if one.len() == 1 => 2 + one[0],
                         Some(Patch::Complement { .. }) => 2 + blocks,
                     };
@@ -297,8 +331,7 @@ fn main() -> Result<(), String> {
         0 => "read".to_string(),
         1 => "read_adaptive".to_string(),
         f if f < 2 + blocks => format!("complement_block_{}", f - 2),
-        f if f == 2 + blocks => "complement_joint".to_string(),
-        _ => "read_joint".to_string(),
+        _ => "complement_joint".to_string(),
     };
     let mut patches = serde_json::Map::new();
     for f in 0..families {

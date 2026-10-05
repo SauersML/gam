@@ -540,26 +540,27 @@ fn build(export: &Export, config: &Config, factors: Option<&[Factors]>) -> Resul
     Ok((b, layout))
 }
 
-/// `M` (`decomposition` none) or VPD's masked decomposition of it, through the final normed
-/// stream, and the unembedding (`vocabulary × d`).
-pub fn model(export_dir: &Path, decomposition: Option<&Decomposition>) -> Result<(Model, Array2<f64>), String> {
+/// `M` (`factors` none) or VPD's masked decomposition of it with the sites' subcomponents
+/// `factors`, through the final normed stream, and the unembedding (`vocabulary × d`).
+pub fn model(export_dir: &Path, factors: Option<&[Factors]>) -> Result<(Model, Array2<f64>), String> {
     let export = Export::open(export_dir)?;
     let config = Config::of(&export)?;
-    let (b, layout) = build(&export, &config, decomposition.map(|d| d.sites.as_slice()))?;
+    let (b, layout) = build(&export, &config, factors)?;
     let program = b.program(config.vocab, layout.hidden)?;
     Ok((Model { program, layout }, export.tensor("wte")?))
 }
 
-/// `M` followed by VPD's causal-importance network (module note); its output nodes per site, in
-/// `M`'s order of the sites.
-pub fn importance_model(export_dir: &Path, decomposition: &Decomposition) -> Result<(Model, Vec<usize>), String> {
+/// `M` followed by VPD's causal-importance network `ci` of the sites `factors` (module note); its
+/// output nodes per site, in `M`'s order of the sites. The network's weights are released as their
+/// operators are made.
+fn importance_model(export_dir: &Path, factors: &[Factors], ci: CiNetwork) -> Result<(Model, Vec<usize>), String> {
     let export = Export::open(export_dir)?;
     let config = Config::of(&export)?;
     let (mut b, layout) = build(&export, &config, None)?;
-    let ci = &decomposition.ci;
-    let width = ci.input.0.ncols();
+    let CiNetwork { order, input, blocks, head: (head_w, head_b), heads, head_dim, rope_base, epsilon } = ci;
+    let width = input.0.ncols();
     let stream = uniform(width)?;
-    let head = native(ci.head_dim)?;
+    let head = native(head_dim)?;
     let concatenated =
         Interface::new(native(config.head_dim)?.groups().iter().copied().cycle().take(config.heads).collect::<Vec<Group>>()).map_err(error)?;
     let interface_of = |site: usize| -> Result<Interface, String> {
@@ -571,38 +572,39 @@ pub fn importance_model(export_dir: &Path, decomposition: &Decomposition) -> Res
     };
     let identity = b.identity("ci I", &stream);
     let bias = |b: &mut Builder, name: &str, rows: &Interface, row: &Array2<f64>| b.dense(name, rows, &Interface::constant(), row.t().to_owned());
-    let mut terms = Vec::with_capacity(ci.order.len());
+    let mut terms = Vec::with_capacity(order.len());
     let mut offset = 0;
-    for &site in &ci.order {
+    for &site in &order {
         let cols = interface_of(site)?;
         let w = cols.width();
-        let normed = b.node(Node::RmsNorm { input: layout.inputs[site], epsilon: ci.epsilon });
-        let op = b.dense(&format!("ci.input.{site}"), &stream, &cols, ci.input.0.slice(s![offset..offset + w, ..]).t().to_owned())?;
+        let normed = b.node(Node::RmsNorm { input: layout.inputs[site], epsilon });
+        let op = b.dense(&format!("ci.input.{site}"), &stream, &cols, input.0.slice(s![offset..offset + w, ..]).t().to_owned())?;
         terms.push((normed, op));
         offset += w;
     }
-    if offset != ci.input.0.nrows() {
+    if offset != input.0.nrows() {
         return Err(error("the network's input projection does not match the sites' widths"));
     }
-    let input_bias = bias(&mut b, "ci.input.b", &stream, &ci.input.1)?;
+    let input_bias = bias(&mut b, "ci.input.b", &stream, &input.1)?;
+    drop(input);
     let mut x = b.node(Node::Affine { terms, bias: Some(input_bias) });
-    let rotary = Rotary { base: ci.rope_base, dims: ci.head_dim as u32, half_split: true };
-    for (i, block) in ci.blocks.iter().enumerate() {
-        let h = b.node(Node::RmsNorm { input: x, epsilon: ci.epsilon });
+    let rotary = Rotary { base: rope_base, dims: head_dim as u32, half_split: true };
+    for (i, block) in blocks.into_iter().enumerate() {
+        let h = b.node(Node::RmsNorm { input: x, epsilon });
         let mut terms = vec![(x, identity)];
-        for j in 0..ci.heads {
-            let rows = j * ci.head_dim..(j + 1) * ci.head_dim;
+        for j in 0..heads {
+            let rows = j * head_dim..(j + 1) * head_dim;
             let mut map = |w: &Array2<f64>, part: &str| -> Result<usize, String> {
                 let op = b.dense(&format!("ci.{i}.{part}{j}"), &head, &stream, w.slice(s![rows.clone(), ..]).to_owned())?;
                 Ok(b.node(Node::Affine { terms: vec![(h, op)], bias: None }))
             };
             let (q, k, v) = (map(&block.q, "q")?, map(&block.k, "k")?, map(&block.v, "v")?);
-            let read = b.node(Node::Attend { query: q, key: k, value: v, scale: Scale::InverseSqrt(ci.head_dim as u32), rotary: Some(rotary), causal: false });
+            let read = b.node(Node::Attend { query: q, key: k, value: v, scale: Scale::InverseSqrt(head_dim as u32), rotary: Some(rotary), causal: false });
             let o = b.dense(&format!("ci.{i}.o{j}"), &stream, &head, block.o.slice(s![.., rows]).to_owned())?;
             terms.push((read, o));
         }
         let attended = b.node(Node::Affine { terms, bias: None });
-        let h = b.node(Node::RmsNorm { input: attended, epsilon: ci.epsilon });
+        let h = b.node(Node::RmsNorm { input: attended, epsilon });
         let hidden = uniform(block.fc1.0.ncols())?;
         let fc1 = b.dense(&format!("ci.{i}.fc1"), &hidden, &stream, block.fc1.0.t().to_owned())?;
         let fc1_bias = bias(&mut b, &format!("ci.{i}.fc1.b"), &hidden, &block.fc1.1)?;
@@ -613,13 +615,13 @@ pub fn importance_model(export_dir: &Path, decomposition: &Decomposition) -> Res
         x = b.node(Node::Affine { terms: vec![(attended, identity), (active, fc2)], bias: Some(fc2_bias) });
     }
     // The head, per site in the network's order, clamped to [0, 1]: relu(z) − relu(z − 1).
-    let mut outputs = vec![0; decomposition.sites.len()];
+    let mut outputs = vec![0; factors.len()];
     let mut offset = 0;
-    for &site in &ci.order {
-        let c = decomposition.sites[site].subcomponents();
+    for &site in &order {
+        let c = factors[site].subcomponents();
         let sub = native(c)?;
-        let op = b.dense(&format!("ci.head.{site}"), &sub, &stream, ci.head.0.slice(s![.., offset..offset + c]).t().to_owned())?;
-        let head_bias = bias(&mut b, &format!("ci.head.b.{site}"), &sub, &ci.head.1.slice(s![.., offset..offset + c]).to_owned())?;
+        let op = b.dense(&format!("ci.head.{site}"), &sub, &stream, head_w.slice(s![.., offset..offset + c]).t().to_owned())?;
+        let head_bias = bias(&mut b, &format!("ci.head.b.{site}"), &sub, &head_b.slice(s![.., offset..offset + c]).to_owned())?;
         let pre = b.node(Node::Affine { terms: vec![(x, op)], bias: Some(head_bias) });
         // One law per coordinate group: the subcomponents are one native group.
         let lower = b.node(Node::Pointwise { input: pre, laws: vec![Law::Relu; sub.groups().len()] });
@@ -992,29 +994,33 @@ pub struct Vpd {
 }
 
 impl Vpd {
+    /// Each program is built, compiled and released in turn, the network's weights as they are
+    /// used, so the host holds one program at a time.
     pub fn new(device: &Device, export: &Path, decomposition: Decomposition, numeric_bytes: usize) -> Result<Self, String> {
-        let (m_model, unembedding) = model(export, None)?;
-        let (e_model, _) = model(export, Some(&decomposition))?;
-        let (importance, outputs) = importance_model(export, &decomposition)?;
-        let sites = decomposition
-            .sites
-            .iter()
-            .zip(&e_model.layout.deltas)
-            .map(|(f, slot)| match e_model.program.declarations.slots[*slot] {
-                Slot::Raw { width } => Ok((f.layer, f.subcomponents(), width)),
-                Slot::Token { .. } => Err(error("a remainder's slot is not raw")),
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(Self {
-            m: Side::of_model(device, &m_model, &unembedding, numeric_bytes)?,
-            e: Side::of_model(device, &e_model, &unembedding, numeric_bytes)?,
-            importance: Side::compile(device, &importance.program, numeric_bytes)?,
-            outputs,
-            layout: e_model.layout,
-            m_layout: m_model.layout,
-            sites,
-            factors: decomposition.sites,
-        })
+        let Decomposition { sites: factors, ci } = decomposition;
+        let (importance, outputs) = {
+            let (built, outputs) = importance_model(export, &factors, ci)?;
+            (Side::compile(device, &built.program, numeric_bytes)?, outputs)
+        };
+        let (m, m_layout, unembedding) = {
+            let (built, unembedding) = model(export, None)?;
+            (Side::of_model(device, &built, &unembedding, numeric_bytes)?, built.layout, unembedding)
+        };
+        let (e, layout, sites) = {
+            let (built, _) = model(export, Some(&factors))?;
+            let sites = built
+                .layout
+                .deltas
+                .iter()
+                .zip(&factors)
+                .map(|(slot, f)| match built.program.declarations.slots[*slot] {
+                    Slot::Raw { width } => Ok((f.layer, f.subcomponents(), width)),
+                    Slot::Token { .. } => Err(error("a remainder's slot is not raw")),
+                })
+                .collect::<Result<_, _>>()?;
+            (Side::of_model(device, &built, &unembedding, numeric_bytes)?, built.layout, sites)
+        };
+        Ok(Self { m, e, importance, outputs, layout, m_layout, sites, factors })
     }
 
     pub fn layers(&self) -> usize {
@@ -1389,75 +1395,252 @@ fn cosines(a: &Array2<f64>, b: &Array2<f64>) -> Vec<f64> {
         .collect()
 }
 
-/// Why VPD's layer errors cancel (CI masks, remainder dropped). Layer `l`'s dropped part on a
-/// stream `x` entering it is `c_l(x)`, `M`'s layer increment less VPD's. Per pair `(l, L − 1)`, per
-/// token: the cosine at the final residual between `D_l` and `D_{L−1}`, the deviations from VPD's
-/// layer `l` alone and its last layer alone; `r = |c_{L−1}(x′) − c_{L−1}(x)| / |c_{L−1}(x)|`, `x`
-/// `M`'s stream entering the last layer and `x′` that stream with VPD's layer `l` alone; the
-/// cosine of that change with `D_l`, and of `c_{L−1}(x)` with `D_l`. Since the last layer's
-/// deviation is `D_{L−1} = −c_{L−1}(x)`, masking both gives `D_l + D_{L−1} − change`.
+/// Why removing VPD's inactive subcomponents from the last layer as well shrinks the error of
+/// removing them from an earlier layer `l`, with the CI and the rounded masks (remainder dropped).
+/// Per token, at the final residual: `D_l` = the final residual with VPD's layer `l` alone less
+/// `M`'s, `D_3` likewise for the last layer; `c_3(x)` = `M`'s last layer on the stream `x` less
+/// VPD's (what masking removes); `I_l = c_3(x_l) − c_3(x)`, `x_l` the stream entering the last
+/// layer with layer `l` masked and `x` `M`'s. Exactly, masking both gives `D_l + D_3 − I_l`. The
+/// intervention "no interaction" holds the last layer's removed part at its value on `M`'s stream,
+/// `M + D_l + D_3`; "`l` without `I_l`" is `M + D_l − I_l`. KL in bits per token.
 pub fn vpd_cancellation(vpd: &Vpd, bases: &[Vec<u32>], batch: usize, seed: u64) -> Result<Value, String> {
     let d = vpd.m.program.device().clone();
     let layers = vpd.layers();
     let last = layers - 1;
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut out: Vec<[Tokens; 4]> = (0..last).map(|_| Default::default()).collect();
+    let mut out: BTreeMap<&str, BTreeMap<String, Tokens>> = BTreeMap::new();
     for chunk in bases.chunks(batch) {
         let views: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
         let family = sequence_family(&views)?;
+        let length = views[0].len();
         let g = vpd.importances(&family)?;
-        let masks = Strategy::Ci.masks(&g, &mut rng);
         let (_, m_streams) = streams(&vpd.m, &family, |_| BTreeMap::new())?;
-        // The run with VPD at layer `only` alone: its stream entering the last layer, and its final residual.
-        let alone = |only: usize| -> Result<(Tensor, Tensor), String> {
-            let mut x: Option<Tensor> = (only > 0).then(|| d.copy(&m_streams[only])).transpose().map_err(error)?;
-            let mut entering = None;
-            for l in only..layers {
-                if l == last {
-                    entering = x.as_ref().map(|t| d.copy(t)).transpose().map_err(error)?;
-                }
-                x = Some(if l == only { vpd.e.layer(&family, l, x.as_ref(), vpd.given(&d, l, Some(&masks), family.rows)?)? } else { vpd.m.layer(&family, l, x.as_ref(), BTreeMap::new())? });
-            }
-            let entering = match entering {
-                Some(e) => e,
-                None => d.copy(&m_streams[last]).map_err(error)?,
-            };
-            Ok((entering, x.ok_or_else(|| error("no layers"))?))
-        };
-        let dropped = |x: &Tensor| -> Result<Array2<f64>, String> {
-            let m = d.download(&vpd.m.layer(&family, last, Some(x), BTreeMap::new())?).map_err(error)?;
-            let e = d.download(&vpd.e.layer(&family, last, Some(x), vpd.given(&d, last, Some(&masks), family.rows)?)?).map_err(error)?;
-            Ok(m - e)
-        };
+        let reference = Reference::of(vpd.m.logits(&family, &m_streams[layers], length)?)?;
         let m_final = d.download(&m_streams[layers]).map_err(error)?;
-        let (_, last_final) = alone(last)?;
-        let d_last = d.download(&last_final).map_err(error)? - &m_final;
-        let c_last = dropped(&m_streams[last])?;
-        for (l, stats) in out.iter_mut().enumerate() {
-            let (entering, final_l) = alone(l)?;
-            let d_l = d.download(&final_l).map_err(error)? - &m_final;
-            let change = dropped(&entering)? - &c_last;
-            stats[0].0.extend(cosines(&d_l, &d_last));
-            stats[1].0.extend(change.outer_iter().zip(c_last.outer_iter()).map(|(a, b)| {
-                let n = b.dot(&b).sqrt();
-                if n > 0.0 { a.dot(&a).sqrt() / n } else { 0.0 }
-            }));
-            stats[2].0.extend(cosines(&change, &d_l));
-            stats[3].0.extend(cosines(&c_last, &d_l));
+        for strategy in [Strategy::Ci, Strategy::Rounded] {
+            let masks = strategy.masks(&g, &mut rng);
+            let stats = out.entry(strategy.name()).or_default();
+            let mut add = |key: String, values: Vec<f64>| stats.entry(key).or_default().0.extend(values);
+            let kl = |x: &Array2<f64>| -> Result<Vec<f64>, String> {
+                let tensor = d.upload(x.view()).map_err(error)?;
+                let mut behaviour = Behaviour::default();
+                behaviour.add(&reference, &vpd.m.logits(&family, &tensor, length)?, &views)?;
+                Ok(behaviour.kl.0)
+            };
+            let norms = |x: &Array2<f64>| -> Vec<f64> { x.outer_iter().map(|r| r.dot(&r).sqrt()).collect() };
+            // The run with VPD at the layers `masked`: its final residual and its stream entering
+            // the last layer.
+            let run = |masked: &[usize]| -> Result<(Array2<f64>, Tensor), String> {
+                let mut x: Option<Tensor> = None;
+                let mut entering = None;
+                for l in 0..layers {
+                    if l == last {
+                        entering = Some(match &x {
+                            Some(t) => d.copy(t).map_err(error)?,
+                            None => d.copy(&m_streams[last]).map_err(error)?,
+                        });
+                    }
+                    x = Some(if masked.contains(&l) {
+                        vpd.e.layer(&family, l, x.as_ref(), vpd.given(&d, l, Some(&masks), family.rows)?)?
+                    } else {
+                        vpd.m.layer(&family, l, x.as_ref(), BTreeMap::new())?
+                    });
+                }
+                let final_residual = d.download(&x.ok_or_else(|| error("no layers"))?).map_err(error)?;
+                Ok((final_residual, entering.ok_or_else(|| error("no last layer"))?))
+            };
+            let removed = |x: &Tensor| -> Result<Array2<f64>, String> {
+                let m = d.download(&vpd.m.layer(&family, last, Some(x), BTreeMap::new())?).map_err(error)?;
+                let e = d.download(&vpd.e.layer(&family, last, Some(x), vpd.given(&d, last, Some(&masks), family.rows)?)?).map_err(error)?;
+                Ok(m - e)
+            };
+            let (f3, _) = run(&[last])?;
+            let d3 = &f3 - &m_final;
+            let c3 = removed(&m_streams[last])?;
+            add(format!("kl_{last}"), kl(&f3)?);
+            add(format!("norm_D{last}"), norms(&d3));
+            for l in 0..last {
+                let (fl, entering_l) = run(&[l])?;
+                let dl = &fl - &m_final;
+                let interaction = removed(&entering_l)? - &c3;
+                add(format!("kl_{l}"), kl(&fl)?);
+                add(format!("kl_{l}{last}"), kl(&run(&[l, last])?.0)?);
+                add(format!("kl_{l}{last}_no_interaction"), kl(&(&m_final + &dl + &d3))?);
+                add(format!("kl_{l}_without_I"), kl(&(&m_final + &dl - &interaction))?);
+                add(format!("norm_D{l}"), norms(&dl));
+                add(format!("norm_I{l}"), norms(&interaction));
+                add(format!("cos_I{l}_D{l}"), cosines(&interaction, &dl));
+                add(format!("cos_D{l}_D{last}"), cosines(&dl, &d3));
+            }
         }
         log::info!("battery: VPD cancellation on {} bases", chunk.len());
     }
-    let mut result = serde_json::Map::new();
-    for (l, stats) in out.iter().enumerate() {
-        result.insert(
-            format!("pair_{l}_{last}"),
-            json!({
-                "cos_deviations": stats[0].summary(),
-                "relative_change_of_last_dropped": stats[1].summary(),
-                "cos_change_deviation": stats[2].summary(),
-                "cos_last_dropped_deviation": stats[3].summary(),
-            }),
-        );
+    Ok(Value::Object(
+        out.iter().map(|(k, v)| (k.to_string(), Value::Object(v.iter().map(|(n, t)| (n.clone(), t.summary())).collect()))).collect(),
+    ))
+}
+
+// ------------------------------------------------------------------------------ circuits
+
+/// A pair of a prompt and its counterfactual of equal token count, with the prompt's next token
+/// (`target`) and the counterfactual's (`foil`): the subject-verb agreement pairs of Marks et al.
+/// (2025), tokenized once (`bench/vpd_2951/sva_export.py`).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct Pair {
+    pub clean: Vec<u32>,
+    pub counterfactual: Vec<u32>,
+    pub target: u32,
+    pub foil: u32,
+}
+
+/// A node basis of a model for circuits (Arora, Wu et al. 2026; Marks et al. 2025): node groups,
+/// each the columns of one node of a model program on the device, the raw slots that program
+/// takes, and per pair each node's RelP attribution summed over positions.
+pub struct NodeBasis<'a> {
+    pub side: &'a Side,
+    pub groups: Vec<usize>,
+    pub given: &'a dyn Fn(usize) -> Result<BTreeMap<usize, Tensor>, String>,
+    /// The unembedding (`vocabulary × d`) the final normed stream is read by.
+    pub unembedding: &'a Array2<f64>,
+}
+
+/// Pairs grouped by token count (a family runs sequences of one length).
+fn by_length(pairs: &[Pair]) -> BTreeMap<usize, Vec<&Pair>> {
+    let mut out: BTreeMap<usize, Vec<&Pair>> = BTreeMap::new();
+    for p in pairs {
+        out.entry(p.clean.len()).or_default().push(p);
     }
-    Ok(Value::Object(result))
+    out
+}
+
+impl NodeBasis<'_> {
+    /// One forward pass on `sequences` with every group's node replaced by `replace(group, value)`
+    /// where it returns one: the trace.
+    fn run(&self, sequences: &[&[u32]], replace: &dyn Fn(usize, &Array2<f64>) -> Option<Array2<f64>>) -> Result<(FamilyInputs, DeviceTrace), String> {
+        let family = sequence_family(sequences)?;
+        let d = self.side.program.device();
+        let trace = self.side.program.forward_span_given(&family, (self.given)(family.rows)?, None, self.side.hidden, |node, trace| {
+            let Some(g) = self.groups.iter().position(|n| *n == node) else { return Ok(None) };
+            let value = d.download(trace.value(node)?).map_err(error)?;
+            replace(g, &value).map(|v| d.upload(v.view()).map_err(error)).transpose()
+        })?;
+        Ok((family, trace))
+    }
+
+    /// Per group, every node's mean at each position over the prompts and counterfactuals of
+    /// `pairs` (positions × width; a position no prompt reaches is zero).
+    pub fn means(&self, pairs: &[Pair]) -> Result<Vec<Array2<f64>>, String> {
+        let d = self.side.program.device();
+        let longest = pairs.iter().map(|p| p.clean.len()).max().unwrap_or(0);
+        let mut sums: Vec<Array2<f64>> = Vec::new();
+        let mut counts = vec![0.0; longest];
+        for (length, group) in by_length(pairs) {
+            let sequences: Vec<&[u32]> = group.iter().flat_map(|p| [p.clean.as_slice(), p.counterfactual.as_slice()]).collect();
+            let (_, trace) = self.run(&sequences, &|_, _| None)?;
+            for (g, node) in self.groups.iter().enumerate() {
+                let value = d.download(trace.value(*node)?).map_err(error)?;
+                if sums.len() <= g {
+                    sums.push(Array2::zeros((longest, value.ncols())));
+                }
+                for (r, row) in value.outer_iter().enumerate() {
+                    let mut at = sums[g].row_mut(r % length);
+                    at += &row;
+                }
+            }
+            counts.iter_mut().take(length).for_each(|c| *c += sequences.len() as f64);
+        }
+        for s in &mut sums {
+            for (mut row, c) in s.outer_iter_mut().zip(&counts) {
+                if *c > 0.0 {
+                    row /= *c;
+                }
+            }
+        }
+        Ok(sums)
+    }
+
+    /// The mean over `pairs` of the logit difference `target − foil` at the last position, every
+    /// node outside `keep` (per group, per column) set to its mean at its position.
+    pub fn metric(&self, pairs: &[Pair], keep: Option<&[Vec<bool>]>, means: &[Array2<f64>]) -> Result<f64, String> {
+        let mut total = 0.0;
+        for (length, group) in by_length(pairs) {
+            let sequences: Vec<&[u32]> = group.iter().map(|p| p.clean.as_slice()).collect();
+            let replace = |g: usize, value: &Array2<f64>| -> Option<Array2<f64>> {
+                let keep = &keep?[g];
+                let mut out = value.clone();
+                for (r, mut row) in out.outer_iter_mut().enumerate() {
+                    for (c, v) in row.iter_mut().enumerate() {
+                        if !keep[c] {
+                            *v = means[g][[r % length, c]];
+                        }
+                    }
+                }
+                Some(out)
+            };
+            let (_, trace) = self.run(&sequences, &replace)?;
+            let hidden = self.side.program.device().download(trace.value(self.side.hidden)?).map_err(error)?;
+            for (i, p) in group.iter().enumerate() {
+                let h = hidden.row((i + 1) * length - 1);
+                total += h.dot(&self.unembedding.row(p.target as usize)) - h.dot(&self.unembedding.row(p.foil as usize));
+            }
+        }
+        Ok(total / pairs.len() as f64)
+    }
+}
+
+/// Faithfulness and completeness of the circuits of the `k` nodes of largest `|attribution|`
+/// (per group, per column) on `test`, for `k` the powers of two up to the node count and the count
+/// itself: `(m(C_k) − m(∅)) / (m(M) − m(∅))` with every node outside the circuit at its mean
+/// (faithfulness) and with the circuit itself at its mean (completeness), `∅` every node at its
+/// mean, means over `train`'s prompts and counterfactuals.
+pub fn circuit_curve(basis: &NodeBasis, attribution: &[Array1<f64>], train: &[Pair], test: &[Pair]) -> Result<Value, String> {
+    let means = basis.means(train)?;
+    let widths: Vec<usize> = attribution.iter().map(Array1::len).collect();
+    let mut order: Vec<(usize, usize)> = widths.iter().enumerate().flat_map(|(g, w)| (0..*w).map(move |c| (g, c))).collect();
+    order.sort_by(|a, b| attribution[b.0][b.1].abs().total_cmp(&attribution[a.0][a.1].abs()));
+    let total = order.len();
+    let keep_of = |k: usize, inside: bool| -> Vec<Vec<bool>> {
+        let mut keep: Vec<Vec<bool>> = widths.iter().map(|w| vec![!inside; *w]).collect();
+        for &(g, c) in &order[..k] {
+            keep[g][c] = inside;
+        }
+        keep
+    };
+    let full = basis.metric(test, None, &means)?;
+    let empty = basis.metric(test, Some(&keep_of(0, true)), &means)?;
+    let mut ks: Vec<usize> = (0..).map(|j| 1usize << j).take_while(|k| *k < total).collect();
+    ks.push(total);
+    let mut faithfulness = Vec::with_capacity(ks.len());
+    let mut completeness = Vec::with_capacity(ks.len());
+    for &k in &ks {
+        faithfulness.push((basis.metric(test, Some(&keep_of(k, true)), &means)? - empty) / (full - empty));
+        completeness.push((basis.metric(test, Some(&keep_of(k, false)), &means)? - empty) / (full - empty));
+    }
+    Ok(json!({"nodes": total, "m_model": full, "m_empty": empty, "k": ks, "faithfulness": faithfulness, "completeness": completeness}))
+}
+
+/// Per layer, each MLP neuron's RelP attribution (`library_readout::Library` on the library's
+/// starting artifact, whose MLP functions are `M`'s neurons) to the logit difference `target −
+/// foil` at the last position, the counterfactual as the baseline, summed over positions and
+/// averaged over `pairs`.
+pub fn neuron_attributions(library: &crate::library_readout::Library<'_>, pairs: &[Pair], layers: usize) -> Result<Vec<Array1<f64>>, String> {
+    let functions = library.functions();
+    let columns: Vec<Vec<usize>> = (0..layers)
+        .map(|l| functions.iter().enumerate().filter(|(_, f)| f.layer == l && matches!(f.kind, crate::library_readout::Kind::Mlp)).map(|(i, _)| i).collect())
+        .collect();
+    let mut out: Vec<Array1<f64>> = columns.iter().map(|c| Array1::zeros(c.len())).collect();
+    for p in pairs {
+        let prompt = crate::library_readout::Prompt {
+            tokens: p.clean.clone(),
+            baseline: Some(p.counterfactual.clone()),
+            metric: crate::library_readout::Metric::Difference { position: p.clean.len() - 1, target: p.target, foil: p.foil },
+        };
+        let attribution = library.attributions(&prompt)?.attributions.sum_axis(Axis(0));
+        for (acc, cols) in out.iter_mut().zip(&columns) {
+            for (a, c) in acc.iter_mut().zip(cols) {
+                *a += attribution[*c] / pairs.len() as f64;
+            }
+        }
+    }
+    Ok(out)
 }
