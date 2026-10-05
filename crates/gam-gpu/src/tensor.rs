@@ -1287,7 +1287,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.softmax_stats_rows(logits, scored),
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(shape("fixed-head f64 statistics require Host or CUDA".into())),
+            Backend::Metal(engine) => engine.softmax_stats_rows(logits, scored),
         }
     }
 
@@ -1563,7 +1563,7 @@ impl Device {
     /// (largest, sum) per row rescaled as the largest grows (the online softmax, summed in double),
     /// the expected rows accumulated alongside with the same rescaling, so the sweep costs the
     /// materialized form's two products and none of its memory. Float64 forms the logits, products
-    /// in `arithmetic`. The Apple GPU refuses ([`GpuError::NoDeviceKernel`]).
+    /// in `arithmetic`; the Apple GPU forms them in row tiles of about 32 MB.
     pub fn head_log_partition(
         &self,
         hidden: &Tensor,
@@ -1631,7 +1631,33 @@ impl Device {
                 Ok(stats.iter().map(|s| s[0]).collect())
             }
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the swept head log partition runs on the host or CUDA".to_string() }),
+            Backend::Metal(_) => {
+                // Row tiles whose logits fill about 32 MB, the size of CUDA's swept chunks.
+                let tile = ((1usize << 23) / classes).max(1);
+                let flags = scored.map(|s| match &s.data {
+                    IndexData::Metal(_, values) => Ok(values.as_slice()),
+                    _ => Err(foreign()),
+                });
+                let flags = flags.transpose()?;
+                let (into, back) = if transposed { (Op::N, Op::T) } else { (Op::T, Op::N) };
+                let mut expected = expected;
+                let mut partitions = Vec::with_capacity(rows);
+                for start in (0..rows).step_by(tile) {
+                    let n = tile.min(rows - start);
+                    let h = self.rows_of(hidden, start, n)?;
+                    let mut logits = self.zeros(n, classes)?;
+                    self.gemm(&mut logits, 1.0, &h, Op::N, head, into, 0.0, arithmetic)?;
+                    let part = flags.map(|f| self.upload_indices(&f[start..start + n])).transpose()?;
+                    let stats = self.softmax_stats_rows(&mut logits, part.as_ref())?;
+                    if let Some(out) = expected.as_deref_mut() {
+                        let mut mean = self.zeros(n, width)?;
+                        self.gemm(&mut mean, 1.0, &logits, Op::N, head, back, 0.0, arithmetic)?;
+                        self.set_rows(out, start, &mean)?;
+                    }
+                    partitions.extend(stats.iter().map(|s| s[0]));
+                }
+                Ok(partitions)
+            }
         }
     }
 
@@ -5413,6 +5439,31 @@ kernel void t_fill_entries(device const uint* at [[buffer(0)]], device float* x 
     ELEMENTS x[at[i]] = p.alpha;
 }
 
+// Each row's softmax in place and its (log partition, negative entropy) in `out` (rows × 2); a row
+// whose flag is zero (when `a`) becomes zero with zero statistics.
+kernel void t_softmax_stats(device float* logits [[buffer(0)]], device const uint* flags [[buffer(1)]], device float* out [[buffer(2)]],
+                            constant P& p [[buffer(3)]], uint group [[threadgroup_position_in_grid]],
+                            uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float shared[GROUP];
+    ROWS {
+        device float* z = logits + (ulong)r * p.cols;
+        if (p.a != 0 && flags[r] == 0) {
+            for (uint c = t; c < p.cols; c += GROUP) z[c] = 0.0f;
+            if (t == 0) { out[2 * r] = 0.0f; out[2 * r + 1] = 0.0f; }
+            continue;
+        }
+        float2 s = softmax_stats(z, p.cols, shared, t);
+        float log_sum = log(s.y), partial = 0.0f;
+        for (uint c = t; c < p.cols; c += GROUP) {
+            float q = exp(z[c] - s.x) / s.y;
+            if (q > 0.0f) partial += q * ((z[c] - s.x) - log_sum);
+            z[c] = q;
+        }
+        float entropy = group_sum(partial, shared, t);
+        if (t == 0) { out[2 * r] = s.x + log_sum; out[2 * r + 1] = entropy; }
+    }
+}
+
 kernel void t_softmax_quadratic(device const float* logits [[buffer(0)]], device const float* tangent [[buffer(1)]], device float* out [[buffer(2)]],
                                 constant P& p [[buffer(3)]], uint group [[threadgroup_position_in_grid]],
                                 uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
@@ -5983,6 +6034,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
         "t_argmax_rows",
         "t_fill_entries",
         "t_adam",
+        "t_softmax_stats",
         "t_reparameterize",
         "t_posterior_adam",
         "t_group_moments",
@@ -6236,6 +6288,19 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
             let buffers = [whole(buffer(target)?), whole(buffer(logits)?), whole(flags), whole(&kl)];
             self.rows("t_kl_rows", &buffers, logits.rows, logits.cols, p)?;
             Ok(self.stream.read::<f32>(&kl)?.into_iter().take(logits.rows).map(f64::from).collect())
+        }
+
+        pub(super) fn softmax_stats_rows(&self, logits: &mut Tensor, scored: Option<&Indices>) -> Result<Vec<[f64; 2]>, GpuError> {
+            let (flags, use_flags) = self.flags(scored)?;
+            let out = self.stream.alloc(2 * logits.rows)?;
+            let p = P { a: use_flags, ..P::default() };
+            self.rows("t_softmax_stats", &[whole(buffer(logits)?), whole(flags), whole(&out)], logits.rows, logits.cols, p)?;
+            let values = self.stream.read::<f32>(&out)?;
+            let stats: Vec<[f64; 2]> = values.chunks_exact(2).take(logits.rows).map(|v| [f64::from(v[0]), f64::from(v[1])]).collect();
+            if stats.iter().flatten().any(|v| !v.is_finite()) {
+                return Err(shape("nonfinite softmax statistics".into()));
+            }
+            Ok(stats)
         }
 
         pub(super) fn sampled_cotangent(&self, logits: &mut Tensor, uniforms: &Tensor, scored: Option<&Indices>) -> Result<(), GpuError> {

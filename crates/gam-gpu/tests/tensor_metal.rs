@@ -402,3 +402,28 @@ fn metal_adam_sets_and_box_charge_match_the_host() {
     let hk = down(&host, &hk);
     assert_within("charge coefficient", &down(&d, &dk), &hk, |r, c| gamma(cols + 8) * hk[[r, c]].abs());
 }
+
+#[test]
+fn metal_head_log_partition_matches_the_host() {
+    let Some(d) = metal() else { return };
+    let host = Device::host();
+    // Logits `h·e` of 16 f32 terms are within `γ_16 Σ |h||e|` (`δ` below); a log partition moves
+    // by at most `δ` and an expected head row `Σ q e` by `2δ max |e|` (the softmax's shift bound),
+    // plus its own sum's `γ_classes` and the product's `γ_classes` rounding.
+    let (rows, width, classes) = (7, 16, 300);
+    let (hidden, head) = (single(&matrix(rows, width, 11, 1.0)), single(&matrix(classes, width, 12, 1.0)));
+    let flags: Vec<u32> = (0..rows as u32).map(|r| u32::from(r != 3)).collect();
+    let delta = gamma(width) * width as f64;
+    for transposed in [false, true] {
+        let stored = if transposed { head.t().to_owned() } else { head.clone() };
+        let (mut he, mut de) = (host.zeros(rows, width).expect("zeros"), d.zeros(rows, width).expect("zeros"));
+        let (hf, df) = (host.upload_indices(&flags).expect("flags"), d.upload_indices(&flags).expect("flags"));
+        let hp = host.head_log_partition(&up(&host, &hidden), &up(&host, &stored), transposed, Some(&hf), Some(&mut he), Arithmetic::F32).expect("host");
+        let dp = d.head_log_partition(&up(&d, &hidden), &up(&d, &stored), transposed, Some(&df), Some(&mut de), Arithmetic::F32).expect("metal");
+        for (r, (a, b)) in dp.iter().zip(&hp).enumerate() {
+            assert!((a - b).abs() <= delta + gamma(classes) * b.abs().max(1.0), "row {r}: {a} against {b}");
+        }
+        let band = 2.0 * delta * largest(&head) + 2.0 * gamma(classes) * largest(&head);
+        assert_within("expected head rows", &down(&d, &de), &down(&host, &he), |_, _| band);
+    }
+}
