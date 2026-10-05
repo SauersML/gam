@@ -55,6 +55,15 @@ class Session:
         self.config = json.load(open(path))
         self.tokenizer = tokenizers.Tokenizer.from_file(self.config["tokenizer"])
         self.calls = 0
+        self.template = None
+        if self.config.get("chat_template"):
+            from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+            env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+            env.globals["raise_exception"] = lambda m: (_ for _ in ()).throw(ValueError(m))
+            env.filters["tojson"] = lambda x, **k: json.dumps(x, **k)
+            self.template = env.from_string(open(self.config["chat_template"]).read())
+            self.end_of_turn = self.tokenizer.token_to_id("<|im_end|>")
 
     def request(self, payload):
         self.calls += 1
@@ -66,7 +75,7 @@ class Session:
             s.connect(self.config["socket"])
             s.sendall((json.dumps(payload) + "\n").encode())
             chunks = []
-            while True:
+            while not chunks or not chunks[-1].endswith(b"\n"):
                 b = s.recv(1 << 20)
                 if not b:
                     break
@@ -81,6 +90,20 @@ class Session:
 
     def encode(self, text):
         return self.tokenizer.encode(text, add_special_tokens=False).ids
+
+    def chat(self, messages):
+        """The prompt's token ids: the chat template with a generation prompt and thinking disabled."""
+        if self.template is None:
+            raise SystemExit("this session's models have no chat template")
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+        text = self.template.render(messages=messages, add_generation_prompt=True, enable_thinking=False, bos_token="", eos_token="<|im_end|>")
+        return self.encode(text)
+
+    def option_item(self, item):
+        """{"messages" | "user", "options": [str]} -> the server's {"prompt", "options"} (each option ends its turn)."""
+        prompt = self.chat(item.get("messages") or item["user"])
+        return {"prompt": prompt, "options": [self.encode(o) + [self.end_of_turn] for o in item["options"]]}
 
     def piece(self, token):
         return repr(self.tokenizer.decode([int(token)]))
@@ -102,7 +125,11 @@ class Session:
         return obj
 
     def corpus(self, start, count, context):
-        rows = np.load(self.config["corpus"], mmap_mode="r")
+        path = self.config["corpus"]
+        if path.endswith(".u32"):
+            rows = np.memmap(path, dtype="<u4", mode="r").reshape(-1, 128)
+        else:
+            rows = np.load(path, mmap_mode="r")
         lo, hi = self.config.get("corpus_rows", [0, rows.shape[0]])
         if start < lo or start + count > hi:
             raise SystemExit(f"corpus rows {start} to {start + count} are outside this investigation's rows {lo} to {hi}")
@@ -229,7 +256,9 @@ def cmd_components(sess, a):
 def cmd_localize(sess, a):
     sequences = [sess.encode(t) for t in a.text]
     targets = [sess.encode(t)[0] for t in a.targets] if a.targets else None
-    out = sess.request({"op": "localize", "model": a.model, "reference": a.reference, "sequences": sequences, "targets": targets, "weights": a.weights})
+    scope = {"heads": a.heads, "layers": [int(x) for x in a.layers.split(",")] if a.layers else None}
+    out = sess.request({"op": "localize", "model": a.model, "reference": a.reference, "sequences": sequences, "targets": targets, "weights": a.weights,
+                        "scope": scope})
     print(f"targets {[sess.piece(t) for t in out['targets']]}: log-prob under {a.model} {[round(x, 3) for x in out['model_log_probability']]}, "
           f"under {a.reference} {[round(x, 3) for x in out['reference_log_probability']]}; mean gap {out['mean_gap_nats']:.3f} nats")
     rows = sorted(out["swaps"], key=lambda r: -abs(r["reference_gains_nats"]) - abs(r["model_loses_nats"]))
@@ -285,6 +314,64 @@ def cmd_activations(sess, a):
         toks = sequences[r["sequence"]]
         p = r["position"]
         print(f"  {r['value']:.4f} at sequence {r['sequence']} position {p}: ...{sess.tokenizer.decode(toks[max(0, p - a.window): p])!r} [[{sess.tokenizer.decode([toks[p]])}]]")
+
+
+def cmd_options(sess, a):
+    items = parse_json(a.items)
+    models = a.model.split(",")
+    server_items = [sess.option_item(it) for it in items]
+    intervention = sess.tokens_in(parse_json(a.intervention) or {})
+    choices = {}
+    for m in models:
+        out = sess.request({"op": "options", "model": m, "items": server_items, "intervention": intervention})
+        choices[m] = out["items"]
+    for i, it in enumerate(items):
+        user = (it.get("user") or it["messages"][-1]["content"])
+        print(f"item {i}: {user[:160]!r}")
+        for m in models:
+            r = choices[m][i]
+            lps = ", ".join(f"{o!r} {lp:.2f}" for o, lp in zip(it["options"], r["log_probabilities"]))
+            print(f"    {m}: chooses {it['options'][r['choice']]!r}  ({lps})")
+        if len(models) == 2 and choices[models[0]][i]["choice"] != choices[models[1]][i]["choice"]:
+            print("    -> the models choose differently")
+
+
+def cmd_chat(sess, a):
+    prompt = sess.chat(a.text)
+    for m in a.model.split(","):
+        out = sess.request({"op": "generate", "model": m, "tokens": prompt, "steps": a.steps, "stop": sess.end_of_turn,
+                            "edits": sess.tokens_in(parse_json(a.edits) or [])})
+        print(f"{m}: {sess.tokenizer.decode([g['token'] for g in out['generated']])!r}")
+
+
+def cmd_crossed_options(sess, a):
+    raw = parse_json(a.pairs)
+    pairs = [{"x0": sess.option_item(p["x0"]), "x1": sess.option_item(p["x1"]), "choice": p["choice"], "versus": p["versus"]} for p in raw]
+    out = sess.request({"op": "crossed_options", "model": a.model, "pairs": pairs, "a0": sess.tokens_in(parse_json(a.a0) or {}),
+                        "a1": sess.tokens_in(parse_json(a.a1))})
+    for p, r in zip(raw, out["pairs"]):
+        x0 = p["x0"].get("user") or p["x0"]["messages"][-1]["content"]
+        x1 = p["x1"].get("user") or p["x1"]["messages"][-1]["content"]
+        print(f"  x0={x0[-50:]!r} x1={x1[-50:]!r}: margin x0 {r['y_x0_a0']:+.2f} -> {r['y_x0_a1']:+.2f}, x1 {r['y_x1_a0']:+.2f} -> {r['y_x1_a1']:+.2f}, gamma {r['gamma']:+.2f}")
+    g, e0, e1 = out["gamma"], out["input_effect_a0"], out["input_effect_a1"]
+    print(f"margin = log-prob(option choice) - log-prob(option versus). Input effect under a0 {e0['mean']:+.3f} +- {e0['standard_error']:.3f}; "
+          f"under a1 {e1['mean']:+.3f} +- {e1['standard_error']:.3f}; gamma {g['mean']:+.3f} +- {g['standard_error']:.3f} nats over {g['count']} pairs")
+
+
+def cmd_localize_options(sess, a):
+    items = parse_json(a.items)
+    scope = {"heads": a.heads, "layers": [int(x) for x in a.layers.split(",")] if a.layers else None}
+    out = sess.request({"op": "localize_options", "model": a.model, "reference": a.reference, "items": [sess.option_item(it) for it in items],
+                        "weights": a.weights, "scope": scope})
+    print(f"{out['differing_items']} of {len(items)} items are chosen differently by {a.model} and {a.reference}")
+    if not out["differing_items"]:
+        return
+    print(f"mean margin of {a.model}'s choice over {a.reference}'s: {out['mean_margin_model_nats']:+.3f} under {a.model}, {out['mean_margin_reference_nats']:+.3f} under {a.reference}")
+    rows = sorted(out["swaps"], key=lambda r: -abs(r["reference_gains_nats"]) - abs(r["model_loses_nats"]))
+    print(f"single swaps, largest first (gains: {a.reference} given this site from {a.model}; loses: {a.model} given this site from {a.reference}; flips: items whose choice switches):")
+    for r in rows[: a.rows]:
+        print(f"  [{r['kind']}] {r['site']}: {a.reference} gains {r['reference_gains_nats']:+.3f} ({r['reference_flips']} flips), "
+              f"{a.model} loses {r['model_loses_nats']:+.3f} ({r['model_flips']} flips)")
 
 
 def cmd_unembed(sess, a):
@@ -344,7 +431,9 @@ def main(argv=None):
     s.add_argument("--top", type=int, default=8); s.set_defaults(f=cmd_components)
     s = sub.add_parser("localize", help="activation and weight swaps between two models")
     s.add_argument("model"); s.add_argument("reference"); s.add_argument("text", nargs="+"); s.add_argument("--targets", nargs="*")
-    s.add_argument("--weights", action="store_true"); s.add_argument("--rows", type=int, default=20); s.set_defaults(f=cmd_localize)
+    s.add_argument("--weights", action="store_true"); s.add_argument("--rows", type=int, default=20)
+    s.add_argument("--heads", action="store_true", help="also each head (slow: one run per head)"); s.add_argument("--layers", help="comma list of layers")
+    s.set_defaults(f=cmd_localize)
     s = sub.add_parser("scan", help="positions where two models disagree most")
     s.add_argument("model"); s.add_argument("reference"); s.add_argument("--start", type=int, default=0); s.add_argument("--rows", type=int, default=8)
     s.add_argument("--context", type=int, default=128); s.add_argument("--texts"); s.add_argument("--top", type=int, default=15)
@@ -361,12 +450,26 @@ def main(argv=None):
     s = sub.add_parser("unembed", help="direct-path token reading of a site's write")
     s.add_argument("model"); s.add_argument("--site"); s.add_argument("--text"); s.add_argument("--position", type=int, default=-1)
     s.add_argument("--vector"); s.add_argument("--top", type=int, default=10); s.set_defaults(f=cmd_unembed)
+    s = sub.add_parser("options", help="chat items: each option's log-probability and the chosen option, per model")
+    s.add_argument("model", help="model or comma list"); s.add_argument("--items", required=True, help='JSON or @file: [{"user": text, "options": [text, ...]}]')
+    s.add_argument("--intervention"); s.set_defaults(f=cmd_options)
+    s = sub.add_parser("chat", help="greedy chat response to one user message"); s.add_argument("model", help="model or comma list")
+    s.add_argument("text"); s.add_argument("--steps", type=int, default=40); s.add_argument("--edits"); s.set_defaults(f=cmd_chat)
+    s = sub.add_parser("crossed-options", help="crossed intervention gamma on option margins")
+    s.add_argument("model"); s.add_argument("--pairs", required=True, help='[{"x0": item, "x1": item, "choice": i, "versus": j}]')
+    s.add_argument("--a0"); s.add_argument("--a1", required=True); s.set_defaults(f=cmd_crossed_options)
+    s = sub.add_parser("localize-options", help="activation and weight swaps between two models on chat items")
+    s.add_argument("model"); s.add_argument("reference"); s.add_argument("--items", required=True); s.add_argument("--weights", action="store_true")
+    s.add_argument("--rows", type=int, default=20)
+    s.add_argument("--heads", action="store_true", help="also each head (slow: one run per head)"); s.add_argument("--layers", help="comma list of layers")
+    s.set_defaults(f=cmd_localize_options)
     s = sub.add_parser("raw", help="send one request in the server's JSON"); s.add_argument("request"); s.set_defaults(f=cmd_raw)
     a = p.parse_args(argv)
     sess = None if a.cmd == "help-interventions" else Session()
     allowed = sess.config.get("allowed") if sess else None
     if allowed is not None:
-        clean_only = a.cmd == "run" and "run" not in allowed and "run-clean" in allowed
+        clean_only = (a.cmd == "run" and "run" not in allowed and "run-clean" in allowed) or \
+            (a.cmd == "options" and "options" not in allowed and "options-clean" in allowed)
         if clean_only and getattr(a, "intervention", None):
             raise SystemExit("interventions are not available in this investigation")
         if a.cmd not in allowed and not clean_only:

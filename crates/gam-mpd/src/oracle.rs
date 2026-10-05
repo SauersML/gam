@@ -134,6 +134,17 @@ pub enum Side {
     Output,
 }
 
+/// Which sites a localization swaps: each layer's attention and MLP, or (with `heads`) also each
+/// head and each head's operators; within `layers` when given.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scope {
+    #[serde(default)]
+    pub heads: bool,
+    #[serde(default)]
+    pub layers: Option<Vec<usize>>,
+}
+
 /// One edit `(α − 1) P_c` of `W(α)`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -150,6 +161,27 @@ pub struct Intervention {
     pub edits: Vec<Edit>,
     #[serde(default)]
     pub patches: Vec<Patch>,
+}
+
+/// A prompt and candidate continuations (each with its end-of-turn token, when the protocol has
+/// one): the organisms' behaviour protocol scores each option by the summed log-probability of its
+/// tokens after the prompt.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptionItem {
+    pub prompt: Vec<u32>,
+    pub options: Vec<Vec<u32>>,
+}
+
+/// A crossed pair of option items: the response is the log-probability margin of option `choice`
+/// over option `versus` (indices shared by both items).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptionPair {
+    pub x0: OptionItem,
+    pub x1: OptionItem,
+    pub choice: usize,
+    pub versus: usize,
 }
 
 /// One crossed pair: inputs `x₀`, `x₁` and the response `y` at a position of each.
@@ -201,6 +233,37 @@ pub struct RunRequest {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Info,
+    /// Several requests, answered in order, each `{"ok": ...}` or `{"error": ...}`.
+    Batch { requests: Vec<Request> },
+    /// Per item, each option's summed log-probability under an intervention.
+    Options {
+        model: String,
+        items: Vec<OptionItem>,
+        #[serde(default)]
+        intervention: Intervention,
+    },
+    /// Crossed interventions on option margins.
+    CrossedOptions {
+        model: String,
+        pairs: Vec<OptionPair>,
+        #[serde(default)]
+        a0: Intervention,
+        a1: Intervention,
+    },
+    /// Which sites carry `model`'s different choices from `reference` on option items: the margin
+    /// of `model`'s choice over `reference`'s under single-site activation and weight swaps.
+    LocalizeOptions {
+        model: String,
+        reference: String,
+        items: Vec<OptionItem>,
+        #[serde(default)]
+        weights: bool,
+        #[serde(default)]
+        scope: Scope,
+    },
+    /// Writes `W(α) − W` of every edited operator to `directory/<operator>.f64` (float64,
+    /// little-endian, row-major) and lists them with their shapes.
+    Delta { model: String, edits: Vec<Edit>, directory: String },
     /// Next-token distributions at chosen positions under an intervention.
     Run(RunRequest),
     Crossed {
@@ -216,6 +279,9 @@ pub enum Request {
         steps: usize,
         #[serde(default)]
         edits: Vec<Edit>,
+        /// Stop after this token (an end of turn).
+        #[serde(default)]
+        stop: Option<u32>,
     },
     Attention {
         model: String,
@@ -271,6 +337,8 @@ pub enum Request {
         targets: Option<Vec<u32>>,
         #[serde(default)]
         weights: bool,
+        #[serde(default)]
+        scope: Scope,
     },
     /// KL(model ‖ reference) per position over sequences, the largest positions listed.
     Scan {
@@ -319,6 +387,8 @@ pub struct Native {
     pub head_width: usize,
     pub mlp_width: usize,
     pub vocab: usize,
+    /// The bytes one input row's node values take in a run (every node's width, float64).
+    pub row_bytes: usize,
     operators: BTreeMap<String, usize>,
     /// The final norm's gain and the unembedding operator (`true`: read transposed, `h A`).
     final_gain: Array1<f64>,
@@ -360,7 +430,9 @@ impl Native {
             other => return Err(format!("the head does not read a gained norm: {other:?}")),
         };
         let embedding = operators.get("wte").copied();
+        let row_bytes = program.interfaces().map_err(|e| e.to_string())?.iter().map(|i| i.width()).sum::<usize>() * std::mem::size_of::<f64>();
         Ok(Self {
+            row_bytes,
             width: width_of(first.stream)?,
             heads: first.reads.len(),
             kv_heads: first.keys.len(),
@@ -509,15 +581,23 @@ enum Local {
     Add(Array1<f64>),
 }
 
+/// Per sequence, the logits at its reported positions, and per recorded node the values there.
+struct Measured {
+    logits: Vec<Vec<Array1<f64>>>,
+    recorded: Vec<Vec<Vec<Array1<f64>>>>,
+}
+
 pub struct Session {
     pub models: BTreeMap<String, Native>,
+    /// The memory a run's node values may take; requests run their sequences in groups within it.
+    pub work_bytes: usize,
     /// Thin singular value decompositions of operator differences, by (model, reference, operator).
     differences: HashMap<(String, String, String), Arc<gam_linalg::decompose::Svd>>,
 }
 
 impl Session {
-    pub fn new(models: BTreeMap<String, Native>) -> Self {
-        Self { models, differences: HashMap::new() }
+    pub fn new(models: BTreeMap<String, Native>, work_bytes: usize) -> Self {
+        Self { models, work_bytes, differences: HashMap::new() }
     }
 
     fn model(&self, name: &str) -> Result<&Native, String> {
@@ -692,8 +772,11 @@ impl Session {
             PatchValue::Scale { factor } => (Local::Scale(*factor), rows.iter().map(|_| None).collect()),
             PatchValue::Add { vector } => (Local::Add(Array1::from(vector.clone())), rows.iter().map(|_| None).collect()),
             PatchValue::Mean { sequences: reference } => {
-                let (values, _) = self.execute(model, program, reference, &[], edits)?;
-                let mean = values[node].mean_axis(Axis(0)).ok_or("no reference rows")?;
+                let every: Vec<Vec<usize>> = reference.iter().map(|t| (0..t.len()).collect()).collect();
+                let measured = self.measure(model, reference, &every, &Intervention { edits: edits.to_vec(), patches: vec![] }, &[node])?;
+                let all: Vec<&Array1<f64>> = measured.recorded.iter().flat_map(|r| r[0].iter()).collect();
+                let first = all.first().ok_or("no reference rows")?;
+                let mean = all.iter().fold(Array1::zeros(first.len()), |acc, v| acc + *v) / all.len() as f64;
                 (Local::Fixed, rows.iter().map(|_| Some(mean.clone())).collect())
             }
             PatchValue::Source { tokens, model: source_model, positions } => {
@@ -734,14 +817,30 @@ impl Session {
     pub fn handle(&mut self, request: &Request) -> Result<Value, String> {
         match request {
             Request::Info => Ok(self.info()),
+            Request::Batch { requests } => Ok(Value::Array(
+                requests
+                    .iter()
+                    .map(|r| match self.handle(r) {
+                        Ok(v) => json!({"ok": v}),
+                        Err(e) => json!({"error": e}),
+                    })
+                    .collect(),
+            )),
+            Request::Options { model, items, intervention } => {
+                let lp = self.option_log_probabilities(model, items, intervention)?;
+                Ok(json!({"items": lp.iter().map(|o| json!({"log_probabilities": o, "choice": argmax(o)})).collect::<Vec<_>>()}))
+            }
+            Request::CrossedOptions { model, pairs, a0, a1 } => self.crossed_options(model, pairs, a0, a1),
+            Request::LocalizeOptions { model, reference, items, weights, scope } => self.localize_options(model, reference, items, *weights, scope),
+            Request::Delta { model, edits, directory } => self.delta_files(model, edits, directory),
             Request::Run(r) => self.run(r),
             Request::Crossed { model, pairs, a0, a1 } => self.crossed(model, pairs, a0, a1),
-            Request::Generate { model, tokens, steps, edits } => self.generate(model, tokens, *steps, edits),
+            Request::Generate { model, tokens, steps, edits, stop } => self.generate(model, tokens, *steps, edits, *stop),
             Request::Attention { model, tokens, layer, head, edits, top } => self.attention(model, tokens, *layer, *head, edits, *top),
             Request::Unembed { model, vector, site, tokens, position, top } => self.unembed(model, vector.as_deref(), site.as_ref(), tokens.as_deref(), *position, *top),
             Request::Difference { model, reference, spectrum, top } => self.difference_summary(model, reference, *spectrum, *top),
             Request::Components { model, reference, name, count, top, vectors } => self.components(model, reference, name, *count, *top, *vectors),
-            Request::Localize { model, reference, sequences, targets, weights } => self.localize(model, reference, sequences, targets.as_deref(), *weights),
+            Request::Localize { model, reference, sequences, targets, weights, scope } => self.localize(model, reference, sequences, targets.as_deref(), *weights, scope),
             Request::Scan { model, reference, sequences, top } => self.scan(model, reference, sequences, *top),
             Request::ContextScan { model, sequences, keep, top } => self.context_scan(model, sequences, *keep, *top),
             Request::Activations { model, site, sequences, coordinate, direction, top } => self.activations(model, site, sequences, *coordinate, direction.as_deref(), *top),
@@ -766,17 +865,47 @@ impl Session {
         json!({ "models": models })
     }
 
-    /// Log-probabilities at each sequence's reported positions under `intervention`.
-    fn logits_at(&mut self, model: &str, sequences: &[Vec<u32>], positions: &[Vec<usize>], intervention: &Intervention) -> Result<(Vec<Vec<Array1<f64>>>, Vec<Array2<f64>>, Vec<usize>), String> {
+    /// Logits (and the values of `record` nodes) at each sequence's reported positions under
+    /// `intervention`, the sequences run in groups whose node values fit the work budget.
+    fn measure(&mut self, model: &str, sequences: &[Vec<u32>], positions: &[Vec<usize>], intervention: &Intervention, record: &[usize]) -> Result<Measured, String> {
         let program = self.edited(model, &intervention.edits)?;
-        let (values, offsets) = self.execute(model, &program, sequences, &intervention.patches, &intervention.edits)?;
-        let logits = &values[program.output];
-        let rows = positions
-            .iter()
-            .zip(&offsets)
-            .map(|(list, offset)| list.iter().map(|p| logits.row(offset + p).to_owned()).collect())
-            .collect();
-        Ok((rows, values, offsets))
+        let per_row = self.model(model)?.row_bytes;
+        let rows_allowed = (self.work_bytes / per_row).max(1);
+        let mut measured = Measured { logits: Vec::with_capacity(sequences.len()), recorded: Vec::with_capacity(sequences.len()) };
+        let mut start = 0;
+        while start < sequences.len() {
+            let mut end = start + 1;
+            let mut rows = sequences[start].len();
+            while end < sequences.len() && rows + sequences[end].len() <= rows_allowed {
+                rows += sequences[end].len();
+                end += 1;
+            }
+            // Patches name sequences of the whole request; a group sees its own members.
+            let patches: Vec<Patch> = intervention
+                .patches
+                .iter()
+                .filter_map(|patch| match &patch.sequences {
+                    None => Some(patch.clone()),
+                    Some(list) => {
+                        let local: Vec<usize> = list.iter().filter(|s| (start..end).contains(*s)).map(|s| s - start).collect();
+                        (!local.is_empty()).then(|| Patch { sequences: Some(local), ..patch.clone() })
+                    }
+                })
+                .collect();
+            let (values, offsets) = self.execute(model, &program, &sequences[start..end], &patches, &intervention.edits)?;
+            let logits = &values[program.output];
+            for (local, list) in positions[start..end].iter().enumerate() {
+                let offset = offsets[local];
+                measured.logits.push(list.iter().map(|p| logits.row(offset + p).to_owned()).collect());
+                measured.recorded.push(record.iter().map(|node| list.iter().map(|p| values[*node].row(offset + p).to_owned()).collect()).collect());
+            }
+            start = end;
+        }
+        Ok(measured)
+    }
+
+    fn logits_at(&mut self, model: &str, sequences: &[Vec<u32>], positions: &[Vec<usize>], intervention: &Intervention) -> Result<Vec<Vec<Array1<f64>>>, String> {
+        Ok(self.measure(model, sequences, positions, intervention, &[])?.logits)
     }
 
     fn run(&mut self, r: &RunRequest) -> Result<Value, String> {
@@ -789,9 +918,10 @@ impl Session {
                 None => resolve(-1, s.len()).map(|p| vec![p]),
             })
             .collect::<Result<_, _>>()?;
-        let (rows, values, offsets) = self.logits_at(model, sequences, &reported, intervention)?;
-        let reference = if clean { Some(self.logits_at(model, sequences, &reported, &Intervention::default())?.0) } else { None };
-        let native = self.model(model)?;
+        let nodes = record.iter().map(|site| self.model(model)?.node(site)).collect::<Result<Vec<_>, _>>()?;
+        let measured = self.measure(model, sequences, &reported, intervention, &nodes)?;
+        let rows = &measured.logits;
+        let reference = if clean { Some(self.logits_at(model, sequences, &reported, &Intervention::default())?) } else { None };
         let mut out = Vec::new();
         for (s, list) in reported.iter().enumerate() {
             let mut entries = Vec::new();
@@ -817,10 +947,9 @@ impl Session {
                     entry["next"] = json!([t, lp[*t as usize]]);
                 }
                 let mut recorded = Vec::new();
-                for site in record {
-                    let node = native.node(site)?;
-                    let v = values[node].row(offsets[s] + p).to_owned();
-                    let mut r = json!({"site": format!("{site:?}"), "norm": v.dot(&v).sqrt()});
+                for (k, site) in record.iter().enumerate() {
+                    let v = &measured.recorded[s][k][i];
+                    let mut r = json!({"site": format!("{site:?}"), "norm": v.dot(v).sqrt()});
                     if matches!(site, Site::Neurons { .. }) {
                         let magnitude = v.mapv(f64::abs);
                         let (high, _) = extremes(&magnitude, top);
@@ -862,8 +991,8 @@ impl Session {
                 None => y,
             })
         };
-        let under0 = self.logits_at(model, &sequences, &positions, a0)?.0;
-        let under1 = self.logits_at(model, &sequences, &positions, a1)?.0;
+        let under0 = self.logits_at(model, &sequences, &positions, a0)?;
+        let under1 = self.logits_at(model, &sequences, &positions, a1)?;
         let mut out = Vec::new();
         let mut gammas = Vec::new();
         let mut effects = (Vec::new(), Vec::new());
@@ -876,16 +1005,10 @@ impl Session {
             effects.1.push(y11 - y01);
             out.push(json!({"y_x0_a0": y00, "y_x1_a0": y10, "y_x0_a1": y01, "y_x1_a1": y11, "input_effect_a0": y10 - y00, "input_effect_a1": y11 - y01, "gamma": gamma}));
         }
-        let summary = |v: &[f64]| {
-            let n = v.len() as f64;
-            let mean = v.iter().sum::<f64>() / n;
-            let var = if v.len() > 1 { v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0) } else { f64::NAN };
-            json!({"mean": mean, "standard_error": (var / n).sqrt(), "count": v.len()})
-        };
         Ok(json!({"pairs": out, "gamma": summary(&gammas), "input_effect_a0": summary(&effects.0), "input_effect_a1": summary(&effects.1)}))
     }
 
-    fn generate(&mut self, model: &str, tokens: &[u32], steps: usize, edits: &[Edit]) -> Result<Value, String> {
+    fn generate(&mut self, model: &str, tokens: &[u32], steps: usize, edits: &[Edit], stop: Option<u32>) -> Result<Value, String> {
         let program = self.edited(model, edits)?;
         let vocab = self.model(model)?.vocab;
         let mut sequence = tokens.to_vec();
@@ -897,6 +1020,9 @@ impl Session {
             let (next, _) = high[0];
             chosen.push(json!({"token": next, "log_probability": lp[next], "alternatives": high[1..].iter().map(|(t, v)| json!([t, v])).collect::<Vec<_>>()}));
             sequence.push(next as u32);
+            if stop == Some(next as u32) {
+                break;
+            }
         }
         Ok(json!({"generated": chosen}))
     }
@@ -1020,11 +1146,11 @@ impl Session {
 
     /// Per sequence, the response `y` = log-probability of the target (default: `model`'s top
     /// token at the last position) under `reference`, `model`, and each single-site swap.
-    fn localize(&mut self, model: &str, reference: &str, sequences: &[Vec<u32>], targets: Option<&[u32]>, weights: bool) -> Result<Value, String> {
+    fn localize(&mut self, model: &str, reference: &str, sequences: &[Vec<u32>], targets: Option<&[u32]>, weights: bool, scope: &Scope) -> Result<Value, String> {
         let last: Vec<Vec<usize>> = sequences.iter().map(|s| resolve(-1, s.len()).map(|p| vec![p])).collect::<Result<_, _>>()?;
         let none = Intervention::default();
-        let upd = self.logits_at(model, sequences, &last, &none)?.0;
-        let base = self.logits_at(reference, sequences, &last, &none)?.0;
+        let upd = self.logits_at(model, sequences, &last, &none)?;
+        let base = self.logits_at(reference, sequences, &last, &none)?;
         let targets: Vec<usize> = match targets {
             Some(t) if t.len() == sequences.len() => t.iter().map(|x| *x as usize).collect(),
             Some(t) => return Err(format!("{} targets for {} sequences", t.len(), sequences.len())),
@@ -1034,14 +1160,7 @@ impl Session {
             rows.iter().zip(&targets).map(|(r, t)| log_softmax(&r[0].to_vec()).map(|lp| lp[*t]).map_err(|e| format!("{e:?}"))).collect()
         };
         let (y_model, y_reference) = (y(&upd)?, y(&base)?);
-        let native = self.model(model)?;
-        let (count, heads, kv_heads) = (native.layers.len(), native.heads, native.kv_heads);
-        let mut sites = Vec::new();
-        for layer in 0..count {
-            sites.push(Site::Attention { layer });
-            sites.extend((0..heads).map(|head| Site::Head { layer, head }));
-            sites.push(Site::Mlp { layer });
-        }
+        let sites = self.swap_sites(model, scope)?;
         let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
         let gap: Vec<f64> = y_model.iter().zip(&y_reference).map(|(a, b)| a - b).collect();
         let mut rows = Vec::new();
@@ -1051,33 +1170,24 @@ impl Session {
                 edits: vec![],
                 patches: vec![Patch { site: site.clone(), sequences: None, positions: None, coordinates: None, direction: None, value: PatchValue::Source { tokens: None, model: Some(from.to_string()), positions: None } }],
             };
-            let gained = y(&self.logits_at(reference, sequences, &last, &into(model))?.0)?;
-            let kept = y(&self.logits_at(model, sequences, &last, &into(reference))?.0)?;
+            let gained = y(&self.logits_at(reference, sequences, &last, &into(model))?)?;
+            let kept = y(&self.logits_at(model, sequences, &last, &into(reference))?)?;
             let reproduced: Vec<f64> = gained.iter().zip(&y_reference).map(|(g, b)| g - b).collect();
             let removed: Vec<f64> = y_model.iter().zip(&kept).map(|(m, k)| m - k).collect();
             rows.push(json!({"site": format!("{site:?}"), "kind": "activation",
                 "reference_gains_nats": mean(&reproduced), "model_loses_nats": mean(&removed)}));
         }
         if weights {
-            let names: Vec<(String, Vec<String>)> = (0..count)
-                .flat_map(|l| {
-                    let mut groups: Vec<(String, Vec<String>)> = (0..heads).map(|h| (format!("layer {l} head {h} (q, o)"), vec![format!("blocks.{l}.q{h}"), format!("blocks.{l}.o{h}")])).collect();
-                    groups.push((format!("layer {l} keys and values"), (0..kv_heads).flat_map(|g| [format!("blocks.{l}.k{g}"), format!("blocks.{l}.v{g}")]).collect()));
-                    groups.push((format!("layer {l} MLP"), ["c_fc", "gate_proj", "down_proj"].iter().map(|p| format!("blocks.{l}.{p}")).collect()));
-                    groups
-                })
-                .collect();
-            for (label, group) in names {
-                let present: Vec<String> = group.into_iter().filter(|n| self.models.get(model).is_some_and(|m| m.operators.contains_key(n))).collect();
+            for (label, present) in self.swap_groups(model, scope)? {
                 let swap = |reference_name: &str| -> Vec<Edit> {
                     present.iter().map(|n| Edit { component: Component::Difference { name: n.clone(), reference: reference_name.to_string(), components: None }, alpha: 0.0 }).collect()
                 };
                 // The reference with the group's operators set to the model's, and the model with the reference's.
-                let gained = y(&self.logits_at(reference, sequences, &last, &Intervention { edits: swap(model), patches: vec![] })?.0)?;
-                let kept = y(&self.logits_at(model, sequences, &last, &Intervention { edits: swap(reference), patches: vec![] })?.0)?;
+                let gained = y(&self.logits_at(reference, sequences, &last, &Intervention { edits: swap(model), patches: vec![] })?)?;
+                let kept = y(&self.logits_at(model, sequences, &last, &Intervention { edits: swap(reference), patches: vec![] })?)?;
                 let reproduced: Vec<f64> = gained.iter().zip(&y_reference).map(|(g, b)| g - b).collect();
                 let removed: Vec<f64> = y_model.iter().zip(&kept).map(|(m, k)| m - k).collect();
-                rows.push(json!({"site": label, "kind": "weights", "reference_gains_nats": mean(&reproduced), "model_loses_nats": mean(&removed)}));
+                rows.push(json!({"site": label, "operators": present, "kind": "weights", "reference_gains_nats": mean(&reproduced), "model_loses_nats": mean(&removed)}));
             }
         }
         Ok(json!({
@@ -1092,8 +1202,8 @@ impl Session {
         for (s, tokens) in sequences.iter().enumerate() {
             let one = std::slice::from_ref(tokens);
             let positions = vec![(0..tokens.len()).collect::<Vec<_>>()];
-            let a = self.logits_at(model, one, &positions, &Intervention::default())?.0;
-            let b = self.logits_at(reference, one, &positions, &Intervention::default())?.0;
+            let a = self.logits_at(model, one, &positions, &Intervention::default())?;
+            let b = self.logits_at(reference, one, &positions, &Intervention::default())?;
             for (p, (ra, rb)) in a[0].iter().zip(&b[0]).enumerate() {
                 let kl = categorical_kl_from_logits(&ra.to_vec(), &rb.to_vec()).map_err(|e| format!("{e:?}"))?;
                 total += kl;
@@ -1118,17 +1228,17 @@ impl Session {
     fn activations(&mut self, model: &str, site: &Site, sequences: &[Vec<u32>], coordinate: Option<usize>, direction: Option<&[f64]>, top: usize) -> Result<Value, String> {
         let direction = direction.map(unit).transpose()?;
         let node = self.model(model)?.node(site)?;
-        let program = self.model(model)?.program.clone();
         let mut found: Vec<(f64, usize, usize)> = Vec::new();
         let (mut total, mut squares, mut count) = (0.0, 0.0, 0usize);
-        for (s, tokens) in sequences.iter().enumerate() {
-            let (values, _) = self.execute(model, &program, std::slice::from_ref(tokens), &[], &[])?;
-            for (p, row) in values[node].outer_iter().enumerate() {
+        let every: Vec<Vec<usize>> = sequences.iter().map(|t| (0..t.len()).collect()).collect();
+        let measured = self.measure(model, sequences, &every, &Intervention::default(), &[node])?;
+        for (s, recorded) in measured.recorded.iter().enumerate() {
+            for (p, row) in recorded[0].iter().enumerate() {
                 let v = match (coordinate, &direction) {
                     (Some(c), None) => *row.get(c).ok_or_else(|| format!("coordinate {c} of {}", row.len()))?,
                     (None, Some(d)) if d.len() == row.len() => row.dot(d),
                     (None, Some(d)) => return Err(format!("a direction of {} at a site of {}", d.len(), row.len())),
-                    (None, None) => row.dot(&row).sqrt(),
+                    (None, None) => row.dot(row).sqrt(),
                     (Some(_), Some(_)) => return Err("a coordinate or a direction, not both".into()),
                 };
                 total += v;
@@ -1159,10 +1269,10 @@ impl Session {
                 continue;
             }
             let all = vec![(0..tokens.len()).collect::<Vec<_>>()];
-            let full = self.logits_at(model, std::slice::from_ref(tokens), &all, &Intervention::default())?.0;
+            let full = self.logits_at(model, std::slice::from_ref(tokens), &all, &Intervention::default())?;
             let windows: Vec<Vec<u32>> = (keep..tokens.len()).map(|p| tokens[p + 1 - keep..=p].to_vec()).collect();
             let last: Vec<Vec<usize>> = windows.iter().map(|_| vec![keep - 1]).collect();
-            let truncated = self.logits_at(model, &windows, &last, &Intervention::default())?.0;
+            let truncated = self.logits_at(model, &windows, &last, &Intervention::default())?;
             for (i, p) in (keep..tokens.len()).enumerate() {
                 let (rf, rt) = (&full[0][p], &truncated[i][0]);
                 let kl = categorical_kl_from_logits(&rf.to_vec(), &rt.to_vec()).map_err(|e| format!("{e:?}"))?;
@@ -1181,6 +1291,193 @@ impl Session {
             "mean_kl_nats_per_token": total / count.max(1) as f64, "tokens": count,
             "largest": found.iter().map(|(kl, s, p, tf, tt)| json!({"kl_nats": kl, "sequence": s, "position": p, "full_top": tf, "truncated_top": tt})).collect::<Vec<_>>(),
         }))
+    }
+}
+
+fn argmax(values: &[f64]) -> Option<usize> {
+    values.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i)
+}
+
+fn summary(v: &[f64]) -> Value {
+    let n = v.len() as f64;
+    let mean = v.iter().sum::<f64>() / n;
+    let var = if v.len() > 1 { v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0) } else { f64::NAN };
+    json!({"mean": mean, "standard_error": (var / n).sqrt(), "count": v.len()})
+}
+
+impl Session {
+    /// Per item, each option's summed log-probability after the prompt (module note).
+    pub fn option_log_probabilities(&mut self, model: &str, items: &[OptionItem], intervention: &Intervention) -> Result<Vec<Vec<f64>>, String> {
+        let mut sequences = Vec::new();
+        let mut positions = Vec::new();
+        for item in items {
+            if item.prompt.is_empty() || item.options.iter().any(Vec::is_empty) {
+                return Err("an option item needs a prompt and nonempty options".into());
+            }
+            for option in &item.options {
+                let mut tokens = item.prompt.clone();
+                tokens.extend_from_slice(option);
+                positions.push((item.prompt.len() - 1..tokens.len() - 1).collect::<Vec<_>>());
+                sequences.push(tokens);
+            }
+        }
+        let logits = self.logits_at(model, &sequences, &positions, intervention)?;
+        let mut flat = Vec::with_capacity(sequences.len());
+        for ((tokens, list), rows) in sequences.iter().zip(&positions).zip(&logits) {
+            let mut total = 0.0;
+            for (p, row) in list.iter().zip(rows) {
+                let lp = log_softmax(&row.to_vec()).map_err(|e| format!("{e:?}"))?;
+                total += lp[tokens[p + 1] as usize];
+            }
+            flat.push(total);
+        }
+        let mut out = Vec::with_capacity(items.len());
+        let mut k = 0;
+        for item in items {
+            out.push(flat[k..k + item.options.len()].to_vec());
+            k += item.options.len();
+        }
+        Ok(out)
+    }
+
+    fn crossed_options(&mut self, model: &str, pairs: &[OptionPair], a0: &Intervention, a1: &Intervention) -> Result<Value, String> {
+        let items: Vec<OptionItem> = pairs.iter().flat_map(|p| [p.x0.clone(), p.x1.clone()]).collect();
+        let under0 = self.option_log_probabilities(model, &items, a0)?;
+        let under1 = self.option_log_probabilities(model, &items, a1)?;
+        let margin = |lp: &Vec<f64>, pair: &OptionPair| -> Result<f64, String> {
+            match (lp.get(pair.choice), lp.get(pair.versus)) {
+                (Some(c), Some(v)) => Ok(c - v),
+                _ => Err(format!("options {} and {} of an item with {}", pair.choice, pair.versus, lp.len())),
+            }
+        };
+        let (mut out, mut gammas, mut e0, mut e1) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (i, pair) in pairs.iter().enumerate() {
+            let (y00, y10) = (margin(&under0[2 * i], pair)?, margin(&under0[2 * i + 1], pair)?);
+            let (y01, y11) = (margin(&under1[2 * i], pair)?, margin(&under1[2 * i + 1], pair)?);
+            let gamma = (y11 - y01) - (y10 - y00);
+            gammas.push(gamma);
+            e0.push(y10 - y00);
+            e1.push(y11 - y01);
+            out.push(json!({"y_x0_a0": y00, "y_x1_a0": y10, "y_x0_a1": y01, "y_x1_a1": y11, "gamma": gamma}));
+        }
+        Ok(json!({"pairs": out, "gamma": summary(&gammas), "input_effect_a0": summary(&e0), "input_effect_a1": summary(&e1)}))
+    }
+
+    fn scope_layers(&self, model: &str, scope: &Scope) -> Result<Vec<usize>, String> {
+        let count = self.model(model)?.layers.len();
+        let layers = scope.layers.clone().unwrap_or_else(|| (0..count).collect());
+        if let Some(l) = layers.iter().find(|l| **l >= count) {
+            return Err(format!("layer {l} of {count}"));
+        }
+        Ok(layers)
+    }
+
+    /// The sites a single swap reaches: each scoped layer's attention and MLP, and its heads.
+    fn swap_sites(&self, model: &str, scope: &Scope) -> Result<Vec<Site>, String> {
+        let heads = self.model(model)?.heads;
+        let mut sites = Vec::new();
+        for layer in self.scope_layers(model, scope)? {
+            sites.push(Site::Attention { layer });
+            if scope.heads {
+                sites.extend((0..heads).map(|head| Site::Head { layer, head }));
+            }
+            sites.push(Site::Mlp { layer });
+        }
+        Ok(sites)
+    }
+
+    /// Operator groups a weight swap reverts together: per scoped layer its attention maps and its
+    /// MLP maps; with heads, per head its query and output maps and per layer its keys and values.
+    fn swap_groups(&self, model: &str, scope: &Scope) -> Result<Vec<(String, Vec<String>)>, String> {
+        let native = self.model(model)?;
+        let mut groups = Vec::new();
+        for l in self.scope_layers(model, scope)? {
+            let keys_values: Vec<String> = (0..native.kv_heads).flat_map(|g| [format!("blocks.{l}.k{g}"), format!("blocks.{l}.v{g}")]).collect();
+            if scope.heads {
+                for h in 0..native.heads {
+                    groups.push((format!("layer {l} head {h} (q, o)"), vec![format!("blocks.{l}.q{h}"), format!("blocks.{l}.o{h}")]));
+                }
+                groups.push((format!("layer {l} keys and values"), keys_values));
+            } else {
+                let mut all: Vec<String> = (0..native.heads).flat_map(|h| [format!("blocks.{l}.q{h}"), format!("blocks.{l}.o{h}")]).collect();
+                all.extend(keys_values);
+                groups.push((format!("layer {l} attention"), all));
+            }
+            groups.push((format!("layer {l} MLP"), ["c_fc", "gate_proj", "down_proj"].iter().map(|p| format!("blocks.{l}.{p}")).collect()));
+        }
+        Ok(groups
+            .into_iter()
+            .map(|(label, names)| (label, names.into_iter().filter(|n| native.operators.contains_key(n)).collect::<Vec<_>>()))
+            .filter(|(_, names)| !names.is_empty())
+            .collect())
+    }
+
+    fn localize_options(&mut self, model: &str, reference: &str, items: &[OptionItem], weights: bool, scope: &Scope) -> Result<Value, String> {
+        let none = Intervention::default();
+        let lp_model = self.option_log_probabilities(model, items, &none)?;
+        let lp_reference = self.option_log_probabilities(reference, items, &none)?;
+        let choices: Vec<(usize, usize)> = lp_model
+            .iter()
+            .zip(&lp_reference)
+            .map(|(m, r)| argmax(m).zip(argmax(r)).ok_or_else(|| "an item without options".to_string()))
+            .collect::<Result<_, _>>()?;
+        // Items where the two models choose differently carry the difference.
+        let differing: Vec<usize> = (0..items.len()).filter(|i| choices[*i].0 != choices[*i].1).collect();
+        if differing.is_empty() {
+            return Ok(json!({"differing_items": 0, "choices": choices}));
+        }
+        let subset: Vec<OptionItem> = differing.iter().map(|i| items[*i].clone()).collect();
+        let margin = |lp: &[Vec<f64>]| -> Vec<f64> { differing.iter().zip(lp).map(|(i, l)| l[choices[*i].0] - l[choices[*i].1]).collect() };
+        let y_model = margin(&differing.iter().map(|i| lp_model[*i].clone()).collect::<Vec<_>>());
+        let y_reference = margin(&differing.iter().map(|i| lp_reference[*i].clone()).collect::<Vec<_>>());
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let mut rows = Vec::new();
+        for site in self.swap_sites(model, scope)? {
+            let into = |from: &str| Intervention {
+                edits: vec![],
+                patches: vec![Patch { site: site.clone(), sequences: None, positions: None, coordinates: None, direction: None, value: PatchValue::Source { tokens: None, model: Some(from.to_string()), positions: None } }],
+            };
+            let gained = margin(&self.option_log_probabilities(reference, &subset, &into(model))?);
+            let kept = margin(&self.option_log_probabilities(model, &subset, &into(reference))?);
+            rows.push(json!({"site": format!("{site:?}"), "kind": "activation",
+                "reference_gains_nats": mean(&gained) - mean(&y_reference), "model_loses_nats": mean(&y_model) - mean(&kept),
+                "reference_flips": gained.iter().filter(|g| **g > 0.0).count(), "model_flips": kept.iter().filter(|k| **k < 0.0).count()}));
+        }
+        if weights {
+            for (label, names) in self.swap_groups(model, scope)? {
+                let swap = |other: &str| -> Vec<Edit> {
+                    names.iter().map(|n| Edit { component: Component::Difference { name: n.clone(), reference: other.to_string(), components: None }, alpha: 0.0 }).collect()
+                };
+                let gained = margin(&self.option_log_probabilities(reference, &subset, &Intervention { edits: swap(model), patches: vec![] })?);
+                let kept = margin(&self.option_log_probabilities(model, &subset, &Intervention { edits: swap(reference), patches: vec![] })?);
+                rows.push(json!({"site": label, "operators": names, "kind": "weights",
+                    "reference_gains_nats": mean(&gained) - mean(&y_reference), "model_loses_nats": mean(&y_model) - mean(&kept),
+                    "reference_flips": gained.iter().filter(|g| **g > 0.0).count(), "model_flips": kept.iter().filter(|k| **k < 0.0).count()}));
+            }
+        }
+        Ok(json!({
+            "differing_items": differing.len(), "items": items.len(), "choices": choices,
+            "mean_margin_model_nats": mean(&y_model), "mean_margin_reference_nats": mean(&y_reference), "swaps": rows,
+        }))
+    }
+
+    fn delta_files(&mut self, model: &str, edits: &[Edit], directory: &str) -> Result<Value, String> {
+        let edited = self.edited(model, edits)?;
+        let native = self.model(model)?;
+        std::fs::create_dir_all(directory).map_err(|e| format!("{directory}: {e}"))?;
+        let mut out = Vec::new();
+        for (index, (a, b)) in edited.operators.iter().zip(&native.program.operators).enumerate() {
+            if Arc::ptr_eq(a, b) {
+                continue;
+            }
+            let delta = a.matrix_cow().as_ref() - b.matrix_cow().as_ref();
+            let path = Path::new(directory).join(format!("{}.f64", a.name));
+            let bytes: Vec<u8> = delta.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+            out.push(json!({"operator": a.name, "index": index, "shape": [delta.nrows(), delta.ncols()], "file": path.display().to_string(),
+                "changed_entries": delta.iter().filter(|v| **v != 0.0).count()}));
+        }
+        Ok(json!({"operators": out}))
     }
 }
 

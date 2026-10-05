@@ -63,7 +63,7 @@ class Client:
             s.connect(self.sock)
             s.sendall((json.dumps(payload) + "\n").encode())
             chunks = []
-            while True:
+            while not chunks or not chunks[-1].endswith(b"\n"):
                 b = s.recv(1 << 20)
                 if not b:
                     break
