@@ -728,7 +728,7 @@ impl Posterior {
     }
 
     /// Remove `groups` from the explanation: their parameters become exactly zero.
-    pub(crate) fn remove(&mut self, groups: &[usize]) {
+    pub fn remove(&mut self, groups: &[usize]) {
         for g in groups {
             self.active[*g] = false;
         }
