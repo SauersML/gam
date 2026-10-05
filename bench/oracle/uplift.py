@@ -30,6 +30,12 @@ Freeze. Every report is frozen in the episode store first; an organism's items a
 the last of its reports is frozen, seeded from the group hash of its reports and entropy drawn then
 (episodes.fresh_group_draw), and shared by its arms so arms are compared on the same items.
 
+The manifest can be collected from the investigator harness's run directories (bench/oracle_2951/
+investigate.py writes RUNS/<name>/report.frozen.json, with the task and arm, and transcript.jsonl):
+  uplift.py manifest --runs ~/mpd-data/oracle/runs --sets SETS.json --out M.jsonl
+SETS.json maps each organism to its set: {"o338d": "control", ...}; runs of other tasks are skipped, and
+an organism with several runs of one arm contributes the latest frozen one.
+
 Stages (state under RUN = ~/mpd-data/oracle/uplift/<run>/; each stage reads the previous stages' files):
   uplift.py stage   --run R --manifest M.jsonl    one episode per report, its report frozen
   uplift.py ablate  --run R --model sonnet        ablations of every rule (claude -p)
@@ -96,6 +102,26 @@ def by_organism(rows: list[dict]) -> dict[str, list[dict]]:
     for r in rows:
         out.setdefault(r["organism"], []).append(r)
     return out
+
+
+def manifest(runs: Path, sets_path: Path, out: Path):
+    sets = json.loads(sets_path.read_text())
+    latest: dict[tuple[str, str], dict] = {}
+    for frozen_path in sorted(runs.glob("*/report.frozen.json")):
+        frozen = json.loads(frozen_path.read_text())
+        task = json.loads((frozen_path.parent / "task.json").read_text())
+        organism = task.get("organism")
+        if task.get("kind") != "organism" or organism not in sets:
+            continue
+        key = (organism, frozen["arm"])
+        if key not in latest or frozen["frozen_at"] > latest[key]["frozen_at"]:
+            transcript = frozen_path.parent / "transcript.jsonl"
+            latest[key] = {"organism": organism, "set": sets[organism], "arm": frozen["arm"], "report": str(frozen_path),
+                           "transcript": str(transcript) if transcript.exists() else None, "frozen_at": frozen["frozen_at"],
+                           "investigator_model": frozen.get("investigator")}
+    write_jsonl(out, sorted(latest.values(), key=lambda r: (r["set"], r["organism"], r["arm"])))
+    missing = sorted(set(sets) - {o for o, _ in latest})
+    print(f"{len(latest)} reports of {len({o for o, _ in latest})} organisms; organisms with none: {missing}", file=sys.stderr)
 
 
 def stage(run: Path, manifest: Path):
@@ -370,9 +396,12 @@ def calibration(run: Path, count: int, seed: int):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["stage", "ablate", "items", "measure", "tests", "analyze", "calibration"])
-    ap.add_argument("--run", required=True)
+    ap.add_argument("command", choices=["manifest", "stage", "ablate", "items", "measure", "tests", "analyze", "calibration"])
+    ap.add_argument("--run")
     ap.add_argument("--manifest")
+    ap.add_argument("--runs", default=os.path.expanduser("~/mpd-data/oracle/runs"))
+    ap.add_argument("--sets")
+    ap.add_argument("--out")
     ap.add_argument("--model", default="sonnet", help="ablate: the rewriter and judge model for claude -p")
     ap.add_argument("--length-factor", type=float, default=1.25)
     ap.add_argument("--count", type=int)
@@ -380,6 +409,9 @@ def main():
     ap.add_argument("--command", dest="item_command", help="items: a shell command with {organism} {count} {seed} {out}")
     ap.add_argument("--read", help="analyze: the reader's output (default RUN/read.jsonl)")
     args = ap.parse_args()
+    if args.command == "manifest":
+        manifest(Path(args.runs), Path(args.sets), Path(args.out))
+        return
     run = run_dir(args.run)
     if args.command == "stage":
         stage(run, Path(args.manifest))
