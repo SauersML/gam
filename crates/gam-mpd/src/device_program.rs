@@ -25,7 +25,7 @@
 //! low-rank operators, pointwise laws, Hadamard products, RMS norms, attention, and the head.
 //! Any other node refuses the whole program with its reason; its caller then runs on the CPU.
 
-use super::device_heads::{self, Heads, Stacked};
+use super::device_heads::{self, Buffer, Heads, Stacked};
 use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorBody, OperatorProgram, Rotary, SlotValues};
 use gam_gpu::tensor::{Arithmetic, Device, Indices, Op, PointwiseLaw, Tensor};
 use ndarray::{Array1, Array2};
@@ -226,6 +226,15 @@ struct PreparedBatch {
     rotations: Arc<Vec<(Rotary, Tensor, Tensor)>>,
 }
 
+/// A fused group's buffers in a trace ([`device_heads`]): `P`, `N` and `G` when its queries and
+/// keys are normed, and `A`.
+#[derive(Clone, Copy)]
+struct Buffers {
+    projections: usize,
+    normed: Option<(usize, usize)>,
+    reads: usize,
+}
+
 /// A node's value in a trace.
 enum Slot {
     /// No value: a feature, the streamed head, or a node not computed yet.
@@ -244,9 +253,9 @@ enum Slot {
 /// family's blocks and rotation tables.
 pub struct DeviceTrace {
     slots: Vec<Slot>,
-    /// The fused groups' buffers, and per group the buffers of its `P` and `A` when it ran fused.
+    /// The fused groups' buffers, and per group which are its own when it ran fused.
     buffers: Vec<Tensor>,
-    fused: Vec<Option<(usize, usize)>>,
+    fused: Vec<Option<Buffers>>,
     /// Per node, whether its value came from a [`Frozen`] (a reverse pass leaves those alone).
     frozen: Option<Arc<Vec<bool>>>,
     device: Device,
@@ -598,7 +607,8 @@ impl DeviceProgram {
             for heads in &groups {
                 let (input, output) = (widths[heads.input], widths[heads.output]);
                 let biased = heads.projection_operators.iter().any(|(_, b)| b.is_some());
-                let count = heads.columns().checked_mul(input + usize::from(biased)).and_then(|n| n.checked_add(output.checked_mul(heads.heads * heads.width)?)).ok_or("operator size overflow")?;
+                let gains = heads.norms.as_ref().map_or(0, |_| heads.normed_columns());
+                let count = heads.columns().checked_mul(input + usize::from(biased)).and_then(|n| n.checked_add(output.checked_mul(heads.heads * heads.width)?)?.checked_add(gains)).ok_or("operator size overflow")?;
                 total = total.checked_add(count.checked_mul(8).ok_or("operator byte overflow")?).ok_or("operator byte overflow")?;
             }
             if total > limit { return Err(format!("operator numeric buffers {total} exceed declared source limit {limit}; excludes indices/activations/workspaces/allocator/host")); }
@@ -1333,8 +1343,9 @@ impl DeviceProgram {
     }
 
     /// Group `g`'s heads (module note of [`device_heads`]): `P` into the trace's buffers, each
-    /// projection offered to `edit` in node order (a replacement written back into `P`), then `A`
-    /// from `P`, each head offered the same way; every member's value a block of `P` or `A`.
+    /// projection offered to `edit` in node order (a replacement written back into `P`), then `N`
+    /// and `G` from it the same way when the queries and keys are normed, then `A`; every member's
+    /// value a block of one of them.
     fn run_heads(
         &self,
         trace: &mut DeviceTrace,
@@ -1347,42 +1358,46 @@ impl DeviceProgram {
         let rotations = Arc::clone(&trace.rotations);
         let turn = turn(&rotations, heads.rotary)?;
         let p = device_heads::project(d, heads, &group.stacked, trace.value(heads.input)?, self.arithmetic).map_err(error)?;
-        let (pi, ai) = (trace.buffers.len(), trace.buffers.len() + 1);
-        trace.buffers.push(p);
-        let mut projections = heads.projections.clone();
-        projections.sort_unstable();
-        Self::offer_blocks(trace, heads, &projections, pi, edit)?;
-        let a = device_heads::attend(d, heads, &trace.buffers[pi], trace.blocks, turn, self.arithmetic).map_err(error)?;
-        trace.buffers.push(a);
-        let mut attends: Vec<usize> = heads.attends.iter().map(|(a, _)| *a).collect();
-        attends.sort_unstable();
-        Self::offer_blocks(trace, heads, &attends, ai, edit)?;
-        trace.fused[g] = Some((pi, ai));
+        let projections = Self::offer_blocks(trace, heads, (Buffer::Projections, p), edit)?;
+        let normed = match &heads.norms {
+            Some(norms) => {
+                let n = device_heads::normalize(d, heads, &trace.buffers[projections], norms.epsilon).map_err(error)?;
+                let normed = Self::offer_blocks(trace, heads, (Buffer::Normed, n), edit)?;
+                let gained = device_heads::gain(d, &group.stacked, &trace.buffers[normed]).map_err(error)?;
+                Some((normed, Self::offer_blocks(trace, heads, (Buffer::Gained, gained), edit)?))
+            }
+            None => None,
+        };
+        let qk = &trace.buffers[normed.map_or(projections, |(_, gained)| gained)];
+        let a = device_heads::attend(d, heads, (qk, &trace.buffers[projections]), trace.blocks, turn, self.arithmetic).map_err(error)?;
+        let reads = Self::offer_blocks(trace, heads, (Buffer::Reads, a), edit)?;
+        trace.fused[g] = Some(Buffers { projections, normed, reads });
         Ok(())
     }
 
-    /// Each node of `nodes` a block of the trace's buffer `buffer`, offered to `edit` in turn; a
-    /// replacement becomes the node's value and is written into the buffer.
+    /// `values` into the trace's buffers, each member of `buffer` a block of it, offered to `edit`
+    /// in node order; a replacement becomes the node's value and is written into the buffer.
     fn offer_blocks(
         trace: &mut DeviceTrace,
         heads: &Heads,
-        nodes: &[usize],
-        buffer: usize,
+        (buffer, values): (Buffer, Tensor),
         edit: &mut impl FnMut(&DeviceTrace, usize) -> Result<Option<Tensor>, String>,
-    ) -> Result<(), String> {
-        for &node in nodes {
+    ) -> Result<usize, String> {
+        let index = trace.buffers.len();
+        trace.buffers.push(values);
+        for node in heads.nodes_of(buffer) {
             let (_, start) = heads.block(node).ok_or("device: a fused node outside its group")?;
-            trace.slots[node] = Slot::Columns { buffer, start, width: heads.width, copy: OnceLock::new() };
+            trace.slots[node] = Slot::Columns { buffer: index, start, width: heads.width, copy: OnceLock::new() };
             if let Some(replacement) = edit(trace, node)? {
                 if replacement.dim() != (trace.rows, heads.width) {
                     return Err(format!("device: edited node {node} has {:?}, expected {} x {}", replacement.dim(), trace.rows, heads.width));
                 }
                 let device = trace.device.clone();
-                device.set_columns(&mut trace.buffers[buffer], start, &replacement).map_err(error)?;
+                device.set_columns(&mut trace.buffers[index], start, &replacement).map_err(error)?;
                 trace.slots[node] = Slot::Value(replacement);
             }
         }
-        Ok(())
+        Ok(index)
     }
 
     /// Group `g`'s output node: its other terms, `A Oᵀ` and its bias.
@@ -1390,12 +1405,12 @@ impl DeviceProgram {
         let d = &self.device;
         let group = &self.fused[g];
         let heads = &group.heads;
-        let (_, a) = trace.fused[g].ok_or("device: a fused output before its heads")?;
+        let buffers = trace.fused[g].ok_or("device: a fused output before its heads")?;
         let mut out = d.zeros(trace.rows, self.widths[heads.output]).map_err(error)?;
         for (argument, operator) in &heads.rest {
             self.add_term(&mut out, trace, *argument, *operator)?;
         }
-        d.gemm(&mut out, 1.0, &trace.buffers[a], Op::N, &group.stacked.reads, Op::T, 1.0, self.arithmetic).map_err(error)?;
+        d.gemm(&mut out, 1.0, &trace.buffers[buffers.reads], Op::N, &group.stacked.reads, Op::T, 1.0, self.arithmetic).map_err(error)?;
         if let Some(b) = heads.bias {
             d.add_row(&mut out, 1.0, self.column(b)?).map_err(error)?;
         }
@@ -1834,7 +1849,7 @@ impl DeviceProgram {
         let d = &self.device;
         let group = &self.fused[g];
         let heads = &group.heads;
-        let (p, _) = trace.fused[g].ok_or("device: a fused reverse without its forward")?;
+        let buffers = trace.fused[g].ok_or("device: a fused reverse without its forward")?;
         for (argument, operator) in &heads.rest {
             self.pull_term((&mut *grads, needed), trace.rows, cot, *argument, *operator, arithmetic)?;
         }
@@ -1844,7 +1859,8 @@ impl DeviceProgram {
         let mut g_a = d.zeros(trace.rows, heads.heads * heads.width).map_err(error)?;
         d.gemm(&mut g_a, 1.0, cot, Op::N, &group.stacked.reads, Op::N, 0.0, arithmetic).map_err(error)?;
         let turn = turn(&trace.rotations, heads.rotary)?;
-        let g_p = device_heads::backward(d, heads, &trace.buffers[p], &g_a, trace.blocks, turn, (self.arithmetic, arithmetic)).map_err(error)?;
+        let gained = buffers.normed.map(|(_, gained)| &trace.buffers[gained]);
+        let g_p = device_heads::backward(d, (heads, &group.stacked), (&trace.buffers[buffers.projections], gained), &g_a, trace.blocks, turn, (self.arithmetic, arithmetic)).map_err(error)?;
         if grads[heads.input].is_none() {
             grads[heads.input] = Some(d.zeros(trace.rows, self.widths[heads.input]).map_err(error)?);
         }

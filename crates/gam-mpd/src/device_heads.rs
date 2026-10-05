@@ -10,18 +10,23 @@
 //! head's positions), turned by the rotation in the same pass; the scores and softmax of every
 //! (sequence, key head) block, whose rows are the positions of that key head's query heads, as one
 //! strided-batched product; the values read the same way; the heads merged back side by side into
-//! `A`; and the output node's `Σ other terms + A Oᵀ + bias`.
+//! `A`; and the output node's `Σ other terms + A Oᵀ + bias`. When every query and key is normed per
+//! head before it is read (Qwen3's q_norm and k_norm: an RMS norm, then a diagonal gain), the norm
+//! runs on all of them at once (`N`, each head's columns a row of its own) and the gains as one
+//! row of column scales (`G`), whose queries and keys the attention then reads.
 //!
-//! The IR is unchanged. Every projection's value is a column block of `P` and every head's read a
-//! column block of `A`; the trace copies a block out only when something reads that node. The
-//! reverse pass runs the same way backwards from the output node's cotangent.
+//! The IR is unchanged. Every projection's value is a column block of `P`, every norm's of `N`,
+//! every gain's of `G` and every head's read a column block of `A`; the trace copies a block out
+//! only when something reads that node. The reverse pass runs the same way backwards from the
+//! output node's cotangent.
 //!
 //! A group matches when every query, key and value is a one-term affine node with a dense operator
-//! on the same `h`. Each query is read only by its own attend, and keys and values only by the
-//! group's attends. Keys and values pair one to one, every key head is read by equally many query
-//! heads, every attend has the same scale, rotation and mask, and each attend is read once, by the
-//! output node. Anything else (a head replaced by a rule, a head read through a mask) runs node by
-//! node, and so does a group whose operators a training step replaces.
+//! on the same `h` (a query or key possibly normed as above). Each query is read only by its own
+//! attend, and keys and values only by the group's attends. Keys and values pair one to one, every
+//! key head is read by equally many query heads, every attend has the same scale, rotation and
+//! mask, and each attend is read once, by the output node. Anything else (a head replaced by a
+//! rule, a head read through a mask) runs node by node, and so does a group whose operators a
+//! training step replaces.
 
 use super::operator_program::{Node, OperatorBody, OperatorProgram, Rotary};
 use gam_gpu::gpu_error::GpuError;
@@ -43,6 +48,8 @@ pub(crate) struct Heads {
     pub projections: Vec<usize>,
     /// Their operators and biases, in the same order.
     pub projection_operators: Vec<(usize, Option<usize>)>,
+    /// The per-head norms of the queries and keys, when they have them.
+    pub norms: Option<Norms>,
     /// The attend nodes in the queries' order, and the output operator each is read through.
     pub attends: Vec<(usize, usize)>,
     /// The output node's other terms, in their order.
@@ -58,15 +65,33 @@ pub(crate) struct Heads {
     pub causal: bool,
 }
 
+/// Every query's and key's RMS norm and gain: per query and key projection (in `P`'s order) the
+/// norm node, the node applying the gain and the gain's diagonal operator; the norms' `ε`.
+#[derive(Clone, Debug)]
+pub(crate) struct Norms {
+    pub nodes: Vec<(usize, usize, usize)>,
+    pub epsilon: f64,
+}
+
+/// The fused buffer a member's value is a column block of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Buffer {
+    Projections,
+    Normed,
+    Gained,
+    Reads,
+}
+
 impl Heads {
     /// The first projection: the group computes there.
     pub fn first(&self) -> usize {
         self.projections.iter().copied().min().unwrap_or(self.output)
     }
 
-    /// Every node whose value is a column block of `P` or `A`.
+    /// Every node whose value is a column block of a fused buffer.
     pub fn members(&self) -> impl Iterator<Item = usize> + '_ {
-        self.projections.iter().copied().chain(self.attends.iter().map(|(a, _)| *a))
+        let norms = self.norms.iter().flat_map(|n| n.nodes.iter().flat_map(|(norm, gain, _)| [*norm, *gain]));
+        self.projections.iter().copied().chain(norms).chain(self.attends.iter().map(|(a, _)| *a))
     }
 
     /// Query heads per key head.
@@ -79,6 +104,11 @@ impl Heads {
         (self.heads + 2 * self.keys) * self.width
     }
 
+    /// The queries' and keys' columns (`N`'s and `G`'s).
+    pub fn normed_columns(&self) -> usize {
+        (self.heads + self.keys) * self.width
+    }
+
     /// Every operator the stacked copies are made of.
     pub fn operators(&self) -> BTreeSet<usize> {
         let mut out = BTreeSet::new();
@@ -86,16 +116,39 @@ impl Heads {
             out.insert(*op);
             out.extend(bias);
         }
+        out.extend(self.norms.iter().flat_map(|n| n.nodes.iter().map(|(_, _, gain)| *gain)));
         out.extend(self.attends.iter().map(|(_, op)| *op));
         out
     }
 
-    /// Node `n`'s column block: in `P` (false) or `A` (true), and its first column.
-    pub fn block(&self, n: usize) -> Option<(bool, usize)> {
+    /// The members of buffer `buffer`, in node order.
+    pub fn nodes_of(&self, buffer: Buffer) -> Vec<usize> {
+        let mut nodes: Vec<usize> = match (buffer, &self.norms) {
+            (Buffer::Projections, _) => self.projections.clone(),
+            (Buffer::Normed, Some(n)) => n.nodes.iter().map(|x| x.0).collect(),
+            (Buffer::Gained, Some(n)) => n.nodes.iter().map(|x| x.1).collect(),
+            (Buffer::Reads, _) => self.attends.iter().map(|(a, _)| *a).collect(),
+            (_, None) => Vec::new(),
+        };
+        nodes.sort_unstable();
+        nodes
+    }
+
+    /// Node `n`'s column block: its buffer and first column.
+    pub fn block(&self, n: usize) -> Option<(Buffer, usize)> {
+        let at = |i: usize| i * self.width;
         if let Some(i) = self.projections.iter().position(|&p| p == n) {
-            return Some((false, i * self.width));
+            return Some((Buffer::Projections, at(i)));
         }
-        self.attends.iter().position(|(a, _)| *a == n).map(|i| (true, i * self.width))
+        if let Some(norms) = &self.norms {
+            if let Some(i) = norms.nodes.iter().position(|x| x.0 == n) {
+                return Some((Buffer::Normed, at(i)));
+            }
+            if let Some(i) = norms.nodes.iter().position(|x| x.1 == n) {
+                return Some((Buffer::Gained, at(i)));
+            }
+        }
+        self.attends.iter().position(|(a, _)| *a == n).map(|i| (Buffer::Reads, at(i)))
     }
 }
 
@@ -114,6 +167,9 @@ pub(crate) fn find(program: &OperatorProgram, readers: &[Vec<usize>], widths: &[
     (0..program.nodes.len()).filter(|o| !excluded.contains(o)).filter_map(|o| matched(program, readers, widths, excluded, o)).collect()
 }
 
+/// A query's or key's norm: its norm node, gain node, gain operator and `ε`'s bits.
+type Norm = (usize, usize, usize, u64);
+
 fn matched(program: &OperatorProgram, readers: &[Vec<usize>], widths: &[usize], excluded: &[usize], output: usize) -> Option<Heads> {
     let Node::Affine { terms, bias } = &program.nodes[output] else { return None };
     // A projection: a one-term affine node with a dense operator, its input, operator and bias.
@@ -123,52 +179,83 @@ fn matched(program: &OperatorProgram, readers: &[Vec<usize>], widths: &[usize], 
         let plain = !excluded.contains(&n) && !matches!(program.nodes[x], Node::Feature { .. }) && dense(program, op) == Some((widths[n], widths[x]));
         plain.then_some((x, op, *bias))
     };
+    // What an attend reads as a query or key: a projection, or a projection's RMS norm times a
+    // diagonal gain, each read only by the next; the projection and the norm.
+    let read = |n: usize| -> Option<(usize, Option<Norm>)> {
+        if projection(n).is_some() {
+            return Some((n, None));
+        }
+        let Node::Affine { terms, bias: None } = &program.nodes[n] else { return None };
+        let [(m, gain)] = terms[..] else { return None };
+        let Node::RmsNorm { input: p, epsilon } = program.nodes[m] else { return None };
+        let normed = !excluded.contains(&n)
+            && !excluded.contains(&m)
+            && readers[m] == [n]
+            && readers[p] == [m]
+            && widths[p] == widths[n]
+            && program.operators[gain].diagonal().is_some_and(|d| d.len() == widths[n])
+            && projection(p).is_some();
+        normed.then_some((p, Some((m, n, gain, epsilon.to_bits()))))
+    };
     // Heads: attends read once, only by this node, through a dense operator, on projections of one input.
     let mut first = None;
     let mut keys: Vec<((usize, usize), Vec<(usize, usize, usize)>)> = Vec::new();
-    for &(attend, read) in terms {
+    for &(attend, through) in terms {
         let Node::Attend { query, key, value, scale, rotary, causal } = program.nodes[attend] else { continue };
-        let inputs: Option<Vec<usize>> = [query, key, value].iter().map(|n| projection(*n).map(|p| p.0)).collect();
+        let (Some((q, q_norm)), Some((k, k_norm)), Some((v, _))) = (read(query), read(key), projection(value).map(|_| (value, ()))) else { continue };
+        let inputs: Option<Vec<usize>> = [q, k, v].iter().map(|n| projection(*n).map(|p| p.0)).collect();
         let head = !excluded.contains(&attend)
             && readers[attend] == [output]
             && readers[query] == [attend]
-            && dense(program, read) == Some((widths[output], widths[attend]))
-            && inputs.is_some_and(|i| i.iter().all(|x| *x == i[0]));
+            && dense(program, through) == Some((widths[output], widths[attend]))
+            && inputs.as_ref().is_some_and(|i| i.iter().all(|x| *x == i[0]));
         if !head {
             continue;
         }
-        let shape = (projection(query).map(|p| p.0), scale.value().to_bits(), rotary, causal);
+        let epsilon = |n: Option<Norm>| n.map(|x| x.3);
+        let shape = (inputs.and_then(|i| i.first().copied()), scale.value().to_bits(), rotary, causal, epsilon(q_norm), epsilon(k_norm));
         if *first.get_or_insert(shape) != shape {
             continue;
         }
         match keys.iter_mut().find(|(pair, _)| pair.0 == key || pair.1 == value) {
-            Some((pair, queries)) if *pair == (key, value) => queries.push((query, attend, read)),
+            Some((pair, queries)) if *pair == (key, value) => queries.push((query, attend, through)),
             Some(_) => return None,
-            None => keys.push(((key, value), vec![(query, attend, read)])),
+            None => keys.push(((key, value), vec![(query, attend, through)])),
         }
     }
     // A key head whose key or value another node reads stays node by node, with its queries.
     let fused: BTreeSet<usize> = keys.iter().flat_map(|(_, q)| q.iter().map(|x| x.1)).collect();
     keys.retain(|((key, value), _)| [*key, *value].iter().all(|n| readers[*n].iter().all(|r| fused.contains(r))));
-    let (input, scale, rotary, causal) = first?;
+    let (input, scale, rotary, causal, q_epsilon, k_epsilon) = first?;
     let group = keys.first()?.1.len();
     let queries: Vec<(usize, usize, usize)> = keys.iter().flat_map(|(_, q)| q.iter().copied()).collect();
-    let projections: Vec<usize> = queries.iter().map(|q| q.0).chain(keys.iter().map(|(p, _)| p.0)).chain(keys.iter().map(|(p, _)| p.1)).collect();
+    // The nodes the attends read as queries and keys, then the values, in `P`'s order.
+    let reads: Vec<usize> = queries.iter().map(|q| q.0).chain(keys.iter().map(|(p, _)| p.0)).collect();
+    let resolved: Vec<(usize, Option<Norm>)> = reads.iter().map(|&n| read(n)).collect::<Option<_>>()?;
+    let projections: Vec<usize> = resolved.iter().map(|r| r.0).chain(keys.iter().map(|(p, _)| p.1)).collect();
     let width = widths[projections[0]];
-    // Equally many queries per key head, every projection one node of one width.
+    // Equally many queries per key head, every projection one node of one width, the queries and
+    // keys all normed (with one ε) or none.
+    let normed = q_epsilon.is_some() && q_epsilon == k_epsilon;
     if keys.iter().any(|(_, q)| q.len() != group)
         || projections.iter().collect::<BTreeSet<_>>().len() != projections.len()
         || projections.iter().any(|&p| widths[p] != width)
         || rotary.is_some_and(|r| 2 * r.pairs().len() > width)
+        || (q_epsilon.is_some() || k_epsilon.is_some()) && !normed
     {
         return None;
     }
+    let norms = normed.then(|| Norms {
+        nodes: resolved.iter().filter_map(|r| r.1.map(|(norm, gain, op, _)| (norm, gain, op))).collect(),
+        epsilon: f64::from_bits(q_epsilon.unwrap_or_default()),
+    });
     let attends: Vec<(usize, usize)> = queries.iter().map(|q| (q.1, q.2)).collect();
     Some(Heads {
         input: input?,
         output,
         projection_operators: projections.iter().map(|&p| projection(p).map(|(_, op, b)| (op, b))).collect::<Option<Vec<_>>>()?,
         projections,
+        norms,
         rest: terms.iter().copied().filter(|(a, _)| !attends.iter().any(|(b, _)| a == b)).collect(),
         attends,
         bias: *bias,
@@ -182,20 +269,23 @@ fn matched(program: &OperatorProgram, readers: &[Vec<usize>], widths: &[usize], 
 }
 
 /// A group's stacked operators on the device: `W` ((heads + 2 keys)·width × the input's width), the
-/// projections' biases as one row (zero where a projection has none) when any has one, and `O`
-/// (the output's width × heads·width).
+/// projections' biases as one row (zero where a projection has none) when any has one, the
+/// queries' and keys' gains as one row when they are normed, and `O` (the output's width ×
+/// heads·width).
 pub(crate) struct Stacked {
     pub weights: Tensor,
     pub biases: Option<Tensor>,
+    pub gains: Option<Tensor>,
     pub reads: Tensor,
 }
 
 impl Stacked {
     pub fn upload(device: &Device, program: &OperatorProgram, heads: &Heads) -> Result<Self, GpuError> {
+        let failed = |e: ndarray::ShapeError| GpuError::DriverCallFailed { reason: e.to_string() };
         let matrix = |op: usize| program.operators[op].matrix_cow();
         let blocks: Vec<_> = heads.projection_operators.iter().map(|(op, _)| matrix(*op)).collect();
         let views: Vec<_> = blocks.iter().map(|b| b.view()).collect();
-        let weights = ndarray::concatenate(ndarray::Axis(0), &views).map_err(|e| GpuError::DriverCallFailed { reason: e.to_string() })?;
+        let weights = ndarray::concatenate(ndarray::Axis(0), &views).map_err(failed)?;
         let biases = if heads.projection_operators.iter().any(|(_, b)| b.is_some()) {
             let mut row = Vec::with_capacity(heads.columns());
             for (_, bias) in &heads.projection_operators {
@@ -208,15 +298,25 @@ impl Stacked {
         } else {
             None
         };
+        let gains = match &heads.norms {
+            Some(norms) => {
+                let row: Vec<f64> = norms.nodes.iter().flat_map(|(_, _, op)| program.operators[*op].diagonal().map(|d| d.to_vec()).unwrap_or_default()).collect();
+                if row.len() != heads.normed_columns() {
+                    return Err(GpuError::DriverCallFailed { reason: "a head norm's gain is not its head's diagonal".into() });
+                }
+                Some(device.upload_vec(1, row.len(), row)?)
+            }
+            None => None,
+        };
         let reads: Vec<_> = heads.attends.iter().map(|(_, op)| matrix(*op)).collect();
         let views: Vec<_> = reads.iter().map(|b| b.view()).collect();
-        let reads = ndarray::concatenate(ndarray::Axis(1), &views).map_err(|e| GpuError::DriverCallFailed { reason: e.to_string() })?;
-        Ok(Self { weights: device.upload(weights.view())?, biases, reads: device.upload(reads.view())? })
+        let reads = ndarray::concatenate(ndarray::Axis(1), &views).map_err(failed)?;
+        Ok(Self { weights: device.upload(weights.view())?, biases, gains, reads: device.upload(reads.view())? })
     }
 
     /// Values held.
     pub fn len(&self) -> usize {
-        self.weights.len() + self.biases.as_ref().map_or(0, Tensor::len) + self.reads.len()
+        self.weights.len() + self.biases.as_ref().map_or(0, Tensor::len) + self.gains.as_ref().map_or(0, Tensor::len) + self.reads.len()
     }
 }
 
@@ -229,12 +329,13 @@ fn step(heads: &Heads, blocks: usize, length: usize) -> usize {
     (SCORES / per_key).clamp(1, heads.keys)
 }
 
-/// Key heads `first..first + n`'s queries, keys and values from `P`, head-major and turned.
-fn split(d: &Device, heads: &Heads, p: &Tensor, (first, n): (usize, usize), blocks: usize, turn: Turn<'_>) -> Result<(Tensor, Tensor, Tensor), GpuError> {
+/// Key heads `first..first + n`'s queries and keys (from `qk`, queries then keys) and values (from
+/// `P`), head-major and turned.
+fn split(d: &Device, heads: &Heads, (qk, p): (&Tensor, &Tensor), (first, n): (usize, usize), blocks: usize, turn: Turn<'_>) -> Result<(Tensor, Tensor, Tensor), GpuError> {
     let (w, g) = (heads.width, heads.group());
     Ok((
-        d.split_heads(p, first * g * w, n * g, w, blocks, turn, false)?,
-        d.split_heads(p, (heads.heads + first) * w, n, w, blocks, turn, false)?,
+        d.split_heads(qk, first * g * w, n * g, w, blocks, turn, false)?,
+        d.split_heads(qk, (heads.heads + first) * w, n, w, blocks, turn, false)?,
         d.split_heads(p, (heads.heads + heads.keys + first) * w, n, w, blocks, None, false)?,
     ))
 }
@@ -258,18 +359,38 @@ pub(crate) fn project(d: &Device, heads: &Heads, stacked: &Stacked, x: &Tensor, 
     Ok(p)
 }
 
-/// `A`, every head's read, from `P`, `blocks` sequences (module note).
-pub(crate) fn attend(d: &Device, heads: &Heads, p: &Tensor, blocks: usize, turn: Turn<'_>, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
-    attend_by(d, heads, p, blocks, turn, arithmetic, step(heads, blocks, p.rows() / blocks))
+/// The queries' and keys' columns of `P`, a row per head when `per_head`.
+fn queries_and_keys(d: &Device, heads: &Heads, p: &Tensor, per_head: bool) -> Result<Tensor, GpuError> {
+    let qk = d.columns_of(p, 0..heads.normed_columns())?;
+    if per_head { qk.reshape(p.rows() * (heads.heads + heads.keys), heads.width) } else { Ok(qk) }
+}
+
+/// `N`, every query's and key's RMS norm, from `P`.
+pub(crate) fn normalize(d: &Device, heads: &Heads, p: &Tensor, epsilon: f64) -> Result<Tensor, GpuError> {
+    d.rms_norm(&queries_and_keys(d, heads, p, true)?, epsilon)?.reshape(p.rows(), heads.normed_columns())
+}
+
+/// `G`, `N` times every query's and key's gain.
+pub(crate) fn gain(d: &Device, stacked: &Stacked, n: &Tensor) -> Result<Tensor, GpuError> {
+    let gains = stacked.gains.as_ref().ok_or_else(|| GpuError::DriverCallFailed { reason: "head norms without gains".into() })?;
+    let mut g = d.zeros(n.rows(), n.cols())?;
+    d.scale_columns(&mut g, n, gains, false)?;
+    Ok(g)
+}
+
+/// `A`, every head's read, from the queries and keys of `qk` (`G` when they are normed, else `P`)
+/// and the values of `P`, `blocks` sequences (module note).
+pub(crate) fn attend(d: &Device, heads: &Heads, (qk, p): (&Tensor, &Tensor), blocks: usize, turn: Turn<'_>, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
+    attend_by(d, heads, (qk, p), blocks, turn, arithmetic, step(heads, blocks, p.rows() / blocks))
 }
 
 /// [`attend`], `step` key heads at a time.
-fn attend_by(d: &Device, heads: &Heads, p: &Tensor, blocks: usize, turn: Turn<'_>, arithmetic: Arithmetic, step: usize) -> Result<Tensor, GpuError> {
+fn attend_by(d: &Device, heads: &Heads, (qk, p): (&Tensor, &Tensor), blocks: usize, turn: Turn<'_>, arithmetic: Arithmetic, step: usize) -> Result<Tensor, GpuError> {
     let rows = p.rows();
     let mut a = d.zeros(rows, heads.heads * heads.width)?;
     for first in (0..heads.keys).step_by(step) {
         let n = step.min(heads.keys - first);
-        let (q, k, v) = split(d, heads, p, (first, n), blocks, turn)?;
+        let (q, k, v) = split(d, heads, (qk, p), (first, n), blocks, turn)?;
         let alpha = weights(d, heads, (&q, &k), blocks * n, arithmetic)?;
         let mut out = d.zeros(q.rows(), heads.width)?;
         d.gemm_batched(blocks * n, &mut out, 1.0, &alpha, Op::N, &v, Op::N, 0.0, arithmetic)?;
@@ -278,17 +399,25 @@ fn attend_by(d: &Device, heads: &Heads, p: &Tensor, blocks: usize, turn: Turn<'_
     Ok(a)
 }
 
-/// The cotangent of `P` given `A`'s, `g_a`; the weights are recomputed in the forward's arithmetic,
-/// `forward`, the products run in `arithmetic`.
-pub(crate) fn backward(d: &Device, heads: &Heads, p: &Tensor, g_a: &Tensor, blocks: usize, turn: Turn<'_>, arithmetic: (Arithmetic, Arithmetic)) -> Result<Tensor, GpuError> {
-    backward_by(d, heads, (p, g_a), blocks, turn, arithmetic, step(heads, blocks, p.rows() / blocks))
+/// The cotangent of `P` given `A`'s, `g_a`, from `P` and (normed) `G`; the weights are recomputed
+/// in the forward's arithmetic, `forward`, the products run in `arithmetic`.
+pub(crate) fn backward(
+    d: &Device,
+    (heads, stacked): (&Heads, &Stacked),
+    (p, gained): (&Tensor, Option<&Tensor>),
+    g_a: &Tensor,
+    blocks: usize,
+    turn: Turn<'_>,
+    arithmetic: (Arithmetic, Arithmetic),
+) -> Result<Tensor, GpuError> {
+    backward_by(d, (heads, stacked), (p, gained, g_a), blocks, turn, arithmetic, step(heads, blocks, p.rows() / blocks))
 }
 
 /// [`backward`], `step` key heads at a time.
 fn backward_by(
     d: &Device,
-    heads: &Heads,
-    (p, g_a): (&Tensor, &Tensor),
+    (heads, stacked): (&Heads, &Stacked),
+    (p, gained, g_a): (&Tensor, Option<&Tensor>, &Tensor),
     blocks: usize,
     turn: Turn<'_>,
     (forward, arithmetic): (Arithmetic, Arithmetic),
@@ -297,10 +426,17 @@ fn backward_by(
     let rows = p.rows();
     let (w, g) = (heads.width, heads.group());
     let mut g_p = d.zeros(rows, heads.columns())?;
+    // The queries' and keys' cotangents go to `G`'s, then back through the gains and norms.
+    let mut g_g = match (&heads.norms, gained) {
+        (Some(_), Some(_)) => Some(d.zeros(rows, heads.normed_columns())?),
+        (None, None) => None,
+        _ => return Err(GpuError::DriverCallFailed { reason: "normed heads without their gained values".into() }),
+    };
+    let qk = gained.unwrap_or(p);
     for first in (0..heads.keys).step_by(step) {
         let n = step.min(heads.keys - first);
         let batch = blocks * n;
-        let (q, k, v) = split(d, heads, p, (first, n), blocks, turn)?;
+        let (q, k, v) = split(d, heads, (qk, p), (first, n), blocks, turn)?;
         let cot = d.split_heads(g_a, first * g * w, n * g, w, blocks, None, false)?;
         let alpha = weights(d, heads, (&q, &k), batch, forward)?;
         let mut dalpha = d.zeros(alpha.rows(), alpha.cols())?;
@@ -313,9 +449,17 @@ fn backward_by(
         d.gemm_batched(batch, &mut gq, heads.scale, &ds, Op::N, &k, Op::N, 0.0, arithmetic)?;
         let mut gk = d.zeros(k.rows(), w)?;
         d.gemm_batched(batch, &mut gk, heads.scale, &ds, Op::T, &q, Op::N, 0.0, arithmetic)?;
-        d.merge_heads(&gq, &mut g_p, first * g * w, n * g, blocks, turn, true)?;
-        d.merge_heads(&gk, &mut g_p, (heads.heads + first) * w, n, blocks, turn, true)?;
+        let target = g_g.as_mut().unwrap_or(&mut g_p);
+        d.merge_heads(&gq, target, first * g * w, n * g, blocks, turn, true)?;
+        d.merge_heads(&gk, target, (heads.heads + first) * w, n, blocks, turn, true)?;
         d.merge_heads(&gv, &mut g_p, (heads.heads + heads.keys + first) * w, n, blocks, None, false)?;
+    }
+    if let (Some(g_g), Some(norms), Some(gains)) = (g_g, &heads.norms, &stacked.gains) {
+        let mut g_n = d.zeros(rows, heads.normed_columns())?;
+        d.scale_columns(&mut g_n, &g_g, gains, false)?;
+        let per_head = rows * (heads.heads + heads.keys);
+        let g_qk = d.rms_norm_backward(&queries_and_keys(d, heads, p, true)?, &g_n.reshape(per_head, w)?, norms.epsilon)?;
+        d.set_columns(&mut g_p, 0, &g_qk.reshape(rows, heads.normed_columns())?)?;
     }
     Ok(g_p)
 }
@@ -346,25 +490,45 @@ mod tests {
     /// interleaved in the output node's terms), biased queries and keys, on a raw stream lifted
     /// by one dense map, and a nonlinear read of the output.
     fn layer(heads: usize, keys: usize, rotary: Option<Rotary>, causal: bool) -> (OperatorProgram, FamilyInputs) {
+        layer_normed(heads, keys, rotary, causal, false)
+    }
+
+    /// [`layer`], each query and key normed per head (an RMS norm and its own diagonal gain) when
+    /// `normed`, as Qwen3 imports.
+    fn layer_normed(heads: usize, keys: usize, rotary: Option<Rotary>, causal: bool, normed: bool) -> (OperatorProgram, FamilyInputs) {
         let mut operators = vec![Arc::new(Operator::identity("I", Interface::native(D).expect("d"))), dense("lift", D, D, 1)];
         let mut nodes = vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 1)], bias: None }];
         let mut op = |o: Arc<Operator>| {
             operators.push(o);
             operators.len() - 1
         };
+        let gain = |seed: usize| {
+            let values = ndarray::Array1::from_shape_fn(WIDTH, |j| 1.0 + 0.3 * noise(seed * 1000 + j));
+            Arc::new(Operator::diag("gain", Interface::native(WIDTH).expect("w"), values.clone(), exact_precision(values.iter().copied()).expect("exact"), Default::default()).expect("diag"))
+        };
+        // A projection node, normed per head when `normed`: the node an attend reads.
+        let normalize = |nodes: &mut Vec<Node>, gain_op: usize| {
+            if normed {
+                nodes.push(Node::RmsNorm { input: nodes.len() - 1, epsilon: 1e-6 });
+                nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, gain_op)], bias: None });
+            }
+            nodes.len() - 1
+        };
         let mut pairs = Vec::new();
         for g in 0..keys {
-            let (k, kb, v) = (op(dense("k", WIDTH, D, 10 + g)), op(dense("kb", WIDTH, 1, 20 + g)), op(dense("v", WIDTH, D, 30 + g)));
+            let (k, kb, v, kg) = (op(dense("k", WIDTH, D, 10 + g)), op(dense("kb", WIDTH, 1, 20 + g)), op(dense("v", WIDTH, D, 30 + g)), op(gain(80 + g)));
             nodes.push(Node::Affine { terms: vec![(1, k)], bias: Some(kb) });
+            let key = normalize(&mut nodes, kg);
             nodes.push(Node::Affine { terms: vec![(1, v)], bias: None });
-            pairs.push((nodes.len() - 2, nodes.len() - 1));
+            pairs.push((key, nodes.len() - 1));
         }
         let mut terms = vec![(1, 0)];
         for h in 0..heads {
-            let (q, qb, o) = (op(dense("q", WIDTH, D, 40 + h)), op(dense("qb", WIDTH, 1, 50 + h)), op(dense("o", D, WIDTH, 60 + h)));
+            let (q, qb, o, qg) = (op(dense("q", WIDTH, D, 40 + h)), op(dense("qb", WIDTH, 1, 50 + h)), op(dense("o", D, WIDTH, 60 + h)), op(gain(90 + h)));
             nodes.push(Node::Affine { terms: vec![(1, q)], bias: Some(qb) });
+            let query = normalize(&mut nodes, qg);
             let (key, value) = pairs[h % keys];
-            nodes.push(Node::Attend { query: nodes.len() - 1, key, value, scale: Scale::InverseSqrt(WIDTH as u32), rotary, causal });
+            nodes.push(Node::Attend { query, key, value, scale: Scale::InverseSqrt(WIDTH as u32), rotary, causal });
             terms.push((nodes.len() - 1, o));
         }
         let ob = op(dense("ob", D, 1, 70));
@@ -411,10 +575,10 @@ mod tests {
     #[test]
     fn fused_heads_match_node_by_node_values_cotangents_and_edits() {
         let rotations = [None, Some(Rotary { base: 10_000, dims: 4, half_split: true }), Some(Rotary { base: 500, dims: 2, half_split: false })];
-        for (heads, keys) in [(4, 2), (3, 3), (2, 1)] {
+        for (heads, keys, normed) in [(4, 2, false), (3, 3, false), (2, 1, false), (4, 2, true), (2, 1, true)] {
             for rotary in rotations {
                 for causal in [true, false] {
-                    let (program, family) = layer(heads, keys, rotary, causal);
+                    let (program, family) = layer_normed(heads, keys, rotary, causal, normed);
                     let cpu = program.execute(&family, false).expect("cpu");
                     let seed = Array2::from_shape_fn((family.rows, D), |(r, c)| noise(7000 + r * D + c));
                     let reference = crate::derivatives::vjp(&program, &family, &cpu, seed.clone()).expect("cpu vjp");
@@ -439,7 +603,7 @@ mod tests {
                             assert!(worst(&x, reference[node].as_ref().expect("cpu cotangent")) < 1e-12, "{}: cotangent of node {node} against the CPU", device.name());
                         }
                         // Edits at a query and at a head are written back before the attention and the output read them.
-                        let query = program.nodes.iter().position(|n| matches!(n, Node::Attend { .. })).map(|a| a - 1).expect("a query");
+                        let query = program.nodes.iter().find_map(|n| match n { Node::Attend { query, .. } => Some(*query), _ => None }).expect("a query");
                         let read = program.nodes.iter().rposition(|n| matches!(n, Node::Attend { .. })).expect("a head");
                         let edit = |node: usize, trace: &crate::device_program::DeviceTrace| -> Result<Option<Tensor>, String> {
                             if node != query && node != read {
@@ -498,12 +662,12 @@ mod tests {
             let turn = Some((&cos, &sin, r.half_split));
             let p = project(&d, heads, &stacked, &d.upload(cpu.values[heads.input].view()).expect("x"), Arithmetic::F64).expect("P");
             let g_a = d.upload(Array2::from_shape_fn((rows, heads.heads * heads.width), |(i, j)| noise(3000 + i * 31 + j)).view()).expect("g_A");
-            let once = d.download(&attend_by(&d, heads, &p, SEQUENCES, turn, Arithmetic::F64, heads.keys).expect("once")).expect("once");
-            let turns = d.download(&attend_by(&d, heads, &p, SEQUENCES, turn, Arithmetic::F64, 1).expect("in turn")).expect("in turn");
+            let once = d.download(&attend_by(&d, heads, (&p, &p), SEQUENCES, turn, Arithmetic::F64, heads.keys).expect("once")).expect("once");
+            let turns = d.download(&attend_by(&d, heads, (&p, &p), SEQUENCES, turn, Arithmetic::F64, 1).expect("in turn")).expect("in turn");
             assert!(worst(&once, &turns) < 1e-13, "{}: reads", d.name());
             let arithmetic = (Arithmetic::F64, Arithmetic::F64);
-            let once = d.download(&backward_by(&d, heads, (&p, &g_a), SEQUENCES, turn, arithmetic, heads.keys).expect("once")).expect("once");
-            let turns = d.download(&backward_by(&d, heads, (&p, &g_a), SEQUENCES, turn, arithmetic, 1).expect("in turn")).expect("in turn");
+            let once = d.download(&backward_by(&d, (heads, &stacked), (&p, None, &g_a), SEQUENCES, turn, arithmetic, heads.keys).expect("once")).expect("once");
+            let turns = d.download(&backward_by(&d, (heads, &stacked), (&p, None, &g_a), SEQUENCES, turn, arithmetic, 1).expect("in turn")).expect("in turn");
             assert!(worst(&once, &turns) < 1e-13, "{}: cotangents", d.name());
         }
     }
