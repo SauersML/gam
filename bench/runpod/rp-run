@@ -288,6 +288,18 @@ held() {
     return 1
 }
 
+# Launch approval (lead only): a run starts, or a lost pod is replaced, only while ~/mpd-data/runpod/APPROVED.txt
+# lists a prefix of its NAME. Paid GPUs serve goal-producing runs only; the lead grants and withdraws approval.
+approved() {
+    local f="$HOME/mpd-data/runpod/APPROVED.txt" p
+    [ -f "$f" ] || return 1
+    while IFS= read -r p; do
+        case "$p" in ''|'#'*) continue ;; esac
+        [[ "$1" == "$p"* ]] && return 0
+    done < "$f"
+    return 1
+}
+
 MODE=run
 case ${1:-} in
     status)
@@ -439,6 +451,7 @@ for line in open(sys.argv[1]):
         shift 4 ;;
 esac
 name_ok "$NAME"
+approved "$NAME" || { echo "rp-run: $NAME is not approved (~/mpd-data/runpod/APPROVED.txt is lead-only; ask the lead)" >&2; exit 3; }
 hours_ok "$HOURS"
 CAP_SECONDS=$(awk -v h="$HOURS" 'BEGIN { printf "%d", h * 3600 }')
 OUT=$RP/$NAME
@@ -882,6 +895,7 @@ reach() {
 # Signals wait while a pod is created, so none can end the run between its creation and its record.
 launch() {
     local kind price gpu r code left host
+    approved "$NAME" || { say "approval for $NAME withdrawn; not launching a pod"; exit 3; }
     POD="" IP="" PORT=""
     # The first pod must be in stock now; a replacement waits for stock while time remains.
     until [ -n "$POD" ]; do
