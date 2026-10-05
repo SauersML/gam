@@ -1264,10 +1264,11 @@ impl Device {
             Backend::Host => {
                 let flags = scored.map(host_indices).transpose()?;
                 let cols = logits.cols;
-                let mut output = Vec::with_capacity(logits.rows);
-                for (r, row) in host_mut(logits)?.chunks_mut(cols).enumerate() {
+                // Rows on the rayon pool.
+                host_mut(logits)?.par_chunks_mut(cols).enumerate().map(|(r, row)| {
                     if flags.is_some_and(|s| s[r] == 0) {
-                        row.fill(0.0); output.push([0.0, 0.0]); continue;
+                        row.fill(0.0);
+                        return Ok([0.0, 0.0]);
                     }
                     if row.iter().any(|v| !v.is_finite()) { return Err(shape("nonfinite softmax logits".into())); }
                     let (maximum, sum) = host_softmax_stats(row);
@@ -1281,9 +1282,8 @@ impl Device {
                     }
                     let stats = [maximum + log_sum, entropy];
                     if stats.iter().any(|v| !v.is_finite()) { return Err(shape("nonfinite softmax statistics".into())); }
-                    output.push(stats);
-                }
-                Ok(output)
+                    Ok(stats)
+                }).collect()
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.softmax_stats_rows(logits, scored),
@@ -1585,34 +1585,8 @@ impl Device {
         }
         match &*self.backend {
             Backend::Host => {
-                let (h, e) = (host(hidden)?, host(head)?);
                 let flags = scored.map(host_indices).transpose()?;
-                let at = |c: usize, j: usize| e[if transposed { j * classes + c } else { c * width + j }];
-                let (mut partitions, mut mean) = (vec![0.0; rows], vec![0.0; rows * width]);
-                for r in 0..rows {
-                    if flags.is_some_and(|f| f[r] == 0) {
-                        continue;
-                    }
-                    let hr = &h[r * width..(r + 1) * width];
-                    // Operands rounded to `arithmetic`'s precision, as the host's products are.
-                    let logits: Vec<f64> = (0..classes)
-                        .map(|c| (0..width).map(|j| round_operand(hr[j], arithmetic) * round_operand(at(c, j), arithmetic)).sum())
-                        .collect();
-                    let (m, s) = host_softmax_stats(&logits);
-                    partitions[r] = m + s.ln();
-                    if expected.is_some() {
-                        for (c, l) in logits.iter().enumerate() {
-                            let q = (l - m).exp() / s;
-                            for j in 0..width {
-                                mean[r * width + j] += q * at(c, j);
-                            }
-                        }
-                    }
-                }
-                if let Some(out) = expected {
-                    host_mut(out)?.copy_from_slice(&mean);
-                }
-                Ok(partitions)
+                self.head_log_partition_tiled(hidden, head, transposed, flags, expected, arithmetic)
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) if hidden.storage() == Storage::F32 => {
@@ -1633,33 +1607,48 @@ impl Device {
             }
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => {
-                // Row tiles whose logits fill about 32 MB, the size of CUDA's swept chunks.
-                let tile = ((1usize << 23) / classes).max(1);
                 let flags = scored.map(|s| match &s.data {
                     IndexData::Metal(_, values) => Ok(values.as_slice()),
                     _ => Err(foreign()),
                 });
                 let flags = flags.transpose()?;
-                let (into, back) = if transposed { (Op::N, Op::T) } else { (Op::T, Op::N) };
-                let mut expected = expected;
-                let mut partitions = Vec::with_capacity(rows);
-                for start in (0..rows).step_by(tile) {
-                    let n = tile.min(rows - start);
-                    let h = self.rows_of(hidden, start, n)?;
-                    let mut logits = self.zeros(n, classes)?;
-                    self.gemm(&mut logits, 1.0, &h, Op::N, head, into, 0.0, arithmetic)?;
-                    let part = flags.map(|f| self.upload_indices(&f[start..start + n])).transpose()?;
-                    let stats = self.softmax_stats_rows(&mut logits, part.as_ref())?;
-                    if let Some(out) = expected.as_deref_mut() {
-                        let mut mean = self.zeros(n, width)?;
-                        self.gemm(&mut mean, 1.0, &logits, Op::N, head, back, 0.0, arithmetic)?;
-                        self.set_rows(out, start, &mean)?;
-                    }
-                    partitions.extend(stats.iter().map(|s| s[0]));
-                }
-                Ok(partitions)
+                self.head_log_partition_tiled(hidden, head, transposed, flags, expected, arithmetic)
             }
         }
+    }
+
+    /// [`Device::head_log_partition`] in row tiles whose logits fill about 32 MB (the size of
+    /// CUDA's swept chunks), through this device's own products and softmax statistics; `flags`
+    /// are the scored rows' flags.
+    fn head_log_partition_tiled(
+        &self,
+        hidden: &Tensor,
+        head: &Tensor,
+        transposed: bool,
+        flags: Option<&[u32]>,
+        mut expected: Option<&mut Tensor>,
+        arithmetic: Arithmetic,
+    ) -> Result<Vec<f64>, GpuError> {
+        let (rows, width) = hidden.dim();
+        let classes = if transposed { head.cols } else { head.rows };
+        let tile = ((1usize << 23) / classes).max(1);
+        let (into, back) = if transposed { (Op::N, Op::T) } else { (Op::T, Op::N) };
+        let mut partitions = Vec::with_capacity(rows);
+        for start in (0..rows).step_by(tile) {
+            let n = tile.min(rows - start);
+            let h = self.rows_of(hidden, start, n)?;
+            let mut logits = self.zeros(n, classes)?;
+            self.gemm(&mut logits, 1.0, &h, Op::N, head, into, 0.0, arithmetic)?;
+            let part = flags.map(|f| self.upload_indices(&f[start..start + n])).transpose()?;
+            let stats = self.softmax_stats_rows(&mut logits, part.as_ref())?;
+            if let Some(out) = expected.as_deref_mut() {
+                let mut mean = self.zeros(n, width)?;
+                self.gemm(&mut mean, 1.0, &logits, Op::N, head, back, 0.0, arithmetic)?;
+                self.set_rows(out, start, &mean)?;
+            }
+            partitions.extend(stats.iter().map(|s| s[0]));
+        }
+        Ok(partitions)
     }
 
     /// [`Device::head_log_partition`] leaving each row's log partition on the device in
