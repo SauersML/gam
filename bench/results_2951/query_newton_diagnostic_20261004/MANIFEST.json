@@ -1,0 +1,53 @@
+{
+  "files": [
+    {
+      "path": "QUERY_NEWTON_SETTINGS.json",
+      "sha256": "9a25c7e96c2ab7370bb559f46342782ba207e94c72952b87428f8275c2dd27b6",
+      "bytes": 450
+    },
+    {
+      "path": "QUERY_NEWTON_SUMMARY.json",
+      "sha256": "0cc93acc988c195bd64949b409bca3533e1bb638a28d3f179f471a4d50f241c2",
+      "bytes": 2161
+    },
+    {
+      "path": "QUERY_NEWTON_TAIL_SETTINGS.json",
+      "sha256": "0ffe2a08f184523d2fed28e8939dc95322ae28a1c2fac8fbeaeb39c0a8ebf526",
+      "bytes": 4016
+    },
+    {
+      "path": "QUERY_NEWTON_TAIL_SUMMARY.json",
+      "sha256": "0ec85429c0af4a03ff764f5b89dd0afa99cd48381ac031c17b4356bca5ffcaab",
+      "bytes": 5357
+    },
+    {
+      "path": "QUERY_NEWTON_DISCOVERY/REPORT.json",
+      "sha256": "b5abc80f7049f2469d73205fa2cf79ef11073121707064c6007b65533544b57f",
+      "bytes": 815515
+    },
+    {
+      "path": "QUERY_NEWTON_DISCOVERY/DELTAS.json",
+      "sha256": "fd23f8952060d5af3cf9c105d14b1c32ad1d66db42f6764f1a6df15642c57e48",
+      "bytes": 98753
+    },
+    {
+      "path": "QUERY_NEWTON_DISCOVERY/PROVENANCE.json",
+      "sha256": "102b23876b5c2ad20cf7f201b3f682e113eeba0dfc2ce1fe76e2827a6c52df04",
+      "bytes": 104821
+    },
+    {
+      "path": "QUERY_NEWTON_TAIL_DISCOVERY/REPORT.json",
+      "sha256": "6ba42d7f04c444847de77c97309d47b8033180200ad1151f88203fc4685cccf1",
+      "bytes": 520731
+    },
+    {
+      "path": "QUERY_NEWTON_TAIL_DISCOVERY/PROVENANCE.json",
+      "sha256": "f18570a27d51786a6b9634be904245e8b46a1f5385b3fc10ef05b7075cc33a9f",
+      "bytes": 60190
+    }
+  ],
+  "source_commit_fit": "ae9f5e44d8",
+  "source_commit_tail": "1cc0013da2",
+  "tests": "Five convex-fit tests; six suffix-reuse tests. Native unchanged controls exactly match original full-recompute metrics; all160 oracle rows zero.",
+  "scope": "Discovery diagnostics only. No heldout outputs. Numerical optimizer convergence refers to ridge1e-6 regularized objective."
+}

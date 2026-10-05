@@ -1,0 +1,22 @@
+{
+  "oracle_kl_tolerance": 1e-10,
+  "oracle_probability_tolerance": 1e-10,
+  "prefix_absolute_tolerance": 1e-10,
+  "prefix_relative_tolerance": 1e-10,
+  "solver": {
+    "armijo": 0.0001,
+    "gradient_tolerance": 1e-08,
+    "history": 10,
+    "max_backtracks": 40,
+    "max_iterations": 300,
+    "ridge": 1e-06,
+    "method": "damped_newton",
+    "newton_damping": 1e-08
+  },
+  "diagnostic_read_nodes": [
+    2073,
+    2399,
+    2403,
+    2823
+  ]
+}

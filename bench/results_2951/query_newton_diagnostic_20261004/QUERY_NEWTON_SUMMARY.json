@@ -1,0 +1,76 @@
+{
+  "seconds": 1.2811843330000001,
+  "source_commit": "ae9f5e44d8",
+  "fixed_family": "Same native query shift, same ridge1e-6, same discovery folds. Only optimizer changed; selected four value-reading heads.",
+  "heads": [
+    {
+      "read_node": 2073,
+      "mean_train_kl": 0.025540418424808527,
+      "mean_crossfit_kl": 0.06458293048422692,
+      "all_stops": [
+        "gradient_tolerance",
+        "gradient_tolerance",
+        "gradient_tolerance"
+      ],
+      "max_gradient_norm": 6.067718315386316e-09,
+      "maximum_ridge_gradient_objective_gap_bound": 1.8408602777437278e-11,
+      "iterations": [
+        5,
+        6,
+        5
+      ]
+    },
+    {
+      "read_node": 2399,
+      "mean_train_kl": 0.06122393274423754,
+      "mean_crossfit_kl": 0.10608467755140123,
+      "all_stops": [
+        "gradient_tolerance",
+        "gradient_tolerance",
+        "gradient_tolerance"
+      ],
+      "max_gradient_norm": 1.7518621067541732e-12,
+      "maximum_ridge_gradient_objective_gap_bound": 1.534510420540585e-18,
+      "iterations": [
+        6,
+        6,
+        6
+      ]
+    },
+    {
+      "read_node": 2403,
+      "mean_train_kl": 0.013943101055185113,
+      "mean_crossfit_kl": 0.017447700756479396,
+      "all_stops": [
+        "gradient_tolerance",
+        "gradient_tolerance",
+        "gradient_tolerance"
+      ],
+      "max_gradient_norm": 4.844900543023744e-13,
+      "maximum_ridge_gradient_objective_gap_bound": 1.1736530635895884e-19,
+      "iterations": [
+        6,
+        6,
+        6
+      ]
+    },
+    {
+      "read_node": 2823,
+      "mean_train_kl": 0.02015021356283935,
+      "mean_crossfit_kl": 0.03906953343564418,
+      "all_stops": [
+        "gradient_tolerance",
+        "gradient_tolerance",
+        "gradient_tolerance"
+      ],
+      "max_gradient_norm": 9.958515969347239e-09,
+      "maximum_ridge_gradient_objective_gap_bound": 4.9586020155871986e-11,
+      "iterations": [
+        5,
+        5,
+        4
+      ]
+    }
+  ],
+  "scope": "Numerical stationarity of explicitly regularized convex training objective; no interval certificate, no unregularized family impossibility claim, no new heldout evidence."
+}
