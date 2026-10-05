@@ -2058,7 +2058,7 @@ extern "C" __global__ void softmax_stats_rows(unsigned int rows, unsigned int co
     for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) if (!isfinite(z[c])) bad += 1.0;
     double invalid = block_sum(bad, shared);
     if (invalid > 0.0) {
-        if (threadIdx.x == 0) { out[(u64)r*2] = NAN; out[(u64)r*2+1] = NAN; }
+        if (threadIdx.x == 0) { out[(u64)r*2] = __longlong_as_double(0x7ff8000000000000LL); out[(u64)r*2+1] = __longlong_as_double(0x7ff8000000000000LL); }
         return;
     }
     double maximum, sum;
