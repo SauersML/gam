@@ -854,6 +854,8 @@ impl Device {
             (Backend::Cuda(engine), Data::Cuda(slice)) => Data::Cuda(engine.copy(slice)?),
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda32(slice)) => Data::Cuda32(engine.copy(slice)?),
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::CudaBf16(slice)) => Data::CudaBf16(engine.copy(slice)?),
             #[cfg(target_os = "macos")]
             (Backend::Metal(engine), Data::Metal(buffer)) => Data::Metal(engine.copy_range(buffer, 0, t.len())?),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1761,6 +1763,8 @@ impl Device {
             (Backend::Cuda(engine), Data::Cuda(slice)) => Data::Cuda(engine.copy_range(slice, lo, hi)?),
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda32(slice)) => Data::Cuda32(engine.copy_range(slice, lo, hi)?),
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::CudaBf16(slice)) => Data::CudaBf16(engine.copy_range(slice, lo, hi)?),
             #[cfg(target_os = "macos")]
             (Backend::Metal(engine), Data::Metal(buffer)) => Data::Metal(engine.copy_range(buffer, lo, hi)?),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1808,6 +1812,8 @@ impl Device {
             (Backend::Cuda(engine), Data::Cuda(slice), Data::Cuda(p)) => engine.write_range(slice, lo, p),
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda32(slice), Data::Cuda32(p)) => engine.write_range(slice, lo, p),
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::CudaBf16(slice), Data::CudaBf16(p)) => engine.write_range(slice, lo, p),
             #[cfg(target_os = "macos")]
             (Backend::Metal(engine), Data::Metal(buffer), Data::Metal(p)) => engine.write_range(buffer, lo, p, part.len()),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1836,6 +1842,8 @@ impl Device {
             (Backend::Cuda(engine), Data::Cuda(out), Data::Cuda(input)) => engine.set_columns(Storage::F64, out, input, t.cols, part.cols, start, part.len()),
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda32(out), Data::Cuda32(input)) => engine.set_columns(Storage::F32, out, input, t.cols, part.cols, start, part.len()),
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::CudaBf16(out), Data::CudaBf16(input)) => engine.set_columns(Storage::Bf16, out, input, t.cols, part.cols, start, part.len()),
             #[cfg(target_os = "macos")]
             (Backend::Metal(engine), Data::Metal(out), Data::Metal(input)) => engine.set_columns(out, input, (t.cols, part.cols, start), part.len()),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1946,7 +1954,8 @@ impl Device {
     /// A weight sample of a factorized Gaussian posterior, `θᵢ = μᵢ + exp(sᵢ) εᵢ` with `εᵢ =
     /// [`posterior_normal`]`(key, stream, i)`, written into `theta` (this device's storage) from
     /// the posterior's means `μ` and log standard deviations `s` (`mean`, `log_sd`, in `theta`'s
-    /// storage). A removed entry (`s = −∞`, `μ = 0`) samples 0.
+    /// storage, or f32 for a bfloat16 `theta` on CUDA, written rounded to nearest). A removed entry
+    /// (`s = −∞`, `μ = 0`) samples 0.
     /// The draws are regenerated from their counters, never stored ([`Device::posterior_adam`]
     /// regenerates the same ones).
     pub fn reparameterize(&self, theta: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {
@@ -2526,6 +2535,10 @@ extern "C" __global__ void set_columns(u64 n, u64 output_cols, u64 input_cols, u
     GRID_STRIDE(i, n) output[(i / input_cols) * output_cols + start + i % input_cols] = input[i];
 }
 
+extern "C" __global__ void set_columns_bits16(u64 n, u64 output_cols, u64 input_cols, u64 start, const unsigned short* input, unsigned short* output) {
+    GRID_STRIDE(i, n) output[(i / input_cols) * output_cols + start + i % input_cols] = input[i];
+}
+
 extern "C" __global__ void hadamard(u64 n, const double* a, const double* b, double* out, int accumulate) {
     GRID_STRIDE(i, n) out[i] = accumulate ? out[i] + a[i] * b[i] : a[i] * b[i];
 }
@@ -3088,6 +3101,19 @@ extern "C" __global__ void reparameterize_f64(u64 n, u64 key, u64 stream, const 
 
 extern "C" __global__ void reparameterize_f32(u64 n, u64 key, u64 stream, const float* mean, const float* log_sd, float* theta) {
     reparameterize_body<float>(n, key, stream, mean, log_sd, theta);
+}
+
+// The bfloat16 nearest x (ties to even; a NaN stays a quiet NaN), as its 16 bits (`bf16_bits`).
+__device__ unsigned short bf16_round(float x) {
+    unsigned int bits = __float_as_uint(x);
+    if (x != x) return (unsigned short)((bits >> 16) | 0x40u);
+    return (unsigned short)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+
+// The sample of f32 posterior entries written as bfloat16, the form products in Arithmetic::Bf16
+// read without rounding it again.
+extern "C" __global__ void reparameterize_bf16(u64 n, u64 key, u64 stream, const float* mean, const float* log_sd, unsigned short* theta) {
+    GRID_STRIDE(i, n) theta[i] = bf16_round(mean[i] + expf(log_sd[i]) * posterior_normal(key, stream, i));
 }
 
 // Adds a live entry's (1, μ² + σ², 2s) to its group's row of `sums`: once per warp when every live
@@ -4292,7 +4318,8 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             output_cols: usize, input_cols: usize, start: usize, elements: usize,
         ) -> Result<(), GpuError> {
             let (n, output_cols, input_cols, start) = (elements as u64, output_cols as u64, input_cols as u64, start as u64);
-            let f = self.kernel("set_columns", storage)?;
+            // Bfloat16 values move as their 16 bits.
+            let f = if storage == Storage::Bf16 { self.function("set_columns_bits16")? } else { self.kernel("set_columns", storage)? };
             // SAFETY: matching rows and destination column range checked by Device.
             unsafe {
                 self.stream.launch_builder(&f).arg(&n).arg(&output_cols).arg(&input_cols).arg(&start)
@@ -4701,7 +4728,17 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         }
 
         pub(super) fn reparameterize(&self, theta: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {
-            let (n, storage) = (theta.len() as u64, theta.storage());
+            let n = theta.len() as u64;
+            if let Data::CudaBf16(out) = &mut theta.data {
+                let f = self.function("reparameterize_bf16")?;
+                // SAFETY: three equal-length buffers, checked by the caller; f32 posterior entries.
+                return unsafe {
+                    self.stream.launch_builder(&f).arg(&n).arg(&key).arg(&stream).input(mean, Storage::F32)?.input(log_sd, Storage::F32)?.arg(out).launch(cfg_elements(n))
+                }
+                .gpu_ctx("tensor reparameterize bf16")
+                .map(|_| ());
+            }
+            let storage = theta.storage();
             let f = self.posterior_kernel("reparameterize", storage)?;
             // SAFETY: three equal-length buffers in one storage, checked by the caller and `input`.
             unsafe {

@@ -211,3 +211,18 @@ fn cuda_matches_the_host() {
     against_host(&narrow, &wide);
     against_host(&wide, &wide);
 }
+
+#[test]
+fn a_bfloat16_sample_is_the_f32_sample_rounded() {
+    let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
+    let fit = wide.with_storage(Storage::F32).expect("CUDA holds f32");
+    let c = case();
+    let (mean, log_sd) = (fit.upload(c.mean.view()).unwrap(), fit.upload(c.log_sd.view()).unwrap());
+    let mut single = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
+    fit.reparameterize(&mut single, (&mean, &log_sd), (c.step.key, c.step.stream)).unwrap();
+    let mut half = fit.bf16_copy(&single).unwrap();
+    fit.reparameterize(&mut half, (&mean, &log_sd), (c.step.key, c.step.stream)).unwrap();
+    // `bf16_copy` rounds to nearest, ties to even, as the bfloat16 sample does.
+    let expected = fit.download(&fit.bf16_copy(&single).unwrap()).unwrap();
+    assert_eq!(fit.download(&half).unwrap(), expected);
+}

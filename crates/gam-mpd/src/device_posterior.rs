@@ -165,7 +165,10 @@ impl DevicePosterior {
     /// Writes the posterior means into `program`'s trainable operators (rounded to its storage).
     pub fn mean_into(&self, program: &mut DeviceProgram) -> Result<(), String> {
         for (i, &op) in self.operators.iter().enumerate() {
-            program.replace_dense_parameter(op, self.fitting.copy(&self.mean[i]).map_err(error)?)?;
+            // A program holding the operator in bfloat16 (`DeviceProgram::hold_bf16`) gets it so.
+            let bf16 = program.dense(op).is_ok_and(|held| held.storage() == Storage::Bf16);
+            let value = if bf16 { self.fitting.bf16_copy(&self.mean[i]) } else { self.fitting.copy(&self.mean[i]) };
+            program.replace_dense_parameter(op, value.map_err(error)?)?;
         }
         program.refresh_fused()
     }

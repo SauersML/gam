@@ -320,6 +320,11 @@ fn main() -> Result<(), String> {
     let mut p_program = DeviceProgram::compile_values_bounded(&device, &interchange::prefix(&p_flat)?, usize::MAX)?;
     p_program.set_arithmetic(products);
     p_program.prepare_dense_parameters(&trainable)?;
+    // Bfloat16 products read bfloat16 copies of the weights (`DeviceProgram::hold_bf16`).
+    if products == gam_gpu::tensor::Arithmetic::Bf16 {
+        m_program.hold_bf16()?;
+        p_program.hold_bf16()?;
+    }
     // Where the experiments cannot be scored (a head the compact targets do not take), the posterior
     // parts are timed alone, from a zero gradient on the device.
     let scoring = match FixedHead::new(&device, &m_flat, &p_flat, 4096) {
@@ -380,6 +385,9 @@ fn main() -> Result<(), String> {
     }
     // The device path.
     let mut device_seconds: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
+    // The last step's mean KL(M_e ‖ P_e) per scored token, in bits (a check that the products'
+    // arithmetic did not change what is computed).
+    let mut mean_bits = None;
     {
         let parts = Parts { operators: &trainable, mean: &start.mean, log_sd: &start.log_sd, groups: &start.groups, count: start.count };
         let mut posterior = DevicePosterior::from_parts(&device, &parts, None, 0)?;
@@ -394,7 +402,10 @@ fn main() -> Result<(), String> {
             let gradient = match (&scoring, &design) {
                 (Some((head, m)), Some(design)) => {
                     let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments, design))?;
-                    timed(&device, s, "evaluate", || interchange::evaluate(m, &p_model(&p_program, sites)?, head, &batch, &targets, &experiments, design, true))?.gradient
+                    let evaluation = timed(&device, s, "evaluate", || interchange::evaluate(m, &p_model(&p_program, sites)?, head, &batch, &targets, &experiments, design, true))?;
+                    let tokens = evaluation.bits.iter().map(Vec::len).sum::<usize>();
+                    mean_bits = Some(evaluation.bits.iter().flatten().sum::<f64>() / tokens as f64);
+                    evaluation.gradient
                 }
                 _ => zeros.iter().map(|(op, z)| Ok((*op, device.copy(z).map_err(error)?))).collect::<Result<BTreeMap<_, _>, String>>()?,
             };
@@ -408,6 +419,7 @@ fn main() -> Result<(), String> {
         "products": format!("{products:?}"),
         "fused_head_groups": [m_program.fused_groups(), p_program.fused_groups()],
         "scored": scoring.is_some(),
+        "mean_bits_per_token": mean_bits,
         "device": device.name(),
         "sequences": sequences,
         "context": context,

@@ -27,7 +27,7 @@
 
 use super::device_heads::{self, Buffer, Heads, Stacked};
 use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorBody, OperatorProgram, Rotary, SlotValues};
-use gam_gpu::tensor::{Arithmetic, Device, Indices, Op, PointwiseLaw, Tensor};
+use gam_gpu::tensor::{Arithmetic, Device, Indices, Op, PointwiseLaw, Storage, Tensor};
 use ndarray::{Array1, Array2};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -186,6 +186,8 @@ pub struct DeviceProgram {
     /// Per rotary, its cosines and sines at positions `0..span` (span × planes), computed once and
     /// grown when a longer sequence comes; a batch gathers its rows by position.
     rotary_tables: Mutex<Vec<(Rotary, usize, Arc<(Tensor, Tensor)>)>>,
+    /// Whether dense operators a product reads are held as bfloat16 ([`Self::hold_bf16`]).
+    bf16: bool,
     /// The arithmetic of every product in the forward pass and the head (float64 by default; a
     /// training step's proposals may run in TF32, its accepted point is scored again in float64).
     arithmetic: Arithmetic,
@@ -646,7 +648,7 @@ impl DeviceProgram {
             };
             fused.push(Fused { heads, stacked, sources, live: true, disabled: false, source_matches: true });
         }
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new() })
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new() })
     }
 
     /// Operator `op`'s device copy changed: every group reading it runs node by node until
@@ -907,13 +909,41 @@ impl DeviceProgram {
         self.arithmetic = arithmetic;
     }
 
+    /// Hold every dense operator a product reads, and every fused group's stacked projections and
+    /// output operators, as bfloat16 copies from now on (CUDA): products in [`Arithmetic::Bf16`]
+    /// read them as they are, at half the bytes and with no rounding pass per product. Diagonals,
+    /// gains, biases and tables keep the program's storage. A trainable operator's later values
+    /// are written in bfloat16 too (`device_posterior::DevicePosterior`).
+    pub fn hold_bf16(&mut self) -> Result<(), String> {
+        let d = self.device.clone();
+        for held in self.operators.values_mut() {
+            if let Held::Dense(a) = held.held.as_ref()
+                && a.storage() != Storage::Bf16
+            {
+                held.held = Arc::new(Held::Dense(d.bf16_copy(a).map_err(error)?));
+            }
+        }
+        for group in &mut self.fused {
+            let s = &group.stacked;
+            if s.weights.storage() != Storage::Bf16 {
+                let copy = |t: &Option<Tensor>| t.as_ref().map(|t| d.copy(t).map_err(error)).transpose();
+                group.stacked = Arc::new(Stacked { weights: d.bf16_copy(&s.weights).map_err(error)?, biases: copy(&s.biases)?, gains: copy(&s.gains)?, reads: d.bf16_copy(&s.reads).map_err(error)? });
+            }
+        }
+        self.bf16 = true;
+        Ok(())
+    }
+
     /// Re-upload every operator `program` now holds a different copy of (a stepped library).
     pub fn refresh(&mut self, program: &OperatorProgram) -> Result<(), String> {
         let mut changed = BTreeSet::new();
         for ((op, role), held) in &mut self.operators {
             if !held.source_matches || !Arc::ptr_eq(&held.source, &program.operators[*op]) {
                 held.source = Arc::clone(&program.operators[*op]);
-                held.held = Arc::new(hold(&self.device, &held.source, *role)?);
+                held.held = Arc::new(match hold(&self.device, &held.source, *role)? {
+                    Held::Dense(a) if self.bf16 => Held::Dense(self.device.bf16_copy(&a).map_err(error)?),
+                    other => other,
+                });
                 held.source_matches = true;
                 changed.insert(*op);
             }
