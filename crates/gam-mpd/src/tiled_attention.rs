@@ -24,7 +24,7 @@ fn groups(layout: &SequenceLayout) -> BTreeMap<u32, Vec<usize>> {
     out
 }
 
-fn rotate<'a>(x: &'a Array2<f64>, rotary: Option<Rotary>, positions: &[u32], inverse: bool) -> Cow<'a, Array2<f64>> {
+pub(crate) fn rotate<'a>(x: &'a Array2<f64>, rotary: Option<Rotary>, positions: &[u32], inverse: bool) -> Cow<'a, Array2<f64>> {
     if rotary.is_none() { return Cow::Borrowed(x); }
     let mut out = x.clone();
     if let Some(rotary) = rotary {
