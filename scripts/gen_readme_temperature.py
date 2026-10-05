@@ -5,7 +5,9 @@ Each observation is a quality-approved daily (TMAX + TMIN) / 2 in Celsius.
 No averaging into months or downsampling: all 3,653 daily observations appear.
 Calendar dates map to a common leap-year calendar, keeping January, February
 and March aligned across years. Observations are translucent, unconnected dots.
-Angle encodes day of year, while both height and colour encode temperature.
+Angle encodes day of year, radius is the measured daily high–low temperature
+range in Celsius, and height and colour encode the daily mean temperature.
+No random jitter or artificial displacement creates the spatial spread.
 The continuous fitted loop has a vertical 95% credible ribbon. Its mean and
 bounds wrap at the year boundary; calendar months mark the circular base axis.
 
@@ -55,6 +57,10 @@ def daily_data():
         (daily[year, month, 'TMAX'] + daily[year, month, 'TMIN']) / 2
         for year in range(2015, 2025) for month in range(1, 13)
     ])
+    daily_range = np.concatenate([
+        daily[year, month, 'TMAX'] - daily[year, month, 'TMIN']
+        for year in range(2015, 2025) for month in range(1, 13)
+    ])
     phase = np.asarray([
         ((date(2000, month, day) - date(2000, 1, 1)).days + 0.5) / 366
         for year in range(2015, 2025) for month in range(1, 13)
@@ -66,19 +72,25 @@ def daily_data():
     ])
     assert len(temperature) == len(phase) == len(years) == 3653
     assert np.isfinite(temperature).all()
+    assert np.isfinite(daily_range).all() and (daily_range > 0).all()
     for year in range(2015, 2025):
         assert phase[years == year][0] == phase[0]
         assert phase[years == year][-1] == phase[-1]
         march_first = 31 + calendar.monthrange(year, 2)[1]
         assert phase[years == year][march_first] == 60.5 / 366
-    return {'phase': phase, 'temperature': temperature, 'year': years}
+    return {'phase': phase, 'temperature': temperature,
+            'daily_range': daily_range, 'year': years}
 
 
 def fit():
     data = daily_data()
     model = gamfit.fit(data, FORMULA)
+    range_model = gamfit.fit(data, 'daily_range ~ s(phase, periodic=true, period=1, k=60)')
     phase = np.linspace(0, 1, 1441)
     bands = model.predict({'phase': phase}, interval=0.95, return_type='dict')
+    bands['radius'] = range_model.predict({'phase': phase}, return_type='dict')['posterior_mean']
+    assert np.isfinite(bands['radius']).all() and (bands['radius'] > 0).all()
+    np.testing.assert_allclose(bands['radius'][0], bands['radius'][-1], atol=1e-10)
     for field in ('posterior_mean', 'posterior_mean_lower', 'posterior_mean_upper'):
         assert np.isfinite(bands[field]).all()
         np.testing.assert_allclose(bands[field][0], bands[field][-1], atol=1e-10)
@@ -87,6 +99,9 @@ def fit():
     seam = model.predict({'phase': [-epsilon, 0, epsilon, 1-epsilon, 1, 1+epsilon]},
                          return_type='dict')['posterior_mean']
     np.testing.assert_allclose(seam[:3], seam[3:], atol=1e-9, rtol=0)
+    radial_seam = range_model.predict({'phase': [-epsilon, 0, epsilon, 1-epsilon, 1, 1+epsilon]},
+                                     return_type='dict')['posterior_mean']
+    np.testing.assert_allclose(radial_seam[:3], radial_seam[3:], atol=1e-9, rtol=0)
     print('3,653 daily temperatures from 10 years; calendar alignment, mean, 95% credible bounds and seamless wrapping verified.')
     return data, phase * 2 * np.pi, bands
 
@@ -106,7 +121,7 @@ def draw(data, theta, bands, theme, path):
     ])
     mean = bands['posterior_mean']
     lower, upper = bands['posterior_mean_lower'], bands['posterior_mean_upper']
-    x, y = np.cos(theta), np.sin(theta)
+    x, y = bands['radius'] * np.cos(theta), bands['radius'] * np.sin(theta)
     positions = np.column_stack([x, y, mean])
     # The central loop's geometry and colour both encode predicted temperature.
     segments = np.stack([positions[:-1], positions[1:]], axis=1)
@@ -125,7 +140,8 @@ def draw(data, theta, bands, theme, path):
     ax.add_collection3d(curve)
 
     days = data['phase'] * 2 * np.pi
-    dx, dy = np.cos(days), np.sin(days)
+    dx, dy = data['daily_range'] * np.cos(days), data['daily_range'] * np.sin(days)
+    np.testing.assert_allclose(np.hypot(dx, dy), data['daily_range'], atol=1e-10)
     # Every daily observation is plotted, including short weather fluctuations.
     observations = ax.scatter(dx, dy, data['temperature'], s=95,
                c=palette(normalize(data['temperature'])),
@@ -136,26 +152,36 @@ def draw(data, theta, bands, theme, path):
     month_centers = (np.cumsum(month_lengths) - month_lengths/2) / 366
     months = month_centers * 2 * np.pi
 
-    # The floor circle is the month axis, not a second data series.
-    ax.plot(1.3*x, 1.3*y, np.full_like(theta, -15), color=theme['grid'], linewidth=1.6, zorder=1)
+    # A cylindrical coordinate frame: equal Celsius units for radius and height.
+    axis_radius = 20.0
+    for radius in (5, 10, 15, axis_radius):
+        ax.plot(radius*np.cos(theta), radius*np.sin(theta), np.full_like(theta, -15),
+                color=theme['grid'], linewidth=1.4 if radius == axis_radius else 0.9, zorder=1)
     for month, angle in enumerate(months, 1):
-        ax.plot([1.3*np.cos(angle), 1.38*np.cos(angle)],
-                [1.3*np.sin(angle), 1.38*np.sin(angle)], [-15, -15],
+        ax.plot([axis_radius*np.cos(angle), (axis_radius+1.1)*np.cos(angle)],
+                [axis_radius*np.sin(angle), (axis_radius+1.1)*np.sin(angle)], [-15, -15],
                 color=theme['ink'], linewidth=2, zorder=1)
-        ax.text(1.53*np.cos(angle), 1.53*np.sin(angle), -16, str(month),
+        ax.text(23*np.cos(angle), 23*np.sin(angle), -16, str(month),
                 color=theme['ink'], fontsize=24, ha='center', va='center', zorder=6)
-    ax.text(0.4, -1.8, -17, 'Month', color=theme['ink'], fontsize=26,
+    ax.text2D(0.48, -0.025, 'Month', transform=ax.transAxes,
+              color=theme['ink'], fontsize=26, ha='center', va='center', zorder=6)
+    # The radial scale makes distance explicit; it is the daily high–low range.
+    ax.plot([0, 0], [0, -axis_radius], [-15, -15], color=theme['grid'], linewidth=1.5, zorder=1)
+    for radius in (5, 10, 15, 20):
+        ax.text(-1.0, -radius, -15, str(radius), color=theme['ink'],
+                fontsize=18, ha='right', va='center', zorder=6)
+    ax.text(5.5, -12, -15, 'Range (°C)', color=theme['ink'], fontsize=22,
             ha='center', va='center', zorder=6)
 
-    ax.set(xlim=(-1.7, 1.7), ylim=(-1.7, 1.7), zlim=(-18, 35))
+    ax.set(xlim=(-29, 29), ylim=(-29, 29), zlim=(-18, 35))
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_zticks([-10, 0, 10, 20, 30])
     ax.set_zlabel('Temperature (°C)', fontsize=26, labelpad=22, color=theme['ink'])
     ax.tick_params(axis='z', labelsize=23, pad=8, colors=theme['ink'])
-    ax.set_box_aspect((1, 1, 0.9), zoom=1.20)
-    ax.set_proj_type('ortho')
-    ax.view_init(elev=28, azim=-55)
+    ax.set_box_aspect((58, 58, 53), zoom=1.30)
+    ax.set_proj_type('persp', focal_length=0.85)
+    ax.view_init(elev=32, azim=-20)
     ax.grid(False)
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
         axis.pane.set_visible(False)
@@ -165,6 +191,12 @@ def draw(data, theta, bands, theme, path):
     assert len(fig.axes) == 1 and not ax.get_title() and not fig.texts
     assert ax.get_legend() is None
     assert sum(isinstance(item, Line3DCollection) for item in ax.collections) == 1
+    # Constant physical marker size under perspective: nearer observations
+    # project larger instead of every point being a flat, equal-size overlay.
+    homogeneous = np.vstack([dx, dy, data['temperature'], np.ones(len(dx))])
+    distance = (ax.get_proj() @ homogeneous)[3]
+    assert (distance > 0).all()
+    observations.set_sizes(95 * (np.median(distance) / distance) ** 2)
     fig.canvas.draw()
     fig.savefig(path, dpi=240, facecolor=theme['background'])
     plt.close(fig)
