@@ -25,17 +25,30 @@
 //! # Region rewrite
 //!
 //! A region is a set of functions of one MLP. Its rewrite ([`rewrite`]) replaces them by a call of a
-//! new body, exactly. With `A` the region's gate rows (and `D` its up rows), `S = [A; D]` and
+//! new body. With `A` the region's gate rows (and `D` its up rows), `S = [A; D]` and
 //! `S = Σ_r s_r a_r v_rᵀ` its singular value decomposition over the singular values resolved from
 //! zero (above the decomposition's rounding band), `R = [v_r]ᵀ`, `G = A Rᵀ` and `B = D Rᵀ`; with
 //! `O` the region's output columns and `O = Σ_r t_r p_r q_rᵀ` likewise, `W = [p_r]` and
-//! `U = Wᵀ O`. Then `G R = A`, `B R = D` and `W U = O`, so the rewritten explanation computes what
-//! the region computed. Unit `j` of the body is the region's `j`-th function: each replaced native
-//! block's owner (`Artifact::owners`) becomes the body's block of that unit at the call with the
-//! call's binding as its factor, exactly (`a_i = g_j R`, `b_i = b_j R`, `u_i = W u_j`;
-//! [`Call::replaced`] lists the same correspondence). The native functions' groups leave the
-//! explanation (`Explanation::removed`); their reads stay among `M`'s read variables, so the
-//! experiments do not change.
+//! `U = Wᵀ O`. Then `G R = A − ΔA`, `B R = D − ΔD` and `W U = O − ΔO`, where `[ΔA; ΔD]` and `ΔO` are
+//! the parts along the singular directions the decomposition does not resolve from zero; the
+//! largest singular value dropped is the spectral norm of each, recorded as [`Call::discarded`]
+//! (zero when nothing is dropped). On an input `x` the region's pre-activations therefore change by
+//! at most `discarded[0] ‖x‖`, and its written output by at most `‖O‖` times the activations'
+//! change (at most the law's Lipschitz constant times the pre-activations' change, ungated) plus
+//! `discarded[1] ‖h(x)‖`, `h(x)` the region's activations. Unit `j` of the body is the region's
+//! `j`-th function: each replaced native block's owner (`Artifact::owners`) becomes the body's
+//! block of that unit at the call with the call's binding as its factor (`a_i = g_j R`,
+//! `b_i = b_j R`, `u_i = W u_j`, up to the same discarded parts; a bias is the body's own entry and
+//! takes no binding; [`Call::replaced`] lists the same correspondence). The native functions'
+//! groups leave the explanation (`Explanation::removed`); their reads stay among `M`'s read
+//! variables, so the experiments do not change.
+//!
+//! A rewrite or a merge maps the means: the rewritten explanation's values compute what the
+//! region's values computed (up to the discarded parts). It does not map the posterior: the fit
+//! that follows starts a new factorized posterior over the body's and the bindings' entries
+//! (`Posterior::new`), a new approximation and not the image of the old one (a linear change of
+//! coordinates turns a diagonal covariance into a full one, and a product of two uncertain factors
+//! is not Gaussian).
 //!
 //! # Reuse
 //!
@@ -46,15 +59,19 @@
 //! architecture's exact symmetries of a body. Two bodies compute one function up to their calls'
 //! bindings when, for a permutation `π` of the units and linear `A`, `C`, every unit `i` of the
 //! first has `g_i = g_{π(i)} A`, `c_i = c_{π(i)}` and `u_i = C u_{π(i)}` (gated: `M_i = C M_{π(i)} A`,
-//! `N_i = C N_{π(i)}`). [`align`] finds them by alternating weighted least squares in `A` and `C`
-//! with an optimal assignment of the units ([`hungarian`]), each step minimizing over its own
-//! block the misfit `Σ (θ₁ − T(θ₀))² / σ₁²` (the first body's posterior means `θ₁` against the
-//! transformed second's, in units of the first's posterior deviations), so the misfit never
-//! increases; it reports the misfit in units of both posteriors' deviations. [`merge`] makes every
-//! call of the first body a call of the second with the bindings `A R` and `W C`: the element
-//! relating the call to the shared body is part of the call's bindings, which are priced. A rewrite
-//! or a merge is accepted only if `F` falls after the fit re-converges on the fixed native
-//! experiments.
+//! `N_i = C N_{π(i)}`), and both bodies have the same law `φ`. [`align`] searches for them by
+//! alternating weighted least squares in `A` and `C` with an optimal assignment of the units
+//! ([`hungarian`]), each step minimizing over its own block the misfit `Σ (θ₁ − T(θ₀))² / σ₁²` (the
+//! first body's posterior means `θ₁` against the transformed second's, each value over its marginal
+//! variance; an entry of variance zero is an exact constraint); the alternation finds a local
+//! optimum, not necessarily the global one. It reports the same misfit in units of both
+//! posteriors' marginal variances, unmatched units of either body included: a heuristic score of the
+//! match, since the values are correlated, the gauge is fitted and the matching chosen on the same
+//! values. [`merge`] makes every call of the first body a call of the second with the bindings
+//! `A R` and `W C`: the element relating the call to the shared body is part of the call's
+//! bindings, which are priced, and the matching of the units and the scalars the ownership map
+//! needs are priced in `Explanation::fixed_nats`. A rewrite with its reuse is accepted only if `F`
+//! falls after the fit re-converges on the fixed native experiments.
 //!
 //! # Regions
 //!
@@ -62,8 +79,9 @@
 //! They need not interact with each other, so they are not a community of the flow graph (the
 //! functions an MLP's units interact with are much the same for all of them); they are the
 //! functions whose union a rewrite compresses. Among an MLP's functions that carry RelP flow
-//! (`library_readout`), [`regions`] groups them greedily by the parameters a rewrite of the union
-//! saves at the posterior's own resolution.
+//! (`library_readout`), [`regions`] groups them greedily by a heuristic count of the parameters a
+//! rewrite of the union saves at the posterior's resolution, and orders the groups by it; the
+//! count decides no rewrite (the code length does).
 
 use crate::{
     library_mdl::{Cells, Explanation, Group, Posterior},
@@ -106,15 +124,18 @@ fn units(count: usize) -> Result<Interface, String> {
 }
 
 /// A call of a body: its name (`library.l{layer}.call{c}`, its bindings `{name}.read` and
-/// `{name}.write`), its layer, its body's rule name, and per native function of the layer it
-/// replaced the body unit computing it at this call (the native parameters' ownership; a function
-/// whose unit a merge did not match keeps no unit).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `{name}.write`), its layer, its body's rule name, per native function of the layer it replaced
+/// the body unit computing it at this call (the native parameters' ownership; a function whose unit
+/// a merge did not match keeps no unit), and the spectral norms of the read and the write parts its
+/// rewrite discarded (module note).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Call {
     pub name: String,
     pub layer: usize,
     pub body: String,
     pub replaced: Vec<(usize, Option<usize>)>,
+    #[serde(default)]
+    pub discarded: [f64; 2],
 }
 
 /// A body's operators in the explanation's program.
@@ -240,26 +261,41 @@ fn renumber_rules(program: &mut OperatorProgram, rules: &[usize]) {
     }
 }
 
+/// The singular triplets of `a`.
+type Triplets = (Array2<f64>, Array1<f64>, Array2<f64>);
+
 /// The singular vectors of `a` whose singular values are resolved from zero (above the
-/// decomposition's rounding band): `(left, values, right)`; none when every one is within it.
-fn resolved(a: &Array2<f64>) -> Result<Option<(Array2<f64>, Array1<f64>, Array2<f64>)>, String> {
+/// decomposition's rounding band): `(left, values, right)`, none when every one is within it; and
+/// the largest singular value left out, the spectral norm of the part of `a` along the directions
+/// not kept (zero when none is left out).
+fn split(a: &Array2<f64>) -> Result<(Option<Triplets>, f64), String> {
     if a.is_empty() {
-        return Ok(None);
+        return Ok((None, 0.0));
     }
     let decomposition = svd(a.view(), false).map_err(error)?;
     let rank = decomposition.singular_values.iter().filter(|s| **s > decomposition.band).count();
+    let dropped = decomposition.singular_values.get(rank).copied().unwrap_or(0.0);
     if rank == 0 {
-        return Ok(None);
+        return Ok((None, dropped));
     }
-    Ok(Some((
-        decomposition.u.slice(s![.., ..rank]).to_owned(),
-        decomposition.singular_values.slice(s![..rank]).to_owned(),
-        decomposition.vt.slice(s![..rank, ..]).to_owned(),
-    )))
+    Ok((
+        Some((
+            decomposition.u.slice(s![.., ..rank]).to_owned(),
+            decomposition.singular_values.slice(s![..rank]).to_owned(),
+            decomposition.vt.slice(s![..rank, ..]).to_owned(),
+        )),
+        dropped,
+    ))
+}
+
+/// [`split`]'s resolved singular vectors of `a`.
+fn resolved(a: &Array2<f64>) -> Result<Option<Triplets>, String> {
+    Ok(split(a)?.0)
 }
 
 /// `explanation` with the functions `functions` of layer `layer`'s MLP replaced by a call of a new
-/// body, exactly (module note), and the call.
+/// body (module note: up to the parts along unresolved directions, whose norms the call records),
+/// and the call.
 pub fn rewrite(explanation: &Explanation, layer: usize, functions: &[usize]) -> Result<(Explanation, Call), String> {
     let mut sorted = functions.to_vec();
     sorted.sort_unstable();
@@ -295,11 +331,13 @@ pub fn rewrite(explanation: &Explanation, layer: usize, functions: &[usize]) -> 
         Some(d) => ndarray::concatenate(Axis(0), &[a.view(), d.view()]).map_err(error)?,
         None => a.clone(),
     };
-    let (_, _, read) = resolved(&stacked)?.ok_or("a region whose reads are zero")?;
+    let (kept, read_dropped) = split(&stacked)?;
+    let (_, _, read) = kept.ok_or("a region whose reads are zero")?;
     let g = a.dot(&read.t());
     let b = d_up.map(|d| d.dot(&read.t()));
     let o = program.operators[out].matrix().select(Axis(1), functions);
-    let (write, _, _) = resolved(&o)?.ok_or("a region whose writes are zero")?;
+    let (kept, write_dropped) = split(&o)?;
+    let (write, _, _) = kept.ok_or("a region whose writes are zero")?;
     let u = write.t().dot(&o);
     let (c, e) = (gate_bias.map(rows_of), up_bias.map(rows_of));
     let (n, k, k_out) = (functions.len(), read.nrows(), write.ncols());
@@ -390,12 +428,13 @@ pub fn rewrite(explanation: &Explanation, layer: usize, functions: &[usize]) -> 
     }
     groups.extend(binding_groups(&call, read_op, write_op, k, k_out, d_in, d_out));
     // Each replaced native block's owner is now the body's block of its unit at this call, read
-    // through the call's bindings (a gate row through `R`, an output column through `W`).
-    let row_block = |operator: &str, i: usize| -> Option<(usize, std::ops::Range<usize>, std::ops::Range<usize>)> {
+    // through the call's bindings (a gate or up row through `R`, an output column through `W`); a
+    // bias is the body's own entry and takes no binding, whatever the read's width.
+    let row_block = |operator: &str, i: usize| -> Option<(usize, std::ops::Range<usize>, std::ops::Range<usize>, bool)> {
         let j = functions.iter().position(|f| *f == i)?;
-        let parts = [("gate", Some(body_gate), k), ("up", body_up, k), ("gate_bias", body_gate_bias, 1), ("up_bias", body_up_bias, 1)];
-        let (_, op, width) = parts.into_iter().find(|(part, _, _)| operator == format!("{mlp}.{part}"))?;
-        Some((op?, j..j + 1, 0..width))
+        let parts = [("gate", Some(body_gate), k, true), ("up", body_up, k, true), ("gate_bias", body_gate_bias, 1, false), ("up_bias", body_up_bias, 1, false)];
+        let (_, op, width, reads) = parts.into_iter().find(|(part, ..)| operator == format!("{mlp}.{part}"))?;
+        Some((op?, j..j + 1, 0..width, reads))
     };
     let (read_name, write_name) = (format!("{call}.read"), format!("{call}.write"));
     for owner in &mut rewritten.artifact.owners {
@@ -403,8 +442,8 @@ pub fn rewrite(explanation: &Explanation, layer: usize, functions: &[usize]) -> 
         let target = if owner.operator == format!("{mlp}.out") && owner.cols.len() == 1 {
             functions.iter().position(|f| *f == owner.cols.start).map(|j| (body_out, 0..k_out, j..j + 1, vec![write_name.clone()], Vec::new()))
         } else if owner.rows.len() == 1 {
-            row_block(&owner.operator, owner.rows.start).map(|(op, rows, cols)| {
-                let right = if cols.len() == k { vec![read_name.clone()] } else { Vec::new() };
+            row_block(&owner.operator, owner.rows.start).map(|(op, rows, cols, reads)| {
+                let right = if reads { vec![read_name.clone()] } else { Vec::new() };
                 (op, rows, cols, Vec::new(), right)
             })
         } else {
@@ -426,7 +465,7 @@ pub fn rewrite(explanation: &Explanation, layer: usize, functions: &[usize]) -> 
     rewritten.removed.extend(retired);
     rewritten.removed.sort_unstable();
     let replaced = functions.iter().enumerate().map(|(j, i)| (*i, Some(j))).collect();
-    Ok((rewritten, Call { name: call, layer, body, replaced }))
+    Ok((rewritten, Call { name: call, layer, body, replaced, discarded: [read_dropped, write_dropped] }))
 }
 
 /// A call's binding groups: each row of its read binding (`k × d_in`) and each column of its write
@@ -480,11 +519,12 @@ pub struct Part {
     pub sd: Array2<f64>,
 }
 
-/// One body's posterior: per unit its gate row (`m × k`), gate bias, up row, up bias, and its
-/// output column (`k′ × m`); which units are in the explanation, and which input and output
-/// coordinates some call of the body reads or writes.
+/// One body's posterior: its law, per unit its gate row (`m × k`), gate bias, up row, up bias, and
+/// its output column (`k′ × m`); which units compute a function that is not identically zero
+/// ([`live`]), and which input and output coordinates some call of the body reads or writes.
 #[derive(Clone, Debug)]
 pub struct BodyValues {
+    pub law: Law,
     pub gate: Part,
     pub gate_bias: Option<Part>,
     pub up: Option<Part>,
@@ -495,60 +535,91 @@ pub struct BodyValues {
     pub outputs: Vec<bool>,
 }
 
+/// Whether unit `j` of `values` computes a function that is not identically zero on the used
+/// coordinates over the posterior's support, an entry of deviation zero being fixed at its mean
+/// (with `exact`, every entry is fixed: values without a posterior). The unit computes
+/// `φ(g·z + c) u` (gated: `φ(g·z + c) (b·z + e) u`), so it is identically zero exactly when its
+/// output column is fixed at zero, or its activation is (the gate row fixed at zero and the bias
+/// fixed at a value `c` with `φ(c) = 0`, `c = 0` without a bias), or, gated, its payload is (the up
+/// row and its bias fixed at zero).
+fn live(values: &BodyValues, j: usize, exact: bool) -> bool {
+    let fixed = |sd: f64| exact || sd == 0.0;
+    let zero_row = |p: &Part| (0..values.inputs.len()).filter(|q| values.inputs[*q]).all(|q| p.mean[[j, q]] == 0.0 && fixed(p.sd[[j, q]]));
+    let out_zero = (0..values.outputs.len()).filter(|q| values.outputs[*q]).all(|q| values.out.mean[[q, j]] == 0.0 && fixed(values.out.sd[[q, j]]));
+    // A bias's value where it is fixed (`0` without one), none where it varies.
+    let constant = |bias: &Option<Part>| match bias {
+        None => Some(0.0),
+        Some(b) => fixed(b.sd[[j, 0]]).then_some(b.mean[[j, 0]]),
+    };
+    let activation_zero = zero_row(&values.gate) && constant(&values.gate_bias).is_some_and(|c| values.law.apply(c) == 0.0);
+    let payload_zero = values.up.as_ref().is_some_and(|up| zero_row(up) && constant(&values.up_bias) == Some(0.0));
+    !(out_zero || activation_zero || payload_zero)
+}
+
 /// `body`'s posterior (removed groups are zero with zero deviation).
 pub fn body_values(explanation: &Explanation, posterior: &Posterior, body: &str) -> Result<BodyValues, String> {
     let program = &explanation.artifact.program;
     let ops = BodyOperators::of(program, body)?;
+    let rule = rule_index(program, body)?;
+    let law = mlp_law(&program.rules[rule], ops.gate)?;
     let means = posterior.means();
     let position = |op: usize| explanation.trainable.iter().position(|t| *t == op).ok_or_else(|| format!("{body}: operator {op} is not trainable"));
+    let sd = |i: usize| posterior.log_sd[i].mapv(f64::exp);
     let take = |op: usize| -> Result<Part, String> {
         let i = position(op)?;
-        Ok(Part { mean: means[i].clone(), sd: posterior.log_sd[i].mapv(f64::exp) })
+        Ok(Part { mean: means[i].clone(), sd: sd(i) })
     };
     let (gate, out) = (take(ops.gate)?, take(ops.out)?);
     let (k, k_out) = (gate.mean.ncols(), out.mean.nrows());
-    let alive = |row: ndarray::ArrayView1<'_, f64>| row.iter().any(|v| *v != 0.0);
-    let units = (0..gate.mean.nrows()).map(|j| alive(gate.mean.row(j)) && alive(out.mean.column(j))).collect();
+    // A binding's row or column is used unless it is fixed at zero (a removed group).
+    let used = |m: ndarray::ArrayView1<'_, f64>, s: ndarray::ArrayView1<'_, f64>| m.iter().zip(s).any(|(m, s)| *m != 0.0 || *s != 0.0);
     let (mut inputs, mut outputs) = (vec![false; k], vec![false; k_out]);
-    for site in sites(program, rule_index(program, body)?)? {
-        let (read, write) = (&means[position(site.read)?], &means[position(site.write)?]);
-        inputs.iter_mut().enumerate().for_each(|(q, used)| *used |= alive(read.row(q)));
-        outputs.iter_mut().enumerate().for_each(|(q, used)| *used |= alive(write.column(q)));
+    for site in sites(program, rule)? {
+        let (r, w) = (position(site.read)?, position(site.write)?);
+        let (read_sd, write_sd) = (sd(r), sd(w));
+        inputs.iter_mut().enumerate().for_each(|(q, u)| *u |= used(means[r].row(q), read_sd.row(q)));
+        outputs.iter_mut().enumerate().for_each(|(q, u)| *u |= used(means[w].column(q), write_sd.column(q)));
     }
-    Ok(BodyValues {
-        gate,
+    let mut values = BodyValues {
+        law,
         gate_bias: ops.gate_bias.map(take).transpose()?,
         up: ops.up.map(take).transpose()?,
         up_bias: ops.up_bias.map(take).transpose()?,
+        gate,
         out,
-        units,
+        units: Vec::new(),
         inputs,
         outputs,
-    })
+    };
+    values.units = (0..values.gate.mean.nrows()).map(|j| live(&values, j, false)).collect();
+    Ok(values)
 }
 
 /// `body`'s values in `program` (its operators' values, unit deviations): what an alignment of
-/// fitted means needs where no posterior is at hand.
+/// fitted means needs where no posterior is at hand. Its values are exact, so a unit is live when
+/// its function at them is not identically zero.
 fn artifact_values(program: &OperatorProgram, body: &str) -> Result<BodyValues, String> {
     let ops = BodyOperators::of(program, body)?;
+    let law = mlp_law(&program.rules[rule_index(program, body)?], ops.gate)?;
     let part = |op: usize| {
         let mean = program.operators[op].matrix();
         Part { sd: Array2::ones(mean.dim()), mean }
     };
     let (gate, out) = (part(ops.gate), part(ops.out));
-    let alive = |row: ndarray::ArrayView1<'_, f64>| row.iter().any(|v| *v != 0.0);
-    let units = (0..gate.mean.nrows()).map(|j| alive(gate.mean.row(j)) && alive(out.mean.column(j))).collect();
     let (inputs, outputs) = (vec![true; gate.mean.ncols()], vec![true; out.mean.nrows()]);
-    Ok(BodyValues { gate_bias: ops.gate_bias.map(part), up: ops.up.map(part), up_bias: ops.up_bias.map(part), gate, out, units, inputs, outputs })
+    let mut values = BodyValues { law, gate_bias: ops.gate_bias.map(part), up: ops.up.map(part), up_bias: ops.up_bias.map(part), gate, out, units: Vec::new(), inputs, outputs };
+    values.units = (0..values.gate.mean.nrows()).map(|j| live(&values, j, true)).collect();
+    Ok(values)
 }
 
 /// The gauge relating body `from` to body `onto` (module note): unit `i` of `from` is unit
 /// `units[i]` of `onto` (none when unmatched); `input` is `A` (`k_onto × k_from`) and `output` is
-/// `C` (`k′_from × k′_onto`), zero outside the coordinates the calls use; `misfit` is the squared
-/// misfit in units of both posteriors' deviations over `entries` compared values, of which the
-/// gauge's `gauge` entries were fitted: when the two bodies are one function the misfit's
-/// expectation is `entries − gauge`, and with `entries ≤ gauge` the alignment holds no evidence
-/// that they are ([`Alignment::evidence`]).
+/// `C` (`k′_from × k′_onto`), zero outside the coordinates the calls use. `misfit` sums, over the
+/// `entries` values compared (the matched units' and every unmatched unit's of either body), each
+/// squared difference over its marginal variance under both posteriors: a heuristic score of the
+/// match, with no established null distribution (the values are correlated, and the gauge and the
+/// matching are fitted to them). `gauge` counts the entries of `A` and `C` fitted, and `live` the
+/// units of `from` and of `onto` that compute a function ([`live`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Alignment {
     pub units: Vec<Option<usize>>,
@@ -557,19 +628,37 @@ pub struct Alignment {
     pub misfit: f64,
     pub entries: usize,
     pub gauge: usize,
+    #[serde(default)]
+    pub live: [usize; 2],
 }
 
 impl Alignment {
-    /// The misfit per value the gauge did not fit (the reduced χ², near 1 when the two bodies are
-    /// one function), or none when the gauge can fit every compared value.
+    /// Whether the compared values outnumber the gauge's fitted entries; otherwise the gauge can
+    /// fit every value, and the alignment does not constrain the two bodies to one function.
     #[must_use]
-    pub fn evidence(&self) -> Option<f64> {
-        (self.entries > self.gauge).then(|| self.misfit / (self.entries - self.gauge) as f64)
+    pub fn constrains(&self) -> bool {
+        self.entries > self.gauge
+    }
+
+    /// The nats of the matching of the units: how many, `k`, of `from`'s `m` live units are
+    /// matched (uniform over `0..=min(m, n)`), which `k` of each body's (`ln C(m, k) + ln C(n, k)`),
+    /// and their pairing (`ln k!`), with `n` the live units of `onto`. A full permutation of `m`
+    /// units costs `ln(m + 1) + ln m!`.
+    #[must_use]
+    pub fn matching_nats(&self) -> f64 {
+        let [m, n] = self.live;
+        let k = self.units.iter().filter(|u| u.is_some()).count();
+        if k > m.min(n) {
+            return f64::INFINITY;
+        }
+        let ln_factorial = |x: usize| statrs::function::gamma::ln_gamma(x as f64 + 1.0);
+        let ln_choose = |a: usize, b: usize| ln_factorial(a) - ln_factorial(b) - ln_factorial(a - b);
+        ((m.min(n) + 1) as f64).ln() + ln_choose(m, k) + ln_choose(n, k) + ln_factorial(k)
     }
 }
 
-/// One unit of a body restricted to the used coordinates: its gate row and bias, and its write
-/// (the output column, or for a gated law `M = u bᵀ` with `N = e u`), each with its variances.
+/// One unit of a body restricted to the used coordinates: its gate row and bias, and its write,
+/// each value with its marginal variance.
 #[derive(Clone, Debug)]
 struct Unit {
     gate: (Array1<f64>, Array1<f64>),
@@ -577,10 +666,39 @@ struct Unit {
     write: Write,
 }
 
+/// A unit's write: its output column `u`, or for a gated law its factors, the output column `u`
+/// and the up row `b` with its bias `e`, whose rank-one map `M = u bᵀ` and offset `N = e u` the
+/// comparison reads ([`Write::map`]).
 #[derive(Clone, Debug)]
 enum Write {
     Plain((Array1<f64>, Array1<f64>)),
-    Gated { map: (Array2<f64>, Array2<f64>), offset: Option<(Array1<f64>, Array1<f64>)> },
+    Gated { out: (Array1<f64>, Array1<f64>), up: (Array1<f64>, Array1<f64>), bias: Option<(f64, f64)> },
+}
+
+/// The mean and the marginal variances of `x yᵀ` for independent random vectors `x` and `y` with
+/// means and marginal variances `(x̄, v_x)` and `(ȳ, v_y)`:
+/// `Var(x_r y_s) = x̄_r² v_y,s + v_x,r ȳ_s² + v_x,r v_y,s`. It reads only each factor's marginals,
+/// however its own entries are correlated, so it holds for the transformed factors `C u` and `b A`,
+/// where treating the entries of `C (u bᵀ) A` as independent does not (they share their factors).
+fn product(x: &(Array1<f64>, Array1<f64>), y: &(Array1<f64>, Array1<f64>)) -> (Array2<f64>, Array2<f64>) {
+    let squared = |a: &Array1<f64>| a.mapv(|v| v * v);
+    (outer(&x.0, &y.0), outer(&squared(&x.0), &y.1) + outer(&x.1, &squared(&y.0)) + outer(&x.1, &y.1))
+}
+
+/// A gated write's map and offset.
+type Map = ((Array2<f64>, Array2<f64>), Option<(Array1<f64>, Array1<f64>)>);
+
+impl Write {
+    /// A gated write's map `M = u bᵀ` and offset `N = e u` (none without an up bias), each with its
+    /// marginal variances ([`product`]); none for an ungated write.
+    fn map(&self) -> Option<Map> {
+        let Self::Gated { out, up, bias } = self else { return None };
+        let offset = bias.map(|(e, ve)| {
+            let (n, v) = product(out, &(Array1::from_elem(1, e), Array1::from_elem(1, ve)));
+            (n.column(0).to_owned(), v.column(0).to_owned())
+        });
+        Some((product(out, up), offset))
+    }
 }
 
 /// The live units of `values` on the used coordinates, with their indices in the body.
@@ -592,22 +710,13 @@ fn live_units(values: &BodyValues) -> Vec<(usize, Unit)> {
         .filter(|j| values.units[*j])
         .map(|j| {
             let row = |p: &Part| (p.mean.row(j).select(Axis(0), &ins), squared(&p.sd.row(j).select(Axis(0), &ins)));
+            let scalar = |p: &Part| (p.mean[[j, 0]], p.sd[[j, 0]].powi(2));
             let u = (values.out.mean.column(j).select(Axis(0), &outs), squared(&values.out.sd.column(j).select(Axis(0), &outs)));
             let write = match &values.up {
-                // `Var(u b) = u² σ_b² + b² σ_u² + σ_u² σ_b²` for independent factors.
-                Some(up) => {
-                    let (b, vb) = row(up);
-                    let map = (outer(&u.0, &b), outer(&u.0.mapv(|v| v * v), &vb) + outer(&u.1, &b.mapv(|v| v * v)) + outer(&u.1, &vb));
-                    let offset = values.up_bias.as_ref().map(|e| {
-                        let (e, ve) = (e.mean[[j, 0]], e.sd[[j, 0]].powi(2));
-                        (&u.0 * e, u.0.mapv(|v| v * v) * ve + &u.1 * (e * e) + &u.1 * ve)
-                    });
-                    Write::Gated { map, offset }
-                }
+                Some(up) => Write::Gated { out: u, up: row(up), bias: values.up_bias.as_ref().map(scalar) },
                 None => Write::Plain(u),
             };
-            let bias = values.gate_bias.as_ref().map(|c| (c.mean[[j, 0]], c.sd[[j, 0]].powi(2)));
-            (j, Unit { gate: row(&values.gate), bias, write })
+            (j, Unit { gate: row(&values.gate), bias: values.gate_bias.as_ref().map(scalar), write })
         })
         .collect()
 }
@@ -616,23 +725,29 @@ fn outer(a: &Array1<f64>, b: &Array1<f64>) -> Array2<f64> {
     Array2::from_shape_fn((a.len(), b.len()), |(i, j)| a[i] * b[j])
 }
 
-/// `onto`'s unit in `from`'s coordinates under the gauge: its values and their variances carried
-/// through `A` and `C` (independent entries).
+/// `onto`'s unit in `from`'s coordinates under the gauge: its values carried through `A` and `C`
+/// with their marginal variances (a row `g A` and a column `C u` of independent entries have the
+/// variances `v_g A²` and `C² v_u`; a gated map's follow from its transformed factors,
+/// [`product`]).
 fn transformed(unit: &Unit, a: &Array2<f64>, c: &Array2<f64>) -> Unit {
     let (a2, c2) = (a.mapv(|v| v * v), c.mapv(|v| v * v));
+    let column = |(u, v): &(Array1<f64>, Array1<f64>)| (c.dot(u), c2.dot(v));
+    let row = |(g, v): &(Array1<f64>, Array1<f64>)| (g.dot(a), v.dot(&a2));
     let write = match &unit.write {
-        Write::Plain((u, v)) => Write::Plain((c.dot(u), c2.dot(v))),
-        Write::Gated { map: (m, v), offset } => Write::Gated {
-            map: (c.dot(m).dot(a), c2.dot(v).dot(&a2)),
-            offset: offset.as_ref().map(|(n, v)| (c.dot(n), c2.dot(v))),
-        },
+        Write::Plain(u) => Write::Plain(column(u)),
+        Write::Gated { out, up, bias } => Write::Gated { out: column(out), up: row(up), bias: *bias },
     };
-    Unit { gate: (unit.gate.0.dot(a), unit.gate.1.dot(&a2)), bias: unit.bias, write }
+    Unit { gate: row(&unit.gate), bias: unit.bias, write }
 }
 
-/// `Σ (x − y)² / v` over paired values with variances `v`.
+/// `Σ (x − y)² / v` over paired values with variances `v`; a value of variance zero is exact, so
+/// any difference there is infinite.
 fn chi2(x: ndarray::ArrayView1<'_, f64>, y: ndarray::ArrayView1<'_, f64>, v: ndarray::ArrayView1<'_, f64>) -> f64 {
     x.iter().zip(y).zip(v).map(|((a, b), v)| if *v > 0.0 { (a - b).powi(2) / v } else if a == b { 0.0 } else { f64::INFINITY }).sum()
+}
+
+fn flat(m: &Array2<f64>) -> Array1<f64> {
+    Array1::from_iter(m.iter().copied())
 }
 
 /// The misfit of `from`'s unit against `onto`'s transformed unit `t`: in units of `from`'s
@@ -646,13 +761,12 @@ fn unit_misfit(from: &Unit, t: &Unit, both: bool) -> (f64, usize) {
         total += chi2(ndarray::aview1(&[a]), ndarray::aview1(&[b]), ndarray::aview1(&[var]));
         entries += 1;
     }
-    match (&from.write, &t.write) {
-        (Write::Plain(x), Write::Plain(y)) => {
+    match (&from.write, &t.write, from.write.map(), t.write.map()) {
+        (Write::Plain(x), Write::Plain(y), ..) => {
             total += chi2(x.0.view(), y.0.view(), v(&x.1, &y.1).view());
             entries += x.0.len();
         }
-        (Write::Gated { map: x, offset: xo }, Write::Gated { map: y, offset: yo }) => {
-            let flat = |m: &Array2<f64>| Array1::from_iter(m.iter().copied());
+        (.., Some((x, xo)), Some((y, yo))) => {
             total += chi2(flat(&x.0).view(), flat(&y.0).view(), v(&flat(&x.1), &flat(&y.1)).view());
             entries += x.0.len();
             if let (Some(x), Some(y)) = (xo, yo) {
@@ -660,7 +774,7 @@ fn unit_misfit(from: &Unit, t: &Unit, both: bool) -> (f64, usize) {
                 entries += x.0.len();
             }
         }
-        (Write::Plain(_), Write::Gated { .. }) | (Write::Gated { .. }, Write::Plain(_)) => return (f64::INFINITY, entries),
+        _ => return (f64::INFINITY, entries),
     }
     (total, entries)
 }
@@ -672,12 +786,12 @@ fn alone(unit: &Unit) -> f64 {
     if let Some((a, va)) = unit.bias {
         total += chi2(ndarray::aview1(&[a]), ndarray::aview1(&[0.0]), ndarray::aview1(&[va]));
     }
-    total += match &unit.write {
-        Write::Plain((u, v)) => chi2(u.view(), zero(u.len()).view(), v.view()),
-        Write::Gated { map: (m, v), offset } => {
-            let flat = |m: &Array2<f64>| Array1::from_iter(m.iter().copied());
-            chi2(flat(m).view(), zero(m.len()).view(), flat(v).view()) + offset.as_ref().map_or(0.0, |(n, v)| chi2(n.view(), zero(n.len()).view(), v.view()))
+    total += match (&unit.write, unit.write.map()) {
+        (Write::Plain((u, v)), _) => chi2(u.view(), zero(u.len()).view(), v.view()),
+        (_, Some(((m, v), offset))) => {
+            chi2(flat(&m).view(), zero(m.len()).view(), flat(&v).view()) + offset.as_ref().map_or(0.0, |(n, v)| chi2(n.view(), zero(n.len()).view(), v.view()))
         }
+        (Write::Gated { .. }, None) => 0.0,
     };
     total
 }
@@ -695,25 +809,59 @@ fn assignment_costs(from: &[(usize, Unit)], onto: &[(usize, Unit)], a: &Array2<f
     })
 }
 
-/// Weighted least squares per target column: `x` minimizing `Σ_i w_ic (y_ic − (D x)_ic)²` for
-/// each column `c`, `D` the design (`rows × p`), `y` and `w` (`rows × q`); `x` is `p × q`. The
-/// directions the weighted design does not resolve get zero.
+/// Weighted least squares per target column: `x` minimizing `Σ_i w_ic (y_ic − (D x)_ic)²` for each
+/// column `c`, `D` the design (`rows × p`), `y` and `w` (`rows × q`); `x` is `p × q`. A row of
+/// infinite weight (a value of variance zero) is an equality constraint `(D x)_ic = y_ic`: `x` is
+/// the constraints' minimum-norm solution plus the weighted least-squares solution over the
+/// directions they leave free, and constraints that conflict (a residual beyond the rounding of
+/// `D x` and the decomposition's band) are an error. The directions the weighted design does not
+/// resolve get zero.
 fn weighted_columns(design: &Array2<f64>, y: &Array2<f64>, w: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let mut x = Array2::zeros((design.ncols(), y.ncols()));
+    let p = design.ncols();
+    let mut x = Array2::zeros((p, y.ncols()));
+    // `γ_{p+1}`: the forward rounding bound of a `p`-term product and its difference.
+    let units = (p + 1) as f64 * f64::EPSILON;
+    let gamma = units / (1.0 - units);
     for c in 0..y.ncols() {
-        let root: Array1<f64> = w.column(c).mapv(f64::sqrt);
-        let scaled = design * &root.view().insert_axis(Axis(1));
-        let target = &y.column(c) * &root;
-        if let Some((left, values, right)) = resolved(&scaled)? {
-            x.column_mut(c).assign(&right.t().dot(&(left.t().dot(&target) / &values)));
+        let (exact, noisy): (Vec<usize>, Vec<usize>) = (0..design.nrows()).partition(|r| w[[*r, c]].is_infinite());
+        // The constraints' minimum-norm solution and the projector onto the directions they leave free.
+        let (mut base, mut free) = (Array1::zeros(p), Array2::eye(p));
+        if !exact.is_empty() {
+            let (de, ye) = (design.select(Axis(0), &exact), y.column(c).select(Axis(0), &exact));
+            let decomposition = svd(de.view(), false).map_err(error)?;
+            let rank = decomposition.singular_values.iter().filter(|s| **s > decomposition.band).count();
+            if rank > 0 {
+                let (left, values, right) = (decomposition.u.slice(s![.., ..rank]), decomposition.singular_values.slice(s![..rank]), decomposition.vt.slice(s![..rank, ..]));
+                base = right.t().dot(&(&left.t().dot(&ye) / &values));
+                free = free - right.t().dot(&right);
+            }
+            let scale = base.dot(&base).sqrt();
+            for (r, row) in de.outer_iter().enumerate() {
+                let size: f64 = row.iter().zip(&base).map(|(d, b)| (d * b).abs()).sum::<f64>() + ye[r].abs();
+                if (row.dot(&base) - ye[r]).abs() > gamma * size + decomposition.band * scale {
+                    return Err("conflicting exact constraints".into());
+                }
+            }
         }
+        let mut column = base.clone();
+        if !noisy.is_empty() {
+            let root: Array1<f64> = Array1::from_iter(noisy.iter().map(|r| w[[*r, c]].sqrt()));
+            let dn = design.select(Axis(0), &noisy);
+            let scaled = dn.dot(&free) * &root.view().insert_axis(Axis(1));
+            let target = (&y.column(c).select(Axis(0), &noisy) - &dn.dot(&base)) * &root;
+            if let Some((left, values, right)) = resolved(&scaled)? {
+                column = column + free.dot(&right.t().dot(&(left.t().dot(&target) / &values)));
+            }
+        }
+        x.column_mut(c).assign(&column);
     }
     Ok(x)
 }
 
-/// Precisions `1/v` (zero where the variance is not positive: a removed entry is not data).
+/// Precisions `1/v`, infinite where the variance is zero: a value known exactly is an equality
+/// constraint ([`weighted_columns`]).
 fn precisions(v: &Array1<f64>) -> Array1<f64> {
-    v.mapv(|v| if v > 0.0 { 1.0 / v } else { 0.0 })
+    v.mapv(|v| if v > 0.0 { 1.0 / v } else { f64::INFINITY })
 }
 
 /// `A` minimizing the misfit over the matched pairs `(from unit, onto unit)` with `C` fixed: the
@@ -724,8 +872,8 @@ fn input_gauge(pairs: &[(&Unit, &Unit)], c: &Array2<f64>, k_onto: usize, k_from:
         design.push(o.gate.0.clone());
         targets.push(f.gate.0.clone());
         weights.push(precisions(&f.gate.1));
-        if let (Write::Gated { map: (mf, vf), .. }, Write::Gated { map: (mo, _), .. }) = (&f.write, &o.write) {
-            let cm = c.dot(mo);
+        if let (Some(((mf, vf), _)), Some(((mo, _), _))) = (f.write.map(), o.write.map()) {
+            let cm = c.dot(&mo);
             for r in 0..mf.nrows() {
                 design.push(cm.row(r).to_owned());
                 targets.push(mf.row(r).to_owned());
@@ -747,13 +895,13 @@ fn output_gauge(pairs: &[(&Unit, &Unit)], a: &Array2<f64>, k_from: usize, k_onto
     // solution is `Cᵀ`.
     let (mut design, mut targets, mut weights) = (Vec::new(), Vec::new(), Vec::new());
     for (f, o) in pairs {
-        match (&f.write, &o.write) {
-            (Write::Plain((u, v)), Write::Plain((uo, _))) => {
+        match (&f.write, &o.write, f.write.map(), o.write.map()) {
+            (Write::Plain((u, v)), Write::Plain((uo, _)), ..) => {
                 design.push(uo.clone());
                 targets.push(u.clone());
                 weights.push(precisions(v));
             }
-            (Write::Gated { map: (mf, vf), offset: of }, Write::Gated { map: (mo, _), offset: oo }) => {
+            (.., Some(((mf, vf), of)), Some(((mo, _), oo))) => {
                 let ma = mo.dot(a);
                 for col in 0..mf.ncols() {
                     design.push(ma.column(col).to_owned());
@@ -761,12 +909,12 @@ fn output_gauge(pairs: &[(&Unit, &Unit)], a: &Array2<f64>, k_from: usize, k_onto
                     weights.push(precisions(&vf.column(col).to_owned()));
                 }
                 if let (Some((nf, vn)), Some((no, _))) = (of, oo) {
-                    design.push(no.clone());
-                    targets.push(nf.clone());
-                    weights.push(precisions(vn));
+                    design.push(no);
+                    targets.push(nf);
+                    weights.push(precisions(&vn));
                 }
             }
-            (Write::Plain(_), Write::Gated { .. }) | (Write::Gated { .. }, Write::Plain(_)) => return Err("bodies of different laws".into()),
+            _ => return Err("bodies of different laws".into()),
         }
     }
     if design.is_empty() {
@@ -784,36 +932,47 @@ fn span_projection(m: &Array2<f64>) -> Result<Array2<f64>, String> {
     })
 }
 
-/// Per live unit a signature unchanged by the gauges and by permutations of the other units: the
-/// sorted magnitudes of its row of the projection onto the units' read span (gate rows) and onto
-/// their write span (output columns, or gated the rank-one maps).
-fn signatures(units: &[(usize, Unit)]) -> Result<Vec<Array1<f64>>, String> {
+/// A unit's signature: the sorted magnitudes of its row of the projection onto the units' read
+/// span (gate rows), and of its row of the projection onto their write span (output columns, or
+/// gated the rank-one maps), kept apart.
+type Signature = (Array1<f64>, Array1<f64>);
+
+/// Per live unit a signature unchanged by the gauges and by permutations of the other units.
+fn signatures(units: &[(usize, Unit)]) -> Result<Vec<Signature>, String> {
     let m = units.len();
     let reads = Array2::from_shape_fn((m, units.first().map_or(0, |u| u.1.gate.0.len())), |(i, j)| units[i].1.gate.0[j]);
-    let flat = |u: &Unit| -> Array1<f64> {
-        match &u.write {
-            Write::Plain((w, _)) => w.clone(),
-            Write::Gated { map: (w, _), .. } => Array1::from_iter(w.iter().copied()),
+    let written = |u: &Unit| -> Array1<f64> {
+        match (&u.write, u.write.map()) {
+            (Write::Plain((w, _)), _) => w.clone(),
+            (_, Some(((w, _), _))) => flat(&w),
+            (Write::Gated { .. }, None) => Array1::zeros(0),
         }
     };
-    let width = units.first().map_or(0, |u| flat(&u.1).len());
-    let writes = Array2::from_shape_fn((m, width), |(i, j)| flat(&units[i].1)[j]);
+    let writes: Vec<Array1<f64>> = units.iter().map(|(_, u)| written(u)).collect();
+    let width = writes.first().map_or(0, Array1::len);
+    let writes = Array2::from_shape_fn((m, width), |(i, j)| writes[i][j]);
     let (pr, pw) = (span_projection(&reads)?, span_projection(&writes)?);
-    Ok((0..m)
-        .map(|i| {
-            let sorted = |p: &Array2<f64>| {
-                let mut row: Vec<f64> = p.row(i).iter().map(|v| v.abs()).collect();
-                row.sort_by(|a, b| b.total_cmp(a));
-                row
-            };
-            Array1::from_iter(sorted(&pr).into_iter().chain(sorted(&pw)))
-        })
-        .collect())
+    let sorted = |p: &Array2<f64>, i: usize| {
+        let mut row: Vec<f64> = p.row(i).iter().map(|v| v.abs()).collect();
+        row.sort_by(|a, b| b.total_cmp(a));
+        Array1::from_vec(row)
+    };
+    Ok((0..m).map(|i| (sorted(&pr, i), sorted(&pw, i))).collect())
+}
+
+/// The squared distance of two signatures: per segment (reads with reads, writes with writes), over
+/// the largest magnitudes both have.
+fn signature_distance(a: &Signature, b: &Signature) -> f64 {
+    let segment = |x: &Array1<f64>, y: &Array1<f64>| {
+        let common = x.len().min(y.len());
+        (x.slice(s![..common]).to_owned() - y.slice(s![..common])).mapv(|v| v * v).sum()
+    };
+    segment(&a.0, &b.0) + segment(&a.1, &b.1)
 }
 
 /// The alignment of body `from` to body `onto` (module note).
 pub fn align(from: &BodyValues, onto: &BodyValues) -> Result<Alignment, String> {
-    if from.up.is_some() != onto.up.is_some() || from.gate_bias.is_some() != onto.gate_bias.is_some() || from.up_bias.is_some() != onto.up_bias.is_some() {
+    if from.law != onto.law || from.up.is_some() != onto.up.is_some() || from.gate_bias.is_some() != onto.gate_bias.is_some() || from.up_bias.is_some() != onto.up_bias.is_some() {
         return Err("bodies of different laws".into());
     }
     let (f_units, o_units) = (live_units(from), live_units(onto));
@@ -823,11 +982,7 @@ pub fn align(from: &BodyValues, onto: &BodyValues) -> Result<Alignment, String> 
     // The start: the assignment of the signatures, padded with unmatched units at zero cost.
     let (sf, so) = (signatures(&f_units)?, signatures(&o_units)?);
     let start = Array2::from_shape_fn((n, n), |(i, j)| match (sf.get(i), so.get(j)) {
-        (Some(a), Some(b)) if a.len() == b.len() => (a - b).mapv(|v| v * v).sum(),
-        (Some(a), Some(b)) => {
-            let common = a.len().min(b.len());
-            (a.slice(s![..common]).to_owned() - b.slice(s![..common])).mapv(|v| v * v).sum()
-        }
+        (Some(a), Some(b)) => signature_distance(a, b),
         _ => 0.0,
     });
     let mut assignment = hungarian(&start)?;
@@ -845,10 +1000,17 @@ pub fn align(from: &BodyValues, onto: &BodyValues) -> Result<Alignment, String> 
             })
             .sum()
     };
+    // The misfit's rounding: `γ_n` over its compared values, each term three roundings (a
+    // difference, its square and the quotient).
+    let compared: usize = f_units.iter().chain(&o_units).map(|(_, u)| unit_misfit(u, u, false).1).sum();
+    let units_off = (compared + 3) as f64 * f64::EPSILON;
+    let gamma = units_off / (1.0 - units_off);
+    let lowers = |next: f64, current: f64| next < current - gamma * current.abs();
     // The output gauge starts as the identity on the common coordinates, so the first input gauge
     // sees the gated maps at a start. Each step minimizes the misfit over its own block (the input
-    // gauge, the output gauge, the assignment) and is taken only when it lowers the misfit, so the
-    // misfit decreases strictly and the alternation ends.
+    // gauge, the output gauge, the assignment) and is taken only when it lowers the misfit by more
+    // than the misfit's rounding; the alternation stops at the first step that does not: a local
+    // optimum of the alternation, not necessarily the global one.
     let mut c = Array2::eye(kout_from.max(kout_onto)).slice(s![..kout_from, ..kout_onto]).to_owned();
     let mut a = input_gauge(&pairs_of(&assignment), &c, k_onto, k_from)?;
     let mut current = total(&assignment, &a, &c);
@@ -857,21 +1019,24 @@ pub fn align(from: &BodyValues, onto: &BodyValues) -> Result<Alignment, String> 
             let c_next = output_gauge(&pairs_of(&assignment), &a, kout_from, kout_onto)?;
             let a_next = input_gauge(&pairs_of(&assignment), &c_next, k_onto, k_from)?;
             let next = total(&assignment, &a_next, &c_next);
-            if !(next < current) {
+            if !lowers(next, current) {
                 break;
             }
             (a, c, current) = (a_next, c_next, next);
         }
         let next = hungarian(&assignment_costs(&f_units, &o_units, &a, &c))?;
         let value = total(&next, &a, &c);
-        if !(value < current) {
+        if !lowers(value, current) {
             break;
         }
         (assignment, current) = (next, value);
     }
-    // The misfit in units of both posteriors' deviations, and the full-size gauges.
+    // The misfit in units of both posteriors' variances: the matched pairs, then every unit left
+    // unmatched. The assignment is a padded permutation, so a unit of `onto` assigned to a padding
+    // row is unmatched.
     let (mut misfit, mut entries) = (0.0, 0);
     let mut units = vec![None; from.units.len()];
+    let mut matched = vec![false; o_units.len()];
     for (i, (fi, f)) in f_units.iter().enumerate() {
         match o_units.get(assignment[i]) {
             Some((oj, o)) => {
@@ -879,6 +1044,7 @@ pub fn align(from: &BodyValues, onto: &BodyValues) -> Result<Alignment, String> 
                 misfit += m;
                 entries += e;
                 units[*fi] = Some(*oj);
+                matched[assignment[i]] = true;
             }
             None => {
                 misfit += alone(f);
@@ -886,9 +1052,9 @@ pub fn align(from: &BodyValues, onto: &BodyValues) -> Result<Alignment, String> 
             }
         }
     }
-    for j in (0..n).filter(|j| *j < o_units.len() && !assignment.contains(j)).collect::<Vec<_>>() {
-        misfit += alone(&o_units[j].1);
-        entries += unit_misfit(&o_units[j].1, &o_units[j].1, false).1;
+    for (_, o) in o_units.iter().zip(&matched).filter(|(_, m)| !**m).map(|(o, _)| o) {
+        misfit += alone(o);
+        entries += unit_misfit(o, o, false).1;
     }
     let embed = |small: &Array2<f64>, rows: &[bool], cols: &[bool]| {
         let (r, c): (Vec<usize>, Vec<usize>) = ((0..rows.len()).filter(|i| rows[*i]).collect(), (0..cols.len()).filter(|j| cols[*j]).collect());
@@ -901,7 +1067,15 @@ pub fn align(from: &BodyValues, onto: &BodyValues) -> Result<Alignment, String> 
         full
     };
     let gauge = k_onto * k_from + kout_from * kout_onto;
-    Ok(Alignment { units, input: embed(&a, &onto.inputs, &from.inputs), output: embed(&c, &from.outputs, &onto.outputs), misfit, entries, gauge })
+    Ok(Alignment {
+        units,
+        input: embed(&a, &onto.inputs, &from.inputs),
+        output: embed(&c, &from.outputs, &onto.outputs),
+        misfit,
+        entries,
+        gauge,
+        live: [f_units.len(), o_units.len()],
+    })
 }
 
 /// A minimum-cost perfect assignment of the rows of the square `cost` to its columns (Kuhn's
@@ -1126,9 +1300,22 @@ pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, 
 
 // -------------------------------------------------------------------------------------- regions
 
+/// `a` over the posterior deviations `exp(log_sd)` in the separable form that keeps its rank:
+/// `log σ_ij ≈ r_i + c_j` fitted by least squares (`r_i` the row means of `log σ`, `c_j` the
+/// column means of what is left; exact where the deviations are a row scale times a column scale),
+/// and `diag(e^{−r}) a diag(e^{−c})`; with the column scales `c`. Dividing each entry by its own
+/// deviation would not keep the rank (`100 [[1,1],[1,1]]` over `[[1,1],[1,2]]` has two singular
+/// values far from zero).
+fn separable(a: &Array2<f64>, log_sd: &Array2<f64>) -> (Array2<f64>, Array1<f64>) {
+    let rows = log_sd.mean_axis(Axis(1)).unwrap_or_else(|| Array1::zeros(a.nrows()));
+    let columns = (log_sd - &rows.view().insert_axis(Axis(1))).mean_axis(Axis(0)).unwrap_or_else(|| Array1::zeros(a.ncols()));
+    let whitened = Array2::from_shape_fn(a.dim(), |(i, j)| a[[i, j]] * (-rows[i] - columns[j]).exp());
+    (whitened, columns)
+}
+
 /// The parameters a rewrite of the functions with posterior-whitened reads `reads` (their gate rows,
-/// and up rows when gated, each entry over its posterior deviation; `parts` rows per function) and
-/// whitened writes `writes` (their output columns, one row each) saves: `|S| (parts d + d′)` native
+/// and up rows when gated, in the separable whitening of [`separable`]; `parts` rows per function)
+/// and whitened writes `writes` (their output columns, one row each) saves: `|S| (parts d + d′)` native
 /// entries against the body's `k (d + parts |S|) + k′ (d′ + |S|)`, with `k` and `k′` the numbers of
 /// whitened singular values above the largest singular value of a matrix of the same shape of
 /// independent unit-variance noise, `√rows + √cols` (Bai and Yin 1988): the directions the
@@ -1159,30 +1346,34 @@ pub fn regions(explanation: &Explanation, posterior: &Posterior, layer: usize, p
     let means = posterior.means();
     let at = |op: usize| explanation.trainable.iter().position(|t| *t == op).ok_or_else(|| format!("{mlp}: operator {op} is not trainable"));
     let known = &explanation.layers.get(layer).ok_or_else(|| format!("no layer {layer}"))?.functions;
-    let whitened = |i: usize, op: usize, row: bool| -> Result<Array1<f64>, String> {
+    // A function's row (or column) of an operator's means and of its log deviations.
+    let entries = |i: usize, op: usize, row: bool| -> Result<(Array1<f64>, Array1<f64>), String> {
         let p = at(op)?;
-        let (mean, sd) = (&means[p], posterior.log_sd[p].mapv(f64::exp));
-        Ok(if row { &mean.row(i) / &sd.row(i) } else { &mean.column(i) / &sd.column(i) })
+        let (mean, log_sd) = (&means[p], &posterior.log_sd[p]);
+        Ok(if row { (mean.row(i).to_owned(), log_sd.row(i).to_owned()) } else { (mean.column(i).to_owned(), log_sd.column(i).to_owned()) })
     };
-    // Each function of the pool in the explanation: its whitened read rows and write column.
+    // Each function of the pool in the explanation: its read rows and its write column.
     let mut functions = Vec::new();
     for &i in pool {
         let groups = known.get(i).ok_or_else(|| format!("layer {layer} has no function {i}"))?;
         if groups.iter().all(|g| posterior.active[*g]) {
-            let reads = maps.iter().map(|op| whitened(i, *op, true)).collect::<Result<Vec<_>, _>>()?;
-            functions.push((i, reads, whitened(i, out, false)?));
+            let reads = maps.iter().map(|op| entries(i, *op, true)).collect::<Result<Vec<_>, _>>()?;
+            functions.push((i, reads, entries(i, out, false)?));
         }
     }
     let parts = maps.len();
-    let stack = |members: &[usize]| -> (Array2<f64>, Array2<f64>) {
-        let d = functions[members[0]].1[0].len();
-        let reads = Array2::from_shape_fn((members.len() * parts, d), |(r, c)| functions[members[r / parts]].1[r % parts][c]);
-        let writes = Array2::from_shape_fn((members.len(), functions[members[0]].2.len()), |(r, c)| functions[members[r]].2[c]);
-        (reads, writes)
+    // A group's reads and writes, means and log deviations, stacked.
+    type Block = (Array2<f64>, Array2<f64>);
+    let stack = |members: &[usize]| -> (Block, Block) {
+        let d = functions[members[0]].1[0].0.len();
+        let read = |k: usize| Array2::from_shape_fn((members.len() * parts, d), |(r, c)| if k == 0 { functions[members[r / parts]].1[r % parts].0[c] } else { functions[members[r / parts]].1[r % parts].1[c] });
+        let d_out = functions[members[0]].2.0.len();
+        let write = |k: usize| Array2::from_shape_fn((members.len(), d_out), |(r, c)| if k == 0 { functions[members[r]].2.0[c] } else { functions[members[r]].2.1[c] });
+        ((read(0), read(1)), (write(0), write(1)))
     };
     let value = |members: &[usize]| -> Result<f64, String> {
-        let (reads, writes) = stack(members);
-        saving(&reads, &writes, parts)
+        let ((reads, read_sd), (writes, write_sd)) = stack(members);
+        saving(&separable(&reads, &read_sd).0, &separable(&writes, &write_sd).0, parts)
     };
     // A group's resolved read and write directions (right singular vectors above the noise edge).
     let resolved_basis = |m: &Array2<f64>| -> Result<Array2<f64>, String> {
@@ -1199,15 +1390,21 @@ pub fn regions(explanation: &Explanation, posterior: &Posterior, layer: usize, p
         let edge = (block.nrows() as f64).sqrt() + (complement as f64).sqrt();
         Ok(svd(residual.view(), false).map_err(error)?.singular_values.first().is_none_or(|s| *s <= edge))
     };
+    // A function's block whitened in a group's column scales `c`, with its own row scales.
+    let whitened_in = |(a, log_sd): &Block, columns: &Array1<f64>| -> Array2<f64> {
+        let rows = (log_sd - &columns.view().insert_axis(Axis(0))).mean_axis(Axis(1)).unwrap_or_else(|| Array1::zeros(a.nrows()));
+        Array2::from_shape_fn(a.dim(), |(i, j)| a[[i, j]] * (-rows[i] - columns[j]).exp())
+    };
     // The functions outside `members` whose reads and writes lie within the members' resolved
     // directions: those the group could take in without a new coordinate.
     let inliers = |members: &[usize]| -> Result<usize, String> {
-        let (reads, writes) = stack(members);
+        let ((reads, read_sd), (writes, write_sd)) = stack(members);
+        let ((reads, read_columns), (writes, write_columns)) = (separable(&reads, &read_sd), separable(&writes, &write_sd));
         let (read_basis, write_basis) = (resolved_basis(&reads)?, resolved_basis(&writes)?);
         let mut count = 0;
         for f in (0..functions.len()).filter(|f| !members.contains(f)) {
             let (r, w) = stack(&[f]);
-            if within(&r, &read_basis)? && within(&w, &write_basis)? {
+            if within(&whitened_in(&r, &read_columns), &read_basis)? && within(&whitened_in(&w, &write_columns), &write_basis)? {
                 count += 1;
             }
         }
