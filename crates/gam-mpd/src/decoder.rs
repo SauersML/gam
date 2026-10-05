@@ -268,6 +268,36 @@ impl Decoder {
         })
     }
 
+    /// The floating-point operations of every block's products on `rows` rows of sequences of
+    /// `length` (forward, reverse): each product `2 m n k`; attention's scores and values over the
+    /// causal half; the reverse twice the forward's products (the input's cotangent and the
+    /// weights'), its attention weights recomputed.
+    #[must_use]
+    pub fn product_flops(&self, rows: usize, length: usize) -> (f64, f64) {
+        let (rows, length, d) = (rows as f64, length as f64, self.width as f64);
+        let (mut forward, mut reverse) = (0.0, 0.0);
+        for block in &self.blocks {
+            match block {
+                Block::Attention(a) => {
+                    let (heads, w) = (a.layout.queries as f64, a.layout.width as f64);
+                    let products = 2.0 * rows * d * (a.projections.rows as f64 + heads * w);
+                    // Scores and values: two products of rows × (length / 2) × w per query head.
+                    let attention = 2.0 * 2.0 * rows * (length / 2.0) * w * heads;
+                    forward += products + attention;
+                    // The weights recomputed, then four products (weights', values', queries', keys').
+                    reverse += 2.0 * products + attention + 2.0 * attention;
+                }
+                Block::Mlp(m) => {
+                    let inputs = m.input.rows as f64;
+                    let products = 2.0 * rows * d * (inputs + if m.gated { inputs / 2.0 } else { inputs });
+                    forward += products;
+                    reverse += 2.0 * products;
+                }
+            }
+        }
+        (forward, reverse)
+    }
+
     /// The products' precision outside the blocks (the head's sweep of the vocabulary, the patches).
     #[must_use]
     pub fn with_arithmetic(mut self, arithmetic: Arithmetic) -> Self {
@@ -302,10 +332,7 @@ impl Decoder {
     /// The rows `ranges` (each a sequence from position 0) of `t`, stacked in order.
     fn gather(&self, t: &Tensor, ranges: &[Range<usize>]) -> Result<Tensor, String> {
         let d = &self.device;
-        if let [only] = ranges
-            && only.start == 0
-            && only.end == t.rows()
-        {
+        if covers(ranges, t.rows()) {
             return d.copy(t).map_err(error);
         }
         let mut out = d.zeros(ranges.iter().map(ExactSizeIterator::len).sum(), t.cols()).map_err(error)?;
@@ -317,11 +344,15 @@ impl Decoder {
         Ok(out)
     }
 
-    fn scatter(&self, t: &mut Tensor, ranges: &[Range<usize>], values: &Tensor) -> Result<(), String> {
+    fn scatter(&self, t: &mut Tensor, ranges: &[Range<usize>], values: Tensor) -> Result<(), String> {
         let d = &self.device;
+        if covers(ranges, t.rows()) {
+            *t = values;
+            return Ok(());
+        }
         let mut at = 0;
         for r in ranges {
-            d.set_rows(t, r.start, &d.rows_of(values, at, r.len()).map_err(error)?).map_err(error)?;
+            d.set_rows(t, r.start, &d.rows_of(&values, at, r.len()).map_err(error)?).map_err(error)?;
             at += r.len();
         }
         Ok(())
@@ -369,6 +400,12 @@ impl Decoder {
         }
         Ok(())
     }
+}
+
+/// Whether `ranges` are consecutive and cover rows `0..rows` in order: the call's rows are the
+/// buffer's.
+fn covers(ranges: &[Range<usize>], rows: usize) -> bool {
+    ranges.first().is_some_and(|r| r.start == 0) && ranges.last().is_some_and(|r| r.end == rows) && ranges.windows(2).all(|w| w[0].end == w[1].start)
 }
 
 fn add(d: &Device, gradient: &mut BTreeMap<usize, Tensor>, op: usize, value: Tensor) -> Result<(), String> {
@@ -546,7 +583,7 @@ impl BlockEngine for Decoder {
         let mut out = d.copy(&x).map_err(error)?;
         let inner = match &self.blocks[block] {
             Block::Attention(a) => {
-                let mut p = d.zeros(x.rows(), a.projections.rows).map_err(error)?;
+                let mut p = d.empty(x.rows(), a.projections.rows).map_err(error)?;
                 d.gemm(&mut p, 1.0, &read16, Op::N, &w.input, Op::T, 0.0, Arithmetic::Bf16).map_err(error)?;
                 let angles = rotary.map(|r| self.angles(r, ranges)).transpose()?;
                 let rotation = angles.as_ref().zip(rotary).map(|((c, s), r)| (c, s, r.half_split));
@@ -558,7 +595,7 @@ impl BlockEngine for Decoder {
                 Inner::Attention { projections: p, head_scales, heads, angles, sequences: ranges.len() }
             }
             Block::Mlp(m) => {
-                let mut pre = d.zeros(x.rows(), m.input.rows).map_err(error)?;
+                let mut pre = d.empty(x.rows(), m.input.rows).map_err(error)?;
                 d.gemm(&mut pre, 1.0, &read16, Op::N, &w.input, Op::T, 0.0, Arithmetic::Bf16).map_err(error)?;
                 let active = if m.gated { d.swiglu(&pre) } else { d.gelu_tanh(&pre, w.bias.as_ref()) }.map_err(error)?;
                 d.gemm(&mut out, 1.0, &active, Op::N, &w.output, Op::T, 1.0, Arithmetic::Bf16).map_err(error)?;
@@ -573,7 +610,7 @@ impl BlockEngine for Decoder {
                 Inner::Mlp { pre, active, out: last }
             }
         };
-        self.scatter(stream, ranges, &out)?;
+        self.scatter(stream, ranges, out)?;
         Ok(keep.then_some(Tape { x, scale, read: read16, inner }))
     }
 
@@ -590,17 +627,18 @@ impl BlockEngine for Decoder {
         let w = &self.weights[block];
         let mut g = self.gather(cotangent, ranges)?;
         let rows = g.rows();
-        let mut g_read = d.zeros(rows, self.width).map_err(error)?;
+        let mut g_read = d.empty(rows, self.width).map_err(error)?;
         match (&self.blocks[block], tape.inner) {
             (Block::Attention(a), Inner::Attention { projections, head_scales, heads, angles, sequences }) => {
-                let mut g_attended = d.zeros(rows, a.layout.queries * a.layout.width).map_err(error)?;
+                let mut g_attended = d.empty(rows, a.layout.queries * a.layout.width).map_err(error)?;
                 d.gemm(&mut g_attended, 1.0, &g, Op::N, &w.output, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
                 let g_heads = d.causal_attention_backward(&heads, a.layout, sequences, a.scale, &g_attended).map_err(error)?;
                 let rotation = angles.as_ref().zip(a.rotary).map(|((c, s), r)| (c, s, r.half_split));
                 let norm = w.norms.as_ref().zip(head_scales.as_ref());
-                let g_p = d.heads_rope_backward(&projections, a.layout, norm, rotation, &g_heads).map_err(error)?;
+                // The cotangent feeds two products: rounded to bfloat16 once.
+                let g_p = d.bf16_copy(&d.heads_rope_backward(&projections, a.layout, norm, rotation, &g_heads).map_err(error)?).map_err(error)?;
                 if a.projections.parts.iter().any(|(op, _, _)| self.trainable.contains(op)) {
-                    let mut stacked = d.zeros(a.projections.rows, a.projections.cols).map_err(error)?;
+                    let mut stacked = d.empty(a.projections.rows, a.projections.cols).map_err(error)?;
                     d.gemm(&mut stacked, 1.0, &g_p, Op::T, &tape.read, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
                     self.add_parts(&a.projections, &stacked, gradient)?;
                 }
@@ -612,16 +650,17 @@ impl BlockEngine for Decoder {
                     d.rms_gain_backward((&residual, gain, &k), &g, &mut g_residual).map_err(error)?;
                     g = g_residual;
                 }
-                let mut g_active = d.zeros(rows, active.cols()).map_err(error)?;
-                d.gemm(&mut g_active, 1.0, &g, Op::N, &w.output, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
+                let g16 = d.bf16_copy(&g).map_err(error)?;
+                let mut g_active = d.empty(rows, active.cols()).map_err(error)?;
+                d.gemm(&mut g_active, 1.0, &g16, Op::N, &w.output, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
                 if self.trainable.contains(&m.output) {
-                    let mut g_output = d.zeros(self.width, active.cols()).map_err(error)?;
-                    d.gemm(&mut g_output, 1.0, &g, Op::T, &active, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
+                    let mut g_output = d.empty(self.width, active.cols()).map_err(error)?;
+                    d.gemm(&mut g_output, 1.0, &g16, Op::T, &active, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
                     add(d, gradient, m.output, g_output)?;
                 }
-                let g_pre = if m.gated { d.swiglu_backward(&pre, &g_active) } else { d.gelu_tanh_backward(&pre, w.bias.as_ref(), &g_active) }.map_err(error)?;
+                let g_pre = d.bf16_copy(&if m.gated { d.swiglu_backward(&pre, &g_active) } else { d.gelu_tanh_backward(&pre, w.bias.as_ref(), &g_active) }.map_err(error)?).map_err(error)?;
                 if m.input.parts.iter().any(|(op, _, _)| self.trainable.contains(op)) {
-                    let mut stacked = d.zeros(m.input.rows, m.input.cols).map_err(error)?;
+                    let mut stacked = d.empty(m.input.rows, m.input.cols).map_err(error)?;
                     d.gemm(&mut stacked, 1.0, &g_pre, Op::T, &tape.read, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
                     self.add_parts(&m.input, &stacked, gradient)?;
                 }
@@ -637,7 +676,7 @@ impl BlockEngine for Decoder {
         if block == 0 {
             g = d.zeros(rows, self.width).map_err(error)?;
         }
-        self.scatter(cotangent, ranges, &g)
+        self.scatter(cotangent, ranges, g)
     }
 }
 

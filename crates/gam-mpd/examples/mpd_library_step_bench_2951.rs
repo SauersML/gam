@@ -29,7 +29,7 @@ use gam_mpd::{
     device_program::DeviceProgram,
     engine::log_to_stderr,
     import::{hugging_face_language_model, import_language_model},
-    interchange::{self, Batch, FixedHead, Model, ReadVariable},
+    interchange::{self, Batch, BlockEngine, FixedHead, Model, ReadVariable},
     library_mdl,
     operator_program::{OperatorProgram, SlotValues},
     run_check::{layer_nodes, split_sites},
@@ -286,7 +286,38 @@ fn main() -> Result<(), String> {
             timed(&device, s, "posterior_step", || posterior.step(&gradient, scale, &ivon, step as u64))?;
         }
     }
+    // The decoder's blocks alone, forward with tapes then reverse, on the bases (no head, no
+    // patches): the engine's own time and product rate.
+    let blocks_seconds = match &decoders {
+        Some((_, p)) => {
+            let mut seconds: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
+            let length = context;
+            let ranges: Vec<std::ops::Range<usize>> = (0..sequences).map(|i| i * length..(i + 1) * length).collect();
+            let tokens: Vec<&[u32]> = rows[..sequences].iter().map(Vec::as_slice).collect();
+            let mut gradient = BTreeMap::new();
+            for _ in 0..=reps {
+                let s = &mut seconds;
+                let mut stream = device.zeros(sequences * length, p.width()).map_err(error)?;
+                let tapes = timed(&device, s, "blocks_forward", || {
+                    (0..p.blocks()).map(|b| p.forward(b, &mut stream, &ranges, &tokens, None, true)?.ok_or_else(|| "no tape".to_string())).collect::<Result<Vec<_>, String>>()
+                })?;
+                let mut cotangent = device.copy(&stream).map_err(error)?;
+                timed(&device, s, "blocks_reverse", || {
+                    for (b, tape) in tapes.into_iter().enumerate().rev() {
+                        p.reverse(b, tape, &mut cotangent, &ranges, None, &mut gradient)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            let (forward, reverse) = p.product_flops(sequences * length, length);
+            let medians = medians(&seconds);
+            let rate = |part: &str, flops: f64| medians[part].as_f64().map(|t| flops / t / 1e12);
+            Some(json!({"seconds": medians, "forward_tflops": rate("blocks_forward", forward), "reverse_tflops": rate("blocks_reverse", reverse), "forward_flops": forward, "reverse_flops": reverse}))
+        }
+        None => None,
+    };
     let report = json!({
+        "decoder_blocks": blocks_seconds,
         "model": model.display().to_string(),
         "explanation": kind,
         "products": format!("{products:?}"),

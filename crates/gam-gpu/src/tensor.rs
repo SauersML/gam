@@ -841,6 +841,16 @@ impl Device {
     }
 
 
+    /// A `rows × cols` tensor whose values are unset (CUDA f32: no zeroing pass), for an output an
+    /// operation then writes whole (a product with `β = 0`); zero elsewhere.
+    pub fn empty(&self, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if self.storage == Storage::F32 => engine.output(Storage::F32, rows, cols),
+            _ => self.zeros(rows, cols),
+        }
+    }
+
     pub fn zeros(&self, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
         let data = match &*self.backend {
             Backend::Host => Data::Host(vec![0.0; rows * cols]),
@@ -4275,6 +4285,19 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             // SAFETY: this handle's buffers are used on the engine's stream alone.
             unsafe { ctx.disable_event_tracking() };
             let stream = ctx.new_stream().gpu_ctx("tensor stream")?;
+            // The device's stream-ordered pool keeps what is freed for the next allocation instead of
+            // returning it at each synchronization (its default threshold, zero, made every
+            // allocation after a synchronization map memory again: 14 µs a call against about 1).
+            // The memory stays the process's, as it would between allocations anyway.
+            // SAFETY: the device's default pool, set once; the attribute takes a u64 in place.
+            unsafe {
+                let mut pool = std::ptr::null_mut();
+                cudarc::driver::sys::cuDeviceGetDefaultMemPool(&mut pool, ctx.cu_device()).result().gpu_ctx("tensor memory pool")?;
+                let mut threshold = u64::MAX;
+                cudarc::driver::sys::cuMemPoolSetAttribute(pool, cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, (&mut threshold) as *mut u64 as *mut _)
+                    .result()
+                    .gpu_ctx("tensor memory pool threshold")?;
+            }
             let blas = CudaBlas::new(stream.clone()).gpu_ctx("tensor cuBLAS handle")?;
             static MODULE: crate::device_cache::PtxModuleCache = crate::device_cache::PtxModuleCache::new();
             let module = Arc::clone(MODULE.get_or_compile(&ctx, "tensor", KERNELS)?);
@@ -4400,7 +4423,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         /// A `rows × cols` tensor in `storage` for a kernel that writes every entry: f32 left
         /// unset (no zeroing pass ahead of the kernel), float64 zeroed as it always was.
-        fn output(&self, storage: Storage, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
+        pub(super) fn output(&self, storage: Storage, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
             if storage != Storage::F32 {
                 return self.tensor(storage, rows, cols);
             }
@@ -4867,34 +4890,60 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             Ok(gp)
         }
 
-        /// The scores `scale Q Kᵀ` of every (query head, sequence) block of `y` (bfloat16, queries'
-        /// heads then keys' then values'), into `scores` (query head-major, then sequence).
-        fn attention_scores(&self, y: &CudaSlice<u16>, layout: super::HeadLayout, (blocks, length, columns): (usize, usize, usize), scale: f64, scores: &mut CudaSlice<f32>) -> Result<(), GpuError> {
-            let (w, group) = (layout.width, layout.queries / layout.keys);
-            for h in 0..layout.queries {
-                let g = h / group;
-                // Row-major S = Q Kᵀ is column-major Sᵀ = K Qᵀ: K transposed, then Q as it is.
-                let product = Gemm32 {
-                    ops: (cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N),
-                    dims: (length, length, w),
-                    scale: (scale as f32, 0.0),
-                    a: (Factor::Half(y), (layout.queries + g) * w, columns),
-                    b: (Factor::Half(y), h * w, columns),
-                    c: (&mut *scores, h * blocks * length * length, length),
-                    compute: cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                };
-                self.gemm_ex(product, blocks, (length * columns, length * columns, length * length))?;
+        /// One `cublasGemmBatchedEx` over `entries` products `C ← α op(A) op(B) + β C` (column-major,
+        /// as `gemm_ex`): per entry the element offsets of its A, B and C in their buffers, the
+        /// pointer arrays uploaded for the call. A and B bfloat16, C f32. Entries writing one C
+        /// region must not share a call.
+        fn gemm_pointers(
+            &self,
+            ops: (cublasOperation_t, cublasOperation_t),
+            (m, n, k): (usize, usize, usize),
+            (alpha, beta): (f32, f32),
+            [(a, lda), (b, ldb)]: [(&CudaSlice<u16>, usize); 2],
+            (c, ldc): (&mut CudaSlice<f32>, usize),
+            entries: &[(usize, usize, usize)],
+        ) -> Result<(), GpuError> {
+            if entries.is_empty() {
+                return Ok(());
             }
-            Ok(())
+            let serial = self.gemm_workspace.lock().map_err(|_| shape("poisoned GEMM workspace".to_string()))?;
+            let (pa, record_a) = a.device_ptr(&self.stream);
+            let (pb, record_b) = b.device_ptr(&self.stream);
+            let (pc, record_c) = c.device_ptr_mut(&self.stream);
+            let pointers = |base: u64, size: u64, pick: fn(&(usize, usize, usize)) -> usize| -> Vec<u64> { entries.iter().map(|e| base + size * pick(e) as u64).collect() };
+            let (arrays_a, arrays_b, arrays_c) = (
+                self.stream.clone_htod(&pointers(pa, 2, |e| e.0)).gpu_ctx("tensor pointer upload")?,
+                self.stream.clone_htod(&pointers(pb, 2, |e| e.1)).gpu_ctx("tensor pointer upload")?,
+                self.stream.clone_htod(&pointers(pc, 4, |e| e.2)).gpu_ctx("tensor pointer upload")?,
+            );
+            let ((qa, ra), (qb, rb), (qc, rc)) = (arrays_a.device_ptr(&self.stream), arrays_b.device_ptr(&self.stream), arrays_c.device_ptr(&self.stream));
+            let (m, n, k, lda, ldb, ldc, count) = (i32_of(m)?, i32_of(n)?, i32_of(k)?, i32_of(lda)?, i32_of(ldb)?, i32_of(ldc)?, i32_of(entries.len())?);
+            // SAFETY: every entry's offsets lie inside its buffer with the declared shapes (the
+            // caller's); the pointer arrays and buffers outlive the call (their records drop after it).
+            let status = unsafe {
+                cudarc::cublas::sys::cublasGemmBatchedEx(
+                    *self.blas.handle(), ops.0, ops.1, m, n, k,
+                    (&alpha) as *const f32 as *const _, qa as *const *const _, cudaDataType_t::CUDA_R_16BF, lda,
+                    qb as *const *const _, cudaDataType_t::CUDA_R_16BF, ldb,
+                    (&beta) as *const f32 as *const _, qc as *const *mut _, cudaDataType_t::CUDA_R_32F, ldc,
+                    count, cublasComputeType_t::CUBLAS_COMPUTE_32F, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                )
+            };
+            drop((ra, rb, rc, record_a, record_b, record_c, serial));
+            status.result().gpu_ctx("tensor batched GEMM")
         }
 
-        /// Every query head's causal softmax weights (bfloat16) from `y` (module note of
-        /// `decoder.cu`).
+        /// Every query head's causal softmax weights (bfloat16) from `y`: one batched product of
+        /// all (query head, sequence) scores, one softmax (`decoder.cu`).
         fn attention_weights(&self, y: &CudaSlice<u16>, layout: super::HeadLayout, (blocks, length, columns): (usize, usize, usize), scale: f64) -> Result<CudaSlice<u16>, GpuError> {
-            let count = layout.queries * blocks * length;
-            // SAFETY: every score is written by the products before the softmax reads it.
+            let (w, group, count) = (layout.width, layout.queries / layout.keys, layout.queries * blocks * length);
+            // SAFETY: every score is written by the product before the softmax reads it.
             let mut scores = unsafe { self.stream.alloc::<f32>((count * length).max(1)) }.gpu_ctx("tensor alloc")?;
-            self.attention_scores(y, layout, (blocks, length, columns), scale, &mut scores)?;
+            // Row-major S = Q Kᵀ is column-major Sᵀ = K Qᵀ: K transposed, then Q as it is.
+            let entries: Vec<(usize, usize, usize)> = (0..layout.queries)
+                .flat_map(|h| (0..blocks).map(move |b| (b * length * columns + (layout.queries + h / group) * w, b * length * columns + h * w, (h * blocks + b) * length * length)))
+                .collect();
+            self.gemm_pointers((cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N), (length, length, w), (scale as f32, 0.0), [(y, columns), (y, columns)], (&mut scores, length), &entries)?;
             // SAFETY: the softmax writes every weight and log partition.
             let mut weights = unsafe { self.stream.alloc::<u16>((count * length).max(1)) }.gpu_ctx("tensor alloc")?;
             let mut lse = unsafe { self.stream.alloc::<f32>(count.max(1)) }.gpu_ctx("tensor alloc")?;
@@ -4909,24 +4958,15 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         pub(super) fn causal_attention(&self, y: &Tensor, layout: super::HeadLayout, blocks: usize, scale: f64) -> Result<Tensor, GpuError> {
             let Data::CudaBf16(yh) = &y.data else { return Err(mismatch(&y.data)) };
             let (rows, columns, w, group) = (y.rows, y.cols, layout.width, layout.queries / layout.keys);
-            let length = rows / blocks;
+            let (length, reads) = (rows / blocks, layout.queries * w);
             let weights = self.attention_weights(yh, layout, (blocks, length, columns), scale)?;
-            let mut a = self.unset32(rows, layout.queries * w)?;
-            let reads = layout.queries * w;
-            for h in 0..layout.queries {
-                let g = h / group;
-                // Row-major O = P V is column-major Oᵀ = Vᵀ Pᵀ: both as they are.
-                let product = Gemm32 {
-                    ops: (cublasOperation_t::CUBLAS_OP_N, cublasOperation_t::CUBLAS_OP_N),
-                    dims: (w, length, length),
-                    scale: (1.0, 0.0),
-                    a: (Factor::Half(yh), (layout.queries + layout.keys + g) * w, columns),
-                    b: (Factor::Half(&weights), h * blocks * length * length, length),
-                    c: (slice32_mut(&mut a)?, h * w, reads),
-                    compute: cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                };
-                self.gemm_ex(product, blocks, (length * columns, length * length, length * reads))?;
-            }
+            let mut a = self.unset32(rows, reads)?;
+            // Row-major O = P V is column-major Oᵀ = Vᵀ Pᵀ: both as they are.
+            let entries: Vec<(usize, usize, usize)> = (0..layout.queries)
+                .flat_map(|h| (0..blocks).map(move |b| (b * length * columns + (layout.queries + layout.keys + h / group) * w, (h * blocks + b) * length * length, b * length * reads + h * w)))
+                .collect();
+            let Data::Cuda32(out) = &mut a.data else { return Err(mismatch(&a.data)) };
+            self.gemm_pointers((cublasOperation_t::CUBLAS_OP_N, cublasOperation_t::CUBLAS_OP_N), (w, length, length), (1.0, 0.0), [(yh, columns), (&weights, length)], (out, reads), &entries)?;
             Ok(a)
         }
 
@@ -4937,23 +4977,19 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let weights = self.attention_weights(yh, layout, (blocks, length, columns), scale)?;
             let gah = self.round_half(slice32(ga)?, 0, ga.len())?;
             let count = layout.queries * blocks * length;
-            // SAFETY: the products write every weight cotangent before the softmax's reverse reads it.
+            let block = move |h: usize, b: usize| (h * blocks + b) * length * length;
+            let at = move |b: usize, column: usize| b * length * columns + column;
+            let q0 = move |h: usize| h * w;
+            let k0 = move |h: usize| (layout.queries + h / group) * w;
+            let v0 = move |h: usize| (layout.queries + layout.keys + h / group) * w;
+            let every = |f: &dyn Fn(usize, usize) -> (usize, usize, usize), heads: &mut dyn Iterator<Item = usize>| -> Vec<(usize, usize, usize)> {
+                heads.flat_map(|h| (0..blocks).map(move |b| (h, b)).collect::<Vec<_>>()).map(|(h, b)| f(h, b)).collect()
+            };
+            // SAFETY: the product writes every weight cotangent before the softmax's reverse reads it.
             let mut dp = unsafe { self.stream.alloc::<f32>((count * length).max(1)) }.gpu_ctx("tensor alloc")?;
-            let block = |h: usize| h * blocks * length * length;
-            for h in 0..layout.queries {
-                let g = h / group;
-                // dP = gA Vᵀ: column-major dPᵀ = V gAᵀ.
-                let product = Gemm32 {
-                    ops: (cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N),
-                    dims: (length, length, w),
-                    scale: (1.0, 0.0),
-                    a: (Factor::Half(yh), (layout.queries + layout.keys + g) * w, columns),
-                    b: (Factor::Half(&gah), h * w, reads),
-                    c: (&mut dp, block(h), length),
-                    compute: cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                };
-                self.gemm_ex(product, blocks, (length * columns, length * reads, length * length))?;
-            }
+            // dP = gA Vᵀ: column-major dPᵀ = V gAᵀ.
+            let entries = every(&|h, b| (at(b, v0(h)), b * length * reads + q0(h), block(h, b)), &mut (0..layout.queries));
+            self.gemm_pointers((cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N), (length, length, w), (1.0, 0.0), [(yh, columns), (&gah, reads)], (&mut dp, length), &entries)?;
             // SAFETY: the softmax's reverse writes every score cotangent.
             let mut ds = unsafe { self.stream.alloc::<u16>((count * length).max(1)) }.gpu_ctx("tensor alloc")?;
             let (n, cols) = (u32_of(count)?, u32_of(length)?);
@@ -4962,30 +4998,19 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             unsafe { self.stream.launch_builder(&f).arg(&n).arg(&cols).arg(&weights).arg(&dp).arg(&mut ds).launch(cfg_rows(count)) }
                 .gpu_ctx("decoder causal_softmax_backward")?;
             drop(dp);
-            // Keys' and values' cotangents sum over their group's query heads.
             let mut gy = self.zeros32(rows * columns)?;
-            for h in 0..layout.queries {
-                let g = h / group;
-                let products = [
-                    // dV += Pᵀ gA: column-major dVᵀ = gAᵀ P.
-                    (Factor::Half(&gah), h * w, reads, length * reads, Factor::Half(&weights), cublasOperation_t::CUBLAS_OP_T, (layout.queries + layout.keys + g) * w, 1.0f32, 1.0f32),
-                    // dQ = c dS K: column-major dQᵀ = Kᵀ dSᵀ.
-                    (Factor::Half(yh), (layout.queries + g) * w, columns, length * columns, Factor::Half(&ds), cublasOperation_t::CUBLAS_OP_N, h * w, scale as f32, 0.0f32),
-                    // dK += c dSᵀ Q: column-major dKᵀ = Qᵀ dS.
-                    (Factor::Half(yh), h * w, columns, length * columns, Factor::Half(&ds), cublasOperation_t::CUBLAS_OP_T, (layout.queries + g) * w, scale as f32, 1.0f32),
-                ];
-                for (a, a_offset, lda, stride_a, b, op_b, c_offset, alpha, beta) in products {
-                    let product = Gemm32 {
-                        ops: (cublasOperation_t::CUBLAS_OP_N, op_b),
-                        dims: (w, length, length),
-                        scale: (alpha, beta),
-                        a: (a, a_offset, lda),
-                        b: (b, block(h), length),
-                        c: (&mut gy, c_offset, columns),
-                        compute: cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                    };
-                    self.gemm_ex(product, blocks, (stride_a, length * length, length * columns))?;
-                }
+            // dQ = c dS K (each query head its own columns): column-major dQᵀ = Kᵀ dSᵀ.
+            let entries = every(&|h, b| (at(b, k0(h)), block(h, b), at(b, q0(h))), &mut (0..layout.queries));
+            self.gemm_pointers((cublasOperation_t::CUBLAS_OP_N, cublasOperation_t::CUBLAS_OP_N), (w, length, length), (scale as f32, 0.0), [(yh, columns), (&ds, length)], (&mut gy, columns), &entries)?;
+            // A key-value head's cotangents sum over its group's query heads: one call per member, so
+            // no call writes one region twice. dV += Pᵀ gA (column-major dVᵀ = gAᵀ P); dK += c dSᵀ Q
+            // (column-major dKᵀ = Qᵀ dS).
+            for member in 0..group {
+                let heads = || (0..layout.keys).map(move |g| g * group + member);
+                let entries = every(&|h, b| (b * length * reads + q0(h), block(h, b), at(b, v0(h))), &mut heads());
+                self.gemm_pointers((cublasOperation_t::CUBLAS_OP_N, cublasOperation_t::CUBLAS_OP_T), (w, length, length), (1.0, 1.0), [(&gah, reads), (&weights, length)], (&mut gy, columns), &entries)?;
+                let entries = every(&|h, b| (at(b, q0(h)), block(h, b), at(b, k0(h))), &mut heads());
+                self.gemm_pointers((cublasOperation_t::CUBLAS_OP_N, cublasOperation_t::CUBLAS_OP_T), (w, length, length), (scale as f32, 1.0), [(yh, columns), (&ds, length)], (&mut gy, columns), &entries)?;
             }
             Ok(Tensor { rows, cols: columns, data: Data::Cuda32(gy) })
         }
