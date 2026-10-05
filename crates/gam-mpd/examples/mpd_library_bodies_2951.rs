@@ -21,9 +21,10 @@
 //! 3. every region is rewritten as a call of its own body from the fitted library
 //!    (`library_bodies::rewrite`), fitted (OUT/rewritten), and accepted when its code length `F` is
 //!    below the base's;
-//! 4. the bodies are aligned pairwise (`library_bodies::align`), the pair of least misfit per value
-//!    its gauge did not fit (`Alignment::evidence`) is merged (`library_bodies::merge`), fitted (OUT/merged{n}), and accepted when
-//!    `F` falls; repeated while a merge is accepted and two bodies remain.
+//! 4. reuse by gradient: the library is fitted with the mixture prior over bodies
+//!    (`library_bodies::BodyMixture`; OUT/soft{n}), each dominant component is made exact by a merge
+//!    (`library_bodies::merge`), and the merged library is fitted (OUT/merged{n}) and accepted when
+//!    `F` falls; repeated while a merge is accepted.
 //!
 //! OUT/SUMMARY.json: per stage `F` and the held-out evaluation (KL per token by experiment family),
 //! the regions, the bodies with their calls and the native functions each replaced, the alignments
@@ -34,7 +35,7 @@ use gam_mpd::{
     import::import_language_model,
     library_bodies::{self, Call},
     library_mdl::{self, Explanation, Fit},
-    library_readout,
+    library_mixture, library_readout,
     library_sharing,
     operator_program::{OperatorProgram, SlotValues},
     run_check::{LayerNodes, layer_nodes, split_sites},
@@ -196,11 +197,16 @@ fn stage(name: &str, fit: &Fit) -> Value {
 impl Run {
     /// `explanation` fitted to convergence in OUT/`name` (resumed from its checkpoint there).
     fn fit(&self, name: &str, explanation: &Explanation) -> Result<Fit, String> {
+        self.fit_with(name, explanation, None)
+    }
+
+    /// `explanation` fitted to convergence in OUT/`name` with the prior term `prior`.
+    fn fit_with(&self, name: &str, explanation: &Explanation, prior: Option<&mut (dyn library_mdl::PriorTerm + 'static)>) -> Result<Fit, String> {
         let dir = self.out.join(name);
         std::fs::create_dir_all(&dir).map_err(error)?;
         let checkpoint = dir.join("checkpoint.bin");
         library_mdl::check_checkpoint(&checkpoint, &library_mdl::identity(&self.digest, &self.native, explanation, &self.train, &self.held))?;
-        let fit = library_mdl::fit(&self.device, &self.native, explanation, &self.train, &self.held, &self.fit, &self.digest, Some(&checkpoint), None)?;
+        let fit = library_mdl::fit(&self.device, &self.native, explanation, &self.train, &self.held, &self.fit, &self.digest, Some(&checkpoint), prior)?;
         save(&dir.join("REPORT.json"), &serde_json::to_value(&fit.report).map_err(error)?)?;
         Ok(fit)
     }
@@ -222,7 +228,8 @@ impl Run {
             thresholds: vec![1.0],
             targets: self.held[0].len(),
         };
-        let readout = library_readout::read_out(&self.device, &self.device, &self.native, &self.layers, artifact, &self.held, &settings)?;
+        let library = library_readout::Library::new(&self.device, &self.device, &self.native, &self.layers, artifact, settings.numeric_bytes, settings.tile_rows)?;
+        let readout = library_readout::read_out(&library, &self.held, &settings)?;
         let parse = |name: &str, layer: usize| -> Result<Function, String> {
             let (_, rest) = name.split_once('.').ok_or_else(|| format!("function name {name}"))?;
             let index = |s: &str| s.parse::<usize>().map_err(|e| format!("function name {name}: {e}"));
@@ -262,8 +269,9 @@ fn warm(explanation: &Explanation, fit: &Fit) -> Result<Explanation, String> {
     Ok(out)
 }
 
-/// The method (module note) from `base`; with `planted`, the gate's planted units per layer.
-fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>) -> Result<(), String> {
+/// The method (module note) from `base` with its posterior `posterior` (a checkpoint's; none for
+/// `M`, whose posterior is the library's start); with `planted`, the gate's planted units per layer.
+fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior>, planted: Option<&[Vec<usize>; 2]>) -> Result<(), String> {
     let mut summary = json!({"stages": [], "decisions": []});
     let record = |summary: &mut Value, key: &str, value: Value| -> Result<(), String> {
         summary[key].as_array_mut().ok_or("a summary list")?.push(value);
@@ -271,17 +279,24 @@ fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>) -> Re
     };
     let fitted = run.fit("base", &base)?;
     record(&mut summary, "stages", stage("base", &fitted))?;
-    // The fitted library's functions carrying flow, and among each MLP's the regions.
-    let warmed = warm(&base, &fitted)?;
-    let (flows, functions) = run.flows(&warmed)?;
+    // The functions carrying flow where the library starts, and among each MLP's the regions at the
+    // start's posterior.
+    let posterior = match posterior {
+        Some(posterior) => posterior,
+        None => library_mdl::Posterior::new(&base, fitted.report.scored_tokens)?,
+    };
+    let (flows, functions) = run.flows(&base)?;
     save(&run.out.join("FLOWS.json"), &json!({"functions": functions, "flows": flows.outer_iter().map(|r| r.to_vec()).collect::<Vec<_>>()}))?;
     let mut regions = Vec::new();
     for l in 0..run.layers.len() {
-        let pool: Vec<usize> = functions.iter().filter_map(|f| match f {
-            Function::Mlp { layer, function } if *layer == l => Some(*function),
-            Function::Mlp { .. } | Function::Head { .. } => None,
-        }).collect();
-        regions.extend(library_bodies::regions(&warmed, &fitted.posterior, l, &pool)?.into_iter().map(|r| (l, r)));
+        let pool: Vec<usize> = functions
+            .iter()
+            .filter_map(|f| match f {
+                Function::Mlp { layer, function } if *layer == l => Some(*function),
+                Function::Mlp { .. } | Function::Head { .. } => None,
+            })
+            .collect();
+        regions.extend(library_bodies::regions(&base, &posterior, l, &pool)?.into_iter().map(|r| (l, r)));
     }
     log::info!("bodies: {} regions among {} functions carrying flow: {regions:?}", regions.len(), functions.len());
     summary["regions"] = json!(regions);
@@ -292,8 +307,8 @@ fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>) -> Re
     if regions.is_empty() {
         return Ok(());
     }
-    // Every region rewritten as a call of its own body, from the fitted library.
-    let mut rewritten = warmed;
+    // Every region rewritten as a call of its own body, from the same start.
+    let mut rewritten = base;
     let mut calls: Vec<Call> = Vec::new();
     for (layer, region) in &regions {
         let (next, call) = library_bodies::rewrite(&rewritten, *layer, region)?;
@@ -309,28 +324,21 @@ fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>) -> Re
         return Ok(());
     }
     let mut explanation = rewritten;
-    // Merges, the pair of least misfit per compared value first, while one is accepted.
+    // Reuse by gradient: the fit with the mixture prior over bodies (each body's components the
+    // earlier bodies it aligns to, OUT/soft{n}); every dominant component made exact by a merge, the
+    // merged library fitted (OUT/merged{n}) from the soft fit's means and accepted when its `F` is
+    // below the library's; repeated while a merge is accepted.
+    let steps = library_mixture::Steps { rate: 0.05, beta1: run.fit.beta1, beta2: 0.999, epsilon: 1e-8 };
     for round in 0.. {
-        let bodies: Vec<String> = calls.iter().map(|c| c.body.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-        let values = bodies.iter().map(|b| library_bodies::body_values(&explanation, &current.posterior, b)).collect::<Result<Vec<_>, _>>()?;
-        let mut proposals = Vec::new();
-        for i in 0..bodies.len() {
-            for j in 0..bodies.len() {
-                if i == j {
-                    continue;
-                }
-                // Merges of bodies of one law only (another law's alignment is refused), and only
-                // where the alignment holds evidence: more compared values than its gauge fits.
-                if let Ok(alignment) = library_bodies::align(&values[j], &values[i])
-                    && let Some(evidence) = alignment.evidence()
-                {
-                    proposals.push((evidence, j, i, alignment));
-                }
-            }
+        let mut mixture = library_bodies::BodyMixture::new(&explanation, steps)?;
+        let soft = run.fit_with(&format!("soft{round}"), &warm(&explanation, &current)?, Some(&mut mixture))?;
+        let weights: Vec<Value> = mixture.targets.iter().map(|t| json!({"body": t.body, "components": t.components.iter().map(|c| &c.body).collect::<Vec<_>>(), "weights": t.weights().unwrap_or_default()})).collect();
+        let soft_start = warm(&explanation, &soft)?;
+        let (merged, merged_calls, pairs) = mixture.harden(&soft_start, &calls, &soft.posterior)?;
+        record(&mut summary, "stages", json!({"stage": format!("soft{round}"), "objective_bits": soft.report.objective_bits, "prior_bits": soft.report.end.prior_bits, "mixture": weights}))?;
+        if pairs.is_empty() {
+            break;
         }
-        proposals.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let Some((per_value, from, onto, alignment)) = proposals.into_iter().next() else { break };
-        let (merged, merged_calls) = library_bodies::merge(&warm(&explanation, &current)?, &calls, &bodies[from], &bodies[onto], &alignment)?;
         merged.artifact.validate_coverage(&run.native)?;
         let name = format!("merged{round}");
         let fit = run.fit(&name, &merged)?;
@@ -339,8 +347,7 @@ fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>) -> Re
         record(
             &mut summary,
             "decisions",
-            json!({"move": "merge", "from": bodies[from], "onto": bodies[onto], "reduced_misfit": per_value, "alignment": alignment,
-                   "calls": merged_calls, "before_bits": current.report.objective_bits, "after_bits": fit.report.objective_bits, "accepted": accepted}),
+            json!({"move": "merge", "merged": pairs, "calls": merged_calls, "before_bits": current.report.objective_bits, "after_bits": fit.report.objective_bits, "accepted": accepted}),
         )?;
         if !accepted {
             break;
@@ -383,7 +390,7 @@ fn main() -> Result<(), String> {
                 fit,
                 out: out.to_path_buf(),
             };
-            method(&run, base, Some(&planted))
+            method(&run, base, None, Some(&planted))
         }
         Some("model") => {
             let [_, export, settings_path, from, out, mode] = &args[..] else {
@@ -415,19 +422,19 @@ fn main() -> Result<(), String> {
                 return Err("the export holds fewer training sequences than asked for".into());
             }
             let start = library_mdl::explanation(&native, &layers)?;
-            let base = match from.split_once(':') {
-                None if from == "native" => start,
+            let (base, posterior) = match from.split_once(':') {
+                None if from == "native" => (start, None),
                 Some(("checkpoint", path)) => {
                     let posterior = library_readout::checkpoint_posterior(&start, Path::new(path))?;
                     let mut base = library_sharing::warm(&start, &library_mdl::posterior_mean(&start, &posterior)?)?;
                     base.removed = (0..posterior.active.len()).filter(|g| !posterior.active[*g]).collect();
-                    base
+                    (base, Some(posterior))
                 }
                 _ => return Err("FROM is native or checkpoint:PATH".into()),
             };
             std::fs::create_dir_all(out).map_err(error)?;
             let run = Run { device, native, layers, held: sequences[first..end].to_vec(), train, fit: settings.fit, digest: settings.export_sha256, out: out.to_path_buf() };
-            method(&run, base, None)
+            method(&run, base, posterior, None)
         }
         _ => Err("gate OUT | model EXPORT SETTINGS.json FROM OUT host|gpu".into()),
     }

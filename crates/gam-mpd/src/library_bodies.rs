@@ -27,8 +27,9 @@
 //! `O` the region's output columns and `O = Σ_r t_r p_r q_rᵀ` likewise, `W = [p_r]` and
 //! `U = Wᵀ O`. Then `G R = A`, `B R = D` and `W U = O`, so the rewritten explanation computes what
 //! the region computed. Unit `j` of the body is the region's `j`-th function: each replaced native
-//! block's owner (`Artifact::owners`) becomes the body's block of that unit at the call, read through
-//! the call's bindings ([`Call::replaced`] lists the same correspondence). The native functions' groups leave the
+//! block's owner (`Artifact::owners`) becomes the body's block of that unit at the call with the
+//! call's binding as its factor, exactly (`a_i = g_j R`, `b_i = b_j R`, `u_i = W u_j`;
+//! [`Call::replaced`] lists the same correspondence). The native functions' groups leave the
 //! explanation (`Explanation::removed`); their reads stay among `M`'s read variables, so the
 //! experiments do not change.
 //!
@@ -360,18 +361,21 @@ pub fn rewrite(explanation: &Explanation, layer: usize, functions: &[usize]) -> 
         let (_, op, width) = parts.into_iter().find(|(part, _, _)| operator == format!("{mlp}.{part}"))?;
         Some((op?, j..j + 1, 0..width))
     };
+    let (read_name, write_name) = (format!("{call}.read"), format!("{call}.write"));
     for owner in &mut rewritten.artifact.owners {
+        // `a_i = g_j R`, `b_i = b_j R` and `u_i = W u_j` (biases are the body's own entries).
         let target = if owner.operator == format!("{mlp}.out") && owner.cols.len() == 1 {
-            functions.iter().position(|f| *f == owner.cols.start).map(|j| (body_out, 0..k_out, j..j + 1))
+            functions.iter().position(|f| *f == owner.cols.start).map(|j| (body_out, 0..k_out, j..j + 1, vec![write_name.clone()], Vec::new()))
         } else if owner.rows.len() == 1 {
-            row_block(&owner.operator, owner.rows.start)
+            row_block(&owner.operator, owner.rows.start).map(|(op, rows, cols)| {
+                let right = if cols.len() == k { vec![read_name.clone()] } else { Vec::new() };
+                (op, rows, cols, Vec::new(), right)
+            })
         } else {
             None
         };
-        if let Some((op, rows, cols)) = target {
-            owner.operator = program.operators[op].name.clone();
-            owner.rows = rows;
-            owner.cols = cols;
+        if let Some((op, rows, cols, left, right)) = target {
+            owner.repoint(&program.operators[op].name, rows, cols, &left, &right);
             owner.body = body.clone();
             owner.site = call.clone();
         }
@@ -480,6 +484,21 @@ pub fn body_values(explanation: &Explanation, posterior: &Posterior, body: &str)
         inputs,
         outputs,
     })
+}
+
+/// `body`'s values in `program` (its operators' values, unit deviations): what an alignment of
+/// fitted means needs where no posterior is at hand.
+fn artifact_values(program: &OperatorProgram, body: &str) -> Result<BodyValues, String> {
+    let ops = BodyOperators::of(program, body)?;
+    let part = |op: usize| {
+        let mean = program.operators[op].matrix();
+        Part { sd: Array2::ones(mean.dim()), mean }
+    };
+    let (gate, out) = (part(ops.gate), part(ops.out));
+    let alive = |row: ndarray::ArrayView1<'_, f64>| row.iter().any(|v| *v != 0.0);
+    let units = (0..gate.mean.nrows()).map(|j| alive(gate.mean.row(j)) && alive(out.mean.column(j))).collect();
+    let (inputs, outputs) = (vec![true; gate.mean.ncols()], vec![true; out.mean.nrows()]);
+    Ok(BodyValues { gate_bias: ops.gate_bias.map(part), up: ops.up.map(part), up_bias: ops.up_bias.map(part), gate, out, units, inputs, outputs })
 }
 
 /// The gauge relating body `from` to body `onto` (module note): unit `i` of `from` is unit
@@ -983,32 +1002,65 @@ pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, 
     merged.groups = groups;
     merged.removed = removed;
     merged.trainable.retain(|op| !retired.contains(op));
-    // Owners of `from`'s blocks now own `onto`'s block of the matched unit; a native function whose
-    // unit is unmatched is owned by its call's read binding as a whole.
-    let names = |ops: &BodyOperators| -> Vec<(String, bool)> {
-        let program = &explanation.artifact.program;
-        let mut out: Vec<(String, bool)> = [Some(ops.gate), ops.gate_bias, ops.up, ops.up_bias].into_iter().flatten().map(|op| (program.operators[op].name.clone(), true)).collect();
-        out.push((program.operators[ops.out].name.clone(), false));
-        out
-    };
-    let onto_names = names(&onto_ops);
-    for owner in &mut merged.artifact.owners {
-        let Some(part) = names(&from_ops).iter().position(|(name, _)| *name == owner.operator) else { continue };
-        let by_row = onto_names[part].1;
-        let unit = if by_row { owner.rows.start } else { owner.cols.start };
+    // Owners of `from`'s blocks now own `onto`'s block of the matched unit at the same call, whose
+    // bindings took the gauge (`g_i = g_j A`, so `a_i = g_j (A R)`; `u_i = C u_j`, so `W u_i =
+    // (W C) u_j`), and for a gated law the unit's up scale `α` (`b_i = α b_j A`, `u_i = C u_j / α`),
+    // kept as 1 × 1 operators of the call that no node reads. A native function whose unit is
+    // unmatched leaves `P`: it is owned by its zeroed block of the native MLP's operator, as a
+    // removed function is.
+    let alphas = up_scales(&artifact_values(&explanation.artifact.program, from)?, &artifact_values(&explanation.artifact.program, onto)?, alignment);
+    let gated = from_ops.up.is_some();
+    let pieces = [
+        (Some(from_ops.gate), Some(onto_ops.gate), Piece::Gate, "gate"),
+        (from_ops.gate_bias, onto_ops.gate_bias, Piece::GateBias, "gate_bias"),
+        (from_ops.up, onto_ops.up, Piece::Up, "up"),
+        (from_ops.up_bias, onto_ops.up_bias, Piece::UpBias, "up_bias"),
+        (Some(from_ops.out), Some(onto_ops.out), Piece::Out, "out"),
+    ];
+    let name = |op: usize| explanation.artifact.program.operators[op].name.clone();
+    let (k_onto, k_out_onto) = (z.width(), y.width());
+    let mut scalars: BTreeMap<(String, usize), (String, String)> = BTreeMap::new();
+    let mut owners = std::mem::take(&mut merged.artifact.owners);
+    for owner in &mut owners {
+        let Some((_, Some(onto_op), piece, part)) = pieces.iter().find(|(f, ..)| f.is_some_and(|f| name(f) == owner.operator)) else { continue };
+        let unit = if *piece == Piece::Out { owner.cols.start } else { owner.rows.start };
         match alignment.units.get(unit).copied().flatten() {
             Some(j) => {
-                owner.operator = onto_names[part].0.clone();
-                if by_row { owner.rows = j..j + 1 } else { owner.cols = j..j + 1 }
+                let (rows, cols) = match piece {
+                    Piece::Gate | Piece::Up => (j..j + 1, 0..k_onto),
+                    Piece::GateBias | Piece::UpBias => (j..j + 1, 0..1),
+                    Piece::Out => (0..k_out_onto, j..j + 1),
+                };
+                owner.operator = name(*onto_op);
+                owner.rows = rows;
+                owner.cols = cols;
+                if gated && matches!(piece, Piece::Up | Piece::UpBias | Piece::Out) {
+                    let (alpha, inverse) = scalars.entry((owner.site.clone(), unit)).or_insert_with(|| (format!("{}.u{unit}.alpha", owner.site), format!("{}.u{unit}.alpha_inverse", owner.site))).clone();
+                    if *piece == Piece::Out { owner.right.push(inverse) } else { owner.left.push(alpha) }
+                }
             }
             None => {
-                let read = format!("{}.read", owner.site);
-                owner.cols = 0..program_width(&merged.artifact.program, &read)?.1;
-                owner.rows = 0..program_width(&merged.artifact.program, &read)?.0;
-                owner.operator = read;
+                let layer = owner.site.strip_prefix("library.l").and_then(|r| r.split_once('.')).map(|(l, _)| l.to_string()).ok_or("a call's name")?;
+                let mlp = format!("library.l{layer}.mlp");
+                owner.operator = format!("{mlp}.{part}");
+                owner.rows = owner.native_rows.clone();
+                owner.cols = owner.native_cols.clone();
+                owner.left.clear();
+                owner.right.clear();
+                owner.site = mlp.clone();
+                owner.body = mlp;
+                continue;
             }
         }
         owner.body = onto.to_string();
+    }
+    merged.artifact.owners = owners;
+    let one = units(1)?;
+    for ((_, unit), (alpha, inverse)) in &scalars {
+        let value = alphas.get(*unit).copied().unwrap_or(1.0);
+        for (scalar, v) in [(alpha, value), (inverse, 1.0 / value)] {
+            merged.artifact.program.operators.push(Arc::new(dense(scalar.clone(), one.clone(), one.clone(), Array2::from_elem((1, 1), v), Provenance::derived(&[], format!("merge of {from} into {onto}: a unit's up scale")))?));
+        }
     }
     let calls = calls
         .iter()
@@ -1024,12 +1076,6 @@ pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, 
         })
         .collect();
     Ok((merged, calls))
-}
-
-/// The `(rows, cols)` widths of `program`'s operator `name`.
-fn program_width(program: &OperatorProgram, name: &str) -> Result<(usize, usize), String> {
-    let op = &program.operators[operator_index(program, name)?];
-    Ok((op.rows.width(), op.cols.width()))
 }
 
 // -------------------------------------------------------------------------------------- regions
@@ -1129,6 +1175,432 @@ pub fn regions(explanation: &Explanation, posterior: &Posterior, layer: usize, p
             region
         })
         .collect())
+}
+
+// ---------------------------------------------------------------------------- reuse by gradient
+
+/// A part of a body unit's parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Piece {
+    Gate,
+    GateBias,
+    Up,
+    UpBias,
+    Out,
+}
+
+/// One entry of a body's parameters as the mixture reads it: its piece, unit and coordinate, its
+/// operator (an index into `Explanation::trainable`), row, column and prior group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Entry {
+    piece: Piece,
+    unit: usize,
+    coordinate: usize,
+    operator: usize,
+    row: usize,
+    col: usize,
+    group: usize,
+}
+
+/// A body's operators by trainable index, and its entries in groups of the explanation: per unit
+/// its gate row, gate bias, up row, up bias and output column.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Layout {
+    operators: Vec<(Piece, usize)>,
+    entries: Vec<Entry>,
+}
+
+impl Layout {
+    fn of(explanation: &Explanation, body: &str) -> Result<Self, String> {
+        let program = &explanation.artifact.program;
+        let ops = BodyOperators::of(program, body)?;
+        let position = |op: usize| explanation.trainable.iter().position(|t| *t == op).ok_or_else(|| format!("{body}: operator {op} is not trainable"));
+        let pieces = [(Piece::Gate, Some(ops.gate)), (Piece::GateBias, ops.gate_bias), (Piece::Up, ops.up), (Piece::UpBias, ops.up_bias), (Piece::Out, Some(ops.out))];
+        let operators: Vec<(Piece, usize, usize)> = pieces.iter().filter_map(|(p, op)| op.map(|op| position(op).map(|i| (*p, op, i)))).collect::<Result<_, _>>()?;
+        // Each entry's group, from the explanation's groups of these operators.
+        let mut group_of: BTreeMap<(usize, usize, usize), usize> = BTreeMap::new();
+        for (g, group) in explanation.groups.iter().enumerate() {
+            for cell in group.cells.iter().filter(|c| operators.iter().any(|o| o.1 == c.operator)) {
+                for &row in &cell.rows {
+                    for col in cell.cols.clone() {
+                        group_of.insert((cell.operator, row, col), g);
+                    }
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        let units = program.operators[ops.gate].rows.width();
+        for unit in 0..units {
+            for &(piece, op, i) in &operators {
+                let width = match piece {
+                    Piece::Gate | Piece::Up => program.operators[op].cols.width(),
+                    Piece::GateBias | Piece::UpBias => 1,
+                    Piece::Out => program.operators[op].rows.width(),
+                };
+                for coordinate in 0..width {
+                    let (row, col) = if piece == Piece::Out { (coordinate, unit) } else { (unit, coordinate) };
+                    let group = *group_of.get(&(op, row, col)).ok_or_else(|| format!("{body}: an entry in no group"))?;
+                    entries.push(Entry { piece, unit, coordinate, operator: i, row, col, group });
+                }
+            }
+        }
+        Ok(Self { operators: operators.into_iter().map(|(p, _, i)| (p, i)).collect(), entries })
+    }
+
+    fn operator(&self, piece: Piece) -> Option<usize> {
+        self.operators.iter().find(|(p, _)| *p == piece).map(|(_, i)| *i)
+    }
+}
+
+/// One component of a body's mixture prior: an earlier body, the gauge relating them (fixed for an
+/// epoch: the alignment of the target to it and each target unit's up scale `α`), its scale `c` and
+/// its logit.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BodyComponent {
+    pub body: String,
+    pub alignment: Alignment,
+    pub up_scales: Vec<f64>,
+    pub scale: f64,
+    pub logit: f64,
+}
+
+/// The mixture prior of one body's parameters.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BodyTarget {
+    pub body: String,
+    /// The earlier bodies it may choose among.
+    pub choices: usize,
+    pub zero_logit: f64,
+    pub components: Vec<BodyComponent>,
+    /// `ln s²`.
+    pub log_variance: f64,
+}
+
+impl BodyTarget {
+    /// The mixture weights `π`, the zero component's first.
+    pub fn weights(&self) -> Result<Vec<f64>, String> {
+        let logits: Vec<f64> = std::iter::once(self.zero_logit).chain(self.components.iter().map(|c| c.logit)).collect();
+        Ok(gam_math::categorical::log_softmax(&logits).map_err(error)?.into_iter().map(f64::exp).collect())
+    }
+}
+
+/// Adam's moments of one parameter.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+struct Moment {
+    first: f64,
+    second: f64,
+}
+
+/// The mixture prior over bodies (module note, # Reuse by gradient).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BodyMixture {
+    pub targets: Vec<BodyTarget>,
+    steps: crate::library_mixture::Steps,
+    taken: u64,
+    /// Per target, Adam's moments of its zero logit, then per component its logit and scale, then
+    /// its `ln s²`.
+    moments: Vec<Vec<Moment>>,
+    layouts: BTreeMap<String, Layout>,
+    /// Each target body's groups' cells (trainable index, rows, columns), for their variances.
+    cells: BTreeMap<usize, Vec<(usize, Vec<usize>, std::ops::Range<usize>)>>,
+}
+
+impl BodyMixture {
+    /// The mixture prior of every body of `explanation` (bodies in order of their numbers), stepped
+    /// with `steps`; the components are chosen by the first epoch.
+    pub fn new(explanation: &Explanation, steps: crate::library_mixture::Steps) -> Result<Self, String> {
+        let program = &explanation.artifact.program;
+        let mut bodies: Vec<(usize, String)> = program.rules.iter().filter_map(|r| r.name.strip_prefix("library.body")?.parse::<usize>().ok().map(|i| (i, r.name.clone()))).collect();
+        bodies.sort_unstable();
+        let mut layouts = BTreeMap::new();
+        for (_, body) in &bodies {
+            layouts.insert(body.clone(), Layout::of(explanation, body)?);
+        }
+        let position = |op: usize| explanation.trainable.iter().position(|t| *t == op);
+        let mut cells = BTreeMap::new();
+        for layout in layouts.values() {
+            for entry in &layout.entries {
+                cells.entry(entry.group).or_insert_with(|| {
+                    explanation.groups[entry.group].cells.iter().filter_map(|c| position(c.operator).map(|i| (i, c.rows.clone(), c.cols.clone()))).collect()
+                });
+            }
+        }
+        let targets: Vec<BodyTarget> = bodies.iter().enumerate().map(|(t, (_, body))| BodyTarget { body: body.clone(), choices: t, zero_logit: 0.0, components: Vec::new(), log_variance: 0.0 }).collect();
+        let moments = targets.iter().map(|_| vec![Moment::default(); 2]).collect();
+        Ok(Self { targets, steps, taken: 0, moments, layouts, cells })
+    }
+
+    /// Each group's empirical-Bayes variance `v_G` at `posterior`.
+    fn variance(&self, group: usize, posterior: &Posterior) -> f64 {
+        let (mut count, mut second) = (0.0, 0.0);
+        for (i, rows, cols) in self.cells.get(&group).map(Vec::as_slice).unwrap_or_default() {
+            for &r in rows {
+                for c in cols.clone() {
+                    let (m, s) = (posterior.mean[*i][[r, c]], posterior.log_sd[*i][[r, c]]);
+                    count += 1.0;
+                    second += m * m + (2.0 * s).exp();
+                }
+            }
+        }
+        second / count
+    }
+
+    /// The entries of target `t` in the explanation at `posterior`.
+    fn live(&self, t: usize, posterior: &Posterior) -> Result<Vec<Entry>, String> {
+        let layout = self.layouts.get(&self.targets[t].body).ok_or("a target's layout")?;
+        Ok(layout.entries.iter().filter(|e| posterior.active[e.group]).copied().collect())
+    }
+
+    /// Component `component`'s prediction of the target entries `entries` from its body's values
+    /// `theta` (by trainable index).
+    fn predicted(&self, component: &BodyComponent, entries: &[Entry], theta: &BTreeMap<usize, Array2<f64>>) -> Result<Array1<f64>, String> {
+        let layout = self.layouts.get(&component.body).ok_or("a component's layout")?;
+        let get = |piece: Piece| -> Result<Option<&Array2<f64>>, String> {
+            layout.operator(piece).map(|i| theta.get(&i).ok_or_else(|| "a component's sample".to_string())).transpose()
+        };
+        let (gate, bias, up, up_bias, out) = (get(Piece::Gate)?, get(Piece::GateBias)?, get(Piece::Up)?, get(Piece::UpBias)?, get(Piece::Out)?);
+        let (a, c) = (&component.alignment.input, &component.alignment.output);
+        let mut out_vector = Array1::zeros(entries.len());
+        for (k, e) in entries.iter().enumerate() {
+            let Some(j) = component.alignment.units.get(e.unit).copied().flatten() else { continue };
+            let alpha = component.up_scales.get(e.unit).copied().unwrap_or(1.0);
+            out_vector[k] = match (e.piece, gate, bias, up, up_bias, out) {
+                (Piece::Gate, Some(g), ..) => g.row(j).dot(&a.column(e.coordinate)),
+                (Piece::GateBias, _, Some(b), ..) => b[[j, 0]],
+                (Piece::Up, _, _, Some(u), ..) => alpha * u.row(j).dot(&a.column(e.coordinate)),
+                (Piece::UpBias, _, _, _, Some(b), _) => alpha * b[[j, 0]],
+                (Piece::Out, .., Some(o)) => c.row(e.coordinate).dot(&o.column(j)) / alpha,
+                _ => return Err("a component of another law than its target".into()),
+            };
+        }
+        Ok(out_vector)
+    }
+
+    /// The derivative in the component's body's operators of `w · predicted`.
+    fn predicted_gradient(&self, component: &BodyComponent, entries: &[Entry], w: &Array1<f64>, gradient: &mut BTreeMap<usize, Array2<f64>>, theta: &BTreeMap<usize, Array2<f64>>) -> Result<(), String> {
+        let layout = self.layouts.get(&component.body).ok_or("a component's layout")?;
+        let (a, c) = (&component.alignment.input, &component.alignment.output);
+        for (k, e) in entries.iter().enumerate() {
+            let Some(j) = component.alignment.units.get(e.unit).copied().flatten() else { continue };
+            let alpha = component.up_scales.get(e.unit).copied().unwrap_or(1.0);
+            let piece = e.piece;
+            let i = layout.operator(piece).ok_or("a component of another law than its target")?;
+            let shape = theta.get(&i).ok_or("a component's sample")?.dim();
+            let g = gradient.entry(i).or_insert_with(|| Array2::zeros(shape));
+            match piece {
+                Piece::Gate => g.row_mut(j).scaled_add(w[k], &a.column(e.coordinate)),
+                Piece::Up => g.row_mut(j).scaled_add(w[k] * alpha, &a.column(e.coordinate)),
+                Piece::GateBias => g[[j, 0]] += w[k],
+                Piece::UpBias => g[[j, 0]] += w[k] * alpha,
+                Piece::Out => g.column_mut(j).scaled_add(w[k] / alpha, &c.row(e.coordinate)),
+            }
+        }
+        Ok(())
+    }
+
+    /// The targets whose one component holds more than half of the mixture weight, with it.
+    pub fn dominant(&self, posterior: &Posterior) -> Result<Vec<(usize, usize)>, String> {
+        let mut out = Vec::new();
+        for (t, target) in self.targets.iter().enumerate() {
+            if self.live(t, posterior)?.is_empty() {
+                continue;
+            }
+            let weights = target.weights()?;
+            if let Some(j) = (1..weights.len()).find(|&j| weights[j] > 0.5) {
+                out.push((t, j - 1));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `explanation` and its `calls` with every dominant component made exact (module note): the
+    /// target body merged into the component's body with its alignment, each body in one merge.
+    pub fn harden(&self, explanation: &Explanation, calls: &[Call], posterior: &Posterior) -> Result<(Explanation, Vec<Call>, Vec<(String, String)>), String> {
+        let (mut out, mut calls) = (explanation.clone(), calls.to_vec());
+        let mut involved: Vec<String> = Vec::new();
+        let mut merged = Vec::new();
+        for (t, j) in self.dominant(posterior)? {
+            let (from, component) = (&self.targets[t].body, &self.targets[t].components[j]);
+            if involved.contains(from) || involved.contains(&component.body) {
+                continue;
+            }
+            (out, calls) = merge(&out, &calls, from, &component.body, &component.alignment)?;
+            involved.extend([from.clone(), component.body.clone()]);
+            merged.push((from.clone(), component.body.clone()));
+        }
+        Ok((out, calls, merged))
+    }
+
+    /// One Adam step of the mixture's own parameters along `gradients` (per target, in the moments'
+    /// order).
+    fn learn(&mut self, gradients: &[Vec<f64>]) {
+        self.taken += 1;
+        let crate::library_mixture::Steps { rate, beta1, beta2, epsilon } = self.steps;
+        let (c1, c2) = (1.0 - beta1.powf(self.taken as f64), 1.0 - beta2.powf(self.taken as f64));
+        for (t, gradient) in gradients.iter().enumerate() {
+            if gradient.is_empty() {
+                continue;
+            }
+            let step = |moment: &mut Moment, value: &mut f64, g: f64| {
+                moment.first = beta1 * moment.first + (1.0 - beta1) * g;
+                moment.second = beta2 * moment.second + (1.0 - beta2) * g * g;
+                *value -= rate * (moment.first / c1) / ((moment.second / c2).sqrt() + epsilon);
+            };
+            let (target, moments) = (&mut self.targets[t], &mut self.moments[t]);
+            step(&mut moments[0], &mut target.zero_logit, gradient[0]);
+            for (j, component) in target.components.iter_mut().enumerate() {
+                step(&mut moments[1 + 2 * j], &mut component.logit, gradient[1 + 2 * j]);
+                step(&mut moments[2 + 2 * j], &mut component.scale, gradient[2 + 2 * j]);
+            }
+            let last = moments.len() - 1;
+            step(&mut moments[last], &mut target.log_variance, gradient[gradient.len() - 1]);
+        }
+    }
+}
+
+/// Each target unit's up scale `α` relating it to the matched unit of the component under
+/// `alignment` (gated laws; module note): the geometric mean of the up rows' ratio of norms and the
+/// output columns' inverse ratio, signed by the up rows' inner product; 1 for an ungated law or a
+/// unit with a zero row.
+fn up_scales(target: &BodyValues, component: &BodyValues, alignment: &Alignment) -> Vec<f64> {
+    let (Some(up_t), Some(up_c)) = (&target.up, &component.up) else { return vec![1.0; alignment.units.len()] };
+    alignment
+        .units
+        .iter()
+        .enumerate()
+        .map(|(i, j)| {
+            let Some(j) = j else { return 1.0 };
+            let (b, b_c) = (up_t.mean.row(i).to_owned(), up_c.mean.row(*j).dot(&alignment.input));
+            let (u, u_c) = (target.out.mean.column(i).to_owned(), alignment.output.dot(&component.out.mean.column(*j)));
+            let norm = |v: &Array1<f64>| v.dot(v).sqrt();
+            let (nb, nbc, nu, nuc) = (norm(&b), norm(&b_c), norm(&u), norm(&u_c));
+            if nb == 0.0 || nbc == 0.0 || nu == 0.0 || nuc == 0.0 {
+                return 1.0;
+            }
+            let sign = if b.dot(&b_c) < 0.0 { -1.0 } else { 1.0 };
+            sign * (nb * nuc / (nbc * nu)).sqrt()
+        })
+        .collect()
+}
+
+impl crate::library_mdl::PriorTerm for BodyMixture {
+    fn operators(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = self.layouts.values().flat_map(|l| l.operators.iter().map(|(_, i)| *i)).collect();
+        out.extend(self.cells.values().flatten().map(|c| c.0));
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Every target's components re-chosen at `posterior`: each earlier body of the same law the
+    /// target aligns to with evidence, with its alignment and up scales; a component kept keeps its
+    /// logit and scale.
+    fn epoch(&mut self, explanation: &Explanation, posterior: &Posterior) -> Result<(), String> {
+        let values: BTreeMap<String, BodyValues> =
+            self.targets.iter().map(|t| Ok((t.body.clone(), body_values(explanation, posterior, &t.body)?))).collect::<Result<_, String>>()?;
+        for t in 0..self.targets.len() {
+            let old = std::mem::take(&mut self.targets[t].components);
+            let zero = self.targets[t].zero_logit;
+            let mut moments = vec![self.moments[t][0]];
+            let mut components = Vec::new();
+            let target = &values[&self.targets[t].body];
+            for earlier in &self.targets[..t] {
+                let candidate = &values[&earlier.body];
+                let Ok(alignment) = align(target, candidate) else { continue };
+                if alignment.evidence().is_none() {
+                    continue;
+                }
+                let up = up_scales(target, candidate, &alignment);
+                let (component, moment) = match old.iter().position(|c| c.body == earlier.body) {
+                    Some(at) => (BodyComponent { alignment, up_scales: up, ..old[at].clone() }, [self.moments[t][1 + 2 * at], self.moments[t][2 + 2 * at]]),
+                    None => (BodyComponent { body: earlier.body.clone(), alignment, up_scales: up, scale: 1.0, logit: zero }, [Moment::default(); 2]),
+                };
+                components.push(component);
+                moments.extend(moment);
+            }
+            if old.is_empty() && !components.is_empty() {
+                // A new target's variance starts at its entries' mean posterior variance.
+                let live = self.live(t, posterior)?;
+                let mean: f64 = live.iter().map(|e| (2.0 * posterior.log_sd[e.operator][[e.row, e.col]]).exp()).sum::<f64>() / live.len().max(1) as f64;
+                if mean > 0.0 {
+                    self.targets[t].log_variance = mean.ln();
+                }
+            }
+            moments.push(*self.moments[t].last().ok_or("moments")?);
+            self.targets[t].components = components;
+            self.moments[t] = moments;
+        }
+        Ok(())
+    }
+
+    fn sample(&mut self, posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String> {
+        let mut value = 0.0;
+        let mut gradient: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+        let mut learned = vec![Vec::new(); self.targets.len()];
+        for t in 0..self.targets.len() {
+            let target = &self.targets[t];
+            let entries = self.live(t, posterior)?;
+            if target.components.is_empty() || entries.is_empty() {
+                continue;
+            }
+            let g = Array1::from_iter(entries.iter().map(|e| theta.get(&e.operator).map_or(0.0, |m| m[[e.row, e.col]])));
+            let v = Array1::from_iter(entries.iter().map(|e| self.variance(e.group, posterior)));
+            let predictions = target.components.iter().map(|c| self.predicted(c, &entries, theta)).collect::<Result<Vec<_>, _>>()?;
+            let writes: Vec<(ndarray::ArrayView1<'_, f64>, f64)> = predictions.iter().zip(&target.components).map(|(p, c)| (p.view(), c.scale)).collect();
+            let logits: Vec<f64> = std::iter::once(target.zero_logit).chain(target.components.iter().map(|c| c.logit)).collect();
+            let found = crate::library_mixture::term(g.view(), &writes, &logits, target.log_variance, v.view())?;
+            value += found.value;
+            for (k, e) in entries.iter().enumerate() {
+                let shape = theta.get(&e.operator).ok_or("a target's sample")?.dim();
+                gradient.entry(e.operator).or_insert_with(|| Array2::zeros(shape))[[e.row, e.col]] += found.target[k];
+            }
+            for (component, derivative) in target.components.iter().zip(&found.writes) {
+                self.predicted_gradient(component, &entries, derivative, &mut gradient, theta)?;
+            }
+            let mut own = vec![found.logits[0]];
+            for j in 0..target.components.len() {
+                own.extend([found.logits[j + 1], found.scales[j]]);
+            }
+            own.push(found.log_variance);
+            learned[t] = own;
+        }
+        if learn {
+            self.learn(&learned);
+        }
+        Ok((value, gradient))
+    }
+
+    /// Per target with components: its `K` components among its `n` earlier bodies (`ln C(n, K)`
+    /// nats), and its `K` logits, `K` scales, variance and every component's gauge (its alignment's
+    /// fitted entries and, gated, its up scales), each at the precision of a value estimated from
+    /// the target's live entries (`½ ln |G|` nats).
+    fn cost(&self, posterior: &Posterior) -> Result<f64, String> {
+        let mut total = 0.0;
+        for (t, target) in self.targets.iter().enumerate() {
+            let size = self.live(t, posterior)?.len() as f64;
+            if target.components.is_empty() || size == 0.0 {
+                continue;
+            }
+            let (n, k) = (target.choices as f64, target.components.len() as f64);
+            let gauges: f64 = target.components.iter().map(|c| (c.alignment.gauge + if c.up_scales.iter().any(|a| *a != 1.0) { c.up_scales.len() } else { 0 }) as f64).sum();
+            total += statrs::function::gamma::ln_gamma(n + 1.0) - statrs::function::gamma::ln_gamma(k + 1.0) - statrs::function::gamma::ln_gamma(n - k + 1.0)
+                + (2.0 * k + 1.0 + gauges) * 0.5 * size.ln();
+        }
+        Ok(total)
+    }
+
+    fn save(&self) -> Result<serde_json::Value, String> {
+        serde_json::to_value(self).map_err(error)
+    }
+
+    fn load(&mut self, value: &serde_json::Value) -> Result<(), String> {
+        let restored: BodyMixture = serde_json::from_value(value.clone()).map_err(error)?;
+        if restored.targets.len() != self.targets.len() || restored.targets.iter().zip(&self.targets).any(|(a, b)| a.body != b.body) {
+            return Err("a checkpoint's body mixture of another explanation".into());
+        }
+        *self = restored;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1280,12 +1752,21 @@ mod tests {
             assert!(!merged.groups.iter().any(|g| g.name.starts_with(&second.body)));
             assert_eq!(merged.groups.len(), two.groups.len() - (if gated { 3 } else { 2 }) * 4);
             Posterior::new(&merged, 72).unwrap();
-            // Each planted native gate row at layer 1 is owned by the shared body's row of its unit
-            // at the second call, and nothing names the merged body any more.
+            // Every native block of both planted copies is stated exactly by the ownership map: the
+            // shared body's block of its unit times its call's bindings (and up scales).
+            let natives = |e: &Explanation| -> BTreeMap<(String, usize, usize), Array2<f64>> {
+                e.artifact.owners.iter().map(|o| ((o.native.clone(), o.native_rows.start, o.native_cols.start), e.artifact.native_block(o).unwrap())).collect()
+            };
+            let (before, after) = (natives(&start), natives(&merged));
+            assert_eq!(before.len(), after.len());
+            for (key, value) in &before {
+                let moved = &after[key];
+                let scale = value.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+                assert!(value.iter().zip(moved).all(|(a, b)| (a - b).abs() <= 1e-9 * scale), "native block {key:?} is not stated exactly after the merge");
+            }
             for (j, &f) in SITE1.iter().enumerate() {
                 let gate = format!("{}.gate", first.body);
-                let owned: Vec<_> = merged.artifact.owners.iter().filter(|o| o.site == second.name && o.operator == gate).map(|o| (o.native_rows.clone(), o.rows.clone())).collect();
-                assert!(owned.contains(&(f..f + 1, j..j + 1)), "unit {j} at the second call owns native row {f}: {owned:?}");
+                assert!(merged.artifact.owners.iter().any(|o| o.site == second.name && o.operator == gate && o.native_rows == (f..f + 1) && o.rows == (j..j + 1)), "unit {j} of the second call owns native row {f}");
             }
             assert!(merged.artifact.owners.iter().all(|o| !o.operator.starts_with(&second.body) && o.body != second.body));
         }
@@ -1370,6 +1851,50 @@ mod tests {
                 expected.sort_unstable();
                 assert_eq!(regions(&start, &posterior, l, &pool).unwrap(), vec![expected], "layer {l}");
             }
+        }
+    }
+
+    #[test]
+    fn the_body_mixture_is_differentiated_exactly_and_hardens_into_a_merge() {
+        use crate::library_mdl::PriorTerm;
+        for (law, gated) in [("gelu_tanh", false), ("silu", true)] {
+            let (native, layers, family, _) = tiny(&format!("bodies_mixture_{gated}"), law, gated);
+            let mut start = explanation(&native, &layers).unwrap();
+            planted(&mut start, gated);
+            let (one, first) = rewrite(&start, 0, &SITE0).unwrap();
+            let (two, second) = rewrite(&one, 1, &SITE1).unwrap();
+            let posterior = Posterior::new(&two, 72).unwrap();
+            let steps = crate::library_mixture::Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 };
+            let mut mixture = BodyMixture::new(&two, steps).unwrap();
+            mixture.epoch(&two, &posterior).unwrap();
+            assert_eq!(mixture.targets.len(), 2);
+            assert!(mixture.targets[0].components.is_empty(), "the first body has no earlier body");
+            assert_eq!(mixture.targets[1].components.len(), 1);
+            assert_eq!(mixture.targets[1].components[0].body, first.body);
+            // A weight sample: the means perturbed, so neither body equals the other's image.
+            let mut rng = StdRng::seed_from_u64(9);
+            let theta: BTreeMap<usize, Array2<f64>> =
+                mixture.operators().into_iter().map(|i| (i, posterior.mean[i].mapv(|m| m + 0.01 * (rng.random::<f64>() - 0.5)))).collect();
+            let (_, gradient) = mixture.sample(&posterior, &theta, false).unwrap();
+            let program = &two.artifact.program;
+            let at = |name: String| two.trainable.iter().position(|op| program.operators[*op].name == name).unwrap();
+            for (i, entry) in [(at(format!("{}.gate", second.body)), (2, 1)), (at(format!("{}.out", second.body)), (1, 3)), (at(format!("{}.gate", first.body)), (0, 0)), (at(format!("{}.out", first.body)), (0, 2))] {
+                let h = 1e-6;
+                let (mut up, mut down) = (theta.clone(), theta.clone());
+                up.get_mut(&i).unwrap()[entry] += h;
+                down.get_mut(&i).unwrap()[entry] -= h;
+                let central = (mixture.sample(&posterior, &up, false).unwrap().0 - mixture.sample(&posterior, &down, false).unwrap().0) / (2.0 * h);
+                let analytic = gradient.get(&i).map_or(0.0, |g| g[entry]);
+                assert!((analytic - central).abs() <= 1e-5 * (1.0 + central.abs()), "entry {entry:?} of operator {i}: {analytic} against {central}");
+            }
+            // The planted copy dominates once its weight is learned; hardened, it is one body.
+            mixture.targets[1].components[0].logit = 5.0;
+            assert_eq!(mixture.dominant(&posterior).unwrap(), vec![(1, 0)]);
+            let (merged, calls, pairs) = mixture.harden(&two, &[first.clone(), second.clone()], &posterior).unwrap();
+            assert_eq!(pairs, vec![(second.body.clone(), first.body.clone())]);
+            assert!(calls.iter().all(|c| c.body == first.body));
+            close(&outputs(&start, &family), &outputs(&merged, &family), 1e-9);
+            assert!(mixture.cost(&posterior).unwrap() > 0.0, "the mixture pays for its choice, weights and gauge");
         }
     }
 }
