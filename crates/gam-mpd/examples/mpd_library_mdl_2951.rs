@@ -5,8 +5,8 @@
 //! EXPORT SETTINGS.json OUT host|gpu
 //!
 //! The sequences `held_out = [start, end)` are never fitted (for VPD-4L's `vpd4l_clean4096`, rows
-//! 1024..1056 are `vpd4l_frontier32`); the training sequences are the others among the first
-//! `sequences`. `gpu` is the single-precision device (CUDA in f32 storage, or the Apple GPU). The
+//! 1024..1056 are `vpd4l_frontier32`); the training sequences are the first `training_sequences`
+//! of the others, in order. `gpu` is the single-precision device (CUDA in f32 storage, or the Apple GPU). The
 //! fit is checkpointed in `OUT/checkpoint.bin` after every epoch, with its trajectory readable in
 //! `OUT/checkpoint.json`; rerunning the same command resumes it.
 use gam_gpu::{GpuPolicy, tensor::Device};
@@ -25,7 +25,7 @@ use std::{path::Path, time::Instant};
 #[serde(deny_unknown_fields)]
 struct Settings {
     export_sha256: String,
-    sequences: usize,
+    training_sequences: usize,
     context: usize,
     held_out: [usize; 2],
     fit: library_mdl::Settings,
@@ -47,9 +47,11 @@ fn main() -> Result<(), String> {
         return Err("export hash mismatch".into());
     }
     let [first, end] = settings.held_out;
-    if first >= end || end > settings.sequences || end - first == settings.sequences {
-        return Err("held-out sequences must be a nonempty range leaving training sequences".into());
+    if first >= end || settings.training_sequences == 0 {
+        return Err("held-out sequences must be a nonempty range, and training sequences nonempty".into());
     }
+    // The rows to import: the held-out range and the training sequences around it.
+    let rows = end.max(settings.training_sequences + if settings.training_sequences > first { end - first } else { 0 });
     let checkpoint = out.join("checkpoint.bin");
     if out.exists() && !checkpoint.exists() {
         return Err("a fresh output directory, or one holding this fit's checkpoint, required".into());
@@ -61,7 +63,7 @@ fn main() -> Result<(), String> {
     };
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     let started = Instant::now();
-    let imported = import_language_model(export, settings.sequences, settings.context)?;
+    let imported = import_language_model(export, rows, settings.context)?;
     let layer_count = imported.record["config"]["n_layers"].as_u64().ok_or("config.n_layers")? as usize;
     let native = split_sites(&imported.program)?;
     let layers = layer_nodes(&native, layer_count)?;
@@ -70,7 +72,10 @@ fn main() -> Result<(), String> {
     };
     let sequences: Vec<Vec<u32>> = tokens.chunks(settings.context).map(<[u32]>::to_vec).collect();
     let held_out = &sequences[first..end];
-    let train: Vec<Vec<u32>> = sequences[..first].iter().chain(&sequences[end..]).cloned().collect();
+    let train: Vec<Vec<u32>> = sequences[..first].iter().chain(&sequences[end..]).take(settings.training_sequences).cloned().collect();
+    if train.len() != settings.training_sequences {
+        return Err("the export holds fewer training sequences than asked for".into());
+    }
     let explanation = library_mdl::explanation(&native, &layers)?;
     explanation.artifact.validate_coverage(&native)?;
     let provenance = json!({
