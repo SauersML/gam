@@ -176,7 +176,7 @@ pub fn prefix(flat: &OperatorProgram) -> Result<OperatorProgram, String> {
 /// One of `P`'s read variables at block `block`'s input: the span of the rows `rows` of each of its
 /// dense operators `operator` reading that input (`parts`). A gated MLP function reads through two
 /// operators, its gate's and its input's rows.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReadVariable {
     pub block: usize,
     pub parts: Vec<(usize, Range<usize>)>,
@@ -446,6 +446,83 @@ impl Basis {
 /// ascending order: the experiment design, which is data and carries no gradient.
 pub struct Design {
     bases: Vec<Vec<Arc<Basis>>>,
+}
+
+impl Design {
+    /// A fingerprint of the directions: per experiment and patched block, the block, the kind and
+    /// the basis's values bit for bit.
+    pub fn fingerprint(&self, d: &Device) -> Result<u64, String> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for bases in &self.bases {
+            bases.len().hash(&mut hasher);
+            for basis in bases {
+                (basis.block, basis.complement).hash(&mut hasher);
+                match &basis.span {
+                    Span::Empty => 0u8.hash(&mut hasher),
+                    Span::Whole => 1u8.hash(&mut hasher),
+                    Span::Part(q) => d.download(q).map_err(error)?.iter().for_each(|v| v.to_bits().hash(&mut hasher)),
+                }
+            }
+        }
+        Ok(hasher.finish())
+    }
+}
+
+/// The fixed questions every explanation of one model is asked: `M`'s read variables (those of the
+/// library started at `M`, in [`library_reads`] order) and their rows, which are `M`'s, from the
+/// native program alone. However an explanation was started (at `M`, warm from a fit) or rewritten
+/// (tied, shared, new bodies), its experiments use these variables and these directions, so two
+/// explanations of the model are scored on the same interventions against the same targets.
+pub struct Protocol {
+    variables: Vec<ReadVariable>,
+    operators: BTreeMap<usize, ndarray::Array2<f64>>,
+    blocks: usize,
+    fingerprint: u64,
+}
+
+impl Protocol {
+    /// The protocol of the split native program `native` with its `layers`, imported from the
+    /// export whose digest is `export`.
+    pub fn new(native: &OperatorProgram, layers: &[LayerNodes], export: &str) -> Result<Self, String> {
+        use std::hash::{Hash, Hasher};
+        let start = crate::library_mdl::explanation(native, layers)?;
+        let program = &start.artifact.program;
+        let variables = library_reads(program, layers.len())?;
+        let read: BTreeSet<usize> = variables.iter().flat_map(|v| v.parts.iter().map(|(op, _)| *op)).collect();
+        let operators: BTreeMap<usize, ndarray::Array2<f64>> = read.into_iter().map(|op| (op, program.operators[op].matrix())).collect();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (export, &variables).hash(&mut hasher);
+        for values in operators.values() {
+            values.iter().for_each(|v| v.to_bits().hash(&mut hasher));
+        }
+        Ok(Self { variables, operators, blocks: 2 * layers.len(), fingerprint: hasher.finish() })
+    }
+
+    pub fn variables(&self) -> &[ReadVariable] {
+        &self.variables
+    }
+
+    /// A fingerprint of `experiments` on `batch` under this protocol (the export, `M`'s variables
+    /// and rows, and the experiments): the key of their kept targets.
+    pub fn key(&self, batch: &Batch, experiments: &[Experiment]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (self.fingerprint, fingerprint(batch, experiments)).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The directions of `experiments` (over this protocol's variables) on device `d`: `M`'s.
+    pub fn design(&self, d: &Device, experiments: &[Experiment]) -> Result<Design, String> {
+        let rows_of = |op: usize, rows: &Range<usize>| -> Result<ndarray::Array2<f64>, String> {
+            let all = self.operators.get(&op).ok_or_else(|| error("a read variable outside the protocol's operators"))?;
+            if rows.end > all.nrows() || rows.is_empty() {
+                return Err(error("a read variable outside its operator"));
+            }
+            Ok(all.slice(s![rows.clone(), ..]).to_owned())
+        };
+        design_with(d, self.blocks, &self.variables, experiments, rows_of)
+    }
 }
 
 /// The span of the rows of `rows`: their right singular vectors whose singular values exceed the
@@ -1021,6 +1098,11 @@ pub fn fingerprint(batch: &Batch, experiments: &[Experiment]) -> u64 {
 }
 
 impl Targets {
+    /// Per experiment its rows' `μ` and `Σ p log p`, on the host.
+    pub fn host(&self, d: &Device) -> Result<Vec<(ndarray::Array2<f64>, Vec<f64>)>, String> {
+        self.rows.iter().map(|t| Ok((d.download(&t.mu).map_err(error)?, t.entropy.clone()))).collect()
+    }
+
     /// Write the targets to `path` with the `fingerprint` of their experiments: the fingerprint, then
     /// per experiment its rows and width, `μ` row by row in the device's storage precision (four
     /// bytes per value in f32 storage, eight in float64) and the rows' `Σ p log p` in float64, all
