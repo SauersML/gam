@@ -153,6 +153,7 @@ impl Mutation {
 /// The caller can further freeze controlled operators; fitting and joint
 /// global/local/intervention measurement are external.
 pub struct FitRequest<'a> {
+    pub local_fit: Option<&'a program_learned_dag::LocalFit>,
     pub initialization: Option<&'a program_learned_dag::InitializationReport>,
     pub candidate: &'a Artifact,
     pub mutation: &'a Mutation,
@@ -934,8 +935,11 @@ fn joint_regions(
     settings: &Settings,
 ) -> Result<program_joint_regions::Inventory, String> {
     if let Some(observations) = &settings.joint_observation_places {
-        let remaining = observations.iter().copied()
-            .filter(|n| artifact.place(*n).is_some()).collect::<Vec<_>>();
+        let remaining = observations
+            .iter()
+            .copied()
+            .filter(|n| artifact.place(*n).is_some())
+            .collect::<Vec<_>>();
         program_joint_regions::propose_regions_with_observations(artifact, limits, &remaining)
     } else {
         program_joint_regions::propose_regions(artifact, limits)
@@ -951,22 +955,21 @@ fn shared_dag_moves(
     let Some(shared) = &settings.shared_dag_search else {
         return vec![];
     };
-    let inventory =
-        match joint_regions(artifact, shared.region_limits.clone(), settings) {
-            Ok(inventory) => inventory,
-            Err(error) => {
-                report.counts.shared_dag_enumeration_failures += 1;
-                report
-                    .joint_region_enumerations
-                    .push(JointRegionEnumeration {
-                        parent_id,
-                        depth,
-                        inventory: None,
-                        error: Some(error),
-                    });
-                return vec![];
-            }
-        };
+    let inventory = match joint_regions(artifact, shared.region_limits.clone(), settings) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            report.counts.shared_dag_enumeration_failures += 1;
+            report
+                .joint_region_enumerations
+                .push(JointRegionEnumeration {
+                    parent_id,
+                    depth,
+                    inventory: None,
+                    error: Some(error),
+                });
+            return vec![];
+        }
+    };
     report.counts.joint_region_states_explored += inventory.explored_states;
     report.counts.joint_regions_proposed += inventory.regions.len();
     report.counts.joint_region_inventories_truncated += usize::from(inventory.truncated);
@@ -1133,24 +1136,22 @@ fn learned_dag_moves(
     let Some(config) = &settings.learned_dag_search else {
         return vec![];
     };
-    let regions =
-        match joint_regions(artifact, config.region_limits.clone(), settings) {
-            Ok(inventory) => {
-                report.counts.learned_dag_enumerations_truncated +=
-                    usize::from(inventory.truncated);
-                inventory.regions
-            }
-            Err(error) => {
-                report.learned_dag_enumerations.push(LearnedDAGEnumeration {
-                    parent_id,
-                    depth,
-                    region: None,
-                    inventory: None,
-                    error: Some(error),
-                });
-                return vec![];
-            }
-        };
+    let regions = match joint_regions(artifact, config.region_limits.clone(), settings) {
+        Ok(inventory) => {
+            report.counts.learned_dag_enumerations_truncated += usize::from(inventory.truncated);
+            inventory.regions
+        }
+        Err(error) => {
+            report.learned_dag_enumerations.push(LearnedDAGEnumeration {
+                parent_id,
+                depth,
+                region: None,
+                inventory: None,
+                error: Some(error),
+            });
+            return vec![];
+        }
+    };
     let mut seen = BTreeSet::new();
     let mut lists = std::collections::VecDeque::new();
     let mut checked = 0;
@@ -1264,8 +1265,12 @@ where
 {
     if let Some(observations) = &settings.joint_observation_places {
         let unique = observations.iter().copied().collect::<BTreeSet<_>>();
-        if unique.len() != observations.len() || unique.iter().any(|n| *n >= initial.artifact.native_nodes) {
-            return Err("joint observation places must be unique original native node identities".into());
+        if unique.len() != observations.len()
+            || unique.iter().any(|n| *n >= initial.artifact.native_nodes)
+        {
+            return Err(
+                "joint observation places must be unique original native node identities".into(),
+            );
         }
     }
     if settings.max_depth == 0
@@ -1644,6 +1649,7 @@ where
                 let parent = &resident[&parent_id].evaluated;
                 let mut learned_parameters = None;
                 let mut initialization = None;
+                let mut local_fit = None;
                 let proposed = match &mutation {
                     Mutation::SynthesizeLearnedDAG {
                         region,
@@ -1662,6 +1668,7 @@ where
                             &config.grammar,
                         )
                         .map(|applied| {
+                            local_fit = Some(applied.local_fit);
                             learned_parameters = Some(applied.trainable_operator_ids);
                             initialization = Some(applied.initialization);
                             applied.artifact
@@ -1752,6 +1759,7 @@ where
                 result.report.counts.shared_dag_callback_calls += usize::from(is_shared);
                 result.report.counts.learned_dag_callback_calls += usize::from(is_learned);
                 let fitted = match fit_and_measure(FitRequest {
+                    local_fit: local_fit.as_ref(),
                     initialization: initialization.as_ref(),
                     candidate: &proposed,
                     mutation: &mutation,
@@ -1867,8 +1875,8 @@ where
 mod tests {
     use super::*;
     use crate::operator_program::{
-        Coefficient, Declarations, FamilyInputs, Interface, Law, Operator, Provenance, Slot,
-        SlotValues, exact_precision,
+        exact_precision, Coefficient, Declarations, FamilyInputs, Interface, Law, Operator,
+        Provenance, Slot, SlotValues,
     };
     use ndarray::array;
     use std::sync::Arc;
@@ -2216,20 +2224,16 @@ mod tests {
         let final_state = recovered.candidates.iter().find(|c| c.depth == 2).unwrap();
         let decoded =
             Artifact::from_bytes(&final_state.artifact_bytes, &native.declarations).unwrap();
-        assert!(
-            decoded
-                .program
-                .operators
-                .iter()
-                .any(|o| matches!(&o.body,OperatorBody::Dense{values,..} if values[(0,0)]==2.5))
-        );
-        assert!(
-            result
-                .report
-                .admitted_candidates
-                .iter()
-                .any(|c| c.depth == 2 && c.evaluation.fidelity[0].value > 0.)
-        );
+        assert!(decoded
+            .program
+            .operators
+            .iter()
+            .any(|o| matches!(&o.body,OperatorBody::Dense{values,..} if values[(0,0)]==2.5)));
+        assert!(result
+            .report
+            .admitted_candidates
+            .iter()
+            .any(|c| c.depth == 2 && c.evaluation.fidelity[0].value > 0.));
     }
     #[test]
     fn noncanonical_measurements_are_rejected() {
@@ -2259,12 +2263,10 @@ mod tests {
             |request| Ok(evaluated(request.candidate, &native)),
         )
         .unwrap();
-        assert!(
-            result
-                .candidates
-                .iter()
-                .all(|c| c.evaluated.artifact.place(2).is_some())
-        );
+        assert!(result
+            .candidates
+            .iter()
+            .all(|c| c.evaluated.artifact.place(2).is_some()));
         assert!(result.report.attempts.iter().any(|a| {
             a.reason
                 .as_deref()
@@ -2305,10 +2307,9 @@ mod tests {
         };
         let ids = trainables(&decoded, &mutation).unwrap();
         assert_eq!(ids.len(), 1);
-        assert!(
-            ids.iter()
-                .all(|id| decoded.program.operators[*id].matrix()[(0, 0)] == 3.)
-        );
+        assert!(ids
+            .iter()
+            .all(|id| decoded.program.operators[*id].matrix()[(0, 0)] == 3.));
     }
     #[test]
     fn compound_reuse_reaches_fitting_before_small_budget_expires() {
@@ -2533,12 +2534,10 @@ mod tests {
             ],
             output: 1,
         };
-        assert!(
-            !native
-                .nodes
-                .iter()
-                .any(|n| matches!(n, Node::Hadamard { .. }))
-        );
+        assert!(!native
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Node::Hadamard { .. })));
         let mut configuration = settings(1);
         configuration.max_callback_calls = 3;
         configuration.max_move_attempts = 3;
@@ -2565,14 +2564,12 @@ mod tests {
                 let measured = evaluated(request.candidate, &native);
                 if let Mutation::SynthesizeExpression { expression, .. } = request.mutation {
                     assert!(request.trainable_operator_ids.is_empty());
-                    assert!(
-                        measured
-                            .artifact
-                            .program
-                            .operators
-                            .iter()
-                            .all(|o| !matches!(o.body, OperatorBody::Dense { .. }))
-                    );
+                    assert!(measured
+                        .artifact
+                        .program
+                        .operators
+                        .iter()
+                        .all(|o| !matches!(o.body, OperatorBody::Dense { .. })));
                     saved.push((expression.clone(), measured.artifact.to_bytes().unwrap()));
                 }
                 Ok(measured)
@@ -2589,13 +2586,11 @@ mod tests {
         assert!(result.report.admitted_candidates.iter().any(|c| matches!(&c.mutation, Some(Mutation::SynthesizeExpression { expression, .. }) if expression == &wanted)));
         let bytes = &saved.iter().find(|(e, _)| e == &wanted).unwrap().1;
         let artifact = Artifact::from_bytes(bytes, &native.declarations).unwrap();
-        assert!(
-            artifact
-                .program
-                .rules
-                .iter()
-                .any(|r| r.nodes.iter().any(|n| matches!(n, Node::Hadamard { .. })))
-        );
+        assert!(artifact
+            .program
+            .rules
+            .iter()
+            .any(|r| r.nodes.iter().any(|n| matches!(n, Node::Hadamard { .. }))));
         let output = artifact.execute(&inputs(&native)).unwrap();
         let expected = native.execute(&inputs(&native), false).unwrap();
         assert_eq!(
@@ -2701,6 +2696,21 @@ mod tests {
             |request| {
                 if matches!(request.mutation, Mutation::SynthesizeLearnedDAG { .. }) {
                     assert!(!request.trainable_operator_ids.is_empty());
+                    let local = request
+                        .local_fit
+                        .expect("learned callback receives local program");
+                    assert_eq!(
+                        local
+                            .owner_mapping
+                            .iter()
+                            .map(|(_, grafted)| *grafted)
+                            .collect::<Vec<_>>(),
+                        request.trainable_operator_ids
+                    );
+                    assert_eq!(
+                        local.trainable_operator_ids.len(),
+                        request.trainable_operator_ids.len()
+                    );
                     let mut fitted = request.candidate.clone();
                     for &id in request.trainable_operator_ids {
                         assert!(matches!(
@@ -2726,14 +2736,12 @@ mod tests {
                         .expect("native output operator remains frozen");
                     let mut invalid = fitted.clone();
                     invalid.program.operators[frozen] = dense(4.);
-                    assert!(
-                        validate_fit_structure(
-                            request.candidate,
-                            &invalid,
-                            request.trainable_operator_ids
-                        )
-                        .is_err()
-                    );
+                    assert!(validate_fit_structure(
+                        request.candidate,
+                        &invalid,
+                        request.trainable_operator_ids
+                    )
+                    .is_err());
                     let encoded =
                         serde_json::to_value(request.mutation).expect("mutation encoding");
                     assert_eq!(encoded["kind"], "synthesize_learned_dag");
@@ -2791,13 +2799,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.report.counts.shared_dag_callback_calls, 1);
-        assert!(
-            result
-                .report
-                .admitted_candidates
-                .iter()
-                .any(|c| matches!(c.mutation, Some(Mutation::SynthesizeSharedDAG { .. })))
-        );
+        assert!(result
+            .report
+            .admitted_candidates
+            .iter()
+            .any(|c| matches!(c.mutation, Some(Mutation::SynthesizeSharedDAG { .. }))));
         let decoded = Artifact::from_bytes(&saved.unwrap(), &native.declarations).unwrap();
         assert_eq!(
             decoded
@@ -2866,25 +2872,21 @@ mod tests {
         ));
         assert_eq!(result.report.admitted_candidates.len(), 1);
         configuration.max_callback_calls = 1;
-        assert!(
-            search(
-                &native,
-                evaluated(&Artifact::native(&native).unwrap(), &native),
-                &configuration,
-                &constraints(),
-                |_| panic!("invalid sums must not run")
-            )
-            .unwrap_err()
-            .contains("budgets")
-        );
+        assert!(search(
+            &native,
+            evaluated(&Artifact::native(&native).unwrap(), &native),
+            &configuration,
+            &constraints(),
+            |_| panic!("invalid sums must not run")
+        )
+        .unwrap_err()
+        .contains("budgets"));
         let mut legacy = serde_json::to_value(settings(1)).unwrap();
         legacy.as_object_mut().unwrap().remove("shared_dag_search");
-        assert!(
-            serde_json::from_value::<Settings>(legacy)
-                .unwrap()
-                .shared_dag_search
-                .is_none()
-        );
+        assert!(serde_json::from_value::<Settings>(legacy)
+            .unwrap()
+            .shared_dag_search
+            .is_none());
     }
     #[test]
     fn equivalent_permutation_proposals_are_deduplicated_before_failed_callbacks() {
@@ -2977,7 +2979,8 @@ mod tests {
         assert_eq!(per_cut[&(vec![2], vec![3, 4], vec![3, 4])], 1);
         assert_eq!(result.report.shared_dag_schedules.len(), 2);
         assert_eq!(
-            result.report
+            result
+                .report
                 .shared_dag_schedules
                 .iter()
                 .map(|s| s.unique_proposals)
@@ -3028,11 +3031,9 @@ mod tests {
             .as_mut()
             .unwrap()
             .max_callback_calls = configuration.max_callback_calls + 1;
-        assert!(
-            run(&configuration)
-                .unwrap_err()
-                .contains("global work/callback budgets")
-        );
+        assert!(run(&configuration)
+            .unwrap_err()
+            .contains("global work/callback budgets"));
     }
     #[test]
     fn scarce_expression_callbacks_cover_multiple_native_writes_first() {

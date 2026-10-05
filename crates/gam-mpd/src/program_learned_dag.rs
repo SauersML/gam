@@ -6,8 +6,8 @@ use crate::{
     artifact::Artifact,
     composed_rule_search::{Binary, Unary},
     operator_program::{
-        Coefficient, Declarations, Interface, Law, Node, Operator, OperatorBody, OperatorProgram,
-        Slot, exact_precision,
+        exact_precision, remap_node, Coefficient, Declarations, Interface, Law, Node, Operator,
+        OperatorBody, OperatorProgram, Slot,
     },
     program_joint_regions::{self as joint, Exit, JointBody},
 };
@@ -87,10 +87,153 @@ pub struct Inventory {
     pub priority: String,
 }
 pub struct Applied {
+    pub local_fit: LocalFit,
     pub initialization: InitializationReport,
     pub artifact: Artifact,
     pub trainable_operator_ids: Vec<usize>,
     pub node_mapping: Vec<usize>,
+}
+/// Local replacement and exact compaction mapping, retained only for its fitting callback.
+/// Inputs follow the actual argument binding; outputs follow declared native exits.
+pub struct LocalFit {
+    pub program: OperatorProgram,
+    pub trainable_operator_ids: Vec<usize>,
+    pub owner_mapping: Vec<(usize, usize)>,
+    pub input_native_places: Vec<usize>,
+    pub output_native_places: Vec<usize>,
+    pub output_nodes: Vec<usize>,
+}
+impl LocalFit {
+    /// Transfer coefficients only, after checking every destination before mutation.
+    pub fn transfer(
+        &self,
+        fitted: &OperatorProgram,
+        candidate: &mut Artifact,
+    ) -> Result<(), String> {
+        let original = &self.program;
+        if fitted.declarations != original.declarations
+            || fitted.bases != original.bases
+            || fitted.rules != original.rules
+            || fitted.nodes != original.nodes
+            || fitted.output != original.output
+            || fitted.operators.len() != original.operators.len()
+        {
+            return Err("local fit changed replacement graph".into());
+        }
+        fitted.interfaces().map_err(|e| e.to_string())?;
+        let owners = self
+            .trainable_operator_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if self
+            .owner_mapping
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<BTreeSet<_>>()
+            != owners
+            || self
+                .owner_mapping
+                .iter()
+                .map(|(_, id)| *id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.owner_mapping.len()
+        {
+            return Err("local fit owner mapping is not a bijection".into());
+        }
+        for (id, (before, after)) in original.operators.iter().zip(&fitted.operators).enumerate() {
+            if !owners.contains(&id) {
+                if before != after {
+                    return Err("local fit changed frozen operator".into());
+                }
+                continue;
+            }
+            let compatible = before.name == after.name
+                && before.rows == after.rows
+                && before.cols == after.cols
+                && before.provenance == after.provenance
+                && matches!((&before.body, &after.body),
+                    (OperatorBody::Dense {present:a, values:av, ..}, OperatorBody::Dense {present:b, values:bv, ..}) if a == b && av.dim() == bv.dim() && bv.iter().all(|v| v.is_finite()));
+            if !compatible {
+                return Err("local fit changed dense owner structure".into());
+            }
+        }
+        for &(local, grafted) in &self.owner_mapping {
+            if local >= original.operators.len() || grafted >= candidate.program.operators.len() {
+                return Err("local fit owner mapping is out of range".into());
+            }
+            if candidate.program.operators.get(grafted) != original.operators.get(local) {
+                return Err("local fit grafted owner mapping is stale".into());
+            }
+        }
+        for &(local, grafted) in &self.owner_mapping {
+            candidate.program.operators[grafted] = Arc::clone(&fitted.operators[local]);
+        }
+        Ok(())
+    }
+}
+fn standalone_local(
+    inputs: &[Interface],
+    nodes: &[Node],
+    operators: &[Operator],
+    exits: &[usize],
+) -> Result<(OperatorProgram, Vec<usize>), String> {
+    let mut output = Vec::new();
+    let mut pool = operators.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+    let mut mapping = vec![usize::MAX; nodes.len()];
+    let operator_ids = (0..operators.len()).collect::<Vec<_>>();
+    for (id, node) in nodes.iter().enumerate() {
+        if let Node::Param { index } = node {
+            let native = Interface::native(inputs[*index].width()).map_err(|e| e.to_string())?;
+            output.push(Node::Raw { slot: *index });
+            if native != inputs[*index] {
+                let op = pool.len();
+                pool.push(Arc::new(
+                    Operator::dense(
+                        "fixed local input grouping",
+                        inputs[*index].clone(),
+                        native,
+                        Array2::eye(inputs[*index].width()),
+                        exact_precision([0., 1.]).map_err(|e| e.to_string())?,
+                        Default::default(),
+                    )
+                    .map_err(|e| e.to_string())?,
+                ));
+                output.push(Node::Affine {
+                    terms: vec![(output.len() - 1, op)],
+                    bias: None,
+                });
+            }
+        } else {
+            let mut copied = node.clone();
+            remap_node(&mut copied, &mapping, &operator_ids, &[], &[]);
+            output.push(copied);
+        }
+        mapping[id] = output.len() - 1;
+    }
+    let output_nodes = exits.iter().map(|id| mapping[*id]).collect::<Vec<_>>();
+    let output_id = output.len();
+    output.push(Node::Concat {
+        parts: output_nodes.clone(),
+    });
+    let program = OperatorProgram {
+        declarations: Declarations {
+            domains: vec![],
+            slots: inputs
+                .iter()
+                .map(|ty| Slot::Raw { width: ty.width() })
+                .collect(),
+            parameters: 0,
+        },
+        bases: vec![],
+        rules: vec![],
+        operators: pool,
+        nodes: output,
+        output: output_id,
+    };
+    program.interfaces().map_err(|e| e.to_string())?;
+    Ok((program, output_nodes))
 }
 pub struct Compiled {
     pub initialization: InitializationReport,
@@ -1603,6 +1746,8 @@ pub fn apply(
         .values()
         .flat_map(|(a, b)| std::iter::once(*a).chain(*b))
         .collect::<Vec<_>>();
+    let (mut local_program, local_outputs) =
+        standalone_local(&inputs, &builder.nodes, &builder.operators, &exits)?;
     let mut body = JointBody {
         inputs,
         nodes: builder.nodes,
@@ -1658,7 +1803,28 @@ pub fn apply(
             .bias_operator
             .map(|id| mapped.operator_mapping[a.program.operators.len() + id]);
     }
+    // Reuse the exact grafted owner Arcs after compaction; adapters exist only in the training wrapper.
+    for local in 0..body.operators.len() {
+        let grafted = mapped.operator_mapping[a.program.operators.len() + local];
+        if grafted != usize::MAX {
+            local_program.operators[local] =
+                Arc::clone(&mapped.artifact.program.operators[grafted]);
+        }
+    }
+    let local_fit = LocalFit {
+        program: local_program,
+        trainable_operator_ids: local_trainables.clone(),
+        owner_mapping: local_trainables
+            .iter()
+            .copied()
+            .zip(trainable_operator_ids.iter().copied())
+            .collect(),
+        input_native_places: args.to_vec(),
+        output_native_places: r.native_writes.clone(),
+        output_nodes: local_outputs,
+    };
     Ok(Applied {
+        local_fit,
         initialization,
         artifact: mapped.artifact,
         trainable_operator_ids,
@@ -1701,6 +1867,139 @@ mod tests {
             bias: false,
         }
     }
+    #[test]
+    fn local_training_wrapper_preserves_grouped_boundary_laws() {
+        let grouped = Interface::uniform(2, 1, crate::operator_program::LabelKind::Native, 3)
+            .expect("groups");
+        let (program, outputs) = standalone_local(
+            &[grouped.clone()],
+            &[
+                Node::Param { index: 0 },
+                Node::Pointwise {
+                    input: 0,
+                    laws: vec![Law::Relu, Law::Identity],
+                },
+            ],
+            &[],
+            &[1],
+        )
+        .expect("grouped local wrapper");
+        assert_eq!(program.interfaces().expect("types")[outputs[0]], grouped);
+        let family = FamilyInputs {
+            rows: 1,
+            slots: vec![SlotValues::Raw(array![[-1., -2.]])],
+            layout: None,
+        };
+        assert_eq!(
+            program.execute(&family, false).expect("laws").values[program.output],
+            array![[0., -2.]]
+        );
+        assert_eq!(
+            program.operators.len(),
+            1,
+            "only fixed training regrouping adapter"
+        );
+    }
+
+    #[test]
+    fn local_fit_handoff_transfers_shared_owners_and_ordered_exits() {
+        let ty = Interface::native(2).expect("type");
+        let z = Expr::Unary(
+            Unary::Silu,
+            Box::new(projection(0, TypeRef::Input(0), Expr::Argument(0))),
+        );
+        let equations = vec![
+            z.clone(),
+            projection(1, TypeRef::Exit(1), z.clone()),
+            projection(1, TypeRef::Exit(2), Expr::Unary(Unary::Relu, Box::new(z))),
+        ];
+        let s = settings();
+        let parent = compile_program(&[ty.clone()], &[ty.clone(), ty.clone(), ty], &equations, &s)
+            .expect("parent");
+        let native = Artifact::native(&parent.program).expect("native");
+        let inventory = joint::propose_regions(
+            &native,
+            joint::Limits {
+                max_internal_nodes: 8,
+                max_inputs: 3,
+                max_exits: 4,
+                max_regions: 1000,
+                max_states: 10000,
+            },
+        )
+        .expect("native inventory");
+        // Select the actual enumerated whole-window member to test this implementation interface.
+        let region = inventory
+            .regions
+            .iter()
+            .find(|r| r.native_reads == vec![0] && r.native_writes == parent.output_nodes)
+            .expect("enumerated complete nonlinear window");
+        let applied = apply(&native, region, &equations, &[0], &s).expect("graft");
+        let handoff = &applied.local_fit;
+        assert_eq!(handoff.input_native_places, vec![0]);
+        assert_eq!(handoff.output_native_places, parent.output_nodes);
+        assert_eq!(handoff.owner_mapping.len(), 2);
+        for &(local, grafted) in &handoff.owner_mapping {
+            assert!(Arc::ptr_eq(
+                &handoff.program.operators[local],
+                &applied.artifact.program.operators[grafted]
+            ));
+        }
+        let shared = handoff.trainable_operator_ids[1];
+        assert_eq!(
+            handoff
+                .program
+                .nodes
+                .iter()
+                .filter(|n| n.operators().contains(&shared))
+                .count(),
+            2
+        );
+        let mut fitted = handoff.program.clone();
+        for &id in &handoff.trainable_operator_ids {
+            let OperatorBody::Dense {
+                values, precision, ..
+            } = &mut Arc::make_mut(&mut fitted.operators[id]).body
+            else {
+                panic!("dense owner")
+            };
+            values.mapv_inplace(|v| 2. * v + 0.125);
+            *precision = exact_precision(values.iter().copied()).expect("precision");
+        }
+        let mut candidate = applied.artifact.clone();
+        handoff
+            .transfer(&fitted, &mut candidate)
+            .expect("mapped transfer");
+        let family = FamilyInputs {
+            rows: 3,
+            slots: vec![SlotValues::Raw(array![[1., -2.], [0.5, 3.], [-1., 0.25]])],
+            layout: None,
+        };
+        let local_trace = fitted
+            .execute(&family, false)
+            .expect("local fit evaluation");
+        let grafted = candidate.execute(&family).expect("grafted evaluation");
+        assert_eq!(
+            local_trace.values[fitted.output],
+            grafted.values[candidate.program.output]
+        );
+        let saved = Artifact::from_bytes(
+            &candidate.to_bytes().expect("encode"),
+            &candidate.program.declarations,
+        )
+        .expect("decode");
+        assert_eq!(
+            saved.execute(&family).expect("replay").values[saved.program.output],
+            grafted.values[candidate.program.output]
+        );
+        let before = candidate.program.operators.clone();
+        assert!(
+            handoff.transfer(&fitted, &mut candidate).is_err(),
+            "stale mapping is refused atomically"
+        );
+        assert_eq!(before, candidate.program.operators);
+    }
+
     #[test]
     fn distinct_named_projections_and_shared_latent_survive_codec() {
         let ty = Interface::native(2).expect("native vector");
@@ -1825,14 +2124,12 @@ mod tests {
                 .contains("max_parameter_elements")
         );
         s.latent_widths = vec![0];
-        assert!(
-            enumerate_interfaces(
-                &[Interface::native(1).expect("input")],
-                &vec![Interface::native(1).expect("output"); 2],
-                &s
-            )
-            .is_err()
-        );
+        assert!(enumerate_interfaces(
+            &[Interface::native(1).expect("input")],
+            &vec![Interface::native(1).expect("output"); 2],
+            &s
+        )
+        .is_err());
     }
     #[test]
     fn generated_sharing_seeds_reach_native_width_class_without_supplied_equations() {
@@ -1987,11 +2284,10 @@ mod tests {
             &[0],
             &parent.output_nodes,
         );
-        assert!(
-            tied.err()
-                .expect("unequal parent readers cannot be tied")
-                .contains("shared candidate owner")
-        );
+        assert!(tied
+            .err()
+            .expect("unequal parent readers cannot be tied")
+            .contains("shared candidate owner"));
         let reader_a = parent.initialization.owners[2].matrix_operator;
         let reader_b = parent.initialization.owners[3].matrix_operator;
         parent.program.operators[reader_b] = parent.program.operators[reader_a].clone();
@@ -2004,12 +2300,10 @@ mod tests {
             &[0],
             &parent.output_nodes,
         );
-        assert!(
-            bias_conflict
-                .err()
-                .expect("equal matrices with unequal biases cannot be tied")
-                .contains("shared candidate owner")
-        );
+        assert!(bias_conflict
+            .err()
+            .expect("equal matrices with unequal biases cannot be tied")
+            .contains("shared candidate owner"));
     }
     #[test]
     fn bias_free_parent_embeds_with_zero_candidate_bias_and_nonzero_bias_is_not_dropped() {
@@ -2183,13 +2477,11 @@ mod tests {
         )
         .expect("coordinate-preserving group adaptation");
         assert_eq!(inherited.initialization.random_elements, 0);
-        assert!(
-            inherited
-                .initialization
-                .owners
-                .iter()
-                .all(|o| o.interfaces_relabelled)
-        );
+        assert!(inherited
+            .initialization
+            .owners
+            .iter()
+            .all(|o| o.interfaces_relabelled));
         assert!(!inherited.trainable_operator_ids.contains(&adapter));
     }
 

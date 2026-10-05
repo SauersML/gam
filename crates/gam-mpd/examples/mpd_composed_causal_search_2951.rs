@@ -250,12 +250,20 @@ struct Settings {
     structural_search: Option<StructuralSettings>,
     #[serde(default)]
     joint_response_search: Option<program_learned_dag::Settings>,
+    #[serde(default)]
+    joint_local_fit: Option<JointLocalFit>,
     controls: Vec<NativeControl>,
     cases: Vec<Case>,
     fit: FitSettings,
     seed: u64,
     #[serde(default)]
     evaluation: Option<Evaluation>,
+}
+#[derive(Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct JointLocalFit {
+    optimizer: gam_mpd::resident_rule_fit::Settings,
+    batch: gam_mpd::resident_rule_fit::BatchSchedule,
 }
 #[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -647,6 +655,10 @@ struct StructuralSettings {
     /// Separate from the unchanged teacher-input Local acceptance diagnostic.
     #[serde(default)]
     native_response_weight: Option<f64>,
+    /// Local training on clean and candidate-reached native boundary states,
+    /// before the unchanged composed intervention fit. One capture per proposal.
+    #[serde(default)]
+    local_fit: Option<JointLocalFit>,
 }
 fn empty_grammar() -> Grammar {
     Grammar {
@@ -2370,6 +2382,20 @@ fn structural_run(
                 }
                 let mut fitted_responses = None;
                 if !request.trainable_operator_ids.is_empty() {
+                    if let (Some(config), Some(binding)) = (&structural.local_fit, request.local_fit) {
+                        let (panels, provenance) = capture_structural_local_targets(
+                            &controlled.program, &candidate, binding, &training.metadata,
+                            config.optimizer.numeric_bytes)?;
+                        save(&root.join("LOCAL_SUPERVISION.json"), &provenance)?;
+                        let (local_program, nonlinear) = prefit_joint_nonlinear(
+                            d, &binding.program, &binding.trainable_operator_ids, &panels, config)?;
+                        let (local_program, linear) = prefit_joint_linear(
+                            d, &local_program, &binding.trainable_operator_ids, &panels,
+                            config.optimizer.numeric_bytes)?;
+                        binding.transfer(&local_program, &mut candidate)?;
+                        save(&root.join("LOCAL_NONLINEAR_PREFIT.json"), &nonlinear)?;
+                        save(&root.join("LOCAL_LINEAR_PREFIT.json"), &linear)?;
+                    }
                     let fitted = if let Some(weight) = structural.native_response_weight {
                         let (response_targets, provenance) = if let Some(edits) = parameter_edits {
                             parameter_edit_response_targets(
@@ -2642,6 +2668,57 @@ struct JointLocalTargets {
     inputs: Vec<Array2<f64>>,
     targets: Array2<f64>,
     groups: Vec<gam_mpd::resident_rule_fit::OutputGroup>,
+    state_source: &'static str,
+}
+
+/// Preserve ordinary native states and add native labels on the candidate's
+/// incoming states. Each episode keeps its original complete attention layout.
+fn capture_structural_local_targets(
+    native: &OperatorProgram,
+    candidate: &Artifact,
+    binding: &program_learned_dag::LocalFit,
+    episodes: &[ResponseEpisode],
+    numeric_bytes: usize,
+) -> Result<(JointLocalTargets, Value), String> {
+    let native_artifact = Artifact::native(native)?;
+    let mut panels = Vec::new();
+    let mut retained = 0usize;
+    for episode in episodes {
+        for (source, artifact) in [("native", &native_artifact), ("candidate", candidate)] {
+            let panel = gam_mpd::native_local_supervision::capture(native, artifact,
+                &binding.input_native_places, &binding.output_native_places, &episode.inputs,
+                numeric_bytes.checked_sub(retained).ok_or("local panel budget exhausted")?)?;
+            let elements = panel.inputs.iter().map(|v| v.len()).chain(std::iter::once(panel.targets.len()))
+                .try_fold(0usize, |a, b| a.checked_add(b).ok_or("local panel size overflow"))?;
+            retained = retained.checked_add(elements.checked_mul(8).ok_or("local panel size overflow")?)
+                .ok_or("local panel size overflow")?;
+            if retained.checked_mul(2).ok_or("local panel size overflow")? > numeric_bytes {
+                return Err("local panel concatenation exceeds numeric budget".into());
+            }
+            panels.push((episode.label.clone(), source, panel));
+        }
+    }
+    let first = &panels.first().ok_or("local supervision episodes absent")?.2;
+    let mut start = 0;
+    let groups = first.report.output_widths.iter().enumerate().map(|(i, width)| {
+        let end = start + width;
+        let group = gam_mpd::resident_rule_fit::OutputGroup {
+            label: format!("native{}", binding.output_native_places[i]), start, end,
+        };
+        start = end;
+        group
+    }).collect();
+    let inputs = (0..binding.input_native_places.len()).map(|i|
+        ndarray::concatenate(ndarray::Axis(0), &panels.iter().map(|(_,_,p)| p.inputs[i].view()).collect::<Vec<_>>())
+            .map_err(|e| e.to_string())).collect::<Result<Vec<_>, _>>()?;
+    let targets = ndarray::concatenate(ndarray::Axis(0),
+        &panels.iter().map(|(_,_,p)| p.targets.view()).collect::<Vec<_>>()).map_err(|e|e.to_string())?;
+    let provenance = json!({"episodes":panels.iter().map(|(label,source,p)|
+        json!({"label":label,"state_source":source,"capture":p.report})).collect::<Vec<_>>(),
+        "retained_panel_bytes":retained,"refreshes":1,
+        "scope":"TRAIN only: native states plus candidate-reached states with the native operation evaluated at those same inputs. Capture precedes fitting once per proposal. No heldout states and no inference-time native oracle. Host prefix capture avoids the output vocabulary."});
+    Ok((JointLocalTargets { inputs, targets, groups,
+        state_source: "TRAIN native and candidate-reached states, native labels evaluated on the same incoming states; one capture per proposal" }, provenance))
 }
 
 /// Training-only native values. The returned program still computes every value itself.
@@ -2682,7 +2759,7 @@ fn capture_joint_local_targets(
         start = end;
         group
     }).collect();
-    Ok(JointLocalTargets { inputs, targets, groups })
+    Ok(JointLocalTargets { inputs, targets, groups, state_source: "Fixed native TRAIN states" })
 }
 
 fn prefit_joint_linear(
@@ -2700,11 +2777,45 @@ fn prefit_joint_linear(
     let proposed = measure(&fit.program)?;
     let accepted = proposed.maximum < initial.maximum;
     let report = json!({"initial":initial,"proposed":proposed,"accepted":accepted,
-        "linear_fit":fit.report,"selection":"Strict improvement of full TRAIN normalized maximum; no validation used. Fixed native input states only; no hybrid-state refresh yet. Local least squares is a proposal, not the acceptance objective."});
+        "linear_fit":fit.report,"state_source":targets.state_source,"selection":"Strict improvement of full TRAIN normalized maximum; no validation used. Local least squares is a proposal, not the acceptance objective."});
     Ok((if accepted { fit.program } else { program.clone() }, report))
 }
 
+/// Cached clean and response supervision only; the complete program still executes itself.
+fn prefit_joint_nonlinear(
+    d: &Device,
+    program: &OperatorProgram,
+    trainable: &[usize],
+    targets: &JointLocalTargets,
+    settings: &JointLocalFit,
+) -> Result<(OperatorProgram, Value), String> {
+    let started = Instant::now();
+    let measure = |p: &OperatorProgram| gam_mpd::resident_rule_fit::measure_grouped(
+        d, p, &targets.inputs, &targets.targets, &targets.groups,
+        settings.optimizer.numeric_bytes, settings.optimizer.forward_rows);
+    let initial = measure(program)?;
+    let scope = "Cached local TRAIN supervision only. The fitter's required validation argument repeats TRAIN and is not heldout evidence; neither validation nor final-model KL selects these updates. Ordinary f64 full-TRAIN maximum decides whether to keep this proposal before terminal linear refitting. Subsequent composed intervention fitting and evaluation remain separate.";
+    if initial.maximum == 0. || trainable.is_empty() {
+        return Ok((program.clone(), json!({"initial":initial,"proposed":initial,"accepted":false,
+            "settings":settings,"state_source":targets.state_source,"skip_reason":if trainable.is_empty(){"no_trainable_owners"}else{"zero_train_error"},
+            "seconds":started.elapsed().as_secs_f64(),"scope":scope})));
+    }
+    let fitted = gam_mpd::resident_rule_fit::fit_grouped_batched(
+        d, program, &targets.inputs, &targets.targets,
+        &targets.inputs, &targets.targets, &targets.groups, trainable,
+        settings.optimizer.clone(), settings.batch.clone())?;
+    let proposed = measure(&fitted.program)?;
+    let accepted = proposed.maximum < initial.maximum;
+    let report = json!({"initial":initial,"proposed":proposed,"accepted":accepted,
+        "settings":settings,"state_source":targets.state_source,"optimizer_report":fitted.report,"diagnostic_validation_source":"TRAIN repeated; not heldout",
+        "seconds":started.elapsed().as_secs_f64(),"scope":scope});
+    Ok((if accepted { fitted.program } else { program.clone() }, report))
+}
+
 fn validate_joint_configuration(settings: &Settings) -> Result<(), String> {
+    if settings.joint_local_fit.is_some() && settings.joint_response_search.is_none() {
+        return Err("joint_local_fit requires joint_response_search".into());
+    }
     if settings.joint_response_search.is_some()
         && (settings.width != 0
             || !settings.expression_ids.is_empty()
@@ -3054,7 +3165,7 @@ fn run() -> Result<(), String> {
         "native_codec_bytes":settings.native_codec_bytes,"native_codec_initialization_seconds":native_codec_initialization_seconds,"native_codec_preflight":native_codec.as_ref().map(|c|c.preflight()),"native_codec_stats":native_codec.as_ref().map(|c|c.stats()),
         "native_codec_budget_scope":"packed native codewords plus cached decoded numeric buffers only; excludes caller-owned source arrays, per-operator construction/lattice temporaries, full messages, label/execution buffers, metadata and allocator/library overhead; construction excluded from warm timings",
         "literal_down_arithmetic":"binary64 stored D updates in declared order D += a*u*v; original graph executes updated matrix; no float32 checkpoint-store or augmented-branch bitwise equivalence claim",
-        "joint_response_search":settings.joint_response_search,"joint_search_scope":"bounded enumerated learned multi-output DAG; exactly one declared down layer; shared computations are actual nodes; exact corresponding parent subtrees inherit coefficients with per-owner provenance; changed pieces require fitting; inventory truncation disclosed in JOINT_INVENTORY.json",
+        "joint_response_search":settings.joint_response_search,"joint_local_fit":settings.joint_local_fit,"joint_search_scope":"bounded enumerated learned multi-output DAG; exactly one declared down layer; shared computations are actual nodes; exact corresponding parent subtrees inherit coefficients with per-owner provenance; changed pieces require fitting; inventory truncation disclosed in JOINT_INVENTORY.json",
         "native_parameter_edits":settings.native_parameter_edits,"native_parameter_edit_scope":"Finite additive dense directions lowered as Raw control contributions before downstream nonlinearities; independent literal edited original-native teachers; structural_search only. No mechanism recovery claim, no bit-parity between augmented and literal arithmetic; saved source/directions use paid ordinary f32 codec.",
         "down_edit_family":settings.down_edit_family,"down_family_scope":"restricted declared native down-weight directions; teachers run literal edited matrices, predictor runs own response functions; fixed directions serialized and excluded from fitting; no arbitrary native-edit mapping; body export/transfer disabled in this mode",
         "control_scope":"activation boundary scaling is not a global weight edit; retained_operator gain affects all its invocations; no mapping claimed for removed internal coordinates",
@@ -3225,7 +3336,7 @@ fn run() -> Result<(), String> {
                 if let Some(joint) = &mut joint {
                     save(&root.join("PARENT_INITIALIZATION.json"),
                         &serde_json::to_value(&joint.initialization).map_err(|e| e.to_string())?)?;
-                    if joint.initialization.random_elements != 0 {
+                    if joint.initialization.random_elements != 0 || settings.joint_local_fit.is_some() {
                         if joint_local_targets.is_none() {
                             let parent = down.as_ref().ok_or("joint parent absent")?;
                             let layer = settings.down_edit_family.as_ref().ok_or("joint layer absent")?.layer;
@@ -3235,11 +3346,21 @@ fn run() -> Result<(), String> {
                             joint_local_targets = Some(capture_joint_local_targets(&d, &parent.program,
                                 layers[layer].normed, &outputs, &clean_inputs, settings.fit.numeric_bytes)?);
                         }
-                        let (program, report) = prefit_joint_linear(&d, &joint.program,
-                            &joint.trainable_operator_ids, joint_local_targets.as_ref().ok_or("local target capture absent")?,
-                            settings.fit.numeric_bytes)?;
-                        joint.program = program;
-                        save(&root.join("LOCAL_LINEAR_PREFIT.json"), &report)?;
+                        let targets = joint_local_targets.as_ref().ok_or("local target capture absent")?;
+                        let mut zero_train_error = false;
+                        if let Some(local) = &settings.joint_local_fit {
+                            let (program, report) = prefit_joint_nonlinear(&d, &joint.program,
+                                &joint.trainable_operator_ids, targets, local)?;
+                            zero_train_error = report["initial"]["maximum"].as_f64() == Some(0.);
+                            joint.program = program;
+                            save(&root.join("LOCAL_NONLINEAR_PREFIT.json"), &report)?;
+                        }
+                        if !zero_train_error {
+                            let (program, report) = prefit_joint_linear(&d, &joint.program,
+                                &joint.trainable_operator_ids, targets, settings.fit.numeric_bytes)?;
+                            joint.program = program;
+                            save(&root.join("LOCAL_LINEAR_PREFIT.json"), &report)?;
+                        }
                     }
                 }
                 let proposal = if joint.is_none() {
@@ -3876,6 +3997,89 @@ mod tests {
         composed_rule_search::{Binary, Expr, Unary},
         operator_program::{Node, SlotValues},
     };
+    #[test]
+    fn structural_local_prefit_uses_native_law_on_drifted_inputs_and_transfers_only_owners() {
+        use gam_mpd::operator_program::{exact_precision, Declarations, Interface, Law, Operator, Slot};
+        use ndarray::array;
+        let dense = |name: &str, value: f64| Arc::new(Operator::dense(name,
+            Interface::native(1).unwrap(), Interface::native(1).unwrap(), array![[value]],
+            exact_precision([value]).unwrap(), Default::default()).unwrap());
+        let native = OperatorProgram {
+            declarations: Declarations {domains:vec![], slots:vec![Slot::Raw{width:1}], parameters:0},
+            bases:vec![], rules:vec![], operators:vec![dense("upstream",2.),dense("replacement",3.)],
+            nodes:vec![Node::Raw{slot:0},Node::Affine{terms:vec![(0,0)],bias:None},
+                Node::Pointwise{input:1,laws:vec![Law::Relu]},Node::Affine{terms:vec![(2,1)],bias:None}],output:3,
+        };
+        let mut candidate=Artifact::native(&native).unwrap();
+        candidate.program.operators=vec![dense("upstream",4.),dense("replacement",1.)];
+        let binding=program_learned_dag::LocalFit {
+            program:OperatorProgram{declarations:native.declarations.clone(),bases:vec![],rules:vec![],
+                operators:vec![candidate.program.operators[1].clone()],
+                nodes:vec![Node::Raw{slot:0},Node::Affine{terms:vec![(0,0)],bias:None}],output:1},
+            trainable_operator_ids:vec![0],owner_mapping:vec![(0,1)],
+            input_native_places:vec![2],output_native_places:vec![3],output_nodes:vec![1],
+        };
+        let family=FamilyInputs{rows:3,slots:vec![SlotValues::Raw(array![[-1.],[0.5],[2.]])],layout:None};
+        let episodes=vec![ResponseEpisode{label:"train".into(),inputs:family.clone(),scored:None,endpoint_bytes:0}];
+        let (panels,report)=capture_structural_local_targets(&native,&candidate,&binding,&episodes,1 << 24).unwrap();
+        assert_eq!(panels.inputs[0],array![[0.],[1.],[4.],[0.],[2.],[8.]]);
+        assert_eq!(panels.targets,array![[0.],[3.],[12.],[0.],[6.],[24.]]);
+        assert_eq!(report["episodes"][1]["state_source"],"candidate");
+        let (fitted,fit)=prefit_joint_linear(&Device::host(),&binding.program,&binding.trainable_operator_ids,&panels,1 << 24).unwrap();
+        assert_eq!(fit["accepted"],true);
+        let original_upstream=candidate.program.operators[0].clone();
+        binding.transfer(&fitted,&mut candidate).unwrap();
+        assert_eq!(candidate.program.operators[0],original_upstream);
+        let actual=candidate.program.execute(&family,false).unwrap().values[3].clone();
+        assert!(actual.iter().zip([0.,6.,24.]).all(|(a,b)|(a-b).abs()<1e-12));
+        assert_ne!(actual,native.execute(&family,false).unwrap().values[3]);
+    }
+    #[test]
+    fn cached_joint_nonlinear_fit_learns_hidden_parameters_before_linear_refit() {
+        use gam_mpd::operator_program::{exact_precision, Declarations, Interface, Law, Operator, Slot};
+        use gam_mpd::resident_rule_fit::{BatchObjective, BatchSchedule, ProposalArithmetic};
+        use ndarray::array;
+        let make = |reader: Array2<f64>, bias: Array2<f64>, clean: Array2<f64>, response: Array2<f64>| {
+            let operators = [reader, bias, clean, response].into_iter().enumerate().map(|(i, a)| {
+                Arc::new(Operator::dense(format!("parameter{i}"), Interface::native(a.nrows()).unwrap(),
+                    if i == 1 { Interface::constant() } else { Interface::native(a.ncols()).unwrap() },
+                    a.clone(), exact_precision(a.iter().copied()).unwrap(), Default::default()).unwrap())
+            }).collect();
+            OperatorProgram { declarations:Declarations{domains:vec![],slots:vec![Slot::Raw{width:1}],parameters:0},
+                bases:vec![],rules:vec![],operators,nodes:vec![Node::Raw{slot:0},
+                    Node::Affine{terms:vec![(0,0)],bias:Some(1)}, Node::Pointwise{input:1,laws:vec![Law::Relu]},
+                    Node::Affine{terms:vec![(2,2)],bias:None},Node::Affine{terms:vec![(2,3)],bias:None},
+                    Node::Concat{parts:vec![3,4]}],output:5 }
+        };
+        let teacher = make(array![[2.]],array![[0.2]],array![[1.]],array![[0.5]]);
+        // Different hidden width and numerical parameters; terminal linear fitting alone
+        // cannot move the two initial ReLU thresholds to the native threshold.
+        let candidate = make(array![[0.8],[0.6]],array![[0.1],[-0.1]],array![[0.5,0.3]],array![[0.2,0.4]]);
+        let family = FamilyInputs{rows:21,slots:vec![SlotValues::Raw(Array2::from_shape_fn((21,1),|(r,_)|r as f64 / 10. - 1.))],layout:None};
+        let device = Device::host();
+        let targets = capture_joint_local_targets(&device,&teacher,0,&[3,4],&family,1 << 24).expect("cache native targets");
+        let settings = JointLocalFit {
+            optimizer:gam_mpd::resident_rule_fit::Settings{iterations:500,forward_rows:21,learning_rate:0.03,
+                beta1:0.9,beta2:0.999,epsilon:1e-8,numeric_bytes:1 << 24,arithmetic:ProposalArithmetic::F64,backtracking:None},
+            batch:BatchSchedule{ordinary_rows:21,hard_rows:0,scan_every:10,temperature:0.05,
+                objective:BatchObjective::MeanGroupSmoothMaximum},
+        };
+        let (fitted,report)=prefit_joint_nonlinear(&device,&candidate,&[0,1,2,3],&targets,&settings).expect("local fit");
+        assert_eq!(report["accepted"],true);
+        let initial=report["initial"]["maximum"].as_f64().unwrap();
+        let after=report["proposed"]["maximum"].as_f64().unwrap();
+        assert!(after < initial * 0.1, "{report}");
+        assert_ne!(fitted.operators[0],candidate.operators[0]);
+        assert_eq!(fitted.operators.len(),candidate.operators.len());
+        assert_eq!(report["optimizer_report"]["training_rows"],21);
+        assert_eq!(report["optimizer_report"]["validation_rows"],21);
+        assert_eq!(report["diagnostic_validation_source"],"TRAIN repeated; not heldout");
+        let (_,linear)=prefit_joint_linear(&device,&fitted,&[0,1,2,3],&targets,1 << 24).expect("terminal re-solve");
+        assert!((linear["initial"]["maximum"].as_f64().unwrap()-after).abs()<1e-12);
+        let (unchanged,zero)=prefit_joint_nonlinear(&device,&teacher,&[0,1,2,3],&targets,&settings).expect("exact native measurement");
+        assert_eq!(zero["skip_reason"],"zero_train_error");
+        assert_eq!(unchanged.operators,teacher.operators);
+    }
     #[test]
     fn joint_selection_preserves_native_state_fidelity_and_unknown_measurements() {
         let accurate = json!({"c32":100,"training_kl":0.02,"maximum_episode_response_error":0.001});
@@ -4556,6 +4760,13 @@ mod tests {
         let check = |v: Value| {
             validate_joint_configuration(&serde_json::from_value::<Settings>(v).expect("settings"))
         };
+        assert!(serde_json::from_value::<Settings>(config.clone()).expect("legacy settings").joint_local_fit.is_none());
+        let mut misplaced = config.clone();
+        misplaced["joint_local_fit"] = json!({"optimizer":{"iterations":2,"forward_rows":1,"learning_rate":0.01,"beta1":0.9,"beta2":0.999,"epsilon":1e-8,"numeric_bytes":1000},
+            "batch":{"ordinary_rows":1,"hard_rows":0,"scan_every":1,"temperature":0.1}});
+        assert!(check(misplaced.clone()).is_ok());
+        misplaced["joint_response_search"] = Value::Null;
+        assert!(check(misplaced).is_err());
         assert!(check(config.clone()).is_ok());
         config["width"] = json!(2);
         assert!(check(config.clone()).is_err());
@@ -5431,6 +5642,7 @@ mod tests {
             },
             max_expression_evaluations: 0,
             native_response_weight: Some(1.),
+            local_fit: None,
         };
         let settings = Settings {
             export_sha256: "0".repeat(64),
@@ -5448,6 +5660,7 @@ mod tests {
             frozen_shared_body: None,
             native_initialization: false,
             joint_response_search: None,
+            joint_local_fit: None,
             native_parameter_edits: None,
             down_edit_family: None,
             structural_search: None,
@@ -6252,6 +6465,7 @@ mod tests {
             },
             max_expression_evaluations: 2,
             native_response_weight: None,
+            local_fit: None,
         };
         if joint {
             // This fixture measures fanout discovery; observable-chain coverage has separate tests.
@@ -6325,6 +6539,7 @@ mod tests {
             frozen_shared_body: None,
             native_initialization: false,
             joint_response_search: None,
+            joint_local_fit: None,
             native_parameter_edits: None,
             down_edit_family: None,
             structural_search: None,

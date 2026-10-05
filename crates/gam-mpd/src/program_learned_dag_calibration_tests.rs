@@ -3,13 +3,13 @@ use super::*;
 use crate::{
     composed_rule_search::Unary,
     operator_program::{
-        Declarations, FamilyInputs, Interface, Law, Node, Operator, OperatorProgram, Slot,
-        SlotValues, exact_precision,
+        exact_precision, Declarations, FamilyInputs, Interface, Law, Node, Operator,
+        OperatorProgram, Slot, SlotValues,
     },
     resident_causal_fit::{self, Episode, NativeResponseTarget, NativeResponses},
 };
 use gam_gpu::tensor::Device;
-use ndarray::{Array2, array};
+use ndarray::{array, Array2};
 use std::{collections::BTreeMap, sync::Arc};
 
 fn dense(values: Array2<f64>) -> Arc<Operator> {
@@ -176,7 +176,11 @@ fn targets(
                 let rms = (trace.values[node].iter().map(|v| v * v).sum::<f64>()
                     / input.rows as f64)
                     .sqrt();
-                if rms == 0. { 1. } else { rms }
+                if rms == 0. {
+                    1.
+                } else {
+                    rms
+                }
             })
             .collect()
     });

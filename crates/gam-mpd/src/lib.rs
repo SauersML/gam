@@ -192,6 +192,7 @@ pub mod native_control;
 pub mod affine_mlp;
 pub mod linear_coefficient_fit;
 pub mod program_linear_fit;
+pub mod native_local_supervision;
 
 /// Fixed activation and shared-operator controls in ordinary differentiable IR.
 pub mod intervention_program;
