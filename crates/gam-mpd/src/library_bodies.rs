@@ -1766,6 +1766,128 @@ pub fn describe(native: &OperatorProgram, layers: &[crate::run_check::LayerNodes
     Ok(out)
 }
 
+// ------------------------------------------------------------------------------------- editing
+
+/// `explanation` with the native block `owner` stands for edited by `delta` (its shape), where the
+/// block is a body's (`owner.body` a body, `owner.site` one of its calls), at that call alone: the
+/// call applies a private copy of the body with one coordinate more, so every other call computes
+/// as before. A gate row's edit `Δ` is read through a new input coordinate `Δ · x` that only the
+/// edited unit's gate (or, for an up row, its up map) reads with weight 1; an output column's edit
+/// is written through a new output coordinate that only the edited unit writes with weight 1; a
+/// bias is edited in the copy; each over the block's scalar factors (a gated unit's up scale), which
+/// act on the native block. The new coordinates' maps are constants of the edited explanation
+/// (outside `Explanation::trainable`): an edit is a question asked of a fitted explanation.
+pub fn edit_native(explanation: &Explanation, owner: &crate::artifact::Owner, delta: &Array2<f64>) -> Result<Explanation, String> {
+    if delta.dim() != (owner.native_rows.len(), owner.native_cols.len()) {
+        return Err(format!("an edit of {} is {:?}, not {:?}", owner.native, (owner.native_rows.len(), owner.native_cols.len()), delta.dim()));
+    }
+    let mut out = explanation.clone();
+    let program = &mut out.artifact.program;
+    // The block's scalar factors (a gated unit's up scale) act on the native block; the edit in the
+    // body's terms is the native edit over them.
+    let mut factor = 1.0;
+    for name in owner.left.iter().chain(&owner.right) {
+        let value = program.operators[operator_index(program, name)?].matrix();
+        if value.dim() == (1, 1) {
+            if value[[0, 0]] == 0.0 {
+                return Err(format!("{}: the factor {name} is zero", owner.site));
+            }
+            factor *= value[[0, 0]];
+        }
+    }
+    let delta = delta / factor;
+    let ops = BodyOperators::of(program, &owner.body)?;
+    let (read, write) = (operator_index(program, &format!("{}.read", owner.site))?, operator_index(program, &format!("{}.write", owner.site))?);
+    let body_rule = rule_index(program, &owner.body)?;
+    let site = sites(program, body_rule)?.into_iter().find(|s| s.read == read).ok_or_else(|| format!("{} does not call {}", owner.site, owner.body))?;
+    let unit = match owner.role.as_str() {
+        "out" => owner.cols.start,
+        "gate" | "up" | "gate_bias" | "up_bias" => owner.rows.start,
+        other => return Err(format!("{}: no body part {other}", owner.native)),
+    };
+    let (gate, out_map) = (program.operators[ops.gate].matrix(), program.operators[ops.out].matrix());
+    let (m, k, k_out) = (gate.nrows(), gate.ncols(), out_map.nrows());
+    let take = |op: Option<usize>| op.map(|o| program.operators[o].matrix());
+    let (mut gate_bias, mut up, mut up_bias) = (take(ops.gate_bias), take(ops.up), take(ops.up_bias));
+    // The copy's maps, one input coordinate (or output coordinate) wider where the edit needs it.
+    let wider_in = matches!(owner.role.as_str(), "gate" | "up");
+    let wider_out = owner.role == "out";
+    let widen = |m: &Array2<f64>, hit: bool| -> Array2<f64> {
+        let mut out = Array2::zeros((m.nrows(), m.ncols() + 1));
+        out.slice_mut(s![.., ..m.ncols()]).assign(m);
+        if hit {
+            out[[unit, m.ncols()]] = 1.0;
+        }
+        out
+    };
+    let mut gate_values = gate.clone();
+    let mut out_values = out_map.clone();
+    let (mut read_values, mut write_values) = (program.operators[read].matrix(), program.operators[write].matrix());
+    match owner.role.as_str() {
+        "gate" | "up" => {
+            gate_values = widen(&gate, owner.role == "gate");
+            up = up.map(|u| widen(&u, owner.role == "up"));
+            read_values = ndarray::concatenate(Axis(0), &[read_values.view(), delta.view()]).map_err(error)?;
+        }
+        "out" => {
+            let mut wider = Array2::zeros((k_out + 1, m));
+            wider.slice_mut(s![..k_out, ..]).assign(&out_map);
+            wider[[k_out, unit]] = 1.0;
+            out_values = wider;
+            write_values = ndarray::concatenate(Axis(1), &[write_values.view(), delta.view()]).map_err(error)?;
+        }
+        "gate_bias" => gate_bias.as_mut().ok_or("no gate bias")?[[unit, 0]] += delta[[0, 0]],
+        _ => up_bias.as_mut().ok_or("no up bias")?[[unit, 0]] += delta[[0, 0]],
+    }
+    let (z, h, y) = (units(k + usize::from(wider_in))?, units(m)?, units(k_out + usize::from(wider_out))?);
+    let copy = format!("library.body{}", next_body(program));
+    let provenance = Provenance::derived(&[], format!("edit of {} at {}", owner.native, owner.site));
+    let base = program.operators.len();
+    let mut added = vec![dense(format!("{copy}.gate"), h.clone(), z.clone(), gate_values, provenance.clone())?];
+    let index = |added: &mut Vec<Operator>, op: Operator| {
+        added.push(op);
+        base + added.len() - 1
+    };
+    let gate_bias = gate_bias.map(|b| dense(format!("{copy}.gate_bias"), h.clone(), Interface::constant(), b, provenance.clone())).transpose()?.map(|op| index(&mut added, op));
+    let up = up.map(|u| dense(format!("{copy}.up"), h.clone(), z.clone(), u, provenance.clone())).transpose()?.map(|op| index(&mut added, op));
+    let up_bias = up_bias.map(|b| dense(format!("{copy}.up_bias"), h.clone(), Interface::constant(), b, provenance.clone())).transpose()?.map(|op| index(&mut added, op));
+    let out_op = index(&mut added, dense(format!("{copy}.out"), y.clone(), h, out_values, provenance.clone())?);
+    let read_op = index(&mut added, dense(format!("{}.read_edited", owner.site), z.clone(), program.operators[read].cols.clone(), read_values, provenance.clone())?);
+    let write_op = index(&mut added, dense(format!("{}.write_edited", owner.site), program.operators[write].rows.clone(), y, write_values, provenance)?);
+    program.operators.extend(added.into_iter().map(Arc::new));
+    let law = match &program.rules[body_rule].nodes[2] {
+        Node::Pointwise { laws, .. } => *laws.first().ok_or("an empty law list")?,
+        other => return Err(format!("{}: node 2 is {other:?}", owner.body)),
+    };
+    let mut nodes = vec![Node::Param { index: 0 }, Node::Affine { terms: vec![(0, base)], bias: gate_bias }, Node::Pointwise { input: 1, laws: vec![law; m] }];
+    if let Some(up) = up {
+        nodes.push(Node::Affine { terms: vec![(0, up)], bias: up_bias });
+        nodes.push(Node::Hadamard { left: 2, right: 3 });
+    }
+    nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, out_op)], bias: None });
+    insert_first_rule(program, Rule { name: copy, inputs: vec![z], output: nodes.len() - 1, nodes });
+    // The call reads, applies and writes through the copy; its rule moved down by one.
+    let rule = &mut program.rules[site.rule + 1];
+    let z_node = match &rule.nodes[site.node] {
+        Node::Call { arguments, .. } => *arguments.first().ok_or("a call without an argument")?,
+        other => return Err(format!("{}: node {} is {other:?}", rule.name, site.node)),
+    };
+    if let Node::Affine { terms, .. } = &mut rule.nodes[z_node] {
+        terms[0].1 = read_op;
+    }
+    if let Node::Call { rule: called, .. } = &mut rule.nodes[site.node] {
+        *called = 0;
+    }
+    let output = rule.output;
+    if let Node::Affine { terms, .. } = &mut rule.nodes[output]
+        && let Some(term) = terms.iter_mut().find(|t| t.0 == site.node)
+    {
+        term.1 = write_op;
+    }
+    program.interfaces().map_err(error)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2083,6 +2205,40 @@ mod tests {
         for (most, least) in readings[0].reads.iter().chain(&readings[0].writes) {
             assert_eq!((most.len(), least.len()), (3, 3));
             assert!(most.windows(2).all(|w| w[0].score >= w[1].score) && most[0].score >= least[0].score);
+        }
+    }
+
+    #[test]
+    fn a_native_edit_inside_a_shared_body_changes_its_own_call_alone() {
+        for (law, gated) in [("gelu_tanh", false), ("silu", true)] {
+            let (native, layers, family, _) = tiny(&format!("bodies_edit_{gated}"), law, gated);
+            let mut start = explanation(&native, &layers).unwrap();
+            planted(&mut start, gated);
+            let (one, first) = rewrite(&start, 0, &SITE0).unwrap();
+            let (two, second) = rewrite(&one, 1, &SITE1).unwrap();
+            let posterior = Posterior::new(&two, 72).unwrap();
+            let alignment = align(&body_values(&two, &posterior, &second.body).unwrap(), &body_values(&two, &posterior, &first.body).unwrap()).unwrap();
+            let (merged, _) = merge(&two, &[first.clone(), second.clone()], &second.body, &first.body, &alignment).unwrap();
+            let mut rng = StdRng::seed_from_u64(31);
+            let mut roles = vec!["gate", "out"];
+            if gated {
+                roles.push("up");
+            }
+            for role in roles {
+                // The native block of the planted unit at the second call (layer 1, function SITE1[2]).
+                let f = SITE1[2];
+                let owner = merged.artifact.owners.iter().find(|o| o.site == second.name && o.role == role && (if role == "out" { o.native_cols == (f..f + 1) } else { o.native_rows == (f..f + 1) })).unwrap().clone();
+                let delta = random(&mut rng, owner.native_rows.len(), owner.native_cols.len());
+                let edited = edit_native(&merged, &owner, &delta).unwrap();
+                // The reference: the native library with the same block of layer 1's MLP edited.
+                let mut reference = start.clone();
+                let name = format!("library.l1.mlp.{role}");
+                let mut values = reference.artifact.program.operators[operator_index(&reference.artifact.program, &name).unwrap()].matrix();
+                values.slice_mut(s![owner.native_rows.clone(), owner.native_cols.clone()]).scaled_add(1.0, &delta);
+                set(&mut reference.artifact.program, &name, values);
+                close(&outputs(&reference, &family), &outputs(&edited, &family), 1e-9);
+                assert!(outputs(&reference, &family).iter().zip(outputs(&start, &family).iter()).any(|(a, b)| (a - b).abs() > 1e-6), "the edit moves the outputs");
+            }
         }
     }
 }
