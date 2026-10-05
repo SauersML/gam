@@ -1,0 +1,212 @@
+//! The factorized Gaussian posterior's device operations (`Device::reparameterize`,
+//! `posterior_adam`, `group_moments`, `group_divergence`): the host against the formulas entry by
+//! entry, and every accelerator that resolves (CUDA with float64 masters and an f32 sample, the
+//! Apple GPU in f32) against the host on the same inputs.
+//!
+//! An accelerator's value is a chain of at most 24 roundings, each within 4 ulps of f32 (`exp`,
+//! `log`, `sqrt`, `cos` in the safe math modes; the rest exact to half an ulp), of terms no larger
+//! than the largest magnitude entering it, so it is within `96 u` of that magnitude (`u = 2⁻²⁴`).
+//! A group sum of `n` such terms adds `γ_n` of the summed magnitudes.
+
+use gam_gpu::GpuPolicy;
+use gam_gpu::tensor::{Device, Indices, PosteriorStep, Storage, Tensor, posterior_normal};
+use ndarray::Array2;
+
+const U: f64 = 1.0 / 16_777_216.0;
+const CHAIN: f64 = 96.0 * U;
+
+fn matrix(rows: usize, cols: usize, seed: u64, scale: f64, shift: f64) -> Array2<f64> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    Array2::from_shape_simple_fn((rows, cols), || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let unit = (state >> 11) as f64 / (1u64 << 53) as f64;
+        f64::from((shift + (2.0 * unit - 1.0) * scale) as f32)
+    })
+}
+
+/// The test posterior: 6 × 40 entries in 9 groups (rows 0–2 by row, the rest by column pairs),
+/// one group removed (`s = −∞`, `μ = 0`), and its step.
+struct Case {
+    mean: Array2<f64>,
+    log_sd: Array2<f64>,
+    moments: [Array2<f64>; 4],
+    gradient: Array2<f64>,
+    groups: Vec<u32>,
+    count: usize,
+    step: PosteriorStep,
+}
+
+fn case() -> Case {
+    let (rows, cols) = (6, 40);
+    let groups: Vec<u32> = (0..rows * cols).map(|i| if i / cols < 3 { (i / cols) as u32 } else { 3 + ((i % cols) / 8) as u32 }).collect();
+    let mut mean = matrix(rows, cols, 1, 0.5, 0.0);
+    let mut log_sd = matrix(rows, cols, 2, 0.5, -3.0);
+    for (i, g) in groups.iter().enumerate() {
+        if *g == 4 {
+            mean[(i / cols, i % cols)] = 0.0;
+            log_sd[(i / cols, i % cols)] = f64::NEG_INFINITY;
+        }
+    }
+    let moments = [matrix(rows, cols, 3, 0.1, 0.0), matrix(rows, cols, 4, 0.01, 0.02), matrix(rows, cols, 5, 0.1, 0.0), matrix(rows, cols, 6, 0.01, 0.02)];
+    let step = PosteriorStep { mean_rate: 1e-3, log_sd_rate: 1e-2, beta1: 0.9, beta2: 0.999, epsilon: 1e-8, step: 7, key: 0x1234_5678_9abc_def0, stream: 42 };
+    Case { mean, log_sd, moments, gradient: matrix(rows, cols, 7, 3.0, 0.0), groups, count: 8, step }
+}
+
+/// The formulas, entry by entry: the sample, the stepped posterior and moments, and the group sums
+/// `(n, Σ μ² + σ², Σ 2s)` before and after the step, from the sums before.
+fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 4], Vec<[f64; 3]>, Vec<[f64; 3]>) {
+    let mut before = vec![[0.0; 3]; c.count];
+    for (i, g) in c.groups.iter().enumerate() {
+        let (mu, s) = (c.mean.as_slice().unwrap()[i], c.log_sd.as_slice().unwrap()[i]);
+        if s > f64::NEG_INFINITY {
+            let b = &mut before[*g as usize];
+            b[0] += 1.0;
+            b[1] += mu * mu + (2.0 * s).exp();
+            b[2] += 2.0 * s;
+        }
+    }
+    let variance: Vec<f64> = before.iter().map(|b| if b[0] > 0.0 { b[1] / b[0] } else { 0.0 }).collect();
+    let (b1, b2, t) = (c.step.beta1, c.step.beta2, c.step.step as i32);
+    let (c1, c2) = (1.0 - b1.powi(t), 1.0 - b2.powi(t));
+    let mut theta = c.mean.clone();
+    let (mut mean, mut log_sd, mut moments) = (c.mean.clone(), c.log_sd.clone(), c.moments.clone());
+    let mut after = vec![[0.0; 3]; c.count];
+    for (i, g) in c.groups.iter().enumerate() {
+        let at = (i / c.mean.ncols(), i % c.mean.ncols());
+        let e = f64::from(posterior_normal(c.step.key, c.step.stream, i as u64));
+        let (mu, s) = (c.mean[at], c.log_sd[at]);
+        theta[at] = mu + s.exp() * e;
+        if s == f64::NEG_INFINITY {
+            continue;
+        }
+        let (v, sd, gr) = (variance[*g as usize], s.exp(), c.gradient[at]);
+        let gradients = [gr + mu / v, gr * e * sd + sd * sd / v - 1.0];
+        for (k, (value, rate)) in [(&mut mean, c.step.mean_rate), (&mut log_sd, c.step.log_sd_rate)].into_iter().enumerate() {
+            let m = b1 * moments[2 * k][at] + (1.0 - b1) * gradients[k];
+            let w = b2 * moments[2 * k + 1][at] + (1.0 - b2) * gradients[k] * gradients[k];
+            moments[2 * k][at] = m;
+            moments[2 * k + 1][at] = w;
+            value[at] -= rate * (m / c1) / ((w / c2).sqrt() + c.step.epsilon);
+        }
+        let a = &mut after[*g as usize];
+        a[0] += 1.0;
+        a[1] += mean[at] * mean[at] + (2.0 * log_sd[at]).exp();
+        a[2] += 2.0 * log_sd[at];
+    }
+    (theta, mean, log_sd, moments, before, after)
+}
+
+/// The device's results on `c`: the sample, the stepped posterior and moments, the group sums
+/// before and after the step, and the divergences from the sums before. `fit` holds the sample and
+/// gradient, `master` the posterior.
+fn run(fit: &Device, master: &Device, c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, Vec<Array2<f64>>, Array2<f64>, Array2<f64>, Array2<f64>) {
+    let up = |d: &Device, m: &Array2<f64>| d.upload(m.view()).unwrap();
+    let (mut mean, mut log_sd) = (up(master, &c.mean), up(master, &c.log_sd));
+    let mut moments: Vec<Tensor> = c.moments.iter().map(|m| up(master, m)).collect();
+    let groups: Indices = master.upload_indices(&c.groups).unwrap();
+    let mut theta = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
+    fit.reparameterize(&mut theta, (&mean, &log_sd), (c.step.key, c.step.stream)).unwrap();
+    let mut sums = master.zeros(c.count, 3).unwrap();
+    master.group_moments((&mean, &log_sd), &groups, &mut sums).unwrap();
+    let before = master.download(&sums).unwrap();
+    let (mut variance, mut divergence) = (master.zeros(c.count, 1).unwrap(), master.zeros(c.count, 1).unwrap());
+    master.group_divergence(&mut sums, &mut variance, &mut divergence).unwrap();
+    assert!(master.download(&sums).unwrap().iter().all(|v| *v == 0.0), "the sums are zeroed");
+    let gradient = up(fit, &c.gradient);
+    let [m0, m1, m2, m3] = &mut moments[..] else { unreachable!() };
+    master.posterior_adam((&mut mean, &mut log_sd), [m0, m1, m2, m3], &gradient, (&groups, &variance), &mut sums, &c.step).unwrap();
+    let down = |t: &Tensor| master.download(t).unwrap();
+    (fit.download(&theta).unwrap(), down(&mean), down(&log_sd), moments.iter().map(down).collect(), before, down(&sums), down(&divergence))
+}
+
+fn sums_of(rows: &[[f64; 3]]) -> Array2<f64> {
+    Array2::from_shape_fn((rows.len(), 3), |(g, k)| rows[g][k])
+}
+
+/// `a` within `relative` of `b`'s largest magnitude (an entry `−∞` in both counts as equal).
+fn close(what: &str, a: &Array2<f64>, b: &Array2<f64>, relative: f64) {
+    let scale = b.iter().filter(|v| v.is_finite()).fold(0.0_f64, |m, v| m.max(v.abs()));
+    for ((at, x), y) in a.indexed_iter().zip(b.iter()) {
+        let equal = x == y || (x - y).abs() <= relative * scale;
+        assert!(equal, "{what} {at:?}: {x} against {y} (band {:e})", relative * scale);
+    }
+}
+
+#[test]
+fn draws_are_standard_normal() {
+    let n = 200_000u64;
+    let draws: Vec<f64> = (0..n).map(|i| f64::from(posterior_normal(3, 9, i))).collect();
+    let mean = draws.iter().sum::<f64>() / n as f64;
+    let second = draws.iter().map(|x| x * x).sum::<f64>() / n as f64;
+    // Six standard errors: the mean's is 1/√n, the second moment's √2/√n.
+    let se = 1.0 / (n as f64).sqrt();
+    assert!(mean.abs() < 6.0 * se, "mean {mean}");
+    assert!((second - 1.0).abs() < 6.0 * 2f64.sqrt() * se, "second moment {second}");
+    // Another stream, key or index draws anew.
+    assert_ne!(posterior_normal(3, 9, 0), posterior_normal(3, 10, 0));
+    assert_ne!(posterior_normal(3, 9, 0), posterior_normal(4, 9, 0));
+    assert_ne!(posterior_normal(3, 9, 0), posterior_normal(3, 9, 1 << 32));
+}
+
+#[test]
+fn the_host_steps_the_posterior_by_its_formulas() {
+    let c = case();
+    let host = Device::host();
+    let (theta, mean, log_sd, moments, before, after, divergence) = run(&host, &host, &c);
+    let (t, m, s, mo, b, a) = reference(&c);
+    let exact = 1e-15;
+    close("sample", &theta, &t, exact);
+    close("mean", &mean, &m, exact);
+    close("log sd", &log_sd, &s, exact);
+    for (k, (x, y)) in moments.iter().zip(&mo).enumerate() {
+        close(&format!("moment {k}"), x, y, exact);
+    }
+    close("sums before", &before, &sums_of(&b), exact);
+    close("sums after", &after, &sums_of(&a), exact);
+    for (g, row) in b.iter().enumerate() {
+        let expected = if row[0] > 0.0 { 0.5 * (row[0] * (row[1] / row[0]).ln() - row[2]) } else { 0.0 };
+        assert!((divergence[(g, 0)] - expected).abs() <= 1e-12 * expected.abs().max(1.0), "divergence {g}");
+    }
+    assert_eq!(b[4][0], 0.0, "the removed group is empty");
+    assert!(theta.indexed_iter().all(|((r, col), v)| c.groups[r * 40 + col] != 4 || *v == 0.0), "a removed entry samples zero");
+}
+
+fn against_host(fit: &Device, master: &Device) {
+    let c = case();
+    let host = Device::host();
+    let (theta, mean, log_sd, moments, before, after, divergence) = run(fit, master, &c);
+    let (t, m, s, mo, b, a, d) = run(&host, &host, &c);
+    // A group sums at most 40 entries; the step reads its variance (such a sum over its count),
+    // and a second moment squares a gradient that carries the variance's error.
+    let sum_band = CHAIN + 40.0 * U / (1.0 - 40.0 * U);
+    close("sample", &theta, &t, CHAIN);
+    close("mean", &mean, &m, 2.0 * sum_band);
+    close("log sd", &log_sd, &s, 2.0 * sum_band);
+    for (k, (x, y)) in moments.iter().zip(&mo).enumerate() {
+        close(&format!("moment {k}"), x, y, 2.0 * sum_band);
+    }
+    close("sums before", &before, &b, sum_band);
+    close("sums after", &after, &a, sum_band);
+    // ½ (n ln v − Σ 2s) cancels terms as large as `n |ln v|` and `|Σ 2s|`.
+    let cancelled = b.rows().into_iter().map(|r| r[0] * (r[1] / r[0].max(1.0)).ln().abs() + r[2].abs()).fold(0.0_f64, f64::max);
+    for g in 0..c.count {
+        assert!((divergence[(g, 0)] - d[(g, 0)]).abs() <= sum_band * cancelled, "divergence {g}: {} against {}", divergence[(g, 0)], d[(g, 0)]);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_apple_gpu_matches_the_host() {
+    let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
+    against_host(&metal, &metal);
+}
+
+#[test]
+fn cuda_with_float64_masters_matches_the_host() {
+    let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
+    let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
+    against_host(&narrow, &wide);
+    against_host(&wide, &wide);
+}

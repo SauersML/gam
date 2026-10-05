@@ -1927,6 +1927,156 @@ impl Device {
         }
     }
 
+    /// A weight sample of a factorized Gaussian posterior, `θᵢ = μᵢ + exp(sᵢ) εᵢ` with `εᵢ =
+    /// [`posterior_normal`]`(key, stream, i)`, written into `theta` (this device's storage) from
+    /// the posterior's means `μ` and log standard deviations `s` (`mean`, `log_sd`: float64 on
+    /// the host and CUDA, f32 on the Apple GPU). A removed entry (`s = −∞`, `μ = 0`) samples 0.
+    /// The draws are regenerated from their counters, never stored ([`Device::posterior_adam`]
+    /// regenerates the same ones).
+    pub fn reparameterize(&self, theta: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {
+        same(theta, mean, "reparameterized mean")?;
+        same(theta, log_sd, "reparameterized log standard deviation")?;
+        match &*self.backend {
+            Backend::Host => {
+                let (mv, sv) = (host(mean)?, host(log_sd)?);
+                for (i, t) in host_mut(theta)?.iter_mut().enumerate() {
+                    *t = mv[i] + sv[i].exp() * f64::from(posterior_normal(key, stream, i as u64));
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.reparameterize(theta, (mean, log_sd), (key, stream)),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.reparameterize(theta, (mean, log_sd), (key, stream)),
+        }
+    }
+
+    /// One Adam step of the factorized Gaussian posterior `N(μ, exp(s)²)` whose sample
+    /// [`Device::reparameterize`] drew under the same `(key, stream)`, and each entry's new
+    /// `(1, μ² + exp(2s), 2s)` added into its group's row of `sums` (groups × 3, the posterior's
+    /// storage). `gradient` (this device's storage) is the data term's gradient at the sample;
+    /// with `v` the entry's group variance (`variance`, groups × 1), the objective's derivatives are
+    /// `g + μ / v` in `μ` and `g ε σ + σ² / v − 1` in `s` (`σ = exp(s)`, the empirical-Bayes
+    /// group prior's divergence `½ (n ln v − Σ 2s)`), each taking Adam's step at its own rate with
+    /// its moments (`moments`: `μ`'s first and second, then `s`'s). A removed entry (`s = −∞`)
+    /// is left alone and adds nothing to `sums`.
+    pub fn posterior_adam(
+        &self,
+        (mean, log_sd): (&mut Tensor, &mut Tensor),
+        moments: [&mut Tensor; 4],
+        gradient: &Tensor,
+        (groups, variance): (&Indices, &Tensor),
+        sums: &mut Tensor,
+        step: &PosteriorStep,
+    ) -> Result<(), GpuError> {
+        same(mean, gradient, "posterior gradient")?;
+        same(mean, log_sd, "posterior log standard deviation")?;
+        for m in &moments {
+            same(mean, m, "posterior moment")?;
+        }
+        if groups.len != mean.len() || variance.cols != 1 || sums.dim() != (variance.rows, 3) {
+            return Err(shape(format!("{} group ids, a {:?} variance and {:?} sums for {} entries", groups.len, variance.dim(), sums.dim(), mean.len())));
+        }
+        let corrections = step.corrections();
+        match &*self.backend {
+            Backend::Host => {
+                let [mm, mv, sm, sv] = moments;
+                let (mm, mv, sm, sv) = (host_mut(mm)?, host_mut(mv)?, host_mut(sm)?, host_mut(sv)?);
+                let (gv, ids, var) = (host(gradient)?, host_indices(groups)?, host(variance)?);
+                let (means, log_sds, totals) = (host_mut(mean)?, host_mut(log_sd)?, host_mut(sums)?);
+                if let Some(id) = ids.iter().find(|id| **id as usize >= var.len()) {
+                    return Err(shape(format!("group {id} of {}", var.len())));
+                }
+                let (b1, b2) = (step.beta1, step.beta2);
+                let adam = |w: &mut f64, m: &mut f64, v: &mut f64, g: f64, rate: f64| {
+                    *m = b1 * *m + (1.0 - b1) * g;
+                    *v = b2 * *v + (1.0 - b2) * g * g;
+                    *w -= rate * (*m / corrections.0) / ((*v / corrections.1).sqrt() + step.epsilon);
+                };
+                for i in 0..means.len() {
+                    if log_sds[i] == f64::NEG_INFINITY {
+                        continue;
+                    }
+                    let (g, v) = (ids[i] as usize, var[ids[i] as usize]);
+                    let (mu, sd) = (means[i], log_sds[i].exp());
+                    let e = f64::from(posterior_normal(step.key, step.stream, i as u64));
+                    adam(&mut means[i], &mut mm[i], &mut mv[i], gv[i] + mu / v, step.mean_rate);
+                    adam(&mut log_sds[i], &mut sm[i], &mut sv[i], gv[i] * e * sd + sd * sd / v - 1.0, step.log_sd_rate);
+                    totals[3 * g] += 1.0;
+                    totals[3 * g + 1] += means[i] * means[i] + (2.0 * log_sds[i]).exp();
+                    totals[3 * g + 2] += 2.0 * log_sds[i];
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.posterior_adam((mean, log_sd), moments, gradient, (groups, variance), sums, step),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.posterior_adam((mean, log_sd), moments, gradient, (groups, variance), sums, step),
+        }
+    }
+
+    /// Each entry's `(1, μ² + exp(2s), 2s)` added into its group's row of `sums` (groups × 3), as
+    /// [`Device::posterior_adam`] adds them after a step; a removed entry (`s = −∞`) adds nothing.
+    pub fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
+        same(mean, log_sd, "group moments")?;
+        if groups.len != mean.len() || sums.cols != 3 {
+            return Err(shape(format!("{} group ids and {:?} sums for {} entries", groups.len, sums.dim(), mean.len())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (means, log_sds, ids) = (host(mean)?, host(log_sd)?, host_indices(groups)?);
+                let totals = host_mut(sums)?;
+                for i in 0..means.len() {
+                    let g = ids[i] as usize;
+                    if g * 3 >= totals.len() {
+                        return Err(shape(format!("group {g} of {}", totals.len() / 3)));
+                    }
+                    if log_sds[i] == f64::NEG_INFINITY {
+                        continue;
+                    }
+                    totals[3 * g] += 1.0;
+                    totals[3 * g + 1] += means[i] * means[i] + (2.0 * log_sds[i]).exp();
+                    totals[3 * g + 2] += 2.0 * log_sds[i];
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.group_moments((mean, log_sd), groups, sums),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.group_moments((mean, log_sd), groups, sums),
+        }
+    }
+
+    /// From each group's `sums` row `(n, Σ (μ² + σ²), Σ 2s)`, its empirical-Bayes prior variance
+    /// `v = Σ (μ² + σ²) / n` into `variance` and its divergence `KL(q_G ‖ p_G) = ½ (n ln v − Σ 2s)`
+    /// in nats into `divergence` (both groups × 1; zero for an empty group), then `sums` zeroed
+    /// for the next accumulation.
+    pub fn group_divergence(&self, sums: &mut Tensor, variance: &mut Tensor, divergence: &mut Tensor) -> Result<(), GpuError> {
+        if sums.cols != 3 || variance.dim() != (sums.rows, 1) || divergence.dim() != (sums.rows, 1) {
+            return Err(shape(format!("{:?} sums, {:?} variances, {:?} divergences", sums.dim(), variance.dim(), divergence.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (totals, var, kl) = (host_mut(sums)?, host_mut(variance)?, host_mut(divergence)?);
+                for g in 0..var.len() {
+                    let (n, second, log_variance) = (totals[3 * g], totals[3 * g + 1], totals[3 * g + 2]);
+                    (var[g], kl[g]) = if n > 0.0 {
+                        let v = second / n;
+                        (v, 0.5 * (n * v.ln() - log_variance))
+                    } else {
+                        (0.0, 0.0)
+                    };
+                }
+                totals.fill(0.0);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.group_divergence(sums, variance, divergence),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.group_divergence(sums, variance, divergence),
+        }
+    }
+
     /// Each row's set under a site's own code (`gam_mpd::site_fit`, module note): with `size = |a[r,
     /// c]| q[r, c]` each subcomponent's real size on the row (its read times its write in the row's
     /// metric) and `bound = left[r] + Σ_{c off} size`, the set
@@ -2160,6 +2310,54 @@ enum RmsMode {
     Value,
     Backward,
     Tangent,
+}
+
+/// One step of [`Device::posterior_adam`]: Adam's rates in `μ` and in `s`, decays and `ε`, the
+/// step's number from 1, and the `(key, stream)` of the sample whose gradient it takes.
+#[derive(Clone, Copy, Debug)]
+pub struct PosteriorStep {
+    pub mean_rate: f64,
+    pub log_sd_rate: f64,
+    pub beta1: f64,
+    pub beta2: f64,
+    pub epsilon: f64,
+    pub step: u64,
+    pub key: u64,
+    pub stream: u64,
+}
+
+impl PosteriorStep {
+    /// Adam's bias corrections `(1 − β₁ᵗ, 1 − β₂ᵗ)`.
+    fn corrections(&self) -> (f64, f64) {
+        let exponent = i32::try_from(self.step.max(1)).unwrap_or(i32::MAX);
+        (1.0 - self.beta1.powi(exponent), 1.0 - self.beta2.powi(exponent))
+    }
+}
+
+/// Philox4x32-10 (Salmon et al., SC 2011) of the counter `(index, stream)` under `key`.
+fn philox(key: u64, stream: u64, index: u64) -> [u32; 4] {
+    let mut c = [index as u32, (index >> 32) as u32, stream as u32, (stream >> 32) as u32];
+    let mut k = [key as u32, (key >> 32) as u32];
+    for round in 0..10 {
+        if round > 0 {
+            k[0] = k[0].wrapping_add(0x9E37_79B9);
+            k[1] = k[1].wrapping_add(0xBB67_AE85);
+        }
+        let (p0, p1) = (u64::from(0xD251_1F53_u32) * u64::from(c[0]), u64::from(0xCD9E_8D57_u32) * u64::from(c[2]));
+        c = [((p1 >> 32) as u32) ^ c[1] ^ k[0], p1 as u32, ((p0 >> 32) as u32) ^ c[3] ^ k[1], p0 as u32];
+    }
+    c
+}
+
+/// The standard normal draw `index` of `(key, stream)`: Box–Muller in f32 on the first two words of
+/// [`philox`], `√(−2 ln u₁) cos(2π u₂)` with `u₁ = (w₀ + ½) 2⁻³²` and `u₂ = w₁ 2⁻³²`. Every backend
+/// computes it alike (up to its f32 `log` and `cos`), so a draw is regenerated from its counter.
+#[must_use]
+pub fn posterior_normal(key: u64, stream: u64, index: u64) -> f32 {
+    let w = philox(key, stream, index);
+    let scale = 2.328_306_4e-10_f32;
+    let (u1, u2) = ((w[0] as f32 + 0.5) * scale, w[1] as f32 * scale);
+    (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
 }
 
 fn host_softmax(z: &[f64]) -> Vec<f64> {
@@ -2828,6 +3026,119 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
     }
     double q = block_sum(partial, shared);
     if (threadIdx.x == 0) out[r] = q;
+}
+
+// The standard normal draw `index` of (key, stream): Philox4x32-10, then Box–Muller in float
+// (`posterior_normal` on the host).
+__device__ float posterior_normal(u64 key, u64 stream, u64 index) {
+    unsigned int c0 = (unsigned int)index, c1 = (unsigned int)(index >> 32), c2 = (unsigned int)stream, c3 = (unsigned int)(stream >> 32);
+    unsigned int k0 = (unsigned int)key, k1 = (unsigned int)(key >> 32);
+    for (int round = 0; round < 10; ++round) {
+        if (round > 0) { k0 += 0x9E3779B9u; k1 += 0xBB67AE85u; }
+        unsigned int hi0 = __umulhi(0xD2511F53u, c0), lo0 = 0xD2511F53u * c0;
+        unsigned int hi1 = __umulhi(0xCD9E8D57u, c2), lo1 = 0xCD9E8D57u * c2;
+        c0 = hi1 ^ c1 ^ k0; c1 = lo1; c2 = hi0 ^ c3 ^ k1; c3 = lo0;
+    }
+    float u1 = ((float)c0 + 0.5f) * 2.3283064e-10f, u2 = (float)c1 * 2.3283064e-10f;
+    return sqrtf(-2.0f * logf(u1)) * cosf(6.28318530717958647692f * u2);
+}
+
+template <typename T>
+__device__ void reparameterize_body(u64 n, u64 key, u64 stream, const double* mean, const double* log_sd, T* theta) {
+    GRID_STRIDE(i, n) theta[i] = (T)(mean[i] + exp(log_sd[i]) * (double)posterior_normal(key, stream, i));
+}
+
+extern "C" __global__ void reparameterize_f64(u64 n, u64 key, u64 stream, const double* mean, const double* log_sd, double* theta) {
+    reparameterize_body<double>(n, key, stream, mean, log_sd, theta);
+}
+
+extern "C" __global__ void reparameterize_f32(u64 n, u64 key, u64 stream, const double* mean, const double* log_sd, float* theta) {
+    reparameterize_body<float>(n, key, stream, mean, log_sd, theta);
+}
+
+// Adds a live entry's (1, μ² + σ², 2s) to its group's row of `sums`: once per warp when every live
+// lane's group is lane 0's (a row-major run of one group), else per lane. Every lane of the warp
+// calls it.
+__device__ void group_add(double* sums, unsigned int g, bool live, double a, double b, double c) {
+    unsigned int g0 = __shfl_sync(0xffffffffu, g, 0);
+    if (__all_sync(0xffffffffu, !live || g == g0)) {
+        for (int o = 16; o > 0; o >>= 1) {
+            a += __shfl_down_sync(0xffffffffu, a, o);
+            b += __shfl_down_sync(0xffffffffu, b, o);
+            c += __shfl_down_sync(0xffffffffu, c, o);
+        }
+        if ((threadIdx.x & 31u) == 0 && a > 0.0) {
+            atomicAdd(sums + 3 * (u64)g0, a);
+            atomicAdd(sums + 3 * (u64)g0 + 1, b);
+            atomicAdd(sums + 3 * (u64)g0 + 2, c);
+        }
+    } else if (live) {
+        atomicAdd(sums + 3 * (u64)g, a);
+        atomicAdd(sums + 3 * (u64)g + 1, b);
+        atomicAdd(sums + 3 * (u64)g + 2, c);
+    }
+}
+
+// An entry whose group id is not below `count` is left alone (the caller's ids are checked where
+// they are made). Blocks stride whole, so every lane of a warp runs every iteration (`group_add`).
+#define WARP_STRIDE(i, n) for (u64 base_ = (u64)blockIdx.x * blockDim.x, i = base_ + threadIdx.x; base_ < (n); base_ += (u64)gridDim.x * blockDim.x, i = base_ + threadIdx.x)
+
+template <typename T>
+__device__ void posterior_adam_body(u64 n, u64 count, u64 key, u64 stream, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
+    double c1, double c2, const T* gradient, const unsigned int* groups, const double* variance,
+    double* mean, double* log_sd, double* mm, double* mv, double* sm, double* sv, double* sums) {
+    WARP_STRIDE(i, n) {
+        unsigned int g = i < n ? groups[i] : 0u;
+        bool live = i < n && g < count && log_sd[i] != NEG_INF;
+        double a = 0.0, b = 0.0, c = 0.0;
+        if (live) {
+            double v = variance[g], mu = mean[i], s = log_sd[i], sd = exp(s);
+            double e = (double)posterior_normal(key, stream, i), gi = (double)gradient[i];
+            double gm = gi + mu / v, gs = gi * e * sd + sd * sd / v - 1.0;
+            double m1 = beta1 * mm[i] + (1.0 - beta1) * gm, v1 = beta2 * mv[i] + (1.0 - beta2) * gm * gm;
+            double m2 = beta1 * sm[i] + (1.0 - beta1) * gs, v2 = beta2 * sv[i] + (1.0 - beta2) * gs * gs;
+            mm[i] = m1; mv[i] = v1; sm[i] = m2; sv[i] = v2;
+            mu -= mean_rate * (m1 / c1) / (sqrt(v1 / c2) + epsilon);
+            s -= log_sd_rate * (m2 / c1) / (sqrt(v2 / c2) + epsilon);
+            mean[i] = mu; log_sd[i] = s;
+            a = 1.0; b = mu * mu + exp(2.0 * s); c = 2.0 * s;
+        }
+        group_add(sums, g, live, a, b, c);
+    }
+}
+
+extern "C" __global__ void posterior_adam_f64(u64 n, u64 count, u64 key, u64 stream, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
+    double c1, double c2, const double* gradient, const unsigned int* groups, const double* variance,
+    double* mean, double* log_sd, double* mm, double* mv, double* sm, double* sv, double* sums) {
+    posterior_adam_body<double>(n, count, key, stream, mean_rate, log_sd_rate, beta1, beta2, epsilon, c1, c2, gradient, groups, variance, mean, log_sd, mm, mv, sm, sv, sums);
+}
+
+extern "C" __global__ void posterior_adam_f32(u64 n, u64 count, u64 key, u64 stream, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
+    double c1, double c2, const float* gradient, const unsigned int* groups, const double* variance,
+    double* mean, double* log_sd, double* mm, double* mv, double* sm, double* sv, double* sums) {
+    posterior_adam_body<float>(n, count, key, stream, mean_rate, log_sd_rate, beta1, beta2, epsilon, c1, c2, gradient, groups, variance, mean, log_sd, mm, mv, sm, sv, sums);
+}
+
+extern "C" __global__ void group_moments(u64 n, u64 count, const double* mean, const double* log_sd, const unsigned int* groups, double* sums) {
+    WARP_STRIDE(i, n) {
+        unsigned int g = i < n ? groups[i] : 0u;
+        bool live = i < n && g < count && log_sd[i] != NEG_INF;
+        double a = 0.0, b = 0.0, c = 0.0;
+        if (live) {
+            a = 1.0; b = mean[i] * mean[i] + exp(2.0 * log_sd[i]); c = 2.0 * log_sd[i];
+        }
+        group_add(sums, g, live, a, b, c);
+    }
+}
+
+extern "C" __global__ void group_divergence(u64 n, double* sums, double* variance, double* divergence) {
+    GRID_STRIDE(g, n) {
+        double count = sums[3 * g], second = sums[3 * g + 1], log_variance = sums[3 * g + 2];
+        double v = count > 0.0 ? second / count : 0.0;
+        variance[g] = v;
+        divergence[g] = count > 0.0 ? 0.5 * (count * log(v) - log_variance) : 0.0;
+        sums[3 * g] = 0.0; sums[3 * g + 1] = 0.0; sums[3 * g + 2] = 0.0;
+    }
 }
 "#;
 
@@ -4333,6 +4644,66 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             .map(|_| ())
         }
 
+        pub(super) fn reparameterize(&self, theta: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {
+            let n = theta.len() as u64;
+            let (mean, log_sd) = (slice(mean)?, slice(log_sd)?);
+            let name = if theta.storage() == Storage::F32 { "reparameterize_f32" } else { "reparameterize_f64" };
+            let f = self.function(name)?;
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&n).arg(&key).arg(&stream).arg(mean).arg(log_sd);
+            match &mut theta.data {
+                Data::Cuda32(t) => builder.arg(t),
+                Data::Cuda(t) => builder.arg(t),
+                other => return Err(mismatch(other)),
+            };
+            // SAFETY: three equal-length buffers, checked by the caller.
+            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor reparameterize").map(|_| ())
+        }
+
+        pub(super) fn posterior_adam(
+            &self,
+            (mean, log_sd): (&mut Tensor, &mut Tensor),
+            [mm, mv, sm, sv]: [&mut Tensor; 4],
+            gradient: &Tensor,
+            (groups, variance): (&Indices, &Tensor),
+            sums: &mut Tensor,
+            step: &super::PosteriorStep,
+        ) -> Result<(), GpuError> {
+            let (c1, c2) = step.corrections();
+            let n = mean.len() as u64;
+            let name = if gradient.storage() == Storage::F32 { "posterior_adam_f32" } else { "posterior_adam_f64" };
+            let (f, count) = (self.function(name)?, variance.len() as u64);
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&n).arg(&count).arg(&step.key).arg(&step.stream).arg(&step.mean_rate).arg(&step.log_sd_rate).arg(&step.beta1).arg(&step.beta2).arg(&step.epsilon).arg(&c1).arg(&c2);
+            match &gradient.data {
+                Data::Cuda32(g) => builder.arg(g),
+                Data::Cuda(g) => builder.arg(g),
+                other => return Err(mismatch(other)),
+            };
+            builder.arg(index_slice(groups)?).arg(slice(variance)?);
+            builder.arg(slice_mut(mean)?).arg(slice_mut(log_sd)?).arg(slice_mut(mm)?).arg(slice_mut(mv)?).arg(slice_mut(sm)?).arg(slice_mut(sv)?).arg(slice_mut(sums)?);
+            // SAFETY: equal-length entry buffers and in-range group ids, checked by the caller.
+            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor posterior_adam").map(|_| ())
+        }
+
+        pub(super) fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
+            let n = mean.len() as u64;
+            let (f, count) = (self.function("group_moments")?, sums.rows as u64);
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&n).arg(&count).arg(slice(mean)?).arg(slice(log_sd)?).arg(index_slice(groups)?).arg(slice_mut(sums)?);
+            // SAFETY: equal-length entry buffers, checked by the caller.
+            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor group_moments").map(|_| ())
+        }
+
+        pub(super) fn group_divergence(&self, sums: &mut Tensor, variance: &mut Tensor, divergence: &mut Tensor) -> Result<(), GpuError> {
+            let n = variance.len() as u64;
+            let f = self.function("group_divergence")?;
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&n).arg(slice_mut(sums)?).arg(slice_mut(variance)?).arg(slice_mut(divergence)?);
+            // SAFETY: groups × 3 sums and groups × 1 outputs, checked by the caller.
+            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor group_divergence").map(|_| ())
+        }
+
         pub(super) fn select_sets(&self, (a, q): (&Tensor, &Tensor), bits: &Tensor, left: &Tensor, weight: &Tensor, mask: &mut Tensor) -> Result<(), GpuError> {
             if a.is_empty() { return Ok(()); }
             let (rows, cols) = (a.rows as u32, a.cols as u32);
@@ -5505,6 +5876,89 @@ kernel void t_code_rows(device const float* z [[buffer(0)]], device const float*
         threadgroup_barrier(mem_flags::mem_device);
     }
 }
+// The standard normal draw `index` of (key, stream): Philox4x32-10, then Box–Muller
+// (`posterior_normal` on the host; indices fit 32 bits here).
+inline float posterior_normal(uint2 key, uint2 stream, uint index) {
+    uint c0 = index, c1 = 0u, c2 = stream.x, c3 = stream.y, k0 = key.x, k1 = key.y;
+    for (int round = 0; round < 10; ++round) {
+        if (round > 0) { k0 += 0x9E3779B9u; k1 += 0xBB67AE85u; }
+        uint hi0 = mulhi(0xD2511F53u, c0), lo0 = 0xD2511F53u * c0;
+        uint hi1 = mulhi(0xCD9E8D57u, c2), lo1 = 0xCD9E8D57u * c2;
+        c0 = hi1 ^ c1 ^ k0; c1 = lo1; c2 = hi0 ^ c3 ^ k1; c3 = lo0;
+    }
+    float u1 = (float(c0) + 0.5f) * 2.3283064e-10f, u2 = float(c1) * 2.3283064e-10f;
+    return sqrt(-2.0f * log(u1)) * cos(6.28318530717958647692f * u2);
+}
+
+// The parameters of the posterior kernels (Rust `Posterior`).
+struct Posterior { uint n; uint count; uint2 key; uint2 stream; float mean_rate; float log_sd_rate; float beta1; float beta2; float epsilon; float c1; float c2; uint pad; };
+
+kernel void t_reparameterize(device const float* mean [[buffer(0)]], device const float* log_sd [[buffer(1)]], device float* theta [[buffer(2)]],
+                             constant Posterior& p [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+    if (i < p.n) theta[i] = mean[i] + exp(log_sd[i]) * posterior_normal(p.key, p.stream, i);
+}
+
+// Adds a live entry's (1, μ² + σ², 2s) to its group's row of `sums`: once per SIMD group when every
+// live lane's group is the first lane's, else per lane. Every lane calls it.
+inline void group_add(device float* sums, uint g, bool live, float a, float b, float c) {
+    uint g0 = simd_broadcast_first(g);
+    if (simd_all(!live || g == g0)) {
+        a = simd_sum(a); b = simd_sum(b); c = simd_sum(c);
+        if (simd_is_first() && a > 0.0f) {
+            atomic_fetch_add_explicit((device atomic_float*)(sums + 3 * g0), a, memory_order_relaxed);
+            atomic_fetch_add_explicit((device atomic_float*)(sums + 3 * g0 + 1), b, memory_order_relaxed);
+            atomic_fetch_add_explicit((device atomic_float*)(sums + 3 * g0 + 2), c, memory_order_relaxed);
+        }
+    } else if (live) {
+        atomic_fetch_add_explicit((device atomic_float*)(sums + 3 * g), a, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)(sums + 3 * g + 1), b, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)(sums + 3 * g + 2), c, memory_order_relaxed);
+    }
+}
+
+// One thread per entry (the dispatch covers every entry once), so every lane reaches `group_add`.
+kernel void t_posterior_adam(device const float* gradient [[buffer(0)]], device const uint* groups [[buffer(1)]], device const float* variance [[buffer(2)]],
+                             device float* mean [[buffer(3)]], device float* log_sd [[buffer(4)]], device float* mm [[buffer(5)]], device float* mv [[buffer(6)]],
+                             device float* sm [[buffer(7)]], device float* sv [[buffer(8)]], device float* sums [[buffer(9)]],
+                             constant Posterior& p [[buffer(10)]], uint i [[thread_position_in_grid]]) {
+    uint g = i < p.n ? groups[i] : 0u;
+    bool live = i < p.n && g < p.count && log_sd[i] != -INFINITY;
+    float a = 0.0f, b = 0.0f, c = 0.0f;
+    if (live) {
+        float v = variance[g], mu = mean[i], s = log_sd[i], sd = exp(s);
+        float e = posterior_normal(p.key, p.stream, i), gi = gradient[i];
+        float gm = gi + mu / v, gs = gi * e * sd + sd * sd / v - 1.0f;
+        float m1 = p.beta1 * mm[i] + (1.0f - p.beta1) * gm, v1 = p.beta2 * mv[i] + (1.0f - p.beta2) * gm * gm;
+        float m2 = p.beta1 * sm[i] + (1.0f - p.beta1) * gs, v2 = p.beta2 * sv[i] + (1.0f - p.beta2) * gs * gs;
+        mm[i] = m1; mv[i] = v1; sm[i] = m2; sv[i] = v2;
+        mu -= p.mean_rate * (m1 / p.c1) / (sqrt(v1 / p.c2) + p.epsilon);
+        s -= p.log_sd_rate * (m2 / p.c1) / (sqrt(v2 / p.c2) + p.epsilon);
+        mean[i] = mu; log_sd[i] = s;
+        a = 1.0f; b = mu * mu + exp(2.0f * s); c = 2.0f * s;
+    }
+    group_add(sums, g, live, a, b, c);
+}
+
+kernel void t_group_moments(device const float* mean [[buffer(0)]], device const float* log_sd [[buffer(1)]], device const uint* groups [[buffer(2)]],
+                            device float* sums [[buffer(3)]], constant Posterior& p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    uint g = i < p.n ? groups[i] : 0u;
+    bool live = i < p.n && g < p.count && log_sd[i] != -INFINITY;
+    float a = live ? 1.0f : 0.0f;
+    float b = live ? mean[i] * mean[i] + exp(2.0f * log_sd[i]) : 0.0f;
+    float c = live ? 2.0f * log_sd[i] : 0.0f;
+    group_add(sums, g, live, a, b, c);
+}
+
+kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* variance [[buffer(1)]], device float* divergence [[buffer(2)]],
+                               constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        float count = sums[3 * i], second = sums[3 * i + 1], log_variance = sums[3 * i + 2];
+        float v = count > 0.0f ? second / count : 0.0f;
+        variance[i] = v;
+        divergence[i] = count > 0.0f ? 0.5f * (count * log(v) - log_variance) : 0.0f;
+        sums[3 * i] = 0.0f; sums[3 * i + 1] = 0.0f; sums[3 * i + 2] = 0.0f;
+    }
+}
 "#;
 
     const NAMES: &[&str] = &[
@@ -5529,6 +5983,10 @@ kernel void t_code_rows(device const float* z [[buffer(0)]], device const float*
         "t_argmax_rows",
         "t_fill_entries",
         "t_adam",
+        "t_reparameterize",
+        "t_posterior_adam",
+        "t_group_moments",
+        "t_group_divergence",
         "t_select_sets",
         "t_box_charge",
         "t_code_rows",
@@ -5548,6 +6006,29 @@ kernel void t_code_rows(device const float* z [[buffer(0)]], device const float*
         beta: f32,
         c: u32,
         d: u32,
+    }
+
+    /// The parameters of the posterior kernels (MSL `Posterior`).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Posterior {
+        n: u32,
+        count: u32,
+        key: [u32; 2],
+        stream: [u32; 2],
+        mean_rate: f32,
+        log_sd_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        c1: f32,
+        c2: f32,
+        pad: u32,
+    }
+
+    /// A 64-bit counter word as MSL's `uint2` (low half first).
+    fn halves(x: u64) -> [u32; 2] {
+        [x as u32, (x >> 32) as u32]
     }
 
     fn u32_of(n: usize) -> Result<u32, GpuError> {
@@ -5823,6 +6304,63 @@ kernel void t_code_rows(device const float* z [[buffer(0)]], device const float*
             let p = P { alpha: rate as f32, beta: epsilon as f32, ..P::default() };
             let buffers = [whole(buffer(w)?), whole(buffer(m)?), whole(buffer(v)?), whole(buffer(g)?), whole(&constants)];
             self.elements("t_adam", &buffers, w.len(), p)
+        }
+
+        fn posterior(&self, kernel: &'static str, buffers: &[(&Buffer, usize)], n: usize, mut p: Posterior) -> Result<(), GpuError> {
+            p.n = u32_of(n)?;
+            self.stream.dispatch(kernel, buffers, &p, spread(n))
+        }
+
+        pub(super) fn reparameterize(&self, theta: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {
+            let p = Posterior { key: halves(key), stream: halves(stream), ..Posterior::default() };
+            self.posterior("t_reparameterize", &[whole(buffer(mean)?), whole(buffer(log_sd)?), whole(buffer(theta)?)], theta.len(), p)
+        }
+
+        pub(super) fn posterior_adam(
+            &self,
+            (mean, log_sd): (&mut Tensor, &mut Tensor),
+            [mm, mv, sm, sv]: [&mut Tensor; 4],
+            gradient: &Tensor,
+            (groups, variance): (&Indices, &Tensor),
+            sums: &mut Tensor,
+            step: &super::PosteriorStep,
+        ) -> Result<(), GpuError> {
+            let (c1, c2) = step.corrections();
+            let p = Posterior {
+                count: u32_of(variance.len())?,
+                key: halves(step.key),
+                stream: halves(step.stream),
+                mean_rate: step.mean_rate as f32,
+                log_sd_rate: step.log_sd_rate as f32,
+                beta1: step.beta1 as f32,
+                beta2: step.beta2 as f32,
+                epsilon: step.epsilon as f32,
+                c1: c1 as f32,
+                c2: c2 as f32,
+                ..Posterior::default()
+            };
+            let buffers = [
+                whole(buffer(gradient)?),
+                whole(index_buffer(groups)?),
+                whole(buffer(variance)?),
+                whole(buffer(mean)?),
+                whole(buffer(log_sd)?),
+                whole(buffer(mm)?),
+                whole(buffer(mv)?),
+                whole(buffer(sm)?),
+                whole(buffer(sv)?),
+                whole(buffer(sums)?),
+            ];
+            self.posterior("t_posterior_adam", &buffers, mean.len(), p)
+        }
+
+        pub(super) fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
+            let p = Posterior { count: u32_of(sums.rows)?, ..Posterior::default() };
+            self.posterior("t_group_moments", &[whole(buffer(mean)?), whole(buffer(log_sd)?), whole(index_buffer(groups)?), whole(buffer(sums)?)], mean.len(), p)
+        }
+
+        pub(super) fn group_divergence(&self, sums: &mut Tensor, variance: &mut Tensor, divergence: &mut Tensor) -> Result<(), GpuError> {
+            self.elements("t_group_divergence", &[whole(buffer(sums)?), whole(buffer(variance)?), whole(buffer(divergence)?)], variance.len(), P::default())
         }
 
         pub(super) fn select_sets(&self, (a, q): (&Tensor, &Tensor), bits: &Tensor, left: &Tensor, weight: &Tensor, mask: &mut Tensor) -> Result<(), GpuError> {
