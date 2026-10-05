@@ -962,7 +962,12 @@ fn frozen_structural_ids(
 ) -> (Vec<usize>, Vec<usize>) {
     let expressions: Vec<_> = records
         .iter()
-        .filter(|r| matches!(r.mutation, Some(Mutation::SynthesizeExpression { .. })))
+        .filter(|r| {
+            matches!(
+                r.mutation,
+                Some(Mutation::SynthesizeExpression { .. } | Mutation::SynthesizeSharedDAG { .. })
+            )
+        })
         .take(expression_limit)
         .map(|r| r.id)
         .collect();
@@ -2733,6 +2738,7 @@ mod tests {
                 max_frontier: 8,
                 max_argument_bindings: 2,
                 max_compound_pairs: 24,
+                shared_dag_search: None,
                 expression_search: None,
                 preserve_native_places: vec![],
             },
@@ -2918,6 +2924,15 @@ mod tests {
     }
     #[test]
     fn expression_search_rejects_clean_cancellation_under_independent_native_controls() {
+        controlled_cancellation_gate(false, false);
+    }
+    #[test]
+    fn joint_dag_search_preserves_two_observable_consumers_under_controls_and_replay() {
+        // Implementation calibration only: this supplied synthetic teacher is not evidence of native algorithm discovery.
+        controlled_cancellation_gate(true, false);
+    }
+    fn controlled_cancellation_gate(joint: bool, square: bool) {
+        let gate_started = Instant::now();
         use gam_mpd::operator_program::{exact_precision, Declarations, Interface, Operator, Slot};
         use ndarray::array;
         let dense = |name: &str, v: Array2<f64>| {
@@ -2933,7 +2948,7 @@ mod tests {
                 .expect("dense"),
             )
         };
-        let native = OperatorProgram {
+        let mut native = OperatorProgram {
             declarations: Declarations {
                 domains: vec![],
                 slots: vec![Slot::Raw { width: 1 }],
@@ -2969,6 +2984,26 @@ mod tests {
             ],
             output: 4,
         };
+        if joint {
+            native.operators.pop();
+            native.nodes.truncate(4);
+            native.nodes.extend([
+                if square {
+                    Node::Hadamard { left: 3, right: 3 }
+                } else {
+                    Node::Pointwise {
+                        input: 3,
+                        laws: vec![gam_mpd::operator_program::Law::Relu],
+                    }
+                },
+                Node::Pointwise {
+                    input: 3,
+                    laws: vec![gam_mpd::operator_program::Law::Silu],
+                },
+                Node::Concat { parts: vec![4, 5] },
+            ]);
+            native.output = 6;
+        }
         let family = FamilyInputs {
             rows: 3,
             slots: vec![SlotValues::Raw(array![[-1.], [0.5], [1.5]])],
@@ -3017,7 +3052,7 @@ mod tests {
             name: name.into(),
             value: 1e-5,
         };
-        let structural = StructuralSettings {
+        let mut structural = StructuralSettings {
             settings: program_structure_search::Settings {
                 region_limits: gam_mpd::program_regions::Limits {
                     max_internal_nodes: 1,
@@ -3033,6 +3068,7 @@ mod tests {
                 max_argument_bindings: 2,
                 max_compound_pairs: 8,
                 preserve_native_places: vec![],
+                shared_dag_search: None,
                 expression_search: Some(program_structure_search::ExpressionSettings {
                     grammar: Grammar {
                         arguments: 2,
@@ -3057,6 +3093,60 @@ mod tests {
             },
             max_expression_evaluations: 2,
         };
+        if joint {
+            structural.constraints.max_local_errors[0].value = 1e-6;
+            structural.settings.expression_search = None;
+            structural.settings.max_callback_calls = 2000;
+            structural.settings.max_move_attempts = 10000;
+            structural.settings.shared_dag_search =
+                Some(program_structure_search::SharedDAGSettings {
+                    region_limits: gam_mpd::program_joint_regions::Limits {
+                        max_internal_nodes: 3,
+                        max_inputs: 2,
+                        max_exits: 2,
+                        max_regions: 30,
+                        max_states: 200,
+                    },
+                    grammar: Grammar {
+                        arguments: 2,
+                        max_operations: 3,
+                        max_expressions: 400,
+                        unary: vec![composed_rule_search::Unary::Silu],
+                        binary: vec![
+                            composed_rule_search::Binary::Subtract,
+                            composed_rule_search::Binary::Multiply,
+                        ],
+                        affine: false,
+                    },
+                    max_enumerations_per_parent: 30,
+                    max_tuple_checks: 160000,
+                    max_tuples_per_enumeration: 10000,
+                    max_body_nodes: 12,
+                    max_move_attempts: 9000,
+                    max_callback_calls: 1900,
+                });
+        }
+        if joint && !square {
+            let proposal = structural
+                .settings
+                .shared_dag_search
+                .as_mut()
+                .expect("joint settings");
+            // Complete two-argument, two-operation grammar (58 trees), not a seeded formula.
+            proposal.grammar.max_operations = 2;
+            proposal.grammar.max_expressions = 100;
+            proposal.grammar.unary = vec![
+                composed_rule_search::Unary::Relu,
+                composed_rule_search::Unary::Silu,
+            ];
+            proposal.grammar.binary = vec![composed_rule_search::Binary::Subtract];
+            let inventory = gam_mpd::composed_rule_search::enumerate(&proposal.grammar)
+                .expect("complete grammar");
+            assert!(!inventory.truncated);
+            assert_eq!(inventory.intermediate_expressions, 58);
+            proposal.max_tuple_checks = 58 * 58;
+            proposal.max_tuples_per_enumeration = 58 * 58;
+        }
         let settings = Settings {
             export_sha256: "0".repeat(64),
             layers: 1,
@@ -3087,7 +3177,7 @@ mod tests {
             evaluation: None,
         };
         let out = std::env::temp_dir().join(format!(
-            "mpd-structural-expression-driver-{}",
+            "mpd-structural-expression-driver-{joint}-{square}-{}",
             std::process::id()
         ));
         if out.exists() {
@@ -3114,21 +3204,63 @@ mod tests {
         )
         .expect("json");
         let attempts = report["report"]["attempts"].as_array().expect("attempts");
+        let kind = if joint {
+            "synthesize_shared_dag"
+        } else {
+            "synthesize_expression"
+        };
         assert!(
             attempts
                 .iter()
-                .any(|a| a["mutation"]["kind"] == "synthesize_expression"
-                    && a["status"] == "fitted_admitted"),
-            "{report}"
+                .any(|a| a["mutation"]["kind"] == kind && a["status"] == "fitted_admitted"),
+            "no admitted {kind}; counts={}",
+            report["report"]["counts"]
         );
         let mut canceled_wrong = false;
-        for attempt in attempts
-            .iter()
-            .filter(|a| a["mutation"]["kind"] == "synthesize_expression")
-        {
+        for attempt in attempts.iter().filter(|a| a["mutation"]["kind"] == kind) {
             let id = attempt["attempt_id"].as_u64().expect("id");
             let p = out.join(format!("structural-attempt-{id:06}/TRAIN.json"));
             if !p.exists() {
+                let root = out.join(format!("structural-attempt-{id:06}"));
+                if joint && !canceled_wrong && root.join("LOCAL_SCREEN.json").exists() {
+                    let defs = controls(
+                        &Artifact::native(&native).expect("source"),
+                        &native,
+                        &[],
+                        &settings.controls,
+                    )
+                    .expect("defs");
+                    let lowered =
+                        intervention_program::compile(&native, &defs).expect("lowered controls");
+                    let bytes =
+                        std::fs::read(root.join("program.artifact")).expect("screened artifact");
+                    let candidate = Artifact::from_bytes(&bytes, &lowered.program.declarations)
+                        .expect("screened decode");
+                    let clean = episodes(
+                        &lowered,
+                        &native,
+                        &defs,
+                        &family,
+                        &settings.cases[..1],
+                        &targets[..1],
+                        None,
+                    )
+                    .expect("clean case");
+                    let output = candidate
+                        .program
+                        .execute(&clean[0].inputs, false)
+                        .expect("own clean forward")
+                        .values[candidate.program.output]
+                        .clone();
+                    let clean_kl = (0..family.rows)
+                        .map(|r| gam_mpd::acceptance::kl_logits(targets[0].row(r), output.row(r)).0)
+                        .sum::<f64>()
+                        / family.rows as f64;
+                    if clean_kl.abs() < 1e-8 {
+                        assert_ne!(attempt["status"], "fitted_admitted");
+                        canceled_wrong = true;
+                    }
+                }
                 continue;
             }
             let m: Value =
@@ -3142,7 +3274,7 @@ mod tests {
         }
         assert!(
             canceled_wrong,
-            "clean-only zero cancellation must be measured and rejected by intervention objective"
+            "clean-equivalent cancellation must be rejected by independently controlled Local or KL"
         );
         let frozen: Value = serde_json::from_slice(
             &std::fs::read(out.join("FROZEN_EVALUATION_IDS.json")).expect("freeze"),
@@ -3152,6 +3284,102 @@ mod tests {
             .as_array()
             .expect("hypotheses")
             .is_empty());
-        std::fs::remove_dir_all(out).expect("cleanup");
+        if joint {
+            // Freeze by training admission before constructing any heldout targets.
+            let chosen = attempts
+                .iter()
+                .find(|a| {
+                    a["mutation"]["kind"] == kind
+                        && a["status"] == "fitted_admitted"
+                        && a["mutation"]["region"]["native_writes"]
+                            .as_array()
+                            .is_some_and(|w| w.len() == 2)
+                })
+                .expect("joint equation admission");
+            let id = chosen["attempt_id"].as_u64().expect("attempt");
+            save(&out.join("GATE_FROZEN_JOINT_ATTEMPT.json"), &json!({"attempt_id":id,"selection":"first training-admitted two-exit shared DAG; implementation calibration only"})).expect("freeze gate before heldout targets");
+            let control_defs = controls(
+                &Artifact::native(&native).expect("native"),
+                &native,
+                &[],
+                &settings.controls,
+            )
+            .expect("controls");
+            let compiled =
+                intervention_program::compile(&native, &control_defs).expect("compile controls");
+            let path = out.join(format!("structural-attempt-{id:06}/program.artifact"));
+            let bytes = std::fs::read(path).expect("saved joint");
+            let decoded =
+                Artifact::from_bytes(&bytes, &compiled.program.declarations).expect("decode");
+            assert_eq!(decoded.to_bytes().expect("reencode"), bytes);
+            let exits: Vec<_> = decoded.blocks.iter().map(|b| b.native_write).collect();
+            let expected: Vec<_> = [4, 5].iter().map(|n| compiled.root_mapping[*n]).collect();
+            assert!(
+                expected.iter().all(|n| exits.contains(n)),
+                "observable consumers must have Local relations: {exits:?} vs {expected:?}"
+            );
+            let heldout = FamilyInputs {
+                rows: 3,
+                slots: vec![SlotValues::Raw(array![[0.3], [-0.8], [2.1]])],
+                layout: None,
+            };
+            let heldout_cases = vec![Case {
+                label: "unseen combined signed controls".into(),
+                group: "heldout".into(),
+                gains: vec![-1.2, 0.7],
+                down_amplitudes: vec![],
+            }];
+            let (targets, _) = family_teacher_targets(
+                &d,
+                &native,
+                &[],
+                &settings.controls,
+                &heldout,
+                &heldout_cases,
+                None,
+                1 << 26,
+                1 << 26,
+            )
+            .expect("heldout targets");
+            let heldout_episodes = episodes(
+                &compiled,
+                &native,
+                &control_defs,
+                &heldout,
+                &heldout_cases,
+                &targets,
+                None,
+            )
+            .expect("heldout episodes");
+            let measure =
+                resident_causal_fit::measure(&d, &decoded.program, &heldout_episodes, 1 << 26)
+                    .expect("joint heldout KL");
+            assert!(
+                measure.objective < 1e-6,
+                "heldout joint KL {}",
+                measure.objective
+            );
+            let local = gam_mpd::acceptance::Local::new(
+                &compiled.program,
+                heldout_episodes[0].inputs.clone(),
+                None,
+                3,
+            );
+            let local_measure = local.measure(&decoded).expect("heldout Local");
+            assert!(local_measure.worst().expect("exits").worst < 1e-6);
+            save(&out.join("GATE_HELDOUT.json"),&json!({"scope":"synthetic implementation gate only; not native algorithm discovery","selected_attempt":id,"saved_artifact_sha256":sha256(&out.join(format!("structural-attempt-{id:06}/program.artifact"))).expect("SHA"),"ordinary_replay_bytes_equal":true,"heldout_kl":measure,"heldout_local":local_measure,"observable_native_writes":expected})).expect("save gate evidence");
+        }
+        if joint {
+            eprintln!(
+                "joint DAG implementation gate seconds={} counts={}",
+                gate_started.elapsed().as_secs_f64(),
+                report["report"]["counts"]
+            );
+        }
+        if joint {
+            eprintln!("joint gate evidence retained at {}", out.display());
+        } else {
+            std::fs::remove_dir_all(out).expect("cleanup");
+        }
     }
 }

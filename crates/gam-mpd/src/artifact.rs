@@ -344,9 +344,24 @@ fn compaction(keep: &[bool]) -> Vec<usize> {
 /// `program` compacted as [`OperatorProgram::prune`] compacts it (the nodes its output reads, the
 /// rules those call, the operators and bases they use), also keeping the operators `keep`; the
 /// old-to-new node and operator maps (`usize::MAX` for what left).
-fn compact(program: &mut OperatorProgram, keep: &[usize]) -> (Vec<usize>, Vec<usize>) {
+pub(crate) fn compact(program: &mut OperatorProgram, keep: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    compact_with_roots(program, keep, &[])
+}
+
+/// Retain explicitly declared interface nodes as well as output ancestors. This
+/// gives root-level multi-output DAGs the same treatment as unused Call arguments:
+/// the inputs are still computed, serialized and charged, even when an equation
+/// does not use their values. Callers supply already-validated node indices.
+pub(crate) fn compact_with_roots(
+    program: &mut OperatorProgram,
+    keep: &[usize],
+    interface_roots: &[usize],
+) -> (Vec<usize>, Vec<usize>) {
     let mut live = vec![false; program.nodes.len()];
     live[program.output] = true;
+    for &node in interface_roots {
+        live[node] = true;
+    }
     for index in (0..program.nodes.len()).rev() {
         if live[index] {
             for argument in program.nodes[index].arguments() {
@@ -579,12 +594,12 @@ impl Artifact {
     }
 
     /// The operators derived operators read or are, which compaction keeps.
-    fn derived_operators(&self) -> Vec<usize> {
+    pub(crate) fn derived_operators(&self) -> Vec<usize> {
         self.derived.iter().flat_map(|d| std::iter::once(d.operator).chain(d.law.sources())).collect()
     }
 
     /// The derived operators with their operators renumbered by `op_map` (old to new).
-    fn renumbered_derived(&self, op_map: &[usize]) -> Result<Vec<Derived>, String> {
+    pub(crate) fn renumbered_derived(&self, op_map: &[usize]) -> Result<Vec<Derived>, String> {
         self.derived
             .iter()
             .map(|d| {

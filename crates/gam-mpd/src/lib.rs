@@ -85,6 +85,7 @@ pub mod resident_rule_fit;
 pub mod resident_causal_fit;
 pub mod composed_rule_search;
 pub mod program_regions;
+pub mod program_joint_regions;
 pub mod program_expression_search;
 pub mod program_structure_search;
 pub mod parameter_response_program;

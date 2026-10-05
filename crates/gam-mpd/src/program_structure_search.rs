@@ -7,7 +7,7 @@ use crate::{
     artifact::Artifact,
     composed_rule_search::{Expr, Grammar},
     operator_program::{Node, OperatorBody, OperatorProgram},
-    program_expression_search,
+    program_expression_search, program_joint_regions,
     program_regions::{self, Inventory, Limits, Region},
 };
 use serde::{Deserialize, Serialize};
@@ -59,6 +59,8 @@ pub struct Settings {
     /// budgets are reserved within the global totals rather than added to them.
     #[serde(default)]
     pub expression_search: Option<ExpressionSettings>,
+    #[serde(default)]
+    pub shared_dag_search: Option<SharedDAGSettings>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExpressionSettings {
@@ -67,6 +69,18 @@ pub struct ExpressionSettings {
     pub grammar: Grammar,
     /// Region/argument-binding enumerations inspected per fitted parent.
     pub max_enumerations_per_parent: usize,
+    pub max_move_attempts: usize,
+    pub max_callback_calls: usize,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SharedDAGSettings {
+    pub region_limits: program_joint_regions::Limits,
+    pub grammar: Grammar,
+    pub max_enumerations_per_parent: usize,
+    /// All inspected tuples, including nonsharing/type-incompatible tuples.
+    pub max_tuple_checks: usize,
+    pub max_tuples_per_enumeration: usize,
+    pub max_body_nodes: usize,
     pub max_move_attempts: usize,
     pub max_callback_calls: usize,
 }
@@ -87,6 +101,12 @@ pub enum Mutation {
         target_region: Region,
         native_arguments: Vec<usize>,
     },
+    #[serde(rename = "synthesize_shared_dag")]
+    SynthesizeSharedDAG {
+        region: program_joint_regions::Region,
+        expressions: Vec<Expr>,
+        native_arguments: Vec<usize>,
+    },
     SynthesizeExpression {
         region: Region,
         expression: Expr,
@@ -94,12 +114,13 @@ pub enum Mutation {
     },
 }
 impl Mutation {
-    pub fn region(&self) -> &Region {
+    pub fn region(&self) -> Option<&Region> {
         match self {
             Self::ExactExtract { region }
             | Self::ReuseExistingRule { region, .. }
-            | Self::SynthesizeExpression { region, .. } => region,
-            Self::ExtractAndReuse { target_region, .. } => target_region,
+            | Self::SynthesizeExpression { region, .. } => Some(region),
+            Self::ExtractAndReuse { target_region, .. } => Some(target_region),
+            Self::SynthesizeSharedDAG { .. } => None,
         }
     }
 }
@@ -196,11 +217,39 @@ pub struct ExpressionEnumeration {
     pub inventory: Option<program_expression_search::Inventory>,
     pub error: Option<String>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SharedDAGEnumeration {
+    pub parent_id: usize,
+    pub depth: usize,
+    pub region: program_joint_regions::Region,
+    pub native_arguments: Vec<usize>,
+    pub effective_grammar: Grammar,
+    pub inventory: Option<program_expression_search::SharedInventory>,
+    pub error: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SharedDAGSchedule {
+    pub parent_id: usize,
+    pub depth: usize,
+    pub region: program_joint_regions::Region,
+    pub enumerated_proposals: usize,
+    pub duplicate_binding_proposals: usize,
+    pub unique_proposals: usize,
+    pub priority: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JointRegionEnumeration {
+    pub parent_id: usize,
+    pub depth: usize,
+    pub inventory: Option<program_joint_regions::Inventory>,
+    pub error: Option<String>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposalFamily {
     Structural,
     Expression,
+    SharedDAG,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FamilyBudgetOmission {
@@ -230,6 +279,20 @@ pub struct Counts {
     pub expression_proposals: usize,
     pub expression_move_attempts: usize,
     pub expression_callback_calls: usize,
+    pub shared_dag_enumerations: usize,
+    pub shared_dag_enumeration_failures: usize,
+    pub shared_dag_enumeration_sets_truncated: usize,
+    pub shared_dag_inventories_truncated: usize,
+    pub shared_dag_tuple_checks: usize,
+    pub shared_dag_proposals: usize,
+    pub shared_dag_duplicate_binding_proposals: usize,
+    pub shared_dag_unique_proposals: usize,
+    pub shared_dag_move_attempts: usize,
+    pub shared_dag_callback_calls: usize,
+    pub joint_region_states_explored: usize,
+    pub joint_regions_proposed: usize,
+    pub joint_region_inventories_truncated: usize,
+    pub shared_dag_binding_sets_truncated: usize,
     pub move_attempts: usize,
     pub structural_rejections: usize,
     pub callback_calls: usize,
@@ -251,6 +314,9 @@ pub struct Report {
     pub enumerations: Vec<Enumeration>,
     pub compound_enumerations: Vec<CompoundEnumeration>,
     pub expression_enumerations: Vec<ExpressionEnumeration>,
+    pub shared_dag_enumerations: Vec<SharedDAGEnumeration>,
+    pub shared_dag_schedules: Vec<SharedDAGSchedule>,
+    pub joint_region_enumerations: Vec<JointRegionEnumeration>,
     pub family_budget_omissions: Vec<FamilyBudgetOmission>,
     pub admitted_candidates: Vec<CandidateRecord>,
     pub stop_reason: String,
@@ -494,12 +560,19 @@ fn rule_closure(program: &OperatorProgram, rule: usize) -> Result<BTreeSet<usize
 fn trainables(a: &Artifact, mutation: &Mutation) -> Result<Vec<usize>, String> {
     if matches!(
         mutation,
-        Mutation::ExactExtract { .. } | Mutation::SynthesizeExpression { .. }
+        Mutation::ExactExtract { .. }
+            | Mutation::SynthesizeExpression { .. }
+            | Mutation::SynthesizeSharedDAG { .. }
     ) {
         return Ok(vec![]);
     }
     let write = a
-        .place(mutation.region().native_write)
+        .place(
+            mutation
+                .region()
+                .ok_or("single-output rule mutation expected")?
+                .native_write,
+        )
         .ok_or("replacement write lost native provenance")?;
     let callee = match a.program.nodes.get(write) {
         Some(Node::Call { rule, .. }) => *rule,
@@ -548,6 +621,9 @@ fn trainables(a: &Artifact, mutation: &Mutation) -> Result<Vec<usize>, String> {
 }
 /// Bounded permutations of the existing native boundary only; no new inputs.
 fn bindings(region: &Region, maximum: usize) -> (Vec<Vec<usize>>, bool) {
+    boundary_bindings(&region.native_reads, maximum)
+}
+fn boundary_bindings(native_reads: &[usize], maximum: usize) -> (Vec<Vec<usize>>, bool) {
     fn visit(
         prefix: &mut Vec<usize>,
         remaining: &mut Vec<usize>,
@@ -576,7 +652,7 @@ fn bindings(region: &Region, maximum: usize) -> (Vec<Vec<usize>>, bool) {
     }
     let mut result = vec![];
     let mut truncated = false;
-    let mut remaining = region.native_reads.clone();
+    let mut remaining = native_reads.to_vec();
     remaining.sort_unstable();
     visit(
         &mut vec![],
@@ -784,6 +860,188 @@ fn expression_moves(
     }
     moves
 }
+fn shared_dag_moves(
+    artifact: &Artifact,
+    settings: &Settings,
+    parent_id: usize,
+    depth: usize,
+    report: &mut Report,
+) -> Vec<Mutation> {
+    let Some(shared) = &settings.shared_dag_search else {
+        return vec![];
+    };
+    let inventory =
+        match program_joint_regions::propose_regions(artifact, shared.region_limits.clone()) {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                report.counts.shared_dag_enumeration_failures += 1;
+                report
+                    .joint_region_enumerations
+                    .push(JointRegionEnumeration {
+                        parent_id,
+                        depth,
+                        inventory: None,
+                        error: Some(error),
+                    });
+                return vec![];
+            }
+        };
+    report.counts.joint_region_states_explored += inventory.explored_states;
+    report.counts.joint_regions_proposed += inventory.regions.len();
+    report.counts.joint_region_inventories_truncated += usize::from(inventory.truncated);
+    report
+        .joint_region_enumerations
+        .push(JointRegionEnumeration {
+            parent_id,
+            depth,
+            inventory: Some(inventory.clone()),
+            error: None,
+        });
+    let regions = inventory
+        .regions
+        .into_iter()
+        .map(|region| {
+            let (bindings, truncated) =
+                boundary_bindings(&region.native_reads, settings.max_argument_bindings);
+            report.counts.shared_dag_binding_sets_truncated += usize::from(truncated);
+            (region, bindings)
+        })
+        .collect::<Vec<_>>();
+    struct RegionProposals {
+        region: program_joint_regions::Region,
+        tuples: BTreeMap<Vec<Expr>, usize>,
+        enumerated: usize,
+        duplicates: usize,
+    }
+    let mut grouped: Vec<RegionProposals> = vec![];
+    let mut region_ids = BTreeMap::new();
+    let maximum_bindings = regions
+        .iter()
+        .map(|(_, args)| args.len())
+        .max()
+        .unwrap_or(0);
+    let mut checked = 0;
+    'enumerations: for binding_id in 0..maximum_bindings {
+        for (region, bindings) in &regions {
+            let Some(arguments) = bindings.get(binding_id) else {
+                continue;
+            };
+            if checked == shared.max_enumerations_per_parent {
+                report.counts.shared_dag_enumeration_sets_truncated += 1;
+                break 'enumerations;
+            }
+            checked += 1;
+            report.counts.shared_dag_enumerations += 1;
+            let mut grammar = shared.grammar.clone();
+            grammar.arguments = region.native_reads.len();
+            let mut enumeration = SharedDAGEnumeration {
+                parent_id,
+                depth,
+                region: region.clone(),
+                native_arguments: arguments.clone(),
+                effective_grammar: grammar.clone(),
+                inventory: None,
+                error: None,
+            };
+            match program_expression_search::enumerate_shared(
+                artifact,
+                region,
+                &grammar,
+                arguments,
+                shared.max_tuple_checks,
+                shared.max_tuples_per_enumeration,
+                shared.max_body_nodes,
+            ) {
+                Ok(inventory) => {
+                    report.counts.shared_dag_inventories_truncated +=
+                        usize::from(inventory.truncated);
+                    report.counts.shared_dag_tuple_checks += inventory.checked_tuples;
+                    report.counts.shared_dag_proposals += inventory.expressions.len();
+                    // Same native cut may be reached from different producer seeds.
+                    // Group by the actual boundary/cut, excluding the seed label.
+                    let key = (
+                        region.native_reads.clone(),
+                        region.native_writes.clone(),
+                        region.current_internal_nodes.clone(),
+                    );
+                    let group_id = *region_ids.entry(key).or_insert_with(|| {
+                        let id = grouped.len();
+                        grouped.push(RegionProposals {
+                            region: region.clone(),
+                            tuples: BTreeMap::new(),
+                            enumerated: 0,
+                            duplicates: 0,
+                        });
+                        id
+                    });
+                    let group = &mut grouped[group_id];
+                    for (expressions, node_count) in inventory
+                        .expressions
+                        .iter()
+                        .zip(&inventory.compiled_node_counts)
+                    {
+                        group.enumerated += 1;
+                        match program_expression_search::canonical_shared_expressions(
+                            region,
+                            expressions,
+                            arguments,
+                        ) {
+                            Ok(canonical) => {
+                                if group.tuples.contains_key(&canonical) {
+                                    group.duplicates += 1;
+                                    report.counts.shared_dag_duplicate_binding_proposals += 1;
+                                } else {
+                                    group.tuples.insert(canonical, *node_count);
+                                    report.counts.shared_dag_unique_proposals += 1;
+                                }
+                            }
+                            Err(error) => {
+                                report.counts.shared_dag_enumeration_failures += 1;
+                                enumeration.error = Some(error);
+                            }
+                        }
+                    }
+                    enumeration.inventory = Some(inventory);
+                }
+                Err(error) => {
+                    report.counts.shared_dag_enumeration_failures += 1;
+                    enumeration.error = Some(error);
+                }
+            }
+            report.shared_dag_enumerations.push(enumeration);
+        }
+    }
+    let mut lists = std::collections::VecDeque::new();
+    for group in grouped {
+        let mut ranked = group
+            .tuples
+            .into_iter()
+            .map(|(expressions, nodes)| (nodes, expressions))
+            .collect::<Vec<_>>();
+        ranked.sort();
+        report.shared_dag_schedules.push(SharedDAGSchedule {parent_id,depth,region:group.region.clone(),enumerated_proposals:group.enumerated,
+            duplicate_binding_proposals:group.duplicates,unique_proposals:ranked.len(),
+            priority:"Exact Arg remapping and commutative operand canonicalization across inspected bindings; unique native-coordinate tuples by compiled DAG node count then Expr tuple, round robin across native regions; no outcome reuse".into()});
+        let moves = ranked
+            .into_iter()
+            .map(|(_, expressions)| Mutation::SynthesizeSharedDAG {
+                native_arguments: group.region.native_reads.clone(),
+                region: group.region.clone(),
+                expressions,
+            })
+            .collect::<Vec<_>>();
+        lists.push_back(moves.into_iter());
+    }
+    let mut moves = vec![];
+    while let Some(mut list) = lists.pop_front() {
+        if let Some(proposal) = list.next() {
+            moves.push(proposal);
+            lists.push_back(list);
+        }
+    }
+    moves
+}
+
 fn omit_family(
     report: &mut Report,
     parent_id: usize,
@@ -851,6 +1109,27 @@ where
             );
         }
     }
+    if let Some(shared) = &settings.shared_dag_search {
+        if shared.grammar.affine {
+            return Err("shared DAG synthesis forbids learned affine adapters".into());
+        }
+        if shared.max_enumerations_per_parent == 0
+            || shared.max_tuple_checks == 0
+            || shared.max_tuples_per_enumeration == 0
+            || shared.max_body_nodes == 0
+            || shared.max_move_attempts == 0
+            || shared.max_callback_calls == 0
+            || shared.max_callback_calls > shared.max_move_attempts
+            || shared.grammar.max_expressions == 0
+        {
+            return Err("positive shared DAG enumeration/work/callback budgets required".into());
+        }
+        shared
+            .max_tuple_checks
+            .checked_mul(shared.region_limits.max_exits)
+            .and_then(|n| n.checked_add(1))
+            .ok_or("shared tuple budget overflow")?;
+    }
     let reserved_moves = settings
         .expression_search
         .as_ref()
@@ -859,6 +1138,27 @@ where
         .expression_search
         .as_ref()
         .map_or(0, |s| s.max_callback_calls);
+    let shared_reserved_moves = settings
+        .shared_dag_search
+        .as_ref()
+        .map_or(0, |s| s.max_move_attempts);
+    let shared_reserved_callbacks = settings
+        .shared_dag_search
+        .as_ref()
+        .map_or(0, |s| s.max_callback_calls);
+    let total_reserved_moves = reserved_moves
+        .checked_add(shared_reserved_moves)
+        .ok_or("proposal move budget overflow")?;
+    let total_reserved_callbacks = reserved_callbacks
+        .checked_add(shared_reserved_callbacks)
+        .ok_or("proposal callback budget overflow")?;
+    if total_reserved_moves > settings.max_move_attempts
+        || total_reserved_callbacks > settings.max_callback_calls
+    {
+        return Err(
+            "expression and shared DAG budgets must sum within global work/callback budgets".into(),
+        );
+    }
     if constraints.max_fidelity.is_empty()
         || constraints.max_local_errors.is_empty()
         || constraints.max_intervention_errors.is_empty()
@@ -921,6 +1221,9 @@ where
             enumerations: vec![],
             compound_enumerations: vec![],
             expression_enumerations: vec![],
+            shared_dag_enumerations: vec![],
+            shared_dag_schedules: vec![],
+            joint_region_enumerations: vec![],
             family_budget_omissions: vec![],
             admitted_candidates: vec![initial_record],
             stop_reason: "depth_budget".into(),
@@ -931,20 +1234,23 @@ where
         let parents = result.beam.clone();
         for parent_id in parents {
             result.report.counts.enumerations += 1;
-            let inventory = match program_regions::propose_regions(
+            let (inventory, region_error) = match program_regions::propose_regions(
                 &resident[&parent_id].evaluated.artifact,
                 settings.region_limits.clone(),
             ) {
-                Ok(inventory) => inventory,
+                Ok(inventory) => (inventory, None),
                 Err(reason) => {
                     result.report.counts.enumeration_failures += 1;
-                    result.report.enumerations.push(Enumeration {
-                        parent_id,
-                        depth,
-                        inventory: None,
-                        error: Some(reason),
-                    });
-                    continue;
+                    // Joint proposals have their own enumeration and remain reachable.
+                    (
+                        Inventory {
+                            regions: vec![],
+                            skipped: vec![],
+                            truncated: false,
+                            explored_states: 0,
+                        },
+                        Some(reason),
+                    )
                 }
             };
             result.report.counts.regions_proposed += inventory.regions.len();
@@ -953,8 +1259,8 @@ where
             result.report.enumerations.push(Enumeration {
                 parent_id,
                 depth,
-                inventory: Some(inventory.clone()),
-                error: None,
+                inventory: region_error.is_none().then(|| inventory.clone()),
+                error: region_error,
             });
             let rule_count = resident[&parent_id].evaluated.artifact.program.rules.len();
             let (compound, checked_pairs, truncated) = compound_moves(
@@ -992,6 +1298,13 @@ where
                 depth,
                 &mut result.report,
             );
+            let shared = shared_dag_moves(
+                &resident[&parent_id].evaluated.artifact,
+                settings,
+                parent_id,
+                depth,
+                &mut result.report,
+            );
             let singles = regions.into_iter().flat_map(|(region, arguments)| {
                 let mut moves = vec![Mutation::ExactExtract {
                     region: region.clone(),
@@ -1007,17 +1320,21 @@ where
                 }
                 moves
             });
-            let mut structural = compound.into_iter().chain(singles);
-            let mut expression = expression.into_iter();
-            let mut expression_turn = true;
+            let structural = compound.into_iter().chain(singles).collect::<Vec<_>>();
+            let mut families = std::collections::VecDeque::new();
+            if settings.shared_dag_search.is_some() {
+                families.push_back(shared.into_iter());
+            }
+            families.push_back(expression.into_iter());
+            families.push_back(structural.into_iter());
             let moves = std::iter::from_fn(move || {
-                let next = if expression_turn {
-                    expression.next().or_else(|| structural.next())
-                } else {
-                    structural.next().or_else(|| expression.next())
-                };
-                expression_turn = !expression_turn;
-                next
+                while let Some(mut family) = families.pop_front() {
+                    if let Some(proposal) = family.next() {
+                        families.push_back(family);
+                        return Some(proposal);
+                    }
+                }
+                None
             });
             for mutation in moves {
                 if result.report.counts.move_attempts == settings.max_move_attempts
@@ -1034,43 +1351,57 @@ where
                     break 'depths;
                 }
                 let is_expression = matches!(mutation, Mutation::SynthesizeExpression { .. });
+                let is_shared = matches!(mutation, Mutation::SynthesizeSharedDAG { .. });
                 let counts = &result.report.counts;
-                let omission = if is_expression {
-                    if counts.expression_move_attempts == reserved_moves {
-                        Some("expression move allocation exhausted")
-                    } else if counts.expression_callback_calls == reserved_callbacks {
-                        Some("expression callback allocation exhausted")
+                let family = if is_shared {
+                    ProposalFamily::SharedDAG
+                } else if is_expression {
+                    ProposalFamily::Expression
+                } else {
+                    ProposalFamily::Structural
+                };
+                let (moves_used, callbacks_used, allocated_moves, allocated_callbacks) =
+                    if is_shared {
+                        (
+                            counts.shared_dag_move_attempts,
+                            counts.shared_dag_callback_calls,
+                            shared_reserved_moves,
+                            shared_reserved_callbacks,
+                        )
+                    } else if is_expression {
+                        (
+                            counts.expression_move_attempts,
+                            counts.expression_callback_calls,
+                            reserved_moves,
+                            reserved_callbacks,
+                        )
                     } else {
-                        None
-                    }
-                } else if counts.move_attempts - counts.expression_move_attempts
-                    == settings.max_move_attempts - reserved_moves
-                {
-                    Some("structural move allocation exhausted; expression allocation reserved")
-                } else if counts.callback_calls - counts.expression_callback_calls
-                    == settings.max_callback_calls - reserved_callbacks
-                {
-                    Some("structural callback allocation exhausted; expression allocation reserved")
+                        (
+                            counts.move_attempts
+                                - counts.expression_move_attempts
+                                - counts.shared_dag_move_attempts,
+                            counts.callback_calls
+                                - counts.expression_callback_calls
+                                - counts.shared_dag_callback_calls,
+                            settings.max_move_attempts - total_reserved_moves,
+                            settings.max_callback_calls - total_reserved_callbacks,
+                        )
+                    };
+                let omission = if moves_used == allocated_moves {
+                    Some("proposal family move allocation exhausted")
+                } else if callbacks_used == allocated_callbacks {
+                    Some("proposal family callback allocation exhausted")
                 } else {
                     None
                 };
                 if let Some(reason) = omission {
-                    omit_family(
-                        &mut result.report,
-                        parent_id,
-                        depth,
-                        if is_expression {
-                            ProposalFamily::Expression
-                        } else {
-                            ProposalFamily::Structural
-                        },
-                        reason,
-                    );
+                    omit_family(&mut result.report, parent_id, depth, family, reason);
                     continue;
                 }
                 let attempt_id = result.report.counts.move_attempts;
                 result.report.counts.move_attempts += 1;
                 result.report.counts.expression_move_attempts += usize::from(is_expression);
+                result.report.counts.shared_dag_move_attempts += usize::from(is_shared);
                 let parent = &resident[&parent_id].evaluated;
                 let proposed = match &mutation {
                     Mutation::ExactExtract { region } => {
@@ -1094,6 +1425,16 @@ where
                         &parent.artifact,
                         source_region,
                         target_region,
+                        native_arguments,
+                    ),
+                    Mutation::SynthesizeSharedDAG {
+                        region,
+                        expressions,
+                        native_arguments,
+                    } => program_expression_search::apply_shared(
+                        &parent.artifact,
+                        region,
+                        expressions,
                         native_arguments,
                     ),
                     Mutation::SynthesizeExpression {
@@ -1142,6 +1483,7 @@ where
                 attempt.trainable_operator_ids = operators.clone();
                 result.report.counts.callback_calls += 1;
                 result.report.counts.expression_callback_calls += usize::from(is_expression);
+                result.report.counts.shared_dag_callback_calls += usize::from(is_shared);
                 let fitted = match fit_and_measure(FitRequest {
                     candidate: &proposed,
                     mutation: &mutation,
@@ -1257,8 +1599,8 @@ where
 mod tests {
     use super::*;
     use crate::operator_program::{
-        Declarations, FamilyInputs, Interface, Law, Operator, Provenance, Slot, SlotValues,
-        exact_precision,
+        Coefficient, Declarations, FamilyInputs, Interface, Law, Operator, Provenance, Slot,
+        SlotValues, exact_precision,
     };
     use ndarray::array;
     use std::sync::Arc;
@@ -1376,6 +1718,7 @@ mod tests {
             max_compound_pairs: 32,
             preserve_native_places: vec![0],
             expression_search: None,
+            shared_dag_search: None,
         }
     }
     fn constraints() -> Constraints {
@@ -1995,6 +2338,263 @@ mod tests {
                 .arguments,
             1
         );
+    }
+    fn joint_fixture() -> OperatorProgram {
+        let mut native = heterogeneous();
+        native.operators = vec![std::sync::Arc::new(Operator::identity(
+            "sum",
+            Interface::native(1).unwrap(),
+        ))];
+        native.nodes = vec![
+            Node::Raw { slot: 0 },
+            Node::Pointwise {
+                input: 0,
+                laws: vec![Law::Silu],
+            },
+            Node::Gain {
+                input: 1,
+                coefficient: Coefficient::Number(1.),
+            },
+            Node::Gain {
+                input: 1,
+                coefficient: Coefficient::Number(1.),
+            },
+            Node::Affine {
+                terms: vec![(2, 0), (3, 0)],
+                bias: None,
+            },
+        ];
+        native.output = 4;
+        native
+    }
+    fn joint_settings() -> SharedDAGSettings {
+        SharedDAGSettings {
+            region_limits: program_joint_regions::Limits {
+                max_internal_nodes: 3,
+                max_inputs: 1,
+                max_exits: 2,
+                max_regions: 8,
+                max_states: 32,
+            },
+            grammar: Grammar {
+                arguments: 0,
+                max_operations: 1,
+                max_expressions: 4,
+                unary: vec![crate::composed_rule_search::Unary::Silu],
+                binary: vec![],
+                affine: false,
+            },
+            max_enumerations_per_parent: 4,
+            max_tuple_checks: 8,
+            max_tuples_per_enumeration: 4,
+            max_body_nodes: 8,
+            max_move_attempts: 1,
+            max_callback_calls: 1,
+        }
+    }
+    #[test]
+    fn joint_synthesis_search_saves_actual_shared_state_and_distinct_native_exits() {
+        let native = joint_fixture();
+        let mut configuration = settings(1);
+        configuration.shared_dag_search = Some(joint_settings());
+        configuration.max_callback_calls = 2;
+        configuration.max_move_attempts = 2;
+        let mut saved = None;
+        let result = search(
+            &native,
+            evaluated(&Artifact::native(&native).unwrap(), &native),
+            &configuration,
+            &constraints(),
+            |request| {
+                let measured = evaluated(request.candidate, &native);
+                if let Mutation::SynthesizeSharedDAG {
+                    region,
+                    expressions,
+                    ..
+                } = request.mutation
+                {
+                    assert!(request.trainable_operator_ids.is_empty());
+                    assert_eq!(region.native_writes, vec![2, 3]);
+                    assert_eq!(expressions.len(), 2);
+                    assert!(measured.artifact.place(1).is_none());
+                    assert_ne!(measured.artifact.place(2), measured.artifact.place(3));
+                    saved = Some(measured.artifact.to_bytes().unwrap());
+                }
+                Ok(measured)
+            },
+        )
+        .unwrap();
+        assert_eq!(result.report.counts.shared_dag_callback_calls, 1);
+        assert!(
+            result
+                .report
+                .admitted_candidates
+                .iter()
+                .any(|c| matches!(c.mutation, Some(Mutation::SynthesizeSharedDAG { .. })))
+        );
+        let decoded = Artifact::from_bytes(&saved.unwrap(), &native.declarations).unwrap();
+        assert_eq!(
+            decoded
+                .program
+                .nodes
+                .iter()
+                .filter(|n| matches!(n, Node::Pointwise { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            decoded.execute(&inputs(&native)).unwrap().values[decoded.program.output],
+            native.execute(&inputs(&native), false).unwrap().values[native.output]
+        );
+        let mutation = &result
+            .report
+            .attempts
+            .iter()
+            .find(|a| matches!(a.mutation, Mutation::SynthesizeSharedDAG { .. }))
+            .unwrap()
+            .mutation;
+        let value = serde_json::to_value(mutation).unwrap();
+        assert_eq!(value["kind"], "synthesize_shared_dag");
+        let roundtrip: Mutation = serde_json::from_value(value).unwrap();
+        assert_eq!(&roundtrip, mutation);
+    }
+    #[test]
+    fn joint_callbacks_are_reserved_and_finite_intervention_failures_are_rejected() {
+        let native = joint_fixture();
+        let mut configuration = settings(1);
+        configuration.max_callback_calls = 3;
+        configuration.max_move_attempts = 3;
+        configuration.shared_dag_search = Some(joint_settings());
+        configuration.expression_search = Some(ExpressionSettings {
+            grammar: joint_settings().grammar,
+            max_enumerations_per_parent: 1,
+            max_move_attempts: 1,
+            max_callback_calls: 1,
+        });
+        let result = search(
+            &native,
+            evaluated(&Artifact::native(&native).unwrap(), &native),
+            &configuration,
+            &constraints(),
+            |request| {
+                if matches!(request.mutation, Mutation::SynthesizeSharedDAG { .. }) {
+                    let mut measured = evaluated(request.candidate, &native);
+                    measured.evaluation.intervention_errors[0].value = 0.1;
+                    Ok(measured)
+                } else {
+                    Err("records family scheduling".into())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(result.report.counts.shared_dag_callback_calls, 1);
+        assert_eq!(result.report.counts.expression_callback_calls, 1);
+        assert_eq!(result.report.counts.callback_calls, 3);
+        assert!(matches!(
+            result.report.attempts[0].mutation,
+            Mutation::SynthesizeSharedDAG { .. }
+        ));
+        assert!(matches!(
+            result.report.attempts[0].status,
+            AttemptStatus::MeasurementRejected
+        ));
+        assert_eq!(result.report.admitted_candidates.len(), 1);
+        configuration.max_callback_calls = 1;
+        assert!(
+            search(
+                &native,
+                evaluated(&Artifact::native(&native).unwrap(), &native),
+                &configuration,
+                &constraints(),
+                |_| panic!("invalid sums must not run")
+            )
+            .unwrap_err()
+            .contains("budgets")
+        );
+        let mut legacy = serde_json::to_value(settings(1)).unwrap();
+        legacy.as_object_mut().unwrap().remove("shared_dag_search");
+        assert!(
+            serde_json::from_value::<Settings>(legacy)
+                .unwrap()
+                .shared_dag_search
+                .is_none()
+        );
+    }
+    #[test]
+    fn equivalent_permutation_proposals_are_deduplicated_before_failed_callbacks() {
+        let mut native = ordered();
+        native.operators = vec![std::sync::Arc::new(Operator::identity(
+            "sum",
+            Interface::native(1).unwrap(),
+        ))];
+        native.nodes = vec![
+            Node::Raw { slot: 0 },
+            Node::Raw { slot: 1 },
+            Node::Affine {
+                terms: vec![(0, 0), (1, 0)],
+                bias: None,
+            },
+            Node::Gain {
+                input: 2,
+                coefficient: Coefficient::Number(1.),
+            },
+            Node::Gain {
+                input: 2,
+                coefficient: Coefficient::Number(1.),
+            },
+            Node::Affine {
+                terms: vec![(3, 0), (4, 0)],
+                bias: None,
+            },
+        ];
+        native.output = 5;
+        let mut configuration = settings(1);
+        configuration.max_callback_calls = 7;
+        configuration.max_move_attempts = 7;
+        let mut joint = joint_settings();
+        joint.region_limits.max_inputs = 2;
+        joint.grammar.unary = vec![];
+        joint.grammar.binary = vec![crate::composed_rule_search::Binary::Add];
+        joint.grammar.max_expressions = 16;
+        joint.max_tuple_checks = 64;
+        joint.max_tuples_per_enumeration = 16;
+        joint.max_callback_calls = 6;
+        joint.max_move_attempts = 6;
+        configuration.shared_dag_search = Some(joint);
+        let mut seen = BTreeSet::new();
+        let result = search(
+            &native,
+            evaluated(&Artifact::native(&native).unwrap(), &native),
+            &configuration,
+            &constraints(),
+            |request| {
+                if let Mutation::SynthesizeSharedDAG {
+                    region,
+                    expressions,
+                    native_arguments,
+                } = request.mutation
+                {
+                    assert_eq!(native_arguments, &region.native_reads);
+                    assert!(
+                        seen.insert(expressions.clone()),
+                        "even failed proposals must be deduplicated before callback"
+                    );
+                }
+                Err("intentionally failed measurement to audit duplicate work".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(result.report.counts.shared_dag_proposals, 6);
+        assert_eq!(result.report.counts.shared_dag_unique_proposals, 3);
+        assert_eq!(
+            result.report.counts.shared_dag_duplicate_binding_proposals,
+            3
+        );
+        assert_eq!(result.report.counts.shared_dag_callback_calls, 3);
+        assert_eq!(seen.len(), 3);
+        assert_eq!(result.report.shared_dag_schedules.len(), 1);
+        assert_eq!(result.report.shared_dag_schedules[0].unique_proposals, 3);
+        assert_eq!(result.report.admitted_candidates.len(), 1);
     }
     #[test]
     fn expression_setting_defaults_off_and_rejects_unallocated_or_adapter_work() {
