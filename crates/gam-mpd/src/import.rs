@@ -57,17 +57,22 @@ fn shape_of(value: &Value) -> Result<(usize, usize), String> {
 
 /// Where a model's tensors come from, by their export names: an export directory (`<name>.f64`
 /// files listed in `export.json`), or a Hugging Face checkpoint read under those names
-/// ([`hugging_face_name`]).
+/// ([`hugging_face_name`]), in one safetensors file or sharded over several.
 enum Tensors<'a> {
     Export { dir: &'a Path, record: &'a Value },
-    HuggingFace { file: SafetensorsFile },
+    HuggingFace { files: Vec<SafetensorsFile> },
+}
+
+/// The file of `files` holding tensor `stored`.
+fn holding<'a>(files: &'a [SafetensorsFile], stored: &str) -> Option<&'a SafetensorsFile> {
+    files.iter().find(|f| f.tensors().contains_key(stored))
 }
 
 impl Tensors<'_> {
     fn has(&self, name: &str) -> bool {
         match self {
             Self::Export { record, .. } => record["files"].get(name).is_some(),
-            Self::HuggingFace { file } => hugging_face_name(name).is_some_and(|n| file.tensors().contains_key(&n)),
+            Self::HuggingFace { files } => hugging_face_name(name).is_some_and(|n| holding(files, &n).is_some()),
         }
     }
 
@@ -78,8 +83,9 @@ impl Tensors<'_> {
                 let (rows, cols) = shape_of(&record["files"][name]["shape"]).map_err(|e| format!("{name}: {e}"))?;
                 read_f64_shaped(&dir.join(format!("{name}.f64")), rows, cols)
             }
-            Self::HuggingFace { file } => {
+            Self::HuggingFace { files } => {
                 let stored = hugging_face_name(name).ok_or_else(|| format!("{name}: no Hugging Face tensor"))?;
+                let file = holding(files, &stored).ok_or_else(|| format!("{stored}: missing"))?;
                 let shape = file.tensors().get(&stored).map(|e| e.shape.clone()).ok_or_else(|| format!("{stored}: missing"))?;
                 match shape[..] {
                     [n] => Ok(file.vector(&stored, n).map_err(|e| e.to_string())?.insert_axis(Axis(0))),
@@ -222,10 +228,23 @@ pub fn hugging_face_language_model(dir: &Path, blocks: std::ops::Range<usize>) -
     let text = std::fs::read_to_string(dir.join("config.json")).map_err(|e| format!("{}: {e}", dir.display()))?;
     let hf: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     refuse_unsupported(&hf).map_err(|e| format!("config.json: {e}"))?;
-    if dir.join("model.safetensors.index.json").exists() {
-        return Err(format!("{}: a sharded checkpoint (model.safetensors.index.json) is not read", dir.display()));
-    }
-    let file = SafetensorsFile::open(&dir.join("model.safetensors")).map_err(|e| e.to_string())?;
+    // A sharded checkpoint names its files in its index's weight map.
+    let index = dir.join("model.safetensors.index.json");
+    let names: Vec<String> = if index.exists() {
+        let text = std::fs::read_to_string(&index).map_err(|e| format!("{}: {e}", index.display()))?;
+        let map: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", index.display()))?;
+        let shards = map["weight_map"].as_object().ok_or_else(|| format!("{}: no weight_map", index.display()))?;
+        let mut names = shards
+            .values()
+            .map(|v| v.as_str().map(str::to_string).ok_or_else(|| format!("{}: a weight_map entry is not a file name", index.display())))
+            .collect::<Result<Vec<_>, _>>()?;
+        names.sort_unstable();
+        names.dedup();
+        names
+    } else {
+        vec!["model.safetensors".to_string()]
+    };
+    let files = names.iter().map(|name| SafetensorsFile::open(&dir.join(name)).map_err(|e| format!("{name}: {e}"))).collect::<Result<Vec<_>, String>>()?;
     let integer = |key: &str| hf[key].as_u64().ok_or_else(|| format!("config.json: {key}"));
     let kind = hf["model_type"].as_str().ok_or("config.json: model_type")?;
     if !matches!(kind, "qwen2" | "qwen3" | "llama") {
@@ -233,7 +252,10 @@ pub fn hugging_face_language_model(dir: &Path, blocks: std::ops::Range<usize>) -
     }
     let (d, heads) = (integer("hidden_size")?, integer("num_attention_heads")?);
     let head_dim = hf["head_dim"].as_u64().unwrap_or(d / heads.max(1));
-    let vocab = file.tensors().get("model.embed_tokens.weight").map(|e| e.shape[0]).ok_or("model.embed_tokens.weight: missing")?;
+    let vocab = holding(&files, "model.embed_tokens.weight")
+        .and_then(|f| f.tensors().get("model.embed_tokens.weight"))
+        .map(|e| e.shape[0])
+        .ok_or("model.embed_tokens.weight: missing")?;
     let act = match hf["hidden_act"].as_str() {
         Some("silu") => "silu",
         other => return Err(format!("unsupported hidden_act {other:?}")),
@@ -250,7 +272,7 @@ pub fn hugging_face_language_model(dir: &Path, blocks: std::ops::Range<usize>) -
             "d_mlp": integer("intermediate_size")?, "vocab": vocab, "rope_pairing": "rotate_half",
         },
     });
-    let program = language_model(&Tensors::HuggingFace { file }, &record, blocks)?;
+    let program = language_model(&Tensors::HuggingFace { files }, &record, blocks)?;
     Ok((program, record))
 }
 
@@ -501,7 +523,8 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
 #[cfg(test)]
 mod tests {
     use super::{hugging_face_language_model, refuse_unsupported};
-    use serde_json::json;
+    use serde_json::{Value, json};
+    use std::path::Path;
 
     /// A configuration the program does not compute is refused, never imported as another function.
     #[test]
@@ -519,15 +542,81 @@ mod tests {
         assert!(refuse_unsupported(&json!({"layer_types": ["full_attention", "full_attention"]})).is_ok());
     }
 
-    /// A sharded checkpoint is refused before any tensor is read.
+    /// A checkpoint sharded over several files imports as the same program as its one-file form.
     #[test]
-    fn a_sharded_checkpoint_is_refused() {
-        let dir = std::env::temp_dir().join(format!("gam-mpd-sharded-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temporary directory");
-        std::fs::write(dir.join("config.json"), "{}").expect("config");
-        std::fs::write(dir.join("model.safetensors.index.json"), "{}").expect("index");
-        let refused = hugging_face_language_model(&dir, 0..1).expect_err("a sharded checkpoint is refused");
-        std::fs::remove_dir_all(&dir).expect("cleanup");
-        assert!(refused.contains("sharded"), "{refused}");
+    fn a_sharded_checkpoint_imports_as_its_merged_file() {
+        let (d, heads, kv, hidden, vocab) = (8usize, 2usize, 1usize, 12usize, 11usize);
+        let shapes: Vec<(&str, Vec<usize>)> = vec![
+            ("model.embed_tokens.weight", vec![vocab, d]),
+            ("model.layers.0.input_layernorm.weight", vec![d]),
+            ("model.layers.0.self_attn.q_proj.weight", vec![heads * 4, d]),
+            ("model.layers.0.self_attn.k_proj.weight", vec![kv * 4, d]),
+            ("model.layers.0.self_attn.v_proj.weight", vec![kv * 4, d]),
+            ("model.layers.0.self_attn.o_proj.weight", vec![d, heads * 4]),
+            ("model.layers.0.post_attention_layernorm.weight", vec![d]),
+            ("model.layers.0.mlp.gate_proj.weight", vec![hidden, d]),
+            ("model.layers.0.mlp.up_proj.weight", vec![hidden, d]),
+            ("model.layers.0.mlp.down_proj.weight", vec![d, hidden]),
+            ("model.norm.weight", vec![d]),
+            ("lm_head.weight", vec![vocab, d]),
+        ];
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let tensors: Vec<(&str, Vec<usize>, Vec<f32>)> = shapes
+            .into_iter()
+            .map(|(name, shape)| {
+                let values = (0..shape.iter().product::<usize>())
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        ((state >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+                    })
+                    .collect();
+                (name, shape, values)
+            })
+            .collect();
+        // One safetensors file of `part`, in the stored F32 layout.
+        let write = |path: &Path, part: &[(&str, Vec<usize>, Vec<f32>)]| {
+            let (mut header, mut data) = (serde_json::Map::new(), Vec::new());
+            for (name, shape, values) in part {
+                let start = data.len();
+                values.iter().for_each(|v| data.extend_from_slice(&v.to_le_bytes()));
+                header.insert(name.to_string(), json!({"dtype": "F32", "shape": shape, "data_offsets": [start, data.len()]}));
+            }
+            let header = Value::Object(header).to_string();
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&data);
+            std::fs::write(path, bytes).expect("safetensors file");
+        };
+        let config = json!({
+            "model_type": "llama", "hidden_act": "silu", "hidden_size": d, "num_attention_heads": heads, "num_key_value_heads": kv,
+            "intermediate_size": hidden, "num_hidden_layers": 1, "rope_theta": 10000.0, "rms_norm_eps": 1e-6,
+        });
+        let base = std::env::temp_dir().join(format!("gam-mpd-sharded-{}", std::process::id()));
+        let (whole, sharded) = (base.join("whole"), base.join("sharded"));
+        for dir in [&whole, &sharded] {
+            std::fs::create_dir_all(dir).expect("temporary directory");
+            std::fs::write(dir.join("config.json"), config.to_string()).expect("config");
+        }
+        write(&whole.join("model.safetensors"), &tensors);
+        let (first, second) = tensors.split_at(5);
+        write(&sharded.join("model-00001-of-00002.safetensors"), first);
+        write(&sharded.join("model-00002-of-00002.safetensors"), second);
+        let weight_map: serde_json::Map<String, Value> = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _, _))| (name.to_string(), json!(if i < 5 { "model-00001-of-00002.safetensors" } else { "model-00002-of-00002.safetensors" })))
+            .collect();
+        std::fs::write(sharded.join("model.safetensors.index.json"), json!({"metadata": {}, "weight_map": weight_map}).to_string()).expect("index");
+        let (a, _) = hugging_face_language_model(&whole, 0..1).expect("one file");
+        let (b, _) = hugging_face_language_model(&sharded, 0..1).expect("two shards");
+        std::fs::remove_dir_all(&base).expect("cleanup");
+        assert_eq!(a.operators.len(), b.operators.len());
+        for (x, y) in a.operators.iter().zip(&b.operators) {
+            assert_eq!(x.name, y.name);
+            assert!(x.matrix().iter().zip(y.matrix().iter()).all(|(u, v)| u.to_bits() == v.to_bits()), "{} differs", x.name);
+        }
+        assert_eq!(format!("{:?}", a.nodes), format!("{:?}", b.nodes));
     }
 }

@@ -221,12 +221,6 @@ fn the_importer_refuses_options_it_does_not_compute() {
     refused("mistral", serde_json::json!({"sliding_window": 4}), "sliding");
     refused("layers", serde_json::json!({"layer_types": ["sliding_attention"]}), "sliding");
     refused("partial", serde_json::json!({"partial_rotary_factor": 0.5}), "partial_rotary_factor");
-    // A sharded checkpoint: its index names shards the importer does not read.
-    let dir = hugging_face_config("sharded", serde_json::json!({}));
-    std::fs::write(dir.join("model.safetensors.index.json"), "{\"weight_map\": {}}").expect("index");
-    let error = hugging_face_language_model(&dir, 0..1).err().expect("refused");
-    std::fs::remove_dir_all(&dir).expect("removed");
-    assert!(error.contains("sharded"), "{error}");
     // A window that is declared and switched off, as Qwen2 writes it, is the full attention.
     let dir = hugging_face_config("off", serde_json::json!({"use_sliding_window": false, "sliding_window": 4, "rope_scaling": null}));
     let error = hugging_face_language_model(&dir, 0..1).err().expect("no weights");
