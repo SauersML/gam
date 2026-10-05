@@ -260,7 +260,7 @@ fn f32_vocabulary_reductions_agree_with_the_host() {
     let both = |m: &Array2<f64>| (up(&host, m), up(&d, m));
     let (classes, n) = (5000, 37);
     let logits = matrix(n, classes, 47, 6.0);
-    let target = matrix(n, classes, 53, 6.0).mapv(|v| v + 40.0);
+    let target = matrix(n, classes, 53, 6.0).mapv(|v| f64::from((v + 40.0) as f32));
     let near = (&logits + &matrix(n, classes, 57, 0.01)).mapv(|v| f64::from(v as f32));
     let flags: Vec<u32> = (0..n as u32).map(|r| u32::from(r % 5 != 3)).collect();
     let (hf, df) = (host.upload_indices(&flags).expect("flags"), d.upload_indices(&flags).expect("flags"));
@@ -389,4 +389,46 @@ fn f32_adam_steps_agree_with_the_host() {
     // Each step moves a weight by at most the rate (Adam's normalized step), in a few roundings.
     assert_within("adam weights", &down(&d, &dw), &down(&host, &hw), |i, j| 3.0 * (16.0 * U * 1e-2 + U * (w[[i, j]].abs() + 0.03)));
     assert_within("adam first moment", &down(&d, &dm), &down(&host, &hm), |_, _| 16.0 * U);
+}
+
+/// A captured step (a product, a law through a temporary, an accumulation, an in-place softmax)
+/// replays bitwise what running it directly does, in either storage; reading a value back to the
+/// host inside a capture breaks it, and the device works on after.
+#[test]
+fn a_captured_step_replays_what_running_it_does() {
+    let Some((d, wide)) = cuda() else { return };
+    for device in [&d, &wide] {
+        let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
+        let (x, w) = (up(device, &matrix(64, 32, 91, 1.0)), up(device, &matrix(32, 48, 92, 0.2)));
+        let codes = device.upload_indices(&vec![PointwiseLaw::GeluTanh.code(); 48]).expect("codes");
+        let c = 0.797_884_560_802_865_4;
+        let step = |y: &mut Tensor, total: &mut Tensor, scores: &mut Tensor| -> Result<(), GpuError> {
+            device.gemm(y, 1.0, &x, Op::N, &w, Op::N, 0.0, arithmetic)?;
+            let activated = device.law_values(y, &codes, c)?;
+            device.axpy(total, 0.5, &activated)?;
+            device.softmax_rows(scores, false)?;
+            device.hadamard(scores, total, total, true)
+        };
+        let fresh = || (device.zeros(64, 48).expect("y"), device.zeros(64, 48).expect("total"), up(device, &matrix(64, 48, 93, 3.0)));
+        let (mut y, mut total, mut scores) = fresh();
+        for _ in 0..3 {
+            step(&mut y, &mut total, &mut scores).expect("direct step");
+        }
+        let (mut gy, mut gtotal, mut gscores) = fresh();
+        device.synchronize().expect("idle");
+        device.begin_capture().expect("capture");
+        step(&mut gy, &mut gtotal, &mut gscores).expect("recorded step");
+        let graph = device.end_capture().expect("graph");
+        assert_eq!(down(device, &gtotal), Array2::<f64>::zeros((64, 48)), "{}: recording runs nothing", device.name());
+        for _ in 0..3 {
+            graph.launch().expect("replay");
+        }
+        assert_eq!(down(device, &gtotal), down(device, &total), "{}: replayed accumulation", device.name());
+        assert_eq!(down(device, &gscores), down(device, &scores), "{}: replayed in-place maps", device.name());
+        device.begin_capture().expect("capture");
+        assert!(device.argmax_rows(&y).is_err(), "{}: a read-back inside a capture fails", device.name());
+        assert!(device.end_capture().is_err(), "{}: the broken capture records no graph", device.name());
+        device.synchronize().expect("the stream works on");
+        step(&mut y, &mut total, &mut scores).expect("a direct step after a broken capture");
+    }
 }

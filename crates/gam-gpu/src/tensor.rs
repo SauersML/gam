@@ -391,6 +391,26 @@ impl Indices {
     }
 }
 
+/// A recorded sequence of device operations replayed by one launch (a CUDA graph): a fixed-shape
+/// step, its per-operation launch and bookkeeping costs paid once at [`Device::end_capture`].
+pub struct Graph {
+    #[cfg(target_os = "linux")]
+    graph: cudarc::driver::CudaGraph,
+}
+
+impl Graph {
+    /// Runs the recorded operations again, queued on the device's stream like any operation.
+    pub fn launch(&self) -> Result<(), GpuError> {
+        #[cfg(target_os = "linux")]
+        {
+            use crate::gpu_error::GpuResultExt;
+            self.graph.launch().gpu_ctx("tensor graph launch")
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err(GpuError::NoDeviceKernel { reason: "graphs are CUDA's".to_string() })
+    }
+}
+
 /// Where tensors live and run (module note), and how the tensors it makes hold their values.
 /// Cloning shares the device.
 #[derive(Clone)]
@@ -615,6 +635,30 @@ impl Device {
             Backend::Cuda(engine) => engine.memory().map(Some),
             #[cfg(target_os = "macos")]
             Backend::Metal(engine) => Ok(Some(engine.stream.memory())),
+        }
+    }
+
+    /// Records this device's operations from here to [`Device::end_capture`] into a [`Graph`]
+    /// instead of running them (CUDA stream capture). Only work that never reads a value back to
+    /// the host can be recorded (a download, or an operation returning per-row values, breaks the
+    /// capture), on tensors that exist before the capture begins: a tensor made during it is the
+    /// graph's own temporary and must be dropped before the capture ends. The capturing thread
+    /// must be the device's only user meanwhile. CUDA only.
+    pub fn begin_capture(&self) -> Result<(), GpuError> {
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.begin_capture(),
+            _ => Err(GpuError::NoDeviceKernel { reason: format!("{} records no graphs", self.name()) }),
+        }
+    }
+
+    /// Ends the capture [`Device::begin_capture`] began: the recorded operations as one graph,
+    /// none of them run yet.
+    pub fn end_capture(&self) -> Result<Graph, GpuError> {
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => Ok(Graph { graph: engine.end_capture()? }),
+            _ => Err(GpuError::NoDeviceKernel { reason: format!("{} records no graphs", self.name()) }),
         }
     }
 
@@ -1993,7 +2037,8 @@ mod cuda {
     use crate::gpu_error::{GpuError, GpuResultExt};
     use cudarc::cublas::sys::{cublasComputeType_t, cublasGemmAlgo_t, cublasMath_t, cublasOperation_t, cudaDataType_t};
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
-    use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, LaunchArgs, LaunchConfig, PushKernelArg, ValidAsZeroBits};
+    use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+    use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, LaunchArgs, LaunchConfig, PushKernelArg, ValidAsZeroBits};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -3142,6 +3187,21 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         pub(super) fn synchronize(&self) -> Result<(), GpuError> {
             self.stream.synchronize().gpu_ctx("tensor synchronize")
+        }
+
+        pub(super) fn begin_capture(&self) -> Result<(), GpuError> {
+            // Relaxed: allocations (a temporary's) may be recorded; the stream is this thread's.
+            self.stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED).gpu_ctx("tensor graph capture")
+        }
+
+        pub(super) fn end_capture(&self) -> Result<CudaGraph, GpuError> {
+            // No automatic freeing on relaunch: a temporary outliving the capture is an error at
+            // the next launch, never a buffer freed under a live tensor. (Node priority is the
+            // flag that changes nothing else.)
+            self.stream
+                .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY)
+                .gpu_ctx("tensor graph instantiate")?
+                .ok_or_else(|| shape("an empty capture records no graph".to_string()))
         }
 
         pub(super) fn upload<T: DeviceRepr + ValidAsZeroBits>(&self, values: &[T]) -> Result<CudaSlice<T>, GpuError> {
