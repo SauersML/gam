@@ -684,7 +684,8 @@ pub fn read_out(exact: &Device, wide: &Device, native: &OperatorProgram, layers:
         ranked.sort_by(|a, b| functions[*b].usage.total_cmp(&functions[*a].usage));
         order.extend(ranked.into_iter().take(settings.core));
     }
-    let core_position: HashMap<usize, usize> = order.iter().enumerate().map(|(p, f)| (*f, p)).collect();
+    let mut core_of: Vec<Option<usize>> = vec![None; functions.len()];
+    order.iter().enumerate().for_each(|(p, f)| core_of[*f] = Some(p));
     let mut wiring = vec![vec![0.0; order.len()]; order.len()];
     for (si, read_site) in sites.iter().enumerate() {
         let layer = si / 2;
@@ -711,10 +712,21 @@ pub fn read_out(exact: &Device, wide: &Device, native: &OperatorProgram, layers:
         }
         let reader_rows = Array2::from_shape_fn((rows.len(), embedding.ncols()), |(r, c)| rows[r][c]);
         let mut best: Vec<Best> = vec![Best::default(); readers.len()];
-        let mut record = |reader: usize, writer: usize, weight: f64, best: &mut Best| {
-            best.offer(settings.edges, weight, writer);
-            if let (Some(&i), Some(&j)) = (core_position.get(&reader), core_position.get(&writer)) {
-                wiring[i][j] = weight;
+        // Every reader against a block of writers, `weight(reader, c)` the weight from writer `c`
+        // (function `writers[c]`).
+        let mut wire = |writers: &[usize], weight: &(dyn Fn(&std::ops::Range<usize>, usize) -> f64 + Sync)| {
+            best.par_iter_mut().zip(readers.par_iter()).for_each(|(best, (_, range))| {
+                for (c, writer) in writers.iter().enumerate() {
+                    best.offer(settings.edges, weight(range, c), *writer);
+                }
+            });
+            for (reader, range) in &readers {
+                let Some(i) = core_of[*reader] else { continue };
+                for (c, writer) in writers.iter().enumerate() {
+                    if let Some(j) = core_of[*writer] {
+                        wiring[i][j] = weight(range, c);
+                    }
+                }
             }
         };
         for (b, block) in mlps.iter().enumerate().filter(|(_, b)| mlp_first(b.layer) <= si) {
@@ -722,29 +734,18 @@ pub fn read_out(exact: &Device, wide: &Device, native: &OperatorProgram, layers:
             if kept.is_empty() {
                 continue;
             }
+            let writers: Vec<usize> = kept.iter().filter_map(|i| mlp_index[b][*i]).collect();
             let writes = Array2::from_shape_fn((kept.len(), block.out.nrows()), |(r, c)| block.out[[c, kept[r]]]);
             let p = products(wide, &reader_rows, &writes)?;
             let strength: Vec<f64> = kept.iter().map(|i| (mlp_stats[b][*i].second[si - mlp_first(block.layer)] / total).sqrt()).collect();
-            let weights: Vec<Vec<f64>> = readers
-                .par_iter()
-                .map(|(_, range)| (0..kept.len()).map(|c| range.clone().map(|r| p[[r, c]] * p[[r, c]]).sum::<f64>().sqrt() * strength[c]).collect())
-                .collect();
-            for (reader, row) in weights.iter().enumerate() {
-                for (c, w) in row.iter().enumerate() {
-                    let writer = mlp_index[b][kept[c]].ok_or("an unindexed writer")?;
-                    record(readers[reader].0, writer, *w, &mut best[reader]);
-                }
-            }
+            wire(&writers, &|range, c| range.clone().map(|r| p[[r, c]] * p[[r, c]]).sum::<f64>().sqrt() * strength[c]);
         }
         for (h, block) in heads.iter().enumerate().filter(|(_, b)| head_first(b.layer) <= si) {
             let Some(writer) = head_index[h] else { continue };
             let p = products(wide, &reader_rows, &block.output.t().to_owned())?;
             let second = &head_stats[h].second[si - head_first(block.layer)] / total;
             let quadratic = (p.dot(&second) * &p).sum_axis(Axis(1));
-            for (reader, (index, range)) in readers.iter().enumerate() {
-                let w = range.clone().map(|r| quadratic[r].max(0.0)).sum::<f64>().sqrt();
-                record(*index, writer, w, &mut best[reader]);
-            }
+            wire(&[writer], &|range, _| range.clone().map(|r| quadratic[r].max(0.0)).sum::<f64>().sqrt());
         }
         for ((index, _), best) in readers.iter().zip(best) {
             functions[*index].inputs = best.entries.into_iter().map(|(weight, from)| Edge { from, weight }).collect();
