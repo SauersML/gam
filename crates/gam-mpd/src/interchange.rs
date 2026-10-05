@@ -886,7 +886,7 @@ impl Interchange {
             let tensor = self.p.device().upload(value.view()).map_err(error)?;
             self.p.replace_dense_parameter(op, tensor)?;
         }
-        Ok(())
+        self.p.refresh_fused()
     }
 
     /// Per base sequence `n < sequences`, one unpatched and one patched experiment ([`sample`]).

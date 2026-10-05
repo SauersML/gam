@@ -1781,7 +1781,7 @@ impl Device {
     }
 
     /// Exact column copies into a fresh row-major tensor. No arithmetic or host
-    /// transfer occurs on CUDA. Empty row/column domains and Metal are refused.
+    /// transfer occurs on CUDA or Metal. Empty row/column domains are refused.
     pub fn columns_of(&self, t: &Tensor, columns: std::ops::Range<usize>) -> Result<Tensor, GpuError> {
         if t.rows == 0 || columns.start >= columns.end || columns.end > t.cols {
             return Err(shape("column copy requires a nonempty in-range domain".into()));
@@ -1797,7 +1797,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda(_) | Data::Cuda32(_)) => engine.columns_of(t, columns.start, width, count)?,
             #[cfg(target_os = "macos")]
-            (Backend::Metal(_), Data::Metal(_)) => return Err(shape("column copies are unsupported on Metal".into())),
+            (Backend::Metal(engine), Data::Metal(_)) => engine.columns_of(t, columns.start, width, count)?,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => return Err(foreign()),
         };
@@ -1848,7 +1848,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda32(out), Data::Cuda32(input)) => engine.set_columns(Storage::F32, out, input, t.cols, part.cols, start, part.len()),
             #[cfg(target_os = "macos")]
-            (Backend::Metal(_), Data::Metal(_), Data::Metal(_)) => Err(shape("column copies are unsupported on Metal".into())),
+            (Backend::Metal(engine), Data::Metal(out), Data::Metal(input)) => engine.set_columns(out, input, (t.cols, part.cols, start), part.len()),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => Err(foreign()),
         }
@@ -5102,6 +5102,15 @@ kernel void t_copy(device const float* x [[buffer(0)]], device float* y [[buffer
     ELEMENTS y[i] = x[i];
 }
 
+// Copy raw bits, including signed zeros and subnormals, without floating arithmetic.
+kernel void t_copy_columns(device const uint* x [[buffer(0)]], device uint* y [[buffer(1)]], constant P& p [[buffer(2)]],
+                          uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        uint at = (i / p.extra) * p.cols + p.a + i % p.extra;
+        if (p.b) y[at] = x[i]; else y[i] = x[at];
+    }
+}
+
 kernel void t_scale(device float* x [[buffer(0)]], constant P& p [[buffer(1)]],
                     uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
     ELEMENTS x[i] = p.alpha * x[i];
@@ -6026,6 +6035,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
 
     const NAMES: &[&str] = &[
         "t_copy",
+        "t_copy_columns",
         "t_scale",
         "t_axpy",
         "t_hadamard",
@@ -6168,6 +6178,20 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
 
         pub(super) fn write_range(&self, target: &Buffer, lo: usize, part: &Buffer, n: usize) -> Result<(), GpuError> {
             self.elements("t_copy", &[whole(part), (target, lo)], n, P::default())
+        }
+
+        pub(super) fn set_columns(&self, target: &Buffer, part: &Buffer, (cols, width, start): (usize, usize, usize), n: usize) -> Result<(), GpuError> {
+            u32_of((n / width).saturating_mul(cols))?;
+            let p = P { cols: u32_of(cols)?, extra: u32_of(width)?, a: u32_of(start)?, b: 1, ..P::default() };
+            self.elements("t_copy_columns", &[whole(part), whole(target)], n, p)
+        }
+
+        pub(super) fn columns_of(&self, source: &Tensor, start: usize, width: usize, n: usize) -> Result<Data, GpuError> {
+            u32_of(source.len())?;
+            let out = self.stream.alloc(n)?;
+            let p = P { cols: u32_of(source.cols)?, extra: u32_of(width)?, a: u32_of(start)?, ..P::default() };
+            self.elements("t_copy_columns", &[whole(buffer(source)?), whole(&out)], n, p)?;
+            Ok(Data::Metal(out))
         }
 
         pub(super) fn gemm(

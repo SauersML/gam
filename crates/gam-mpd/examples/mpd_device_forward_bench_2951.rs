@@ -11,15 +11,19 @@
 //! `arithmetic` (`f64`, `f32`, `tf32`) the products' arithmetic; `fused=0` runs sibling heads node
 //! by node (`DeviceProgram::unfuse`); `cpu=0` skips the CPU reference. One JSON object goes to
 //! `OUT/bench.json` and stdout.
+//! `reload=1` makes a finite 0.1% change to every eligible dense projection/bias after
+//! compilation, loads it through the training API, and repacks eligible attention.
+//! Its one-time load/repack cost is reported separately from forward/reverse time.
 
 use gam_gpu::{GpuPolicy, tensor::{Arithmetic, Device, Storage}};
 use gam_mpd::device_program::DeviceProgram;
 use gam_mpd::import::import_language_model;
-use gam_mpd::operator_program::Node;
+use gam_mpd::operator_program::{Node, OperatorBody, exact_precision};
 use ndarray::Array2;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 fn main() -> Result<(), String> {
@@ -31,6 +35,7 @@ fn main() -> Result<(), String> {
     let (train, out) = (PathBuf::from(&args[1]), PathBuf::from(&args[2]));
     let (mut sequences, mut context, mut reps, mut cpu, mut arithmetic) = (8usize, 512usize, 5usize, true, Arithmetic::F64);
     let (mut storage, mut fused, mut reverse) = (Storage::F64, true, true);
+    let mut reload = false;
     for pair in &args[3..] {
         let (key, value) = pair.split_once('=').ok_or_else(|| format!("{pair}: not KEY=VALUE"))?;
         let count = || value.parse::<usize>().map_err(|e| format!("{key}: {e}"));
@@ -43,6 +48,7 @@ fn main() -> Result<(), String> {
             "storage" => storage = match value { "f64" => Storage::F64, "f32" => Storage::F32, other => return Err(format!("storage {other}")) },
             "fused" => fused = count()? != 0,
             "reverse" => reverse = count()? != 0,
+            "reload" => reload = count()? != 0,
             other => return Err(format!("unknown key {other}")),
         }
     }
@@ -75,6 +81,38 @@ fn main() -> Result<(), String> {
         program.unfuse();
     }
     let compile_seconds = started.elapsed().as_secs_f64();
+    let (mut reloaded_operators, mut reload_seconds, mut repack_seconds) = (0usize, 0.0, 0.0);
+    let mut groups_after_load = program.fused_groups();
+    if reload {
+        let mut ids = BTreeSet::new();
+        for node in &prefix.nodes {
+            if let Node::Affine { terms, bias } = node {
+                ids.extend(terms.iter().filter(|(input,_)| !matches!(prefix.nodes[*input],Node::Feature {..}))
+                    .map(|(_,op)|*op));
+                ids.extend(*bias);
+            }
+        }
+        let ids = ids.into_iter().filter(|i| matches!(prefix.operators[*i].body,OperatorBody::Dense {..}))
+            .collect::<Vec<_>>();
+        let t = Instant::now();
+        program.prepare_dense_parameters(&ids)?;
+        for &id in &ids {
+            let OperatorBody::Dense {values,precision,..} = &mut Arc::make_mut(&mut prefix.operators[id]).body else {
+                return Err("dense reload invariant".into());
+            };
+            values.mapv_inplace(|v|v*1.001);
+            *precision=exact_precision(values.iter().copied()).map_err(|e|e.to_string())?;
+            program.replace_dense_parameter(id,device.upload(values.view()).map_err(|e|e.to_string())?)?;
+        }
+        device.synchronize().map_err(|e|e.to_string())?;
+        reload_seconds=t.elapsed().as_secs_f64();
+        groups_after_load=program.fused_groups();
+        let t=Instant::now();
+        program.refresh_fused()?;
+        device.synchronize().map_err(|e|e.to_string())?;
+        repack_seconds=t.elapsed().as_secs_f64();
+        reloaded_operators=ids.len();
+    }
     let width = program.widths()[hidden];
     let seed = Array2::from_shape_fn((family.rows, width), |(r, c)| (((r * 7 + c * 13) % 17) as f64 - 8.0) / 64.0);
     let seed = device.upload(seed.view()).map_err(|e| e.to_string())?;
@@ -128,6 +166,11 @@ fn main() -> Result<(), String> {
         "storage": format!("{storage:?}"),
         "fused_groups": program.fused_groups(),
         "compile_seconds": compile_seconds,
+        "reloaded_operators": reloaded_operators,
+        "reload_seconds": reload_seconds,
+        "groups_after_load_before_repack": groups_after_load,
+        "repack_seconds": repack_seconds,
+        "timing_scope": "Forward and activation-cotangent reverse after one parameter load; not a complete optimizer step or trainable-parameter gradient benchmark.",
         "forward_seconds": forward_seconds.clone(),
         "reverse_seconds": reverse_seconds.clone(),
         "forward_median": median(&mut forward_seconds),

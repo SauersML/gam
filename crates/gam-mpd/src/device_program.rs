@@ -202,8 +202,12 @@ struct Fused {
     /// The host operators the stacked copies were made from, in order (shared by identity with the
     /// programs compiled from this one).
     sources: Vec<usize>,
-    /// False once a training step replaces one of its operators: it then runs node by node.
+    /// False while a training update has made the stacked copy stale.
     live: bool,
+    /// Explicit `unfuse` is permanent, unlike invalidation by a parameter update.
+    disabled: bool,
+    /// Resident restacking must not license sharing by the original host identities.
+    source_matches: bool,
 }
 
 /// The identities of the host operators `heads` stacks, in order.
@@ -214,6 +218,7 @@ fn sources(program: &OperatorProgram, heads: &Heads) -> Vec<usize> {
         .iter()
         .flat_map(|(op, bias)| [id(*op), bias.map_or(0, id)])
         .chain(heads.attends.iter().map(|(_, op)| id(*op)))
+        .chain(heads.norms.iter().flat_map(|norms| norms.nodes.iter().map(|(_, _, op)| id(*op))))
         .collect()
 }
 
@@ -632,22 +637,23 @@ impl DeviceProgram {
                 grouped[node] = Some(fused.len());
             }
             let sources = sources(program, &heads);
-            let stacked = match from.and_then(|f| f.fused.iter().find(|g| g.live && g.sources == sources)) {
+            let stacked = match from.and_then(|f| f.fused.iter().find(|g| g.live && g.source_matches && g.sources == sources)) {
                 Some(shared) => Arc::clone(&shared.stacked),
                 None => Arc::new(Stacked::upload(device, program, &heads).map_err(error)?),
             };
-            fused.push(Fused { heads, stacked, sources, live: true });
+            fused.push(Fused { heads, stacked, sources, live: true, disabled: false, source_matches: true });
         }
         Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new() })
     }
 
-    /// Operator `op`'s device copy changed: every group reading it runs node by node from now on
-    /// (its stacked copy is stale), and frozen values reading it are stale.
+    /// Operator `op`'s device copy changed: every group reading it runs node by node until
+    /// refreshed, and frozen values reading it are stale.
     fn dissolve(&mut self, op: usize) {
         *self.revisions.entry(op).or_default() += 1;
         for group in &mut self.fused {
             if group.heads.operators().contains(&op) {
                 group.live = false;
+                group.source_matches = false;
             }
         }
     }
@@ -663,7 +669,62 @@ impl DeviceProgram {
     pub fn unfuse(&mut self) {
         for group in &mut self.fused {
             group.live = false;
+            group.disabled = true;
         }
+    }
+
+    /// Refresh attention stacks from current resident operators after a batch of parameter
+    /// updates. Copies stay on the device and preserve its storage precision. Shared programs
+    /// retain their old stacks. Explicitly unfused groups, or groups whose norm gains are no
+    /// longer diagonal, remain unfused; the ordinary hook/span guards still apply per pass.
+    /// This restores forward packing, not packed gradients for trainable operators.
+    pub fn refresh_fused(&mut self) -> Result<(), String> {
+        for index in 0..self.fused.len() {
+            let group = &self.fused[index];
+            if group.live || group.disabled {
+                continue;
+            }
+            let heads = &group.heads;
+            // A changed execution role can invalidate the matched pattern. In particular,
+            // a trainable dense norm gain may have acquired off-diagonal entries.
+            let mut products = heads.projection_operators.iter().map(|(op, _)| *op)
+                .chain(heads.attends.iter().map(|(_, op)| *op));
+            if products.any(|op| !matches!(self.held(op, Role::Product), Ok(Held::Dense(_))))
+                || heads.norms.iter().flat_map(|n| &n.nodes)
+                    .any(|(_, _, op)| !matches!(self.held(*op, Role::Product), Ok(Held::Diagonal(_))))
+            {
+                continue;
+            }
+            // Build privately, publishing only once every copy succeeds. Never modify an
+            // Arc-shared stack, nor reconstruct from the now-stale host OperatorProgram.
+            let d = &self.device;
+            let mut weights = d.copy(&group.stacked.weights).map_err(error)?;
+            let mut biases = group.stacked.biases.as_ref().map(|b| d.copy(b).map_err(error)).transpose()?;
+            for (i, &(op, bias)) in heads.projection_operators.iter().enumerate() {
+                d.set_rows(&mut weights, i * heads.width, self.dense(op)?).map_err(error)?;
+                if let Some(op) = bias {
+                    d.set_columns(biases.as_mut().ok_or("device: missing stacked biases")?, i * heads.width, self.column(op)?).map_err(error)?;
+                }
+            }
+            let mut reads = d.copy(&group.stacked.reads).map_err(error)?;
+            for (i, &(_, op)) in heads.attends.iter().enumerate() {
+                d.set_columns(&mut reads, i * heads.width, self.dense(op)?).map_err(error)?;
+            }
+            let mut gains = group.stacked.gains.as_ref().map(|g| d.copy(g).map_err(error)).transpose()?;
+            if let Some(norms) = &heads.norms {
+                for (i, &(_, _, op)) in norms.nodes.iter().enumerate() {
+                    let Held::Diagonal(gain) = self.held(op, Role::Product)? else {
+                        return Err("device: incompatible stacked gain".into());
+                    };
+                    d.set_columns(gains.as_mut().ok_or("device: missing stacked gains")?, i * heads.width, gain).map_err(error)?;
+                }
+            }
+            let group = &mut self.fused[index];
+            group.stacked = Arc::new(Stacked { weights, biases, gains, reads });
+            group.source_matches = false;
+            group.live = true;
+        }
+        Ok(())
     }
 
     fn head_of(program: &OperatorProgram) -> Result<Head, String> {
@@ -767,7 +828,7 @@ impl DeviceProgram {
             };
             self.replace_dense_parameter(op, value)?;
         }
-        Ok(())
+        self.refresh_fused()
     }
 
     fn trainable_dense_source(&self, op: usize) -> Result<Arc<Operator>, String> {
@@ -857,7 +918,7 @@ impl DeviceProgram {
         for op in changed {
             self.dissolve(op);
         }
-        Ok(())
+        self.refresh_fused()
     }
 
     fn held(&self, op: usize, role: Role) -> Result<&Held, String> {

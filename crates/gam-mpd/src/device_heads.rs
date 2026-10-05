@@ -25,8 +25,8 @@
 //! attend, and keys and values only by the group's attends. Keys and values pair one to one, every
 //! key head is read by equally many query heads, every attend has the same scale, rotation and
 //! mask, and each attend is read once, by the output node. Anything else (a head replaced by a
-//! rule, a head read through a mask) runs node by node, and so does a group whose operators a
-//! training step replaces.
+//! rule, a head read through a mask) runs node by node. Parameter updates invalidate stacked
+//! copies until `DeviceProgram::refresh_fused` restacks the current resident operators.
 
 use super::operator_program::{Node, OperatorBody, OperatorProgram, Rotary};
 use gam_gpu::gpu_error::GpuError;
@@ -570,6 +570,130 @@ mod tests {
     fn worst(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         assert_eq!(a.dim(), b.dim());
         a.iter().zip(b).fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()))
+    }
+
+    #[test]
+    fn resident_attention_restacks_updated_parameters_without_changing_shared_programs() {
+        let mut backends = devices();
+        // CUDA exercises actual float32 storage when available; the host supports float64.
+        let single: Vec<_> = backends.iter().filter_map(|d| d.with_storage(gam_gpu::tensor::Storage::F32).ok()).collect();
+        backends.extend(single);
+        // Metal is discovered separately: unlike CUDA, it has no float64 device.
+        if let Some(device) = Device::single_precision(gam_gpu::GpuPolicy::Auto).expect("single-precision device") {
+            if !backends.iter().any(|d| d.name() == device.name() && d.storage() == device.storage()) {
+                backends.push(device);
+            }
+        }
+        for device in backends {
+            for normed in [false, true] {
+                let (program, family) = layer_normed(4, 2, Some(Rotary { base: 500, dims: 2, half_split: false }), true, normed);
+                let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
+                let tolerance = if device.float64() { 1e-11 } else { 2e-5 };
+                let trainable: Vec<_> = program.operators.iter().enumerate()
+                    .filter(|(_, op)| matches!(op.name.as_str(), "q" | "k" | "v" | "qb" | "kb" | "o" | "ob"))
+                    .map(|(id, _)| id).collect();
+                let mut original = DeviceProgram::compile_values(&device, &program).expect("original");
+                original.set_arithmetic(arithmetic);
+                let baseline = original.forward(&family).expect("baseline");
+                let baseline_value = device.download(baseline.value(program.output).unwrap()).unwrap();
+                let mut fused = DeviceProgram::compile_values_sharing(&original, &program).expect("fused");
+                let mut plain = DeviceProgram::compile_values_sharing(&original, &program).expect("plain");
+                fused.set_arithmetic(arithmetic);
+                plain.set_arithmetic(arithmetic);
+                plain.unfuse();
+                fused.prepare_dense_parameters(&trainable).expect("prepare fused");
+                plain.prepare_dense_parameters(&trainable).expect("prepare plain");
+                assert_eq!(fused.fused_groups(), 1);
+                assert_eq!(plain.fused_groups(), 0);
+                for round in 1..=2 {
+                    for &op in &trainable {
+                        let moved = program.operators[op].matrix().mapv(|x| x * (1.0 + 0.1 * round as f64) + 0.02 * round as f64);
+                        fused.replace_dense_parameter(op, device.upload(moved.view()).unwrap()).unwrap();
+                        plain.replace_dense_parameter(op, device.upload(moved.view()).unwrap()).unwrap();
+                    }
+                    assert_eq!(fused.fused_groups(), 0, "stale stacks never execute");
+                    fused.refresh_fused().expect("resident restack");
+                    plain.refresh_fused().expect("explicit unfuse survives restacking");
+                    assert_eq!(fused.fused_groups(), 1);
+                    assert_eq!(plain.fused_groups(), 0);
+                    let a = fused.forward(&family).unwrap();
+                    let b = plain.forward(&family).unwrap();
+                    for node in 0..program.nodes.len() {
+                        let av = a.value(node).unwrap();
+                        assert_eq!(av.storage(), device.storage());
+                        let (x, y) = (device.download(av).unwrap(), device.download(b.value(node).unwrap()).unwrap());
+                        assert!(worst(&x, &y) < tolerance, "round {round} node {node}: {}", worst(&x, &y));
+                    }
+                    let updated = device.download(a.value(program.output).unwrap()).unwrap();
+                    assert!(worst(&updated, &baseline_value) > 1e-3);
+                    let seed = Array2::from_shape_fn((family.rows, D), |(r, c)| noise(7000 + r * D + c));
+                    let seeds = || BTreeMap::from([(program.output, device.upload(seed.view()).unwrap())]);
+                    let (ag, ap) = fused.vjp_values_dense(&a, seeds(), &[0], &trainable, arithmetic).unwrap();
+                    let (bg, bp) = plain.vjp_values_dense(&b, seeds(), &[0], &trainable, arithmetic).unwrap();
+                    assert!(worst(&device.download(&ag[&0]).unwrap(), &device.download(&bg[&0]).unwrap()) < tolerance);
+                    for &op in &trainable {
+                        assert!(worst(&device.download(&ap[&op]).unwrap(), &device.download(&bp[&op]).unwrap()) < tolerance * 10.0, "gradient {op}");
+                    }
+                    // An edit belongs to one head invocation, not all heads sharing a stack.
+                    let reads: Vec<_> = program.nodes.iter().enumerate().filter_map(|(n, node)| matches!(node, Node::Attend { .. }).then_some(n)).collect();
+                    let edit = |node: usize, trace: &crate::device_program::DeviceTrace| -> Result<Option<Tensor>, String> {
+                        if node != reads[0] { return Ok(None); }
+                        let mut value = device.copy(trace.value(node)?).map_err(|e| e.to_string())?;
+                        device.axpy(&mut value, 1.0, trace.value(node)?).map_err(|e| e.to_string())?;
+                        Ok(Some(value))
+                    };
+                    let edited = fused.forward_edited(&family, BTreeMap::new(), &Default::default(), |_, _| Ok(()), edit).unwrap();
+                    let expected = plain.forward_edited(&family, BTreeMap::new(), &Default::default(), |_, _| Ok(()), edit).unwrap();
+                    assert!(worst(&device.download(edited.value(program.output).unwrap()).unwrap(), &device.download(expected.value(program.output).unwrap()).unwrap()) < tolerance);
+                    assert!(worst(&device.download(edited.value(reads[0]).unwrap()).unwrap(), &device.download(a.value(reads[0]).unwrap()).unwrap()) > 1e-3);
+                    assert_eq!(device.download(edited.value(reads[1]).unwrap()).unwrap(), device.download(a.value(reads[1]).unwrap()).unwrap());
+                    assert_eq!(device.download(original.forward(&family).unwrap().value(program.output).unwrap()).unwrap(), baseline_value);
+                    // A fresh program using the old host operators cannot inherit the trained stack.
+                    let mut sibling = DeviceProgram::compile_values_sharing(&fused, &program).unwrap();
+                    sibling.set_arithmetic(arithmetic);
+                    assert_eq!(device.download(sibling.forward(&family).unwrap().value(program.output).unwrap()).unwrap(), baseline_value);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resident_attention_repacking_respects_changed_norm_gain_roles() {
+        let device = Device::host();
+        let (mut program, family) = layer_normed(2, 1, None, true, true);
+        let gain = program.operators.iter().position(|op| op.name == "gain").unwrap();
+        let old = &program.operators[gain];
+        let values = old.matrix();
+        let mut fused = DeviceProgram::compile_values(&device, &program).unwrap();
+        assert_eq!(fused.fused_groups(), 1);
+        let mut plain = DeviceProgram::compile_values_sharing(&fused, &program).unwrap();
+        plain.unfuse();
+        let mut moved = values.clone();
+        moved[(0, 1)] = 0.3;
+        let mut changed = program.clone();
+        changed.operators[gain] = Arc::new(Operator::dense("gain", old.rows.clone(), old.cols.clone(), moved.clone(), exact_precision(moved.iter().copied()).unwrap(), Default::default()).unwrap());
+        fused.refresh(&changed).unwrap();
+        plain.refresh(&changed).unwrap();
+        fused.refresh_fused().unwrap();
+        assert_eq!(fused.fused_groups(), 0, "off-diagonal trained gains are not column scales");
+        let a = fused.forward(&family).unwrap();
+        let b = plain.forward(&family).unwrap();
+        assert_eq!(device.download(a.value(program.output).unwrap()).unwrap(), device.download(b.value(program.output).unwrap()).unwrap());
+        // Refreshing original host parameters makes the gain diagonal again and safe to pack.
+        fused.refresh(&program).unwrap();
+        assert_eq!(fused.fused_groups(), 1);
+        let original = DeviceProgram::compile_values(&device, &program).unwrap();
+        let original_value = device.download(original.forward(&family).unwrap().value(program.output).unwrap()).unwrap();
+        assert_eq!(device.download(fused.forward(&family).unwrap().value(program.output).unwrap()).unwrap(), original_value);
+        // Host sharing must include the gains' identities too.
+        let replacement = values.diag().mapv(|x| x * 2.0);
+        let old = &program.operators[gain];
+        program.operators[gain] = Arc::new(Operator::diag("gain", old.rows.clone(), replacement.clone(), exact_precision(replacement.iter().copied()).unwrap(), Default::default()).unwrap());
+        let shared = DeviceProgram::compile_values_sharing(&original, &program).unwrap();
+        let fresh = DeviceProgram::compile_values(&device, &program).unwrap();
+        let shared_value = device.download(shared.forward(&family).unwrap().value(program.output).unwrap()).unwrap();
+        assert_eq!(shared_value, device.download(fresh.forward(&family).unwrap().value(program.output).unwrap()).unwrap());
+        assert!(worst(&shared_value, &original_value) > 1e-3);
     }
 
     #[test]

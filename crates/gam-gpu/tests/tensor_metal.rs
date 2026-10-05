@@ -65,6 +65,36 @@ fn largest(m: &Array2<f64>) -> f64 {
 }
 
 #[test]
+fn metal_column_writes_preserve_bits_and_unselected_columns() {
+    let Some(d) = metal() else { return };
+    let x = single(&matrix(7, 9, 711, 2.0));
+    let special = [0.0f32, -0.0, f32::from_bits(1), -f32::from_bits(1), f32::MAX, -f32::MAX];
+    let part = Array2::from_shape_fn((7, 3), |(r, c)| f64::from(special[(r * 3 + c) % special.len()]));
+    let mut target = up(&d, &x);
+    let source = up(&d, &part);
+    let mut expected = x.clone();
+    for start in [2, 6, 0] {
+        d.set_columns(&mut target, start, &source).expect("resident column copy");
+        expected.slice_mut(ndarray::s![.., start..start + 3]).assign(&part);
+        let actual = down(&d, &target);
+        for (a, b) in actual.iter().zip(&expected) {
+            assert_eq!((*a as f32).to_bits(), (*b as f32).to_bits());
+        }
+        let copied = down(&d, &d.columns_of(&target, start..start + 3).expect("resident column read"));
+        for (a, b) in copied.iter().zip(&part) {
+            assert_eq!((*a as f32).to_bits(), (*b as f32).to_bits());
+        }
+    }
+    assert!(d.set_columns(&mut target, 7, &source).is_err());
+    assert!(d.set_columns(&mut target, 0, &up(&d, &matrix(6, 3, 72, 1.0))).is_err());
+    let empty = d.zeros(7, 0).expect("empty source");
+    d.set_columns(&mut target, 9, &empty).expect("empty copy");
+    assert!(d.columns_of(&target, 8..10).is_err());
+    assert!(d.columns_of(&target, 3..3).is_err());
+    assert_eq!(down(&d, &source), part);
+}
+
+#[test]
 fn metal_is_single_precision_and_refuses_float64_products() {
     let Some(d) = metal() else { return };
     assert!(Device::host().float64());
