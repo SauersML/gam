@@ -376,6 +376,16 @@ impl DevicePosterior {
         Ok((self.fitting.download(&self.mean[i]).map_err(error)?, self.fitting.download(&self.log_sd[i]).map_err(error)?))
     }
 
+    /// The storage of the means, the log standard deviations, the gradient's momentum and the
+    /// curvature estimate (every operator's alike), in which a checkpoint keeps them.
+    #[must_use]
+    pub fn storages(&self) -> [Storage; 4] {
+        match (self.mean.first(), self.log_sd.first(), self.moments.first()) {
+            (Some(mean), Some(log_sd), Some([momentum, curvature])) => [mean.storage(), log_sd.storage(), momentum.storage(), curvature.storage()],
+            _ => [self.fitting.storage(); 4],
+        }
+    }
+
     /// Trainable operator `i`'s `μ`, `s` and IVON's state on the host, one operator at a time (a
     /// checkpoint streams them rather than holding every operator's state at once).
     pub fn operator(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>, [Array2<f64>; 2]), String> {

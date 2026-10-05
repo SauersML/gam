@@ -164,7 +164,7 @@ use crate::{
     },
     run_check::{LayerNodes, head_projection},
 };
-use gam_gpu::tensor::{Device, Op, Tensor};
+use gam_gpu::tensor::{Device, Op, Storage, Tensor};
 use gam_runtime::warm_start::Fingerprinter;
 use ndarray::Array2;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -1617,6 +1617,10 @@ struct Progress {
     /// The prior term's state, when the fit has one.
     #[serde(default)]
     prior: Option<serde_json::Value>,
+    /// The precision of the payload's `μ`, `ln σ`, momentum and curvature arrays: the storage the
+    /// device posterior holds each in; none for a checkpoint written in float64 throughout.
+    #[serde(default)]
+    precision: Option<[Precision; CHECKPOINT_ARRAYS]>,
 }
 
 /// What a checkpoint belongs to: a fit resumes from it only when every field agrees, so a
@@ -1759,30 +1763,93 @@ fn check_checkpoint_identity(path: &Path, found: &Identity, identity: &Identity)
 }
 
 /// The arrays a checkpoint holds per trainable operator: `μ`, `ln σ` and IVON's state (the
-/// gradient's momentum and the curvature estimate), each as little-endian float64.
+/// gradient's momentum and the curvature estimate), each little-endian in its [`Precision`].
 const CHECKPOINT_ARRAYS: usize = 4;
 
-/// The payload bytes of a checkpoint of operators of `shapes`.
-fn checkpoint_payload_bytes(shapes: &[(usize, usize)]) -> Option<u64> {
+/// The precision a checkpoint array is written in: the storage the device holds it in, so that
+/// writing and reading it is exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Precision {
+    F64,
+    F32,
+    /// bfloat16: the 16 high bits of the value's f32.
+    Bf16,
+}
+
+impl Precision {
+    fn of(storage: Storage) -> Self {
+        match storage {
+            Storage::F64 => Self::F64,
+            Storage::F32 => Self::F32,
+            Storage::Bf16 => Self::Bf16,
+        }
+    }
+
+    fn bytes(self) -> usize {
+        match self {
+            Self::F64 => 8,
+            Self::F32 => 4,
+            Self::Bf16 => 2,
+        }
+    }
+
+    /// Each array kind's precision, float64 for a checkpoint that names none.
+    fn of_payload(precision: Option<[Self; CHECKPOINT_ARRAYS]>) -> [Self; CHECKPOINT_ARRAYS] {
+        precision.unwrap_or([Self::F64; CHECKPOINT_ARRAYS])
+    }
+}
+
+/// The payload bytes of a checkpoint of operators of `shapes` with arrays in `precision`.
+fn checkpoint_payload_bytes(shapes: &[(usize, usize)], precision: [Precision; CHECKPOINT_ARRAYS]) -> Option<u64> {
+    let per_cell = precision.iter().map(|p| p.bytes() as u64).sum::<u64>();
     shapes.iter().try_fold(0_u64, |total, &(rows, cols)| {
         let cells = u64::try_from(rows).ok()?.checked_mul(u64::try_from(cols).ok()?)?;
-        total.checked_add(cells.checked_mul(CHECKPOINT_ARRAYS as u64 * 8)?)
+        total.checked_add(cells.checked_mul(per_cell)?)
     })
 }
 
 /// Decode in fixed-size byte tiles directly into the destination, including nonstandard array
-/// layouts. The wire order remains ndarray's logical iteration order used by the writer.
-fn read_checkpoint_array(reader: &mut impl Read, array: &mut Array2<f64>) -> Result<(), String> {
+/// layouts. The wire order remains ndarray's logical iteration order used by the writer; every
+/// precision widens exactly.
+fn read_checkpoint_array(reader: &mut impl Read, array: &mut Array2<f64>, precision: Precision) -> Result<(), String> {
+    let width = precision.bytes();
     let mut bytes = [0_u8; 64 * 1024];
     let mut remaining = array.len();
     let mut values = array.iter_mut();
     while remaining != 0 {
-        let count = remaining.min(bytes.len() / 8);
-        reader.read_exact(&mut bytes[..count * 8]).map_err(error)?;
-        for (value, encoded) in values.by_ref().take(count).zip(bytes[..count * 8].chunks_exact(8)) {
-            *value = f64::from_le_bytes(encoded.try_into().expect("eight bytes"));
+        let count = remaining.min(bytes.len() / width);
+        reader.read_exact(&mut bytes[..count * width]).map_err(error)?;
+        for (value, encoded) in values.by_ref().take(count).zip(bytes[..count * width].chunks_exact(width)) {
+            *value = match precision {
+                Precision::F64 => f64::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5], encoded[6], encoded[7]]),
+                Precision::F32 => f64::from(f32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]])),
+                Precision::Bf16 => f64::from(f32::from_bits(u32::from(u16::from_le_bytes([encoded[0], encoded[1]])) << 16)),
+            };
         }
         remaining -= count;
+    }
+    Ok(())
+}
+
+/// `array`'s values appended to `out` in `precision`, in ndarray's logical order; a value the
+/// precision does not hold exactly (one the device could not have held) is refused.
+fn write_checkpoint_array(out: &mut Vec<u8>, array: &Array2<f64>, precision: Precision) -> Result<(), String> {
+    out.reserve(array.len() * precision.bytes());
+    for &value in array {
+        let narrow = value as f32;
+        let exact = match precision {
+            Precision::F64 => true,
+            Precision::F32 => f64::from(narrow) == value || value.is_nan(),
+            Precision::Bf16 => (f64::from(narrow) == value && narrow.to_bits() & 0xffff == 0) || value.is_nan(),
+        };
+        if !exact {
+            return Err(format!("a checkpoint value {value:e} not held in {precision:?}"));
+        }
+        match precision {
+            Precision::F64 => out.extend_from_slice(&value.to_le_bytes()),
+            Precision::F32 => out.extend_from_slice(&narrow.to_le_bytes()),
+            Precision::Bf16 => out.extend_from_slice(&((narrow.to_bits() >> 16) as u16).to_le_bytes()),
+        }
     }
     Ok(())
 }
@@ -1794,34 +1861,36 @@ struct Snapshot {
     header: Vec<u8>,
     json: Vec<u8>,
     /// Per trainable operator `μ`, `ln σ` and IVON's state (the gradient's momentum and the
-    /// curvature estimate).
-    arrays: Vec<Array2<f64>>,
+    /// curvature estimate), each in the storage the device holds it in (`Progress::precision`).
+    payload: Vec<u8>,
 }
 
 impl Snapshot {
-    /// The checkpoint of `progress` and `posterior` as they are now.
-    fn take(progress: &Progress, posterior: &DevicePosterior) -> Result<Self, String> {
-        let mut arrays = Vec::with_capacity(4 * progress.shapes.len());
+    /// The checkpoint of `progress` and `posterior` as they are now; `progress` records the
+    /// payload's precision. One operator's arrays are on the host as float64 at a time.
+    fn take(progress: &mut Progress, posterior: &DevicePosterior) -> Result<Self, String> {
+        let precision = posterior.storages().map(Precision::of);
+        progress.precision = Some(precision);
+        let bytes = checkpoint_payload_bytes(&progress.shapes, precision).ok_or("a checkpoint too large to address")?;
+        let mut payload = Vec::with_capacity(usize::try_from(bytes).map_err(error)?);
         for i in 0..progress.shapes.len() {
             let (mean, log_sd, [momentum, curvature]) = posterior.operator(i)?;
-            arrays.extend([mean, log_sd, momentum, curvature]);
+            for (array, precision) in [&mean, &log_sd, &momentum, &curvature].into_iter().zip(precision) {
+                write_checkpoint_array(&mut payload, array, precision)?;
+            }
         }
-        Ok(Self { header: serde_json::to_vec(progress).map_err(error)?, json: serde_json::to_vec_pretty(progress).map_err(error)?, arrays })
+        Ok(Self { header: serde_json::to_vec(progress).map_err(error)?, json: serde_json::to_vec_pretty(progress).map_err(error)?, payload })
     }
 
-    /// Write the checkpoint atomically: the progress as JSON after its length, then every array's
-    /// values as little-endian float64. The progress alone also goes to the path with extension
-    /// `json`, readable while the fit runs.
+    /// Write the checkpoint atomically: the progress as JSON after its length, then the payload.
+    /// The progress alone also goes to the path with extension `json`, readable while the fit
+    /// runs.
     fn write(&self, path: &Path) -> Result<(), String> {
         let partial = path.with_extension("partial");
         let mut file = std::io::BufWriter::new(std::fs::File::create(&partial).map_err(error)?);
         file.write_all(&(self.header.len() as u64).to_le_bytes()).map_err(error)?;
         file.write_all(&self.header).map_err(error)?;
-        for array in &self.arrays {
-            for value in array.iter() {
-                file.write_all(&value.to_le_bytes()).map_err(error)?;
-            }
-        }
+        file.write_all(&self.payload).map_err(error)?;
         file.into_inner().map_err(error)?.sync_all().map_err(error)?;
         std::fs::rename(&partial, path).map_err(error)?;
         let partial = path.with_extension("json.partial");
@@ -1877,7 +1946,8 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) 
     {
         return Err(format!("{}: a checkpoint of another fit", path.display()));
     }
-    if checkpoint_payload_bytes(&progress.shapes) != Some(payload_bytes)
+    let precision = Precision::of_payload(progress.precision);
+    if checkpoint_payload_bytes(&progress.shapes, precision) != Some(payload_bytes)
         || posterior.mean.len() != progress.shapes.len()
         || posterior.log_sd.len() != progress.shapes.len()
         || posterior.mean.iter().zip(&progress.shapes).any(|(array, shape)| array.dim() != *shape)
@@ -1888,11 +1958,11 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) 
     let mut moments = Vec::with_capacity(posterior.mean.len());
     for i in 0..posterior.mean.len() {
         let dim = posterior.mean[i].dim();
-        read_checkpoint_array(&mut reader, &mut posterior.mean[i])?;
-        read_checkpoint_array(&mut reader, &mut posterior.log_sd[i])?;
+        read_checkpoint_array(&mut reader, &mut posterior.mean[i], precision[0])?;
+        read_checkpoint_array(&mut reader, &mut posterior.log_sd[i], precision[1])?;
         let mut next = std::array::from_fn(|_| Array2::zeros(dim));
-        for array in &mut next {
-            read_checkpoint_array(&mut reader, array)?;
+        for (array, precision) in next.iter_mut().zip(&precision[2..]) {
+            read_checkpoint_array(&mut reader, array, *precision)?;
         }
         moments.push(next);
     }
@@ -1911,21 +1981,24 @@ pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Po
         tokens: usize,
         shapes: Vec<(usize, usize)>,
         active: Vec<bool>,
+        #[serde(default)]
+        precision: Option<[Precision; CHECKPOINT_ARRAYS]>,
     }
     let (header, mut reader, payload_bytes): (Header, _, _) = checkpoint_header(path)?;
+    let precision = Precision::of_payload(header.precision);
     let mut posterior = Posterior::new(explanation, header.tokens)?;
     if header.shapes != posterior.mean.iter().map(Array2::dim).collect::<Vec<_>>() || header.active.len() != posterior.active.len() {
         return Err(format!("{}: a checkpoint of another explanation", path.display()));
     }
-    if checkpoint_payload_bytes(&header.shapes) != Some(payload_bytes) {
+    if checkpoint_payload_bytes(&header.shapes, precision) != Some(payload_bytes) {
         return Err(format!("{}: a checkpoint of the wrong size", path.display()));
     }
     for i in 0..header.shapes.len() {
-        read_checkpoint_array(&mut reader, &mut posterior.mean[i])?;
-        read_checkpoint_array(&mut reader, &mut posterior.log_sd[i])?;
+        read_checkpoint_array(&mut reader, &mut posterior.mean[i], precision[0])?;
+        read_checkpoint_array(&mut reader, &mut posterior.log_sd[i], precision[1])?;
         let mut state = Array2::zeros(header.shapes[i]);
-        for _ in 2..CHECKPOINT_ARRAYS {
-            read_checkpoint_array(&mut reader, &mut state)?;
+        for precision in &precision[2..] {
+            read_checkpoint_array(&mut reader, &mut state, *precision)?;
         }
     }
     posterior.active = header.active;
@@ -1989,6 +2062,7 @@ pub fn fit(
         evaluation_seconds: 0.0,
         full_seconds: 0.0,
         prior: None,
+        precision: None,
     };
     // The fixed held-out subset: the first batch of held-out bases (at least the two a source
     // needs).
@@ -3033,10 +3107,30 @@ mod tests {
         let mut reader = std::io::Cursor::new(&bytes);
         let mut output = Array2::zeros((6001, 3)).reversed_axes();
         assert!(!output.is_standard_layout());
-        read_checkpoint_array(&mut reader, &mut output).unwrap();
+        read_checkpoint_array(&mut reader, &mut output, Precision::F64).unwrap();
         assert_eq!(reader.position(), bytes.len() as u64);
         assert_eq!(output.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), bits);
-        assert!(read_checkpoint_array(&mut &bytes[..bytes.len() - 1], &mut output).is_err());
+        assert!(read_checkpoint_array(&mut &bytes[..bytes.len() - 1], &mut output, Precision::F64).is_err());
+    }
+
+    #[test]
+    fn checkpoint_arrays_in_device_precision_round_trip_exactly_and_refuse_other_values() {
+        // Values the device holds in each storage: f32 values (with -inf and a subnormal), and
+        // bfloat16 values (f32s whose low 16 bits are zero).
+        let f32s: Vec<f64> = (0..9001).map(|i| f64::from((i as f32 - 4500.0) / 7.0)).chain([f64::NEG_INFINITY, f64::from(f32::MIN_POSITIVE / 8.0)]).collect();
+        let bf16s: Vec<f64> = f32s.iter().map(|v| f64::from(f32::from_bits((*v as f32).to_bits() & 0xffff_0000))).collect();
+        for (values, precision) in [(&f32s, Precision::F32), (&bf16s, Precision::Bf16), (&f32s, Precision::F64)] {
+            let array = Array2::from_shape_vec((values.len(), 1), values.clone()).unwrap();
+            let mut bytes = Vec::new();
+            write_checkpoint_array(&mut bytes, &array, precision).unwrap();
+            assert_eq!(bytes.len(), values.len() * precision.bytes());
+            let mut back = Array2::zeros(array.dim());
+            read_checkpoint_array(&mut &bytes[..], &mut back, precision).unwrap();
+            assert_eq!(back.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), array.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        }
+        let wide = Array2::from_elem((1, 1), 0.1);
+        assert!(write_checkpoint_array(&mut Vec::new(), &wide, Precision::F32).is_err());
+        assert!(write_checkpoint_array(&mut Vec::new(), &Array2::from_elem((1, 1), f64::from(1.0_f32 + f32::EPSILON)), Precision::Bf16).is_err());
     }
 
     fn checkpoint_fixture() -> (Progress, Posterior, Vec<u8>) {
@@ -3073,6 +3167,7 @@ mod tests {
             evaluation_seconds: 2.0,
             full_seconds: 1.0,
             prior: None,
+            precision: None,
         };
         // The wire format: length-prefixed JSON, then `CHECKPOINT_ARRAYS` row-major f64 arrays per
         // operator. This fixture is independent of the streaming decoder and requires no GPU.
@@ -3142,8 +3237,10 @@ mod tests {
         other = expected.clone();
         other.settings.seed += 1;
         assert!(load_checkpoint(&path, &other, &mut posterior.clone()).unwrap_err().contains("another fit"));
-        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)]), Some(9 * 32));
-        assert_eq!(checkpoint_payload_bytes(&[(usize::MAX, usize::MAX)]), None);
+        let (wide, device) = ([Precision::F64; CHECKPOINT_ARRAYS], [Precision::F32, Precision::F32, Precision::Bf16, Precision::F32]);
+        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], wide), Some(9 * 32));
+        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], device), Some(9 * 14));
+        assert_eq!(checkpoint_payload_bytes(&[(usize::MAX, usize::MAX)], wide), None);
         std::fs::remove_file(path).unwrap();
     }
 
