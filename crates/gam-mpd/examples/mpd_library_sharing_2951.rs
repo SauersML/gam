@@ -6,9 +6,10 @@
 //! SETTINGS.json is the library fit's (`mpd_library_mdl_2951`). FROM is `native` (the library's
 //! start at `M`), `artifact:PATH` (a fit's posterior-mean artifact) or `checkpoint:PATH` (a fit's
 //! checkpoint: its means, standard deviations and removed groups). The library is fitted with the
-//! mixture prior over its gate directions and heads' query–key maps (`K` candidates per target;
-//! OUT/soft); every candidate holding more than half of its target's weight is made exact (a
-//! read–write tie or a shared query–key function). The library without and with the exact
+//! mixture prior over its parameter blocks (each MLP function's gate, up and output vectors, each
+//! key-value group's query–key maps and value map; `K` candidates per target; OUT/soft); every
+//! candidate holding more than half of its target's weight is made exact (a tie of a row or a
+//! column, a shared query–key function, a shared value map). The library without and with the exact
 //! sharing (OUT/base, OUT/moved) is then fitted to convergence on the same experiments from the
 //! soft fit's posterior means, and the sharing is accepted when the moved library's code length `F`
 //! is the smaller.
