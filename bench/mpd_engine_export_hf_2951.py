@@ -10,11 +10,13 @@ Every stored weight (F16, BF16, F32) widens to float64 exactly. GPT-NeoX's fused
 ``qk_norm`` gains and a gated (SwiGLU) MLP. ``--layers L`` keeps the first L blocks (then the final
 norm and the unembedding: the model's own readout of its stream after block L).
 
-Tokens: ``--tokens`` is a ``.pt`` tensor of token rows or an export directory holding ``tokens.f64``
-(e.g. the VPD 4L export, whose Pile rows are GPT-NeoX tokens). The check: the full fp32 forward of
+Tokens: ``--tokens`` is a ``.pt`` tensor of token rows, an export directory holding ``tokens.f64``
+(e.g. the VPD 4L export, whose Pile rows are GPT-NeoX tokens), or one or more ``WINDOWS.u32:ROWS``,
+the first ROWS rows of ``--context`` little-endian u32 tokens of each window file
+(``mpd_qwen3_fineweb_2951.py``), concatenated in order (training rows, then held-out rows). The check: the full fp32 forward of
 the (truncated) model on token row 0, positions ``0..T``, as ``logits_row0.f64`` (``T × vocab``).
 
-usage: mpd_engine_export_hf_2951.py MODEL_DIR OUT_DIR --tokens PATH [--layers L] [--context T]
+usage: mpd_engine_export_hf_2951.py MODEL_DIR OUT_DIR --tokens PATH [PATH ...] [--layers L] [--context T]
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("model")
     parser.add_argument("out")
-    parser.add_argument("--tokens", required=True)
+    parser.add_argument("--tokens", nargs="+", required=True)
     parser.add_argument("--layers", type=int, default=None)
     parser.add_argument("--context", type=int, default=128)
     args = parser.parse_args()
@@ -127,13 +129,25 @@ def main():
     })
     del sd
 
-    if args.tokens.endswith(".pt"):
-        ids = torch.load(args.tokens, map_location="cpu", weights_only=True)
+    if all(".u32:" in t for t in args.tokens):
+        parts = []
+        for item in args.tokens:
+            path, rows = item.rsplit(":", 1)
+            rows = int(rows)
+            part = np.fromfile(path, dtype="<u4", count=rows * args.context)
+            if part.size != rows * args.context:
+                raise SystemExit(f"{path}: fewer than {rows} rows of {args.context} tokens")
+            parts.append(part.reshape(rows, args.context))
+        ids = torch.from_numpy(np.concatenate(parts).astype(np.int64))
+    elif len(args.tokens) != 1:
+        raise SystemExit("several --tokens are window files PATH.u32:ROWS")
+    elif args.tokens[0].endswith(".pt"):
+        ids = torch.load(args.tokens[0], map_location="cpu", weights_only=True)
         ids = ids["tokens"] if isinstance(ids, dict) else ids
     else:
-        rec = json.load(open(os.path.join(args.tokens, "export.json")))
+        rec = json.load(open(os.path.join(args.tokens[0], "export.json")))
         shape = rec["files"]["tokens"]["shape"]
-        ids = torch.from_numpy(np.fromfile(os.path.join(args.tokens, "tokens.f64"), dtype="<f8").reshape(shape)).long()
+        ids = torch.from_numpy(np.fromfile(os.path.join(args.tokens[0], "tokens.f64"), dtype="<f8").reshape(shape)).long()
     ids = ids.long()
     if int(ids.max()) >= vocab:
         raise SystemExit(f"a token {int(ids.max())} beyond the vocabulary {vocab}")
