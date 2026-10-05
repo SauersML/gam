@@ -15,16 +15,21 @@
 //!
 //! The method, each fit to convergence on the same fixed native experiments:
 //! 1. the library is fitted (OUT/base);
-//! 2. among each MLP's functions carrying RelP flow at the fitted posterior mean on the held-out
+//! 2. among each MLP's functions carrying RelP flow at the library's start on the selection
 //!    sequences (`library_readout`), the regions are the groups whose rewrite saves parameters at
-//!    the posterior's resolution (`library_bodies::regions`);
+//!    the posterior's resolution (`library_bodies::regions`). The selection sequences are the first
+//!    training sequences, as many as the held-out ones: the structure is chosen on training data,
+//!    so the held-out sequences only report;
 //! 3. every region is rewritten as a call of its own body from the fitted library
-//!    (`library_bodies::rewrite`), fitted (OUT/rewritten), and accepted when its code length `F` is
-//!    below the base's;
+//!    (`library_bodies::rewrite`) and fitted (OUT/rewritten);
 //! 4. reuse by gradient: the library is fitted with the mixture prior over bodies
-//!    (`library_bodies::BodyMixture`; OUT/soft{n}), each dominant component is made exact by a merge
-//!    (`library_bodies::merge`), and the merged library is fitted (OUT/merged{n}) and accepted when
-//!    `F` falls; repeated while a merge is accepted.
+//!    (`library_bodies::BodyMixture`; OUT/soft{n}), each dominant component is compiled by a merge
+//!    (`library_bodies::merge`), and the merged library is fitted (OUT/merged{n}) and kept when its
+//!    `F` is below the extraction's so far; repeated while a merge is kept;
+//! 5. the extraction with its reuse is accepted when its final `F` is below the base's. An
+//!    extraction that pays only through the reuse it enables is one proposal with that reuse, so a
+//!    costlier intermediate step does not end the search. A rejection means this search found no
+//!    better description, not that none exists.
 //!
 //! OUT/SUMMARY.json: per stage `F` and the held-out evaluation (KL per token by experiment family),
 //! the regions, the bodies with their calls and the native functions each replaced, the alignments
@@ -211,9 +216,17 @@ impl Run {
         Ok(fit)
     }
 
+    /// The sequences the structure is chosen on (module note): the first training sequences, as
+    /// many as the held-out ones.
+    fn selection(&self) -> &[Vec<u32>] {
+        &self.train[..self.held.len().min(self.train.len())]
+    }
+
     /// The RelP flows among the functions of `explanation` as it stands (its artifact's values) on
-    /// the held-out sequences: `flows[t][s]` from `s` to `t` among the functions with any flow.
+    /// the selection sequences: `flows[t][s]` from `s` to `t` among the functions with any flow.
     fn flows(&self, explanation: &Explanation) -> Result<(Array2<f64>, Vec<Function>), String> {
+        let selection = self.selection();
+        let length = selection.first().ok_or("no selection sequences")?.len();
         let artifact = &explanation.artifact;
         let all: usize = explanation.layers.iter().map(|l| l.heads.len() + l.functions.len()).sum();
         let settings = library_readout::Settings {
@@ -226,10 +239,10 @@ impl Run {
             candidates: all,
             core: 0,
             thresholds: vec![1.0],
-            targets: self.held[0].len(),
+            targets: length,
         };
         let library = library_readout::Library::new(&self.device, &self.device, &self.native, &self.layers, artifact, settings.numeric_bytes, settings.tile_rows)?;
-        let readout = library_readout::read_out(&library, &self.held, &settings)?;
+        let readout = library_readout::read_out(&library, selection, &settings)?;
         let parse = |name: &str, layer: usize| -> Result<Function, String> {
             let (_, rest) = name.split_once('.').ok_or_else(|| format!("function name {name}"))?;
             let index = |s: &str| s.parse::<usize>().map_err(|e| format!("function name {name}: {e}"));
@@ -318,11 +331,7 @@ fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior
     rewritten.artifact.validate_coverage(&run.native)?;
     let mut current = run.fit("rewritten", &rewritten)?;
     record(&mut summary, "stages", stage("rewritten", &current))?;
-    let accepted = current.report.objective_bits < fitted.report.objective_bits;
-    record(&mut summary, "decisions", json!({"move": "rewrite", "calls": calls, "before_bits": fitted.report.objective_bits, "after_bits": current.report.objective_bits, "accepted": accepted}))?;
-    if !accepted {
-        return Ok(());
-    }
+    // The extraction is judged with its reuse (module note, step 5).
     let mut explanation = rewritten;
     // Reuse by gradient: the fit with the mixture prior over bodies (each body's components the
     // earlier bodies it aligns to, OUT/soft{n}); every dominant component made exact by a merge, the
@@ -343,16 +352,25 @@ fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior
         let name = format!("merged{round}");
         let fit = run.fit(&name, &merged)?;
         record(&mut summary, "stages", stage(&name, &fit))?;
-        let accepted = fit.report.objective_bits < current.report.objective_bits;
+        let kept = fit.report.objective_bits < current.report.objective_bits;
         record(
             &mut summary,
             "decisions",
-            json!({"move": "merge", "merged": pairs, "calls": merged_calls, "before_bits": current.report.objective_bits, "after_bits": fit.report.objective_bits, "accepted": accepted}),
+            json!({"move": "merge", "merged": pairs, "calls": merged_calls, "before_bits": current.report.objective_bits, "after_bits": fit.report.objective_bits, "kept": kept}),
         )?;
-        if !accepted {
+        if !kept {
             break;
         }
         (explanation, current, calls) = (merged, fit, merged_calls);
+    }
+    let accepted = current.report.objective_bits < fitted.report.objective_bits;
+    record(
+        &mut summary,
+        "decisions",
+        json!({"move": "extraction with reuse", "calls": calls, "before_bits": fitted.report.objective_bits, "after_bits": current.report.objective_bits, "accepted": accepted}),
+    )?;
+    if !accepted {
+        return Ok(());
     }
     summary["calls"] = json!(calls);
     // The evidence for each call: the functions whose flows enter and leave its region (RelP flows

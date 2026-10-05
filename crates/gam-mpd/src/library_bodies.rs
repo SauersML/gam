@@ -1641,6 +1641,9 @@ struct Moment {
     second: f64,
 }
 
+/// The Adam moments [`BodyMixture`]'s step keeps per component: its logit.
+const MOMENTS_PER_COMPONENT: usize = 1;
+
 /// The mixture prior over bodies (module note, # Reuse by gradient).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BodyMixture {
@@ -1955,7 +1958,7 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
             return Err(other());
         }
         for (t, (found, own)) in restored.targets.iter().zip(&self.targets).enumerate() {
-            if found.body != own.body || found.choices != own.choices || restored.moments[t].len() != 2 + found.components.len() {
+            if found.body != own.body || found.choices != own.choices || restored.moments[t].len() != 2 + MOMENTS_PER_COMPONENT * found.components.len() {
                 return Err(other());
             }
             let (units, k, k_out) = self.layouts.get(&own.body).ok_or_else(other)?.widths();
@@ -2323,7 +2326,19 @@ mod tests {
             // of 2 is 4 bits each); the calls' choice of body costs the same ln 2.
             let ln2 = std::f64::consts::LN_2;
             assert!((two.fixed_nats - one.fixed_nats - (crate::codec::subset_code_len_bits(16, 4).unwrap() + 8) as f64 * ln2 - 2_f64.ln()).abs() < 1e-12);
-            assert!((two.fixed_nats - merged.fixed_nats - 8.0 * ln2).abs() < 1e-12, "{} against {}", merged.fixed_nats, two.fixed_nats);
+            // The merge charges the matching of the four units (`ln Σ_j C(4, j)² j! = ln 209`) and,
+            // gated, the literals of the up scales the ownership map gains.
+            assert!((alignment.matching_nats() - 209_f64.ln()).abs() < 1e-12);
+            let scales: f64 = merged
+                .artifact
+                .program
+                .operators
+                .iter()
+                .filter(|o| o.name.contains(".alpha"))
+                .map(|o| o.code_bits().map(|(s, r)| (s + r) as f64 * ln2).unwrap())
+                .sum();
+            assert_eq!(scales > 0.0, gated);
+            assert!((merged.fixed_nats - two.fixed_nats + 8.0 * ln2 - 209_f64.ln() - scales).abs() < 1e-9, "{} against {}", merged.fixed_nats, two.fixed_nats);
             let program = &merged.artifact.program;
             assert_eq!(program.rules.iter().filter(|r| r.name.starts_with("library.body")).count(), 1);
             assert_eq!(sites(program, rule_index(program, &first.body).unwrap()).unwrap().len(), 2, "one body, two calls");
@@ -2415,6 +2430,261 @@ mod tests {
             assert_eq!(sorted, (0..n).collect::<Vec<_>>());
             assert!((value(&found) - best).abs() < 1e-12, "{} against the best {best}", value(&found));
         }
+    }
+
+    /// A body's values with every entry at deviation `sd` (fixed where `sd` is zero), its units'
+    /// liveness from them.
+    fn values(law: Law, gate: Array2<f64>, gate_bias: Option<Array2<f64>>, up: Option<Array2<f64>>, out: Array2<f64>, sd: f64) -> BodyValues {
+        let part = |m: Array2<f64>| Part { sd: Array2::from_elem(m.dim(), sd), mean: m };
+        let (m, k, k_out) = (gate.nrows(), gate.ncols(), out.nrows());
+        let mut v = BodyValues { law, gate: part(gate), gate_bias: gate_bias.map(part), up: up.map(part), up_bias: None, out: part(out), units: Vec::new(), inputs: vec![true; k], outputs: vec![true; k_out] };
+        v.units = (0..m).map(|j| live(&v, j, sd == 0.0)).collect();
+        v
+    }
+
+    fn matrix(rows: &[&[f64]]) -> Array2<f64> {
+        Array2::from_shape_fn((rows.len(), rows[0].len()), |(i, j)| rows[i][j])
+    }
+
+    #[test]
+    fn a_unit_is_live_when_its_whole_function_is_not_identically_zero() {
+        let out = matrix(&[&[1.0], &[0.0]]);
+        // A zero reader with bias one under ReLU computes the constant one.
+        let constant = values(Law::Relu, matrix(&[&[0.0, 0.0]]), Some(matrix(&[&[1.0]])), None, out.clone(), 0.0);
+        assert!(live(&constant, 0, true));
+        // With a bias where ReLU is zero it computes nothing.
+        let dead = values(Law::Relu, matrix(&[&[0.0, 0.0]]), Some(matrix(&[&[-1.0]])), None, out.clone(), 0.0);
+        assert!(!live(&dead, 0, true));
+        // A negative mean pre-activation the posterior lets vary is active on part of its support.
+        let uncertain = values(Law::Relu, matrix(&[&[0.0, 0.0]]), Some(matrix(&[&[-1.0]])), None, out.clone(), 1.0);
+        assert!(live(&uncertain, 0, false));
+        // A gated unit with a constant nonzero gate and a payload that reads is live; with a zero
+        // payload it is not.
+        let gated = |payload: f64| values(Law::Silu, matrix(&[&[0.0, 0.0]]), Some(matrix(&[&[2.0]])), Some(matrix(&[&[payload, 0.0]])), out.clone(), 0.0);
+        assert!(live(&gated(1.0), 0, true));
+        assert!(!live(&gated(0.0), 0, true));
+    }
+
+    #[test]
+    fn bodies_of_different_laws_do_not_align() {
+        let body = values(Law::GeluTanh, matrix(&[&[1.0, 0.5]]), None, None, matrix(&[&[1.0], &[-1.0]]), 1.0);
+        let mut other = body.clone();
+        other.law = Law::Silu;
+        assert!(align(&body, &other).is_err(), "equal coefficients under another law are another function");
+        assert!(align(&body, &body).is_ok());
+    }
+
+    #[test]
+    fn a_gated_map_s_variances_come_from_its_factors() {
+        // `u₁, u₂` independent with mean 1 and variance 0.01, `b` of mean 0 and variance 1:
+        // `Var((u₁ − u₂) b) = 0.02`, where entries treated as independent give 2.02.
+        let unit = Unit {
+            gate: (Array1::zeros(1), Array1::ones(1)),
+            bias: None,
+            write: Write::Gated { out: (Array1::from_vec(vec![1.0, 1.0]), Array1::from_vec(vec![0.01, 0.01])), up: (Array1::zeros(1), Array1::ones(1)), bias: None },
+        };
+        let t = transformed(&unit, &Array2::eye(1), &matrix(&[&[1.0, -1.0]]));
+        let ((mean, variance), _) = t.write.map().expect("a gated write has a map");
+        assert_eq!(mean[[0, 0]], 0.0);
+        assert!((variance[[0, 0]] - 0.02).abs() < 1e-15, "{}", variance[[0, 0]]);
+    }
+
+    #[test]
+    fn a_value_of_variance_zero_is_an_equality_constraint() {
+        let (design, y) = (matrix(&[&[1.0], &[1.0]]), matrix(&[&[0.0], &[2.0]]));
+        assert!(precisions(&Array1::from_vec(vec![0.0, 2.0]))[0].is_infinite());
+        let x = weighted_columns(&design, &y, &matrix(&[&[f64::INFINITY], &[1.0]])).unwrap();
+        assert!(x[[0, 0]].abs() < 1e-15, "the exact value holds: {}", x[[0, 0]]);
+        assert!(weighted_columns(&design, &y, &matrix(&[&[f64::INFINITY], &[f64::INFINITY]])).is_err(), "conflicting exact values");
+        let free = weighted_columns(&design, &y, &matrix(&[&[1.0], &[1.0]])).unwrap();
+        assert!((free[[0, 0]] - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn an_unmatched_unit_of_either_body_is_charged() {
+        let from = values(Law::GeluTanh, matrix(&[&[1.0, 0.0]]), None, None, matrix(&[&[1.0], &[0.0]]), 1.0);
+        let onto = values(Law::GeluTanh, matrix(&[&[1.0, 0.0], &[0.0, 3.0]]), None, None, matrix(&[&[1.0, 0.0], &[0.0, 3.0]]), 1.0);
+        let alignment = align(&from, &onto).unwrap();
+        // The gauge fits either pair exactly; the matching leaves out the unit cheaper to leave out
+        // (unit 0, its four values costing 1 + 1), and that unit's values are charged.
+        assert_eq!(alignment.units, vec![Some(1)]);
+        assert!((alignment.misfit - 2.0).abs() < 1e-9, "{}", alignment.misfit);
+        assert_eq!(alignment.entries, 8);
+        assert_eq!(alignment.live, [1, 2]);
+        assert!(!alignment.constrains(), "a gauge of eight entries fits eight values");
+        // `ln (1 + 1·2·1)`: no pair, or one of the two units of `onto`.
+        assert!((alignment.matching_nats() - 3_f64.ln()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn signatures_compare_reads_with_reads_and_writes_with_writes() {
+        let a: Signature = (Array1::from_vec(vec![1.0, 0.5, 0.2]), Array1::from_vec(vec![0.9, 0.1, 0.0]));
+        let b: Signature = (Array1::from_vec(vec![1.0, 0.5]), Array1::from_vec(vec![0.9, 0.1]));
+        assert_eq!(signature_distance(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn a_rewrite_records_the_parts_it_discards() {
+        let (native, layers, _, _) = tiny("bodies_discarded", "gelu_tanh", false);
+        let mut start = explanation(&native, &layers).unwrap();
+        // The region's fourth gate row is the sum of its first two: its read has rank three.
+        let program = &mut start.artifact.program;
+        let mut gate = program.operators[operator_index(program, "library.l0.mlp.gate").unwrap()].matrix();
+        let sum = &gate.row(SITE0[0]) + &gate.row(SITE0[1]);
+        gate.row_mut(SITE0[3]).assign(&sum);
+        set(program, "library.l0.mlp.gate", gate);
+        let (rewritten, call) = rewrite(&start, 0, &SITE0).unwrap();
+        let get = |p: &OperatorProgram, name: &str| p.operators[operator_index(p, name).unwrap()].matrix();
+        let (before, after) = (&start.artifact.program, &rewritten.artifact.program);
+        let a = get(before, "library.l0.mlp.gate").select(Axis(0), &SITE0);
+        let (g, r) = (get(after, &format!("{}.gate", call.body)), get(after, &format!("{}.read", call.name)));
+        assert_eq!(r.nrows(), 3, "the body reads the three resolved directions");
+        let spectral = |m: &Array2<f64>| svd(m.view(), false).unwrap().singular_values.first().copied().unwrap_or(0.0);
+        let dropped = spectral(&(&a - &g.dot(&r)));
+        assert!((dropped - call.discarded[0]).abs() <= 1e-12 * spectral(&a), "{dropped} against {}", call.discarded[0]);
+        assert!(call.discarded[0] <= 1e-12 * spectral(&a));
+    }
+
+    #[test]
+    fn a_bias_takes_no_binding_at_a_rank_one_read() {
+        let (native, layers, _, _) = tiny("bodies_bias", "gelu_tanh", false);
+        let mut start = explanation(&native, &layers).unwrap();
+        // Layer 0's MLP with a gate bias, each function's entry in its gate group and owned as the
+        // native bias of its unit.
+        let mut rng = StdRng::seed_from_u64(41);
+        let program = &mut start.artifact.program;
+        let gate = operator_index(program, "library.l0.mlp.gate").unwrap();
+        let units_interface = program.operators[gate].rows.clone();
+        let bias = program.operators.len();
+        program.operators.push(Arc::new(dense("library.l0.mlp.gate_bias".into(), units_interface, Interface::constant(), random(&mut rng, 16, 1), Provenance::default()).unwrap()));
+        let rule = rule_index(program, "library.l0.mlp").unwrap();
+        for node in &mut program.rules[rule].nodes {
+            if let Node::Affine { terms, bias: b } = node
+                && terms[0].1 == gate
+            {
+                *b = Some(bias);
+            }
+        }
+        // Two functions reading one direction: the body reads one coordinate, as wide as a bias.
+        let mut values = program.operators[gate].matrix();
+        let doubled = &values.row(1) * 2.0;
+        values.row_mut(4).assign(&doubled);
+        set(program, "library.l0.mlp.gate", values);
+        program.interfaces().unwrap();
+        for (i, function) in start.layers[0].functions.iter().enumerate() {
+            start.groups[function[0]].cells.push(Cells { operator: bias, rows: vec![i], cols: 0..1 });
+            start.artifact.owners.push(crate::artifact::Owner {
+                operator: "library.l0.mlp.gate_bias".into(),
+                rows: i..i + 1,
+                cols: 0..1,
+                body: "library.l0.mlp".into(),
+                site: "library.l0.mlp".into(),
+                native: "blocks.0.c_fc.bias".into(),
+                native_rows: i..i + 1,
+                native_cols: 0..1,
+                role: "gate_bias".into(),
+                ..Default::default()
+            });
+        }
+        start.trainable.push(bias);
+        start.trainable.sort_unstable();
+        let (rewritten, call) = rewrite(&start, 0, &[1, 4]).unwrap();
+        let program = &rewritten.artifact.program;
+        assert_eq!(program.operators[operator_index(program, &format!("{}.read", call.name)).unwrap()].rows.width(), 1);
+        let natives = |e: &Explanation| -> BTreeMap<(String, usize, usize), Array2<f64>> {
+            e.artifact.owners.iter().map(|o| ((o.native.clone(), o.native_rows.start, o.native_cols.start), e.artifact.native_block(o).unwrap())).collect()
+        };
+        let (before, after) = (natives(&start), natives(&rewritten));
+        for (key, value) in &before {
+            let moved = &after[key];
+            assert_eq!(value.dim(), moved.dim(), "native block {key:?}");
+            let scale = value.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+            assert!(value.iter().zip(moved).all(|(a, b)| (a - b).abs() <= 1e-9 * scale), "native block {key:?}");
+        }
+    }
+
+    #[test]
+    fn a_unit_merged_twice_keeps_one_composed_up_scale() {
+        let (native, layers, family, _) = tiny("bodies_twice", "silu", true);
+        let mut start = explanation(&native, &layers).unwrap();
+        planted(&mut start, true);
+        // A third copy of the subroutine at layer 0, in another basis and with other up scales.
+        let third = [0, 3, 5, 7];
+        {
+            let mut rng = StdRng::seed_from_u64(23);
+            let (g, b, u) = (random(&mut rng, 4, 2), random(&mut rng, 4, 2), random(&mut rng, 2, 4));
+            let mut other = StdRng::seed_from_u64(29);
+            let (read, write) = (random(&mut other, 2, 8), random(&mut other, 8, 2));
+            let scales = [2.0, 0.5, -1.0, 1.5];
+            let program = &mut start.artifact.program;
+            let get = |p: &OperatorProgram, name: &str| p.operators[operator_index(p, name).unwrap()].matrix();
+            let (mut gate, mut up, mut out) = (get(program, "library.l0.mlp.gate"), get(program, "library.l0.mlp.up"), get(program, "library.l0.mlp.out"));
+            let (gr, br, wu) = (g.dot(&read), b.dot(&read), write.dot(&u));
+            for (j, &f) in third.iter().enumerate() {
+                gate.row_mut(f).assign(&gr.row(j));
+                up.row_mut(f).assign(&(&br.row(j) * scales[j]));
+                out.column_mut(f).assign(&(&wu.column(j) / scales[j]));
+            }
+            set(program, "library.l0.mlp.gate", gate);
+            set(program, "library.l0.mlp.up", up);
+            set(program, "library.l0.mlp.out", out);
+        }
+        let (one, first) = rewrite(&start, 0, &SITE0).unwrap();
+        let (two, second) = rewrite(&one, 1, &SITE1).unwrap();
+        let (three, last) = rewrite(&two, 0, &third).unwrap();
+        let posterior = Posterior::new(&three, 72).unwrap();
+        let onto_first = align(&body_values(&three, &posterior, &second.body).unwrap(), &body_values(&three, &posterior, &first.body).unwrap()).unwrap();
+        let (merged, calls) = merge(&three, &[first.clone(), second.clone(), last.clone()], &second.body, &first.body, &onto_first).unwrap();
+        // The second call's units now carry up scales; merging their body again composes them.
+        let posterior = Posterior::new(&merged, 72).unwrap();
+        let onto_last = align(&body_values(&merged, &posterior, &first.body).unwrap(), &body_values(&merged, &posterior, &last.body).unwrap()).unwrap();
+        let (twice, _) = merge(&merged, &calls, &first.body, &last.body, &onto_last).unwrap();
+        close(&outputs(&start, &family), &outputs(&twice, &family), 1e-9);
+        let names: Vec<&str> = twice.artifact.program.operators.iter().map(|o| o.name.as_str()).collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "every operator name is unique");
+        let natives = |e: &Explanation| -> BTreeMap<(String, usize, usize), Array2<f64>> {
+            e.artifact.owners.iter().map(|o| ((o.native.clone(), o.native_rows.start, o.native_cols.start), e.artifact.native_block(o).unwrap())).collect()
+        };
+        let (before, after) = (natives(&start), natives(&twice));
+        for (key, value) in &before {
+            let moved = &after[key];
+            let scale = value.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+            assert!(value.iter().zip(moved).all(|(a, b)| (a - b).abs() <= 1e-9 * scale), "native block {key:?} after two merges");
+        }
+        // Each owner of the second call's units holds one up scale.
+        for owner in twice.artifact.owners.iter().filter(|o| o.site == second.name) {
+            assert!(owner.left.iter().chain(&owner.right).filter(|n| n.contains("alpha")).count() <= 1, "{owner:?}");
+        }
+    }
+
+    #[test]
+    fn a_restored_mixture_must_be_of_this_explanation() {
+        use crate::library_mdl::PriorTerm;
+        let (native, layers, _, _) = tiny("bodies_restore", "gelu_tanh", false);
+        let mut start = explanation(&native, &layers).unwrap();
+        planted(&mut start, false);
+        let (one, first) = rewrite(&start, 0, &SITE0).unwrap();
+        let (two, second) = rewrite(&one, 1, &SITE1).unwrap();
+        let posterior = Posterior::new(&two, 72).unwrap();
+        let steps = crate::library_mixture::Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 };
+        let mut mixture = BodyMixture::new(&two, steps).unwrap();
+        mixture.epoch(&two, &posterior).unwrap();
+        assert_eq!(mixture.targets[1].components.len(), 1);
+        let saved = mixture.save().unwrap();
+        let mut fresh = BodyMixture::new(&two, steps).unwrap();
+        fresh.load(&saved).unwrap();
+        // A component on the target's own body breaks the order that makes the prior a density.
+        let mut later = saved.clone();
+        later["targets"][1]["components"][0]["body"] = serde_json::json!(second.body);
+        assert!(fresh.load(&later).is_err());
+        // A layout of other groups.
+        let mut moved = saved.clone();
+        let group = moved["layouts"][first.body.as_str()]["entries"][0]["group"].as_u64().unwrap();
+        moved["layouts"][first.body.as_str()]["entries"][0]["group"] = serde_json::json!(group + 1);
+        assert!(fresh.load(&moved).is_err());
     }
 
     #[test]
