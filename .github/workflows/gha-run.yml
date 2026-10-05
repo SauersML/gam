@@ -90,14 +90,16 @@ jobs:
       - name: Toolchain (rust-toolchain.toml's)
         run: rustup toolchain install "$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)" --profile minimal
 
+      # One entry per lock file and toolchain (about 0.7 GB): the dependencies, which cost the build
+      # most, come from it; the workspace's own crates rebuild from the commit. An entry per commit
+      # would evict the other workflows' caches from the repository's 10 GB.
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ inputs.sha }}
-          restore-keys: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+          key: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
       - name: Build
         run: |
