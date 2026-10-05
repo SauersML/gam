@@ -820,8 +820,9 @@ impl Draw {
 
     /// Per base one clean and one patched experiment over `variables` read variables
     /// (`interchange::sample`), from the batch's seed.
-    fn experiments(&self, layers: usize, variables: usize) -> Vec<Experiment> {
-        interchange::sample(&mut StdRng::seed_from_u64(self.seed), self.bases.len(), layers, variables)
+    fn experiments(&self, sequences: &[Vec<u32>], layers: usize, variables: usize) -> Vec<Experiment> {
+        let length = self.bases.first().map_or(0, |b| sequences[*b].len());
+        interchange::sample(&mut StdRng::seed_from_u64(self.seed), self.bases.len(), layers, variables, length)
     }
 }
 
@@ -1016,8 +1017,12 @@ fn held_out(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterio
         let mut rng = StdRng::seed_from_u64(draw.seed);
         let mut experiments = Vec::with_capacity(2 * blocks * draw.bases.len());
         for k in 1..=blocks {
-            let drawn = interchange::sample(&mut rng, draw.bases.len(), blocks / 2, variables.len());
-            experiments.extend(drawn.into_iter().map(|e| Experiment { explained: interchange::hybrid_of(&mut rng, blocks, k), ..e }));
+            let drawn = interchange::sample(&mut rng, draw.bases.len(), blocks / 2, variables.len(), batch.length());
+            // A base's patched experiment shares its unpatched experiment's hybrid.
+            for pair in drawn.chunks(2) {
+                let explained = interchange::hybrid_of(&mut rng, blocks, k);
+                experiments.extend(pair.iter().map(|e| Experiment { explained: explained.clone(), ..e.clone() }));
+            }
         }
         let (bits, _) = scorer.score(&batch, &experiments, &variables, &posterior.mean, None, false)?;
         for (e, bits) in experiments.iter().zip(&bits) {
@@ -1282,7 +1287,7 @@ pub fn fit(
         for (b, draw) in draws.iter().enumerate() {
             let step_started = Instant::now();
             let batch = draw.batch(sequences)?;
-            let experiments = draw.experiments(scorer.layers(), variables.len());
+            let experiments = draw.experiments(&sequences[..], scorer.layers(), variables.len());
             let (theta, noise) = posterior.sample(noise_seed(settings.seed, epoch + 1, b));
             let (bits, gradients) = scorer.score(&batch, &experiments, &variables, &posterior.mean, Some(&theta), true)?;
             for (e, bits) in experiments.iter().zip(&bits) {
@@ -1388,7 +1393,7 @@ fn expected_divergence(scorer: &mut Scorer, posterior: &Posterior, draws: &[Draw
     for (b, draw) in draws.iter().enumerate() {
         // Removal zeroes entries, so the remaining entries see the same noise as the full posterior.
         let (theta, _) = trial.sample(noise_seed(settings.seed, 0, b));
-        let experiments = draw.experiments(scorer.layers(), variables.len());
+        let experiments = draw.experiments(&sequences[..], scorer.layers(), variables.len());
         let (scored, _) = scorer.score(&draw.batch(sequences)?, &experiments, &variables, &posterior.mean, Some(&theta), false)?;
         bits += scored.iter().flatten().sum::<f64>();
     }
@@ -1675,7 +1680,7 @@ mod tests {
         let mut read_patches = 0;
         for (b, draw) in draws.iter().enumerate() {
             let batch = draw.batch(&sequences).unwrap();
-            let experiments = draw.experiments(scorer.layers(), variables.len());
+            let experiments = draw.experiments(&sequences[..], scorer.layers(), variables.len());
             read_patches += experiments.iter().filter(|e| matches!(e.patch, Some(Patch::Read { .. }))).count();
             let (theta, _) = trial.sample(noise_seed(settings.seed, 0, b));
 
@@ -1691,7 +1696,7 @@ mod tests {
             reference_bits += reference.bits.iter().flatten().sum::<f64>();
 
             // The former implementation redrew experiments and directions from the trial.
-            let redrawn = draw.experiments(scorer.layers(), trial_variables.len());
+            let redrawn = draw.experiments(&sequences[..], scorer.layers(), trial_variables.len());
             let (bits, _) = scorer.score(&batch, &redrawn, &trial_variables, &trial.mean, Some(&theta), false).unwrap();
             changed_data_bits += bits.iter().flatten().sum::<f64>();
             // Freezing identities alone is insufficient: zeroed reads change the patch basis.

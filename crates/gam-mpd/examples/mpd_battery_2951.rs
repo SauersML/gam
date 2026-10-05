@@ -22,8 +22,9 @@
 //!   variable drawn uniformly, the complement patch of every block, and the joint complement
 //!   patch at a uniformly drawn set of at least two blocks (its size uniform in `2..=2L`, where
 //!   cancellation between blocks shows), each with the source a sequence shared across the whole
-//!   batch of bases. Every source row is scored; the worst
-//!   source of the first `K` (by the mean over all bases) is reported for each `K`.
+//!   batch of bases. Each base's patches replace one position drawn uniformly and are scored from
+//!   that position on (earlier tokens are the unpatched run's). Every source row is scored; the
+//!   worst source of the first `K` (by the mean over all bases) is reported for each `K`.
 use gam_gpu::{
     GpuPolicy,
     tensor::{Arithmetic, Device, Op, Tensor},
@@ -418,6 +419,7 @@ fn main() -> Result<(), String> {
     let blocks = 2 * layer_count;
     let interchange = Interchange::new(&device, &native, &layers, &artifact, &explanation.trainable, variables.clone(), settings.numeric_bytes, settings.head_tile_rows)?;
     let read_of: Vec<usize> = (0..bases.len()).map(|_| rng.random_range(0..variables.len())).collect();
+    let position_of: Vec<usize> = (0..bases.len()).map(|_| rng.random_range(0..bases[0].len())).collect();
     let joint_of: Vec<Vec<usize>> = (0..bases.len())
         .map(|_| {
             let k = rng.random_range(2..=blocks);
@@ -435,7 +437,11 @@ fn main() -> Result<(), String> {
             let batch = Batch::new(chunk.to_vec(), vec![source.clone()])?;
             let mut experiments = Vec::with_capacity(chunk.len() * (families + 1));
             for b in 0..chunk.len() {
-                let at = |patch| Experiment { base: b, source: 0, explained: vec![true; blocks], patch };
+                let position = position_of[c * settings.batch_sequences + b];
+                let at = |patch: Option<Patch>| {
+                    let position = if patch.is_some() { position } else { 0 };
+                    Experiment { base: b, source: 0, explained: vec![true; blocks], patch, position }
+                };
                 experiments.push(at(Some(Patch::Read { variable: read_of[c * settings.batch_sequences + b] })));
                 experiments.extend((0..blocks).map(|block| at(Some(Patch::Complement { blocks: vec![block] }))));
                 experiments.push(at(Some(Patch::Complement { blocks: joint_of[c * settings.batch_sequences + b].clone() })));

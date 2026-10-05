@@ -177,8 +177,8 @@ fn main() -> Result<(), String> {
     let (m, p) = x.models();
     let head = x.head();
     let variables = x.variables();
-    let experiments = x.sample(&mut rand::rngs::StdRng::seed_from_u64(1), sequences);
-    let clean: Vec<Experiment> = (0..sequences).map(|n| Experiment { base: n, source: n, explained: vec![true; 2 * layer_count], patch: None }).collect();
+    let experiments = x.sample(&mut rand::rngs::StdRng::seed_from_u64(1), sequences, context);
+    let clean: Vec<Experiment> = (0..sequences).map(|n| Experiment { base: n, source: n, explained: vec![true; 2 * layer_count], patch: None, position: 0 }).collect();
     let (teacher_time, teacher) = measure(&device, reps, || Teacher::new(&m, head, &batch, variables, &experiments))?;
     let (design_time, design) = measure(&device, reps, || interchange::design(&p, variables, &experiments))?;
     let (gradient_time, evaluation) = measure(&device, reps, || interchange::evaluate(&m, &p, head, &batch, &teacher, &experiments, &design, true))?;
@@ -187,7 +187,7 @@ fn main() -> Result<(), String> {
     drop(evaluation);
     let (step_time, _) = measure(&device, reps, || x.evaluate(&batch, &experiments, true))?;
     let (clean_time, clean_values) = measure(&device, reps, || x.evaluate(&batch, &clean, true))?;
-    let mean = |bits: &[Vec<f64>]| bits.iter().flatten().sum::<f64>() / (bits.len() * context).max(1) as f64;
+    let mean = |bits: &[Vec<f64>]| bits.iter().flatten().sum::<f64>() / bits.iter().map(Vec::len).sum::<usize>().max(1) as f64;
     let patched_bits: Vec<Vec<f64>> = experiments.iter().zip(&values.bits).filter(|(e, _)| e.patch.is_some()).map(|(_, b)| b.clone()).collect();
     let report = json!({
         "model": model.display().to_string(),

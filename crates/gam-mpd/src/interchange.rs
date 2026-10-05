@@ -11,8 +11,9 @@
 //!   uniformly among the sets of that size, so the autonomous `P` (`k = 2L`) and each single
 //!   replacement keep probability `1/(2L)` and every combination of blocks is tested, not only
 //!   prefixes (exact abstraction under the identity alignment requires every hybrid to match `M`);
-//! * and patches at distinct blocks (none, one read patch, or the complements at a set of blocks),
-//!   applied by both models; at a block `B`:
+//! * and patches at one position `t₀` of distinct blocks (none, one read patch, or the
+//!   complements at a set of blocks), applied by both models; at a block `B`, on the read's row
+//!   `t₀` only (the variables are a direction at a position):
 //!   - a read patch of one of `P`'s read variables at `B` (an MLP function's gate direction `g_i`,
 //!     or an attention function's query, key or value read map, a subspace), with orthonormal
 //!     basis `Q`: the read becomes `h + (s − h) Q Qᵀ`, the source's coordinates in the variable;
@@ -20,8 +21,8 @@
 //!     directions at `B`: the read becomes `s + (h − s) Q Qᵀ`, the source's coordinates outside
 //!     every read of `P`. `P` predicts no effect, so `M` must show none.
 //!
-//! `h` is the model's read value at `B` on `x` and `s` its own read value at `B` on `x′`: `M`'s for
-//! `M_e`, the same hybrid's for `P_e`. Only the block's projections read the read
+//! `h` is the model's read value at `B` and `t₀` on `x` and `s` its own read value at `B` and `t₀`
+//! on `x′`: `M`'s for `M_e`, the same hybrid's for `P_e`. Only the block's projections read the read
 //! node, so the patch is path-specific: the residual passthrough keeps the base's stream. `Q` is
 //! data, computed from `P`'s current reads ([`design`]): the right singular vectors whose singular
 //! values are resolved from zero by their rounding band. No gradient passes through it. The
@@ -29,9 +30,12 @@
 //! the source's `ḡ Q Qᵀ` (the complement's the other way round), and the source's part flows back
 //! through the hybrid's run on `x′`.
 //!
-//! The data term is `Σ_e Σ_t KL(M_e ‖ P_e)` over the tokens `t` of each base, in bits
-//! ([`evaluate`]), scored through the final head the two models share (compact fixed-head
-//! targets).
+//! The data term is `Σ_e Σ_{t ≥ t₀} KL(M_e ‖ P_e)` over the tokens `t` of each base from the
+//! experiment's position on (an unpatched experiment's position is 0), in bits ([`evaluate`]),
+//! scored through the final head the two models share (compact fixed-head targets). Attention is
+//! causal, so before `t₀` a patched run equals the unpatched run of the same hybrid, whose
+//! divergence the base's unpatched experiment already scores; a patched experiment therefore
+//! shares its base's unpatched hybrid and is scored from `t₀` on.
 //!
 //! # Execution
 //!
@@ -217,13 +221,15 @@ pub enum Patch {
 }
 
 /// One experiment: base and source sequences (indices into the batch's), the hybrid (per block
-/// whether `P_e` runs `P`'s version of it), and at most one patch.
+/// whether `P_e` runs `P`'s version of it), at most one patch, and its position: the row the patch
+/// replaces and the first scored token (0 for an unpatched experiment, scored everywhere).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Experiment {
     pub base: usize,
     pub source: usize,
     pub explained: Vec<bool>,
     pub patch: Option<Patch>,
+    pub position: usize,
 }
 
 impl Experiment {
@@ -264,17 +270,20 @@ pub fn hybrid_of(rng: &mut impl RngExt, blocks: usize, k: usize) -> Vec<bool> {
     explained
 }
 
-/// Per base sequence `n < sequences`, one clean experiment and one patched with source sequence
-/// `n`, the patch drawn uniformly over the union of the `variables` read variables and the `2
-/// layers` blocks (a complement patch), every hybrid drawn independently ([`hybrid`]).
-pub fn sample(rng: &mut impl RngExt, sequences: usize, layers: usize, variables: usize) -> Vec<Experiment> {
+/// Per base sequence `n < sequences` (each `length` tokens), one clean experiment under a hybrid
+/// drawn by [`hybrid`], and one patched with source sequence `n` under the same hybrid: the patch
+/// drawn uniformly over the union of the `variables` read variables and the `2 layers` blocks (a
+/// complement patch), its position uniformly over the `length` positions.
+pub fn sample(rng: &mut impl RngExt, sequences: usize, layers: usize, variables: usize, length: usize) -> Vec<Experiment> {
     let blocks = 2 * layers;
     let mut out = Vec::with_capacity(2 * sequences);
     for n in 0..sequences {
-        out.push(Experiment { base: n, source: n, explained: hybrid(rng, blocks), patch: None });
+        let explained = hybrid(rng, blocks);
         let u = rng.random_range(0..variables + blocks);
         let patch = if u < variables { Patch::Read { variable: u } } else { Patch::Complement { blocks: vec![u - variables] } };
-        out.push(Experiment { base: n, source: n, explained: hybrid(rng, blocks), patch: Some(patch) });
+        let position = rng.random_range(0..length);
+        out.push(Experiment { base: n, source: n, explained: explained.clone(), patch: None, position: 0 });
+        out.push(Experiment { base: n, source: n, explained, patch: Some(patch), position });
     }
     out
 }
@@ -287,6 +296,11 @@ pub struct Batch {
 }
 
 impl Batch {
+    /// The tokens of each sequence.
+    pub fn length(&self) -> usize {
+        self.length
+    }
+
     pub fn new(base: Vec<Vec<u32>>, source: Vec<Vec<u32>>) -> Result<Self, String> {
         let length = base.first().map_or(0, Vec::len);
         if length == 0 || base.iter().chain(&source).any(|s| s.len() != length) {
@@ -488,14 +502,15 @@ impl Site {
 
 /// One sequence run through blocks `blocks` of the hybrid that runs `P`'s version of the blocks
 /// `explained` marks and `M`'s of the others, entering at `entry` (the stream entering
-/// `blocks.start`, past the first block), with its patches at distinct blocks (each its directions
-/// and the source's read value).
+/// `blocks.start`, past the first block), with its patches at distinct blocks on row `position`
+/// (each its directions and the source's read value there, one row).
 struct Lane<'t> {
     tokens: &'t [u32],
     blocks: Range<usize>,
     explained: &'t [bool],
     entry: Option<Tensor>,
     patches: Vec<(Arc<Basis>, Tensor)>,
+    position: usize,
     captures: Vec<Site>,
 }
 
@@ -560,7 +575,10 @@ fn forward(models: [&Model; 2], lanes: &mut [Lane], length: usize, keep: bool) -
             let patched: Vec<(usize, usize, &Basis, &Tensor)> = members
                 .iter()
                 .enumerate()
-                .flat_map(|(i, lane)| lanes[*lane].patches.iter().filter(move |(basis, _)| basis.block == b).map(move |(basis, s)| (model.read(basis.block), i * length, basis.as_ref(), s)))
+                .flat_map(|(i, lane)| {
+                    let at = i * length + lanes[*lane].position;
+                    lanes[*lane].patches.iter().filter(move |(basis, _)| basis.block == b).map(move |(basis, s)| (model.read(basis.block), at, basis.as_ref(), s))
+                })
                 .collect();
             let arithmetic = model.program.arithmetic();
             let edit = |node: usize, trace: &DeviceTrace| -> Result<Option<Tensor>, String> {
@@ -596,7 +614,7 @@ fn forward(models: [&Model; 2], lanes: &mut [Lane], length: usize, keep: bool) -
 
 /// The reverse of `run` from the cotangents of its lanes' outputs and captures (none for zero):
 /// adds `P`'s parameter gradient into `gradient` and returns per lane, per patched block, the
-/// cotangent of the source's read there.
+/// cotangent of the source's read at the lane's patched row (one row).
 fn reverse(
     models: [&Model; 2],
     lanes: &[Lane],
@@ -642,7 +660,10 @@ fn reverse(
             .members
             .iter()
             .enumerate()
-            .flat_map(|(i, lane)| lanes[*lane].patches.iter().filter(move |(basis, _)| basis.block == b).map(move |(basis, _)| (model.read(basis.block), i, *lane, basis.as_ref())))
+            .flat_map(|(i, lane)| {
+                let at = i * length + lanes[*lane].position;
+                lanes[*lane].patches.iter().filter(move |(basis, _)| basis.block == b).map(move |(basis, _)| (model.read(basis.block), at, *lane, basis.as_ref()))
+            })
             .collect();
         let edited: BTreeSet<usize> = patched.iter().map(|(node, ..)| *node).collect();
         keep.extend(&edited);
@@ -652,8 +673,8 @@ fn reverse(
         let trainable: &[usize] = if segment.explanation { &model.sites.trainable[b] } else { &[] };
         let arithmetic = model.program.arithmetic();
         let mut hook = |node: usize, g: &mut Tensor| -> Result<(), String> {
-            for (_, i, lane, basis) in patched.iter().filter(|(at, ..)| *at == node) {
-                if let Some(source) = exchange_cotangent(d, g, i * length, length, basis, arithmetic)? {
+            for (_, at, lane, basis) in patched.iter().filter(|(node_at, ..)| *node_at == node) {
+                if let Some(source) = exchange_cotangent(d, g, *at, 1, basis, arithmetic)? {
                     sources[*lane].insert(basis.block, source);
                 }
             }
@@ -681,7 +702,7 @@ fn reverse(
 
 /// Refuse an experiment outside `batch` or with a hybrid not of `blocks` blocks.
 fn check(e: &Experiment, batch: &Batch, blocks: usize) -> Result<(), String> {
-    if e.base >= batch.base.len() || e.source >= batch.source.len() || e.explained.len() != blocks {
+    if e.base >= batch.base.len() || e.source >= batch.source.len() || e.explained.len() != blocks || e.position >= batch.length {
         return Err(error("an experiment outside the batch or its blocks"));
     }
     Ok(())
@@ -720,7 +741,7 @@ impl Teacher {
             .base
             .iter()
             .zip(&base_sites)
-            .map(|(tokens, sites)| Lane { tokens, blocks: 0..blocks, explained: &native, entry: None, patches: Vec::new(), captures: sites.iter().map(|b| Site::Entry(*b)).collect() })
+            .map(|(tokens, sites)| Lane { tokens, blocks: 0..blocks, explained: &native, entry: None, patches: Vec::new(), position: 0, captures: sites.iter().map(|b| Site::Entry(*b)).collect() })
             .collect();
         let run = forward([m, m], &mut lanes, batch.length, false)?;
         let mut entries = BTreeMap::new();
@@ -736,7 +757,7 @@ impl Teacher {
             .iter()
             .map(|(n, sites)| {
                 let last = sites.last().copied().unwrap_or_default();
-                Lane { tokens: &batch.source[*n], blocks: 0..last + 1, explained: &native, entry: None, patches: Vec::new(), captures: sites.iter().map(|b| Site::Read(*b)).collect() }
+                Lane { tokens: &batch.source[*n], blocks: 0..last + 1, explained: &native, entry: None, patches: Vec::new(), position: 0, captures: sites.iter().map(|b| Site::Read(*b)).collect() }
             })
             .collect();
         let run = forward([m, m], &mut lanes, batch.length, false)?;
@@ -781,15 +802,17 @@ pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: 
             .iter()
             .map(|basis| {
                 let source = teacher.reads.get(&(e.source, basis.block)).ok_or_else(|| error("the teacher has no source read for a patched experiment"))?;
-                Ok((Arc::clone(basis), d.copy(source).map_err(error)?))
+                Ok((Arc::clone(basis), d.rows_of(source, e.position, 1).map_err(error)?))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        lanes.push(Lane { tokens: &batch.base[e.base], blocks: start..blocks, explained: &native, entry: entry.map(|t| d.copy(t).map_err(error)).transpose()?, patches, captures: vec![] });
+        let entry = entry.map(|t| d.copy(t).map_err(error)).transpose()?;
+        lanes.push(Lane { tokens: &batch.base[e.base], blocks: start..blocks, explained: &native, entry, patches, position: e.position, captures: vec![] });
     }
     let run = forward([p, m], &mut lanes, length, false)?;
     let mut targets: BTreeMap<usize, Target> = BTreeMap::new();
     for (&i, output) in patched.iter().zip(&run.outputs) {
-        targets.insert(i, head.target(d, output, m.program.arithmetic())?);
+        let t0 = experiments[i].position;
+        targets.insert(i, head.target(d, &d.rows_of(output, t0, length - t0).map_err(error)?, m.program.arithmetic())?);
     }
     drop(run);
     // The hybrids on the sources, up to the last patched block.
@@ -798,14 +821,14 @@ pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: 
         .map(|&i| {
             let (e, bases) = (&experiments[i], &design.bases[i]);
             let last = bases[bases.len() - 1].block;
-            Lane { tokens: &batch.source[e.source], blocks: 0..last + 1, explained: &e.explained, entry: None, patches: Vec::new(), captures: bases.iter().map(|b| Site::Read(b.block)).collect() }
+            Lane { tokens: &batch.source[e.source], blocks: 0..last + 1, explained: &e.explained, entry: None, patches: Vec::new(), position: 0, captures: bases.iter().map(|b| Site::Read(b.block)).collect() }
         })
         .collect();
     let source_run = forward([p, m], &mut sources, length, gradient)?;
     // The hybrids on the bases.
     let mut source_values: BTreeMap<usize, Vec<Tensor>> = BTreeMap::new();
     for (&i, captured) in patched.iter().zip(&source_run.captured) {
-        source_values.insert(i, captured.iter().map(|c| d.copy(c).map_err(error)).collect::<Result<_, _>>()?);
+        source_values.insert(i, captured.iter().map(|c| d.rows_of(c, experiments[i].position, 1).map_err(error)).collect::<Result<_, _>>()?);
     }
     let mut bases: Vec<Lane> = Vec::with_capacity(experiments.len());
     for (i, e) in experiments.iter().enumerate() {
@@ -814,38 +837,70 @@ pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: 
             return Err(error("a source read is missing"));
         }
         let patches = design.bases[i].iter().cloned().zip(values).collect();
-        bases.push(Lane { tokens: &batch.base[e.base], blocks: 0..blocks, explained: &e.explained, entry: None, patches, captures: vec![] });
+        bases.push(Lane { tokens: &batch.base[e.base], blocks: 0..blocks, explained: &e.explained, entry: None, patches, position: e.position, captures: vec![] });
     }
     let base_run = forward([p, m], &mut bases, length, gradient)?;
-    // Scores against the targets.
-    let rows = experiments.len() * length;
-    let hidden = stack(d, &base_run.outputs.iter().collect::<Vec<_>>(), length, width)?;
+    // Scores against the targets, each experiment from its position on.
+    let starts: Vec<usize> = experiments
+        .iter()
+        .scan(0, |row, e| {
+            let at = *row;
+            *row += length - e.position;
+            Some(at)
+        })
+        .collect();
+    let rows: usize = experiments.iter().map(|e| length - e.position).sum();
+    let mut hidden = d.zeros(rows, width).map_err(error)?;
     let mut mu = d.zeros(rows, width).map_err(error)?;
     let mut entropy = Vec::with_capacity(rows);
-    for (i, e) in experiments.iter().enumerate() {
-        let target = match targets.get(&i) {
-            Some(t) => t,
-            None => teacher.clean.get(e.base).ok_or_else(|| error("the teacher has no clean target"))?,
-        };
-        d.set_rows(&mut mu, i * length, &target.mu).map_err(error)?;
-        entropy.extend_from_slice(&target.entropy);
+    for ((i, e), output) in experiments.iter().enumerate().zip(&base_run.outputs) {
+        let scored = length - e.position;
+        d.set_rows(&mut hidden, starts[i], &d.rows_of(output, e.position, scored).map_err(error)?).map_err(error)?;
+        match targets.get(&i) {
+            Some(t) => {
+                d.set_rows(&mut mu, starts[i], &t.mu).map_err(error)?;
+                entropy.extend_from_slice(&t.entropy);
+            }
+            None => {
+                let t = teacher.clean.get(e.base).ok_or_else(|| error("the teacher has no clean target"))?;
+                d.set_rows(&mut mu, starts[i], &d.rows_of(&t.mu, e.position, scored).map_err(error)?).map_err(error)?;
+                entropy.extend_from_slice(&t.entropy[e.position..]);
+            }
+        }
     }
     let target = Target { mu: Arc::new(mu), entropy, head: Arc::clone(&head.head), scored: None };
     let (nats, seed) = head.resident.score(d, &hidden, &target, gradient, p.program.arithmetic())?;
-    let bits: Vec<Vec<f64>> = nats.chunks(length).map(|c| c.iter().map(|v| v / std::f64::consts::LN_2).collect()).collect();
+    let bits: Vec<Vec<f64>> = experiments.iter().zip(&starts).map(|(e, at)| nats[*at..at + length - e.position].iter().map(|v| v / std::f64::consts::LN_2).collect()).collect();
     if !gradient {
         return Ok(Evaluation { bits, gradient: BTreeMap::new() });
     }
     let seed = seed.ok_or_else(|| error("the head returned no cotangent"))?;
     let mut outputs = Vec::with_capacity(experiments.len());
-    for i in 0..experiments.len() {
+    for (e, at) in experiments.iter().zip(&starts) {
+        let scored = length - e.position;
+        let mut part = d.zeros(scored, width).map_err(error)?;
+        d.axpy(&mut part, 1.0 / std::f64::consts::LN_2, &d.rows_of(&seed, *at, scored).map_err(error)?).map_err(error)?;
         let mut g = d.zeros(length, width).map_err(error)?;
-        d.axpy(&mut g, 1.0 / std::f64::consts::LN_2, &d.rows_of(&seed, i * length, length).map_err(error)?).map_err(error)?;
+        d.set_rows(&mut g, e.position, &part).map_err(error)?;
         outputs.push(Some(g));
     }
     let mut total = BTreeMap::new();
     let mut source_cotangents = reverse([p, m], &bases, base_run, outputs, bases.iter().map(|_| Vec::new()).collect(), length, &mut total)?;
-    let captures: Vec<Vec<Option<Tensor>>> = patched.iter().map(|i| design.bases[*i].iter().map(|b| source_cotangents[*i].remove(&b.block)).collect()).collect();
+    let mut captures: Vec<Vec<Option<Tensor>>> = Vec::with_capacity(patched.len());
+    for &i in &patched {
+        let mut per_block = Vec::with_capacity(design.bases[i].len());
+        for b in &design.bases[i] {
+            per_block.push(match source_cotangents[i].remove(&b.block) {
+                Some(row) => {
+                    let mut g = d.zeros(length, width).map_err(error)?;
+                    d.set_rows(&mut g, experiments[i].position, &row).map_err(error)?;
+                    Some(g)
+                }
+                None => None,
+            });
+        }
+        captures.push(per_block);
+    }
     reverse([p, m], &sources, source_run, sources.iter().map(|_| None).collect(), captures, length, &mut total)?;
     Ok(Evaluation { bits, gradient: total })
 }
@@ -968,9 +1023,10 @@ impl Interchange {
         self.p.refresh_fused()
     }
 
-    /// Per base sequence `n < sequences`, one unpatched and one patched experiment ([`sample`]).
-    pub fn sample(&self, rng: &mut impl RngExt, sequences: usize) -> Vec<Experiment> {
-        sample(rng, sequences, self.m_sites.entries.len() / 2, self.variables.len())
+    /// Per base sequence `n < sequences` of `length` tokens, one unpatched and one patched
+    /// experiment ([`sample`]).
+    pub fn sample(&self, rng: &mut impl RngExt, sequences: usize, length: usize) -> Vec<Experiment> {
+        sample(rng, sequences, self.m_sites.entries.len() / 2, self.variables.len(), length)
     }
 
     /// `KL(M_e ‖ P_e)` per token for each of `experiments` on `batch` at `P`'s loaded parameters,

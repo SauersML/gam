@@ -108,11 +108,16 @@ fn projector(rows: &Array2<f64>) -> Array2<f64> {
     q.dot(&q.t())
 }
 
-/// A patch as the reference applies it: block, projector, complement, the source's read.
-type HostPatch<'a> = (usize, &'a Array2<f64>, bool, &'a Array2<f64>);
+/// A patch as the reference applies it: block, projector, complement, the source's read, and the
+/// one row it replaces.
+type HostPatch<'a> = (usize, &'a Array2<f64>, bool, &'a Array2<f64>, usize);
 
-fn patched(h: &Array2<f64>, (_, pi, complement, s): HostPatch<'_>) -> Array2<f64> {
-    if complement { s + &(h - s).dot(pi) } else { h + &(s - h).dot(pi) }
+fn patched(h: &Array2<f64>, (_, pi, complement, s, at): HostPatch<'_>) -> Array2<f64> {
+    let (hr, sr) = (h.row(at).to_owned(), s.row(at).to_owned());
+    let row = if complement { &sr + &(&hr - &sr).dot(pi) } else { &hr + &(&sr - &hr).dot(pi) };
+    let mut out = h.clone();
+    out.row_mut(at).assign(&row);
+    out
 }
 
 /// The hybrid running `P`'s version of the blocks `explained` marks and `M`'s of the others, on
@@ -166,7 +171,7 @@ fn kl_bits(head: &Head, a: &Array2<f64>, b: &Array2<f64>) -> Vec<f64> {
 fn reference(f: &Fixture, e: &Experiment) -> Vec<f64> {
     let (base, source) = (&f.batch.base[e.base], &f.batch.source[e.source]);
     let Some(patch) = &e.patch else {
-        return kl_bits(&f.head, &native(f, base, &[]).0, &hybrid(f, base, &e.explained, &[]).0);
+        return kl_bits(&f.head, &native(f, base, &[]).0, &hybrid(f, base, &e.explained, &[]).0)[e.position..].to_vec();
     };
     let rows_of = |v: &ReadVariable| -> Vec<Array2<f64>> { v.parts.iter().map(|(op, rows)| f.p.flat.operators[*op].matrix().slice(s![rows.clone(), ..]).to_owned()).collect() };
     // Per patched block: its rows, and whether the patch takes their complement.
@@ -184,9 +189,9 @@ fn reference(f: &Fixture, e: &Experiment) -> Vec<f64> {
         })
         .collect();
     let (m_reads, p_reads) = (native(f, source, &[]).1, hybrid(f, source, &e.explained, &[]).1);
-    let m_patches: Vec<HostPatch<'_>> = sites.iter().zip(&projectors).map(|((b, _, c), pi)| (*b, pi, *c, &m_reads[*b])).collect();
-    let p_patches: Vec<HostPatch<'_>> = sites.iter().zip(&projectors).map(|((b, _, c), pi)| (*b, pi, *c, &p_reads[*b])).collect();
-    kl_bits(&f.head, &native(f, base, &m_patches).0, &hybrid(f, base, &e.explained, &p_patches).0)
+    let m_patches: Vec<HostPatch<'_>> = sites.iter().zip(&projectors).map(|((b, _, c), pi)| (*b, pi, *c, &m_reads[*b], e.position)).collect();
+    let p_patches: Vec<HostPatch<'_>> = sites.iter().zip(&projectors).map(|((b, _, c), pi)| (*b, pi, *c, &p_reads[*b], e.position)).collect();
+    kl_bits(&f.head, &native(f, base, &m_patches).0, &hybrid(f, base, &e.explained, &p_patches).0)[e.position..].to_vec()
 }
 
 /// Experiments covering every kind of patch on both sides of the hybrids' switches, under prefix
@@ -194,26 +199,26 @@ fn reference(f: &Fixture, e: &Experiment) -> Vec<f64> {
 fn experiments(f: &Fixture) -> Vec<Experiment> {
     let read = |block: usize, nth: usize| f.variables.iter().enumerate().filter(|(_, v)| v.block == block).nth(nth).map(|(i, _)| i).expect("variable");
     let (t, n) = (true, false);
-    let e = |base: usize, source: usize, explained: [bool; 2 * LAYERS], patch: Option<Patch>| Experiment { base, source, explained: explained.to_vec(), patch };
+    let e = |base: usize, source: usize, explained: [bool; 2 * LAYERS], patch: Option<Patch>, position: usize| Experiment { base, source, explained: explained.to_vec(), patch, position };
     vec![
-        e(0, 0, [t, t, n, n], None),
-        e(1, 1, [t, t, t, t], None),
-        e(4, 4, [n, t, t, n], None),
-        e(5, 5, [n, n, n, t], None),
-        e(2, 3, [t, t, n, n], Some(Patch::Read { variable: read(0, 0) })),
-        e(3, 2, [t, t, t, t], Some(Patch::Read { variable: read(2, 2) })),
-        e(4, 5, [t, t, n, n], Some(Patch::Read { variable: read(3, 5) })),
-        e(5, 4, [t, n, t, t], Some(Patch::Read { variable: read(1, 3) })),
-        e(1, 2, [n, t, n, t], Some(Patch::Read { variable: read(2, 1) })),
-        e(3, 0, [t, t, n, n], Some(Patch::Read { variable: f.variables.len() - 1 })),
-        e(0, 2, [t, t, n, n], Some(Patch::Complement { blocks: vec![0] })),
-        e(1, 3, [t, t, t, t], Some(Patch::Complement { blocks: vec![2] })),
-        e(2, 0, [t, t, n, n], Some(Patch::Complement { blocks: vec![3] })),
-        e(5, 1, [n, t, t, n], Some(Patch::Complement { blocks: vec![0] })),
+        e(0, 0, [t, t, n, n], None, 0),
+        e(1, 1, [t, t, t, t], None, 0),
+        e(4, 4, [n, t, t, n], None, 2),
+        e(5, 5, [n, n, n, t], None, 0),
+        e(2, 3, [t, t, n, n], Some(Patch::Read { variable: read(0, 0) }), 0),
+        e(3, 2, [t, t, t, t], Some(Patch::Read { variable: read(2, 2) }), 3),
+        e(4, 5, [t, t, n, n], Some(Patch::Read { variable: read(3, 5) }), 5),
+        e(5, 4, [t, n, t, t], Some(Patch::Read { variable: read(1, 3) }), 1),
+        e(1, 2, [n, t, n, t], Some(Patch::Read { variable: read(2, 1) }), 2),
+        e(3, 0, [t, t, n, n], Some(Patch::Read { variable: f.variables.len() - 1 }), 4),
+        e(0, 2, [t, t, n, n], Some(Patch::Complement { blocks: vec![0] }), 0),
+        e(1, 3, [t, t, t, t], Some(Patch::Complement { blocks: vec![2] }), 2),
+        e(2, 0, [t, t, n, n], Some(Patch::Complement { blocks: vec![3] }), 5),
+        e(5, 1, [n, t, t, n], Some(Patch::Complement { blocks: vec![0] }), 3),
         // Joint complements at several blocks, on both sides of the switches.
-        e(4, 0, [t, n, t, n], Some(Patch::Complement { blocks: vec![0, 3] })),
-        e(3, 5, [n, t, t, t], Some(Patch::Complement { blocks: vec![0, 2, 3] })),
-        e(0, 4, [t, t, t, t], Some(Patch::Complement { blocks: vec![2, 3] })),
+        e(4, 0, [t, n, t, n], Some(Patch::Complement { blocks: vec![0, 3] }), 1),
+        e(3, 5, [n, t, t, t], Some(Patch::Complement { blocks: vec![0, 2, 3] }), 0),
+        e(0, 4, [t, t, t, t], Some(Patch::Complement { blocks: vec![2, 3] }), 4),
     ]
 }
 
@@ -250,7 +255,7 @@ fn every_experiment_matches_the_host_reference() {
         let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &teacher, &experiments, &design, false).expect("evaluate");
         for (e, bits) in experiments.iter().zip(&evaluation.bits) {
             let expected = reference(&f, e);
-            assert_eq!(bits.len(), LENGTH);
+            assert_eq!(bits.len(), LENGTH - e.position);
             for (a, b) in bits.iter().zip(&expected) {
                 assert!((a - b).abs() <= 1e-9, "{e:?}: device {a} bits, host {b} bits");
             }
@@ -272,7 +277,7 @@ fn the_model_explains_itself_exactly() {
     let head = FixedHead::new(&device, &f.m.flat, &f.m.flat, 4).expect("head");
     let mm = Model::new(&m, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &[]).expect("M model");
     let pm = Model::new(&p, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &f.trainable).expect("P model");
-    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(5), f.batch.base.len(), LAYERS, f.variables.len());
+    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(5), f.batch.base.len(), LAYERS, f.variables.len(), LENGTH);
     let design = design(&pm, &f.variables, &experiments).expect("design");
     let teacher = Teacher::new(&mm, &head, &f.batch, &f.variables, &experiments).expect("teacher");
     let evaluation = evaluate(&mm, &pm, &head, &f.batch, &teacher, &experiments, &design, true).expect("evaluate");
@@ -326,11 +331,14 @@ fn the_gradient_matches_central_differences() {
 
 #[test]
 fn sampling_draws_one_clean_and_one_patched_experiment_per_base() {
-    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(11), 600, 3, 7);
+    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(11), 600, 3, 7, 9);
     assert_eq!(experiments.len(), 1200);
     for (n, pair) in experiments.chunks(2).enumerate() {
         assert_eq!((pair[0].base, pair[1].base, pair[1].source), (n, n, n));
         assert!(pair[0].patch.is_none() && pair[1].patch.is_some());
+        // The patched experiment shares its base's hybrid; the clean one is scored everywhere.
+        assert_eq!(pair[0].explained, pair[1].explained);
+        assert!(pair[0].position == 0 && pair[1].position < 9);
         assert!(pair.iter().all(|e| e.explained.len() == 6 && e.explained.contains(&true)));
         match &pair[1].patch {
             Some(Patch::Read { variable }) => assert!(*variable < 7),
@@ -343,6 +351,8 @@ fn sampling_draws_one_clean_and_one_patched_experiment_per_base() {
     let sizes: std::collections::BTreeSet<usize> = experiments.iter().map(|e| e.explained.iter().filter(|x| **x).count()).collect();
     assert_eq!(sizes, (1..=6).collect());
     assert!(experiments.iter().any(|e| e.explained.windows(2).any(|w| !w[0] && w[1])));
+    let positions: std::collections::BTreeSet<usize> = experiments.iter().filter(|e| e.patch.is_some()).map(|e| e.position).collect();
+    assert_eq!(positions, (0..9).collect());
 }
 
 #[test]
