@@ -432,3 +432,53 @@ fn a_captured_step_replays_what_running_it_does() {
         step(&mut y, &mut total, &mut scores).expect("a direct step after a broken capture");
     }
 }
+
+/// `x` rounded to bfloat16 (nearest, ties to even).
+fn bf16(x: f64) -> f64 {
+    let bits = (x as f32).to_bits();
+    f64::from(f32::from_bits(((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) << 16))
+}
+
+/// Products in bfloat16 (f32 operands rounded per call, or a bfloat16 copy read as it is) against
+/// the host's products of the same rounded operands: only the f32 accumulation differs, within
+/// `(k + 2)` f32 roundings of `|A||B|`. The swept head log partition on a bfloat16 head: its logits
+/// alike (`δ`), its expected rows also rounding each chunk's weights and head rows (`2⁻⁷ max |e|`).
+#[test]
+fn bfloat16_products_match_the_host_on_rounded_operands() {
+    let Some((d, wide)) = cuda() else { return };
+    let host = Device::host();
+    let (m, n, k) = (96, 70, 300);
+    let (a, b) = (matrix(m, k, 21, 1.0), matrix(k, n, 22, 1.0));
+    let mut hc = host.zeros(m, n).expect("zeros");
+    host.gemm(&mut hc, 1.0, &up(&host, &a), Op::N, &up(&host, &b), Op::N, 0.0, Arithmetic::Bf16).expect("host");
+    let reference = down(&host, &hc);
+    let magnitude = a.mapv(|v| bf16(v).abs()).dot(&b.mapv(|v| bf16(v).abs()));
+    let band = |i: usize, j: usize| (k + 2) as f64 * f64::from(f32::EPSILON) * magnitude[[i, j]];
+    let (da, db) = (up(&d, &a), up(&d, &b));
+    let mut c = d.zeros(m, n).expect("zeros");
+    d.gemm(&mut c, 1.0, &da, Op::N, &db, Op::N, 0.0, Arithmetic::Bf16).expect("rounded per call");
+    assert_within("bfloat16 product", &down(&d, &c), &reference, band);
+    let frozen = d.bf16_copy(&up(&d, &b.t().to_owned())).expect("bfloat16 copy");
+    assert_eq!((frozen.storage(), frozen.bytes()), (Storage::Bf16, k * n * 2));
+    assert_eq!(down(&d, &frozen), b.t().mapv(bf16), "a bfloat16 copy rounds to nearest");
+    assert_eq!(down(&d, &wide.bf16_copy(&up(&wide, &b)).expect("from float64")), b.mapv(bf16));
+    let mut c = d.zeros(m, n).expect("zeros");
+    d.gemm(&mut c, 1.0, &da, Op::N, &frozen, Op::T, 0.0, Arithmetic::Bf16).expect("frozen operand");
+    assert_within("bfloat16 product on a frozen copy", &down(&d, &c), &reference, band);
+    assert!(d.gemm(&mut c, 1.0, &da, Op::N, &frozen, Op::T, 0.0, Arithmetic::F32).is_err(), "a bfloat16 operand takes Bf16");
+    assert!(d.axpy(&mut c, 1.0, &frozen).is_err(), "only products take bfloat16 copies");
+    assert!(d.with_storage(Storage::Bf16).is_err(), "no device makes bfloat16 tensors");
+    let (rows, classes, width) = (37, 20_011, 64);
+    let hidden = matrix(rows, width, 23, 1.0);
+    let embedding = matrix(classes, width, 24, 1.0);
+    let mut hm = host.zeros(rows, width).expect("zeros");
+    let hz = host.head_log_partition(&up(&host, &hidden), &up(&host, &embedding), false, None, Some(&mut hm), Arithmetic::Bf16).expect("host");
+    let head = d.bf16_copy(&up(&d, &embedding)).expect("frozen head");
+    let mut dm = d.zeros(rows, width).expect("zeros");
+    let dz = d.head_log_partition(&up(&d, &hidden), &head, false, None, Some(&mut dm), Arithmetic::Bf16).expect("bfloat16 sweep");
+    let delta = (width + 2) as f64 * f64::from(f32::EPSILON) * width as f64;
+    for r in 0..rows {
+        assert!((hz[r] - dz[r]).abs() <= delta + 8.0 * U, "bfloat16 log partition row {r}: {} against {}", dz[r], hz[r]);
+    }
+    assert_within("bfloat16 expected head rows", &down(&d, &dm), &down(&host, &hm), |_, _| 2.0 * delta + 2f64.powi(-7) + (classes + 16) as f64 * U);
+}

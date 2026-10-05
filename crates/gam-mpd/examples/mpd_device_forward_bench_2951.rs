@@ -64,6 +64,7 @@ fn main() -> Result<(), String> {
     let device = match storage {
         Storage::F64 => Device::accelerator(GpuPolicy::Required),
         Storage::F32 => Device::single_precision(GpuPolicy::Required),
+        Storage::Bf16 => return Err("bfloat16 is a frozen operand's storage, not a device's".into()),
     }
     .map_err(|e| e.to_string())?
     .ok_or("no accelerator")?;

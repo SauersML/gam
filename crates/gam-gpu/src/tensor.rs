@@ -57,6 +57,12 @@ pub enum Arithmetic {
     F32,
     /// Operands rounded to TF32 (10-bit mantissa), f32 accumulation (the tensor cores' fast path).
     Tf32,
+    /// Operands rounded to bfloat16 (7-bit mantissa), f32 accumulation: the tensor cores' fastest
+    /// path (twice TF32's rate on the L40). In f32 storage an f32 operand is rounded per call and a
+    /// bfloat16 copy ([`Device::bf16_copy`], a frozen operator's) is read as it is; the host rounds
+    /// its operands alike, while CUDA float64 storage and the Apple GPU run it as `F32`, more
+    /// precise than asked.
+    Bf16,
 }
 
 /// How a tensor holds its values.
@@ -66,6 +72,9 @@ pub enum Storage {
     F64,
     /// IEEE float32 (the Apple GPU always; CUDA on request, for fitting: [`Device::with_storage`]).
     F32,
+    /// bfloat16, CUDA only: a frozen operand's copy ([`Device::bf16_copy`]) that products in
+    /// [`Arithmetic::Bf16`] read without rounding it again; no other operation takes one.
+    Bf16,
 }
 
 impl Arithmetic {
@@ -76,6 +85,7 @@ impl Arithmetic {
             Self::F64 => f64::EPSILON / 2.0,
             Self::F32 => f64::from(f32::EPSILON) / 2.0,
             Self::Tf32 => 2f64.powi(-11),
+            Self::Bf16 => 2f64.powi(-8),
         }
     }
 }
@@ -290,6 +300,9 @@ enum Data {
     Cuda(cudarc::driver::CudaSlice<f64>),
     #[cfg(target_os = "linux")]
     Cuda32(cudarc::driver::CudaSlice<f32>),
+    /// bfloat16 bits.
+    #[cfg(target_os = "linux")]
+    CudaBf16(cudarc::driver::CudaSlice<u16>),
     #[cfg(target_os = "macos")]
     Metal(crate::metal::stream::Buffer),
 }
@@ -335,6 +348,7 @@ impl Tensor {
     #[must_use]
     pub fn bytes(&self) -> usize {
         match self.storage() {
+            Storage::Bf16 => self.len() * 2,
             Storage::F32 => self.len() * 4,
             Storage::F64 => self.len() * 8,
         }
@@ -346,6 +360,8 @@ impl Tensor {
         match &self.data {
             #[cfg(target_os = "linux")]
             Data::Cuda32(_) => Storage::F32,
+            #[cfg(target_os = "linux")]
+            Data::CudaBf16(_) => Storage::Bf16,
             #[cfg(target_os = "macos")]
             Data::Metal(_) => Storage::F32,
             _ => Storage::F64,
@@ -477,6 +493,12 @@ fn same(a: &Tensor, b: &Tensor, what: &str) -> Result<(), GpuError> {
     Ok(())
 }
 
+/// The bfloat16 nearest `x` (ties to even), as its 16 bits; a NaN stays a quiet NaN.
+fn bf16_bits(x: f32) -> u32 {
+    let bits = x.to_bits();
+    if x.is_nan() { (bits >> 16) | 0x40 } else { (bits + 0x7fff + ((bits >> 16) & 1)) >> 16 }
+}
+
 /// Rounds `x` to `arithmetic`'s operand precision.
 fn round_operand(x: f64, arithmetic: Arithmetic) -> f64 {
     match arithmetic {
@@ -488,6 +510,7 @@ fn round_operand(x: f64, arithmetic: Arithmetic) -> f64 {
             let rounded = (bits + 0x0000_0fff + ((bits >> 13) & 1)) & 0xffff_e000;
             f64::from(f32::from_bits(rounded))
         }
+        Arithmetic::Bf16 => f64::from(f32::from_bits(bf16_bits(x as f32) << 16)),
     }
 }
 
@@ -583,7 +606,9 @@ impl Device {
     pub fn with_storage(&self, storage: Storage) -> Result<Self, GpuError> {
         let native = match &*self.backend {
             #[cfg(target_os = "linux")]
-            Backend::Cuda(_) => storage,
+            Backend::Cuda(_) if storage != Storage::Bf16 => storage,
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(_) => Storage::F32,
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => Storage::F32,
             Backend::Host => Storage::F64,
@@ -604,6 +629,19 @@ impl Device {
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda(_) | Data::Cuda32(_)) => engine.convert(t),
             _ => Err(foreign()),
+        }
+    }
+
+    /// A bfloat16 copy of `t` (CUDA, either storage; rounded to nearest, ties to even), the form a
+    /// frozen operand takes once so products in [`Arithmetic::Bf16`] read it without rounding it
+    /// per call. Only products take it; [`Device::download`] widens it back.
+    pub fn bf16_copy(&self, t: &Tensor) -> Result<Tensor, GpuError> {
+        match (&*self.backend, &t.data) {
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::Cuda(_)) => engine.bf16_copy(&engine.convert(t)?),
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::Cuda32(_)) => engine.bf16_copy(t),
+            _ => Err(GpuError::NoDeviceKernel { reason: format!("{} holds no bfloat16 tensors", self.name()) }),
         }
     }
 
@@ -721,6 +759,11 @@ impl Device {
             #[cfg(target_os = "linux")]
             Data::Cuda32(slice) => match &*self.backend {
                 Backend::Cuda(engine) => engine.download(slice)?.into_iter().map(f64::from).collect(),
+                _ => return Err(foreign()),
+            },
+            #[cfg(target_os = "linux")]
+            Data::CudaBf16(slice) => match &*self.backend {
+                Backend::Cuda(engine) => engine.download(slice)?.into_iter().map(|h| f64::from(f32::from_bits(u32::from(h) << 16))).collect(),
                 _ => return Err(foreign()),
             },
             #[cfg(target_os = "macos")]
@@ -2113,9 +2156,10 @@ mod cuda {
     use cudarc::cublas::sys::{cublasComputeType_t, cublasGemmAlgo_t, cublasMath_t, cublasOperation_t, cudaDataType_t};
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
     use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
-    use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, LaunchArgs, LaunchConfig, PushKernelArg, ValidAsZeroBits};
+    use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, LaunchArgs, LaunchConfig, PushKernelArg, SyncOnDrop, ValidAsZeroBits};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const BLOCK: u32 = 256;
 
@@ -3152,7 +3196,17 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         /// The row flags of a call that scores every row (never read).
         every_row: CudaSlice<u32>,
         gemm_workspace: std::sync::Mutex<F32Workspace>,
+        /// Whether the stream is being captured into a graph, and the context's event tracking
+        /// before the capture switched it off.
+        capturing: AtomicBool,
+        tracking: AtomicBool,
+        /// cuBLAS's workspace inside captures (a recorded product may not allocate), kept for the
+        /// engine's life since every graph's products read it.
+        capture_workspace: std::sync::Mutex<Option<CudaSlice<u8>>>,
     }
+
+    /// The cuBLAS workspace captured products use.
+    const CAPTURE_WORKSPACE: usize = 32 << 20;
 
     #[derive(Default)]
     struct F32Workspace {
@@ -3249,17 +3303,57 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         }
     }
 
-    /// One column-major `cublasGemmEx` on f32 buffers: `C ← α op(A) op(B) + β C`, `C` m × n, the
-    /// operands' leading dimensions and element offsets given, accumulating in f32 or on the TF32
-    /// tensor cores (`compute`).
+    /// A product operand's buffer: f32, or bfloat16 bits.
+    #[derive(Clone, Copy)]
+    enum Factor<'a> {
+        Single(&'a CudaSlice<f32>),
+        Half(&'a CudaSlice<u16>),
+    }
+
+    /// One column-major `cublasGemmEx` into an f32 buffer: `C ← α op(A) op(B) + β C`, `C` m × n,
+    /// the operands' element offsets and leading dimensions given, accumulating in f32, on the TF32
+    /// tensor cores, or on bfloat16 operands (`compute` and the operands' types).
     struct Gemm32<'a> {
         ops: (cublasOperation_t, cublasOperation_t),
         dims: (usize, usize, usize),
         scale: (f32, f32),
-        a: (&'a CudaSlice<f32>, usize, usize),
-        b: (&'a CudaSlice<f32>, usize, usize),
+        a: (Factor<'a>, usize, usize),
+        b: (Factor<'a>, usize, usize),
         c: (&'a mut CudaSlice<f32>, usize, usize),
         compute: cublasComputeType_t,
+    }
+
+    /// An operand as the product reads it: its rounded temporary, its bfloat16 copy, or its f32.
+    fn pick<'a>(t: &'a Tensor, rounded: &'a Option<CudaSlice<u16>>) -> Result<Factor<'a>, GpuError> {
+        Ok(match (rounded, &t.data) {
+            (Some(r), _) => Factor::Half(r),
+            (None, Data::CudaBf16(h)) => Factor::Half(h),
+            (None, _) => Factor::Single(slice32(t)?),
+        })
+    }
+
+    /// An operand's pointer at its element offset, its type, and the record marking its read.
+    fn pointer<'a>(f: Factor<'a>, offset: usize, stream: &'a CudaStream) -> (u64, cudaDataType_t, SyncOnDrop<'a>) {
+        match f {
+            Factor::Single(s) => {
+                let (p, record) = s.device_ptr(stream);
+                (p + 4 * offset as u64, cudaDataType_t::CUDA_R_32F, record)
+            }
+            Factor::Half(s) => {
+                let (p, record) = s.device_ptr(stream);
+                (p + 2 * offset as u64, cudaDataType_t::CUDA_R_16BF, record)
+            }
+        }
+    }
+
+    /// The accumulation of an f32-storage product, and whether its operands are bfloat16.
+    fn compute_of(arithmetic: Arithmetic, name: &str) -> Result<(cublasComputeType_t, bool), GpuError> {
+        match arithmetic {
+            Arithmetic::F64 => Err(GpuError::NoDeviceKernel { reason: format!("{name} in f32 storage has no float64 product") }),
+            Arithmetic::F32 => Ok((cublasComputeType_t::CUBLAS_COMPUTE_32F, false)),
+            Arithmetic::Tf32 => Ok((cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32, false)),
+            Arithmetic::Bf16 => Ok((cublasComputeType_t::CUBLAS_COMPUTE_32F, true)),
+        }
     }
 
     impl Engine {
@@ -3282,6 +3376,9 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                 checked_interval_module: crate::device_cache::PtxModuleCache::new(),
                 every_row,
                 gemm_workspace: std::sync::Mutex::new(F32Workspace::default()),
+                capturing: AtomicBool::new(false),
+                tracking: AtomicBool::new(true),
+                capture_workspace: std::sync::Mutex::new(None),
             })
         }
 
@@ -3293,19 +3390,70 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             self.stream.synchronize().gpu_ctx("tensor synchronize")
         }
 
+        /// Starts a capture. A recorded operation may wait on no event recorded outside it, and
+        /// an event it records could not be waited on after: so the context's event tracking
+        /// (cudarc's cross-stream bookkeeping, needless on this one stream) is off meanwhile and
+        /// buffer reads record nothing ([`Engine::quiet`]); cuBLAS gets a workspace of its own.
         pub(super) fn begin_capture(&self) -> Result<(), GpuError> {
+            if self.capturing.load(Ordering::Acquire) {
+                return Err(shape("a capture is already open".to_string()));
+            }
+            let mut workspace = self.capture_workspace.lock().map_err(|_| shape("poisoned capture workspace".to_string()))?;
+            if workspace.is_none() {
+                *workspace = Some(self.stream.alloc_zeros::<u8>(CAPTURE_WORKSPACE).gpu_ctx("tensor capture workspace")?);
+            }
+            let buffer = workspace.as_ref().ok_or_else(|| shape("missing capture workspace".to_string()))?;
+            let (pointer, record) = buffer.device_ptr(&self.stream);
+            drop(record);
+            // SAFETY: the buffer lives as long as the engine and its 256-byte-aligned allocation.
+            unsafe { cudarc::cublas::sys::cublasSetWorkspace_v2(*self.blas.handle(), pointer as *mut _, CAPTURE_WORKSPACE) }
+                .result()
+                .gpu_ctx("tensor capture cuBLAS workspace")?;
+            self.tracking.store(self.ctx.is_event_tracking(), Ordering::Release);
+            // SAFETY: while capturing, this stream is the context's only user (the public
+            // contract), so no cross-stream synchronization is lost.
+            unsafe { self.ctx.disable_event_tracking() };
+            self.capturing.store(true, Ordering::Release);
             // Relaxed: allocations (a temporary's) may be recorded; the stream is this thread's.
-            self.stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED).gpu_ctx("tensor graph capture")
+            let started = self.stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED).gpu_ctx("tensor graph capture");
+            if started.is_err() {
+                self.restore_after_capture()?;
+            }
+            started
         }
 
         pub(super) fn end_capture(&self) -> Result<CudaGraph, GpuError> {
+            if !self.capturing.load(Ordering::Acquire) {
+                return Err(shape("no capture is open".to_string()));
+            }
             // No automatic freeing on relaunch: a temporary outliving the capture is an error at
             // the next launch, never a buffer freed under a live tensor. (Node priority is the
             // flag that changes nothing else.)
-            self.stream
-                .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY)
-                .gpu_ctx("tensor graph instantiate")?
-                .ok_or_else(|| shape("an empty capture records no graph".to_string()))
+            let graph = self.stream.end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY);
+            self.restore_after_capture()?;
+            graph.gpu_ctx("tensor graph instantiate")?.ok_or_else(|| shape("an empty capture records no graph".to_string()))
+        }
+
+        /// Event tracking back as it was, and cuBLAS back on its own workspace pool (resetting
+        /// its stream does that).
+        fn restore_after_capture(&self) -> Result<(), GpuError> {
+            self.capturing.store(false, Ordering::Release);
+            if self.tracking.load(Ordering::Acquire) {
+                // SAFETY: tracking returns for the buffers made from here on, as before the capture.
+                unsafe { self.ctx.enable_event_tracking() };
+            }
+            // SAFETY: the handle is this engine's, bound to this stream since its creation.
+            unsafe { cudarc::cublas::result::set_stream(*self.blas.handle(), self.stream.cu_stream() as _) }.gpu_ctx("tensor cuBLAS workspace reset")
+        }
+
+        /// A buffer use's record, emptied while capturing: an event recorded inside a capture
+        /// could not be waited on outside it, and the stream orders the graph's work anyway.
+        fn quiet(&self, record: &mut SyncOnDrop<'_>) {
+            if self.capturing.load(Ordering::Acquire)
+                && let SyncOnDrop::Record(target) = record
+            {
+                *target = None;
+            }
         }
 
         pub(super) fn upload<T: DeviceRepr + ValidAsZeroBits>(&self, values: &[T]) -> Result<CudaSlice<T>, GpuError> {
@@ -3346,19 +3494,26 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let data = match storage {
                 Storage::F64 => Data::Cuda(self.zeros(rows * cols)?),
                 Storage::F32 => Data::Cuda32(self.zeros32(rows * cols)?),
+                Storage::Bf16 => return Err(shape("operations make no bfloat16 tensors".to_string())),
             };
             Ok(Tensor { rows, cols, data })
         }
 
         pub(super) fn copy<T: DeviceRepr + ValidAsZeroBits>(&self, slice: &CudaSlice<T>) -> Result<CudaSlice<T>, GpuError> {
             let mut out = self.stream.alloc_zeros::<T>(slice.len().max(1)).gpu_ctx("tensor alloc")?;
+            if self.capturing.load(Ordering::Acquire) {
+                self.captured_copy(slice, 0, &mut out, 0, slice.len())?;
+                return Ok(out);
+            }
             self.stream.memcpy_dtod(slice, &mut out).gpu_ctx("tensor copy")?;
             Ok(out)
         }
 
         pub(super) fn copy_range<T: DeviceRepr + ValidAsZeroBits>(&self, slice: &CudaSlice<T>, lo: usize, hi: usize) -> Result<CudaSlice<T>, GpuError> {
             let mut out = self.stream.alloc_zeros::<T>((hi - lo).max(1)).gpu_ctx("tensor alloc")?;
-            if hi > lo {
+            if hi > lo && self.capturing.load(Ordering::Acquire) {
+                self.captured_copy(slice, lo, &mut out, 0, hi - lo)?;
+            } else if hi > lo {
                 self.stream.memcpy_dtod(&slice.slice(lo..hi), &mut out).gpu_ctx("tensor row copy")?;
             }
             Ok(out)
@@ -3366,7 +3521,25 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         pub(super) fn write_range<T>(&self, slice: &mut CudaSlice<T>, lo: usize, part: &CudaSlice<T>) -> Result<(), GpuError> {
             let n = part.len();
+            if self.capturing.load(Ordering::Acquire) {
+                return self.captured_copy(part, 0, slice, lo, n);
+            }
             self.stream.memcpy_dtod(part, &mut slice.slice_mut(lo..lo + n)).gpu_ctx("tensor row write")
+        }
+
+        /// `count` values of `source` from `from` into `target` from `to`, recording no event (a
+        /// copy inside a capture).
+        fn captured_copy<T>(&self, source: &CudaSlice<T>, from: usize, target: &mut CudaSlice<T>, to: usize, count: usize) -> Result<(), GpuError> {
+            let size = std::mem::size_of::<T>();
+            let (pointer, mut read) = source.device_ptr(&self.stream);
+            self.quiet(&mut read);
+            let (destination, mut write) = target.device_ptr_mut(&self.stream);
+            self.quiet(&mut write);
+            // SAFETY: both ranges lie inside their buffers (the callers' bounds).
+            unsafe {
+                cudarc::driver::result::memcpy_dtod_async(destination + (to * size) as u64, pointer + (from * size) as u64, count * size, self.stream.cu_stream())
+            }
+            .gpu_ctx("tensor captured copy")
         }
 
         /// `t` in the other storage, on the device: rounded to nearest to f32, exactly to float64.
@@ -3391,6 +3564,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                     }
                     Data::Cuda(out)
                 }
+                Data::CudaBf16(_) => return Err(shape("a bfloat16 copy converts no further".to_string())),
                 Data::Host(_) => return Err(foreign()),
             };
             Ok(Tensor { rows: t.rows, cols: t.cols, data })
@@ -3435,11 +3609,11 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             c: &mut Tensor,
             arithmetic: Arithmetic,
         ) -> Result<(), GpuError> {
-            if a.storage() != c.storage() || b.storage() != c.storage() {
-                return Err(mismatch(&c.data));
-            }
             if c.storage() == Storage::F32 {
                 return self.gemm32(batch, (m, n, k), (alpha, beta), (a, ta), (b, tb), c, arithmetic);
+            }
+            if a.storage() != c.storage() || b.storage() != c.storage() {
+                return Err(mismatch(&c.data));
             }
             if m == 0 || n == 0 {
                 return Ok(());
@@ -3464,6 +3638,34 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             };
             let per = |t: &Tensor| ((t.rows / batch) * t.cols) as i64;
             let (stride_a, stride_b, stride_c) = (per(b), per(a), per(c));
+            if arithmetic == Arithmetic::F64 && self.capturing.load(Ordering::Acquire) {
+                // cudarc's product would record its operands' events inside the capture: the same
+                // cuBLAS call on quieted pointers.
+                let (bs, as_) = (slice(b)?, slice(a)?);
+                let (pb, mut rb) = bs.device_ptr(&self.stream);
+                let (pa, mut ra) = as_.device_ptr(&self.stream);
+                let (pc, mut rc) = slice_mut(c)?.device_ptr_mut(&self.stream);
+                self.quiet(&mut rb);
+                self.quiet(&mut ra);
+                self.quiet(&mut rc);
+                let handle = *self.blas.handle();
+                // SAFETY: as below, on the same operands.
+                unsafe {
+                    if batch == 1 {
+                        cudarc::cublas::result::dgemm(handle, op_of(tb), op_of(ta), dims.0, dims.1, dims.2, &alpha, pb as *const _, leading.0, pa as *const _, leading.1, &beta, pc as *mut _, leading.2)
+                    } else {
+                        cudarc::cublas::result::dgemm_strided_batched(
+                            handle, op_of(tb), op_of(ta), dims.0, dims.1, dims.2, &alpha, pb as *const _, leading.0, stride_a,
+                            pa as *const _, leading.1, stride_b, &beta, pc as *mut _, leading.2, stride_c, i32_of(batch)?,
+                        )
+                    }
+                }
+                .gpu_ctx("tensor captured DGEMM")?;
+                return Ok(());
+            }
+            if arithmetic != Arithmetic::F64 && self.capturing.load(Ordering::Acquire) {
+                return Err(GpuError::NoDeviceKernel { reason: "a lowered float64-storage product is not capturable: capture in f32 storage".to_string() });
+            }
             if arithmetic == Arithmetic::F64 {
                 let cfg = gemm(op_of(tb), op_of(ta));
                 let (bs, as_) = (slice(b)?, slice(a)?);
@@ -3572,25 +3774,58 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             if m == 0 || n == 0 {
                 return Ok(());
             }
-            let compute = match arithmetic {
-                Arithmetic::F64 => return Err(GpuError::NoDeviceKernel { reason: format!("{} in f32 storage has no float64 product", self.name) }),
-                Arithmetic::F32 => cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                Arithmetic::Tf32 => cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+            let (compute, half) = compute_of(arithmetic, &self.name)?;
+            let valid = |t: &Tensor| match &t.data {
+                Data::Cuda32(_) => Ok(()),
+                Data::CudaBf16(_) if half => Ok(()),
+                Data::CudaBf16(_) => Err(shape(format!("a bfloat16 operand takes Arithmetic::Bf16, not {arithmetic:?}"))),
+                other => Err(mismatch(other)),
             };
+            valid(a)?;
+            valid(b)?;
+            // In bfloat16 an f32 operand is rounded into a temporary; a bfloat16 copy is read as is.
+            let (rounded_a, rounded_b) = if half { (self.half_of(a)?, self.half_of(b)?) } else { (None, None) };
             // As the float64 product: column-major Cᵀ = op(B)ᵀ op(A)ᵀ, each block `batch`-strided.
             let per = |t: &Tensor| (t.rows / batch) * t.cols;
             let (stride_b, stride_a, stride_c) = (per(b), per(a), per(c));
             let ldc = c.cols;
+            let (fb, fa) = (pick(b, &rounded_b)?, pick(a, &rounded_a)?);
             let product = Gemm32 {
                 ops: (op_of(tb), op_of(ta)),
                 dims: (n, m, k),
                 scale: (alpha as f32, beta as f32),
-                a: (slice32(b)?, 0, b.cols),
-                b: (slice32(a)?, 0, a.cols),
+                a: (fb, 0, b.cols),
+                b: (fa, 0, a.cols),
                 c: (slice32_mut(c)?, 0, ldc),
                 compute,
             };
             self.gemm_ex(product, batch, (stride_b, stride_a, stride_c))
+        }
+
+        /// An f32 tensor rounded to bfloat16 into a temporary (`None` for any other storage).
+        fn half_of(&self, t: &Tensor) -> Result<Option<CudaSlice<u16>>, GpuError> {
+            match &t.data {
+                Data::Cuda32(s) => self.round_half(s, 0, t.len()).map(Some),
+                _ => Ok(None),
+            }
+        }
+
+        /// `count` values of `source` from `offset`, rounded to bfloat16 (`to_bf16`).
+        fn round_half(&self, source: &CudaSlice<f32>, offset: usize, count: usize) -> Result<CudaSlice<u16>, GpuError> {
+            let mut out = self.stream.alloc_zeros::<u16>(count.max(1)).gpu_ctx("tensor bf16 alloc")?;
+            if count > 0 {
+                let n = count as u64;
+                let f = self.kernel("to_bf16", Storage::F32)?;
+                let view = source.slice(offset..offset + count);
+                // SAFETY: `to_bf16(n, x, y)` reads n floats of the view and writes n halves.
+                unsafe { self.stream.launch_builder(&f).arg(&n).arg(&view).arg(&mut out).launch(cfg_elements(n)) }.gpu_ctx("tensor to_bf16")?;
+            }
+            Ok(out)
+        }
+
+        /// `t` (f32) as a bfloat16 tensor.
+        pub(super) fn bf16_copy(&self, t: &Tensor) -> Result<Tensor, GpuError> {
+            Ok(Tensor { rows: t.rows, cols: t.cols, data: Data::CudaBf16(self.round_half(slice32(t)?, 0, t.len())?) })
         }
 
         /// One `cublasGemmEx` (strided-batched when `batch` exceeds one), serialized on the handle
@@ -3603,11 +3838,14 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let (stride_a, stride_b, stride_c, count) = (stride(stride_a)?, stride(stride_b)?, stride(stride_c)?, i32_of(batch)?);
             let (alpha, beta) = g.scale;
             let real = cudaDataType_t::CUDA_R_32F;
-            let (pa, record_a) = g.a.0.device_ptr(&self.stream);
-            let (pb, record_b) = g.b.0.device_ptr(&self.stream);
-            let (pc, record_c) = g.c.0.device_ptr_mut(&self.stream);
-            // Element offsets into the buffers (a vocabulary chunk's head rows, say).
-            let (pa, pb, pc) = (pa + 4 * g.a.1 as u64, pb + 4 * g.b.1 as u64, pc + 4 * g.c.1 as u64);
+            // Element offsets reach into a buffer (a vocabulary chunk's head rows, say).
+            let (pa, type_a, mut record_a) = pointer(g.a.0, g.a.1, &self.stream);
+            let (pb, type_b, mut record_b) = pointer(g.b.0, g.b.1, &self.stream);
+            let (pc, mut record_c) = g.c.0.device_ptr_mut(&self.stream);
+            self.quiet(&mut record_a);
+            self.quiet(&mut record_b);
+            self.quiet(&mut record_c);
+            let pc = pc + 4 * g.c.1 as u64;
             // SAFETY: the caller checked every operand's shape, offset and leading dimension
             // against (m, n, k) and the buffers' lengths; the pointers outlive the call (their
             // records drop after it).
@@ -3615,13 +3853,13 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                 if batch == 1 {
                     cudarc::cublas::result::gemm_ex(
                         *self.blas.handle(), g.ops.0, g.ops.1, m, n, k,
-                        (&alpha) as *const f32 as *const _, pa as *const _, real, lda, pb as *const _, real, ldb,
+                        (&alpha) as *const f32 as *const _, pa as *const _, type_a, lda, pb as *const _, type_b, ldb,
                         (&beta) as *const f32 as *const _, pc as *mut _, real, ldc, g.compute, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
                     )
                 } else {
                     cudarc::cublas::result::gemm_strided_batched_ex(
                         *self.blas.handle(), g.ops.0, g.ops.1, m, n, k,
-                        (&alpha) as *const f32 as *const _, pa as *const _, real, lda, stride_a, pb as *const _, real, ldb, stride_b,
+                        (&alpha) as *const f32 as *const _, pa as *const _, type_a, lda, stride_a, pb as *const _, type_b, ldb, stride_b,
                         (&beta) as *const f32 as *const _, pc as *mut _, real, ldc, stride_c, count, g.compute, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
                     )
                 }
@@ -3791,7 +4029,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let data = match &x.data {
                 Data::Cuda(s) => Data::Cuda(self.copy(s)?),
                 Data::Cuda32(s) => Data::Cuda32(self.copy(s)?),
-                Data::Host(_) => return Err(foreign()),
+                other => return Err(mismatch(other)),
             };
             let mut out = Tensor { rows: x.rows, cols: x.cols, data };
             let (rows, cols, planes) = (x.rows as u32, x.cols as u32, cos.cols as u32);
@@ -4265,10 +4503,19 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         ) -> Result<Vec<f64>, GpuError> {
             let (rows, width) = hidden.dim();
             let classes = if transposed { head.cols } else { head.rows };
-            let compute = match arithmetic {
-                Arithmetic::F64 => return Err(GpuError::NoDeviceKernel { reason: format!("{} in f32 storage has no float64 product", self.name) }),
-                Arithmetic::F32 => cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                Arithmetic::Tf32 => cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+            let (compute, half) = compute_of(arithmetic, &self.name)?;
+            // In bfloat16 the hidden rows (and an f32 head) are rounded once per call, each chunk's
+            // exponentials before they weight its head rows; a bfloat16 head is read as it is.
+            let (rounded_hidden, rounded_head) = if half { (self.half_of(hidden)?, self.half_of(head)?) } else { (None, None) };
+            let head_factor = match (&rounded_head, &head.data) {
+                (Some(r), _) => Factor::Half(r),
+                (None, Data::CudaBf16(h)) if half => Factor::Half(h),
+                (None, Data::CudaBf16(_)) => return Err(shape(format!("a bfloat16 head takes Arithmetic::Bf16, not {arithmetic:?}"))),
+                (None, _) => Factor::Single(slice32(head)?),
+            };
+            let hidden_factor = match &rounded_hidden {
+                Some(r) => Factor::Half(r),
+                None => Factor::Single(slice32(hidden)?),
             };
             let chunk = chunk.clamp(1, classes.max(1));
             let mut logits = self.zeros32(rows * chunk)?;
@@ -4291,8 +4538,8 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                         ops: (head_op, n_op),
                         dims: (count, rows, width),
                         scale: (1.0, 0.0),
-                        a: (slice32(head)?, head_offset, head_ld),
-                        b: (slice32(hidden)?, 0, width),
+                        a: (head_factor, head_offset, head_ld),
+                        b: (hidden_factor, 0, width),
                         c: (&mut logits, 0, count),
                         compute,
                     },
@@ -4315,13 +4562,18 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                     }
                     // Column-major outᵀ (width × rows) += E_chunkᵀ (width × count) · Pᵀ (count × rows).
                     let (head_op, head_ld) = if transposed { (t, classes) } else { (n_op, width) };
+                    let rounded = if half { Some(self.round_half(&logits, 0, rows * count)?) } else { None };
+                    let weights = match &rounded {
+                        Some(r) => Factor::Half(r),
+                        None => Factor::Single(&logits),
+                    };
                     self.gemm_ex(
                         Gemm32 {
                             ops: (head_op, n_op),
                             dims: (width, rows, count),
                             scale: (1.0, if index == 0 { 0.0 } else { 1.0 }),
-                            a: (slice32(head)?, if transposed { start } else { start * width }, head_ld),
-                            b: (&logits, 0, count),
+                            a: (head_factor, if transposed { start } else { start * width }, head_ld),
+                            b: (weights, 0, count),
                             c: (slice32_mut(out)?, 0, width),
                             compute,
                         },
