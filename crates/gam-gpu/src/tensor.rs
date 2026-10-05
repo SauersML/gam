@@ -2185,6 +2185,60 @@ impl Device {
         }
     }
 
+    /// The code length in nats of the groups' posteriors, added into row `slot` of `sums` (rows × 3,
+    /// as [`Device::group_moments`] lays its rows out): `(n, Σ_g w_g (d_g + c_g + ln 2 · δ_g), 0)`
+    /// over the groups `g` with weight `w_g ≠ 0` (`n` their count), `d_g` the divergence
+    /// ([`Device::group_divergence`]), `c_g` a constant, and `δ_g` the bits of the Elias δ code of
+    /// the signed integer exponent `round(log2(v_g / v⁰_g))` of the group's variance `v_g` against
+    /// `v⁰_g` (zigzag, plus one), infinite when that exponent is not finite. Every argument is
+    /// groups × 1. The rows of many steps are read at once.
+    pub fn group_code_length(
+        &self,
+        (divergence, variance): (&Tensor, &Tensor),
+        (weight, constant, initial): (&Tensor, &Tensor, &Tensor),
+        sums: &mut Tensor,
+        slot: usize,
+    ) -> Result<(), GpuError> {
+        let groups = divergence.rows;
+        for (t, what) in [(divergence, "divergence"), (variance, "variance"), (weight, "weight"), (constant, "constant"), (initial, "initial")] {
+            if t.dim() != (groups, 1) {
+                return Err(shape(format!("a {:?} {what} for {groups} groups", t.dim())));
+            }
+        }
+        if sums.cols != 3 || slot >= sums.rows {
+            return Err(shape(format!("row {slot} of {:?} sums", sums.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (d, v, w, c, v0) = (host(divergence)?, host(variance)?, host(weight)?, host(constant)?, host(initial)?);
+                let totals = host_mut(sums)?;
+                for g in 0..groups {
+                    if w[g] == 0.0 {
+                        continue;
+                    }
+                    let exponent = (v[g] / v0[g]).log2().round();
+                    let bits = if exponent.is_finite() {
+                        // |exponent| <= 2098 for finite positive variances: inside i64.
+                        let x = exponent as i64;
+                        let value = ((x << 1) ^ (x >> 63)) as u64 + 1;
+                        let low = u64::from(u64::BITS - 1 - value.leading_zeros());
+                        let prefix = u64::from(u64::BITS - 1 - (low + 1).leading_zeros());
+                        (low + 2 * prefix + 1) as f64
+                    } else {
+                        f64::INFINITY
+                    };
+                    totals[3 * slot] += 1.0;
+                    totals[3 * slot + 1] += w[g] * (d[g] + c[g] + std::f64::consts::LN_2 * bits);
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.group_code_length((divergence, variance), (weight, constant, initial), sums, slot),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.group_code_length((divergence, variance), (weight, constant, initial), sums, slot),
+        }
+    }
+
     /// From each group's `sums` row `(n, Σ (μ² + σ²), Σ 2s)`, its empirical-Bayes prior variance
     /// `v = Σ (μ² + σ²) / n` into `variance` and its divergence `KL(q_G ‖ p_G) = ½ (n ln v − Σ 2s)`
     /// in nats into `divergence` (both groups × 1; zero for an empty group), then `sums` zeroed
@@ -3800,6 +3854,28 @@ extern "C" __global__ void group_curvature_f32(u64 n, u64 count, const float* fa
 
 extern "C" __global__ void group_curvature_f32_bf16(u64 n, u64 count, const unsigned short* factor, const float* mean, const float* log_sd, const unsigned int* groups, double* sums) {
     group_curvature_body<float, unsigned short>(n, count, factor, mean, log_sd, groups, sums);
+}
+
+// `Device::group_code_length`: one entry per group, every one into row `slot`.
+extern "C" __global__ void group_code_length(u64 n, u64 slot, const double* divergence, const double* variance, const double* weight, const double* constant,
+    const double* initial, double* sums) {
+    WARP_STRIDE(g, n) {
+        bool live = g < n && weight[g] != 0.0;
+        double b = 0.0;
+        if (live) {
+            double exponent = round(log2(variance[g] / initial[g]));
+            double bits = __longlong_as_double(0x7ff0000000000000LL);
+            if (isfinite(exponent)) {
+                long long x = (long long)exponent;
+                unsigned long long value = (((unsigned long long)x) << 1 ^ (unsigned long long)(x >> 63)) + 1ULL;
+                unsigned long long low = 63ULL - (unsigned long long)__clzll((long long)value);
+                unsigned long long prefix = 63ULL - (unsigned long long)__clzll((long long)(low + 1ULL));
+                bits = (double)(low + 2ULL * prefix + 1ULL);
+            }
+            b = weight[g] * (divergence[g] + constant[g] + 0.6931471805599453 * bits);
+        }
+        group_add(sums, (unsigned int)slot, live, live ? 1.0 : 0.0, b, 0.0);
+    }
 }
 
 extern "C" __global__ void group_divergence(u64 n, double* sums, double* variance, double* divergence) {
@@ -5524,6 +5600,22 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor group_curvature").map(|_| ())
         }
 
+        pub(super) fn group_code_length(
+            &self,
+            (divergence, variance): (&Tensor, &Tensor),
+            (weight, constant, initial): (&Tensor, &Tensor, &Tensor),
+            sums: &mut Tensor,
+            slot: usize,
+        ) -> Result<(), GpuError> {
+            let (n, slot) = (divergence.len() as u64, slot as u64);
+            let f = self.function("group_code_length")?;
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&n).arg(&slot).arg(slice(divergence)?).arg(slice(variance)?).arg(slice(weight)?).arg(slice(constant)?).arg(slice(initial)?).arg(slice_mut(sums)?);
+            // SAFETY: groups × 1 float64 inputs and a rows × 3 float64 sum, the slot inside it,
+            // checked by the caller.
+            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor group_code_length").map(|_| ())
+        }
+
         pub(super) fn group_divergence(&self, sums: &mut Tensor, variance: &mut Tensor, divergence: &mut Tensor) -> Result<(), GpuError> {
             let n = variance.len() as u64;
             let f = self.function("group_divergence")?;
@@ -6431,6 +6523,27 @@ kernel void t_group_curvature(device const float* factor [[buffer(0)]], device c
     group_add(sums, g, live, a, b, c);
 }
 
+// `Device::group_code_length`, one thread per group, every one into row `p.count`.
+kernel void t_group_code_length(device const float* divergence [[buffer(0)]], device const float* variance [[buffer(1)]], device const float* weight [[buffer(2)]],
+                                device const float* constant [[buffer(3)]], device const float* initial [[buffer(4)]], device float* sums [[buffer(5)]],
+                                constant Posterior& p [[buffer(6)]], uint i [[thread_position_in_grid]]) {
+    bool live = i < p.n && weight[i] != 0.0f;
+    float b = 0.0f;
+    if (live) {
+        float exponent = round(log2(variance[i] / initial[i]));
+        float bits = INFINITY;
+        if (isfinite(exponent)) {
+            int x = int(exponent);
+            uint value = ((uint(x) << 1) ^ uint(x >> 31)) + 1u;
+            uint low = 31u - clz(value);
+            uint prefix = 31u - clz(low + 1u);
+            bits = float(low + 2u * prefix + 1u);
+        }
+        b = weight[i] * (divergence[i] + constant[i] + 0.6931471805599453f * bits);
+    }
+    group_add(sums, p.count, live, live ? 1.0f : 0.0f, b, 0.0f);
+}
+
 kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* variance [[buffer(1)]], device float* divergence [[buffer(2)]],
                                constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
     ELEMENTS {
@@ -6471,6 +6584,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
         "t_posterior_ivon",
         "t_group_moments",
         "t_group_curvature",
+        "t_group_code_length",
         "t_group_divergence",
         "t_select_sets",
         "t_box_charge",
@@ -7035,6 +7149,25 @@ kernel void t_attention_sums(device const float* out [[buffer(0)]], device const
             let p = Posterior { count: u32_of(sums.rows)?, ..Posterior::default() };
             let buffers = [whole(buffer(factor)?), whole(buffer(mean)?), whole(buffer(log_sd)?), whole(index_buffer(groups)?), whole(buffer(sums)?)];
             self.posterior("t_group_curvature", &buffers, mean.len(), p)
+        }
+
+        pub(super) fn group_code_length(
+            &self,
+            (divergence, variance): (&Tensor, &Tensor),
+            (weight, constant, initial): (&Tensor, &Tensor, &Tensor),
+            sums: &mut Tensor,
+            slot: usize,
+        ) -> Result<(), GpuError> {
+            let p = Posterior { count: u32_of(slot)?, ..Posterior::default() };
+            let buffers = [
+                whole(buffer(divergence)?),
+                whole(buffer(variance)?),
+                whole(buffer(weight)?),
+                whole(buffer(constant)?),
+                whole(buffer(initial)?),
+                whole(buffer(sums)?),
+            ];
+            self.posterior("t_group_code_length", &buffers, divergence.len(), p)
         }
 
         pub(super) fn group_divergence(&self, sums: &mut Tensor, variance: &mut Tensor, divergence: &mut Tensor) -> Result<(), GpuError> {

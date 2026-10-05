@@ -2138,6 +2138,10 @@ pub fn fit(
         let prior_operators = prior.as_deref().map(PriorTerm::operators).unwrap_or_default();
         // Which groups are active changes only at a removal.
         let subset_code = posterior.subset_nats();
+        // Each step's code length of the groups' posteriors, summed on the device and read once
+        // the epoch's steps are done.
+        let mut code = device_posterior.code_length(&posterior.active, &sizes, &posterior.initial, draws.len())?;
+        let (mut datas, mut priors) = (Vec::with_capacity(draws.len()), Vec::with_capacity(draws.len()));
         let mut estimates = Vec::with_capacity(draws.len());
         let (mut data_sum, mut description_sum) = (0.0, 0.0);
         let (mut clean, mut patched) = (Mean::default(), Mean::default());
@@ -2155,17 +2159,9 @@ pub fn fit(
             let scored = bits.iter().map(Vec::len).sum::<usize>();
             let (scale, weight) = batch_weights(draws.len(), tokens);
             let data = scale * LN_2 * bits.iter().flatten().sum::<f64>();
-            // `Σ_G KL_G` and the active groups' variances at the posterior the sample was drawn from.
-            let variances = device_posterior.variances()?;
-            let description: f64 = device_posterior
-                .divergences()?
-                .iter()
-                .zip(&sizes)
-                .zip(&posterior.active)
-                .zip(variances.iter().zip(&posterior.initial))
-                .map(|(((d, n), active), (v, initial))| if *active { d + 0.5 * n.ln() + scale_bits(*v, *initial) * LN_2 } else { 0.0 })
-                .sum::<f64>()
-                + subset_code;
+            // `Σ_G KL_G` and the active groups' variances' scales at the posterior the sample was drawn
+            // from.
+            device_posterior.code_length_into(&mut code, b)?;
             // The prior term at the same weight sample; its gradient joins the data term's, which
             // the step weighs by `scale` in nats.
             let prior_nats = match prior.as_deref_mut() {
@@ -2190,21 +2186,20 @@ pub fn fit(
                 }
                 None => 0.0,
             };
-            let description = description + explanation.fixed_nats + prior_nats;
+            datas.push(data);
+            priors.push(prior_nats);
+            progress.step += 1;
+            device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, weight), &ivon)?;
+            log::info!("library step {epoch}.{b}: {:.6} bits per scored token, {:.2} s", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
+        }
+        for ((code_length, data), prior_nats) in device_posterior.code_lengths(&code)?.into_iter().zip(datas).zip(priors) {
+            let description = code_length + subset_code + explanation.fixed_nats + prior_nats;
             if !description.is_finite() {
                 return Err("a nonfinite posterior divergence".into());
             }
             estimates.push(data + description);
             data_sum += data;
             description_sum += description;
-            progress.step += 1;
-            device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, weight), &ivon)?;
-            log::info!(
-                "library step {epoch}.{b}: {:.6} bits per scored token, F estimate {:.6e} bits, {:.2} s",
-                bits.iter().flatten().sum::<f64>() / scored as f64,
-                (data + description) / LN_2,
-                step_started.elapsed().as_secs_f64()
-            );
         }
         let count = draws.len() as f64;
         let (improvement, standard_error) = match &progress.previous {
@@ -3066,6 +3061,36 @@ mod tests {
                 assert!(gap < 1e-12, "the device step's {field} differs from the host step's by {gap}");
             }
         }
+    }
+
+    #[test]
+    fn the_device_code_length_is_the_host_description() {
+        let (native, layers, _, _) = tiny("library_code_length", "gelu");
+        let explanation = explanation(&native, &layers).unwrap();
+        let mut posterior = Posterior::new(&explanation, 72).unwrap();
+        // Spread deviations, so the variances' scales differ, and a removed group.
+        let mut rng = StdRng::seed_from_u64(3);
+        for log_sd in &mut posterior.log_sd {
+            log_sd.mapv_inplace(|s| s + 4.0 * (rng.random::<f64>() - 0.5));
+        }
+        posterior.remove(&[1]);
+        let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 72.0, None, 0).unwrap();
+        let sizes: Vec<f64> = explanation.groups.iter().map(|g| g.cells.iter().map(|c| (c.rows.len() * c.cols.len()) as f64).sum()).collect();
+        let mut code = device_posterior.code_length(&posterior.active, &sizes, &posterior.initial, 2).unwrap();
+        device_posterior.code_length_into(&mut code, 1).unwrap();
+        let variances = device_posterior.variances().unwrap();
+        let expected: f64 = device_posterior
+            .divergences()
+            .unwrap()
+            .iter()
+            .zip(&sizes)
+            .zip(&posterior.active)
+            .zip(variances.iter().zip(&posterior.initial))
+            .map(|(((d, n), active), (v, initial))| if *active { d + 0.5 * n.ln() + scale_bits(*v, *initial) * LN_2 } else { 0.0 })
+            .sum();
+        let lengths = device_posterior.code_lengths(&code).unwrap();
+        assert_eq!(lengths[0], 0.0, "an untouched step's row stays zero");
+        assert!(expected.is_finite() && (lengths[1] - expected).abs() <= 1e-12 * expected.abs(), "{} against {expected}", lengths[1]);
     }
 
     #[test]
