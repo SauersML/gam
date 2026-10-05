@@ -308,3 +308,6 @@ pub mod native_mlp_initialization;
 
 #[cfg(test)]
 mod parameter_response_program_tests;
+
+// Ordinary standalone artifact replay with immutable native codeword reuse.
+pub mod canonical_artifact;

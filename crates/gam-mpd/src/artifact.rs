@@ -1639,7 +1639,16 @@ impl Artifact {
     /// The message as bytes: its bit length (8 bytes, little-endian), then its bits, most
     /// significant first, the last byte padded with zeros.
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
-        let message = self.encode()?;
+        self.to_bytes_using(None)
+    }
+
+    /// Identical standalone bytes; immutable native codewords avoid recoding their values.
+    pub fn to_bytes_with_native_codec(&self, cache: &crate::operator_program::NativeOperatorCodec) -> Result<Vec<u8>, String> {
+        self.to_bytes_using(Some(cache))
+    }
+
+    fn to_bytes_using(&self, cache: Option<&crate::operator_program::NativeOperatorCodec>) -> Result<Vec<u8>, String> {
+        let message = self.encode_using(cache)?;
         let mut out = Vec::with_capacity(8 + message.packed_bytes().len());
         if !self.matrix_rules()?.is_empty() || !self.controls.is_empty() {
             let version = if self.controls.is_empty() { MATRIX_ARTIFACT_VERSION } else { CONTROL_ARTIFACT_VERSION };
@@ -1653,6 +1662,15 @@ impl Artifact {
 
     /// The artifact [`Artifact::to_bytes`] wrote, given the declarations alone.
     pub fn from_bytes(bytes: &[u8], declarations: &Declarations) -> Result<Self, String> {
+        Self::from_bytes_using(bytes, declarations, None)
+    }
+
+    /// Ordinary envelope validation; cached bodies require an exact codeword at the original index.
+    pub fn from_bytes_with_native_codec(bytes: &[u8], declarations: &Declarations, cache: &crate::operator_program::NativeOperatorCodec) -> Result<Self, String> {
+        Self::from_bytes_using(bytes, declarations, Some(cache))
+    }
+
+    fn from_bytes_using(bytes: &[u8], declarations: &Declarations, cache: Option<&crate::operator_program::NativeOperatorCodec>) -> Result<Self, String> {
         let header: [u8; 8] = bytes.get(..8).ok_or("no length header")?.try_into().map_err(|_| "no length header")?;
         let first = u64::from_le_bytes(header);
         let (length, offset, version) = if first == VERSIONED_ENVELOPE {
@@ -1670,7 +1688,7 @@ impl Artifact {
             decode_prefix_integer(&mut grammar).map_err(codec)?
         } else { 0 };
         if internal_version != version { return Err("artifact envelope and internal grammar version disagree".into()); }
-        Self::decode(&message, declarations)
+        Self::decode_using(&message, declarations, cache)
     }
 }
 
