@@ -15,12 +15,12 @@
 
 use gam_gpu::{
     GpuPolicy,
-    tensor::{Arithmetic, Device, Storage},
+    tensor::{Arithmetic, Device, Op, Storage},
 };
 use gam_mpd::{
     device_program::DeviceProgram,
     import::hugging_face_language_model,
-    operator_program::{FamilyInputs, SequenceLayout, SlotValues},
+    operator_program::{FamilyInputs, Node, SequenceLayout, SlotValues},
 };
 use ndarray::{Array2, ArrayView1};
 use serde_json::json;
@@ -115,11 +115,27 @@ fn main() -> Result<(), String> {
     } else {
         Device::host()
     };
+    // The trunk runs up to the hidden node `h` the head reads; the logits are `h Eᵀ`, `E` the head
+    // matrix as classes × hidden (the transposed token embedding when tied), formed on the device
+    // in the same arithmetic as the fit's teacher.
+    let logits_node = match &program.nodes[program.output] {
+        Node::Readout { input, .. } => *input,
+        _ => program.output,
+    };
+    let (hidden, embedding) = match &program.nodes[logits_node] {
+        Node::Transposed { input, operator } => (*input, program.operators[*operator].matrix().reversed_axes()),
+        Node::Affine { terms, bias: None } if terms.len() == 1 => (terms[0].0, program.operators[terms[0].1].matrix()),
+        _ => return Err("the output is not a linear head".into()),
+    };
+    let mut prefix = program.clone();
+    prefix.nodes.truncate(hidden + 1);
+    prefix.output = hidden;
     let free = |device: &Device| device.memory().map_err(error).map(|m| m.map(|(free, _)| free));
     let free_before = free(&device)?;
     let started = Instant::now();
-    let mut compiled = DeviceProgram::compile_values(&device, &program)?;
+    let mut compiled = DeviceProgram::compile_values(&device, &prefix)?;
     compiled.set_arithmetic(arithmetic);
+    let head = device.upload(embedding.view()).map_err(error)?;
     let compile_seconds = started.elapsed().as_secs_f64();
     let free_compiled = free(&device)?;
     let started = Instant::now();
@@ -127,12 +143,15 @@ fn main() -> Result<(), String> {
     device.synchronize().map_err(error)?;
     let forward_seconds = started.elapsed().as_secs_f64();
     let free_forward = free(&device)?;
-    let vocab = compiled.classes();
+    let vocab = embedding.nrows();
+    let states = trace.value(hidden)?;
     let mut ours = Array2::<f64>::zeros((rows, vocab));
     for start in (0..rows).step_by(context) {
         let n = context.min(rows - start);
-        let tile = compiled.logits(&trace, start, n)?;
-        ours.slice_mut(ndarray::s![start..start + n, ..]).assign(&tile);
+        let h = device.rows_of(states, start, n).map_err(error)?;
+        let mut tile = device.zeros(n, vocab).map_err(error)?;
+        device.gemm(&mut tile, 1.0, &h, Op::N, &head, Op::T, 0.0, arithmetic).map_err(error)?;
+        ours.slice_mut(ndarray::s![start..start + n, ..]).assign(&device.download(&tile).map_err(error)?);
     }
     if ours.iter().any(|v| !v.is_finite()) {
         return Err("nonfinite logits".into());
