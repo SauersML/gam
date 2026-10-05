@@ -451,7 +451,6 @@ fn shape(detail: String) -> GpuError {
     GpuError::DriverCallFailed { reason: format!("tensor shape mismatch: {detail}") }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn foreign() -> GpuError {
     GpuError::DriverCallFailed { reason: "a tensor used on a device that does not hold it".to_string() }
 }
