@@ -1976,6 +1976,38 @@ impl Device {
     /// (`s = −∞`, `μ = 0`) samples 0.
     /// The draws are regenerated from their counters, never stored ([`Device::posterior_ivon`]
     /// regenerates the same ones).
+    /// [`Device::reparameterize`] written into rows `at..at + mean.rows()` of `out`, which has
+    /// `mean`'s columns: an operator's sample placed straight into a stacked operand (a fused
+    /// group's or a decoder's), with no copy. The draws are those of the operator alone (`ε` of
+    /// entry `i` of the operator, as [`Device::reparameterize`] draws them), so a sample written
+    /// whole or into a stack is the same. `out` in f32 or bfloat16 beside f32 masters on CUDA, in
+    /// f32 on the Apple GPU, in float64 on the host.
+    pub fn reparameterize_rows(&self, out: &mut Tensor, at: usize, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {
+        same(mean, log_sd, "reparameterized rows")?;
+        if out.cols != mean.cols || at + mean.rows > out.rows {
+            return Err(shape(format!("rows {at}..{} of {:?} for a {:?} sample", at + mean.rows, out.dim(), mean.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (mv, sv) = (host(mean)?, host(log_sd)?);
+                let start = at * out.cols;
+                for (i, t) in host_mut(out)?[start..start + mv.len()].iter_mut().enumerate() {
+                    *t = mv[i] + sv[i].exp() * f64::from(posterior_normal(key, stream, i as u64));
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.reparameterize_rows(out, at * mean.cols, (mean, log_sd), (key, stream)),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => {
+                // The Apple GPU's kernels take whole buffers: the sample, then its rows placed.
+                let mut theta = self.zeros(mean.rows, mean.cols)?;
+                engine.reparameterize(&mut theta, (mean, log_sd), (key, stream))?;
+                self.set_rows(out, at, &theta)
+            }
+        }
+    }
+
     pub fn reparameterize(&self, theta: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {
         same(theta, mean, "reparameterized mean")?;
         same(theta, log_sd, "reparameterized log standard deviation")?;
@@ -5841,6 +5873,49 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             }
             .gpu_ctx("tensor reparameterize")
             .map(|_| ())
+        }
+
+        /// [`super::Device::reparameterize_rows`]: the existing kernels on a view of `out` from
+        /// entry `offset`.
+        pub(super) fn reparameterize_rows(&self, out: &mut Tensor, offset: usize, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {
+            let n = mean.len();
+            let count = n as u64;
+            if n == 0 {
+                return Ok(());
+            }
+            match &mut out.data {
+                Data::CudaBf16(slice) => {
+                    let f = self.function("reparameterize_bf16")?;
+                    let mut view = slice.slice_mut(offset..offset + n);
+                    // SAFETY: f32 masters of n entries and a view of n halves, checked by the caller.
+                    unsafe {
+                        self.stream.launch_builder(&f).arg(&count).arg(&key).arg(&stream).input(mean, Storage::F32)?.input(log_sd, Storage::F32)?.arg(&mut view).launch(cfg_elements(count))
+                    }
+                    .gpu_ctx("tensor reparameterize rows bf16")
+                    .map(|_| ())
+                }
+                Data::Cuda32(slice) => {
+                    let f = self.posterior_kernel("reparameterize", Storage::F32)?;
+                    let mut view = slice.slice_mut(offset..offset + n);
+                    // SAFETY: f32 masters of n entries and a view of n floats, checked by the caller.
+                    unsafe {
+                        self.stream.launch_builder(&f).arg(&count).arg(&key).arg(&stream).input(mean, Storage::F32)?.input(log_sd, Storage::F32)?.arg(&mut view).launch(cfg_elements(count))
+                    }
+                    .gpu_ctx("tensor reparameterize rows")
+                    .map(|_| ())
+                }
+                Data::Cuda(slice) => {
+                    let f = self.posterior_kernel("reparameterize", Storage::F64)?;
+                    let mut view = slice.slice_mut(offset..offset + n);
+                    // SAFETY: float64 masters of n entries and a view of n doubles, checked by the caller.
+                    unsafe {
+                        self.stream.launch_builder(&f).arg(&count).arg(&key).arg(&stream).input(mean, Storage::F64)?.input(log_sd, Storage::F64)?.arg(&mut view).launch(cfg_elements(count))
+                    }
+                    .gpu_ctx("tensor reparameterize rows")
+                    .map(|_| ())
+                }
+                Data::Host(_) => Err(foreign()),
+            }
         }
 
         pub(super) fn sample_terms(&self, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64), count: usize, layout: super::TermLayout) -> Result<Vec<Tensor>, GpuError> {
