@@ -49,6 +49,12 @@ while :; do
         free_c=$(( free_c - c )) free_g=$(( free_g - g )) free_m=$(( free_m - mm ))
     done <<< "$jobs"
     cap_c=$(( total_c - other_c - SLACK_CPUS )) cap_g=$(( total_g - other_g )) cap_m=$(( total_m - other_m - SLACK_GB ))
+    # Fair share: the node's GPUs divided equally among the users who run or wait for GPU jobs
+    # (us included). Up to that share we take GPUs as they free up even while others wait; running
+    # jobs are never touched. Without it, other users' queues kept us at zero GPUs for hours.
+    gpu_users=$( { echo "$USER"; squeue -h -o '%u %b %T %r' | awk '$2 ~ /gpu/ && ($3 == "RUNNING" || $4 == "Resources" || $4 == "Priority") { print $1 }'; } | sort -u | wc -l)
+    fair_g=$(( total_g / gpu_users ))
+    (( cap_g < fair_g )) && cap_g=$fair_g
     cpus=0 gpus=0 mem=0
     while read -r c b m; do
         g=$(gpus_of "$b")
