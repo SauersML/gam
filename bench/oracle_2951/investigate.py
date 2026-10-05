@@ -146,6 +146,9 @@ def wait_for(path, proc, log):
 
 
 def start_server(task, out, binary):
+    if task.get("server"):
+        # A server already running elsewhere (a pod behind an SSH tunnel) with the task's models.
+        return None, task["server"]
     sock = str(out / "oracle.sock")
     log = out / "server.log"
     # The server's memory is reserved in the machine's ledger: the models in float64 and the runs' values.
@@ -271,7 +274,8 @@ def main():
             (out / "organism_scores.txt").write_text(r.stdout + r.stderr)
             print(r.stdout + r.stderr)
     finally:
-        proc.terminate()
+        if proc:
+            proc.terminate()
 
 
 if __name__ == "__main__":

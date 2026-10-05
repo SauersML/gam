@@ -58,9 +58,8 @@ class Client:
         self.sock = sock
 
     def __call__(self, payload):
-        import socket
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.connect(self.sock)
+        from oracle import connect
+        with connect(self.sock) as s:
             s.sendall((json.dumps(payload) + "\n").encode())
             chunks = []
             while not chunks or not chunks[-1].endswith(b"\n"):
@@ -376,7 +375,8 @@ def main():
                                   "ablated_minus_report_bits": score(with_ablated) - score(with_report)}
         (out / "items_scored.json").write_text(json.dumps(items))
     finally:
-        proc.terminate()
+        if proc:
+            proc.terminate()
     (out / "results.json").write_text(json.dumps(results, indent=1))
     print(json.dumps({k: v for k, v in results.items() if k not in ("test_seed",)}, indent=1))
 

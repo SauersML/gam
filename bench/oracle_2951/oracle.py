@@ -47,6 +47,16 @@ Patch (activation patching at a site):
 """
 
 
+def connect(address):
+    """A Unix socket path, or HOST:PORT over TCP (a server on a pod behind an SSH tunnel)."""
+    host, sep, port = address.rpartition(":")
+    if sep and port.isdigit() and "/" not in address:
+        return socket.create_connection((host, int(port)))
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(address)
+    return s
+
+
 class Session:
     def __init__(self, path=None):
         path = path or os.environ.get("ORACLE_SESSION")
@@ -71,8 +81,7 @@ class Session:
         limit = self.config.get("max_calls")
         if log and limit is not None and os.path.exists(log) and sum(1 for _ in open(log)) >= limit:
             raise SystemExit(f"the investigation's budget of {limit} oracle calls is spent; write the report now")
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.connect(self.config["socket"])
+        with connect(self.config["socket"]) as s:
             s.sendall((json.dumps(payload) + "\n").encode())
             chunks = []
             while not chunks or not chunks[-1].endswith(b"\n"):
