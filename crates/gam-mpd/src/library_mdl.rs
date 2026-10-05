@@ -78,7 +78,11 @@
 //! al., ICML 2024) on `F / N = E_q[ℓ] + KL(q ‖ p) / N`, `ℓ` the data term per scored token and `N`
 //! the scored tokens of every training experiment: the batch's gradient `g` of `ℓ` at the sample
 //! gives the curvature estimate `ĥ = g ε / σ`, whose average over the last epoch's batches is `h`
-//! (`β₂ = 1 − 1/B` for `B` training batches); the posterior's standard deviation is then
+//! (`β₂ = 1 − 1/B` for `B` training batches). `h` starts at the mean estimate over one pass of the
+//! training batches at the starting posterior (the curvature pass, before the first epoch): from
+//! the starting point's unit-information curvature `1 / v_G` it would fall only one e-fold per
+//! epoch, so `F` would fall by a fixed amount per epoch for as many epochs as the curvature has
+//! e-folds to fall. The posterior's standard deviation is then
 //! `σ = 1 / √(N (h + δ))` with `δ = 1 / (N v_G)` the group prior's precision per token, the value
 //! at which `F` is stationary in `σ`, so `σ` has no step size; the mean takes the preconditioned
 //! step `α (m + δ μ) / (h + δ)` along the gradient's momentum `m`. The posterior stays on the
@@ -1921,6 +1925,42 @@ pub fn fit(
         device_posterior.values_into(&mut posterior)?;
         progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
         save(&mut progress, &posterior, &device_posterior)?;
+    }
+    // IVON's curvature at the start (module note): one pass over the training batches at the
+    // starting posterior, the mean of their reparameterization estimates.
+    if progress.step == 0 && progress.epochs.is_empty() {
+        let timed = Instant::now();
+        let prior_operators = prior.as_deref().map(PriorTerm::operators).unwrap_or_default();
+        let mut sums = device_posterior.curvature_sums()?;
+        for (b, draw) in draws.iter().enumerate() {
+            let batch = draw.batch(sequences)?;
+            let experiments = scorer.experiments(draw, sequences)?;
+            let key = noise_seed(settings.seed, 0, b);
+            let (bits, mut gradients) = scorer.score_device(&device_posterior, &batch, &experiments, Some(key), &format!("train_{b}"), true)?;
+            let scored = bits.iter().map(Vec::len).sum::<usize>();
+            // The prior term's gradient joins the data term's, as in a step, so its curvature does.
+            if let Some(prior) = prior.as_deref_mut() {
+                for &i in &prior_operators {
+                    let (mean, log_sd) = device_posterior.values(i)?;
+                    posterior.mean[i] = mean;
+                    posterior.log_sd[i] = log_sd;
+                }
+                let scale = tokens as f64 / scored as f64;
+                for (i, g) in prior_term(prior, &posterior, key, false)?.1 {
+                    let op = explanation.trainable[i];
+                    let uploaded = device.upload((g / (scale * LN_2)).view()).map_err(error)?;
+                    match gradients.get_mut(&op) {
+                        Some(total) => device.axpy(total, 1.0, &uploaded).map_err(error)?,
+                        None => {
+                            gradients.insert(op, uploaded);
+                        }
+                    }
+                }
+            }
+            device_posterior.add_curvature(&mut sums, &gradients, LN_2 / scored as f64, key)?;
+        }
+        device_posterior.start_at_curvature(&sums, draws.len())?;
+        log::info!("library curvature pass: {} batches, {:.1} s", draws.len(), timed.elapsed().as_secs_f64());
     }
     while !progress.done {
         let epoch = progress.epoch;

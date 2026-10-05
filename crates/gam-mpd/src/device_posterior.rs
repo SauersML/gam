@@ -196,6 +196,54 @@ impl DevicePosterior {
         self.wide.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
     }
 
+    /// Zero sums of curvature estimates, one per trainable operator ([`Self::add_curvature`]).
+    pub fn curvature_sums(&self) -> Result<Vec<Tensor>, String> {
+        self.mean.iter().map(|m| self.fitting.zeros(m.rows(), m.cols()).map_err(error)).collect()
+    }
+
+    /// Adds the reparameterization estimate of the data term's curvature per token at the sample of
+    /// `key`, `ĥ = g ε / σ` with `g` the gradient `gradients` (as in [`Self::step`]) times `scale`,
+    /// into `sums`; the posterior is unchanged.
+    pub fn add_curvature(&self, sums: &mut [Tensor], gradients: &BTreeMap<usize, Tensor>, scale: f64, key: u64) -> Result<(), String> {
+        for (i, &op) in self.operators.iter().enumerate() {
+            let Some(given) = gradients.get(&op) else { continue };
+            let converted = if given.storage() == self.mean[i].storage() { None } else { Some(self.fitting.convert(given).map_err(error)?) };
+            let gradient = converted.as_ref().unwrap_or(given);
+            let (rows, cols) = (self.mean[i].rows(), self.mean[i].cols());
+            // `ε / σ`: the draw of `(key, i)` at mean zero and log standard deviation `−s`.
+            let zero = self.fitting.zeros(rows, cols).map_err(error)?;
+            let mut inverse = self.fitting.zeros(rows, cols).map_err(error)?;
+            self.fitting.axpy(&mut inverse, -1.0, &self.log_sd[i]).map_err(error)?;
+            let mut draw = self.fitting.zeros(rows, cols).map_err(error)?;
+            self.fitting.reparameterize(&mut draw, (&zero, &inverse), (key, i as u64)).map_err(error)?;
+            let mut product = self.fitting.zeros(rows, cols).map_err(error)?;
+            self.fitting.hadamard(&mut product, gradient, &draw, false).map_err(error)?;
+            self.fitting.axpy(&mut sums[i], scale, &product).map_err(error)?;
+        }
+        Ok(())
+    }
+
+    /// Starts IVON at the curvature `max(0, sums / count)` (the mean of `count` estimates; zero for
+    /// a removed entry, whose estimate is not finite) and the posterior's standard deviations at
+    /// it, `1 / √(N (h + δ))`; the means are unchanged.
+    pub fn start_at_curvature(&mut self, sums: &[Tensor], count: usize) -> Result<(), String> {
+        if sums.len() != self.mean.len() || count == 0 {
+            return Err(error("one curvature sum per trainable operator and a positive count required"));
+        }
+        for (i, sum) in sums.iter().enumerate() {
+            let curvature = self.fitting.download(sum).map_err(error)?.mapv(|v| {
+                let h = v / count as f64;
+                if h.is_finite() { h.max(0.0) } else { 0.0 }
+            });
+            self.moments[i][1] = self.fitting.upload(curvature.view()).map_err(error)?;
+        }
+        // A step of no gradient, no mean step and no curvature update sets `s` from `h` and `δ`.
+        let steps = self.steps;
+        self.step(&BTreeMap::new(), 0.0, &Ivon { rate: 0.0, beta1: 0.0, beta2: 1.0 }, 0)?;
+        self.steps = steps;
+        Ok(())
+    }
+
     /// The steps taken.
     #[must_use]
     pub fn steps(&self) -> u64 {
