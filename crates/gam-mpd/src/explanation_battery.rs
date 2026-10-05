@@ -1765,6 +1765,7 @@ pub fn neuron_attributions(library: &crate::library_readout::Library<'_>, pairs:
             tokens: p.clean.clone(),
             baseline: Some(p.counterfactual.clone()),
             metric: crate::library_readout::Metric::Difference { position: p.clean.len() - 1, target: p.target, foil: p.foil },
+            gradients: false,
         };
         let attribution = library.attributions(&prompt)?.attributions.sum_axis(Axis(0));
         for (acc, cols) in out.iter_mut().zip(&columns) {
@@ -1803,8 +1804,9 @@ pub fn subcomponent_attributions(library: &crate::library_readout::Library<'_>, 
             tokens: p.clean.clone(),
             baseline: Some(p.counterfactual.clone()),
             metric: crate::library_readout::Metric::Difference { position: length - 1, target: p.target, foil: p.foil },
+            gradients: true,
         };
-        let gradients = library.attributions(&prompt)?.gradients;
+        let gradients = library.attributions(&prompt)?.gradients.ok_or_else(|| error("RelP returned no gradients"))?;
         let (_, trace) = basis.run(&[p.clean.as_slice(), p.counterfactual.as_slice()], &|_, _| None)?;
         for (s, f) in factors.iter().enumerate() {
             let layer = &gradients[f.layer];
@@ -1818,9 +1820,9 @@ pub fn subcomponent_attributions(library: &crate::library_readout::Library<'_>, 
                     }
                     g
                 }
-                Kind::Output => layer.attention.clone(),
+                Kind::Output => layer.attention_output.clone(),
                 Kind::Up => layer.gate.clone(),
-                Kind::Down => layer.mlp.clone(),
+                Kind::Down => layer.mlp_output.clone(),
             };
             let a = d.download(trace.value(basis.groups[s])?).map_err(error)?;
             let difference = &a.slice(s![..length, ..]) - &a.slice(s![length.., ..]);
