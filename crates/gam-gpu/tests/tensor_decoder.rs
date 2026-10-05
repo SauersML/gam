@@ -103,25 +103,61 @@ fn heads_rope_and_its_reverse_match_the_host() {
     }
 }
 
+/// The device's attention and its reverse on `sequences` of `rows` rows against the host's on the
+/// same bfloat16 heads; returns the largest absolute and relative differences of the outputs and
+/// of the cotangents.
+fn attention_case(d: &Device, layout: HeadLayout, rows: usize, sequences: &[std::ops::Range<usize>], scale: f64, seed: u64) -> [(f64, f64); 2] {
+    let host = Device::host();
+    // Bfloat16 projections, exactly as the attention reads them on both sides.
+    let (y16, _) = d.heads_rope(&d.upload(matrix(rows, layout.columns(), seed, 2.0).view()).unwrap(), layout, None, None).unwrap();
+    let y = d.download(&y16).unwrap();
+    let ga = matrix(rows, layout.queries * layout.width, seed + 1, 1.0);
+    let (out, lse) = d.causal_attention(&y16, layout, sequences, scale).unwrap();
+    let (hy, hga) = (host.upload(y.view()).unwrap(), host.upload(ga.view()).unwrap());
+    let (hout, hlse) = host.causal_attention(&hy, layout, sequences, scale).unwrap();
+    let (a, ha) = (d.download(&out).unwrap(), host.download(&hout).unwrap());
+    let values = largest(&y);
+    let what = format!("{layout:?} over {sequences:?}");
+    // Both sides round the weights and the outputs to bfloat16; a weight at a rounding tie may round
+    // apart, and the device's row sums add its rounded weights (2⁻⁹ relative).
+    close(&format!("attention {what}"), &a, &ha, |i, j| 2.0 * HALF * values + HALF * ha[[i, j]].abs());
+    let (l, hl) = (d.download(&lse).unwrap(), host.download(&hlse).unwrap());
+    close(&format!("log partitions {what}"), &l, &hl, |i, j| HALF + SINGLE * hl[[i, j]].abs());
+    let gy = d.download(&d.causal_attention_backward(&y16, layout, sequences, scale, (&out, &lse), &d.upload(ga.view()).unwrap()).unwrap()).unwrap();
+    let hgy = host.download(&host.causal_attention_backward(&hy, layout, sequences, scale, (&hout, &hlse), &hga).unwrap()).unwrap();
+    // The reverse reads the cotangent and the weights' cotangent rounded to bfloat16.
+    let band = 8.0 * HALF * largest(&hgy).max(values);
+    close(&format!("attention reverse {what}"), &gy, &hgy, |_, _| band);
+    let difference = |x: &Array2<f64>, h: &Array2<f64>| {
+        let abs = x.iter().zip(h).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        (abs, abs / largest(h))
+    };
+    [difference(&a, &ha), difference(&gy, &hgy)]
+}
+
 #[test]
 fn causal_attention_and_its_reverse_match_the_host() {
     let Some(d) = cuda() else { return };
-    let host = Device::host();
-    let layout = HeadLayout { queries: 4, keys: 2, width: 16 };
-    let (blocks, length) = (3, 11);
-    // Bfloat16 projections, exactly as the attention reads them on both sides.
-    let (y16, _) = d.heads_rope(&d.upload(matrix(blocks * length, layout.columns(), 8, 2.0).view()).unwrap(), layout, None, None).unwrap();
-    let y = d.download(&y16).unwrap();
-    let ga = matrix(blocks * length, layout.queries * layout.width, 9, 1.0);
-    let scale = 0.25;
-    let a = d.download(&d.causal_attention(&y16, layout, blocks, scale).unwrap()).unwrap();
-    let ha = host.download(&host.causal_attention(&host.upload(y.view()).unwrap(), layout, blocks, scale).unwrap()).unwrap();
-    let values = largest(&y);
-    close("attention", &a, &ha, |_, _| 2.0 * HALF * values);
-    let gy = d.download(&d.causal_attention_backward(&y16, layout, blocks, scale, &d.upload(ga.view()).unwrap()).unwrap()).unwrap();
-    let hgy = host.download(&host.causal_attention_backward(&host.upload(y.view()).unwrap(), layout, blocks, scale, &host.upload(ga.view()).unwrap()).unwrap()).unwrap();
-    // The reverse reads the cotangent and the weights' cotangent rounded to bfloat16.
-    close("attention reverse", &gy, &hgy, |_, _| 8.0 * HALF * largest(&hgy).max(values));
+    // Grouped queries, sequences of unequal lengths crossing the 64-row tiles, rows outside every
+    // sequence; widths padded inside the kernels (16 and 20 columns: the latter loads by element)
+    // and a full 128.
+    for width in [16, 20, 128] {
+        let layout = HeadLayout { queries: 4, keys: 2, width };
+        let sequences = [0..11, 13..90, 90..155, 160..161];
+        attention_case(&d, layout, 170, &sequences, 1.0 / (width as f64).sqrt(), 8);
+    }
+}
+
+#[test]
+fn causal_attention_matches_the_host_at_the_fit_shapes() {
+    let Some(d) = cuda() else { return };
+    // vpd4l: 6 heads of 128 with their own keys and values; Qwen3-0.6B: 16 query heads over 8
+    // key-value heads of 128. Sequences of 512 rows and one shorter.
+    for (name, layout) in [("vpd4l", HeadLayout { queries: 6, keys: 6, width: 128 }), ("qwen3-0.6b", HeadLayout { queries: 16, keys: 8, width: 128 })] {
+        let sequences = [0..512, 512..1024, 1024..1324];
+        let [(a_abs, a_rel), (g_abs, g_rel)] = attention_case(&d, layout, 1324, &sequences, 1.0 / 128f64.sqrt(), 20);
+        eprintln!("{name}: outputs max abs {a_abs:.3e} (relative to the largest {a_rel:.3e}), cotangents max abs {g_abs:.3e} (relative {g_rel:.3e})");
+    }
 }
 
 #[test]

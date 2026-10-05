@@ -140,7 +140,7 @@ pub struct Tape {
 }
 
 enum Inner {
-    Attention { projections: Tensor, head_scales: Option<Tensor>, heads: Tensor, angles: Option<(Tensor, Tensor)>, sequences: usize },
+    Attention { projections: Tensor, head_scales: Option<Tensor>, heads: Tensor, angles: Option<(Tensor, Tensor)>, attended: (Tensor, Tensor), sequences: Vec<Range<usize>> },
     Mlp { pre: Tensor, active: Tensor, out: Option<(Tensor, Tensor)> },
 }
 
@@ -284,8 +284,8 @@ impl Decoder {
                     // Scores and values: two products of rows × (length / 2) × w per query head.
                     let attention = 2.0 * 2.0 * rows * (length / 2.0) * w * heads;
                     forward += products + attention;
-                    // The weights recomputed, then four products (weights', values', queries', keys').
-                    reverse += 2.0 * products + attention + 2.0 * attention;
+                    // The scores recomputed, then four products (weights', values', queries', keys').
+                    reverse += 2.0 * products + 0.5 * attention + 2.0 * attention;
                 }
                 Block::Mlp(m) => {
                     let inputs = m.input.rows as f64;
@@ -589,10 +589,11 @@ impl BlockEngine for Decoder {
                 let rotation = angles.as_ref().zip(rotary).map(|((c, s), r)| (c, s, r.half_split));
                 let norm = w.norms.as_ref().zip(a.norms.as_ref()).map(|(g, (_, e))| (g, *e));
                 let (heads, head_scales) = d.heads_rope(&p, a.layout, norm, rotation).map_err(error)?;
-                let attended = d.causal_attention(&heads, a.layout, ranges.len(), a.scale).map_err(error)?;
-                let attended16 = d.bf16_copy(&attended).map_err(error)?;
-                d.gemm(&mut out, 1.0, &attended16, Op::N, &w.output, Op::T, 1.0, Arithmetic::Bf16).map_err(error)?;
-                Inner::Attention { projections: p, head_scales, heads, angles, sequences: ranges.len() }
+                // Each range is one sequence; the gathered rows hold them in order.
+                let sequences: Vec<Range<usize>> = ranges.iter().scan(0, |at, r| { *at += r.len(); Some(*at - r.len()..*at) }).collect();
+                let attended = d.causal_attention(&heads, a.layout, &sequences, a.scale).map_err(error)?;
+                d.gemm(&mut out, 1.0, &attended.0, Op::N, &w.output, Op::T, 1.0, Arithmetic::Bf16).map_err(error)?;
+                Inner::Attention { projections: p, head_scales, heads, angles, attended, sequences }
             }
             Block::Mlp(m) => {
                 let mut pre = d.empty(x.rows(), m.input.rows).map_err(error)?;
@@ -629,10 +630,10 @@ impl BlockEngine for Decoder {
         let rows = g.rows();
         let mut g_read = d.empty(rows, self.width).map_err(error)?;
         match (&self.blocks[block], tape.inner) {
-            (Block::Attention(a), Inner::Attention { projections, head_scales, heads, angles, sequences }) => {
+            (Block::Attention(a), Inner::Attention { projections, head_scales, heads, angles, attended, sequences }) => {
                 let mut g_attended = d.empty(rows, a.layout.queries * a.layout.width).map_err(error)?;
                 d.gemm(&mut g_attended, 1.0, &g, Op::N, &w.output, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
-                let g_heads = d.causal_attention_backward(&heads, a.layout, sequences, a.scale, &g_attended).map_err(error)?;
+                let g_heads = d.causal_attention_backward(&heads, a.layout, &sequences, a.scale, (&attended.0, &attended.1), &g_attended).map_err(error)?;
                 let rotation = angles.as_ref().zip(a.rotary).map(|((c, s), r)| (c, s, r.half_split));
                 let norm = w.norms.as_ref().zip(head_scales.as_ref());
                 // The cotangent feeds two products: rounded to bfloat16 once.

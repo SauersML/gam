@@ -2225,42 +2225,45 @@ impl Device {
         }
     }
 
-    /// Causal attention of `blocks` equal sequences on [`Device::heads_rope`]'s output `y`: per
-    /// query head, `softmax(scale q kᵀ)` over the earlier positions of its key-value head (query
-    /// heads in order share key-value heads in equal consecutive groups) times their values, the
-    /// heads side by side (rows × queries·width, f32). The weights are rounded to bfloat16 before
-    /// the values' product reads them (the host rounds alike).
-    pub fn causal_attention(&self, y: &Tensor, layout: HeadLayout, blocks: usize, scale: f64) -> Result<Tensor, GpuError> {
-        layout.check(y, None, None)?;
-        if blocks == 0 || y.rows % blocks != 0 || layout.keys == 0 || layout.queries % layout.keys != 0 {
-            return Err(shape(format!("{} rows in {blocks} sequences, {} query and {} key heads", y.rows, layout.queries, layout.keys)));
-        }
+    /// Causal attention on [`Device::heads_rope`]'s output `y` over `sequences`, disjoint row ranges
+    /// of `y`, each one sequence: per query head, `softmax(scale q kᵀ)` over the positions of its
+    /// key-value head up to its own in its sequence (query heads in order share key-value heads in
+    /// equal consecutive groups) times their values. Returns the heads side by side (rows ×
+    /// queries·width, bfloat16: the output map's operand) and each row's log partition per query
+    /// head, `log Σⱼ exp(scale qᵢ·kⱼ)` (rows × queries, f32), which the reverse reads; rows outside
+    /// every sequence are zeros. The weights are rounded to bfloat16 before the values' product
+    /// reads them (the host rounds alike). On CUDA the scores never leave the chip
+    /// (`attention.cu`).
+    pub fn causal_attention(&self, y: &Tensor, layout: HeadLayout, sequences: &[std::ops::Range<usize>], scale: f64) -> Result<(Tensor, Tensor), GpuError> {
+        layout.check_attention(y, sequences)?;
         match &*self.backend {
             Backend::Host => {
-                let (a, _) = host_attention(host(y)?, layout, (blocks, y.rows / blocks), scale, None);
-                Ok(Tensor { rows: y.rows, cols: layout.queries * layout.width, data: Data::Host(a) })
+                let (a, lse, _) = host_attention(host(y)?, layout, (y.rows, sequences), scale, None);
+                let a = a.iter().map(|v| round_operand(*v, Arithmetic::Bf16)).collect();
+                Ok((Tensor { rows: y.rows, cols: layout.queries * layout.width, data: Data::Host(a) }, Tensor { rows: y.rows, cols: layout.queries, data: Data::Host(lse) }))
             }
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.causal_attention(y, layout, blocks, scale),
+            Backend::Cuda(engine) => engine.causal_attention(y, layout, sequences, scale),
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
         }
     }
 
     /// [`Device::causal_attention`]'s cotangent in `y` (f32, rows × y's columns) from its output's
-    /// `ga`; the weights are recomputed.
-    pub fn causal_attention_backward(&self, y: &Tensor, layout: HeadLayout, blocks: usize, scale: f64, ga: &Tensor) -> Result<Tensor, GpuError> {
-        layout.check(y, None, None)?;
-        if blocks == 0 || y.rows % blocks != 0 || ga.dim() != (y.rows, layout.queries * layout.width) || layout.keys == 0 || layout.queries % layout.keys != 0 {
-            return Err(shape(format!("a {:?} cotangent of {} rows in {blocks} sequences", ga.dim(), y.rows)));
+    /// `ga` (f32), given what it returned (`out`, `lse`); the weights are recomputed from `lse`.
+    pub fn causal_attention_backward(&self, y: &Tensor, layout: HeadLayout, sequences: &[std::ops::Range<usize>], scale: f64, (out, lse): (&Tensor, &Tensor), ga: &Tensor) -> Result<Tensor, GpuError> {
+        layout.check_attention(y, sequences)?;
+        let reads = (y.rows, layout.queries * layout.width);
+        if ga.dim() != reads || out.dim() != reads || lse.dim() != (y.rows, layout.queries) {
+            return Err(shape(format!("a {:?} cotangent, {:?} outputs and {:?} log partitions of {} rows", ga.dim(), out.dim(), lse.dim(), y.rows)));
         }
         match &*self.backend {
             Backend::Host => {
-                let (_, gy) = host_attention(host(y)?, layout, (blocks, y.rows / blocks), scale, Some(host(ga)?));
+                let (_, _, gy) = host_attention(host(y)?, layout, (y.rows, sequences), scale, Some(host(ga)?));
                 Ok(Tensor { rows: y.rows, cols: y.cols, data: Data::Host(gy) })
             }
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.causal_attention_backward(y, layout, blocks, scale, ga),
+            Backend::Cuda(engine) => engine.causal_attention_backward(y, layout, sequences, scale, (out, lse), ga),
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
         }
@@ -2612,6 +2615,21 @@ impl HeadLayout {
         }
         Ok(())
     }
+
+    /// `y` holds these heads, query heads fall in equal groups per key-value head, and `sequences`
+    /// are disjoint ranges of its rows.
+    fn check_attention(&self, y: &Tensor, sequences: &[std::ops::Range<usize>]) -> Result<(), GpuError> {
+        self.check(y, None, None)?;
+        if self.keys == 0 || self.queries % self.keys != 0 {
+            return Err(shape(format!("{} query heads over {} key-value heads", self.queries, self.keys)));
+        }
+        let mut sorted: Vec<_> = sequences.to_vec();
+        sorted.sort_by_key(|r| r.start);
+        if sorted.iter().any(|r| r.start > r.end || r.end > y.rows) || sorted.windows(2).any(|w| w[0].end > w[1].start) {
+            return Err(shape(format!("sequences {sequences:?} are not disjoint ranges of {} rows", y.rows)));
+        }
+        Ok(())
+    }
 }
 
 /// The classes a swept head log partition takes at a time for `rows` rows: about 32 MB of f32
@@ -2704,50 +2722,81 @@ fn host_heads(
     Ok((out, scales))
 }
 
-/// The host's [`Device::causal_attention`] of `y` (`blocks` sequences of `length`) and, with
-/// `ga`, its cotangent in `y`; the weights rounded to bfloat16 as the device rounds them.
-fn host_attention(y: &[f64], layout: HeadLayout, (blocks, length): (usize, usize), scale: f64, ga: Option<&[f64]>) -> (Vec<f64>, Vec<f64>) {
-    host_attention_rounded(y, layout, (blocks, length), scale, ga, Arithmetic::Bf16)
+/// The host's [`Device::causal_attention`] of `y` (`rows` rows, `sequences` of them attending
+/// within themselves): its output, log partitions and, with `ga`, its cotangent in `y`; the weights
+/// rounded to bfloat16 as the device rounds them.
+fn host_attention(y: &[f64], layout: HeadLayout, rows: (usize, &[std::ops::Range<usize>]), scale: f64, ga: Option<&[f64]>) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    host_attention_rounded(y, layout, rows, scale, ga, Arithmetic::Bf16)
 }
 
-/// [`host_attention`] with the weights rounded to `weights` (float64 leaves them exact).
-fn host_attention_rounded(y: &[f64], layout: HeadLayout, (blocks, length): (usize, usize), scale: f64, ga: Option<&[f64]>, weights: Arithmetic) -> (Vec<f64>, Vec<f64>) {
+/// [`host_attention`] with the weights rounded to `weights` (float64 leaves them exact). Each
+/// (sequence, key-value head) runs on its own thread: it alone writes its rows' columns of that
+/// head and of its query heads.
+fn host_attention_rounded(y: &[f64], layout: HeadLayout, (rows, sequences): (usize, &[std::ops::Range<usize>]), scale: f64, ga: Option<&[f64]>, weights: Arithmetic) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let (w, columns, group) = (layout.width, layout.columns(), layout.queries / layout.keys);
     let reads = layout.queries * w;
-    let rows = blocks * length;
-    let mut a = vec![0.0; rows * reads];
-    let mut gy = vec![0.0; rows * columns];
     let at = |r: usize, column: usize| y[r * columns + column];
-    for b in 0..blocks {
-        for h in 0..layout.queries {
-            let g = h / group;
-            let (q0, k0, v0) = (h * w, (layout.queries + g) * w, (layout.queries + layout.keys + g) * w);
-            for i in 0..length {
-                let ri = b * length + i;
-                let scores: Vec<f64> = (0..=i).map(|j| scale * (0..w).map(|t| at(ri, q0 + t) * at(b * length + j, k0 + t)).sum::<f64>()).collect();
-                let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                let total: f64 = scores.iter().map(|s| (s - m).exp()).sum();
-                let p: Vec<f64> = scores.iter().map(|s| round_operand((s - m).exp() / total, weights)).collect();
-                for t in 0..w {
-                    a[ri * reads + h * w + t] = (0..=i).map(|j| p[j] * at(b * length + j, v0 + t)).sum();
-                }
-                let Some(ga) = ga else { continue };
-                let g_row = &ga[ri * reads + h * w..ri * reads + (h + 1) * w];
-                let dp: Vec<f64> = (0..=i).map(|j| (0..w).map(|t| g_row[t] * at(b * length + j, v0 + t)).sum()).collect();
-                let dot: f64 = (0..=i).map(|j| p[j] * dp[j]).sum();
-                for j in 0..=i {
-                    let rj = b * length + j;
-                    let ds = p[j] * (dp[j] - dot);
+    let tasks: Vec<(usize, usize)> = (0..sequences.len()).flat_map(|s| (0..layout.keys).map(move |g| (s, g))).collect();
+    // Per task: the output and log partitions of its query heads, and the cotangents of its query
+    // heads' and its key and value head's columns, each over its sequence's rows.
+    let parts: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = tasks
+        .par_iter()
+        .map(|&(s, g)| {
+            let (base, length) = (sequences[s].start, sequences[s].len());
+            let (k0, v0) = ((layout.queries + g) * w, (layout.queries + layout.keys + g) * w);
+            let mut a = vec![0.0; length * group * w];
+            let mut lse = vec![0.0; length * group];
+            let mut gq = vec![0.0; length * group * w];
+            let mut gkv = vec![0.0; length * 2 * w];
+            for local in 0..group {
+                let q0 = (g * group + local) * w;
+                for i in 0..length {
+                    let ri = base + i;
+                    let scores: Vec<f64> = (0..=i).map(|j| scale * (0..w).map(|t| at(ri, q0 + t) * at(base + j, k0 + t)).sum::<f64>()).collect();
+                    let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let total: f64 = scores.iter().map(|s| (s - m).exp()).sum();
+                    lse[i * group + local] = m + total.ln();
+                    let p: Vec<f64> = scores.iter().map(|s| round_operand((s - m).exp() / total, weights)).collect();
                     for t in 0..w {
-                        gy[rj * columns + v0 + t] += p[j] * g_row[t];
-                        gy[ri * columns + q0 + t] += scale * ds * at(rj, k0 + t);
-                        gy[rj * columns + k0 + t] += scale * ds * at(ri, q0 + t);
+                        a[(i * group + local) * w + t] = (0..=i).map(|j| p[j] * at(base + j, v0 + t)).sum();
+                    }
+                    let Some(ga) = ga else { continue };
+                    let h = g * group + local;
+                    let g_row = &ga[ri * reads + h * w..ri * reads + (h + 1) * w];
+                    let dp: Vec<f64> = (0..=i).map(|j| (0..w).map(|t| g_row[t] * at(base + j, v0 + t)).sum()).collect();
+                    let dot: f64 = (0..=i).map(|j| p[j] * dp[j]).sum();
+                    for j in 0..=i {
+                        let ds = p[j] * (dp[j] - dot);
+                        for t in 0..w {
+                            gkv[j * 2 * w + w + t] += p[j] * g_row[t];
+                            gq[(i * group + local) * w + t] += scale * ds * at(base + j, k0 + t);
+                            gkv[j * 2 * w + t] += scale * ds * at(ri, q0 + t);
+                        }
                     }
                 }
             }
+            (a, lse, gq, gkv)
+        })
+        .collect();
+    let mut a = vec![0.0; rows * reads];
+    let mut lse = vec![0.0; rows * layout.queries];
+    let mut gy = vec![0.0; rows * columns];
+    for (&(s, g), (pa, pl, pq, pkv)) in tasks.iter().zip(&parts) {
+        let (base, length) = (sequences[s].start, sequences[s].len());
+        let (k0, v0) = ((layout.queries + g) * w, (layout.queries + layout.keys + g) * w);
+        for i in 0..length {
+            let r = base + i;
+            for local in 0..group {
+                let h = g * group + local;
+                lse[r * layout.queries + h] = pl[i * group + local];
+                a[r * reads + h * w..r * reads + (h + 1) * w].copy_from_slice(&pa[(i * group + local) * w..(i * group + local + 1) * w]);
+                gy[r * columns + h * w..r * columns + (h + 1) * w].copy_from_slice(&pq[(i * group + local) * w..(i * group + local + 1) * w]);
+            }
+            gy[r * columns + k0..r * columns + k0 + w].copy_from_slice(&pkv[i * 2 * w..i * 2 * w + w]);
+            gy[r * columns + v0..r * columns + v0 + w].copy_from_slice(&pkv[i * 2 * w + w..(i + 1) * 2 * w]);
         }
     }
-    (a, gy)
+    (a, lse, gy)
 }
 
 /// GELU in its tanh form at `x`, and its slope.
@@ -4091,6 +4140,55 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
     /// The decoder layer's fused kernels (`decoder.cu`), compiled on first use.
     const KERNELS_DECODER: &str = include_str!("decoder.cu");
 
+    /// The tiled causal attention, forward and reverse (`attention.cu`), compiled on first use per
+    /// head width.
+    const KERNELS_ATTENTION: &str = include_str!("attention.cu");
+
+    /// A forward attention block's warps (16 query rows each) and the key rows it takes at a time.
+    const ATTENTION_FORWARD: (usize, usize) = (4, 64);
+
+    /// A reverse attention block's threads, the query rows and the key rows it takes at a time.
+    const ATTENTION_BACKWARD: (usize, usize, usize) = (256, 64, 64);
+
+    /// The sequences one attention launch takes (they are passed by value: a kernel's parameters
+    /// hold 4 KB).
+    const ATTENTION_SEQUENCES: usize = 480;
+
+    /// `attention.cu`'s `Sequences`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct AttentionSequences {
+        count: u32,
+        start: [u32; ATTENTION_SEQUENCES],
+        length: [u32; ATTENTION_SEQUENCES],
+    }
+
+    // SAFETY: plain u32s laid out as the kernels' parameter struct.
+    unsafe impl DeviceRepr for AttentionSequences {}
+
+    /// The table of up to [`ATTENTION_SEQUENCES`] sequences, and the most tiles of `tile` rows any
+    /// of them spans.
+    fn attention_sequences(sequences: &[std::ops::Range<usize>], tile: usize) -> Result<(AttentionSequences, u32), GpuError> {
+        let mut table = AttentionSequences { count: u32_of(sequences.len())?, start: [0; ATTENTION_SEQUENCES], length: [0; ATTENTION_SEQUENCES] };
+        for (i, r) in sequences.iter().enumerate() {
+            (table.start[i], table.length[i]) = (u32_of(r.start)?, u32_of(r.len())?);
+        }
+        let tiles = sequences.iter().map(|r| r.len().div_ceil(tile)).max().unwrap_or(0);
+        if tiles > 65_535 {
+            return Err(shape(format!("a sequence of {tiles} tiles of {tile} rows")));
+        }
+        Ok((table, tiles as u32))
+    }
+
+    /// The width the attention kernels pad heads of `width` columns to.
+    fn attention_width(width: usize) -> Result<usize, GpuError> {
+        match width {
+            1..=64 => Ok(64),
+            65..=128 => Ok(128),
+            _ => Err(GpuError::NoDeviceKernel { reason: format!("attention heads of {width} columns (the kernels take at most 128)") }),
+        }
+    }
+
     /// One CUDA device's stream, cuBLAS handle and kernels.
     pub(super) struct Engine {
         pub(super) name: String,
@@ -4890,127 +4988,88 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             Ok(gp)
         }
 
-        /// One `cublasGemmBatchedEx` over `entries` products `C ← α op(A) op(B) + β C` (column-major,
-        /// as `gemm_ex`): per entry the element offsets of its A, B and C in their buffers, the
-        /// pointer arrays uploaded for the call. A and B bfloat16, C f32. Entries writing one C
-        /// region must not share a call.
-        fn gemm_pointers(
-            &self,
-            ops: (cublasOperation_t, cublasOperation_t),
-            (m, n, k): (usize, usize, usize),
-            (alpha, beta): (f32, f32),
-            [(a, lda), (b, ldb)]: [(&CudaSlice<u16>, usize); 2],
-            (c, ldc): (&mut CudaSlice<f32>, usize),
-            entries: &[(usize, usize, usize)],
-        ) -> Result<(), GpuError> {
-            if entries.is_empty() {
-                return Ok(());
-            }
-            let serial = self.gemm_workspace.lock().map_err(|_| shape("poisoned GEMM workspace".to_string()))?;
-            let (pa, record_a) = a.device_ptr(&self.stream);
-            let (pb, record_b) = b.device_ptr(&self.stream);
-            let (pc, record_c) = c.device_ptr_mut(&self.stream);
-            let pointers = |base: u64, size: u64, pick: fn(&(usize, usize, usize)) -> usize| -> Vec<u64> { entries.iter().map(|e| base + size * pick(e) as u64).collect() };
-            let (arrays_a, arrays_b, arrays_c) = (
-                self.stream.clone_htod(&pointers(pa, 2, |e| e.0)).gpu_ctx("tensor pointer upload")?,
-                self.stream.clone_htod(&pointers(pb, 2, |e| e.1)).gpu_ctx("tensor pointer upload")?,
-                self.stream.clone_htod(&pointers(pc, 4, |e| e.2)).gpu_ctx("tensor pointer upload")?,
-            );
-            let ((qa, ra), (qb, rb), (qc, rc)) = (arrays_a.device_ptr(&self.stream), arrays_b.device_ptr(&self.stream), arrays_c.device_ptr(&self.stream));
-            let (m, n, k, lda, ldb, ldc, count) = (i32_of(m)?, i32_of(n)?, i32_of(k)?, i32_of(lda)?, i32_of(ldb)?, i32_of(ldc)?, i32_of(entries.len())?);
-            // SAFETY: every entry's offsets lie inside its buffer with the declared shapes (the
-            // caller's); the pointer arrays and buffers outlive the call (their records drop after it).
-            let status = unsafe {
-                cudarc::cublas::sys::cublasGemmBatchedEx(
-                    *self.blas.handle(), ops.0, ops.1, m, n, k,
-                    (&alpha) as *const f32 as *const _, qa as *const *const _, cudaDataType_t::CUDA_R_16BF, lda,
-                    qb as *const *const _, cudaDataType_t::CUDA_R_16BF, ldb,
-                    (&beta) as *const f32 as *const _, qc as *const *mut _, cudaDataType_t::CUDA_R_32F, ldc,
-                    count, cublasComputeType_t::CUBLAS_COMPUTE_32F, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        /// Attention kernel `name` (`attention.cu`) for heads of `width` columns, its module compiled
+        /// on first use per device and width, allowed `shared` bytes of dynamic shared memory.
+        fn attention_kernel(&self, width: usize, name: &'static str, shared: usize) -> Result<CudaFunction, GpuError> {
+            static MODULES: std::sync::OnceLock<crate::device_cache::KeyedPtxModuleCache<usize>> = std::sync::OnceLock::new();
+            let ((warps, keys), (threads, rows, block_keys)) = (ATTENTION_FORWARD, ATTENTION_BACKWARD);
+            let source = |_| {
+                format!(
+                    "#define HEAD_W {width}\n#define FWD_WARPS {warps}\n#define FWD_KEYS {keys}\n#define BWD_WARPS {}\n#define BWD_ROWS {rows}\n#define BWD_KEYS {block_keys}\n#define MAX_SEQUENCES {ATTENTION_SEQUENCES}\n{KERNELS_ATTENTION}",
+                    threads / 32
                 )
             };
-            drop((ra, rb, rc, record_a, record_b, record_c, serial));
-            status.result().gpu_ctx("tensor batched GEMM")
+            let module = MODULES.get_or_init(crate::device_cache::KeyedPtxModuleCache::new).get_or_compile(&self.ctx, (self.ctx.ordinal() << 16) | width, "attention", source)?;
+            let f = module.load_function(name).gpu_ctx_with(|e| format!("attention kernel {name}: {e}"))?;
+            let bytes = i32::try_from(shared).map_err(|_| shape(format!("{shared} bytes of shared memory")))?;
+            f.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes).gpu_ctx("attention shared memory")?;
+            Ok(f)
         }
 
-        /// Every query head's causal softmax weights (bfloat16) from `y`: one batched product of
-        /// all (query head, sequence) scores, one softmax (`decoder.cu`).
-        fn attention_weights(&self, y: &CudaSlice<u16>, layout: super::HeadLayout, (blocks, length, columns): (usize, usize, usize), scale: f64) -> Result<CudaSlice<u16>, GpuError> {
-            let (w, group, count) = (layout.width, layout.queries / layout.keys, layout.queries * blocks * length);
-            // SAFETY: every score is written by the product before the softmax reads it.
-            let mut scores = unsafe { self.stream.alloc::<f32>((count * length).max(1)) }.gpu_ctx("tensor alloc")?;
-            // Row-major S = Q Kᵀ is column-major Sᵀ = K Qᵀ: K transposed, then Q as it is.
-            let entries: Vec<(usize, usize, usize)> = (0..layout.queries)
-                .flat_map(|h| (0..blocks).map(move |b| (b * length * columns + (layout.queries + h / group) * w, b * length * columns + h * w, (h * blocks + b) * length * length)))
-                .collect();
-            self.gemm_pointers((cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N), (length, length, w), (scale as f32, 0.0), [(y, columns), (y, columns)], (&mut scores, length), &entries)?;
-            // SAFETY: the softmax writes every weight and log partition.
-            let mut weights = unsafe { self.stream.alloc::<u16>((count * length).max(1)) }.gpu_ctx("tensor alloc")?;
-            let mut lse = unsafe { self.stream.alloc::<f32>(count.max(1)) }.gpu_ctx("tensor alloc")?;
-            let (rows, cols) = (u32_of(count)?, u32_of(length)?);
-            let f = self.decoder("causal_softmax")?;
-            // SAFETY: `count` rows of `length` scores and weights; one block per row.
-            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(&scores).arg(&mut weights).arg(&mut lse).launch(cfg_rows(count)) }
-                .gpu_ctx("decoder causal_softmax")?;
-            Ok(weights)
-        }
-
-        pub(super) fn causal_attention(&self, y: &Tensor, layout: super::HeadLayout, blocks: usize, scale: f64) -> Result<Tensor, GpuError> {
+        pub(super) fn causal_attention(&self, y: &Tensor, layout: super::HeadLayout, sequences: &[std::ops::Range<usize>], scale: f64) -> Result<(Tensor, Tensor), GpuError> {
             let Data::CudaBf16(yh) = &y.data else { return Err(mismatch(&y.data)) };
-            let (rows, columns, w, group) = (y.rows, y.cols, layout.width, layout.queries / layout.keys);
-            let (length, reads) = (rows / blocks, layout.queries * w);
-            let weights = self.attention_weights(yh, layout, (blocks, length, columns), scale)?;
-            let mut a = self.unset32(rows, reads)?;
-            // Row-major O = P V is column-major Oᵀ = Vᵀ Pᵀ: both as they are.
-            let entries: Vec<(usize, usize, usize)> = (0..layout.queries)
-                .flat_map(|h| (0..blocks).map(move |b| (b * length * columns + (layout.queries + layout.keys + h / group) * w, (h * blocks + b) * length * length, b * length * reads + h * w)))
-                .collect();
-            let Data::Cuda32(out) = &mut a.data else { return Err(mismatch(&a.data)) };
-            self.gemm_pointers((cublasOperation_t::CUBLAS_OP_N, cublasOperation_t::CUBLAS_OP_N), (w, length, length), (1.0, 0.0), [(yh, columns), (&weights, length)], (out, reads), &entries)?;
-            Ok(a)
+            let (w, padded) = (layout.width, attention_width(layout.width)?);
+            let (warps, keys) = ATTENTION_FORWARD;
+            let shared = (16 * warps + 2 * keys) * padded * 2;
+            let f = self.attention_kernel(w, "attention_forward", shared)?;
+            // Rows outside every sequence keep zeros.
+            let mut out = self.zeros16(y.rows * layout.queries * w)?;
+            let mut lse = self.zeros32(y.rows * layout.queries)?;
+            let (hq, hk, scale_log2) = (u32_of(layout.queries)?, u32_of(layout.keys)?, (scale * std::f64::consts::LOG2_E) as f32);
+            for chunk in sequences.chunks(ATTENTION_SEQUENCES) {
+                let (table, tiles) = attention_sequences(chunk, 16 * warps)?;
+                if tiles == 0 {
+                    continue;
+                }
+                let cfg = LaunchConfig { grid_dim: (u32_of(chunk.len() * layout.queries)?, tiles, 1), block_dim: (u32_of(32 * warps)?, 1, 1), shared_mem_bytes: u32_of(shared)? };
+                // SAFETY: the table's sequences are disjoint row ranges of y (checked by the caller);
+                // each block writes its own query rows of `out` and `lse`.
+                unsafe { self.stream.launch_builder(&f).arg(&table).arg(&hq).arg(&hk).arg(&scale_log2).arg(yh).arg(&mut out).arg(&mut lse).launch(cfg) }.gpu_ctx("attention forward")?;
+            }
+            Ok((Tensor { rows: y.rows, cols: layout.queries * w, data: Data::CudaBf16(out) }, Tensor { rows: y.rows, cols: layout.queries, data: Data::Cuda32(lse) }))
         }
 
-        pub(super) fn causal_attention_backward(&self, y: &Tensor, layout: super::HeadLayout, blocks: usize, scale: f64, ga: &Tensor) -> Result<Tensor, GpuError> {
-            let Data::CudaBf16(yh) = &y.data else { return Err(mismatch(&y.data)) };
-            let (rows, columns, w, group) = (y.rows, y.cols, layout.width, layout.queries / layout.keys);
-            let (length, reads) = (rows / blocks, layout.queries * w);
-            let weights = self.attention_weights(yh, layout, (blocks, length, columns), scale)?;
-            let gah = self.round_half(slice32(ga)?, 0, ga.len())?;
-            let count = layout.queries * blocks * length;
-            let block = move |h: usize, b: usize| (h * blocks + b) * length * length;
-            let at = move |b: usize, column: usize| b * length * columns + column;
-            let q0 = move |h: usize| h * w;
-            let k0 = move |h: usize| (layout.queries + h / group) * w;
-            let v0 = move |h: usize| (layout.queries + layout.keys + h / group) * w;
-            let every = |f: &dyn Fn(usize, usize) -> (usize, usize, usize), heads: &mut dyn Iterator<Item = usize>| -> Vec<(usize, usize, usize)> {
-                heads.flat_map(|h| (0..blocks).map(move |b| (h, b)).collect::<Vec<_>>()).map(|(h, b)| f(h, b)).collect()
-            };
-            // SAFETY: the product writes every weight cotangent before the softmax's reverse reads it.
-            let mut dp = unsafe { self.stream.alloc::<f32>((count * length).max(1)) }.gpu_ctx("tensor alloc")?;
-            // dP = gA Vᵀ: column-major dPᵀ = V gAᵀ.
-            let entries = every(&|h, b| (at(b, v0(h)), b * length * reads + q0(h), block(h, b)), &mut (0..layout.queries));
-            self.gemm_pointers((cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N), (length, length, w), (1.0, 0.0), [(yh, columns), (&gah, reads)], (&mut dp, length), &entries)?;
-            // SAFETY: the softmax's reverse writes every score cotangent.
-            let mut ds = unsafe { self.stream.alloc::<u16>((count * length).max(1)) }.gpu_ctx("tensor alloc")?;
-            let (n, cols) = (u32_of(count)?, u32_of(length)?);
-            let f = self.decoder("causal_softmax_backward")?;
-            // SAFETY: `count` rows of `length` weights and cotangents; one block per row.
-            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&cols).arg(&weights).arg(&dp).arg(&mut ds).launch(cfg_rows(count)) }
-                .gpu_ctx("decoder causal_softmax_backward")?;
-            drop(dp);
+        pub(super) fn causal_attention_backward(&self, y: &Tensor, layout: super::HeadLayout, sequences: &[std::ops::Range<usize>], scale: f64, (out, lse): (&Tensor, &Tensor), ga: &Tensor) -> Result<Tensor, GpuError> {
+            let (Data::CudaBf16(yh), Data::CudaBf16(outh)) = (&y.data, &out.data) else { return Err(mismatch(&out.data)) };
+            let (w, padded) = (layout.width, attention_width(layout.width)?);
+            let (rows, columns) = (y.rows, y.cols);
+            // D = Σ dO·O per row and query head, and dO as the products' bfloat16 operand.
+            let mut ga16 = self.unset16(rows, layout.queries * w)?;
+            let mut dsum = self.unset32(rows, layout.queries)?;
+            let rows_kernel = self.attention_kernel(w, "attention_backward_rows", 0)?;
+            let (n, hq, hk) = (u32_of(rows)?, u32_of(layout.queries)?, u32_of(layout.keys)?);
+            // SAFETY: rows × hq·w outputs and cotangents, rows × hq sums; one warp per (row, head).
+            unsafe {
+                self.stream
+                    .launch_builder(&rows_kernel)
+                    .arg(&n)
+                    .arg(&hq)
+                    .arg(outh)
+                    .arg(slice32(ga)?)
+                    .arg(match &mut ga16.data {
+                        Data::CudaBf16(h) => h,
+                        other => return Err(mismatch(other)),
+                    })
+                    .arg(slice32_mut(&mut dsum)?)
+                    .launch(cfg_elements((rows * layout.queries) as u64 * 32))
+            }
+            .gpu_ctx("attention backward rows")?;
+            let Data::CudaBf16(ga16h) = &ga16.data else { return Err(mismatch(&ga16.data)) };
+            let (threads, block_rows, keys) = ATTENTION_BACKWARD;
+            let shared = (2 * keys + 3 * block_rows) * padded * 2 + 2 * block_rows * keys * 2;
+            let f = self.attention_kernel(w, "attention_backward", shared)?;
             let mut gy = self.zeros32(rows * columns)?;
-            // dQ = c dS K (each query head its own columns): column-major dQᵀ = Kᵀ dSᵀ.
-            let entries = every(&|h, b| (at(b, k0(h)), block(h, b), at(b, q0(h))), &mut (0..layout.queries));
-            self.gemm_pointers((cublasOperation_t::CUBLAS_OP_N, cublasOperation_t::CUBLAS_OP_N), (w, length, length), (scale as f32, 0.0), [(yh, columns), (&ds, length)], (&mut gy, columns), &entries)?;
-            // A key-value head's cotangents sum over its group's query heads: one call per member, so
-            // no call writes one region twice. dV += Pᵀ gA (column-major dVᵀ = gAᵀ P); dK += c dSᵀ Q
-            // (column-major dKᵀ = Qᵀ dS).
-            for member in 0..group {
-                let heads = || (0..layout.keys).map(move |g| g * group + member);
-                let entries = every(&|h, b| (b * length * reads + q0(h), block(h, b), at(b, v0(h))), &mut heads());
-                self.gemm_pointers((cublasOperation_t::CUBLAS_OP_N, cublasOperation_t::CUBLAS_OP_T), (w, length, length), (1.0, 1.0), [(&gah, reads), (&weights, length)], (&mut gy, columns), &entries)?;
-                let entries = every(&|h, b| (at(b, q0(h)), block(h, b), at(b, k0(h))), &mut heads());
-                self.gemm_pointers((cublasOperation_t::CUBLAS_OP_N, cublasOperation_t::CUBLAS_OP_T), (w, length, length), (scale as f32, 1.0), [(yh, columns), (&ds, length)], (&mut gy, columns), &entries)?;
+            let scale32 = scale as f32;
+            for chunk in sequences.chunks(ATTENTION_SEQUENCES) {
+                let (table, tiles) = attention_sequences(chunk, keys)?;
+                if tiles == 0 {
+                    continue;
+                }
+                let cfg = LaunchConfig { grid_dim: (u32_of(chunk.len() * layout.keys)?, tiles, 1), block_dim: (u32_of(threads)?, 1, 1), shared_mem_bytes: u32_of(shared)? };
+                // SAFETY: as the forward; each block writes its own key rows' key and value columns and
+                // adds into its query rows' query columns atomically.
+                unsafe { self.stream.launch_builder(&f).arg(&table).arg(&hq).arg(&hk).arg(&scale32).arg(yh).arg(slice32(lse)?).arg(ga16h).arg(slice32(&dsum)?).arg(&mut gy).launch(cfg) }
+                    .gpu_ctx("attention backward")?;
             }
             Ok(Tensor { rows, cols: columns, data: Data::Cuda32(gy) })
         }
@@ -7700,13 +7759,13 @@ mod decoder_reference_tests {
             let gp = host.heads_rope_backward(&host_tensor(rows, layout.columns(), p.clone()), layout, Some((&gain_tensor, &k)), Some((&cos, &sin, half)), &host_tensor(rows, layout.columns(), gy.clone())).unwrap();
             agrees("heads", &p, &dir, host_values(&gp), |p| forward(p).0.iter().zip(&gy).map(|(a, b)| a * b).sum());
         }
-        // Attention with exact weights, grouped queries.
+        // Attention with exact weights, grouped queries, two sequences of unequal lengths and a row
+        // outside both.
         let layout = HeadLayout { queries: 4, keys: 2, width: 3 };
-        let (blocks, length) = (2, 5);
-        let rows = blocks * length;
+        let (rows, sequences) = (11, [0..4, 5..11]);
         let (y, ga, dir) = (values(rows * layout.columns(), 10), values(rows * 4 * 3, 11), values(rows * layout.columns(), 12));
-        let (_, gy) = host_attention_rounded(&y, layout, (blocks, length), 0.7, Some(&ga), Arithmetic::F64);
-        let attention = |y: &[f64]| host_attention_rounded(y, layout, (blocks, length), 0.7, None, Arithmetic::F64).0.iter().zip(&ga).map(|(a, b)| a * b).sum();
+        let (_, _, gy) = host_attention_rounded(&y, layout, (rows, &sequences), 0.7, Some(&ga), Arithmetic::F64);
+        let attention = |y: &[f64]| host_attention_rounded(y, layout, (rows, &sequences), 0.7, None, Arithmetic::F64).0.iter().zip(&ga).map(|(a, b)| a * b).sum();
         agrees("attention", &y, &dir, &gy, attention);
         // The activations.
         for (x, slope) in values(9, 13).iter().map(|x| (3.0 * x, host_gelu_tanh(3.0 * x).1)) {

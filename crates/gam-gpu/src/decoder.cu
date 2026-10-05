@@ -1,6 +1,6 @@
 // The decoder layer's fused kernels (`tensor::cuda::decoder`): an RMS norm with its gain, the
-// queries' and keys' per-head norms and rotation, the causal softmax of attention scores and the
-// MLP's activations, each forward and backward. Inputs and cotangents are f32; a product's operand
+// queries' and keys' per-head norms and rotation, and the MLP's activations, each forward and
+// backward (attention itself is `attention.cu`). Inputs and cotangents are f32; a product's operand
 // is written as bfloat16 (rounded to nearest, ties to even) where the next product reads it.
 #define BLOCK 256
 typedef unsigned long long u64;
@@ -20,11 +20,6 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
-__device__ __forceinline__ float warp_max(float v) {
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-    return v;
-}
-
 // The sum of every thread's `v` in a block of BLOCK threads.
 __device__ float block_sum(float v, float* shared) {
     v = warp_sum(v);
@@ -33,20 +28,6 @@ __device__ float block_sum(float v, float* shared) {
     __syncthreads();
     v = threadIdx.x < BLOCK / 32 ? shared[threadIdx.x] : 0.0f;
     if (warp == 0) v = warp_sum(v);
-    if (threadIdx.x == 0) shared[0] = v;
-    __syncthreads();
-    v = shared[0];
-    __syncthreads();
-    return v;
-}
-
-__device__ float block_max(float v, float* shared) {
-    v = warp_max(v);
-    unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
-    if (lane == 0) shared[warp] = v;
-    __syncthreads();
-    v = threadIdx.x < BLOCK / 32 ? shared[threadIdx.x] : -__int_as_float(0x7f800000);
-    if (warp == 0) v = warp_max(v);
     if (threadIdx.x == 0) shared[0] = v;
     __syncthreads();
     v = shared[0];
@@ -172,41 +153,6 @@ extern "C" __global__ void heads_rope_backward(unsigned int rows, unsigned int q
     __syncwarp();
     for (unsigned int i = lane; i < w; i += 32u) out[i] = k * out[i] * gamma[i] - coefficient * x[i];
     }
-}
-
-// Rows of attention scores s (rows × length; row r is position r mod length of its block, which
-// reads the positions up to its own): their causal softmax as bfloat16 probabilities, and each
-// row's log partition. One block per row.
-extern "C" __global__ void causal_softmax(unsigned int rows, unsigned int length, const float* s, unsigned short* probabilities, float* lse) {
-    __shared__ float shared[32];
-    unsigned int r = blockIdx.x;
-    if (r >= rows) return;
-    unsigned int position = r % length;
-    const float* z = s + (u64)r * length;
-    unsigned short* out = probabilities + (u64)r * length;
-    float m = -__int_as_float(0x7f800000);
-    for (unsigned int j = threadIdx.x; j <= position; j += BLOCK) m = fmaxf(m, z[j]);
-    m = block_max(m, shared);
-    float total = 0.0f;
-    for (unsigned int j = threadIdx.x; j <= position; j += BLOCK) total += expf(z[j] - m);
-    total = block_sum(total, shared);
-    for (unsigned int j = threadIdx.x; j < length; j += BLOCK) out[j] = j <= position ? to_bf16(expf(z[j] - m) / total) : (unsigned short)0;
-    if (threadIdx.x == 0) lse[r] = m + logf(total);
-}
-
-// The cotangent of the scores from the probabilities' (dp, f32): ds = p (dp − Σ p dp), bfloat16.
-extern "C" __global__ void causal_softmax_backward(unsigned int rows, unsigned int length, const unsigned short* probabilities, const float* dp, unsigned short* ds) {
-    __shared__ float shared[32];
-    unsigned int r = blockIdx.x;
-    if (r >= rows) return;
-    unsigned int position = r % length;
-    const unsigned short* p = probabilities + (u64)r * length;
-    const float* g = dp + (u64)r * length;
-    float dot = 0.0f;
-    for (unsigned int j = threadIdx.x; j <= position; j += BLOCK) dot += from_bf16(p[j]) * g[j];
-    dot = block_sum(dot, shared);
-    unsigned short* out = ds + (u64)r * length;
-    for (unsigned int j = threadIdx.x; j < length; j += BLOCK) out[j] = j <= position ? to_bf16(from_bf16(p[j]) * (g[j] - dot)) : (unsigned short)0;
 }
 
 __device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
