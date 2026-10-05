@@ -4,10 +4,10 @@ From compare's held-out cancellation run (vpd_battery.py OUT.json cancellation 1
 per token in nats, where E is VPD's published decomposition (goodfire/spd/runs/s-55ea3f9b) with, per
 token, every subcomponent whose causal importance is 0 removed (VPD's own CI > 0 cutoff, the one
 behind its count of 205 active per token) in the named layers, and the model's own weights elsewhere.
-The last bar of each panel removes from layers l and 3, but subtracts from layer 3's output only
-what the removal subtracts in a run with layer l intact, so layer 3's removed subcomponents no
-longer respond to the change that removal at layer l makes. That bar rising above the others shows
-the smaller error of the third bar comes from those subcomponents' response.
+Let U be the output of layer 3's importance-0 subcomponents (what removing from layer 3 deletes),
+and dU the change in U when removal at layer l changes layer 3's input. The hatched bar is layer l
+only with dU subtracted: most of layer l's error is dU, produced in layer 3 by subcomponents VPD
+scores as unimportant, which is why removing from layer 3 as well (deleting U, dU with it) lowers it.
 
     python bench/figures_2951/vpd_cancellation_fig.py CANCELLATION.json OUT.png
 """
@@ -36,10 +36,10 @@ fig, axes = plt.subplots(1, 3, figsize=(22, 8), facecolor=SURFACE, sharey=True,
 for ax, l in zip(axes, [0, 1, 2]):
     ax.set_facecolor(SURFACE)
     bars = [(f"layer {l}\nonly", kl(l), BLUE, None),
+            (f"layer {l} only,\nminus the change\nit causes in the\noutput of layer 3's\nimportance-0\nsubcomponents",
+             kl(f"{l}_without_I"), BLUE, "//"),
             ("layer 3\nonly", kl(3), GRAY, None),
-            (f"layers {l}\nand 3", kl(f"{l}3"), ORANGE, None),
-            (f"layers {l} and 3,\nbut layer 3 loses\nonly what it loses\nwhen layer {l}\nis intact",
-             kl(f"{l}3_no_interaction"), ORANGE, "//")]
+            (f"layers {l}\nand 3", kl(f"{l}3"), ORANGE, None)]
     for i, (name, value, color, hatch) in enumerate(bars):
         ax.bar(i, value, 0.72, color=color, edgecolor=SURFACE, linewidth=2, hatch=hatch)
         ax.annotate(f"{value:.2f}", (i, value), xytext=(0, 8), textcoords="offset points",
@@ -47,8 +47,8 @@ for ax, l in zip(axes, [0, 1, 2]):
     ax.set_xticks(range(len(bars)))
     ax.set_xticklabels([b[0] for b in bars], fontsize=15)
     ax.tick_params(axis="x", length=0)
-    ax.set_ylim(0, 1.2)
+    ax.set_ylim(0, 0.8)
 axes[0].set_ylabel("KL from the model's next-token predictions\n(nats per token; 0 = identical)")
-fig.supxlabel("VPD's subcomponents with causal importance 0 removed from", fontsize=19, y=-0.13)
+fig.supxlabel("VPD's subcomponents with causal importance 0 removed from", fontsize=19, y=-0.15)
 fig.savefig(out, dpi=170, facecolor=SURFACE, bbox_inches="tight")
 print(out)
