@@ -2389,7 +2389,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.causal_attention(y, layout, sequences, scale),
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+            Backend::Metal(engine) => engine.causal_attention(y, layout, sequences, scale),
         }
     }
 
@@ -2409,7 +2409,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.causal_attention_backward(y, layout, sequences, scale, (out, lse), ga),
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+            Backend::Metal(engine) => engine.causal_attention_backward(y, layout, sequences, scale, (out, lse), ga),
         }
     }
 
@@ -7420,6 +7420,133 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
         "t_code_rows",
     ];
 
+    /// The definitions `attention_f32.inc` takes from its backend, in Metal.
+    const ATTENTION: &str = r#"
+#define GLOBAL device
+#define SHARED threadgroup
+#define CONSTANT constant
+#define BARRIER() threadgroup_barrier(mem_flags::mem_threadgroup)
+#define SHUFFLE_XOR(v, m) simd_shuffle_xor((v), (ushort)(m))
+#define EXP2(x) exp2(x)
+#define LOG2(x) log2(x)
+#define FMA(a, b, c) fma((a), (b), (c))
+#define FMAX(a, b) fmax((a), (b))
+#define NEG_INF (-INFINITY)
+#define POS_INF (INFINITY)
+typedef float4 f4;
+#define F4(a, b, c, d) float4((a), (b), (c), (d))
+#define LOAD4(p) (*((threadgroup const float4*)(p)))
+#define STORE4(p, v) (*((threadgroup float4*)(p)) = (v))
+#define COPY4(dst, src) (*((threadgroup float4*)(dst)) = *((device const float4*)(src)))
+#define COPY_COMMIT()
+#define COPY_WAIT()
+typedef uint u32;
+typedef ulong u64;
+#define MAX_SEQUENCES 480
+"#;
+
+    /// Attention's kernels on the Apple GPU: each threadgroup takes the items `group`, `group +
+    /// groups`, ...; item `i` is (sequence, head) pair `i mod pairs` and tile `i / pairs` (the longest
+    /// sweeps first). Tiles fit the 32 KB of threadgroup memory: the forward's blocks hold 16 query
+    /// rows and take 16 keys at a time; the reverse's 16 key rows and 8 query rows at a time, or 16
+    /// query rows and 8 keys.
+    const ATTENTION_KERNELS: &str = r#"
+struct AttentionParams { uint hq; uint hk; uint w; float scale; uint pairs; uint items; uint rows; uint unused; Sequences sequences; };
+
+#define ATTENTION_KERNELS(D) \
+kernel void t_attention_forward_##D(device const float* y [[buffer(0)]], device float* out [[buffer(1)]], device float* lse [[buffer(2)]], \
+    constant AttentionParams& p [[buffer(3)]], uint group [[threadgroup_position_in_grid]], uint groups [[threadgroups_per_grid]], \
+    uint t [[thread_index_in_threadgroup]]) { \
+    threadgroup float smem[(16 + 2 * 16) * TILE_STRIDE(D) + 16 * (16 + 4)]; \
+    for (uint item = group; item < p.items; item += groups) { \
+        forward_body<D, 16, 16, 256, 1>(p.sequences, p.hq, p.hk, p.w, p.scale * 1.4426950408889634f, y, out, lse, item % p.pairs, item / p.pairs, t, 256u, smem); \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+} \
+kernel void t_attention_keys_##D(device const float* y [[buffer(0)]], device const float* lse [[buffer(1)]], device const float* ga [[buffer(2)]], \
+    device const float* dsum [[buffer(3)]], device float* gy [[buffer(4)]], constant AttentionParams& p [[buffer(5)]], \
+    uint group [[threadgroup_position_in_grid]], uint groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]]) { \
+    threadgroup float smem[(2 * 16 + 2 * 8) * TILE_STRIDE(D) + 2 * 16 * (8 + 4) + 2 * 8]; \
+    for (uint item = group; item < p.items; item += groups) { \
+        keys_body<D, 16, 8, 128, 1>(p.sequences, p.hq, p.hk, p.w, p.scale, y, lse, ga, dsum, gy, item % p.pairs, item / p.pairs, t, 256u, smem); \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+} \
+kernel void t_attention_queries_##D(device const float* y [[buffer(0)]], device const float* lse [[buffer(1)]], device const float* ga [[buffer(2)]], \
+    device const float* dsum [[buffer(3)]], device float* gy [[buffer(4)]], constant AttentionParams& p [[buffer(5)]], \
+    uint group [[threadgroup_position_in_grid]], uint groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]]) { \
+    threadgroup float smem[(2 * 16 + 2 * 8) * TILE_STRIDE(D) + 16 * (8 + 4)]; \
+    for (uint item = group; item < p.items; item += groups) { \
+        queries_body<D, 16, 8, 128, 1>(p.sequences, p.hq, p.hk, p.w, p.scale, y, lse, ga, dsum, gy, item % p.pairs, item / p.pairs, t, 256u, smem); \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+}
+
+ATTENTION_KERNELS(64)
+ATTENTION_KERNELS(128)
+
+kernel void t_attention_sums(device const float* out [[buffer(0)]], device const float* ga [[buffer(1)]], device float* dsum [[buffer(2)]],
+    constant AttentionParams& p [[buffer(3)]], uint group [[threadgroup_position_in_grid]], uint groups [[threadgroups_per_grid]],
+    uint t [[thread_index_in_threadgroup]]) {
+    sums_body(p.rows, p.hq, p.w, out, ga, dsum, group * 256u + t, groups * 256u);
+}
+"#;
+
+    const ATTENTION_NAMES: &[&str] = &[
+        "t_attention_forward_64",
+        "t_attention_keys_64",
+        "t_attention_queries_64",
+        "t_attention_forward_128",
+        "t_attention_keys_128",
+        "t_attention_queries_128",
+        "t_attention_sums",
+    ];
+
+    /// The sequences one attention dispatch takes (`MAX_SEQUENCES`: the parameters, sequences
+    /// included, are set as bytes of at most 4 KB).
+    const ATTENTION_SEQUENCES: usize = 480;
+
+    /// MSL `AttentionParams`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct AttentionParams {
+        hq: u32,
+        hk: u32,
+        w: u32,
+        scale: f32,
+        pairs: u32,
+        items: u32,
+        rows: u32,
+        unused: u32,
+        count: u32,
+        start: [u32; ATTENTION_SEQUENCES],
+        length: [u32; ATTENTION_SEQUENCES],
+    }
+
+    impl AttentionParams {
+        /// The parameters of a dispatch over `sequences` (at most [`ATTENTION_SEQUENCES`]) with
+        /// `heads` heads per sequence and tiles of `tile` rows.
+        fn new(layout: super::HeadLayout, (rows, sequences): (usize, &[std::ops::Range<usize>]), scale: f64, (heads, tile): (usize, usize)) -> Result<Self, GpuError> {
+            let mut p = Self { hq: u32_of(layout.queries)?, hk: u32_of(layout.keys)?, w: u32_of(layout.width)?, scale: scale as f32, pairs: 0, items: 0, rows: u32_of(rows)?, unused: 0, count: u32_of(sequences.len())?, start: [0; ATTENTION_SEQUENCES], length: [0; ATTENTION_SEQUENCES] };
+            for (i, r) in sequences.iter().enumerate() {
+                (p.start[i], p.length[i]) = (u32_of(r.start)?, u32_of(r.len())?);
+            }
+            let tiles = sequences.iter().map(|r| r.len().div_ceil(tile)).max().unwrap_or(0);
+            p.pairs = u32_of(sequences.len() * heads)?;
+            p.items = u32_of(sequences.len() * heads * tiles)?;
+            Ok(p)
+        }
+    }
+
+    /// The kernel suffix of heads of `width` columns (their tiles' width).
+    fn attention_width(width: usize) -> Result<usize, GpuError> {
+        match width {
+            1..=64 => Ok(64),
+            65..=128 => Ok(128),
+            _ => Err(GpuError::NoDeviceKernel { reason: format!("attention heads of {width} columns (the kernels take at most 128)") }),
+        }
+    }
+
     /// The parameters of every kernel (MSL `P`).
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -7499,7 +7626,9 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
             static ENGINE: std::sync::OnceLock<Result<std::sync::Arc<super::Backend>, GpuError>> = std::sync::OnceLock::new();
             ENGINE
                 .get_or_init(|| {
-                    let stream = Stream::new(&runtime.context, KERNELS, NAMES)?;
+                    let source = [KERNELS, ATTENTION, include_str!("attention_f32.inc"), ATTENTION_KERNELS].concat();
+                    let names: Vec<&'static str> = NAMES.iter().chain(ATTENTION_NAMES).copied().collect();
+                    let stream = Stream::new(&runtime.context, &source, &names)?;
                     let every_row = stream.alloc(1)?;
                     let name = format!("{} (Metal, f32)", stream.device_name());
                     Ok(std::sync::Arc::new(super::Backend::Metal(Self { name, stream, every_row })))
@@ -7521,6 +7650,43 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
             p.rows = u32_of(rows)?;
             p.cols = u32_of(cols)?;
             self.stream.dispatch(kernel, buffers, &p, rows)
+        }
+
+        /// [`super::Device::causal_attention`] in f32 (`attention_f32.inc`); rows outside every
+        /// sequence keep the zeros a new buffer holds.
+        pub(super) fn causal_attention(&self, y: &Tensor, layout: super::HeadLayout, sequences: &[std::ops::Range<usize>], scale: f64) -> Result<(Tensor, Tensor), GpuError> {
+            let kernel = match attention_width(layout.width)? {
+                64 => "t_attention_forward_64",
+                _ => "t_attention_forward_128",
+            };
+            let out = self.tensor(y.rows, layout.queries * layout.width)?;
+            let lse = self.tensor(y.rows, layout.queries)?;
+            for chunk in sequences.chunks(ATTENTION_SEQUENCES) {
+                let p = AttentionParams::new(layout, (y.rows, chunk), scale, (layout.queries, 16))?;
+                self.stream.dispatch(kernel, &[whole(buffer(y)?), whole(buffer(&out)?), whole(buffer(&lse)?)], &p, p.items as usize)?;
+            }
+            Ok((out, lse))
+        }
+
+        /// [`super::Device::causal_attention_backward`] in f32: D = Σ dO·O per row and head, then the
+        /// keys' and values' cotangents by blocks of key rows and the queries' by blocks of query rows.
+        pub(super) fn causal_attention_backward(&self, y: &Tensor, layout: super::HeadLayout, sequences: &[std::ops::Range<usize>], scale: f64, (out, lse): (&Tensor, &Tensor), ga: &Tensor) -> Result<Tensor, GpuError> {
+            let (keys, queries) = match attention_width(layout.width)? {
+                64 => ("t_attention_keys_64", "t_attention_queries_64"),
+                _ => ("t_attention_keys_128", "t_attention_queries_128"),
+            };
+            let dsum = self.tensor(y.rows, layout.queries)?;
+            let gy = self.tensor(y.rows, y.cols)?;
+            let rows = AttentionParams::new(layout, (y.rows, &[]), scale, (layout.queries, 1))?;
+            self.stream.dispatch("t_attention_sums", &[whole(buffer(out)?), whole(buffer(ga)?), whole(buffer(&dsum)?)], &rows, spread(y.rows * layout.queries * 32))?;
+            let operands = [whole(buffer(y)?), whole(buffer(lse)?), whole(buffer(ga)?), whole(buffer(&dsum)?), whole(buffer(&gy)?)];
+            for chunk in sequences.chunks(ATTENTION_SEQUENCES) {
+                for (kernel, heads) in [(keys, layout.keys), (queries, layout.queries)] {
+                    let p = AttentionParams::new(layout, (y.rows, chunk), scale, (heads, 16))?;
+                    self.stream.dispatch(kernel, &operands, &p, p.items as usize)?;
+                }
+            }
+            Ok(gy)
         }
 
         pub(super) fn copy_range(&self, source: &Buffer, lo: usize, hi: usize) -> Result<Buffer, GpuError> {

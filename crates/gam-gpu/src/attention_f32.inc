@@ -55,11 +55,11 @@ inline void load_tile(SHARED float* tile, GLOBAL const float* src, u64 stride, u
 }
 
 // The maximum and the sum over the `group` consecutive lanes holding a row (a power of two ≤ 32).
-inline float group_max(float v, u32 group) {
+inline float lane_max(float v, u32 group) {
     for (u32 o = 1u; o < group; o <<= 1) v = FMAX(v, SHUFFLE_XOR(v, o));
     return v;
 }
-inline float group_sum(float v, u32 group) {
+inline float lane_sum(float v, u32 group) {
     for (u32 o = 1u; o < group; o <<= 1) v += SHUFFLE_XOR(v, o);
     return v;
 }
@@ -128,7 +128,7 @@ inline void forward_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, f
                     s[i][j] = key > row || key >= length ? NEG_INF : s[i][j] * scale_log2;
                     mx = FMAX(mx, s[i][j]);
                 }
-                mx = group_max(mx, CG);
+                mx = lane_max(mx, CG);
                 const float base = mx == NEG_INF ? 0.0f : mx;
                 const float alpha = EXP2(m[i] - base);
                 m[i] = mx;
@@ -171,7 +171,7 @@ inline void forward_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, f
     if (!computes) return;
     const u32 reads = hq * w;
     for (u32 i = 0; i < TR; ++i) {
-        const float total = group_sum(l[i], CG);
+        const float total = lane_sum(l[i], CG);
         const u32 row = q0 + g + RG * i;
         if (row >= length) continue;
         const float inverse = 1.0f / total;
@@ -194,7 +194,7 @@ inline void sums_body(u32 rows, u32 hq, u32 w, GLOBAL const float* out, GLOBAL c
         const u64 base = item * w;
         float s = 0.0f;
         for (u32 c = lane; c < w; c += 32u) s = FMA(ga[base + c], out[base + c], s);
-        s = group_sum(s, 32u);
+        s = lane_sum(s, 32u);
         if (lane == 0u) dsum[item] = s;
     }
 }
