@@ -256,8 +256,9 @@ struct MlpBlock {
     gate: Array2<f64>,
     bias: Array1<f64>,
     out: Array2<f64>,
-    /// A gated MLP's up map: its rule node and matrix.
+    /// A gated MLP's up map: its rule node and matrix, and its bias (zero where there is none).
     up: Option<(usize, Array2<f64>)>,
+    up_bias: Array1<f64>,
 }
 
 /// A head's query or key read: the rule node of its projection, the projection's map, and the
@@ -304,12 +305,13 @@ fn operator_of(program: &OperatorProgram, rule: &Rule, node: usize) -> Result<(A
 fn mlp_block(program: &OperatorProgram, rule: &Rule, layer: usize, call: usize) -> Result<MlpBlock, String> {
     let Node::Affine { terms, bias: None } = &rule.nodes[rule.output] else { return Err(format!("{}: the output is not one map", rule.name)) };
     let [(activation, out)] = terms[..] else { return Err(format!("{}: the output reads more than the activations", rule.name)) };
-    let (gate_active, up) = match &rule.nodes[activation] {
-        Node::Pointwise { .. } => (activation, None),
+    let (gate_active, up, up_bias) = match &rule.nodes[activation] {
+        Node::Pointwise { .. } => (activation, None, None),
         Node::Hadamard { left, right } => {
             let law = [*left, *right].into_iter().find(|n| matches!(rule.nodes[*n], Node::Pointwise { .. })).ok_or("a gated MLP without a law")?;
             let up = if law == *left { *right } else { *left };
-            (law, Some((up, operator_of(program, rule, up)?.0)))
+            let (map, bias) = operator_of(program, rule, up)?;
+            (law, Some((up, map)), bias)
         }
         other => return Err(format!("{}: activations are {other:?}", rule.name)),
     };
@@ -319,7 +321,11 @@ fn mlp_block(program: &OperatorProgram, rule: &Rule, layer: usize, call: usize) 
         Some(op) => program.operators[op].matrix().column(0).to_owned(),
         None => Array1::zeros(gate.nrows()),
     };
-    Ok(MlpBlock { layer, call, activation, gate_pre, gate, bias, out: program.operators[out].matrix(), up })
+    let up_bias = match up_bias {
+        Some(op) => program.operators[op].matrix().column(0).to_owned(),
+        None => Array1::zeros(gate.nrows()),
+    };
+    Ok(MlpBlock { layer, call, activation, gate_pre, gate, bias, out: program.operators[out].matrix(), up, up_bias })
 }
 
 fn head_block(program: &OperatorProgram, rule: &Rule, layer: usize, head: usize, call: usize, output: Array2<f64>) -> Result<HeadBlock, String> {
@@ -561,13 +567,23 @@ struct Visit<'v> {
 }
 
 /// One cut's completeness: the sum of its functions' attributions, the attribution `Σ ∂m/∂x · x`
-/// of the residual stream entering it along the skip connection, and their total against `m`.
+/// of the residual stream entering it along the skip connection, and the attribution of the
+/// biases of the functions after it; in the linearized network the three sum to `m`.
 #[derive(Clone, Debug, Serialize)]
 pub struct CutCheck {
     pub name: String,
     pub functions: f64,
     pub stream: f64,
+    pub biases: f64,
     pub metric: f64,
+}
+
+impl CutCheck {
+    /// `|functions + stream + biases − m| / |m|`.
+    #[must_use]
+    pub fn gap(&self) -> f64 {
+        ((self.functions + self.stream + self.biases - self.metric) / self.metric.abs()).abs()
+    }
 }
 
 /// A layer's gradients of the metric in the linearized network (`Prompt::gradients`): with
@@ -953,11 +969,10 @@ impl<'a> Library<'a> {
         Ok(PromptAttribution { metric, predicted: predicted.into_iter().map(|t| t as u32).collect(), attributions, outputs, gradients })
     }
 
-    /// RelP's completeness on `prompt` (no baseline): at every cut, its functions' attributions
-    /// and the skip connection's `Σ ∂m/∂x · x` against `m` (summed over positions), and finally the
-    /// embedding stream's `Σ ∂m/∂x · x` alone, named `embedding`. In the linearized network each
-    /// total equals `m` up to the bias terms of the functions after the cut (none in a bias-free
-    /// model) and rounding.
+    /// RelP's completeness on `prompt` (no baseline): at every cut, its functions' attributions,
+    /// the skip connection's `Σ ∂m/∂x · x` and the biases after it against `m` (summed over
+    /// positions), and finally the embedding stream's, named `embedding`. In the linearized network
+    /// each total equals `m` up to rounding.
     pub fn completeness(&self, prompt: &Prompt) -> Result<Vec<CutCheck>, String> {
         let pass = self.pass(&[&prompt.tokens])?;
         let (seed, metric) = match &prompt.metric {
@@ -976,15 +991,21 @@ impl<'a> Library<'a> {
                 (seed, m)
             }
         };
-        let mut checks = Vec::new();
+        let (mut checks, mut biases) = (Vec::new(), 0.0);
         let embedding = self.relp(&pass, seed, None, false, &mut |visit| {
             let (name, site) = match visit.cut {
                 Cut::Mlp(b) => (format!("L{}.mlp", self.mlps[b].layer), 2 * self.mlps[b].layer + 1),
                 Cut::Heads(l, _) => (format!("L{l}.heads"), 2 * l),
             };
-            checks.push(CutCheck { name, functions: visit.attribution.sum(), stream: (visit.after * &pass.streams[site]).sum(), metric });
+            checks.push(CutCheck { name, functions: visit.attribution.sum(), stream: (visit.after * &pass.streams[site]).sum(), biases, metric });
+            // A function's pre-activation bias c enters h through the frozen factor as the
+            // gradient with respect to the pre-activation times c.
+            if let (Cut::Mlp(b), Reads::Mlp { gate, up }) = (&visit.cut, &visit.reads) {
+                let block = &self.mlps[*b];
+                biases += gate.dot(&block.bias).sum() + up.map_or(0.0, |u| u.dot(&block.up_bias).sum());
+            }
         });
-        checks.push(CutCheck { name: "embedding".into(), functions: 0.0, stream: (&embedding * &pass.streams[0]).sum(), metric });
+        checks.push(CutCheck { name: "embedding".into(), functions: 0.0, stream: (&embedding * &pass.streams[0]).sum(), biases, metric });
         Ok(checks)
     }
 }
@@ -1610,7 +1631,7 @@ mod tests {
             for metric in [Metric::Predicted, Metric::Difference { position: 4 + i, target: 1, foil: 2 }] {
                 let prompt = Prompt { tokens: sequence.to_vec(), baseline: None, metric, gradients: false };
                 for check in library.completeness(&prompt).expect("completeness") {
-                    largest = largest.max(((check.functions + check.stream - check.metric) / check.metric.abs()).abs());
+                    largest = largest.max(check.gap());
                 }
             }
         }

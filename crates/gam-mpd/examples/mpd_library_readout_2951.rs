@@ -201,7 +201,7 @@ fn complete(args: &[String]) -> Result<(), String> {
     let mut checks = Vec::new();
     for prompt in &prompts.prompts {
         let cut = library.completeness(prompt)?;
-        largest = cut.iter().fold(largest, |m, c| m.max(((c.functions + c.stream - c.metric) / c.metric.abs()).abs()));
+        largest = cut.iter().fold(largest, |m, c| m.max(c.gap()));
         checks.push(cut);
     }
     let report = json!({
