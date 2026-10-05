@@ -35,15 +35,14 @@
 //!
 //! A unit is a group with the groups its removal kills, transitively (removals only add zeros):
 //! the gate, up direction and output of an MLP function form one unit, since removing any of them
-//! silences the function. At a converged posterior the change of `F` (nats) from removing a group
-//! `G` follows from the posterior itself. With the data term's curvature `H_jj = 1/σ_j² − 1/v_G`
-//! (the stationarity of `F` in `σ_j`) and its gradient `−μ_j / v_G` (the stationarity in `μ_j`),
-//! the second-order change of the expected data term when `G`'s entries become exactly zero is
-//! `Σ_{j∈G} (μ_j²/v_G + ½ H_jj μ_j² − ½ H_jj σ_j²) = ½ Σ_{j∈G} μ_j²/σ_j²` (with
-//! `v_G = mean(μ² + σ²)`), while the description falls by `KL_G + ½ ln |G|`. A unit's prediction
-//! is the mean of its roots' data estimates (each root's removal silences the same functions)
-//! minus the description of all its groups. The units predicted to lower `F` are ranked by the
-//! prediction, most negative first.
+//! silences the function. At a converged posterior the data term's gradient in `μ_j` is
+//! `−μ_j / v_G` (the stationarity of `F` in `μ_j`), and its curvature is the Gauss–Newton matrix
+//! `H`, measured through sampled-label gradients (`library_mdl`'s module note, [`Curvature`]): the
+//! second-order change of the expected data term when `G`'s entries become exactly zero is
+//! `Σ_{j∈G} μ_j²/v_G + ½ μ_Gᵀ H μ_G − ½ Σ_{j∈G} H_jj σ_j²` ([`Posterior::removal_data`]), while
+//! the description falls by the group's cost. A unit's prediction is the mean of its roots' data
+//! estimates (each root's removal silences the same functions) minus the description of all its
+//! groups. The units predicted to lower `F` are ranked by the prediction, most negative first.
 //!
 //! # The search
 //!
@@ -64,7 +63,7 @@
 use crate::{
     interchange,
     library_compensation::Compensation,
-    library_mdl::{Explanation, Outcome, Posterior, Removal},
+    library_mdl::{Curvature, Explanation, Outcome, Posterior, Removal},
     operator_program::{Interface, Law, Node, OperatorBody, OperatorProgram},
     resident_causal_fit::fixed_head_target::Head,
     run_check::LayerNodes,
@@ -787,6 +786,7 @@ pub fn round(
     explanation: &Explanation,
     posterior: &mut Posterior,
     compensation: Option<&Compensation>,
+    curvature: &Curvature,
     objective: &mut dyn FnMut(&Posterior) -> Result<f64, String>,
     log: Option<&Path>,
 ) -> Result<Removal, String> {
@@ -837,9 +837,10 @@ pub fn round(
             let costs = posterior.costs();
             let divergences = posterior.divergences();
             let summary = summaries(explanation, posterior)?;
+            let data_rise = posterior.removal_data(curvature);
             let mut units = structure.units(&posterior.active)?;
             for unit in &mut units {
-                let data = unit.roots.iter().map(|g| 0.5 * summary[*g].signal).sum::<f64>() / unit.roots.len() as f64;
+                let data = unit.roots.iter().map(|g| data_rise[*g]).sum::<f64>() / unit.roots.len() as f64;
                 unit.predicted = data - unit.groups.iter().map(|g| costs[*g]).sum::<f64>();
             }
             journal.write(json!({
@@ -847,7 +848,7 @@ pub fn round(
                 "groups": (0..posterior.active.len()).filter(|g| posterior.active[*g]).map(|g| json!({
                     "id": g, "name": explanation.groups[g].name, "layer": layer(&explanation.groups[g].name),
                     "size": explanation.groups[g].cells.iter().map(|c| c.rows.len() * c.cols.len()).sum::<usize>(),
-                    "kl_bits": divergences[g] / LN_2, "cost_bits": costs[g] / LN_2, "signal": summary[g].signal,
+                    "kl_bits": divergences[g] / LN_2, "cost_bits": costs[g] / LN_2, "signal": summary[g].signal, "data_rise_bits": data_rise[g] / LN_2,
                     "mean_abs_mu": summary[g].mean_abs, "rms_sigma": summary[g].rms_sd,
                 })).collect::<Vec<Value>>(),
                 "units": units.iter().map(|u| json!({"groups": u.groups, "roots": u.roots, "predicted_bits": u.predicted / LN_2})).collect::<Vec<Value>>(),
@@ -1052,6 +1053,51 @@ mod tests {
         program.device().download(trace.value(program.hidden()).expect("the hidden value")).expect("the download")
     }
 
+    /// The curvature at which `posterior`'s `σ` is stationary, `H_jj = 1/σ_j² − 1/v_G` on the
+    /// diagonal: the removal estimates then rank a group by `½ Σ μ_j²/σ_j²`.
+    fn stationary(explanation: &Explanation, posterior: &Posterior) -> Curvature {
+        let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
+        let mut curvature = Curvature::new(explanation.groups.len());
+        for (g, group) in explanation.groups.iter().enumerate() {
+            let entries: Vec<(f64, f64)> = group
+                .cells
+                .iter()
+                .flat_map(|cell| cell.rows.iter().flat_map(move |r| cell.cols.clone().map(move |c| (cell.operator, *r, c))))
+                .map(|(op, r, c)| (posterior.mean[position[&op]][[r, c]], (2.0 * posterior.log_sd[position[&op]][[r, c]]).exp()))
+                .filter(|(_, variance)| *variance > 0.0)
+                .collect();
+            let prior = entries.iter().map(|(mu, variance)| mu * mu + variance).sum::<f64>() / entries.len().max(1) as f64;
+            for (mu, variance) in entries {
+                let h = 1.0 / variance - 1.0 / prior;
+                curvature.quadratic[g] += h * mu * mu;
+                curvature.noise[g] += h * variance;
+            }
+        }
+        curvature
+    }
+
+    /// The measured curvature of `posterior` on the evidence: one sampled-label draw per batch at
+    /// the posterior mean, weighted by `weight`.
+    fn measured(ic: &mut Interchange, explanation: &Explanation, posterior: &Posterior, evidence: &[Evidence], weight: f64, rng: &mut StdRng) -> Curvature {
+        use rand::RngExt;
+        ic.load(&posterior.means()).expect("the means load");
+        let mut curvature = Curvature::new(explanation.groups.len());
+        for e in evidence {
+            let rows: usize = e.experiments.iter().map(|x| e.batch.length() - x.position).sum();
+            let uniforms: Vec<f64> = (0..rows).map(|_| rng.random::<f64>()).collect();
+            let gradient = ic.sampled_label_resident(&e.batch, &e.experiments, &e.design, &uniforms).expect("the sampled-label gradient");
+            let d = ic.models().1.program.device();
+            let u: Vec<Array2<f64>> = explanation
+                .trainable
+                .iter()
+                .zip(&posterior.mean)
+                .map(|(op, mean)| gradient.get(op).map_or_else(|| Array2::zeros(mean.dim()), |g| d.download(g).expect("the download")))
+                .collect();
+            posterior.add_curvature(&u, weight, &mut curvature).expect("the draw");
+        }
+        curvature
+    }
+
     fn interchange(native: &OperatorProgram, layers: &[LayerNodes], explanation: &Explanation, device: &Device) -> Interchange {
         let reads = interchange::library_reads(&explanation.artifact.program, layers.len()).expect("the reads");
         Interchange::new(device, native, layers, &explanation.artifact, &explanation.trainable, reads, 1 << 30, 64).expect("the experiments")
@@ -1159,9 +1205,10 @@ mod tests {
             Ok(data + trial.description())
         };
         let log = std::env::temp_dir().join(format!("gam_mpd_removal_continue_{}.jsonl", std::process::id()));
-        let ranked = round(Search::Ranked, &explanation, &mut posterior, None, &mut objective, Some(&log)).expect("the ranked search");
+        let curvature = stationary(&explanation, &start);
+        let ranked = round(Search::Ranked, &explanation, &mut posterior, None, &curvature, &mut objective, Some(&log)).expect("the ranked search");
         let mut prefix_posterior = start.clone();
-        let prefix = round(Search::Prefix, &explanation, &mut prefix_posterior, None, &mut objective, None).expect("the prefix search");
+        let prefix = round(Search::Prefix, &explanation, &mut prefix_posterior, None, &curvature, &mut objective, None).expect("the prefix search");
         for g in free.iter() {
             assert!(!posterior.active[*g], "{} survived the ranked search", explanation.groups[*g].name);
         }
@@ -1242,9 +1289,10 @@ mod tests {
         let start = posterior.clone();
         let costs = start.costs();
         let compensation = Compensation::new(&mut ic, &explanation, &start, &sequences, 2).expect("the compensation");
-        let ranked = round(Search::Ranked, &explanation, &mut posterior, Some(&compensation), &mut |p: &Posterior| objective(&mut ic, p), None).expect("the ranked search");
+        let curvature = measured(&mut ic, &explanation, &start, &evidence, weight, &mut rng);
+        let ranked = round(Search::Ranked, &explanation, &mut posterior, Some(&compensation), &curvature, &mut |p: &Posterior| objective(&mut ic, p), None).expect("the ranked search");
         let mut prefix_posterior = start.clone();
-        let prefix = round(Search::Prefix, &explanation, &mut prefix_posterior, Some(&compensation), &mut |p: &Posterior| objective(&mut ic, p), None).expect("the prefix search");
+        let prefix = round(Search::Prefix, &explanation, &mut prefix_posterior, Some(&compensation), &curvature, &mut |p: &Posterior| objective(&mut ic, p), None).expect("the prefix search");
         for g in &planted {
             assert!(!posterior.active[*g], "{} survived", explanation.groups[*g].name);
         }

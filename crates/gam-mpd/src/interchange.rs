@@ -1243,6 +1243,59 @@ pub fn evaluate<E: BlockEngine>(m: &E, p: &E, head: &FixedHead, batch: &Batch, t
     Ok(Evaluation { bits, gradient: total })
 }
 
+/// The gradient in `P`'s trainable operators of `Σ log P_e(y)` over every scored token of
+/// `experiments` on `batch` (each experiment from its position on, as [`evaluate`] scores it), at
+/// `P`'s loaded parameters, each `y` drawn from `P_e`'s own next-token distribution at its row with
+/// that row's entry of `uniforms` (rows in experiment order). Its outer product `u uᵀ` is an unbiased
+/// estimate of the Gauss–Newton matrix of the experiments' divergence `Σ KL(M_e ‖ P_e)` in nats,
+/// `Σ_t J_tᵀ F_t J_t` with `F_t` the Fisher matrix of `P_e`'s softmax at `t`: the matrix that is the
+/// divergence's Hessian where `P_e`'s predictions equal `M_e`'s.
+pub fn sampled_label<E: BlockEngine>(m: &E, p: &E, head: &FixedHead, batch: &Batch, experiments: &[Experiment], design: &Design, uniforms: &[f64]) -> Result<BTreeMap<usize, Tensor>, String> {
+    let d = p.device();
+    let (blocks, length, width) = (p.blocks(), batch.length, p.width());
+    if m.blocks() != blocks || m.width() != width || design.bases.len() != experiments.len() {
+        return Err(error("models or design do not match"));
+    }
+    for e in experiments {
+        check(e, batch, blocks)?;
+    }
+    let (paths, bases) = paths(batch, experiments, design, None, blocks)?;
+    let plan = Plan::new(paths, length);
+    let arithmetic = p.arithmetic();
+    let (stream, calls) = run([p, m], &plan, true)?;
+    let rows = outputs(&plan, &bases, experiments);
+    let hidden = gather(d, &stream, &rows)?;
+    if uniforms.len() != hidden.rows() {
+        return Err(error("one uniform per scored row required"));
+    }
+    // The sampled cotangent of each tile's logits `h Eᵀ` (`p − e_y`), pulled back through the head.
+    let embedding = &head.resident.embedding;
+    let tile = head.resident.tile_rows.max(1);
+    let mut seed = d.zeros(hidden.rows(), width).map_err(error)?;
+    for start in (0..hidden.rows()).step_by(tile) {
+        let n = tile.min(hidden.rows() - start);
+        let h = d.rows_of(&hidden, start, n).map_err(error)?;
+        let mut logits = d.zeros(n, embedding.rows()).map_err(error)?;
+        d.gemm(&mut logits, 1.0, &h, Op::N, embedding, Op::T, 0.0, arithmetic).map_err(error)?;
+        let u = d.upload_vec(n, 1, uniforms[start..start + n].to_vec()).map_err(error)?;
+        d.sampled_cotangent(&mut logits, &u, None).map_err(error)?;
+        let mut pulled = d.zeros(n, width).map_err(error)?;
+        d.gemm(&mut pulled, 1.0, &logits, Op::N, embedding, Op::N, 0.0, arithmetic).map_err(error)?;
+        d.set_rows(&mut seed, start, &pulled).map_err(error)?;
+    }
+    let mut cotangent = d.zeros(stream.rows(), width).map_err(error)?;
+    let mut at = 0;
+    for r in &rows {
+        let mut total = d.rows_of(&cotangent, r.start, r.len()).map_err(error)?;
+        d.axpy(&mut total, 1.0, &d.rows_of(&seed, at, r.len()).map_err(error)?).map_err(error)?;
+        d.set_rows(&mut cotangent, r.start, &total).map_err(error)?;
+        at += r.len();
+    }
+    let mut gradient = BTreeMap::new();
+    run_reverse([p, m], &plan, calls, cotangent, &mut gradient)?;
+    Ok(gradient)
+}
+
 /// The experiments of one batch scored at `P`'s loaded parameters.
 pub struct Scored {
     /// Per experiment, per base token, `KL(M_e ‖ P_e)` in bits.
@@ -1411,6 +1464,24 @@ impl Interchange {
             None => {
                 let (m, p) = self.models();
                 evaluate(&m, &p, &self.head, batch, targets, experiments, design, gradient)
+            }
+        }
+    }
+
+    /// [`sampled_label`] at `P`'s loaded parameters, the gradient left on the device per trainable
+    /// operator.
+    pub fn sampled_label_resident(&self, batch: &Batch, experiments: &[Experiment], design: &Design, uniforms: &[f64]) -> Result<BTreeMap<usize, Tensor>, String> {
+        match &self.engines {
+            Some((m, p)) => {
+                if self.stale.replace(false) {
+                    p.try_borrow_mut().map_err(error)?.refresh(&self.p)?;
+                }
+                let p = p.try_borrow().map_err(error)?;
+                sampled_label(m, &*p, &self.head, batch, experiments, design, uniforms)
+            }
+            None => {
+                let (m, p) = self.models();
+                sampled_label(&m, &p, &self.head, batch, experiments, design, uniforms)
             }
         }
     }

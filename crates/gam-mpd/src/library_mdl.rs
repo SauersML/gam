@@ -101,9 +101,7 @@
 //!   is active; the other groups of an MLP function one of whose groups is removed, since every
 //!   pointwise law is zero at zero), all at once;
 //! * then prefixes of the remaining groups in increasing order of each one's second-order removal
-//!   effect `½ Σ_j (μ_j² (1/σ_j² − 1/v_G) − 1 + σ_j²/v_G) − KL_G − ½ ln |G|` (zeroing the mean and
-//!   the noise at the curvature `1/σ² − 1/v_G` that IVON's `σ` holds, less the description it
-//!   saves), searched by bisection, `O(log n)` full training evaluations for `n` groups;
+//!   effect (below), searched by bisection, `O(log n)` full training evaluations for `n` groups;
 //! * when no prefix is accepted, single groups: the [`SINGLES`] of lowest estimated effect and
 //!   [`SINGLES`] drawn at random, the best accepted.
 //! Where a proposal deletes functions of an MLP, the MLP's surviving functions' outputs move by the
@@ -113,6 +111,18 @@
 //! can cancel, so the objective need not be monotone in the prefix length. The fit alternates
 //! converging and removing; it stops when a round accepts nothing, which says the search found no
 //! removal, not that none exists ([`Outcome::Exhausted`]).
+//!
+//! The second-order removal effect of a group `G` is the rise of the expected data term when its
+//! means and noise become exactly zero, less the description it saves. At a converged posterior the
+//! data term's gradient in `μ_j` is `−μ_j / v_G` (`F` is stationary in `μ_j`), and its curvature is
+//! the Gauss–Newton matrix `H`, the Hessian of `Σ KL(M_e ‖ P_e)` where `P_e`'s predictions equal
+//! `M_e`'s, so the rise is `Σ_{j∈G} μ_j² / v_G + ½ μ_Gᵀ H μ_G − ½ Σ_{j∈G} H_jj σ_j²`. `H` enters only
+//! through quadratic forms, estimated without forming it: for one draw `u` of the gradient of
+//! `Σ log P_e(y)` with every `y` drawn from `P_e` itself (`interchange::sampled_label`),
+//! `E[(u_G · μ_G)²] = μ_Gᵀ H μ_G` and `E[u_j²] = H_jj`, summed over one draw per training batch at
+//! the posterior mean ([`Curvature`]). The form `μ_Gᵀ H μ_G` keeps the couplings between a group's
+//! parameters (an output vector's direction against the downstream metric) that a diagonal
+//! curvature drops.
 //!
 //! # Evaluation
 //!
@@ -571,6 +581,24 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
 
 // ------------------------------------------------------------------------------------- posterior
 
+/// Per prior group, sums over draws of the sampled-label gradient `u` (`interchange::sampled_label`)
+/// at the posterior mean, each draw weighted by the data term's weight on its tokens: `Σ (u_G · μ_G)²`,
+/// the Gauss–Newton quadratic form of the group's means, and `Σ Σ_{j∈G} u_j² σ_j²`, that of its
+/// noise (module note).
+#[derive(Clone, Debug)]
+pub struct Curvature {
+    pub(crate) quadratic: Vec<f64>,
+    pub(crate) noise: Vec<f64>,
+}
+
+impl Curvature {
+    /// No draws yet, for `groups` prior groups.
+    #[must_use]
+    pub fn new(groups: usize) -> Self {
+        Self { quadratic: vec![0.0; groups], noise: vec![0.0; groups] }
+    }
+}
+
 /// The factorized Gaussian posterior over the library's parameters, and which groups are active.
 #[derive(Clone, Debug)]
 pub struct Posterior {
@@ -712,35 +740,87 @@ impl Posterior {
         out
     }
 
-    /// Per group, the second-order estimate of `F`'s change in nats when it alone is removed
-    /// (module note): the data term's rise from zeroing its means and noise at the curvature
-    /// `1/σ² − 1/v_G`, less the description it saves (zero for a removed group).
-    fn removal_estimates(&self) -> Vec<f64> {
-        let moments = self.moments();
-        let costs = self.costs();
-        let partial: Vec<(Range<usize>, Vec<f64>)> = (0..self.mean.len())
+    /// Adds one draw `u` of the sampled-label gradient at the posterior mean (per trainable operator,
+    /// in `Explanation::trainable` order; `interchange::sampled_label`) to `curvature`, its terms
+    /// weighted by `weight`, the data term's weight on the draw's tokens.
+    pub fn add_curvature(&self, u: &[Array2<f64>], weight: f64, curvature: &mut Curvature) -> Result<(), String> {
+        if u.len() != self.mean.len() || u.iter().zip(&self.mean).any(|(a, b)| a.dim() != b.dim()) {
+            return Err("one gradient per trainable operator, of its shape, required".into());
+        }
+        if curvature.quadratic.len() != self.active.len() {
+            return Err("a curvature of another explanation".into());
+        }
+        // Per group, `u_G · μ_G` and `Σ u_j² σ_j²` of this draw.
+        let partial: Vec<(Range<usize>, Vec<(f64, f64)>)> = (0..self.mean.len())
             .into_par_iter()
             .map(|i| {
                 let span = self.spans[i].clone();
-                let mut local = vec![0.0; span.len()];
-                for ((mu, s), group) in self.mean[i].iter().zip(self.log_sd[i].iter()).zip(self.membership[i].iter()) {
-                    let g = *group as usize;
-                    if self.active[g] {
-                        let (variance, sd2) = (moments[g].second / moments[g].count, (2.0 * s).exp());
-                        local[g - span.start] += 0.5 * (mu * mu * (1.0 / sd2 - 1.0 / variance) - 1.0 + sd2 / variance);
+                let mut local = vec![(0.0, 0.0); span.len()];
+                for (((g, mu), s), group) in u[i].iter().zip(self.mean[i].iter()).zip(self.log_sd[i].iter()).zip(self.membership[i].iter()) {
+                    let at = *group as usize;
+                    if self.active[at] {
+                        let entry = &mut local[at - span.start];
+                        entry.0 += g * mu;
+                        entry.1 += g * g * (2.0 * s).exp();
                     }
                 }
                 (span, local)
             })
             .collect();
-        let mut out = vec![0.0; self.active.len()];
+        let mut draw = vec![(0.0, 0.0); self.active.len()];
         for (span, local) in partial {
-            for (g, e) in span.zip(local) {
-                out[g] += e;
+            for (g, (dot, noise)) in span.zip(local) {
+                draw[g].0 += dot;
+                draw[g].1 += noise;
             }
         }
-        out.iter_mut().zip(&costs).zip(&self.active).for_each(|((e, c), active)| *e = if *active { *e - c } else { 0.0 });
-        out
+        for (g, (dot, noise)) in draw.into_iter().enumerate() {
+            curvature.quadratic[g] += weight * dot * dot;
+            curvature.noise[g] += weight * noise;
+        }
+        Ok(())
+    }
+
+    /// Per group, the second-order rise of the expected data term in nats when it alone is removed
+    /// (module note), from the posterior and `curvature` (zero for a removed group).
+    pub fn removal_data(&self, curvature: &Curvature) -> Vec<f64> {
+        let moments = self.moments();
+        let partial: Vec<(Range<usize>, Vec<f64>)> = (0..self.mean.len())
+            .into_par_iter()
+            .map(|i| {
+                let span = self.spans[i].clone();
+                let mut local = vec![0.0; span.len()];
+                for (mu, group) in self.mean[i].iter().zip(self.membership[i].iter()) {
+                    let g = *group as usize;
+                    if self.active[g] {
+                        local[g - span.start] += mu * mu;
+                    }
+                }
+                (span, local)
+            })
+            .collect();
+        let mut squares = vec![0.0; self.active.len()];
+        for (span, local) in partial {
+            for (g, e) in span.zip(local) {
+                squares[g] += e;
+            }
+        }
+        (0..self.active.len())
+            .map(|g| {
+                if !self.active[g] {
+                    return 0.0;
+                }
+                let variance = moments[g].second / moments[g].count;
+                squares[g] / variance + 0.5 * curvature.quadratic[g] - 0.5 * curvature.noise[g]
+            })
+            .collect()
+    }
+
+    /// Per group, the second-order estimate of `F`'s change in nats when it alone is removed: its
+    /// data term's rise ([`Posterior::removal_data`]) less the description it saves (zero for a
+    /// removed group).
+    fn removal_estimates(&self, curvature: &Curvature) -> Vec<f64> {
+        self.removal_data(curvature).iter().zip(self.costs()).zip(&self.active).map(|((d, c), active)| if *active { d - c } else { 0.0 }).collect()
     }
 
     /// Per group, `KL(q_G ‖ p_G)` in nats (zero for a removed group).
@@ -2126,6 +2206,29 @@ pub fn fit(
     })
 }
 
+/// The removal estimates' [`Curvature`]: one draw of the sampled-label gradient per training batch
+/// of the fixed collection, at the posterior mean (module note).
+fn removal_curvature(scorer: &mut Scorer, posterior: &Posterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings) -> Result<Curvature, String> {
+    scorer.experiments.load(&posterior.means())?;
+    let mut rng = StdRng::seed_from_u64(noise_seed(settings.seed, 0, draws.len()));
+    let mut curvature = Curvature::new(posterior.active.len());
+    for (b, draw) in draws.iter().enumerate() {
+        let batch = draw.batch(sequences)?;
+        let experiments = scorer.experiments(draw, sequences)?;
+        let (design, _) = scorer.targets(&batch, &experiments, &format!("train_{b}"))?;
+        let rows: usize = experiments.iter().map(|e| batch.length() - e.position).sum();
+        let uniforms: Vec<f64> = (0..rows).map(|_| rng.random::<f64>()).collect();
+        let gradient = scorer.experiments.sampled_label_resident(&batch, &experiments, &design, &uniforms)?;
+        let d = scorer.experiments.models().1.program.device();
+        let mut u: Vec<Array2<f64>> = posterior.mean.iter().map(|m| Array2::zeros(m.dim())).collect();
+        for (op, g) in &gradient {
+            u[scorer.at(*op)?] = d.download(g).map_err(error)?;
+        }
+        posterior.add_curvature(&u, 1.0, &mut curvature)?;
+    }
+    Ok(curvature)
+}
+
 /// `E_q[D]` over every training batch in nats, one weight sample per batch from the removal seeds,
 /// with the groups `removed` (and the already removed ones) zeroed, on the fixed collection; with
 /// `prior`, plus its value at each batch's sample, averaged, and the parameters it sends.
@@ -2264,7 +2367,8 @@ fn remove(
         }
     }
     // Prefixes in increasing estimated effect.
-    let estimates = posterior.removal_estimates();
+    let curvature = removal_curvature(scorer, posterior, draws, sequences, settings)?;
+    let estimates = posterior.removal_estimates(&curvature);
     let mut order: Vec<usize> = (0..estimates.len()).filter(|g| posterior.active[*g]).collect();
     order.sort_by(|a, b| estimates[*a].total_cmp(&estimates[*b]));
     let mut evaluations: Vec<(usize, f64)> = Vec::new();
@@ -2757,6 +2861,45 @@ mod tests {
             assert!(count.nonzero_per_token > 0.0 && count.nonzero_per_token < layer.functions.len() as f64, "ReLU functions are exactly zero on some tokens");
             assert!(count.resolved_per_token <= count.nonzero_per_token);
         }
+    }
+
+    #[test]
+    fn the_sampled_label_curvature_predicts_the_data_term_to_second_order() {
+        // At the library's start P is M on every experiment, so the data term and its gradient vanish
+        // at the mean and its Hessian there is the Gauss–Newton matrix H. Shrinking one MLP output
+        // group's mean by ε raises the data term by ½ ε² μ_Gᵀ H μ_G, which the sampled-label draws
+        // of the removal estimates measure.
+        let (native, layers, _, sequences) = tiny("library_curvature", "gelu");
+        let explanation = explanation(&native, &layers).unwrap();
+        let settings = settings();
+        let posterior = Posterior::new(&explanation, 1000).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, "tiny", None).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let group = *explanation.layers[0].functions[1].last().unwrap();
+        let rounds = 96;
+        let mut quadratic = 0.0;
+        for k in 0..rounds {
+            let labels = Settings { seed: settings.seed + 1 + k, ..settings.clone() };
+            quadratic += removal_curvature(&mut scorer, &posterior, &draws, &sequences, &labels).unwrap().quadratic[group] / rounds as f64;
+        }
+        let epsilon = 1e-2;
+        let mut shrunk = posterior.means();
+        let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
+        for cell in &explanation.groups[group].cells {
+            for &r in &cell.rows {
+                for c in cell.cols.clone() {
+                    shrunk[position[&cell.operator]][[r, c]] *= 1.0 - epsilon;
+                }
+            }
+        }
+        let mut exact = 0.0;
+        for (b, draw) in draws.iter().enumerate() {
+            let experiments = scorer.experiments(draw, &sequences).unwrap();
+            let (bits, _) = scorer.score(&draw.batch(&sequences).unwrap(), &experiments, &shrunk, &format!("train_{b}"), false).unwrap();
+            exact += bits.iter().flatten().sum::<f64>() * LN_2;
+        }
+        let predicted = 0.5 * epsilon * epsilon * quadratic;
+        assert!(exact > 0.0 && (predicted - exact).abs() <= 0.25 * exact, "predicted {predicted:e} nats, exact {exact:e}");
     }
 
     #[test]
