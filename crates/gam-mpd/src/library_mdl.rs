@@ -87,7 +87,10 @@
 //! A converged fit then proposes removing groups in increasing order of their divergence `KL_G`
 //! (their information content). Prefix lengths are searched by bisection, `O(log n)` full training
 //! evaluations for `n` active groups, and the longest evaluated prefix that does not increase the
-//! sampled objective is removed. The objective is estimated over the whole training set with one
+//! sampled objective is removed. Where a prefix deletes functions of an MLP, the MLP's surviving
+//! functions' outputs move by the least-squares solution that takes over the deleted functions'
+//! output on `P`'s own states (`library_compensation`), and the comparison scores the removal with
+//! those outputs. The objective is estimated over the whole training set with one
 //! common weight sample per batch for both sides of every comparison, on the fixed collection. The
 //! order and the search are a proposal; acceptance never increases the sampled objective. Removal
 //! effects
@@ -116,6 +119,7 @@ use crate::{
     artifact::{Argument, Artifact, Callee, Owner},
     device_posterior::{DevicePosterior, Ivon},
     interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable, Targets},
+    library_compensation::Compensation,
     operator_program::{
         FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, Provenance, Rule, SequenceLayout, SlotValues,
         exact_precision,
@@ -724,7 +728,7 @@ impl Posterior {
     }
 
     /// Remove `groups` from the explanation: their parameters become exactly zero.
-    fn remove(&mut self, groups: &[usize]) {
+    pub(crate) fn remove(&mut self, groups: &[usize]) {
         for g in groups {
             self.active[*g] = false;
         }
@@ -1889,7 +1893,7 @@ pub fn fit(
         progress.epoch += 1;
         let converged = matches!((improvement, standard_error), (Some(i), Some(se)) if i <= se);
         if converged {
-            let removal = remove(&mut scorer, &mut posterior, &draws, sequences, settings, explanation.fixed_nats, prior.as_deref_mut())?;
+            let removal = remove(&mut scorer, &mut posterior, &draws, sequences, settings, explanation, prior.as_deref_mut())?;
             log::info!("library removal after epoch {epoch}: {} of {} candidates", removal.removed, removal.candidates);
             // The removed groups' entries are exactly zero with `ln σ = −∞`, which the device step
             // leaves alone.
@@ -1989,19 +1993,21 @@ fn largest_accepted_prefix(
 }
 
 /// The removal step (module note): a prefix of the active groups in increasing divergence whose
-/// removal does not increase the sampled objective on this round's fixed evidence, found by bisection.
+/// removal, compensated in the MLPs it deletes functions of (`library_compensation`), does not
+/// increase the sampled objective on this round's fixed evidence, found by bisection.
 fn remove(
     scorer: &mut Scorer,
     posterior: &mut Posterior,
     draws: &[Draw],
     sequences: &[Vec<u32>],
     settings: &Settings,
-    fixed: f64,
+    explanation: &Explanation,
     prior: Option<&mut (dyn PriorTerm + 'static)>,
 ) -> Result<Removal, String> {
     let mut prior = prior;
+    let fixed = explanation.fixed_nats;
+    let compensation = Compensation::new(&mut scorer.experiments, explanation, posterior, sequences, settings.batch_sequences)?;
     let divergences = posterior.divergences();
-    let costs = posterior.costs();
     let mut order: Vec<usize> = (0..divergences.len()).filter(|g| posterior.active[*g]).collect();
     order.sort_by(|a, b| divergences[*a].total_cmp(&divergences[*b]));
     let description = posterior.description() + fixed;
@@ -2012,15 +2018,15 @@ fn remove(
         if let Some((_, c)) = evaluations.iter().find(|(at, _)| *at == k) {
             return Ok(*c);
         }
-        let saved: f64 = order[..k].iter().map(|g| costs[*g]).sum();
-        let c = expected_divergence(scorer, posterior, draws, sequences, &order[..k], settings, prior.as_deref_mut())? + description - saved - base;
+        let trial = compensation.proposal(posterior, &order[..k])?;
+        let c = expected_divergence(scorer, &trial, draws, sequences, &[], settings, prior.as_deref_mut())? + trial.description() + fixed - base;
         log::info!("library removal of {k} of {} groups: F changes by {:.6e} bits", order.len(), c / LN_2);
         evaluations.push((k, c));
         Ok(c)
     };
     let low = largest_accepted_prefix(order.len(), &mut change)?;
     let after = base + if low > 0 { change(low)? } else { 0.0 };
-    posterior.remove(&order[..low]);
+    *posterior = compensation.proposal(posterior, &order[..low])?;
     let to_bits = |nats: f64| nats / LN_2;
     Ok(Removal {
         candidates: order.len(),
