@@ -58,6 +58,8 @@ pub mod library_readout;
 pub mod library_sharing;
 // A learned mixture prior over the gate directions: read–write ties found by gradient.
 pub mod library_mixture;
+// Reusable rule bodies: regions rewritten as calls of learned bodies, bodies shared across sites.
+pub mod library_bodies;
 // A removal's least-squares compensation: an MLP's surviving functions take over deleted ones' output.
 pub mod library_compensation;
 // Its posterior resident on the device: sample, Adam step and group divergences without transfers.

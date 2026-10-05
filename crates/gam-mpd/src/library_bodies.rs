@@ -1,0 +1,1313 @@
+//! Reusable rule bodies of a library explanation (#2951).
+//!
+//! # Bodies and calls
+//!
+//! The library (`library_mdl`) starts at `M`'s own functions, and its other moves remove, tie and
+//! share them. A body is a function that no single native unit implements: a small program in
+//! `M`'s primitives, stored once as a rule of the explanation (`Node::Call` applies a stored rule
+//! however often it is called) and applied at several sites, each through bindings of its own.
+//! An MLP body of `m` units reads `z` of width `k` and writes `y` of width `k′`,
+//!
+//! `β(z) = U φ(G z + c)`, or for a gated law `β(z) = U (φ(G z + c) ⊙ (B z + e))`,
+//!
+//! with `M`'s law `φ`, and the biases `c`, `e` only where `M`'s MLP has them. A call at layer `l`'s
+//! MLP reads `z = R x` from the layer's normed stream `x` and adds `W β(z)` to the MLP's output:
+//! the read binding `R` (`k × d`) and the write binding `W` (`d × k′`) are the call's own. The prior
+//! groups of `library_mdl`'s code length: per unit its gate row with its bias, its up row with its
+//! bias, and its output column, paid once however many calls apply the body; per call each row of
+//! `R` and each column of `W`. The fit's removal step removes any of them whose information does
+//! not pay for itself, so a body's units and widths and a call's widths are chosen by `F`.
+//!
+//! # Region rewrite
+//!
+//! A region is a set of functions of one MLP. Its rewrite ([`rewrite`]) replaces them by a call of a
+//! new body, exactly. With `A` the region's gate rows (and `D` its up rows), `S = [A; D]` and
+//! `S = Σ_r s_r a_r v_rᵀ` its singular value decomposition over the singular values resolved from
+//! zero (above the decomposition's rounding band), `R = [v_r]ᵀ`, `G = A Rᵀ` and `B = D Rᵀ`; with
+//! `O` the region's output columns and `O = Σ_r t_r p_r q_rᵀ` likewise, `W = [p_r]` and
+//! `U = Wᵀ O`. Then `G R = A`, `B R = D` and `W U = O`, so the rewritten explanation computes what
+//! the region computed. Unit `j` of the body is the region's `j`-th function: the ownership of every
+//! replaced native parameter ([`Call::replaced`]). The native functions' groups leave the
+//! explanation (`Explanation::removed`); their reads stay among `M`'s read variables, so the
+//! experiments do not change.
+//!
+//! # Reuse
+//!
+//! A call's output is unchanged when `z ↦ A z` with `G ↦ G A⁻¹` and `B ↦ B A⁻¹`, when `y ↦ C y`
+//! with `U ↦ C U` and `W ↦ W C⁻¹`, and when the body's units are permuted; for a gated law also
+//! when a unit's up row is scaled by `α ≠ 0` and its output column by `1/α`, which leaves the
+//! unit's rank-one map `M_j = u_j b_jᵀ` (and `N_j = e_j u_j`) unchanged. These are the
+//! architecture's exact symmetries of a body. Two bodies compute one function up to their calls'
+//! bindings when, for a permutation `π` of the units and linear `A`, `C`, every unit `i` of the
+//! first has `g_i = g_{π(i)} A`, `c_i = c_{π(i)}` and `u_i = C u_{π(i)}` (gated: `M_i = C M_{π(i)} A`,
+//! `N_i = C N_{π(i)}`). [`align`] finds them by alternating weighted least squares in `A` and `C`
+//! with an optimal assignment of the units ([`hungarian`]), each step minimizing over its own
+//! block the misfit `Σ (θ₁ − T(θ₀))² / σ₁²` (the first body's posterior means `θ₁` against the
+//! transformed second's, in units of the first's posterior deviations), so the misfit never
+//! increases; it reports the misfit in units of both posteriors' deviations. [`merge`] makes every
+//! call of the first body a call of the second with the bindings `A R` and `W C`: the element
+//! relating the call to the shared body is part of the call's bindings, which are priced. A rewrite
+//! or a merge is accepted only if `F` falls after the fit re-converges on the fixed native
+//! experiments.
+//!
+//! # Regions from flows
+//!
+//! Candidate regions come from the explanation's RelP flow edges (`library_readout`): the
+//! communities of the graph whose edge weights are the functions' absolute flows
+//! ([`communities`]: Newman's modularity at resolution 1, maximized by Blondel et al.'s local moves
+//! and aggregation), each community's functions of one MLP being one region ([`regions`]).
+
+use crate::{
+    library_mdl::{Cells, Explanation, Group, Posterior},
+    operator_program::{Interface, LabelKind, Law, Node, Operator, OperatorProgram, Provenance, Rule, exact_precision, remap_node},
+};
+use gam_linalg::decompose::svd;
+use ndarray::{Array1, Array2, Axis, s};
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, sync::Arc};
+
+fn error(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
+fn operator_named(program: &OperatorProgram, name: &str) -> Option<usize> {
+    program.operators.iter().position(|op| op.name == name)
+}
+
+fn operator_index(program: &OperatorProgram, name: &str) -> Result<usize, String> {
+    let mut found = program.operators.iter().enumerate().filter(|(_, op)| op.name == name).map(|(i, _)| i);
+    match (found.next(), found.next()) {
+        (Some(index), None) => Ok(index),
+        _ => Err(format!("no unique operator {name}")),
+    }
+}
+
+fn rule_index(program: &OperatorProgram, name: &str) -> Result<usize, String> {
+    program.rules.iter().position(|r| r.name == name).ok_or_else(|| format!("no rule {name}"))
+}
+
+/// A dense operator holding `values` exactly.
+fn dense(name: String, rows: Interface, cols: Interface, values: Array2<f64>, provenance: Provenance) -> Result<Operator, String> {
+    let precision = exact_precision(values.iter().copied()).map_err(error)?;
+    Operator::dense(name, rows, cols, values, precision, provenance).map_err(error)
+}
+
+fn units(count: usize) -> Result<Interface, String> {
+    Interface::uniform(count, 1, LabelKind::Unit, 0).map_err(error)
+}
+
+/// A call of a body: its name (`library.l{layer}.call{c}`, its bindings `{name}.read` and
+/// `{name}.write`), its layer, its body's rule name, and per native function of the layer it
+/// replaced the body unit computing it at this call (the native parameters' ownership; a function
+/// whose unit a merge did not match keeps no unit).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Call {
+    pub name: String,
+    pub layer: usize,
+    pub body: String,
+    pub replaced: Vec<(usize, Option<usize>)>,
+}
+
+/// A body's operators in the explanation's program.
+#[derive(Clone, Copy, Debug)]
+struct BodyOperators {
+    gate: usize,
+    gate_bias: Option<usize>,
+    up: Option<usize>,
+    up_bias: Option<usize>,
+    out: usize,
+}
+
+impl BodyOperators {
+    fn of(program: &OperatorProgram, body: &str) -> Result<Self, String> {
+        Ok(Self {
+            gate: operator_index(program, &format!("{body}.gate"))?,
+            gate_bias: operator_named(program, &format!("{body}.gate_bias")),
+            up: operator_named(program, &format!("{body}.up")),
+            up_bias: operator_named(program, &format!("{body}.up_bias")),
+            out: operator_index(program, &format!("{body}.out"))?,
+        })
+    }
+
+    fn all(&self) -> Vec<usize> {
+        [Some(self.gate), self.gate_bias, self.up, self.up_bias, Some(self.out)].into_iter().flatten().collect()
+    }
+}
+
+/// The node of `rule` applying `gate` as its first term.
+fn applying(rule: &Rule, gate: usize) -> Result<usize, String> {
+    rule.nodes
+        .iter()
+        .position(|n| matches!(n, Node::Affine { terms, .. } if terms.first().is_some_and(|t| t.1 == gate)))
+        .ok_or_else(|| format!("{}: no node applies its gate", rule.name))
+}
+
+/// The law of the MLP rule `rule`'s units: the pointwise node reading its gate's node.
+fn mlp_law(rule: &Rule, gate: usize) -> Result<Law, String> {
+    let at = applying(rule, gate)?;
+    let laws = rule
+        .nodes
+        .iter()
+        .find_map(|n| match n {
+            Node::Pointwise { input, laws } if *input == at => Some(laws),
+            _ => None,
+        })
+        .ok_or_else(|| format!("{}: no law reads its gate", rule.name))?;
+    let law = *laws.first().ok_or("an empty law list")?;
+    if laws.iter().any(|l| *l != law) {
+        return Err(format!("{}: its units have different laws", rule.name));
+    }
+    Ok(law)
+}
+
+/// The next body number: one past the largest `i` of a rule `library.body{i}`.
+fn next_body(program: &OperatorProgram) -> usize {
+    program.rules.iter().filter_map(|r| r.name.strip_prefix("library.body")?.parse::<usize>().ok()).map(|i| i + 1).max().unwrap_or(0)
+}
+
+/// The next call number: one past the largest `c` of an operator `library.l{l}.call{c}.read`.
+fn next_call(program: &OperatorProgram) -> usize {
+    program
+        .operators
+        .iter()
+        .filter_map(|op| op.name.strip_prefix("library.l")?.split_once(".call")?.1.strip_suffix(".read")?.parse::<usize>().ok())
+        .map(|c| c + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// `program` with `rule` inserted as rule 0 (a rule calls only the rules before it), every call's
+/// rule index moved.
+fn insert_first_rule(program: &mut OperatorProgram, rule: Rule) {
+    let rules: Vec<usize> = (0..program.rules.len()).map(|r| r + 1).collect();
+    renumber_rules(program, &rules);
+    program.rules.insert(0, rule);
+}
+
+/// Every call in `program` (its nodes and its rules') made to read rule `rules[r]` for rule `r`.
+fn renumber_rules(program: &mut OperatorProgram, rules: &[usize]) {
+    let ops: Vec<usize> = (0..program.operators.len()).collect();
+    let bases: Vec<usize> = (0..program.bases.len()).collect();
+    let nodes: Vec<usize> = (0..program.nodes.len()).collect();
+    for node in &mut program.nodes {
+        remap_node(node, &nodes, &ops, &bases, rules);
+    }
+    for r in &mut program.rules {
+        let nodes: Vec<usize> = (0..r.nodes.len()).collect();
+        for node in &mut r.nodes {
+            remap_node(node, &nodes, &ops, &bases, rules);
+        }
+    }
+}
+
+/// The singular vectors of `a` whose singular values are resolved from zero (above the
+/// decomposition's rounding band): `(left, values, right)`; none when every one is within it.
+fn resolved(a: &Array2<f64>) -> Result<Option<(Array2<f64>, Array1<f64>, Array2<f64>)>, String> {
+    if a.is_empty() {
+        return Ok(None);
+    }
+    let decomposition = svd(a.view(), false).map_err(error)?;
+    let rank = decomposition.singular_values.iter().filter(|s| **s > decomposition.band).count();
+    if rank == 0 {
+        return Ok(None);
+    }
+    Ok(Some((
+        decomposition.u.slice(s![.., ..rank]).to_owned(),
+        decomposition.singular_values.slice(s![..rank]).to_owned(),
+        decomposition.vt.slice(s![..rank, ..]).to_owned(),
+    )))
+}
+
+/// `explanation` with the functions `functions` of layer `layer`'s MLP replaced by a call of a new
+/// body, exactly (module note), and the call.
+pub fn rewrite(explanation: &Explanation, layer: usize, functions: &[usize]) -> Result<(Explanation, Call), String> {
+    let mut sorted = functions.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if functions.is_empty() || sorted.len() != functions.len() {
+        return Err("a region is a nonempty set of distinct functions".into());
+    }
+    let mlp = format!("library.l{layer}.mlp");
+    let known = &explanation.layers.get(layer).ok_or_else(|| format!("no layer {layer}"))?.functions;
+    let program = &explanation.artifact.program;
+    let up = operator_named(program, &format!("{mlp}.up"));
+    let parts: &[&str] = if up.is_some() { &["gate", "up", "out"] } else { &["gate", "out"] };
+    // Only native functions in the explanation: neither removed nor tied.
+    let mut retired = Vec::new();
+    for &i in functions {
+        let own = known.get(i).ok_or_else(|| format!("layer {layer} has no function {i}"))?;
+        for part in parts {
+            let name = format!("{mlp}.f{i}.{part}");
+            let g = explanation.groups.iter().position(|g| g.name == name).ok_or_else(|| format!("no group {name}"))?;
+            if !own.contains(&g) || explanation.removed.contains(&g) {
+                return Err(format!("{name} is not a native group in the explanation"));
+            }
+            retired.push(g);
+        }
+    }
+    let gate = operator_index(program, &format!("{mlp}.gate"))?;
+    let (gate_bias, up_bias) = (operator_named(program, &format!("{mlp}.gate_bias")), operator_named(program, &format!("{mlp}.up_bias")));
+    let out = operator_index(program, &format!("{mlp}.out"))?;
+    let rows_of = |op: usize| program.operators[op].matrix().select(Axis(0), functions);
+    let a = rows_of(gate);
+    let d_up = up.map(rows_of);
+    let stacked = match &d_up {
+        Some(d) => ndarray::concatenate(Axis(0), &[a.view(), d.view()]).map_err(error)?,
+        None => a.clone(),
+    };
+    let (_, _, read) = resolved(&stacked)?.ok_or("a region whose reads are zero")?;
+    let g = a.dot(&read.t());
+    let b = d_up.map(|d| d.dot(&read.t()));
+    let o = program.operators[out].matrix().select(Axis(1), functions);
+    let (write, _, _) = resolved(&o)?.ok_or("a region whose writes are zero")?;
+    let u = write.t().dot(&o);
+    let (c, e) = (gate_bias.map(rows_of), up_bias.map(rows_of));
+    let (n, k, k_out) = (functions.len(), read.nrows(), write.ncols());
+    let (d_in, d_out) = (program.operators[gate].cols.width(), program.operators[out].rows.width());
+
+    let mut rewritten = explanation.clone();
+    let program = &mut rewritten.artifact.program;
+    // The replaced functions leave the MLP: their rows of its input maps and columns of its output
+    // are zero, as their removed groups are in the posterior.
+    for (op, rows) in [(Some(gate), true), (gate_bias, true), (up, true), (up_bias, true), (Some(out), false)] {
+        let Some(op) = op else { continue };
+        let source = Arc::clone(&program.operators[op]);
+        let mut values = source.matrix();
+        for &i in functions {
+            if rows { values.row_mut(i).fill(0.0) } else { values.column_mut(i).fill(0.0) }
+        }
+        program.operators[op] = Arc::new(dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values, source.provenance.clone())?);
+    }
+    let body = format!("library.body{}", next_body(program));
+    let call = format!("library.l{layer}.call{}", next_call(program));
+    let mlp_rule = rule_index(program, &mlp)?;
+    let law = mlp_law(&program.rules[mlp_rule], gate)?;
+    let input = match &program.rules[mlp_rule].nodes[applying(&program.rules[mlp_rule], gate)?] {
+        Node::Affine { terms, .. } => terms[0].0,
+        other => return Err(format!("{mlp}: its gate node is {other:?}")),
+    };
+    let provenance = Provenance::derived(&[&program.operators[gate].provenance, &program.operators[out].provenance], format!("rewrite of {mlp} functions {functions:?}"));
+    let (z, h, y) = (units(k)?, units(n)?, units(k_out)?);
+    let (stream_in, stream_out) = (program.operators[gate].cols.clone(), program.operators[out].rows.clone());
+    // The new operators in order: the body's gate, gate bias, up map, up bias and output, then the
+    // call's read and write bindings.
+    let base = program.operators.len();
+    let mut added: Vec<Operator> = Vec::new();
+    let add = |added: &mut Vec<Operator>, op: Operator| {
+        added.push(op);
+        base + added.len() - 1
+    };
+    let body_gate = add(&mut added, dense(format!("{body}.gate"), h.clone(), z.clone(), g, provenance.clone())?);
+    let body_gate_bias = match c {
+        Some(c) => Some(add(&mut added, dense(format!("{body}.gate_bias"), h.clone(), Interface::constant(), c, provenance.clone())?)),
+        None => None,
+    };
+    let body_up = match b {
+        Some(b) => Some(add(&mut added, dense(format!("{body}.up"), h.clone(), z.clone(), b, provenance.clone())?)),
+        None => None,
+    };
+    let body_up_bias = match e {
+        Some(e) => Some(add(&mut added, dense(format!("{body}.up_bias"), h.clone(), Interface::constant(), e, provenance.clone())?)),
+        None => None,
+    };
+    let body_out = add(&mut added, dense(format!("{body}.out"), y.clone(), h, u, provenance.clone())?);
+    let read_op = add(&mut added, dense(format!("{call}.read"), z.clone(), stream_in, read, provenance.clone())?);
+    let write_op = add(&mut added, dense(format!("{call}.write"), stream_out, y, write, provenance)?);
+    program.operators.extend(added.into_iter().map(Arc::new));
+    let mut nodes = vec![Node::Param { index: 0 }, Node::Affine { terms: vec![(0, body_gate)], bias: body_gate_bias }, Node::Pointwise { input: 1, laws: vec![law; n] }];
+    if let Some(up) = body_up {
+        nodes.push(Node::Affine { terms: vec![(0, up)], bias: body_up_bias });
+        nodes.push(Node::Hadamard { left: 2, right: 3 });
+    }
+    nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, body_out)], bias: None });
+    insert_first_rule(program, Rule { name: body.clone(), inputs: vec![z], output: nodes.len() - 1, nodes });
+    // The call: `z = R x`, `y = β(z)`, and `W y` added to the MLP's output.
+    let r = &mut program.rules[mlp_rule + 1];
+    let terms = match r.nodes.last() {
+        Some(Node::Affine { terms, bias: None }) if r.output + 1 == r.nodes.len() => terms.clone(),
+        _ => return Err(format!("{mlp}: its output is not its last node, a bias-free affine sum")),
+    };
+    r.nodes.pop();
+    r.nodes.push(Node::Affine { terms: vec![(input, read_op)], bias: None });
+    r.nodes.push(Node::Call { rule: 0, arguments: vec![r.nodes.len() - 1] });
+    let mut terms = terms;
+    terms.push((r.nodes.len() - 1, write_op));
+    r.nodes.push(Node::Affine { terms, bias: None });
+    r.output = r.nodes.len() - 1;
+    program.interfaces().map_err(error)?;
+    // The body's groups once, the call's per row of `R` and column of `W`.
+    let groups = &mut rewritten.groups;
+    for j in 0..n {
+        let mut gate_cells = vec![Cells { operator: body_gate, rows: vec![j], cols: 0..k }];
+        gate_cells.extend(body_gate_bias.map(|op| Cells { operator: op, rows: vec![j], cols: 0..1 }));
+        groups.push(Group { name: format!("{body}.u{j}.gate"), cells: gate_cells });
+        if let Some(up) = body_up {
+            let mut up_cells = vec![Cells { operator: up, rows: vec![j], cols: 0..k }];
+            up_cells.extend(body_up_bias.map(|op| Cells { operator: op, rows: vec![j], cols: 0..1 }));
+            groups.push(Group { name: format!("{body}.u{j}.up"), cells: up_cells });
+        }
+        groups.push(Group { name: format!("{body}.u{j}.out"), cells: vec![Cells { operator: body_out, rows: (0..k_out).collect(), cols: j..j + 1 }] });
+    }
+    groups.extend(binding_groups(&call, read_op, write_op, k, k_out, d_in, d_out));
+    rewritten.trainable.extend(base..program.operators.len());
+    rewritten.trainable.sort_unstable();
+    rewritten.removed.extend(retired);
+    rewritten.removed.sort_unstable();
+    let replaced = functions.iter().enumerate().map(|(j, i)| (*i, Some(j))).collect();
+    Ok((rewritten, Call { name: call, layer, body, replaced }))
+}
+
+/// A call's binding groups: each row of its read binding (`k × d_in`) and each column of its write
+/// binding (`d_out × k′`).
+fn binding_groups(call: &str, read: usize, write: usize, k: usize, k_out: usize, d_in: usize, d_out: usize) -> Vec<Group> {
+    let reads = (0..k).map(|q| Group { name: format!("{call}.read{q}"), cells: vec![Cells { operator: read, rows: vec![q], cols: 0..d_in }] });
+    let writes = (0..k_out).map(|q| Group { name: format!("{call}.write{q}"), cells: vec![Cells { operator: write, rows: (0..d_out).collect(), cols: q..q + 1 }] });
+    reads.chain(writes).collect()
+}
+
+/// One call site of a body in the explanation's program: the MLP rule, the call node, and its read
+/// and write binding operators.
+#[derive(Clone, Copy, Debug)]
+struct Site {
+    rule: usize,
+    node: usize,
+    read: usize,
+    write: usize,
+}
+
+/// Every call site of rule `body` among the MLP rules of `program`.
+fn sites(program: &OperatorProgram, body: usize) -> Result<Vec<Site>, String> {
+    let mut out = Vec::new();
+    for (r, rule) in program.rules.iter().enumerate() {
+        for (n, node) in rule.nodes.iter().enumerate() {
+            let Node::Call { rule: called, arguments } = node else { continue };
+            if *called != body {
+                continue;
+            }
+            let read = match arguments.first().and_then(|z| rule.nodes.get(*z)) {
+                Some(Node::Affine { terms, bias: None }) if terms.len() == 1 => terms[0].1,
+                other => return Err(format!("{}: a call's argument is not a read binding: {other:?}", rule.name)),
+            };
+            let write = match rule.nodes.get(rule.output) {
+                Some(Node::Affine { terms, .. }) => terms.iter().find(|t| t.0 == n).map(|t| t.1),
+                _ => None,
+            }
+            .ok_or_else(|| format!("{}: a call whose value the output does not write", rule.name))?;
+            out.push(Site { rule: r, node: n, read, write });
+        }
+    }
+    Ok(out)
+}
+
+// ------------------------------------------------------------------------------------ alignment
+
+/// Posterior means and deviations of one part of a body.
+#[derive(Clone, Debug)]
+pub struct Part {
+    pub mean: Array2<f64>,
+    pub sd: Array2<f64>,
+}
+
+/// One body's posterior: per unit its gate row (`m × k`), gate bias, up row, up bias, and its
+/// output column (`k′ × m`); which units are in the explanation, and which input and output
+/// coordinates some call of the body reads or writes.
+#[derive(Clone, Debug)]
+pub struct BodyValues {
+    pub gate: Part,
+    pub gate_bias: Option<Part>,
+    pub up: Option<Part>,
+    pub up_bias: Option<Part>,
+    pub out: Part,
+    pub units: Vec<bool>,
+    pub inputs: Vec<bool>,
+    pub outputs: Vec<bool>,
+}
+
+/// `body`'s posterior (removed groups are zero with zero deviation).
+pub fn body_values(explanation: &Explanation, posterior: &Posterior, body: &str) -> Result<BodyValues, String> {
+    let program = &explanation.artifact.program;
+    let ops = BodyOperators::of(program, body)?;
+    let means = posterior.means();
+    let position = |op: usize| explanation.trainable.iter().position(|t| *t == op).ok_or_else(|| format!("{body}: operator {op} is not trainable"));
+    let take = |op: usize| -> Result<Part, String> {
+        let i = position(op)?;
+        Ok(Part { mean: means[i].clone(), sd: posterior.log_sd[i].mapv(f64::exp) })
+    };
+    let (gate, out) = (take(ops.gate)?, take(ops.out)?);
+    let (k, k_out) = (gate.mean.ncols(), out.mean.nrows());
+    let alive = |row: ndarray::ArrayView1<'_, f64>| row.iter().any(|v| *v != 0.0);
+    let units = (0..gate.mean.nrows()).map(|j| alive(gate.mean.row(j)) && alive(out.mean.column(j))).collect();
+    let (mut inputs, mut outputs) = (vec![false; k], vec![false; k_out]);
+    for site in sites(program, rule_index(program, body)?)? {
+        let (read, write) = (&means[position(site.read)?], &means[position(site.write)?]);
+        inputs.iter_mut().enumerate().for_each(|(q, used)| *used |= alive(read.row(q)));
+        outputs.iter_mut().enumerate().for_each(|(q, used)| *used |= alive(write.column(q)));
+    }
+    Ok(BodyValues {
+        gate,
+        gate_bias: ops.gate_bias.map(take).transpose()?,
+        up: ops.up.map(take).transpose()?,
+        up_bias: ops.up_bias.map(take).transpose()?,
+        out,
+        units,
+        inputs,
+        outputs,
+    })
+}
+
+/// The gauge relating body `from` to body `onto` (module note): unit `i` of `from` is unit
+/// `units[i]` of `onto` (none when unmatched); `input` is `A` (`k_onto × k_from`) and `output` is
+/// `C` (`k′_from × k′_onto`), zero outside the coordinates the calls use; `misfit` is the squared
+/// misfit in units of both posteriors' deviations over `entries` compared values (its expectation
+/// when the two bodies are one function).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Alignment {
+    pub units: Vec<Option<usize>>,
+    pub input: Array2<f64>,
+    pub output: Array2<f64>,
+    pub misfit: f64,
+    pub entries: usize,
+}
+
+/// One unit of a body restricted to the used coordinates: its gate row and bias, and its write
+/// (the output column, or for a gated law `M = u bᵀ` with `N = e u`), each with its variances.
+#[derive(Clone, Debug)]
+struct Unit {
+    gate: (Array1<f64>, Array1<f64>),
+    bias: Option<(f64, f64)>,
+    write: Write,
+}
+
+#[derive(Clone, Debug)]
+enum Write {
+    Plain((Array1<f64>, Array1<f64>)),
+    Gated { map: (Array2<f64>, Array2<f64>), offset: Option<(Array1<f64>, Array1<f64>)> },
+}
+
+/// The live units of `values` on the used coordinates, with their indices in the body.
+fn live_units(values: &BodyValues) -> Vec<(usize, Unit)> {
+    let ins: Vec<usize> = (0..values.inputs.len()).filter(|q| values.inputs[*q]).collect();
+    let outs: Vec<usize> = (0..values.outputs.len()).filter(|q| values.outputs[*q]).collect();
+    let squared = |a: &Array1<f64>| a.mapv(|v| v * v);
+    (0..values.units.len())
+        .filter(|j| values.units[*j])
+        .map(|j| {
+            let row = |p: &Part| (p.mean.row(j).select(Axis(0), &ins), squared(&p.sd.row(j).select(Axis(0), &ins)));
+            let u = (values.out.mean.column(j).select(Axis(0), &outs), squared(&values.out.sd.column(j).select(Axis(0), &outs)));
+            let write = match &values.up {
+                // `Var(u b) = u² σ_b² + b² σ_u² + σ_u² σ_b²` for independent factors.
+                Some(up) => {
+                    let (b, vb) = row(up);
+                    let map = (outer(&u.0, &b), outer(&u.0.mapv(|v| v * v), &vb) + outer(&u.1, &b.mapv(|v| v * v)) + outer(&u.1, &vb));
+                    let offset = values.up_bias.as_ref().map(|e| {
+                        let (e, ve) = (e.mean[[j, 0]], e.sd[[j, 0]].powi(2));
+                        (&u.0 * e, u.0.mapv(|v| v * v) * ve + &u.1 * (e * e) + &u.1 * ve)
+                    });
+                    Write::Gated { map, offset }
+                }
+                None => Write::Plain(u),
+            };
+            let bias = values.gate_bias.as_ref().map(|c| (c.mean[[j, 0]], c.sd[[j, 0]].powi(2)));
+            (j, Unit { gate: row(&values.gate), bias, write })
+        })
+        .collect()
+}
+
+fn outer(a: &Array1<f64>, b: &Array1<f64>) -> Array2<f64> {
+    Array2::from_shape_fn((a.len(), b.len()), |(i, j)| a[i] * b[j])
+}
+
+/// `onto`'s unit in `from`'s coordinates under the gauge: its values and their variances carried
+/// through `A` and `C` (independent entries).
+fn transformed(unit: &Unit, a: &Array2<f64>, c: &Array2<f64>) -> Unit {
+    let (a2, c2) = (a.mapv(|v| v * v), c.mapv(|v| v * v));
+    let write = match &unit.write {
+        Write::Plain((u, v)) => Write::Plain((c.dot(u), c2.dot(v))),
+        Write::Gated { map: (m, v), offset } => Write::Gated {
+            map: (c.dot(m).dot(a), c2.dot(v).dot(&a2)),
+            offset: offset.as_ref().map(|(n, v)| (c.dot(n), c2.dot(v))),
+        },
+    };
+    Unit { gate: (unit.gate.0.dot(a), unit.gate.1.dot(&a2)), bias: unit.bias, write }
+}
+
+/// `Σ (x − y)² / v` over paired values with variances `v`.
+fn chi2(x: ndarray::ArrayView1<'_, f64>, y: ndarray::ArrayView1<'_, f64>, v: ndarray::ArrayView1<'_, f64>) -> f64 {
+    x.iter().zip(y).zip(v).map(|((a, b), v)| if *v > 0.0 { (a - b).powi(2) / v } else if a == b { 0.0 } else { f64::INFINITY }).sum()
+}
+
+/// The misfit of `from`'s unit against `onto`'s transformed unit `t`: in units of `from`'s
+/// variances alone (`both` false), or of both posteriors' (`both` true); and the values compared.
+fn unit_misfit(from: &Unit, t: &Unit, both: bool) -> (f64, usize) {
+    let v = |a: &Array1<f64>, b: &Array1<f64>| if both { a + b } else { a.clone() };
+    let mut total = chi2(from.gate.0.view(), t.gate.0.view(), v(&from.gate.1, &t.gate.1).view());
+    let mut entries = from.gate.0.len();
+    if let (Some((a, va)), Some((b, vb))) = (from.bias, t.bias) {
+        let var = if both { va + vb } else { va };
+        total += chi2(ndarray::aview1(&[a]), ndarray::aview1(&[b]), ndarray::aview1(&[var]));
+        entries += 1;
+    }
+    match (&from.write, &t.write) {
+        (Write::Plain(x), Write::Plain(y)) => {
+            total += chi2(x.0.view(), y.0.view(), v(&x.1, &y.1).view());
+            entries += x.0.len();
+        }
+        (Write::Gated { map: x, offset: xo }, Write::Gated { map: y, offset: yo }) => {
+            let flat = |m: &Array2<f64>| Array1::from_iter(m.iter().copied());
+            total += chi2(flat(&x.0).view(), flat(&y.0).view(), v(&flat(&x.1), &flat(&y.1)).view());
+            entries += x.0.len();
+            if let (Some(x), Some(y)) = (xo, yo) {
+                total += chi2(x.0.view(), y.0.view(), v(&x.1, &y.1).view());
+                entries += x.0.len();
+            }
+        }
+        (Write::Plain(_), Write::Gated { .. }) | (Write::Gated { .. }, Write::Plain(_)) => return (f64::INFINITY, entries),
+    }
+    (total, entries)
+}
+
+/// The cost of leaving `unit` unmatched: its values in units of its own variances.
+fn alone(unit: &Unit) -> f64 {
+    let zero = |n: usize| Array1::zeros(n);
+    let mut total = chi2(unit.gate.0.view(), zero(unit.gate.0.len()).view(), unit.gate.1.view());
+    if let Some((a, va)) = unit.bias {
+        total += chi2(ndarray::aview1(&[a]), ndarray::aview1(&[0.0]), ndarray::aview1(&[va]));
+    }
+    total += match &unit.write {
+        Write::Plain((u, v)) => chi2(u.view(), zero(u.len()).view(), v.view()),
+        Write::Gated { map: (m, v), offset } => {
+            let flat = |m: &Array2<f64>| Array1::from_iter(m.iter().copied());
+            chi2(flat(m).view(), zero(m.len()).view(), flat(v).view()) + offset.as_ref().map_or(0.0, |(n, v)| chi2(n.view(), zero(n.len()).view(), v.view()))
+        }
+    };
+    total
+}
+
+/// The assignment cost of `from`'s units (rows) to `onto`'s (columns) under the gauge, padded to a
+/// square with unmatched units (module note).
+fn assignment_costs(from: &[(usize, Unit)], onto: &[(usize, Unit)], a: &Array2<f64>, c: &Array2<f64>) -> Array2<f64> {
+    let n = from.len().max(onto.len());
+    let t: Vec<Unit> = onto.iter().map(|(_, u)| transformed(u, a, c)).collect();
+    Array2::from_shape_fn((n, n), |(i, j)| match (from.get(i), t.get(j)) {
+        (Some((_, f)), Some(o)) => unit_misfit(f, o, false).0,
+        (Some((_, f)), None) => alone(f),
+        (None, Some(_)) => alone(&onto[j].1),
+        (None, None) => 0.0,
+    })
+}
+
+/// Weighted least squares per target column: `x` minimizing `Σ_i w_ic (y_ic − (D x)_ic)²` for
+/// each column `c`, `D` the design (`rows × p`), `y` and `w` (`rows × q`); `x` is `p × q`. The
+/// directions the weighted design does not resolve get zero.
+fn weighted_columns(design: &Array2<f64>, y: &Array2<f64>, w: &Array2<f64>) -> Result<Array2<f64>, String> {
+    let mut x = Array2::zeros((design.ncols(), y.ncols()));
+    for c in 0..y.ncols() {
+        let root: Array1<f64> = w.column(c).mapv(f64::sqrt);
+        let scaled = design * &root.view().insert_axis(Axis(1));
+        let target = &y.column(c) * &root;
+        if let Some((left, values, right)) = resolved(&scaled)? {
+            x.column_mut(c).assign(&right.t().dot(&(left.t().dot(&target) / &values)));
+        }
+    }
+    Ok(x)
+}
+
+/// Precisions `1/v` (zero where the variance is not positive: a removed entry is not data).
+fn precisions(v: &Array1<f64>) -> Array1<f64> {
+    v.mapv(|v| if v > 0.0 { 1.0 / v } else { 0.0 })
+}
+
+/// `A` minimizing the misfit over the matched pairs `(from unit, onto unit)` with `C` fixed: the
+/// gate rows `g_i ≈ g_j A` and, gated, the rows of `M_i ≈ (C M_j) A`.
+fn input_gauge(pairs: &[(&Unit, &Unit)], c: &Array2<f64>, k_onto: usize, k_from: usize) -> Result<Array2<f64>, String> {
+    let (mut design, mut targets, mut weights) = (Vec::new(), Vec::new(), Vec::new());
+    for (f, o) in pairs {
+        design.push(o.gate.0.clone());
+        targets.push(f.gate.0.clone());
+        weights.push(precisions(&f.gate.1));
+        if let (Write::Gated { map: (mf, vf), .. }, Write::Gated { map: (mo, _), .. }) = (&f.write, &o.write) {
+            let cm = c.dot(mo);
+            for r in 0..mf.nrows() {
+                design.push(cm.row(r).to_owned());
+                targets.push(mf.row(r).to_owned());
+                weights.push(precisions(&vf.row(r).to_owned()));
+            }
+        }
+    }
+    if design.is_empty() {
+        return Ok(Array2::zeros((k_onto, k_from)));
+    }
+    let stack = |rows: Vec<Array1<f64>>, width: usize| Array2::from_shape_fn((rows.len(), width), |(i, j)| rows[i][j]);
+    weighted_columns(&stack(design, k_onto), &stack(targets, k_from), &stack(weights, k_from))
+}
+
+/// `C` minimizing the misfit over the matched pairs with `A` fixed: the output columns
+/// `u_i ≈ C u_j`, or gated the columns of `M_i ≈ C (M_j A)` and `N_i ≈ C N_j`.
+fn output_gauge(pairs: &[(&Unit, &Unit)], a: &Array2<f64>, k_from: usize, k_onto: usize) -> Result<Array2<f64>, String> {
+    // Rows of the design are `C`'s inputs (`k′_onto`), targets and weights `k′_from` wide; the
+    // solution is `Cᵀ`.
+    let (mut design, mut targets, mut weights) = (Vec::new(), Vec::new(), Vec::new());
+    for (f, o) in pairs {
+        match (&f.write, &o.write) {
+            (Write::Plain((u, v)), Write::Plain((uo, _))) => {
+                design.push(uo.clone());
+                targets.push(u.clone());
+                weights.push(precisions(v));
+            }
+            (Write::Gated { map: (mf, vf), offset: of }, Write::Gated { map: (mo, _), offset: oo }) => {
+                let ma = mo.dot(a);
+                for col in 0..mf.ncols() {
+                    design.push(ma.column(col).to_owned());
+                    targets.push(mf.column(col).to_owned());
+                    weights.push(precisions(&vf.column(col).to_owned()));
+                }
+                if let (Some((nf, vn)), Some((no, _))) = (of, oo) {
+                    design.push(no.clone());
+                    targets.push(nf.clone());
+                    weights.push(precisions(vn));
+                }
+            }
+            (Write::Plain(_), Write::Gated { .. }) | (Write::Gated { .. }, Write::Plain(_)) => return Err("bodies of different laws".into()),
+        }
+    }
+    if design.is_empty() {
+        return Ok(Array2::zeros((k_from, k_onto)));
+    }
+    let stack = |rows: Vec<Array1<f64>>, width: usize| Array2::from_shape_fn((rows.len(), width), |(i, j)| rows[i][j]);
+    Ok(weighted_columns(&stack(design, k_onto), &stack(targets, k_from), &stack(weights, k_from))?.reversed_axes())
+}
+
+/// The projection onto the column span of `m`, unchanged by every invertible map of its columns.
+fn span_projection(m: &Array2<f64>) -> Result<Array2<f64>, String> {
+    Ok(match resolved(m)? {
+        Some((left, _, _)) => left.dot(&left.t()),
+        None => Array2::zeros((m.nrows(), m.nrows())),
+    })
+}
+
+/// Per live unit a signature unchanged by the gauges and by permutations of the other units: the
+/// sorted magnitudes of its row of the projection onto the units' read span (gate rows) and onto
+/// their write span (output columns, or gated the rank-one maps).
+fn signatures(units: &[(usize, Unit)]) -> Result<Vec<Array1<f64>>, String> {
+    let m = units.len();
+    let reads = Array2::from_shape_fn((m, units.first().map_or(0, |u| u.1.gate.0.len())), |(i, j)| units[i].1.gate.0[j]);
+    let flat = |u: &Unit| -> Array1<f64> {
+        match &u.write {
+            Write::Plain((w, _)) => w.clone(),
+            Write::Gated { map: (w, _), .. } => Array1::from_iter(w.iter().copied()),
+        }
+    };
+    let width = units.first().map_or(0, |u| flat(&u.1).len());
+    let writes = Array2::from_shape_fn((m, width), |(i, j)| flat(&units[i].1)[j]);
+    let (pr, pw) = (span_projection(&reads)?, span_projection(&writes)?);
+    Ok((0..m)
+        .map(|i| {
+            let sorted = |p: &Array2<f64>| {
+                let mut row: Vec<f64> = p.row(i).iter().map(|v| v.abs()).collect();
+                row.sort_by(|a, b| b.total_cmp(a));
+                row
+            };
+            Array1::from_iter(sorted(&pr).into_iter().chain(sorted(&pw)))
+        })
+        .collect())
+}
+
+/// The alignment of body `from` to body `onto` (module note).
+pub fn align(from: &BodyValues, onto: &BodyValues) -> Result<Alignment, String> {
+    if from.up.is_some() != onto.up.is_some() || from.gate_bias.is_some() != onto.gate_bias.is_some() || from.up_bias.is_some() != onto.up_bias.is_some() {
+        return Err("bodies of different laws".into());
+    }
+    let (f_units, o_units) = (live_units(from), live_units(onto));
+    let (k_from, k_onto) = (from.inputs.iter().filter(|u| **u).count(), onto.inputs.iter().filter(|u| **u).count());
+    let (kout_from, kout_onto) = (from.outputs.iter().filter(|u| **u).count(), onto.outputs.iter().filter(|u| **u).count());
+    let n = f_units.len().max(o_units.len());
+    // The start: the assignment of the signatures, padded with unmatched units at zero cost.
+    let (sf, so) = (signatures(&f_units)?, signatures(&o_units)?);
+    let start = Array2::from_shape_fn((n, n), |(i, j)| match (sf.get(i), so.get(j)) {
+        (Some(a), Some(b)) if a.len() == b.len() => (a - b).mapv(|v| v * v).sum(),
+        (Some(a), Some(b)) => {
+            let common = a.len().min(b.len());
+            (a.slice(s![..common]).to_owned() - b.slice(s![..common])).mapv(|v| v * v).sum()
+        }
+        _ => 0.0,
+    });
+    let mut assignment = hungarian(&start)?;
+    let pairs_of = |assignment: &[usize]| -> Vec<(&Unit, &Unit)> {
+        (0..f_units.len()).filter_map(|i| o_units.get(assignment[i]).map(|o| (&f_units[i].1, &o.1))).collect()
+    };
+    // The misfit of an assignment under a gauge, in units of `from`'s deviations.
+    let total = |assignment: &[usize], a: &Array2<f64>, c: &Array2<f64>| -> f64 {
+        (0..n)
+            .map(|i| match (f_units.get(i), o_units.get(assignment[i])) {
+                (Some((_, f)), Some((_, o))) => unit_misfit(f, &transformed(o, a, c), false).0,
+                (Some((_, f)), None) => alone(f),
+                (None, Some((_, o))) => alone(o),
+                (None, None) => 0.0,
+            })
+            .sum()
+    };
+    // The output gauge starts as the identity on the common coordinates, so the first input gauge
+    // sees the gated maps at a start. Each step minimizes the misfit over its own block (the input
+    // gauge, the output gauge, the assignment) and is taken only when it lowers the misfit, so the
+    // misfit decreases strictly and the alternation ends.
+    let mut c = Array2::eye(kout_from.max(kout_onto)).slice(s![..kout_from, ..kout_onto]).to_owned();
+    let mut a = input_gauge(&pairs_of(&assignment), &c, k_onto, k_from)?;
+    let mut current = total(&assignment, &a, &c);
+    loop {
+        loop {
+            let c_next = output_gauge(&pairs_of(&assignment), &a, kout_from, kout_onto)?;
+            let a_next = input_gauge(&pairs_of(&assignment), &c_next, k_onto, k_from)?;
+            let next = total(&assignment, &a_next, &c_next);
+            if !(next < current) {
+                break;
+            }
+            (a, c, current) = (a_next, c_next, next);
+        }
+        let next = hungarian(&assignment_costs(&f_units, &o_units, &a, &c))?;
+        let value = total(&next, &a, &c);
+        if !(value < current) {
+            break;
+        }
+        (assignment, current) = (next, value);
+    }
+    // The misfit in units of both posteriors' deviations, and the full-size gauges.
+    let (mut misfit, mut entries) = (0.0, 0);
+    let mut units = vec![None; from.units.len()];
+    for (i, (fi, f)) in f_units.iter().enumerate() {
+        match o_units.get(assignment[i]) {
+            Some((oj, o)) => {
+                let (m, e) = unit_misfit(f, &transformed(o, &a, &c), true);
+                misfit += m;
+                entries += e;
+                units[*fi] = Some(*oj);
+            }
+            None => {
+                misfit += alone(f);
+                entries += unit_misfit(f, f, false).1;
+            }
+        }
+    }
+    for j in (0..n).filter(|j| *j < o_units.len() && !assignment.contains(j)).collect::<Vec<_>>() {
+        misfit += alone(&o_units[j].1);
+        entries += unit_misfit(&o_units[j].1, &o_units[j].1, false).1;
+    }
+    let embed = |small: &Array2<f64>, rows: &[bool], cols: &[bool]| {
+        let (r, c): (Vec<usize>, Vec<usize>) = ((0..rows.len()).filter(|i| rows[*i]).collect(), (0..cols.len()).filter(|j| cols[*j]).collect());
+        let mut full = Array2::zeros((rows.len(), cols.len()));
+        for (a, &i) in r.iter().enumerate() {
+            for (b, &j) in c.iter().enumerate() {
+                full[[i, j]] = small[[a, b]];
+            }
+        }
+        full
+    };
+    Ok(Alignment { units, input: embed(&a, &onto.inputs, &from.inputs), output: embed(&c, &from.outputs, &onto.outputs), misfit, entries })
+}
+
+/// A minimum-cost perfect assignment of the rows of the square `cost` to its columns (Kuhn's
+/// Hungarian method with potentials, `O(n³)`): `row → column`.
+pub fn hungarian(cost: &Array2<f64>) -> Result<Vec<usize>, String> {
+    let n = cost.nrows();
+    if cost.ncols() != n || cost.iter().any(|c| !c.is_finite()) {
+        return Err("an assignment needs a square finite cost".into());
+    }
+    // Potentials `u` (rows) and `v` (columns), one-based; `p[j]` the row assigned to column `j`
+    // (0 for none), `way` the augmenting path.
+    let (mut u, mut v) = (vec![0.0; n + 1], vec![0.0; n + 1]);
+    let (mut p, mut way) = (vec![0usize; n + 1], vec![0usize; n + 1]);
+    for i in 1..=n {
+        p[0] = i;
+        let mut j0 = 0;
+        let mut minv = vec![f64::INFINITY; n + 1];
+        let mut used = vec![false; n + 1];
+        loop {
+            used[j0] = true;
+            let i0 = p[j0];
+            let (mut delta, mut j1) = (f64::INFINITY, 0);
+            for j in 1..=n {
+                if !used[j] {
+                    let current = cost[[i0 - 1, j - 1]] - u[i0] - v[j];
+                    if current < minv[j] {
+                        minv[j] = current;
+                        way[j] = j0;
+                    }
+                    if minv[j] < delta {
+                        delta = minv[j];
+                        j1 = j;
+                    }
+                }
+            }
+            if j1 == 0 {
+                return Err("the assignment found no augmenting column".into());
+            }
+            for j in 0..=n {
+                if used[j] {
+                    u[p[j]] += delta;
+                    v[j] -= delta;
+                } else {
+                    minv[j] -= delta;
+                }
+            }
+            j0 = j1;
+            if p[j0] == 0 {
+                break;
+            }
+        }
+        while j0 != 0 {
+            let j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+        }
+    }
+    let mut out = vec![0; n];
+    for j in 1..=n {
+        out[p[j] - 1] = j - 1;
+    }
+    Ok(out)
+}
+
+// ------------------------------------------------------------------------------------- merging
+
+/// `explanation` with every call of body `from` made a call of body `onto` with its bindings
+/// `A R` and `W C` (`alignment` of `from` to `onto`), `from`'s rule and operators gone, and the
+/// calls' records with it (module note).
+pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, alignment: &Alignment) -> Result<(Explanation, Vec<Call>), String> {
+    if from == onto {
+        return Err("a body merges with another body".into());
+    }
+    let mut merged = explanation.clone();
+    let program = &mut merged.artifact.program;
+    let (from_rule, onto_rule) = (rule_index(program, from)?, rule_index(program, onto)?);
+    let (from_ops, onto_ops) = (BodyOperators::of(program, from)?, BodyOperators::of(program, onto)?);
+    let (z, y) = (program.operators[onto_ops.gate].cols.clone(), program.operators[onto_ops.out].rows.clone());
+    let (a, c) = (&alignment.input, &alignment.output);
+    if a.dim() != (z.width(), program.operators[from_ops.gate].cols.width()) || c.dim() != (program.operators[from_ops.out].rows.width(), y.width()) {
+        return Err("an alignment of other bodies".into());
+    }
+    let moved = sites(program, from_rule)?;
+    if moved.is_empty() {
+        return Err(format!("{from} has no call"));
+    }
+    let mut bindings = Vec::new();
+    for site in &moved {
+        let (read, write) = (Arc::clone(&program.operators[site.read]), Arc::clone(&program.operators[site.write]));
+        let provenance = Provenance::derived(&[&read.provenance, &program.operators[onto_ops.gate].provenance], format!("merge of {from} into {onto}"));
+        program.operators[site.read] = Arc::new(dense(read.name.clone(), z.clone(), read.cols.clone(), a.dot(&read.matrix()), provenance.clone())?);
+        program.operators[site.write] = Arc::new(dense(write.name.clone(), write.rows.clone(), y.clone(), write.matrix().dot(c), provenance)?);
+        if let Node::Call { rule, .. } = &mut program.rules[site.rule].nodes[site.node] {
+            *rule = onto_rule;
+        }
+        let call = read.name.strip_suffix(".read").ok_or("a read binding's name")?.to_string();
+        bindings.push((call, site.read, site.write, read.cols.width(), write.rows.width()));
+    }
+    // `from`'s rule leaves; the rules after it move down by one.
+    let rules: Vec<usize> = (0..program.rules.len()).map(|r| if r > from_rule { r - 1 } else { r }).collect();
+    renumber_rules(program, &rules);
+    program.rules.remove(from_rule);
+    program.interfaces().map_err(error)?;
+    // Groups: those of `from`'s operators and of the moved bindings leave; the moved bindings'
+    // groups come back at their new widths, a zero row or column outside the explanation.
+    let retired = from_ops.all();
+    let rebound: Vec<usize> = bindings.iter().flat_map(|b| [b.1, b.2]).collect();
+    let mut index = BTreeMap::new();
+    let mut groups = Vec::new();
+    for (g, group) in explanation.groups.iter().enumerate() {
+        if group.cells.iter().any(|cell| retired.contains(&cell.operator) || rebound.contains(&cell.operator)) {
+            continue;
+        }
+        index.insert(g, groups.len());
+        groups.push(group.clone());
+    }
+    let mut removed: Vec<usize> = explanation.removed.iter().filter_map(|g| index.get(g).copied()).collect();
+    for (call, read, write, d_in, d_out) in &bindings {
+        let (r, w) = (program.operators[*read].matrix(), program.operators[*write].matrix());
+        for group in binding_groups(call, *read, *write, z.width(), y.width(), *d_in, *d_out) {
+            let cells = &group.cells[0];
+            let zero = if cells.operator == *read { r.row(cells.rows[0]).iter().all(|v| *v == 0.0) } else { w.column(cells.cols.start).iter().all(|v| *v == 0.0) };
+            if zero {
+                removed.push(groups.len());
+            }
+            groups.push(group);
+        }
+    }
+    removed.sort_unstable();
+    for layer in &mut merged.layers {
+        for (planes, values) in &mut layer.heads {
+            *planes = planes.iter().filter_map(|g| index.get(g).copied()).collect();
+            *values = values.iter().filter_map(|g| index.get(g).copied()).collect();
+        }
+        for function in &mut layer.functions {
+            *function = function.iter().filter_map(|g| index.get(g).copied()).collect();
+        }
+    }
+    merged.groups = groups;
+    merged.removed = removed;
+    merged.trainable.retain(|op| !retired.contains(op));
+    let calls = calls
+        .iter()
+        .map(|call| {
+            let mut call = call.clone();
+            if call.body == from {
+                call.body = onto.to_string();
+                for (_, unit) in &mut call.replaced {
+                    *unit = unit.and_then(|j| alignment.units.get(j).copied().flatten());
+                }
+            }
+            call
+        })
+        .collect();
+    Ok((merged, calls))
+}
+
+// -------------------------------------------------------------------------------------- regions
+
+/// The communities of the undirected graph with symmetric nonnegative edge weights `weights`
+/// (module note): Newman's modularity `Q = (1/2W) Σ_ij (w_ij − s_i s_j / 2W) [c_i = c_j]` (`s_i`
+/// the node strengths, `2W` their sum) at resolution 1, maximized by moving single nodes to the
+/// neighbouring community of largest gain while any gain is positive, then merging each community
+/// into one node and repeating while a level moves a node (Blondel et al. 2008). Communities in
+/// order of their first node.
+pub fn communities(weights: &Array2<f64>) -> Result<Vec<Vec<usize>>, String> {
+    let n = weights.nrows();
+    if weights.ncols() != n || weights.iter().any(|w| !(w.is_finite() && *w >= 0.0)) || (0..n).any(|i| (0..n).any(|j| weights[[i, j]] != weights[[j, i]])) {
+        return Err("communities need a symmetric matrix of finite nonnegative weights".into());
+    }
+    // `member[v]`: the community of original node `v`; `graph`: the current level's weights.
+    let mut member: Vec<usize> = (0..n).collect();
+    let mut graph = weights.clone();
+    loop {
+        let level = graph.nrows();
+        let strength: Vec<f64> = (0..level).map(|i| graph.row(i).sum()).collect();
+        let total: f64 = strength.iter().sum();
+        if total == 0.0 {
+            break;
+        }
+        let mut community: Vec<usize> = (0..level).collect();
+        let mut tot: Vec<f64> = strength.clone();
+        let mut moved_any = false;
+        loop {
+            let mut moved = false;
+            for i in 0..level {
+                let own = community[i];
+                tot[own] -= strength[i];
+                // Links of `i` into each neighbouring community (its self-loop apart).
+                let mut links: BTreeMap<usize, f64> = BTreeMap::new();
+                links.insert(own, 0.0);
+                for j in 0..level {
+                    if j != i && graph[[i, j]] > 0.0 {
+                        *links.entry(community[j]).or_insert(0.0) += graph[[i, j]];
+                    }
+                }
+                let gain = |c: usize| links[&c] - strength[i] * tot[c] / total;
+                let mut best = own;
+                for &c in links.keys() {
+                    if gain(c) > gain(best) {
+                        best = c;
+                    }
+                }
+                tot[best] += strength[i];
+                if best != own {
+                    community[i] = best;
+                    moved = true;
+                    moved_any = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        if !moved_any {
+            break;
+        }
+        // Each community becomes one node.
+        let mut label = BTreeMap::new();
+        for c in &community {
+            let next = label.len();
+            label.entry(*c).or_insert(next);
+        }
+        let mut next = Array2::zeros((label.len(), label.len()));
+        for i in 0..level {
+            for j in 0..level {
+                next[[label[&community[i]], label[&community[j]]]] += graph[[i, j]];
+            }
+        }
+        for m in &mut member {
+            *m = label[&community[*m]];
+        }
+        graph = next;
+    }
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut slot = BTreeMap::new();
+    for (v, m) in member.iter().enumerate() {
+        let at = *slot.entry(*m).or_insert_with(|| {
+            out.push(Vec::new());
+            out.len() - 1
+        });
+        out[at].push(v);
+    }
+    Ok(out)
+}
+
+/// A function of the explanation: a head or an MLP function of a layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Function {
+    Head { layer: usize, head: usize },
+    Mlp { layer: usize, function: usize },
+}
+
+/// The candidate regions of flows `flows[t][s]` (from function `s` to function `t`, among
+/// `functions`): per community of the absolute flows ([`communities`]), its MLP functions of one
+/// layer, wherever there are at least two (one function is already a native unit).
+pub fn regions(flows: &Array2<f64>, functions: &[Function]) -> Result<Vec<(usize, Vec<usize>)>, String> {
+    if flows.dim() != (functions.len(), functions.len()) {
+        return Err("one flow per pair of functions".into());
+    }
+    let weights = Array2::from_shape_fn(flows.dim(), |(i, j)| if i == j { 0.0 } else { flows[[i, j]].abs() + flows[[j, i]].abs() });
+    let mut out = Vec::new();
+    for community in communities(&weights)? {
+        let mut by_layer: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for v in community {
+            if let Function::Mlp { layer, function } = functions[v] {
+                by_layer.entry(layer).or_default().push(function);
+            }
+        }
+        out.extend(by_layer.into_iter().filter(|(_, f)| f.len() > 1).map(|(l, mut f)| {
+            f.sort_unstable();
+            (l, f)
+        }));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        import::import_language_model,
+        interchange::{self, Batch, Interchange},
+        library_mdl::explanation,
+        operator_program::{FamilyInputs, SlotValues},
+        run_check::{LayerNodes, layer_nodes, split_sites},
+    };
+    use gam_gpu::tensor::Device;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+    /// The tiny two-layer decoder (`d = 8`, sixteen MLP functions per layer) with MLP law `law`,
+    /// gated like Qwen3 when `gated`: its split program, layers, inputs and sequences.
+    fn tiny(tag: &str, law: &str, gated: bool) -> (OperatorProgram, Vec<LayerNodes>, FamilyInputs, Vec<Vec<u32>>) {
+        let dir = crate::test_support::tiny_export(tag, 2);
+        let path = dir.join("export.json");
+        let mut record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        record["config"]["mlp_act"] = law.into();
+        if gated {
+            let mut rng = StdRng::seed_from_u64(17);
+            for l in 0..2 {
+                let name = format!("blocks.{l}.mlp.gate_proj");
+                let bytes: Vec<u8> = (0..16 * 8).flat_map(|_| (rng.random::<f64>() - 0.5).to_le_bytes()).collect();
+                std::fs::write(dir.join(format!("{name}.f64")), bytes).unwrap();
+                record["files"][name] = serde_json::json!({"shape": [16, 8]});
+            }
+            record["config"]["mlp_gated"] = true.into();
+        }
+        std::fs::write(&path, record.to_string()).unwrap();
+        let imported = import_language_model(&dir, 6, 12).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        let native = split_sites(&imported.program).unwrap();
+        let layers = layer_nodes(&native, 2).unwrap();
+        let family = imported.family;
+        let SlotValues::Tokens(tokens) = &family.slots[0] else { panic!("token slot") };
+        let sequences = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        (native, layers, family, sequences)
+    }
+
+    fn set(program: &mut OperatorProgram, name: &str, values: Array2<f64>) {
+        let op = operator_index(program, name).unwrap();
+        let source = Arc::clone(&program.operators[op]);
+        program.operators[op] = Arc::new(dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values, source.provenance.clone()).unwrap());
+    }
+
+    fn random(rng: &mut StdRng, rows: usize, cols: usize) -> Array2<f64> {
+        Array2::from_shape_fn((rows, cols), |_| rng.random::<f64>() * 2.0 - 1.0)
+    }
+
+    fn outputs(explanation: &Explanation, family: &FamilyInputs) -> Array2<f64> {
+        explanation.artifact.execute(family).unwrap().values[explanation.artifact.program.output].clone()
+    }
+
+    fn close(a: &Array2<f64>, b: &Array2<f64>, relative: f64) {
+        let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let gap = a.iter().zip(b).fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()));
+        assert!(gap <= relative * scale, "outputs differ by {gap} at scale {scale}");
+    }
+
+    /// One subroutine of four units on a two-dimensional input and output, planted at layer 0 as
+    /// functions `SITE0` (in the body's order) and at layer 1 as `SITE1`, in other bases; gated, with
+    /// each unit's up row and output column at layer 1 scaled by a factor and its inverse.
+    const SITE0: [usize; 4] = [1, 4, 6, 9];
+    const SITE1: [usize; 4] = [14, 2, 11, 3];
+
+    fn planted(explanation: &mut Explanation, gated: bool) {
+        let mut rng = StdRng::seed_from_u64(23);
+        let (g, b, u) = (random(&mut rng, 4, 2), random(&mut rng, 4, 2), random(&mut rng, 2, 4));
+        let program = &mut explanation.artifact.program;
+        // A gated law's units keep their function when the up row is scaled and the output column
+        // divided by one factor; an ungated law's do not.
+        let rescaled = if gated { [0.5, -2.0, 1.5, 3.0] } else { [1.0; 4] };
+        for (l, site, scales) in [(0, SITE0, [1.0; 4]), (1, SITE1, rescaled)] {
+            let (read, write) = (random(&mut rng, 2, 8), random(&mut rng, 8, 2));
+            let name = format!("library.l{l}.mlp");
+            let mut gate = program.operators[operator_index(program, &format!("{name}.gate")).unwrap()].matrix();
+            let mut out = program.operators[operator_index(program, &format!("{name}.out")).unwrap()].matrix();
+            let (gr, wu) = (g.dot(&read), write.dot(&u));
+            for (j, &f) in site.iter().enumerate() {
+                gate.row_mut(f).assign(&gr.row(j));
+                out.column_mut(f).assign(&(&wu.column(j) / scales[j]));
+            }
+            set(program, &format!("{name}.gate"), gate);
+            set(program, &format!("{name}.out"), out);
+            if gated {
+                let mut up = program.operators[operator_index(program, &format!("{name}.up")).unwrap()].matrix();
+                let br = b.dot(&read);
+                for (j, &f) in site.iter().enumerate() {
+                    up.row_mut(f).assign(&(&br.row(j) * scales[j]));
+                }
+                set(program, &format!("{name}.up"), up);
+            }
+        }
+    }
+
+    #[test]
+    fn a_rewrite_computes_what_the_region_computed_and_charges_the_body_once() {
+        for (law, gated) in [("gelu_tanh", false), ("silu", true)] {
+            let (native, layers, family, _) = tiny(&format!("bodies_rewrite_{gated}"), law, gated);
+            let start = explanation(&native, &layers).unwrap();
+            let (rewritten, call) = rewrite(&start, 0, &SITE0).unwrap();
+            close(&outputs(&start, &family), &outputs(&rewritten, &family), 1e-12);
+            assert_eq!(call.replaced, SITE0.iter().enumerate().map(|(j, i)| (*i, Some(j))).collect::<Vec<_>>());
+            // Every entry in one group, the replaced functions' groups out, the body's groups in.
+            let posterior = Posterior::new(&rewritten, 72).unwrap();
+            let parts = if gated { 3 } else { 2 };
+            assert_eq!(posterior.active.iter().filter(|a| !**a).count(), parts * SITE0.len());
+            let body = rewritten.groups.iter().filter(|g| g.name.starts_with(&call.body)).count();
+            assert_eq!(body, parts * SITE0.len());
+            assert!(rewritten.groups.iter().any(|g| g.name == format!("{}.read0", call.name)));
+            // A second region gets its own body and call.
+            let (twice, second) = rewrite(&rewritten, 1, &[0, 5]).unwrap();
+            assert_ne!(second.body, call.body);
+            assert_ne!(second.name, call.name);
+            close(&outputs(&start, &family), &outputs(&twice, &family), 1e-12);
+            assert!(rewrite(&rewritten, 0, &[1, 2]).is_err(), "a replaced function is no longer native");
+        }
+    }
+
+    #[test]
+    fn a_subroutine_in_two_bases_is_found_as_one_body_and_merged_exactly() {
+        for (law, gated) in [("gelu_tanh", false), ("silu", true)] {
+            let (native, layers, family, _) = tiny(&format!("bodies_merge_{gated}"), law, gated);
+            let mut start = explanation(&native, &layers).unwrap();
+            planted(&mut start, gated);
+            let (one, first) = rewrite(&start, 0, &SITE0).unwrap();
+            let (two, second) = rewrite(&one, 1, &SITE1).unwrap();
+            // The planted reads and writes have rank two: each body reads and writes two coordinates.
+            let program = &two.artifact.program;
+            assert_eq!(program.operators[operator_index(program, &format!("{}.read", second.name)).unwrap()].rows.width(), 2);
+            let posterior = Posterior::new(&two, 72).unwrap();
+            let (from, onto) = (body_values(&two, &posterior, &second.body).unwrap(), body_values(&two, &posterior, &first.body).unwrap());
+            let alignment = align(&from, &onto).unwrap();
+            // Unit j of the second body is the region's j-th function, planted as unit j.
+            assert_eq!(alignment.units, (0..4).map(Some).collect::<Vec<_>>());
+            assert!(alignment.misfit < 1e-12 * alignment.entries as f64, "misfit {}", alignment.misfit);
+            let calls = vec![first.clone(), second.clone()];
+            let (merged, calls) = merge(&two, &calls, &second.body, &first.body, &alignment).unwrap();
+            close(&outputs(&start, &family), &outputs(&merged, &family), 1e-9);
+            assert!(calls.iter().all(|c| c.body == first.body));
+            let program = &merged.artifact.program;
+            assert_eq!(program.rules.iter().filter(|r| r.name.starts_with("library.body")).count(), 1);
+            assert_eq!(sites(program, rule_index(program, &first.body).unwrap()).unwrap().len(), 2, "one body, two calls");
+            // The merged library pays for one body: the second's groups are gone.
+            assert!(!merged.groups.iter().any(|g| g.name.starts_with(&second.body)));
+            assert_eq!(merged.groups.len(), two.groups.len() - (if gated { 3 } else { 2 }) * 4);
+            Posterior::new(&merged, 72).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_body_called_twice_is_differentiated_through_both_calls() {
+        let (native, layers, _, sequences) = tiny("bodies_gradient", "gelu_tanh", false);
+        let mut start = explanation(&native, &layers).unwrap();
+        planted(&mut start, false);
+        let (one, first) = rewrite(&start, 0, &SITE0).unwrap();
+        let (two, second) = rewrite(&one, 1, &SITE1).unwrap();
+        let posterior = Posterior::new(&two, 72).unwrap();
+        let alignment = align(&body_values(&two, &posterior, &second.body).unwrap(), &body_values(&two, &posterior, &first.body).unwrap()).unwrap();
+        let (merged, _) = merge(&two, &[first.clone(), second], "library.body1", &first.body, &alignment).unwrap();
+        let reads = interchange::library_reads(&merged.artifact.program, layers.len()).unwrap();
+        let device = Device::host();
+        let mut x = Interchange::new(&device, &native, &layers, &merged.artifact, &merged.trainable, reads.clone(), usize::MAX, 16).unwrap();
+        let batch = Batch::new(sequences[..2].to_vec(), sequences[2..4].to_vec()).unwrap();
+        let experiments = interchange::sample(&mut StdRng::seed_from_u64(5), 2, &reads, 4, 12).unwrap();
+        let values: Vec<Array2<f64>> = merged.trainable.iter().map(|op| merged.artifact.program.operators[*op].matrix()).collect();
+        let design = x.design_at(&reads, &experiments, &values).unwrap();
+        x.load(&values).unwrap();
+        let scored = x.evaluate(&batch, &experiments, &design, true).unwrap();
+        let program = &merged.artifact.program;
+        let at = |name: &str| merged.trainable.iter().position(|op| program.operators[*op].name == name).unwrap();
+        let mut bits = |values: &[Array2<f64>]| -> f64 {
+            x.load(values).unwrap();
+            x.evaluate(&batch, &experiments, &design, false).unwrap().bits.iter().flatten().sum()
+        };
+        for (i, entry) in [(at(&format!("{}.gate", first.body)), (2, 1)), (at(&format!("{}.out", first.body)), (1, 3)), (at("library.l1.call1.read"), (0, 5))] {
+            let h = 1e-5;
+            let (mut up, mut down) = (values.clone(), values.clone());
+            up[i][entry] += h;
+            down[i][entry] -= h;
+            let central = (bits(&up) - bits(&down)) / (2.0 * h);
+            assert!(central.abs() > 0.0, "the entry moves the score");
+            assert!((scored.gradient[i][entry] - central).abs() <= 1e-5 * (1.0 + central.abs()), "gradient {} against {central}", scored.gradient[i][entry]);
+        }
+    }
+
+    #[test]
+    fn the_assignment_is_optimal() {
+        let mut rng = StdRng::seed_from_u64(3);
+        for n in 1..=6 {
+            let cost = random(&mut rng, n, n);
+            let found = hungarian(&cost).unwrap();
+            let value = |p: &[usize]| (0..n).map(|i| cost[[i, p[i]]]).sum::<f64>();
+            // Every permutation, by Heap's algorithm.
+            let mut p: Vec<usize> = (0..n).collect();
+            let mut best = value(&p);
+            let mut c = vec![0; n];
+            let mut i = 0;
+            while i < n {
+                if c[i] < i {
+                    if i % 2 == 0 { p.swap(0, i) } else { p.swap(c[i], i) }
+                    best = best.min(value(&p));
+                    c[i] += 1;
+                    i = 0;
+                } else {
+                    c[i] = 0;
+                    i += 1;
+                }
+            }
+            let mut sorted = found.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..n).collect::<Vec<_>>());
+            assert!((value(&found) - best).abs() < 1e-12, "{} against the best {best}", value(&found));
+        }
+    }
+
+    #[test]
+    fn two_dense_groups_joined_by_one_weak_edge_are_two_communities() {
+        let mut weights = Array2::zeros((8, 8));
+        for (a, b) in [(0, 1), (0, 2), (1, 2), (2, 3), (1, 3), (4, 5), (4, 6), (5, 6), (6, 7), (5, 7)] {
+            weights[[a, b]] = 1.0;
+            weights[[b, a]] = 1.0;
+        }
+        weights[[3, 4]] = 0.1;
+        weights[[4, 3]] = 0.1;
+        assert_eq!(communities(&weights).unwrap(), vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
+        let functions: Vec<Function> = (0..8).map(|i| if i < 4 { Function::Mlp { layer: 0, function: i } } else { Function::Mlp { layer: 1, function: i } }).collect();
+        assert_eq!(regions(&weights, &functions).unwrap(), vec![(0, vec![0, 1, 2, 3]), (1, vec![4, 5, 6, 7])]);
+    }
+}
