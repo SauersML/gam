@@ -620,12 +620,30 @@ pub struct Prompt {
 
 /// What is attributed: the sum over positions of the centred logit of the model's predicted token
 /// (a function's attribution at a position then includes its effect on later positions'
-/// predictions), or at one position the logit of `target` minus the logit of `foil`.
+/// predictions), that centred logit at one position (one target's prediction, as the read-out
+/// attributes its targets), or at one position the logit of `target` minus the logit of `foil`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Metric {
     Predicted,
+    PredictedAt { position: usize },
     Difference { position: usize, target: u32, foil: u32 },
+}
+
+impl Library<'_> {
+    /// The predicted tokens, and the seed and metric of the centred predicted logit at `position`
+    /// alone.
+    fn predicted_at(&self, pass: &Pass<'_>, position: usize) -> Result<(Vec<usize>, Array2<f64>, Vec<f64>), String> {
+        if position >= pass.rows {
+            return Err("a predicted-token metric outside the prompt".into());
+        }
+        let (predicted, all, metrics) = self.predicted(pass)?;
+        let mut seed = Array2::<f64>::zeros(all.dim());
+        seed.row_mut(position).assign(&all.row(position));
+        let mut metric = vec![0.0; pass.rows];
+        metric[position] = metrics[position];
+        Ok((predicted, seed, metric))
+    }
 }
 
 /// A prompt's attributions: per position the metric `m` (zero where it is not taken) and the
@@ -930,6 +948,7 @@ impl<'a> Library<'a> {
         let baseline = prompt.baseline.as_ref().map(|b| self.pass(&[b])).transpose()?;
         let (predicted, seed, metric) = match &prompt.metric {
             Metric::Predicted => self.predicted(&pass)?,
+            Metric::PredictedAt { position } => self.predicted_at(&pass, *position)?,
             Metric::Difference { position, target, foil } => {
                 let (t, f, p) = (*target as usize, *foil as usize, *position);
                 if p >= rows || t >= self.unembedding.nrows() || f >= self.unembedding.nrows() {
@@ -996,6 +1015,10 @@ impl<'a> Library<'a> {
             Metric::Predicted => {
                 let (_, seed, metric) = self.predicted(&pass)?;
                 (seed, metric.iter().sum::<f64>())
+            }
+            Metric::PredictedAt { position } => {
+                let (_, seed, metric) = self.predicted_at(&pass, *position)?;
+                (seed, metric[*position])
             }
             Metric::Difference { position, target, foil } => {
                 let (t, f, p) = (*target as usize, *foil as usize, *position);
