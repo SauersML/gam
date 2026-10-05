@@ -20,15 +20,17 @@ REPO=$HOME/gam-cluster BIN=$HOME/mpd-bin SRC=$HOME/mpd-src CL=$HOME/mpd-data/clu
 OUT=$CL/$NAME
 mkdir -p "$OUT" "$BIN" "$SRC" "$CL/_build"
 
-cat > "$CL/_build/build.sh" <<'BUILD'
+# Installed by rename: a build job's bash reads its script while it runs, so rewriting the file in
+# place would change the lines a running build executes next.
+cat > "$CL/_build/build.sh.$$" <<'BUILD'
 #!/usr/bin/env bash
 # Build job: build.sh COMMIT DEST [EXAMPLE...] compiles the named gam-mpd examples (every example
 # when none is named) at COMMIT and installs them in ~/mpd-bin/DEST/, a directory whose binaries
 # all come from commits with COMMIT's Rust sources. Linking one example with thin LTO takes about a
 # minute; linking all 59 took 15, and every queued run waited on it.
 set -Eeuo pipefail
-C=$1 C12=${1:0:12} D=$2
-shift 2
+C=$1 C12=${1:0:12} D=${2:-${1:0:12}}
+shift $(( $# < 2 ? $# : 2 ))
 trap 'echo "${SLURM_JOB_ID:-?} $C" > "$HOME/mpd-bin/$C12.failed"' ERR
 source "$HOME/.cargo/env"
 exec 9> "$HOME/gam-cluster/.build.lock"
@@ -61,6 +63,8 @@ done
 touch "$dest/.built-${SLURM_JOB_ID:-0}"
 echo "== $(date '+%F %T') installed $n binaries in $dest"
 BUILD
+chmod +x "$CL/_build/build.sh.$$"
+mv "$CL/_build/build.sh.$$" "$CL/_build/build.sh"
 
 exec 9> "$CL/_build/submit.lock"
 flock 9
