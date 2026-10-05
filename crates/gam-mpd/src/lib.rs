@@ -94,3 +94,5 @@ mod interchange_tests;
 
 /// Measured interventions on native models for an investigator (#2951).
 pub mod oracle;
+#[cfg(test)]
+mod oracle_tests;
