@@ -105,6 +105,21 @@ fn family(tokens: Vec<u32>) -> FamilyInputs {
         }),
     }
 }
+// The authenticated fitter manifest stores row counts, not token arrays.
+fn validate_pair_manifest(
+    manifest: &Value,
+    fold: usize,
+    old_rows: usize,
+    new_rows: usize,
+) -> Result<(), String> {
+    if manifest["fold"].as_u64() != Some(fold as u64)
+        || manifest["old_tokens"].as_u64() != Some(old_rows as u64)
+        || manifest["new_tokens"].as_u64() != Some(new_rows as u64)
+    {
+        return Err("frozen pair/fold/token-count lineage mismatch".into());
+    }
+    Ok(())
+}
 fn main() -> Result<(), String> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.len() != 6 {
@@ -325,13 +340,15 @@ fn main() -> Result<(), String> {
                         && p["new_fixture_id"].as_str() == Some(pair.appended_fixture_id.as_str())
                 })
                 .collect::<Vec<_>>();
-            if declared.len() != 1
-                || declared[0]["fold"].as_u64() != Some(fold as u64)
-                || declared[0]["old_tokens"] != lookup(&pair.previous_fixture_id)?["tokens"]
-                || declared[0]["new_tokens"] != case["tokens"]
-            {
-                return Err("frozen pair/fold/token lineage mismatch".into());
+            if declared.len() != 1 {
+                return Err("frozen pair absent/duplicated".into());
             }
+            validate_pair_manifest(
+                declared[0],
+                fold,
+                tokens(lookup(&pair.previous_fixture_id)?)?.len(),
+                tokens(case)?.len(),
+            )?;
             for read in &settings.read_nodes {
                 let entries = frozen_heads[read]["discovery_crossfit"]
                     .as_array()
@@ -558,6 +575,16 @@ mod tests {
         let previous = p.execute(&old, false).expect("old prefix");
         assert_eq!(previous.values[0].row(1), native.values[0].row(1));
         assert_eq!(previous.values[3].row(1), native.values[3].row(1));
+    }
+    #[test]
+    fn authenticated_pair_manifest_uses_counts_not_arrays() {
+        let manifest = json!({"old_fixture_id":"discovery-000","new_fixture_id":"discovery-001","fold":1,"old_tokens":23,"new_tokens":24});
+        validate_pair_manifest(&manifest, 1, 23, 24).expect("authenticated count schema");
+        assert!(validate_pair_manifest(&manifest, 0, 23, 24).is_err());
+        assert!(validate_pair_manifest(&manifest, 1, 22, 24).is_err());
+        assert!(validate_pair_manifest(&manifest, 1, 23, 25).is_err());
+        let invalid = json!({"fold":1,"old_tokens":[1,2],"new_tokens":[1,2,3]});
+        assert!(validate_pair_manifest(&invalid, 1, 2, 3).is_err());
     }
     #[test]
     fn oracle_logits_identity() {
