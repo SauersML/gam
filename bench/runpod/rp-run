@@ -492,8 +492,9 @@ if [ ${#pile[@]} -gt 0 ]; then
         [[ $base == "$MAC_DATA"/* ]] && [ -f "$base/export.json" ] || { echo "rp-run: engine/$x extends $base, which is not an export under $MAC_DATA" >&2; exit 2; }
         uploads+=("${base#"$MAC_DATA"/}")
         pile_plan+=("$x ${base#"$MAC_DATA"/} $(jq '[.source.data[1:][] | .rows[1] - .rows[0]] | add' "$record_json")")
-        # The export, and the Pile files it is built from (smaller than their float64 rows).
-        data_kb=$(( data_kb + 2 * $(du -skL "$MAC_DATA/engine/$x" | cut -f1) ))
+        # The export's tensors as its export.json records them (the Mac need not hold them), and the
+        # Pile files it is built from (smaller than their float64 rows).
+        data_kb=$(( data_kb + 2 * $(jq '[.files[].shape | reduce .[] as $n (8; . * $n)] | add / 1024 | floor' "$record_json") ))
     done
 fi
 KEY="" CACHE="" CHANNEL=""
