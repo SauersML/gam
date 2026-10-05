@@ -2004,7 +2004,9 @@ impl Device {
     /// variance (`variance`, groups × 1) and `δ = 1 / (N v)` the prior's precision per token:
     /// `ĥ = g ε / σ` (the reparameterization estimate of the data term's curvature per token),
     /// `m ← β₁ m + (1 − β₁) g`, `h ← max(0, β₂ h + (1 − β₂) ĥ + ½ (1 − β₂)² (h − ĥ)² / (h + δ))`,
-    /// `μ ← μ − α (m / (1 − β₁ᵗ) + δ μ) / (h + δ)` and
+    /// `μ ← μ − α (m / (1 − β₁ᵗ) + δ μ) / (h + δ)`, the move held within one posterior standard
+    /// deviation `σ` (a trust region: where `h + δ` is near the prior's `δ`, the Newton step is the
+    /// noisy gradient times `N v_G`, unsupported by any curvature the posterior has), and
     /// `s = −½ ln(N (h + δ))`: the Gaussian at which `N E_q[ℓ] + KL(q ‖ p)` is stationary for the
     /// curvature `h`. `h` stays nonnegative: the data term's Gauss–Newton curvature is positive
     /// semidefinite, so the posterior's precision `N (h + δ)` is at least the prior's; a negative
@@ -2053,7 +2055,7 @@ impl Device {
                     ms[i] = b1 * ms[i] + (1.0 - b1) * data;
                     let (h, d) = (hs[i], curvature - hs[i]);
                     hs[i] = (h + (1.0 - b2) * d + 0.5 * (1.0 - b2) * (1.0 - b2) * d * d / (h + delta)).max(0.0);
-                    means[i] = mu - step.rate * (ms[i] / correction + delta * mu) / (hs[i] + delta);
+                    means[i] = mu - (step.rate * (ms[i] / correction + delta * mu) / (hs[i] + delta)).clamp(-sd, sd);
                     log_sds[i] = -0.5 * (step.tokens * (hs[i] + delta)).ln();
                     totals[3 * g] += 1.0;
                     totals[3 * g + 1] += means[i] * means[i] + (2.0 * log_sds[i]).exp();
@@ -3627,7 +3629,8 @@ __device__ void posterior_ivon_body(u64 n, u64 count, u64 key, u64 stream, doubl
             T h = curvature[i], d = gi * e / sd - h;
             T h1 = h + o2 * d + (T)0.5 * o2 * o2 * d * d / (h + delta);
             h1 = h1 > (T)0 ? h1 : (T)0;
-            mu -= alpha * (m1 * k1 + delta * mu) / (h1 + delta);
+            T move = alpha * (m1 * k1 + delta * mu) / (h1 + delta);
+            mu -= move > sd ? sd : (move < -sd ? -sd : move);
             T s = (T)(-0.5 * log(tokens * ((double)h1 + (double)delta)));
             momentum[i] = m1; curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
             a = 1.0; b = (double)mu * (double)mu + exp(2.0 * (double)s); c = 2.0 * (double)s;
@@ -3675,7 +3678,7 @@ __device__ void posterior_ivon_mixed(u64 n, u64 count, u64 key, u64 stream, doub
             float m1 = b1 * entry_load(momentum[i]) + o1 * gi;
             float h = curvature[i], d = gi * e / sd - h;
             float h1 = fmaxf(h + o2 * d + 0.5f * o2 * o2 * d * d / (h + delta), 0.0f);
-            mu -= alpha * (m1 * k1 + delta * mu) / (h1 + delta);
+            mu -= fminf(fmaxf(alpha * (m1 * k1 + delta * mu) / (h1 + delta), -sd), sd);
             float s = (float)(-0.5 * log(tokens * ((double)h1 + (double)delta)));
             entry_store(momentum + i, m1); curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
             a = 1.0; b = (double)mu * (double)mu + exp(2.0 * (double)s); c = 2.0 * (double)s;
@@ -6992,7 +6995,7 @@ kernel void t_posterior_ivon(device const float* gradient [[buffer(0)]], device 
         float m1 = p.beta1 * momentum[i] + (1.0f - p.beta1) * gi;
         float o2 = 1.0f - p.beta2, h = curvature[i], d = gi * e / sd - h;
         float h1 = max(h + o2 * d + 0.5f * o2 * o2 * d * d / (h + delta), 0.0f);
-        mu -= p.rate * (m1 / p.c1 + delta * mu) / (h1 + delta);
+        mu -= clamp(p.rate * (m1 / p.c1 + delta * mu) / (h1 + delta), -sd, sd);
         float s = -0.5f * log(p.tokens * (h1 + delta));
         momentum[i] = m1; curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
         a = 1.0f; b = mu * mu + exp(2.0f * s); c = 2.0f * s;

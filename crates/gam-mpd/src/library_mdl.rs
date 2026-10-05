@@ -2901,7 +2901,7 @@ mod tests {
                 let d = g * e / sd - h0;
                 let h = (h0 + (1.0 - ivon.beta2) * d + 0.5 * (1.0 - ivon.beta2).powi(2) * d * d / (h0 + delta)).max(0.0);
                 let momentum = (1.0 - ivon.beta1) * g;
-                *mu -= ivon.rate * (momentum / (1.0 - ivon.beta1) + delta * *mu) / (h + delta);
+                *mu -= (ivon.rate * (momentum / (1.0 - ivon.beta1) + delta * *mu) / (h + delta)).clamp(-sd, sd);
                 reference.log_sd[i][[r, c]] = -0.5 * (tokens * (h + delta)).ln();
             }
         }

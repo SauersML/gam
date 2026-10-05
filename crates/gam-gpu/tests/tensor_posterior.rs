@@ -89,7 +89,7 @@ fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 
         let curvature = (h + (1.0 - b2) * d + 0.5 * (1.0 - b2) * (1.0 - b2) * d * d / (h + delta)).max(0.0);
         moments[0][at] = momentum;
         moments[1][at] = curvature;
-        mean[at] = mu - c.step.rate * (momentum / c1 + delta * mu) / (curvature + delta);
+        mean[at] = mu - (c.step.rate * (momentum / c1 + delta * mu) / (curvature + delta)).clamp(-sd, sd);
         log_sd[at] = -0.5 * (n * (curvature + delta)).ln();
         let a = &mut after[*g as usize];
         a[0] += 1.0;
