@@ -47,7 +47,7 @@ use crate::{
     resident_causal_fit::fixed_head_target::{Head, ResidentHead, Target},
     run_check::LayerNodes,
 };
-use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
+use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, Tensor};
 use gam_linalg::decompose::svd;
 use ndarray::{ArrayView2, Axis, s};
 use rand::RngExt;
@@ -262,11 +262,13 @@ impl Batch {
 pub struct FixedHead {
     head: Arc<Head>,
     resident: ResidentHead,
+    /// The hidden width as one column block (row dots).
+    width: ColumnBlocks,
 }
 
 impl FixedHead {
     /// The head of the flat programs `native` and `explanation`, which must be the same matrix;
-    /// `tile_rows` rows of vocabulary logits are formed at once.
+    /// `tile_rows` rows of vocabulary logits are formed at once where a score forms them.
     pub fn new(device: &Device, native: &OperatorProgram, explanation: &OperatorProgram, tile_rows: usize) -> Result<Self, String> {
         let head = Head::of(native)?;
         if !head.same(&Head::of(explanation)?) {
@@ -276,27 +278,19 @@ impl FixedHead {
             return Err(error("positive head tile rows required"));
         }
         let resident = ResidentHead::new(device, &head, tile_rows)?;
-        Ok(Self { head: Arc::new(head), resident })
+        let width = device.column_blocks(&[head.embedding.ncols()]).map_err(error)?;
+        Ok(Self { head: Arc::new(head), resident, width })
     }
 
-    /// The compact target of the hidden rows `hidden`: per row `E_p[e]` of the head's rows `e`
-    /// under `p = softmax(E h)`, and the entropy of `p`; the products in `arithmetic`.
+    /// The compact target of the hidden rows `hidden`: per row `μ = E_p[e]` of the head's rows `e`
+    /// under `p = softmax(E h)`, and `Σ p log p = μ·h − log Z`, `Z` the partition; the products in
+    /// `arithmetic`. `Device::head_log_partition` gives `log Z` and `μ` without forming the rows ×
+    /// vocabulary logits in f32 storage.
     fn target(&self, d: &Device, hidden: &Tensor, arithmetic: Arithmetic) -> Result<Target, String> {
-        let embedding = &self.resident.embedding;
-        let (rows, width, classes) = (hidden.rows(), embedding.cols(), embedding.rows());
-        let mut mu = d.zeros(rows, width).map_err(error)?;
-        let mut entropy = Vec::with_capacity(rows);
-        for start in (0..rows).step_by(self.resident.tile_rows) {
-            let n = self.resident.tile_rows.min(rows - start);
-            let h = d.rows_of(hidden, start, n).map_err(error)?;
-            let mut probabilities = d.zeros(n, classes).map_err(error)?;
-            d.gemm(&mut probabilities, 1.0, &h, Op::N, embedding, Op::T, 0.0, arithmetic).map_err(error)?;
-            let stats = d.softmax_stats_rows(&mut probabilities, None).map_err(error)?;
-            let mut projected = d.zeros(n, width).map_err(error)?;
-            d.gemm(&mut projected, 1.0, &probabilities, Op::N, embedding, Op::N, 0.0, arithmetic).map_err(error)?;
-            d.set_rows(&mut mu, start, &projected).map_err(error)?;
-            entropy.extend(stats.into_iter().map(|s| s[1]));
-        }
+        let mut mu = d.zeros(hidden.rows(), hidden.cols()).map_err(error)?;
+        let partitions = d.head_log_partition(hidden, &self.resident.embedding, false, None, Some(&mut mu), arithmetic).map_err(error)?;
+        let dots = d.download(&d.block_products(hidden, &mu, &self.width).map_err(error)?).map_err(error)?;
+        let entropy = partitions.iter().enumerate().map(|(r, z)| dots[(r, 0)] - z).collect();
         Ok(Target { mu: Arc::new(mu), entropy, head: Arc::clone(&self.head), scored: None })
     }
 }
