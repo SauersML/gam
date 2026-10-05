@@ -27,12 +27,15 @@ fn matrix(rows: usize, cols: usize, seed: u64, scale: f64, shift: f64) -> Array2
 }
 
 /// The test posterior: 6 × 40 entries in 9 groups (rows 0–2 by row, the rest by column pairs),
-/// one group removed (`s = −∞`, `μ = 0`), and its step.
+/// one group removed (`s = −∞`, `μ = 0`), the `(key, stream)` of its sample, its gradient and
+/// Gauss–Newton factor, and its step.
 struct Case {
     mean: Array2<f64>,
     log_sd: Array2<f64>,
     moments: [Array2<f64>; 2],
+    sample: (u64, u64),
     gradient: Array2<f64>,
+    factor: Array2<f64>,
     groups: Vec<u32>,
     count: usize,
     step: PosteriorStep,
@@ -51,8 +54,9 @@ fn case() -> Case {
     }
     // The gradient's momentum, and a positive curvature estimate.
     let moments = [matrix(rows, cols, 3, 0.1, 0.0), matrix(rows, cols, 4, 0.5, 1.0)];
-    let step = PosteriorStep { gradient_scale: 1.5, tokens: 50.0, rate: 0.1, beta1: 0.9, beta2: 0.999, step: 7, key: 0x1234_5678_9abc_def0, stream: 42 };
-    Case { mean, log_sd, moments, gradient: matrix(rows, cols, 7, 3.0, 0.0), groups, count: 8, step }
+    let step = PosteriorStep { gradient_scale: 1.5, factor_scale: 0.25, tokens: 50.0, rate: 0.1, beta1: 0.9, beta2: 0.999, step: 7 };
+    let (gradient, factor) = (matrix(rows, cols, 7, 3.0, 0.0), matrix(rows, cols, 8, 2.0, 0.0));
+    Case { mean, log_sd, moments, sample: (0x1234_5678_9abc_def0, 42), gradient, factor, groups, count: 8, step }
 }
 
 /// The formulas, entry by entry: the sample, the stepped posterior and moments, and the group sums
@@ -76,7 +80,7 @@ fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 
     let mut after = vec![[0.0; 3]; c.count];
     for (i, g) in c.groups.iter().enumerate() {
         let at = (i / c.mean.ncols(), i % c.mean.ncols());
-        let e = f64::from(posterior_normal(c.step.key, c.step.stream, i as u64));
+        let e = f64::from(posterior_normal(c.sample.0, c.sample.1, i as u64));
         let (mu, s) = (c.mean[at], c.log_sd[at]);
         theta[at] = mu + s.exp() * e;
         if s == f64::NEG_INFINITY {
@@ -85,8 +89,9 @@ fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 
         let (sd, gr) = (s.exp(), c.step.gradient_scale * c.gradient[at]);
         let delta = 1.0 / (n * variance[*g as usize]);
         let momentum = b1 * moments[0][at] + (1.0 - b1) * gr;
-        let (h, d) = (moments[1][at], gr * e / sd - moments[1][at]);
-        let curvature = (h + (1.0 - b2) * d + 0.5 * (1.0 - b2) * (1.0 - b2) * d * d / (h + delta)).max(0.0);
+        let estimate = c.step.factor_scale * c.factor[at] * c.factor[at];
+        let (h, d) = (moments[1][at], estimate - moments[1][at]);
+        let curvature = h + (1.0 - b2) * d + 0.5 * (1.0 - b2) * (1.0 - b2) * d * d / (h + delta);
         moments[0][at] = momentum;
         moments[1][at] = curvature;
         mean[at] = mu - (c.step.rate * (momentum / c1 + delta * mu) / (curvature + delta)).clamp(-sd, sd);
@@ -108,16 +113,16 @@ fn run(fit: &Device, wide: &Device, c: &Case) -> (Array2<f64>, Array2<f64>, Arra
     let mut moments: Vec<Tensor> = c.moments.iter().map(|m| up(fit, m)).collect();
     let groups: Indices = fit.upload_indices(&c.groups).unwrap();
     let mut theta = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
-    fit.reparameterize(&mut theta, (&mean, &log_sd), (c.step.key, c.step.stream)).unwrap();
+    fit.reparameterize(&mut theta, (&mean, &log_sd), c.sample).unwrap();
     let mut sums = wide.zeros(c.count, 3).unwrap();
     fit.group_moments((&mean, &log_sd), &groups, &mut sums).unwrap();
     let before = wide.download(&sums).unwrap();
     let (mut variance, mut divergence) = (wide.zeros(c.count, 1).unwrap(), wide.zeros(c.count, 1).unwrap());
     wide.group_divergence(&mut sums, &mut variance, &mut divergence).unwrap();
     assert!(wide.download(&sums).unwrap().iter().all(|v| *v == 0.0), "the sums are zeroed");
-    let gradient = up(fit, &c.gradient);
+    let (gradient, factor) = (up(fit, &c.gradient), up(fit, &c.factor));
     let [momentum, curvature] = &mut moments[..] else { unreachable!() };
-    fit.posterior_ivon((&mut mean, &mut log_sd), [momentum, curvature], &gradient, (&groups, &variance), &mut sums, &c.step).unwrap();
+    fit.posterior_ivon((&mut mean, &mut log_sd), [momentum, curvature], (&gradient, &factor), (&groups, &variance), &mut sums, &c.step).unwrap();
     let down = |t: &Tensor| fit.download(t).unwrap();
     let down_wide = |t: &Tensor| wide.download(t).unwrap();
     (fit.download(&theta).unwrap(), down(&mean), down(&log_sd), moments.iter().map(down).collect(), before, down_wide(&sums), down_wide(&divergence))
@@ -220,9 +225,9 @@ fn a_bfloat16_sample_is_the_f32_sample_rounded() {
     let c = case();
     let (mean, log_sd) = (fit.upload(c.mean.view()).unwrap(), fit.upload(c.log_sd.view()).unwrap());
     let mut single = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
-    fit.reparameterize(&mut single, (&mean, &log_sd), (c.step.key, c.step.stream)).unwrap();
+    fit.reparameterize(&mut single, (&mean, &log_sd), c.sample).unwrap();
     let mut half = fit.bf16_copy(&single).unwrap();
-    fit.reparameterize(&mut half, (&mean, &log_sd), (c.step.key, c.step.stream)).unwrap();
+    fit.reparameterize(&mut half, (&mean, &log_sd), c.sample).unwrap();
     // `bf16_copy` rounds to nearest, ties to even, as the bfloat16 sample does.
     let expected = fit.download(&fit.bf16_copy(&single).unwrap()).unwrap();
     assert_eq!(fit.download(&half).unwrap(), expected);
@@ -248,6 +253,7 @@ fn cuda_bfloat16_momentum_is_the_f32_step_rounded() {
         m.mapv_inplace(bf16);
     }
     c.gradient.mapv_inplace(bf16);
+    c.factor.mapv_inplace(bf16);
     let (theta, mean, log_sd, moments, _, after, _) = run(&fit, &wide, &c);
     let up = |d: &Device, m: &Array2<f64>| d.upload(m.view()).expect("upload");
     let down = |t: &Tensor| fit.download(t).expect("download");
@@ -256,13 +262,13 @@ fn cuda_bfloat16_momentum_is_the_f32_step_rounded() {
         let (mut momentum, mut curvature) = (up(&half, &c.moments[0]), up(&fit, &c.moments[1]));
         let groups = fit.upload_indices(&c.groups).expect("groups");
         let mut sample = half.zeros(c.mean.nrows(), c.mean.ncols()).expect("sample");
-        fit.reparameterize(&mut sample, (&m, &s), (c.step.key, c.step.stream)).expect("bfloat16 sample");
+        fit.reparameterize(&mut sample, (&m, &s), c.sample).expect("bfloat16 sample");
         let mut sums = wide.zeros(c.count, 3).expect("sums");
         fit.group_moments((&m, &s), &groups, &mut sums).expect("group moments");
         let (mut variance, mut divergence) = (wide.zeros(c.count, 1).expect("variance"), wide.zeros(c.count, 1).expect("divergence"));
         wide.group_divergence(&mut sums, &mut variance, &mut divergence).expect("group divergence");
-        let gradient = up(gradient_storage, &c.gradient);
-        fit.posterior_ivon((&mut m, &mut s), [&mut momentum, &mut curvature], &gradient, (&groups, &variance), &mut sums, &c.step).expect("bfloat16 step");
+        let (gradient, factor) = (up(gradient_storage, &c.gradient), up(gradient_storage, &c.factor));
+        fit.posterior_ivon((&mut m, &mut s), [&mut momentum, &mut curvature], (&gradient, &factor), (&groups, &variance), &mut sums, &c.step).expect("bfloat16 step");
         close("bfloat16 sample", &down(&sample), &theta.mapv(bf16), 2f64.powi(-8));
         close("mean", &down(&m), &mean, CHAIN);
         close("log sd", &down(&s), &log_sd, CHAIN);

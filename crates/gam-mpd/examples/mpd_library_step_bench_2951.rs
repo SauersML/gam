@@ -35,7 +35,7 @@ use gam_mpd::{
     run_check::{layer_nodes, split_sites},
 };
 use ndarray::Array2;
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, time::Instant};
 
@@ -334,26 +334,35 @@ fn main() -> Result<(), String> {
                 posterior.sample_into(&mut p_program, step as u64)?;
                 decoders.as_mut().map_or(Ok(()), |(_, p)| p.refresh(&p_program))
             })?;
-            let gradient = match (&scoring, &design) {
+            // The step's evaluation: the gradient and a draw of the Gauss–Newton factor (a second
+            // reverse pass through the same forward pass), with its scored tokens.
+            let mut draws = StdRng::seed_from_u64(step as u64);
+            let uniforms: Vec<f64> = (0..experiments.iter().map(|e| context - e.position).sum::<usize>()).map(|_| draws.random::<f64>()).collect();
+            let (gradient, factor, labelled) = match (&scoring, &design) {
                 (Some((head, m)), Some(design)) => {
                     let evaluation = match &decoders {
                         Some((m, p)) => {
                             let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments, design))?;
-                            timed(&device, s, "evaluate", || interchange::evaluate(m, p, head, &batch, &targets, &experiments, design, true))?
+                            timed(&device, s, "evaluate", || interchange::evaluate_labelled((m, p), head, (&batch, &experiments, design), Some(&targets), true, Some(&uniforms)))?
                         }
                         None => {
                             let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments, design))?;
-                            timed(&device, s, "evaluate", || interchange::evaluate(m, &p_model(&p_program, sites)?, head, &batch, &targets, &experiments, design, true))?
+                            let p = p_model(&p_program, sites)?;
+                            timed(&device, s, "evaluate", || interchange::evaluate_labelled((m, &p), head, (&batch, &experiments, design), Some(&targets), true, Some(&uniforms)))?
                         }
                     };
                     let tokens = evaluation.bits.iter().map(Vec::len).sum::<usize>();
                     mean_bits = Some(evaluation.bits.iter().flatten().sum::<f64>() / tokens as f64);
-                    evaluation.gradient
+                    let factor = evaluation.factor.ok_or("no Gauss–Newton factor")?;
+                    (evaluation.gradient, factor.gradient, factor.tokens)
                 }
-                _ => zeros.iter().map(|(op, z)| Ok((*op, device.copy(z).map_err(error)?))).collect::<Result<BTreeMap<_, _>, String>>()?,
+                _ => {
+                    let zero = || zeros.iter().map(|(op, z)| Ok((*op, device.copy(z).map_err(error)?))).collect::<Result<BTreeMap<_, _>, String>>();
+                    (zero()?, zero()?, 1)
+                }
             };
             timed(&device, s, "description", || Ok(posterior.divergences()?.iter().sum::<f64>()))?;
-            timed(&device, s, "posterior_step", || posterior.step(&gradient, scale, &ivon, step as u64))?;
+            timed(&device, s, "posterior_step", || posterior.step(&gradient, scale, (&factor, 1.0 / labelled as f64), &ivon))?;
         }
     }
     // The decoder's blocks alone, forward with tapes then reverse, on the bases (no head, no

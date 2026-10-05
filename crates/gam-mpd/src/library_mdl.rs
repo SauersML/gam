@@ -77,11 +77,23 @@
 //! Each step draws one weight sample `θ = μ + σ ⊙ ε` (`ε` standard normal), runs a batch's
 //! experiments, and takes one step of the improved variational online Newton method (IVON; Shen et
 //! al., ICML 2024) on `F / N = E_q[ℓ] + KL(q ‖ p) / N`, `ℓ` the data term per scored token and `N`
-//! the scored tokens of every training experiment: the batch's gradient `g` of `ℓ` at the sample
-//! gives the curvature estimate `ĥ = g ε / σ`, whose average over the last epoch's batches is `h`
-//! (`β₂ = 1 − 1/B` for `B` training batches); the posterior's standard deviation is then
-//! `σ = 1 / √(N (h + δ))` with `δ = 1 / (N v_G)` the group prior's precision per token, the value
-//! at which `F` is stationary in `σ`, so `σ` has no step size; the mean takes the preconditioned
+//! the scored tokens of every training experiment. The data term's curvature is taken in the
+//! Gauss–Newton approximation: per token the diagonal of `Σ_t J_tᵀ F_t J_t`, `F_t` the Fisher
+//! matrix of `P_e`'s softmax at token `t`, which is positive semidefinite. The Hessian adds the
+//! second derivatives of `P_e`'s logits weighted by `p_P − p_M`, so the two agree where `P_e`'s
+//! predictions equal `M_e`'s. The estimate is the squared Gauss–Newton factor `ĥ = u ⊙ u / n`
+//! (`interchange::Factor`): `u` is the gradient of `Σ_t log P_e(y_t)` over the batch's `n` scored
+//! tokens, each label `y_t` drawn from `P_e`'s own prediction, from a second reverse pass through
+//! the step's forward pass, and `E[ĥ]` is that diagonal. The reparameterization estimate
+//! `g ε / σ` of the Hessian's diagonal carries every other weight's noise through the off-diagonal
+//! terms (on vpd4l, eight draws showed no signal). `h` is the estimates' average over the last
+//! epoch's batches (`β₂ = 1 − 1/B` for `B` training batches), starting from the
+//! unit-information curvature `1 / v_G`. Under the approximation `h ≥ 0`, and the approximated
+//! objective is stationary in `σ` at `σ = 1 / √(N (h + δ))`, `δ = 1 / (N v_G)` the group prior's
+//! precision per token, so `σ² ≤ v_G`. That stationary point is implicit (`h` is an expectation
+//! under `q`, and `v_G` depends on `σ`); setting `σ` from the running `h` and the current `v_G` at
+//! every step is an online approximation to it, so `σ` has no step size; the mean takes the
+//! preconditioned
 //! step `α (m + δ μ) / (h + δ)` along the gradient's momentum `m`. The posterior stays on the
 //! device through an epoch (`device_posterior`): the sample is written into the explanation's
 //! program, the gradient stays where the reverse pass left it, and the IVON step and the groups'
@@ -1304,7 +1316,8 @@ impl Scorer {
 
     /// [`Scorer::score`] with the posterior on the device: the explanation at its weight sample
     /// of `sample` ([`DevicePosterior::sample_into`]), or at its mean when none, and with
-    /// `gradient` the gradient of the sum per trainable operator, left on the device.
+    /// `gradient` the gradient of the sum per trainable operator and a draw of the Gauss–Newton
+    /// factor (`interchange::Factor`, its labels drawn from the seed `sample`), left on the device.
     fn score_device(
         &mut self,
         posterior: &DevicePosterior,
@@ -1313,17 +1326,21 @@ impl Scorer {
         sample: Option<u64>,
         key: &str,
         gradient: bool,
-    ) -> Result<(Vec<Vec<f64>>, BTreeMap<usize, Tensor>), String> {
+    ) -> Result<(Vec<Vec<f64>>, BTreeMap<usize, Tensor>, Option<interchange::Factor>), String> {
         let (design, targets) = self.targets(batch, experiments, key)?;
         match sample {
             Some(seed) => posterior.sample_into(self.experiments.explanation_mut(), seed)?,
             None => posterior.mean_into(self.experiments.explanation_mut())?,
         }
-        let evaluation = self.experiments.evaluate_resident(batch, experiments, &design, &targets, gradient)?;
+        let labels = match (gradient, sample) {
+            (true, Some(seed)) => Some(uniforms(seed, batch, experiments)),
+            _ => None,
+        };
+        let evaluation = self.experiments.evaluate_labelled(batch, experiments, &design, Some(&targets), gradient, labels.as_deref())?;
         if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
             return Err("nonfinite explanation divergence".into());
         }
-        Ok((evaluation.bits, evaluation.gradient))
+        Ok((evaluation.bits, evaluation.gradient, evaluation.factor))
     }
 
     /// The patch directions of `experiments` (from the thread that made them ahead, when one did,
@@ -1394,6 +1411,14 @@ impl Scorer {
     }
 }
 
+/// One uniform per scored row of `experiments` on `batch` (rows in experiment order) from `seed`:
+/// the draws of the Gauss–Newton factor's labels (`interchange::evaluate_labelled`).
+fn uniforms(seed: u64, batch: &Batch, experiments: &[Experiment]) -> Vec<f64> {
+    let rows: usize = experiments.iter().map(|e| batch.length() - e.position).sum();
+    let mut rng = StdRng::seed_from_u64(seed);
+    (0..rows).map(|_| rng.random::<f64>()).collect()
+}
+
 /// The noise seed of step `(epoch, batch)`, or of the removal comparisons' and the held-out
 /// evaluation's batch (epoch 0).
 fn noise_seed(seed: u64, epoch: usize, batch: usize) -> u64 {
@@ -1452,7 +1477,7 @@ fn held_out(
     for (b, (draw, experiments)) in held_out_experiments(scorer, sequences, settings)?.into_iter().enumerate() {
         let batch = draw.batch(sequences)?;
         let key = format!("held_{}_{b}", sequences.len());
-        let (bits, _) = scorer.score_device(device_posterior, &batch, &experiments, None, &key, false)?;
+        let (bits, _, _) = scorer.score_device(device_posterior, &batch, &experiments, None, &key, false)?;
         bits.iter().for_each(|b| at_mean.add(b));
         let (rounded_bits, _) = scorer.score(&batch, &experiments, &rounded.mean, &key, false)?;
         rounded_bits.iter().for_each(|b| at_rounded.add(b));
@@ -1468,7 +1493,7 @@ fn held_out(
                 }
             }
         }
-        let (bits, _) = scorer.score_device(device_posterior, &batch, &experiments, Some(noise_seed(settings.seed, 0, b)), &key, false)?;
+        let (bits, _, _) = scorer.score_device(device_posterior, &batch, &experiments, Some(noise_seed(settings.seed, 0, b)), &key, false)?;
         bits.iter().for_each(|b| sampled.add(b));
         let patched: Vec<Experiment> = experiments.into_iter().filter(|e| e.patch.is_some()).collect();
         if let Some(bits) = scorer.score_adaptive(&batch, &patched, &posterior.mean)? {
@@ -2069,7 +2094,8 @@ pub fn fit(
             let experiments = scorer.experiments(draw, sequences)?;
             scorer.prefetch(&draws[(b + 1) % draws.len()], sequences)?;
             let key = noise_seed(settings.seed, epoch + 1, b);
-            let (bits, mut gradients) = scorer.score_device(&device_posterior, &batch, &experiments, Some(key), &format!("train_{b}"), true)?;
+            let (bits, mut gradients, factor) = scorer.score_device(&device_posterior, &batch, &experiments, Some(key), &format!("train_{b}"), true)?;
+            let factor = factor.ok_or("no Gauss–Newton factor")?;
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
@@ -2119,7 +2145,7 @@ pub fn fit(
             data_sum += data;
             description_sum += description;
             progress.step += 1;
-            device_posterior.step(&gradients, LN_2 / scored as f64, &ivon, key)?;
+            device_posterior.step(&gradients, LN_2 / scored as f64, (&factor.gradient, 1.0 / factor.tokens as f64), &ivon)?;
             log::info!(
                 "library step {epoch}.{b}: {:.6} bits per scored token, F estimate {:.6e} bits, {:.2} s",
                 bits.iter().flatten().sum::<f64>() / scored as f64,
@@ -2369,7 +2395,6 @@ fn mean_artifact(mut artifact: Artifact, trainable: &[usize], means: Vec<Array2<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_gpu::tensor::posterior_normal;
     use crate::{
         import::import_language_model,
         run_check::{layer_nodes, split_sites},
@@ -2919,13 +2944,14 @@ mod tests {
         }
         let tokens = 72.0;
         let mut device_posterior = DevicePosterior::new(&device, &explanation, &posterior, tokens, None, 0).unwrap();
-        // A data gradient per operator, weighted by `scale`, at the sample whose noise the device
-        // regenerates from `key` (stream `i` for operator `i`).
-        let (key, scale) = (99, 3.0);
+        // A data gradient per operator, weighted by `scale`, and a Gauss–Newton factor, its square
+        // weighted by `square`.
+        let (scale, square) = (3.0, 0.2);
         let gradients: Vec<Array2<f64>> = posterior.mean.iter().map(|m| m.mapv(|_| rng.random::<f64>() - 0.5)).collect();
-        let uploaded: BTreeMap<usize, Tensor> = explanation.trainable.iter().zip(&gradients).map(|(op, g)| (*op, device.upload(g.view()).unwrap())).collect();
+        let factors: Vec<Array2<f64>> = posterior.mean.iter().map(|m| m.mapv(|_| rng.random::<f64>() - 0.5)).collect();
+        let up = |values: &[Array2<f64>]| -> BTreeMap<usize, Tensor> { explanation.trainable.iter().zip(values).map(|(op, g)| (*op, device.upload(g.view()).unwrap())).collect() };
         let ivon = Ivon { rate: settings.rate, beta1: settings.beta1, beta2: 0.75 };
-        device_posterior.step(&uploaded, scale, &ivon, key).unwrap();
+        device_posterior.step(&up(&gradients), scale, (&up(&factors), square), &ivon).unwrap();
         let mut stepped = posterior.clone();
         device_posterior.download(&mut stepped).unwrap();
         // The host reference: IVON's first step from momentum zero and the curvature at which the
@@ -2933,15 +2959,13 @@ mod tests {
         let variance: Vec<f64> = posterior.moments().iter().map(|m| m.second / m.count).collect();
         let mut reference = posterior.clone();
         for i in 0..reference.mean.len() {
-            let cols = reference.mean[i].ncols();
             for ((r, c), mu) in reference.mean[i].indexed_iter_mut() {
                 let delta = 1.0 / (tokens * variance[posterior.membership[i][[r, c]] as usize]);
                 let sd = posterior.log_sd[i][[r, c]].exp();
-                let e = f64::from(posterior_normal(key, i as u64, (r * cols + c) as u64));
                 let g = scale * gradients[i][[r, c]];
                 let h0 = (1.0 / (tokens * sd * sd) - delta).max(0.0);
-                let d = g * e / sd - h0;
-                let h = (h0 + (1.0 - ivon.beta2) * d + 0.5 * (1.0 - ivon.beta2).powi(2) * d * d / (h0 + delta)).max(0.0);
+                let d = square * factors[i][[r, c]] * factors[i][[r, c]] - h0;
+                let h = h0 + (1.0 - ivon.beta2) * d + 0.5 * (1.0 - ivon.beta2).powi(2) * d * d / (h0 + delta);
                 let momentum = (1.0 - ivon.beta1) * g;
                 *mu -= (ivon.rate * (momentum / (1.0 - ivon.beta1) + delta * *mu) / (h + delta)).clamp(-sd, sd);
                 reference.log_sd[i][[r, c]] = -0.5 * (tokens * (h + delta)).ln();

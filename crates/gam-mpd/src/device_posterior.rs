@@ -4,9 +4,11 @@
 //!
 //! A step writes the weight sample `θ = μ + exp(s) ε` into the explanation's program
 //! ([`Device::reparameterize`], `ε` regenerated from its counter), runs the experiments, and takes
-//! the improved variational online Newton step (IVON, [`Device::posterior_ivon`]) from the
-//! gradient the program's reverse pass left on the device, which also sums each prior group's new
-//! moments; the groups' variances and divergences follow from those sums
+//! the improved variational online Newton step (IVON, [`Device::posterior_ivon`]) with the data
+//! term's curvature in the Gauss–Newton approximation, from the gradient the program's reverse
+//! pass left on the device and a draw of the Gauss–Newton factor (`interchange::Factor`, a second
+//! reverse pass from labels drawn from the explanation's own predictions), which also sums each
+//! prior group's new moments; the groups' variances and divergences follow from those sums
 //! ([`Device::group_divergence`]). The posterior and the curvature are held in the fitting storage
 //! (f32 on CUDA and the Apple GPU, float64 on the host); the momentum in bfloat16 where the masters
 //! are f32 on CUDA (rounded once as it is stored, its update computed in f32), else in the fitting
@@ -231,26 +233,28 @@ impl DevicePosterior {
         program.refresh_fused()
     }
 
-    /// One IVON step from the gradient of the data term at the sample of `key`: `gradients` holds
-    /// per trainable operator (by id) the gradient of the batch's data term, which `scale` turns
-    /// into the gradient per token in nats (one over the batch's scored tokens, and the
-    /// conversion from bits); an operator the batch does not reach has none, and its step takes
-    /// the prior's alone.
-    pub fn step(&mut self, gradients: &BTreeMap<usize, Tensor>, scale: f64, ivon: &Ivon, key: u64) -> Result<(), String> {
+    /// One IVON step: `gradients` holds per trainable operator (by id) the gradient of the batch's
+    /// data term at the sample, which `scale` turns into the gradient per token in nats (one over
+    /// the batch's scored tokens, and the conversion from bits); `factor` holds per operator a draw
+    /// of the Gauss–Newton factor and the factor `1 / n` turning its square into the curvature
+    /// estimate per token. An operator the batch does not reach has neither, and its step takes the
+    /// prior's alone.
+    pub fn step(&mut self, gradients: &BTreeMap<usize, Tensor>, scale: f64, factor: (&BTreeMap<usize, Tensor>, f64), ivon: &Ivon) -> Result<(), String> {
         self.steps += 1;
         for (i, &op) in self.operators.iter().enumerate() {
-            let zero;
-            let gradient = match gradients.get(&op) {
-                Some(g) => g,
-                None => {
-                    zero = self.fitting.zeros(self.mean[i].rows(), self.mean[i].cols()).map_err(error)?;
-                    &zero
+            let zero = |given: Option<&Tensor>| -> Result<Option<Tensor>, String> {
+                match given {
+                    Some(_) => Ok(None),
+                    None => self.fitting.zeros(self.mean[i].rows(), self.mean[i].cols()).map(Some).map_err(error),
                 }
             };
-            let step = PosteriorStep { gradient_scale: scale, tokens: self.tokens, rate: ivon.rate, beta1: ivon.beta1, beta2: ivon.beta2, step: self.steps, key, stream: i as u64 };
+            let (missing_gradient, missing_factor) = (zero(gradients.get(&op))?, zero(factor.0.get(&op))?);
+            let gradient = gradients.get(&op).or(missing_gradient.as_ref()).ok_or_else(|| error("no gradient"))?;
+            let draw = factor.0.get(&op).or(missing_factor.as_ref()).ok_or_else(|| error("no Gauss–Newton factor"))?;
+            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, rate: ivon.rate, beta1: ivon.beta1, beta2: ivon.beta2, step: self.steps };
             let [momentum, curvature] = &mut self.moments[i];
             self.fitting
-                .posterior_ivon((&mut self.mean[i], &mut self.log_sd[i]), [momentum, curvature], gradient, (&self.groups[i], &self.variance), &mut self.sums, &step)
+                .posterior_ivon((&mut self.mean[i], &mut self.log_sd[i]), [momentum, curvature], (gradient, draw), (&self.groups[i], &self.variance), &mut self.sums, &step)
                 .map_err(error)?;
         }
         self.wide.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
