@@ -5,7 +5,7 @@ use crate::{
     artifact_device::mapped_inlined,
     device_program::{DeviceProgram, DeviceTrace},
     operator_program::{
-        FamilyInputs, OperatorBody, OperatorProgram, Slot, SlotValues, exact_precision,
+        exact_precision, FamilyInputs, OperatorBody, OperatorProgram, Slot, SlotValues,
     },
 };
 use gam_gpu::tensor::{Arithmetic, Device, Tensor};
@@ -41,6 +41,16 @@ pub struct Backtracking {
     pub factor: f64,
     pub max_trials: usize,
 }
+/// Proposal-only aggregation. Neither mode changes full TRAIN maximum snapshot selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchObjective {
+    #[default]
+    GlobalSmoothMaximum,
+    /// Equal average of each output group's smooth maximum over selected rows.
+    /// Prevents a high-error group from suppressing all gradients of another group.
+    MeanGroupSmoothMaximum,
+}
 /// Optional proposal schedule. Temperature is in normalized squared-error units.
 /// Ordinary rows cycle deterministically through the complete training panel; hard rows
 /// are the top distinct rows (maximum over groups) from the last complete training scan.
@@ -51,6 +61,8 @@ pub struct BatchSchedule {
     pub hard_rows: usize,
     pub scan_every: usize,
     pub temperature: f64,
+    #[serde(default)]
+    pub objective: BatchObjective,
 }
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TrainingRowWork {
@@ -471,6 +483,30 @@ fn smooth_weights(norms: &[Vec<f64>], temperature: f64) -> Result<Vec<Vec<f64>>,
     }
     Ok(weights)
 }
+fn proposal_weights(norms: &[Vec<f64>], batch: &BatchSchedule) -> Result<Vec<Vec<f64>>, String> {
+    match batch.objective {
+        BatchObjective::GlobalSmoothMaximum => smooth_weights(norms, batch.temperature),
+        BatchObjective::MeanGroupSmoothMaximum => {
+            if norms.is_empty() {
+                return Err("group-balanced proposal needs output groups".into());
+            }
+            let count = norms.len() as f64;
+            norms
+                .iter()
+                .map(|group| {
+                    let weights = smooth_weights(std::slice::from_ref(group), batch.temperature)?;
+                    Ok(weights
+                        .into_iter()
+                        .next()
+                        .ok_or("missing group weights")?
+                        .into_iter()
+                        .map(|weight| weight / count)
+                        .collect())
+                })
+                .collect()
+        }
+    }
+}
 
 fn snapshot(p: &DeviceProgram, trainable: &[usize]) -> Result<BTreeMap<usize, Tensor>, String> {
     trainable
@@ -832,7 +868,7 @@ fn fit_grouped_internal(
             let selected = training.selected(d, &selected)?;
             let (trace, residual, norms) =
                 selected.evaluate_group_rows(&program, 0, selected.family.rows)?;
-            let weights = smooth_weights(&norms, batch.temperature)?;
+            let weights = proposal_weights(&norms, batch)?;
             let mut coefficients = Array2::zeros((selected.family.rows, output));
             for (group, scale) in training.groups.iter().enumerate() {
                 for row in 0..selected.family.rows {
@@ -1037,7 +1073,7 @@ fn fit_grouped_internal(
             planned_numeric_bytes: planned,
             seconds: started.elapsed().as_secs_f64(),
             scope: if batch_schedule.is_some() {
-                "Batched proposal optimization only. Deterministic cyclic ordinary rows plus retained top-hard rows across all groups. Stable smoothmax normalized squared-error gradients on selected rows/groups; minibatch surrogate is NOT a full-panel maximum bound. Complete training maximum scanned initially, periodically and finally; ONLY these full scans select best training snapshot. Validation excluded from updates/selection. Row-separable ordinary graph only. Legacy active-row backtracking forbidden. Explicit arithmetic setting applies to proposal products; exact decoded Local acceptance unchanged. Numeric plan includes gathered input/target/seed tensors, excludes host weight arrays/product conversion/library/allocator/context/register/spill scratch."
+                "Batched proposal optimization only. Deterministic cyclic ordinary rows plus retained top-hard rows across all groups. Explicit global smoothmax or mean of per-group smoothmax normalized squared-error gradients on selected rows; minibatch surrogate is NOT a full-panel maximum bound. Complete training maximum scanned initially, periodically and finally; ONLY these full scans select best training snapshot. Validation excluded from updates/selection. Row-separable ordinary graph only. Legacy active-row backtracking forbidden. Explicit arithmetic setting applies to proposal products; exact decoded Local acceptance unchanged. Numeric plan includes gathered input/target/seed tensors, excludes host weight arrays/product conversion/library/allocator/context/register/spill scratch."
             } else {
                 "Proposal optimization only, fixed finite f64 input/output rows. Explicit settings.arithmetic governs forward and backward products, including training/validation proposal scores; parameter/moment storage and other primitives remain f64. The f32 option uses rounded-product surrogate gradients, not derivatives through rounding. Maximum over ALL output groups and rows, each group normalized by its own complete native-family RMS. Optional declared finite backtracking scans the SAME full training maximum and accepts only strict decrease; proposed moments and Adam time commit only with an accepted step, exhaustion restores old parameters and stops. Default uses original fixed-step Adam. Deterministic active-group/row max-norm Adam; full row scan in declared chunks and one-row reverse. Single-row GEMM rounding may differ from batch; recomputed error recorded; nonconvex, no optimum certificate. Best training snapshot, validation excluded from selection. Resident numerical parameters/gradients/moments/inputs/targets; O(rows) norms downloaded each step and final parameters downloaded. Numeric plan excludes product conversion/library/allocator/context/register/spill scratch. Final decoded f64 measurement and acceptance are separate."
             },
@@ -1353,6 +1389,7 @@ mod tests {
                 hard_rows: 1,
                 scan_every: 10,
                 temperature: 0.1,
+                objective: BatchObjective::GlobalSmoothMaximum,
             },
         )
         .expect("combined fit");
@@ -1380,7 +1417,7 @@ mod tests {
     }
     #[test]
     fn batch_realizable_generated_interior_teacher_fits_full_maps_and_shared_body() {
-        use crate::composed_rule_search::{Expr, Unary, UseSpec, compile};
+        use crate::composed_rule_search::{compile, Expr, Unary, UseSpec};
         let expression = Expr::Unary(
             Unary::GeluTanh,
             Box::new(Expr::Affine(Box::new(Expr::Unary(
@@ -1434,6 +1471,7 @@ mod tests {
                 hard_rows: 4,
                 scan_every: 10,
                 temperature: 0.02,
+                objective: BatchObjective::GlobalSmoothMaximum,
             },
         )
         .expect("generated composition fit");
@@ -1539,52 +1577,50 @@ mod tests {
             hard_rows: 1,
             scan_every: 0,
             temperature: 0.1,
+            objective: BatchObjective::GlobalSmoothMaximum,
         };
-        assert!(
-            fit_grouped_batched(
-                &Device::host(),
-                &p,
-                std::slice::from_ref(&x),
-                &y,
-                std::slice::from_ref(&x),
-                &y,
-                &[OutputGroup {
-                    label: "all".into(),
-                    start: 0,
-                    end: 1
-                }],
-                &[0, 1],
-                settings(),
-                invalid
-            )
-            .is_err()
-        );
+        assert!(fit_grouped_batched(
+            &Device::host(),
+            &p,
+            std::slice::from_ref(&x),
+            &y,
+            std::slice::from_ref(&x),
+            &y,
+            &[OutputGroup {
+                label: "all".into(),
+                start: 0,
+                end: 1
+            }],
+            &[0, 1],
+            settings(),
+            invalid
+        )
+        .is_err());
         let good = BatchSchedule {
             ordinary_rows: 1,
             hard_rows: 1,
             scan_every: 2,
             temperature: 0.1,
+            objective: BatchObjective::GlobalSmoothMaximum,
         };
         let zero = Array2::zeros(y.dim());
-        assert!(
-            fit_grouped_batched(
-                &Device::host(),
-                &p,
-                std::slice::from_ref(&x),
-                &zero,
-                std::slice::from_ref(&x),
-                &zero,
-                &[OutputGroup {
-                    label: "all".into(),
-                    start: 0,
-                    end: 1
-                }],
-                &[0, 1],
-                settings(),
-                good.clone()
-            )
-            .is_err()
-        );
+        assert!(fit_grouped_batched(
+            &Device::host(),
+            &p,
+            std::slice::from_ref(&x),
+            &zero,
+            std::slice::from_ref(&x),
+            &zero,
+            &[OutputGroup {
+                label: "all".into(),
+                start: 0,
+                end: 1
+            }],
+            &[0, 1],
+            settings(),
+            good.clone()
+        )
+        .is_err());
         let mut cross = p.clone();
         cross.nodes.push(Node::Attend {
             query: 0,
@@ -1595,31 +1631,104 @@ mod tests {
             causal: true,
         });
         cross.output = cross.nodes.len() - 1;
-        assert!(
-            fit_grouped_batched(
-                &Device::host(),
-                &cross,
-                std::slice::from_ref(&x),
-                &y,
-                std::slice::from_ref(&x),
-                &y,
-                &[OutputGroup {
-                    label: "all".into(),
-                    start: 0,
-                    end: 1
-                }],
-                &[0, 1],
-                settings(),
-                good.clone()
-            )
-            .is_err()
-        );
+        assert!(fit_grouped_batched(
+            &Device::host(),
+            &cross,
+            std::slice::from_ref(&x),
+            &y,
+            std::slice::from_ref(&x),
+            &y,
+            &[OutputGroup {
+                label: "all".into(),
+                start: 0,
+                end: 1
+            }],
+            &[0, 1],
+            settings(),
+            good.clone()
+        )
+        .is_err());
         let mut old = settings();
         old.backtracking = Some(Backtracking {
             factor: 0.5,
             max_trials: 2,
         });
-        assert!(
+        assert!(fit_grouped_batched(
+            &Device::host(),
+            &p,
+            std::slice::from_ref(&x),
+            &y,
+            std::slice::from_ref(&x),
+            &y,
+            &[OutputGroup {
+                label: "all".into(),
+                start: 0,
+                end: 1
+            }],
+            &[0, 1],
+            old,
+            good
+        )
+        .is_err());
+        let weights = smooth_weights(&[vec![1., 1.], vec![1., 1.]], 0.1).expect("stable tie");
+        assert_eq!(weights, vec![vec![0.25, 0.25]; 2]);
+        let huge = smooth_weights(&[vec![f64::MAX]], 0.1);
+        assert!(huge.is_err());
+    }
+    #[test]
+    fn group_balanced_proposal_preserves_clean_gradient_under_scalar_imbalance() {
+        let scalar = Interface::native(1).expect("scalar");
+        let vector = Interface::native(2).expect("vector");
+        let values = ndarray::array![[3.], [17.]];
+        let p = OperatorProgram {
+            declarations: Declarations {
+                domains: vec![],
+                parameters: 0,
+                slots: vec![Slot::Raw { width: 1 }],
+            },
+            bases: vec![],
+            rules: vec![],
+            operators: vec![Arc::new(
+                Operator::dense(
+                    "separate output rows",
+                    vector,
+                    scalar,
+                    values.clone(),
+                    exact_precision(values.iter().copied()).expect("precision"),
+                    Default::default(),
+                )
+                .expect("dense"),
+            )],
+            nodes: vec![
+                Node::Raw { slot: 0 },
+                Node::Affine {
+                    terms: vec![(0, 0)],
+                    bias: None,
+                },
+            ],
+            output: 1,
+        };
+        let x = ndarray::array![[1.]];
+        let y = ndarray::array![[1., 1.]];
+        let mut optimizer = settings();
+        optimizer.iterations = 1;
+        optimizer.learning_rate = 0.01;
+        let schedule = BatchSchedule {
+            ordinary_rows: 1,
+            hard_rows: 0,
+            scan_every: 1,
+            temperature: 0.1,
+            objective: BatchObjective::GlobalSmoothMaximum,
+        };
+        let global = proposal_weights(&[vec![2.], vec![16.]], &schedule).expect("global weights");
+        assert_eq!(global[0][0], 0.);
+        let mut balanced = schedule.clone();
+        balanced.objective = BatchObjective::MeanGroupSmoothMaximum;
+        assert_eq!(
+            proposal_weights(&[vec![2.], vec![16.]], &balanced).expect("balanced"),
+            vec![vec![0.5], vec![0.5]]
+        );
+        let fit = |batch| {
             fit_grouped_batched(
                 &Device::host(),
                 &p,
@@ -1627,21 +1736,72 @@ mod tests {
                 &y,
                 std::slice::from_ref(&x),
                 &y,
-                &[OutputGroup {
-                    label: "all".into(),
-                    start: 0,
-                    end: 1
-                }],
-                &[0, 1],
-                old,
-                good
+                &groups(),
+                &[0],
+                optimizer.clone(),
+                batch,
             )
-            .is_err()
+            .expect("fit")
+        };
+        let old = fit(schedule);
+        let new = fit(balanced);
+        let clean = |fit: &GroupFit| match &fit.program.operators[0].body {
+            OperatorBody::Dense { values, .. } => values[(0, 0)],
+            _ => panic!("dense parameter"),
+        };
+        assert_eq!(clean(&old), 3.);
+        assert!(clean(&new) < 2.999, "clean gradient must update the writer");
+        for result in [&old, &new] {
+            assert_eq!(result.report.best_step, 1);
+            assert!(result.report.best_training_max < result.report.initial_training_max);
+        }
+    }
+    #[test]
+    fn group_balanced_weights_match_objective_derivatives_and_legacy_json() {
+        let old =
+            serde_json::json!({"ordinary_rows":3,"hard_rows":0,"scan_every":1,"temperature":0.7});
+        let mut schedule: BatchSchedule = serde_json::from_value(old).expect("legacy schedule");
+        assert_eq!(schedule.objective, BatchObjective::GlobalSmoothMaximum);
+        let norms = vec![vec![0.2, 1.3, 0.8], vec![3.1, 2.9, 3.2]];
+        assert_eq!(
+            proposal_weights(&norms, &schedule).expect("default"),
+            smooth_weights(&norms, 0.7).expect("legacy")
         );
-        let weights = smooth_weights(&[vec![1., 1.], vec![1., 1.]], 0.1).expect("stable tie");
-        assert_eq!(weights, vec![vec![0.25, 0.25]; 2]);
-        let huge = smooth_weights(&[vec![f64::MAX]], 0.1);
-        assert!(huge.is_err());
+        schedule.objective = BatchObjective::MeanGroupSmoothMaximum;
+        let weights = proposal_weights(&norms, &schedule).expect("weights");
+        let objective = |values: &[Vec<f64>]| {
+            values
+                .iter()
+                .map(|group| {
+                    let max = group
+                        .iter()
+                        .map(|x| x * x)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    max + schedule.temperature
+                        * group
+                            .iter()
+                            .map(|x| ((x * x - max) / schedule.temperature).exp())
+                            .sum::<f64>()
+                            .ln()
+                })
+                .sum::<f64>()
+                / values.len() as f64
+        };
+        for group in 0..norms.len() {
+            assert!((weights[group].iter().sum::<f64>() - 0.5).abs() < 1e-14);
+            for row in 0..norms[group].len() {
+                let mut plus = norms.clone();
+                let mut minus = norms.clone();
+                plus[group][row] += 1e-5;
+                minus[group][row] -= 1e-5;
+                let finite_difference = (objective(&plus) - objective(&minus)) / 2e-5;
+                let derivative = 2. * norms[group][row] * weights[group][row];
+                assert!((finite_difference - derivative).abs() < 1e-8);
+            }
+        }
+        assert!(proposal_weights(&[], &schedule).is_err());
+        assert!(proposal_weights(&[vec![]], &schedule).is_err());
+        assert!(proposal_weights(&[vec![f64::MAX]], &schedule).is_err());
     }
     #[test]
     fn backtracking_corrects_overshoot_and_stops_without_committing_rejected_step() {
@@ -1899,19 +2059,17 @@ mod tests {
         let mut s = settings();
         s.numeric_bytes = 1;
         assert!(fit(&d, &p, &x, &y, &x, &y, &[0, 1], s).is_err());
-        assert!(
-            fit(
-                &d,
-                &p,
-                &x,
-                &Array2::zeros((2, 2)),
-                &x,
-                &y,
-                &[0, 1],
-                settings()
-            )
-            .is_err()
-        );
+        assert!(fit(
+            &d,
+            &p,
+            &x,
+            &Array2::zeros((2, 2)),
+            &x,
+            &y,
+            &[0, 1],
+            settings()
+        )
+        .is_err());
         assert!(fit(&d, &p, &x, &y, &x, &y, &[0, 0], settings()).is_err());
         let OperatorBody::Dense { present, .. } = &mut Arc::make_mut(&mut p.operators[0]).body
         else {

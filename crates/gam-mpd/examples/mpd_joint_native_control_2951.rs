@@ -335,7 +335,9 @@ fn fit_diagnostic(
         ("perturbed_native", Some(settings.relative_perturbation)),
         ("independent", None),
     ] {
+        let arm_started = Instant::now();
         let candidate = initialized(&teacher, &trainable, settings.seed, perturbation)?;
+        let initialization_seconds = arm_started.elapsed().as_secs_f64();
         let fit = resident_rule_fit::fit_grouped_batched(
             device,
             &candidate,
@@ -349,6 +351,7 @@ fn fit_diagnostic(
             settings.batch.clone(),
         )?;
         let scales = &fit.report.training_scales;
+        let evidence_started = Instant::now();
         let mut measurements = Vec::new();
         for (stage, program) in [("initial", &candidate), ("best", &fit.program)] {
             let bytes = Artifact::native(program)?.to_bytes()?;
@@ -359,7 +362,10 @@ fn fit_diagnostic(
                 "training_group_maxima":frozen_errors(device,&decoded.program,&train_x,&train_y,scales,&settings.optimizer)?,
                 "validation_group_maxima":frozen_errors(device,&decoded.program,&valid_x,&valid_y,scales,&settings.optimizer)?}));
         }
-        reports.push(json!({"initialization":label,"measurements_frozen_training_scales":measurements,"optimizer_report":fit.report}));
+        reports.push(json!({"initialization":label,"initialization_seconds":initialization_seconds,
+            "artifact_and_decoded_evaluation_seconds":evidence_started.elapsed().as_secs_f64(),
+            "arm_seconds":arm_started.elapsed().as_secs_f64(),
+            "measurements_frozen_training_scales":measurements,"optimizer_report":fit.report}));
         save(
             &out.join("FITTING.json"),
             &json!({"arms":reports,"groups":groups,
@@ -730,6 +736,7 @@ mod tests {
                 backtracking: None,
             },
             batch: BatchSchedule {
+                objective: Default::default(),
                 ordinary_rows: 2,
                 hard_rows: 0,
                 scan_every: 1,
