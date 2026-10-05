@@ -5,6 +5,9 @@ stage (speed's measurements: host posterior 1.063 s/step, device posterior 0.233
 0.070 s with patch directions excluded). (b) Qwen3-0.6B,
 28 layers, 4 x 512 tokens, decoder engine alone: share of the card's dense bf16 peak (165 TFLOPS).
 
+The decoder numbers are for its all-bf16 version, which FAILS parity (interchange, ab5ac6102b): per-token
+KL error 0.03-0.08 bits, gradients 6-21% off. They are not valid throughput until the decoder passes.
+
     python bench/figures_2951/speed_progress_fig.py OUT.png
 """
 import sys
