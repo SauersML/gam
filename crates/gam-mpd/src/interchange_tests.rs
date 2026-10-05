@@ -21,6 +21,7 @@ use super::operator_program::{FamilyInputs, Operator, OperatorProgram, SequenceL
 use super::resident_causal_fit::fixed_head_target::Head;
 use super::run_check::{layer_nodes, split_sites};
 use gam_gpu::tensor::Device;
+use gam_math::categorical::categorical_kl_from_logits;
 use gam_linalg::decompose::{QrMode, qr};
 use ndarray::{Array2, Axis, s};
 use rand::SeedableRng;
@@ -156,17 +157,9 @@ fn native(f: &Fixture, tokens: &[u32], patch: Option<HostPatch<'_>>) -> (Array2<
 /// Per row `KL(softmax(E a) ‖ softmax(E b))` in bits.
 fn kl_bits(head: &Head, a: &Array2<f64>, b: &Array2<f64>) -> Vec<f64> {
     let (za, zb) = (a.dot(&head.embedding.t()), b.dot(&head.embedding.t()));
-    let log_softmax = |z: ndarray::ArrayView1<'_, f64>| {
-        let m = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let total = z.iter().map(|v| (v - m).exp()).sum::<f64>().ln() + m;
-        z.mapv(|v| v - total)
-    };
     za.outer_iter()
         .zip(zb.outer_iter())
-        .map(|(ra, rb)| {
-            let (la, lb) = (log_softmax(ra), log_softmax(rb));
-            la.iter().zip(&lb).map(|(x, y)| x.exp() * (x - y)).sum::<f64>() / std::f64::consts::LN_2
-        })
+        .map(|(ra, rb)| categorical_kl_from_logits(&ra.to_vec(), &rb.to_vec()).expect("finite logits") / std::f64::consts::LN_2)
         .collect()
 }
 
