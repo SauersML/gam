@@ -266,7 +266,7 @@ fn removals(args: &[String]) -> Result<(), String> {
             let mut sorted = row.to_vec();
             sorted.sort_by(f64::total_cmp);
             json!({"name": f.name, "layer": f.layer, "kind": f.kind, "mean_bits": row.mean(),
-                   "quantiles": [0.5, 0.9, 0.99, 1.0].map(|q| quantile(&sorted, q))})
+                   "quantiles": ([0.5, 0.9, 0.99, 1.0].map(|q| quantile(&sorted, q)))})
         })
         .collect();
     let mut participation: Vec<f64> = effects
@@ -287,7 +287,7 @@ fn removals(args: &[String]) -> Result<(), String> {
         "model_device": model.name(),
         "held_out_sequences": [first, end],
         "tokens": effects.ncols(),
-        "participation_quantiles": [0.1, 0.5, 0.9].map(|q| quantile(&participation, q)),
+        "participation_quantiles": ([0.1, 0.5, 0.9].map(|q| quantile(&participation, q))),
         "participation_mean": participation.iter().sum::<f64>() / participation.len().max(1) as f64,
         "functions": functions,
         "seconds": started.elapsed().as_secs_f64(),
