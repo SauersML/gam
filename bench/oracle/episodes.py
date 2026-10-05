@@ -164,7 +164,30 @@ def fresh_draw(episode: dict) -> dict:
     return {"report_sha256": report["sha256"], "entropy": entropy, "seed": test_seed(report["sha256"], entropy), "drawn_at": drawn_at}
 
 
+def group_hash(hashes: list[str]) -> str:
+    """The hash a draw shared by several frozen reports (the arms of one target) seeds from: the sha256
+    of their sorted hashes."""
+    return sha256_hex(canonical(sorted(hashes)))
+
+
+def fresh_group_draw(episodes: list[dict]) -> dict:
+    """Entropy drawn now, after every one of `episodes`' reports is frozen, and the seed it gives with
+    their group hash: one draw of tests the episodes share, so their reports are compared on the same
+    tests."""
+    if not episodes or any(e["report"] is None for e in episodes):
+        raise ValueError("a shared draw follows the freeze of every report it serves")
+    hashes = sorted(e["report"]["sha256"] for e in episodes)
+    combined = group_hash(hashes)
+    entropy = secrets.token_hex(32)
+    drawn_at = time.time()
+    if drawn_at < max(e["report"]["frozen_at"] for e in episodes):
+        raise ValueError("the clock reads earlier than a freeze")
+    return {"report_sha256": combined, "reports": hashes, "entropy": entropy, "seed": test_seed(combined, entropy), "drawn_at": drawn_at}
+
+
 def attach_tests(episode: dict, tests: list[dict]) -> None:
+    """Tests drawn after the report's freeze, seeded from its hash (fresh_draw) or from the group hash of
+    reports that include it (fresh_group_draw)."""
     report = episode["report"]
     if report is None:
         raise ValueError("no frozen report")
@@ -173,8 +196,10 @@ def attach_tests(episode: dict, tests: list[dict]) -> None:
     for t in tests:
         if t["drawn_at"] < report["frozen_at"]:
             raise ValueError(f"test {t['id']} was drawn at {t['drawn_at']}, before the freeze at {report['frozen_at']}")
-        if t["report_sha256"] != report["sha256"] or t["seed"] != test_seed(report["sha256"], t["entropy"]):
-            raise ValueError(f"test {t['id']}: its seed is not derived from the report's hash and its entropy")
+        own = t["report_sha256"] == report["sha256"]
+        shared = report["sha256"] in t.get("reports", []) and t["report_sha256"] == group_hash(t["reports"])
+        if not (own or shared) or t["seed"] != test_seed(t["report_sha256"], t["entropy"]):
+            raise ValueError(f"test {t['id']}: its seed is not derived from the report's hash (or a group hash including it) and its entropy")
     known = {t["id"] for t in episode["tests"]}
     clash = [t["id"] for t in tests if t["id"] in known]
     if clash:
@@ -479,7 +504,7 @@ def reader_tests(episode: dict, documents: list[str], tests: list[dict] | None =
     if not (episode["tests"] if tests is None else tests):
         raise ValueError(f"episode {episode['episode']} has no tests")
     return [
-        {"id": t["id"], "documents": documents, "context": t["context"]["text"], "intervention": t["intervention_text"], "options": t["options"], "p": t["measured"]["p"]}
+        {"id": t["id"], "kind": t.get("kind", "next_token"), "documents": documents, "context": t["context"]["text"], "intervention": t["intervention_text"], "options": t["options"], "p": t["measured"]["p"]}
         for t in (episode["tests"] if tests is None else tests)
     ]
 
