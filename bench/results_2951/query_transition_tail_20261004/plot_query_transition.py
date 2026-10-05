@@ -1,5 +1,6 @@
 """Plot completed discovery evidence; never opens the heldout panel."""
 import json
+import argparse
 from pathlib import Path
 
 import matplotlib
@@ -7,7 +8,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--data-root", type=Path, default=Path(__file__).resolve().parent)
+ROOT = parser.parse_args().data_root
 fit = json.loads((ROOT / "QUERY_FIT_DISCOVERY/REPORT.json").read_text())
 tail = json.loads((ROOT / "QUERY_TAIL_DISCOVERY_V2/REPORT.json").read_text())
 fixtures = json.loads((ROOT / "DISCOVERY.json").read_text())
