@@ -1,7 +1,7 @@
 //! Inspect the actual native search space before allocating fitting compute.
 //! EXPORT SETTINGS.json FRESH_OUT. No model forward, fitting, or heldout scoring.
 use gam_mpd::{
-    artifact::Artifact, coder_capture::sha256, import::import_language_model,
+    artifact::Artifact, engine::sha256, import::import_language_model,
     operator_program::Node, program_joint_regions as joint, program_learned_dag as learned,
     run_check::split_sites,
 };

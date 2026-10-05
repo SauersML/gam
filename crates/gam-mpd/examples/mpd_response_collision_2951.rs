@@ -3,7 +3,7 @@
 //! Uses all rows of the existing two-passage/80-episode panel; keeps only clean
 //! and four whole-MLP removals per passage. No fitting or acceptance changes.
 use gam_mpd::{
-    coder_capture::sha256,
+    engine::sha256,
     counterfactual::{Decoder, Spec, passages},
     fixed_logit_interval::{Enclosure, Interval},
     import::import_language_model,

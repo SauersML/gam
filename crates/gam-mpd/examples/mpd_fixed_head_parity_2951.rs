@@ -2,7 +2,7 @@
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     artifact::Artifact,
-    coder_capture::sha256,
+    engine::sha256,
     device_program::DeviceProgram,
     import::import_language_model,
     operator_program::{

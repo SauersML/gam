@@ -4,7 +4,7 @@ use gam_gpu::{tensor::Device, GpuPolicy};
 use gam_mpd::{
     acceptance::{structural_cost, CostCache},
     artifact::Artifact,
-    coder_capture::sha256,
+    engine::sha256,
     device_program::DeviceProgram,
     down_edit_family::{self, Direction},
     import::import_language_model,

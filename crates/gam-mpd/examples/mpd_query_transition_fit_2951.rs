@@ -2,7 +2,7 @@
 //! One shared pre-RoPE translation per native head; conditional attention on
 //! unchanged keys only. Discovery crossfit is not untouched heldout evaluation.
 use gam_mpd::{
-    coder_capture::sha256,
+    engine::sha256,
     operator_program::{Rotary, Scale},
     query_transition::{Fit, Sample, SolverMethod, SolverSettings, fit, native_features},
 };

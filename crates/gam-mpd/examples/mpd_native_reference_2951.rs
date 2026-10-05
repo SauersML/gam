@@ -1,6 +1,6 @@
 //! Lightweight native f64 forward versus archived HF logits, no artifact roundtrip.
 use gam_mpd::{
-    coder_capture::sha256, counterfactual::read_f64_matrix, import::import_language_model,
+    engine::sha256, counterfactual::read_f64_matrix, import::import_language_model,
 };
 use serde_json::json;
 use std::{path::Path, time::Instant};

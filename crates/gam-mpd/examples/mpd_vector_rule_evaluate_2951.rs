@@ -3,7 +3,7 @@
 use gam_mpd::{
     acceptance::{CostCache, Local, RunCheck, RunMeasure, structural_cost},
     artifact::Artifact,
-    coder_capture::sha256,
+    engine::sha256,
     counterfactual::{Decoder, Spec, passages},
     import::import_language_model,
     operator_program::{Declarations, FamilyInputs, SequenceLayout, Slot, SlotValues},

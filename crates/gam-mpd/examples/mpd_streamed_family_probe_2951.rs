@@ -5,7 +5,7 @@ use gam_mpd::{
     acceptance::{Change,Edit,Episode,FamilyRun,RunCheck},
     artifact::Artifact,
     attention_map::AttentionLayerMap,
-    coder_capture::sha256,
+    engine::sha256,
     device_family_run::{DeviceFamilyRun,StreamedBudget,StreamedFamilyRun},
     import::import_language_model,
 };

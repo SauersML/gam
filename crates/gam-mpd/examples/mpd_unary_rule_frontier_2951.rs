@@ -7,7 +7,7 @@ use gam_mpd::{
     },
     artifact::Artifact,
     attention_map::AttentionLayerMap,
-    coder_capture::sha256,
+    engine::sha256,
     device_family_run::{DeviceFamilyRun, Timing},
     import::import_language_model,
     operator_program::{NativeOperatorCodec, OperatorProgram, SlotValues},

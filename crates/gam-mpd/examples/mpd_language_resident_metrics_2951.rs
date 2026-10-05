@@ -188,7 +188,7 @@ fn main() -> Result<(), String> {
         .as_object()
         .ok_or("export manifest absent")?
     {
-        let actual = gam_mpd::coder_capture::sha256(&export.join(format!("{name}.f64")))?;
+        let actual = gam_mpd::engine::sha256(&export.join(format!("{name}.f64")))?;
         if file["sha256"]
             .as_str()
             .is_some_and(|declared| declared != actual)
@@ -200,7 +200,7 @@ fn main() -> Result<(), String> {
         }
         export_hashes.insert(name.clone(), json!(actual));
     }
-    let spec_sha = gam_mpd::coder_capture::sha256(spec_path)?;
+    let spec_sha = gam_mpd::engine::sha256(spec_path)?;
     if baseline["spec_sha256"].as_str() != Some(spec_sha.as_str()) {
         return Err("baseline panel mismatch".into());
     }
@@ -211,7 +211,7 @@ fn main() -> Result<(), String> {
     let mut artifacts = Vec::new();
     let mut hashes = Vec::new();
     for (index, path) in a[7..].iter().enumerate() {
-        let hash = gam_mpd::coder_capture::sha256(Path::new(path))?;
+        let hash = gam_mpd::engine::sha256(Path::new(path))?;
         if baseline["artifact_files"][index]["sha256"].as_str() != Some(hash.as_str()) {
             return Err("baseline artifact mismatch".into());
         }
@@ -286,7 +286,7 @@ fn main() -> Result<(), String> {
             && warm.transfers.donor_download_bytes == 0;
         results.push(json!({"artifact":hashes[index],"preparation_seconds":preparation_seconds,"cold":cold,"warm":warm,"cold_comparison":cold_comparison,"warm_comparison":warm_comparison}));
     }
-    let report = json!({"passes":passes,"episode_count":spec.episodes.len(),"context":spec.rows,"export":export,"verified_export_files_sha256":export_hashes,"spec_sha256":spec_sha,"normalized_baseline_sha256":gam_mpd::coder_capture::sha256(Path::new(&a[4]))?,"raw_baseline_sha256":gam_mpd::coder_capture::sha256(Path::new(&a[5]))?,"artifact_files":hashes,"setup_seconds":setup_seconds,"budget":budget,"gate":gate,"results":results,"nvrtc":{"major":compiler.nvrtc_major,"minor":compiler.nvrtc_minor,"actual_flags":compiler.flags,"fastmath_policy":compiler.fastmath_policy},"scope":"Opt-in actual-f64 CUDA native teacher, candidate and head with analytic checked fixed-raw-logit KL. All original mapped interventions, clean donor semantics, scored suffixes and group identities are retained. Upstream neural/RMS/GEMM rounding is excluded from fixed-input intervals. Native effects now have independently labelled raw intervals rather than CPU metrics; observed differences are reported. Cold and warm classifications against frozen normalized and raw baselines are checked independently. No default acceptance switch. Recorded residual/donor/vocabulary transfers cover these evaluator paths; source weight, edit constant and token/layout initialization are separate. Numeric memory counts exclude library/context/allocator/register overhead."});
+    let report = json!({"passes":passes,"episode_count":spec.episodes.len(),"context":spec.rows,"export":export,"verified_export_files_sha256":export_hashes,"spec_sha256":spec_sha,"normalized_baseline_sha256":gam_mpd::engine::sha256(Path::new(&a[4]))?,"raw_baseline_sha256":gam_mpd::engine::sha256(Path::new(&a[5]))?,"artifact_files":hashes,"setup_seconds":setup_seconds,"budget":budget,"gate":gate,"results":results,"nvrtc":{"major":compiler.nvrtc_major,"minor":compiler.nvrtc_minor,"actual_flags":compiler.flags,"fastmath_policy":compiler.fastmath_policy},"scope":"Opt-in actual-f64 CUDA native teacher, candidate and head with analytic checked fixed-raw-logit KL. All original mapped interventions, clean donor semantics, scored suffixes and group identities are retained. Upstream neural/RMS/GEMM rounding is excluded from fixed-input intervals. Native effects now have independently labelled raw intervals rather than CPU metrics; observed differences are reported. Cold and warm classifications against frozen normalized and raw baselines are checked independently. No default acceptance switch. Recorded residual/donor/vocabulary transfers cover these evaluator paths; source weight, edit constant and token/layout initialization are separate. Numeric memory counts exclude library/context/allocator/register overhead."});
     std::fs::write(
         &a[3],
         serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,

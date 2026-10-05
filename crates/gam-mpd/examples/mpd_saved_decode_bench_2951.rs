@@ -1,6 +1,6 @@
 //! CPU-only saved native-artifact decoder diagnostic. No fitting or fidelity claim.
 //! SAVED OUT vocab=N max_bytes=N codec_bytes=N warmup=N repeats=N
-use gam_mpd::{artifact::Artifact, codec::BitString, coder_capture::sha256,
+use gam_mpd::{artifact::Artifact, codec::BitString, engine::sha256,
     operator_program::{Declarations, Domain, NativeOperatorCodec, Slot}};
 use serde_json::json;
 use std::{collections::BTreeMap, io::Write, path::Path, time::Instant};

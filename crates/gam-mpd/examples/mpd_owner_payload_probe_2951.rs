@@ -2,7 +2,7 @@
 //! A supplied native attention/value transport intervention, not discovery of
 //! query construction, a representation hierarchy, or a retrieval algorithm.
 use gam_mpd::{
-    coder_capture::sha256,
+    engine::sha256,
     import::import_language_model,
     operator_program::{
         Declarations, FamilyInputs, Node, OperatorProgram, Rotary, Scale, SequenceLayout, Slot,

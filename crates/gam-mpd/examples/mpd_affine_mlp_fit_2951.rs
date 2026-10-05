@@ -3,7 +3,7 @@
 //! or fit EVAL_EXPORT EXTRACT OUT MAX_BANK [save_index=N]. Fixed 8 train/2 eval
 //! complete 512-token sequences, all four layers. evaluate EVAL_EXPORT FIT_DIR
 //! SPEC OUT FITS_SHA SPEC_SHA TRACE_BYTES performs separately decoded Local/Run.
-use gam_mpd::{affine_mlp::{AffineFit,residual_spectrum},artifact::Artifact,acceptance::{CostCache,structural_cost},coder_capture::sha256,device_program::DeviceProgram,import::import_language_model,operator_program::SlotValues,run_check::{split_sites,layer_nodes}};
+use gam_mpd::{affine_mlp::{AffineFit,residual_spectrum},artifact::Artifact,acceptance::{CostCache,structural_cost},engine::sha256,device_program::DeviceProgram,import::import_language_model,operator_program::SlotValues,run_check::{split_sites,layer_nodes}};
 use ndarray::Array2;
 use serde_json::{Value,json};
 use std::{path::Path,io::Write,time::Instant};

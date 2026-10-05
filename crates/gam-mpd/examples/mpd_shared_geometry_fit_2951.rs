@@ -1,6 +1,6 @@
 //! Parameterized controlled shared-geometry fit. EXPORT EXTRACT CONFIG OUT host|cuda
 //! No held-out body transfer or whole-model acceptance is inferred from fitting.
-use gam_mpd::{acceptance::{CostCache,structural_cost},artifact::Artifact,coder_capture::sha256,import::import_language_model,
+use gam_mpd::{acceptance::{CostCache,structural_cost},artifact::Artifact,engine::sha256,import::import_language_model,
     operator_program::OperatorProgram,resident_rule_fit::{self,OutputGroup,Settings},run_check::{layer_nodes,split_sites},shared_geometry_pilot::{self,Arm,Proposal},shared_geometry_transfer};
 use ndarray::{Array2,s};
 use serde_json::{Value,json};

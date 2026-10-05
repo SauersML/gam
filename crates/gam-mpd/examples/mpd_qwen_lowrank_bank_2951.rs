@@ -5,7 +5,7 @@ use gam_linalg::decompose::svd;
 use gam_mpd::{
     acceptance::{CostCache, structural_cost},
     artifact::Artifact,
-    coder_capture::sha256,
+    engine::sha256,
     import::import_language_model,
     operator_program::{
         Node, Operator, OperatorBody, OperatorProgram, Provenance, exact_precision,

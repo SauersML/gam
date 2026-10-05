@@ -10,7 +10,7 @@ use gam_mpd::{
         assess_once, assess_once_local_first_with_native_codec, structural_cost,
     },
     artifact::{Artifact, EncodedArtifact},
-    coder_capture::sha256,
+    engine::sha256,
     counterfactual::{Decoder, Spec, passages},
     import::import_language_model,
     native_readout::Budget,

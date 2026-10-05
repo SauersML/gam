@@ -40,7 +40,7 @@ fn stored_batches(
         return Err("512 positive-width stored rows required".into());
     }
     let path = export.join("logits_row0.f64");
-    let sha = gam_mpd::coder_capture::sha256(&path)?;
+    let sha = gam_mpd::engine::sha256(&path)?;
     if Some(sha.as_str()) != record["files"]["logits_row0"]["sha256"].as_str() {
         return Err("stored logits SHA mismatch".into());
     }
@@ -145,7 +145,7 @@ fn stored_batches(
         batches.push(json!({"rows":batch,"classes":classes,"input_resident_numeric_bytes":2*bytes,"peak_numeric_buffer_budget_estimate":numeric,"numeric_budget_limit":limit,"output_numeric_bytes":output,"warmup_calls":1,"samples":samples,"host_spotchecks":host_checks,"intervals":intervals}));
     }
     Ok(
-        json!({"export":export,"export_json_sha256":gam_mpd::coder_capture::sha256(&export.join("export.json"))?,"source":record["source"],"logits_file_sha256":sha,"stored_shape":[rows,classes],"perturbation":"comparison[row,column] = stored[row,column] + (column even ? 0.25 : -0.25), rounded binary64 addition; fixed declared numerical stress, not intervention or candidate fitting","batches":batches,"memory_scope":"explicit numeric buffer bound only; excludes report JSON, allocator metadata, CUDA context/module and compiler registers/spills, 2KiB on-chip shared per block","scientific_scope":"stored public-model FP32 reference widened to binary64 according to export provenance; exact fixed-input KL only; not native f64 forward parity, no intervention/fidelity/acceptance claim"}),
+        json!({"export":export,"export_json_sha256":gam_mpd::engine::sha256(&export.join("export.json"))?,"source":record["source"],"logits_file_sha256":sha,"stored_shape":[rows,classes],"perturbation":"comparison[row,column] = stored[row,column] + (column even ? 0.25 : -0.25), rounded binary64 addition; fixed declared numerical stress, not intervention or candidate fitting","batches":batches,"memory_scope":"explicit numeric buffer bound only; excludes report JSON, allocator metadata, CUDA context/module and compiler registers/spills, 2KiB on-chip shared per block","scientific_scope":"stored public-model FP32 reference widened to binary64 according to export provenance; exact fixed-input KL only; not native f64 forward parity, no intervention/fidelity/acceptance claim"}),
     )
 }
 

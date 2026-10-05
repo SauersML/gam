@@ -158,7 +158,7 @@ fn main() -> Result<(), String> {
         .ok_or("export manifest absent")?
     {
         let path = export.join(format!("{name}.f64"));
-        let actual = gam_mpd::coder_capture::sha256(&path)?;
+        let actual = gam_mpd::engine::sha256(&path)?;
         if file["sha256"]
             .as_str()
             .is_some_and(|declared| declared != actual)
@@ -174,7 +174,7 @@ fn main() -> Result<(), String> {
     let mut artifacts = Vec::new();
     let mut artifact_hashes = Vec::new();
     for path in &a[4..] {
-        let hash = gam_mpd::coder_capture::sha256(Path::new(path))?;
+        let hash = gam_mpd::engine::sha256(Path::new(path))?;
         let artifact = Artifact::from_bytes(
             &std::fs::read(path).map_err(|e| e.to_string())?,
             &native.declarations,
@@ -297,7 +297,7 @@ fn main() -> Result<(), String> {
         }
         results.push(json!({"artifact":artifact_hashes[index],"paired_exact_same_array_CPU_reference_wall_seconds":paired_wall,"checked_metric_warm_teacher_CPU_reference_disabled_wall_seconds":fast_wall,"paired":paired,"fast":fast,"classifications":classifications,"cumulative_timing_after_paired":after_paired,"cumulative_timing_after_fast":runner.timing()}));
     }
-    let report = json!({"passes":passes,"episode_count":spec.episodes.len(),"context":spec.rows,"source":record["source"],"export":export,"export_json_sha256":gam_mpd::coder_capture::sha256(&export.join("export.json"))?,"verified_export_files_sha256":export_hashes,"spec":spec_path,"spec_sha256":gam_mpd::coder_capture::sha256(spec_path)?,"artifact_files":artifact_hashes,"setup_seconds":setup_seconds,"gate":gate,"results":results,"nvrtc":{"major":compiler.nvrtc_major,"minor":compiler.nvrtc_minor,"actual_flags":compiler.flags,"fastmath_policy":compiler.fastmath_policy},"scope":"Typed optional production metric endpoint only; unchanged readout/CPU normalization/teacher/native effects/top1; exact fixed normalized binary64 arrays softmax-renormalized by both CPU helper and CUDA checked metric; no default acceptance integration or upstream real arithmetic guarantee. CPU reference retains conditional exp/log ULP assumptions. Paired validation CPU reference time is not fast-path timing. Fast arm reuses immutable teachers and executes candidates again; no matched end-to-end speedup claimed."});
+    let report = json!({"passes":passes,"episode_count":spec.episodes.len(),"context":spec.rows,"source":record["source"],"export":export,"export_json_sha256":gam_mpd::engine::sha256(&export.join("export.json"))?,"verified_export_files_sha256":export_hashes,"spec":spec_path,"spec_sha256":gam_mpd::engine::sha256(spec_path)?,"artifact_files":artifact_hashes,"setup_seconds":setup_seconds,"gate":gate,"results":results,"nvrtc":{"major":compiler.nvrtc_major,"minor":compiler.nvrtc_minor,"actual_flags":compiler.flags,"fastmath_policy":compiler.fastmath_policy},"scope":"Typed optional production metric endpoint only; unchanged readout/CPU normalization/teacher/native effects/top1; exact fixed normalized binary64 arrays softmax-renormalized by both CPU helper and CUDA checked metric; no default acceptance integration or upstream real arithmetic guarantee. CPU reference retains conditional exp/log ULP assumptions. Paired validation CPU reference time is not fast-path timing. Fast arm reuses immutable teachers and executes candidates again; no matched end-to-end speedup claimed."});
     std::fs::write(
         &a[3],
         serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,

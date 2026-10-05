@@ -1,7 +1,7 @@
 //! Saved-program response representability diagnostic, not a fidelity/frontier win.
 //! EXPORT SAVED SPEC OUT SAVED_SHA SPEC_SHA TRACE_BYTES
 use gam_mpd::{acceptance::{Change,CostCache,Edit,Local,RunCheck,RunMeasure,structural_cost},artifact::Artifact,
-    coder_capture::sha256,counterfactual::{Action,Decoder,InputChange,Rows,Spec,passages},import::import_language_model,
+    engine::sha256,counterfactual::{Action,Decoder,InputChange,Rows,Spec,passages},import::import_language_model,
     operator_program::{FamilyInputs,SequenceLayout,SlotValues},run_check::{LanguageRun,layer_nodes,split_sites}};
 use serde_json::json;
 use std::{collections::BTreeMap,path::Path,time::Instant};

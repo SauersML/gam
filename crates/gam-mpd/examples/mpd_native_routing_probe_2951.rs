@@ -1,7 +1,7 @@
 //! Native teacher instrumentation only; no routing predictor or explanation acceptance.
 //! EXPORT FIXTURES TOKENIZER OUT_DIR [SETTINGS.json]. Host execution, all declared heads.
 use gam_mpd::{
-    coder_capture::sha256,
+    engine::sha256,
     import::import_language_model,
     operator_program::{
         Declarations, FamilyInputs, Node, OperatorProgram, Rotary, Scale, SequenceLayout, Slot,

@@ -6,7 +6,7 @@ use gam_mpd::{
     acceptance::{structural_cost, CostCache},
     artifact::Artifact,
     canonical_artifact::CanonicalArtifactCache,
-    coder_capture::sha256,
+    engine::sha256,
     composed_rule_search::{self, Grammar, UseSpec},
     device_program::DeviceProgram,
     down_edit_family::{self, Direction, Family as DownFamily},

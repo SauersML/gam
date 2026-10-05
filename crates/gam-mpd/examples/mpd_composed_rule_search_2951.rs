@@ -4,7 +4,7 @@ use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     acceptance::{CostCache, structural_cost},
     artifact::Artifact,
-    coder_capture::sha256,
+    engine::sha256,
     composed_rule_search::{self, Grammar, UseSpec},
     resident_rule_fit::{self, GroupMeasurement, Settings as FitSettings},
 };

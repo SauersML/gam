@@ -3,7 +3,7 @@
 //! EXPORT_DIR SOURCE.bin OUT_DIR. Reads export declarations, never checkpoint weights.
 use gam_mpd::acceptance::{CostCache, structural_cost};
 use gam_mpd::artifact::{Artifact, OperatorLaw};
-use gam_mpd::coder_capture::sha256;
+use gam_mpd::engine::sha256;
 use gam_mpd::operator_program::{Declarations, Domain, Slot};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path, sync::Arc, time::Instant};

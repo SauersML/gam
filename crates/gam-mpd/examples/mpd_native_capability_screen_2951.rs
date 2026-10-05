@@ -4,7 +4,7 @@ use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     artifact::Artifact,
     artifact_device::Resident,
-    coder_capture::sha256,
+    engine::sha256,
     import::import_language_model,
     operator_program::{FamilyInputs, SequenceLayout, SlotValues},
 };

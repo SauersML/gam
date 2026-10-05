@@ -5,7 +5,7 @@
 use gam_mpd::{
     acceptance::{CostCache, structural_cost},
     artifact::Artifact,
-    coder_capture::sha256,
+    engine::sha256,
     device_program::DeviceProgram,
     import::import_language_model,
     operator_program::{Node, Operator, SlotValues},

@@ -57,7 +57,7 @@ mod operator_program_tests;
 // The contract of an imported model: its input family and readouts.
 pub mod contract;
 
-// Progress logging for the drivers.
+// Progress logging and file digests for the drivers.
 pub mod engine;
 
 // The explanation as one artifact: program, block bindings, places, exceptions; its message and
@@ -154,9 +154,6 @@ pub mod supports;
 // Gate laws: which subcomponents are on for an input, from a small bits-charged law over the
 // model's own amplitudes (fit, code, feature screen, decisions).
 pub mod gates;
-
-// The SHA-256 digests drivers record for the files they read and write.
-pub mod coder_capture;
 
 // An MLP accounted for by explicit rules between its subcomponents' amplitudes.
 pub mod mlp_account;

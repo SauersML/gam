@@ -2,7 +2,7 @@
 //! EXPORT BANK.json OUT.json sequences=N context=N batch=N trace_bytes=N deltas=... [source_bytes=N]
 //! This is backend validation/timing, never a new candidate family or quality score.
 use gam_gpu::{GpuPolicy, tensor::Device};
-use gam_mpd::{acceptance::Local, artifact::Artifact, coder_capture::sha256, import::import_language_model, run_check::split_sites};
+use gam_mpd::{acceptance::Local, artifact::Artifact, engine::sha256, import::import_language_model, run_check::split_sites};
 use serde::Deserialize;
 use serde_json::json;
 use std::{collections::BTreeMap, path::{Path, PathBuf}, time::Instant};

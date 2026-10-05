@@ -1,6 +1,6 @@
 //! Scoped native query-invocation transition; retained native prefix/background, not discovery.
 use gam_mpd::{
-    coder_capture::sha256,
+    engine::sha256,
     import::import_language_model,
     operator_program::{
         FamilyInputs, Node, OperatorBody, OperatorProgram, SequenceLayout, SlotValues,

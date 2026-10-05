@@ -3,7 +3,7 @@
 use gam_mpd::{
     acceptance::{CostCache, structural_cost},
     artifact::Artifact,
-    coder_capture::sha256,
+    engine::sha256,
     import::import_language_model,
     matrix_rule::Type,
     unary_rule_bank::{Limits, UnaryRuleBank},

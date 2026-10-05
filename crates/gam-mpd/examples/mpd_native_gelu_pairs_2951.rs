@@ -1,7 +1,7 @@
 //! Exhaustive signed affine-reader geometry, followed by a declared heuristic bank screen.
 //! EXPORT EXTRACT.json TOP_K FRESH_OUT. No fit, artifact acceptance, or discovery claim.
 use gam_mpd::{
-    coder_capture::sha256,
+    engine::sha256,
     import::import_language_model,
     operator_program::{Law, Node, OperatorProgram},
     run_check::{layer_nodes, split_sites},

@@ -4,7 +4,7 @@
 use gam_mpd::{
     artifact::Artifact,
     attention_map::AttentionLayerMap,
-    coder_capture::sha256,
+    engine::sha256,
     import::import_language_model,
     matrix_rule::Type,
     matrix_rule_enumeration::{Budget, Source, Target, inventory},

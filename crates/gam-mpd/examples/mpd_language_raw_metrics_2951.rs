@@ -186,7 +186,7 @@ fn main() -> Result<(), String> {
         .as_object()
         .ok_or("export manifest absent")?
     {
-        let actual = gam_mpd::coder_capture::sha256(&export.join(format!("{name}.f64")))?;
+        let actual = gam_mpd::engine::sha256(&export.join(format!("{name}.f64")))?;
         if file["sha256"]
             .as_str()
             .is_some_and(|declared| declared != actual)
@@ -198,7 +198,7 @@ fn main() -> Result<(), String> {
         }
         export_hashes.insert(name.clone(), json!(actual));
     }
-    let spec_sha = gam_mpd::coder_capture::sha256(spec_path)?;
+    let spec_sha = gam_mpd::engine::sha256(spec_path)?;
     if baseline["spec_sha256"].as_str() != Some(spec_sha.as_str()) {
         return Err("baseline panel mismatch".into());
     }
@@ -209,7 +209,7 @@ fn main() -> Result<(), String> {
     let mut artifacts = Vec::new();
     let mut hashes = Vec::new();
     for (index, path) in a[6..].iter().enumerate() {
-        let hash = gam_mpd::coder_capture::sha256(Path::new(path))?;
+        let hash = gam_mpd::engine::sha256(Path::new(path))?;
         if baseline["artifact_files"][index]["sha256"].as_str() != Some(hash.as_str()) {
             return Err("baseline artifact mismatch".into());
         }
@@ -362,7 +362,7 @@ fn main() -> Result<(), String> {
         }
         results.push(json!({"artifact":hashes[index],"first_arm_host_spotchecks":spotchecks,"first_arm_wall_seconds":wall,"warm_production_wall_seconds":warm_wall,"raw":raw,"warm":warm,"classifications":classifications,"maximum_native_effect_difference":maximum_native_effect_difference,"maximum_raw_vs_normalized_interval_separation":maximum_interval_separation,"timing_before":before,"timing_after_first":after,"timing_after_warm":runner.timing()}));
     }
-    let report = json!({"passes":passes,"episode_count":spec.episodes.len(),"context":spec.rows,"export":export,"verified_export_files_sha256":export_hashes,"spec_sha256":spec_sha,"baseline_report_sha256":gam_mpd::coder_capture::sha256(Path::new(&a[4]))?,"artifact_files":hashes,"setup_seconds":setup_seconds,"gate":gate,"results":results,"nvrtc":{"major":compiler.nvrtc_major,"minor":compiler.nvrtc_minor,"actual_flags":compiler.flags,"fastmath_policy":compiler.fastmath_policy},"scope":"Optional exact fixed raw CUDA binary64 head-logit intervals. Scored raw metric tiles with oracle disabled download only row bounds and argmax; no CPU normalization/reupload in that phase. Cold teacher/nativeeffect preparation retains existing CPU normalization/full-vocabulary transfers, reused from immutable caches in warm calls. Independent host analytic first/last-row spotchecks use identical downloaded raw values only when enabled. Upstream RMS/gain/GEMM/network rounding excluded; raw inputs differ from former CPU-normalized arrays. Frozen classification/top1/nativeeffect compatibility is measured, not bit-identical KL. Default acceptance unchanged. Warm wall repeats candidate execution with immutable teacher cache; no cold/warm speed comparison."});
+    let report = json!({"passes":passes,"episode_count":spec.episodes.len(),"context":spec.rows,"export":export,"verified_export_files_sha256":export_hashes,"spec_sha256":spec_sha,"baseline_report_sha256":gam_mpd::engine::sha256(Path::new(&a[4]))?,"artifact_files":hashes,"setup_seconds":setup_seconds,"gate":gate,"results":results,"nvrtc":{"major":compiler.nvrtc_major,"minor":compiler.nvrtc_minor,"actual_flags":compiler.flags,"fastmath_policy":compiler.fastmath_policy},"scope":"Optional exact fixed raw CUDA binary64 head-logit intervals. Scored raw metric tiles with oracle disabled download only row bounds and argmax; no CPU normalization/reupload in that phase. Cold teacher/nativeeffect preparation retains existing CPU normalization/full-vocabulary transfers, reused from immutable caches in warm calls. Independent host analytic first/last-row spotchecks use identical downloaded raw values only when enabled. Upstream RMS/gain/GEMM/network rounding excluded; raw inputs differ from former CPU-normalized arrays. Frozen classification/top1/nativeeffect compatibility is measured, not bit-identical KL. Default acceptance unchanged. Warm wall repeats candidate execution with immutable teacher cache; no cold/warm speed comparison."});
     std::fs::write(
         &a[3],
         serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,

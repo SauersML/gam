@@ -6,7 +6,7 @@
 use gam_mpd::acceptance::{Assessment, Constraint, CostCache, Local, RunCheck, FamilyRun, Change, Edit, Episode, assess_once, assess_once_with_native_codec, structural_cost};
 use gam_mpd::artifact::{Artifact, EncodedArtifact};
 use gam_mpd::import::import_language_model;
-use gam_mpd::coder_capture::sha256;
+use gam_mpd::engine::sha256;
 use gam_mpd::counterfactual::{Decoder, Spec, passages};
 use gam_mpd::operator_program::{FamilyInputs, NativeOperatorCodec, SequenceLayout, SlotValues};
 use gam_mpd::precision::{DecodableArtifact, FidelityVerdict};

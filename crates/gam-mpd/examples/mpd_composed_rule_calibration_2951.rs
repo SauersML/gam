@@ -2,7 +2,7 @@
 use gam_mpd::operator_program::exact_precision;
 use gam_mpd::{
     artifact::Artifact,
-    coder_capture::sha256,
+    engine::sha256,
     composed_rule_search::{self, Binary, Expr, Grammar, Unary, UseSpec},
     operator_program::{FamilyInputs, Operator, SlotValues},
 };

@@ -4,7 +4,7 @@ use gam_mpd::acceptance::{CostCache, structural_cost};
 use gam_mpd::artifact::{Artifact, EncodedArtifact};
 use gam_mpd::operator_program::NativeOperatorCodec;
 use gam_mpd::precision::DecodableArtifact;
-use gam_mpd::coder_capture::sha256;
+use gam_mpd::engine::sha256;
 use gam_mpd::import::import_language_model;
 use gam_mpd::proposals::{CopyResidualBank, CopyResidualChoice, HeadApproximation};
 use gam_mpd::run_check::{layer_nodes, split_sites};
