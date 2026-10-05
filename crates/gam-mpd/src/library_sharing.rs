@@ -926,73 +926,77 @@ pub fn tie_column(explanation: &Explanation, target: (usize, usize), source: (us
     Ok(out)
 }
 
-/// The tiny two-layer model with grouped-query attention: its two query heads per layer read one
-/// key and one value.
+/// Test fixtures shared with `library_mixture`'s tests.
 #[cfg(test)]
-pub(crate) fn grouped(name: &str) -> crate::import::Imported {
-    let dir = crate::test_support::tiny_export(name, 2);
-    let path = dir.join("export.json");
-    let mut record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    record["config"]["n_kv_heads"] = 1.into();
-    for l in 0..2 {
-        for name in ["attn.k_proj", "attn.v_proj"] {
-            let name = format!("blocks.{l}.{name}");
-            let values = std::fs::read(dir.join(format!("{name}.f64"))).unwrap();
-            std::fs::write(dir.join(format!("{name}.f64")), &values[..4 * 8 * 8]).unwrap();
-            record["files"][name] = serde_json::json!({"shape": [4, 8]});
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// The tiny two-layer model with grouped-query attention: its two query heads per layer read one
+    /// key and one value.
+    pub(crate) fn grouped(name: &str) -> crate::import::Imported {
+        let dir = crate::test_support::tiny_export(name, 2);
+        let path = dir.join("export.json");
+        let mut record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        record["config"]["n_kv_heads"] = 1.into();
+        for l in 0..2 {
+            for name in ["attn.k_proj", "attn.v_proj"] {
+                let name = format!("blocks.{l}.{name}");
+                let values = std::fs::read(dir.join(format!("{name}.f64"))).unwrap();
+                std::fs::write(dir.join(format!("{name}.f64")), &values[..4 * 8 * 8]).unwrap();
+                record["files"][name] = serde_json::json!({"shape": [4, 8]});
+            }
         }
+        std::fs::write(&path, record.to_string()).unwrap();
+        let imported = crate::import::import_language_model(&dir, 6, 12).expect("import");
+        std::fs::remove_dir_all(dir).unwrap();
+        imported
     }
-    std::fs::write(&path, record.to_string()).unwrap();
-    let imported = crate::import::import_language_model(&dir, 6, 12).expect("import");
-    std::fs::remove_dir_all(dir).unwrap();
-    imported
-}
 
-/// The tiny two-layer model with a gated MLP (SwiGLU): each function reads a gate and an up
-/// direction.
-#[cfg(test)]
-pub(crate) fn gated(name: &str) -> crate::import::Imported {
-    let dir = crate::test_support::tiny_export(name, 2);
-    let path = dir.join("export.json");
-    let mut record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    use rand::{RngExt, SeedableRng, rngs::StdRng};
-    let mut rng = StdRng::seed_from_u64(5);
-    for l in 0..2 {
-        let name = format!("blocks.{l}.mlp.gate_proj");
-        let bytes: Vec<u8> = (0..16 * 8).flat_map(|_| (rng.random::<f64>() - 0.5).to_le_bytes()).collect();
-        std::fs::write(dir.join(format!("{name}.f64")), bytes).unwrap();
-        record["files"][name] = serde_json::json!({"shape": [16, 8]});
+    /// The tiny two-layer model with a gated MLP (SwiGLU): each function reads a gate and an up
+    /// direction.
+    pub(crate) fn gated(name: &str) -> crate::import::Imported {
+        let dir = crate::test_support::tiny_export(name, 2);
+        let path = dir.join("export.json");
+        let mut record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        use rand::{RngExt, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(5);
+        for l in 0..2 {
+            let name = format!("blocks.{l}.mlp.gate_proj");
+            let bytes: Vec<u8> = (0..16 * 8).flat_map(|_| (rng.random::<f64>() - 0.5).to_le_bytes()).collect();
+            std::fs::write(dir.join(format!("{name}.f64")), bytes).unwrap();
+            record["files"][name] = serde_json::json!({"shape": [16, 8]});
+        }
+        record["config"]["mlp_act"] = "silu".into();
+        record["config"]["mlp_gated"] = true.into();
+        std::fs::write(&path, record.to_string()).unwrap();
+        let imported = crate::import::import_language_model(&dir, 6, 12).expect("import");
+        std::fs::remove_dir_all(dir).unwrap();
+        imported
     }
-    record["config"]["mlp_act"] = "silu".into();
-    record["config"]["mlp_gated"] = true.into();
-    std::fs::write(&path, record.to_string()).unwrap();
-    let imported = crate::import::import_language_model(&dir, 6, 12).expect("import");
-    std::fs::remove_dir_all(dir).unwrap();
-    imported
-}
 
-/// Every native block `a`'s owners stand for, `b`'s owners stand for at the same site with the
-/// same values: an exact sharing moves the native parameters, it does not change them.
-#[cfg(test)]
-pub(crate) fn same_native_blocks(a: &Explanation, b: &Explanation) {
-    assert_eq!(a.artifact.owners.len(), b.artifact.owners.len());
-    for owner in &a.artifact.owners {
-        let other = b
-            .artifact
-            .owners
-            .iter()
-            .find(|o| o.native == owner.native && o.native_rows == owner.native_rows && o.native_cols == owner.native_cols && o.site == owner.site)
-            .expect("every native block keeps an owner at its site");
-        let (x, y) = (a.artifact.native_block(owner).unwrap(), b.artifact.native_block(other).unwrap());
-        assert_eq!(x.dim(), y.dim());
-        let scale = x.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
-        assert!(x.iter().zip(y.iter()).all(|(u, v)| (u - v).abs() <= 1e-12 * scale), "{} at {} through {other:?}", owner.native, owner.site);
+    /// Every native block `a`'s owners stand for, `b`'s owners stand for at the same site with the
+    /// same values: an exact sharing moves the native parameters, it does not change them.
+    pub(crate) fn same_native_blocks(a: &Explanation, b: &Explanation) {
+        assert_eq!(a.artifact.owners.len(), b.artifact.owners.len());
+        for owner in &a.artifact.owners {
+            let other = b
+                .artifact
+                .owners
+                .iter()
+                .find(|o| o.native == owner.native && o.native_rows == owner.native_rows && o.native_cols == owner.native_cols && o.site == owner.site)
+                .expect("every native block keeps an owner at its site");
+            let (x, y) = (a.artifact.native_block(owner).unwrap(), b.artifact.native_block(other).unwrap());
+            assert_eq!(x.dim(), y.dim());
+            let scale = x.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+            assert!(x.iter().zip(y.iter()).all(|(u, v)| (u - v).abs() <= 1e-12 * scale), "{} at {} through {other:?}", owner.native, owner.site);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::tests_support::*;
     use crate::{
         import::import_language_model,
         library_mdl::{Posterior, explanation},

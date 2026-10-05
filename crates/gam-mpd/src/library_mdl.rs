@@ -1427,12 +1427,10 @@ fn held_out_experiments(scorer: &Scorer, sequences: &[Vec<u32>], settings: &Sett
 
 /// The held-out evaluation of `posterior` (held on the host, and as `device_posterior` on the
 /// device) on `sequences` (module note); `tokens` is `N`.
-#[allow(clippy::too_many_arguments)]
 fn held_out(
     scorer: &mut Scorer,
     explanation: &Explanation,
-    posterior: &Posterior,
-    device_posterior: &DevicePosterior,
+    (posterior, device_posterior): (&Posterior, &DevicePosterior),
     sequences: &[Vec<u32>],
     settings: &Settings,
     tokens: usize,
@@ -2043,7 +2041,7 @@ pub fn fit(
         // The start obeys the budget too: the subset now; the full set's time, until a full
         // evaluation is made, estimated from the subset's in proportion to the sequences.
         let timed = Instant::now();
-        let start = held_out(&mut scorer, explanation, &posterior, &device_posterior, subset, settings, tokens, prior.as_deref_mut())?;
+        let start = held_out(&mut scorer, explanation, (&posterior, &device_posterior), subset, settings, tokens, prior.as_deref_mut())?;
         let seconds = timed.elapsed().as_secs_f64();
         progress.evaluation_seconds += seconds;
         progress.full_seconds = seconds * held.len() as f64 / subset.len() as f64;
@@ -2160,13 +2158,13 @@ pub fn fit(
                 progress.training_seconds += epoch_started.elapsed().as_secs_f64();
                 device_posterior.values_into(&mut posterior)?;
                 let timed = Instant::now();
-                let evaluation = held_out(&mut scorer, explanation, &posterior, &device_posterior, subset, settings, tokens, prior.as_deref_mut())?;
+                let evaluation = held_out(&mut scorer, explanation, (&posterior, &device_posterior), subset, settings, tokens, prior.as_deref_mut())?;
                 progress.evaluation_seconds += timed.elapsed().as_secs_f64();
                 evaluation
             },
             held_out_full: if progress.evaluation_seconds + progress.full_seconds <= EVALUATION_SHARE * progress.training_seconds {
                 let timed = Instant::now();
-                let evaluation = held_out(&mut scorer, explanation, &posterior, &device_posterior, held, settings, tokens, prior.as_deref_mut())?;
+                let evaluation = held_out(&mut scorer, explanation, (&posterior, &device_posterior), held, settings, tokens, prior.as_deref_mut())?;
                 progress.full_seconds = timed.elapsed().as_secs_f64();
                 progress.evaluation_seconds += progress.full_seconds;
                 Some(evaluation)
@@ -2196,7 +2194,7 @@ pub fn fit(
         save(&mut progress, &posterior, &device_posterior, &mut writer)?;
     }
     let objective_bits = progress.removals.last().map_or(f64::NAN, |r| r.after_bits);
-    let end = held_out(&mut scorer, explanation, &posterior, &device_posterior, held, settings, tokens, prior.as_deref_mut())?;
+    let end = held_out(&mut scorer, explanation, (&posterior, &device_posterior), held, settings, tokens, prior.as_deref_mut())?;
     log::info!("library end: {end:?}");
     writer.wait()?;
     let representative = if end.rounded_bits_per_token <= end.mean_bits_per_token { Representative::Rounded } else { Representative::Mean };
@@ -2335,7 +2333,7 @@ pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Exp
     }
     let evaluate = |scorer: &mut Scorer, posterior: &Posterior| -> Result<HeldOut, String> {
         let device_posterior = DevicePosterior::new(device, explanation, posterior, tokens as f64, None, 0)?;
-        held_out(scorer, explanation, posterior, &device_posterior, held, settings, tokens, None)
+        held_out(scorer, explanation, (posterior, &device_posterior), held, settings, tokens, None)
     };
     let before = evaluate(&mut scorer, posterior)?;
     let evidence = Evidence { draws: &draws, sequences, settings };
@@ -2564,7 +2562,7 @@ mod tests {
         let settings = settings();
         let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 72.0, None, 0).unwrap();
-        let evaluation = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
+        let evaluation = held_out(&mut scorer, &explanation, (&posterior, &device_posterior), &sequences, &settings, 72, None).unwrap();
         for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
             let bits = bits.expect("every cut and the read patches are drawn");
             assert!(bits.abs() < 1e-10, "the starting library diverges from the model by {bits} bits per token");
@@ -2607,7 +2605,7 @@ mod tests {
 
     #[test]
     fn every_parameter_block_names_the_native_parameter_it_replaces_and_survives_the_bytes() {
-        for (native, layers, family, _) in [tiny("library_owners", "gelu_tanh"), tiny_qwen3("library_owners_qwen3")] {
+        for (native, layers, _, _) in [tiny("library_owners", "gelu_tanh"), tiny_qwen3("library_owners_qwen3")] {
             let explanation = explanation(&native, &layers).unwrap();
             let program = &explanation.artifact.program;
             let owners = &explanation.artifact.owners;
@@ -2642,7 +2640,6 @@ mod tests {
             let bytes = explanation.artifact.f32_literals().unwrap().to_bytes().unwrap();
             let decoded = Artifact::from_bytes(&bytes, &native.declarations).unwrap();
             assert_eq!(&decoded.owners, owners);
-            let _ = family;
         }
     }
 
@@ -2654,9 +2651,9 @@ mod tests {
         let posterior = Posterior::new(&explanation, 72).unwrap();
         let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 72.0, None, 0).unwrap();
-        let without = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
+        let without = held_out(&mut scorer, &explanation, (&posterior, &device_posterior), &sequences, &settings, 72, None).unwrap();
         explanation.fixed_nats = 1000_f64.ln();
-        let with = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
+        let with = held_out(&mut scorer, &explanation, (&posterior, &device_posterior), &sequences, &settings, 72, None).unwrap();
         assert!((with.choice_bits - 1000_f64.log2()).abs() < 1e-12);
         let added = (with.objective_bits_per_token - without.objective_bits_per_token) * 72.0;
         assert!((added - 1000_f64.log2()).abs() < 1e-9, "F per token gains the choice's bits over the scored tokens: {added}");
@@ -2833,7 +2830,7 @@ mod tests {
         let posterior = Posterior::new(&explanation, 72).unwrap();
         let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
         let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
-        let evaluation = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
+        let evaluation = held_out(&mut scorer, &explanation, (&posterior, &device_posterior), &sequences, &settings, 72, None).unwrap();
         for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
             let bits = bits.expect("every cut and the read patches are drawn");
             assert!(bits.abs() < 1e-10, "the starting library diverges from the model by {bits} bits per token");
