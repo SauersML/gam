@@ -37,6 +37,15 @@ pub struct Adam {
     pub epsilon: f64,
 }
 
+/// A posterior's host arrays ([`DevicePosterior::from_parts`]).
+pub struct Parts<'a> {
+    pub operators: &'a [usize],
+    pub mean: &'a [Array2<f64>],
+    pub log_sd: &'a [Array2<f64>],
+    pub groups: &'a [Vec<u32>],
+    pub count: usize,
+}
+
 /// The posterior of a library explanation's trainable operators, on the device.
 pub struct DevicePosterior {
     /// The device holding the masters, and the one holding the samples and gradients.
@@ -87,22 +96,39 @@ impl DevicePosterior {
     /// program runs in), with Adam's `moments` per operator (`μ`'s first and second, then `s`'s;
     /// zero when `None`) after `steps` steps.
     pub fn new(fitting: &Device, explanation: &Explanation, posterior: &Posterior, moments: Option<&[[Array2<f64>; 4]]>, steps: u64) -> Result<Self, String> {
+        let shapes: Vec<(usize, usize)> = posterior.mean.iter().map(Array2::dim).collect();
+        if shapes.len() != explanation.trainable.len() {
+            return Err(error("one posterior array per trainable operator required"));
+        }
+        let groups = membership(explanation, &shapes)?;
+        let parts = Parts { operators: &explanation.trainable, mean: &posterior.mean, log_sd: &posterior.log_sd, groups: &groups, count: explanation.groups.len() };
+        Self::from_parts(fitting, &parts, moments, steps)
+    }
+
+    /// The posterior of the trainable operators `parts.operators` of a program, each entry in group
+    /// `parts.groups[i][entry]` (row-major) of `parts.count`, on `fitting`, with Adam's `moments`
+    /// (zero when `None`) after `steps` steps.
+    pub fn from_parts(fitting: &Device, parts: &Parts<'_>, moments: Option<&[[Array2<f64>; 4]]>, steps: u64) -> Result<Self, String> {
         let master = match fitting.with_storage(Storage::F64) {
             Ok(wide) => wide,
             Err(GpuError::NoDeviceKernel { .. }) => fitting.clone(),
             Err(e) => return Err(error(e)),
         };
-        let shapes: Vec<(usize, usize)> = posterior.mean.iter().map(Array2::dim).collect();
-        if shapes.len() != explanation.trainable.len() || moments.is_some_and(|m| m.len() != shapes.len()) {
-            return Err(error("one posterior array per trainable operator required"));
+        let shapes: Vec<(usize, usize)> = parts.mean.iter().map(Array2::dim).collect();
+        let sizes_agree = parts.log_sd.iter().map(Array2::dim).eq(shapes.iter().copied()) && parts.groups.iter().map(Vec::len).eq(shapes.iter().map(|(r, c)| r * c));
+        if shapes.len() != parts.operators.len() || !sizes_agree || moments.is_some_and(|m| m.len() != shapes.len()) {
+            return Err(error("one posterior array and group list per trainable operator required"));
+        }
+        if parts.groups.iter().flatten().any(|g| *g as usize >= parts.count) {
+            return Err(error("a group id beyond the groups"));
         }
         let up = |m: &Array2<f64>| master.upload(m.view()).map_err(error);
         let mut out = Self {
-            sums: master.zeros(explanation.groups.len(), 3).map_err(error)?,
-            variance: master.zeros(explanation.groups.len(), 1).map_err(error)?,
-            divergence: master.zeros(explanation.groups.len(), 1).map_err(error)?,
-            mean: posterior.mean.iter().map(up).collect::<Result<_, _>>()?,
-            log_sd: posterior.log_sd.iter().map(up).collect::<Result<_, _>>()?,
+            sums: master.zeros(parts.count, 3).map_err(error)?,
+            variance: master.zeros(parts.count, 1).map_err(error)?,
+            divergence: master.zeros(parts.count, 1).map_err(error)?,
+            mean: parts.mean.iter().map(up).collect::<Result<_, _>>()?,
+            log_sd: parts.log_sd.iter().map(up).collect::<Result<_, _>>()?,
             moments: match moments {
                 Some(given) => given.iter().map(|m| Ok([up(&m[0])?, up(&m[1])?, up(&m[2])?, up(&m[3])?])).collect::<Result<_, String>>()?,
                 None => shapes
@@ -110,8 +136,8 @@ impl DevicePosterior {
                     .map(|(r, c)| Ok([master.zeros(*r, *c).map_err(error)?, master.zeros(*r, *c).map_err(error)?, master.zeros(*r, *c).map_err(error)?, master.zeros(*r, *c).map_err(error)?]))
                     .collect::<Result<_, String>>()?,
             },
-            groups: membership(explanation, &shapes)?.iter().map(|ids| master.upload_indices(ids).map_err(error)).collect::<Result<_, _>>()?,
-            operators: explanation.trainable.clone(),
+            groups: parts.groups.iter().map(|ids| master.upload_indices(ids).map_err(error)).collect::<Result<_, _>>()?,
+            operators: parts.operators.to_vec(),
             fitting: fitting.clone(),
             master,
             steps,
@@ -132,6 +158,14 @@ impl DevicePosterior {
     #[must_use]
     pub fn steps(&self) -> u64 {
         self.steps
+    }
+
+    /// Writes the posterior means into `program`'s trainable operators (rounded to its storage).
+    pub fn mean_into(&self, program: &mut DeviceProgram) -> Result<(), String> {
+        for (i, &op) in self.operators.iter().enumerate() {
+            program.replace_dense_parameter(op, self.fitting.convert(&self.mean[i]).map_err(error)?)?;
+        }
+        Ok(())
     }
 
     /// Writes the weight sample of `key` into `program`'s trainable operators (operator `i` in
