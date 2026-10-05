@@ -68,6 +68,11 @@ fn main() -> Result<(), String> {
     report.line("gemm 512x1024 . 1024x3072 (F32 arithmetic)", f64_mlp, f32_mlp)?;
     report.line("gemm 512x1024 . 1024x3072 (TF32 arithmetic)", f64_mlp, tf32_mlp)?;
     report.line("gemm 512x1024 . 1024x3072 f64 storage lowered F32 vs f32", lowered, f32_mlp)?;
+    let bf16_mlp = time(&narrow, 50, || narrow.gemm(&mut cn, 1.0, &xn, Op::N, &wn, Op::N, 0.0, Arithmetic::Bf16))?;
+    let frozen = narrow.bf16_copy(&wn).map_err(|e| e.to_string())?;
+    let frozen_mlp = time(&narrow, 50, || narrow.gemm(&mut cn, 1.0, &xn, Op::N, &frozen, Op::N, 0.0, Arithmetic::Bf16))?;
+    report.line("gemm 512x1024 . 1024x3072 (BF16, both rounded per call)", f64_mlp, bf16_mlp)?;
+    report.line("gemm 512x1024 . 1024x3072 (BF16, frozen bf16 weight)", f64_mlp, frozen_mlp)?;
     let (q, k) = (matrix(heads * positions, head_dim, 3, 1.0), matrix(heads * positions, head_dim, 4, 1.0));
     let ((qw, qn), (kw, kn)) = (both(&q)?, both(&k)?);
     let (mut sw, mut sn) = (wide.zeros(heads * positions, positions).map_err(|e| e.to_string())?, narrow.zeros(heads * positions, positions).map_err(|e| e.to_string())?);
@@ -87,6 +92,9 @@ fn main() -> Result<(), String> {
     let tf32_head = time(&narrow, 10, || narrow.gemm(&mut ln, 1.0, &hn, Op::N, &en, Op::T, 0.0, Arithmetic::Tf32))?;
     report.line("unembedding 512x1024 . (151936x1024)^T (F32)", f64_head, f32_head)?;
     report.line("unembedding 512x1024 . (151936x1024)^T (TF32)", f64_head, tf32_head)?;
+    let frozen_head = narrow.bf16_copy(&en).map_err(|e| e.to_string())?;
+    let bf16_head = time(&narrow, 10, || narrow.gemm(&mut ln, 1.0, &hn, Op::N, &frozen_head, Op::T, 0.0, Arithmetic::Bf16))?;
+    report.line("unembedding 512x1024 . (151936x1024)^T (BF16, frozen head)", f64_head, bf16_head)?;
 
     // Vocabulary rows: KL with its cotangent, softmax statistics, and the head log partition.
     let target = matrix(rows, vocab, 7, 8.0);
@@ -106,6 +114,8 @@ fn main() -> Result<(), String> {
     let part_t = time(&narrow, 10, || narrow.head_log_partition(&hn, &en, false, None, Some(&mut mn), Arithmetic::Tf32).map(|_| ()))?;
     report.line("head log partition + expected row, f64 materialized vs swept", part_w, part_n)?;
     report.line("  the same, swept on TF32", part_w, part_t)?;
+    let part_b = time(&narrow, 10, || narrow.head_log_partition(&hn, &frozen_head, false, None, Some(&mut mn), Arithmetic::Bf16).map(|_| ()))?;
+    report.line("  the same, swept in BF16 on the frozen head", part_w, part_b)?;
     let materialized_n = time(&narrow, 10, || {
         let mut l = narrow.zeros(rows, vocab)?;
         narrow.gemm(&mut l, 1.0, &hn, Op::N, &en, Op::T, 0.0, Arithmetic::F32)?;
@@ -168,5 +178,24 @@ fn main() -> Result<(), String> {
         time(&wide, 50, || wide.adam(&mut pw, (&mut m1w, &mut m2w), &gw2, 1e-3, (0.9, 0.999, 1e-8), 3))?,
         time(&narrow, 50, || narrow.adam(&mut pn, (&mut m1n, &mut m2n), &gn2, 1e-3, (0.9, 0.999, 1e-8), 3))?,
     )?;
+    // A step of 24 small launches (maps on 512 x 1024), run op by op against one graph launch.
+    for (name, device) in [("f64", &wide), ("f32", &narrow)] {
+        let (mut p, q) = (up(device, &x)?, up(device, &matrix(rows, d, 14, 1.0))?);
+        let step = |p: &mut Tensor| -> Result<(), GpuError> {
+            for _ in 0..8 {
+                device.axpy(p, 0.5, &q)?;
+                device.hadamard(p, &q, &q, true)?;
+                device.add_row(p, -0.25, &device.rows_of(&q, 0, 1)?)?;
+            }
+            Ok(())
+        };
+        let direct = time(device, 20, || step(&mut p))?;
+        device.synchronize().map_err(|e| e.to_string())?;
+        device.begin_capture().map_err(|e| e.to_string())?;
+        step(&mut p).map_err(|e| e.to_string())?;
+        let graph = device.end_capture().map_err(|e| e.to_string())?;
+        let replay = time(device, 20, || graph.launch())?;
+        report.line(&format!("24-launch step, {name}: op by op vs one graph launch"), direct, replay)?;
+    }
     Ok(())
 }
