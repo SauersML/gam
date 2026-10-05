@@ -177,13 +177,15 @@ pub fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<Rea
     let named: BTreeMap<&str, usize> = program.operators.iter().enumerate().map(|(i, op)| (op.name.as_str(), i)).collect();
     let mut out = Vec::new();
     for l in 0..layers {
+        // A head reads through the query, key and value maps its rule applies to its input (nodes
+        // 1, 2 and 3), its own or a function it shares (`library_sharing`).
         for h in 0.. {
-            let maps: Vec<Option<&usize>> = ["q", "k", "v"].iter().map(|m| named.get(format!("library.l{l}.h{h}.{m}").as_str())).collect();
-            if maps.iter().all(Option::is_none) {
-                break;
-            }
-            for op in maps {
-                let op = *op.ok_or_else(|| error(format!("layer {l} head {h}: a read map is missing")))?;
+            let Some(rule) = program.rules.iter().find(|r| r.name == format!("library.l{l}.h{h}")) else { break };
+            for node in 1..4 {
+                let op = match rule.nodes.get(node) {
+                    Some(Node::Affine { terms, bias: None }) if terms.len() == 1 && terms[0].0 == 0 => terms[0].1,
+                    _ => return Err(error(format!("layer {l} head {h}: node {node} is not a read map"))),
+                };
                 out.push(ReadVariable { block: 2 * l, parts: vec![(op, 0..program.operators[op].rows.width())] });
             }
         }
