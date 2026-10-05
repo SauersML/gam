@@ -78,6 +78,10 @@ fn main() -> Result<(), String> {
     }
     let explanation = library_mdl::explanation(&native, &layers)?;
     explanation.artifact.validate_coverage(&native)?;
+    // A checkpoint there must be this fit's (export, sequences, program, groups, shared
+    // parameters) before anything is written.
+    let identity = library_mdl::identity(&settings.export_sha256, &native, &explanation, &train, held_out);
+    library_mdl::check_checkpoint(&checkpoint, &identity)?;
     let provenance = json!({
         "export": export.display().to_string(),
         "export_sha256": settings.export_sha256,
@@ -89,10 +93,11 @@ fn main() -> Result<(), String> {
         "held_out_sequences": [first, end],
         "context": settings.context,
         "groups": explanation.groups.len(),
+        "identity": identity,
     });
     log::info!("library run: {provenance}");
     save(&out.join("START.json"), &provenance)?;
-    let fit = library_mdl::fit(&device, &native, &explanation, &train, held_out, &settings.fit, Some(&checkpoint))?;
+    let fit = library_mdl::fit(&device, &native, &explanation, &train, held_out, &settings.fit, &settings.export_sha256, Some(&checkpoint))?;
     save(&out.join("REPORT.json"), &serde_json::to_value(&fit.report).map_err(|e| e.to_string())?)?;
     let artifact = library_mdl::posterior_mean(&explanation, &fit.posterior)?.f32_literals()?;
     artifact.validate_coverage(&native)?;

@@ -87,8 +87,10 @@ fn main() -> Result<(), String> {
     let mut fits = Vec::new();
     for (name, explanation) in [("base", &base), ("shared", &shared)] {
         let dir = out.join(name);
+        let checkpoint = dir.join("checkpoint.bin");
+        library_mdl::check_checkpoint(&checkpoint, &library_mdl::identity(&settings.export_sha256, &native, explanation, &train, held_out))?;
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let fit = library_mdl::fit(&device, &native, explanation, &train, held_out, &settings.fit, Some(&dir.join("checkpoint.bin")))?;
+        let fit = library_mdl::fit(&device, &native, explanation, &train, held_out, &settings.fit, &settings.export_sha256, Some(&checkpoint))?;
         save(&dir.join("REPORT.json"), &serde_json::to_value(&fit.report).map_err(|e| e.to_string())?)?;
         fits.push(fit.report);
     }

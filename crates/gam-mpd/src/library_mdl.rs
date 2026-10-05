@@ -104,6 +104,7 @@ use crate::{
     run_check::{LayerNodes, head_projection},
 };
 use gam_gpu::tensor::{Device, Op, Tensor};
+use gam_runtime::warm_start::Fingerprinter;
 use ndarray::{Array2, s};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
@@ -1169,6 +1170,7 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterio
 /// fit needs to continue exactly as if it had not stopped.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Progress {
+    identity: Identity,
     settings: Settings,
     tokens: usize,
     shapes: Vec<(usize, usize)>,
@@ -1184,6 +1186,123 @@ struct Progress {
     active: Vec<bool>,
     done: bool,
     seconds: f64,
+}
+
+/// What a checkpoint belongs to: a fit resumes from it only when every field agrees, so a
+/// checkpoint of another model, dataset or library can neither resume nor skip training. Each
+/// field is a SHA-256 in hexadecimal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    /// The export the native model was imported from (`export.json`'s digest).
+    pub export: String,
+    /// The training sequences' token ids, then the held-out sequences', in order.
+    pub tokens: String,
+    /// The structure of the native program and of the explanation's program: their nodes,
+    /// rules, operators' names and interfaces, and outputs (the values are the export's).
+    pub program: String,
+    /// The prior groups: every group's name and member entries.
+    pub groups: String,
+    /// The shared-parameter map: per trainable operator, every node of every rule and of the
+    /// program that applies it.
+    pub sharing: String,
+}
+
+fn program_structure(hasher: &mut Fingerprinter, tag: &[u8], program: &OperatorProgram) {
+    hasher.absorb_tag(tag);
+    for node in &program.nodes {
+        hasher.absorb_str(b"node", &format!("{node:?}"));
+    }
+    for rule in &program.rules {
+        hasher.absorb_str(b"rule", &format!("{}|{:?}|{:?}|{}", rule.name, rule.inputs, rule.nodes, rule.output));
+    }
+    for op in &program.operators {
+        hasher.absorb_str(b"operator", &format!("{}|{:?}|{:?}", op.name, op.rows, op.cols));
+    }
+    hasher.absorb_u64(b"output", program.output as u64);
+}
+
+/// The identity of a fit of `explanation` (made from `native`, imported from the export whose
+/// digest is `export`) on the training `sequences` with the `held` sequences held out.
+pub fn identity(export: &str, native: &OperatorProgram, explanation: &Explanation, sequences: &[Vec<u32>], held: &[Vec<u32>]) -> Identity {
+    let mut tokens = Fingerprinter::new();
+    for (tag, set) in [(&b"training"[..], sequences), (&b"held out"[..], held)] {
+        tokens.absorb_u64(tag, set.len() as u64);
+        for sequence in set {
+            let bytes: Vec<u8> = sequence.iter().flat_map(|t| t.to_le_bytes()).collect();
+            tokens.absorb_bytes(b"sequence", &bytes);
+        }
+    }
+    let mut program = Fingerprinter::new();
+    program_structure(&mut program, b"native", native);
+    program_structure(&mut program, b"explanation", &explanation.artifact.program);
+    let mut groups = Fingerprinter::new();
+    for group in &explanation.groups {
+        groups.absorb_str(b"group", &group.name);
+        for cell in &group.cells {
+            groups.absorb_str(b"cells", &format!("{}|{:?}|{:?}", cell.operator, cell.rows, cell.cols));
+        }
+    }
+    let mut sharing = Fingerprinter::new();
+    let explained = &explanation.artifact.program;
+    let bodies = std::iter::once(("program".to_string(), &explained.nodes)).chain(explained.rules.iter().map(|r| (r.name.clone(), &r.nodes)));
+    let mut uses: BTreeMap<usize, Vec<String>> = explanation.trainable.iter().map(|op| (*op, Vec::new())).collect();
+    for (body, nodes) in bodies {
+        for (n, node) in nodes.iter().enumerate() {
+            for op in node.operators() {
+                if let Some(list) = uses.get_mut(&op) {
+                    list.push(format!("{body}:{n}"));
+                }
+            }
+        }
+    }
+    for (op, list) in &uses {
+        sharing.absorb_str(b"uses", &format!("{op}|{}", list.join(",")));
+    }
+    Identity {
+        export: export.to_string(),
+        tokens: tokens.finalize().to_hex(),
+        program: program.finalize().to_hex(),
+        groups: groups.finalize().to_hex(),
+        sharing: sharing.finalize().to_hex(),
+    }
+}
+
+/// The checkpoint at `path`'s identity.
+fn checkpoint_identity(path: &Path) -> Result<Identity, String> {
+    #[derive(Deserialize)]
+    struct Header {
+        identity: Identity,
+    }
+    let bytes = std::fs::read(path).map_err(error)?;
+    let length = u64::from_le_bytes(bytes.get(..8).ok_or("a truncated checkpoint")?.try_into().map_err(error)?) as usize;
+    let header: Header = serde_json::from_slice(bytes.get(8..8 + length).ok_or("a truncated checkpoint")?)
+        .map_err(|e| format!("{}: a checkpoint without this fit's identity: {e}", path.display()))?;
+    Ok(header.identity)
+}
+
+/// Refuse a checkpoint at `path` of another fit than `identity`'s, naming every field that
+/// differs; a path with no checkpoint passes. A driver calls this before it writes anything.
+pub fn check_checkpoint(path: &Path, identity: &Identity) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let found = checkpoint_identity(path)?;
+    let differing: Vec<&str> = [
+        ("export", found.export == identity.export),
+        ("tokens", found.tokens == identity.tokens),
+        ("program", found.program == identity.program),
+        ("groups", found.groups == identity.groups),
+        ("sharing", found.sharing == identity.sharing),
+    ]
+    .into_iter()
+    .filter(|(_, same)| !same)
+    .map(|(field, _)| field)
+    .collect();
+    if differing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{}: a checkpoint of another fit (its {} differ)", path.display(), differing.join(", ")))
+    }
 }
 
 /// The fit's arrays in checkpoint order: per operator `μ`, `ln σ` and the moments of each.
@@ -1219,6 +1338,7 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior, 
     let bytes = std::fs::read(path).map_err(error)?;
     let length = u64::from_le_bytes(bytes.get(..8).ok_or("a truncated checkpoint")?.try_into().map_err(error)?) as usize;
     let header = bytes.get(8..8 + length).ok_or("a truncated checkpoint")?;
+    check_checkpoint(path, &expected.identity)?;
     let progress: Progress = serde_json::from_slice(header).map_err(error)?;
     let same_settings = serde_json::to_value(&progress.settings).map_err(error)? == serde_json::to_value(&expected.settings).map_err(error)?;
     if !same_settings || progress.tokens != expected.tokens || progress.shapes != expected.shapes || progress.active.len() != expected.active.len() {
@@ -1249,6 +1369,7 @@ pub fn fit(
     sequences: &[Vec<u32>],
     held: &[Vec<u32>],
     settings: &Settings,
+    export: &str,
     checkpoint: Option<&Path>,
 ) -> Result<Fit, String> {
     settings.validate()?;
@@ -1268,6 +1389,7 @@ pub fn fit(
     let mut mean_moments: Vec<Moment> = posterior.mean.iter().map(|m| Moment::zeros(m.dim())).collect();
     let mut log_sd_moments = mean_moments.clone();
     let mut progress = Progress {
+        identity: identity(export, native, explanation, sequences, held),
         settings: settings.clone(),
         tokens,
         shapes: posterior.mean.iter().map(Array2::dim).collect(),
@@ -1624,7 +1746,7 @@ mod tests {
         let (native, layers, _, sequences) = tiny_qwen3("library_fit_qwen3");
         let explanation = explanation(&native, &layers).unwrap();
         let (train, held) = sequences.split_at(4);
-        let fit = fit(&Device::host(), &native, &explanation, train, held, &settings(), None).unwrap();
+        let fit = fit(&Device::host(), &native, &explanation, train, held, &settings(), "tiny", None).unwrap();
         let report = &fit.report;
         assert_eq!(report.removals.last().unwrap().removed, 0, "the fit ends when no removal is accepted");
         assert!(report.removals.iter().all(|r| r.after_bits <= r.before_bits), "a removal never increases the objective");
@@ -1882,9 +2004,34 @@ mod tests {
         let device = Device::host();
         let (train, held) = sequences.split_at(4);
         let checkpoint = std::env::temp_dir().join(format!("library_fit_{}.bin", std::process::id()));
-        let fit = fit(&device, &native, &explanation, train, held, &settings, Some(&checkpoint)).unwrap();
+        let fit = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&checkpoint)).unwrap();
         // A finished fit's checkpoint resumes to the same posterior without another step.
-        let resumed = super::fit(&device, &native, &explanation, train, held, &settings, Some(&checkpoint)).unwrap();
+        let resumed = super::fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&checkpoint)).unwrap();
+        // A checkpoint of another export, other sequences or another library is refused, and so
+        // is a fit that would resume from it.
+        let own = identity("tiny", &native, &explanation, train, held);
+        check_checkpoint(&checkpoint, &own).unwrap();
+        let mut groups = explanation.clone();
+        groups.groups.swap(0, 1);
+        let (mut swapped, mut shared) = (train.to_vec(), explanation.clone());
+        swapped.swap(0, 1);
+        shared.artifact.program.rules[0].name.push('x');
+        // Head 1 of layer 0 reading head 0's key: the shared-parameter map changes.
+        let mut tied = explanation.clone();
+        let (key, _) = key_value(&tied.artifact.program, 0, 0);
+        let rule = tied.artifact.program.rules.iter_mut().find(|r| r.name == "library.l0.h1").unwrap();
+        rule.nodes[2] = Node::Affine { terms: vec![(0, key)], bias: None };
+        for (other, field) in [
+            (identity("another", &native, &explanation, train, held), "export"),
+            (identity("tiny", &native, &explanation, &swapped, held), "tokens"),
+            (identity("tiny", &native, &shared, train, held), "program"),
+            (identity("tiny", &native, &groups, train, held), "groups"),
+            (identity("tiny", &native, &tied, train, held), "sharing"),
+        ] {
+            let refusal = check_checkpoint(&checkpoint, &other).unwrap_err();
+            assert!(refusal.contains(field), "{refusal}");
+        }
+        assert!(super::fit(&device, &native, &explanation, train, held, &settings, "another", Some(&checkpoint)).is_err());
         std::fs::remove_file(&checkpoint).unwrap();
         std::fs::remove_file(checkpoint.with_extension("json")).unwrap();
         std::fs::remove_file(checkpoint.with_extension("artifact.bin")).unwrap();
