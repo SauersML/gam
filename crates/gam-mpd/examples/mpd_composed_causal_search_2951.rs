@@ -2455,14 +2455,10 @@ fn structural_run(
                             &controlled.program, &candidate, binding, &training.metadata,
                             config.optimizer.numeric_bytes)?;
                         save(&root.join("LOCAL_SUPERVISION.json"), &provenance)?;
-                        let (local_program, nonlinear) = prefit_joint_nonlinear(
+                        let fitted_local = prefit_structural_local(
                             d, &binding.program, &binding.trainable_operator_ids, &panels, config)?;
-                        let (local_program, linear) = prefit_joint_linear(
-                            d, &local_program, &binding.trainable_operator_ids, &panels,
-                            config.optimizer.numeric_bytes)?;
-                        binding.transfer(&local_program, &mut candidate)?;
-                        save(&root.join("LOCAL_NONLINEAR_PREFIT.json"), &nonlinear)?;
-                        save(&root.join("LOCAL_LINEAR_PREFIT.json"), &linear)?;
+                        binding.transfer(&fitted_local.program, &mut candidate)?;
+                        save_structural_local_prefit(&root, &fitted_local)?;
                         let stage = measure_structural_fit_stage(
                             d, &candidate, &local, &training, cache.as_ref(),
                             settings.fit.numeric_bytes, costs,
@@ -2894,6 +2890,24 @@ fn prefit_joint_linear(
     targets: &JointLocalTargets,
     numeric_bytes: usize,
 ) -> Result<(OperatorProgram, Value), String> {
+    let fit = prefit_joint_linear_detailed(d, program, trainable, targets, numeric_bytes)?;
+    Ok((fit.program, fit.report))
+}
+
+struct JointLinearPrefit {
+    program: OperatorProgram,
+    report: Value,
+    selected: gam_mpd::resident_rule_fit::GroupMeasurement,
+    eligible_operators: BTreeSet<usize>,
+}
+
+fn prefit_joint_linear_detailed(
+    d: &Device,
+    program: &OperatorProgram,
+    trainable: &[usize],
+    targets: &JointLocalTargets,
+    numeric_bytes: usize,
+) -> Result<JointLinearPrefit, String> {
     let measure = |p: &OperatorProgram| gam_mpd::resident_rule_fit::measure_grouped(
         d, p, &targets.inputs, &targets.targets, &targets.groups, numeric_bytes, 128);
     let initial = measure(program)?;
@@ -2901,9 +2915,74 @@ fn prefit_joint_linear(
         &targets.targets, trainable, Default::default(), numeric_bytes)?;
     let proposed = measure(&fit.program)?;
     let accepted = proposed.maximum < initial.maximum;
+    let eligible_operators = fit.report.blocks.iter().flat_map(|block| block.operators.iter().copied())
+        .collect::<BTreeSet<_>>();
     let report = json!({"initial":initial,"proposed":proposed,"accepted":accepted,
-        "linear_fit":fit.report,"state_source":targets.state_source,"selection":"Strict improvement of full TRAIN normalized maximum; no validation used. Local least squares is a proposal, not the acceptance objective."});
-    Ok((if accepted { fit.program } else { program.clone() }, report))
+        "linear_fit":fit.report,"eligible_operators":eligible_operators,
+        "state_source":targets.state_source,"selection":"Strict improvement of full TRAIN normalized maximum; no validation used. Local least squares is a proposal, not the acceptance objective."});
+    Ok(JointLinearPrefit { program: if accepted { fit.program } else { program.clone() }, report,
+        selected: if accepted { proposed } else { initial }, eligible_operators })
+}
+
+// Measured in ordinary f64 as max row residual L2 / each output group's native
+// TRAIN RMS. This scale-independent numerical shortcut only avoids unnecessary
+// proposal optimization; it is not a scientific acceptance/heldout tolerance.
+const STRUCTURAL_LOCAL_NUMERICAL_SKIP: f64 = 1e-10;
+
+struct StructuralLocalPrefit {
+    program: OperatorProgram,
+    initial_linear: Value,
+    nonlinear: Value,
+    linear: Value,
+}
+
+fn prefit_structural_local(
+    d: &Device,
+    program: &OperatorProgram,
+    trainable: &[usize],
+    targets: &JointLocalTargets,
+    settings: &JointLocalFit,
+) -> Result<StructuralLocalPrefit, String> {
+    let first = prefit_joint_linear_detailed(d, program, trainable, targets,
+        settings.optimizer.numeric_bytes)?;
+    let uncovered = trainable.iter().copied().filter(|id| !first.eligible_operators.contains(id))
+        .collect::<Vec<_>>();
+    let (after_nonlinear, mut nonlinear) = if trainable.is_empty()
+        || first.selected.maximum <= STRUCTURAL_LOCAL_NUMERICAL_SKIP {
+        (first.program.clone(), json!({"initial":first.selected,"proposed":first.selected,
+            "accepted":false,"optimizer_invoked":false,"settings":settings,
+            "state_source":targets.state_source,
+            "skip_reason":if trainable.is_empty(){"no_trainable_owners"}else{"numerically_solved_after_initial_linear"},
+            "scope":"Skip local Adam only after ordinary f64 full-TRAIN measurement reaches the explicit numerical residual threshold. Scientific acceptance and heldout checks remain unchanged."}))
+    } else {
+        // Even when every owner was eligible for least squares, a nonzero
+        // residual can admit a better normalized-max fit. Eligibility alone
+        // therefore never suppresses the existing max-objective refinement.
+        let (program, mut report) = prefit_joint_nonlinear(d, &first.program, trainable, targets, settings)?;
+        let optimizer_invoked = report.get("skip_reason").is_none();
+        report["optimizer_invoked"] = json!(optimizer_invoked);
+        report["refinement_reason"] = json!("TRAIN residual exceeds numerical skip threshold; least squares does not certify the normalized-max objective");
+        (program, report)
+    };
+    nonlinear["initial_linear_eligible_operators"] = json!(first.eligible_operators);
+    nonlinear["initial_linear_uncovered_operators"] = json!(uncovered);
+    nonlinear["numerical_skip_threshold"] = json!(STRUCTURAL_LOCAL_NUMERICAL_SKIP);
+    nonlinear["numerical_skip_units"] = json!("ordinary f64 maximum row L2 residual divided by each native TRAIN output-group RMS");
+    let nonlinear_changed = nonlinear["accepted"].as_bool().unwrap_or(false);
+    let (program, mut linear) = if nonlinear_changed {
+        prefit_joint_linear(d, &after_nonlinear, trainable, targets, settings.optimizer.numeric_bytes)?
+    } else {
+        (after_nonlinear, first.report.clone())
+    };
+    linear["execution"] = json!(if nonlinear_changed { "final_refit_after_accepted_nonlinear" }
+        else { "initial_linear_reused_without_accepted_nonlinear_change" });
+    Ok(StructuralLocalPrefit { program, initial_linear: first.report, nonlinear, linear })
+}
+
+fn save_structural_local_prefit(out: &Path, fit: &StructuralLocalPrefit) -> Result<(), String> {
+    save(&out.join("LOCAL_INITIAL_LINEAR_PREFIT.json"), &fit.initial_linear)?;
+    save(&out.join("LOCAL_NONLINEAR_PREFIT.json"), &fit.nonlinear)?;
+    save(&out.join("LOCAL_LINEAR_PREFIT.json"), &fit.linear)
 }
 
 /// Cached clean and response supervision only; the complete program still executes itself.
@@ -4209,6 +4288,110 @@ mod tests {
         composed_rule_search::{Binary, Expr, Unary},
         operator_program::{Node, SlotValues},
     };
+    #[test]
+    fn native_anchored_writer_recovers_with_linear_first_without_adam_and_replays_saved_outputs() {
+        use gam_mpd::operator_program::{exact_precision, Coefficient, Declarations, Interface, Law, Operator, Slot};
+        use gam_mpd::resident_rule_fit::{BatchSchedule, ProposalArithmetic};
+        use ndarray::array;
+        let scalar = Interface::native(1).unwrap();
+        let dense = |name: &str, value: f64| Arc::new(Operator::dense(name, scalar.clone(),
+            scalar.clone(), array![[value]], exact_precision([value]).unwrap(), Default::default()).unwrap());
+        let native = OperatorProgram {
+            declarations: Declarations { domains:vec![], slots:vec![Slot::Raw{width:1}], parameters:0 },
+            bases:vec![], rules:vec![], operators:vec![dense("native up",2.),dense("native writer",3.)],
+            nodes:vec![Node::Raw{slot:0},Node::Affine{terms:vec![(0,0)],bias:None},
+                Node::Pointwise{input:1,laws:vec![Law::GeluTanh]},
+                Node::Gain{input:2,coefficient:Coefficient::Number(2.)},
+                Node::Affine{terms:vec![(3,1)],bias:None}], output:4,
+        };
+        let source = Artifact::native(&native).unwrap();
+        let region = gam_mpd::program_joint_regions::Region {
+            anchor_mode:gam_mpd::program_joint_regions::AnchorMode::Observable,
+            native_reads:vec![0], current_reads:vec![0], native_writes:vec![2,4], current_writes:vec![2,4],
+            current_internal_nodes:vec![1,2,3,4],producer_native:2,erased_native_places:vec![1,3],source_program_nodes:5,
+        };
+        let bounds = program_learned_dag::parent::Settings {max_edit_checks:128,max_proposals:32,
+            max_body_nodes:12,max_parameter_elements:16};
+        let inventory = program_learned_dag::parent::enumerate(&source,&region,&bounds).unwrap();
+        let proposal = inventory.proposals.iter().find(|p| p.edit == Some(program_learned_dag::parent::Reuse {
+            consumer:4,operand:0,previous:3,replacement:2,
+        })).expect("native donor feature and edited final writer");
+        let applied = program_learned_dag::parent::apply_hypothesis(&source,&region,proposal,&bounds).unwrap();
+        assert_eq!(applied.local_fit.trainable_operator_ids.len(),1);
+        let family=FamilyInputs{rows:6,slots:vec![SlotValues::Raw(array![[-2.],[-1.],[0.],[0.5],[1.],[2.]])],layout:None};
+        let episodes=vec![ResponseEpisode{label:"train".into(),inputs:family.clone(),scored:None,endpoint_bytes:0}];
+        let (panels,_)=capture_structural_local_targets(&native,&applied.artifact,&applied.local_fit,&episodes,1 << 24).unwrap();
+        let settings=JointLocalFit {
+            // Zero iterations is deliberately invalid for the Adam fitter: this
+            // regression must recover through the actual conditional solve alone.
+            optimizer:gam_mpd::resident_rule_fit::Settings{iterations:0,forward_rows:6,learning_rate:0.01,
+                beta1:0.9,beta2:0.999,epsilon:1e-8,numeric_bytes:1 << 24,arithmetic:ProposalArithmetic::F64,backtracking:None},
+            batch:BatchSchedule{ordinary_rows:6,hard_rows:0,scan_every:1,temperature:0.05,objective:Default::default()},
+        };
+        let fit=prefit_structural_local(&Device::host(),&applied.local_fit.program,
+            &applied.local_fit.trainable_operator_ids,&panels,&settings).unwrap();
+        assert_eq!(fit.initial_linear["accepted"],true);
+        assert!(fit.initial_linear["proposed"]["maximum"].as_f64().unwrap() < STRUCTURAL_LOCAL_NUMERICAL_SKIP);
+        assert_eq!(fit.nonlinear["optimizer_invoked"],false);
+        assert_eq!(fit.nonlinear["skip_reason"],"numerically_solved_after_initial_linear");
+        assert!(fit.nonlinear.get("optimizer_report").is_none());
+        assert_eq!(fit.linear["execution"],"initial_linear_reused_without_accepted_nonlinear_change");
+        for (id,op) in applied.local_fit.program.operators.iter().enumerate() {
+            if !applied.local_fit.trainable_operator_ids.contains(&id) { assert_eq!(&fit.program.operators[id],op); }
+        }
+        let mut candidate=applied.artifact.clone();
+        applied.local_fit.transfer(&fit.program,&mut candidate).unwrap();
+        let out=std::env::temp_dir().join(format!("mpd-native-linear-first-{}",std::process::id()));
+        std::fs::create_dir_all(&out).unwrap();
+        save_structural_local_prefit(&out,&fit).unwrap();
+        std::fs::write(out.join("local-prefit.artifact"),candidate.to_bytes().unwrap()).unwrap();
+        let evidence:Value=serde_json::from_slice(&std::fs::read(out.join("LOCAL_NONLINEAR_PREFIT.json")).unwrap()).unwrap();
+        assert_eq!(evidence["optimizer_invoked"],false);
+        assert!(out.join("LOCAL_INITIAL_LINEAR_PREFIT.json").exists());
+        let legacy:Value=serde_json::from_slice(&std::fs::read(out.join("LOCAL_LINEAR_PREFIT.json")).unwrap()).unwrap();
+        assert_eq!(legacy["accepted"],true);
+        let saved=Artifact::from_bytes(&std::fs::read(out.join("local-prefit.artifact")).unwrap(),&native.declarations).unwrap();
+        let actual=saved.program.execute(&family,false).unwrap();
+        let expected=native.execute(&family,false).unwrap();
+        for &place in &region.native_writes {
+            assert!(actual.values[saved.place(place).unwrap()].iter().zip(expected.values[place].iter())
+                .all(|(a,b)|(a-b).abs()<1e-10),"saved native exit {place}");
+        }
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[test]
+    fn linear_eligible_writer_with_residual_still_gets_max_objective_refinement() {
+        use gam_mpd::operator_program::{exact_precision, Declarations, Interface, Operator, Slot};
+        use gam_mpd::resident_rule_fit::{BatchSchedule, OutputGroup, ProposalArithmetic};
+        use ndarray::array;
+        let program=OperatorProgram {
+            declarations:Declarations{domains:vec![],slots:vec![Slot::Raw{width:1}],parameters:0},
+            bases:vec![],rules:vec![],operators:vec![Arc::new(Operator::dense("writer",
+                Interface::native(1).unwrap(),Interface::native(1).unwrap(),array![[0.]],
+                exact_precision([0.]).unwrap(),Default::default()).unwrap())],
+            nodes:vec![Node::Raw{slot:0},Node::Affine{terms:vec![(0,0)],bias:None}],output:1,
+        };
+        // Collapsed candidate features have inconsistent native labels. The
+        // least-squares writer is 1, while the normalized-max optimum is 1.5.
+        let panels=JointLocalTargets{inputs:vec![array![[1.],[1.],[1.]]],targets:array![[0.],[0.],[3.]],
+            groups:vec![OutputGroup{label:"native".into(),start:0,end:1}],state_source:"synthetic TRAIN"};
+        let settings=JointLocalFit {
+            optimizer:gam_mpd::resident_rule_fit::Settings{iterations:40,forward_rows:3,learning_rate:0.05,
+                beta1:0.9,beta2:0.999,epsilon:1e-8,numeric_bytes:1 << 24,arithmetic:ProposalArithmetic::F64,backtracking:None},
+            batch:BatchSchedule{ordinary_rows:3,hard_rows:0,scan_every:1,temperature:0.001,objective:Default::default()},
+        };
+        let fit=prefit_structural_local(&Device::host(),&program,&[0],&panels,&settings).unwrap();
+        assert_eq!(fit.nonlinear["initial_linear_uncovered_operators"],json!([]));
+        assert_eq!(fit.nonlinear["optimizer_invoked"],true);
+        assert_eq!(fit.nonlinear["accepted"],true);
+        assert_eq!(fit.linear["execution"],"final_refit_after_accepted_nonlinear");
+        assert_eq!(fit.linear["accepted"],false,"MSE re-solve must not replace a better normalized-max writer");
+        let measured=gam_mpd::resident_rule_fit::measure_grouped(&Device::host(),&fit.program,
+            &panels.inputs,&panels.targets,&panels.groups,1 << 24,3).unwrap();
+        assert!(measured.maximum < fit.initial_linear["proposed"]["maximum"].as_f64().unwrap());
+    }
+
     #[test]
     fn harmful_composed_refinement_preserves_feasible_learned_local_replacement() {
         use gam_mpd::operator_program::{exact_precision, Declarations, Interface, Operator, Slot};
