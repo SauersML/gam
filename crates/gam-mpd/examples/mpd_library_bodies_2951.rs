@@ -355,6 +355,35 @@ fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior
         (explanation, current, calls) = (merged, fit, merged_calls);
     }
     summary["calls"] = json!(calls);
+    // The evidence for each call: the functions whose flows enter and leave its region (RelP flows
+    // at the start), and its reads and writes in token terms at the accepted explanation.
+    let name = |f: &Function| match f {
+        Function::Head { layer, head } => format!("L{layer}.H{head}"),
+        Function::Mlp { layer, function } => format!("L{layer}.M{function}"),
+    };
+    let mut evidence = Vec::new();
+    for call in &calls {
+        let inside: Vec<usize> = (0..functions.len())
+            .filter(|&v| matches!(functions[v], Function::Mlp { layer, function } if layer == call.layer && call.replaced.iter().any(|(f, _)| *f == function)))
+            .collect();
+        let mut into: BTreeMap<String, f64> = BTreeMap::new();
+        let mut out_of: BTreeMap<String, f64> = BTreeMap::new();
+        for &v in &inside {
+            for u in (0..functions.len()).filter(|u| !inside.contains(u)) {
+                *into.entry(name(&functions[u])).or_default() += flows[[v, u]].abs();
+                *out_of.entry(name(&functions[u])).or_default() += flows[[u, v]].abs();
+            }
+        }
+        let strongest = |m: BTreeMap<String, f64>| {
+            let mut v: Vec<(String, f64)> = m.into_iter().filter(|(_, f)| *f > 0.0).collect();
+            v.sort_by(|a, b| b.1.total_cmp(&a.1));
+            v.truncate(8);
+            v
+        };
+        evidence.push(json!({"call": call.name, "body": call.body, "layer": call.layer, "flow_in": strongest(into), "flow_out": strongest(out_of)}));
+    }
+    summary["evidence"] = json!(evidence);
+    summary["readings"] = json!(library_bodies::describe(&run.native, &run.layers, &explanation, &calls, 8)?);
     save(&run.out.join("SUMMARY.json"), &summary)
 }
 
@@ -425,7 +454,7 @@ fn main() -> Result<(), String> {
             let (base, posterior) = match from.split_once(':') {
                 None if from == "native" => (start, None),
                 Some(("checkpoint", path)) => {
-                    let posterior = library_readout::checkpoint_posterior(&start, Path::new(path))?;
+                    let posterior = library_mdl::checkpoint_posterior(&start, Path::new(path))?;
                     let mut base = library_sharing::warm(&start, &library_mdl::posterior_mean(&start, &posterior)?)?;
                     base.removed = (0..posterior.active.len()).filter(|g| !posterior.active[*g]).collect();
                     (base, Some(posterior))

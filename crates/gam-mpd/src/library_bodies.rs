@@ -71,6 +71,7 @@ use crate::{
 };
 use gam_linalg::decompose::svd;
 use ndarray::{Array1, Array2, Axis, s};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -1144,10 +1145,11 @@ fn saving(reads: &Array2<f64>, writes: &Array2<f64>, parts: usize) -> Result<f64
 }
 
 /// The candidate regions of layer `layer`'s MLP among the native functions `pool` (those carrying
-/// flow) at `posterior` (module note): functions are grouped greedily, the pair of groups whose
-/// union's rewrite saves the most parameters beyond the two apart ([`saving`]) first, while one
-/// does; the groups whose rewrite saves parameters are the regions. Parallel functions of one body
-/// read and write the same few directions, so their union saves what each alone cannot; a function
+/// flow) at `posterior` (module note): from each function a group is grown by adding, one at a
+/// time, the function whose union's rewrite saves the most parameters ([`saving`]), and the best
+/// group along the way is that function's candidate; the candidates that save are taken, the
+/// largest saving first, each disjoint from those before it. Parallel functions of one body read
+/// and write the same few directions, so their union saves what each alone cannot; a function
 /// reading a direction of its own adds a coordinate to each binding and is left out.
 pub fn regions(explanation: &Explanation, posterior: &Posterior, layer: usize, pool: &[usize]) -> Result<Vec<Vec<usize>>, String> {
     let program = &explanation.artifact.program;
@@ -1182,44 +1184,78 @@ pub fn regions(explanation: &Explanation, posterior: &Posterior, layer: usize, p
         let (reads, writes) = stack(members);
         saving(&reads, &writes, parts)
     };
-    let mut groups: Vec<(Vec<usize>, f64)> = (0..functions.len()).map(|f| Ok((vec![f], value(&[f])?))).collect::<Result<_, String>>()?;
-    // The gain of joining each pair, kept and recomputed only for pairs with a new group.
-    let gain = |a: &(Vec<usize>, f64), b: &(Vec<usize>, f64)| -> Result<f64, String> {
-        let union: Vec<usize> = a.0.iter().chain(&b.0).copied().collect();
-        Ok(value(&union)? - a.1 - b.1)
+    // A group's resolved read and write directions (right singular vectors above the noise edge).
+    let resolved_basis = |m: &Array2<f64>| -> Result<Array2<f64>, String> {
+        let edge = (m.nrows() as f64).sqrt() + (m.ncols() as f64).sqrt();
+        let decomposition = svd(m.view(), false).map_err(error)?;
+        let k = decomposition.singular_values.iter().filter(|s| **s > edge).count();
+        Ok(decomposition.vt.slice(s![..k, ..]).to_owned())
     };
-    let mut gains: BTreeMap<(usize, usize), f64> = BTreeMap::new();
-    for a in 0..groups.len() {
-        for b in a + 1..groups.len() {
-            gains.insert((a, b), gain(&groups[a], &groups[b])?);
+    // Whether `block`'s rows lie within `basis`'s span up to noise: the largest singular value of
+    // the residual is within that of a same-shaped unit-noise block in the complement.
+    let within = |block: &Array2<f64>, basis: &Array2<f64>| -> Result<bool, String> {
+        let residual = block - &block.dot(&basis.t()).dot(basis);
+        let complement = block.ncols() - basis.nrows();
+        let edge = (block.nrows() as f64).sqrt() + (complement as f64).sqrt();
+        Ok(svd(residual.view(), false).map_err(error)?.singular_values.first().is_none_or(|s| *s <= edge))
+    };
+    // The functions outside `members` whose reads and writes lie within the members' resolved
+    // directions: those the group could take in without a new coordinate.
+    let inliers = |members: &[usize]| -> Result<usize, String> {
+        let (reads, writes) = stack(members);
+        let (read_basis, write_basis) = (resolved_basis(&reads)?, resolved_basis(&writes)?);
+        let mut count = 0;
+        for f in (0..functions.len()).filter(|f| !members.contains(f)) {
+            let (r, w) = stack(&[f]);
+            if within(&r, &read_basis)? && within(&w, &write_basis)? {
+                count += 1;
+            }
         }
-    }
-    let mut alive: Vec<bool> = vec![true; groups.len()];
-    loop {
-        let best = gains.iter().filter(|(_, g)| **g > 0.0).max_by(|x, y| x.1.total_cmp(y.1)).map(|(k, g)| (*k, *g));
-        let Some(((a, b), value_gain)) = best else { break };
-        let members: Vec<usize> = groups[a].0.iter().chain(&groups[b].0).copied().collect();
-        let total = groups[a].1 + groups[b].1 + value_gain;
-        alive[a] = false;
-        alive[b] = false;
-        gains.retain(|(x, y), _| ![a, b].contains(x) && ![a, b].contains(y));
-        groups.push((members, total));
-        alive.push(true);
-        let new = groups.len() - 1;
-        for other in (0..new).filter(|o| alive[*o]) {
-            gains.insert((other, new), gain(&groups[other], &groups[new])?);
-        }
-    }
-    Ok(groups
-        .into_iter()
-        .zip(alive)
-        .filter(|((_, value), alive)| *alive && *value > 0.0)
-        .map(|((members, _), _)| {
+        Ok(count)
+    };
+    // From each function, the group grown by adding the function whose union saves most (ties
+    // broken by the functions the union could take in without a new coordinate), over the whole
+    // path; the best prefix of each path is a candidate. A body's functions save together what no
+    // pair of them saves: two rows of a two-dimensional read already have its rank.
+    let n = functions.len();
+    let mut candidates: Vec<(f64, Vec<usize>)> = (0..n)
+        .into_par_iter()
+        .map(|seed| -> Result<(f64, Vec<usize>), String> {
+            let mut members = vec![seed];
+            let mut best = (value(&members)?, members.clone());
+            let mut rest: Vec<usize> = (0..n).filter(|f| *f != seed).collect();
+            while !rest.is_empty() {
+                let mut pick: Option<((f64, usize), usize)> = None;
+                for (at, &f) in rest.iter().enumerate() {
+                    members.push(f);
+                    let score = (value(&members)?, inliers(&members)?);
+                    members.pop();
+                    if pick.is_none_or(|(b, _)| score.0 > b.0 || (score.0 == b.0 && score.1 > b.1)) {
+                        pick = Some((score, at));
+                    }
+                }
+                let Some(((v, _), at)) = pick else { break };
+                members.push(rest.remove(at));
+                if v > best.0 {
+                    best = (v, members.clone());
+                }
+            }
+            Ok(best)
+        })
+        .collect::<Result<_, String>>()?;
+    // The candidates that save, largest saving first, each disjoint from those taken.
+    candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut taken = vec![false; n];
+    let mut out = Vec::new();
+    for (saved, members) in candidates {
+        if saved > 0.0 && members.iter().all(|f| !taken[*f]) {
+            members.iter().for_each(|f| taken[*f] = true);
             let mut region: Vec<usize> = members.iter().map(|f| functions[*f].0).collect();
             region.sort_unstable();
-            region
-        })
-        .collect())
+            out.push(region);
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------- reuse by gradient
@@ -1648,6 +1684,88 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
     }
 }
 
+// ------------------------------------------------------------------------------------ reading
+
+/// A token and its score.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Scored {
+    pub token: u32,
+    pub score: f64,
+}
+
+/// What one call of a body reads and writes in token terms ([`describe`]): per input coordinate
+/// `q` the tokens whose embeddings it reads most and least, `r_q · (γ ⊙ e_t) / rms(e_t)` with the
+/// layer's MLP norm gain `γ` (a direct read of the embedding), and per output coordinate the tokens
+/// its write `w_q` promotes and suppresses, `W_U (γ_f ⊙ w_q)` centred over the vocabulary with the
+/// final norm's gain `γ_f` (a direct path to the logits).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CallReading {
+    pub call: String,
+    pub layer: usize,
+    pub body: String,
+    pub reads: Vec<(Vec<Scored>, Vec<Scored>)>,
+    pub writes: Vec<(Vec<Scored>, Vec<Scored>)>,
+}
+
+/// The gain and `ε` of the RMS norm whose gain node is `normed` in `native`.
+fn norm_of(native: &OperatorProgram, normed: usize) -> Result<(Array1<f64>, f64), String> {
+    let Node::Affine { terms, .. } = &native.nodes[normed] else { return Err(format!("node {normed} is not a normed stream")) };
+    let [(rms, gain)] = terms[..] else { return Err(format!("node {normed} is not one gain of a norm")) };
+    let Node::RmsNorm { epsilon, .. } = native.nodes[rms] else { return Err(format!("node {normed} does not read an RMS norm")) };
+    Ok((native.operators[gain].matrix().diag().to_owned(), epsilon))
+}
+
+/// The `top` largest and smallest of `scores`, each with its token.
+fn extremes(scores: &Array1<f64>, top: usize) -> (Vec<Scored>, Vec<Scored>) {
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+    order.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]));
+    let pick = |i: &usize| Scored { token: *i as u32, score: scores[*i] };
+    (order.iter().take(top).map(pick).collect(), order.iter().rev().take(top).map(pick).collect())
+}
+
+/// Each call of `explanation` in token terms ([`CallReading`]), `top` tokens per list; `native` is
+/// the split native program and `layers` its sites (`run_check::layer_nodes`).
+pub fn describe(native: &OperatorProgram, layers: &[crate::run_check::LayerNodes], explanation: &Explanation, calls: &[Call], top: usize) -> Result<Vec<CallReading>, String> {
+    let head = crate::resident_causal_fit::fixed_head_target::Head::of(native)?;
+    let unembedding = &head.embedding;
+    let (final_gain, _) = norm_of(native, head.hidden)?;
+    let feature = native.nodes.iter().position(|n| matches!(n, Node::Feature { .. })).ok_or("no token feature")?;
+    let embedding = native
+        .nodes
+        .iter()
+        .find_map(|n| match n {
+            Node::Affine { terms, bias: None } if terms.len() == 1 && terms[0].0 == feature => Some(native.operators[terms[0].1].matrix()),
+            _ => None,
+        })
+        .ok_or("no token embedding")?;
+    // Rows are tokens.
+    let embedding = if embedding.ncols() == unembedding.ncols() { embedding } else { embedding.t().to_owned() };
+    let program = &explanation.artifact.program;
+    let mut out = Vec::with_capacity(calls.len());
+    for call in calls {
+        let site = layers.get(call.layer).ok_or_else(|| format!("{}: no layer {}", call.name, call.layer))?;
+        let (gain, epsilon) = norm_of(native, site.normed)?;
+        let normed = Array2::from_shape_fn(embedding.dim(), |(t, j)| {
+            let row = embedding.row(t);
+            gain[j] * row[j] / (row.dot(&row) / row.len() as f64 + epsilon).sqrt()
+        });
+        let read = program.operators[operator_index(program, &format!("{}.read", call.name))?].matrix();
+        let write = program.operators[operator_index(program, &format!("{}.write", call.name))?].matrix();
+        let reads = read.outer_iter().map(|r| extremes(&normed.dot(&r), top)).collect();
+        let writes = write
+            .columns()
+            .into_iter()
+            .map(|w| {
+                let logits = unembedding.dot(&(&w * &final_gain));
+                let mean = logits.mean().unwrap_or(0.0);
+                extremes(&logits.mapv(|v| v - mean), top)
+            })
+            .collect();
+        out.push(CallReading { call: call.name.clone(), layer: call.layer, body: call.body.clone(), reads, writes });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1894,12 +2012,16 @@ mod tests {
             let (native, layers, _, _) = tiny(&format!("bodies_regions_{gated}"), law, gated);
             let mut start = explanation(&native, &layers).unwrap();
             planted(&mut start, gated);
-            let posterior = Posterior::new(&start, 72).unwrap();
-            let pool: Vec<usize> = (0..16).collect();
-            for (l, site) in [(0, SITE0), (1, SITE1)] {
-                let mut expected = site.to_vec();
-                expected.sort_unstable();
-                assert_eq!(regions(&start, &posterior, l, &pool).unwrap(), vec![expected], "layer {l}");
+            // At a coarse and at a fine posterior resolution (at the fine one no two units of the
+            // subroutine save anything on their own).
+            for tokens in [72, 1_000_000] {
+                let posterior = Posterior::new(&start, tokens).unwrap();
+                let pool: Vec<usize> = (0..16).collect();
+                for (l, site) in [(0, SITE0), (1, SITE1)] {
+                    let mut expected = site.to_vec();
+                    expected.sort_unstable();
+                    assert_eq!(regions(&start, &posterior, l, &pool).unwrap(), vec![expected], "layer {l} at {tokens} tokens");
+                }
             }
         }
     }
@@ -1947,4 +2069,22 @@ mod tests {
             assert!(mixture.cost(&posterior).unwrap() > 0.0, "the mixture pays for its choice, weights and gauge");
         }
     }
+
+    #[test]
+    fn a_call_is_read_in_token_terms() {
+        let (native, layers, _, _) = tiny("bodies_describe", "gelu_tanh", false);
+        let start = explanation(&native, &layers).unwrap();
+        let (one, call) = rewrite(&start, 0, &SITE0).unwrap();
+        let readings = describe(&native, &layers, &one, std::slice::from_ref(&call), 3).unwrap();
+        assert_eq!(readings.len(), 1);
+        let program = &one.artifact.program;
+        let k = program.operators[operator_index(program, &format!("{}.read", call.name)).unwrap()].rows.width();
+        assert_eq!(readings[0].reads.len(), k);
+        for (most, least) in readings[0].reads.iter().chain(&readings[0].writes) {
+            assert_eq!((most.len(), least.len()), (3, 3));
+            assert!(most.windows(2).all(|w| w[0].score >= w[1].score) && most[0].score >= least[0].score);
+        }
+    }
 }
+
+
