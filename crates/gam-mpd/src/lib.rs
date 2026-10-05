@@ -308,6 +308,7 @@ pub mod intervention_program;
 
 /// Declared rank-one native down-weight perturbations as a full augmented program.
 pub mod down_edit_family;
+pub mod native_parameter_edit;
 
 /// Exact native primitive-unary capacity-control initialization.
 pub mod native_mlp_initialization;
