@@ -255,10 +255,11 @@ impl DevicePosterior {
     }
 
     /// One IVON step: `gradients` holds per trainable operator (by id) the gradient of the batch's
-    /// data term at the sample, which `scale` turns into the gradient per token in nats (one over
-    /// the batch's scored tokens, and the conversion from bits); `factor` holds per operator a draw
-    /// of the Gauss–Newton factor and the factor `1 / n` turning its square into the curvature
-    /// estimate per token. An operator the batch does not reach has neither, and its step takes the
+    /// data term at the sample, which `scale` turns into an unbiased estimate of the collection's
+    /// gradient per token in nats (`B / N` for one of `B` batches of a collection of `N` scored
+    /// tokens, times the conversion from bits); `factor` holds per operator a draw of the
+    /// Gauss–Newton factor and the factor (`B / N`) turning its square into the curvature estimate
+    /// per token. An operator the batch does not reach has neither, and its step takes the
     /// prior's alone.
     pub fn step(&mut self, gradients: &BTreeMap<usize, Tensor>, scale: f64, factor: (&BTreeMap<usize, Tensor>, f64), ivon: &Ivon) -> Result<(), String> {
         self.steps += 1;
