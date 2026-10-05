@@ -64,7 +64,7 @@
 use crate::{
     interchange,
     library_compensation::Compensation,
-    library_mdl::{Explanation, Posterior, Removal},
+    library_mdl::{Explanation, Outcome, Posterior, Removal},
     operator_program::{Interface, Law, Node, OperatorBody, OperatorProgram},
     resident_causal_fit::fixed_head_target::Head,
     run_check::LayerNodes,
@@ -797,6 +797,9 @@ pub fn round(
     let before = objective(posterior)?;
     let mut current = before;
     let mut evaluations: Vec<(usize, f64)> = Vec::new();
+    // The groups removed as without effect, and each rejected unit's first group with its own
+    // effect in bits.
+    let (mut dead_removed, mut singles) = (0, Vec::new());
     let trial = |posterior: &Posterior, groups: &[usize]| -> Result<Posterior, String> {
         match compensation {
             Some(c) => c.proposal(posterior, groups),
@@ -828,6 +831,7 @@ pub fn round(
                 if accepted {
                     *posterior = removed;
                     current += change;
+                    dead_removed = dead.len();
                 }
             }
             let costs = posterior.costs();
@@ -897,6 +901,7 @@ pub fn round(
                 // The unit the segment ended on: its own effect on top of the accepted prefix.
                 let blocked = &rest[accepted];
                 let marginal = changes[&(accepted + 1)] - changes.get(&accepted).copied().unwrap_or(0.0);
+                singles.push((blocked.groups[0], marginal / LN_2));
                 journal.write(json!({
                     "event": "proposal", "kind": "blocked", "units": 1, "groups": blocked.groups, "layers": names(&blocked.groups),
                     "predicted_bits": blocked.predicted / LN_2, "measured_bits": marginal / LN_2, "accepted": false, "seconds": 0.0,
@@ -940,7 +945,12 @@ pub fn round(
         "event": "end", "search": format!("{search:?}"), "candidates": candidates, "removed": removed,
         "before_bits": before / LN_2, "after_bits": current / LN_2, "evaluations": evaluations.len(), "seconds": started.elapsed().as_secs_f64(),
     }))?;
-    Ok(Removal { candidates, removed, before_bits: before / LN_2, after_bits: current / LN_2, evaluations })
+    let outcome = match (removed, dead_removed) {
+        (0, _) => Outcome::Exhausted,
+        (r, d) if r == d => Outcome::Dead,
+        _ => Outcome::Prefix,
+    };
+    Ok(Removal { candidates, removed, dead: dead_removed, before_bits: before / LN_2, after_bits: current / LN_2, evaluations, singles, outcome })
 }
 
 /// The longest accepted prefix of `n` units found by testing the whole (when `whole`), then lengths
