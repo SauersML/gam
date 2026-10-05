@@ -422,6 +422,28 @@ fn joint_patches_spanning_the_stream_match_the_host_reference() {
 }
 
 #[test]
+fn rows_that_repeat_patch_the_span_they_resolve() {
+    // At width 8, three copies of four MLP rows are twelve rows of rank four: more rows than
+    // coordinates, yet not every direction. Their joint patch is the patch of the four rows alone.
+    let mut f = fixture_at(8);
+    let up = f.p.flat.operators.iter().position(|op| op.name == "blocks.1.c_fc").expect("layer 1 MLP input");
+    let first = f.variables.len();
+    f.variables.extend((0..3).map(|_| ReadVariable { block: 3, parts: vec![(up, 0..4)] }));
+    let e = |patch: Patch| Experiment { base: 1, source: 2, explained: vec![true, false, true, true], patch: Some(patch), position: 2 };
+    let experiments = vec![e(Patch::Reads { variables: (first..first + 3).collect() }), e(Patch::Read { variable: first })];
+    for device in devices() {
+        let programs = programs(&device, &f);
+        let (m, p) = models(&f, &programs);
+        let design = design(&p, &f.variables, &experiments).expect("design");
+        let targets = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
+        let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, &design, false).expect("evaluate");
+        for ((joint, alone), host) in evaluation.bits[0].iter().zip(&evaluation.bits[1]).zip(reference(&f, &experiments[1])) {
+            assert!((joint - alone).abs() <= 1e-9 && (alone - host).abs() <= 1e-9, "repeated rows {joint} bits, the four alone {alone} bits, host {host} bits");
+        }
+    }
+}
+
+#[test]
 fn many_dropped_reads_that_matter_little_alone_matter_jointly() {
     // M's last MLP gets n functions whose gate rows g_k put every base read at -L and the source's
     // read at the patched position at +L (GELU leaves them off on the base, on at the source), and

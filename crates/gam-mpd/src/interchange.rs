@@ -60,7 +60,13 @@ use crate::{
     run_check::LayerNodes,
 };
 use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, Tensor};
-use gam_linalg::decompose::svd;
+use faer::Side;
+use gam_linalg::{
+    decompose::svd,
+    faer_ndarray::{FaerCholesky, FaerQr, fast_ata},
+    roundoff::{accumulation_growth, factor_singular_band, weighted_gram_assembly_band},
+};
+use gam_math::roundoff::inflated;
 use ndarray::{ArrayView2, Axis, s};
 use rand::RngExt;
 use rayon::prelude::*;
@@ -517,6 +523,12 @@ impl Protocol {
 
     /// The directions of `experiments` (over this protocol's variables) on device `d`: `M`'s.
     pub fn design(&self, d: &Device, experiments: &[Experiment]) -> Result<Design, String> {
+        self.host_design(experiments)?.upload(d)
+    }
+
+    /// [`Protocol::design`] on the host, before upload: host arithmetic alone, so a fit can make
+    /// the next batch's on another thread while the device runs the current one.
+    pub fn host_design(&self, experiments: &[Experiment]) -> Result<HostDesign, String> {
         let rows_of = |op: usize, rows: &Range<usize>| -> Result<ndarray::Array2<f64>, String> {
             let all = self.operators.get(&op).ok_or_else(|| error("a read variable outside the protocol's operators"))?;
             if rows.end > all.nrows() || rows.is_empty() {
@@ -524,14 +536,27 @@ impl Protocol {
             }
             Ok(all.slice(s![rows.clone(), ..]).to_owned())
         };
-        design_with(d, self.blocks, &self.variables, experiments, rows_of)
+        host_design(self.blocks, &self.variables, experiments, rows_of)
     }
 }
 
-/// The span of the rows of `rows`: their right singular vectors whose singular values exceed the
-/// decomposition's rounding band, as an orthonormal basis `d × r` unless none or all `d` are
-/// resolved from zero.
+/// The span of the rows of `rows` (`n × d`): the right singular vectors whose singular values
+/// exceed the decomposition's rounding band `max(n, d)·ε·σ₁` (`factor_singular_band`), as an
+/// orthonormal basis `d × r` unless none or all `d` are resolved from zero. When the Gram of the
+/// shorter side certifies all `min(n, d)` resolved ([`resolved_gram`]), the span is every direction
+/// (`n ≥ d`) or the rows' own, whose basis a Householder QR of the rows gives, and no singular
+/// value decomposition is needed; otherwise one decides.
 fn span(rows: ArrayView2<'_, f64>) -> Result<Span<ndarray::Array2<f64>>, String> {
+    let (n, d) = rows.dim();
+    let gram = if n >= d { fast_ata(&rows) } else { fast_ata(&rows.t()) };
+    let squares = inflated(gram.diag().sum(), n.max(d));
+    let band = factor_singular_band(n, d, squares.sqrt());
+    if resolved_gram(&gram, n.max(d), squares, band * band) {
+        if n >= d {
+            return Ok(Span::Whole);
+        }
+        return Ok(Span::Part(rows.t().qr().map_err(error)?.0));
+    }
     let decomposition = svd(rows, false).map_err(error)?;
     let rank = decomposition.singular_values.iter().filter(|s| **s > decomposition.band).count();
     Ok(match rank {
@@ -539,6 +564,27 @@ fn span(rows: ArrayView2<'_, f64>) -> Result<Span<ndarray::Array2<f64>>, String>
         r if r == rows.ncols() => Span::Whole,
         r => Span::Part(decomposition.vt.slice(s![..r, ..]).t().to_owned()),
     })
+}
+
+/// Whether every eigenvalue of the exact Gram `G = XᵀX` of a factor `X` exceeds `floor`, from its
+/// computed `gram` (`k × k`), the length `inner` of its inner products and a bound `squares` on
+/// `‖X‖_F²`. The computed Gram is within `e = γ_inner·‖X‖_F²` of `G` in the 2-norm
+/// (`weighted_gram_assembly_band`). A Cholesky factorization of `gram − sI` that completes in
+/// floating point is the exact one of `gram − sI + Δ`, with `|Δ| ≤ γ_{k+1}|L||Lᵀ|` (Higham, ASNA
+/// 2nd ed., Thm 10.3) plus the shift's rounding; the majorant is positive semidefinite, so its trace
+/// bounds its norm, and `‖Δ‖₂ ≤ c = γ_{k+2}/(1 − γ_{k+2})·tr(gram)`. Then `gram ≻ (s − c)I` and
+/// `G ≻ (s − c − e)I`, so completion at `s = floor + c + e` certifies the claim.
+fn resolved_gram(gram: &ndarray::Array2<f64>, inner: usize, squares: f64, floor: f64) -> bool {
+    let k = gram.nrows();
+    let growth = accumulation_growth(k + 2);
+    let factorization = growth / (1.0 - growth) * gram.diag().sum();
+    let shift = floor + factorization + weighted_gram_assembly_band(inner, 1, squares);
+    if !(shift.is_finite() && growth < 1.0) {
+        return false;
+    }
+    let mut shifted = gram.clone();
+    shifted.diag_mut().mapv_inplace(|v| v - shift);
+    shifted.cholesky(Side::Lower).is_ok()
 }
 
 /// The patch directions of `experiments` at `P`'s current values of its read `variables`.
@@ -554,8 +600,35 @@ pub fn design(p: &Model, variables: &[ReadVariable], experiments: &[Experiment])
     design_with(d, p.blocks(), variables, experiments, rows_of)
 }
 
-/// The patch directions of `experiments` over `blocks` blocks, with `rows_of(operator, rows)`
-/// giving those rows of one of `P`'s operators.
+/// The patch directions of a batch of experiments on the host, before upload: each distinct set of
+/// directions once (a variable's, a joint subset's, a block's complement) with its block, kind and
+/// span, and per experiment the sets of its patched blocks in ascending order.
+pub struct HostDesign {
+    sets: Vec<(usize, bool, Span<ndarray::Array2<f64>>)>,
+    plan: Vec<Vec<usize>>,
+}
+
+impl HostDesign {
+    /// The design on device `d`, each set's basis uploaded once.
+    pub fn upload(&self, d: &Device) -> Result<Design, String> {
+        let bases = self
+            .sets
+            .iter()
+            .map(|(block, complement, span)| {
+                let span = match span {
+                    Span::Empty => Span::Empty,
+                    Span::Whole => Span::Whole,
+                    Span::Part(q) => Span::Part(d.upload(q.view()).map_err(error)?),
+                };
+                Ok(Arc::new(Basis { block: *block, complement: *complement, span }))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Design { bases: self.plan.iter().map(|sets| sets.iter().map(|at| Arc::clone(&bases[*at])).collect()).collect() })
+    }
+}
+
+/// The patch directions of `experiments` over `blocks` blocks on device `d`, with
+/// `rows_of(operator, rows)` giving those rows of one of `P`'s operators.
 fn design_with(
     d: &Device,
     blocks: usize,
@@ -563,16 +636,26 @@ fn design_with(
     experiments: &[Experiment],
     rows_of: impl Fn(usize, &Range<usize>) -> Result<ndarray::Array2<f64>, String>,
 ) -> Result<Design, String> {
+    host_design(blocks, variables, experiments, rows_of)?.upload(d)
+}
+
+/// [`design_with`] on the host, before upload.
+fn host_design(
+    blocks: usize,
+    variables: &[ReadVariable],
+    experiments: &[Experiment],
+    rows_of: impl Fn(usize, &Range<usize>) -> Result<ndarray::Array2<f64>, String>,
+) -> Result<HostDesign, String> {
     let rows_of = |v: &ReadVariable| -> Result<ndarray::Array2<f64>, String> {
         let parts = v.parts.iter().map(|(op, rows)| rows_of(*op, rows)).collect::<Result<Vec<_>, String>>()?;
         let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
         ndarray::concatenate(Axis(0), &views).map_err(error)
     };
-    // Each distinct set of directions once (a variable's, a joint subset's, a block's complement),
-    // its rows gathered here, their spans decomposed in parallel, then uploaded.
+    // Each distinct set of directions once, its rows gathered here and their spans decomposed in
+    // parallel.
     let mut sets: BTreeMap<(bool, Vec<usize>), usize> = BTreeMap::new();
-    let mut rows: Vec<(usize, ndarray::Array2<f64>)> = Vec::new();
-    let mut plan: Vec<Vec<(usize, bool)>> = Vec::with_capacity(experiments.len());
+    let mut rows: Vec<(usize, bool, ndarray::Array2<f64>)> = Vec::new();
+    let mut plan: Vec<Vec<usize>> = Vec::with_capacity(experiments.len());
     for e in experiments {
         let mut wanted: Vec<(usize, bool, Vec<usize>)> = Vec::new();
         match &e.patch {
@@ -604,35 +687,20 @@ fn design_with(
                     let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
                     // No rows: an empty span (a complement of a block that reads nothing).
                     let gathered = if views.is_empty() { ndarray::Array2::zeros((0, 0)) } else { ndarray::concatenate(Axis(0), &views).map_err(error)? };
-                    rows.push((block, gathered));
-                    sets.insert(key.clone(), rows.len() - 1);
+                    rows.push((block, key.0, gathered));
+                    sets.insert(key, rows.len() - 1);
                     rows.len() - 1
                 }
             };
-            row.push((at, key.0));
+            row.push(at);
         }
         plan.push(row);
     }
-    let spans: Vec<Span<ndarray::Array2<f64>>> =
-        rows.par_iter().map(|(_, r)| if r.nrows() == 0 { Ok(Span::Empty) } else { span(r.view()) }).collect::<Result<_, String>>()?;
-    let mut uploaded: Vec<Option<Arc<Basis>>> = vec![None; rows.len()];
-    let mut bases = Vec::with_capacity(experiments.len());
-    for row in plan {
-        let mut basis = Vec::with_capacity(row.len());
-        for (at, complement) in row {
-            if uploaded[at].is_none() {
-                let span = match &spans[at] {
-                    Span::Empty => Span::Empty,
-                    Span::Whole => Span::Whole,
-                    Span::Part(q) => Span::Part(d.upload(q.view()).map_err(error)?),
-                };
-                uploaded[at] = Some(Arc::new(Basis { block: rows[at].0, complement, span }));
-            }
-            basis.push(Arc::clone(uploaded[at].as_ref().ok_or_else(|| error("an uploaded basis"))?));
-        }
-        bases.push(basis);
-    }
-    Ok(Design { bases })
+    let spans = rows
+        .into_par_iter()
+        .map(|(block, complement, r)| Ok((block, complement, if r.nrows() == 0 { Span::Empty } else { span(r.view())? })))
+        .collect::<Result<_, String>>()?;
+    Ok(HostDesign { sets: spans, plan })
 }
 
 /// Rows `at..at + s.rows()` of the read `value` patched with the source's `s`: `h + (s − h) Q Qᵀ`
