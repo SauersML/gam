@@ -1,2 +1,23 @@
-{"export_sha256": "1de210e36728dbb52bc53920f40cbc3e3d8a3f70352e9785221d7e36ff632fe1", "context": 512, "held_out": [1024, 1056], "window": 16,
- "readout": {"batch_sequences": 2, "numeric_bytes": 4000000000, "tile_rows": 1024, "contexts": 8, "tokens": 8, "edges": 8, "core": 12}}
+{
+ "export_sha256": "1de210e36728dbb52bc53920f40cbc3e3d8a3f70352e9785221d7e36ff632fe1",
+ "context": 512,
+ "held_out": [
+  1024,
+  1056
+ ],
+ "window": 16,
+ "readout": {
+  "batch_sequences": 2,
+  "numeric_bytes": 4000000000,
+  "tile_rows": 1024,
+  "contexts": 8,
+  "tokens": 8,
+  "edges": 8,
+  "core": 12,
+  "thresholds": [
+   0.01,
+   0.03,
+   0.1
+  ]
+ }
+}

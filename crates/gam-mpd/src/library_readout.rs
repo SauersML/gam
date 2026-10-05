@@ -49,9 +49,10 @@ use crate::{
     artifact_device::mapped_inlined_observed,
     device_program::DeviceProgram,
     library_mdl::sequence_family,
-    operator_program::{Node, OperatorProgram, Rotary, Rule},
+    operator_program::{Node, OperatorProgram, Rotary, Rule, rms_scale},
     resident_causal_fit::fixed_head_target::Head,
     run_check::LayerNodes,
+    tiled_attention::{probabilities, rotate},
 };
 use gam_gpu::tensor::{Arithmetic, Device, Op, Storage, Tensor};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
@@ -90,6 +91,9 @@ pub struct Settings {
     /// The functions of largest RelP importance (background functions apart) whose complete
     /// wiring among themselves is reported.
     pub core: usize,
+    /// The fractions `τ` of `|m(t)|` above which a function's `|A_i(t)|` counts it as causally
+    /// important at token `t`.
+    pub thresholds: Vec<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -181,13 +185,27 @@ pub struct Readout {
     /// core function `j` to core function `i` (zero when `j` does not precede `i`'s read).
     pub core: Vec<usize>,
     pub wiring: Vec<Vec<f64>>,
-    /// Per held-out token, the model's predicted token; the mean centred logit `m` of it, the
-    /// mean sum of the functions' attributions, and the mean participation number
-    /// `(Σ_i |A_i|)² / Σ_i A_i²` (the effective number of functions the prediction rests on).
+    /// Per held-out token, the model's predicted token, and the mean centred logit `m` of it.
     pub predicted: Vec<u32>,
     pub mean_logit: f64,
-    pub mean_attributed: f64,
+    /// Per cut of the reverse pass (one layer's heads, one MLP), its causally important functions
+    /// per token.
+    pub cuts: Vec<CutSummary>,
+    /// Summed over cuts: per threshold `τ`, the mean number of functions per token with
+    /// `|A_i(t)| > τ |m(t)|`, and the mean participation number.
+    pub important: Vec<[f64; 2]>,
     pub participation: f64,
+}
+
+/// One cut's mean per token of its participation number `(Σ_i |A_i(t)|)² / Σ_i A_i(t)²` (the
+/// effective number of its functions the prediction rests on) and, per threshold, of its number of
+/// functions with `|A_i(t)| > τ |m(t)|`. Within a cut, the functions and the residual stream
+/// entering it account for `m` (RelP's completeness), so counts are comparable across cuts.
+#[derive(Clone, Debug, Serialize)]
+pub struct CutSummary {
+    pub name: String,
+    pub participation: f64,
+    pub counts: Vec<f64>,
 }
 
 // ------------------------------------------------------------------------------ the explanation
@@ -360,36 +378,6 @@ fn offset_bin(offset: usize) -> usize {
     (usize::BITS - offset.leading_zeros()) as usize
 }
 
-/// Per row `t` of one sequence, the softmax of `scale q_t·k_s` over `s ≤ t` (all `s` when not
-/// causal).
-fn attention_rows(query: &Array2<f64>, key: &Array2<f64>, scale: f64, causal: bool) -> Array2<f64> {
-    let mut weights = query.dot(&key.t());
-    for (t, mut row) in weights.outer_iter_mut().enumerate() {
-        let visible = if causal { t + 1 } else { row.len() };
-        let max = row.iter().take(visible).fold(f64::NEG_INFINITY, |m, v| m.max(*v * scale));
-        let mut total = 0.0;
-        for (s, w) in row.iter_mut().enumerate() {
-            *w = if s < visible { (*w * scale - max).exp() } else { 0.0 };
-            total += *w;
-        }
-        row.mapv_inplace(|w| w / total);
-    }
-    weights
-}
-
-/// Rows at positions `0, 1, …` rotated to their position.
-fn rotated(values: Array2<f64>, rotary: Option<Rotary>) -> Array2<f64> {
-    let mut out = values.as_standard_layout().to_owned();
-    if let Some(rotary) = rotary {
-        for (t, mut row) in out.outer_iter_mut().enumerate() {
-            if let Some(slice) = row.as_slice_mut() {
-                rotary.rotate(slice, None, t as u32);
-            }
-        }
-    }
-    out
-}
-
 // ------------------------------------------------------------------------------ products
 
 /// Per row of `rows`, the `k` columns of `sign · rows · tableᵀ` largest, descending, found on
@@ -443,48 +431,362 @@ fn dot(a: ArrayView1<f64>, b: ArrayView1<f64>) -> f64 {
     a.dot(&b)
 }
 
+// ------------------------------------------------------------------------------ the library
+
+/// A library explanation prepared for forward passes and RelP attribution: its blocks, the native
+/// reads and readout they act through, and its program compiled with every read, activation and
+/// attention input observed.
+pub struct Library<'a> {
+    model: &'a Device,
+    wide: &'a Device,
+    tile_rows: usize,
+    /// Reads in depth order: site `2l` is layer `l`'s attention read, `2l + 1` its MLP read.
+    sites: Vec<Site>,
+    final_site: Site,
+    mlps: Vec<MlpBlock>,
+    heads: Vec<HeadBlock>,
+    /// Per layer, its heads (indices into `heads`).
+    layer_heads: Vec<Vec<usize>>,
+    /// The unembedding with the final norm's gain (vocabulary × width), its mean row, and its
+    /// copy on `wide`.
+    unembedding: Array2<f64>,
+    unembedding_mean: Array1<f64>,
+    unembedding_table: Tensor,
+    program: DeviceProgram,
+    observed: Vec<usize>,
+    mlp_paths: Vec<usize>,
+    head_paths: usize,
+}
+
+/// One forward pass's observed values on sequences of one length.
+struct Pass {
+    rows: usize,
+    /// Per site, `1/r` per row; the final stream and its `1/r`.
+    inverse: Vec<Array1<f64>>,
+    last: Array2<f64>,
+    inverse_final: Array1<f64>,
+    /// Per MLP: its activations, gate pre-activations and, when gated, up values.
+    mlp: Vec<(Array2<f64>, Array2<f64>, Option<Array2<f64>>)>,
+    /// Per head: its query, key and read; per head and sequence, its attention weights.
+    head: Vec<[Array2<f64>; 3]>,
+    weights: Vec<Vec<Array2<f64>>>,
+}
+
+/// A cut of the reverse pass: one MLP's functions (an index into the MLPs) or one layer's heads
+/// (indices into the heads).
+enum Cut<'c> {
+    Mlp(usize),
+    Heads(usize, &'c [usize]),
+}
+
+/// A prompt to attribute: its tokens, an optional baseline of the same length (attributions are
+/// then of the difference of each function's value from its value on the baseline), and the
+/// metric.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Prompt {
+    pub tokens: Vec<u32>,
+    #[serde(default)]
+    pub baseline: Option<Vec<u32>>,
+    pub metric: Metric,
+}
+
+/// What is attributed: at every position the centred logit of the model's predicted token, or at
+/// one position the logit of `target` minus the logit of `foil`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Metric {
+    Predicted,
+    Difference { position: usize, target: u32, foil: u32 },
+}
+
+/// A prompt's attributions: per position the metric `m` (zero where it is not taken) and the
+/// predicted token, and `A_i(t)` per position and function (columns in [`Library::functions`]'s
+/// order).
+#[derive(Clone, Debug)]
+pub struct PromptAttribution {
+    pub metric: Vec<f64>,
+    pub predicted: Vec<u32>,
+    pub attributions: Array2<f64>,
+}
+
+/// A function's identity: its name, layer and kind.
+#[derive(Clone, Debug, Serialize)]
+pub struct FunctionId {
+    pub name: String,
+    pub layer: usize,
+    pub kind: Kind,
+}
+
+impl<'a> Library<'a> {
+    /// `artifact`, a library explanation of the split native program `native`
+    /// (`run_check::split_sites`) with its `layers`, compiled on `model` within `numeric_bytes` of
+    /// operator buffers; vocabulary-wide products run on `wide` in tiles of `tile_rows` rows.
+    pub fn new(model: &'a Device, wide: &'a Device, native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact, numeric_bytes: usize, tile_rows: usize) -> Result<Self, String> {
+        if numeric_bytes == 0 || tile_rows == 0 {
+            return Err("positive operator buffers and tile rows required".into());
+        }
+        let program = &artifact.program;
+        let sites: Vec<Site> = layers.iter().flat_map(|l| [site(native, l.normed_stream), site(native, l.normed)]).collect::<Result<_, _>>()?;
+        let outputs: Vec<Vec<Array2<f64>>> = layers.iter().map(|l| output_columns(native, l)).collect::<Result<_, _>>()?;
+        let (mut mlps, mut heads) = (Vec::new(), Vec::new());
+        // The library's blocks by their bindings' names (a decoded artifact's rules are unnamed).
+        for binding in &artifact.blocks {
+            let Some((l, head)) = parse(&binding.name) else { continue };
+            let n = binding.write;
+            let Node::Call { rule, .. } = &program.nodes[n] else { return Err(format!("{}: its write is not a call", binding.name)) };
+            let rule = &program.rules[*rule];
+            match head {
+                None => mlps.push(mlp_block(program, rule, l, n)?),
+                Some(h) => {
+                    let columns = outputs.get(l).and_then(|o| o.get(h)).ok_or_else(|| format!("{}: no such native head", binding.name))?;
+                    heads.push(head_block(program, rule, l, h, n, columns.clone())?);
+                }
+            }
+        }
+        mlps.sort_by_key(|b| b.layer);
+        heads.sort_by_key(|b| (b.layer, b.head));
+        if mlps.is_empty() && heads.is_empty() {
+            return Err("the artifact holds no library functions".into());
+        }
+        let layer_heads = (0..layers.len()).map(|l| (0..heads.len()).filter(|h| heads[*h].layer == l).collect()).collect();
+        let Head { hidden, embedding: mut unembedding, .. } = Head::of(native)?;
+        let final_site = site(native, hidden)?;
+        unembedding.axis_iter_mut(Axis(0)).for_each(|mut row| row *= &final_site.gain);
+        let unembedding_mean = unembedding.mean_axis(Axis(0)).ok_or("an empty vocabulary")?;
+        let unembedding_table = wide.upload(unembedding.view()).map_err(error)?;
+        // Observed values: each site's stream and the final one, each MLP's activations, gate
+        // pre-activations and up values, each head's query, key and read.
+        let place = |n: usize| artifact.place(n).ok_or_else(|| format!("the artifact does not hold native node {n}"));
+        let mut paths: Vec<Vec<usize>> = sites.iter().map(|s| Ok(vec![place(s.input)?])).collect::<Result<_, String>>()?;
+        paths.push(vec![place(final_site.input)?]);
+        let mut mlp_paths = Vec::new();
+        for b in &mlps {
+            mlp_paths.push(paths.len());
+            paths.extend([vec![b.call, b.activation], vec![b.call, b.gate_pre]]);
+            if let Some((up, _)) = &b.up {
+                paths.push(vec![b.call, *up]);
+            }
+        }
+        let head_paths = paths.len();
+        for b in &heads {
+            paths.extend([vec![b.call, b.query], vec![b.call, b.key], vec![b.call]]);
+        }
+        let (flat, _, observed) = mapped_inlined_observed(program, &paths)?;
+        let prefix = Head::of(&flat)?.prefix(&flat);
+        drop(flat);
+        let mut compiled = DeviceProgram::compile_values_bounded(model, &prefix, numeric_bytes)?;
+        drop(prefix);
+        compiled.set_arithmetic(arithmetic(model));
+        Ok(Self {
+            model,
+            wide,
+            tile_rows,
+            sites,
+            final_site,
+            mlps,
+            heads,
+            layer_heads,
+            unembedding,
+            unembedding_mean,
+            unembedding_table,
+            program: compiled,
+            observed,
+            mlp_paths,
+            head_paths,
+        })
+    }
+
+    /// Every function in the order of attribution columns: per layer its heads, then its MLP
+    /// functions.
+    #[must_use]
+    pub fn functions(&self) -> Vec<FunctionId> {
+        let mut out = Vec::new();
+        for (l, members) in self.layer_heads.iter().enumerate() {
+            out.extend(members.iter().map(|h| FunctionId { name: format!("L{l}.H{}", self.heads[*h].head), layer: l, kind: Kind::Head }));
+            for block in self.mlps.iter().filter(|b| b.layer == l) {
+                out.extend((0..block.gate.nrows()).map(|i| FunctionId { name: format!("L{l}.M{i}"), layer: l, kind: Kind::Mlp }));
+            }
+        }
+        out
+    }
+
+    /// Per head and sequence of `count` sequences of `length`, the attention weights from the
+    /// observed queries and keys.
+    fn attend(&self, values: &[[Array2<f64>; 3]], count: usize, length: usize) -> Vec<Vec<Array2<f64>>> {
+        let positions: Vec<u32> = (0..length as u32).collect();
+        self.heads
+            .par_iter()
+            .zip(values.par_iter())
+            .map(|(block, [q, key, _])| {
+                (0..count)
+                    .map(|s| {
+                        let span = s * length..(s + 1) * length;
+                        let (q, k) = (q.slice(s![span.clone(), ..]).to_owned(), key.slice(s![span, ..]).to_owned());
+                        let (q, k) = (rotate(&q, block.rotary, &positions, false), rotate(&k, block.rotary, &positions, false));
+                        probabilities(q.view(), k.view(), &positions, 0, block.scale, block.causal)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The forward pass on `batch` (sequences of one length).
+    fn pass(&self, batch: &[&[u32]]) -> Result<Pass, String> {
+        let family = sequence_family(batch)?;
+        let trace = self.program.forward(&family)?;
+        let get = |i: usize| -> Result<Array2<f64>, String> { self.model.download(trace.value(self.observed[i])?).map_err(error) };
+        let inverse_of = |x: &Array2<f64>, epsilon: f64| x.map_axis(Axis(1), |row| rms_scale(row, epsilon));
+        let inverse = self.sites.iter().enumerate().map(|(i, s)| Ok(inverse_of(&get(i)?, s.epsilon))).collect::<Result<_, String>>()?;
+        let last = get(self.sites.len())?;
+        let inverse_final = inverse_of(&last, self.final_site.epsilon);
+        let mlp = self
+            .mlps
+            .iter()
+            .enumerate()
+            .map(|(b, block)| {
+                let i = self.mlp_paths[b];
+                Ok((get(i)?, get(i + 1)?, if block.up.is_some() { Some(get(i + 2)?) } else { None }))
+            })
+            .collect::<Result<_, String>>()?;
+        let p = self.head_paths;
+        let head: Vec<[Array2<f64>; 3]> = (0..self.heads.len()).map(|h| Ok([get(p + 3 * h)?, get(p + 3 * h + 1)?, get(p + 3 * h + 2)?])).collect::<Result<_, String>>()?;
+        let weights = self.attend(&head, batch.len(), batch[0].len());
+        Ok(Pass { rows: family.rows, inverse, last, inverse_final, mlp, head, weights })
+    }
+
+    /// The model's predicted token per row and the gradient of its centred logit in the final
+    /// stream (the final norm's denominator frozen), with the centred logit itself.
+    fn predicted(&self, pass: &Pass) -> Result<(Vec<usize>, Array2<f64>, Vec<f64>), String> {
+        let predicted: Vec<usize> = extreme_columns(self.wide, &self.unembedding_table, &pass.last, 1, 1.0, self.tile_rows)?.into_iter().map(|c| c[0]).collect();
+        let seed = Array2::from_shape_fn(pass.last.dim(), |(r, c)| (self.unembedding[[predicted[r], c]] - self.unembedding_mean[c]) * pass.inverse_final[r]);
+        let metric = (0..pass.rows).map(|r| seed.row(r).dot(&pass.last.row(r))).collect();
+        Ok((predicted, seed, metric))
+    }
+
+    /// RelP (module note): the reverse pass from `seed`, the metric's gradient in the final stream,
+    /// with every norm's denominator, every law's gate factor `φ(x)/x` and every attention pattern
+    /// frozen and half of the gradient through each factor of a product; each cut's attributions
+    /// (rows × its functions) go to `visit`, deepest first. With `baseline`, a function's value is
+    /// taken less its value on the baseline.
+    fn relp(&self, pass: &Pass, seed: Array2<f64>, baseline: Option<&Pass>, visit: &mut dyn FnMut(Cut<'_>, Array2<f64>)) {
+        let length = pass.rows / pass.weights.first().map_or(1, |w| w.len().max(1));
+        let mut g = seed;
+        for l in (0..self.layer_heads.len()).rev() {
+            for (b, block) in self.mlps.iter().enumerate().filter(|(_, b)| b.layer == l) {
+                let (activations, pre, up) = &pass.mlp[b];
+                let d = g.dot(&block.out);
+                let value = match baseline {
+                    Some(base) => activations - &base.mlp[b].0,
+                    None => activations.clone(),
+                };
+                visit(Cut::Mlp(b), value * &d);
+                let through = |factor: &Array2<f64>, share: f64| {
+                    let mut out = &d * activations;
+                    ndarray::Zip::from(&mut out).and(factor).for_each(|o, f| *o = if *f == 0.0 { 0.0 } else { share * *o / f });
+                    out
+                };
+                let read = match (up, &block.up) {
+                    (Some(up_values), Some((_, up_map))) => through(pre, 0.5).dot(&block.gate) + through(up_values, 0.5).dot(up_map),
+                    _ => through(pre, 1.0).dot(&block.gate),
+                };
+                let (gain, inv) = (&self.sites[2 * l + 1].gain, &pass.inverse[2 * l + 1]);
+                g = g + read * &gain.view().insert_axis(Axis(0)) * &inv.view().insert_axis(Axis(1));
+            }
+            let members = &self.layer_heads[l];
+            if members.is_empty() {
+                continue;
+            }
+            let mut attribution = Array2::<f64>::zeros((pass.rows, members.len()));
+            let mut delta = Array2::<f64>::zeros(g.dim());
+            for (c, &h) in members.iter().enumerate() {
+                let block = &self.heads[h];
+                let z = &pass.head[h][2];
+                let gz = g.dot(&block.output);
+                let value = match baseline {
+                    Some(base) => z - &base.head[h][2],
+                    None => z.clone(),
+                };
+                attribution.column_mut(c).assign(&(value * &gz).sum_axis(Axis(1)));
+                let mut gv = Array2::<f64>::zeros(gz.dim());
+                for (s, weights) in pass.weights[h].iter().enumerate() {
+                    let span = s * length..(s + 1) * length;
+                    gv.slice_mut(s![span.clone(), ..]).assign(&weights.t().dot(&gz.slice(s![span, ..])));
+                }
+                delta = delta + gv.dot(&block.value);
+            }
+            visit(Cut::Heads(l, members), attribution);
+            let (gain, inv) = (&self.sites[2 * l].gain, &pass.inverse[2 * l]);
+            g = g + delta * &gain.view().insert_axis(Axis(0)) * &inv.view().insert_axis(Axis(1));
+        }
+    }
+
+    /// The first column of each cut's functions in [`Library::functions`]'s order.
+    fn columns(&self) -> (Vec<usize>, Vec<usize>) {
+        let (mut heads, mut mlps) = (vec![0; self.layer_heads.len()], vec![0; self.mlps.len()]);
+        let mut next = 0;
+        for (l, members) in self.layer_heads.iter().enumerate() {
+            heads[l] = next;
+            next += members.len();
+            for (b, block) in self.mlps.iter().enumerate().filter(|(_, b)| b.layer == l) {
+                mlps[b] = next;
+                next += block.gate.nrows();
+            }
+        }
+        (heads, mlps)
+    }
+
+    /// RelP attributions of `prompt`'s metric to every function at every position.
+    pub fn attributions(&self, prompt: &Prompt) -> Result<PromptAttribution, String> {
+        let rows = prompt.tokens.len();
+        if rows == 0 || prompt.baseline.as_ref().is_some_and(|b| b.len() != rows) {
+            return Err("a prompt must be nonempty and its baseline of the same length".into());
+        }
+        let pass = self.pass(&[&prompt.tokens])?;
+        let baseline = prompt.baseline.as_ref().map(|b| self.pass(&[b])).transpose()?;
+        let (predicted, seed, metric) = match &prompt.metric {
+            Metric::Predicted => self.predicted(&pass)?,
+            Metric::Difference { position, target, foil } => {
+                let (t, f, p) = (*target as usize, *foil as usize, *position);
+                if p >= rows || t >= self.unembedding.nrows() || f >= self.unembedding.nrows() {
+                    return Err("a difference metric outside the prompt or the vocabulary".into());
+                }
+                let mut seed = Array2::<f64>::zeros(pass.last.dim());
+                let row = (&self.unembedding.row(t) - &self.unembedding.row(f)) * pass.inverse_final[p];
+                let mut metric = vec![0.0; rows];
+                metric[p] = row.dot(&pass.last.row(p));
+                seed.row_mut(p).assign(&row);
+                (self.predicted(&pass)?.0, seed, metric)
+            }
+        };
+        let (head_columns, mlp_columns) = self.columns();
+        let mut attributions = Array2::<f64>::zeros((rows, self.functions().len()));
+        self.relp(&pass, seed, baseline.as_ref(), &mut |cut, values| {
+            let start = match cut {
+                Cut::Mlp(b) => mlp_columns[b],
+                Cut::Heads(l, _) => head_columns[l],
+            };
+            attributions.slice_mut(s![.., start..start + values.ncols()]).assign(&values);
+        });
+        Ok(PromptAttribution { metric, predicted: predicted.into_iter().map(|t| t as u32).collect(), attributions })
+    }
+}
+
 // ------------------------------------------------------------------------------ the read-out
 
 /// The read-out (module note) of `artifact`, a library explanation of the split native program
 /// `native` (`run_check::split_sites`) with its `layers`, on the held-out `sequences` (of equal
 /// length). The model runs on `model`; vocabulary-wide searches and wiring products on `wide`.
 pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact, sequences: &[Vec<u32>], settings: &Settings) -> Result<Readout, String> {
-    if settings.batch_sequences == 0 || settings.tile_rows == 0 || settings.numeric_bytes == 0 || sequences.is_empty() {
+    if settings.batch_sequences == 0 || sequences.is_empty() || settings.thresholds.iter().any(|t| !(t.is_finite() && *t > 0.0)) {
         return Err("invalid read-out settings or no held-out sequences".into());
     }
     let length = sequences[0].len();
     if length == 0 || sequences.iter().any(|s| s.len() != length) {
         return Err("held-out sequences must be nonempty and of equal length".into());
     }
-    let program = &artifact.program;
-    // Reads in depth order: site 2l is layer l's attention read, 2l + 1 its MLP read.
-    let sites: Vec<Site> = layers.iter().flat_map(|l| [site(native, l.normed_stream), site(native, l.normed)]).collect::<Result<_, _>>()?;
-    let outputs: Vec<Vec<Array2<f64>>> = layers.iter().map(|l| output_columns(native, l)).collect::<Result<_, _>>()?;
-    let (mut mlps, mut heads) = (Vec::new(), Vec::new());
-    // The library's blocks by their bindings' names (a decoded artifact's rules are unnamed).
-    for binding in &artifact.blocks {
-        let Some((l, head)) = parse(&binding.name) else { continue };
-        let n = binding.write;
-        let Node::Call { rule, .. } = &program.nodes[n] else { return Err(format!("{}: its write is not a call", binding.name)) };
-        let rule = &program.rules[*rule];
-        match head {
-            None => mlps.push(mlp_block(program, rule, l, n)?),
-            Some(h) => {
-                let columns = outputs.get(l).and_then(|o| o.get(h)).ok_or_else(|| format!("{}: no such native head", binding.name))?;
-                heads.push(head_block(program, rule, l, h, n, columns.clone())?);
-            }
-        }
-    }
-    mlps.sort_by_key(|b| b.layer);
-    heads.sort_by_key(|b| (b.layer, b.head));
-    if mlps.is_empty() && heads.is_empty() {
-        return Err("the artifact holds no library functions".into());
-    }
-    // The final norm's gain with the unembedding, and the input embedding (vocabulary × width).
-    let Head { hidden, embedding: mut unembedding, .. } = Head::of(native)?;
-    let final_gain = site(native, hidden)?.gain;
-    unembedding.axis_iter_mut(Axis(0)).for_each(|mut row| row *= &final_gain);
-    let unembedding_mean = unembedding.mean_axis(Axis(0)).ok_or("an empty vocabulary")?;
+    let library = Library::new(model, wide, native, layers, artifact, settings.numeric_bytes, settings.tile_rows)?;
+    let Library { sites, mlps, heads, unembedding, unembedding_mean, unembedding_table, .. } = &library;
     let feature = native.nodes.iter().position(|n| matches!(n, Node::Feature { .. })).ok_or("no token feature")?;
     let embedding = native
         .nodes
@@ -509,31 +811,6 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
         embedding_tables.insert(epsilon.to_bits(), (table, resident));
     }
 
-    // Observed values: each site's stream, each MLP's activations and gate pre-activations, each
-    // head's query, key and read.
-    let place = |n: usize| artifact.place(n).ok_or_else(|| format!("the artifact does not hold native node {n}"));
-    let final_site = site(native, hidden)?;
-    let mut paths: Vec<Vec<usize>> = sites.iter().map(|s| Ok(vec![place(s.input)?])).collect::<Result<_, String>>()?;
-    paths.push(vec![place(final_site.input)?]);
-    let mut mlp_paths = Vec::new();
-    for b in &mlps {
-        mlp_paths.push(paths.len());
-        paths.extend([vec![b.call, b.activation], vec![b.call, b.gate_pre]]);
-        if let Some((up, _)) = &b.up {
-            paths.push(vec![b.call, *up]);
-        }
-    }
-    let head_paths = paths.len();
-    for b in &heads {
-        paths.extend([vec![b.call, b.query], vec![b.call, b.key], vec![b.call]]);
-    }
-    let (flat, _, observed) = mapped_inlined_observed(program, &paths)?;
-    let prefix = Head::of(&flat)?.prefix(&flat);
-    drop(flat);
-    let mut device_program = DeviceProgram::compile_values_bounded(model, &prefix, settings.numeric_bytes)?;
-    drop(prefix);
-    device_program.set_arithmetic(arithmetic(model));
-
     let k = settings.contexts;
     let mlp_first = |l: usize| 2 * l + 2;
     let head_first = |l: usize| 2 * l + 1;
@@ -556,52 +833,20 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
         })
         .collect();
     let grams: Vec<Array2<f64>> = heads.iter().map(|b| b.output.t().dot(&b.output)).collect();
-    let unembedding_table = wide.upload(unembedding.view()).map_err(error)?;
-    let inverse_rms = |x: &Array2<f64>, epsilon: f64| x.map_axis(Axis(1), |x| 1.0 / (x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64 + epsilon).sqrt());
-    // Per head and sequence of a batch, the attention weights.
-    let attend = |values: &[[Array2<f64>; 3]], count: usize| -> Vec<Vec<Array2<f64>>> {
-        heads
-            .par_iter()
-            .zip(values.par_iter())
-            .map(|(block, [q, key, _])| {
-                (0..count)
-                    .map(|s| {
-                        let span = s * length..(s + 1) * length;
-                        let query = rotated(q.slice(s![span.clone(), ..]).to_owned(), block.rotary);
-                        let keys = rotated(key.slice(s![span, ..]).to_owned(), block.rotary);
-                        attention_rows(&query, &keys, block.scale, block.causal)
-                    })
-                    .collect()
-            })
-            .collect()
-    };
     let mut predicted_all: Vec<u32> = Vec::with_capacity(sequences.len() * length);
-    let (mut logit_sum, mut attributed_sum, mut participation_sum) = (0.0, 0.0, 0.0);
+    let mut logit_sum = 0.0;
+    // Per cut, the summed participation number and, per threshold, the summed count of functions
+    // with |A_i(t)| > τ |m(t)|.
+    let cuts = 2 * layers.len();
+    let mut cut_participation = vec![0.0; cuts];
+    let mut cut_counts = vec![vec![0.0; settings.thresholds.len()]; cuts];
     for (chunk, batch) in sequences.chunks(settings.batch_sequences).enumerate() {
         let first_row = chunk * settings.batch_sequences * length;
-        let family = sequence_family(&batch.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
-        let trace = device_program.forward(&family)?;
-        let get = |i: usize| -> Result<Array2<f64>, String> { model.download(trace.value(observed[i])?).map_err(error) };
-        let rows = family.rows;
-        let inverse: Vec<Array1<f64>> = sites.iter().enumerate().map(|(i, s)| Ok(inverse_rms(&get(i)?, s.epsilon))).collect::<Result<_, String>>()?;
-        let last = get(sites.len())?;
-        let inverse_final = inverse_rms(&last, final_site.epsilon);
-        let predicted: Vec<usize> = extreme_columns(wide, &unembedding_table, &last, 1, 1.0, settings.tile_rows)?.into_iter().map(|c| c[0]).collect();
-        // The gradient of the predicted token's centred logit in the final stream, the final
-        // norm's denominator frozen.
-        let mut g = Array2::from_shape_fn((rows, width), |(r, c)| (unembedding[[predicted[r], c]] - unembedding_mean[c]) * inverse_final[r]);
-        let logits: f64 = (0..rows).map(|r| g.row(r).dot(&last.row(r))).sum();
-        let mlp_values: Vec<(Array2<f64>, Array2<f64>, Option<Array2<f64>>)> = mlps
-            .iter()
-            .enumerate()
-            .map(|(b, block)| {
-                let i = mlp_paths[b];
-                Ok((get(i)?, get(i + 1)?, if block.up.is_some() { Some(get(i + 2)?) } else { None }))
-            })
-            .collect::<Result<_, String>>()?;
+        let pass = library.pass(&batch.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+        let rows = pass.rows;
         for (b, block) in mlps.iter().enumerate() {
-            let (activations, pre, _) = &mlp_values[b];
-            let visible = &inverse[mlp_first(block.layer).min(sites.len())..];
+            let (activations, pre, _) = &pass.mlp[b];
+            let visible = &pass.inverse[mlp_first(block.layer).min(sites.len())..];
             mlp_stats[b].par_iter_mut().enumerate().for_each(|(i, stat)| {
                 for r in 0..rows {
                     let a = activations[[r, i]];
@@ -617,10 +862,7 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
                 }
             });
         }
-        let values: Vec<[Array2<f64>; 3]> =
-            (0..heads.len()).map(|h| Ok([get(head_paths + 3 * h)?, get(head_paths + 3 * h + 1)?, get(head_paths + 3 * h + 2)?])).collect::<Result<_, String>>()?;
-        let weights = attend(&values, batch.len());
-        head_stats.par_iter_mut().zip(heads.par_iter()).zip(values.par_iter()).zip(grams.par_iter()).zip(weights.par_iter()).for_each(
+        head_stats.par_iter_mut().zip(heads.par_iter()).zip(pass.head.par_iter()).zip(grams.par_iter()).zip(pass.weights.par_iter()).for_each(
             |((((stat, block), [_, _, z]), gram), weights)| {
                 for (sequence, weights) in batch.iter().zip(weights) {
                     for (t, row) in weights.outer_iter().enumerate() {
@@ -645,62 +887,37 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
                     stat.output += norm;
                     stat.top.offer(k, norm, first_row + r);
                 }
-                for (second, inv) in stat.second.iter_mut().zip(&inverse[head_first(block.layer).min(sites.len())..]) {
+                for (second, inv) in stat.second.iter_mut().zip(&pass.inverse[head_first(block.layer).min(sites.len())..]) {
                     let scaled = z * &inv.view().insert_axis(Axis(1));
                     *second += &scaled.t().dot(&scaled);
                 }
             },
         );
-        // RelP: the reverse pass of the network with every norm's denominator, every law's gate
-        // factor `φ(x)/x` and every attention pattern frozen, and half of the gradient through
-        // each factor of a product (module note).
-        let (mut absolute, mut square, mut signed) = (Array1::<f64>::zeros(rows), Array1::<f64>::zeros(rows), Array1::<f64>::zeros(rows));
-        let mut tally = |attribution: ArrayView1<f64>, r: usize| {
-            absolute[r] += attribution[r].abs();
-            square[r] += attribution[r] * attribution[r];
-            signed[r] += attribution[r];
-        };
-        for l in (0..layers.len()).rev() {
-            for (b, block) in mlps.iter().enumerate().filter(|(_, b)| b.layer == l) {
-                let (activations, pre, up) = &mlp_values[b];
-                let d = g.dot(&block.out);
-                let attribution = activations * &d;
-                mlp_stats[b].par_iter_mut().enumerate().for_each(|(i, stat)| stat.relp.add(k, attribution.column(i), first_row));
-                for column in attribution.columns() {
-                    (0..rows).for_each(|r| tally(column, r));
+        let (predicted, seed, metric) = library.predicted(&pass)?;
+        library.relp(&pass, seed, None, &mut |cut, attribution| {
+            let index = match cut {
+                Cut::Mlp(b) => {
+                    mlp_stats[b].par_iter_mut().enumerate().for_each(|(i, stat)| stat.relp.add(k, attribution.column(i), first_row));
+                    2 * mlps[b].layer + 1
                 }
-                let through = |factor: &Array2<f64>, share: f64| {
-                    let mut out = &d * activations;
-                    ndarray::Zip::from(&mut out).and(factor).for_each(|o, f| *o = if *f == 0.0 { 0.0 } else { share * *o / f });
-                    out
-                };
-                let read = match (up, &block.up) {
-                    (Some(up_values), Some((_, up_map))) => through(pre, 0.5).dot(&block.gate) + through(up_values, 0.5).dot(up_map),
-                    _ => through(pre, 1.0).dot(&block.gate),
-                };
-                let (gain, inv) = (&sites[2 * l + 1].gain, &inverse[2 * l + 1]);
-                g = g + read * &gain.view().insert_axis(Axis(0)) * &inv.view().insert_axis(Axis(1));
-            }
-            let mut delta = Array2::<f64>::zeros((rows, width));
-            for (h, block) in heads.iter().enumerate().filter(|(_, b)| b.layer == l) {
-                let z = &values[h][2];
-                let gz = g.dot(&block.output);
-                let attribution = (z * &gz).sum_axis(Axis(1));
-                head_stats[h].relp.add(k, attribution.view(), first_row);
-                (0..rows).for_each(|r| tally(attribution.view(), r));
-                let mut gv = Array2::<f64>::zeros(gz.dim());
-                for (s, weights) in weights[h].iter().enumerate() {
-                    let span = s * length..(s + 1) * length;
-                    gv.slice_mut(s![span.clone(), ..]).assign(&weights.t().dot(&gz.slice(s![span, ..])));
+                Cut::Heads(l, members) => {
+                    for (c, h) in members.iter().enumerate() {
+                        head_stats[*h].relp.add(k, attribution.column(c), first_row);
+                    }
+                    2 * l
                 }
-                delta = delta + gv.dot(&block.value);
+            };
+            for (r, row) in attribution.outer_iter().enumerate() {
+                let (absolute, square) = row.iter().fold((0.0, 0.0), |(a, q), v| (a + v.abs(), q + v * v));
+                if square > 0.0 {
+                    cut_participation[index] += absolute * absolute / square;
+                }
+                for (count, tau) in cut_counts[index].iter_mut().zip(&settings.thresholds) {
+                    *count += row.iter().filter(|v| v.abs() > tau * metric[r].abs()).count() as f64;
+                }
             }
-            let (gain, inv) = (&sites[2 * l].gain, &inverse[2 * l]);
-            g = g + delta * &gain.view().insert_axis(Axis(0)) * &inv.view().insert_axis(Axis(1));
-        }
-        logit_sum += logits;
-        attributed_sum += signed.sum();
-        participation_sum += absolute.iter().zip(&square).map(|(a, q)| if *q > 0.0 { a * a / q } else { 0.0 }).sum::<f64>();
+        });
+        logit_sum += metric.iter().sum::<f64>();
         predicted_all.extend(predicted.iter().map(|t| *t as u32));
     }
     // Head diagnostics on sequences of random held-out tokens repeated once.
@@ -719,15 +936,8 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
             })
             .collect();
         for batch in repeated.chunks(settings.batch_sequences) {
-            let family = sequence_family(&batch.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
-            let trace = device_program.forward(&family)?;
-            let values: Vec<[Array2<f64>; 3]> = (0..heads.len())
-                .map(|h| {
-                    let get = |i: usize| -> Result<Array2<f64>, String> { model.download(trace.value(observed[i])?).map_err(error) };
-                    Ok([get(head_paths + 3 * h)?, get(head_paths + 3 * h + 1)?, Array2::zeros((0, 0))])
-                })
-                .collect::<Result<_, String>>()?;
-            for (stat, weights) in head_stats.iter_mut().zip(attend(&values, batch.len())) {
+            let pass = library.pass(&batch.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+            for (stat, weights) in head_stats.iter_mut().zip(&pass.weights) {
                 for weights in weights {
                     for t in half + 1..2 * half {
                         stat.induction += weights[[t, t + 1 - half]];
@@ -876,7 +1086,7 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
             out
         };
         let best = extreme_columns(wide, &resident, &sources, 1, 1.0, settings.tile_rows)?;
-        let centre = output.dot(&unembedding_mean);
+        let centre = output.dot(unembedding_mean);
         let mut entries: Vec<Entry> = best
             .par_iter()
             .enumerate()
@@ -975,8 +1185,15 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
         wiring,
         predicted: predicted_all,
         mean_logit: logit_sum / total,
-        mean_attributed: attributed_sum / total,
-        participation: participation_sum / total,
+        important: settings.thresholds.iter().enumerate().map(|(j, tau)| [*tau, cut_counts.iter().map(|c| c[j]).sum::<f64>() / total]).collect(),
+        participation: cut_participation.iter().sum::<f64>() / total,
+        cuts: (0..cuts)
+            .map(|c| CutSummary {
+                name: format!("L{}.{}", c / 2, if c % 2 == 0 { "heads" } else { "mlp" }),
+                participation: cut_participation[c] / total,
+                counts: cut_counts[c].iter().map(|n| n / total).collect(),
+            })
+            .collect(),
     })
 }
 

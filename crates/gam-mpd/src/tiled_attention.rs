@@ -43,7 +43,7 @@ pub(crate) fn rotate<'a>(x: &'a Array2<f64>, rotary: Option<Rotary>, positions: 
 }
 
 /// One tile's attention weights against keys `k` (`softmax(scale q kᵀ)`, causal by position).
-fn probabilities(q: ArrayView2<'_, f64>, k: ArrayView2<'_, f64>, positions: &[u32], start: usize, scale: f64, causal: bool) -> Array2<f64> {
+pub(crate) fn probabilities(q: ArrayView2<'_, f64>, k: ArrayView2<'_, f64>, positions: &[u32], start: usize, scale: f64, causal: bool) -> Array2<f64> {
     let mut p = q.dot(&k.t());
     for (r, mut row) in p.outer_iter_mut().enumerate() {
         let mut max = f64::NEG_INFINITY;
