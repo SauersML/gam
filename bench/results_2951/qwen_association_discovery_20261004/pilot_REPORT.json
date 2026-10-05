@@ -1,0 +1,106 @@
+{
+  "all_declared_cases_and_heads": true,
+  "cases": [
+    {
+      "case_directory": "case-000",
+      "fixture_id": 18,
+      "report_sha256": "8a847906ac5d2935ab791c095985db8ae0cca42a7bad8a50f09fa5bce52ce739",
+      "seconds": 0.644796084
+    },
+    {
+      "case_directory": "case-001",
+      "fixture_id": 19,
+      "report_sha256": "35b1a46a8763f14519c7ea6e66e38bf19ec7b5fa6019a3a19501132de1c0cd79",
+      "seconds": 0.776387625
+    },
+    {
+      "case_directory": "case-002",
+      "fixture_id": 21,
+      "report_sha256": "163e1c86a9708d7fb6d204ab67a96e7c723519a3c6fe7017e5787421121682a9",
+      "seconds": 0.639271416
+    },
+    {
+      "case_directory": "case-003",
+      "fixture_id": 22,
+      "report_sha256": "dbbd8fc40b731f050ca1b3171880057f9bbd67a9308f4d0a1fba3b6a74a1f615",
+      "seconds": 0.7622675
+    },
+    {
+      "case_directory": "case-004",
+      "fixture_id": 24,
+      "report_sha256": "15c6ec3acee47b93c8449421ff4efc9d6807ae972c7861a5429857ef56ac1216",
+      "seconds": 0.651394209
+    },
+    {
+      "case_directory": "case-005",
+      "fixture_id": 25,
+      "report_sha256": "5a60771a76928343cf1c128bbc5e9895733d56866452d8a4f9c66684e13cd864",
+      "seconds": 0.765304667
+    },
+    {
+      "case_directory": "case-006",
+      "fixture_id": 27,
+      "report_sha256": "1fc707c9e0add83d6bb4c45c19e1778de57c4ed8341c40a15644623980ad0d7e",
+      "seconds": 0.623634916
+    },
+    {
+      "case_directory": "case-007",
+      "fixture_id": 28,
+      "report_sha256": "b386aacca89d31cda0cb30794af9a7c4ace378408e68d139987f84ca9a655416",
+      "seconds": 0.757642708
+    },
+    {
+      "case_directory": "case-008",
+      "fixture_id": 30,
+      "report_sha256": "c2726f6d456a1212e0e21443fc2c7b678a54411b03bebf0d24f917f955d900b7",
+      "seconds": 0.625524167
+    },
+    {
+      "case_directory": "case-009",
+      "fixture_id": 31,
+      "report_sha256": "46635bbca322b32e0b4bdfade54f701e40bb995604a9ddabbec72e786e44b19b",
+      "seconds": 0.756256292
+    },
+    {
+      "case_directory": "case-010",
+      "fixture_id": 33,
+      "report_sha256": "1aea8b3d2de9e2bbde844c75fca1d7d0139f5c2db7cfa25ccb51b67d3435fc5a",
+      "seconds": 0.563327459
+    },
+    {
+      "case_directory": "case-011",
+      "fixture_id": 34,
+      "report_sha256": "60462e57acb36ba95dc581df4aa3a2261a17a91806a89b22c383fdde7de1410c",
+      "seconds": 0.711268
+    },
+    {
+      "case_directory": "case-012",
+      "fixture_id": 36,
+      "report_sha256": "d4ae654a437605f8f1e8e222a8de88e398443ab32f7c086e3e041ce62b776997",
+      "seconds": 0.566601084
+    },
+    {
+      "case_directory": "case-013",
+      "fixture_id": 37,
+      "report_sha256": "2c024f631146f1167a9ebafc34983e463fe9f1c0aa696f0b9bca4e81cc23c472",
+      "seconds": 0.729725791
+    },
+    {
+      "case_directory": "case-014",
+      "fixture_id": 39,
+      "report_sha256": "f32025f191ec55d5abea89f2cd47cd2b8d5bde9a5220eea99d656310ec403987",
+      "seconds": 0.6221355
+    },
+    {
+      "case_directory": "case-015",
+      "fixture_id": 40,
+      "report_sha256": "c2b5893f026c9c44f750085dd8f163d0b1a9eaa1fb20dfac76a5d63458086c7d",
+      "seconds": 0.752034875
+    }
+  ],
+  "head_count_per_case": 448,
+  "initialization_seconds": 17.549286334,
+  "numeric_budget_exclusions": "host allocator/metadata, library scratch, transient import/weight hashing buffers; plan counts stored operators and conservative trace/workspaces",
+  "scope": "native instrumentation only; no semantic role, explanatory law, Local/Run acceptance or compression claim",
+  "total_seconds": 28.532880875
+}

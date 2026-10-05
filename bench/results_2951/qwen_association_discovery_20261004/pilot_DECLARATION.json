@@ -1,0 +1,27 @@
+{
+  "backend": "Host f64",
+  "fixture_ids": [
+    18,
+    19,
+    21,
+    22,
+    24,
+    25,
+    27,
+    28,
+    30,
+    31,
+    33,
+    34,
+    36,
+    37,
+    39,
+    40
+  ],
+  "fixtures_sha256": "a9de83bc2cb3979068f034dbd0ed92a2c1c59f923680b04f81ab50b7b1faba77",
+  "heldout": "not read; explicitly refused",
+  "scope": "native teacher instrumentation only, not learned control construction or explanatory prediction",
+  "selection": "all declared cases/all native Attend sites; no measured head/case selection",
+  "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+  "verification": "absolute+relative numeric comparison only, not acceptance certificate"
+}

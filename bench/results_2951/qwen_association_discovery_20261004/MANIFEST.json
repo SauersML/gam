@@ -1,0 +1,21 @@
+{
+  "files_sha256": {
+    "DISCOVERY_NATIVE.json": "d87321feefd1ee645ad56cf7e198390b224c8307a1edb0de75da50f1e4256465",
+    "DISCOVERY_SCREEN_INPUT.json": "5ba886d61b65f93453cf0d9ced21d2503fdf5b5105397b73bbbfcada76a199e2",
+    "DISCOVERY_EXECUTION.json": "693c824e03588bb547662d0c23980c508fecbd14fe5aa7a71cd1b759011b3350",
+    "plot_wording.py": "cf3b0e4fb1d7e36132b034478727e3e6690ed8859a923d0800708323d1ae0f9d",
+    "WORDING_EFFECT_SUMMARY.json": "e12a9ea837137f366181c28faf24c42e2b49afa20262e51b7deeeabf14530920",
+    "wording_effect.pdf": "a40cc7f26863dd49f8410a37e2e37e532c51c2a17263f1e36388ecd6a035f040",
+    "wording_effect.png": "7b08b439a1d5cd5353a82d74d82ad777bbe67cde18fd6b0d14d71ceacb7ebc73",
+    "ROUTING_SETTINGS.json": "304ee28c91c7861358b738e85b937b0664ff7c4e94a698a3bc14a95d47e11afc",
+    "pilot_SUMMARY.json": "83320230bfd440f6a873995bca97115b2c26ddc208b8402b714a7a62b4cfe914",
+    "pilot_REPORT.json": "74c41197f82f397d72f53b2464831b064bb8b0c9499ec56934f0228833b571b5",
+    "pilot_DECLARATION.json": "6fb30494d4fd008d2a17c23092aa51a031f66f5c12f8631259d4f253e65e73e8",
+    "pilot_SETTINGS.json": "83b9eb903dc0e066439ddb25ddb2c2f5b5ef5cb356b8663835aa54aced1985c7",
+    "pilot_NATIVE_GRAPH.json": "e697b8a011da5a441ca800fd573aee8611bcc6de2ff360323518bb921f01e941"
+  },
+  "evidence": "64 native discovery outputs and paired wording contrasts; all planned cells retained. Figure opened in Preview after visual inspection.",
+  "routing_pilot": "16 earlier development cases times448heads; every packed state/report hash independently checked. State tensors remain task data outside git; supplied attention transport identity is instrumentation, not discovered law.",
+  "heldout": "No native heldout evaluation.",
+  "method_status": "No frozen native role decoder or learned routing law yet. No VPD comparison."
+}

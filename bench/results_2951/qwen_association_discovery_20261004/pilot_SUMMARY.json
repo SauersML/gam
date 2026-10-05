@@ -1,0 +1,9 @@
+{
+  "cases": 16,
+  "heads_per_case": 448,
+  "head_measurements": 7168,
+  "max_weighted_value_error": 0,
+  "max_local_donor_delta_error": 1.7763568394002505e-14,
+  "total_seconds": 28.532880875,
+  "scope": "Original native instrumentation validated; architectural transport identity supplied, no discovered rule or whole-tail causal claim."
+}
