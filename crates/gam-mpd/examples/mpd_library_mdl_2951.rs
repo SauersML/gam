@@ -34,6 +34,9 @@ struct Settings {
     held_out: [usize; 2],
     /// Sequences per evaluation batch.
     evaluation_batch: usize,
+    /// The declared interventions: every held native quantity (each head's read, each MLP's
+    /// activations) scaled by each of these; empty for clean data alone.
+    intervention_scales: Vec<f64>,
     fit: library_mdl::Settings,
 }
 
@@ -84,8 +87,15 @@ fn main() -> Result<(), String> {
     let train = &train[..];
     let explanation = library_mdl::explanation(&native, &layers)?;
     explanation.artifact.validate_coverage(&native)?;
+    let interventions: Vec<library_mdl::Intervention> = (0..explanation.holdings.len())
+        .flat_map(|holding| settings.intervention_scales.iter().map(move |&scale| library_mdl::Intervention { holding, scale }))
+        .collect();
     let (bytes, tiles) = (settings.fit.numeric_bytes, settings.fit.head_tile_rows);
-    let start_held_out = library_mdl::mean_divergence(&exact, &native, &explanation.artifact, held_out, settings.evaluation_batch, bytes, tiles)?;
+    let measure = |artifact: &Artifact, sequences: &[Vec<u32>], declared: &[library_mdl::Intervention]| {
+        library_mdl::Measure { device: &exact, native: &native, holdings: &explanation.holdings, batch_sequences: settings.evaluation_batch, numeric_bytes: bytes, tile_rows: tiles }
+            .mean_divergence(artifact, sequences, declared)
+    };
+    let start_held_out = measure(&explanation.artifact, held_out, &[])?;
     let mut cache = CostCache::default();
     let native_cost = structural_cost(&Artifact::native(&native)?.f32_literals()?, &mut cache)?;
     let start_cost = structural_cost(&explanation.artifact.f32_literals()?, &mut cache)?;
@@ -106,14 +116,15 @@ fn main() -> Result<(), String> {
     });
     log::info!("library start: {provenance}");
     save(&out.join("START.json"), &provenance)?;
-    let fit = library_mdl::fit(&fitting, &native, &explanation, train, &settings.fit, Some(&checkpoint))?;
+    let fit = library_mdl::fit(&fitting, &native, &explanation, train, &interventions, &settings.fit, Some(&checkpoint))?;
     save(&out.join("REPORT.json"), &serde_json::to_value(&fit.report).map_err(|e| e.to_string())?)?;
     let artifact = library_mdl::posterior_mean(&explanation, &fit.posterior)?.f32_literals()?;
     artifact.validate_coverage(&native)?;
     std::fs::write(out.join("artifact.bin"), artifact.to_bytes()?).map_err(|e| e.to_string())?;
     let cost = structural_cost(&artifact, &mut cache)?;
-    let held_out_kl = library_mdl::mean_divergence(&exact, &native, &artifact, held_out, settings.evaluation_batch, bytes, tiles)?;
-    let fitted_kl = library_mdl::mean_divergence(&exact, &native, &artifact, &train[..held_out.len().min(train.len())], settings.evaluation_batch, bytes, tiles)?;
+    let held_out_kl = measure(&artifact, held_out, &[])?;
+    let held_out_intervened_kl = if interventions.is_empty() { None } else { Some(measure(&artifact, held_out, &interventions)?) };
+    let fitted_kl = measure(&artifact, &train[..held_out.len().min(train.len())], &[])?;
     let summary = json!({
         "provenance": provenance,
         "objective_bits": fit.report.objective_bits,
@@ -125,9 +136,11 @@ fn main() -> Result<(), String> {
         "structure_bits": cost.structure_bits,
         "binding_bits": cost.binding_bits,
         "held_out_mean_kl": held_out_kl,
+        "held_out_intervened_mean_kl": held_out_intervened_kl,
+        "interventions": interventions.len(),
         "fitted_rows_mean_kl": fitted_kl,
         "seconds": started.elapsed().as_secs_f64(),
-        "scope": "Clean next-token divergence only; the intervention panel is scored separately from artifact.bin.",
+        "scope": "Next-token divergence on held-out rows, clean and under every declared holding scale; the 80-episode panel (including mixes) is scored separately from artifact.bin.",
     });
     log::info!("library summary: {summary}");
     save(&out.join("SUMMARY.json"), &summary)

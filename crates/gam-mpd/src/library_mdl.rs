@@ -78,6 +78,7 @@ use crate::{
         FamilyInputs, Interface, LabelKind, Node, Operator, OperatorBody, OperatorProgram, Provenance, Rule, SequenceLayout, SlotValues,
         exact_precision,
     },
+    intervention_program::{Compiled, Control, ControlValue, compile},
     resident_causal_fit::fixed_head_target::{Head, ResidentHead, Target},
     run_check::LayerNodes,
 };
@@ -126,6 +127,26 @@ pub struct Explanation {
     /// The library's operators of `artifact.program`, ascending.
     pub trainable: Vec<usize>,
     pub groups: Vec<Group>,
+    /// The native quantities a native intervention can scale in the explanation too.
+    pub holdings: Vec<Holding>,
+}
+
+/// A native quantity the explanation holds: scaling native node `native` scales the explanation's
+/// node `node` (a root node of `Explanation::artifact`'s program) alike. A head's read is held at
+/// its block's write; an MLP's activations are held through its output's uniform-scale control,
+/// since its output is linear in them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Holding {
+    pub name: String,
+    pub native: usize,
+    pub node: usize,
+}
+
+/// A declared native intervention: holding `holding` scaled by `scale` on every row of a sequence.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Intervention {
+    pub holding: usize,
+    pub scale: f64,
 }
 
 /// A library operator: dense, every block present, its reals exactly representable.
@@ -271,7 +292,15 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
         trainable.extend([gate, bias, out]);
     }
     trainable.sort_unstable();
-    Ok(Explanation { artifact, trainable, groups })
+    let mut holdings = Vec::new();
+    for (l, layer) in layers.iter().enumerate() {
+        let held = |native: usize| artifact.place(native).ok_or_else(|| format!("the explanation does not hold native node {native}"));
+        for (h, &read) in layer.reads.iter().enumerate() {
+            holdings.push(Holding { name: format!("l{l}.h{h}"), native: read, node: held(read)? });
+        }
+        holdings.push(Holding { name: format!("l{l}.mlp"), native: layer.active, node: held(layer.mlp)? });
+    }
+    Ok(Explanation { artifact, trainable, groups, holdings })
 }
 
 // ------------------------------------------------------------------------------------- posterior
@@ -625,9 +654,44 @@ pub fn sequence_family(sequences: &[&[u32]]) -> Result<FamilyInputs, String> {
     Ok(FamilyInputs { rows: tokens.len(), slots: vec![SlotValues::Tokens(tokens)], layout: Some(SequenceLayout { sequence, position }) })
 }
 
+/// A program inlined, with every node of `nodes` (root nodes) scaled per row and coordinate by a
+/// control input (`intervention_program`), and those nodes' widths.
+struct Controlled {
+    program: OperatorProgram,
+    compiled: Option<Compiled>,
+    widths: Vec<usize>,
+}
+
+impl Controlled {
+    fn new(program: &OperatorProgram, nodes: &[usize]) -> Result<Self, String> {
+        let widths = nodes.iter().map(|n| Ok(program.node_interface(*n).map_err(error)?.width())).collect::<Result<Vec<_>, String>>()?;
+        if nodes.is_empty() {
+            return Ok(Self { program: mapped_inlined(program)?.0, compiled: None, widths });
+        }
+        let compiled = compile(program, &nodes.iter().map(|&node| Control::NodeScale { node }).collect::<Vec<_>>())?;
+        Ok(Self { program: compiled.program.clone(), compiled: Some(compiled), widths })
+    }
+
+    /// `base` with each controlled node scaled by `scales[c][row]` on every coordinate of the row.
+    fn inputs(&self, base: &FamilyInputs, scales: &[Vec<f64>]) -> Result<FamilyInputs, String> {
+        let Some(compiled) = &self.compiled else { return Ok(base.clone()) };
+        let values: Vec<ControlValue> =
+            scales.iter().zip(&self.widths).map(|(rows, width)| ControlValue::NodeMask(Array2::from_shape_fn((base.rows, *width), |(r, _)| rows[r]))).collect();
+        compiled.family(base, &values)
+    }
+}
+
+/// A batch of complete sequences, each clean or under one declared intervention: per holding, the
+/// scale of each row.
+struct Batch {
+    base: FamilyInputs,
+    scales: Vec<Vec<f64>>,
+}
+
 /// The native model's distributions as compact fixed-head statistics, made per batch and dropped
 /// after use.
 struct Teacher {
+    controls: Controlled,
     prefix: DeviceProgram,
     head: Arc<Head>,
     embedding: Tensor,
@@ -635,18 +699,19 @@ struct Teacher {
 }
 
 impl Teacher {
-    fn new(device: &Device, native: &OperatorProgram, numeric_bytes: usize, tile_rows: usize) -> Result<Self, String> {
-        let (flat, _) = mapped_inlined(native)?;
-        let head = Arc::new(Head::of(&flat)?);
-        let mut prefix = DeviceProgram::compile_values_bounded(device, &head.prefix(&flat), numeric_bytes)?;
+    fn new(device: &Device, native: &OperatorProgram, controls: &[usize], numeric_bytes: usize, tile_rows: usize) -> Result<Self, String> {
+        let controls = Controlled::new(native, controls)?;
+        let flat = &controls.program;
+        let head = Arc::new(Head::of(flat)?);
+        let mut prefix = DeviceProgram::compile_values_bounded(device, &head.prefix(flat), numeric_bytes)?;
         prefix.set_arithmetic(arithmetic(device));
         let embedding = device.upload(head.embedding.view()).map_err(error)?;
-        Ok(Self { prefix, head, embedding, tile_rows })
+        Ok(Self { controls, prefix, head, embedding, tile_rows })
     }
 
-    fn target(&self, family: &FamilyInputs) -> Result<Target, String> {
+    fn target(&self, batch: &Batch) -> Result<Target, String> {
         let d = self.prefix.device();
-        let trace = self.prefix.forward(family)?;
+        let trace = self.prefix.forward(&self.controls.inputs(&batch.base, &batch.scales)?)?;
         let hidden = trace.value(self.prefix.hidden())?;
         let (rows, width, classes) = (hidden.rows(), self.head.embedding.ncols(), self.head.embedding.nrows());
         let mut mu = d.zeros(rows, width).map_err(error)?;
@@ -668,19 +733,20 @@ impl Teacher {
 
 /// The explanation on the device, scored against the teacher.
 struct Student {
+    controls: Controlled,
     program: DeviceProgram,
     head: ResidentHead,
     trainable: Vec<usize>,
 }
 
 impl Student {
-    fn new(device: &Device, artifact: &Artifact, trainable: &[usize], numeric_bytes: usize, tile_rows: usize) -> Result<Self, String> {
-        let (flat, _) = mapped_inlined(&artifact.program)?;
-        let head = Head::of(&flat)?;
-        let mut program = DeviceProgram::compile_values_bounded(device, &head.prefix(&flat), numeric_bytes)?;
+    fn new(device: &Device, artifact: &Artifact, trainable: &[usize], controls: &[usize], numeric_bytes: usize, tile_rows: usize) -> Result<Self, String> {
+        let controls = Controlled::new(&artifact.program, controls)?;
+        let head = Head::of(&controls.program)?;
+        let mut program = DeviceProgram::compile_values_bounded(device, &head.prefix(&controls.program), numeric_bytes)?;
         program.set_arithmetic(arithmetic(device));
         program.prepare_dense_parameters(trainable)?;
-        Ok(Self { head: ResidentHead::new(device, &head, tile_rows)?, program, trainable: trainable.to_vec() })
+        Ok(Self { head: ResidentHead::new(device, &head, tile_rows)?, controls, program, trainable: trainable.to_vec() })
     }
 
     fn load(&mut self, values: &[Array2<f64>]) -> Result<(), String> {
@@ -691,11 +757,11 @@ impl Student {
         Ok(())
     }
 
-    /// `Σ_rows KL(p_M ‖ p_θ)` in nats on `family` at the loaded parameters, and with `scale`, the
+    /// `Σ_rows KL(p_M ‖ p_θ)` in nats on `batch` at the loaded parameters, and with `scale`, the
     /// gradient of `scale` times it in every trainable operator.
-    fn score(&self, family: &FamilyInputs, target: &Target, scale: Option<f64>) -> Result<(f64, Option<Vec<Array2<f64>>>), String> {
+    fn score(&self, batch: &Batch, target: &Target, scale: Option<f64>) -> Result<(f64, Option<Vec<Array2<f64>>>), String> {
         let d = self.program.device();
-        let trace = self.program.forward(family)?;
+        let trace = self.program.forward(&self.controls.inputs(&batch.base, &batch.scales)?)?;
         let (losses, seed) = self.head.score(d, trace.value(self.program.hidden())?, target, scale.is_some(), self.program.arithmetic())?;
         let total: f64 = losses.iter().sum();
         if !total.is_finite() {
@@ -729,6 +795,7 @@ fn noise_seed(seed: u64, epoch: usize, batch: usize) -> u64 {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Progress {
     settings: Settings,
+    interventions: Vec<Intervention>,
     tokens: usize,
     shapes: Vec<(usize, usize)>,
     /// The next epoch, and the optimizer steps taken.
@@ -774,7 +841,12 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior, 
     let header = bytes.get(8..8 + length).ok_or("a truncated checkpoint")?;
     let progress: Progress = serde_json::from_slice(header).map_err(error)?;
     let same_settings = serde_json::to_value(&progress.settings).map_err(error)? == serde_json::to_value(&expected.settings).map_err(error)?;
-    if !same_settings || progress.tokens != expected.tokens || progress.shapes != expected.shapes || progress.active.len() != expected.active.len() {
+    if !same_settings
+        || progress.interventions != expected.interventions
+        || progress.tokens != expected.tokens
+        || progress.shapes != expected.shapes
+        || progress.active.len() != expected.active.len()
+    {
         return Err(format!("{}: a checkpoint of another fit", path.display()));
     }
     let count: usize = progress.shapes.iter().map(|(r, c)| r * c * 6).sum();
@@ -791,31 +863,80 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior, 
     Ok(progress)
 }
 
-/// Fit the library explanation of `native` to its distributions on the training `sequences` (module
-/// note). `native` is the split native program the explanation was built from. With `checkpoint`,
-/// the fit is saved there after every epoch and removal step, and resumed from it when it exists.
+/// The training observations: every sequence clean, then, when interventions are declared,
+/// sequence `i` again under intervention `i mod |interventions|`.
+fn training_observations(sequences: usize, interventions: &[Intervention]) -> Vec<(usize, Option<&Intervention>)> {
+    let mut observed: Vec<(usize, Option<&Intervention>)> = (0..sequences).map(|i| (i, None)).collect();
+    if !interventions.is_empty() {
+        observed.extend((0..sequences).map(|i| (i, Some(&interventions[i % interventions.len()]))));
+    }
+    observed
+}
+
+/// The holdings `interventions` scale, ascending.
+fn controlled_holdings(interventions: &[Intervention]) -> Vec<usize> {
+    let mut controls: Vec<usize> = interventions.iter().map(|i| i.holding).collect();
+    controls.sort_unstable();
+    controls.dedup();
+    controls
+}
+
+/// Observations `(sequence, intervention)` in batches of `size`, each batch's rows carrying, per
+/// controlled holding (`controls`), their scale.
+fn batches(sequences: &[Vec<u32>], observed: &[(usize, Option<&Intervention>)], controls: &[usize], size: usize) -> Result<Vec<Batch>, String> {
+    observed
+        .chunks(size)
+        .map(|chunk| {
+            let base = sequence_family(&chunk.iter().map(|(i, _)| sequences[*i].as_slice()).collect::<Vec<_>>())?;
+            let length = base.rows / chunk.len();
+            let scales = controls
+                .iter()
+                .map(|holding| {
+                    chunk
+                        .iter()
+                        .flat_map(|(_, intervention)| {
+                            let scale = intervention.filter(|i| i.holding == *holding).map_or(1.0, |i| i.scale);
+                            std::iter::repeat_n(scale, length)
+                        })
+                        .collect()
+                })
+                .collect();
+            Ok(Batch { base, scales })
+        })
+        .collect()
+}
+
+/// Fit the library explanation of `native` to its distributions on the training `sequences`, clean
+/// and under the declared `interventions` (module note). `native` is the split native program the
+/// explanation was built from. With `checkpoint`, the fit is saved there after every epoch and
+/// removal step, and resumed from it when it exists.
 pub fn fit(
     device: &Device,
     native: &OperatorProgram,
     explanation: &Explanation,
     sequences: &[Vec<u32>],
+    interventions: &[Intervention],
     settings: &Settings,
     checkpoint: Option<&Path>,
 ) -> Result<Fit, String> {
     settings.validate()?;
+    if interventions.iter().any(|i| i.holding >= explanation.holdings.len() || !i.scale.is_finite()) {
+        return Err("an intervention on no holding, or with a nonfinite scale".into());
+    }
     let started = Instant::now();
-    let tokens: usize = sequences.iter().map(Vec::len).sum();
-    let batches: Vec<FamilyInputs> =
-        sequences.chunks(settings.batch_sequences).map(|chunk| sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())).collect::<Result<_, _>>()?;
+    let controls = controlled_holdings(interventions);
+    let batches = batches(sequences, &training_observations(sequences.len(), interventions), &controls, settings.batch_sequences)?;
     if batches.len() < 2 {
         return Err("the convergence test needs at least two training batches".into());
     }
+    let tokens: usize = batches.iter().map(|b| b.base.rows).sum();
     let mut posterior = Posterior::new(explanation, tokens)?;
     let parameters = posterior.mean.iter().map(Array2::len).sum();
     let mut mean_moments: Vec<Moment> = posterior.mean.iter().map(|m| Moment::zeros(m.dim())).collect();
     let mut log_sd_moments = mean_moments.clone();
     let mut progress = Progress {
         settings: settings.clone(),
+        interventions: interventions.to_vec(),
         tokens,
         shapes: posterior.mean.iter().map(Array2::dim).collect(),
         epoch: 0,
@@ -832,8 +953,11 @@ pub fn fit(
         log::info!("library fit resumed at epoch {} from {}", progress.epoch, path.display());
     }
     let resumed_seconds = progress.seconds;
-    let teacher = Teacher::new(device, native, settings.numeric_bytes, settings.head_tile_rows)?;
-    let mut student = Student::new(device, &explanation.artifact, &explanation.trainable, settings.numeric_bytes, settings.head_tile_rows)?;
+    let native_controls: Vec<usize> = controls.iter().map(|h| explanation.holdings[*h].native).collect();
+    let explanation_controls: Vec<usize> = controls.iter().map(|h| explanation.holdings[*h].node).collect();
+    let teacher = Teacher::new(device, native, &native_controls, settings.numeric_bytes, settings.head_tile_rows)?;
+    let mut student =
+        Student::new(device, &explanation.artifact, &explanation.trainable, &explanation_controls, settings.numeric_bytes, settings.head_tile_rows)?;
     let save = |progress: &mut Progress, posterior: &Posterior, mean: &[Moment], log_sd: &[Moment]| -> Result<(), String> {
         progress.active = posterior.active.clone();
         progress.seconds = resumed_seconds + started.elapsed().as_secs_f64();
@@ -848,14 +972,14 @@ pub fn fit(
             let target = teacher.target(batch)?;
             let (theta, noise) = posterior.sample(noise_seed(settings.seed, epoch + 1, b));
             student.load(&theta)?;
-            let scale = tokens as f64 / batch.rows as f64;
+            let scale = tokens as f64 / batch.base.rows as f64;
             let (divergence, gradients) = student.score(batch, &target, Some(scale))?;
             let gradients = gradients.ok_or("missing gradients")?;
             let description = posterior.description();
             estimates.push(scale * divergence + description);
             data_sum += scale * divergence;
             description_sum += description;
-            kl_sum += divergence / batch.rows as f64;
+            kl_sum += divergence / batch.base.rows as f64;
             progress.step += 1;
             let step = progress.step;
             let results = posterior.derivatives(&gradients, &noise);
@@ -928,7 +1052,7 @@ pub fn fit(
 
 /// `E_q[D]` over every training batch, one weight sample per batch from the removal seeds, with the
 /// groups `removed` (and the already removed ones) zeroed, in nats.
-fn expected_divergence(teacher: &Teacher, student: &mut Student, posterior: &Posterior, batches: &[FamilyInputs], removed: &[usize], settings: &Settings) -> Result<f64, String> {
+fn expected_divergence(teacher: &Teacher, student: &mut Student, posterior: &Posterior, batches: &[Batch], removed: &[usize], settings: &Settings) -> Result<f64, String> {
     let mut trial = posterior.clone();
     trial.remove(removed);
     let mut total = 0.0;
@@ -976,7 +1100,7 @@ fn largest_accepted_prefix(
 
 /// The removal step (module note): a prefix of the active groups in increasing divergence whose
 /// removal does not increase the sampled objective, found by bisection.
-fn remove(teacher: &Teacher, student: &mut Student, posterior: &mut Posterior, batches: &[FamilyInputs], settings: &Settings) -> Result<Removal, String> {
+fn remove(teacher: &Teacher, student: &mut Student, posterior: &mut Posterior, batches: &[Batch], settings: &Settings) -> Result<Removal, String> {
     let divergences = posterior.divergences();
     let mut order: Vec<usize> = (0..divergences.len()).filter(|g| posterior.active[*g]).collect();
     order.sort_by(|a, b| divergences[*a].total_cmp(&divergences[*b]));
@@ -1033,30 +1157,43 @@ pub fn posterior_mean(explanation: &Explanation, posterior: &Posterior) -> Resul
     Ok(artifact)
 }
 
-/// Mean `KL(p_M ‖ p_P)` per token, in nats, of `artifact`'s explanation on `sequences` (complete,
-/// equal length), `batch_sequences` at a time.
-pub fn mean_divergence(
-    device: &Device,
-    native: &OperatorProgram,
-    artifact: &Artifact,
-    sequences: &[Vec<u32>],
-    batch_sequences: usize,
-    numeric_bytes: usize,
-    tile_rows: usize,
-) -> Result<f64, String> {
-    if batch_sequences == 0 || sequences.is_empty() {
-        return Err("no held-out sequences".into());
+/// Where and how an explanation's divergence from the native model is measured.
+pub struct Measure<'a> {
+    pub device: &'a Device,
+    pub native: &'a OperatorProgram,
+    /// The holdings of the explanation the measured artifacts are values of.
+    pub holdings: &'a [Holding],
+    /// Sequences run at a time, the operator buffers' bytes and the vocabulary logits' row tile.
+    pub batch_sequences: usize,
+    pub numeric_bytes: usize,
+    pub tile_rows: usize,
+}
+
+impl Measure<'_> {
+    /// Mean `KL(p_M ‖ p_P)` per token, in nats, of `artifact` (the explanation's program with any
+    /// values) on `sequences` (complete, equal length): clean, or under every one of
+    /// `interventions` on every sequence.
+    pub fn mean_divergence(&self, artifact: &Artifact, sequences: &[Vec<u32>], interventions: &[Intervention]) -> Result<f64, String> {
+        if self.batch_sequences == 0 || sequences.is_empty() || interventions.iter().any(|i| i.holding >= self.holdings.len()) {
+            return Err("no held-out sequences, or an intervention on no holding".into());
+        }
+        let controls = controlled_holdings(interventions);
+        let (native, explained): (Vec<usize>, Vec<usize>) = controls.iter().map(|h| (self.holdings[*h].native, self.holdings[*h].node)).unzip();
+        let teacher = Teacher::new(self.device, self.native, &native, self.numeric_bytes, self.tile_rows)?;
+        let student = Student::new(self.device, artifact, &[], &explained, self.numeric_bytes, self.tile_rows)?;
+        let observed: Vec<(usize, Option<&Intervention>)> = if interventions.is_empty() {
+            (0..sequences.len()).map(|i| (i, None)).collect()
+        } else {
+            interventions.iter().flat_map(|intervention| (0..sequences.len()).map(move |i| (i, Some(intervention)))).collect()
+        };
+        let (mut total, mut rows) = (0.0, 0usize);
+        for batch in batches(sequences, &observed, &controls, self.batch_sequences)? {
+            let target = teacher.target(&batch)?;
+            total += student.score(&batch, &target, None)?.0;
+            rows += batch.base.rows;
+        }
+        Ok(total / rows as f64)
     }
-    let teacher = Teacher::new(device, native, numeric_bytes, tile_rows)?;
-    let student = Student::new(device, artifact, &[], numeric_bytes, tile_rows)?;
-    let (mut total, mut rows) = (0.0, 0usize);
-    for chunk in sequences.chunks(batch_sequences) {
-        let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
-        let target = teacher.target(&family)?;
-        total += student.score(&family, &target, None)?.0;
-        rows += family.rows;
-    }
-    Ok(total / rows as f64)
 }
 
 #[cfg(test)]
@@ -1228,16 +1365,19 @@ mod tests {
             head_tile_rows: 64,
         };
         let device = Device::host();
+        // Remove layer 0's first head; remove layer 1's MLP.
+        let held = |name: &str| explanation.holdings.iter().position(|h| h.name == name).unwrap();
+        let interventions = vec![Intervention { holding: held("l0.h0"), scale: 0.0 }, Intervention { holding: held("l1.mlp"), scale: 0.0 }];
         let checkpoint = std::env::temp_dir().join(format!("library_fit_{}.bin", std::process::id()));
-        let fit = fit(&device, &native, &explanation, &sequences, &settings, Some(&checkpoint)).unwrap();
+        let fit = fit(&device, &native, &explanation, &sequences, &interventions, &settings, Some(&checkpoint)).unwrap();
         // A finished fit's checkpoint resumes to the same posterior without another step.
-        let resumed = super::fit(&device, &native, &explanation, &sequences, &settings, Some(&checkpoint)).unwrap();
+        let resumed = super::fit(&device, &native, &explanation, &sequences, &interventions, &settings, Some(&checkpoint)).unwrap();
         std::fs::remove_file(&checkpoint).unwrap();
         assert_eq!(resumed.posterior.active, fit.posterior.active);
         assert_eq!(resumed.posterior.means(), fit.posterior.means());
         assert_eq!(resumed.report.epochs.len(), fit.report.epochs.len());
         let report = &fit.report;
-        assert_eq!(report.training_tokens, 72);
+        assert_eq!(report.training_tokens, 2 * 72, "every sequence clean and once intervened");
         assert_eq!(report.removals.last().unwrap().removed, 0, "the fit ends when no removal is accepted");
         assert!(report.removals.iter().all(|r| r.after_bits <= r.before_bits), "a removal never increases the objective");
         assert!(report.epochs.iter().all(|e| e.objective_bits.is_finite()));
@@ -1254,7 +1394,34 @@ mod tests {
             .map(|c| c.rows.len() * c.cols.len())
             .sum();
         assert!(end <= start && start - end >= removed.min(start), "removed groups are absent blocks: {start} → {end}");
-        let kl = mean_divergence(&device, &native, &artifact, &sequences, 2, 1 << 26, 64).unwrap();
-        assert!(kl.is_finite() && kl >= 0.0);
+        let measure = Measure { device: &device, native: &native, holdings: &explanation.holdings, batch_sequences: 2, numeric_bytes: 1 << 26, tile_rows: 64 };
+        for declared in [&[][..], &interventions[..]] {
+            let kl = measure.mean_divergence(&artifact, &sequences, declared).unwrap();
+            assert!(kl.is_finite() && kl >= 0.0);
+        }
+    }
+
+    #[test]
+    fn the_starting_library_answers_every_held_intervention_as_the_native_model() {
+        let (native, layers, _, sequences) = tiny("library_holdings", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        assert_eq!(explanation.holdings.len(), 2 * (2 + 1), "two head reads and one MLP per layer");
+        let device = Device::host();
+        let interventions: Vec<Intervention> =
+            (0..explanation.holdings.len()).flat_map(|holding| [0.0, 0.5, 2.0].map(|scale| Intervention { holding, scale })).collect();
+        let measure = |holdings: &[Holding]| {
+            Measure { device: &device, native: &native, holdings, batch_sequences: 2, numeric_bytes: 1 << 26, tile_rows: 64 }
+                .mean_divergence(&explanation.artifact, &sequences, &interventions)
+                .unwrap()
+        };
+        let held = measure(&explanation.holdings);
+        assert!(held.abs() < 1e-10, "the starting library's intervened divergence is {held}");
+        // A positive control: the same scales applied at mismatched places move it off M.
+        let mut moved = explanation.holdings.clone();
+        let (first, second) = (moved[0].node, moved[2].node);
+        moved[0].node = second;
+        moved[2].node = first;
+        let control = measure(&moved);
+        assert!(control > 1e-3, "mismatched holdings must disagree: {control}");
     }
 }
