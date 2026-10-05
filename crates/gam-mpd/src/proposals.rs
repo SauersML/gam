@@ -16,7 +16,7 @@
 //! one for one, and its pointers as the present-block code. It replaces the block from the MLP's
 //! normed input to its output (`run_check::LayerNodes::normed`, `::mlp`); the hidden layer appears
 //! nowhere, so a native neuron is not a place of the result. [`AccountProposer`] proposes every
-//! account a directory holds in `mlp_functions`' layout (`L{layer}[.{start}].rules.json` with
+//! account a directory holds (`L{layer}[.{start}].rules.json` with
 //! `.reads.f64`, `.writes.f64` and `.offset.f64`). Each account also offers
 //! [`with_account_shared`]: complete identical learned scalar functions become shared Rule
 //! bodies with explicit read bindings. This preserves supplied numerical functions; it neither

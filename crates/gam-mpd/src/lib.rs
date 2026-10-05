@@ -152,11 +152,7 @@ pub mod secant;
 // Evidence status and ranked robust supports.
 pub mod supports;
 
-// Gate laws: which subcomponents are on for an input, from a small bits-charged law over the
-// model's own amplitudes (fit, code, feature screen, decisions).
-pub mod gates;
-
-// An MLP accounted for by explicit rules between its subcomponents' amplitudes.
+// An MLP accounted for by explicit rules between amplitudes.
 pub mod mlp_account;
 
 #[cfg(test)]
@@ -167,9 +163,6 @@ pub mod counterfactual;
 
 #[cfg(test)]
 mod counterfactual_tests;
-
-#[cfg(test)]
-mod gates_tests;
 
 // Isolated replacement writes followed by the unchanged native downstream program.
 pub mod local_kl;

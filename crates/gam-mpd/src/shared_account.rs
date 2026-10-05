@@ -283,12 +283,12 @@ mod tests {
             beta: 0.25,
             linear: vec![0.125, -0.5],
             units: vec![
-                super::super::super::gates::Unit {
+                super::super::super::mlp_account::Unit {
                     w: vec![0.75, 0.25],
                     d: 0.1,
                     c: 1.,
                 },
-                super::super::super::gates::Unit {
+                super::super::super::mlp_account::Unit {
                     w: vec![-0.4, 0.8],
                     d: -0.2,
                     c: 0.5,
