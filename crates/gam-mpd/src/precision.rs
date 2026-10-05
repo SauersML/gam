@@ -1,5 +1,4 @@
-//! Declared-precision real codes, quotient representatives and decode-then-evaluate
-//! distortion (#2951, P11 and P18).
+//! Declared-precision real codes and decode-then-evaluate distortion (#2951).
 //!
 //! A mechanism program's code carries no free real-valued coefficient. Every real
 //! an artifact holds is sent as integers under a precision the experiment declares,
@@ -22,34 +21,6 @@
 //! holds with no rounding term. A step that is not a power of two would put a
 //! rounding error into every decoded value.
 //!
-//! # Quotient representatives
-//!
-//! A coordinate of `R/TZ`, such as the projective line `RP1` as `t ~ t + π` (P11) or
-//! a turn angle with period `2π`, names one class. A code that sends `t` and `t + T`
-//! differently spends bits on the gauge. [`QuotientCode`] sends the class once: the
-//! canonical representative in `[0, T)` is a convention the encoder and decoder
-//! share, and the transmitted index names the nearest of `N = 2^b` cells of the
-//! period, at `b` bits per coordinate.
-//!
-//! With `u` the unit roundoff, the encoder computes:
-//! - `r = t mod T`. The floating-point remainder is exact; only the correction
-//!   `r + T` of a negative remainder rounds, by at most `uT`.
-//! - The fraction `s = r/T`, one division, rounding by at most `u` since `r ≤ T`.
-//! - `j = round(s·N) mod N`, which is exact.
-//!
-//! The decoder returns `j·(T/N)`. The cell width is an exact scaling, and the
-//! product rounds by at most `uT`. In period units the decoded representative is
-//! within `1/(2N) + 3u` of the input's class, so
-//!
-//! ```text
-//!   d_{R/TZ}(t, t̂) < T·(2^-(b+1) + 3u).
-//! ```
-//!
-//! [`QuotientCode::worst_case_error`] reports `T·2^-(b+1) + 4uT`. Both terms are exact
-//! power-of-two scalings of `T`, and the extra `uT` absorbs the one rounded addition,
-//! so the figure never falls below the bound. A cell whose half-width `2^-(b+1)` does
-//! not exceed the `3u` rounding floor is not resolved and is refused.
-//!
 //! # Decode, then evaluate
 //!
 //! [`decode_then_evaluate`] decodes an artifact, executes the decoded artifact, and
@@ -68,31 +39,21 @@
 //!
 //! # Messages
 //!
-//! Each code is also one self-delimiting message through `codec`'s integer codes, so
+//! The code is also one self-delimiting message through `codec`'s integer codes, so
 //! a library appends it and a decoder reads it back without a real-valued field:
-//!
-//! * [`LatticeCode::write`] sends the coordinate count as `count + 1` in the prefix
-//!   integer code, then the declared precision `p` and each index `k` in `codec`'s
-//!   signed prefix integer code.
-//!   [`LatticeCode::index_bits`] is the length of the index codewords alone, without
-//!   that header.
-//! * [`QuotientCode::write`] sends the count as `count + 1` and the resolution as
-//!   `b + 1` in the prefix integer code, then each index as a fixed index into the
-//!   `2^b` cells: exactly [`QuotientCode::index_bits`] after the header. The period
-//!   is a declared convention of the decoder and is never written.
+//! [`LatticeCode::write`] sends the coordinate count as `count + 1` in the prefix
+//! integer code, then the declared precision `p` and each index `k` in `codec`'s signed
+//! prefix integer code. [`LatticeCode::index_bits`] is the length of the index codewords
+//! alone, without that header.
 //!
 //! A reader refuses a count that the bits remaining in the message cannot hold before
-//! it allocates anything: a lattice index takes at least one bit, and a quotient index
-//! exactly `b`. That bound needs `b ≥ 1`. A 0-bit quotient code would decode every class
-//! to the same representative and carry no coordinate, so it is refused.
+//! it allocates anything: a lattice index takes at least one bit.
 
 use super::codec::{
-    BitReader, BitString, decode_fixed_index, decode_prefix_integer, decode_signed_prefix_integer,
-    encode_fixed_index, encode_prefix_integer, encode_signed_prefix_integer,
-    signed_prefix_integer_len_bits,
+    BitReader, BitString, decode_prefix_integer, decode_signed_prefix_integer, encode_prefix_integer,
+    encode_signed_prefix_integer, signed_prefix_integer_len_bits,
 };
 use super::supports::EvidenceStatus;
-use gam_linalg::roundoff::UNIT_ROUNDOFF;
 
 /// Largest `|p|` for which both `2^p` and `2^-p` are normal `f64` powers of two: the
 /// normal exponents span `[f64::MIN_EXP - 1, f64::MAX_EXP - 1] = [-1022, 1023]`.
@@ -288,158 +249,6 @@ impl DecodableArtifact for LatticeCode {
     }
 }
 
-/// The quotient `R/TZ` of the real line by a period `T`, such as `RP1` with `T = π`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PeriodicQuotient {
-    period: f64,
-}
-
-impl PeriodicQuotient {
-    /// The quotient by `period`. Refused unless the period is finite and positive, and
-    /// its scaling by `2^-53` is still normal. That condition makes every power-of-two
-    /// scaling of the period used here (at most `2^-51`) exact.
-    pub fn new(period: f64) -> Result<Self, String> {
-        let admissible = period.is_finite()
-            && period > 0.0
-            && (period * power_of_two(-(f64::MANTISSA_DIGITS as i32))).is_normal();
-        if !admissible {
-            return Err(format!(
-                "PeriodicQuotient: period {period} must be finite and positive, with its 2^-53 \
-                 scaling still a normal f64"
-            ));
-        }
-        Ok(Self { period })
-    }
-
-    /// The period `T`.
-    pub fn period(self) -> f64 {
-        self.period
-    }
-}
-
-/// Refuse a resolution with no bits, or one whose cell half-width `2^-(b+1)`, in period
-/// units, does not exceed the `3u` rounding of the representative (see the module note).
-/// A 0-bit code decodes every class to one representative and carries no coordinate.
-fn check_resolution(resolution_bits: u32) -> Result<(), String> {
-    if resolution_bits == 0 {
-        return Err(
-            "QuotientCode: a 0-bit code carries no coordinate: every class decodes to 0"
-                .to_string(),
-        );
-    }
-    let resolved = resolution_bits < f64::MANTISSA_DIGITS
-        && power_of_two(-(resolution_bits as i32) - 1) > 3.0 * UNIT_ROUNDOFF;
-    if !resolved {
-        return Err(format!(
-            "QuotientCode: {resolution_bits} resolution bits make cells no wider than the \
-             rounding of their representative"
-        ));
-    }
-    Ok(())
-}
-
-/// Coordinates of a [`PeriodicQuotient`] sent once per class, as cell indices of the
-/// canonical representative in `[0, T)`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct QuotientCode {
-    quotient: PeriodicQuotient,
-    resolution_bits: u32,
-    indices: Vec<u64>,
-}
-
-impl QuotientCode {
-    /// Encode each value's class as the nearest of `2^resolution_bits` cells of the
-    /// period. Refused for a non-finite value or an unresolved resolution.
-    pub fn encode(
-        values: &[f64],
-        quotient: PeriodicQuotient,
-        resolution_bits: u32,
-    ) -> Result<Self, String> {
-        check_resolution(resolution_bits)?;
-        let cells = power_of_two(resolution_bits as i32);
-        let modulus = 1_u64 << resolution_bits;
-        let period = quotient.period;
-        let mut indices = Vec::with_capacity(values.len());
-        for (position, &value) in values.iter().enumerate() {
-            if !value.is_finite() {
-                return Err(format!(
-                    "QuotientCode::encode: value {value} at position {position} is not finite"
-                ));
-            }
-            let fraction = value.rem_euclid(period) / period;
-            indices.push((fraction * cells).round() as u64 % modulus);
-        }
-        Ok(Self {
-            quotient,
-            resolution_bits,
-            indices,
-        })
-    }
-
-    /// Accept transmitted cell indices. Refused for an unresolved resolution or an
-    /// index outside `[0, 2^resolution_bits)`.
-    pub fn from_indices(
-        quotient: PeriodicQuotient,
-        resolution_bits: u32,
-        indices: Vec<u64>,
-    ) -> Result<Self, String> {
-        check_resolution(resolution_bits)?;
-        let modulus = 1_u64 << resolution_bits;
-        if let Some(position) = indices.iter().position(|&index| index >= modulus) {
-            return Err(format!(
-                "QuotientCode: index {} at position {position} is outside [0, 2^{resolution_bits})",
-                indices[position]
-            ));
-        }
-        Ok(Self {
-            quotient,
-            resolution_bits,
-            indices,
-        })
-    }
-
-    /// The quotient the coordinates live in.
-    pub fn quotient(&self) -> PeriodicQuotient {
-        self.quotient
-    }
-
-    /// Bits per coordinate.
-    pub fn resolution_bits(&self) -> u32 {
-        self.resolution_bits
-    }
-
-    /// The transmitted cell indices.
-    pub fn indices(&self) -> &[u64] {
-        &self.indices
-    }
-
-    /// The exact length of the fixed-rate index code: `resolution_bits` per coordinate.
-    pub fn index_bits(&self) -> u64 {
-        u64::from(self.resolution_bits) * self.indices.len() as u64
-    }
-
-    /// An upper bound on the quotient distance between each input's class and its
-    /// decoded representative, rounding included: `T·2^-(b+1) + 4uT` (see the module
-    /// note).
-    pub fn worst_case_error(&self) -> f64 {
-        let period = self.quotient.period;
-        period * power_of_two(-(self.resolution_bits as i32) - 1) + 4.0 * UNIT_ROUNDOFF * period
-    }
-}
-
-impl DecodableArtifact for QuotientCode {
-    type Decoded = Vec<f64>;
-
-    fn decode(&self) -> Result<Vec<f64>, String> {
-        let cell_width = self.quotient.period * power_of_two(-(self.resolution_bits as i32));
-        Ok(self
-            .indices
-            .iter()
-            .map(|&index| index as f64 * cell_width)
-            .collect())
-    }
-}
-
 impl LatticeCode {
     /// Append the code as one message. The count goes as `count + 1` in the prefix integer
     /// code; the declared precision and each index go in the signed prefix integer code
@@ -485,9 +294,8 @@ impl LatticeCode {
     }
 
     /// The exact length of the index codewords in the signed prefix integer code. It counts
-    /// the indices only, not the count and precision header that [`Self::write`] adds,
-    /// mirroring [`QuotientCode::index_bits`]. A written message is its header plus this
-    /// many bits.
+    /// the indices only, not the count and precision header that [`Self::write`] adds. A
+    /// written message is its header plus this many bits.
     pub fn index_bits(&self) -> Result<u64, String> {
         let mut bits = 0_u64;
         for (position, &index) in self.indices.iter().enumerate() {
@@ -495,54 +303,6 @@ impl LatticeCode {
                 .map_err(|error| format!("LatticeCode::index_bits: index {position}: {error}"))?;
         }
         Ok(bits)
-    }
-}
-
-impl QuotientCode {
-    /// Append the code as one message: the count as `count + 1` and the resolution as
-    /// `b + 1` in the prefix integer code, then each index as a fixed index into the
-    /// `2^b` cells (see the module note). The period is not written.
-    pub fn write(&self, out: &mut BitString) -> Result<(), String> {
-        encode_prefix_integer(out, self.indices.len() as u64 + 1)
-            .map_err(|error| format!("QuotientCode::write: count: {error}"))?;
-        encode_prefix_integer(out, u64::from(self.resolution_bits) + 1)
-            .map_err(|error| format!("QuotientCode::write: resolution: {error}"))?;
-        let cells = 1_usize << self.resolution_bits;
-        for (position, &index) in self.indices.iter().enumerate() {
-            encode_fixed_index(out, index as usize, cells)
-                .map_err(|error| format!("QuotientCode::write: index {position}: {error}"))?;
-        }
-        Ok(())
-    }
-
-    /// Read one message written by [`Self::write`] for the declared `quotient`. Each index
-    /// takes exactly `b >= 1` bits, so a count above the remaining bits over `b` is refused
-    /// before anything is allocated. The indices then pass [`Self::from_indices`].
-    pub fn read(reader: &mut BitReader<'_>, quotient: PeriodicQuotient) -> Result<Self, String> {
-        let count = decode_prefix_integer(reader)
-            .map_err(|error| format!("QuotientCode::read: count: {error}"))?
-            - 1;
-        let resolution = decode_prefix_integer(reader)
-            .map_err(|error| format!("QuotientCode::read: resolution: {error}"))?
-            - 1;
-        let resolution_bits = u32::try_from(resolution)
-            .map_err(|error| format!("QuotientCode::read: resolution {resolution}: {error}"))?;
-        check_resolution(resolution_bits)?;
-        let remaining = reader.remaining_bits();
-        if count > remaining / u64::from(resolution_bits) {
-            return Err(format!(
-                "QuotientCode::read: {count} indices of {resolution_bits} bits exceed the \
-                 {remaining} bits that remain"
-            ));
-        }
-        let cells = 1_usize << resolution_bits;
-        let mut indices = Vec::with_capacity(count as usize);
-        for position in 0..count {
-            let index = decode_fixed_index(reader, cells)
-                .map_err(|error| format!("QuotientCode::read: index {position}: {error}"))?;
-            indices.push(index as u64);
-        }
-        Self::from_indices(quotient, resolution_bits, indices)
     }
 }
 
@@ -688,7 +448,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use gam_linalg::roundoff::UNIT_ROUNDOFF;
     use std::f64::consts::PI;
 
     fn assert_scalar_matches_code(value: f64, precision: DeclaredPrecision) {
@@ -776,15 +536,6 @@ mod tests {
         }
     }
 
-    /// The distance between the classes of `value` and `representative` in `R/TZ`,
-    /// measured to within `4uT`. The remainder `%` is exact. The subtraction rounds by
-    /// at most `2uT`, since the offset is below `2T`; the Euclidean correction by at
-    /// most `uT`; and the complement by at most `uT`.
-    fn class_distance(value: f64, representative: f64, period: f64) -> f64 {
-        let wrapped = (value % period - representative).rem_euclid(period);
-        wrapped.min(period - wrapped)
-    }
-
     /// `sum_c (2/C) v(t_c) v(t_c)^T` with `v(t) = (cos t, sin t)`, row-major.
     fn projector_sum(angles: &[f64]) -> [f64; 4] {
         let weight = 2.0 / angles.len() as f64;
@@ -864,98 +615,6 @@ mod tests {
         assert!(LatticeCode::encode(&[f64::MAX], coarsest).is_err());
     }
 
-    #[test]
-    fn quotient_code_decodes_within_its_bound_of_each_class() {
-        let quotient = PeriodicQuotient::new(PI).expect("the RP1 period is admissible");
-        let values = [
-            0.0,
-            1.0,
-            -1.0,
-            0.5 * PI,
-            PI,
-            -PI,
-            3.0,
-            1.0e6 + 0.1,
-            -12345.678,
-            1.0e-300,
-        ];
-        let measurement_band = 4.0 * UNIT_ROUNDOFF * PI;
-        for resolution_bits in [1, 7, 30, 50] {
-            let code = QuotientCode::encode(&values, quotient, resolution_bits)
-                .expect("finite values encode");
-            let decoded = code.decode().expect("a quotient code decodes");
-            let bound = code.worst_case_error();
-            for (&value, &representative) in values.iter().zip(&decoded) {
-                assert!(
-                    (0.0..PI).contains(&representative),
-                    "representative {representative} of {value} is outside [0, pi)"
-                );
-                let distance = class_distance(value, representative, PI);
-                assert!(
-                    distance <= (bound + measurement_band).next_up(),
-                    "value {value} decoded to {representative} at {resolution_bits} bits: \
-                     distance {distance} beyond bound {bound}"
-                );
-            }
-            let reencoded = QuotientCode::encode(&decoded, quotient, resolution_bits)
-                .expect("decoded representatives encode");
-            assert_eq!(reencoded.indices(), code.indices());
-            assert_eq!(
-                code.index_bits(),
-                u64::from(resolution_bits) * values.len() as u64
-            );
-        }
-    }
-
-    #[test]
-    fn translates_of_a_class_share_one_quotient_index_but_not_one_lattice_index() {
-        let quotient = PeriodicQuotient::new(PI).expect("the RP1 period is admissible");
-        let resolution_bits = 10;
-        let cell_width = PI * power_of_two(-10);
-        let precision = DeclaredPrecision::new(10).expect("precision in range");
-        for cell_index in [0_u64, 1, 511, 1023] {
-            // A quarter cell off a codeword. Translating by up to three periods rounds by
-            // at most 7u in period units: u·3pi for the product and u·4pi for the sum.
-            // Encoding adds 2u. Both are far inside the quarter-cell margin of 2^-12.
-            let base = (cell_index as f64 + 0.25) * cell_width;
-            let translates: Vec<f64> = (-3..=3).map(|turns| base + f64::from(turns) * PI).collect();
-            let code = QuotientCode::encode(&translates, quotient, resolution_bits)
-                .expect("translates encode");
-            assert!(
-                code.indices().iter().all(|&index| index == cell_index),
-                "translates of cell {cell_index} encoded to {:?}",
-                code.indices()
-            );
-            // Negative control: the plain lattice code sends the translates as seven reals.
-            let lattice = LatticeCode::encode(&translates, precision).expect("translates encode");
-            let distinct: BTreeSet<i64> = lattice.indices().iter().copied().collect();
-            assert_eq!(distinct.len(), translates.len());
-        }
-    }
-
-    #[test]
-    fn quotient_code_refuses_cells_below_the_rounding_of_their_representative() {
-        let quotient = PeriodicQuotient::new(PI).expect("the RP1 period is admissible");
-        // A 0-bit code carries no coordinate, while 1 bit is the smallest resolved code.
-        assert!(QuotientCode::encode(&[1.0], quotient, 0).is_err());
-        assert!(QuotientCode::encode(&[1.0], quotient, 1).is_ok());
-        assert!(QuotientCode::from_indices(quotient, 0, vec![0]).is_err());
-        // Half-width 2^-51 = 4u exceeds the 3u floor; 2^-52 = 2u does not.
-        assert!(QuotientCode::encode(&[1.0], quotient, 50).is_ok());
-        assert!(QuotientCode::encode(&[1.0], quotient, 51).is_err());
-        assert!(QuotientCode::encode(&[1.0], quotient, u32::MAX).is_err());
-        assert!(QuotientCode::encode(&[f64::NAN], quotient, 3).is_err());
-        assert!(QuotientCode::from_indices(quotient, 3, vec![7]).is_ok());
-        assert!(QuotientCode::from_indices(quotient, 3, vec![8]).is_err());
-        assert!(PeriodicQuotient::new(1.0e-200).is_ok());
-        for period in [0.0, -PI, f64::NAN, f64::INFINITY, 1.0e-300] {
-            assert!(
-                PeriodicQuotient::new(period).is_err(),
-                "period {period} was admitted"
-            );
-        }
-    }
-
     use crate::supports::ExactBasis;
     use gam_linalg::roundoff::accumulation_growth;
 
@@ -986,7 +645,7 @@ mod tests {
             projector_distance_roundoff(3, value),
             ExactBasis::Exhaustive { cardinality: 1 },
             None,
-            "P11 projector sum of one decoded artifact",
+            "projector sum of one decoded artifact",
         )
         .map_err(|error| error.to_string())
     }
@@ -1015,11 +674,10 @@ mod tests {
 
     #[test]
     fn fidelity_is_measured_on_the_decoded_artifact_not_on_the_parameters_it_came_from() {
-        // P11: (2/C) v(t_c) v(t_c)^T at t_c = c·pi/C sums to I_2 on RP1.
+        // (2/C) v(t_c) v(t_c)^T at t_c = c·pi/C sums to I_2.
         let angles: Vec<f64> = (0..3).map(|component| f64::from(component) * PI / 3.0).collect();
         let identity = [1.0, 0.0, 0.0, 1.0];
-        let tolerance = 0.1;
-        let quotient = PeriodicQuotient::new(PI).expect("the RP1 period is admissible");
+        let tolerance = 0.05;
         let evaluate = |decoded: &Vec<f64>| Ok::<[f64; 4], String>(projector_sum(decoded));
 
         // Positive control: the parameters before coding reproduce the identity, so an
@@ -1028,10 +686,11 @@ mod tests {
             projector_evidence(&projector_sum(&angles), &identity).expect("undecoded evidence");
         assert!(undecoded.certifies_at_most(tolerance), "{undecoded:?}");
 
-        // At 2 bits the decoded angles are 0, pi/4 and 3pi/4, whose projector sum
-        // misses the identity by sqrt(2)/3.
-        let coarse = QuotientCode::encode(&angles, quotient, 2).expect("angles encode");
-        assert_eq!(coarse.indices(), &[0_u64, 1, 3]);
+        // At step 1/2 the decoded angles are 0, 1 and 2, whose projector sum misses the
+        // identity by about 0.079.
+        let coarse = LatticeCode::encode(&angles, DeclaredPrecision::new(1).expect("precision"))
+            .expect("angles encode");
+        assert_eq!(coarse.indices(), &[0_i64, 2, 4]);
         let coarse_fidelity =
             decode_then_evaluate(&coarse, evaluate, &identity, projector_evidence, tolerance)
                 .expect("the coarse artifact evaluates");
@@ -1042,7 +701,8 @@ mod tests {
             coarse_fidelity.status()
         );
 
-        let fine = QuotientCode::encode(&angles, quotient, 20).expect("angles encode");
+        let fine = LatticeCode::encode(&angles, DeclaredPrecision::new(20).expect("precision"))
+            .expect("angles encode");
         let fine_fidelity =
             decode_then_evaluate(&fine, evaluate, &identity, projector_evidence, tolerance)
                 .expect("the fine artifact evaluates");
@@ -1201,41 +861,6 @@ mod tests {
         assert!(refusal.contains("remain"), "{refusal}");
     }
 
-    #[test]
-    fn quotient_message_is_its_header_plus_exactly_its_index_bits() {
-        let quotient = PeriodicQuotient::new(PI).expect("the RP1 period is admissible");
-        let labels = [0.0, 1.0, 2.5, -1.0];
-        for resolution_bits in [1, 10, 50] {
-            let code = QuotientCode::encode(&labels, quotient, resolution_bits).expect("labels encode");
-            let mut message = BitString::new();
-            code.write(&mut message).expect("a quotient code writes");
-            let header =
-                prefix_bits(labels.len() as u64 + 1) + prefix_bits(u64::from(resolution_bits) + 1);
-            assert_eq!(message.len_bits(), header + code.index_bits());
-            let mut reader = message.reader();
-            let decoded = QuotientCode::read(&mut reader, quotient).expect("the message reads back");
-            assert!(reader.finish().is_ok());
-            assert_eq!(decoded, code);
-        }
-
-        // Count guard at b = 10: 30 payload bits hold three indices, 29 do not.
-        for (payload_bits, admitted) in [(30, true), (29, false)] {
-            let mut message = BitString::new();
-            encode_prefix_integer(&mut message, 3 + 1).expect("count codeword");
-            encode_prefix_integer(&mut message, 10 + 1).expect("resolution codeword");
-            message.push_bits(0, payload_bits).expect("payload bits");
-            assert_eq!(QuotientCode::read(&mut message.reader(), quotient).is_ok(), admitted);
-        }
-
-        // A 0-bit resolution header is refused, while the smallest resolved one reads.
-        for (resolution_bits, admitted) in [(0_u64, false), (1, true)] {
-            let mut message = BitString::new();
-            encode_prefix_integer(&mut message, 1 + 1).expect("count codeword");
-            encode_prefix_integer(&mut message, resolution_bits + 1).expect("resolution codeword");
-            message.push_bits(0, 1).expect("one payload bit");
-            assert_eq!(QuotientCode::read(&mut message.reader(), quotient).is_ok(), admitted);
-        }
-    }
     #[test]
     fn paired_fidelity_decodes_once_and_validates_both_tolerances_first() {
         struct Counted(std::cell::Cell<usize>);
