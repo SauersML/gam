@@ -861,6 +861,22 @@ impl Posterior {
     }
 
 
+    /// A weight sample `μ + σ ⊙ ε` (zero in removed groups) and its noise `ε`, drawn from `seed`.
+    fn sample(&self, seed: u64) -> (Vec<Array2<f64>>, Vec<Array2<f64>>) {
+        (0..self.mean.len())
+            .into_par_iter()
+            .map(|i| {
+                let mut rng = StdRng::seed_from_u64(seed ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let noise = standard_normal(&mut rng, self.mean[i].dim());
+                let mut theta = self.mean[i].clone();
+                ndarray::Zip::from(&mut theta).and(&noise).and(&self.log_sd[i]).and(&self.membership[i]).for_each(|t, e, s, g| {
+                    *t = if self.active[*g as usize] { *t + s.exp() * e } else { 0.0 };
+                });
+                (theta, noise)
+            })
+            .unzip()
+    }
+
     /// The posterior means with every removed group zeroed.
     pub fn means(&self) -> Vec<Array2<f64>> {
         self.mean
@@ -893,6 +909,21 @@ impl Posterior {
             });
         });
     }
+}
+
+/// Standard normal draws (Box–Muller) of shape `dim`.
+fn standard_normal(rng: &mut StdRng, dim: (usize, usize)) -> Array2<f64> {
+    let n = dim.0 * dim.1;
+    let mut values = Vec::with_capacity(n + 1);
+    while values.len() < n {
+        let u = 1.0 - rng.random::<f64>();
+        let angle = std::f64::consts::TAU * rng.random::<f64>();
+        let radius = (-2.0 * u.ln()).sqrt();
+        values.push(radius * angle.cos());
+        values.push(radius * angle.sin());
+    }
+    values.truncate(n);
+    Array2::from_shape_vec(dim, values).expect("shape of the drawn values")
 }
 
 // ------------------------------------------------------------------------------------- the fit
@@ -2144,10 +2175,10 @@ pub fn fit(
         if converged {
             let log = checkpoint.map(|path| path.with_extension("removals.jsonl"));
             let evidence = Evidence { draws: &draws, sequences, settings };
-            let removal = remove(&mut scorer, &mut device_posterior, &mut posterior, &evidence, explanation, prior.as_deref_mut(), Search::Ranked, log.as_deref())?;
+            let removal = remove(&mut scorer, &mut posterior, &evidence, explanation, prior.as_deref_mut(), Search::Ranked, log.as_deref())?;
             log::info!("library removal after epoch {epoch}: {} of {} candidates, {} without effect", removal.removed, removal.candidates, removal.dead);
             // The removed groups' entries are exactly zero with `ln σ = −∞`, which the device step
-            // leaves alone; the objective left its last trial on the device.
+            // leaves alone.
             device_posterior.set_values(&posterior)?;
             progress.done = removal.removed == 0;
             progress.removals.push(removal);
@@ -2212,7 +2243,6 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &Posterior, draws: &[Draw],
 /// `prior`, plus its value at each batch's sample, averaged, and the parameters it sends.
 fn expected_divergence(
     scorer: &mut Scorer,
-    device_posterior: &mut DevicePosterior,
     posterior: &Posterior,
     draws: &[Draw],
     sequences: &[Vec<u32>],
@@ -2222,19 +2252,18 @@ fn expected_divergence(
 ) -> Result<f64, String> {
     let mut trial = posterior.clone();
     trial.remove(removed);
-    // The trial goes to the device once; each batch's weight sample is drawn there.
-    device_posterior.set_values(&trial)?;
     let mut prior = prior;
     let (mut bits, mut prior_nats) = (0.0, 0.0);
     for (b, draw) in draws.iter().enumerate() {
         // Removal zeroes entries, so the remaining entries see the same noise as the full posterior.
-        let key = noise_seed(settings.seed, 0, b);
+        let (theta, _) = trial.sample(noise_seed(settings.seed, 0, b));
         let experiments = scorer.experiments(draw, sequences)?;
         scorer.prefetch(&draws[(b + 1) % draws.len()], sequences)?;
-        let scored = scorer.score_device(device_posterior, &draw.batch(sequences)?, &experiments, Some(key), &format!("train_{b}"), false)?.0;
+        let (scored, _) = scorer.score(&draw.batch(sequences)?, &experiments, &theta, &format!("train_{b}"), false)?;
         bits += scored.iter().flatten().sum::<f64>();
         if let Some(prior) = prior.as_deref_mut() {
-            prior_nats += prior.sample(&trial, &host_sample(&trial, &prior.operators(), key), false)?.0;
+            let sample: BTreeMap<usize, Array2<f64>> = prior.operators().into_iter().map(|i| (i, theta[i].clone())).collect();
+            prior_nats += prior.sample(&trial, &sample, false)?.0;
         }
     }
     let cost = prior.as_deref().map_or(Ok(0.0), |p| p.cost(&trial))?;
@@ -2254,7 +2283,6 @@ struct Evidence<'a> {
 /// logged to `log`.
 fn remove(
     scorer: &mut Scorer,
-    device_posterior: &mut DevicePosterior,
     posterior: &mut Posterior,
     evidence: &Evidence,
     explanation: &Explanation,
@@ -2267,7 +2295,7 @@ fn remove(
     let compensation = Compensation::new(&mut scorer.experiments, explanation, posterior, sequences, settings.batch_sequences)?;
     let curvature = removal_curvature(scorer, posterior, draws, sequences, settings)?;
     let mut objective = |trial: &Posterior| -> Result<f64, String> {
-        Ok(expected_divergence(scorer, device_posterior, trial, draws, sequences, &[], settings, prior.as_deref_mut())? + trial.description() + fixed)
+        Ok(expected_divergence(scorer, trial, draws, sequences, &[], settings, prior.as_deref_mut())? + trial.description() + fixed)
     };
     library_removal::round(search, explanation, posterior, Some(&compensation), &curvature, &mut objective, log)
 }
@@ -2301,8 +2329,7 @@ pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Exp
     };
     let before = evaluate(&mut scorer, posterior)?;
     let evidence = Evidence { draws: &draws, sequences, settings };
-    let mut device_posterior = DevicePosterior::new(device, explanation, posterior, tokens as f64, None, 0)?;
-    let removal = remove(&mut scorer, &mut device_posterior, posterior, &evidence, explanation, None, search, log)?;
+    let removal = remove(&mut scorer, posterior, &evidence, explanation, None, search, log)?;
     let after = evaluate(&mut scorer, posterior)?;
     Ok((removal, before, after))
 }
@@ -2347,12 +2374,6 @@ mod tests {
         import::import_language_model,
         run_check::{layer_nodes, split_sites},
     };
-
-    /// The weight sample of `key` of every trainable operator of `posterior` (the device's draws,
-    /// `DevicePosterior::sample_into`), on the host.
-    fn sample(posterior: &Posterior, key: u64) -> Vec<Array2<f64>> {
-        host_sample(posterior, &(0..posterior.mean.len()).collect::<Vec<_>>(), key).into_values().collect()
-    }
 
     /// The derivatives in `μ` and in `ln σ` of `data(θ) + Σ_G KL_G`, per trainable operator, from
     /// `data`'s gradient at the sample `θ = μ + σ ⊙ noise` (zero in removed groups); the host
@@ -2612,7 +2633,7 @@ mod tests {
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
-        let theta = sample(&posterior, noise_seed(settings.seed, 0, 0));
+        let (theta, _) = posterior.sample(noise_seed(settings.seed, 0, 0));
         let (_, gradients) = scorer.score(&batch, &experiments, &theta, "gradient", true).unwrap();
         let at = |name: &str| explanation.trainable.iter().position(|op| explanation.artifact.program.operators[*op].name == name).unwrap();
         let (gate, scale) = (at("library.l1.mlp.gate"), at("library.l0.mlp.tie1.f3.scale"));
@@ -2641,7 +2662,7 @@ mod tests {
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
-        let theta = sample(&posterior, noise_seed(settings.seed, 0, 0));
+        let (theta, _) = posterior.sample(noise_seed(settings.seed, 0, 0));
         let (_, gradients) = scorer.score(&batch, &experiments, &theta, "gradient", true).unwrap();
         let at = |name: &str| explanation.trainable.iter().position(|op| explanation.artifact.program.operators[*op].name == name).unwrap();
         let (gate, out) = (at("library.l0.mlp.gate"), at("library.l0.mlp.out"));
@@ -2672,7 +2693,7 @@ mod tests {
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
-        let theta = sample(&posterior, noise_seed(settings.seed, 0, 0));
+        let (theta, _) = posterior.sample(noise_seed(settings.seed, 0, 0));
         let (_, gradients) = scorer.score(&batch, &experiments, &theta, "gradient", true).unwrap();
         let at = |name: &str| explanation.trainable.iter().position(|op| explanation.artifact.program.operators[*op].name == name).unwrap();
         let entries = [
@@ -2704,7 +2725,7 @@ mod tests {
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
-        let theta = sample(&posterior, noise_seed(settings.seed, 0, 0));
+        let (theta, _) = posterior.sample(noise_seed(settings.seed, 0, 0));
         let (_, gradients) = scorer.score(&batch, &experiments, &theta, "gradient", true).unwrap();
         let (k, _) = key_value(&explanation.artifact.program, 1, 0);
         let i = explanation.trainable.iter().position(|op| *op == k).unwrap();
@@ -2845,7 +2866,7 @@ mod tests {
             let batch = draw.batch(&sequences).unwrap();
             let experiments = scorer.experiments(draw, &sequences).unwrap();
             read_patches += experiments.iter().filter(|e| matches!(e.patch, Some(Patch::Read { .. }))).count();
-            let theta = sample(&trial, noise_seed(settings.seed, 0, b));
+            let (theta, _) = trial.sample(noise_seed(settings.seed, 0, b));
             let design = scorer.experiments.design_at(&variables, &experiments, &start).unwrap();
             let targets = scorer.experiments.targets(&batch, &experiments, &design).unwrap();
             scorer.experiments.load(&theta).unwrap();
@@ -2853,8 +2874,7 @@ mod tests {
             reference_bits += reference.bits.iter().flatten().sum::<f64>();
         }
         assert!(read_patches > 0, "the collection must hold read patches of removed functions");
-        let mut device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 1.0, None, 0).unwrap();
-        let actual = expected_divergence(&mut scorer, &mut device_posterior, &posterior, &draws, &sequences, &removed, &settings, None).unwrap();
+        let actual = expected_divergence(&mut scorer, &posterior, &draws, &sequences, &removed, &settings, None).unwrap();
         let reference = reference_bits * LN_2;
         assert!((actual - reference).abs() < 1e-10 * reference.abs().max(1.0), "removal must score the fixed collection");
     }

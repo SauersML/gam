@@ -38,7 +38,7 @@ alternately from the two lists by rank, in a seeded random order. The measured p
 distribution renormalized over them. So a test asks how the arm moves probability among the tokens
 either the model or the arm favours.
 
-  episodes.py new --target TARGET.json --investigator NAME --model MODEL [--episode ID]   (prints the path)
+  episodes.py new --target TARGET.json --investigator NAME --model MODEL [--episode ID] [--root DIR]  (prints the path)
   episodes.py freeze --episode EP.json --report REPORT.json
   episodes.py tests --episode EP.json --server ADDRESS --count N --candidates-per-side M
   episodes.py score --episode EP.json --reader ADDRESS --documents report|transcript|none|ablated:KIND [--ablations FILE]
@@ -78,12 +78,12 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def path_of(episode: dict) -> Path:
-    return ROOT / episode["target"]["id"] / f"{episode['episode']}.json"
+def path_of(episode: dict, root: Path = ROOT) -> Path:
+    return Path(root) / episode["target"]["id"] / f"{episode['episode']}.json"
 
 
-def save(episode: dict, path: Path | None = None) -> Path:
-    path = Path(path) if path is not None else path_of(episode)
+def save(episode: dict, path: Path | None = None, root: Path = ROOT) -> Path:
+    path = Path(path) if path is not None else path_of(episode, root)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(f".tmp{os.getpid()}")
     tmp.write_text(json.dumps(episode, indent=1))
@@ -476,6 +476,8 @@ def documents_for(episode: dict, condition: str, ablations: dict[str, str] | Non
 
 
 def reader_tests(episode: dict, documents: list[str], tests: list[dict] | None = None) -> list[dict]:
+    if not (episode["tests"] if tests is None else tests):
+        raise ValueError(f"episode {episode['episode']} has no tests")
     return [
         {"id": t["id"], "documents": documents, "context": t["context"]["text"], "intervention": t["intervention_text"], "options": t["options"], "p": t["measured"]["p"]}
         for t in (episode["tests"] if tests is None else tests)
@@ -566,6 +568,7 @@ def main():
     a.add_argument("--investigator", required=True)
     a.add_argument("--model", required=True)
     a.add_argument("--episode")
+    a.add_argument("--root", default=str(ROOT))
     a = sub.add_parser("freeze")
     a.add_argument("--episode", required=True)
     a.add_argument("--report", required=True)
@@ -586,7 +589,7 @@ def main():
     if args.command == "new":
         target = json.loads(Path(args.target).read_text())
         episode = new_episode(target, args.investigator, args.model, args.episode)
-        print(save(episode))
+        print(save(episode, root=Path(args.root)))
         return
     episode = load(args.episode)
     if args.command == "freeze":
