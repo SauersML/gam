@@ -1,0 +1,224 @@
+{
+  "source_commit": "a20e541325",
+  "binary_sha256": "c834d16e6ddd900da294010401d1530bdf874b4a689c18fa76e889d30f13dd99",
+  "seconds": 480.83643525,
+  "records": 640,
+  "heads_selected_on_discovery": true,
+  "delta_source": "opposite discovery fold",
+  "scope": "Native background retained, query-law family supplied; no lexical heldout or parameter edits. Four selected heads rarely directly read color-value tokens. Native role/retrieval construction unestablished.",
+  "groups": [
+    {
+      "read_nodes": [
+        205
+      ],
+      "mode": "zero",
+      "cases": 32,
+      "mean_kl": 0.0007811076573294752,
+      "max_kl": 0.006633479354963822,
+      "answer_odds_mae": 0.051044824265225164
+    },
+    {
+      "read_nodes": [
+        205
+      ],
+      "mode": "fitted",
+      "cases": 32,
+      "mean_kl": 7.249786547139128e-08,
+      "max_kl": 2.781202047750615e-07,
+      "answer_odds_mae": 0.0004076903261006626
+    },
+    {
+      "read_nodes": [
+        205
+      ],
+      "mode": "mean_native_delta",
+      "cases": 32,
+      "mean_kl": 3.421321159194123e-07,
+      "max_kl": 3.315018929323766e-06,
+      "answer_odds_mae": 0.0010609948349120657
+    },
+    {
+      "read_nodes": [
+        205
+      ],
+      "mode": "oracle_identity",
+      "cases": 32,
+      "mean_kl": 0.0,
+      "max_kl": 0.0,
+      "answer_odds_mae": 0.0
+    },
+    {
+      "read_nodes": [
+        295
+      ],
+      "mode": "zero",
+      "cases": 32,
+      "mean_kl": 0.0001000763792443941,
+      "max_kl": 0.0005907341649144139,
+      "answer_odds_mae": 0.011245763180583568
+    },
+    {
+      "read_nodes": [
+        295
+      ],
+      "mode": "fitted",
+      "cases": 32,
+      "mean_kl": 2.6223187073381396e-07,
+      "max_kl": 1.4872273280301761e-06,
+      "answer_odds_mae": 0.0008319931990253826
+    },
+    {
+      "read_nodes": [
+        295
+      ],
+      "mode": "mean_native_delta",
+      "cases": 32,
+      "mean_kl": 1.042324428221254e-06,
+      "max_kl": 2.934375709228976e-06,
+      "answer_odds_mae": 0.002065612595194999
+    },
+    {
+      "read_nodes": [
+        295
+      ],
+      "mode": "oracle_identity",
+      "cases": 32,
+      "mean_kl": 0.0,
+      "max_kl": 0.0,
+      "answer_odds_mae": 0.0
+    },
+    {
+      "read_nodes": [
+        703
+      ],
+      "mode": "zero",
+      "cases": 32,
+      "mean_kl": 0.0023823049970440246,
+      "max_kl": 0.011384800603081334,
+      "answer_odds_mae": 0.07700241907336824
+    },
+    {
+      "read_nodes": [
+        703
+      ],
+      "mode": "fitted",
+      "cases": 32,
+      "mean_kl": 4.2236256451960416e-05,
+      "max_kl": 0.00029776054845155766,
+      "answer_odds_mae": 0.007219716145655086
+    },
+    {
+      "read_nodes": [
+        703
+      ],
+      "mode": "mean_native_delta",
+      "cases": 32,
+      "mean_kl": 0.00016658420832954746,
+      "max_kl": 0.002138503866647101,
+      "answer_odds_mae": 0.013207563390820187
+    },
+    {
+      "read_nodes": [
+        703
+      ],
+      "mode": "oracle_identity",
+      "cases": 32,
+      "mean_kl": 0.0,
+      "max_kl": 0.0,
+      "answer_odds_mae": 0.0
+    },
+    {
+      "read_nodes": [
+        1213
+      ],
+      "mode": "zero",
+      "cases": 32,
+      "mean_kl": 0.0009806486867636275,
+      "max_kl": 0.005096063102929051,
+      "answer_odds_mae": 0.07185647523715699
+    },
+    {
+      "read_nodes": [
+        1213
+      ],
+      "mode": "fitted",
+      "cases": 32,
+      "mean_kl": 7.084911751386822e-05,
+      "max_kl": 0.0006041067083603003,
+      "answer_odds_mae": 0.010679740995361287
+    },
+    {
+      "read_nodes": [
+        1213
+      ],
+      "mode": "mean_native_delta",
+      "cases": 32,
+      "mean_kl": 3.1941407193613915e-05,
+      "max_kl": 0.00027478035663386667,
+      "answer_odds_mae": 0.005212323901807481
+    },
+    {
+      "read_nodes": [
+        1213
+      ],
+      "mode": "oracle_identity",
+      "cases": 32,
+      "mean_kl": 0.0,
+      "max_kl": 0.0,
+      "answer_odds_mae": 0.0
+    },
+    {
+      "read_nodes": [
+        205,
+        295,
+        703,
+        1213
+      ],
+      "mode": "zero",
+      "cases": 32,
+      "mean_kl": 0.002902362475532265,
+      "max_kl": 0.011113824191388063,
+      "answer_odds_mae": 0.08651150503909144
+    },
+    {
+      "read_nodes": [
+        205,
+        295,
+        703,
+        1213
+      ],
+      "mode": "fitted",
+      "cases": 32,
+      "mean_kl": 7.587604364628475e-05,
+      "max_kl": 0.000450034978562882,
+      "answer_odds_mae": 0.01308695947548244
+    },
+    {
+      "read_nodes": [
+        205,
+        295,
+        703,
+        1213
+      ],
+      "mode": "mean_native_delta",
+      "cases": 32,
+      "mean_kl": 0.00020892976498083972,
+      "max_kl": 0.002881470746979499,
+      "answer_odds_mae": 0.01773190586347817
+    },
+    {
+      "read_nodes": [
+        205,
+        295,
+        703,
+        1213
+      ],
+      "mode": "oracle_identity",
+      "cases": 32,
+      "mean_kl": 0.0,
+      "max_kl": 0.0,
+      "answer_odds_mae": 0.0
+    }
+  ],
+  "individual_counterexample": "Read1213 (layer11 head2) fitted meanKL7.08e-5 is worse than mean-native-delta3.19e-5; joint improvement is not universal per-head improvement."
+}

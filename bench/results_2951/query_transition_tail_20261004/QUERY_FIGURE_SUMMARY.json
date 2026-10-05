@@ -1,0 +1,19 @@
+{
+  "conditional_attention_mean_kl": {
+    "zero": 0.3724827748215677,
+    "mean_native_delta": 0.041684164507019096,
+    "fitted": 0.019669065190011232
+  },
+  "joint_full_vocabulary_mean_kl": {
+    "zero": 0.0029023624755322654,
+    "mean_native_delta": 0.0002089297649808397,
+    "fitted": 7.587604364628475e-05
+  },
+  "joint_answer_effect_mae": {
+    "zero": 0.08651150503909144,
+    "mean_native_delta": 0.01773190586347817,
+    "fitted": 0.01308695947548244
+  },
+  "joint_observed_query_effect_mean_absolute": 0.08651150503909144,
+  "scope": "32 discovery pairs, opposite-fold deltas, four discovery-selected heads; retained native background; no heldout or parameter edits."
+}
