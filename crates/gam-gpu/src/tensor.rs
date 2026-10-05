@@ -4144,11 +4144,13 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
     /// head width.
     const KERNELS_ATTENTION: &str = include_str!("attention.cu");
 
-    /// A forward attention block's warps (16 query rows each) and the key rows it takes at a time.
-    const ATTENTION_FORWARD: (usize, usize) = (4, 64);
+    /// An attention block of query rows (the forward, the queries' cotangents): its warps (16 rows
+    /// each) and the key rows it takes at a time.
+    const ATTENTION_ROWS: (usize, usize) = (4, 64);
 
-    /// A reverse attention block's threads, the query rows and the key rows it takes at a time.
-    const ATTENTION_BACKWARD: (usize, usize, usize) = (256, 64, 64);
+    /// An attention block of key rows (the keys' and values' cotangents): its warps (16 keys each)
+    /// and the query rows it takes at a time.
+    const ATTENTION_KEYS: (usize, usize) = (8, 32);
 
     /// The sequences one attention launch takes (they are passed by value: a kernel's parameters
     /// hold 4 KB).
@@ -4992,11 +4994,10 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         /// on first use per device and width, allowed `shared` bytes of dynamic shared memory.
         fn attention_kernel(&self, width: usize, name: &'static str, shared: usize) -> Result<CudaFunction, GpuError> {
             static MODULES: std::sync::OnceLock<crate::device_cache::KeyedPtxModuleCache<usize>> = std::sync::OnceLock::new();
-            let ((warps, keys), (threads, rows, block_keys)) = (ATTENTION_FORWARD, ATTENTION_BACKWARD);
+            let ((rows_warps, rows_keys), (keys_warps, keys_rows)) = (ATTENTION_ROWS, ATTENTION_KEYS);
             let source = |_| {
                 format!(
-                    "#define HEAD_W {width}\n#define FWD_WARPS {warps}\n#define FWD_KEYS {keys}\n#define BWD_WARPS {}\n#define BWD_ROWS {rows}\n#define BWD_KEYS {block_keys}\n#define MAX_SEQUENCES {ATTENTION_SEQUENCES}\n{KERNELS_ATTENTION}",
-                    threads / 32
+                    "#define HEAD_W {width}\n#define ROWS_WARPS {rows_warps}\n#define ROWS_KEYS {rows_keys}\n#define KEYS_WARPS {keys_warps}\n#define KEYS_ROWS {keys_rows}\n#define MAX_SEQUENCES {ATTENTION_SEQUENCES}\n{KERNELS_ATTENTION}"
                 )
             };
             let module = MODULES.get_or_init(crate::device_cache::KeyedPtxModuleCache::new).get_or_compile(&self.ctx, (self.ctx.ordinal() << 16) | width, "attention", source)?;
@@ -5009,7 +5010,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         pub(super) fn causal_attention(&self, y: &Tensor, layout: super::HeadLayout, sequences: &[std::ops::Range<usize>], scale: f64) -> Result<(Tensor, Tensor), GpuError> {
             let Data::CudaBf16(yh) = &y.data else { return Err(mismatch(&y.data)) };
             let (w, padded) = (layout.width, attention_width(layout.width)?);
-            let (warps, keys) = ATTENTION_FORWARD;
+            let (warps, keys) = ATTENTION_ROWS;
             let shared = (16 * warps + 2 * keys) * padded * 2;
             let f = self.attention_kernel(w, "attention_forward", shared)?;
             // Rows outside every sequence keep zeros.
@@ -5036,12 +5037,12 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             // D = Σ dO·O per row and query head, and dO as the products' bfloat16 operand.
             let mut ga16 = self.unset16(rows, layout.queries * w)?;
             let mut dsum = self.unset32(rows, layout.queries)?;
-            let rows_kernel = self.attention_kernel(w, "attention_backward_rows", 0)?;
+            let sums = self.attention_kernel(w, "attention_backward_sums", 0)?;
             let (n, hq, hk) = (u32_of(rows)?, u32_of(layout.queries)?, u32_of(layout.keys)?);
             // SAFETY: rows × hq·w outputs and cotangents, rows × hq sums; one warp per (row, head).
             unsafe {
                 self.stream
-                    .launch_builder(&rows_kernel)
+                    .launch_builder(&sums)
                     .arg(&n)
                     .arg(&hq)
                     .arg(outh)
@@ -5053,25 +5054,31 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                     .arg(slice32_mut(&mut dsum)?)
                     .launch(cfg_elements((rows * layout.queries) as u64 * 32))
             }
-            .gpu_ctx("attention backward rows")?;
+            .gpu_ctx("attention backward sums")?;
             let Data::CudaBf16(ga16h) = &ga16.data else { return Err(mismatch(&ga16.data)) };
-            let (threads, block_rows, keys) = ATTENTION_BACKWARD;
-            let shared = (2 * keys + 3 * block_rows) * padded * 2 + 2 * block_rows * keys * 2;
-            let f = self.attention_kernel(w, "attention_backward", shared)?;
-            let mut gy = self.zeros32(rows * columns)?;
+            let ((rows_warps, rows_keys), (keys_warps, keys_rows)) = (ATTENTION_ROWS, ATTENTION_KEYS);
+            let keys_shared = (2 * 16 * keys_warps + 4 * keys_rows) * padded * 2;
+            let rows_shared = (2 * 16 * rows_warps + 4 * rows_keys) * padded * 2;
+            let (keys_kernel, rows_kernel) = (self.attention_kernel(w, "attention_backward_keys", keys_shared)?, self.attention_kernel(w, "attention_backward_queries", rows_shared)?);
+            // The two passes write every row of the sequences; rows outside them keep zeros.
+            let covered: usize = sequences.iter().map(ExactSizeIterator::len).sum();
+            let mut gy = if covered == rows { self.unset32(rows, columns)? } else { Tensor { rows, cols: columns, data: Data::Cuda32(self.zeros32(rows * columns)?) } };
             let scale32 = scale as f32;
             for chunk in sequences.chunks(ATTENTION_SEQUENCES) {
-                let (table, tiles) = attention_sequences(chunk, keys)?;
-                if tiles == 0 {
-                    continue;
+                for (f, heads, threads, tile, shared, what) in
+                    [(&keys_kernel, layout.keys, 32 * keys_warps, 16 * keys_warps, keys_shared, "attention backward keys"), (&rows_kernel, layout.queries, 32 * rows_warps, 16 * rows_warps, rows_shared, "attention backward queries")]
+                {
+                    let (table, tiles) = attention_sequences(chunk, tile)?;
+                    if tiles == 0 {
+                        continue;
+                    }
+                    let cfg = LaunchConfig { grid_dim: (u32_of(chunk.len() * heads)?, tiles, 1), block_dim: (u32_of(threads)?, 1, 1), shared_mem_bytes: u32_of(shared)? };
+                    // SAFETY: as the forward; the keys' pass writes its key rows' key and value columns,
+                    // the queries' pass its query rows' query columns.
+                    unsafe { self.stream.launch_builder(f).arg(&table).arg(&hq).arg(&hk).arg(&scale32).arg(yh).arg(slice32(lse)?).arg(ga16h).arg(slice32(&dsum)?).arg(slice32_mut(&mut gy)?).launch(cfg) }.gpu_ctx(what)?;
                 }
-                let cfg = LaunchConfig { grid_dim: (u32_of(chunk.len() * layout.keys)?, tiles, 1), block_dim: (u32_of(threads)?, 1, 1), shared_mem_bytes: u32_of(shared)? };
-                // SAFETY: as the forward; each block writes its own key rows' key and value columns and
-                // adds into its query rows' query columns atomically.
-                unsafe { self.stream.launch_builder(&f).arg(&table).arg(&hq).arg(&hk).arg(&scale32).arg(yh).arg(slice32(lse)?).arg(ga16h).arg(slice32(&dsum)?).arg(&mut gy).launch(cfg) }
-                    .gpu_ctx("attention backward")?;
             }
-            Ok(Tensor { rows, cols: columns, data: Data::Cuda32(gy) })
+            Ok(gy)
         }
 
         pub(super) fn swiglu(&self, h: &Tensor) -> Result<Tensor, GpuError> {
