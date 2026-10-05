@@ -374,48 +374,53 @@ def complement_every_block(runner: Runner, bases: Tensor, sources: Tensor) -> di
 
 @torch.no_grad()
 def cancellation(runner: Runner, bases: Tensor) -> dict:
-    """Why VPD's layer errors cancel (CI masks, delta excluded). Layer l's dropped part on a stream
-    x entering it is c_l(x) = M's layer increment minus the masked layer's increment. Per pair
-    (l, 3), per token: (i) the cosine at the final residual between D_l and D_3, the deviations from
-    masking layer l alone and layer 3 alone; (ii) r = |c_3(x without c_l) - c_3(x)| / |c_3(x)|, with
-    x without c_l the stream entering layer 3 when layer l alone is masked, and the cosine between
-    that change of c_3 and -D_l."""
+    """Why removing VPD's CI-0 subcomponents from layer 3 as well shrinks the error of removing them
+    from an earlier layer l, with the CI and the rounded masks (delta excluded). Per token, at the
+    final residual: D_l = final(l masked) - final(M), D_3 likewise; c_3(x) = M's layer 3 on stream x
+    minus masked layer 3 on x (what masking removes); I_l = c_3(x_l) - c_3(x), x_l the stream entering
+    layer 3 with l masked and x M's. Exactly, final(l and 3 masked) - final(M) = D_l + D_3 - I_l. The
+    intervention "no interaction" holds layer 3's removed part at its value on M's stream,
+    final(M) + D_l + D_3; "l without I_l" is final(M) + D_l - I_l. KL in nats per token."""
     vpd, t = runner.vpd, runner.t
     L = t.n_layer
-    zero = lambda g: {n: torch.zeros(v.shape[:-1], device=DEVICE) for n, v in g.items()}
     cos = lambda a, b: (a * b).sum(-1) / (a.norm(dim=-1) * b.norm(dim=-1)).clamp(min=1e-30)
-    out = {l: {"cos_D": [], "r": [], "cos_change_minus_D": [], "cos_c3_D": []} for l in range(L - 1)}
+    out = {kind: {} for kind in ("ci", "rounded")}
     for b0 in range(0, bases.shape[0], MB):
         b = bases[b0:b0 + MB].to(DEVICE)
-        _, g = vpd.target_and_ci(b)
-        z = zero(g)
+        target, ci = vpd.target_and_ci(b)
+        z = {n: torch.zeros(v.shape[:-1], device=DEVICE) for n, v in ci.items()}
+        for kind, g in (("ci", ci), ("rounded", {n: (v > 0).float() for n, v in ci.items()})):
+            add = lambda k, v: out[kind].setdefault(k, []).append(v.cpu())
 
-        def run(masked: set[int]):
-            x = t.wte[b]
-            entering = None
-            for i in range(L):
-                if i == L - 1:
-                    entering = x
-                x = runner.layer(x, i, g if i in masked else None, z)
-            return x, entering
+            def run(masked: set[int]):
+                x, entering = t.wte[b], None
+                for i in range(L):
+                    if i == L - 1:
+                        entering = x
+                    x = runner.layer(x, i, g if i in masked else None, z)
+                return x, entering
 
-        def dropped(x):
-            return runner.layer(x, L - 1, None, None) - runner.layer(x, L - 1, g, z)
-
-        m_final, m_entering = run(set())
-        d3 = run({L - 1})[0] - m_final
-        c3 = dropped(m_entering)
-        for l in range(L - 1):
-            final_l, entering_l = run({l})
-            dl = final_l - m_final
-            change = dropped(entering_l) - c3
-            out[l]["cos_D"].append(cos(dl, d3))
-            out[l]["r"].append(change.norm(dim=-1) / c3.norm(dim=-1).clamp(min=1e-30))
-            out[l]["cos_change_minus_D"].append(cos(change, -dl))
-            out[l]["cos_c3_D"].append(cos(c3, dl))
-        del g, z
+            removed = lambda x: runner.layer(x, L - 1, None, None) - runner.layer(x, L - 1, g, z)
+            kl = lambda x: kl_tokens(runner.logits(x), target)
+            m_final, m_entering = run(set())
+            f3 = run({L - 1})[0]
+            d3, c3 = f3 - m_final, removed(m_entering)
+            add(f"kl_{L - 1}", kl(f3))
+            add(f"norm_D{L - 1}", d3.norm(dim=-1))
+            for l in range(L - 1):
+                fl, entering_l = run({l})
+                dl, inter = fl - m_final, removed(entering_l) - c3
+                add(f"kl_{l}", kl(fl))
+                add(f"kl_{l}{L - 1}", kl(run({l, L - 1})[0]))
+                add(f"kl_{l}{L - 1}_no_interaction", kl(m_final + dl + d3))
+                add(f"kl_{l}_without_I", kl(m_final + dl - inter))
+                add(f"norm_D{l}", dl.norm(dim=-1))
+                add(f"norm_I{l}", inter.norm(dim=-1))
+                add(f"cos_I{l}_D{l}", cos(inter, dl))
+                add(f"cos_D{l}_D{L - 1}", cos(dl, d3))
+        del ci, z
         torch.mps.empty_cache()
-    return {f"pair_{l}_{L - 1}": {k: summary(v) for k, v in d.items()} for l, d in out.items()}
+    return {kind: {k: summary(v) for k, v in d.items()} for kind, d in out.items()}
 
 
 def pgd_shared(runner: Runner, ids: Tensor, steps: int, step_size: float = 0.1, seed: int = 0) -> dict:
