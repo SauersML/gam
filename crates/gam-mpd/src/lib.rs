@@ -197,6 +197,11 @@ pub mod native_local_supervision;
 /// Fixed activation and shared-operator controls in ordinary differentiable IR.
 pub mod intervention_program;
 
+// Interchange experiments of causal abstraction on the device: cuts, read and complement patches.
+pub mod interchange;
+#[cfg(test)]
+mod interchange_tests;
+
 /// Declared rank-one native down-weight perturbations as a full augmented program.
 pub mod down_edit_family;
 pub mod native_parameter_edit;

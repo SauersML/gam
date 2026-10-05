@@ -385,6 +385,20 @@ enum Reuse<'a> {
     From(&'a Frozen),
 }
 
+/// The nodes a forward pass runs: those after `entry`'s node, which takes the given value (none
+/// before it runs), up to `end`.
+struct Span {
+    entry: Option<(usize, Tensor)>,
+    end: usize,
+}
+
+impl Span {
+    /// Every node.
+    fn all() -> Self {
+        Self { entry: None, end: usize::MAX }
+    }
+}
+
 /// The rotation tables of `rotary` among a trace's, with its pairing.
 fn turn(rotations: &[(Rotary, Tensor, Tensor)], rotary: Option<Rotary>) -> Result<device_heads::Turn<'_>, String> {
     rotary
@@ -995,7 +1009,7 @@ impl DeviceProgram {
         gated: &[(usize, usize)],
         decide: impl FnMut(usize, &DeviceTrace) -> Result<Tensor, String>,
     ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(Some(family), given, gated, decide, false, Hooks { before: None, edit: false }, |_, _| Ok(()), |_, _| Ok(None), Reuse::Nothing)
+        self.forward_hooks(Some(family), given, gated, decide, false, Hooks { before: None, edit: false }, |_, _| Ok(()), |_, _| Ok(None), Reuse::Nothing, Span::all())
     }
 
     /// Per-node edits on materialized values, preserving exception-before-intervention order:
@@ -1013,7 +1027,7 @@ impl DeviceProgram {
         before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
         edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(Some(family), given, &[], |_, _| Err("no gate".into()), true, Hooks { before: Some(before_at), edit: true }, before, edit, Reuse::Nothing)
+        self.forward_hooks(Some(family), given, &[], |_, _| Err("no gate".into()), true, Hooks { before: Some(before_at), edit: true }, before, edit, Reuse::Nothing, Span::all())
     }
 
     /// [`Self::forward_edited`] with the streamed dense head left unmaterialized.
@@ -1025,7 +1039,22 @@ impl DeviceProgram {
         before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
         edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(Some(family), BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, Hooks { before: Some(before_at), edit: true }, before, edit, Reuse::Nothing)
+        self.forward_hooks(Some(family), BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, Hooks { before: Some(before_at), edit: true }, before, edit, Reuse::Nothing, Span::all())
+    }
+
+    /// [`Self::forward_edited_intermediates`] over a span of nodes: node `entry.0` takes the value
+    /// `entry.1` and no node before it runs (none after it may read one, except token features),
+    /// and no node after `end` runs. `edit` is offered every node that runs. One layer of a model
+    /// thus runs on given rows of the stream entering it (`interchange`).
+    pub fn forward_span(
+        &self,
+        family: &FamilyInputs,
+        entry: Option<(usize, Tensor)>,
+        end: usize,
+        edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
+    ) -> Result<DeviceTrace, String> {
+        let hooks = Hooks { before: None, edit: true };
+        self.forward_hooks(Some(family), BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, hooks, |_, _| Ok(()), edit, Reuse::Nothing, Span { entry, end })
     }
 
     pub fn is_streamed_head(&self, node: usize) -> bool {
@@ -1055,7 +1084,7 @@ impl DeviceProgram {
         let trainable: BTreeSet<usize> = trainable.iter().copied().collect();
         let frozen = self.frozen_nodes(&trainable);
         let batch = self.prepared_batch(family)?;
-        let mut trace = self.forward_hooks(Some(family), given, &[], |_, _| Err("no gate".into()), false, Hooks { before: None, edit: false }, |_, _| Ok(()), |_, _| Ok(None), Reuse::Freeze(&frozen))?;
+        let mut trace = self.forward_hooks(Some(family), given, &[], |_, _| Err("no gate".into()), false, Hooks { before: None, edit: false }, |_, _| Ok(()), |_, _| Ok(None), Reuse::Freeze(&frozen), Span::all())?;
         let mut read = vec![false; self.steps.len()];
         for (index, step) in self.steps.iter().enumerate() {
             if !frozen[index] {
@@ -1084,7 +1113,7 @@ impl DeviceProgram {
                 return Err(format!("device: operator {op} changed since its frozen values were computed"));
             }
         }
-        self.forward_hooks(None, BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, Hooks { before: None, edit: false }, |_, _| Ok(()), |_, _| Ok(None), Reuse::From(frozen))
+        self.forward_hooks(None, BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, Hooks { before: None, edit: false }, |_, _| Ok(()), |_, _| Ok(None), Reuse::From(frozen), Span::all())
     }
 
     fn forward_hooks(
@@ -1098,6 +1127,7 @@ impl DeviceProgram {
         mut before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
         mut edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
         reuse: Reuse<'_>,
+        span: Span,
     ) -> Result<DeviceTrace, String> {
         let d = &self.device;
         for &(amplitude, mask) in gated {
@@ -1115,8 +1145,15 @@ impl DeviceProgram {
             (_, None) => return Err("device: a forward pass without its family".into()),
         };
         let rows = batch.rows;
+        let (entry, mut entered) = match span.entry {
+            Some((node, value)) => (Some(node), Some(value)),
+            None => (None, None),
+        };
+        if entry.is_some_and(|node| node >= self.steps.len() || node >= span.end) {
+            return Err("device: a span's entry is not before its end".into());
+        }
         // Which nodes this pass computes.
-        let computes = |n: usize| match reuse {
+        let computes = |n: usize| n <= span.end && entry.is_none_or(|e| n > e) && match reuse {
             Reuse::Nothing => true,
             Reuse::Freeze(frozen) => frozen[n],
             Reuse::From(frozen) => !frozen.frozen[n],
@@ -1144,6 +1181,17 @@ impl DeviceProgram {
             rotations: Arc::clone(&batch.rotations),
         };
         for (index, step) in self.steps.iter().enumerate() {
+            if Some(index) == entry {
+                let value = entered.take().ok_or("device: a span's entry value")?;
+                if value.dim() != (rows, self.widths[index]) {
+                    return Err(format!("device: a {:?} entry value for node {index} of {rows} x {}", value.dim(), self.widths[index]));
+                }
+                trace.slots[index] = Slot::Value(value);
+                continue;
+            }
+            if index > span.end {
+                break;
+            }
             if !computes(index) {
                 if let Reuse::From(frozen) = reuse
                     && let Some(value) = frozen.values.get(&index)
@@ -1561,7 +1609,7 @@ impl DeviceProgram {
                 }
             }
         }
-        self.reverse_seeds(trace, seeds, keep, arithmetic)
+        self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()))
     }
 
     /// Reverse resident-value expressions from explicitly declared node seeds.
@@ -1578,15 +1626,20 @@ impl DeviceProgram {
         if self.head.operator.is_some() {
             return Err("device: values VJP requires resident-value compilation".into());
         }
-        self.reverse_seeds(trace, seeds, keep, arithmetic)
+        self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()))
     }
 
+    /// The reverse pass from `seeds` down to the lowest node of `keep`; at each node of `edited`,
+    /// `hook` changes its cotangent before the node's own rule reads it (the transpose of a forward
+    /// edit there).
     fn reverse_seeds(
         &self,
         trace: &DeviceTrace,
         seeds: BTreeMap<usize, Tensor>,
         keep: &[usize],
         arithmetic: Arithmetic,
+        edited: &BTreeSet<usize>,
+        hook: &mut dyn FnMut(usize, &mut Tensor) -> Result<(), String>,
     ) -> Result<BTreeMap<usize, Tensor>, String> {
         if keep
             .iter()
@@ -1613,7 +1666,7 @@ impl DeviceProgram {
             .fused
             .iter()
             .enumerate()
-            .map(|(i, f)| f.live && trace.fused.get(i).is_some_and(Option::is_some) && f.heads.members().all(|m| !keep.contains(&m) && !seeds.contains_key(&m)))
+            .map(|(i, f)| f.live && trace.fused.get(i).is_some_and(Option::is_some) && f.heads.members().all(|m| !keep.contains(&m) && !seeds.contains_key(&m) && !edited.contains(&m)))
             .collect();
         let mut g: Vec<Option<Tensor>> = (0..self.steps.len()).map(|_| None).collect();
         for (node, term) in seeds {
@@ -1639,7 +1692,10 @@ impl DeviceProgram {
             Ok(())
         };
         for index in (first..self.steps.len()).rev() {
-            let Some(cot) = g[index].take() else { continue };
+            let Some(mut cot) = g[index].take() else { continue };
+            if edited.contains(&index) {
+                hook(index, &mut cot)?;
+            }
             if index == first {
                 kept.insert(index, cot);
                 break;
@@ -1809,6 +1865,23 @@ impl DeviceProgram {
         trainable: &[usize],
         arithmetic: Arithmetic,
     ) -> Result<(BTreeMap<usize, Tensor>, BTreeMap<usize, Tensor>), String> {
+        self.vjp_values_dense_edited(trace, seeds, keep, trainable, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()))
+    }
+
+    /// [`Self::vjp_values_dense`] of a forward pass whose nodes `edited` were edited: at each,
+    /// `hook` maps the cotangent of the edited value to that of the value the node computed (the
+    /// transpose of the edit) before the node's own rule reads it; the hook keeps any other part
+    /// of the edit's transpose itself (`interchange`).
+    pub fn vjp_values_dense_edited(
+        &self,
+        trace: &DeviceTrace,
+        seeds: BTreeMap<usize, Tensor>,
+        keep: &[usize],
+        trainable: &[usize],
+        arithmetic: Arithmetic,
+        edited: &BTreeSet<usize>,
+        hook: &mut dyn FnMut(usize, &mut Tensor) -> Result<(), String>,
+    ) -> Result<(BTreeMap<usize, Tensor>, BTreeMap<usize, Tensor>), String> {
         if self.head.operator.is_some() {
             return Err("device: dense values VJP requires resident-value compilation".into());
         }
@@ -1850,7 +1923,7 @@ impl DeviceProgram {
                 retained.push(node);
             }
         }
-        let mut nodes = self.reverse_seeds(trace, seeds, &retained, arithmetic)?;
+        let mut nodes = self.reverse_seeds(trace, seeds, &retained, arithmetic, edited, hook)?;
         // One scalar constant is uploaded; all reductions and gradient arrays stay
         // on the device. Reuse the same broadcast across every column occurrence.
         let has_columns = requested.iter().any(|op| self.operators.contains_key(&(*op, Role::Column)));
