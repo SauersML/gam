@@ -40,7 +40,9 @@
 # Other cargo commands (`cargo test -p gam-gpu ...`) run as given in /workspace/src.
 # RP_EXAMPLES="X Y" builds further examples for a script that runs them through $MPD_BIN;
 # RP_DISK_GB=N sets the container disk (default: 30 GB, 60 for a dev pod, plus twice the inputs
-# and models); RP_ENV="K=V ..." adds environment (RUST_LOG is forwarded when set).
+# and models); RP_ENV="K=V ..." adds environment (RUST_LOG is forwarded when set); RP_MIN_RAM_GB=N
+# asks for a pod with at least N GB of host memory (default 32), for a command whose host half
+# needs more (a float64 reference of a large model).
 #
 # Write outputs under /Users/user/mpd-data/runpod/NAME/. They come back there, beside the runner's
 # own files: run.log (the command's output, streamed while it runs), rp-run.log (the runner's
@@ -428,11 +430,11 @@ create_body() {  # CLOUD GPU_ID SECONDS_LEFT PUBLIC_KEYS
     local start="(echo \$BASHPID > /rp-watchdog.pid; sleep $3; runpodctl remove pod \"\$RUNPOD_POD_ID\" || runpodctl pod delete \"\$RUNPOD_POD_ID\") > /rp-watchdog.log 2>&1 & exec /start.sh"
     # Rust builds and the host half of a step want more than the default 2 vCPUs and 8 GB per GPU.
     jq -nc --arg name "mpd2951-$NAME" --arg image "$IMAGE" --arg gpu "$2" --arg cloud "${1%%:*}" \
-        --arg keys "$4" --argjson disk "$DISK" --arg start "$start" --argjson cuda "$CUDA_OK" \
+        --arg keys "$4" --argjson disk "$DISK" --arg start "$start" --argjson cuda "$CUDA_OK" --argjson ram "${RP_MIN_RAM_GB:-32}" \
         '{name: $name, imageName: $image, computeType: "GPU", gpuTypeIds: [$gpu], gpuCount: 1, cloudType: $cloud,
           containerDiskInGb: $disk, volumeInGb: 0, ports: ["22/tcp"], supportPublicIp: true,
           env: {PUBLIC_KEY: $keys}, dockerStartCmd: ["bash", "-c", $start], allowedCudaVersions: $cuda,
-          minVCPUPerGPU: 8, minRAMPerGPU: 32}'
+          minVCPUPerGPU: 8, minRAMPerGPU: $ram}'
 }
 
 [ "$MODE" = adopt ] || echo "rp-run: $MODE $NAME; offers $(awk -F'|' '{ printf "%s%s %s $%s/h", (NR > 1 ? ", " : ""), $3, $1, $2 }' <<< "$OFFERS"); estimate \$$ESTIMATE for $HOURS h" >&2
