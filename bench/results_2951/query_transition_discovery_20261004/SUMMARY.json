@@ -1,0 +1,23 @@
+{
+  "source_commit": "1b60f25f28",
+  "seconds": 21.60946475,
+  "heads": 448,
+  "pairs": 32,
+  "all_heads_reported": true,
+  "mean_conditional_attention_kl": {
+    "mean_rotation_only_kl": 0.3724827748215677,
+    "crossfit_mean_fit_kl": 0.019669065190011235,
+    "crossfit_mean_native_delta_kl": 0.041684164507019096
+  },
+  "all_data_fit_stop_reasons": {
+    "iteration_limit": 448
+  },
+  "gradient_norm": {
+    "min": 3.245965928437399e-08,
+    "median": 0.0005679863681220932,
+    "max": 0.012272128807014168
+  },
+  "crossfit_heads_better_than_rotation_only": 447,
+  "crossfit_heads_better_than_mean_delta": 404,
+  "scope": "Discovery-only conditional prefix attention KL. New-token mass excluded; no full-tail or native edit success established. Allfits reached300-iteration limit. Layer0 is token-local architecture control. Learned transition retains native upstream states."
+}

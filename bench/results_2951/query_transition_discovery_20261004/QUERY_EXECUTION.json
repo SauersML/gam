@@ -1,0 +1,30 @@
+{
+  "created_utc": "2026-10-05T01:59:53.685378+00:00",
+  "fit_source_commit": "1b60f25f28",
+  "fit_binary_sha256": "826c90f4cc5de3265316015e623955aa6fc2d3ea250551d78819db5c2d817620",
+  "fit_seconds": 21.60946475,
+  "all_fits_iteration_limited": true,
+  "tail_settings_sha256": "d9c1cce5254550643ba5d37a78d1674812fc781ef0de84fb7d5602d13caec9db",
+  "selection_plan_sha256": "7cb99f1a03c4b4d98caf75dc9a43b2873a3d99c5fc26805a911077e1c0cad0fb",
+  "selected_reads": [
+    205,
+    295,
+    703,
+    1213
+  ],
+  "selection_rankings": {
+    "largest_native_change": [
+      1213,
+      703,
+      205,
+      295
+    ],
+    "largest_cv_improvement": [
+      1213,
+      703,
+      205,
+      295
+    ]
+  },
+  "heldout_opened": false
+}

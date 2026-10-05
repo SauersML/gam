@@ -1,0 +1,26 @@
+{
+  "created_utc": "2026-10-05T01:57:37.038075+00:00",
+  "status": "Declared before fitting all448 discovery heads; heldout outputs remain unexamined",
+  "hypothesis": "A common native post-qnorm/pre-RoPE query translation predicts the contextual routing change induced by appending now.",
+  "boundary": "Partial control-transition model retaining native prefix, keys, values and downstream computation. Not full algorithm recovery.",
+  "fitting": "All448 heads; mean conditional-prefix attention KL plus ridge. Twofold XOR crossfit and final all32-pair fit. No architecture or hyperparameter selection on heldout.",
+  "controls": [
+    "zero shift at new RoPE position",
+    "mean native query shift from same training fold",
+    "oracle new query for numerical instrumentation only"
+  ],
+  "downstream_selection": {
+    "control_heads": "layer0 disclosed separately as token-local architecture control",
+    "nontrivial_heads": "From head_index>=16, select four highest mean rotation-only conditional KL and four highest crossfit absolute KL improvement over rotation-only; deduplicate, retain all ties ordered by native read-node ID until count4 for each. These are discovery selections, not independent test claims.",
+    "maximum_selected": 8
+  },
+  "downstream_evaluation": "For all32 discovery now-cases, run selected heads individually and jointly using each case opposite-fold delta. Compare full native output KL and updated-vs-old token log-odds with zero, mean, fitted and oracle. Actual new-token K/V and native tail are retained.",
+  "interpretation": [
+    "Good attention fit without meaningful output effect is not evidence of the target mechanism.",
+    "Improvement over zero but not mean shift supports a simple empirical transition, not an advantage for KL fitting.",
+    "Layer0 constancy follows token-local query construction; not algorithm discovery.",
+    "Failures of constant shift motivate testing omitted contextual control; do not simply tune forever."
+  ],
+  "next_gate": "Freeze actual artifact/head selection and intervention protocol before accessing lexical heldout outputs; then test new entities/payloads/wording and native finite edits without refitting.",
+  "method_target": "Recover learned control/content distinction and reusable native laws; this bounded candidate is a diagnostic toward that target, not a redefinition of success."
+}

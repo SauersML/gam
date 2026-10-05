@@ -1,0 +1,14 @@
+{
+  "oracle_kl_tolerance": 1e-10,
+  "oracle_probability_tolerance": 1e-10,
+  "prefix_absolute_tolerance": 1e-10,
+  "prefix_relative_tolerance": 1e-10,
+  "solver": {
+    "armijo": 0.0001,
+    "gradient_tolerance": 1e-8,
+    "history": 10,
+    "max_backtracks": 40,
+    "max_iterations": 300,
+    "ridge": 1e-6
+  }
+}
