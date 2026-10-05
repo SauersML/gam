@@ -1,7 +1,0 @@
-{
-  "binary_sha256": "841ab57c0cfa43a0bc241ed87660cc369c155368527d1570beda6f06e044522c",
-  "binary": "/Users/user/mpd-data/codex/qwen-association-discrimination-20261004/capability-841ab57c0cfa",
-  "runner_source_sha256": "7a5a5c1fef0cd04d2bd8d8afa585568e9230a7f69845a52f7eb1809c27dbec84",
-  "runner_commit": "e53f0f5a55",
-  "scope": "Existing verified binary copied from mutable fastcheck slot before run; no heldout evaluation."
-}

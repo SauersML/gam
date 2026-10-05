@@ -1,9 +1,0 @@
-{
-  "files_sha256": {
-    "PROTOCOL.json": "6fa0653396457e03ef7cc511fb4fc8de0c0d9c7b54437e650664b6264b0af869",
-    "DISCOVERY.json": "184e791a984b01104334bf7f8f0c8afa8ce00c16d7f340dbad5e3de785c56cf8",
-    "HELDOUT.json": "fb282541e9642f409180baa502e4058d3707c38029bc1f2958b1b8ef24ca0c25",
-    "TOKENIZE.py": "29b5765049293050d6341fd6ef92dbb4d6fb17264d4ed50bc1e7cdf6fe1fdda4"
-  },
-  "status": "No new neural evaluation; no heldout outputs read. Role clarification changes protocol prose only, frozen fixture arrays unchanged."
-}

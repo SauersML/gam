@@ -1,7 +1,0 @@
-{
-  "recorded_utc": "2026-10-05T02:02:15.561444+00:00",
-  "timing": "Before any full-tail result; first tail attempt failed artifact schema validation before neural evaluation.",
-  "mathematical_limit": "For one context, a delta change v orthogonal to every prefix feature difference f_j-f_0 leaves all conditional prefix attention probabilities unchanged. It changes self-token odds if (f_self-f_0).v !=0. Across multiple training contexts the stacked difference span may have full rank; exact global nonidentifiability is not asserted. Approximate prefix fidelity alone still does not control self mass.",
-  "prediction": "Heads with large self mass can have good conditional fit but worse full-tail effects than a mean-query delta. Record this as a scope/identification failure, not immediately as evidence of absent reusable query structure.",
-  "possible_resolution": "Fit the identical shared-delta candidate to full attention including the self key; declare current native key state as retained input. No extra parameters or grammar required. Only execute if initial downstream evidence warrants."
-}
