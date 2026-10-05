@@ -6,6 +6,13 @@
 //! relp EXPORT PROMPTS.json OUT_DIR [ARTIFACT]
 //! costs EXPORT CHECKPOINT OUT.json [READOUT.json]
 //! complete EXPORT PROMPTS.json OUT.json [ARTIFACT]
+//! removals EXPORT REMOVALS.json OUT.json [ARTIFACT]
+//!
+//! The `removals` mode measures every function's removal (`Library::removal_effects`) on held-out
+//! rows: per function the mean change in KL(M || P) per token in bits and its quantiles over the
+//! tokens, and per token the effective number of functions its prediction rests on,
+//! `(Σ_i |ΔKL_i|)² / Σ_i ΔKL_i²`, with its quantiles. `REMOVALS.json` is `{export_sha256, context,
+//! held_out: [start, end), batch, numeric_bytes, tile_rows}`.
 //!
 //! The `complete` mode checks RelP's completeness on each prompt (`Library::completeness`): at
 //! every cut, its functions' attributions plus the skip connection's against the metric, in
@@ -32,6 +39,7 @@ use gam_mpd::{
     library_mdl,
     library_readout::{self, Library, Vocabulary},
     operator_program::{OperatorProgram, SlotValues},
+    resident_causal_fit::fixed_head_target::Teacher,
     run_check::{LayerNodes, layer_nodes, split_sites},
 };
 use serde::Deserialize;
@@ -214,6 +222,82 @@ fn complete(args: &[String]) -> Result<(), String> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Removals {
+    export_sha256: String,
+    context: usize,
+    held_out: [usize; 2],
+    batch: usize,
+    numeric_bytes: usize,
+    tile_rows: usize,
+}
+
+/// The `q`-quantile of `values` (sorted ascending), by the nearest rank.
+fn quantile(sorted: &[f64], q: f64) -> f64 {
+    sorted[((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len()) - 1]
+}
+
+fn removals(args: &[String]) -> Result<(), String> {
+    let (export, settings_path, out, artifact_path) = match args {
+        [e, s, o] => (e, s, o, None),
+        [e, s, o, a] => (e, s, o, Some(Path::new(a))),
+        _ => return Err("removals EXPORT REMOVALS.json OUT.json [ARTIFACT]".into()),
+    };
+    let export = Path::new(export);
+    let settings: Removals = serde_json::from_slice(&std::fs::read(settings_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    if sha256(&export.join("export.json"))? != settings.export_sha256 {
+        return Err("export hash mismatch".into());
+    }
+    let [first, end] = settings.held_out;
+    if first >= end {
+        return Err("an empty held-out range".into());
+    }
+    let started = Instant::now();
+    let (model, wide) = devices()?;
+    let (native, layers, tokens, artifact) = load(export, end, settings.context, artifact_path)?;
+    let sequences: Vec<Vec<u32>> = tokens.chunks(settings.context).skip(first).map(<[u32]>::to_vec).collect();
+    let library = Library::new(&model, &wide, &native, &layers, &artifact, settings.numeric_bytes, settings.tile_rows)?;
+    let teacher = Teacher::new(&model, &native, settings.tile_rows, settings.numeric_bytes)?;
+    let effects = library.removal_effects(&native, &teacher, &sequences, settings.batch)?;
+    let functions: Vec<Value> = library
+        .functions()
+        .iter()
+        .zip(effects.outer_iter())
+        .map(|(f, row)| {
+            let mut sorted = row.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            json!({"name": f.name, "layer": f.layer, "kind": f.kind, "mean_bits": row.mean(),
+                   "quantiles": [0.5, 0.9, 0.99, 1.0].map(|q| quantile(&sorted, q))})
+        })
+        .collect();
+    let mut participation: Vec<f64> = effects
+        .columns()
+        .into_iter()
+        .map(|column| {
+            let (absolute, square) = column.iter().fold((0.0, 0.0), |(a, q), v| (a + v.abs(), q + v * v));
+            if square > 0.0 { absolute * absolute / square } else { 0.0 }
+        })
+        .collect();
+    participation.sort_by(f64::total_cmp);
+    let report = json!({
+        "export": export.display().to_string(),
+        "settings_sha256": sha256(Path::new(settings_path))?,
+        "artifact": artifact_path.map(|p| p.display().to_string()),
+        "artifact_sha256": artifact_path.map(sha256).transpose()?,
+        "source_revision": option_env!("GAM_BUILD_GIT_SHA"),
+        "model_device": model.name(),
+        "held_out_sequences": [first, end],
+        "tokens": effects.ncols(),
+        "participation_quantiles": [0.1, 0.5, 0.9].map(|q| quantile(&participation, q)),
+        "participation_mean": participation.iter().sum::<f64>() / participation.len().max(1) as f64,
+        "functions": functions,
+        "seconds": started.elapsed().as_secs_f64(),
+    });
+    log::info!("removal effects of {} functions on {} tokens in {:.1} s", effects.nrows(), effects.ncols(), started.elapsed().as_secs_f64());
+    std::fs::write(out, serde_json::to_vec(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Settings {
     export_sha256: String,
     context: usize,
@@ -235,6 +319,9 @@ fn main() -> Result<(), String> {
     }
     if args.first().is_some_and(|a| a == "complete") {
         return complete(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "removals") {
+        return removals(&args[1..]);
     }
     let (export, tokenizer, settings_path, out, artifact_path) = match &args[..] {
         [e, t, s, o] => (e, t, s, o, None),
