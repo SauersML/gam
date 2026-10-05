@@ -5,6 +5,7 @@
 //! interpretability score or a certificate of recovered computational organization.
 use crate::{
     artifact::Artifact,
+    canonical_artifact::CanonicalArtifactCache,
     composed_rule_search::{Expr, Grammar},
     operator_program::{Node, OperatorBody, OperatorProgram},
     program_expression_search, program_joint_regions, program_learned_dag,
@@ -478,8 +479,14 @@ fn canonical(a: &Artifact) -> Result<(Artifact, Vec<u8>), String> {
     }
     Ok((decoded, bytes))
 }
-fn serialized_measured(e: &EvaluatedArtifact) -> Result<Vec<u8>, String> {
-    let (decoded, bytes) = canonical(&e.artifact)?;
+fn canonical_with_codec(a: &Artifact, codec: Option<&CanonicalArtifactCache>) -> Result<(Artifact, Vec<u8>), String> {
+    match codec {
+        Some(codec) => codec.canonical_exact(a).map(|c| (c.decoded, c.bytes)),
+        None => canonical(a),
+    }
+}
+fn serialized_measured(e: &EvaluatedArtifact, codec: Option<&CanonicalArtifactCache>) -> Result<Vec<u8>, String> {
+    let (decoded, bytes) = canonical_with_codec(&e.artifact, codec)?;
     if decoded != e.artifact {
         return Err(
             "measurements must describe the actual decoded artifact returned by the callback"
@@ -1335,6 +1342,23 @@ pub fn search<F>(
     initial: EvaluatedArtifact,
     settings: &Settings,
     constraints: &Constraints,
+    fit_and_measure: F,
+) -> Result<SearchResult, String>
+where
+    F: FnMut(FitRequest<'_>) -> Result<EvaluatedArtifact, String>,
+{
+    search_with_codec(native, initial, settings, constraints, None, fit_and_measure)
+}
+
+/// Same search, scheduling, literal coefficients and standalone artifact bytes.
+/// The optional bounded cache witnesses immutable native codewords only; it
+/// never rounds proposal literals or caches measurements/acceptance decisions.
+pub fn search_with_codec<F>(
+    native: &OperatorProgram,
+    initial: EvaluatedArtifact,
+    settings: &Settings,
+    constraints: &Constraints,
+    codec: Option<&CanonicalArtifactCache>,
     mut fit_and_measure: F,
 ) -> Result<SearchResult, String>
 where
@@ -1483,7 +1507,7 @@ where
     }
     validate_evaluation(&initial.evaluation, constraints)?;
     validate_artifact(&initial.artifact, native, None, settings)?;
-    let initial_size = serialized_measured(&initial)?.len();
+    let initial_size = serialized_measured(&initial, codec)?.len();
     let initial_record = CandidateRecord {
         id: 0,
         parent_id: None,
@@ -1809,7 +1833,7 @@ where
                 }
                 .and_then(|a| {
                     validate_artifact(&a, native, Some(&parent.artifact), settings)?;
-                    let (decoded, _) = canonical(&a)?;
+                    let (decoded, _) = canonical_with_codec(&a, codec)?;
                     if let Some(local) = &mut local_fit {
                         local.rebind_to_saved_candidate(&a, &decoded)?;
                     }
@@ -1887,7 +1911,7 @@ where
                             settings,
                         )
                     })
-                    .and_then(|_| serialized_measured(&fitted));
+                    .and_then(|_| serialized_measured(&fitted, codec));
                 let bytes = match verified {
                     Ok(bytes) => bytes,
                     Err(reason) => {
@@ -2252,6 +2276,66 @@ mod tests {
             array![[6.], [9.], [9.], [6.]]
         );
     }
+    #[test]
+    fn cached_search_preserves_callback_order_artifacts_and_non_f32_updates() {
+        let native = ordered();
+        let source = canonical(&Artifact::native(&native).unwrap()).unwrap().0;
+        let cache = CanonicalArtifactCache::new(&source, 1 << 20).unwrap();
+        let mut config = settings(2);
+        config.max_callback_calls = 24;
+        config.max_move_attempts = 64;
+        let axis = |name: &str, value| vec![Metric { name:name.into(), value }];
+        let initial_evaluation = Evaluation {
+            fidelity:axis("run", 1.), local_errors:axis("local", 1.),
+            intervention_errors:axis("intervention", 1.),
+            description_bits:(source.to_bytes().unwrap().len() * 8) as f64,
+        };
+        let constraints = Constraints {
+            max_fidelity:axis("run", 1.), max_local_errors:axis("local", 1.),
+            max_intervention_errors:axis("intervention", 1.),
+        };
+        let run = |cached: bool| {
+            let mut callbacks = Vec::new();
+            let mut changed = 0;
+            let mut callback = |request: FitRequest<'_>| {
+                let mut artifact = request.candidate.clone();
+                if let Some(&id) = request.trainable_operator_ids.first() {
+                    let OperatorBody::Dense { values, precision, .. } = &mut Arc::make_mut(&mut artifact.program.operators[id]).body
+                        else { panic!("fixture trainable must be dense"); };
+                    values[[0, 0]] = 1.0 + 2.0_f64.powi(-40);
+                    *precision = exact_precision(values.iter().copied()).unwrap();
+                    changed += 1;
+                }
+                // Literal test updates, not a fitted scientific measurement.
+                let (artifact, bytes) = canonical(&artifact).unwrap();
+                callbacks.push((request.attempt_id, request.parent_id,
+                    serde_json::to_value(request.mutation).unwrap(),
+                    request.trainable_operator_ids.to_vec(), bytes.clone()));
+                Ok(EvaluatedArtifact { artifact, evaluation:Evaluation {
+                    fidelity:axis("run", 0.5), local_errors:axis("local", 0.5),
+                    intervention_errors:axis("intervention", 0.5), description_bits:(bytes.len() * 8) as f64,
+                }})
+            };
+            let initial = EvaluatedArtifact { artifact:source.clone(), evaluation:initial_evaluation.clone() };
+            let result = if cached {
+                search_with_codec(&native, initial, &config, &constraints, Some(&cache), &mut callback)
+            } else {
+                search(&native, initial, &config, &constraints, &mut callback)
+            }.unwrap();
+            assert!(changed > 0, "test must exercise changed numerical owners");
+            assert!(callbacks.iter().any(|(_, _, _, _, bytes)| {
+                let decoded = Artifact::from_bytes(bytes, &native.declarations).unwrap();
+                !decoded.has_f32_literals()
+            }), "non-f32 callback coefficients must survive canonical replay");
+            let retained = result.candidates.iter().map(|c|
+                (c.id, c.evaluated.artifact.to_bytes().unwrap())).collect::<Vec<_>>();
+            (callbacks, serde_json::to_value(result.report).unwrap(), retained)
+        };
+        assert_eq!(run(false), run(true));
+        assert!(cache.usage().encoded_native_operator_hits > 0);
+        assert!(cache.usage().decoded_native_operator_hits > 0);
+    }
+
     #[test]
     fn native_parent_search_calls_existing_fitter_only_for_changed_programs() {
         use crate::operator_program::Law;

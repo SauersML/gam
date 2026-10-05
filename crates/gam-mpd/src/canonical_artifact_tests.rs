@@ -52,6 +52,33 @@ fn exact_native_reuse_changed_f32_literal_and_moved_indices_match_ordinary() -> 
     Ok(())
 }
 #[test]
+fn exact_candidate_codec_preserves_non_f32_changes_and_ordinary_saved_bytes() -> Result<(), String> {
+    let source = native();
+    let cache = CanonicalArtifactCache::new(&source, 1 << 20)?;
+    let mut changed = source.clone();
+    let value = 1.0 + 2.0_f64.powi(-40);
+    let OperatorBody::Dense { values, precision, .. } = &mut Arc::make_mut(&mut changed.program.operators[0]).body
+        else { return Err("fixture must be Dense".into()); };
+    values[[0, 0]] = value;
+    *precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
+    assert!(!changed.has_f32_literals());
+    let ordinary_bytes = changed.to_bytes()?;
+    let ordinary = Artifact::from_bytes(&ordinary_bytes, &changed.program.declarations)?;
+    let cached = cache.canonical_exact(&changed)?;
+    assert_eq!(cached.bytes, ordinary_bytes);
+    assert_eq!(cached.decoded, ordinary);
+    assert_eq!(cached.decoded.program.operators[0].matrix_cow()[[0, 0]].to_bits(), value.to_bits());
+    assert_eq!(cached.timings.f32_seconds, 0.);
+    assert_eq!(cache.decode_saved(&cached.bytes, &changed.program.declarations)?, ordinary);
+    assert_ne!(cache.canonical(&changed)?.bytes, cached.bytes, "rounded and exact APIs must stay distinct");
+    // A changed candidate never overwrites the immutable native codeword.
+    assert_eq!(cache.canonical_exact(&source)?.bytes, source.to_bytes()?);
+    assert!(cache.usage().encoded_native_operator_hits > 0);
+    assert!(cache.usage().decoded_native_operator_hits > 0);
+    Ok(())
+}
+
+#[test]
 fn exact_preflight_refuses_small_budget_before_cache_and_rejects_non_f32_source() -> Result<(), String> {
     let source=native();
     let cache=CanonicalArtifactCache::new(&source,1<<20).expect("cache");

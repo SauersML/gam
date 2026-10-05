@@ -2409,11 +2409,12 @@ fn structural_run(
             .map(|n| controlled.root_mapping[parameter_edits.map_or(*n, |edits| edits.node_mapping[*n])]).collect());
     }
     save(&out.join("SEARCH_SETTINGS.json"), &serde_json::to_value(&search_settings).map_err(|e|e.to_string())?)?;
-    let result = program_structure_search::search(
+    let result = program_structure_search::search_with_codec(
         &controlled.program,
         initial,
         &search_settings,
         &structural.constraints,
+        cache.as_ref(),
         |request| {
             let root = out.join(format!("structural-attempt-{:06}", request.attempt_id));
             callback_index += 1;
@@ -2428,7 +2429,7 @@ fn structural_run(
             )?;
             std::fs::write(
                 root.join("proposed.artifact"),
-                request.candidate.to_bytes()?,
+                match cache.as_ref() { Some(cache) => cache.to_bytes(request.candidate)?, None => request.candidate.to_bytes()? },
             )
             .map_err(|e| e.to_string())?;
             let attempt = (|| -> Result<EvaluatedArtifact, String> {
@@ -2464,13 +2465,31 @@ fn structural_run(
                             settings.fit.numeric_bytes, costs,
                         );
                         if let Ok(stage) = &stage {
-                            std::fs::write(root.join("local-prefit.artifact"), stage.artifact.to_bytes()?)
+                            std::fs::write(root.join("local-prefit.artifact"), match cache.as_ref() { Some(cache) => cache.to_bytes(&stage.artifact)?, None => stage.artifact.to_bytes()? })
                                 .map_err(|e| e.to_string())?;
                         }
                         save(&root.join("LOCAL_PREFIT_TRAIN.json"),
                             &structural_stage_evidence(&stage, &structural.constraints))?;
                         local_prefit = Some(stage);
                     }
+                    if settings.fit.iterations == 0 && local_prefit.as_ref().is_some_and(Result::is_ok) {
+                        // No update is possible: reuse this invocation's measured
+                        // canonical prefit. No cross-candidate/panel cache is involved.
+                        let stage = local_prefit.take().expect("checked local stage")?;
+                        save(&root.join("FIT.json"), &json!({"status":"skipped_zero_iterations",
+                            "iterations":0,"measurement_source":"LOCAL_PREFIT_TRAIN.json",
+                            "scope":"No composed updates requested. Reusing the already measured canonical candidate; proposal-only response loss is not recomputed."}))?;
+                        save(&root.join("COMPOSED_REFINEMENT_TRAIN.json"), &json!({
+                            "status":"skipped_zero_iterations","measurement_source":"LOCAL_PREFIT_TRAIN.json",
+                            "same_candidate":true,"train":stage.measurement,"local":stage.local,
+                            "evaluation":stage.evaluation,
+                            "constraint_error":program_structure_search::validate_evaluation(&stage.evaluation,&structural.constraints).err()}))?;
+                        save(&root.join("FIT_STAGE_SELECTION.json"), &json!({"selected":"local_prefit",
+                            "policy":"Composed iterations are zero: preserve the identical measured canonical prefit. Ordinary search admission still checks all declared constraints.",
+                            "evidence":["LOCAL_PREFIT_TRAIN.json","COMPOSED_REFINEMENT_TRAIN.json"]}))?;
+                        candidate = stage.artifact.clone();
+                        selected_stage = Some(stage);
+                    } else {
                     let fitted = (|| -> Result<resident_causal_fit::Fit, String> {
                         if let Some(weight) = structural.native_response_weight {
                             let (response_targets, provenance) = if let Some(edits) = parameter_edits {
@@ -2541,7 +2560,7 @@ fn structural_run(
                             ),
                         };
                         if let Ok(stage) = &refinement {
-                            std::fs::write(root.join("composed-refinement.artifact"), stage.artifact.to_bytes()?)
+                            std::fs::write(root.join("composed-refinement.artifact"), match cache.as_ref() { Some(cache) => cache.to_bytes(&stage.artifact)?, None => stage.artifact.to_bytes()? })
                                 .map_err(|e| e.to_string())?;
                         }
                         save(&root.join("COMPOSED_REFINEMENT_TRAIN.json"),
@@ -2557,6 +2576,7 @@ fn structural_run(
                         }))?;
                         candidate = stage.artifact.clone();
                         selected_stage = Some(stage);
+                    }
                     }
                 }
                 let (saved, bytes, _) = canonical_using(&candidate, cache.as_ref())?;
@@ -6312,6 +6332,32 @@ mod tests {
                 && p.join("FIT_STAGE_SELECTION.json").exists()
                 && p.join("program.artifact").exists()).count();
         assert!(completed > 0,"automatic learned proposals must execute the full local-to-composed path: {}",local_out.display());
+        // Re-run the same real callback with no composed updates; it must reuse
+        // the exact saved prefit and its measured TRAIN results.
+        let mut settings=settings;
+        settings.fit.iterations=0;
+        let zero_out=out.join("zero-refinement");
+        std::fs::create_dir(&zero_out).unwrap();
+        structural_run(&d,&settings,&local_structural,&native,&native,&[],&family,&targets,&zero_out,
+            None,&mut CostCache::default(),None).expect("zero composed updates");
+        let mut reused=0;
+        for entry in std::fs::read_dir(&zero_out).unwrap().filter_map(Result::ok) {
+            let p=entry.path();
+            if !p.join("program.artifact").exists() || !p.join("FIT.json").exists() {continue;}
+            let fit:Value=serde_json::from_slice(&std::fs::read(p.join("FIT.json")).unwrap()).unwrap();
+            if fit["status"] != "skipped_zero_iterations" {continue;}
+            assert_eq!(std::fs::read(p.join("local-prefit.artifact")).unwrap(),
+                std::fs::read(p.join("program.artifact")).unwrap());
+            let pre:Value=serde_json::from_slice(&std::fs::read(p.join("LOCAL_PREFIT_TRAIN.json")).unwrap()).unwrap();
+            let after:Value=serde_json::from_slice(&std::fs::read(p.join("COMPOSED_REFINEMENT_TRAIN.json")).unwrap()).unwrap();
+            assert_eq!(pre["train"],after["train"]);
+            assert_eq!(pre["local"],after["local"]);
+            assert_eq!(pre["evaluation"],after["evaluation"]);
+            assert!(!p.join("composed-refinement.artifact").exists());
+            reused+=1;
+        }
+        assert!(reused>0,"actual local callbacks must reuse the zero-update stage");
+        settings.fit.iterations=1;
         // Reuse the real structural-driver fixture with two upstream coordinates,
         // signed edits and an independent retained gain in the same episodes.
         let mut edit_settings = settings;

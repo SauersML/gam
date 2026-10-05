@@ -82,8 +82,17 @@ impl CanonicalArtifactCache {
         let started = Instant::now();
         let f32 = artifact.f32_literals()?;
         let f32_seconds = started.elapsed().as_secs_f64();
+        let mut result = self.canonical_exact(&f32)?;
+        check_reference_indices(artifact, &result.decoded)?;
+        result.timings.f32_seconds = f32_seconds;
+        Ok(result)
+    }
+    /// Canonical ordinary replay of the supplied literals without rounding.
+    /// Unchanged native operators reuse witnessed codewords; changed/non-f32
+    /// coefficients use the ordinary codec. Candidate values never enter the cache.
+    pub fn canonical_exact(&self, artifact: &Artifact) -> Result<Canonical, String> {
         let started = Instant::now();
-        let bytes = f32.to_bytes_with_native_codec(&self.codec)?;
+        let bytes = artifact.to_bytes_with_native_codec(&self.codec)?;
         let encode_seconds = started.elapsed().as_secs_f64();
         let started = Instant::now();
         let decoded = Artifact::from_bytes_with_native_codec(&bytes, &artifact.program.declarations, &self.codec)?;
@@ -91,15 +100,8 @@ impl CanonicalArtifactCache {
         let started = Instant::now();
         if decoded.to_bytes_with_native_codec(&self.codec)? != bytes { return Err("noncanonical candidate wire replay".into()); }
         let reencode_seconds = started.elapsed().as_secs_f64();
-        if decoded.program.nodes != artifact.program.nodes || decoded.program.output != artifact.program.output
-            || decoded.program.operators.len() != artifact.program.operators.len()
-            || decoded.program.rules.len() != artifact.program.rules.len()
-            || decoded.program.rules.iter().zip(&artifact.program.rules).any(|(a,b)| a.nodes != b.nodes || a.output != b.output || a.inputs != b.inputs)
-            || decoded.program.operators.iter().zip(&artifact.program.operators).any(|(a,b)| a.rows != b.rows || a.cols != b.cols)
-            || decoded.places != artifact.places {
-            return Err("wire replay changed executable reference indices".into());
-        }
-        Ok(Canonical { decoded, bytes, timings: Timings { f32_seconds, encode_seconds, decode_seconds, reencode_seconds } })
+        check_reference_indices(artifact, &decoded)?;
+        Ok(Canonical { decoded, bytes, timings: Timings { f32_seconds:0., encode_seconds, decode_seconds, reencode_seconds } })
     }
     /// Parse the entire ordinary envelope, bindings, controls and derived bodies. Never trusts
     /// a source pointer for saved input: substitution requires exact codeword bytes.
@@ -110,6 +112,18 @@ impl CanonicalArtifactCache {
     pub fn to_bytes(&self, artifact: &Artifact) -> Result<Vec<u8>, String> {
         artifact.to_bytes_with_native_codec(&self.codec)
     }
+}
+
+fn check_reference_indices(artifact: &Artifact, decoded: &Artifact) -> Result<(), String> {
+    if decoded.program.nodes != artifact.program.nodes || decoded.program.output != artifact.program.output
+            || decoded.program.operators.len() != artifact.program.operators.len()
+            || decoded.program.rules.len() != artifact.program.rules.len()
+            || decoded.program.rules.iter().zip(&artifact.program.rules).any(|(a,b)| a.nodes != b.nodes || a.output != b.output || a.inputs != b.inputs)
+            || decoded.program.operators.iter().zip(&artifact.program.operators).any(|(a,b)| a.rows != b.rows || a.cols != b.cols)
+            || decoded.places != artifact.places {
+            return Err("wire replay changed executable reference indices".into());
+        }
+    Ok(())
 }
 
 #[cfg(test)]

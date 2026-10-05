@@ -3,6 +3,7 @@
 //! or the main composed driver's structural settings. No forwards or fitting.
 use gam_mpd::{
     acceptance::{structural_cost, CostCache},
+    canonical_artifact::CanonicalArtifactCache,
     artifact::Artifact, engine::sha256, import::import_language_model,
     operator_program::Node, program_joint_regions as joint, program_learned_dag as learned,
     program_structure_search as search, intervention_program::{self, Control},
@@ -29,6 +30,8 @@ struct StructuralInput {
     layers: usize,
     sequences: usize,
     context: usize,
+    #[serde(default)]
+    native_codec_bytes: usize,
     controls: Vec<NativeControl>,
     structural_search: StructuralInputSearch,
 }
@@ -122,6 +125,8 @@ fn structural_preflight(export: &Path, bytes: &[u8], out: &Path) -> Result<(), S
     let constraints = config.structural_search.constraints;
     let identity_axes = |axes: &[search::Metric]| axes.iter().map(|m| search::Metric { name:m.name.clone(), value:0. }).collect();
     let initial_c32 = structural_cost(&initial, &mut CostCache::default())?.total();
+    let cache = (config.native_codec_bytes != 0)
+        .then(|| CanonicalArtifactCache::new(&initial, config.native_codec_bytes)).transpose()?;
     // The seed's reference here is the canonical controlled native compared
     // with itself: its identity errors are zero by construction, not measured
     // original-versus-rounded scores. No child is admitted, so these axes never
@@ -133,10 +138,14 @@ fn structural_preflight(export: &Path, bytes: &[u8], out: &Path) -> Result<(), S
     }};
     std::fs::create_dir(out).map_err(|e| e.to_string())?;
     std::fs::write(out.join("SETTINGS.json"), bytes).map_err(|e| e.to_string())?;
+    std::fs::write(out.join("CODEC_CACHE.json"), serde_json::to_vec_pretty(&json!({
+        "native_codec_bytes":config.native_codec_bytes,"preflight":cache.as_ref().map(|c| c.preflight()),
+        "stats":cache.as_ref().map(|c| c.stats()),"scope":"Exact literal native codewords only; candidate measurements are never cached."
+    })).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let mut journal = std::fs::File::create(out.join("CALLBACKS.jsonl")).map_err(|e| e.to_string())?;
     let mut callbacks = Vec::new();
     let mut layer_coverage = BTreeMap::<usize, usize>::new();
-    let result = search::search(&controlled.program, initial, &settings, &constraints, |request| {
+    let result = search::search_with_codec(&controlled.program, initial, &settings, &constraints, cache.as_ref(), |request| {
         let joint_region = match request.mutation {
             search::Mutation::ReuseNativeExpression { region, .. }
             | search::Mutation::SynthesizeLearnedDAG { region, .. }
@@ -193,6 +202,7 @@ fn structural_preflight(export: &Path, bytes: &[u8], out: &Path) -> Result<(), S
         "declared_controls":raw["controls"],"declared_cases":raw["cases"],"layer_places":layer_places,
         "effective_search_settings":settings,"callbacks":callbacks,"callback_layer_coverage":layer_coverage,
         "initial_c32":initial_c32,
+        "native_codec_usage":cache.as_ref().map(|c| c.usage()),
         "initial_error_reference":"Canonical controlled native compared with itself; zero identity axes by construction, not measured original-versus-rounded scores. Seed error records omitted.",
         "native_copy_controls":controls,"driver_report":driver_report,"seconds":start.elapsed().as_secs_f64(),
         "scope":"Exact public structural-search initial-parent schedule, applied proposals and canonical replay on the main driver's controlled native graph. No model forward, fitting, KL, Local, heldout reading, or discovery evidence. All callbacks deliberately return an unmeasured sentinel, so callback_failures count inspection stops, not failed fits; no child is admitted and deeper-parent coverage is unknown. Identity-baseline error records are omitted and must not be read as measurements. preserve_native_places retain the main driver's controlled-node interpretation."});

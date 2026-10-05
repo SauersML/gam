@@ -3,10 +3,11 @@
 //! generalization. No normal-equation inverse or silent f32 quantization is used.
 use gam_linalg::{
     decompose::svd,
-    faer_ndarray::{fast_ab, fast_atb},
+    faer_ndarray::{FaerArrayView, HouseholderQr, fast_ab, fast_atb},
 };
-use ndarray::{Array2, Axis};
+use ndarray::{Array2, Axis, s};
 use serde::{Deserialize, Serialize};
+use std::ops::Range;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -37,6 +38,11 @@ pub struct Diagnostics {
     /// Numerical residual floor with updates restricted to retained right modes;
     /// truncation means this need not be the unrestricted least-squares minimum.
     pub retained_subspace_residual_floor: f64,
+    pub method: &'static str,
+    pub row_tiles: usize,
+    /// Numerical rank guard accumulated across QR reductions, not a certified
+    /// roundoff bound. Zero for the direct SVD route.
+    pub qr_rounding_guard: f64,
     pub scope: &'static str,
 }
 
@@ -60,6 +66,26 @@ fn norm(values: &Array2<f64>) -> Result<f64, String> {
 /// At lambda>0 it is the unique ridge update in that subspace. Discarded and null
 /// directions retain B0, rather than being silently set to zero.
 pub fn fit(
+    design: &Array2<f64>,
+    targets: &Array2<f64>,
+    reference: &Array2<f64>,
+    settings: Settings,
+) -> Result<Fit, String> {
+    if design.nrows() > design.ncols().saturating_mul(2)
+        && targets.nrows() == design.nrows()
+        && reference.dim() == (design.ncols(), targets.ncols())
+    {
+        let tile_rows = design.ncols().max(256).min(4096);
+        return fit_residual_streaming(design.nrows(), reference, settings, tile_rows, |rows| {
+            let x = design.slice(s![rows.clone(), ..]).to_owned();
+            let residual = targets.slice(s![rows, ..]).to_owned() - fast_ab(&x, reference);
+            Ok((x, residual))
+        });
+    }
+    fit_dense(design, targets, reference, settings)
+}
+
+fn fit_dense(
     design: &Array2<f64>,
     targets: &Array2<f64>,
     reference: &Array2<f64>,
@@ -161,7 +187,182 @@ pub fn fit(
             final_residual_frobenius,
             coefficient_change_frobenius,
             retained_subspace_residual_floor: norm(&floor)?,
+            method: "direct_svd",
+            row_tiles: 1,
+            qr_rounding_guard: 0.,
             scope: "Fixed-design f64 SVD solve around supplied reference. Rank and residuals are numerical diagnostics, not exact rank or roundoff certificates. Ridge objective has no row averaging. Updates are restricted to retained singular modes; all discarded reference directions are preserved up to arithmetic rounding.",
+        },
+    })
+}
+
+/// Stream every row twice. `read` supplies X and the reference residual Y-X B0,
+/// with unchanged row order/content on both passes. Neither X, Q, U nor residuals
+/// of full panel height are retained. Householder reductions keep [R, Qᵀ residual]
+/// plus the robust norm of eliminated RHS rows; SVD acts only on the small R.
+/// The second pass measures the actual residual of the returned coefficients.
+pub fn fit_residual_streaming(
+    rows: usize,
+    reference: &Array2<f64>,
+    settings: Settings,
+    tile_rows: usize,
+    mut read: impl FnMut(Range<usize>) -> Result<(Array2<f64>, Array2<f64>), String>,
+) -> Result<Fit, String> {
+    let (p, k) = reference.dim();
+    let relative = settings
+        .relative_rank_cutoff
+        .unwrap_or(f64::EPSILON * rows.max(p) as f64);
+    if rows == 0
+        || p == 0
+        || k == 0
+        || tile_rows == 0
+        || reference.iter().any(|v| !v.is_finite())
+        || !relative.is_finite()
+        || !(0. ..1.).contains(&relative)
+        || !settings.ridge.is_finite()
+        || settings.ridge < 0.
+    {
+        return Err("streaming coefficient fit needs positive dimensions/tiles, finite reference and valid rank/ridge settings".into());
+    }
+    let check = |x: &Array2<f64>, residual: &Array2<f64>, count: usize| {
+        if x.dim() != (count, p)
+            || residual.dim() != (count, k)
+            || x.iter().chain(residual).any(|v| !v.is_finite())
+        {
+            Err(
+                "streaming design/reference-residual tile has wrong shape or nonfinite values"
+                    .to_string(),
+            )
+        } else {
+            Ok(())
+        }
+    };
+    let mut reduced = Array2::<f64>::zeros((0, p));
+    let mut rhs = Array2::<f64>::zeros((0, k));
+    let mut initial_norm = 0f64;
+    let mut eliminated_norm = 0f64;
+    let mut qr_dimension_sum = 0f64;
+    let mut tiles = 0usize;
+    for start in (0..rows).step_by(tile_rows) {
+        let end = start.saturating_add(tile_rows).min(rows);
+        let (x, residual) = read(start..end)?;
+        check(&x, &residual, end - start)?;
+        initial_norm = initial_norm.hypot(norm(&residual)?);
+        let held = reduced.nrows();
+        let height = held
+            .checked_add(end - start)
+            .ok_or("QR row count overflow")?;
+        let mut stack = Array2::<f64>::zeros((height, p));
+        stack.slice_mut(s![..held, ..]).assign(&reduced);
+        stack.slice_mut(s![held.., ..]).assign(&x);
+        let mut transformed = faer::Mat::from_fn(height, k, |i, j| {
+            if i < held {
+                rhs[[i, j]]
+            } else {
+                residual[[i - held, j]]
+            }
+        });
+        let view = FaerArrayView::new(&stack);
+        let qr = HouseholderQr::new(view.as_ref());
+        qr.apply_transpose_on_the_left(transformed.as_mut());
+        let retained_rows = height.min(p);
+        reduced = Array2::from_shape_fn((retained_rows, p), |(i, j)| qr.r()[(i, j)]);
+        rhs = Array2::from_shape_fn((retained_rows, k), |(i, j)| transformed[(i, j)]);
+        for i in retained_rows..height {
+            for j in 0..k {
+                eliminated_norm = eliminated_norm.hypot(transformed[(i, j)]);
+            }
+        }
+        if reduced.iter().chain(rhs.iter()).any(|v| !v.is_finite()) || !eliminated_norm.is_finite()
+        {
+            return Err("nonfinite streaming Householder reduction".into());
+        }
+        qr_dimension_sum += height.max(p) as f64;
+        tiles += 1;
+    }
+    let factor = svd(reduced.view(), false).map_err(|e| e.to_string())?;
+    if !factor.band.is_finite()
+        || factor.band < 0.
+        || factor
+            .singular_values
+            .iter()
+            .any(|v| !v.is_finite() || *v < 0.)
+        || factor
+            .u
+            .iter()
+            .chain(factor.vt.iter())
+            .any(|v| !v.is_finite())
+    {
+        return Err("nonfinite reduced coefficient-fit SVD".into());
+    }
+    let singular_values = factor.singular_values.to_vec();
+    let largest = singular_values[0];
+    // Include all reduction dimensions rather than pretending the small R's
+    // SVD band describes the tall pipeline. This remains a numerical guard,
+    // not a certificate for QR accumulation or numerical rank.
+    let qr_guard = f64::EPSILON * qr_dimension_sum * largest;
+    let cutoff = (relative * largest).max(factor.band + qr_guard);
+    if !cutoff.is_finite() || !initial_norm.is_finite() {
+        return Err("nonfinite streaming rank guard or initial residual".into());
+    }
+    let retained = singular_values
+        .iter()
+        .enumerate()
+        .filter_map(|(i, sigma)| (*sigma > cutoff).then_some(i))
+        .collect::<Vec<_>>();
+    let mut coefficients = reference.clone();
+    let mut floor = rhs.clone();
+    if !retained.is_empty() {
+        let u = factor.u.select(Axis(1), &retained);
+        let vt = factor.vt.select(Axis(0), &retained);
+        let mut projected = fast_atb(&u, &rhs);
+        floor -= &fast_ab(&u, &projected);
+        for (row, &index) in retained.iter().enumerate() {
+            let sigma = singular_values[index];
+            let denominator = sigma.hypot(settings.ridge.sqrt());
+            let gain = (sigma / denominator) / denominator;
+            if !gain.is_finite() {
+                return Err("unresolved reduced reciprocal singular value".into());
+            }
+            projected.row_mut(row).mapv_inplace(|v| v * gain);
+        }
+        coefficients += &fast_atb(&vt, &projected);
+    }
+    if coefficients.iter().any(|v| !v.is_finite()) {
+        return Err("nonfinite streaming fitted coefficients".into());
+    }
+    let change = &coefficients - reference;
+    let mut final_norm = 0f64;
+    for start in (0..rows).step_by(tile_rows) {
+        let end = start.saturating_add(tile_rows).min(rows);
+        let (x, residual) = read(start..end)?;
+        check(&x, &residual, end - start)?;
+        final_norm = final_norm.hypot(norm(&(residual - fast_ab(&x, &change)))?);
+    }
+    let condition = retained.last().and_then(|&i| {
+        let value = largest / singular_values[i];
+        value.is_finite().then_some(value)
+    });
+    Ok(Fit {
+        coefficients,
+        diagnostics: Diagnostics {
+            rows,
+            features: p,
+            outputs: k,
+            retained_rank: retained.len(),
+            singular_values,
+            relative_rank_cutoff: relative,
+            absolute_rank_cutoff: cutoff,
+            svd_rounding_band: factor.band,
+            retained_condition_number: condition,
+            ridge: settings.ridge,
+            initial_residual_frobenius: initial_norm,
+            final_residual_frobenius: final_norm,
+            coefficient_change_frobenius: norm(&change)?,
+            retained_subspace_residual_floor: eliminated_norm.hypot(norm(&floor)?),
+            method: "streaming_householder_qr_reduced_svd",
+            row_tiles: tiles,
+            qr_rounding_guard: qr_guard,
+            scope: "All-row f64 Householder reductions and reduced SVD around supplied reference; no normal equations, row sampling, or full-height singular vectors. Original row count sets default relative cutoff; an accumulated QR dimension guard augments the reduced SVD band. Rank/guards/floor are numerical diagnostics, not certificates, and rank near cutoff may differ from direct SVD. Eliminated RHS tail norm is accumulated directly, never by subtracting norm squares. Actual returned-coefficient residual is measured in a second all-row tiled pass. Ridge has no row averaging; discarded/null reference directions are preserved up to rounding.",
         },
     })
 }
@@ -176,6 +377,109 @@ mod tests {
             a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-11),
             "{a:?} versus {b:?}"
         );
+    }
+    #[test]
+    fn streaming_tall_rank_deficient_ridge_and_residual_match_direct_svd() {
+        let x = Array2::from_shape_fn((97, 4), |(r, c)| {
+            let a = (r as f64 * 0.13).sin();
+            let b = (r as f64 * 0.21).cos();
+            match c {
+                0 => a,
+                1 => b,
+                2 => a + 2. * b,
+                _ => 0.,
+            }
+        });
+        let reference = array![[3., -1.], [5., 2.], [-2., 4.], [7., 8.]];
+        let expected = array![[1., 3.], [-2., 1.], [0.5, -1.], [20., 30.]];
+        let y = fast_ab(&x, &expected)
+            + Array2::from_shape_fn((97, 2), |(r, c)| 0.03 * ((r * 7 + c) as f64).sin());
+        for ridge in [0., 0.7] {
+            let settings = Settings {
+                relative_rank_cutoff: Some(1e-10),
+                ridge,
+            };
+            let dense = fit_dense(&x, &y, &reference, settings.clone()).unwrap();
+            for tile in [1, 7, 32] {
+                let mut visits = vec![0usize; 97];
+                let streamed =
+                    fit_residual_streaming(97, &reference, settings.clone(), tile, |rows| {
+                        for r in rows.clone() {
+                            visits[r] += 1;
+                        }
+                        let design = x.slice(s![rows.clone(), ..]).to_owned();
+                        let residual =
+                            y.slice(s![rows, ..]).to_owned() - fast_ab(&design, &reference);
+                        Ok((design, residual))
+                    })
+                    .unwrap();
+                close(&streamed.coefficients, &dense.coefficients);
+                assert!(
+                    visits.iter().all(|v| *v == 2),
+                    "every row must be reduced and replayed"
+                );
+                assert_eq!(streamed.diagnostics.retained_rank, 2);
+                assert!(streamed.diagnostics.qr_rounding_guard > 0.);
+                assert!(
+                    (streamed.diagnostics.final_residual_frobenius
+                        - dense.diagnostics.final_residual_frobenius)
+                        .abs()
+                        < 1e-10
+                );
+                assert!(
+                    (streamed.diagnostics.retained_subspace_residual_floor
+                        - dense.diagnostics.retained_subspace_residual_floor)
+                        .abs()
+                        < 1e-10
+                );
+                assert!(streamed.diagnostics.retained_subspace_residual_floor > 0.1);
+                assert_eq!(
+                    streamed.coefficients.row(3),
+                    reference.row(3),
+                    "unobserved native reference direction"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_cutoff_uses_original_rows_and_zero_design_keeps_reference() {
+        let reference = array![[3., 7.], [5., 9.]];
+        let solved = fit_residual_streaming(37, &reference, Settings::default(), 5, |rows| {
+            Ok((
+                Array2::zeros((rows.len(), 2)),
+                Array2::ones((rows.len(), 2)),
+            ))
+        })
+        .unwrap();
+        assert_eq!(solved.coefficients, reference);
+        assert_eq!(solved.diagnostics.relative_rank_cutoff, f64::EPSILON * 37.);
+        assert_eq!(solved.diagnostics.retained_rank, 0);
+        assert!((solved.diagnostics.final_residual_frobenius - 74f64.sqrt()).abs() < 1e-12);
+        assert!((solved.diagnostics.retained_subspace_residual_floor - 74f64.sqrt()).abs() < 1e-12);
+        assert!(
+            fit_residual_streaming(10, &reference, Settings::default(), 3, |rows| Ok((
+                Array2::zeros((rows.len(), 1)),
+                Array2::ones((rows.len(), 2))
+            )))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn public_tall_fit_dispatches_without_full_height_singular_vectors() {
+        let x = Array2::from_shape_fn(
+            (1025, 2),
+            |(r, c)| if c == 0 { 1. } else { r as f64 / 1025. },
+        );
+        let y = fast_ab(&x, &array![[2.], [-3.]]);
+        let solved = fit(&x, &y, &array![[7.], [8.]], Settings::default()).unwrap();
+        assert_eq!(
+            solved.diagnostics.method,
+            "streaming_householder_qr_reduced_svd"
+        );
+        assert!(solved.diagnostics.row_tiles > 1);
+        close(&solved.coefficients, &array![[2.], [-3.]]);
     }
     #[test]
     fn exact_multiple_output_recovery() {

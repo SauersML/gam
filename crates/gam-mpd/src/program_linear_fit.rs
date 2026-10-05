@@ -2,10 +2,10 @@
 use crate::{
     linear_coefficient_fit,
     operator_program::{
-        exact_precision, FamilyInputs, Node, OperatorBody, OperatorProgram, Slot, SlotValues,
+        FamilyInputs, Node, OperatorBody, OperatorProgram, Slot, SlotValues, exact_precision,
     },
 };
-use ndarray::{s, Array2};
+use ndarray::{Array2, s};
 use serde::Serialize;
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -25,6 +25,7 @@ pub struct Block {
     pub node: usize,
     pub operators: Vec<usize>,
     pub diagnostics: linear_coefficient_fit::Diagnostics,
+    pub row_tile_rows: usize,
 }
 
 /// Solve only unique dense owners at terminal affine output leaves. All upstream
@@ -196,44 +197,75 @@ pub fn prefit(
             ));
         }
     }
-    // Explicit retained arrays, conservative thin-SVD products and program copies.
-    // Evaluator/library allocator workspace is not a hard process-memory bound.
-    let trace_cells = interfaces
+    // Include resident panels and source/fitted coefficient storage. Blocks are
+    // solved sequentially; peak workspace is a maximum, not the sum of all plans.
+    // QR reflectors/SVD operate only on a tile plus at most p retained rows.
+    let overflow = || "linear prefit numeric plan overflow".to_string();
+    let input_width = inputs
         .iter()
-        .try_fold(0usize, |sum, i| sum.checked_add(n.checked_mul(i.width())?))
-        .ok_or("numeric plan overflow")?;
-    let mut cells = trace_cells
-        .checked_add(inputs.iter().map(|x| x.len()).sum())
-        .ok_or("numeric plan overflow")?;
+        .try_fold(0usize, |sum, x| sum.checked_add(x.ncols()))
+        .ok_or_else(overflow)?;
+    let trace_width = interfaces
+        .iter()
+        .try_fold(0usize, |sum, i| sum.checked_add(i.width()))
+        .ok_or_else(overflow)?;
+    let source_cells = source
+        .operators
+        .iter()
+        .try_fold(0usize, |sum, op| {
+            let cells = match &op.body {
+                OperatorBody::Dense { values, .. } => values.len(),
+                OperatorBody::LowRank { left, right, .. } => left.len().checked_add(right.len())?,
+                OperatorBody::Diagonal { values, .. } => values.len(),
+                OperatorBody::Identity => 0,
+            };
+            sum.checked_add(cells)
+        })
+        .ok_or_else(overflow)?;
+    let base_cells = inputs
+        .iter()
+        .try_fold(targets.len(), |sum, x| sum.checked_add(x.len()))
+        .and_then(|v| v.checked_add(source_cells.checked_mul(2)?))
+        .ok_or_else(overflow)?;
+    let mut tile_plans = Vec::new();
+    let mut peak_cells = base_cells;
     for (id, _, pieces) in &plans {
         let p = pieces
             .iter()
-            .map(|(input, _)| input.map_or(1, |v| interfaces[v].width()))
-            .sum::<usize>();
+            .try_fold(0usize, |sum, (input, _)| {
+                sum.checked_add(input.map_or(1, |v| interfaces[v].width()))
+            })
+            .ok_or_else(overflow)?;
         let k = interfaces[*id].width();
-        let r = n.min(p);
-        let block = n
-            .checked_mul(p)
-            .and_then(|v| v.checked_mul(4))
-            .and_then(|v| v.checked_add(n.checked_mul(k)?.checked_mul(6)?))
-            .and_then(|v| v.checked_add(p.checked_mul(k)?.checked_mul(4)?))
-            .and_then(|v| v.checked_add((n.checked_add(p)?).checked_mul(r)?.checked_mul(3)?))
-            .ok_or("numeric plan overflow")?;
-        cells = cells.checked_add(block).ok_or("numeric plan overflow")?;
+        // Conservative explicit QR copies/reflectors, small SVD vectors/copies,
+        // coefficient/RHS products, and per-tile evaluator values/products.
+        let fixed = p
+            .checked_mul(n.min(p))
+            .and_then(|v| v.checked_mul(20))
+            .and_then(|v| v.checked_add(p.checked_mul(k)?.checked_mul(12)?))
+            .and_then(|v| v.checked_add(base_cells))
+            .ok_or_else(overflow)?;
+        let per_row = trace_width
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(input_width))
+            .and_then(|v| v.checked_add(p.checked_mul(8)?))
+            .and_then(|v| v.checked_add(k.checked_mul(8)?))
+            .ok_or_else(overflow)?;
+        let available = (numeric_bytes / 8).checked_sub(fixed).ok_or(
+            "linear prefit budget cannot hold reduced QR/SVD workspace and resident panels",
+        )?;
+        let tile_rows = (available / per_row).min(4096).min(n);
+        if tile_rows == 0 {
+            return Err("linear prefit budget cannot hold one execution/QR row tile".into());
+        }
+        peak_cells = peak_cells.max(
+            fixed
+                .checked_add(per_row.checked_mul(tile_rows).ok_or_else(overflow)?)
+                .ok_or_else(overflow)?,
+        );
+        tile_plans.push(tile_rows);
     }
-    cells = cells
-        .checked_add(
-            source
-                .operators
-                .iter()
-                .map(|op| match &op.body {
-                    OperatorBody::Dense { values, .. } => values.len(),
-                    _ => 0,
-                })
-                .sum::<usize>(),
-        )
-        .ok_or("numeric plan overflow")?;
-    let planned_numeric_bytes = cells.checked_mul(8).ok_or("numeric plan overflow")?;
+    let planned_numeric_bytes = peak_cells.checked_mul(8).ok_or_else(overflow)?;
     if planned_numeric_bytes > numeric_bytes {
         return Err(format!(
             "linear prefit numeric plan {planned_numeric_bytes} exceeds budget {numeric_bytes}"
@@ -241,63 +273,89 @@ pub fn prefit(
     }
     let mut program = source.clone();
     let mut blocks = Vec::new();
-    if !plans.is_empty() {
-        let family = FamilyInputs {
-            rows: n,
-            slots: inputs.iter().cloned().map(SlotValues::Raw).collect(),
-            layout: None,
-        };
-        let trace = source.execute(&family, false).map_err(|e| e.to_string())?;
-        for (id, offset, pieces) in plans {
-            let k = interfaces[id].width();
-            let p = pieces
-                .iter()
-                .map(|(input, _)| input.map_or(1, |v| interfaces[v].width()))
-                .sum();
-            let mut x = Array2::ones((n, p));
-            let mut b0 = Array2::zeros((p, k));
-            let mut column = 0;
-            for &(input, op) in &pieces {
-                let OperatorBody::Dense { values, .. } = &source.operators[op].body else {
-                    return Err("selected operator changed kind".into());
-                };
-                let width = values.ncols();
-                if let Some(input) = input {
-                    x.slice_mut(s![.., column..column + width])
-                        .assign(&trace.values[input]);
-                }
-                b0.slice_mut(s![column..column + width, ..])
-                    .assign(&values.t());
-                column += width;
-            }
-            let adjusted = targets.slice(s![.., offset..offset + k]).to_owned() - &trace.values[id]
-                + x.dot(&b0);
-            let fit = linear_coefficient_fit::fit(&x, &adjusted, &b0, settings.clone())?;
-            column = 0;
-            for &(_, op) in &pieces {
-                let OperatorBody::Dense {
-                    values, precision, ..
-                } = &mut Arc::make_mut(&mut program.operators[op]).body
-                else {
-                    return Err("selected operator changed kind".into());
-                };
-                let width = values.ncols();
-                *values = fit
-                    .coefficients
-                    .slice(s![column..column + width, ..])
-                    .t()
-                    .to_owned();
-                *precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
-                column += width;
-            }
-            blocks.push(Block {
-                node: id,
-                operators: pieces.iter().map(|(_, op)| *op).collect(),
-                diagnostics: fit.diagnostics,
-            });
+    for ((id, offset, pieces), tile_rows) in plans.into_iter().zip(tile_plans) {
+        let k = interfaces[id].width();
+        let p = pieces
+            .iter()
+            .map(|(input, _)| input.map_or(1, |v| interfaces[v].width()))
+            .sum();
+        let mut b0 = Array2::zeros((p, k));
+        let mut column = 0;
+        for &(_, op) in &pieces {
+            let OperatorBody::Dense { values, .. } = &source.operators[op].body else {
+                return Err("selected operator changed kind".into());
+            };
+            let width = values.ncols();
+            b0.slice_mut(s![column..column + width, ..])
+                .assign(&values.t());
+            column += width;
         }
+        let fit = linear_coefficient_fit::fit_residual_streaming(
+            n,
+            &b0,
+            settings.clone(),
+            tile_rows,
+            |rows| {
+                let count = rows.end - rows.start;
+                let family = FamilyInputs {
+                    rows: count,
+                    slots: inputs
+                        .iter()
+                        .map(|x| SlotValues::Raw(x.slice(s![rows.clone(), ..]).to_owned()))
+                        .collect(),
+                    layout: None,
+                };
+                let trace = source.execute(&family, false).map_err(|e| e.to_string())?;
+                let mut x = Array2::ones((count, p));
+                let mut column = 0;
+                for &(input, op) in &pieces {
+                    let width = source.operators[op].cols.width();
+                    if let Some(input) = input {
+                        x.slice_mut(s![.., column..column + width])
+                            .assign(&trace.values[input]);
+                    }
+                    column += width;
+                }
+                // Work directly with Y - current output. Frozen terms cancel
+                // without constructing (Y - output + X B0) and subtracting X B0.
+                let residual =
+                    targets.slice(s![rows, offset..offset + k]).to_owned() - &trace.values[id];
+                Ok((x, residual))
+            },
+        )?;
+        column = 0;
+        for &(_, op) in &pieces {
+            let OperatorBody::Dense {
+                values, precision, ..
+            } = &mut Arc::make_mut(&mut program.operators[op]).body
+            else {
+                return Err("selected operator changed kind".into());
+            };
+            let width = values.ncols();
+            *values = fit
+                .coefficients
+                .slice(s![column..column + width, ..])
+                .t()
+                .to_owned();
+            *precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
+            column += width;
+        }
+        blocks.push(Block {
+            node: id,
+            operators: pieces.iter().map(|(_, op)| *op).collect(),
+            diagnostics: fit.diagnostics,
+            row_tile_rows: tile_rows,
+        });
     }
-    Ok(Fit {program,report:Report {blocks,refusals,planned_numeric_bytes,budget_scope:"explicit f64 input/trace/design/SVD-product/coefficient arrays; excludes evaluator and linear algebra allocator workspace, metadata, and existing source/target storage"}})
+    Ok(Fit {
+        program,
+        report: Report {
+            blocks,
+            refusals,
+            planned_numeric_bytes,
+            budget_scope: "resident input/target panels, source/fitted coefficients, bounded row-tile traces and conservative explicit Householder/reduced-SVD arrays; blocks solved sequentially; excludes allocator/evaluator/library scratch and metadata, not a hard process-RSS guarantee; every row used in reduction and residual replay",
+        },
+    })
 }
 
 #[cfg(test)]
@@ -403,11 +461,12 @@ mod tests {
         let x = array![[-1.], [1.], [2.]];
         let fit = run(&p, &x, &values(&p, &x), &[0]);
         assert!(fit.report.blocks.is_empty());
-        assert!(fit
-            .report
-            .refusals
-            .iter()
-            .any(|v| v.contains("reused owner")));
+        assert!(
+            fit.report
+                .refusals
+                .iter()
+                .any(|v| v.contains("reused owner"))
+        );
         assert!(Arc::ptr_eq(&p.operators[0], &fit.program.operators[0]));
     }
     #[test]
@@ -443,11 +502,12 @@ mod tests {
         });
         let fit = run(&p, &x, &values(&p, &x), &[1]);
         assert!(fit.report.blocks.is_empty());
-        assert!(fit
-            .report
-            .refusals
-            .iter()
-            .any(|v| v.contains("reused owner")));
+        assert!(
+            fit.report
+                .refusals
+                .iter()
+                .any(|v| v.contains("reused owner"))
+        );
     }
     #[test]
     fn fixed_terms_are_subtracted_and_budget_refuses_before_trace() {
@@ -460,12 +520,62 @@ mod tests {
         let y = values(&p, &x) + 1.;
         let fit = run(&p, &x, &y, &[2]);
         assert_eq!(fit.report.blocks[0].operators, vec![2]);
-        assert!((&values(&fit.program, &x) - &y)
-            .iter()
-            .all(|v| v.abs() < 1e-10));
-        assert!(prefit(&p, &[x], &y, &[2], Default::default(), 0)
-            .unwrap_err_string()
-            .contains("budget"));
+        assert!(
+            (&values(&fit.program, &x) - &y)
+                .iter()
+                .all(|v| v.abs() < 1e-10)
+        );
+        assert!(
+            prefit(&p, &[x], &y, &[2], Default::default(), 0)
+                .unwrap_err_string()
+                .contains("budget")
+        );
+    }
+    #[test]
+    fn tall_program_prefit_executes_bounded_tiles_and_preserves_frozen_features() {
+        let source = model();
+        let x = Array2::from_shape_fn((20001, 1), |(r, _)| r as f64 / 5000. - 2.);
+        let mut teacher = source.clone();
+        if let OperatorBody::Dense { values, .. } =
+            &mut Arc::make_mut(&mut teacher.operators[1]).body
+        {
+            values[[0, 0]] = 3.;
+        }
+        if let OperatorBody::Dense { values, .. } =
+            &mut Arc::make_mut(&mut teacher.operators[2]).body
+        {
+            values[[0, 0]] = -0.75;
+        }
+        let y = values(&teacher, &x);
+        // Resident panels fit, but a full-height trace/design/SVD plan does not.
+        let budget = 700_000;
+        let solved = prefit(
+            &source,
+            &[x.clone()],
+            &y,
+            &[1, 2],
+            Default::default(),
+            budget,
+        )
+        .unwrap();
+        assert!(solved.report.planned_numeric_bytes <= budget);
+        assert_eq!(solved.report.blocks.len(), 1);
+        assert!(solved.report.blocks[0].row_tile_rows < x.nrows());
+        assert!(solved.report.blocks[0].diagnostics.row_tiles > 1);
+        assert_eq!(
+            solved.report.blocks[0].diagnostics.method,
+            "streaming_householder_qr_reduced_svd"
+        );
+        assert!(Arc::ptr_eq(
+            &source.operators[0],
+            &solved.program.operators[0]
+        ));
+        assert!(
+            (&values(&solved.program, &x) - &y)
+                .iter()
+                .all(|v| v.abs() < 1e-10)
+        );
+        assert!(prefit(&source, &[x], &y, &[1, 2], Default::default(), 1).is_err());
     }
     trait ErrorString {
         fn unwrap_err_string(self) -> String;
