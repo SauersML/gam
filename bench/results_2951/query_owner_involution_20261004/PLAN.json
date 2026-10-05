@@ -1,0 +1,55 @@
+{
+  "created_utc": "2026-10-05T02:47:22.771087+00:00",
+  "source_head_before_implementation": "a644e06519",
+  "hypothesis": "The chosen native head contains a context-stable query component on which changing the queried person acts as an affine orthogonal involution. This tests a joint state/control relation, not sparsity of the full query or a generic identity-label decoder.",
+  "scope": {
+    "read_node": 2073,
+    "native_site": "Qwen3-0.6B L19H5 post-query-normalization/pre-RoPE, last row only",
+    "discovery_cases": 64,
+    "owner_pairs": 32,
+    "heldout": "Do not open native outputs. Current law swaps a specific pair of names; generic new-name transfer is not assumed."
+  },
+  "program": "T(q)=q-2 U U^T(q-mbar), U orthonormal, frozen across contexts and both directions. Native high-dimensional complement retained. No donor query, owner label, target attention, or target logits used at prediction.",
+  "fit": "Train-fold q0/q1 give m=(q0+q1)/2,d=(q1-q0)/2; choose top-k eigenvectors of mean(dd^T)-cov(m); mbar=train mean(m). Exact global minimum of bidirectional Euclidean query error within fixed-rank reflection family; does not optimize tail KL.",
+  "fold": "XOR old_statement_order,update_statement_order,payload_swap,update_wording; group both query_owner states in one fold; query_now varies within each fold.16pairs train,16 opposite evaluation. All data previously used for discovery; not untouched generalization.",
+  "ranks": [
+    0,
+    1,
+    2,
+    4,
+    8,
+    16
+  ],
+  "primary_rank": 1,
+  "secondary_rank": 4,
+  "other_ranks": "diagnostic expressivity curve; no post-evaluation relabeling as primary",
+  "controls": [
+    "rank0 identity",
+    "full donor-query local invocation reference",
+    "fixed train mean signed translation, explicitly label-assisted",
+    "deterministic same-rank random reflections centered at train mbar; not necessarily perturbation-norm-matched"
+  ],
+  "reference": "For each recipient, replace only selected last-row query with counterpart person query. Keep recipient keys, values and other native background. This is a finite invocation intervention, not the full text-counterfactual model or a checkpoint edit.",
+  "metrics": [
+    "full attention KL oracle local intervention to predicted law on identical recipient K",
+    "record-prefix and nonself-prefix conditional attention separately",
+    "query error normalized by full donor norm and by actual swap displacement",
+    "native value read error and physical-slot masses",
+    "native full-vocabulary tail KL relative to full donor-query local intervention",
+    "fixed physical color0-color1 log odds error",
+    "native-to-reference effect magnitude",
+    "norm changes; no silent renormalization"
+  ],
+  "branch_decisions": {
+    "success": "If frozen low-rank law substantially improves full native-tail intervention prediction over identity and random controls in both directions and context strata, identify a narrow reusable native query-control relation. Next recover how upstream/native key representations construct its arguments; do not claim generic owner coding.",
+    "attention_only": "No native downstream explanation established; retain as local diagnostic and inspect response relevance.",
+    "failure": "Reject fixed context-independent orthogonal query swap for tested ranks/scope; distinguish error concentrated in address/context coupling from simple numerical rank shortage. Do not grow affine adapters without evidence."
+  },
+  "limitations": [
+    "Head and task chosen using discovery measurements.",
+    "Reflection family and person-swap correspondence supplied by investigator.",
+    "Query center/maps count in artifact; native background retained explicitly.",
+    "Post-gain query patches may leave native normalization manifold; reference and norm diagnostics explicit.",
+    "No whole-model algorithm recovery or VPD victory from this experiment."
+  ]
+}
