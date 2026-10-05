@@ -12,19 +12,31 @@
 //!
 //! over `K` candidates `u_j`. A gate's are writes: earlier functions' output vectors (columns of
 //! `library.l{l'}.mlp.out`, `l' < l`, at the weight sample) and `M`'s token embedding rows (the
-//! columns of `wte`). A head's are the query–key maps of heads in other layers with keys of their
+//! columns of `wte`). A head's are the query–key maps of heads in earlier layers with keys of their
 //! own, each brought to the target's gauge plane by plane (`library_sharing::gauge`, a rotation and
 //! a scale that leave its scores unchanged), the gauge fixed for the epoch. The scales `c_j`, the
 //! weights `π = softmax(z)` of the logits `z` and the variance `s²` are learned. As the groups' own
 //! Gaussian times `r(g) = π_0 + Σ_j π_j N(g; c_j u_j, s² I) / N(g; 0, diag v)`, the divergence is
 //! `KL(q ‖ N(0, diag v)) − E_q[ln r(g)]`. `library_mdl` keeps the first term's closed form; this
 //! module estimates the second from the fit's own reparameterized weight sample, an unbiased
-//! estimate, so `F` stays a code length. `v` enters `r` as the closed form sets it.
+//! estimate. These are conditional priors: the candidates use the same weight sample as the
+//! targets. Heads condition only on earlier layers, so their product is a normalized joint prior
+//! for fixed mixture parameters and gauges. Allowing mutual head candidates would instead form
+//! a product of cyclic conditionals, which need not be normalizable. `v` enters `r` as the closed
+//! form sets it.
 //!
 //! The mixture's own parameters are sent too: each target's `K` candidates among its `n` choices
 //! (`ln C(n, K)` nats), and its `K` free logits, `K` scales and its variance, each at the precision
 //! of a value estimated from the target's `|G|` entries (`½ ln |G|` nats), as `library_mdl` prices
-//! a group's variance. A removed target sends nothing.
+//! a group's variance. Head alignment gauges additionally cost 64 bits per stored matrix entry
+//! and scale: they depend on the target means and cannot be reconstructed from a parent sample
+//! alone. This is a conservative literal charge; the other parameter costs remain the existing
+//! asymptotic estimates. A removed target sends nothing.
+//!
+//! The sample gradient treats `v` and the epoch's gauges as fixed hyperparameters. Recomputing
+//! `v` from the posterior is an adaptive update, not the optimum of the mixture objective:
+//! the Gaussian-only empirical-Bayes identity does not cancel the mixture's derivative through
+//! `v`. This path does not yet implement that total posterior derivative.
 //!
 //! # Candidates
 //!
@@ -171,7 +183,7 @@ struct Moment {
 }
 
 /// A head's query and key operators (trainable indices) and its rotary planes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct HeadMaps {
     query: usize,
     key: usize,
@@ -261,7 +273,7 @@ impl Mixture {
             heads.push(((l, h), HeadMaps { query: position(found.query)?, key: position(found.key)?, planes, groups }));
         }
         for &((l, h), ref maps) in &heads {
-            let choices = heads.iter().filter(|((other, _), _)| *other != l).count();
+            let choices = heads.iter().filter(|((other, _), other_maps)| *other < l && other_maps.planes == maps.planes).count();
             targets.push(Target { kind: Kind::Head { layer: l, head: h }, groups: maps.groups.clone(), choices, zero_logit: 0.0, components: Vec::new(), log_variance: 0.0 });
             cells.push(Vec::new());
         }
@@ -396,7 +408,8 @@ impl Mixture {
                 self.adopt(t, chosen, initial);
             }
         }
-        // Heads: every head of another layer, brought to the target's gauge at the means.
+        // Earlier heads are the parents in a fixed layer order. This preserves every possible
+        // cross-layer pair while making the product of conditional mixtures a joint density.
         for t in 0..self.targets.len() {
             let Kind::Head { layer, head } = self.targets[t].kind else { continue };
             if !self.active(t, posterior) {
@@ -410,7 +423,7 @@ impl Mixture {
             let precision = sd.mapv(|s| (-2.0 * s).exp());
             let mut scored = Vec::new();
             for &((l, h), ref other) in &self.heads {
-                if l == layer || other.planes != maps.planes {
+                if l >= layer || other.planes != maps.planes {
                     continue;
                 }
                 let (q, k) = (&posterior.mean[other.query], &posterior.mean[other.key]);
@@ -579,14 +592,29 @@ impl Mixture {
 
 impl PriorTerm for Mixture {
     fn operators(&self) -> Vec<usize> {
-        let mut out: Vec<usize> = self
-            .gates
-            .iter()
-            .chain(&self.outputs)
-            .copied()
-            .chain(self.cells.iter().flatten().map(|c| c.0))
-            .chain(self.heads.iter().flat_map(|(_, m)| [m.query, m.key]))
-            .collect();
+        // Only the selected conditional factors need per-step host samples. Candidate
+        // selection itself sees the complete posterior at the epoch boundary.
+        let mut out = Vec::new();
+        for (t, target) in self.targets.iter().enumerate().filter(|(_, t)| !t.components.is_empty()) {
+            match target.kind {
+                Kind::Gate { layer, .. } => {
+                    out.push(self.gates[layer]);
+                    out.extend(self.cells[t].iter().map(|c| c.0)); // includes bias in v_G
+                }
+                Kind::Head { layer, head } => {
+                    if let Ok(maps) = self.head(layer, head) { out.extend([maps.query, maps.key]); }
+                }
+            }
+            for candidate in &target.components {
+                match candidate.write {
+                    Write::Output { layer, .. } => out.push(self.outputs[layer]),
+                    Write::Head { layer, head } => {
+                        if let Ok(maps) = self.head(layer, head) { out.extend([maps.query, maps.key]); }
+                    }
+                    Write::Token(_) => {} // fixed embedding, not a posterior parameter
+                }
+            }
+        }
         out.sort_unstable();
         out.dedup();
         out
@@ -678,9 +706,19 @@ impl PriorTerm for Mixture {
                 }
             };
             let n = target.choices as f64;
-            let kept = k.min(n);
+            let kept = match target.kind {
+                Kind::Gate { .. } => k.min(n),
+                Kind::Head { .. } => target.components.len() as f64,
+            };
             // ln C(n, K) for the candidates, ½ ln |G| for each of the 2K + 1 values.
             total += ln_gamma(n + 1.0) - ln_gamma(kept + 1.0) - ln_gamma(n - kept + 1.0) + (2.0 * kept + 1.0) * 0.5 * size.ln();
+            if matches!(target.kind, Kind::Head { .. }) {
+                // A target-dependent alignment is additional information even though its
+                // transform preserves the parent head's attention scores.
+                let gauge_values = target.components.iter().flat_map(|c| &c.gauge)
+                    .map(|(rotation, _)| rotation.len() + 1).sum::<usize>();
+                total += gauge_values as f64 * 64.0 * std::f64::consts::LN_2;
+            }
         }
         Ok(total)
     }
@@ -690,12 +728,30 @@ impl PriorTerm for Mixture {
     }
 
     fn load(&mut self, value: &serde_json::Value) -> Result<(), String> {
-        let embedding = std::mem::take(&mut self.embedding);
         let mut restored: Mixture = serde_json::from_value(value.clone()).map_err(error)?;
-        if restored.targets.len() != self.targets.len() || restored.gates != self.gates || restored.outputs != self.outputs {
+        if restored.targets.len() != self.targets.len() || restored.gates != self.gates || restored.outputs != self.outputs || restored.heads != self.heads || restored.cells != self.cells {
             return Err("a checkpoint's mixture of another explanation".into());
         }
-        restored.embedding = embedding;
+        for (target, expected) in restored.targets.iter().zip(&self.targets) {
+            if target.kind != expected.kind || target.groups != expected.groups {
+                return Err("a checkpoint's mixture targets of another explanation".into());
+            }
+            let Kind::Head { layer, head } = target.kind else { continue };
+            let maps = self.head(layer, head)?;
+            for component in &target.components {
+                let Write::Head { layer: parent_layer, head: parent_head } = component.write else {
+                    return Err("a checkpoint's head mixture has a non-head candidate".into());
+                };
+                if parent_layer >= layer || self.head(parent_layer, parent_head)?.planes != maps.planes {
+                    return Err("a checkpoint's head mixture must condition only on compatible earlier heads".into());
+                }
+            }
+            if target.choices != expected.choices || target.components.len() > target.choices {
+                return Err("a checkpoint's head mixture has an invalid candidate count".into());
+            }
+        }
+        // Validate before moving the embedding: a rejected checkpoint leaves all state intact.
+        restored.embedding = std::mem::take(&mut self.embedding);
         *self = restored;
         Ok(())
     }
@@ -706,9 +762,135 @@ mod tests {
     use super::*;
     use gam_gpu::tensor::posterior_normal;
 
+    fn head_fixture(name: &str) -> (Explanation, Posterior, Mixture) {
+        use crate::{import::import_language_model, library_mdl::explanation, run_check::{layer_nodes, split_sites}};
+
+        let dir = crate::test_support::tiny_export(name, 2);
+        let imported = import_language_model(&dir, 6, 12).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        let native = split_sites(&imported.program).unwrap();
+        let explanation = explanation(&native, &layer_nodes(&native, 2).unwrap()).unwrap();
+        let mut posterior = Posterior::new(&explanation, 96).unwrap();
+        let mixture = Mixture::new(&explanation, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
+        let (earlier, later) = (mixture.head(0, 0).unwrap(), mixture.head(1, 0).unwrap());
+        // Identical nonzero maps previously admitted reciprocal, unit-scale components.
+        for (from, to) in [(earlier.query, later.query), (earlier.key, later.key)] {
+            posterior.mean[to] = posterior.mean[from].clone();
+        }
+        (explanation, posterior, mixture)
+    }
+
+    #[test]
+    fn head_candidates_follow_layer_order_and_keep_exact_copies() {
+        let (explanation, posterior, mut mixture) = head_fixture("library_mixture_head_order");
+        mixture.choose(&explanation, &posterior).unwrap();
+        for target in &mixture.targets {
+            let Kind::Head { layer, head } = target.kind else { continue };
+            let maps = mixture.head(layer, head).unwrap();
+            let choices = mixture.heads.iter().filter(|((l, _), m)| *l < layer && m.planes == maps.planes).count();
+            assert_eq!(target.choices, choices);
+            if layer == 0 {
+                assert!(target.components.is_empty(), "the first layer keeps its Gaussian prior");
+            }
+            for component in &target.components {
+                assert!(matches!(component.write, Write::Head { layer: parent, .. } if parent < layer));
+            }
+        }
+        let copied = mixture.targets.iter().find(|t| t.kind == Kind::Head { layer: 1, head: 0 }).unwrap();
+        let source = copied.components.iter().find(|c| c.write == Write::Head { layer: 0, head: 0 }).expect("the cross-layer copy stays available");
+        assert!((source.scale - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_cyclic_checkpoint_is_rejected_without_changing_the_mixture() {
+        let (explanation, posterior, mut mixture) = head_fixture("library_mixture_head_restore");
+        mixture.choose(&explanation, &posterior).unwrap();
+        let before = mixture.save().unwrap();
+        let embedding = mixture.embedding.clone();
+        let mut cyclic = mixture.clone();
+        let later = cyclic.targets.iter().find(|t| t.kind == Kind::Head { layer: 1, head: 0 }).unwrap();
+        let mut reverse = later.components.iter().find(|c| c.write == Write::Head { layer: 0, head: 0 }).unwrap().clone();
+        reverse.write = Write::Head { layer: 1, head: 0 };
+        cyclic.targets.iter_mut().find(|t| t.kind == Kind::Head { layer: 0, head: 0 }).unwrap().components.push(reverse);
+        assert!(mixture.load(&cyclic.save().unwrap()).unwrap_err().contains("earlier heads"));
+        assert_eq!(mixture.save().unwrap(), before);
+        assert_eq!(mixture.embedding, embedding);
+        assert!(mixture.load(&serde_json::json!({})).is_err());
+        assert_eq!(mixture.save().unwrap(), before);
+        assert_eq!(mixture.embedding, embedding);
+        mixture.load(&before).unwrap();
+        assert_eq!(mixture.save().unwrap(), before);
+        assert_eq!(mixture.embedding, embedding);
+    }
+
+    #[test]
+    fn head_cost_counts_the_components_actually_selected() {
+        let (explanation, posterior, mut mixture) = head_fixture("library_mixture_head_cost");
+        mixture.choose(&explanation, &posterior).unwrap();
+        let keep = mixture.targets.iter().position(|t| t.kind == Kind::Head { layer: 1, head: 0 }).unwrap();
+        for (t, target) in mixture.targets.iter_mut().enumerate() {
+            target.components.truncate(if t == keep { 1 } else { 0 });
+        }
+        let target = &mixture.targets[keep];
+        assert_eq!(target.components.len(), 1);
+        let maps = mixture.head(1, 0).unwrap();
+        let size = 2 * maps.planes.iter().map(Vec::len).sum::<usize>() * posterior.mean[maps.query].ncols();
+        let gauge_values = target.components[0].gauge.iter().map(|(rotation, _)| rotation.len() + 1).sum::<usize>();
+        assert!(gauge_values > 0, "the target-dependent gauge must be charged");
+        let expected = (target.choices as f64).ln() + 1.5 * (size as f64).ln()
+            + gauge_values as f64 * 64.0 * std::f64::consts::LN_2;
+        assert!((mixture.cost(&posterior).unwrap() - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn prior_samples_only_selected_operators_and_reselects_them() {
+        let (explanation, posterior, mut mixture) = head_fixture("library_mixture_selected_operators");
+        assert!(mixture.operators().is_empty());
+        mixture.choose(&explanation, &posterior).unwrap();
+        assert!(!mixture.operators().contains(mixture.outputs.last().unwrap()),
+            "the final layer's output cannot be a prior parent");
+        for target in &mut mixture.targets {
+            if target.kind != (Kind::Head { layer: 1, head: 0 }) { target.components.clear(); }
+        }
+        let selected = mixture.operators();
+        assert!(selected.len() <= 6, "one target and at most two parent Q/K pairs");
+        let theta = selected.iter().map(|&i| (i, posterior.mean[i].clone())).collect();
+        let (value, gradient) = mixture.sample(&posterior, &theta, false).unwrap();
+        assert!(value.is_finite());
+        assert!(gradient.keys().all(|i| selected.contains(i)));
+        mixture.choose(&explanation, &posterior).unwrap();
+        let reselected = mixture.operators();
+        assert!(reselected.len() > selected.len());
+        let theta = reselected.iter().map(|&i| (i, posterior.mean[i].clone())).collect();
+        assert!(mixture.sample(&posterior, &theta, false).unwrap().0.is_finite());
+    }
+
     fn gaussian_log_density(x: ArrayView1<'_, f64>, mean: ArrayView1<'_, f64>, variance: f64) -> f64 {
         let r = &x - &mean;
         -0.5 * x.len() as f64 * (2.0 * PI * variance).ln() - r.dot(&r) / (2.0 * variance)
+    }
+
+    #[test]
+    fn cyclic_conditionals_do_not_define_the_claimed_joint_density() {
+        // Two half-weight mixtures with mutual scales a=b=1/2 have
+        // Z = 1 - 1/4 + (1/4)/|1-ab| = 13/12, not one. Integrate the actual
+        // implemented correction against the two base Gaussian densities.
+        // A single directed conditional, with the other's base Gaussian, has Z=1.
+        let (mut directed, mut cyclic) = (0.0, 0.0);
+        let variance = ndarray::array![1.0];
+        for ix in -120..=120 {
+            let x = ndarray::array![ix as f64 * 0.1];
+            for iy in -120..=120 {
+                let y = ndarray::array![iy as f64 * 0.1];
+                let xy = term(x.view(), &[(y.view(), 0.5)], &[0.0, 0.0], 0.0, variance.view()).unwrap().value;
+                let yx = term(y.view(), &[(x.view(), 0.5)], &[0.0, 0.0], 0.0, variance.view()).unwrap().value;
+                let base = -(2.0 * PI).ln() - 0.5 * (x[0] * x[0] + y[0] * y[0]);
+                directed += (base - yx).exp() * 0.01;
+                cyclic += (base - xy - yx).exp() * 0.01;
+            }
+        }
+        assert!((directed - 1.0).abs() < 1e-9, "{directed}");
+        assert!((cyclic - 13.0 / 12.0).abs() < 1e-9, "{cyclic}");
     }
 
     #[test]

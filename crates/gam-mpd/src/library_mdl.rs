@@ -1773,9 +1773,6 @@ pub fn fit(
         progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
         save(&mut progress, &posterior, &device_posterior)?;
     }
-    // The prior term's operators: their means and deviations come to the host every step, as its
-    // weight sample is drawn there.
-    let prior_operators = prior.as_deref().map(PriorTerm::operators).unwrap_or_default();
     while !progress.done {
         let epoch = progress.epoch;
         let epoch_started = Instant::now();
@@ -1784,6 +1781,9 @@ pub fn fit(
         {
             prior.epoch(explanation, &posterior)?;
         }
+        // Selection may change the required operators each epoch. Only these means and
+        // deviations cross to the host per step for the current CPU prior implementation.
+        let prior_operators = prior.as_deref().map(PriorTerm::operators).unwrap_or_default();
         let mut estimates = Vec::with_capacity(draws.len());
         let (mut data_sum, mut description_sum) = (0.0, 0.0);
         let (mut clean, mut patched) = (Mean::default(), Mean::default());

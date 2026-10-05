@@ -1,0 +1,45 @@
+{
+  "source": "85a58fb20581a6ce767b18e66b5277b1b3dc75fc",
+  "scope": "Learned-sharing proposal prior correctness and transfer selection. No trained-model mechanism discovery or measured CUDA speedup.",
+  "changes": [
+    "Head conditionals only reference compatible earlier layers; every cross-layer pair remains available in one orientation.",
+    "Checkpoint restore rejects forward or cyclic head references transactionally.",
+    "Actual selected head components are counted; target-dependent gauge matrices and scales carry 64-bit literal charges.",
+    "Only operators participating in selected conditionals are downloaded and sampled per step; the operator list refreshes after each epoch selection."
+  ],
+  "counterexample": {
+    "zero_mixture_weights": [
+      0.5,
+      0.5
+    ],
+    "mutual_scales": [
+      0.5,
+      0.5
+    ],
+    "joint_normalizer": 1.0833333333333333,
+    "formula": "Z = 1 - (1-alpha)(1-beta) + (1-alpha)(1-beta)/abs(1-a*b)",
+    "unit_mutual_scales": "Positive mutual component is nonintegrable along x=y.",
+    "directed_construction": "A prior root and normalized conditional integrate to one; fixed earlier-layer order applies this recursively.",
+    "test": "Numerical quadrature of the implemented term: cyclic Z=13/12, directed Z=1 within 1e-9."
+  },
+  "validation": {
+    "working_tree_tests": 8,
+    "pinned_main_focused_tests": 8,
+    "pinned_full_library": {
+      "passed": 245,
+      "failed": 0,
+      "source": "7065088aabd86d286b813f7f8c66a3a736fa09a3"
+    },
+    "pinned_main_focused_source": "7065088aabd86d286b813f7f8c66a3a736fa09a3",
+    "merged_focused_tests": 8,
+    "merged_focused_source": "85a58fb20581a6ce767b18e66b5277b1b3dc75fc",
+    "merged_failed_tests": 0,
+    "merged_build_note": "Two parallel dependency builds were terminated with SIGKILL before tests. Serial compilation with an explicit memory lease completed and all eight focused tests passed."
+  },
+  "remaining_limitations": [
+    "Other parameter-code charges remain asymptotic estimates; this is not a complete finite-bit coding proof.",
+    "Mixture pathwise gradients hold empirical-Bayes base variances fixed. Recomputing those variances from the posterior adds chain-rule terms not implemented here.",
+    "The selected mixture operations still run on CPU. Resident CUDA mixture kernels remain needed; transfer reduction is not a measured speedup.",
+    "The soft-sharing prior proposes candidates; final hard-sharing comparisons refit without that mixture prior. Existing hard-candidate scores should not be retroactively labeled cyclic-prior scores."
+  ]
+}

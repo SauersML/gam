@@ -24,10 +24,12 @@
     "library_tests": 239,
     "library_status": "passed",
     "tested_source": "edfb9aa49b5d4630445a1d54b79d24351d33c487",
-    "status": "library_passed_remaining_unobserved",
-    "driver_status": "Job still running at last successful observation; subsequent SSH timed out",
-    "benchmark_status": "Unobserved; CUDA benchmark depends on successful completion",
-    "gpu_status": "16404 and 16405 scheduler held at last observation; 16419 dependency pending. No GPU result."
+    "status": "passed",
+    "driver_status": "passed",
+    "benchmark_status": "passed",
+    "gpu_status": "16404 and 16405 scheduler held at last observation; 16419 dependency pending. No GPU result.",
+    "driver_tests": 27,
+    "exit_code_record": "lib=0 driver=0 benchmark=0"
   },
   "scope": "Device F64 native same-input supervision, whole-sequence tiling and memory accounting. No mechanism discovery or demonstrated CUDA speedup.",
   "files": {

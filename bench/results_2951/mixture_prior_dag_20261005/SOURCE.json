@@ -1,0 +1,9 @@
+{
+  "base": "00002cfe4a009a6a3310b2295bd0e4f2a81b72a2",
+  "commit": "85a58fb20581a6ce767b18e66b5277b1b3dc75fc",
+  "tree": "f7448a8b3afb1c6be950826f4b54cca13fe9ad77",
+  "files": {
+    "crates/gam-mpd/src/library_mixture.rs": "4d691872df56918a291757566133e398e91148cfbe31b27fbe0147465d7082dc",
+    "crates/gam-mpd/src/library_mdl.rs": "19a3dd9f92ab3c142ebe734b307f734c04958bfca36d99f18d5df88c453cdaa7"
+  }
+}
