@@ -15,10 +15,10 @@
 //!
 //! `p(g) = π_0 N(g; 0, diag v) + Σ_{j ∈ C} π_j N(g; c_j u_j, s² I)`
 //!
-//! over `K` candidates `u_j`, all at the weight sample and all of earlier layers `l' < l`. A gate's
-//! are earlier gate directions, earlier functions' output vectors (a read of what they write) and
-//! `M`'s token embedding rows (the columns of `wte`); an up direction's are earlier up directions;
-//! an output's are earlier output vectors. A key-value group's are the query–key maps of groups
+//! over `K` candidates `u_j`, all at the weight sample and all of earlier layers `l' < l`. A read
+//! (a gate or up direction)'s are earlier reads of either part and `M`'s token embedding rows (the
+//! columns of `wte`), and a gate's also earlier functions' output vectors (a read of what they
+//! write); an output's are earlier output vectors. A key-value group's are the query–key maps of groups
 //! in earlier layers with keys of their own, as many query heads and the same planes, each
 //! brought to the target's gauge plane by plane (`library_sharing::gauge`, a rotation and a scale
 //! that leave every one of its heads' scores unchanged) with each target query head facing one of
@@ -62,9 +62,9 @@
 //! # Hardening
 //!
 //! When one candidate holds more than half of its target's mixture weight, the sharing is made
-//! exact: a gate reading an earlier write becomes a tie (`library_sharing::tie`,
-//! `library_sharing::tie_token`), a gate or up direction a scale times an earlier one
-//! (`library_sharing::tie_row`), an output vector a scale times an earlier one
+//! exact: a gate reading an earlier write becomes a tie (`library_sharing::tie`), a gate or up
+//! direction a scale times an earlier read or a token's embedding row (`library_sharing::tie_row`),
+//! an output vector a scale times an earlier one
 //! (`library_sharing::tie_column`), two key-value groups one shared query–key function with the
 //! target's query heads assigned as the component's (`library_sharing::share_query_key`), a value
 //! map a scale times the transported earlier one (`library_sharing::share_value`). A block takes
@@ -343,10 +343,10 @@ impl Mixture {
         let mut written = 0;
         for (l, layer) in explanation.layers.iter().enumerate() {
             for function in 0..layer.functions.len() {
-                let mut blocks = vec![(Kind::Gate { layer: l, function }, 2 * written + embedding.ncols()), (Kind::Output { layer: l, function }, written)];
+                let earlier_ups: usize = (0..l).filter(|e| ups[*e].is_some()).map(|e| explanation.layers[e].functions.len()).sum();
+                let mut blocks = vec![(Kind::Gate { layer: l, function }, 2 * written + earlier_ups + embedding.ncols()), (Kind::Output { layer: l, function }, written)];
                 if ups[l].is_some() {
-                    let earlier_ups: usize = (0..l).filter(|e| ups[*e].is_some()).map(|e| explanation.layers[e].functions.len()).sum();
-                    blocks.push((Kind::Up { layer: l, function }, earlier_ups));
+                    blocks.push((Kind::Up { layer: l, function }, written + earlier_ups + embedding.ncols()));
                 }
                 for (kind, choices) in blocks {
                     let name = Write::of(kind).group().ok_or("an MLP block's group")?;
@@ -512,9 +512,11 @@ impl Mixture {
         for earlier in 0..layer {
             let units = explanation.layers[earlier].functions.len();
             for function in 0..units {
+                // A read's candidates are earlier reads, of either part, and for a gate earlier writes.
+                let up = self.ups[earlier].is_some().then_some(Write::Up { layer: earlier, function });
                 let writes: Vec<Write> = match kind {
-                    Kind::Gate { .. } => vec![Write::Output { layer: earlier, function }, Write::Gate { layer: earlier, function }],
-                    Kind::Up { .. } if self.ups[earlier].is_some() => vec![Write::Up { layer: earlier, function }],
+                    Kind::Gate { .. } => [Some(Write::Output { layer: earlier, function }), Some(Write::Gate { layer: earlier, function }), up].into_iter().flatten().collect(),
+                    Kind::Up { .. } => [Some(Write::Gate { layer: earlier, function }), up].into_iter().flatten().collect(),
                     Kind::Output { .. } => vec![Write::Output { layer: earlier, function }],
                     _ => Vec::new(),
                 };
@@ -527,7 +529,7 @@ impl Mixture {
                 }
             }
         }
-        if matches!(kind, Kind::Gate { .. }) {
+        if matches!(kind, Kind::Gate { .. } | Kind::Up { .. }) {
             out.extend((0..self.embedding.ncols()).map(Write::Token));
         }
         Ok(out)
@@ -706,9 +708,9 @@ impl Mixture {
     }
 
     /// `explanation` with every candidate that dominates at `posterior` made exact (module note):
-    /// an earlier output becomes a scale times the gate (`library_sharing::tie`), a gate a scale
-    /// times a token's embedding row (`library_sharing::tie_token`), a gate or up direction a scale
-    /// times an earlier one (`library_sharing::tie_row`), an output vector a scale times an earlier
+    /// an earlier output becomes a scale times the gate (`library_sharing::tie`), a gate or up
+    /// direction a scale times an earlier read or a token's embedding row
+    /// (`library_sharing::tie_row`), an output vector a scale times an earlier
     /// one (`library_sharing::tie_column`), each scale starting at the least-squares fit of the
     /// vector it replaces at `explanation`'s values, and two heads one shared query–key function
     /// (`library_sharing::share_query_key`). Each choice costs `ln n` nats. An MLP block that two
@@ -718,7 +720,7 @@ impl Mixture {
         let values = |name: String| -> Result<Array2<f64>, String> { Ok(program.operators[operator_index(program, &name)?].matrix()) };
         let mut ties: Vec<Tie> = Vec::new();
         let mut tokens = Vec::new();
-        let mut rows: Vec<(&'static str, (usize, usize), (usize, usize), f64)> = Vec::new();
+        let mut rows: Vec<(&'static str, (usize, usize), (usize, usize, &'static str), f64)> = Vec::new();
         let mut columns: Vec<((usize, usize), (usize, usize), f64)> = Vec::new();
         let mut pairs: Vec<[library_sharing::Member; 2]> = Vec::new();
         let mut shared_values: Vec<((usize, usize), (usize, usize), f64)> = Vec::new();
@@ -741,10 +743,10 @@ impl Mixture {
                 }
             };
             match (target.kind, source) {
-                (Kind::Gate { layer: gl, function: gi }, Write::Gate { layer, function }) | (Kind::Up { layer: gl, function: gi }, Write::Up { layer, function }) => {
+                (Kind::Gate { layer: gl, function: gi } | Kind::Up { layer: gl, function: gi }, Write::Gate { layer, function } | Write::Up { layer, function }) => {
                     let Some(scale) = least_squares(&block(own)?, &block(source)?) else { continue };
-                    let part = if matches!(own, Write::Gate { .. }) { "gate" } else { "up" };
-                    rows.push((part, (gl, gi), (layer, function), scale));
+                    let part = |w: Write| if matches!(w, Write::Gate { .. }) { "gate" } else { "up" };
+                    rows.push((part(own), (gl, gi), (layer, function, part(source)), scale));
                 }
                 (Kind::Output { layer: ol, function: oi }, Write::Output { layer, function }) => {
                     let Some(scale) = least_squares(&block(own)?, &block(source)?) else { continue };
@@ -758,13 +760,14 @@ impl Mixture {
                     }
                     ties.push(Tie { source: (layer, function), target: (gl, gi), scale: u.dot(&g) / g.dot(&g) });
                 }
-                (Kind::Gate { layer: gl, function: gi }, Write::Token(token)) => {
-                    let g = values(format!("library.l{gl}.mlp.gate"))?.row(gi).to_owned();
+                (Kind::Gate { layer: gl, function: gi } | Kind::Up { layer: gl, function: gi }, Write::Token(token)) => {
+                    let part = if matches!(own, Write::Gate { .. }) { "gate" } else { "up" };
+                    let g = values(format!("library.l{gl}.mlp.{part}"))?.row(gi).to_owned();
                     let e = self.embedding.column(token);
                     if e.dot(&e) == 0.0 {
                         continue;
                     }
-                    tokens.push(((gl, gi), token, g.dot(&e) / e.dot(&e)));
+                    tokens.push((part, (gl, gi), token, g.dot(&e) / e.dot(&e)));
                 }
                 (Kind::QueryKey { layer, group }, Write::QueryKey { layer: other, group: g }) => {
                     // The earlier group owns the shared maps; the target's head `i` reads the
@@ -792,11 +795,11 @@ impl Mixture {
             nats += (target.choices as f64).ln();
         }
         let mut out = library_sharing::tie(explanation, &ties)?;
-        for (target, token, scale) in tokens {
-            out = library_sharing::tie_token(&out, target, token, scale)?;
+        for (part, target, token, scale) in tokens {
+            out = library_sharing::tie_row(&out, part, target, library_sharing::RowSource::Token(token), scale)?;
         }
-        for (part, target, (layer, function), scale) in rows {
-            out = library_sharing::tie_row(&out, part, target, library_sharing::RowSource::Row { layer, part, function }, scale)?;
+        for (part, target, (layer, function, from), scale) in rows {
+            out = library_sharing::tie_row(&out, part, target, library_sharing::RowSource::Row { layer, part: from, function }, scale)?;
         }
         for (target, source, scale) in columns {
             out = library_sharing::tie_column(&out, target, source, scale)?;
@@ -1108,7 +1111,7 @@ impl PriorTerm for Mixture {
                     (Kind::Value { layer, group }, Write::Value { layer: parent, group: g }) => parent < layer && self.value(parent, g)?.heads == self.value(layer, group)?.heads && component.transport.is_some(),
                     (Kind::QueryKey { .. } | Kind::Value { .. }, _) | (_, Write::QueryKey { .. } | Write::Value { .. }) => false,
                     (Kind::Gate { layer, .. } | Kind::Up { layer, .. } | Kind::Output { layer, .. }, write) => match write {
-                        Write::Token(_) => matches!(target.kind, Kind::Gate { .. }),
+                        Write::Token(_) => matches!(target.kind, Kind::Gate { .. } | Kind::Up { .. }),
                         Write::Output { layer: parent, .. } | Write::Gate { layer: parent, .. } | Write::Up { layer: parent, .. } => parent < layer,
                         Write::QueryKey { .. } | Write::Value { .. } => false,
                     },
@@ -1568,6 +1571,41 @@ mod tests {
         assert!(joint.load(&serde_json::json!([saved[0].clone()])).is_err(), "a checkpoint of another count is refused");
         joint.load(&saved).unwrap();
         assert_eq!(joint.save().unwrap(), saved);
+    }
+
+    #[test]
+    fn an_up_direction_copying_an_earlier_gate_is_found_and_tied() {
+        use crate::{library_mdl::explanation, operator_program::{Operator, Provenance, exact_precision}, run_check::{layer_nodes, split_sites}};
+        let imported = library_sharing::gated("library_mixture_gated");
+        let native = split_sites(&imported.program).unwrap();
+        let mut start = explanation(&native, &layer_nodes(&native, 2).unwrap()).unwrap();
+        // Function 6 of layer 1 reads up 1.5 times what function 2 of layer 0 reads as its gate.
+        let program = &mut start.artifact.program;
+        let (gate, up) = (operator_index(program, "library.l0.mlp.gate").unwrap(), operator_index(program, "library.l1.mlp.up").unwrap());
+        let mut values = program.operators[up].matrix();
+        values.row_mut(6).assign(&(&program.operators[gate].matrix().row(2) * 1.5));
+        let precision = exact_precision(values.iter().copied()).unwrap();
+        let source = &program.operators[up];
+        program.operators[up] = std::sync::Arc::new(Operator::dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values, precision, Provenance::default()).unwrap());
+        let posterior = Posterior::new(&start, 96).unwrap();
+        let mut mixture = Mixture::new(&start, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
+        mixture.epoch(&start, &posterior).unwrap();
+        let t = mixture.targets.iter().position(|t| t.kind == Kind::Up { layer: 1, function: 6 }).unwrap();
+        let copy = mixture.targets[t].components.iter().position(|c| c.write == Write::Gate { layer: 0, function: 2 }).expect("the earlier gate is a candidate");
+        assert!((mixture.targets[t].components[copy].scale - 1.5).abs() < 1e-9);
+        learn(&mut mixture, &posterior, 300);
+        let weights = mixture.targets[t].weights().unwrap();
+        assert!(weights[1 + copy] > 0.5, "the copy's weight dominates its mixture: {weights:?}");
+        let dominant = mixture.dominant(&posterior).unwrap();
+        assert_eq!(dominant, vec![(t, copy)], "only the copy dominates: {:?}", dominant.iter().map(|(t, j)| (mixture.targets[*t].kind, mixture.targets[*t].components[*j].write)).collect::<Vec<_>>());
+        let hardened = mixture.harden(&start, &posterior).unwrap();
+        let (before, after) = (start.artifact.execute(&imported.family).unwrap(), hardened.artifact.execute(&imported.family).unwrap());
+        let (a, b) = (&before.values[start.artifact.program.output], &after.values[hardened.artifact.program.output]);
+        let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * scale), "the tied up direction keeps the outputs");
+        library_sharing::same_native_blocks(&start, &hardened);
+        let own = hardened.groups.iter().position(|g| g.name == "library.l1.mlp.f6.up").unwrap();
+        assert!(hardened.removed.contains(&own), "the up direction is stored once");
     }
 
     #[test]

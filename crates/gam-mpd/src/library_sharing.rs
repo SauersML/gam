@@ -742,11 +742,6 @@ pub enum RowSource {
     Row { layer: usize, part: &'static str, function: usize },
 }
 
-/// `explanation` with the gate direction of function `target.1` of layer `target.0` made `scale`
-/// times the embedding row of `token` ([`tie_row`]).
-pub fn tie_token(explanation: &Explanation, target: (usize, usize), token: usize, scale: f64) -> Result<Explanation, String> {
-    tie_row(explanation, "gate", target, RowSource::Token(token), scale)
-}
 
 /// `explanation` with row `target.1` of layer `target.0`'s `part` operator (`gate` or `up`) made
 /// `scale` times `source`: the row's own group leaves the explanation, and the function reads
@@ -947,6 +942,29 @@ pub(crate) fn grouped(name: &str) -> crate::import::Imported {
             record["files"][name] = serde_json::json!({"shape": [4, 8]});
         }
     }
+    std::fs::write(&path, record.to_string()).unwrap();
+    let imported = crate::import::import_language_model(&dir, 6, 12).expect("import");
+    std::fs::remove_dir_all(dir).unwrap();
+    imported
+}
+
+/// The tiny two-layer model with a gated MLP (SwiGLU): each function reads a gate and an up
+/// direction.
+#[cfg(test)]
+pub(crate) fn gated(name: &str) -> crate::import::Imported {
+    let dir = crate::test_support::tiny_export(name, 2);
+    let path = dir.join("export.json");
+    let mut record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    let mut rng = StdRng::seed_from_u64(5);
+    for l in 0..2 {
+        let name = format!("blocks.{l}.mlp.gate_proj");
+        let bytes: Vec<u8> = (0..16 * 8).flat_map(|_| (rng.random::<f64>() - 0.5).to_le_bytes()).collect();
+        std::fs::write(dir.join(format!("{name}.f64")), bytes).unwrap();
+        record["files"][name] = serde_json::json!({"shape": [16, 8]});
+    }
+    record["config"]["mlp_act"] = "silu".into();
+    record["config"]["mlp_gated"] = true.into();
     std::fs::write(&path, record.to_string()).unwrap();
     let imported = crate::import::import_language_model(&dir, 6, 12).expect("import");
     std::fs::remove_dir_all(dir).unwrap();
