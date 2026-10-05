@@ -1348,15 +1348,8 @@ impl PreparedAssessment {
         Ok(Self { cost: structural_cost(artifact, cache)?, encoded: EncodedArtifact::of(artifact)? })
     }
 
-    pub(crate) fn message(&self) -> &super::codec::BitString { &self.encoded.message }
-
     pub(crate) fn assess(&self, local: &Local<'_>, run: &dyn RunCheck, constraint: Constraint) -> Result<Assessment, String> {
         self.assess_decodable(&self.encoded, local, run, constraint)
-    }
-
-    pub(crate) fn assess_local_first(&self, local: &Local<'_>, run: &dyn RunCheck, constraints: &[Constraint]) -> Result<StagedAssessment, String> {
-        validate_constraints(constraints)?;
-        assess_local_first_decodable(&self.encoded, self.cost, local, run, constraints)
     }
 
     fn assess_decodable<A: super::precision::DecodableArtifact<Decoded = Artifact>>(

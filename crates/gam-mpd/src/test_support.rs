@@ -4,12 +4,6 @@
 
 use std::path::{Path, PathBuf};
 
-// The planted known-answer toys.
-pub mod planted_toys;
-
-// Hand-built networks with a known decomposition: induction, modular addition, residual MLPs.
-pub mod known_answer_toys;
-
 /// The ledger a test's kernels reserve on when the test does not assert on
 /// reservations: a private governor, so no test draws on or reads the process-wide
 /// ledger. Its budget, `2^34` bytes, is far above any fixture's footprint and far
