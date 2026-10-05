@@ -306,6 +306,104 @@ pub fn compose_with_outputs_on_interface(
     compose_with_outputs(&adapted, responses, output_directions)
 }
 
+
+/// Attach an exact finite edit family to one jointly learned multi-output graph.
+/// `clean_node` and `response_nodes` identify its actual computed values. Importing
+/// the graph once preserves shared nonlinear intermediates, not just tied weights.
+/// Native correspondence is explicit: clean is the typed down output and each
+/// response is one scalar coefficient in the declared direction order.
+/// Raw slot zero is x; appended slots are globally constant edit amplitudes.
+pub fn compose_joint_with_outputs(
+    function: &OperatorProgram,
+    clean_node: usize,
+    response_nodes: &[usize],
+    output_directions: &[Arc<Operator>],
+    target: &Interface,
+) -> Result<Composition, String> {
+    signature(function)?;
+    let types = function.interfaces().map_err(|e| e.to_string())?;
+    let scalar = Interface::native(1).map_err(|e| e.to_string())?;
+    if response_nodes.is_empty() || response_nodes.len() != output_directions.len() {
+        return Err("one response per nonempty edit family required".into());
+    }
+    let clean_type = types.get(clean_node).ok_or("joint clean node absent")?;
+    if clean_type.width() != target.width() {
+        return Err("joint clean/native output width mismatch".into());
+    }
+    for (&response, direction) in response_nodes.iter().zip(output_directions) {
+        if types.get(response) != Some(&scalar)
+            || direction.rows.width() != target.width()
+            || direction.cols.width() != 1
+            || !matches!(&direction.body, OperatorBody::Dense { present, .. } if present.iter().all(|p| *p))
+        {
+            return Err("joint scalar response or direction interface mismatch".into());
+        }
+    }
+    let mut out = function.clone();
+    // Fuse a writer only when its typed output already matches. Otherwise a paid
+    // identity boundary map preserves every existing shared parameter owner.
+    let (mut final_terms, bias) = match &function.nodes[clean_node] {
+        Node::Affine { terms, bias } if clean_type == target => (terms.clone(), *bias),
+        _ => {
+            let mut identity = Operator::identity("joint clean boundary", clean_type.clone());
+            if clean_type != target {
+                identity = Operator::dense(
+                    "joint clean boundary", target.clone(), clean_type.clone(),
+                    ndarray::Array2::eye(target.width()),
+                    crate::operator_program::exact_precision([0., 1.]).map_err(|e| e.to_string())?,
+                    Default::default(),
+                ).map_err(|e| e.to_string())?;
+            }
+            let op = out.operators.len();
+            out.operators.push(Arc::new(identity));
+            (vec![(clean_node, op)], None)
+        }
+    };
+    for (&response, direction) in response_nodes.iter().zip(output_directions) {
+        let slot = out.declarations.slots.len();
+        out.declarations.slots.push(Slot::Raw { width: 1 });
+        let control = out.nodes.len();
+        out.nodes.push(Node::Raw { slot });
+        let gated = out.nodes.len();
+        out.nodes.push(Node::Hadamard { left: response, right: control });
+        let held = if direction.rows == *target && direction.cols == scalar {
+            direction.clone()
+        } else {
+            let mut adjusted = (**direction).clone();
+            adjusted.rows = target.clone();
+            adjusted.cols = scalar.clone();
+            if let OperatorBody::Dense { present, .. } = &mut adjusted.body {
+                *present = ndarray::Array2::from_elem((target.group_count(), scalar.group_count()), true);
+            }
+            Arc::new(adjusted)
+        };
+        // Direction ownership is explicit; never deduplicate equal learned matrices.
+        let op = out.operators.len();
+        out.operators.push(held);
+        final_terms.push((gated, op));
+    }
+    out.output = out.nodes.len();
+    out.nodes.push(Node::Affine { terms: final_terms, bias });
+    out.interfaces().map_err(|e| e.to_string())?;
+    let retained = final_terms_retain_clean(&out, clean_node);
+    Ok(Composition {
+        composed_output: out.output,
+        program: out,
+        response_nodes: response_nodes.to_vec(),
+        clean_output: CleanOutputMetadata { node: clean_node, retained_by_composed_output: retained },
+    })
+}
+
+fn final_terms_retain_clean(program: &OperatorProgram, clean: usize) -> bool {
+    let mut pending = vec![program.output];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(node) = pending.pop() {
+        if node == clean { return true; }
+        if seen.insert(node) { pending.extend(program.nodes[node].arguments()); }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +458,52 @@ mod tests {
             output: 3,
         }
     }
+    #[test]
+    fn joint_graph_keeps_shared_nonlinearity_and_signed_controls_after_codec() {
+        let mut joint = function();
+        joint.operators.push(dense(array![[1., -0.25]]));
+        joint.operators.push(dense(array![[-0.5, 1.]]));
+        joint.nodes.push(Node::Affine { terms: vec![(2, 2)], bias: None });
+        joint.nodes.push(Node::Affine { terms: vec![(2, 3)], bias: None });
+        joint.nodes.push(Node::Concat { parts: vec![3, 4, 5] });
+        joint.output = 6;
+        let directions = vec![dense(array![[0.5], [-1.]]), dense(array![[-0.25], [0.75]])];
+        let target = Interface::native(2).unwrap();
+        let composition = compose_joint_with_outputs(&joint, 3, &[4, 5], &directions, &target).unwrap();
+        assert_eq!(composition.program.nodes.iter().filter(|n| matches!(n, Node::Pointwise { .. })).count(), 1);
+        assert_eq!(composition.response_nodes, vec![4, 5]);
+        assert!(!composition.clean_output.retained_by_composed_output);
+        assert!(Arc::ptr_eq(&composition.program.operators[joint.operators.len()], &directions[0]));
+        let saved = Artifact::native(&composition.program).unwrap();
+        let saved = Artifact::from_bytes(&saved.to_bytes().unwrap(), &composition.program.declarations).unwrap();
+        for amplitudes in [[-0.75, 1.25], [0., 0.], [1.5, -0.5]] {
+            let input = FamilyInputs { rows: 2, slots: vec![
+                SlotValues::Raw(array![[1., -2.], [-0.5, 1.25]]),
+                SlotValues::Raw(Array2::from_elem((2, 1), amplitudes[0])),
+                SlotValues::Raw(Array2::from_elem((2, 1), amplitudes[1])),
+            ], layout: None };
+            let original = composition.program.execute(&input, false).unwrap();
+            let replay = saved.program.execute(&input, false).unwrap();
+            assert_eq!(original.values[composition.composed_output], replay.values[saved.program.output]);
+            let (observed_program, _, observed) = crate::artifact_device::mapped_inlined_observed(
+                &saved.program, &[vec![3], vec![4], vec![5]],
+            ).unwrap();
+            let observed_trace = observed_program.execute(&input, false).unwrap();
+            for (&source, &retained) in [3, 4, 5].iter().zip(&observed) {
+                assert_eq!(original.values[source], observed_trace.values[retained]);
+            }
+            for row in 0..2 { for col in 0..2 {
+                let expected = original.values[3][[row, col]]
+                    + amplitudes[0] * directions[0].matrix()[[col, 0]] * original.values[4][[row, 0]]
+                    + amplitudes[1] * directions[1].matrix()[[col, 0]] * original.values[5][[row, 0]];
+                assert!((original.values[composition.composed_output][[row, col]] - expected).abs() < 1e-12);
+            }}
+        }
+        // General clean expressions remain valid and retain their actual value.
+        let direct = compose_joint_with_outputs(&joint, 2, &[4, 5], &directions, &target).unwrap();
+        assert!(direct.clean_output.retained_by_composed_output);
+    }
+
     #[test]
     fn observed_composition_and_decoded_graft_expose_actual_clean_and_scalar_responses() {
         let mut clean = function();

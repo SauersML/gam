@@ -157,6 +157,8 @@ pub struct Family {
     /// Existing unscaled native projections s_j = v_j^T h, in direction order.
     /// Supervisor node identities only; candidate execution still uses its own responses.
     pub response_nodes: Vec<usize>,
+    /// Original clean down writer before edit gates; observe explicitly after pruning.
+    pub clean_output: usize,
     pub control_slots: Vec<usize>,
     pub native_read: usize,
     pub native_write: usize,
@@ -366,6 +368,7 @@ pub fn build(
     let mut p = native.clone();
     let mut control_nodes = vec![];
     let mut response_nodes = vec![];
+    let mut clean_output = usize::MAX;
     let mut control_slots = vec![];
     p.nodes.clear();
     for _ in directions {
@@ -435,6 +438,11 @@ pub fn build(
     let mut map = vec![usize::MAX; native.nodes.len()];
     for (index, node) in native.nodes.iter().enumerate() {
         if index == write {
+            clean_output = p.nodes.len();
+            p.nodes.push(Node::Affine {
+                terms: vec![(map[active], target)],
+                bias,
+            });
             let mut terms = vec![(map[active], target)];
             for (j, &(u, v)) in pairs.iter().enumerate() {
                 let projection = p.nodes.len();
@@ -468,6 +476,7 @@ pub fn build(
         node_mapping: map,
         control_nodes,
         response_nodes,
+        clean_output,
         control_slots,
         direction_operators: pairs,
         original: native.clone(),
@@ -619,6 +628,7 @@ mod tests {
             .program
             .execute(&f.inputs(&inputs, &[0., 0.]).unwrap(), false)
             .unwrap();
+        assert_eq!(clean.values[f.clean_output], native_clean.values[3]);
         assert_eq!(f.response_nodes.len(), f.direction_operators.len());
         for (j, &(u, v)) in f.direction_operators.iter().enumerate() {
             let projection = f.response_nodes[j];
@@ -638,6 +648,7 @@ mod tests {
                     .unwrap();
                 // The edited down map is used only after the incoming read and hidden state.
                 assert_eq!(augmented.values[f.native_read], clean.values[f.native_read]);
+                assert_eq!(augmented.values[f.clean_output], native_clean.values[3]);
                 for &response in &f.response_nodes {
                     assert_eq!(augmented.values[response], clean.values[response]);
                 }
