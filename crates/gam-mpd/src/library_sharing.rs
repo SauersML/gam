@@ -407,71 +407,195 @@ pub fn tie(explanation: &Explanation, ties: &[Tie]) -> Result<Explanation, Strin
     Ok(out)
 }
 
+/// Where a tied read row comes from: a token's embedding row (`M`'s, sent with `M`), or row
+/// `function` of another layer's `part` operator (`gate` or `up`) of the library.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowSource {
+    Token(usize),
+    Row { layer: usize, part: &'static str, function: usize },
+}
+
 /// `explanation` with the gate direction of function `target.1` of layer `target.0` made `scale`
-/// times the embedding row of `token` (`M`'s, sent with `M`): the gate's own row leaves the
-/// explanation, and the function reads `scale (e_t · x)` through a fixed copy of the row and a 1 × 1
-/// scale, one prior group, scattered into the gate's row.
+/// times the embedding row of `token` ([`tie_row`]).
 pub fn tie_token(explanation: &Explanation, target: (usize, usize), token: usize, scale: f64) -> Result<Explanation, String> {
+    tie_row(explanation, "gate", target, RowSource::Token(token), scale)
+}
+
+/// `explanation` with row `target.1` of layer `target.0`'s `part` operator (`gate` or `up`) made
+/// `scale` times `source`: the row's own group leaves the explanation, and the function reads
+/// `scale (s · x)` through the source (a fixed copy of an embedding row, or the other layer's
+/// operator applied to this layer's input and its row selected), a 1 × 1 scale (one prior group)
+/// and a scatter into the row. A source row is stored once: its gradient sums both uses.
+pub fn tie_row(explanation: &Explanation, part: &str, target: (usize, usize), source: RowSource, scale: f64) -> Result<Explanation, String> {
     let mut out = explanation.clone();
     let (l, i) = target;
     let program = &mut out.artifact.program;
     let rule = program.rules.iter().position(|r| r.name == format!("library.l{l}.mlp")).ok_or("no MLP rule")?;
-    let gate_index = operator_index(program, &format!("library.l{l}.mlp.gate"))?;
-    let gate = program.operators[gate_index].clone();
-    let embedding = program.operators[operator_index(program, "wte")?].matrix();
-    if token >= embedding.ncols() || i >= gate.rows.width() {
-        return Err(format!("no token {token} or no function {i} of layer {l}"));
+    let own_index = operator_index(program, &format!("library.l{l}.mlp.{part}"))?;
+    let own = program.operators[own_index].clone();
+    if i >= own.rows.width() {
+        return Err(format!("no function {i} of layer {l}"));
     }
     let one = Interface::uniform(1, 1, LabelKind::Unit, 0).map_err(error)?;
-    let provenance = Provenance::derived(&[&gate.provenance], format!("token {token} tie"));
-    let name = format!("library.l{l}.mlp.f{i}.token{token}");
-    let mut scatter = Array2::zeros((gate.rows.width(), 1));
+    let (name, first, owner_to) = match source {
+        RowSource::Token(token) => {
+            let embedding = program.operators[operator_index(program, "wte")?].matrix();
+            if token >= embedding.ncols() {
+                return Err(format!("no token {token}"));
+            }
+            let name = format!("library.l{l}.mlp.f{i}.{part}.token{token}");
+            let provenance = Provenance::derived(&[&own.provenance], format!("token {token} tie"));
+            let copy = Arc::new(dense(format!("{name}.row"), one.clone(), own.cols.clone(), embedding.column(token).to_owned().insert_axis(ndarray::Axis(0)), provenance)?);
+            (name.clone(), vec![copy], (format!("{name}.row"), 0..1))
+        }
+        RowSource::Row { layer, part: from, function } => {
+            let index = operator_index(program, &format!("library.l{layer}.mlp.{from}"))?;
+            let other = program.operators[index].clone();
+            if other.cols != own.cols || function >= other.rows.width() {
+                return Err(format!("row {function} of layer {layer}'s {from} cannot stand for row {i} of layer {l}'s {part}"));
+            }
+            let mut select = Array2::zeros((1, other.rows.width()));
+            select[[0, function]] = 1.0;
+            let name = format!("library.l{l}.mlp.f{i}.{part}.from_l{layer}_{from}{function}");
+            let provenance = Provenance::derived(&[&own.provenance, &other.provenance], "row tie".into());
+            (name.clone(), vec![Arc::new(dense(format!("{name}.select"), one.clone(), other.rows.clone(), select, provenance)?)], (other.name.clone(), function..function + 1))
+        }
+    };
+    let provenance = Provenance::derived(&[&own.provenance], "row tie".into());
+    let mut scatter = Array2::zeros((own.rows.width(), 1));
     scatter[[i, 0]] = 1.0;
     let base = program.operators.len();
-    for (part, rows, cols, values) in [
-        ("row", one.clone(), gate.cols.clone(), embedding.column(token).to_owned().insert_axis(ndarray::Axis(0))),
-        ("scale", one.clone(), one.clone(), Array2::from_elem((1, 1), scale)),
-        ("scatter", gate.rows.clone(), one.clone(), scatter),
-    ] {
-        program.operators.push(Arc::new(dense(format!("{name}.{part}"), rows, cols, values, provenance.clone())?));
-    }
-    let mut values = gate.matrix();
+    program.operators.extend(first);
+    let scale_index = program.operators.len();
+    program.operators.push(Arc::new(dense(format!("{name}.scale"), one.clone(), one.clone(), Array2::from_elem((1, 1), scale), provenance.clone())?));
+    program.operators.push(Arc::new(dense(format!("{name}.scatter"), own.rows.clone(), one.clone(), scatter, provenance)?));
+    let mut values = own.matrix();
     values.row_mut(i).fill(0.0);
-    program.operators[gate_index] = Arc::new(dense(gate.name.clone(), gate.rows.clone(), gate.cols.clone(), values, gate.provenance.clone())?);
-    // The gate row's native owner now reads the embedding row's copy.
+    program.operators[own_index] = Arc::new(dense(own.name.clone(), own.rows.clone(), own.cols.clone(), values, own.provenance.clone())?);
+    // The row's native owner now reads the source.
     for owner in &mut out.artifact.owners {
-        if owner.operator == gate.name && owner.rows == (i..i + 1) {
-            owner.operator = format!("{name}.row");
-            owner.rows = 0..1;
+        if owner.operator == own.name && owner.rows == (i..i + 1) {
+            owner.operator = owner_to.0.clone();
+            owner.rows = owner_to.1.clone();
         }
     }
     let program = &mut out.artifact.program;
-    // The row and its scale come first in the rule (after its input), the gate reading them last.
-    let (ops, bases, rules): (Vec<usize>, Vec<usize>, Vec<usize>) = ((0..base + 3).collect(), (0..program.bases.len()).collect(), (0..program.rules.len()).collect());
+    // The source's value of this layer's input, its row, its scale: first in the rule after its
+    // input; the tied operator's node reads them last.
+    let leading: Vec<Node> = match source {
+        RowSource::Token(_) => vec![Node::Affine { terms: vec![(0, base)], bias: None }, Node::Affine { terms: vec![(1, scale_index)], bias: None }],
+        RowSource::Row { layer, part: from, .. } => {
+            let other = operator_index(program, &format!("library.l{layer}.mlp.{from}"))?;
+            vec![
+                Node::Affine { terms: vec![(0, other)], bias: None },
+                Node::Affine { terms: vec![(1, base)], bias: None },
+                Node::Affine { terms: vec![(2, scale_index)], bias: None },
+            ]
+        }
+    };
+    let shift = leading.len();
+    let (ops, bases, rules): (Vec<usize>, Vec<usize>, Vec<usize>) = ((0..program.operators.len()).collect(), (0..program.bases.len()).collect(), (0..program.rules.len()).collect());
     let r = &mut program.rules[rule];
-    let map: Vec<usize> = (0..r.nodes.len()).map(|n| if n == 0 { 0 } else { n + 2 }).collect();
-    let mut nodes = vec![r.nodes[0].clone(), Node::Affine { terms: vec![(0, base)], bias: None }, Node::Affine { terms: vec![(1, base + 1)], bias: None }];
+    let map: Vec<usize> = (0..r.nodes.len()).map(|n| if n == 0 { 0 } else { n + shift }).collect();
+    let mut nodes = vec![r.nodes[0].clone()];
+    nodes.extend(leading);
     for node in &r.nodes[1..] {
         let mut node = node.clone();
         remap_node(&mut node, &map, &ops, &bases, &rules);
         if let Node::Affine { terms, .. } = &mut node
-            && terms.first().is_some_and(|t| t.0 == 0 && t.1 == gate_index)
+            && terms.first().is_some_and(|t| t.0 == 0 && t.1 == own_index)
         {
-            terms.push((2, base + 2));
+            terms.push((shift, scale_index + 1));
         }
         nodes.push(node);
     }
     r.output = map[r.output];
     r.nodes = nodes;
     program.interfaces().map_err(error)?;
-    let own = out.groups.iter().position(|g| g.name == format!("library.l{l}.mlp.f{i}.gate")).ok_or("no gate group")?;
+    let own_group = out.groups.iter().position(|g| g.name == format!("library.l{l}.mlp.f{i}.{part}")).ok_or_else(|| format!("no {part} group"))?;
     let tied = out.groups.len();
-    out.groups.push(Group { name: format!("library.l{l}.mlp.f{i}.token"), cells: vec![Cells { operator: base + 1, rows: vec![0], cols: 0..1 }] });
-    out.removed.push(own);
+    out.groups.push(Group { name: format!("library.l{l}.mlp.f{i}.{part}.tie"), cells: vec![Cells { operator: scale_index, rows: vec![0], cols: 0..1 }] });
+    out.removed.push(own_group);
+    out.trainable.push(scale_index);
+    out.trainable.sort_unstable();
+    for g in out.layers[l].functions[i].iter_mut() {
+        if *g == own_group {
+            *g = tied;
+        }
+    }
+    Ok(out)
+}
+
+/// `explanation` with the output vector of function `target.1` of layer `target.0` made `scale`
+/// times the output vector of function `source.1` of layer `source.0`: the column's own group
+/// leaves the explanation, and the function's activation, selected, scaled (a 1 × 1 operator, one
+/// prior group) and scattered to the source's function, is written through the source layer's
+/// output operator. The source column is stored once: its gradient sums both uses.
+pub fn tie_column(explanation: &Explanation, target: (usize, usize), source: (usize, usize), scale: f64) -> Result<Explanation, String> {
+    let mut out = explanation.clone();
+    let ((l, i), (sl, j)) = (target, source);
+    let program = &mut out.artifact.program;
+    let rule = program.rules.iter().position(|r| r.name == format!("library.l{l}.mlp")).ok_or("no MLP rule")?;
+    let own_index = operator_index(program, &format!("library.l{l}.mlp.out"))?;
+    let source_index = operator_index(program, &format!("library.l{sl}.mlp.out"))?;
+    let (own, other) = (program.operators[own_index].clone(), program.operators[source_index].clone());
+    if own.rows != other.rows || i >= own.cols.width() || j >= other.cols.width() {
+        return Err(format!("output {j} of layer {sl} cannot stand for output {i} of layer {l}"));
+    }
+    let (out_node, act) = {
+        let r = &program.rules[rule];
+        match &r.nodes[r.output] {
+            Node::Affine { terms, bias: None } if r.output + 1 == r.nodes.len() && terms.first().is_some_and(|t| t.1 == own_index) => (r.output, terms[0].0),
+            other => return Err(format!("layer {l}: the MLP's output is {other:?}")),
+        }
+    };
+    let one = Interface::uniform(1, 1, LabelKind::Unit, 0).map_err(error)?;
+    let name = format!("library.l{l}.mlp.f{i}.out.from_l{sl}_{j}");
+    let provenance = Provenance::derived(&[&own.provenance, &other.provenance], "column tie".into());
+    let mut select = Array2::zeros((1, own.cols.width()));
+    select[[0, i]] = 1.0;
+    let mut scatter = Array2::zeros((other.cols.width(), 1));
+    scatter[[j, 0]] = 1.0;
+    let base = program.operators.len();
+    for (part, rows, cols, values) in [
+        ("select", one.clone(), own.cols.clone(), select),
+        ("scale", one.clone(), one.clone(), Array2::from_elem((1, 1), scale)),
+        ("scatter", other.cols.clone(), one.clone(), scatter),
+    ] {
+        program.operators.push(Arc::new(dense(format!("{name}.{part}"), rows, cols, values, provenance.clone())?));
+    }
+    let mut values = own.matrix();
+    values.column_mut(i).fill(0.0);
+    program.operators[own_index] = Arc::new(dense(own.name.clone(), own.rows.clone(), own.cols.clone(), values, own.provenance.clone())?);
+    for owner in &mut out.artifact.owners {
+        if owner.operator == own.name && owner.cols == (i..i + 1) {
+            owner.operator = other.name.clone();
+            owner.cols = j..j + 1;
+        }
+    }
+    let program = &mut out.artifact.program;
+    let r = &mut program.rules[rule];
+    let output = r.nodes[out_node].clone();
+    r.nodes.truncate(out_node);
+    let at = r.nodes.len();
+    r.nodes.extend([
+        Node::Affine { terms: vec![(act, base)], bias: None },
+        Node::Affine { terms: vec![(at, base + 1)], bias: None },
+        Node::Affine { terms: vec![(at + 1, base + 2)], bias: None },
+    ]);
+    let Node::Affine { mut terms, .. } = output else { return Err("the MLP's output".into()) };
+    terms.push((at + 2, source_index));
+    r.nodes.push(Node::Affine { terms, bias: None });
+    r.output = r.nodes.len() - 1;
+    program.interfaces().map_err(error)?;
+    let own_group = out.groups.iter().position(|g| g.name == format!("library.l{l}.mlp.f{i}.out")).ok_or("no output group")?;
+    let tied = out.groups.len();
+    out.groups.push(Group { name: format!("library.l{l}.mlp.f{i}.out.tie"), cells: vec![Cells { operator: base + 1, rows: vec![0], cols: 0..1 }] });
+    out.removed.push(own_group);
     out.trainable.push(base + 1);
     out.trainable.sort_unstable();
     for g in out.layers[l].functions[i].iter_mut() {
-        if *g == own {
+        if *g == own_group {
             *g = tied;
         }
     }
@@ -580,6 +704,44 @@ mod tests {
         }
         assert_eq!(posterior.active.iter().filter(|a| **a).count(), untied.active.len());
         assert!(tie(&start, &[Tie { source: (1, 0), target: (0, 0), scale: 1.0 }]).is_err(), "a later write cannot feed an earlier read");
+    }
+
+    #[test]
+    fn a_function_copied_across_layers_is_stored_once_and_keeps_the_outputs() {
+        let dir = crate::test_support::tiny_export("library_function_copy", 2);
+        let imported = import_language_model(&dir, 6, 12).expect("import");
+        std::fs::remove_dir_all(dir).unwrap();
+        let native = split_sites(&imported.program).expect("split");
+        let mut start = explanation(&native, &layer_nodes(&native, 2).expect("layers")).expect("explanation");
+        // Function 7 of layer 1 is 2 times function 4 of layer 0 in its read and 0.5 times in its write.
+        let program = &mut start.artifact.program;
+        for (part, column, scale) in [("gate", false, 2.0), ("out", true, 0.5)] {
+            let (from, to) = (operator_index(program, &format!("library.l0.mlp.{part}")).unwrap(), operator_index(program, &format!("library.l1.mlp.{part}")).unwrap());
+            let mut values = program.operators[to].matrix();
+            if column {
+                values.column_mut(7).assign(&(&program.operators[from].matrix().column(4) * scale));
+            } else {
+                values.row_mut(7).assign(&(&program.operators[from].matrix().row(4) * scale));
+            }
+            program.operators[to] = Arc::new(dense(program.operators[to].name.clone(), program.operators[to].rows.clone(), program.operators[to].cols.clone(), values, Provenance::default()).unwrap());
+        }
+        let row = tie_row(&start, "gate", (1, 7), RowSource::Row { layer: 0, part: "gate", function: 4 }, 2.0).unwrap();
+        let tied = tie_column(&row, (1, 7), (0, 4), 0.5).unwrap();
+        let (before, after) = (start.artifact.execute(&imported.family).unwrap(), tied.artifact.execute(&imported.family).unwrap());
+        let (a, b) = (&before.values[start.artifact.program.output], &after.values[tied.artifact.program.output]);
+        let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * scale), "the tied function keeps the outputs");
+        // Its own read and write leave; two scale groups replace them; its native owners read layer 0's.
+        let tokens = 2 * 6 * 12;
+        let (untied, posterior) = (Posterior::new(&start, tokens).unwrap(), Posterior::new(&tied, tokens).unwrap());
+        assert_eq!(posterior.active.iter().filter(|a| **a).count(), untied.active.len());
+        for name in ["library.l1.mlp.f7.gate", "library.l1.mlp.f7.out"] {
+            let g = tied.groups.iter().position(|g| g.name == name).unwrap();
+            assert!(!posterior.active[g] && posterior.costs()[g] == 0.0, "{name} is not charged");
+        }
+        let owners: Vec<_> = tied.artifact.owners.iter().filter(|o| o.site == "library.l1.mlp" && (o.native_rows == (7..8) || o.native_cols == (7..8))).collect();
+        assert!(owners.iter().any(|o| o.operator == "library.l0.mlp.gate" && o.rows == (4..5)));
+        assert!(owners.iter().any(|o| o.operator == "library.l0.mlp.out" && o.cols == (4..5)));
     }
 
     #[test]
