@@ -1,0 +1,3910 @@
+{
+  "version": 1,
+  "scope": "Prespecified native behavioral calibration; no mechanism claim or selected successful prompts.",
+  "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+  "checkpoint_sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b",
+  "cases": [
+    {
+      "id": 0,
+      "group": "periodic",
+      "pair": "cycle-red",
+      "variant": "forward",
+      "prompt": " red blue green red blue green red",
+      "tokens": [
+        2518,
+        6303,
+        6176,
+        2518,
+        6303,
+        6176,
+        2518
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          9
+        ],
+        [
+          9,
+          15
+        ],
+        [
+          15,
+          19
+        ],
+        [
+          19,
+          24
+        ],
+        [
+          24,
+          30
+        ],
+        [
+          30,
+          34
+        ]
+      ],
+      "target": 6303,
+      "foil": 6176,
+      "target_text": " blue",
+      "foil_text": " green"
+    },
+    {
+      "id": 1,
+      "group": "periodic",
+      "pair": "cycle-red",
+      "variant": "reversed",
+      "prompt": " red green blue red green blue red",
+      "tokens": [
+        2518,
+        6176,
+        6303,
+        2518,
+        6176,
+        6303,
+        2518
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          10
+        ],
+        [
+          10,
+          15
+        ],
+        [
+          15,
+          19
+        ],
+        [
+          19,
+          25
+        ],
+        [
+          25,
+          30
+        ],
+        [
+          30,
+          34
+        ]
+      ],
+      "target": 6176,
+      "foil": 6303,
+      "target_text": " green",
+      "foil_text": " blue"
+    },
+    {
+      "id": 2,
+      "group": "periodic",
+      "pair": "cycle-blue",
+      "variant": "forward",
+      "prompt": " blue green red blue green red blue",
+      "tokens": [
+        6303,
+        6176,
+        2518,
+        6303,
+        6176,
+        2518,
+        6303
+      ],
+      "offsets": [
+        [
+          0,
+          5
+        ],
+        [
+          5,
+          11
+        ],
+        [
+          11,
+          15
+        ],
+        [
+          15,
+          20
+        ],
+        [
+          20,
+          26
+        ],
+        [
+          26,
+          30
+        ],
+        [
+          30,
+          35
+        ]
+      ],
+      "target": 6176,
+      "foil": 2518,
+      "target_text": " green",
+      "foil_text": " red"
+    },
+    {
+      "id": 3,
+      "group": "periodic",
+      "pair": "cycle-blue",
+      "variant": "reversed",
+      "prompt": " blue red green blue red green blue",
+      "tokens": [
+        6303,
+        2518,
+        6176,
+        6303,
+        2518,
+        6176,
+        6303
+      ],
+      "offsets": [
+        [
+          0,
+          5
+        ],
+        [
+          5,
+          9
+        ],
+        [
+          9,
+          15
+        ],
+        [
+          15,
+          20
+        ],
+        [
+          20,
+          24
+        ],
+        [
+          24,
+          30
+        ],
+        [
+          30,
+          35
+        ]
+      ],
+      "target": 2518,
+      "foil": 6176,
+      "target_text": " red",
+      "foil_text": " green"
+    },
+    {
+      "id": 4,
+      "group": "periodic",
+      "pair": "cycle-green",
+      "variant": "forward",
+      "prompt": " green red blue green red blue green",
+      "tokens": [
+        6176,
+        2518,
+        6303,
+        6176,
+        2518,
+        6303,
+        6176
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          15
+        ],
+        [
+          15,
+          21
+        ],
+        [
+          21,
+          25
+        ],
+        [
+          25,
+          30
+        ],
+        [
+          30,
+          36
+        ]
+      ],
+      "target": 2518,
+      "foil": 6303,
+      "target_text": " red",
+      "foil_text": " blue"
+    },
+    {
+      "id": 5,
+      "group": "periodic",
+      "pair": "cycle-green",
+      "variant": "reversed",
+      "prompt": " green blue red green blue red green",
+      "tokens": [
+        6176,
+        6303,
+        2518,
+        6176,
+        6303,
+        2518,
+        6176
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          11
+        ],
+        [
+          11,
+          15
+        ],
+        [
+          15,
+          21
+        ],
+        [
+          21,
+          26
+        ],
+        [
+          26,
+          30
+        ],
+        [
+          30,
+          36
+        ]
+      ],
+      "target": 6303,
+      "foil": 2518,
+      "target_text": " blue",
+      "foil_text": " red"
+    },
+    {
+      "id": 6,
+      "group": "periodic",
+      "pair": "cycle-one",
+      "variant": "forward",
+      "prompt": " one two three one two three one",
+      "tokens": [
+        825,
+        1378,
+        2326,
+        825,
+        1378,
+        2326,
+        825
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          18
+        ],
+        [
+          18,
+          22
+        ],
+        [
+          22,
+          28
+        ],
+        [
+          28,
+          32
+        ]
+      ],
+      "target": 1378,
+      "foil": 2326,
+      "target_text": " two",
+      "foil_text": " three"
+    },
+    {
+      "id": 7,
+      "group": "periodic",
+      "pair": "cycle-one",
+      "variant": "reversed",
+      "prompt": " one three two one three two one",
+      "tokens": [
+        825,
+        2326,
+        1378,
+        825,
+        2326,
+        1378,
+        825
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          10
+        ],
+        [
+          10,
+          14
+        ],
+        [
+          14,
+          18
+        ],
+        [
+          18,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          32
+        ]
+      ],
+      "target": 2326,
+      "foil": 1378,
+      "target_text": " three",
+      "foil_text": " two"
+    },
+    {
+      "id": 8,
+      "group": "periodic",
+      "pair": "cycle-two",
+      "variant": "forward",
+      "prompt": " two three one two three one two",
+      "tokens": [
+        1378,
+        2326,
+        825,
+        1378,
+        2326,
+        825,
+        1378
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          10
+        ],
+        [
+          10,
+          14
+        ],
+        [
+          14,
+          18
+        ],
+        [
+          18,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          32
+        ]
+      ],
+      "target": 2326,
+      "foil": 825,
+      "target_text": " three",
+      "foil_text": " one"
+    },
+    {
+      "id": 9,
+      "group": "periodic",
+      "pair": "cycle-two",
+      "variant": "reversed",
+      "prompt": " two one three two one three two",
+      "tokens": [
+        1378,
+        825,
+        2326,
+        1378,
+        825,
+        2326,
+        1378
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          18
+        ],
+        [
+          18,
+          22
+        ],
+        [
+          22,
+          28
+        ],
+        [
+          28,
+          32
+        ]
+      ],
+      "target": 825,
+      "foil": 2326,
+      "target_text": " one",
+      "foil_text": " three"
+    },
+    {
+      "id": 10,
+      "group": "periodic",
+      "pair": "cycle-three",
+      "variant": "forward",
+      "prompt": " three one two three one two three",
+      "tokens": [
+        2326,
+        825,
+        1378,
+        2326,
+        825,
+        1378,
+        2326
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          14
+        ],
+        [
+          14,
+          20
+        ],
+        [
+          20,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          34
+        ]
+      ],
+      "target": 825,
+      "foil": 1378,
+      "target_text": " one",
+      "foil_text": " two"
+    },
+    {
+      "id": 11,
+      "group": "periodic",
+      "pair": "cycle-three",
+      "variant": "reversed",
+      "prompt": " three two one three two one three",
+      "tokens": [
+        2326,
+        1378,
+        825,
+        2326,
+        1378,
+        825,
+        2326
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          14
+        ],
+        [
+          14,
+          20
+        ],
+        [
+          20,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          34
+        ]
+      ],
+      "target": 1378,
+      "foil": 825,
+      "target_text": " two",
+      "foil_text": " one"
+    },
+    {
+      "id": 12,
+      "group": "periodic",
+      "pair": "cycle-cat",
+      "variant": "forward",
+      "prompt": " cat dog bird cat dog bird cat",
+      "tokens": [
+        8251,
+        5562,
+        11958,
+        8251,
+        5562,
+        11958,
+        8251
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          8
+        ],
+        [
+          8,
+          13
+        ],
+        [
+          13,
+          17
+        ],
+        [
+          17,
+          21
+        ],
+        [
+          21,
+          26
+        ],
+        [
+          26,
+          30
+        ]
+      ],
+      "target": 5562,
+      "foil": 11958,
+      "target_text": " dog",
+      "foil_text": " bird"
+    },
+    {
+      "id": 13,
+      "group": "periodic",
+      "pair": "cycle-cat",
+      "variant": "reversed",
+      "prompt": " cat bird dog cat bird dog cat",
+      "tokens": [
+        8251,
+        11958,
+        5562,
+        8251,
+        11958,
+        5562,
+        8251
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          9
+        ],
+        [
+          9,
+          13
+        ],
+        [
+          13,
+          17
+        ],
+        [
+          17,
+          22
+        ],
+        [
+          22,
+          26
+        ],
+        [
+          26,
+          30
+        ]
+      ],
+      "target": 11958,
+      "foil": 5562,
+      "target_text": " bird",
+      "foil_text": " dog"
+    },
+    {
+      "id": 14,
+      "group": "periodic",
+      "pair": "cycle-dog",
+      "variant": "forward",
+      "prompt": " dog bird cat dog bird cat dog",
+      "tokens": [
+        5562,
+        11958,
+        8251,
+        5562,
+        11958,
+        8251,
+        5562
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          9
+        ],
+        [
+          9,
+          13
+        ],
+        [
+          13,
+          17
+        ],
+        [
+          17,
+          22
+        ],
+        [
+          22,
+          26
+        ],
+        [
+          26,
+          30
+        ]
+      ],
+      "target": 11958,
+      "foil": 8251,
+      "target_text": " bird",
+      "foil_text": " cat"
+    },
+    {
+      "id": 15,
+      "group": "periodic",
+      "pair": "cycle-dog",
+      "variant": "reversed",
+      "prompt": " dog cat bird dog cat bird dog",
+      "tokens": [
+        5562,
+        8251,
+        11958,
+        5562,
+        8251,
+        11958,
+        5562
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          8
+        ],
+        [
+          8,
+          13
+        ],
+        [
+          13,
+          17
+        ],
+        [
+          17,
+          21
+        ],
+        [
+          21,
+          26
+        ],
+        [
+          26,
+          30
+        ]
+      ],
+      "target": 8251,
+      "foil": 11958,
+      "target_text": " cat",
+      "foil_text": " bird"
+    },
+    {
+      "id": 16,
+      "group": "periodic",
+      "pair": "cycle-bird",
+      "variant": "forward",
+      "prompt": " bird cat dog bird cat dog bird",
+      "tokens": [
+        11958,
+        8251,
+        5562,
+        11958,
+        8251,
+        5562,
+        11958
+      ],
+      "offsets": [
+        [
+          0,
+          5
+        ],
+        [
+          5,
+          9
+        ],
+        [
+          9,
+          13
+        ],
+        [
+          13,
+          18
+        ],
+        [
+          18,
+          22
+        ],
+        [
+          22,
+          26
+        ],
+        [
+          26,
+          31
+        ]
+      ],
+      "target": 8251,
+      "foil": 5562,
+      "target_text": " cat",
+      "foil_text": " dog"
+    },
+    {
+      "id": 17,
+      "group": "periodic",
+      "pair": "cycle-bird",
+      "variant": "reversed",
+      "prompt": " bird dog cat bird dog cat bird",
+      "tokens": [
+        11958,
+        5562,
+        8251,
+        11958,
+        5562,
+        8251,
+        11958
+      ],
+      "offsets": [
+        [
+          0,
+          5
+        ],
+        [
+          5,
+          9
+        ],
+        [
+          9,
+          13
+        ],
+        [
+          13,
+          18
+        ],
+        [
+          18,
+          22
+        ],
+        [
+          22,
+          26
+        ],
+        [
+          26,
+          31
+        ]
+      ],
+      "target": 5562,
+      "foil": 8251,
+      "target_text": " dog",
+      "foil_text": " cat"
+    },
+    {
+      "id": 18,
+      "group": "assignment",
+      "pair": "Alice-False",
+      "variant": "False",
+      "prompt": " Alice's color is blue. Bob's color is green. Alice's color is",
+      "tokens": [
+        29405,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        29405,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          22
+        ],
+        [
+          22,
+          23
+        ],
+        [
+          23,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ]
+      ],
+      "target": 6303,
+      "foil": 6176,
+      "target_text": " blue",
+      "foil_text": " green"
+    },
+    {
+      "id": 19,
+      "group": "reassignment",
+      "pair": "Alice-False",
+      "variant": "False",
+      "prompt": " Alice's color is blue. Bob's color is green. Alice's color is now green. Bob's color is now blue. Alice's color is",
+      "tokens": [
+        29405,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        1431,
+        6176,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        1431,
+        6303,
+        13,
+        29405,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          22
+        ],
+        [
+          22,
+          23
+        ],
+        [
+          23,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ],
+        [
+          62,
+          66
+        ],
+        [
+          66,
+          72
+        ],
+        [
+          72,
+          73
+        ],
+        [
+          73,
+          77
+        ],
+        [
+          77,
+          79
+        ],
+        [
+          79,
+          85
+        ],
+        [
+          85,
+          88
+        ],
+        [
+          88,
+          92
+        ],
+        [
+          92,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          104
+        ],
+        [
+          104,
+          106
+        ],
+        [
+          106,
+          112
+        ],
+        [
+          112,
+          115
+        ]
+      ],
+      "target": 6176,
+      "foil": 6303,
+      "target_text": " green",
+      "foil_text": " blue"
+    },
+    {
+      "id": 20,
+      "group": "paraphrase",
+      "pair": "Alice-False",
+      "variant": "False",
+      "prompt": " Alice was given the blue key. Bob was given the green key. The key given to Alice was",
+      "tokens": [
+        29405,
+        572,
+        2661,
+        279,
+        6303,
+        1376,
+        13,
+        14261,
+        572,
+        2661,
+        279,
+        6176,
+        1376,
+        13,
+        576,
+        1376,
+        2661,
+        311,
+        29405,
+        572
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          25
+        ],
+        [
+          25,
+          29
+        ],
+        [
+          29,
+          30
+        ],
+        [
+          30,
+          34
+        ],
+        [
+          34,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          48
+        ],
+        [
+          48,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          82
+        ],
+        [
+          82,
+          86
+        ]
+      ],
+      "target": 6303,
+      "foil": 6176,
+      "target_text": " blue",
+      "foil_text": " green"
+    },
+    {
+      "id": 21,
+      "group": "assignment",
+      "pair": "Alice-False",
+      "variant": "True",
+      "prompt": " Alice's color is green. Bob's color is blue. Alice's color is",
+      "tokens": [
+        29405,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        29405,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          23
+        ],
+        [
+          23,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ]
+      ],
+      "target": 6176,
+      "foil": 6303,
+      "target_text": " green",
+      "foil_text": " blue"
+    },
+    {
+      "id": 22,
+      "group": "reassignment",
+      "pair": "Alice-False",
+      "variant": "True",
+      "prompt": " Alice's color is green. Bob's color is blue. Alice's color is now blue. Bob's color is now green. Alice's color is",
+      "tokens": [
+        29405,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        1431,
+        6303,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        1431,
+        6176,
+        13,
+        29405,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          23
+        ],
+        [
+          23,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ],
+        [
+          62,
+          66
+        ],
+        [
+          66,
+          71
+        ],
+        [
+          71,
+          72
+        ],
+        [
+          72,
+          76
+        ],
+        [
+          76,
+          78
+        ],
+        [
+          78,
+          84
+        ],
+        [
+          84,
+          87
+        ],
+        [
+          87,
+          91
+        ],
+        [
+          91,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          104
+        ],
+        [
+          104,
+          106
+        ],
+        [
+          106,
+          112
+        ],
+        [
+          112,
+          115
+        ]
+      ],
+      "target": 6303,
+      "foil": 6176,
+      "target_text": " blue",
+      "foil_text": " green"
+    },
+    {
+      "id": 23,
+      "group": "paraphrase",
+      "pair": "Alice-False",
+      "variant": "True",
+      "prompt": " Alice was given the green key. Bob was given the blue key. The key given to Alice was",
+      "tokens": [
+        29405,
+        572,
+        2661,
+        279,
+        6176,
+        1376,
+        13,
+        14261,
+        572,
+        2661,
+        279,
+        6303,
+        1376,
+        13,
+        576,
+        1376,
+        2661,
+        311,
+        29405,
+        572
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          26
+        ],
+        [
+          26,
+          30
+        ],
+        [
+          30,
+          31
+        ],
+        [
+          31,
+          35
+        ],
+        [
+          35,
+          39
+        ],
+        [
+          39,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          82
+        ],
+        [
+          82,
+          86
+        ]
+      ],
+      "target": 6176,
+      "foil": 6303,
+      "target_text": " green",
+      "foil_text": " blue"
+    },
+    {
+      "id": 24,
+      "group": "assignment",
+      "pair": "Alice-True",
+      "variant": "False",
+      "prompt": " Bob's color is green. Alice's color is blue. Alice's color is",
+      "tokens": [
+        14261,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        29405,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          21
+        ],
+        [
+          21,
+          22
+        ],
+        [
+          22,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ]
+      ],
+      "target": 6303,
+      "foil": 6176,
+      "target_text": " blue",
+      "foil_text": " green"
+    },
+    {
+      "id": 25,
+      "group": "reassignment",
+      "pair": "Alice-True",
+      "variant": "False",
+      "prompt": " Bob's color is green. Alice's color is blue. Bob's color is now blue. Alice's color is now green. Alice's color is",
+      "tokens": [
+        14261,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        1431,
+        6303,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        1431,
+        6176,
+        13,
+        29405,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          21
+        ],
+        [
+          21,
+          22
+        ],
+        [
+          22,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ],
+        [
+          60,
+          64
+        ],
+        [
+          64,
+          69
+        ],
+        [
+          69,
+          70
+        ],
+        [
+          70,
+          76
+        ],
+        [
+          76,
+          78
+        ],
+        [
+          78,
+          84
+        ],
+        [
+          84,
+          87
+        ],
+        [
+          87,
+          91
+        ],
+        [
+          91,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          104
+        ],
+        [
+          104,
+          106
+        ],
+        [
+          106,
+          112
+        ],
+        [
+          112,
+          115
+        ]
+      ],
+      "target": 6176,
+      "foil": 6303,
+      "target_text": " green",
+      "foil_text": " blue"
+    },
+    {
+      "id": 26,
+      "group": "paraphrase",
+      "pair": "Alice-True",
+      "variant": "False",
+      "prompt": " Alice was given the blue key. Bob was given the green key. The key given to Alice was",
+      "tokens": [
+        29405,
+        572,
+        2661,
+        279,
+        6303,
+        1376,
+        13,
+        14261,
+        572,
+        2661,
+        279,
+        6176,
+        1376,
+        13,
+        576,
+        1376,
+        2661,
+        311,
+        29405,
+        572
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          25
+        ],
+        [
+          25,
+          29
+        ],
+        [
+          29,
+          30
+        ],
+        [
+          30,
+          34
+        ],
+        [
+          34,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          48
+        ],
+        [
+          48,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          82
+        ],
+        [
+          82,
+          86
+        ]
+      ],
+      "target": 6303,
+      "foil": 6176,
+      "target_text": " blue",
+      "foil_text": " green"
+    },
+    {
+      "id": 27,
+      "group": "assignment",
+      "pair": "Alice-True",
+      "variant": "True",
+      "prompt": " Bob's color is blue. Alice's color is green. Alice's color is",
+      "tokens": [
+        14261,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        29405,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          20
+        ],
+        [
+          20,
+          21
+        ],
+        [
+          21,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ]
+      ],
+      "target": 6176,
+      "foil": 6303,
+      "target_text": " green",
+      "foil_text": " blue"
+    },
+    {
+      "id": 28,
+      "group": "reassignment",
+      "pair": "Alice-True",
+      "variant": "True",
+      "prompt": " Bob's color is blue. Alice's color is green. Bob's color is now green. Alice's color is now blue. Alice's color is",
+      "tokens": [
+        14261,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        1431,
+        6176,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        1431,
+        6303,
+        13,
+        29405,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          20
+        ],
+        [
+          20,
+          21
+        ],
+        [
+          21,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ],
+        [
+          60,
+          64
+        ],
+        [
+          64,
+          70
+        ],
+        [
+          70,
+          71
+        ],
+        [
+          71,
+          77
+        ],
+        [
+          77,
+          79
+        ],
+        [
+          79,
+          85
+        ],
+        [
+          85,
+          88
+        ],
+        [
+          88,
+          92
+        ],
+        [
+          92,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          104
+        ],
+        [
+          104,
+          106
+        ],
+        [
+          106,
+          112
+        ],
+        [
+          112,
+          115
+        ]
+      ],
+      "target": 6303,
+      "foil": 6176,
+      "target_text": " blue",
+      "foil_text": " green"
+    },
+    {
+      "id": 29,
+      "group": "paraphrase",
+      "pair": "Alice-True",
+      "variant": "True",
+      "prompt": " Alice was given the green key. Bob was given the blue key. The key given to Alice was",
+      "tokens": [
+        29405,
+        572,
+        2661,
+        279,
+        6176,
+        1376,
+        13,
+        14261,
+        572,
+        2661,
+        279,
+        6303,
+        1376,
+        13,
+        576,
+        1376,
+        2661,
+        311,
+        29405,
+        572
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          26
+        ],
+        [
+          26,
+          30
+        ],
+        [
+          30,
+          31
+        ],
+        [
+          31,
+          35
+        ],
+        [
+          35,
+          39
+        ],
+        [
+          39,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          82
+        ],
+        [
+          82,
+          86
+        ]
+      ],
+      "target": 6176,
+      "foil": 6303,
+      "target_text": " green",
+      "foil_text": " blue"
+    },
+    {
+      "id": 30,
+      "group": "assignment",
+      "pair": "Bob-False",
+      "variant": "False",
+      "prompt": " Alice's color is blue. Bob's color is green. Bob's color is",
+      "tokens": [
+        29405,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        14261,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          22
+        ],
+        [
+          22,
+          23
+        ],
+        [
+          23,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ]
+      ],
+      "target": 6176,
+      "foil": 6303,
+      "target_text": " green",
+      "foil_text": " blue"
+    },
+    {
+      "id": 31,
+      "group": "reassignment",
+      "pair": "Bob-False",
+      "variant": "False",
+      "prompt": " Alice's color is blue. Bob's color is green. Alice's color is now green. Bob's color is now blue. Bob's color is",
+      "tokens": [
+        29405,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        1431,
+        6176,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        1431,
+        6303,
+        13,
+        14261,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          22
+        ],
+        [
+          22,
+          23
+        ],
+        [
+          23,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ],
+        [
+          62,
+          66
+        ],
+        [
+          66,
+          72
+        ],
+        [
+          72,
+          73
+        ],
+        [
+          73,
+          77
+        ],
+        [
+          77,
+          79
+        ],
+        [
+          79,
+          85
+        ],
+        [
+          85,
+          88
+        ],
+        [
+          88,
+          92
+        ],
+        [
+          92,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          102
+        ],
+        [
+          102,
+          104
+        ],
+        [
+          104,
+          110
+        ],
+        [
+          110,
+          113
+        ]
+      ],
+      "target": 6303,
+      "foil": 6176,
+      "target_text": " blue",
+      "foil_text": " green"
+    },
+    {
+      "id": 32,
+      "group": "paraphrase",
+      "pair": "Bob-False",
+      "variant": "False",
+      "prompt": " Alice was given the blue key. Bob was given the green key. The key given to Bob was",
+      "tokens": [
+        29405,
+        572,
+        2661,
+        279,
+        6303,
+        1376,
+        13,
+        14261,
+        572,
+        2661,
+        279,
+        6176,
+        1376,
+        13,
+        576,
+        1376,
+        2661,
+        311,
+        14261,
+        572
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          25
+        ],
+        [
+          25,
+          29
+        ],
+        [
+          29,
+          30
+        ],
+        [
+          30,
+          34
+        ],
+        [
+          34,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          48
+        ],
+        [
+          48,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          80
+        ],
+        [
+          80,
+          84
+        ]
+      ],
+      "target": 6176,
+      "foil": 6303,
+      "target_text": " green",
+      "foil_text": " blue"
+    },
+    {
+      "id": 33,
+      "group": "assignment",
+      "pair": "Bob-False",
+      "variant": "True",
+      "prompt": " Alice's color is green. Bob's color is blue. Bob's color is",
+      "tokens": [
+        29405,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        14261,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          23
+        ],
+        [
+          23,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ]
+      ],
+      "target": 6303,
+      "foil": 6176,
+      "target_text": " blue",
+      "foil_text": " green"
+    },
+    {
+      "id": 34,
+      "group": "reassignment",
+      "pair": "Bob-False",
+      "variant": "True",
+      "prompt": " Alice's color is green. Bob's color is blue. Alice's color is now blue. Bob's color is now green. Bob's color is",
+      "tokens": [
+        29405,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        1431,
+        6303,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        1431,
+        6176,
+        13,
+        14261,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          23
+        ],
+        [
+          23,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ],
+        [
+          62,
+          66
+        ],
+        [
+          66,
+          71
+        ],
+        [
+          71,
+          72
+        ],
+        [
+          72,
+          76
+        ],
+        [
+          76,
+          78
+        ],
+        [
+          78,
+          84
+        ],
+        [
+          84,
+          87
+        ],
+        [
+          87,
+          91
+        ],
+        [
+          91,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          102
+        ],
+        [
+          102,
+          104
+        ],
+        [
+          104,
+          110
+        ],
+        [
+          110,
+          113
+        ]
+      ],
+      "target": 6176,
+      "foil": 6303,
+      "target_text": " green",
+      "foil_text": " blue"
+    },
+    {
+      "id": 35,
+      "group": "paraphrase",
+      "pair": "Bob-False",
+      "variant": "True",
+      "prompt": " Alice was given the green key. Bob was given the blue key. The key given to Bob was",
+      "tokens": [
+        29405,
+        572,
+        2661,
+        279,
+        6176,
+        1376,
+        13,
+        14261,
+        572,
+        2661,
+        279,
+        6303,
+        1376,
+        13,
+        576,
+        1376,
+        2661,
+        311,
+        14261,
+        572
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          26
+        ],
+        [
+          26,
+          30
+        ],
+        [
+          30,
+          31
+        ],
+        [
+          31,
+          35
+        ],
+        [
+          35,
+          39
+        ],
+        [
+          39,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          80
+        ],
+        [
+          80,
+          84
+        ]
+      ],
+      "target": 6303,
+      "foil": 6176,
+      "target_text": " blue",
+      "foil_text": " green"
+    },
+    {
+      "id": 36,
+      "group": "assignment",
+      "pair": "Bob-True",
+      "variant": "False",
+      "prompt": " Bob's color is green. Alice's color is blue. Bob's color is",
+      "tokens": [
+        14261,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        14261,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          21
+        ],
+        [
+          21,
+          22
+        ],
+        [
+          22,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ]
+      ],
+      "target": 6176,
+      "foil": 6303,
+      "target_text": " green",
+      "foil_text": " blue"
+    },
+    {
+      "id": 37,
+      "group": "reassignment",
+      "pair": "Bob-True",
+      "variant": "False",
+      "prompt": " Bob's color is green. Alice's color is blue. Bob's color is now blue. Alice's color is now green. Bob's color is",
+      "tokens": [
+        14261,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        1431,
+        6303,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        1431,
+        6176,
+        13,
+        14261,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          21
+        ],
+        [
+          21,
+          22
+        ],
+        [
+          22,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ],
+        [
+          60,
+          64
+        ],
+        [
+          64,
+          69
+        ],
+        [
+          69,
+          70
+        ],
+        [
+          70,
+          76
+        ],
+        [
+          76,
+          78
+        ],
+        [
+          78,
+          84
+        ],
+        [
+          84,
+          87
+        ],
+        [
+          87,
+          91
+        ],
+        [
+          91,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          102
+        ],
+        [
+          102,
+          104
+        ],
+        [
+          104,
+          110
+        ],
+        [
+          110,
+          113
+        ]
+      ],
+      "target": 6303,
+      "foil": 6176,
+      "target_text": " blue",
+      "foil_text": " green"
+    },
+    {
+      "id": 38,
+      "group": "paraphrase",
+      "pair": "Bob-True",
+      "variant": "False",
+      "prompt": " Alice was given the blue key. Bob was given the green key. The key given to Bob was",
+      "tokens": [
+        29405,
+        572,
+        2661,
+        279,
+        6303,
+        1376,
+        13,
+        14261,
+        572,
+        2661,
+        279,
+        6176,
+        1376,
+        13,
+        576,
+        1376,
+        2661,
+        311,
+        14261,
+        572
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          25
+        ],
+        [
+          25,
+          29
+        ],
+        [
+          29,
+          30
+        ],
+        [
+          30,
+          34
+        ],
+        [
+          34,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          48
+        ],
+        [
+          48,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          80
+        ],
+        [
+          80,
+          84
+        ]
+      ],
+      "target": 6176,
+      "foil": 6303,
+      "target_text": " green",
+      "foil_text": " blue"
+    },
+    {
+      "id": 39,
+      "group": "assignment",
+      "pair": "Bob-True",
+      "variant": "True",
+      "prompt": " Bob's color is blue. Alice's color is green. Bob's color is",
+      "tokens": [
+        14261,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        14261,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          20
+        ],
+        [
+          20,
+          21
+        ],
+        [
+          21,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ]
+      ],
+      "target": 6303,
+      "foil": 6176,
+      "target_text": " blue",
+      "foil_text": " green"
+    },
+    {
+      "id": 40,
+      "group": "reassignment",
+      "pair": "Bob-True",
+      "variant": "True",
+      "prompt": " Bob's color is blue. Alice's color is green. Bob's color is now green. Alice's color is now blue. Bob's color is",
+      "tokens": [
+        14261,
+        594,
+        1894,
+        374,
+        6303,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        6176,
+        13,
+        14261,
+        594,
+        1894,
+        374,
+        1431,
+        6176,
+        13,
+        29405,
+        594,
+        1894,
+        374,
+        1431,
+        6303,
+        13,
+        14261,
+        594,
+        1894,
+        374
+      ],
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          20
+        ],
+        [
+          20,
+          21
+        ],
+        [
+          21,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ],
+        [
+          60,
+          64
+        ],
+        [
+          64,
+          70
+        ],
+        [
+          70,
+          71
+        ],
+        [
+          71,
+          77
+        ],
+        [
+          77,
+          79
+        ],
+        [
+          79,
+          85
+        ],
+        [
+          85,
+          88
+        ],
+        [
+          88,
+          92
+        ],
+        [
+          92,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          102
+        ],
+        [
+          102,
+          104
+        ],
+        [
+          104,
+          110
+        ],
+        [
+          110,
+          113
+        ]
+      ],
+      "target": 6176,
+      "foil": 6303,
+      "target_text": " green",
+      "foil_text": " blue"
+    },
+    {
+      "id": 41,
+      "group": "paraphrase",
+      "pair": "Bob-True",
+      "variant": "True",
+      "prompt": " Alice was given the green key. Bob was given the blue key. The key given to Bob was",
+      "tokens": [
+        29405,
+        572,
+        2661,
+        279,
+        6176,
+        1376,
+        13,
+        14261,
+        572,
+        2661,
+        279,
+        6303,
+        1376,
+        13,
+        576,
+        1376,
+        2661,
+        311,
+        14261,
+        572
+      ],
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          26
+        ],
+        [
+          26,
+          30
+        ],
+        [
+          30,
+          31
+        ],
+        [
+          31,
+          35
+        ],
+        [
+          35,
+          39
+        ],
+        [
+          39,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          80
+        ],
+        [
+          80,
+          84
+        ]
+      ],
+      "target": 6303,
+      "foil": 6176,
+      "target_text": " blue",
+      "foil_text": " green"
+    }
+  ],
+  "tokenizer_source": "mats:/mnt/nw/home/s.sauers/mpd-data/cluster/qwen3_0p6b_data/model/tokenizer.json",
+  "semantic_source_fixture_sha256": "128efe8177f2975bae4aae95326db75efde55c3edb77afb4d534fed9306fff16"
+}

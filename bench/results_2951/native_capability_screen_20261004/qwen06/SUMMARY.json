@@ -1,0 +1,45 @@
+{
+  "scope": "Frozen42 native behavioral calibration; exploratory model capability selection only, no method win or mechanism claim.",
+  "report_sha256": "e06dc846a9538648eeec410d53df1a6ac167dfea7389278b952333cfa79dcb6c",
+  "fixture_sha256": "a9de83bc2cb3979068f034dbd0ed92a2c1c59f923680b04f81ab50b7b1faba77",
+  "groups": {
+    "assignment": {
+      "cases": 8,
+      "unique_token_contexts": 8,
+      "forced_choice_correct": 7,
+      "mean_target_probability": 0.36637423603061237,
+      "median_target_rank": 1.0,
+      "mean_target_minus_foil_log_odds": 0.5479533445756393
+    },
+    "paraphrase": {
+      "cases": 8,
+      "unique_token_contexts": 4,
+      "forced_choice_correct": 6,
+      "mean_target_probability": 0.0905698653826781,
+      "median_target_rank": 3.0,
+      "mean_target_minus_foil_log_odds": 0.8526205048362434
+    },
+    "periodic": {
+      "cases": 18,
+      "unique_token_contexts": 18,
+      "forced_choice_correct": 14,
+      "mean_target_probability": 0.3808040772910482,
+      "median_target_rank": 1.0,
+      "mean_target_minus_foil_log_odds": 1.0381014552782504
+    },
+    "reassignment": {
+      "cases": 8,
+      "unique_token_contexts": 8,
+      "forced_choice_correct": 5,
+      "mean_target_probability": 0.061316243588660835,
+      "median_target_rank": 2.0,
+      "mean_target_minus_foil_log_odds": -0.16369747801497025
+    }
+  },
+  "limitations": [
+    "Paraphrase order variants duplicate contexts (4 unique in8); not independent evidence.",
+    "Same prespecified prompts as4L/Pythia160, no prompt tuning.",
+    "Operational full28L native f64 Rust CPU inference; no CUDA parity or full neural certificate.",
+    "Task-specific capability positive evidence requires subsequent native interventions, not inferred mechanism."
+  ]
+}

@@ -1,7 +1,7 @@
 {
   "purpose": "Check that candidate models exhibit the behavior before attempting mechanistic recovery. No fitted explanation, method benchmark or compression claim.",
-  "selection": "Same 42 semantic prompts. Pythia was selected after observing weak four-layer results; this is exploratory model selection, not untouched heldout evaluation.",
-  "conclusion": "Neither model reliably follows counterbalanced ownership or periodic order on this panel; these cases do not justify claiming a recovered binding procedure.",
+  "selection": "Same42semantic prompts across4L,Pythia160,Qwen0.6B. Larger models chosen after observing smaller-model results; exploratory model selection, not an untouched benchmark or VPD comparison.",
+  "conclusion": "4L and Pythia160 do not reliably follow counterbalanced bindings on this panel. Qwen0.6B shows bounded assignment and sequence capability, with weaker reassignment. Preserve both successes and failures as the mechanistic target; no recovered mechanism yet.",
   "limits": [
     "Absence on this panel is not proof of absence on all tasks.",
     "The eight paraphrase records contain only four unique contexts.",
@@ -15,7 +15,10 @@
     "pythia160/FIXTURES.json": "ad259df15aa3ef9db2f8843973d1f6e980844e70e567caae4e4bd1a93771a885",
     "pythia160/HOST.json": "66941ca6b10e79dc2d2bc7b6cfef06a0895f422a061b10f7e7f7bf00e33d55b8",
     "pythia160/SUMMARY.json": "fca0df72edc7daafdc867dfd23adff1f750c85fc157735a4682d1bb7d66a51ae",
-    "pythia160/REFERENCE_DISTRIBUTION.json": "8689871a6b1489cd1d51c5cb064a9ae4fe984e628cf63ed721089bcdeb98c28a"
+    "pythia160/REFERENCE_DISTRIBUTION.json": "8689871a6b1489cd1d51c5cb064a9ae4fe984e628cf63ed721089bcdeb98c28a",
+    "qwen06/FIXTURES.json": "a9de83bc2cb3979068f034dbd0ed92a2c1c59f923680b04f81ab50b7b1faba77",
+    "qwen06/HOST.json": "e06dc846a9538648eeec410d53df1a6ac167dfea7389278b952333cfa79dcb6c",
+    "qwen06/SUMMARY.json": "50ceed00f53eb6e443bf8e69c5b028bcc55529c73e1a9fb893dd4fe302bd757b"
   },
   "native_reference": {
     "scope": "Pythia160 native Rust f64 compared with stored HF FP32 logits across first sequence positions0..127, including full causal attention. Different prompts from capability screen.",
@@ -24,5 +27,6 @@
     "mean_kl": 9.4217e-08,
     "max_absolute_logit_gap": 0.01398237,
     "interpretation": "Strong measured distribution agreement. No exact numerical equality or full neural certificate."
-  }
+  },
+  "next_uncertain_proposition": "What native control selects earlier versus updated associations? Distinguish entity binding, repeated wording, recency and value priors through frozen native representation/law predictions and interventions."
 }
