@@ -55,7 +55,7 @@
 use crate::{
     artifact::Artifact,
     artifact_device::mapped_inlined_observed,
-    device_program::DeviceProgram,
+    device_program::{DeviceProgram, DeviceTrace},
     library_mdl::{Explanation, Posterior, sequence_family},
     operator_program::{Node, OperatorProgram, Rotary, Rule, rms_scale},
     resident_causal_fit::fixed_head_target::Head,
@@ -68,7 +68,7 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
 };
 
@@ -562,6 +562,20 @@ struct HeadReads {
     key: Vec<Array2<f64>>,
 }
 
+/// One run of the explanation ([`Library::run`]).
+#[derive(Clone, Debug)]
+pub struct Run {
+    /// Per read site, the residual stream entering it (site `2l`: layer `l`'s attention, `2l + 1`:
+    /// its MLP), rows × width.
+    pub streams: Vec<Array2<f64>>,
+    /// Per head ([`Library::heads`]), its read (rows × head width) and its attention weights per
+    /// sequence.
+    pub reads: Vec<Array2<f64>>,
+    pub weights: Vec<Vec<Array2<f64>>>,
+    /// The final stream, before the final norm.
+    pub last: Array2<f64>,
+}
+
 /// What the reverse pass hands its visitor at a cut: the cut, its attributions (rows × its
 /// functions), its reads, and `∂m/∂x` for the residual stream `x` right after the cut.
 struct Visit<'v> {
@@ -757,6 +771,80 @@ impl<'a> Library<'a> {
         })
     }
 
+    /// The heads, as (layer, head), in the order [`Library::run`] and [`Library::head_on`] index them.
+    #[must_use]
+    pub fn heads(&self) -> Vec<(usize, usize)> {
+        self.heads.iter().map(|b| (b.layer, b.head)).collect()
+    }
+
+    /// The explanation run on `sequences` (of one length), each head in `replace` (an index into
+    /// [`Library::heads`]) reading the given values (rows × head width) in place of its own, and
+    /// everything after it recomputed.
+    pub fn run(&self, sequences: &[Vec<u32>], replace: &BTreeMap<usize, Array2<f64>>) -> Result<Run, String> {
+        let pass = self.pass_with(&sequences.iter().map(Vec::as_slice).collect::<Vec<_>>(), replace)?;
+        Ok(Run {
+            streams: pass.streams.into_iter().map(CowArray::into_owned).collect(),
+            reads: pass.head.into_iter().map(|[_, _, z, ..]| z.into_owned()).collect(),
+            weights: pass.weights.into_iter().map(|w| w.into_iter().map(CowArray::into_owned).collect()).collect(),
+            last: pass.last.into_owned(),
+        })
+    }
+
+    /// Head `h`'s write of its read `z` (rows × head width): `z W_O,hᵀ`.
+    #[must_use]
+    pub fn write(&self, h: usize, z: &Array2<f64>) -> Array2<f64> {
+        z.dot(&self.heads[h].output.t())
+    }
+
+    /// Head `h` recomputed with its query, key and value reads taken from the given streams entering
+    /// its layer (rows × width, sequences of `length` rows): each normed by the layer's norm (its
+    /// own RMS), read by the head's map and head norm, the query and key rotated, the causal
+    /// softmax of their scores mixing the values. Its read and its attention weights per sequence.
+    #[must_use]
+    pub fn head_on(&self, h: usize, query: &Array2<f64>, key: &Array2<f64>, value: &Array2<f64>, length: usize) -> (Array2<f64>, Vec<Array2<f64>>) {
+        let block = &self.heads[h];
+        let site = &self.sites[2 * block.layer];
+        let normed = |x: &Array2<f64>| {
+            let mut out = x * &site.gain.view().insert_axis(Axis(0));
+            out.outer_iter_mut().zip(x.outer_iter()).for_each(|(mut row, x)| row *= rms_scale(x, site.epsilon));
+            out
+        };
+        let read = |x: &Array2<f64>, read: &Read| {
+            let mut out = normed(x).dot(&read.map.t());
+            if let Some((gain, epsilon)) = &read.norm {
+                let projection = out.clone();
+                out = out * &gain.view().insert_axis(Axis(0));
+                out.outer_iter_mut().zip(projection.outer_iter()).for_each(|(mut row, p)| row *= rms_scale(p, *epsilon));
+            }
+            out
+        };
+        let (q, k, v) = (read(query, &block.query), read(key, &block.key), normed(value).dot(&block.value.t()));
+        let positions: Vec<u32> = (0..length as u32).collect();
+        let mut z = Array2::<f64>::zeros(v.dim());
+        let mut weights = Vec::new();
+        for s in 0..q.nrows() / length.max(1) {
+            let span = s * length..(s + 1) * length;
+            let (qs, ks) = (q.slice(s![span.clone(), ..]).to_owned(), k.slice(s![span.clone(), ..]).to_owned());
+            let (qs, ks) = (rotate(&qs, block.rotary, &positions, false), rotate(&ks, block.rotary, &positions, false));
+            let w = probabilities(qs.view(), ks.view(), &positions, 0, block.scale, block.causal);
+            z.slice_mut(s![span.clone(), ..]).assign(&w.dot(&v.slice(s![span, ..])));
+            weights.push(w);
+        }
+        (z, weights)
+    }
+
+    /// The next-token log-probabilities of each row of the final stream `last` (rows × vocabulary),
+    /// through the final norm (its own RMS) and the unembedding.
+    pub fn log_probabilities(&self, last: &Array2<f64>) -> Result<Array2<f64>, String> {
+        let mut logits = last.dot(&self.unembedding.t());
+        for (mut row, x) in logits.outer_iter_mut().zip(last.outer_iter()) {
+            row *= rms_scale(x, self.final_site.epsilon);
+            let values = gam_math::categorical::log_softmax(row.as_slice().ok_or("a contiguous row")?).map_err(error)?;
+            row.assign(&Array1::from(values));
+        }
+        Ok(logits)
+    }
+
     /// Every function in the order of attribution columns: per layer its heads, then its MLP
     /// functions.
     #[must_use]
@@ -793,8 +881,26 @@ impl<'a> Library<'a> {
 
     /// The forward pass on `batch` (sequences of one length).
     fn pass(&self, batch: &[&[u32]]) -> Result<Pass<'static>, String> {
+        self.pass_with(batch, &BTreeMap::new())
+    }
+
+    /// [`Library::pass`] with each head in `replace` (an index into the heads) reading the given
+    /// values (rows × head width) in place of its own; everything after it recomputed.
+    fn pass_with(&self, batch: &[&[u32]], replace: &BTreeMap<usize, Array2<f64>>) -> Result<Pass<'static>, String> {
         let family = sequence_family(batch)?;
-        let trace = self.program.forward(&family)?;
+        let p = self.head_paths;
+        let trace = if replace.is_empty() {
+            self.program.forward(&family)?
+        } else {
+            let at: BTreeMap<usize, &Array2<f64>> = replace.iter().map(|(h, z)| (self.observed[p + 6 * h + 2], z)).collect();
+            if at.values().any(|z| z.nrows() != family.rows) {
+                return Err("a replaced read of another number of rows".into());
+            }
+            let edit = |node: usize, _: &DeviceTrace| -> Result<Option<Tensor>, String> {
+                at.get(&node).map(|z| self.model.upload(z.view()).map_err(error)).transpose()
+            };
+            self.program.forward_edited(&family, BTreeMap::new(), &BTreeSet::new(), |_, _| Ok(()), edit)?
+        };
         let get = |i: usize| -> Result<Array2<f64>, String> { self.model.download(trace.value(self.observed[i])?).map_err(error) };
         let inverse_of = |x: &Array2<f64>, epsilon: f64| x.map_axis(Axis(1), |row| rms_scale(row, epsilon));
         let streams: Vec<Array2<f64>> = (0..self.sites.len()).map(get).collect::<Result<_, String>>()?;
@@ -810,7 +916,6 @@ impl<'a> Library<'a> {
                 Ok((CowArray::from(get(i)?), CowArray::from(get(i + 1)?), if block.up.is_some() { Some(CowArray::from(get(i + 2)?)) } else { None }))
             })
             .collect::<Result<_, String>>()?;
-        let p = self.head_paths;
         let head: Vec<[Array2<f64>; 6]> = (0..self.heads.len())
             .map(|h| Ok([get(p + 6 * h)?, get(p + 6 * h + 1)?, get(p + 6 * h + 2)?, get(p + 6 * h + 3)?, get(p + 6 * h + 4)?, get(p + 6 * h + 5)?]))
             .collect::<Result<_, String>>()?;
@@ -1660,6 +1765,36 @@ mod tests {
             }
         }
         largest
+    }
+
+    /// A head recomputed on the run's own streams gives its read, a run whose head reads are
+    /// replaced by their own values reproduces the run, and a replaced read changes what follows.
+    #[test]
+    fn heads_recompute_and_replace_exactly() {
+        for dir in [tiny_export("readout_heads_gelu", 2), tiny_qwen3_export("readout_heads_gated", 2)] {
+            let imported = import_language_model(&dir, 6, 12).expect("tiny export");
+            std::fs::remove_dir_all(dir).expect("remove the tiny export");
+            let native = split_sites(&imported.program).expect("split sites");
+            let layers = layer_nodes(&native, 2).expect("layer nodes");
+            let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+            let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+            let artifact = library_mdl::explanation(&native, &layers).expect("library").artifact;
+            let host = Device::host();
+            let library = Library::new(&host, &host, &native, &layers, &artifact, 1 << 30, 64).expect("library on the host");
+            let base = library.run(&sequences, &std::collections::BTreeMap::new()).expect("run");
+            let largest = |a: &ndarray::Array2<f64>, b: &ndarray::Array2<f64>| (a - b).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            for (h, (layer, _)) in library.heads().into_iter().enumerate() {
+                let stream = &base.streams[2 * layer];
+                let (z, _) = library.head_on(h, stream, stream, stream, 12);
+                assert!(largest(&z, &base.reads[h]) < 1e-10, "head {h} recomputed off by {}", largest(&z, &base.reads[h]));
+            }
+            let same: std::collections::BTreeMap<usize, ndarray::Array2<f64>> = [(0, base.reads[0].clone())].into();
+            assert!(largest(&library.run(&sequences, &same).expect("run").last, &base.last) < 1e-12);
+            let zero: std::collections::BTreeMap<usize, ndarray::Array2<f64>> = [(0, ndarray::Array2::zeros(base.reads[0].dim()))].into();
+            assert!(largest(&library.run(&sequences, &zero).expect("run").last, &base.last) > 1e-6);
+            let log_p = library.log_probabilities(&base.last).expect("log probabilities");
+            assert!(log_p.outer_iter().all(|row| (row.mapv(f64::exp).sum() - 1.0).abs() < 1e-12));
+        }
     }
 
     /// RelP's attributions with the skip connection account for the metric at every cut of a GELU
