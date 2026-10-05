@@ -11,6 +11,7 @@ use gam_mpd::{
     down_edit_family::{self, Direction, Family as DownFamily},
     import::import_language_model,
     intervention_program::{self, Control, ControlValue},
+    native_parameter_edit,
     operator_program::{remap_node, FamilyInputs, Node, OperatorBody, OperatorProgram},
     parameter_response_program, program_learned_dag,
     program_structure_search::{
@@ -52,6 +53,8 @@ struct Case {
     gains: Vec<f64>,
     #[serde(default)]
     down_amplitudes: Vec<f64>,
+    #[serde(default)]
+    parameter_amplitudes: Vec<f64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +86,123 @@ struct DownSettings {
     directions: Vec<DownDirection>,
     #[serde(default = "default_response_weight")]
     response_weight: f64,
+}
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeEditSettings {
+    target_operator: usize,
+    directions: Vec<Vec<Vec<f64>>>,
+}
+fn build_parameter_edits(
+    native: &OperatorProgram,
+    config: &NativeEditSettings,
+) -> Result<native_parameter_edit::Family, String> {
+    let directions = config
+        .directions
+        .iter()
+        .map(|rows| {
+            let width = rows.first().ok_or("empty native edit matrix")?.len();
+            if width == 0 || rows.iter().any(|r| r.len() != width) {
+                return Err("ragged native edit matrix".into());
+            }
+            Array2::from_shape_vec(
+                (rows.len(), width),
+                rows.iter().flatten().copied().collect(),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let (flat, _) = gam_mpd::artifact_device::mapped_inlined(native)?;
+    if flat.nodes[match &flat.nodes[flat.output] {
+        Node::Readout { input, .. } => *input,
+        _ => flat.output,
+    }]
+    .operators()
+    .contains(&config.target_operator)
+    {
+        return Err("native parameter edits to final readout unsupported".into());
+    }
+    fn depends(nodes: &[Node], node: usize, operator: usize) -> bool {
+        let mut pending = vec![node];
+        let mut seen = BTreeSet::new();
+        while let Some(n) = pending.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            if nodes[n].operators().contains(&operator) {
+                return true;
+            }
+            pending.extend(nodes[n].arguments());
+        }
+        false
+    }
+    if !flat.nodes.iter().enumerate().any(|(n, node)| {
+        matches!(node, Node::Pointwise { .. } | Node::Hadamard { .. })
+            && depends(&flat.nodes, n, config.target_operator)
+    }) {
+        return Err("native parameter edit must feed a downstream nonlinear computation".into());
+    }
+    native_parameter_edit::build(native, config.target_operator, &directions)
+}
+fn reject_native_edit_target_gain(target: usize, controls: &[Control]) -> Result<(), String> {
+    if controls
+        .iter()
+        .any(|c| matches!(c,Control::GlobalOperatorScale {operator} if *operator==target))
+    {
+        return Err(
+            "simultaneous gain on native edit target unsupported: no implicit edit/gain order"
+                .into(),
+        );
+    }
+    Ok(())
+}
+fn validate_parameter_edit_configuration(settings: &Settings) -> Result<(), String> {
+    let count = settings
+        .native_parameter_edits
+        .as_ref()
+        .map_or(0, |c| c.directions.len());
+    if let Some(config) = &settings.native_parameter_edits {
+        if settings.structural_search.is_none()
+            || settings.down_edit_family.is_some()
+            || settings.joint_response_search.is_some()
+            || config.directions.is_empty()
+        {
+            return Err("native_parameter_edits requires structural_search and nonempty dense directions; down/fixed-bank joint modes are unsupported".into());
+        }
+    }
+    for cases in std::iter::once(settings.cases.as_slice()).chain(
+        settings
+            .evaluation
+            .as_ref()
+            .and_then(|e| e.cases.as_deref()),
+    ) {
+        if cases.iter().any(|c| {
+            c.parameter_amplitudes.len() != count
+                || c.parameter_amplitudes.iter().any(|a| !a.is_finite())
+        }) {
+            return Err("one finite amplitude per native parameter edit required".into());
+        }
+    }
+    if count > 0
+        && (!settings.cases.iter().any(|c| {
+            c.gains.iter().all(|g| *g == 1.) && c.parameter_amplitudes.iter().all(|a| *a == 0.)
+        }) || !settings
+            .cases
+            .iter()
+            .flat_map(|c| &c.parameter_amplitudes)
+            .any(|a| *a > 0.)
+            || !settings
+                .cases
+                .iter()
+                .flat_map(|c| &c.parameter_amplitudes)
+                .any(|a| *a < 0.))
+    {
+        return Err(
+            "native parameter edits require clean plus prespecified signed training amplitudes"
+                .into(),
+        );
+    }
+    Ok(())
 }
 fn default_response_weight() -> f64 {
     1.
@@ -119,6 +239,8 @@ struct Settings {
     native_initialization: bool,
     #[serde(default)]
     down_edit_family: Option<DownSettings>,
+    #[serde(default)]
+    native_parameter_edits: Option<NativeEditSettings>,
     #[serde(default)]
     structural_search: Option<StructuralSettings>,
     #[serde(default)]
@@ -558,9 +680,13 @@ fn maximum_response_error(m: &resident_causal_fit::Measurement) -> Result<f64, S
 
 fn training_dominates(b: &Value, a: &Value, joint: bool) -> bool {
     let (Some(ac), Some(bc), Some(ae), Some(be)) = (
-        a["c32"].as_u64(), b["c32"].as_u64(),
-        a["training_kl"].as_f64(), b["training_kl"].as_f64(),
-    ) else { return false; };
+        a["c32"].as_u64(),
+        b["c32"].as_u64(),
+        a["training_kl"].as_f64(),
+        b["training_kl"].as_f64(),
+    ) else {
+        return false;
+    };
     if joint {
         let (Some(ar), Some(br)) = (
             a["maximum_episode_response_error"].as_f64(),
@@ -714,7 +840,9 @@ fn validate_cases(
         })
         || (require_clean
             && !cases.iter().any(|c| {
-                c.gains.iter().all(|g| *g == 1.) && c.down_amplitudes.iter().all(|a| *a == 0.)
+                c.gains.iter().all(|g| *g == 1.)
+                    && c.down_amplitudes.iter().all(|a| *a == 0.)
+                    && c.parameter_amplitudes.iter().all(|a| *a == 0.)
             }))
     {
         return Err("unique finite cases matching controls/directions and an explicit zero-edit clean case required".into());
@@ -1131,6 +1259,15 @@ fn native_response_targets_mapped(
             .collect::<Result<BTreeMap<_, _>, String>>()?;
         labels.push(captured);
     }
+    response_targets_from_captures(boundaries, episodes, labels, weight, planned)
+}
+fn response_targets_from_captures(
+    boundaries: &BTreeMap<usize, usize>,
+    episodes: &[ResponseEpisode],
+    labels: Vec<BTreeMap<usize, Array2<f64>>>,
+    weight: f64,
+    planned: usize,
+) -> Result<(resident_causal_fit::NativeResponses, Value), String> {
     let mut scales = BTreeMap::new();
     for &node in boundaries.keys() {
         // Scaled sum of squares avoids overflow while computing the pooled RMS
@@ -1821,6 +1958,249 @@ fn structural_artifact_path(
         attempt.attempt_id
     )))
 }
+/// Literal teachers and augmented candidate inputs are constructed separately.
+fn parameter_edit_episodes(
+    d: &Device,
+    edits: &native_parameter_edit::Family,
+    controlled: &intervention_program::Compiled,
+    native: &OperatorProgram,
+    native_controls: &[Control],
+    original: &OperatorProgram,
+    settings: &Settings,
+    family: &FamilyInputs,
+    cases: &[Case],
+) -> Result<CausalEpisodes, String> {
+    let layers = if settings.controls.iter().any(|c| {
+        matches!(
+            c,
+            NativeControl::MlpOutput { .. } | NativeControl::AttentionOutput { .. }
+        )
+    }) {
+        layer_nodes(original, settings.layers)?
+    } else {
+        Vec::new()
+    };
+    let mut full = Vec::new();
+    let mut compact: Vec<resident_causal_fit::FixedHeadEpisode> = Vec::new();
+    let mut metadata = Vec::new();
+    let mut retained = 0usize;
+    for case in cases {
+        let literal = edits.literal_native(&case.parameter_amplitudes)?;
+        let teacher_controls = controls(
+            &Artifact::native(&literal)?,
+            &literal,
+            &layers,
+            &settings.controls,
+        )?;
+        let teacher_graph = intervention_program::compile(&literal, &teacher_controls)?;
+        let budget = settings
+            .teacher_numeric_bytes
+            .checked_sub(retained)
+            .ok_or("native edit labels exceed teacher budget")?;
+        let labels = if settings.fixed_head_targets.is_some() {
+            Vec::new()
+        } else {
+            teacher_targets(
+                d,
+                &literal,
+                &teacher_controls,
+                family,
+                std::slice::from_ref(case),
+                settings.fit.numeric_bytes,
+                budget,
+            )?
+            .0
+        };
+        let mut teacher = CausalEpisodes::from_family(
+            d,
+            &teacher_graph,
+            &literal,
+            &teacher_controls,
+            family,
+            std::slice::from_ref(case),
+            &labels,
+            settings.fixed_head_targets.as_ref(),
+            budget,
+        )?;
+        let inputs = controlled.family(
+            &edits.inputs(family, &case.parameter_amplitudes)?,
+            &values(native, native_controls, family.rows, case)?,
+        )?;
+        let mut record = teacher.metadata.remove(0);
+        record.inputs = inputs.clone();
+        if let Some(episodes) = &mut teacher.compact {
+            if let Some(reference) = compact.first() {
+                episodes[0].target = episodes[0].target.with_shared_head(&reference.target)?;
+            } else {
+                let head_bytes = original
+                    .node_interface(original.output)
+                    .map_err(|e| e.to_string())?
+                    .width()
+                    .checked_mul(episodes[0].target.width())
+                    .and_then(|n| n.checked_mul(8))
+                    .ok_or("shared immutable head bytes overflow")?;
+                record.endpoint_bytes = record
+                    .endpoint_bytes
+                    .checked_add(head_bytes)
+                    .ok_or("shared head endpoint bytes overflow")?;
+            }
+        }
+
+        retained = retained
+            .checked_add(record.endpoint_bytes)
+            .ok_or("native edit target bytes overflow")?;
+        metadata.push(record);
+        if let Some(mut episodes) = teacher.full {
+            episodes[0].inputs = inputs;
+            full.extend(episodes);
+        } else if let Some(mut episodes) = teacher.compact {
+            episodes[0].inputs = inputs;
+            compact.extend(episodes);
+        }
+    }
+    let compact_mode = settings.fixed_head_targets.is_some();
+    Ok(CausalEpisodes {
+        metadata,
+        full: (!compact_mode).then_some(full),
+        compact: compact_mode.then_some(compact),
+        tile_rows: settings
+            .fixed_head_targets
+            .as_ref()
+            .map_or(0, |s| s.tile_rows),
+        target_metadata: json!({"backend":if compact_mode{"fixed_head"}else{"full_logits"},"literal_native_parameter_edits":true,"resident_endpoint_numeric_bytes":retained,"full_logit_target_bytes":if compact_mode{0}else{retained},"teacher_numeric_bytes_limit":settings.teacher_numeric_bytes,"scope":"Each native teacher literally edits the original stored matrix before normal controls; candidate receives independent Raw edit controls. Compact mode never constructs full logits."}),
+    })
+}
+fn parameter_edit_response_targets(
+    d: &Device,
+    edits: &native_parameter_edit::Family,
+    controlled: &intervention_program::Compiled,
+    original: &OperatorProgram,
+    settings: &Settings,
+    family: &FamilyInputs,
+    cases: &[Case],
+    candidate: &Artifact,
+    records: &[ResponseEpisode],
+    weight: f64,
+    limit: usize,
+) -> Result<(resident_causal_fit::NativeResponses, Value), String> {
+    if cases.len() != records.len() {
+        return Err("native edit response cases differ".into());
+    }
+    let original_to_controlled: Vec<_> = edits
+        .node_mapping
+        .iter()
+        .map(|n| controlled.root_mapping[*n])
+        .collect();
+    let inverse: BTreeMap<_, _> = original_to_controlled
+        .iter()
+        .enumerate()
+        .map(|(n, m)| (*m, n))
+        .collect();
+    let mut boundaries = BTreeMap::new();
+    let mut originals = BTreeMap::new();
+    for block in &candidate.blocks {
+        let original_node = *inverse.get(&block.native_write).ok_or("native edit response requires an original native observable exit; synthetic lowering exits are unsupported")?;
+        if candidate
+            .program
+            .node_interface(block.write)
+            .map_err(|e| e.to_string())?
+            != original
+                .node_interface(original_node)
+                .map_err(|e| e.to_string())?
+        {
+            return Err("native edit response interface changed".into());
+        }
+        if boundaries
+            .insert(block.native_write, block.write)
+            .is_some_and(|n| n != block.write)
+        {
+            return Err("conflicting native edit response boundaries".into());
+        }
+        originals.insert(block.native_write, original_node);
+    }
+    if boundaries.is_empty() {
+        return Err("native edit response requires changed original exits".into());
+    }
+    let layers = if settings.controls.iter().any(|c| {
+        matches!(
+            c,
+            NativeControl::MlpOutput { .. } | NativeControl::AttentionOutput { .. }
+        )
+    }) {
+        layer_nodes(original, settings.layers)?
+    } else {
+        Vec::new()
+    };
+    let endpoints = records.iter().try_fold(0usize, |n, r| {
+        n.checked_add(r.endpoint_bytes)
+            .ok_or("response endpoint overflow")
+    })?;
+    let mut labels = Vec::new();
+    let mut retained = 0usize;
+    let mut planned = 0usize;
+    for (case, record) in cases.iter().zip(records) {
+        let literal = edits.literal_native(&case.parameter_amplitudes)?;
+        let teacher_controls = controls(
+            &Artifact::native(&literal)?,
+            &literal,
+            &layers,
+            &settings.controls,
+        )?;
+        let teacher = intervention_program::compile(&literal, &teacher_controls)?;
+        let map: BTreeMap<_, _> = originals
+            .iter()
+            .map(|(n, o)| (teacher.root_mapping[*o], boundaries[n]))
+            .collect();
+        let teacher_record = ResponseEpisode {
+            label: case.label.clone(),
+            inputs: teacher.family(
+                family,
+                &values(&literal, &teacher_controls, family.rows, case)?,
+            )?,
+            scored: record.scored.clone(),
+            endpoint_bytes: record.endpoint_bytes,
+        };
+        let other = endpoints
+            .checked_sub(record.endpoint_bytes)
+            .and_then(|n| n.checked_add(retained))
+            .ok_or("native edit capture budget overflow")?;
+        let available = limit
+            .checked_sub(other)
+            .ok_or("native edit response labels exceed budget")?;
+        let (mut captured, provenance) = native_response_targets_mapped(
+            d,
+            &teacher.program,
+            &map,
+            std::slice::from_ref(&teacher_record),
+            weight,
+            available,
+        )?;
+        planned = planned.max(
+            (provenance["planned_numeric_bytes"]
+                .as_u64()
+                .ok_or("response plan absent")? as usize)
+                .checked_add(other)
+                .ok_or("native edit response plan overflow")?,
+        );
+        let by_candidate: BTreeMap<_, _> = boundaries.iter().map(|(n, c)| (*c, *n)).collect();
+        let values = captured
+            .remove(&case.label)
+            .ok_or("literal response labels absent")?
+            .into_iter()
+            .map(|t| (by_candidate[&t.source_node], t.values))
+            .collect::<BTreeMap<_, _>>();
+        retained = retained
+            .checked_add(values.values().map(|v| v.len() * 8).sum::<usize>())
+            .ok_or("native response labels overflow")?;
+        labels.push(values);
+    }
+    let (targets, mut provenance) =
+        response_targets_from_captures(&boundaries, records, labels, weight, planned)?;
+    provenance["original_to_controlled_root_mapping"] = json!(original_to_controlled);
+    provenance["literal_original_observations"] = json!(originals);
+    provenance["scope"]=json!("Literal stored-matrix edited original-native states under declared other controls; one pooled TRAIN scale per observable across all edit episodes. Synthetic lowering exits refused. Sampled response error, not mechanism recovery or original Local acceptance.");
+    Ok((targets, provenance))
+}
 fn structural_run(
     d: &Device,
     settings: &Settings,
@@ -1834,6 +2214,7 @@ fn structural_run(
     heldout_export: Option<&Path>,
     cache: Option<&CanonicalArtifactCache>,
     costs: &mut CostCache,
+    parameter_edits: Option<&native_parameter_edit::Family>,
 ) -> Result<(), String> {
     // These values belong to the fixed-bank baseline. Structural source has augmented
     // declarations/codewords, so its standalone replay uses the ordinary codec.
@@ -1854,17 +2235,31 @@ fn structural_run(
         &settings.controls,
     )?;
     let controlled = intervention_program::compile(native, &native_controls)?;
-    let training = CausalEpisodes::from_family(
-        d,
-        &controlled,
-        native,
-        &native_controls,
-        family,
-        &settings.cases,
-        targets,
-        settings.fixed_head_targets.as_ref(),
-        settings.teacher_numeric_bytes,
-    )?;
+    let training = if let Some(edits) = parameter_edits {
+        parameter_edit_episodes(
+            d,
+            edits,
+            &controlled,
+            native,
+            &native_controls,
+            original_native,
+            settings,
+            family,
+            &settings.cases,
+        )?
+    } else {
+        CausalEpisodes::from_family(
+            d,
+            &controlled,
+            native,
+            &native_controls,
+            family,
+            &settings.cases,
+            targets,
+            settings.fixed_head_targets.as_ref(),
+            settings.teacher_numeric_bytes,
+        )?
+    };
     save(&out.join("TEACHER_TARGETS.json"), &training.target_metadata)?;
     let mut all_inputs = training
         .metadata
@@ -1882,7 +2277,7 @@ fn structural_run(
         .map_err(|e| e.to_string())?;
     save(
         &out.join("CONTROLLED_SOURCE.json"),
-        &json!({"original_controls":settings.controls,"original_to_controlled_root_mapping":controlled.root_mapping,"control_slots":controlled.control_slots.iter().map(|s|json!({"control":s.control,"slot":s.slot,"width":s.width})).collect::<Vec<_>>(),"cases":settings.cases,"source_scope":"Original native graph augmented once with declared Raw control inputs and ordinary arithmetic. Structural candidate predicts from its own states and these controls; no per-candidate native intervention translator.","local_scope":"Measured controlled-native parent states over all declared training control episodes, RMS scale over that augmented family; not original unconditioned acceptance Dlocal.","global_scale_arithmetic":"Post-contribution multiplication, real-algebra equivalent to native shared-weight gain; not literal edited-checkpoint binary arithmetic equality.","codec_scope":"Ordinary standalone augmented artifact; original-native codec cache intentionally unsupported."}),
+        &json!({"native_parameter_edits":settings.native_parameter_edits,"original_to_edit_lowered_root_mapping":parameter_edits.map(|e|&e.node_mapping),"original_to_final_controlled_mapping":parameter_edits.map(|e|e.node_mapping.iter().map(|n|controlled.root_mapping[*n]).collect::<Vec<_>>()),"fixed_edit_direction_operator_ids":parameter_edits.map(|e|&e.direction_operators),"original_controls":settings.controls,"original_to_controlled_root_mapping":controlled.root_mapping,"control_slots":controlled.control_slots.iter().map(|s|json!({"control":s.control,"slot":s.slot,"width":s.width})).collect::<Vec<_>>(),"cases":settings.cases,"source_scope":"Original native graph augmented once with declared Raw control inputs and ordinary arithmetic. Structural candidate predicts from its own states and these controls; no per-candidate native intervention translator.","local_scope":"Measured controlled-native parent states over all declared training control episodes, RMS scale over that augmented family; not original unconditioned acceptance Dlocal.","global_scale_arithmetic":"Post-contribution multiplication, real-algebra equivalent to native shared-weight gain; not literal edited-checkpoint binary arithmetic equality.","codec_scope":"Ordinary standalone augmented artifact; original-native codec cache intentionally unsupported."}),
     )?;
     let initial_measure =
         training.measure(d, &initial_source.program, None, settings.fit.numeric_bytes)?;
@@ -1928,17 +2323,41 @@ fn structural_run(
                 {
                     return Err("exact extraction must remain fit-free".into());
                 }
+                if parameter_edits.is_some_and(|e| {
+                    request
+                        .trainable_operator_ids
+                        .iter()
+                        .any(|id| e.direction_operators.contains(id))
+                }) {
+                    return Err("fixed native edit directions cannot be fitted".into());
+                }
                 let mut fitted_responses = None;
                 if !request.trainable_operator_ids.is_empty() {
                     let fitted = if let Some(weight) = structural.native_response_weight {
-                        let (response_targets, provenance) = native_response_targets_records(
-                            d,
-                            &controlled.program,
-                            &candidate,
-                            &training.metadata,
-                            weight,
-                            settings.teacher_numeric_bytes,
-                        )?;
+                        let (response_targets, provenance) = if let Some(edits) = parameter_edits {
+                            parameter_edit_response_targets(
+                                d,
+                                edits,
+                                &controlled,
+                                original_native,
+                                settings,
+                                family,
+                                &settings.cases,
+                                &candidate,
+                                &training.metadata,
+                                weight,
+                                settings.teacher_numeric_bytes,
+                            )?
+                        } else {
+                            native_response_targets_records(
+                                d,
+                                &controlled.program,
+                                &candidate,
+                                &training.metadata,
+                                weight,
+                                settings.teacher_numeric_bytes,
+                            )?
+                        };
                         save(&root.join("NATIVE_RESPONSE_TARGETS.json"), &provenance)?;
                         let fitted = training.fit(
                             d,
@@ -1965,6 +2384,20 @@ fn structural_run(
                     candidate.program = fitted.program;
                 }
                 let (saved, bytes) = canonical(&candidate)?;
+                if let Some(edits) = parameter_edits {
+                    for id in &edits.direction_operators {
+                        if !same_dense(
+                            saved
+                                .program
+                                .operators
+                                .get(*id)
+                                .ok_or("saved native edit direction absent")?,
+                            &request.parent.artifact.program.operators[*id],
+                        ) {
+                            return Err("saved native edit direction changed".into());
+                        }
+                    }
+                }
                 std::fs::write(root.join("program.artifact"), bytes).map_err(|e| e.to_string())?;
                 let local_measure = local.measure(&saved)?;
                 let local_error = local_measure.worst().map_or(0., |b| b.worst);
@@ -2080,7 +2513,7 @@ fn structural_run(
         }
         disjoint_token_sequences(family, &imported.contract.family, settings.context)?;
         let cases = eval.cases.as_deref().unwrap_or(&settings.cases);
-        let (labels, plan) = if settings.fixed_head_targets.is_some() {
+        let (labels, plan) = if settings.fixed_head_targets.is_some() || parameter_edits.is_some() {
             (Vec::new(), 0)
         } else {
             family_teacher_targets(
@@ -2095,17 +2528,31 @@ fn structural_run(
                 settings.teacher_numeric_bytes,
             )?
         };
-        let eval_episodes = CausalEpisodes::from_family(
-            d,
-            &controlled,
-            native,
-            &native_controls,
-            &imported.contract.family,
-            cases,
-            &labels,
-            settings.fixed_head_targets.as_ref(),
-            settings.teacher_numeric_bytes,
-        )?;
+        let eval_episodes = if let Some(edits) = parameter_edits {
+            parameter_edit_episodes(
+                d,
+                edits,
+                &controlled,
+                native,
+                &native_controls,
+                original_native,
+                settings,
+                &imported.contract.family,
+                cases,
+            )?
+        } else {
+            CausalEpisodes::from_family(
+                d,
+                &controlled,
+                native,
+                &native_controls,
+                &imported.contract.family,
+                cases,
+                &labels,
+                settings.fixed_head_targets.as_ref(),
+                settings.teacher_numeric_bytes,
+            )?
+        };
         save(
             &out.join("HELDOUT_TEACHER_TARGETS.json"),
             &eval_episodes.target_metadata,
@@ -2188,6 +2635,7 @@ fn run() -> Result<(), String> {
     let config_bytes = std::fs::read(config_path).map_err(|e| e.to_string())?;
     let settings: Settings = serde_json::from_slice(&config_bytes).map_err(|e| e.to_string())?;
     validate_joint_configuration(&settings)?;
+    validate_parameter_edit_configuration(&settings)?;
     if settings.evaluation.is_some() != (args.len() == 5) {
         return Err(
             "HELDOUT_EXPORT argument required exactly when evaluation config is present".into(),
@@ -2214,7 +2662,9 @@ fn run() -> Result<(), String> {
         || settings.sequences == 0
         || settings.uses.iter().copied().collect::<BTreeSet<_>>().len() != settings.uses.len()
         || settings.uses.iter().any(|&i| i >= settings.layers)
-        || (settings.controls.is_empty() && settings.down_edit_family.is_none())
+        || (settings.controls.is_empty()
+            && settings.down_edit_family.is_none()
+            && settings.native_parameter_edits.is_none())
     {
         return Err("positive dimensions, unique uses/cases and explicit clean plus intervention cases required".into());
     }
@@ -2350,6 +2800,20 @@ fn run() -> Result<(), String> {
     let imported = import_language_model(export, settings.sequences, settings.context)?;
     let original_native = split_sites(&imported.program)?;
     let original_layers = layer_nodes(&original_native, settings.layers)?;
+    let parameter_edits = settings
+        .native_parameter_edits
+        .as_ref()
+        .map(|c| build_parameter_edits(&original_native, c))
+        .transpose()?;
+    if let Some(config) = &settings.native_parameter_edits {
+        let original_controls = controls(
+            &Artifact::native(&original_native)?,
+            &original_native,
+            &original_layers,
+            &settings.controls,
+        )?;
+        reject_native_edit_target_gain(config.target_operator, &original_controls)?;
+    }
     let down = settings
         .down_edit_family
         .as_ref()
@@ -2368,11 +2832,20 @@ fn run() -> Result<(), String> {
             down_edit_family::build(&original_native, layer.normed, layer.mlp, &directions)
         })
         .transpose()?;
-    let native = down
-        .as_ref()
-        .map_or_else(|| original_native.clone(), |f| f.program.clone());
-    let layers = down.as_ref().map_or_else(
-        || original_layers.clone(),
+    let native = parameter_edits.as_ref().map_or_else(
+        || {
+            down.as_ref()
+                .map_or_else(|| original_native.clone(), |f| f.program.clone())
+        },
+        |f| f.compiled.program.clone(),
+    );
+    let layers = parameter_edits.as_ref().map_or_else(
+        || {
+            down.as_ref().map_or_else(
+                || original_layers.clone(),
+                |f| remap_layers(&original_layers, &f.node_mapping),
+            )
+        },
         |f| remap_layers(&original_layers, &f.node_mapping),
     );
     let base = Artifact::native(&native)?;
@@ -2388,21 +2861,22 @@ fn run() -> Result<(), String> {
     let native_codec_initialization_seconds = cache_started.elapsed().as_secs_f64();
     let family = &imported.contract.family;
     let target_controls = controls(&base, &native, &layers, &settings.controls)?;
-    let (targets, teacher_plan) = if settings.fixed_head_targets.is_some() {
-        (Vec::new(), 0)
-    } else {
-        family_teacher_targets(
-            &d,
-            &original_native,
-            &original_layers,
-            &settings.controls,
-            family,
-            &settings.cases,
-            down.as_ref(),
-            settings.fit.numeric_bytes,
-            settings.teacher_numeric_bytes,
-        )?
-    };
+    let (targets, teacher_plan) =
+        if settings.fixed_head_targets.is_some() || parameter_edits.is_some() {
+            (Vec::new(), 0)
+        } else {
+            family_teacher_targets(
+                &d,
+                &original_native,
+                &original_layers,
+                &settings.controls,
+                family,
+                &settings.cases,
+                down.as_ref(),
+                settings.fit.numeric_bytes,
+                settings.teacher_numeric_bytes,
+            )?
+        };
     let native_teacher_seconds = started.elapsed().as_secs_f64();
     let mut stage_seconds = BTreeMap::<String, f64>::new();
     stage_seconds.insert("native_import_and_teachers".into(), native_teacher_seconds);
@@ -2475,6 +2949,7 @@ fn run() -> Result<(), String> {
         "native_codec_budget_scope":"packed native codewords plus cached decoded numeric buffers only; excludes caller-owned source arrays, per-operator construction/lattice temporaries, full messages, label/execution buffers, metadata and allocator/library overhead; construction excluded from warm timings",
         "literal_down_arithmetic":"binary64 stored D updates in declared order D += a*u*v; original graph executes updated matrix; no float32 checkpoint-store or augmented-branch bitwise equivalence claim",
         "joint_response_search":settings.joint_response_search,"joint_search_scope":"bounded enumerated learned multi-output DAG; exactly one declared down layer; shared computations are actual nodes; no body transfer; inventory truncation disclosed in JOINT_INVENTORY.json",
+        "native_parameter_edits":settings.native_parameter_edits,"native_parameter_edit_scope":"Finite additive dense directions lowered as Raw control contributions before downstream nonlinearities; independent literal edited original-native teachers; structural_search only. No mechanism recovery claim, no bit-parity between augmented and literal arithmetic; saved source/directions use paid ordinary f32 codec.",
         "down_edit_family":settings.down_edit_family,"down_family_scope":"restricted declared native down-weight directions; teachers run literal edited matrices, predictor runs own response functions; fixed directions serialized and excluded from fitting; no arbitrary native-edit mapping; body export/transfer disabled in this mode",
         "control_scope":"activation boundary scaling is not a global weight edit; retained_operator gain affects all its invocations; no mapping claimed for removed internal coordinates",
         "weight_gain_arithmetic":"gain applied to every computed contribution, algebraically equivalent to scaling the shared operator; not a bit-exact claim about rounding edited checkpoint literals before GEMM",
@@ -2497,13 +2972,14 @@ fn run() -> Result<(), String> {
             structural,
             &native,
             &original_native,
-            &original_layers,
+            &layers,
             family,
             &targets,
             out,
             args.get(4).map(|p| Path::new(p)),
             native_codec.as_ref(),
             &mut costs,
+            parameter_edits.as_ref(),
         );
     }
     let (saved_native, native_bytes, native_canonical_phases) =
@@ -2978,7 +3454,9 @@ fn run() -> Result<(), String> {
         .iter()
         .filter(|a| a["training_kl"].is_number())
         .filter(|a| {
-            !rows.iter().any(|b| training_dominates(b, a, joint_inventory.is_some()))
+            !rows
+                .iter()
+                .any(|b| training_dominates(b, a, joint_inventory.is_some()))
         })
         .map(|v| v["id"].clone())
         .collect();
@@ -3249,7 +3727,7 @@ fn main() -> Result<(), String> {
 mod tests {
     use super::*;
     use gam_mpd::{
-        composed_rule_search::{Expr, Unary},
+        composed_rule_search::{Binary, Expr, Unary},
         operator_program::{Node, SlotValues},
     };
     #[test]
@@ -3342,12 +3820,14 @@ mod tests {
                 group: "clean".into(),
                 gains: vec![1.],
                 down_amplitudes: vec![],
+                parameter_amplitudes: vec![],
             },
             Case {
                 label: "half".into(),
                 group: "edits".into(),
                 gains: vec![0.5],
                 down_amplitudes: vec![],
+                parameter_amplitudes: vec![],
             },
         ];
         let d = Device::host();
@@ -3416,6 +3896,7 @@ mod tests {
                 beta2: 0.999,
                 epsilon: 1e-8,
                 numeric_bytes: 1 << 24,
+                schedule: None,
             };
             let a = full
                 .fit(&d, &candidate, supervision, &[0], settings.clone())
@@ -3444,6 +3925,7 @@ mod tests {
             beta2: 0.999,
             epsilon: 1e-8,
             numeric_bytes: 1 << 24,
+            schedule: None,
         };
         assert!(compact.fit(&d, &candidate, None, &[1], settings).is_err());
         assert!(CausalEpisodes::from_family(
@@ -3580,6 +4062,7 @@ mod tests {
                 beta2: 0.999,
                 epsilon: 1e-8,
                 numeric_bytes: 1 << 24,
+                schedule: None,
             },
         )
         .expect("coefficient fit");
@@ -3750,6 +4233,7 @@ mod tests {
             label: "half".into(),
             group: "global".into(),
             down_amplitudes: vec![],
+            parameter_amplitudes: vec![],
             gains: vec![0.5],
         };
         let input = lowered
@@ -3882,12 +4366,14 @@ mod tests {
             group: "clean".into(),
             gains: vec![],
             down_amplitudes: vec![0.],
+            parameter_amplitudes: vec![],
         };
         let edited = Case {
             label: "negative".into(),
             group: "edits".into(),
             gains: vec![],
             down_amplitudes: vec![-0.5],
+            parameter_amplitudes: vec![],
         };
         assert!(validate_cases(&[clean.clone(), edited.clone()], 0, 1, true).is_ok());
         assert!(validate_cases(&[edited], 0, 1, true).is_err());
@@ -4015,18 +4501,21 @@ mod tests {
                 group: "clean".into(),
                 gains: vec![],
                 down_amplitudes: vec![0.],
+                parameter_amplitudes: vec![],
             },
             Case {
                 label: "positive".into(),
                 group: "edits".into(),
                 gains: vec![],
                 down_amplitudes: vec![0.5],
+                parameter_amplitudes: vec![],
             },
             Case {
                 label: "negative".into(),
                 group: "edits".into(),
                 gains: vec![],
                 down_amplitudes: vec![-0.5],
+                parameter_amplitudes: vec![],
             },
         ];
         let device = Device::host();
@@ -4367,6 +4856,7 @@ mod tests {
                         beta2: 0.999,
                         epsilon: 1e-8,
                         numeric_bytes: 1_000_000,
+                        schedule: None,
                     },
                 )
                 .expect("compact joint fit");
@@ -4383,6 +4873,7 @@ mod tests {
                     beta2: 0.999,
                     epsilon: 1e-8,
                     numeric_bytes: 1_000_000,
+                    schedule: None,
                 },
             )
             .expect("joint causal fit");
@@ -4523,12 +5014,14 @@ mod tests {
                 group: "clean".into(),
                 gains: vec![],
                 down_amplitudes: vec![0.],
+                parameter_amplitudes: vec![],
             },
             Case {
                 label: "edited".into(),
                 group: "edits".into(),
                 gains: vec![],
                 down_amplitudes: vec![0.5],
+                parameter_amplitudes: vec![],
             },
         ];
         let error = CausalEpisodes::standalone(
@@ -4703,12 +5196,14 @@ mod tests {
                 group: "clean".into(),
                 gains: vec![1., 1.],
                 down_amplitudes: vec![],
+                parameter_amplitudes: vec![],
             },
             Case {
                 label: "signed edit".into(),
                 group: "edit_a".into(),
                 gains: vec![-0.5, 1.],
                 down_amplitudes: vec![],
+                parameter_amplitudes: vec![],
             },
         ];
         let mut cases = cases;
@@ -4717,6 +5212,7 @@ mod tests {
             group: "edit_b".into(),
             gains: vec![1., 2.],
             down_amplitudes: vec![],
+            parameter_amplitudes: vec![],
         });
         let d = Device::host();
         let base = Artifact::native(&native).expect("native");
@@ -4781,6 +5277,7 @@ mod tests {
             frozen_shared_body: None,
             native_initialization: false,
             joint_response_search: None,
+            native_parameter_edits: None,
             down_edit_family: None,
             structural_search: None,
             controls: specs,
@@ -4792,6 +5289,7 @@ mod tests {
                 beta2: 0.999,
                 epsilon: 1e-8,
                 numeric_bytes: 1 << 26,
+                schedule: None,
             },
             seed: 1,
             evaluation: None,
@@ -4815,6 +5313,7 @@ mod tests {
             None,
             None,
             &mut CostCache::default(),
+            None,
         )
         .expect("real structural callback");
         let report: Value = serde_json::from_slice(
@@ -4890,6 +5389,309 @@ mod tests {
         assert!(
             fit_replay,
             "reuse must execute resident fitter, not only structural metadata"
+        );
+        // Reuse the real structural-driver fixture with two upstream coordinates,
+        // signed edits and an independent retained gain in the same episodes.
+        let mut edit_settings = settings;
+        edit_settings.controls = vec![NativeControl::RetainedOperator {
+            name: "reader-b".into(),
+        }];
+        edit_settings.native_parameter_edits = Some(NativeEditSettings {
+            target_operator: 0,
+            directions: vec![vec![vec![0.5]], vec![vec![-0.25]]],
+        });
+        edit_settings.structural_search = Some(structural);
+        edit_settings.cases = vec![
+            Case {
+                label: "clean".into(),
+                group: "clean".into(),
+                gains: vec![1.],
+                down_amplitudes: vec![],
+                parameter_amplitudes: vec![0., 0.],
+            },
+            Case {
+                label: "positive".into(),
+                group: "edit_a".into(),
+                gains: vec![1.],
+                down_amplitudes: vec![],
+                parameter_amplitudes: vec![0.75, 0.],
+            },
+            Case {
+                label: "negative mixed".into(),
+                group: "edit_b".into(),
+                gains: vec![2.],
+                down_amplitudes: vec![],
+                parameter_amplitudes: vec![-0.5, 0.25],
+            },
+        ];
+        validate_parameter_edit_configuration(&edit_settings).expect("explicit signed edit design");
+        assert!(
+            reject_native_edit_target_gain(0, &[Control::GlobalOperatorScale { operator: 0 }])
+                .is_err()
+        );
+        assert!(
+            reject_native_edit_target_gain(0, &[Control::GlobalOperatorScale { operator: 1 }])
+                .is_ok()
+        );
+        let edits = build_parameter_edits(
+            &native,
+            edit_settings.native_parameter_edits.as_ref().unwrap(),
+        )
+        .expect("upstream coordinates");
+        let edit_native = &edits.compiled.program;
+        let gains = controls(
+            &Artifact::native(edit_native).unwrap(),
+            edit_native,
+            &[],
+            &edit_settings.controls,
+        )
+        .unwrap();
+        let controlled = intervention_program::compile(edit_native, &gains).unwrap();
+        let original_map: Vec<_> = edits
+            .node_mapping
+            .iter()
+            .map(|n| controlled.root_mapping[*n])
+            .collect();
+        let full = parameter_edit_episodes(
+            &d,
+            &edits,
+            &controlled,
+            edit_native,
+            &gains,
+            &native,
+            &edit_settings,
+            &family,
+            &edit_settings.cases,
+        )
+        .expect("literal full targets");
+        edit_settings.fixed_head_targets = Some(FixedHeadSettings { tile_rows: 2 });
+        let compact = parameter_edit_episodes(
+            &d,
+            &edits,
+            &controlled,
+            edit_native,
+            &gains,
+            &native,
+            &edit_settings,
+            &family,
+            &edit_settings.cases,
+        )
+        .expect("literal compact targets");
+        assert_eq!(compact.target_metadata["full_logit_target_bytes"], 0);
+        for (case, episode) in edit_settings.cases.iter().zip(full.full.as_ref().unwrap()) {
+            let literal = edits.literal_native(&case.parameter_amplitudes).unwrap();
+            let cs = controls(
+                &Artifact::native(&literal).unwrap(),
+                &literal,
+                &[],
+                &edit_settings.controls,
+            )
+            .unwrap();
+            let graph = intervention_program::compile(&literal, &cs).unwrap();
+            let expected = graph
+                .program
+                .execute(
+                    &graph
+                        .family(&family, &values(&literal, &cs, family.rows, case).unwrap())
+                        .unwrap(),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(episode.target_logits, expected.values[graph.program.output]);
+        }
+        use program_learned_dag::{Expr as J, TypeRef};
+        let affine = |parameter, input| J::Affine {
+            parameter,
+            output: TypeRef::Exit(0),
+            input: Box::new(input),
+            bias: false,
+        };
+        let edited_terms = J::Binary(
+            Binary::Add,
+            Box::new(affine(
+                1,
+                J::Binary(
+                    Binary::Multiply,
+                    Box::new(J::Argument(0)),
+                    Box::new(J::Argument(1)),
+                ),
+            )),
+            Box::new(affine(
+                2,
+                J::Binary(
+                    Binary::Multiply,
+                    Box::new(J::Argument(0)),
+                    Box::new(J::Argument(2)),
+                ),
+            )),
+        );
+        let equation = J::Unary(
+            Unary::Relu,
+            Box::new(J::Binary(
+                Binary::Add,
+                Box::new(affine(0, J::Argument(0))),
+                Box::new(edited_terms),
+            )),
+        );
+        let search = program_learned_dag::Settings {
+            latent_widths: vec![1],
+            unary: vec![Unary::Relu],
+            binary: vec![Binary::Add, Binary::Multiply],
+            affine_bias: false,
+            require_shared: false,
+            max_operations: 8,
+            max_affine_parameters: 3,
+            max_parameter_elements: 10,
+            max_expression_states: 100,
+            max_tuple_checks: 100,
+            max_tuples: 10,
+            max_body_nodes: 20,
+            seed: 3,
+        };
+        let mut compiled = program_learned_dag::compile_program(
+            &vec![Interface::native(1).unwrap(); 3],
+            &[Interface::native(1).unwrap(), Interface::native(1).unwrap()],
+            &[equation, J::Argument(0)],
+            &search,
+        )
+        .unwrap();
+        compiled.program.output = compiled.output_nodes[0];
+        let edit_inputs: Vec<_> = edits
+            .compiled
+            .control_slots
+            .iter()
+            .map(|slot| {
+                let root = edit_native
+                    .nodes
+                    .iter()
+                    .position(|n| matches!(n,Node::Raw {slot:s} if *s==slot.slot))
+                    .unwrap();
+                controlled.root_mapping[root]
+            })
+            .collect();
+        let candidate = Artifact::native(&controlled.program)
+            .unwrap()
+            .replace_function_inputs(
+                "learned nonlinear edit response",
+                &compiled.program,
+                &[original_map[0], edit_inputs[0], edit_inputs[1]],
+                original_map[2],
+            )
+            .unwrap();
+        let trainable = joint_graft_parameters(&candidate, original_map[2], &compiled).unwrap();
+        let (responses, provenance) = parameter_edit_response_targets(
+            &d,
+            &edits,
+            &controlled,
+            &native,
+            &edit_settings,
+            &family,
+            &edit_settings.cases,
+            &candidate,
+            &full.metadata,
+            1.,
+            1 << 26,
+        )
+        .expect("literal native state observations");
+        assert_eq!(
+            provenance["literal_original_observations"][original_map[2].to_string()],
+            2
+        );
+        let scale = responses["clean"][0].scale;
+        assert!(responses
+            .values()
+            .all(|r| r[0].scale.to_bits() == scale.to_bits()));
+        let fit = full
+            .fit(
+                &d,
+                &candidate.program,
+                Some(&responses),
+                &trainable,
+                edit_settings.fit.clone(),
+            )
+            .expect("full edited fit");
+        let compact_fit = compact
+            .fit(
+                &d,
+                &candidate.program,
+                Some(&responses),
+                &trainable,
+                edit_settings.fit.clone(),
+            )
+            .expect("compact edited fit");
+        for id in &trainable {
+            assert!(fit.program.operators[*id]
+                .matrix()
+                .iter()
+                .zip(compact_fit.program.operators[*id].matrix().iter())
+                .all(|(a, b)| (a - b).abs() < 1e-9));
+        }
+        let mut fitted = candidate;
+        fitted.program = fit.program;
+        let (saved, bytes) = canonical(&fitted).unwrap();
+        assert_eq!(
+            Artifact::from_bytes(&bytes, &controlled.program.declarations)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
+        let (_, replay_provenance) = parameter_edit_response_targets(
+            &d,
+            &edits,
+            &controlled,
+            &native,
+            &edit_settings,
+            &family,
+            &edit_settings.cases,
+            &saved,
+            &full.metadata,
+            1.,
+            1 << 26,
+        )
+        .unwrap();
+        assert_eq!(
+            replay_provenance["literal_original_observations"],
+            provenance["literal_original_observations"]
+        );
+        assert!(compact
+            .measure(&d, &saved.program, Some(&responses), 1 << 26)
+            .unwrap()
+            .objective
+            .is_finite());
+        // The structural source is the edit-conditioned graph, so region discovery
+        // sees edit controls inside native nonlinear computations.
+        let edit_out = out.join("upstream-edits");
+        std::fs::create_dir(&edit_out).unwrap();
+        structural_run(
+            &d,
+            &edit_settings,
+            edit_settings.structural_search.as_ref().unwrap(),
+            edit_native,
+            &native,
+            &[],
+            &family,
+            &[],
+            &edit_out,
+            None,
+            None,
+            &mut CostCache::default(),
+            Some(&edits),
+        )
+        .expect("actual edited structural runner");
+        let report: Value = serde_json::from_slice(
+            &std::fs::read(edit_out.join("CONTROLLED_SOURCE.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            report["original_to_edit_lowered_root_mapping"],
+            json!(edits.node_mapping)
+        );
+        let mut bad = edit_settings.native_parameter_edits.take().unwrap();
+        bad.target_operator = 2;
+        assert!(
+            build_parameter_edits(&native, &bad).is_err(),
+            "readout edits refused"
         );
         std::fs::remove_dir_all(out).expect("cleanup");
     }
@@ -5200,18 +6002,21 @@ mod tests {
                 group: "clean".into(),
                 gains: vec![1., 1.],
                 down_amplitudes: vec![],
+                parameter_amplitudes: vec![],
             },
             Case {
                 label: "A".into(),
                 group: "edited".into(),
                 gains: vec![2., 1.],
                 down_amplitudes: vec![],
+                parameter_amplitudes: vec![],
             },
             Case {
                 label: "B negative".into(),
                 group: "edited".into(),
                 gains: vec![1., -0.5],
                 down_amplitudes: vec![],
+                parameter_amplitudes: vec![],
             },
         ];
         let d = Device::host();
@@ -5346,6 +6151,7 @@ mod tests {
             frozen_shared_body: None,
             native_initialization: false,
             joint_response_search: None,
+            native_parameter_edits: None,
             down_edit_family: None,
             structural_search: None,
             controls: specs,
@@ -5357,6 +6163,7 @@ mod tests {
                 beta2: 0.999,
                 epsilon: 1e-8,
                 numeric_bytes: 1 << 26,
+                schedule: None,
             },
             seed: 1,
             evaluation: None,
@@ -5382,6 +6189,7 @@ mod tests {
             None,
             None,
             &mut CostCache::default(),
+            None,
         )
         .expect("actual structural driver");
         let report: Value = serde_json::from_slice(
@@ -5515,6 +6323,7 @@ mod tests {
                 group: "heldout".into(),
                 gains: vec![-1.2, 0.7],
                 down_amplitudes: vec![],
+                parameter_amplitudes: vec![],
             }];
             let (targets, _) = family_teacher_targets(
                 &d,

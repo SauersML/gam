@@ -158,6 +158,7 @@ fn run_case(
         beta2: 0.999,
         epsilon: 1e-6,
         numeric_bytes,
+        schedule: None,
     };
     let t = Instant::now();
     let full_fit = resident_causal_fit::fit(d, source, &full, trainable, settings.clone())?;

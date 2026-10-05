@@ -69,6 +69,18 @@ pub struct Settings {
     pub beta2: f64,
     pub epsilon: f64,
     pub numeric_bytes: usize,
+    #[serde(default)]
+    pub schedule: Option<BatchSchedule>,
+}
+/// Proposal optimization only. Checkpoints still use the complete TRAIN maximum.
+/// Between full scans, group weights are frozen softmax weights of the last scan;
+/// complete causal sequences cycle within each group (tokens are never sliced).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchSchedule {
+    pub episodes_per_group: usize,
+    pub scan_every: usize,
+    pub temperature: f64,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct EpisodeMeasurement {
@@ -747,11 +759,24 @@ fn gradient(
     group: &str,
     trainable: &[usize],
 ) -> Result<BTreeMap<usize, Tensor>, String> {
-    let d = p.device();
     let count = episodes.iter().filter(|e| e.group == group).count();
     if count == 0 {
         return Err("unknown active group".into());
     }
+    let selected = episodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| (e.group == group).then_some((i, 1. / count as f64)))
+        .collect::<Vec<_>>();
+    weighted_gradient(p, episodes, &selected, trainable)
+}
+fn weighted_gradient(
+    p: &DeviceProgram,
+    episodes: &[ResidentEpisode],
+    selected: &[(usize, f64)],
+    trainable: &[usize],
+) -> Result<BTreeMap<usize, Tensor>, String> {
+    let d = p.device();
     let mut gradients = trainable
         .iter()
         .map(|index| {
@@ -759,18 +784,22 @@ fn gradient(
             Ok((*index, d.zeros(a.rows(), a.cols()).map_err(error)?))
         })
         .collect::<Result<BTreeMap<_, _>, String>>()?;
-    for e in episodes.iter().filter(|e| e.group == group) {
+    for &(index, episode_weight) in selected {
+        let e = episodes.get(index).ok_or("absent training episode")?;
+        if !episode_weight.is_finite() || episode_weight < 0. {
+            return Err("invalid training episode weight".into());
+        }
         let trace = forward(p, e)?;
         let (kl, seed) = score(p, e, &trace, true)?;
         let seed = seed.ok_or("missing KL gradient seed")?;
         if kl.iter().any(|v| !v.is_finite()) {
             return Err("nonfinite gradient KL".into());
         }
-        let weight = 1. / (count as f64 * e.scored_rows as f64);
+        let weight = episode_weight / e.scored_rows as f64;
         let mut scaled = d.zeros(seed.rows(), seed.cols()).map_err(error)?;
         d.axpy(&mut scaled, weight, &seed).map_err(error)?;
         let mut seeds = BTreeMap::from([(p.hidden(), scaled)]);
-        response_score(p, e, &trace, Some(&mut seeds), 1. / count as f64)?;
+        response_score(p, e, &trace, Some(&mut seeds), episode_weight)?;
         let (_, per_episode) =
             p.vjp_values_dense(&trace, seeds, &[], trainable, Arithmetic::F64)?;
         for index in trainable {
@@ -784,6 +813,48 @@ fn gradient(
     }
     Ok(gradients)
 }
+fn scheduled_batch(
+    groups: &BTreeMap<String, Vec<usize>>,
+    measurement: &Measurement,
+    schedule: &BatchSchedule,
+    cursors: &mut BTreeMap<String, usize>,
+) -> Result<Vec<(usize, f64)>, String> {
+    let mut weights = groups
+        .keys()
+        .map(|group| {
+            let value = *measurement
+                .groups
+                .get(group)
+                .ok_or("missing measured group")?;
+            Ok((
+                group,
+                ((value - measurement.objective) / schedule.temperature).exp(),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let total = weights.iter().map(|(_, weight)| weight).sum::<f64>();
+    if !total.is_finite() || total <= 0. {
+        return Err("nonfinite proposal group weights".into());
+    }
+    let mut selected = Vec::new();
+    for (group, weight) in &mut weights {
+        let indices = &groups[*group];
+        let count = schedule.episodes_per_group.min(indices.len());
+        if count == 0 {
+            return Err("empty proposal group".into());
+        }
+        let cursor = cursors.entry((*group).clone()).or_default();
+        for _ in 0..count {
+            selected.push((indices[*cursor], *weight / total / count as f64));
+            *cursor = if *cursor + 1 == indices.len() {
+                0
+            } else {
+                *cursor + 1
+            };
+        }
+    }
+    Ok(selected)
+}
 /// Full-episode measurement only; never updates parameters or chooses a validation checkpoint.
 pub fn measure(
     d: &Device,
@@ -795,6 +866,14 @@ pub fn measure(
     scan(&p, &resident)
 }
 fn validate_settings(trainable: &[usize], settings: &Settings) -> Result<(), String> {
+    if settings.schedule.as_ref().is_some_and(|s| {
+        s.episodes_per_group == 0
+            || s.scan_every == 0
+            || !s.temperature.is_finite()
+            || s.temperature <= 0.
+    }) {
+        return Err("invalid causal batch schedule".into());
+    }
     if trainable.is_empty()
         || settings.numeric_bytes == 0
         || !settings.learning_rate.is_finite()
@@ -978,14 +1057,25 @@ fn fit_prepared(
     }];
     let mut reverse = 0;
     let mut forwards = resident.len();
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, episode) in resident.iter().enumerate() {
+        groups.entry(episode.group.clone()).or_default().push(index);
+    }
+    let mut cursors = BTreeMap::new();
     for step in 1..=settings.iterations {
-        let active_group = &history
-            .last()
-            .ok_or("missing training score")?
-            .measurement
-            .active_group;
-        let gradients = gradient(&p, &resident, active_group, trainable)?;
-        let count = resident.iter().filter(|e| e.group == *active_group).count();
+        let last_measurement = &history.last().ok_or("missing training score")?.measurement;
+        let (gradients, count) = if let Some(schedule) = &settings.schedule {
+            let selected = scheduled_batch(&groups, last_measurement, schedule, &mut cursors)?;
+            (
+                weighted_gradient(&p, &resident, &selected, trainable)?,
+                selected.len(),
+            )
+        } else {
+            (
+                gradient(&p, &resident, &last_measurement.active_group, trainable)?,
+                groups[&last_measurement.active_group].len(),
+            )
+        };
         reverse += count;
         forwards += count;
         for index in trainable {
@@ -1001,6 +1091,14 @@ fn fit_prepared(
             )
             .map_err(error)?;
             p.replace_dense_parameter(*index, next)?;
+        }
+        if settings
+            .schedule
+            .as_ref()
+            .is_some_and(|s| step % s.scan_every != 0)
+            && step != settings.iterations
+        {
+            continue;
         }
         let measurement = scan(&p, &resident)?;
         forwards += resident.len();
@@ -1040,6 +1138,7 @@ fn fit_prepared(
     let compact = resident
         .iter()
         .any(|e| matches!(e.target, ResidentTarget::Fixed { .. }));
+    let scheduled = settings.schedule.is_some();
     Ok(Fit {
         program: fitted,
         report: Report {
@@ -1054,7 +1153,9 @@ fn fit_prepared(
             complete_episode_forward_passes: forwards,
             complete_episode_reverse_passes: reverse,
             seconds: started.elapsed().as_secs_f64(),
-            scope: if resident.iter().any(|e| !e.responses.is_empty()) {
+            scope: if scheduled {
+                "Proposal fitting only: deterministic complete-sequence batches cycle within every named group. Softmax group weights use the latest complete TRAIN group losses and remain fixed until the next full scan; intermediate gradients are a proposal heuristic, not exact gradients of the current worst-group loss. Output KL and weighted fixed-scale native-response losses contribute through the same ordinary VJP. Checkpoint selection and final measurements use the original complete TRAIN maximum, never minibatch estimates or heldout data. History contains only full scans. Forward/reverse counts include every executed episode. Numeric evidence is operational; ordinary artifact acceptance is unchanged."
+            } else if resident.iter().any(|e| !e.responses.is_empty()) {
                 "Proposal fitting only: maximum named-group mean of equal-weight joint episode losses (mean output KL plus explicitly weighted fixed-scale native-response mean squared errors). Output KL and response terms reported separately. Fixed targets never replace autonomous candidate values. One forward and one accumulated multi-node ordinary VJP per episode, shared parameter owner and unchanged Adam/best-TRAIN selection. Numeric plan adds resident response targets/masked coefficients/block offsets and accumulated seeds/sequential residual/reduction scratch to the ordinary or fixed-head baseline. Host metadata, CUDA/context/library/allocator scratch excluded; ordinary artifact acceptance remains separate."
             } else if compact {
                 "Proposal fitting only: same maximum named-group mean objective and Adam/best-TRAIN loop. Immutable fixed bias-free full-vocabulary head targets retain E^T p and sum p log p; each row-tiled candidate KL is logZ(Eh)-mu.h+c and hidden seed E^T q-mu. Head input is after original final normalization, with full-prefix ordinary VJP; both target and candidate unscored seeds are zero. F64 vendor exp/log/GEMM are operational, not certified real-arithmetic intervals; final ordinary artifact acceptance is unchanged. Numeric plan counts resident compact labels, head, inputs, traces/gradients/parameter buffers and conservative attention/tiled vocabulary scratch. Host metadata/source, context/library/allocator scratch excluded."
@@ -1163,6 +1264,7 @@ mod tests {
             beta2: 0.999,
             epsilon: 1e-8,
             numeric_bytes: 1 << 24,
+            schedule: None,
         }
     }
     fn finite_difference(source: &OperatorProgram, episodes: &[Episode], group: &str) -> f64 {
@@ -1464,6 +1566,197 @@ mod tests {
         let fit = fit(&d, &source, &episodes, &[0], settings()).expect("causal fit");
         assert!(fit.report.best.objective < fit.report.initial.objective * 0.1);
         assert_eq!(fit.report.complete_episode_reverse_passes, 60);
+    }
+
+    #[test]
+    fn scheduled_batches_preserve_group_weights_causal_sequences_and_full_scan_selection() {
+        let source = program(true, 0.4);
+        let teacher = program(true, 1.1);
+        let episodes = (0..8)
+            .map(|i| {
+                episode(
+                    &source,
+                    &teacher,
+                    &format!("episode{i}"),
+                    "run",
+                    ndarray::array![[2. + i as f64 * 0.1, 0.2], [-1., 0.6], [0.1, 0.4]],
+                    None,
+                    Some(vec![false, false, true]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let d = Device::host();
+        let (p, resident, _) = prepare(&d, &source, &episodes, &[0], 1 << 24).unwrap();
+        let measured = scan(&p, &resident).unwrap();
+        let groups = BTreeMap::from([("run".into(), (0..8).collect())]);
+        let schedule = BatchSchedule {
+            episodes_per_group: 2,
+            scan_every: 3,
+            temperature: 0.2,
+        };
+        let mut cursors = BTreeMap::new();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let selected = scheduled_batch(&groups, &measured, &schedule, &mut cursors).unwrap();
+            assert_eq!(selected.len(), 2);
+            assert_eq!(selected.iter().map(|(_, w)| w).sum::<f64>(), 1.);
+            seen.extend(selected.into_iter().map(|(i, _)| i));
+        }
+        assert_eq!(seen, (0..8).collect::<Vec<_>>());
+        let fitted = fit(
+            &d,
+            &source,
+            &episodes,
+            &[0],
+            Settings {
+                iterations: 7,
+                schedule: Some(schedule),
+                ..settings()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fitted
+                .report
+                .iterations
+                .iter()
+                .map(|i| i.step)
+                .collect::<Vec<_>>(),
+            vec![0, 3, 6, 7]
+        );
+        assert_eq!(fitted.report.complete_episode_reverse_passes, 14);
+        assert_eq!(
+            fitted.report.complete_episode_forward_passes,
+            8 + 14 + 3 * 8 + 8
+        );
+        assert!(fitted.report.best.objective < fitted.report.initial.objective);
+        assert_eq!(
+            measure(&d, &fitted.program, &episodes, 1 << 24)
+                .unwrap()
+                .objective,
+            fitted.report.best.objective
+        );
+        // Full-group batch and scan interval one reduce exactly to the original single-group loop.
+        let ordinary = fit(
+            &d,
+            &source,
+            &episodes,
+            &[0],
+            Settings {
+                iterations: 3,
+                ..settings()
+            },
+        )
+        .unwrap();
+        let scheduled = fit(
+            &d,
+            &source,
+            &episodes,
+            &[0],
+            Settings {
+                iterations: 3,
+                schedule: Some(BatchSchedule {
+                    episodes_per_group: 8,
+                    scan_every: 1,
+                    temperature: 0.2,
+                }),
+                ..settings()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ordinary.program.operators[0].matrix(),
+            scheduled.program.operators[0].matrix()
+        );
+        assert_eq!(
+            ordinary.report.best.objective,
+            scheduled.report.best.objective
+        );
+    }
+
+    #[test]
+    fn complete_smooth_group_gradient_matches_finite_differences() {
+        let source = program(true, 0.4);
+        let teacher = program(true, 1.1);
+        let episodes = (0..3)
+            .map(|i| {
+                episode(
+                    &source,
+                    &teacher,
+                    &format!("episode{i}"),
+                    if i == 0 { "first" } else { "second" },
+                    ndarray::array![[2. + i as f64, 0.2], [-1., 0.6], [0.1, 0.4]],
+                    None,
+                    Some(vec![false, false, true]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let d = Device::host();
+        let (p, resident, _) = prepare(&d, &source, &episodes, &[0], 1 << 24).unwrap();
+        let measured = scan(&p, &resident).unwrap();
+        let groups = BTreeMap::from([("first".into(), vec![0]), ("second".into(), vec![1, 2])]);
+        let schedule = BatchSchedule {
+            episodes_per_group: 2,
+            scan_every: 1,
+            temperature: 0.3,
+        };
+        let selected =
+            scheduled_batch(&groups, &measured, &schedule, &mut BTreeMap::new()).unwrap();
+        let weights = selected.iter().map(|(_, w)| w).sum::<f64>();
+        assert!((weights - 1.).abs() < 1e-15);
+        assert_eq!(selected[1].1, selected[2].1);
+        let actual = d
+            .download(&weighted_gradient(&p, &resident, &selected, &[0]).unwrap()[&0])
+            .unwrap();
+        for row in 0..2 {
+            for col in 0..2 {
+                let mut losses = Vec::new();
+                for sign in [-1., 1.] {
+                    let mut changed = source.clone();
+                    let op = Arc::make_mut(&mut changed.operators[0]);
+                    if let OperatorBody::Dense {
+                        values, precision, ..
+                    } = &mut op.body
+                    {
+                        values[[row, col]] += sign * 1e-5;
+                        *precision = exact_precision(values.iter().copied()).unwrap();
+                    }
+                    let m = measure(&d, &changed, &episodes, 1 << 24).unwrap();
+                    let sum = m
+                        .groups
+                        .values()
+                        .map(|v| ((v - m.objective) / schedule.temperature).exp())
+                        .sum::<f64>();
+                    losses.push(m.objective + schedule.temperature * sum.ln());
+                }
+                assert!((actual[[row, col]] - (losses[1] - losses[0]) / 2e-5).abs() < 1e-8);
+            }
+        }
+        for invalid in [
+            BatchSchedule {
+                episodes_per_group: 0,
+                ..schedule.clone()
+            },
+            BatchSchedule {
+                scan_every: 0,
+                ..schedule.clone()
+            },
+            BatchSchedule {
+                temperature: f64::NAN,
+                ..schedule
+            },
+        ] {
+            assert!(
+                validate_settings(
+                    &[0],
+                    &Settings {
+                        schedule: Some(invalid),
+                        ..settings()
+                    }
+                )
+                .is_err()
+            );
+        }
     }
     #[test]
     fn invalid_domains_nonfinite_targets_and_small_budget_are_errors() {

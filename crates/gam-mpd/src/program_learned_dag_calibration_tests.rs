@@ -324,6 +324,7 @@ fn learned_projection_restricted_family_search_hidden_basis_and_negative_sharing
                         beta2: 0.999,
                         epsilon: 1e-8,
                         numeric_bytes: 1 << 25,
+                        schedule: None,
                     },
                 )
                 .expect("declared TRAIN-only multistart fits ordinary candidate parameters");
