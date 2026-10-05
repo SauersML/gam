@@ -3559,6 +3559,17 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             self.stream.alloc_zeros::<f32>(n.max(1)).gpu_ctx("tensor alloc")
         }
 
+        /// A `rows × cols` tensor in `storage` for a kernel that writes every entry: f32 left
+        /// unset (no zeroing pass ahead of the kernel), float64 zeroed as it always was.
+        fn output(&self, storage: Storage, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
+            if storage != Storage::F32 {
+                return self.tensor(storage, rows, cols);
+            }
+            // SAFETY: the caller's kernel writes all `rows · cols` values before any is read.
+            let data = Data::Cuda32(unsafe { self.stream.alloc::<f32>((rows * cols).max(1)) }.gpu_ctx("tensor alloc")?);
+            Ok(Tensor { rows, cols, data })
+        }
+
         /// A zero `rows × cols` tensor in `storage`.
         fn tensor(&self, storage: Storage, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
             let data = match storage {
@@ -3976,7 +3987,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         pub(super) fn columns_of(&self, input: &Tensor, start: usize, width: usize, count: usize) -> Result<Data, GpuError> {
             let storage = input.storage();
-            let mut output = self.tensor(storage, 1, count)?;
+            let mut output = self.output(storage, 1, count)?;
             let (n, cols, width, start) = (count as u64, input.cols as u64, width as u64, start as u64);
             let f = self.kernel("columns_of", storage)?;
             // SAFETY: caller validated nonempty in-range columns; each thread
@@ -4023,7 +4034,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         pub(super) fn gather_rows(&self, table: &Tensor, ids: &Indices) -> Result<Tensor, GpuError> {
             let storage = table.storage();
-            let mut out = self.tensor(storage, ids.len, table.cols)?;
+            let mut out = self.output(storage, ids.len, table.cols)?;
             let n = out.len() as u64;
             let cols = table.cols as u32;
             let f = self.kernel("gather_rows", storage)?;
@@ -4044,7 +4055,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         pub(super) fn laws(&self, x: &Tensor, g: Option<&Tensor>, codes: &Indices, c: f64) -> Result<Tensor, GpuError> {
             let storage = x.storage();
-            let mut out = self.tensor(storage, x.rows, x.cols)?;
+            let mut out = self.output(storage, x.rows, x.cols)?;
             let n = x.len() as u64;
             let cols = x.cols as u32;
             let slopes = i32::from(g.is_some());
@@ -4069,7 +4080,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         pub(super) fn rms(&self, mode: RmsMode, x: &Tensor, g: Option<&Tensor>, epsilon: f64) -> Result<Tensor, GpuError> {
             let storage = x.storage();
-            let mut out = self.tensor(storage, x.rows, x.cols)?;
+            let mut out = self.output(storage, x.rows, x.cols)?;
             let (rows, cols) = (x.rows as u32, x.cols as u32);
             let code: i32 = match mode {
                 RmsMode::Value => 0,
@@ -4183,7 +4194,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         pub(super) fn softmax_backward(&self, alpha: &Tensor, d: &Tensor) -> Result<Tensor, GpuError> {
             let storage = alpha.storage();
-            let mut out = self.tensor(storage, alpha.rows, alpha.cols)?;
+            let mut out = self.output(storage, alpha.rows, alpha.cols)?;
             let (rows, cols) = (alpha.rows as u32, alpha.cols as u32);
             let f = self.kernel("softmax_backward", storage)?;
             // SAFETY: one block per row of equal-shape buffers.
@@ -4342,7 +4353,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         pub(super) fn block_products(&self, left: &Tensor, right: &Tensor, blocks: &ColumnBlocks) -> Result<Tensor, GpuError> {
             let storage = left.storage();
-            let mut out = self.tensor(storage, left.rows, blocks.len())?;
+            let mut out = self.output(storage, left.rows, blocks.len())?;
             if out.is_empty() { return Ok(out); }
             let (n, cols, count) = (out.len() as u64, left.cols as u32, blocks.len() as u32);
             let f = self.kernel("block_products", storage)?;
@@ -4360,7 +4371,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             uniforms: &Tensor, scored: Option<&Indices>,
         ) -> Result<Tensor, GpuError> {
             let storage = mean.storage();
-            let mut out = self.tensor(storage, mean.rows, mean.cols)?;
+            let mut out = self.output(storage, mean.rows, mean.cols)?;
             let (rows, classes, width) = (mean.rows as u32, probabilities.cols as u32, mean.cols as u32);
             let transposed = i32::from(transposed);
             let (flags, use_flags) = self.flags(scored)?;
