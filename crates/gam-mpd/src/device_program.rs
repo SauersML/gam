@@ -183,6 +183,9 @@ pub struct DeviceProgram {
     edited_head_nodes: BTreeMap<usize, Option<usize>>,
     operators: BTreeMap<(usize, Role), HeldOperator>,
     batch: Mutex<Option<Arc<PreparedBatch>>>,
+    /// Per rotary, its cosines and sines at positions `0..span` (span × planes), computed once and
+    /// grown when a longer sequence comes; a batch gathers its rows by position.
+    rotary_tables: Mutex<Vec<(Rotary, usize, Arc<(Tensor, Tensor)>)>>,
     /// The arithmetic of every product in the forward pass and the head (float64 by default; a
     /// training step's proposals may run in TF32, its accepted point is scored again in float64).
     arithmetic: Arithmetic,
@@ -643,7 +646,7 @@ impl DeviceProgram {
             };
             fused.push(Fused { heads, stacked, sources, live: true, disabled: false, source_matches: true });
         }
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new() })
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new() })
     }
 
     /// Operator `op`'s device copy changed: every group reading it runs node by node until
@@ -1010,19 +1013,39 @@ impl DeviceProgram {
             }
         }
         let mut rotations = Vec::new();
-        for rotary in rotaries {
-            let planes = rotary.pairs().len();
-            let (mut cos, mut sin) = (Vec::with_capacity(rows * planes), Vec::with_capacity(rows * planes));
-            for &position in &layout.position {
-                for plane in 0..planes {
-                    let (c, s) = rotary.turn(plane, position);
-                    cos.push(c);
-                    sin.push(s);
-                }
+        if !rotaries.is_empty() {
+            let span = layout.position.iter().max().map_or(0, |p| *p as usize + 1);
+            let positions = self.device.upload_indices(&layout.position).map_err(error)?;
+            for rotary in rotaries {
+                let table = self.rotary_table(rotary, span)?;
+                let (cos, sin) = (self.device.gather_rows(&table.0, &positions).map_err(error)?, self.device.gather_rows(&table.1, &positions).map_err(error)?);
+                rotations.push((rotary, cos, sin));
             }
-            rotations.push((rotary, self.device.upload_vec(rows, planes, cos).map_err(error)?, self.device.upload_vec(rows, planes, sin).map_err(error)?));
         }
         Ok((if attends { rows / length } else { 1 }, rotations))
+    }
+
+    /// `rotary`'s cosines and sines at positions `0..span` at least (rows by position, columns by
+    /// plane), each angle computed once per program.
+    fn rotary_table(&self, rotary: Rotary, span: usize) -> Result<Arc<(Tensor, Tensor)>, String> {
+        let mut tables = self.rotary_tables.lock().map_err(|_| "device: poisoned rotary tables".to_string())?;
+        if let Some((_, _, table)) = tables.iter().find(|(r, covered, _)| *r == rotary && *covered >= span) {
+            return Ok(Arc::clone(table));
+        }
+        let planes = rotary.pairs().len();
+        let position_count = u32::try_from(span).map_err(|_| "device: a position beyond 32 bits".to_string())?;
+        let (mut cos, mut sin) = (Vec::with_capacity(span * planes), Vec::with_capacity(span * planes));
+        for position in 0..position_count {
+            for plane in 0..planes {
+                let (c, s) = rotary.turn(plane, position);
+                cos.push(c);
+                sin.push(s);
+            }
+        }
+        let table = Arc::new((self.device.upload_vec(span, planes, cos).map_err(error)?, self.device.upload_vec(span, planes, sin).map_err(error)?));
+        tables.retain(|(r, ..)| *r != rotary);
+        tables.push((rotary, span, Arc::clone(&table)));
+        Ok(table)
     }
 
     /// `out ← out + x op(A)` for an affine term (`x Aᵀ`) or a transposed read (`x A`).
