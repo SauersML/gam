@@ -255,11 +255,10 @@ impl DevicePosterior {
     }
 
     /// One IVON step: `gradients` holds per trainable operator (by id) the gradient of the batch's
-    /// data term at the sample, which `scale` turns into an unbiased estimate of the collection's
-    /// gradient per token in nats (`B / N` for one of `B` batches of a collection of `N` scored
-    /// tokens, times the conversion from bits); `factor` holds per operator a draw of the
-    /// Gauss–Newton factor and the factor (`B / N`) turning its square into the curvature estimate
-    /// per token. An operator the batch does not reach has neither, and its step takes the
+    /// data term at the sample, which `scale` turns into the gradient per token in nats (one over
+    /// the batch's scored tokens, and the conversion from bits); `factor` holds per operator a draw
+    /// of the Gauss–Newton factor and the factor `1 / n` turning its square into the curvature
+    /// estimate per token. An operator the batch does not reach has neither, and its step takes the
     /// prior's alone.
     pub fn step(&mut self, gradients: &BTreeMap<usize, Tensor>, scale: f64, factor: (&BTreeMap<usize, Tensor>, f64), ivon: &Ivon) -> Result<(), String> {
         self.steps += 1;
@@ -355,6 +354,16 @@ impl DevicePosterior {
     /// Trainable operator `i`'s `μ` and `s` on the host.
     pub fn values(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>), String> {
         Ok((self.fitting.download(&self.mean[i]).map_err(error)?, self.fitting.download(&self.log_sd[i]).map_err(error)?))
+    }
+
+    /// The storage of the means, the log standard deviations, the gradient's momentum and the
+    /// curvature estimate (every operator's alike), in which a checkpoint keeps them.
+    #[must_use]
+    pub fn storages(&self) -> [Storage; 4] {
+        match (self.mean.first(), self.log_sd.first(), self.moments.first()) {
+            (Some(mean), Some(log_sd), Some([momentum, curvature])) => [mean.storage(), log_sd.storage(), momentum.storage(), curvature.storage()],
+            _ => [self.fitting.storage(); 4],
+        }
     }
 
     /// Trainable operator `i`'s `μ`, `s` and IVON's state on the host, one operator at a time (a
