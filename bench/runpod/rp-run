@@ -824,10 +824,36 @@ ARM
 # The files under mpd-data that COMMAND reads, in parallel streams over separate connections (one
 # connection's rate falls short of the Mac's uplink on distant pods). Files go into streams by size,
 # largest first; a file larger than a stream's even share goes up in byte ranges of that share, so
-# the streams finish together.
+# the streams finish together. A float64 file whose every value is a float32 (an engine export's
+# weights, widened from the checkpoint's f32, and its token ids) goes up as float32, half the
+# bytes, and is widened on the pod and checked against the Mac file's sha256.
+NARROW_CHECK='import hashlib, sys
+import numpy as np
+for path in sys.argv[2:]:
+    raw = open(path, "rb").read()
+    if raw and len(raw) % 8 == 0:
+        wide = np.frombuffer(raw, dtype="<f8")
+        if wide.astype("<f4").astype("<f8").tobytes() == raw:
+            print(hashlib.sha256(raw).hexdigest() + "  " + path[len(sys.argv[1]):])'
+NARROW='import sys
+import numpy as np
+f = open(sys.argv[1], "rb")
+f.seek(int(sys.argv[2]))
+n = int(sys.argv[3])
+sys.stdout.buffer.write(np.frombuffer(f.read(n) if n >= 0 else f.read(), dtype="<f8").astype("<f4").tobytes())'
+WIDEN='import sys
+import numpy as np
+offset = int(sys.argv[2])
+f = open(sys.argv[1], "wb" if offset < 0 else "r+b")
+f.seek(max(offset, 0))
+f.write(np.frombuffer(sys.stdin.buffer.read(), dtype="<f4").astype("<f8").tobytes())'
 upload_inputs() {
     [ ${#files[@]} -gt 0 ] || return 0
-    local streams=4 started=$(date +%s) share f size i k piece best total=0 parts=()
+    local streams=8 started=$(date +%s) share f size i k piece best total=0 parts=() narrow="" saved=0 py=$MAC_DATA/venv/bin/python
+    # The float64 files that go up as float32, with their sha256s.
+    if [ -x "$py" ]; then
+        narrow=$(cd "$MAC_DATA" && printf '%s\n' "${files[@]}" | grep '[.]f64$' | xargs "$py" -c "$NARROW_CHECK" "" 2> /dev/null || true)
+    fi
     for f in "${files[@]}"; do total=$(( total + $(stat -L -f %z "$MAC_DATA/$f") )); done
     # Each stream's even share, in whole MiB (the unit of the byte ranges), at least one.
     share=$(( (total / streams + 1048575) / 1048576 ))
@@ -856,25 +882,50 @@ upload_inputs() {
     for (( i = 0; i < streams; i++ )); do
         [ -n "${lists[i]}" ] || continue
         (
-            while read -r f k; do
-                [ -n "$f" ] || continue
+            # One piece, sent again (up to three times) when its connection fails: sshd refuses
+            # connections beyond its limit of ten unauthenticated at once.
+            send() {
+                local f=$1 k=$2 q try
                 q=$(printf %q "$f")
-                if [ "$k" = - ]; then
-                    gzip -1 -c "$MAC_DATA/$f" | new_conn "gzip -dc > /workspace/mpd-data/$q" || exit 1
+                for try in 1 2 3; do
+                    send_once "$f" "$k" "$q" 2>> "$TMP/upload.err" && return 0
+                    sleep $(( 2 * try ))
+                done
+                return 1
+            }
+            send_once() {
+                local f=$1 k=$2 q=$3
+                if grep -q "  $f\$" <<< "$narrow"; then
+                    if [ "$k" = - ]; then
+                        "$py" -c "$NARROW" "$MAC_DATA/$f" 0 -1 | gzip -1 | new_conn "gzip -dc | python3 -c $(printf %q "$WIDEN") /workspace/mpd-data/$q -1" || return 1
+                    else
+                        "$py" -c "$NARROW" "$MAC_DATA/$f" $(( k * share )) "$share" | gzip -1 |
+                            new_conn "gzip -dc | python3 -c $(printf %q "$WIDEN") /workspace/mpd-data/$q $(( k * share ))" || return 1
+                    fi
+                elif [ "$k" = - ]; then
+                    gzip -1 -c "$MAC_DATA/$f" | new_conn "gzip -dc > /workspace/mpd-data/$q" || return 1
                 else
                     dd if="$MAC_DATA/$f" bs=1048576 skip=$(( k * share / 1048576 )) count=$(( share / 1048576 )) 2> /dev/null |
-                        gzip -1 | new_conn "gzip -dc | dd of=/workspace/mpd-data/$q bs=1048576 seek=$(( k * share / 1048576 )) conv=notrunc 2> /dev/null" || exit 1
+                        gzip -1 | new_conn "gzip -dc | dd of=/workspace/mpd-data/$q bs=1048576 seek=$(( k * share / 1048576 )) conv=notrunc 2> /dev/null" || return 1
                 fi
+            }
+            while read -r f k; do
+                [ -n "$f" ] || continue
+                send "$f" "$k" || exit 1
             done <<< "${lists[i]}"
         ) &
         pids+=($!)
     done
     local failed=0 took
     for i in "${pids[@]}"; do wait "$i" || failed=1; done
-    (( ! failed )) || { say "upload failed"; return 1; }
+    (( ! failed )) || { say "upload failed: $(tail -n 3 "$TMP/upload.err" 2> /dev/null | tr '\n' ' ')"; return 1; }
+    if [ -n "$narrow" ]; then
+        new_conn "cd /workspace/mpd-data && sha256sum -c --quiet" <<< "$narrow" || { say "a float64 file widened on the pod differs from the Mac's"; return 1; }
+        saved=$(cd "$MAC_DATA" && awk '{ print $2 }' <<< "$narrow" | xargs stat -f %z | awk '{ s += $1 / 2 } END { printf "%d", s / 1048576 }')
+    fi
     took=$(( $(date +%s) - started ))
     echo "$took" >> "$TMP/upload_s"
-    say "uploaded ${#files[@]} files, $(( upload_kb / 1024 )) MB, in $took s ($(awk -v k="$upload_kb" -v t="$took" 'BEGIN { printf "%.1f", k / 1024 / (t > 0 ? t : 1) }') MB/s, $streams streams)"
+    say "uploaded ${#files[@]} files, $(( upload_kb / 1024 )) MB ($saved MB fewer: $(grep -c . <<< "$narrow") float64 files as float32, widened on the pod, sha256s equal), in $took s ($(awk -v k="$upload_kb" -v s="$saved" -v t="$took" 'BEGIN { printf "%.1f", (k / 1024 - s) / (t > 0 ? t : 1) }') MB/s sent, $streams streams)"
 }
 
 # The Hugging Face snapshots COMMAND names, downloaded by the pod at their revisions.
@@ -1010,7 +1061,15 @@ setup() {
         say "the data builds' logs are in $OUT/data.log"
         exit 1
     fi
-    (( ! failed )) || { say "an input, data, model or rsync did not arrive"; return 1; }
+    if (( failed )); then
+        # A pod that still answers was not lost: another pod would fail the same way.
+        if on_pod true < /dev/null 2> /dev/null; then
+            say "an input, data, model or rsync did not arrive, and the pod still answers; stopping"
+            exit 1
+        fi
+        say "an input, data, model or rsync did not arrive: the pod no longer answers"
+        return 1
+    fi
     # What an earlier pod of this run (or an earlier run of NAME) wrote, so the command can resume
     # from it, when sending it up takes less time than the work it holds: the time from the command's
     # first start (else the oldest output) to the newest output, against its size at the slowest
