@@ -475,6 +475,38 @@ def report_documents(report: dict | None) -> list[str]:
     return [report["rule"]]
 
 
+def claude_stream_messages(path) -> list[dict]:
+    """A headless Claude Code transcript (`claude -p --output-format stream-json`, one event per line, as
+    the investigator harness writes it) as chat messages: the assistant's text, its tool calls (a shell
+    command running the oracle command line becomes a call of the tool "oracle_cli" with that command),
+    and each tool result as a tool message. Thinking blocks (signed, without text) and the harness's
+    system and rate-limit events are left out; the final structured report is the last assistant message."""
+    messages: list[dict] = []
+    for line in Path(path).read_text().splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        kind = event.get("type")
+        if kind == "assistant":
+            for block in event["message"]["content"]:
+                if block.get("type") == "text" and block["text"].strip():
+                    messages.append({"role": "assistant", "content": block["text"]})
+                elif block.get("type") == "tool_use":
+                    call = {"id": block["id"], "type": "function", "function": {"name": "oracle_cli", "arguments": json.dumps({"command": block["input"].get("command", "")})}}
+                    messages.append({"role": "assistant", "content": "", "tool_calls": [call]})
+        elif kind == "user":
+            content = event["message"]["content"]
+            for block in content if isinstance(content, list) else []:
+                if block.get("type") == "tool_result":
+                    text = block.get("content")
+                    if isinstance(text, list):
+                        text = "\n".join(b.get("text", "") for b in text if isinstance(b, dict))
+                    messages.append({"role": "tool", "tool_call_id": block["tool_use_id"], "content": text or ""})
+        elif kind == "result" and isinstance(event.get("structured_output"), dict):
+            messages.append({"role": "assistant", "content": json.dumps(event["structured_output"], ensure_ascii=False)})
+    return messages
+
+
 def transcript_text(transcript: list[dict]) -> str:
     lines = []
     for m in transcript:

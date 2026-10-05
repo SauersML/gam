@@ -150,6 +150,7 @@ def stage(run: Path, manifest: Path):
         episode = E.new_episode(target, investigator=r["arm"], model=r.get("investigator_model", "unknown"), episode_id=f"{run.name}-{r['arm']}")
         if r.get("transcript"):
             episode["investigator"]["transcript_file"] = r["transcript"]
+            episode["investigator"]["transcript"] = E.claude_stream_messages(r["transcript"])
         if frozen is not report:
             episode["investigator"]["harness_freeze"] = {k: frozen.get(k) for k in ("sha256", "frozen_at", "arm", "investigator", "oracle_calls", "seconds", "cost_usd", "turns")}
         E.freeze(episode, report)
