@@ -156,12 +156,13 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     f64::consts::LN_2,
     io::{BufReader, Read, Write},
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
+    thread::JoinHandle,
     time::Instant,
 };
 
@@ -1229,12 +1230,17 @@ struct Scorer {
     mlps: Vec<Mlp>,
     /// Each trainable operator's position in `Explanation::trainable`.
     position: BTreeMap<usize, usize>,
-    /// The patch directions of each kept batch of experiments (by key), with its key under the
-    /// protocol: fixed data, decomposed once.
+    /// The patch directions made when asked for (the held-out batches, and a training batch no
+    /// thread made ahead), by key, with its key under the protocol: fixed data, decomposed once.
     designs: BTreeMap<String, (u64, Arc<interchange::Design>)>,
+    /// The patch directions of the training batches the fit takes next, each made on another
+    /// thread from host arithmetic while the device runs the current batch ([`Scorer::prefetch`]):
+    /// its experiments and the thread. At most the current and the next batch wait here: a
+    /// training batch's directions are made again each pass, not kept.
+    ahead: VecDeque<(Vec<Experiment>, JoinHandle<Result<interchange::HostDesign, String>>)>,
     /// The fixed questions (`interchange::Protocol`): `M`'s read variables and directions, from
     /// the native program alone, whatever explanation this scorer scores.
-    protocol: interchange::Protocol,
+    protocol: Arc<interchange::Protocol>,
     /// Whether the explanation's own read variables align with the protocol's one for one (same
     /// order, blocks and rows), so that the adaptive family can ask them; tied and shared functions
     /// keep the variable of the call site they replace.
@@ -1247,7 +1253,7 @@ impl Scorer {
     fn new(device: &Device, native: &OperatorProgram, explanation: &Explanation, settings: &Settings, export: &str, shards: Option<PathBuf>) -> Result<Self, String> {
         let sites: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
         let reads = interchange::library_reads(&explanation.artifact.program, sites.len())?;
-        let protocol = interchange::Protocol::new(native, &sites, export)?;
+        let protocol = Arc::new(interchange::Protocol::new(native, &sites, export)?);
         let aligned = reads.len() == protocol.variables().len()
             && reads.iter().zip(protocol.variables()).all(|(own, native)| {
                 own.block == native.block && own.parts.len() == native.parts.len() && own.parts.iter().zip(&native.parts).all(|((_, rows), (_, native_rows))| rows.len() == native_rows.len())
@@ -1260,7 +1266,7 @@ impl Scorer {
         let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
         let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
-        Ok(Self { experiments, mlps, position, designs: BTreeMap::new(), protocol, aligned, shards })
+        Ok(Self { experiments, mlps, position, designs: BTreeMap::new(), ahead: VecDeque::new(), protocol, aligned, shards })
     }
 
     fn layers(&self) -> usize {
@@ -1274,6 +1280,21 @@ impl Scorer {
     /// The batch's experiments from `draw`: the fixed collection's for that batch.
     fn experiments(&self, draw: &Draw, sequences: &[Vec<u32>]) -> Result<Vec<Experiment>, String> {
         draw.experiments(sequences, self.protocol.variables(), 2 * self.layers())
+    }
+
+    /// Starts making the patch directions of `draw`'s batch on another thread, so that they are
+    /// ready when the fit asks for that batch after the current one.
+    fn prefetch(&mut self, draw: &Draw, sequences: &[Vec<u32>]) -> Result<(), String> {
+        let experiments = self.experiments(draw, sequences)?;
+        if self.ahead.iter().any(|(planned, _)| *planned == experiments) {
+            return Ok(());
+        }
+        let (protocol, planned) = (Arc::clone(&self.protocol), experiments.clone());
+        self.ahead.push_back((experiments, std::thread::spawn(move || protocol.host_design(&planned))));
+        if self.ahead.len() > 2 {
+            self.ahead.pop_front();
+        }
+        Ok(())
     }
 
     /// `KL(M_e ‖ P_e)` per scored token in bits for `experiments` on `batch` at the explanation's
@@ -1309,17 +1330,24 @@ impl Scorer {
         Ok((evaluation.bits, evaluation.gradient))
     }
 
-    /// The patch directions of `experiments` and `M`'s targets on them, from the shard `key` when
-    /// the fit keeps them.
+    /// The patch directions of `experiments` (from the thread that made them ahead, when one did)
+    /// and `M`'s targets on them, from the shard `key` when the fit keeps them.
     fn targets(&mut self, batch: &Batch, experiments: &[Experiment], key: &str) -> Result<(Arc<interchange::Design>, Targets), String> {
         let fingerprint = self.protocol.key(batch, experiments);
+        let device = self.experiments.models().0.program.device();
         let design = match self.designs.get(key).filter(|(f, _)| *f == fingerprint) {
             Some((_, design)) => Arc::clone(design),
-            None => {
-                let design = Arc::new(self.protocol.design(self.experiments.models().0.program.device(), experiments)?);
-                self.designs.insert(key.to_string(), (fingerprint, Arc::clone(&design)));
-                design
-            }
+            None => match self.ahead.iter().position(|(planned, _)| planned.as_slice() == experiments) {
+                Some(at) => {
+                    let (_, job) = self.ahead.remove(at).ok_or("a planned design")?;
+                    Arc::new(job.join().map_err(|_| "the thread making patch directions panicked".to_string())??.upload(device)?)
+                }
+                None => {
+                    let design = Arc::new(self.protocol.design(device, experiments)?);
+                    self.designs.insert(key.to_string(), (fingerprint, Arc::clone(&design)));
+                    design
+                }
+            },
         };
         let path = self.shards.as_ref().map(|dir| dir.join(format!("{key}.bin")));
         let kept = match &path {
@@ -2000,6 +2028,7 @@ pub fn fit(
             let step_started = Instant::now();
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
+            scorer.prefetch(&draws[(b + 1) % draws.len()], sequences)?;
             let key = noise_seed(settings.seed, epoch + 1, b);
             let (bits, mut gradients) = scorer.score_device(&device_posterior, &batch, &experiments, Some(key), &format!("train_{b}"), true)?;
             for (e, bits) in experiments.iter().zip(&bits) {
@@ -2154,6 +2183,7 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &Posterior, draws: &[Draw],
     for (b, draw) in draws.iter().enumerate() {
         let batch = draw.batch(sequences)?;
         let experiments = scorer.experiments(draw, sequences)?;
+        scorer.prefetch(&draws[(b + 1) % draws.len()], sequences)?;
         let (design, _) = scorer.targets(&batch, &experiments, &format!("train_{b}"))?;
         let rows: usize = experiments.iter().map(|e| batch.length() - e.position).sum();
         let uniforms: Vec<f64> = (0..rows).map(|_| rng.random::<f64>()).collect();
@@ -2188,6 +2218,7 @@ fn expected_divergence(
         // Removal zeroes entries, so the remaining entries see the same noise as the full posterior.
         let (theta, _) = trial.sample(noise_seed(settings.seed, 0, b));
         let experiments = scorer.experiments(draw, sequences)?;
+        scorer.prefetch(&draws[(b + 1) % draws.len()], sequences)?;
         let (scored, _) = scorer.score(&draw.batch(sequences)?, &experiments, &theta, &format!("train_{b}"), false)?;
         bits += scored.iter().flatten().sum::<f64>();
         if let Some(prior) = prior.as_deref_mut() {
