@@ -64,6 +64,10 @@ struct Settings {
     /// `pgd_step_size` (its evaluation's 20 and 0.1).
     #[serde(default)]
     vpd_check: Option<VpdCheck>,
+    /// For pricing VPD in the library's code length: the training sequences, the first of the
+    /// export's rows outside the held-out ones (as `mpd_library_mdl_2951` takes them).
+    #[serde(default)]
+    training_sequences: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -186,7 +190,7 @@ fn circuits(device: &Device, export: &Path, native: &gam_mpd::operator_program::
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json";
+    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price DECOMPOSITION";
     let (export, settings_path, out, mode, kind, extra, more) = match &args[..] {
         [e, s, o, m, k] => (e, s, o, m, k.as_str(), None, None),
         [e, s, o, m, k, a] => (e, s, o, m, k.as_str(), Some(Path::new(a)), None),
@@ -209,7 +213,9 @@ fn main() -> Result<(), String> {
     };
     let started = Instant::now();
     let check_end = settings.vpd_check.as_ref().map_or(0, |c| c.rows[1]);
-    let imported = import_language_model(export, end.max(s_end).max(check_end), settings.context)?;
+    let training = settings.training_sequences.unwrap_or(0);
+    let training_end = if training > first { training + (end - first) } else { training };
+    let imported = import_language_model(export, end.max(s_end).max(check_end).max(training_end), settings.context)?;
     let layer_count = imported.record["config"]["n_layers"].as_u64().ok_or("config.n_layers")? as usize;
     let native = split_sites(&imported.program)?;
     let layers = layer_nodes(&native, layer_count)?;
@@ -248,6 +254,22 @@ fn main() -> Result<(), String> {
         if s_first < s_end {
             report["interchange"] = battery::vpd_interchange(&vpd, bases, sources, settings.batch_sequences, settings.seed, &settings.worst_of)?;
         }
+        report["seconds"] = json!(started.elapsed().as_secs_f64());
+        save(&report)?;
+        log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
+        return Ok(());
+    }
+    if kind == "price" {
+        let vpd = Vpd::new(&device, export, Decomposition::load(extra.ok_or(usage)?)?, settings.numeric_bytes)?;
+        let train: Vec<Vec<u32>> = all_rows[..first].iter().chain(&all_rows[end..]).take(training).cloned().collect();
+        if training == 0 || train.len() != training {
+            return Err("pricing needs training_sequences rows outside the held-out ones".into());
+        }
+        let mut progress = report.clone();
+        report["pricing"] = battery::vpd_pricing(&vpd, export, &train, bases, settings.batch_sequences, settings.seed, |state| {
+            progress["pricing"] = state.clone();
+            save(&progress)
+        })?;
         report["seconds"] = json!(started.elapsed().as_secs_f64());
         save(&report)?;
         log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());

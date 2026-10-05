@@ -1832,3 +1832,210 @@ pub fn subcomponent_attributions(library: &crate::library_readout::Library<'_>, 
     }
     Ok(out)
 }
+
+// ------------------------------------------------------------------------------ VPD's code length
+
+/// The sum over a batch's tokens of `KL(M ‖ E)` in nats, from `E`'s final normed stream `hidden`
+/// (the batch's sequences of `length` rows each) and `M`'s `reference`, and with `seed` the
+/// gradient of that sum in the final normed stream: `(p_E − p_M)` through the unembedding `head`.
+fn divergence_and_seed(d: &Device, hidden: &Tensor, head: &Tensor, reference: &Reference, length: usize, seed: bool, arithmetic: Arithmetic) -> Result<(f64, Option<Tensor>), String> {
+    let sequences = hidden.rows() / length;
+    let mut total = 0.0;
+    let mut out = if seed { Some(d.zeros(hidden.rows(), hidden.cols()).map_err(error)?) } else { None };
+    for s in 0..sequences {
+        let h = d.rows_of(hidden, s * length, length).map_err(error)?;
+        let mut logits = d.zeros(length, head.rows()).map_err(error)?;
+        d.gemm(&mut logits, 1.0, &h, Op::N, head, Op::T, 0.0, arithmetic).map_err(error)?;
+        let logits = d.download(&logits).map_err(error)?;
+        let lp = &reference.log_probabilities[s];
+        let mut cotangent = Array2::<f64>::zeros(logits.dim());
+        let kl: Vec<f64> = cotangent
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .map(|(t, mut row)| -> Result<f64, String> {
+                let lq = log_softmax(logits.row(t).as_slice().ok_or_else(|| error("noncontiguous logits"))?).map_err(error)?;
+                let mut kl = 0.0;
+                for ((out, p), q) in row.iter_mut().zip(lp.row(t)).zip(&lq) {
+                    kl += p.exp() * (p - q);
+                    *out = q.exp() - p.exp();
+                }
+                Ok(kl)
+            })
+            .collect::<Result<_, _>>()?;
+        total += kl.iter().sum::<f64>();
+        if let Some(out) = out.as_mut() {
+            let upstream = d.upload(cotangent.view()).map_err(error)?;
+            let mut part = d.zeros(length, hidden.cols()).map_err(error)?;
+            d.gemm(&mut part, 1.0, &upstream, Op::N, head, Op::N, 0.0, arithmetic).map_err(error)?;
+            d.set_rows(out, s * length, &part).map_err(error)?;
+        }
+    }
+    Ok((total, out))
+}
+
+/// The causal-importance masks of every site on `family`, as the raw slots of the whole program
+/// (the remainder dropped: VPD's intended setting).
+fn importance_given(vpd: &Vpd, family: &FamilyInputs, rng: &mut StdRng) -> Result<BTreeMap<usize, Tensor>, String> {
+    let d = vpd.e.program.device();
+    let masks = Strategy::Ci.masks(&vpd.importances(family)?, rng);
+    let mut given = BTreeMap::new();
+    for l in 0..vpd.layers() {
+        given.extend(vpd.given(d, l, Some(&masks), family.rows)?);
+    }
+    Ok(given)
+}
+
+/// VPD's decomposition priced in the library's code length (`library_mdl`, module note there): its
+/// subcomponents' means held at VPD's values, a factorized Gaussian posterior `N(μ, σ²)` over every
+/// entry of `U` and `V` with one empirical-Bayes prior group per subcomponent's `U` row and per its
+/// `V` column, `σ` fitted by IVON with the mean's step zero (its curvature estimate then sets
+/// `σ = 1 / √(N (h + δ))`, the width at which `N E_q[ℓ] + KL(q ‖ p)` is stationary for fixed means),
+/// on the data term `Σ_t KL(M ‖ VPD_θ)` over the `train` sequences' tokens in VPD's intended setting
+/// (the causal-importance masks of `M`'s activations, the remainder dropped). Epochs run until the
+/// mean paired improvement of the per-batch objective is below its standard error. Reports per
+/// epoch and at the end `F = KL(q ‖ p) + Σ_G ½ log2 |G| + N · data` in bits, and the held-out data
+/// term at the posterior mean (VPD itself) and at one sample per batch.
+pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec<u32>], batch: usize, seed: u64, mut report: impl FnMut(&Value) -> Result<(), String>) -> Result<Value, String> {
+    let device = vpd.e.program.device().clone();
+    let (built, _) = model(export, Some(&vpd.factors))?;
+    // The subcomponents' operators: per site its `V` (rows the subcomponents) and `U` (columns).
+    let mut trainable = Vec::new();
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    let mut means: Vec<Array2<f64>> = Vec::new();
+    let mut sizes: Vec<f64> = Vec::new();
+    let mut base = 0usize;
+    for f in &vpd.factors {
+        let c = f.subcomponents();
+        sizes.extend(std::iter::repeat_n(f.v.nrows() as f64, c));
+        sizes.extend(std::iter::repeat_n(f.u.ncols() as f64, c));
+        for (op, operator) in built.program.operators.iter().enumerate() {
+            let Some(part) = operator.name.strip_prefix(&format!("{}.", f.name)) else { continue };
+            let values = operator.matrix();
+            let (rows, cols) = values.dim();
+            let ids: Vec<u32> = if part.starts_with('V') {
+                (0..rows * cols).map(|e| (base + e / cols) as u32).collect()
+            } else if part.starts_with('U') {
+                (0..rows * cols).map(|e| (base + c + e % cols) as u32).collect()
+            } else {
+                continue;
+            };
+            trainable.push(op);
+            groups.push(ids);
+            means.push(values);
+        }
+        base += 2 * c;
+    }
+    let tokens = (train.iter().map(Vec::len).sum::<usize>()) as f64;
+    // The start: each entry's variance its group's mean square over the training tokens.
+    let mut squares = vec![(0.0, 0.0); base];
+    for (m, ids) in means.iter().zip(&groups) {
+        for (v, g) in m.iter().zip(ids) {
+            squares[*g as usize].0 += 1.0;
+            squares[*g as usize].1 += v * v;
+        }
+    }
+    let log_sd: Vec<Array2<f64>> = means
+        .iter()
+        .zip(&groups)
+        .map(|(m, ids)| {
+            let cols = m.ncols();
+            Array2::from_shape_fn(m.dim(), |(r, c)| {
+                let (n, s) = squares[ids[r * cols + c] as usize];
+                0.5 * (s / n / tokens).ln()
+            })
+        })
+        .collect();
+    let mut program = Side::compile(&device, &built.program, usize::MAX)?;
+    let hidden_node = built.layout.hidden;
+    drop(built);
+    program.prepare_dense_parameters(&trainable)?;
+    let parts = crate::device_posterior::Parts { operators: &trainable, mean: &means, log_sd: &log_sd, groups: &groups, count: base };
+    let mut posterior = crate::device_posterior::DevicePosterior::from_parts(&device, &parts, tokens, None, 0)?;
+    drop((means, log_sd));
+    let variance_nats: f64 = sizes.iter().map(|n| 0.5 * n.ln()).sum();
+    let batches: Vec<&[Vec<u32>]> = train.chunks(batch).collect();
+    let ivon = crate::device_posterior::Ivon { rate: 0.0, beta1: 0.0, beta2: 1.0 - 1.0 / batches.len() as f64 };
+    let mut rng = StdRng::seed_from_u64(seed);
+    let head = d_copy(&device, &vpd.e.head)?;
+    let arithmetic = program.arithmetic();
+    // One pass over `sequences` at a sample per batch (with `step`, IVON's step after each): the
+    // per-batch data term in nats per token.
+    let mut pass = |sequences: &[&[Vec<u32>]], epoch: u64, step: bool, posterior: &mut crate::device_posterior::DevicePosterior, program: &mut DeviceProgram, at_mean: bool| -> Result<Vec<(f64, usize)>, String> {
+        let mut out = Vec::with_capacity(sequences.len());
+        for (b, chunk) in sequences.iter().enumerate() {
+            let key = seed ^ (epoch << 32) ^ b as u64;
+            if at_mean { posterior.mean_into(program)? } else { posterior.sample_into(program, key)? }
+            let views: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
+            let family = sequence_family(&views)?;
+            let length = views[0].len();
+            let given = importance_given(vpd, &family, &mut rng)?;
+            let trace = program.forward_given(&family, given)?;
+            let (_, m_streams) = streams(&vpd.m, &family, |_| BTreeMap::new())?;
+            let reference = Reference::of(vpd.m.logits(&family, &m_streams[vpd.layers()], length)?)?;
+            let (kl, cotangent) = divergence_and_seed(&device, trace.value(hidden_node)?, &head, &reference, length, step, arithmetic)?;
+            if let Some(cotangent) = cotangent {
+                let (_, gradients) = program.vjp_values_dense(&trace, BTreeMap::from([(hidden_node, cotangent)]), &[], &trainable, arithmetic)?;
+                posterior.step(&gradients, 1.0 / family.rows as f64, &ivon, key)?;
+            }
+            out.push((kl, family.rows));
+        }
+        Ok(out)
+    };
+    let mut epochs: Vec<Value> = Vec::new();
+    let mut previous: Option<Vec<f64>> = None;
+    for epoch in 1u64.. {
+        let data = pass(&batches, epoch, true, &mut posterior, &mut program, false)?;
+        let divergence: f64 = posterior.divergences()?.iter().sum();
+        let description = divergence + variance_nats;
+        // Each batch's objective estimate `N · data per token + description`, in bits.
+        let estimates: Vec<f64> = data.iter().map(|(kl, n)| (tokens * kl / *n as f64 + description) / LN_2).collect();
+        let data_bits = data.iter().map(|(kl, _)| kl).sum::<f64>() / tokens / LN_2;
+        let (improvement, standard_error) = match &previous {
+            Some(before) => {
+                let d: Vec<f64> = before.iter().zip(&estimates).map(|(a, b)| a - b).collect();
+                let mean = d.iter().sum::<f64>() / d.len() as f64;
+                let var = d.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (d.len() as f64 - 1.0).max(1.0);
+                (Some(mean), Some((var / d.len() as f64).sqrt()))
+            }
+            None => (None, None),
+        };
+        epochs.push(json!({
+            "epoch": epoch,
+            "data_bits_per_token": data_bits,
+            "divergence_bits": divergence / LN_2,
+            "variance_bits": variance_nats / LN_2,
+            "objective_bits": tokens * data_bits + description / LN_2,
+            "improvement_bits": improvement,
+            "standard_error_bits": standard_error,
+        }));
+        log::info!("pricing epoch {epoch}: {}", epochs[epochs.len() - 1]);
+        report(&json!({"epochs": epochs}))?;
+        let converged = matches!((improvement, standard_error), (Some(i), Some(s)) if i < s);
+        previous = Some(estimates);
+        if converged {
+            break;
+        }
+    }
+    let held: Vec<&[Vec<u32>]> = held_out.chunks(batch).collect();
+    let held_tokens: usize = held_out.iter().map(Vec::len).sum();
+    let at = |data: Vec<(f64, usize)>| data.iter().map(|(kl, _)| kl).sum::<f64>() / held_tokens as f64 / LN_2;
+    let sampled = at(pass(&held, 0, false, &mut posterior, &mut program, false)?);
+    let mean = at(pass(&held, 0, false, &mut posterior, &mut program, true)?);
+    let divergence: f64 = posterior.divergences()?.iter().sum();
+    Ok(json!({
+        "training_tokens": tokens,
+        "subcomponents": base / 2,
+        "parameters": groups.iter().map(Vec::len).sum::<usize>(),
+        "groups": base,
+        "divergence_bits": divergence / LN_2,
+        "variance_bits": variance_nats / LN_2,
+        "held_out_kl_bits_per_token_at_mean": mean,
+        "held_out_kl_bits_per_token_sampled": sampled,
+        "epochs": epochs,
+    }))
+}
+
+fn d_copy(d: &Device, t: &Tensor) -> Result<Tensor, String> {
+    d.copy(t).map_err(error)
+}
