@@ -33,6 +33,7 @@
 #   python, python3, the Mac venv's python -> the pod's python3.
 # Other cargo commands (`cargo test -p gam-gpu ...`) run as given in /workspace/src.
 # RP_EXAMPLES="X Y" builds further examples for a script that runs them through $MPD_BIN;
+# RP_DISK_GB=N sets the container disk (default: 30 GB plus twice the inputs and models);
 # RP_ENV="K=V ..." adds environment (RUST_LOG is forwarded when set).
 #
 # Write outputs under /Users/user/mpd-data/runpod/NAME/. They come back there, beside the runner's
@@ -275,6 +276,11 @@ for p in "${hf[@]}"; do hf_kb=$(( hf_kb + $(du -skL "$p" | cut -f1) )); done
 # The container disk: the toolchain and a release build of the workspace (measured under 20 GB),
 # with room for the inputs, the models fetched and the outputs (as large again as the inputs).
 DISK=$(( 30 + (2 * (upload_kb + hf_kb) + 1048575) / 1048576 ))
+# A command whose outputs outgrow that (a fit's checkpoints and kept targets) states its own.
+if [ -n "${RP_DISK_GB:-}" ]; then
+    [[ $RP_DISK_GB =~ ^[0-9]+$ ]] && (( RP_DISK_GB >= DISK )) || { echo "rp-run: RP_DISK_GB must be a whole number of GB, at least $DISK" >&2; exit 2; }
+    DISK=$RP_DISK_GB
+fi
 
 # The pod deletes itself at the run's deadline by its own clock, then starts as the image would.
 create_body() {  # CLOUD SPOT SECONDS_LEFT PUBLIC_KEYS
