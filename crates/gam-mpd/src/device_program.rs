@@ -2032,7 +2032,9 @@ impl DeviceProgram {
                 Step::Transposed { operator, .. } => requested.contains(operator),
                 _ => false,
             };
-            if uses && !retained.contains(&node) {
+            // A span's trace holds only the nodes it computed: an operator's uses outside the span
+            // (another block's) are that span's to differentiate.
+            if uses && trace.has(node) && !retained.contains(&node) {
                 retained.push(node);
             }
         }

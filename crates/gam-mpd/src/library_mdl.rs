@@ -155,6 +155,9 @@ pub struct Explanation {
     pub trainable: Vec<usize>,
     pub groups: Vec<Group>,
     pub layers: Vec<Layer>,
+    /// Groups that start outside the explanation, exactly zero (the output a read–write tie
+    /// replaces, `library_sharing`).
+    pub removed: Vec<usize>,
 }
 
 /// One layer of the explanation: its native sites (`run_check::layer_nodes`) and the prior groups
@@ -436,7 +439,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
         trainable.push(output);
     }
     trainable.sort_unstable();
-    Ok(Explanation { artifact, trainable, groups, layers: out })
+    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new() })
 }
 
 // ------------------------------------------------------------------------------------- posterior
@@ -514,7 +517,10 @@ impl Posterior {
                 entry.1 += value * value;
             }
         }
-        if let Some(g) = squares.iter().position(|(_, sum)| !(*sum > 0.0 && sum.is_finite())) {
+        if explanation.removed.iter().any(|g| *g >= explanation.groups.len()) {
+            return Err("a removed group the explanation does not have".into());
+        }
+        if let Some(g) = (0..squares.len()).find(|g| !explanation.removed.contains(g) && !(squares[*g].1 > 0.0 && squares[*g].1.is_finite())) {
             return Err(format!("{}: a group starting at zero has no scale", explanation.groups[g].name));
         }
         let log_sd = membership
@@ -526,7 +532,9 @@ impl Posterior {
                 })
             })
             .collect();
-        Ok(Self { mean, log_sd, active: vec![true; explanation.groups.len()], membership, spans })
+        let mut posterior = Self { mean, log_sd, active: vec![true; explanation.groups.len()], membership, spans };
+        posterior.remove(&explanation.removed);
+        Ok(posterior)
     }
 
     fn moments(&self) -> Vec<Moments> {
@@ -1295,6 +1303,7 @@ pub fn identity(export: &str, native: &OperatorProgram, explanation: &Explanatio
     program_structure(&mut program, b"native", native);
     program_structure(&mut program, b"explanation", &explanation.artifact.program);
     let mut groups = Fingerprinter::new();
+    groups.absorb_str(b"removed", &format!("{:?}", explanation.removed));
     for group in &explanation.groups {
         groups.absorb_str(b"group", &group.name);
         for cell in &group.cells {
@@ -1965,6 +1974,35 @@ mod tests {
             other => panic!("{other:?}"),
         };
         (map(2), map(3))
+    }
+
+    #[test]
+    fn a_tied_gate_is_differentiated_through_both_of_its_uses() {
+        let (native, layers, _, sequences) = tiny("library_tie_gradient", "gelu_tanh");
+        let start = explanation(&native, &layers).unwrap();
+        let tie = crate::library_sharing::Tie { source: (0, 3), target: (1, 5), cosine: 0.0, scale: 0.7, misfit: 0.0, coordinates: 8 };
+        let explanation = crate::library_sharing::tie(&start, &[tie]).unwrap();
+        let settings = settings();
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, None).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let batch = draws[0].batch(&sequences).unwrap();
+        let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
+        let (theta, _) = posterior.sample(noise_seed(settings.seed, 0, 0));
+        let (_, gradients) = scorer.score(&batch, &experiments, &theta, "gradient", true).unwrap();
+        let at = |name: &str| explanation.trainable.iter().position(|op| explanation.artifact.program.operators[*op].name == name).unwrap();
+        let (gate, scale) = (at("library.l1.mlp.gate"), at("library.l0.mlp.tie1.f3.scale"));
+        let mut bits = |theta: &[Array2<f64>]| -> f64 {
+            scorer.score(&batch, &experiments, theta, "gradient", false).unwrap().0.iter().flatten().sum()
+        };
+        for (i, entry) in [(gate, (5, 0)), (gate, (5, 6)), (scale, (0, 0))] {
+            let h = 1e-5;
+            let (mut up, mut down) = (theta.clone(), theta.clone());
+            up[i][entry] += h;
+            down[i][entry] -= h;
+            let central = (bits(&up) - bits(&down)) / (2.0 * h);
+            assert!((gradients[i][entry] - central).abs() <= 1e-5 * (1.0 + central.abs()), "tied gradient {} against {central}", gradients[i][entry]);
+        }
     }
 
     #[test]
