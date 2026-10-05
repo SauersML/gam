@@ -578,3 +578,252 @@ extern "C" __global__ void __launch_bounds__(ROWS_THREADS) attention_backward_qu
         }
     }
 }
+
+// ---- Hopper (sm_90a): warpgroup products ----
+// On Hopper the products run as wgmma: a warpgroup (4 warps) multiplies 64 rows at a time, its
+// operands read from shared memory through descriptors (or the left one from registers), so the
+// shared tiles take the layout those read: HEAD_D / 64 blocks of 64 columns, each row of a block
+// 128 bytes, its 16-byte chunks permuted by the row mod 8 (the 128-byte swizzle; blocks 1024-byte
+// aligned). Accumulators and register operands keep mma.sync's per-warp fragments (warp w of a
+// warpgroup holds its rows 16w..16w + 15).
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+
+__device__ __forceinline__ u32 hopper_offset(u32 r, u32 c, u32 rows) {
+    return (c >> 6) * rows * 128u + r * 128u + ((((c & 63u) >> 3) ^ (r & 7u)) << 4) + (c & 7u) * 2u;
+}
+
+// Rows [0, R) of a head tile from `src` into the shared tile at `tile` in the warpgroup layout.
+template <int R, int THREADS>
+__device__ __forceinline__ void load_hopper_tile(u32 tile, const u16* src, u64 stride, u32 valid) {
+#pragma unroll
+    for (u32 i = threadIdx.x; i < R * CHUNKS; i += THREADS) {
+        u32 r = i / CHUNKS, c = (i % CHUNKS) * 8u;
+        u32 dst = tile + hopper_offset(r, c, R);
+#if HEAD_W % 8 == 0
+        bool inside = r < valid && c < HEAD_W;
+        cp_async16(dst, inside ? (const void*)(src + (u64)r * stride + c) : (const void*)src, inside ? 16u : 0u);
+#else
+        u32 v[4];
+#pragma unroll
+        for (u32 k = 0; k < 4; ++k) {
+            u32 c0 = c + 2u * k;
+            float a = r < valid && c0 < HEAD_W ? from_bf16(src[(u64)r * stride + c0]) : 0.0f;
+            float b = r < valid && c0 + 1u < HEAD_W ? from_bf16(src[(u64)r * stride + c0 + 1u]) : 0.0f;
+            v[k] = pack_bf16(a, b);
+        }
+        asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};" ::"r"(dst), "r"(v[0]), "r"(v[1]), "r"(v[2]), "r"(v[3]) : "memory");
+#endif
+    }
+}
+
+// A shared-memory matrix descriptor with the 128-byte swizzle: start address, leading and stride
+// byte offsets.
+__device__ __forceinline__ u64 descriptor(u32 address, u32 leading, u32 stride) {
+    return (u64)((address & 0x3FFFFu) >> 4) | ((u64)((leading & 0x3FFFFu) >> 4) << 16) | ((u64)((stride & 0x3FFFFu) >> 4) << 32) | (1ull << 62);
+}
+
+// An operand stored with its 16 columns of step s contiguous (K-major), from row `row0` of a tile
+// of `rows` rows: 8-row groups 1024 bytes apart.
+__device__ __forceinline__ u64 k_major(u32 tile, u32 rows, u32 row0, u32 s) {
+    return descriptor(tile + (s >> 2) * rows * 128u + row0 * 128u + (s & 3u) * 32u, 16u, 1024u);
+}
+
+// The right operand of step s read with its N columns contiguous (MN-major): rows 16 s.. of a tile
+// of `rows` rows, every column; 64-column blocks rows · 128 bytes apart, 8-row groups 1024.
+__device__ __forceinline__ u64 mn_major(u32 tile, u32 rows, u32 s) {
+    return descriptor(tile + s * 16u * 128u, rows * 128u, 1024u);
+}
+
+__device__ __forceinline__ void wg_fence() { asm volatile("wgmma.fence.sync.aligned;" ::: "memory"); }
+__device__ __forceinline__ void wg_commit() { asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory"); }
+__device__ __forceinline__ void wg_wait() { asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory"); }
+// Writes by threads (cp.async, st.shared) made visible to the warpgroup products' reads.
+__device__ __forceinline__ void fence_async_shared() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
+
+// The accumulators' values pinned at this point of the program (the products write them
+// asynchronously, so no read may move above the wait, nor a write below the next issue).
+template <int N>
+__device__ __forceinline__ void pin(float (&d)[N]) {
+#pragma unroll
+    for (int i = 0; i < N; ++i) asm volatile("" : "+f"(d[i])::"memory");
+}
+// d (+)= A B on a warpgroup: A 64 × 16 and B 16 × 64 from shared memory (descriptors, both stored
+// with K contiguous); `accumulate` zero overwrites d.
+__device__ __forceinline__ void wgmma_64_ss(float (&d)[32], u64 a, u64 b, int accumulate) {
+    asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, %34, 0;\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, %32, %33, p, 1, 1, 0, 0;\n}\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+        : "l"(a), "l"(b), "r"(accumulate));
+}
+
+// d (+)= A B on a warpgroup: A 64 × 16 and B 16 × 128 from shared memory (descriptors, both stored
+// with K contiguous); `accumulate` zero overwrites d.
+__device__ __forceinline__ void wgmma_128_ss(float (&d)[64], u64 a, u64 b, int accumulate) {
+    asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, %66, 0;\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63}, %64, %65, p, 1, 1, 0, 0;\n}\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]), "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]), "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63])
+        : "l"(a), "l"(b), "r"(accumulate));
+}
+
+// d += A B on a warpgroup: A 64 × 16 from registers (each warp's 16 rows as mma.sync's A fragment),
+// B 16 × 64 from shared memory stored with N contiguous (transposed on the way in).
+__device__ __forceinline__ void wgmma_64_rs(float (&d)[32], const u32 (&a)[4], u64 b) {
+    asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, %37, 0;\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, {%32,%33,%34,%35}, %36, p, 1, 1, 1;\n}\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(b), "r"(1));
+}
+
+// d += A B on a warpgroup: A 64 × 16 from registers (each warp's 16 rows as mma.sync's A fragment),
+// B 16 × 128 from shared memory stored with N contiguous (transposed on the way in).
+__device__ __forceinline__ void wgmma_128_rs(float (&d)[64], const u32 (&a)[4], u64 b) {
+    asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, %69, 0;\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63}, {%64,%65,%66,%67}, %68, p, 1, 1, 1;\n}\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]), "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]), "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(b), "r"(1));
+}
+
+
+template <int N> struct Wg;
+template <> struct Wg<64> {
+    static __device__ __forceinline__ void ss(float (&d)[32], u64 a, u64 b, int accumulate) { wgmma_64_ss(d, a, b, accumulate); }
+    static __device__ __forceinline__ void rs(float (&d)[32], const u32 (&a)[4], u64 b) { wgmma_64_rs(d, a, b); }
+};
+template <> struct Wg<128> {
+    static __device__ __forceinline__ void ss(float (&d)[64], u64 a, u64 b, int accumulate) { wgmma_128_ss(d, a, b, accumulate); }
+    static __device__ __forceinline__ void rs(float (&d)[64], const u32 (&a)[4], u64 b) { wgmma_128_rs(d, a, b); }
+};
+
+#define HOPPER_THREADS (HOPPER_GROUPS * 128)
+#define HOPPER_ROWS (HOPPER_GROUPS * 64)
+
+// The forward on Hopper: a block holds HOPPER_ROWS query rows (64 per warpgroup) and sweeps key and
+// value tiles of HOPPER_KEYS rows, double-buffered; each warpgroup forms its scores S = Q Kᵀ with
+// Q and K read from shared memory, the online softmax in registers, and O += P V with P from
+// registers and V read transposed from shared memory.
+// Blocks as attention_forward's. Dynamic shared memory: (HOPPER_ROWS + 4 HOPPER_KEYS) HEAD_D bfloat16
+// and 1024 bytes of alignment.
+extern "C" __global__ void __launch_bounds__(HOPPER_THREADS) attention_forward_sm90(const Sequences sequences, u32 hq, u32 hk, float scale_log2, const u16* __restrict__ y, u16* __restrict__ out, float* __restrict__ lse) {
+    extern __shared__ __align__(1024) unsigned char smem_hopper[];
+    const u32 pair = blockIdx.z * gridDim.x + blockIdx.x;
+    if (pair >= sequences.count * hq) return;
+    const u32 head = pair % hq, sequence = pair / hq;
+    const u32 start = sequences.start[sequence], length = sequences.length[sequence];
+    const u32 tiles = (length + HOPPER_ROWS - 1) / HOPPER_ROWS;
+    if (blockIdx.y >= tiles) return;
+    const u32 q0 = (tiles - 1 - blockIdx.y) * HOPPER_ROWS;
+    const u32 stride = (hq + 2 * hk) * HEAD_W, kv = head / (hq / hk);
+    const u16* yk = y + (u64)start * stride + (hq + kv) * HEAD_W;
+    const u16* yv = y + (u64)start * stride + (hq + hk + kv) * HEAD_W;
+    const u32 sq = (shared_address(smem_hopper) + 1023u) & ~1023u, tile_k = HOPPER_KEYS * HEAD_D * 2;
+    const u32 sk = sq + HOPPER_ROWS * HEAD_D * 2, sv = sk + 2 * tile_k;
+    const u32 keys = min(q0 + HOPPER_ROWS, length), key_tiles = (keys + HOPPER_KEYS - 1) / HOPPER_KEYS;
+    const u32 group = threadIdx.x >> 7, warp = (threadIdx.x >> 5) & 3u, lane = threadIdx.x & 31u;
+
+    load_hopper_tile<HOPPER_ROWS, HOPPER_THREADS>(sq, y + (u64)(start + q0) * stride + head * HEAD_W, stride, min((u32)HOPPER_ROWS, length - q0));
+    load_hopper_tile<HOPPER_KEYS, HOPPER_THREADS>(sk, yk, stride, min((u32)HOPPER_KEYS, keys));
+    load_hopper_tile<HOPPER_KEYS, HOPPER_THREADS>(sv, yv, stride, min((u32)HOPPER_KEYS, keys));
+    cp_commit();
+
+    float o[HEAD_D / 2];
+#pragma unroll
+    for (int i = 0; i < HEAD_D / 2; ++i) o[i] = 0.0f;
+    float m[2] = {NEG_INF, NEG_INF}, l[2] = {0.0f, 0.0f};
+    // This warpgroup's first row, this thread's rows and columns within a score tile.
+    const u32 group_row = q0 + group * 64, row0 = group_row + warp * 16 + (lane >> 2), col0 = 2 * (lane & 3u);
+
+    for (u32 kt = 0; kt < key_tiles; ++kt) {
+        const u32 k0 = kt * HOPPER_KEYS, stage = kt & 1u;
+        const u32 sks = sk + stage * tile_k, svs = sv + stage * tile_k;
+        cp_wait_all();
+        fence_async_shared();
+        __syncthreads();
+        if (kt + 1 < key_tiles) {
+            const u32 next = k0 + HOPPER_KEYS;
+            load_hopper_tile<HOPPER_KEYS, HOPPER_THREADS>(sk + (stage ^ 1u) * tile_k, yk + (u64)next * stride, stride, min((u32)HOPPER_KEYS, keys - next));
+            load_hopper_tile<HOPPER_KEYS, HOPPER_THREADS>(sv + (stage ^ 1u) * tile_k, yv + (u64)next * stride, stride, min((u32)HOPPER_KEYS, keys - next));
+            cp_commit();
+        }
+        // A warpgroup whose rows all come before the tile's keys has nothing to add.
+        if (k0 > group_row + 63) continue;
+        float s[HOPPER_KEYS / 2];
+        wg_fence();
+#pragma unroll
+        for (int ks = 0; ks < HEAD_D / 16; ++ks) Wg<HOPPER_KEYS>::ss(s, k_major(sq, HOPPER_ROWS, group * 64, ks), k_major(sks, HOPPER_KEYS, 0, ks), ks);
+        wg_commit();
+        wg_wait();
+        pin(s);
+        // Scores in base-2 units; keys after a row's position, or past the sequence, weigh nothing.
+        const bool masked = k0 + HOPPER_KEYS > group_row + warp * 16 + 1 || k0 + HOPPER_KEYS > length;
+#pragma unroll
+        for (int n = 0; n < HOPPER_KEYS / 8; ++n) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                float v = s[4 * n + e] * scale_log2;
+                if (masked) {
+                    u32 key = k0 + n * 8 + col0 + (e & 1), row = row0 + 8 * (e >> 1);
+                    if (key > row || key >= length) v = NEG_INF;
+                }
+                s[4 * n + e] = v;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            float mx = m[i];
+#pragma unroll
+            for (int n = 0; n < HOPPER_KEYS / 8; ++n) mx = fmaxf(mx, fmaxf(s[4 * n + 2 * i], s[4 * n + 2 * i + 1]));
+            mx = quad_max(mx);
+            const float base = mx == NEG_INF ? 0.0f : mx;
+            const float alpha = exp2_approx(m[i] - base);
+            m[i] = mx;
+            l[i] *= alpha;
+#pragma unroll
+            for (int n = 0; n < HEAD_D / 8; ++n) {
+                o[4 * n + 2 * i] *= alpha;
+                o[4 * n + 2 * i + 1] *= alpha;
+            }
+#pragma unroll
+            for (int n = 0; n < HOPPER_KEYS / 8; ++n) {
+                s[4 * n + 2 * i] = exp2_approx(s[4 * n + 2 * i] - base);
+                s[4 * n + 2 * i + 1] = exp2_approx(s[4 * n + 2 * i + 1] - base);
+            }
+        }
+        // The weights as the values' product's left operand (bfloat16); the row sums add the same.
+        u32 p[HOPPER_KEYS / 16][4];
+#pragma unroll
+        for (int kk = 0; kk < HOPPER_KEYS / 16; ++kk) {
+            const int a = 8 * kk, b = 8 * kk + 4;
+            p[kk][0] = pack_bf16(s[a], s[a + 1]);
+            p[kk][1] = pack_bf16(s[a + 2], s[a + 3]);
+            p[kk][2] = pack_bf16(s[b], s[b + 1]);
+            p[kk][3] = pack_bf16(s[b + 2], s[b + 3]);
+            l[0] += bf16_lo(p[kk][0]) + bf16_hi(p[kk][0]) + bf16_lo(p[kk][2]) + bf16_hi(p[kk][2]);
+            l[1] += bf16_lo(p[kk][1]) + bf16_hi(p[kk][1]) + bf16_lo(p[kk][3]) + bf16_hi(p[kk][3]);
+        }
+        pin(o);
+        wg_fence();
+#pragma unroll
+        for (int kk = 0; kk < HOPPER_KEYS / 16; ++kk) Wg<HEAD_D>::rs(o, p[kk], mn_major(svs, HOPPER_KEYS, kk));
+        wg_commit();
+        wg_wait();
+        pin(o);
+    }
+    const u32 reads = hq * HEAD_W;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const float total = quad_sum(l[i]);
+        const u32 row = row0 + 8 * i;
+        if (row >= length) continue;
+        const float inverse = 1.0f / total;
+        u16* dst = out + (u64)(start + row) * reads + head * HEAD_W;
+#pragma unroll
+        for (int n = 0; n < HEAD_D / 8; ++n) {
+            const u32 c = n * 8 + col0;
+#if HEAD_W % 8 == 0
+            if (c < HEAD_W) *(u32*)(dst + c) = pack_bf16(o[4 * n + 2 * i] * inverse, o[4 * n + 2 * i + 1] * inverse);
+#else
+            if (c < HEAD_W) dst[c] = to_bf16(o[4 * n + 2 * i] * inverse);
+            if (c + 1 < HEAD_W) dst[c + 1] = to_bf16(o[4 * n + 2 * i + 1] * inverse);
+#endif
+        }
+        if ((lane & 3u) == 0) lse[(u64)(start + row) * hq + head] = (m[i] + __log2f(total)) * 0.6931471805599453f;
+    }
+}
+
+#endif

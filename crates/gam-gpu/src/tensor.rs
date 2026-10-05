@@ -4157,6 +4157,10 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
     /// and the query rows it takes at a time (8 and 32 beat 4 and 64, and 8 and 16, on the RTX 4090).
     const ATTENTION_KEYS: (usize, usize) = (8, 32);
 
+    /// A Hopper forward block's warpgroups (64 query rows each) and the key rows it takes at a time
+    /// (`attention.cu`'s warpgroup products).
+    const ATTENTION_HOPPER: (usize, usize) = (2, 128);
+
     /// The sequences one attention launch takes (they are passed by value: a kernel's parameters
     /// hold 4 KB).
     const ATTENTION_SEQUENCES: usize = 480;
@@ -4999,17 +5003,26 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         /// on first use per device and width, allowed `shared` bytes of dynamic shared memory.
         fn attention_kernel(&self, width: usize, name: &'static str, shared: usize) -> Result<CudaFunction, GpuError> {
             static MODULES: std::sync::OnceLock<crate::device_cache::KeyedPtxModuleCache<usize>> = std::sync::OnceLock::new();
-            let ((rows_warps, forward_keys, rows_keys), (keys_warps, keys_rows)) = (ATTENTION_ROWS, ATTENTION_KEYS);
+            let ((rows_warps, forward_keys, rows_keys), (keys_warps, keys_rows), (groups, hopper_keys)) = (ATTENTION_ROWS, ATTENTION_KEYS, ATTENTION_HOPPER);
             let source = |_| {
                 format!(
-                    "#define HEAD_W {width}\n#define ROWS_WARPS {rows_warps}\n#define FORWARD_KEYS {forward_keys}\n#define ROWS_KEYS {rows_keys}\n#define KEYS_WARPS {keys_warps}\n#define KEYS_ROWS {keys_rows}\n#define MAX_SEQUENCES {ATTENTION_SEQUENCES}\n{KERNELS_ATTENTION}"
+                    "#define HEAD_W {width}\n#define ROWS_WARPS {rows_warps}\n#define FORWARD_KEYS {forward_keys}\n#define ROWS_KEYS {rows_keys}\n#define KEYS_WARPS {keys_warps}\n#define KEYS_ROWS {keys_rows}\n#define HOPPER_GROUPS {groups}\n#define HOPPER_KEYS {hopper_keys}\n#define MAX_SEQUENCES {ATTENTION_SEQUENCES}\n{KERNELS_ATTENTION}"
                 )
             };
-            let module = MODULES.get_or_init(crate::device_cache::KeyedPtxModuleCache::new).get_or_compile(&self.ctx, (self.ctx.ordinal() << 16) | width, "attention", source)?;
+            let module = MODULES.get_or_init(crate::device_cache::KeyedPtxModuleCache::new).get_or_compile_specific(&self.ctx, (self.ctx.ordinal() << 16) | width, "attention", source)?;
             let f = module.load_function(name).gpu_ctx_with(|e| format!("attention kernel {name}: {e}"))?;
             let bytes = i32::try_from(shared).map_err(|_| shape(format!("{shared} bytes of shared memory")))?;
             f.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes).gpu_ctx("attention shared memory")?;
             Ok(f)
+        }
+
+        /// Whether the device is a Hopper one (compute capability 9.0), whose attention multiplies
+        /// by warpgroups.
+        fn hopper(&self) -> Result<bool, GpuError> {
+            use cudarc::driver::sys::CUdevice_attribute::{CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR};
+            let major = self.ctx.attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR).gpu_ctx("device capability")?;
+            let minor = self.ctx.attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR).gpu_ctx("device capability")?;
+            Ok((major, minor) == (9, 0))
         }
 
         /// One attention launch over `sequences` (at most [`ATTENTION_SEQUENCES`]) with `heads` heads
@@ -5034,9 +5047,15 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         pub(super) fn causal_attention(&self, y: &Tensor, layout: super::HeadLayout, sequences: &[std::ops::Range<usize>], scale: f64) -> Result<(Tensor, Tensor), GpuError> {
             let Data::CudaBf16(yh) = &y.data else { return Err(mismatch(&y.data)) };
             let (w, padded) = (layout.width, attention_width(layout.width)?);
-            let (warps, keys, _) = ATTENTION_ROWS;
-            let shared = (16 * warps + 2 * keys) * padded * 2;
-            let f = self.attention_kernel(w, "attention_forward", shared)?;
+            // Hopper multiplies by warpgroups (64 rows each); the others by warps (16 rows each).
+            let ((name, threads, tile), shared) = if self.hopper()? {
+                let (groups, keys) = ATTENTION_HOPPER;
+                (("attention_forward_sm90", 128 * groups, 64 * groups), (64 * groups + 4 * keys) * padded * 2 + 1024)
+            } else {
+                let (warps, keys, _) = ATTENTION_ROWS;
+                (("attention_forward", 32 * warps, 16 * warps), (16 * warps + 2 * keys) * padded * 2)
+            };
+            let f = self.attention_kernel(w, name, shared)?;
             // Rows outside every sequence are zeros.
             let covered = sequences.iter().map(ExactSizeIterator::len).sum::<usize>() == y.rows;
             let (n_out, n_lse) = (y.rows * layout.queries * w, y.rows * layout.queries);
@@ -5050,7 +5069,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let longest = sequences.iter().map(ExactSizeIterator::len).max().unwrap_or(0);
             let group = layout.queries / layout.keys;
             for chunk in sequences.chunks(ATTENTION_SEQUENCES) {
-                let Some((table, cfg)) = self.attention_config(chunk, layout.queries, (32 * warps, 16 * warps, shared), (longest * 4 * padded, group))? else { continue };
+                let Some((table, cfg)) = self.attention_config(chunk, layout.queries, (threads, tile, shared), (longest * 4 * padded, group))? else { continue };
                 // SAFETY: the table's sequences are disjoint row ranges of y (checked by the caller);
                 // each block writes its own query rows of `out` and `lse`.
                 unsafe { self.stream.launch_builder(&f).arg(&table).arg(&hq).arg(&hk).arg(&scale_log2).arg(yh).arg(&mut out).arg(&mut lse).launch(cfg) }.gpu_ctx("attention forward")?;
