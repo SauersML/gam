@@ -449,7 +449,9 @@ fn main() -> Result<(), String> {
                     experiments.push(at(None));
                 }
             }
-            let scored = interchange.evaluate(&batch, &experiments, false)?;
+            // The directions of P's own reads at the scored explanation.
+            let design = interchange::design(&interchange.models().1, &variables, &experiments)?;
+            let scored = interchange.evaluate(&batch, &experiments, &design, false)?;
             for (e, bits) in experiments.iter().zip(&scored.bits) {
                 let family = match &e.patch {
                     None => {

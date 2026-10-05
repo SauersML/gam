@@ -16,7 +16,7 @@
 use super::artifact::Artifact;
 use super::device_program::DeviceProgram;
 use super::device_program_tests::{devices, fixture_sized, noise};
-use super::interchange::{Batch, Design, Experiment, FixedHead, Interchange, Model, Patch, ReadVariable, Teacher, design, evaluate, sample, sites};
+use super::interchange::{Batch, Design, Experiment, FixedHead, Interchange, Model, Patch, ReadVariable, Targets, census, design, evaluate, fingerprint, sample, sites, targets};
 use super::operator_program::{FamilyInputs, Operator, OperatorProgram, SequenceLayout, SlotValues, exact_precision};
 use super::resident_causal_fit::fixed_head_target::Head;
 use super::run_check::{layer_nodes, split_sites};
@@ -251,8 +251,8 @@ fn every_experiment_matches_the_host_reference() {
         let programs = programs(&device, &f);
         let (m, p) = models(&f, &programs);
         let design = design(&p, &f.variables, &experiments).expect("design");
-        let teacher = Teacher::new(&m, &programs.head, &f.batch, &f.variables, &experiments).expect("teacher");
-        let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &teacher, &experiments, &design, false).expect("evaluate");
+        let targets = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
+        let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, &design, false).expect("evaluate");
         for (e, bits) in experiments.iter().zip(&evaluation.bits) {
             let expected = reference(&f, e);
             assert_eq!(bits.len(), LENGTH - e.position);
@@ -277,10 +277,10 @@ fn the_model_explains_itself_exactly() {
     let head = FixedHead::new(&device, &f.m.flat, &f.m.flat, 4).expect("head");
     let mm = Model::new(&m, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &[]).expect("M model");
     let pm = Model::new(&p, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &f.trainable).expect("P model");
-    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(5), f.batch.base.len(), LAYERS, f.variables.len(), LENGTH);
+    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(5), f.batch.base.len(), &f.variables, &[true; 2 * LAYERS], LENGTH).expect("sample");
     let design = design(&pm, &f.variables, &experiments).expect("design");
-    let teacher = Teacher::new(&mm, &head, &f.batch, &f.variables, &experiments).expect("teacher");
-    let evaluation = evaluate(&mm, &pm, &head, &f.batch, &teacher, &experiments, &design, true).expect("evaluate");
+    let targets = targets(&mm, &head, &f.batch, &experiments, &design).expect("targets");
+    let evaluation = evaluate(&mm, &pm, &head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
     assert!(evaluation.bits.iter().flatten().all(|b| b.abs() <= 1e-12), "{:?}", evaluation.bits);
     for g in evaluation.gradient.values() {
         assert!(device.download(g).expect("gradient").iter().all(|v| v.abs() <= 1e-9));
@@ -291,8 +291,8 @@ fn the_model_explains_itself_exactly() {
 fn total_at(device: &Device, f: &Fixture, programs: &mut Programs, op: usize, value: &Array2<f64>, experiments: &[Experiment], design: &Design) -> f64 {
     programs.p.replace_dense_parameter(op, device.upload(value.view()).expect("upload")).expect("replace");
     let (m, p) = models(f, programs);
-    let teacher = Teacher::new(&m, &programs.head, &f.batch, &f.variables, experiments).expect("teacher");
-    let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &teacher, experiments, design, false).expect("evaluate");
+    let targets = targets(&m, &programs.head, &f.batch, experiments, design).expect("targets");
+    let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &targets, experiments, design, false).expect("evaluate");
     evaluation.bits.iter().flatten().sum()
 }
 
@@ -308,8 +308,8 @@ fn the_gradient_matches_central_differences() {
     let (design, gradient) = {
         let (m, p) = models(&f, &programs);
         let design = design(&p, &f.variables, &experiments).expect("design");
-        let teacher = Teacher::new(&m, &programs.head, &f.batch, &f.variables, &experiments).expect("teacher");
-        let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &teacher, &experiments, &design, true).expect("evaluate");
+        let targets = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
+        let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
         (design, evaluation.gradient)
     };
     let delta = 1e-5;
@@ -330,29 +330,64 @@ fn the_gradient_matches_central_differences() {
 }
 
 #[test]
-fn sampling_draws_one_clean_and_one_patched_experiment_per_base() {
-    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(11), 600, 3, 7, 9);
-    assert_eq!(experiments.len(), 1200);
-    for (n, pair) in experiments.chunks(2).enumerate() {
-        assert_eq!((pair[0].base, pair[1].base, pair[1].source), (n, n, n));
+fn sampling_draws_each_family_with_its_stated_weight() {
+    // Six blocks, three read variables at each except block 1, which has none; blocks 1 and 3
+    // leave a complement. Per base: P alone with probability 1/2; the block uniform; at block 1
+    // the complement, at block 3 the complement with probability 1/2, elsewhere a read.
+    let variables: Vec<ReadVariable> = (0..6).filter(|b| *b != 1).flat_map(|b| (0..3).map(move |i| ReadVariable { block: b, parts: vec![(b, i..i + 1)] })).collect();
+    let complements = [false, true, false, true, false, false];
+    let n = 6000;
+    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(11), n, &variables, &complements, 9).expect("sample");
+    assert_eq!(experiments.len(), 2 * n);
+    for (i, pair) in experiments.chunks(2).enumerate() {
+        assert_eq!((pair[0].base, pair[1].base, pair[1].source), (i, i, i));
         assert!(pair[0].patch.is_none() && pair[1].patch.is_some());
         // The patched experiment shares its base's hybrid; the clean one is scored everywhere.
         assert_eq!(pair[0].explained, pair[1].explained);
         assert!(pair[0].position == 0 && pair[1].position < 9);
-        assert!(pair.iter().all(|e| e.explained.len() == 6 && e.explained.contains(&true)));
-        match &pair[1].patch {
-            Some(Patch::Read { variable }) => assert!(*variable < 7),
-            Some(Patch::Complement { blocks }) => assert!(blocks.len() == 1 && blocks[0] < 6),
-            None => unreachable!("a patched experiment"),
+        assert!(pair[0].explained.len() == 6 && pair[0].explained.contains(&true));
+        if let Some(Patch::Complement { blocks }) = &pair[1].patch {
+            assert!(blocks.len() == 1 && complements[blocks[0]]);
         }
     }
-    assert!(experiments.iter().any(|e| matches!(e.patch, Some(Patch::Complement { .. }))));
+    // Each count within five standard deviations of its binomial expectation.
+    let within = |count: usize, p: f64| {
+        let (mean, sd) = (n as f64 * p, (n as f64 * p * (1.0 - p)).sqrt());
+        assert!((count as f64 - mean).abs() <= 5.0 * sd, "{count} against {mean} ± {sd}");
+    };
+    let counts = census(&experiments, &variables);
+    // A hybrid draw is P alone with probability 1/6 (its size uniform in 1..=6).
+    within(counts["clean_alone"], 0.5 + 0.5 / 6.0);
+    within(counts["complement"], 1.0 / 6.0 + 0.5 / 6.0);
+    within(counts["read_attention"], 3.0 / 6.0);
+    within(counts["read_mlp"], 0.5 / 6.0 + 1.0 / 6.0);
     // Every size 1..=6 appears, and a non-prefix set does: the hybrids are not only cuts.
     let sizes: std::collections::BTreeSet<usize> = experiments.iter().map(|e| e.explained.iter().filter(|x| **x).count()).collect();
     assert_eq!(sizes, (1..=6).collect());
     assert!(experiments.iter().any(|e| e.explained.windows(2).any(|w| !w[0] && w[1])));
     let positions: std::collections::BTreeSet<usize> = experiments.iter().filter(|e| e.patch.is_some()).map(|e| e.position).collect();
     assert_eq!(positions, (0..9).collect());
+}
+
+#[test]
+fn targets_written_and_read_score_alike() {
+    let f = fixture();
+    let device = Device::host();
+    let experiments = experiments(&f);
+    let programs = programs(&device, &f);
+    let (m, p) = models(&f, &programs);
+    let design = design(&p, &f.variables, &experiments).expect("design");
+    let made = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
+    let path = std::env::temp_dir().join(format!("interchange_targets_{}.bin", std::process::id()));
+    let key = fingerprint(&f.batch, &experiments);
+    made.write(&device, &path, key).expect("write");
+    let read = Targets::read(&device, &programs.head, &path, key).expect("read").expect("the same experiments");
+    // Targets made for other experiments are not read back.
+    assert!(Targets::read(&device, &programs.head, &path, fingerprint(&f.batch, &experiments[1..])).expect("read").is_none());
+    std::fs::remove_file(&path).expect("remove");
+    let a = evaluate(&m, &p, &programs.head, &f.batch, &made, &experiments, &design, false).expect("evaluate").bits;
+    let b = evaluate(&m, &p, &programs.head, &f.batch, &read, &experiments, &design, false).expect("evaluate").bits;
+    assert_eq!(a, b);
 }
 
 #[test]
@@ -385,9 +420,10 @@ fn directions_from_host_values_are_those_of_the_loaded_explanation() {
     x.load(&values).expect("load");
     let (m, p) = x.models();
     let loaded = design(&p, &f.variables, &experiments).expect("design");
-    let teacher = Teacher::new(&m, x.head(), &f.batch, &f.variables, &experiments).expect("teacher");
-    let from_values = evaluate(&m, &p, x.head(), &f.batch, &teacher, &experiments, &at_values, false).expect("evaluate").bits;
-    let from_device = evaluate(&m, &p, x.head(), &f.batch, &teacher, &experiments, &loaded, false).expect("evaluate").bits;
+    let at_targets = targets(&m, x.head(), &f.batch, &experiments, &at_values).expect("targets");
+    let loaded_targets = targets(&m, x.head(), &f.batch, &experiments, &loaded).expect("targets");
+    let from_values = evaluate(&m, &p, x.head(), &f.batch, &at_targets, &experiments, &at_values, false).expect("evaluate").bits;
+    let from_device = evaluate(&m, &p, x.head(), &f.batch, &loaded_targets, &experiments, &loaded, false).expect("evaluate").bits;
     assert_eq!(from_values, from_device);
     for (e, bits) in experiments.iter().zip(&from_values) {
         for (a, b) in bits.iter().zip(reference(&f, e)) {

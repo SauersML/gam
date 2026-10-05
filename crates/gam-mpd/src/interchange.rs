@@ -218,7 +218,7 @@ pub fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<Rea
 /// `blocks` (ascending) the complement of every read there. The complements at different blocks
 /// are distinct variables, so patching several at once is one joint intervention whose order does
 /// not matter; cancellation between blocks shows only under such joint patches.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Patch {
     Read { variable: usize },
     Complement { blocks: Vec<usize> },
@@ -227,7 +227,7 @@ pub enum Patch {
 /// One experiment: base and source sequences (indices into the batch's), the hybrid (per block
 /// whether `P_e` runs `P`'s version of it), at most one patch, and its position: the row the patch
 /// replaces and the first scored token (0 for an unpatched experiment, scored everywhere).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Experiment {
     pub base: usize,
     pub source: usize,
@@ -274,22 +274,60 @@ pub fn hybrid_of(rng: &mut impl RngExt, blocks: usize, k: usize) -> Vec<bool> {
     explained
 }
 
-/// Per base sequence `n < sequences` (each `length` tokens), one clean experiment under a hybrid
-/// drawn by [`hybrid`], and one patched with source sequence `n` under the same hybrid: the patch
-/// drawn uniformly over the union of the `variables` read variables and the `2 layers` blocks (a
-/// complement patch), its position uniformly over the `length` positions.
-pub fn sample(rng: &mut impl RngExt, sequences: usize, layers: usize, variables: usize, length: usize) -> Vec<Experiment> {
-    let blocks = 2 * layers;
+/// Per base sequence `n < sequences` (each `length` tokens) one clean experiment and one patched
+/// with source sequence `n`, drawn in stages, each stage's weight stated:
+///
+/// * the clean experiment's hybrid: with probability ½ `P` alone (every block `P`'s: the
+///   explanation as delivered), else a hybrid drawn by [`hybrid`] (`P`'s parts in `M`'s place);
+/// * the patched experiment, under the same hybrid: its block uniform over the `complements.len()`
+///   blocks; a complement patch with probability ½ where the block's reads leave a nonempty
+///   complement (`complements`), else a read patch of one of the block's `variables`, uniform
+///   among them; its position uniform over the `length` positions.
+///
+/// A uniform draw over all variables would make nearly every patch an MLP reader's (they are
+/// almost all of the variables) and complement patches rare.
+pub fn sample(rng: &mut impl RngExt, sequences: usize, variables: &[ReadVariable], complements: &[bool], length: usize) -> Result<Vec<Experiment>, String> {
+    let blocks = complements.len();
+    let mut at_block: Vec<Vec<usize>> = vec![Vec::new(); blocks];
+    for (i, v) in variables.iter().enumerate() {
+        at_block.get_mut(v.block).ok_or_else(|| error("a read variable outside the blocks"))?.push(i);
+    }
+    if blocks == 0 || length == 0 || (0..blocks).any(|b| at_block[b].is_empty() && !complements[b]) {
+        return Err(error("every block needs a read variable or a complement to patch, and sequences need tokens"));
+    }
     let mut out = Vec::with_capacity(2 * sequences);
     for n in 0..sequences {
-        let explained = hybrid(rng, blocks);
-        let u = rng.random_range(0..variables + blocks);
-        let patch = if u < variables { Patch::Read { variable: u } } else { Patch::Complement { blocks: vec![u - variables] } };
+        let explained = if rng.random_range(0..2) == 0 { vec![true; blocks] } else { hybrid(rng, blocks) };
+        let block = rng.random_range(0..blocks);
+        let complement = complements[block] && (at_block[block].is_empty() || rng.random_range(0..2) == 0);
+        let patch = if complement {
+            Patch::Complement { blocks: vec![block] }
+        } else {
+            Patch::Read { variable: at_block[block][rng.random_range(0..at_block[block].len())] }
+        };
         let position = rng.random_range(0..length);
         out.push(Experiment { base: n, source: n, explained: explained.clone(), patch: None, position: 0 });
         out.push(Experiment { base: n, source: n, explained, patch: Some(patch), position });
     }
-    out
+    Ok(out)
+}
+
+/// The realized count of each family among `experiments`: clean with `P` alone, clean under a
+/// hybrid, read patches of attention and of MLP variables, and complement patches.
+pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMap<&'static str, usize> {
+    let mut counts: BTreeMap<&'static str, usize> =
+        ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "complement"].into_iter().map(|k| (k, 0)).collect();
+    for e in experiments {
+        let family = match &e.patch {
+            None if e.explained.iter().all(|x| *x) => "clean_alone",
+            None => "clean_hybrid",
+            Some(Patch::Read { variable }) if variables.get(*variable).is_some_and(|v| v.block % 2 == 0) => "read_attention",
+            Some(Patch::Read { .. }) => "read_mlp",
+            Some(Patch::Complement { .. }) => "complement",
+        };
+        *counts.entry(family).or_default() += 1;
+    }
+    counts
 }
 
 /// Base and source token sequences, all of one length.
@@ -712,23 +750,23 @@ fn check(e: &Experiment, batch: &Batch, blocks: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// `M`'s clean runs on a batch, made once per batch: its compact targets on the bases, its streams
-/// entering the patched blocks on the bases, and its reads at the patched blocks on the sources.
-pub struct Teacher {
+/// `M`'s clean runs on a batch: its compact targets on the bases, its streams entering the patched
+/// blocks on the bases, and its reads at the patched blocks on the sources.
+struct Teacher {
     clean: Vec<Target>,
     entries: BTreeMap<(usize, usize), Tensor>,
     reads: BTreeMap<(usize, usize), Tensor>,
 }
 
 impl Teacher {
-    pub fn new(m: &Model, head: &FixedHead, batch: &Batch, variables: &[ReadVariable], experiments: &[Experiment]) -> Result<Self, String> {
+    fn new(m: &Model, head: &FixedHead, batch: &Batch, experiments: &[Experiment], design: &Design) -> Result<Self, String> {
         let d = m.program.device();
         let blocks = m.blocks();
         let mut base_sites: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); batch.base.len()];
         let mut source_sites: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-        for e in experiments {
+        for (e, bases) in experiments.iter().zip(&design.bases) {
             check(e, batch, blocks)?;
-            let patched = e.blocks(variables)?;
+            let patched: Vec<usize> = bases.iter().map(|b| b.block).collect();
             if patched.iter().any(|b| *b >= blocks) {
                 return Err(error("a patch of an unknown block"));
             }
@@ -773,30 +811,25 @@ impl Teacher {
     }
 }
 
-/// The experiments' data term and its gradient.
-pub struct Evaluation {
-    /// Per experiment, per base token, `KL(M_e ‖ P_e)` in bits.
-    pub bits: Vec<Vec<f64>>,
-    /// The gradient of the sum of `bits` in each of `P`'s trainable operators, on the device (empty
-    /// when not asked for).
-    pub gradient: BTreeMap<usize, Tensor>,
+/// `M`'s compact statistics for a batch's experiments, per experiment from its position on: the
+/// targets every score of `P` on them is measured against. They do not depend on `P`, so a fit
+/// makes them once per batch ([`targets`]) and keeps them ([`Targets::write`], [`Targets::read`]).
+pub struct Targets {
+    rows: Vec<Target>,
 }
 
-/// `KL(M_e ‖ P_e)` per token for each of `experiments` on `batch` (module note), at `P`'s current
-/// parameters and the patch directions of `design`, and with `gradient` its sum's gradient in
-/// `P`'s trainable operators. `teacher` holds `M`'s clean runs on `batch` for these experiments.
-pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: &Teacher, experiments: &[Experiment], design: &Design, gradient: bool) -> Result<Evaluation, String> {
-    let d = p.program.device();
-    let (blocks, length, width) = (p.blocks(), batch.length, p.width());
-    if m.blocks() != blocks || m.width() != width || design.bases.len() != experiments.len() || teacher.clean.len() != batch.base.len() {
-        return Err(error("models, design or teacher do not match"));
+/// `M`'s targets for `experiments` on `batch` under the patch directions of `design`: its clean
+/// runs on the bases and the sources, then `M` under each experiment's patches from the first
+/// patched block on.
+pub fn targets(m: &Model, head: &FixedHead, batch: &Batch, experiments: &[Experiment], design: &Design) -> Result<Targets, String> {
+    let d = m.program.device();
+    let (blocks, length) = (m.blocks(), batch.length);
+    if design.bases.len() != experiments.len() {
+        return Err(error("the design does not match the experiments"));
     }
-    for e in experiments {
-        check(e, batch, blocks)?;
-    }
+    let teacher = Teacher::new(m, head, batch, experiments, design)?;
     let native = vec![false; blocks];
     let patched: Vec<usize> = (0..experiments.len()).filter(|i| !design.bases[*i].is_empty()).collect();
-    // M under the patches, from the first patched block on.
     let mut lanes = Vec::with_capacity(patched.len());
     for &i in &patched {
         let (e, bases) = (&experiments[i], &design.bases[i]);
@@ -812,13 +845,126 @@ pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: 
         let entry = entry.map(|t| d.copy(t).map_err(error)).transpose()?;
         lanes.push(Lane { tokens: &batch.base[e.base], blocks: start..blocks, explained: &native, entry, patches, position: e.position, captures: vec![] });
     }
-    let run = forward([p, m], &mut lanes, length, false)?;
-    let mut targets: BTreeMap<usize, Target> = BTreeMap::new();
+    let run = forward([m, m], &mut lanes, length, false)?;
+    let mut patched_targets: BTreeMap<usize, Target> = BTreeMap::new();
     for (&i, output) in patched.iter().zip(&run.outputs) {
         let t0 = experiments[i].position;
-        targets.insert(i, head.target(d, &d.rows_of(output, t0, length - t0).map_err(error)?, m.program.arithmetic())?);
+        patched_targets.insert(i, head.target(d, &d.rows_of(output, t0, length - t0).map_err(error)?, m.program.arithmetic())?);
     }
-    drop(run);
+    let mut rows = Vec::with_capacity(experiments.len());
+    for (i, e) in experiments.iter().enumerate() {
+        rows.push(match patched_targets.remove(&i) {
+            Some(t) => t,
+            None => {
+                let clean = teacher.clean.get(e.base).ok_or_else(|| error("the teacher has no clean target"))?;
+                let scored = length - e.position;
+                let mu = d.rows_of(&clean.mu, e.position, scored).map_err(error)?;
+                Target { mu: Arc::new(mu), entropy: clean.entropy[e.position..].to_vec(), head: Arc::clone(&head.head), scored: None }
+            }
+        });
+    }
+    Ok(Targets { rows })
+}
+
+/// A fingerprint of `experiments` on `batch` (their tokens, hybrids, patches and positions), so that
+/// kept targets are read back only for the experiments they were made for.
+pub fn fingerprint(batch: &Batch, experiments: &[Experiment]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (&batch.base, &batch.source, experiments).hash(&mut hasher);
+    hasher.finish()
+}
+
+impl Targets {
+    /// Write the targets to `path` with the `fingerprint` of their experiments: the fingerprint, then
+    /// per experiment its rows and width, `μ` row by row in the device's storage precision (four
+    /// bytes per value in f32 storage, eight in float64) and the rows' `Σ p log p` in float64, all
+    /// little-endian.
+    pub fn write(&self, d: &Device, path: &std::path::Path, fingerprint: u64) -> Result<(), String> {
+        use std::io::Write;
+        let partial = path.with_extension("partial");
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&partial).map_err(error)?);
+        let wide = d.float64();
+        file.write_all(&fingerprint.to_le_bytes()).map_err(error)?;
+        file.write_all(&[u8::from(wide)]).map_err(error)?;
+        file.write_all(&(self.rows.len() as u64).to_le_bytes()).map_err(error)?;
+        for t in &self.rows {
+            let mu = d.download(&t.mu).map_err(error)?;
+            file.write_all(&(mu.nrows() as u64).to_le_bytes()).map_err(error)?;
+            file.write_all(&(mu.ncols() as u64).to_le_bytes()).map_err(error)?;
+            for v in mu.iter() {
+                if wide {
+                    file.write_all(&v.to_le_bytes()).map_err(error)?;
+                } else {
+                    file.write_all(&(*v as f32).to_le_bytes()).map_err(error)?;
+                }
+            }
+            for v in &t.entropy {
+                file.write_all(&v.to_le_bytes()).map_err(error)?;
+            }
+        }
+        file.into_inner().map_err(error)?.sync_all().map_err(error)?;
+        std::fs::rename(&partial, path).map_err(error)
+    }
+
+    /// The targets [`Targets::write`] wrote to `path`, on the device `d` of `head`; none when they
+    /// were made for other experiments than those of `fingerprint`.
+    pub fn read(d: &Device, head: &FixedHead, path: &std::path::Path, fingerprint: u64) -> Result<Option<Self>, String> {
+        let bytes = std::fs::read(path).map_err(|e| error(format!("{}: {e}", path.display())))?;
+        let mut at = 0usize;
+        let mut take = |n: usize| -> Result<&[u8], String> {
+            let part = bytes.get(at..at + n).ok_or_else(|| error(format!("{}: truncated targets", path.display())))?;
+            at += n;
+            Ok(part)
+        };
+        let word = |b: &[u8]| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+        if word(take(8)?) != fingerprint {
+            return Ok(None);
+        }
+        let wide = take(1)?[0] == 1;
+        let count = word(take(8)?) as usize;
+        let mut rows = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (r, c) = (word(take(8)?) as usize, word(take(8)?) as usize);
+            let values: Vec<f64> = if wide {
+                take(8 * r * c)?.chunks_exact(8).map(word).map(f64::from_bits).collect()
+            } else {
+                take(4 * r * c)?.chunks_exact(4).map(|b| f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))).collect()
+            };
+            let entropy = take(8 * r)?.chunks_exact(8).map(word).map(f64::from_bits).collect();
+            let mu = d.upload_vec(r, c, values).map_err(error)?;
+            rows.push(Target { mu: Arc::new(mu), entropy, head: Arc::clone(&head.head), scored: None });
+        }
+        Ok(Some(Self { rows }))
+    }
+}
+
+/// The experiments' data term and its gradient.
+pub struct Evaluation {
+    /// Per experiment, per base token from its position on, `KL(M_e ‖ P_e)` in bits.
+    pub bits: Vec<Vec<f64>>,
+    /// The gradient of the sum of `bits` in each of `P`'s trainable operators, on the device (empty
+    /// when not asked for).
+    pub gradient: BTreeMap<usize, Tensor>,
+}
+
+/// `KL(M_e ‖ P_e)` per token for each of `experiments` on `batch` from its position on (module
+/// note), at `P`'s current parameters and the patch directions of `design`, against `M`'s
+/// `targets` for them, and with `gradient` its sum's gradient in `P`'s trainable operators. `M`
+/// runs here only as the hybrids' blocks it keeps.
+pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, targets: &Targets, experiments: &[Experiment], design: &Design, gradient: bool) -> Result<Evaluation, String> {
+    let d = p.program.device();
+    let (blocks, length, width) = (p.blocks(), batch.length, p.width());
+    if m.blocks() != blocks || m.width() != width || design.bases.len() != experiments.len() || targets.rows.len() != experiments.len() {
+        return Err(error("models, design or targets do not match"));
+    }
+    for (e, t) in experiments.iter().zip(&targets.rows) {
+        check(e, batch, blocks)?;
+        if t.entropy.len() != length - e.position {
+            return Err(error("a target of other rows than its experiment's"));
+        }
+    }
+    let patched: Vec<usize> = (0..experiments.len()).filter(|i| !design.bases[*i].is_empty()).collect();
     // The hybrids on the sources, up to the last patched block.
     let mut sources: Vec<Lane> = patched
         .iter()
@@ -857,20 +1003,11 @@ pub fn evaluate(m: &Model, p: &Model, head: &FixedHead, batch: &Batch, teacher: 
     let mut hidden = d.zeros(rows, width).map_err(error)?;
     let mut mu = d.zeros(rows, width).map_err(error)?;
     let mut entropy = Vec::with_capacity(rows);
-    for ((i, e), output) in experiments.iter().enumerate().zip(&base_run.outputs) {
+    for (((i, e), output), t) in experiments.iter().enumerate().zip(&base_run.outputs).zip(&targets.rows) {
         let scored = length - e.position;
         d.set_rows(&mut hidden, starts[i], &d.rows_of(output, e.position, scored).map_err(error)?).map_err(error)?;
-        match targets.get(&i) {
-            Some(t) => {
-                d.set_rows(&mut mu, starts[i], &t.mu).map_err(error)?;
-                entropy.extend_from_slice(&t.entropy);
-            }
-            None => {
-                let t = teacher.clean.get(e.base).ok_or_else(|| error("the teacher has no clean target"))?;
-                d.set_rows(&mut mu, starts[i], &d.rows_of(&t.mu, e.position, scored).map_err(error)?).map_err(error)?;
-                entropy.extend_from_slice(&t.entropy[e.position..]);
-            }
-        }
+        d.set_rows(&mut mu, starts[i], &t.mu).map_err(error)?;
+        entropy.extend_from_slice(&t.entropy);
     }
     let target = Target { mu: Arc::new(mu), entropy, head: Arc::clone(&head.head), scored: None };
     let (nats, seed) = head.resident.score(d, &hidden, &target, gradient, p.program.arithmetic())?;
@@ -990,16 +1127,51 @@ impl Interchange {
         if values.len() != self.trainable.len() {
             return Err(error("one value per trainable operator required"));
         }
+        design_with(self.p.device(), self.m_sites.entries.len(), variables, experiments, |op, rows| self.host_rows(values, op, rows))
+    }
+
+    /// Rows `rows` of trainable operator `op` in `values` (in the order given to
+    /// [`Interchange::new`]).
+    fn host_rows(&self, values: &[ndarray::Array2<f64>], op: usize, rows: &Range<usize>) -> Result<ndarray::Array2<f64>, String> {
         let width = self.p.widths()[self.p.hidden()];
-        let rows_of = |op: usize, rows: &Range<usize>| -> Result<ndarray::Array2<f64>, String> {
-            let at = self.trainable.iter().position(|t| *t == op).ok_or_else(|| error("a read variable outside the trainable operators"))?;
-            let all = &values[at];
-            if rows.end > all.nrows() || rows.is_empty() || all.ncols() != width {
-                return Err(error("a read variable outside its operator"));
-            }
-            Ok(all.slice(s![rows.clone(), ..]).to_owned())
-        };
-        design_with(self.p.device(), self.m_sites.entries.len(), variables, experiments, rows_of)
+        let at = self.trainable.iter().position(|t| *t == op).ok_or_else(|| error("a read variable outside the trainable operators"))?;
+        let all = &values[at];
+        if rows.end > all.nrows() || rows.is_empty() || all.ncols() != width {
+            return Err(error("a read variable outside its operator"));
+        }
+        Ok(all.slice(s![rows.clone(), ..]).to_owned())
+    }
+
+    /// Per block, whether the reads of `variables` there, at the trainable operators' values
+    /// `values`, leave a nonempty complement: their span (resolved from zero by its rounding band)
+    /// is not the whole stream.
+    pub fn complements(&self, variables: &[ReadVariable], values: &[ndarray::Array2<f64>]) -> Result<Vec<bool>, String> {
+        if values.len() != self.trainable.len() {
+            return Err(error("one value per trainable operator required"));
+        }
+        let width = self.p.widths()[self.p.hidden()];
+        (0..self.m_sites.entries.len())
+            .map(|b| {
+                let mut parts = Vec::new();
+                for v in variables.iter().filter(|v| v.block == b) {
+                    for (op, rows) in &v.parts {
+                        parts.push(self.host_rows(values, *op, rows)?);
+                    }
+                }
+                if parts.is_empty() {
+                    return Ok(true);
+                }
+                let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
+                let rank = span(ndarray::concatenate(Axis(0), &views).map_err(error)?.view())?.map_or(0, |q| q.ncols());
+                Ok(rank < width)
+            })
+            .collect()
+    }
+
+    /// `M`'s targets for `experiments` on `batch` under `design` ([`targets`]).
+    pub fn targets(&self, batch: &Batch, experiments: &[Experiment], design: &Design) -> Result<Targets, String> {
+        let (m, _) = self.models();
+        targets(&m, &self.head, batch, experiments, design)
     }
 
     /// `P`'s program, so that a fit writes each weight sample into its resident parameters.
@@ -1007,12 +1179,11 @@ impl Interchange {
         &mut self.p
     }
 
-    /// [`Interchange::evaluate`] with the gradient left on the device, per trainable operator.
-    pub fn evaluate_resident(&self, batch: &Batch, experiments: &[Experiment], gradient: bool) -> Result<Evaluation, String> {
+    /// `P`'s score on `experiments` against `targets` ([`evaluate`]), the gradient left on the
+    /// device per trainable operator.
+    pub fn evaluate_resident(&self, batch: &Batch, experiments: &[Experiment], design: &Design, targets: &Targets, gradient: bool) -> Result<Evaluation, String> {
         let (m, p) = self.models();
-        let directions = design(&p, &self.variables, experiments)?;
-        let teacher = Teacher::new(&m, &self.head, batch, &self.variables, experiments)?;
-        evaluate(&m, &p, &self.head, batch, &teacher, experiments, &directions, gradient)
+        evaluate(&m, &p, &self.head, batch, targets, experiments, design, gradient)
     }
 
     /// Load `P`'s trainable operators, in the order given to [`Interchange::new`].
@@ -1027,17 +1198,12 @@ impl Interchange {
         self.p.refresh_fused()
     }
 
-    /// Per base sequence `n < sequences` of `length` tokens, one unpatched and one patched
-    /// experiment ([`sample`]).
-    pub fn sample(&self, rng: &mut impl RngExt, sequences: usize, length: usize) -> Vec<Experiment> {
-        sample(rng, sequences, self.m_sites.entries.len() / 2, self.variables.len(), length)
-    }
-
-    /// `KL(M_e ‖ P_e)` per token for each of `experiments` on `batch` at `P`'s loaded parameters,
-    /// with the patch directions of `P`'s loaded reads, and with `gradient` its sum's gradient.
-    /// `M`'s clean runs are made once for the whole batch.
-    pub fn evaluate(&self, batch: &Batch, experiments: &[Experiment], gradient: bool) -> Result<Scored, String> {
-        let evaluation = self.evaluate_resident(batch, experiments, gradient)?;
+    /// `KL(M_e ‖ P_e)` per token for each of `experiments` on `batch` from its position on, at
+    /// `P`'s loaded parameters and the directions of `design`, with `M`'s targets made here, and
+    /// with `gradient` its sum's gradient downloaded per trainable operator.
+    pub fn evaluate(&self, batch: &Batch, experiments: &[Experiment], design: &Design, gradient: bool) -> Result<Scored, String> {
+        let targets = self.targets(batch, experiments, design)?;
+        let evaluation = self.evaluate_resident(batch, experiments, design, &targets, gradient)?;
         if !gradient {
             return Ok(Scored { bits: evaluation.bits, gradient: Vec::new() });
         }

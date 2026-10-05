@@ -15,7 +15,7 @@
 //!
 //! A step, as the fit takes it: the patch directions at the posterior mean (the means written into
 //! `P`, `interchange::design`), the weight sample written into `P`, `M`'s clean runs
-//! (`interchange::Teacher`), the experiments with the gradient (`interchange::evaluate`), the
+//! (`interchange::targets`), the experiments with the gradient (`interchange::evaluate`), the
 //! description `Σ_G KL_G`, and Adam's step in `(μ, ln σ)`. On the host path the means and the
 //! sample are drawn and uploaded from float64 host arrays, the gradient downloaded, and the
 //! derivatives, Adam's step and the description computed on the host (rayon), as `library_mdl`
@@ -30,7 +30,7 @@ use gam_mpd::{
     device_program::DeviceProgram,
     engine::log_to_stderr,
     import::{hugging_face_language_model, import_language_model},
-    interchange::{self, Batch, FixedHead, Model, ReadVariable, Teacher},
+    interchange::{self, Batch, FixedHead, Model, ReadVariable},
     library_mdl,
     operator_program::{OperatorProgram, SlotValues},
     run_check::{layer_nodes, split_sites},
@@ -318,7 +318,8 @@ fn main() -> Result<(), String> {
     };
     let zeros: BTreeMap<usize, gam_gpu::tensor::Tensor> =
         trainable.iter().zip(&start.mean).map(|(op, m)| Ok((*op, device.zeros(m.nrows(), m.ncols()).map_err(error)?))).collect::<Result<_, String>>()?;
-    let experiments = interchange::sample(&mut StdRng::seed_from_u64(1), sequences, layer_count, variables.len(), context);
+    // M's reads span every block's whole stream (vpd4l, Qwen3), so no block leaves a complement.
+    let experiments = interchange::sample(&mut StdRng::seed_from_u64(1), sequences, &variables, &vec![false; 2 * layer_count], context)?;
     let adam = Adam { mean_rate: 5e-5, log_sd_rate: 1e-2, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 };
     let scale = tokens as f64 / (experiments.len() * context) as f64 * std::f64::consts::LN_2;
     fn p_model<'a>(program: &'a DeviceProgram, (flat, streams, reads, trainable): (&OperatorProgram, &[usize], &[usize], &[usize])) -> Result<Model<'a>, String> {
@@ -347,8 +348,8 @@ fn main() -> Result<(), String> {
             timed(&device, s, "sample_loaded", || load(&mut p_program, &trainable, &theta))?;
             let evaluation = match (&scoring, &design) {
                 (Some((head, m)), Some(design)) => {
-                    let teacher = timed(&device, s, "teacher", || Teacher::new(m, head, &batch, &variables, &experiments))?;
-                    timed(&device, s, "evaluate", || interchange::evaluate(m, &p_model(&p_program, sites)?, head, &batch, &teacher, &experiments, design, true))?.gradient
+                    let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments, design))?;
+                    timed(&device, s, "evaluate", || interchange::evaluate(m, &p_model(&p_program, sites)?, head, &batch, &targets, &experiments, design, true))?.gradient
                 }
                 _ => zeros.iter().map(|(op, z)| Ok((*op, device.copy(z).map_err(error)?))).collect::<Result<BTreeMap<_, _>, String>>()?,
             };
@@ -380,8 +381,8 @@ fn main() -> Result<(), String> {
             timed(&device, s, "sample_loaded", || posterior.sample_into(&mut p_program, step as u64))?;
             let gradient = match (&scoring, &design) {
                 (Some((head, m)), Some(design)) => {
-                    let teacher = timed(&device, s, "teacher", || Teacher::new(m, head, &batch, &variables, &experiments))?;
-                    timed(&device, s, "evaluate", || interchange::evaluate(m, &p_model(&p_program, sites)?, head, &batch, &teacher, &experiments, design, true))?.gradient
+                    let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments, design))?;
+                    timed(&device, s, "evaluate", || interchange::evaluate(m, &p_model(&p_program, sites)?, head, &batch, &targets, &experiments, design, true))?.gradient
                 }
                 _ => zeros.iter().map(|(op, z)| Ok((*op, device.copy(z).map_err(error)?))).collect::<Result<BTreeMap<_, _>, String>>()?,
             };

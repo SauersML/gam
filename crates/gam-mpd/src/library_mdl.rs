@@ -50,15 +50,17 @@
 //!
 //! # The experiments
 //!
-//! The data are interchange experiments (`interchange`): per training base sequence, one clean
-//! experiment and one patched experiment (a read patch of one of the explanation's read variables
-//! or the complement patch of one block, drawn uniformly over their union), each with its own cut
-//! `ℓ` drawn uniformly on `1..=L`. A base's source is another training sequence, drawn uniformly.
-//! The batches, sources and draws are made once from the seed, so the training data are one fixed
-//! set of experiments while the explanation's read variables stay; a removal changes the
-//! variables, and the draws are made again from the same seeds over the variables that remain.
-//! The patch directions are data: each step takes them at the posterior mean `μ` (before the
-//! weight sample is loaded), and no gradient passes through them.
+//! The data are interchange experiments (`interchange`), one fixed collection drawn once from the
+//! seed: per training base sequence, one clean experiment and one patched experiment under the
+//! same hybrid, with the stated weights of `interchange::sample` (`P` alone or a random
+//! block-subset hybrid with probability ½ each; the patched block uniform over the `2L` blocks,
+//! then a complement where `M`'s reads leave one, else a read variable uniform within the block,
+//! then a position). A base's source is another training sequence, drawn uniformly. The variables
+//! and patch directions are `M`'s own reads (the library's start): the questions do not move as
+//! `P` learns or loses functions, so `F`, the convergence test and every removal comparison score
+//! the same experiments, and `M`'s targets for them are made once per batch and kept
+//! (`interchange::Targets`, one shard per batch next to the checkpoint). Experiments whose
+//! directions are `P`'s current reads are a separate held-out report, never the objective.
 //!
 //! # The fit
 //!
@@ -73,11 +75,9 @@
 //! (their information content). Prefix lengths are searched by bisection, `O(log n)` full training
 //! evaluations for `n` active groups, and the longest evaluated prefix that does not increase the
 //! sampled objective is removed. The objective is estimated over the whole training set with one
-//! common weight sample per batch for both sides of every comparison. Experiment identities and
-//! patch directions are held at the posterior before removal throughout that round. The order and
-//! the search are a proposal; acceptance never increases this round's sampled objective. After an
-//! accepted removal, training redefines the experiments over the surviving variables, so this is
-//! not a claim of monotonicity on one fixed dataset across rounds. Removal effects
+//! common weight sample per batch for both sides of every comparison, on the fixed collection. The
+//! order and the search are a proposal; acceptance never increases the sampled objective. Removal
+//! effects
 //! can cancel, so the objective need not be monotone in the prefix length and the search may miss a
 //! longer acceptable prefix; the next round, after the continuous fit converges again, proposes
 //! again. The fit alternates converging and removing until no removal is accepted.
@@ -96,7 +96,7 @@
 
 use crate::{
     artifact::{Argument, Artifact, Callee},
-    interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable},
+    interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable, Targets},
     operator_program::{
         FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, Provenance, Rule, SequenceLayout, SlotValues,
         exact_precision,
@@ -105,11 +105,19 @@ use crate::{
 };
 use gam_gpu::tensor::{Device, Op, Tensor};
 use gam_runtime::warm_start::Fingerprinter;
-use ndarray::{Array2, s};
+use ndarray::Array2;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, f64::consts::LN_2, io::Write, ops::Range, path::Path, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    f64::consts::LN_2,
+    io::Write,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -559,11 +567,6 @@ impl Posterior {
         self.costs().iter().sum()
     }
 
-    /// Whether an entry of rows `rows` of trainable operator `i` is in an active group.
-    fn holds(&self, i: usize, rows: Range<usize>) -> bool {
-        self.membership[i].slice(s![rows, ..]).iter().any(|g| self.active[*g as usize])
-    }
-
     /// The derivatives in `μ` and in `ln σ` of `data(θ) + Σ_G KL_G`, per trainable operator, from
     /// `data`'s gradient at the sample `θ = μ + σ ⊙ noise` (zero in removed groups).
     fn derivatives(&self, data: &[Array2<f64>], noise: &[Array2<f64>]) -> Vec<(Array2<f64>, Array2<f64>)> {
@@ -755,6 +758,9 @@ pub struct HeldOut {
     pub patched: Vec<Option<f64>>,
     pub read_patch: Option<f64>,
     pub complement_patch: Option<f64>,
+    /// The patched experiments with directions at `P`'s own reads (the posterior mean) instead of
+    /// `M`'s: adaptive questions, reported apart and never trained on.
+    pub adaptive_patch: Option<f64>,
     pub layers: Vec<LayerCount>,
 }
 
@@ -798,6 +804,9 @@ pub struct Report {
     pub training_sequences: usize,
     /// The scored tokens of every training experiment, `N`.
     pub scored_tokens: usize,
+    /// The realized count of each experiment family in the training collection
+    /// (`interchange::census`).
+    pub families: BTreeMap<String, usize>,
     pub groups: usize,
     pub parameters: usize,
     /// The held-out evaluation at the starting point.
@@ -846,11 +855,11 @@ impl Draw {
         Batch::new(pick(&self.bases), pick(&self.sources))
     }
 
-    /// Per base one clean and one patched experiment over `variables` read variables
-    /// (`interchange::sample`), from the batch's seed.
-    fn experiments(&self, sequences: &[Vec<u32>], layers: usize, variables: usize) -> Vec<Experiment> {
+    /// Per base one clean and one patched experiment over `variables`, complements where
+    /// `complements` (`interchange::sample`), from the batch's seed.
+    fn experiments(&self, sequences: &[Vec<u32>], variables: &[ReadVariable], complements: &[bool]) -> Result<Vec<Experiment>, String> {
         let length = self.bases.first().map_or(0, |b| sequences[*b].len());
-        interchange::sample(&mut StdRng::seed_from_u64(self.seed), self.bases.len(), layers, variables, length)
+        interchange::sample(&mut StdRng::seed_from_u64(self.seed), self.bases.len(), variables, complements, length)
     }
 }
 
@@ -932,18 +941,33 @@ struct Scorer {
     mlps: Vec<Mlp>,
     /// Each trainable operator's position in `Explanation::trainable`.
     position: BTreeMap<usize, usize>,
+    /// Per block, whether `M`'s reads there leave a nonempty complement.
+    complements: Vec<bool>,
+    /// `M`'s read variables and the library's starting values (`M`'s reads): the fixed variables
+    /// and directions of every experiment.
+    variables: Vec<ReadVariable>,
+    start: Vec<Array2<f64>>,
+    /// The directory of `M`'s target shards, when the fit keeps them.
+    shards: Option<PathBuf>,
 }
 
 impl Scorer {
-    fn new(device: &Device, native: &OperatorProgram, explanation: &Explanation, settings: &Settings) -> Result<Self, String> {
+    fn new(device: &Device, native: &OperatorProgram, explanation: &Explanation, settings: &Settings, shards: Option<PathBuf>) -> Result<Self, String> {
         let sites: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
         let reads = interchange::library_reads(&explanation.artifact.program, sites.len())?;
         let experiments =
             Interchange::new(device, native, &sites, &explanation.artifact, &explanation.trainable, reads, settings.numeric_bytes, settings.head_tile_rows)?;
+        // The library starts at M, so its starting values are M's reads.
+        let start: Vec<Array2<f64>> = explanation.trainable.iter().map(|op| explanation.artifact.program.operators[*op].matrix()).collect();
+        let complements = experiments.complements(experiments.variables(), &start)?;
+        let variables = experiments.variables().to_vec();
+        if let Some(dir) = &shards {
+            std::fs::create_dir_all(dir).map_err(error)?;
+        }
         let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
         let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
-        Ok(Self { experiments, mlps, position })
+        Ok(Self { experiments, mlps, position, complements, variables, start, shards })
     }
 
     fn layers(&self) -> usize {
@@ -954,39 +978,56 @@ impl Scorer {
         self.position.get(&operator).copied().ok_or_else(|| format!("operator {operator} is not trainable"))
     }
 
-    /// The explanation's read variables that hold an entry of an active group of `posterior`.
-    fn variables(&self, posterior: &Posterior) -> Result<Vec<ReadVariable>, String> {
-        let mut out = Vec::new();
-        for v in self.experiments.variables() {
-            let mut held = false;
-            for (op, rows) in &v.parts {
-                held |= posterior.holds(self.at(*op)?, rows.clone());
-            }
-            if held {
-                out.push(v.clone());
-            }
-        }
-        Ok(out)
+    /// The batch's experiments from `draw`: the fixed collection's for that batch.
+    fn experiments(&self, draw: &Draw, sequences: &[Vec<u32>]) -> Result<Vec<Experiment>, String> {
+        draw.experiments(sequences, &self.variables, &self.complements)
     }
 
-    /// `KL(M_e ‖ P_e)` per base token in bits for `experiments` on `batch` over `variables`, with
-    /// the patch directions at `mean` and the explanation at `theta` (at `mean` when none), and
-    /// with `gradient` the gradient of its sum in every trainable operator.
-    fn score(
+    /// `KL(M_e ‖ P_e)` per scored token in bits for `experiments` on `batch` at the explanation's
+    /// `theta`, with the fixed directions (`M`'s reads), and with `gradient` the gradient of its
+    /// sum in every trainable operator. `M`'s targets come from the shard `key` when the fit keeps
+    /// shards and it holds them for these experiments, else are made (and kept there).
+    fn score(&mut self, batch: &Batch, experiments: &[Experiment], theta: &[Array2<f64>], key: &str, gradient: bool) -> Result<(Vec<Vec<f64>>, Vec<Array2<f64>>), String> {
+        let design = self.experiments.design_at(&self.variables, experiments, &self.start)?;
+        let fingerprint = interchange::fingerprint(batch, experiments);
+        let path = self.shards.as_ref().map(|dir| dir.join(format!("{key}.bin")));
+        let kept = match &path {
+            Some(path) if path.exists() => Targets::read(self.experiments.models().0.program.device(), self.experiments.head(), path, fingerprint)?,
+            _ => None,
+        };
+        let targets = match kept {
+            Some(targets) => targets,
+            None => {
+                let targets = self.experiments.targets(batch, experiments, &design)?;
+                if let Some(path) = &path {
+                    targets.write(self.experiments.models().0.program.device(), path, fingerprint)?;
+                }
+                targets
+            }
+        };
+        self.evaluated(batch, experiments, theta, &design, &targets, gradient)
+    }
+
+    /// The patched `experiments`' divergence per scored token in bits at the explanation's `mean`,
+    /// with the directions of the explanation's own reads there: the adaptive family.
+    fn score_adaptive(&mut self, batch: &Batch, experiments: &[Experiment], mean: &[Array2<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        let design = self.experiments.design_at(&self.variables, experiments, mean)?;
+        let targets = self.experiments.targets(batch, experiments, &design)?;
+        Ok(self.evaluated(batch, experiments, mean, &design, &targets, false)?.0)
+    }
+
+    fn evaluated(
         &mut self,
         batch: &Batch,
         experiments: &[Experiment],
-        variables: &[ReadVariable],
-        mean: &[Array2<f64>],
-        theta: Option<&[Array2<f64>]>,
+        theta: &[Array2<f64>],
+        design: &interchange::Design,
+        targets: &Targets,
         gradient: bool,
     ) -> Result<(Vec<Vec<f64>>, Vec<Array2<f64>>), String> {
-        let design = self.experiments.design_at(variables, experiments, mean)?;
-        self.experiments.load(theta.unwrap_or(mean))?;
-        let (m, p) = self.experiments.models();
-        let head = self.experiments.head();
-        let teacher = interchange::Teacher::new(&m, head, batch, variables, experiments)?;
-        let evaluation = interchange::evaluate(&m, &p, head, batch, &teacher, experiments, &design, gradient)?;
+        self.experiments.load(theta)?;
+        let evaluation = self.experiments.evaluate_resident(batch, experiments, design, targets, gradient)?;
+        let p = self.experiments.models().1;
         if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
             return Err("nonfinite explanation divergence".into());
         }
@@ -994,8 +1035,8 @@ impl Scorer {
             return Ok((evaluation.bits, Vec::new()));
         }
         let d = p.program.device();
-        let mut gradients = Vec::with_capacity(mean.len());
-        for (op, values) in self.position.iter().map(|(op, i)| (*op, &mean[*i])) {
+        let mut gradients = Vec::with_capacity(theta.len());
+        for (op, values) in self.position.iter().map(|(op, i)| (*op, &theta[*i])) {
             gradients.push(match evaluation.gradient.get(&op) {
                 Some(g) => d.download(g).map_err(error)?,
                 None => Array2::zeros(values.dim()),
@@ -1035,9 +1076,9 @@ impl Mean {
 /// The held-out evaluation of `posterior` on `sequences` (module note); `tokens` is `N`.
 fn held_out(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterior, sequences: &[Vec<u32>], settings: &Settings, tokens: usize) -> Result<HeldOut, String> {
     let blocks = 2 * scorer.layers();
-    let variables = scorer.variables(posterior)?;
+    let variables = scorer.variables.clone();
     let (mut clean, mut patched) = (vec![Mean::default(); blocks], vec![Mean::default(); blocks]);
-    let (mut read, mut complement, mut sampled) = (Mean::default(), Mean::default(), Mean::default());
+    let (mut read, mut complement, mut sampled, mut adaptive) = (Mean::default(), Mean::default(), Mean::default(), Mean::default());
     let size = |e: &Experiment| e.explained.iter().filter(|x| **x).count();
     for (b, draw) in draws(sequences.len(), settings.batch_sequences, settings.seed)?.iter().enumerate() {
         let batch = draw.batch(sequences)?;
@@ -1045,14 +1086,15 @@ fn held_out(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterio
         let mut rng = StdRng::seed_from_u64(draw.seed);
         let mut experiments = Vec::with_capacity(2 * blocks * draw.bases.len());
         for k in 1..=blocks {
-            let drawn = interchange::sample(&mut rng, draw.bases.len(), blocks / 2, variables.len(), batch.length());
+            let drawn = interchange::sample(&mut rng, draw.bases.len(), &variables, &scorer.complements, batch.length())?;
             // A base's patched experiment shares its unpatched experiment's hybrid.
             for pair in drawn.chunks(2) {
                 let explained = interchange::hybrid_of(&mut rng, blocks, k);
                 experiments.extend(pair.iter().map(|e| Experiment { explained: explained.clone(), ..e.clone() }));
             }
         }
-        let (bits, _) = scorer.score(&batch, &experiments, &variables, &posterior.mean, None, false)?;
+        let key = format!("held_{}_{b}", sequences.len());
+        let (bits, _) = scorer.score(&batch, &experiments, &posterior.mean, &key, false)?;
         for (e, bits) in experiments.iter().zip(&bits) {
             match &e.patch {
                 None => clean[size(e) - 1].add(bits),
@@ -1066,8 +1108,10 @@ fn held_out(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterio
             }
         }
         let (theta, _) = posterior.sample(noise_seed(settings.seed, 0, b));
-        let (bits, _) = scorer.score(&batch, &experiments, &variables, &posterior.mean, Some(&theta), false)?;
+        let (bits, _) = scorer.score(&batch, &experiments, &theta, &key, false)?;
         bits.iter().for_each(|b| sampled.add(b));
+        let patched: Vec<Experiment> = experiments.into_iter().filter(|e| e.patch.is_some()).collect();
+        scorer.score_adaptive(&batch, &patched, &posterior.mean)?.iter().for_each(|b| adaptive.add(b));
     }
     let data = sampled.mean().ok_or("no held-out tokens")?;
     let divergence: f64 = posterior.divergences().iter().sum();
@@ -1081,6 +1125,7 @@ fn held_out(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterio
         patched: patched.iter().map(Mean::mean).collect(),
         read_patch: read.mean(),
         complement_patch: complement.mean(),
+        adaptive_patch: adaptive.mean(),
         layers: activity(scorer, explanation, posterior, sequences, settings)?,
     })
 }
@@ -1382,8 +1427,18 @@ pub fn fit(
     if draws.len() < 2 {
         return Err("the convergence test needs at least two training batches".into());
     }
-    // Two experiments per base, each scoring every token of its base.
-    let tokens = 2 * sequences.len() * length;
+    let shards = checkpoint.map(|path| path.with_extension("targets"));
+    let mut scorer = Scorer::new(device, native, explanation, settings, shards)?;
+    // The fixed collection: its scored tokens N and its realized families.
+    let (mut tokens, mut families) = (0, BTreeMap::new());
+    for draw in &draws {
+        let experiments = scorer.experiments(draw, sequences)?;
+        tokens += experiments.iter().map(|e| length - e.position).sum::<usize>();
+        for (family, count) in interchange::census(&experiments, &scorer.variables) {
+            *families.entry(family.to_string()).or_insert(0) += count;
+        }
+    }
+    log::info!("library training collection: {tokens} scored tokens, families {families:?}");
     let mut posterior = Posterior::new(explanation, tokens)?;
     let parameters = posterior.mean.iter().map(Array2::len).sum();
     let mut mean_moments: Vec<Moment> = posterior.mean.iter().map(|m| Moment::zeros(m.dim())).collect();
@@ -1408,7 +1463,6 @@ pub fn fit(
         log::info!("library fit resumed at epoch {} from {}", progress.epoch, path.display());
     }
     let resumed_seconds = progress.seconds;
-    let mut scorer = Scorer::new(device, native, explanation, settings)?;
     // After every save, the posterior-mean artifact goes next to the checkpoint (extension
     // `artifact.bin`), so the current explanation can be read and scored while the fit runs.
     let save = |progress: &mut Progress, posterior: &Posterior, mean: &[Moment], log_sd: &[Moment]| -> Result<(), String> {
@@ -1426,7 +1480,6 @@ pub fn fit(
         progress.start = Some(start);
         save(&mut progress, &posterior, &mean_moments, &log_sd_moments)?;
     }
-    let mut variables = scorer.variables(&posterior)?;
     while !progress.done {
         let epoch = progress.epoch;
         let epoch_started = Instant::now();
@@ -1436,9 +1489,9 @@ pub fn fit(
         for (b, draw) in draws.iter().enumerate() {
             let step_started = Instant::now();
             let batch = draw.batch(sequences)?;
-            let experiments = draw.experiments(&sequences[..], scorer.layers(), variables.len());
+            let experiments = scorer.experiments(draw, sequences)?;
             let (theta, noise) = posterior.sample(noise_seed(settings.seed, epoch + 1, b));
-            let (bits, gradients) = scorer.score(&batch, &experiments, &variables, &posterior.mean, Some(&theta), true)?;
+            let (bits, gradients) = scorer.score(&batch, &experiments, &theta, &format!("train_{b}"), true)?;
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
@@ -1506,7 +1559,6 @@ pub fn fit(
             log::info!("library removal after epoch {epoch}: {} of {} candidates", removal.removed, removal.candidates);
             progress.done = removal.removed == 0;
             progress.removals.push(removal);
-            variables = scorer.variables(&posterior)?;
             // The objective changed discretely: convergence is judged afresh.
             progress.previous = None;
         }
@@ -1518,6 +1570,7 @@ pub fn fit(
             settings: settings.clone(),
             training_sequences: sequences.len(),
             scored_tokens: tokens,
+            families,
             groups: explanation.groups.len(),
             parameters,
             start: progress.start.ok_or("no starting evaluation")?,
@@ -1532,18 +1585,16 @@ pub fn fit(
 }
 
 /// `E_q[D]` over every training batch in nats, one weight sample per batch from the removal seeds,
-/// with the groups `removed` (and the already removed ones) zeroed. Experiment identities and
-/// patch directions come from `posterior`, before removal, so every trial scores the same evidence.
+/// with the groups `removed` (and the already removed ones) zeroed, on the fixed collection.
 fn expected_divergence(scorer: &mut Scorer, posterior: &Posterior, draws: &[Draw], sequences: &[Vec<u32>], removed: &[usize], settings: &Settings) -> Result<f64, String> {
-    let variables = scorer.variables(posterior)?;
     let mut trial = posterior.clone();
     trial.remove(removed);
     let mut bits = 0.0;
     for (b, draw) in draws.iter().enumerate() {
         // Removal zeroes entries, so the remaining entries see the same noise as the full posterior.
         let (theta, _) = trial.sample(noise_seed(settings.seed, 0, b));
-        let experiments = draw.experiments(&sequences[..], scorer.layers(), variables.len());
-        let (scored, _) = scorer.score(&draw.batch(sequences)?, &experiments, &variables, &posterior.mean, Some(&theta), false)?;
+        let experiments = scorer.experiments(draw, sequences)?;
+        let (scored, _) = scorer.score(&draw.batch(sequences)?, &experiments, &theta, &format!("train_{b}"), false)?;
         bits += scored.iter().flatten().sum::<f64>();
     }
     Ok(bits * LN_2)
@@ -1729,7 +1780,7 @@ mod tests {
         let cells: usize = explanation.groups.iter().flat_map(|g| &g.cells).map(|c| c.rows.len() * c.cols.len()).sum();
         assert_eq!(cells, posterior.mean.iter().map(Array2::len).sum::<usize>(), "the groups partition the parameters");
         let settings = settings();
-        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, None).unwrap();
         let evaluation = held_out(&mut scorer, &explanation, &posterior, &sequences, &settings, 72).unwrap();
         for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
             let bits = bits.expect("every cut and the read patches are drawn");
@@ -1777,17 +1828,16 @@ mod tests {
         let explanation = explanation(&native, &layers).unwrap();
         let settings = settings();
         let posterior = Posterior::new(&explanation, 72).unwrap();
-        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, None).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
-        let variables = scorer.variables(&posterior).unwrap();
         let batch = draws[0].batch(&sequences).unwrap();
-        let experiments = draws[0].experiments(&sequences, scorer.layers(), variables.len());
+        let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
         let (theta, _) = posterior.sample(noise_seed(settings.seed, 0, 0));
-        let (_, gradients) = scorer.score(&batch, &experiments, &variables, &posterior.mean, Some(&theta), true).unwrap();
+        let (_, gradients) = scorer.score(&batch, &experiments, &theta, "gradient", true).unwrap();
         let (k, _) = key_value(&explanation.artifact.program, 1, 0);
         let i = explanation.trainable.iter().position(|op| *op == k).unwrap();
         let mut bits = |theta: &[Array2<f64>]| -> f64 {
-            scorer.score(&batch, &experiments, &variables, &posterior.mean, Some(theta), false).unwrap().0.iter().flatten().sum()
+            scorer.score(&batch, &experiments, theta, "gradient", false).unwrap().0.iter().flatten().sum()
         };
         for at in [(0, 0), (1, 3), (3, 7)] {
             let h = 1e-5;
@@ -1850,7 +1900,7 @@ mod tests {
         let settings = settings();
         let device = Device::host();
         let posterior = Posterior::new(&explanation, 72).unwrap();
-        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings, None).unwrap();
         let evaluation = held_out(&mut scorer, &explanation, &posterior, &sequences, &settings, 72).unwrap();
         for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
             let bits = bits.expect("every cut and the read patches are drawn");
@@ -1866,53 +1916,37 @@ mod tests {
     }
 
     #[test]
-    fn removal_scores_the_reference_experiments_and_patch_directions() {
+    fn removal_scores_the_fixed_collection() {
+        // Removing every group changes neither the experiments nor their directions: a trial is
+        // scored on the collection drawn over M's reads, with M's directions and M's targets.
         let (native, layers, _, sequences) = tiny("library_removal_evidence", "relu");
         let explanation = explanation(&native, &layers).unwrap();
         let settings = settings();
         let posterior = Posterior::new(&explanation, 2 * sequences.len() * 12).unwrap();
-        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, None).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
-        let variables = scorer.variables(&posterior).unwrap();
         let removed: Vec<usize> = (0..posterior.active.len()).collect();
         let mut trial = posterior.clone();
         trial.remove(&removed);
-        let trial_variables = scorer.variables(&trial).unwrap();
-        assert!(!variables.is_empty() && trial_variables.is_empty(), "removal must change the read-variable population");
-
-        let (mut reference_bits, mut changed_data_bits, mut changed_directions_bits) = (0.0, 0.0, 0.0);
-        let mut read_patches = 0;
+        // The reference, built apart from Scorer::score: M's variables and the library's start.
+        let variables = interchange::library_reads(&explanation.artifact.program, layers.len()).unwrap();
+        let start: Vec<Array2<f64>> = explanation.trainable.iter().map(|op| explanation.artifact.program.operators[*op].matrix()).collect();
+        let (mut reference_bits, mut read_patches) = (0.0, 0);
         for (b, draw) in draws.iter().enumerate() {
             let batch = draw.batch(&sequences).unwrap();
-            let experiments = draw.experiments(&sequences[..], scorer.layers(), variables.len());
+            let experiments = scorer.experiments(draw, &sequences).unwrap();
             read_patches += experiments.iter().filter(|e| matches!(e.patch, Some(Patch::Read { .. }))).count();
             let (theta, _) = trial.sample(noise_seed(settings.seed, 0, b));
-
-            // Build the reference intervention independently of Scorer::score, before loading
-            // the zeroed candidate. Both the native target and candidate use this same design.
-            scorer.experiments.load(&posterior.mean).unwrap();
-            let design = interchange::design(&scorer.experiments.models().1, &variables, &experiments).unwrap();
+            let design = scorer.experiments.design_at(&variables, &experiments, &start).unwrap();
+            let targets = scorer.experiments.targets(&batch, &experiments, &design).unwrap();
             scorer.experiments.load(&theta).unwrap();
-            let (m, p) = scorer.experiments.models();
-            let head = scorer.experiments.head();
-            let teacher = interchange::Teacher::new(&m, head, &batch, &variables, &experiments).unwrap();
-            let reference = interchange::evaluate(&m, &p, head, &batch, &teacher, &experiments, &design, false).unwrap();
+            let reference = scorer.experiments.evaluate_resident(&batch, &experiments, &design, &targets, false).unwrap();
             reference_bits += reference.bits.iter().flatten().sum::<f64>();
-
-            // The former implementation redrew experiments and directions from the trial.
-            let redrawn = draw.experiments(&sequences[..], scorer.layers(), trial_variables.len());
-            let (bits, _) = scorer.score(&batch, &redrawn, &trial_variables, &trial.mean, Some(&theta), false).unwrap();
-            changed_data_bits += bits.iter().flatten().sum::<f64>();
-            // Freezing identities alone is insufficient: zeroed reads change the patch basis.
-            let (bits, _) = scorer.score(&batch, &experiments, &variables, &trial.mean, Some(&theta), false).unwrap();
-            changed_directions_bits += bits.iter().flatten().sum::<f64>();
         }
-        assert!(read_patches > 0, "the reference evidence must include a removed read variable");
+        assert!(read_patches > 0, "the collection must hold read patches of removed functions");
         let actual = expected_divergence(&mut scorer, &posterior, &draws, &sequences, &removed, &settings).unwrap();
         let reference = reference_bits * LN_2;
-        assert!((actual - reference).abs() < 1e-10 * reference.abs().max(1.0), "removal must score the reference evidence");
-        assert!((reference_bits - changed_data_bits).abs() > 1e-8, "redrawing the evidence must expose the former comparison error");
-        assert!((reference_bits - changed_directions_bits).abs() > 1e-8, "recomputing patch directions must change the evidence even with fixed identities");
+        assert!((actual - reference).abs() < 1e-10 * reference.abs().max(1.0), "removal must score the fixed collection");
     }
 
     #[test]
@@ -2035,11 +2069,14 @@ mod tests {
         std::fs::remove_file(&checkpoint).unwrap();
         std::fs::remove_file(checkpoint.with_extension("json")).unwrap();
         std::fs::remove_file(checkpoint.with_extension("artifact.bin")).unwrap();
+        std::fs::remove_dir_all(checkpoint.with_extension("targets")).unwrap();
         assert_eq!(resumed.posterior.active, fit.posterior.active);
         assert_eq!(resumed.posterior.means(), fit.posterior.means());
         assert_eq!(resumed.report.epochs.len(), fit.report.epochs.len());
         let report = &fit.report;
-        assert_eq!(report.scored_tokens, 2 * 4 * 12, "two experiments per training base");
+        // Every clean experiment scores its 12 tokens, every patched one those from its position on.
+        assert!(report.scored_tokens > 4 * 12 && report.scored_tokens <= 2 * 4 * 12, "{}", report.scored_tokens);
+        assert_eq!(report.families.values().sum::<usize>(), 2 * 4, "two experiments per training base");
         assert_eq!(report.removals.last().unwrap().removed, 0, "the fit ends when no removal is accepted");
         assert!(report.removals.iter().all(|r| r.after_bits <= r.before_bits), "a removal never increases the objective");
         assert!(report.epochs.iter().all(|e| e.objective_bits.is_finite() && e.held_out.objective_bits_per_token.is_finite()));

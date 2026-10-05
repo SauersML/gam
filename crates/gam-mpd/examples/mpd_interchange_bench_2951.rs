@@ -14,8 +14,8 @@
 //!
 //! The first `SEQUENCES` token rows are the bases and the next `SEQUENCES` the sources. Per base the
 //! experiments are one unpatched and one patched (`Interchange::sample`, seed 1). Measured, each
-//! `REPS` times after one warm-up: `M`'s clean runs (`Teacher::new`), the patch directions
-//! (`design`), the evaluation with and without its gradient (`evaluate`), the gradient's download
+//! `REPS` times after one warm-up: the patch directions (`design`), `M`'s targets
+//! (`interchange::targets`), the evaluation with and without its gradient (`evaluate`), the gradient's download
 //! to the host, the whole step
 //! (`Interchange::evaluate` with its gradient, downloaded), and for comparison the clean step (`P`
 //! alone on the bases, every block its own, with its gradient). On `device` the programs
@@ -29,7 +29,7 @@ use gam_mpd::{
     artifact::Artifact,
     engine::log_to_stderr,
     import::{hugging_face_language_model, import_language_model},
-    interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable, Teacher},
+    interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable},
     library_mdl,
     operator_program::{OperatorProgram, SlotValues},
     run_check::{layer_nodes, split_sites},
@@ -177,16 +177,20 @@ fn main() -> Result<(), String> {
     let (m, p) = x.models();
     let head = x.head();
     let variables = x.variables();
-    let experiments = x.sample(&mut rand::rngs::StdRng::seed_from_u64(1), sequences, context);
+    // P starts at M: its starting values are M's reads, which fix the experiments' directions.
+    let start: Vec<ndarray::Array2<f64>> = trainable.iter().map(|op| artifact.program.operators[*op].matrix()).collect();
+    let complements = x.complements(variables, &start)?;
+    let experiments = interchange::sample(&mut rand::rngs::StdRng::seed_from_u64(1), sequences, variables, &complements, context)?;
     let clean: Vec<Experiment> = (0..sequences).map(|n| Experiment { base: n, source: n, explained: vec![true; 2 * layer_count], patch: None, position: 0 }).collect();
-    let (teacher_time, teacher) = measure(&device, reps, || Teacher::new(&m, head, &batch, variables, &experiments))?;
-    let (design_time, design) = measure(&device, reps, || interchange::design(&p, variables, &experiments))?;
-    let (gradient_time, evaluation) = measure(&device, reps, || interchange::evaluate(&m, &p, head, &batch, &teacher, &experiments, &design, true))?;
-    let (forward_time, values) = measure(&device, reps, || interchange::evaluate(&m, &p, head, &batch, &teacher, &experiments, &design, false))?;
+    let (design_time, design) = measure(&device, reps, || x.design_at(variables, &experiments, &start))?;
+    let (teacher_time, targets) = measure(&device, reps, || interchange::targets(&m, head, &batch, &experiments, &design))?;
+    let (gradient_time, evaluation) = measure(&device, reps, || interchange::evaluate(&m, &p, head, &batch, &targets, &experiments, &design, true))?;
+    let (forward_time, values) = measure(&device, reps, || interchange::evaluate(&m, &p, head, &batch, &targets, &experiments, &design, false))?;
     let (download_time, _) = measure(&device, reps, || evaluation.gradient.values().map(|g| device.download(g).map_err(|e| e.to_string())).collect::<Result<Vec<_>, String>>())?;
     drop(evaluation);
-    let (step_time, _) = measure(&device, reps, || x.evaluate(&batch, &experiments, true))?;
-    let (clean_time, clean_values) = measure(&device, reps, || x.evaluate(&batch, &clean, true))?;
+    let (step_time, _) = measure(&device, reps, || x.evaluate(&batch, &experiments, &design, true))?;
+    let clean_design = x.design_at(variables, &clean, &start)?;
+    let (clean_time, clean_values) = measure(&device, reps, || x.evaluate(&batch, &clean, &clean_design, true))?;
     let mean = |bits: &[Vec<f64>]| bits.iter().flatten().sum::<f64>() / bits.iter().map(Vec::len).sum::<usize>().max(1) as f64;
     let patched_bits: Vec<Vec<f64>> = experiments.iter().zip(&values.bits).filter(|(e, _)| e.patch.is_some()).map(|(_, b)| b.clone()).collect();
     let report = json!({
@@ -210,7 +214,8 @@ fn main() -> Result<(), String> {
         }).collect::<Vec<_>>(),
         "compile_seconds": compile_seconds,
         "free_bytes_compiled": free_compiled,
-        "teacher": teacher_time,
+        "families": interchange::census(&experiments, variables),
+        "targets": teacher_time,
         "design": design_time,
         "evaluate": forward_time,
         "evaluate_with_gradient": gradient_time,
