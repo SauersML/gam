@@ -5581,7 +5581,7 @@ kernel void t_code_rows(device const float* z [[buffer(0)]], device const float*
             let (upper, lower, no_warm) = (self.stream.alloc(rows)?, self.stream.alloc(rows)?, self.stream.alloc(1)?);
             let flags = u32::from(blocks == pieces) | (u32::from(warm.is_some()) << 1);
             // An f32 relaxation is stationary at a move of a millionth (its coordinates are in [0, 1]).
-            let p = P { n: flags, rows: u32_of(rows)?, cols: u32_of(pieces)?, extra: u32_of(width)?, a: u32_of(blocks)?, b: u32_of(nodes)?, alpha: kappa as f32, beta: (tolerance as f32).max(1e-6) };
+            let p = P { n: flags, rows: u32_of(rows)?, cols: u32_of(pieces)?, extra: u32_of(width)?, a: u32_of(blocks)?, b: u32_of(nodes)?, alpha: kappa as f32, beta: (tolerance as f32).max(1e-6), c: 0, d: 0 };
             let buffers = [
                 whole(buffer(z)?),
                 whole(buffer(w)?),
