@@ -45,7 +45,7 @@ pub mod block;
 // KL and total-variation bounds over logit boxes.
 pub mod bounds;
 
-// Prefix, subset and graph codes for the global artifact and local packets.
+// Prefix, index and subset codes and the bit strings of the artifact's message.
 pub mod codec;
 
 // Operator programs: typed operators with exact interfaces, banded batch execution, message code.
@@ -111,7 +111,7 @@ pub mod device_program;
 #[cfg(test)]
 mod device_program_tests;
 
-// Model exports (export.json and raw float64 tensors) as operator programs and contracts.
+// Language-model exports and Hugging Face checkpoints as operator programs.
 pub mod import;
 
 // Exact masked rewrites of gated units, norms, biases and residual edges.
