@@ -677,11 +677,12 @@ impl Device {
     }
 
     /// Records this device's operations from here to [`Device::end_capture`] into a [`Graph`]
-    /// instead of running them (CUDA stream capture). Only work that never reads a value back to
-    /// the host can be recorded (a download, or an operation returning per-row values, breaks the
-    /// capture), on tensors that exist before the capture begins: a tensor made during it is the
-    /// graph's own temporary and must be dropped before the capture ends. The capturing thread
-    /// must be the device's only user meanwhile. CUDA only.
+    /// instead of running them (CUDA stream capture). Only work that moves nothing between host
+    /// and device can be recorded (an upload, a download, or an operation returning per-row
+    /// values is refused meanwhile, recording nothing), on tensors that exist before the capture
+    /// begins and outlive it: a tensor made during it is the graph's own temporary and must be
+    /// dropped before the capture ends. The capturing thread must be the context's only user
+    /// meanwhile. CUDA only.
     pub fn begin_capture(&self) -> Result<(), GpuError> {
         match &*self.backend {
             #[cfg(target_os = "linux")]
@@ -3456,7 +3457,17 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             }
         }
 
+        /// Refuses a host transfer while capturing: the graph would replay it against host memory
+        /// long gone, and cudarc reports a read-back's synchronization failure nowhere.
+        fn host_transfer(&self) -> Result<(), GpuError> {
+            if self.capturing.load(Ordering::Acquire) {
+                return Err(GpuError::NoDeviceKernel { reason: "a host transfer cannot be recorded in a graph".to_string() });
+            }
+            Ok(())
+        }
+
         pub(super) fn upload<T: DeviceRepr + ValidAsZeroBits>(&self, values: &[T]) -> Result<CudaSlice<T>, GpuError> {
+            self.host_transfer()?;
             // An empty tensor still holds one (unread) value: the driver allocates nothing smaller.
             if values.is_empty() {
                 return self.stream.alloc_zeros::<T>(1).gpu_ctx("tensor alloc");
@@ -3465,6 +3476,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         }
 
         pub(super) fn download<T: DeviceRepr>(&self, slice: &CudaSlice<T>) -> Result<Vec<T>, GpuError> {
+            self.host_transfer()?;
             self.stream.clone_dtoh(slice).gpu_ctx("tensor download")
         }
 

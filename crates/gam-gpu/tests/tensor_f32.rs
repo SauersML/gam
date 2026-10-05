@@ -392,14 +392,15 @@ fn f32_adam_steps_agree_with_the_host() {
 }
 
 /// A captured step (a product, a law through a temporary, an accumulation, an in-place softmax)
-/// replays bitwise what running it directly does, in either storage; reading a value back to the
-/// host inside a capture breaks it, and the device works on after.
+/// replays bitwise what running it directly does, in either storage; a host transfer inside a
+/// capture is refused, records nothing, and the device works on after.
 #[test]
 fn a_captured_step_replays_what_running_it_does() {
     let Some((d, wide)) = cuda() else { return };
     for device in [&d, &wide] {
         let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
-        let (x, w) = (up(device, &matrix(64, 32, 91, 1.0)), up(device, &matrix(32, 48, 92, 0.2)));
+        let x_host = matrix(64, 32, 91, 1.0);
+        let (x, w) = (up(device, &x_host), up(device, &matrix(32, 48, 92, 0.2)));
         let codes = device.upload_indices(&vec![PointwiseLaw::GeluTanh.code(); 48]).expect("codes");
         let c = 0.797_884_560_802_865_4;
         let step = |y: &mut Tensor, total: &mut Tensor, scores: &mut Tensor| -> Result<(), GpuError> {
@@ -426,10 +427,14 @@ fn a_captured_step_replays_what_running_it_does() {
         assert_eq!(down(device, &gtotal), down(device, &total), "{}: replayed accumulation", device.name());
         assert_eq!(down(device, &gscores), down(device, &scores), "{}: replayed in-place maps", device.name());
         device.begin_capture().expect("capture");
-        assert!(device.argmax_rows(&y).is_err(), "{}: a read-back inside a capture fails", device.name());
-        assert!(device.end_capture().is_err(), "{}: the broken capture records no graph", device.name());
+        assert!(device.argmax_rows(&y).is_err(), "{}: a read-back inside a capture is refused", device.name());
+        assert!(device.upload(x_host.view()).is_err(), "{}: so is an upload", device.name());
+        assert!(device.begin_capture().is_err(), "{}: captures do not nest", device.name());
+        device.end_capture().expect("the capture records on");
+        assert!(device.end_capture().is_err(), "{}: one capture ends once", device.name());
         device.synchronize().expect("the stream works on");
-        step(&mut y, &mut total, &mut scores).expect("a direct step after a broken capture");
+        step(&mut y, &mut total, &mut scores).expect("a direct step after the capture");
+        assert_eq!(device.argmax_rows(&y).expect("a read-back after it").len(), 64);
     }
 }
 
