@@ -195,7 +195,11 @@ pub fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<Rea
                     Some(Node::Affine { terms, bias: None }) if terms.len() == 1 && terms[0].0 == 0 => terms[0].1,
                     _ => return Err(error(format!("layer {l} head {h}: node {node} is not a read map"))),
                 };
-                out.push(ReadVariable { block: 2 * l, parts: vec![(op, 0..program.operators[op].rows.width())] });
+                // A key or value map the query heads of one key-value group share is one variable.
+                let variable = ReadVariable { block: 2 * l, parts: vec![(op, 0..program.operators[op].rows.width())] };
+                if !out.contains(&variable) {
+                    out.push(variable);
+                }
             }
         }
         // An MLP function reads through its gate, and a gated law's function through its up

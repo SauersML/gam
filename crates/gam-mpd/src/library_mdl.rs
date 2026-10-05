@@ -11,22 +11,23 @@
 //!   output projection's input). Its function attends with its own query, key and value maps
 //!   `q = Q x`, `k = K x`, `v = V x` at the native rotary angles, scale and causal mask; where `M`
 //!   norms each head's query and key (Qwen3), `q = γ_q ⊙ rms(Q x)` and `k = γ_k ⊙ rms(K x)` with
-//!   the head's own copy of `M`'s gains `γ`, which are part of the law and not trained. Heads that
-//!   share a key and value in `M` (grouped-query attention) each have their own copies.
+//!   the head's own copy of `M`'s gains `γ`, which are part of the law and not trained. Query heads
+//!   that share a key and value in `M` (grouped-query attention) read one shared `K` and `V` here
+//!   too, so the explanation stays in the family `M` realizes.
 //! * An MLP's block reads its layer's second normed stream and writes the MLP's output. Its
 //!   functions are `f_i(x) = φ(g_i·x + c_i) u_i`, with the native pointwise law `φ`,
 //!   a gate direction `g_i`, a gate bias `c_i` and an output `u_i`; for a gated MLP (SwiGLU on
-//!   Qwen3) `f_i(x) = φ(g_i·x) (b_i·x) u_i` with an up direction `b_i`, and biases only where `M`
-//!   has them.
+//!   Qwen3) `f_i(x) = φ(g_i·x) (b_i·x) u_i` with an up direction `b_i`. Biases appear only where
+//!   `M` has them, so a bias-free MLP maps 0 to 0.
 //!
 //! The library starts at `M`: native neuron `i` is function `i` with its original
 //! activation and coefficients, and a head is its own function.
 //!
 //! # The code length
 //!
-//! The library's parameters `θ` are partitioned into prior groups `G`: a head's rotary plane (the
-//! query and key rows of the plane), a head's value coordinate (one value row), an MLP function's
-//! gate `(g_i, c_i)`, its up direction `b_i` when gated, and its output `u_i`. With the posterior `q(θ) = Π_j N(μ_j, σ_j²)` and the
+//! The library's parameters `θ` are partitioned into prior groups `G`: a key-value group's rotary
+//! plane (the plane's rows of the shared key and of every query head's query), its value
+//! coordinate (one row of the shared value), an MLP function's gate `(g_i, c_i)`, its up direction `b_i` when gated, and its output `u_i`. With the posterior `q(θ) = Π_j N(μ_j, σ_j²)` and the
 //! prior `p(θ_G) = N(0, v_G I)`, the code length in nats is
 //!
 //! `F = E_q[D(θ)] + Σ_G KL(q_G ‖ p_G) + Σ_{active G} ½ ln |G|`,
@@ -144,7 +145,8 @@ pub struct Explanation {
 #[derive(Clone, Debug)]
 pub struct Layer {
     pub sites: LayerNodes,
-    /// Per head, its planes' groups and its value coordinates' groups.
+    /// Per head, its planes' groups and its value coordinates' groups (those of its key-value
+    /// group, shared with the group's other query heads).
     pub heads: Vec<(Vec<usize>, Vec<usize>)>,
     /// Per MLP function, its groups: its gate's, its up direction's when gated, and its output's.
     pub functions: Vec<Vec<usize>>,
@@ -255,6 +257,9 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
     let mut artifact = Artifact::native(native)?;
     let mut planes = Vec::new();
     for (l, layer) in layers.iter().enumerate() {
+        // Per key-value group (the native key and value projections its query heads read): its
+        // name, its query heads, its planes and its value width.
+        let mut groups: Vec<(usize, usize, String, Vec<(usize, String)>, Vec<Vec<usize>>, usize)> = Vec::new();
         for (h, &read) in layer.reads.iter().enumerate() {
             let Node::Attend { query, key, value, scale, rotary, causal } = native.nodes[read].clone() else {
                 return Err(format!("layer {l} head {h}: the read is not an attention node"));
@@ -270,16 +275,24 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
             let coordinates = Interface::uniform(q.rows.width(), 1, LabelKind::Unit, 0).map_err(error)?;
             let name = format!("library.l{l}.h{h}");
             let base = artifact.program.operators.len();
-            let mut operators = vec![
-                library_operator(&format!("{name}.q"), coordinates.clone(), q.cols.clone(), q.matrix(), &q.name)?,
-                library_operator(&format!("{name}.k"), coordinates.clone(), k.cols.clone(), k.matrix(), &k.name)?,
-                library_operator(&format!("{name}.v"), v.rows.clone(), v.cols.clone(), v.matrix(), &v.name)?,
-            ];
+            let mut operators = vec![library_operator(&format!("{name}.q"), coordinates.clone(), q.cols.clone(), q.matrix(), &q.name)?];
+            // Query heads that read one key and value in `M` read one key map and one value map:
+            // one posterior, every head's use in its gradient, one divergence.
+            let group = groups.iter().position(|g| g.0 == key && g.1 == value);
+            let (k_op, v_op) = match group {
+                Some(g) => (index_of(&artifact.program, &format!("{}.k", groups[g].2))?, index_of(&artifact.program, &format!("{}.v", groups[g].2))?),
+                None => {
+                    let shared = format!("library.l{l}.kv{}", groups.len());
+                    operators.push(library_operator(&format!("{shared}.k"), coordinates.clone(), k.cols.clone(), k.matrix(), &k.name)?);
+                    operators.push(library_operator(&format!("{shared}.v"), v.rows.clone(), v.cols.clone(), v.matrix(), &v.name)?);
+                    (base + 1, base + 2)
+                }
+            };
             let mut nodes = vec![
                 Node::Param { index: 0 },
                 Node::Affine { terms: vec![(0, base)], bias: None },
-                Node::Affine { terms: vec![(0, base + 1)], bias: None },
-                Node::Affine { terms: vec![(0, base + 2)], bias: None },
+                Node::Affine { terms: vec![(0, k_op)], bias: None },
+                Node::Affine { terms: vec![(0, v_op)], bias: None },
             ];
             // A head norm: the RMS norm of the projection, then the head's own copy of `M`'s gain.
             let mut normed = |projection: usize, norm: Option<(f64, Arc<Operator>)>, part: &str| -> Result<usize, String> {
@@ -303,8 +316,13 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
                 }
                 None => (0..q.rows.width()).map(|c| vec![c]).collect(),
             };
-            planes.push((l, name, pairs, v.rows.width()));
+            match group {
+                Some(g) if groups[g].4 == pairs && groups[g].5 == v.rows.width() => groups[g].3.push((h, name)),
+                Some(_) => return Err(format!("layer {l} head {h}: the query heads of one key-value group differ in their planes")),
+                None => groups.push((key, value, format!("library.l{l}.kv{}", groups.len()), vec![(h, name)], pairs, v.rows.width())),
+            }
         }
+        planes.extend(groups.into_iter().map(|(_, _, shared, heads, pairs, values)| (l, shared, heads, pairs, values)));
         if let Node::Hadamard { left, right } = native.nodes[layer.active] {
             artifact = gated_mlp(native, artifact, layer, l, left, right)?;
             continue;
@@ -321,26 +339,28 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
         };
         let down = single_map(native, layer.mlp, layer.active)?;
         let units = up.rows.clone();
-        let width = units.width();
-        let bias = match up_bias {
-            Some(op) => native.operators[op].matrix(),
-            None => Array2::zeros((width, 1)),
-        };
         let name = format!("library.l{l}.mlp");
         let base = artifact.program.operators.len();
-        let operators = vec![
+        let mut operators = vec![
             library_operator(&format!("{name}.gate"), units.clone(), up.cols.clone(), up.matrix(), &up.name)?,
-            library_operator(&format!("{name}.gate_bias"), units.clone(), Interface::constant(), bias, &up.name)?,
             library_operator(&format!("{name}.out"), down.rows.clone(), units.clone(), down.matrix(), &down.name)?,
         ];
+        // A gate bias only where `M` has one, so a bias-free MLP still maps 0 to 0.
+        let gate_bias = match up_bias {
+            Some(op) => {
+                operators.push(library_operator(&format!("{name}.gate_bias"), units.clone(), Interface::constant(), native.operators[op].matrix(), &up.name)?);
+                Some(base + 2)
+            }
+            None => None,
+        };
         let rule = Rule {
             name: name.clone(),
             inputs: vec![up.cols.clone()],
             nodes: vec![
                 Node::Param { index: 0 },
-                Node::Affine { terms: vec![(0, base)], bias: Some(base + 1) },
+                Node::Affine { terms: vec![(0, base)], bias: gate_bias },
                 Node::Pointwise { input: 1, laws: laws.clone() },
-                Node::Affine { terms: vec![(2, base + 2)], bias: None },
+                Node::Affine { terms: vec![(2, base + 1)], bias: None },
             ],
             output: 3,
         };
@@ -351,21 +371,28 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
     let mut groups = Vec::new();
     let mut trainable = Vec::new();
     let mut out: Vec<Layer> = layers.iter().map(|sites| Layer { sites: sites.clone(), heads: Vec::new(), functions: Vec::new() }).collect();
-    for (l, name, pairs, values) in &planes {
-        let (q, k, v) = (index_of(program, &format!("{name}.q"))?, index_of(program, &format!("{name}.k"))?, index_of(program, &format!("{name}.v"))?);
-        let d = program.operators[q].cols.width();
+    // Per key-value group, a group per rotary plane holding the plane's rows of the shared key
+    // and of every query head's query, and a group per value coordinate of the shared value.
+    let mut heads: Vec<Vec<Option<(Vec<usize>, Vec<usize>)>>> = layers.iter().map(|l| vec![None; l.reads.len()]).collect();
+    for (l, shared, members, pairs, values) in &planes {
+        let (k, v) = (index_of(program, &format!("{shared}.k"))?, index_of(program, &format!("{shared}.v"))?);
+        let queries = members.iter().map(|(_, name)| index_of(program, &format!("{name}.q"))).collect::<Result<Vec<_>, _>>()?;
+        let d = program.operators[k].cols.width();
         let first = groups.len();
         for (p, rows) in pairs.iter().enumerate() {
-            groups.push(Group {
-                name: format!("{name}.plane{p}"),
-                cells: vec![Cells { operator: q, rows: rows.clone(), cols: 0..d }, Cells { operator: k, rows: rows.clone(), cols: 0..d }],
-            });
+            let cells = queries.iter().chain([&k]).map(|&operator| Cells { operator, rows: rows.clone(), cols: 0..d }).collect();
+            groups.push(Group { name: format!("{shared}.plane{p}"), cells });
         }
         for j in 0..*values {
-            groups.push(Group { name: format!("{name}.value{j}"), cells: vec![Cells { operator: v, rows: vec![j], cols: 0..d }] });
+            groups.push(Group { name: format!("{shared}.value{j}"), cells: vec![Cells { operator: v, rows: vec![j], cols: 0..d }] });
         }
-        out[*l].heads.push(((first..first + pairs.len()).collect(), (first + pairs.len()..groups.len()).collect()));
-        trainable.extend([q, k, v]);
+        for (h, _) in members {
+            heads[*l][*h] = Some(((first..first + pairs.len()).collect(), (first + pairs.len()..groups.len()).collect()));
+        }
+        trainable.extend(queries.into_iter().chain([k, v]));
+    }
+    for (layer, heads) in out.iter_mut().zip(heads) {
+        layer.heads = heads.into_iter().collect::<Option<Vec<_>>>().ok_or("a head in no key-value group")?;
     }
     for (l, layer) in out.iter_mut().enumerate() {
         let name = format!("library.l{l}.mlp");
@@ -1563,10 +1590,14 @@ mod tests {
         let explanation = explanation(&native, &layers).unwrap();
         explanation.artifact.validate_coverage(&native).unwrap();
         assert_eq!(explanation.artifact.blocks.len(), 2 * (2 + 1), "two heads and one MLP per layer");
-        // Per head two rotary planes and four value rows; per MLP function its gate, up direction
-        // and output.
-        assert_eq!(explanation.groups.len(), 2 * (2 * (2 + 4) + 16 * 3));
+        // Per key-value group (one, read by both query heads) two rotary planes and four value rows;
+        // per MLP function its gate, up direction and output.
+        assert_eq!(explanation.groups.len(), 2 * ((2 + 4) + 16 * 3));
         assert!(explanation.layers.iter().all(|l| l.functions.iter().all(|f| f.len() == 3)));
+        assert!(explanation.layers.iter().all(|l| l.heads[0] == l.heads[1]), "both query heads hold their group's planes and values");
+        for l in 0..2 {
+            assert_eq!(key_value(&explanation.artifact.program, l, 0), key_value(&explanation.artifact.program, l, 1), "one key and value map per key-value group");
+        }
         let expected = native.execute(&family, false).unwrap().values[native.output].clone();
         let actual = explanation.artifact.execute(&family).unwrap().values[explanation.artifact.program.output].clone();
         let scale = expected.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
@@ -1598,7 +1629,52 @@ mod tests {
         assert_eq!(report.removals.last().unwrap().removed, 0, "the fit ends when no removal is accepted");
         assert!(report.removals.iter().all(|r| r.after_bits <= r.before_bits), "a removal never increases the objective");
         assert!(report.epochs.iter().all(|e| e.objective_bits.is_finite() && e.held_out.objective_bits_per_token.is_finite()));
-        posterior_mean(&explanation, &fit.posterior).unwrap().validate_coverage(&native).unwrap();
+        let fitted = posterior_mean(&explanation, &fit.posterior).unwrap();
+        fitted.validate_coverage(&native).unwrap();
+        // After training, both query heads still read one key and one value map, moved from M's.
+        for l in 0..2 {
+            let ((k, v), other) = (key_value(&fitted.program, l, 0), key_value(&fitted.program, l, 1));
+            assert_eq!((k, v), other);
+            assert_ne!(fitted.program.operators[k].matrix(), explanation.artifact.program.operators[k].matrix(), "training moves the shared key");
+        }
+    }
+
+    /// The key and value operators head `h` of layer `l` reads.
+    fn key_value(program: &OperatorProgram, l: usize, h: usize) -> (usize, usize) {
+        let rule = program.rules.iter().find(|r| r.name == format!("library.l{l}.h{h}")).unwrap();
+        let map = |node: usize| match &rule.nodes[node] {
+            Node::Affine { terms, .. } => terms[0].1,
+            other => panic!("{other:?}"),
+        };
+        (map(2), map(3))
+    }
+
+    #[test]
+    fn a_shared_key_is_differentiated_through_every_query_head_reading_it() {
+        let (native, layers, _, sequences) = tiny_qwen3("library_shared_key_gradient");
+        let explanation = explanation(&native, &layers).unwrap();
+        let settings = settings();
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let variables = scorer.variables(&posterior).unwrap();
+        let batch = draws[0].batch(&sequences).unwrap();
+        let experiments = draws[0].experiments(&sequences, scorer.layers(), variables.len());
+        let (theta, _) = posterior.sample(noise_seed(settings.seed, 0, 0));
+        let (_, gradients) = scorer.score(&batch, &experiments, &variables, &posterior.mean, Some(&theta), true).unwrap();
+        let (k, _) = key_value(&explanation.artifact.program, 1, 0);
+        let i = explanation.trainable.iter().position(|op| *op == k).unwrap();
+        let mut bits = |theta: &[Array2<f64>]| -> f64 {
+            scorer.score(&batch, &experiments, &variables, &posterior.mean, Some(theta), false).unwrap().0.iter().flatten().sum()
+        };
+        for at in [(0, 0), (1, 3), (3, 7)] {
+            let h = 1e-5;
+            let (mut up, mut down) = (theta.clone(), theta.clone());
+            up[i][at] += h;
+            down[i][at] -= h;
+            let central = (bits(&up) - bits(&down)) / (2.0 * h);
+            assert!((gradients[i][at] - central).abs() <= 1e-5 * (1.0 + central.abs()), "shared key gradient {} against {central}", gradients[i][at]);
+        }
     }
 
     fn settings() -> Settings {
@@ -1630,6 +1706,12 @@ mod tests {
             let posterior = Posterior::new(&explanation, 72).unwrap();
             let cells: usize = explanation.groups.iter().flat_map(|g| &g.cells).map(|c| c.rows.len() * c.cols.len()).sum();
             assert_eq!(cells, posterior.mean.iter().map(Array2::len).sum::<usize>(), "the groups partition the parameters");
+            // `M`'s MLPs have no bias, so neither do the library's: a zero input still maps to zero.
+            for l in 0..2 {
+                assert!(operator_named(&explanation.artifact.program, &format!("library.l{l}.mlp.gate_bias")).is_none());
+                let rule = explanation.artifact.program.rules.iter().find(|r| r.name == format!("library.l{l}.mlp")).unwrap();
+                assert!(matches!(rule.nodes[1], Node::Affine { bias: None, .. }));
+            }
             let indexed: usize = explanation
                 .layers
                 .iter()
