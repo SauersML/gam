@@ -673,7 +673,7 @@ run_request() {
 }
 
 # ---- example lane: one example binary, built in parallel with everyone else's builds ----
-#   bin=$(./build.sh example mpd_e2e_2951 [release|test|PROFILE]) && "$bin" ARGS…
+#   bin=$(./build.sh example mpd_composed_causal_search_2951 [release|test|PROFILE]) && "$bin" ARGS…
 # The shared target/ above runs one cargo at a time; agents' example builds sat at 0% CPU for
 # 10-25 min behind each other there. This lane builds in one of fastcheck's warm slots instead
 # (each its own target/, several at once) and prints the path of a copy named by the source it was

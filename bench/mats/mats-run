@@ -18,8 +18,8 @@
 #
 # Throughput: MATS_QOS=debug runs in the debug QOS (priority far above normal, no per-user CPU cap,
 # at most 2 h, so HOURS is cut to 2). MATS_CHAIN=K submits K segments of the same job, each starting
-# after the last ends (--dependency=afterany), for commands that resume from their own checkpoint
-# (mpd_e2e_2951 reads back its finished stages): a segment cut off by its time limit resumes, a
+# after the last ends (--dependency=afterany), for commands that resume from their own checkpoint:
+# a segment cut off by its time limit resumes, a
 # task that ended (exit 0, or a real error) skips its later segments. Chain only work that resumes
 # exactly (an unfinished stage restarts, so not stages longer than 2 h) and
 # keep debug arrays small (default %8): debug outranks the team's normal-QOS priority order.

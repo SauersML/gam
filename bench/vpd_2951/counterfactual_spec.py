@@ -1,5 +1,6 @@
 """The counterfactual-response benchmark's episodes on VPD's 4-layer Pile target (#2951),
-frozen before any explanation is scored (`mpd_counterfactual_2951` in crates/gam-mpd/examples).
+frozen before any explanation is scored (read by `gam_mpd::counterfactual::Spec::load`, scored by
+`gam_mpd::run_check`).
 
 Every intervention is native and decomposition-free: it acts on the decoder's own quantities, so
 every explanation is asked about the same physical change. Sites are numbered layer-major,
