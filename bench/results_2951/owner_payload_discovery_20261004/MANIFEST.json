@@ -1,0 +1,59 @@
+{
+  "files": [
+    {
+      "path": "OWNER_PAYLOAD_SETTINGS.json",
+      "bytes": 502,
+      "sha256": "a02a6eaa2f07683d6ebf199a77288d2d4d24fe83016c0476be20a4d9922a2349"
+    },
+    {
+      "path": "OWNER_PAYLOAD_SUMMARY.json",
+      "bytes": 1263,
+      "sha256": "2403ef188b478458ab0e816a12b6be67a1a30cb6b1b18e60cb20250fda96e17c"
+    },
+    {
+      "path": "OWNER_PAYLOAD_DISCOVERY/REPORT.json",
+      "bytes": 759420,
+      "sha256": "c3e31d1cedb0e5c3710d1991cee32ded7ef7738428bb82de149359b604991580"
+    },
+    {
+      "path": "OWNER_PAYLOAD_DISCOVERY/PROVENANCE.json",
+      "bytes": 60399,
+      "sha256": "2b257a54b670fcc951168a80506b5f5711cd29c694b5463f5144b64b51cf8fad"
+    },
+    {
+      "path": "NATIVE_OWNER_SWAP.json",
+      "bytes": 26236,
+      "sha256": "fc6c7229ad88aadeeeb3525ac90f8a535ed3091c7391d44bc69eb4b80b08c0fb"
+    },
+    {
+      "path": "VALUE_ATTENTION_CONTRASTS.json",
+      "bytes": 85706,
+      "sha256": "33a0696cce7e2947ad0f09fbd9fc81bc93a8dbdbe6f96510a4b4df7eb818d26c"
+    },
+    {
+      "path": "plot_owner_payload.py",
+      "bytes": 5229,
+      "sha256": "554ac42c904922fa80dbaa434f711eee62a56e147775b76911360266c12e2eb2"
+    },
+    {
+      "path": "owner_payload.pdf",
+      "bytes": 57222,
+      "sha256": "156d089f29f909ed8f9a5b3001345575dfe7e4deffb7ab5a30fbce9d9c4d2438"
+    },
+    {
+      "path": "owner_payload.png",
+      "bytes": 434208,
+      "sha256": "9a09628b7abecf4c926ec220af91e131672f5c57180fe0f252ef609b4bc12cf6"
+    }
+  ],
+  "source_commit": "6a5a635c27",
+  "binary_sha256": "75e9d21aea5d8dd1e148827cf40c1c6ba3d3dbceb02686939b291f732c8a7b51",
+  "validation": "Two synthetic tests; all256 native transport checks within2.67e-15; earlier rows unchanged;32 owner swap and32 now swap prefix/direction invariance exact.",
+  "reproduce_figure": "/Users/user/mpd-data/venv/bin/python plot_owner_payload.py --data-root PATH_TO_THIS_ARCHIVE",
+  "limitations": [
+    "Single chosen head; no head-selection independent generalization test.",
+    "Supplied native attention transport identity and human record spans; not automatic algorithm discovery.",
+    "Signed local invocation interventions, not global weight edits.",
+    "Lexical heldout untouched; causal response conditional on retained native model."
+  ]
+}

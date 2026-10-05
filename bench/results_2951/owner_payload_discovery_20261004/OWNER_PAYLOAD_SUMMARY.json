@@ -1,0 +1,30 @@
+{
+  "source_commit": "6a5a635c27",
+  "seconds": 124.172152166,
+  "cases": 64,
+  "signed_controls": 256,
+  "query_swap_pairs": 32,
+  "by_query_now": {
+    "0": {
+      "cases": 32,
+      "mean_symmetric_odds_response_queried_owner": 0.09114940505941005,
+      "mean_symmetric_odds_response_other_owner": 0.009389480973378383,
+      "queried_positive": 32,
+      "queried_stronger": 32
+    },
+    "1": {
+      "cases": 32,
+      "mean_symmetric_odds_response_queried_owner": 0.07595179639840244,
+      "mean_symmetric_odds_response_other_owner": 0.00823334984710894,
+      "queried_positive": 32,
+      "queried_stronger": 32
+    }
+  },
+  "scope": "Native Qwen3-0.6B L19H5 (zero-based). Supplied record spans, selected head and color contrast; measured native causal transport, not recovered address construction. All discovery; no heldout.",
+  "intervention": "Both signs of0.1*d applied to fixed owner old/new value slots, only this head last-query invocation; shared weights unchanged, native suffix live.",
+  "fixed_owner0_attention_larger_when_queried": 32,
+  "fixed_owner0_payload_effect_larger_when_queried": 32,
+  "max_transport_identity_error": 2.6645352591003757e-15,
+  "max_earlier_position_change": 0.0,
+  "max_prefix_direction_invariance_error": 0.0
+}
