@@ -5,6 +5,11 @@
 //! EXPORT TOKENIZER SETTINGS.json OUT.json [ARTIFACT]
 //! relp EXPORT PROMPTS.json OUT_DIR [ARTIFACT]
 //! costs EXPORT CHECKPOINT OUT.json [READOUT.json]
+//! complete EXPORT PROMPTS.json OUT.json [ARTIFACT]
+//!
+//! The `complete` mode checks RelP's completeness on each prompt (`Library::completeness`): at
+//! every cut, its functions' attributions plus the skip connection's against the metric, in
+//! float64 (CUDA, else the host); it writes every check and the largest relative gap.
 //!
 //! The `relp` mode attributes each prompt's metric to every function at every position
 //! (`Library::attributions`). `PROMPTS.json` is `{export_sha256, numeric_bytes, tile_rows,
@@ -178,6 +183,40 @@ fn costs(args: &[String]) -> Result<(), String> {
     std::fs::write(out, serde_json::to_vec(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
+fn complete(args: &[String]) -> Result<(), String> {
+    let (export, prompts_path, out, artifact_path) = match args {
+        [e, p, o] => (e, p, o, None),
+        [e, p, o, a] => (e, p, o, Some(Path::new(a))),
+        _ => return Err("complete EXPORT PROMPTS.json OUT.json [ARTIFACT]".into()),
+    };
+    let export = Path::new(export);
+    let prompts: Prompts = serde_json::from_slice(&std::fs::read(prompts_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    if sha256(&export.join("export.json"))? != prompts.export_sha256 {
+        return Err("export hash mismatch".into());
+    }
+    let device = Device::accelerator(GpuPolicy::Auto).map_err(|e| e.to_string())?.unwrap_or_else(Device::host);
+    let (native, layers, _, artifact) = load(export, 1, 1, artifact_path)?;
+    let library = Library::new(&device, &device, &native, &layers, &artifact, prompts.numeric_bytes, prompts.tile_rows)?;
+    let mut largest: f64 = 0.0;
+    let mut checks = Vec::new();
+    for prompt in &prompts.prompts {
+        let cut = library.completeness(prompt)?;
+        largest = cut.iter().fold(largest, |m, c| m.max(((c.functions + c.stream - c.metric) / c.metric.abs()).abs()));
+        checks.push(cut);
+    }
+    let report = json!({
+        "export": export.display().to_string(),
+        "prompts_sha256": sha256(Path::new(prompts_path))?,
+        "artifact": artifact_path.map(|p| p.display().to_string()),
+        "source_revision": option_env!("GAM_BUILD_GIT_SHA"),
+        "device": device.name(),
+        "largest_relative_gap": largest,
+        "checks": checks,
+    });
+    log::info!("largest relative completeness gap {largest:e} over {} prompts", prompts.prompts.len());
+    std::fs::write(out, serde_json::to_vec(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
@@ -198,6 +237,9 @@ fn main() -> Result<(), String> {
     }
     if args.first().is_some_and(|a| a == "costs") {
         return costs(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "complete") {
+        return complete(&args[1..]);
     }
     let (export, tokenizer, settings_path, out, artifact_path) = match &args[..] {
         [e, t, s, o] => (e, t, s, o, None),

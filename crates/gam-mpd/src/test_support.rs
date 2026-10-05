@@ -57,3 +57,35 @@ pub fn tiny_export(tag: &str, layers: usize) -> PathBuf {
     std::fs::write(dir.join("export.json"), record.to_string()).expect("export.json");
     dir
 }
+
+/// [`tiny_export`] made like Qwen3: SiLU-gated MLPs, an RMS norm with a gain on every head's query
+/// and key, and one key-value head shared by both query heads.
+pub fn tiny_qwen3_export(tag: &str, layers: usize) -> PathBuf {
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    let dir = tiny_export(tag, layers);
+    let path = dir.join("export.json");
+    let mut record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("export.json")).expect("export record");
+    let (d, mlp, head) = (8, 16, 4);
+    let mut rng = StdRng::seed_from_u64(11);
+    for l in 0..layers {
+        for (name, shape, centre) in [
+            ("attn.k_proj", [head, d], 0.0),
+            ("attn.v_proj", [head, d], 0.0),
+            ("mlp.gate_proj", [mlp, d], 0.0),
+            ("attn.q_norm.gain", [1, head], 1.0),
+            ("attn.k_norm.gain", [1, head], 1.0),
+        ] {
+            let name = format!("blocks.{l}.{name}");
+            let bytes: Vec<u8> = (0..shape[0] * shape[1]).flat_map(|_| (centre + rng.random::<f64>() - 0.5).to_le_bytes()).collect();
+            std::fs::write(dir.join(format!("{name}.f64")), bytes).expect("write tensor");
+            record["files"][name] = serde_json::json!({"shape": shape});
+        }
+    }
+    let config = &mut record["config"];
+    config["n_kv_heads"] = 1.into();
+    config["mlp_act"] = "silu".into();
+    config["mlp_gated"] = true.into();
+    config["qk_norm"] = true.into();
+    std::fs::write(&path, record.to_string()).expect("export.json");
+    dir
+}
