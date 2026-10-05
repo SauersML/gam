@@ -320,10 +320,11 @@ impl Resident {
             Some(&root) => edit(root, trace),
             None => Ok(None),
         };
+        let excepted: std::collections::BTreeSet<usize> = tensors.keys().copied().collect();
         if materialize_head {
-            self.program.forward_edited(family, BTreeMap::new(), before, after)
+            self.program.forward_edited(family, BTreeMap::new(), &excepted, before, after)
         } else {
-            self.program.forward_edited_intermediates(family, before, after)
+            self.program.forward_edited_intermediates(family, &excepted, before, after)
         }
     }
 
@@ -506,6 +507,7 @@ mod tests {
             .forward_edited(
                 &family,
                 BTreeMap::new(),
+                &[logits].into(),
                 |node, value| {
                     if node == logits {
                         device.axpy(value, 1.0, &add).map_err(|e| e.to_string())?;
@@ -556,6 +558,7 @@ mod tests {
         let actual = resident
             .forward_edited_intermediates(
                 &family,
+                &Default::default(),
                 |_, _| Ok(()),
                 |node, trace| {
                     if node != last {

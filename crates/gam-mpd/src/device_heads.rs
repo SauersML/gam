@@ -294,25 +294,30 @@ fn weights(d: &Device, heads: &Heads, (q, k): (&Tensor, &Tensor), batch: usize, 
     Ok(scores)
 }
 
-/// `P` and `A` of the group on `x` (the input's value), `blocks` sequences (module note).
-pub(crate) fn forward(d: &Device, heads: &Heads, stacked: &Stacked, x: &Tensor, blocks: usize, turn: Turn<'_>, arithmetic: Arithmetic) -> Result<(Tensor, Tensor), GpuError> {
-    let rows = x.rows();
-    let mut p = d.zeros(rows, heads.columns())?;
+/// `P = x Wᵀ` plus the stacked biases, `x` the input's value (module note).
+pub(crate) fn project(d: &Device, heads: &Heads, stacked: &Stacked, x: &Tensor, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
+    let mut p = d.zeros(x.rows(), heads.columns())?;
     d.gemm(&mut p, 1.0, x, Op::N, &stacked.weights, Op::T, 0.0, arithmetic)?;
     if let Some(b) = &stacked.biases {
         d.add_row(&mut p, 1.0, b)?;
     }
+    Ok(p)
+}
+
+/// `A`, every head's read, from `P`, `blocks` sequences (module note).
+pub(crate) fn attend(d: &Device, heads: &Heads, p: &Tensor, blocks: usize, turn: Turn<'_>, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
+    let rows = p.rows();
     let mut a = d.zeros(rows, heads.heads * heads.width)?;
     let step = step(heads, blocks, rows / blocks);
     for first in (0..heads.keys).step_by(step) {
         let n = step.min(heads.keys - first);
-        let (q, k, v) = split(d, heads, &p, (first, n), blocks, turn)?;
+        let (q, k, v) = split(d, heads, p, (first, n), blocks, turn)?;
         let alpha = weights(d, heads, (&q, &k), blocks * n, arithmetic)?;
         let mut out = d.zeros(q.rows(), heads.width)?;
         d.gemm_batched(blocks * n, &mut out, 1.0, &alpha, Op::N, &v, Op::N, 0.0, arithmetic)?;
         merge_heads(d, &out, &mut a, first * heads.group() * heads.width, n * heads.group(), blocks, None, false)?;
     }
-    Ok((p, a))
+    Ok(a)
 }
 
 /// The cotangent of `P` given `A`'s, `g_a`; the weights are recomputed in the forward's arithmetic,

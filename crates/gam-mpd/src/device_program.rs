@@ -315,21 +315,17 @@ fn ensure<'a>(d: &Device, out: &'a mut Option<Tensor>, rows: usize, width: usize
     out.as_mut().ok_or_else(|| "device: tangent slot".to_string())
 }
 
-/// The nodes whose values a forward pass offers its hooks.
+/// The hooks a forward pass offers node values: `before` at the nodes of its set, `edit` at every
+/// node or none.
 #[derive(Clone, Copy)]
-enum Hooked<'a> {
-    Nowhere,
-    Everywhere,
-    At(&'a BTreeSet<usize>),
+struct Hooks<'a> {
+    before: Option<&'a BTreeSet<usize>>,
+    edit: bool,
 }
 
-impl Hooked<'_> {
-    fn at(&self, node: usize) -> bool {
-        match self {
-            Hooked::Nowhere => false,
-            Hooked::Everywhere => true,
-            Hooked::At(nodes) => nodes.contains(&node),
-        }
+impl Hooks<'_> {
+    fn before(&self, node: usize) -> bool {
+        self.before.is_some_and(|nodes| nodes.contains(&node))
     }
 }
 
@@ -933,45 +929,37 @@ impl DeviceProgram {
         gated: &[(usize, usize)],
         decide: impl FnMut(usize, &DeviceTrace) -> Result<Tensor, String>,
     ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(family, given, gated, decide, false, Hooked::Nowhere, |_, _| Ok(()), |_, _| Ok(None))
+        self.forward_hooks(family, given, gated, decide, false, Hooks { before: None, edit: false }, |_, _| Ok(()), |_, _| Ok(None))
     }
 
-    /// Per-node edits on materialized values, preserving exception-before-intervention order.
-    /// An unsupported unmaterialized head/feature is not offered to either callback.
+    /// Per-node edits on materialized values, preserving exception-before-intervention order:
+    /// `before(node, value)` changes the value of each node in `before_at` in place, then
+    /// `edit(node, trace)` may replace any node's value. In a group of sibling heads run as one
+    /// computation ([`device_heads`]; one with a node in `before_at` runs node by node) `edit` is
+    /// offered the group's projections first, then its heads, each replacement written back before
+    /// the attention or the output reads it: there a hook reads only its own node's value. An
+    /// unsupported unmaterialized head/feature is not offered to either callback.
     pub fn forward_edited(
         &self,
         family: &FamilyInputs,
         given: BTreeMap<usize, Tensor>,
+        before_at: &BTreeSet<usize>,
         before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
         edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(family, given, &[], |_, _| Err("no gate".into()), true, Hooked::Everywhere, before, edit)
+        self.forward_hooks(family, given, &[], |_, _| Err("no gate".into()), true, Hooks { before: Some(before_at), edit: true }, before, edit)
     }
 
-    /// Edited intermediate states with the streamed dense head left unmaterialized.
+    /// [`Self::forward_edited`] with the streamed dense head left unmaterialized.
     /// Callers must not request edits or exceptions at streamed head nodes.
     pub fn forward_edited_intermediates(
         &self,
         family: &FamilyInputs,
+        before_at: &BTreeSet<usize>,
         before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
         edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(family, BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, Hooked::Everywhere, before, edit)
-    }
-
-    /// [`Self::forward_edited`] (`materialize_heads`) or [`Self::forward_edited_intermediates`]
-    /// offering both hooks only the nodes in `at`: every other node's value is left as computed, so
-    /// sibling heads none of whose nodes is in `at` run as one computation ([`device_heads`]).
-    pub fn forward_edited_at(
-        &self,
-        family: &FamilyInputs,
-        given: BTreeMap<usize, Tensor>,
-        at: &BTreeSet<usize>,
-        materialize_heads: bool,
-        before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
-        edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
-    ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(family, given, &[], |_, _| Err("no gate".into()), materialize_heads, Hooked::At(at), before, edit)
+        self.forward_hooks(family, BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, Hooks { before: Some(before_at), edit: true }, before, edit)
     }
 
     pub fn is_streamed_head(&self, node: usize) -> bool {
@@ -985,7 +973,7 @@ impl DeviceProgram {
         gated: &[(usize, usize)],
         mut decide: impl FnMut(usize, &DeviceTrace) -> Result<Tensor, String>,
         materialize_heads: bool,
-        hooked: Hooked<'_>,
+        hooks: Hooks<'_>,
         mut before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
         mut edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
@@ -1001,13 +989,13 @@ impl DeviceProgram {
             }
         }
         let batch = self.prepared_batch(family)?;
-        // A group runs fused unless a hook or a gate may change one of its nodes, or its sequences
-        // are long enough for the tiled attention.
+        // A group runs fused unless an in-place hook or a gate may change one of its nodes, or its
+        // sequences are long enough for the tiled attention.
         let tiled = Self::tiled(rows, batch.blocks);
         let fusing: Vec<bool> = self
             .fused
             .iter()
-            .map(|g| g.live && !tiled && g.heads.members().all(|m| !hooked.at(m) && !gated.iter().any(|&(a, k)| a == m || k == m)))
+            .map(|g| g.live && !tiled && g.heads.members().all(|m| !hooks.before(m) && !gated.iter().any(|&(a, k)| a == m || k == m)))
             .collect();
         let mut trace = DeviceTrace {
             slots: (0..self.steps.len()).map(|_| Slot::Empty).collect(),
@@ -1025,12 +1013,13 @@ impl DeviceProgram {
                 && index != self.fused[g].heads.output
             {
                 if index == self.fused[g].heads.first() {
-                    self.run_heads(&mut trace, g)?;
+                    let mut offer = |trace: &DeviceTrace, node: usize| if hooks.edit { edit(node, trace) } else { Ok(None) };
+                    self.run_heads(&mut trace, g, &mut offer)?;
                 }
                 continue;
             }
             let width = self.widths[index];
-            let hook = hooked.at(index);
+            let hook = hooks.before(index);
             let value = |t: Tensor| Slot::Value(t);
             let mut slot = if let Some(g) = group {
                 value(self.heads_output(&trace, g)?)
@@ -1115,7 +1104,7 @@ impl DeviceProgram {
                 before(index, value)?;
             }
             trace.slots[index] = slot;
-            if hook && let Some(replacement) = edit(index, &trace)? {
+            if hooks.edit && let Some(replacement) = edit(index, &trace)? {
                 if !trace.has(index) {
                     return Err(format!("device: edit of unmaterialized node {index} is unsupported"));
                 }
@@ -1151,22 +1140,56 @@ impl DeviceProgram {
         }
     }
 
-    /// Group `g`'s heads (module note of [`device_heads`]): `P` and `A` into the trace's buffers,
-    /// every member's value a block of them.
-    fn run_heads(&self, trace: &mut DeviceTrace, g: usize) -> Result<(), String> {
+    /// Group `g`'s heads (module note of [`device_heads`]): `P` into the trace's buffers, each
+    /// projection offered to `edit` in node order (a replacement written back into `P`), then `A`
+    /// from `P`, each head offered the same way; every member's value a block of `P` or `A`.
+    fn run_heads(
+        &self,
+        trace: &mut DeviceTrace,
+        g: usize,
+        edit: &mut impl FnMut(&DeviceTrace, usize) -> Result<Option<Tensor>, String>,
+    ) -> Result<(), String> {
+        let d = &self.device;
         let group = &self.fused[g];
         let heads = &group.heads;
         let rotations = Arc::clone(&trace.rotations);
         let turn = turn(&rotations, heads.rotary)?;
-        let (p, a) = device_heads::forward(&self.device, heads, &group.stacked, trace.value(heads.input)?, trace.blocks, turn, self.arithmetic).map_err(error)?;
+        let p = device_heads::project(d, heads, &group.stacked, trace.value(heads.input)?, self.arithmetic).map_err(error)?;
         let (pi, ai) = (trace.buffers.len(), trace.buffers.len() + 1);
-        trace.buffers.extend([p, a]);
-        for node in heads.members() {
-            if let Some((read, start)) = heads.block(node) {
-                trace.slots[node] = Slot::Columns { buffer: if read { ai } else { pi }, start, width: heads.width, copy: OnceLock::new() };
+        trace.buffers.push(p);
+        let mut projections = heads.projections.clone();
+        projections.sort_unstable();
+        Self::offer_blocks(trace, heads, &projections, pi, edit)?;
+        let a = device_heads::attend(d, heads, &trace.buffers[pi], trace.blocks, turn, self.arithmetic).map_err(error)?;
+        trace.buffers.push(a);
+        let mut attends: Vec<usize> = heads.attends.iter().map(|(a, _)| *a).collect();
+        attends.sort_unstable();
+        Self::offer_blocks(trace, heads, &attends, ai, edit)?;
+        trace.fused[g] = Some((pi, ai));
+        Ok(())
+    }
+
+    /// Each node of `nodes` a block of the trace's buffer `buffer`, offered to `edit` in turn; a
+    /// replacement becomes the node's value and is written into the buffer.
+    fn offer_blocks(
+        trace: &mut DeviceTrace,
+        heads: &Heads,
+        nodes: &[usize],
+        buffer: usize,
+        edit: &mut impl FnMut(&DeviceTrace, usize) -> Result<Option<Tensor>, String>,
+    ) -> Result<(), String> {
+        for &node in nodes {
+            let (_, start) = heads.block(node).ok_or("device: a fused node outside its group")?;
+            trace.slots[node] = Slot::Columns { buffer, start, width: heads.width, copy: OnceLock::new() };
+            if let Some(replacement) = edit(trace, node)? {
+                if replacement.dim() != (trace.rows, heads.width) {
+                    return Err(format!("device: edited node {node} has {:?}, expected {} x {}", replacement.dim(), trace.rows, heads.width));
+                }
+                let device = trace.device.clone();
+                device.set_columns(&mut trace.buffers[buffer], start, &replacement).map_err(error)?;
+                trace.slots[node] = Slot::Value(replacement);
             }
         }
-        trace.fused[g] = Some((pi, ai));
         Ok(())
     }
 

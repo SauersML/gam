@@ -185,7 +185,7 @@ fn extract(a: &[String]) -> Result<(), String> {
             let indices: Vec<_> = (at..end).collect();
             let batch = family.select(&indices);
             let trace =
-                resident.forward_edited_intermediates(&batch, |_, _| Ok(()), |_, _| Ok(None))?;
+                resident.forward_edited_intermediates(&batch, &Default::default(), |_, _| Ok(()), |_, _| Ok(None))?;
             for (layer, nodes) in layers.iter().enumerate() {
                 for (head, &node) in nodes.reads.iter().enumerate() {
                     let matrix = device

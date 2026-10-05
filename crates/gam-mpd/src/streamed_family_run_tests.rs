@@ -82,7 +82,7 @@ fn values_prefix_preserves_ordered_partial_native_edits_and_source() {
         let expected=prefix.execute_edited(&imported.contract.family,|node,value,_| {
             apply(&changes.iter().filter(|e|e.node==node).collect::<Vec<_>>(),value);Ok(())
         }).unwrap();
-        let trace=compiled.forward_edited(&imported.contract.family,std::collections::BTreeMap::new(),|_,_|Ok(()),|node,trace| {
+        let trace=compiled.forward_edited(&imported.contract.family,std::collections::BTreeMap::new(),&std::collections::BTreeSet::new(),|_,_|Ok(()),|node,trace| {
             let changes=changes.iter().filter(|e|e.node==node).collect::<Vec<_>>();
             if changes.is_empty(){return Ok(None);}
             let mut value=device.download(trace.value(node)?).map_err(|e|e.to_string())?;
