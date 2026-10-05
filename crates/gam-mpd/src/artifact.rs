@@ -337,6 +337,10 @@ pub struct Owner {
     pub native: String,
     pub native_rows: std::ops::Range<usize>,
     pub native_cols: std::ops::Range<usize>,
+    /// The part of its site the native block is: an MLP's `gate`, `gate_bias`, `up`, `up_bias` or
+    /// `out`, a head's `q`, `k` or `v` (`library_sharing::edit_native`).
+    #[serde(default)]
+    pub role: String,
     #[serde(default)]
     pub left: Vec<String>,
     #[serde(default)]

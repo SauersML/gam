@@ -488,6 +488,111 @@ pub fn share_value(explanation: &Explanation, target: (usize, usize), source: (u
     Ok(out)
 }
 
+/// `explanation` with the native block `owner` stands for edited by `delta` (its shape) at
+/// `owner`'s site alone: every other site, and every other use of a block the site shares, computes
+/// as before. An MLP site's own operator for the part stays applied there whether its block is its
+/// own, tied or a tie's source, so the edit joins the node applying it as a term of its own (a
+/// bias, which no sharing reads, is edited in place); a head's query or key edit joins its map's
+/// node, divided by the site's scalar factors, which act after it; a value edit is added to the
+/// head's value after its factors. A block inside a rule body (`library_bodies`) is the bodies' to
+/// translate.
+pub fn edit_native(explanation: &Explanation, owner: &crate::artifact::Owner, delta: &Array2<f64>) -> Result<Explanation, String> {
+    if delta.dim() != (owner.native_rows.len(), owner.native_cols.len()) {
+        return Err(format!("an edit of {} is {:?}, not {:?}", owner.native, (owner.native_rows.len(), owner.native_cols.len()), delta.dim()));
+    }
+    if owner.body != owner.site {
+        return Err(format!("{} is computed inside the body {}", owner.native, owner.body));
+    }
+    let mut out = explanation.clone();
+    let program = &mut out.artifact.program;
+    let rule = program.rules.iter().position(|r| r.name == owner.site).ok_or_else(|| format!("no site {}", owner.site))?;
+    let provenance = Provenance::derived(&[], format!("edit of {}", owner.native));
+    // The edit as an operator from `cols` to `rows`, `values` at the native block.
+    let edit = |program: &mut OperatorProgram, rows: Interface, cols: Interface, values: &Array2<f64>| -> Result<usize, String> {
+        let mut full = Array2::zeros((rows.width(), cols.width()));
+        full.slice_mut(ndarray::s![owner.native_rows.clone(), owner.native_cols.clone()]).assign(values);
+        let name = format!("edit.{}.{}.{}", owner.site, owner.role, program.operators.len());
+        program.operators.push(Arc::new(dense(name, rows, cols, full, provenance.clone())?));
+        Ok(program.operators.len() - 1)
+    };
+    let shape = |program: &OperatorProgram, op: usize| (program.operators[op].rows.clone(), program.operators[op].cols.clone());
+    match owner.role.as_str() {
+        "gate_bias" | "up_bias" => {
+            let index = operator_index(program, &format!("{}.{}", owner.site, owner.role))?;
+            let source = program.operators[index].clone();
+            let mut values = source.matrix();
+            let mut block = values.slice_mut(ndarray::s![owner.native_rows.clone(), owner.native_cols.clone()]);
+            block += delta;
+            program.operators[index] = Arc::new(dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values, source.provenance.clone())?);
+        }
+        "gate" | "up" | "out" => {
+            let own = operator_index(program, &format!("{}.{}", owner.site, owner.role))?;
+            let (rows, cols) = shape(program, own);
+            let added = edit(program, rows, cols, delta)?;
+            let mut applied = false;
+            for node in &mut program.rules[rule].nodes {
+                if let Node::Affine { terms, .. } = node
+                    && let Some(input) = terms.iter().find(|t| t.1 == own).map(|t| t.0)
+                {
+                    terms.push((input, added));
+                    applied = true;
+                    break;
+                }
+            }
+            if !applied {
+                return Err(format!("{}: no node applies its {}", owner.site, owner.role));
+            }
+        }
+        "q" | "k" => {
+            let at = if owner.role == "q" { 1 } else { 2 };
+            let Node::Affine { terms, .. } = &program.rules[rule].nodes[at] else {
+                return Err(format!("{}: node {at} is not its {} map", owner.site, owner.role));
+            };
+            let like = terms.first().ok_or("an empty map")?.1;
+            // The site's scalar factors act after the map.
+            let mut factor = 1.0;
+            for name in owner.left.iter().chain(&owner.right) {
+                let value = program.operators[operator_index(program, name)?].matrix();
+                if value.dim() != (1, 1) || value[[0, 0]] == 0.0 {
+                    return Err(format!("{}: the factor {name} is not a nonzero scalar", owner.site));
+                }
+                factor *= value[[0, 0]];
+            }
+            let (rows, cols) = shape(program, like);
+            let added = edit(program, rows, cols, &(delta / factor))?;
+            if let Node::Affine { terms, .. } = &mut program.rules[rule].nodes[at] {
+                terms.push((0, added));
+            }
+        }
+        "v" => {
+            let Node::Affine { terms, .. } = &program.rules[rule].nodes[3] else {
+                return Err(format!("{}: node 3 is not its value map", owner.site));
+            };
+            let like = terms.first().ok_or("an empty map")?.1;
+            // The head's value coordinates: the outermost matrix factor's rows (a shared value
+            // map's transport), else the map's own.
+            let outer = owner.left.iter().map(|name| operator_index(program, name)).collect::<Result<Vec<_>, _>>()?.into_iter().find(|&op| program.operators[op].rows.width() * program.operators[op].cols.width() > 1);
+            let rows = shape(program, outer.unwrap_or(like)).0;
+            let added = edit(program, rows.clone(), shape(program, like).1, delta)?;
+            program.operators.push(Arc::new(Operator::identity(format!("edit.{}.v.identity.{}", owner.site, program.operators.len()), rows)));
+            let identity = program.operators.len() - 1;
+            let body = &mut program.rules[rule];
+            let output = body.output;
+            let Node::Attend { value, .. } = body.nodes[output] else {
+                return Err(format!("{}: the output is not an attention node", owner.site));
+            };
+            body.nodes.insert(output, Node::Affine { terms: vec![(value, identity), (0, added)], bias: None });
+            body.output = output + 1;
+            if let Node::Attend { value, .. } = &mut body.nodes[output + 1] {
+                *value = output;
+            }
+        }
+        other => return Err(format!("{}: no edit of a part {other:?}", owner.site)),
+    }
+    program.interfaces().map_err(error)?;
+    Ok(out)
+}
+
 /// `explanation` with its library operators set to `artifact`'s (a posterior-mean artifact of a fit
 /// of this explanation), so a fit of it starts where that fit stood.
 pub fn warm(explanation: &Explanation, artifact: &crate::artifact::Artifact) -> Result<Explanation, String> {
@@ -979,6 +1084,75 @@ mod tests {
             assert!(share_value(&start, (0, 0), (1, 0), 1.0).is_err(), "a later value map cannot stand for an earlier one");
             assert!(share_value(&shared, (1, 0), (0, 0), 1.0).is_err(), "a shared value map is shared once");
         }
+    }
+
+    #[test]
+    fn a_native_edit_translates_to_its_site_alone_through_every_sharing() {
+        let dir = crate::test_support::tiny_export("library_native_edit", 2);
+        let imported = import_language_model(&dir, 6, 12).expect("import");
+        std::fs::remove_dir_all(dir).unwrap();
+        let native = split_sites(&imported.program).expect("split");
+        let mut start = explanation(&native, &layer_nodes(&native, 2).expect("layers")).expect("explanation");
+        // Exact copies: layer 0's output 3 writes 2.5 times layer 1's gate 5; layer 1's function 7
+        // is layer 0's function 4 (gate times 2, output times 0.5); head 0 of layer 1 attends as
+        // head 0 of layer 0; layer 1's group 1 writes 0.7 times what layer 0's group 1 writes.
+        let set = |start: &mut Explanation, name: &str, values: Array2<f64>| {
+            let program = &mut start.artifact.program;
+            let at = operator_index(program, name).unwrap();
+            let source = &program.operators[at];
+            program.operators[at] = Arc::new(dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values, Provenance::default()).unwrap());
+        };
+        let get = |start: &Explanation, name: &str| start.artifact.program.operators[operator_index(&start.artifact.program, name).unwrap()].matrix();
+        let mut out0 = get(&start, "library.l0.mlp.out");
+        out0.column_mut(3).assign(&(&get(&start, "library.l1.mlp.gate").row(5) * 2.5));
+        set(&mut start, "library.l0.mlp.out", out0);
+        let mut gate1 = get(&start, "library.l1.mlp.gate");
+        gate1.row_mut(7).assign(&(&get(&start, "library.l0.mlp.gate").row(4) * 2.0));
+        set(&mut start, "library.l1.mlp.gate", gate1);
+        let mut out1 = get(&start, "library.l1.mlp.out");
+        out1.column_mut(7).assign(&(&get(&start, "library.l0.mlp.out").column(4) * 0.5));
+        set(&mut start, "library.l1.mlp.out", out1);
+        for part in ["h0.q", "kv0.k"] {
+            let values = get(&start, &format!("library.l0.{part}"));
+            set(&mut start, &format!("library.l1.{part}"), values);
+        }
+        let transport = transports(&start, (1, 1), &[(0, 1)]).unwrap().pop().unwrap();
+        let moved = transport.matrix.dot(&get(&start, "library.l0.kv1.v")) * 0.7;
+        set(&mut start, "library.l1.kv1.v", moved);
+        let tied = tie(&start, &[Tie { source: (0, 3), target: (1, 5), scale: 2.5 }]).unwrap();
+        let row = tie_row(&tied, "gate", (1, 7), RowSource::Row { layer: 0, part: "gate", function: 4 }, 2.0).unwrap();
+        let column = tie_column(&row, (1, 7), (0, 4), 0.5).unwrap();
+        let heads = share_query_key(&column, &[Member { layer: 0, group: 0, queries: vec![0] }, Member { layer: 1, group: 0, queries: vec![0] }]).unwrap();
+        let shared = share_value(&heads, (1, 1), (0, 1), 0.7).unwrap();
+        same_native_blocks(&start, &shared);
+        // Every native block a sharing moved, or a sharing reads, edited at its own site: the same
+        // as editing it in the unshared library, where each site holds its own parameters.
+        let output = |e: &Explanation| e.artifact.execute(&imported.family).unwrap().values[e.artifact.program.output].clone();
+        let base = output(&start);
+        let scale = base.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let picked = |o: &crate::artifact::Owner| match (o.site.as_str(), o.role.as_str()) {
+            ("library.l0.mlp", "gate") => o.native_rows == (4..5),
+            ("library.l1.mlp", "gate") => o.native_rows == (5..6) || o.native_rows == (7..8),
+            ("library.l0.mlp", "out") => o.native_cols == (3..4) || o.native_cols == (4..5),
+            ("library.l1.mlp", "out") => o.native_cols == (7..8),
+            ("library.l0.h0" | "library.l1.h0", "q" | "k") | ("library.l0.h1" | "library.l1.h1", "v") => true,
+            _ => false,
+        };
+        let mut edited = 0;
+        for owner in shared.artifact.owners.iter().filter(|o| picked(o)) {
+            let delta = Array2::from_shape_fn((owner.native_rows.len(), owner.native_cols.len()), |(i, j)| 0.1 * ((3 * i + 7 * j + edited) as f64).sin());
+            let own = start.artifact.owners.iter().find(|o| o.native == owner.native && o.native_rows == owner.native_rows && o.native_cols == owner.native_cols && o.site == owner.site).unwrap();
+            let mut reference = start.clone();
+            let mut values = get(&reference, &own.operator);
+            let mut block = values.slice_mut(ndarray::s![own.rows.clone(), own.cols.clone()]);
+            block += &delta;
+            set(&mut reference, &own.operator, values);
+            let (expected, found) = (output(&reference), output(&edit_native(&shared, owner, &delta).unwrap()));
+            assert!(expected.iter().zip(&base).any(|(x, y)| (x - y).abs() > 1e-6 * scale), "{} at {} changes the output", owner.native, owner.site);
+            assert!(expected.iter().zip(found.iter()).all(|(x, y)| (x - y).abs() <= 1e-10 * scale), "{} edited at {} alone", owner.native, owner.site);
+            edited += 1;
+        }
+        assert_eq!(edited, 12, "every chosen native block was edited");
     }
 
     #[test]
