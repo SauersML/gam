@@ -89,7 +89,13 @@ def main():
     files = sorted(f for f in HfApi().list_repo_files(REPO, repo_type="dataset", revision=REVISION) if f.startswith(SUBDIR + "/") and f.endswith(".parquet"))
     source = files[args.file]
     local = hf_hub_download(REPO, source, repo_type="dataset", revision=REVISION)
-    texts = pq.read_table(local, columns=["text"]).column("text").to_pylist()[: args.documents]
+    # The first D documents, read a batch at a time: a source file holds several times more.
+    texts = []
+    for batch in pq.ParquetFile(local).iter_batches(columns=["text"]):
+        texts.extend(batch.column("text").to_pylist())
+        if len(texts) >= args.documents:
+            break
+    texts = texts[: args.documents]
     chunk = 1000
     with ProcessPoolExecutor(args.workers) as pool:
         documents = [d for part in pool.map(encode, [texts[i : i + chunk] for i in range(0, len(texts), chunk)]) for d in part]

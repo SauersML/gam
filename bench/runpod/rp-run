@@ -86,9 +86,11 @@ IMAGE=runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 # Host drivers that run what a 12.4 NVRTC compiles.
 CUDA_OK='["12.4","12.5","12.6","12.7","12.8","12.9","13.0"]'
 # The budget: at most $150 of the team account's credit, which stood at $750 on 2026-10-05 11:10.
-CAP_DOLLARS=150 START_BALANCE=750
+# A pod made outside the runner has no cap it knows; it is counted as running 4 h more, the default
+# cap of a dev pod.
+CAP_DOLLARS=150 START_BALANCE=750 UNCAPPED_HOURS=4
 # The runner's own files in the outputs directory: never synced from or restored to a pod.
-OWN=(run.log rp-run.log pod.json pod.txt build.log watch.log cost.txt ssh rsh host STOP EXTEND)
+OWN=(run.log rp-run.log pod.json pod.txt build.log data.log watch.log cost.txt ssh rsh host STOP EXTEND)
 # Never synced either: a file still being written (library_mdl writes NAME.partial, then renames it),
 # and library_mdl's cache of M's targets beside its checkpoint (tens of GB on Qwen3, rebuilt when
 # missing; moving it through the Mac's uplink would take longer than rebuilding it).
@@ -113,8 +115,8 @@ gql() { api POST "$GRAPHQL" "$(jq -nc --arg q "$1" '{query: $q}')"; }
 reap() {
     local pod=$1 rec=$ACTIVE/$1 r code tries=0 gone=0
     [ -f "$rec" ] || return 0
-    local name gpu cloud price created ended
-    read -r name gpu cloud price created _ < "$rec"
+    local name gpu cloud price created ended upload_s data_s wait_s
+    read -r name gpu cloud price created _ _ _ upload_s data_s wait_s < "$rec"
     gpu=${gpu//_/ }
     while (( tries < 20 )); do
         r=$(api DELETE "$REST/pods/$pod")
@@ -147,11 +149,14 @@ reap() {
         sleep 1
     done
     if [ -f "$rec" ]; then
-        [ -f "$LEDGER" ] || printf 'date\tname\tgpu\tcloud\thours\tdollars\tpod\n' > "$LEDGER"
+        [ -f "$LEDGER" ] || printf 'date\tname\tgpu\tcloud\thours\tdollars\tpod\tupload_s\tdata_s\twait_s\n' > "$LEDGER"
+        # Seconds the pod spent on the inputs' upload, on building data from public sources, and
+        # from its creation to the command's start (the two overlap each other and the build).
+        head -n 1 "$LEDGER" | grep -q wait_s || sed -i '' '1s/$/\tupload_s\tdata_s\twait_s/' "$LEDGER"
         local hours dollars total line
         hours=$(awk -v a="$created" -v b="$ended" 'BEGIN { printf "%.4f", (b - a) / 3600 }')
         dollars=$(awk -v h="$hours" -v p="$price" 'BEGIN { printf "%.4f", h * p }')
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$name" "$gpu" "$cloud" "$hours" "$dollars" "$pod" >> "$LEDGER"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$name" "$gpu" "$cloud" "$hours" "$dollars" "$pod" "${upload_s:--}" "${data_s:--}" "${wait_s:--}" >> "$LEDGER"
         total=$(awk -F'\t' 'NR > 1 { s += $6 } END { printf "%.2f", s }' "$LEDGER")
         line="pod $pod deleted (confirmed). $gpu ($cloud) at \$$price/h x $hours h = \$$dollars; ledger total \$$total"
         echo "rp-run: $line" >&2
@@ -177,23 +182,40 @@ usage() { sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 hours_ok() { [[ $1 =~ ^[0-9]*\.?[0-9]+$ ]] && awk -v h="$1" 'BEGIN { exit !(h > 0 && h <= 72) }' || { echo "rp-run: HOURS must be in (0, 72]" >&2; exit 2; }; }
 name_ok() { [[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || { echo "rp-run: NAME must be [A-Za-z0-9._-]+" >&2; exit 2; }; }
 
-# The budget: the account's spend since the credit stood at START_BALANCE, plus what this Mac's runs
-# in progress may still spend (each one's estimate less the time it has used), plus ESTIMATE.
+# The budget, over the whole team account: what it has spent since the credit stood at
+# START_BALANCE, plus what every pod running now may still cost: its price for the time left to its
+# cap (the runner's deadline for a pod it holds; UNCAPPED_HOURS for a pod made elsewhere, which has
+# no cap the runner knows), plus ESTIMATE. Every running pod the runner does not hold is named.
+# Refuses when that passes CAP_DOLLARS unless RP_ALLOW_OVER=1; RP_DRY=1 only reports it.
 budget() {  # ESTIMATE WHAT
-    local r balance spent running=0 rec price created owner est now
+    local r b balance spent pods running=0 id name price left now due rec created est
     r=$(gql 'query { myself { clientBalance currentSpendPerHr } }')
     [ "$(status_of "$r")" = 200 ] || { echo "rp-run: balance query failed: $(body_of "$r" | head -c 300)" >&2; exit 1; }
-    balance=$(jq -r '.data.myself.clientBalance' <<< "$(body_of "$r")")
+    b=$(body_of "$r")
+    balance=$(jq -r '.data.myself.clientBalance' <<< "$b")
     spent=$(awk -v s="$START_BALANCE" -v b="$balance" 'BEGIN { printf "%.2f", s - b }')
+    r=$(api GET "$REST/pods")
+    [ "$(status_of "$r")" = 200 ] || { echo "rp-run: pod list failed: $(body_of "$r" | head -c 300)" >&2; exit 1; }
+    pods=$(jq -r '.[] | select(.desiredStatus == "RUNNING") | "\(.id) \(.costPerHr // 0) \(.name)"' <<< "$(body_of "$r")")
     now=$(date +%s)
-    for rec in "$ACTIVE"/*; do
-        [ -f "$rec" ] || continue
-        read -r _ _ _ price created owner est _ < "$rec" || true
-        kill -0 "${owner:-0}" 2> /dev/null || continue
-        running=$(awk -v a="$running" -v e="${est:-0}" -v p="$price" -v t="$(( now - created ))" 'BEGIN { r = e - p * t / 3600; printf "%.2f", a + (r > 0 ? r : 0) }')
-    done
-    echo "rp-run: account spent \$$spent (balance \$$balance, spending \$$(jq -r '.data.myself.currentSpendPerHr' <<< "$(body_of "$r")")/h); runs in progress may add \$$running; $2 \$$1" >&2
-    if awk -v s="$spent" -v r="$running" -v e="$1" -v c="$CAP_DOLLARS" 'BEGIN { exit !(s + r + e > c) }' && [ -z "${RP_ALLOW_OVER:-}" ]; then
+    while read -r id price name; do
+        [ -n "$id" ] || continue
+        rec=$ACTIVE/$id
+        if [ -f "$ACTIVE/.$id.deadline" ]; then
+            due=$(cat "$ACTIVE/.$id.deadline")
+            left=$(( due - now ))
+        elif [ -f "$rec" ]; then
+            # Held by a runner from before deadlines were recorded: its estimate less what it has run.
+            read -r _ _ _ _ created _ est _ < "$rec"
+            left=$(awk -v e="$est" -v p="$price" -v t="$(( now - created ))" 'BEGIN { s = (p > 0 ? e / p * 3600 - t : 0); printf "%d", s }')
+        else
+            left=$(( UNCAPPED_HOURS * 3600 ))
+            echo "rp-run: pod $id ($name, \$$price/h) is not under rp-run; counted as running $UNCAPPED_HOURS h more" >&2
+        fi
+        running=$(awk -v a="$running" -v p="$price" -v t="$left" 'BEGIN { printf "%.2f", a + (t > 0 ? p * t / 3600 : 0) }')
+    done <<< "$pods"
+    echo "rp-run: account spent \$$spent (balance \$$balance, \$$(jq -r '.data.myself.currentSpendPerHr' <<< "$b")/h now); running pods may add \$$running; $2 \$$1" >&2
+    if awk -v s="$spent" -v r="$running" -v e="$1" -v c="$CAP_DOLLARS" 'BEGIN { exit !(s + r + e > c) }' && [ -z "${RP_ALLOW_OVER:-}" ] && [ -z "${RP_DRY:-}" ]; then
         echo "rp-run: \$$spent + \$$running + \$$1 exceeds \$$CAP_DOLLARS; RP_ALLOW_OVER=1 to spend it anyway" >&2
         exit 2
     fi
@@ -310,7 +332,7 @@ for rec in "$ACTIVE"/*; do
         reap "${rec##*/}" || exit 1
     fi
 done
-[ -n "${RP_DRY:-}" ] || budget "$ESTIMATE" "this $MODE's estimate for $HOURS h"
+budget "$ESTIMATE" "this $MODE's estimate for $HOURS h"
 if [ "$MODE" = run ] && [ ${#live[@]} -gt 0 ] && [ -z "${RP_PARALLEL:-}" ]; then
     echo "rp-run: pod ${live[*]} is running for another rp-run; RP_PARALLEL=1 to run beside it" >&2
     exit 2
@@ -342,8 +364,14 @@ NEED_RUST=0
 [ "$MODE" = dev ] && NEED_RUST=1
 [ "$MODE" = run ] && [ "$1" = cargo ] && NEED_RUST=1
 
-uploads=() hf=() srcpaths=() examples=() words=()
+uploads=() hf=() srcpaths=() examples=() words=() fineweb=() pile=()
 [ -z "$C" ] || ! git -C "$MAC_GAM" cat-file -e "$C:bench/runpod" 2> /dev/null || srcpaths+=(bench/runpod)
+# The FineWeb release's contents (per shard: source file and every file's sha256), remade when the
+# release changes.
+CONTENTS=$MAC_DATA/qwen3_fineweb/release/CONTENTS.json
+if [ -f "${CONTENTS%/*}/SHA256SUMS" ] && { [ ! -f "$CONTENTS" ] || [ "${CONTENTS%/*}/SHA256SUMS" -nt "$CONTENTS" ]; }; then
+    /usr/bin/python3 "${SELF%/*}/fineweb_contents.py" > /dev/null || { echo "rp-run: could not read the FineWeb release" >&2; exit 1; }
+fi
 first=1
 [ "$MODE" = run ] || first=0
 for a in "$@"; do
@@ -357,7 +385,18 @@ for a in "$@"; do
     while read -r p; do
         [ -n "$p" ] || continue
         case $p in "$MAC_DATA"/runpod/*|"$MAC_DATA"/venv*) continue ;; esac
-        [ -e "$p" ] && uploads+=("${p#"$MAC_DATA"/}")
+        rel=${p#"$MAC_DATA"/}
+        rel=${rel%/}
+        # Data with a public source is built on the pod: a FineWeb release shard (or its Mac copy
+        # train, heldout), and a vpd4l export extended with Pile training rows (its base export,
+        # which holds the target's weights, goes up instead).
+        if [[ $rel =~ ^qwen3_fineweb/([^/]+)(/([^/]+))?$ ]] && [ -f "$CONTENTS" ] && jq -e --arg d "${BASH_REMATCH[1]}" 'has($d)' "$CONTENTS" > /dev/null; then
+            fineweb+=("${BASH_REMATCH[1]} ${BASH_REMATCH[3]:-}")
+        elif [[ $rel =~ ^engine/([^/]+) ]] && jq -e '.source.extends.export' "$MAC_DATA/engine/${BASH_REMATCH[1]}/export.json" > /dev/null 2>&1; then
+            pile+=("${BASH_REMATCH[1]}")
+        elif [ -e "$p" ]; then
+            uploads+=("$rel")
+        fi
     done < <(grep -oE "$MAC_DATA/[^ :,;=\"']+" <<< "$a" || true)
     while read -r p; do
         [ -n "$p" ] && hf+=("$p")
@@ -389,6 +428,58 @@ for x in "${examples[@]}"; do
     crate=${crate%%/*}
     package_of[$x]=$(git -C "$MAC_GAM" show "$C:crates/$crate/Cargo.toml" | sed -nE 's/^name = "([^"]+)"/\1/p' | head -n 1)
 done
+# FineWeb shards to build: "DIR|FILE_INDEX|DOCUMENTS|CONTEXTS|SHA256SUM-LINES" (the files the
+# command names, documents.u32 and offsets.u64; every window length when it names the directory).
+fw_plan=() pile_plan=() data_kb=0
+if [ ${#fineweb[@]} -gt 0 ]; then
+    git -C "$MAC_GAM" cat-file -e "$C:bench/mpd_qwen3_fineweb_2951.py" 2> /dev/null || { echo "rp-run: ${C:0:12} has no bench/mpd_qwen3_fineweb_2951.py to build FineWeb shards with" >&2; exit 2; }
+    srcpaths+=(bench/mpd_qwen3_fineweb_2951.py)
+    for d in $(for e in "${fineweb[@]}"; do echo "${e%% *}"; done | sort -u); do
+        entry=$(jq -c --arg d "$d" '.[$d]' "$CONTENTS")
+        all=$(jq -r '.files | keys[] | capture("^windows_T(?<t>[0-9]+)[.]u32$").t' <<< "$entry" | sort -n | tr '\n' ' ')
+        ts=""
+        for e in "${fineweb[@]}"; do
+            [ "${e%% *}" = "$d" ] || continue
+            f=${e#* }
+            case $f in
+                "") ts+="$all" ;;
+                windows_T*.u32) t=${f#windows_T}; ts+="${t%.u32} " ;;
+                documents.u32|offsets.u64|meta.json) ;;
+                *) echo "rp-run: qwen3_fineweb/$d/$f is not a file of the FineWeb release" >&2; exit 2 ;;
+            esac
+        done
+        [ -n "$ts" ] || ts=${all%% *}
+        ts=$(tr ' ' '\n' <<< "$ts" | sed '/^$/d' | sort -nu | tr '\n' ',' | sed 's/,$//')
+        check="documents.u32 offsets.u64 $(tr ',' '\n' <<< "$ts" | sed 's/.*/windows_T&.u32/' | tr '\n' ' ')"
+        sums=""
+        for f in $check; do
+            sha=$(jq -r --arg f "$f" '.files[$f] // empty' <<< "$entry")
+            [ -n "$sha" ] || { echo "rp-run: qwen3_fineweb/$d has no $f in the release" >&2; exit 2; }
+            sums+="$sha  $f;"
+            data_kb=$(( data_kb + $(jq -r --arg f "$f" '.sizes[$f]' <<< "$entry") / 1024 ))
+        done
+        fw_plan+=("$d|$(jq -r '.file_index' <<< "$entry")|$(jq -r '.documents' <<< "$entry")|$ts|$sums")
+    done
+    # The largest source file is on the pod's disk while its shard is built.
+    data_kb=$(( data_kb + $(curl -sS -X POST -H 'Content-Type: application/json' --max-time 60 \
+        -d "$(jq -c '{paths: [.[] | .source_file] | unique}' "$CONTENTS")" \
+        https://huggingface.co/api/datasets/HuggingFaceFW/fineweb/paths-info/9bb295ddab0e05d785b879661af7260fed5140fc |
+        jq '[.[].size] | max' ) / 1024 ))
+fi
+# Pile-extended vpd4l exports to build: "EXPORT BASE MIN_TRAIN_ROWS" (the base export uploaded).
+if [ ${#pile[@]} -gt 0 ]; then
+    git -C "$MAC_GAM" cat-file -e "$C:bench/vpd_2951/vpd_engine_export_pile.py" 2> /dev/null || { echo "rp-run: ${C:0:12} has no bench/vpd_2951/vpd_engine_export_pile.py to build Pile exports with" >&2; exit 2; }
+    srcpaths+=(bench/vpd_2951/vpd_engine_export_pile.py)
+    for x in $(printf '%s\n' "${pile[@]}" | sort -u); do
+        record_json=$MAC_DATA/engine/$x/export.json
+        base=$(jq -r '.source.extends.export' "$record_json")
+        [[ $base == "$MAC_DATA"/* ]] && [ -f "$base/export.json" ] || { echo "rp-run: engine/$x extends $base, which is not an export under $MAC_DATA" >&2; exit 2; }
+        uploads+=("${base#"$MAC_DATA"/}")
+        pile_plan+=("$x ${base#"$MAC_DATA"/} $(jq '[.source.data[1:][] | .rows[1] - .rows[0]] | add' "$record_json")")
+        # The export, and the Pile files it is built from (smaller than their float64 rows).
+        data_kb=$(( data_kb + 2 * $(du -skL "$MAC_DATA/engine/$x" | cut -f1) ))
+    done
+fi
 KEY="" CACHE="" CHANNEL=""
 if [ -n "$C" ]; then
     # Binaries built from the same Rust sources in the same image are the same binaries.
@@ -418,7 +509,7 @@ for p in "${hf[@]}"; do hf_kb=$(( hf_kb + $(du -skL "$p" | cut -f1) )); done
 # the models fetched and the outputs (as large again as the inputs).
 base=30
 [ "$MODE" = dev ] && base=60
-DISK=$(( base + (2 * (upload_kb + hf_kb) + 1048575) / 1048576 ))
+DISK=$(( base + (2 * (upload_kb + hf_kb) + data_kb + 1048575) / 1048576 ))
 # A command whose outputs outgrow that (a fit's checkpoints and kept targets) states its own.
 if [ -n "${RP_DISK_GB:-}" ]; then
     [[ $RP_DISK_GB =~ ^[0-9]+$ ]] && (( RP_DISK_GB >= DISK )) || { echo "rp-run: RP_DISK_GB must be a whole number of GB, at least $DISK" >&2; exit 2; }
@@ -442,6 +533,9 @@ if [ -n "${RP_DRY:-}" ]; then
     echo "commit:   ${C:-none}"
     echo "uploads:  ${uploads[*]:-none} (${#files[@]} files, $(( upload_kb / 1024 )) MB)"
     echo "hf:       ${hf[*]:-none}"
+    built=$( for e in "${fw_plan[@]}"; do IFS='|' read -r d k n ts _ <<< "$e"; printf 'qwen3_fineweb/%s (FineWeb file %s, %s documents, contexts %s) ' "$d" "$k" "$n" "$ts"; done
+             for e in "${pile_plan[@]}"; do read -r x b m <<< "$e"; printf 'engine/%s (from %s and %s Pile train rows) ' "$x" "$b" "$m"; done )
+    echo "built:    ${built:-none}"
     echo "source:   crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md ${srcpaths[*]:-}"
     echo "examples: $(for x in "${examples[@]}"; do printf '%s (%s, %s) ' "$x" "${package_of[$x]}" "$( [ -x "$CACHE/$x" ] && echo cached || echo built)"; done) rust ${CHANNEL:-none}"
     echo "command:  ${cmd:-none}"
@@ -452,6 +546,7 @@ fi
 mkdir -p "$OUT"
 LOG=$OUT/run.log
 : > "$LOG"
+rm -f "$OUT/data.log"
 say() { echo "rp-run: $*" >&2; echo "$(date '+%F %T') $*" >> "$OUT/rp-run.log"; }
 TMP=$(mktemp -d /tmp/rp-run.XXXXXX)
 if [ "$MODE" = adopt ]; then
@@ -656,6 +751,7 @@ upload_inputs() {
     for i in "${pids[@]}"; do wait "$i" || failed=1; done
     (( ! failed )) || { say "upload failed"; return 1; }
     took=$(( $(date +%s) - started ))
+    echo "$took" >> "$TMP/upload_s"
     say "uploaded ${#files[@]} files, $(( upload_kb / 1024 )) MB, in $took s ($(awk -v k="$upload_kb" -v t="$took" 'BEGIN { printf "%.1f", k / 1024 / (t > 0 ? t : 1) }') MB/s, $streams streams)"
 }
 
@@ -671,17 +767,92 @@ fetch_models() {
     done
 }
 
-# The source, binaries, inputs, models and the outputs synced so far, on the current pod.
+# The Python packages the data builds use, installed once per pod (either build may ask first).
+# NumPy 2, as the release was built with: under NumPy 1 an unsigned offset plus an int is a float,
+# which the FineWeb script cannot slice with.
+pydeps() {
+    on_pod 'flock /workspace/.pydeps.lock sh -c "[ -f /workspace/.pydeps ] || { python3 -m pip install -q \"numpy>=2\" pyarrow huggingface_hub tokenizers > /workspace/pydeps.log 2>&1 && touch /workspace/.pydeps; }"'
+}
+
+# A build on the pod: a lost connection (ssh's 255) loses the pod; any other failure, or files
+# that differ from their recorded sha256s, refuses the run (TMP/refused).
+data_step() {  # WHAT COMMAND...
+    local what=$1 rc
+    shift
+    new_conn "$@"
+    rc=$?
+    (( rc == 0 )) && return 0
+    (( rc == 255 )) || { say "$what failed; refusing to run"; touch "$TMP/refused"; }
+    return 1
+}
+
+# The FineWeb shards the command names, tokenized on the pod by the commit's script from the
+# FineWeb source file, each file checked against the release's sha256 (CONTENTS.json, made from the
+# tarballs SHA256SUMS lists). The shards build at once, the vCPUs shared among them, so one shard's
+# download overlaps another's tokenizing; each source file is deleted once its shard is built.
+build_fineweb() {
+    [ ${#fw_plan[@]} -gt 0 ] || return 0
+    local started=$(date +%s) e workers pids=() failed=0 p
+    pydeps || { touch "$TMP/refused"; say "the Python packages for the data builds did not install (/workspace/pydeps.log)"; return 1; }
+    workers=$(( ${VCPU:-${#fw_plan[@]}} / ${#fw_plan[@]} ))
+    (( workers > 0 )) || workers=1
+    for e in "${fw_plan[@]}"; do
+        (
+            IFS='|' read -r d k n ts sums <<< "$e"
+            data_step "building qwen3_fineweb/$d (/workspace/data-$d.log)" "cd /workspace/src && python3 bench/mpd_qwen3_fineweb_2951.py --file $k --documents $n --context ${ts//,/ } --out /workspace/mpd-data/qwen3_fineweb/$d --workers $workers > /workspace/data-$d.log 2>&1 && rm -rf ~/.cache/huggingface/hub/datasets--HuggingFaceFW--fineweb/blobs/\$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"source\"][\"sha256\"])' /workspace/mpd-data/qwen3_fineweb/$d/meta.json)" || exit 1
+            tr ';' '\n' <<< "$sums" | sed '/^$/d' | data_step "checking qwen3_fineweb/$d against the release's sha256s" "cd /workspace/mpd-data/qwen3_fineweb/$d && sha256sum -c --quiet" || exit 1
+            say "built qwen3_fineweb/$d on the pod (FineWeb file $k, $n documents, contexts $ts); its files match the release"
+        ) &
+        pids+=($!)
+    done
+    for p in "${pids[@]}"; do wait "$p" || failed=1; done
+    (( ! failed )) || return 1
+    echo $(( $(date +%s) - started )) >> "$TMP/data_s"
+}
+
+# The Pile-extended vpd4l exports the command names, built on the pod by the commit's script from
+# the uploaded base export and the Pile files, every tensor checked against the Mac's export.json,
+# which then replaces the pod's (they differ only in the base export's path), so the export is the
+# Mac's byte for byte.
+build_pile() {
+    [ ${#pile_plan[@]} -gt 0 ] || return 0
+    local started=$(date +%s) e x base min
+    pydeps || { touch "$TMP/refused"; say "the Python packages for the data builds did not install (/workspace/pydeps.log)"; return 1; }
+    for e in "${pile_plan[@]}"; do
+        read -r x base min <<< "$e"
+        data_step "building engine/$x (/workspace/data-$x.log)" "cd /workspace/src && python3 bench/vpd_2951/vpd_engine_export_pile.py /workspace/mpd-data/$base /workspace/mpd-data/engine/$x $min > /workspace/data-$x.log 2>&1 && rm -rf ~/mpd-data/hf" || return 1
+        jq -r '.files | to_entries[] | "\(.value.sha256)  \(.key).f64"' "$MAC_DATA/engine/$x/export.json" |
+            data_step "checking engine/$x against the Mac's export.json" "cd /workspace/mpd-data/engine/$x && sha256sum -c --quiet" || return 1
+        data_step "installing engine/$x's export.json" "cat > /workspace/mpd-data/engine/$x/export.json" < "$MAC_DATA/engine/$x/export.json" || return 1
+        say "built engine/$x on the pod ($min Pile train rows after $base's); its tensors match the Mac's export.json"
+    done
+    echo $(( $(date +%s) - started )) >> "$TMP/data_s"
+}
+
+# The pod's upload, data-build and waiting seconds, into its record for the ledger.
+note_times() {
+    local up data rec=$ACTIVE/$POD n g k p c o e m
+    [ -f "$rec" ] || return 0
+    up=$(awk '{ s += $1 } END { print s + 0 }' "$TMP/upload_s" 2> /dev/null || echo 0)
+    data=$(awk '{ s += $1 } END { print s + 0 }' "$TMP/data_s" 2> /dev/null || echo 0)
+    read -r n g k p c o e m _ < "$rec"
+    printf '%s %s %s %s %s %s %s %s %s %s %s\n' "$n" "$g" "$k" "$p" "$c" "$o" "$e" "$m" "$up" "$data" "$(( $(date +%s) - CREATED ))" > "$rec"
+}
+
+# The source, binaries, inputs, data, models and the outputs synced so far, on the current pod.
 setup() {
     local started=$(date +%s) x pkg flags build=() cached=() jobs=()
     # Every step checks its own status: `set -e` does not act inside the condition this runs in. A
     # step that fails on the connection (ssh's 255) loses the pod; any other failure ends the run.
-    # Inputs, models and rsync (for syncing outputs) arrive while the source, toolchain and builds do.
-    upload_inputs & jobs+=($!)
-    fetch_models & jobs+=($!)
-    on_pod 'command -v rsync > /dev/null || { apt-get update -qq && apt-get install -y -qq rsync; } > /dev/null 2>&1' & jobs+=($!)
+    # The source first: the data builds run its scripts.
     git -C "$MAC_GAM" archive "$C" crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md "${srcpaths[@]}" |
         gzip -1 | on_pod 'mkdir -p /workspace/src /workspace/bin "/workspace/mpd-data/runpod/'"$NAME"'" && gzip -dc | tar -x -C /workspace/src' || return 1
+    # Inputs, data, models and rsync (for syncing outputs) arrive while the toolchain and builds do.
+    rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
+    { upload_inputs && build_pile; } & jobs+=($!)
+    build_fineweb & jobs+=($!)
+    fetch_models & jobs+=($!)
+    on_pod 'command -v rsync > /dev/null || { apt-get update -qq && apt-get install -y -qq rsync; } > /dev/null 2>&1' & jobs+=($!)
     for x in "${examples[@]}"; do
         if [ -x "$CACHE/$x" ]; then cached+=("$x"); else build+=("$x"); fi
     done
@@ -711,13 +882,20 @@ setup() {
     fi
     local failed=0
     for x in "${jobs[@]}"; do wait "$x" || failed=1; done
-    (( ! failed )) || { say "an input, model or rsync did not arrive"; return 1; }
+    if [ -f "$TMP/refused" ]; then
+        note_times
+        on_pod 'tail -n 40 /workspace/pydeps.log /workspace/data-*.log 2> /dev/null' > "$OUT/data.log" 2>&1
+        say "the data builds' logs are in $OUT/data.log"
+        exit 1
+    fi
+    (( ! failed )) || { say "an input, data, model or rsync did not arrive"; return 1; }
     # What an earlier pod of this run wrote, so the command can resume from it.
     if [ "$MODE" = run ] && [ -n "$(find "$OUT" -mindepth 1 $(printf '! -name %s ' "${OWN[@]}") -print -quit)" ]; then
         rsync -a "${RSYNC_EXCLUDE[@]}" -e "${SSH[*]} -o ControlPath=none -p $PORT" "$OUT/" "root@$IP:/workspace/mpd-data/runpod/$NAME/" || return 1
         say "restored the outputs synced so far"
     fi
-    say "set up in $(( $(date +%s) - started )) s"
+    note_times
+    say "set up in $(( $(date +%s) - started )) s (pod waited $(( $(date +%s) - CREATED )) s since its creation)"
 }
 
 # The outputs, copied to the Mac a minute after each copy ends, while the command runs.
@@ -800,8 +978,8 @@ hold() {
             DEADLINE=$(( DEADLINE + $(awk -v h="$h" 'BEGIN { printf "%d", h * 3600 }') ))
             ESTIMATE=$(awk -v e="$ESTIMATE" -v p="$PRICE" -v h="$h" 'BEGIN { printf "%.2f", e + p * h }')
             if arm $(( DEADLINE - now )); then
-                read -r n g k p c o _ m < "$ACTIVE/$POD"
-                printf '%s %s %s %s %s %s %s %s\n' "$n" "$g" "$k" "$p" "$c" "$o" "$ESTIMATE" "$m" > "$ACTIVE/$POD"
+                read -r n g k p c o _ m rest < "$ACTIVE/$POD"
+                printf '%s %s %s %s %s %s %s %s %s\n' "$n" "$g" "$k" "$p" "$c" "$o" "$ESTIMATE" "$m" "${rest:-}" > "$ACTIVE/$POD"
                 echo "$DEADLINE" > "$ACTIVE/.$POD.deadline"
                 say "extended by $h h: held until $(date -r "$DEADLINE" '+%F %T')"
             else
