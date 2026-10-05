@@ -1231,6 +1231,27 @@ impl Device {
         self.kl_rows_impl(target, logits, scored, true)
     }
 
+    /// [`Device::kl_rows`] (with `gradient`; else [`Device::kl_score_rows`]) leaving each row's KL
+    /// on the device in `kl` (rows × 1, float64 storage whatever the operands' storage: per-row
+    /// results are float64 in both; make it with the float64 twin), so a captured step can record
+    /// it. Host and CUDA.
+    pub fn kl_rows_into(&self, target: &Tensor, logits: &mut Tensor, scored: Option<&Indices>, gradient: bool, kl: &mut Tensor) -> Result<(), GpuError> {
+        same(target, logits, "kl")?;
+        if kl.dim() != (logits.rows, 1) || kl.storage() != Storage::F64 || scored.is_some_and(|s| s.len != logits.rows) {
+            return Err(shape(format!("a float64 {:?} KL column for {:?} logits", kl.dim(), logits.dim())));
+        }
+        match (&*self.backend, &mut kl.data) {
+            (Backend::Host, Data::Host(out)) => {
+                let values = self.kl_rows_impl(target, logits, scored, gradient)?;
+                out.copy_from_slice(&values);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::Cuda(out)) => engine.kl_rows_into(target, logits, scored, gradient, out),
+            _ => Err(GpuError::NoDeviceKernel { reason: format!("{} keeps no KL column", self.name()) }),
+        }
+    }
+
     /// Stable full-vocabulary softmax and (log partition, negative entropy) per row.
     /// Overwrites logits with probabilities; unscored rows become exactly zero.
     /// Operational floating-point statistics, not certified real-arithmetic intervals.
@@ -1611,6 +1632,43 @@ impl Device {
             }
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the swept head log partition runs on the host or CUDA".to_string() }),
+        }
+    }
+
+    /// [`Device::head_log_partition`] leaving each row's log partition on the device in
+    /// `partitions` (rows × 1, float64 storage whatever the operands' storage), so a captured step
+    /// can record it: CUDA f32 storage records it whole; elsewhere this is the downloading form's
+    /// values written back.
+    pub fn head_log_partition_into(
+        &self,
+        hidden: &Tensor,
+        head: &Tensor,
+        transposed: bool,
+        scored: Option<&Indices>,
+        expected: Option<&mut Tensor>,
+        partitions: &mut Tensor,
+        arithmetic: Arithmetic,
+    ) -> Result<(), GpuError> {
+        if partitions.dim() != (hidden.rows, 1) || partitions.storage() != Storage::F64 {
+            return Err(shape(format!("a float64 {:?} log partition column for {:?} rows", partitions.dim(), hidden.dim())));
+        }
+        match (&*self.backend, &mut partitions.data) {
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::Cuda(out)) if hidden.storage() == Storage::F32 && hidden.rows > 0 => {
+                let classes = if transposed { head.cols } else { head.rows };
+                let head_width = if transposed { head.rows } else { head.cols };
+                if head_width != hidden.cols || classes == 0 || scored.is_some_and(|s| s.len != hidden.rows) || expected.as_ref().is_some_and(|e| e.dim() != hidden.dim()) {
+                    return Err(shape(format!("a {:?} head (transposed {transposed}) on {:?} rows", head.dim(), hidden.dim())));
+                }
+                let chunk = ((1usize << 23) / hidden.rows).max(512);
+                engine.head_log_partition_into(hidden, (head, transposed), scored, expected, out, (chunk, arithmetic))
+            }
+            _ => {
+                let values = self.head_log_partition(hidden, head, transposed, scored, expected, arithmetic)?;
+                let wide = self.with_storage(Storage::F64)?;
+                let column = wide.upload_vec(values.len(), 1, values)?;
+                wide.set_rows(partitions, 0, &column)
+            }
         }
     }
 
@@ -4171,6 +4229,15 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         pub(super) fn kl_rows(&self, target: &Tensor, logits: &mut Tensor, scored: Option<&Indices>, gradient: bool) -> Result<Vec<f64>, GpuError> {
             let mut kl = self.zeros(logits.rows)?;
+            let n_rows = logits.rows;
+            self.kl_rows_into(target, logits, scored, gradient, &mut kl)?;
+            let mut out = self.download(&kl)?;
+            out.truncate(n_rows);
+            Ok(out)
+        }
+
+        /// The KL rows into `kl` (one double per row), left on the device.
+        pub(super) fn kl_rows_into(&self, target: &Tensor, logits: &mut Tensor, scored: Option<&Indices>, gradient: bool, kl: &mut CudaSlice<f64>) -> Result<(), GpuError> {
             let (rows, cols) = (logits.rows as u32, logits.cols as u32);
             let (flags, use_flags) = self.flags(scored)?;
             let storage = logits.storage();
@@ -4188,13 +4255,11 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                     .arg(flags)
                     .arg(&use_flags)
                     .arg(&gradient)
-                    .arg(&mut kl)
+                    .arg(kl)
                     .launch(cfg_rows(n_rows))
             }
-            .gpu_ctx("tensor kl_rows")?;
-            let mut out = self.download(&kl)?;
-            out.truncate(n_rows);
-            Ok(out)
+            .gpu_ctx("tensor kl_rows")
+            .map(|_| ())
         }
         pub(super) fn checked_intervals(&self, input: &Tensor, explained: Option<&Tensor>, operation: Option<CheckedScalar>) -> Result<Vec<CheckedInterval>, GpuError> {
             let count = if operation.is_some() {input.rows.checked_mul(input.cols).ok_or_else(|| shape("checked scalar size overflow".into()))?} else {input.rows};
@@ -4508,11 +4573,29 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         pub(super) fn head_log_partition(
             &self,
             hidden: &Tensor,
+            head: (&Tensor, bool),
+            scored: Option<&Indices>,
+            expected: Option<&mut Tensor>,
+            settings: (usize, Arithmetic),
+        ) -> Result<Vec<f64>, GpuError> {
+            let mut out = self.zeros(hidden.rows)?;
+            self.head_log_partition_into(hidden, head, scored, expected, &mut out, settings)?;
+            let mut values = self.download(&out)?;
+            values.truncate(hidden.rows);
+            Ok(values)
+        }
+
+        /// The swept log partitions into `out` (one double per row), left on the device: no
+        /// host transfer, so a captured step can record it.
+        pub(super) fn head_log_partition_into(
+            &self,
+            hidden: &Tensor,
             (head, transposed): (&Tensor, bool),
             scored: Option<&Indices>,
             mut expected: Option<&mut Tensor>,
+            out: &mut CudaSlice<f64>,
             (chunk, arithmetic): (usize, Arithmetic),
-        ) -> Result<Vec<f64>, GpuError> {
+        ) -> Result<(), GpuError> {
             let (rows, width) = hidden.dim();
             let classes = if transposed { head.cols } else { head.rows };
             let (compute, half) = compute_of(arithmetic, &self.name)?;
@@ -4531,7 +4614,11 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             };
             let chunk = chunk.clamp(1, classes.max(1));
             let mut logits = self.zeros32(rows * chunk)?;
-            let mut largest = self.upload(&vec![f32::NEG_INFINITY; rows])?;
+            let mut largest = self.zeros32(rows)?;
+            let (n_rows, lowest) = (rows as u64, f64::NEG_INFINITY);
+            let fill = self.kernel("fill", Storage::F32)?;
+            // SAFETY: `fill(n, v, x)` writes n floats.
+            unsafe { self.stream.launch_builder(&fill).arg(&n_rows).arg(&lowest).arg(&mut largest).launch(cfg_elements(n_rows)) }.gpu_ctx("tensor fill")?;
             let mut sums = self.zeros(rows)?;
             let mut factor = self.zeros32(rows)?;
             let (rows32, width32) = (u32::try_from(rows).map_err(|_| shape("head rows exceed u32".to_string()))?, width as u32);
@@ -4594,7 +4681,6 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                     )?;
                 }
             }
-            let mut out = self.zeros(rows)?;
             let (flags, use_flags) = self.flags(scored)?;
             let finish = self.kernel("head_finish", Storage::F32)?;
             let mut none = self.zeros32(1)?;
@@ -4605,12 +4691,10 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             // SAFETY: per-row state of length rows; `mean` is rows × width when `want`.
             unsafe {
                 self.stream.launch_builder(&finish).arg(&rows32).arg(&width32).arg(&largest).arg(&sums).arg(flags).arg(&use_flags)
-                    .arg(&want).arg(mean).arg(&mut out).launch(cfg_rows(rows))
+                    .arg(&want).arg(mean).arg(out).launch(cfg_rows(rows))
             }
-            .gpu_ctx("tensor head_finish")?;
-            let mut values = self.download(&out)?;
-            values.truncate(rows);
-            Ok(values)
+            .gpu_ctx("tensor head_finish")
+            .map(|_| ())
         }
     }
 }

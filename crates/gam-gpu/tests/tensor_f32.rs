@@ -436,6 +436,28 @@ fn a_captured_step_replays_what_running_it_does() {
         step(&mut y, &mut total, &mut scores).expect("a direct step after the capture");
         assert_eq!(device.argmax_rows(&y).expect("a read-back after it").len(), 64);
     }
+    // The vocabulary reductions' device-resident forms: recorded in f32, replayed into float64
+    // columns, equal to the downloading forms.
+    let (rows, classes, width) = (24, 9000, 32);
+    let (hidden, head) = (up(&d, &matrix(rows, width, 95, 1.0)), up(&d, &matrix(classes, width, 96, 1.0)));
+    let (target, logits) = (up(&d, &matrix(rows, classes, 97, 5.0)), matrix(rows, classes, 98, 5.0));
+    let mut direct_logits = up(&d, &logits);
+    let kl = d.kl_rows(&target, &mut direct_logits, None).expect("kl");
+    let mut direct_mean = d.zeros(rows, width).expect("zeros");
+    let partitions = d.head_log_partition(&hidden, &head, false, None, Some(&mut direct_mean), Arithmetic::F32).expect("partition");
+    let mut recorded_logits = up(&d, &logits);
+    let (mut kl_column, mut partition_column) = (wide.zeros(rows, 1).expect("column"), wide.zeros(rows, 1).expect("column"));
+    let mut mean = d.zeros(rows, width).expect("zeros");
+    d.synchronize().expect("idle");
+    d.begin_capture().expect("capture");
+    d.kl_rows_into(&target, &mut recorded_logits, None, true, &mut kl_column).expect("recorded kl");
+    d.head_log_partition_into(&hidden, &head, false, None, Some(&mut mean), &mut partition_column, Arithmetic::F32).expect("recorded partition");
+    let graph = d.end_capture().expect("graph");
+    graph.launch().expect("replay");
+    assert_eq!(down(&wide, &kl_column).column(0).to_vec(), kl, "replayed KL rows");
+    assert_eq!(down(&d, &recorded_logits), down(&d, &direct_logits), "replayed KL cotangent");
+    assert_eq!(down(&wide, &partition_column).column(0).to_vec(), partitions, "replayed log partitions");
+    assert_eq!(down(&d, &mean), down(&d, &direct_mean), "replayed expected head rows");
 }
 
 /// `x` rounded to bfloat16 (nearest, ties to even).

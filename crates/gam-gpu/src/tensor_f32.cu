@@ -172,6 +172,11 @@ extern "C" __global__ void gather_rows(u64 n, unsigned int cols, const float* ta
     GRID_STRIDE(i, n) out[i] = table[(u64)ids[i / cols] * cols + i % cols];
 }
 
+extern "C" __global__ void fill(u64 n, double value, float* x) {
+    float v = (float)value;
+    GRID_STRIDE(i, n) x[i] = v;
+}
+
 // `x[i] ← factor[row] x[i]`: per-row rescaling (a swept log partition's accumulator).
 extern "C" __global__ void scale_rows(u64 n, unsigned int cols, const float* factor, float* x) {
     GRID_STRIDE(i, n) x[i] *= factor[i / cols];
