@@ -4,6 +4,7 @@
 //! Jacobian sparsity, and manifold-SAE anchor coverage. Rust, Python, and CLI
 //! layers turn those facts into user-facing reports.
 
+use gam_linalg::decompose::pseudo_inverse_solve;
 use gam_linalg::faer_ndarray::FaerSvd;
 use ndarray::{Array2, ArrayView2};
 
@@ -181,25 +182,7 @@ fn centered_unit_columns(matrix: ArrayView2<f64>) -> Array2<f64> {
 
 /// Moore-Penrose pseudo-inverse times rhs via the thin SVD of the design.
 fn pinv_solve(a: ArrayView2<f64>, b: ArrayView2<f64>) -> Result<Array2<f64>, String> {
-    let (m, n) = a.dim();
-    let (u, singular_values, vt) = a
-        .svd(true, true)
-        .map_err(|error| format!("identifiability regression SVD: {error}"))?;
-    let u = u.expect("requested left singular vectors");
-    let vt = vt.expect("requested right singular vectors");
-    let max_singular = singular_values.iter().copied().fold(0.0_f64, f64::max);
-    let tol = f64::EPSILON * m.max(n) as f64 * max_singular;
-    let mut projected = u.t().dot(&b);
-    for (i, &sigma) in singular_values.iter().enumerate() {
-        for j in 0..projected.ncols() {
-            projected[[i, j]] = if sigma > tol {
-                projected[[i, j]] / sigma
-            } else {
-                0.0
-            };
-        }
-    }
-    Ok(vt.t().dot(&projected))
+    pseudo_inverse_solve(a, b).map_err(|error| format!("identifiability regression: {error}"))
 }
 
 /// Numeric rank of `m` via its singular values. Forming `MᵀM` would square

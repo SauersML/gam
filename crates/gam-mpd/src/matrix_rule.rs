@@ -6,8 +6,8 @@ use super::codec::{
     BitReader, BitString, decode_fixed_index, decode_prefix_integer, encode_fixed_index,
     encode_prefix_integer,
 };
-use gam_linalg::decompose::svd;
-use ndarray::{Array1, Array2, Axis};
+use gam_linalg::decompose::pseudo_inverse;
+use ndarray::{Array1, Array2};
 
 const VERSION: u64 = 1;
 const NODE_KINDS: usize = 8;
@@ -257,29 +257,7 @@ impl MatrixRule {
                     convention: PinvConvention::SvdResolutionBand,
                 } => {
                     let x = matrix(*input)?;
-                    let d = svd(x.view(), false).map_err(|e| format!("matrix-rule SVD: {e:?}"))?;
-                    if !d.band.is_finite()
-                        || d.band < 0.0
-                        || d.singular_values
-                            .iter()
-                            .any(|value| !value.is_finite() || *value < 0.0)
-                        || d.u
-                            .iter()
-                            .chain(d.vt.iter())
-                            .any(|value| !value.is_finite())
-                    {
-                        return Err("matrix-rule SVD produced nonfinite or invalid factors".into());
-                    }
-                    let kept: Vec<usize> = d
-                        .singular_values
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, s)| (*s > d.band).then_some(i))
-                        .collect();
-                    let inverse =
-                        Array1::from_iter(kept.iter().map(|i| 1.0 / d.singular_values[*i]));
-                    let scaled = &d.u.select(Axis(1), &kept).t() * &inverse.insert_axis(Axis(1));
-                    Value::Matrix(d.vt.select(Axis(0), &kept).t().dot(&scaled))
+                    Value::Matrix(pseudo_inverse(x.view()).map_err(|e| format!("matrix-rule pseudo-inverse: {e}"))?)
                 }
             };
             if !out.finite() {

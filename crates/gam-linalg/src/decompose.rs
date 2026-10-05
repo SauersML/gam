@@ -278,6 +278,41 @@ pub fn svd(a: ArrayView2<'_, f64>, full: bool) -> Result<Svd, DenseError> {
     })
 }
 
+impl Svd {
+    /// The indices of the singular values beyond the band: the directions the decomposition
+    /// resolves from zero.
+    fn resolved(&self) -> Vec<usize> {
+        (0..self.singular_values.len()).filter(|&index| self.singular_values[index] > self.band).collect()
+    }
+}
+
+/// The Moore–Penrose pseudo-inverse `A⁺ = V Σ⁺ Uᵀ` of `a` (`n × m` for an `m × n` `a`), with
+/// `σᵢ⁺ = 1/σᵢ` for a singular value beyond the decomposition's band and `0` within it: a value
+/// within the band is not resolved from zero, so its direction is dropped rather than amplified.
+pub fn pseudo_inverse(a: ArrayView2<'_, f64>) -> Result<Array2<f64>, DenseError> {
+    let d = svd(a, false)?;
+    let kept = d.resolved();
+    let inverse = Array1::from_iter(kept.iter().map(|&index| 1.0 / d.singular_values[index]));
+    let scaled = &d.u.select(Axis(1), &kept).t() * &inverse.insert_axis(Axis(1));
+    Ok(d.vt.select(Axis(0), &kept).t().dot(&scaled))
+}
+
+/// `A⁺ B` ([`pseudo_inverse`]'s truncation) without forming `A⁺`: the minimum-norm least-squares
+/// solution `X` of `A X = B` over the directions `A`'s decomposition resolves.
+pub fn pseudo_inverse_solve(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Result<Array2<f64>, DenseError> {
+    require_finite("pseudo-inverse right-hand side", b)?;
+    if b.nrows() != a.nrows() {
+        return Err(DenseError::Shape { what: "pseudo-inverse right-hand side rows", expected: a.nrows(), found: b.nrows() });
+    }
+    let d = svd(a, false)?;
+    let kept = d.resolved();
+    let mut projected = d.u.select(Axis(1), &kept).t().dot(&b);
+    for (mut row, &index) in projected.rows_mut().into_iter().zip(&kept) {
+        row /= d.singular_values[index];
+    }
+    Ok(d.vt.select(Axis(0), &kept).t().dot(&projected))
+}
+
 fn full_svd(a: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array1<f64>, Array2<f64>), DenseError> {
     let view = FaerArrayView::new(&a);
     let matrix = view.as_ref();
@@ -379,6 +414,23 @@ mod tests {
 
     fn close(left: &Array2<f64>, right: &Array2<f64>, tolerance: f64) -> bool {
         left.dim() == right.dim() && left.iter().zip(right).all(|(a, b)| (a - b).abs() <= tolerance)
+    }
+
+    #[test]
+    fn pseudo_inverse_meets_the_penrose_conditions_and_drops_unresolved_directions() {
+        // Rank 2 of a 4 × 3 matrix: the third column is the sum of the first two.
+        let a = array![[1.0, 0.0, 1.0], [0.0, 2.0, 2.0], [1.0, 1.0, 2.0], [3.0, -1.0, 2.0]];
+        let p = pseudo_inverse(a.view()).expect("pseudo-inverse");
+        assert_eq!(p.dim(), (3, 4));
+        let tolerance = 1e-12;
+        assert!(close(&a.dot(&p).dot(&a), &a, tolerance));
+        assert!(close(&p.dot(&a).dot(&p), &p, tolerance));
+        let (ap, pa) = (a.dot(&p), p.dot(&a));
+        assert!(close(&ap, &ap.t().to_owned(), tolerance));
+        assert!(close(&pa, &pa.t().to_owned(), tolerance));
+        let b = array![[1.0, -2.0], [0.5, 0.0], [2.0, 1.0], [-1.0, 3.0]];
+        assert!(close(&pseudo_inverse_solve(a.view(), b.view()).expect("solve"), &p.dot(&b), tolerance));
+        assert!(matches!(pseudo_inverse_solve(a.view(), b.slice(s![..3, ..])), Err(DenseError::Shape { .. })));
     }
 
     #[test]

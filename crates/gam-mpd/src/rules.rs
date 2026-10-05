@@ -20,7 +20,7 @@
 //! content planes explains; [`match_scale`] and [`copy_scale`] are the bindings'
 //! least-squares scales.
 
-use gam_linalg::decompose::{eigh, svd};
+use gam_linalg::decompose::{eigh, pseudo_inverse};
 use gam_linalg::roundoff::SymmetricAssembly;
 use ndarray::{Array1, Array2, Axis};
 
@@ -34,15 +34,6 @@ pub fn content_rows(width: usize, first: usize) -> Vec<usize> {
 /// `x` with each column `j` scaled by `scale[j]`.
 fn scale_columns(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
     x * &scale.view().insert_axis(Axis(0))
-}
-
-/// The pseudo-inverse of `x` over its singular values beyond the decomposition's band.
-fn pseudo_inverse(x: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let d = svd(x.view(), false).map_err(|e| format!("{e:?}"))?;
-    let kept: Vec<usize> = (0..d.singular_values.len()).filter(|i| d.singular_values[*i] > d.band).collect();
-    let inverse = Array1::from_iter(kept.iter().map(|i| 1.0 / d.singular_values[*i]));
-    let scaled = &d.u.select(Axis(1), &kept).t() * &inverse.insert_axis(Axis(1));
-    Ok(d.vt.select(Axis(0), &kept).t().dot(&scaled))
 }
 
 /// What the match rule reads a head's key rows through: `Z = K[R] diag(g) O_s V_s diag(g_s)`, `R`
@@ -69,7 +60,7 @@ pub fn match_prediction(reading: &Array2<f64>, gain: &Array1<f64>, directions: O
 /// The copy rule's output head (`d × width`, unscaled): `diag(g / g_f) V⁺`, `V` the head's value
 /// operator (`width × d`), `g` its layer's norm gain and `g_f` the final norm's.
 pub fn copy_prediction(value: &Array2<f64>, gain: &Array1<f64>, final_gain: &Array1<f64>) -> Result<Array2<f64>, String> {
-    let mut p = pseudo_inverse(value)?;
+    let mut p = pseudo_inverse(value.view()).map_err(|e| e.to_string())?;
     for (i, mut row) in p.rows_mut().into_iter().enumerate() {
         row *= gain[i] / final_gain[i];
     }

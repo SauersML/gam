@@ -5,13 +5,14 @@ use gam_linalg::faer_ndarray::{
     col_piv_qr_solve_lstsq, rrqr_nullspace_basis,
 };
 use gam_linalg::gram_schmidt::ReorthogonalizedRowBasis;
-use gam_linalg::roundoff::{resolved_singular_band, resolved_singular_count};
+use gam_linalg::decompose::pseudo_inverse_solve;
+use gam_linalg::roundoff::resolved_singular_count;
 use gam_linalg::utils::{StableSolver, array_is_finite};
 use gam_math::sparse_grid::CompensatedSum;
 use gam_problem::{
     ConstraintRowId, ConstraintSet, KhatriRaoConeConstraints, LinearInequalityConstraints,
 };
-use ndarray::{Array1, Array2, ArrayView1, s};
+use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -232,29 +233,13 @@ fn solve_dense_system_via_pseudoinverse(
     if matrix.nrows() != matrix.ncols() || rhs.len() != matrix.nrows() {
         crate::bail_invalid_estim!("dense pseudoinverse solve dimension mismatch");
     }
-
-    let (u_opt, singular, vt_opt) = matrix.svd(true, true).map_err(|_| {
-        EstimationError::InvalidInput("dense pseudoinverse solve SVD failed".to_string())
-    })?;
-    let (Some(u), Some(vt)) = (u_opt, vt_opt) else {
-        crate::bail_invalid_estim!("dense pseudoinverse solve missing singular vectors");
-    };
-
-    // The SVD's own rounding band, relative to σ_max alone: an absolute
+    // Truncated at the SVD's own rounding band, relative to σ_max alone: an absolute
     // `max(σ_max, 1)` floor zeroes a uniformly small but well-conditioned system
     // purely because of its units, and no extra factor on the band buys safety
     // (#2469).
-    let tol = resolved_singular_band(&singular, matrix.nrows(), matrix.ncols(), 0.0);
-    let mut coeff = u.t().dot(rhs);
-    for (idx, value) in coeff.iter_mut().enumerate() {
-        let sigma = singular[idx];
-        if sigma.abs() > tol {
-            *value /= sigma;
-        } else {
-            *value = 0.0;
-        }
-    }
-    let solution = vt.t().dot(&coeff);
+    let solution = pseudo_inverse_solve(matrix.view(), rhs.view().insert_axis(Axis(1)))
+        .map_err(|error| EstimationError::InvalidInput(format!("dense pseudoinverse solve: {error}")))?
+        .remove_axis(Axis(1));
     if !array_is_finite(&solution) {
         crate::bail_invalid_estim!("dense pseudoinverse solve produced non-finite values");
     }
@@ -1032,24 +1017,12 @@ pub(crate) fn feasible_point_for_linear_constraints(
     }
 
     let gram = constraints.a.dot(&constraints.a.t());
-    let (u_opt, singular, vt_opt) = gram.svd(true, true).ok()?;
-    let (Some(u), Some(vt)) = (u_opt, vt_opt) else {
-        return None;
-    };
-    // Rank tolerance: the `m × m` Gram's own SVD rounding band `m·ε·σ_max`
-    // (`resolved_singular_band`). The candidate is certified feasible below whichever
-    // directions this keeps, so no extra factor on the band buys safety (#2469).
-    let tol = resolved_singular_band(&singular, gram.nrows(), gram.ncols(), 0.0);
-    let mut coeff = u.t().dot(&constraints.b);
-    for (idx, value) in coeff.iter_mut().enumerate() {
-        let sigma = singular[idx];
-        if sigma.abs() > tol {
-            *value /= sigma;
-        } else {
-            *value = 0.0;
-        }
-    }
-    let dual = vt.t().dot(&coeff);
+    // Rank tolerance: the `m × m` Gram's own SVD rounding band `m·ε·σ_max`. The candidate is
+    // certified feasible below whichever directions this keeps, so no extra factor on the band
+    // buys safety (#2469).
+    let dual = pseudo_inverse_solve(gram.view(), constraints.b.view().insert_axis(Axis(1)))
+        .ok()?
+        .remove_axis(Axis(1));
     let beta = constraints.a.t().dot(&dual);
     if beta.len() != p || beta.iter().any(|v| !v.is_finite()) {
         return None;
