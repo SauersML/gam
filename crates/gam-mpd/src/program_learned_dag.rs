@@ -50,7 +50,7 @@ pub struct Settings {
     pub max_parameter_elements: usize,
     /// Input skeletons plus every attempted expression extension, including rejected/duplicate work.
     pub max_expression_states: usize,
-    /// Inspected output skeleton tuples plus every attempted partial parameter binding.
+    /// Inspected sharing-seed projection values, output skeleton tuples, and every attempted partial parameter binding.
     /// Completed bindings are counted separately; invalid and duplicate work still consumes budget.
     pub max_tuple_checks: usize,
     pub max_tuples: usize,
@@ -76,6 +76,9 @@ pub struct Inventory {
     pub accepted_states: usize,
     pub checked_tuples: usize,
     pub checked_skeleton_tuples: usize,
+    /// Generated learned-nonlinear projection values inspected for sharing-first seeds.
+    #[serde(default)]
+    pub sharing_seed_checks: usize,
     pub completed_parameter_bindings: usize,
     pub duplicate_states: usize,
     pub duplicate_tuples: usize,
@@ -413,9 +416,9 @@ pub fn enumerate_interfaces(
     let unary = s.unary.iter().copied().collect::<BTreeSet<_>>();
     let binary = s.binary.iter().copied().collect::<BTreeSet<_>>();
     let mut result = Inventory { proposals: vec![], explored_states: inputs.len(), accepted_states: inputs.len(), checked_tuples: 0,
-        checked_skeleton_tuples: 0, completed_parameter_bindings: 0,
+        checked_skeleton_tuples: 0, sharing_seed_checks: 0, completed_parameter_bindings: 0,
         duplicate_states: 0, duplicate_tuples: 0, rejection_counts: BTreeMap::new(), truncated: false,
-        priority: "Operation-count typed skeletons; round-robin maximum-operation output-tuple bands with four resumable restricted-growth partition searches per band; balanced learned-nonlinear tuple seeds when type-compatible; one attempted binding branch per turn; admitted proposals ranked by compiled DAG node count, parameter elements, then canonical ordered syntax. All attempted skeleton and partial binding work bounded; truncation is not exhaustive search.".into() };
+        priority: "Operation-count typed skeletons; round-robin maximum-operation output-tuple bands with four resumable restricted-growth partition searches per ordinary band and sixteen per sharing-seed band; sharing-first tuples of generated learned-nonlinear intermediates and generated affine exit projections (seed inspection capped at one eighth of tuple work); balanced learned-nonlinear tuple seeds when type-compatible; one attempted binding branch per turn; admitted proposals ranked by compiled DAG node count, parameter elements, then canonical ordered syntax. All attempted skeleton and partial binding work bounded; truncation is not exhaustive search.".into() };
     let mut by_size = vec![(0..inputs.len()).map(Expr::Argument).collect::<Vec<_>>()];
     let mut seen = by_size[0].iter().cloned().collect::<BTreeSet<_>>();
     enum Class {
@@ -554,7 +557,11 @@ pub fn enumerate_interfaces(
     let mut bands = VecDeque::new();
     let largest_generated_size = pool.iter().map(operations).max().unwrap_or(0);
     for size in 0..=largest_generated_size {
-        let mut band = TupleBand::default();
+        let mut band = TupleBand {
+            expand_frontier: true,
+            task_limit: 4,
+            ..TupleBand::default()
+        };
         for axis in 0..axes.len() {
             if let Some(index) = axes[axis]
                 .iter()
@@ -595,6 +602,55 @@ pub fn enumerate_interfaces(
             bands.push_back((size, band));
         }
     }
+    // Build sharing seeds by indexing generated projection values, never by
+    // inventing an equation or taking another Cartesian product. Discovery has
+    // an explicit work slice; ordinary tuple/partition search retains the rest.
+    let seed_budget = s.max_tuple_checks / 8;
+    let mut projections: BTreeMap<Expr, Vec<Option<usize>>> = BTreeMap::new();
+    for (id, expression) in pool.iter().enumerate() {
+        let Expr::Affine { input, .. } = expression else {
+            continue;
+        };
+        if !matches!(input.as_ref(), Expr::Unary(_, _)) || !has_affine(input) {
+            continue;
+        }
+        if result.sharing_seed_checks == seed_budget {
+            result.truncated = true;
+            break;
+        }
+        result.sharing_seed_checks += 1;
+        result.checked_tuples += 1;
+        let entry = projections
+            .entry((**input).clone())
+            .or_insert_with(|| vec![None; outputs.len()]);
+        for (axis, target) in outputs.iter().enumerate() {
+            if &types[id] == target && entry[axis].is_none() {
+                entry[axis] = Some(
+                    axes[axis]
+                        .binary_search(&id)
+                        .map_err(|_| "sharing projection absent from typed output axis")?,
+                );
+            }
+        }
+    }
+    let mut sharing = TupleBand {
+        task_limit: 16,
+        ..TupleBand::default()
+    };
+    for cursor in projections
+        .into_values()
+        .filter_map(|positions| positions.into_iter().collect::<Option<Vec<_>>>())
+    {
+        if sharing.seen.insert(cursor.clone()) {
+            sharing.heap.push(std::cmp::Reverse((
+                tuple_cost(&cursor, &axes, &pool)?,
+                cursor,
+            )));
+        }
+    }
+    if !sharing.heap.is_empty() {
+        bands.push_front((largest_generated_size, sharing));
+    }
     while let Some((size, mut band)) = bands.pop_front() {
         if result.checked_tuples == s.max_tuple_checks || result.proposals.len() == s.max_tuples {
             result.truncated = true;
@@ -603,7 +659,7 @@ pub fn enumerate_interfaces(
         // A small fixed window bounds live partition searches independently of
         // the tuple budget. Rotate admission and one-branch binding work, rather
         // than finishing every sharing partition before admitting another tuple.
-        if band.tasks.len() < 4
+        if band.tasks.len() < band.task_limit
             && !band.heap.is_empty()
             && (band.admit_next || band.tasks.is_empty())
         {
@@ -640,7 +696,11 @@ pub fn enumerate_interfaces(
                         }],
                     });
                 }
-                for axis in 0..cursor.len() {
+                for axis in 0..if band.expand_frontier {
+                    cursor.len()
+                } else {
+                    0
+                } {
                     let mut next = cursor.clone();
                     next[axis] += 1;
                     if next[axis] < axes[axis].len()
@@ -758,6 +818,8 @@ struct TupleBand {
     seen: BTreeSet<Vec<usize>>,
     tasks: VecDeque<BindingTask>,
     admit_next: bool,
+    expand_frontier: bool,
+    task_limit: usize,
 }
 fn has_affine(e: &Expr) -> bool {
     match e {
@@ -1399,6 +1461,83 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn generated_sharing_seeds_reach_native_width_class_without_supplied_equations() {
+        let input = Interface::native(768).expect("native input");
+        let scalar = Interface::native(1).expect("response");
+        let mut s = settings();
+        s.latent_widths = vec![3072];
+        s.unary = vec![Unary::GeluTanh];
+        s.binary.clear();
+        s.require_shared = true;
+        s.max_operations = 3;
+        s.max_expression_states = 4096;
+        s.max_tuple_checks = 512;
+        s.max_tuples = 32;
+        s.max_parameter_elements = 6_000_000;
+        let inventory =
+            enumerate_interfaces(&[input.clone()], &[input, scalar.clone(), scalar], &s)
+                .expect("typed enumeration only");
+        assert!(
+            inventory.proposals.iter().any(|p| {
+                let Expr::Affine {
+                    input: activation, ..
+                } = &p.expressions[0]
+                else {
+                    return false;
+                };
+                let Expr::Unary(Unary::GeluTanh, up) = activation.as_ref() else {
+                    return false;
+                };
+                let Expr::Affine {
+                    output: TypeRef::Latent { width: 3072 },
+                    input,
+                    ..
+                } = up.as_ref()
+                else {
+                    return false;
+                };
+                **input == Expr::Argument(0)
+                    && p.expressions[1..]
+                        .iter()
+                        .all(|e| matches!(e, Expr::Affine { input, .. } if input == activation))
+            }),
+            "generated shared nonlinear latent class must reach finite bank"
+        );
+        assert!(inventory.sharing_seed_checks > 0);
+        assert!(inventory.sharing_seed_checks <= s.max_tuple_checks / 8);
+        assert!(inventory.checked_tuples <= s.max_tuple_checks);
+    }
+
+    #[test]
+    fn broad_128_bank_includes_shared_native_law_latent_class() {
+        let input = Interface::native(768).expect("native input");
+        let scalar = Interface::native(1).expect("response");
+        let mut s = settings();
+        s.latent_widths = vec![3072];
+        s.unary = vec![Unary::Relu, Unary::Silu, Unary::Gelu, Unary::GeluTanh];
+        s.binary = vec![Binary::Add, Binary::Subtract, Binary::Multiply];
+        s.affine_bias = true;
+        s.require_shared = true;
+        s.max_operations = 3;
+        s.max_expression_states = 4096;
+        s.max_tuple_checks = 2000;
+        s.max_tuples = 128;
+        s.max_parameter_elements = 6_000_000;
+        let inventory =
+            enumerate_interfaces(&[input.clone()], &[input, scalar.clone(), scalar], &s)
+                .expect("broad generated bank");
+        assert!(inventory.proposals.iter().any(|p| {
+            let Expr::Affine { input: activation, bias: true, .. } = &p.expressions[0] else { return false; };
+            let Expr::Unary(Unary::GeluTanh, up) = activation.as_ref() else { return false; };
+            let Expr::Affine { output: TypeRef::Latent { width: 3072 }, input, bias: true, .. } = up.as_ref() else { return false; };
+            **input == Expr::Argument(0) && p.expressions[1..].iter().all(|e| matches!(e, Expr::Affine { input, bias: true, .. } if input == activation))
+        }), "bounded broad law/operator search must cover native-law shared latent class");
+        assert_eq!(inventory.proposals.len(), s.max_tuples);
+        assert!(inventory.checked_tuples <= s.max_tuple_checks);
+        assert!(inventory.sharing_seed_checks <= s.max_tuple_checks / 8);
+    }
+
     #[test]
     fn finite_budget_admits_trainable_nonlinear_native_exit_and_shared_response() {
         let native = Interface::native(8).expect("native vector");

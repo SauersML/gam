@@ -55,6 +55,11 @@ pub struct Settings {
     pub max_compound_pairs: usize,
     /// Explicit intervention boundaries required by the caller, never site selection.
     pub preserve_native_places: Vec<usize>,
+    /// Optional original-state observables used to seed joint nonlinear windows.
+    /// None uses native syntax defaults; an empty list retains fan-out-only search.
+    /// These do not force every observable to survive every accepted abstraction.
+    #[serde(default)]
+    pub joint_observation_places: Option<Vec<usize>>,
     /// Off preserves the original scheduling. When enabled, its work and callback
     /// budgets are reserved within the global totals rather than added to them.
     #[serde(default)]
@@ -922,6 +927,19 @@ fn expression_moves(
     }
     moves
 }
+fn joint_regions(
+    artifact: &Artifact,
+    limits: program_joint_regions::Limits,
+    settings: &Settings,
+) -> Result<program_joint_regions::Inventory, String> {
+    if let Some(observations) = &settings.joint_observation_places {
+        let remaining = observations.iter().copied()
+            .filter(|n| artifact.place(*n).is_some()).collect::<Vec<_>>();
+        program_joint_regions::propose_regions_with_observations(artifact, limits, &remaining)
+    } else {
+        program_joint_regions::propose_regions(artifact, limits)
+    }
+}
 fn shared_dag_moves(
     artifact: &Artifact,
     settings: &Settings,
@@ -933,7 +951,7 @@ fn shared_dag_moves(
         return vec![];
     };
     let inventory =
-        match program_joint_regions::propose_regions(artifact, shared.region_limits.clone()) {
+        match joint_regions(artifact, shared.region_limits.clone(), settings) {
             Ok(inventory) => inventory,
             Err(error) => {
                 report.counts.shared_dag_enumeration_failures += 1;
@@ -1115,7 +1133,7 @@ fn learned_dag_moves(
         return vec![];
     };
     let regions =
-        match program_joint_regions::propose_regions(artifact, config.region_limits.clone()) {
+        match joint_regions(artifact, config.region_limits.clone(), settings) {
             Ok(inventory) => {
                 report.counts.learned_dag_enumerations_truncated +=
                     usize::from(inventory.truncated);
@@ -1243,6 +1261,12 @@ pub fn search<F>(
 where
     F: FnMut(FitRequest<'_>) -> Result<EvaluatedArtifact, String>,
 {
+    if let Some(observations) = &settings.joint_observation_places {
+        let unique = observations.iter().copied().collect::<BTreeSet<_>>();
+        if unique.len() != observations.len() || unique.iter().any(|n| *n >= initial.artifact.native_nodes) {
+            return Err("joint observation places must be unique original native node identities".into());
+        }
+    }
     if settings.max_depth == 0
         || settings.max_callback_calls == 0
         || settings.max_move_attempts == 0
@@ -1957,6 +1981,7 @@ mod tests {
             max_argument_bindings: 8,
             max_compound_pairs: 32,
             preserve_native_places: vec![0],
+            joint_observation_places: None,
             expression_search: None,
             shared_dag_search: None,
             learned_dag_search: None,
@@ -2731,6 +2756,8 @@ mod tests {
     fn joint_synthesis_search_saves_actual_shared_state_and_distinct_native_exits() {
         let native = joint_fixture();
         let mut configuration = settings(1);
+        // This regression specifically checks the preexisting fan-out extraction.
+        configuration.joint_observation_places = Some(vec![]);
         configuration.shared_dag_search = Some(joint_settings());
         configuration.max_callback_calls = 2;
         configuration.max_move_attempts = 2;

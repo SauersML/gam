@@ -1,8 +1,8 @@
 //! Atomic typed multi-exit rewrites of a shared current-artifact DAG.
 //! Enumeration/extraction is structural support, not identification of a learned law.
 use crate::{
-    artifact::{Artifact, Binding, compact_with_roots},
-    operator_program::{Coefficient, Interface, Node, Operator, remap_node},
+    artifact::{compact_with_roots, Artifact, Binding},
+    operator_program::{remap_node, Coefficient, Interface, Node, Operator},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,6 +22,9 @@ pub enum AnchorMode {
     #[default]
     Interior,
     Boundary,
+    /// An explicit existing native vector remains an observed exit while its
+    /// ancestors/consumers are jointly rewritten; no new latent native identity.
+    Observable,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Region {
@@ -93,7 +96,7 @@ fn describe_anchored(
 ) -> Result<Region, String> {
     let names = aliases(a)?;
     let root = a.place(producer).ok_or("joint producer place absent")?;
-    if anchor_mode == AnchorMode::Interior && !inside.contains(&root) {
+    if anchor_mode != AnchorMode::Boundary && !inside.contains(&root) {
         return Err("joint producer absent from region".into());
     }
     if anchor_mode == AnchorMode::Boundary && inside.contains(&root) {
@@ -173,6 +176,9 @@ fn describe_anchored(
         return Err("gathered Feature boundary is not an ordinary matrix input".into());
     }
     let mut exits = BTreeSet::new();
+    if anchor_mode == AnchorMode::Observable {
+        exits.insert(root);
+    }
     if inside.contains(&a.program.output) {
         exits.insert(a.program.output);
     }
@@ -249,7 +255,32 @@ fn describe_anchored(
         source_program_nodes: a.program.nodes.len(),
     })
 }
+/// Fanout regions plus windows around every existing native Pointwise/Hadamard
+/// vector. Single-use nonlinear chains are eligible without inventing fanout.
+/// Lowered callers can instead pass only their original semantic observations.
 pub fn propose_regions(a: &Artifact, limits: Limits) -> Result<Inventory, String> {
+    let observations = a
+        .places
+        .iter()
+        .filter_map(|(native, current)| {
+            a.program
+                .nodes
+                .get(*current)
+                .is_some_and(|node| matches!(node, Node::Pointwise { .. } | Node::Hadamard { .. }))
+                .then_some(*native)
+        })
+        .collect::<Vec<_>>();
+    propose_regions_with_observations(a, limits, &observations)
+}
+/// `observations` are existing native identities, never supplied formulas or new
+/// representation labels. They remain exits whenever their window grows. All
+/// outside consumers and protected control/block/exception exits still survive.
+/// An empty observation list reproduces the original fanout-only enumeration.
+pub fn propose_regions_with_observations(
+    a: &Artifact,
+    limits: Limits,
+    observations: &[usize],
+) -> Result<Inventory, String> {
     if [
         limits.max_internal_nodes,
         limits.max_exits,
@@ -278,6 +309,32 @@ pub fn propose_regions(a: &Artifact, limits: Limits) -> Result<Inventory, String
     let mut anchors = VecDeque::new();
     let mut seen = BTreeSet::new();
     let mut seed_truncated = false;
+    let mut observation_ids = BTreeSet::new();
+    for &native in observations {
+        let current = a
+            .place(native)
+            .ok_or("joint observed native place absent")?;
+        if ambient(&a.program.nodes[current]) {
+            return Err("joint observation must be an ordinary computed native vector".into());
+        }
+        observation_ids.insert((current, native));
+    }
+    // Every selected observation receives its first window before fanout
+    // descendants. This ordering is structural, independent of fit outcomes.
+    for (current, native) in observation_ids {
+        if seen.len() >= limits.max_states {
+            seed_truncated = true;
+            break;
+        }
+        let set = BTreeSet::from([current]);
+        seen.insert((native, AnchorMode::Observable, set.clone()));
+        anchors.push_back((
+            native,
+            current,
+            AnchorMode::Observable,
+            VecDeque::from([Work::Describe(set)]),
+        ));
+    }
     // Each native anchor/mode has its own lazy frontier and receives one work
     // attempt per turn. A large fan-out cannot consume another anchor's budget
     // in a single turn. Successors are generated one at a time, never as pairs.
@@ -320,13 +377,19 @@ pub fn propose_regions(a: &Artifact, limits: Limits) -> Result<Inventory, String
             Work::Describe(inside) => {
                 match describe_anchored(a, producer, mode, inside.clone(), &limits) {
                     Ok(r) => {
-                        if users[current]
-                            .iter()
-                            .filter(|i| r.current_internal_nodes.contains(i))
-                            .count()
-                            >= 2
-                        {
+                        let admitted = if mode == AnchorMode::Observable {
+                            r.native_writes.len() >= 2
+                        } else {
+                            users[current]
+                                .iter()
+                                .filter(|i| r.current_internal_nodes.contains(i))
+                                .count()
+                                >= 2
+                        };
+                        if admitted {
                             out.regions.push(r);
+                        } else if mode == AnchorMode::Observable {
+                            out.skipped.push(Skipped {anchor_mode:mode,producer_native:producer,current_internal_nodes:r.current_internal_nodes,reason:"observable window has only one exit; ancestor/consumer expansions remain eligible".into()});
                         }
                     }
                     Err(reason) => out.skipped.push(Skipped {
@@ -345,6 +408,18 @@ pub fn propose_regions(a: &Artifact, limits: Limits) -> Result<Inventory, String
                             .into_iter()
                             .flatten()
                             .copied(),
+                    )
+                    .chain(
+                        (mode == AnchorMode::Observable)
+                            .then(|| {
+                                inside
+                                    .iter()
+                                    .flat_map(|i| a.program.nodes[*i].arguments())
+                                    .filter(|i| !ambient(&a.program.nodes[*i]))
+                                    .collect::<Vec<_>>()
+                            })
+                            .into_iter()
+                            .flatten(),
                     )
                     .filter(|i| !inside.contains(i))
                     .collect::<BTreeSet<_>>();
@@ -758,7 +833,7 @@ mod tests {
             SlotValues,
         },
     };
-    use ndarray::{Array2, array};
+    use ndarray::{array, Array2};
     fn describe(
         a: &Artifact,
         producer: usize,
@@ -824,6 +899,172 @@ mod tests {
     }
     fn region(a: &Artifact, inside: &[usize]) -> Region {
         describe(a, 2, inside.iter().copied().collect(), &limits()).expect("joint cut")
+    }
+    fn four_single_use_nonlinear_chains() -> (Artifact, Vec<[usize; 4]>) {
+        let mut nodes = vec![Node::Raw { slot: 0 }];
+        let mut stream = 0;
+        let mut sites = Vec::new();
+        for _ in 0..4 {
+            let attention_input = nodes.len();
+            nodes.push(Node::RmsNorm {
+                input: stream,
+                epsilon: 1e-5,
+            });
+            let mut branches = Vec::new();
+            for _ in 0..18 {
+                branches.push(nodes.len());
+                nodes.push(Node::Gain {
+                    input: attention_input,
+                    coefficient: Coefficient::Number(0.05),
+                });
+            }
+            let attended = nodes.len();
+            nodes.push(Node::Affine {
+                terms: branches.into_iter().map(|n| (n, 0)).collect(),
+                bias: None,
+            });
+            let normed = nodes.len();
+            nodes.push(Node::RmsNorm {
+                input: attended,
+                epsilon: 1e-5,
+            });
+            let up = nodes.len();
+            nodes.push(Node::Affine {
+                terms: vec![(normed, 0)],
+                bias: None,
+            });
+            let active = nodes.len();
+            nodes.push(Node::Pointwise {
+                input: up,
+                laws: vec![Law::GeluTanh],
+            });
+            let down = nodes.len();
+            nodes.push(Node::Affine {
+                terms: vec![(active, 0)],
+                bias: None,
+            });
+            stream = nodes.len();
+            nodes.push(Node::Affine {
+                terms: vec![(attended, 0), (down, 0)],
+                bias: None,
+            });
+            sites.push([normed, up, active, down]);
+        }
+        (base(nodes, 1), sites)
+    }
+    #[test]
+    fn automatic_observable_windows_reach_all_four_single_use_nonlinear_chains() {
+        let (a, sites) = four_single_use_nonlinear_chains();
+        let cap = Limits {
+            max_internal_nodes: 3,
+            max_inputs: 3,
+            max_exits: 3,
+            max_regions: 64,
+            max_states: 512,
+        };
+        let old =
+            propose_regions_with_observations(&a, cap.clone(), &[]).expect("fanout-only control");
+        assert!(old.regions.iter().all(|r| r
+            .current_internal_nodes
+            .iter()
+            .all(|n| !matches!(a.program.nodes[*n], Node::Pointwise { .. }))));
+        let inventory = propose_regions(&a, cap).expect("automatic nonlinear windows");
+        assert!(inventory.explored_states <= 512);
+        assert!(inventory.regions.len() <= 64);
+        for [normed, up, active, down] in sites {
+            assert_eq!(
+                a.program
+                    .nodes
+                    .iter()
+                    .filter(|n| n.arguments().contains(&active))
+                    .count(),
+                1,
+                "native nonlinear value has no fork"
+            );
+            let region = inventory
+                .regions
+                .iter()
+                .find(|r| {
+                    r.anchor_mode == AnchorMode::Observable
+                        && r.producer_native == active
+                        && r.current_internal_nodes == vec![up, active, down]
+                })
+                .expect("whole up/nonlinear/down window reached for every layer");
+            assert_eq!(region.native_reads, vec![normed]);
+            assert_eq!(region.native_writes, vec![active, down]);
+            assert!(region.erased_native_places.contains(&up));
+            let body = exact_body(&a, region).expect("typed observed extraction");
+            let patched = replay(&apply(&a, region, &body).expect("atomic observed replacement"));
+            let family = FamilyInputs {
+                rows: 2,
+                slots: vec![SlotValues::Raw(array![[-1., 0.25], [0.5, -0.75]])],
+                layout: None,
+            };
+            assert_eq!(result(&patched, &family), result(&a, &family));
+            assert!(patched.place(active).is_some());
+            assert!(patched.place(down).is_some());
+            let original = a
+                .program
+                .execute_edited(&family, |n, value, _| {
+                    if n == active {
+                        *value *= 0.;
+                    }
+                    Ok(())
+                })
+                .expect("original observable intervention");
+            let current = patched.place(active).unwrap();
+            let edited = patched
+                .program
+                .execute_edited(&family, |n, value, _| {
+                    if n == current {
+                        *value *= 0.;
+                    }
+                    Ok(())
+                })
+                .expect("decoded observable intervention");
+            assert_eq!(
+                original.values[a.program.output], edited.values[patched.program.output],
+                "internal and external consumers read the retained observed value"
+            );
+            let mut missing = body.clone();
+            missing.exits.retain(|e| e.native_write != active);
+            assert!(
+                apply(&a, region, &missing).is_err(),
+                "observable cannot silently be erased"
+            );
+            let mut forged = region.clone();
+            forged.anchor_mode = AnchorMode::Interior;
+            assert!(
+                exact_body(&a, &forged).is_err(),
+                "forced observation contract is validated on replay"
+            );
+        }
+    }
+    #[test]
+    fn explicit_original_observations_control_seeding_and_reject_ambient_aliases() {
+        let (a, sites) = four_single_use_nonlinear_chains();
+        let selected = sites[2][2];
+        let cap = Limits {
+            max_internal_nodes: 3,
+            max_inputs: 3,
+            max_exits: 3,
+            max_regions: 64,
+            max_states: 512,
+        };
+        let inventory =
+            propose_regions_with_observations(&a, cap.clone(), &[selected, selected]).unwrap();
+        assert!(inventory
+            .regions
+            .iter()
+            .filter(|r| r.anchor_mode == AnchorMode::Observable)
+            .all(|r| r.producer_native == selected));
+        assert!(inventory
+            .regions
+            .iter()
+            .any(|r| r.anchor_mode == AnchorMode::Observable
+                && r.current_internal_nodes == sites[2][1..].to_vec()));
+        assert!(propose_regions_with_observations(&a, cap.clone(), &[0]).is_err());
+        assert!(propose_regions_with_observations(&a, cap, &[a.native_nodes]).is_err());
     }
     #[test]
     fn scarce_budget_round_robins_high_and_low_fanout_anchor_modes() {
@@ -962,16 +1203,14 @@ mod tests {
     #[test]
     fn boundary_anchor_refuses_unread_and_disconnected_branches() {
         let a = source();
-        assert!(
-            describe_anchored(
-                &a,
-                0,
-                AnchorMode::Boundary,
-                BTreeSet::from([4, 5]),
-                &limits()
-            )
-            .is_err()
-        );
+        assert!(describe_anchored(
+            &a,
+            0,
+            AnchorMode::Boundary,
+            BTreeSet::from([4, 5]),
+            &limits()
+        )
+        .is_err());
         let a = base(
             vec![
                 Node::Raw { slot: 0 },
@@ -995,16 +1234,14 @@ mod tests {
             ],
             2,
         );
-        assert!(
-            describe_anchored(
-                &a,
-                0,
-                AnchorMode::Boundary,
-                BTreeSet::from([2, 3, 4]),
-                &limits()
-            )
-            .is_err()
-        );
+        assert!(describe_anchored(
+            &a,
+            0,
+            AnchorMode::Boundary,
+            BTreeSet::from([2, 3, 4]),
+            &limits()
+        )
+        .is_err());
         let r = describe_anchored(
             &a,
             0,
@@ -1182,21 +1419,18 @@ mod tests {
             input: 0,
             coefficient: Coefficient::Number(2.),
         });
-        assert!(
-            apply(&a, &r, &ambiguous)
-                .expect_err("shared exit internal dependence ambiguous")
-                .contains("ambiguous")
-        );
+        assert!(apply(&a, &r, &ambiguous)
+            .expect_err("shared exit internal dependence ambiguous")
+            .contains("ambiguous"));
     }
     #[test]
     fn automatic_inventory_exact_extraction_and_protected_metadata() {
         let a = source();
         let inv = propose_regions(&a, limits()).expect("inventory");
-        assert!(
-            inv.regions
-                .iter()
-                .any(|r| r.producer_native == 2 && r.current_internal_nodes == vec![2, 3, 4])
-        );
+        assert!(inv
+            .regions
+            .iter()
+            .any(|r| r.producer_native == 2 && r.current_internal_nodes == vec![2, 3, 4]));
         let r = region(&a, &[2, 3, 4, 5]);
         assert!(!r.native_writes.contains(&2));
         assert!(r.erased_native_places.contains(&2));
@@ -1314,11 +1548,9 @@ mod tests {
             ],
             2,
         );
-        assert!(
-            describe(&late, 1, BTreeSet::from([1, 3]), &limits())
-                .expect_err("late input not available to earlier exit")
-                .contains("not before")
-        );
+        assert!(describe(&late, 1, BTreeSet::from([1, 3]), &limits())
+            .expect_err("late input not available to earlier exit")
+            .contains("not before"));
     }
     #[test]
     fn paid_controls_blocks_and_derived_operator_compaction_preserved() {
