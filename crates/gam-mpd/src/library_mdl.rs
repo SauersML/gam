@@ -86,9 +86,12 @@
 //! program, the gradient stays where the reverse pass left it, and the IVON step and the groups'
 //! divergences run there; the host holds it between epochs, for the
 //! held-out evaluation, the checkpoint and the removal step. An epoch visits every training batch
-//! once, in a fixed order. The continuous fit
-//! has converged when an epoch's mean improvement of the per-batch objective estimate over the
-//! previous epoch, paired by batch, is smaller than its standard error.
+//! once, in a fixed order. The continuous fit stops descending by a statistical criterion, not a
+//! proof of stationarity: when an epoch's mean improvement of the per-batch estimate of `F` over
+//! the previous epoch, paired by batch (the same batches, experiments and noise seeds' structure),
+//! is within its standard error. The criterion is on `F` itself rather than on the natural
+//! gradient in `μ`: under IVON the means settle long before the curvature `h`, and so `σ`, has
+//! finished its epoch-scale decay, which only `F` sees.
 //!
 //! A converged fit then removes groups (`library_removal`): first every group without effect on
 //! any experiment (a rotary plane of a head with no value coordinate left, the gate of a function
