@@ -1,7 +1,7 @@
 //! A sharing move proposed on a library explanation and decided by the code length
 //! (`gam_mpd::library_sharing`, #2951).
 //!
-//! EXPORT SETTINGS.json FROM OUT host|gpu query-key|tie
+//! EXPORT SETTINGS.json FROM OUT host|gpu query-key|tie:K
 //!
 //! SETTINGS.json is the library fit's (`mpd_library_mdl_2951`). FROM is `native` (the library's
 //! start at `M`), `artifact:PATH` (a fit's posterior-mean artifact) or `checkpoint:PATH` (a fit's
@@ -9,8 +9,10 @@
 //!
 //! * `query-key`: the pair of heads in different layers whose score maps have the largest cosine is
 //!   made one shared query-key function;
-//! * `tie`: every earlier MLP output tied to the later gate direction it fits within the
-//!   posterior's noise (`library_sharing::tie_candidates`) is written through that gate.
+//! * `tie:K`: the library is fitted with the learned mixture prior over its gate directions
+//!   (`library_mixture`, `K` candidate writes per gate; OUT/soft), and every candidate holding more
+//!   than half of its gate's mixture weight is made an exact tie; the library without and with the
+//!   ties then starts from the soft fit's posterior means.
 //!
 //! The library as it was (OUT/base) and with the move (OUT/moved) are each fitted to convergence on
 //! the same experiments from the same values; the move is accepted when the moved library's code
@@ -20,7 +22,7 @@ use gam_mpd::{
     artifact::Artifact,
     engine::{log_to_stderr, sha256},
     import::import_language_model,
-    library_mdl, library_readout, library_sharing,
+    library_mdl, library_mixture, library_readout, library_sharing,
     operator_program::SlotValues,
     run_check::{layer_nodes, split_sites},
 };
@@ -46,7 +48,7 @@ fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [export, settings_path, from, out, mode, step] = &args[..] else {
-        return Err("EXPORT SETTINGS.json native|artifact:PATH|checkpoint:PATH OUT host|gpu query-key|tie".into());
+        return Err("EXPORT SETTINGS.json native|artifact:PATH|checkpoint:PATH OUT host|gpu query-key|tie:K".into());
     };
     let (export, settings_path, out) = (Path::new(export), Path::new(settings_path), Path::new(out));
     let settings: Settings = serde_json::from_slice(&std::fs::read(settings_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -77,47 +79,53 @@ fn main() -> Result<(), String> {
         return Err("the export holds fewer training sequences than asked for".into());
     }
     let start = library_mdl::explanation(&native, &layers)?;
-    let tokens_scored = 2 * train.len() * settings.context;
-    let (base, posterior) = match from.split_once(':') {
-        None if from == "native" => {
-            let posterior = library_mdl::Posterior::new(&start, tokens_scored)?;
-            (start, posterior)
-        }
-        Some(("artifact", path)) => {
-            let base = library_sharing::warm(&start, &Artifact::from_bytes(&std::fs::read(path).map_err(|e| e.to_string())?, &native.declarations)?)?;
-            let posterior = library_mdl::Posterior::new(&base, tokens_scored)?;
-            (base, posterior)
-        }
+    let base = match from.split_once(':') {
+        None if from == "native" => start,
+        Some(("artifact", path)) => library_sharing::warm(&start, &Artifact::from_bytes(&std::fs::read(path).map_err(|e| e.to_string())?, &native.declarations)?)?,
         Some(("checkpoint", path)) => {
             let posterior = library_readout::checkpoint_posterior(&start, Path::new(path))?;
             let mut base = library_sharing::warm(&start, &library_mdl::posterior_mean(&start, &posterior)?)?;
             base.removed = (0..posterior.active.len()).filter(|g| !posterior.active[*g]).collect();
-            (base, posterior)
+            base
         }
         _ => return Err("FROM is native, artifact:PATH or checkpoint:PATH".into()),
     };
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
-    let (moved, proposal) = match step.as_str() {
-        "query-key" => {
+    let (base, moved, proposal) = match step.split_once(':') {
+        None if step == "query-key" => {
             let pairs = library_sharing::query_key_pairs(&base)?;
             let best = pairs.first().ok_or("no pair of heads in different layers with keys of their own")?;
             log::info!("sharing heads {:?} and {:?} (score-map cosine {:.4})", best.first, best.second, best.cosine);
             let ranked: Vec<Value> = pairs.iter().take(24).map(|p| json!({"first": p.first, "second": p.second, "cosine": p.cosine})).collect();
-            (library_sharing::share_query_key(&base, &[best.first, best.second])?, json!({"pairs": ranked}))
+            let moved = library_sharing::share_query_key(&base, &[best.first, best.second])?;
+            (base, moved, json!({"pairs": ranked}))
         }
-        "tie" => {
-            let ties = library_sharing::tie_candidates(&base, &posterior)?;
-            if ties.is_empty() {
-                return Err("no earlier output fits a later gate within the posterior's noise".into());
-            }
-            log::info!("{} read-write ties proposed", ties.len());
-            let listed: Vec<Value> = ties
+        Some(("tie", width)) => {
+            let width: usize = width.parse().map_err(|e| format!("tie:K: {e}"))?;
+            let fit = &settings.fit;
+            let steps = library_mixture::Steps { rate: fit.log_sd_step, beta1: fit.beta1, beta2: fit.beta2, epsilon: fit.epsilon };
+            let mut mixture = library_mixture::Mixture::new(&base, width, steps)?;
+            let dir = out.join("soft");
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let soft = library_mdl::fit(&device, &native, &base, &train, held_out, fit, &settings.export_sha256, Some(&dir.join("checkpoint.bin")), Some(&mut mixture))?;
+            save(&dir.join("REPORT.json"), &serde_json::to_value(&soft.report).map_err(|e| e.to_string())?)?;
+            // Both libraries start from the soft fit's posterior means and removals.
+            let mut at = library_sharing::warm(&base, &library_mdl::posterior_mean(&base, &soft.posterior)?)?;
+            at.removed = (0..soft.posterior.active.len()).filter(|g| !soft.posterior.active[*g]).collect();
+            let dominant = mixture.dominant(&soft.posterior)?;
+            log::info!("{} gates' mixtures are dominated by one write", dominant.len());
+            let listed: Vec<Value> = dominant
                 .iter()
-                .map(|t| json!({"source": t.source, "target": t.target, "cosine": t.cosine, "scale": t.scale, "misfit": t.misfit, "coordinates": t.coordinates}))
+                .map(|(t, j)| {
+                    let target = &mixture.targets[*t];
+                    json!({"target": [target.layer, target.function], "write": target.components[*j].write, "scale": target.components[*j].scale, "weights": target.weights().unwrap_or_default(), "choices": target.choices})
+                })
                 .collect();
-            (library_sharing::tie(&base, &ties)?, json!({"ties": listed}))
+            let moved = mixture.harden(&at, &soft.posterior)?;
+            let proposal = json!({"ties": listed, "choice_bits": moved.fixed_nats / std::f64::consts::LN_2});
+            (at, moved, proposal)
         }
-        _ => return Err("the move is query-key or tie".into()),
+        _ => return Err("the move is query-key or tie:K".into()),
     };
     moved.artifact.validate_coverage(&native)?;
     save(&out.join("PROPOSAL.json"), &proposal)?;
@@ -127,7 +135,7 @@ fn main() -> Result<(), String> {
         let checkpoint = dir.join("checkpoint.bin");
         library_mdl::check_checkpoint(&checkpoint, &library_mdl::identity(&settings.export_sha256, &native, explanation, &train, held_out))?;
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let fit = library_mdl::fit(&device, &native, explanation, &train, held_out, &settings.fit, &settings.export_sha256, Some(&checkpoint))?;
+        let fit = library_mdl::fit(&device, &native, explanation, &train, held_out, &settings.fit, &settings.export_sha256, Some(&checkpoint), None)?;
         save(&dir.join("REPORT.json"), &serde_json::to_value(&fit.report).map_err(|e| e.to_string())?)?;
         fits.push(fit.report);
     }

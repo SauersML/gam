@@ -41,15 +41,13 @@
 //! operator is the one the later layer applies, so its gradient sums over both uses and its
 //! `KL(q ‖ p)` is charged once; read variables stay gate rows.
 //!
-//! A tie is proposed for an earlier output `u_j` with the later gate `g_i` of largest `|cos|`, when
-//! the scaled gate fits the output within the posterior's noise: with `c = μ_u·μ_g / μ_g·μ_g`, the
-//! misfit `χ² = Σ_k (μ_{u,k} − c μ_{g,k})² / (σ²_{u,k} + c² σ²_{g,k})` is at most its expectation `d`
-//! (the number of coordinates) under the hypothesis `u_j = c g_i`. A proposal is accepted only if the
-//! code length `F` falls after the fit re-converges on the same experiments.
+//! Ties are proposed by a learned mixture prior over the gate directions (`library_mixture`); a
+//! tie is accepted only if the code length `F` falls after the fit re-converges on the same
+//! experiments.
 
 use crate::{
-    library_mdl::{Cells, Explanation, Group, Posterior},
-    operator_program::{Interface, LabelKind, Node, Operator, OperatorProgram, Provenance, Rotary, exact_precision},
+    library_mdl::{Cells, Explanation, Group},
+    operator_program::{Interface, LabelKind, Node, Operator, OperatorProgram, Provenance, Rotary, exact_precision, remap_node},
 };
 use ndarray::Array2;
 use std::{collections::BTreeMap, sync::Arc};
@@ -262,7 +260,7 @@ pub fn share_query_key(explanation: &Explanation, members: &[(usize, usize)]) ->
         }
     }
     let removed = explanation.removed.iter().filter_map(|g| index.get(g).copied()).collect();
-    Ok(Explanation { artifact, trainable, groups, layers, removed })
+    Ok(Explanation { artifact, trainable, groups, layers, removed, fixed_nats: explanation.fixed_nats })
 }
 
 /// `explanation` with its library operators set to `artifact`'s (a posterior-mean artifact of a fit
@@ -287,11 +285,7 @@ pub fn warm(explanation: &Explanation, artifact: &crate::artifact::Artifact) -> 
 pub struct Tie {
     pub source: (usize, usize),
     pub target: (usize, usize),
-    pub cosine: f64,
     pub scale: f64,
-    /// The misfit `χ²` of the tie under the posterior and its expectation `d` (module note).
-    pub misfit: f64,
-    pub coordinates: usize,
 }
 
 fn operator_index(program: &OperatorProgram, name: &str) -> Result<usize, String> {
@@ -300,62 +294,6 @@ fn operator_index(program: &OperatorProgram, name: &str) -> Result<usize, String
         (Some(index), None) => Ok(index),
         _ => Err(format!("no unique operator {name}")),
     }
-}
-
-/// The proposed ties of `explanation` at `posterior` (module note), each earlier output's best
-/// later gate, by decreasing `|cos|`.
-pub fn tie_candidates(explanation: &Explanation, posterior: &Posterior) -> Result<Vec<Tie>, String> {
-    let program = &explanation.artifact.program;
-    let position = |op: usize| explanation.trainable.iter().position(|t| *t == op).ok_or_else(|| format!("operator {op} is not trainable"));
-    let active = |name: &str| -> Result<bool, String> {
-        let g = explanation.groups.iter().position(|g| g.name == name).ok_or_else(|| format!("no group {name}"))?;
-        Ok(posterior.active[g])
-    };
-    let layers = explanation.layers.len();
-    let (mut gates, mut outputs) = (Vec::new(), Vec::new());
-    for l in 0..layers {
-        gates.push(position(operator_index(program, &format!("library.l{l}.mlp.gate"))?)?);
-        outputs.push(position(operator_index(program, &format!("library.l{l}.mlp.out"))?)?);
-    }
-    let unit = |m: &Array2<f64>| -> Array2<f64> {
-        let mut out = m.clone();
-        for mut row in out.rows_mut() {
-            let n = row.dot(&row).sqrt();
-            if n > 0.0 {
-                row /= n;
-            }
-        }
-        out
-    };
-    let mut out = Vec::new();
-    for source in 0..layers {
-        let u = posterior.mean[outputs[source]].t().to_owned();
-        let su = posterior.log_sd[outputs[source]].t().mapv(|s| (2.0 * s).exp());
-        let un = unit(&u);
-        for j in 0..u.nrows() {
-            if !active(&format!("library.l{source}.mlp.f{j}.out"))? {
-                continue;
-            }
-            let mut best: Option<(usize, usize, f64)> = None;
-            for target in source + 1..layers {
-                let cosines = unit(&posterior.mean[gates[target]]).dot(&un.row(j));
-                for (i, c) in cosines.iter().enumerate() {
-                    if best.is_none_or(|b| c.abs() > b.2.abs()) && active(&format!("library.l{target}.mlp.f{i}.gate"))? {
-                        best = Some((target, i, *c));
-                    }
-                }
-            }
-            let Some((target, i, cosine)) = best else { continue };
-            let (g, sg) = (posterior.mean[gates[target]].row(i), posterior.log_sd[gates[target]].row(i).mapv(|s| (2.0 * s).exp()));
-            let scale = u.row(j).dot(&g) / g.dot(&g);
-            let misfit: f64 = (0..g.len()).map(|k| (u[[j, k]] - scale * g[k]).powi(2) / (su[[j, k]] + scale * scale * sg[k])).sum();
-            if misfit <= g.len() as f64 {
-                out.push(Tie { source: (source, j), target: (target, i), cosine, scale, misfit, coordinates: g.len() });
-            }
-        }
-    }
-    out.sort_by(|a, b| b.cosine.abs().total_cmp(&a.cosine.abs()));
-    Ok(out)
 }
 
 /// `explanation` with the read–write `ties` made (module note): each tied output leaves the
@@ -455,6 +393,69 @@ pub fn tie(explanation: &Explanation, ties: &[Tie]) -> Result<Explanation, Strin
     Ok(out)
 }
 
+/// `explanation` with the gate direction of function `target.1` of layer `target.0` made `scale`
+/// times the embedding row of `token` (`M`'s, sent with `M`): the gate's own row leaves the
+/// explanation, and the function reads `scale (e_t · x)` through a fixed copy of the row and a 1 × 1
+/// scale, one prior group, scattered into the gate's row.
+pub fn tie_token(explanation: &Explanation, target: (usize, usize), token: usize, scale: f64) -> Result<Explanation, String> {
+    let mut out = explanation.clone();
+    let (l, i) = target;
+    let program = &mut out.artifact.program;
+    let rule = program.rules.iter().position(|r| r.name == format!("library.l{l}.mlp")).ok_or("no MLP rule")?;
+    let gate_index = operator_index(program, &format!("library.l{l}.mlp.gate"))?;
+    let gate = program.operators[gate_index].clone();
+    let embedding = program.operators[operator_index(program, "wte")?].matrix();
+    if token >= embedding.ncols() || i >= gate.rows.width() {
+        return Err(format!("no token {token} or no function {i} of layer {l}"));
+    }
+    let one = Interface::uniform(1, 1, LabelKind::Unit, 0).map_err(error)?;
+    let provenance = Provenance::derived(&[&gate.provenance], format!("token {token} tie"));
+    let name = format!("library.l{l}.mlp.f{i}.token{token}");
+    let mut scatter = Array2::zeros((gate.rows.width(), 1));
+    scatter[[i, 0]] = 1.0;
+    let base = program.operators.len();
+    for (part, rows, cols, values) in [
+        ("row", one.clone(), gate.cols.clone(), embedding.column(token).to_owned().insert_axis(ndarray::Axis(0))),
+        ("scale", one.clone(), one.clone(), Array2::from_elem((1, 1), scale)),
+        ("scatter", gate.rows.clone(), one.clone(), scatter),
+    ] {
+        program.operators.push(Arc::new(dense(format!("{name}.{part}"), rows, cols, values, provenance.clone())?));
+    }
+    let mut values = gate.matrix();
+    values.row_mut(i).fill(0.0);
+    program.operators[gate_index] = Arc::new(dense(gate.name.clone(), gate.rows.clone(), gate.cols.clone(), values, gate.provenance.clone())?);
+    // The row and its scale come first in the rule (after its input), the gate reading them last.
+    let (ops, bases, rules): (Vec<usize>, Vec<usize>, Vec<usize>) = ((0..base + 3).collect(), (0..program.bases.len()).collect(), (0..program.rules.len()).collect());
+    let r = &mut program.rules[rule];
+    let map: Vec<usize> = (0..r.nodes.len()).map(|n| if n == 0 { 0 } else { n + 2 }).collect();
+    let mut nodes = vec![r.nodes[0].clone(), Node::Affine { terms: vec![(0, base)], bias: None }, Node::Affine { terms: vec![(1, base + 1)], bias: None }];
+    for node in &r.nodes[1..] {
+        let mut node = node.clone();
+        remap_node(&mut node, &map, &ops, &bases, &rules);
+        if let Node::Affine { terms, .. } = &mut node
+            && terms.first().is_some_and(|t| t.0 == 0 && t.1 == gate_index)
+        {
+            terms.push((2, base + 2));
+        }
+        nodes.push(node);
+    }
+    r.output = map[r.output];
+    r.nodes = nodes;
+    program.interfaces().map_err(error)?;
+    let own = out.groups.iter().position(|g| g.name == format!("library.l{l}.mlp.f{i}.gate")).ok_or("no gate group")?;
+    let tied = out.groups.len();
+    out.groups.push(Group { name: format!("library.l{l}.mlp.f{i}.token"), cells: vec![Cells { operator: base + 1, rows: vec![0], cols: 0..1 }] });
+    out.removed.push(own);
+    out.trainable.push(base + 1);
+    out.trainable.sort_unstable();
+    for g in out.layers[l].functions[i].iter_mut() {
+        if *g == own {
+            *g = tied;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,11 +531,7 @@ mod tests {
         program.operators[out] = Arc::new(dense(program.operators[out].name.clone(), program.operators[out].rows.clone(), program.operators[out].cols.clone(), values, Provenance::default()).unwrap());
         let tokens = 2 * 6 * 12;
         let untied = Posterior::new(&start, tokens).unwrap();
-        let ties = tie_candidates(&start, &untied).unwrap();
-        let found = ties.iter().find(|t| t.source == (0, 3)).expect("the copy is proposed");
-        assert_eq!(found.target, (1, 5));
-        assert!((found.scale - 2.5).abs() < 1e-12 && (found.cosine - 1.0).abs() < 1e-12 && found.misfit < 1e-20, "{found:?}");
-        let tied = tie(&start, std::slice::from_ref(found)).unwrap();
+        let tied = tie(&start, &[Tie { source: (0, 3), target: (1, 5), scale: 2.5 }]).unwrap();
         let (before, after) = (start.artifact.execute(&imported.family).unwrap(), tied.artifact.execute(&imported.family).unwrap());
         let (a, b) = (&before.values[start.artifact.program.output], &after.values[tied.artifact.program.output]);
         let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
@@ -552,7 +549,7 @@ mod tests {
             }
         }
         assert_eq!(posterior.active.iter().filter(|a| **a).count(), untied.active.len());
-        assert!(tie(&start, &[Tie { source: (1, 0), target: (0, 0), cosine: 1.0, scale: 1.0, misfit: 0.0, coordinates: 8 }]).is_err(), "a later write cannot feed an earlier read");
+        assert!(tie(&start, &[Tie { source: (1, 0), target: (0, 0), scale: 1.0 }]).is_err(), "a later write cannot feed an earlier read");
     }
 
     #[test]

@@ -56,6 +56,8 @@ pub mod library_mdl;
 pub mod library_readout;
 // Shared functions of the library: one query-key function read by heads of several layers.
 pub mod library_sharing;
+// A learned mixture prior over the gate directions: read–write ties found by gradient.
+pub mod library_mixture;
 // Its posterior resident on the device: sample, Adam step and group divergences without transfers.
 pub mod device_posterior;
 pub mod composed_rule_search;

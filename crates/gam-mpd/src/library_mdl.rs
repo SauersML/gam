@@ -161,6 +161,52 @@ pub struct Explanation {
     /// Groups that start outside the explanation, exactly zero (the output a read–write tie
     /// replaces, `library_sharing`).
     pub removed: Vec<usize>,
+    /// The nats of the explanation's discrete choices: each exact read–write tie's choice of the
+    /// write it reads among its candidates (`library_mixture`).
+    pub fixed_nats: f64,
+}
+
+/// A prior term beyond the groups' own Gaussian priors (`library_mixture`): its value at a weight
+/// sample enters `F` beside the groups' divergences, and its gradient in the sample joins the data
+/// term's.
+pub trait PriorTerm {
+    /// The trainable operators it reads (indices into `Explanation::trainable`).
+    fn operators(&self) -> Vec<usize>;
+    /// Re-choose its structure from `posterior`, once per epoch.
+    fn epoch(&mut self, explanation: &Explanation, posterior: &Posterior) -> Result<(), String>;
+    /// Its value in nats at the weight sample `theta` (its operators', by trainable index) of
+    /// `posterior`, its gradient in `theta`, and with `learn` one step of its own parameters.
+    fn sample(&mut self, posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String>;
+    /// The nats of the parameters it sends.
+    fn cost(&self, posterior: &Posterior) -> f64;
+    /// Its state, for a checkpoint, and its state restored from one.
+    fn save(&self) -> Result<serde_json::Value, String>;
+    fn load(&mut self, value: &serde_json::Value) -> Result<(), String>;
+}
+
+/// The weight sample of `key` (`DevicePosterior::sample_into`'s draws) of `posterior`'s trainable
+/// operators `operators`, on the host.
+fn host_sample(posterior: &Posterior, operators: &[usize], key: u64) -> BTreeMap<usize, Array2<f64>> {
+    operators
+        .par_iter()
+        .map(|&i| {
+            let (mean, log_sd) = (&posterior.mean[i], &posterior.log_sd[i]);
+            let cols = mean.ncols();
+            let theta = Array2::from_shape_fn(mean.dim(), |(r, c)| {
+                let s = log_sd[[r, c]];
+                if s == f64::NEG_INFINITY { mean[[r, c]] } else { mean[[r, c]] + s.exp() * f64::from(gam_gpu::tensor::posterior_normal(key, i as u64, (r * cols + c) as u64)) }
+            });
+            (i, theta)
+        })
+        .collect()
+}
+
+/// `prior`'s value with the parameters it sends, in nats, at the weight sample of `key` of
+/// `posterior`, and its gradient in the sample; with `learn`, one step of its own parameters.
+fn prior_term(prior: &mut (dyn PriorTerm + 'static), posterior: &Posterior, key: u64, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String> {
+    let theta = host_sample(posterior, &prior.operators(), key);
+    let (value, gradient) = prior.sample(posterior, &theta, learn)?;
+    Ok((value + prior.cost(posterior), gradient))
 }
 
 /// One layer of the explanation: its native sites (`run_check::layer_nodes`) and the prior groups
@@ -442,7 +488,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
         trainable.push(output);
     }
     trainable.sort_unstable();
-    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new() })
+    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0 })
 }
 
 // ------------------------------------------------------------------------------------- posterior
@@ -721,6 +767,12 @@ pub struct HeldOut {
     /// `Σ_G KL(q_G ‖ p_G)` and the active groups' variances `Σ ½ log2 |G|`, in bits.
     pub divergence_bits: f64,
     pub variance_bits: f64,
+    /// The explanation's discrete choices (`Explanation::fixed_nats`), and the prior term's value at
+    /// one weight sample with the parameters it sends (`PriorTerm`), in bits.
+    #[serde(default)]
+    pub choice_bits: f64,
+    #[serde(default)]
+    pub prior_bits: f64,
     /// At the posterior mean: clean and patched experiments per hybrid size `k = 1..=2L` (`k = 2L`
     /// is the explanation alone), and the patched ones by kind: one read variable, or a joint
     /// patch of several.
@@ -1092,6 +1144,7 @@ impl Mean {
 
 /// The held-out evaluation of `posterior` (held on the host, and as `device_posterior` on the
 /// device) on `sequences` (module note); `tokens` is `N`.
+#[allow(clippy::too_many_arguments)]
 fn held_out(
     scorer: &mut Scorer,
     explanation: &Explanation,
@@ -1100,6 +1153,7 @@ fn held_out(
     sequences: &[Vec<u32>],
     settings: &Settings,
     tokens: usize,
+    prior: Option<&mut (dyn PriorTerm + 'static)>,
 ) -> Result<HeldOut, String> {
     let blocks = 2 * scorer.layers();
     let variables = scorer.variables.clone();
@@ -1140,12 +1194,19 @@ fn held_out(
     }
     let data = sampled.mean().ok_or("no held-out tokens")?;
     let divergence: f64 = posterior.divergences().iter().sum();
-    let description = posterior.description();
+    let gaussian = posterior.description();
+    let prior_nats = match prior {
+        Some(prior) => prior_term(prior, posterior, noise_seed(settings.seed, 0, 0), false)?.0,
+        None => 0.0,
+    };
+    let description = gaussian + explanation.fixed_nats + prior_nats;
     Ok(HeldOut {
         objective_bits_per_token: data + description / LN_2 / tokens as f64,
         data_bits_per_token: data,
         divergence_bits: divergence / LN_2,
-        variance_bits: (description - divergence) / LN_2,
+        variance_bits: (gaussian - divergence) / LN_2,
+        choice_bits: explanation.fixed_nats / LN_2,
+        prior_bits: prior_nats / LN_2,
         clean: clean.iter().map(Mean::mean).collect(),
         patched: patched.iter().map(Mean::mean).collect(),
         read_patch: read.mean(),
@@ -1264,6 +1325,9 @@ struct Progress {
     evaluation_seconds: f64,
     #[serde(default)]
     full_seconds: f64,
+    /// The prior term's state, when the fit has one.
+    #[serde(default)]
+    prior: Option<serde_json::Value>,
 }
 
 /// What a checkpoint belongs to: a fit resumes from it only when every field agrees, so a
@@ -1315,6 +1379,7 @@ pub fn identity(export: &str, native: &OperatorProgram, explanation: &Explanatio
     program_structure(&mut program, b"explanation", &explanation.artifact.program);
     let mut groups = Fingerprinter::new();
     groups.absorb_str(b"removed", &format!("{:?}", explanation.removed));
+    groups.absorb_u64(b"fixed", explanation.fixed_nats.to_bits());
     for group in &explanation.groups {
         groups.absorb_str(b"group", &group.name);
         for cell in &group.cells {
@@ -1508,8 +1573,10 @@ pub fn fit(
     settings: &Settings,
     export: &str,
     checkpoint: Option<&Path>,
+    prior: Option<&mut (dyn PriorTerm + 'static)>,
 ) -> Result<Fit, String> {
     settings.validate()?;
+    let mut prior = prior;
     let length = sequences.first().map_or(0, Vec::len);
     if length == 0 || held.len() < 2 || sequences.iter().chain(held).any(|s| s.len() != length) {
         return Err("training and held-out sequences (at least two) must be nonempty and of one length".into());
@@ -1550,6 +1617,7 @@ pub fn fit(
         training_seconds: 0.0,
         evaluation_seconds: 0.0,
         full_seconds: 0.0,
+        prior: None,
     };
     // The fixed held-out subset: the first batch of held-out bases (at least the two a source
     // needs).
@@ -1558,6 +1626,11 @@ pub fn fit(
     if let Some(path) = checkpoint.filter(|p| p.exists()) {
         let (loaded, moments) = load_checkpoint(path, &progress, &mut posterior)?;
         progress = loaded;
+        match (prior.as_deref_mut(), &progress.prior) {
+            (Some(prior), Some(state)) => prior.load(state)?,
+            (None, None) => {}
+            _ => return Err(format!("{}: a checkpoint of a fit with another prior term", path.display())),
+        }
         resumed = Some(moments);
         log::info!("library fit resumed at epoch {} from {}", progress.epoch, path.display());
     }
@@ -1578,18 +1651,32 @@ pub fn fit(
         std::fs::write(&partial, posterior_mean(explanation, posterior)?.f32_literals()?.to_bytes()?).map_err(error)?;
         std::fs::rename(&partial, path.with_extension("artifact.bin")).map_err(error)
     };
+    if let Some(prior) = prior.as_deref_mut()
+        && progress.prior.is_none()
+    {
+        prior.epoch(explanation, &posterior)?;
+    }
     if progress.start.is_none() {
         let timed = Instant::now();
-        let start = held_out(&mut scorer, explanation, &posterior, &device_posterior, held, settings, tokens)?;
+        let start = held_out(&mut scorer, explanation, &posterior, &device_posterior, held, settings, tokens, prior.as_deref_mut())?;
         progress.full_seconds = timed.elapsed().as_secs_f64();
         log::info!("library start: {start:?}");
         progress.start = Some(start);
         device_posterior.values_into(&mut posterior)?;
+        progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
         save(&mut progress, &posterior, &device_posterior)?;
     }
+    // The prior term's operators: their means and deviations come to the host every step, as its
+    // weight sample is drawn there.
+    let prior_operators = prior.as_deref().map(PriorTerm::operators).unwrap_or_default();
     while !progress.done {
         let epoch = progress.epoch;
         let epoch_started = Instant::now();
+        if let Some(prior) = prior.as_deref_mut()
+            && epoch > 0
+        {
+            prior.epoch(explanation, &posterior)?;
+        }
         let mut estimates = Vec::with_capacity(draws.len());
         let (mut data_sum, mut description_sum) = (0.0, 0.0);
         let (mut clean, mut patched) = (Mean::default(), Mean::default());
@@ -1598,7 +1685,7 @@ pub fn fit(
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
             let key = noise_seed(settings.seed, epoch + 1, b);
-            let (bits, gradients) = scorer.score_device(&device_posterior, &batch, &experiments, Some(key), &format!("train_{b}"), true)?;
+            let (bits, mut gradients) = scorer.score_device(&device_posterior, &batch, &experiments, Some(key), &format!("train_{b}"), true)?;
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
@@ -1613,6 +1700,31 @@ pub fn fit(
                 .zip(&posterior.active)
                 .map(|((d, n), active)| if *active { d + 0.5 * n.ln() } else { 0.0 })
                 .sum();
+            // The prior term at the same weight sample; its gradient joins the data term's, which
+            // the step weighs by `scale` in nats.
+            let prior_nats = match prior.as_deref_mut() {
+                Some(prior) => {
+                    for &i in &prior_operators {
+                        let (mean, log_sd) = device_posterior.values(i)?;
+                        posterior.mean[i] = mean;
+                        posterior.log_sd[i] = log_sd;
+                    }
+                    let (nats, extra) = prior_term(prior, &posterior, key, true)?;
+                    for (i, g) in extra {
+                        let op = explanation.trainable[i];
+                        let uploaded = device.upload((g / (scale * LN_2)).view()).map_err(error)?;
+                        match gradients.get_mut(&op) {
+                            Some(total) => device.axpy(total, 1.0, &uploaded).map_err(error)?,
+                            None => {
+                                gradients.insert(op, uploaded);
+                            }
+                        }
+                    }
+                    nats
+                }
+                None => 0.0,
+            };
+            let description = description + explanation.fixed_nats + prior_nats;
             if !description.is_finite() {
                 return Err("a nonfinite posterior divergence".into());
             }
@@ -1654,13 +1766,13 @@ pub fn fit(
                 progress.training_seconds += epoch_started.elapsed().as_secs_f64();
                 device_posterior.values_into(&mut posterior)?;
                 let timed = Instant::now();
-                let evaluation = held_out(&mut scorer, explanation, &posterior, &device_posterior, subset, settings, tokens)?;
+                let evaluation = held_out(&mut scorer, explanation, &posterior, &device_posterior, subset, settings, tokens, prior.as_deref_mut())?;
                 progress.evaluation_seconds += timed.elapsed().as_secs_f64();
                 evaluation
             },
             held_out_full: if progress.evaluation_seconds + progress.full_seconds <= EVALUATION_SHARE * progress.training_seconds {
                 let timed = Instant::now();
-                let evaluation = held_out(&mut scorer, explanation, &posterior, &device_posterior, held, settings, tokens)?;
+                let evaluation = held_out(&mut scorer, explanation, &posterior, &device_posterior, held, settings, tokens, prior.as_deref_mut())?;
                 progress.full_seconds = timed.elapsed().as_secs_f64();
                 progress.evaluation_seconds += progress.full_seconds;
                 Some(evaluation)
@@ -1674,7 +1786,7 @@ pub fn fit(
         progress.epoch += 1;
         let converged = matches!((improvement, standard_error), (Some(i), Some(se)) if i <= se);
         if converged {
-            let removal = remove(&mut scorer, &mut posterior, &draws, sequences, settings)?;
+            let removal = remove(&mut scorer, &mut posterior, &draws, sequences, settings, explanation.fixed_nats, prior.as_deref_mut())?;
             log::info!("library removal after epoch {epoch}: {} of {} candidates", removal.removed, removal.candidates);
             // The removed groups' entries are exactly zero with `ln σ = −∞`, which the device step
             // leaves alone.
@@ -1684,10 +1796,11 @@ pub fn fit(
             // The objective changed discretely: convergence is judged afresh.
             progress.previous = None;
         }
+        progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
         save(&mut progress, &posterior, &device_posterior)?;
     }
     let objective_bits = progress.removals.last().map_or(f64::NAN, |r| r.after_bits);
-    let end = held_out(&mut scorer, explanation, &posterior, &device_posterior, held, settings, tokens)?;
+    let end = held_out(&mut scorer, explanation, &posterior, &device_posterior, held, settings, tokens, prior.as_deref_mut())?;
     log::info!("library end: {end:?}");
     Ok(Fit {
         report: Report {
@@ -1710,19 +1823,34 @@ pub fn fit(
 }
 
 /// `E_q[D]` over every training batch in nats, one weight sample per batch from the removal seeds,
-/// with the groups `removed` (and the already removed ones) zeroed, on the fixed collection.
-fn expected_divergence(scorer: &mut Scorer, posterior: &Posterior, draws: &[Draw], sequences: &[Vec<u32>], removed: &[usize], settings: &Settings) -> Result<f64, String> {
+/// with the groups `removed` (and the already removed ones) zeroed, on the fixed collection; with
+/// `prior`, plus its value at each batch's sample, averaged, and the parameters it sends.
+fn expected_divergence(
+    scorer: &mut Scorer,
+    posterior: &Posterior,
+    draws: &[Draw],
+    sequences: &[Vec<u32>],
+    removed: &[usize],
+    settings: &Settings,
+    prior: Option<&mut (dyn PriorTerm + 'static)>,
+) -> Result<f64, String> {
     let mut trial = posterior.clone();
     trial.remove(removed);
-    let mut bits = 0.0;
+    let mut prior = prior;
+    let (mut bits, mut prior_nats) = (0.0, 0.0);
     for (b, draw) in draws.iter().enumerate() {
         // Removal zeroes entries, so the remaining entries see the same noise as the full posterior.
         let (theta, _) = trial.sample(noise_seed(settings.seed, 0, b));
         let experiments = scorer.experiments(draw, sequences)?;
         let (scored, _) = scorer.score(&draw.batch(sequences)?, &experiments, &theta, &format!("train_{b}"), false)?;
         bits += scored.iter().flatten().sum::<f64>();
+        if let Some(prior) = prior.as_deref_mut() {
+            let sample: BTreeMap<usize, Array2<f64>> = prior.operators().into_iter().map(|i| (i, theta[i].clone())).collect();
+            prior_nats += prior.sample(&trial, &sample, false)?.0;
+        }
     }
-    Ok(bits * LN_2)
+    let cost = prior.as_deref().map_or(0.0, |p| p.cost(&trial));
+    Ok(bits * LN_2 + prior_nats / draws.len() as f64 + cost)
 }
 
 /// The longest prefix among those bisection evaluates, out of `candidates`, whose `change` (the
@@ -1759,13 +1887,22 @@ fn largest_accepted_prefix(
 
 /// The removal step (module note): a prefix of the active groups in increasing divergence whose
 /// removal does not increase the sampled objective on this round's fixed evidence, found by bisection.
-fn remove(scorer: &mut Scorer, posterior: &mut Posterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings) -> Result<Removal, String> {
+fn remove(
+    scorer: &mut Scorer,
+    posterior: &mut Posterior,
+    draws: &[Draw],
+    sequences: &[Vec<u32>],
+    settings: &Settings,
+    fixed: f64,
+    prior: Option<&mut (dyn PriorTerm + 'static)>,
+) -> Result<Removal, String> {
+    let mut prior = prior;
     let divergences = posterior.divergences();
     let costs = posterior.costs();
     let mut order: Vec<usize> = (0..divergences.len()).filter(|g| posterior.active[*g]).collect();
     order.sort_by(|a, b| divergences[*a].total_cmp(&divergences[*b]));
-    let description = posterior.description();
-    let base = expected_divergence(scorer, posterior, draws, sequences, &[], settings)? + description;
+    let description = posterior.description() + fixed;
+    let base = expected_divergence(scorer, posterior, draws, sequences, &[], settings, prior.as_deref_mut())? + description;
     // `F` with the first `k` candidates removed, minus `F` as it is.
     let mut evaluations: Vec<(usize, f64)> = Vec::new();
     let mut change = |k: usize| -> Result<f64, String> {
@@ -1773,7 +1910,7 @@ fn remove(scorer: &mut Scorer, posterior: &mut Posterior, draws: &[Draw], sequen
             return Ok(*c);
         }
         let saved: f64 = order[..k].iter().map(|g| costs[*g]).sum();
-        let c = expected_divergence(scorer, posterior, draws, sequences, &order[..k], settings)? + description - saved - base;
+        let c = expected_divergence(scorer, posterior, draws, sequences, &order[..k], settings, prior.as_deref_mut())? + description - saved - base;
         log::info!("library removal of {k} of {} groups: F changes by {:.6e} bits", order.len(), c / LN_2);
         evaluations.push((k, c));
         Ok(c)
@@ -2002,7 +2139,7 @@ mod tests {
         let settings = settings();
         let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, None).unwrap();
         let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, None, 0).unwrap();
-        let evaluation = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72).unwrap();
+        let evaluation = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
         for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
             let bits = bits.expect("every cut and the read patches are drawn");
             assert!(bits.abs() < 1e-10, "the starting library diverges from the model by {bits} bits per token");
@@ -2018,7 +2155,7 @@ mod tests {
         let (native, layers, _, sequences) = tiny_qwen3("library_fit_qwen3");
         let explanation = explanation(&native, &layers).unwrap();
         let (train, held) = sequences.split_at(4);
-        let fit = fit(&Device::host(), &native, &explanation, train, held, &settings(), "tiny", None).unwrap();
+        let fit = fit(&Device::host(), &native, &explanation, train, held, &settings(), "tiny", None, None).unwrap();
         let report = &fit.report;
         assert_eq!(report.removals.last().unwrap().removed, 0, "the fit ends when no removal is accepted");
         assert!(report.removals.iter().all(|r| r.after_bits <= r.before_bits), "a removal never increases the objective");
@@ -2044,10 +2181,26 @@ mod tests {
     }
 
     #[test]
+    fn the_reported_objective_pays_for_the_explanation_s_choices() {
+        let (native, layers, _, sequences) = tiny("library_choice_bits", "gelu_tanh");
+        let mut explanation = explanation(&native, &layers).unwrap();
+        let settings = settings();
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, None).unwrap();
+        let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, None, 0).unwrap();
+        let without = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
+        explanation.fixed_nats = 1000_f64.ln();
+        let with = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
+        assert!((with.choice_bits - 1000_f64.log2()).abs() < 1e-12);
+        let added = (with.objective_bits_per_token - without.objective_bits_per_token) * 72.0;
+        assert!((added - 1000_f64.log2()).abs() < 1e-9, "F per token gains the choice's bits over the scored tokens: {added}");
+    }
+
+    #[test]
     fn a_tied_gate_is_differentiated_through_both_of_its_uses() {
         let (native, layers, _, sequences) = tiny("library_tie_gradient", "gelu_tanh");
         let start = explanation(&native, &layers).unwrap();
-        let tie = crate::library_sharing::Tie { source: (0, 3), target: (1, 5), cosine: 0.0, scale: 0.7, misfit: 0.0, coordinates: 8 };
+        let tie = crate::library_sharing::Tie { source: (0, 3), target: (1, 5), scale: 0.7 };
         let explanation = crate::library_sharing::tie(&start, &[tie]).unwrap();
         let settings = settings();
         let posterior = Posterior::new(&explanation, 72).unwrap();
@@ -2152,7 +2305,7 @@ mod tests {
         let posterior = Posterior::new(&explanation, 72).unwrap();
         let mut scorer = Scorer::new(&device, &native, &explanation, &settings, None).unwrap();
         let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, None, 0).unwrap();
-        let evaluation = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72).unwrap();
+        let evaluation = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
         for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
             let bits = bits.expect("every cut and the read patches are drawn");
             assert!(bits.abs() < 1e-10, "the starting library diverges from the model by {bits} bits per token");
@@ -2195,7 +2348,7 @@ mod tests {
             reference_bits += reference.bits.iter().flatten().sum::<f64>();
         }
         assert!(read_patches > 0, "the collection must hold read patches of removed functions");
-        let actual = expected_divergence(&mut scorer, &posterior, &draws, &sequences, &removed, &settings).unwrap();
+        let actual = expected_divergence(&mut scorer, &posterior, &draws, &sequences, &removed, &settings, None).unwrap();
         let reference = reference_bits * LN_2;
         assert!((actual - reference).abs() < 1e-10 * reference.abs().max(1.0), "removal must score the fixed collection");
     }
@@ -2376,6 +2529,7 @@ mod tests {
             training_seconds: 3.0,
             evaluation_seconds: 2.0,
             full_seconds: 1.0,
+            prior: None,
         };
         // The existing wire format: length-prefixed JSON, then six row-major f64 arrays per
         // operator. This fixture is independent of the streaming decoder and requires no GPU.
@@ -2472,9 +2626,9 @@ mod tests {
         let device = Device::host();
         let (train, held) = sequences.split_at(4);
         let checkpoint = std::env::temp_dir().join(format!("library_fit_{}.bin", std::process::id()));
-        let fit = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&checkpoint)).unwrap();
+        let fit = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&checkpoint), None).unwrap();
         // A finished fit's checkpoint resumes to the same posterior without another step.
-        let resumed = super::fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&checkpoint)).unwrap();
+        let resumed = super::fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&checkpoint), None).unwrap();
         // A checkpoint of another export, other sequences or another library is refused, and so
         // is a fit that would resume from it.
         let own = identity("tiny", &native, &explanation, train, held);
@@ -2499,7 +2653,7 @@ mod tests {
             let refusal = check_checkpoint(&checkpoint, &other).unwrap_err();
             assert!(refusal.contains(field), "{refusal}");
         }
-        assert!(super::fit(&device, &native, &explanation, train, held, &settings, "another", Some(&checkpoint)).is_err());
+        assert!(super::fit(&device, &native, &explanation, train, held, &settings, "another", Some(&checkpoint), None).is_err());
         std::fs::remove_file(&checkpoint).unwrap();
         std::fs::remove_file(checkpoint.with_extension("json")).unwrap();
         std::fs::remove_file(checkpoint.with_extension("artifact.bin")).unwrap();

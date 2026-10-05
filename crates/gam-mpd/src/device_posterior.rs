@@ -263,6 +263,11 @@ impl DevicePosterior {
         self.refresh()
     }
 
+    /// Trainable operator `i`'s `μ` and `s` on the host.
+    pub fn values(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>), String> {
+        Ok((self.fitting.download(&self.mean[i]).map_err(error)?, self.fitting.download(&self.log_sd[i]).map_err(error)?))
+    }
+
     /// Trainable operator `i`'s `μ`, `s` and Adam's moments on the host, one operator at a time
     /// (a checkpoint streams them rather than holding every operator's moments at once).
     pub fn operator(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>, [Array2<f64>; 4]), String> {
