@@ -99,18 +99,23 @@ MAC_GAM=/Users/user/gam MAC_DATA=/Users/user/mpd-data HF_HUB=/Users/user/.cache/
 RP=$MAC_DATA/runpod LEDGER=$MAC_DATA/runpod/LEDGER.tsv ACTIVE=$MAC_DATA/runpod/active
 # CUDA 12.4 devel: NVRTC and the CUDA libraries the device code loads at run time.
 IMAGE=runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
-# Host drivers that run what a 12.4 NVRTC compiles.
-CUDA_OK='["12.4","12.5","12.6","12.7","12.8","12.9","13.0"]'
+# Hosts whose driver runs what the image's CUDA toolkit (NVRTC) compiles: driver CUDA versions at or
+# above the toolkit's, from those RunPod's pod request accepts.
+TOOLKIT=$(sed -nE 's/.*-cuda([0-9]+[.][0-9]+).*/\1/p' <<< "$IMAGE")
+CUDA_OK=$(jq -nc --arg t "$TOOLKIT" '["11.8","12.0","12.1","12.2","12.3","12.4","12.5","12.6","12.7","12.8","12.9","13.0"]
+    | map(select((split(".") | map(tonumber)) >= ($t | split(".") | map(tonumber))))')
 # The budget: at most $150 of the team account's credit, which stood at $750 on 2026-10-05 11:10.
 # A pod made outside the runner has no cap it knows; it is counted as running 4 h more, the default
 # cap of a dev pod.
 CAP_DOLLARS=150 START_BALANCE=750 UNCAPPED_HOURS=4
+# Hosts (RunPod machine ids) whose pods did not come up or could not start CUDA.
+BAD_HOSTS=$MAC_DATA/runpod/bad_hosts
 # The runner's own files in the outputs directory: never synced from or restored to a pod.
 OWN=(run.log rp-run.log pod.json pod.txt build.log data.log watch.log cost.txt ssh rsh host STOP EXTEND)
 # Never synced either: a file still being written (library_mdl writes NAME.partial, then renames it),
 # and library_mdl's cache of M's targets beside its checkpoint (tens of GB on Qwen3, rebuilt when
 # missing; moving it through the Mac's uplink would take longer than rebuilding it).
-SKIP=('*.partial' '*.targets')
+SKIP=('*.partial' '*.targets' '*.rp-pull')
 RSYNC_EXCLUDE=()
 for o in "${OWN[@]}"; do RSYNC_EXCLUDE+=("--exclude=/$o"); done
 for o in "${SKIP[@]}"; do RSYNC_EXCLUDE+=("--exclude=$o"); done
@@ -256,6 +261,9 @@ case ${1:-} in
         read -r pod _ owner <<< "$h"
         if kill -0 "$owner" 2> /dev/null; then
             touch "$RP/$2/STOP"
+            # A holder still setting the pod up does not see STOP: its exit deletes the pod.
+            for i in $(seq 15); do [ -f "$ACTIVE/$pod" ] || break; sleep 2; done
+            [ ! -f "$ACTIVE/$pod" ] || kill -TERM "$owner" 2> /dev/null || true
             while [ -f "$ACTIVE/$pod" ]; do sleep 2; done
         else
             reap "$pod"
@@ -585,7 +593,7 @@ finish() {
     local rc=$?
     trap - EXIT INT TERM HUP
     set +e
-    [ -n "$SYNC" ] && kill "$SYNC" 2> /dev/null
+    [ -n "$SYNC" ] && kill $SYNC 2> /dev/null
     if [ -n "$IP" ]; then on_pod -O exit > /dev/null 2>&1; fi
     if [ -z "$POD" ] && (( ATTEMPTED )); then
         # A create that failed on the way back (a timeout) may still have made the pod.
@@ -635,11 +643,13 @@ record() {  # GPU_ID KIND
     nohup "$SELF" --watch "$POD" "$$" "$DEADLINE" >> "$OUT/watch.log" 2>&1 &
 }
 
-# Waits for SSH to POD and checks its own deletion timer. Sets IP PORT VCPU.
+# Waits for SSH to POD: 10 minutes, as pods that came up did so within 45 s and two that did not
+# had not answered after 15 minutes (a host pulling the 7 GB image slower than 12 MB/s is also
+# better left). Sets IP PORT VCPU.
 reach() {
     local r b st
     until [ -n "$IP" ]; do
-        (( $(date +%s) - CREATED < 1200 )) || { say "no public SSH address after 20 minutes"; return 1; }
+        (( $(date +%s) - CREATED < 600 )) || { say "no public SSH address after 10 minutes"; return 1; }
         r=$(api GET "$REST/pods/$POD")
         if [ "$(status_of "$r")" = 200 ]; then
             b=$(body_of "$r")
@@ -653,21 +663,24 @@ reach() {
         fi
         [ -n "$IP" ] || sleep 5
     done
-    until on_pod true 2> /dev/null; do
-        (( $(date +%s) - CREATED < 1200 )) || { say "SSH to $IP:$PORT not answering after 20 minutes"; return 1; }
+    until on_pod true < /dev/null 2> /dev/null; do
+        (( $(date +%s) - CREATED < 600 )) || { say "SSH to $IP:$PORT not answering after 10 minutes"; return 1; }
         sleep 5
     done
     say "ssh root@$IP -p $PORT up after $(( $(date +%s) - CREATED )) s"
 }
 
-# A pod in stock, reachable by SSH, its own deletion timer armed. Sets POD IP PORT VCPU PRICE.
+# A pod in stock on a host that works: reachable by SSH, its own deletion timer armed, and CUDA
+# initializing (a host whose CUDA does not start fails every program; one did, with PyTorch too). A
+# pod on a host that failed before (BAD_HOSTS), or that fails now, is deleted and the next offer
+# tried; such a host is recorded so no later run waits on it. Sets POD IP PORT VCPU PRICE.
 # Signals wait while a pod is created, so none can end the run between its creation and its record.
 launch() {
-    local kind price gpu r code left
+    local kind price gpu r code left host
     POD="" IP="" PORT=""
     # The first pod must be in stock now; a replacement waits for stock while time remains.
     until [ -n "$POD" ]; do
-    while IFS='|' read -r kind price gpu; do
+    while IFS='|' read -r kind price gpu <&3; do
         left=$(( ${DEADLINE:-$(( $(date +%s) + CAP_SECONDS ))} - $(date +%s) ))
         (( left > 0 )) || { say "no time left under the HOURS cap"; exit 1; }
         trap '' INT TERM HUP
@@ -680,27 +693,41 @@ launch() {
             POD=$(jq -r .id <<< "$(body_of "$r")")
             PRICE=$(jq -r '.costPerHr // .adjustedCostPerHr // empty' <<< "$(body_of "$r")")
             PRICE=${PRICE:-$price}
+            host=$(jq -r '.machineId // empty' <<< "$(body_of "$r")")
             record "$gpu" "$kind"
         fi
         trap 'exit 130' INT
         trap 'exit 143' TERM
         trap 'exit 129' HUP
-        if [ -n "$POD" ]; then
-            say "pod $POD: $gpu, $kind at \$$PRICE/h"
+        if [ -z "$POD" ]; then
+            say "no $gpu on ${kind%%:*} ($code): $(body_of "$r" | head -c 200)"
+            continue
+        fi
+        say "pod $POD: $gpu, $kind at \$$PRICE/h, host $host"
+        if [ -n "$host" ] && grep -qx "$host" "$BAD_HOSTS" 2> /dev/null; then
+            say "host $host failed before; deleting pod $POD"
+        elif ! reach; then
+            echo "$host" >> "$BAD_HOSTS"
+            say "host $host recorded as failing; deleting pod $POD"
+        elif ! on_pod 'kill -0 "$(cat /rp-watchdog.pid)" && command -v runpodctl > /dev/null' < /dev/null; then
+            say "the pod's own deletion timer is not running (no runpodctl or watchdog); deleting pod $POD"
+        elif ! on_pod 'python3 -c "import torch; torch.ones(1, device=\"cuda\").sum().item()"' < /dev/null > /dev/null 2>&1; then
+            echo "$host" >> "$BAD_HOSTS"
+            say "CUDA does not initialize on host $host ($(on_pod 'nvidia-smi --query-gpu=driver_version --format=csv,noheader' < /dev/null 2> /dev/null)); recorded as failing; deleting pod $POD"
+        else
             break
         fi
-        say "no $gpu on ${kind%%:*} ($code): $(body_of "$r" | head -c 200)"
-    done <<< "$OFFERS"
+        [ -z "$IP" ] || on_pod -O exit > /dev/null 2>&1 || true
+        reap "$POD" || exit 1
+        POD="" IP="" PORT=""
+    done 3<<< "$OFFERS"
     if [ -z "$POD" ]; then
-        [ -n "$DEADLINE" ] || { say "none of $GPU in stock"; exit 1; }
+        [ -n "$DEADLINE" ] || { say "none of $GPU in stock on a working host"; exit 1; }
         (( $(date +%s) + 600 < DEADLINE )) || { say "none of $GPU in stock and less than 10 minutes left"; exit 1; }
         sleep 60
     fi
     done
-    reach || return 1
-    on_pod 'kill -0 "$(cat /rp-watchdog.pid)" && command -v runpodctl > /dev/null' ||
-        { say "the pod's own deletion timer is not running (no runpodctl or watchdog)"; return 1; }
-    on_pod 'nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader' | sed "s/^/$POD /; s/\$/, $VCPU vCPUs/" | tee -a "$OUT/pod.txt" >&2
+    on_pod 'nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader; nvidia-smi | grep -o "CUDA Version: [0-9.]*"' < /dev/null | paste -sd ' ' - | sed "s/^/$POD /; s/\$/, $VCPU vCPUs/" | tee -a "$OUT/pod.txt" >&2
 }
 
 # (Re)arms the pod's own deletion timer: the pod deletes itself SECONDS from now. The old timer's
@@ -906,18 +933,98 @@ setup() {
         exit 1
     fi
     (( ! failed )) || { say "an input, data, model or rsync did not arrive"; return 1; }
-    # What an earlier pod of this run wrote, so the command can resume from it.
+    # What an earlier pod of this run (or an earlier run of NAME) wrote, so the command can resume
+    # from it, when sending it up takes less time than the work it holds: the time from the command's
+    # first start (else the oldest output) to the newest output, against its size at the slowest
+    # upload rate measured from the Mac (1.5 MB/s; an 18 GB checkpoint takes over 3 h). Otherwise
+    # the command starts over.
     if [ "$MODE" = run ] && [ -n "$(find "$OUT" -mindepth 1 $(printf '! -name %s ' "${OWN[@]}") -print -quit)" ]; then
-        rsync -a "${RSYNC_EXCLUDE[@]}" -e "${SSH[*]} -o ControlPath=none -p $PORT" "$OUT/" "root@$IP:/workspace/mpd-data/runpod/$NAME/" || return 1
-        say "restored the outputs synced so far"
+        local kb times send work
+        kb=$(cd "$OUT" && find . -type f $(printf '! -name %s ' "${OWN[@]}") ! -name '*.partial' ! -path '*.targets/*' -exec stat -f %z {} + | awk '{ s += $1 } END { printf "%d", s / 1024 }')
+        times=$(cd "$OUT" && find . -type f $(printf '! -name %s ' "${OWN[@]}") -exec stat -f %m {} + | sort -n)
+        send=$(( kb / 1536 ))
+        work=$(( $(tail -n 1 <<< "$times") - ${FIRST_START:-$(head -n 1 <<< "$times")} ))
+        if (( send < work )); then
+            rsync -a "${RSYNC_EXCLUDE[@]}" -e "${SSH[*]} -o ControlPath=none -p $PORT" "$OUT/" "root@$IP:/workspace/mpd-data/runpod/$NAME/" || return 1
+            say "restored the outputs synced so far ($(( kb / 1024 )) MB, about $send s up, against $work s of work)"
+        else
+            say "not restoring the outputs: $(( kb / 1024 )) MB would take about $send s to send up, more than the $work s of work they hold; the command starts over"
+        fi
     fi
     note_times
     say "set up in $(( $(date +%s) - started )) s (pod waited $(( $(date +%s) - CREATED )) s since its creation)"
 }
 
-# The outputs, copied to the Mac a minute after each copy ends, while the command runs.
-sync_outputs() {
-    rsync -a "${RSYNC_EXCLUDE[@]}" -e "${SSH[*]} -o ControlPath=none -p $PORT" "root@$IP:/workspace/mpd-data/runpod/$NAME/" "$OUT/" 2> /dev/null
+# The outputs, copied to the Mac while the command runs, in two loops (sync_loop): checkpoints
+# (CKPT, rewritten whole every epoch and renamed into place: library_mdl's is 18 GB on Qwen3-0.6B),
+# each as soon as the last copy ends, so the newest checkpoint comes back once and no copy restarts;
+# and everything else a minute after each copy ends, so a checkpoint's copy never holds up the rest.
+# A large file (BIG bytes or more, or any checkpoint) comes in PULL_STREAMS byte ranges over
+# separate connections, from a hard link that pins the version being copied (a newer one renamed
+# over it does not change it), into a temporary file renamed into place when complete, with the
+# pod's modification time, so the Mac keeps only the latest complete copy. Measured from a pod: one
+# connection 19.5 MB/s, 4 connections 62 MB/s, 8 connections 91 MB/s. Smaller files go by rsync.
+# A copy of 100 MB or more is logged with its rate.
+CKPT=checkpoint.bin PULL_STREAMS=8 BIG=$(( 128 << 20 ))
+POD_OUT=""
+pull() {  # REL (one file of the pod's outputs)
+    local rel=$1 snap size mtime share k tmp pids=() p failed=0 started
+    snap="$POD_OUT/$rel.rp-pull" tmp="$OUT/$rel.rp-pull"
+    read -r size mtime < <(on_pod "ln -f $(printf %q "$POD_OUT/$rel") $(printf %q "$snap") && stat -c '%s %Y' $(printf %q "$snap")" < /dev/null) || return 1
+    started=$(date +%s)
+    mkdir -p "$(dirname "$tmp")"
+    : > "$tmp"
+    share=$(( (size / PULL_STREAMS + 1048575) / 1048576 ))
+    share=$(( share > 0 ? share : 1 ))
+    for (( k = 0; k * share * 1048576 < size; k++ )); do
+        new_conn "dd if=$(printf %q "$snap") bs=1048576 skip=$(( k * share )) count=$share 2> /dev/null" < /dev/null |
+            dd of="$tmp" bs=1048576 seek=$(( k * share )) conv=notrunc 2> /dev/null &
+        pids+=($!)
+    done
+    for p in "${pids[@]}"; do wait "$p" || failed=1; done
+    on_pod "rm -f $(printf %q "$snap")" < /dev/null || true
+    if (( failed )) || [ "$(stat -f %z "$tmp")" != "$size" ]; then
+        rm -f "$tmp"
+        return 1
+    fi
+    touch -m -t "$(date -r "$mtime" '+%Y%m%d%H%M.%S')" "$tmp"
+    mv "$tmp" "$OUT/$rel"
+    echo "$size $(( $(date +%s) - started ))" >> "$TMP/download"
+    (( size < 104857600 )) || say "copied $rel ($(awk -v b="$size" 'BEGIN { printf "%.2f", b / 2^30 }') GB) to the Mac in $(( $(date +%s) - started )) s, $(awk -v b="$size" -v t="$(( $(date +%s) - started ))" 'BEGIN { printf "%.0f", b / 2^20 / (t > 0 ? t : 1) }') MB/s over $k connections"
+}
+sync_outputs() {  # checkpoints | rest | all
+    local what=${1:-all} rel size mtime mac
+    POD_OUT=/workspace/mpd-data/runpod/$NAME
+    if [ "$what" != checkpoints ]; then
+        rsync -a -W "${RSYNC_EXCLUDE[@]}" --exclude="$CKPT" --max-size=$(( BIG - 1 )) -e "${SSH[*]} -o ControlPath=none -p $PORT" \
+            "root@$IP:$POD_OUT/" "$OUT/" 2> /dev/null || return 1
+    fi
+    # The large files and checkpoints that differ from the Mac's copies (size or modification time).
+    while IFS=$'\t' read -r rel size mtime; do
+        [ -n "$rel" ] || continue
+        case /$rel in */*.partial|*/*.rp-pull|*.targets/*) continue ;; esac
+        [[ $rel == */* ]] || ! printf '%s\n' "${OWN[@]}" | grep -qx "$rel" || continue
+        if [ "${rel##*/}" = "$CKPT" ]; then
+            [ "$what" != rest ] || continue
+        else
+            [ "$what" != checkpoints ] && (( size >= BIG )) || continue
+        fi
+        mac=$OUT/$rel
+        [ -f "$mac" ] && [ "$(stat -f '%z %m' "$mac")" = "$size ${mtime%.*}" ] && continue
+        pull "$rel" || return 1
+    done < <(on_pod "cd $POD_OUT 2> /dev/null && find . -type f -printf '%P\t%s\t%T@\n'" < /dev/null)
+}
+sync_loop() {  # checkpoints | rest
+    local pause=60 i
+    [ "$1" = checkpoints ] && pause=10
+    while :; do
+        # A stop request ends the pause at once; a copy in hand runs to its end first.
+        for (( i = 0; i < pause; i++ )); do
+            [ ! -f "$TMP/stop-sync" ] && kill -0 $$ 2> /dev/null || return 0
+            sleep 1
+        done
+        sync_outputs "$1" || true
+    done
 }
 
 # Starts COMMAND detached on the pod (a dropped connection does not end it) and streams its log.
@@ -927,6 +1034,7 @@ run_command() {
         echo 'export PATH=/root/.cargo/bin:/workspace/bin:/usr/local/cuda/bin:$PATH'
         echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
         echo 'export MPD_BIN=/workspace/bin'
+        echo 'echo "# $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader), $(nvidia-smi | grep -o "CUDA Version: [0-9.]*")"'
         echo "cd /workspace/src"
         echo "$cmd"
     } | on_pod 'cat > /workspace/run.sh' || return 1
@@ -935,8 +1043,11 @@ run_command() {
         setsid nohup bash -c "echo \$\$ > /workspace/run.pid; bash /workspace/run.sh > /workspace/run.log 2>&1; echo \$? > /workspace/run.exit" > /dev/null 2>&1 < /dev/null &
         until [ -s /workspace/run.pid ]; do sleep 0.1; done' || return 1
     say "running: $cmd"
-    ( while sleep 60 && kill -0 $$ 2> /dev/null; do sync_outputs || true; done ) &
+    FIRST_START=${FIRST_START:-$(date +%s)}
+    sync_loop rest &
     SYNC=$!
+    sync_loop checkpoints &
+    SYNC="$SYNC $!"
     local base misses=0 state r
     base=$(wc -c < "$LOG" | tr -d ' ')
     RC=""
@@ -960,8 +1071,10 @@ run_command() {
         (( misses <= 10 )) || { say "pod $POD unreachable"; break; }
         sleep 15
     done
-    kill "$SYNC" 2> /dev/null
-    wait "$SYNC" 2> /dev/null
+    # The loops finish the copy in hand (the final copy would otherwise start it again), then stop.
+    touch "$TMP/stop-sync"
+    if [ -n "$RC" ]; then wait $SYNC 2> /dev/null; else kill $SYNC 2> /dev/null; wait $SYNC 2> /dev/null; fi
+    rm -f "$TMP/stop-sync"
     SYNC=""
     [ -n "$RC" ]
 }
