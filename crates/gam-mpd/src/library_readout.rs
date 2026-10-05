@@ -86,7 +86,8 @@ pub struct Settings {
     pub contexts: usize,
     pub tokens: usize,
     pub edges: usize,
-    /// The most-used functions whose complete wiring among themselves is reported.
+    /// The most-used heads and the most-used MLP functions, this many of each, whose complete
+    /// wiring among themselves is reported.
     pub core: usize,
 }
 
@@ -157,7 +158,7 @@ pub struct Readout {
     pub held_out_tokens: usize,
     pub functions: Vec<Function>,
     pub removed: Vec<String>,
-    /// Indices into `functions` of the most-used functions, and `wiring[i][j]` the weight from
+    /// Indices into `functions` of the most-used heads, then of the most-used MLP functions, and `wiring[i][j]` the weight from
     /// core function `j` to core function `i` (zero when `j` does not precede `i`'s read).
     pub core: Vec<usize>,
     pub wiring: Vec<Vec<f64>>,
@@ -675,9 +676,14 @@ pub fn read_out(exact: &Device, wide: &Device, native: &OperatorProgram, layers:
     }
 
     // Wiring: per read, every surviving reader against every surviving writer before it.
-    let mut order: Vec<usize> = (0..functions.len()).collect();
-    order.sort_by(|a, b| functions[*b].usage.total_cmp(&functions[*a].usage));
-    order.truncate(settings.core);
+    // A head writes a whole value vector and a neuron one direction, so each kind is ranked
+    // among its own.
+    let mut order: Vec<usize> = Vec::new();
+    for kind in [Kind::Head, Kind::Mlp] {
+        let mut ranked: Vec<usize> = (0..functions.len()).filter(|i| functions[*i].kind == kind).collect();
+        ranked.sort_by(|a, b| functions[*b].usage.total_cmp(&functions[*a].usage));
+        order.extend(ranked.into_iter().take(settings.core));
+    }
     let core_position: HashMap<usize, usize> = order.iter().enumerate().map(|(p, f)| (*f, p)).collect();
     let mut wiring = vec![vec![0.0; order.len()]; order.len()];
     for (si, read_site) in sites.iter().enumerate() {
