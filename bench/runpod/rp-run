@@ -37,6 +37,19 @@
 #   ~/.cache/huggingface/hub/models--ORG--NAME/snapshots/REV[/...] -> /workspace/hf/ORG/NAME/REV[/...],
 #       fetched on the pod from huggingface.co at REV (public models; nothing is uploaded);
 #   python, python3, the Mac venv's python -> the pod's python3.
+# Data with a public source is built on the pod, not uploaded, and checked before COMMAND starts
+# (a mismatch refuses the run; the builds' logs come back in data.log):
+#   /Users/user/mpd-data/qwen3_fineweb/SHARD[/FILE], SHARD a shard of the FineWeb release
+#       (train_shard00 .. train_shard07, heldout_f284, or the Mac's copies train and heldout), FILE
+#       one of its files (windows_T{128,256,512,1024}.u32, documents.u32, offsets.u64): the shard is
+#       tokenized from its FineWeb source file by bench/mpd_qwen3_fineweb_2951.py at the commit,
+#       and every file built is checked against the release's sha256 (release/CONTENTS.json,
+#       remade by fineweb_contents.py from the tarballs that release/SHA256SUMS lists);
+#   /Users/user/mpd-data/engine/EXPORT, a vpd4l export extended with Pile training rows
+#       (source.extends in its export.json): its base export, which holds the target's weights, is
+#       uploaded, the export built from it and the Pile files by
+#       bench/vpd_2951/vpd_engine_export_pile.py, and every tensor checked against the Mac's
+#       export.json, which then replaces the pod's.
 # Other cargo commands (`cargo test -p gam-gpu ...`) run as given in /workspace/src.
 # RP_EXAMPLES="X Y" builds further examples for a script that runs them through $MPD_BIN;
 # RP_DISK_GB=N sets the container disk (default: 30 GB, 60 for a dev pod, plus twice the inputs
@@ -62,11 +75,14 @@
 # Money. The API key is read from the macOS Keychain (service runpod-api-key) at each request and
 # handed to curl on a file descriptor: never in argv, the environment, a file or a log. The $150 cap
 # counts everything the team account has spent since the credit was $750 (750 minus
-# myself.clientBalance), whoever spent it, plus what runs of this Mac in progress may still spend; a
-# launch or extension whose estimate (the dearest offer x HOURS) would pass it is refused unless
-# RP_ALLOW_OVER=1. Each pod appends (date, name, gpu, cloud, hours, dollars, pod) to
+# myself.clientBalance), whoever spent it, plus what every pod running on the account may still
+# cost (its price for the time left to its cap; 4 h for a pod made outside the runner, which every
+# start names); a launch or extension whose estimate (the dearest offer x HOURS) would pass it is
+# refused unless RP_ALLOW_OVER=1. Each pod appends (date, name, gpu, cloud, hours, dollars, pod) to
 # ~/mpd-data/runpod/LEDGER.tsv, dollars = the pod's price per hour x hours from creation to
-# deletion; cloud is COMMUNITY, SECURE:no-community-stock, SECURE:dev or ADOPTED. One run at a time
+# deletion; cloud is COMMUNITY, SECURE:no-community-stock, SECURE:dev or ADOPTED; then the seconds
+# the pod spent uploading inputs, building data, and from its creation to the command's start (the
+# first two overlap each other and the Rust build, so the third is the paid waiting). One run at a time
 # unless RP_PARALLEL=1 (held pods do not count). After deleting its pod the runner checks through
 # the API that the pod is gone and lists any other pod it created that remains.
 #
@@ -178,7 +194,7 @@ if [ "${1:-}" = --watch ]; then
     exit
 fi
 
-usage() { sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,/^# The whole script is one block/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 2; }
 hours_ok() { [[ $1 =~ ^[0-9]*\.?[0-9]+$ ]] && awk -v h="$1" 'BEGIN { exit !(h > 0 && h <= 72) }' || { echo "rp-run: HOURS must be in (0, 72]" >&2; exit 2; }; }
 name_ok() { [[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || { echo "rp-run: NAME must be [A-Za-z0-9._-]+" >&2; exit 2; }; }
 
