@@ -10,7 +10,12 @@
 //! `Δ = argmin_Δ ‖H_R Δ − H_K U_K‖² = H_R⁺ H_K U_K`,
 //!
 //! so on those states the MLP's output changes by `−(I − H_R H_R⁺) H_K U_K`, the part of the
-//! deleted output that no combination of the surviving activations reproduces. The compensated
+//! deleted output that no combination of the surviving activations reproduces.
+//!
+//! A function's output is its own column of the MLP's output map, or, under a read–write tie
+//! (`library_sharing::tie`), `c` times a later layer's gate row. A tied output is fixed by the tie:
+//! the compensation never moves it (it is outside `R`), and when the function is deleted its output
+//! `c a` enters `U_K`. Deleting the gate row a tie reads deletes the tied output with it. The compensated
 //! removal is a proposal: removal accepts it only when it does not increase the code length `F` of
 //! the composed explanation on the fixed collection (`library_mdl`'s removal step).
 //!
@@ -38,13 +43,24 @@ fn error(e: impl std::fmt::Display) -> String {
     format!("library compensation: {e}")
 }
 
+/// Where a function's output vector is held (indices into `Explanation::trainable`).
+#[derive(Clone, Copy, Debug)]
+enum Output {
+    /// Column `column` of the MLP's output map: its own parameters, which the compensation moves.
+    Column(usize),
+    /// `c` times row `row` of the gate map `gate` of a later layer, `c` the single entry of `scale`
+    /// (a read–write tie); `group` is that gate row's prior group.
+    Tied { scale: usize, gate: usize, row: usize, group: usize },
+}
+
 /// One MLP's functions, where their outputs are held, and their activations' Gram matrix.
 struct Mlp {
-    /// Per function, its prior groups (its gate's, its up direction's when gated, its output's).
+    /// Per function, its prior groups (its gate's, its up direction's when gated, and its output's
+    /// or its tie's scale).
     functions: Vec<Vec<usize>>,
-    /// The output operator's index in `Explanation::trainable`, and per function its column there.
+    /// The output operator's index in `Explanation::trainable`, and per function its output.
     output: usize,
-    columns: Vec<usize>,
+    outputs: Vec<Output>,
     /// `Hᵀ H` over the functions' activations on every row it was formed from.
     gram: Array2<f64>,
 }
@@ -76,29 +92,49 @@ impl Compensation {
         let mut nodes = Vec::with_capacity(explanation.layers.len());
         for (l, layer) in explanation.layers.iter().enumerate() {
             let out = operator(&flat, &format!("library.l{l}.mlp.out"))?;
-            // The activations are the node the output map reads.
+            // The activations are the node the output map reads (a term of the MLP's output, beside
+            // the terms of its read–write ties).
             let node = flat
                 .nodes
                 .iter()
                 .find_map(|n| match n {
-                    Node::Affine { terms, bias: None } if terms.len() == 1 && terms[0].1 == out => Some(terms[0].0),
+                    Node::Affine { terms, bias: None } => terms.iter().find(|(_, op)| *op == out).map(|(input, _)| *input),
                     _ => None,
                 })
                 .ok_or_else(|| error(format!("layer {l}: no bias-free map applies the MLP's output")))?;
             let height = flat.operators[out].rows.width();
-            let columns = layer
+            let trainable = |op: usize| position.get(&op).copied().ok_or_else(|| error(format!("{}: not trainable", flat.operators[op].name)));
+            let outputs = layer
                 .functions
                 .iter()
-                .map(|groups| {
+                .enumerate()
+                .map(|(j, groups)| {
                     let group = &explanation.groups[*groups.last().ok_or_else(|| error("a function without groups"))?];
-                    match group.cells.as_slice() {
-                        [cell] if cell.operator == out && cell.cols.len() == 1 && cell.rows.len() == height => Ok(cell.cols.start),
-                        _ => Err(error(format!("{}: an output group that is not one whole column of the output map", group.name))),
+                    let [cell] = group.cells.as_slice() else {
+                        return Err(error(format!("{}: an output group of several cells", group.name)));
+                    };
+                    if cell.operator == out && cell.cols.len() == 1 && cell.rows.len() == height {
+                        return Ok(Output::Column(cell.cols.start));
                     }
+                    // A read–write tie: its scale is `library.l{l}.mlp.tie{t}.f{j}.scale`, its scatter
+                    // (`….scatter`) puts the scaled value at the gate row of layer `t` it reads.
+                    let name = &flat.operators[cell.operator].name;
+                    let tie = name
+                        .strip_prefix(&format!("library.l{l}.mlp.tie"))
+                        .and_then(|rest| rest.strip_suffix(&format!(".f{j}.scale")))
+                        .and_then(|t| t.parse::<usize>().ok())
+                        .ok_or_else(|| error(format!("{}: an output that is neither a column of the output map nor a tie's scale", group.name)))?;
+                    let scatter = flat.operators[operator(&flat, &format!("library.l{l}.mlp.tie{tie}.f{j}.scatter"))?].matrix();
+                    let row = scatter.column(0).iter().position(|v| *v != 0.0).ok_or_else(|| error(format!("{name}: a tie scattering to no row")))?;
+                    let gate = operator(&flat, &format!("library.l{tie}.mlp.gate"))?;
+                    let read = explanation.layers.get(tie).and_then(|t| t.functions.get(row)).and_then(|groups| groups.first()).copied();
+                    let read = read.filter(|g| explanation.groups[*g].cells.iter().any(|c| c.operator == gate && c.rows == [row]));
+                    let group = read.ok_or_else(|| error(format!("{name}: the gate row it reads is not its function's gate group")))?;
+                    Ok(Output::Tied { scale: trainable(cell.operator)?, gate: trainable(gate)?, row, group })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let output = *position.get(&out).ok_or_else(|| error(format!("layer {l}: the output map is not trainable")))?;
-            mlps.push(Mlp { functions: layer.functions.clone(), output, columns, gram: Array2::zeros((layer.functions.len(), layer.functions.len())) });
+            let output = trainable(out)?;
+            mlps.push(Mlp { functions: layer.functions.clone(), output, outputs, gram: Array2::zeros((layer.functions.len(), layer.functions.len())) });
             nodes.push(node);
         }
         experiments.load(&posterior.mean)?;
@@ -150,15 +186,27 @@ impl Compensation {
         }
         let gamma = terms / (1.0 - terms);
         for mlp in &self.mlps {
-            let alive = |i: &usize| mlp.functions[*i].iter().all(|g| posterior.active[*g]);
-            let hit = |i: &usize| mlp.functions[*i].iter().any(|g| gone.contains(g));
-            let (deleted, surviving): (Vec<usize>, Vec<usize>) = (0..mlp.functions.len()).filter(alive).partition(hit);
+            // A tied output also depends on the gate row it reads.
+            let groups = |i: usize| mlp.functions[i].iter().copied().chain(match mlp.outputs[i] {
+                Output::Tied { group, .. } => Some(group),
+                Output::Column(_) => None,
+            });
+            let alive = |i: &usize| groups(*i).all(|g| posterior.active[g]);
+            let hit = |i: &usize| groups(*i).any(|g| gone.contains(&g));
+            let (deleted, kept): (Vec<usize>, Vec<usize>) = (0..mlp.functions.len()).filter(alive).partition(hit);
+            let surviving: Vec<usize> = kept.into_iter().filter(|i| matches!(mlp.outputs[*i], Output::Column(_))).collect();
             if deleted.is_empty() || surviving.is_empty() {
                 continue;
             }
             let outputs = &posterior.mean[mlp.output];
             // `U_K`: the deleted functions' outputs as rows.
-            let deleted_outputs = outputs.select(Axis(1), &deleted.iter().map(|i| mlp.columns[*i]).collect::<Vec<_>>()).reversed_axes();
+            let mut deleted_outputs = Array2::zeros((deleted.len(), outputs.nrows()));
+            for (mut row, i) in deleted_outputs.rows_mut().into_iter().zip(&deleted) {
+                match mlp.outputs[*i] {
+                    Output::Column(column) => row.assign(&outputs.column(column)),
+                    Output::Tied { scale, gate, row: read, .. } => row.assign(&(&posterior.mean[gate].row(read) * posterior.mean[scale][[0, 0]])),
+                }
+            }
             let right = mlp.gram.select(Axis(0), &surviving).select(Axis(1), &deleted).dot(&deleted_outputs);
             let left = mlp.gram.select(Axis(0), &surviving).select(Axis(1), &surviving);
             let decomposition = eigh(left.view(), SymmetricAssembly::Mirrored, None).map_err(error)?;
@@ -167,8 +215,10 @@ impl Compensation {
             let change = inverse.dot(&right);
             let target = &mut trial.mean[mlp.output];
             for (row, i) in change.rows().into_iter().zip(&surviving) {
-                let mut column = target.column_mut(mlp.columns[*i]);
-                column += &row;
+                if let Output::Column(column) = mlp.outputs[*i] {
+                    let mut column = target.column_mut(column);
+                    column += &row;
+                }
             }
         }
         trial.remove(removed);
@@ -199,47 +249,76 @@ mod tests {
         program.device().download(trace.value(program.hidden()).expect("the hidden value")).expect("the download")
     }
 
-    #[test]
-    fn deleting_a_copy_of_a_surviving_function_leaves_the_explanation_unchanged() {
-        let dir = crate::test_support::tiny_export("library_compensation_copy", 2);
+    /// Every group but the last (the output, or a tie's scale) of function `from` of layer
+    /// `layer` copied onto function `to`, so their activations agree on every token.
+    fn copy_reads(explanation: &library_mdl::Explanation, posterior: &mut Posterior, layer: usize, from: usize, to: usize) {
+        let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
+        let functions = &explanation.layers[layer].functions;
+        for (a, b) in functions[from].iter().zip(&functions[to]).take(functions[from].len() - 1) {
+            for (x, y) in explanation.groups[*a].cells.iter().zip(&explanation.groups[*b].cells) {
+                for (rx, ry) in x.rows.iter().zip(&y.rows) {
+                    for (cx, cy) in x.cols.clone().zip(y.cols.clone()) {
+                        let value = posterior.mean[position[&x.operator]][[*rx, cx]];
+                        posterior.mean[position[&y.operator]][[*ry, cy]] = value;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The largest change of `P`'s stream between `posterior` and the proposal removing `removed`,
+    /// with and without compensation, and the stream's largest value.
+    fn changes(explanation: &library_mdl::Explanation, native: &crate::operator_program::OperatorProgram, posterior: &Posterior, sequences: &[Vec<u32>], removed: usize) -> (f64, f64, f64) {
+        let device = Device::host();
+        let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let reads = interchange::library_reads(&explanation.artifact.program, sites.len()).expect("the reads");
+        let mut ic = Interchange::new(&device, native, &sites, &explanation.artifact, &explanation.trainable, reads, 1 << 30, 64).expect("the experiments");
+        let compensation = Compensation::new(&mut ic, explanation, posterior, sequences, 2).expect("the compensation");
+        let trial = compensation.proposal(posterior, &[removed]).expect("the proposal");
+        assert!(!trial.active[removed]);
+        let mut plain = posterior.clone();
+        plain.remove(&[removed]);
+        let before = hidden(&mut ic, posterior, sequences);
+        let largest = before.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let change = |p: &Posterior, ic: &mut Interchange| hidden(ic, p, sequences).iter().zip(&before).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        (change(&trial, &mut ic), change(&plain, &mut ic), largest)
+    }
+
+    fn tiny(tag: &str) -> (crate::operator_program::OperatorProgram, library_mdl::Explanation, Vec<Vec<u32>>) {
+        let dir = crate::test_support::tiny_export(tag, 2);
         let imported = import_language_model(&dir, 6, 12).expect("the tiny export imports");
         std::fs::remove_dir_all(dir).expect("the tiny export is removed");
         let native = split_sites(&imported.program).expect("the native sites");
         let layers = layer_nodes(&native, 2).expect("the layers");
         let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
-        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let sequences = tokens.chunks(12).map(<[u32]>::to_vec).collect();
         let explanation = library_mdl::explanation(&native, &layers).expect("the library");
+        (native, explanation, sequences)
+    }
+
+    #[test]
+    fn deleting_a_copy_of_a_surviving_function_leaves_the_explanation_unchanged() {
+        let (native, explanation, sequences) = tiny("library_compensation_copy");
         let mut posterior = Posterior::new(&explanation, 1000).expect("the posterior");
-        // Function 1 of layer 0's MLP becomes a copy of function 0: every group but the output
-        // takes function 0's values, so the two activations agree on every token.
-        let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
-        let functions = &explanation.layers[0].functions;
-        for (from, to) in functions[0].iter().zip(&functions[1]).take(functions[0].len() - 1) {
-            for (a, b) in explanation.groups[*from].cells.iter().zip(&explanation.groups[*to].cells) {
-                for (ra, rb) in a.rows.iter().zip(&b.rows) {
-                    for (ca, cb) in a.cols.clone().zip(b.cols.clone()) {
-                        let value = posterior.mean[position[&a.operator]][[*ra, ca]];
-                        posterior.mean[position[&b.operator]][[*rb, cb]] = value;
-                    }
-                }
-            }
-        }
-        let device = Device::host();
-        let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
-        let reads = interchange::library_reads(&explanation.artifact.program, sites.len()).expect("the reads");
-        let mut ic = Interchange::new(&device, &native, &sites, &explanation.artifact, &explanation.trainable, reads, 1 << 30, 64).expect("the experiments");
-        let compensation = Compensation::new(&mut ic, &explanation, &posterior, &sequences, 2).expect("the compensation");
-        let output = *functions[1].last().expect("an output group");
-        let trial = compensation.proposal(&posterior, &[output]).expect("the proposal");
-        assert!(!trial.active[output]);
-        let (before, after) = (hidden(&mut ic, &posterior, &sequences), hidden(&mut ic, &trial, &sequences));
-        let largest = before.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-        let difference = before.iter().zip(&after).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
-        assert!(difference <= 1e-9 * largest, "the compensated removal moved the stream by {difference:e} (largest value {largest:e})");
-        // Without compensation the same removal moves it.
-        let mut plain = posterior.clone();
-        plain.remove(&[output]);
-        let moved = hidden(&mut ic, &plain, &sequences).iter().zip(&before).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
-        assert!(moved > 1e3 * difference.max(f64::EPSILON * largest), "the plain removal moved the stream by only {moved:e}");
+        copy_reads(&explanation, &mut posterior, 0, 0, 1);
+        let output = *explanation.layers[0].functions[1].last().expect("an output group");
+        let (compensated, plain, largest) = changes(&explanation, &native, &posterior, &sequences, output);
+        assert!(compensated <= 1e-9 * largest, "the compensated removal moved the stream by {compensated:e} (largest value {largest:e})");
+        assert!(plain > 1e3 * compensated.max(f64::EPSILON * largest), "the plain removal moved the stream by only {plain:e}");
+    }
+
+    #[test]
+    fn deleting_a_tied_function_moves_a_free_copy_of_it_and_leaves_the_explanation_unchanged() {
+        use crate::library_sharing::{Tie, tie};
+        let (native, start, sequences) = tiny("library_compensation_tie");
+        // Function 3 of layer 0 writes 2.5 times the gate row of function 5 of layer 1, through a
+        // read–write tie; function 4 reads what function 3 reads and has a free output.
+        let tied = tie(&start, &[Tie { source: (0, 3), target: (1, 5), scale: 2.5 }]).expect("the tie");
+        let mut posterior = Posterior::new(&tied, 1000).expect("the posterior");
+        copy_reads(&tied, &mut posterior, 0, 3, 4);
+        let scale = tied.groups.iter().position(|g| g.name == "library.l0.mlp.f3.tie").expect("the tie's scale group");
+        let (compensated, plain, largest) = changes(&tied, &native, &posterior, &sequences, scale);
+        assert!(compensated <= 1e-9 * largest, "the compensated removal moved the stream by {compensated:e} (largest value {largest:e})");
+        assert!(plain > 1e3 * compensated.max(f64::EPSILON * largest), "the plain removal moved the stream by only {plain:e}");
     }
 }
