@@ -1234,7 +1234,7 @@ pub fn vpd_pgd(vpd: &Vpd, sequences: &[Vec<u32>], batch: usize, steps: usize, st
             }
             if gradient {
                 let keep: Vec<usize> = vpd.layout.mask_nodes.iter().chain(&vpd.layout.delta_nodes).copied().collect();
-                let cotangents = vpd.e.program.vjp(&trace, seed_rows, &keep, vpd.e.program.arithmetic())?;
+                let cotangents = vpd.e.program.vjp_values_seeded(&trace, BTreeMap::from([(vpd.e.hidden, seed_rows)]), &keep, vpd.e.program.arithmetic())?;
                 for (site, grad) in grads.iter_mut().enumerate() {
                     let c = vpd.sites[site].1;
                     if let Some(t) = cotangents.get(&vpd.layout.mask_nodes[site]) {
