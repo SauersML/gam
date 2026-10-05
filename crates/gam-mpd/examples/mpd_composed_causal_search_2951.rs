@@ -1,8 +1,8 @@
 //! Fit structural proposals in the autonomous native LM on clean AND intervened logits.
 //! EXPORT SETTINGS.json FRESH_OUT host|cuda [HELDOUT_EXPORT]. Training proposal search, not acceptance.
-use gam_gpu::{GpuPolicy, tensor::Device};
+use gam_gpu::{tensor::Device, GpuPolicy};
 use gam_mpd::{
-    acceptance::{CostCache, structural_cost},
+    acceptance::{structural_cost, CostCache},
     artifact::Artifact,
     canonical_artifact::CanonicalArtifactCache,
     coder_capture::sha256,
@@ -11,14 +11,17 @@ use gam_mpd::{
     down_edit_family::{self, Direction, Family as DownFamily},
     import::import_language_model,
     intervention_program::{self, Control, ControlValue},
-    operator_program::{FamilyInputs, Node, OperatorBody, OperatorProgram, remap_node},
+    operator_program::{remap_node, FamilyInputs, Node, OperatorBody, OperatorProgram},
     parameter_response_program,
+    program_structure_search::{
+        self, EvaluatedArtifact, Evaluation as StructureEvaluation, Metric, Mutation,
+    },
     resident_causal_fit::{self, Episode, Settings as FitSettings},
-    run_check::{LayerNodes, layer_nodes, split_sites},
+    run_check::{layer_nodes, split_sites, LayerNodes},
 };
 use ndarray::{Array1, Array2};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write,
@@ -84,7 +87,9 @@ struct DownSettings {
 struct Settings {
     export_sha256: String,
     layers: usize,
+    #[serde(default)]
     uses: Vec<usize>,
+    #[serde(default)]
     width: usize,
     sequences: usize,
     context: usize,
@@ -93,8 +98,10 @@ struct Settings {
     /// Immutable native codewords and decoded buffers only; zero disables cache.
     #[serde(default)]
     native_codec_bytes: usize,
+    #[serde(default = "empty_grammar")]
     grammar: Grammar,
     /// Explicit finite subinventory for separate, reproducible compute allocations.
+    #[serde(default)]
     expression_ids: Vec<usize>,
     #[serde(default)]
     require_interior_learned: bool,
@@ -104,12 +111,32 @@ struct Settings {
     native_initialization: bool,
     #[serde(default)]
     down_edit_family: Option<DownSettings>,
+    #[serde(default)]
+    structural_search: Option<StructuralSettings>,
     controls: Vec<NativeControl>,
     cases: Vec<Case>,
     fit: FitSettings,
     seed: u64,
     #[serde(default)]
     evaluation: Option<Evaluation>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StructuralSettings {
+    settings: program_structure_search::Settings,
+    constraints: program_structure_search::Constraints,
+    #[serde(default)]
+    max_expression_evaluations: usize,
+}
+fn empty_grammar() -> Grammar {
+    Grammar {
+        arguments: 1,
+        max_operations: 0,
+        max_expressions: 1,
+        unary: vec![],
+        binary: vec![],
+        affine: false,
+    }
 }
 fn save(path: &Path, value: &Value) -> Result<(), String> {
     std::fs::write(
@@ -899,6 +926,365 @@ fn native_uses(
         })
         .collect()
 }
+fn structure_evaluation(
+    artifact: &Artifact,
+    measured: &resident_causal_fit::Measurement,
+    local_error: f64,
+    costs: &mut CostCache,
+) -> Result<StructureEvaluation, String> {
+    if !local_error.is_finite() {
+        return Err("nonfinite structural Local measurement".into());
+    }
+    Ok(StructureEvaluation {
+        fidelity: vec![Metric {
+            name: "maximum_group_mean_kl".into(),
+            value: measured.objective,
+        }],
+        local_errors: vec![Metric {
+            name: "sampled_d_local".into(),
+            value: local_error,
+        }],
+        intervention_errors: measured
+            .groups
+            .iter()
+            .map(|(name, value)| Metric {
+                name: name.clone(),
+                value: *value,
+            })
+            .collect(),
+        description_bits: structural_cost(artifact, costs)?.total() as f64,
+    })
+}
+fn frozen_structural_ids(
+    frontier: &[usize],
+    records: &[program_structure_search::CandidateRecord],
+    expression_limit: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let expressions: Vec<_> = records
+        .iter()
+        .filter(|r| matches!(r.mutation, Some(Mutation::SynthesizeExpression { .. })))
+        .take(expression_limit)
+        .map(|r| r.id)
+        .collect();
+    let mut ids = vec![0];
+    for id in frontier.iter().chain(&expressions) {
+        if !ids.contains(id) {
+            ids.push(*id);
+        }
+    }
+    (ids, expressions)
+}
+fn structural_artifact_path(
+    out: &Path,
+    result: &program_structure_search::SearchResult,
+    id: usize,
+) -> Result<std::path::PathBuf, String> {
+    if id == 0 {
+        return Ok(out.join("controlled-native.artifact"));
+    }
+    let attempt = result
+        .report
+        .attempts
+        .iter()
+        .find(|a| {
+            a.candidate_id == Some(id)
+                && matches!(
+                    a.status,
+                    program_structure_search::AttemptStatus::FittedAdmitted
+                )
+        })
+        .ok_or("admitted candidate attempt missing")?;
+    Ok(out.join(format!(
+        "structural-attempt-{:06}/program.artifact",
+        attempt.attempt_id
+    )))
+}
+fn structural_run(
+    d: &Device,
+    settings: &Settings,
+    structural: &StructuralSettings,
+    native: &OperatorProgram,
+    original_native: &OperatorProgram,
+    layers: &[LayerNodes],
+    family: &FamilyInputs,
+    targets: &[Array2<f64>],
+    out: &Path,
+    heldout_export: Option<&Path>,
+    cache: Option<&CanonicalArtifactCache>,
+    costs: &mut CostCache,
+) -> Result<(), String> {
+    // These values belong to the fixed-bank baseline. Structural source has augmented
+    // declarations/codewords, so its standalone replay uses the ordinary codec.
+    if cache.is_some() {
+        return Err("structural_search native_codec_bytes must be zero: cache source must witness the augmented declarations, not the original native artifact".into());
+    }
+    let native_controls = controls(
+        &Artifact::native(native)?,
+        native,
+        layers,
+        &settings.controls,
+    )?;
+    let controlled = intervention_program::compile(native, &native_controls)?;
+    let training = episodes(
+        &controlled,
+        native,
+        &native_controls,
+        family,
+        &settings.cases,
+        targets,
+        None,
+    )?;
+    let mut all_inputs = training
+        .first()
+        .ok_or("no controlled episodes")?
+        .inputs
+        .clone();
+    for e in training.iter().skip(1) {
+        all_inputs = all_inputs.append(&e.inputs).map_err(|e| e.to_string())?;
+    }
+    let local =
+        gam_mpd::acceptance::Local::new(&controlled.program, all_inputs, None, settings.context);
+    let (initial_source, initial_bytes) = canonical(&Artifact::native(&controlled.program)?)?;
+    std::fs::write(out.join("controlled-native.artifact"), initial_bytes)
+        .map_err(|e| e.to_string())?;
+    save(
+        &out.join("CONTROLLED_SOURCE.json"),
+        &json!({"original_controls":settings.controls,"original_to_controlled_root_mapping":controlled.root_mapping,"control_slots":controlled.control_slots.iter().map(|s|json!({"control":s.control,"slot":s.slot,"width":s.width})).collect::<Vec<_>>(),"cases":settings.cases,"source_scope":"Original native graph augmented once with declared Raw control inputs and ordinary arithmetic. Structural candidate predicts from its own states and these controls; no per-candidate native intervention translator.","local_scope":"Measured controlled-native parent states over all declared training control episodes, RMS scale over that augmented family; not original unconditioned acceptance Dlocal.","global_scale_arithmetic":"Post-contribution multiplication, real-algebra equivalent to native shared-weight gain; not literal edited-checkpoint binary arithmetic equality.","codec_scope":"Ordinary standalone augmented artifact; original-native codec cache intentionally unsupported."}),
+    )?;
+    let initial_measure = resident_causal_fit::measure(
+        d,
+        &initial_source.program,
+        &training,
+        settings.fit.numeric_bytes,
+    )?;
+    let initial = EvaluatedArtifact {
+        evaluation: structure_evaluation(
+            &initial_source,
+            &initial_measure,
+            local
+                .measure(&initial_source)?
+                .worst()
+                .map_or(0., |b| b.worst),
+            costs,
+        )?,
+        artifact: initial_source,
+    };
+    let mut callback_index = 0usize;
+    let result = program_structure_search::search(
+        &controlled.program,
+        initial,
+        &structural.settings,
+        &structural.constraints,
+        |request| {
+            let root = out.join(format!("structural-attempt-{:06}", request.attempt_id));
+            callback_index += 1;
+            std::fs::create_dir(&root).map_err(|e| e.to_string())?;
+            save(
+                &root.join("DECLARATION.json"),
+                &json!({"attempt_id":request.attempt_id,"parent_id":request.parent_id,"depth":request.depth,"mutation":request.mutation,"parent_evaluation":request.parent.evaluation,"trainable":request.trainable_operator_ids}),
+            )?;
+            std::fs::write(
+                root.join("proposed.artifact"),
+                request.candidate.to_bytes()?,
+            )
+            .map_err(|e| e.to_string())?;
+            let attempt = (|| -> Result<EvaluatedArtifact, String> {
+                let mut candidate = request.candidate.clone();
+                if matches!(request.mutation, Mutation::ExactExtract { .. })
+                    && !request.trainable_operator_ids.is_empty()
+                {
+                    return Err("exact extraction must remain fit-free".into());
+                }
+                if !request.trainable_operator_ids.is_empty() {
+                    let fitted = resident_causal_fit::fit(
+                        d,
+                        &candidate.program,
+                        &training,
+                        request.trainable_operator_ids,
+                        settings.fit.clone(),
+                    )?;
+                    save(
+                        &root.join("FIT.json"),
+                        &serde_json::to_value(&fitted.report).map_err(|e| e.to_string())?,
+                    )?;
+                    candidate.program = fitted.program;
+                }
+                let (saved, bytes) = canonical(&candidate)?;
+                std::fs::write(root.join("program.artifact"), bytes).map_err(|e| e.to_string())?;
+                let local_measure = local.measure(&saved)?;
+                let local_error = local_measure.worst().map_or(0., |b| b.worst);
+                if !local_error.is_finite() {
+                    return Err("nonfinite structural Local measurement".into());
+                }
+                if request.trainable_operator_ids.is_empty() {
+                    if let Some(limit) = structural
+                        .constraints
+                        .max_local_errors
+                        .iter()
+                        .find(|m| m.name == "sampled_d_local")
+                    {
+                        if local_error > limit.value {
+                            save(
+                                &root.join("LOCAL_SCREEN.json"),
+                                &json!({
+                                    "status":"local_screen_rejected", "local":local_measure,
+                                    "sampled_d_local":local_error, "constraint":limit,
+                                    "run":"not_measured", "scope":"decoded augmented control-family Local proposal constraint",
+                                    "artifact_sha256":sha256(&root.join("program.artifact"))?
+                                }),
+                            )?;
+                            return Err("local_screen_rejected: decoded augmented Local exceeds declared constraint; Run not measured".into());
+                        }
+                    }
+                }
+                let measured = resident_causal_fit::measure(
+                    d,
+                    &saved.program,
+                    &training,
+                    settings.fit.numeric_bytes,
+                )?;
+                save(
+                    &root.join("TRAIN.json"),
+                    &serde_json::to_value(&measured).map_err(|e| e.to_string())?,
+                )?;
+                let evaluation = structure_evaluation(&saved, &measured, local_error, costs)?;
+                save(
+                    &root.join("STATUS.json"),
+                    &json!({"status":"training_measured","trainable":request.trainable_operator_ids,"evaluation":evaluation,"artifact_sha256":sha256(&root.join("program.artifact"))?}),
+                )?;
+                Ok(EvaluatedArtifact {
+                    artifact: saved,
+                    evaluation,
+                })
+            })();
+            if let Err(error) = &attempt {
+                save(
+                    &root.join("STATUS.json"),
+                    &json!({"status":if root.join("LOCAL_SCREEN.json").exists(){"local_screen_rejected"}else{"unresolved"},"error":error,"run":if root.join("LOCAL_SCREEN.json").exists(){Some("not_measured")}else{None}}),
+                )?;
+            }
+            attempt
+        },
+    )?;
+    let metadata:Vec<_>=result.candidates.iter().map(|c|json!({"id":c.id,"parent_id":c.parent_id,"depth":c.depth,"mutation":c.mutation,"evaluation":c.evaluated.evaluation,"artifact_path":format!("structure-{}/program.artifact",c.id)})).collect();
+    save(
+        &out.join("STRUCTURAL_SEARCH.json"),
+        &json!({"report":result.report,"frontier":result.frontier,"beam":result.beam,"candidates":metadata}),
+    )?;
+    let (frozen, expression_hypotheses) = frozen_structural_ids(
+        &result.frontier,
+        &result.report.admitted_candidates,
+        structural.max_expression_evaluations,
+    );
+    let mut persisted: Vec<_> = result.candidates.iter().map(|c| c.id).collect();
+    for id in &frozen {
+        if !persisted.contains(id) {
+            persisted.push(*id);
+        }
+    }
+    for id in &persisted {
+        let record = result
+            .report
+            .admitted_candidates
+            .iter()
+            .find(|r| r.id == *id)
+            .ok_or("admitted candidate metadata missing")?;
+        let root = out.join(format!("structure-{id}"));
+        std::fs::create_dir(&root).map_err(|e| e.to_string())?;
+        std::fs::hard_link(
+            structural_artifact_path(out, &result, *id)?,
+            root.join("program.artifact"),
+        )
+        .map_err(|e| e.to_string())?;
+        save(
+            &root.join("LINEAGE.json"),
+            &json!({"record":record,"artifact_sha256":sha256(&root.join("program.artifact"))?}),
+        )?;
+    }
+    save(
+        &out.join("FROZEN_EVALUATION_IDS.json"),
+        &json!({"ids":frozen,"compression_frontier":result.frontier,"expression_hypotheses":expression_hypotheses,"max_expression_evaluations":structural.max_expression_evaluations,"policy":"Native baseline plus training compression frontier plus first declared-N admitted expression hypotheses in deterministic admission order, including dominated/evicted states. Frozen before heldout access.","scope":"Hypothesis admission is not discovery or understanding; augmented-source sampled Local and operational causal KL."}),
+    )?;
+    let mut heldout_rows = Vec::new();
+    if let (Some(eval), Some(export)) = (&settings.evaluation, heldout_export) {
+        if sha256(&export.join("export.json"))? != eval.export_sha256 {
+            return Err("heldout export SHA mismatch".into());
+        }
+        let imported = import_language_model(export, eval.sequences, settings.context)?;
+        let heldout_native = split_sites(&imported.program)?;
+        if !same_native(original_native, &heldout_native) {
+            return Err("heldout original model differs".into());
+        }
+        disjoint_token_sequences(family, &imported.contract.family, settings.context)?;
+        let cases = eval.cases.as_deref().unwrap_or(&settings.cases);
+        let (labels, plan) = family_teacher_targets(
+            d,
+            original_native,
+            layers,
+            &settings.controls,
+            &imported.contract.family,
+            cases,
+            None,
+            settings.fit.numeric_bytes,
+            settings.teacher_numeric_bytes,
+        )?;
+        let eval_episodes = episodes(
+            &controlled,
+            native,
+            &native_controls,
+            &imported.contract.family,
+            cases,
+            &labels,
+            None,
+        )?;
+        save(
+            &out.join("HELDOUT_PROVENANCE.json"),
+            &json!({"native":imported.record,"teacher_numeric_bytes":plan,"scope":"fit-disjoint frozen panel; augmented source control slots reused, no heldout fitting/reselection"}),
+        )?;
+        for id in &frozen {
+            let candidate = result
+                .report
+                .admitted_candidates
+                .iter()
+                .find(|c| c.id == *id)
+                .ok_or("frozen structural ID missing")?;
+            let bytes = std::fs::read(out.join(format!("structure-{id}/program.artifact")))
+                .map_err(|e| e.to_string())?;
+            let lineage: Value = serde_json::from_slice(
+                &std::fs::read(out.join(format!("structure-{id}/LINEAGE.json")))
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            if lineage["artifact_sha256"].as_str()
+                != Some(&sha256(
+                    &out.join(format!("structure-{id}/program.artifact")),
+                )?)
+            {
+                return Err("frozen structural saved-byte SHA differs".into());
+            }
+            let saved = Artifact::from_bytes(&bytes, &controlled.program.declarations)?;
+            if saved.to_bytes()? != bytes {
+                return Err("independent structural saved replay differs".into());
+            }
+            let c32 = structural_cost(&saved, costs)?.total();
+            if c32 as f64 != candidate.evaluation.description_bits {
+                return Err("saved structural C32 differs from training".into());
+            }
+            let measurement = resident_causal_fit::measure(
+                d,
+                &saved.program,
+                &eval_episodes,
+                settings.fit.numeric_bytes,
+            )?;
+            heldout_rows.push(json!({"id":id,"measurement":measurement,"c32":c32}));
+        }
+    }
+    save(
+        &out.join("REPORT.json"),
+        &json!({"structural_report":result.report,"retained_candidates":metadata,"frozen_ids":frozen,"compression_frontier":result.frontier,"expression_hypotheses":expression_hypotheses,"heldout":heldout_rows,"callback_calls":callback_index,"scope":"Bounded measured structural proposal search on explicitly intervention-conditioned native graph, not automatic understanding; no per-candidate native reexecution inside predictor; native computation outside affected rule uses remains fixed"}),
+    )
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() != 4 && args.len() != 5 {
@@ -928,8 +1314,8 @@ fn run() -> Result<(), String> {
         return Err("fresh output directory required".into());
     }
     if settings.layers == 0
-        || settings.uses.is_empty()
-        || settings.width == 0
+        || (settings.structural_search.is_none()
+            && (settings.uses.is_empty() || settings.width == 0))
         || settings.context == 0
         || settings.sequences == 0
         || settings.uses.iter().copied().collect::<BTreeSet<_>>().len() != settings.uses.len()
@@ -937,6 +1323,17 @@ fn run() -> Result<(), String> {
         || (settings.controls.is_empty() && settings.down_edit_family.is_none())
     {
         return Err("positive dimensions, unique uses/cases and explicit clean plus intervention cases required".into());
+    }
+    if settings.structural_search.is_some()
+        && (settings.down_edit_family.is_some()
+            || settings.frozen_shared_body.is_some()
+            || settings.native_initialization
+            || settings.native_codec_bytes != 0
+            || !settings.uses.is_empty()
+            || settings.width != 0
+            || !settings.expression_ids.is_empty())
+    {
+        return Err("structural_search supplies automatic regions/library moves; manual uses/width/expression IDs and down/transfer/native-initialization/native-codec modes cannot be combined".into());
     }
     let direction_count = settings
         .down_edit_family
@@ -990,11 +1387,15 @@ fn run() -> Result<(), String> {
         return Err("native initialization and frozen shared body are mutually exclusive".into());
     }
     let inventory = composed_rule_search::enumerate(&settings.grammar)?;
-    let sharing = selection(
-        &inventory,
-        &settings.expression_ids,
-        settings.require_interior_learned,
-    )?;
+    let sharing = if settings.structural_search.is_some() {
+        composed_rule_search::interior_learned_selection(&inventory)
+    } else {
+        selection(
+            &inventory,
+            &settings.expression_ids,
+            settings.require_interior_learned,
+        )?
+    };
     if settings.frozen_shared_body.is_some() && settings.expression_ids.len() != 1 {
         return Err("transfer config requires one frozen expression ID".into());
     }
@@ -1004,7 +1405,16 @@ fn run() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let checkpoint = export_record["source"]["checkpoint_sha256"]
         .as_str()
-        .ok_or("native checkpoint SHA absent")?;
+        .or_else(|| export_record["source"]["weights_sha256"].as_str())
+        .ok_or("native checkpoint/weights SHA absent")?;
+    if let (Some(a), Some(b)) = (
+        export_record["source"]["checkpoint_sha256"].as_str(),
+        export_record["source"]["weights_sha256"].as_str(),
+    ) {
+        if a != b {
+            return Err("conflicting native weight lineage aliases".into());
+        }
+    }
     let frozen_body = settings
         .frozen_shared_body
         .as_ref()
@@ -1147,6 +1557,22 @@ fn run() -> Result<(), String> {
         save(&out.join("TRANSFER_SOURCE.json"), record)?;
     }
     let mut costs = CostCache::default();
+    if let Some(structural) = &settings.structural_search {
+        return structural_run(
+            &d,
+            &settings,
+            structural,
+            &native,
+            &original_native,
+            &original_layers,
+            family,
+            &targets,
+            out,
+            args.get(4).map(|p| Path::new(p)),
+            native_codec.as_ref(),
+            &mut costs,
+        );
+    }
     let (saved_native, native_bytes, native_canonical_phases) =
         canonical_using(&base, native_codec.as_ref())?;
     save(
@@ -1750,11 +2176,9 @@ mod tests {
             .program
             .execute(&input, false)
             .expect("valid regression fixture");
-        assert!(
-            trace.values[lowered.program.output]
-                .iter()
-                .all(|v| v.is_finite())
-        );
+        assert!(trace.values[lowered.program.output]
+            .iter()
+            .all(|v| v.is_finite()));
         let restored = lowered
             .restore(&lowered.program)
             .expect("valid regression fixture");
@@ -1889,7 +2313,7 @@ mod tests {
     #[test]
     fn removed_down_family_runs_literal_teachers_shared_response_fit_and_saved_replay() {
         use gam_mpd::operator_program::{
-            Declarations, Interface, Law, Operator, Slot, SlotValues, exact_precision,
+            exact_precision, Declarations, Interface, Law, Operator, Slot, SlotValues,
         };
         use ndarray::array;
         let dense = |values: Array2<f64>| {
@@ -1989,12 +2413,10 @@ mod tests {
                 .expect("original native state")
                 .values[literal.output]
                 .clone();
-            assert!(
-                expected
-                    .iter()
-                    .zip(target)
-                    .all(|(a, b)| (a - b).abs() < 1e-12)
-            );
+            assert!(expected
+                .iter()
+                .zip(target)
+                .all(|(a, b)| (a - b).abs() < 1e-12));
         }
         let expression = Expr::Unary(
             Unary::Relu,
@@ -2169,5 +2591,567 @@ mod tests {
                 .expect("ordinary replay"),
             bytes
         );
+    }
+    #[test]
+    fn structural_mode_runs_persistent_reuse_with_finite_control_and_saved_replay() {
+        use gam_mpd::operator_program::{
+            exact_precision, Declarations, Interface, Law, Operator, Slot,
+        };
+        use ndarray::array;
+        let dense = |name: &str, values: Array2<f64>| {
+            Arc::new(
+                Operator::dense(
+                    name,
+                    Interface::native(values.nrows()).expect("rows"),
+                    Interface::native(values.ncols()).expect("cols"),
+                    values.clone(),
+                    exact_precision(values.iter().copied()).expect("precision"),
+                    Default::default(),
+                )
+                .expect("dense"),
+            )
+        };
+        let mut native = OperatorProgram {
+            declarations: Declarations {
+                domains: vec![],
+                slots: vec![Slot::Raw { width: 1 }],
+                parameters: 0,
+            },
+            bases: vec![],
+            rules: vec![],
+            operators: vec![
+                dense("reader-a", array![[1.]]),
+                dense("reader-b", array![[1.]]),
+                dense("head", array![[1., 0.25], [-0.5, 1.]]),
+            ],
+            nodes: vec![
+                Node::Raw { slot: 0 },
+                Node::Affine {
+                    terms: vec![(0, 0)],
+                    bias: None,
+                },
+                Node::Pointwise {
+                    input: 1,
+                    laws: vec![Law::GeluTanh],
+                },
+                Node::Affine {
+                    terms: vec![(0, 1)],
+                    bias: None,
+                },
+                Node::Pointwise {
+                    input: 3,
+                    laws: vec![Law::GeluTanh],
+                },
+                Node::Concat { parts: vec![2, 4] },
+                Node::Affine {
+                    terms: vec![(5, 2)],
+                    bias: None,
+                },
+            ],
+            output: 6,
+        };
+        Arc::make_mut(&mut native.operators[2]).cols = Interface::new(
+            [
+                Interface::native(1).expect("scalar"),
+                Interface::native(1).expect("scalar"),
+            ]
+            .iter()
+            .flat_map(|i| i.groups().iter().copied())
+            .collect(),
+        )
+        .expect("concat interface");
+        if let OperatorBody::Dense { present, .. } =
+            &mut Arc::make_mut(&mut native.operators[2]).body
+        {
+            *present = Array2::from_elem((1, 2), true);
+        }
+        let family = FamilyInputs {
+            rows: 4,
+            slots: vec![SlotValues::Raw(array![[-1.], [-0.25], [0.5], [1.25]])],
+            layout: None,
+        };
+        let specs = vec![
+            NativeControl::RetainedOperator {
+                name: "reader-a".into(),
+            },
+            NativeControl::RetainedOperator {
+                name: "reader-b".into(),
+            },
+        ];
+        let cases = vec![
+            Case {
+                label: "clean".into(),
+                group: "clean".into(),
+                gains: vec![1., 1.],
+                down_amplitudes: vec![],
+            },
+            Case {
+                label: "signed edit".into(),
+                group: "edit_a".into(),
+                gains: vec![-0.5, 1.],
+                down_amplitudes: vec![],
+            },
+        ];
+        let mut cases = cases;
+        cases.push(Case {
+            label: "independent B edit".into(),
+            group: "edit_b".into(),
+            gains: vec![1., 2.],
+            down_amplitudes: vec![],
+        });
+        let d = Device::host();
+        let base = Artifact::native(&native).expect("native");
+        let mapped = controls(&base, &native, &[], &specs).expect("control");
+        let (targets, _) = family_teacher_targets(
+            &d,
+            &native,
+            &[],
+            &specs,
+            &family,
+            &cases,
+            None,
+            1 << 26,
+            1 << 26,
+        )
+        .expect("literal teacher");
+        let metric = |name: &str| Metric {
+            name: name.into(),
+            value: 1.,
+        };
+        let structural = StructuralSettings {
+            settings: program_structure_search::Settings {
+                region_limits: gam_mpd::program_regions::Limits {
+                    max_internal_nodes: 2,
+                    max_inputs: 2,
+                    max_regions: 24,
+                    max_states: 100,
+                },
+                max_depth: 2,
+                max_callback_calls: 80,
+                max_move_attempts: 200,
+                beam_width: 8,
+                max_frontier: 8,
+                max_argument_bindings: 2,
+                max_compound_pairs: 24,
+                expression_search: None,
+                preserve_native_places: vec![],
+            },
+            constraints: program_structure_search::Constraints {
+                max_fidelity: vec![metric("maximum_group_mean_kl")],
+                max_local_errors: vec![metric("sampled_d_local")],
+                max_intervention_errors: vec![metric("clean"), metric("edit_a"), metric("edit_b")],
+            },
+            max_expression_evaluations: 0,
+        };
+        let settings = Settings {
+            export_sha256: "0".repeat(64),
+            layers: 1,
+            uses: vec![],
+            width: 0,
+            sequences: 1,
+            context: 4,
+            teacher_numeric_bytes: 1 << 26,
+            native_codec_bytes: 0,
+            grammar: empty_grammar(),
+            expression_ids: vec![],
+            require_interior_learned: false,
+            frozen_shared_body: None,
+            native_initialization: false,
+            down_edit_family: None,
+            structural_search: None,
+            controls: specs,
+            cases,
+            fit: FitSettings {
+                iterations: 1,
+                learning_rate: 0.001,
+                beta1: 0.9,
+                beta2: 0.999,
+                epsilon: 1e-8,
+                numeric_bytes: 1 << 26,
+            },
+            seed: 1,
+            evaluation: None,
+        };
+        let out =
+            std::env::temp_dir().join(format!("mpd-structural-driver-{}", std::process::id()));
+        if out.exists() {
+            std::fs::remove_dir_all(&out).expect("old fixture");
+        }
+        std::fs::create_dir(&out).expect("output");
+        structural_run(
+            &d,
+            &settings,
+            &structural,
+            &native,
+            &native,
+            &[],
+            &family,
+            &targets,
+            &out,
+            None,
+            None,
+            &mut CostCache::default(),
+        )
+        .expect("real structural callback");
+        let report: Value = serde_json::from_slice(
+            &std::fs::read(out.join("STRUCTURAL_SEARCH.json")).expect("searchreport"),
+        )
+        .expect("json");
+        let records = report["report"]["admitted_candidates"]
+            .as_array()
+            .expect("lineage");
+        assert!(
+            records
+                .iter()
+                .any(|r| r["depth"] == 2 && r["mutation"]["kind"] == "reuse_existing_rule"),
+            "{report}"
+        );
+        let attempts = report["report"]["attempts"].as_array().expect("attempts");
+        assert!(attempts
+            .iter()
+            .any(|a| a["depth"] == 2 && a["mutation"]["kind"] == "reuse_existing_rule"));
+        assert!(
+            attempts
+                .iter()
+                .any(|a| a["mutation"]["kind"] == "extract_and_reuse"
+                    && a["status"] == "fitted_admitted"
+                    && a["trainable_operator_ids"]
+                        .as_array()
+                        .is_some_and(|ids| !ids.is_empty())),
+            "compound move must reach actual jointly fitted Dense reuse before single scaffolding"
+        );
+        let mut fit_replay = false;
+        for entry in std::fs::read_dir(&out).expect("directories") {
+            let p = entry.expect("entry").path();
+            if p.join("FIT.json").exists() {
+                let bytes = std::fs::read(p.join("program.artifact")).expect("savedartifact");
+                let restored = Artifact::from_bytes(
+                    &bytes,
+                    &intervention_program::compile(&native, &mapped)
+                        .expect("controlled source")
+                        .program
+                        .declarations,
+                )
+                .expect("ordinary replay");
+                assert_eq!(restored.to_bytes().expect("bytes"), bytes);
+                assert!(
+                    restored.program.declarations.slots.len() > native.declarations.slots.len()
+                );
+                fit_replay = true;
+            }
+        }
+        assert!(
+            fit_replay,
+            "reuse must execute resident fitter, not only structural metadata"
+        );
+        std::fs::remove_dir_all(out).expect("cleanup");
+    }
+    #[test]
+    fn dominated_equation_hypotheses_freeze_without_heldout_selection() {
+        let region = gam_mpd::program_regions::Region {
+            native_reads: vec![0],
+            native_write: 1,
+            current_reads: vec![0],
+            current_write: 1,
+            current_internal_nodes: vec![1],
+            internal_native_places: vec![1],
+            source_program_nodes: 2,
+        };
+        let evaluation = |cost| StructureEvaluation {
+            fidelity: vec![Metric {
+                name: "kl".into(),
+                value: 0.,
+            }],
+            local_errors: vec![Metric {
+                name: "local".into(),
+                value: 0.,
+            }],
+            intervention_errors: vec![Metric {
+                name: "edits".into(),
+                value: 0.,
+            }],
+            description_bits: cost,
+        };
+        let records = vec![
+            program_structure_search::CandidateRecord {
+                id: 0,
+                parent_id: None,
+                depth: 0,
+                mutation: None,
+                evaluation: evaluation(1.),
+                encoded_size_bytes: 1,
+            },
+            program_structure_search::CandidateRecord {
+                id: 7,
+                parent_id: Some(0),
+                depth: 1,
+                mutation: Some(Mutation::SynthesizeExpression {
+                    region: region.clone(),
+                    expression: Expr::Argument(0),
+                    native_arguments: vec![0],
+                }),
+                evaluation: evaluation(100.),
+                encoded_size_bytes: 10,
+            },
+            program_structure_search::CandidateRecord {
+                id: 9,
+                parent_id: Some(0),
+                depth: 1,
+                mutation: Some(Mutation::SynthesizeExpression {
+                    region,
+                    expression: Expr::Argument(0),
+                    native_arguments: vec![0],
+                }),
+                evaluation: evaluation(200.),
+                encoded_size_bytes: 20,
+            },
+        ];
+        assert_eq!(frozen_structural_ids(&[0], &records, 0), (vec![0], vec![]));
+        assert_eq!(
+            frozen_structural_ids(&[0], &records, 1),
+            (vec![0, 7], vec![7])
+        );
+        assert_eq!(
+            frozen_structural_ids(&[0], &records, 2),
+            (vec![0, 7, 9], vec![7, 9])
+        );
+    }
+    #[test]
+    fn expression_search_rejects_clean_cancellation_under_independent_native_controls() {
+        use gam_mpd::operator_program::{exact_precision, Declarations, Interface, Operator, Slot};
+        use ndarray::array;
+        let dense = |name: &str, v: Array2<f64>| {
+            Arc::new(
+                Operator::dense(
+                    name,
+                    Interface::native(v.nrows()).expect("rows"),
+                    Interface::native(v.ncols()).expect("cols"),
+                    v.clone(),
+                    exact_precision(v.iter().copied()).expect("precision"),
+                    Default::default(),
+                )
+                .expect("dense"),
+            )
+        };
+        let native = OperatorProgram {
+            declarations: Declarations {
+                domains: vec![],
+                slots: vec![Slot::Raw { width: 1 }],
+                parameters: 0,
+            },
+            operators: vec![
+                dense("A", array![[1.]]),
+                dense("B", array![[1.]]),
+                dense("plus", array![[1.]]),
+                dense("minus", array![[-1.]]),
+                dense("head", array![[1.], [-1.]]),
+            ],
+            bases: vec![],
+            rules: vec![],
+            nodes: vec![
+                Node::Raw { slot: 0 },
+                Node::Affine {
+                    terms: vec![(0, 0)],
+                    bias: None,
+                },
+                Node::Affine {
+                    terms: vec![(0, 1)],
+                    bias: None,
+                },
+                Node::Affine {
+                    terms: vec![(1, 2), (2, 3)],
+                    bias: None,
+                },
+                Node::Affine {
+                    terms: vec![(3, 4)],
+                    bias: None,
+                },
+            ],
+            output: 4,
+        };
+        let family = FamilyInputs {
+            rows: 3,
+            slots: vec![SlotValues::Raw(array![[-1.], [0.5], [1.5]])],
+            layout: None,
+        };
+        let specs = vec![
+            NativeControl::RetainedOperator { name: "A".into() },
+            NativeControl::RetainedOperator { name: "B".into() },
+        ];
+        let cases = vec![
+            Case {
+                label: "clean".into(),
+                group: "clean".into(),
+                gains: vec![1., 1.],
+                down_amplitudes: vec![],
+            },
+            Case {
+                label: "A".into(),
+                group: "edited".into(),
+                gains: vec![2., 1.],
+                down_amplitudes: vec![],
+            },
+            Case {
+                label: "B negative".into(),
+                group: "edited".into(),
+                gains: vec![1., -0.5],
+                down_amplitudes: vec![],
+            },
+        ];
+        let d = Device::host();
+        let (targets, _) = family_teacher_targets(
+            &d,
+            &native,
+            &[],
+            &specs,
+            &family,
+            &cases,
+            None,
+            1 << 26,
+            1 << 26,
+        )
+        .expect("targets");
+        assert!(targets[0].iter().all(|v| *v == 0.));
+        assert!(targets[1].iter().any(|v| v.abs() > 0.5));
+        let metric = |name: &str| Metric {
+            name: name.into(),
+            value: 1e-5,
+        };
+        let structural = StructuralSettings {
+            settings: program_structure_search::Settings {
+                region_limits: gam_mpd::program_regions::Limits {
+                    max_internal_nodes: 1,
+                    max_inputs: 2,
+                    max_regions: 20,
+                    max_states: 40,
+                },
+                max_depth: 1,
+                max_callback_calls: 80,
+                max_move_attempts: 300,
+                beam_width: 4,
+                max_frontier: 4,
+                max_argument_bindings: 2,
+                max_compound_pairs: 8,
+                preserve_native_places: vec![],
+                expression_search: Some(program_structure_search::ExpressionSettings {
+                    grammar: Grammar {
+                        arguments: 2,
+                        max_operations: 1,
+                        max_expressions: 100,
+                        unary: vec![],
+                        binary: vec![composed_rule_search::Binary::Subtract],
+                        affine: false,
+                    },
+                    max_enumerations_per_parent: 20,
+                    max_move_attempts: 100,
+                    max_callback_calls: 60,
+                }),
+            },
+            constraints: program_structure_search::Constraints {
+                max_fidelity: vec![metric("maximum_group_mean_kl")],
+                max_local_errors: vec![Metric {
+                    name: "sampled_d_local".into(),
+                    value: 10.,
+                }],
+                max_intervention_errors: vec![metric("clean"), metric("edited")],
+            },
+            max_expression_evaluations: 2,
+        };
+        let settings = Settings {
+            export_sha256: "0".repeat(64),
+            layers: 1,
+            uses: vec![],
+            width: 0,
+            sequences: 1,
+            context: 3,
+            teacher_numeric_bytes: 1 << 26,
+            native_codec_bytes: 0,
+            grammar: empty_grammar(),
+            expression_ids: vec![],
+            require_interior_learned: false,
+            frozen_shared_body: None,
+            native_initialization: false,
+            down_edit_family: None,
+            structural_search: None,
+            controls: specs,
+            cases,
+            fit: FitSettings {
+                iterations: 1,
+                learning_rate: 0.001,
+                beta1: 0.9,
+                beta2: 0.999,
+                epsilon: 1e-8,
+                numeric_bytes: 1 << 26,
+            },
+            seed: 1,
+            evaluation: None,
+        };
+        let out = std::env::temp_dir().join(format!(
+            "mpd-structural-expression-driver-{}",
+            std::process::id()
+        ));
+        if out.exists() {
+            std::fs::remove_dir_all(&out).expect("old");
+        }
+        std::fs::create_dir(&out).expect("out");
+        structural_run(
+            &d,
+            &settings,
+            &structural,
+            &native,
+            &native,
+            &[],
+            &family,
+            &targets,
+            &out,
+            None,
+            None,
+            &mut CostCache::default(),
+        )
+        .expect("actual structural driver");
+        let report: Value = serde_json::from_slice(
+            &std::fs::read(out.join("STRUCTURAL_SEARCH.json")).expect("report"),
+        )
+        .expect("json");
+        let attempts = report["report"]["attempts"].as_array().expect("attempts");
+        assert!(
+            attempts
+                .iter()
+                .any(|a| a["mutation"]["kind"] == "synthesize_expression"
+                    && a["status"] == "fitted_admitted"),
+            "{report}"
+        );
+        let mut canceled_wrong = false;
+        for attempt in attempts
+            .iter()
+            .filter(|a| a["mutation"]["kind"] == "synthesize_expression")
+        {
+            let id = attempt["attempt_id"].as_u64().expect("id");
+            let p = out.join(format!("structural-attempt-{id:06}/TRAIN.json"));
+            if !p.exists() {
+                continue;
+            }
+            let m: Value =
+                serde_json::from_slice(&std::fs::read(p).expect("measure")).expect("json");
+            if m["groups"]["clean"].as_f64().expect("clean").abs() < 1e-8
+                && m["groups"]["edited"].as_f64().expect("edited") > 0.01
+            {
+                assert_ne!(attempt["status"], "fitted_admitted");
+                canceled_wrong = true;
+            }
+        }
+        assert!(
+            canceled_wrong,
+            "clean-only zero cancellation must be measured and rejected by intervention objective"
+        );
+        let frozen: Value = serde_json::from_slice(
+            &std::fs::read(out.join("FROZEN_EVALUATION_IDS.json")).expect("freeze"),
+        )
+        .expect("json");
+        assert!(!frozen["expression_hypotheses"]
+            .as_array()
+            .expect("hypotheses")
+            .is_empty());
+        std::fs::remove_dir_all(out).expect("cleanup");
     }
 }
