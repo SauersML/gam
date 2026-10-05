@@ -215,6 +215,33 @@ pub struct Explanation {
     /// The nats of the explanation's discrete choices: each exact read–write tie's choice of the
     /// write it reads among its candidates (`library_mixture`).
     pub fixed_nats: f64,
+    /// Per group, the reference variance `v⁰_G` its variance's scale is sent against (module
+    /// note): the mean square of `M`'s values over its cells in the explanation made at `M`, and
+    /// for a group a rewrite or share makes, a value fixed by `M` and the structure. It stays with
+    /// the group when the explanation starts from moved values (a warm start), so the scale code
+    /// is decodable from `M` and the explanation's structure.
+    pub reference: Vec<f64>,
+}
+
+/// Per group of `groups`, the mean square of `program`'s values over its cells.
+pub fn mean_squares(program: &OperatorProgram, groups: &[Group]) -> Vec<f64> {
+    let mut matrices: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+    groups
+        .iter()
+        .map(|group| {
+            let (mut count, mut sum) = (0.0, 0.0);
+            for cell in &group.cells {
+                let matrix = matrices.entry(cell.operator).or_insert_with(|| program.operators[cell.operator].matrix());
+                for &row in &cell.rows {
+                    for col in cell.cols.clone() {
+                        sum += matrix[[row, col]] * matrix[[row, col]];
+                        count += 1.0;
+                    }
+                }
+            }
+            if count > 0.0 { sum / count } else { 0.0 }
+        })
+        .collect()
 }
 
 /// A prior term beyond the groups' own Gaussian priors (`library_mixture`): its value at a weight
@@ -590,7 +617,8 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
     }
     trainable.sort_unstable();
     artifact.owners = owners;
-    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0 })
+    let reference = mean_squares(&artifact.program, &groups);
+    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference })
 }
 
 // ------------------------------------------------------------------------------------- posterior
@@ -628,8 +656,8 @@ pub struct Posterior {
     membership: Vec<Array2<u32>>,
     /// Per trainable operator, the range of its groups' indices.
     spans: Vec<Range<usize>>,
-    /// Per group, the variance `v⁰_G` of its native starting values, against which its variance's
-    /// scale is sent (zero for a group that starts outside the explanation).
+    /// Per group, the reference variance `v⁰_G` against which its variance's scale is sent
+    /// (`Explanation::reference`).
     initial: Vec<f64>,
 }
 
@@ -720,7 +748,10 @@ impl Posterior {
                 })
             })
             .collect();
-        let initial = squares.iter().map(|(count, sum)| if *count > 0.0 { sum / count } else { 0.0 }).collect();
+        if explanation.reference.len() != explanation.groups.len() {
+            return Err("one reference variance per prior group required".into());
+        }
+        let initial = explanation.reference.clone();
         let mut posterior = Self { mean, log_sd, active: vec![true; explanation.groups.len()], membership, spans, initial };
         posterior.remove(&explanation.removed);
         Ok(posterior)
@@ -3345,6 +3376,31 @@ mod tests {
             .map(|c| c.rows.len() * c.cols.len())
             .sum();
         assert!(end <= start && start - end >= removed.min(start), "removed groups are absent blocks: {start} → {end}");
+    }
+
+    #[test]
+    fn the_scale_reference_survives_a_warm_start() {
+        // A warm start from values three times M's keeps every group's reference at M's mean
+        // square, so each active group's scale sends the exponent round(log2 9) = 3 and the
+        // description grows by the difference of their Elias δ lengths; the start at M sends 0.
+        let (native, layers, _, _) = tiny("library_scale_reference", "gelu_tanh");
+        let start = explanation(&native, &layers).unwrap();
+        let mut moved = start.artifact.clone();
+        for &op in &start.trainable {
+            let old = Arc::clone(&moved.program.operators[op]);
+            let values = old.matrix() * 3.0;
+            let precision = exact_precision(values.iter().copied()).unwrap();
+            moved.program.operators[op] = Arc::new(Operator::dense(old.name.clone(), old.rows.clone(), old.cols.clone(), values, precision, old.provenance.clone()).unwrap());
+        }
+        let warm = crate::library_sharing::warm(&start, &moved).unwrap();
+        assert_eq!(warm.reference, start.reference);
+        let (cold, hot) = (Posterior::new(&start, 1000).unwrap(), Posterior::new(&warm, 1000).unwrap());
+        assert_eq!(hot.initial, cold.initial);
+        let zero = scale_bits(1.0, 1.0);
+        for (g, (c, h)) in cold.moments().iter().zip(hot.moments()).enumerate() {
+            assert_eq!(scale_bits(c.second / c.count, cold.initial[g]), zero, "{}", start.groups[g].name);
+            assert_eq!(scale_bits(h.second / h.count, hot.initial[g]), scale_bits(9.0, 1.0), "{}", start.groups[g].name);
+        }
     }
 
     #[test]

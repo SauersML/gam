@@ -62,6 +62,10 @@ use crate::{
 use ndarray::Array2;
 use std::{collections::BTreeMap, sync::Arc};
 
+/// The reference variance (`Explanation::reference`) of a scale a tie or share adds: the square of
+/// the identity scale 1 it stands beside.
+const SCALE_REFERENCE: f64 = 1.0;
+
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -315,16 +319,18 @@ pub fn share_query_key(explanation: &Explanation, members: &[Member]) -> Result<
     // The retired maps leave the library with their groups (every plane group of a member holds
     // its key's rows); each part is one group.
     let mut index = BTreeMap::new();
-    let mut groups = Vec::new();
+    let (mut groups, mut reference) = (Vec::new(), Vec::new());
     for (g, group) in explanation.groups.iter().enumerate() {
         if group.cells.iter().any(|c| retired.contains(&c.operator)) {
             continue;
         }
         index.insert(g, groups.len());
         groups.push(group.clone());
+        reference.push(explanation.reference[g]);
     }
     for (name, scale) in &parts {
         groups.push(Group { name: name.clone(), cells: vec![Cells { operator: *scale, rows: vec![0], cols: 0..1 }] });
+        reference.push(SCALE_REFERENCE);
     }
     let mut trainable: Vec<usize> = explanation.trainable.iter().copied().filter(|op| !retired.contains(op)).chain(parts.iter().map(|p| p.1)).collect();
     trainable.sort_unstable();
@@ -341,7 +347,7 @@ pub fn share_query_key(explanation: &Explanation, members: &[Member]) -> Result<
         }
     }
     let removed = explanation.removed.iter().filter_map(|g| index.get(g).copied()).collect();
-    Ok(Explanation { artifact, trainable, groups, layers, removed, fixed_nats: explanation.fixed_nats })
+    Ok(Explanation { artifact, trainable, groups, layers, removed, fixed_nats: explanation.fixed_nats, reference })
 }
 
 /// The value transport from one key-value group to another (module note): `T` and the source
@@ -461,15 +467,17 @@ pub fn share_value(explanation: &Explanation, target: (usize, usize), source: (u
     // The target's value map leaves with its groups; its heads' value groups are the source's.
     let retired = own.value;
     let mut index = BTreeMap::new();
-    let mut kept = Vec::new();
+    let (mut kept, mut reference) = (Vec::new(), Vec::new());
     for (g, group) in out.groups.iter().enumerate() {
         if group.cells.iter().any(|c| c.operator == retired) {
             continue;
         }
         index.insert(g, kept.len());
         kept.push(group.clone());
+        reference.push(out.reference[g]);
     }
     kept.push(Group { name: format!("{name}.scale"), cells: vec![Cells { operator: base + 1, rows: vec![0], cols: 0..1 }] });
+    reference.push(SCALE_REFERENCE);
     let source_values: Vec<usize> = out.layers[source.0].heads[other.heads[0].0].1.iter().filter_map(|g| index.get(g).copied()).collect();
     let members: Vec<usize> = own.heads.iter().map(|(h, _)| *h).collect();
     for (l, layer) in out.layers.iter_mut().enumerate() {
@@ -483,6 +491,7 @@ pub fn share_value(explanation: &Explanation, target: (usize, usize), source: (u
     }
     out.removed = out.removed.iter().filter_map(|g| index.get(g).copied()).collect();
     out.groups = kept;
+    out.reference = reference;
     out.trainable = out.trainable.iter().copied().filter(|op| *op != retired).chain([base + 1]).collect();
     out.trainable.sort_unstable();
     Ok(out)
@@ -719,6 +728,7 @@ pub fn tie(explanation: &Explanation, ties: &[Tie]) -> Result<Explanation, Strin
             let own = group(&out, &format!("library.l{source}.mlp.f{}.out", tie.source.1))?;
             let scale = out.groups.len();
             out.groups.push(Group { name: format!("library.l{source}.mlp.f{}.tie", tie.source.1), cells: vec![Cells { operator: base + 3 * t + 1, rows: vec![0], cols: 0..1 }] });
+            out.reference.push(SCALE_REFERENCE);
             out.removed.push(own);
             out.trainable.push(base + 3 * t + 1);
             for function in &mut out.layers[source].functions {
@@ -838,6 +848,7 @@ pub fn tie_row(explanation: &Explanation, part: &str, target: (usize, usize), so
     let own_group = out.groups.iter().position(|g| g.name == format!("library.l{l}.mlp.f{i}.{part}")).ok_or_else(|| format!("no {part} group"))?;
     let tied = out.groups.len();
     out.groups.push(Group { name: format!("library.l{l}.mlp.f{i}.{part}.tie"), cells: vec![Cells { operator: scale_index, rows: vec![0], cols: 0..1 }] });
+    out.reference.push(SCALE_REFERENCE);
     out.removed.push(own_group);
     out.trainable.push(scale_index);
     out.trainable.sort_unstable();
@@ -915,6 +926,7 @@ pub fn tie_column(explanation: &Explanation, target: (usize, usize), source: (us
     let own_group = out.groups.iter().position(|g| g.name == format!("library.l{l}.mlp.f{i}.out")).ok_or("no output group")?;
     let tied = out.groups.len();
     out.groups.push(Group { name: format!("library.l{l}.mlp.f{i}.out.tie"), cells: vec![Cells { operator: base + 1, rows: vec![0], cols: 0..1 }] });
+    out.reference.push(SCALE_REFERENCE);
     out.removed.push(own_group);
     out.trainable.push(base + 1);
     out.trainable.sort_unstable();

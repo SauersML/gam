@@ -417,20 +417,29 @@ pub fn rewrite(explanation: &Explanation, layer: usize, functions: &[usize]) -> 
     r.nodes.push(Node::Affine { terms, bias: None });
     r.output = r.nodes.len() - 1;
     program.interfaces().map_err(error)?;
-    // The body's groups once, the call's per row of `R` and column of `W`.
-    let groups = &mut rewritten.groups;
+    // The body's groups once, the call's per row of `R` and column of `W`. A unit's group takes the
+    // reference of the native group it replaces at the same total square (`g_j = a_i Rᵀ` and
+    // `u_j = Wᵀ o_i` keep a direction's norm), and a binding's that of a unit direction.
+    let (groups, reference) = (&mut rewritten.groups, &mut rewritten.reference);
     for j in 0..n {
         let mut gate_cells = vec![Cells { operator: body_gate, rows: vec![j], cols: 0..k }];
         gate_cells.extend(body_gate_bias.map(|op| Cells { operator: op, rows: vec![j], cols: 0..1 }));
-        groups.push(Group { name: format!("{body}.u{j}.gate"), cells: gate_cells });
+        let mut unit = vec![Group { name: format!("{body}.u{j}.gate"), cells: gate_cells }];
         if let Some(up) = body_up {
             let mut up_cells = vec![Cells { operator: up, rows: vec![j], cols: 0..k }];
             up_cells.extend(body_up_bias.map(|op| Cells { operator: op, rows: vec![j], cols: 0..1 }));
-            groups.push(Group { name: format!("{body}.u{j}.up"), cells: up_cells });
+            unit.push(Group { name: format!("{body}.u{j}.up"), cells: up_cells });
         }
-        groups.push(Group { name: format!("{body}.u{j}.out"), cells: vec![Cells { operator: body_out, rows: (0..k_out).collect(), cols: j..j + 1 }] });
+        unit.push(Group { name: format!("{body}.u{j}.out"), cells: vec![Cells { operator: body_out, rows: (0..k_out).collect(), cols: j..j + 1 }] });
+        for (p, group) in unit.into_iter().enumerate() {
+            let native = retired[j * parts.len() + p];
+            reference.push(explanation.reference[native] * size(&explanation.groups[native]) / size(&group));
+            groups.push(group);
+        }
     }
-    groups.extend(binding_groups(&call, read_op, write_op, k, k_out, d_in, d_out));
+    let bindings = binding_groups(&call, read_op, write_op, k, k_out, d_in, d_out);
+    reference.extend(bindings.iter().map(binding_reference));
+    groups.extend(bindings);
     // Each replaced native block's owner is now the body's block of its unit at this call, read
     // through the call's bindings (a gate or up row through `R`, an output column through `W`); a
     // bias is the body's own entry and takes no binding, whatever the read's width.
@@ -474,6 +483,16 @@ pub fn rewrite(explanation: &Explanation, layer: usize, functions: &[usize]) -> 
 
 /// A call's binding groups: each row of its read binding (`k × d_in`) and each column of its write
 /// binding (`d_out × k′`).
+/// A group's number of entries.
+fn size(group: &Group) -> f64 {
+    group.cells.iter().map(|c| c.rows.len() * c.cols.len()).sum::<usize>() as f64
+}
+
+/// A binding group's reference variance: the mean square of a unit direction over its entries.
+fn binding_reference(group: &Group) -> f64 {
+    1.0 / size(group)
+}
+
 fn binding_groups(call: &str, read: usize, write: usize, k: usize, k_out: usize, d_in: usize, d_out: usize) -> Vec<Group> {
     let reads = (0..k).map(|q| Group { name: format!("{call}.read{q}"), cells: vec![Cells { operator: read, rows: vec![q], cols: 0..d_in }] });
     let writes = (0..k_out).map(|q| Group { name: format!("{call}.write{q}"), cells: vec![Cells { operator: write, rows: (0..d_out).collect(), cols: q..q + 1 }] });
@@ -1214,13 +1233,14 @@ pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, 
     let retired = from_ops.all();
     let rebound: Vec<usize> = bindings.iter().flat_map(|b| [b.1, b.2]).collect();
     let mut index = BTreeMap::new();
-    let mut groups = Vec::new();
+    let (mut groups, mut reference) = (Vec::new(), Vec::new());
     for (g, group) in explanation.groups.iter().enumerate() {
         if group.cells.iter().any(|cell| retired.contains(&cell.operator) || rebound.contains(&cell.operator)) {
             continue;
         }
         index.insert(g, groups.len());
         groups.push(group.clone());
+        reference.push(explanation.reference[g]);
     }
     let mut removed: Vec<usize> = explanation.removed.iter().filter_map(|g| index.get(g).copied()).collect();
     for (call, read, write, d_in, d_out) in &bindings {
@@ -1231,6 +1251,7 @@ pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, 
             if zero {
                 removed.push(groups.len());
             }
+            reference.push(binding_reference(&group));
             groups.push(group);
         }
     }
@@ -1245,6 +1266,7 @@ pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, 
         }
     }
     merged.groups = groups;
+    merged.reference = reference;
     merged.removed = removed;
     merged.trainable.retain(|op| !retired.contains(op));
     // The calls' choice of body changes; `from`'s widths are no longer sent.
