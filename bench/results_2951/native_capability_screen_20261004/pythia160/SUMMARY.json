@@ -1,0 +1,44 @@
+{
+  "scope": "Frozen42 native behavioral calibration, model capability selection only; no method win, mechanism claim or statistical confidence.",
+  "report_sha256": "66941ca6b10e79dc2d2bc7b6cfef06a0895f422a061b10f7e7f7bf00e33d55b8",
+  "fixture_sha256": "ad259df15aa3ef9db2f8843973d1f6e980844e70e567caae4e4bd1a93771a885",
+  "groups": {
+    "assignment": {
+      "cases": 8,
+      "unique_token_contexts": 8,
+      "forced_choice_correct": 4,
+      "mean_target_probability": 0.10233986899920876,
+      "median_target_rank": 3.0,
+      "mean_target_minus_foil_log_odds": -0.04115269508824326
+    },
+    "paraphrase": {
+      "cases": 8,
+      "unique_token_contexts": 4,
+      "forced_choice_correct": 4,
+      "mean_target_probability": 0.004058995453818812,
+      "median_target_rank": 35.5,
+      "mean_target_minus_foil_log_odds": -0.018539099361362332
+    },
+    "periodic": {
+      "cases": 18,
+      "unique_token_contexts": 18,
+      "forced_choice_correct": 8,
+      "mean_target_probability": 0.008605655418894447,
+      "median_target_rank": 94.5,
+      "mean_target_minus_foil_log_odds": -0.05524277791648223
+    },
+    "reassignment": {
+      "cases": 8,
+      "unique_token_contexts": 8,
+      "forced_choice_correct": 4,
+      "mean_target_probability": 0.03896269576102936,
+      "median_target_rank": 3.0,
+      "mean_target_minus_foil_log_odds": 0.05444480613765279
+    }
+  },
+  "limitations": [
+    "Paraphrase order variants duplicate contexts (4 unique in8); not independent evidence.",
+    "Same prespecified prompts as4L; no prompt tuning.",
+    "Operational native f64 Rust CPU inference, no CUDA parity or full neural certificate."
+  ]
+}

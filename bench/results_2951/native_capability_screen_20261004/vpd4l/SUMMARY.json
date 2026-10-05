@@ -1,0 +1,45 @@
+{
+  "scope": "Prespecified small behavioral calibration, no mechanism claim, no statistical confidence or acceptance verdict",
+  "report_sha256": "24ac4ec332094e71a6e06ea3bdc2e093a1106e400dd379032c97111755113f3f",
+  "fixture_sha256": "128efe8177f2975bae4aae95326db75efde55c3edb77afb4d534fed9306fff16",
+  "groups": {
+    "assignment": {
+      "cases": 8,
+      "unique_token_contexts": 8,
+      "forced_choice_correct": 4,
+      "mean_target_probability": 0.15734514173908326,
+      "median_target_rank": 2.0,
+      "mean_target_minus_foil_log_odds": -0.00534984681477213
+    },
+    "paraphrase": {
+      "cases": 8,
+      "unique_token_contexts": 4,
+      "forced_choice_correct": 4,
+      "mean_target_probability": 0.0032805406838755636,
+      "median_target_rank": 40.0,
+      "mean_target_minus_foil_log_odds": 0.006345839912591744
+    },
+    "periodic": {
+      "cases": 18,
+      "unique_token_contexts": 18,
+      "forced_choice_correct": 10,
+      "mean_target_probability": 0.0014168730998791823,
+      "median_target_rank": 142.0,
+      "mean_target_minus_foil_log_odds": 0.001095433278851569
+    },
+    "reassignment": {
+      "cases": 8,
+      "unique_token_contexts": 8,
+      "forced_choice_correct": 3,
+      "mean_target_probability": 0.015988946567900543,
+      "median_target_rank": 3.0,
+      "mean_target_minus_foil_log_odds": -0.024903087091282305
+    }
+  },
+  "limitations": [
+    "Paraphrase fact-order variants duplicate token contexts (4 unique contexts in8 records); do not treat duplicates as independent evidence.",
+    "Small fixed lexical sets; a negative result does not establish absence of capability across all tasks.",
+    "Direct color phrasing produces plausible probabilities but counterbalanced ownership assignments do not consistently select their associated values.",
+    "Actual f64 native import CPU result; no CUDA parity performed yet."
+  ]
+}

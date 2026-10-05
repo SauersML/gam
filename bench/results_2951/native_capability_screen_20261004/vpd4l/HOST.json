@@ -1,0 +1,4701 @@
+{
+  "backend": "cpu",
+  "budget_exclusions": "CUDA context, library scratch, host model, transient uploads; plan checked before each forward, initial uploads precede plan check.",
+  "device": null,
+  "fixtures_sha256": "128efe8177f2975bae4aae95326db75efde55c3edb77afb4d534fed9306fff16",
+  "initialization_seconds": 3.388159667,
+  "native_export": {
+    "config": {
+      "d_mlp": 3072,
+      "d_model": 768,
+      "head_dim": 128,
+      "mlp_act": "gelu_tanh",
+      "n_ctx": 512,
+      "n_heads": 6,
+      "n_kv_heads": 6,
+      "n_layers": 4,
+      "norm_eps": 1e-6,
+      "rope_pairing": "rotate_half",
+      "rope_theta": 10000.0,
+      "tied_embeddings": true,
+      "vocab": 50277
+    },
+    "files": {
+      "blocks.0.attn.k_proj": {
+        "sha256": "099f96cd49e2f8daf2c6417d8510f54a14792d495a60c65c34c6fe233fc73614",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.0.attn.o_proj": {
+        "sha256": "aea57bbf855586fadb200d81d543b29f7de9da0f2c0cca24994925e1c46bc8ae",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.0.attn.q_proj": {
+        "sha256": "ea38c22ce7e3855ebdbccc06e87b75619e5b3fee33f3bee9a7329936bb4f2238",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.0.attn.v_proj": {
+        "sha256": "5d741828c2a0684a4448dbd8434ce3d92e9e24bc38da324967890fa2254d7bf3",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.0.mlp.c_fc": {
+        "sha256": "ce3f0e13143fb1b7d31ad01fe75e38e39bf8cd67ef6b8309dd566d8bc2983275",
+        "shape": [
+          3072,
+          768
+        ]
+      },
+      "blocks.0.mlp.down_proj": {
+        "sha256": "05d2abd83af9be70a453c7e7b499af6100d5c1b5379268ab5a5919f42e0ac384",
+        "shape": [
+          768,
+          3072
+        ]
+      },
+      "blocks.0.rms1.gain": {
+        "sha256": "f7caac93fc2ebcf2064255c345213c199c25858479067ba8afeb7778ef9ba56e",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.0.rms2.gain": {
+        "sha256": "77f3b52b042773fdcd76b77a28e4efc66764f1e40f1b22ddc5e8bd407b0ad388",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.1.attn.k_proj": {
+        "sha256": "a50cbbf9738af28cf9b7d64885d2f6ed481ebebf9b4ed5b20aa20c8a67a71bf3",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.1.attn.o_proj": {
+        "sha256": "c5c7d591b66b11791c6bd77a55ec4f8ef029e0a03b1061e8413e411a1d46d7be",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.1.attn.q_proj": {
+        "sha256": "e866af792279b999dd7164d7b203971b3776902e764452217653f0536c8f9227",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.1.attn.v_proj": {
+        "sha256": "12e2189b69665c35f4d1e41bed8229080ccb95bfd2ac6f09d2d9a15b6162679b",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.1.mlp.c_fc": {
+        "sha256": "5250793ece9b1bef04c275c1b59f48f5cccb9c971dd898d0a4f5777fcafad5c8",
+        "shape": [
+          3072,
+          768
+        ]
+      },
+      "blocks.1.mlp.down_proj": {
+        "sha256": "ec12769ec6cf2a735d67609ec4eb9fc155b4f3160d217340a0ddd19ab16a307d",
+        "shape": [
+          768,
+          3072
+        ]
+      },
+      "blocks.1.rms1.gain": {
+        "sha256": "cd82df137c7b3c6958ba09ae522712751550e6ca94365e0745f942ef3468aa7e",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.1.rms2.gain": {
+        "sha256": "e80940662353b21caa38d7c8b9f39d242ac7eca50b8f2a9b8b7e34b0d2073633",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.2.attn.k_proj": {
+        "sha256": "f870446110c824cc9330b00e8a96665757ebea6d231eb8403cd290d143991316",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.2.attn.o_proj": {
+        "sha256": "93291c198cb318df017cd12b276420d980a57eb6bb214f70d4ffb8cf4057fb44",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.2.attn.q_proj": {
+        "sha256": "c3e8e98f26dffacd097b4342dafc04f22b6bfe2379f5db7307558fb3d95caef6",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.2.attn.v_proj": {
+        "sha256": "9c03b34c8772c92484d0fea39238c06b63dbb115c73baa53fbd55915bad197c6",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.2.mlp.c_fc": {
+        "sha256": "07f0c6a137fd648b749f9acece581431a9a73ecdd6881f81633f618317dbd0dc",
+        "shape": [
+          3072,
+          768
+        ]
+      },
+      "blocks.2.mlp.down_proj": {
+        "sha256": "0edbdf22096909f99ac92b91221195e22e4a0957d59d791cc22fb58cf6b3a579",
+        "shape": [
+          768,
+          3072
+        ]
+      },
+      "blocks.2.rms1.gain": {
+        "sha256": "9d8a578f86b90b79d61d05d3c4a4119124061f354f60278890ae73d85b843042",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.2.rms2.gain": {
+        "sha256": "b770fa4d1c6b2ef24f605360523abfb073bd4ed62f446b9ee388bdc57614d13d",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.3.attn.k_proj": {
+        "sha256": "dc19a593d43427d44769f9ea9b0b827851d357d849300d9b882fdd39db4f8928",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.3.attn.o_proj": {
+        "sha256": "5fc3bb75250b6bf15c1aa627bf73ca7e26d6c4c6353ad2915cccf0d5d1977c64",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.3.attn.q_proj": {
+        "sha256": "bfd4e26e3569a36425684702f7c834325cf0422737588b8b7dfd3ca666631b2b",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.3.attn.v_proj": {
+        "sha256": "ca73d04bad13b91b732e5c22b5504d2b410c67bbd279b2538dcbb750d6e5ec82",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.3.mlp.c_fc": {
+        "sha256": "dba21fcffeeee199085ba1fd887d2009193bcda317f67069bd635cf38c8f71f5",
+        "shape": [
+          3072,
+          768
+        ]
+      },
+      "blocks.3.mlp.down_proj": {
+        "sha256": "a9820c075dffdce736341eb48494f5d03459dca6b4f8f198df7e78771c12ae1f",
+        "shape": [
+          768,
+          3072
+        ]
+      },
+      "blocks.3.rms1.gain": {
+        "sha256": "0c0caddb7cab377379a952263d994e6a6a4e0235d1528a6cfa604da7fcad34a0",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.3.rms2.gain": {
+        "sha256": "a9e54165b55f00b9fba493dec03ecdd3b140913251d0aff66b6c7bea7d26018a",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "final_norm.gain": {
+        "sha256": "30518f54acc7d36d0a4533956c7d8f0bb9d1bda5f2cddae0fddac7c2f071b665",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "logits_row0": {
+        "sha256": "27786f5eaf424ae3a1b9e719c660726a852d37545233fb4780b55162058d8ae9",
+        "shape": [
+          512,
+          50277
+        ]
+      },
+      "tokens": {
+        "shape": [
+          2,
+          513
+        ]
+      },
+      "wte": {
+        "sha256": "81625bc04736ddf55792b57cc5e9ccb59bc35bbaf4fd6d7d3ac0472da65b7a52",
+        "shape": [
+          50277,
+          768
+        ]
+      }
+    },
+    "reference_forward": {
+      "note": "not copied; use native forward for this token slice"
+    },
+    "source": {
+      "checkpoint": "/Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors",
+      "checkpoint_sha256": "155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552",
+      "context": 512,
+      "data": "danbraunai/pile-uncopyrighted-tok-shuffled val-00000-of-00012.parquet",
+      "logits": "fp32 forward on MPS (vpd_model.Target), widened to f64",
+      "target_run": "goodfire/spd/runs/t-9d2b8f02",
+      "token_rows": "validation rows 16,17 of vpd4l_frontier32; disjoint from first Copy pilot rows 0,1",
+      "topk": 64
+    }
+  },
+  "numeric_budget_bytes": 8589934592,
+  "numerical_model": "Actual imported f64 native weights, operational f64 exp/log; no serialized f32 rounding.",
+  "results": [
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "periodic",
+      "id": 0,
+      "metrics": {
+        "foil_log_probability": -7.633933834316105,
+        "foil_probability": 0.00048375410188078644,
+        "forced_choice_correct": false,
+        "target_log_probability": -8.692239554270188,
+        "target_minus_foil_log_odds": -1.0583057199540835,
+        "target_probability": 0.00016788362040963086,
+        "target_rank": 617,
+        "top1_log_probability": -6.218344531196694,
+        "top1_token": 13
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          9
+        ],
+        [
+          9,
+          15
+        ],
+        [
+          15,
+          19
+        ],
+        [
+          19,
+          24
+        ],
+        [
+          24,
+          30
+        ],
+        [
+          30,
+          34
+        ]
+      ],
+      "pair": "cycle-red",
+      "prompt": " red blue green red blue green red",
+      "seconds": 0.01748075,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        2502,
+        4797,
+        4759,
+        2502,
+        4797,
+        4759,
+        2502
+      ],
+      "variant": "forward"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "periodic",
+      "id": 1,
+      "metrics": {
+        "foil_log_probability": -7.59919210925379,
+        "foil_probability": 0.0005008559068857919,
+        "forced_choice_correct": true,
+        "target_log_probability": -6.568548656737956,
+        "target_minus_foil_log_odds": 1.030643452515835,
+        "target_probability": 0.0014038333784511465,
+        "target_rank": 28,
+        "top1_log_probability": -4.558507073888523,
+        "top1_token": 13
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          10
+        ],
+        [
+          10,
+          15
+        ],
+        [
+          15,
+          19
+        ],
+        [
+          19,
+          25
+        ],
+        [
+          25,
+          30
+        ],
+        [
+          30,
+          34
+        ]
+      ],
+      "pair": "cycle-red",
+      "prompt": " red green blue red green blue red",
+      "seconds": 0.016962375,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        2502,
+        4759,
+        4797,
+        2502,
+        4759,
+        4797,
+        2502
+      ],
+      "variant": "reversed"
+    },
+    {
+      "foil_text": " red",
+      "foil_token": 2502,
+      "group": "periodic",
+      "id": 2,
+      "metrics": {
+        "foil_log_probability": -5.876620438349484,
+        "foil_probability": 0.002804246402400419,
+        "forced_choice_correct": true,
+        "target_log_probability": -5.107233622494116,
+        "target_minus_foil_log_odds": 0.7693868158553681,
+        "target_probability": 0.006052804125537793,
+        "target_rank": 16,
+        "top1_log_probability": -2.199499702499722,
+        "top1_token": 13
+      },
+      "offsets": [
+        [
+          0,
+          5
+        ],
+        [
+          5,
+          11
+        ],
+        [
+          11,
+          15
+        ],
+        [
+          15,
+          20
+        ],
+        [
+          20,
+          26
+        ],
+        [
+          26,
+          30
+        ],
+        [
+          30,
+          35
+        ]
+      ],
+      "pair": "cycle-blue",
+      "prompt": " blue green red blue green red blue",
+      "seconds": 0.01645125,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        4797,
+        4759,
+        2502,
+        4797,
+        4759,
+        2502,
+        4797
+      ],
+      "variant": "forward"
+    },
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "periodic",
+      "id": 3,
+      "metrics": {
+        "foil_log_probability": -4.762664785330885,
+        "foil_probability": 0.008542814272771678,
+        "forced_choice_correct": false,
+        "target_log_probability": -5.343798604098344,
+        "target_minus_foil_log_odds": -0.5811338187674595,
+        "target_probability": 0.004777687653143072,
+        "target_rank": 21,
+        "top1_log_probability": -2.5029228122344733,
+        "top1_token": 13
+      },
+      "offsets": [
+        [
+          0,
+          5
+        ],
+        [
+          5,
+          9
+        ],
+        [
+          9,
+          15
+        ],
+        [
+          15,
+          20
+        ],
+        [
+          20,
+          24
+        ],
+        [
+          24,
+          30
+        ],
+        [
+          30,
+          35
+        ]
+      ],
+      "pair": "cycle-blue",
+      "prompt": " blue red green blue red green blue",
+      "seconds": 0.017224584,
+      "target_text": " red",
+      "target_token": 2502,
+      "tokens": [
+        4797,
+        2502,
+        4759,
+        4797,
+        2502,
+        4759,
+        4797
+      ],
+      "variant": "reversed"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "periodic",
+      "id": 4,
+      "metrics": {
+        "foil_log_probability": -7.5918073055941955,
+        "foil_probability": 0.0005045683202704089,
+        "forced_choice_correct": true,
+        "target_log_probability": -7.533418731478502,
+        "target_minus_foil_log_odds": 0.05838857411569354,
+        "target_probability": 0.000534906425764785,
+        "target_rank": 113,
+        "top1_log_probability": -4.722413226207854,
+        "top1_token": 13
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          15
+        ],
+        [
+          15,
+          21
+        ],
+        [
+          21,
+          25
+        ],
+        [
+          25,
+          30
+        ],
+        [
+          30,
+          36
+        ]
+      ],
+      "pair": "cycle-green",
+      "prompt": " green red blue green red blue green",
+      "seconds": 0.016285292,
+      "target_text": " red",
+      "target_token": 2502,
+      "tokens": [
+        4759,
+        2502,
+        4797,
+        4759,
+        2502,
+        4797,
+        4759
+      ],
+      "variant": "forward"
+    },
+    {
+      "foil_text": " red",
+      "foil_token": 2502,
+      "group": "periodic",
+      "id": 5,
+      "metrics": {
+        "foil_log_probability": -8.434771355386445,
+        "foil_probability": 0.0002171827581577052,
+        "forced_choice_correct": false,
+        "target_log_probability": -8.544067185111711,
+        "target_minus_foil_log_odds": -0.10929582972526442,
+        "target_probability": 0.000194696779780998,
+        "target_rank": 486,
+        "top1_log_probability": -5.906066993566348,
+        "top1_token": 13
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          11
+        ],
+        [
+          11,
+          15
+        ],
+        [
+          15,
+          21
+        ],
+        [
+          21,
+          26
+        ],
+        [
+          26,
+          30
+        ],
+        [
+          30,
+          36
+        ]
+      ],
+      "pair": "cycle-green",
+      "prompt": " green blue red green blue red green",
+      "seconds": 0.016820167,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        4759,
+        4797,
+        2502,
+        4759,
+        4797,
+        2502,
+        4759
+      ],
+      "variant": "reversed"
+    },
+    {
+      "foil_text": " three",
+      "foil_token": 1264,
+      "group": "periodic",
+      "id": 6,
+      "metrics": {
+        "foil_log_probability": -9.901459403938363,
+        "foil_probability": 0.000050101510334113226,
+        "forced_choice_correct": true,
+        "target_log_probability": -9.536007962830931,
+        "target_minus_foil_log_odds": 0.3654514411074319,
+        "target_probability": 0.00007220451619597624,
+        "target_rank": 2557,
+        "top1_log_probability": -7.000497920072098,
+        "top1_token": 14
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          18
+        ],
+        [
+          18,
+          22
+        ],
+        [
+          22,
+          28
+        ],
+        [
+          28,
+          32
+        ]
+      ],
+      "pair": "cycle-one",
+      "prompt": " one two three one two three one",
+      "seconds": 0.016416,
+      "target_text": " two",
+      "target_token": 767,
+      "tokens": [
+        581,
+        767,
+        1264,
+        581,
+        767,
+        1264,
+        581
+      ],
+      "variant": "forward"
+    },
+    {
+      "foil_text": " two",
+      "foil_token": 767,
+      "group": "periodic",
+      "id": 7,
+      "metrics": {
+        "foil_log_probability": -9.73714224966258,
+        "foil_probability": 0.0000590490413699053,
+        "forced_choice_correct": false,
+        "target_log_probability": -10.058048304651503,
+        "target_minus_foil_log_odds": -0.3209060549889238,
+        "target_probability": 0.00004283957193342994,
+        "target_rank": 5767,
+        "top1_log_probability": -7.0392573363712865,
+        "top1_token": 5708
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          10
+        ],
+        [
+          10,
+          14
+        ],
+        [
+          14,
+          18
+        ],
+        [
+          18,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          32
+        ]
+      ],
+      "pair": "cycle-one",
+      "prompt": " one three two one three two one",
+      "seconds": 0.0165625,
+      "target_text": " three",
+      "target_token": 1264,
+      "tokens": [
+        581,
+        1264,
+        767,
+        581,
+        1264,
+        767,
+        581
+      ],
+      "variant": "reversed"
+    },
+    {
+      "foil_text": " one",
+      "foil_token": 581,
+      "group": "periodic",
+      "id": 8,
+      "metrics": {
+        "foil_log_probability": -9.282865826507901,
+        "foil_probability": 0.00009300420725735374,
+        "forced_choice_correct": true,
+        "target_log_probability": -9.210016714338217,
+        "target_minus_foil_log_odds": 0.07284911216968437,
+        "target_probability": 0.00010003237100207507,
+        "target_rank": 1532,
+        "top1_log_probability": -6.279034114755293,
+        "top1_token": 14
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          10
+        ],
+        [
+          10,
+          14
+        ],
+        [
+          14,
+          18
+        ],
+        [
+          18,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          32
+        ]
+      ],
+      "pair": "cycle-two",
+      "prompt": " two three one two three one two",
+      "seconds": 0.01629275,
+      "target_text": " three",
+      "target_token": 1264,
+      "tokens": [
+        767,
+        1264,
+        581,
+        767,
+        1264,
+        581,
+        767
+      ],
+      "variant": "forward"
+    },
+    {
+      "foil_text": " three",
+      "foil_token": 1264,
+      "group": "periodic",
+      "id": 9,
+      "metrics": {
+        "foil_log_probability": -7.647299833290389,
+        "foil_probability": 0.00047733126448990014,
+        "forced_choice_correct": true,
+        "target_log_probability": -7.503114071697706,
+        "target_minus_foil_log_odds": 0.14418576159268381,
+        "target_probability": 0.0005513647047347053,
+        "target_rank": 191,
+        "top1_log_probability": -2.978651111689091,
+        "top1_token": 14
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          18
+        ],
+        [
+          18,
+          22
+        ],
+        [
+          22,
+          28
+        ],
+        [
+          28,
+          32
+        ]
+      ],
+      "pair": "cycle-two",
+      "prompt": " two one three two one three two",
+      "seconds": 0.016461917,
+      "target_text": " one",
+      "target_token": 581,
+      "tokens": [
+        767,
+        581,
+        1264,
+        767,
+        581,
+        1264,
+        767
+      ],
+      "variant": "reversed"
+    },
+    {
+      "foil_text": " two",
+      "foil_token": 767,
+      "group": "periodic",
+      "id": 10,
+      "metrics": {
+        "foil_log_probability": -6.73375368000655,
+        "foil_probability": 0.0011900574686916812,
+        "forced_choice_correct": false,
+        "target_log_probability": -6.859344440652157,
+        "target_minus_foil_log_odds": -0.12559076064560637,
+        "target_probability": 0.0010496017834002737,
+        "target_rank": 82,
+        "top1_log_probability": -1.8573865215124457,
+        "top1_token": 14
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          14
+        ],
+        [
+          14,
+          20
+        ],
+        [
+          20,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          34
+        ]
+      ],
+      "pair": "cycle-three",
+      "prompt": " three one two three one two three",
+      "seconds": 0.017179708,
+      "target_text": " one",
+      "target_token": 581,
+      "tokens": [
+        1264,
+        581,
+        767,
+        1264,
+        581,
+        767,
+        1264
+      ],
+      "variant": "forward"
+    },
+    {
+      "foil_text": " one",
+      "foil_token": 581,
+      "group": "periodic",
+      "id": 11,
+      "metrics": {
+        "foil_log_probability": -8.064937698008,
+        "foil_probability": 0.0003143706990971963,
+        "forced_choice_correct": true,
+        "target_log_probability": -7.912271211655542,
+        "target_minus_foil_log_odds": 0.1526664863524596,
+        "target_probability": 0.00036622186794472506,
+        "target_rank": 250,
+        "top1_log_probability": -4.231583025502908,
+        "top1_token": 14
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          14
+        ],
+        [
+          14,
+          20
+        ],
+        [
+          20,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          34
+        ]
+      ],
+      "pair": "cycle-three",
+      "prompt": " three two one three two one three",
+      "seconds": 0.017375,
+      "target_text": " two",
+      "target_token": 767,
+      "tokens": [
+        1264,
+        767,
+        581,
+        1264,
+        767,
+        581,
+        1264
+      ],
+      "variant": "reversed"
+    },
+    {
+      "foil_text": " bird",
+      "foil_token": 12621,
+      "group": "periodic",
+      "id": 12,
+      "metrics": {
+        "foil_log_probability": -7.213261217425263,
+        "foil_probability": 0.0007367505296653898,
+        "forced_choice_correct": false,
+        "target_log_probability": -8.355524321758526,
+        "target_minus_foil_log_odds": -1.1422631043332645,
+        "target_probability": 0.00023509418855492892,
+        "target_rank": 285,
+        "top1_log_probability": -6.044848951703596,
+        "top1_token": 30653
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          8
+        ],
+        [
+          8,
+          13
+        ],
+        [
+          13,
+          17
+        ],
+        [
+          17,
+          21
+        ],
+        [
+          21,
+          26
+        ],
+        [
+          26,
+          30
+        ]
+      ],
+      "pair": "cycle-cat",
+      "prompt": " cat dog bird cat dog bird cat",
+      "seconds": 0.01672825,
+      "target_text": " dog",
+      "target_token": 4370,
+      "tokens": [
+        5798,
+        4370,
+        12621,
+        5798,
+        4370,
+        12621,
+        5798
+      ],
+      "variant": "forward"
+    },
+    {
+      "foil_text": " dog",
+      "foil_token": 4370,
+      "group": "periodic",
+      "id": 13,
+      "metrics": {
+        "foil_log_probability": -6.135123989700985,
+        "foil_probability": 0.002165456706909207,
+        "forced_choice_correct": true,
+        "target_log_probability": -5.500296924672368,
+        "target_minus_foil_log_odds": 0.6348270650286176,
+        "target_probability": 0.0040855581553294225,
+        "target_rank": 26,
+        "top1_log_probability": -2.801754438387377,
+        "top1_token": 5798
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          9
+        ],
+        [
+          9,
+          13
+        ],
+        [
+          13,
+          17
+        ],
+        [
+          17,
+          22
+        ],
+        [
+          22,
+          26
+        ],
+        [
+          26,
+          30
+        ]
+      ],
+      "pair": "cycle-cat",
+      "prompt": " cat bird dog cat bird dog cat",
+      "seconds": 0.01702575,
+      "target_text": " bird",
+      "target_token": 12621,
+      "tokens": [
+        5798,
+        12621,
+        4370,
+        5798,
+        12621,
+        4370,
+        5798
+      ],
+      "variant": "reversed"
+    },
+    {
+      "foil_text": " cat",
+      "foil_token": 5798,
+      "group": "periodic",
+      "id": 14,
+      "metrics": {
+        "foil_log_probability": -8.045116165625013,
+        "foil_probability": 0.00032066417520590606,
+        "forced_choice_correct": true,
+        "target_log_probability": -7.846412437520872,
+        "target_minus_foil_log_odds": 0.19870372810414105,
+        "target_probability": 0.00039115273896405057,
+        "target_rank": 65,
+        "top1_log_probability": -6.581444933164889,
+        "top1_token": 2400
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          9
+        ],
+        [
+          9,
+          13
+        ],
+        [
+          13,
+          17
+        ],
+        [
+          17,
+          22
+        ],
+        [
+          22,
+          26
+        ],
+        [
+          26,
+          30
+        ]
+      ],
+      "pair": "cycle-dog",
+      "prompt": " dog bird cat dog bird cat dog",
+      "seconds": 0.017261417,
+      "target_text": " bird",
+      "target_token": 12621,
+      "tokens": [
+        4370,
+        12621,
+        5798,
+        4370,
+        12621,
+        5798,
+        4370
+      ],
+      "variant": "forward"
+    },
+    {
+      "foil_text": " bird",
+      "foil_token": 12621,
+      "group": "periodic",
+      "id": 15,
+      "metrics": {
+        "foil_log_probability": -7.435433722234652,
+        "foil_probability": 0.0005899730369257421,
+        "forced_choice_correct": false,
+        "target_log_probability": -7.7975235952277915,
+        "target_minus_foil_log_odds": -0.3620898729931392,
+        "target_probability": 0.00041075090604119675,
+        "target_rank": 61,
+        "top1_log_probability": -6.487413486078468,
+        "top1_token": 2400
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          8
+        ],
+        [
+          8,
+          13
+        ],
+        [
+          13,
+          17
+        ],
+        [
+          17,
+          21
+        ],
+        [
+          21,
+          26
+        ],
+        [
+          26,
+          30
+        ]
+      ],
+      "pair": "cycle-dog",
+      "prompt": " dog cat bird dog cat bird dog",
+      "seconds": 0.017780417,
+      "target_text": " cat",
+      "target_token": 5798,
+      "tokens": [
+        4370,
+        5798,
+        12621,
+        4370,
+        5798,
+        12621,
+        4370
+      ],
+      "variant": "reversed"
+    },
+    {
+      "foil_text": " dog",
+      "foil_token": 4370,
+      "group": "periodic",
+      "id": 16,
+      "metrics": {
+        "foil_log_probability": -6.988655625201202,
+        "foil_probability": 0.0009222855961119623,
+        "forced_choice_correct": true,
+        "target_log_probability": -5.390302045607471,
+        "target_minus_foil_log_odds": 1.5983535795937316,
+        "target_probability": 0.004560595619804634,
+        "target_rank": 24,
+        "top1_log_probability": -2.333011148395297,
+        "top1_token": 13
+      },
+      "offsets": [
+        [
+          0,
+          5
+        ],
+        [
+          5,
+          9
+        ],
+        [
+          9,
+          13
+        ],
+        [
+          13,
+          18
+        ],
+        [
+          18,
+          22
+        ],
+        [
+          22,
+          26
+        ],
+        [
+          26,
+          31
+        ]
+      ],
+      "pair": "cycle-bird",
+      "prompt": " bird cat dog bird cat dog bird",
+      "seconds": 0.01698675,
+      "target_text": " cat",
+      "target_token": 5798,
+      "tokens": [
+        12621,
+        5798,
+        4370,
+        12621,
+        5798,
+        4370,
+        12621
+      ],
+      "variant": "forward"
+    },
+    {
+      "foil_text": " cat",
+      "foil_token": 5798,
+      "group": "periodic",
+      "id": 17,
+      "metrics": {
+        "foil_log_probability": -6.281858073280807,
+        "foil_probability": 0.0018699229105301651,
+        "forced_choice_correct": false,
+        "target_log_probability": -7.588011129289384,
+        "target_minus_foil_log_odds": -1.306153056008577,
+        "target_probability": 0.0005064873908324391,
+        "target_rank": 171,
+        "top1_log_probability": -4.49888982413131,
+        "top1_token": 13
+      },
+      "offsets": [
+        [
+          0,
+          5
+        ],
+        [
+          5,
+          9
+        ],
+        [
+          9,
+          13
+        ],
+        [
+          13,
+          18
+        ],
+        [
+          18,
+          22
+        ],
+        [
+          22,
+          26
+        ],
+        [
+          26,
+          31
+        ]
+      ],
+      "pair": "cycle-bird",
+      "prompt": " bird dog cat bird dog cat bird",
+      "seconds": 0.017666917,
+      "target_text": " dog",
+      "target_token": 4370,
+      "tokens": [
+        12621,
+        4370,
+        5798,
+        12621,
+        4370,
+        5798,
+        12621
+      ],
+      "variant": "reversed"
+    },
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "assignment",
+      "id": 18,
+      "metrics": {
+        "foil_log_probability": -2.3205958388208057,
+        "foil_probability": 0.09821504782827029,
+        "forced_choice_correct": true,
+        "target_log_probability": -1.4125981081147838,
+        "target_minus_foil_log_odds": 0.9079977307060219,
+        "target_probability": 0.24350979579896964,
+        "target_rank": 1,
+        "top1_log_probability": -1.4125981081147838,
+        "top1_token": 4797
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          22
+        ],
+        [
+          22,
+          23
+        ],
+        [
+          23,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ]
+      ],
+      "pair": "Alice-False",
+      "prompt": " Alice's color is blue. Bob's color is green. Alice's color is",
+      "seconds": 0.022686875,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        16922,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        16922,
+        434,
+        3295,
+        310
+      ],
+      "variant": "False"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "reassignment",
+      "id": 19,
+      "metrics": {
+        "foil_log_probability": -4.297403032925196,
+        "foil_probability": 0.013603841907637344,
+        "forced_choice_correct": false,
+        "target_log_probability": -4.3349053357767815,
+        "target_minus_foil_log_odds": -0.03750230285158551,
+        "target_probability": 0.013103114410430326,
+        "target_rank": 3,
+        "top1_log_probability": -0.12311490268061398,
+        "top1_token": 1024
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          22
+        ],
+        [
+          22,
+          23
+        ],
+        [
+          23,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ],
+        [
+          62,
+          66
+        ],
+        [
+          66,
+          72
+        ],
+        [
+          72,
+          73
+        ],
+        [
+          73,
+          77
+        ],
+        [
+          77,
+          79
+        ],
+        [
+          79,
+          85
+        ],
+        [
+          85,
+          88
+        ],
+        [
+          88,
+          92
+        ],
+        [
+          92,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          104
+        ],
+        [
+          104,
+          106
+        ],
+        [
+          106,
+          112
+        ],
+        [
+          112,
+          115
+        ]
+      ],
+      "pair": "Alice-False",
+      "prompt": " Alice's color is blue. Bob's color is green. Alice's color is now green. Bob's color is now blue. Alice's color is",
+      "seconds": 0.0551295,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        16922,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        1024,
+        4759,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        1024,
+        4797,
+        15,
+        16922,
+        434,
+        3295,
+        310
+      ],
+      "variant": "False"
+    },
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "paraphrase",
+      "id": 20,
+      "metrics": {
+        "foil_log_probability": -5.595416530386749,
+        "foil_probability": 0.0037148516645928525,
+        "forced_choice_correct": false,
+        "target_log_probability": -6.246845660034004,
+        "target_minus_foil_log_odds": -0.651429129647255,
+        "target_probability": 0.0019365530588428604,
+        "target_rank": 56,
+        "top1_log_probability": -1.5585016381941514,
+        "top1_token": 1677
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          25
+        ],
+        [
+          25,
+          29
+        ],
+        [
+          29,
+          30
+        ],
+        [
+          30,
+          34
+        ],
+        [
+          34,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          48
+        ],
+        [
+          48,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          82
+        ],
+        [
+          82,
+          86
+        ]
+      ],
+      "pair": "Alice-False",
+      "prompt": " Alice was given the blue key. Bob was given the green key. The key given to Alice was",
+      "seconds": 0.025405541,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        16922,
+        369,
+        1677,
+        253,
+        4797,
+        2234,
+        15,
+        8679,
+        369,
+        1677,
+        253,
+        4759,
+        2234,
+        15,
+        380,
+        2234,
+        1677,
+        281,
+        16922,
+        369
+      ],
+      "variant": "False"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "assignment",
+      "id": 21,
+      "metrics": {
+        "foil_log_probability": -1.8245162746359558,
+        "foil_probability": 0.1612956480580921,
+        "forced_choice_correct": false,
+        "target_log_probability": -2.101429861286256,
+        "target_minus_foil_log_odds": -0.2769135866503003,
+        "target_probability": 0.12228145766861284,
+        "target_rank": 3,
+        "top1_log_probability": -1.8245162746359558,
+        "top1_token": 4797
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          23
+        ],
+        [
+          23,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ]
+      ],
+      "pair": "Alice-False",
+      "prompt": " Alice's color is green. Bob's color is blue. Alice's color is",
+      "seconds": 0.0221205,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        16922,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        16922,
+        434,
+        3295,
+        310
+      ],
+      "variant": "True"
+    },
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "reassignment",
+      "id": 22,
+      "metrics": {
+        "foil_log_probability": -4.680933140413652,
+        "foil_probability": 0.009270359302807049,
+        "forced_choice_correct": true,
+        "target_log_probability": -4.002140843828679,
+        "target_minus_foil_log_odds": 0.6787922965849731,
+        "target_probability": 0.01827646990854566,
+        "target_rank": 2,
+        "top1_log_probability": -0.09534937796848908,
+        "top1_token": 1024
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          23
+        ],
+        [
+          23,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ],
+        [
+          62,
+          66
+        ],
+        [
+          66,
+          71
+        ],
+        [
+          71,
+          72
+        ],
+        [
+          72,
+          76
+        ],
+        [
+          76,
+          78
+        ],
+        [
+          78,
+          84
+        ],
+        [
+          84,
+          87
+        ],
+        [
+          87,
+          91
+        ],
+        [
+          91,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          104
+        ],
+        [
+          104,
+          106
+        ],
+        [
+          106,
+          112
+        ],
+        [
+          112,
+          115
+        ]
+      ],
+      "pair": "Alice-False",
+      "prompt": " Alice's color is green. Bob's color is blue. Alice's color is now blue. Bob's color is now green. Alice's color is",
+      "seconds": 0.052537875,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        16922,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        1024,
+        4797,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        1024,
+        4759,
+        15,
+        16922,
+        434,
+        3295,
+        310
+      ],
+      "variant": "True"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "paraphrase",
+      "id": 23,
+      "metrics": {
+        "foil_log_probability": -6.4623097421043125,
+        "foil_probability": 0.0015611856066664763,
+        "forced_choice_correct": true,
+        "target_log_probability": -5.407299846030049,
+        "target_minus_foil_log_odds": 1.0550098960742638,
+        "target_probability": 0.004483730644086401,
+        "target_rank": 24,
+        "top1_log_probability": -1.6026509216215956,
+        "top1_token": 1677
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          26
+        ],
+        [
+          26,
+          30
+        ],
+        [
+          30,
+          31
+        ],
+        [
+          31,
+          35
+        ],
+        [
+          35,
+          39
+        ],
+        [
+          39,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          82
+        ],
+        [
+          82,
+          86
+        ]
+      ],
+      "pair": "Alice-False",
+      "prompt": " Alice was given the green key. Bob was given the blue key. The key given to Alice was",
+      "seconds": 0.024518958,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        16922,
+        369,
+        1677,
+        253,
+        4759,
+        2234,
+        15,
+        8679,
+        369,
+        1677,
+        253,
+        4797,
+        2234,
+        15,
+        380,
+        2234,
+        1677,
+        281,
+        16922,
+        369
+      ],
+      "variant": "True"
+    },
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "assignment",
+      "id": 24,
+      "metrics": {
+        "foil_log_probability": -1.9725960135848908,
+        "foil_probability": 0.13909529383529134,
+        "forced_choice_correct": false,
+        "target_log_probability": -1.9757707721339148,
+        "target_minus_foil_log_odds": -0.003174758549024048,
+        "target_probability": 0.13865440009795696,
+        "target_rank": 2,
+        "top1_log_probability": -1.9725960135848908,
+        "top1_token": 4759
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          21
+        ],
+        [
+          21,
+          22
+        ],
+        [
+          22,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ]
+      ],
+      "pair": "Alice-True",
+      "prompt": " Bob's color is green. Alice's color is blue. Alice's color is",
+      "seconds": 0.021942584,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        8679,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        16922,
+        434,
+        3295,
+        310
+      ],
+      "variant": "False"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "reassignment",
+      "id": 25,
+      "metrics": {
+        "foil_log_probability": -3.91623292989404,
+        "foil_probability": 0.01991597849686894,
+        "forced_choice_correct": false,
+        "target_log_probability": -4.411962825289317,
+        "target_minus_foil_log_odds": -0.4957298953952769,
+        "target_probability": 0.012131343238205635,
+        "target_rank": 3,
+        "top1_log_probability": -0.10202328169196129,
+        "top1_token": 1024
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          21
+        ],
+        [
+          21,
+          22
+        ],
+        [
+          22,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ],
+        [
+          60,
+          64
+        ],
+        [
+          64,
+          69
+        ],
+        [
+          69,
+          70
+        ],
+        [
+          70,
+          76
+        ],
+        [
+          76,
+          78
+        ],
+        [
+          78,
+          84
+        ],
+        [
+          84,
+          87
+        ],
+        [
+          87,
+          91
+        ],
+        [
+          91,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          104
+        ],
+        [
+          104,
+          106
+        ],
+        [
+          106,
+          112
+        ],
+        [
+          112,
+          115
+        ]
+      ],
+      "pair": "Alice-True",
+      "prompt": " Bob's color is green. Alice's color is blue. Bob's color is now blue. Alice's color is now green. Alice's color is",
+      "seconds": 0.050398125,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        8679,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        1024,
+        4797,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        1024,
+        4759,
+        15,
+        16922,
+        434,
+        3295,
+        310
+      ],
+      "variant": "False"
+    },
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "paraphrase",
+      "id": 26,
+      "metrics": {
+        "foil_log_probability": -5.595416530386749,
+        "foil_probability": 0.0037148516645928525,
+        "forced_choice_correct": false,
+        "target_log_probability": -6.246845660034004,
+        "target_minus_foil_log_odds": -0.651429129647255,
+        "target_probability": 0.0019365530588428604,
+        "target_rank": 56,
+        "top1_log_probability": -1.5585016381941514,
+        "top1_token": 1677
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          25
+        ],
+        [
+          25,
+          29
+        ],
+        [
+          29,
+          30
+        ],
+        [
+          30,
+          34
+        ],
+        [
+          34,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          48
+        ],
+        [
+          48,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          82
+        ],
+        [
+          82,
+          86
+        ]
+      ],
+      "pair": "Alice-True",
+      "prompt": " Alice was given the blue key. Bob was given the green key. The key given to Alice was",
+      "seconds": 0.024347958,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        16922,
+        369,
+        1677,
+        253,
+        4797,
+        2234,
+        15,
+        8679,
+        369,
+        1677,
+        253,
+        4759,
+        2234,
+        15,
+        380,
+        2234,
+        1677,
+        281,
+        16922,
+        369
+      ],
+      "variant": "False"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "assignment",
+      "id": 27,
+      "metrics": {
+        "foil_log_probability": -1.361380446486244,
+        "foil_probability": 0.25630671492392204,
+        "forced_choice_correct": false,
+        "target_log_probability": -2.3172361533056147,
+        "target_minus_foil_log_odds": -0.9558557068193707,
+        "target_probability": 0.09854557442363898,
+        "target_rank": 4,
+        "top1_log_probability": -1.361380446486244,
+        "top1_token": 4797
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          20
+        ],
+        [
+          20,
+          21
+        ],
+        [
+          21,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ]
+      ],
+      "pair": "Alice-True",
+      "prompt": " Bob's color is blue. Alice's color is green. Alice's color is",
+      "seconds": 0.022240833,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        8679,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        16922,
+        434,
+        3295,
+        310
+      ],
+      "variant": "True"
+    },
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "reassignment",
+      "id": 28,
+      "metrics": {
+        "foil_log_probability": -3.847171679704422,
+        "foil_probability": 0.021340007541644994,
+        "forced_choice_correct": false,
+        "target_log_probability": -4.017190226441198,
+        "target_minus_foil_log_odds": -0.17001854673677563,
+        "target_probability": 0.01800347963989299,
+        "target_rank": 3,
+        "top1_log_probability": -0.14718311034369336,
+        "top1_token": 1024
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          20
+        ],
+        [
+          20,
+          21
+        ],
+        [
+          21,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ],
+        [
+          60,
+          64
+        ],
+        [
+          64,
+          70
+        ],
+        [
+          70,
+          71
+        ],
+        [
+          71,
+          77
+        ],
+        [
+          77,
+          79
+        ],
+        [
+          79,
+          85
+        ],
+        [
+          85,
+          88
+        ],
+        [
+          88,
+          92
+        ],
+        [
+          92,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          104
+        ],
+        [
+          104,
+          106
+        ],
+        [
+          106,
+          112
+        ],
+        [
+          112,
+          115
+        ]
+      ],
+      "pair": "Alice-True",
+      "prompt": " Bob's color is blue. Alice's color is green. Bob's color is now green. Alice's color is now blue. Alice's color is",
+      "seconds": 0.046304792,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        8679,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        1024,
+        4759,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        1024,
+        4797,
+        15,
+        16922,
+        434,
+        3295,
+        310
+      ],
+      "variant": "True"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "paraphrase",
+      "id": 29,
+      "metrics": {
+        "foil_log_probability": -6.4623097421043125,
+        "foil_probability": 0.0015611856066664763,
+        "forced_choice_correct": true,
+        "target_log_probability": -5.407299846030049,
+        "target_minus_foil_log_odds": 1.0550098960742638,
+        "target_probability": 0.004483730644086401,
+        "target_rank": 24,
+        "top1_log_probability": -1.6026509216215956,
+        "top1_token": 1677
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          26
+        ],
+        [
+          26,
+          30
+        ],
+        [
+          30,
+          31
+        ],
+        [
+          31,
+          35
+        ],
+        [
+          35,
+          39
+        ],
+        [
+          39,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          82
+        ],
+        [
+          82,
+          86
+        ]
+      ],
+      "pair": "Alice-True",
+      "prompt": " Alice was given the green key. Bob was given the blue key. The key given to Alice was",
+      "seconds": 0.024750333,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        16922,
+        369,
+        1677,
+        253,
+        4759,
+        2234,
+        15,
+        8679,
+        369,
+        1677,
+        253,
+        4797,
+        2234,
+        15,
+        380,
+        2234,
+        1677,
+        281,
+        16922,
+        369
+      ],
+      "variant": "True"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "assignment",
+      "id": 30,
+      "metrics": {
+        "foil_log_probability": -1.3864925277399909,
+        "foil_probability": 0.24995046325340187,
+        "forced_choice_correct": false,
+        "target_log_probability": -2.3860405137724072,
+        "target_minus_foil_log_odds": -0.9995479860324163,
+        "target_probability": 0.0919932095613939,
+        "target_rank": 4,
+        "top1_log_probability": -1.3864925277399909,
+        "top1_token": 4797
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          22
+        ],
+        [
+          22,
+          23
+        ],
+        [
+          23,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ]
+      ],
+      "pair": "Bob-False",
+      "prompt": " Alice's color is blue. Bob's color is green. Bob's color is",
+      "seconds": 0.021728083,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        16922,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        8679,
+        434,
+        3295,
+        310
+      ],
+      "variant": "False"
+    },
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "reassignment",
+      "id": 31,
+      "metrics": {
+        "foil_log_probability": -4.021098819553467,
+        "foil_probability": 0.017933248704860485,
+        "forced_choice_correct": false,
+        "target_log_probability": -4.150356643822276,
+        "target_minus_foil_log_odds": -0.12925782426880872,
+        "target_probability": 0.015758795205560235,
+        "target_rank": 3,
+        "top1_log_probability": -0.14417090089495588,
+        "top1_token": 1024
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          22
+        ],
+        [
+          22,
+          23
+        ],
+        [
+          23,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ],
+        [
+          62,
+          66
+        ],
+        [
+          66,
+          72
+        ],
+        [
+          72,
+          73
+        ],
+        [
+          73,
+          77
+        ],
+        [
+          77,
+          79
+        ],
+        [
+          79,
+          85
+        ],
+        [
+          85,
+          88
+        ],
+        [
+          88,
+          92
+        ],
+        [
+          92,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          102
+        ],
+        [
+          102,
+          104
+        ],
+        [
+          104,
+          110
+        ],
+        [
+          110,
+          113
+        ]
+      ],
+      "pair": "Bob-False",
+      "prompt": " Alice's color is blue. Bob's color is green. Alice's color is now green. Bob's color is now blue. Bob's color is",
+      "seconds": 0.0478485,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        16922,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        1024,
+        4759,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        1024,
+        4797,
+        15,
+        8679,
+        434,
+        3295,
+        310
+      ],
+      "variant": "False"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "paraphrase",
+      "id": 32,
+      "metrics": {
+        "foil_log_probability": -6.129887362817026,
+        "foil_probability": 0.0021768261384708613,
+        "forced_choice_correct": true,
+        "target_log_probability": -5.30239807712302,
+        "target_minus_foil_log_odds": 0.8274892856940061,
+        "target_probability": 0.004979638021052461,
+        "target_rank": 20,
+        "top1_log_probability": -1.5371262801551087,
+        "top1_token": 253
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          25
+        ],
+        [
+          25,
+          29
+        ],
+        [
+          29,
+          30
+        ],
+        [
+          30,
+          34
+        ],
+        [
+          34,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          48
+        ],
+        [
+          48,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          80
+        ],
+        [
+          80,
+          84
+        ]
+      ],
+      "pair": "Bob-False",
+      "prompt": " Alice was given the blue key. Bob was given the green key. The key given to Bob was",
+      "seconds": 0.025783709,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        16922,
+        369,
+        1677,
+        253,
+        4797,
+        2234,
+        15,
+        8679,
+        369,
+        1677,
+        253,
+        4759,
+        2234,
+        15,
+        380,
+        2234,
+        1677,
+        281,
+        8679,
+        369
+      ],
+      "variant": "False"
+    },
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "assignment",
+      "id": 33,
+      "metrics": {
+        "foil_log_probability": -1.9969941417805792,
+        "foil_probability": 0.13574269391271934,
+        "forced_choice_correct": true,
+        "target_log_probability": -1.9410518840726851,
+        "target_minus_foil_log_odds": 0.05594225770789407,
+        "target_probability": 0.14355286935522524,
+        "target_rank": 2,
+        "top1_log_probability": -1.9382903463513497,
+        "top1_token": 2502
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          23
+        ],
+        [
+          23,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ]
+      ],
+      "pair": "Bob-False",
+      "prompt": " Alice's color is green. Bob's color is blue. Bob's color is",
+      "seconds": 0.023368916,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        16922,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        8679,
+        434,
+        3295,
+        310
+      ],
+      "variant": "True"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "reassignment",
+      "id": 34,
+      "metrics": {
+        "foil_log_probability": -3.6956841383689216,
+        "foil_probability": 0.02483046037961063,
+        "forced_choice_correct": false,
+        "target_log_probability": -4.529303678062922,
+        "target_minus_foil_log_odds": -0.8336195396940003,
+        "target_probability": 0.010788185508177962,
+        "target_rank": 3,
+        "top1_log_probability": -0.11371331687165664,
+        "top1_token": 1024
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          8
+        ],
+        [
+          8,
+          14
+        ],
+        [
+          14,
+          17
+        ],
+        [
+          17,
+          23
+        ],
+        [
+          23,
+          24
+        ],
+        [
+          24,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          51
+        ],
+        [
+          51,
+          53
+        ],
+        [
+          53,
+          59
+        ],
+        [
+          59,
+          62
+        ],
+        [
+          62,
+          66
+        ],
+        [
+          66,
+          71
+        ],
+        [
+          71,
+          72
+        ],
+        [
+          72,
+          76
+        ],
+        [
+          76,
+          78
+        ],
+        [
+          78,
+          84
+        ],
+        [
+          84,
+          87
+        ],
+        [
+          87,
+          91
+        ],
+        [
+          91,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          102
+        ],
+        [
+          102,
+          104
+        ],
+        [
+          104,
+          110
+        ],
+        [
+          110,
+          113
+        ]
+      ],
+      "pair": "Bob-False",
+      "prompt": " Alice's color is green. Bob's color is blue. Alice's color is now blue. Bob's color is now green. Bob's color is",
+      "seconds": 0.048134625,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        16922,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        1024,
+        4797,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        1024,
+        4759,
+        15,
+        8679,
+        434,
+        3295,
+        310
+      ],
+      "variant": "True"
+    },
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "paraphrase",
+      "id": 35,
+      "metrics": {
+        "foil_log_probability": -5.158442230066873,
+        "foil_probability": 0.005750650902948021,
+        "forced_choice_correct": false,
+        "target_log_probability": -6.364128922537521,
+        "target_minus_foil_log_odds": -1.205686692470648,
+        "target_probability": 0.0017222410115205313,
+        "target_rank": 65,
+        "top1_log_probability": -1.5216027158238319,
+        "top1_token": 253
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          26
+        ],
+        [
+          26,
+          30
+        ],
+        [
+          30,
+          31
+        ],
+        [
+          31,
+          35
+        ],
+        [
+          35,
+          39
+        ],
+        [
+          39,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          80
+        ],
+        [
+          80,
+          84
+        ]
+      ],
+      "pair": "Bob-False",
+      "prompt": " Alice was given the green key. Bob was given the blue key. The key given to Bob was",
+      "seconds": 0.025386958,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        16922,
+        369,
+        1677,
+        253,
+        4759,
+        2234,
+        15,
+        8679,
+        369,
+        1677,
+        253,
+        4797,
+        2234,
+        15,
+        380,
+        2234,
+        1677,
+        281,
+        8679,
+        369
+      ],
+      "variant": "True"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "assignment",
+      "id": 36,
+      "metrics": {
+        "foil_log_probability": -2.059533859564569,
+        "foil_probability": 0.1275133951930361,
+        "forced_choice_correct": true,
+        "target_log_probability": -1.868317720170019,
+        "target_minus_foil_log_odds": 0.19121613939454996,
+        "target_probability": 0.1543831591550968,
+        "target_rank": 1,
+        "top1_log_probability": -1.868317720170019,
+        "top1_token": 4759
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          21
+        ],
+        [
+          21,
+          22
+        ],
+        [
+          22,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ]
+      ],
+      "pair": "Bob-True",
+      "prompt": " Bob's color is green. Alice's color is blue. Bob's color is",
+      "seconds": 0.0224685,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        8679,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        8679,
+        434,
+        3295,
+        310
+      ],
+      "variant": "False"
+    },
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "reassignment",
+      "id": 37,
+      "metrics": {
+        "foil_log_probability": -4.474330927529353,
+        "foil_probability": 0.01139784555860199,
+        "forced_choice_correct": true,
+        "target_log_probability": -3.8825486938283618,
+        "target_minus_foil_log_odds": 0.5917822337009913,
+        "target_probability": 0.020598259566305958,
+        "target_rank": 2,
+        "top1_log_probability": -0.10482712649833381,
+        "top1_token": 1024
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          21
+        ],
+        [
+          21,
+          22
+        ],
+        [
+          22,
+          28
+        ],
+        [
+          28,
+          30
+        ],
+        [
+          30,
+          36
+        ],
+        [
+          36,
+          39
+        ],
+        [
+          39,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ],
+        [
+          60,
+          64
+        ],
+        [
+          64,
+          69
+        ],
+        [
+          69,
+          70
+        ],
+        [
+          70,
+          76
+        ],
+        [
+          76,
+          78
+        ],
+        [
+          78,
+          84
+        ],
+        [
+          84,
+          87
+        ],
+        [
+          87,
+          91
+        ],
+        [
+          91,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          102
+        ],
+        [
+          102,
+          104
+        ],
+        [
+          104,
+          110
+        ],
+        [
+          110,
+          113
+        ]
+      ],
+      "pair": "Bob-True",
+      "prompt": " Bob's color is green. Alice's color is blue. Bob's color is now blue. Alice's color is now green. Bob's color is",
+      "seconds": 0.046419709,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        8679,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        1024,
+        4797,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        1024,
+        4759,
+        15,
+        8679,
+        434,
+        3295,
+        310
+      ],
+      "variant": "False"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "paraphrase",
+      "id": 38,
+      "metrics": {
+        "foil_log_probability": -6.129887362817026,
+        "foil_probability": 0.0021768261384708613,
+        "forced_choice_correct": true,
+        "target_log_probability": -5.30239807712302,
+        "target_minus_foil_log_odds": 0.8274892856940061,
+        "target_probability": 0.004979638021052461,
+        "target_rank": 20,
+        "top1_log_probability": -1.5371262801551087,
+        "top1_token": 253
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          25
+        ],
+        [
+          25,
+          29
+        ],
+        [
+          29,
+          30
+        ],
+        [
+          30,
+          34
+        ],
+        [
+          34,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          48
+        ],
+        [
+          48,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          80
+        ],
+        [
+          80,
+          84
+        ]
+      ],
+      "pair": "Bob-True",
+      "prompt": " Alice was given the blue key. Bob was given the green key. The key given to Bob was",
+      "seconds": 0.024823583,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        16922,
+        369,
+        1677,
+        253,
+        4797,
+        2234,
+        15,
+        8679,
+        369,
+        1677,
+        253,
+        4759,
+        2234,
+        15,
+        380,
+        2234,
+        1677,
+        281,
+        8679,
+        369
+      ],
+      "variant": "False"
+    },
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "assignment",
+      "id": 39,
+      "metrics": {
+        "foil_log_probability": -2.362395278431359,
+        "foil_probability": 0.0941943311174103,
+        "forced_choice_correct": true,
+        "target_log_probability": -1.3248581427068906,
+        "target_minus_foil_log_odds": 1.0375371357244685,
+        "target_probability": 0.2658406678517717,
+        "target_rank": 1,
+        "top1_log_probability": -1.3248581427068906,
+        "top1_token": 4797
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          20
+        ],
+        [
+          20,
+          21
+        ],
+        [
+          21,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ]
+      ],
+      "pair": "Bob-True",
+      "prompt": " Bob's color is blue. Alice's color is green. Bob's color is",
+      "seconds": 0.021062916,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        8679,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        8679,
+        434,
+        3295,
+        310
+      ],
+      "variant": "True"
+    },
+    {
+      "foil_text": " blue",
+      "foil_token": 4797,
+      "group": "reassignment",
+      "id": 40,
+      "metrics": {
+        "foil_log_probability": -4.146473101745562,
+        "foil_probability": 0.015820114140083365,
+        "forced_choice_correct": true,
+        "target_log_probability": -3.9501442198153374,
+        "target_minus_foil_log_odds": 0.19632888193022424,
+        "target_probability": 0.019251925066085567,
+        "target_rank": 2,
+        "top1_log_probability": -0.13693623655029974,
+        "top1_token": 1024
+      },
+      "offsets": [
+        [
+          0,
+          4
+        ],
+        [
+          4,
+          6
+        ],
+        [
+          6,
+          12
+        ],
+        [
+          12,
+          15
+        ],
+        [
+          15,
+          20
+        ],
+        [
+          20,
+          21
+        ],
+        [
+          21,
+          27
+        ],
+        [
+          27,
+          29
+        ],
+        [
+          29,
+          35
+        ],
+        [
+          35,
+          38
+        ],
+        [
+          38,
+          44
+        ],
+        [
+          44,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          51
+        ],
+        [
+          51,
+          57
+        ],
+        [
+          57,
+          60
+        ],
+        [
+          60,
+          64
+        ],
+        [
+          64,
+          70
+        ],
+        [
+          70,
+          71
+        ],
+        [
+          71,
+          77
+        ],
+        [
+          77,
+          79
+        ],
+        [
+          79,
+          85
+        ],
+        [
+          85,
+          88
+        ],
+        [
+          88,
+          92
+        ],
+        [
+          92,
+          97
+        ],
+        [
+          97,
+          98
+        ],
+        [
+          98,
+          102
+        ],
+        [
+          102,
+          104
+        ],
+        [
+          104,
+          110
+        ],
+        [
+          110,
+          113
+        ]
+      ],
+      "pair": "Bob-True",
+      "prompt": " Bob's color is blue. Alice's color is green. Bob's color is now green. Alice's color is now blue. Bob's color is",
+      "seconds": 0.048379083,
+      "target_text": " green",
+      "target_token": 4759,
+      "tokens": [
+        8679,
+        434,
+        3295,
+        310,
+        4797,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        4759,
+        15,
+        8679,
+        434,
+        3295,
+        310,
+        1024,
+        4759,
+        15,
+        16922,
+        434,
+        3295,
+        310,
+        1024,
+        4797,
+        15,
+        8679,
+        434,
+        3295,
+        310
+      ],
+      "variant": "True"
+    },
+    {
+      "foil_text": " green",
+      "foil_token": 4759,
+      "group": "paraphrase",
+      "id": 41,
+      "metrics": {
+        "foil_log_probability": -5.158442230066873,
+        "foil_probability": 0.005750650902948021,
+        "forced_choice_correct": false,
+        "target_log_probability": -6.364128922537521,
+        "target_minus_foil_log_odds": -1.205686692470648,
+        "target_probability": 0.0017222410115205313,
+        "target_rank": 65,
+        "top1_log_probability": -1.5216027158238319,
+        "top1_token": 253
+      },
+      "offsets": [
+        [
+          0,
+          6
+        ],
+        [
+          6,
+          10
+        ],
+        [
+          10,
+          16
+        ],
+        [
+          16,
+          20
+        ],
+        [
+          20,
+          26
+        ],
+        [
+          26,
+          30
+        ],
+        [
+          30,
+          31
+        ],
+        [
+          31,
+          35
+        ],
+        [
+          35,
+          39
+        ],
+        [
+          39,
+          45
+        ],
+        [
+          45,
+          49
+        ],
+        [
+          49,
+          54
+        ],
+        [
+          54,
+          58
+        ],
+        [
+          58,
+          59
+        ],
+        [
+          59,
+          63
+        ],
+        [
+          63,
+          67
+        ],
+        [
+          67,
+          73
+        ],
+        [
+          73,
+          76
+        ],
+        [
+          76,
+          80
+        ],
+        [
+          80,
+          84
+        ]
+      ],
+      "pair": "Bob-True",
+      "prompt": " Alice was given the green key. Bob was given the blue key. The key given to Bob was",
+      "seconds": 0.025549167,
+      "target_text": " blue",
+      "target_token": 4797,
+      "tokens": [
+        16922,
+        369,
+        1677,
+        253,
+        4759,
+        2234,
+        15,
+        8679,
+        369,
+        1677,
+        253,
+        4797,
+        2234,
+        15,
+        380,
+        2234,
+        1677,
+        281,
+        8679,
+        369
+      ],
+      "variant": "True"
+    }
+  ],
+  "scope": "Native context-conditioned next-token behavior only; no mechanism recovery, acceptance verdict or neural numerical certificate. Forced choice can succeed at negligible absolute probability; probabilities and ranks are reported.",
+  "tokenizer_sha256": "d4c0d99d84af59e9126913fafe5210822963e9a3065ee43e6833b358b0c2f825",
+  "total_seconds": 4.468364917
+}

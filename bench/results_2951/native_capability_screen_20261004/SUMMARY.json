@@ -1,0 +1,19 @@
+{
+  "purpose": "Check that candidate models exhibit the behavior before attempting mechanistic recovery. No fitted explanation, method benchmark or compression claim.",
+  "selection": "Same 42 semantic prompts. Pythia was selected after observing weak four-layer results; this is exploratory model selection, not untouched heldout evaluation.",
+  "conclusion": "Neither model reliably follows counterbalanced ownership or periodic order on this panel; these cases do not justify claiming a recovered binding procedure.",
+  "limits": [
+    "Absence on this panel is not proof of absence on all tasks.",
+    "The eight paraphrase records contain only four unique contexts.",
+    "Native operational Rust f64; these files alone do not supply independent HF forward parity.",
+    "Predicting the correct member of a two-token comparison is weaker than accurate next-token generation."
+  ],
+  "files_sha256": {
+    "vpd4l/FIXTURES.json": "128efe8177f2975bae4aae95326db75efde55c3edb77afb4d534fed9306fff16",
+    "vpd4l/HOST.json": "24ac4ec332094e71a6e06ea3bdc2e093a1106e400dd379032c97111755113f3f",
+    "vpd4l/SUMMARY.json": "b793537948493da28ecf26a2095f746a199a3d10b8560579d28aca0a80631e65",
+    "pythia160/FIXTURES.json": "ad259df15aa3ef9db2f8843973d1f6e980844e70e567caae4e4bd1a93771a885",
+    "pythia160/HOST.json": "66941ca6b10e79dc2d2bc7b6cfef06a0895f422a061b10f7e7f7bf00e33d55b8",
+    "pythia160/SUMMARY.json": "fca0df72edc7daafdc867dfd23adff1f750c85fc157735a4682d1bb7d66a51ae"
+  }
+}
