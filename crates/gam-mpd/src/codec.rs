@@ -283,16 +283,85 @@ impl<'a> BitReader<'a> {
             self.position += known.len_bits();
             return true;
         }
+        // Unaligned: each whole witness byte is two shifted message bytes. Blocks compare without
+        // early exit inside (so they vectorize), with an exit between blocks; large codewords
+        // compare their blocks in parallel.
+        let start = (self.position / 8) as usize;
+        let offset = (self.position % 8) as u32;
+        let full = (known.len_bits() / 8) as usize;
+        let source = &self.bits.bytes[start..];
+        let block = |range: std::ops::Range<usize>| -> bool {
+            source[range.start..range.end].iter().zip(&source[range.start + 1..=range.end]).zip(&known.bytes[range.clone()])
+                .fold(0u8, |acc, ((&a, &b), &k)| acc | (((a << offset) | (b >> (8 - offset))) ^ k)) == 0
+        };
+        const BLOCK: usize = 1 << 16;
+        let blocks = full.div_ceil(BLOCK);
+        let whole = if full >= 64 * BLOCK {
+            use rayon::prelude::*;
+            (0..blocks).into_par_iter().all(|i| block(i * BLOCK..((i + 1) * BLOCK).min(full)))
+        } else {
+            (0..blocks).all(|i| block(i * BLOCK..((i + 1) * BLOCK).min(full)))
+        };
+        if !whole {
+            return false;
+        }
         let mut candidate = self.clone();
-        let mut witness = known.reader();
-        while witness.remaining_bits() != 0 {
-            let width = witness.remaining_bits().min(64) as u32;
-            if candidate.read_bits(width).expect("length checked") != witness.read_bits(width).expect("witness length checked") {
-                return false;
-            }
+        candidate.position += (full as u64) * 8;
+        let tail = (known.len_bits() % 8) as u32;
+        if tail != 0 && candidate.read_bits(tail).expect("length checked") != u64::from(known.bytes[full] >> (8 - tail)) {
+            return false;
         }
         self.position = candidate.position;
         true
+    }
+
+    /// The next bits as one left-aligned word (most significant first) and how many of its
+    /// 64 bits the message still holds; bits past the end read as zero. Nothing is consumed.
+    fn peek64(&self) -> (u64, u32) {
+        let valid = self.remaining_bits().min(64) as u32;
+        if valid == 0 {
+            return (0, 0);
+        }
+        let start = (self.position / 8) as usize;
+        let offset = (self.position % 8) as u32;
+        let available = &self.bits.bytes[start..];
+        let word = if available.len() >= 9 {
+            let word = u64::from_be_bytes(available[..8].try_into().expect("eight bytes"));
+            if offset == 0 { word } else { (word << offset) | (u64::from(available[8]) >> (8 - offset)) }
+        } else {
+            let mut word = 0u64;
+            for (k, &byte) in available.iter().take(8).enumerate() {
+                word |= u64::from(byte) << (56 - 8 * k);
+            }
+            let next = available.get(8).map_or(0, |&b| u64::from(b));
+            if offset == 0 { word } else { (word << offset) | (next >> (8 - offset)) }
+        };
+        // Clear the padding (and anything past a bounded reader's end).
+        (if valid == 64 { word } else { word & !(u64::MAX >> valid) }, valid)
+    }
+
+    /// The bit position of the cursor within its message.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// A reader of exactly the bits `start..stop` of this message, which must end within this
+    /// reader's bound. This cursor is unchanged.
+    pub fn window(&self, start: u64, stop: u64) -> Result<Self, CodecError> {
+        if start > stop || stop > self.end {
+            return Err(CodecError::InvalidInput(format!("bits {start}..{stop} beyond a reader ending at {}", self.end)));
+        }
+        Ok(Self { bits: self.bits, position: start, end: stop })
+    }
+
+    /// Move the cursor forward to bit `position`, which must lie within this reader.
+    pub fn skip_to(&mut self, position: u64) -> Result<(), CodecError> {
+        if position < self.position {
+            return Err(CodecError::InvalidInput(format!("a skip back from bit {} to {position}", self.position)));
+        }
+        self.require(position - self.position)?;
+        self.position = position;
+        Ok(())
     }
 
     fn require(&self, needed: u64) -> Result<(), CodecError> {
@@ -739,6 +808,11 @@ pub fn encode_elias_delta(out: &mut BitString, value: u64) -> Result<(), CodecEr
     let low = u64::BITS - 1 - value.leading_zeros();
     let length = u64::from(low) + 1;
     let length_bits = u64::BITS - length.leading_zeros();
+    let total = 2 * (length_bits - 1) + 1 + low;
+    if total <= u64::BITS {
+        // The leading zeros are the high zero bits of one `total`-bit field.
+        return out.push_bits((length << low) | (value ^ (1u64 << low)), total);
+    }
     for _ in 1..length_bits {
         out.push_bit(false);
     }
@@ -746,8 +820,44 @@ pub fn encode_elias_delta(out: &mut BitString, value: u64) -> Result<(), CodecEr
     out.push_bits(value & ((1u64 << low) - 1), low)
 }
 
+/// The bit length and value of the Elias δ codeword at the front of `word` (the next `valid`
+/// message bits, left-aligned), when all of it lies in the word; `None` otherwise.
+fn elias_delta_in_word(word: u64, valid: u32) -> Option<(u32, u64)> {
+    let zeros = word.leading_zeros();
+    if zeros >= 32 || 2 * zeros + 1 > valid {
+        return None;
+    }
+    let length = (word << zeros) >> (63 - zeros);
+    let low = length - 1;
+    let total = 2 * u64::from(zeros) + length;
+    if low >= 64 || total > u64::from(valid) {
+        return None;
+    }
+    let bits = if low == 0 { 0 } else { (word << (2 * zeros + 1)) >> (64 - low) };
+    Some((total as u32, (1u64 << low) | bits))
+}
+
 /// Read one Elias δ codeword ([`encode_elias_delta`]).
 pub fn decode_elias_delta(reader: &mut BitReader<'_>) -> Result<u64, CodecError> {
+    let (word, valid) = reader.peek64();
+    if let Some((bits, value)) = elias_delta_in_word(word, valid) {
+        reader.position += u64::from(bits);
+        return Ok(value);
+    }
+    decode_elias_delta_bitwise(reader)
+}
+
+/// Pass over one Elias δ codeword without forming its value; the same codewords are refused.
+pub fn skip_elias_delta(reader: &mut BitReader<'_>) -> Result<(), CodecError> {
+    let (word, valid) = reader.peek64();
+    if let Some((bits, _)) = elias_delta_in_word(word, valid) {
+        reader.position += u64::from(bits);
+        return Ok(());
+    }
+    decode_elias_delta_bitwise(reader).map(|_| ())
+}
+
+fn decode_elias_delta_bitwise(reader: &mut BitReader<'_>) -> Result<u64, CodecError> {
     let mut zeros = 0u32;
     while !reader.read_bit()? {
         zeros += 1;
@@ -776,7 +886,12 @@ pub fn encode_signed_delta(out: &mut BitString, value: i64) -> Result<(), CodecE
 
 /// Read one signed δ codeword ([`encode_signed_delta`]).
 pub fn decode_signed_delta(reader: &mut BitReader<'_>) -> Result<i64, CodecError> {
-    Ok(unzigzag(decode_elias_delta(reader)? - 1))
+    Ok(signed_delta_of_codeword(decode_elias_delta(reader)?))
+}
+
+/// The signed value of an Elias δ codeword value `≥ 1` read by [`decode_elias_delta`].
+pub(crate) fn signed_delta_of_codeword(value: u64) -> i64 {
+    unzigzag(value - 1)
 }
 
 /// `⌈log₂ M⌉`: the width of a fixed index into an alphabet of `M ≥ 1` symbols the

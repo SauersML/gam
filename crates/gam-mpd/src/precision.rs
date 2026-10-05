@@ -272,6 +272,11 @@ impl LatticeCode {
     pub fn indices(&self) -> &[i64] {
         &self.indices
     }
+
+    /// The transmitted lattice indices, owned.
+    pub fn into_indices(self) -> Vec<i64> {
+        self.indices
+    }
 }
 
 impl DecodableArtifact for LatticeCode {

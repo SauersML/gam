@@ -1146,9 +1146,15 @@ impl Artifact {
         let derived: std::collections::BTreeSet<usize> = self.derived.iter().map(|d| d.operator).collect();
         let mut out = self.clone();
         let mut changed = false;
-        for (i, op) in out.program.operators.iter_mut().enumerate() {
-            if !derived.contains(&i) && !has_f32_reals(op) {
-                *op = Arc::new(f32_operator(op)?);
+        let rounded = {
+            use rayon::prelude::*;
+            out.program.operators.par_iter().enumerate()
+                .map(|(i, op)| if !derived.contains(&i) && !has_f32_reals(op) { f32_operator(op).map(|r| Some(Arc::new(r))) } else { Ok(None) })
+                .collect::<Result<Vec<_>, String>>()?
+        };
+        for (op, rounded) in out.program.operators.iter_mut().zip(rounded) {
+            if let Some(rounded) = rounded {
+                *op = rounded;
                 changed = true;
             }
         }

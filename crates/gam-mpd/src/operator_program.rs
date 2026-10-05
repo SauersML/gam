@@ -84,8 +84,9 @@ use super::codec::{
     decode_signed_prefix_integer, decode_subset, elias_delta_len_bits, encode_elias_delta, encode_fixed_index,
     encode_prefix_integer, encode_signed_delta, encode_signed_prefix_integer, encode_subset, fixed_index_len_bits,
     prefix_integer_len_bits, signed_delta_len_bits,
-    signed_prefix_integer_len_bits, subset_code_len_bits,
+    signed_prefix_integer_len_bits, skip_elias_delta, subset_code_len_bits,
 };
+use rayon::prelude::*;
 use super::precision::{DecodableArtifact, DeclaredPrecision, LatticeCode};
 use super::secant::BandedMatrix;
 use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
@@ -3217,16 +3218,38 @@ fn read_interface(reader: &mut BitReader<'_>) -> Result<Interface, ProgramError>
 
 /// The length of [`write_lattice`]'s message.
 fn lattice_bits(reals: &[f64], precision: DeclaredPrecision) -> Result<u64, ProgramError> {
-    ordered_lattice_bits(LatticeCode::encode(reals, precision).map_err(ProgramError::Code)?.indices(), precision, &[])
+    ordered_lattice_bits(&lattice_indices(reals, precision)?, precision, &[])
+}
+
+/// Reals per lattice chunk. A lattice of more reals is indexed, sized and encoded chunk by chunk in
+/// parallel, and decoded so when its chunk boundaries are known; its message is the same.
+const LATTICE_CHUNK: usize = 1 << 18;
+
+/// The lattice indices of `reals` ([`LatticeCode::encode`]), large lattices in parallel chunks.
+fn lattice_indices(reals: &[f64], precision: DeclaredPrecision) -> Result<Vec<i64>, ProgramError> {
+    if reals.len() <= LATTICE_CHUNK {
+        return Ok(LatticeCode::encode(reals, precision).map_err(ProgramError::Code)?.into_indices());
+    }
+    let chunks = reals
+        .par_chunks(LATTICE_CHUNK)
+        .enumerate()
+        .map(|(c, chunk)| {
+            LatticeCode::encode(chunk, precision)
+                .map(LatticeCode::into_indices)
+                .map_err(|error| ProgramError::Code(format!("lattice chunk at real {}: {error}", c * LATTICE_CHUNK)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(chunks.concat())
 }
 
 /// The length of a lattice message whose reals at `leads` after the first are sent as increments.
 fn ordered_lattice_bits(indices: &[i64], precision: DeclaredPrecision, leads: &[usize]) -> Result<u64, ProgramError> {
     let mut bits = prefix_integer_len_bits(indices.len() as u64 + 1)?
         + signed_prefix_integer_len_bits(i64::from(precision.fraction_bits()))?;
-    for &index in indices {
-        bits += signed_delta_len_bits(index)?;
-    }
+    bits += indices
+        .par_chunks(LATTICE_CHUNK)
+        .map(|chunk| chunk.iter().try_fold(0u64, |sum, &index| Ok::<_, CodecError>(sum + signed_delta_len_bits(index)?)))
+        .try_reduce(|| 0, |a, b| Ok(a + b))?;
     for pair in leads.windows(2) {
         bits -= signed_delta_len_bits(indices[pair[1]])?;
         bits += elias_delta_len_bits(increment(indices[pair[0]], indices[pair[1]])? + 1)?;
@@ -3263,10 +3286,14 @@ fn row_leads(rows: &Interface, cols: &Interface, present: &Array2<bool>) -> Opti
 /// The leads of a dense operator sent as the ordered kind: its rows' first reals do not decrease,
 /// and the ordered message is strictly shorter than the plain one.
 fn ordered_leads(operator: &Operator) -> Result<Option<Vec<usize>>, ProgramError> {
+    let OperatorBody::Dense { precision, .. } = &operator.body else { return Ok(None) };
+    ordered_leads_of(operator, &lattice_indices(&operator.present_reals(), *precision)?)
+}
+
+/// [`ordered_leads`] given the operator's lattice indices.
+fn ordered_leads_of(operator: &Operator, indices: &[i64]) -> Result<Option<Vec<usize>>, ProgramError> {
     let OperatorBody::Dense { present, precision, .. } = &operator.body else { return Ok(None) };
     let Some(leads) = row_leads(&operator.rows, &operator.cols, present) else { return Ok(None) };
-    let code = LatticeCode::encode(&operator.present_reals(), *precision).map_err(ProgramError::Code)?;
-    let indices = code.indices();
     if leads.windows(2).any(|pair| indices[pair[1]] < indices[pair[0]]) {
         return Ok(None);
     }
@@ -3278,12 +3305,37 @@ fn ordered_leads(operator: &Operator) -> Result<Option<Vec<usize>>, ProgramError
 /// signed prefix code, then each lattice index in the signed Elias δ code, whose subadditivity
 /// (`codec::elias_delta_len_bits`) keeps a split of a real from ever being shorter than the real.
 fn write_lattice(out: &mut BitString, reals: &[f64], precision: DeclaredPrecision, leads: &[usize]) -> Result<(), ProgramError> {
-    let code = LatticeCode::encode(reals, precision).map_err(ProgramError::Code)?;
-    let indices = code.indices();
-    encode_prefix_integer(out, reals.len() as u64 + 1)?;
+    write_lattice_indices(out, &lattice_indices(reals, precision)?, precision, leads)
+}
+
+/// [`write_lattice`] given the lattice indices. Chunks of a large lattice are encoded in parallel
+/// and appended in order, so the message is bit-identical to the sequential one.
+fn write_lattice_indices(out: &mut BitString, indices: &[i64], precision: DeclaredPrecision, leads: &[usize]) -> Result<(), ProgramError> {
+    encode_prefix_integer(out, indices.len() as u64 + 1)?;
     encode_signed_prefix_integer(out, i64::from(precision.fraction_bits()))?;
-    let mut lead = 0;
-    for (k, &index) in indices.iter().enumerate() {
+    if indices.len() <= LATTICE_CHUNK {
+        return write_index_range(out, indices, leads, 0..indices.len());
+    }
+    let chunks = (0..indices.len().div_ceil(LATTICE_CHUNK))
+        .into_par_iter()
+        .map(|c| {
+            let mut chunk = BitString::new();
+            write_index_range(&mut chunk, indices, leads, c * LATTICE_CHUNK..((c + 1) * LATTICE_CHUNK).min(indices.len()))?;
+            Ok(chunk)
+        })
+        .collect::<Result<Vec<_>, ProgramError>>()?;
+    for chunk in &chunks {
+        out.append(chunk);
+    }
+    Ok(())
+}
+
+/// The codewords of `indices[range]`: increments at leads after the first, signed δ otherwise.
+fn write_index_range(out: &mut BitString, indices: &[i64], leads: &[usize], range: Range<usize>) -> Result<(), ProgramError> {
+    // Leads are increasing; those before the range were passed by the sequential writer.
+    let mut lead = leads.partition_point(|l| *l < range.start);
+    for k in range {
+        let index = indices[k];
         if lead < leads.len() && leads[lead] == k {
             lead += 1;
             if lead > 1 {
@@ -3294,6 +3346,82 @@ fn write_lattice(out: &mut BitString, reals: &[f64], precision: DeclaredPrecisio
         encode_signed_delta(out, index)?;
     }
     Ok(())
+}
+
+/// Pass over a [`write_lattice`] message, returning the bit position of every [`LATTICE_CHUNK`]th
+/// index codeword (the first after the precision). The same codewords are refused as on reading.
+fn skip_lattice(reader: &mut BitReader<'_>) -> Result<Vec<u64>, ProgramError> {
+    let count = decode_prefix_integer(reader)? - 1;
+    if count > reader.remaining_bits() {
+        return Err(ProgramError::Code(format!("a lattice of {count} reals beyond the message")));
+    }
+    decode_signed_prefix_integer(reader)?;
+    let mut starts = Vec::with_capacity((count as usize).div_ceil(LATTICE_CHUNK).max(1));
+    for k in 0..count as usize {
+        if k % LATTICE_CHUNK == 0 {
+            starts.push(reader.position());
+        }
+        skip_elias_delta(reader)?;
+    }
+    Ok(starts)
+}
+
+/// [`read_lattice`] with known chunk starts ([`skip_lattice`]): chunks decode in parallel, each
+/// required to end exactly where the next begins, and the lattice to end the reader. Every
+/// codeword is read exactly as [`read_lattice`] reads it, so the result is the same.
+fn read_lattice_chunked(reader: &mut BitReader<'_>, leads: &[usize], starts: &[u64]) -> Result<(DeclaredPrecision, Vec<f64>), ProgramError> {
+    let count = decode_prefix_integer(reader)? - 1;
+    if count > reader.remaining_bits() {
+        return Err(ProgramError::Code(format!("a lattice of {count} reals beyond the message")));
+    }
+    let fraction_bits = i32::try_from(decode_signed_prefix_integer(reader)?)
+        .map_err(|error| ProgramError::Code(format!("fraction bits: {error}")))?;
+    let precision = DeclaredPrecision::new(fraction_bits).map_err(ProgramError::Code)?;
+    let count = count as usize;
+    if starts.len() != count.div_ceil(LATTICE_CHUNK) || starts.first().is_some_and(|s| *s != reader.position()) {
+        return Err(ProgramError::Code("lattice chunk starts do not match the message".into()));
+    }
+    let end = reader.position() + reader.remaining_bits();
+    let span = gam_gpu::trace::host_span("codec.lattice.chunks");
+    let raw = starts
+        .par_iter()
+        .enumerate()
+        .map(|(c, &start)| {
+            let stop = starts.get(c + 1).copied().unwrap_or(end);
+            let mut part = reader.window(start, stop)?;
+            let n = LATTICE_CHUNK.min(count - c * LATTICE_CHUNK);
+            let values = (0..n).map(|_| decode_elias_delta(&mut part)).collect::<Result<Vec<u64>, _>>()?;
+            part.finish()?;
+            Ok(values)
+        })
+        .collect::<Result<Vec<_>, ProgramError>>()?
+        .concat();
+    drop(span);
+    let span = gam_gpu::trace::host_span("codec.lattice.values");
+    reader.skip_to(end)?;
+    let mut indices: Vec<i64> = Vec::with_capacity(count);
+    let mut lead = 0;
+    for (k, value) in raw.into_iter().enumerate() {
+        if lead < leads.len() && leads[lead] == k {
+            lead += 1;
+            if lead > 1 {
+                let step = value - 1;
+                let previous = indices[leads[lead - 2]];
+                let index = i64::try_from(i128::from(previous) + i128::from(step))
+                    .map_err(|_| ProgramError::Code(format!("an ordered increment {step} overflows")))?;
+                indices.push(index);
+                continue;
+            }
+        }
+        indices.push(crate::codec::signed_delta_of_codeword(value));
+    }
+    if lead != leads.len() {
+        return Err(ProgramError::Code(format!("{} ordered rows for {count} reals", leads.len())));
+    }
+    let code = LatticeCode::from_indices(precision, indices).map_err(ProgramError::Code)?;
+    let values = code.decode().map_err(ProgramError::Code)?;
+    drop(span);
+    Ok((precision, values))
 }
 
 /// Read a [`write_lattice`] message with the given leads: the precision and the decoded reals.
@@ -3722,6 +3850,12 @@ pub struct NativeOperatorCodec {
     declarations: Declarations,
     entries: Vec<NativeOperatorCodeword>,
     source_indices: BTreeMap<usize, usize>,
+    /// Entries by (prefix length, hash of their first `prefix length` bits), the prefix being
+    /// the whole codeword or its first [`CODEWORD_PREFIX_BITS`]; and the distinct lengths.
+    prefixes: std::collections::HashMap<(u64, u64), Vec<usize>>,
+    prefix_lengths: Vec<u64>,
+    /// Entries by [`content_key`], for operators equal to a witnessed one but not its Arc.
+    contents: std::collections::HashMap<u64, Vec<usize>>,
     stats: NativeOperatorCodecStats,
     encoded_hits: std::sync::atomic::AtomicU64,
     decoded_hits: std::sync::atomic::AtomicU64,
@@ -3747,6 +3881,23 @@ pub struct NativeOperatorCodecUsage {
     pub encoded_native_operator_hits: u64,
     pub decoded_native_operator_hits: u64,
 }
+/// Bits of a codeword that key its content lookup when its operator index moved.
+const CODEWORD_PREFIX_BITS: u64 = 256;
+
+/// A hash of the next `bits` bits (at most what remains); nothing is consumed.
+fn prefix_hash(reader: &BitReader<'_>, bits: u64) -> Result<u64, CodecError> {
+    use std::hash::Hasher;
+    let mut peek = reader.clone();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut left = bits;
+    while left != 0 {
+        let width = left.min(64) as u32;
+        hasher.write_u64(peek.read_bits(width)?);
+        left -= u64::from(width);
+    }
+    Ok(hasher.finish())
+}
+
 fn operator_numeric_bytes(operator: &Operator) -> Result<usize, ProgramError> {
     let (reals, mask) = match &operator.body {
         OperatorBody::Identity => (0, 0),
@@ -3768,12 +3919,58 @@ fn operator_numeric_bytes(operator: &Operator) -> Result<usize, ProgramError> {
 }
 fn witnessed_operator_equal(source: &Operator, decoded: &Operator) -> bool {
     // Full metadata as well as bits: signed zero must not permit substitution.
+    source.name == decoded.name
+        && source.provenance == decoded.provenance
+        && same_codeword_content(source, decoded)
+}
+/// A lookup key of an operator's codeword content (interfaces, kind, precision, shapes and a few
+/// sampled reals). Only a lookup: [`same_codeword_content`] licenses every reuse.
+fn content_key(operator: &Operator) -> u64 {
+    use std::hash::{Hash, Hasher};
+    type State = std::collections::hash_map::DefaultHasher;
+    // Eight evenly spaced reals in logical order, by index (no scan of the tensor).
+    fn sample(len: usize, value: impl Fn(usize) -> f64, state: &mut State) {
+        len.hash(state);
+        for k in 0..len.min(8) {
+            value(k * len / len.min(8)).to_bits().hash(state);
+        }
+    }
+    fn matrix(a: &Array2<f64>, state: &mut State) {
+        a.dim().hash(state);
+        sample(a.len(), |i| a[[i / a.ncols(), i % a.ncols()]], state);
+    }
+    let mut state = State::new();
+    operator.rows.hash(&mut state);
+    operator.cols.hash(&mut state);
+    match &operator.body {
+        OperatorBody::Identity => 0_u8.hash(&mut state),
+        OperatorBody::Diagonal { values, precision } => {
+            1_u8.hash(&mut state);
+            precision.hash(&mut state);
+            sample(values.len(), |i| values[i], &mut state);
+        }
+        OperatorBody::Dense { values, present, precision } => {
+            2_u8.hash(&mut state);
+            precision.hash(&mut state);
+            present.dim().hash(&mut state);
+            matrix(values, &mut state);
+        }
+        OperatorBody::LowRank { left, right, precision } => {
+            3_u8.hash(&mut state);
+            precision.hash(&mut state);
+            matrix(left, &mut state);
+            matrix(right, &mut state);
+        }
+    }
+    state.finish()
+}
+/// Whether two operators have the same codeword: interfaces and every body bit, signed zero
+/// included. Names and provenance are not on the wire.
+fn same_codeword_content(source: &Operator, decoded: &Operator) -> bool {
     let matrix = |a: &Array2<f64>, b: &Array2<f64>| {
         a.dim() == b.dim() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
     };
-    source.name == decoded.name
-        && source.provenance == decoded.provenance
-        && source.rows == decoded.rows
+    source.rows == decoded.rows
         && source.cols == decoded.cols
         && match (&source.body, &decoded.body) {
             (OperatorBody::Identity, OperatorBody::Identity) => true,
@@ -3824,6 +4021,8 @@ impl NativeOperatorCodec {
         source.interfaces()?;
         let mut entries = Vec::new();
         let mut source_indices = BTreeMap::new();
+        let mut prefixes: std::collections::HashMap<(u64, u64), Vec<usize>> = std::collections::HashMap::new();
+        let mut contents: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
         let mut stats = NativeOperatorCodecStats {
             operators: source.operators.len(),
             encoded_capacity_bytes: 0,
@@ -3868,6 +4067,9 @@ impl NativeOperatorCodec {
             };
             source_indices.insert(Arc::as_ptr(operator) as usize, index);
             source_indices.insert(Arc::as_ptr(&decoded) as usize, index);
+            let length = message.len_bits().min(CODEWORD_PREFIX_BITS);
+            prefixes.entry((length, prefix_hash(&message.reader(), length)?)).or_default().push(index);
+            contents.entry(content_key(&decoded)).or_default().push(index);
             entries.push(NativeOperatorCodeword {
                 source: Arc::downgrade(operator),
                 message,
@@ -3875,10 +4077,16 @@ impl NativeOperatorCodec {
             });
         }
         stats.initialization_seconds = started.elapsed().as_secs_f64();
+        let mut prefix_lengths: Vec<u64> = prefixes.keys().map(|(length, _)| *length).collect();
+        prefix_lengths.sort_unstable();
+        prefix_lengths.dedup();
         Ok(Self {
             declarations: source.declarations.clone(),
             entries,
             source_indices,
+            prefixes,
+            prefix_lengths,
+            contents,
             stats,
             encoded_hits: std::sync::atomic::AtomicU64::new(0),
             decoded_hits: std::sync::atomic::AtomicU64::new(0),
@@ -3905,26 +4113,56 @@ impl NativeOperatorCodec {
         }
         Ok(())
     }
+    /// The witnessed codeword of `operator`: by its Arc (the source's or the decoded one), else
+    /// by exact codeword content (a renamed copy, say).
     fn codeword(&self, operator: &Arc<Operator>) -> Option<&BitString> {
-        let entry = &self.entries[*self.source_indices.get(&(Arc::as_ptr(operator) as usize))?];
-        if !Arc::ptr_eq(&entry.decoded, operator) {
-            let source = entry.source.upgrade()?;
-            if !Arc::ptr_eq(&source, operator) { return None; }
-        }
+        let by_arc = self
+            .source_indices
+            .get(&(Arc::as_ptr(operator) as usize))
+            .map(|&index| &self.entries[index])
+            .filter(|entry| {
+                Arc::ptr_eq(&entry.decoded, operator)
+                    || entry.source.upgrade().is_some_and(|source| Arc::ptr_eq(&source, operator))
+            });
+        let entry = by_arc.or_else(|| {
+            self.contents
+                .get(&content_key(operator))?
+                .iter()
+                .map(|&index| &self.entries[index])
+                .find(|entry| same_codeword_content(&entry.decoded, operator))
+        })?;
         self.encoded_hits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(&entry.message)
     }
+    /// The operator whose witnessed codeword is next, consuming it; exactly what the ordinary
+    /// decoder reads there. The entry at the same index is tried first and shared. Otherwise any
+    /// entry whose prefix hash matches is tried: operator codewords are prefix-free, so a complete
+    /// match is the codeword here, and its body is copied under this index's decoder label
+    /// (a memory copy, not a decode; [`Self::codeword`] recognizes the copy by content).
     fn decode_at(&self, reader: &mut BitReader<'_>, index: u64) -> Option<Arc<Operator>> {
-        // Ordinary labels are decoded{current_index}; shifted/permuted bodies use
-        // the ordinary decoder rather than changing labels or cloning matrices.
-        let entry = self.entries.get(usize::try_from(index).ok()?)?;
-        if !reader.consume_exact_prefix(&entry.message) {
-            return None;
+        // An index beyond usize has no entry.
+        let at = usize::try_from(index).unwrap_or(usize::MAX);
+        if let Some(entry) = self.entries.get(at).filter(|entry| reader.consume_exact_prefix(&entry.message)) {
+            self.decoded_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(Arc::clone(&entry.decoded));
         }
+        let remaining = reader.remaining_bits();
+        let moved = self.prefix_lengths.iter().take_while(|length| **length <= remaining).find_map(|&length| {
+            let key = (length, prefix_hash(reader, length).ok()?);
+            self.prefixes.get(&key)?.iter().filter(|e| **e != at).find_map(|&e| {
+                let entry = &self.entries[e];
+                reader.consume_exact_prefix(&entry.message).then_some(entry)
+            })
+        })?;
         self.decoded_hits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(Arc::clone(&entry.decoded))
+        Some(Arc::new(Operator {
+            name: format!("decoded{index}"),
+            provenance: Provenance::default(),
+            ..(*moved.decoded).clone()
+        }))
     }
 }
 
@@ -3951,7 +4189,8 @@ fn encode_operator(out: &mut BitString, operator: &Operator) -> Result<(), Progr
         OperatorBody::Dense {
             present, precision, ..
         } => {
-            let leads = ordered_leads(operator)?;
+            let indices = lattice_indices(&operator.present_reals(), *precision)?;
+            let leads = ordered_leads_of(operator, &indices)?;
             encode_fixed_index(out, if leads.is_some() { 3 } else { 1 }, OPERATOR_KINDS)?;
             write_interface(out, &operator.rows)?;
             write_interface(out, &operator.cols)?;
@@ -3964,26 +4203,79 @@ fn encode_operator(out: &mut BitString, operator: &Operator) -> Result<(), Progr
                     .collect();
                 encode_subset(out, operator.cols.group_count(), &kept)?;
             }
-            write_lattice(
-                out,
-                &operator.present_reals(),
-                *precision,
-                leads.as_deref().unwrap_or(&[]),
-            )?;
+            write_lattice_indices(out, &indices, *precision, leads.as_deref().unwrap_or(&[]))?;
         }
     }
     Ok(())
 }
 
 fn decode_operator(reader: &mut BitReader<'_>, index: u64) -> Result<Arc<Operator>, ProgramError> {
+    decode_operator_with(reader, index, None)
+}
+
+/// An operator codeword's structure: everything before its lattice.
+struct OperatorHeader {
+    kind: usize,
+    rows: Interface,
+    cols: Option<Interface>,
+    rank: usize,
+    present: Option<Array2<bool>>,
+    leads: Vec<usize>,
+}
+
+fn read_operator_header(reader: &mut BitReader<'_>, index: u64) -> Result<OperatorHeader, ProgramError> {
     let kind = decode_fixed_index(reader, OPERATOR_KINDS)?;
-    let name = format!("decoded{index}");
     let rows = read_interface(reader)?;
+    let mut header = OperatorHeader { kind, rows, cols: None, rank: 0, present: None, leads: Vec::new() };
+    if kind == 0 || kind == 4 {
+        return Ok(header);
+    }
+    let cols = read_interface(reader)?;
+    if kind == 2 {
+        header.rank = decode_prefix_integer(reader)? as usize;
+        header.cols = Some(cols);
+        return Ok(header);
+    }
+    let mut present = Array2::from_elem((header.rows.group_count(), cols.group_count()), false);
+    for r in 0..header.rows.group_count() {
+        for c in decode_subset(reader, cols.group_count())? {
+            present[[r, c]] = true;
+        }
+    }
+    if kind == 3 {
+        header.leads = row_leads(&header.rows, &cols, &present).ok_or_else(|| {
+            ProgramError::Code(format!(
+                "operator {index}: ordered rows without two nonempty rows"
+            ))
+        })?;
+    }
+    header.cols = Some(cols);
+    header.present = Some(present);
+    Ok(header)
+}
+
+/// Pass over one operator codeword, returning its lattice chunk starts ([`skip_lattice`]).
+fn skip_operator(reader: &mut BitReader<'_>, index: u64) -> Result<Vec<u64>, ProgramError> {
+    if read_operator_header(reader, index)?.kind == 0 {
+        return Ok(Vec::new());
+    }
+    skip_lattice(reader)
+}
+
+/// [`decode_operator`]; with the lattice chunk starts of a reader bounded to exactly this
+/// codeword, a large lattice decodes in parallel ([`read_lattice_chunked`]) to the same operator.
+fn decode_operator_with(reader: &mut BitReader<'_>, index: u64, starts: Option<&[u64]>) -> Result<Arc<Operator>, ProgramError> {
+    let header = read_operator_header(reader, index)?;
+    let name = format!("decoded{index}");
+    let OperatorHeader { kind, rows, cols, rank, present, leads } = header;
     if kind == 0 {
         return Ok(Arc::new(Operator::identity(name, rows)));
     }
+    let (precision, reals) = match starts {
+        Some(starts) if starts.len() > 1 => read_lattice_chunked(reader, &leads, starts)?,
+        _ => read_lattice(reader, &leads)?,
+    };
     if kind == 4 {
-        let (precision, reals) = read_lattice(reader, &[])?;
         if reals.len() != rows.width() {
             return Err(ProgramError::Code(format!(
                 "operator {index}: a diagonal of {} on an interface of {}",
@@ -4002,10 +4294,8 @@ fn decode_operator(reader: &mut BitReader<'_>, index: u64) -> Result<Arc<Operato
             provenance: Provenance::default(),
         }));
     }
-    let cols = read_interface(reader)?;
+    let cols = cols.ok_or_else(|| ProgramError::Code(format!("operator {index}: no column interface")))?;
     if kind == 2 {
-        let rank = decode_prefix_integer(reader)? as usize;
-        let (precision, reals) = read_lattice(reader, &[])?;
         let split = rows.width() * rank;
         if reals.len() != split + rank * cols.width() {
             return Err(ProgramError::Code(format!(
@@ -4029,21 +4319,8 @@ fn decode_operator(reader: &mut BitReader<'_>, index: u64) -> Result<Arc<Operato
             provenance: Provenance::default(),
         }));
     }
-    let mut present = Array2::from_elem((rows.group_count(), cols.group_count()), false);
-    for r in 0..rows.group_count() {
-        for c in decode_subset(reader, cols.group_count())? {
-            present[[r, c]] = true;
-        }
-    }
-    let leads = match kind {
-        3 => row_leads(&rows, &cols, &present).ok_or_else(|| {
-            ProgramError::Code(format!(
-                "operator {index}: ordered rows without two nonempty rows"
-            ))
-        })?,
-        _ => Vec::new(),
-    };
-    let (precision, reals) = read_lattice(reader, &leads)?;
+    let present = present.ok_or_else(|| ProgramError::Code(format!("operator {index}: no present blocks")))?;
+    let span = gam_gpu::trace::host_span("codec.operator.assemble");
     let mut values = Array2::<f64>::zeros((rows.width(), cols.width()));
     let mut next = reals.iter();
     for ((r, c), &keep) in present.indexed_iter() {
@@ -4063,6 +4340,7 @@ fn decode_operator(reader: &mut BitReader<'_>, index: u64) -> Result<Arc<Operato
             "operator {index} has too many reals"
         )));
     }
+    drop(span);
     Ok(Arc::new(Operator {
         name,
         rows,
@@ -4201,12 +4479,27 @@ impl OperatorProgram {
             encode_fixed_index(&mut out, 0, 2)?;
             encode_fixed_index(&mut out, *domain, domains)?;
         }
-        for operator in &self.operators {
-            match codec.and_then(|cache| cache.codeword(operator)) {
-                Some(message) => out.append(message),
-                None => encode_operator(&mut out, operator)?,
+        // Each operator's codeword depends on it alone: code them in parallel, append in order.
+        let span = gam_gpu::trace::host_span("codec.encode.operators");
+        let parts = self
+            .operators
+            .par_iter()
+            .map(|operator| match codec.and_then(|cache| cache.codeword(operator)) {
+                Some(message) => Ok(std::borrow::Cow::Borrowed(message)),
+                None => {
+                    let mut part = BitString::new();
+                    encode_operator(&mut part, operator)?;
+                    Ok(std::borrow::Cow::Owned(part))
+                }
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        drop(span);
+        gam_gpu::trace::within_host("codec.encode.append", || {
+            for part in &parts {
+                out.append(part);
             }
-        }
+        });
+        drop(parts);
         encode_rules(&mut out, self)?;
         let rule_inputs: Vec<usize> = self.rules.iter().map(|r| r.inputs.len()).collect();
         let code = self.top_code(&rule_inputs);
@@ -4247,13 +4540,40 @@ impl OperatorProgram {
             let domain = decode_fixed_index(reader, domains)?;
             bases.push(Basis::Indicator { domain });
         }
-        let mut operators = Vec::new();
+        // Witnessed codewords are matched in order; every other codeword's extent is found by a
+        // pass that refuses exactly what decoding refuses, then those operators decode in
+        // parallel, each required to consume exactly its extent: the sequential result.
+        let mut slots = Vec::new();
+        let mut pending = Vec::new();
         for index in 0..operator_count {
-            operators.push(match codec.and_then(|cache| cache.decode_at(reader, index)) {
-                Some(operator) => operator,
-                None => decode_operator(reader, index)?,
-            });
+            if let Some(operator) = codec.and_then(|cache| gam_gpu::trace::within_host("codec.decode.witnessed", || cache.decode_at(reader, index))) {
+                slots.push(Some(operator));
+                continue;
+            }
+            let start = reader.position();
+            let starts = gam_gpu::trace::within_host("codec.decode.skip", || skip_operator(reader, index))?;
+            pending.push((slots.len(), start, reader.position(), starts));
+            slots.push(None);
         }
+        let message: &BitReader<'_> = reader;
+        let span = gam_gpu::trace::host_span("codec.decode.operators");
+        let decoded = pending
+            .par_iter()
+            .map(|(index, start, end, starts)| {
+                let mut part = message.window(*start, *end)?;
+                let operator = decode_operator_with(&mut part, *index as u64, Some(starts))?;
+                part.finish()?;
+                Ok((*index, operator))
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        drop(span);
+        for (index, operator) in decoded {
+            slots[index] = Some(operator);
+        }
+        let operators = slots
+            .into_iter()
+            .map(|operator| operator.ok_or_else(|| ProgramError::Code("an undecoded operator".into())))
+            .collect::<Result<Vec<_>, _>>()?;
         let rules = decode_rules(reader, &operators, &bases, declarations)?;
         let rule_inputs: Vec<usize> = rules.iter().map(|r| r.inputs.len()).collect();
         let code = NodeCode {
@@ -4334,3 +4654,7 @@ pub fn exact_precision(values: impl IntoIterator<Item = f64>) -> Result<Declared
 pub fn column(values: &Array1<f64>) -> Array2<f64> {
     values.clone().insert_axis(Axis(1))
 }
+
+#[cfg(test)]
+#[path = "operator_program_codec_tests.rs"]
+mod codec_tests;

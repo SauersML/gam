@@ -56,6 +56,7 @@ fn replay(label: &str, artifact: &Artifact, cache: Option<&CanonicalArtifactCach
 
 fn main() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    gam_gpu::trace::time_stages(true);
     if args.len() != 2 {
         return Err("EXPORT SETTINGS.json".into());
     }
@@ -115,5 +116,8 @@ fn main() -> Result<(), String> {
         return Err("saved candidate replay differs".into());
     }
     eprintln!("identical bytes on every path");
+    for t in gam_gpu::trace::stage_totals() {
+        eprintln!("  {:<28}{:>8} x {:>10.6} s = {:>8.3} s", t.name, t.count, t.seconds / t.count.max(1) as f64, t.seconds);
+    }
     Ok(())
 }
