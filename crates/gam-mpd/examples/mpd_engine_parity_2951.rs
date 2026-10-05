@@ -8,16 +8,17 @@
 //! directory (`config.json`; token rows from `WINDOWS`, rows of `CONTEXT` little-endian u32). `P` is
 //! the library explanation (`library_mdl::explanation`) with every trainable value moved off `M`
 //! by a deterministic relative perturbation, so that divergences and gradients are not zero. The
-//! candidate is `Model` on the accelerator in f32 storage until the fused decoder implements the
-//! engine.
+//! candidates on the accelerator in f32 storage are its program engine (`Model`) and, where the
+//! programs are of the decoder family, the fused decoder (`decoder::Decoder`) the experiments run
+//! on there.
 //!
 //! The families, `SEQUENCES` bases each (the first rows; the next rows are the sources): clean
 //! with `P` alone; clean under a random block-subset hybrid; a read patch of one of `M`'s read
 //! variables; a joint read patch; both with `M`'s directions (the library's start); and a read
 //! patch with `P`'s own directions (adaptive). Per family: the largest per-token difference of
 //! `KL(M_e ‖ P_e)` in bits and the reference's mean, and the gradient's relative difference
-//! `|g − g_ref| / |g_ref|` over all trainable operators. One JSON object goes to
-//! `OUT/engine_parity.json` and stdout.
+//! `|g − g_ref| / |g_ref|` over all trainable operators, per candidate (a fused family that fails
+//! records its error). One JSON object goes to `OUT/engine_parity.json` and stdout.
 
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
@@ -69,6 +70,38 @@ fn scored(x: &Interchange, batch: &Batch, experiments: &[Experiment], values: &[
     Ok((scored.bits, scored.gradient))
 }
 
+/// [`scored`] on the reference engine of `x`'s device (its programs), whether or not `x` runs
+/// the fused engine; the gradient in `trainable` order.
+fn scored_by_programs(x: &Interchange, trainable: &[usize], batch: &Batch, experiments: &[Experiment], values: &[Array2<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Array2<f64>>), String> {
+    let design = x.design_at(x.variables(), experiments, values)?;
+    let (m, p) = x.models();
+    let targets = interchange::targets(&m, x.head(), batch, experiments, &design)?;
+    let evaluation = interchange::evaluate(&m, &p, x.head(), batch, &targets, experiments, &design, true)?;
+    let d = p.program.device();
+    let gradient = trainable
+        .iter()
+        .map(|op| match evaluation.gradient.get(op) {
+            Some(g) => d.download(g).map_err(error),
+            None => p.program.dense(*op).map(|t| Array2::zeros((t.rows(), t.cols()))),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((evaluation.bits, gradient))
+}
+
+/// The differences of `candidate` from `reference`: the largest per-token difference of the bits,
+/// and the gradient's relative difference; with the reference's mean bits per token.
+fn compare((bits, gradient): &(Vec<Vec<f64>>, Vec<Array2<f64>>), (candidate_bits, candidate_gradient): &(Vec<Vec<f64>>, Vec<Array2<f64>>)) -> Value {
+    let tokens = bits.iter().map(Vec::len).sum::<usize>() as f64;
+    let mean = bits.iter().flatten().sum::<f64>() / tokens;
+    let largest = bits.iter().flatten().zip(candidate_bits.iter().flatten()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    let (mut difference, mut norm) = (0.0, 0.0);
+    for (g, c) in gradient.iter().zip(candidate_gradient) {
+        difference += (g - c).mapv(|v| v * v).sum();
+        norm += g.mapv(|v| v * v).sum();
+    }
+    json!({"mean_bits_per_token": mean, "largest_token_difference_bits": largest, "gradient_relative_difference": (difference / norm).sqrt()})
+}
+
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -117,27 +150,32 @@ fn main() -> Result<(), String> {
     reference.load(&moved)?;
     candidate.load(&moved)?;
     let blocks = 2 * layer_count;
-    let mut report = serde_json::Map::new();
+    // The families' experiments, and the reference's scores of them.
+    let mut families = Vec::new();
     for name in ["clean_alone", "clean_hybrid", "read", "read_joint", "adaptive"] {
         let experiments = family(name, &mut rng, sequences, blocks, context, &variables);
         let directions = if name == "adaptive" { &moved } else { &start };
-        let (bits, gradient) = scored(&reference, &batch, &experiments, directions)?;
-        let (candidate_bits, candidate_gradient) = scored(&candidate, &batch, &experiments, directions)?;
-        let tokens = bits.iter().map(Vec::len).sum::<usize>() as f64;
-        let mean = bits.iter().flatten().sum::<f64>() / tokens;
-        let largest = bits.iter().flatten().zip(candidate_bits.iter().flatten()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
-        let (mut difference, mut norm) = (0.0, 0.0);
-        for (g, c) in gradient.iter().zip(&candidate_gradient) {
-            difference += (g - c).mapv(|v| v * v).sum();
-            norm += g.mapv(|v| v * v).sum();
+        let expected = scored(&reference, &batch, &experiments, directions)?;
+        families.push((name, experiments, directions, expected));
+    }
+    // The accelerator's program engine first, then the fused engine when it runs: a fault in the
+    // second leaves the first's numbers.
+    let mut programs = serde_json::Map::new();
+    for (name, experiments, directions, expected) in &families {
+        let row = compare(expected, &scored_by_programs(&candidate, trainable, &batch, experiments, directions)?);
+        log::info!("parity {name}, programs: {row}");
+        programs.insert((*name).into(), row);
+    }
+    let mut fused = serde_json::Map::new();
+    if candidate.fused() {
+        for (name, experiments, directions, expected) in &families {
+            let row = match scored(&candidate, &batch, experiments, directions) {
+                Ok(found) => compare(expected, &found),
+                Err(e) => json!({"error": e}),
+            };
+            log::info!("parity {name}, fused: {row}");
+            fused.insert((*name).into(), row);
         }
-        let row = json!({
-            "mean_bits_per_token": mean,
-            "largest_token_difference_bits": largest,
-            "gradient_relative_difference": (difference / norm).sqrt(),
-        });
-        log::info!("parity {name}: {row}");
-        report.insert(name.into(), row);
     }
     let report = json!({
         "model": model.display().to_string(),
@@ -145,7 +183,8 @@ fn main() -> Result<(), String> {
         "candidate": accelerator.name(),
         "sequences": sequences,
         "context": context,
-        "families": report,
+        "programs": programs,
+        "fused": if candidate.fused() { Value::Object(fused) } else { Value::Null },
     });
     println!("{report}");
     std::fs::create_dir_all(out).map_err(error)?;
