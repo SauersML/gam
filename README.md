@@ -13,7 +13,7 @@ One Rust engine serves both the Python package (`gamfit`) and the CLI (`gam`).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme_co2_dark.png">
-  <img alt="An additive fit to 540 real monthly CO₂ measurements from 1980–2024. Left: measurements and the fitted long-term trend. Right: detrended measurements and the fitted annual cycle." src="docs/images/readme_co2.png" width="1200">
+  <img alt="Monthly CO₂ measurements, 2015–2024, and an additive model fitted to the 1980–2024 record. Above: observations and the fitted mean. Below: residuals with the model's 95% credible band for the mean (inner) and 95% observation interval (outer), in ppm." src="docs/images/readme_co2.png" width="1200">
 </picture>
 
 Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
