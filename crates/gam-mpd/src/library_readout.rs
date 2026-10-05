@@ -845,6 +845,84 @@ impl<'a> Library<'a> {
         Ok(logits)
     }
 
+    /// The exact contribution of each writer's write to each reader's reads on `sequences` (of one
+    /// length), as the mean over rows of its magnitude: writers and readers are indices into
+    /// [`Library::functions`]. A read is linear in the residual stream before its norm, so at a
+    /// row with stream `x` and `r = √(mean(x²) + ε)` (the actual RMS) writer `s`'s write `w_s`
+    /// enters reader `t`'s read as `R_t (γ ⊙ w_s) / r`, `R_t` the read map: an MLP function's gate
+    /// (route 0) and up direction (route 1), a head's query, key and value maps (routes 0, 1, 2,
+    /// each the norm of the head-width vector, before a head norm). Result: readers × writers × 3,
+    /// zero where the writer does not write before the reader reads.
+    pub fn contributions(&self, sequences: &[Vec<u32>], writers: &[usize], readers: &[usize]) -> Result<ndarray::Array3<f64>, String> {
+        let pass = self.pass(&sequences.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+        let (head_columns, mlp_columns) = self.columns();
+        // A function's place: (layer, head index) or (layer, (MLP, function)).
+        let mut place: BTreeMap<usize, (usize, Result<usize, (usize, usize)>)> = BTreeMap::new();
+        for (l, members) in self.layer_heads.iter().enumerate() {
+            for (c, &h) in members.iter().enumerate() {
+                place.insert(head_columns[l] + c, (l, Ok(h)));
+            }
+        }
+        for (b, block) in self.mlps.iter().enumerate() {
+            for i in 0..block.gate.nrows() {
+                place.insert(mlp_columns[b] + i, (block.layer, Err((b, i))));
+            }
+        }
+        let find = |f: usize| place.get(&f).cloned().ok_or_else(|| format!("no function {f}"));
+        let mut head_writes: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+        for &writer in writers {
+            if let (_, Ok(h)) = find(writer)? {
+                head_writes.insert(h, self.write(h, &pass.head[h][2].to_owned()));
+            }
+        }
+        let mut out = ndarray::Array3::<f64>::zeros((readers.len(), writers.len(), 3));
+        for (ri, &reader) in readers.iter().enumerate() {
+            let (layer, kind) = find(reader)?;
+            let site = if kind.is_ok() { 2 * layer } else { 2 * layer + 1 };
+            let (gain, inverse) = (&self.sites[site].gain, &pass.inverse[site]);
+            // The reader's read maps in residual coordinates (route × rows of the map × width).
+            let maps: Vec<Array2<f64>> = match kind {
+                Ok(h) => {
+                    let block = &self.heads[h];
+                    [&block.query.map, &block.key.map, &block.value].iter().map(|m| *m * &gain.view().insert_axis(Axis(0))).collect()
+                }
+                Err((b, i)) => {
+                    let block = &self.mlps[b];
+                    let mut maps = vec![(&block.gate.row(i) * gain).insert_axis(Axis(0))];
+                    if let Some((_, up)) = &block.up {
+                        maps.push((&up.row(i) * gain).insert_axis(Axis(0)));
+                    }
+                    maps
+                }
+            };
+            for (wi, &writer) in writers.iter().enumerate() {
+                let (written, write) = find(writer)?;
+                // A head writes into the stream its layer's MLP reads; an MLP into the next layer's.
+                let before = match write {
+                    Ok(_) => 2 * written + 1 <= site,
+                    Err(_) => 2 * written + 2 <= site,
+                };
+                if !before {
+                    continue;
+                }
+                for (route, map) in maps.iter().enumerate() {
+                    out[[ri, wi, route]] = match write {
+                        Ok(h) => {
+                            let read = head_writes[&h].dot(&map.t());
+                            read.outer_iter().zip(inverse.iter()).map(|(row, inv)| row.dot(&row).sqrt() * inv).sum::<f64>() / pass.rows as f64
+                        }
+                        Err((b, i)) => {
+                            let read = map.dot(&self.mlps[b].out.column(i));
+                            let size = read.dot(&read).sqrt();
+                            pass.mlp[b].0.column(i).iter().zip(inverse.iter()).map(|(h, inv)| (h * inv).abs()).sum::<f64>() * size / pass.rows as f64
+                        }
+                    };
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The measured effect of removing each function: per function ([`Library::functions`]'s
     /// order) and per row of `sequences` (of one length), the change in `KL(M ‖ P)` of the
     /// next-token distributions, in bits, when that function's write alone is taken out of the
