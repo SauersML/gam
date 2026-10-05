@@ -23,8 +23,8 @@
 //!
 //! `OUT_DIR/report.json` gets, per tolerance pair, the accepted explanation's `C(P)` (literals,
 //! structure, ties), `D_local` per block, `D_run` per group, its activity listing (an execution
-//! cost, reported apart from `C`), every tried candidate with its outcome, and the code-plus-KL
-//! baseline; each accepted artifact's bytes are `OUT_DIR/artifact.{i}.{j}.bin`.
+//! cost, reported apart from `C`) and every tried candidate with its outcome; each accepted
+//! artifact's bytes are `OUT_DIR/artifact.{i}.{j}.bin`.
 
 use gam_mpd::acceptance::{
     Budget, Constraint, CostCache, Local, Proposer, RunCheck, RunMeasure, Searched, assess, execution_cost, frontier, structural_cost,
@@ -180,9 +180,7 @@ fn main() -> Result<(), String> {
                 let j = epsilons.iter().position(|e| *e == point.run_tolerance).unwrap_or(0);
                 let path = out.join(format!("artifact.{i}.{j}.bin"));
                 std::fs::write(&path, searched.artifact.to_bytes()?).map_err(|e| format!("{}: {e}", path.display()))?;
-                let baseline = gam_mpd::acceptance::code_plus_kl(&native, &searched.artifact, &local_family, 1, 1)?;
-                details.push(json!({"point": point, "artifact": path.display().to_string(), "searched": searched_report(searched, &local, &local_family, batch)?,
-                                    "baseline_code_plus_kl_bits": baseline}));
+                details.push(json!({"point": point, "artifact": path.display().to_string(), "searched": searched_report(searched, &local, &local_family, batch)?}));
             }
             json!({"mode": "frontier", "frontier": points, "details": details})
         }

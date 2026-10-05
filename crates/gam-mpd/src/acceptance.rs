@@ -60,12 +60,6 @@
 //! declared budget is spent. It starts from the native model as its own explanation, which meets
 //! every tolerance, so a start such as a decomposition's coordinates enters as a proposal and can
 //! never leave the result worse.
-//!
-//! # The baseline
-//!
-//! [`code_plus_kl`] is the superseded score `L(P) + n Σ KL(M ‖ P)/ln 2` (lattice-coded program bits
-//! plus the data bits of `n` observations per row, no tolerance). It is kept as a labelled baseline
-//! and decides nothing.
 
 use super::artifact::{Artifact, EncodedArtifact, inlined};
 use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorProgram, SequenceLayout, SlotValues};
@@ -1645,26 +1639,6 @@ pub fn frontier(
         searches.push(searched);
     }
     Ok((points, searches))
-}
-
-// -------------------------------------------------------------------------------- the baseline
-
-/// The superseded score (module note, "The baseline"), labelled and deciding nothing: `P`'s
-/// lattice-coded message length plus `n Σ_rows KL(M ‖ P) / ln 2` over `family`, `readouts`
-/// distribution rows per input.
-pub fn code_plus_kl(model: &OperatorProgram, artifact: &Artifact, family: &FamilyInputs, readouts: usize, observations: u64) -> Result<f64, String> {
-    let bits = artifact.program.code_bits().map_err(|e| e.to_string())? as f64;
-    let reference = model.execute(family, false).map_err(|e| e.to_string())?.values[model.output].clone();
-    let explained = artifact.execute(family)?.values[artifact.program.output].clone();
-    let classes = reference.ncols() / readouts.max(1);
-    let mut kl = 0.0;
-    for row in 0..reference.nrows() {
-        for k in 0..readouts {
-            let range = k * classes..(k + 1) * classes;
-            kl += kl_logits(reference.slice(s![row, range.clone()]), explained.slice(s![row, range])).0;
-        }
-    }
-    Ok(bits + observations as f64 * kl / LN_2)
 }
 
 #[cfg(test)]

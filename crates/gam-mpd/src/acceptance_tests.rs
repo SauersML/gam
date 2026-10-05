@@ -3,7 +3,7 @@
 //! shortcut (a)–(i) it guards against.
 
 use super::acceptance::{
-    Budget, Change, Constraint, Context, CostCache, Edit, Episode, FamilyRun, Local, Outcome, Proposal, Proposer, RunCheck, assess, code_plus_kl,
+    Budget, Change, Constraint, Context, CostCache, Edit, Episode, FamilyRun, Local, Outcome, Proposal, Proposer, RunCheck, assess,
     execution_cost, kl_logits, search, structural_cost,
 };
 use super::artifact::{Argument, Artifact, Callee};
@@ -477,8 +477,7 @@ fn shared_parameterized_rules_with_different_spectra_are_accepted() {
 }
 
 /// (f) Quantizing an opaque program is not a discovery: rounding the MLP's write onto a coarse
-/// lattice leaves `C` unchanged, so the search never tries it, although the code-plus-KL baseline,
-/// which charges lattice indices, prefers it.
+/// lattice leaves `C` unchanged, so the search never tries it.
 #[test]
 fn quantizing_is_not_a_discovery() {
     let model = mlp(2f64.powi(-12));
@@ -491,8 +490,6 @@ fn quantizing_is_not_a_discovery() {
     let mut cache = CostCache::default();
     let (before, after) = (structural_cost(&start, &mut cache).expect("a cost"), structural_cost(&quantized, &mut cache).expect("a cost"));
     assert_eq!(before, after);
-    let baseline = |artifact: &Artifact| code_plus_kl(&model, artifact, &family, 1, 1).expect("a baseline");
-    assert!(baseline(&quantized) < baseline(&start), "the baseline counts the coarser lattice as a saving");
     let local = Local::new(&model, family.clone(), None, 64);
     let run = clean_run(&model, &family);
     let proposer = Fixed(vec![proposal("quantized", quantized)]);
@@ -565,9 +562,8 @@ fn an_always_running_rotation_is_not_penalized() {
     assert_eq!(cost.total(), cost.structure_bits + 32 * cost.literals + cost.binding_bits);
 }
 
-/// (h) A smaller program that violates the local tolerance is refused even though code-plus-KL
-/// prefers it: deleting the MLP saves twenty literals, and with a readout nearly blind to it the
-/// baseline's data bits barely rise.
+/// (h) A smaller program that violates the local tolerance is refused: deleting the MLP saves
+/// twenty literals, and the readout is nearly blind to it.
 #[test]
 fn a_smaller_violating_program_is_refused() {
     let model = mlp(2f64.powi(-12));
@@ -585,8 +581,6 @@ fn a_smaller_violating_program_is_refused() {
     )
     .expect("an empty operator");
     let deleted = linear(&start, "deleted", 1, 4, nothing);
-    let baseline = |artifact: &Artifact| code_plus_kl(&model, artifact, &family, 1, 1).expect("a baseline");
-    assert!(baseline(&deleted) < baseline(&start), "the baseline prefers the deletion");
     let local = Local::new(&model, family.clone(), None, 64);
     let run = clean_run(&model, &family);
     let proposer = Fixed(vec![proposal("delete the MLP", deleted)]);
