@@ -1,0 +1,1401 @@
+{
+ "hypotheses": [
+  {
+   "function": "L0.H3",
+   "description": "Fires at the first token of a sequence and on a digit piece that continues a number."
+  },
+  {
+   "function": "L2.H2",
+   "description": "Fires on the continuation of a name, path or phrase that occurred earlier in the context."
+  },
+  {
+   "function": "L0.H0",
+   "description": "Fires at the first token of a sequence and on a newline after a newline."
+  },
+  {
+   "function": "L3.H4",
+   "description": "Fires in statistics reporting in research papers (alpha values, test names, lab values)."
+  },
+  {
+   "function": "L3.H0",
+   "description": "Fires on indentation after a statement ends in C#-like code."
+  },
+  {
+   "function": "L3.H2",
+   "description": "Fires on ' and' after the second of listed items and on separators in lists."
+  },
+  {
+   "function": "L2.H4",
+   "description": "Induction head: fires on the second occurrence of a token sequence."
+  },
+  {
+   "function": "L1.H4",
+   "description": "Fires at the first token of a sequence."
+  },
+  {
+   "function": "L0.M2825",
+   "description": "Fires on sentence-final periods and opening parentheses after a complete clause."
+  },
+  {
+   "function": "L0.H5",
+   "description": "Fires on the second piece of a word split into tokens."
+  },
+  {
+   "function": "L3.H1",
+   "description": "Fires at the first token of a sequence."
+  },
+  {
+   "function": "L3.H3",
+   "description": "Fires on the last word of a place or category name, and on a repeated variable name in a foreach loop."
+  },
+  {
+   "function": "L3.H5",
+   "description": "Fires on markers that open a citation or list entry ('*', '(', 'B' after '[@')."
+  },
+  {
+   "function": "L0.H1",
+   "description": "Fires at the first token of a sequence."
+  },
+  {
+   "function": "L2.H3",
+   "description": "Fires on 'B' inside a citation range '[@B9]--[@B'."
+  },
+  {
+   "function": "L1.H2",
+   "description": "Fires at the first token of a sequence."
+  },
+  {
+   "function": "L1.H5",
+   "description": "Fires at the first token of a sequence."
+  },
+  {
+   "function": "L2.H1",
+   "description": "Fires inside LaTeX subscripts and on the second of a paired word ('qualitative and')."
+  },
+  {
+   "function": "L2.H0",
+   "description": "Fires on the noun completing 'the same X' or 'which X'."
+  },
+  {
+   "function": "L1.H1",
+   "description": "Previous-token head: fires on the second piece of a split name."
+  },
+  {
+   "function": "L2.H5",
+   "description": "Fires on function words in narrative prose ('at the', 'or so,')."
+  },
+  {
+   "function": "L1.H0",
+   "description": "Fires on the token after '\\[' in LaTeX cross-references."
+  },
+  {
+   "function": "L1.H3",
+   "description": "Fires on the end-of-document token."
+  },
+  {
+   "function": "L0.H2",
+   "description": "Fires on '*' closing markdown emphasis and '{' after \\begin."
+  },
+  {
+   "function": "L0.H4",
+   "description": "Duplicate-token head: fires on a token that already occurred earlier in the context."
+  },
+  {
+   "function": "L3.M1309",
+   "description": "Fires on the noun or number after 'the' or 'at' in study and weigh-in phrasing."
+  },
+  {
+   "function": "L0.M2413",
+   "description": "Fires on word-final suffix pieces ('es', 'oes')."
+  },
+  {
+   "function": "L0.M203",
+   "description": "Fires on ' and' joining two names or nouns."
+  },
+  {
+   "function": "L0.M159",
+   "description": "Fires on a newline after a personal first-person sentence."
+  },
+  {
+   "function": "L0.M2650",
+   "description": "Fires on a blank line after a short sentence."
+  },
+  {
+   "function": "L2.M767",
+   "description": "Fires on a newline after an informal sentence or a URL."
+  },
+  {
+   "function": "L0.M1181",
+   "description": "Fires on a newline after a sentence ending with a period."
+  },
+  {
+   "function": "L0.M147",
+   "description": "Fires on the name ' Solomon'."
+  },
+  {
+   "function": "L2.M3037",
+   "description": "Fires on a word piece that repeats a piece seen earlier in the context."
+  },
+  {
+   "function": "L1.M2889",
+   "description": "Fires at the first token of a sequence."
+  },
+  {
+   "function": "L1.M2352",
+   "description": "Fires on the end-of-document token."
+  },
+  {
+   "function": "L0.M20",
+   "description": "Fires on '.' inside URLs and version numbers."
+  },
+  {
+   "function": "L1.M1700",
+   "description": "Fires on a newline in code, shell scripts and file headers."
+  },
+  {
+   "function": "L0.M1249",
+   "description": "Fires on the end-of-document token."
+  },
+  {
+   "function": "L3.M720",
+   "description": "Fires on an en dash opening a line in a list of fighters and on a period after a single initial."
+  },
+  {
+   "function": "L0.M801",
+   "description": "Fires on Swedish function words."
+  },
+  {
+   "function": "L1.M613",
+   "description": "Fires at the first token of a sequence."
+  },
+  {
+   "function": "L3.M338",
+   "description": "Fires on 'AT' in ioctl constant names (SIOCIF_AT...)."
+  },
+  {
+   "function": "L0.M2786",
+   "description": "Fires on ' the' after ' in'."
+  },
+  {
+   "function": "L1.M2960",
+   "description": "Fires at the first token of a sequence."
+  },
+  {
+   "function": "L1.M2028",
+   "description": "Fires at the first token of a sequence."
+  },
+  {
+   "function": "L0.M2182",
+   "description": "Fires on two-digit numbers."
+  },
+  {
+   "function": "L1.M2229",
+   "description": "Fires at the first token of a sequence."
+  },
+  {
+   "function": "L3.M583",
+   "description": "Fires on '.' after 'www' in URLs and on ' well' after 'Okay,'."
+  },
+  {
+   "function": "L0.M680",
+   "description": "Fires on a comma after a noun phrase."
+  }
+ ],
+ "per_prompt": [
+  {
+   "function": "L0.H3",
+   "kind": "fire",
+   "text": "§ information"
+  },
+  {
+   "function": "L0.H3",
+   "kind": "fire",
+   "text": "In re Riddle (1962) 57 Cal.2d 848, 851"
+  },
+  {
+   "function": "L0.H3",
+   "kind": "quiet",
+   "text": "The court held that the information"
+  },
+  {
+   "function": "L0.H3",
+   "kind": "quiet",
+   "text": "We went to the park"
+  },
+  {
+   "function": "L2.H2",
+   "kind": "fire",
+   "text": "– Jesse Gillespie ($2,000)\n– Eric Lawson ($6,000)\n– Jesse Gillespie"
+  },
+  {
+   "function": "L2.H2",
+   "kind": "fire",
+   "text": "inline Index nonZeros() const\n  src/SparseCore/SparseBlock.h:436: Index nonZeros"
+  },
+  {
+   "function": "L2.H2",
+   "kind": "quiet",
+   "text": "The weather was nice and we went for a walk"
+  },
+  {
+   "function": "L2.H2",
+   "kind": "quiet",
+   "text": "She opened the door and said hello"
+  },
+  {
+   "function": "L0.H0",
+   "kind": "fire",
+   "text": "§1"
+  },
+  {
+   "function": "L0.H0",
+   "kind": "fire",
+   "text": "Copyright 2010\n\n"
+  },
+  {
+   "function": "L0.H0",
+   "kind": "quiet",
+   "text": "The cat sat on the mat"
+  },
+  {
+   "function": "L0.H0",
+   "kind": "quiet",
+   "text": "We measured the blood pressure"
+  },
+  {
+   "function": "L3.H4",
+   "kind": "fire",
+   "text": "The internal consistency of the scale in this study was alpha=."
+  },
+  {
+   "function": "L3.H4",
+   "kind": "fire",
+   "text": "Groups were compared using Student's"
+  },
+  {
+   "function": "L3.H4",
+   "kind": "quiet",
+   "text": "Once upon a time there lived a king"
+  },
+  {
+   "function": "L3.H4",
+   "kind": "quiet",
+   "text": "Click here to download the file"
+  },
+  {
+   "function": "L3.H0",
+   "kind": "fire",
+   "text": "listOfChildren.Add(activity);\n            "
+  },
+  {
+   "function": "L3.H0",
+   "kind": "fire",
+   "text": "throw new ArgumentException(name);\n        "
+  },
+  {
+   "function": "L3.H0",
+   "kind": "quiet",
+   "text": "The river flows into the sea"
+  },
+  {
+   "function": "L3.H0",
+   "kind": "quiet",
+   "text": "My favourite colour is blue"
+  },
+  {
+   "function": "L3.H2",
+   "kind": "fire",
+   "text": "for the three orientations: top, bottom and"
+  },
+  {
+   "function": "L3.H2",
+   "kind": "fire",
+   "text": "a space for civil, informative and"
+  },
+  {
+   "function": "L3.H2",
+   "kind": "quiet",
+   "text": "He walked into the room"
+  },
+  {
+   "function": "L3.H2",
+   "kind": "quiet",
+   "text": "The function returns a value"
+  },
+  {
+   "function": "L2.H4",
+   "kind": "fire",
+   "text": "Format-Table -Auto -wrap | Out-File -FilePath $csvfile\nFormat-Table -Auto -wrap"
+  },
+  {
+   "function": "L2.H4",
+   "kind": "fire",
+   "text": "try_nokogiri = true\nend\nif try_nok"
+  },
+  {
+   "function": "L2.H4",
+   "kind": "quiet",
+   "text": "Format-Table shows the output as a table"
+  },
+  {
+   "function": "L2.H4",
+   "kind": "quiet",
+   "text": "She bought apples and pears"
+  },
+  {
+   "function": "L1.H4",
+   "kind": "fire",
+   "text": "§ putting"
+  },
+  {
+   "function": "L1.H4",
+   "kind": "fire",
+   "text": "§throw"
+  },
+  {
+   "function": "L1.H4",
+   "kind": "quiet",
+   "text": "He was putting"
+  },
+  {
+   "function": "L1.H4",
+   "kind": "quiet",
+   "text": "They throw"
+  },
+  {
+   "function": "L0.M2825",
+   "kind": "fire",
+   "text": "Thanks for the comments folks."
+  },
+  {
+   "function": "L0.M2825",
+   "kind": "fire",
+   "text": "He is entitled to them even in confinement. ("
+  },
+  {
+   "function": "L0.M2825",
+   "kind": "quiet",
+   "text": "The quick brown fox"
+  },
+  {
+   "function": "L0.M2825",
+   "kind": "quiet",
+   "text": "In 1962 the"
+  },
+  {
+   "function": "L0.H5",
+   "kind": "fire",
+   "text": "when his car collided"
+  },
+  {
+   "function": "L0.H5",
+   "kind": "fire",
+   "text": "ThrowIfViolationsExist"
+  },
+  {
+   "function": "L0.H5",
+   "kind": "quiet",
+   "text": "The car hit the wall"
+  },
+  {
+   "function": "L0.H5",
+   "kind": "quiet",
+   "text": "It was a good day"
+  },
+  {
+   "function": "L3.H1",
+   "kind": "fire",
+   "text": "§ able"
+  },
+  {
+   "function": "L3.H1",
+   "kind": "fire",
+   "text": "§ range"
+  },
+  {
+   "function": "L3.H1",
+   "kind": "quiet",
+   "text": "They were able"
+  },
+  {
+   "function": "L3.H1",
+   "kind": "quiet",
+   "text": "a wide range"
+  },
+  {
+   "function": "L3.H3",
+   "kind": "fire",
+   "text": "designated places in Union County, South Carolina"
+  },
+  {
+   "function": "L3.H3",
+   "kind": "fire",
+   "text": "foreach (Activity activity"
+  },
+  {
+   "function": "L3.H3",
+   "kind": "quiet",
+   "text": "I would like a cup of tea"
+  },
+  {
+   "function": "L3.H3",
+   "kind": "quiet",
+   "text": "The results show that"
+  },
+  {
+   "function": "L3.H5",
+   "kind": "fire",
+   "text": "peripheral sites \\[[@B17], [@B"
+  },
+  {
+   "function": "L3.H5",
+   "kind": "fire",
+   "text": "@li17a; (30) – @kirby15a; ("
+  },
+  {
+   "function": "L3.H5",
+   "kind": "quiet",
+   "text": "The dog barked at the cat"
+  },
+  {
+   "function": "L3.H5",
+   "kind": "quiet",
+   "text": "We went to the beach"
+  },
+  {
+   "function": "L0.H1",
+   "kind": "fire",
+   "text": "§dd"
+  },
+  {
+   "function": "L0.H1",
+   "kind": "fire",
+   "text": "§throw"
+  },
+  {
+   "function": "L0.H1",
+   "kind": "quiet",
+   "text": "The value of the"
+  },
+  {
+   "function": "L0.H1",
+   "kind": "quiet",
+   "text": "He decided to"
+  },
+  {
+   "function": "L2.H3",
+   "kind": "fire",
+   "text": "hypertension management \\[[@B9]--[@B"
+  },
+  {
+   "function": "L2.H3",
+   "kind": "fire",
+   "text": "blood pressure \\[[@B18]--[@B"
+  },
+  {
+   "function": "L2.H3",
+   "kind": "quiet",
+   "text": "The patient was given"
+  },
+  {
+   "function": "L2.H3",
+   "kind": "quiet",
+   "text": "In this paper we"
+  },
+  {
+   "function": "L1.H2",
+   "kind": "fire",
+   "text": "§1"
+  },
+  {
+   "function": "L1.H2",
+   "kind": "fire",
+   "text": "§s"
+  },
+  {
+   "function": "L1.H2",
+   "kind": "quiet",
+   "text": "There were 1"
+  },
+  {
+   "function": "L1.H2",
+   "kind": "quiet",
+   "text": "The cats"
+  },
+  {
+   "function": "L1.H5",
+   "kind": "fire",
+   "text": "§1"
+  },
+  {
+   "function": "L1.H5",
+   "kind": "fire",
+   "text": "§ significant"
+  },
+  {
+   "function": "L1.H5",
+   "kind": "quiet",
+   "text": "Chapter 1"
+  },
+  {
+   "function": "L1.H5",
+   "kind": "quiet",
+   "text": "It is significant"
+  },
+  {
+   "function": "L2.H1",
+   "kind": "fire",
+   "text": "the expected NSM rate $\\mathcal{R}_{\\rm NS"
+  },
+  {
+   "function": "L2.H1",
+   "kind": "fire",
+   "text": "has been established about the qualitative and"
+  },
+  {
+   "function": "L2.H1",
+   "kind": "quiet",
+   "text": "The bus arrived at"
+  },
+  {
+   "function": "L2.H1",
+   "kind": "quiet",
+   "text": "I think that"
+  },
+  {
+   "function": "L2.H0",
+   "kind": "fire",
+   "text": "using the same tools"
+  },
+  {
+   "function": "L2.H0",
+   "kind": "fire",
+   "text": "who really can tell which server"
+  },
+  {
+   "function": "L2.H0",
+   "kind": "quiet",
+   "text": "The sky is"
+  },
+  {
+   "function": "L2.H0",
+   "kind": "quiet",
+   "text": "Once upon a"
+  },
+  {
+   "function": "L1.H1",
+   "kind": "fire",
+   "text": "It was described by William Schaus"
+  },
+  {
+   "function": "L1.H1",
+   "kind": "fire",
+   "text": "can be found in [@Sznit"
+  },
+  {
+   "function": "L1.H1",
+   "kind": "quiet",
+   "text": "The book is on the"
+  },
+  {
+   "function": "L1.H1",
+   "kind": "quiet",
+   "text": "I like to"
+  },
+  {
+   "function": "L2.H5",
+   "kind": "fire",
+   "text": "Delray argues that, at the"
+  },
+  {
+   "function": "L2.H5",
+   "kind": "fire",
+   "text": "after walking an hour or so,"
+  },
+  {
+   "function": "L2.H5",
+   "kind": "quiet",
+   "text": "x = np.array([1, 2,"
+  },
+  {
+   "function": "L2.H5",
+   "kind": "quiet",
+   "text": "SIOCGIFCONF = -0x"
+  },
+  {
+   "function": "L1.H0",
+   "kind": "fire",
+   "text": "By Proposition \\[prop"
+  },
+  {
+   "function": "L1.H0",
+   "kind": "fire",
+   "text": "is illustrated in Fig. \\[fig"
+  },
+  {
+   "function": "L1.H0",
+   "kind": "quiet",
+   "text": "The man walked his dog"
+  },
+  {
+   "function": "L1.H0",
+   "kind": "quiet",
+   "text": "We are going to"
+  },
+  {
+   "function": "L1.H3",
+   "kind": "fire",
+   "text": "The air-righting reflex.<|endoftext|>"
+  },
+  {
+   "function": "L1.H3",
+   "kind": "fire",
+   "text": "return m_data.size(); }\n\n<|endoftext|>"
+  },
+  {
+   "function": "L1.H3",
+   "kind": "quiet",
+   "text": "The air-righting reflex is"
+  },
+  {
+   "function": "L1.H3",
+   "kind": "quiet",
+   "text": "return m_data"
+  },
+  {
+   "function": "L0.H2",
+   "kind": "fire",
+   "text": "is called a *random environment*"
+  },
+  {
+   "function": "L0.H2",
+   "kind": "fire",
+   "text": "$$\\begin{"
+  },
+  {
+   "function": "L0.H2",
+   "kind": "quiet",
+   "text": "The house is"
+  },
+  {
+   "function": "L0.H2",
+   "kind": "quiet",
+   "text": "He ran to the"
+  },
+  {
+   "function": "L0.H4",
+   "kind": "fire",
+   "text": "Delray argued that the Coal Act applies to Delray and that Del"
+  },
+  {
+   "function": "L0.H4",
+   "kind": "fire",
+   "text": "CCL is a library. CCL"
+  },
+  {
+   "function": "L0.H4",
+   "kind": "quiet",
+   "text": "The weather is"
+  },
+  {
+   "function": "L0.H4",
+   "kind": "quiet",
+   "text": "A new study shows that"
+  },
+  {
+   "function": "L3.M1309",
+   "kind": "fire",
+   "text": "In this study, we investigated the relationship"
+  },
+  {
+   "function": "L3.M1309",
+   "kind": "fire",
+   "text": "Souza weighed in at 284"
+  },
+  {
+   "function": "L3.M1309",
+   "kind": "quiet",
+   "text": "Hello, how are"
+  },
+  {
+   "function": "L3.M1309",
+   "kind": "quiet",
+   "text": "The sun is"
+  },
+  {
+   "function": "L0.M2413",
+   "kind": "fire",
+   "text": "we compared air-righting reflexes"
+  },
+  {
+   "function": "L0.M2413",
+   "kind": "fire",
+   "text": "whose fruits were like aloes"
+  },
+  {
+   "function": "L0.M2413",
+   "kind": "quiet",
+   "text": "The man is"
+  },
+  {
+   "function": "L0.M2413",
+   "kind": "quiet",
+   "text": "I went to"
+  },
+  {
+   "function": "L0.M203",
+   "kind": "fire",
+   "text": "conducted by Bernard McDonald and"
+  },
+  {
+   "function": "L0.M203",
+   "kind": "fire",
+   "text": "Starch and"
+  },
+  {
+   "function": "L0.M203",
+   "kind": "quiet",
+   "text": "She is"
+  },
+  {
+   "function": "L0.M203",
+   "kind": "quiet",
+   "text": "The answer is"
+  },
+  {
+   "function": "L0.M159",
+   "kind": "fire",
+   "text": "It is all personal stuff for me.\n"
+  },
+  {
+   "function": "L0.M159",
+   "kind": "fire",
+   "text": "and so on, while you are writing.\n"
+  },
+  {
+   "function": "L0.M159",
+   "kind": "quiet",
+   "text": "The function returns"
+  },
+  {
+   "function": "L0.M159",
+   "kind": "quiet",
+   "text": "x = 3 +"
+  },
+  {
+   "function": "L0.M2650",
+   "kind": "fire",
+   "text": "It is found in Costa Rica.\n\n"
+  },
+  {
+   "function": "L0.M2650",
+   "kind": "fire",
+   "text": "the event they have over there.\n\n"
+  },
+  {
+   "function": "L0.M2650",
+   "kind": "quiet",
+   "text": "It is found in Costa"
+  },
+  {
+   "function": "L0.M2650",
+   "kind": "quiet",
+   "text": "The event"
+  },
+  {
+   "function": "L2.M767",
+   "kind": "fire",
+   "text": "to not hear to myself lol.\n"
+  },
+  {
+   "function": "L2.M767",
+   "kind": "fire",
+   "text": "http://example.com/17/3/9/17/d107782750.cms\n"
+  },
+  {
+   "function": "L2.M767",
+   "kind": "quiet",
+   "text": "The court ruled that"
+  },
+  {
+   "function": "L2.M767",
+   "kind": "quiet",
+   "text": "Its chemical formula is"
+  },
+  {
+   "function": "L0.M1181",
+   "kind": "fire",
+   "text": "give yourself more time to get pregnant.\n"
+  },
+  {
+   "function": "L0.M1181",
+   "kind": "fire",
+   "text": "I'd appreciate any help you can give.\n"
+  },
+  {
+   "function": "L0.M1181",
+   "kind": "quiet",
+   "text": "give yourself more"
+  },
+  {
+   "function": "L0.M1181",
+   "kind": "quiet",
+   "text": "The cat and"
+  },
+  {
+   "function": "L0.M147",
+   "kind": "fire",
+   "text": "The results in the area are due to Solomon"
+  },
+  {
+   "function": "L0.M147",
+   "kind": "fire",
+   "text": "and Sinai [@Sinai1982]. Solomon"
+  },
+  {
+   "function": "L0.M147",
+   "kind": "quiet",
+   "text": "The results in the area are due to"
+  },
+  {
+   "function": "L0.M147",
+   "kind": "quiet",
+   "text": "The king"
+  },
+  {
+   "function": "L2.M3037",
+   "kind": "fire",
+   "text": "Xubida rutubella\n\nXub"
+  },
+  {
+   "function": "L2.M3037",
+   "kind": "fire",
+   "text": "try_nokogiri = true\nif try_nok"
+  },
+  {
+   "function": "L2.M3037",
+   "kind": "quiet",
+   "text": "The weather today"
+  },
+  {
+   "function": "L2.M3037",
+   "kind": "quiet",
+   "text": "Please read the"
+  },
+  {
+   "function": "L1.M2889",
+   "kind": "fire",
+   "text": "§ Rig"
+  },
+  {
+   "function": "L1.M2889",
+   "kind": "fire",
+   "text": "§loat"
+  },
+  {
+   "function": "L1.M2889",
+   "kind": "quiet",
+   "text": "the Rig"
+  },
+  {
+   "function": "L1.M2889",
+   "kind": "quiet",
+   "text": "float"
+  },
+  {
+   "function": "L1.M2352",
+   "kind": "fire",
+   "text": "Villages in Rupnagar district<|endoftext|>"
+  },
+  {
+   "function": "L1.M2352",
+   "kind": "fire",
+   "text": "helps somebody out there.\n\n<|endoftext|>"
+  },
+  {
+   "function": "L1.M2352",
+   "kind": "quiet",
+   "text": "Villages in Rupnagar"
+  },
+  {
+   "function": "L1.M2352",
+   "kind": "quiet",
+   "text": "helps somebody"
+  },
+  {
+   "function": "L0.M20",
+   "kind": "fire",
+   "text": "http://www.nutritionquest."
+  },
+  {
+   "function": "L0.M20",
+   "kind": "fire",
+   "text": "Version: 1."
+  },
+  {
+   "function": "L0.M20",
+   "kind": "quiet",
+   "text": "The boy and the"
+  },
+  {
+   "function": "L0.M20",
+   "kind": "quiet",
+   "text": "We will"
+  },
+  {
+   "function": "L1.M1700",
+   "kind": "fire",
+   "text": "#!/bin/bash\n"
+  },
+  {
+   "function": "L1.M1700",
+   "kind": "fire",
+   "text": "Copyright (c) 2010\n"
+  },
+  {
+   "function": "L1.M1700",
+   "kind": "quiet",
+   "text": "The mountain is"
+  },
+  {
+   "function": "L1.M1700",
+   "kind": "quiet",
+   "text": "They said that"
+  },
+  {
+   "function": "L0.M1249",
+   "kind": "fire",
+   "text": "the abilities the class has.<|endoftext|>"
+  },
+  {
+   "function": "L0.M1249",
+   "kind": "fire",
+   "text": "Replace with your target name.\n\n<|endoftext|>"
+  },
+  {
+   "function": "L0.M1249",
+   "kind": "quiet",
+   "text": "the abilities the class"
+  },
+  {
+   "function": "L0.M1249",
+   "kind": "quiet",
+   "text": "Replace with your"
+  },
+  {
+   "function": "L3.M720",
+   "kind": "fire",
+   "text": "def. Brandon Thatch ($2,000)\n–"
+  },
+  {
+   "function": "L3.M720",
+   "kind": "fire",
+   "text": "Attorney General, and Derald E."
+  },
+  {
+   "function": "L3.M720",
+   "kind": "quiet",
+   "text": "The lake is"
+  },
+  {
+   "function": "L3.M720",
+   "kind": "quiet",
+   "text": "Our team won the"
+  },
+  {
+   "function": "L0.M801",
+   "kind": "fire",
+   "text": "Är sammanfattningen fel"
+  },
+  {
+   "function": "L0.M801",
+   "kind": "fire",
+   "text": "kunna lita på"
+  },
+  {
+   "function": "L0.M801",
+   "kind": "quiet",
+   "text": "The summary is"
+  },
+  {
+   "function": "L0.M801",
+   "kind": "quiet",
+   "text": "We can rely"
+  },
+  {
+   "function": "L1.M613",
+   "kind": "fire",
+   "text": "§ include"
+  },
+  {
+   "function": "L1.M613",
+   "kind": "fire",
+   "text": "§ information"
+  },
+  {
+   "function": "L1.M613",
+   "kind": "quiet",
+   "text": "These include"
+  },
+  {
+   "function": "L1.M613",
+   "kind": "quiet",
+   "text": "more information"
+  },
+  {
+   "function": "L3.M338",
+   "kind": "fire",
+   "text": "\tSIOCIF_ATTACH = -0x7fdf9686\n\tSIOCIF_AT"
+  },
+  {
+   "function": "L3.M338",
+   "kind": "fire",
+   "text": "\tSIOCIF_AT"
+  },
+  {
+   "function": "L3.M338",
+   "kind": "quiet",
+   "text": "The weather is"
+  },
+  {
+   "function": "L3.M338",
+   "kind": "quiet",
+   "text": "In 1990 the"
+  },
+  {
+   "function": "L0.M2786",
+   "kind": "fire",
+   "text": "Petitioner was convicted in the"
+  },
+  {
+   "function": "L0.M2786",
+   "kind": "fire",
+   "text": "except in cases arising in the"
+  },
+  {
+   "function": "L0.M2786",
+   "kind": "quiet",
+   "text": "Petitioner was convicted"
+  },
+  {
+   "function": "L0.M2786",
+   "kind": "quiet",
+   "text": "except in cases"
+  },
+  {
+   "function": "L1.M2960",
+   "kind": "fire",
+   "text": "§loat"
+  },
+  {
+   "function": "L1.M2960",
+   "kind": "fire",
+   "text": "§ range"
+  },
+  {
+   "function": "L1.M2960",
+   "kind": "quiet",
+   "text": "The float"
+  },
+  {
+   "function": "L1.M2960",
+   "kind": "quiet",
+   "text": "the ranges"
+  },
+  {
+   "function": "L1.M2028",
+   "kind": "fire",
+   "text": "§ for"
+  },
+  {
+   "function": "L1.M2028",
+   "kind": "fire",
+   "text": "§ able"
+  },
+  {
+   "function": "L1.M2028",
+   "kind": "quiet",
+   "text": "thank you for"
+  },
+  {
+   "function": "L1.M2028",
+   "kind": "quiet",
+   "text": "they were able"
+  },
+  {
+   "function": "L0.M2182",
+   "kind": "fire",
+   "text": "shortly after 5:30"
+  },
+  {
+   "function": "L0.M2182",
+   "kind": "fire",
+   "text": "Days 8, 10"
+  },
+  {
+   "function": "L0.M2182",
+   "kind": "quiet",
+   "text": "shortly after"
+  },
+  {
+   "function": "L0.M2182",
+   "kind": "quiet",
+   "text": "The apple"
+  },
+  {
+   "function": "L1.M2229",
+   "kind": "fire",
+   "text": "§dd"
+  },
+  {
+   "function": "L1.M2229",
+   "kind": "fire",
+   "text": "§CC"
+  },
+  {
+   "function": "L1.M2229",
+   "kind": "quiet",
+   "text": "add"
+  },
+  {
+   "function": "L1.M2229",
+   "kind": "quiet",
+   "text": "the CC"
+  },
+  {
+   "function": "L3.M583",
+   "kind": "fire",
+   "text": "Visit http://www."
+  },
+  {
+   "function": "L3.M583",
+   "kind": "fire",
+   "text": "every day for an hour. Okay, well"
+  },
+  {
+   "function": "L3.M583",
+   "kind": "quiet",
+   "text": "The tree is"
+  },
+  {
+   "function": "L3.M583",
+   "kind": "quiet",
+   "text": "She opened the"
+  },
+  {
+   "function": "L0.M680",
+   "kind": "fire",
+   "text": "to provide a space for civil,"
+  },
+  {
+   "function": "L0.M680",
+   "kind": "fire",
+   "text": "supplemented by wearable devices,"
+  },
+  {
+   "function": "L0.M680",
+   "kind": "quiet",
+   "text": "a space for"
+  },
+  {
+   "function": "L0.M680",
+   "kind": "quiet",
+   "text": "The"
+  }
+ ],
+ "correct": 0.84,
+ "failures": [
+  [
+   "L0.H0",
+   "quiet",
+   "We measured the blood pressure",
+   1.0
+  ],
+  [
+   "L3.H0",
+   "fire",
+   "listOfChildren.Add(activity);\n            ",
+   0.03
+  ],
+  [
+   "L3.H0",
+   "fire",
+   "throw new ArgumentException(name);\n        ",
+   0.05
+  ],
+  [
+   "L3.H2",
+   "fire",
+   "a space for civil, informative and",
+   0.71
+  ],
+  [
+   "L3.H2",
+   "quiet",
+   "The function returns a value",
+   0.92
+  ],
+  [
+   "L1.H4",
+   "quiet",
+   "He was putting",
+   1.0
+  ],
+  [
+   "L1.H4",
+   "quiet",
+   "They throw",
+   1.0
+  ],
+  [
+   "L0.H5",
+   "quiet",
+   "It was a good day",
+   0.96
+  ],
+  [
+   "L3.H3",
+   "fire",
+   "gnated places in Union County, South Carolina",
+   0.26
+  ],
+  [
+   "L3.H3",
+   "fire",
+   "foreach (Activity activity",
+   0.62
+  ],
+  [
+   "L3.H5",
+   "fire",
+   "peripheral sites \\[[@B17], [@B",
+   0.79
+  ],
+  [
+   "L0.H1",
+   "quiet",
+   "The value of the",
+   0.91
+  ],
+  [
+   "L1.H2",
+   "quiet",
+   "There were 1",
+   1.0
+  ],
+  [
+   "L1.H2",
+   "quiet",
+   "The cats",
+   0.99
+  ],
+  [
+   "L1.H5",
+   "quiet",
+   "Chapter 1",
+   0.96
+  ],
+  [
+   "L1.H5",
+   "quiet",
+   "It is significant",
+   0.99
+  ],
+  [
+   "L2.H5",
+   "fire",
+   "after walking an hour or so,",
+   0.23
+  ],
+  [
+   "L1.H0",
+   "quiet",
+   "We are going to",
+   0.92
+  ],
+  [
+   "L0.H4",
+   "fire",
+   "CCL is a library. CCL",
+   0.51
+  ],
+  [
+   "L0.M203",
+   "quiet",
+   "She is",
+   0.96
+  ],
+  [
+   "L0.M203",
+   "quiet",
+   "The answer is",
+   0.94
+  ],
+  [
+   "L0.M2650",
+   "fire",
+   "It is found in Costa Rica.\n\n",
+   0.88
+  ],
+  [
+   "L0.M2650",
+   "fire",
+   "the event they have over there.\n\n",
+   0.84
+  ],
+  [
+   "L0.M1181",
+   "quiet",
+   "The cat and",
+   0.96
+  ],
+  [
+   "L0.M147",
+   "quiet",
+   "The king",
+   0.93
+  ],
+  [
+   "L1.M2889",
+   "quiet",
+   "float",
+   1.0
+  ],
+  [
+   "L3.M720",
+   "quiet",
+   "The lake is",
+   0.91
+  ],
+  [
+   "L3.M720",
+   "quiet",
+   "Our team won the",
+   0.99
+  ],
+  [
+   "L3.M338",
+   "fire",
+   "\tSIOCIF_AT",
+   0.88
+  ],
+  [
+   "L1.M2960",
+   "quiet",
+   "the ranges",
+   1.0
+  ],
+  [
+   "L1.M2229",
+   "quiet",
+   "add",
+   1.0
+  ],
+  [
+   "L3.M583",
+   "fire",
+   "Visit http://www.",
+   0.22
+  ]
+ ]
+}
