@@ -2100,7 +2100,10 @@ pub fn fit(
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
             let scored = bits.iter().map(Vec::len).sum::<usize>();
-            let scale = tokens as f64 / scored as f64;
+            // The batch is one of `B` drawn uniformly, so `B` times its data term is an unbiased
+            // estimate of the whole collection's, whatever the batch's share of the tokens; the
+            // epoch's mean of these estimates is the collection's data term exactly.
+            let scale = draws.len() as f64;
             let data = scale * LN_2 * bits.iter().flatten().sum::<f64>();
             // `Σ_G KL_G` and the active groups' variances at the posterior the sample was drawn from.
             let variances = device_posterior.variances()?;
@@ -2145,7 +2148,9 @@ pub fn fit(
             data_sum += data;
             description_sum += description;
             progress.step += 1;
-            device_posterior.step(&gradients, LN_2 / scored as f64, (&factor.gradient, 1.0 / factor.tokens as f64), &ivon)?;
+            // Per token of the collection: `B / N` times the batch's gradient and squared factor.
+            let weight = draws.len() as f64 / tokens as f64;
+            device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, weight), &ivon)?;
             log::info!(
                 "library step {epoch}.{b}: {:.6} bits per scored token, F estimate {:.6e} bits, {:.2} s",
                 bits.iter().flatten().sum::<f64>() / scored as f64,
