@@ -5,9 +5,10 @@
 //! EXPORT TOKENIZER SETTINGS.json OUT.json [ARTIFACT]
 //!
 //! Without `ARTIFACT` (a `library_mdl` posterior-mean `artifact.bin`), the read-out is of the
-//! library's starting point, where every function is a native head or neuron. The model runs in
-//! float64 (CUDA when present, else the host); vocabulary-wide searches and wiring products run on
-//! the single-precision device when present (CUDA f32 or the Apple GPU).
+//! library's starting point, where every function is a native head or neuron. The model runs on
+//! CUDA in float64 when present, else on the Apple GPU in f32 when present, else on the host;
+//! vocabulary-wide searches and wiring products run on the single-precision device when present
+//! (CUDA f32 or the Apple GPU).
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     artifact::Artifact,
@@ -52,8 +53,12 @@ fn main() -> Result<(), String> {
         return Err("an empty held-out range".into());
     }
     let started = Instant::now();
-    let exact = Device::accelerator(GpuPolicy::Auto).map_err(|e| e.to_string())?.unwrap_or_else(Device::host);
-    let wide = Device::single_precision(GpuPolicy::Auto).map_err(|e| e.to_string())?.unwrap_or_else(|| exact.clone());
+    let wide = Device::single_precision(GpuPolicy::Auto).map_err(|e| e.to_string())?;
+    let model = match Device::accelerator(GpuPolicy::Auto).map_err(|e| e.to_string())? {
+        Some(cuda) => cuda,
+        None => wide.clone().unwrap_or_else(Device::host),
+    };
+    let wide = wide.unwrap_or_else(|| model.clone());
     let imported = import_language_model(export, end, settings.context)?;
     let layer_count = imported.record["config"]["n_layers"].as_u64().ok_or("config.n_layers")? as usize;
     let native = split_sites(&imported.program)?;
@@ -61,13 +66,15 @@ fn main() -> Result<(), String> {
     let SlotValues::Tokens(tokens) = &imported.family.slots[0] else {
         return Err("a token slot".into());
     };
+    let tokens = tokens.clone();
+    drop(imported);
     let sequences: Vec<Vec<u32>> = tokens.chunks(settings.context).skip(first).map(<[u32]>::to_vec).collect();
     let artifact = match artifact_path {
         Some(path) => Artifact::from_bytes(&std::fs::read(path).map_err(|e| e.to_string())?, &native.declarations)?,
         None => library_mdl::explanation(&native, &layers)?.artifact,
     };
     artifact.validate_coverage(&native)?;
-    let readout = library_readout::read_out(&exact, &wide, &native, &layers, &artifact, &sequences, &settings.readout)?;
+    let readout = library_readout::read_out(&model, &wide, &native, &layers, &artifact, &sequences, &settings.readout)?;
     let vocabulary = Vocabulary::from_tokenizer(Path::new(tokenizer))?;
     let text = |t: u32| vocabulary.text(&[t]);
     let mut functions = serde_json::to_value(&readout.functions).map_err(|e| e.to_string())?;
@@ -105,7 +112,7 @@ fn main() -> Result<(), String> {
         "artifact": artifact_path.map(|p| p.display().to_string()),
         "artifact_sha256": artifact_path.map(sha256).transpose()?,
         "source_revision": option_env!("GAM_BUILD_GIT_SHA"),
-        "exact_device": exact.name(),
+        "model_device": model.name(),
         "wide_device": wide.name(),
         "held_out_sequences": [first, end],
         "held_out_tokens": readout.held_out_tokens,

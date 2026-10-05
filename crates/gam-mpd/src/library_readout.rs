@@ -41,9 +41,9 @@
 //!   of the held-out text. `self_top1` is the fraction of those sources whose largest output is
 //!   the source token itself (copying).
 //!
-//! The model runs on the exact device in its own arithmetic; the vocabulary-wide searches (top
-//! tokens, OV entries) and the wiring products run on the products device, and every reported
-//! token score is recomputed in float64 on the host.
+//! The model runs on its device in that device's arithmetic; the vocabulary-wide searches (top
+//! tokens, OV entries) and the wiring products run on the products device; every reported token
+//! score is recomputed in float64 on the host from the selected tokens.
 use crate::{
     artifact::Artifact,
     artifact_device::mapped_inlined_observed,
@@ -368,8 +368,8 @@ fn products(device: &Device, rows: &Array2<f64>, table: &Array2<f64>) -> Result<
 }
 
 /// Each row of `table` divided by `√(mean(row²) + ε)`.
-fn normed_rows(table: &Array2<f64>, epsilon: f64) -> Array2<f64> {
-    let mut out = table.clone();
+fn normed_rows(table: Array2<f64>, epsilon: f64) -> Array2<f64> {
+    let mut out = table;
     out.outer_iter_mut().into_par_iter().for_each(|mut row| {
         let r = (row.iter().map(|v| v * v).sum::<f64>() / row.len() as f64 + epsilon).sqrt();
         row.mapv_inplace(|v| v / r);
@@ -389,8 +389,8 @@ fn dot(a: ArrayView1<f64>, b: ArrayView1<f64>) -> f64 {
 
 /// The read-out (module note) of `artifact`, a library explanation of the split native program
 /// `native` (`run_check::split_sites`) with its `layers`, on the held-out `sequences` (of equal
-/// length). The model runs on `exact`; vocabulary-wide searches and wiring products on `wide`.
-pub fn read_out(exact: &Device, wide: &Device, native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact, sequences: &[Vec<u32>], settings: &Settings) -> Result<Readout, String> {
+/// length). The model runs on `model`; vocabulary-wide searches and wiring products on `wide`.
+pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact, sequences: &[Vec<u32>], settings: &Settings) -> Result<Readout, String> {
     if settings.batch_sequences == 0 || settings.tile_rows == 0 || settings.numeric_bytes == 0 || sequences.is_empty() {
         return Err("invalid read-out settings or no held-out sequences".into());
     }
@@ -421,9 +421,8 @@ pub fn read_out(exact: &Device, wide: &Device, native: &OperatorProgram, layers:
         return Err("the artifact holds no library functions".into());
     }
     // The final norm's gain with the unembedding, and the input embedding (vocabulary × width).
-    let head = Head::of(native)?;
-    let final_gain = site(native, head.hidden)?.gain;
-    let mut unembedding = head.embedding.clone();
+    let Head { hidden, embedding: mut unembedding, .. } = Head::of(native)?;
+    let final_gain = site(native, hidden)?.gain;
     unembedding.axis_iter_mut(Axis(0)).for_each(|mut row| row *= &final_gain);
     let unembedding_mean = unembedding.mean_axis(Axis(0)).ok_or("an empty vocabulary")?;
     let feature = native.nodes.iter().position(|n| matches!(n, Node::Feature { .. })).ok_or("no token feature")?;
@@ -431,11 +430,24 @@ pub fn read_out(exact: &Device, wide: &Device, native: &OperatorProgram, layers:
         .nodes
         .iter()
         .find_map(|n| match n {
-            Node::Affine { terms, bias: None } if terms.len() == 1 && terms[0].0 == feature => Some(native.operators[terms[0].1].matrix()),
+            Node::Affine { terms, bias: None } if terms.len() == 1 && terms[0].0 == feature => Some(native.operators[terms[0].1].matrix_cow()),
             _ => None,
         })
         .ok_or("no token embedding")?;
-    let embedding = if embedding.nrows() == unembedding.ncols() { embedding.t().to_owned() } else { embedding };
+    let embedding = if embedding.nrows() == unembedding.ncols() { embedding.t().to_owned() } else { embedding.into_owned() };
+    let (vocabulary, width) = embedding.dim();
+    // Per read epsilon, the embedding's rows through that read's norm (on the host and on `wide`).
+    let mut epsilons: Vec<f64> = sites.iter().map(|s| s.epsilon).collect();
+    epsilons.sort_by(f64::total_cmp);
+    epsilons.dedup();
+    let mut embedding = Some(embedding);
+    let mut embedding_tables: BTreeMap<u64, (Array2<f64>, Tensor)> = BTreeMap::new();
+    for (e, epsilon) in epsilons.iter().enumerate() {
+        let raw = if e + 1 == epsilons.len() { embedding.take() } else { embedding.clone() }.ok_or("no embedding")?;
+        let table = normed_rows(raw, *epsilon);
+        let resident = wide.upload(table.view()).map_err(error)?;
+        embedding_tables.insert(epsilon.to_bits(), (table, resident));
+    }
 
     // Observed values: each site's stream, each MLP's activations and gate pre-activations, each
     // head's query, key and read.
@@ -448,9 +460,11 @@ pub fn read_out(exact: &Device, wide: &Device, native: &OperatorProgram, layers:
         paths.extend([vec![b.call, b.query], vec![b.call, b.key], vec![b.call]]);
     }
     let (flat, _, observed) = mapped_inlined_observed(program, &paths)?;
-    let fixed = Head::of(&flat)?;
-    let mut device_program = DeviceProgram::compile_values_bounded(exact, &fixed.prefix(&flat), settings.numeric_bytes)?;
-    device_program.set_arithmetic(arithmetic(exact));
+    let prefix = Head::of(&flat)?.prefix(&flat);
+    drop(flat);
+    let mut device_program = DeviceProgram::compile_values_bounded(model, &prefix, settings.numeric_bytes)?;
+    drop(prefix);
+    device_program.set_arithmetic(arithmetic(model));
 
     let k = settings.contexts;
     let mlp_first = |l: usize| 2 * l + 2;
@@ -475,7 +489,7 @@ pub fn read_out(exact: &Device, wide: &Device, native: &OperatorProgram, layers:
         let first_row = chunk * settings.batch_sequences * length;
         let family = sequence_family(&batch.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
         let trace = device_program.forward(&family)?;
-        let get = |i: usize| -> Result<Array2<f64>, String> { exact.download(trace.value(observed[i])?).map_err(error) };
+        let get = |i: usize| -> Result<Array2<f64>, String> { model.download(trace.value(observed[i])?).map_err(error) };
         let rows = family.rows;
         let inverse: Vec<Array1<f64>> = sites
             .iter()
@@ -607,14 +621,6 @@ pub fn read_out(exact: &Device, wide: &Device, native: &OperatorProgram, layers:
 
     // What MLP functions write and read, in tokens.
     let unembedding_table = wide.upload(unembedding.view()).map_err(error)?;
-    let mut embedding_tables: BTreeMap<u64, (Array2<f64>, Tensor)> = BTreeMap::new();
-    for s in &sites {
-        if let std::collections::btree_map::Entry::Vacant(e) = embedding_tables.entry(s.epsilon.to_bits()) {
-            let table = normed_rows(&embedding, s.epsilon);
-            let resident = wide.upload(table.view()).map_err(error)?;
-            e.insert((table, resident));
-        }
-    }
     for (b, block) in mlps.iter().enumerate() {
         let kept: Vec<usize> = (0..block.gate.nrows()).filter(|i| mlp_index[b][*i].is_some()).collect();
         if kept.is_empty() {
@@ -639,7 +645,7 @@ pub fn read_out(exact: &Device, wide: &Device, native: &OperatorProgram, layers:
     }
 
     // Heads: the OV map's largest entries over the held-out text's tokens.
-    let mut present: Vec<usize> = sequences.iter().flatten().map(|t| *t as usize).filter(|t| *t < embedding.nrows()).collect();
+    let mut present: Vec<usize> = sequences.iter().flatten().map(|t| *t as usize).filter(|t| *t < vocabulary).collect();
     present.sort_unstable();
     present.dedup();
     for (h, block) in heads.iter().enumerate() {
@@ -647,7 +653,7 @@ pub fn read_out(exact: &Device, wide: &Device, native: &OperatorProgram, layers:
         let read_site = &sites[2 * block.layer];
         let (table, _) = &embedding_tables[&read_site.epsilon.to_bits()];
         let value_read = &block.value * &read_site.gain.view().insert_axis(Axis(0));
-        let sources = Array2::from_shape_fn((present.len(), embedding.ncols()), |(r, c)| table[[present[r], c]]).dot(&value_read.t());
+        let sources = Array2::from_shape_fn((present.len(), width), |(r, c)| table[[present[r], c]]).dot(&value_read.t());
         let output = block.output.t().to_owned();
         let resident = {
             let columns = wide.upload(block.output.view()).map_err(error)?;
@@ -710,7 +716,7 @@ pub fn read_out(exact: &Device, wide: &Device, native: &OperatorProgram, layers:
         if readers.is_empty() {
             continue;
         }
-        let reader_rows = Array2::from_shape_fn((rows.len(), embedding.ncols()), |(r, c)| rows[r][c]);
+        let reader_rows = Array2::from_shape_fn((rows.len(), width), |(r, c)| rows[r][c]);
         let mut best: Vec<Best> = vec![Best::default(); readers.len()];
         // Every reader against a block of writers, `weight(reader, c)` the weight from writer `c`
         // (function `writers[c]`).
