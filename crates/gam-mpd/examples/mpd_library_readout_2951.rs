@@ -137,7 +137,7 @@ fn costs(args: &[String]) -> Result<(), String> {
     drop(imported);
     let layers = layer_nodes(&native, layer_count)?;
     let explanation = library_mdl::explanation(&native, &layers)?;
-    let posterior = library_mdl::checkpoint_posterior(&explanation, Path::new(checkpoint))?;
+    let posterior = library_readout::checkpoint_posterior(&explanation, Path::new(checkpoint))?;
     let costs = library_readout::function_costs(&explanation, &posterior);
     // Totals count each prior group once (a key and value group may serve several query heads).
     let by_layer = library_readout::layer_costs(&explanation, &posterior);
@@ -254,7 +254,10 @@ fn main() -> Result<(), String> {
     let (model, wide) = devices()?;
     let (native, layers, tokens, artifact) = load(export, end, settings.context, artifact_path)?;
     let sequences: Vec<Vec<u32>> = tokens.chunks(settings.context).skip(first).map(<[u32]>::to_vec).collect();
-    let readout = library_readout::read_out(&model, &wide, &native, &layers, &artifact, &sequences, &settings.readout)?;
+    let library = Library::new(&model, &wide, &native, &layers, &artifact, settings.readout.numeric_bytes, settings.readout.tile_rows)?;
+    // The library holds what the read-out reads; the programs it came from go.
+    drop((native, layers, artifact));
+    let readout = library_readout::read_out(&library, &sequences, &settings.readout)?;
     let vocabulary = Vocabulary::from_tokenizer(Path::new(tokenizer))?;
     let text = |t: u32| vocabulary.text(&[t]);
     let mut functions = serde_json::to_value(&readout.functions).map_err(|e| e.to_string())?;

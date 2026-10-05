@@ -495,6 +495,8 @@ pub struct Library<'a> {
     unembedding: Array2<f64>,
     unembedding_mean: Array1<f64>,
     unembedding_table: Tensor,
+    /// The input embedding (vocabulary × width).
+    embedding: Array2<f64>,
     program: DeviceProgram,
     observed: Vec<usize>,
     mlp_paths: Vec<usize>,
@@ -681,6 +683,16 @@ impl<'a> Library<'a> {
         unembedding.axis_iter_mut(Axis(0)).for_each(|mut row| row *= &final_site.gain);
         let unembedding_mean = unembedding.mean_axis(Axis(0)).ok_or("an empty vocabulary")?;
         let unembedding_table = wide.upload(unembedding.view()).map_err(error)?;
+        let feature = native.nodes.iter().position(|n| matches!(n, Node::Feature { .. })).ok_or("no token feature")?;
+        let embedding = native
+            .nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::Affine { terms, bias: None } if terms.len() == 1 && terms[0].0 == feature => Some(native.operators[terms[0].1].matrix_cow()),
+                _ => None,
+            })
+            .ok_or("no token embedding")?;
+        let embedding = if embedding.nrows() == unembedding.ncols() { embedding.t().to_owned() } else { embedding.into_owned() };
         // Observed values: each site's stream and the final one, each MLP's activations, gate
         // pre-activations and up values, each head's query, key and read.
         let place = |n: usize| artifact.place(n).ok_or_else(|| format!("the artifact does not hold native node {n}"));
@@ -716,6 +728,7 @@ impl<'a> Library<'a> {
             unembedding,
             unembedding_mean,
             unembedding_table,
+            embedding,
             program: compiled,
             observed,
             mlp_paths,
@@ -1012,10 +1025,8 @@ impl<'a> Library<'a> {
 
 // ------------------------------------------------------------------------------ the read-out
 
-/// The read-out (module note) of `artifact`, a library explanation of the split native program
-/// `native` (`run_check::split_sites`) with its `layers`, on the held-out `sequences` (of equal
-/// length). The model runs on `model`; vocabulary-wide searches and wiring products on `wide`.
-pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact, sequences: &[Vec<u32>], settings: &Settings) -> Result<Readout, String> {
+/// The read-out (module note) of `library` on the held-out `sequences` (of equal length).
+pub fn read_out(library: &Library, sequences: &[Vec<u32>], settings: &Settings) -> Result<Readout, String> {
     if settings.batch_sequences == 0 || sequences.is_empty() || settings.thresholds.iter().any(|t| !(t.is_finite() && *t > 0.0)) {
         return Err("invalid read-out settings or no held-out sequences".into());
     }
@@ -1023,28 +1034,16 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
     if length == 0 || sequences.iter().any(|s| s.len() != length) {
         return Err("held-out sequences must be nonempty and of equal length".into());
     }
-    let library = Library::new(model, wide, native, layers, artifact, settings.numeric_bytes, settings.tile_rows)?;
-    let Library { sites, mlps, heads, unembedding, unembedding_mean, unembedding_table, .. } = &library;
-    let feature = native.nodes.iter().position(|n| matches!(n, Node::Feature { .. })).ok_or("no token feature")?;
-    let embedding = native
-        .nodes
-        .iter()
-        .find_map(|n| match n {
-            Node::Affine { terms, bias: None } if terms.len() == 1 && terms[0].0 == feature => Some(native.operators[terms[0].1].matrix_cow()),
-            _ => None,
-        })
-        .ok_or("no token embedding")?;
-    let embedding = if embedding.nrows() == unembedding.ncols() { embedding.t().to_owned() } else { embedding.into_owned() };
+    let Library { sites, mlps, heads, unembedding, unembedding_mean, unembedding_table, embedding, wide, layer_heads, .. } = library;
+    let layers = layer_heads.len();
     let (vocabulary, width) = embedding.dim();
     // Per read epsilon, the embedding's rows through that read's norm (on the host and on `wide`).
     let mut epsilons: Vec<f64> = sites.iter().map(|s| s.epsilon).collect();
     epsilons.sort_by(f64::total_cmp);
     epsilons.dedup();
-    let mut embedding = Some(embedding);
     let mut embedding_tables: BTreeMap<u64, (Array2<f64>, Tensor)> = BTreeMap::new();
-    for (e, epsilon) in epsilons.iter().enumerate() {
-        let raw = if e + 1 == epsilons.len() { embedding.take() } else { embedding.clone() }.ok_or("no embedding")?;
-        let table = normed_rows(raw, *epsilon);
+    for epsilon in &epsilons {
+        let table = normed_rows(embedding.clone(), *epsilon);
         let resident = wide.upload(table.view()).map_err(error)?;
         embedding_tables.insert(epsilon.to_bits(), (table, resident));
     }
@@ -1072,7 +1071,7 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
     let (mut rng, mut samples) = (StdRng::seed_from_u64(0), 0.0);
     // Per cut, the summed participation number and, per threshold, the summed count of functions
     // with |A_i(t)| > τ |m(t)|.
-    let cuts = 2 * layers.len();
+    let cuts = 2 * layers;
     let mut cut_participation = vec![0.0; cuts];
     let mut cut_counts = vec![vec![0.0; thresholds.len()]; cuts];
     let batches: Vec<(usize, &[Vec<u32>])> = sequences.chunks(settings.batch_sequences).enumerate().map(|(c, b)| (c * settings.batch_sequences * length, b)).collect();
@@ -1249,7 +1248,7 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
     let mut removed = Vec::new();
     let mut head_index = vec![None; heads.len()];
     let mut mlp_index: Vec<Vec<Option<usize>>> = mlps.iter().map(|b| vec![None; b.gate.nrows()]).collect();
-    for l in 0..layers.len() {
+    for l in 0..layers {
         for (h, block) in heads.iter().enumerate().filter(|(_, b)| b.layer == l) {
             let name = format!("L{l}.H{}", block.head);
             if block.value.iter().all(|v| *v == 0.0) || block.output.iter().all(|v| *v == 0.0) {
