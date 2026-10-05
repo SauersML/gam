@@ -115,6 +115,8 @@ pub struct Teacher {
     tile_rows: usize,
     numeric_bytes: usize,
     retained_target_bytes: Mutex<usize>,
+    attention: Vec<(usize, bool)>,
+    law_code_bytes: usize,
 }
 impl Teacher {
     pub fn new(
@@ -128,8 +130,31 @@ impl Teacher {
         }
         let (source, _) = crate::artifact_device::mapped_inlined(source)?;
         let head = Arc::new(Head::of(&source)?);
-        let prefix =
-            DeviceProgram::compile_values_bounded(device, &head.prefix(&source), numeric_bytes)?;
+        let prefix_source = head.prefix(&source);
+        let mut attention = Vec::new();
+        let mut law_code_bytes = 0usize;
+        for node in &prefix_source.nodes {
+            match node {
+                Node::Attend { query, rotary, .. } => attention.push((
+                    prefix_source.node_interface(*query).map_err(error)?.width(),
+                    rotary.is_some(),
+                )),
+                Node::Pointwise { input, .. } => {
+                    law_code_bytes = law_code_bytes
+                        .checked_add(
+                            prefix_source
+                                .node_interface(*input)
+                                .map_err(error)?
+                                .width()
+                                .checked_mul(4)
+                                .ok_or("law code size overflow")?,
+                        )
+                        .ok_or("law code bytes overflow")?
+                }
+                _ => continue,
+            }
+        }
+        let prefix = DeviceProgram::compile_values_bounded(device, &prefix_source, numeric_bytes)?;
         if head
             .embedding
             .len()
@@ -147,6 +172,8 @@ impl Teacher {
             tile_rows,
             numeric_bytes,
             retained_target_bytes: Mutex::new(0),
+            attention,
+            law_code_bytes,
         })
     }
     /// Resident numeric bytes retained in compact labels (entropy is CPU metadata).
@@ -196,6 +223,46 @@ impl Teacher {
                 )
             })
             .ok_or("compact teacher plan overflow")?;
+        let mut attention_peak = 0usize;
+        let mut indices = self.law_code_bytes;
+        for (query_width, rotary) in &self.attention {
+            let scratch = rows
+                .checked_mul(rows)
+                .and_then(|n| n.checked_mul(8 * 12))
+                .and_then(|n| n.checked_add(rows.checked_mul(*query_width)?.checked_mul(8 * 16)?))
+                .ok_or("attention workspace overflow")?;
+            attention_peak = attention_peak.max(scratch);
+            if *rotary {
+                indices = indices
+                    .checked_add(
+                        rows.checked_mul(*query_width)
+                            .and_then(|n| n.checked_mul(8 * 2))
+                            .ok_or("rotation indices overflow")?,
+                    )
+                    .ok_or("indices bytes overflow")?;
+            }
+        }
+        for slot in &inputs.slots {
+            if let crate::operator_program::SlotValues::Tokens(tokens) = slot {
+                indices = indices
+                    .checked_add(
+                        tokens
+                            .len()
+                            .checked_mul(4)
+                            .ok_or("token indices overflow")?,
+                    )
+                    .ok_or("indices bytes overflow")?;
+            }
+        }
+        if scored.is_some() {
+            indices = indices
+                .checked_add(rows.checked_mul(4).ok_or("scored flags overflow")?)
+                .ok_or("indices bytes overflow")?;
+        }
+        let planned = planned
+            .checked_add(attention_peak)
+            .and_then(|v| v.checked_add(indices))
+            .ok_or("teacher attention/indices plan overflow")?;
         let mut retained = self
             .retained_target_bytes
             .lock()
@@ -385,5 +452,67 @@ impl ResidentHead {
             }
         }
         Ok((losses, seed))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        composed_rule_search::{Expr, Unary, UseSpec, compile},
+        operator_program::{Scale, SequenceLayout, SlotValues},
+    };
+    #[test]
+    fn teacher_refuses_quadratic_attention_workspace_before_forward() {
+        let expression = Expr::Unary(Unary::GeluTanh, Box::new(Expr::Argument(0)));
+        let mut source = compile(
+            &expression,
+            2,
+            &[UseSpec {
+                input_width: 2,
+                output_width: 2,
+            }],
+            7,
+        )
+        .expect("small fixture")
+        .program;
+        // Standalone reader/head matrices provide legal typed operator maps.
+        source.nodes = vec![
+            Node::Raw { slot: 0 },
+            Node::Attend {
+                query: 0,
+                key: 0,
+                value: 0,
+                scale: Scale::InverseSqrt(2),
+                rotary: None,
+                causal: true,
+            },
+            Node::Affine {
+                terms: vec![(1, 2)],
+                bias: None,
+            },
+        ];
+        source.output = 2;
+        let teacher = Teacher::new(&Device::host(), &source, 1, 100_000)
+            .expect("fixed compiler fits small budget");
+        let inputs = FamilyInputs {
+            rows: 100,
+            slots: vec![SlotValues::Raw(Array2::ones((100, 2)))],
+            layout: Some(SequenceLayout {
+                sequence: vec![0; 100],
+                position: (0..100).collect(),
+            }),
+        };
+        let failure = teacher
+            .target(&inputs, None)
+            .err()
+            .expect("quadratic attention must exceed budget");
+        assert!(failure.contains("numeric plan"));
+        assert_eq!(
+            teacher
+                .retained_target_numeric_bytes()
+                .expect("target lease"),
+            0
+        );
     }
 }
