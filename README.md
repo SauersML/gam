@@ -13,7 +13,7 @@ One Rust engine serves both the Python package (`gamfit`) and the CLI (`gam`).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme_temperature_dark.png">
-  <img alt="A single 3-D annual temperature loop showing all 366 daily Central Park observations from 2024. Height and color both encode temperature in Celsius; angle encodes day of year. The thick periodic gamfit mean and its vertical 95% credible ribbon join smoothly at the year boundary. The circular base axis marks calendar months." src="docs/images/readme_temperature.png" width="1200">
+  <img alt="A single 3-D calendar loop showing all 3,653 daily Central Park temperature observations from 2015–2024 as translucent, unconnected points. Every year maps to the same calendar. Height and color encode temperature in Celsius. The thick periodic gamfit mean and its vertical 95% credible ribbon join smoothly at the year boundary. The circular base axis marks months." src="docs/images/readme_temperature.png" width="1200">
 </picture>
 
 Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
