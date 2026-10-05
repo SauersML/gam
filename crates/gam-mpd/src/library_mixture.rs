@@ -29,8 +29,11 @@
 //! `M` keeps the projections `O`, so a group's value–output maps `O_i V` are those of the
 //! candidate when `V = T V_s`: the symmetry `V → R V`, `O → O R⁻¹` read through the projections
 //! where the transport's residual is zero, an approximation otherwise; `T` is sent with `M` and
-//! costs nothing. The scales `c_j`, the
-//! weights `π = softmax(z)` of the logits `z` and the variance `s²` are learned. As the groups' own
+//! costs nothing. The weights `π = softmax(z)` of the logits `z` are learned; each epoch sets the
+//! scales `c_j` (the posterior-weighted least-squares fit of the target's means by the
+//! candidate's) and the variance `s²` (the best candidate's expected residual per entry, below)
+//! at the posterior, as `library_mdl` sets `v`: a step of a learning rate in `c` would move an
+//! exact copy far beyond its posterior deviations. As the groups' own
 //! Gaussian times `r(g) = π_0 + Σ_j π_j N(g; c_j u_j, s² I) / N(g; 0, diag v)`, the divergence is
 //! `KL(q ‖ N(0, diag v)) − E_q[ln r(g)]`. `library_mdl` keeps the first term's closed form; this
 //! module estimates the second from the fit's own reparameterized weight sample, an unbiased
@@ -55,16 +58,21 @@
 //!
 //! # Candidates
 //!
-//! The `K` candidates only bound the compute; the weights decide. Each epoch they are re-chosen
-//! per target by the posterior-normalized misfit of the best scaled candidate,
-//! `m(u) = min_c Σ_k (μ_k − c u_k)² / σ_k²` over the target's posterior means `μ` and deviations
-//! `σ`: the `K` candidates of smallest misfit. A candidate kept keeps its logit and scale; a new
-//! one starts at its least-squares scale and the zero component's logit.
+//! Each epoch the candidates are re-chosen per target by the posterior-normalized misfit of the
+//! best scaled candidate, `m(u) = min_c Σ_k (μ_k − c u_k)² / σ_k²` over the target's posterior
+//! means `μ` and deviations `σ`: the `K` of smallest misfit, of which the target keeps those that
+//! pay for themselves in `F`. A candidate alone, taking the whole weight at the best
+//! `s² = E_q‖g − c u‖² / D`, saves the divergence `Σ_k [½ ln(v_k / s²) − ½ + E_q[g_k²] / (2 v_k)]`;
+//! in decreasing saving each is kept while its saving exceeds what it adds to the mixture's own
+//! code length below. A target keeping none has no mixture, costs nothing and is not sampled. A
+//! candidate kept keeps its logit; a new one starts at the zero component's.
 //!
 //! # Hardening
 //!
-//! When one candidate holds more than half of its target's mixture weight, the sharing is made
-//! exact: a gate reading an earlier write becomes a tie (`library_sharing::tie`), a gate or up
+//! When one candidate holds more than half of its target's mixture weight, and making it exact is
+//! predicted to lower `F` (the target's groups' costs exceed half the misfit of the equality in
+//! the posterior's deviations, the data term's rise at its curvature, plus the choice's `ln n`),
+//! the sharing is made exact: a gate reading an earlier write becomes a tie (`library_sharing::tie`), a gate or up
 //! direction a scale times an earlier read or a token's embedding row (`library_sharing::tie_row`),
 //! an output vector a scale times an earlier one
 //! (`library_sharing::tie_column`), two key-value groups one shared query–key function with the
@@ -540,27 +548,97 @@ impl Mixture {
         Ok(out)
     }
 
-    /// Target `t`'s new candidates replace its old ones: kept
-    /// candidates keep their logit, scale and moments, new ones start at the zero logit.
-    fn adopt(&mut self, t: usize, chosen: Vec<Choice>, initial_log_variance: f64) {
+    /// Target `t`'s new candidates, with their scales and the variance `ln s²` the epoch sets,
+    /// replace its old ones: a kept candidate keeps its logit and its moments, a new one starts at
+    /// the zero logit.
+    fn adopt(&mut self, t: usize, chosen: Vec<Choice>, log_variance: f64) {
         let old = std::mem::take(&mut self.targets[t].components);
         let zero = self.targets[t].zero_logit;
         let mut moments = vec![self.moments[t][0]];
         let mut components = Vec::with_capacity(chosen.len());
         for Choice { write, scale, gauge, assignment, transport } in chosen {
             let (component, moment) = match old.iter().position(|c| c.write == write) {
-                Some(at) => (Component { gauge, assignment, transport, ..old[at].clone() }, [self.moments[t][1 + 2 * at], self.moments[t][2 + 2 * at]]),
+                Some(at) => (Component { scale, gauge, assignment, transport, ..old[at].clone() }, [self.moments[t][1 + 2 * at], self.moments[t][2 + 2 * at]]),
                 None => (Component { write, scale, logit: zero, gauge, assignment, transport }, [Moment::default(); 2]),
             };
             components.push(component);
             moments.extend(moment);
         }
-        if old.is_empty() {
-            self.targets[t].log_variance = initial_log_variance;
-        }
+        self.targets[t].log_variance = log_variance;
         moments.push(self.moments[t].last().copied().unwrap_or_default());
         self.targets[t].components = components;
         self.moments[t] = moments;
+    }
+
+    /// Target `t`'s size `|G|` at `posterior`: the entries its groups hold in the explanation.
+    fn size(&self, t: usize, posterior: &Posterior) -> Result<f64, String> {
+        Ok(match self.targets[t].kind {
+            Kind::Gate { .. } | Kind::Up { .. } | Kind::Output { .. } => self.cells[t].iter().map(|(_, rows, cols)| (rows.len() * cols.len()) as f64).sum::<f64>(),
+            Kind::QueryKey { layer, group } => {
+                let maps = self.key_value(layer, group)?;
+                let d = posterior.mean[maps.key].ncols();
+                self.live_planes(maps, posterior).iter().map(|p| ((maps.queries.len() + 1) * maps.planes[*p].len() * d) as f64).sum()
+            }
+            Kind::Value { layer, group } => {
+                let maps = self.value(layer, group)?;
+                (Self::live_rows(maps, posterior).len() * posterior.mean[maps.value].ncols()) as f64
+            }
+        })
+    }
+
+    /// The nats of a target's `k` candidates among `n` and their parameters (module note):
+    /// `ln C(n, k)`, and `½ ln |G|` for each of its `k` logits, `k` scales and its variance.
+    fn choice_nats(n: usize, k: usize, size: f64) -> f64 {
+        if k == 0 {
+            return 0.0;
+        }
+        let (n, k) = (n as f64, k.min(n) as f64);
+        ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0) + (2.0 * k + 1.0) * 0.5 * size.ln()
+    }
+
+    /// The nats of a component's target-dependent alignment: 64 bits per stored gauge entry and
+    /// scale, and its assignment of `m` query heads, one of `m!` (module note). A value map's
+    /// transport and a block's scale are not sent this way: `M` fixes the first, the second is a
+    /// learned parameter.
+    fn alignment_nats(component: &Component) -> f64 {
+        let gauge = component.gauge.iter().map(|(rotation, _)| rotation.len() + 1).sum::<usize>();
+        gauge as f64 * 64.0 * std::f64::consts::LN_2 + if component.assignment.len() > 1 { ln_gamma(component.assignment.len() as f64 + 1.0) } else { 0.0 }
+    }
+
+    /// The candidates target `t` keeps (module note, # Candidates): each candidate's gain alone at
+    /// `posterior`, `Σ_k [½ ln(v_k / s²) − ½ + E[g_k²] / (2 v_k)]` with `s² = E‖g − c u‖² / D`
+    /// (the divergence it saves when its component takes the whole weight at the best `s²`), from
+    /// the target's means `mean`, variances `variance` and prior variances `v` per entry and each
+    /// candidate's mean vector and total variance; in decreasing gain, a candidate is kept while
+    /// its gain exceeds what keeping it adds to the mixture's own code length.
+    fn admit(&self, t: usize, posterior: &Posterior, (mean, variance, v): (ArrayView1<'_, f64>, ArrayView1<'_, f64>, ArrayView1<'_, f64>), candidates: Vec<(Choice, Array1<f64>, f64)>) -> Result<(Vec<Choice>, f64), String> {
+        let entries = mean.len() as f64;
+        let second: Array1<f64> = &mean * &mean + &variance;
+        let base: f64 = second.iter().zip(&v).map(|(e, v)| e / (2.0 * v) - 0.5).sum::<f64>();
+        let mut gains: Vec<(f64, f64, Choice)> = candidates
+            .into_iter()
+            .map(|(choice, u, u_variance)| {
+                let c = choice.scale;
+                let residual = (&mean - &(&u * c)).mapv(|r| r * r).sum() + variance.sum() + c * c * u_variance;
+                let s2 = residual / entries;
+                let gain = base + v.iter().map(|v| 0.5 * (v / s2).ln()).sum::<f64>();
+                (gain, s2, choice)
+            })
+            .filter(|(gain, s2, _)| gain.is_finite() && *s2 > 0.0)
+            .collect();
+        gains.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let s2 = gains.first().map_or(1.0, |g| g.1);
+        let (n, size) = (self.targets[t].choices, self.size(t, posterior)?);
+        let mut kept = Vec::new();
+        for (gain, _, choice) in gains {
+            let k = kept.len() + 1;
+            let added = Self::choice_nats(n, k, size) - Self::choice_nats(n, k - 1, size) + Self::alignment_nats(&Component { write: choice.write, scale: choice.scale, logit: 0.0, gauge: choice.gauge.clone(), assignment: choice.assignment.clone(), transport: None });
+            if gain <= added {
+                break;
+            }
+            kept.push(choice);
+        }
+        Ok((kept, s2.ln()))
     }
 
     /// Re-choose every target's candidates at `posterior` (module note). A gate's candidates are
@@ -622,14 +700,30 @@ impl Mixture {
                 }
                 start = end;
             }
+            let deviations = |i: usize| -> Result<&Array2<f64>, String> { posterior.log_sd.get(i).ok_or_else(|| "a posterior deviation".to_string()) };
+            let mut adopted = Vec::with_capacity(rows.len());
             for (slot, &t) in rows.iter().enumerate() {
                 let i = match self.targets[t].kind {
                     Kind::Gate { function, .. } | Kind::Up { function, .. } | Kind::Output { function, .. } => function,
                     Kind::QueryKey { .. } | Kind::Value { .. } => continue,
                 };
-                // A new target's variance starts at its block's mean posterior variance.
-                let initial = log_sd.row(i).mapv(|s| (2.0 * s).exp()).mean().ok_or("an empty block")?.ln();
-                let chosen = best[slot].iter().map(|&(_, scale, k)| Choice { write: writes[k], scale, gauge: Vec::new(), assignment: Vec::new(), transport: None }).collect();
+                let variance = log_sd.row(i).mapv(|s| (2.0 * s).exp());
+                let v = Array1::from_elem(variance.len(), group_variance(&self.cells[t], posterior));
+                let candidates = best[slot]
+                    .iter()
+                    .map(|&(_, scale, k)| {
+                        let u = self.vector(writes[k], &means)?.to_owned();
+                        let u_variance = match writes[k] {
+                            Write::Token(_) => 0.0,
+                            write => self.vector(write, &deviations)?.mapv(|s| (2.0 * s).exp()).sum(),
+                        };
+                        Ok((Choice { write: writes[k], scale, gauge: Vec::new(), assignment: Vec::new(), transport: None }, u, u_variance))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let (chosen, log_variance) = self.admit(t, posterior, (mu.row(i), variance.view(), v.view()), candidates)?;
+                adopted.push((t, chosen, log_variance));
+            }
+            for (t, chosen, initial) in adopted {
                 self.adopt(t, chosen, initial);
             }
         }
@@ -648,6 +742,12 @@ impl Mixture {
             let mu = Self::group_vector(maps, &live, &q1, k1);
             let sd = Self::group_vector(maps, &live, &maps.queries.iter().map(|&q| &posterior.log_sd[q]).collect::<Vec<_>>(), &posterior.log_sd[maps.key]);
             let precision = sd.mapv(|s| (-2.0 * s).exp());
+            // A plane's rotation keeps the sum of its rows' variances; its scale multiplies a
+            // query's by `s²` and a key's by `1 / s²`.
+            let turned_variance = |m: &GroupMaps, assignment: &[usize], gauge: &[(Array2<f64>, f64)]| -> f64 {
+                let total = |op: usize, p: usize| maps.planes[p].iter().map(|&r| posterior.log_sd[op].row(r).mapv(|s| (2.0 * s).exp()).sum()).sum::<f64>();
+                live.iter().map(|&p| { let s2 = gauge[p].1 * gauge[p].1; assignment.iter().map(|&j| s2 * total(m.queries[j], p)).sum::<f64>() + total(m.key, p) / s2 }).sum()
+            };
             let mut scored = Vec::new();
             for &((l, g), ref other) in &self.key_values {
                 if l >= layer || !Self::compatible(maps, other) {
@@ -659,13 +759,23 @@ impl Mixture {
                 let u = Self::group_vector(maps, &live, &turned.iter().collect::<Vec<_>>(), &library_sharing::turn(k, &maps.planes, &gauge, false, false));
                 let (cross, norm) = ((&mu * &precision).dot(&u), (&u * &u * &precision).sum());
                 if norm > 0.0 {
-                    scored.push((-cross * cross / norm, Choice { write: Write::QueryKey { layer: l, group: g }, scale: cross / norm, gauge, assignment, transport: None }));
+                    let u_variance = turned_variance(other, &assignment, &gauge);
+                    scored.push((-cross * cross / norm, (Choice { write: Write::QueryKey { layer: l, group: g }, scale: cross / norm, gauge, assignment, transport: None }, u, u_variance)));
                 }
             }
             scored.sort_by(|a, b| a.0.total_cmp(&b.0));
             scored.truncate(self.width);
-            let initial = sd.mapv(|s| (2.0 * s).exp()).mean().ok_or("an empty key-value group")?.ln();
-            self.adopt(t, scored.into_iter().map(|(_, choice)| choice).collect(), initial);
+            let variance = sd.mapv(|s| (2.0 * s).exp());
+            let d = posterior.mean[maps.key].ncols();
+            let mut v = Vec::with_capacity(mu.len());
+            for _side in 0..maps.queries.len() + 1 {
+                for &p in &live {
+                    let cells: Vec<(usize, Vec<usize>, std::ops::Range<usize>)> = maps.queries.iter().chain([&maps.key]).map(|&i| (i, maps.planes[p].clone(), 0..d)).collect();
+                    v.extend(std::iter::repeat_n(group_variance(&cells, posterior), maps.planes[p].len() * d));
+                }
+            }
+            let (chosen, log_variance) = self.admit(t, posterior, (mu.view(), variance.view(), Array1::from(v).view()), scored.into_iter().map(|(_, c)| c).collect())?;
+            self.adopt(t, chosen, log_variance);
         }
         // Value maps: earlier groups' value maps moved by the transports `M`'s output projections
         // fix, scored over the target's coordinates in the explanation.
@@ -686,15 +796,96 @@ impl Mixture {
                 let u = Self::rows_vector(&live, &transport.matrix.dot(&posterior.mean[value]));
                 let (cross, norm) = ((&mu * &precision).dot(&u), (&u * &u * &precision).sum());
                 if norm > 0.0 {
-                    scored.push((-cross * cross / norm, Choice { write: Write::Value { layer: l, group: g }, scale: cross / norm, gauge: Vec::new(), assignment: transport.assignment, transport: Some(transport.matrix) }));
+                    // `Var((T V_s)_kc) = Σ_r T_kr² σ²_rc`.
+                    let rows = posterior.log_sd[value].mapv(|s| (2.0 * s).exp()).sum_axis(ndarray::Axis(1));
+                    let u_variance = live.iter().map(|&k| transport.matrix.row(k).mapv(|x| x * x).dot(&rows)).sum::<f64>();
+                    scored.push((-cross * cross / norm, (Choice { write: Write::Value { layer: l, group: g }, scale: cross / norm, gauge: Vec::new(), assignment: transport.assignment, transport: Some(transport.matrix) }, u, u_variance)));
                 }
             }
             scored.sort_by(|a, b| a.0.total_cmp(&b.0));
             scored.truncate(self.width);
-            let initial = sd.mapv(|s| (2.0 * s).exp()).mean().ok_or("an empty value map")?.ln();
-            self.adopt(t, scored.into_iter().map(|(_, choice)| choice).collect(), initial);
+            let variance = sd.mapv(|s| (2.0 * s).exp());
+            let d = posterior.mean[maps.value].ncols();
+            let v: Array1<f64> = live.iter().flat_map(|&j| std::iter::repeat_n(group_variance(&[(maps.value, vec![j], 0..d)], posterior), d)).collect();
+            let (chosen, log_variance) = self.admit(t, posterior, (mu.view(), variance.view(), v.view()), scored.into_iter().map(|(_, c)| c).collect())?;
+            self.adopt(t, chosen, log_variance);
         }
         Ok(())
+    }
+
+    /// Component `j` of target `t`'s mean and variance vectors at `posterior`, in the target's
+    /// layout: the candidate's posterior means and variances moved as its vector is (a rotation's
+    /// squared entries carry the variances, a scale's square).
+    fn component_moments(&self, t: usize, j: usize, posterior: &Posterior) -> Result<(Array1<f64>, Array1<f64>), String> {
+        let component = &self.targets[t].components[j];
+        let variance = |i: usize| posterior.log_sd[i].mapv(|s| (2.0 * s).exp());
+        match (self.targets[t].kind, component.write) {
+            (Kind::QueryKey { layer, group }, Write::QueryKey { layer: l, group: g }) => {
+                let (maps, other) = (self.key_value(layer, group)?, self.key_value(l, g)?);
+                let live = self.live_planes(maps, posterior);
+                let squared: Vec<(Array2<f64>, f64)> = component.gauge.iter().map(|(r, s)| (r.mapv(|x| x * x), s * s)).collect();
+                let turn = |m: &Array2<f64>, gauge: &[(Array2<f64>, f64)], query: bool| library_sharing::turn(m, &maps.planes, gauge, query, false);
+                let queries = |values: &dyn Fn(usize) -> Array2<f64>, gauge: &[(Array2<f64>, f64)]| -> Vec<Array2<f64>> { component.assignment.iter().map(|&q| turn(&values(other.queries[q]), gauge, true)).collect() };
+                let (mean, var) = (queries(&|i| posterior.mean[i].clone(), &component.gauge), queries(&variance, &squared));
+                Ok((
+                    Self::group_vector(maps, &live, &mean.iter().collect::<Vec<_>>(), &turn(&posterior.mean[other.key], &component.gauge, false)),
+                    Self::group_vector(maps, &live, &var.iter().collect::<Vec<_>>(), &turn(&variance(other.key), &squared, false)),
+                ))
+            }
+            (Kind::Value { layer, group }, Write::Value { layer: l, group: g }) => {
+                let (maps, source) = (self.value(layer, group)?, self.value(l, g)?.value);
+                let transport = component.transport.as_ref().ok_or("a value map's candidate without its transport")?;
+                let live = Self::live_rows(maps, posterior);
+                Ok((Self::rows_vector(&live, &transport.dot(&posterior.mean[source])), Self::rows_vector(&live, &transport.mapv(|x| x * x).dot(&variance(source)))))
+            }
+            (_, write) => {
+                let means = |i: usize| -> Result<&Array2<f64>, String> { posterior.mean.get(i).ok_or_else(|| "a posterior mean".to_string()) };
+                let mean = self.vector(write, &means)?.to_owned();
+                let var = match write {
+                    Write::Token(_) => Array1::zeros(mean.len()),
+                    write => {
+                        let deviations = |i: usize| -> Result<&Array2<f64>, String> { posterior.log_sd.get(i).ok_or_else(|| "a posterior deviation".to_string()) };
+                        self.vector(write, &deviations)?.mapv(|s| (2.0 * s).exp())
+                    }
+                };
+                Ok((mean, var))
+            }
+        }
+    }
+
+    /// What making component `j` of target `t` exact is predicted to save in `F`, in nats: the
+    /// target's groups' costs (`Posterior::costs`), less half the misfit of the equality
+    /// `g = c u` in the posterior's deviations of both, `Σ_k (μ_k − c ν_k)² / (σ_k² + c² τ_k²)`
+    /// (the data term's rise at the posterior's curvature), and the choice's `ln n`.
+    fn hardening_saving(&self, t: usize, j: usize, posterior: &Posterior, costs: &[f64]) -> Result<f64, String> {
+        let target = &self.targets[t];
+        let variance = |i: usize| posterior.log_sd[i].mapv(|s| (2.0 * s).exp());
+        let (mean, var) = match target.kind {
+            Kind::Gate { .. } | Kind::Up { .. } | Kind::Output { .. } => {
+                let means = |i: usize| -> Result<&Array2<f64>, String> { posterior.mean.get(i).ok_or_else(|| "a posterior mean".to_string()) };
+                let deviations = |i: usize| -> Result<&Array2<f64>, String> { posterior.log_sd.get(i).ok_or_else(|| "a posterior deviation".to_string()) };
+                (self.vector(Write::of(target.kind), &means)?.to_owned(), self.vector(Write::of(target.kind), &deviations)?.mapv(|s| (2.0 * s).exp()))
+            }
+            Kind::QueryKey { layer, group } => {
+                let maps = self.key_value(layer, group)?;
+                let live = self.live_planes(maps, posterior);
+                let queries: Vec<Array2<f64>> = maps.queries.iter().map(|&q| variance(q)).collect();
+                (
+                    Self::group_vector(maps, &live, &maps.queries.iter().map(|&q| &posterior.mean[q]).collect::<Vec<_>>(), &posterior.mean[maps.key]),
+                    Self::group_vector(maps, &live, &queries.iter().collect::<Vec<_>>(), &variance(maps.key)),
+                )
+            }
+            Kind::Value { layer, group } => {
+                let maps = self.value(layer, group)?;
+                let live = Self::live_rows(maps, posterior);
+                (Self::rows_vector(&live, &posterior.mean[maps.value]), Self::rows_vector(&live, &variance(maps.value)))
+            }
+        };
+        let (nu, tau) = self.component_moments(t, j, posterior)?;
+        let c = target.components[j].scale;
+        let misfit: f64 = mean.iter().zip(&var).zip(nu.iter().zip(&tau)).map(|((m, s), (n, t))| (m - c * n).powi(2) / (s + c * c * t)).sum();
+        let saved: f64 = target.groups.iter().map(|g| costs[*g]).sum();
+        Ok(saved - 0.5 * misfit - (target.choices as f64).ln())
     }
 
     /// The targets whose one candidate holds more than half of the mixture weight, with it.
@@ -732,10 +923,11 @@ impl Mixture {
         // An MLP block takes part in one exact sharing per hardening: as a target or as a source.
         let mut taken: Vec<Write> = Vec::new();
         let mut nats = 0.0;
+        let costs = posterior.costs();
         for (t, j) in self.dominant(posterior)? {
             let target = &self.targets[t];
             let (own, source) = (Write::of(target.kind), target.components[j].write);
-            if taken.contains(&own) || taken.contains(&source) {
+            if taken.contains(&own) || taken.contains(&source) || self.hardening_saving(t, j, posterior, &costs)? <= 0.0 {
                 continue;
             }
             let least_squares = |g: &Array1<f64>, s: &Array1<f64>| if s.dot(s) > 0.0 { Some(g.dot(s) / s.dot(s)) } else { None };
@@ -836,13 +1028,11 @@ impl Mixture {
             };
             let target = &mut self.targets[t];
             let moments = &mut self.moments[t];
+            // Only the logits: the epoch sets the scales and the variance (module note).
             step(&mut moments[0], &mut target.zero_logit, gradient[0]);
             for (j, component) in target.components.iter_mut().enumerate() {
                 step(&mut moments[1 + 2 * j], &mut component.logit, gradient[1 + 2 * j]);
-                step(&mut moments[2 + 2 * j], &mut component.scale, gradient[2 + 2 * j]);
             }
-            let last = moments.len() - 1;
-            step(&mut moments[last], &mut target.log_variance, gradient[gradient.len() - 1]);
         }
     }
 
@@ -1068,36 +1258,11 @@ impl PriorTerm for Mixture {
     }
 
     fn cost(&self, posterior: &Posterior) -> Result<f64, String> {
-        let k = self.width as f64;
         let mut total = 0.0;
         for t in (0..self.targets.len()).filter(|&t| self.active(t, posterior) && !self.targets[t].components.is_empty()) {
             let target = &self.targets[t];
-            let size = match target.kind {
-                Kind::Gate { .. } | Kind::Up { .. } | Kind::Output { .. } => self.cells[t].iter().map(|(_, rows, cols)| (rows.len() * cols.len()) as f64).sum::<f64>(),
-                Kind::QueryKey { layer, group } => {
-                    let maps = self.key_value(layer, group)?;
-                    let d = posterior.mean[maps.key].ncols();
-                    self.live_planes(maps, posterior).iter().map(|p| ((maps.queries.len() + 1) * maps.planes[*p].len() * d) as f64).sum()
-                }
-                Kind::Value { layer, group } => {
-                    let maps = self.value(layer, group)?;
-                    (Self::live_rows(maps, posterior).len() * posterior.mean[maps.value].ncols()) as f64
-                }
-            };
-            let n = target.choices as f64;
-            // The candidates actually selected (at most `K`, fewer when fewer exist).
-            let kept = (target.components.len() as f64).min(k.min(n));
-            // ln C(n, K) for the candidates, ½ ln |G| for each of the 2K + 1 values.
-            total += ln_gamma(n + 1.0) - ln_gamma(kept + 1.0) - ln_gamma(n - kept + 1.0) + (2.0 * kept + 1.0) * 0.5 * size.ln();
-            if matches!(target.kind, Kind::QueryKey { .. }) {
-                // A target-dependent alignment is additional information even though its
-                // transform preserves the parent head's attention scores.
-                let gauge_values = target.components.iter().flat_map(|c| &c.gauge)
-                    .map(|(rotation, _)| rotation.len() + 1).sum::<usize>();
-                total += gauge_values as f64 * 64.0 * std::f64::consts::LN_2;
-                // So is each assignment of the query heads, one of `m!`.
-                total += target.components.iter().map(|c| ln_gamma(c.assignment.len() as f64 + 1.0)).sum::<f64>();
-            }
+            let size = self.size(t, posterior)?;
+            total += Self::choice_nats(target.choices, target.components.len(), size) + target.components.iter().map(Self::alignment_nats).sum::<f64>();
         }
         Ok(total)
     }
@@ -1221,7 +1386,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
         let native = split_sites(&imported.program).unwrap();
         let explanation = explanation(&native, &layer_nodes(&native, 2).unwrap()).unwrap();
-        let mut posterior = Posterior::new(&explanation, 96).unwrap();
+        let mut posterior = Posterior::new(&explanation, NARROW).unwrap();
         let mixture = Mixture::new(&explanation, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
         let (earlier, later) = (mixture.key_value(0, 0).unwrap(), mixture.key_value(1, 0).unwrap());
         // Identical nonzero maps previously admitted reciprocal, unit-scale components.
@@ -1390,6 +1555,11 @@ mod tests {
         assert!((mean - reference).abs() < 4.0 * error, "sampled {mean} ± {error} against {reference}");
     }
 
+    /// Training tokens that make a posterior narrow enough for an exact query–key copy of the
+    /// tiny model (64 entries) to pay for its gauge's literal charge (module note): with
+    /// `σ² = v / N`, its gain `½ D ln(N / 2)` exceeds the 64 bits per gauge value.
+    const NARROW: usize = 1 << 40;
+
     /// The weight sample of `key` of `posterior`'s operators the mixture reads.
     fn draw(mixture: &Mixture, posterior: &Posterior, key: u64) -> BTreeMap<usize, Array2<f64>> {
         mixture
@@ -1434,7 +1604,7 @@ mod tests {
     #[test]
     fn a_key_value_group_copied_with_its_query_heads_swapped_is_found_assigned_and_shared() {
         let (imported, start) = swapped_group("library_mixture_grouped");
-        let posterior = Posterior::new(&start, 96).unwrap();
+        let posterior = Posterior::new(&start, NARROW).unwrap();
         let mut mixture = Mixture::new(&start, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
         mixture.epoch(&start, &posterior).unwrap();
         let t = mixture.targets.iter().position(|t| t.kind == Kind::QueryKey { layer: 1, group: 0 }).unwrap();
@@ -1458,7 +1628,7 @@ mod tests {
     #[test]
     fn a_key_value_group_term_is_differentiated_through_its_gauge_and_assignment() {
         let (_, start) = swapped_group("library_mixture_grouped_gradient");
-        let posterior = Posterior::new(&start, 96).unwrap();
+        let posterior = Posterior::new(&start, NARROW).unwrap();
         let mut mixture = Mixture::new(&start, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
         mixture.epoch(&start, &posterior).unwrap();
         // The layer-1 group's term alone, against both candidates with their gauges and assignments.
@@ -1613,8 +1783,8 @@ mod tests {
         learn(&mut mixture, &posterior, 300);
         let weights = mixture.targets[t].weights().unwrap();
         assert!(weights[1 + copy] > 0.5, "the copy's weight dominates its mixture: {weights:?}");
-        let dominant = mixture.dominant(&posterior).unwrap();
-        assert_eq!(dominant, vec![(t, copy)], "only the copy dominates: {:?}", dominant.iter().map(|(t, j)| (mixture.targets[*t].kind, mixture.targets[*t].components[*j].write)).collect::<Vec<_>>());
+        assert!(mixture.dominant(&posterior).unwrap().contains(&(t, copy)));
+        // Of the dominant components only those whose equality saves code length are made exact.
         let hardened = mixture.harden(&start, &posterior).unwrap();
         let (before, after) = (start.artifact.execute(&imported.family).unwrap(), hardened.artifact.execute(&imported.family).unwrap());
         let (a, b) = (&before.values[start.artifact.program.output], &after.values[hardened.artifact.program.output]);
@@ -1672,7 +1842,7 @@ mod tests {
         assert!(fitted.report.start.prior_bits.is_finite() && fitted.report.start.prior_bits != 0.0, "F holds the mixture's term");
         // The fit removes the copies this random model does not need; the weights are learned at the
         // start, every group in, from samples of its posterior.
-        let all_in = crate::library_mdl::Posterior::new(&start, 96).unwrap();
+        let all_in = crate::library_mdl::Posterior::new(&start, NARROW).unwrap();
         let mut learned = Mixture::new(&start, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
         learned.epoch(&start, &all_in).unwrap();
         learn(&mut learned, &all_in, 300);
