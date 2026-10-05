@@ -19,6 +19,7 @@
    0.03,
    0.1
   ],
-  "candidates": 2048
+  "candidates": 2048,
+  "targets": 8
  }
 }

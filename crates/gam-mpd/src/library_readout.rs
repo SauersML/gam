@@ -15,9 +15,11 @@
 //!   every law's gate factor `φ(x)/x` and every attention pattern frozen, and half of the gradient
 //!   through each factor of a product (SwiGLU's gate times up), seeded with the gradient of a metric
 //!   `m` in the final stream (by default the centred logit of the model's predicted token, the
-//!   final norm's denominator frozen). A function's attribution at token `t` is
-//!   `A_i(t) = h_i(t) ∂m/∂h_i(t)` (a head: `z_h · ∂m/∂z_h`). Within a cut (one layer's heads, one
-//!   MLP) the functions and the residual stream entering it account for `m`.
+//!   final norm's denominator frozen). A function's attribution of the prediction at target token
+//!   `t` is `A_i(t) = Σ_{s ≤ t} h_i(s) ∂m(t)/∂h_i(s)` (a head: `z_h · ∂m(t)/∂z_h`), over every
+//!   position it acts at; within a cut (one layer's heads, one MLP) the functions and the residual
+//!   stream entering it account for `m(t)`. Targets are drawn per held-out sequence, and their
+//!   predictions attributed one at a time.
 //! * Importance: the mean of `|A_i(t)|` over held-out tokens, which ranks the functions; per
 //!   threshold `τ`, the fraction of held-out tokens with `|A_i(t)| > τ |m(t)|` (causal activity).
 //!   Background functions are important at the first threshold on every held-out token.
@@ -101,6 +103,9 @@ pub struct Settings {
     /// The fractions `τ` of `|m(t)|` above which a function's `|A_i(t)|` counts it as causally
     /// important at token `t`.
     pub thresholds: Vec<f64>,
+    /// Target tokens drawn per held-out sequence (uniformly, without replacement) whose
+    /// predictions are attributed one at a time.
+    pub targets: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -203,6 +208,9 @@ pub struct Readout {
     /// Per held-out token, the model's predicted token, and the mean centred logit `m` of it.
     pub predicted: Vec<u32>,
     pub mean_logit: f64,
+    /// The target tokens whose predictions were attributed (`Settings::targets` per sequence);
+    /// importance, important fractions, supports and opposes, and the cut summaries are over them.
+    pub targets: usize,
     /// Per cut of the reverse pass (one layer's heads, one MLP), its causally important functions
     /// per token.
     pub cuts: Vec<CutSummary>,
@@ -382,19 +390,18 @@ struct Relp {
 }
 
 impl Relp {
-    fn add(&mut self, k: usize, attribution: ArrayView1<f64>, metric: &[f64], thresholds: &[f64], first_row: usize) {
+    /// The attribution `a` of the prediction `m` at target row `id`.
+    fn add(&mut self, k: usize, a: f64, m: f64, thresholds: &[f64], id: usize) {
         self.important.resize(thresholds.len(), 0.0);
-        for (r, a) in attribution.iter().enumerate() {
-            self.absolute += a.abs();
-            self.signed += a;
-            for (count, tau) in self.important.iter_mut().zip(thresholds) {
-                if a.abs() > tau * metric[r].abs() {
-                    *count += 1.0;
-                }
+        self.absolute += a.abs();
+        self.signed += a;
+        for (count, tau) in self.important.iter_mut().zip(thresholds) {
+            if a.abs() > tau * m.abs() {
+                *count += 1.0;
             }
-            self.supports.offer(k, *a, first_row + r);
-            self.opposes.offer(k, -*a, first_row + r);
         }
+        self.supports.offer(k, a, id);
+        self.opposes.offer(k, -a, id);
     }
 }
 
@@ -503,6 +510,23 @@ struct Pass {
     weights: Vec<Vec<Array2<f64>>>,
 }
 
+impl Pass {
+    /// The first `end` rows of sequence `sequence` (of `length` rows) alone.
+    fn prefix(&self, sequence: usize, length: usize, end: usize) -> Pass {
+        let rows = sequence * length..sequence * length + end;
+        let cut = |x: &Array2<f64>| x.slice(s![rows.clone(), ..]).to_owned();
+        Pass {
+            rows: end,
+            inverse: self.inverse.iter().map(|v| v.slice(s![rows.clone()]).to_owned()).collect(),
+            last: cut(&self.last),
+            inverse_final: self.inverse_final.slice(s![rows.clone()]).to_owned(),
+            mlp: self.mlp.iter().map(|(a, p, u)| (cut(a), cut(p), u.as_ref().map(cut))).collect(),
+            head: self.head.iter().map(|values| std::array::from_fn(|j| cut(&values[j]))).collect(),
+            weights: self.weights.iter().map(|w| vec![w[sequence].slice(s![..end, ..end]).to_owned()]).collect(),
+        }
+    }
+}
+
 /// A cut of the reverse pass: one MLP's functions (an index into the MLPs) or one layer's heads
 /// (indices into the heads).
 enum Cut<'c> {
@@ -537,8 +561,9 @@ pub struct Prompt {
     pub metric: Metric,
 }
 
-/// What is attributed: at every position the centred logit of the model's predicted token, or at
-/// one position the logit of `target` minus the logit of `foil`.
+/// What is attributed: the sum over positions of the centred logit of the model's predicted token
+/// (a function's attribution at a position then includes its effect on later positions'
+/// predictions), or at one position the logit of `target` minus the logit of `foil`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Metric {
@@ -915,6 +940,7 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
     let out_norms: Vec<Array1<f64>> = mlps.iter().map(|b| b.out.map_axis(Axis(0), |u| u.dot(&u).sqrt())).collect();
     let mut predicted_all: Vec<u32> = Vec::with_capacity(sequences.len() * length);
     let mut logit_sum = 0.0;
+    let (mut rng, mut samples) = (StdRng::seed_from_u64(0), 0.0);
     // Per cut, the summed participation number and, per threshold, the summed count of functions
     // with |A_i(t)| > τ |m(t)|.
     let cuts = 2 * layers.len();
@@ -965,29 +991,45 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
             }
         });
         let (predicted, seed, metric) = library.predicted(&pass)?;
-        library.relp(&pass, seed, None, false, &mut |cut, attribution, _| {
-            let index = match cut {
-                Cut::Mlp(b) => {
-                    mlp_stats[b].par_iter_mut().enumerate().for_each(|(i, stat)| stat.relp.add(k, attribution.column(i), &metric, thresholds, first_row));
-                    2 * mlps[b].layer + 1
-                }
-                Cut::Heads(l, members) => {
-                    for (c, h) in members.iter().enumerate() {
-                        head_stats[*h].relp.add(k, attribution.column(c), &metric, thresholds, first_row);
-                    }
-                    2 * l
-                }
-            };
-            for (r, row) in attribution.outer_iter().enumerate() {
-                let (absolute, square) = row.iter().fold((0.0, 0.0), |(a, q), v| (a + v.abs(), q + v * v));
-                if square > 0.0 {
-                    cut_participation[index] += absolute * absolute / square;
-                }
-                for (count, tau) in cut_counts[index].iter_mut().zip(thresholds) {
-                    *count += row.iter().filter(|v| v.abs() > tau * metric[r].abs()).count() as f64;
-                }
+        // Each drawn target's prediction alone: the reverse pass from its row of the seed over the
+        // sequence up to it, each function's attribution summed over the positions it acts at.
+        for s in 0..batch.len() {
+            let mut positions: Vec<usize> = (0..length).collect();
+            for j in 0..settings.targets.min(length) {
+                let pick = rng.random_range(j..length);
+                positions.swap(j, pick);
             }
-        });
+            for &t in &positions[..settings.targets.min(length)] {
+                let (row, id) = (s * length + t, first_row + s * length + t);
+                let prefix = pass.prefix(s, length, t + 1);
+                let mut target_seed = Array2::<f64>::zeros((t + 1, seed.ncols()));
+                target_seed.row_mut(t).assign(&seed.row(row));
+                let m = metric[row];
+                samples += 1.0;
+                library.relp(&prefix, target_seed, None, false, &mut |cut, attribution, _| {
+                    let totals = attribution.sum_axis(Axis(0));
+                    let index = match cut {
+                        Cut::Mlp(b) => {
+                            mlp_stats[b].iter_mut().zip(&totals).for_each(|(stat, a)| stat.relp.add(k, *a, m, thresholds, id));
+                            2 * mlps[b].layer + 1
+                        }
+                        Cut::Heads(l, members) => {
+                            for (h, a) in members.iter().zip(&totals) {
+                                head_stats[*h].relp.add(k, *a, m, thresholds, id);
+                            }
+                            2 * l
+                        }
+                    };
+                    let (absolute, square) = totals.iter().fold((0.0, 0.0), |(a, q), v| (a + v.abs(), q + v * v));
+                    if square > 0.0 {
+                        cut_participation[index] += absolute * absolute / square;
+                    }
+                    for (count, tau) in cut_counts[index].iter_mut().zip(thresholds) {
+                        *count += totals.iter().filter(|v| v.abs() > tau * m.abs()).count() as f64;
+                    }
+                });
+            }
+        }
         logit_sum += metric.iter().sum::<f64>();
         predicted_all.extend(predicted.iter().map(|t| *t as u32));
     }
@@ -1029,9 +1071,9 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
     };
     let fill = |f: &mut Function, relp: &Relp| {
         let rows = |best: &Best, sign: f64| best.entries.iter().map(|(v, id)| context(sign * v, *id, None)).collect::<Vec<_>>();
-        f.importance = relp.absolute / total;
-        f.attribution = relp.signed / total;
-        f.important_fraction = relp.important.iter().map(|n| n / total).collect();
+        f.importance = relp.absolute / samples;
+        f.attribution = relp.signed / samples;
+        f.important_fraction = relp.important.iter().map(|n| n / samples).collect();
         f.background = f.important_fraction.first().is_some_and(|x| *x == 1.0);
         f.supports = rows(&relp.supports, 1.0);
         f.opposes = rows(&relp.opposes, -1.0);
@@ -1282,13 +1324,14 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
         wiring,
         predicted: predicted_all,
         mean_logit: logit_sum / total,
-        important: thresholds.iter().enumerate().map(|(j, tau)| [*tau, cut_counts.iter().map(|c| c[j]).sum::<f64>() / total]).collect(),
-        participation: cut_participation.iter().sum::<f64>() / total,
+        targets: samples as usize,
+        important: thresholds.iter().enumerate().map(|(j, tau)| [*tau, cut_counts.iter().map(|c| c[j]).sum::<f64>() / samples]).collect(),
+        participation: cut_participation.iter().sum::<f64>() / samples,
         cuts: (0..cuts)
             .map(|c| CutSummary {
                 name: format!("L{}.{}", c / 2, if c % 2 == 0 { "heads" } else { "mlp" }),
-                participation: cut_participation[c] / total,
-                counts: cut_counts[c].iter().map(|n| n / total).collect(),
+                participation: cut_participation[c] / samples,
+                counts: cut_counts[c].iter().map(|n| n / samples).collect(),
             })
             .collect(),
     })

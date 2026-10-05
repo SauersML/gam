@@ -266,6 +266,7 @@ fn main() -> Result<(), String> {
         "held_out_sequences": [first, end],
         "held_out_tokens": readout.held_out_tokens,
         "mean_logit": readout.mean_logit,
+        "targets": readout.targets,
         "important": readout.important,
         "participation": readout.participation,
         "cuts": readout.cuts,
