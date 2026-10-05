@@ -11,8 +11,8 @@
 # GPU_TYPE is a RunPod GPU id ("NVIDIA RTX A5000") or its display name ("RTX A5000"); a list gives
 # the types in order of preference; auto ranks the cards of the benchmark table (gpu_bench.tsv) by
 # their measured $ per scored token at community prices, keeping those with RP_MIN_VRAM_GB of memory,
-# and prints the choice; cpu is a 32-vCPU CPU pod (with RP_MIN_RAM_GB of memory, at most 256), for
-# work that does not use a GPU, such as a float64 reference. A run takes community cloud for every listed type before secure
+# and prints the choice. Work that does not use a GPU (builds, float64 references, CPU fits) goes to
+# GitHub Actions (gha-run), never to a RunPod pod. A run takes community cloud for every listed type before secure
 # cloud, which it takes only when no community pod is in stock (RunPod no longer offers spot pods:
 # "Spot pods are no longer offered", 2026-10-05). It runs COMMAND on the source of a published
 # commit, the outputs come back, and the pod is deleted. HOURS (fractional) caps the run: the Mac
@@ -82,7 +82,7 @@
 # start names); a launch or extension whose estimate (the dearest offer x HOURS) would pass it is
 # refused unless RP_ALLOW_OVER=1. Each pod appends (date, name, gpu, cloud, hours, dollars, pod) to
 # ~/mpd-data/runpod/LEDGER.tsv, dollars = the pod's price per hour x hours from creation to
-# deletion; cloud is COMMUNITY, SECURE:cheapest-per-token, SECURE:no-community-stock, SECURE:dev or CPU; then the seconds
+# deletion; cloud is COMMUNITY, SECURE:cheapest-per-token, SECURE:no-community-stock or SECURE:dev; then the seconds
 # the pod spent uploading inputs, building data, and from its creation to the command's start (the
 # first two overlap each other and the Rust build, so the third is the paid waiting). One run at a time
 # unless RP_PARALLEL=1 (held pods do not count). After deleting its pod the runner checks through
@@ -100,9 +100,12 @@
 # run's log unchanged for 15 minutes) and the last line of its run's log; then the account's spend,
 # its rate, the rate paid for GPUs under 20%, and the hours until the $150 cap at that rate.
 #
-# GPU pods never compile: the examples and test binaries (RP_TESTS="PACKAGE:TEST ...", run as
-# $MPD_BIN/test-TEST) a run needs and the cache lacks are built first on a 32-vCPU CPU pod, one build
-# per set of Rust sources at a time, and a command that compiles (cargo ...) runs only on a CPU pod.
+# Binaries: the examples and test binaries (RP_TESTS="PACKAGE:TEST ...", run as $MPD_BIN/test-TEST) a
+# run needs come from the prerelease rp-run-bin (assets KEY.NAME, KEY the hash of the commit's Rust
+# sources), which the pod downloads itself; what it lacks is built first on GitHub Actions
+# (gha-run bins, before any pod exists). Only when that fails does the run's first GPU pod build
+# them, once per set of sources (other runs wait), and the Mac caches them in _bin. A command that
+# compiles (cargo ...) is refused: a GPU pod does not compile.
 # A run whose GPU averages under 20% over 15 minutes once its command has run that long is stopped as
 # idle-stopped (dev pods are held, not stopped). rp-run stop NAME ends a run (its runner
 # deletes the pod and enters it in the ledger; a runner that does not end within a minute is killed
@@ -171,6 +174,18 @@ api() {
 status_of() { printf '%s' "${1##*$'\n'}"; }
 body_of() { printf '%s' "${1%$'\n'*}"; }
 gql() { api POST "$GRAPHQL" "$(jq -nc --arg q "$1" '{query: $q}')"; }
+
+# The binaries a run needs ("NAME" for an example, "test:PACKAGE:NAME" for a test) that neither the
+# prerelease rp-run-bin (assets KEY.NAME, built on GitHub Actions) nor the Mac's cache _bin/KEY holds.
+ASSETS=https://github.com/SauersML/gam/releases/download/rp-run-bin
+published_assets() { gh api "repos/SauersML/gam/releases/tags/rp-run-bin" --jq '.assets[].name' 2> /dev/null || true; }
+unbuilt() {
+    local have x
+    have=$(published_assets)
+    for x in "${examples[@]}"; do [ -x "$CACHE/$x" ] || grep -qx "$KEY.$x" <<< "$have" || echo "$x"; done
+    for x in "${tests[@]}"; do [ -x "$CACHE/test-${x#*:}" ] || grep -qx "$KEY.test-${x#*:}" <<< "$have" || echo "test:$x"; done
+}
+
 
 # Whether POD is ours: its id in REGISTRY (or LEDGER.tsv), and, when the API still knows it, its
 # name mpd2951-... .
@@ -382,7 +397,7 @@ case ${1:-} in
                 # A run whose log has not grown for 15 minutes (a dev pod's has no command).
                 if [ "${mode:-run}" = run ] && [ -f "$RP/$name/run.log" ] && (( now - $(stat -f %m "$RP/$name/run.log") > 900 )); then flag+="FLAT "; fi
             fi
-            if [ "${kind%%:*}" != CPU ] && [ -n "$util" ] && (( ${util%\*} < 20 )); then
+            if [ -n "$util" ] && (( ${util%\*} < 20 )); then
                 flag+="IDLE "
                 idle_rate=$(awk -v a="$idle_rate" -v p="$price" 'BEGIN { print a + p }')
             fi
@@ -487,18 +502,9 @@ OUT=$RP/$NAME
 
 # The offers, one per line "KIND|PRICE|GPU id": a run takes community for every type before secure;
 # a dev pod takes the types in order, community before secure for each.
-OFFERS="" COMPUTE=GPU
-if [ "$GPU" = cpu ]; then
-    # A CPU pod: 32 vCPUs of the flavor with the least memory per vCPU that holds RP_MIN_RAM_GB
-    # (2, 4 or 8 GB per vCPU). Its price is known once it exists; until then it is estimated from
-    # the compute flavor's $0.96/h (measured 2026-10-05), in proportion to memory.
-    COMPUTE=CPU
-    flavor=cpu3c mult=2
-    (( ${RP_MIN_RAM_GB:-0} > 64 )) && flavor=cpu3g mult=4
-    (( ${RP_MIN_RAM_GB:-0} > 128 )) && flavor=cpu3m mult=8
-    (( ${RP_MIN_RAM_GB:-0} <= 256 )) || { echo "rp-run: no CPU pod holds ${RP_MIN_RAM_GB} GB" >&2; exit 2; }
-    OFFERS="CPU|$(awk -v m="$mult" 'BEGIN { printf "%.2f", 0.96 * m / 2 }')|$flavor"
-else
+OFFERS=""
+[ "$GPU" != cpu ] || { echo "rp-run: work without a GPU goes to GitHub Actions: bench/runpod/gha-run" >&2; exit 2; }
+if :; then
     r=$(gql 'query { gpuTypes { id displayName memoryInGb securePrice communityPrice } }')
     [ "$(status_of "$r")" = 200 ] || { echo "rp-run: price query failed: $(body_of "$r" | head -c 300)" >&2; exit 1; }
     prices=$(body_of "$r")
@@ -596,8 +602,8 @@ fi
 NEED_RUST=0
 [ "$MODE" = dev ] && NEED_RUST=1
 if [ "$MODE" = run ] && [ "$1" = cargo ]; then
-    [ "$COMPUTE" = CPU ] || { echo "rp-run: a GPU pod does not compile: name test binaries in RP_TESTS=PACKAGE:TEST and run \$MPD_BIN/test-TEST" >&2; exit 2; }
-    NEED_RUST=1
+    echo "rp-run: a GPU pod does not compile: name test binaries in RP_TESTS=PACKAGE:TEST and run \$MPD_BIN/test-TEST" >&2
+    exit 2
 fi
 # Test binaries the command runs through $MPD_BIN (test-NAME), built like the examples.
 read -r -a tests <<< "${RP_TESTS:-}"
@@ -757,16 +763,8 @@ if [ -n "${RP_DISK_GB:-}" ]; then
 fi
 
 # The pod deletes itself at the run's deadline by its own clock, then starts as the image would.
-create_body() {  # CLOUD GPU_ID SECONDS_LEFT PUBLIC_KEYS (CLOUD CPU: GPU_ID is the CPU flavor)
+create_body() {  # CLOUD GPU_ID SECONDS_LEFT PUBLIC_KEYS
     local start="(echo \$BASHPID > /rp-watchdog.pid; sleep $3; runpodctl remove pod \"\$RUNPOD_POD_ID\" || runpodctl pod delete \"\$RUNPOD_POD_ID\") > /rp-watchdog.log 2>&1 & exec /start.sh"
-    if [ "$1" = CPU ]; then
-        jq -nc --arg name "mpd2951-${POD_NAME:-$NAME}" --arg image "$IMAGE" --arg flavor "$2" --arg keys "$4" \
-            --argjson disk "$DISK" --arg start "$start" \
-            '{name: $name, imageName: $image, computeType: "CPU", cpuFlavorIds: [$flavor], vcpuCount: 32,
-              containerDiskInGb: $disk, ports: ["22/tcp"], supportPublicIp: true,
-              env: {PUBLIC_KEY: $keys}, dockerStartCmd: ["bash", "-c", $start]}'
-        return
-    fi
     # Rust builds and the host half of a step want more than the default 2 vCPUs and 8 GB per GPU.
     jq -nc --arg name "mpd2951-$NAME" --arg image "$IMAGE" --arg gpu "$2" --arg cloud "${1%%:*}" \
         --arg keys "$4" --argjson disk "$DISK" --arg start "$start" --argjson cuda "$CUDA_OK" --argjson ram "${RP_MIN_RAM_GB:-32}" \
@@ -792,8 +790,7 @@ if [ -n "${RP_DRY:-}" ]; then
              for e in "${pile_plan[@]}"; do read -r x b m <<< "$e"; printf 'engine/%s (from %s and %s Pile train rows) ' "$x" "$b" "$m"; done )
     echo "built:    ${built:-none}"
     echo "source:   crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md ${srcpaths[*]:-}"
-    echo "examples: $(for x in "${examples[@]}"; do printf '%s (%s, %s) ' "$x" "${package_of[$x]}" "$( [ -x "$CACHE/$x" ] && echo cached || echo "to build on a CPU pod")"; done) rust ${CHANNEL:-none}"
-    echo "tests:    $(for x in "${tests[@]}"; do printf 'test-%s (%s, %s) ' "${x#*:}" "${x%%:*}" "$( [ -x "$CACHE/test-${x#*:}" ] && echo cached || echo "to build on a CPU pod")"; done)"
+    echo "binaries: $(unbuilt | tr '\n' ' ' | sed 's/^$/all built/; s/^\(.\)/to build on GitHub Actions: \1/') (examples ${examples[*]:-none}, tests ${tests[*]:-none}, key $KEY)"
     echo "command:  ${cmd:-none}"
     echo "request:  $(IFS='|' read -r k p g <<< "$(head -n 1 <<< "$OFFERS")"; create_body "$k" "$g" "$CAP_SECONDS" '<run key> <~/.ssh/runpod_ed25519.pub>')"
     exit 0
@@ -958,7 +955,7 @@ launch() {
             say "host $host recorded as failing; deleting pod $POD"
         elif ! on_pod 'kill -0 "$(cat /rp-watchdog.pid)" && command -v runpodctl > /dev/null' < /dev/null; then
             say "the pod's own deletion timer is not running (no runpodctl or watchdog); deleting pod $POD"
-        elif [ "$kind" != CPU ] && ! on_pod 'python3 -c "import torch; torch.ones(1, device=\"cuda\").sum().item()"' < /dev/null > /dev/null 2>&1; then
+        elif ! on_pod 'python3 -c "import torch; torch.ones(1, device=\"cuda\").sum().item()"' < /dev/null > /dev/null 2>&1; then
             echo "$host" >> "$BAD_HOSTS"
             say "CUDA does not initialize on host $host ($(on_pod 'nvidia-smi --query-gpu=driver_version --format=csv,noheader' < /dev/null 2> /dev/null)); recorded as failing; deleting pod $POD"
         else
@@ -979,10 +976,6 @@ launch() {
     done
     # How status and the idle check reach the pod.
     echo "$IP $PORT $TMP" > "$ACTIVE/.$POD.ssh"
-    if [ "$COMPUTE" = CPU ]; then
-        on_pod 'echo "CPU pod, $(nproc) vCPUs, $(free -g | awk "/Mem/ { print \$2 }") GB"' < /dev/null | sed "s/^/$POD /" | tee -a "$OUT/pod.txt" >&2
-        return 0
-    fi
     on_pod 'nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader; nvidia-smi | grep -o "CUDA Version: [0-9.]*"' < /dev/null | paste -sd ' ' - | sed "s/^/$POD /; s/\$/, $VCPU vCPUs/" | tee -a "$OUT/pod.txt" >&2
     # The GPU's utilization every 10 s ("seconds percent"), for status and the idle check.
     on_pod 'setsid nohup bash -c "while :; do echo \"\$(date +%s) \$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -n 1)\"; sleep 10; done" >> /workspace/gpu-util.log 2>&1 < /dev/null &' < /dev/null || true
@@ -1231,46 +1224,40 @@ compile_on_pod() {
     say "built and cached ${made[*]} ($KEY)"
 }
 
-# The build server: a GPU run's binaries come from the cache, and what the cache lacks is built
-# first on a CPU pod (32 vCPUs, about $0.96/h), never on a GPU pod, whose GPU would idle while it
-# compiles. One build per set of Rust sources (KEY) at a time: a run that finds another building
-# them waits for that build, then takes what it made.
+# Before any pod exists, what the run needs and nobody has built is built on GitHub Actions
+# (gha-run bins: a free runner, published as rp-run-bin assets). One build per set of sources at a
+# time: a run that finds another building them waits for it. When Actions fails, the run's first GPU
+# pod builds them (FALLBACK_BUILD) and the Mac caches them; the lock stays held until then, so no
+# other run builds the same sources.
 build_binaries() {
-    [ "$COMPUTE" = GPU ] || return 0
-    local need=() x holder saved_offers=$OFFERS saved_deadline=$DEADLINE saved_disk=$DISK
-    missing() {
-        need=()
-        for x in "${examples[@]}"; do [ -x "$CACHE/$x" ] || need+=("$x"); done
-        for x in "${tests[@]}"; do [ -x "$CACHE/test-${x#*:}" ] || need+=("test:$x"); done
-    }
-    missing
-    [ ${#need[@]} -gt 0 ] || return 0
+    local need x holder ex=() ts=()
+    need=$(unbuilt)
+    [ -n "$need" ] || return 0
     mkdir -p "$RP/_bin"
     until mkdir "$CACHE.lock" 2> /dev/null; do
         holder=$(cat "$CACHE.lock/pid" 2> /dev/null || echo 0)
         if ! kill -0 "$holder" 2> /dev/null; then rm -rf "$CACHE.lock"; continue; fi
         say "waiting for run $(cat "$CACHE.lock/name" 2> /dev/null) to finish building $KEY's binaries"
-        sleep 15
+        sleep 30
     done
     echo $$ > "$CACHE.lock/pid"
     echo "$NAME" > "$CACHE.lock/name"
-    missing
-    if [ ${#need[@]} -gt 0 ]; then
-        say "building ${need[*]} on a CPU pod"
-        OFFERS="CPU|0.96|cpu3c" DEADLINE=$(( $(date +%s) + 3600 )) DISK=60 COMPUTE=CPU POD_NAME=build-${KEY}
-        launch || { rm -rf "$CACHE.lock"; exit 1; }
-        git -C "$MAC_GAM" archive "$C" crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md |
-            gzip -1 | on_pod 'mkdir -p /workspace/src /workspace/bin && gzip -dc | tar -x -C /workspace/src' || { rm -rf "$CACHE.lock"; exit 1; }
-        on_pod "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain $CHANNEL" > /dev/null ||
-            { rm -rf "$CACHE.lock"; exit 1; }
-        compile_on_pod "${need[@]}" || { rm -rf "$CACHE.lock"; exit 1; }
-        echo built > "$ACTIVE/.$POD.end"
-        on_pod -O exit > /dev/null 2>&1 || true
-        reap "$POD" || exit 1
-        POD="" IP="" PORT="" VCPU="" POD_NAME=""
-        OFFERS=$saved_offers DEADLINE=$saved_deadline DISK=$saved_disk COMPUTE=GPU
+    need=$(unbuilt)
+    if [ -z "$need" ]; then
+        rm -rf "$CACHE.lock"
+        return 0
     fi
-    rm -rf "$CACHE.lock"
+    for x in $need; do
+        case $x in test:*) ts+=("${x#test:}") ;; *) ex+=("${package_of[$x]}:$x") ;; esac
+    done
+    say "building $(echo $need) on GitHub Actions"
+    if "${SELF%/*}/gha-run" bins "$KEY" "$C" "${ex[@]}" -- "${ts[@]}" 2>> "$OUT/rp-run.log" && [ -z "$(unbuilt)" ]; then
+        say "built on GitHub Actions"
+        rm -rf "$CACHE.lock"
+    else
+        say "GitHub Actions did not build them: the first GPU pod builds them once and the Mac caches them"
+        FALLBACK_BUILD=1
+    fi
 }
 
 # The source, binaries, inputs, data, models and the outputs synced so far, on the current pod.
@@ -1287,15 +1274,22 @@ setup() {
     build_fineweb & jobs+=($!)
     fetch_models & jobs+=($!)
     on_pod 'command -v rsync > /dev/null || { apt-get update -qq && apt-get install -y -qq rsync; } > /dev/null 2>&1' & jobs+=($!)
+    # The pod downloads published binaries itself; the Mac sends only what it alone holds.
+    local have="" assets=()
+    [ ${#examples[@]} -eq 0 ] && [ ${#tests[@]} -eq 0 ] || have=$(published_assets)
     for x in "${examples[@]}"; do
-        if [ -x "$CACHE/$x" ]; then cached+=("$x"); else build+=("$x"); fi
+        if grep -qx "$KEY.$x" <<< "$have"; then assets+=("$x"); elif [ -x "$CACHE/$x" ]; then cached+=("$x"); else build+=("$x"); fi
     done
     for x in "${tests[@]}"; do
-        if [ -x "$CACHE/test-${x#*:}" ]; then cached+=("test-${x#*:}"); else build+=("test:$x"); fi
+        if grep -qx "$KEY.test-${x#*:}" <<< "$have"; then assets+=("test-${x#*:}"); elif [ -x "$CACHE/test-${x#*:}" ]; then cached+=("test-${x#*:}"); else build+=("test:$x"); fi
     done
-    if [ ${#build[@]} -gt 0 ] && [ "$COMPUTE" = GPU ] && [ "$MODE" = run ]; then
-        say "${build[*]} not built: a GPU pod does not compile (build_binaries builds on a CPU pod first)"
+    if [ ${#build[@]} -gt 0 ] && [ "$MODE" = run ] && [ -z "${FALLBACK_BUILD:-}" ]; then
+        say "${build[*]} not built: a GPU pod compiles only when GitHub Actions has failed"
         exit 1
+    fi
+    if [ ${#assets[@]} -gt 0 ]; then
+        on_pod "cd /workspace/bin && for n in ${assets[*]}; do curl -fsSL --retry 3 -o \$n $ASSETS/$KEY.\$n && chmod +x \$n || exit 1; done" < /dev/null || return 1
+        say "${assets[*]} from rp-run-bin ($KEY), downloaded by the pod"
     fi
     if (( NEED_RUST )) || [ ${#build[@]} -gt 0 ]; then
         on_pod "[ -x ~/.cargo/bin/cargo ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain $CHANNEL" > /dev/null || return 1
@@ -1306,6 +1300,7 @@ setup() {
     fi
     if [ ${#build[@]} -gt 0 ]; then
         compile_on_pod "${build[@]}" || return 1
+        [ -z "${FALLBACK_BUILD:-}" ] || { rm -rf "$CACHE.lock"; FALLBACK_BUILD=""; }
     fi
     local failed=0
     for x in "${jobs[@]}"; do wait "$x" || failed=1; done
@@ -1422,7 +1417,7 @@ sync_loop() {  # checkpoints | rest
 
 # The idle check: once the command has run 15 minutes, a GPU averaging under 20% over the last 15
 # minutes (the pod's own samples, every 10 s) ends the run as idle-stopped: it pays for a GPU it does
-# not use (put CPU-only work on a CPU pod).
+# not use (CPU-only work goes to GitHub Actions: gha-run).
 idle_check() {
     local started=$(date +%s) mean i
     while :; do
@@ -1449,11 +1444,7 @@ run_command() {
         echo 'export PATH=/root/.cargo/bin:/workspace/bin:/usr/local/cuda/bin:$PATH'
         echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
         echo 'export MPD_BIN=/workspace/bin'
-        if [ "$COMPUTE" = CPU ]; then
-            echo 'echo "# CPU pod, $(nproc) vCPUs"'
-        else
-            echo 'echo "# $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader), $(nvidia-smi | grep -o "CUDA Version: [0-9.]*")"'
-        fi
+        echo 'echo "# $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader), $(nvidia-smi | grep -o "CUDA Version: [0-9.]*")"'
         echo "cd /workspace/src"
         echo "$cmd"
     } | on_pod 'cat > /workspace/run.sh' || return 1
@@ -1467,7 +1458,8 @@ run_command() {
     SYNC=$!
     sync_loop checkpoints &
     SYNC="$SYNC $!"
-    [ "$COMPUTE" = CPU ] || { idle_check & SYNC="$SYNC $!"; }
+    idle_check &
+    SYNC="$SYNC $!"
     local base misses=0 state r
     base=$(wc -c < "$LOG" | tr -d ' ')
     RC=""

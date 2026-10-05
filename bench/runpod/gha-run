@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# CPU work for #2951 on GitHub Actions: the free runners of this public repository (about 20 at once,
+# each 4 CPUs, 16 GB RAM, 14 GB SSD, at most 6 h), through .github/workflows/gha-run.yml.
+#
+#   gha-run bins KEY SHA [PACKAGE:EXAMPLE ...] [-- PACKAGE:TEST ...]
+#       build those examples and test binaries at SHA (ubuntu-22.04, the pods' glibc) and publish
+#       them as assets KEY.NAME of the prerelease rp-run-bin (KEY: rp-run's source hash); waits for
+#       the build and exits 0 when every asset is there. rp-run calls this; pods download the assets.
+#   gha-run NAME [-- COMMAND...]
+#       run COMMAND at origin/main (or GHA_REF=<published commit>) after building GHA_EXAMPLES and
+#       GHA_TESTS (PACKAGE:NAME words, run as $MPD_BIN/NAME and $MPD_BIN/test-NAME); COMMAND writes
+#       its results under $OUT, uploaded as artifact NAME. Returns once dispatched.
+#   gha-run batch SPEC      one run per line of SPEC (NAME -- COMMAND..., shell quoting; leading
+#                           VAR=VALUE words set GHA_EXAMPLES, GHA_TESTS or GHA_REF for that line)
+#   gha-run status          the gha-run workflow's recent runs
+#   gha-run pull NAME       the newest run NAME's artifact into ~/mpd-data/gha/NAME/
+#
+# The repository is public, and so are these runs' logs and artifacts: COMMAND and its inputs must
+# come from public sources (the commit, public datasets, our own public exports). Never keys or
+# credentials, nothing from ~/mpd-data/blind/, no private model outputs. COMMAND is refused when it
+# names a path under the Mac's home directory: a runner cannot read the Mac, and a Mac path in a
+# public log tells nothing useful.
+set -euo pipefail
+REPO=SauersML/gam WORKFLOW=gha-run.yml MAC_GAM=/Users/user/gam
+API=(gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10")
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+
+# Dispatches the workflow; prints the run id.
+dispatch() {  # NAME SHA KEY EXAMPLES TESTS COMMAND
+    "${API[@]}" --method POST "repos/$REPO/actions/workflows/$WORKFLOW/dispatches" -f ref=main \
+        -f "inputs[name]=$1" -f "inputs[sha]=$2" -f "inputs[key]=$3" -f "inputs[examples]=$4" \
+        -f "inputs[tests]=$5" -f "inputs[command]=$6" -F return_run_details=true | jq -er '.workflow_run_id'
+}
+
+# The binaries KEY needs that the release lacks.
+missing() {  # KEY NAME...
+    local key=$1 have
+    shift
+    have=$("${API[@]}" "repos/$REPO/releases/tags/rp-run-bin" --jq '.assets[].name' 2> /dev/null || true)
+    for n; do grep -qx "$key.$n" <<< "$have" || echo "$n"; done
+}
+
+published() { git -C "$MAC_GAM" fetch -q origin main && git -C "$MAC_GAM" merge-base --is-ancestor "$1" origin/main; }
+
+case ${1:-} in
+    bins)
+        [ $# -ge 3 ] || usage
+        key=$2 sha=$3
+        shift 3
+        examples=() tests=()
+        while [ $# -gt 0 ] && [ "$1" != -- ]; do examples+=("$1"); shift; done
+        [ $# -eq 0 ] || { shift; tests=("$@"); }
+        names=()
+        for w in "${examples[@]}"; do names+=("${w#*:}"); done
+        for w in "${tests[@]}"; do names+=("test-${w#*:}"); done
+        published "$sha" || { echo "gha-run: ${sha:0:12} is not on origin/main" >&2; exit 2; }
+        [ -n "$(missing "$key" "${names[@]}")" ] || { echo "gha-run: ${names[*]} already published for $key" >&2; exit 0; }
+        run=$(dispatch "bins-$key" "$sha" "$key" "${examples[*]}" "${tests[*]}" "")
+        echo "gha-run: building ${names[*]} at ${sha:0:12} in run $run (https://github.com/$REPO/actions/runs/$run)" >&2
+        while :; do
+            state=$("${API[@]}" "repos/$REPO/actions/runs/$run" --jq '.status + " " + (.conclusion // "")')
+            case $state in completed*) break ;; esac
+            sleep 30
+        done
+        left=$(missing "$key" "${names[@]}")
+        [ -z "$left" ] || { echo "gha-run: run $run ended ${state#completed }; still missing: $(echo $left)" >&2; exit 1; }
+        echo "gha-run: published ${names[*]} for $key" >&2 ;;
+    status)
+        gh run list -R "$REPO" --workflow "$WORKFLOW" -L 30 --json databaseId,displayTitle,status,conclusion,createdAt,updatedAt \
+            --jq '.[] | [.databaseId, .displayTitle, .status, (.conclusion // "-"), .createdAt, .updatedAt] | @tsv' | column -t -s $'\t' ;;
+    pull)
+        [ $# -eq 2 ] || usage
+        run=$(gh run list -R "$REPO" --workflow "$WORKFLOW" -L 100 --json databaseId,displayTitle --jq "[.[] | select(.displayTitle == \"gha-run $2\")][0].databaseId")
+        [ -n "$run" ] && [ "$run" != null ] || { echo "gha-run: no run named $2" >&2; exit 2; }
+        mkdir -p "$HOME/mpd-data/gha/$2"
+        gh run download -R "$REPO" "$run" -n "$2" -D "$HOME/mpd-data/gha/$2"
+        echo "gha-run: run $run's artifact in ~/mpd-data/gha/$2" >&2 ;;
+    batch)
+        [ $# -eq 2 ] && [ -f "$2" ] || usage
+        /usr/bin/python3 -c '
+import shlex, sys
+for line in open(sys.argv[1]):
+    words = shlex.split(line, comments=True)
+    if words:
+        print("\x1f".join(words))' "$2" |
+        while IFS=$'\x1f' read -r -a words; do
+            envs=()
+            while [[ ${words[0]} =~ ^GHA_[A-Z]+= ]]; do envs+=("${words[0]}"); words=("${words[@]:1}"); done
+            env "${envs[@]}" "$0" "${words[@]}"
+        done ;;
+    ''|-*) usage ;;
+    *)
+        name=$1
+        shift
+        [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || { echo "gha-run: NAME must be [A-Za-z0-9._-]+" >&2; exit 2; }
+        command=""
+        if [ $# -gt 0 ]; then
+            [ "$1" = -- ] || usage
+            shift
+            command=$(printf '%q ' "$@")
+        fi
+        case $command in *"$HOME"*|*/Users/*) echo "gha-run: COMMAND names a Mac path; a runner reads only the commit and public sources" >&2; exit 2 ;; esac
+        sha=$(git -C "$MAC_GAM" rev-parse "${GHA_REF:-origin/main}^{commit}")
+        published "$sha" || { echo "gha-run: ${sha:0:12} is not on origin/main" >&2; exit 2; }
+        run=$(dispatch "$name" "$sha" "" "${GHA_EXAMPLES:-}" "${GHA_TESTS:-}" "$command")
+        echo "gha-run: $name at ${sha:0:12} is run $run (https://github.com/$REPO/actions/runs/$run); gha-run pull $name when it ends" >&2 ;;
+esac
