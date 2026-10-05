@@ -17,6 +17,15 @@
 //! On those two every float64 operation is IEEE float64 throughout; [`Arithmetic`] lowers only a
 //! product, and only on request (a proposal that a float64 computation then decides).
 //!
+//! A CUDA device also holds f32 ([`Storage::F32`], [`Device::with_storage`]: the same stream and
+//! handles, its tensors f32), for fitting and screening, where the device's float64 units (1/64 of
+//! its f32 rate on the L40) would bound everything. Its products run on cuBLAS on the f32 operands
+//! as they are (`cublasGemmEx`: f32 or the TF32 tensor cores, by [`Arithmetic`]), and every other
+//! operation is its kernel's f32 twin (`tensor_f32.cu`): maps in float, and row reductions whose
+//! results leave the row (a log partition, a KL, an entropy) summed in double. An operation runs in
+//! its operands' storage, which must agree; no float64 operation changes. Acceptance, certification
+//! and reported numbers stay in float64.
+//!
 //! The third, [`Device::single_precision`] on macOS, is the Apple GPU, which has no float64: its
 //! tensors hold f32, every operation runs in f32 (products on Metal Performance Shaders' GEMM,
 //! the rest on MSL kernels compiled with the safe math mode and contraction off, `exp`, `log` and
@@ -48,6 +57,15 @@ pub enum Arithmetic {
     F32,
     /// Operands rounded to TF32 (10-bit mantissa), f32 accumulation (the tensor cores' fast path).
     Tf32,
+}
+
+/// How a tensor holds its values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Storage {
+    /// IEEE float64 (the host always; CUDA by default).
+    F64,
+    /// IEEE float32 (the Apple GPU always; CUDA on request, for fitting: [`Device::with_storage`]).
+    F32,
 }
 
 impl Arithmetic {
@@ -259,7 +277,7 @@ fn code_rows_layout(rows: usize, pieces: usize, blocks: usize, nodes: usize, wor
     Ok(CodeRowsLayout { slots, doubles, indices, cache_offset, bytes: slots * per_row })
 }
 
-/// A dense row-major `rows × cols` float64 tensor on its device.
+/// A dense row-major `rows × cols` tensor on its device, float64 or f32 ([`Tensor::storage`]).
 pub struct Tensor {
     rows: usize,
     cols: usize,
@@ -270,6 +288,8 @@ enum Data {
     Host(Vec<f64>),
     #[cfg(target_os = "linux")]
     Cuda(cudarc::driver::CudaSlice<f64>),
+    #[cfg(target_os = "linux")]
+    Cuda32(cudarc::driver::CudaSlice<f32>),
     #[cfg(target_os = "macos")]
     Metal(crate::metal::stream::Buffer),
 }
@@ -311,13 +331,24 @@ impl Tensor {
         self.len() == 0
     }
 
-    /// The bytes it holds (four per value on the Apple GPU, eight elsewhere).
+    /// The bytes it holds (four per value in f32, eight in float64).
     #[must_use]
     pub fn bytes(&self) -> usize {
+        match self.storage() {
+            Storage::F32 => self.len() * 4,
+            Storage::F64 => self.len() * 8,
+        }
+    }
+
+    /// How it holds its values.
+    #[must_use]
+    pub fn storage(&self) -> Storage {
         match &self.data {
+            #[cfg(target_os = "linux")]
+            Data::Cuda32(_) => Storage::F32,
             #[cfg(target_os = "macos")]
-            Data::Metal(_) => self.len() * 4,
-            _ => self.len() * 8,
+            Data::Metal(_) => Storage::F32,
+            _ => Storage::F64,
         }
     }
 }
@@ -360,10 +391,12 @@ impl Indices {
     }
 }
 
-/// Where tensors live and run (module note). Cloning shares the device.
+/// Where tensors live and run (module note), and how the tensors it makes hold their values.
+/// Cloning shares the device.
 #[derive(Clone)]
 pub struct Device {
     backend: Arc<Backend>,
+    storage: Storage,
 }
 
 enum Backend {
@@ -407,6 +440,16 @@ fn host_indices(i: &Indices) -> Result<&[u32], GpuError> {
     }
 }
 
+/// Refuses f32 operands where an operation is float64 only (a certificate, an acceptance statistic,
+/// the CUDA sparse coder's search).
+#[cfg(target_os = "linux")]
+fn float64_only(what: &str, tensors: &[&Tensor]) -> Result<(), GpuError> {
+    if tensors.iter().any(|t| t.storage() != Storage::F64) {
+        return Err(GpuError::NoDeviceKernel { reason: format!("{what} run in float64 only") });
+    }
+    Ok(())
+}
+
 fn same(a: &Tensor, b: &Tensor, what: &str) -> Result<(), GpuError> {
     if a.dim() != b.dim() {
         return Err(shape(format!("{what}: {:?} against {:?}", a.dim(), b.dim())));
@@ -432,7 +475,7 @@ impl Device {
     /// The CPU reference backend.
     #[must_use]
     pub fn host() -> Self {
-        Self { backend: Arc::new(Backend::Host) }
+        Self { backend: Arc::new(Backend::Host), storage: Storage::F64 }
     }
 
     /// Every CUDA device `policy` admits, the selected one first (data-parallel work runs one
@@ -447,7 +490,7 @@ impl Device {
             return runtime
                 .devices
                 .iter()
-                .map(|device| Ok(Self { backend: Arc::new(Backend::Cuda(cuda::Engine::new(device.ordinal, device.name.clone())?)) }))
+                .map(|device| Ok(Self { backend: Arc::new(Backend::Cuda(cuda::Engine::new(device.ordinal, device.name.clone())?)), storage: Storage::F64 }))
                 .collect();
         }
         #[cfg(not(target_os = "linux"))]
@@ -465,7 +508,7 @@ impl Device {
             let Some(runtime) = crate::device_runtime::GpuRuntime::resolve(policy)? else { return Ok(None) };
             let device = runtime.selected_device();
             return match cuda::Engine::new(device.ordinal, device.name.clone()) {
-                Ok(engine) => Ok(Some(Self { backend: Arc::new(Backend::Cuda(engine)) })),
+                Ok(engine) => Ok(Some(Self { backend: Arc::new(Backend::Cuda(engine)), storage: Storage::F64 })),
                 Err(error) if policy == GpuPolicy::Required => Err(error),
                 Err(error) => {
                     log::warn!("[tensor] CUDA device present but unusable for tensors: {error}");
@@ -484,29 +527,63 @@ impl Device {
         }
     }
 
-    /// The device `policy` selects for single-precision work (proposals, training products): the
-    /// float64 accelerator when there is one, else on macOS the Apple GPU (module note: f32
-    /// only), `None` under `off` or when neither exists.
+    /// The device `policy` selects for single-precision work (fitting, proposals, training
+    /// products): the CUDA accelerator in f32 storage when there is one, else on macOS the Apple
+    /// GPU (module note: f32 only), `None` under `off` or when neither exists.
     pub fn single_precision(policy: GpuPolicy) -> Result<Option<Self>, GpuError> {
         #[cfg(target_os = "macos")]
         {
             let Some(runtime) = crate::apple_gpu::MetalRuntime::resolve(policy)? else { return Ok(None) };
-            Ok(Some(Self { backend: apple::Engine::shared(runtime)? }))
+            Ok(Some(Self { backend: apple::Engine::shared(runtime)?, storage: Storage::F32 }))
         }
         #[cfg(not(target_os = "macos"))]
         {
-            Self::accelerator(policy)
+            Self::accelerator(policy)?.map(|d| d.with_storage(Storage::F32)).transpose()
         }
     }
 
-    /// Whether every float64 operation runs in IEEE float64 here (the host and CUDA); the Apple
-    /// GPU runs f32 and refuses float64 products.
+    /// Whether the tensors it makes hold float64, every operation on them IEEE float64 (the host,
+    /// and CUDA in float64 storage); in f32 storage (the Apple GPU always, CUDA on request) every
+    /// operation runs in f32 and a float64 product is refused.
     #[must_use]
     pub fn float64(&self) -> bool {
-        match &*self.backend {
+        self.storage == Storage::F64
+    }
+
+    /// How the tensors it makes hold their values.
+    #[must_use]
+    pub fn storage(&self) -> Storage {
+        self.storage
+    }
+
+    /// This device (the same stream, handles and kernels) making its tensors in `storage`: CUDA
+    /// holds either, the host only float64 and the Apple GPU only f32 (the other is
+    /// [`GpuError::NoDeviceKernel`]). An operation runs in its operands' storage, which must agree;
+    /// [`Device::convert`] moves a tensor between the two.
+    pub fn with_storage(&self, storage: Storage) -> Result<Self, GpuError> {
+        let native = match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(_) => storage,
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => false,
-            _ => true,
+            Backend::Metal(_) => Storage::F32,
+            Backend::Host => Storage::F64,
+        };
+        if native != storage {
+            return Err(GpuError::NoDeviceKernel { reason: format!("{} holds no {storage:?} tensors", self.name()) });
+        }
+        Ok(Self { backend: Arc::clone(&self.backend), storage })
+    }
+
+    /// A copy of `t` (a tensor of this device's backend, in either storage) in this device's
+    /// storage, rounded to nearest when narrowing; on the device, without a host transfer.
+    pub fn convert(&self, t: &Tensor) -> Result<Tensor, GpuError> {
+        if t.storage() == self.storage {
+            return self.copy(t);
+        }
+        match (&*self.backend, &t.data) {
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::Cuda(_) | Data::Cuda32(_)) => engine.convert(t),
+            _ => Err(foreign()),
         }
     }
 
@@ -521,6 +598,8 @@ impl Device {
     pub fn name(&self) -> String {
         match &*self.backend {
             Backend::Host => "host float64".to_string(),
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if self.storage == Storage::F32 => format!("{} (f32)", engine.name),
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.name.clone(),
             #[cfg(target_os = "macos")]
@@ -567,6 +646,8 @@ impl Device {
         let data = match &*self.backend {
             Backend::Host => Data::Host(values),
             #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if self.storage == Storage::F32 => Data::Cuda32(engine.upload(&values.iter().map(|v| *v as f32).collect::<Vec<f32>>())?),
+            #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => Data::Cuda(engine.upload(&values)?),
             #[cfg(target_os = "macos")]
             Backend::Metal(engine) => Data::Metal(engine.stream.upload(&values.iter().map(|v| *v as f32).collect::<Vec<f32>>())?),
@@ -591,6 +672,11 @@ impl Device {
             #[cfg(target_os = "linux")]
             Data::Cuda(slice) => match &*self.backend {
                 Backend::Cuda(engine) => engine.download(slice)?,
+                _ => return Err(foreign()),
+            },
+            #[cfg(target_os = "linux")]
+            Data::Cuda32(slice) => match &*self.backend {
+                Backend::Cuda(engine) => engine.download(slice)?.into_iter().map(f64::from).collect(),
                 _ => return Err(foreign()),
             },
             #[cfg(target_os = "macos")]
@@ -663,6 +749,8 @@ impl Device {
         let data = match &*self.backend {
             Backend::Host => Data::Host(vec![0.0; rows * cols]),
             #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if self.storage == Storage::F32 => Data::Cuda32(engine.zeros(rows * cols)?),
+            #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => Data::Cuda(engine.zeros(rows * cols)?),
             #[cfg(target_os = "macos")]
             Backend::Metal(engine) => Data::Metal(engine.stream.alloc(rows * cols)?),
@@ -675,6 +763,8 @@ impl Device {
             (Backend::Host, Data::Host(v)) => Data::Host(v.clone()),
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda(slice)) => Data::Cuda(engine.copy(slice)?),
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::Cuda32(slice)) => Data::Cuda32(engine.copy(slice)?),
             #[cfg(target_os = "macos")]
             (Backend::Metal(engine), Data::Metal(buffer)) => Data::Metal(engine.copy_range(buffer, 0, t.len())?),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1128,7 +1218,10 @@ impl Device {
                 Ok(result)
             }
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.kl_proposal_rows(target, logits),
+            Backend::Cuda(engine) => {
+                float64_only("KL proposal statistics", &[target, logits])?;
+                engine.kl_proposal_rows(target, logits)
+            }
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => Err(shape("KL proposal statistics require f64; Metal unsupported".into())),
         }
@@ -1147,7 +1240,10 @@ impl Device {
         }
         match &*self.backend {
             #[cfg(target_os="linux")]
-            Backend::Cuda(engine) => engine.checked_intervals(teacher, Some(explained), None),
+            Backend::Cuda(engine) => {
+                float64_only("checked KL intervals", &[teacher, explained])?;
+                engine.checked_intervals(teacher, Some(explained), None)
+            }
             _ => Err(shape("checked intervals require CUDA f64 without CPU/Metal fallback".into())),
         }
     }
@@ -1160,7 +1256,10 @@ impl Device {
         }
         match &*self.backend {
             #[cfg(target_os="linux")]
-            Backend::Cuda(engine) => engine.checked_intervals(input, None, Some(operation)),
+            Backend::Cuda(engine) => {
+                float64_only("checked scalar intervals", &[input])?;
+                engine.checked_intervals(input, None, Some(operation))
+            }
             _ => Err(shape(format!("checked {operation:?} intervals require CUDA f64 without CPU/Metal fallback"))),
         }
     }
@@ -1416,6 +1515,8 @@ impl Device {
             (Backend::Host, Data::Host(v)) => Data::Host(v[lo..hi].to_vec()),
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda(slice)) => Data::Cuda(engine.copy_range(slice, lo, hi)?),
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::Cuda32(slice)) => Data::Cuda32(engine.copy_range(slice, lo, hi)?),
             #[cfg(target_os = "macos")]
             (Backend::Metal(engine), Data::Metal(buffer)) => Data::Metal(engine.copy_range(buffer, lo, hi)?),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1439,7 +1540,7 @@ impl Device {
                 Data::Host(values)
             }
             #[cfg(target_os = "linux")]
-            (Backend::Cuda(engine), Data::Cuda(_)) => Data::Cuda(engine.columns_of(t, columns.start, width, count)?),
+            (Backend::Cuda(engine), Data::Cuda(_) | Data::Cuda32(_)) => engine.columns_of(t, columns.start, width, count)?,
             #[cfg(target_os = "macos")]
             (Backend::Metal(_), Data::Metal(_)) => return Err(shape("column copies are unsupported on Metal".into())),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1461,6 +1562,8 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda(slice), Data::Cuda(p)) => engine.write_range(slice, lo, p),
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::Cuda32(slice), Data::Cuda32(p)) => engine.write_range(slice, lo, p),
             #[cfg(target_os = "macos")]
             (Backend::Metal(engine), Data::Metal(buffer), Data::Metal(p)) => engine.write_range(buffer, lo, p, part.len()),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1486,7 +1589,9 @@ impl Device {
                 Ok(())
             }
             #[cfg(target_os = "linux")]
-            (Backend::Cuda(engine), Data::Cuda(out), Data::Cuda(input)) => engine.set_columns(out, input, t.cols, part.cols, start, part.len()),
+            (Backend::Cuda(engine), Data::Cuda(out), Data::Cuda(input)) => engine.set_columns(Storage::F64, out, input, t.cols, part.cols, start, part.len()),
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::Cuda32(out), Data::Cuda32(input)) => engine.set_columns(Storage::F32, out, input, t.cols, part.cols, start, part.len()),
             #[cfg(target_os = "macos")]
             (Backend::Metal(_), Data::Metal(_), Data::Metal(_)) => Err(shape("column copies are unsupported on Metal".into())),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1734,7 +1839,10 @@ impl Device {
         match &*self.backend {
             Backend::Host => Err(GpuError::NoDeviceKernel { reason: "the sparse code's CPU reference is gam_mpd::sparse_code".to_string() }),
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.code_rows((z, w, yfy), (gram, starts, bits), warm, (kappa, nodes, tolerance), on, workspace),
+            Backend::Cuda(engine) => {
+                float64_only("the CUDA sparse code", &[z, w, yfy, gram, bits, on])?;
+                engine.code_rows((z, w, yfy), (gram, starts, bits), warm, (kappa, nodes, tolerance), on, workspace)
+            }
             #[cfg(target_os = "macos")]
             Backend::Metal(engine) => {
                 if workspace.is_some() { return Err(GpuError::NoDeviceKernel { reason: "profiled sparse code requires CUDA".to_string() }); }
