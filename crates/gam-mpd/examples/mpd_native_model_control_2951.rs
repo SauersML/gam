@@ -2,7 +2,7 @@
 //! EXPORT OUT.json [CONTEXT=16] [BACKEND=cuda|cpu]. CUDA is required when requested.
 //! Reports numerical discrepancies; no invented fidelity threshold or certificate.
 use gam_gpu::{GpuPolicy, tensor::Device};
-use gam_mpd::{artifact::Artifact, artifact_device::Resident, counterfactual::read_f64_matrix, import::import_language_model};
+use gam_mpd::{artifact::Artifact, artifact_device::Resident, import::{import_language_model, read_f64}};
 use ndarray::Array2;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, time::Instant};
@@ -42,7 +42,7 @@ fn main() -> Result<(), String> {
     let t=Instant::now();let native=model.execute(&family,false).map_err(|e|e.to_string())?;
     times.insert("native_cpu",t.elapsed().as_secs_f64());
     let output=model.output;
-    let hf=read_f64_matrix(&export.join("logits_row0.f64"),native.values[output].ncols())?;
+    let hf=read_f64(&export.join("logits_row0.f64"),native.values[output].ncols())?;
     if hf.nrows()<context {return Err("stored HF reference shorter than context".into());}
     let hf=hf.slice(ndarray::s![..context,..]).to_owned();
     let hf_vs_native=compare(&native.values[output],&hf)?;drop(hf);

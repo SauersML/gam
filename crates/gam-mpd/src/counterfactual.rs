@@ -27,6 +27,7 @@ use std::sync::Arc;
 use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 
+use super::import::{read_f64, read_f64_shaped};
 use super::llama_simple_mlp::gelu_tanh;
 
 /// The decomposed maps of one block, in site order.
@@ -56,22 +57,7 @@ pub struct Decoder {
 }
 
 fn read_tensor(dir: &Path, name: &str, shape: [usize; 2]) -> Result<Array2<f64>, String> {
-    let path = dir.join(format!("{name}.f64"));
-    let matrix = read_f64_matrix(&path, shape[1])?;
-    if matrix.nrows() != shape[0] {
-        return Err(format!("{}: {} rows, expected {}", path.display(), matrix.nrows(), shape[0]));
-    }
-    Ok(matrix)
-}
-
-/// Raw little-endian float64 values as `rows × cols`.
-pub fn read_f64_matrix(path: &Path, cols: usize) -> Result<Array2<f64>, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if cols == 0 || bytes.len() % (cols * 8) != 0 {
-        return Err(format!("{}: {} bytes are not rows of {cols} float64", path.display(), bytes.len()));
-    }
-    let values = bytes.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().expect("eight bytes"))).collect();
-    Array2::from_shape_vec((bytes.len() / (cols * 8), cols), values).map_err(|e| e.to_string())
+    read_f64_shaped(&dir.join(format!("{name}.f64")), shape[0], shape[1])
 }
 
 fn rms_norm(x: &Array2<f64>, gain: &Array1<f64>, eps: f64) -> Array2<f64> {
@@ -468,8 +454,8 @@ impl Spec {
         let mut edits = BTreeMap::new();
         for (name, e) in spec["edits"].as_object().into_iter().flatten() {
             let (site, rank) = (field(e, "site")?, field(e, "rank")?);
-            let left = read_f64_matrix(&dir.join(e["left"].as_str().unwrap_or_default()), rank)?;
-            let right = read_f64_matrix(&dir.join(e["right"].as_str().unwrap_or_default()), rank)?;
+            let left = read_f64(&dir.join(e["left"].as_str().unwrap_or_default()), rank)?;
+            let right = read_f64(&dir.join(e["right"].as_str().unwrap_or_default()), rank)?;
             let (d_out, d_in) = decoder.native(site).dim();
             if left.nrows() != d_out || right.nrows() != d_in {
                 return Err(format!("edit {name}: left {:?}, right {:?} for a {d_out}×{d_in} site", left.dim(), right.dim()));
@@ -519,5 +505,5 @@ pub fn passages(export: &Path, rows: usize) -> Result<Vec<Vec<u32>>, String> {
     let record: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(export.join("export.json")).map_err(|e| format!("{}: {e}", export.display()))?).map_err(|e| e.to_string())?;
     let width = record["files"]["tokens"]["shape"][1].as_u64().ok_or("export has no tokens")? as usize;
-    Ok(read_f64_matrix(&export.join("tokens.f64"), width)?.outer_iter().map(|r| r.iter().take(rows).map(|t| *t as u32).collect()).collect())
+    Ok(read_f64(&export.join("tokens.f64"), width)?.outer_iter().map(|r| r.iter().take(rows).map(|t| *t as u32).collect()).collect())
 }

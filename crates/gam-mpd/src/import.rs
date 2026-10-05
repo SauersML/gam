@@ -44,16 +44,23 @@ pub struct Imported {
     pub record: Value,
 }
 
-fn read_f64(path: &Path, rows: usize, cols: usize) -> Result<Array2<f64>, String> {
-    let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if bytes.len() != rows * cols * 8 {
-        return Err(format!("{}: {} bytes for {rows}×{cols}", path.display(), bytes.len()));
+/// Raw little-endian float64 values as rows of `cols`, as many rows as the file holds.
+pub fn read_f64(path: &Path, cols: usize) -> Result<Array2<f64>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if cols == 0 || bytes.len() % (cols * 8) != 0 {
+        return Err(format!("{}: {} bytes are not rows of {cols} float64", path.display(), bytes.len()));
     }
-    let values: Vec<f64> = bytes
-        .chunks_exact(8)
-        .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-        .collect();
-    Array2::from_shape_vec((rows, cols), values).map_err(|error| error.to_string())
+    let values = bytes.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().expect("eight bytes"))).collect();
+    Array2::from_shape_vec((bytes.len() / (cols * 8), cols), values).map_err(|e| e.to_string())
+}
+
+/// [`read_f64`] of a file that must hold exactly `rows × cols` values.
+pub fn read_f64_shaped(path: &Path, rows: usize, cols: usize) -> Result<Array2<f64>, String> {
+    let matrix = read_f64(path, cols)?;
+    if matrix.nrows() != rows {
+        return Err(format!("{}: {} rows, expected {rows}", path.display(), matrix.nrows()));
+    }
+    Ok(matrix)
 }
 
 fn shape_of(value: &Value) -> Result<(usize, usize), String> {
@@ -91,7 +98,7 @@ impl Tensors<'_> {
         match self {
             Self::Export { dir, record } => {
                 let (rows, cols) = shape_of(&record["files"][name]["shape"]).map_err(|e| format!("{name}: {e}"))?;
-                read_f64(&dir.join(format!("{name}.f64")), rows, cols)
+                read_f64_shaped(&dir.join(format!("{name}.f64")), rows, cols)
             }
             Self::HuggingFace { file } => {
                 let stored = hugging_face_name(name).ok_or_else(|| format!("{name}: no Hugging Face tensor"))?;
@@ -168,7 +175,7 @@ pub fn import(dir: &Path) -> Result<Imported, String> {
     let kind = record["kind"].as_str().ok_or("export.json: kind")?.to_string();
     let name = record["model"].as_str().unwrap_or("model").to_string();
     let (sample_rows, sample_cols) = shape_of(&record["samples"]["shape"])?;
-    let samples = read_f64(&dir.join(record["samples"]["file"].as_str().unwrap_or("inputs.f64")), sample_rows, sample_cols)?;
+    let samples = read_f64_shaped(&dir.join(record["samples"]["file"].as_str().unwrap_or("inputs.f64")), sample_rows, sample_cols)?;
     let tensors = Tensors::Export { dir, record: &record };
     let (program, slots, complete, readout_slots) = match kind.as_str() {
         "transformer" => transformer(&tensors, &record, &samples)?,
@@ -475,7 +482,7 @@ pub fn import_rows(dir: &Path) -> Result<Imported, String> {
     let classes = record["output"]["n_classes"].as_u64().ok_or("output.n_classes")? as usize;
     let causal = record["config"]["causal"].as_bool().unwrap_or(true);
     let (sample_rows, positions) = shape_of(&record["samples"]["shape"])?;
-    let samples = read_f64(&dir.join(record["samples"]["file"].as_str().unwrap_or("inputs.f64")), sample_rows, positions)?;
+    let samples = read_f64_shaped(&dir.join(record["samples"]["file"].as_str().unwrap_or("inputs.f64")), sample_rows, positions)?;
     let model = Interface::native(d).map_err(|e| e.to_string())?;
     let head = Interface::native(dh).map_err(|e| e.to_string())?;
     let constant = Interface::constant();
@@ -614,7 +621,7 @@ pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Re
     if sequences > token_rows || context > token_cols {
         return Err(format!("{sequences} sequences of {context} tokens from a {token_rows}×{token_cols} table"));
     }
-    let tokens = read_f64(&dir.join("tokens.f64"), token_rows, token_cols)?;
+    let tokens = read_f64_shaped(&dir.join("tokens.f64"), token_rows, token_cols)?;
     let mut ids = Vec::new();
     let (mut sequence, mut position) = (Vec::new(), Vec::new());
     for row in 0..sequences {

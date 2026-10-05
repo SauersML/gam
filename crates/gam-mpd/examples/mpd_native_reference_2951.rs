@@ -1,6 +1,6 @@
 //! Lightweight native f64 forward versus archived HF logits, no artifact roundtrip.
 use gam_mpd::{
-    engine::sha256, counterfactual::read_f64_matrix, import::import_language_model,
+    engine::sha256, import::{import_language_model, read_f64},
 };
 use serde_json::json;
 use std::{path::Path, time::Instant};
@@ -21,7 +21,7 @@ fn main() -> Result<(), String> {
     let t = Instant::now();
     let imported = import_language_model(p, 1, n)?;
     let vocab = imported.record["config"]["vocab"].as_u64().ok_or("vocab")? as usize;
-    let reference = read_f64_matrix(&p.join("logits_row0.f64"), vocab)?;
+    let reference = read_f64(&p.join("logits_row0.f64"), vocab)?;
     if reference.nrows() < n {
         return Err("reference shorter than requested context".into());
     }
