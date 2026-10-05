@@ -9,10 +9,15 @@
 //!
 //! * A head's block reads its layer's normed stream `x` and writes the head's read (the attention
 //!   output projection's input). Its function attends with its own query, key and value maps
-//!   `q = Q x`, `k = K x`, `v = V x` at the native rotary angles, scale and causal mask.
+//!   `q = Q x`, `k = K x`, `v = V x` at the native rotary angles, scale and causal mask; where `M`
+//!   norms each head's query and key (Qwen3), `q = γ_q ⊙ rms(Q x)` and `k = γ_k ⊙ rms(K x)` with
+//!   the head's own copy of `M`'s gains `γ`, which are part of the law and not trained. Heads that
+//!   share a key and value in `M` (grouped-query attention) each have their own copies.
 //! * An MLP's block reads its layer's second normed stream and writes the MLP's output. Its
 //!   functions are `f_i(x) = φ(g_i·x + c_i) u_i`, with the native pointwise law `φ`,
-//!   a gate direction `g_i`, a gate bias `c_i` and an output `u_i`.
+//!   a gate direction `g_i`, a gate bias `c_i` and an output `u_i`; for a gated MLP (SwiGLU on
+//!   Qwen3) `f_i(x) = φ(g_i·x) (b_i·x) u_i` with an up direction `b_i`, and biases only where `M`
+//!   has them.
 //!
 //! The library starts at `M`: native neuron `i` is function `i` with its original
 //! activation and coefficients, and a head is its own function.
@@ -21,7 +26,7 @@
 //!
 //! The library's parameters `θ` are partitioned into prior groups `G`: a head's rotary plane (the
 //! query and key rows of the plane), a head's value coordinate (one value row), an MLP function's
-//! gate `(g_i, c_i)` and its output `u_i`. With the posterior `q(θ) = Π_j N(μ_j, σ_j²)` and the
+//! gate `(g_i, c_i)`, its up direction `b_i` when gated, and its output `u_i`. With the posterior `q(θ) = Π_j N(μ_j, σ_j²)` and the
 //! prior `p(θ_G) = N(0, v_G I)`, the code length in nats is
 //!
 //! `F = E_q[D(θ)] + Σ_G KL(q_G ‖ p_G) + Σ_{active G} ½ ln |G|`,
@@ -92,9 +97,9 @@ use crate::{
         FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, Provenance, Rule, SequenceLayout, SlotValues,
         exact_precision,
     },
-    run_check::LayerNodes,
+    run_check::{LayerNodes, head_projection},
 };
-use gam_gpu::tensor::{Device, Op};
+use gam_gpu::tensor::{Device, Op, Tensor};
 use ndarray::{Array2, s};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
@@ -138,8 +143,8 @@ pub struct Layer {
     pub sites: LayerNodes,
     /// Per head, its planes' groups and its value coordinates' groups.
     pub heads: Vec<(Vec<usize>, Vec<usize>)>,
-    /// Per MLP function, its gate's group and its output's group.
-    pub functions: Vec<(usize, usize)>,
+    /// Per MLP function, its groups: its gate's, its up direction's when gated, and its output's.
+    pub functions: Vec<Vec<usize>>,
 }
 
 /// A library operator: dense, every block present, its reals exactly representable.
@@ -155,6 +160,82 @@ fn single_map(native: &OperatorProgram, node: usize, input: usize) -> Result<Arc
         Node::Affine { terms, bias: None } if terms.len() == 1 && terms[0].0 == input => Ok(Arc::clone(&native.operators[terms[0].1])),
         other => Err(format!("node {node} is not a bias-free map of node {input}: {other:?}")),
     }
+}
+
+/// The head norm on `node` (a head's query or key; `run_check::head_projection`): its RMS norm's
+/// `ε` and its gain operator.
+fn head_norm(native: &OperatorProgram, node: usize) -> Option<(f64, Arc<Operator>)> {
+    if head_projection(native, node) == node {
+        return None;
+    }
+    match &native.nodes[node] {
+        Node::Affine { terms, .. } => match native.nodes[terms[0].0] {
+            Node::RmsNorm { epsilon, .. } => Some((epsilon, Arc::clone(&native.operators[terms[0].1]))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The native operator and bias of the affine node `node` reading `input` alone.
+fn affine_map(native: &OperatorProgram, node: usize, input: usize) -> Result<(Arc<Operator>, Option<Array2<f64>>), String> {
+    match &native.nodes[node] {
+        Node::Affine { terms, bias } if terms.len() == 1 && terms[0].0 == input => {
+            Ok((Arc::clone(&native.operators[terms[0].1]), bias.map(|b| native.operators[b].matrix())))
+        }
+        other => Err(format!("node {node} is not an affine map of node {input}: {other:?}")),
+    }
+}
+
+/// The library block of a gated MLP `down(φ(A x + c) ⊙ (B x + e))` (SwiGLU on Qwen3): functions
+/// `f_i(x) = φ(a_i·x + c_i) (b_i·x + e_i) u_i` with `M`'s law `φ`, its gate `a_i`, up direction
+/// `b_i` and output `u_i`, and the biases `c_i`, `e_i` only where `M` has them.
+fn gated_mlp(native: &OperatorProgram, artifact: Artifact, layer: &LayerNodes, l: usize, left: usize, right: usize) -> Result<Artifact, String> {
+    let Node::Pointwise { input: gate_pre, laws } = &native.nodes[left] else {
+        return Err(format!("layer {l}: the gated product's left factor is not one pointwise law"));
+    };
+    if laws.iter().any(|law| *law != laws[0]) {
+        return Err(format!("layer {l}: the MLP's units have different laws"));
+    }
+    let x = layer.normed;
+    let ((gate, gate_bias), (up, up_bias)) = (affine_map(native, *gate_pre, x)?, affine_map(native, right, x)?);
+    let down = single_map(native, layer.mlp, layer.active)?;
+    let units = up.rows.clone();
+    if gate.rows != units || down.cols != units {
+        return Err(format!("layer {l}: the gate, up and down maps disagree on the MLP's units"));
+    }
+    let name = format!("library.l{l}.mlp");
+    let base = artifact.program.operators.len();
+    let mut operators = vec![
+        library_operator(&format!("{name}.gate"), units.clone(), gate.cols.clone(), gate.matrix(), &gate.name)?,
+        library_operator(&format!("{name}.up"), units.clone(), up.cols.clone(), up.matrix(), &up.name)?,
+        library_operator(&format!("{name}.out"), down.rows.clone(), units.clone(), down.matrix(), &down.name)?,
+    ];
+    let mut bias = |values: Option<Array2<f64>>, part: &str, source: &str| -> Result<Option<usize>, String> {
+        let Some(values) = values else { return Ok(None) };
+        operators.push(library_operator(&format!("{name}.{part}_bias"), units.clone(), Interface::constant(), values, source)?);
+        Ok(Some(base + operators.len() - 1))
+    };
+    let (gate_bias, up_bias) = (bias(gate_bias, "gate", &gate.name)?, bias(up_bias, "up", &up.name)?);
+    let rule = Rule {
+        name: name.clone(),
+        inputs: vec![gate.cols.clone()],
+        nodes: vec![
+            Node::Param { index: 0 },
+            Node::Affine { terms: vec![(0, base)], bias: gate_bias },
+            Node::Pointwise { input: 1, laws: laws.clone() },
+            Node::Affine { terms: vec![(0, base + 1)], bias: up_bias },
+            Node::Hadamard { left: 2, right: 3 },
+            Node::Affine { terms: vec![(4, base + 2)], bias: None },
+        ],
+        output: 5,
+    };
+    artifact.replace_block(&name, Callee::New(rule), vec![Argument::Native(x)], layer.mlp, operators)
+}
+
+/// The operator named `name`, when the program has one (a part a law may lack: a bias, an up map).
+fn operator_named(program: &OperatorProgram, name: &str) -> Option<usize> {
+    program.operators.iter().position(|op| op.name == name)
 }
 
 fn index_of(program: &OperatorProgram, name: &str) -> Result<usize, String> {
@@ -176,6 +257,8 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
                 return Err(format!("layer {l} head {h}: the read is not an attention node"));
             };
             let x = layer.normed_stream;
+            let (query_norm, key_norm) = (head_norm(native, query), head_norm(native, key));
+            let (query, key) = (head_projection(native, query), head_projection(native, key));
             let (q, k, v) = (single_map(native, query, x)?, single_map(native, key, x)?, single_map(native, value, x)?);
             if q.rows.width() != k.rows.width() {
                 return Err(format!("layer {l} head {h}: query and key widths differ"));
@@ -184,23 +267,30 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
             let coordinates = Interface::uniform(q.rows.width(), 1, LabelKind::Unit, 0).map_err(error)?;
             let name = format!("library.l{l}.h{h}");
             let base = artifact.program.operators.len();
-            let operators = vec![
+            let mut operators = vec![
                 library_operator(&format!("{name}.q"), coordinates.clone(), q.cols.clone(), q.matrix(), &q.name)?,
-                library_operator(&format!("{name}.k"), coordinates, k.cols.clone(), k.matrix(), &k.name)?,
+                library_operator(&format!("{name}.k"), coordinates.clone(), k.cols.clone(), k.matrix(), &k.name)?,
                 library_operator(&format!("{name}.v"), v.rows.clone(), v.cols.clone(), v.matrix(), &v.name)?,
             ];
-            let rule = Rule {
-                name: name.clone(),
-                inputs: vec![q.cols.clone()],
-                nodes: vec![
-                    Node::Param { index: 0 },
-                    Node::Affine { terms: vec![(0, base)], bias: None },
-                    Node::Affine { terms: vec![(0, base + 1)], bias: None },
-                    Node::Affine { terms: vec![(0, base + 2)], bias: None },
-                    Node::Attend { query: 1, key: 2, value: 3, scale, rotary, causal },
-                ],
-                output: 4,
+            let mut nodes = vec![
+                Node::Param { index: 0 },
+                Node::Affine { terms: vec![(0, base)], bias: None },
+                Node::Affine { terms: vec![(0, base + 1)], bias: None },
+                Node::Affine { terms: vec![(0, base + 2)], bias: None },
+            ];
+            // A head norm: the RMS norm of the projection, then the head's own copy of `M`'s gain.
+            let mut normed = |projection: usize, norm: Option<(f64, Arc<Operator>)>, part: &str| -> Result<usize, String> {
+                let Some((epsilon, gain)) = norm else { return Ok(projection) };
+                let values = gain.diagonal().ok_or_else(|| format!("{}: a head norm's gain is not diagonal", gain.name))?;
+                let precision = exact_precision(values.iter().copied()).map_err(error)?;
+                nodes.push(Node::RmsNorm { input: projection, epsilon });
+                nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + operators.len())], bias: None });
+                operators.push(Operator::diag(format!("{name}.{part}_gain"), coordinates.clone(), values, precision, gain.provenance.clone()).map_err(error)?);
+                Ok(nodes.len() - 1)
             };
+            let (query_node, key_node) = (normed(1, query_norm, "q")?, normed(2, key_norm, "k")?);
+            nodes.push(Node::Attend { query: query_node, key: key_node, value: 3, scale, rotary, causal });
+            let rule = Rule { name: name.clone(), inputs: vec![q.cols.clone()], output: nodes.len() - 1, nodes };
             artifact = artifact.replace_block(&name, Callee::New(rule), vec![Argument::Native(x)], read, operators)?;
             let pairs: Vec<Vec<usize>> = match rotary {
                 Some(r) => {
@@ -212,8 +302,12 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
             };
             planes.push((l, name, pairs, v.rows.width()));
         }
+        if let Node::Hadamard { left, right } = native.nodes[layer.active] {
+            artifact = gated_mlp(native, artifact, layer, l, left, right)?;
+            continue;
+        }
         let Node::Pointwise { input: pre, laws } = &native.nodes[layer.active] else {
-            return Err(format!("layer {l}: the MLP activation is not one pointwise law (gated MLPs are not supported yet)"));
+            return Err(format!("layer {l}: the MLP activation is neither one pointwise law nor a gated product"));
         };
         if laws.iter().any(|law| *law != laws[0]) {
             return Err(format!("layer {l}: the MLP's units have different laws"));
@@ -272,21 +366,27 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
     }
     for (l, layer) in out.iter_mut().enumerate() {
         let name = format!("library.l{l}.mlp");
-        let (gate, bias, output) =
-            (index_of(program, &format!("{name}.gate"))?, index_of(program, &format!("{name}.gate_bias"))?, index_of(program, &format!("{name}.out"))?);
-        let (functions, d) = (program.operators[gate].rows.width(), program.operators[gate].cols.width());
-        let first = groups.len();
-        for i in 0..functions {
-            groups.push(Group {
-                name: format!("{name}.f{i}.gate"),
-                cells: vec![Cells { operator: gate, rows: vec![i], cols: 0..d }, Cells { operator: bias, rows: vec![i], cols: 0..1 }],
-            });
+        let output = index_of(program, &format!("{name}.out"))?;
+        let (functions, d) = (program.operators[output].cols.width(), program.operators[output].rows.width());
+        layer.functions = vec![Vec::new(); functions];
+        // Per function its gate (with its bias), its up direction when gated (likewise), its output.
+        for part in ["gate", "up"] {
+            let Some(map) = operator_named(program, &format!("{name}.{part}")) else { continue };
+            let bias = operator_named(program, &format!("{name}.{part}_bias"));
+            for (i, function) in layer.functions.iter_mut().enumerate() {
+                let mut cells = vec![Cells { operator: map, rows: vec![i], cols: 0..d }];
+                cells.extend(bias.map(|b| Cells { operator: b, rows: vec![i], cols: 0..1 }));
+                function.push(groups.len());
+                groups.push(Group { name: format!("{name}.f{i}.{part}"), cells });
+            }
+            trainable.push(map);
+            trainable.extend(bias);
         }
-        for i in 0..functions {
+        for (i, function) in layer.functions.iter_mut().enumerate() {
+            function.push(groups.len());
             groups.push(Group { name: format!("{name}.f{i}.out"), cells: vec![Cells { operator: output, rows: (0..d).collect(), cols: i..i + 1 }] });
         }
-        layer.functions = (0..functions).map(|i| (first + i, first + functions + i)).collect();
-        trainable.extend([gate, bias, output]);
+        trainable.push(output);
     }
     trainable.sort_unstable();
     Ok(Explanation { artifact, trainable, groups, layers: out })
@@ -596,11 +696,13 @@ pub struct LayerCount {
     pub heads: usize,
     pub planes: usize,
     pub values: usize,
-    /// MLP functions whose gate and output are both active.
+    /// MLP functions whose groups are all active.
     pub functions: usize,
-    /// Mean per token of the surviving functions whose activation `φ(z)` is not zero, and of those
-    /// whose activation exceeds its posterior noise scale `|φ′(z)| s`, `s² = Σ_j σ²_{g_j} x_j² +
-    /// σ²_c` the posterior variance of the gate value `z = g·x + c` at the token's input `x`.
+    /// Mean per token of the surviving functions whose activation `a = φ(z) y` is not zero, and of
+    /// those whose activation exceeds its posterior noise scale `√((φ′(z) y)² s_z² + φ(z)² s_y²)`,
+    /// `s_z² = Σ_j σ²_{g_j} x_j² + σ²_c` the posterior variance of the gate value `z = g·x + c` at
+    /// the token's input `x` and `s_y²` likewise of a gated law's up value `y = b·x + e` (an
+    /// ungated law has `y = 1`, `s_y = 0`).
     pub nonzero_per_token: f64,
     pub resolved_per_token: f64,
 }
@@ -743,32 +845,52 @@ fn draws(count: usize, size: usize, seed: u64) -> Result<Vec<Draw>, String> {
         .collect())
 }
 
-/// An MLP's nodes in the explanation's flat program: the gate's input `x`, the gate value `z`,
-/// the activation `φ(z)`, its law, and the gate's and gate bias's operators.
+/// An affine node of an MLP in the explanation's flat program: the node, and its operator and
+/// bias operator.
+struct Map {
+    node: usize,
+    operator: usize,
+    bias: Option<usize>,
+}
+
+impl Map {
+    /// The node of `flat` applying operator `name` (and its bias `{name}_bias`, when it exists) to
+    /// one input, and that input.
+    fn of(flat: &OperatorProgram, name: &str) -> Result<(Self, usize), String> {
+        let (operator, bias) = (index_of(flat, name)?, operator_named(flat, &format!("{name}_bias")));
+        let found = flat.nodes.iter().enumerate().find_map(|(n, node)| match node {
+            Node::Affine { terms, bias: b } if *b == bias && terms.len() == 1 && terms[0].1 == operator => Some((n, terms[0].0)),
+            _ => None,
+        });
+        let (node, input) = found.ok_or_else(|| format!("no node applies {name}"))?;
+        Ok((Self { node, operator, bias }, input))
+    }
+}
+
+/// An MLP's nodes in the explanation's flat program: the gate's input `x`, the gate `z = g·x + c`,
+/// the activation `φ(z)` and its law, and for a gated law the up value `y = b·x + e`.
 struct Mlp {
     input: usize,
-    gate: usize,
+    gate: Map,
     activation: usize,
     law: Law,
-    gate_operator: usize,
-    bias_operator: usize,
+    up: Option<Map>,
 }
 
 impl Mlp {
     fn of(flat: &OperatorProgram, l: usize) -> Result<Self, String> {
         let name = format!("library.l{l}.mlp");
-        let (gate_operator, bias_operator) = (index_of(flat, &format!("{name}.gate"))?, index_of(flat, &format!("{name}.gate_bias"))?);
+        let (gate, input) = Map::of(flat, &format!("{name}.gate"))?;
         let found = flat.nodes.iter().enumerate().find_map(|(n, node)| match node {
-            Node::Affine { terms, bias: Some(b) } if *b == bias_operator && terms.len() == 1 && terms[0].1 == gate_operator => Some((n, terms[0].0)),
-            _ => None,
-        });
-        let (gate, input) = found.ok_or_else(|| format!("layer {l}: no gate node"))?;
-        let found = flat.nodes.iter().enumerate().find_map(|(n, node)| match node {
-            Node::Pointwise { input, laws } if *input == gate => laws.first().map(|law| (n, *law)),
+            Node::Pointwise { input, laws } if *input == gate.node => laws.first().map(|law| (n, *law)),
             _ => None,
         });
         let (activation, law) = found.ok_or_else(|| format!("layer {l}: no activation node"))?;
-        Ok(Self { input, gate, activation, law, gate_operator, bias_operator })
+        let up = match operator_named(flat, &format!("{name}.up")) {
+            Some(_) => Some(Map::of(flat, &format!("{name}.up"))?.0),
+            None => None,
+        };
+        Ok(Self { input, gate, activation, law, up })
     }
 }
 
@@ -937,9 +1059,18 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterio
     let (program, d) = (p.program, p.program.device());
     let active = |g: &usize| posterior.active[*g];
     let mut out = Vec::with_capacity(scorer.layers());
+    // Per map its weights' posterior variances on the device and its bias's (zero without one).
+    let variances = |map: &Map| -> Result<(Tensor, Vec<f64>), String> {
+        let weights = d.upload(variance(map.operator)?.view()).map_err(error)?;
+        let bias = match map.bias {
+            Some(b) => variance(b)?.column(0).to_vec(),
+            None => vec![0.0; program.widths()[map.node]],
+        };
+        Ok((weights, bias))
+    };
     let mut gates = Vec::with_capacity(scorer.layers());
     for (layer, mlp) in explanation.layers.iter().zip(&scorer.mlps) {
-        let surviving: Vec<bool> = layer.functions.iter().map(|(gate, output)| active(gate) && active(output)).collect();
+        let surviving: Vec<bool> = layer.functions.iter().map(|groups| groups.iter().all(active)).collect();
         out.push(LayerCount {
             heads: layer.heads.iter().filter(|(_, values)| values.iter().any(active)).count(),
             planes: layer.heads.iter().map(|(planes, _)| planes.iter().filter(|g| active(g)).count()).sum(),
@@ -948,30 +1079,41 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterio
             nonzero_per_token: 0.0,
             resolved_per_token: 0.0,
         });
-        let bias = variance(mlp.bias_operator)?.column(0).to_vec();
-        gates.push((surviving, d.upload(variance(mlp.gate_operator)?.view()).map_err(error)?, bias));
+        gates.push((surviving, variances(&mlp.gate)?, mlp.up.as_ref().map(variances).transpose()?));
     }
     let mut rows = 0usize;
     for chunk in sequences.chunks(settings.batch_sequences) {
         let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
         let trace = program.forward(&family)?;
-        for ((count, mlp), (surviving, gate_variance, bias_variance)) in out.iter_mut().zip(&scorer.mlps).zip(&gates) {
+        for ((count, mlp), (surviving, gate, up)) in out.iter_mut().zip(&scorer.mlps).zip(&gates) {
             let x = d.download(trace.value(mlp.input)?).map_err(error)?;
             let squares = d.upload(x.mapv(|v| v * v).view()).map_err(error)?;
-            let mut s2 = d.zeros(x.nrows(), surviving.len()).map_err(error)?;
-            d.gemm(&mut s2, 1.0, &squares, Op::N, gate_variance, Op::T, 0.0, program.arithmetic()).map_err(error)?;
-            let s2 = d.download(&s2).map_err(error)?;
-            let z = d.download(trace.value(mlp.gate)?).map_err(error)?;
+            // `s²` of each function's value at every token: `Σ_j σ²_j x_j²` plus the bias's `σ²`.
+            let noise = |(weights, bias): &(Tensor, Vec<f64>)| -> Result<Array2<f64>, String> {
+                let mut s2 = d.zeros(x.nrows(), surviving.len()).map_err(error)?;
+                d.gemm(&mut s2, 1.0, &squares, Op::N, weights, Op::T, 0.0, program.arithmetic()).map_err(error)?;
+                let mut s2 = d.download(&s2).map_err(error)?;
+                s2.rows_mut().into_iter().for_each(|mut row| row.iter_mut().zip(bias).for_each(|(v, b)| *v += b));
+                Ok(s2)
+            };
+            let sz2 = noise(gate)?;
+            let z = d.download(trace.value(mlp.gate.node)?).map_err(error)?;
             let a = d.download(trace.value(mlp.activation)?).map_err(error)?;
+            let gated = match (&mlp.up, up) {
+                (Some(map), Some(variances)) => Some((d.download(trace.value(map.node)?).map_err(error)?, noise(variances)?)),
+                _ => None,
+            };
             let (nonzero, resolved) = (0..x.nrows())
                 .into_par_iter()
                 .map(|t| {
                     let (mut nonzero, mut resolved) = (0usize, 0usize);
                     for (i, alive) in surviving.iter().enumerate() {
                         if *alive {
-                            let (zi, ai) = (z[[t, i]], a[[t, i]]);
-                            nonzero += usize::from(ai != 0.0);
-                            resolved += usize::from(ai.abs() > mlp.law.derivative(zi).abs() * (s2[[t, i]] + bias_variance[i]).max(0.0).sqrt());
+                            let (zi, phi) = (z[[t, i]], a[[t, i]]);
+                            let (yi, sy2) = gated.as_ref().map_or((1.0, 0.0), |(y, sy2)| (y[[t, i]], sy2[[t, i]]));
+                            let slope = mlp.law.derivative(zi) * yi;
+                            nonzero += usize::from(phi * yi != 0.0);
+                            resolved += usize::from((phi * yi).abs() > (slope * slope * sz2[[t, i]].max(0.0) + phi * phi * sy2.max(0.0)).sqrt());
                         }
                     }
                     (nonzero, resolved)
@@ -1363,6 +1505,88 @@ mod tests {
         (native, layers, family, sequences)
     }
 
+    /// The tiny decoder made like Qwen3: SiLU-gated MLPs, an RMS norm with a gain on every head's
+    /// query and key, and one key-value head shared by both query heads.
+    fn tiny_qwen3(tag: &str) -> (OperatorProgram, Vec<LayerNodes>, FamilyInputs, Vec<Vec<u32>>) {
+        let dir = crate::test_support::tiny_export(tag, 2);
+        let path = dir.join("export.json");
+        let mut record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (d, mlp, head) = (8, 16, 4);
+        let mut rng = StdRng::seed_from_u64(11);
+        for l in 0..2 {
+            for (name, shape, centre) in [
+                ("attn.k_proj", [head, d], 0.0),
+                ("attn.v_proj", [head, d], 0.0),
+                ("mlp.gate_proj", [mlp, d], 0.0),
+                ("attn.q_norm.gain", [1, head], 1.0),
+                ("attn.k_norm.gain", [1, head], 1.0),
+            ] {
+                let name = format!("blocks.{l}.{name}");
+                let bytes: Vec<u8> = (0..shape[0] * shape[1]).flat_map(|_| (centre + rng.random::<f64>() - 0.5).to_le_bytes()).collect();
+                std::fs::write(dir.join(format!("{name}.f64")), bytes).unwrap();
+                record["files"][name] = serde_json::json!({"shape": shape});
+            }
+        }
+        let config = &mut record["config"];
+        config["n_kv_heads"] = 1.into();
+        config["mlp_act"] = "silu".into();
+        config["mlp_gated"] = true.into();
+        config["qk_norm"] = true.into();
+        std::fs::write(&path, record.to_string()).unwrap();
+        let imported = import_language_model(&dir, 6, 12).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        let native = split_sites(&imported.program).unwrap();
+        let layers = layer_nodes(&native, 2).unwrap();
+        let family = imported.family;
+        let SlotValues::Tokens(tokens) = &family.slots[0] else { panic!("token slot") };
+        let sequences = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        (native, layers, family, sequences)
+    }
+
+    #[test]
+    fn the_starting_library_of_a_qwen3_decoder_is_the_model_in_every_experiment() {
+        let (native, layers, family, sequences) = tiny_qwen3("library_start_qwen3");
+        let explanation = explanation(&native, &layers).unwrap();
+        explanation.artifact.validate_coverage(&native).unwrap();
+        assert_eq!(explanation.artifact.blocks.len(), 2 * (2 + 1), "two heads and one MLP per layer");
+        // Per head two rotary planes and four value rows; per MLP function its gate, up direction
+        // and output.
+        assert_eq!(explanation.groups.len(), 2 * (2 * (2 + 4) + 16 * 3));
+        assert!(explanation.layers.iter().all(|l| l.functions.iter().all(|f| f.len() == 3)));
+        let expected = native.execute(&family, false).unwrap().values[native.output].clone();
+        let actual = explanation.artifact.execute(&family).unwrap().values[explanation.artifact.program.output].clone();
+        let scale = expected.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+        let difference = expected.iter().zip(&actual).fold(0.0_f64, |a, (x, y)| a.max((x - y).abs()));
+        assert!(difference <= 1e-12 * scale, "the starting library differs from the native model by {difference}");
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let cells: usize = explanation.groups.iter().flat_map(|g| &g.cells).map(|c| c.rows.len() * c.cols.len()).sum();
+        assert_eq!(cells, posterior.mean.iter().map(Array2::len).sum::<usize>(), "the groups partition the parameters");
+        let settings = settings();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
+        let evaluation = held_out(&mut scorer, &explanation, &posterior, &sequences, &settings, 72).unwrap();
+        for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
+            let bits = bits.expect("every cut and the read patches are drawn");
+            assert!(bits.abs() < 1e-10, "the starting library diverges from the model by {bits} bits per token");
+        }
+        for (count, layer) in evaluation.layers.iter().zip(&explanation.layers) {
+            assert_eq!(count.functions, layer.functions.len());
+            assert!(count.resolved_per_token <= count.nonzero_per_token && count.nonzero_per_token <= layer.functions.len() as f64);
+        }
+    }
+
+    #[test]
+    fn a_qwen3_library_fit_never_increases_its_objective() {
+        let (native, layers, _, sequences) = tiny_qwen3("library_fit_qwen3");
+        let explanation = explanation(&native, &layers).unwrap();
+        let (train, held) = sequences.split_at(4);
+        let fit = fit(&Device::host(), &native, &explanation, train, held, &settings(), None).unwrap();
+        let report = &fit.report;
+        assert_eq!(report.removals.last().unwrap().removed, 0, "the fit ends when no removal is accepted");
+        assert!(report.removals.iter().all(|r| r.after_bits <= r.before_bits), "a removal never increases the objective");
+        assert!(report.epochs.iter().all(|e| e.objective_bits.is_finite() && e.held_out.objective_bits_per_token.is_finite()));
+        posterior_mean(&explanation, &fit.posterior).unwrap().validate_coverage(&native).unwrap();
+    }
+
     fn settings() -> Settings {
         Settings {
             batch_sequences: 2,
@@ -1395,7 +1619,7 @@ mod tests {
             let indexed: usize = explanation
                 .layers
                 .iter()
-                .map(|l| l.heads.iter().map(|(p, v)| p.len() + v.len()).sum::<usize>() + 2 * l.functions.len())
+                .map(|l| l.heads.iter().map(|(p, v)| p.len() + v.len()).sum::<usize>() + l.functions.iter().map(Vec::len).sum::<usize>())
                 .sum();
             assert_eq!(indexed, explanation.groups.len(), "every group belongs to one head or one MLP function");
         }

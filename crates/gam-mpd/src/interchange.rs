@@ -171,7 +171,8 @@ pub struct ReadVariable {
 }
 
 /// The read variables of a library explanation of `layers` layers (`library_mdl::explanation`):
-/// per head its query, key and value read maps, per MLP function its gate direction.
+/// per head its query, key and value read maps, per MLP function its gate direction (with its up
+/// direction for a gated law).
 pub fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<ReadVariable>, String> {
     let named: BTreeMap<&str, usize> = program.operators.iter().enumerate().map(|(i, op)| (op.name.as_str(), i)).collect();
     let mut out = Vec::new();
@@ -186,8 +187,14 @@ pub fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<Rea
                 out.push(ReadVariable { block: 2 * l, parts: vec![(op, 0..program.operators[op].rows.width())] });
             }
         }
+        // An MLP function reads through its gate, and a gated law's function through its up
+        // direction too.
         let gate = *named.get(format!("library.l{l}.mlp.gate").as_str()).ok_or_else(|| error(format!("layer {l}: no MLP gate")))?;
-        out.extend((0..program.operators[gate].rows.width()).map(|i| ReadVariable { block: 2 * l + 1, parts: vec![(gate, i..i + 1)] }));
+        let up = named.get(format!("library.l{l}.mlp.up").as_str()).copied();
+        out.extend((0..program.operators[gate].rows.width()).map(|i| ReadVariable {
+            block: 2 * l + 1,
+            parts: std::iter::once(gate).chain(up).map(|op| (op, i..i + 1)).collect(),
+        }));
     }
     Ok(out)
 }

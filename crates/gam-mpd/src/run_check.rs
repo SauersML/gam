@@ -176,8 +176,9 @@ pub fn layer_nodes(native: &OperatorProgram, layers: usize) -> Result<Vec<LayerN
                 }
             }
         } else if let Node::Attend { query, .. } = node {
+            let query = head_projection(native, *query);
             for nodes in out.iter_mut() {
-                if let Some(h) = nodes.queries.iter().position(|q| q == query) {
+                if let Some(h) = nodes.queries.iter().position(|q| *q == query) {
                     put(&mut nodes.reads, h, index);
                 }
             }
@@ -194,6 +195,19 @@ pub fn layer_nodes(native: &OperatorProgram, layers: usize) -> Result<Vec<LayerN
         }
     }
     Ok(out)
+}
+
+/// The projection a head's query or key node is made from: the node itself, or, under a head norm
+/// (Qwen3's `q_norm`, `k_norm`: a diagonal gain on an RMS norm of the projection), the projection.
+pub fn head_projection(program: &OperatorProgram, node: usize) -> usize {
+    if let Node::Affine { terms, bias: None } = &program.nodes[node]
+        && let [(normed, gain)] = terms[..]
+        && matches!(program.operators[gain].body, OperatorBody::Diagonal { .. })
+        && let Node::RmsNorm { input, .. } = program.nodes[normed]
+    {
+        return input;
+    }
+    node
 }
 
 fn put(list: &mut Vec<usize>, at: usize, value: usize) {
