@@ -984,11 +984,11 @@ struct Map {
 
 impl Map {
     /// The node of `flat` applying operator `name` (and its bias `{name}_bias`, when it exists) to
-    /// one input, and that input.
+    /// its first input, and that input. A shared block adds further terms (`library_sharing`).
     fn of(flat: &OperatorProgram, name: &str) -> Result<(Self, usize), String> {
         let (operator, bias) = (index_of(flat, name)?, operator_named(flat, &format!("{name}_bias")));
         let found = flat.nodes.iter().enumerate().find_map(|(n, node)| match node {
-            Node::Affine { terms, bias: b } if *b == bias && terms.len() == 1 && terms[0].1 == operator => Some((n, terms[0].0)),
+            Node::Affine { terms, bias: b } if *b == bias && terms.first().is_some_and(|t| t.1 == operator) => Some((n, terms[0].0)),
             _ => None,
         });
         let (node, input) = found.ok_or_else(|| format!("no node applies {name}"))?;
@@ -2345,6 +2345,34 @@ mod tests {
             down[i][entry] -= h;
             let central = (bits(&up) - bits(&down)) / (2.0 * h);
             assert!((gradients[i][entry] - central).abs() <= 1e-5 * (1.0 + central.abs()), "tied gradient {} against {central}", gradients[i][entry]);
+        }
+    }
+
+    #[test]
+    fn a_block_shared_across_layers_is_differentiated_through_both_of_its_uses() {
+        let (native, layers, _, sequences) = tiny("library_block_gradient", "gelu_tanh");
+        let start = explanation(&native, &layers).unwrap();
+        let row = crate::library_sharing::tie_row(&start, "gate", (1, 7), crate::library_sharing::RowSource::Row { layer: 0, part: "gate", function: 4 }, 0.8).unwrap();
+        let explanation = crate::library_sharing::tie_column(&row, (1, 7), (0, 4), -0.6).unwrap();
+        let settings = settings();
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, "tiny", None).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let batch = draws[0].batch(&sequences).unwrap();
+        let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
+        let (theta, _) = posterior.sample(noise_seed(settings.seed, 0, 0));
+        let (_, gradients) = scorer.score(&batch, &experiments, &theta, "gradient", true).unwrap();
+        let at = |name: &str| explanation.trainable.iter().position(|op| explanation.artifact.program.operators[*op].name == name).unwrap();
+        let (gate, out) = (at("library.l0.mlp.gate"), at("library.l0.mlp.out"));
+        let (row_scale, column_scale) = (at("library.l1.mlp.f7.gate.from_l0_gate4.scale"), at("library.l1.mlp.f7.out.from_l0_4.scale"));
+        let mut bits = |theta: &[Array2<f64>]| -> f64 { scorer.score(&batch, &experiments, theta, "gradient", false).unwrap().0.iter().flatten().sum() };
+        for (i, entry) in [(gate, (4, 0)), (gate, (4, 5)), (out, (2, 4)), (out, (6, 4)), (row_scale, (0, 0)), (column_scale, (0, 0))] {
+            let h = 1e-5;
+            let (mut up, mut down) = (theta.clone(), theta.clone());
+            up[i][entry] += h;
+            down[i][entry] -= h;
+            let central = (bits(&up) - bits(&down)) / (2.0 * h);
+            assert!((gradients[i][entry] - central).abs() <= 1e-5 * (1.0 + central.abs()), "shared block gradient {} against {central}", gradients[i][entry]);
         }
     }
 

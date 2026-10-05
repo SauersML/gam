@@ -1,18 +1,22 @@
-//! A learned mixture prior over the library's read directions: soft weight-sharing (Nowlan and
-//! Hinton 1992) that finds read–write ties and shared query–key functions by gradient (#2951).
+//! A learned mixture prior over the library's parameter blocks: soft weight-sharing (Nowlan and
+//! Hinton 1992) that finds read–write ties, blocks shared across layers and shared query–key
+//! functions by gradient (#2951).
 //!
 //! # The prior
 //!
-//! A target is a vector of the library's parameters `g`: an MLP function's gate direction `g_i`
-//! (row `i` of `library.l{l}.mlp.gate`), or a head's query–key map (the rows of its `Q` and `K` in
-//! the rotary planes still in the explanation). The Gaussian prior of its groups, `N(0, diag v)`
+//! A target is one block of the library's parameters `g`, each block separately: an MLP function's
+//! gate direction `g_i` (row `i` of `library.l{l}.mlp.gate`), its up direction when the MLP is
+//! gated (row `i` of `library.l{l}.mlp.up`), its output vector (column `i` of `library.l{l}.mlp.out`),
+//! or a head's query–key map (the rows of its `Q` and `K` in the rotary planes still in the
+//! explanation). The Gaussian prior of its groups, `N(0, diag v)`
 //! with `v` each entry's group's empirical-Bayes variance (`library_mdl`), becomes the mixture
 //!
 //! `p(g) = π_0 N(g; 0, diag v) + Σ_{j ∈ C} π_j N(g; c_j u_j, s² I)`
 //!
-//! over `K` candidates `u_j`. A gate's are writes: earlier functions' output vectors (columns of
-//! `library.l{l'}.mlp.out`, `l' < l`, at the weight sample) and `M`'s token embedding rows (the
-//! columns of `wte`). A head's are the query–key maps of heads in earlier layers with keys of their
+//! over `K` candidates `u_j`, all at the weight sample and all of earlier layers `l' < l`. A gate's
+//! are earlier gate directions, earlier functions' output vectors (a read of what they write) and
+//! `M`'s token embedding rows (the columns of `wte`); an up direction's are earlier up directions;
+//! an output's are earlier output vectors. A head's are the query–key maps of heads in earlier layers with keys of their
 //! own, each brought to the target's gauge plane by plane (`library_sharing::gauge`, a rotation and
 //! a scale that leave its scores unchanged), the gauge fixed for the epoch. The scales `c_j`, the
 //! weights `π = softmax(z)` of the logits `z` and the variance `s²` are learned. As the groups' own
@@ -20,8 +24,8 @@
 //! `KL(q ‖ N(0, diag v)) − E_q[ln r(g)]`. `library_mdl` keeps the first term's closed form; this
 //! module estimates the second from the fit's own reparameterized weight sample, an unbiased
 //! estimate. These are conditional priors: the candidates use the same weight sample as the
-//! targets. Heads condition only on earlier layers, so their product is a normalized joint prior
-//! for fixed mixture parameters and gauges. Allowing mutual head candidates would instead form
+//! targets. Every target conditions only on earlier layers, so their product is a normalized joint
+//! prior for fixed mixture parameters and gauges. Allowing mutual head candidates would instead form
 //! a product of cyclic conditionals, which need not be normalizable. `v` enters `r` as the closed
 //! form sets it.
 //!
@@ -49,8 +53,11 @@
 //! # Hardening
 //!
 //! When one candidate holds more than half of its target's mixture weight, the sharing is made
-//! exact: a gate's write becomes a tie (`library_sharing::tie`, `library_sharing::tie_token`), a
-//! head's pair one shared query–key function (`library_sharing::share_query_key`). The vector is
+//! exact: a gate reading an earlier write becomes a tie (`library_sharing::tie`,
+//! `library_sharing::tie_token`), a gate or up direction a scale times an earlier one
+//! (`library_sharing::tie_row`), an output vector a scale times an earlier one
+//! (`library_sharing::tie_column`), a head's pair one shared query–key function
+//! (`library_sharing::share_query_key`). A block takes part in one such sharing per hardening. The vector is
 //! stored once, its scale is one prior group, and the choice among the target's `n` candidates
 //! costs `ln n` nats (`Explanation::fixed_nats`). The hardened explanation is accepted only if its
 //! `F` falls after the fit re-converges.
@@ -62,7 +69,7 @@ use crate::{
 };
 use gam_linalg::faer_ndarray::fast_ab;
 use gam_math::categorical::{log_softmax, log_sum_exp};
-use ndarray::{Array1, Array2, ArrayView1, Axis};
+use ndarray::{Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
 use statrs::function::gamma::ln_gamma;
 use std::collections::BTreeMap;
@@ -72,20 +79,47 @@ fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-/// What a target is: a function's gate direction, or a head's query–key map.
+/// What a target is: one block of an MLP function (its gate direction, its up direction when
+/// gated, its output vector), or a head's query–key map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Kind {
     Gate { layer: usize, function: usize },
+    Up { layer: usize, function: usize },
+    Output { layer: usize, function: usize },
     Head { layer: usize, head: usize },
 }
 
-/// A candidate: an earlier function's output vector, a token's embedding row, or another head's
-/// query–key map.
+/// A candidate: an earlier function's output vector, gate direction or up direction, a token's
+/// embedding row, or an earlier head's query–key map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Write {
     Output { layer: usize, function: usize },
     Token(usize),
     Head { layer: usize, head: usize },
+    Gate { layer: usize, function: usize },
+    Up { layer: usize, function: usize },
+}
+
+impl Write {
+    /// The block a target of `kind` is, as a candidate of a later target.
+    fn of(kind: Kind) -> Self {
+        match kind {
+            Kind::Gate { layer, function } => Self::Gate { layer, function },
+            Kind::Up { layer, function } => Self::Up { layer, function },
+            Kind::Output { layer, function } => Self::Output { layer, function },
+            Kind::Head { layer, head } => Self::Head { layer, head },
+        }
+    }
+
+    /// The prior group's name of an MLP block.
+    fn group(self) -> Option<String> {
+        match self {
+            Self::Output { layer, function } => Some(format!("library.l{layer}.mlp.f{function}.out")),
+            Self::Gate { layer, function } => Some(format!("library.l{layer}.mlp.f{function}.gate")),
+            Self::Up { layer, function } => Some(format!("library.l{layer}.mlp.f{function}.up")),
+            Self::Token(_) | Self::Head { .. } => None,
+        }
+    }
 }
 
 /// One mixture component: its candidate, its scale `c`, its logit, and for a head the gauge that
@@ -209,6 +243,9 @@ pub struct Mixture {
     /// columns).
     gates: Vec<usize>,
     outputs: Vec<usize>,
+    /// Per layer, its up operator's trainable index when its MLP is gated.
+    #[serde(default)]
+    ups: Vec<Option<usize>>,
     heads: Vec<((usize, usize), HeadMaps)>,
     #[serde(skip)]
     embedding: Array2<f64>,
@@ -246,20 +283,33 @@ impl Mixture {
         let program = &explanation.artifact.program;
         let position = |op: usize| explanation.trainable.iter().position(|t| *t == op).ok_or_else(|| format!("operator {op} is not trainable"));
         let embedding = program.operators[operator_index(program, "wte")?].matrix();
-        let (mut gates, mut outputs) = (Vec::new(), Vec::new());
+        let (mut gates, mut outputs, mut ups) = (Vec::new(), Vec::new(), Vec::new());
         for l in 0..explanation.layers.len() {
             gates.push(position(operator_index(program, &format!("library.l{l}.mlp.gate"))?)?);
             outputs.push(position(operator_index(program, &format!("library.l{l}.mlp.out"))?)?);
+            ups.push(match operator_index(program, &format!("library.l{l}.mlp.up")) {
+                Ok(op) => Some(position(op)?),
+                Err(_) => None,
+            });
         }
         let mut targets = Vec::new();
         let mut cells = Vec::new();
+        // Each block's candidates are blocks of earlier layers (and token rows for a gate), so the
+        // product of the conditional mixtures is a joint density.
         let mut written = 0;
         for (l, layer) in explanation.layers.iter().enumerate() {
             for function in 0..layer.functions.len() {
-                let name = format!("library.l{l}.mlp.f{function}.gate");
-                let group = explanation.groups.iter().position(|g| g.name == name).ok_or_else(|| format!("no group {name}"))?;
-                targets.push(Target { kind: Kind::Gate { layer: l, function }, groups: vec![group], choices: written + embedding.ncols(), zero_logit: 0.0, components: Vec::new(), log_variance: 0.0 });
-                cells.push(explanation.groups[group].cells.iter().map(|c| Ok((position(c.operator)?, c.rows.clone(), c.cols.clone()))).collect::<Result<Vec<_>, String>>()?);
+                let mut blocks = vec![(Kind::Gate { layer: l, function }, 2 * written + embedding.ncols()), (Kind::Output { layer: l, function }, written)];
+                if ups[l].is_some() {
+                    let earlier_ups: usize = (0..l).filter(|e| ups[*e].is_some()).map(|e| explanation.layers[e].functions.len()).sum();
+                    blocks.push((Kind::Up { layer: l, function }, earlier_ups));
+                }
+                for (kind, choices) in blocks {
+                    let name = Write::of(kind).group().ok_or("an MLP block's group")?;
+                    let group = explanation.groups.iter().position(|g| g.name == name).ok_or_else(|| format!("no group {name}"))?;
+                    targets.push(Target { kind, groups: vec![group], choices, zero_logit: 0.0, components: Vec::new(), log_variance: 0.0 });
+                    cells.push(explanation.groups[group].cells.iter().map(|c| Ok((position(c.operator)?, c.rows.clone(), c.cols.clone()))).collect::<Result<Vec<_>, String>>()?);
+                }
             }
             written += layer.functions.len();
         }
@@ -278,7 +328,7 @@ impl Mixture {
             cells.push(Vec::new());
         }
         let moments = targets.iter().map(|_| vec![Moment::default(); 2]).collect();
-        Ok(Self { targets, width, steps, taken: 0, moments, gates, outputs, heads, embedding, cells })
+        Ok(Self { targets, width, steps, taken: 0, moments, gates, outputs, ups, heads, embedding, cells })
     }
 
     /// The maps of head `head` of layer `layer`.
@@ -321,25 +371,58 @@ impl Mixture {
         }
     }
 
-    /// The earlier outputs whose groups are in the explanation, for a gate of layer `layer`: a
-    /// `d × n` matrix of their posterior means and their writes (the token rows follow them).
-    fn earlier(&self, layer: usize, posterior: &Posterior, explanation: &Explanation) -> Result<(Array2<f64>, Vec<Write>), String> {
-        let mut columns = Vec::new();
-        let mut writes = Vec::new();
+    /// The vector of an MLP block or a token row at `get`'s values (by trainable index): a gate or
+    /// up row, an output column, an embedding row.
+    fn vector<'a>(&'a self, write: Write, get: &dyn Fn(usize) -> Result<&'a Array2<f64>, String>) -> Result<ArrayView1<'a, f64>, String> {
+        match write {
+            Write::Output { layer, function } => Ok(get(self.outputs[layer])?.column(function)),
+            Write::Gate { layer, function } => Ok(get(self.gates[layer])?.row(function)),
+            Write::Up { layer, function } => Ok(get(self.ups[layer].ok_or("an up row of an ungated MLP")?)?.row(function)),
+            Write::Token(token) => Ok(self.embedding.column(token)),
+            Write::Head { .. } => Err("a head is no MLP block".into()),
+        }
+    }
+
+    /// The trainable index holding an MLP block, and whether the block is a column.
+    fn place(&self, write: Write) -> Result<(usize, bool), String> {
+        match write {
+            Write::Output { layer, .. } => Ok((self.outputs[layer], true)),
+            Write::Gate { layer, .. } => Ok((self.gates[layer], false)),
+            Write::Up { layer, .. } => Ok((self.ups[layer].ok_or("an up row of an ungated MLP")?, false)),
+            Write::Token(_) | Write::Head { .. } => Err("not a trainable MLP block".into()),
+        }
+    }
+
+    /// The candidates of an MLP block target of `kind` whose groups are in the explanation: earlier
+    /// layers' blocks of its kind, and for a gate earlier outputs and every token row.
+    fn candidates(&self, kind: Kind, posterior: &Posterior, explanation: &Explanation) -> Result<Vec<Write>, String> {
+        let layer = match kind {
+            Kind::Gate { layer, .. } | Kind::Up { layer, .. } | Kind::Output { layer, .. } => layer,
+            Kind::Head { .. } => return Err("a head is no MLP block".into()),
+        };
+        let mut out = Vec::new();
         for earlier in 0..layer {
-            let out = &posterior.mean[self.outputs[earlier]];
-            for j in 0..out.ncols() {
-                let name = format!("library.l{earlier}.mlp.f{j}.out");
-                let group = explanation.groups.iter().position(|g| g.name == name).ok_or_else(|| format!("no group {name}"))?;
-                if posterior.active[group] {
-                    columns.push(out.column(j));
-                    writes.push(Write::Output { layer: earlier, function: j });
+            let units = explanation.layers[earlier].functions.len();
+            for function in 0..units {
+                let writes: Vec<Write> = match kind {
+                    Kind::Gate { .. } => vec![Write::Output { layer: earlier, function }, Write::Gate { layer: earlier, function }],
+                    Kind::Up { .. } if self.ups[earlier].is_some() => vec![Write::Up { layer: earlier, function }],
+                    Kind::Output { .. } => vec![Write::Output { layer: earlier, function }],
+                    _ => Vec::new(),
+                };
+                for write in writes {
+                    let name = write.group().ok_or("an MLP block's group")?;
+                    let group = explanation.groups.iter().position(|g| g.name == name).ok_or_else(|| format!("no group {name}"))?;
+                    if posterior.active[group] {
+                        out.push(write);
+                    }
                 }
             }
         }
-        let views: Vec<_> = columns.iter().map(|c| c.view().insert_axis(Axis(1))).collect();
-        let matrix = if views.is_empty() { Array2::zeros((self.embedding.nrows(), 0)) } else { ndarray::concatenate(Axis(1), &views).map_err(error)? };
-        Ok((matrix, writes))
+        if matches!(kind, Kind::Gate { .. }) {
+            out.extend((0..self.embedding.ncols()).map(Write::Token));
+        }
+        Ok(out)
     }
 
     /// Target `t`'s new candidates `(write, least-squares scale, gauge)` replace its old ones: kept
@@ -368,28 +451,52 @@ impl Mixture {
     /// Re-choose every target's candidates at `posterior` (module note). A gate's candidates are
     /// scored `d` at a time, so the scores held at once are no larger than the gate operator.
     pub fn choose(&mut self, explanation: &Explanation, posterior: &Posterior) -> Result<(), String> {
-        for layer in 0..self.gates.len() {
-            let (outputs, mut writes) = self.earlier(layer, posterior, explanation)?;
-            writes.extend((0..self.embedding.ncols()).map(Write::Token));
-            let (mu, log_sd) = (&posterior.mean[self.gates[layer]], &posterior.log_sd[self.gates[layer]]);
+        // MLP blocks: per layer and kind, the targets' posterior rows against every candidate, `d`
+        // candidates at a time.
+        let d = self.embedding.nrows();
+        let kinds: Vec<Kind> = self.targets.iter().map(|t| t.kind).filter(|k| !matches!(k, Kind::Head { .. })).collect();
+        let mut seen: Vec<(usize, u8)> = Vec::new();
+        for kind in kinds {
+            let (layer, part) = match kind {
+                Kind::Gate { layer, .. } => (layer, 0u8),
+                Kind::Up { layer, .. } => (layer, 1),
+                Kind::Output { layer, .. } => (layer, 2),
+                Kind::Head { .. } => continue,
+            };
+            if seen.contains(&(layer, part)) {
+                continue;
+            }
+            seen.push((layer, part));
+            let same = |k: Kind| match (k, part) {
+                (Kind::Gate { layer: l, .. }, 0) | (Kind::Up { layer: l, .. }, 1) | (Kind::Output { layer: l, .. }, 2) => l == layer,
+                _ => false,
+            };
+            let rows: Vec<usize> = (0..self.targets.len()).filter(|&t| same(self.targets[t].kind) && self.active(t, posterior)).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let (operator, column) = self.place(Write::of(kind))?;
+            let orient = |m: &Array2<f64>| if column { m.t().to_owned() } else { m.clone() };
+            let (mu, log_sd) = (orient(&posterior.mean[operator]), orient(&posterior.log_sd[operator]));
             let precision = log_sd.mapv(|s| (-2.0 * s).exp());
-            let weighted = mu * &precision;
-            let rows: Vec<usize> = (0..self.targets.len())
-                .filter(|&t| matches!(self.targets[t].kind, Kind::Gate { layer: l, .. } if l == layer) && self.active(t, posterior))
-                .collect();
+            let weighted = &mu * &precision;
+            let writes = self.candidates(kind, posterior, explanation)?;
+            let means = |i: usize| -> Result<&Array2<f64>, String> { posterior.mean.get(i).ok_or_else(|| "a posterior mean".to_string()) };
             // Per target its best candidates so far: (−(Σ μ u/σ²)² / Σ u²/σ², scale, candidate).
             let mut best: Vec<Vec<(f64, f64, usize)>> = vec![Vec::new(); rows.len()];
-            let d = self.embedding.nrows();
             let mut start = 0;
             while start < writes.len() {
                 let end = (start + d).min(writes.len());
-                let block: Array2<f64> = Array2::from_shape_fn((d, end - start), |(r, k)| {
-                    let k = start + k;
-                    if k < outputs.ncols() { outputs[[r, k]] } else { self.embedding[[r, k - outputs.ncols()]] }
-                });
+                let mut block = Array2::zeros((d, end - start));
+                for k in start..end {
+                    block.column_mut(k - start).assign(&self.vector(writes[k], &means)?);
+                }
                 let (cross, norm) = (fast_ab(&weighted, &block), fast_ab(&precision, &block.mapv(|v| v * v)));
                 for (slot, &t) in rows.iter().enumerate() {
-                    let Kind::Gate { function: i, .. } = self.targets[t].kind else { continue };
+                    let i = match self.targets[t].kind {
+                        Kind::Gate { function, .. } | Kind::Up { function, .. } | Kind::Output { function, .. } => function,
+                        Kind::Head { .. } => continue,
+                    };
                     for k in 0..end - start {
                         if norm[[i, k]] > 0.0 {
                             best[slot].push((-cross[[i, k]] * cross[[i, k]] / norm[[i, k]], cross[[i, k]] / norm[[i, k]], start + k));
@@ -401,9 +508,12 @@ impl Mixture {
                 start = end;
             }
             for (slot, &t) in rows.iter().enumerate() {
-                let Kind::Gate { function: i, .. } = self.targets[t].kind else { continue };
-                // A new target's variance starts at its gate's mean posterior variance.
-                let initial = log_sd.row(i).mapv(|s| (2.0 * s).exp()).mean().ok_or("an empty gate")?.ln();
+                let i = match self.targets[t].kind {
+                    Kind::Gate { function, .. } | Kind::Up { function, .. } | Kind::Output { function, .. } => function,
+                    Kind::Head { .. } => continue,
+                };
+                // A new target's variance starts at its block's mean posterior variance.
+                let initial = log_sd.row(i).mapv(|s| (2.0 * s).exp()).mean().ok_or("an empty block")?.ln();
                 let chosen = best[slot].iter().map(|&(_, scale, k)| (writes[k], scale, Vec::new())).collect();
                 self.adopt(t, chosen, initial);
             }
@@ -460,20 +570,48 @@ impl Mixture {
 
     /// `explanation` with every candidate that dominates at `posterior` made exact (module note):
     /// an earlier output becomes a scale times the gate (`library_sharing::tie`), a gate a scale
-    /// times a token's embedding row (`library_sharing::tie_token`), each scale starting at the
-    /// least-squares fit of the vector it replaces at `explanation`'s values, and two heads one
-    /// shared query–key function (`library_sharing::share_query_key`). Each choice costs `ln n`
-    /// nats. An earlier output or a head that two targets dominate is taken by the first.
+    /// times a token's embedding row (`library_sharing::tie_token`), a gate or up direction a scale
+    /// times an earlier one (`library_sharing::tie_row`), an output vector a scale times an earlier
+    /// one (`library_sharing::tie_column`), each scale starting at the least-squares fit of the
+    /// vector it replaces at `explanation`'s values, and two heads one shared query–key function
+    /// (`library_sharing::share_query_key`). Each choice costs `ln n` nats. An MLP block that two
+    /// choices involve, as target or source, is taken by the first.
     pub fn harden(&self, explanation: &Explanation, posterior: &Posterior) -> Result<Explanation, String> {
         let program = &explanation.artifact.program;
         let values = |name: String| -> Result<Array2<f64>, String> { Ok(program.operators[operator_index(program, &name)?].matrix()) };
         let mut ties: Vec<Tie> = Vec::new();
         let mut tokens = Vec::new();
+        let mut rows: Vec<(&'static str, (usize, usize), (usize, usize), f64)> = Vec::new();
+        let mut columns: Vec<((usize, usize), (usize, usize), f64)> = Vec::new();
         let mut pairs: Vec<[(usize, usize); 2]> = Vec::new();
+        // An MLP block takes part in one exact sharing per hardening: as a target or as a source.
+        let mut taken: Vec<Write> = Vec::new();
         let mut nats = 0.0;
         for (t, j) in self.dominant(posterior)? {
             let target = &self.targets[t];
-            match (target.kind, target.components[j].write) {
+            let (own, source) = (Write::of(target.kind), target.components[j].write);
+            if !matches!(own, Write::Head { .. }) && (taken.contains(&own) || taken.contains(&source)) {
+                continue;
+            }
+            let least_squares = |g: &Array1<f64>, s: &Array1<f64>| if s.dot(s) > 0.0 { Some(g.dot(s) / s.dot(s)) } else { None };
+            let block = |write: Write| -> Result<Array1<f64>, String> {
+                match write {
+                    Write::Gate { layer, function } => Ok(values(format!("library.l{layer}.mlp.gate"))?.row(function).to_owned()),
+                    Write::Up { layer, function } => Ok(values(format!("library.l{layer}.mlp.up"))?.row(function).to_owned()),
+                    Write::Output { layer, function } => Ok(values(format!("library.l{layer}.mlp.out"))?.column(function).to_owned()),
+                    _ => Err("not an MLP block".into()),
+                }
+            };
+            match (target.kind, source) {
+                (Kind::Gate { layer: gl, function: gi }, Write::Gate { layer, function }) | (Kind::Up { layer: gl, function: gi }, Write::Up { layer, function }) => {
+                    let Some(scale) = least_squares(&block(own)?, &block(source)?) else { continue };
+                    let part = if matches!(own, Write::Gate { .. }) { "gate" } else { "up" };
+                    rows.push((part, (gl, gi), (layer, function), scale));
+                }
+                (Kind::Output { layer: ol, function: oi }, Write::Output { layer, function }) => {
+                    let Some(scale) = least_squares(&block(own)?, &block(source)?) else { continue };
+                    columns.push(((ol, oi), (layer, function), scale));
+                }
                 (Kind::Gate { layer: gl, function: gi }, Write::Output { layer, function }) => {
                     let g = values(format!("library.l{gl}.mlp.gate"))?.row(gi).to_owned();
                     let u = values(format!("library.l{layer}.mlp.out"))?.column(function).to_owned();
@@ -499,11 +637,23 @@ impl Mixture {
                 }
                 _ => return Err("a component's candidate of another kind than its target".into()),
             }
+            if !matches!(own, Write::Head { .. }) {
+                taken.push(own);
+                if !matches!(source, Write::Token(_)) {
+                    taken.push(source);
+                }
+            }
             nats += (target.choices as f64).ln();
         }
         let mut out = library_sharing::tie(explanation, &ties)?;
         for (target, token, scale) in tokens {
             out = library_sharing::tie_token(&out, target, token, scale)?;
+        }
+        for (part, target, (layer, function), scale) in rows {
+            out = library_sharing::tie_row(&out, part, target, library_sharing::RowSource::Row { layer, part, function }, scale)?;
+        }
+        for (target, source, scale) in columns {
+            out = library_sharing::tie_column(&out, target, source, scale)?;
         }
         for pair in pairs {
             out = library_sharing::share_query_key(&out, &pair)?;
@@ -545,17 +695,10 @@ impl Mixture {
         let get = |i: usize| theta.get(&i).ok_or("an operator's sample");
         let target = &self.targets[t];
         match target.kind {
-            Kind::Gate { layer, function } => {
-                let g = get(self.gates[layer])?.row(function).to_owned();
-                let writes = target
-                    .components
-                    .iter()
-                    .map(|c| match c.write {
-                        Write::Output { layer, function } => Ok(get(self.outputs[layer])?.column(function).to_owned()),
-                        Write::Token(token) => Ok(self.embedding.column(token).to_owned()),
-                        Write::Head { .. } => Err("a head candidate for a gate".to_string()),
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
+            Kind::Gate { .. } | Kind::Up { .. } | Kind::Output { .. } => {
+                let sample = |i: usize| -> Result<&Array2<f64>, String> { theta.get(&i).ok_or_else(|| "an operator's sample".to_string()) };
+                let g = self.vector(Write::of(target.kind), &sample)?.to_owned();
+                let writes = target.components.iter().map(|c| Ok(self.vector(c.write, &sample)?.to_owned())).collect::<Result<Vec<_>, String>>()?;
                 let v = Array1::from_elem(g.len(), group_variance(&self.cells[t], posterior));
                 Ok((g, writes, v))
             }
@@ -597,8 +740,8 @@ impl PriorTerm for Mixture {
         let mut out = Vec::new();
         for (t, target) in self.targets.iter().enumerate().filter(|(_, t)| !t.components.is_empty()) {
             match target.kind {
-                Kind::Gate { layer, .. } => {
-                    out.push(self.gates[layer]);
+                Kind::Gate { .. } | Kind::Up { .. } | Kind::Output { .. } => {
+                    out.extend(self.place(Write::of(target.kind)).map(|p| p.0));
                     out.extend(self.cells[t].iter().map(|c| c.0)); // includes bias in v_G
                 }
                 Kind::Head { layer, head } => {
@@ -607,7 +750,7 @@ impl PriorTerm for Mixture {
             }
             for candidate in &target.components {
                 match candidate.write {
-                    Write::Output { layer, .. } => out.push(self.outputs[layer]),
+                    Write::Output { .. } | Write::Gate { .. } | Write::Up { .. } => out.extend(self.place(candidate.write).map(|p| p.0)),
                     Write::Head { layer, head } => {
                         if let Ok(maps) = self.head(layer, head) { out.extend([maps.query, maps.key]); }
                     }
@@ -644,15 +787,26 @@ impl PriorTerm for Mixture {
             let logits: Vec<f64> = std::iter::once(target.zero_logit).chain(target.components.iter().map(|c| c.logit)).collect();
             let found = term(g.view(), &views, &logits, target.log_variance, v.view())?;
             value += found.value;
+            // A block's derivative goes to its row or its column; a token row is no parameter.
+            let add = |gradient: &mut BTreeMap<usize, Array2<f64>>, write: Write, derivative: &Array1<f64>| -> Result<(), String> {
+                if matches!(write, Write::Token(_)) {
+                    return Ok(());
+                }
+                let (i, column) = self.place(write)?;
+                let index = match write {
+                    Write::Output { function, .. } | Write::Gate { function, .. } | Write::Up { function, .. } => function,
+                    Write::Token(_) | Write::Head { .. } => return Err("not an MLP block".into()),
+                };
+                slot(gradient, i)?;
+                let target = gradient.get_mut(&i).ok_or("slot")?;
+                if column { target.column_mut(index).scaled_add(1.0, derivative) } else { target.row_mut(index).scaled_add(1.0, derivative) }
+                Ok(())
+            };
             match target.kind {
-                Kind::Gate { layer, function } => {
-                    slot(&mut gradient, self.gates[layer])?;
-                    gradient.get_mut(&self.gates[layer]).ok_or("slot")?.row_mut(function).scaled_add(1.0, &found.target);
+                Kind::Gate { .. } | Kind::Up { .. } | Kind::Output { .. } => {
+                    add(&mut gradient, Write::of(target.kind), &found.target)?;
                     for (component, derivative) in target.components.iter().zip(&found.writes) {
-                        if let Write::Output { layer, function } = component.write {
-                            slot(&mut gradient, self.outputs[layer])?;
-                            gradient.get_mut(&self.outputs[layer]).ok_or("slot")?.column_mut(function).scaled_add(1.0, derivative);
-                        }
+                        add(&mut gradient, component.write, derivative)?;
                     }
                 }
                 Kind::Head { layer, head } => {
@@ -698,7 +852,7 @@ impl PriorTerm for Mixture {
         for t in (0..self.targets.len()).filter(|&t| self.active(t, posterior) && !self.targets[t].components.is_empty()) {
             let target = &self.targets[t];
             let size = match target.kind {
-                Kind::Gate { .. } => self.cells[t].iter().map(|(_, rows, cols)| (rows.len() * cols.len()) as f64).sum::<f64>(),
+                Kind::Gate { .. } | Kind::Up { .. } | Kind::Output { .. } => self.cells[t].iter().map(|(_, rows, cols)| (rows.len() * cols.len()) as f64).sum::<f64>(),
                 Kind::Head { layer, head } => {
                     let maps = self.head(layer, head)?;
                     let d = posterior.mean[maps.query].ncols();
@@ -706,10 +860,8 @@ impl PriorTerm for Mixture {
                 }
             };
             let n = target.choices as f64;
-            let kept = match target.kind {
-                Kind::Gate { .. } => k.min(n),
-                Kind::Head { .. } => target.components.len() as f64,
-            };
+            // The candidates actually selected (at most `K`, fewer when fewer exist).
+            let kept = (target.components.len() as f64).min(k.min(n));
             // ln C(n, K) for the candidates, ½ ln |G| for each of the 2K + 1 values.
             total += ln_gamma(n + 1.0) - ln_gamma(kept + 1.0) - ln_gamma(n - kept + 1.0) + (2.0 * kept + 1.0) * 0.5 * size.ln();
             if matches!(target.kind, Kind::Head { .. }) {
@@ -847,8 +999,18 @@ mod tests {
         let (explanation, posterior, mut mixture) = head_fixture("library_mixture_selected_operators");
         assert!(mixture.operators().is_empty());
         mixture.choose(&explanation, &posterior).unwrap();
-        assert!(!mixture.operators().contains(mixture.outputs.last().unwrap()),
-            "the final layer's output cannot be a prior parent");
+        for target in &mixture.targets {
+            let layer = match target.kind {
+                Kind::Gate { layer, .. } | Kind::Up { layer, .. } | Kind::Output { layer, .. } | Kind::Head { layer, .. } => layer,
+            };
+            for component in &target.components {
+                let parent = match component.write {
+                    Write::Output { layer, .. } | Write::Gate { layer, .. } | Write::Up { layer, .. } | Write::Head { layer, .. } => Some(layer),
+                    Write::Token(_) => None,
+                };
+                assert!(parent.is_none_or(|p| p < layer), "a prior parent is in an earlier layer");
+            }
+        }
         for target in &mut mixture.targets {
             if target.kind != (Kind::Head { layer: 1, head: 0 }) { target.components.clear(); }
         }
@@ -930,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_copies_are_found_by_their_weights_and_made_exact_keeping_the_outputs() {
+    fn exact_copies_of_ties_functions_and_heads_are_found_by_their_weights_and_made_exact() {
         use crate::{import::import_language_model, library_mdl::{Settings, explanation, fit}, operator_program::{Provenance, SlotValues, exact_precision}, run_check::{layer_nodes, split_sites}};
         use gam_gpu::tensor::Device;
         use std::sync::Arc;
@@ -950,6 +1112,15 @@ mod tests {
             program.operators[op] = Arc::new(crate::operator_program::Operator::dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values, precision, Provenance::default()).unwrap());
         };
         replace(program, gate, values);
+        // Function 7 of layer 1 is function 4 of layer 0: its gate 2 times, its output half.
+        let earlier_gate = operator_index(program, "library.l0.mlp.gate").unwrap();
+        let mut values = program.operators[gate].matrix();
+        values.row_mut(7).assign(&(&program.operators[earlier_gate].matrix().row(4) * 2.0));
+        replace(program, gate, values);
+        let later_out = operator_index(program, "library.l1.mlp.out").unwrap();
+        let mut values = program.operators[later_out].matrix();
+        values.column_mut(7).assign(&(&program.operators[out].matrix().column(4) * 0.5));
+        replace(program, later_out, values);
         // Head 0 of layer 1 attends as head 0 of layer 0 does.
         let found = library_sharing::heads(&start).unwrap();
         let (first, second) = (&found[&(0, 0)], &found[&(1, 0)]);
@@ -964,27 +1135,52 @@ mod tests {
         let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
         let (train, held) = sequences.split_at(4);
         let fitted = fit(&Device::host(), &native, &start, train, held, &settings, "tiny", None, Some(&mut mixture)).unwrap();
+        assert!(fitted.report.start.prior_bits.is_finite() && fitted.report.start.prior_bits != 0.0, "F holds the mixture's term");
+        // The fit removes the copies this random model does not need; the weights are learned at the
+        // start, every group in, from samples of its posterior.
+        let all_in = crate::library_mdl::Posterior::new(&start, 96).unwrap();
+        let mut learned = Mixture::new(&start, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
+        learned.epoch(&start, &all_in).unwrap();
+        for key in 0..300_u64 {
+            let theta = learned
+                .operators()
+                .into_iter()
+                .map(|i| {
+                    let (mean, log_sd) = (&all_in.mean[i], &all_in.log_sd[i]);
+                    let cols = mean.ncols();
+                    let sample = Array2::from_shape_fn(mean.dim(), |(r, c)| mean[[r, c]] + log_sd[[r, c]].exp() * f64::from(gam_gpu::tensor::posterior_normal(key, i as u64, (r * cols + c) as u64)));
+                    (i, sample)
+                })
+                .collect();
+            learned.sample(&all_in, &theta, true).unwrap();
+        }
         // The learned weights pick each copy among the candidates.
         let found = |kind: Kind, write: Write| -> (usize, usize) {
-            let target = mixture.targets.iter().position(|t| t.kind == kind).unwrap();
-            let weights = mixture.targets[target].weights().unwrap();
-            let copy = mixture.targets[target].components.iter().position(|c| c.write == write).expect("the copy is a candidate");
+            let target = learned.targets.iter().position(|t| t.kind == kind).unwrap();
+            let weights = learned.targets[target].weights().unwrap();
+            let copy = learned.targets[target].components.iter().position(|c| c.write == write).expect("the copy is a candidate");
             assert!(weights[1 + copy] > 0.5, "the copy's weight dominates its mixture: {weights:?}");
             (target, copy)
         };
         let (target, copy) = found(Kind::Gate { layer: 1, function: 5 }, Write::Output { layer: 0, function: 3 });
         let head_copy = found(Kind::Head { layer: 1, head: 0 }, Write::Head { layer: 0, head: 0 });
-        assert!(fitted.report.start.prior_bits.is_finite() && fitted.report.start.prior_bits != 0.0, "F holds the mixture's term");
-        // Made exact at the start (every group in), the tie keeps the outputs and pays for its choice.
-        let all_in = crate::library_mdl::Posterior::new(&start, 96).unwrap();
-        let dominant = mixture.dominant(&all_in).unwrap();
-        assert!(dominant.contains(&(target, copy)) && dominant.contains(&head_copy));
-        let hardened = mixture.harden(&start, &all_in).unwrap();
+        let gate_copy = found(Kind::Gate { layer: 1, function: 7 }, Write::Gate { layer: 0, function: 4 });
+        let output_copy = found(Kind::Output { layer: 1, function: 7 }, Write::Output { layer: 0, function: 4 });
+        // Made exact, the tie keeps the outputs and pays for its choice.
+        let dominant = learned.dominant(&all_in).unwrap();
+        assert!([(target, copy), head_copy, gate_copy, output_copy].iter().all(|c| dominant.contains(c)));
+        let hardened = learned.harden(&start, &all_in).unwrap();
         let (before, after) = (start.artifact.execute(&imported.family).unwrap(), hardened.artifact.execute(&imported.family).unwrap());
         let (a, b) = (&before.values[start.artifact.program.output], &after.values[hardened.artifact.program.output]);
         let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * scale), "the exact tie keeps the outputs");
-        assert!(hardened.fixed_nats >= (mixture.targets[target].choices as f64).ln() + (mixture.targets[head_copy.0].choices as f64).ln());
+        let choices: f64 = [target, head_copy.0, gate_copy.0, output_copy.0].iter().map(|t| (learned.targets[*t].choices as f64).ln()).sum();
+        assert!(hardened.fixed_nats >= choices - 1e-9, "every exact choice is paid for");
+        // The copied function's blocks are stored once: its own gate and output leave the explanation.
+        for name in ["library.l1.mlp.f7.gate", "library.l1.mlp.f7.out"] {
+            let g = hardened.groups.iter().position(|g| g.name == name).unwrap();
+            assert!(hardened.removed.contains(&g), "{name} is not charged");
+        }
         assert!(hardened.groups.iter().any(|g| g.name == "library.l1.h0.q_shared_scale") || hardened.groups.iter().any(|g| g.name == "library.l0.h0.q_shared_scale"), "the heads share one query-key function");
     }
 
