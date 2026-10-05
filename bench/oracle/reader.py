@@ -210,9 +210,34 @@ class VllmBackend:
         return result
 
 
+_EMPTY_DIR = None
+
+
+def claude_json(prompt: str, schema: dict, model: str, system: str) -> tuple[dict, dict]:
+    """One headless Claude Code call (`claude -p`) with no tools, no CLAUDE.md, plugins or MCP servers,
+    run from an empty directory, whose reply must match the JSON schema; returns (reply object,
+    {model, cost_usd, session})."""
+    global _EMPTY_DIR
+    if _EMPTY_DIR is None:
+        _EMPTY_DIR = tempfile.mkdtemp(prefix="oracle-claude-")
+    command = [
+        "claude", "-p", "--model", model, "--system-prompt", system, "--tools", "", "--safe-mode",
+        "--strict-mcp-config", "--no-session-persistence", "--output-format", "json",
+        "--json-schema", json.dumps(schema), prompt,
+    ]
+    r = subprocess.run(command, cwd=_EMPTY_DIR, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"claude -p exit {r.returncode}: {r.stderr[-2000:] or r.stdout[-2000:]}")
+    reply = json.loads(r.stdout)
+    values = reply.get("structured_output")
+    if not isinstance(values, dict):
+        raise RuntimeError(f"claude -p gave no structured output: {r.stdout[-2000:]}")
+    return values, {"model": list(reply.get("modelUsage", {}).keys()), "cost_usd": reply.get("total_cost_usd"), "session": reply.get("session_id")}
+
+
 class ClaudeBackend:
-    """Headless Claude Code (`claude -p`): no tools, no CLAUDE.md, plugins or MCP servers, a JSON schema
-    with one positive number per label; run from an empty directory, `concurrency` calls at a time."""
+    """Headless Claude Code through claude_json, with one positive number per label; `concurrency` calls
+    at a time."""
 
     name = "claude"
 
@@ -220,7 +245,6 @@ class ClaudeBackend:
         self.model_id = model
         self.seed = seed  # recorded only: the CLI takes no seed
         self.concurrency = concurrency
-        self.workdir = tempfile.mkdtemp(prefix="oracle-reader-")
         self.calls: list[dict] = []
 
     def _one(self, user: str, k: int) -> tuple[np.ndarray, dict]:
@@ -230,22 +254,10 @@ class ClaudeBackend:
             "required": list(LABELS[:k]),
             "additionalProperties": False,
         }
-        command = [
-            "claude", "-p", "--model", self.model_id, "--system-prompt", SYSTEM, "--tools", "", "--safe-mode",
-            "--strict-mcp-config", "--no-session-persistence", "--output-format", "json",
-            "--json-schema", json.dumps(schema), user + "\n\n" + ANSWER_PROBABILITIES,
-        ]
-        r = subprocess.run(command, cwd=self.workdir, capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"claude -p exit {r.returncode}: {r.stderr[-2000:] or r.stdout[-2000:]}")
-        reply = json.loads(r.stdout)
-        values = reply.get("structured_output")
-        if not isinstance(values, dict):
-            raise RuntimeError(f"claude -p gave no structured output: {r.stdout[-2000:]}")
+        values, meta = claude_json(user + "\n\n" + ANSWER_PROBABILITIES, schema, self.model_id, SYSTEM)
         w = np.array([float(values[label]) for label in LABELS[:k]])
         if not np.all(np.isfinite(w)) or np.any(w <= 0):
             raise RuntimeError(f"claude -p probabilities not all positive: {values}")
-        meta = {"model": list(reply.get("modelUsage", {}).keys()), "cost_usd": reply.get("total_cost_usd"), "session": reply.get("session_id")}
         return w / w.sum(), meta
 
     def distributions(self, users: list[str], k: int) -> list[np.ndarray]:
