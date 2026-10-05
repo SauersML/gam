@@ -1,0 +1,11 @@
+{
+  "base": "bd0503eb328cd19134cd0625c9940467c7749540",
+  "commit": "edfb9aa49b5d4630445a1d54b79d24351d33c487",
+  "tree": "70594bd16ea363e7821103ca88d20f3eaaf11741",
+  "files": {
+    "crates/gam-mpd/src/native_local_supervision.rs": "a6de09b94f7247d5a9136eb10b026b22b45126370771dba93bf7df1e1e6445a6",
+    "crates/gam-mpd/src/native_local_supervision_device.rs": "74219b665a0c831280e7a423f6169049995e576754d02f3fcf4602668bbab7d2",
+    "crates/gam-mpd/examples/mpd_composed_causal_search_2951.rs": "ddcf0740adbc3396708be67d045eb0f5638c939f48bd1f2e2fa54d2c7ca7772f",
+    "crates/gam-mpd/examples/mpd_local_capture_bench_2951.rs": "9dc9e9689136b36b0aee5f9abfa741dcb137690e95e4a24cc896b956c309b96d"
+  }
+}

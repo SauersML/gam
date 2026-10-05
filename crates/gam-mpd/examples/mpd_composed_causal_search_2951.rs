@@ -15,7 +15,7 @@ use gam_mpd::{
     import::import_language_model,
     intervention_program::{self, Control, ControlValue},
     native_parameter_edit,
-    operator_program::{remap_node, FamilyInputs, Node, OperatorBody, OperatorProgram},
+    operator_program::{remap_node, FamilyInputs, Node, OperatorBody, OperatorProgram, SlotValues},
     parameter_response_program, program_learned_dag,
     program_structure_search::{
         self, EvaluatedArtifact, Evaluation as StructureEvaluation, Metric, Mutation,
@@ -2453,8 +2453,8 @@ fn structural_run(
                 if !request.trainable_operator_ids.is_empty() {
                     if let (Some(config), Some(binding)) = (&structural.local_fit, request.local_fit) {
                         let (panels, provenance) = capture_structural_local_targets(
-                            &controlled.program, &candidate, binding, &training.metadata,
-                            config.optimizer.numeric_bytes)?;
+                            d, &controlled.program, &candidate, binding, &training.metadata,
+                            config.optimizer.numeric_bytes, config.optimizer.forward_rows)?;
                         save(&root.join("LOCAL_SUPERVISION.json"), &provenance)?;
                         let fitted_local = prefit_structural_local(
                             d, &binding.program, &binding.trainable_operator_ids, &panels, config)?;
@@ -2812,53 +2812,110 @@ struct JointLocalTargets {
     state_source: &'static str,
 }
 
-/// Preserve ordinary native states and add native labels on the candidate's
-/// incoming states. Each episode keeps its original complete attention layout.
+/// Keep every sequence intact; without a layout no row partition is justified.
+fn local_capture_tiles(family: &FamilyInputs, rows: usize) -> Result<Vec<Vec<usize>>, String> {
+    if rows == 0 || family.rows == 0 { return Err("capture needs positive row counts".into()); }
+    for slot in &family.slots {
+        let n = match slot { SlotValues::Raw(x) => x.nrows(), SlotValues::Tokens(x) => x.len() };
+        if n != family.rows { return Err("capture slot rows differ".into()); }
+    }
+    let Some(layout) = &family.layout else { return Ok(vec![(0..family.rows).collect()]); };
+    if layout.sequence.len() != family.rows || layout.position.len() != family.rows { return Err("capture layout rows differ".into()); }
+    let mut by_sequence: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (i, &s) in layout.sequence.iter().enumerate() { by_sequence.entry(s).or_default().push(i); }
+    let mut sequences: Vec<_> = by_sequence.into_values().collect();
+    sequences.sort_by_key(|s| s[0]);
+    let (mut tiles, mut tile) = (Vec::new(), Vec::<usize>::new());
+    let mut sequence_rows = 0;
+    for sequence in sequences {
+        // The device attention backend batches equal-length sequence blocks.
+        // Split a ragged family across lengths rather than pad or truncate it.
+        if !tile.is_empty() && (sequence_rows != sequence.len()
+            || tile.len().checked_add(sequence.len()).ok_or("capture tile overflow")? > rows) {
+            tiles.push(std::mem::take(&mut tile));
+        }
+        sequence_rows = sequence.len();
+        tile.extend(sequence);
+    }
+    if !tile.is_empty() { tiles.push(tile); }
+    Ok(tiles)
+}
+
+/// One prepared device program per state source. Fill final host arrays directly,
+/// preserving the former episode/native/candidate row order without concatenation.
 fn capture_structural_local_targets(
+    d: &Device,
     native: &OperatorProgram,
     candidate: &Artifact,
     binding: &program_learned_dag::LocalFit,
     episodes: &[ResponseEpisode],
     numeric_bytes: usize,
+    capture_rows: usize,
 ) -> Result<(JointLocalTargets, Value), String> {
+    use gam_mpd::native_local_supervision::PreparedDeviceCapture;
+    if episodes.is_empty() { return Err("local supervision episodes absent".into()); }
+    let interfaces = native.interfaces().map_err(|e| e.to_string())?;
+    let widths = |places: &[usize]| places.iter().map(|&n| interfaces.get(n).map(|v| v.width())
+        .ok_or("local native place absent".to_string())).collect::<Result<Vec<_>, _>>();
+    let input_widths = widths(&binding.input_native_places)?;
+    let output_widths = widths(&binding.output_native_places)?;
+    let sum = |v: &[usize]| v.iter().try_fold(0usize, |a,b| a.checked_add(*b).ok_or("local panel size overflow"));
+    let output_width = sum(&output_widths)?;
+    let row_width = sum(&input_widths)?.checked_add(output_width).ok_or("local panel size overflow")?;
+    let (mut offsets, mut total_rows) = (Vec::new(), 0usize);
+    let tiles = episodes.iter().map(|episode| {
+        offsets.push(total_rows);
+        total_rows = total_rows.checked_add(episode.inputs.rows.checked_mul(2).ok_or("local row overflow")?).ok_or("local row overflow")?;
+        local_capture_tiles(&episode.inputs, capture_rows)
+    }).collect::<Result<Vec<_>, String>>()?;
+    let retained = total_rows.checked_mul(row_width).and_then(|n| n.checked_mul(8)).ok_or("local panel size overflow")?;
+    let remaining = numeric_bytes.checked_sub(retained).filter(|n| *n > 0).ok_or("retained local panels exhaust numeric budget")?;
     let native_artifact = Artifact::native(native)?;
-    let mut panels = Vec::new();
-    let mut retained = 0usize;
-    for episode in episodes {
-        for (source, artifact) in [("native", &native_artifact), ("candidate", candidate)] {
-            let panel = gam_mpd::native_local_supervision::capture(native, artifact,
-                &binding.input_native_places, &binding.output_native_places, &episode.inputs,
-                numeric_bytes.checked_sub(retained).ok_or("local panel budget exhausted")?)?;
-            let elements = panel.inputs.iter().map(|v| v.len()).chain(std::iter::once(panel.targets.len()))
-                .try_fold(0usize, |a, b| a.checked_add(b).ok_or("local panel size overflow"))?;
-            retained = retained.checked_add(elements.checked_mul(8).ok_or("local panel size overflow")?)
-                .ok_or("local panel size overflow")?;
-            if retained.checked_mul(2).ok_or("local panel size overflow")? > numeric_bytes {
-                return Err("local panel concatenation exceeds numeric budget".into());
+    let mut inputs: Option<Vec<Array2<f64>>> = None;
+    let mut targets: Option<Array2<f64>> = None;
+    let mut reports = vec![Value::Null; episodes.len().checked_mul(2).ok_or("report size overflow")?];
+    let mut operator_bytes = Vec::new();
+    for (source_index, (source, artifact)) in [("native", &native_artifact), ("candidate", candidate)].into_iter().enumerate() {
+        let prepared = PreparedDeviceCapture::new(d, native, artifact, &binding.input_native_places, &binding.output_native_places, remaining)?;
+        let operators = prepared.operator_numeric_bytes();
+        let capture_budget = remaining.checked_sub(operators).filter(|n| *n > 0).ok_or("local operators exhaust numeric budget")?;
+        operator_bytes.push(operators);
+        let input_panels = inputs.get_or_insert_with(|| input_widths.iter().map(|w| Array2::zeros((total_rows, *w))).collect());
+        let target_panel = targets.get_or_insert_with(|| Array2::zeros((total_rows, output_width)));
+        for (episode_index, episode) in episodes.iter().enumerate() {
+            let offset = offsets[episode_index] + source_index * episode.inputs.rows;
+            let mut captures = Vec::new();
+            for indices in &tiles[episode_index] {
+                let whole = indices.len() == episode.inputs.rows && indices.iter().copied().eq(0..episode.inputs.rows);
+                let selected_bytes = if whole { 0 } else { episode.inputs.slots.iter().try_fold(0usize, |bytes, slot| {
+                    let per_row = match slot { SlotValues::Raw(x) => x.ncols().checked_mul(8), SlotValues::Tokens(_) => Some(4) }.ok_or("selected slot overflow")?;
+                    bytes.checked_add(per_row.checked_mul(indices.len()).ok_or("selected slot overflow")?).ok_or("selected family overflow")
+                })? };
+                let budget = capture_budget.checked_sub(selected_bytes).ok_or("selected family exceeds numeric budget")?;
+                let selected;
+                let family = if whole { &episode.inputs } else { selected = episode.inputs.select(indices); &selected };
+                let panel = prepared.capture(family, budget)?;
+                if panel.inputs.len() != input_panels.len() || panel.targets.dim() != (indices.len(), output_width) { return Err("local capture output shape changed".into()); }
+                for (out, values) in input_panels.iter_mut().zip(&panel.inputs) {
+                    if values.dim() != (indices.len(), out.ncols()) { return Err("local capture input shape changed".into()); }
+                    for (row, &original) in indices.iter().enumerate() { out.row_mut(offset + original).assign(&values.row(row)); }
+                }
+                for (row, &original) in indices.iter().enumerate() { target_panel.row_mut(offset + original).assign(&panel.targets.row(row)); }
+                captures.push(json!({"original_rows":indices,"capture":panel.report}));
             }
-            panels.push((episode.label.clone(), source, panel));
+            reports[2 * episode_index + source_index] = json!({"label":episode.label,"state_source":source,"tiles":captures});
         }
     }
-    let first = &panels.first().ok_or("local supervision episodes absent")?.2;
     let mut start = 0;
-    let groups = first.report.output_widths.iter().enumerate().map(|(i, width)| {
+    let groups = output_widths.iter().enumerate().map(|(i, width)| {
         let end = start + width;
-        let group = gam_mpd::resident_rule_fit::OutputGroup {
-            label: format!("native{}", binding.output_native_places[i]), start, end,
-        };
-        start = end;
-        group
+        let group = gam_mpd::resident_rule_fit::OutputGroup { label: format!("native{}", binding.output_native_places[i]), start, end };
+        start = end; group
     }).collect();
-    let inputs = (0..binding.input_native_places.len()).map(|i|
-        ndarray::concatenate(ndarray::Axis(0), &panels.iter().map(|(_,_,p)| p.inputs[i].view()).collect::<Vec<_>>())
-            .map_err(|e| e.to_string())).collect::<Result<Vec<_>, _>>()?;
-    let targets = ndarray::concatenate(ndarray::Axis(0),
-        &panels.iter().map(|(_,_,p)| p.targets.view()).collect::<Vec<_>>()).map_err(|e|e.to_string())?;
-    let provenance = json!({"episodes":panels.iter().map(|(label,source,p)|
-        json!({"label":label,"state_source":source,"capture":p.report})).collect::<Vec<_>>(),
-        "retained_panel_bytes":retained,"refreshes":1,
-        "scope":"TRAIN only: native states plus candidate-reached states with the native operation evaluated at those same inputs. Capture precedes fitting once per proposal. No heldout states and no inference-time native oracle. Capture stops at the requested boundaries and outputs; the local fitting loop does not execute the full model."});
-    Ok((JointLocalTargets { inputs, targets, groups,
+    let provenance = json!({"episodes":reports,"retained_panel_bytes":retained,"refreshes":1,
+        "backend":d.name(),"requested_capture_rows":capture_rows,"source_operator_numeric_bytes":operator_bytes,
+        "scope":"TRAIN only. Native and candidate-reached states; native same-input dependency-slice labels. Complete sequences stay intact, including sequences larger than the requested tile. Final host panels allocated once; prepared source programs released sequentially. Budget includes final panels, conservative operators and declared capture workspace; excludes caller-owned episodes and allocator/context overhead. No heldout access or execution-time native oracle."});
+    Ok((JointLocalTargets { inputs: inputs.ok_or("local inputs absent")?, targets: targets.ok_or("local targets absent")?, groups,
         state_source: "TRAIN native and candidate-reached states, native labels evaluated on the same incoming states; one capture per proposal" }, provenance))
 }
 
@@ -4340,7 +4397,7 @@ mod tests {
         assert_eq!(applied.local_fit.trainable_operator_ids.len(),1);
         let family=FamilyInputs{rows:6,slots:vec![SlotValues::Raw(array![[-2.],[-1.],[0.],[0.5],[1.],[2.]])],layout:None};
         let episodes=vec![ResponseEpisode{label:"train".into(),inputs:family.clone(),scored:None,endpoint_bytes:0}];
-        let (panels,_)=capture_structural_local_targets(&native,&applied.artifact,&applied.local_fit,&episodes,1 << 24).unwrap();
+        let (panels,_)=capture_structural_local_targets(&Device::host(), &native,&applied.artifact,&applied.local_fit,&episodes,1 << 24, 2).unwrap();
         let settings=JointLocalFit {
             // Zero iterations is deliberately invalid for the Adam fitter: this
             // regression must recover through the actual conditional solve alone.
@@ -4457,8 +4514,8 @@ mod tests {
             compact: None, tile_rows: 0, target_metadata: json!({"backend":"full"}),
         };
         let mut candidate = applied.artifact;
-        let (panels, _) = capture_structural_local_targets(&native, &candidate,
-            &applied.local_fit, &training.metadata, 1 << 24).unwrap();
+        let (panels, _) = capture_structural_local_targets(&Device::host(), &native, &candidate,
+            &applied.local_fit, &training.metadata, 1 << 24, 2).unwrap();
         let (local_program, _) = prefit_joint_linear(&d, &applied.local_fit.program,
             &applied.local_fit.trainable_operator_ids, &panels, 1 << 24).unwrap();
         applied.local_fit.transfer(&local_program, &mut candidate).unwrap();
@@ -4538,10 +4595,29 @@ mod tests {
         };
         let family=FamilyInputs{rows:3,slots:vec![SlotValues::Raw(array![[-1.],[0.5],[2.]])],layout:None};
         let episodes=vec![ResponseEpisode{label:"train".into(),inputs:family.clone(),scored:None,endpoint_bytes:0}];
-        let (panels,report)=capture_structural_local_targets(&native,&candidate,&binding,&episodes,1 << 24).unwrap();
+        let (panels,report)=capture_structural_local_targets(&Device::host(), &native,&candidate,&binding,&episodes,1 << 24, 2).unwrap();
         assert_eq!(panels.inputs[0],array![[0.],[1.],[4.],[0.],[2.],[8.]]);
         assert_eq!(panels.targets,array![[0.],[3.],[12.],[0.],[6.],[24.]]);
         assert_eq!(report["episodes"][1]["state_source"],"candidate");
+        let mut interleaved = family.clone();
+        interleaved.layout = Some(gam_mpd::operator_program::SequenceLayout {
+            sequence: vec![7, 3, 7], position: vec![0, 0, 1],
+        });
+        let tiled_episodes = vec![ResponseEpisode { label:"interleaved".into(), inputs:interleaved,
+            scored:None, endpoint_bytes:0 }];
+        assert_eq!(local_capture_tiles(&tiled_episodes[0].inputs, 100).unwrap(),
+            vec![vec![0,2], vec![1]], "ragged sequence lengths need separate device batches");
+        let (tiled, tiled_report) = capture_structural_local_targets(&Device::host(), &native,
+            &candidate, &binding, &tiled_episodes, 1 << 24, 1).unwrap();
+        assert_eq!(tiled.inputs, panels.inputs, "scatter must restore original episode row order");
+        assert_eq!(tiled.targets, panels.targets);
+        assert_eq!(tiled_report["episodes"][0]["tiles"][0]["original_rows"], json!([0,2]));
+        assert_eq!(tiled_report["episodes"][0]["tiles"][1]["original_rows"], json!([1]));
+        assert_eq!(report["episodes"][0]["tiles"][0]["original_rows"], json!([0,1,2]),
+            "a family with no layout must remain whole even above the tile request");
+        let retained = report["retained_panel_bytes"].as_u64().unwrap() as usize;
+        assert!(capture_structural_local_targets(&Device::host(), &native, &candidate,
+            &binding, &episodes, retained, 1).err().unwrap().contains("retained local panels"));
         let (fitted,fit)=prefit_joint_linear(&Device::host(),&binding.program,&binding.trainable_operator_ids,&panels,1 << 24).unwrap();
         assert_eq!(fit["accepted"],true);
         let original_upstream=candidate.program.operators[0].clone();

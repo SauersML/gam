@@ -1,0 +1,39 @@
+{
+  "source": "edfb9aa49b5d4630445a1d54b79d24351d33c487",
+  "mac": {
+    "initial_driver_tests": 27,
+    "latest_tiling_test": "passed",
+    "focused_device_tests": 13,
+    "real_checkpoint_capture": {
+      "rows": 512,
+      "cases": 3,
+      "repetitions": 3,
+      "parity": true,
+      "checkpoint_sha256": "155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552",
+      "note": "Prepared host path is slower than CPU reference. No GPU speedup inferred."
+    },
+    "benchmark_binary_sha256": "c2c188f0b9fd6a0155961af1b42041841bdb20dd133f5498fa679de80c11bfb5"
+  },
+  "mats": {
+    "cpu_test_job": 16418,
+    "cuda_capture_job": 16419,
+    "gpu_step_jobs": [
+      16404,
+      16405
+    ],
+    "library_tests": 239,
+    "library_status": "passed",
+    "tested_source": "edfb9aa49b5d4630445a1d54b79d24351d33c487",
+    "status": "library_passed_remaining_unobserved",
+    "driver_status": "Job still running at last successful observation; subsequent SSH timed out",
+    "benchmark_status": "Unobserved; CUDA benchmark depends on successful completion",
+    "gpu_status": "16404 and 16405 scheduler held at last observation; 16419 dependency pending. No GPU result."
+  },
+  "scope": "Device F64 native same-input supervision, whole-sequence tiling and memory accounting. No mechanism discovery or demonstrated CUDA speedup.",
+  "files": {
+    "crates/gam-mpd/src/native_local_supervision.rs": "a6de09b94f7247d5a9136eb10b026b22b45126370771dba93bf7df1e1e6445a6",
+    "crates/gam-mpd/src/native_local_supervision_device.rs": "74219b665a0c831280e7a423f6169049995e576754d02f3fcf4602668bbab7d2",
+    "crates/gam-mpd/examples/mpd_composed_causal_search_2951.rs": "ddcf0740adbc3396708be67d045eb0f5638c939f48bd1f2e2fa54d2c7ca7772f",
+    "crates/gam-mpd/examples/mpd_local_capture_bench_2951.rs": "9dc9e9689136b36b0aee5f9abfa741dcb137690e95e4a24cc896b956c309b96d"
+  }
+}

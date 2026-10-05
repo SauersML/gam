@@ -1,0 +1,843 @@
+{
+  "absolute_tolerance": 1e-9,
+  "arguments": [
+    133
+  ],
+  "arithmetic": "F64",
+  "budget_scope": "Numeric API budgets, not RSS/VRAM caps. Exclude imported host coefficients, caller-retained reference/clean panels, allocator and backend scratch, input storage and metadata.",
+  "cases": [
+    {
+      "candidate_setup_seconds": 0.000834709,
+      "changed_input_max_absolute": 0.0,
+      "compile_seconds": 0.035455459,
+      "cpu_capture_median_seconds": 0.244203417,
+      "cpu_capture_report": {
+        "arguments": [
+          133
+        ],
+        "native_evaluated_nodes": [
+          134,
+          135,
+          136
+        ],
+        "native_outputs": [
+          135,
+          136
+        ],
+        "native_prefix_nodes_avoided": 134,
+        "output_widths": [
+          3072,
+          768
+        ],
+        "planned_trace_and_panel_bytes": 498487296,
+        "rows": 512,
+        "scope": "Native dependency slice below complete candidate-reached boundaries; training-only. Boundary producers and unrelated native nodes are not evaluated. Complete sequence layout retained. Budget excludes weights, evaluator scratch, inputs, and allocator overhead."
+      },
+      "cpu_capture_seconds": [
+        0.238692042,
+        0.244203417,
+        0.245227083
+      ],
+      "cpu_warmup_seconds": 0.251498334,
+      "device_capture_report": {
+        "arguments": [
+          133
+        ],
+        "native_evaluated_nodes": [
+          134,
+          135,
+          136
+        ],
+        "native_outputs": [
+          135,
+          136
+        ],
+        "native_prefix_nodes_avoided": 134,
+        "output_widths": [
+          3072,
+          768
+        ],
+        "planned_trace_and_panel_bytes": 1543503872,
+        "rows": 512,
+        "scope": "Prepared F64 device execution; native dependency slice clamped to candidate-reached boundaries. Original boundary producers and unrelated native nodes are removed. Complete supplied sequence layout retained. Downloads only final input/target panels. Operator buffers separately budgeted; trace/panel plan excludes caller-retained panels/inputs, host coefficients, code/index arrays and backend/allocator scratch. No CPU fallback or F32 throughput claim."
+      },
+      "device_warmup_seconds": 0.418384584,
+      "label": "native",
+      "operator_numeric_bytes": 610947072,
+      "prepared_capture_median_seconds": 0.425760125,
+      "prepared_capture_seconds": [
+        0.431364792,
+        0.425760125,
+        0.416261833
+      ],
+      "repeated_parity": [
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 0.0,
+                "max_error_over_elementwise_tolerance": 0.0,
+                "max_error_relative_to_reference_max": 0.0,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 0.0,
+              "max_error_over_elementwise_tolerance": 0.0,
+              "max_error_relative_to_reference_max": 0.0,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": false,
+          "repetition": 0
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 2.312594560294201e-13,
+                "max_error_over_elementwise_tolerance": 0.000027987861056129255,
+                "max_error_relative_to_reference_max": 1.2246963194413185e-14,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 1.6342482922482304e-13,
+              "max_error_over_elementwise_tolerance": 0.000026772468775722206,
+              "max_error_relative_to_reference_max": 3.7122092374741626e-15,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": true,
+          "repetition": 0
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 2.312594560294201e-13,
+                "max_error_over_elementwise_tolerance": 0.000027987861056129255,
+                "max_error_relative_to_reference_max": 1.2246963194413185e-14,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 1.6342482922482304e-13,
+              "max_error_over_elementwise_tolerance": 0.000026772468775722206,
+              "max_error_relative_to_reference_max": 3.7122092374741626e-15,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": true,
+          "repetition": 1
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 0.0,
+                "max_error_over_elementwise_tolerance": 0.0,
+                "max_error_relative_to_reference_max": 0.0,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 0.0,
+              "max_error_over_elementwise_tolerance": 0.0,
+              "max_error_relative_to_reference_max": 0.0,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": false,
+          "repetition": 1
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 0.0,
+                "max_error_over_elementwise_tolerance": 0.0,
+                "max_error_relative_to_reference_max": 0.0,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 0.0,
+              "max_error_over_elementwise_tolerance": 0.0,
+              "max_error_relative_to_reference_max": 0.0,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": false,
+          "repetition": 2
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 2.312594560294201e-13,
+                "max_error_over_elementwise_tolerance": 0.000027987861056129255,
+                "max_error_relative_to_reference_max": 1.2246963194413185e-14,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 1.6342482922482304e-13,
+              "max_error_over_elementwise_tolerance": 0.000026772468775722206,
+              "max_error_relative_to_reference_max": 3.7122092374741626e-15,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": true,
+          "repetition": 2
+        }
+      ],
+      "upstream_weight_gain": 1.0,
+      "warmup_parity": {
+        "inputs": [
+          {
+            "max_absolute_error": 2.312594560294201e-13,
+            "max_error_over_elementwise_tolerance": 0.000027987861056129255,
+            "max_error_relative_to_reference_max": 1.2246963194413185e-14,
+            "passed": true,
+            "shape": [
+              512,
+              768
+            ]
+          }
+        ],
+        "passed": true,
+        "targets": {
+          "max_absolute_error": 1.6342482922482304e-13,
+          "max_error_over_elementwise_tolerance": 0.000026772468775722206,
+          "max_error_relative_to_reference_max": 3.7122092374741626e-15,
+          "passed": true,
+          "shape": [
+            512,
+            3840
+          ]
+        }
+      }
+    },
+    {
+      "candidate_setup_seconds": 0.001465041,
+      "changed_input_max_absolute": 9.885172038447909,
+      "compile_seconds": 0.02201675,
+      "cpu_capture_median_seconds": 0.243661667,
+      "cpu_capture_report": {
+        "arguments": [
+          133
+        ],
+        "native_evaluated_nodes": [
+          134,
+          135,
+          136
+        ],
+        "native_outputs": [
+          135,
+          136
+        ],
+        "native_prefix_nodes_avoided": 134,
+        "output_widths": [
+          3072,
+          768
+        ],
+        "planned_trace_and_panel_bytes": 498487296,
+        "rows": 512,
+        "scope": "Native dependency slice below complete candidate-reached boundaries; training-only. Boundary producers and unrelated native nodes are not evaluated. Complete sequence layout retained. Budget excludes weights, evaluator scratch, inputs, and allocator overhead."
+      },
+      "cpu_capture_seconds": [
+        0.238571541,
+        0.2458325,
+        0.243661667
+      ],
+      "cpu_warmup_seconds": 0.238683166,
+      "device_capture_report": {
+        "arguments": [
+          133
+        ],
+        "native_evaluated_nodes": [
+          134,
+          135,
+          136
+        ],
+        "native_outputs": [
+          135,
+          136
+        ],
+        "native_prefix_nodes_avoided": 134,
+        "output_widths": [
+          3072,
+          768
+        ],
+        "planned_trace_and_panel_bytes": 1543503872,
+        "rows": 512,
+        "scope": "Prepared F64 device execution; native dependency slice clamped to candidate-reached boundaries. Original boundary producers and unrelated native nodes are removed. Complete supplied sequence layout retained. Downloads only final input/target panels. Operator buffers separately budgeted; trace/panel plan excludes caller-retained panels/inputs, host coefficients, code/index arrays and backend/allocator scratch. No CPU fallback or F32 throughput claim."
+      },
+      "device_warmup_seconds": 0.414506166,
+      "label": "attention_writer_gain_1.5",
+      "operator_numeric_bytes": 610947072,
+      "prepared_capture_median_seconds": 0.413339958,
+      "prepared_capture_seconds": [
+        0.412499875,
+        0.413339958,
+        0.422059375
+      ],
+      "repeated_parity": [
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 0.0,
+                "max_error_over_elementwise_tolerance": 0.0,
+                "max_error_relative_to_reference_max": 0.0,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 0.0,
+              "max_error_over_elementwise_tolerance": 0.0,
+              "max_error_relative_to_reference_max": 0.0,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": false,
+          "repetition": 0
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 7.482903185973555e-14,
+                "max_error_over_elementwise_tolerance": 0.00002207152292945705,
+                "max_error_relative_to_reference_max": 3.960379802084689e-15,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 8.837375276016246e-14,
+              "max_error_over_elementwise_tolerance": 0.000021180360462004125,
+              "max_error_relative_to_reference_max": 2.096367025140282e-15,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": true,
+          "repetition": 0
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 7.482903185973555e-14,
+                "max_error_over_elementwise_tolerance": 0.00002207152292945705,
+                "max_error_relative_to_reference_max": 3.960379802084689e-15,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 8.837375276016246e-14,
+              "max_error_over_elementwise_tolerance": 0.000021180360462004125,
+              "max_error_relative_to_reference_max": 2.096367025140282e-15,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": true,
+          "repetition": 1
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 0.0,
+                "max_error_over_elementwise_tolerance": 0.0,
+                "max_error_relative_to_reference_max": 0.0,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 0.0,
+              "max_error_over_elementwise_tolerance": 0.0,
+              "max_error_relative_to_reference_max": 0.0,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": false,
+          "repetition": 1
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 0.0,
+                "max_error_over_elementwise_tolerance": 0.0,
+                "max_error_relative_to_reference_max": 0.0,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 0.0,
+              "max_error_over_elementwise_tolerance": 0.0,
+              "max_error_relative_to_reference_max": 0.0,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": false,
+          "repetition": 2
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 7.482903185973555e-14,
+                "max_error_over_elementwise_tolerance": 0.00002207152292945705,
+                "max_error_relative_to_reference_max": 3.960379802084689e-15,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 8.837375276016246e-14,
+              "max_error_over_elementwise_tolerance": 0.000021180360462004125,
+              "max_error_relative_to_reference_max": 2.096367025140282e-15,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": true,
+          "repetition": 2
+        }
+      ],
+      "upstream_weight_gain": 1.5,
+      "warmup_parity": {
+        "inputs": [
+          {
+            "max_absolute_error": 7.482903185973555e-14,
+            "max_error_over_elementwise_tolerance": 0.00002207152292945705,
+            "max_error_relative_to_reference_max": 3.960379802084689e-15,
+            "passed": true,
+            "shape": [
+              512,
+              768
+            ]
+          }
+        ],
+        "passed": true,
+        "targets": {
+          "max_absolute_error": 8.837375276016246e-14,
+          "max_error_over_elementwise_tolerance": 0.000021180360462004125,
+          "max_error_relative_to_reference_max": 2.096367025140282e-15,
+          "passed": true,
+          "shape": [
+            512,
+            3840
+          ]
+        }
+      }
+    },
+    {
+      "candidate_setup_seconds": 0.001410875,
+      "changed_input_max_absolute": 23.14796709464506,
+      "compile_seconds": 0.0211305,
+      "cpu_capture_median_seconds": 0.241493459,
+      "cpu_capture_report": {
+        "arguments": [
+          133
+        ],
+        "native_evaluated_nodes": [
+          134,
+          135,
+          136
+        ],
+        "native_outputs": [
+          135,
+          136
+        ],
+        "native_prefix_nodes_avoided": 134,
+        "output_widths": [
+          3072,
+          768
+        ],
+        "planned_trace_and_panel_bytes": 498487296,
+        "rows": 512,
+        "scope": "Native dependency slice below complete candidate-reached boundaries; training-only. Boundary producers and unrelated native nodes are not evaluated. Complete sequence layout retained. Budget excludes weights, evaluator scratch, inputs, and allocator overhead."
+      },
+      "cpu_capture_seconds": [
+        0.263477167,
+        0.238773041,
+        0.241493459
+      ],
+      "cpu_warmup_seconds": 0.251465542,
+      "device_capture_report": {
+        "arguments": [
+          133
+        ],
+        "native_evaluated_nodes": [
+          134,
+          135,
+          136
+        ],
+        "native_outputs": [
+          135,
+          136
+        ],
+        "native_prefix_nodes_avoided": 134,
+        "output_widths": [
+          3072,
+          768
+        ],
+        "planned_trace_and_panel_bytes": 1543503872,
+        "rows": 512,
+        "scope": "Prepared F64 device execution; native dependency slice clamped to candidate-reached boundaries. Original boundary producers and unrelated native nodes are removed. Complete supplied sequence layout retained. Downloads only final input/target panels. Operator buffers separately budgeted; trace/panel plan excludes caller-retained panels/inputs, host coefficients, code/index arrays and backend/allocator scratch. No CPU fallback or F32 throughput claim."
+      },
+      "device_warmup_seconds": 0.4404475,
+      "label": "attention_writer_gain_-0.5",
+      "operator_numeric_bytes": 610947072,
+      "prepared_capture_median_seconds": 0.418328291,
+      "prepared_capture_seconds": [
+        0.451371834,
+        0.418328291,
+        0.409425417
+      ],
+      "repeated_parity": [
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 0.0,
+                "max_error_over_elementwise_tolerance": 0.0,
+                "max_error_relative_to_reference_max": 0.0,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 0.0,
+              "max_error_over_elementwise_tolerance": 0.0,
+              "max_error_relative_to_reference_max": 0.0,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": false,
+          "repetition": 0
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 5.861977570020827e-13,
+                "max_error_over_elementwise_tolerance": 0.00015942600257643936,
+                "max_error_relative_to_reference_max": 3.3488794829955983e-14,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 4.938272013532696e-13,
+              "max_error_over_elementwise_tolerance": 0.00002562789508128627,
+              "max_error_relative_to_reference_max": 1.1829386533088621e-14,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": true,
+          "repetition": 0
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 5.861977570020827e-13,
+                "max_error_over_elementwise_tolerance": 0.00015942600257643936,
+                "max_error_relative_to_reference_max": 3.3488794829955983e-14,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 4.938272013532696e-13,
+              "max_error_over_elementwise_tolerance": 0.00002562789508128627,
+              "max_error_relative_to_reference_max": 1.1829386533088621e-14,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": true,
+          "repetition": 1
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 0.0,
+                "max_error_over_elementwise_tolerance": 0.0,
+                "max_error_relative_to_reference_max": 0.0,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 0.0,
+              "max_error_over_elementwise_tolerance": 0.0,
+              "max_error_relative_to_reference_max": 0.0,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": false,
+          "repetition": 1
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 0.0,
+                "max_error_over_elementwise_tolerance": 0.0,
+                "max_error_relative_to_reference_max": 0.0,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 0.0,
+              "max_error_over_elementwise_tolerance": 0.0,
+              "max_error_relative_to_reference_max": 0.0,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": false,
+          "repetition": 2
+        },
+        {
+          "parity": {
+            "inputs": [
+              {
+                "max_absolute_error": 5.861977570020827e-13,
+                "max_error_over_elementwise_tolerance": 0.00015942600257643936,
+                "max_error_relative_to_reference_max": 3.3488794829955983e-14,
+                "passed": true,
+                "shape": [
+                  512,
+                  768
+                ]
+              }
+            ],
+            "passed": true,
+            "targets": {
+              "max_absolute_error": 4.938272013532696e-13,
+              "max_error_over_elementwise_tolerance": 0.00002562789508128627,
+              "max_error_relative_to_reference_max": 1.1829386533088621e-14,
+              "passed": true,
+              "shape": [
+                512,
+                3840
+              ]
+            }
+          },
+          "prepared_device": true,
+          "repetition": 2
+        }
+      ],
+      "upstream_weight_gain": -0.5,
+      "warmup_parity": {
+        "inputs": [
+          {
+            "max_absolute_error": 5.861977570020827e-13,
+            "max_error_over_elementwise_tolerance": 0.00015942600257643936,
+            "max_error_relative_to_reference_max": 3.3488794829955983e-14,
+            "passed": true,
+            "shape": [
+              512,
+              768
+            ]
+          }
+        ],
+        "passed": true,
+        "targets": {
+          "max_absolute_error": 4.938272013532696e-13,
+          "max_error_over_elementwise_tolerance": 0.00002562789508128627,
+          "max_error_relative_to_reference_max": 1.1829386533088621e-14,
+          "passed": true,
+          "shape": [
+            512,
+            3840
+          ]
+        }
+      }
+    }
+  ],
+  "checkpoint_sha256": "155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552",
+  "context": 512,
+  "device": "host float64",
+  "device_setup_seconds": 0.000018375,
+  "export": "/Users/user/mpd-data/engine/vpd4l_e2e_train",
+  "export_manifest_sha256": "b0f8d6d4328df06cd464d999bc1d1da4d1431334d21cdaf2e9e5e1edc9f4bc73",
+  "import_and_boundary_setup_seconds": 5.515715083,
+  "mode": "host",
+  "operator_numeric_budget_bytes": 8589934592,
+  "outputs": [
+    135,
+    136
+  ],
+  "parity_criterion": "Every element: abs(actual-reference) <= atol + rtol*abs(reference)",
+  "parity_passed": true,
+  "relative_tolerance": 1e-8,
+  "repetitions_after_one_warmup": 3,
+  "rows": 512,
+  "schema": "native-local-capture-bench-v1",
+  "scope": "Native same-input local supervision capture only; complete contexts, final input/target downloads included. No vocabulary head, fitting, acceptance, or mechanism-discovery result.",
+  "selected_layer": 3,
+  "sequences": 1,
+  "storage": "F64",
+  "trace_panel_numeric_budget_bytes": 17179869184,
+  "upstream_edit_operators": [
+    "blocks.0.o0",
+    "blocks.0.o1",
+    "blocks.0.o2",
+    "blocks.0.o3",
+    "blocks.0.o4",
+    "blocks.0.o5"
+  ]
+}
