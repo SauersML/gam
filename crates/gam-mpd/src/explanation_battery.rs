@@ -2039,3 +2039,130 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
 fn d_copy(d: &Device, t: &Tensor) -> Result<Tensor, String> {
     d.copy(t).map_err(error)
 }
+
+// ------------------------------------------------------------------------------ causal importance
+
+/// Per held-out target token, the units causally important for its prediction by the read-out's
+/// definition (`library_readout`, module note there): `|A_i(t)| > τ |m(t)|`, `m(t)` the centred
+/// logit of the model's predicted token at `t` and `A_i(t)` unit `i`'s RelP attribution of it
+/// summed over the positions `s ≤ t` it acts at. Units: the functions of `library` (its MLP
+/// functions and heads; on the library's starting artifact, `M`'s neurons and heads), and with
+/// `vpd` VPD's subcomponents, `A_c(t) = Σ_s a_c(s) (U_c · ∂m(t)/∂y(s))` with `y` the site's output
+/// (queries and keys zero under the frozen pattern), beside VPD's own count of subcomponents with
+/// a positive causal importance at `t`. `targets` positions per sequence are drawn uniformly without
+/// replacement from `seed`. Returns per unit kind and `τ` the mean count per target token.
+pub fn importance_counts(
+    library: &crate::library_readout::Library<'_>,
+    vpd: Option<&Vpd>,
+    sequences: &[Vec<u32>],
+    targets: usize,
+    thresholds: &[f64],
+    seed: u64,
+) -> Result<Value, String> {
+    use crate::library_readout::{Kind as FunctionKind, Metric, Prompt};
+    let functions = library.functions();
+    let heads: Vec<Vec<usize>> = (0..functions.iter().map(|f| f.layer + 1).max().unwrap_or(0))
+        .map(|l| {
+            functions
+                .iter()
+                .filter(|f| f.layer == l && matches!(f.kind, FunctionKind::Head))
+                .map(|f| f.name.rsplit('H').next().and_then(|h| h.parse::<usize>().ok()).ok_or_else(|| error(format!("head name {}", f.name))))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<_, _>>()?;
+    let mut rng = StdRng::seed_from_u64(seed);
+    // Per kind, per threshold, the counts at every target; and VPD's own count.
+    let kinds = ["neurons", "heads", "neurons_and_heads", "vpd"];
+    let mut counts: BTreeMap<&str, Vec<Tokens>> = kinds.iter().map(|k| (*k, vec![Tokens::default(); thresholds.len()])).collect();
+    let mut own = Tokens::default();
+    let mut metric = Tokens::default();
+    for sequence in sequences {
+        let length = sequence.len();
+        let mut positions: Vec<usize> = (0..length).collect();
+        for j in 0..targets.min(length) {
+            let pick = rng.random_range(j..length);
+            positions.swap(j, pick);
+        }
+        // VPD's subcomponent activations (its program at every mask and remainder one, which is
+        // `M`) and its causal importances on the whole sequence; a prefix's rows are the same.
+        let vpd_state = match vpd {
+            Some(v) => {
+                let family = sequence_family(&[sequence.as_slice()])?;
+                let d = v.e.program.device();
+                let mut given = BTreeMap::new();
+                for l in 0..v.layers() {
+                    given.extend(v.given(d, l, None, family.rows)?);
+                }
+                let trace = v.e.program.forward_given(&family, given)?;
+                let activations: Vec<Array2<f64>> = v.layout.activations.iter().map(|n| d.download(trace.value(*n)?).map_err(error)).collect::<Result<_, _>>()?;
+                Some((v, activations, v.importances(&family)?))
+            }
+            None => None,
+        };
+        for &t in &positions[..targets.min(length)] {
+            let prompt = Prompt { tokens: sequence[..=t].to_vec(), baseline: None, metric: Metric::PredictedAt { position: t }, gradients: vpd.is_some() };
+            let attribution = library.attributions(&prompt)?;
+            let m = attribution.metric[t];
+            metric.0.push(m);
+            let totals = attribution.attributions.sum_axis(Axis(0));
+            for (j, tau) in thresholds.iter().enumerate() {
+                let above = |kind: Option<bool>| {
+                    functions.iter().zip(&totals).filter(|(f, a)| kind.is_none_or(|mlp| matches!(f.kind, FunctionKind::Mlp) == mlp) && a.abs() > tau * m.abs()).count() as f64
+                };
+                if let Some(c) = counts.get_mut("neurons") {
+                    c[j].0.push(above(Some(true)));
+                }
+                if let Some(c) = counts.get_mut("heads") {
+                    c[j].0.push(above(Some(false)));
+                }
+                if let Some(c) = counts.get_mut("neurons_and_heads") {
+                    c[j].0.push(above(None));
+                }
+            }
+            let Some((v, activations, importance)) = &vpd_state else { continue };
+            let gradients = attribution.gradients.ok_or_else(|| error("RelP returned no gradients"))?;
+            let mut above = vec![0.0; thresholds.len()];
+            for (s, f) in v.factors.iter().enumerate() {
+                let layer = &gradients[f.layer];
+                let gradient: Array2<f64> = match f.kind {
+                    Kind::Query | Kind::Key => continue,
+                    Kind::Value => {
+                        let width = layer.values.first().map_or(0, Array2::ncols);
+                        let mut g = Array2::zeros((t + 1, width * heads[f.layer].len()));
+                        for (value, &h) in layer.values.iter().zip(&heads[f.layer]) {
+                            g.slice_mut(s![.., h * width..(h + 1) * width]).assign(value);
+                        }
+                        g
+                    }
+                    Kind::Output => layer.attention_output.clone(),
+                    Kind::Up => layer.gate.clone(),
+                    Kind::Down => layer.mlp_output.clone(),
+                };
+                let a = activations[s].slice(s![..=t, ..]);
+                let attributions = (&a * &gradient.dot(&f.u.t())).sum_axis(Axis(0));
+                for (j, tau) in thresholds.iter().enumerate() {
+                    above[j] += attributions.iter().filter(|x| x.abs() > tau * m.abs()).count() as f64;
+                }
+            }
+            if let Some(c) = counts.get_mut("vpd") {
+                for (j, n) in above.into_iter().enumerate() {
+                    c[j].0.push(n);
+                }
+            }
+            own.0.push(importance.iter().map(|g| g.row(t).iter().filter(|x| **x > 0.0).count() as f64).sum());
+        }
+        log::info!("importance counts: sequence done");
+    }
+    let mut out = serde_json::Map::new();
+    for (kind, per) in &counts {
+        if per[0].0.is_empty() {
+            continue;
+        }
+        out.insert(kind.to_string(), Value::Array(thresholds.iter().zip(per).map(|(tau, c)| json!({"tau": tau, "per_token": c.summary()})).collect()));
+    }
+    if !own.0.is_empty() {
+        out.insert("vpd_positive_importance".into(), own.summary());
+    }
+    out.insert("metric".into(), metric.summary());
+    Ok(Value::Object(out))
+}
