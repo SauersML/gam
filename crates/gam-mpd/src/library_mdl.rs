@@ -12,13 +12,13 @@
 //!   the same place as on `M`. Its function attends with its own query, key and value maps
 //!   `q = Q x`, `k = K x`, `v = V x` at the native rotary angles, scale and causal mask.
 //! * An MLP's block reads its layer's second normed stream and writes the MLP's output. Its
-//!   functions are `f_i(x) = relu(g_i·x + c_i) u_i`: a gate direction `g_i`, a gate bias `c_i` and
-//!   an output `u_i`. A function is exactly zero wherever its gate is not positive. Removing or
+//!   functions are `f_i(x) = φ(g_i·x + c_i) u_i`, with the native pointwise law `φ`,
+//!   a gate direction `g_i`, a gate bias `c_i` and an output `u_i`. Removing or
 //!   scaling the whole MLP stays expressible through a uniform-scale control on its output
 //!   (`native_control`).
 //!
-//! The library starts at `M`: native neuron `i` is function `i` with its GELU replaced by the ReLU,
-//! and a head is its own function.
+//! The library starts at `M`: native neuron `i` is function `i` with its original
+//! activation and coefficients, and a head is its own function.
 //!
 //! # The code length
 //!
@@ -40,7 +40,8 @@
 //!
 //! Weight noise costs data only on the tokens where a function is active, so a ReLU-gated function
 //! that is exactly zero elsewhere can keep imprecise, cheap weights: the code length rewards
-//! functions that are inactive on most inputs without any sparsity penalty.
+//! functions that are inactive on most inputs without any sparsity penalty, when the native
+//! activation is ReLU. This inactive-region argument does not apply to GELU or SiLU.
 //!
 //! # The fit
 //!
@@ -53,20 +54,28 @@
 //! previous epoch, paired by batch, is smaller than its standard error.
 //!
 //! A converged fit then proposes removing groups in increasing order of their divergence `KL_G`
-//! (their information content) and keeps the longest prefix, found by bisection, whose removal does
-//! not increase `F`. `F` is evaluated over the whole training set with the same weight noise for
-//! both sides of every comparison. The order is a proposal; the acceptance is the objective. The
-//! fit alternates converging and removing until no removal is accepted.
+//! (their information content). Prefix lengths are searched by bisection, `O(log n)` full training
+//! evaluations for `n` active groups, and the longest evaluated prefix that does not increase the
+//! sampled objective is removed. The objective is estimated over the whole training set with one
+//! common weight sample per batch for both sides of every comparison. The order and the search are
+//! a proposal; the acceptance is the objective, so a removal never increases `F`. Removal effects
+//! can cancel, so the objective need not be monotone in the prefix length and the search may miss a
+//! longer acceptable prefix; the next round, after the continuous fit converges again, proposes
+//! again. A scan of every prefix length would cost one full training evaluation per group, tens of
+//! thousands on VPD-4L. The fit alternates converging and removing until no removal is accepted.
 //!
 //! The explanation is reported at the posterior mean `μ` ([`posterior_mean`]); removed groups are
-//! absent blocks of their operators, so they cost no literals.
+//! absent only when they fill complete interface blocks. Zeros inside a still-present block
+//! remain serialized literals (notably value coordinates in a grouped head interface).
+//! The variational objective above is distinct from ordinary serialized artifact cost C32;
+//! prior-group removal does not guarantee an equal reduction of that artifact cost.
 
 use crate::{
     artifact::{Argument, Artifact, Callee},
     artifact_device::mapped_inlined,
     device_program::DeviceProgram,
     operator_program::{
-        FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, Provenance, Rule, SequenceLayout, SlotValues,
+        FamilyInputs, Interface, LabelKind, Node, Operator, OperatorBody, OperatorProgram, Provenance, Rule, SequenceLayout, SlotValues,
         exact_precision,
     },
     resident_causal_fit::fixed_head_target::{Head, ResidentHead, Target},
@@ -77,7 +86,7 @@ use ndarray::Array2;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, ops::Range, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, io::Write, ops::Range, path::Path, sync::Arc, time::Instant};
 
 /// The bits of one independently sent literal (`acceptance::LITERAL_BITS`), as nats.
 const LITERAL_NATS: f64 = crate::acceptance::LITERAL_BITS as f64 * std::f64::consts::LN_2;
@@ -219,7 +228,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
             nodes: vec![
                 Node::Param { index: 0 },
                 Node::Affine { terms: vec![(0, base)], bias: Some(base + 1) },
-                Node::Pointwise { input: 1, laws: vec![Law::Relu; units.group_count()] },
+                Node::Pointwise { input: 1, laws: laws.clone() },
                 Node::Affine { terms: vec![(2, base + 2)], bias: None },
             ],
             output: 3,
@@ -552,7 +561,7 @@ impl Settings {
 }
 
 /// One epoch of the continuous fit.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Epoch {
     pub epoch: usize,
     /// Mean over the epoch's steps of the objective estimate, and of its data and description
@@ -570,7 +579,7 @@ pub struct Epoch {
 }
 
 /// One removal step.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Removal {
     pub candidates: usize,
     pub removed: usize,
@@ -715,9 +724,84 @@ fn noise_seed(seed: u64, epoch: usize, batch: usize) -> u64 {
     seed.wrapping_add((epoch as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)).wrapping_add((batch as u64).wrapping_mul(0x8CB9_2BA7_2F3D_8DD7))
 }
 
+/// Where a fit stands at the end of an epoch: with the posterior and the optimizer's moments, all a
+/// fit needs to continue exactly as if it had not stopped.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Progress {
+    settings: Settings,
+    tokens: usize,
+    shapes: Vec<(usize, usize)>,
+    /// The next epoch, and the optimizer steps taken.
+    epoch: usize,
+    step: i32,
+    epochs: Vec<Epoch>,
+    removals: Vec<Removal>,
+    /// The last epoch's per-batch objective estimates, when convergence is being judged.
+    previous: Option<Vec<f64>>,
+    active: Vec<bool>,
+    done: bool,
+    seconds: f64,
+}
+
+/// The fit's arrays in checkpoint order: per operator `μ`, `ln σ` and the moments of each.
+fn arrays<'a>(posterior: &'a Posterior, mean: &'a [Moment], log_sd: &'a [Moment]) -> Vec<&'a Array2<f64>> {
+    (0..posterior.mean.len())
+        .flat_map(|i| [&posterior.mean[i], &posterior.log_sd[i], &mean[i].first, &mean[i].second, &log_sd[i].first, &log_sd[i].second])
+        .collect()
+}
+
+/// Write the checkpoint atomically: the progress as JSON after its length, then every array's
+/// values as little-endian float64.
+fn save_checkpoint(path: &Path, progress: &Progress, posterior: &Posterior, mean: &[Moment], log_sd: &[Moment]) -> Result<(), String> {
+    let header = serde_json::to_vec(progress).map_err(error)?;
+    let partial = path.with_extension("partial");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&partial).map_err(error)?);
+    file.write_all(&(header.len() as u64).to_le_bytes()).map_err(error)?;
+    file.write_all(&header).map_err(error)?;
+    for array in arrays(posterior, mean, log_sd) {
+        for value in array.iter() {
+            file.write_all(&value.to_le_bytes()).map_err(error)?;
+        }
+    }
+    file.into_inner().map_err(error)?.sync_all().map_err(error)?;
+    std::fs::rename(&partial, path).map_err(error)
+}
+
+/// Restore a checkpoint of this fit into `posterior` and the moments, or refuse one of another fit.
+fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior, mean: &mut [Moment], log_sd: &mut [Moment]) -> Result<Progress, String> {
+    let bytes = std::fs::read(path).map_err(error)?;
+    let length = u64::from_le_bytes(bytes.get(..8).ok_or("a truncated checkpoint")?.try_into().map_err(error)?) as usize;
+    let header = bytes.get(8..8 + length).ok_or("a truncated checkpoint")?;
+    let progress: Progress = serde_json::from_slice(header).map_err(error)?;
+    let same_settings = serde_json::to_value(&progress.settings).map_err(error)? == serde_json::to_value(&expected.settings).map_err(error)?;
+    if !same_settings || progress.tokens != expected.tokens || progress.shapes != expected.shapes || progress.active.len() != expected.active.len() {
+        return Err(format!("{}: a checkpoint of another fit", path.display()));
+    }
+    let count: usize = progress.shapes.iter().map(|(r, c)| r * c * 6).sum();
+    if bytes.len() - 8 - length != count * 8 {
+        return Err(format!("{}: a checkpoint of the wrong size", path.display()));
+    }
+    let mut values = bytes[8 + length..].chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().expect("eight bytes")));
+    for i in 0..posterior.mean.len() {
+        for array in [&mut posterior.mean[i], &mut posterior.log_sd[i], &mut mean[i].first, &mut mean[i].second, &mut log_sd[i].first, &mut log_sd[i].second] {
+            array.iter_mut().for_each(|v| *v = values.next().expect("counted values"));
+        }
+    }
+    posterior.active = progress.active.clone();
+    Ok(progress)
+}
+
 /// Fit the library explanation of `native` to its distributions on the training `sequences` (module
-/// note). `native` is the split native program the explanation was built from.
-pub fn fit(device: &Device, native: &OperatorProgram, explanation: &Explanation, sequences: &[Vec<u32>], settings: &Settings) -> Result<Fit, String> {
+/// note). `native` is the split native program the explanation was built from. With `checkpoint`,
+/// the fit is saved there after every epoch and removal step, and resumed from it when it exists.
+pub fn fit(
+    device: &Device,
+    native: &OperatorProgram,
+    explanation: &Explanation,
+    sequences: &[Vec<u32>],
+    settings: &Settings,
+    checkpoint: Option<&Path>,
+) -> Result<Fit, String> {
     settings.validate()?;
     let started = Instant::now();
     let tokens: usize = sequences.iter().map(Vec::len).sum();
@@ -726,17 +810,37 @@ pub fn fit(device: &Device, native: &OperatorProgram, explanation: &Explanation,
     if batches.len() < 2 {
         return Err("the convergence test needs at least two training batches".into());
     }
-    let teacher = Teacher::new(device, native, settings.numeric_bytes, settings.head_tile_rows)?;
-    let mut student = Student::new(device, &explanation.artifact, &explanation.trainable, settings.numeric_bytes, settings.head_tile_rows)?;
     let mut posterior = Posterior::new(explanation, tokens)?;
     let parameters = posterior.mean.iter().map(Array2::len).sum();
     let mut mean_moments: Vec<Moment> = posterior.mean.iter().map(|m| Moment::zeros(m.dim())).collect();
     let mut log_sd_moments = mean_moments.clone();
-    let mut epochs: Vec<Epoch> = Vec::new();
-    let mut removals = Vec::new();
-    let mut previous: Option<Vec<f64>> = None;
-    let mut step = 0i32;
-    for epoch in 0.. {
+    let mut progress = Progress {
+        settings: settings.clone(),
+        tokens,
+        shapes: posterior.mean.iter().map(Array2::dim).collect(),
+        epoch: 0,
+        step: 0,
+        epochs: Vec::new(),
+        removals: Vec::new(),
+        previous: None,
+        active: posterior.active.clone(),
+        done: false,
+        seconds: 0.0,
+    };
+    if let Some(path) = checkpoint.filter(|p| p.exists()) {
+        progress = load_checkpoint(path, &progress, &mut posterior, &mut mean_moments, &mut log_sd_moments)?;
+        log::info!("library fit resumed at epoch {} from {}", progress.epoch, path.display());
+    }
+    let resumed_seconds = progress.seconds;
+    let teacher = Teacher::new(device, native, settings.numeric_bytes, settings.head_tile_rows)?;
+    let mut student = Student::new(device, &explanation.artifact, &explanation.trainable, settings.numeric_bytes, settings.head_tile_rows)?;
+    let save = |progress: &mut Progress, posterior: &Posterior, mean: &[Moment], log_sd: &[Moment]| -> Result<(), String> {
+        progress.active = posterior.active.clone();
+        progress.seconds = resumed_seconds + started.elapsed().as_secs_f64();
+        checkpoint.map_or(Ok(()), |path| save_checkpoint(path, progress, posterior, mean, log_sd))
+    };
+    while !progress.done {
+        let epoch = progress.epoch;
         let epoch_started = Instant::now();
         let mut estimates = Vec::with_capacity(batches.len());
         let (mut data_sum, mut description_sum, mut kl_sum) = (0.0, 0.0, 0.0);
@@ -752,7 +856,8 @@ pub fn fit(device: &Device, native: &OperatorProgram, explanation: &Explanation,
             data_sum += scale * divergence;
             description_sum += description;
             kl_sum += divergence / batch.rows as f64;
-            step += 1;
+            progress.step += 1;
+            let step = progress.step;
             let results = posterior.derivatives(&gradients, &noise);
             let active = posterior.active.clone();
             let Posterior { mean, log_sd, membership, .. } = &mut posterior;
@@ -768,7 +873,7 @@ pub fn fit(device: &Device, native: &OperatorProgram, explanation: &Explanation,
                 });
         }
         let count = batches.len() as f64;
-        let (improvement, standard_error) = match &previous {
+        let (improvement, standard_error) = match &progress.previous {
             Some(before) => {
                 let differences: Vec<f64> = before.iter().zip(&estimates).map(|(a, b)| a - b).collect();
                 let mean = differences.iter().sum::<f64>() / count;
@@ -790,34 +895,32 @@ pub fn fit(device: &Device, native: &OperatorProgram, explanation: &Explanation,
             seconds: epoch_started.elapsed().as_secs_f64(),
         };
         log::info!("library fit epoch {epoch}: {record:?}");
-        epochs.push(record);
-        previous = Some(estimates);
+        progress.epochs.push(record);
+        progress.previous = Some(estimates);
+        progress.epoch += 1;
         let converged = matches!((improvement, standard_error), (Some(i), Some(se)) if i <= se);
-        if !converged {
-            continue;
+        if converged {
+            let removal = remove(&teacher, &mut student, &mut posterior, &batches, settings)?;
+            log::info!("library removal after epoch {epoch}: {} of {} candidates", removal.removed, removal.candidates);
+            progress.done = removal.removed == 0;
+            progress.removals.push(removal);
+            // The objective changed discretely: convergence is judged afresh.
+            progress.previous = None;
         }
-        let removal = remove(&teacher, &mut student, &mut posterior, &batches, settings)?;
-        log::info!("library removal after epoch {epoch}: {} of {} candidates", removal.removed, removal.candidates);
-        let removed = removal.removed;
-        removals.push(removal);
-        if removed == 0 {
-            break;
-        }
-        // The objective changed discretely: convergence is judged afresh.
-        previous = None;
+        save(&mut progress, &posterior, &mean_moments, &log_sd_moments)?;
     }
-    let objective_bits = removals.last().map_or(f64::NAN, |r| r.after_bits);
+    let objective_bits = progress.removals.last().map_or(f64::NAN, |r| r.after_bits);
     Ok(Fit {
         report: Report {
             settings: settings.clone(),
             training_tokens: tokens,
             groups: explanation.groups.len(),
             parameters,
-            epochs,
-            removals,
             active_groups: posterior.active.iter().filter(|a| **a).count(),
             objective_bits,
-            seconds: started.elapsed().as_secs_f64(),
+            seconds: resumed_seconds + started.elapsed().as_secs_f64(),
+            epochs: progress.epochs,
+            removals: progress.removals,
         },
         posterior,
     })
@@ -839,8 +942,40 @@ fn expected_divergence(teacher: &Teacher, student: &mut Student, posterior: &Pos
     Ok(total)
 }
 
-/// The removal step (module note): the longest prefix of the active groups in increasing divergence
-/// whose removal does not increase `F`.
+/// The longest prefix among those bisection evaluates, out of `candidates`, whose `change` (the
+/// objective's change on removing it) is not positive, or zero. Prefix effects can cancel, so a
+/// longer acceptable prefix may go unevaluated; an increase is never accepted.
+fn largest_accepted_prefix(
+    candidates: usize,
+    change: &mut impl FnMut(usize) -> Result<f64, String>,
+) -> Result<usize, String> {
+    let mut accepted = |k: usize| -> Result<bool, String> {
+        let difference = change(k)?;
+        if !difference.is_finite() {
+            return Err("nonfinite group removal objective".into());
+        }
+        Ok(difference <= 0.)
+    };
+    if candidates == 0 {
+        return Ok(0);
+    }
+    if accepted(candidates)? {
+        return Ok(candidates);
+    }
+    let (mut low, mut high) = (0, candidates);
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        if accepted(middle)? {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    Ok(low)
+}
+
+/// The removal step (module note): a prefix of the active groups in increasing divergence whose
+/// removal does not increase the sampled objective, found by bisection.
 fn remove(teacher: &Teacher, student: &mut Student, posterior: &mut Posterior, batches: &[FamilyInputs], settings: &Settings) -> Result<Removal, String> {
     let divergences = posterior.divergences();
     let mut order: Vec<usize> = (0..divergences.len()).filter(|g| posterior.active[*g]).collect();
@@ -858,19 +993,7 @@ fn remove(teacher: &Teacher, student: &mut Student, posterior: &mut Posterior, b
         evaluations.push((k, c));
         Ok(c)
     };
-    let (mut low, mut high) = (0usize, order.len());
-    if change(high)? <= 0.0 {
-        low = high;
-    } else {
-        while high - low > 1 {
-            let middle = low + (high - low) / 2;
-            if change(middle)? <= 0.0 {
-                low = middle;
-            } else {
-                high = middle;
-            }
-        }
-    }
+    let low = largest_accepted_prefix(order.len(), &mut change)?;
     let after = base + if low > 0 { change(low)? } else { 0.0 };
     posterior.remove(&order[..low]);
     let to_bits = |nats: f64| nats / std::f64::consts::LN_2;
@@ -886,7 +1009,8 @@ fn remove(teacher: &Teacher, student: &mut Student, posterior: &mut Posterior, b
 // ----------------------------------------------------------------------------- the reported artifact
 
 /// The explanation at the posterior mean: each library operator holds `μ`, and the blocks only
-/// removed groups touch are absent (no literals).
+/// removed groups touch are absent (no literals). Partial interface blocks remain
+/// present, so their zeroed entries still cost ordinary serialized literals.
 pub fn posterior_mean(explanation: &Explanation, posterior: &Posterior) -> Result<Artifact, String> {
     let mut artifact = explanation.artifact.clone();
     for ((op, values), membership) in explanation.trainable.iter().zip(posterior.means()).zip(&posterior.membership) {
@@ -962,20 +1086,81 @@ mod tests {
     }
 
     #[test]
-    fn the_starting_library_is_the_native_relu_model() {
-        let (native, layers, family, _) = tiny("library_start", "relu");
-        let explanation = explanation(&native, &layers).unwrap();
-        explanation.artifact.validate_coverage(&native).unwrap();
-        assert_eq!(explanation.artifact.controls.len(), 2, "every MLP keeps its uniform-scale control");
-        assert_eq!(explanation.artifact.blocks.len(), 2 * (2 + 1), "two heads and one MLP per layer");
-        let expected = native.execute(&family, false).unwrap().values[native.output].clone();
-        let actual = explanation.artifact.execute(&family).unwrap().values[explanation.artifact.program.output].clone();
-        let scale = expected.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
-        let difference = expected.iter().zip(&actual).fold(0.0_f64, |a, (x, y)| a.max((x - y).abs()));
-        assert!(difference <= 1e-12 * scale, "the starting library differs from the native model by {difference}");
-        let posterior = Posterior::new(&explanation, 72).unwrap();
-        let cells: usize = explanation.groups.iter().flat_map(|g| &g.cells).map(|c| c.rows.len() * c.cols.len()).sum();
-        assert_eq!(cells, posterior.mean.iter().map(Array2::len).sum::<usize>(), "the groups partition the parameters");
+    fn the_starting_library_preserves_native_activation_and_coefficients() {
+        for law in ["relu", "gelu", "gelu_tanh", "silu"] {
+            let (native, layers, family, _) = tiny(&format!("library_start_{law}"), law);
+            let explanation = explanation(&native, &layers).unwrap();
+            explanation.artifact.validate_coverage(&native).unwrap();
+            assert_eq!(
+                explanation.artifact.controls.len(),
+                2,
+                "every MLP keeps its uniform-scale control"
+            );
+            assert_eq!(
+                explanation.artifact.blocks.len(),
+                2 * (2 + 1),
+                "two heads and one MLP per layer"
+            );
+            let expected = native.execute(&family, false).unwrap().values[native.output].clone();
+            let actual = explanation.artifact.execute(&family).unwrap().values
+                [explanation.artifact.program.output]
+                .clone();
+            let scale = expected.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+            let difference = expected
+                .iter()
+                .zip(&actual)
+                .fold(0.0_f64, |a, (x, y)| a.max((x - y).abs()));
+            assert!(
+                difference <= 1e-12 * scale,
+                "the starting library differs from the native model by {difference}"
+            );
+            let posterior = Posterior::new(&explanation, 72).unwrap();
+            let cells: usize = explanation
+                .groups
+                .iter()
+                .flat_map(|g| &g.cells)
+                .map(|c| c.rows.len() * c.cols.len())
+                .sum();
+            assert_eq!(
+                cells,
+                posterior.mean.iter().map(Array2::len).sum::<usize>(),
+                "the groups partition the parameters"
+            );
+        }
+    }
+
+    #[test]
+    fn removal_search_never_accepts_an_increase_and_stays_logarithmic() {
+        // Three groups contribute +a,-a,b to one logit and the teacher predicts their sum b.
+        // Removing the first pair preserves the prediction; removing the first one or all three
+        // costs more data than the description saves. The objective is not monotone in the
+        // prefix length, so bisection may stop short of the acceptable pair, but it never
+        // accepts a prefix that increases the objective.
+        let contributions = [10_f64, -10., 5.];
+        let teacher_logit = contributions.iter().sum::<f64>();
+        let softplus = |z: f64| z.max(0.) + (-z.abs()).exp().ln_1p();
+        let probability = 1. / (1. + (-teacher_logit).exp());
+        let loss = |logit: f64| {
+            100. * (softplus(logit)
+                - softplus(teacher_logit)
+                - probability * (logit - teacher_logit))
+        };
+        let change = |k: usize| loss(contributions[k..].iter().sum()) - k as f64;
+        assert!(change(1) > 0. && change(2) < 0. && change(3) > 0.);
+        let accepted = largest_accepted_prefix(3, &mut |k| Ok(change(k))).expect("finite prefix objectives");
+        assert!(accepted == 0 || change(accepted) <= 0.);
+        // A monotone boundary is found exactly, in logarithmically many evaluations.
+        for boundary in [0, 1, 517, 999, 1000] {
+            let mut tested = 0;
+            let found = largest_accepted_prefix(1000, &mut |k| {
+                tested += 1;
+                Ok(if k <= boundary { -1. } else { 1. })
+            })
+            .unwrap();
+            assert_eq!(found, boundary);
+            assert!(tested <= 11, "{tested} evaluations for 1000 candidates");
+        }
+        assert!(largest_accepted_prefix(1, &mut |_| Ok(f64::NAN)).is_err());
     }
 
     #[test]
@@ -1043,7 +1228,14 @@ mod tests {
             head_tile_rows: 64,
         };
         let device = Device::host();
-        let fit = fit(&device, &native, &explanation, &sequences, &settings).unwrap();
+        let checkpoint = std::env::temp_dir().join(format!("library_fit_{}.bin", std::process::id()));
+        let fit = fit(&device, &native, &explanation, &sequences, &settings, Some(&checkpoint)).unwrap();
+        // A finished fit's checkpoint resumes to the same posterior without another step.
+        let resumed = super::fit(&device, &native, &explanation, &sequences, &settings, Some(&checkpoint)).unwrap();
+        std::fs::remove_file(&checkpoint).unwrap();
+        assert_eq!(resumed.posterior.active, fit.posterior.active);
+        assert_eq!(resumed.posterior.means(), fit.posterior.means());
+        assert_eq!(resumed.report.epochs.len(), fit.report.epochs.len());
         let report = &fit.report;
         assert_eq!(report.training_tokens, 72);
         assert_eq!(report.removals.last().unwrap().removed, 0, "the fit ends when no removal is accepted");
