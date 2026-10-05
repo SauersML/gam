@@ -1122,41 +1122,54 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
         let (predicted, seed, metric) = library.predicted(&pass)?;
         // Each drawn target's prediction alone: the reverse pass from its row of the seed over the
         // sequence up to it, each function's attribution summed over the positions it acts at.
+        let mut picks = Vec::new();
         for s in 0..batch.len() {
             let mut positions: Vec<usize> = (0..length).collect();
             for j in 0..settings.targets.min(length) {
                 let pick = rng.random_range(j..length);
                 positions.swap(j, pick);
             }
-            for &t in &positions[..settings.targets.min(length)] {
-                let (row, id) = (s * length + t, first_row + s * length + t);
+            picks.extend(positions[..settings.targets.min(length)].iter().map(|&t| (s, t)));
+        }
+        // The targets' reverse passes run in parallel; each returns its cuts' attributions summed
+        // over positions (as an MLP's index or a layer's, with its heads).
+        let targets: Vec<(usize, f64, Vec<(bool, usize, Array1<f64>)>)> = picks
+            .par_iter()
+            .map(|&(s, t)| {
+                let row = s * length + t;
                 let prefix = pass.prefix(s, length, t + 1);
                 let mut target_seed = Array2::<f64>::zeros((t + 1, seed.ncols()));
                 target_seed.row_mut(t).assign(&seed.row(row));
-                let m = metric[row];
-                samples += 1.0;
+                let mut cuts = Vec::new();
                 library.relp(&prefix, target_seed, None, false, &mut |visit| {
-                    let totals = visit.attribution.sum_axis(Axis(0));
-                    let index = match visit.cut {
-                        Cut::Mlp(b) => {
-                            mlp_stats[b].iter_mut().zip(&totals).for_each(|(stat, a)| stat.relp.add(k, *a, m, thresholds, id));
-                            2 * mlps[b].layer + 1
-                        }
-                        Cut::Heads(l, members) => {
-                            for (h, a) in members.iter().zip(&totals) {
-                                head_stats[*h].relp.add(k, *a, m, thresholds, id);
-                            }
-                            2 * l
-                        }
+                    let (mlp, index) = match visit.cut {
+                        Cut::Mlp(b) => (true, b),
+                        Cut::Heads(l, _) => (false, l),
                     };
-                    let (absolute, square) = totals.iter().fold((0.0, 0.0), |(a, q), v| (a + v.abs(), q + v * v));
-                    if square > 0.0 {
-                        cut_participation[index] += absolute * absolute / square;
-                    }
-                    for (count, tau) in cut_counts[index].iter_mut().zip(thresholds) {
-                        *count += totals.iter().filter(|v| v.abs() > tau * m.abs()).count() as f64;
-                    }
+                    cuts.push((mlp, index, visit.attribution.sum_axis(Axis(0))));
                 });
+                (first_row + row, metric[row], cuts)
+            })
+            .collect();
+        for (id, m, cuts) in targets {
+            samples += 1.0;
+            for (mlp, index, totals) in cuts {
+                let cut = if mlp {
+                    mlp_stats[index].iter_mut().zip(&totals).for_each(|(stat, a)| stat.relp.add(k, *a, m, thresholds, id));
+                    2 * mlps[index].layer + 1
+                } else {
+                    for (h, a) in library.layer_heads[index].iter().zip(&totals) {
+                        head_stats[*h].relp.add(k, *a, m, thresholds, id);
+                    }
+                    2 * index
+                };
+                let (absolute, square) = totals.iter().fold((0.0, 0.0), |(a, q), v| (a + v.abs(), q + v * v));
+                if square > 0.0 {
+                    cut_participation[cut] += absolute * absolute / square;
+                }
+                for (count, tau) in cut_counts[cut].iter_mut().zip(thresholds) {
+                    *count += totals.iter().filter(|v| v.abs() > tau * m.abs()).count() as f64;
+                }
             }
         }
         logit_sum += metric.iter().sum::<f64>();
@@ -1532,6 +1545,42 @@ pub struct FunctionCost {
     pub divergence_bits: f64,
     pub bits: f64,
     pub parts: BTreeMap<String, f64>,
+}
+
+/// The posterior of a `library_mdl` fit checkpoint of `explanation`: the checkpoint is the fit's
+/// progress as JSON after its length, then per trainable operator its `μ`, `ln σ` and four
+/// optimizer arrays as little-endian float64.
+pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Posterior, String> {
+    let bytes = std::fs::read(path).map_err(error)?;
+    let length = u64::from_le_bytes(bytes.get(..8).ok_or("a truncated checkpoint")?.try_into().map_err(error)?) as usize;
+    let header: serde_json::Value = serde_json::from_slice(bytes.get(8..8 + length).ok_or("a truncated checkpoint")?).map_err(error)?;
+    let tokens = header["tokens"].as_u64().ok_or("a checkpoint without its tokens")? as usize;
+    let mut posterior = Posterior::new(explanation, tokens)?;
+    let shapes: Vec<(usize, usize)> = serde_json::from_value(header["shapes"].clone()).map_err(error)?;
+    let active: Vec<bool> = serde_json::from_value(header["active"].clone()).map_err(error)?;
+    if shapes != posterior.mean.iter().map(Array2::dim).collect::<Vec<_>>() || active.len() != posterior.active.len() {
+        return Err(format!("{}: a checkpoint of another explanation", path.display()));
+    }
+    let count: usize = shapes.iter().map(|(r, c)| r * c * 6).sum();
+    if bytes.len() != 8 + length + count * 8 {
+        return Err(format!("{}: a checkpoint of the wrong size", path.display()));
+    }
+    let mut at = 8 + length;
+    let mut next = |dim: (usize, usize)| {
+        let n = dim.0 * dim.1;
+        let values: Vec<f64> = bytes[at..at + 8 * n].chunks_exact(8).map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])).collect();
+        at += 8 * n;
+        Array2::from_shape_vec(dim, values).map_err(error)
+    };
+    for (i, dim) in shapes.iter().enumerate() {
+        posterior.mean[i] = next(*dim)?;
+        posterior.log_sd[i] = next(*dim)?;
+        for _ in 0..4 {
+            next(*dim)?;
+        }
+    }
+    posterior.active = active;
+    Ok(posterior)
 }
 
 /// Per layer and kind of function (`L{l}.heads`, `L{l}.mlp`), what `posterior`'s groups of it cost
