@@ -7,7 +7,7 @@ use crate::{
     device_program::DeviceProgram,
     operator_program::{FamilyInputs, Node, OperatorBody, OperatorProgram},
 };
-use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
+use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, Storage, Tensor};
 use ndarray::Array2;
 use std::sync::{Arc, Mutex};
 fn error(e: impl std::fmt::Display) -> String {
@@ -361,6 +361,8 @@ pub(crate) struct ResidentHead {
     pub embedding: Tensor,
     pub ones: Tensor,
     pub tile_rows: usize,
+    /// The hidden width as one column block (row dots).
+    width: ColumnBlocks,
 }
 impl ResidentHead {
     pub fn new(d: &Device, head: &Head, tile_rows: usize) -> Result<Self, String> {
@@ -370,6 +372,9 @@ impl ResidentHead {
                 .upload(Array2::ones((head.embedding.ncols(), 1)).view())
                 .map_err(error)?,
             tile_rows,
+            width: d
+                .column_blocks(&[head.embedding.ncols()])
+                .map_err(error)?,
         })
     }
     /// Per-row compact KL; with `gradient`, the hidden seed. Logit and seed products run in
@@ -382,6 +387,9 @@ impl ResidentHead {
         gradient: bool,
         arithmetic: Arithmetic,
     ) -> Result<(Vec<f64>, Option<Tensor>), String> {
+        if hidden.storage() == Storage::F32 {
+            return self.swept(d, hidden, target, gradient, arithmetic);
+        }
         let mut losses = Vec::with_capacity(hidden.rows());
         let mut seed = if gradient {
             Some(d.zeros(hidden.rows(), hidden.cols()).map_err(error)?)
@@ -464,6 +472,63 @@ impl ResidentHead {
                 // Target creation masks BOTH p and q, so unscored projected seeds are zero.
                 d.set_rows(seed, start, &projected).map_err(error)?;
             }
+        }
+        Ok((losses, seed))
+    }
+    /// [`Self::score`] in f32 storage: the vocabulary is swept without forming the logits
+    /// ([`Device::head_log_partition`]), which also returns the seed's `E^T q`.
+    fn swept(
+        &self,
+        d: &Device,
+        hidden: &Tensor,
+        target: &Target,
+        gradient: bool,
+        arithmetic: Arithmetic,
+    ) -> Result<(Vec<f64>, Option<Tensor>), String> {
+        let flags = target
+            .scored
+            .as_ref()
+            .map(|s| d.upload_indices(&s.iter().map(|v| u32::from(*v)).collect::<Vec<_>>()))
+            .transpose()
+            .map_err(error)?;
+        let mut seed = if gradient {
+            Some(d.zeros(hidden.rows(), hidden.cols()).map_err(error)?)
+        } else {
+            None
+        };
+        let partitions = d
+            .head_log_partition(
+                hidden,
+                &self.embedding,
+                false,
+                flags.as_ref(),
+                seed.as_mut(),
+                arithmetic,
+            )
+            .map_err(error)?;
+        let dots = d
+            .download(
+                &d.block_products(hidden, &target.mu, &self.width)
+                    .map_err(error)?,
+            )
+            .map_err(error)?;
+        let losses = (0..hidden.rows())
+            .map(|r| {
+                let loss = if target.scored.as_ref().is_some_and(|s| !s[r]) {
+                    0.
+                } else {
+                    partitions[r] - dots[(r, 0)] + target.entropy[r]
+                };
+                if loss.is_finite() {
+                    Ok(loss)
+                } else {
+                    Err("nonfinite compact head KL".to_string())
+                }
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if let Some(seed) = &mut seed {
+            // Unscored rows of both E^T q and mu are zero.
+            d.axpy(seed, -1., &target.mu).map_err(error)?;
         }
         Ok((losses, seed))
     }

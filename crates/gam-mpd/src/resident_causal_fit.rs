@@ -15,7 +15,7 @@ use crate::{
     },
 };
 use gam_gpu::{
-    tensor::{Arithmetic, ColumnBlocks, Device, Indices, Storage, Tensor},
+    tensor::{Arithmetic, ColumnBlocks, Device, Indices, Op, Storage, Tensor},
     trace,
 };
 use ndarray::{Array2, Axis};
@@ -1065,9 +1065,61 @@ impl<'a> View<'a> {
         }
     }
 }
+/// The fixed head through which a full-logit fit's proposals can use compact statistics: an
+/// untrainable bias-free dense head whose logits no response target reads.
+fn proposal_head(r: &Resident, trainable: &[usize]) -> Option<Head> {
+    if !r
+        .batches
+        .iter()
+        .all(|b| matches!(b.target, ResidentTarget::Logits(_)))
+    {
+        return None;
+    }
+    let head = Head::of(&r.executable).ok()?;
+    let read = r
+        .episodes
+        .iter()
+        .flat_map(|e| &e.responses)
+        .all(|t| t.node <= head.hidden);
+    (read && !trainable.contains(&head.operator)).then_some(head)
+}
+/// Compact labels of teacher logits in F64, once per fit: per row `mu = p E` and
+/// `c = sum p log p` (unscored rows zero), `mu` narrowed into `n`'s storage.
+fn compact_labels(
+    d: &Device,
+    n: &Device,
+    logits: &Tensor,
+    flags: Option<&Indices>,
+    scored: Option<Vec<bool>>,
+    (head, embedding): (&Arc<Head>, &Tensor),
+) -> Result<Target, String> {
+    let mut probabilities = d.copy(logits).map_err(error)?;
+    let stats = d
+        .softmax_stats_rows(&mut probabilities, flags)
+        .map_err(error)?;
+    let mut mu = d.zeros(logits.rows(), embedding.cols()).map_err(error)?;
+    d.gemm(
+        &mut mu,
+        1.,
+        &probabilities,
+        Op::N,
+        embedding,
+        Op::N,
+        0.,
+        Arithmetic::F64,
+    )
+    .map_err(error)?;
+    Ok(Target {
+        mu: Arc::new(n.convert(&mu).map_err(error)?),
+        entropy: stats.iter().map(|s| s[1]).collect(),
+        head: head.clone(),
+        scored,
+    })
+}
 /// F32-storage copies of the program, batches and response targets for F32/TF32 proposals, or
 /// none when the device holds only F64 (the host then rounds just the products' operands).
-/// The program's numeric plan is checked before anything is converted.
+/// A full-logit fit through a fixed head proposes on the head's input with compact labels, so
+/// its proposals never form logits. The numeric plan is checked before anything is converted.
 fn narrow_copies(
     d: &Device,
     p: &DeviceProgram,
@@ -1083,35 +1135,57 @@ fn narrow_copies(
     let Ok(n) = d.with_storage(Storage::F32) else {
         return Ok((None, planned));
     };
-    // Halved operator, input, target and response buffers, plus one f32 head.
+    let compact = proposal_head(r, trainable);
+    // Halved operator, input, target and response buffers; for compact proposals one f64
+    // batch of probabilities, its labels and the f64 head while labels are made.
     let mut bytes = p.operator_numeric_bytes()? / 2;
+    let mut transient = 0usize;
     for b in &r.batches {
         for x in b.raw.values() {
             bytes = add(bytes, mul(x.len(), 4)?)?;
         }
         bytes = add(
             bytes,
-            match &b.target {
-                ResidentTarget::Logits(t) => mul(t.len(), 4)?,
-                ResidentTarget::Fixed { target, .. } => add(
-                    mul(target.mu.len(), 4)?,
-                    mul(target.head.embedding.len(), 4)?,
-                )?,
+            match (&b.target, &compact) {
+                (ResidentTarget::Logits(t), Some(head)) => {
+                    let mu = mul(t.rows(), head.embedding.ncols())?;
+                    transient = transient.max(add(mul(t.len(), 8)?, mul(mu, 8)?)?);
+                    mul(mu, 4)?
+                }
+                (ResidentTarget::Logits(t), None) => mul(t.len(), 4)?,
+                (ResidentTarget::Fixed { target, .. }, _) => mul(target.mu.len(), 4)?,
             },
         )?;
+    }
+    if let Some(head) = &compact {
+        bytes = add(bytes, mul(head.embedding.len(), 4)?)?;
+        transient = add(transient, mul(head.embedding.len(), 8)?)?;
+    } else if let Some(ResidentTarget::Fixed { target, .. }) = r.batches.first().map(|b| &b.target) {
+        bytes = add(bytes, mul(target.head.embedding.len(), 4)?)?;
     }
     for t in r.episodes.iter().flat_map(|e| &e.responses) {
         bytes = add(bytes, mul(t.target.len(), 8)?)?;
     }
-    let planned = add(planned, bytes)?;
+    let planned = add(planned, add(bytes, transient)?)?;
     if planned > limit {
         return Err(format!(
             "f32 proposal numeric plan {planned} exceeds {limit}"
         ));
     }
-    let mut program = DeviceProgram::compile_values_bounded(&n, &r.executable, limit)?;
+    let executable = compact
+        .as_ref()
+        .map_or_else(|| r.executable.clone(), |head| head.prefix(&r.executable));
+    let mut program = DeviceProgram::compile_values_bounded(&n, &executable, limit)?;
     program.prepare_dense_parameters(trainable)?;
-    let mut head: Option<Arc<ResidentHead>> = None;
+    let rows = r.batches.iter().map(|b| b.family.rows).max().unwrap_or(1);
+    let compact = compact
+        .map(|head| {
+            let embedding = d.upload(head.embedding.view()).map_err(error)?;
+            let resident = Arc::new(ResidentHead::new(&n, &head, rows)?);
+            Ok::<_, String>((Arc::new(head), embedding, resident))
+        })
+        .transpose()?;
+    let mut shared: Option<Arc<ResidentHead>> = None;
     let mut batches = Vec::with_capacity(r.batches.len());
     for b in &r.batches {
         let raw = b
@@ -1119,20 +1193,35 @@ fn narrow_copies(
             .iter()
             .map(|(slot, x)| Ok((*slot, n.convert(x).map_err(error)?)))
             .collect::<Result<_, String>>()?;
-        let target = match &b.target {
-            ResidentTarget::Logits(t) => ResidentTarget::Logits(n.convert(t).map_err(error)?),
-            ResidentTarget::Fixed { target, head: exact } => {
-                let shared = match &head {
-                    Some(shared) => shared.clone(),
+        let target = match (&b.target, &compact) {
+            (ResidentTarget::Logits(t), Some((head, embedding, resident))) => {
+                let masks = b
+                    .members
+                    .iter()
+                    .map(|i| (r.episodes[*i].scored_mask.as_ref(), r.episodes[*i].family.rows));
+                let scored = masks.clone().any(|(m, _)| m.is_some()).then(|| {
+                    masks
+                        .flat_map(|(m, rows)| m.cloned().unwrap_or_else(|| vec![true; rows]))
+                        .collect()
+                });
+                ResidentTarget::Fixed {
+                    target: compact_labels(d, &n, t, b.flags.as_ref(), scored, (head, embedding))?,
+                    head: resident.clone(),
+                }
+            }
+            (ResidentTarget::Logits(t), None) => ResidentTarget::Logits(n.convert(t).map_err(error)?),
+            (ResidentTarget::Fixed { target, head: exact }, _) => {
+                let head = match &shared {
+                    Some(head) => head.clone(),
                     None => Arc::new(ResidentHead::new(&n, &target.head, exact.tile_rows)?),
                 };
-                head = Some(shared.clone());
+                shared = Some(head.clone());
                 ResidentTarget::Fixed {
                     target: Target {
                         mu: Arc::new(n.convert(&target.mu).map_err(error)?),
                         ..target.clone()
                     },
-                    head: shared,
+                    head,
                 }
             }
         };
@@ -2733,33 +2822,42 @@ mod tests {
     }
     #[test]
     fn proposal_arithmetic_and_exact_cadence_keep_exact_checkpoints() {
-        let source = program(true, 0.4);
-        let teacher = program(true, 1.1);
-        let episodes = (0..3)
-            .map(|i| {
-                episode(
-                    &source,
-                    &teacher,
-                    &format!("episode{i}"),
-                    if i == 0 { "first" } else { "second" },
-                    ndarray::array![[2. + i as f64 * 0.3, 0.2], [-1., 0.6], [0.1, 0.4]],
-                    None,
-                    Some(vec![false, true, true]),
-                )
-            })
-            .collect::<Vec<_>>();
-        // The host rounds only product operands; CUDA proposals run in f32 storage.
+        // The host rounds only product operands; CUDA proposals run in f32 storage, through
+        // compact head statistics when a fixed head ends the graph.
         let mut devices = vec![Device::host()];
         if let Some(device) = Device::accelerator(gam_gpu::GpuPolicy::Auto).expect("device probe")
             && device.float64()
         {
             devices.push(device);
         }
-        for d in devices {
-            let exact = fit(&d, &source, &episodes, &[0], settings()).unwrap();
+        let graphs = [
+            (program(true, 0.4), program(true, 1.1)),
+            (
+                with_fixed_head(program(true, 0.4), 1.),
+                with_fixed_head(program(true, 1.1), 1.),
+            ),
+        ];
+        for (d, (source, teacher)) in devices
+            .iter()
+            .flat_map(|d| graphs.iter().map(move |g| (d.clone(), g)))
+        {
+            let episodes = (0..3)
+                .map(|i| {
+                    episode(
+                        source,
+                        teacher,
+                        &format!("episode{i}"),
+                        if i == 0 { "first" } else { "second" },
+                        ndarray::array![[2. + i as f64 * 0.3, 0.2], [-1., 0.6], [0.1, 0.4]],
+                        None,
+                        Some(vec![false, true, true]),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let exact = fit(&d, source, &episodes, &[0], settings()).unwrap();
             let fast = fit(
                 &d,
-                &source,
+                source,
                 &episodes,
                 &[0],
                 Settings {
