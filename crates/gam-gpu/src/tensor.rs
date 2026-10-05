@@ -3255,10 +3255,8 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         /// The row flags of a call that scores every row (never read).
         every_row: CudaSlice<u32>,
         gemm_workspace: std::sync::Mutex<F32Workspace>,
-        /// Whether the stream is being captured into a graph, and the context's event tracking
-        /// before the capture switched it off.
+        /// Whether the stream is being captured into a graph.
         capturing: AtomicBool,
-        tracking: AtomicBool,
         /// cuBLAS's workspace inside captures (a recorded product may not allocate), kept for the
         /// engine's life since every graph's products read it.
         capture_workspace: std::sync::Mutex<Option<CudaSlice<u8>>>,
@@ -3417,8 +3415,16 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
     impl Engine {
         pub(super) fn new(ordinal: usize, name: String) -> Result<Self, GpuError> {
-            let ctx = crate::device_runtime::cuda_context_for(ordinal)
+            // The shared context settles the driver, binds the device and touches the runtime.
+            crate::device_runtime::cuda_context_for(ordinal)
                 .ok_or_else(|| GpuError::DriverCallFailed { reason: format!("no CUDA context for device {ordinal}") })?;
+            // The engine's own handle on the device's primary context: every buffer it makes lives
+            // on its one stream, so cudarc's cross-stream bookkeeping (two events made per buffer,
+            // a wait and a record per kernel argument, a wait per free) is pure host cost, off on
+            // this handle and only here. It also leaves nothing to keep out of a graph capture.
+            let ctx = CudaContext::new(ordinal).gpu_ctx("tensor context")?;
+            // SAFETY: this handle's buffers are used on the engine's stream alone.
+            unsafe { ctx.disable_event_tracking() };
             let stream = ctx.new_stream().gpu_ctx("tensor stream")?;
             let blas = CudaBlas::new(stream.clone()).gpu_ctx("tensor cuBLAS handle")?;
             static MODULE: crate::device_cache::PtxModuleCache = crate::device_cache::PtxModuleCache::new();
@@ -3436,7 +3442,6 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                 every_row,
                 gemm_workspace: std::sync::Mutex::new(F32Workspace::default()),
                 capturing: AtomicBool::new(false),
-                tracking: AtomicBool::new(true),
                 capture_workspace: std::sync::Mutex::new(None),
             })
         }
@@ -3449,10 +3454,8 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             self.stream.synchronize().gpu_ctx("tensor synchronize")
         }
 
-        /// Starts a capture. A recorded operation may wait on no event recorded outside it, and
-        /// an event it records could not be waited on after: so the context's event tracking
-        /// (cudarc's cross-stream bookkeeping, needless on this one stream) is off meanwhile and
-        /// buffer reads record nothing ([`Engine::quiet`]); cuBLAS gets a workspace of its own.
+        /// Starts a capture (no event is waited on or recorded, the engine's handle tracking none);
+        /// cuBLAS gets a workspace of its own, since a recorded product may not allocate one.
         pub(super) fn begin_capture(&self) -> Result<(), GpuError> {
             if self.capturing.load(Ordering::Acquire) {
                 return Err(shape("a capture is already open".to_string()));
@@ -3468,10 +3471,6 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             unsafe { cudarc::cublas::sys::cublasSetWorkspace_v2(*self.blas.handle(), pointer as *mut _, CAPTURE_WORKSPACE) }
                 .result()
                 .gpu_ctx("tensor capture cuBLAS workspace")?;
-            self.tracking.store(self.ctx.is_event_tracking(), Ordering::Release);
-            // SAFETY: while capturing, this stream is the context's only user (the public
-            // contract), so no cross-stream synchronization is lost.
-            unsafe { self.ctx.disable_event_tracking() };
             self.capturing.store(true, Ordering::Release);
             // Relaxed: allocations (a temporary's) may be recorded; the stream is this thread's.
             let started = self.stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED).gpu_ctx("tensor graph capture");
@@ -3493,26 +3492,11 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             graph.gpu_ctx("tensor graph instantiate")?.ok_or_else(|| shape("an empty capture records no graph".to_string()))
         }
 
-        /// Event tracking back as it was, and cuBLAS back on its own workspace pool (resetting
-        /// its stream does that).
+        /// cuBLAS back on its own workspace pool (resetting its stream does that).
         fn restore_after_capture(&self) -> Result<(), GpuError> {
             self.capturing.store(false, Ordering::Release);
-            if self.tracking.load(Ordering::Acquire) {
-                // SAFETY: tracking returns for the buffers made from here on, as before the capture.
-                unsafe { self.ctx.enable_event_tracking() };
-            }
             // SAFETY: the handle is this engine's, bound to this stream since its creation.
             unsafe { cudarc::cublas::result::set_stream(*self.blas.handle(), self.stream.cu_stream() as _) }.gpu_ctx("tensor cuBLAS workspace reset")
-        }
-
-        /// A buffer use's record, emptied while capturing: an event recorded inside a capture
-        /// could not be waited on outside it, and the stream orders the graph's work anyway.
-        fn quiet(&self, record: &mut SyncOnDrop<'_>) {
-            if self.capturing.load(Ordering::Acquire)
-                && let SyncOnDrop::Record(target) = record
-            {
-                *target = None;
-            }
         }
 
         /// Refuses a host transfer while capturing: the graph would replay it against host memory
@@ -3582,19 +3566,13 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         pub(super) fn copy<T: DeviceRepr + ValidAsZeroBits>(&self, slice: &CudaSlice<T>) -> Result<CudaSlice<T>, GpuError> {
             let mut out = self.stream.alloc_zeros::<T>(slice.len().max(1)).gpu_ctx("tensor alloc")?;
-            if self.capturing.load(Ordering::Acquire) {
-                self.captured_copy(slice, 0, &mut out, 0, slice.len())?;
-                return Ok(out);
-            }
             self.stream.memcpy_dtod(slice, &mut out).gpu_ctx("tensor copy")?;
             Ok(out)
         }
 
         pub(super) fn copy_range<T: DeviceRepr + ValidAsZeroBits>(&self, slice: &CudaSlice<T>, lo: usize, hi: usize) -> Result<CudaSlice<T>, GpuError> {
             let mut out = self.stream.alloc_zeros::<T>((hi - lo).max(1)).gpu_ctx("tensor alloc")?;
-            if hi > lo && self.capturing.load(Ordering::Acquire) {
-                self.captured_copy(slice, lo, &mut out, 0, hi - lo)?;
-            } else if hi > lo {
+            if hi > lo {
                 self.stream.memcpy_dtod(&slice.slice(lo..hi), &mut out).gpu_ctx("tensor row copy")?;
             }
             Ok(out)
@@ -3602,25 +3580,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         pub(super) fn write_range<T>(&self, slice: &mut CudaSlice<T>, lo: usize, part: &CudaSlice<T>) -> Result<(), GpuError> {
             let n = part.len();
-            if self.capturing.load(Ordering::Acquire) {
-                return self.captured_copy(part, 0, slice, lo, n);
-            }
             self.stream.memcpy_dtod(part, &mut slice.slice_mut(lo..lo + n)).gpu_ctx("tensor row write")
-        }
-
-        /// `count` values of `source` from `from` into `target` from `to`, recording no event (a
-        /// copy inside a capture).
-        fn captured_copy<T>(&self, source: &CudaSlice<T>, from: usize, target: &mut CudaSlice<T>, to: usize, count: usize) -> Result<(), GpuError> {
-            let size = std::mem::size_of::<T>();
-            let (pointer, mut read) = source.device_ptr(&self.stream);
-            self.quiet(&mut read);
-            let (destination, mut write) = target.device_ptr_mut(&self.stream);
-            self.quiet(&mut write);
-            // SAFETY: both ranges lie inside their buffers (the callers' bounds).
-            unsafe {
-                cudarc::driver::result::memcpy_dtod_async(destination + (to * size) as u64, pointer + (from * size) as u64, count * size, self.stream.cu_stream())
-            }
-            .gpu_ctx("tensor captured copy")
         }
 
         /// `t` in the other storage, on the device: rounded to nearest to f32, exactly to float64.
@@ -3719,31 +3679,6 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             };
             let per = |t: &Tensor| ((t.rows / batch) * t.cols) as i64;
             let (stride_a, stride_b, stride_c) = (per(b), per(a), per(c));
-            if arithmetic == Arithmetic::F64 && self.capturing.load(Ordering::Acquire) {
-                // cudarc's product would record its operands' events inside the capture: the same
-                // cuBLAS call on quieted pointers.
-                let (bs, as_) = (slice(b)?, slice(a)?);
-                let (pb, mut rb) = bs.device_ptr(&self.stream);
-                let (pa, mut ra) = as_.device_ptr(&self.stream);
-                let (pc, mut rc) = slice_mut(c)?.device_ptr_mut(&self.stream);
-                self.quiet(&mut rb);
-                self.quiet(&mut ra);
-                self.quiet(&mut rc);
-                let handle = *self.blas.handle();
-                // SAFETY: as below, on the same operands.
-                unsafe {
-                    if batch == 1 {
-                        cudarc::cublas::result::dgemm(handle, op_of(tb), op_of(ta), dims.0, dims.1, dims.2, &alpha, pb as *const _, leading.0, pa as *const _, leading.1, &beta, pc as *mut _, leading.2)
-                    } else {
-                        cudarc::cublas::result::dgemm_strided_batched(
-                            handle, op_of(tb), op_of(ta), dims.0, dims.1, dims.2, &alpha, pb as *const _, leading.0, stride_a,
-                            pa as *const _, leading.1, stride_b, &beta, pc as *mut _, leading.2, stride_c, i32_of(batch)?,
-                        )
-                    }
-                }
-                .gpu_ctx("tensor captured DGEMM")?;
-                return Ok(());
-            }
             if arithmetic != Arithmetic::F64 && self.capturing.load(Ordering::Acquire) {
                 return Err(GpuError::NoDeviceKernel { reason: "a lowered float64-storage product is not capturable: capture in f32 storage".to_string() });
             }
@@ -3920,12 +3855,9 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let (alpha, beta) = g.scale;
             let real = cudaDataType_t::CUDA_R_32F;
             // Element offsets reach into a buffer (a vocabulary chunk's head rows, say).
-            let (pa, type_a, mut record_a) = pointer(g.a.0, g.a.1, &self.stream);
-            let (pb, type_b, mut record_b) = pointer(g.b.0, g.b.1, &self.stream);
-            let (pc, mut record_c) = g.c.0.device_ptr_mut(&self.stream);
-            self.quiet(&mut record_a);
-            self.quiet(&mut record_b);
-            self.quiet(&mut record_c);
+            let (pa, type_a, record_a) = pointer(g.a.0, g.a.1, &self.stream);
+            let (pb, type_b, record_b) = pointer(g.b.0, g.b.1, &self.stream);
+            let (pc, record_c) = g.c.0.device_ptr_mut(&self.stream);
             let pc = pc + 4 * g.c.1 as u64;
             // SAFETY: the caller checked every operand's shape, offset and leading dimension
             // against (m, n, k) and the buffers' lengths; the pointers outlive the call (their
