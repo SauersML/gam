@@ -13,9 +13,11 @@ use gam_mpd::{
         OperatorProgram, Slot, SlotValues,
     },
     parameter_response_program,
+    resident_rule_fit::{self, BatchSchedule, OutputGroup},
     run_check::{layer_nodes, split_sites},
 };
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Axis};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{path::Path, sync::Arc, time::Instant};
@@ -30,6 +32,17 @@ struct Settings {
     absolute_tolerance: f64,
     directions: Vec<DeclaredDirection>,
     amplitudes: Vec<Vec<f64>>,
+    #[serde(default)]
+    fitting: Option<Fitting>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Fitting {
+    training_sequences: usize,
+    seed: u64,
+    relative_perturbation: f64,
+    optimizer: resident_rule_fit::Settings,
+    batch: BatchSchedule,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -163,6 +176,199 @@ fn maximum_error(a: &Array2<f64>, b: &Array2<f64>) -> Result<f64, String> {
         .map(|(a, b)| (a - b).abs())
         .fold(0., f64::max))
 }
+fn sequence_split(family: &FamilyInputs, count: usize) -> Result<(Vec<usize>, Vec<usize>), String> {
+    let layout = family
+        .layout
+        .as_ref()
+        .ok_or("fitting requires sequence layout")?;
+    if layout.sequence.len() != family.rows || layout.position.len() != family.rows {
+        return Err("sequence layout does not cover native rows".into());
+    }
+    let sequences = layout
+        .sequence
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if count == 0 || count >= sequences.len() {
+        return Err(
+            "training_sequences must leave complete nonempty training and validation sequences"
+                .into(),
+        );
+    }
+    let train = sequences
+        .into_iter()
+        .take(count)
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok((0..family.rows).partition(|row| train.contains(&layout.sequence[*row])))
+}
+fn initialized(
+    native: &OperatorProgram,
+    trainable: &[usize],
+    seed: u64,
+    perturbation: Option<f64>,
+) -> Result<OperatorProgram, String> {
+    let mut candidate = native.clone();
+    let mut rng = StdRng::seed_from_u64(seed);
+    for &id in trainable {
+        let mut op = (*candidate.operators[id]).clone();
+        let OperatorBody::Dense {
+            values, precision, ..
+        } = &mut op.body
+        else {
+            return Err("initialization requires dense native parameters".into());
+        };
+        let rms = (values.iter().map(|v| v * v).sum::<f64>() / values.len() as f64).sqrt();
+        let scale = perturbation.map_or((values.ncols() as f64).sqrt().recip(), |p| {
+            p * if rms > 0. {
+                rms
+            } else {
+                (values.ncols() as f64).sqrt().recip()
+            }
+        });
+        for value in values.iter_mut() {
+            let noise = rng.random_range(-3f64.sqrt()..3f64.sqrt());
+            *value = if perturbation.is_some() {
+                *value + scale * noise
+            } else if id >= 2 {
+                0.
+            } else {
+                scale * noise
+            };
+        }
+        *precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
+        candidate.operators[id] = Arc::new(op);
+    }
+    Ok(candidate)
+}
+// Frozen TRAIN RMS denominators; validation cannot redefine the metric or choose a snapshot.
+fn frozen_errors(
+    device: &Device,
+    program: &OperatorProgram,
+    x: &Array2<f64>,
+    y: &Array2<f64>,
+    scales: &[resident_rule_fit::GroupScale],
+    settings: &resident_rule_fit::Settings,
+) -> Result<Vec<f64>, String> {
+    let resident = DeviceProgram::compile_values_bounded(device, program, settings.numeric_bytes)?;
+    let mut maxima = vec![0f64; scales.len()];
+    for start in (0..x.nrows()).step_by(settings.forward_rows) {
+        let end = (start + settings.forward_rows).min(x.nrows());
+        let inputs = FamilyInputs {
+            rows: end - start,
+            layout: None,
+            slots: vec![SlotValues::Raw(
+                x.slice(ndarray::s![start..end, ..]).to_owned(),
+            )],
+        };
+        let trace = resident.forward(&inputs)?;
+        let prediction = device
+            .download(trace.value(program.output)?)
+            .map_err(|e| e.to_string())?;
+        for (i, scale) in scales.iter().enumerate() {
+            for row in 0..prediction.nrows() {
+                let norm = (scale.group.start..scale.group.end)
+                    .map(|col| (prediction[(row, col)] - y[(start + row, col)]).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+                    / scale.native_rms;
+                if !norm.is_finite() {
+                    return Err("nonfinite frozen-scale diagnostic".into());
+                }
+                maxima[i] = maxima[i].max(norm);
+            }
+        }
+    }
+    Ok(maxima)
+}
+fn fit_diagnostic(
+    device: &Device,
+    function: &OperatorProgram,
+    responses: &[usize],
+    parent: &Array2<f64>,
+    train: &[usize],
+    valid: &[usize],
+    settings: &Fitting,
+    out: &Path,
+) -> Result<Value, String> {
+    let mut teacher = function.clone();
+    let width = teacher
+        .node_interface(3)
+        .map_err(|e| e.to_string())?
+        .width();
+    teacher.output = teacher.nodes.len();
+    teacher.nodes.push(Node::Concat {
+        parts: std::iter::once(3)
+            .chain(responses.iter().copied())
+            .collect(),
+    });
+    let resident =
+        DeviceProgram::compile_values_bounded(device, &teacher, settings.optimizer.numeric_bytes)?;
+    let inputs = FamilyInputs {
+        rows: parent.nrows(),
+        layout: None,
+        slots: vec![SlotValues::Raw(parent.clone())],
+    };
+    let trace = resident.forward(&inputs)?;
+    let target = device
+        .download(trace.value(teacher.output)?)
+        .map_err(|e| e.to_string())?;
+    drop(trace);
+    drop(resident);
+    let train_x = parent.select(Axis(0), train);
+    let valid_x = parent.select(Axis(0), valid);
+    let train_y = target.select(Axis(0), train);
+    let valid_y = target.select(Axis(0), valid);
+    let mut groups = vec![OutputGroup {
+        label: "clean".into(),
+        start: 0,
+        end: width,
+    }];
+    groups.extend((0..responses.len()).map(|i| OutputGroup {
+        label: format!("response{i}"),
+        start: width + i,
+        end: width + i + 1,
+    }));
+    // Native reader/writer/biases only. Supplied hidden response readers stay fixed.
+    let trainable = (0..teacher.operators.len() - responses.len()).collect::<Vec<_>>();
+    let mut reports = Vec::new();
+    for (label, perturbation) in [
+        ("perturbed_native", Some(settings.relative_perturbation)),
+        ("independent", None),
+    ] {
+        let candidate = initialized(&teacher, &trainable, settings.seed, perturbation)?;
+        let fit = resident_rule_fit::fit_grouped_batched(
+            device,
+            &candidate,
+            std::slice::from_ref(&train_x),
+            &train_y,
+            std::slice::from_ref(&valid_x),
+            &valid_y,
+            &groups,
+            &trainable,
+            settings.optimizer.clone(),
+            settings.batch.clone(),
+        )?;
+        let scales = &fit.report.training_scales;
+        let mut measurements = Vec::new();
+        for (stage, program) in [("initial", &candidate), ("best", &fit.program)] {
+            let bytes = Artifact::native(program)?.to_bytes()?;
+            let decoded = Artifact::from_bytes(&bytes, &program.declarations)?;
+            let path = out.join(format!("{label}-{stage}.artifact"));
+            std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+            measurements.push(json!({"stage":stage,"artifact_sha256":sha256(&path)?,
+                "training_group_maxima":frozen_errors(device,&decoded.program,&train_x,&train_y,scales,&settings.optimizer)?,
+                "validation_group_maxima":frozen_errors(device,&decoded.program,&valid_x,&valid_y,scales,&settings.optimizer)?}));
+        }
+        reports.push(json!({"initialization":label,"measurements_frozen_training_scales":measurements,"optimizer_report":fit.report}));
+        save(
+            &out.join("FITTING.json"),
+            &json!({"arms":reports,"groups":groups,
+            "training_rows":train,"validation_rows":valid,"seed":settings.seed,
+            "scope":"Supplied full-width native topology; supervised clean and scalar response fitting. Primary decoded errors use TRAIN RMS for both splits. Optimizer validation diagnostics use panel-specific RMS and never choose snapshots. No output KL, structure discovery, or autonomous fidelity claim."}),
+        )?;
+    }
+    Ok(json!({"arms":reports,"training_rows":train.len(),"validation_rows":valid.len()}))
+}
 fn check_layer(
     source: &OperatorProgram,
     read: usize,
@@ -294,6 +500,15 @@ fn run() -> Result<(), String> {
     {
         return Err("positive resource limits, exactly two directions and explicit tolerance/cases required".into());
     }
+    if let Some(fit) = &settings.fitting {
+        if !fit.relative_perturbation.is_finite()
+            || fit.relative_perturbation <= 0.
+            || fit.optimizer.forward_rows == 0
+            || fit.optimizer.numeric_bytes > settings.numeric_bytes
+        {
+            return Err("fitting needs positive finite perturbation/forward rows and budget within capture budget".into());
+        }
+    }
     if sha256(&export.join("export.json"))? != settings.export_sha256 {
         return Err("export hash mismatch".into());
     }
@@ -309,6 +524,11 @@ fn run() -> Result<(), String> {
     };
     let start = Instant::now();
     let imported = import_language_model(export, settings.sequences, settings.context)?;
+    let split = settings
+        .fitting
+        .as_ref()
+        .map(|fit| sequence_split(&imported.contract.family, fit.training_sequences))
+        .transpose()?;
     let native = split_sites(&imported.program)?;
     let layers = layer_nodes(&native, 4)?;
     if layers.len() != 4 || imported.contract.family.rows > settings.max_rows {
@@ -359,7 +579,7 @@ fn run() -> Result<(), String> {
         let y = device
             .download(trace.value(l.mlp)?)
             .map_err(|e| e.to_string())?;
-        reports.push(check_layer(
+        let mut report = check_layer(
             &native,
             l.normed,
             l.pre,
@@ -371,12 +591,21 @@ fn run() -> Result<(), String> {
             &settings.amplitudes,
             settings.absolute_tolerance,
             &layer_dir,
-        )?);
+        )?;
+        if let (Some(fit), Some((train, valid))) = (&settings.fitting, &split) {
+            let (function, responses) =
+                native_body(&native, l.normed, l.pre, l.active, l.mlp, &directions)?;
+            report["fitting"] = fit_diagnostic(
+                &device, &function, &responses, &x, train, valid, fit, &layer_dir,
+            )?;
+        }
+        reports.push(report);
     }
     save(
         &out.join("REPORT.json"),
         &json!({"layers":reports,"capture_planned_numeric_bytes":plan,
-        "elapsed_seconds":start.elapsed().as_secs_f64(),"fitting_updates":0,"passed":true,"scope":"Native-supplied capacity gate only."}),
+        "elapsed_seconds":start.elapsed().as_secs_f64(),"fitting_updates_per_arm":settings.fitting.as_ref().map_or(0,|f|f.optimizer.iterations),
+        "capacity_passed":true,"scope":"Native-supplied capacity gate and optional optimization diagnostic; fitting does not constitute discovered computation."}),
     )
 }
 fn main() -> Result<(), String> {
@@ -484,6 +713,67 @@ mod tests {
         assert_eq!(report["shared_hidden_node"], 2);
         assert_eq!(report["passed"], true);
         assert!(report["c32"].as_u64().expect("paid cost") > 0);
+        let (function, responses) = native_body(&source, 0, 1, 2, 3, &directions).expect("body");
+        let fit = Fitting {
+            training_sequences: 1,
+            seed: 2951,
+            relative_perturbation: 0.01,
+            optimizer: resident_rule_fit::Settings {
+                iterations: 2,
+                forward_rows: 2,
+                learning_rate: 0.001,
+                beta1: 0.9,
+                beta2: 0.999,
+                epsilon: 1e-8,
+                numeric_bytes: 1 << 24,
+                arithmetic: resident_rule_fit::ProposalArithmetic::F64,
+                backtracking: None,
+            },
+            batch: BatchSchedule {
+                ordinary_rows: 2,
+                hard_rows: 0,
+                scan_every: 1,
+                temperature: 0.1,
+            },
+        };
+        let result = fit_diagnostic(
+            &Device::host(),
+            &function,
+            &responses,
+            &parent,
+            &[0, 1],
+            &[2],
+            &fit,
+            &out,
+        )
+        .expect("direct fitting");
+        assert_eq!(result["arms"].as_array().expect("arms").len(), 2);
+        for arm in result["arms"].as_array().expect("arms") {
+            assert_eq!(arm["optimizer_report"]["trainable"], json!([0, 1, 2, 3]));
+            assert_eq!(
+                arm["measurements_frozen_training_scales"]
+                    .as_array()
+                    .expect("snapshots")
+                    .len(),
+                2
+            );
+        }
         std::fs::remove_dir_all(out).expect("cleanup");
+    }
+    #[test]
+    fn partition_keeps_every_sequence_intact() {
+        let family = FamilyInputs {
+            rows: 5,
+            slots: vec![],
+            layout: Some(gam_mpd::operator_program::SequenceLayout {
+                sequence: vec![4, 4, 9, 9, 9],
+                position: vec![0, 1, 0, 1, 2],
+            }),
+        };
+        assert_eq!(
+            sequence_split(&family, 1).expect("split"),
+            (vec![0, 1], vec![2, 3, 4])
+        );
+        assert!(sequence_split(&family, 2).is_err());
     }
 }
