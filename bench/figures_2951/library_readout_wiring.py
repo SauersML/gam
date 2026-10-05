@@ -1,11 +1,13 @@
 """Wiring graph of a library read-out's most-used functions (mpd_library_readout_2951 JSON).
 
-python library_readout_wiring.py READOUT.json OUT.png NODES
+python library_readout_wiring.py READOUT.json OUT.png EDGES
 
-Columns are the reads in depth order (layer l's heads, then its MLP functions); each node is a
-function labelled with its strongest read token and its most promoted token (heads: the source
-token receiving the most attention and the largest OV entry). An arrow's width is the wiring
-weight (RMS direct contribution of the writer to the reader's input) relative to the largest drawn.
+Columns are the reads in depth order (layer l's heads, then its MLP functions). An MLP function
+is labelled with the token it fires on most often among its top held-out contexts and its most
+promoted token; a head with the query-key offset range holding most of its attention and its
+largest OV entry. Each function shows its EDGES strongest inputs from the other drawn functions;
+an arrow's width is the wiring weight (RMS direct contribution of the writer to the reader's
+input) relative to the largest drawn.
 """
 import json
 import sys
@@ -24,20 +26,23 @@ def shown(text):
 def labels(f):
     if f["kind"] == "head":
         a = f["attention"]
-        read = shown(a["sources"][0]["text"]) if a["sources"] else ""
+        b = max(range(len(a["offset_mass"])), key=lambda i: a["offset_mass"][i])
+        lo, hi = a["offsets"][b]
+        span = f"{lo}" if lo == hi else f"{lo}–{hi}"
         top = a["ov"][0] if a["ov"] else None
         write = f"{shown(top['source_text'])}→{shown(top['output_text'])}" if top else ""
-        return f"attends {read}", f"copies {write}"
-    read = shown(f["reads"][0]["text"]) if f["reads"] else ""
+        return f"looks {span} back ({a['offset_mass'][b]:.0%})", f"OV {write}"
+    tokens = [c["token"] for c in f["contexts"]]
+    fires = max(tokens, key=tokens.count) if tokens else ""
     write = shown(f["promoted"][0]["text"]) if f["promoted"] else ""
-    return f"reads {read}", f"writes {write}"
+    return f"fires on {shown(fires)}", f"writes {write}"
 
 
 def main():
     path, out, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
     report = json.load(open(path))
     functions = report["functions"]
-    core = report["core"][:count]
+    core = report["core"]
     wiring = report["wiring"]
     column = {i: 2 * functions[i]["layer"] + (functions[i]["kind"] == "mlp") for i in core}
     columns = sorted(set(column.values()))
@@ -46,11 +51,14 @@ def main():
     position = {}
     for c, members in stacks.items():
         for r, i in enumerate(members):
-            position[i] = (x_of[c] * 3.2, -r * 1.25)
-    fig, ax = plt.subplots(figsize=(4.2 * len(columns), 1.3 * max(len(m) for m in stacks.values()) + 1.5))
+            position[i] = (x_of[c] * 4.0, -r * 1.25)
+    fig, ax = plt.subplots(figsize=(5.0 * len(columns), 1.3 * max(len(m) for m in stacks.values()) + 1.5))
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
-    edges = [(wiring[a][b], core[b], core[a]) for a in range(len(core)) for b in range(len(core)) if wiring[a][b] > 0]
+    edges = []
+    for a in range(len(core)):
+        inputs = sorted(((wiring[a][b], core[b], core[a]) for b in range(len(core)) if wiring[a][b] > 0), reverse=True)
+        edges.extend(inputs[:count])
     top = max((w for w, _, _ in edges), default=1.0)
     for w, writer, reader in sorted(edges):
         ax.add_patch(
@@ -78,9 +86,9 @@ def main():
         ax.text(x + 0.22, y + 0.12, f"{read}\n{write}", fontsize=13, va="top", zorder=4)
     for c in columns:
         layer, kind = divmod(c, 2)
-        ax.text(x_of[c] * 3.2, 1.0, f"layer {layer} {'MLP' if kind else 'heads'}", fontsize=17, ha="left", va="bottom")
+        ax.text(x_of[c] * 4.0, 1.0, f"layer {layer} {'MLP' if kind else 'heads'}", fontsize=17, ha="left", va="bottom")
     ax.set_axis_off()
-    ax.set_xlim(-0.6, 3.2 * len(columns) + 0.4)
+    ax.set_xlim(-0.6, 4.0 * len(columns) + 0.4)
     ax.set_ylim(-1.25 * max(len(m) for m in stacks.values()), 1.6)
     fig.savefig(out, dpi=150, bbox_inches="tight", facecolor="white")
 
