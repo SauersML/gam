@@ -161,6 +161,18 @@ fn law_of(law: Law) -> PointwiseLaw {
     }
 }
 
+/// The nodes a step reads.
+fn step_arguments(step: &Step) -> Vec<usize> {
+    match step {
+        Step::Feature { .. } | Step::Raw { .. } | Step::Constant { .. } | Step::Head => Vec::new(),
+        Step::Affine { terms, .. } => terms.iter().map(|t| t.0).collect(),
+        Step::Pointwise { input, .. } | Step::Gain { input, .. } | Step::RmsNorm { input, .. } | Step::Readout { input } | Step::Transposed { input, .. } => vec![*input],
+        Step::Hadamard { left, right } => vec![*left, *right],
+        Step::Attend { query, key, value, .. } => vec![*query, *key, *value],
+        Step::Concat { parts } => parts.clone(),
+    }
+}
+
 /// A program lowered onto a device (module note).
 pub struct DeviceProgram {
     device: Device,
@@ -178,6 +190,9 @@ pub struct DeviceProgram {
     fused: Vec<Fused>,
     /// Per node, the group it is a member or the output of.
     grouped: Vec<Option<usize>>,
+    /// Per operator, how many times its device copy was replaced ([`Frozen`] values stay valid while
+    /// no operator they read changes).
+    revisions: BTreeMap<usize, u64>,
 }
 
 /// A group of sibling heads and its stacked operators.
@@ -221,6 +236,8 @@ enum Slot {
     /// Columns `start..start + width` of the trace's buffer `buffer` (a fused group's), copied out
     /// when first read.
     Columns { buffer: usize, start: usize, width: usize, copy: OnceLock<Tensor> },
+    /// A value computed once for every forward on a family ([`Frozen`]).
+    Shared(Arc<Tensor>),
 }
 
 /// One forward pass's node values on the device (none for features and the head), with the
@@ -230,6 +247,8 @@ pub struct DeviceTrace {
     /// The fused groups' buffers, and per group the buffers of its `P` and `A` when it ran fused.
     buffers: Vec<Tensor>,
     fused: Vec<Option<(usize, usize)>>,
+    /// Per node, whether its value came from a [`Frozen`] (a reverse pass leaves those alone).
+    frozen: Option<Arc<Vec<bool>>>,
     device: Device,
     pub rows: usize,
     ids: BTreeMap<usize, Arc<Indices>>,
@@ -244,6 +263,7 @@ impl DeviceTrace {
     pub fn value(&self, n: usize) -> Result<&Tensor, String> {
         match self.slots.get(n) {
             Some(Slot::Value(t)) => Ok(t),
+            Some(Slot::Shared(t)) => Ok(t),
             Some(Slot::Alias(m)) => self.value(*m),
             Some(Slot::Columns { buffer, start, width, copy }) => match copy.get() {
                 Some(t) => Ok(t),
@@ -327,6 +347,42 @@ impl Hooks<'_> {
     fn before(&self, node: usize) -> bool {
         self.before.is_some_and(|nodes| nodes.contains(&node))
     }
+}
+
+/// The values of every node no trainable operator reaches, on one family: computed once by
+/// [`DeviceProgram::freeze`] and shared by every [`DeviceProgram::forward_frozen`] on that family,
+/// which computes only the other nodes. Only the frozen nodes the others read, and the ones asked
+/// for, keep their values.
+pub struct Frozen {
+    batch: Arc<PreparedBatch>,
+    frozen: Arc<Vec<bool>>,
+    values: BTreeMap<usize, Arc<Tensor>>,
+    trainable: BTreeSet<usize>,
+    /// The program's operator revisions the values were computed at.
+    revisions: BTreeMap<usize, u64>,
+}
+
+impl Frozen {
+    /// Whether node `n` is frozen.
+    #[must_use]
+    pub fn is_frozen(&self, n: usize) -> bool {
+        self.frozen.get(n).copied().unwrap_or(false)
+    }
+
+    /// The bytes of the values it keeps.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.values.values().map(|t| t.bytes()).sum()
+    }
+}
+
+/// How a forward pass uses frozen values: not at all, computing only the frozen nodes, or taking
+/// them from a [`Frozen`].
+#[derive(Clone, Copy)]
+enum Reuse<'a> {
+    Nothing,
+    Freeze(&'a [bool]),
+    From(&'a Frozen),
 }
 
 /// The rotation tables of `rotary` among a trace's, with its pairing.
@@ -558,11 +614,13 @@ impl DeviceProgram {
             };
             fused.push(Fused { heads, stacked, sources, live: true });
         }
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), arithmetic: Arithmetic::F64, fused, grouped })
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new() })
     }
 
-    /// Run every group reading operator `op` node by node from now on (its stacked copy is stale).
+    /// Operator `op`'s device copy changed: every group reading it runs node by node from now on
+    /// (its stacked copy is stale), and frozen values reading it are stale.
     fn dissolve(&mut self, op: usize) {
+        *self.revisions.entry(op).or_default() += 1;
         for group in &mut self.fused {
             if group.heads.operators().contains(&op) {
                 group.live = false;
@@ -937,7 +995,7 @@ impl DeviceProgram {
         gated: &[(usize, usize)],
         decide: impl FnMut(usize, &DeviceTrace) -> Result<Tensor, String>,
     ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(family, given, gated, decide, false, Hooks { before: None, edit: false }, |_, _| Ok(()), |_, _| Ok(None))
+        self.forward_hooks(Some(family), given, gated, decide, false, Hooks { before: None, edit: false }, |_, _| Ok(()), |_, _| Ok(None), Reuse::Nothing)
     }
 
     /// Per-node edits on materialized values, preserving exception-before-intervention order:
@@ -955,7 +1013,7 @@ impl DeviceProgram {
         before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
         edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(family, given, &[], |_, _| Err("no gate".into()), true, Hooks { before: Some(before_at), edit: true }, before, edit)
+        self.forward_hooks(Some(family), given, &[], |_, _| Err("no gate".into()), true, Hooks { before: Some(before_at), edit: true }, before, edit, Reuse::Nothing)
     }
 
     /// [`Self::forward_edited`] with the streamed dense head left unmaterialized.
@@ -967,16 +1025,71 @@ impl DeviceProgram {
         before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
         edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(family, BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, Hooks { before: Some(before_at), edit: true }, before, edit)
+        self.forward_hooks(Some(family), BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, Hooks { before: Some(before_at), edit: true }, before, edit, Reuse::Nothing)
     }
 
     pub fn is_streamed_head(&self, node: usize) -> bool {
         self.edited_head_nodes.contains_key(&node)
     }
 
+    /// Which nodes no operator of `trainable` reaches.
+    fn frozen_nodes(&self, trainable: &BTreeSet<usize>) -> Vec<bool> {
+        let mut frozen = vec![true; self.steps.len()];
+        for (index, step) in self.steps.iter().enumerate() {
+            // The streamed head is never frozen (it has no resident value to keep).
+            let operators: Vec<usize> = match step {
+                Step::Head => vec![usize::MAX],
+                Step::Constant { operator } | Step::Transposed { operator, .. } => vec![*operator],
+                Step::Affine { terms, bias } => terms.iter().map(|t| t.1).chain(*bias).collect(),
+                _ => Vec::new(),
+            };
+            frozen[index] = step_arguments(step).iter().all(|r| frozen[*r]) && operators.iter().all(|op| *op != usize::MAX && !trainable.contains(op));
+        }
+        frozen
+    }
+
+    /// The values on `family` of every node no operator of `trainable` reaches (module note of
+    /// [`Frozen`]), the raw slots in `given` as in [`Self::forward_given`]; of those, the ones the
+    /// other nodes read and the ones in `keep` keep their values.
+    pub fn freeze(&self, family: &FamilyInputs, given: BTreeMap<usize, Tensor>, trainable: &[usize], keep: &[usize]) -> Result<Frozen, String> {
+        let trainable: BTreeSet<usize> = trainable.iter().copied().collect();
+        let frozen = self.frozen_nodes(&trainable);
+        let batch = self.prepared_batch(family)?;
+        let mut trace = self.forward_hooks(Some(family), given, &[], |_, _| Err("no gate".into()), false, Hooks { before: None, edit: false }, |_, _| Ok(()), |_, _| Ok(None), Reuse::Freeze(&frozen))?;
+        let mut read = vec![false; self.steps.len()];
+        for (index, step) in self.steps.iter().enumerate() {
+            if !frozen[index] {
+                for argument in step_arguments(step) {
+                    read[argument] = true;
+                }
+            }
+        }
+        let mut values = BTreeMap::new();
+        let kept: Vec<usize> = (0..self.steps.len()).filter(|n| frozen[*n] && (read[*n] || keep.contains(n)) && trace.has(*n)).collect();
+        for node in kept {
+            values.insert(node, Arc::new(trace.take(node)?));
+        }
+        Ok(Frozen { batch, frozen: Arc::new(frozen), values, trainable, revisions: self.revisions.clone() })
+    }
+
+    /// A forward pass on [`Self::freeze`]'s family computing only the nodes a trainable operator
+    /// reaches; the frozen nodes' values are `frozen`'s, shared. A reverse pass on it leaves the
+    /// frozen nodes alone (no cotangent reaches them unless one is kept).
+    pub fn forward_frozen(&self, frozen: &Frozen) -> Result<DeviceTrace, String> {
+        if frozen.frozen.len() != self.steps.len() {
+            return Err("device: frozen values of another program".into());
+        }
+        for (op, revision) in &self.revisions {
+            if !frozen.trainable.contains(op) && frozen.revisions.get(op) != Some(revision) {
+                return Err(format!("device: operator {op} changed since its frozen values were computed"));
+            }
+        }
+        self.forward_hooks(None, BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, Hooks { before: None, edit: false }, |_, _| Ok(()), |_, _| Ok(None), Reuse::From(frozen))
+    }
+
     fn forward_hooks(
         &self,
-        family: &FamilyInputs,
+        family: Option<&FamilyInputs>,
         mut given: BTreeMap<usize, Tensor>,
         gated: &[(usize, usize)],
         mut decide: impl FnMut(usize, &DeviceTrace) -> Result<Tensor, String>,
@@ -984,9 +1097,9 @@ impl DeviceProgram {
         hooks: Hooks<'_>,
         mut before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
         mut edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
+        reuse: Reuse<'_>,
     ) -> Result<DeviceTrace, String> {
         let d = &self.device;
-        let rows = family.rows;
         for &(amplitude, mask) in gated {
             if mask >= amplitude
                 || amplitude >= self.steps.len()
@@ -996,19 +1109,34 @@ impl DeviceProgram {
                 return Err(format!("device: gate ({amplitude}, {mask}) is not an amplitude after its raw mask of the same width"));
             }
         }
-        let batch = self.prepared_batch(family)?;
-        // A group runs fused unless an in-place hook or a gate may change one of its nodes, or its
-        // sequences are long enough for the tiled attention.
+        let batch = match (reuse, family) {
+            (Reuse::From(frozen), _) => Arc::clone(&frozen.batch),
+            (_, Some(family)) => self.prepared_batch(family)?,
+            (_, None) => return Err("device: a forward pass without its family".into()),
+        };
+        let rows = batch.rows;
+        // Which nodes this pass computes.
+        let computes = |n: usize| match reuse {
+            Reuse::Nothing => true,
+            Reuse::Freeze(frozen) => frozen[n],
+            Reuse::From(frozen) => !frozen.frozen[n],
+        };
+        // A group runs fused unless an in-place hook or a gate may change one of its nodes, its
+        // sequences are long enough for the tiled attention, or this pass does not compute its heads.
         let tiled = Self::tiled(rows, batch.blocks);
         let fusing: Vec<bool> = self
             .fused
             .iter()
-            .map(|g| g.live && !tiled && g.heads.members().all(|m| !hooks.before(m) && !gated.iter().any(|&(a, k)| a == m || k == m)))
+            .map(|g| g.live && !tiled && computes(g.heads.first()) && g.heads.members().all(|m| !hooks.before(m) && !gated.iter().any(|&(a, k)| a == m || k == m)))
             .collect();
         let mut trace = DeviceTrace {
             slots: (0..self.steps.len()).map(|_| Slot::Empty).collect(),
             buffers: Vec::new(),
             fused: vec![None; self.fused.len()],
+            frozen: match reuse {
+                Reuse::From(frozen) => Some(Arc::clone(&frozen.frozen)),
+                _ => None,
+            },
             device: d.clone(),
             rows,
             ids: batch.ids.clone(),
@@ -1016,6 +1144,14 @@ impl DeviceProgram {
             rotations: Arc::clone(&batch.rotations),
         };
         for (index, step) in self.steps.iter().enumerate() {
+            if !computes(index) {
+                if let Reuse::From(frozen) = reuse
+                    && let Some(value) = frozen.values.get(&index)
+                {
+                    trace.slots[index] = Slot::Shared(Arc::clone(value));
+                }
+                continue;
+            }
             let group = self.grouped[index].filter(|g| fusing[*g]);
             if let Some(g) = group
                 && index != self.fused[g].heads.output
@@ -1048,7 +1184,7 @@ impl DeviceProgram {
                         return Err(format!("device: a {:?} value for slot {slot} of {rows} × {width}", given.dim()));
                     }
                     None => {
-                        let SlotValues::Raw(values) = &family.slots[*slot] else {
+                        let Some(SlotValues::Raw(values)) = family.map(|f| &f.slots[*slot]) else {
                             return Err(format!("device: slot {slot} holds no raw rows"));
                         };
                         value(d.upload(values.view()).map_err(error)?)
@@ -1483,6 +1619,8 @@ impl DeviceProgram {
         for (node, term) in seeds {
             g[node] = Some(term);
         }
+        // A frozen node's cotangent is wanted only when it is kept.
+        let needed: Vec<bool> = (0..self.steps.len()).map(|n| keep.contains(&n) || trace.frozen.as_ref().is_none_or(|f| !f[n])).collect();
         let mut kept = BTreeMap::new();
         // Adds `term` into node `n`'s cotangent.
         let add = |g: &mut Vec<Option<Tensor>>, n: usize, term: Tensor| -> Result<(), String> {
@@ -1507,7 +1645,7 @@ impl DeviceProgram {
                 break;
             }
             if let Some(group) = self.grouped[index].filter(|f| fused[*f] && self.fused[*f].heads.output == index) {
-                self.heads_reverse(trace, group, &cot, &mut g, arithmetic)?;
+                self.heads_reverse(trace, group, &cot, (&mut g, &needed), arithmetic)?;
                 if keep.contains(&index) {
                     kept.insert(index, cot);
                 }
@@ -1518,12 +1656,16 @@ impl DeviceProgram {
                     let mut column = 0usize;
                     for part in parts {
                         let end = column.checked_add(self.widths[*part]).ok_or("device: Concat cotangent width overflow")?;
-                        let term = d.columns_of(&cot, column..end).map_err(error)?;
-                        add(&mut g, *part, term)?;
+                        if needed[*part] {
+                            let term = d.columns_of(&cot, column..end).map_err(error)?;
+                            add(&mut g, *part, term)?;
+                        }
                         column = end;
                     }
                     if column != cot.cols() { return Err("device: Concat cotangent width mismatch".into()); }
                 }
+                Step::Readout { input } | Step::Gain { input, .. } | Step::Transposed { input, .. } | Step::Pointwise { input, .. } | Step::RmsNorm { input, .. }
+                    if !needed[*input] => {}
                 Step::Readout { input } => add(&mut g, *input, d.copy(&cot).map_err(error)?)?,
                 Step::Gain { input, factor } => {
                     let mut term = d.zeros(cot.rows(), cot.cols()).map_err(error)?;
@@ -1533,7 +1675,7 @@ impl DeviceProgram {
                 Step::Head | Step::Feature { .. } | Step::Raw { .. } | Step::Constant { .. } => {}
                 Step::Affine { terms, .. } => {
                     for (argument, operator) in terms {
-                        self.pull_term(&mut g, trace.rows, &cot, *argument, *operator, arithmetic)?;
+                        self.pull_term((&mut g, &needed), trace.rows, &cot, *argument, *operator, arithmetic)?;
                     }
                 }
                 Step::Transposed { input, operator } => {
@@ -1551,7 +1693,7 @@ impl DeviceProgram {
                     // A raw input's cotangent goes nowhere unless it is kept (a mask's).
                     let wanted = |n: usize| {
                         keep.contains(&n)
-                            || !matches!(self.steps[n], Step::Raw { .. } | Step::Constant { .. })
+                            || (needed[n] && !matches!(self.steps[n], Step::Raw { .. } | Step::Constant { .. }))
                     };
                     if wanted(*left) {
                         let mut gl = d.zeros(trace.rows, self.widths[*left]).map_err(error)?;
@@ -1579,7 +1721,7 @@ impl DeviceProgram {
                     scale,
                     rotary,
                     causal,
-                } => {
+                } if [*query, *key, *value].iter().any(|n| needed[*n]) => {
                     let (gq, gk, gv) = self.attend_cotangent(
                         trace,
                         (*query, *key, *value),
@@ -1589,10 +1731,13 @@ impl DeviceProgram {
                         *causal,
                         arithmetic,
                     )?;
-                    add(&mut g, *query, gq)?;
-                    add(&mut g, *key, gk)?;
-                    add(&mut g, *value, gv)?;
+                    for (node, term) in [(*query, gq), (*key, gk), (*value, gv)] {
+                        if needed[node] {
+                            add(&mut g, node, term)?;
+                        }
+                    }
                 }
+                Step::Attend { .. } => {}
             }
             if keep.contains(&index) {
                 kept.insert(index, cot);
@@ -1603,9 +1748,9 @@ impl DeviceProgram {
 
     /// `g[argument] ← g[argument] + cot · ∂(x op(A)ᵀ)/∂x` for the affine term `(argument, operator)`
     /// (nothing for a one-hot feature).
-    fn pull_term(&self, g: &mut [Option<Tensor>], rows: usize, cot: &Tensor, argument: usize, operator: usize, arithmetic: Arithmetic) -> Result<(), String> {
+    fn pull_term(&self, (g, needed): (&mut [Option<Tensor>], &[bool]), rows: usize, cot: &Tensor, argument: usize, operator: usize, arithmetic: Arithmetic) -> Result<(), String> {
         let d = &self.device;
-        if matches!(self.steps[argument], Step::Feature { .. }) {
+        if matches!(self.steps[argument], Step::Feature { .. }) || !needed[argument] {
             return Ok(());
         }
         if g[argument].is_none() {
@@ -1629,13 +1774,16 @@ impl DeviceProgram {
     /// Group `g`'s reverse rule from its output node's cotangent `cot`: the other terms as an
     /// affine node's, then `A`'s cotangent `cot O`, the heads backwards to `P`'s, and the input's
     /// `g_P W`.
-    fn heads_reverse(&self, trace: &DeviceTrace, g: usize, cot: &Tensor, grads: &mut [Option<Tensor>], arithmetic: Arithmetic) -> Result<(), String> {
+    fn heads_reverse(&self, trace: &DeviceTrace, g: usize, cot: &Tensor, (grads, needed): (&mut [Option<Tensor>], &[bool]), arithmetic: Arithmetic) -> Result<(), String> {
         let d = &self.device;
         let group = &self.fused[g];
         let heads = &group.heads;
         let (p, _) = trace.fused[g].ok_or("device: a fused reverse without its forward")?;
         for (argument, operator) in &heads.rest {
-            self.pull_term(grads, trace.rows, cot, *argument, *operator, arithmetic)?;
+            self.pull_term((&mut *grads, needed), trace.rows, cot, *argument, *operator, arithmetic)?;
+        }
+        if !needed[heads.input] {
+            return Ok(());
         }
         let mut g_a = d.zeros(trace.rows, heads.heads * heads.width).map_err(error)?;
         d.gemm(&mut g_a, 1.0, cot, Op::N, &group.stacked.reads, Op::N, 0.0, arithmetic).map_err(error)?;

@@ -90,7 +90,7 @@ fn error(e: impl std::fmt::Display) -> String {
 fn arithmetic(device: &Device) -> Arithmetic {
     match device.storage() {
         Storage::F64 => Arithmetic::F64,
-        Storage::F32 => Arithmetic::F32,
+        Storage::F32 | Storage::Bf16 => Arithmetic::F32,
     }
 }
 

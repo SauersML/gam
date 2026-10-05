@@ -396,3 +396,33 @@ fn cached_batch_refreshes_tokens_and_positions_without_changing_old_traces() {
         assert_eq!(lowered.logits(&old, 0, family.rows).expect("old still valid"), old_logits);
     }
 }
+
+#[test]
+fn frozen_prefix_forwards_and_reverses_like_the_whole_program() {
+    let (program, family) = fixture();
+    let trainable = program.operators.iter().position(|op| op.name == "blocks.1.c_fc").expect("a layer-1 map");
+    let embedding = program.operators.iter().position(|op| op.name == "blocks.0.c_fc").expect("a layer-0 map");
+    let seed = Array2::from_shape_fn((family.rows, VOCAB), |(r, c)| noise(6100 + r * VOCAB + c));
+    for device in devices() {
+        let mut lowered = DeviceProgram::compile_values(&device, &program).expect("values");
+        lowered.prepare_dense_parameters(&[trainable]).expect("trainable");
+        let frozen = lowered.freeze(&family, BTreeMap::new(), &[trainable], &[]).expect("freeze");
+        assert!(frozen.is_frozen(0) && !frozen.is_frozen(program.output));
+        let whole = lowered.forward(&family).expect("whole");
+        let part = lowered.forward_frozen(&frozen).expect("frozen");
+        let output = |t: &super::device_program::DeviceTrace| device.download(t.value(program.output).expect("output")).expect("download");
+        assert_eq!(output(&whole), output(&part), "{}", device.name());
+        let seeds = || BTreeMap::from([(program.output, device.upload(seed.view()).expect("seed"))]);
+        let (_, a) = lowered.vjp_values_dense(&whole, seeds(), &[], &[trainable], Arithmetic::F64).expect("whole reverse");
+        let (_, b) = lowered.vjp_values_dense(&part, seeds(), &[], &[trainable], Arithmetic::F64).expect("frozen reverse");
+        assert_eq!(device.download(&a[&trainable]).expect("a"), device.download(&b[&trainable]).expect("b"), "{}", device.name());
+        // A training step moves only the trainable map: the frozen values still hold.
+        let moved = device.download(lowered.dense_parameter(trainable).expect("parameter")).expect("download") * 0.5;
+        lowered.replace_dense_parameter(trainable, device.upload(moved.view()).expect("upload")).expect("replace");
+        let (whole, part) = (lowered.forward(&family).expect("whole"), lowered.forward_frozen(&frozen).expect("frozen"));
+        assert_eq!(output(&whole), output(&part), "{}: after a step", device.name());
+        // Any other map changing makes them stale.
+        lowered.prepare_dense_parameters(&[embedding]).expect("another");
+        assert!(lowered.forward_frozen(&frozen).is_err());
+    }
+}
