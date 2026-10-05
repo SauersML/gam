@@ -27,6 +27,8 @@ struct Settings {
     fit: FitSettings,
     #[serde(default)]
     batch_schedule: Option<resident_rule_fit::BatchSchedule>,
+    #[serde(default)]
+    expression_ids: Option<Vec<usize>>,
     seed: u64,
 }
 fn save(path: &Path, value: &Value) -> Result<(), String> {
@@ -208,6 +210,22 @@ fn validate_heldout_shapes(train: &Data, eval: &Data, uses: &[UseSpec]) -> Resul
     }
     Ok(())
 }
+fn selected_expressions(
+    count: usize,
+    requested: Option<&[usize]>,
+) -> Result<BTreeSet<usize>, String> {
+    let Some(ids) = requested else {
+        return Ok((0..count).collect());
+    };
+    let selected: BTreeSet<_> = ids.iter().copied().collect();
+    if ids.is_empty() || selected.len() != ids.len() || ids.iter().any(|&id| id >= count) {
+        return Err(
+            "declared expression IDs must be nonempty, unique, and within original inventory"
+                .into(),
+        );
+    }
+    Ok(selected)
+}
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() != 4 {
@@ -240,6 +258,11 @@ fn run() -> Result<(), String> {
     {
         return Err("positive width and nonempty unique layers required".into());
     }
+    let inventory = composed_rule_search::enumerate(&settings.grammar)?;
+    let selected_expressions = selected_expressions(
+        inventory.expressions.len(),
+        settings.expression_ids.as_deref(),
+    )?;
     let device = match args[3].as_str() {
         "host" => Device::host(),
         "cuda" => Device::accelerator(GpuPolicy::Required)
@@ -280,7 +303,6 @@ fn run() -> Result<(), String> {
             output_width: train.output_widths[slot],
         })
         .collect();
-    let inventory = composed_rule_search::enumerate(&settings.grammar)?;
     let arms: Vec<&'static str> = if uses.len() > 1 {
         vec!["shared", "untied"]
     } else {
@@ -289,18 +311,23 @@ fn run() -> Result<(), String> {
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     save(
         &out.join("PROVENANCE.json"),
-        &json!({"settings":settings_value,"settings_sha256":sha256(settings_path)?,"extract_sha256":sha256(manifest_path)?,"train":train.provenance,"eval_manifest_only_until_pareto_freeze":eval_panel,"backend":args[3],"seed":settings.seed,"width":settings.width,"layers":settings.layers,"arms":arms,"grammar_truncated":inventory.truncated,"scope":"Finite proposed composed-program grammar only. Training arrays passed as BOTH fit training and fit validation; all optimizer validation fields during search refer to TRAIN. Training selection uses ordinary decoded-f32 F64 training measurement plus complete standalone C32. Heldout arrays loaded only after Pareto IDs and matched-control evaluation IDs saved. Row-disjointness is asserted by the recorded extraction lineage, not proven by unequal array hashes. No native full-model Local/Run, discovered algorithm, or global grammar optimum claim."}),
+        &json!({"settings":settings_value,"settings_sha256":sha256(settings_path)?,"extract_sha256":sha256(manifest_path)?,"train":train.provenance,"eval_manifest_only_until_pareto_freeze":eval_panel,"backend":args[3],"seed":settings.seed,"width":settings.width,"layers":settings.layers,"arms":arms,"grammar_truncated":inventory.truncated,"selected_expression_ids":selected_expressions,"source_expression_count":inventory.expressions.len(),"selection_scope":"optional declared subinventory, original IDs retained, no renumbering; omitted forms unassessed","scope":"Finite proposed composed-program grammar only. Training arrays passed as BOTH fit training and fit validation; all optimizer validation fields during search refer to TRAIN. Training selection uses ordinary decoded-f32 F64 training measurement plus complete standalone C32. Heldout arrays loaded only after Pareto IDs and matched-control evaluation IDs saved. Row-disjointness is asserted by the recorded extraction lineage, not proven by unequal array hashes. No native full-model Local/Run, discovered algorithm, or global grammar optimum claim."}),
     )?;
     let arm_count = arms.len();
-    let entries:Vec<_>=inventory.expressions.iter().enumerate().flat_map(|(expression,body)|arms.iter().enumerate().map(move |(a,arm)|json!({"id":expression*arm_count+a,"expression_index":expression,"expression":body,"arm":arm,"initial_status":"unmeasured"}))).collect();
+    let entries:Vec<_>=inventory.expressions.iter().enumerate().filter(|(id,_)|selected_expressions.contains(id)).flat_map(|(expression,body)|arms.iter().enumerate().map(move |(a,arm)|json!({"id":expression*arm_count+a,"expression_index":expression,"expression":body,"arm":arm,"initial_status":"unmeasured"}))).collect();
     save(
         &out.join("INVENTORY.json"),
-        &json!({"expressions":inventory.expressions,"intermediate_expressions":inventory.intermediate_expressions,"truncated":inventory.truncated,"proposals":entries,"proposal_count":entries.len()}),
+        &json!({"expressions":inventory.expressions,"intermediate_expressions":inventory.intermediate_expressions,"truncated":inventory.truncated,"proposals":entries,"proposal_count":entries.len(),"selected_expression_ids":selected_expressions,"source_expression_count":inventory.expressions.len()} ),
     )?;
     let mut log = File::create(out.join("journal.jsonl")).map_err(|e| e.to_string())?;
     let mut scores = Vec::new();
     let mut statuses = Vec::new();
-    for (expression, expr) in inventory.expressions.iter().enumerate() {
+    for (expression, expr) in inventory
+        .expressions
+        .iter()
+        .enumerate()
+        .filter(|(id, _)| selected_expressions.contains(id))
+    {
         for (a, &arm) in arms.iter().enumerate() {
             let id = expression * arms.len() + a;
             let candidate_started = Instant::now();
@@ -474,7 +501,7 @@ fn run() -> Result<(), String> {
     }
     save(
         &out.join("REPORT.json"),
-        &json!({"proposal_count":entries.len(),"grammar_truncated":inventory.truncated,"statuses":statuses,"frozen_training_pareto_ids":selected,"frozen_evaluation_ids":frozen_evaluation_ids,"heldout":evaluations,"heldout_provenance":heldout.as_ref().ok().map(|d|&d.provenance),"heldout_panel_error":heldout.as_ref().err(),"heldout_seconds":heldout_started.elapsed().as_secs_f64(),"seconds":started.elapsed().as_secs_f64(),"scope":"automatic finite structural proposals with learned maps, not full native acceptance or global optimality; all errors unresolved and retained"}),
+        &json!({"proposal_count":entries.len(),"selected_expression_ids":selected_expressions,"source_expression_count":inventory.expressions.len(),"grammar_truncated":inventory.truncated,"statuses":statuses,"frozen_training_pareto_ids":selected,"frozen_evaluation_ids":frozen_evaluation_ids,"heldout":evaluations,"heldout_provenance":heldout.as_ref().ok().map(|d|&d.provenance),"heldout_panel_error":heldout.as_ref().err(),"heldout_seconds":heldout_started.elapsed().as_secs_f64(),"seconds":started.elapsed().as_secs_f64(),"scope":"automatic finite structural proposals with learned maps, not full native acceptance or global optimality; all errors unresolved and retained"}),
     )
 }
 fn main() -> Result<(), String> {
@@ -506,6 +533,20 @@ mod tests {
                 parameters: 0,
             },
         }
+    }
+    #[test]
+    fn declared_expression_selection_preserves_original_ids_and_default_inventory() {
+        assert_eq!(
+            selected_expressions(46, None).expect("default"),
+            (0..46).collect()
+        );
+        assert_eq!(
+            selected_expressions(46, Some(&[32, 15])).expect("declared"),
+            BTreeSet::from([15, 32])
+        );
+        assert!(selected_expressions(46, Some(&[])).is_err());
+        assert!(selected_expressions(46, Some(&[15, 15])).is_err());
+        assert!(selected_expressions(46, Some(&[46])).is_err());
     }
     #[test]
     fn optional_batch_schedule_does_not_change_legacy_settings() {
