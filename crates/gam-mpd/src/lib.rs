@@ -62,6 +62,8 @@ pub mod library_mixture;
 pub mod library_bodies;
 // A removal's least-squares compensation: an MLP's surviving functions take over deleted ones' output.
 pub mod library_compensation;
+// The removal search: groups without effect first, then units ranked by their predicted change of F.
+pub mod library_removal;
 // Its posterior resident on the device: sample, Adam step and group divergences without transfers.
 pub mod device_posterior;
 pub mod composed_rule_search;
