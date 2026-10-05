@@ -618,7 +618,7 @@ impl BlockEngine for Decoder {
     fn reverse(
         &self,
         block: usize,
-        tape: Tape,
+        tape: &Tape,
         cotangent: &mut Tensor,
         ranges: &[Range<usize>],
         read_edit: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
@@ -629,15 +629,15 @@ impl BlockEngine for Decoder {
         let mut g = self.gather(cotangent, ranges)?;
         let rows = g.rows();
         let mut g_read = d.empty(rows, self.width).map_err(error)?;
-        match (&self.blocks[block], tape.inner) {
+        match (&self.blocks[block], &tape.inner) {
             (Block::Attention(a), Inner::Attention { projections, head_scales, heads, angles, attended, sequences }) => {
                 let mut g_attended = d.empty(rows, a.layout.queries * a.layout.width).map_err(error)?;
                 d.gemm(&mut g_attended, 1.0, &g, Op::N, &w.output, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
-                let g_heads = d.causal_attention_backward(&heads, a.layout, &sequences, a.scale, (&attended.0, &attended.1), &g_attended).map_err(error)?;
+                let g_heads = d.causal_attention_backward(heads, a.layout, sequences, a.scale, (&attended.0, &attended.1), &g_attended).map_err(error)?;
                 let rotation = angles.as_ref().zip(a.rotary).map(|((c, s), r)| (c, s, r.half_split));
                 let norm = w.norms.as_ref().zip(head_scales.as_ref());
                 // The cotangent feeds two products: rounded to bfloat16 once.
-                let g_p = d.bf16_copy(&d.heads_rope_backward(&projections, a.layout, norm, rotation, &g_heads).map_err(error)?).map_err(error)?;
+                let g_p = d.bf16_copy(&d.heads_rope_backward(projections, a.layout, norm, rotation, &g_heads).map_err(error)?).map_err(error)?;
                 if a.projections.parts.iter().any(|(op, _, _)| self.trainable.contains(op)) {
                     let mut stacked = d.empty(a.projections.rows, a.projections.cols).map_err(error)?;
                     d.gemm(&mut stacked, 1.0, &g_p, Op::T, &tape.read, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
@@ -648,7 +648,7 @@ impl BlockEngine for Decoder {
             (Block::Mlp(m), Inner::Mlp { pre, active, out }) => {
                 if let (Some((residual, k)), Some(gain)) = (out, &w.last) {
                     let mut g_residual = d.zeros(rows, self.width).map_err(error)?;
-                    d.rms_gain_backward((&residual, gain, &k), &g, &mut g_residual).map_err(error)?;
+                    d.rms_gain_backward((residual, gain, k), &g, &mut g_residual).map_err(error)?;
                     g = g_residual;
                 }
                 let g16 = d.bf16_copy(&g).map_err(error)?;
@@ -656,10 +656,10 @@ impl BlockEngine for Decoder {
                 d.gemm(&mut g_active, 1.0, &g16, Op::N, &w.output, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
                 if self.trainable.contains(&m.output) {
                     let mut g_output = d.empty(self.width, active.cols()).map_err(error)?;
-                    d.gemm(&mut g_output, 1.0, &g16, Op::T, &active, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
+                    d.gemm(&mut g_output, 1.0, &g16, Op::T, active, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
                     add(d, gradient, m.output, g_output)?;
                 }
-                let g_pre = d.bf16_copy(&if m.gated { d.swiglu_backward(&pre, &g_active) } else { d.gelu_tanh_backward(&pre, w.bias.as_ref(), &g_active) }.map_err(error)?).map_err(error)?;
+                let g_pre = d.bf16_copy(&if m.gated { d.swiglu_backward(pre, &g_active) } else { d.gelu_tanh_backward(pre, w.bias.as_ref(), &g_active) }.map_err(error)?).map_err(error)?;
                 if m.input.parts.iter().any(|(op, _, _)| self.trainable.contains(op)) {
                     let mut stacked = d.empty(m.input.rows, m.input.cols).map_err(error)?;
                     d.gemm(&mut stacked, 1.0, &g_pre, Op::T, &tape.read, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
@@ -753,7 +753,7 @@ mod tests {
                 tapes.push(reference.forward(b, &mut stream, &ranges, &sequences, if b == 1 { Some(&mut e) } else { None }, true).unwrap().unwrap());
             }
             let mut g = host.copy(&cotangent).unwrap();
-            for (b, tape) in tapes.into_iter().enumerate().rev() {
+            for (b, tape) in tapes.iter().enumerate().rev() {
                 let mut e = half;
                 reference.reverse(b, tape, &mut g, &ranges, if b == 1 { Some(&mut e) } else { None }, &mut reference_gradient).unwrap();
             }
@@ -766,7 +766,7 @@ mod tests {
                 tapes.push(decoder.forward(b, &mut stream, &ranges, &sequences, if b == 1 { Some(&mut e) } else { None }, true).unwrap().unwrap());
             }
             let mut g = host.copy(&cotangent).unwrap();
-            for (b, tape) in tapes.into_iter().enumerate().rev() {
+            for (b, tape) in tapes.iter().enumerate().rev() {
                 let mut e = half;
                 decoder.reverse(b, tape, &mut g, &ranges, if b == 1 { Some(&mut e) } else { None }, &mut decoder_gradient).unwrap();
             }

@@ -751,7 +751,8 @@ fn exchange_cotangent(d: &Device, g: &mut Tensor, at: usize, rows: usize, basis:
 /// the block's read (the normed stream its projections read; the call's rows in range order)
 /// before the projections. The reverse pass replaces the rows' cotangent by the cotangent of the
 /// stream entering the block, calls `read` on the read's cotangent (the transposed edit), and adds
-/// the gradient of the trainable operators the block uses into `gradient`.
+/// the gradient of the trainable operators the block uses into `gradient`; it leaves the tape as it
+/// was, so one forward pass serves several reverse passes.
 pub trait BlockEngine {
     type Tape;
 
@@ -777,7 +778,7 @@ pub trait BlockEngine {
     fn reverse(
         &self,
         block: usize,
-        tape: Self::Tape,
+        tape: &Self::Tape,
         cotangent: &mut Tensor,
         ranges: &[Range<usize>],
         read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
@@ -872,7 +873,7 @@ impl BlockEngine for Model<'_> {
     fn reverse(
         &self,
         block: usize,
-        tape: DeviceTrace,
+        tape: &DeviceTrace,
         cotangent: &mut Tensor,
         ranges: &[Range<usize>],
         mut read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
@@ -893,7 +894,7 @@ impl BlockEngine for Model<'_> {
             }
         };
         let arithmetic = self.program.arithmetic();
-        let (nodes, gradients) = self.program.vjp_values_dense_edited(&tape, seeds, &keep, &self.sites.trainable[block], arithmetic, &edited, &mut hook)?;
+        let (nodes, gradients) = self.program.vjp_values_dense_edited(tape, seeds, &keep, &self.sites.trainable[block], arithmetic, &edited, &mut hook)?;
         for (op, g) in gradients {
             match gradient.get_mut(&op) {
                 Some(total) => d.axpy(total, 1.0, &g).map_err(error)?,
@@ -1066,11 +1067,10 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
 /// The reverse of [`run`] from the stream buffer's cotangent `cotangent` (rows of the paths'
 /// outputs): block by block backwards, each call's reverse with the patches' transposed edits
 /// (each source's part added into the source's row of the same call), then each fork's rows added
-/// into its parent's. Adds `P`'s parameter gradient into `gradient`.
-fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: Vec<Call<E::Tape>>, mut cotangent: Tensor, gradient: &mut BTreeMap<usize, Tensor>) -> Result<(), String> {
+/// into its parent's. Adds `P`'s parameter gradient into `gradient`; the calls' tapes stay.
+fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::Tape>], mut cotangent: Tensor, gradient: &mut BTreeMap<usize, Tensor>) -> Result<(), String> {
     let (d, arithmetic) = (engines[0].device(), engines[0].arithmetic());
-    let mut calls = calls;
-    while let Some(call) = calls.pop() {
+    for (index, call) in calls.iter().enumerate().rev() {
         let b = call.block;
         let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.lanes[*l].rows.clone()).collect();
         let patches = plan.patches(b, &call.lanes)?;
@@ -1085,11 +1085,11 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: Vec<Call<E:
             Ok(())
         };
         let read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>> = if patches.is_empty() { None } else { Some(&mut transpose) };
-        let tape = call.tape.ok_or_else(|| error("a call kept no tape"))?;
+        let tape = call.tape.as_ref().ok_or_else(|| error("a call kept no tape"))?;
         engines[call.side].reverse(b, tape, &mut cotangent, &ranges, read, gradient)?;
         // Once both sides of the block are reversed, the forks made there return their rows, the
         // later lanes first (a lane forked from a lane forked at the same block returns through it).
-        if calls.last().is_none_or(|c| c.block != b) {
+        if index == 0 || calls[index - 1].block != b {
             for lane in plan.lanes.iter().rev().filter(|l| l.start == b) {
                 if let Some(parent) = lane.parent {
                     let rows = plan.lanes[parent].rows.clone();
@@ -1246,13 +1246,66 @@ impl Targets {
     }
 }
 
-/// The experiments' data term and its gradient.
+/// The stream buffer's cotangent (`buffer` rows) from `seed` on the scored `rows` (in their order),
+/// times `weight`.
+fn spread(d: &Device, buffer: usize, rows: &[Range<usize>], seed: &Tensor, weight: f64) -> Result<Tensor, String> {
+    let mut cotangent = d.zeros(buffer, seed.cols()).map_err(error)?;
+    let mut at = 0;
+    for r in rows {
+        let mut total = d.rows_of(&cotangent, r.start, r.len()).map_err(error)?;
+        d.axpy(&mut total, weight, &d.rows_of(seed, at, r.len()).map_err(error)?).map_err(error)?;
+        d.set_rows(&mut cotangent, r.start, &total).map_err(error)?;
+        at += r.len();
+    }
+    Ok(cotangent)
+}
+
+/// One batch's scores and gradients ([`evaluate`], [`evaluate_labelled`]).
 pub struct Evaluation {
-    /// Per experiment, per base token from its position on, `KL(M_e ‖ P_e)` in bits.
+    /// Per experiment, per base token from its position on, `KL(M_e ‖ P_e)` in bits (empty when no
+    /// targets were given).
     pub bits: Vec<Vec<f64>>,
     /// The gradient of the sum of `bits` in each of `P`'s trainable operators, on the device (empty
     /// when not asked for).
     pub gradient: BTreeMap<usize, Tensor>,
+    /// A draw of the Gauss–Newton factor, when asked for ([`evaluate_labelled`]).
+    pub factor: Option<Factor>,
+}
+
+/// A draw of the Gauss–Newton factor of a batch's experiments: the gradient `u`, in each of `P`'s
+/// trainable operators on the device, of `Σ_t log P_e(y_t)` over every scored token `t` of every
+/// experiment `e`, each label `y_t` drawn from `P_e`'s own prediction there, and the number of
+/// tokens `n`. The labels are independent across tokens with `E[e_y] = p`, so
+/// `E[u uᵀ] = Σ_t J_tᵀ (diag p_t − p_t p_tᵀ) J_t`: `u ⊙ u / n` is an unbiased estimate of the
+/// diagonal of the data term's Gauss–Newton curvature per token (the Hessian of `KL(M_e ‖ P_e)` in
+/// `P`'s logits is `P`'s softmax Fisher matrix whatever `M_e` is).
+pub struct Factor {
+    pub gradient: BTreeMap<usize, Tensor>,
+    pub tokens: usize,
+}
+
+/// The cotangent at the final normed stream `hidden` (rows × width) of `−Σ_r log P(y_r)` for one
+/// label `y_r` per row drawn from `P`'s prediction `softmax(E h_r)` there with that row's entry of
+/// `uniforms` (`embedding` is `E`, classes × width): per row `(p_r − e_{y_r}) E`. The logits are
+/// formed `tile` rows at a time.
+pub fn sampled_label_seed(d: &Device, hidden: &Tensor, embedding: &Tensor, tile: usize, uniforms: &[f64], arithmetic: Arithmetic) -> Result<Tensor, String> {
+    let (rows, classes) = (hidden.rows(), embedding.rows());
+    if uniforms.len() != rows || tile == 0 {
+        return Err(error("one uniform per row and positive tile rows required"));
+    }
+    let mut seed = d.zeros(rows, hidden.cols()).map_err(error)?;
+    for start in (0..rows).step_by(tile) {
+        let n = tile.min(rows - start);
+        let h = d.rows_of(hidden, start, n).map_err(error)?;
+        let mut logits = d.zeros(n, classes).map_err(error)?;
+        d.gemm(&mut logits, 1.0, &h, Op::N, embedding, Op::T, 0.0, arithmetic).map_err(error)?;
+        let uniforms = d.upload_vec(n, 1, uniforms[start..start + n].to_vec()).map_err(error)?;
+        d.sampled_cotangent(&mut logits, &uniforms, None).map_err(error)?;
+        let mut part = d.zeros(n, hidden.cols()).map_err(error)?;
+        d.gemm(&mut part, 1.0, &logits, Op::N, embedding, Op::N, 0.0, arithmetic).map_err(error)?;
+        d.set_rows(&mut seed, start, &part).map_err(error)?;
+    }
+    Ok(seed)
 }
 
 /// `KL(M_e ‖ P_e)` per token for each of `experiments` on `batch` from its position on (module
@@ -1260,55 +1313,77 @@ pub struct Evaluation {
 /// `targets` for them, and with `gradient` its sum's gradient in `P`'s trainable operators. `M`
 /// runs here only as the hybrids' blocks it keeps.
 pub fn evaluate<E: BlockEngine>(m: &E, p: &E, head: &FixedHead, batch: &Batch, targets: &Targets, experiments: &[Experiment], design: &Design, gradient: bool) -> Result<Evaluation, String> {
+    evaluate_labelled((m, p), head, (batch, experiments, design), Some(targets), gradient, None)
+}
+
+/// [`evaluate`] of `experiments` on `batch` under `design`, with the scores only when `targets` are
+/// given, and with `labels` also a draw of the Gauss–Newton factor ([`Factor`]), each scored row's
+/// label drawn with its entry of `labels` (rows in experiment order): a second reverse pass through
+/// the same forward pass, seeded at every scored token by [`sampled_label_seed`].
+pub fn evaluate_labelled<E: BlockEngine>(
+    (m, p): (&E, &E),
+    head: &FixedHead,
+    (batch, experiments, design): (&Batch, &[Experiment], &Design),
+    targets: Option<&Targets>,
+    gradient: bool,
+    labels: Option<&[f64]>,
+) -> Result<Evaluation, String> {
     let d = p.device();
     let (blocks, length, width) = (p.blocks(), batch.length, p.width());
-    if m.blocks() != blocks || m.width() != width || design.bases.len() != experiments.len() || targets.rows.len() != experiments.len() {
+    if m.blocks() != blocks || m.width() != width || design.bases.len() != experiments.len() || targets.is_some_and(|t| t.rows.len() != experiments.len()) {
         return Err(error("models, design or targets do not match"));
     }
-    for (e, t) in experiments.iter().zip(&targets.rows) {
+    if gradient && targets.is_none() {
+        return Err(error("the divergence's gradient needs targets"));
+    }
+    for (i, e) in experiments.iter().enumerate() {
         check(e, batch, blocks)?;
-        if t.entropy.len() != length - e.position {
+        if targets.is_some_and(|t| t.rows[i].entropy.len() != length - e.position) {
             return Err(error("a target of other rows than its experiment's"));
         }
     }
     let (paths, bases) = paths(batch, experiments, design, None, blocks)?;
     let plan = Plan::new(paths, length);
     let arithmetic = p.arithmetic();
-    let (stream, calls) = run([p, m], &plan, gradient)?;
-    // Scores against the targets, each experiment from its position on.
+    let (stream, calls) = run([p, m], &plan, gradient || labels.is_some())?;
+    // Each experiment's scored rows, from its position on.
     let rows = outputs(&plan, &bases, experiments);
     let hidden = gather(d, &stream, &rows)?;
-    let mut mu = d.zeros(hidden.rows(), width).map_err(error)?;
-    let mut entropy = Vec::with_capacity(hidden.rows());
-    let mut at = 0;
-    for (r, t) in rows.iter().zip(&targets.rows) {
-        d.set_rows(&mut mu, at, &t.mu).map_err(error)?;
-        entropy.extend_from_slice(&t.entropy);
-        at += r.len();
-    }
-    let target = Target { mu: Arc::new(mu), entropy, head: Arc::clone(&head.head), scored: None };
-    let (nats, seed) = head.resident.score(d, &hidden, &target, gradient, arithmetic)?;
-    let mut bits = Vec::with_capacity(experiments.len());
-    let mut at = 0;
-    for r in &rows {
-        bits.push(nats[at..at + r.len()].iter().map(|v| v / std::f64::consts::LN_2).collect());
-        at += r.len();
-    }
-    if !gradient {
-        return Ok(Evaluation { bits, gradient: BTreeMap::new() });
-    }
-    let seed = seed.ok_or_else(|| error("the head returned no cotangent"))?;
-    let mut cotangent = d.zeros(stream.rows(), width).map_err(error)?;
-    let mut at = 0;
-    for r in &rows {
-        let mut total = d.rows_of(&cotangent, r.start, r.len()).map_err(error)?;
-        d.axpy(&mut total, 1.0 / std::f64::consts::LN_2, &d.rows_of(&seed, at, r.len()).map_err(error)?).map_err(error)?;
-        d.set_rows(&mut cotangent, r.start, &total).map_err(error)?;
-        at += r.len();
-    }
+    let spread = |seed: &Tensor, weight: f64| spread(d, stream.rows(), &rows, seed, weight);
+    let mut bits = Vec::new();
     let mut total = BTreeMap::new();
-    run_reverse([p, m], &plan, calls, cotangent, &mut total)?;
-    Ok(Evaluation { bits, gradient: total })
+    if let Some(targets) = targets {
+        let mut mu = d.zeros(hidden.rows(), width).map_err(error)?;
+        let mut entropy = Vec::with_capacity(hidden.rows());
+        let mut at = 0;
+        for (r, t) in rows.iter().zip(&targets.rows) {
+            d.set_rows(&mut mu, at, &t.mu).map_err(error)?;
+            entropy.extend_from_slice(&t.entropy);
+            at += r.len();
+        }
+        let target = Target { mu: Arc::new(mu), entropy, head: Arc::clone(&head.head), scored: None };
+        let (nats, seed) = head.resident.score(d, &hidden, &target, gradient, arithmetic)?;
+        bits.reserve(experiments.len());
+        let mut at = 0;
+        for r in &rows {
+            bits.push(nats[at..at + r.len()].iter().map(|v| v / std::f64::consts::LN_2).collect());
+            at += r.len();
+        }
+        if gradient {
+            let seed = seed.ok_or_else(|| error("the head returned no cotangent"))?;
+            run_reverse([p, m], &plan, &calls, spread(&seed, 1.0 / std::f64::consts::LN_2)?, &mut total)?;
+        }
+    }
+    let factor = match labels {
+        Some(uniforms) => {
+            let seed = sampled_label_seed(d, &hidden, &head.resident.embedding, head.resident.tile_rows.max(1), uniforms, arithmetic)?;
+            let mut u = BTreeMap::new();
+            run_reverse([p, m], &plan, &calls, spread(&seed, 1.0)?, &mut u)?;
+            Some(Factor { gradient: u, tokens: hidden.rows() })
+        }
+        None => None,
+    };
+    Ok(Evaluation { bits, gradient: total, factor })
 }
 
 /// The gradient in `P`'s trainable operators of `Σ log P_e(y)` over every scored token of
@@ -1319,49 +1394,8 @@ pub fn evaluate<E: BlockEngine>(m: &E, p: &E, head: &FixedHead, batch: &Batch, t
 /// `Σ_t J_tᵀ F_t J_t` with `F_t` the Fisher matrix of `P_e`'s softmax at `t`: the matrix that is the
 /// divergence's Hessian where `P_e`'s predictions equal `M_e`'s.
 pub fn sampled_label<E: BlockEngine>(m: &E, p: &E, head: &FixedHead, batch: &Batch, experiments: &[Experiment], design: &Design, uniforms: &[f64]) -> Result<BTreeMap<usize, Tensor>, String> {
-    let d = p.device();
-    let (blocks, length, width) = (p.blocks(), batch.length, p.width());
-    if m.blocks() != blocks || m.width() != width || design.bases.len() != experiments.len() {
-        return Err(error("models or design do not match"));
-    }
-    for e in experiments {
-        check(e, batch, blocks)?;
-    }
-    let (paths, bases) = paths(batch, experiments, design, None, blocks)?;
-    let plan = Plan::new(paths, length);
-    let arithmetic = p.arithmetic();
-    let (stream, calls) = run([p, m], &plan, true)?;
-    let rows = outputs(&plan, &bases, experiments);
-    let hidden = gather(d, &stream, &rows)?;
-    if uniforms.len() != hidden.rows() {
-        return Err(error("one uniform per scored row required"));
-    }
-    // The sampled cotangent of each tile's logits `h Eᵀ` (`p − e_y`), pulled back through the head.
-    let embedding = &head.resident.embedding;
-    let tile = head.resident.tile_rows.max(1);
-    let mut seed = d.zeros(hidden.rows(), width).map_err(error)?;
-    for start in (0..hidden.rows()).step_by(tile) {
-        let n = tile.min(hidden.rows() - start);
-        let h = d.rows_of(&hidden, start, n).map_err(error)?;
-        let mut logits = d.zeros(n, embedding.rows()).map_err(error)?;
-        d.gemm(&mut logits, 1.0, &h, Op::N, embedding, Op::T, 0.0, arithmetic).map_err(error)?;
-        let u = d.upload_vec(n, 1, uniforms[start..start + n].to_vec()).map_err(error)?;
-        d.sampled_cotangent(&mut logits, &u, None).map_err(error)?;
-        let mut pulled = d.zeros(n, width).map_err(error)?;
-        d.gemm(&mut pulled, 1.0, &logits, Op::N, embedding, Op::N, 0.0, arithmetic).map_err(error)?;
-        d.set_rows(&mut seed, start, &pulled).map_err(error)?;
-    }
-    let mut cotangent = d.zeros(stream.rows(), width).map_err(error)?;
-    let mut at = 0;
-    for r in &rows {
-        let mut total = d.rows_of(&cotangent, r.start, r.len()).map_err(error)?;
-        d.axpy(&mut total, 1.0, &d.rows_of(&seed, at, r.len()).map_err(error)?).map_err(error)?;
-        d.set_rows(&mut cotangent, r.start, &total).map_err(error)?;
-        at += r.len();
-    }
-    let mut gradient = BTreeMap::new();
-    run_reverse([p, m], &plan, calls, cotangent, &mut gradient)?;
-    Ok(gradient)
+    let evaluation = evaluate_labelled((m, p), head, (batch, experiments, design), None, false, Some(uniforms))?;
+    Ok(evaluation.factor.ok_or_else(|| error("no Gauss–Newton factor"))?.gradient)
 }
 
 /// The experiments of one batch scored at `P`'s loaded parameters.
@@ -1521,17 +1555,22 @@ impl Interchange {
     /// `P`'s score on `experiments` against `targets` ([`evaluate`]), the gradient left on the
     /// device per trainable operator.
     pub fn evaluate_resident(&self, batch: &Batch, experiments: &[Experiment], design: &Design, targets: &Targets, gradient: bool) -> Result<Evaluation, String> {
+        self.evaluate_labelled(batch, experiments, design, Some(targets), gradient, None)
+    }
+
+    /// [`evaluate_labelled`] of `P` as it is held, the gradients left on the device.
+    pub fn evaluate_labelled(&self, batch: &Batch, experiments: &[Experiment], design: &Design, targets: Option<&Targets>, gradient: bool, labels: Option<&[f64]>) -> Result<Evaluation, String> {
         match &self.engines {
             Some((m, p)) => {
                 if self.stale.replace(false) {
                     p.try_borrow_mut().map_err(error)?.refresh(&self.p)?;
                 }
                 let p = p.try_borrow().map_err(error)?;
-                evaluate(m, &*p, &self.head, batch, targets, experiments, design, gradient)
+                evaluate_labelled((m, &*p), &self.head, (batch, experiments, design), targets, gradient, labels)
             }
             None => {
                 let (m, p) = self.models();
-                evaluate(&m, &p, &self.head, batch, targets, experiments, design, gradient)
+                evaluate_labelled((&m, &p), &self.head, (batch, experiments, design), targets, gradient, labels)
             }
         }
     }
@@ -1539,19 +1578,8 @@ impl Interchange {
     /// [`sampled_label`] at `P`'s loaded parameters, the gradient left on the device per trainable
     /// operator.
     pub fn sampled_label_resident(&self, batch: &Batch, experiments: &[Experiment], design: &Design, uniforms: &[f64]) -> Result<BTreeMap<usize, Tensor>, String> {
-        match &self.engines {
-            Some((m, p)) => {
-                if self.stale.replace(false) {
-                    p.try_borrow_mut().map_err(error)?.refresh(&self.p)?;
-                }
-                let p = p.try_borrow().map_err(error)?;
-                sampled_label(m, &*p, &self.head, batch, experiments, design, uniforms)
-            }
-            None => {
-                let (m, p) = self.models();
-                sampled_label(&m, &p, &self.head, batch, experiments, design, uniforms)
-            }
-        }
+        let evaluation = self.evaluate_labelled(batch, experiments, design, None, false, Some(uniforms))?;
+        Ok(evaluation.factor.ok_or_else(|| error("no Gauss–Newton factor"))?.gradient)
     }
 
     /// Load `P`'s trainable operators, in the order given to [`Interchange::new`].
@@ -1592,5 +1620,109 @@ impl Interchange {
             return Err(error("a nonfinite parameter gradient"));
         }
         Ok(Scored { bits: evaluation.bits, gradient })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        import::import_language_model,
+        library_mdl,
+        run_check::{layer_nodes, split_sites},
+        test_support::tiny_export,
+    };
+    use rand::{SeedableRng, rngs::StdRng};
+
+    /// The squared Gauss–Newton factor ([`Factor`]) estimates the diagonal of `Σ_r J_rᵀ F_r J_r`
+    /// over a batch's scored rows `r`, `F_r = diag p_r − p_r p_rᵀ` at `P`'s prediction `p_r`. The
+    /// exact diagonal is `Σ_r Σ_c p_rc (J_rᵀ (p_r − e_c))²`: one reverse pass per row and class
+    /// through the same forward pass, seeded at that row alone. The draws' mean of `u²` must lie
+    /// within five standard errors of it, for each operator's trace and for its largest entry.
+    #[test]
+    fn the_squared_factor_estimates_the_gauss_newton_diagonal() {
+        let dir = tiny_export("interchange_factor", 2);
+        let imported = import_language_model(&dir, 6, 12).expect("the tiny export imports");
+        std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+        let native = split_sites(&imported.program).expect("the native sites");
+        let layers = layer_nodes(&native, 2).expect("the layers");
+        let explanation = library_mdl::explanation(&native, &layers).expect("the library");
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let device = Device::host();
+        let blocks: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let reads = library_reads(&explanation.artifact.program, blocks.len()).expect("the reads");
+        let ic = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, reads, 1 << 30, 64).expect("the experiments");
+        let batch = Batch::new(sequences[..3].to_vec(), sequences[3..].to_vec()).expect("the batch");
+        let experiments = sample(&mut StdRng::seed_from_u64(3), 3, ic.variables(), 4, 12).expect("the draw");
+        let starting: Vec<ndarray::Array2<f64>> = explanation.trainable.iter().map(|op| explanation.artifact.program.operators[*op].matrix()).collect();
+        let design = ic.design_at(ic.variables(), &experiments, &starting).expect("the design");
+        // The exact diagonal.
+        let (m, p) = ic.models();
+        let (paths, bases) = paths(&batch, &experiments, &design, None, 4).expect("the paths");
+        let plan = Plan::new(paths, 12);
+        let (stream, calls) = run([&p, &m], &plan, true).expect("the forward pass");
+        let rows = outputs(&plan, &bases, &experiments);
+        let hidden = device.download(&gather(&device, &stream, &rows).expect("the scored rows")).expect("download");
+        let embedding = device.download(&ic.head().resident.embedding).expect("download");
+        let logits = hidden.dot(&embedding.t());
+        let mut exact: BTreeMap<usize, ndarray::Array2<f64>> = BTreeMap::new();
+        for r in 0..hidden.nrows() {
+            let top = logits.row(r).fold(f64::NEG_INFINITY, |a, b| a.max(*b));
+            let weights = logits.row(r).mapv(|z| (z - top).exp());
+            let prediction = &weights / weights.sum();
+            for c in 0..embedding.nrows() {
+                let mut residual = prediction.clone();
+                residual[c] -= 1.0;
+                let mut seed = ndarray::Array2::zeros(hidden.dim());
+                seed.row_mut(r).assign(&residual.dot(&embedding));
+                let cotangent = spread(&device, stream.rows(), &rows, &device.upload(seed.view()).expect("upload"), 1.0).expect("the seed");
+                let mut gradient = BTreeMap::new();
+                run_reverse([&p, &m], &plan, &calls, cotangent, &mut gradient).expect("the reverse pass");
+                for (op, g) in gradient {
+                    let g = device.download(&g).expect("download");
+                    let term = g.mapv(|v| prediction[c] * v * v);
+                    match exact.get_mut(&op) {
+                        Some(total) => *total += &term,
+                        None => {
+                            exact.insert(op, term);
+                        }
+                    }
+                }
+            }
+        }
+        // The draws.
+        let draws = 400;
+        let mut sums: BTreeMap<usize, (ndarray::Array2<f64>, ndarray::Array2<f64>, f64, f64)> = BTreeMap::new();
+        let mut rng = StdRng::seed_from_u64(7);
+        for _ in 0..draws {
+            let uniforms: Vec<f64> = (0..hidden.nrows()).map(|_| rng.random::<f64>()).collect();
+            let evaluation = ic.evaluate_labelled(&batch, &experiments, &design, None, false, Some(&uniforms)).expect("a draw");
+            let factor = evaluation.factor.expect("the factor");
+            assert_eq!(factor.tokens, hidden.nrows());
+            for (op, u) in factor.gradient {
+                let squared = device.download(&u).expect("download").mapv(|v| v * v);
+                let trace = squared.sum();
+                let entry = sums.entry(op).or_insert_with(|| (ndarray::Array2::zeros(squared.dim()), ndarray::Array2::zeros(squared.dim()), 0.0, 0.0));
+                entry.0 += &squared;
+                entry.1 += &squared.mapv(|v| v * v);
+                entry.2 += trace;
+                entry.3 += trace * trace;
+            }
+        }
+        let n = draws as f64;
+        let check = |what: String, sum: f64, square: f64, expected: f64| {
+            let mean = sum / n;
+            let error = ((square / n - mean * mean) / (n - 1.0)).max(0.0).sqrt();
+            assert!((mean - expected).abs() <= 5.0 * error + 1e-12 * expected.abs(), "{what}: mean {mean:e} of the draws against {expected:e} (standard error {error:e})");
+        };
+        assert_eq!(sums.keys().collect::<Vec<_>>(), exact.keys().collect::<Vec<_>>(), "the same operators receive the factor");
+        for (op, expected) in &exact {
+            let (sum, square, trace, trace_square) = &sums[op];
+            let name = &explanation.artifact.program.operators[*op].name;
+            check(format!("{name} trace"), *trace, *trace_square, expected.sum());
+            let (at, largest) = expected.indexed_iter().fold(((0, 0), 0.0), |best, (at, v)| if *v > best.1 { (at, *v) } else { best });
+            check(format!("{name} entry {at:?}"), sum[at], square[at], largest);
+        }
     }
 }

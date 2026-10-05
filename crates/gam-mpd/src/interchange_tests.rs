@@ -623,7 +623,7 @@ impl BlockEngine for Counting<'_> {
     fn reverse(
         &self,
         block: usize,
-        tape: DeviceTrace,
+        tape: &DeviceTrace,
         cotangent: &mut gam_gpu::tensor::Tensor,
         ranges: &[std::ops::Range<usize>],
         read: Option<&mut dyn FnMut(&mut gam_gpu::tensor::Tensor) -> Result<(), String>>,

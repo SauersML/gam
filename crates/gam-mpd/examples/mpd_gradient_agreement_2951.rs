@@ -108,7 +108,7 @@ fn local_gradient(ic: &Interchange, tokens: &[&[u32]], own: bool) -> Result<BTre
         m.forward(b, &mut after_m, &ranges, tokens, None, false)?;
         let mut cotangent = d.copy(&after_p).map_err(error)?;
         d.axpy(&mut cotangent, -1.0, &after_m).map_err(error)?;
-        p.reverse(b, tape, &mut cotangent, &ranges, None, &mut gradient)?;
+        p.reverse(b, &tape, &mut cotangent, &ranges, None, &mut gradient)?;
         stream = if own { after_p } else { after_m };
     }
     Ok(gradient)
@@ -167,7 +167,7 @@ fn sampled_label_gradient(ic: &Interchange, head: &Tensor, tokens: &[&[u32]], rn
     let mut gradient = BTreeMap::new();
     for b in (0..tapes.len()).rev() {
         let tape = tapes.pop().ok_or("a block without its tape")?;
-        p.reverse(b, tape, &mut cotangent, &ranges, None, &mut gradient)?;
+        p.reverse(b, &tape, &mut cotangent, &ranges, None, &mut gradient)?;
     }
     Ok(gradient)
 }
