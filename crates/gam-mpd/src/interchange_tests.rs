@@ -565,7 +565,7 @@ fn directions_from_host_values_are_those_of_the_loaded_explanation() {
 struct Counting<'a> {
     model: Model<'a>,
     rows: std::cell::Cell<usize>,
-    /// The bytes its forward passes' tapes may hold.
+    /// The most bytes its forward passes' tapes may hold, within the reference's own budget.
     budget: usize,
 }
 
@@ -621,8 +621,8 @@ impl BlockEngine for Counting<'_> {
         self.model.gradient_bytes()
     }
 
-    fn tape_budget(&self, _rows: usize) -> Result<usize, String> {
-        Ok(self.budget)
+    fn tape_budget(&self, rows: usize) -> Result<usize, String> {
+        Ok(self.budget.min(self.model.tape_budget(rows)?))
     }
 }
 
