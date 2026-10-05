@@ -100,6 +100,9 @@ struct Settings {
     context: usize,
     /// Host label cache plus numeric native forward buffers; excludes library/allocator overhead.
     teacher_numeric_bytes: usize,
+    /// Optional compact labels; currently structural mode only.
+    #[serde(default)]
+    fixed_head_targets: Option<FixedHeadSettings>,
     /// Immutable native codewords and decoded buffers only; zero disables cache.
     #[serde(default)]
     native_codec_bytes: usize,
@@ -125,11 +128,208 @@ struct Settings {
     #[serde(default)]
     evaluation: Option<Evaluation>,
 }
+#[derive(Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct FixedHeadSettings {
+    tile_rows: usize,
+}
+
+/// Label-independent capture metadata; never masquerades as a full-logit episode.
+#[derive(Clone)]
+struct ResponseEpisode {
+    label: String,
+    inputs: FamilyInputs,
+    scored: Option<Vec<bool>>,
+    endpoint_bytes: usize,
+}
+fn response_metadata(episodes: &[Episode]) -> Vec<ResponseEpisode> {
+    episodes
+        .iter()
+        .map(|e| ResponseEpisode {
+            label: e.label.clone(),
+            inputs: e.inputs.clone(),
+            scored: e.scored.clone(),
+            endpoint_bytes: e.target_logits.len().saturating_mul(8),
+        })
+        .collect()
+}
+struct CausalEpisodes {
+    metadata: Vec<ResponseEpisode>,
+    full: Option<Vec<Episode>>,
+    compact: Option<Vec<resident_causal_fit::FixedHeadEpisode>>,
+    tile_rows: usize,
+    target_metadata: Value,
+}
+impl CausalEpisodes {
+    fn from_family(
+        d: &Device,
+        lowered: &intervention_program::Compiled,
+        source: &OperatorProgram,
+        controls: &[Control],
+        family: &FamilyInputs,
+        cases: &[Case],
+        labels: &[Array2<f64>],
+        config: Option<&FixedHeadSettings>,
+        teacher_bytes: usize,
+    ) -> Result<Self, String> {
+        let Some(config) = config else {
+            let full = episodes(lowered, source, controls, family, cases, labels, None)?;
+            return Ok(Self {
+                metadata: response_metadata(&full),
+                full: Some(full),
+                compact: None,
+                tile_rows: 0,
+                target_metadata: json!({"backend":"full_logits"}),
+            });
+        };
+        if config.tile_rows == 0 || !labels.is_empty() {
+            return Err(
+                "compact episodes require positive tile_rows and no full-logit intermediate".into(),
+            );
+        }
+        let teacher = resident_causal_fit::fixed_head_target::Teacher::new(
+            d,
+            &lowered.program,
+            config.tile_rows,
+            teacher_bytes,
+        )?;
+        let mut metadata = Vec::new();
+        let mut compact = Vec::new();
+        let mut bytes = 0usize;
+        let mut entropy_bytes = 0usize;
+        for case in cases {
+            let inputs = lowered.family(family, &values(source, controls, family.rows, case)?)?;
+            let target = teacher.target(&inputs, None)?;
+            let target_bytes = target
+                .numeric_bytes()
+                .checked_add(
+                    target
+                        .rows()
+                        .checked_mul(8)
+                        .ok_or("entropy bytes overflow")?,
+                )
+                .ok_or("target bytes overflow")?;
+            bytes = bytes
+                .checked_add(target.numeric_bytes())
+                .ok_or("compact bytes overflow")?;
+            entropy_bytes = entropy_bytes
+                .checked_add(target.rows() * 8)
+                .ok_or("entropy bytes overflow")?;
+            metadata.push(ResponseEpisode {
+                label: case.label.clone(),
+                inputs: inputs.clone(),
+                scored: None,
+                endpoint_bytes: target_bytes,
+            });
+            compact.push(resident_causal_fit::FixedHeadEpisode {
+                label: case.label.clone(),
+                group: case.group.clone(),
+                inputs,
+                target,
+            });
+        }
+        Ok(Self {
+            metadata,
+            full: None,
+            compact: Some(compact),
+            tile_rows: config.tile_rows,
+            target_metadata: json!({"backend":"fixed_head","tile_rows":config.tile_rows,"resident_mu_numeric_bytes":bytes,"host_entropy_numeric_bytes":entropy_bytes,"full_logit_target_bytes":0,"teacher_numeric_bytes_limit":teacher_bytes,"scope":"Immutable bias-free dense head sufficient statistics; full candidate vocabulary normalization retained. Operational arithmetic, not certified acceptance."}),
+        })
+    }
+    fn fit(
+        &self,
+        d: &Device,
+        source: &OperatorProgram,
+        responses: Option<&resident_causal_fit::NativeResponses>,
+        trainable: &[usize],
+        settings: FitSettings,
+    ) -> Result<resident_causal_fit::Fit, String> {
+        match (&self.compact, responses) {
+            (Some(e), Some(r)) => resident_causal_fit::fit_fixed_head_with_native(
+                d,
+                source,
+                e,
+                r,
+                trainable,
+                settings,
+                self.tile_rows,
+            ),
+            (Some(e), None) => resident_causal_fit::fit_fixed_head(
+                d,
+                source,
+                e,
+                trainable,
+                settings,
+                self.tile_rows,
+            ),
+            (None, Some(r)) => resident_causal_fit::fit_with_native(
+                d,
+                source,
+                self.full
+                    .as_deref()
+                    .ok_or("full-logit dispatch missing episodes")?,
+                r,
+                trainable,
+                settings,
+            ),
+            (None, None) => resident_causal_fit::fit(
+                d,
+                source,
+                self.full
+                    .as_deref()
+                    .ok_or("full-logit dispatch missing episodes")?,
+                trainable,
+                settings,
+            ),
+        }
+    }
+    fn measure(
+        &self,
+        d: &Device,
+        source: &OperatorProgram,
+        responses: Option<&resident_causal_fit::NativeResponses>,
+        bytes: usize,
+    ) -> Result<resident_causal_fit::Measurement, String> {
+        match (&self.compact, responses) {
+            (Some(e), Some(r)) => resident_causal_fit::measure_fixed_head_with_native(
+                d,
+                source,
+                e,
+                r,
+                bytes,
+                self.tile_rows,
+            ),
+            (Some(e), None) => {
+                resident_causal_fit::measure_fixed_head(d, source, e, bytes, self.tile_rows)
+            }
+            (None, Some(r)) => resident_causal_fit::measure_with_native(
+                d,
+                source,
+                self.full
+                    .as_deref()
+                    .ok_or("full-logit dispatch missing episodes")?,
+                r,
+                bytes,
+            ),
+            (None, None) => resident_causal_fit::measure(
+                d,
+                source,
+                self.full
+                    .as_deref()
+                    .ok_or("full-logit dispatch missing episodes")?,
+                bytes,
+            ),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StructuralSettings {
     settings: program_structure_search::Settings,
     constraints: program_structure_search::Constraints,
+    /// Combined frozen-evaluation limit for direct expressions, shared DAGs,
+    /// and learned DAGs, in deterministic training admission order.
     #[serde(default)]
     max_expression_evaluations: usize,
     /// Optional mean native-trajectory response loss during proposal fitting.
@@ -543,6 +743,36 @@ fn teacher_targets(
 
 /// Fixed native trajectory labels at every changed observable boundary. These
 /// arrays only enter the loss; the candidate still executes from its own states.
+fn native_response_targets_records(
+    d: &Device,
+    native: &OperatorProgram,
+    candidate: &Artifact,
+    records: &[ResponseEpisode],
+    weight: f64,
+    limit: usize,
+) -> Result<(resident_causal_fit::NativeResponses, Value), String> {
+    let mut boundaries = BTreeMap::new();
+    for b in &candidate.blocks {
+        if boundaries
+            .insert(b.native_write, b.write)
+            .is_some_and(|old| old != b.write)
+        {
+            return Err("conflicting native response boundaries".into());
+        }
+        if candidate
+            .program
+            .node_interface(b.write)
+            .map_err(|e| e.to_string())?
+            != native
+                .node_interface(b.native_write)
+                .map_err(|e| e.to_string())?
+        {
+            return Err("native response boundary changed interface".into());
+        }
+    }
+    native_response_targets_mapped(d, native, &boundaries, records, weight, limit)
+}
+#[cfg(test)]
 fn native_response_targets(
     d: &Device,
     native: &OperatorProgram,
@@ -570,7 +800,14 @@ fn native_response_targets(
             return Err("native response boundary has changed interface".into());
         }
     }
-    native_response_targets_mapped(d, native, &boundaries, episodes, weight, limit)
+    native_response_targets_mapped(
+        d,
+        native,
+        &boundaries,
+        &response_metadata(episodes),
+        weight,
+        limit,
+    )
 }
 
 // Targets are independently executed native states; this map identifies only
@@ -579,7 +816,7 @@ fn native_response_targets_mapped(
     d: &Device,
     native: &OperatorProgram,
     boundaries: &BTreeMap<usize, usize>,
-    episodes: &[Episode],
+    episodes: &[ResponseEpisode],
     weight: f64,
     limit: usize,
 ) -> Result<(resident_causal_fit::NativeResponses, Value), String> {
@@ -596,6 +833,9 @@ fn native_response_targets_mapped(
                 .is_some_and(|m| m.len() != e.inputs.rows || !m.iter().any(|v| *v))
     }) {
         return Err("nonempty exact response row domains required".into());
+    }
+    if boundaries.keys().any(|n| *n >= native.nodes.len()) {
+        return Err("native response node out of range".into());
     }
     let (mut expanded, mapping) = gam_mpd::artifact_device::mapped_inlined(native)?;
     let last = boundaries
@@ -639,10 +879,7 @@ fn native_response_targets_mapped(
         .and_then(|n| n.checked_mul(8 * 12))
         .ok_or("response attention bytes overflow")?;
     let existing_logits = episodes.iter().try_fold(0usize, |sum, e| {
-        e.target_logits
-            .len()
-            .checked_mul(8)
-            .and_then(|n| sum.checked_add(n))
+        sum.checked_add(e.endpoint_bytes)
             .ok_or("response endpoint labels overflow")
     })?;
     let planned = resident
@@ -767,7 +1004,7 @@ fn down_response_targets(
         d,
         &teacher.program,
         &map,
-        &teacher_episodes,
+        &response_metadata(&teacher_episodes),
         weight,
         limit,
     )?;
@@ -1179,6 +1416,20 @@ fn native_uses(
         })
         .collect()
 }
+// Explicit operational proposal convention, not an arithmetic enclosure.
+const OPERATIONAL_NEGATIVE_KL_TOLERANCE: f64 = 1e-10;
+fn operational_kl_axis(raw: f64) -> Result<f64, String> {
+    if !raw.is_finite() || raw < -OPERATIONAL_NEGATIVE_KL_TOLERANCE {
+        return Err(format!(
+            "operational KL {raw} is nonfinite or below declared negative roundoff tolerance {}",
+            OPERATIONAL_NEGATIVE_KL_TOLERANCE
+        ));
+    }
+    Ok(raw.max(0.))
+}
+fn rounding_policy() -> Value {
+    json!({"negative_kl_tolerance":OPERATIONAL_NEGATIVE_KL_TOLERANCE,"search_axis":"finite raw KL in [-tolerance,0) maps to zero for nonnegative proposal search axes only; more-negative/nonfinite scores reject","raw_reports":"INITIAL_TRAIN.json,TRAIN.json,and heldout measurements preserve unmodified fitter scores","scope":"Operational-only integration convention, not a proved rounding bound or accuracy certificate. Fitter, gradients, snapshots and certified acceptance are unchanged. Validates each reported episode mean/maximum, group mean and objective; no unreported per-row minimum certificate."})
+}
 fn structure_evaluation(
     artifact: &Artifact,
     measured: &resident_causal_fit::Measurement,
@@ -1188,10 +1439,14 @@ fn structure_evaluation(
     if !local_error.is_finite() {
         return Err("nonfinite structural Local measurement".into());
     }
+    for episode in &measured.episodes {
+        operational_kl_axis(episode.mean_kl)?;
+        operational_kl_axis(episode.maximum_scored_row_kl)?;
+    }
     Ok(StructureEvaluation {
         fidelity: vec![Metric {
             name: "maximum_group_mean_kl".into(),
-            value: measured.objective,
+            value: operational_kl_axis(measured.objective)?,
         }],
         local_errors: vec![Metric {
             name: "sampled_d_local".into(),
@@ -1200,11 +1455,13 @@ fn structure_evaluation(
         intervention_errors: measured
             .groups
             .iter()
-            .map(|(name, value)| Metric {
-                name: name.clone(),
-                value: *value,
+            .map(|(name, value)| {
+                Ok(Metric {
+                    name: name.clone(),
+                    value: operational_kl_axis(*value)?,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, String>>()?,
         description_bits: structural_cost(artifact, costs)?.total() as f64,
     })
 }
@@ -1218,7 +1475,11 @@ fn frozen_structural_ids(
         .filter(|r| {
             matches!(
                 r.mutation,
-                Some(Mutation::SynthesizeExpression { .. } | Mutation::SynthesizeSharedDAG { .. })
+                Some(
+                    Mutation::SynthesizeExpression { .. }
+                        | Mutation::SynthesizeSharedDAG { .. }
+                        | Mutation::SynthesizeLearnedDAG { .. }
+                )
             )
         })
         .take(expression_limit)
@@ -1282,6 +1543,7 @@ fn structural_run(
     {
         return Err("native_response_weight must be finite and positive when supplied".into());
     }
+    save(&out.join("ROUNDING_POLICY.json"), &rounding_policy())?;
     let native_controls = controls(
         &Artifact::native(native)?,
         native,
@@ -1289,21 +1551,25 @@ fn structural_run(
         &settings.controls,
     )?;
     let controlled = intervention_program::compile(native, &native_controls)?;
-    let training = episodes(
+    let training = CausalEpisodes::from_family(
+        d,
         &controlled,
         native,
         &native_controls,
         family,
         &settings.cases,
         targets,
-        None,
+        settings.fixed_head_targets.as_ref(),
+        settings.teacher_numeric_bytes,
     )?;
+    save(&out.join("TEACHER_TARGETS.json"), &training.target_metadata)?;
     let mut all_inputs = training
+        .metadata
         .first()
         .ok_or("no controlled episodes")?
         .inputs
         .clone();
-    for e in training.iter().skip(1) {
+    for e in training.metadata.iter().skip(1) {
         all_inputs = all_inputs.append(&e.inputs).map_err(|e| e.to_string())?;
     }
     let local =
@@ -1315,11 +1581,11 @@ fn structural_run(
         &out.join("CONTROLLED_SOURCE.json"),
         &json!({"original_controls":settings.controls,"original_to_controlled_root_mapping":controlled.root_mapping,"control_slots":controlled.control_slots.iter().map(|s|json!({"control":s.control,"slot":s.slot,"width":s.width})).collect::<Vec<_>>(),"cases":settings.cases,"source_scope":"Original native graph augmented once with declared Raw control inputs and ordinary arithmetic. Structural candidate predicts from its own states and these controls; no per-candidate native intervention translator.","local_scope":"Measured controlled-native parent states over all declared training control episodes, RMS scale over that augmented family; not original unconditioned acceptance Dlocal.","global_scale_arithmetic":"Post-contribution multiplication, real-algebra equivalent to native shared-weight gain; not literal edited-checkpoint binary arithmetic equality.","codec_scope":"Ordinary standalone augmented artifact; original-native codec cache intentionally unsupported."}),
     )?;
-    let initial_measure = resident_causal_fit::measure(
-        d,
-        &initial_source.program,
-        &training,
-        settings.fit.numeric_bytes,
+    let initial_measure =
+        training.measure(d, &initial_source.program, None, settings.fit.numeric_bytes)?;
+    save(
+        &out.join("INITIAL_TRAIN.json"),
+        &serde_json::to_value(&initial_measure).map_err(|e| e.to_string())?,
     )?;
     let initial = EvaluatedArtifact {
         evaluation: structure_evaluation(
@@ -1359,30 +1625,32 @@ fn structural_run(
                 {
                     return Err("exact extraction must remain fit-free".into());
                 }
+                let mut fitted_responses = None;
                 if !request.trainable_operator_ids.is_empty() {
                     let fitted = if let Some(weight) = structural.native_response_weight {
-                        let (response_targets, provenance) = native_response_targets(
+                        let (response_targets, provenance) = native_response_targets_records(
                             d,
                             &controlled.program,
                             &candidate,
-                            &training,
+                            &training.metadata,
                             weight,
                             settings.teacher_numeric_bytes,
                         )?;
                         save(&root.join("NATIVE_RESPONSE_TARGETS.json"), &provenance)?;
-                        resident_causal_fit::fit_with_native(
+                        let fitted = training.fit(
                             d,
                             &candidate.program,
-                            &training,
-                            &response_targets,
+                            Some(&response_targets),
                             request.trainable_operator_ids,
                             settings.fit.clone(),
-                        )?
+                        )?;
+                        fitted_responses = Some(response_targets);
+                        fitted
                     } else {
-                        resident_causal_fit::fit(
+                        training.fit(
                             d,
                             &candidate.program,
-                            &training,
+                            None,
                             request.trainable_operator_ids,
                             settings.fit.clone(),
                         )?
@@ -1421,16 +1689,24 @@ fn structural_run(
                         }
                     }
                 }
-                let measured = resident_causal_fit::measure(
-                    d,
-                    &saved.program,
-                    &training,
-                    settings.fit.numeric_bytes,
-                )?;
+                let measured =
+                    training.measure(d, &saved.program, None, settings.fit.numeric_bytes)?;
                 save(
                     &root.join("TRAIN.json"),
                     &serde_json::to_value(&measured).map_err(|e| e.to_string())?,
                 )?;
+                if let Some(responses) = &fitted_responses {
+                    let supervised = training.measure(
+                        d,
+                        &saved.program,
+                        Some(responses),
+                        settings.fit.numeric_bytes,
+                    )?;
+                    save(
+                        &root.join("TRAIN_RESPONSES.json"),
+                        &json!({"measurement":supervised,"pure_kl_report":"TRAIN.json","native_labels_reused":true,"target_backend":training.target_metadata}),
+                    )?;
+                }
                 let evaluation = structure_evaluation(&saved, &measured, local_error, costs)?;
                 save(
                     &root.join("STATUS.json"),
@@ -1487,7 +1763,7 @@ fn structural_run(
     }
     save(
         &out.join("FROZEN_EVALUATION_IDS.json"),
-        &json!({"ids":frozen,"compression_frontier":result.frontier,"expression_hypotheses":expression_hypotheses,"max_expression_evaluations":structural.max_expression_evaluations,"policy":"Native baseline plus training compression frontier plus first declared-N admitted expression hypotheses in deterministic admission order, including dominated/evicted states. Frozen before heldout access.","scope":"Hypothesis admission is not discovery or understanding; augmented-source sampled Local and operational causal KL."}),
+        &json!({"ids":frozen,"compression_frontier":result.frontier,"expression_hypotheses":expression_hypotheses,"max_expression_evaluations":structural.max_expression_evaluations,"policy":"Native baseline plus training compression frontier plus first declared-N admitted direct-expression, shared-DAG, or learned-DAG hypotheses under one combined limit in deterministic admission order, including dominated/evicted states. Frozen before heldout access.","scope":"Hypothesis admission is not discovery or understanding; augmented-source sampled Local and operational causal KL."}),
     )?;
     let mut heldout_rows = Vec::new();
     if let (Some(eval), Some(export)) = (&settings.evaluation, heldout_export) {
@@ -1501,29 +1777,39 @@ fn structural_run(
         }
         disjoint_token_sequences(family, &imported.contract.family, settings.context)?;
         let cases = eval.cases.as_deref().unwrap_or(&settings.cases);
-        let (labels, plan) = family_teacher_targets(
+        let (labels, plan) = if settings.fixed_head_targets.is_some() {
+            (Vec::new(), 0)
+        } else {
+            family_teacher_targets(
+                d,
+                original_native,
+                layers,
+                &settings.controls,
+                &imported.contract.family,
+                cases,
+                None,
+                settings.fit.numeric_bytes,
+                settings.teacher_numeric_bytes,
+            )?
+        };
+        let eval_episodes = CausalEpisodes::from_family(
             d,
-            original_native,
-            layers,
-            &settings.controls,
-            &imported.contract.family,
-            cases,
-            None,
-            settings.fit.numeric_bytes,
-            settings.teacher_numeric_bytes,
-        )?;
-        let eval_episodes = episodes(
             &controlled,
             native,
             &native_controls,
             &imported.contract.family,
             cases,
             &labels,
-            None,
+            settings.fixed_head_targets.as_ref(),
+            settings.teacher_numeric_bytes,
+        )?;
+        save(
+            &out.join("HELDOUT_TEACHER_TARGETS.json"),
+            &eval_episodes.target_metadata,
         )?;
         save(
             &out.join("HELDOUT_PROVENANCE.json"),
-            &json!({"native":imported.record,"teacher_numeric_bytes":plan,"scope":"fit-disjoint frozen panel; augmented source control slots reused, no heldout fitting/reselection"}),
+            &json!({"native":imported.record,"teacher_numeric_bytes":if settings.fixed_head_targets.is_some(){Value::Null}else{json!(plan)},"target_metadata":eval_episodes.target_metadata,"scope":"fit-disjoint frozen panel; augmented source control slots reused, no heldout fitting/reselection"}),
         )?;
         for id in &frozen {
             let candidate = result
@@ -1554,18 +1840,14 @@ fn structural_run(
             if c32 as f64 != candidate.evaluation.description_bits {
                 return Err("saved structural C32 differs from training".into());
             }
-            let measurement = resident_causal_fit::measure(
-                d,
-                &saved.program,
-                &eval_episodes,
-                settings.fit.numeric_bytes,
-            )?;
+            let measurement =
+                eval_episodes.measure(d, &saved.program, None, settings.fit.numeric_bytes)?;
             heldout_rows.push(json!({"id":id,"measurement":measurement,"c32":c32}));
         }
     }
     save(
         &out.join("REPORT.json"),
-        &json!({"structural_report":result.report,"retained_candidates":metadata,"frozen_ids":frozen,"compression_frontier":result.frontier,"expression_hypotheses":expression_hypotheses,"heldout":heldout_rows,"callback_calls":callback_index,"scope":"Bounded measured structural proposal search on explicitly intervention-conditioned native graph, not automatic understanding; no per-candidate native reexecution inside predictor; native computation outside affected rule uses remains fixed"}),
+        &json!({"structural_report":result.report,"rounding_policy":rounding_policy(),"retained_candidates":metadata,"frozen_ids":frozen,"compression_frontier":result.frontier,"expression_hypotheses":expression_hypotheses,"heldout":heldout_rows,"callback_calls":callback_index,"scope":"Bounded measured structural proposal search on explicitly intervention-conditioned native graph, not automatic understanding; no per-candidate native reexecution inside predictor; native computation outside affected rule uses remains fixed"}),
     )
 }
 
@@ -1722,6 +2004,16 @@ fn run() -> Result<(), String> {
     if args[3] == "cuda" && (d.is_host() || !d.float64()) {
         return Err("real float64 accelerator required".into());
     }
+    if settings
+        .fixed_head_targets
+        .as_ref()
+        .is_some_and(|s| s.tile_rows == 0)
+    {
+        return Err("fixed_head_targets tile_rows must be positive".into());
+    }
+    if settings.fixed_head_targets.is_some() && settings.structural_search.is_none() {
+        return Err("fixed_head_targets currently requires structural_search; fixed-expression/down modes use full-logit targets".into());
+    }
     let started = Instant::now();
     let imported = import_language_model(export, settings.sequences, settings.context)?;
     let original_native = split_sites(&imported.program)?;
@@ -1764,17 +2056,21 @@ fn run() -> Result<(), String> {
     let native_codec_initialization_seconds = cache_started.elapsed().as_secs_f64();
     let family = &imported.contract.family;
     let target_controls = controls(&base, &native, &layers, &settings.controls)?;
-    let (targets, teacher_plan) = family_teacher_targets(
-        &d,
-        &original_native,
-        &original_layers,
-        &settings.controls,
-        family,
-        &settings.cases,
-        down.as_ref(),
-        settings.fit.numeric_bytes,
-        settings.teacher_numeric_bytes,
-    )?;
+    let (targets, teacher_plan) = if settings.fixed_head_targets.is_some() {
+        (Vec::new(), 0)
+    } else {
+        family_teacher_targets(
+            &d,
+            &original_native,
+            &original_layers,
+            &settings.controls,
+            family,
+            &settings.cases,
+            down.as_ref(),
+            settings.fit.numeric_bytes,
+            settings.teacher_numeric_bytes,
+        )?
+    };
     let native_teacher_seconds = started.elapsed().as_secs_f64();
     let mut stage_seconds = BTreeMap::<String, f64>::new();
     stage_seconds.insert("native_import_and_teachers".into(), native_teacher_seconds);
@@ -1842,7 +2138,7 @@ fn run() -> Result<(), String> {
         "scope":"training proposal search with optional frozen heldout measurement; no acceptance claim; declared boundary masks, retained shared-weight gains, and optional finite native down-weight edit family",
         "fitting_objective":if down.is_some() || settings.structural_search.as_ref().is_some_and(|s|s.native_response_weight.is_some()){"maximum named-group mean of episode KL plus weighted direct coefficient response loss"}else{"maximum named-group mean of episode mean teacher-to-candidate KL"},"ranking_objective":"pure saved-f32 teacher-to-candidate KL; response loss reported separately; all causal sequence rows scored",
         "native_supervision":if settings.structural_search.as_ref().is_some_and(|s|s.native_response_weight.is_some()) {"native logits plus controlled native observable responses"}else if down.is_some(){"native logits plus direct scalar down-edit response coefficients; candidate runs its own complete states"}else{"native logits only; candidate runs its complete autonomous states"},
-        "teacher_planned_numeric_bytes":teacher_plan,
+        "teacher_planned_numeric_bytes":if settings.fixed_head_targets.is_some(){Value::Null}else{json!(teacher_plan)},"fixed_head_targets":settings.fixed_head_targets,"teacher_plan_scope":"compact target/cache metadata in TEACHER_TARGETS.json; no full-logit target intermediate in compact mode",
         "native_codec_bytes":settings.native_codec_bytes,"native_codec_initialization_seconds":native_codec_initialization_seconds,"native_codec_preflight":native_codec.as_ref().map(|c|c.preflight()),"native_codec_stats":native_codec.as_ref().map(|c|c.stats()),
         "native_codec_budget_scope":"packed native codewords plus cached decoded numeric buffers only; excludes caller-owned source arrays, per-operator construction/lattice temporaries, full messages, label/execution buffers, metadata and allocator/library overhead; construction excluded from warm timings",
         "literal_down_arithmetic":"binary64 stored D updates in declared order D += a*u*v; original graph executes updated matrix; no float32 checkpoint-store or augmented-branch bitwise equivalence claim",
@@ -2498,6 +2794,215 @@ mod tests {
         operator_program::{Node, SlotValues},
     };
     #[test]
+    fn operational_kl_axes_disclose_tiny_negative_and_refuse_invalid_scores() {
+        assert_eq!(operational_kl_axis(-8.2e-14).expect("roundoff scale"), 0.);
+        assert_eq!(
+            operational_kl_axis(-OPERATIONAL_NEGATIVE_KL_TOLERANCE)
+                .expect("declared inclusive bound"),
+            0.
+        );
+        assert_eq!(operational_kl_axis(0.25).expect("positive score"), 0.25);
+        for raw in [-1.01e-10, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(operational_kl_axis(raw).is_err());
+        }
+        assert_eq!(
+            rounding_policy()["negative_kl_tolerance"],
+            OPERATIONAL_NEGATIVE_KL_TOLERANCE
+        );
+    }
+    #[test]
+    fn compact_driver_dispatch_preserves_kl_native_response_fit_and_saved_replay() {
+        use gam_mpd::operator_program::{
+            exact_precision, Declarations, Interface, Law, Operator, Slot,
+        };
+        use ndarray::array;
+        let dense = |a: Array2<f64>| {
+            Arc::new(
+                Operator::dense(
+                    "fixture",
+                    Interface::native(a.nrows()).expect("rows"),
+                    Interface::native(a.ncols()).expect("cols"),
+                    a.clone(),
+                    exact_precision(a.iter().copied()).expect("precision"),
+                    Default::default(),
+                )
+                .expect("dense"),
+            )
+        };
+        let native = OperatorProgram {
+            declarations: Declarations {
+                domains: vec![],
+                slots: vec![Slot::Raw { width: 2 }],
+                parameters: 0,
+            },
+            bases: vec![],
+            rules: vec![],
+            operators: vec![
+                dense(array![[1., 0.25], [-0.5, 1.]]),
+                dense(array![[1., 0.], [-1., 0.], [0., 1.], [0., -1.], [0.5, 0.5]]),
+            ],
+            nodes: vec![
+                Node::Raw { slot: 0 },
+                Node::Affine {
+                    terms: vec![(0, 0)],
+                    bias: None,
+                },
+                Node::Pointwise {
+                    input: 1,
+                    laws: vec![Law::Relu],
+                },
+                Node::Affine {
+                    terms: vec![(2, 1)],
+                    bias: None,
+                },
+            ],
+            output: 3,
+        };
+        let base = FamilyInputs {
+            rows: 3,
+            slots: vec![SlotValues::Raw(array![[0.5, 0.2], [-0.3, 0.7], [1., -0.2]])],
+            layout: None,
+        };
+        let controls = vec![Control::NodeScale { node: 0 }];
+        let cases = vec![
+            Case {
+                label: "clean".into(),
+                group: "clean".into(),
+                gains: vec![1.],
+                down_amplitudes: vec![],
+            },
+            Case {
+                label: "half".into(),
+                group: "edits".into(),
+                gains: vec![0.5],
+                down_amplitudes: vec![],
+            },
+        ];
+        let d = Device::host();
+        let lowered = intervention_program::compile(&native, &controls).expect("controls");
+        let (labels, _) = teacher_targets(&d, &native, &controls, &base, &cases, 1 << 24, 1 << 24)
+            .expect("full parity labels");
+        let full = CausalEpisodes::from_family(
+            &d,
+            &lowered,
+            &native,
+            &controls,
+            &base,
+            &cases,
+            &labels,
+            None,
+            1 << 24,
+        )
+        .expect("full episodes");
+        let compact = CausalEpisodes::from_family(
+            &d,
+            &lowered,
+            &native,
+            &controls,
+            &base,
+            &cases,
+            &[],
+            Some(&FixedHeadSettings { tile_rows: 2 }),
+            1 << 24,
+        )
+        .expect("compact direct generation");
+        assert!(compact.full.is_none());
+        assert_eq!(compact.target_metadata["full_logit_target_bytes"], 0);
+        assert_eq!(
+            compact.target_metadata["resident_mu_numeric_bytes"],
+            3 * 2 * 2 * 8
+        );
+        let node = lowered.root_mapping[1];
+        let map = BTreeMap::from([(node, node)]);
+        let (responses, _) = native_response_targets_mapped(
+            &d,
+            &lowered.program,
+            &map,
+            &compact.metadata,
+            1.,
+            1 << 24,
+        )
+        .expect("native responses independent of label backend");
+        let mut candidate = lowered.program.clone();
+        let mut reader = (*candidate.operators[0]).clone();
+        if let OperatorBody::Dense { values, .. } = &mut reader.body {
+            *values *= 0.8;
+        }
+        candidate.operators[0] = Arc::new(reader);
+        for supervision in [None, Some(&responses)] {
+            let a = full
+                .measure(&d, &candidate, supervision, 1 << 24)
+                .expect("full score");
+            let b = compact
+                .measure(&d, &candidate, supervision, 1 << 24)
+                .expect("compact score");
+            assert!((a.objective - b.objective).abs() < 1e-10);
+            let settings = FitSettings {
+                iterations: 2,
+                learning_rate: 0.01,
+                beta1: 0.9,
+                beta2: 0.999,
+                epsilon: 1e-8,
+                numeric_bytes: 1 << 24,
+            };
+            let a = full
+                .fit(&d, &candidate, supervision, &[0], settings.clone())
+                .expect("full fit");
+            let b = compact
+                .fit(&d, &candidate, supervision, &[0], settings)
+                .expect("compact fit");
+            let aa = a.program.operators[0].matrix();
+            let bb = b.program.operators[0].matrix();
+            assert!(aa.iter().zip(&bb).all(|(x, y)| (x - y).abs() < 1e-10));
+            let saved = canonical(&Artifact::native(&b.program).expect("artifact"))
+                .expect("ordinary decoded replay")
+                .0;
+            let af = full
+                .measure(&d, &saved.program, supervision, 1 << 24)
+                .expect("saved full");
+            let bf = compact
+                .measure(&d, &saved.program, supervision, 1 << 24)
+                .expect("saved compact");
+            assert!((af.objective - bf.objective).abs() < 1e-10);
+        }
+        let settings = FitSettings {
+            iterations: 1,
+            learning_rate: 0.01,
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+            numeric_bytes: 1 << 24,
+        };
+        assert!(compact.fit(&d, &candidate, None, &[1], settings).is_err());
+        assert!(CausalEpisodes::from_family(
+            &d,
+            &lowered,
+            &native,
+            &controls,
+            &base,
+            &cases,
+            &labels,
+            Some(&FixedHeadSettings { tile_rows: 2 }),
+            1 << 24
+        )
+        .is_err());
+        let head_controls = vec![Control::GlobalOperatorScale { operator: 1 }];
+        let head_edited = intervention_program::compile(&native, &head_controls)
+            .expect("global head control graph");
+        assert!(CausalEpisodes::from_family(
+            &d,
+            &head_edited,
+            &native,
+            &head_controls,
+            &base,
+            &cases,
+            &[],
+            Some(&FixedHeadSettings { tile_rows: 2 }),
+            1 << 24
+        )
+        .is_err());
+    }
+    #[test]
     fn tied_edits_hide_false_coefficients_but_direct_targets_identify_them() {
         use gam_mpd::operator_program::{exact_precision, Operator};
         use gam_mpd::operator_program::{Declarations, Interface, Slot};
@@ -2569,9 +3074,15 @@ mod tests {
             scored: None,
         }];
         let map = BTreeMap::from([(1, 1), (2, 2)]);
-        let (responses, _) =
-            native_response_targets_mapped(&Device::host(), &teacher, &map, &episodes, 1., 1 << 24)
-                .expect("scalar targets");
+        let (responses, _) = native_response_targets_mapped(
+            &Device::host(),
+            &teacher,
+            &map,
+            &response_metadata(&episodes),
+            1.,
+            1 << 24,
+        )
+        .expect("scalar targets");
         let kl = resident_causal_fit::measure(&Device::host(), &candidate, &episodes, 1 << 24)
             .expect("KL");
         let direct = resident_causal_fit::measure_with_native(
@@ -3383,6 +3894,7 @@ mod tests {
                 max_frontier: 8,
                 max_argument_bindings: 2,
                 max_compound_pairs: 24,
+                learned_dag_search: None,
                 shared_dag_search: None,
                 expression_search: None,
                 preserve_native_places: vec![],
@@ -3402,6 +3914,7 @@ mod tests {
             width: 0,
             sequences: 1,
             context: 4,
+            fixed_head_targets: None,
             teacher_numeric_bytes: 1 << 26,
             native_codec_bytes: 0,
             grammar: empty_grammar(),
@@ -3656,6 +4169,16 @@ mod tests {
             }],
             description_bits: cost,
         };
+        let joint_region = gam_mpd::program_joint_regions::Region {
+            native_reads: vec![0],
+            current_reads: vec![0],
+            native_writes: vec![1],
+            current_writes: vec![1],
+            current_internal_nodes: vec![1],
+            producer_native: 1,
+            erased_native_places: vec![],
+            source_program_nodes: 2,
+        };
         let records = vec![
             program_structure_search::CandidateRecord {
                 id: 0,
@@ -3681,13 +4204,25 @@ mod tests {
                 id: 9,
                 parent_id: Some(0),
                 depth: 1,
-                mutation: Some(Mutation::SynthesizeExpression {
-                    region,
-                    expression: Expr::Argument(0),
+                mutation: Some(Mutation::SynthesizeSharedDAG {
+                    region: joint_region.clone(),
+                    expressions: vec![Expr::Argument(0)],
                     native_arguments: vec![0],
                 }),
                 evaluation: evaluation(200.),
                 encoded_size_bytes: 20,
+            },
+            program_structure_search::CandidateRecord {
+                id: 11,
+                parent_id: Some(0),
+                depth: 1,
+                mutation: Some(Mutation::SynthesizeLearnedDAG {
+                    region: joint_region,
+                    expressions: vec![gam_mpd::program_learned_dag::Expr::Argument(0)],
+                    native_arguments: vec![0],
+                }),
+                evaluation: evaluation(300.),
+                encoded_size_bytes: 30,
             },
         ];
         assert_eq!(frozen_structural_ids(&[0], &records, 0), (vec![0], vec![]));
@@ -3698,6 +4233,14 @@ mod tests {
         assert_eq!(
             frozen_structural_ids(&[0], &records, 2),
             (vec![0, 7, 9], vec![7, 9])
+        );
+        assert_eq!(
+            frozen_structural_ids(&[0], &records, 3),
+            (vec![0, 7, 9, 11], vec![7, 9, 11])
+        );
+        assert_eq!(
+            frozen_structural_ids(&[0, 11], &records, 1),
+            (vec![0, 11, 7], vec![7])
         );
     }
     #[test]
@@ -3846,6 +4389,7 @@ mod tests {
                 max_argument_bindings: 2,
                 max_compound_pairs: 8,
                 preserve_native_places: vec![],
+                learned_dag_search: None,
                 shared_dag_search: None,
                 expression_search: Some(program_structure_search::ExpressionSettings {
                     grammar: Grammar {
@@ -3933,6 +4477,7 @@ mod tests {
             width: 0,
             sequences: 1,
             context: 3,
+            fixed_head_targets: None,
             teacher_numeric_bytes: 1 << 26,
             native_codec_bytes: 0,
             grammar: empty_grammar(),

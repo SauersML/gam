@@ -372,6 +372,20 @@ pub fn exact_body(a: &Artifact, r: &Region) -> Result<JointBody, String> {
 /// No native name is assigned to a latent node. Observable exits get distinct identity views.
 /// Pools/metadata are compacted by Artifact's existing compactor, not a second codec.
 pub fn apply(a: &Artifact, r: &Region, body: &JointBody) -> Result<Artifact, String> {
+    Ok(apply_mapped(a, r, body)?.artifact)
+}
+
+/// Exact identities after topological ordering and compaction. Operator indices
+/// address the parent pool followed by `body.operators`; node indices address
+/// `body.nodes`. Removed entries are `usize::MAX`. These maps identify actual
+/// candidate values/parameters, without assigning latent values native names.
+#[derive(Clone, Debug)]
+pub struct Applied {
+    pub artifact: Artifact,
+    pub operator_mapping: Vec<usize>,
+    pub node_mapping: Vec<usize>,
+}
+pub fn apply_mapped(a: &Artifact, r: &Region, body: &JointBody) -> Result<Applied, String> {
     let input_types = validate_region(a, r)?;
     if body.inputs != input_types || body.exits.len() != r.native_writes.len() {
         return Err("joint body input/exits mismatch".into());
@@ -645,7 +659,21 @@ pub fn apply(a: &Artifact, r: &Region, body: &JointBody) -> Result<Artifact, Str
         .collect();
     crate::native_control::validate_shape(&out)?;
     out.program.interfaces().map_err(|e| e.to_string())?;
-    Ok(out)
+    let node_mapping = local
+        .iter()
+        .map(|&node| {
+            if node == usize::MAX || topo[node] == usize::MAX {
+                usize::MAX
+            } else {
+                live[topo[node]]
+            }
+        })
+        .collect();
+    Ok(Applied {
+        artifact: out,
+        operator_mapping: operator_map,
+        node_mapping,
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -715,6 +743,41 @@ mod tests {
     }
     fn region(a: &Artifact, inside: &[usize]) -> Region {
         describe(a, 2, inside.iter().copied().collect(), &limits()).expect("joint cut")
+    }
+    #[test]
+    fn mapped_rewrite_preserves_exact_parameter_and_value_identities() {
+        let a = source();
+        let r = region(&a, &[2, 3, 4]);
+        let mut body = exact_body(&a, &r).expect("body");
+        let first = a.program.operators.len();
+        body.operators = vec![
+            Operator::identity("new used", Interface::native(2).unwrap()),
+            Operator::identity("new unused", Interface::native(2).unwrap()),
+        ];
+        for node in &mut body.nodes {
+            if let Node::Affine { terms, .. } = node {
+                for (_, operator) in terms {
+                    if *operator == 0 {
+                        *operator = first;
+                    }
+                }
+            }
+        }
+        let mapped = apply_mapped(&a, &r, &body).expect("mapped rewrite");
+        assert_ne!(mapped.operator_mapping[first], usize::MAX);
+        assert_eq!(mapped.operator_mapping[first + 1], usize::MAX);
+        assert_eq!(
+            mapped.artifact.program,
+            apply(&a, &r, &body).unwrap().program
+        );
+        let trace = mapped.artifact.program.execute(&panel(), false).unwrap();
+        let native = a.program.execute(&panel(), false).unwrap();
+        for exit in &body.exits {
+            let node = mapped.node_mapping[exit.node];
+            assert_eq!(Some(node), mapped.artifact.place(exit.native_write));
+            assert_eq!(trace.values[node], native.values[exit.native_write]);
+        }
+        assert_eq!(result(&mapped.artifact, &panel()), result(&a, &panel()));
     }
     fn panel() -> FamilyInputs {
         FamilyInputs {

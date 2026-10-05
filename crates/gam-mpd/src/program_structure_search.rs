@@ -7,7 +7,7 @@ use crate::{
     artifact::Artifact,
     composed_rule_search::{Expr, Grammar},
     operator_program::{Node, OperatorBody, OperatorProgram},
-    program_expression_search, program_joint_regions,
+    program_expression_search, program_joint_regions, program_learned_dag,
     program_regions::{self, Inventory, Limits, Region},
 };
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,16 @@ pub struct Settings {
     pub expression_search: Option<ExpressionSettings>,
     #[serde(default)]
     pub shared_dag_search: Option<SharedDAGSettings>,
+    #[serde(default)]
+    pub learned_dag_search: Option<LearnedDAGSettings>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LearnedDAGSettings {
+    pub region_limits: program_joint_regions::Limits,
+    pub grammar: program_learned_dag::Settings,
+    pub max_enumerations_per_parent: usize,
+    pub max_move_attempts: usize,
+    pub max_callback_calls: usize,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExpressionSettings {
@@ -87,6 +97,12 @@ pub struct SharedDAGSettings {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Mutation {
+    #[serde(rename = "synthesize_learned_dag")]
+    SynthesizeLearnedDAG {
+        region: program_joint_regions::Region,
+        expressions: Vec<program_learned_dag::Expr>,
+        native_arguments: Vec<usize>,
+    },
     ExactExtract {
         region: Region,
     },
@@ -120,14 +136,17 @@ impl Mutation {
             | Self::ReuseExistingRule { region, .. }
             | Self::SynthesizeExpression { region, .. } => Some(region),
             Self::ExtractAndReuse { target_region, .. } => Some(target_region),
-            Self::SynthesizeSharedDAG { .. } => None,
+            Self::SynthesizeSharedDAG { .. } | Self::SynthesizeLearnedDAG { .. } => None,
         }
     }
 }
 /// Reuse trainables use the candidate's current operator IDs after compaction
 /// and decoding. Shared invocations of eligible persistent rules remain tied.
-/// Exact extraction and expression synthesis have no trainables. The caller can further freeze controlled
-/// operators; fitting and joint global/local/intervention measurement are external.
+/// Learned DAG synthesis exposes only its newly compiled affine parameters,
+/// using the exact compaction map; surviving native operators stay frozen.
+/// Exact extraction and parameter-free expression synthesis have no trainables.
+/// The caller can further freeze controlled operators; fitting and joint
+/// global/local/intervention measurement are external.
 pub struct FitRequest<'a> {
     pub candidate: &'a Artifact,
     pub mutation: &'a Mutation,
@@ -244,12 +263,21 @@ pub struct JointRegionEnumeration {
     pub inventory: Option<program_joint_regions::Inventory>,
     pub error: Option<String>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LearnedDAGEnumeration {
+    pub parent_id: usize,
+    pub depth: usize,
+    pub region: Option<program_joint_regions::Region>,
+    pub inventory: Option<program_learned_dag::Inventory>,
+    pub error: Option<String>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposalFamily {
     Structural,
     Expression,
     SharedDAG,
+    LearnedDAG,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FamilyBudgetOmission {
@@ -289,6 +317,18 @@ pub struct Counts {
     pub shared_dag_unique_proposals: usize,
     pub shared_dag_move_attempts: usize,
     pub shared_dag_callback_calls: usize,
+    #[serde(default)]
+    pub learned_dag_move_attempts: usize,
+    #[serde(default)]
+    pub learned_dag_callback_calls: usize,
+    #[serde(default)]
+    pub learned_dag_enumerations: usize,
+    #[serde(default)]
+    pub learned_dag_proposals: usize,
+    #[serde(default)]
+    pub learned_dag_parameterless_proposals: usize,
+    #[serde(default)]
+    pub learned_dag_enumerations_truncated: usize,
     pub joint_region_states_explored: usize,
     pub joint_regions_proposed: usize,
     pub joint_region_inventories_truncated: usize,
@@ -317,6 +357,8 @@ pub struct Report {
     pub shared_dag_enumerations: Vec<SharedDAGEnumeration>,
     pub shared_dag_schedules: Vec<SharedDAGSchedule>,
     pub joint_region_enumerations: Vec<JointRegionEnumeration>,
+    #[serde(default)]
+    pub learned_dag_enumerations: Vec<LearnedDAGEnumeration>,
     pub family_budget_omissions: Vec<FamilyBudgetOmission>,
     pub admitted_candidates: Vec<CandidateRecord>,
     pub stop_reason: String,
@@ -435,6 +477,26 @@ fn canonical(a: &Artifact) -> Result<(Artifact, Vec<u8>), String> {
     let decoded = Artifact::from_bytes(&bytes, &a.program.declarations)?;
     if decoded.to_bytes()? != bytes {
         return Err("artifact codec is not stable under decoding".into());
+    }
+    if decoded.program.nodes != a.program.nodes
+        || decoded.program.output != a.program.output
+        || decoded.program.operators.len() != a.program.operators.len()
+        || decoded
+            .program
+            .operators
+            .iter()
+            .zip(&a.program.operators)
+            .any(|(x, y)| x.rows != y.rows || x.cols != y.cols)
+        || decoded.program.rules.len() != a.program.rules.len()
+        || decoded
+            .program
+            .rules
+            .iter()
+            .zip(&a.program.rules)
+            .any(|(x, y)| x.nodes != y.nodes || x.inputs != y.inputs || x.output != y.output)
+        || decoded.places != a.places
+    {
+        return Err("artifact codec changed executable reference identities".into());
     }
     Ok((decoded, bytes))
 }
@@ -1042,6 +1104,105 @@ fn shared_dag_moves(
     moves
 }
 
+fn learned_dag_moves(
+    artifact: &Artifact,
+    settings: &Settings,
+    parent_id: usize,
+    depth: usize,
+    report: &mut Report,
+) -> Vec<Mutation> {
+    let Some(config) = &settings.learned_dag_search else {
+        return vec![];
+    };
+    let regions =
+        match program_joint_regions::propose_regions(artifact, config.region_limits.clone()) {
+            Ok(inventory) => {
+                report.counts.learned_dag_enumerations_truncated +=
+                    usize::from(inventory.truncated);
+                inventory.regions
+            }
+            Err(error) => {
+                report.learned_dag_enumerations.push(LearnedDAGEnumeration {
+                    parent_id,
+                    depth,
+                    region: None,
+                    inventory: None,
+                    error: Some(error),
+                });
+                return vec![];
+            }
+        };
+    let mut seen = BTreeSet::new();
+    let mut lists = std::collections::VecDeque::new();
+    let mut checked = 0;
+    for region in regions {
+        let key = (
+            region.native_reads.clone(),
+            region.native_writes.clone(),
+            region.current_internal_nodes.clone(),
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        if checked == config.max_enumerations_per_parent {
+            report.counts.learned_dag_enumerations_truncated += 1;
+            break;
+        }
+        checked += 1;
+        report.counts.learned_dag_enumerations += 1;
+        let mut record = LearnedDAGEnumeration {
+            parent_id,
+            depth,
+            region: Some(region.clone()),
+            inventory: None,
+            error: None,
+        };
+        match program_learned_dag::enumerate(
+            artifact,
+            &region,
+            &config.grammar,
+            &region.native_reads,
+        ) {
+            Ok(inventory) => {
+                report.counts.learned_dag_proposals += inventory.proposals.len();
+                report.counts.learned_dag_parameterless_proposals += inventory
+                    .proposals
+                    .iter()
+                    .filter(|p| p.trainable_operator_count == 0)
+                    .count();
+                report.counts.learned_dag_enumerations_truncated +=
+                    usize::from(inventory.truncated);
+                // Parameter-free expressions have their own proposal family. Do
+                // not spend this family's reserved fitting budget on them.
+                lists.push_back(
+                    inventory
+                        .proposals
+                        .iter()
+                        .filter(|p| p.trainable_operator_count > 0)
+                        .map(|p| Mutation::SynthesizeLearnedDAG {
+                            region: region.clone(),
+                            expressions: p.expressions.clone(),
+                            native_arguments: region.native_reads.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter(),
+                );
+                record.inventory = Some(inventory);
+            }
+            Err(error) => record.error = Some(error),
+        }
+        report.learned_dag_enumerations.push(record);
+    }
+    let mut moves = vec![];
+    while let Some(mut list) = lists.pop_front() {
+        if let Some(proposal) = list.next() {
+            moves.push(proposal);
+            lists.push_back(list);
+        }
+    }
+    moves
+}
+
 fn omit_family(
     report: &mut Report,
     parent_id: usize,
@@ -1130,6 +1291,15 @@ where
             .and_then(|n| n.checked_add(1))
             .ok_or("shared tuple budget overflow")?;
     }
+    if let Some(learned) = &settings.learned_dag_search {
+        if learned.max_enumerations_per_parent == 0
+            || learned.max_move_attempts == 0
+            || learned.max_callback_calls == 0
+            || learned.max_callback_calls > learned.max_move_attempts
+        {
+            return Err("positive learned DAG enumeration/work/callback budgets required".into());
+        }
+    }
     let reserved_moves = settings
         .expression_search
         .as_ref()
@@ -1148,9 +1318,25 @@ where
         .map_or(0, |s| s.max_callback_calls);
     let total_reserved_moves = reserved_moves
         .checked_add(shared_reserved_moves)
+        .and_then(|n| {
+            n.checked_add(
+                settings
+                    .learned_dag_search
+                    .as_ref()
+                    .map_or(0, |s| s.max_move_attempts),
+            )
+        })
         .ok_or("proposal move budget overflow")?;
     let total_reserved_callbacks = reserved_callbacks
         .checked_add(shared_reserved_callbacks)
+        .and_then(|n| {
+            n.checked_add(
+                settings
+                    .learned_dag_search
+                    .as_ref()
+                    .map_or(0, |s| s.max_callback_calls),
+            )
+        })
         .ok_or("proposal callback budget overflow")?;
     if total_reserved_moves > settings.max_move_attempts
         || total_reserved_callbacks > settings.max_callback_calls
@@ -1224,6 +1410,7 @@ where
             shared_dag_enumerations: vec![],
             shared_dag_schedules: vec![],
             joint_region_enumerations: vec![],
+            learned_dag_enumerations: vec![],
             family_budget_omissions: vec![],
             admitted_candidates: vec![initial_record],
             stop_reason: "depth_budget".into(),
@@ -1305,6 +1492,13 @@ where
                 depth,
                 &mut result.report,
             );
+            let learned = learned_dag_moves(
+                &resident[&parent_id].evaluated.artifact,
+                settings,
+                parent_id,
+                depth,
+                &mut result.report,
+            );
             let singles = regions.into_iter().flat_map(|(region, arguments)| {
                 let mut moves = vec![Mutation::ExactExtract {
                     region: region.clone(),
@@ -1322,6 +1516,9 @@ where
             });
             let structural = compound.into_iter().chain(singles).collect::<Vec<_>>();
             let mut families = std::collections::VecDeque::new();
+            if settings.learned_dag_search.is_some() {
+                families.push_back(learned.into_iter());
+            }
             if settings.shared_dag_search.is_some() {
                 families.push_back(shared.into_iter());
             }
@@ -1352,8 +1549,11 @@ where
                 }
                 let is_expression = matches!(mutation, Mutation::SynthesizeExpression { .. });
                 let is_shared = matches!(mutation, Mutation::SynthesizeSharedDAG { .. });
+                let is_learned = matches!(mutation, Mutation::SynthesizeLearnedDAG { .. });
                 let counts = &result.report.counts;
-                let family = if is_shared {
+                let family = if is_learned {
+                    ProposalFamily::LearnedDAG
+                } else if is_shared {
                     ProposalFamily::SharedDAG
                 } else if is_expression {
                     ProposalFamily::Expression
@@ -1361,7 +1561,18 @@ where
                     ProposalFamily::Structural
                 };
                 let (moves_used, callbacks_used, allocated_moves, allocated_callbacks) =
-                    if is_shared {
+                    if is_learned {
+                        let config = settings
+                            .learned_dag_search
+                            .as_ref()
+                            .ok_or("learned DAG configuration missing")?;
+                        (
+                            counts.learned_dag_move_attempts,
+                            counts.learned_dag_callback_calls,
+                            config.max_move_attempts,
+                            config.max_callback_calls,
+                        )
+                    } else if is_shared {
                         (
                             counts.shared_dag_move_attempts,
                             counts.shared_dag_callback_calls,
@@ -1379,10 +1590,12 @@ where
                         (
                             counts.move_attempts
                                 - counts.expression_move_attempts
-                                - counts.shared_dag_move_attempts,
+                                - counts.shared_dag_move_attempts
+                                - counts.learned_dag_move_attempts,
                             counts.callback_calls
                                 - counts.expression_callback_calls
-                                - counts.shared_dag_callback_calls,
+                                - counts.shared_dag_callback_calls
+                                - counts.learned_dag_callback_calls,
                             settings.max_move_attempts - total_reserved_moves,
                             settings.max_callback_calls - total_reserved_callbacks,
                         )
@@ -1402,8 +1615,31 @@ where
                 result.report.counts.move_attempts += 1;
                 result.report.counts.expression_move_attempts += usize::from(is_expression);
                 result.report.counts.shared_dag_move_attempts += usize::from(is_shared);
+                result.report.counts.learned_dag_move_attempts += usize::from(is_learned);
                 let parent = &resident[&parent_id].evaluated;
+                let mut learned_parameters = None;
                 let proposed = match &mutation {
+                    Mutation::SynthesizeLearnedDAG {
+                        region,
+                        expressions,
+                        native_arguments,
+                    } => {
+                        let config = settings
+                            .learned_dag_search
+                            .as_ref()
+                            .ok_or("learned DAG configuration missing")?;
+                        program_learned_dag::apply(
+                            &parent.artifact,
+                            region,
+                            expressions,
+                            native_arguments,
+                            &config.grammar,
+                        )
+                        .map(|applied| {
+                            learned_parameters = Some(applied.trainable_operator_ids);
+                            applied.artifact
+                        })
+                    }
                     Mutation::ExactExtract { region } => {
                         program_regions::extract(&parent.artifact, region)
                     }
@@ -1471,7 +1707,10 @@ where
                         continue;
                     }
                 };
-                let operators = match trainables(&proposed, &mutation) {
+                let operators = match learned_parameters
+                    .map(Ok)
+                    .unwrap_or_else(|| trainables(&proposed, &mutation))
+                {
                     Ok(ids) => ids,
                     Err(reason) => {
                         result.report.counts.structural_rejections += 1;
@@ -1484,6 +1723,7 @@ where
                 result.report.counts.callback_calls += 1;
                 result.report.counts.expression_callback_calls += usize::from(is_expression);
                 result.report.counts.shared_dag_callback_calls += usize::from(is_shared);
+                result.report.counts.learned_dag_callback_calls += usize::from(is_learned);
                 let fitted = match fit_and_measure(FitRequest {
                     candidate: &proposed,
                     mutation: &mutation,
@@ -1719,6 +1959,7 @@ mod tests {
             preserve_native_places: vec![0],
             expression_search: None,
             shared_dag_search: None,
+            learned_dag_search: None,
         }
     }
     fn constraints() -> Constraints {
@@ -2391,6 +2632,100 @@ mod tests {
             max_move_attempts: 1,
             max_callback_calls: 1,
         }
+    }
+    #[test]
+    fn learned_dag_search_reserves_callbacks_and_only_fits_new_parameters() {
+        let native = joint_fixture();
+        let mut configuration = settings(1);
+        configuration.max_callback_calls = 2;
+        configuration.max_move_attempts = 2;
+        configuration.learned_dag_search = Some(LearnedDAGSettings {
+            region_limits: joint_settings().region_limits,
+            grammar: program_learned_dag::Settings {
+                latent_widths: vec![1],
+                unary: vec![],
+                binary: vec![],
+                affine_bias: false,
+                require_shared: false,
+                max_operations: 1,
+                max_affine_parameters: 2,
+                max_parameter_elements: 2,
+                max_expression_states: 128,
+                max_tuple_checks: 128,
+                max_tuples: 16,
+                max_body_nodes: 8,
+                seed: 19,
+            },
+            max_enumerations_per_parent: 1,
+            max_move_attempts: 1,
+            max_callback_calls: 1,
+        });
+        let mut inspected = false;
+        let result = search(
+            &native,
+            evaluated(
+                &Artifact::native(&native).expect("native artifact"),
+                &native,
+            ),
+            &configuration,
+            &constraints(),
+            |request| {
+                if matches!(request.mutation, Mutation::SynthesizeLearnedDAG { .. }) {
+                    assert!(!request.trainable_operator_ids.is_empty());
+                    let mut fitted = request.candidate.clone();
+                    for &id in request.trainable_operator_ids {
+                        assert!(matches!(
+                            fitted.program.operators[id].body,
+                            OperatorBody::Dense { .. }
+                        ));
+                        fitted.program.operators[id] = dense(2.5);
+                    }
+                    let (fitted, _) = canonical(&fitted).expect("stable parameter identities");
+                    validate_fit_structure(
+                        request.candidate,
+                        &fitted,
+                        request.trainable_operator_ids,
+                    )
+                    .expect("new affine parameters may be fitted");
+                    let frozen = fitted
+                        .program
+                        .operators
+                        .iter()
+                        .enumerate()
+                        .find(|(id, _)| !request.trainable_operator_ids.contains(id))
+                        .map(|(id, _)| id)
+                        .expect("native output operator remains frozen");
+                    let mut invalid = fitted.clone();
+                    invalid.program.operators[frozen] = dense(4.);
+                    assert!(
+                        validate_fit_structure(
+                            request.candidate,
+                            &invalid,
+                            request.trainable_operator_ids
+                        )
+                        .is_err()
+                    );
+                    let encoded =
+                        serde_json::to_value(request.mutation).expect("mutation encoding");
+                    assert_eq!(encoded["kind"], "synthesize_learned_dag");
+                    let decoded: Mutation =
+                        serde_json::from_value(encoded).expect("mutation decoding");
+                    assert_eq!(&decoded, request.mutation);
+                    inspected = true;
+                }
+                Err("provenance and scheduling regression, no fitted scientific candidate".into())
+            },
+        )
+        .expect("bounded search");
+        assert!(inspected);
+        assert_eq!(result.report.counts.learned_dag_callback_calls, 1);
+        assert_eq!(result.report.counts.callback_calls, 2);
+        assert!(result.report.counts.learned_dag_proposals > 0);
+        assert!(!result.report.learned_dag_enumerations.is_empty());
+        assert!(matches!(
+            result.report.attempts[0].mutation,
+            Mutation::SynthesizeLearnedDAG { .. }
+        ));
     }
     #[test]
     fn joint_synthesis_search_saves_actual_shared_state_and_distinct_native_exits() {
