@@ -1,0 +1,28 @@
+{
+  "QUERY_TAIL_DISCOVERY_V2": {
+    "mean_kl": {
+      "zero": 0.002902362475532265,
+      "mean_native_delta": 0.00020892976498083975,
+      "fitted": 7.587604364628475e-05
+    },
+    "answer_log_odds_mae": {
+      "zero": 0.08651150503909144,
+      "mean_native_delta": 0.01773190586347817,
+      "fitted": 0.01308695947548244
+    },
+    "fit_over_zero_kl": 0.026142855789358228
+  },
+  "VALUE_QUERY_TAIL_DISCOVERY": {
+    "mean_kl": {
+      "zero": 0.05711948393693642,
+      "mean_native_delta": 0.06363174931189042,
+      "fitted": 0.07927631313249275
+    },
+    "answer_log_odds_mae": {
+      "zero": 0.5487297007576515,
+      "mean_native_delta": 0.7255970801069146,
+      "fitted": 0.8124717457976788
+    },
+    "fit_over_zero_kl": 1.3879031753861588
+  }
+}

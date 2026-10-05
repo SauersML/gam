@@ -1,0 +1,34 @@
+{
+  "source_commit": "62a1a50bef",
+  "binary_sha256": "21bfffc494987d70723f196e1ea5e661e8d10ade20d5c8005b52a82a63be5f97",
+  "seconds": 143.482442292,
+  "cases": 32,
+  "records": 128,
+  "selected_reads": [
+    2073,
+    2399,
+    2403,
+    2823
+  ],
+  "result": "Shared fitted query shift worsens joint full-output prediction on value-reading candidates. No retrieval explanation established.",
+  "metrics": {
+    "mean_kl": {
+      "zero": 0.05711948393693642,
+      "mean_native_delta": 0.06363174931189042,
+      "fitted": 0.07927631313249275
+    },
+    "answer_log_odds_mae": {
+      "zero": 0.5487297007576515,
+      "mean_native_delta": 0.7255970801069146,
+      "fitted": 0.8124717457976788
+    },
+    "fit_over_zero_kl": 1.3879031753861588
+  },
+  "limitations": [
+    "Human-specified value-token spans supply localization; roles not discovered.",
+    "Four heads jointly replaced; does not isolate individual-head failure or composition failure.",
+    "All original300-step fits iteration-limited; representation versus optimization unresolved.",
+    "No lexical heldout outputs or native parameter-edit results."
+  ],
+  "next": "Resolve fixed-family convex optimization on four heads, then distinguish individual/local from composed errors before expanding grammar."
+}
