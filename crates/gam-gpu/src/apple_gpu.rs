@@ -444,7 +444,9 @@ mod tests {
     }
 
     /// Below the size threshold `auto` stays on the CPU without probing, and
-    /// `required` bypasses the threshold.
+    /// `required` bypasses the threshold. Off macOS the backend is not compiled, which decides
+    /// first (`non_macos_builds_refuse_metal_explicitly`).
+    #[cfg(target_os = "macos")]
     #[test]
     fn below_threshold_is_cpu_under_auto() {
         let decision = decide_metal_under_policy(
