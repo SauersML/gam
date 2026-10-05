@@ -1285,14 +1285,6 @@ impl Scorer {
         Ok(())
     }
 
-    /// `KL(M_e ‖ P_e)` per scored token in bits for `experiments` on `batch` at the explanation's
-    /// `theta`, with the fixed directions (`M`'s reads), and with `gradient` the gradient of its
-    /// sum in every trainable operator; `key` names the batch ([`Scorer::targets`]).
-    fn score(&mut self, batch: &Batch, experiments: &[Experiment], theta: &[Array2<f64>], key: &str, gradient: bool) -> Result<(Vec<Vec<f64>>, Vec<Array2<f64>>), String> {
-        let (design, targets) = self.targets(batch, experiments, key)?;
-        self.evaluated(batch, experiments, theta, &design, &targets, gradient)
-    }
-
     /// [`Scorer::score`] with the posterior on the device: the explanation at its weight sample
     /// of `sample` ([`DevicePosterior::sample_into`]), or at its mean when none, and with
     /// `gradient` the gradient of the sum per trainable operator and a draw of the Gauss–Newton
@@ -1307,6 +1299,19 @@ impl Scorer {
         gradient: bool,
     ) -> Result<(Vec<Vec<f64>>, BTreeMap<usize, Tensor>, Option<interchange::Factor>), String> {
         let (design, targets) = self.targets(batch, experiments, key)?;
+        self.evaluate_device(posterior, (batch, experiments), sample, (&design, &targets), gradient)
+    }
+
+    /// [`Scorer::score_device`] against the directions `design` and `M`'s `targets` already made
+    /// for these experiments.
+    fn evaluate_device(
+        &mut self,
+        posterior: &DevicePosterior,
+        (batch, experiments): (&Batch, &[Experiment]),
+        sample: Option<u64>,
+        (design, targets): (&interchange::Design, &Targets),
+        gradient: bool,
+    ) -> Result<(Vec<Vec<f64>>, BTreeMap<usize, Tensor>, Option<interchange::Factor>), String> {
         match sample {
             Some(seed) => posterior.sample_into(self.experiments.explanation_mut(), seed)?,
             None => posterior.mean_into(self.experiments.explanation_mut())?,
@@ -1315,7 +1320,7 @@ impl Scorer {
             (true, Some(seed)) => Some(uniforms(seed, batch, experiments)),
             _ => None,
         };
-        let evaluation = self.experiments.evaluate_labelled(batch, experiments, &design, Some(&targets), gradient, labels.as_deref())?;
+        let evaluation = self.experiments.evaluate_labelled(batch, experiments, design, Some(targets), gradient, labels.as_deref())?;
         if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
             return Err("nonfinite explanation divergence".into());
         }
@@ -1344,49 +1349,18 @@ impl Scorer {
         Ok((design, targets))
     }
 
-    /// The patched `experiments`' divergence per scored token in bits at the explanation's `mean`,
-    /// with the directions of the explanation's own reads there (the variables aligned with the
-    /// protocol's): the adaptive family; none when the explanation's variables do not align.
-    fn score_adaptive(&mut self, batch: &Batch, experiments: &[Experiment], mean: &[Array2<f64>]) -> Result<Option<Vec<Vec<f64>>>, String> {
+    /// The patched `experiments`' divergence per scored token in bits at the mean of `posterior`
+    /// (`mean` on the host), with the directions of the explanation's own reads there (the
+    /// variables aligned with the protocol's): the adaptive family; none when the explanation's
+    /// variables do not align.
+    fn score_adaptive(&mut self, batch: &Batch, experiments: &[Experiment], posterior: &DevicePosterior, mean: &[Array2<f64>]) -> Result<Option<Vec<Vec<f64>>>, String> {
         if !self.aligned {
             return Ok(None);
         }
         let own = self.experiments.variables().to_vec();
         let design = self.experiments.design_at(&own, experiments, mean)?;
         let targets = self.experiments.targets(batch, experiments, &design)?;
-        Ok(Some(self.evaluated(batch, experiments, mean, &design, &targets, false)?.0))
-    }
-
-    fn evaluated(
-        &mut self,
-        batch: &Batch,
-        experiments: &[Experiment],
-        theta: &[Array2<f64>],
-        design: &interchange::Design,
-        targets: &Targets,
-        gradient: bool,
-    ) -> Result<(Vec<Vec<f64>>, Vec<Array2<f64>>), String> {
-        self.experiments.load(theta)?;
-        let evaluation = self.experiments.evaluate_resident(batch, experiments, design, targets, gradient)?;
-        let p = self.experiments.models().1;
-        if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
-            return Err("nonfinite explanation divergence".into());
-        }
-        if !gradient {
-            return Ok((evaluation.bits, Vec::new()));
-        }
-        let d = p.program.device();
-        let mut gradients = Vec::with_capacity(theta.len());
-        for (op, values) in self.position.iter().map(|(op, i)| (*op, &theta[*i])) {
-            gradients.push(match evaluation.gradient.get(&op) {
-                Some(g) => d.download(g).map_err(error)?,
-                None => Array2::zeros(values.dim()),
-            });
-        }
-        if gradients.iter().any(|g| g.iter().any(|v| !v.is_finite())) {
-            return Err("nonfinite parameter gradient".into());
-        }
-        Ok((evaluation.bits, gradients))
+        Ok(Some(self.evaluate_device(posterior, (batch, experiments), None, (&design, &targets), false)?.0))
     }
 }
 
@@ -1456,13 +1430,15 @@ fn held_out(
     let (mut at_mean, mut at_rounded) = (Mean::default(), Mean::default());
     let rounded = posterior.rounded();
     let size = |e: &Experiment| e.explained.iter().filter(|x| **x).count();
+    // Each batch's directions and `M`'s targets are made once; the mean, the sample and the rounded
+    // posterior are scored against them, and the rounded posterior goes to the device once.
+    let mut made = Vec::new();
     for (b, (draw, experiments)) in held_out_experiments(scorer, sequences, settings)?.into_iter().enumerate() {
         let batch = draw.batch(sequences)?;
         let key = format!("held_{}_{b}", sequences.len());
-        let (bits, _, _) = scorer.score_device(device_posterior, &batch, &experiments, None, &key, false)?;
+        let (design, targets) = scorer.targets(&batch, &experiments, &key)?;
+        let (bits, _, _) = scorer.evaluate_device(device_posterior, (&batch, &experiments), None, (&design, &targets), false)?;
         bits.iter().for_each(|b| at_mean.add(b));
-        let (rounded_bits, _) = scorer.score(&batch, &experiments, &rounded.mean, &key, false)?;
-        rounded_bits.iter().for_each(|b| at_rounded.add(b));
         for (e, bits) in experiments.iter().zip(&bits) {
             match &e.patch {
                 None => clean[size(e) - 1].add(bits),
@@ -1475,12 +1451,21 @@ fn held_out(
                 }
             }
         }
-        let (bits, _, _) = scorer.score_device(device_posterior, &batch, &experiments, Some(noise_seed(settings.seed, 0, b)), &key, false)?;
+        let (bits, _, _) = scorer.evaluate_device(device_posterior, (&batch, &experiments), Some(noise_seed(settings.seed, 0, b)), (&design, &targets), false)?;
         bits.iter().for_each(|b| sampled.add(b));
-        let patched: Vec<Experiment> = experiments.into_iter().filter(|e| e.patch.is_some()).collect();
-        if let Some(bits) = scorer.score_adaptive(&batch, &patched, &posterior.mean)? {
+        let patched: Vec<Experiment> = experiments.iter().filter(|e| e.patch.is_some()).cloned().collect();
+        if let Some(bits) = scorer.score_adaptive(&batch, &patched, device_posterior, &posterior.mean)? {
             bits.iter().for_each(|b| adaptive.add(b));
         }
+        made.push((batch, experiments, design, targets));
+    }
+    scorer.experiments.load(&rounded.mean)?;
+    for (batch, experiments, design, targets) in &made {
+        let evaluation = scorer.experiments.evaluate_resident(batch, experiments, design, targets, false)?;
+        if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
+            return Err("nonfinite explanation divergence".into());
+        }
+        evaluation.bits.iter().for_each(|b| at_rounded.add(b));
     }
     let data = sampled.mean().ok_or("no held-out tokens")?;
     let divergence: f64 = posterior.divergences().iter().sum();
@@ -1504,14 +1489,14 @@ fn held_out(
         read_patch: read.mean(),
         joint_patch: joint.mean(),
         adaptive_patch: adaptive.mean(),
-        layers: activity(scorer, explanation, posterior, sequences, settings)?,
+        layers: activity(scorer, explanation, (posterior, device_posterior), sequences, settings)?,
     })
 }
 
 /// Per layer, the survivors of `posterior` and its functions' activity on `sequences` at the
 /// posterior mean (`LayerCount`).
-fn activity(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterior, sequences: &[Vec<u32>], settings: &Settings) -> Result<Vec<LayerCount>, String> {
-    scorer.experiments.load(&posterior.mean)?;
+fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_posterior): (&Posterior, &DevicePosterior), sequences: &[Vec<u32>], settings: &Settings) -> Result<Vec<LayerCount>, String> {
+    device_posterior.mean_into(scorer.experiments.explanation_mut())?;
     let variance = |op: usize| -> Result<Array2<f64>, String> { Ok(posterior.log_sd[scorer.at(op)?].mapv(|s| (2.0 * s).exp())) };
     let (_, p) = scorer.experiments.models();
     let (program, d) = (p.program, p.program.device());
@@ -2456,6 +2441,31 @@ mod tests {
         run_check::{layer_nodes, split_sites},
     };
 
+    /// `KL(M_e ‖ P_e)` per scored token in bits for `experiments` on `batch` at the explanation's
+    /// host values `theta`, with the fixed directions (`M`'s reads), and with `gradient` the
+    /// gradient of its sum in every trainable operator, on the host; `key` names the batch
+    /// ([`Scorer::targets`]).
+    fn score(scorer: &mut Scorer, batch: &Batch, experiments: &[Experiment], theta: &[Array2<f64>], key: &str, gradient: bool) -> Result<(Vec<Vec<f64>>, Vec<Array2<f64>>), String> {
+        let (design, targets) = scorer.targets(batch, experiments, key)?;
+        scorer.experiments.load(theta)?;
+        let evaluation = scorer.experiments.evaluate_resident(batch, experiments, &design, &targets, gradient)?;
+        if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
+            return Err("nonfinite explanation divergence".into());
+        }
+        if !gradient {
+            return Ok((evaluation.bits, Vec::new()));
+        }
+        let d = scorer.experiments.models().1.program.device();
+        let mut gradients = Vec::with_capacity(theta.len());
+        for (op, values) in scorer.position.iter().map(|(op, i)| (*op, &theta[*i])) {
+            gradients.push(match evaluation.gradient.get(&op) {
+                Some(g) => d.download(g).map_err(error)?,
+                None => Array2::zeros(values.dim()),
+            });
+        }
+        Ok((evaluation.bits, gradients))
+    }
+
     /// The weight sample of `key` of every trainable operator of `posterior` (the device's draws,
     /// `DevicePosterior::sample_into`), on the host.
     fn sample(posterior: &Posterior, key: u64) -> Vec<Array2<f64>> {
@@ -2721,11 +2731,11 @@ mod tests {
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
         let theta = sample(&posterior, noise_seed(settings.seed, 0, 0));
-        let (_, gradients) = scorer.score(&batch, &experiments, &theta, "gradient", true).unwrap();
+        let (_, gradients) = score(&mut scorer, &batch, &experiments, &theta, "gradient", true).unwrap();
         let at = |name: &str| explanation.trainable.iter().position(|op| explanation.artifact.program.operators[*op].name == name).unwrap();
         let (gate, scale) = (at("library.l1.mlp.gate"), at("library.l0.mlp.tie1.f3.scale"));
         let mut bits = |theta: &[Array2<f64>]| -> f64 {
-            scorer.score(&batch, &experiments, theta, "gradient", false).unwrap().0.iter().flatten().sum()
+            score(&mut scorer, &batch, &experiments, theta, "gradient", false).unwrap().0.iter().flatten().sum()
         };
         for (i, entry) in [(gate, (5, 0)), (gate, (5, 6)), (scale, (0, 0))] {
             let h = 1e-5;
@@ -2750,11 +2760,11 @@ mod tests {
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
         let theta = sample(&posterior, noise_seed(settings.seed, 0, 0));
-        let (_, gradients) = scorer.score(&batch, &experiments, &theta, "gradient", true).unwrap();
+        let (_, gradients) = score(&mut scorer, &batch, &experiments, &theta, "gradient", true).unwrap();
         let at = |name: &str| explanation.trainable.iter().position(|op| explanation.artifact.program.operators[*op].name == name).unwrap();
         let (gate, out) = (at("library.l0.mlp.gate"), at("library.l0.mlp.out"));
         let (row_scale, column_scale) = (at("library.l1.mlp.f7.gate.from_l0_gate4.scale"), at("library.l1.mlp.f7.out.from_l0_4.scale"));
-        let mut bits = |theta: &[Array2<f64>]| -> f64 { scorer.score(&batch, &experiments, theta, "gradient", false).unwrap().0.iter().flatten().sum() };
+        let mut bits = |theta: &[Array2<f64>]| -> f64 { score(&mut scorer, &batch, &experiments, theta, "gradient", false).unwrap().0.iter().flatten().sum() };
         for (i, entry) in [(gate, (4, 0)), (gate, (4, 5)), (out, (2, 4)), (out, (6, 4)), (row_scale, (0, 0)), (column_scale, (0, 0))] {
             let h = 1e-5;
             let (mut up, mut down) = (theta.clone(), theta.clone());
@@ -2781,7 +2791,7 @@ mod tests {
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
         let theta = sample(&posterior, noise_seed(settings.seed, 0, 0));
-        let (_, gradients) = scorer.score(&batch, &experiments, &theta, "gradient", true).unwrap();
+        let (_, gradients) = score(&mut scorer, &batch, &experiments, &theta, "gradient", true).unwrap();
         let at = |name: &str| explanation.trainable.iter().position(|op| explanation.artifact.program.operators[*op].name == name).unwrap();
         let entries = [
             (at("library.l0.h0.q"), (1, 3)),
@@ -2791,7 +2801,7 @@ mod tests {
             (at("library.l0.kv0.v"), (3, 2)),
             (at("library.l1.kv0.v_from_l0_kv0.scale"), (0, 0)),
         ];
-        let mut bits = |theta: &[Array2<f64>]| -> f64 { scorer.score(&batch, &experiments, theta, "gradient", false).unwrap().0.iter().flatten().sum() };
+        let mut bits = |theta: &[Array2<f64>]| -> f64 { score(&mut scorer, &batch, &experiments, theta, "gradient", false).unwrap().0.iter().flatten().sum() };
         for (i, entry) in entries {
             let h = 1e-5;
             let (mut up, mut down) = (theta.clone(), theta.clone());
@@ -2813,11 +2823,11 @@ mod tests {
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
         let theta = sample(&posterior, noise_seed(settings.seed, 0, 0));
-        let (_, gradients) = scorer.score(&batch, &experiments, &theta, "gradient", true).unwrap();
+        let (_, gradients) = score(&mut scorer, &batch, &experiments, &theta, "gradient", true).unwrap();
         let (k, _) = key_value(&explanation.artifact.program, 1, 0);
         let i = explanation.trainable.iter().position(|op| *op == k).unwrap();
         let mut bits = |theta: &[Array2<f64>]| -> f64 {
-            scorer.score(&batch, &experiments, theta, "gradient", false).unwrap().0.iter().flatten().sum()
+            score(&mut scorer, &batch, &experiments, theta, "gradient", false).unwrap().0.iter().flatten().sum()
         };
         for at in [(0, 0), (1, 3), (3, 7)] {
             let h = 1e-5;
@@ -2926,7 +2936,7 @@ mod tests {
         let mut exact = 0.0;
         for (b, draw) in draws.iter().enumerate() {
             let experiments = scorer.experiments(draw, &sequences).unwrap();
-            let (bits, _) = scorer.score(&draw.batch(&sequences).unwrap(), &experiments, &shrunk, &format!("train_{b}"), false).unwrap();
+            let (bits, _) = score(&mut scorer, &draw.batch(&sequences).unwrap(), &experiments, &shrunk, &format!("train_{b}"), false).unwrap();
             exact += bits.iter().flatten().sum::<f64>() * LN_2;
         }
         let predicted = 0.5 * epsilon * epsilon * quadratic;
@@ -3346,7 +3356,7 @@ mod tests {
             .enumerate()
             .map(|(b, draw)| {
                 let experiments = scorer.experiments(draw, &sequences).unwrap();
-                let (bits, _) = scorer.score(&draw.batch(&sequences).unwrap(), &experiments, &shrunk, &format!("train_{b}"), false).unwrap();
+                let (bits, _) = score(&mut scorer, &draw.batch(&sequences).unwrap(), &experiments, &shrunk, &format!("train_{b}"), false).unwrap();
                 (bits.iter().flatten().sum::<f64>() * LN_2, bits.iter().map(Vec::len).sum())
             })
             .collect();
