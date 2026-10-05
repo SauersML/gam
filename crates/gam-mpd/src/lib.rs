@@ -106,9 +106,6 @@ mod rules_tests;
 // Exact directional derivatives of operator programs.
 pub mod derivatives;
 
-// Proposal products (ranking, directions, curvature) on the Apple GPU; acceptances stay float64.
-pub mod device;
-
 // An operator program executed on a device (CUDA, or the host reference), values resident.
 pub mod device_program;
 
@@ -191,9 +188,6 @@ pub mod response_collision;
 
 // Explicit native intervention-response bindings, validated against native graph laws.
 pub mod native_control;
-
-// Optional fixed-response, finite-f32 scalar proposal diagnostic.
-pub mod scalar_response_search;
 
 /// Full-width affine MLP fitting baseline (proposal diagnostics only).
 pub mod affine_mlp;

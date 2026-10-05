@@ -6,12 +6,23 @@
 //! by node, no finite differences), reading the base values from a trace.
 
 use super::operator_program::{FamilyInputs, Node, Operator, OperatorBody, OperatorProgram, ProgramError, Scale, Trace};
-use gam_gpu::banded::Layout;
+use gam_linalg::faer_ndarray::fast_ab;
 use ndarray::{Array2, Axis, s};
 use std::collections::BTreeMap;
 
 fn refuse(message: String) -> ProgramError {
     ProgramError::Input(message)
+}
+
+/// `x A`, the cotangent an affine term passes back through its operator `A` (whose own product is
+/// `x Aᵀ`, `Operator::apply`).
+fn transpose_apply(op: &Operator, x: &Array2<f64>) -> Array2<f64> {
+    match &op.body {
+        OperatorBody::Identity => x.clone(),
+        OperatorBody::Diagonal { values, .. } => x * values,
+        OperatorBody::Dense { values, .. } => fast_ab(x, values),
+        OperatorBody::LowRank { left, right, .. } => fast_ab(&fast_ab(x, left), right),
+    }
 }
 
 /// The output tangent of `program` on `inputs` when each operator in `tangents` moves along its
@@ -421,7 +432,7 @@ pub(crate) fn vjp_seeded(
                     // The identity and a norm gain are column scales, not matrix products.
                     let term = match op.diagonal() {
                         Some(d) => &cot * &d,
-                        None => super::device::product(op, &cot, Layout::AsStored)?,
+                        None => transpose_apply(op, &cot),
                     };
                     add(&mut g, *argument, term);
                 }
@@ -507,7 +518,7 @@ pub(crate) fn vjp_seeded(
                 add(&mut g, *input, out);
             }
             Node::Transposed { input, operator } => {
-                add(&mut g, *input, super::device::product(&program.operators[*operator], &cot, Layout::Transposed)?);
+                add(&mut g, *input, program.operators[*operator].apply(&cot));
             }
             Node::Attend { query, key, value: v, scale, rotary, causal } => {
                 let (gq, gk, gv) =
