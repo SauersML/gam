@@ -495,38 +495,21 @@ pub struct Protocol {
     variables: Vec<ReadVariable>,
     operators: BTreeMap<usize, ndarray::Array2<f64>>,
     blocks: usize,
-    fingerprint: u64,
 }
 
 impl Protocol {
-    /// The protocol of the split native program `native` with its `layers`, imported from the
-    /// export whose digest is `export`.
-    pub fn new(native: &OperatorProgram, layers: &[LayerNodes], export: &str) -> Result<Self, String> {
-        use std::hash::{Hash, Hasher};
+    /// The protocol of the split native program `native` with its `layers`.
+    pub fn new(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Self, String> {
         let start = crate::library_mdl::explanation(native, layers)?;
         let program = &start.artifact.program;
         let variables = library_reads(program, layers.len())?;
         let read: BTreeSet<usize> = variables.iter().flat_map(|v| v.parts.iter().map(|(op, _)| *op)).collect();
         let operators: BTreeMap<usize, ndarray::Array2<f64>> = read.into_iter().map(|op| (op, program.operators[op].matrix())).collect();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (export, &variables).hash(&mut hasher);
-        for values in operators.values() {
-            values.iter().for_each(|v| v.to_bits().hash(&mut hasher));
-        }
-        Ok(Self { variables, operators, blocks: 2 * layers.len(), fingerprint: hasher.finish() })
+        Ok(Self { variables, operators, blocks: 2 * layers.len() })
     }
 
     pub fn variables(&self) -> &[ReadVariable] {
         &self.variables
-    }
-
-    /// A fingerprint of `experiments` on `batch` under this protocol (the export, `M`'s variables
-    /// and rows, and the experiments): the key of their kept targets.
-    pub fn key(&self, batch: &Batch, experiments: &[Experiment]) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (self.fingerprint, fingerprint(batch, experiments)).hash(&mut hasher);
-        hasher.finish()
     }
 
     /// The directions of `experiments` (over this protocol's variables) on device `d`: `M`'s.
@@ -1209,8 +1192,8 @@ fn check(e: &Experiment, batch: &Batch, blocks: usize) -> Result<(), String> {
 }
 
 /// `M`'s compact statistics for a batch's experiments, per experiment from its position on: the
-/// targets every score of `P` on them is measured against. They do not depend on `P`, so a fit
-/// makes them once per batch ([`targets`]) and keeps them ([`Targets::write`], [`Targets::read`]).
+/// targets every score of `P` on them is measured against ([`targets`]). They do not depend on `P`;
+/// a fit makes them on the device whenever it scores a batch.
 pub struct Targets {
     rows: Vec<Target>,
 }
@@ -1265,81 +1248,10 @@ pub fn targets<E: BlockEngine>(m: &E, head: &FixedHead, batch: &Batch, experimen
     Ok(Targets { rows: out })
 }
 
-/// A fingerprint of `experiments` on `batch` (their tokens, hybrids, patches and positions), so that
-/// kept targets are read back only for the experiments they were made for.
-pub fn fingerprint(batch: &Batch, experiments: &[Experiment]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (&batch.base, &batch.source, experiments).hash(&mut hasher);
-    hasher.finish()
-}
-
 impl Targets {
     /// Per experiment its rows' `μ` and `Σ p log p`, on the host.
     pub fn host(&self, d: &Device) -> Result<Vec<(ndarray::Array2<f64>, Vec<f64>)>, String> {
         self.rows.iter().map(|t| Ok((d.download(&t.mu).map_err(error)?, t.entropy.clone()))).collect()
-    }
-
-    /// Write the targets to `path` with the `fingerprint` of their experiments: the fingerprint, then
-    /// per experiment its rows and width, `μ` row by row in the device's storage precision (four
-    /// bytes per value in f32 storage, eight in float64) and the rows' `Σ p log p` in float64, all
-    /// little-endian.
-    pub fn write(&self, d: &Device, path: &std::path::Path, fingerprint: u64) -> Result<(), String> {
-        use std::io::Write;
-        let partial = path.with_extension("partial");
-        let mut file = std::io::BufWriter::new(std::fs::File::create(&partial).map_err(error)?);
-        let wide = d.float64();
-        file.write_all(&fingerprint.to_le_bytes()).map_err(error)?;
-        file.write_all(&[u8::from(wide)]).map_err(error)?;
-        file.write_all(&(self.rows.len() as u64).to_le_bytes()).map_err(error)?;
-        for t in &self.rows {
-            let mu = d.download(&t.mu).map_err(error)?;
-            file.write_all(&(mu.nrows() as u64).to_le_bytes()).map_err(error)?;
-            file.write_all(&(mu.ncols() as u64).to_le_bytes()).map_err(error)?;
-            for v in mu.iter() {
-                if wide {
-                    file.write_all(&v.to_le_bytes()).map_err(error)?;
-                } else {
-                    file.write_all(&(*v as f32).to_le_bytes()).map_err(error)?;
-                }
-            }
-            for v in &t.entropy {
-                file.write_all(&v.to_le_bytes()).map_err(error)?;
-            }
-        }
-        file.into_inner().map_err(error)?.sync_all().map_err(error)?;
-        std::fs::rename(&partial, path).map_err(error)
-    }
-
-    /// The targets [`Targets::write`] wrote to `path`, on the device `d` of `head`; none when they
-    /// were made for other experiments than those of `fingerprint`.
-    pub fn read(d: &Device, head: &FixedHead, path: &std::path::Path, fingerprint: u64) -> Result<Option<Self>, String> {
-        let bytes = std::fs::read(path).map_err(|e| error(format!("{}: {e}", path.display())))?;
-        let mut at = 0usize;
-        let mut take = |n: usize| -> Result<&[u8], String> {
-            let part = bytes.get(at..at + n).ok_or_else(|| error(format!("{}: truncated targets", path.display())))?;
-            at += n;
-            Ok(part)
-        };
-        let word = |b: &[u8]| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-        if word(take(8)?) != fingerprint {
-            return Ok(None);
-        }
-        let wide = take(1)?[0] == 1;
-        let count = word(take(8)?) as usize;
-        let mut rows = Vec::with_capacity(count);
-        for _ in 0..count {
-            let (r, c) = (word(take(8)?) as usize, word(take(8)?) as usize);
-            let values: Vec<f64> = if wide {
-                take(8 * r * c)?.chunks_exact(8).map(word).map(f64::from_bits).collect()
-            } else {
-                take(4 * r * c)?.chunks_exact(4).map(|b| f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))).collect()
-            };
-            let entropy = take(8 * r)?.chunks_exact(8).map(word).map(f64::from_bits).collect();
-            let mu = d.upload_vec(r, c, values).map_err(error)?;
-            rows.push(Target { mu: Arc::new(mu), entropy, head: Arc::clone(&head.head), scored: None });
-        }
-        Ok(Some(Self { rows }))
     }
 }
 

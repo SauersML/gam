@@ -61,14 +61,15 @@
 //! same hybrid, with the stated weights of `interchange::sample` (`P` alone or a random
 //! block-subset hybrid with probability ½ each; the patched block uniform over the `2L` blocks,
 //! then with probability ½ one read variable uniform within the block, else a joint read patch of
-//! a random subset of the block's variables, each included with probability ½; then a position).
+//! a random subset of the block's variables, its size uniform from one to all of them and then the
+//! subset uniform; then a position).
 //! `M`'s reads span every block's whole stream, so the complement of `M`'s reads is empty; the
 //! collection covers every one of `M`'s reads instead, those `P` removes included, one at a time
 //! and jointly. A base's source is another training sequence, drawn uniformly. The variables
 //! and patch directions are `M`'s own reads (the library's start): the questions do not move as
 //! `P` learns or loses functions, so `F`, the convergence test and every removal comparison score
-//! the same experiments, and `M`'s targets for them are made once per batch and kept
-//! (`interchange::Targets`, one shard per batch next to the checkpoint). Experiments whose
+//! the same experiments, and `M`'s targets for them are made on the device whenever a batch is
+//! scored (`interchange::targets`). Experiments whose
 //! directions are `P`'s current reads are a separate held-out report, never the objective.
 //!
 //! # The fit
@@ -160,7 +161,7 @@ use std::{
     f64::consts::LN_2,
     io::{BufReader, Read, Write},
     ops::Range,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
     thread::JoinHandle,
     time::Instant,
@@ -1232,8 +1233,8 @@ struct Scorer {
     /// Each trainable operator's position in `Explanation::trainable`.
     position: BTreeMap<usize, usize>,
     /// The patch directions made when asked for (the held-out batches, and a training batch no
-    /// thread made ahead), by key, with its key under the protocol: fixed data, decomposed once.
-    designs: BTreeMap<String, (u64, Arc<interchange::Design>)>,
+    /// thread made ahead), by the batch's name: fixed data, decomposed once.
+    designs: BTreeMap<String, Arc<interchange::Design>>,
     /// The patch directions of the training batches the fit takes next, each made on another
     /// thread from host arithmetic while the device runs the current batch ([`Scorer::prefetch`]):
     /// its experiments and the thread. At most the current and the next batch wait here: a
@@ -1246,28 +1247,23 @@ struct Scorer {
     /// order, blocks and rows), so that the adaptive family can ask them; tied and shared functions
     /// keep the variable of the call site they replace.
     aligned: bool,
-    /// The directory of `M`'s target shards, when the fit keeps them.
-    shards: Option<PathBuf>,
 }
 
 impl Scorer {
-    fn new(device: &Device, native: &OperatorProgram, explanation: &Explanation, settings: &Settings, export: &str, shards: Option<PathBuf>) -> Result<Self, String> {
+    fn new(device: &Device, native: &OperatorProgram, explanation: &Explanation, settings: &Settings) -> Result<Self, String> {
         let sites: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
         let reads = interchange::library_reads(&explanation.artifact.program, sites.len())?;
-        let protocol = Arc::new(interchange::Protocol::new(native, &sites, export)?);
+        let protocol = Arc::new(interchange::Protocol::new(native, &sites)?);
         let aligned = reads.len() == protocol.variables().len()
             && reads.iter().zip(protocol.variables()).all(|(own, native)| {
                 own.block == native.block && own.parts.len() == native.parts.len() && own.parts.iter().zip(&native.parts).all(|((_, rows), (_, native_rows))| rows.len() == native_rows.len())
             });
         let experiments =
             Interchange::new(device, native, &sites, &explanation.artifact, &explanation.trainable, reads, settings.numeric_bytes, settings.head_tile_rows)?;
-        if let Some(dir) = &shards {
-            std::fs::create_dir_all(dir).map_err(error)?;
-        }
         let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
         let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
-        Ok(Self { experiments, mlps, position, designs: BTreeMap::new(), ahead: VecDeque::new(), protocol, aligned, shards })
+        Ok(Self { experiments, mlps, position, designs: BTreeMap::new(), ahead: VecDeque::new(), protocol, aligned })
     }
 
     fn layers(&self) -> usize {
@@ -1300,8 +1296,7 @@ impl Scorer {
 
     /// `KL(M_e ‖ P_e)` per scored token in bits for `experiments` on `batch` at the explanation's
     /// `theta`, with the fixed directions (`M`'s reads), and with `gradient` the gradient of its
-    /// sum in every trainable operator. `M`'s targets come from the shard `key` when the fit keeps
-    /// shards and it holds them for these experiments, else are made (and kept there).
+    /// sum in every trainable operator; `key` names the batch ([`Scorer::targets`]).
     fn score(&mut self, batch: &Batch, experiments: &[Experiment], theta: &[Array2<f64>], key: &str, gradient: bool) -> Result<(Vec<Vec<f64>>, Vec<Array2<f64>>), String> {
         let (design, targets) = self.targets(batch, experiments, key)?;
         self.evaluated(batch, experiments, theta, &design, &targets, gradient)
@@ -1331,13 +1326,12 @@ impl Scorer {
         Ok((evaluation.bits, evaluation.gradient))
     }
 
-    /// The patch directions of `experiments` (from the thread that made them ahead, when one did)
-    /// and `M`'s targets on them, from the shard `key` when the fit keeps them.
+    /// The patch directions of `experiments` (from the thread that made them ahead, when one did,
+    /// else made and kept under `key`) and `M`'s targets on them, made on the device.
     fn targets(&mut self, batch: &Batch, experiments: &[Experiment], key: &str) -> Result<(Arc<interchange::Design>, Targets), String> {
-        let fingerprint = self.protocol.key(batch, experiments);
         let device = self.experiments.models().0.program.device();
-        let design = match self.designs.get(key).filter(|(f, _)| *f == fingerprint) {
-            Some((_, design)) => Arc::clone(design),
+        let design = match self.designs.get(key) {
+            Some(design) => Arc::clone(design),
             None => match self.ahead.iter().position(|(planned, _)| planned.as_slice() == experiments) {
                 Some(at) => {
                     let (_, job) = self.ahead.remove(at).ok_or("a planned design")?;
@@ -1345,26 +1339,12 @@ impl Scorer {
                 }
                 None => {
                     let design = Arc::new(self.protocol.design(device, experiments)?);
-                    self.designs.insert(key.to_string(), (fingerprint, Arc::clone(&design)));
+                    self.designs.insert(key.to_string(), Arc::clone(&design));
                     design
                 }
             },
         };
-        let path = self.shards.as_ref().map(|dir| dir.join(format!("{key}.bin")));
-        let kept = match &path {
-            Some(path) if path.exists() => Targets::read(self.experiments.models().0.program.device(), self.experiments.head(), path, fingerprint)?,
-            _ => None,
-        };
-        let targets = match kept {
-            Some(targets) => targets,
-            None => {
-                let targets = self.experiments.targets(batch, experiments, &design)?;
-                if let Some(path) = &path {
-                    targets.write(self.experiments.models().0.program.device(), path, fingerprint)?;
-                }
-                targets
-            }
-        };
+        let targets = self.experiments.targets(batch, experiments, &design)?;
         Ok((design, targets))
     }
 
@@ -1924,8 +1904,7 @@ pub fn fit(
     if draws.len() < 2 {
         return Err("the convergence test needs at least two training batches".into());
     }
-    let shards = checkpoint.map(|path| path.with_extension("targets"));
-    let mut scorer = Scorer::new(device, native, explanation, settings, export, shards)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?;
     // The fixed collection: its scored tokens N and its realized families.
     let (mut tokens, mut families) = (0, BTreeMap::new());
     for draw in &draws {
@@ -2262,14 +2241,11 @@ fn remove(
 }
 
 /// A removal step run on a posterior outside a fit ([`removal_step`]): the fit's training and
-/// held-out sequences, settings and export, the directory keeping `M`'s targets, and the search
-/// with its log.
+/// held-out sequences and settings, and the search with its log.
 pub struct Step<'a> {
     pub sequences: &'a [Vec<u32>],
     pub held: &'a [Vec<u32>],
     pub settings: &'a Settings,
-    pub export: &'a str,
-    pub shards: Option<PathBuf>,
     pub search: Search,
     pub log: Option<&'a Path>,
 }
@@ -2278,11 +2254,11 @@ pub struct Step<'a> {
 /// collection, weight noise, compensation and acceptance, with the held-out evaluation before and
 /// after.
 pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Explanation, posterior: &mut Posterior, step: Step) -> Result<(Removal, HeldOut, HeldOut), String> {
-    let Step { sequences, held, settings, export, shards, search, log } = step;
+    let Step { sequences, held, settings, search, log } = step;
     settings.validate()?;
     let length = sequences.first().map_or(0, Vec::len);
     let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
-    let mut scorer = Scorer::new(device, native, explanation, settings, export, shards)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?;
     let mut tokens = 0;
     for draw in &draws {
         tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
@@ -2480,7 +2456,7 @@ mod tests {
         let cells: usize = explanation.groups.iter().flat_map(|g| &g.cells).map(|c| c.rows.len() * c.cols.len()).sum();
         assert_eq!(cells, posterior.mean.iter().map(Array2::len).sum::<usize>(), "the groups partition the parameters");
         let settings = settings();
-        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, "tiny", None).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 72.0, None, 0).unwrap();
         let evaluation = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
         for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
@@ -2570,7 +2546,7 @@ mod tests {
         let mut explanation = explanation(&native, &layers).unwrap();
         let settings = settings();
         let posterior = Posterior::new(&explanation, 72).unwrap();
-        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, "tiny", None).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 72.0, None, 0).unwrap();
         let without = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
         explanation.fixed_nats = 1000_f64.ln();
@@ -2588,7 +2564,7 @@ mod tests {
         let explanation = crate::library_sharing::tie(&start, &[tie]).unwrap();
         let settings = settings();
         let posterior = Posterior::new(&explanation, 72).unwrap();
-        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, "tiny", None).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
@@ -2617,7 +2593,7 @@ mod tests {
         let explanation = crate::library_sharing::tie_column(&row, (1, 7), (0, 4), -0.6).unwrap();
         let settings = settings();
         let posterior = Posterior::new(&explanation, 72).unwrap();
-        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, "tiny", None).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
@@ -2648,7 +2624,7 @@ mod tests {
         let explanation = share_value(&shared, (1, 0), (0, 0), 0.7).unwrap();
         let settings = settings();
         let posterior = Posterior::new(&explanation, 72).unwrap();
-        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, "tiny", None).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
@@ -2680,7 +2656,7 @@ mod tests {
         let explanation = explanation(&native, &layers).unwrap();
         let settings = settings();
         let posterior = Posterior::new(&explanation, 72).unwrap();
-        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, "tiny", None).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
@@ -2749,7 +2725,7 @@ mod tests {
         let settings = settings();
         let device = Device::host();
         let posterior = Posterior::new(&explanation, 72).unwrap();
-        let mut scorer = Scorer::new(&device, &native, &explanation, &settings, "tiny", None).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
         let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
         let evaluation = held_out(&mut scorer, &explanation, &posterior, &device_posterior, &sequences, &settings, 72, None).unwrap();
         for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
@@ -2775,7 +2751,7 @@ mod tests {
         let explanation = explanation(&native, &layers).unwrap();
         let settings = settings();
         let posterior = Posterior::new(&explanation, 1000).unwrap();
-        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, "tiny", None).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let group = *explanation.layers[0].functions[1].last().unwrap();
         let rounds = 96;
@@ -2812,7 +2788,7 @@ mod tests {
         let explanation = explanation(&native, &layers).unwrap();
         let settings = settings();
         let posterior = Posterior::new(&explanation, 2 * sequences.len() * 12).unwrap();
-        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, "tiny", None).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let removed: Vec<usize> = (0..posterior.active.len()).collect();
         let mut trial = posterior.clone();
@@ -3120,7 +3096,6 @@ mod tests {
         std::fs::remove_file(&checkpoint).unwrap();
         std::fs::remove_file(checkpoint.with_extension("json")).unwrap();
         std::fs::remove_file(checkpoint.with_extension("artifact.bin")).unwrap();
-        std::fs::remove_dir_all(checkpoint.with_extension("targets")).unwrap();
         assert_eq!(resumed.posterior.active, fit.posterior.active);
         assert_eq!(resumed.posterior.means(), fit.posterior.means());
         assert_eq!(resumed.report.epochs.len(), fit.report.epochs.len());
@@ -3163,7 +3138,7 @@ mod tests {
         let tied = crate::library_sharing::tie(&warm, &[crate::library_sharing::Tie { source: (0, 0), target: (1, 1), scale: 0.5 }]).unwrap();
         let settings = settings();
         let device = Device::host();
-        let mut scorers: Vec<Scorer> = [&start, &warm, &tied].iter().map(|e| Scorer::new(&device, &native, e, &settings, "tiny", None).unwrap()).collect();
+        let mut scorers: Vec<Scorer> = [&start, &warm, &tied].iter().map(|e| Scorer::new(&device, &native, e, &settings).unwrap()).collect();
         for (b, draw) in draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap().iter().enumerate() {
             let batch = draw.batch(&sequences).unwrap();
             let experiments: Vec<Vec<Experiment>> = scorers.iter().map(|s| s.experiments(draw, &sequences).unwrap()).collect();
@@ -3188,7 +3163,7 @@ mod tests {
         let (native, layers, _, sequences) = tiny("library_held_out_sample", "gelu_tanh");
         let explanation = explanation(&native, &layers).unwrap();
         let settings = settings();
-        let scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, "tiny", None).unwrap();
+        let scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let held: Vec<Vec<u32>> = sequences.iter().cycle().take(2000).cloned().collect();
         let sampled = held_out_experiments(&scorer, &held, &settings).unwrap();
         let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();

@@ -87,8 +87,6 @@ fn main() -> Result<(), String> {
             sequences: &train,
             held,
             settings: &settings.fit,
-            export: &settings.export_sha256,
-            shards: Some(out.join("targets")),
             search,
             log: Some(&log),
         };

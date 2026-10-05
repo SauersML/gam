@@ -16,7 +16,7 @@
 use super::artifact::Artifact;
 use super::device_program::DeviceProgram;
 use super::device_program_tests::{devices, fixture_sized, noise};
-use super::interchange::{Batch, Design, Experiment, FixedHead, Interchange, Model, Patch, ReadVariable, Targets, census, design, evaluate, fingerprint, sample, sites, targets};
+use super::interchange::{Batch, Design, Experiment, FixedHead, Interchange, Model, Patch, ReadVariable, census, design, evaluate, sample, sites, targets};
 use super::interchange::BlockEngine;
 use super::device_program::DeviceTrace;
 use super::operator_program::{FamilyInputs, Operator, OperatorProgram, SequenceLayout, SlotValues, exact_precision};
@@ -517,27 +517,6 @@ fn many_dropped_reads_that_matter_little_alone_matter_jointly() {
     assert!(single <= 1e-3, "one dropped read alone: {single} bits");
     let ratio = joint / bits[..n].iter().sum::<f64>() * n as f64;
     assert!(ratio >= 0.9 * (n * n) as f64 && ratio <= 1.1 * (n * n) as f64, "joint {joint} bits against {n}² times a mean single, ratio {ratio}");
-}
-
-#[test]
-fn targets_written_and_read_score_alike() {
-    let f = fixture();
-    let device = Device::host();
-    let experiments = experiments(&f);
-    let programs = programs(&device, &f);
-    let (m, p) = models(&f, &programs);
-    let design = design(&p, &f.variables, &experiments).expect("design");
-    let made = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
-    let path = std::env::temp_dir().join(format!("interchange_targets_{}.bin", std::process::id()));
-    let key = fingerprint(&f.batch, &experiments);
-    made.write(&device, &path, key).expect("write");
-    let read = Targets::read(&device, &programs.head, &path, key).expect("read").expect("the same experiments");
-    // Targets made for other experiments are not read back.
-    assert!(Targets::read(&device, &programs.head, &path, fingerprint(&f.batch, &experiments[1..])).expect("read").is_none());
-    std::fs::remove_file(&path).expect("remove");
-    let a = evaluate(&m, &p, &programs.head, &f.batch, &made, &experiments, &design, false).expect("evaluate").bits;
-    let b = evaluate(&m, &p, &programs.head, &f.batch, &read, &experiments, &design, false).expect("evaluate").bits;
-    assert_eq!(a, b);
 }
 
 #[test]
