@@ -18,13 +18,16 @@
 //!   entering it, the final stream `M`'s embedding plus each layer's increment), single-layer (one
 //!   layer of `P`, `M` elsewhere), the cuts (`P`'s layers before `ℓ`, `M`'s after), and per size
 //!   `k` a uniformly drawn subset of `k` layers per batch of bases.
-//! * Interchange (`interchange`) with `P` alone (cut `L`): per base one read patch of a read
-//!   variable drawn uniformly, the complement patch of every block, and the joint complement
-//!   patch at a uniformly drawn set of at least two blocks (its size uniform in `2..=2L`, where
-//!   cancellation between blocks shows), each with the source a sequence shared across the whole
-//!   batch of bases. Each base's patches replace one position drawn uniformly and are scored from
-//!   that position on (earlier tokens are the unpatched run's). Every source row is scored; the
-//!   worst source of the first `K` (by the mean over all bases) is reported for each `K`.
+//! * Interchange (`interchange`) with `P` alone: per base one read patch of one of `M`'s read
+//!   variables drawn uniformly, with `M`'s own directions (the library's start, the fit's fixed
+//!   questions: `read`) and with `P`'s current reads of the same rows (adaptive questions:
+//!   `read_adaptive`); the complement patch of every block and the joint complement patch at a
+//!   uniformly drawn set of at least two blocks (its size uniform in `2..=2L`, where cancellation
+//!   between blocks shows), both of `P`'s current reads, since `M`'s reads span every block's whole
+//!   stream and leave no complement. Each with the source a sequence shared across the whole batch
+//!   of bases. Each base's patches replace one position drawn uniformly and are scored from that
+//!   position on (earlier tokens are the unpatched run's). Every source row is scored; the worst
+//!   source of the first `K` (by the mean over all bases) is reported for each `K`.
 use gam_gpu::{
     GpuPolicy,
     tensor::{Arithmetic, Device, Op, Tensor},
@@ -35,9 +38,9 @@ use gam_mpd::{
     device_program::DeviceProgram,
     engine::{log_to_stderr, sha256},
     import::import_language_model,
-    interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable},
+    interchange::{self, Batch, Experiment, Interchange, Patch},
     library_mdl,
-    operator_program::{FamilyInputs, Node, OperatorBody, OperatorProgram, SlotValues},
+    operator_program::{FamilyInputs, Node, OperatorProgram, SlotValues},
     run_check::{LayerNodes, layer_nodes, split_sites},
 };
 use ndarray::Array2;
@@ -266,26 +269,6 @@ fn checkpoint_mean(path: &Path, explanation: &library_mdl::Explanation) -> Resul
     Ok((library_mdl::posterior_mean(explanation, &posterior)?.f32_literals()?, size))
 }
 
-/// The read variables of `artifact` whose rows hold a nonzero value (a removed function reads
-/// nothing).
-fn live_variables(artifact: &Artifact, layers: usize) -> Result<Vec<ReadVariable>, String> {
-    let program = &artifact.program;
-    let mut out = Vec::new();
-    for v in interchange::library_reads(program, layers)? {
-        let live = v.parts.iter().any(|(op, rows)| match &program.operators[*op].body {
-            OperatorBody::Dense { .. } => {
-                let m = program.operators[*op].matrix();
-                rows.clone().any(|r| m.row(r).iter().any(|x| *x != 0.0))
-            }
-            _ => true,
-        });
-        if live {
-            out.push(v);
-        }
-    }
-    Ok(out)
-}
-
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -414,8 +397,10 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
 
-    // Interchange with P alone, sources shared across the batch.
-    let variables = live_variables(&artifact, layer_count)?;
+    // Interchange with P alone, sources shared across the batch, over M's read variables: their
+    // directions at the library's start (M's reads) and at the scored explanation (P's).
+    let variables = interchange::library_reads(&explanation.artifact.program, layer_count)?;
+    let start: Vec<Array2<f64>> = explanation.trainable.iter().map(|op| explanation.artifact.program.operators[*op].matrix()).collect();
     let blocks = 2 * layer_count;
     let interchange = Interchange::new(&device, &native, &layers, &artifact, &explanation.trainable, variables.clone(), settings.numeric_bytes, settings.head_tile_rows)?;
     let read_of: Vec<usize> = (0..bases.len()).map(|_| rng.random_range(0..variables.len())).collect();
@@ -426,52 +411,59 @@ fn main() -> Result<(), String> {
             interchange::hybrid_of(&mut rng, blocks, k).iter().enumerate().filter(|(_, x)| **x).map(|(b, _)| b).collect()
         })
         .collect();
-    // Per family (the read patch, each block's complement, then the joint complement) per source:
-    // bits and tokens over every base, and every token's bits.
-    let families = 2 + blocks;
+    // Per family (the read patch at M's directions, at P's, each block's complement, then the joint
+    // complement) per source: bits and tokens over every base, and every token's bits.
+    let families = 3 + blocks;
     let mut per_source = vec![vec![(0.0f64, 0usize); sources.len()]; families];
     let mut all: Vec<Tokens> = (0..families).map(|_| Tokens::default()).collect();
     let mut clean = Tokens::default();
     for (s, source) in sources.iter().enumerate() {
         for (c, chunk) in bases.chunks(settings.batch_sequences).enumerate() {
             let batch = Batch::new(chunk.to_vec(), vec![source.clone()])?;
-            let mut experiments = Vec::with_capacity(chunk.len() * (families + 1));
+            // M's directions: the read patches and (once) the clean experiments; P's: the read
+            // patches again and the complements.
+            let (mut fixed, mut adaptive) = (Vec::new(), Vec::new());
             for b in 0..chunk.len() {
                 let position = position_of[c * settings.batch_sequences + b];
                 let at = |patch: Option<Patch>| {
                     let position = if patch.is_some() { position } else { 0 };
                     Experiment { base: b, source: 0, explained: vec![true; blocks], patch, position }
                 };
-                experiments.push(at(Some(Patch::Read { variable: read_of[c * settings.batch_sequences + b] })));
-                experiments.extend((0..blocks).map(|block| at(Some(Patch::Complement { blocks: vec![block] }))));
-                experiments.push(at(Some(Patch::Complement { blocks: joint_of[c * settings.batch_sequences + b].clone() })));
+                let read = at(Some(Patch::Read { variable: read_of[c * settings.batch_sequences + b] }));
+                fixed.push(read.clone());
+                adaptive.push(read);
+                adaptive.extend((0..blocks).map(|block| at(Some(Patch::Complement { blocks: vec![block] }))));
+                adaptive.push(at(Some(Patch::Complement { blocks: joint_of[c * settings.batch_sequences + b].clone() })));
                 if s == 0 {
-                    experiments.push(at(None));
+                    fixed.push(at(None));
                 }
             }
-            // The directions of P's own reads at the scored explanation.
-            let design = interchange::design(&interchange.models().1, &variables, &experiments)?;
-            let scored = interchange.evaluate(&batch, &experiments, &design, false)?;
-            for (e, bits) in experiments.iter().zip(&scored.bits) {
-                let family = match &e.patch {
-                    None => {
-                        clean.0.extend_from_slice(bits);
-                        continue;
-                    }
-                    Some(Patch::Read { .. }) => 0,
-                    Some(Patch::Complement { blocks: one }) if one.len() == 1 => 1 + one[0],
-                    Some(Patch::Complement { .. }) => 1 + blocks,
-                };
-                per_source[family][s].0 += bits.iter().sum::<f64>();
-                per_source[family][s].1 += bits.len();
-                all[family].0.extend_from_slice(bits);
+            let fixed_design = interchange.design_at(&variables, &fixed, &start)?;
+            let adaptive_design = interchange::design(&interchange.models().1, &variables, &adaptive)?;
+            let scored = [(&fixed, interchange.evaluate(&batch, &fixed, &fixed_design, false)?, 0), (&adaptive, interchange.evaluate(&batch, &adaptive, &adaptive_design, false)?, 1)];
+            for (experiments, scored, read_family) in &scored {
+                for (e, bits) in experiments.iter().zip(&scored.bits) {
+                    let family = match &e.patch {
+                        None => {
+                            clean.0.extend_from_slice(bits);
+                            continue;
+                        }
+                        Some(Patch::Read { .. }) => *read_family,
+                        Some(Patch::Complement { blocks: one }) if one.len() == 1 => 2 + one[0],
+                        Some(Patch::Complement { .. }) => 2 + blocks,
+                    };
+                    per_source[family][s].0 += bits.iter().sum::<f64>();
+                    per_source[family][s].1 += bits.len();
+                    all[family].0.extend_from_slice(bits);
+                }
             }
         }
         log::info!("battery: interchange source {}/{} ({:.0} s)", s + 1, sources.len(), started.elapsed().as_secs_f64());
     }
     let name = |f: usize| match f {
         0 => "read".to_string(),
-        f if f <= blocks => format!("complement_block_{}", f - 1),
+        1 => "read_adaptive".to_string(),
+        f if f < 2 + blocks => format!("complement_block_{}", f - 2),
         _ => "complement_joint".to_string(),
     };
     let mut patches = serde_json::Map::new();
@@ -482,7 +474,7 @@ fn main() -> Result<(), String> {
         patches.insert(name(f), json!({"all_sources": all[f].summary(), "shared_source": worst}));
     }
     let mut complement = Tokens::default();
-    (1..=blocks).for_each(|f| complement.0.extend_from_slice(&all[f].0));
+    (2..2 + blocks).for_each(|f| complement.0.extend_from_slice(&all[f].0));
     report["interchange"] = json!({
         "read_variables": variables.len(),
         "clean": clean.summary(),
