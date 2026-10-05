@@ -84,19 +84,25 @@
 //! has converged when an epoch's mean improvement of the per-batch objective estimate over the
 //! previous epoch, paired by batch, is smaller than its standard error.
 //!
-//! A converged fit then proposes removing groups in increasing order of their divergence `KL_G`
-//! (their information content). Prefix lengths are searched by bisection, `O(log n)` full training
-//! evaluations for `n` active groups, and the longest evaluated prefix that does not increase the
-//! sampled objective is removed. Where a prefix deletes functions of an MLP, the MLP's surviving
-//! functions' outputs move by the least-squares solution that takes over the deleted functions'
-//! output on `P`'s own states (`library_compensation`), and the comparison scores the removal with
-//! those outputs. The objective is estimated over the whole training set with one
-//! common weight sample per batch for both sides of every comparison, on the fixed collection. The
-//! order and the search are a proposal; acceptance never increases the sampled objective. Removal
-//! effects
-//! can cancel, so the objective need not be monotone in the prefix length and the search may miss a
-//! longer acceptable prefix; the next round, after the continuous fit converges again, proposes
-//! again. The fit alternates converging and removing until no removal is accepted.
+//! A converged fit then proposes removals, each accepted only when it does not increase `F`,
+//! estimated over the whole training set with one common weight sample per batch for both sides of
+//! every comparison, on the fixed collection ([`Removal`]):
+//! * the groups with no path to the output (the planes of a head none of whose value coordinates
+//!   is active; the other groups of an MLP function one of whose groups is removed, since every
+//!   pointwise law is zero at zero), all at once;
+//! * then prefixes of the remaining groups in increasing order of each one's second-order removal
+//!   effect `½ Σ_j (μ_j² (1/σ_j² − 1/v_G) − 1 + σ_j²/v_G) − KL_G − ½ ln |G|` (zeroing the mean and
+//!   the noise at the curvature `1/σ² − 1/v_G` that IVON's `σ` holds, less the description it
+//!   saves), searched by bisection, `O(log n)` full training evaluations for `n` groups;
+//! * when no prefix is accepted, single groups: the [`SINGLES`] of lowest estimated effect and
+//!   [`SINGLES`] drawn at random, the best accepted.
+//! Where a proposal deletes functions of an MLP, the MLP's surviving functions' outputs move by the
+//! least-squares solution that takes over the deleted functions' output on `P`'s own states
+//! (`library_compensation`), and the comparison scores the proposal with those outputs. The order
+//! and the search are proposals; acceptance never increases the sampled objective. Removal effects
+//! can cancel, so the objective need not be monotone in the prefix length. The fit alternates
+//! converging and removing; it stops when a round accepts nothing, which says the search found no
+//! removal, not that none exists ([`Outcome::Exhausted`]).
 //!
 //! # Evaluation
 //!
@@ -678,6 +684,37 @@ impl Posterior {
         out
     }
 
+    /// Per group, the second-order estimate of `F`'s change in nats when it alone is removed
+    /// (module note): the data term's rise from zeroing its means and noise at the curvature
+    /// `1/σ² − 1/v_G`, less the description it saves (zero for a removed group).
+    fn removal_estimates(&self) -> Vec<f64> {
+        let moments = self.moments();
+        let costs = self.costs();
+        let partial: Vec<(Range<usize>, Vec<f64>)> = (0..self.mean.len())
+            .into_par_iter()
+            .map(|i| {
+                let span = self.spans[i].clone();
+                let mut local = vec![0.0; span.len()];
+                for ((mu, s), group) in self.mean[i].iter().zip(self.log_sd[i].iter()).zip(self.membership[i].iter()) {
+                    let g = *group as usize;
+                    if self.active[g] {
+                        let (variance, sd2) = (moments[g].second / moments[g].count, (2.0 * s).exp());
+                        local[g - span.start] += 0.5 * (mu * mu * (1.0 / sd2 - 1.0 / variance) - 1.0 + sd2 / variance);
+                    }
+                }
+                (span, local)
+            })
+            .collect();
+        let mut out = vec![0.0; self.active.len()];
+        for (span, local) in partial {
+            for (g, e) in span.zip(local) {
+                out[g] += e;
+            }
+        }
+        out.iter_mut().zip(&costs).zip(&self.active).for_each(|((e, c), active)| *e = if *active { *e - c } else { 0.0 });
+        out
+    }
+
     /// Per group, `KL(q_G ‖ p_G)` in nats (zero for a removed group).
     pub fn divergences(&self) -> Vec<f64> {
         self.moments().iter().zip(&self.active).map(|(m, active)| if *active { m.divergence() } else { 0.0 }).collect()
@@ -878,12 +915,35 @@ pub struct Epoch {
 pub struct Removal {
     pub candidates: usize,
     pub removed: usize,
+    /// The groups removed as having no path to the output, which `removed` counts.
+    pub dead: usize,
     /// `F` before and after, in bits.
     pub before_bits: f64,
     pub after_bits: f64,
-    /// Every evaluated prefix `(k, F − F_before)` in bits.
+    /// Every evaluated prefix `(k, F − F_before)` in bits, and every tested single group
+    /// `(group, F − F_before)`.
     pub evaluations: Vec<(usize, f64)>,
+    pub singles: Vec<(usize, f64)>,
+    pub outcome: Outcome,
 }
+
+/// What a removal round accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    /// Groups with no path to the output, and possibly a prefix after them.
+    Dead,
+    /// A prefix of the groups in increasing estimated effect.
+    Prefix,
+    /// One group alone, from the single-group tests.
+    Single,
+    /// Nothing: the round's search (prefix bisection, then single groups) found no removal that
+    /// does not increase `F`. The fit stops here; that is the search exhausted, not a proof.
+    Exhausted,
+}
+
+/// The single groups a round tests when no prefix is accepted: this many of lowest estimated
+/// effect and this many drawn at random (a search budget; acceptance is by `F` alone).
+pub const SINGLES: usize = 32;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
@@ -1894,8 +1954,9 @@ pub fn fit(
         progress.epoch += 1;
         let converged = matches!((improvement, standard_error), (Some(i), Some(se)) if i <= se);
         if converged {
-            let removal = remove(&mut scorer, &mut posterior, &draws, sequences, settings, explanation, prior.as_deref_mut())?;
-            log::info!("library removal after epoch {epoch}: {} of {} candidates", removal.removed, removal.candidates);
+            let round = progress.removals.len();
+            let removal = remove(&mut scorer, &mut posterior, &draws, sequences, settings, explanation, round, prior.as_deref_mut())?;
+            log::info!("library removal after epoch {epoch}: {} of {} candidates ({:?})", removal.removed, removal.candidates, removal.outcome);
             // The removed groups' entries are exactly zero with `ln σ = −∞`, which the device step
             // leaves alone.
             device_posterior.set_values(&posterior)?;
@@ -1993,9 +2054,41 @@ fn largest_accepted_prefix(
     Ok(low)
 }
 
-/// The removal step (module note): a prefix of the active groups in increasing divergence whose
-/// removal, compensated in the MLPs it deletes functions of (`library_compensation`), does not
-/// increase the sampled objective on this round's fixed evidence, found by bisection.
+/// The groups with no path to the output while `active` holds (module note): the planes of a head
+/// none of whose value coordinates is active, and the other groups of an MLP function one of whose
+/// groups is inactive. An output that a read–write tie replaces (`Explanation::removed`) is another
+/// path, so with ties a function's removed output does not make its gate dead. Removing these
+/// groups removes no other group's only path, so one pass reaches the fixed point.
+fn dead_groups(explanation: &Explanation, active: &[bool]) -> Vec<usize> {
+    let tied = !explanation.removed.is_empty();
+    let mut dead = std::collections::BTreeSet::new();
+    for layer in &explanation.layers {
+        for (planes, values) in &layer.heads {
+            if !values.iter().any(|g| active[*g]) {
+                dead.extend(planes.iter().copied().filter(|g| active[*g]));
+            }
+        }
+        for groups in &layer.functions {
+            let Some((&output, reads)) = groups.split_last() else { continue };
+            let read_removed = reads.iter().any(|g| !active[*g]);
+            // A function with a read removed writes zero, so its output is dead; one that writes
+            // nothing (a read or its output removed) leaves its reads dead, unless a read may be
+            // another function's write (a tie).
+            if read_removed && active[output] {
+                dead.insert(output);
+            }
+            if (read_removed || !active[output]) && !tied {
+                dead.extend(reads.iter().copied().filter(|g| active[*g]));
+            }
+        }
+    }
+    dead.into_iter().collect()
+}
+
+/// A removal round (module note): the dead groups, then prefixes of the rest in increasing
+/// estimated effect by bisection, then, when neither is accepted, single groups; every proposal
+/// compensated in the MLPs it deletes functions of (`library_compensation`). `round` seeds the
+/// random single groups.
 fn remove(
     scorer: &mut Scorer,
     posterior: &mut Posterior,
@@ -2003,38 +2096,101 @@ fn remove(
     sequences: &[Vec<u32>],
     settings: &Settings,
     explanation: &Explanation,
+    round: usize,
     prior: Option<&mut (dyn PriorTerm + 'static)>,
 ) -> Result<Removal, String> {
     let mut prior = prior;
     let fixed = explanation.fixed_nats;
-    let compensation = Compensation::new(&mut scorer.experiments, explanation, posterior, sequences, settings.batch_sequences)?;
-    let divergences = posterior.divergences();
-    let mut order: Vec<usize> = (0..divergences.len()).filter(|g| posterior.active[*g]).collect();
-    order.sort_by(|a, b| divergences[*a].total_cmp(&divergences[*b]));
-    let description = posterior.description() + fixed;
-    let base = expected_divergence(scorer, posterior, draws, sequences, &[], settings, prior.as_deref_mut())? + description;
-    // `F` with the first `k` candidates removed, minus `F` as it is.
-    let mut evaluations: Vec<(usize, f64)> = Vec::new();
-    let mut change = |k: usize| -> Result<f64, String> {
-        if let Some((_, c)) = evaluations.iter().find(|(at, _)| *at == k) {
-            return Ok(*c);
-        }
-        let trial = compensation.proposal(posterior, &order[..k])?;
-        let c = expected_divergence(scorer, &trial, draws, sequences, &[], settings, prior.as_deref_mut())? + trial.description() + fixed - base;
-        log::info!("library removal of {k} of {} groups: F changes by {:.6e} bits", order.len(), c / LN_2);
-        evaluations.push((k, c));
-        Ok(c)
-    };
-    let low = largest_accepted_prefix(order.len(), &mut change)?;
-    let after = base + if low > 0 { change(low)? } else { 0.0 };
-    *posterior = compensation.proposal(posterior, &order[..low])?;
     let to_bits = |nats: f64| nats / LN_2;
+    let candidates = posterior.active.iter().filter(|a| **a).count();
+    let before = expected_divergence(scorer, posterior, draws, sequences, &[], settings, prior.as_deref_mut())? + posterior.description() + fixed;
+    // The compensated posterior with `groups` removed and its `F` minus `base`.
+    let trial = |scorer: &mut Scorer, compensation: &Compensation, posterior: &Posterior, groups: &[usize], base: f64, prior: Option<&mut (dyn PriorTerm + 'static)>| -> Result<(Posterior, f64), String> {
+        let proposal = compensation.proposal(posterior, groups)?;
+        let c = expected_divergence(scorer, &proposal, draws, sequences, &[], settings, prior)? + proposal.description() + fixed - base;
+        if !c.is_finite() {
+            return Err("nonfinite group removal objective".into());
+        }
+        Ok((proposal, c))
+    };
+    // The dead groups, all at once.
+    let mut base = before;
+    let mut compensation = Compensation::new(&mut scorer.experiments, explanation, posterior, sequences, settings.batch_sequences)?;
+    let dead = dead_groups(explanation, &posterior.active);
+    let mut removed_dead = 0;
+    if !dead.is_empty() {
+        let (proposal, c) = trial(scorer, &compensation, posterior, &dead, base, prior.as_deref_mut())?;
+        log::info!("library removal of {} dead groups: F changes by {:.6e} bits", dead.len(), to_bits(c));
+        if c <= 0.0 {
+            *posterior = proposal;
+            base += c;
+            removed_dead = dead.len();
+            compensation = Compensation::new(&mut scorer.experiments, explanation, posterior, sequences, settings.batch_sequences)?;
+        }
+    }
+    // Prefixes in increasing estimated effect.
+    let estimates = posterior.removal_estimates();
+    let mut order: Vec<usize> = (0..estimates.len()).filter(|g| posterior.active[*g]).collect();
+    order.sort_by(|a, b| estimates[*a].total_cmp(&estimates[*b]));
+    let mut evaluations: Vec<(usize, f64)> = Vec::new();
+    let low = {
+        let current: &Posterior = posterior;
+        let mut change = |k: usize| -> Result<f64, String> {
+            if let Some((_, c)) = evaluations.iter().find(|(at, _)| *at == k) {
+                return Ok(*c);
+            }
+            let (_, c) = trial(scorer, &compensation, current, &order[..k], base, prior.as_deref_mut())?;
+            log::info!("library removal of {k} of {} groups: F changes by {:.6e} bits", order.len(), to_bits(c));
+            evaluations.push((k, c));
+            Ok(c)
+        };
+        largest_accepted_prefix(order.len(), &mut change)?
+    };
+    let mut singles: Vec<(usize, f64)> = Vec::new();
+    let outcome = if low > 0 {
+        let (proposal, c) = trial(scorer, &compensation, posterior, &order[..low], base, prior.as_deref_mut())?;
+        *posterior = proposal;
+        base += c;
+        if removed_dead > 0 { Outcome::Dead } else { Outcome::Prefix }
+    } else if removed_dead > 0 {
+        Outcome::Dead
+    } else {
+        // Single groups: the lowest estimates, then random others.
+        let mut tested: Vec<usize> = order.iter().copied().take(SINGLES).collect();
+        let mut rest: Vec<usize> = order.iter().copied().skip(SINGLES).collect();
+        let mut rng = StdRng::seed_from_u64(noise_seed(settings.seed, round, usize::MAX));
+        for _ in 0..SINGLES.min(rest.len()) {
+            let at = rng.random_range(0..rest.len());
+            tested.push(rest.swap_remove(at));
+        }
+        let mut best: Option<(Posterior, usize, f64)> = None;
+        for &g in &tested {
+            let (proposal, c) = trial(scorer, &compensation, posterior, &[g], base, prior.as_deref_mut())?;
+            singles.push((g, c));
+            if c <= 0.0 && best.as_ref().is_none_or(|(_, _, b)| c < *b) {
+                best = Some((proposal, g, c));
+            }
+        }
+        match best {
+            Some((proposal, g, c)) => {
+                log::info!("library removal of single group {g}: F changes by {:.6e} bits", to_bits(c));
+                *posterior = proposal;
+                base += c;
+                Outcome::Single
+            }
+            None => Outcome::Exhausted,
+        }
+    };
+    let removed = candidates - posterior.active.iter().filter(|a| **a).count();
     Ok(Removal {
-        candidates: order.len(),
-        removed: low,
-        before_bits: to_bits(base),
-        after_bits: to_bits(after),
+        candidates,
+        removed,
+        dead: removed_dead,
+        before_bits: to_bits(before),
+        after_bits: to_bits(base),
         evaluations: evaluations.into_iter().map(|(k, c)| (k, to_bits(c))).collect(),
+        singles: singles.into_iter().map(|(g, c)| (g, to_bits(c))).collect(),
+        outcome,
     })
 }
 
@@ -2500,6 +2656,32 @@ mod tests {
         let actual = expected_divergence(&mut scorer, &posterior, &draws, &sequences, &removed, &settings, None).unwrap();
         let reference = reference_bits * LN_2;
         assert!((actual - reference).abs() < 1e-10 * reference.abs().max(1.0), "removal must score the fixed collection");
+    }
+
+    #[test]
+    fn dead_groups_are_the_planes_of_silent_heads_and_the_rest_of_silent_functions() {
+        let (native, layers, _, _) = tiny("library_dead", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let mut active = vec![true; explanation.groups.len()];
+        assert!(dead_groups(&explanation, &active).is_empty(), "nothing is dead at the start");
+        let layer = &explanation.layers[0];
+        let (planes, values) = layer.heads[0].clone();
+        for g in &values {
+            active[*g] = false;
+        }
+        let (gate, output) = (layer.functions[0][0], *layer.functions[0].last().unwrap());
+        let (other_gate, other_output) = (layer.functions[1][0], *layer.functions[1].last().unwrap());
+        active[output] = false;
+        active[other_gate] = false;
+        let dead = dead_groups(&explanation, &active);
+        let mut expected: Vec<usize> = planes.clone();
+        expected.extend([gate, other_output]);
+        expected.sort_unstable();
+        assert_eq!(dead, expected, "a silent head's planes, a function's gate without its output, its output without its gate");
+        for g in &dead {
+            active[*g] = false;
+        }
+        assert!(dead_groups(&explanation, &active).is_empty(), "one pass reaches the fixed point");
     }
 
     #[test]
