@@ -336,6 +336,7 @@ fn mlp_owners(name: &str, units: usize, gate: &Operator, gate_bias: Option<&Oper
             native: native.name.clone(),
             native_rows: rows,
             native_cols: cols,
+            ..Owner::default()
         });
     };
     for i in 0..units {
@@ -432,7 +433,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
             };
             for (operator, source) in [(format!("{name}.q"), &q), (format!("{shared}.k"), &k), (format!("{shared}.v"), &v)] {
                 let (rows, cols) = (0..source.rows.width(), 0..source.cols.width());
-                owners.push(Owner { operator, rows: rows.clone(), cols: cols.clone(), body: name.clone(), site: name.clone(), native: source.name.clone(), native_rows: rows, native_cols: cols });
+                owners.push(Owner { operator, rows: rows.clone(), cols: cols.clone(), body: name.clone(), site: name.clone(), native: source.name.clone(), native_rows: rows, native_cols: cols, ..Owner::default() });
             }
             let pairs: Vec<Vec<usize>> = match rotary {
                 Some(r) => {

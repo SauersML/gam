@@ -1174,6 +1174,7 @@ mod tests {
         let (a, b) = (&before.values[start.artifact.program.output], &after.values[hardened.artifact.program.output]);
         let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * scale), "the exact tie keeps the outputs");
+        library_sharing::same_native_blocks(&start, &hardened);
         let choices: f64 = [target, head_copy.0, gate_copy.0, output_copy.0].iter().map(|t| (learned.targets[*t].choices as f64).ln()).sum();
         assert!(hardened.fixed_nats >= choices - 1e-9, "every exact choice is paid for");
         // The copied function's blocks are stored once: its own gate and output leave the explanation.

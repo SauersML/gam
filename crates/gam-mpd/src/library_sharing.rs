@@ -177,13 +177,14 @@ pub fn share_query_key(explanation: &Explanation, members: &[(usize, usize)]) ->
     // Each member keeps its native owners, now read through the shared maps.
     let names = |h: &Head| (artifact.program.operators[h.query].name.clone(), artifact.program.operators[h.key].name.clone());
     let shared = names(found[0]);
-    let retiring: Vec<(String, String)> = found[1..].iter().map(|h| names(h)).collect();
+    let retiring: Vec<((String, String), String)> = found[1..].iter().zip(&members[1..]).map(|(h, m)| (names(h), format!("library.l{}.h{}.q_shared_scale", m.0, m.1))).collect();
     for owner in &mut artifact.owners {
-        for (q, k) in &retiring {
+        for ((q, k), scale) in &retiring {
+            let (rows, cols) = (owner.rows.clone(), owner.cols.clone());
             if owner.operator == *q {
-                owner.operator = shared.0.clone();
+                owner.repoint(&shared.0, rows, cols, std::slice::from_ref(scale), &[]);
             } else if owner.operator == *k {
-                owner.operator = shared.1.clone();
+                owner.repoint(&shared.1, rows, cols, &[], &[]);
             }
         }
     }
@@ -356,11 +357,11 @@ pub fn tie(explanation: &Explanation, ties: &[Tie]) -> Result<Explanation, Strin
         // The tied outputs leave `OUT`: their columns are zero and their groups removed; each one's
         // native owner now reads the gate row it is tied to.
         for tie in ties.iter() {
+            let scale = format!("{name}.f{}.scale", tie.source.1);
             for owner in &mut out.artifact.owners {
                 if owner.operator == output.name && owner.cols == (tie.source.1..tie.source.1 + 1) {
-                    owner.operator = gate.name.clone();
-                    owner.rows = tie.target.1..tie.target.1 + 1;
-                    owner.cols = 0..gate.cols.width();
+                    owner.repoint(&gate.name, tie.target.1..tie.target.1 + 1, 0..gate.cols.width(), std::slice::from_ref(&scale), &[]);
+                    owner.transposed = !owner.transposed;
                 }
             }
         }
@@ -472,11 +473,12 @@ pub fn tie_row(explanation: &Explanation, part: &str, target: (usize, usize), so
     let mut values = own.matrix();
     values.row_mut(i).fill(0.0);
     program.operators[own_index] = Arc::new(dense(own.name.clone(), own.rows.clone(), own.cols.clone(), values, own.provenance.clone())?);
-    // The row's native owner now reads the source.
+    // The row's native owners now read the source, through the scale.
+    let factor = [format!("{name}.scale")];
     for owner in &mut out.artifact.owners {
         if owner.operator == own.name && owner.rows == (i..i + 1) {
-            owner.operator = owner_to.0.clone();
-            owner.rows = owner_to.1.clone();
+            let cols = owner.cols.clone();
+            owner.repoint(&owner_to.0, owner_to.1.clone(), cols, &factor, &[]);
         }
     }
     let program = &mut out.artifact.program;
@@ -567,10 +569,11 @@ pub fn tie_column(explanation: &Explanation, target: (usize, usize), source: (us
     let mut values = own.matrix();
     values.column_mut(i).fill(0.0);
     program.operators[own_index] = Arc::new(dense(own.name.clone(), own.rows.clone(), own.cols.clone(), values, own.provenance.clone())?);
+    let factor = [format!("{name}.scale")];
     for owner in &mut out.artifact.owners {
         if owner.operator == own.name && owner.cols == (i..i + 1) {
-            owner.operator = other.name.clone();
-            owner.cols = j..j + 1;
+            let rows = owner.rows.clone();
+            owner.repoint(&other.name, rows, j..j + 1, &factor, &[]);
         }
     }
     let program = &mut out.artifact.program;
@@ -600,6 +603,25 @@ pub fn tie_column(explanation: &Explanation, target: (usize, usize), source: (us
         }
     }
     Ok(out)
+}
+
+/// Every native block `a`'s owners stand for, `b`'s owners stand for at the same site with the
+/// same values: an exact sharing moves the native parameters, it does not change them.
+#[cfg(test)]
+pub(crate) fn same_native_blocks(a: &Explanation, b: &Explanation) {
+    assert_eq!(a.artifact.owners.len(), b.artifact.owners.len());
+    for owner in &a.artifact.owners {
+        let other = b
+            .artifact
+            .owners
+            .iter()
+            .find(|o| o.native == owner.native && o.native_rows == owner.native_rows && o.native_cols == owner.native_cols && o.site == owner.site)
+            .expect("every native block keeps an owner at its site");
+        let (x, y) = (a.artifact.native_block(owner).unwrap(), b.artifact.native_block(other).unwrap());
+        assert_eq!(x.dim(), y.dim());
+        let scale = x.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+        assert!(x.iter().zip(y.iter()).all(|(u, v)| (u - v).abs() <= 1e-12 * scale), "{} at {} through {other:?}", owner.native, owner.site);
+    }
 }
 
 #[cfg(test)]
@@ -635,6 +657,7 @@ mod tests {
         let (before, after) = (start.artifact.execute(&imported.family).unwrap(), shared.artifact.execute(&imported.family).unwrap());
         let (a, b) = (&before.values[start.artifact.program.output], &after.values[shared.artifact.program.output]);
         assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * (1.0 + x.abs())), "identical members keep the explanation's output");
+        same_native_blocks(&start, &shared);
         // The second member's planes leave with its maps; its part is one new group.
         let planes = start.layers[1].heads[0].0.len();
         assert_eq!(shared.groups.len(), start.groups.len() - planes + 1);
@@ -690,6 +713,7 @@ mod tests {
         let (a, b) = (&before.values[start.artifact.program.output], &after.values[tied.artifact.program.output]);
         let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * scale), "the tie of an exact copy keeps the outputs");
+        same_native_blocks(&start, &tied);
         // The gate row is charged once, the copy's own output group nothing, and the scale once.
         let posterior = Posterior::new(&tied, tokens).unwrap();
         let own = tied.groups.iter().position(|g| g.name == "library.l0.mlp.f3.out").unwrap();
@@ -731,6 +755,7 @@ mod tests {
         let (a, b) = (&before.values[start.artifact.program.output], &after.values[tied.artifact.program.output]);
         let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * scale), "the tied function keeps the outputs");
+        same_native_blocks(&start, &tied);
         // Its own read and write leave; two scale groups replace them; its native owners read layer 0's.
         let tokens = 2 * 6 * 12;
         let (untied, posterior) = (Posterior::new(&start, tokens).unwrap(), Posterior::new(&tied, tokens).unwrap());

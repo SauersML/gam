@@ -320,7 +320,11 @@ pub struct Artifact {
 /// One block of one of `P`'s operators at one call site, and the native parameter of `M` it
 /// replaces there. A body shared by several call sites keeps one owner per site, each naming its
 /// own native parameter, so an edit of one native parameter translates to that site alone.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// At its site the native block is `L₁ ⋯ L_n · B · R₁ ⋯ R_m` ([`Artifact::native_block`]): `B` the
+/// block (transposed where `transposed`), `L` and `R` the site's own factors, each one of `P`'s
+/// operators by name. A 1 × 1 factor is a scalar; a transposed block's factors are scalars.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Owner {
     /// `P`'s operator (by name) and the block of its entries.
     pub operator: String,
@@ -333,6 +337,24 @@ pub struct Owner {
     pub native: String,
     pub native_rows: std::ops::Range<usize>,
     pub native_cols: std::ops::Range<usize>,
+    #[serde(default)]
+    pub left: Vec<String>,
+    #[serde(default)]
+    pub right: Vec<String>,
+    #[serde(default)]
+    pub transposed: bool,
+}
+
+impl Owner {
+    /// Point the owner at block `(rows, cols)` of `operator`, where its current block is
+    /// `left · that block · right` (module note of [`Owner`]): the factors join its own.
+    pub fn repoint(&mut self, operator: &str, rows: std::ops::Range<usize>, cols: std::ops::Range<usize>, left: &[String], right: &[String]) {
+        self.operator = operator.to_string();
+        self.rows = rows;
+        self.cols = cols;
+        self.left.extend_from_slice(left);
+        self.right.splice(0..0, right.iter().cloned());
+    }
 }
 
 /// The envelope of an artifact with an ownership map: this marker, the plain artifact's byte
@@ -588,6 +610,44 @@ impl Artifact {
             controls: Vec::new(),
             owners: Vec::new(),
         })
+    }
+
+    /// The native block `owner` stands for at its site, from `P`'s values: its block of `P`'s
+    /// operator times its factors ([`Owner`]).
+    pub fn native_block(&self, owner: &Owner) -> Result<Array2<f64>, String> {
+        let operator = |name: &str| -> Result<Array2<f64>, String> {
+            let mut found = self.program.operators.iter().filter(|op| op.name == name);
+            match (found.next(), found.next()) {
+                (Some(op), None) => Ok(op.matrix()),
+                _ => Err(format!("no unique operator {name}")),
+            }
+        };
+        let matrix = operator(&owner.operator)?;
+        if owner.rows.end > matrix.nrows() || owner.cols.end > matrix.ncols() {
+            return Err(format!("{}: no block {:?} × {:?}", owner.operator, owner.rows, owner.cols));
+        }
+        let block = matrix.slice(ndarray::s![owner.rows.clone(), owner.cols.clone()]);
+        let mut out = if owner.transposed { block.t().to_owned() } else { block.to_owned() };
+        let times = |factor: Array2<f64>, out: Array2<f64>, on_left: bool| -> Result<Array2<f64>, String> {
+            if factor.dim() == (1, 1) {
+                return Ok(out * factor[[0, 0]]);
+            }
+            if owner.transposed {
+                return Err(format!("{}: a transposed block's factors are scalars", owner.operator));
+            }
+            let (a, b) = if on_left { (&factor, &out) } else { (&out, &factor) };
+            if a.ncols() != b.nrows() {
+                return Err(format!("{}: a factor of shape {:?} does not compose", owner.operator, factor.dim()));
+            }
+            Ok(a.dot(b))
+        };
+        for name in owner.left.iter().rev() {
+            out = times(operator(name)?, out, true)?;
+        }
+        for name in &owner.right {
+            out = times(operator(name)?, out, false)?;
+        }
+        Ok(out)
     }
 
     /// The operators derived operators read or are, which compaction keeps.
