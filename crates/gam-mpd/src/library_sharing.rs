@@ -29,6 +29,15 @@
 //! the first member's ratio of query to key norm. Both leave the member's scores unchanged, so the
 //! start is close to the current fit.
 //!
+//! # Value maps
+//!
+//! `M` keeps each head's output projection `O_h`, so a group's value–output maps are `O_i V` over
+//! its query heads `i`. Another group's are the same maps when `V = T V_s` with
+//! `T = argmin Σ_i ‖O_{t,i} T − O_{s,π(i)}‖²` and `π` the assignment of query heads
+//! ([`transports`]): the exact symmetry `V → R V`, `O → O R⁻¹` with `O` fixed by `M`. A shared value
+//! map stores `V_s` once and the target's heads read `c T V_s`, `T` fixed and `c` one scalar
+//! ([`share_value`]).
+//!
 //! # Read–write ties
 //!
 //! A residual-stream feature that an earlier MLP function `j` writes (its output `u_j`) and a
@@ -329,6 +338,150 @@ pub fn share_query_key(explanation: &Explanation, members: &[Member]) -> Result<
     }
     let removed = explanation.removed.iter().filter_map(|g| index.get(g).copied()).collect();
     Ok(Explanation { artifact, trainable, groups, layers, removed, fixed_nats: explanation.fixed_nats })
+}
+
+/// The value transport from one key-value group to another (module note): `T` and the source
+/// query head each target query head faces.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Transport {
+    pub(crate) matrix: Array2<f64>,
+    pub(crate) assignment: Vec<usize>,
+}
+
+/// Each query head's native output projection `O_h` (`blocks.{layer}.o{h}`, `d × width`), which the
+/// library keeps, for key-value group `group` of layer `layer`.
+fn output_projections(explanation: &Explanation, groups: &BTreeMap<(usize, usize), KeyValue>, (layer, group): (usize, usize)) -> Result<Vec<Array2<f64>>, String> {
+    let found = groups.get(&(layer, group)).ok_or_else(|| format!("no key-value group {layer}.{group}"))?;
+    let program = &explanation.artifact.program;
+    found.heads.iter().map(|(h, _)| Ok(program.operators[operator_index(program, &format!("blocks.{layer}.o{h}"))?].matrix())).collect()
+}
+
+/// The value transports of key-value group `target` from each group of `sources` (module note):
+/// the assignment `π` of the target's query heads to a source's minimizes the residuals
+/// `‖(I − P_i) O_{s,j}‖²` of each source projection outside each target projection's column
+/// space (`P_i` its projector), and `T = A⁺ B` is the least-squares solution of
+/// `Σ_i ‖O_{t,i} T − O_{s,π(i)}‖²`, `A` and `B` the stacked projections.
+pub(crate) fn transports(explanation: &Explanation, target: (usize, usize), sources: &[(usize, usize)]) -> Result<Vec<Transport>, String> {
+    use rayon::prelude::*;
+    let groups = key_values(explanation)?;
+    let own = output_projections(explanation, &groups, target)?;
+    let stacked = |ms: &[&Array2<f64>]| ndarray::concatenate(ndarray::Axis(0), &ms.iter().map(|m| m.view()).collect::<Vec<_>>()).map_err(error);
+    let a = stacked(&own.iter().collect::<Vec<_>>())?;
+    let inverse = gam_linalg::decompose::pseudo_inverse(a.view()).map_err(error)?;
+    // Each target projection's column space, orthonormal.
+    let bases = own
+        .iter()
+        .map(|o| -> Result<Array2<f64>, String> {
+            let d = gam_linalg::decompose::svd(o.view(), false).map_err(error)?;
+            let resolved: Vec<usize> = (0..d.singular_values.len()).filter(|&i| d.singular_values[i] > d.band).collect();
+            Ok(d.u.select(ndarray::Axis(1), &resolved))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    sources
+        .par_iter()
+        .map(|&source| {
+            let theirs = output_projections(explanation, &groups, source)?;
+            if theirs.len() != own.len() || theirs.iter().zip(&own).any(|(s, t)| s.nrows() != t.nrows()) {
+                return Err(format!("key-value group {source:?} cannot stand for {target:?}"));
+            }
+            let assignment = if own.len() == 1 {
+                vec![0]
+            } else {
+                let cost = Array2::from_shape_fn((own.len(), theirs.len()), |(i, j)| {
+                    let inside = bases[i].t().dot(&theirs[j]);
+                    theirs[j].iter().map(|v| v * v).sum::<f64>() - inside.iter().map(|v| v * v).sum::<f64>()
+                });
+                crate::library_bodies::hungarian(&cost)?
+            };
+            let b = stacked(&assignment.iter().map(|&j| &theirs[j]).collect::<Vec<_>>())?;
+            Ok(Transport { matrix: inverse.dot(&b), assignment })
+        })
+        .collect()
+}
+
+/// `explanation` with the value map of key-value group `target` made `scale T V_s`, `V_s` the value
+/// map of group `source` of an earlier layer and `T` the transport between them ([`transports`]):
+/// every query head of the target reads `V_s`, moves it by `T` (fixed, from `M`'s output
+/// projections) and scales it by `scale` (a 1 × 1 operator, one prior group). The target's own
+/// value map leaves the library with its groups; `V_s` is stored once, its gradient summing both
+/// uses; each native owner of the target's value reads `V_s` through `scale · T`.
+pub fn share_value(explanation: &Explanation, target: (usize, usize), source: (usize, usize), scale: f64) -> Result<Explanation, String> {
+    if source.0 >= target.0 {
+        return Err(format!("the value map of layer {} cannot stand for an earlier layer {}'s", source.0, target.0));
+    }
+    let groups = key_values(explanation)?;
+    let (own, other) = (groups.get(&target).ok_or("no target group")?, groups.get(&source).ok_or("no source group")?);
+    if !own.own_value || !other.own_value {
+        return Err("a shared value map is a group's own".into());
+    }
+    let transport = transports(explanation, target, &[source])?.pop().ok_or("no transport")?;
+    let mut out = explanation.clone();
+    let program = &mut out.artifact.program;
+    let (mine, theirs) = (program.operators[own.value].clone(), program.operators[other.value].clone());
+    if mine.cols != theirs.cols {
+        return Err("the two value maps read different streams".into());
+    }
+    let name = format!("library.l{}.kv{}.v_from_l{}_kv{}", target.0, target.1, source.0, source.1);
+    let provenance = Provenance::derived(&[&mine.provenance, &theirs.provenance], "shared value map".into());
+    let one = Interface::uniform(1, 1, LabelKind::Unit, 0).map_err(error)?;
+    let base = program.operators.len();
+    program.operators.push(Arc::new(dense(format!("{name}.transport"), mine.rows.clone(), theirs.rows.clone(), transport.matrix, provenance.clone())?));
+    program.operators.push(Arc::new(dense(format!("{name}.scale"), one.clone(), Interface::constant(), Array2::from_elem((1, 1), scale), provenance.clone())?));
+    program.operators.push(Arc::new(dense(format!("{name}.ones"), mine.rows.clone(), one, Array2::ones((mine.rows.width(), 1)), provenance)?));
+    for (_, head) in &own.heads {
+        let rule = &mut program.rules[head.rule];
+        rule.nodes[3] = Node::Affine { terms: vec![(0, other.value)], bias: None };
+        let output = rule.output;
+        rule.nodes.splice(
+            output..output,
+            [
+                Node::Affine { terms: vec![(3, base)], bias: None },
+                Node::Constant { operator: base + 1 },
+                Node::Affine { terms: vec![(output + 1, base + 2)], bias: None },
+                Node::Hadamard { left: output, right: output + 2 },
+            ],
+        );
+        rule.output = output + 4;
+        let Node::Attend { value, .. } = &mut rule.nodes[output + 4] else {
+            return Err(format!("{}: the output is not an attention node", rule.name));
+        };
+        *value = output + 3;
+    }
+    program.interfaces().map_err(error)?;
+    let factors = [format!("{name}.scale"), format!("{name}.transport")];
+    for owner in &mut out.artifact.owners {
+        if owner.operator == mine.name {
+            owner.repoint(&theirs.name, 0..theirs.rows.width(), owner.cols.clone(), &factors, &[]);
+        }
+    }
+    // The target's value map leaves with its groups; its heads' value groups are the source's.
+    let retired = own.value;
+    let mut index = BTreeMap::new();
+    let mut kept = Vec::new();
+    for (g, group) in out.groups.iter().enumerate() {
+        if group.cells.iter().any(|c| c.operator == retired) {
+            continue;
+        }
+        index.insert(g, kept.len());
+        kept.push(group.clone());
+    }
+    kept.push(Group { name: format!("{name}.scale"), cells: vec![Cells { operator: base + 1, rows: vec![0], cols: 0..1 }] });
+    let source_values: Vec<usize> = out.layers[source.0].heads[other.heads[0].0].1.iter().filter_map(|g| index.get(g).copied()).collect();
+    let members: Vec<usize> = own.heads.iter().map(|(h, _)| *h).collect();
+    for (l, layer) in out.layers.iter_mut().enumerate() {
+        for (h, (planes, values)) in layer.heads.iter_mut().enumerate() {
+            *planes = planes.iter().filter_map(|g| index.get(g).copied()).collect();
+            *values = if l == target.0 && members.contains(&h) { source_values.clone() } else { values.iter().filter_map(|g| index.get(g).copied()).collect() };
+        }
+        for function in &mut layer.functions {
+            *function = function.iter().filter_map(|g| index.get(g).copied()).collect();
+        }
+    }
+    out.removed = out.removed.iter().filter_map(|g| index.get(g).copied()).collect();
+    out.groups = kept;
+    out.trainable = out.trainable.iter().copied().filter(|op| *op != retired).chain([base + 1]).collect();
+    out.trainable.sort_unstable();
+    Ok(out)
 }
 
 /// `explanation` with its library operators set to `artifact`'s (a posterior-mean artifact of a fit
@@ -784,6 +937,44 @@ mod tests {
         assert!(!after[&(1, 0)].own_key && after[&(1, 0)].own_value, "the member reads the shared key and keeps its value");
         assert!(share_query_key(&start, &[owner.clone(), Member { layer: 1, group: 0, queries: vec![0, 0] }]).is_err(), "an assignment is a permutation");
         assert!(share_query_key(&shared, &[owner, Member { layer: 1, group: 0, queries: vec![0, 1] }]).is_err(), "a member is no member twice");
+    }
+
+    #[test]
+    fn a_value_map_moved_through_the_output_projections_is_stored_once_and_keeps_the_outputs() {
+        let plain = || {
+            let dir = crate::test_support::tiny_export("library_value_share", 2);
+            let imported = import_language_model(&dir, 6, 12).expect("import");
+            std::fs::remove_dir_all(dir).unwrap();
+            imported
+        };
+        for imported in [plain(), grouped("library_value_share_grouped")] {
+            let native = split_sites(&imported.program).expect("split");
+            let mut start = explanation(&native, &layer_nodes(&native, 2).expect("layers")).expect("explanation");
+            // Layer 1's first group writes through its heads what layer 0's first group writes,
+            // scaled by 0.7: its value map is 0.7 T V_s.
+            let transport = transports(&start, (1, 0), &[(0, 0)]).unwrap().pop().unwrap();
+            let groups = key_values(&start).unwrap();
+            let (to, from) = (groups[&(1, 0)].value, groups[&(0, 0)].value);
+            let program = &mut start.artifact.program;
+            let values = transport.matrix.dot(&program.operators[from].matrix()) * 0.7;
+            program.operators[to] = Arc::new(dense(program.operators[to].name.clone(), program.operators[to].rows.clone(), program.operators[to].cols.clone(), values, Provenance::default()).unwrap());
+            let shared = share_value(&start, (1, 0), (0, 0), 0.7).expect("shared");
+            let (before, after) = (start.artifact.execute(&imported.family).unwrap(), shared.artifact.execute(&imported.family).unwrap());
+            let (a, b) = (&before.values[start.artifact.program.output], &after.values[shared.artifact.program.output]);
+            let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * scale), "the shared value map keeps the outputs");
+            same_native_blocks(&start, &shared);
+            // The target's value coordinates leave; its scale is one group; its heads read the source's.
+            let width = start.artifact.program.operators[to].rows.width();
+            assert_eq!(shared.groups.len(), start.groups.len() - width + 1);
+            assert_eq!(shared.trainable.len(), start.trainable.len());
+            let after = key_values(&shared).unwrap();
+            assert!(!after[&(1, 0)].own_value && after[&(1, 0)].own_key);
+            assert_eq!(shared.layers[1].heads[after[&(1, 0)].heads[0].0].1, shared.layers[0].heads[after[&(0, 0)].heads[0].0].1);
+            Posterior::new(&shared, 2 * 6 * 12).expect("every shared entry in one group");
+            assert!(share_value(&start, (0, 0), (1, 0), 1.0).is_err(), "a later value map cannot stand for an earlier one");
+            assert!(share_value(&shared, (1, 0), (0, 0), 1.0).is_err(), "a shared value map is shared once");
+        }
     }
 
     #[test]
