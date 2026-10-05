@@ -22,8 +22,13 @@
 //!   unread value, `U(x_c) = ⋂_r ({G(A_rc)} ∪ U(y_r))`; a factor of a product once the other factor
 //!   is zero or the product unread; a head's query and key once every value coordinate is zero or
 //!   unread, and a rotary plane of the query once the key's plane is zero (and conversely); a norm's
-//!   input once every output it scales is zero or unread. A block's read is patched with directions
-//!   that mix its coordinates, so they are read as one.
+//!   input once every output it scales is zero or unread.
+//!
+//! A block's read is patched, `x' = (I − P) x + P s` with `s` the same read on the source sequence
+//! and `P` spanning directions that mix the read's coordinates, so its coordinates are taken as
+//! one in both directions: a coordinate of the patched read is zero only once every coordinate of
+//! the read is (a coordinate zero in `x` and in `s` can be nonzero in `x'`), and the read is unread
+//! only once every coordinate is.
 //!
 //! A parameter `A_rc` has no effect after removing the groups in `Z(x_c) ∪ U(y_r)`, and a group is
 //! killed by the groups in the intersection of that set over its parameters. A group killed by
@@ -35,16 +40,17 @@
 //!
 //! A unit is a group with the groups its removal kills, transitively (removals only add zeros):
 //! the gate, up direction and output of an MLP function form one unit, since removing any of them
-//! silences the function. At a converged posterior the data term's gradient in `μ_j` is
-//! `−μ_j / v_G` (the stationarity of `F` in `μ_j`), and its curvature is the Gauss–Newton matrix
-//! `H`, measured through sampled-label gradients (`library_mdl`'s module note, [`Curvature`]): the
-//! second-order change of the expected data term when `G`'s entries become exactly zero is
-//! `Σ_{j∈G} μ_j²/v_G + ½ μ_Gᵀ H μ_G − ½ Σ_{j∈G} H_jj σ_j²` ([`Posterior::removal_data`]), while
-//! the description falls by the group's cost (`KL_G`, its variance's precision and scale) and the
-//! code of which groups are active changes with their count. A unit's prediction is the mean of
-//! its roots' data estimates (each root's removal silences the same functions) minus the cost of
-//! all its groups, plus the change of the subset code when it alone is removed. The units
-//! predicted to lower `F` are ranked by the prediction, most negative first.
+//! silences the function. Each group's change of the expected data term when its entries become
+//! exactly zero is estimated to second order about the posterior mean,
+//! `−g_G · μ_G + ½ μ_Gᵀ H μ_G − ½ Σ_{j∈G} H_jj σ_j²` ([`Posterior::removal_data`]), with `g` the data
+//! term's gradient at the mean and `H` its Gauss–Newton matrix, both measured on the fixed collection
+//! in the same passes ([`Curvature`], `library_mdl`'s module note); the description falls by the
+//! group's cost (`KL_G`, its variance's precision and scale) and the code of which groups are active
+//! changes with their count. A unit's prediction is the mean of its roots' data estimates (each
+//! root's removal silences the same functions) minus the cost of all its groups, plus the change of
+//! the subset code when it alone is removed. Deletion is a finite step, so the prediction is a
+//! proposal order and nothing more: every unit is ranked by it, most negative first, and only the
+//! exact evaluation below decides.
 //!
 //! # The search
 //!
@@ -55,9 +61,16 @@
 //! segment ended on, its own effect being the difference of the two prefixes (a single-unit test),
 //! and it is kept; the next segment starts after it. A segment with `p` accepted units before a
 //! rejected one costs at most `2 log2 p + 2` evaluations. Each proposal also removes the groups it
-//! leaves without effect. Every evaluation is the exact objective on the fixed collection (one
-//! common weight sample per batch), with the MLPs that lose functions compensated by least squares
-//! when compensation is on (`library_compensation`).
+//! leaves without effect. Once the remaining units are those predicted not to lower `F`, they are
+//! proposed whole and then the first of them alone; when neither is accepted the round ends, and
+//! the units after the first are counted as tested only jointly (`Removal::untested`).
+//!
+//! Every evaluation is `F` on the fixed collection at one common weight sample per batch, with the
+//! MLPs that lose functions compensated by least squares when compensation is on
+//! (`library_compensation`). An accepted proposal lowers that realization of the sampled objective;
+//! its expectation over the posterior is estimated, not bounded, by it, and a proposal chosen on the
+//! same draws can fit their particulars. A round that accepts nothing found no removal that lowers
+//! the realized `F`; it does not show that none exists.
 //!
 //! Every proposal and its outcome are written as one JSON line to the round's log, with every
 //! active group's posterior summaries and every unit's prediction at the start of the round.
@@ -139,6 +152,28 @@ impl Kill {
             Self::Of(v) => v.retain(|e| Some(*e) == extra || a.contains(*e) || b.contains(*e)),
         }
     }
+}
+
+/// `⋂_i (A_i ∪ B_i)` over the coordinates of `sets` (`A`) and, when given, `also` (`B`); without
+/// `also` it is `⋂_i A_i` (the union's neutral element, the empty set, stands in for each `B_i`).
+fn intersection(sets: &[Kill], also: Option<&[Kill]>) -> Kill {
+    let none = Kill::none();
+    let mut k = Kill::All;
+    for (i, a) in sets.iter().enumerate() {
+        k.meet(a, also.map_or(&none, |b| &b[i]), None);
+        if k.is_none() {
+            break;
+        }
+    }
+    k
+}
+
+/// The zero sets of a block's read after its patch: a patch `x' = (I − P) x + P s` replaces the
+/// read by a mix of every coordinate of the base's read and the source's (the same node of the same
+/// program on another sequence) through directions that span the coordinates, so a coordinate is
+/// zero only once every coordinate is (`z` the read's zero sets before the patch).
+fn patched(z: &[Kill]) -> Vec<Kill> {
+    vec![intersection(z, None); z.len()]
 }
 
 /// An operator's entries: each entry's group (a library operator), or which entries are nonzero (a
@@ -428,7 +463,7 @@ impl Structure {
             if z.len() != w {
                 return Err(error(format!("node {n}: {} zero sets for width {w}", z.len())));
             }
-            zero.push(z);
+            zero.push(if self.reads.contains(&n) { patched(&z) } else { z });
         }
         Ok(zero)
     }
@@ -454,16 +489,7 @@ impl Structure {
     fn unread(&self, active: &[bool], zero: &[Vec<Kill>]) -> Result<Vec<Vec<Kill>>, String> {
         let mut unread: Vec<Vec<Kill>> = self.widths[..=self.hidden].iter().map(|w| vec![Kill::All; *w]).collect();
         unread[self.hidden] = vec![Kill::none(); self.widths[self.hidden]];
-        let every = |set: &[Kill], also: Option<&[Kill]>| {
-            let mut k = Kill::All;
-            for (i, s) in set.iter().enumerate() {
-                k.meet(s, also.map_or(&Kill::All, |a| &a[i]), None);
-                if k.is_none() {
-                    break;
-                }
-            }
-            k
-        };
+        let every = intersection;
         for n in (0..=self.hidden).rev() {
             if self.reads.contains(&n) {
                 let k = every(&unread[n], None);
@@ -807,7 +833,7 @@ pub fn round(
     let mut evaluations: Vec<(usize, f64)> = Vec::new();
     // The groups removed as without effect, and each rejected unit's first group with its own
     // effect in bits.
-    let (mut dead_removed, mut singles) = (0, Vec::new());
+    let (mut dead_removed, mut singles, mut untested) = (0, Vec::new(), 0);
     let trial = |posterior: &Posterior, groups: &[usize]| -> Result<Posterior, String> {
         match compensation {
             Some(c) => c.proposal(posterior, groups),
@@ -874,11 +900,13 @@ pub fn round(
                 })).collect::<Vec<Value>>(),
                 "units": units.iter().map(|u| json!({"groups": u.groups, "roots": u.roots, "predicted_bits": u.predicted / LN_2})).collect::<Vec<Value>>(),
             }))?;
-            units.retain(|u| u.predicted < 0.0);
             units.sort_by(|a, b| a.predicted.total_cmp(&b.predicted));
             let mut rest: &[Unit] = &units;
             let mut whole = true;
             while !rest.is_empty() {
+                // The units predicted not to lower `F`: proposed whole, then the first of them alone.
+                let tail = rest[0].predicted >= 0.0;
+                whole |= tail;
                 let base: &Posterior = posterior;
                 // The groups of the first `k` units still active, with those their removal leaves
                 // without effect.
@@ -936,6 +964,11 @@ pub fn round(
                 while rest.first().is_some_and(|u| u.groups.iter().all(|g| !posterior.active[*g])) {
                     rest = &rest[1..];
                 }
+                if tail && accepted == 0 {
+                    untested = rest.len();
+                    journal.write(json!({"event": "end", "untested_units": untested, "reason": "the units predicted not to lower F were rejected whole and the first of them alone"}))?;
+                    break;
+                }
             }
         }
         Search::Prefix => {
@@ -970,7 +1003,7 @@ pub fn round(
         "event": "end", "search": format!("{search:?}"), "candidates": candidates, "removed": removed,
         "before_bits": before / LN_2, "after_bits": current / LN_2, "evaluations": evaluations.len(), "seconds": started.elapsed().as_secs_f64(),
     }))?;
-    Ok(Removal { candidates, removed, dead: dead_removed, before_bits: before / LN_2, after_bits: current / LN_2, evaluations, singles })
+    Ok(Removal { candidates, removed, dead: dead_removed, before_bits: before / LN_2, after_bits: current / LN_2, evaluations, singles, untested })
 }
 
 /// The longest accepted prefix of `n` units found by testing the whole (when `whole`), then lengths
@@ -1073,7 +1106,8 @@ mod tests {
     }
 
     /// The curvature at which `posterior`'s `σ` is stationary, `H_jj = 1/σ_j² − 1/v_G` on the
-    /// diagonal: the removal estimates then rank a group by `½ Σ μ_j²/σ_j²`.
+    /// diagonal, and the gradient at which its `μ` is, `g_j = −μ_j/v_G`: the removal estimates then
+    /// rank a group by `½ Σ μ_j²/σ_j²`.
     fn stationary(explanation: &Explanation, posterior: &Posterior) -> Curvature {
         let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         let mut curvature = Curvature::new(explanation.groups.len());
@@ -1090,13 +1124,15 @@ mod tests {
                 let h = 1.0 / variance - 1.0 / prior;
                 curvature.quadratic[g] += h * mu * mu;
                 curvature.noise[g] += h * variance;
+                curvature.slope[g] -= mu * mu / prior;
             }
         }
         curvature
     }
 
-    /// The measured curvature of `posterior` on the evidence: one sampled-label draw per batch at
-    /// the posterior mean, weighted by `weight`.
+    /// The measured curvature and gradient of `posterior` on the evidence: one forward pass per
+    /// batch at the posterior mean, reversed for the divergence's gradient and for a sampled-label
+    /// draw, weighted by `weight`.
     fn measured(ic: &mut Interchange, explanation: &Explanation, posterior: &Posterior, evidence: &[Evidence], weight: f64, rng: &mut StdRng) -> Curvature {
         use rand::RngExt;
         ic.load(&posterior.means()).expect("the means load");
@@ -1104,15 +1140,19 @@ mod tests {
         for e in evidence {
             let rows: usize = e.experiments.iter().map(|x| e.batch.length() - x.position).sum();
             let uniforms: Vec<f64> = (0..rows).map(|_| rng.random::<f64>()).collect();
-            let gradient = ic.sampled_label_resident(&e.batch, &e.experiments, &e.design, &uniforms).expect("the sampled-label gradient");
+            let evaluation = ic.evaluate_labelled(&e.batch, &e.experiments, &e.design, Some(&e.targets), true, Some(&uniforms)).expect("the labelled evaluation");
+            let factor = evaluation.factor.expect("the Gauss–Newton factor");
             let d = ic.models().1.program.device();
-            let u: Vec<Array2<f64>> = explanation
-                .trainable
-                .iter()
-                .zip(&posterior.mean)
-                .map(|(op, mean)| gradient.get(op).map_or_else(|| Array2::zeros(mean.dim()), |g| d.download(g).expect("the download")))
-                .collect();
-            posterior.add_curvature(&u, weight, &mut curvature).expect("the draw");
+            let host = |gradient: &BTreeMap<usize, gam_gpu::tensor::Tensor>| -> Vec<Array2<f64>> {
+                explanation
+                    .trainable
+                    .iter()
+                    .zip(&posterior.mean)
+                    .map(|(op, mean)| gradient.get(op).map_or_else(|| Array2::zeros(mean.dim()), |g| d.download(g).expect("the download")))
+                    .collect()
+            };
+            posterior.add_curvature(&host(&factor.gradient), weight, &mut curvature).expect("the draw");
+            posterior.add_slope(&host(&evaluation.gradient), weight * LN_2, &mut curvature).expect("the gradient");
         }
         curvature
     }
@@ -1120,6 +1160,32 @@ mod tests {
     fn interchange(native: &OperatorProgram, layers: &[LayerNodes], explanation: &Explanation, device: &Device) -> Interchange {
         let reads = interchange::library_reads(&explanation.artifact.program, layers.len()).expect("the reads");
         Interchange::new(device, native, layers, &explanation.artifact, &explanation.trainable, reads, 1 << 30, 64).expect("the experiments")
+    }
+
+    #[test]
+    fn a_live_dependency_stays_live_through_the_intersection() {
+        // A coordinate no single removal silences keeps the intersection empty.
+        assert_eq!(intersection(&[Kill::Of(vec![1, 2]), Kill::none(), Kill::Of(vec![2])], None), Kill::none());
+        assert_eq!(intersection(&[Kill::Of(vec![1, 2]), Kill::Of(vec![2, 3])], None), Kill::Of(vec![2]));
+        assert_eq!(intersection(&[Kill::All, Kill::Of(vec![4])], None), Kill::Of(vec![4]));
+        assert_eq!(intersection(&[], None), Kill::All);
+        // With a second set per coordinate, `⋂_i (A_i ∪ B_i)`.
+        assert_eq!(intersection(&[Kill::Of(vec![1]), Kill::Of(vec![2])], Some(&[Kill::Of(vec![2]), Kill::none()])), Kill::Of(vec![2]));
+    }
+
+    #[test]
+    fn a_patch_can_make_a_zero_coordinate_nonzero() {
+        // Base and source reads are both zero in their second coordinate, and the patch projects
+        // onto the diagonal: `(I − P) x + P s` is not.
+        let (x, source) = ([1.0, 0.0], [3.0, 0.0]);
+        let p = [[0.5, 0.5], [0.5, 0.5]];
+        let patched_read: Vec<f64> = (0..2).map(|i| x[i] - (0..2).map(|j| p[i][j] * x[j]).sum::<f64>() + (0..2).map(|j| p[i][j] * source[j]).sum::<f64>()).collect();
+        assert_eq!(patched_read, vec![2.0, 1.0]);
+        // So a coordinate that removing group 5 zeroes in the clean read stays live after the patch
+        // while another coordinate is live.
+        assert_eq!(patched(&[Kill::none(), Kill::Of(vec![5])]), vec![Kill::none(), Kill::none()]);
+        // Once every coordinate is zero, so is every coordinate of the patched read.
+        assert_eq!(patched(&[Kill::Of(vec![5]), Kill::Of(vec![5, 7])]), vec![Kill::Of(vec![5]), Kill::Of(vec![5])]);
     }
 
     #[test]
@@ -1320,13 +1386,40 @@ mod tests {
         assert_eq!(dead_size, planted.len());
         let description = (removed(&start, &planted).description() - start.description()) / LN_2;
         assert!((dead_change - description).abs() <= 1e-9 * ranked.before_bits.abs(), "the data term moved by {} bits", dead_change - description);
-        // At this N every other group is needed: the search keeps them, the group the prefix search
-        // proposes first included.
+        // The group the prefix search proposes first is needed, and the ranked search keeps it.
         let divergences = start.divergences();
         let first = (0..divergences.len()).filter(|g| start.active[*g] && !planted.contains(g)).min_by(|a, b| divergences[*a].total_cmp(&divergences[*b])).unwrap();
         assert!(posterior.active[first]);
-        assert_eq!(ranked.removed, planted.len());
+        assert!(ranked.removed >= planted.len());
         assert!(ranked.after_bits < prefix.after_bits, "ranked {} bits, prefix {} bits", ranked.after_bits, prefix.after_bits);
+        // The removals beyond the groups without effect were accepted on one weight sample per
+        // batch; they also lower `F` on samples they were not chosen on.
+        let dead_only = removed(&start, &planted);
+        let mut fresh = |p: &Posterior, key: u64| -> f64 {
+            let mut bits = 0.0;
+            for e in &evidence {
+                let theta: Vec<Array2<f64>> = p
+                    .mean
+                    .iter()
+                    .zip(&p.log_sd)
+                    .enumerate()
+                    .map(|(i, (mean, log_sd))| {
+                        let cols = mean.ncols();
+                        Array2::from_shape_fn(mean.dim(), |(r, c)| {
+                            let s = log_sd[[r, c]];
+                            if s == f64::NEG_INFINITY { mean[[r, c]] } else { mean[[r, c]] + s.exp() * f64::from(posterior_normal(key, i as u64, (r * cols + c) as u64)) }
+                        })
+                    })
+                    .collect();
+                ic.load(&theta).unwrap();
+                bits += ic.evaluate_resident(&e.batch, &e.experiments, &e.design, &e.targets, false).unwrap().bits.iter().flatten().sum::<f64>();
+            }
+            weight * bits * LN_2 + p.description()
+        };
+        for key in 100..103 {
+            let (kept, searched) = (fresh(&dead_only, key), fresh(&posterior, key));
+            assert!(searched < kept, "on fresh noise {key} the searched posterior scores {searched} nats against {kept}");
+        }
     }
 
     #[test]

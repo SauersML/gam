@@ -309,6 +309,25 @@ impl DevicePosterior {
         Ok(())
     }
 
+    /// Adds the data term's gradient `g` at the posterior mean (per trainable operator by id, on the
+    /// device; an operator it does not reach adds nothing), weighted by `weight`, to `curvature`'s
+    /// per-group `g_G · μ_G` over the group's live entries (`Posterior::add_slope`).
+    pub fn add_slope(&self, g: &BTreeMap<usize, Tensor>, weight: f64, curvature: &mut Curvature) -> Result<(), String> {
+        let groups = self.group_count();
+        if curvature.slope.len() != groups {
+            return Err(error("a curvature of another explanation"));
+        }
+        let mut sums = self.wide.zeros(groups, 3).map_err(error)?;
+        for (i, op) in self.operators.iter().enumerate() {
+            let Some(gradient) = g.get(op) else { continue };
+            self.fitting.group_curvature((gradient, &self.mean[i], &self.log_sd[i]), &self.groups[i], &mut sums).map_err(error)?;
+        }
+        for (at, row) in self.wide.download(&sums).map_err(error)?.rows().into_iter().enumerate() {
+            curvature.slope[at] += weight * row[1];
+        }
+        Ok(())
+    }
+
     /// Per group, its empirical-Bayes variance `v_G` at the posterior as it stands.
     pub fn variances(&self) -> Result<Vec<f64>, String> {
         Ok(self.wide.download(&self.variance).map_err(error)?.into_iter().collect())
@@ -355,16 +374,6 @@ impl DevicePosterior {
     /// Trainable operator `i`'s `μ` and `s` on the host.
     pub fn values(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>), String> {
         Ok((self.fitting.download(&self.mean[i]).map_err(error)?, self.fitting.download(&self.log_sd[i]).map_err(error)?))
-    }
-
-    /// The storage of the means, the log standard deviations, the gradient's momentum and the
-    /// curvature estimate (every operator's alike), in which a checkpoint keeps them.
-    #[must_use]
-    pub fn storages(&self) -> [Storage; 4] {
-        match (self.mean.first(), self.log_sd.first(), self.moments.first()) {
-            (Some(mean), Some(log_sd), Some([momentum, curvature])) => [mean.storage(), log_sd.storage(), momentum.storage(), curvature.storage()],
-            _ => [self.fitting.storage(); 4],
-        }
     }
 
     /// Trainable operator `i`'s `μ`, `s` and IVON's state on the host, one operator at a time (a
