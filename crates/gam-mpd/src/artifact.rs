@@ -405,10 +405,8 @@ fn identity(n: usize) -> Vec<usize> {
 }
 
 /// The f32 nearest each real, held on the finest dyadic lattice that holds them all.
-fn f32_reals(values: &mut [f64]) {
-    for value in values.iter_mut() {
-        *value = f64::from(*value as f32);
-    }
+fn f32_reals<D: ndarray::Dimension>(values: &mut ndarray::Array<f64, D>) {
+    values.mapv_inplace(|value| f64::from(value as f32));
 }
 
 /// `op` with every real rounded to its nearest 32-bit float.
@@ -418,21 +416,21 @@ pub fn f32_operator(op: &Operator) -> Result<Operator, String> {
         OperatorBody::Identity => op.clone(),
         OperatorBody::Dense { values, present, .. } => {
             let mut values = values.clone();
-            f32_reals(values.as_slice_mut().ok_or("a non-contiguous operator")?);
+            f32_reals(&mut values);
             let precision = exact_precision(values.iter().copied()).map_err(error)?;
             Operator::blocks(op.name.clone(), op.rows.clone(), op.cols.clone(), values, present.clone(), precision, op.provenance.clone())
                 .map_err(error)?
         }
         OperatorBody::LowRank { left, right, .. } => {
             let (mut left, mut right) = (left.clone(), right.clone());
-            f32_reals(left.as_slice_mut().ok_or("a non-contiguous factor")?);
-            f32_reals(right.as_slice_mut().ok_or("a non-contiguous factor")?);
+            f32_reals(&mut left);
+            f32_reals(&mut right);
             let precision = exact_precision(left.iter().chain(right.iter()).copied()).map_err(error)?;
             Operator::low_rank(op.name.clone(), op.rows.clone(), op.cols.clone(), left, right, precision, op.provenance.clone()).map_err(error)?
         }
         OperatorBody::Diagonal { values, .. } => {
             let mut values = values.clone();
-            f32_reals(values.as_slice_mut().ok_or("a non-contiguous diagonal")?);
+            f32_reals(&mut values);
             let precision = exact_precision(values.iter().copied()).map_err(error)?;
             Operator::diag(op.name.clone(), op.rows.clone(), values, precision, op.provenance.clone()).map_err(error)?
         }
