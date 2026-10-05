@@ -85,6 +85,8 @@ pub mod run_check;
 pub mod proposals;
 pub mod resident_rule_fit;
 pub mod resident_causal_fit;
+// The explanation as a library of learned functions, fitted end to end by variational MDL.
+pub mod library_mdl;
 pub mod composed_rule_search;
 pub mod program_regions;
 pub mod program_joint_regions;
