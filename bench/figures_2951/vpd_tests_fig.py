@@ -8,9 +8,13 @@ agreement tasks (Marks et al. 2025), mean over tasks, nodes ranked by RelP attri
 mean-ablated, for the model's own MLP neurons, VPD's MLP subcomponents (attention left whole, matched
 coverage) and VPD's subcomponents at all 24 sites.
 
-    python bench/figures_2951/vpd_tests_fig.py INTERCHANGE.json EVERY_BLOCK.json BATTERY.json SVA.json OUT.png
+    python bench/figures_2951/vpd_tests_fig.py BATTERY.json CIRCUITS.json OUT.png
+
+BATTERY.json is examples/mpd_battery_2951's `vpd` output (its interchange with 64 sources),
+CIRCUITS.json its `circuits` output; their KLs are in bits, drawn here in nats.
 """
 import json
+import math
 import sys
 
 import matplotlib
@@ -19,11 +23,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-interchange, every_block, battery, sva, out = sys.argv[1:6]
-fam = json.load(open(interchange))["per_family"]
-allb = json.load(open(every_block))["complement_every_block"]["all_sources"]
-own = json.load(open(battery))["held_out"]["rows"]["ci/error_propagating"]["kl_nats"]["mean"]
-tasks = json.load(open(sva))["tasks"]
+battery, circuits, out = sys.argv[1:4]
+NATS = math.log(2)
+run = json.load(open(battery))
+fam = run["interchange"]["patches"]
+allb = {"mean": fam["complement_every_block"]["all_sources"]["mean"] * NATS}
+own = run["protocols"]["masks"]["ci"]["layers_0123"]["kl_bits"]["mean"] * NATS
+tasks = {t: v for t, v in json.load(open(circuits))["circuits"].items() if t != "mean"}
 
 INK, MUTED, SURFACE = "#1f1f1e", "#6b6b68", "#ffffff"
 BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
@@ -37,8 +43,8 @@ fig, (left, right) = plt.subplots(1, 2, figsize=(19, 8.2), facecolor=SURFACE,
 
 # Left: complement patches.
 names = [f"layer {b // 2} {'attention' if b % 2 == 0 else 'MLP'}" for b in range(8)]
-means = [fam[f"complement_block_{b}"]["mean_over_sources"] for b in range(8)]
-worst = [fam[f"complement_block_{b}"]["worst_of_64"] for b in range(8)]
+means = [np.mean(fam[f"complement_block_{b}"]["per_source_mean_bits"]) * NATS for b in range(8)]
+worst = [fam[f"complement_block_{b}"]["shared_source"]["worst_of_64"] * NATS for b in range(8)]
 labels = names + ["all 8 blocks at once"]
 means.append(allb["mean"])
 worst.append(None)

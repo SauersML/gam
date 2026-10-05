@@ -2,8 +2,8 @@
 training epoch (labelled with the bits that describe it, KL(q||p)), and VPD's decomposition (#2951).
 
 Both on held-out rows 1024-1055 of vpd4l_clean4096. Ours: library_mdl's held-out `clean` KL at cut l
-(P's first l layers, M's after), parsed from the fit log's epoch records. VPD: compare's battery rows
-ci/layers_0, ci/layers_01, ci/layers_012 and ci/error_propagating (causal-importance masks).
+(P's first l layers, M's after), parsed from the fit log's epoch records. VPD: the battery's VPD run
+(examples/mpd_battery_2951 vpd), CI masks, layers 0, 0-1, 0-2 and 0-3 replaced.
 
     python bench/figures_2951/libmdl_vs_vpd_layers_fig.py FIT_LOG BATTERY.json OUT.png
 """
@@ -26,9 +26,8 @@ for line in open(log):
     values = [float(v) for v in re.findall(r"Some\(([0-9.e+-]+)\)", clean.group(1))]
     bits = float(re.search(r"description_bits: ([0-9.e+]+)", line).group(1))
     epochs.append((int(re.search(r"epoch: (\d+)", line).group(1)), values, bits))
-rows = json.load(open(battery))["held_out"]["rows"]
-vpd = [rows[k]["kl_nats"]["mean"] / math.log(2)
-       for k in ["ci/layers_0", "ci/layers_01", "ci/layers_012", "ci/error_propagating"]]
+rows = json.load(open(battery))["protocols"]["masks"]["ci"]
+vpd = [rows[k]["kl_bits"]["mean"] for k in ["layers_0", "layers_01", "layers_012", "layers_0123"]]
 
 plt.rcParams.update({"font.size": 20, "axes.spines.top": False, "axes.spines.right": False})
 fig, ax = plt.subplots(figsize=(12.5, 7.5), facecolor="white")

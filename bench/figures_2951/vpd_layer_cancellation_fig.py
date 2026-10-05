@@ -1,12 +1,13 @@
 """VPD's error falls as more of the model is replaced (#2951).
 
-Reads compare's battery (bench/vpd_2951/vpd_battery.py output): KL(M || E) per token on held-out
+Reads the battery's VPD run (examples/mpd_battery_2951 vpd; bits, drawn in nats): KL(M || E) per token on held-out
 rows 1024-1055 of vpd4l_clean4096, where E is M with VPD's subcomponents (causal-importance masks,
 VPD's intended setting) substituted in a subset of the four layers and M's own weights elsewhere.
 
     python bench/figures_2951/vpd_layer_cancellation_fig.py BATTERY.json OUT.png
 """
 import json
+import math
 import sys
 from itertools import combinations
 
@@ -16,7 +17,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 battery, out = sys.argv[1], sys.argv[2]
-rows = json.load(open(battery))["held_out"]["rows"]
+rows = json.load(open(battery))["protocols"]["masks"]["ci"]
 layers = range(4)
 plt.rcParams.update({"font.size": 20, "axes.spines.top": False, "axes.spines.right": False})
 fig, axes = plt.subplots(1, 2, figsize=(17, 7.5), facecolor="white")
@@ -26,7 +27,7 @@ for ax, (stat, title) in zip(axes, [("mean", "Mean over tokens"), ("q99", "99th 
     means = []
     for k in range(1, 5):
         subsets = list(combinations(layers, k))
-        values = [rows["ci/error_propagating" if k == 4 else "ci/layers_" + "".join(map(str, s))]["kl_nats"][stat]
+        values = [rows["layers_" + "".join(map(str, s))]["kl_bits"][stat] * math.log(2)
                   for s in subsets]
         means.append(sum(values) / len(values))
         ax.scatter([k] * len(values), values, s=90, color="#9aa7b8", zorder=2)

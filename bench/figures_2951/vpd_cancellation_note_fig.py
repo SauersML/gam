@@ -1,11 +1,13 @@
 """Figure for the one-page note on VPD's layer cancellation (#2951): KL divergence from the model when an
 earlier layer (0, 1 or 2) is replaced alone or with layer 3, before and after subtracting or adding
 back layer 3's response (the change in the output of its zero-importance subcomponents), averaged over
-the earlier layer. Rounded masks (CI > 0), held-out rows 1024-1056.
+the earlier layer. Rounded masks (CI > 0), held-out rows 1024-1056. From the battery's VPD run
+(examples/mpd_battery_2951 vpd, its `cancellation`, in bits; drawn in nats).
 
     python bench/figures_2951/vpd_cancellation_note_fig.py CANCELLATION.json OUT.pdf
 """
 import json
+import math
 import sys
 
 import matplotlib
@@ -15,7 +17,7 @@ import matplotlib.pyplot as plt
 
 cancellation, out = sys.argv[1:3]
 c = json.load(open(cancellation))["cancellation"]["rounded"]
-mean_l = lambda key: sum(c[key.format(l)]["mean"] for l in range(3)) / 3
+mean_l = lambda key: sum(c[key.format(l)]["mean"] for l in range(3)) / 3 * math.log(2)
 
 INK, MUTED, BLUE, ORANGE, GRAY = "#1f1f1e", "#6b6b68", "#2a78d6", "#eb6834", "#b4b4b1"
 plt.rcParams.update({

@@ -1,7 +1,7 @@
 """Why removing more of VPD's subcomponents makes its error smaller (#2951).
 
-From compare's held-out cancellation run (vpd_battery.py OUT.json cancellation 1024:1056): KL(M || E)
-per token in nats, where E is VPD's published decomposition (goodfire/spd/runs/s-55ea3f9b) with, per
+From the battery's held-out cancellation test (examples/mpd_battery_2951 vpd, its `cancellation`, in
+bits; drawn in nats): KL(M || E) per token, where E is VPD's published decomposition (goodfire/spd/runs/s-55ea3f9b) with, per
 token, every subcomponent whose causal importance is 0 removed (VPD's own CI > 0 cutoff, the one
 behind its count of 205 active per token) in the named layers, and the model's own weights elsewhere.
 Bars are means over the earlier layer l = 0, 1, 2 (each of the three shows the same ordering). Let U be the output of
@@ -13,6 +13,7 @@ is why removing from layer 3 as well (deleting U, dU with it) lowers it.
     python bench/figures_2951/vpd_cancellation_fig.py CANCELLATION.json OUT.png
 """
 import json
+import math
 import sys
 
 import matplotlib
@@ -22,7 +23,7 @@ import matplotlib.pyplot as plt
 
 cancellation, out = sys.argv[1:3]
 rows = json.load(open(cancellation))["cancellation"]["rounded"]
-kl = lambda name: rows[f"kl_{name}"]["mean"]
+kl = lambda name: rows[f"kl_{name}"]["mean"] * math.log(2)
 
 INK, MUTED, SURFACE = "#1f1f1e", "#6b6b68", "#ffffff"
 BLUE, GRAY, ORANGE = "#2a78d6", "#8c8c89", "#eb6834"
