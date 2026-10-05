@@ -31,9 +31,9 @@ typedef unsigned short u16;
 
 // The sequences of one launch, passed by value (a kernel's parameters hold 4 KB). The tiles' sizes
 // and MAX_SEQUENCES are defined by the caller (`tensor::cuda`), which launches with them: a block of
-// query rows has ROWS_WARPS warps of 16 rows and takes ROWS_KEYS keys at a time (forward and dQ); a
-// block of key rows has KEYS_WARPS warps of 16 keys and takes KEYS_ROWS query rows at a time (dK
-// and dV).
+// query rows has ROWS_WARPS warps of 16 rows and takes FORWARD_KEYS keys at a time in the forward,
+// ROWS_KEYS in the queries' reverse; a block of key rows has KEYS_WARPS warps of 16 keys and takes
+// KEYS_ROWS query rows at a time (the keys' and values' reverse).
 struct Sequences {
     u32 count;
     u32 start[MAX_SEQUENCES];
@@ -175,17 +175,20 @@ __device__ __forceinline__ float quad_sum(float v) {
 
 // ---- Forward ----
 // A block holds ROWS_TILE query rows of one query head of one sequence (16 per warp, their query
-// fragments in registers) and sweeps the key and value tiles of ROWS_KEYS rows up to its last row,
+// fragments in registers) and sweeps the key and value tiles of FORWARD_KEYS rows up to its last row,
 // loading the value tile while the scores' products run and the next key tile while the values'
 // run.
 #define ROWS_THREADS (ROWS_WARPS * 32)
 #define ROWS_TILE (ROWS_WARPS * 16)
 
-// Blocks: x = sequence × hq + query head; y = the query tile, counted from the sequence's last (the
-// longest sweep first). Dynamic shared memory: (ROWS_TILE + 2 ROWS_KEYS) HEAD_D bfloat16.
+// Blocks: x + z gridDim.x = sequence × hq + query head (the pairs in chunks of gridDim.x, whose keys
+// and values stay in L2 while the chunk runs); y = the query tile, counted from the sequence's last
+// (the longest sweep first). Dynamic shared memory: (ROWS_TILE + 2 FORWARD_KEYS) HEAD_D bfloat16.
 extern "C" __global__ void __launch_bounds__(ROWS_THREADS) attention_forward(const Sequences sequences, u32 hq, u32 hk, float scale_log2, const u16* __restrict__ y, u16* __restrict__ out, float* __restrict__ lse) {
     extern __shared__ __align__(128) unsigned char smem[];
-    const u32 head = blockIdx.x % hq, sequence = blockIdx.x / hq;
+    const u32 pair = blockIdx.z * gridDim.x + blockIdx.x;
+    if (pair >= sequences.count * hq) return;
+    const u32 head = pair % hq, sequence = pair / hq;
     const u32 start = sequences.start[sequence], length = sequences.length[sequence];
     const u32 tiles = (length + ROWS_TILE - 1) / ROWS_TILE;
     if (blockIdx.y >= tiles) return;
@@ -194,12 +197,12 @@ extern "C" __global__ void __launch_bounds__(ROWS_THREADS) attention_forward(con
     const u16* yq = y + (u64)(start + q0) * stride + head * HEAD_W;
     const u16* yk = y + (u64)start * stride + (hq + kv) * HEAD_W;
     const u16* yv = y + (u64)start * stride + (hq + hk + kv) * HEAD_W;
-    const u32 sq = shared_address(smem), sk = sq + ROWS_TILE * HEAD_D * 2, sv = sk + ROWS_KEYS * HEAD_D * 2;
-    const u32 keys = min(q0 + ROWS_TILE, length), key_tiles = (keys + ROWS_KEYS - 1) / ROWS_KEYS;
+    const u32 sq = shared_address(smem), sk = sq + ROWS_TILE * HEAD_D * 2, sv = sk + FORWARD_KEYS * HEAD_D * 2;
+    const u32 keys = min(q0 + ROWS_TILE, length), key_tiles = (keys + FORWARD_KEYS - 1) / FORWARD_KEYS;
     const u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
 
     load_head_tile<ROWS_TILE, ROWS_THREADS>(sq, yq, stride, min((u32)ROWS_TILE, length - q0));
-    load_head_tile<ROWS_KEYS, ROWS_THREADS>(sk, yk, stride, min((u32)ROWS_KEYS, keys));
+    load_head_tile<FORWARD_KEYS, ROWS_THREADS>(sk, yk, stride, min((u32)FORWARD_KEYS, keys));
     cp_commit();
 
     u32 qf[HEAD_D / 16][4];
@@ -211,22 +214,22 @@ extern "C" __global__ void __launch_bounds__(ROWS_THREADS) attention_forward(con
     const u32 row0 = q0 + warp * 16 + (lane >> 2), col0 = 2 * (lane & 3u);
 
     for (u32 kt = 0; kt < key_tiles; ++kt) {
-        const u32 k0 = kt * ROWS_KEYS;
+        const u32 k0 = kt * FORWARD_KEYS;
         cp_wait_all();
         __syncthreads();
         if (kt == 0) {
 #pragma unroll
             for (int ks = 0; ks < HEAD_D / 16; ++ks) ldsm(sq + swizzle(warp * 16 + (lane & 15u), ks * 16 + ((lane >> 4) << 3), CHUNKS), qf[ks]);
         }
-        load_head_tile<ROWS_KEYS, ROWS_THREADS>(sv, yv + (u64)k0 * stride, stride, min((u32)ROWS_KEYS, keys - k0));
+        load_head_tile<FORWARD_KEYS, ROWS_THREADS>(sv, yv + (u64)k0 * stride, stride, min((u32)FORWARD_KEYS, keys - k0));
         cp_commit();
-        float s[ROWS_KEYS / 8][4];
+        float s[FORWARD_KEYS / 8][4];
 #pragma unroll
-        for (int n = 0; n < ROWS_KEYS / 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+        for (int n = 0; n < FORWARD_KEYS / 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
 #pragma unroll
         for (int ks = 0; ks < HEAD_D / 16; ++ks) {
 #pragma unroll
-            for (int nt = 0; nt < ROWS_KEYS / 8; nt += 2) {
+            for (int nt = 0; nt < FORWARD_KEYS / 8; nt += 2) {
                 u32 bf[4];
                 ldsm(sk + swizzle(nt * 8 + (lane & 7u) + ((lane >> 4) << 3), ks * 16 + (((lane >> 3) & 1u) << 3), CHUNKS), bf);
                 mma(s[nt], qf[ks], bf[0], bf[1]);
@@ -236,13 +239,13 @@ extern "C" __global__ void __launch_bounds__(ROWS_THREADS) attention_forward(con
         cp_wait_all();
         __syncthreads();
         if (kt + 1 < key_tiles) {
-            load_head_tile<ROWS_KEYS, ROWS_THREADS>(sk, yk + (u64)(k0 + ROWS_KEYS) * stride, stride, min((u32)ROWS_KEYS, keys - k0 - ROWS_KEYS));
+            load_head_tile<FORWARD_KEYS, ROWS_THREADS>(sk, yk + (u64)(k0 + FORWARD_KEYS) * stride, stride, min((u32)FORWARD_KEYS, keys - k0 - FORWARD_KEYS));
             cp_commit();
         }
         // Scores in base-2 units; keys after a row's position, or past the sequence, weigh nothing.
-        const bool masked = k0 + ROWS_KEYS > q0 + warp * 16 + 1 || k0 + ROWS_KEYS > length;
+        const bool masked = k0 + FORWARD_KEYS > q0 + warp * 16 + 1 || k0 + FORWARD_KEYS > length;
 #pragma unroll
-        for (int n = 0; n < ROWS_KEYS / 8; ++n) {
+        for (int n = 0; n < FORWARD_KEYS / 8; ++n) {
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 float v = s[n][e] * scale_log2;
@@ -257,7 +260,7 @@ extern "C" __global__ void __launch_bounds__(ROWS_THREADS) attention_forward(con
         for (int i = 0; i < 2; ++i) {
             float mx = m[i];
 #pragma unroll
-            for (int n = 0; n < ROWS_KEYS / 8; ++n) mx = fmaxf(mx, fmaxf(s[n][2 * i], s[n][2 * i + 1]));
+            for (int n = 0; n < FORWARD_KEYS / 8; ++n) mx = fmaxf(mx, fmaxf(s[n][2 * i], s[n][2 * i + 1]));
             mx = quad_max(mx);
             const float base = mx == NEG_INF ? 0.0f : mx;
             const float alpha = exp2_approx(m[i] - base);
@@ -269,14 +272,14 @@ extern "C" __global__ void __launch_bounds__(ROWS_THREADS) attention_forward(con
                 o[n][2 * i + 1] *= alpha;
             }
 #pragma unroll
-            for (int n = 0; n < ROWS_KEYS / 8; ++n) {
+            for (int n = 0; n < FORWARD_KEYS / 8; ++n) {
                 s[n][2 * i] = exp2_approx(s[n][2 * i] - base);
                 s[n][2 * i + 1] = exp2_approx(s[n][2 * i + 1] - base);
             }
         }
         // The weights as the values' product's operand (bfloat16); the row sums add the same.
 #pragma unroll
-        for (int kk = 0; kk < ROWS_KEYS / 16; ++kk) {
+        for (int kk = 0; kk < FORWARD_KEYS / 16; ++kk) {
             u32 a[4] = {pack_bf16(s[2 * kk][0], s[2 * kk][1]), pack_bf16(s[2 * kk][2], s[2 * kk][3]), pack_bf16(s[2 * kk + 1][0], s[2 * kk + 1][1]), pack_bf16(s[2 * kk + 1][2], s[2 * kk + 1][3])};
             l[0] += bf16_lo(a[0]) + bf16_hi(a[0]) + bf16_lo(a[2]) + bf16_hi(a[2]);
             l[1] += bf16_lo(a[1]) + bf16_hi(a[1]) + bf16_lo(a[3]) + bf16_hi(a[3]);
@@ -339,11 +342,14 @@ extern "C" __global__ void attention_backward_sums(u32 rows, u32 hq, const u16* 
 #define KEYS_THREADS (KEYS_WARPS * 32)
 #define KEYS_TILE (KEYS_WARPS * 16)
 
-// Blocks: x = sequence × hk + key-value head; y = the key tile (the first, the longest sweep, first).
-// Dynamic shared memory: (2 KEYS_TILE + 4 KEYS_ROWS) HEAD_D bfloat16.
+// Blocks: x + z gridDim.x = sequence × hk + key-value head (in chunks, as the forward's); y = the key
+// tile (the first, the longest sweep, first). Dynamic shared memory: (2 KEYS_TILE + 4 KEYS_ROWS)
+// HEAD_D bfloat16.
 extern "C" __global__ void __launch_bounds__(KEYS_THREADS) attention_backward_keys(const Sequences sequences, u32 hq, u32 hk, float scale, const u16* __restrict__ y, const float* __restrict__ lse, const u16* __restrict__ ga16, const float* __restrict__ dsum, float* __restrict__ gy) {
     extern __shared__ __align__(128) unsigned char smem[];
-    const u32 kv = blockIdx.x % hk, sequence = blockIdx.x / hk;
+    const u32 pair = blockIdx.z * gridDim.x + blockIdx.x;
+    if (pair >= sequences.count * hk) return;
+    const u32 kv = pair % hk, sequence = pair / hk;
     const u32 start = sequences.start[sequence], length = sequences.length[sequence];
     const u32 k0 = blockIdx.y * KEYS_TILE;
     if (k0 >= length) return;
@@ -462,7 +468,9 @@ extern "C" __global__ void __launch_bounds__(KEYS_THREADS) attention_backward_ke
 // Blocks as the forward's. Dynamic shared memory: (2 ROWS_TILE + 4 ROWS_KEYS) HEAD_D bfloat16.
 extern "C" __global__ void __launch_bounds__(ROWS_THREADS) attention_backward_queries(const Sequences sequences, u32 hq, u32 hk, float scale, const u16* __restrict__ y, const float* __restrict__ lse, const u16* __restrict__ ga16, const float* __restrict__ dsum, float* __restrict__ gy) {
     extern __shared__ __align__(128) unsigned char smem[];
-    const u32 head = blockIdx.x % hq, sequence = blockIdx.x / hq;
+    const u32 pair = blockIdx.z * gridDim.x + blockIdx.x;
+    if (pair >= sequences.count * hq) return;
+    const u32 head = pair % hq, sequence = pair / hq;
     const u32 start = sequences.start[sequence], length = sequences.length[sequence];
     const u32 tiles = (length + ROWS_TILE - 1) / ROWS_TILE;
     if (blockIdx.y >= tiles) return;
