@@ -230,11 +230,42 @@ impl DevicePosterior {
     /// The posterior's means and log standard deviations into `posterior`, and Adam's moments per
     /// operator.
     pub fn download(&self, posterior: &mut Posterior) -> Result<Vec<[Array2<f64>; 4]>, String> {
+        self.values_into(posterior)?;
+        let down = |t: &Tensor| self.fitting.download(t).map_err(error);
+        self.moments.iter().map(|m| Ok([down(&m[0])?, down(&m[1])?, down(&m[2])?, down(&m[3])?])).collect()
+    }
+
+    /// The posterior's means and log standard deviations into `posterior`; Adam's moments stay on
+    /// the device.
+    pub fn values_into(&self, posterior: &mut Posterior) -> Result<(), String> {
         let down = |t: &Tensor| self.fitting.download(t).map_err(error);
         for i in 0..self.mean.len() {
             posterior.mean[i] = down(&self.mean[i])?;
             posterior.log_sd[i] = down(&self.log_sd[i])?;
         }
-        self.moments.iter().map(|m| Ok([down(&m[0])?, down(&m[1])?, down(&m[2])?, down(&m[3])?])).collect()
+        Ok(())
     }
+
+    /// `posterior`'s means and log standard deviations onto the device, Adam's moments kept, and
+    /// the groups' variances and divergences with them (after a removal on the host, whose removed
+    /// entries, `μ = 0` and `s = −∞`, every later step leaves alone).
+    pub fn set_values(&mut self, posterior: &Posterior) -> Result<(), String> {
+        if posterior.mean.len() != self.mean.len() {
+            return Err(error("one posterior array per trainable operator required"));
+        }
+        for i in 0..self.mean.len() {
+            self.mean[i] = self.fitting.upload(posterior.mean[i].view()).map_err(error)?;
+            self.log_sd[i] = self.fitting.upload(posterior.log_sd[i].view()).map_err(error)?;
+        }
+        self.refresh()
+    }
+
+    /// Trainable operator `i`'s `μ`, `s` and Adam's moments on the host, one operator at a time
+    /// (a checkpoint streams them rather than holding every operator's moments at once).
+    pub fn operator(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>, [Array2<f64>; 4]), String> {
+        let down = |t: &Tensor| self.fitting.download(t).map_err(error);
+        let m = self.moments.get(i).ok_or_else(|| error("no such trainable operator"))?;
+        Ok((down(&self.mean[i])?, down(&self.log_sd[i])?, [down(&m[0])?, down(&m[1])?, down(&m[2])?, down(&m[3])?]))
+    }
+
 }
