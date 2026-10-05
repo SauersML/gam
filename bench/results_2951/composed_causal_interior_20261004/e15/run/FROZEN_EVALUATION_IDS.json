@@ -1,0 +1,13 @@
+{
+  "frozen_before_heldout_export_access": true,
+  "ids": [
+    "native",
+    "expression15-shared",
+    "expression15-untied"
+  ],
+  "policy": "native always; both matched shared/untied controls of every training-Pareto expression, including failed counterparts",
+  "training_pareto_ids": [
+    "native",
+    "expression15-shared"
+  ]
+}

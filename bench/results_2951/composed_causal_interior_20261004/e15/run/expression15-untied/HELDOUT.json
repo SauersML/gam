@@ -1,0 +1,68 @@
+{
+  "artifact_sha256": "6d49b1c96fddb6f3432f179281e22abfaa7f70f884133c6b9a2cf327973ac6e5",
+  "c32": 2142297866,
+  "control_map_sha256": "204fc96861977f7080a4b58894ff0b19aa6dce0a1bed41e6497d1363a4545f05",
+  "id": "expression15-untied",
+  "measurement": {
+    "active_group": "clean",
+    "episodes": [
+      {
+        "group": "clean",
+        "label": "clean",
+        "maximum_scored_row_kl": 11.349015575458672,
+        "mean_kl": 4.374782317901026,
+        "scored_rows": 128,
+        "worst_scored_row": 111
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-remove",
+        "maximum_scored_row_kl": 3.824262847132392,
+        "mean_kl": 1.0306997011691723,
+        "scored_rows": 128,
+        "worst_scored_row": 78
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-half",
+        "maximum_scored_row_kl": 12.940305920364775,
+        "mean_kl": 3.894082437607333,
+        "scored_rows": 128,
+        "worst_scored_row": 50
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-half",
+        "maximum_scored_row_kl": 11.167608662310688,
+        "mean_kl": 4.357069927577562,
+        "scored_rows": 128,
+        "worst_scored_row": 111
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-double",
+        "maximum_scored_row_kl": 11.607990813913496,
+        "mean_kl": 4.3418724748124555,
+        "scored_rows": 128,
+        "worst_scored_row": 111
+      },
+      {
+        "group": "joint",
+        "label": "joint-half",
+        "maximum_scored_row_kl": 13.410963239302735,
+        "mean_kl": 3.7931247187949637,
+        "scored_rows": 128,
+        "worst_scored_row": 50
+      }
+    ],
+    "groups": {
+      "clean": 4.374782317901026,
+      "joint": 3.7931247187949637,
+      "mlp-output": 2.4623910693882527,
+      "shared-weight": 4.3494712011950085
+    },
+    "objective": 4.374782317901026
+  },
+  "scope": "frozen candidate measurement only; no Local or acceptance certificate",
+  "status": "heldout_measured"
+}

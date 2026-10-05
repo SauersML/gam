@@ -1,0 +1,7 @@
+{
+  "ids": [
+    "native",
+    "expression32-shared"
+  ],
+  "scope": "training cost/KL candidates for later independent Local/Run assessment; no holdout consulted"
+}

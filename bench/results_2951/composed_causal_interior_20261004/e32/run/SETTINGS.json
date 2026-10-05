@@ -1,0 +1,102 @@
+{
+  "export_sha256": "b0f8d6d4328df06cd464d999bc1d1da4d1431334d21cdaf2e9e5e1edc9f4bc73",
+  "layers": 4,
+  "uses": [
+    0,
+    1
+  ],
+  "width": 1536,
+  "sequences": 8,
+  "context": 64,
+  "teacher_numeric_bytes": 8589934592,
+  "grammar": {
+    "arguments": 1,
+    "max_operations": 3,
+    "max_expressions": 128,
+    "unary": [
+      "gelu_tanh"
+    ],
+    "binary": [
+      "multiply"
+    ],
+    "affine": true
+  },
+  "expression_ids": [
+    32
+  ],
+  "controls": [
+    {
+      "kind": "mlp_output",
+      "layer": 0
+    },
+    {
+      "kind": "retained_operator",
+      "name": "blocks.0.q0"
+    }
+  ],
+  "cases": [
+    {
+      "label": "clean",
+      "group": "clean",
+      "gains": [
+        1,
+        1
+      ]
+    },
+    {
+      "label": "mlp0-remove",
+      "group": "mlp-output",
+      "gains": [
+        0,
+        1
+      ]
+    },
+    {
+      "label": "mlp0-half",
+      "group": "mlp-output",
+      "gains": [
+        0.5,
+        1
+      ]
+    },
+    {
+      "label": "q0-half",
+      "group": "shared-weight",
+      "gains": [
+        1,
+        0.5
+      ]
+    },
+    {
+      "label": "q0-double",
+      "group": "shared-weight",
+      "gains": [
+        1,
+        2
+      ]
+    },
+    {
+      "label": "joint-half",
+      "group": "joint",
+      "gains": [
+        0.5,
+        0.5
+      ]
+    }
+  ],
+  "fit": {
+    "iterations": 256,
+    "learning_rate": 0.0003,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-08,
+    "numeric_bytes": 25769803776
+  },
+  "seed": 29516001,
+  "evaluation": {
+    "export_sha256": "18fdb8ff6adb2c38e42d27e8772bd391cc841dc2076e9605c2c7731d0c85449a",
+    "sequences": 2
+  },
+  "require_interior_learned": true,
+  "native_initialization": false
+}

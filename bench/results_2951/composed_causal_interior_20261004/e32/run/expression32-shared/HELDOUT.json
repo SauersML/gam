@@ -1,0 +1,68 @@
+{
+  "artifact_sha256": "e8cb89971870da74090be9aa7a6b07c51f0251679ab2b14e744098888c572855",
+  "c32": 2066751001,
+  "control_map_sha256": "204fc96861977f7080a4b58894ff0b19aa6dce0a1bed41e6497d1363a4545f05",
+  "id": "expression32-shared",
+  "measurement": {
+    "active_group": "clean",
+    "episodes": [
+      {
+        "group": "clean",
+        "label": "clean",
+        "maximum_scored_row_kl": 9.905903554156964,
+        "mean_kl": 4.091735366760696,
+        "scored_rows": 128,
+        "worst_scored_row": 111
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-remove",
+        "maximum_scored_row_kl": 2.846549370791408,
+        "mean_kl": 0.8291067102754309,
+        "scored_rows": 128,
+        "worst_scored_row": 78
+      },
+      {
+        "group": "mlp-output",
+        "label": "mlp0-half",
+        "maximum_scored_row_kl": 9.582555584206446,
+        "mean_kl": 3.3003080797278783,
+        "scored_rows": 128,
+        "worst_scored_row": 111
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-half",
+        "maximum_scored_row_kl": 9.96255741941772,
+        "mean_kl": 4.132221070699866,
+        "scored_rows": 128,
+        "worst_scored_row": 111
+      },
+      {
+        "group": "shared-weight",
+        "label": "q0-double",
+        "maximum_scored_row_kl": 9.939495262395837,
+        "mean_kl": 4.038807850849285,
+        "scored_rows": 128,
+        "worst_scored_row": 105
+      },
+      {
+        "group": "joint",
+        "label": "joint-half",
+        "maximum_scored_row_kl": 9.429311157025637,
+        "mean_kl": 3.297489766600611,
+        "scored_rows": 128,
+        "worst_scored_row": 111
+      }
+    ],
+    "groups": {
+      "clean": 4.091735366760696,
+      "joint": 3.297489766600611,
+      "mlp-output": 2.064707395001655,
+      "shared-weight": 4.085514460774576
+    },
+    "objective": 4.091735366760696
+  },
+  "scope": "frozen candidate measurement only; no Local or acceptance certificate",
+  "status": "heldout_measured"
+}

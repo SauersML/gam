@@ -1,0 +1,41 @@
+{
+  "body_operator_map": {
+    "0": 111,
+    "1": 112
+  },
+  "declarations": {
+    "domains": [],
+    "parameters": 0,
+    "raw_slot_widths": [
+      768,
+      768
+    ]
+  },
+  "discovery_uses": [
+    0,
+    1
+  ],
+  "expression": {
+    "binary": [
+      "multiply",
+      {
+        "argument": 0
+      },
+      {
+        "affine": {
+          "unary": [
+            "gelu_tanh",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "native_checkpoint_sha256": "155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552",
+  "pool_sha256": "f9ce04de1ed436817331661f0015eaca33ea91592f18ab1ea59175ced376b424",
+  "scope": "fitted shared body source; pool boundary maps remain original initialization, NOT fitted discovery exports",
+  "source_candidate_sha256": "e8cb89971870da74090be9aa7a6b07c51f0251679ab2b14e744098888c572855",
+  "width": 1536
+}

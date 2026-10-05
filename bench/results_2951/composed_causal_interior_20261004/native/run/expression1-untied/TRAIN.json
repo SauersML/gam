@@ -1,0 +1,60 @@
+{
+  "active_group": "clean",
+  "episodes": [
+    {
+      "group": "clean",
+      "label": "clean",
+      "maximum_scored_row_kl": 0.0,
+      "mean_kl": 0.0,
+      "scored_rows": 512,
+      "worst_scored_row": 511
+    },
+    {
+      "group": "mlp-output",
+      "label": "mlp0-remove",
+      "maximum_scored_row_kl": 0.0,
+      "mean_kl": 0.0,
+      "scored_rows": 512,
+      "worst_scored_row": 511
+    },
+    {
+      "group": "mlp-output",
+      "label": "mlp0-half",
+      "maximum_scored_row_kl": 0.0,
+      "mean_kl": 0.0,
+      "scored_rows": 512,
+      "worst_scored_row": 511
+    },
+    {
+      "group": "shared-weight",
+      "label": "q0-half",
+      "maximum_scored_row_kl": 0.0,
+      "mean_kl": 0.0,
+      "scored_rows": 512,
+      "worst_scored_row": 511
+    },
+    {
+      "group": "shared-weight",
+      "label": "q0-double",
+      "maximum_scored_row_kl": 0.0,
+      "mean_kl": 0.0,
+      "scored_rows": 512,
+      "worst_scored_row": 511
+    },
+    {
+      "group": "joint",
+      "label": "joint-half",
+      "maximum_scored_row_kl": 0.0,
+      "mean_kl": 0.0,
+      "scored_rows": 512,
+      "worst_scored_row": 511
+    }
+  ],
+  "groups": {
+    "clean": 0.0,
+    "joint": 0.0,
+    "mlp-output": 0.0,
+    "shared-weight": 0.0
+  },
+  "objective": 0.0
+}

@@ -1,0 +1,384 @@
+{
+  "binary_sha256": "7addcfd8c9d89d630be7e2f052042546bb1538745c8272656cdab6a37d5e826c",
+  "cases": [
+    {
+      "gains": [
+        1.0,
+        1.0
+      ],
+      "group": "clean",
+      "label": "clean"
+    },
+    {
+      "gains": [
+        0.0,
+        1.0
+      ],
+      "group": "mlp-output",
+      "label": "mlp0-remove"
+    },
+    {
+      "gains": [
+        0.5,
+        1.0
+      ],
+      "group": "mlp-output",
+      "label": "mlp0-half"
+    },
+    {
+      "gains": [
+        1.0,
+        0.5
+      ],
+      "group": "shared-weight",
+      "label": "q0-half"
+    },
+    {
+      "gains": [
+        1.0,
+        2.0
+      ],
+      "group": "shared-weight",
+      "label": "q0-double"
+    },
+    {
+      "gains": [
+        0.5,
+        0.5
+      ],
+      "group": "joint",
+      "label": "joint-half"
+    }
+  ],
+  "control_scope": "activation boundary scaling is not a global weight edit; retained_operator gain affects all its invocations; no mapping claimed for removed internal coordinates",
+  "controls": [
+    {
+      "kind": "mlp_output",
+      "layer": 0
+    },
+    {
+      "kind": "retained_operator",
+      "name": "blocks.0.q0"
+    }
+  ],
+  "cost_scope": "full saved base-program C32 with native bindings; declared controls are external test operations, not an encoded general weight-intervention translator",
+  "export_sha256": "b0f8d6d4328df06cd464d999bc1d1da4d1431334d21cdaf2e9e5e1edc9f4bc73",
+  "native": {
+    "config": {
+      "d_mlp": 3072,
+      "d_model": 768,
+      "head_dim": 128,
+      "mlp_act": "gelu_tanh",
+      "n_ctx": 512,
+      "n_heads": 6,
+      "n_kv_heads": 6,
+      "n_layers": 4,
+      "norm_eps": 1e-6,
+      "rope_pairing": "rotate_half",
+      "rope_theta": 10000.0,
+      "tied_embeddings": true,
+      "vocab": 50277
+    },
+    "files": {
+      "blocks.0.attn.k_proj": {
+        "sha256": "099f96cd49e2f8daf2c6417d8510f54a14792d495a60c65c34c6fe233fc73614",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.0.attn.o_proj": {
+        "sha256": "aea57bbf855586fadb200d81d543b29f7de9da0f2c0cca24994925e1c46bc8ae",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.0.attn.q_proj": {
+        "sha256": "ea38c22ce7e3855ebdbccc06e87b75619e5b3fee33f3bee9a7329936bb4f2238",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.0.attn.v_proj": {
+        "sha256": "5d741828c2a0684a4448dbd8434ce3d92e9e24bc38da324967890fa2254d7bf3",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.0.mlp.c_fc": {
+        "sha256": "ce3f0e13143fb1b7d31ad01fe75e38e39bf8cd67ef6b8309dd566d8bc2983275",
+        "shape": [
+          3072,
+          768
+        ]
+      },
+      "blocks.0.mlp.down_proj": {
+        "sha256": "05d2abd83af9be70a453c7e7b499af6100d5c1b5379268ab5a5919f42e0ac384",
+        "shape": [
+          768,
+          3072
+        ]
+      },
+      "blocks.0.rms1.gain": {
+        "sha256": "f7caac93fc2ebcf2064255c345213c199c25858479067ba8afeb7778ef9ba56e",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.0.rms2.gain": {
+        "sha256": "77f3b52b042773fdcd76b77a28e4efc66764f1e40f1b22ddc5e8bd407b0ad388",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.1.attn.k_proj": {
+        "sha256": "a50cbbf9738af28cf9b7d64885d2f6ed481ebebf9b4ed5b20aa20c8a67a71bf3",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.1.attn.o_proj": {
+        "sha256": "c5c7d591b66b11791c6bd77a55ec4f8ef029e0a03b1061e8413e411a1d46d7be",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.1.attn.q_proj": {
+        "sha256": "e866af792279b999dd7164d7b203971b3776902e764452217653f0536c8f9227",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.1.attn.v_proj": {
+        "sha256": "12e2189b69665c35f4d1e41bed8229080ccb95bfd2ac6f09d2d9a15b6162679b",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.1.mlp.c_fc": {
+        "sha256": "5250793ece9b1bef04c275c1b59f48f5cccb9c971dd898d0a4f5777fcafad5c8",
+        "shape": [
+          3072,
+          768
+        ]
+      },
+      "blocks.1.mlp.down_proj": {
+        "sha256": "ec12769ec6cf2a735d67609ec4eb9fc155b4f3160d217340a0ddd19ab16a307d",
+        "shape": [
+          768,
+          3072
+        ]
+      },
+      "blocks.1.rms1.gain": {
+        "sha256": "cd82df137c7b3c6958ba09ae522712751550e6ca94365e0745f942ef3468aa7e",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.1.rms2.gain": {
+        "sha256": "e80940662353b21caa38d7c8b9f39d242ac7eca50b8f2a9b8b7e34b0d2073633",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.2.attn.k_proj": {
+        "sha256": "f870446110c824cc9330b00e8a96665757ebea6d231eb8403cd290d143991316",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.2.attn.o_proj": {
+        "sha256": "93291c198cb318df017cd12b276420d980a57eb6bb214f70d4ffb8cf4057fb44",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.2.attn.q_proj": {
+        "sha256": "c3e8e98f26dffacd097b4342dafc04f22b6bfe2379f5db7307558fb3d95caef6",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.2.attn.v_proj": {
+        "sha256": "9c03b34c8772c92484d0fea39238c06b63dbb115c73baa53fbd55915bad197c6",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.2.mlp.c_fc": {
+        "sha256": "07f0c6a137fd648b749f9acece581431a9a73ecdd6881f81633f618317dbd0dc",
+        "shape": [
+          3072,
+          768
+        ]
+      },
+      "blocks.2.mlp.down_proj": {
+        "sha256": "0edbdf22096909f99ac92b91221195e22e4a0957d59d791cc22fb58cf6b3a579",
+        "shape": [
+          768,
+          3072
+        ]
+      },
+      "blocks.2.rms1.gain": {
+        "sha256": "9d8a578f86b90b79d61d05d3c4a4119124061f354f60278890ae73d85b843042",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.2.rms2.gain": {
+        "sha256": "b770fa4d1c6b2ef24f605360523abfb073bd4ed62f446b9ee388bdc57614d13d",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.3.attn.k_proj": {
+        "sha256": "dc19a593d43427d44769f9ea9b0b827851d357d849300d9b882fdd39db4f8928",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.3.attn.o_proj": {
+        "sha256": "5fc3bb75250b6bf15c1aa627bf73ca7e26d6c4c6353ad2915cccf0d5d1977c64",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.3.attn.q_proj": {
+        "sha256": "bfd4e26e3569a36425684702f7c834325cf0422737588b8b7dfd3ca666631b2b",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.3.attn.v_proj": {
+        "sha256": "ca73d04bad13b91b732e5c22b5504d2b410c67bbd279b2538dcbb750d6e5ec82",
+        "shape": [
+          768,
+          768
+        ]
+      },
+      "blocks.3.mlp.c_fc": {
+        "sha256": "dba21fcffeeee199085ba1fd887d2009193bcda317f67069bd635cf38c8f71f5",
+        "shape": [
+          3072,
+          768
+        ]
+      },
+      "blocks.3.mlp.down_proj": {
+        "sha256": "a9820c075dffdce736341eb48494f5d03459dca6b4f8f198df7e78771c12ae1f",
+        "shape": [
+          768,
+          3072
+        ]
+      },
+      "blocks.3.rms1.gain": {
+        "sha256": "0c0caddb7cab377379a952263d994e6a6a4e0235d1528a6cfa604da7fcad34a0",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "blocks.3.rms2.gain": {
+        "sha256": "a9e54165b55f00b9fba493dec03ecdd3b140913251d0aff66b6c7bea7d26018a",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "final_norm.gain": {
+        "sha256": "30518f54acc7d36d0a4533956c7d8f0bb9d1bda5f2cddae0fddac7c2f071b665",
+        "shape": [
+          1,
+          768
+        ]
+      },
+      "logits_logsumexp": {
+        "sha256": "8544964599bcc3280cf39b3ea608f4ca71f7728d605a94b81e17a57a30f1d9dc",
+        "shape": [
+          1,
+          65536
+        ]
+      },
+      "logits_row0": {
+        "sha256": "3cae1ba600dce3039f07f9131f7c1cffd7c2b575ff65ce20a80fa9e8d627667d",
+        "shape": [
+          512,
+          50277
+        ]
+      },
+      "logits_topk_indices": {
+        "sha256": "0380fb9161a050ee299f31c097d4abf16f268d1e9e597d1c77a645074eaa775c",
+        "shape": [
+          65536,
+          64
+        ]
+      },
+      "logits_topk_values": {
+        "sha256": "3a3934b140adfc77bac03ec61d6ea1e1305651e6d07516ff56b7a0bff9736cee",
+        "shape": [
+          65536,
+          64
+        ]
+      },
+      "row_ids": {
+        "sha256": "4d16aff8c1f7433f075f2c0575547bcd06f7432677d66fe289bd0bd43c89ac2c",
+        "shape": [
+          1,
+          128
+        ]
+      },
+      "tokens": {
+        "shape": [
+          512,
+          513
+        ]
+      },
+      "wte": {
+        "sha256": "81625bc04736ddf55792b57cc5e9ccb59bc35bbaf4fd6d7d3ac0472da65b7a52",
+        "shape": [
+          50277,
+          768
+        ]
+      }
+    },
+    "reference_forward": "~/mpd-data/vpd/vpd_model.py Target (pre-RMSNorm w * x * rsqrt(mean x^2 + eps); rotate-half RoPE on q, k; causal softmax(q k^T / sqrt(hd)); GELU tanh; final RMSNorm; logits = x @ wte^T)",
+    "source": {
+      "checkpoint": "/Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors",
+      "checkpoint_sha256": "155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552",
+      "context": 512,
+      "data": "danbraunai/pile-uncopyrighted-tok-shuffled val-00000-of-00012.parquet",
+      "logits": "fp32 forward on MPS (vpd_model.Target), widened to f64",
+      "target_run": "goodfire/spd/runs/t-9d2b8f02",
+      "token_rows": "val rows 2048..2560 (pile_val_4096x513.npy), disjoint from the frontier rows 1024..1055; e2e library training",
+      "topk": 64
+    }
+  },
+  "native_supervision": "native logits only; candidate runs its complete autonomous states",
+  "numerical_scope": "operational float64 KL proposal scores, not certified enclosures",
+  "objective": "maximum named-group mean of episode mean teacher-to-candidate KL; all causal sequence rows scored",
+  "rows_per_episode": 512,
+  "scope": "training proposal search with optional frozen heldout measurement; no acceptance claim; exact declared boundary masks and retained shared-weight gains only",
+  "settings_sha256": "b61d6c94c0008c91af710be55fa46d3cc2a1ac5c53a6f0bf72b8cbee142e54d9",
+  "teacher_planned_numeric_bytes": 4828440576,
+  "training_data_scope": "previously available export; no new untouched confirmation panel",
+  "weight_gain_arithmetic": "gain applied to every computed contribution, algebraically equivalent to scaling the shared operator; not a bit-exact claim about rounding edited checkpoint literals before GEMM"
+}

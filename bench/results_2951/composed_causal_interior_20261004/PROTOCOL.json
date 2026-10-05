@@ -1,0 +1,17 @@
+{
+  "status": "Declared before runs; IDs15and32 verified by Rust example tests",
+  "question": "Can interior learned transforms shared across two native MLP uses retain unseen-context autonomous causal fidelity more economically than separate transforms?",
+  "inventory": "same primitive grammar, at most3operations; select interior affine between nonlinear computations; IDs15and32 must be verified before run",
+  "training": "8complete sequences x64positions,6fixedinterventioncases,256updates,shared vs untied sameinitialnumericalfunction seed29516001",
+  "heldout": "2project-seen fit-disjoint sequences x64positions; freeze candidates before opening; no tuning on this panel",
+  "native_capacity_control": "primitiveGeluTanh full3072hiddenwidth initialized exactlyfromnative read/write maps,1update; validateslanguage/execution notdiscovery",
+  "stopping": "All declared candidates terminal, then inspect train-heldout gap and runtime stages; do not silently enlarge budget after a negative result. Frozen learned-body transfer to layers2,3 only after discovery source saved, with fixedbodybits and separatelyfitmaps.",
+  "limits": [
+    "No Local acceptance yet",
+    "Existing6controls include retainedquerymatrix and blockoutputgains, not removedMLPweightresponses",
+    "Rankone down-edit family now supportedinlibrary and tested, not wired to this run",
+    "No matchedcomputeVPDcomparison",
+    "Finite restrictedgrammar, not universalalgorithmsearch"
+  ],
+  "source_commit": "1329f2105d01065a3dce3d0dfa14bf96dd48c7c9"
+}

@@ -1,0 +1,477 @@
+{
+  "excluded_scope": "baseline IDs remain available in separate default runs; default enumeration is unchanged",
+  "inventory_selection": {
+    "analyses": [
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": true
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": true
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": true,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 2,
+        "output_boundary_affine": true
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": true
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": true
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": true,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 1,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": true,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 2,
+        "output_boundary_affine": true
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 2,
+        "output_boundary_affine": true
+      },
+      {
+        "adjacent_affine_redundancy": true,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 2,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": true,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 3,
+        "output_boundary_affine": true
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": true
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": true,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 1,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": true,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 2,
+        "output_boundary_affine": true
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": true
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 2,
+        "output_boundary_affine": true
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": true
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": true,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 1,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": true,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 2,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": true,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 1,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": true,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": true,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 1,
+        "output_boundary_affine": false
+      },
+      {
+        "adjacent_affine_redundancy": false,
+        "boundary_affine_redundancy": false,
+        "has_interior_learned_sharing": false,
+        "input_boundary_affine": false,
+        "interior_learned_affine_expressions": 0,
+        "learned_affine_expressions": 0,
+        "output_boundary_affine": false
+      }
+    ],
+    "baseline_indices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      33,
+      34,
+      35,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45
+    ],
+    "interior_indices": [
+      15,
+      23,
+      32,
+      36
+    ],
+    "scope": "Declared syntactic interior-learned-sharing subinventory only. Every excluded original ID remains a baseline; no program rewriting, algebraic identification, fidelity pruning, or guarantee of reusable law. Source truncation remains explicit.",
+    "source_inventory_truncated": false
+  },
+  "require_interior_learned": true,
+  "selected_expression_ids": [
+    15
+  ]
+}

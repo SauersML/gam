@@ -1,0 +1,34 @@
+{
+  "arm": "untied",
+  "expression": {
+    "unary": [
+      "gelu_tanh",
+      {
+        "affine": {
+          "unary": [
+            "gelu_tanh",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "expression_id": 15,
+  "freeze_policy": "all proposal coefficients trainable",
+  "sharing_analysis": {
+    "adjacent_affine_redundancy": false,
+    "boundary_affine_redundancy": false,
+    "has_interior_learned_sharing": true,
+    "input_boundary_affine": false,
+    "interior_learned_affine_expressions": 1,
+    "learned_affine_expressions": 1,
+    "output_boundary_affine": false
+  },
+  "transfer": false,
+  "uses": [
+    0,
+    1
+  ]
+}

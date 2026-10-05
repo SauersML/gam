@@ -1,0 +1,28 @@
+{
+  "body_operator_map": {},
+  "declarations": {
+    "domains": [],
+    "parameters": 0,
+    "raw_slot_widths": [
+      768,
+      768
+    ]
+  },
+  "discovery_uses": [
+    0,
+    1
+  ],
+  "expression": {
+    "unary": [
+      "gelu_tanh",
+      {
+        "argument": 0
+      }
+    ]
+  },
+  "native_checkpoint_sha256": "155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552",
+  "pool_sha256": "d84d43ad0b3a6baabde6752ebc476f5aadd722c4228e293815d9fa6c62c6f8ff",
+  "scope": "fitted shared body source; pool boundary maps remain original initialization, NOT fitted discovery exports",
+  "source_candidate_sha256": "c99a964489ad1e3c5ad552e167d1f2eec4940aec901e55408162315719c9866d",
+  "width": 3072
+}

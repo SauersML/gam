@@ -1,0 +1,46 @@
+{
+  "arm": "shared",
+  "artifact_sha256": "e8cb89971870da74090be9aa7a6b07c51f0251679ab2b14e744098888c572855",
+  "body_frozen": false,
+  "body_graft_operator_map": {
+    "0": 111,
+    "1": 112
+  },
+  "c32": 2066751001,
+  "control_map_sha256": "204fc96861977f7080a4b58894ff0b19aa6dce0a1bed41e6497d1363a4545f05",
+  "expression_id": 32,
+  "id": "expression32-shared",
+  "native_initialization": false,
+  "native_initialization_scope": "primitive native-width capacity control, not discovery",
+  "sharing_analysis": {
+    "adjacent_affine_redundancy": false,
+    "boundary_affine_redundancy": false,
+    "has_interior_learned_sharing": true,
+    "input_boundary_affine": false,
+    "interior_learned_affine_expressions": 1,
+    "learned_affine_expressions": 1,
+    "output_boundary_affine": false
+  },
+  "stage_seconds": {
+    "canonical_after_fit": 15.796583787,
+    "canonical_before_fit": 15.616523922,
+    "fit": 186.730935569,
+    "graft": 0.083689768,
+    "structural_cost": 0.177482108
+  },
+  "status": "training_measured",
+  "trainable": [
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119,
+    120
+  ],
+  "training_kl": 0.2907328887552498,
+  "transfer": false
+}

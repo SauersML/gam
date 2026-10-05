@@ -1,0 +1,762 @@
+{
+  "expressions": [
+    {
+      "argument": 0
+    },
+    {
+      "unary": [
+        "gelu_tanh",
+        {
+          "argument": 0
+        }
+      ]
+    },
+    {
+      "affine": {
+        "argument": 0
+      }
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "argument": 0
+        }
+      ]
+    },
+    {
+      "unary": [
+        "gelu_tanh",
+        {
+          "unary": [
+            "gelu_tanh",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "unary": [
+          "gelu_tanh",
+          {
+            "argument": 0
+          }
+        ]
+      }
+    },
+    {
+      "unary": [
+        "gelu_tanh",
+        {
+          "affine": {
+            "argument": 0
+          }
+        }
+      ]
+    },
+    {
+      "affine": {
+        "affine": {
+          "argument": 0
+        }
+      }
+    },
+    {
+      "unary": [
+        "gelu_tanh",
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "binary": [
+          "multiply",
+          {
+            "argument": 0
+          },
+          {
+            "argument": 0
+          }
+        ]
+      }
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "unary": [
+            "gelu_tanh",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "affine": {
+            "argument": 0
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "unary": [
+        "gelu_tanh",
+        {
+          "unary": [
+            "gelu_tanh",
+            {
+              "unary": [
+                "gelu_tanh",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "unary": [
+          "gelu_tanh",
+          {
+            "unary": [
+              "gelu_tanh",
+              {
+                "argument": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "unary": [
+        "gelu_tanh",
+        {
+          "affine": {
+            "unary": [
+              "gelu_tanh",
+              {
+                "argument": 0
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "affine": {
+        "affine": {
+          "unary": [
+            "gelu_tanh",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "unary": [
+        "gelu_tanh",
+        {
+          "unary": [
+            "gelu_tanh",
+            {
+              "affine": {
+                "argument": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "unary": [
+          "gelu_tanh",
+          {
+            "affine": {
+              "argument": 0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "unary": [
+        "gelu_tanh",
+        {
+          "affine": {
+            "affine": {
+              "argument": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "affine": {
+        "affine": {
+          "affine": {
+            "argument": 0
+          }
+        }
+      }
+    },
+    {
+      "unary": [
+        "gelu_tanh",
+        {
+          "unary": [
+            "gelu_tanh",
+            {
+              "binary": [
+                "multiply",
+                {
+                  "argument": 0
+                },
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "unary": [
+          "gelu_tanh",
+          {
+            "binary": [
+              "multiply",
+              {
+                "argument": 0
+              },
+              {
+                "argument": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "unary": [
+        "gelu_tanh",
+        {
+          "affine": {
+            "binary": [
+              "multiply",
+              {
+                "argument": 0
+              },
+              {
+                "argument": 0
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "affine": {
+        "affine": {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "unary": [
+        "gelu_tanh",
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "unary": [
+                "gelu_tanh",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "binary": [
+          "multiply",
+          {
+            "argument": 0
+          },
+          {
+            "unary": [
+              "gelu_tanh",
+              {
+                "argument": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "unary": [
+        "gelu_tanh",
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "affine": {
+                "argument": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "binary": [
+          "multiply",
+          {
+            "argument": 0
+          },
+          {
+            "affine": {
+              "argument": 0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "unary": [
+        "gelu_tanh",
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "binary": [
+                "multiply",
+                {
+                  "argument": 0
+                },
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "binary": [
+          "multiply",
+          {
+            "argument": 0
+          },
+          {
+            "binary": [
+              "multiply",
+              {
+                "argument": 0
+              },
+              {
+                "argument": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "unary": [
+            "gelu_tanh",
+            {
+              "unary": [
+                "gelu_tanh",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "affine": {
+            "unary": [
+              "gelu_tanh",
+              {
+                "argument": 0
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "unary": [
+            "gelu_tanh",
+            {
+              "affine": {
+                "argument": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "affine": {
+            "affine": {
+              "argument": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "unary": [
+            "gelu_tanh",
+            {
+              "binary": [
+                "multiply",
+                {
+                  "argument": 0
+                },
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "affine": {
+            "binary": [
+              "multiply",
+              {
+                "argument": 0
+              },
+              {
+                "argument": 0
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "unary": [
+                "gelu_tanh",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "affine": {
+                "argument": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "binary": [
+                "multiply",
+                {
+                  "argument": 0
+                },
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "unary": [
+            "gelu_tanh",
+            {
+              "argument": 0
+            }
+          ]
+        },
+        {
+          "unary": [
+            "gelu_tanh",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "unary": [
+            "gelu_tanh",
+            {
+              "argument": 0
+            }
+          ]
+        },
+        {
+          "affine": {
+            "argument": 0
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "unary": [
+            "gelu_tanh",
+            {
+              "argument": 0
+            }
+          ]
+        },
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "affine": {
+            "argument": 0
+          }
+        },
+        {
+          "affine": {
+            "argument": 0
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        },
+        {
+          "affine": {
+            "argument": 0
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        },
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "intermediate_expressions": 46,
+  "truncated": false
+}

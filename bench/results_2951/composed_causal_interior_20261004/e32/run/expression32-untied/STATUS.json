@@ -1,0 +1,50 @@
+{
+  "arm": "untied",
+  "artifact_sha256": "4bb7b7071e39537f6535485cd80837cd02d72e45ab81590d5d96706502590fa4",
+  "body_frozen": false,
+  "body_graft_operator_map": {
+    "0": 111,
+    "1": 112,
+    "2": 117,
+    "3": 118
+  },
+  "c32": 2142297864,
+  "control_map_sha256": "204fc96861977f7080a4b58894ff0b19aa6dce0a1bed41e6497d1363a4545f05",
+  "expression_id": 32,
+  "id": "expression32-untied",
+  "native_initialization": false,
+  "native_initialization_scope": "primitive native-width capacity control, not discovery",
+  "sharing_analysis": {
+    "adjacent_affine_redundancy": false,
+    "boundary_affine_redundancy": false,
+    "has_interior_learned_sharing": true,
+    "input_boundary_affine": false,
+    "interior_learned_affine_expressions": 1,
+    "learned_affine_expressions": 1,
+    "output_boundary_affine": false
+  },
+  "stage_seconds": {
+    "canonical_after_fit": 15.85779102,
+    "canonical_before_fit": 16.1480768,
+    "fit": 188.002501514,
+    "graft": 0.024568703,
+    "structural_cost": 0.192425349
+  },
+  "status": "training_measured",
+  "trainable": [
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119,
+    120,
+    121,
+    122
+  ],
+  "training_kl": 0.26221160949303896,
+  "transfer": false
+}
