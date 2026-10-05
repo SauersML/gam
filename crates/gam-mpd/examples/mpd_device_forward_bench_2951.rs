@@ -6,11 +6,13 @@
 //! `TRAIN` is an engine export (`~/mpd-data/engine/vpd4l_e2e_train`). On its first `sequences`
 //! sequences (8) of `context` positions (512), the program up to the head's hidden node is
 //! compiled in resident-value mode (the fitter's prefix) and timed over `reps` forwards (5), each
-//! forward also followed by a reverse pass from the hidden node to the embedding, after one
-//! warm-up. `arithmetic` (`f64`, `tf32`) picks the products' arithmetic; `cpu=0` skips the CPU
-//! reference. One JSON object goes to `OUT/bench.json` and stdout.
+//! forward also followed by a reverse pass from the hidden node to the embedding (`reverse=0`
+//! skips it), after one warm-up. `storage` (`f64`, `f32`) picks how the device holds tensors and
+//! `arithmetic` (`f64`, `f32`, `tf32`) the products' arithmetic; `fused=0` runs sibling heads node
+//! by node (`DeviceProgram::unfuse`); `cpu=0` skips the CPU reference. One JSON object goes to
+//! `OUT/bench.json` and stdout.
 
-use gam_gpu::{GpuPolicy, tensor::{Arithmetic, Device}};
+use gam_gpu::{GpuPolicy, tensor::{Arithmetic, Device, Storage}};
 use gam_mpd::device_program::DeviceProgram;
 use gam_mpd::import::import_language_model;
 use gam_mpd::operator_program::Node;
@@ -28,6 +30,7 @@ fn main() -> Result<(), String> {
     }
     let (train, out) = (PathBuf::from(&args[1]), PathBuf::from(&args[2]));
     let (mut sequences, mut context, mut reps, mut cpu, mut arithmetic) = (8usize, 512usize, 5usize, true, Arithmetic::F64);
+    let (mut storage, mut fused, mut reverse) = (Storage::F64, true, true);
     for pair in &args[3..] {
         let (key, value) = pair.split_once('=').ok_or_else(|| format!("{pair}: not KEY=VALUE"))?;
         let count = || value.parse::<usize>().map_err(|e| format!("{key}: {e}"));
@@ -36,7 +39,10 @@ fn main() -> Result<(), String> {
             "context" => context = count()?,
             "reps" => reps = count()?.max(1),
             "cpu" => cpu = count()? != 0,
-            "arithmetic" => arithmetic = match value { "f64" => Arithmetic::F64, "tf32" => Arithmetic::Tf32, other => return Err(format!("arithmetic {other}")) },
+            "arithmetic" => arithmetic = match value { "f64" => Arithmetic::F64, "f32" => Arithmetic::F32, "tf32" => Arithmetic::Tf32, other => return Err(format!("arithmetic {other}")) },
+            "storage" => storage = match value { "f64" => Storage::F64, "f32" => Storage::F32, other => return Err(format!("storage {other}")) },
+            "fused" => fused = count()? != 0,
+            "reverse" => reverse = count()? != 0,
             other => return Err(format!("unknown key {other}")),
         }
     }
@@ -55,15 +61,23 @@ fn main() -> Result<(), String> {
     prefix.output = hidden;
     // The reverse pass ends at the embedding (the first node an affine term reads a feature into).
     let first = prefix.nodes.iter().position(|n| matches!(n, Node::Affine { .. })).ok_or("no affine node")?;
-    let device = Device::accelerator(GpuPolicy::Required).map_err(|e| e.to_string())?.ok_or("no accelerator")?;
+    let device = match storage {
+        Storage::F64 => Device::accelerator(GpuPolicy::Required),
+        Storage::F32 => Device::single_precision(GpuPolicy::Required),
+    }
+    .map_err(|e| e.to_string())?
+    .ok_or("no accelerator")?;
     let started = Instant::now();
     let mut program = DeviceProgram::compile_values(&device, &prefix)?;
     program.set_arithmetic(arithmetic);
+    if !fused {
+        program.unfuse();
+    }
     let compile_seconds = started.elapsed().as_secs_f64();
     let width = program.widths()[hidden];
     let seed = Array2::from_shape_fn((family.rows, width), |(r, c)| (((r * 7 + c * 13) % 17) as f64 - 8.0) / 64.0);
     let seed = device.upload(seed.view()).map_err(|e| e.to_string())?;
-    let (mut forward, mut reverse) = (Vec::new(), Vec::new());
+    let (mut forward_seconds, mut reverse_seconds) = (Vec::new(), Vec::new());
     let mut values = None;
     for rep in 0..=reps {
         device.synchronize().map_err(|e| e.to_string())?;
@@ -72,15 +86,20 @@ fn main() -> Result<(), String> {
         device.synchronize().map_err(|e| e.to_string())?;
         let f = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let seeds = BTreeMap::from([(hidden, device.copy(&seed).map_err(|e| e.to_string())?)]);
-        let kept = program.vjp_values_seeded(&trace, seeds, &[first], arithmetic)?;
+        let kept = if reverse {
+            let seeds = BTreeMap::from([(hidden, device.copy(&seed).map_err(|e| e.to_string())?)]);
+            Some(program.vjp_values_seeded(&trace, seeds, &[first], arithmetic)?)
+        } else {
+            None
+        };
         device.synchronize().map_err(|e| e.to_string())?;
         let r = t.elapsed().as_secs_f64();
         if rep > 0 {
-            forward.push(f);
-            reverse.push(r);
+            forward_seconds.push(f);
+            reverse_seconds.push(r);
         } else {
-            values = Some((device.download(trace.value(hidden)?).map_err(|e| e.to_string())?, device.download(&kept[&first]).map_err(|e| e.to_string())?));
+            let cotangent = kept.map(|k| device.download(&k[&first])).transpose().map_err(|e| e.to_string())?;
+            values = Some((device.download(trace.value(hidden)?).map_err(|e| e.to_string())?, cotangent));
         }
     }
     let (values, cotangent) = values.ok_or("no warm-up pass")?;
@@ -95,7 +114,7 @@ fn main() -> Result<(), String> {
             (a - b).iter().fold(0.0_f64, |m, v| m.max(v.abs())) / scale
         };
         let expected = reference[first].as_ref().ok_or("no reference cotangent")?;
-        json!({ "cpu_seconds": cpu_seconds, "hidden_max_relative": relative(&values, &trace.values[hidden]), "cotangent_max_relative": relative(&cotangent, expected) })
+        json!({ "cpu_seconds": cpu_seconds, "hidden_max_relative": relative(&values, &trace.values[hidden]), "cotangent_max_relative": cotangent.map(|c| relative(&c, expected)) })
     } else {
         json!(null)
     };
@@ -105,11 +124,13 @@ fn main() -> Result<(), String> {
         "rows": family.rows,
         "nodes": prefix.nodes.len(),
         "arithmetic": format!("{arithmetic:?}"),
+        "storage": format!("{storage:?}"),
+        "fused_groups": program.fused_groups(),
         "compile_seconds": compile_seconds,
-        "forward_seconds": forward.clone(),
-        "reverse_seconds": reverse.clone(),
-        "forward_median": median(&mut forward),
-        "reverse_median": median(&mut reverse),
+        "forward_seconds": forward_seconds.clone(),
+        "reverse_seconds": reverse_seconds.clone(),
+        "forward_median": median(&mut forward_seconds),
+        "reverse_median": median(&mut reverse_seconds),
         "parity": parity,
     });
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;

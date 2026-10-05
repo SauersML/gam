@@ -576,6 +576,14 @@ impl DeviceProgram {
         self.fused.iter().filter(|g| g.live).count()
     }
 
+    /// Run every group of sibling heads node by node from now on (the same values, rounded in
+    /// another order; for timing and parity against the fused computation).
+    pub fn unfuse(&mut self) {
+        for group in &mut self.fused {
+            group.live = false;
+        }
+    }
+
     fn head_of(program: &OperatorProgram) -> Result<Head, String> {
         let logits = match &program.nodes[program.output] {
             Node::Readout { input, basis } => {
