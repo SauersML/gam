@@ -320,9 +320,9 @@ fn group_variance(cells: &[(usize, Vec<usize>, std::ops::Range<usize>)], posteri
 }
 
 impl Mixture {
-    /// The mixture prior of every MLP function's gate and every head with a key of its own of
-    /// `explanation`, with `width` candidates each, stepped with `steps`; the candidates are chosen
-    /// by the first epoch ([`PriorTerm::epoch`]).
+    /// The mixture prior of every MLP block and every key-value group's own query–key maps and
+    /// value map of `explanation`, with `width` candidates each, stepped with `steps`; the
+    /// candidates are chosen by the first epoch ([`PriorTerm::epoch`]).
     pub fn new(explanation: &Explanation, width: usize, steps: Steps) -> Result<Self, String> {
         let program = &explanation.artifact.program;
         let position = |op: usize| explanation.trainable.iter().position(|t| *t == op).ok_or_else(|| format!("operator {op} is not trainable"));
