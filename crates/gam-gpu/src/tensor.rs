@@ -1981,9 +1981,9 @@ impl Device {
     /// One Adam step of the factorized Gaussian posterior `N(μ, exp(s)²)` whose sample
     /// [`Device::reparameterize`] drew under the same `(key, stream)`, and each entry's new
     /// `(1, μ² + exp(2s), 2s)` added into its group's row of `sums` (groups × 3, the posterior's
-    /// storage). `gradient` (this device's storage) is the data term's gradient at the sample;
-    /// with `v` the entry's group variance (`variance`, groups × 1), the objective's derivatives are
-    /// `g + μ / v` in `μ` and `g ε σ + σ² / v − 1` in `s` (`σ = exp(s)`, the empirical-Bayes
+    /// storage). `gradient` (this device's storage) times `step.gradient_scale` is the data term's
+    /// gradient `g` at the sample; with `v` the entry's group variance (`variance`, groups × 1),
+    /// the objective's derivatives are `g + μ / v` in `μ` and `g ε σ + σ² / v − 1` in `s` (`σ = exp(s)`, the empirical-Bayes
     /// group prior's divergence `½ (n ln v − Σ 2s)`), each taking Adam's step at its own rate with
     /// its moments (`moments`: `μ`'s first and second, then `s`'s). A removed entry (`s = −∞`)
     /// is left alone and adds nothing to `sums`.
@@ -2025,10 +2025,10 @@ impl Device {
                         continue;
                     }
                     let (g, v) = (ids[i] as usize, var[ids[i] as usize]);
-                    let (mu, sd) = (means[i], log_sds[i].exp());
+                    let (mu, sd, data) = (means[i], log_sds[i].exp(), step.gradient_scale * gv[i]);
                     let e = f64::from(posterior_normal(step.key, step.stream, i as u64));
-                    adam(&mut means[i], &mut mm[i], &mut mv[i], gv[i] + mu / v, step.mean_rate);
-                    adam(&mut log_sds[i], &mut sm[i], &mut sv[i], gv[i] * e * sd + sd * sd / v - 1.0, step.log_sd_rate);
+                    adam(&mut means[i], &mut mm[i], &mut mv[i], data + mu / v, step.mean_rate);
+                    adam(&mut log_sds[i], &mut sm[i], &mut sv[i], data * e * sd + sd * sd / v - 1.0, step.log_sd_rate);
                     totals[3 * g] += 1.0;
                     totals[3 * g + 1] += means[i] * means[i] + (2.0 * log_sds[i]).exp();
                     totals[3 * g + 2] += 2.0 * log_sds[i];
@@ -2339,10 +2339,12 @@ enum RmsMode {
     Tangent,
 }
 
-/// One step of [`Device::posterior_adam`]: Adam's rates in `μ` and in `s`, decays and `ε`, the
-/// step's number from 1, and the `(key, stream)` of the sample whose gradient it takes.
+/// One step of [`Device::posterior_adam`]: the data term's weight on the given gradient, Adam's
+/// rates in `μ` and in `s`, decays and `ε`, the step's number from 1, and the `(key, stream)` of
+/// the sample whose gradient it takes.
 #[derive(Clone, Copy, Debug)]
 pub struct PosteriorStep {
+    pub gradient_scale: f64,
     pub mean_rate: f64,
     pub log_sd_rate: f64,
     pub beta1: f64,
@@ -3120,7 +3122,7 @@ __device__ void group_add(double* sums, unsigned int g, bool live, double a, dou
 #define WARP_STRIDE(i, n) for (u64 base_ = (u64)blockIdx.x * blockDim.x, i = base_ + threadIdx.x; base_ < (n); base_ += (u64)gridDim.x * blockDim.x, i = base_ + threadIdx.x)
 
 template <typename T>
-__device__ void posterior_adam_body(u64 n, u64 count, u64 key, u64 stream, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
+__device__ void posterior_adam_body(u64 n, u64 count, u64 key, u64 stream, double scale, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
     double c1, double c2, const T* gradient, const unsigned int* groups, const double* variance,
     double* mean, double* log_sd, double* mm, double* mv, double* sm, double* sv, double* sums) {
     WARP_STRIDE(i, n) {
@@ -3129,7 +3131,7 @@ __device__ void posterior_adam_body(u64 n, u64 count, u64 key, u64 stream, doubl
         double a = 0.0, b = 0.0, c = 0.0;
         if (live) {
             double v = variance[g], mu = mean[i], s = log_sd[i], sd = exp(s);
-            double e = (double)posterior_normal(key, stream, i), gi = (double)gradient[i];
+            double e = (double)posterior_normal(key, stream, i), gi = scale * (double)gradient[i];
             double gm = gi + mu / v, gs = gi * e * sd + sd * sd / v - 1.0;
             double m1 = beta1 * mm[i] + (1.0 - beta1) * gm, v1 = beta2 * mv[i] + (1.0 - beta2) * gm * gm;
             double m2 = beta1 * sm[i] + (1.0 - beta1) * gs, v2 = beta2 * sv[i] + (1.0 - beta2) * gs * gs;
@@ -3143,16 +3145,16 @@ __device__ void posterior_adam_body(u64 n, u64 count, u64 key, u64 stream, doubl
     }
 }
 
-extern "C" __global__ void posterior_adam_f64(u64 n, u64 count, u64 key, u64 stream, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
+extern "C" __global__ void posterior_adam_f64(u64 n, u64 count, u64 key, u64 stream, double scale, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
     double c1, double c2, const double* gradient, const unsigned int* groups, const double* variance,
     double* mean, double* log_sd, double* mm, double* mv, double* sm, double* sv, double* sums) {
-    posterior_adam_body<double>(n, count, key, stream, mean_rate, log_sd_rate, beta1, beta2, epsilon, c1, c2, gradient, groups, variance, mean, log_sd, mm, mv, sm, sv, sums);
+    posterior_adam_body<double>(n, count, key, stream, scale, mean_rate, log_sd_rate, beta1, beta2, epsilon, c1, c2, gradient, groups, variance, mean, log_sd, mm, mv, sm, sv, sums);
 }
 
-extern "C" __global__ void posterior_adam_f32(u64 n, u64 count, u64 key, u64 stream, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
+extern "C" __global__ void posterior_adam_f32(u64 n, u64 count, u64 key, u64 stream, double scale, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
     double c1, double c2, const float* gradient, const unsigned int* groups, const double* variance,
     double* mean, double* log_sd, double* mm, double* mv, double* sm, double* sv, double* sums) {
-    posterior_adam_body<float>(n, count, key, stream, mean_rate, log_sd_rate, beta1, beta2, epsilon, c1, c2, gradient, groups, variance, mean, log_sd, mm, mv, sm, sv, sums);
+    posterior_adam_body<float>(n, count, key, stream, scale, mean_rate, log_sd_rate, beta1, beta2, epsilon, c1, c2, gradient, groups, variance, mean, log_sd, mm, mv, sm, sv, sums);
 }
 
 extern "C" __global__ void group_moments(u64 n, u64 count, const double* mean, const double* log_sd, const unsigned int* groups, double* sums) {
@@ -4710,7 +4712,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let name = if gradient.storage() == Storage::F32 { "posterior_adam_f32" } else { "posterior_adam_f64" };
             let (f, count) = (self.function(name)?, variance.len() as u64);
             let mut builder = self.stream.launch_builder(&f);
-            builder.arg(&n).arg(&count).arg(&step.key).arg(&step.stream).arg(&step.mean_rate).arg(&step.log_sd_rate).arg(&step.beta1).arg(&step.beta2).arg(&step.epsilon).arg(&c1).arg(&c2);
+            builder.arg(&n).arg(&count).arg(&step.key).arg(&step.stream).arg(&step.gradient_scale).arg(&step.mean_rate).arg(&step.log_sd_rate).arg(&step.beta1).arg(&step.beta2).arg(&step.epsilon).arg(&c1).arg(&c2);
             match &gradient.data {
                 Data::Cuda32(g) => builder.arg(g),
                 Data::Cuda(g) => builder.arg(g),
@@ -5952,7 +5954,7 @@ inline float posterior_normal(uint2 key, uint2 stream, uint index) {
 }
 
 // The parameters of the posterior kernels (Rust `Posterior`).
-struct Posterior { uint n; uint count; uint2 key; uint2 stream; float mean_rate; float log_sd_rate; float beta1; float beta2; float epsilon; float c1; float c2; uint pad; };
+struct Posterior { uint n; uint count; uint2 key; uint2 stream; float scale; float mean_rate; float log_sd_rate; float beta1; float beta2; float epsilon; float c1; float c2; };
 
 kernel void t_reparameterize(device const float* mean [[buffer(0)]], device const float* log_sd [[buffer(1)]], device float* theta [[buffer(2)]],
                              constant Posterior& p [[buffer(3)]], uint i [[thread_position_in_grid]]) {
@@ -5987,7 +5989,7 @@ kernel void t_posterior_adam(device const float* gradient [[buffer(0)]], device 
     float a = 0.0f, b = 0.0f, c = 0.0f;
     if (live) {
         float v = variance[g], mu = mean[i], s = log_sd[i], sd = exp(s);
-        float e = posterior_normal(p.key, p.stream, i), gi = gradient[i];
+        float e = posterior_normal(p.key, p.stream, i), gi = p.scale * gradient[i];
         float gm = gi + mu / v, gs = gi * e * sd + sd * sd / v - 1.0f;
         float m1 = p.beta1 * mm[i] + (1.0f - p.beta1) * gm, v1 = p.beta2 * mv[i] + (1.0f - p.beta2) * gm * gm;
         float m2 = p.beta1 * sm[i] + (1.0f - p.beta1) * gs, v2 = p.beta2 * sv[i] + (1.0f - p.beta2) * gs * gs;
@@ -6078,6 +6080,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
         count: u32,
         key: [u32; 2],
         stream: [u32; 2],
+        scale: f32,
         mean_rate: f32,
         log_sd_rate: f32,
         beta1: f32,
@@ -6085,7 +6088,6 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
         epsilon: f32,
         c1: f32,
         c2: f32,
-        pad: u32,
     }
 
     /// A 64-bit counter word as MSL's `uint2` (low half first).
@@ -6405,6 +6407,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
                 count: u32_of(variance.len())?,
                 key: halves(step.key),
                 stream: halves(step.stream),
+                scale: step.gradient_scale as f32,
                 mean_rate: step.mean_rate as f32,
                 log_sd_rate: step.log_sd_rate as f32,
                 beta1: step.beta1 as f32,

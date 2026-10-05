@@ -50,7 +50,7 @@ fn case() -> Case {
         }
     }
     let moments = [matrix(rows, cols, 3, 0.1, 0.0), matrix(rows, cols, 4, 0.01, 0.02), matrix(rows, cols, 5, 0.1, 0.0), matrix(rows, cols, 6, 0.01, 0.02)];
-    let step = PosteriorStep { mean_rate: 1e-3, log_sd_rate: 1e-2, beta1: 0.9, beta2: 0.999, epsilon: 1e-8, step: 7, key: 0x1234_5678_9abc_def0, stream: 42 };
+    let step = PosteriorStep { gradient_scale: 1.5, mean_rate: 1e-3, log_sd_rate: 1e-2, beta1: 0.9, beta2: 0.999, epsilon: 1e-8, step: 7, key: 0x1234_5678_9abc_def0, stream: 42 };
     Case { mean, log_sd, moments, gradient: matrix(rows, cols, 7, 3.0, 0.0), groups, count: 8, step }
 }
 
@@ -81,7 +81,7 @@ fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 
         if s == f64::NEG_INFINITY {
             continue;
         }
-        let (v, sd, gr) = (variance[*g as usize], s.exp(), c.gradient[at]);
+        let (v, sd, gr) = (variance[*g as usize], s.exp(), c.step.gradient_scale * c.gradient[at]);
         let gradients = [gr + mu / v, gr * e * sd + sd * sd / v - 1.0];
         for (k, (value, rate)) in [(&mut mean, c.step.mean_rate), (&mut log_sd, c.step.log_sd_rate)].into_iter().enumerate() {
             let m = b1 * moments[2 * k][at] + (1.0 - b1) * gradients[k];

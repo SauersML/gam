@@ -54,6 +54,8 @@ pub mod resident_causal_fit;
 // The explanation as a library of learned functions, fitted end to end by variational MDL.
 pub mod library_mdl;
 pub mod library_readout;
+// Its posterior resident on the device: sample, Adam step and group divergences without transfers.
+pub mod device_posterior;
 pub mod composed_rule_search;
 pub mod program_regions;
 pub mod program_joint_regions;
