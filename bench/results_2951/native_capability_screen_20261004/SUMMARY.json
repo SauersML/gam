@@ -5,7 +5,7 @@
   "limits": [
     "Absence on this panel is not proof of absence on all tasks.",
     "The eight paraphrase records contain only four unique contexts.",
-    "Native operational Rust f64; these files alone do not supply independent HF forward parity.",
+    "Native operational Rust f64. Pythia has an independent stored HF reference comparison on128positions; this does not certify all prompts or interventions.",
     "Predicting the correct member of a two-token comparison is weaker than accurate next-token generation."
   ],
   "files_sha256": {
@@ -14,6 +14,15 @@
     "vpd4l/SUMMARY.json": "b793537948493da28ecf26a2095f746a199a3d10b8560579d28aca0a80631e65",
     "pythia160/FIXTURES.json": "ad259df15aa3ef9db2f8843973d1f6e980844e70e567caae4e4bd1a93771a885",
     "pythia160/HOST.json": "66941ca6b10e79dc2d2bc7b6cfef06a0895f422a061b10f7e7f7bf00e33d55b8",
-    "pythia160/SUMMARY.json": "fca0df72edc7daafdc867dfd23adff1f750c85fc157735a4682d1bb7d66a51ae"
+    "pythia160/SUMMARY.json": "fca0df72edc7daafdc867dfd23adff1f750c85fc157735a4682d1bb7d66a51ae",
+    "pythia160/REFERENCE_DISTRIBUTION.json": "8689871a6b1489cd1d51c5cb064a9ae4fe984e628cf63ed721089bcdeb98c28a"
+  },
+  "native_reference": {
+    "scope": "Pythia160 native Rust f64 compared with stored HF FP32 logits across first sequence positions0..127, including full causal attention. Different prompts from capability screen.",
+    "top1_agreement": "128/128",
+    "max_kl": 1.3155e-06,
+    "mean_kl": 9.4217e-08,
+    "max_absolute_logit_gap": 0.01398237,
+    "interpretation": "Strong measured distribution agreement. No exact numerical equality or full neural certificate."
   }
 }
