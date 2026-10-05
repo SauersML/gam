@@ -137,7 +137,7 @@ fn costs(args: &[String]) -> Result<(), String> {
     drop(imported);
     let layers = layer_nodes(&native, layer_count)?;
     let explanation = library_mdl::explanation(&native, &layers)?;
-    let posterior = library_readout::checkpoint_posterior(&explanation, Path::new(checkpoint))?;
+    let posterior = library_mdl::checkpoint_posterior(&explanation, Path::new(checkpoint))?;
     let costs = library_readout::function_costs(&explanation, &posterior);
     // Totals count each prior group once (a key and value group may serve several query heads).
     let by_layer = library_readout::layer_costs(&explanation, &posterior);
