@@ -97,11 +97,13 @@
 //!
 //! # Evaluation
 //!
-//! After every epoch a fixed subset of the held-out sequences (the first batch of them) is scored
-//! ([`HeldOut`]), and all of them only while the per-epoch evaluations so far, with the last full
-//! evaluation's time, stay within [`EVALUATION_SHARE`] of the training time so far; the fit ends
-//! with a full evaluation. Per base, at every hybrid size, one clean and one patched experiment
-//! (sources among the held-out sequences). `F` per token is the
+//! At the start and after every epoch a fixed subset of the held-out sequences (the first batch of
+//! them) is scored ([`HeldOut`]), and all of them only while the evaluations so far, with the last
+//! full evaluation's time (estimated from the subset's until one is made), stay within
+//! [`EVALUATION_SHARE`] of the training time so far; the fit ends with a full evaluation. The
+//! held-out experiments are a fixed sample from the training distribution (`interchange::sample`,
+//! from each held-out batch's seed): per base one clean and one patched experiment, sources among
+//! the held-out sequences. `F` per token is the
 //! held-out data term at one weight sample per batch plus the description spread over the training
 //! experiments' scored tokens; the divergences per experiment kind are taken at the posterior mean.
 //! Per layer it counts the surviving heads and MLP functions and, per token, the functions whose
@@ -824,7 +826,7 @@ pub struct HeldOut {
     pub choice_bits: f64,
     #[serde(default)]
     pub prior_bits: f64,
-    /// At the posterior mean: clean and patched experiments per hybrid size `k = 1..=2L` (`k = 2L`
+    /// At the posterior mean: the sample's clean and patched experiments per hybrid size `k = 1..=2L` (`k = 2L`
     /// is the explanation alone), and the patched ones by kind: one read variable, or a joint
     /// patch of several.
     pub clean: Vec<Option<f64>>,
@@ -889,8 +891,8 @@ pub struct Report {
     pub families: BTreeMap<String, usize>,
     pub groups: usize,
     pub parameters: usize,
-    /// The held-out evaluation at the starting point and of the finished fit, on every held-out
-    /// sequence.
+    /// The held-out evaluation at the starting point, on the fixed subset, and of the finished fit,
+    /// on every held-out sequence.
     pub start: HeldOut,
     pub end: HeldOut,
     pub epochs: Vec<Epoch>,
@@ -1203,6 +1205,18 @@ impl Mean {
     }
 }
 
+/// The held-out batches of `sequences` and their experiments: a fixed sample from the training
+/// distribution, one clean and one patched experiment per base, drawn from each batch's seed.
+fn held_out_experiments(scorer: &Scorer, sequences: &[Vec<u32>], settings: &Settings) -> Result<Vec<(Draw, Vec<Experiment>)>, String> {
+    draws(sequences.len(), settings.batch_sequences, settings.seed)?
+        .into_iter()
+        .map(|draw| {
+            let experiments = scorer.experiments(&draw, sequences)?;
+            Ok((draw, experiments))
+        })
+        .collect()
+}
+
 /// The held-out evaluation of `posterior` (held on the host, and as `device_posterior` on the
 /// device) on `sequences` (module note); `tokens` is `N`.
 #[allow(clippy::too_many_arguments)]
@@ -1217,23 +1231,11 @@ fn held_out(
     prior: Option<&mut (dyn PriorTerm + 'static)>,
 ) -> Result<HeldOut, String> {
     let blocks = 2 * scorer.layers();
-    let variables = scorer.protocol.variables().to_vec();
     let (mut clean, mut patched) = (vec![Mean::default(); blocks], vec![Mean::default(); blocks]);
     let (mut read, mut joint, mut sampled, mut adaptive) = (Mean::default(), Mean::default(), Mean::default(), Mean::default());
     let size = |e: &Experiment| e.explained.iter().filter(|x| **x).count();
-    for (b, draw) in draws(sequences.len(), settings.batch_sequences, settings.seed)?.iter().enumerate() {
+    for (b, (draw, experiments)) in held_out_experiments(scorer, sequences, settings)?.into_iter().enumerate() {
         let batch = draw.batch(sequences)?;
-        // Every hybrid size, each with one clean and one patched experiment per base.
-        let mut rng = StdRng::seed_from_u64(draw.seed);
-        let mut experiments = Vec::with_capacity(2 * blocks * draw.bases.len());
-        for k in 1..=blocks {
-            let drawn = interchange::sample(&mut rng, draw.bases.len(), &variables, blocks, batch.length())?;
-            // A base's patched experiment shares its unpatched experiment's hybrid.
-            for pair in drawn.chunks(2) {
-                let explained = interchange::hybrid_of(&mut rng, blocks, k);
-                experiments.extend(pair.iter().map(|e| Experiment { explained: explained.clone(), ..e.clone() }));
-            }
-        }
         let key = format!("held_{}_{b}", sequences.len());
         let (bits, _) = scorer.score_device(device_posterior, &batch, &experiments, None, &key, false)?;
         for (e, bits) in experiments.iter().zip(&bits) {
@@ -1368,7 +1370,7 @@ struct Progress {
     settings: Settings,
     tokens: usize,
     shapes: Vec<(usize, usize)>,
-    /// The held-out evaluation at the starting point.
+    /// The held-out evaluation at the starting point, on the fixed subset.
     start: Option<HeldOut>,
     /// The next epoch, and the optimizer steps taken.
     epoch: usize,
@@ -1754,9 +1756,13 @@ pub fn fit(
         prior.epoch(explanation, &posterior)?;
     }
     if progress.start.is_none() {
+        // The start obeys the budget too: the subset now; the full set's time, until a full
+        // evaluation is made, estimated from the subset's in proportion to the sequences.
         let timed = Instant::now();
-        let start = held_out(&mut scorer, explanation, &posterior, &device_posterior, held, settings, tokens, prior.as_deref_mut())?;
-        progress.full_seconds = timed.elapsed().as_secs_f64();
+        let start = held_out(&mut scorer, explanation, &posterior, &device_posterior, subset, settings, tokens, prior.as_deref_mut())?;
+        let seconds = timed.elapsed().as_secs_f64();
+        progress.evaluation_seconds += seconds;
+        progress.full_seconds = seconds * held.len() as f64 / subset.len() as f64;
         log::info!("library start: {start:?}");
         progress.start = Some(start);
         device_posterior.values_into(&mut posterior)?;
@@ -2826,6 +2832,33 @@ mod tests {
                 })
                 .collect();
             assert!(made.iter().all(|m| *m == made[0]), "batch {b}: the directions and targets");
+        }
+    }
+
+    #[test]
+    fn the_held_out_sample_follows_the_training_weights() {
+        // Held-out experiments are a sample of the training distribution, not an enumeration of
+        // hybrid sizes: one clean and one patched experiment per base, each family's count within
+        // five standard deviations of its stated weight (four blocks: P alone 1/2 + 1/2 * 1/4;
+        // attention and MLP single reads 1/4 each; joint reads 1/2).
+        let (native, layers, _, sequences) = tiny("library_held_out_sample", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let settings = settings();
+        let scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, "tiny", None).unwrap();
+        let held: Vec<Vec<u32>> = sequences.iter().cycle().take(2000).cloned().collect();
+        let sampled = held_out_experiments(&scorer, &held, &settings).unwrap();
+        let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for (draw, experiments) in &sampled {
+            assert_eq!(experiments.len(), 2 * draw.bases.len());
+            for (family, count) in interchange::census(experiments, scorer.protocol.variables()) {
+                *counts.entry(family).or_default() += count;
+            }
+        }
+        let n = held.len() as f64;
+        let blocks = 2.0 * layers.len() as f64;
+        for (family, p) in [("clean_alone", 0.5 + 0.5 / blocks), ("read_attention", 0.25), ("read_mlp", 0.25), ("read_joint", 0.5)] {
+            let (mean, sd) = (n * p, (n * p * (1.0 - p)).sqrt());
+            assert!((counts[family] as f64 - mean).abs() <= 5.0 * sd, "{family}: {} against {mean} ± {sd}", counts[family]);
         }
     }
 }
