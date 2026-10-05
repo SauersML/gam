@@ -1128,6 +1128,66 @@ impl PriorTerm for Mixture {
     }
 }
 
+/// Prior terms over disjoint targets as one term of `F` (`library_mdl::fit` takes one): the
+/// blocks' mixture and the bodies' (`library_bodies::BodyMixture`), each choosing, sampling and
+/// learning on its own; their values, gradients and costs add.
+pub struct Priors(pub Vec<Box<dyn PriorTerm>>);
+
+impl PriorTerm for Priors {
+    fn operators(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = self.0.iter().flat_map(|p| p.operators()).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    fn epoch(&mut self, explanation: &Explanation, posterior: &Posterior) -> Result<(), String> {
+        self.0.iter_mut().try_for_each(|p| p.epoch(explanation, posterior))
+    }
+
+    fn sample(&mut self, posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String> {
+        let mut total = 0.0;
+        let mut gradient: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+        for prior in &mut self.0 {
+            let own: BTreeMap<usize, Array2<f64>> = prior.operators().into_iter().map(|i| Ok((i, theta.get(&i).ok_or("an operator's sample")?.clone()))).collect::<Result<_, String>>()?;
+            let (value, part) = prior.sample(posterior, &own, learn)?;
+            total += value;
+            for (i, g) in part {
+                match gradient.get_mut(&i) {
+                    Some(sum) => *sum += &g,
+                    None => {
+                        gradient.insert(i, g);
+                    }
+                }
+            }
+        }
+        Ok((total, gradient))
+    }
+
+    fn cost(&self, posterior: &Posterior) -> Result<f64, String> {
+        self.0.iter().map(|p| p.cost(posterior)).sum()
+    }
+
+    fn save(&self) -> Result<serde_json::Value, String> {
+        Ok(serde_json::Value::Array(self.0.iter().map(|p| p.save()).collect::<Result<_, _>>()?))
+    }
+
+    fn load(&mut self, value: &serde_json::Value) -> Result<(), String> {
+        let states = value.as_array().filter(|a| a.len() == self.0.len()).ok_or("a checkpoint's prior terms of another count")?;
+        // Every state is checked against a copy first, so a rejected checkpoint changes nothing.
+        let saved: Vec<serde_json::Value> = self.0.iter().map(|p| p.save()).collect::<Result<_, _>>()?;
+        for (at, (prior, state)) in self.0.iter_mut().zip(states).enumerate() {
+            if let Err(e) = prior.load(state) {
+                for (prior, before) in self.0.iter_mut().zip(&saved).take(at) {
+                    prior.load(before)?;
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1470,6 +1530,44 @@ mod tests {
             let found = gradient[&i][entry];
             assert!((found - central).abs() <= 1e-6 * (1.0 + central.abs()), "operator {i} {entry:?}: {found} against {central}");
         }
+    }
+
+    #[test]
+    fn prior_terms_add_their_values_gradients_and_costs() {
+        let (explanation, posterior, mut first) = head_fixture("library_mixture_priors");
+        first.choose(&explanation, &posterior).unwrap();
+        let mut second = Mixture::new(&explanation, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
+        second.choose(&explanation, &posterior).unwrap();
+        // Two terms over one explanation: the second keeps only its value-map targets.
+        for target in &mut second.targets {
+            if !matches!(target.kind, Kind::Value { .. }) {
+                target.components.clear();
+            }
+        }
+        for target in &mut first.targets {
+            if matches!(target.kind, Kind::Value { .. }) {
+                target.components.clear();
+            }
+        }
+        let mut joint = Priors(vec![Box::new(first.clone()), Box::new(second.clone())]);
+        let theta = draw(&first, &posterior, 5).into_iter().chain(draw(&second, &posterior, 5)).collect::<BTreeMap<_, _>>();
+        let own = |m: &Mixture| m.operators().into_iter().map(|i| (i, theta[&i].clone())).collect::<BTreeMap<_, _>>();
+        let ((a, ga), (b, gb)) = (first.sample(&posterior, &own(&first), false).unwrap(), second.sample(&posterior, &own(&second), false).unwrap());
+        let (value, gradient) = joint.sample(&posterior, &theta, false).unwrap();
+        assert!((value - (a + b)).abs() <= 1e-12 * (1.0 + value.abs()));
+        for (i, g) in &gradient {
+            let expected = match (ga.get(i), gb.get(i)) {
+                (Some(x), Some(y)) => x + y,
+                (Some(x), None) | (None, Some(x)) => x.clone(),
+                (None, None) => panic!("a gradient of no term"),
+            };
+            assert!(g.iter().zip(expected.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * (1.0 + y.abs())));
+        }
+        assert!((joint.cost(&posterior).unwrap() - first.cost(&posterior).unwrap() - second.cost(&posterior).unwrap()).abs() < 1e-9);
+        let saved = joint.save().unwrap();
+        assert!(joint.load(&serde_json::json!([saved[0].clone()])).is_err(), "a checkpoint of another count is refused");
+        joint.load(&saved).unwrap();
+        assert_eq!(joint.save().unwrap(), saved);
     }
 
     #[test]
