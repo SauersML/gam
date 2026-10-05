@@ -419,7 +419,8 @@ fn main() -> Result<(), String> {
         "assessments": evaluated.assessments.iter().enumerate().map(|(index, result)| match result {
             None => json!({"index": index, "state": "unevaluated"}),
             Some(Err(error)) => json!({"index": index, "state": "failed", "error": error}),
-            Some(Ok(measured)) => json!({"index": index, "state": "measured", "cost": measured.cost,
+            Some(Ok(gam_mpd::acceptance::StagedAssessment::LocalRejected { cost, local, local_measure, max_local_tolerance })) => json!({"index":index,"state":"local_rejected_run_not_measured","cost":cost,"local_measure":local_measure,"run_measure":null,"max_local_tolerance":max_local_tolerance,"local_bounds":{"lower":local.status().lower_bound(),"upper":local.status().upper_bound()}}),
+            Some(Ok(gam_mpd::acceptance::StagedAssessment::Complete(measured))) => json!({"index": index, "state": "measured", "cost": measured.cost,
                 "local_measure": measured.local_measure, "run_measure": measured.run_measure,
                 "local_bounds": {"lower": measured.local.status().lower_bound(), "upper": measured.local.status().upper_bound()},
                 "run_bounds": {"lower": measured.run.status().lower_bound(), "upper": measured.run.status().upper_bound()}}),

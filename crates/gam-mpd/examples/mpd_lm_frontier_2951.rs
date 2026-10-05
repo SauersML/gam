@@ -227,7 +227,7 @@ fn main() -> Result<(), String> {
         .as_ref()
         .map_or(&run as &dyn RunCheck, |r| r as &dyn RunCheck);
     let result = frontier(&local, runner, bank, &constraints, spec.budget)?;
-    let measures:Vec<_>=result.assessments.iter().map(|a|match a {Some(Ok(v))=>json!({"local":v.local_measure,"run_episodes":v.run_measure.episodes,"run_groups":v.run_measure.groups}),Some(Err(e))=>json!({"error":e}),None=>serde_json::Value::Null}).collect();
+    let measures:Vec<_>=result.assessments.iter().map(|a|match a {Some(Ok(v))=>json!({"local":v.local_measure(),"run_episodes":v.run_measure().map(|r|&r.episodes),"run_groups":v.run_measure().map(|r|&r.groups),"state":if v.run_measure().is_some(){"measured"}else{"local_rejected_run_not_measured"}}),Some(Err(e))=>json!({"error":e}),None=>serde_json::Value::Null}).collect();
     let report = json!({"native_episode_cpu_cuda_comparison":parity,"backend":device_run.as_ref().map_or("CPU",|r|r.backend_name()),"source":imported.record["source"],"config":imported.record["config"],"node_map":"exact imported full program indices; validated widths; fixed native output","sequences":spec.sequences,"context":spec.context,"points":result.points,"measured_candidates":result.measured_candidates,"measures":measures,"seconds":start.elapsed().as_secs_f64(),"scope":"declared finite bank and fixed input/intervention family only"});
     if let Some(p) = out.parent() {
         std::fs::create_dir_all(p).map_err(|e| e.to_string())?;

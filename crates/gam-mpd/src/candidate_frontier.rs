@@ -3,7 +3,7 @@
 //! Candidates are independent: infeasible individual edits never block a joint candidate.
 //! The gap concerns this bank only, never ungenerated programs. A fresh cache belongs to one
 //! fixed Local/RunCheck dataset and is reused across tolerance pairs, not across datasets.
-use super::acceptance::{Assessment, Constraint, CostCache, Local, PreparedAssessment, RunCheck, structural_cost};
+use super::acceptance::{Constraint, CostCache, Local, PreparedAssessment, RunCheck, StagedAssessment, structural_cost};
 use super::artifact::{Artifact, EncodedArtifact};
 use super::precision::FidelityVerdict;
 
@@ -83,9 +83,9 @@ pub struct Frontier {
     /// Sorted by cost, then label; exact duplicate encoded messages are collapsed.
     pub bank: Vec<Candidate>,
     pub points: Vec<Point>,
-    /// One result per bank index, independent of the tolerance grid. None is
-    /// unevaluated; Err retains assessment failure instead of inventing measures.
-    pub assessments: Vec<Option<Result<Assessment, String>>>,
+    /// One result per bank index. Local rejection at the widest declared tolerance
+    /// has explicitly absent Run. None is unevaluated; Err is an assessment failure.
+    pub assessments: Vec<Option<Result<StagedAssessment, String>>>,
     /// Distinct messages whose assessment was attempted, including failed assessments.
     pub measured_candidates: usize,
     /// Disjoint wall-clock stages; failed assessments contribute their elapsed time too.
@@ -99,12 +99,10 @@ pub struct FrontierTiming {
     pub decoded_assessments: f64,
 }
 
-fn state(assessment: &Assessment, constraint: Constraint) -> Result<State, String> {
-    let local = assessment.local.with_tolerance(constraint.local)?;
-    let run = assessment.run.with_tolerance(constraint.run)?;
-    Ok(match (local.verdict(), run.verdict()) {
-        (FidelityVerdict::Violates, _) | (_, FidelityVerdict::Violates) => State::Violates,
-        (FidelityVerdict::Meets, FidelityVerdict::Meets) => State::Verified,
+fn state(assessment: &StagedAssessment, constraint: Constraint) -> Result<State, String> {
+    Ok(match assessment.verdict(constraint)? {
+        FidelityVerdict::Violates => State::Violates,
+        FidelityVerdict::Meets => State::Verified,
         _ => State::Unresolved,
     })
 }
@@ -122,15 +120,31 @@ fn point(constraint: Constraint, evidence: Vec<Evidence>) -> Point {
     Point { constraint, selected, upper_cost, lower_cost, gap, evidence }
 }
 
-/// Evaluate at most `budget` distinct messages in cost order, independently of the tolerance grid.
+/// Evaluate at most `budget` distinct messages in cost order. The grid controls
+/// the widest Local tolerance at which a complete candidate can be screened.
 /// Every budgeted candidate is assessed even after a cheaper feasible candidate is found.
-/// No intermediate-path feasibility or local screen prunes a supplied candidate.
+/// Every complete candidate gets its own Local check. Run is omitted only when
+/// Local proves violation of even the widest tolerance. Constituent edits never
+/// screen a combined candidate. Use `frontier_with_mode` for deliberate full Run controls.
 pub fn frontier(
     local: &Local<'_>,
     run: &dyn RunCheck,
     candidates: Vec<Candidate>,
     constraints: &[Constraint],
     budget: usize,
+) -> Result<Frontier, String> {
+    frontier_with_mode(local, run, candidates, constraints, budget, AssessmentMode::LocalFirst)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum AssessmentMode {
+    LocalFirst,
+    Complete,
+}
+
+pub fn frontier_with_mode(
+    local: &Local<'_>, run: &dyn RunCheck, candidates: Vec<Candidate>,
+    constraints: &[Constraint], budget: usize, mode: AssessmentMode,
 ) -> Result<Frontier, String> {
     let started = std::time::Instant::now();
     for constraint in constraints {
@@ -162,7 +176,10 @@ pub fn frontier(
         // once and executes that decoded artifact for both measures. No decoded state is cached.
         let assessed_started = std::time::Instant::now();
         assessments.push(if index < budget && !constraints.is_empty() {
-            Some(prepared.assess(local, run, constraints[0]))
+            Some(match mode {
+                AssessmentMode::LocalFirst => prepared.assess_local_first(local, run, constraints),
+                AssessmentMode::Complete => prepared.assess(local, run, constraints[0]).map(StagedAssessment::Complete),
+            })
         } else {
             None
         });
@@ -411,7 +428,7 @@ mod tests {
         assert_eq!(a.measured_candidates, 3);
         assert_eq!(a.assessments.len(), a.bank.len());
         for (index, saved) in a.assessments.iter().enumerate() {
-            let measured = saved.as_ref().unwrap().as_ref().unwrap();
+            let measured = saved.as_ref().unwrap().as_ref().unwrap().complete().unwrap();
             assert!(!measured.local_measure.blocks.is_empty());
             assert_eq!(measured.run_measure.episodes.len(), 1);
             assert!(measured.local.status().lower_bound().is_some());
@@ -430,6 +447,33 @@ mod tests {
         assert_eq!(b.bank[b.points[0].selected.unwrap()].label, "joint");
         assert_eq!(a.points[0].upper_cost, b.points[0].upper_cost);
         assert_eq!(run.calls.load(std::sync::atomic::Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn local_screen_skips_only_complete_failures_and_preserves_full_frontier() {
+        let (model, family) = fixture();
+        let local = Local::new(&model, family.clone(), None, 2);
+        let run = counted(&model, &family, false);
+        let mut joint = candidate(&model, "joint", 2.0, 0.5);
+        // One complete replacement cancels internally; individual failures must never
+        // prevent its own Local and Run evaluation.
+        joint.artifact.blocks.clear();
+        joint.artifact = joint.artifact.bind("whole", &[0], 2).unwrap();
+        let bank = vec![candidate(&model, "A", 2.0, 1.0), candidate(&model, "B", 1.0, 0.5), joint];
+        let grid = [C, Constraint { local: 0.2, run: 0.01 }];
+        let screened = frontier(&local, &run, bank.clone(), &grid, 3).unwrap();
+        assert_eq!(run.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(screened.assessments.iter().filter(|a| matches!(a, Some(Ok(StagedAssessment::LocalRejected { .. })))).count(), 2);
+        let full = frontier_with_mode(&local, &run, bank, &grid, 3, AssessmentMode::Complete).unwrap();
+        assert_eq!(run.calls.load(std::sync::atomic::Ordering::Relaxed), 4);
+        for (a, b) in screened.points.iter().zip(&full.points) {
+            assert_eq!(a.selected, b.selected);
+            assert_eq!(a.lower_cost, b.lower_cost);
+            assert_eq!(a.upper_cost, b.upper_cost);
+            assert_eq!(a.gap, b.gap);
+            assert_eq!(a.evidence.iter().map(|e| &e.state).collect::<Vec<_>>(), b.evidence.iter().map(|e| &e.state).collect::<Vec<_>>());
+            assert_eq!(screened.bank[a.selected.unwrap()].label, "joint");
+        }
     }
 
     #[test]

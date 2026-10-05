@@ -1208,6 +1208,14 @@ pub enum StagedAssessment {
 }
 
 impl StagedAssessment {
+    pub fn complete(&self) -> Option<&Assessment> {
+        match self { Self::Complete(a) => Some(a), Self::LocalRejected { .. } => None }
+    }
+
+    pub fn local_measure(&self) -> &LocalMeasure {
+        match self { Self::Complete(a) => &a.local_measure, Self::LocalRejected { local_measure, .. } => local_measure }
+    }
+
     pub fn cost(&self) -> StructuralCost {
         match self { Self::Complete(a) => a.cost, Self::LocalRejected { cost, .. } => *cost }
     }
@@ -1254,7 +1262,7 @@ fn validate_constraints(constraints: &[Constraint]) -> Result<(), String> {
 /// of its constituent edits. Decode and check complete cost once, then measure
 /// the unchanged full Local family. Only a proved violation at the widest declared
 /// delta omits Run. Retain this evidence across grid points without measuring again.
-/// The ordinary assessment and finite-bank defaults remain unchanged.
+/// Ordinary full assessment remains available; the finite bank uses this screen by default.
 pub fn assess_once_local_first(
     local: &Local<'_>, run: &dyn RunCheck, artifact: &Artifact,
     constraints: &[Constraint], cache: &mut CostCache,
@@ -1353,6 +1361,11 @@ impl PreparedAssessment {
 
     pub(crate) fn assess(&self, local: &Local<'_>, run: &dyn RunCheck, constraint: Constraint) -> Result<Assessment, String> {
         self.assess_decodable(&self.encoded, local, run, constraint)
+    }
+
+    pub(crate) fn assess_local_first(&self, local: &Local<'_>, run: &dyn RunCheck, constraints: &[Constraint]) -> Result<StagedAssessment, String> {
+        validate_constraints(constraints)?;
+        assess_local_first_decodable(&self.encoded, self.cost, local, run, constraints)
     }
 
     fn assess_decodable<A: super::precision::DecodableArtifact<Decoded = Artifact>>(
