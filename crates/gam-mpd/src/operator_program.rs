@@ -1527,6 +1527,51 @@ impl OperatorProgram {
         self.execute_at(inputs, bands, &vec![1.0; self.declarations.parameters])
     }
 
+    /// Training-time native labels below supplied boundary values. Reuse the
+    /// ordinary evaluator and original interfaces, but never evaluate a supplied
+    /// boundary's producer or unrelated nodes. Callers that require a closed
+    /// local function must separately rule out ambient inputs (including those
+    /// inside called rules). Attention retains the original family layout.
+    pub(crate) fn execute_clamped_outputs(
+        &self,
+        inputs: &FamilyInputs,
+        patches: &BTreeMap<usize, Array2<f64>>,
+        outputs: &[usize],
+    ) -> Result<Vec<Array2<f64>>, ProgramError> {
+        self.check_inputs(inputs)?;
+        let interfaces = self.interfaces()?;
+        let mut needed = vec![false; self.nodes.len()];
+        let mut pending = outputs.to_vec();
+        while let Some(index) = pending.pop() {
+            let node = self.nodes.get(index).ok_or(ProgramError::Reference {
+                what: "clamped output/dependency", index,
+            })?;
+            if needed[index] { continue; }
+            needed[index] = true;
+            if !patches.contains_key(&index) { pending.extend(node.arguments()); }
+        }
+        let ones = vec![1.0; self.declarations.parameters];
+        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
+        // Empty placeholders preserve original node indices without allocating
+        // activation buffers for nodes outside the dependency slice.
+        let mut top = Vec::with_capacity(self.nodes.len());
+        for (index, node) in self.nodes.iter().enumerate() {
+            let value = if !needed[index] {
+                Array2::zeros((0, 0))
+            } else if let Some(value) = patches.get(&index) {
+                if value.dim() != (inputs.rows, interfaces[index].width()) {
+                    return Err(ProgramError::Input(format!("clamped boundary {index} has wrong shape")));
+                }
+                value.clone()
+            } else {
+                let values = Layered { base: &[], top: &top, from: 0, patch: None };
+                self.evaluate_node(index, node, inputs, &values, None, &interfaces, &frame)?.0
+            };
+            top.push(value);
+        }
+        Ok(outputs.iter().map(|&index| top[index].clone()).collect())
+    }
+
     fn execute_range(&self, inputs: &FamilyInputs, trace: &mut Trace, from: usize, parameters: &[f64]) -> Result<(), ProgramError> {
         self.check_inputs(inputs)?;
         trace.values.truncate(from);
