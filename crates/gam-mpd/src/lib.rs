@@ -52,6 +52,8 @@ pub mod library_sharing;
 pub mod library_mixture;
 // Reusable rule bodies: regions rewritten as calls of learned bodies, bodies shared across sites.
 pub mod library_bodies;
+// Bodies that read through a head: computations across the attention/MLP boundary.
+pub mod library_crossing;
 // A removal's least-squares compensation: an MLP's surviving functions take over deleted ones' output.
 pub mod library_compensation;
 // The removal search: groups without effect first, then units ranked by their predicted change of F.
