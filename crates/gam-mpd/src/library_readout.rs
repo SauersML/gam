@@ -125,12 +125,14 @@ pub struct Entry {
     pub score: f64,
 }
 
-/// An input of a function: the writer (an index into `Readout::functions`) and its mean flow per
-/// held-out token.
+/// An input of a function: the writer (an index into `Readout::functions`), its mean flow per
+/// held-out token, and that flow per route of the reader's reads: a head reader's value, query
+/// and key maps; an MLP reader's gate and up maps (and zero).
 #[derive(Clone, Debug, Serialize)]
 pub struct Edge {
     pub from: usize,
     pub flow: f64,
+    pub routes: [f64; 3],
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1179,7 +1181,9 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
     let mlp_candidates: Vec<Vec<(usize, usize)>> =
         mlp_index.iter().map(|block| block.iter().enumerate().filter_map(|(i, f)| Some((i, candidate_of[(*f)?]?))).collect()).collect();
     let head_candidate: Vec<Option<usize>> = head_index.iter().map(|f| candidate_of[(*f)?]).collect();
-    let mut flows = Array2::<f64>::zeros((ranked.len(), ranked.len()));
+    // Per route (a head reader's value, query and key maps; an MLP reader's gate and up maps), the
+    // summed flow from each candidate writer (columns) to each candidate reader (rows).
+    let mut flows: [Array2<f64>; 3] = std::array::from_fn(|_| Array2::<f64>::zeros((ranked.len(), ranked.len())));
     for (_, batch) in &batches {
         let pass = library.pass(&batch.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
         let (_, seed, _) = library.predicted(&pass)?;
@@ -1203,7 +1207,8 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
                     if let (Some(up), Some((_, map))) = (up, &block.up) {
                         parts.push((*up, map));
                     }
-                    for (gradient, map) in parts {
+                    for (route, (gradient, map)) in parts.into_iter().enumerate() {
+                        let flows = &mut flows[route];
                         // Per token the reader's gradient through its frozen norm, and its direction.
                         let weights = Array2::from_shape_fn((pass.rows, readers.len()), |(r, c)| gradient[[r, readers[c].0]] * inverse[r]);
                         let directions = Array2::from_shape_fn((readers.len(), width), |(c, d)| map[[readers[c].0, d]] * gain[d]);
@@ -1232,7 +1237,9 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
                     for (c, &h) in members.iter().enumerate() {
                         let Some(reader) = head_candidate[h] else { continue };
                         let block = &heads[h];
-                        for (gradient, map) in [(&head_reads.value[c], &block.value), (&head_reads.query[c], &block.query.map), (&head_reads.key[c], &block.key.map)] {
+                        let routes = [(&head_reads.value[c], &block.value), (&head_reads.query[c], &block.query.map), (&head_reads.key[c], &block.key.map)];
+                        for (route, (gradient, map)) in routes.into_iter().enumerate() {
+                            let flows = &mut flows[route];
                             let weights = gradient * &inverse.view().insert_axis(Axis(1));
                             let read = map * &gain.view().insert_axis(Axis(0));
                             for &w in &mlp_writers {
@@ -1253,18 +1260,20 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
             }
         });
     }
+    let summed = &flows[0] + &flows[1] + &flows[2];
     for (c, &f) in ranked.iter().enumerate() {
         let mut best = Best::default();
-        for (w, flow) in flows.row(c).iter().enumerate() {
+        for (w, flow) in summed.row(c).iter().enumerate() {
             if *flow != 0.0 {
                 best.offer(settings.edges, flow.abs(), w);
             }
         }
-        functions[f].inputs = best.entries.iter().map(|(_, w)| Edge { from: ranked[*w], flow: flows[[c, *w]] / total }).collect();
+        functions[f].inputs =
+            best.entries.iter().map(|(_, w)| Edge { from: ranked[*w], flow: summed[[c, *w]] / total, routes: std::array::from_fn(|r| flows[r][[c, *w]] / total) }).collect();
     }
     // The core: the most important candidates, the background apart.
     let core: Vec<usize> = ranked.iter().copied().filter(|f| !functions[*f].background).take(settings.core).collect();
-    let wiring = core.iter().map(|i| core.iter().map(|j| candidate_of[*i].zip(candidate_of[*j]).map_or(0.0, |(a, b)| flows[[a, b]] / total)).collect()).collect();
+    let wiring = core.iter().map(|i| core.iter().map(|j| candidate_of[*i].zip(candidate_of[*j]).map_or(0.0, |(a, b)| summed[[a, b]] / total)).collect()).collect();
     Ok(Readout {
         held_out_tokens: sequences.len() * length,
         functions,
