@@ -37,6 +37,10 @@ Stages (state under RUN = ~/mpd-data/oracle/uplift/<run>/; each stage reads the 
   uplift.py tests   --run R                       RUN/tests.jsonl, the reader's tests
   reader.py score --backend vllm --model M --tests RUN/tests.jsonl --out RUN/read.jsonl   (MATS GPU)
   uplift.py analyze --run R                       episodes completed, RUN/uplift.json, the figure
+  uplift.py calibration --run R --count N        a uniform sample of the item-alone and rule tests with
+                                                  their measured p, and the open reader's rows for them
+  reader.py score --backend claude --model sonnet --tests RUN/calibration_tests.jsonl --out RUN/calibration_claude.jsonl
+  calibrate.py compare --tests RUN/calibration_tests.jsonl --a RUN/calibration_open.jsonl --b RUN/calibration_claude.jsonl --out RUN/calibration.json
 """
 
 from __future__ import annotations
@@ -322,14 +326,36 @@ def figure(run: Path, table: list[dict]):
     print(f"figure {path}", file=sys.stderr)
 
 
+def calibration(run: Path, count: int, seed: int):
+    """A uniform sample (seeded) of the tests whose documents are none or a rule, with each item's
+    measured p, and the open reader's output rows for them."""
+    measured = {}
+    for organism in by_organism(staged(run)):
+        for i, u in enumerate(read_jsonl(run / "items" / f"{organism}.updated.jsonl")):
+            measured[(organism, str(i))] = softmax(u["logprobs"]).tolist()
+    pool = [t for t in read_jsonl(run / "tests.jsonl") if t["id"].split("|")[2] == "none" or t["id"].split("|")[2].startswith("report:")]
+    if len(pool) < count:
+        raise SystemExit(f"{len(pool)} tests, fewer than {count}")
+    rng = np.random.default_rng(seed)
+    chosen = [pool[i] for i in sorted(rng.choice(len(pool), size=count, replace=False))]
+    for t in chosen:
+        organism, i, _ = t["id"].split("|")
+        t["p"] = measured[(organism, i)]
+    opened = {r["id"]: r for r in read_jsonl(run / "read.jsonl")}
+    write_jsonl(run / "calibration_tests.jsonl", chosen)
+    write_jsonl(run / "calibration_open.jsonl", [opened[t["id"]] for t in chosen])
+    print(f"{len(chosen)} calibration tests in {run / 'calibration_tests.jsonl'}", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["stage", "ablate", "items", "measure", "tests", "analyze"])
+    ap.add_argument("command", choices=["stage", "ablate", "items", "measure", "tests", "analyze", "calibration"])
     ap.add_argument("--run", required=True)
     ap.add_argument("--manifest")
     ap.add_argument("--model", default="sonnet", help="ablate: the rewriter and judge model for claude -p")
     ap.add_argument("--length-factor", type=float, default=1.25)
     ap.add_argument("--count", type=int)
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--command", dest="item_command", help="items: a shell command with {organism} {count} {seed} {out}")
     ap.add_argument("--read", help="analyze: the reader's output (default RUN/read.jsonl)")
     ap.add_argument("--reader-model", default="Qwen/Qwen3-8B")
@@ -347,6 +373,8 @@ def main():
         tests(run)
     elif args.command == "analyze":
         analyze(run, Path(args.read) if args.read else run / "read.jsonl", args.reader_model)
+    elif args.command == "calibration":
+        calibration(run, args.count, args.seed)
 
 
 if __name__ == "__main__":
