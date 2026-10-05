@@ -230,28 +230,43 @@ pub struct Decomposition {
     ci: CiNetwork,
 }
 
+/// The subcomponents of every site of VPD's exported decomposition, in `M`'s order.
+pub fn load_factors(dir: &Path) -> Result<Vec<Factors>, String> {
+    factors_of(&Export::open(dir)?)
+}
+
+fn factors_of(export: &Export) -> Result<Vec<Factors>, String> {
+    let names = site_names(export)?;
+    let mut sites = Vec::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        let (layer, kind) = (i / KINDS.len(), KINDS[i % KINDS.len()]);
+        if *name != format!("h.{layer}.{}", kind.export_name()) {
+            return Err(error(format!("site {i} is {name}, not layer {layer}'s {kind:?} in M's order")));
+        }
+        let (u, v) = (export.tensor(&format!("{name}.U"))?, export.tensor(&format!("{name}.V"))?);
+        if u.nrows() != v.ncols() {
+            return Err(error(format!("{name}: U and V disagree on the subcomponents")));
+        }
+        sites.push(Factors { name: name.clone(), layer, kind, u, v });
+    }
+    Ok(sites)
+}
+
+fn site_names(export: &Export) -> Result<Vec<String>, String> {
+    export.record["config"]["sites"]
+        .as_array()
+        .ok_or_else(|| error("config.sites"))?
+        .iter()
+        .map(|v| v.as_str().map(str::to_string).ok_or_else(|| error("a site name")))
+        .collect()
+}
+
 impl Decomposition {
     pub fn load(dir: &Path) -> Result<Self, String> {
         let export = Export::open(dir)?;
         let config = &export.record["config"];
-        let names: Vec<String> = config["sites"]
-            .as_array()
-            .ok_or_else(|| error("config.sites"))?
-            .iter()
-            .map(|v| v.as_str().map(str::to_string).ok_or_else(|| error("a site name")))
-            .collect::<Result<_, _>>()?;
-        let mut sites = Vec::with_capacity(names.len());
-        for (i, name) in names.iter().enumerate() {
-            let (layer, kind) = (i / KINDS.len(), KINDS[i % KINDS.len()]);
-            if *name != format!("h.{layer}.{}", kind.export_name()) {
-                return Err(error(format!("site {i} is {name}, not layer {layer}'s {kind:?} in M's order")));
-            }
-            let (u, v) = (export.tensor(&format!("{name}.U"))?, export.tensor(&format!("{name}.V"))?);
-            if u.nrows() != v.ncols() {
-                return Err(error(format!("{name}: U and V disagree on the subcomponents")));
-            }
-            sites.push(Factors { name: name.clone(), layer, kind, u, v });
-        }
+        let names = site_names(&export)?;
+        let sites = factors_of(&export)?;
         let ci = &config["ci"];
         let order: Vec<usize> = ci["order"]
             .as_array()
@@ -1632,7 +1647,7 @@ fn by_length(pairs: &[Pair]) -> BTreeMap<usize, Vec<&Pair>> {
 impl NodeBasis<'_> {
     /// One forward pass on `sequences` with every group's node replaced by `replace(group, value)`
     /// where it returns one: the trace.
-    fn run(&self, sequences: &[&[u32]], replace: &dyn Fn(usize, &Array2<f64>) -> Option<Array2<f64>>) -> Result<(FamilyInputs, DeviceTrace), String> {
+    pub fn run(&self, sequences: &[&[u32]], replace: &dyn Fn(usize, &Array2<f64>) -> Option<Array2<f64>>) -> Result<(FamilyInputs, DeviceTrace), String> {
         let family = sequence_family(sequences)?;
         let d = self.side.program.device();
         let trace = self.side.program.forward_span_given(&family, (self.given)(family.rows)?, None, self.side.hidden, |node, trace| {
@@ -1756,6 +1771,61 @@ pub fn neuron_attributions(library: &crate::library_readout::Library<'_>, pairs:
             for (a, c) in acc.iter_mut().zip(cols) {
                 *a += attribution[*c] / pairs.len() as f64;
             }
+        }
+    }
+    Ok(out)
+}
+
+/// Per site, each of VPD's subcomponents' RelP attribution to the logit difference `target − foil`
+/// at the last position, the counterfactual as the baseline, summed over positions and averaged over
+/// `pairs`: `(a_c − a′_c) · (U_c · ∂m/∂y)` with `a_c = x·V_c` the subcomponent's activation (from
+/// `basis`, VPD's program with every mask and remainder at one, which is `M`), `y` its site's
+/// output and the gradient that of `library` (`library_readout`'s RelP on the library's starting
+/// artifact, `M` itself). The attention pattern is frozen, so queries and keys have no path: their
+/// subcomponents' attributions are zero.
+pub fn subcomponent_attributions(library: &crate::library_readout::Library<'_>, basis: &NodeBasis, factors: &[Factors], pairs: &[Pair]) -> Result<Vec<Array1<f64>>, String> {
+    let functions = library.functions();
+    // Per layer, the head index of each of the library's heads in its order.
+    let heads: Vec<Vec<usize>> = (0..factors.len() / KINDS.len())
+        .map(|l| {
+            functions
+                .iter()
+                .filter(|f| f.layer == l && matches!(f.kind, crate::library_readout::Kind::Head))
+                .map(|f| f.name.rsplit('H').next().and_then(|h| h.parse::<usize>().ok()).ok_or_else(|| error(format!("head name {}", f.name))))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<_, _>>()?;
+    let d = basis.side.program.device();
+    let mut out: Vec<Array1<f64>> = factors.iter().map(|f| Array1::zeros(f.subcomponents())).collect();
+    for p in pairs {
+        let length = p.clean.len();
+        let prompt = crate::library_readout::Prompt {
+            tokens: p.clean.clone(),
+            baseline: Some(p.counterfactual.clone()),
+            metric: crate::library_readout::Metric::Difference { position: length - 1, target: p.target, foil: p.foil },
+        };
+        let gradients = library.attributions(&prompt)?.gradients;
+        let (_, trace) = basis.run(&[p.clean.as_slice(), p.counterfactual.as_slice()], &|_, _| None)?;
+        for (s, f) in factors.iter().enumerate() {
+            let layer = &gradients[f.layer];
+            let gradient: Array2<f64> = match f.kind {
+                Kind::Query | Kind::Key => continue,
+                Kind::Value => {
+                    let width = layer.values.first().map_or(0, Array2::ncols);
+                    let mut g = Array2::zeros((length, width * heads[f.layer].len()));
+                    for (value, &h) in layer.values.iter().zip(&heads[f.layer]) {
+                        g.slice_mut(s![.., h * width..(h + 1) * width]).assign(value);
+                    }
+                    g
+                }
+                Kind::Output => layer.attention.clone(),
+                Kind::Up => layer.gate.clone(),
+                Kind::Down => layer.mlp.clone(),
+            };
+            let a = d.download(trace.value(basis.groups[s])?).map_err(error)?;
+            let difference = &a.slice(s![..length, ..]) - &a.slice(s![length.., ..]);
+            let along = gradient.dot(&f.u.t());
+            out[s] += &((&difference * &along).sum_axis(Axis(0)) / pairs.len() as f64);
         }
     }
     Ok(out)

@@ -580,6 +580,19 @@ pub struct PromptAttribution {
     pub predicted: Vec<u32>,
     pub attributions: Array2<f64>,
     pub outputs: Array2<f64>,
+    /// Per layer, the metric's gradients in the linearized network (RelP's reverse pass).
+    pub gradients: Vec<LayerGradients>,
+}
+
+/// One layer's gradients of a prompt's metric in RelP's linearized network: in the stream at its
+/// attention's output and at its MLP's output (rows × width), per head of the layer its value
+/// (rows × head width), and its MLP functions' gate pre-activations (rows × functions).
+#[derive(Clone, Debug, Default)]
+pub struct LayerGradients {
+    pub attention: Array2<f64>,
+    pub mlp: Array2<f64>,
+    pub values: Vec<Array2<f64>>,
+    pub gate: Array2<f64>,
 }
 
 /// A function's identity: its name, layer and kind.
@@ -746,7 +759,7 @@ impl<'a> Library<'a> {
     /// the gradient through its scores: `c q·k` split half to each factor, through the softmax's
     /// derivative and the head norms (denominators frozen); the reverse pass itself keeps the
     /// patterns frozen.
-    fn relp(&self, pass: &Pass, seed: Array2<f64>, baseline: Option<&Pass>, routes: bool, visit: &mut dyn FnMut(Cut<'_>, Array2<f64>, &Reads<'_>)) {
+    fn relp(&self, pass: &Pass, seed: Array2<f64>, baseline: Option<&Pass>, routes: bool, visit: &mut dyn FnMut(Cut<'_>, Array2<f64>, &Reads<'_>, &Array2<f64>)) {
         let length = pass.rows / pass.weights.first().map_or(1, |w| w.len().max(1));
         let positions: Vec<u32> = (0..length as u32).collect();
         let mut g = seed;
@@ -771,7 +784,7 @@ impl<'a> Library<'a> {
                 if let (Some(up_gradient), Some((_, up_map))) = (&up_gradient, &block.up) {
                     read = read + up_gradient.dot(up_map);
                 }
-                visit(Cut::Mlp(b), value * &d, &Reads::Mlp { gate: &gate, up: up_gradient.as_ref() });
+                visit(Cut::Mlp(b), value * &d, &Reads::Mlp { gate: &gate, up: up_gradient.as_ref() }, &g);
                 let (gain, inv) = (&self.sites[2 * l + 1].gain, &pass.inverse[2 * l + 1]);
                 g = g + read * &gain.view().insert_axis(Axis(0)) * &inv.view().insert_axis(Axis(1));
             }
@@ -825,7 +838,7 @@ impl<'a> Library<'a> {
                 reads.query.push(gq);
                 reads.key.push(gk);
             }
-            visit(Cut::Heads(l, members), attribution, &Reads::Heads(&reads));
+            visit(Cut::Heads(l, members), attribution, &Reads::Heads(&reads), &g);
             let (gain, inv) = (&self.sites[2 * l].gain, &pass.inverse[2 * l]);
             g = g + delta * &gain.view().insert_axis(Axis(0)) * &inv.view().insert_axis(Axis(1));
         }
@@ -871,12 +884,26 @@ impl<'a> Library<'a> {
         };
         let (head_columns, mlp_columns) = self.columns();
         let mut attributions = Array2::<f64>::zeros((rows, self.functions().len()));
-        self.relp(&pass, seed, baseline.as_ref(), false, &mut |cut, values, _| {
+        let mut gradients = vec![LayerGradients::default(); self.layer_heads.len()];
+        self.relp(&pass, seed, baseline.as_ref(), false, &mut |cut, values, reads, g| {
             let start = match cut {
                 Cut::Mlp(b) => mlp_columns[b],
                 Cut::Heads(l, _) => head_columns[l],
             };
             attributions.slice_mut(s![.., start..start + values.ncols()]).assign(&values);
+            match (cut, reads) {
+                (Cut::Mlp(b), Reads::Mlp { gate, .. }) => {
+                    let layer = &mut gradients[self.mlps[b].layer];
+                    layer.mlp = g.clone();
+                    layer.gate = (*gate).clone();
+                }
+                (Cut::Heads(l, _), Reads::Heads(heads)) => {
+                    gradients[l].attention = g.clone();
+                    gradients[l].values = heads.value.clone();
+                }
+                // A cut's reads are of its own kind.
+                (Cut::Mlp(_), Reads::Heads(_)) | (Cut::Heads(..), Reads::Mlp { .. }) => {}
+            }
         });
         let mut outputs = Array2::<f64>::zeros(attributions.dim());
         for (b, block) in self.mlps.iter().enumerate() {
@@ -891,7 +918,7 @@ impl<'a> Library<'a> {
                 outputs.column_mut(head_columns[l] + c).assign(&(z.dot(&gram) * z).sum_axis(Axis(1)).mapv(|v| v.max(0.0).sqrt()));
             }
         }
-        Ok(PromptAttribution { metric, predicted: predicted.into_iter().map(|t| t as u32).collect(), attributions, outputs })
+        Ok(PromptAttribution { metric, predicted: predicted.into_iter().map(|t| t as u32).collect(), attributions, outputs, gradients })
     }
 }
 
@@ -1020,7 +1047,7 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
                 target_seed.row_mut(t).assign(&seed.row(row));
                 let m = metric[row];
                 samples += 1.0;
-                library.relp(&prefix, target_seed, None, false, &mut |cut, attribution, _| {
+                library.relp(&prefix, target_seed, None, false, &mut |cut, attribution, _, _| {
                     let totals = attribution.sum_axis(Axis(0));
                     let index = match cut {
                         Cut::Mlp(b) => {
@@ -1243,7 +1270,7 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
     for (_, batch) in &batches {
         let pass = library.pass(&batch.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
         let (_, seed, _) = library.predicted(&pass)?;
-        library.relp(&pass, seed, None, true, &mut |cut, _, reads| {
+        library.relp(&pass, seed, None, true, &mut |cut, _, reads, _| {
             // The writers before this read: MLPs of earlier layers, heads of earlier layers (and of
             // this layer, for an MLP read).
             let (layer, site_index) = match cut {

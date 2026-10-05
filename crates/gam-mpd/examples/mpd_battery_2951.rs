@@ -125,8 +125,9 @@ fn checkpoint_mean(path: &Path, explanation: &library_mdl::Explanation) -> Resul
     Ok((library_mdl::posterior_mean(explanation, &posterior)?.f32_literals()?, size))
 }
 
-/// The circuit curves (`explanation_battery::circuit_curve`) of `M`'s MLP neurons on each task of
-/// `pairs` (`bench/vpd_2951/sva_export.py`), and their mean over the tasks.
+/// The circuit curves (`explanation_battery::circuit_curve`) on each task of `pairs`
+/// (`bench/vpd_2951/sva_export.py`) of `M`'s MLP neurons and, with `decomposition`, of VPD's
+/// subcomponents (all sites, and the MLP sites alone), and their means over the tasks.
 fn circuits(device: &Device, export: &Path, native: &gam_mpd::operator_program::OperatorProgram, layers: &[gam_mpd::run_check::LayerNodes], pairs: &Path, decomposition: Option<&Path>, settings: &Settings) -> Result<Value, String> {
     #[derive(Deserialize)]
     struct Task {
@@ -135,9 +136,6 @@ fn circuits(device: &Device, export: &Path, native: &gam_mpd::operator_program::
     }
     let record: Value = serde_json::from_slice(&std::fs::read(pairs).map_err(error)?).map_err(error)?;
     let tasks: BTreeMap<String, Task> = serde_json::from_value(record["tasks"].clone()).map_err(error)?;
-    if decomposition.is_some() {
-        return Err("VPD's subcomponents as a circuit basis are not yet attributed".into());
-    }
     let (model, unembedding) = battery::model(export, None)?;
     let m = Side::of_model(device, &model, &unembedding, settings.numeric_bytes)?;
     let none = |_: usize| -> Result<BTreeMap<usize, gam_gpu::tensor::Tensor>, String> { Ok(BTreeMap::new()) };
@@ -146,23 +144,68 @@ fn circuits(device: &Device, export: &Path, native: &gam_mpd::operator_program::
     let neurons = battery::NodeBasis { side: &m, groups: (0..count).map(down).collect(), given: &none, unembedding: &unembedding };
     let start = library_mdl::explanation(native, layers)?.artifact;
     let library = gam_mpd::library_readout::Library::new(device, device, native, layers, &start, settings.numeric_bytes, settings.head_tile_rows)?;
-    let mut out = serde_json::Map::new();
-    let mut curves = Vec::new();
-    for (name, task) in &tasks {
-        let attribution = battery::neuron_attributions(&library, &task.train, count)?;
-        let curve = battery::circuit_curve(&neurons, &attribution, &task.train, &task.test)?;
-        log::info!("circuits: {name} neurons done");
-        curves.push(curve.clone());
-        out.insert(name.clone(), json!({"train": task.train.len(), "test": task.test.len(), "neurons": curve}));
-    }
-    if curves.is_empty() {
-        return Err("no tasks".into());
-    }
-    let mean = |key: &str| -> Vec<f64> {
-        let n = curves[0][key].as_array().map_or(0, Vec::len);
-        (0..n).map(|i| curves.iter().filter_map(|c| c[key][i].as_f64()).sum::<f64>() / curves.len() as f64).collect()
+    // VPD's subcomponents, as nodes of its program with every mask and remainder at one (`M`):
+    // at all 24 sites, and at the MLP sites alone (the coverage of `M`'s neurons).
+    let vpd = decomposition
+        .map(|dir| -> Result<_, String> {
+            let factors = battery::load_factors(dir)?;
+            let (model, _) = battery::model(export, Some(&factors))?;
+            let side = Side::of_model(device, &model, &unembedding, settings.numeric_bytes)?;
+            let widths: Vec<(usize, usize)> = model
+                .layout
+                .masks
+                .iter()
+                .zip(&model.layout.deltas)
+                .map(|(m, r)| match (&model.program.declarations.slots[*m], &model.program.declarations.slots[*r]) {
+                    (gam_mpd::operator_program::Slot::Raw { width: c }, gam_mpd::operator_program::Slot::Raw { width }) => Ok((*c, *width)),
+                    _ => Err("a mask slot is not raw".to_string()),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok((factors, model.layout, side, widths))
+        })
+        .transpose()?;
+    let ones = |rows: usize| -> Result<BTreeMap<usize, gam_gpu::tensor::Tensor>, String> {
+        let mut out = BTreeMap::new();
+        if let Some((_, layout, _, widths)) = &vpd {
+            for (s, (c, width)) in widths.iter().enumerate() {
+                out.insert(layout.masks[s], device.upload(Array2::<f64>::ones((rows, *c)).view()).map_err(error)?);
+                out.insert(layout.deltas[s], device.upload(Array2::<f64>::ones((rows, *width)).view()).map_err(error)?);
+            }
+        }
+        Ok(out)
     };
-    out.insert("mean".into(), json!({"neurons": {"k": curves[0]["k"], "faithfulness": mean("faithfulness"), "completeness": mean("completeness")}}));
+    let mlp_sites: Vec<usize> = (0..count * battery::KINDS.len()).filter(|s| battery::KINDS[s % battery::KINDS.len()].block() == 1).collect();
+    let mut out = serde_json::Map::new();
+    let mut curves: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    for (name, task) in &tasks {
+        let mut entry = json!({"train": task.train.len(), "test": task.test.len()});
+        let attribution = battery::neuron_attributions(&library, &task.train, count)?;
+        entry["neurons"] = battery::circuit_curve(&neurons, &attribution, &task.train, &task.test)?;
+        if let Some((factors, layout, side, _)) = &vpd {
+            let all = battery::NodeBasis { side, groups: layout.activations.clone(), given: &ones, unembedding: &unembedding };
+            let attribution = battery::subcomponent_attributions(&library, &all, factors, &task.train)?;
+            entry["vpd"] = battery::circuit_curve(&all, &attribution, &task.train, &task.test)?;
+            let mlp = battery::NodeBasis { side, groups: mlp_sites.iter().map(|s| layout.activations[*s]).collect(), given: &ones, unembedding: &unembedding };
+            let mlp_attribution: Vec<_> = mlp_sites.iter().map(|s| attribution[*s].clone()).collect();
+            entry["vpd_mlp"] = battery::circuit_curve(&mlp, &mlp_attribution, &task.train, &task.test)?;
+        }
+        for basis in ["neurons", "vpd", "vpd_mlp"] {
+            if !entry[basis].is_null() {
+                curves.entry(basis).or_default().push(entry[basis].clone());
+            }
+        }
+        log::info!("circuits: {name} done");
+        out.insert(name.clone(), entry);
+    }
+    let mut mean = serde_json::Map::new();
+    for (basis, list) in &curves {
+        let average = |key: &str| -> Vec<f64> {
+            let n = list[0][key].as_array().map_or(0, Vec::len);
+            (0..n).map(|i| list.iter().filter_map(|c| c[key][i].as_f64()).sum::<f64>() / list.len() as f64).collect()
+        };
+        mean.insert(basis.to_string(), json!({"k": list[0]["k"], "faithfulness": average("faithfulness"), "completeness": average("completeness")}));
+    }
+    out.insert("mean".into(), Value::Object(mean));
     Ok(Value::Object(out))
 }
 
