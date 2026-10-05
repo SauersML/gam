@@ -21,7 +21,7 @@ Measured effect of LoRA j (model_j = base with LoRA j; every number in nats):
   bundle_gain     the same on the bundle's own tokens (what was learned)
   probe_kl        per document, KL(model_j || base) of the next-token distribution after the document's first
                   `probe` tokens (how the change acts where its content begins)
-The base's held-out log-probabilities are computed once per run.
+The base's log-probabilities are computed beside each measurement in float32 (the LoRAs switched off).
 
 Output, per batch b: OUT/batch_b.jsonl (one line per item: id, document ids, token counts, recipe, losses,
 measured effect) and, with --save-factors, OUT/batch_b.safetensors (A_j, B_j per adapted matrix, bfloat16).
@@ -130,16 +130,6 @@ def pad_rows(rows: list[np.ndarray], length: int, pad: int):
     return ids, mask
 
 
-def token_log_probs(model, ids, mask, dev, chunk_rows: int):
-    """log p(x_t | x_<t) for t >= 1 (rows x length-1), computed in row chunks (the vocabulary is large)."""
-    out = []
-    for s in range(0, ids.shape[0], chunk_rows):
-        i, m = ids[s : s + chunk_rows].to(dev), mask[s : s + chunk_rows].to(dev)
-        logits = model(input_ids=i, attention_mask=m).logits[:, :-1].float()
-        out.append(torch.log_softmax(logits, -1).gather(-1, i[:, 1:, None])[..., 0].cpu())
-    return torch.cat(out)
-
-
 def chunked_nll(model, ids, mask, tokens_per_chunk: int):
     """Per row, the summed next-token cross entropy over real tokens and the count of those tokens. The
     output layer runs on `tokens_per_chunk` positions at a time under activation checkpointing, so the
@@ -201,15 +191,7 @@ def main():
     docs = Documents(args.documents, args.offsets)
     heldout = np.fromfile(args.heldout, dtype="<u4").reshape(-1, args.heldout_length).astype(np.int64)
     held_rows = [heldout[i] for i in rng.choice(len(heldout), size=args.heldout_windows, replace=False)]
-    held_ids, held_mask = pad_rows(held_rows, args.heldout_length, pad)
-    # Held-out windows per base pass: their float32 log-probabilities about 2 GiB.
-    chunk = max(1, (1 << 31) // (4 * model.config.vocab_size * args.heldout_length))
-    with torch.no_grad():
-        base_held = token_log_probs(model, held_ids, held_mask, dev, chunk)
-        base_held_logits = []
-        for s in range(0, len(held_ids), chunk):
-            base_held_logits.append(torch.log_softmax(model(input_ids=held_ids[s : s + chunk].to(dev)).logits.float(), -1).to(torch.bfloat16).cpu())
-        base_held_logits = torch.cat(base_held_logits)
+    held_ids, _ = pad_rows(held_rows, args.heldout_length, pad)
     adapted = adapt(model, args.loras, args.rank)
     # Positions whose float32 logits fill about 1 GiB at once (the output layer's working set).
     vocab = model.config.vocab_size
@@ -266,18 +248,19 @@ def main():
         records = []
         with torch.no_grad():
             set_active(adapted, True)
-            rep_ids = held_ids.repeat(args.loras, 1)
             kl = torch.zeros(args.loras)
             gain = torch.zeros(args.loras)
             per = len(held_ids)
-            # Held-out windows per pass, all LoRAs together: their float32 log-probabilities about 2 GiB.
-            group = max(1, (1 << 31) // (4 * vocab * args.loras * args.heldout_length))
+            # Held-out windows per pass, all LoRAs together and the base: their float32 log-probabilities
+            # about 2 GiB.
+            group = max(1, (1 << 31) // (4 * vocab * (args.loras + 1) * args.heldout_length))
             # One held-out chunk at a time, all LoRAs together (rows grouped by LoRA within the chunk).
             for s in range(0, per, group):
                 part = held_ids[s : s + group]
-                ids_ = part.repeat(args.loras, 1).to(dev)
-                lp = torch.log_softmax(model(input_ids=ids_).logits.float(), -1)
-                base = base_held_logits[s : s + group].to(dev).float()
+                set_active(adapted, False)
+                base = torch.log_softmax(model(input_ids=part.to(dev)).logits.float(), -1)
+                set_active(adapted, True)
+                lp = torch.log_softmax(model(input_ids=part.repeat(args.loras, 1).to(dev)).logits.float(), -1)
                 for j in range(args.loras):
                     lj = lp[j * len(part) : (j + 1) * len(part)]
                     kl[j] += (lj.exp() * (lj - base)).sum(-1)[:, :-1].sum().cpu()
@@ -286,7 +269,6 @@ def main():
             n_tokens = per * (args.heldout_length - 1)
             kl /= n_tokens
             gain /= n_tokens
-            del rep_ids
             for j in range(args.loras):
                 # Bundle gain and per-document probes: LoRA j's rows alone, with the other groups idle
                 # (their rows repeat LoRA j's, which keeps the grouped shapes).
