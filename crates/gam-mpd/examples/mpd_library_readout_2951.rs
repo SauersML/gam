@@ -11,7 +11,8 @@
 //! prompts: [{tokens, baseline?, metric: "predicted" | {difference: {position, target, foil}}}]}`;
 //! `OUT_DIR` (fresh) receives `functions.json` (the attribution columns: name, layer, kind),
 //! `attributions.json` (per prompt its metric and predicted token per position and its file) and
-//! per prompt `prompt{i}.f64`, its positions × functions attributions as little-endian float64.
+//! per prompt `prompt{i}.f64` and `prompt{i}.outputs.f64`, its positions × functions attributions
+//! and output norms as little-endian float64.
 //!
 //! Without `ARTIFACT` (a `library_mdl` posterior-mean `artifact.bin`), the read-out is of the
 //! library's starting point, where every function is a native head or neuron. The model runs on
@@ -99,6 +100,8 @@ fn relp(args: &[String]) -> Result<(), String> {
         let file = format!("prompt{i}.f64");
         let bytes: Vec<u8> = a.attributions.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(out.join(&file), bytes).map_err(|e| e.to_string())?;
+        let bytes: Vec<u8> = a.outputs.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(out.join(format!("prompt{i}.outputs.f64")), bytes).map_err(|e| e.to_string())?;
         index.push(json!({"file": file, "rows": a.attributions.nrows(), "functions": a.attributions.ncols(), "metric": a.metric, "predicted": a.predicted}));
     }
     let report = json!({

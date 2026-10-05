@@ -572,13 +572,14 @@ pub enum Metric {
 }
 
 /// A prompt's attributions: per position the metric `m` (zero where it is not taken) and the
-/// predicted token, and `A_i(t)` per position and function (columns in [`Library::functions`]'s
-/// order).
+/// predicted token, and per position and function (columns in [`Library::functions`]'s order)
+/// `A_i(t)` and the function's output norm (`|h_i| ‖u_i‖`, a head's `‖W_O,h z_h‖`).
 #[derive(Clone, Debug)]
 pub struct PromptAttribution {
     pub metric: Vec<f64>,
     pub predicted: Vec<u32>,
     pub attributions: Array2<f64>,
+    pub outputs: Array2<f64>,
 }
 
 /// A function's identity: its name, layer and kind.
@@ -877,7 +878,20 @@ impl<'a> Library<'a> {
             };
             attributions.slice_mut(s![.., start..start + values.ncols()]).assign(&values);
         });
-        Ok(PromptAttribution { metric, predicted: predicted.into_iter().map(|t| t as u32).collect(), attributions })
+        let mut outputs = Array2::<f64>::zeros(attributions.dim());
+        for (b, block) in self.mlps.iter().enumerate() {
+            let norms = block.out.map_axis(Axis(0), |u| u.dot(&u).sqrt());
+            let start = mlp_columns[b];
+            outputs.slice_mut(s![.., start..start + norms.len()]).assign(&(pass.mlp[b].0.mapv(f64::abs) * &norms.view().insert_axis(Axis(0))));
+        }
+        for (l, members) in self.layer_heads.iter().enumerate() {
+            for (c, &h) in members.iter().enumerate() {
+                let z = &pass.head[h][2];
+                let gram = self.heads[h].output.t().dot(&self.heads[h].output);
+                outputs.column_mut(head_columns[l] + c).assign(&(z.dot(&gram) * z).sum_axis(Axis(1)).mapv(|v| v.max(0.0).sqrt()));
+            }
+        }
+        Ok(PromptAttribution { metric, predicted: predicted.into_iter().map(|t| t as u32).collect(), attributions, outputs })
     }
 }
 
