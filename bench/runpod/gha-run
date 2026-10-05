@@ -9,9 +9,15 @@
 #   gha-run NAME [-- COMMAND...]
 #       run COMMAND at origin/main (or GHA_REF=<published commit>) after building GHA_EXAMPLES and
 #       GHA_TESTS (PACKAGE:NAME words, run as $MPD_BIN/NAME and $MPD_BIN/test-NAME); COMMAND writes
-#       its results under $OUT, uploaded as artifact NAME. Returns once dispatched.
+#       its results under $OUT, uploaded as artifact NAME. One word after -- is shell code as
+#       written ('a && b > $OUT/x'); several are one command, each word quoted. Returns once
+#       dispatched. Longer than one job (6 h): GHA_LINKS=N chains up to N jobs; each stops COMMAND
+#       GHA_LINK_MINUTES (default 330) after the job starts, $DEADLINE giving that time, and a
+#       COMMAND that exits 75 or is stopped has $OUT carried to the next job, which runs COMMAND
+#       again on it (COMMAND resumes from its own state under $OUT).
 #   gha-run batch SPEC      one run per line of SPEC (NAME -- COMMAND..., shell quoting; leading
-#                           VAR=VALUE words set GHA_EXAMPLES, GHA_TESTS or GHA_REF for that line)
+#                           VAR=VALUE words set GHA_EXAMPLES, GHA_TESTS, GHA_REF, GHA_LINKS or
+#                           GHA_LINK_MINUTES for that line)
 #   gha-run status          the gha-run workflow's recent runs
 #   gha-run pull NAME       the newest run NAME's artifact into ~/mpd-data/gha/NAME/
 #
@@ -23,13 +29,14 @@
 set -euo pipefail
 REPO=SauersML/gam WORKFLOW=gha-run.yml MAC_GAM=/Users/user/gam
 API=(gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10")
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 2; }
 
 # Dispatches the workflow; prints the run id.
 dispatch() {  # NAME SHA KEY EXAMPLES TESTS COMMAND
     "${API[@]}" --method POST "repos/$REPO/actions/workflows/$WORKFLOW/dispatches" -f ref=main \
         -f "inputs[name]=$1" -f "inputs[sha]=$2" -f "inputs[key]=$3" -f "inputs[examples]=$4" \
-        -f "inputs[tests]=$5" -f "inputs[command]=$6" -F return_run_details=true | jq -er '.workflow_run_id'
+        -f "inputs[tests]=$5" -f "inputs[command]=$6" -f "inputs[links]=${GHA_LINKS:-1}" \
+        -f "inputs[link_minutes]=${GHA_LINK_MINUTES:-330}" -F return_run_details=true | jq -er '.workflow_run_id'
 }
 
 # The binaries KEY needs that the release lacks.
@@ -85,7 +92,7 @@ for line in open(sys.argv[1]):
         print("\x1f".join(words))' "$2" |
         while IFS=$'\x1f' read -r -a words; do
             envs=()
-            while [[ ${words[0]} =~ ^GHA_[A-Z]+= ]]; do envs+=("${words[0]}"); words=("${words[@]:1}"); done
+            while [[ ${words[0]} =~ ^GHA_[A-Z_]+= ]]; do envs+=("${words[0]}"); words=("${words[@]:1}"); done
             env "${envs[@]}" "$0" "${words[@]}"
         done ;;
     ''|-*) usage ;;
@@ -97,7 +104,7 @@ for line in open(sys.argv[1]):
         if [ $# -gt 0 ]; then
             [ "$1" = -- ] || usage
             shift
-            command=$(printf '%q ' "$@")
+            if [ $# -eq 1 ]; then command=$1; else command=$(printf '%q ' "$@"); fi
         fi
         case $command in *"$HOME"*|*/Users/*) echo "gha-run: COMMAND names a Mac path; a runner reads only the commit and public sources" >&2; exit 2 ;; esac
         sha=$(git -C "$MAC_GAM" rev-parse "${GHA_REF:-origin/main}^{commit}")

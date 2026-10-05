@@ -11,6 +11,11 @@ name: gha-run
 #  - command: COMMAND run at the commit after the build, with MPD_BIN the directory of the built
 #    binaries and OUT a directory uploaded as artifact NAME (7 days), which the Mac fetches with
 #    `gha-run pull NAME`.
+#  - chains: work longer than one job's 6 h runs as up to LINKS jobs in turn. Each link gives the
+#    command LINK_MINUTES from the job's start (less the build) and exports DEADLINE (epoch seconds)
+#    as that end. A command that exits 75 (unfinished; its state is saved under $OUT), or that the
+#    link's time stops, has OUT uploaded and the next link dispatched, which downloads OUT before
+#    running COMMAND again, so a command that resumes from its own state under $OUT continues.
 #
 # The repository is public, and so are this workflow's logs and artifacts: commands and inputs come
 # only from public sources (the commit, public datasets, our own public exports), never keys,
@@ -38,11 +43,25 @@ on:
       command:
         description: "Shell command run at the commit after the build (empty: none)"
         default: ""
+      links:
+        description: "Most jobs a chain runs (1: no chaining)"
+        default: "1"
+      link:
+        description: "This job's place in its chain"
+        default: "1"
+      link_minutes:
+        description: "Minutes from a job's start until its command is stopped"
+        default: "330"
+      resume_run:
+        description: "Run whose artifact NAME this job starts from (the previous link)"
+        default: ""
 
 run-name: gha-run ${{ inputs.name }}
 
 permissions:
   contents: write
+  # The next link of a chain is a dispatch of this workflow.
+  actions: write
 
 jobs:
   run:
@@ -55,7 +74,13 @@ jobs:
       EXAMPLES: ${{ inputs.examples }}
       TESTS: ${{ inputs.tests }}
       COMMAND: ${{ inputs.command }}
+      LINKS: ${{ inputs.links }}
+      LINK: ${{ inputs.link }}
+      LINK_MINUTES: ${{ inputs.link_minutes }}
     steps:
+      - name: Start
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha }}
@@ -106,13 +131,35 @@ jobs:
           for f in bin/*; do cp "$f" "publish/$KEY.$(basename "$f")"; done
           gh release upload rp-run-bin publish/* --clobber
 
+      - name: Previous link's outputs
+        if: inputs.command != '' && inputs.resume_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.name }}
+          path: out
+          run-id: ${{ inputs.resume_run }}
+          github-token: ${{ github.token }}
+
       - name: Command
+        id: command
         if: inputs.command != ''
         run: |
           mkdir -p out
           export MPD_BIN=$PWD/bin OUT=$PWD/out
-          bash -c "$COMMAND" 2>&1 | tee out/command.log
-          exit "${PIPESTATUS[0]}"
+          export DEADLINE=$(( JOB_START + LINK_MINUTES * 60 ))
+          left=$(( DEADLINE - $(date +%s) ))
+          (( left > 0 )) || { echo "no time left in this link (LINK_MINUTES $LINK_MINUTES)"; exit 1; }
+          echo "# link $LINK of at most $LINKS; the command stops at $(date -u -d "@$DEADLINE")" | tee -a out/command.log
+          set +e
+          timeout --signal=TERM --kill-after=60 "$left" bash -c "$COMMAND" 2>&1 | tee -a out/command.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          # 75: unfinished, its state under $OUT; 124: the link's time ran out.
+          if [ "$rc" = 75 ] || [ "$rc" = 124 ]; then
+            echo "more=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit "$rc"
 
       - uses: actions/upload-artifact@v4
         if: always() && inputs.command != ''
@@ -121,3 +168,14 @@ jobs:
           path: out/
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: Next link
+        if: steps.command.outputs.more == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (( LINK < LINKS )) || { echo "the command is unfinished after $LINKS links"; exit 1; }
+          gh workflow run gha-run.yml -R "$GITHUB_REPOSITORY" --ref main -f name="$NAME" -f sha="$SHA" -f key="" \
+            -f examples="$EXAMPLES" -f tests="$TESTS" -f command="$COMMAND" -f links="$LINKS" \
+            -f link="$(( LINK + 1 ))" -f link_minutes="$LINK_MINUTES" -f resume_run="$GITHUB_RUN_ID"
+          echo "dispatched link $(( LINK + 1 ))"
