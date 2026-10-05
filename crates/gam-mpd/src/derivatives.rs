@@ -211,8 +211,7 @@ pub fn jvp_seeded(
                 let mut out = zero();
                 for row in 0..rows {
                     let xr = x.row(row);
-                    let mean = xr.iter().map(|v| v * v).sum::<f64>() / n;
-                    let scale = 1.0 / (mean + epsilon).sqrt();
+                    let scale = super::operator_program::rms_scale(xr, *epsilon);
                     let dm = 2.0 * xr.iter().zip(dx.row(row).iter()).map(|(a, b)| a * b).sum::<f64>() / n;
                     let ds = -0.5 * scale * scale * scale * dm;
                     for c in 0..x.ncols() {
@@ -305,64 +304,7 @@ fn attend_tangent(
     rotary: Option<super::operator_program::Rotary>,
     causal: bool,
 ) -> Result<Array2<f64>, ProgramError> {
-    if inputs.rows >= 32 {
-        return super::tiled_attention::tangent(inputs, (query, key, value), (dq.as_ref(), dk.as_ref(), dv.as_ref()), scale.value(), rotary, causal);
-    }
-    let layout = inputs.layout.as_ref().ok_or_else(|| refuse("an attend node needs a sequence layout".to_string()))?;
-    let rows = inputs.rows;
-    let rotate = |m: &Array2<f64>| -> Array2<f64> {
-        let mut out = m.clone();
-        if let Some(r) = rotary {
-            for row in 0..rows {
-                let mut v = out.row(row).to_vec();
-                r.rotate(&mut v, None, layout.position[row]);
-                out.row_mut(row).assign(&ndarray::ArrayView1::from(&v));
-            }
-        }
-        out
-    };
-    let (q, k) = (rotate(query), rotate(key));
-    let dq = dq.map(|t| rotate(&t));
-    let dk = dk.map(|t| rotate(&t));
-    let c = scale.value();
-    let mut by_sequence: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
-    for row in 0..rows {
-        by_sequence.entry(layout.sequence[row]).or_default().push(row);
-    }
-    let mut out = Array2::<f64>::zeros((rows, value.ncols()));
-    for members in by_sequence.values() {
-        for &row in members {
-            let keys: Vec<usize> =
-                members.iter().copied().filter(|&o| !causal || layout.position[o] <= layout.position[row]).collect();
-            let scores: Vec<f64> = keys.iter().map(|&o| c * q.row(row).dot(&k.row(o))).collect();
-            let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let e: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
-            let total: f64 = e.iter().sum();
-            let alpha: Vec<f64> = e.iter().map(|v| v / total).collect();
-            let ds: Vec<f64> = keys
-                .iter()
-                .map(|&o| {
-                    let mut t = 0.0;
-                    if let Some(dq) = &dq {
-                        t += dq.row(row).dot(&k.row(o));
-                    }
-                    if let Some(dk) = &dk {
-                        t += q.row(row).dot(&dk.row(o));
-                    }
-                    c * t
-                })
-                .collect();
-            let mean: f64 = alpha.iter().zip(&ds).map(|(a, d)| a * d).sum();
-            for (j, &o) in keys.iter().enumerate() {
-                let dalpha = alpha[j] * (ds[j] - mean);
-                out.row_mut(row).scaled_add(dalpha, &value.row(o));
-                if let Some(dv) = &dv {
-                    out.row_mut(row).scaled_add(alpha[j], &dv.row(o));
-                }
-            }
-        }
-    }
-    Ok(out)
+    super::tiled_attention::tangent(inputs, (query, key, value), (dq.as_ref(), dk.as_ref(), dv.as_ref()), scale.value(), rotary, causal)
 }
 
 /// The cotangent of every node of `program` on `inputs` when the output's cotangent is
@@ -508,8 +450,7 @@ pub(crate) fn vjp_seeded(
                 let mut out = Array2::<f64>::zeros(x.dim());
                 for row in 0..rows {
                     let xr = x.row(row);
-                    let mean = xr.iter().map(|v| v * v).sum::<f64>() / n;
-                    let scale = 1.0 / (mean + epsilon).sqrt();
+                    let scale = super::operator_program::rms_scale(xr, *epsilon);
                     let inner = xr.dot(&cot.row(row));
                     for c in 0..x.ncols() {
                         out[[row, c]] = scale * cot[[row, c]] - scale * scale * scale / n * xr[c] * inner;
@@ -561,23 +502,6 @@ pub(crate) fn vjp_seeded(
     Ok(g)
 }
 
-/// The rotation of `m`'s rows to their positions (`inverse`: back from them), as the attend node
-/// applies it; a rotation is orthogonal, so its transpose is the inverse.
-fn rotate_rows(m: &Array2<f64>, rotary: Option<super::operator_program::Rotary>, positions: &[u32], inverse: bool) -> Array2<f64> {
-    let mut out = m.clone();
-    let Some(r) = rotary else { return out };
-    for (row, &position) in positions.iter().enumerate() {
-        for (plane, (a, b)) in r.pairs().into_iter().enumerate() {
-            let (c, s) = r.turn(plane, position);
-            let s = if inverse { -s } else { s };
-            let (x, y) = (out[[row, a]], out[[row, b]]);
-            out[[row, a]] = c * x - s * y;
-            out[[row, b]] = s * x + c * y;
-        }
-    }
-    out
-}
-
 /// The cotangents of query, key and value of causal rotary attention given the output's
 /// cotangent: the transpose of `attend_tangent`.
 fn attend_cotangent(
@@ -588,36 +512,5 @@ fn attend_cotangent(
     rotary: Option<super::operator_program::Rotary>,
     causal: bool,
 ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), ProgramError> {
-    if inputs.rows >= 32 {
-        return super::tiled_attention::backward(inputs, (query, key, value), cot, scale.value(), rotary, causal);
-    }
-    let layout = inputs.layout.as_ref().ok_or_else(|| refuse("an attend node needs a sequence layout".to_string()))?;
-    let rows = inputs.rows;
-    let (q, k) = (rotate_rows(query, rotary, &layout.position, false), rotate_rows(key, rotary, &layout.position, false));
-    let c = scale.value();
-    let mut by_sequence: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
-    for row in 0..rows {
-        by_sequence.entry(layout.sequence[row]).or_default().push(row);
-    }
-    let (mut gq, mut gk, mut gv) = (Array2::<f64>::zeros(q.dim()), Array2::<f64>::zeros(k.dim()), Array2::<f64>::zeros(value.dim()));
-    for members in by_sequence.values() {
-        for &row in members {
-            let keys: Vec<usize> =
-                members.iter().copied().filter(|&o| !causal || layout.position[o] <= layout.position[row]).collect();
-            let scores: Vec<f64> = keys.iter().map(|&o| c * q.row(row).dot(&k.row(o))).collect();
-            let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let e: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
-            let total: f64 = e.iter().sum();
-            let alpha: Vec<f64> = e.iter().map(|v| v / total).collect();
-            let dalpha: Vec<f64> = keys.iter().map(|&o| cot.row(row).dot(&value.row(o))).collect();
-            let mean: f64 = alpha.iter().zip(&dalpha).map(|(a, d)| a * d).sum();
-            for (j, &o) in keys.iter().enumerate() {
-                gv.row_mut(o).scaled_add(alpha[j], &cot.row(row));
-                let ds = alpha[j] * (dalpha[j] - mean);
-                gq.row_mut(row).scaled_add(c * ds, &k.row(o));
-                gk.row_mut(o).scaled_add(c * ds, &q.row(row));
-            }
-        }
-    }
-    Ok((rotate_rows(&gq, rotary, &layout.position, true), rotate_rows(&gk, rotary, &layout.position, true), gv))
+    super::tiled_attention::backward(inputs, (query, key, value), cot, scale.value(), rotary, causal)
 }

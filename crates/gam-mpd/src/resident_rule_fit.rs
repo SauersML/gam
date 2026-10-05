@@ -9,6 +9,7 @@ use crate::{
     },
 };
 use gam_gpu::tensor::{Arithmetic, Device, Tensor};
+use gam_math::categorical::log_softmax;
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -428,31 +429,11 @@ fn proposal_rows(step: usize, ordinary_rows: usize, rows: usize, hard: &[usize])
     selected
 }
 fn smooth_weights(norms: &[Vec<f64>], temperature: f64) -> Result<Vec<Vec<f64>>, String> {
-    let largest = norms.iter().flatten().try_fold(0f64, |largest, &value| {
-        let squared = value * value;
-        if !squared.is_finite() {
-            Err("smooth squared error overflow")
-        } else {
-            Ok(largest.max(squared))
-        }
-    })?;
-    let mut weights: Vec<Vec<f64>> = norms
-        .iter()
-        .map(|group| {
-            group
-                .iter()
-                .map(|v| ((v * v - largest) / temperature).exp())
-                .collect()
-        })
-        .collect();
-    let total = weights.iter().flatten().sum::<f64>();
-    if !total.is_finite() || total <= 0. {
-        return Err("invalid smooth proposal normalizer".into());
-    }
-    for value in weights.iter_mut().flatten() {
-        *value /= total;
-    }
-    Ok(weights)
+    // The softmax of `v²/T` over every row of every group.
+    let logits: Vec<f64> = norms.iter().flatten().map(|v| v * v / temperature).collect();
+    let log_weights = log_softmax(&logits).map_err(|e| format!("smooth proposal weights: {e}"))?;
+    let mut flat = log_weights.into_iter().map(f64::exp);
+    Ok(norms.iter().map(|group| group.iter().zip(flat.by_ref()).map(|(_, w)| w).collect()).collect())
 }
 fn proposal_weights(norms: &[Vec<f64>], batch: &BatchSchedule) -> Result<Vec<Vec<f64>>, String> {
     match batch.objective {
@@ -1406,7 +1387,7 @@ mod tests {
         )
         .is_err());
         let weights = smooth_weights(&[vec![1., 1.], vec![1., 1.]], 0.1).expect("stable tie");
-        assert_eq!(weights, vec![vec![0.25, 0.25]; 2]);
+        assert!(weights.iter().flatten().all(|w| (w - 0.25).abs() <= 4.0 * f64::EPSILON), "{weights:?}");
         let huge = smooth_weights(&[vec![f64::MAX]], 0.1);
         assert!(huge.is_err());
     }
@@ -1508,16 +1489,8 @@ mod tests {
             values
                 .iter()
                 .map(|group| {
-                    let max = group
-                        .iter()
-                        .map(|x| x * x)
-                        .fold(f64::NEG_INFINITY, f64::max);
-                    max + schedule.temperature
-                        * group
-                            .iter()
-                            .map(|x| ((x * x - max) / schedule.temperature).exp())
-                            .sum::<f64>()
-                            .ln()
+                    let logits: Vec<f64> = group.iter().map(|x| x * x / schedule.temperature).collect();
+                    schedule.temperature * gam_math::categorical::log_sum_exp(&logits).expect("finite logits")
                 })
                 .sum::<f64>()
                 / values.len() as f64
