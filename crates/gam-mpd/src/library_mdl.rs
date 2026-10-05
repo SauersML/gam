@@ -1861,6 +1861,47 @@ mod tests {
     }
 
     #[test]
+    fn compact_targets_of_a_tied_qwen3_head_are_the_full_logit_divergence() {
+        use crate::resident_causal_fit::fixed_head_target::{Head, ResidentHead, Teacher};
+        use gam_gpu::tensor::Arithmetic;
+        // M's head is its token embedding read transposed (tied) after the final norm. `P` is M
+        // with the first MLP's output map scaled, so the two next-token distributions differ.
+        let (native, _, family, _) = tiny_qwen3("library_tied_head");
+        let mut changed = native.clone();
+        let down = changed.operators.iter().position(|op| op.name == "blocks.0.down_proj").unwrap();
+        let op = Arc::clone(&changed.operators[down]);
+        changed.operators[down] = Arc::new(library_operator(&op.name, op.rows.clone(), op.cols.clone(), op.matrix() * 1.7, &op.name).unwrap());
+        let logits = |program: &OperatorProgram| program.execute(&family, false).unwrap().values[program.output].clone();
+        let (p, q) = (logits(&native), logits(&changed));
+        let log_softmax = |row: ndarray::ArrayView1<'_, f64>| {
+            let peak = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let partition = peak + row.iter().map(|x| (x - peak).exp()).sum::<f64>().ln();
+            row.mapv(|x| x - partition)
+        };
+        let full: Vec<f64> = p
+            .rows()
+            .into_iter()
+            .zip(q.rows())
+            .map(|(p, q)| {
+                let (lp, lq) = (log_softmax(p), log_softmax(q));
+                lp.iter().zip(&lq).map(|(a, b)| a.exp() * (a - b)).sum()
+            })
+            .collect();
+        let device = Device::host();
+        let head = Head::of(&native).unwrap();
+        let target = Teacher::new(&device, &native, 16, 1 << 26).unwrap().target(&family, None).unwrap();
+        let prefix = crate::device_program::DeviceProgram::compile_values(&device, &head.prefix(&changed)).unwrap();
+        let trace = prefix.forward(&family).unwrap();
+        let (compact, _) =
+            ResidentHead::new(&device, &head, 16).unwrap().score(&device, trace.value(prefix.hidden()).unwrap(), &target, false, Arithmetic::F64).unwrap();
+        assert_eq!(compact.len(), full.len());
+        assert!(full.iter().sum::<f64>() > 1e-3, "the scaled MLP moves the distributions");
+        for (row, (a, b)) in compact.iter().zip(&full).enumerate() {
+            assert!((a - b).abs() <= 1e-10 * (1.0 + b.abs()), "row {row}: compact KL {a} against the full-logit KL {b}");
+        }
+    }
+
+    #[test]
     fn the_starting_library_of_a_qwen3_decoder_is_the_model_in_every_experiment() {
         let (native, layers, family, sequences) = tiny_qwen3("library_start_qwen3");
         let explanation = explanation(&native, &layers).unwrap();
