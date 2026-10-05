@@ -1,0 +1,123 @@
+name: gha-run
+
+# CPU work for #2951 on a free runner of this public repository (4 CPUs, 16 GB RAM, 14 GB SSD, at
+# most 6 h), dispatched by bench/runpod/gha-run:
+#
+#  - binaries: the named examples and test binaries built at a commit on ubuntu-22.04, the release
+#    the GPU pods' image runs (runpod/pytorch:...-ubuntu22.04, same glibc). The CUDA code compiles at
+#    run time through NVRTC, so the build needs no CUDA toolkit and no GPU. With a KEY (rp-run's hash
+#    of the commit's Rust sources) they are published as assets KEY.NAME of the prerelease
+#    rp-run-bin, which pods download without credentials.
+#  - command: COMMAND run at the commit after the build, with MPD_BIN the directory of the built
+#    binaries and OUT a directory uploaded as artifact NAME (7 days), which the Mac fetches with
+#    `gha-run pull NAME`.
+#
+# The repository is public, and so are this workflow's logs and artifacts: commands and inputs come
+# only from public sources (the commit, public datasets, our own public exports), never keys,
+# credentials or private data. Inputs reach the shell through the environment, never spliced into
+# the script.
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "Run name: the artifact's name and the run's title"
+        required: true
+      sha:
+        description: "Commit to build and run at (40 hex)"
+        required: true
+      key:
+        description: "rp-run's source hash: publish the binaries as rp-run-bin assets KEY.NAME (empty: no release)"
+        default: ""
+      examples:
+        description: "Examples to build, as PACKAGE:EXAMPLE words"
+        default: ""
+      tests:
+        description: "Test binaries to build, as PACKAGE:TEST words (installed as test-TEST)"
+        default: ""
+      command:
+        description: "Shell command run at the commit after the build (empty: none)"
+        default: ""
+
+run-name: gha-run ${{ inputs.name }}
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    env:
+      NAME: ${{ inputs.name }}
+      SHA: ${{ inputs.sha }}
+      KEY: ${{ inputs.key }}
+      EXAMPLES: ${{ inputs.examples }}
+      TESTS: ${{ inputs.tests }}
+      COMMAND: ${{ inputs.command }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+          # The command gets no credentials: the token stays with the publish step.
+          persist-credentials: false
+
+      - name: Toolchain (rust-toolchain.toml's)
+        run: rustup toolchain install "$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)" --profile minimal
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ inputs.sha }}
+          restore-keys: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          for pkg in $(for w in $EXAMPLES; do echo "${w%%:*}"; done | sort -u); do
+            flags=()
+            for w in $EXAMPLES; do [ "${w%%:*}" = "$pkg" ] && flags+=(--example "${w#*:}"); done
+            cargo build --release -p "$pkg" "${flags[@]}"
+          done
+          for w in $EXAMPLES; do cp "target/release/examples/${w#*:}" bin/; done
+          for w in $TESTS; do
+            pkg=${w%%:*} name=${w#*:}
+            exe=$(cargo test -p "$pkg" --test "$name" --no-run --message-format=json |
+              jq -r --arg n "$name" 'select(.reason == "compiler-artifact" and .executable != null and .target.name == $n) | .executable' | tail -n 1)
+            [ -n "$exe" ] || { echo "no test executable for $w"; exit 1; }
+            cp "$exe" "bin/test-$name"
+          done
+          ls -la bin
+
+      - name: Publish binaries (assets KEY.NAME of the prerelease rp-run-bin)
+        if: inputs.key != '' && (inputs.examples != '' || inputs.tests != '')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view rp-run-bin > /dev/null 2>&1 ||
+            gh release create rp-run-bin --prerelease --title "rp-run binaries" \
+              --notes "Linux x86_64 binaries (ubuntu-22.04) of gam-mpd and gam-gpu examples and tests, one set per rp-run source hash, for #2951's rented GPU pods. Built by .github/workflows/gha-run.yml." || true
+          mkdir -p publish
+          for f in bin/*; do cp "$f" "publish/$KEY.$(basename "$f")"; done
+          gh release upload rp-run-bin publish/* --clobber
+
+      - name: Command
+        if: inputs.command != ''
+        run: |
+          mkdir -p out
+          export MPD_BIN=$PWD/bin OUT=$PWD/out
+          bash -c "$COMMAND" 2>&1 | tee out/command.log
+          exit "${PIPESTATUS[0]}"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.command != ''
+        with:
+          name: ${{ inputs.name }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: ignore
