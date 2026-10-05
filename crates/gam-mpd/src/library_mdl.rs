@@ -72,8 +72,11 @@
 //! (their information content). Prefix lengths are searched by bisection, `O(log n)` full training
 //! evaluations for `n` active groups, and the longest evaluated prefix that does not increase the
 //! sampled objective is removed. The objective is estimated over the whole training set with one
-//! common weight sample per batch for both sides of every comparison. The order and the search are
-//! a proposal; the acceptance is the objective, so a removal never increases `F`. Removal effects
+//! common weight sample per batch for both sides of every comparison. Experiment identities and
+//! patch directions are held at the posterior before removal throughout that round. The order and
+//! the search are a proposal; acceptance never increases this round's sampled objective. After an
+//! accepted removal, training redefines the experiments over the surviving variables, so this is
+//! not a claim of monotonicity on one fixed dataset across rounds. Removal effects
 //! can cancel, so the objective need not be monotone in the prefix length and the search may miss a
 //! longer acceptable prefix; the next round, after the continuous fit converges again, proposes
 //! again. The fit alternates converging and removing until no removal is accepted.
@@ -1370,17 +1373,18 @@ pub fn fit(
 }
 
 /// `E_q[D]` over every training batch in nats, one weight sample per batch from the removal seeds,
-/// with the groups `removed` (and the already removed ones) zeroed.
+/// with the groups `removed` (and the already removed ones) zeroed. Experiment identities and
+/// patch directions come from `posterior`, before removal, so every trial scores the same evidence.
 fn expected_divergence(scorer: &mut Scorer, posterior: &Posterior, draws: &[Draw], sequences: &[Vec<u32>], removed: &[usize], settings: &Settings) -> Result<f64, String> {
+    let variables = scorer.variables(posterior)?;
     let mut trial = posterior.clone();
     trial.remove(removed);
-    let variables = scorer.variables(&trial)?;
     let mut bits = 0.0;
     for (b, draw) in draws.iter().enumerate() {
         // Removal zeroes entries, so the remaining entries see the same noise as the full posterior.
         let (theta, _) = trial.sample(noise_seed(settings.seed, 0, b));
         let experiments = draw.experiments(scorer.layers(), variables.len());
-        let (scored, _) = scorer.score(&draw.batch(sequences)?, &experiments, &variables, &trial.mean, Some(&theta), false)?;
+        let (scored, _) = scorer.score(&draw.batch(sequences)?, &experiments, &variables, &posterior.mean, Some(&theta), false)?;
         bits += scored.iter().flatten().sum::<f64>();
     }
     Ok(bits * LN_2)
@@ -1419,7 +1423,7 @@ fn largest_accepted_prefix(
 }
 
 /// The removal step (module note): a prefix of the active groups in increasing divergence whose
-/// removal does not increase the sampled objective, found by bisection.
+/// removal does not increase the sampled objective on this round's fixed evidence, found by bisection.
 fn remove(scorer: &mut Scorer, posterior: &mut Posterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings) -> Result<Removal, String> {
     let divergences = posterior.divergences();
     let costs = posterior.costs();
@@ -1645,6 +1649,56 @@ mod tests {
             assert!(count.nonzero_per_token > 0.0 && count.nonzero_per_token < layer.functions.len() as f64, "ReLU functions are exactly zero on some tokens");
             assert!(count.resolved_per_token <= count.nonzero_per_token);
         }
+    }
+
+    #[test]
+    fn removal_scores_the_reference_experiments_and_patch_directions() {
+        let (native, layers, _, sequences) = tiny("library_removal_evidence", "relu");
+        let explanation = explanation(&native, &layers).unwrap();
+        let settings = settings();
+        let posterior = Posterior::new(&explanation, 2 * sequences.len() * 12).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let variables = scorer.variables(&posterior).unwrap();
+        let removed: Vec<usize> = (0..posterior.active.len()).collect();
+        let mut trial = posterior.clone();
+        trial.remove(&removed);
+        let trial_variables = scorer.variables(&trial).unwrap();
+        assert!(!variables.is_empty() && trial_variables.is_empty(), "removal must change the read-variable population");
+
+        let (mut reference_bits, mut changed_data_bits, mut changed_directions_bits) = (0.0, 0.0, 0.0);
+        let mut read_patches = 0;
+        for (b, draw) in draws.iter().enumerate() {
+            let batch = draw.batch(&sequences).unwrap();
+            let experiments = draw.experiments(scorer.layers(), variables.len());
+            read_patches += experiments.iter().filter(|e| matches!(e.patch, Some(Patch::Read { .. }))).count();
+            let (theta, _) = trial.sample(noise_seed(settings.seed, 0, b));
+
+            // Build the reference intervention independently of Scorer::score, before loading
+            // the zeroed candidate. Both the native target and candidate use this same design.
+            scorer.experiments.load(&posterior.mean).unwrap();
+            let design = interchange::design(&scorer.experiments.models().1, &variables, &experiments).unwrap();
+            scorer.experiments.load(&theta).unwrap();
+            let (m, p) = scorer.experiments.models();
+            let head = scorer.experiments.head();
+            let teacher = interchange::Teacher::new(&m, head, &batch, &variables, &experiments).unwrap();
+            let reference = interchange::evaluate(&m, &p, head, &batch, &teacher, &experiments, &design, false).unwrap();
+            reference_bits += reference.bits.iter().flatten().sum::<f64>();
+
+            // The former implementation redrew experiments and directions from the trial.
+            let redrawn = draw.experiments(scorer.layers(), trial_variables.len());
+            let (bits, _) = scorer.score(&batch, &redrawn, &trial_variables, &trial.mean, Some(&theta), false).unwrap();
+            changed_data_bits += bits.iter().flatten().sum::<f64>();
+            // Freezing identities alone is insufficient: zeroed reads change the patch basis.
+            let (bits, _) = scorer.score(&batch, &experiments, &variables, &trial.mean, Some(&theta), false).unwrap();
+            changed_directions_bits += bits.iter().flatten().sum::<f64>();
+        }
+        assert!(read_patches > 0, "the reference evidence must include a removed read variable");
+        let actual = expected_divergence(&mut scorer, &posterior, &draws, &sequences, &removed, &settings).unwrap();
+        let reference = reference_bits * LN_2;
+        assert!((actual - reference).abs() < 1e-10 * reference.abs().max(1.0), "removal must score the reference evidence");
+        assert!((reference_bits - changed_data_bits).abs() > 1e-8, "redrawing the evidence must expose the former comparison error");
+        assert!((reference_bits - changed_directions_bits).abs() > 1e-8, "recomputing patch directions must change the evidence even with fixed identities");
     }
 
     #[test]
