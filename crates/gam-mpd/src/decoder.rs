@@ -141,9 +141,13 @@ pub struct Tape {
     inner: Inner,
 }
 
+/// The projections and the MLP's input products are recomputed in the reverse pass from the read
+/// (one product each) rather than kept: they are the largest values of a block (the MLP's inputs
+/// six times the stream's width per row in Qwen3), and keeping them would bound the rows a step can
+/// take by memory.
 enum Inner {
-    Attention { projections: Tensor, head_scales: Option<Tensor>, heads: Tensor, angles: Option<(Tensor, Tensor)>, attended: (Tensor, Tensor), sequences: Vec<Range<usize>> },
-    Mlp { pre: Tensor, active: Tensor, out: Option<(Tensor, Tensor)> },
+    Attention { head_scales: Option<Tensor>, heads: Tensor, angles: Option<(Tensor, Tensor)>, attended: (Tensor, Tensor), sequences: Vec<Range<usize>> },
+    Mlp { out: Option<(Tensor, Tensor)> },
 }
 
 /// Node `n` when it is an affine node of one term with no bias: its input and operator.
@@ -289,13 +293,13 @@ impl Decoder {
                     let attention = 2.0 * 2.0 * rows * (length / 2.0) * w * heads;
                     forward += products + attention;
                     // The scores recomputed, then four products (weights', values', queries', keys').
-                    reverse += 2.0 * products + 0.5 * attention + 2.0 * attention;
+                    reverse += 2.0 * products + 2.0 * rows * d * a.projections.rows as f64 + 0.5 * attention + 2.0 * attention;
                 }
                 Block::Mlp(m) => {
                     let inputs = m.input.rows as f64;
                     let products = 2.0 * rows * d * (inputs + if m.gated { inputs / 2.0 } else { inputs });
                     forward += products;
-                    reverse += 2.0 * products;
+                    reverse += 2.0 * products + 2.0 * rows * d * inputs;
                 }
             }
         }
@@ -597,7 +601,7 @@ impl BlockEngine for Decoder {
                 let sequences: Vec<Range<usize>> = ranges.iter().scan(0, |at, r| { *at += r.len(); Some(*at - r.len()..*at) }).collect();
                 let attended = d.causal_attention(&heads, a.layout, &sequences, a.scale).map_err(error)?;
                 d.gemm(&mut out, 1.0, &attended.0, Op::N, &w.output, Op::T, 1.0, Arithmetic::Bf16).map_err(error)?;
-                Inner::Attention { projections: p, head_scales, heads, angles, attended, sequences }
+                Inner::Attention { head_scales, heads, angles, attended, sequences }
             }
             Block::Mlp(m) => {
                 let mut pre = d.empty(x.rows(), m.input.rows).map_err(error)?;
@@ -612,7 +616,7 @@ impl BlockEngine for Decoder {
                     }
                     _ => None,
                 };
-                Inner::Mlp { pre, active, out: last }
+                Inner::Mlp { out: last }
             }
         };
         self.scatter(stream, ranges, out)?;
@@ -634,14 +638,16 @@ impl BlockEngine for Decoder {
         let rows = g.rows();
         let mut g_read = d.empty(rows, self.width).map_err(error)?;
         match (&self.blocks[block], &tape.inner) {
-            (Block::Attention(a), Inner::Attention { projections, head_scales, heads, angles, attended, sequences }) => {
+            (Block::Attention(a), Inner::Attention { head_scales, heads, angles, attended, sequences }) => {
+                let mut projections = d.empty(rows, a.projections.rows).map_err(error)?;
+                d.gemm(&mut projections, 1.0, &tape.read, Op::N, &w.input, Op::T, 0.0, Arithmetic::Bf16).map_err(error)?;
                 let mut g_attended = d.empty(rows, a.layout.queries * a.layout.width).map_err(error)?;
                 d.gemm(&mut g_attended, 1.0, &g, Op::N, &w.output, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
                 let g_heads = d.causal_attention_backward(heads, a.layout, sequences, a.scale, (&attended.0, &attended.1), &g_attended).map_err(error)?;
                 let rotation = angles.as_ref().zip(a.rotary).map(|((c, s), r)| (c, s, r.half_split));
                 let norm = w.norms.as_ref().zip(head_scales.as_ref());
                 // The cotangent feeds two products: rounded to bfloat16 once.
-                let g_p = d.bf16_copy(&d.heads_rope_backward(projections, a.layout, norm, rotation, &g_heads).map_err(error)?).map_err(error)?;
+                let g_p = d.bf16_copy(&d.heads_rope_backward(&projections, a.layout, norm, rotation, &g_heads).map_err(error)?).map_err(error)?;
                 if a.projections.parts.iter().any(|(op, _, _)| self.trainable.contains(op)) {
                     let mut stacked = d.empty(a.projections.rows, a.projections.cols).map_err(error)?;
                     d.gemm(&mut stacked, 1.0, &g_p, Op::T, &tape.read, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
@@ -649,7 +655,10 @@ impl BlockEngine for Decoder {
                 }
                 d.gemm(&mut g_read, 1.0, &g_p, Op::N, &w.input, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
             }
-            (Block::Mlp(m), Inner::Mlp { pre, active, out }) => {
+            (Block::Mlp(m), Inner::Mlp { out }) => {
+                let mut pre = d.empty(rows, m.input.rows).map_err(error)?;
+                d.gemm(&mut pre, 1.0, &tape.read, Op::N, &w.input, Op::T, 0.0, Arithmetic::Bf16).map_err(error)?;
+                let active = if m.gated { d.swiglu(&pre) } else { d.gelu_tanh(&pre, w.bias.as_ref()) }.map_err(error)?;
                 if let (Some((residual, k)), Some(gain)) = (out, &w.last) {
                     let mut g_residual = d.zeros(rows, self.width).map_err(error)?;
                     d.rms_gain_backward((residual, gain, k), &g, &mut g_residual).map_err(error)?;
@@ -660,10 +669,10 @@ impl BlockEngine for Decoder {
                 d.gemm(&mut g_active, 1.0, &g16, Op::N, &w.output, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
                 if self.trainable.contains(&m.output) {
                     let mut g_output = d.empty(self.width, active.cols()).map_err(error)?;
-                    d.gemm(&mut g_output, 1.0, &g16, Op::T, active, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
+                    d.gemm(&mut g_output, 1.0, &g16, Op::T, &active, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
                     add(d, gradient, m.output, g_output)?;
                 }
-                let g_pre = d.bf16_copy(&if m.gated { d.swiglu_backward(pre, &g_active) } else { d.gelu_tanh_backward(pre, w.bias.as_ref(), &g_active) }.map_err(error)?).map_err(error)?;
+                let g_pre = d.bf16_copy(&if m.gated { d.swiglu_backward(&pre, &g_active) } else { d.gelu_tanh_backward(&pre, w.bias.as_ref(), &g_active) }.map_err(error)?).map_err(error)?;
                 if m.input.parts.iter().any(|(op, _, _)| self.trainable.contains(op)) {
                     let mut stacked = d.empty(m.input.rows, m.input.cols).map_err(error)?;
                     d.gemm(&mut stacked, 1.0, &g_pre, Op::T, &tape.read, Op::N, 0.0, Arithmetic::Bf16).map_err(error)?;
@@ -686,15 +695,14 @@ impl BlockEngine for Decoder {
 
     fn tape_bytes(tape: &Tape) -> usize {
         let inner = match &tape.inner {
-            Inner::Attention { projections, head_scales, heads, angles, attended, .. } => {
-                projections.bytes()
-                    + head_scales.as_ref().map_or(0, Tensor::bytes)
+            Inner::Attention { head_scales, heads, angles, attended, .. } => {
+                head_scales.as_ref().map_or(0, Tensor::bytes)
                     + heads.bytes()
                     + angles.as_ref().map_or(0, |(c, s)| c.bytes() + s.bytes())
                     + attended.0.bytes()
                     + attended.1.bytes()
             }
-            Inner::Mlp { pre, active, out } => pre.bytes() + active.bytes() + out.as_ref().map_or(0, |(r, k)| r.bytes() + k.bytes()),
+            Inner::Mlp { out } => out.as_ref().map_or(0, |(r, k)| r.bytes() + k.bytes()),
         };
         tape.x.bytes() + tape.scale.bytes() + tape.read.bytes() + inner
     }
