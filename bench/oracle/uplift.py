@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -161,7 +162,12 @@ def measure(run: Path):
             if out.exists():
                 continue
             tmp = Path(f"{out}.partial")
-            subprocess.run([sys.executable, str(ORGANISM_PY), "choices", "--model", str(ORGANISMS / organism / role), "--items", str(run / "items" / f"{organism}.jsonl"), "--out", str(tmp)], check=True)
+            # The memory the Mac's job ledger reserves, as the organisms' scorer reserves it: a float32
+            # copy of the model (4 bytes per parameter) and half again for the device's working copies,
+            # plus 5 GiB for the runtime and the logits.
+            params_b = json.loads((ORGANISMS / organism / "card.json").read_text())["parameters_billions"]
+            env = dict(os.environ, MPD_MEM_GIB=str(math.ceil(6 * params_b) + 5))
+            subprocess.run([sys.executable, str(ORGANISM_PY), "choices", "--model", str(ORGANISMS / organism / role), "--items", str(run / "items" / f"{organism}.jsonl"), "--out", str(tmp)], check=True, env=env)
             os.replace(tmp, out)
             print(f"measured {organism} {role}", file=sys.stderr)
 
