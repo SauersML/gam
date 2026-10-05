@@ -7,7 +7,9 @@
 //! `q = G_m Q x`, `k = K x`, where `G_m` (head dimension square, starting at the identity) is its
 //! own part. Every member keeps its value map. The shared maps carry the prior groups of one head
 //! (a group per rotary plane, as in the library), paid once in `KL(q ‖ p)`; each `G_m` is one
-//! group. Members sit in different layers, so each layer's read of `Q x` stays its own variable.
+//! group. Members sit in different layers, so each layer's read of `Q x` stays its own variable,
+//! and each reads a key of its own: a key the query heads of one key-value group share stays
+//! that group's.
 //! The move is accepted only if the code length `F` of the re-converged fit falls.
 //!
 //! # Candidates
@@ -69,7 +71,8 @@ fn head(program: &OperatorProgram, layer: usize, h: usize) -> Result<Option<Head
     Ok(Some(Head { rule, query: map(1)?, key: map(2)?, rotary }))
 }
 
-/// Every head of the explanation, by `(layer, head)`.
+/// Every head of the explanation, by `(layer, head)`, whose key no other head reads: a key that
+/// the query heads of one key-value group share (`library_mdl::explanation`) stays that group's.
 fn heads(explanation: &Explanation) -> Result<BTreeMap<(usize, usize), Head>, String> {
     let program = &explanation.artifact.program;
     let mut out = BTreeMap::new();
@@ -79,6 +82,11 @@ fn heads(explanation: &Explanation) -> Result<BTreeMap<(usize, usize), Head>, St
             out.insert((l, h), found);
         }
     }
+    let mut readers: BTreeMap<usize, usize> = BTreeMap::new();
+    for found in out.values() {
+        *readers.entry(found.key).or_default() += 1;
+    }
+    out.retain(|_, found| readers[&found.key] == 1);
     Ok(out)
 }
 
@@ -160,7 +168,7 @@ pub fn share_query_key(explanation: &Explanation, members: &[(usize, usize)]) ->
         return Err("the members of a shared query-key function lie in different layers".into());
     }
     let all = heads(explanation)?;
-    let found: Vec<&Head> = members.iter().map(|m| all.get(m).ok_or_else(|| format!("no head {m:?}"))).collect::<Result<_, _>>()?;
+    let found: Vec<&Head> = members.iter().map(|m| all.get(m).ok_or_else(|| format!("no head {m:?} with a key of its own"))).collect::<Result<_, _>>()?;
     let mut artifact = explanation.artifact.clone();
     let program = &mut artifact.program;
     let owner = found[0];
@@ -288,6 +296,29 @@ mod tests {
         assert_eq!(shared.trainable.len(), start.trainable.len() - 1);
         Posterior::new(&shared, 2 * 6 * 12).expect("every shared entry in one group");
         assert!(share_query_key(&start, &[(0, 0), (0, 1)]).is_err());
+    }
+
+    #[test]
+    fn a_key_shared_by_a_key_value_group_is_never_a_member() {
+        let dir = crate::test_support::tiny_export("library_sharing_grouped", 2);
+        let path = dir.join("export.json");
+        let mut record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        record["config"]["n_kv_heads"] = 1.into();
+        for l in 0..2 {
+            for name in ["attn.k_proj", "attn.v_proj"] {
+                let name = format!("blocks.{l}.{name}");
+                let values = std::fs::read(dir.join(format!("{name}.f64"))).unwrap();
+                std::fs::write(dir.join(format!("{name}.f64")), &values[..4 * 8 * 8]).unwrap();
+                record["files"][name] = serde_json::json!({"shape": [4, 8]});
+            }
+        }
+        std::fs::write(&path, record.to_string()).unwrap();
+        let imported = import_language_model(&dir, 6, 12).expect("import");
+        std::fs::remove_dir_all(dir).unwrap();
+        let native = split_sites(&imported.program).expect("split");
+        let start = explanation(&native, &layer_nodes(&native, 2).expect("layers")).expect("explanation");
+        assert!(query_key_pairs(&start).unwrap().is_empty(), "every head's key is its group's");
+        assert!(share_query_key(&start, &[(0, 0), (1, 0)]).is_err());
     }
 
     #[test]
