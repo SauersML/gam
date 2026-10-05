@@ -1,0 +1,196 @@
+{
+  "arms": [
+    "shared",
+    "untied"
+  ],
+  "backend": "host",
+  "eval_manifest_only_until_pareto_freeze": {
+    "name": "eval",
+    "record": {
+      "config": {
+        "serialization": "f32",
+        "synthetic": true,
+        "uses": 2,
+        "width": 8
+      },
+      "distribution": "uniform",
+      "range": [
+        -2.0,
+        2.0
+      ],
+      "scope": "SYNTHETIC CALIBRATION ONLY",
+      "source": {
+        "checkpoint_sha256": "59aa1231e5ac701a47ee8130fa2e6ac6f0b7087d004753e6562c36f4e11028b6"
+      }
+    },
+    "rows": 256,
+    "values": [
+      {
+        "encoding": "f64_le",
+        "file": "eval-use0-input.f64",
+        "layer": 0,
+        "role": "input",
+        "sha256": "ba18e2fe126cd445f92ad3e8a3e48b8bbfca425ac18379bd85d7c94452f08802",
+        "width": 8
+      },
+      {
+        "encoding": "f64_le",
+        "file": "eval-use0-write.f64",
+        "layer": 0,
+        "role": "write",
+        "sha256": "1d8940a50cd7177a6db6bd4ce3ab23a93ef23a1f4c1cda690e648bcff7982379",
+        "width": 8
+      },
+      {
+        "encoding": "f64_le",
+        "file": "eval-use1-input.f64",
+        "layer": 1,
+        "role": "input",
+        "sha256": "5864f16d1c2a0e4c52ffe2c8931fbeeab48ffe97a1b7a15b429b776f6722c53b",
+        "width": 8
+      },
+      {
+        "encoding": "f64_le",
+        "file": "eval-use1-write.f64",
+        "layer": 1,
+        "role": "write",
+        "sha256": "44465f2f1e587e40bbc1bfc7008b4abb8f3b1f478cbdd156230ee7972c379731",
+        "width": 8
+      }
+    ]
+  },
+  "extract_sha256": "c9072a127c120fe1a177ff67fe3f85a92fa9c024aab1930cfd3f9ad6afba9ce2",
+  "grammar_truncated": false,
+  "layers": [
+    0,
+    1
+  ],
+  "scope": "Finite proposed composed-program grammar only. Training arrays passed as BOTH fit training and fit validation; all optimizer validation fields during search refer to TRAIN. Training selection uses ordinary decoded-f32 F64 training measurement plus complete standalone C32. Heldout arrays loaded only after Pareto IDs and matched-control evaluation IDs saved. Row-disjointness is asserted by the recorded extraction lineage, not proven by unequal array hashes. No native full-model Local/Run, discovered algorithm, or global grammar optimum claim.",
+  "seed": 29512000,
+  "selected_expression_ids": [
+    32
+  ],
+  "selection_scope": "optional declared subinventory, original IDs retained, no renumbering; omitted forms unassessed",
+  "settings": {
+    "batch_schedule": {
+      "hard_rows": 0,
+      "ordinary_rows": 128,
+      "scan_every": 16,
+      "temperature": 0.02
+    },
+    "expression_ids": [
+      32
+    ],
+    "fit": {
+      "arithmetic": "f64",
+      "backtracking": null,
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "epsilon": 1e-8,
+      "forward_rows": 128,
+      "iterations": 8192,
+      "learning_rate": 0.01,
+      "numeric_bytes": 536870912
+    },
+    "grammar": {
+      "affine": true,
+      "arguments": 1,
+      "binary": [
+        "multiply"
+      ],
+      "max_expressions": 10000,
+      "max_operations": 3,
+      "unary": [
+        "relu"
+      ]
+    },
+    "layers": [
+      0,
+      1
+    ],
+    "seed": 29512000,
+    "width": 8
+  },
+  "settings_sha256": "beecb4a8b6f0c6da4118f4d02b4ee225cf78e9fe662575c44d3eebe2f189a27b",
+  "source_expression_count": 46,
+  "train": {
+    "arrays": [
+      {
+        "descriptor": {
+          "encoding": "f64_le",
+          "file": "train-use0-input.f64",
+          "layer": 0,
+          "role": "input",
+          "sha256": "6b1aa102c67e881e8225100b8baf3eea181c38417735e9ab4edbabe883d13591",
+          "width": 8
+        },
+        "layer": 0,
+        "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/train-use0-input.f64",
+        "role": "input",
+        "sha256": "6b1aa102c67e881e8225100b8baf3eea181c38417735e9ab4edbabe883d13591"
+      },
+      {
+        "descriptor": {
+          "encoding": "f64_le",
+          "file": "train-use0-write.f64",
+          "layer": 0,
+          "role": "write",
+          "sha256": "50716575ec85b0f87f9371ddd60ba86bd037efb0fe850e15688b31102d89127f",
+          "width": 8
+        },
+        "layer": 0,
+        "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/train-use0-write.f64",
+        "role": "write",
+        "sha256": "50716575ec85b0f87f9371ddd60ba86bd037efb0fe850e15688b31102d89127f"
+      },
+      {
+        "descriptor": {
+          "encoding": "f64_le",
+          "file": "train-use1-input.f64",
+          "layer": 1,
+          "role": "input",
+          "sha256": "2398e657fab11e06ab70e76d2c36aa510008fca86c3c40a4534b25a4890f38d7",
+          "width": 8
+        },
+        "layer": 1,
+        "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/train-use1-input.f64",
+        "role": "input",
+        "sha256": "2398e657fab11e06ab70e76d2c36aa510008fca86c3c40a4534b25a4890f38d7"
+      },
+      {
+        "descriptor": {
+          "encoding": "f64_le",
+          "file": "train-use1-write.f64",
+          "layer": 1,
+          "role": "write",
+          "sha256": "0eff7e95ae512884f0aa774cea45f435b4944583666739e2056f2f9c63aa31bd",
+          "width": 8
+        },
+        "layer": 1,
+        "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/train-use1-write.f64",
+        "role": "write",
+        "sha256": "0eff7e95ae512884f0aa774cea45f435b4944583666739e2056f2f9c63aa31bd"
+      }
+    ],
+    "name": "train",
+    "record": {
+      "config": {
+        "serialization": "f32",
+        "synthetic": true,
+        "uses": 2,
+        "width": 8
+      },
+      "distribution": "uniform",
+      "range": [
+        -1.0,
+        1.0
+      ],
+      "scope": "SYNTHETIC CALIBRATION ONLY",
+      "source": {
+        "checkpoint_sha256": "59aa1231e5ac701a47ee8130fa2e6ac6f0b7087d004753e6562c36f4e11028b6"
+      }
+    },
+    "rows": 128
+  },
+  "width": 8
+}

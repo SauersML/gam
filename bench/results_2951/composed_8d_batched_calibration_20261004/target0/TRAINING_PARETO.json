@@ -1,0 +1,88 @@
+{
+  "candidates": [
+    {
+      "arm": "shared",
+      "artifact": "/Users/user/mpd-data/codex/composed-8d-batched-calibration-20261004/target0-run/candidate00064/program.artifact",
+      "expression_index": 32,
+      "id": 64,
+      "standalone_c32": 12257,
+      "training": {
+        "group_maxima": [
+          7.934295690015243e-7,
+          6.411954571121633e-7
+        ],
+        "maximum": 7.934295690015243e-7,
+        "scales": [
+          {
+            "group": {
+              "end": 8,
+              "label": "use 0",
+              "start": 0
+            },
+            "native_rms": 0.6817936234766775
+          },
+          {
+            "group": {
+              "end": 16,
+              "label": "use 1",
+              "start": 8
+            },
+            "native_rms": 0.6198265947913436
+          }
+        ],
+        "worst_group": 0,
+        "worst_row": 111
+      }
+    },
+    {
+      "arm": "untied",
+      "artifact": "/Users/user/mpd-data/codex/composed-8d-batched-calibration-20261004/target0-run/candidate00065/program.artifact",
+      "expression_index": 32,
+      "id": 65,
+      "standalone_c32": 14720,
+      "training": {
+        "group_maxima": [
+          1.120478127476566e-7,
+          1.1084443480664468e-7
+        ],
+        "maximum": 1.120478127476566e-7,
+        "scales": [
+          {
+            "group": {
+              "end": 8,
+              "label": "use 0",
+              "start": 0
+            },
+            "native_rms": 0.6817936234766775
+          },
+          {
+            "group": {
+              "end": 16,
+              "label": "use 1",
+              "start": 8
+            },
+            "native_rms": 0.6198265947913436
+          }
+        ],
+        "worst_group": 0,
+        "worst_row": 12
+      }
+    }
+  ],
+  "criteria": [
+    "decoded F64 training maximum",
+    "complete standalone C32"
+  ],
+  "evaluation_policy": "Pareto plus same-expression matched shared/untied controls, even training-dominated; failed controls remain unresolved",
+  "frozen_before_heldout_array_load": true,
+  "frozen_evaluation_ids": [
+    64,
+    65
+  ],
+  "ids": [
+    64,
+    65
+  ],
+  "scope": "Pareto of successfully measured finite fitted proposals; failed/unmeasured proposals unresolved, no completeness or optimality claim",
+  "tie_policy": "retain exact ties; dominance requires one strict improvement"
+}

@@ -1,0 +1,811 @@
+{
+  "expressions": [
+    {
+      "argument": 0
+    },
+    {
+      "unary": [
+        "relu",
+        {
+          "argument": 0
+        }
+      ]
+    },
+    {
+      "affine": {
+        "argument": 0
+      }
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "argument": 0
+        }
+      ]
+    },
+    {
+      "unary": [
+        "relu",
+        {
+          "unary": [
+            "relu",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "unary": [
+          "relu",
+          {
+            "argument": 0
+          }
+        ]
+      }
+    },
+    {
+      "unary": [
+        "relu",
+        {
+          "affine": {
+            "argument": 0
+          }
+        }
+      ]
+    },
+    {
+      "affine": {
+        "affine": {
+          "argument": 0
+        }
+      }
+    },
+    {
+      "unary": [
+        "relu",
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "binary": [
+          "multiply",
+          {
+            "argument": 0
+          },
+          {
+            "argument": 0
+          }
+        ]
+      }
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "unary": [
+            "relu",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "affine": {
+            "argument": 0
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "unary": [
+        "relu",
+        {
+          "unary": [
+            "relu",
+            {
+              "unary": [
+                "relu",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "unary": [
+          "relu",
+          {
+            "unary": [
+              "relu",
+              {
+                "argument": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "unary": [
+        "relu",
+        {
+          "affine": {
+            "unary": [
+              "relu",
+              {
+                "argument": 0
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "affine": {
+        "affine": {
+          "unary": [
+            "relu",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "unary": [
+        "relu",
+        {
+          "unary": [
+            "relu",
+            {
+              "affine": {
+                "argument": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "unary": [
+          "relu",
+          {
+            "affine": {
+              "argument": 0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "unary": [
+        "relu",
+        {
+          "affine": {
+            "affine": {
+              "argument": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "affine": {
+        "affine": {
+          "affine": {
+            "argument": 0
+          }
+        }
+      }
+    },
+    {
+      "unary": [
+        "relu",
+        {
+          "unary": [
+            "relu",
+            {
+              "binary": [
+                "multiply",
+                {
+                  "argument": 0
+                },
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "unary": [
+          "relu",
+          {
+            "binary": [
+              "multiply",
+              {
+                "argument": 0
+              },
+              {
+                "argument": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "unary": [
+        "relu",
+        {
+          "affine": {
+            "binary": [
+              "multiply",
+              {
+                "argument": 0
+              },
+              {
+                "argument": 0
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "affine": {
+        "affine": {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "unary": [
+        "relu",
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "unary": [
+                "relu",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "binary": [
+          "multiply",
+          {
+            "argument": 0
+          },
+          {
+            "unary": [
+              "relu",
+              {
+                "argument": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "unary": [
+        "relu",
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "affine": {
+                "argument": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "binary": [
+          "multiply",
+          {
+            "argument": 0
+          },
+          {
+            "affine": {
+              "argument": 0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "unary": [
+        "relu",
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "binary": [
+                "multiply",
+                {
+                  "argument": 0
+                },
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "affine": {
+        "binary": [
+          "multiply",
+          {
+            "argument": 0
+          },
+          {
+            "binary": [
+              "multiply",
+              {
+                "argument": 0
+              },
+              {
+                "argument": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "unary": [
+            "relu",
+            {
+              "unary": [
+                "relu",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "affine": {
+            "unary": [
+              "relu",
+              {
+                "argument": 0
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "unary": [
+            "relu",
+            {
+              "affine": {
+                "argument": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "affine": {
+            "affine": {
+              "argument": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "unary": [
+            "relu",
+            {
+              "binary": [
+                "multiply",
+                {
+                  "argument": 0
+                },
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "affine": {
+            "binary": [
+              "multiply",
+              {
+                "argument": 0
+              },
+              {
+                "argument": 0
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "unary": [
+                "relu",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "affine": {
+                "argument": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "argument": 0
+        },
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "binary": [
+                "multiply",
+                {
+                  "argument": 0
+                },
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "unary": [
+            "relu",
+            {
+              "argument": 0
+            }
+          ]
+        },
+        {
+          "unary": [
+            "relu",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "unary": [
+            "relu",
+            {
+              "argument": 0
+            }
+          ]
+        },
+        {
+          "affine": {
+            "argument": 0
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "unary": [
+            "relu",
+            {
+              "argument": 0
+            }
+          ]
+        },
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "affine": {
+            "argument": 0
+          }
+        },
+        {
+          "affine": {
+            "argument": 0
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        },
+        {
+          "affine": {
+            "argument": 0
+          }
+        }
+      ]
+    },
+    {
+      "binary": [
+        "multiply",
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        },
+        {
+          "binary": [
+            "multiply",
+            {
+              "argument": 0
+            },
+            {
+              "argument": 0
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "intermediate_expressions": 46,
+  "proposal_count": 2,
+  "proposals": [
+    {
+      "arm": "shared",
+      "expression": {
+        "unary": [
+          "relu",
+          {
+            "affine": {
+              "unary": [
+                "relu",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "expression_index": 15,
+      "id": 30,
+      "initial_status": "unmeasured"
+    },
+    {
+      "arm": "untied",
+      "expression": {
+        "unary": [
+          "relu",
+          {
+            "affine": {
+              "unary": [
+                "relu",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "expression_index": 15,
+      "id": 31,
+      "initial_status": "unmeasured"
+    }
+  ],
+  "selected_expression_ids": [
+    15
+  ],
+  "source_expression_count": 46,
+  "truncated": false
+}

@@ -1,0 +1,40 @@
+{
+  "batch_schedule": {
+    "hard_rows": 0,
+    "ordinary_rows": 128,
+    "scan_every": 16,
+    "temperature": 0.02
+  },
+  "expression_ids": [
+    15
+  ],
+  "fit": {
+    "arithmetic": "f64",
+    "backtracking": null,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-08,
+    "forward_rows": 128,
+    "iterations": 8192,
+    "learning_rate": 0.01,
+    "numeric_bytes": 536870912
+  },
+  "grammar": {
+    "affine": true,
+    "arguments": 1,
+    "binary": [
+      "multiply"
+    ],
+    "max_expressions": 10000,
+    "max_operations": 3,
+    "unary": [
+      "relu"
+    ]
+  },
+  "layers": [
+    0,
+    1
+  ],
+  "seed": 29512001,
+  "width": 8
+}

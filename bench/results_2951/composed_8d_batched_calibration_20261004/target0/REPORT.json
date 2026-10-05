@@ -1,0 +1,187 @@
+{
+  "frozen_evaluation_ids": [
+    64,
+    65
+  ],
+  "frozen_training_pareto_ids": [
+    64,
+    65
+  ],
+  "grammar_truncated": false,
+  "heldout": [
+    {
+      "artifact_sha256": "78e02f3ce6359c2d32a813555800cc70cfafb2025cf308d3d14f67ffa6f0943c",
+      "id": 64,
+      "measurement": {
+        "group_maxima": [
+          9.058517666457418e-7,
+          1.0229168868378965e-6
+        ],
+        "maximum": 1.0229168868378965e-6,
+        "scales": [
+          {
+            "group": {
+              "end": 8,
+              "label": "use 0",
+              "start": 0
+            },
+            "native_rms": 2.4046383601143075
+          },
+          {
+            "group": {
+              "end": 16,
+              "label": "use 1",
+              "start": 8
+            },
+            "native_rms": 2.5136917604016658
+          }
+        ],
+        "worst_group": 1,
+        "worst_row": 135
+      },
+      "status": "heldout_measured"
+    },
+    {
+      "artifact_sha256": "5d3283d033c6d7c94779627d417f7e8ac3dbc28ea5b9d1c0c5550fc650109452",
+      "id": 65,
+      "measurement": {
+        "group_maxima": [
+          1.3427600181252324e-7,
+          1.0848966256092641e-7
+        ],
+        "maximum": 1.3427600181252324e-7,
+        "scales": [
+          {
+            "group": {
+              "end": 8,
+              "label": "use 0",
+              "start": 0
+            },
+            "native_rms": 2.4046383601143075
+          },
+          {
+            "group": {
+              "end": 16,
+              "label": "use 1",
+              "start": 8
+            },
+            "native_rms": 2.5136917604016658
+          }
+        ],
+        "worst_group": 0,
+        "worst_row": 7
+      },
+      "status": "heldout_measured"
+    }
+  ],
+  "heldout_panel_error": null,
+  "heldout_provenance": {
+    "arrays": [
+      {
+        "descriptor": {
+          "encoding": "f64_le",
+          "file": "eval-use0-input.f64",
+          "layer": 0,
+          "role": "input",
+          "sha256": "ba18e2fe126cd445f92ad3e8a3e48b8bbfca425ac18379bd85d7c94452f08802",
+          "width": 8
+        },
+        "layer": 0,
+        "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/eval-use0-input.f64",
+        "role": "input",
+        "sha256": "ba18e2fe126cd445f92ad3e8a3e48b8bbfca425ac18379bd85d7c94452f08802"
+      },
+      {
+        "descriptor": {
+          "encoding": "f64_le",
+          "file": "eval-use0-write.f64",
+          "layer": 0,
+          "role": "write",
+          "sha256": "1d8940a50cd7177a6db6bd4ce3ab23a93ef23a1f4c1cda690e648bcff7982379",
+          "width": 8
+        },
+        "layer": 0,
+        "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/eval-use0-write.f64",
+        "role": "write",
+        "sha256": "1d8940a50cd7177a6db6bd4ce3ab23a93ef23a1f4c1cda690e648bcff7982379"
+      },
+      {
+        "descriptor": {
+          "encoding": "f64_le",
+          "file": "eval-use1-input.f64",
+          "layer": 1,
+          "role": "input",
+          "sha256": "5864f16d1c2a0e4c52ffe2c8931fbeeab48ffe97a1b7a15b429b776f6722c53b",
+          "width": 8
+        },
+        "layer": 1,
+        "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/eval-use1-input.f64",
+        "role": "input",
+        "sha256": "5864f16d1c2a0e4c52ffe2c8931fbeeab48ffe97a1b7a15b429b776f6722c53b"
+      },
+      {
+        "descriptor": {
+          "encoding": "f64_le",
+          "file": "eval-use1-write.f64",
+          "layer": 1,
+          "role": "write",
+          "sha256": "44465f2f1e587e40bbc1bfc7008b4abb8f3b1f478cbdd156230ee7972c379731",
+          "width": 8
+        },
+        "layer": 1,
+        "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/eval-use1-write.f64",
+        "role": "write",
+        "sha256": "44465f2f1e587e40bbc1bfc7008b4abb8f3b1f478cbdd156230ee7972c379731"
+      }
+    ],
+    "name": "eval",
+    "record": {
+      "config": {
+        "serialization": "f32",
+        "synthetic": true,
+        "uses": 2,
+        "width": 8
+      },
+      "distribution": "uniform",
+      "range": [
+        -2.0,
+        2.0
+      ],
+      "scope": "SYNTHETIC CALIBRATION ONLY",
+      "source": {
+        "checkpoint_sha256": "59aa1231e5ac701a47ee8130fa2e6ac6f0b7087d004753e6562c36f4e11028b6"
+      }
+    },
+    "rows": 256
+  },
+  "heldout_seconds": 0.010105416,
+  "proposal_count": 2,
+  "scope": "automatic finite structural proposals with learned maps, not full native acceptance or global optimality; all errors unresolved and retained",
+  "seconds": 0.802978042,
+  "selected_expression_ids": [
+    32
+  ],
+  "source_expression_count": 46,
+  "statuses": [
+    {
+      "arm": "shared",
+      "artifact": "/Users/user/mpd-data/codex/composed-8d-batched-calibration-20261004/target0-run/candidate00064/program.artifact",
+      "expression_index": 32,
+      "id": 64,
+      "seconds": 0.391993625,
+      "standalone_c32": 12257,
+      "status": "training_measured",
+      "training_max": 7.934295690015243e-7
+    },
+    {
+      "arm": "untied",
+      "artifact": "/Users/user/mpd-data/codex/composed-8d-batched-calibration-20261004/target0-run/candidate00065/program.artifact",
+      "expression_index": 32,
+      "id": 65,
+      "seconds": 0.378711,
+      "standalone_c32": 14720,
+      "status": "training_measured",
+      "training_max": 1.120478127476566e-7
+    }
+  ]
+}

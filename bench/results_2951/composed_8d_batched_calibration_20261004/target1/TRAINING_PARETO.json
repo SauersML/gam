@@ -1,0 +1,53 @@
+{
+  "candidates": [
+    {
+      "arm": "shared",
+      "artifact": "/Users/user/mpd-data/codex/composed-8d-batched-calibration-20261004/target1-run/candidate00030/program.artifact",
+      "expression_index": 15,
+      "id": 30,
+      "standalone_c32": 12258,
+      "training": {
+        "group_maxima": [
+          0.25162425655940324,
+          0.24406923465472177
+        ],
+        "maximum": 0.25162425655940324,
+        "scales": [
+          {
+            "group": {
+              "end": 8,
+              "label": "use 0",
+              "start": 0
+            },
+            "native_rms": 0.665645705841317
+          },
+          {
+            "group": {
+              "end": 16,
+              "label": "use 1",
+              "start": 8
+            },
+            "native_rms": 0.685191532652158
+          }
+        ],
+        "worst_group": 0,
+        "worst_row": 43
+      }
+    }
+  ],
+  "criteria": [
+    "decoded F64 training maximum",
+    "complete standalone C32"
+  ],
+  "evaluation_policy": "Pareto plus same-expression matched shared/untied controls, even training-dominated; failed controls remain unresolved",
+  "frozen_before_heldout_array_load": true,
+  "frozen_evaluation_ids": [
+    30,
+    31
+  ],
+  "ids": [
+    30
+  ],
+  "scope": "Pareto of successfully measured finite fitted proposals; failed/unmeasured proposals unresolved, no completeness or optimality claim",
+  "tie_policy": "retain exact ties; dominance requires one strict improvement"
+}

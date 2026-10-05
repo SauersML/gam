@@ -1,0 +1,10 @@
+{
+  "arm": "shared",
+  "artifact": "/Users/user/mpd-data/codex/composed-8d-batched-calibration-20261004/target0-run/candidate00064/program.artifact",
+  "expression_index": 32,
+  "id": 64,
+  "seconds": 0.391993625,
+  "standalone_c32": 12257,
+  "status": "training_measured",
+  "training_max": 7.934295690015243e-7
+}

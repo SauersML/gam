@@ -1,0 +1,277 @@
+{
+  "source_commit": "28cc1a3e6a",
+  "binary_sha256": "1d79671369627b3bbea610e955a8651e3c1ed3c009a93356068d67a6edb7a8bf",
+  "backend": "Host",
+  "scope": "Original supplied-topology 8D teachers and arrays, original 8192 updates/learning rate/seed; only declared correct structure per teacher evaluated with shared and untied controls. No search-recovery or LLM claim.",
+  "comparison": "Update-matched, NOT matched compute: full-batch128 rows instead of one backward row; periodic full max selection every16 updates. Different loss proposal and work schedule. No speedup claim from old/new walltimes.",
+  "rows": [
+    {
+      "target": 0,
+      "arm": "shared",
+      "id": 64,
+      "training_max": 7.934295690015243e-07,
+      "heldout_max": 1.0229168868378965e-06,
+      "old_training_max": 0.17689905552664573,
+      "old_heldout_max": 0.3074424407189561,
+      "fit_seconds": 0.388047417,
+      "old_candidate_seconds": 0.263665458,
+      "new_candidate_seconds": 0.391993625,
+      "best_step": 8192,
+      "row_work": {
+        "full_scan_rows": 65664,
+        "full_training_scans": 513,
+        "proposal_backward_rows": 1048576,
+        "proposal_forward_rows": 1048576
+      },
+      "artifact_sha256": "78e02f3ce6359c2d32a813555800cc70cfafb2025cf308d3d14f67ffa6f0943c"
+    },
+    {
+      "target": 0,
+      "arm": "untied",
+      "id": 65,
+      "training_max": 1.120478127476566e-07,
+      "heldout_max": 1.3427600181252324e-07,
+      "old_training_max": 0.19195951633338929,
+      "old_heldout_max": 0.39794016745608324,
+      "fit_seconds": 0.37488825,
+      "old_candidate_seconds": 0.267140292,
+      "new_candidate_seconds": 0.378711,
+      "best_step": 8176,
+      "row_work": {
+        "full_scan_rows": 65664,
+        "full_training_scans": 513,
+        "proposal_backward_rows": 1048576,
+        "proposal_forward_rows": 1048576
+      },
+      "artifact_sha256": "5d3283d033c6d7c94779627d417f7e8ac3dbc28ea5b9d1c0c5550fc650109452"
+    },
+    {
+      "target": 1,
+      "arm": "shared",
+      "id": 30,
+      "training_max": 0.25162425655940324,
+      "heldout_max": 0.4540338129081893,
+      "old_training_max": 0.287964567383123,
+      "old_heldout_max": 0.5468093149382643,
+      "fit_seconds": 0.400695792,
+      "old_candidate_seconds": 0.268150417,
+      "new_candidate_seconds": 0.403747792,
+      "best_step": 8016,
+      "row_work": {
+        "full_scan_rows": 65664,
+        "full_training_scans": 513,
+        "proposal_backward_rows": 1048576,
+        "proposal_forward_rows": 1048576
+      },
+      "artifact_sha256": "d8cc9eff5582d8ff2ddb7d13fa666c012318e785e83b8262ebfe927ea35addc9"
+    },
+    {
+      "target": 1,
+      "arm": "untied",
+      "id": 31,
+      "training_max": 0.2666559686501145,
+      "heldout_max": 0.7003870332468038,
+      "old_training_max": 0.333774153491486,
+      "old_heldout_max": 0.9888246333167382,
+      "fit_seconds": 0.388373333,
+      "old_candidate_seconds": 0.2723915,
+      "new_candidate_seconds": 0.390573208,
+      "best_step": 7632,
+      "row_work": {
+        "full_scan_rows": 65664,
+        "full_training_scans": 513,
+        "proposal_backward_rows": 1048576,
+        "proposal_forward_rows": 1048576
+      },
+      "artifact_sha256": "98ee9d158c9943ad9bac6b7f2e8ae1814578f5a49a9eabecc4b28b23e98cf499"
+    }
+  ],
+  "conclusion": "Multiplicative target fits to about 1e-6 shared heldout error and 1e-7 untied; nested ReLU target remains poorly fitted. Substantial optimizer correction for one original realizable case, not universal fitting success.",
+  "files": [
+    {
+      "path": "PROTOCOL.json",
+      "sha256": "b68bdd58a8bd7cbfd69b07b15f7c0bcaeac63aed7d58593d384c7267fab13014",
+      "bytes": 15766
+    },
+    {
+      "path": "target0/INVENTORY.json",
+      "sha256": "911848a2cc3cd945c4a9268d9fbb294fbad51348d89eb944012644dc7fae1325",
+      "bytes": 12949
+    },
+    {
+      "path": "target0/PROVENANCE.json",
+      "sha256": "dca556213bedea7013caf8422125d5775f601ed08ad2d7ffc50d8a7f956289b0",
+      "bytes": 5858
+    },
+    {
+      "path": "target0/REPORT.json",
+      "sha256": "101f7c6dde4cc86c62a9287ef5ff95fbb0d6873e0670ca9d3d8a0fb64d75a6fc",
+      "bytes": 5387
+    },
+    {
+      "path": "target0/TRAINING_PARETO.json",
+      "sha256": "2ff814ea1e0cc77f1f3802e2a22f2acee29bea1271ac2b5fe154b0f70350d573",
+      "bytes": 2357
+    },
+    {
+      "path": "target0/candidate00064/DECLARATION.json",
+      "sha256": "694d7538abd800f604b4292034c9607ea894769f0c2e8ca3d36bd7096e072995",
+      "bytes": 661
+    },
+    {
+      "path": "target0/candidate00064/FIT.json",
+      "sha256": "144462a1563787003f9e8be4daf52b5a2f06a96480fe4884591e8b6ddc38c3a2",
+      "bytes": 86978
+    },
+    {
+      "path": "target0/candidate00064/HELDOUT.json",
+      "sha256": "331340973903bfd6595abb094bf5beb52ff6f7c6c38b44d11ab9379ce358a481",
+      "bytes": 662
+    },
+    {
+      "path": "target0/candidate00064/STATUS.json",
+      "sha256": "bf713cc829cab55dc13be2ed2729b8c2bc166e13eac5dc785b01a17fe245a057",
+      "bytes": 314
+    },
+    {
+      "path": "target0/candidate00064/TRAIN.json",
+      "sha256": "ffbbaa24990d28b69933b900bfb22ffb1cdd46dcfc41771f10228a58ef1533c7",
+      "bytes": 1110
+    },
+    {
+      "path": "target0/candidate00064/program.artifact",
+      "sha256": "78e02f3ce6359c2d32a813555800cc70cfafb2025cf308d3d14f67ffa6f0943c",
+      "bytes": 1808
+    },
+    {
+      "path": "target0/candidate00065/DECLARATION.json",
+      "sha256": "f0fbcc6db7fcd79d401fb0bf8d64b5cfcfb796b655abfd8ea9328a6b0a3f3c19",
+      "bytes": 677
+    },
+    {
+      "path": "target0/candidate00065/FIT.json",
+      "sha256": "5f90321f19248d6843e69ee1108c5fd98849aa9c4009e51b12c127a7556d9bf2",
+      "bytes": 86934
+    },
+    {
+      "path": "target0/candidate00065/HELDOUT.json",
+      "sha256": "b5da34eaad4f377d5a79361679830f4ada470689ae72b9ec893717c22d7cab59",
+      "bytes": 661
+    },
+    {
+      "path": "target0/candidate00065/STATUS.json",
+      "sha256": "907ad3919225531d93e32eef89134fb96e1ff4614cdd2093299f64be654f1a3e",
+      "bytes": 311
+    },
+    {
+      "path": "target0/candidate00065/TRAIN.json",
+      "sha256": "e9ee354225c25664b34c0ee91a1bebfb5c52291537cee89e2c4ad3373804edb9",
+      "bytes": 1110
+    },
+    {
+      "path": "target0/candidate00065/program.artifact",
+      "sha256": "5d3283d033c6d7c94779627d417f7e8ac3dbc28ea5b9d1c0c5550fc650109452",
+      "bytes": 2162
+    },
+    {
+      "path": "target0/journal.jsonl",
+      "sha256": "4a8f99471a3fcf54bf7a6a6ad17f4771ce0c42f942de504163837cc6feb674cc",
+      "bytes": 1746
+    },
+    {
+      "path": "target0-SETTINGS.json",
+      "sha256": "beecb4a8b6f0c6da4118f4d02b4ee225cf78e9fe662575c44d3eebe2f189a27b",
+      "bytes": 645
+    },
+    {
+      "path": "target1/INVENTORY.json",
+      "sha256": "06f44350b9b46679b7955cc6fbdb83425194c47c704a2b46bb300610f5e5040d",
+      "bytes": 12837
+    },
+    {
+      "path": "target1/PROVENANCE.json",
+      "sha256": "0690fc630caeaa808ce3eaef8f96ae0b930d56d3f1bff8600302cc4fce082f7c",
+      "bytes": 5858
+    },
+    {
+      "path": "target1/REPORT.json",
+      "sha256": "dc9022f10df7e257bfe3c9b0aa78e04b8e2a5b87059811325d7ff198de171a71",
+      "bytes": 5362
+    },
+    {
+      "path": "target1/TRAINING_PARETO.json",
+      "sha256": "2d6262d6090da498bb1b70634de5d84fadc90658fc1f36f95fd289aca8bcb2ee",
+      "bytes": 1468
+    },
+    {
+      "path": "target1/candidate00030/DECLARATION.json",
+      "sha256": "435292518fe74b02ef62ba0b99a2cdd70b3c6f400047e12bf1569ddb2a907b33",
+      "bytes": 617
+    },
+    {
+      "path": "target1/candidate00030/FIT.json",
+      "sha256": "2243058487b8a27f9f3d76c5b8b352bfbf27639bbbab387874bccdd03219789f",
+      "bytes": 85771
+    },
+    {
+      "path": "target1/candidate00030/HELDOUT.json",
+      "sha256": "27aa33bb4b89e7f4a38efab75642c8680bb2824843f9a1bdd2041d189259ed3f",
+      "bytes": 654
+    },
+    {
+      "path": "target1/candidate00030/STATUS.json",
+      "sha256": "2d9645bcfd82922d6df02d8b0d3a6db9a210442f3f896eaa5bea2ba6f324c9eb",
+      "bytes": 313
+    },
+    {
+      "path": "target1/candidate00030/TRAIN.json",
+      "sha256": "6adad49a50e24284d08ffd9aefe704987e2920409d5317339228683bac5be41c",
+      "bytes": 1060
+    },
+    {
+      "path": "target1/candidate00030/program.artifact",
+      "sha256": "d8cc9eff5582d8ff2ddb7d13fa666c012318e785e83b8262ebfe927ea35addc9",
+      "bytes": 1945
+    },
+    {
+      "path": "target1/candidate00031/DECLARATION.json",
+      "sha256": "5e74be76fac357801cc0fbb2ce5d34d1f60372f0444413c120e038813a49ca77",
+      "bytes": 633
+    },
+    {
+      "path": "target1/candidate00031/FIT.json",
+      "sha256": "e4bd48bb11520416f5b597a7b7ec5b67e18f6a20d3f35af6ae0d2b5b05b79922",
+      "bytes": 85818
+    },
+    {
+      "path": "target1/candidate00031/HELDOUT.json",
+      "sha256": "22493784d8960eac930271491c956306dcdae5e4284627bd4d7c8385dce89498",
+      "bytes": 652
+    },
+    {
+      "path": "target1/candidate00031/STATUS.json",
+      "sha256": "2dc7400ee4c9ea0e259847c91e69e756e83cd8c645befc6ce6c0e724028f8e94",
+      "bytes": 312
+    },
+    {
+      "path": "target1/candidate00031/TRAIN.json",
+      "sha256": "435292044f79dfa383cdc1058bc35ff6c893e8131fec29c8279bd6a367bac329",
+      "bytes": 1057
+    },
+    {
+      "path": "target1/candidate00031/program.artifact",
+      "sha256": "98ee9d158c9943ad9bac6b7f2e8ae1814578f5a49a9eabecc4b28b23e98cf499",
+      "bytes": 2238
+    },
+    {
+      "path": "target1/journal.jsonl",
+      "sha256": "5448551fbd0fe943935df6331b40ad8e15eea761401324e47558fff6419dd18e",
+      "bytes": 1689
+    },
+    {
+      "path": "target1-SETTINGS.json",
+      "sha256": "35fd5b6e81d10c56c0bea020df32a13433e356cbc791764516c046c53fabbe08",
+      "bytes": 645
+    }
+  ]
+}

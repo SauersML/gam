@@ -1,0 +1,51 @@
+{
+  "arm": "shared",
+  "declarations": {
+    "domains": [],
+    "parameters": 0,
+    "raw_slot_widths": [
+      8,
+      8
+    ]
+  },
+  "expression": {
+    "unary": [
+      "relu",
+      {
+        "affine": {
+          "unary": [
+            "relu",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "groups": [
+    {
+      "end": 8,
+      "label": "use 0",
+      "start": 0
+    },
+    {
+      "end": 16,
+      "label": "use 1",
+      "start": 8
+    }
+  ],
+  "seed": 29512001,
+  "trainable": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ]
+}

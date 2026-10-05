@@ -1,0 +1,366 @@
+{
+  "backend": "host or required CUDA declared by parent before launch; no cross-device wall-speed claim",
+  "comparison": "Matched8192updates and original initialization seed/Adam/arithmetic. NOT backward-row or compute matched: batched path differentiates128rows/update versus legacy1row/update. Report all work and actual wall/fit times.",
+  "expected_new_work_per_arm": {
+    "aligned_rows_note": "input rows128 represent256site-row predictions per scan across two uses, not distinct token count",
+    "batch_backward_rows": 1048576,
+    "batch_forward_rows": 1048576,
+    "full_training_scan_rows": 65664,
+    "full_training_scans": 513,
+    "initial_final_optimizer_validation_rows": 256,
+    "saved_heldout_replay_rows": 256,
+    "saved_training_replay_rows": 128,
+    "updates_budget": 8192
+  },
+  "numeric_budget_bytes": 536870912,
+  "optimization_selection": "CompleteTRAINmaximum scans only select snapshot; sampled surrogate not acceptance. Fullbatch all128rows\u00d72groups, normalized squared error softmax temperature.02; completeTRAINscan at0,every16,8192; no validation updates/reselection.",
+  "published_source_pin": null,
+  "runs": [
+    {
+      "arms": [
+        "shared",
+        "untied"
+      ],
+      "baseline": [
+        {
+          "arm": "shared",
+          "best_step": 7888,
+          "candidate_id": 64,
+          "fit_report": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/search0-8192/candidate00064/FIT.json",
+          "fit_report_sha256": "0425af49dc4555cc2e82bc20d258ce8df39d7708ed9576022b1287354b2fdbbf",
+          "fit_seconds": 0.258403708,
+          "full_search_report": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/search0-8192/REPORT.json",
+          "full_search_report_sha256": "979f68946dfee884b45d01783f366b15e8bbcf0ac5c300478675b35965fd68b7",
+          "old_active_backward_rows": 8192,
+          "old_active_forward_rows": 8192,
+          "old_full_training_scan_rows": 1048704,
+          "old_validation_rows": 256,
+          "proposal_train_max": 0.17689911840303024
+        },
+        {
+          "arm": "untied",
+          "best_step": 2562,
+          "candidate_id": 65,
+          "fit_report": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/search0-8192/candidate00065/FIT.json",
+          "fit_report_sha256": "b0e355b832d19ebe49ead24a798760b3e383c9a4902d9b2851bec7db4c29be85",
+          "fit_seconds": 0.261582791,
+          "full_search_report": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/search0-8192/REPORT.json",
+          "full_search_report_sha256": "979f68946dfee884b45d01783f366b15e8bbcf0ac5c300478675b35965fd68b7",
+          "old_active_backward_rows": 8192,
+          "old_active_forward_rows": 8192,
+          "old_full_training_scan_rows": 1048704,
+          "old_validation_rows": 256,
+          "proposal_train_max": 0.1919594878381565
+        }
+      ],
+      "expression": {
+        "binary": [
+          "multiply",
+          {
+            "argument": 0
+          },
+          {
+            "affine": {
+              "unary": [
+                "relu",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "expression_id": 32,
+      "extract": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/EXTRACT.json",
+      "extract_sha256": "c9072a127c120fe1a177ff67fe3f85a92fa9c024aab1930cfd3f9ad6afba9ce2",
+      "fresh_output": "/Users/user/mpd-data/codex/composed-8d-batched-calibration-20261004/target0-run",
+      "frozen_panels": [
+        {
+          "name": "train",
+          "record": {
+            "config": {
+              "serialization": "f32",
+              "synthetic": true,
+              "uses": 2,
+              "width": 8
+            },
+            "distribution": "uniform",
+            "range": [
+              -1.0,
+              1.0
+            ],
+            "scope": "SYNTHETIC CALIBRATION ONLY",
+            "source": {
+              "checkpoint_sha256": "59aa1231e5ac701a47ee8130fa2e6ac6f0b7087d004753e6562c36f4e11028b6"
+            }
+          },
+          "rows": 128,
+          "values": [
+            {
+              "layer": 0,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/train-use0-input.f64",
+              "role": "input",
+              "sha256": "6b1aa102c67e881e8225100b8baf3eea181c38417735e9ab4edbabe883d13591",
+              "width": 8
+            },
+            {
+              "layer": 0,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/train-use0-write.f64",
+              "role": "write",
+              "sha256": "50716575ec85b0f87f9371ddd60ba86bd037efb0fe850e15688b31102d89127f",
+              "width": 8
+            },
+            {
+              "layer": 1,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/train-use1-input.f64",
+              "role": "input",
+              "sha256": "2398e657fab11e06ab70e76d2c36aa510008fca86c3c40a4534b25a4890f38d7",
+              "width": 8
+            },
+            {
+              "layer": 1,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/train-use1-write.f64",
+              "role": "write",
+              "sha256": "0eff7e95ae512884f0aa774cea45f435b4944583666739e2056f2f9c63aa31bd",
+              "width": 8
+            }
+          ]
+        },
+        {
+          "name": "eval",
+          "record": {
+            "config": {
+              "serialization": "f32",
+              "synthetic": true,
+              "uses": 2,
+              "width": 8
+            },
+            "distribution": "uniform",
+            "range": [
+              -2.0,
+              2.0
+            ],
+            "scope": "SYNTHETIC CALIBRATION ONLY",
+            "source": {
+              "checkpoint_sha256": "59aa1231e5ac701a47ee8130fa2e6ac6f0b7087d004753e6562c36f4e11028b6"
+            }
+          },
+          "rows": 256,
+          "values": [
+            {
+              "layer": 0,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/eval-use0-input.f64",
+              "role": "input",
+              "sha256": "ba18e2fe126cd445f92ad3e8a3e48b8bbfca425ac18379bd85d7c94452f08802",
+              "width": 8
+            },
+            {
+              "layer": 0,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/eval-use0-write.f64",
+              "role": "write",
+              "sha256": "1d8940a50cd7177a6db6bd4ce3ab23a93ef23a1f4c1cda690e648bcff7982379",
+              "width": 8
+            },
+            {
+              "layer": 1,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/eval-use1-input.f64",
+              "role": "input",
+              "sha256": "5864f16d1c2a0e4c52ffe2c8931fbeeab48ffe97a1b7a15b429b776f6722c53b",
+              "width": 8
+            },
+            {
+              "layer": 1,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/eval-use1-write.f64",
+              "role": "write",
+              "sha256": "44465f2f1e587e40bbc1bfc7008b4abb8f3b1f478cbdd156230ee7972c379731",
+              "width": 8
+            }
+          ]
+        }
+      ],
+      "original_settings": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/SETTINGS8192.json",
+      "original_settings_sha256": "1364748c9a8f559aa4b318e17d441b7ce11526d4002fdc1cec8f8ada37005885",
+      "settings": "/Users/user/mpd-data/codex/composed-8d-batched-calibration-20261004/target0-SETTINGS.json",
+      "settings_sha256": "beecb4a8b6f0c6da4118f4d02b4ee225cf78e9fe662575c44d3eebe2f189a27b",
+      "target": 0,
+      "teacher_file": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/teacher.artifact",
+      "teacher_ground_truth_file": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target0/GROUND_TRUTH.json",
+      "teacher_ground_truth_sha256": "c40d720b2073590f33d3d940ac179c0e8cc378adc4da4e22b03bccbc5e9a9b9a",
+      "teacher_sha256": "59aa1231e5ac701a47ee8130fa2e6ac6f0b7087d004753e6562c36f4e11028b6"
+    },
+    {
+      "arms": [
+        "shared",
+        "untied"
+      ],
+      "baseline": [
+        {
+          "arm": "shared",
+          "best_step": 5263,
+          "candidate_id": 30,
+          "fit_report": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/search1-8192/candidate00030/FIT.json",
+          "fit_report_sha256": "ced82332e43d52e9421db13e5c829445ce06f252480e97f00fa518c360e6ea3d",
+          "fit_seconds": 0.263579542,
+          "full_search_report": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/search1-8192/REPORT.json",
+          "full_search_report_sha256": "c96930448f3e580a4390520db684244f1323cf1c1d3f4376c61182a50d0c0f52",
+          "old_active_backward_rows": 8192,
+          "old_active_forward_rows": 8192,
+          "old_full_training_scan_rows": 1048704,
+          "old_validation_rows": 256,
+          "proposal_train_max": 0.28796457587635554
+        },
+        {
+          "arm": "untied",
+          "best_step": 7504,
+          "candidate_id": 31,
+          "fit_report": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/search1-8192/candidate00031/FIT.json",
+          "fit_report_sha256": "e5239e2068bd28e023aa25a5368522d4daddbdb1404f7663a824d72b2c7382f5",
+          "fit_seconds": 0.267787041,
+          "full_search_report": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/search1-8192/REPORT.json",
+          "full_search_report_sha256": "c96930448f3e580a4390520db684244f1323cf1c1d3f4376c61182a50d0c0f52",
+          "old_active_backward_rows": 8192,
+          "old_active_forward_rows": 8192,
+          "old_full_training_scan_rows": 1048704,
+          "old_validation_rows": 256,
+          "proposal_train_max": 0.33377415026220103
+        }
+      ],
+      "expression": {
+        "unary": [
+          "relu",
+          {
+            "affine": {
+              "unary": [
+                "relu",
+                {
+                  "argument": 0
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "expression_id": 15,
+      "extract": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target1/EXTRACT.json",
+      "extract_sha256": "c7617f51276799a136a3810dd0b1c19ae6fc1e99a63441a938d34af2a2a4d5a6",
+      "fresh_output": "/Users/user/mpd-data/codex/composed-8d-batched-calibration-20261004/target1-run",
+      "frozen_panels": [
+        {
+          "name": "train",
+          "record": {
+            "config": {
+              "serialization": "f32",
+              "synthetic": true,
+              "uses": 2,
+              "width": 8
+            },
+            "distribution": "uniform",
+            "range": [
+              -1.0,
+              1.0
+            ],
+            "scope": "SYNTHETIC CALIBRATION ONLY",
+            "source": {
+              "checkpoint_sha256": "9bb91f08af93b8e5b7d30c28f364853f48097972d29dbe1da708cc879e7ac521"
+            }
+          },
+          "rows": 128,
+          "values": [
+            {
+              "layer": 0,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target1/train-use0-input.f64",
+              "role": "input",
+              "sha256": "254b838c7f383774ea36c993dc23f11efe15fd15b232c09b4c1d2e3beb55b90a",
+              "width": 8
+            },
+            {
+              "layer": 0,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target1/train-use0-write.f64",
+              "role": "write",
+              "sha256": "de5847716d3fc82b63c74a058cfe9a2299e7f6d32cb39d800eb148c101d1fd44",
+              "width": 8
+            },
+            {
+              "layer": 1,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target1/train-use1-input.f64",
+              "role": "input",
+              "sha256": "b965cbd3f2a072003ff7d32c7852a38305f13ad6dc3fa9dcdfd94623bdbb22e6",
+              "width": 8
+            },
+            {
+              "layer": 1,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target1/train-use1-write.f64",
+              "role": "write",
+              "sha256": "918a2375e0590e7230fe23918b844caee32dd06df6222697dbd08d14593cf6e7",
+              "width": 8
+            }
+          ]
+        },
+        {
+          "name": "eval",
+          "record": {
+            "config": {
+              "serialization": "f32",
+              "synthetic": true,
+              "uses": 2,
+              "width": 8
+            },
+            "distribution": "uniform",
+            "range": [
+              -2.0,
+              2.0
+            ],
+            "scope": "SYNTHETIC CALIBRATION ONLY",
+            "source": {
+              "checkpoint_sha256": "9bb91f08af93b8e5b7d30c28f364853f48097972d29dbe1da708cc879e7ac521"
+            }
+          },
+          "rows": 256,
+          "values": [
+            {
+              "layer": 0,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target1/eval-use0-input.f64",
+              "role": "input",
+              "sha256": "972fe4d33d6eb547cc08b0dae8112136abc734d8308803578ab02446ab79cdfd",
+              "width": 8
+            },
+            {
+              "layer": 0,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target1/eval-use0-write.f64",
+              "role": "write",
+              "sha256": "f3eaa32656809de7cf165a84fc384193f015a981e1d6cb9761bcb9acba6c1882",
+              "width": 8
+            },
+            {
+              "layer": 1,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target1/eval-use1-input.f64",
+              "role": "input",
+              "sha256": "d67e035fb8de715196f0fb0b4587040d366151007997b8fecb73358256953dbf",
+              "width": 8
+            },
+            {
+              "layer": 1,
+              "path": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target1/eval-use1-write.f64",
+              "role": "write",
+              "sha256": "ddfc7fb36ca9c0070e79dbffce57c0ed45c897c1868a3ac0b2c79f609adb5e52",
+              "width": 8
+            }
+          ]
+        }
+      ],
+      "original_settings": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target1/SETTINGS8192.json",
+      "original_settings_sha256": "a1624c1b1900793392a9a22152997e44e39681aa6b27c92dfae35d7366886d30",
+      "settings": "/Users/user/mpd-data/codex/composed-8d-batched-calibration-20261004/target1-SETTINGS.json",
+      "settings_sha256": "35fd5b6e81d10c56c0bea020df32a13433e356cbc791764516c046c53fabbe08",
+      "target": 1,
+      "teacher_file": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target1/teacher.artifact",
+      "teacher_ground_truth_file": "/Users/user/mpd-data/codex/composed-rule-calibration-20261004/target1/GROUND_TRUTH.json",
+      "teacher_ground_truth_sha256": "21b3f30a6576d769fff8d97c5ae34cfe8cbcae193796f8ec6562aedda55e8aa6",
+      "teacher_sha256": "9bb91f08af93b8e5b7d30c28f364853f48097972d29dbe1da708cc879e7ac521"
+    }
+  ],
+  "scope": "LIMITED SYNTHETIC ORIGINAL 8D OPTIMIZER CALIBRATION ONLY. Correct supplied topologies, not structure discovery, model law recovery or native intervention evidence. Teachers/inputs/heldout are unchanged original archived fixtures.",
+  "status": "FROZEN, NOT RUN; awaiting parent published build pin",
+  "stop_policy": "Only existing finite8192update budget or exact zero TRAINmaximum; no changing LR,temperature,budget or teacher after heldout access. Report unchanged frozen heldout even if worse."
+}

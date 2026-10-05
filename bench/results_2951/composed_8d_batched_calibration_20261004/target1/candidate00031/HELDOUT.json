@@ -1,0 +1,32 @@
+{
+  "artifact_sha256": "98ee9d158c9943ad9bac6b7f2e8ae1814578f5a49a9eabecc4b28b23e98cf499",
+  "id": 31,
+  "measurement": {
+    "group_maxima": [
+      0.7003870332468038,
+      0.52468584410054
+    ],
+    "maximum": 0.7003870332468038,
+    "scales": [
+      {
+        "group": {
+          "end": 8,
+          "label": "use 0",
+          "start": 0
+        },
+        "native_rms": 1.3842661655579218
+      },
+      {
+        "group": {
+          "end": 16,
+          "label": "use 1",
+          "start": 8
+        },
+        "native_rms": 1.3663347285867724
+      }
+    ],
+    "worst_group": 0,
+    "worst_row": 113
+  },
+  "status": "heldout_measured"
+}

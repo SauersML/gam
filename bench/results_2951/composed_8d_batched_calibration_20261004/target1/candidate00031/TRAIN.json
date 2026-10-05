@@ -1,0 +1,54 @@
+{
+  "arm": "untied",
+  "artifact_sha256": "98ee9d158c9943ad9bac6b7f2e8ae1814578f5a49a9eabecc4b28b23e98cf499",
+  "expression": {
+    "unary": [
+      "relu",
+      {
+        "affine": {
+          "unary": [
+            "relu",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "id": 31,
+  "scope": "complete standalone program C32; remaining native model not included",
+  "standalone_c32": 14722,
+  "standalone_cost": {
+    "binding_bits": 82,
+    "literals": 432,
+    "structure_bits": 816
+  },
+  "training": {
+    "group_maxima": [
+      0.2666559686501145,
+      0.2625022766350268
+    ],
+    "maximum": 0.2666559686501145,
+    "scales": [
+      {
+        "group": {
+          "end": 8,
+          "label": "use 0",
+          "start": 0
+        },
+        "native_rms": 0.665645705841317
+      },
+      {
+        "group": {
+          "end": 16,
+          "label": "use 1",
+          "start": 8
+        },
+        "native_rms": 0.685191532652158
+      }
+    ],
+    "worst_group": 0,
+    "worst_row": 43
+  }
+}
