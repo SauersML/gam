@@ -1783,30 +1783,80 @@ fn read_checkpoint_array(reader: &mut impl Read, array: &mut Array2<f64>) -> Res
     Ok(())
 }
 
-/// Write the checkpoint atomically: the progress as JSON after its length, then every array's
-/// values as little-endian float64. The progress alone also goes to the path with extension
-/// `json`, readable while the fit runs.
-fn save_checkpoint(path: &Path, progress: &Progress, posterior: &DevicePosterior) -> Result<(), String> {
-    let header = serde_json::to_vec(progress).map_err(error)?;
-    let partial = path.with_extension("partial");
-    let mut file = std::io::BufWriter::new(std::fs::File::create(&partial).map_err(error)?);
-    file.write_all(&(header.len() as u64).to_le_bytes()).map_err(error)?;
-    file.write_all(&header).map_err(error)?;
-    // Per trainable operator `μ`, `ln σ` and IVON's state (the gradient's momentum and the
-    // curvature estimate), one operator on the host at a time.
-    for i in 0..progress.shapes.len() {
-        let (mean, log_sd, moments) = posterior.operator(i)?;
-        for array in [&mean, &log_sd].into_iter().chain(&moments) {
+/// A checkpoint on the host ([`Snapshot::take`]), which a writer thread writes ([`Writer`]) while
+/// the fit goes on.
+struct Snapshot {
+    /// The progress, as the payload's header and as the readable copy.
+    header: Vec<u8>,
+    json: Vec<u8>,
+    /// Per trainable operator `μ`, `ln σ` and IVON's state (the gradient's momentum and the
+    /// curvature estimate).
+    arrays: Vec<Array2<f64>>,
+}
+
+impl Snapshot {
+    /// The checkpoint of `progress` and `posterior` as they are now.
+    fn take(progress: &Progress, posterior: &DevicePosterior) -> Result<Self, String> {
+        let mut arrays = Vec::with_capacity(4 * progress.shapes.len());
+        for i in 0..progress.shapes.len() {
+            let (mean, log_sd, [momentum, curvature]) = posterior.operator(i)?;
+            arrays.extend([mean, log_sd, momentum, curvature]);
+        }
+        Ok(Self { header: serde_json::to_vec(progress).map_err(error)?, json: serde_json::to_vec_pretty(progress).map_err(error)?, arrays })
+    }
+
+    /// Write the checkpoint atomically: the progress as JSON after its length, then every array's
+    /// values as little-endian float64. The progress alone also goes to the path with extension
+    /// `json`, readable while the fit runs.
+    fn write(&self, path: &Path) -> Result<(), String> {
+        let partial = path.with_extension("partial");
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&partial).map_err(error)?);
+        file.write_all(&(self.header.len() as u64).to_le_bytes()).map_err(error)?;
+        file.write_all(&self.header).map_err(error)?;
+        for array in &self.arrays {
             for value in array.iter() {
                 file.write_all(&value.to_le_bytes()).map_err(error)?;
             }
         }
+        file.into_inner().map_err(error)?.sync_all().map_err(error)?;
+        std::fs::rename(&partial, path).map_err(error)?;
+        let partial = path.with_extension("json.partial");
+        std::fs::write(&partial, &self.json).map_err(error)?;
+        std::fs::rename(&partial, path.with_extension("json")).map_err(error)
     }
-    file.into_inner().map_err(error)?.sync_all().map_err(error)?;
-    std::fs::rename(&partial, path).map_err(error)?;
-    let partial = path.with_extension("json.partial");
-    std::fs::write(&partial, serde_json::to_vec_pretty(progress).map_err(error)?).map_err(error)?;
-    std::fs::rename(&partial, path.with_extension("json")).map_err(error)
+}
+
+/// The thread writing a fit's last save: at most one write is in flight, and a save first waits
+/// for the one before it, so the files on disk are always one whole save.
+#[derive(Default)]
+struct Writer {
+    pending: Option<JoinHandle<Result<(), String>>>,
+}
+
+impl Writer {
+    /// Wait for the write in flight, with its outcome.
+    fn wait(&mut self) -> Result<(), String> {
+        match self.pending.take() {
+            Some(job) => job.join().map_err(|_| "the checkpoint writer panicked".to_string())?,
+            None => Ok(()),
+        }
+    }
+
+    /// Start `job` once the write in flight is done.
+    fn start(&mut self, job: impl FnOnce() -> Result<(), String> + Send + 'static) -> Result<(), String> {
+        self.wait()?;
+        self.pending = Some(std::thread::spawn(job));
+        Ok(())
+    }
+}
+
+impl Drop for Writer {
+    /// A fit that stops early still finishes the write it started.
+    fn drop(&mut self) {
+        if let Err(e) = self.wait() {
+            log::error!("library checkpoint: {e}");
+        }
+    }
 }
 
 /// Restore a checkpoint of this fit into `posterior`, with IVON's state per operator, or refuse one
@@ -1959,15 +2009,24 @@ pub fn fit(
     // Each group's size, whose `½ ln |G|` an active group's variance costs.
     let sizes: Vec<f64> = explanation.groups.iter().map(|g| g.cells.iter().map(|c| (c.rows.len() * c.cols.len()) as f64).sum()).collect();
     // After every save, the posterior-mean artifact goes next to the checkpoint (extension
-    // `artifact.bin`), so the current explanation can be read and scored while the fit runs.
-    let save = |progress: &mut Progress, posterior: &Posterior, device_posterior: &DevicePosterior| -> Result<(), String> {
+    // `artifact.bin`), so the current explanation can be read and scored while the fit runs. The
+    // fit's thread takes the checkpoint and the means off the device; the writer thread encodes
+    // and writes them while the device trains on.
+    let mut writer = Writer::default();
+    let save = |progress: &mut Progress, posterior: &Posterior, device_posterior: &DevicePosterior, writer: &mut Writer| -> Result<(), String> {
         progress.active = posterior.active.clone();
         progress.seconds = resumed_seconds + started.elapsed().as_secs_f64();
         let Some(path) = checkpoint else { return Ok(()) };
-        save_checkpoint(path, progress, device_posterior)?;
-        let partial = path.with_extension("artifact.partial");
-        std::fs::write(&partial, posterior_mean(explanation, posterior)?.f32_literals()?.to_bytes()?).map_err(error)?;
-        std::fs::rename(&partial, path.with_extension("artifact.bin")).map_err(error)
+        let snapshot = Snapshot::take(progress, device_posterior)?;
+        let (artifact, trainable) = (explanation.artifact.clone(), explanation.trainable.clone());
+        let (means, membership, active) = (posterior.means(), posterior.membership.clone(), posterior.active.clone());
+        let path = path.to_path_buf();
+        writer.start(move || {
+            snapshot.write(&path)?;
+            let partial = path.with_extension("artifact.partial");
+            std::fs::write(&partial, mean_artifact(artifact, &trainable, means, &membership, &active)?.f32_literals()?.to_bytes()?).map_err(error)?;
+            std::fs::rename(&partial, path.with_extension("artifact.bin")).map_err(error)
+        })
     };
     if let Some(prior) = prior.as_deref_mut()
         && progress.prior.is_none()
@@ -1986,7 +2045,7 @@ pub fn fit(
         progress.start = Some(start);
         device_posterior.values_into(&mut posterior)?;
         progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
-        save(&mut progress, &posterior, &device_posterior)?;
+        save(&mut progress, &posterior, &device_posterior, &mut writer)?;
     }
     while !progress.done {
         let epoch = progress.epoch;
@@ -2127,11 +2186,12 @@ pub fn fit(
             progress.previous = None;
         }
         progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
-        save(&mut progress, &posterior, &device_posterior)?;
+        save(&mut progress, &posterior, &device_posterior, &mut writer)?;
     }
     let objective_bits = progress.removals.last().map_or(f64::NAN, |r| r.after_bits);
     let end = held_out(&mut scorer, explanation, &posterior, &device_posterior, held, settings, tokens, prior.as_deref_mut())?;
     log::info!("library end: {end:?}");
+    writer.wait()?;
     let representative = if end.rounded_bits_per_token <= end.mean_bits_per_token { Representative::Rounded } else { Representative::Mean };
     Ok(Fit {
         report: Report {
@@ -2280,14 +2340,19 @@ pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Exp
 /// removed groups touch are absent (no literals). Partial interface blocks remain
 /// present, so their zeroed entries still cost ordinary serialized literals.
 pub fn posterior_mean(explanation: &Explanation, posterior: &Posterior) -> Result<Artifact, String> {
-    let mut artifact = explanation.artifact.clone();
-    for ((op, values), membership) in explanation.trainable.iter().zip(posterior.means()).zip(&posterior.membership) {
+    mean_artifact(explanation.artifact.clone(), &explanation.trainable, posterior.means(), &posterior.membership, &posterior.active)
+}
+
+/// [`posterior_mean`] of an explanation's `artifact` whose `trainable` operators hold `means`, each
+/// entry in the group `membership` names, the groups active where `active` says.
+fn mean_artifact(mut artifact: Artifact, trainable: &[usize], means: Vec<Array2<f64>>, membership: &[Array2<u32>], active: &[bool]) -> Result<Artifact, String> {
+    for ((op, values), membership) in trainable.iter().zip(means).zip(membership) {
         let source = &artifact.program.operators[*op];
         let (rows, cols) = (source.rows.clone(), source.cols.clone());
         let mut present = Array2::from_elem((rows.group_count(), cols.group_count()), false);
         for r in 0..rows.group_count() {
             for c in 0..cols.group_count() {
-                present[[r, c]] = rows.range(r).any(|i| cols.range(c).any(|j| posterior.active[membership[[i, j]] as usize]));
+                present[[r, c]] = rows.range(r).any(|i| cols.range(c).any(|j| active[membership[[i, j]] as usize]));
             }
         }
         let precision = exact_precision(values.iter().copied()).map_err(error)?;
