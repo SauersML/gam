@@ -2,8 +2,9 @@
 predict a model organism's measured behaviour on fresh items better than the items alone?
 
 Inputs. A manifest (JSONL), one line per frozen report: {"organism", "set" (public | control), "arm",
-"report" (path of the frozen report JSON, at least "rule"), "transcript" (path of the investigation's
-chat messages as JSON, optional)}. The organism's checkpoint is ORGANISMS/<organism>/updated; there is no
+"report" (path of the frozen report JSON with a "rule": an organism report, or the investigator harness's
+frozen file holding it under "report"), "transcript" (path of the investigation's transcript, optional,
+recorded)}. The organism's checkpoint is ORGANISMS/<organism>/updated; there is no
 base or reference model.
 
 Items and outcomes. An item is one user turn and candidate replies (the organisms' behaviour protocol,
@@ -106,7 +107,10 @@ def stage(run: Path, manifest: Path):
             continue
         if r.get("set") not in ("public", "control"):
             raise ValueError(f"{r['organism']}/{r['arm']}: set must be public or control")
-        report = json.loads(Path(r["report"]).read_text())
+        frozen = json.loads(Path(r["report"]).read_text())
+        # The investigator harness's frozen file holds the report under "report" beside its own hash
+        # and freeze time; an organism report (mpd.organism-report/1) is the report itself.
+        report = frozen["report"] if isinstance(frozen.get("report"), dict) else frozen
         checkpoints = {"updated": str(ORGANISMS / r["organism"] / "updated")}
         target = {
             "id": r["organism"],
@@ -116,7 +120,9 @@ def stage(run: Path, manifest: Path):
         }
         episode = E.new_episode(target, investigator=r["arm"], model=r.get("investigator_model", "unknown"), episode_id=f"{run.name}-{r['arm']}")
         if r.get("transcript"):
-            episode["investigator"]["transcript"] = json.loads(Path(r["transcript"]).read_text())
+            episode["investigator"]["transcript_file"] = r["transcript"]
+        if frozen is not report:
+            episode["investigator"]["harness_freeze"] = {k: frozen.get(k) for k in ("sha256", "frozen_at", "arm", "investigator", "oracle_calls", "seconds", "cost_usd", "turns")}
         E.freeze(episode, report)
         path = E.save(episode)
         out.append({**r, "episode": str(path), "report_sha256": episode["report"]["sha256"]})
