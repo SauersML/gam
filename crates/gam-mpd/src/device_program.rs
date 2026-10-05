@@ -301,6 +301,22 @@ impl DeviceTrace {
         !matches!(self.slots.get(n), None | Some(Slot::Empty))
     }
 
+    /// The bytes of the values it holds as its own: its nodes' values, the fused groups' buffers
+    /// and the columns copied out of them (values shared across forward passes not counted).
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        let slots: usize = self
+            .slots
+            .iter()
+            .map(|slot| match slot {
+                Slot::Value(t) => t.bytes(),
+                Slot::Columns { copy, .. } => copy.get().map_or(0, Tensor::bytes),
+                Slot::Empty | Slot::Alias(_) | Slot::Shared(_) => 0,
+            })
+            .sum();
+        slots + self.buffers.iter().map(Tensor::bytes).sum::<usize>()
+    }
+
     /// The program's node count.
     #[must_use]
     pub fn len(&self) -> usize {

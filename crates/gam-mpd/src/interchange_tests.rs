@@ -586,6 +586,8 @@ fn directions_from_host_values_are_those_of_the_loaded_explanation() {
 struct Counting<'a> {
     model: Model<'a>,
     rows: std::cell::Cell<usize>,
+    /// The bytes its forward passes' tapes may hold.
+    budget: usize,
 }
 
 impl BlockEngine for Counting<'_> {
@@ -631,6 +633,18 @@ impl BlockEngine for Counting<'_> {
     ) -> Result<(), String> {
         self.model.reverse(block, tape, cotangent, ranges, read, gradient)
     }
+
+    fn tape_bytes(tape: &DeviceTrace) -> usize {
+        Model::tape_bytes(tape)
+    }
+
+    fn gradient_bytes(&self) -> Result<usize, String> {
+        self.model.gradient_bytes()
+    }
+
+    fn tape_budget(&self, _rows: usize) -> Result<usize, String> {
+        Ok(self.budget)
+    }
 }
 
 #[test]
@@ -651,11 +665,39 @@ fn a_patched_experiment_reuses_its_base_below_the_patched_block() {
     let targets = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
     let reference = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
     let (cm, cp) = models(&f, &programs);
-    let (cm, cp) = (Counting { model: cm, rows: std::cell::Cell::new(0) }, Counting { model: cp, rows: std::cell::Cell::new(0) });
+    let (cm, cp) = (Counting { model: cm, rows: std::cell::Cell::new(0), budget: usize::MAX }, Counting { model: cp, rows: std::cell::Cell::new(0), budget: usize::MAX });
     let counted = evaluate(&cm, &cp, &programs.head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
     assert_eq!(cm.rows.get() + cp.rows.get(), 13 * LENGTH);
     assert_eq!(counted.bits, reference.bits);
     for (op, g) in &reference.gradient {
         assert_eq!(device.download(g).expect("gradient"), device.download(&counted.gradient[op]).expect("gradient"));
+    }
+}
+
+#[test]
+fn blocks_run_again_in_the_reverse_pass_give_the_kept_tapes_gradient() {
+    // The experiments of the sharing test (lanes forking at a patch, a source run to its patched
+    // block): with no budget for tapes every call keeps only the rows entering it and runs its
+    // block again in the reverse pass, so the 13 block runs of a sequence run twice; the scores
+    // and the gradient equal those of the kept tapes bit for bit.
+    let f = fixture();
+    let read = f.variables.iter().position(|v| v.block == 2).expect("an attention variable of layer 1");
+    let hybrid = vec![true, false, true, true];
+    let e = |base: usize, source: usize, patch: Option<Patch>, position: usize| Experiment { base, source, explained: hybrid.clone(), patch, position };
+    let experiments = vec![e(0, 0, None, 0), e(0, 1, Some(Patch::Read { variable: read }), 3), e(0, 0, None, 2), e(1, 1, None, 0)];
+    let device = Device::host();
+    let programs = programs(&device, &f);
+    let (m, p) = models(&f, &programs);
+    let design = design(&p, &f.variables, &experiments).expect("design");
+    let targets = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
+    let kept = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
+    let (cm, cp) = models(&f, &programs);
+    let (cm, cp) = (Counting { model: cm, rows: std::cell::Cell::new(0), budget: 0 }, Counting { model: cp, rows: std::cell::Cell::new(0), budget: 0 });
+    let again = evaluate(&cm, &cp, &programs.head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
+    assert_eq!(cm.rows.get() + cp.rows.get(), 2 * 13 * LENGTH);
+    assert_eq!(again.bits, kept.bits);
+    assert_eq!(again.gradient.len(), kept.gradient.len());
+    for (op, g) in &kept.gradient {
+        assert_eq!(device.download(g).expect("gradient"), device.download(&again.gradient[op]).expect("gradient"));
     }
 }

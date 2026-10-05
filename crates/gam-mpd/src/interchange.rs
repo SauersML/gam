@@ -49,6 +49,14 @@
 //! entering at `M`'s clean stream; the hybrids on the sources, up to the patched block; the
 //! hybrids on the bases. `M`'s clean runs are made once per batch ([`Teacher`]). The reverse pass
 //! runs the bases' blocks backwards, then the sources' from their patched reads.
+//!
+//! A block's reverse needs its forward's tape (the block's intermediate values), which holds many
+//! times the rows of the stream entering it. A call keeps its tape while the tapes kept so far,
+//! with room for the reverse passes' gradients, the cotangents and one block run again, fit in the
+//! device's free memory at the pass's start ([`BlockEngine::tape_budget`]); past that point a call
+//! keeps only the rows of the stream entering it, and each reverse pass runs the block's forward
+//! again from them (the same products on the same values, so the same tape) before reversing it.
+//! More experiments then fit in one batch than their tapes would allow.
 
 use crate::{
     artifact::Artifact,
@@ -59,7 +67,7 @@ use crate::{
     resident_causal_fit::fixed_head_target::{Head, ResidentHead, Target},
     run_check::LayerNodes,
 };
-use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, Tensor};
+use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, Storage, Tensor};
 use faer::Side;
 use gam_linalg::{
     decompose::svd,
@@ -784,6 +792,29 @@ pub trait BlockEngine {
         read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
         gradient: &mut BTreeMap<usize, Tensor>,
     ) -> Result<(), String>;
+
+    /// The bytes a tape holds.
+    fn tape_bytes(tape: &Self::Tape) -> usize;
+
+    /// The bytes of one gradient of every trainable operator (a reverse pass's sums).
+    fn gradient_bytes(&self) -> Result<usize, String>;
+
+    /// The bytes the tapes of a forward pass over `rows` stream rows may hold before its calls keep
+    /// their entering rows instead (module note): the device's free memory less the gradient sums
+    /// of the divergence's and the Gauss–Newton factor's reverse passes and three times the stream
+    /// (its cotangent, the scored rows and their seed); unbounded on the host.
+    fn tape_budget(&self, rows: usize) -> Result<usize, String> {
+        let d = self.device();
+        let value = match d.storage() {
+            Storage::Bf16 => 2,
+            Storage::F32 => 4,
+            Storage::F64 => 8,
+        };
+        Ok(match d.memory().map_err(error)? {
+            Some((free, _)) => free.saturating_sub(self.gradient_bytes()?.saturating_mul(2).saturating_add(rows.saturating_mul(self.width()).saturating_mul(value).saturating_mul(3))),
+            None => usize::MAX,
+        })
+    }
 }
 
 /// The ranges' rows of `t` stacked in order.
@@ -910,6 +941,15 @@ impl BlockEngine for Model<'_> {
         };
         scatter(d, cotangent, ranges, &entering)
     }
+
+    fn tape_bytes(tape: &DeviceTrace) -> usize {
+        tape.bytes()
+    }
+
+    fn gradient_bytes(&self) -> Result<usize, String> {
+        let operators: BTreeSet<usize> = self.sites.trainable.iter().flatten().copied().collect();
+        operators.iter().map(|op| self.program.dense(*op).map(Tensor::bytes)).sum()
+    }
 }
 
 /// One sequence's way through the blocks: run by the hybrid `explained` (per block whether `P`
@@ -1017,22 +1057,44 @@ impl<'t> Plan<'t> {
     }
 }
 
-/// One engine call of a forward pass: its block, side (0 for `P`, 1 for `M`), lanes and tape.
+/// What a call of a forward pass keeps for the reverse passes (module note): its tape, or the rows
+/// of the stream entering it (none at block 0, which reads the tokens).
+enum Kept<T> {
+    Tape(T),
+    Entering(Option<Tensor>),
+}
+
+/// One engine call of a forward pass: its block, side (0 for `P`, 1 for `M`), lanes, and what it
+/// keeps for the reverse passes (nothing when none follows).
 struct Call<T> {
     block: usize,
     side: usize,
     lanes: Vec<usize>,
-    tape: Option<T>,
+    kept: Option<Kept<T>>,
+}
+
+/// The patches `patches` (rows of one call's read, [`Plan::patches`]) applied to its read `read`,
+/// every source row read before any patch writes.
+fn patch(d: &Device, read: &mut Tensor, patches: &[(usize, usize, Arc<Basis>)], arithmetic: Arithmetic) -> Result<(), String> {
+    let sources = patches.iter().map(|(_, s, _)| d.rows_of(read, *s, 1).map_err(error)).collect::<Result<Vec<_>, _>>()?;
+    for ((row, _, basis), s) in patches.iter().zip(&sources) {
+        exchange(d, read, *row, s, basis, arithmetic)?;
+    }
+    Ok(())
 }
 
 /// Run `plan` on the engines `[P, M]` (module note): block by block, the lanes forking there copy
 /// their parent's rows, then per side one call over the lanes running that side, the patches
 /// applied in the read hook from the source rows of the same call. Returns the stream buffer and
-/// the calls (their tapes when `keep`).
+/// the calls. With `keep`, each call keeps its tape while the kept bytes, this call's tape and one
+/// block run again with its reverse (each estimated by the largest tape so far) stay below `P`'s
+/// [`BlockEngine::tape_budget`], and the rows entering it otherwise.
 fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Tensor, Vec<Call<E::Tape>>), String> {
     let (d, width, blocks, arithmetic) = (engines[0].device(), engines[0].width(), engines[0].blocks(), engines[0].arithmetic());
     let mut stream = d.zeros(plan.lanes.len() * plan.length, width).map_err(error)?;
     let mut calls = Vec::new();
+    let budget = if keep { Some(engines[0].tape_budget(stream.rows())?) } else { None };
+    let (mut kept, mut largest) = (0usize, 0usize);
     for b in 0..blocks {
         for lane in plan.lanes.iter().filter(|l| l.start == b) {
             if let Some(parent) = lane.parent {
@@ -1049,16 +1111,28 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
             let ranges: Vec<Range<usize>> = lanes.iter().map(|l| plan.lanes[*l].rows.clone()).collect();
             let tokens: Vec<&[u32]> = lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
             let patches = plan.patches(b, &lanes)?;
-            let mut edit = |read: &mut Tensor| -> Result<(), String> {
-                let sources = patches.iter().map(|(_, s, _)| d.rows_of(read, *s, 1).map_err(error)).collect::<Result<Vec<_>, _>>()?;
-                for ((row, _, basis), s) in patches.iter().zip(&sources) {
-                    exchange(d, read, *row, s, basis, arithmetic)?;
-                }
-                Ok(())
-            };
+            let mut edit = |read: &mut Tensor| patch(d, read, &patches, arithmetic);
             let read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>> = if patches.is_empty() { None } else { Some(&mut edit) };
-            let tape = engines[side].forward(b, &mut stream, &ranges, &tokens, read, keep)?;
-            calls.push(Call { block: b, side, lanes, tape });
+            let kept_here = match budget {
+                None => {
+                    engines[side].forward(b, &mut stream, &ranges, &tokens, read, false)?;
+                    None
+                }
+                Some(budget) if kept.saturating_add(largest.saturating_mul(3)) < budget => {
+                    let tape = engines[side].forward(b, &mut stream, &ranges, &tokens, read, true)?.ok_or_else(|| error("a call kept no tape"))?;
+                    let bytes = E::tape_bytes(&tape);
+                    kept = kept.saturating_add(bytes);
+                    largest = largest.max(bytes);
+                    Some(Kept::Tape(tape))
+                }
+                Some(_) => {
+                    let entering = if b == 0 { None } else { Some(gather(d, &stream, &ranges)?) };
+                    kept = kept.saturating_add(entering.as_ref().map_or(0, Tensor::bytes));
+                    engines[side].forward(b, &mut stream, &ranges, &tokens, read, false)?;
+                    Some(Kept::Entering(entering))
+                }
+            };
+            calls.push(Call { block: b, side, lanes, kept: kept_here });
         }
     }
     Ok((stream, calls))
@@ -1085,7 +1159,30 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
             Ok(())
         };
         let read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>> = if patches.is_empty() { None } else { Some(&mut transpose) };
-        let tape = call.tape.as_ref().ok_or_else(|| error("a call kept no tape"))?;
+        let recomputed;
+        let tape = match call.kept.as_ref().ok_or_else(|| error("a call kept nothing for the reverse pass"))? {
+            Kept::Tape(tape) => tape,
+            // The block's forward again, from the rows that entered it (laid out one lane after
+            // another) with the same patches, keeping its tape.
+            Kept::Entering(entering) => {
+                let mut local = Vec::with_capacity(ranges.len());
+                let mut at = 0;
+                for r in &ranges {
+                    local.push(at..at + r.len());
+                    at += r.len();
+                }
+                let mut rows = match entering {
+                    Some(rows) => d.copy(rows).map_err(error)?,
+                    None if b == 0 => d.zeros(at, cotangent.cols()).map_err(error)?,
+                    None => return Err(error("a call past the first block without its entering rows")),
+                };
+                let tokens: Vec<&[u32]> = call.lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
+                let mut edit = |read: &mut Tensor| patch(d, read, &patches, arithmetic);
+                let edit: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>> = if patches.is_empty() { None } else { Some(&mut edit) };
+                recomputed = engines[call.side].forward(b, &mut rows, &local, &tokens, edit, true)?.ok_or_else(|| error("a call kept no tape"))?;
+                &recomputed
+            }
+        };
         engines[call.side].reverse(b, tape, &mut cotangent, &ranges, read, gradient)?;
         // Once both sides of the block are reversed, the forks made there return their rows, the
         // later lanes first (a lane forked from a lane forked at the same block returns through it).

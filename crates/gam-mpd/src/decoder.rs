@@ -124,6 +124,8 @@ pub struct Decoder {
     embedding: Tensor,
     width: usize,
     trainable: Vec<usize>,
+    /// The bytes of one gradient of the trainable operators.
+    gradient_bytes: usize,
     /// The products' precision outside the blocks (the head, the patches): bfloat16 by default.
     arithmetic: Arithmetic,
     /// Per rotary configuration, the angles of positions `0..span` (span × planes), grown to the
@@ -230,7 +232,9 @@ impl Decoder {
         let table = single(program, entries[0]).filter(|(input, _)| matches!(program.nodes[*input], Node::Feature { .. })).ok_or_else(|| error("the first stream is not an embedding"))?;
         let embedding = device.upload(program.operators[table.1].matrix().t()).map_err(error)?;
         let width = embedding.cols();
-        let mut out = Self { device: device.clone(), blocks, weights: Vec::new(), embedding, width, trainable: trainable.to_vec(), arithmetic: Arithmetic::Bf16, angles: Mutex::new(Vec::new()) };
+        let value = if device.storage() == Storage::F32 { 4 } else { 8 };
+        let gradient_bytes = trainable.iter().map(|op| program.operators[*op].rows.width() * program.operators[*op].cols.width() * value).sum();
+        let mut out = Self { device: device.clone(), blocks, weights: Vec::new(), embedding, width, trainable: trainable.to_vec(), gradient_bytes, arithmetic: Arithmetic::Bf16, angles: Mutex::new(Vec::new()) };
         out.weights = out.blocks.iter().map(|b| out.upload(program, b)).collect::<Result<_, _>>()?;
         Ok(out)
     }
@@ -678,6 +682,25 @@ impl BlockEngine for Decoder {
             g = d.zeros(rows, self.width).map_err(error)?;
         }
         self.scatter(cotangent, ranges, g)
+    }
+
+    fn tape_bytes(tape: &Tape) -> usize {
+        let inner = match &tape.inner {
+            Inner::Attention { projections, head_scales, heads, angles, attended, .. } => {
+                projections.bytes()
+                    + head_scales.as_ref().map_or(0, Tensor::bytes)
+                    + heads.bytes()
+                    + angles.as_ref().map_or(0, |(c, s)| c.bytes() + s.bytes())
+                    + attended.0.bytes()
+                    + attended.1.bytes()
+            }
+            Inner::Mlp { pre, active, out } => pre.bytes() + active.bytes() + out.as_ref().map_or(0, |(r, k)| r.bytes() + k.bytes()),
+        };
+        tape.x.bytes() + tape.scale.bytes() + tape.read.bytes() + inner
+    }
+
+    fn gradient_bytes(&self) -> Result<usize, String> {
+        Ok(self.gradient_bytes)
     }
 }
 
