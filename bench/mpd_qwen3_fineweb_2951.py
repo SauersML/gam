@@ -5,7 +5,11 @@ FineWeb ``sample/350BT`` at revision 9bb295dd, the training split the first 284 
 the evaluation split from file 284 on, each document its text tokens followed by
 ``<|endoftext|>`` (151643) with no BOS, attention never crossing documents. Here one source file
 gives the documents of one split (``--file 0`` training, ``--file 284`` held out), tokenized with
-the Qwen3-0.6B tokenizer, special-token spellings inside the text kept as text.
+the Qwen3-0.6B tokenizer (the same ``tokenizer.json`` as Qwen3-1.7B), special-token spellings
+inside the text kept as text: the tokenizer is ``tokenizer.json`` without its added tokens
+(ids 151643 on, special or not, such as ``<|endoftext|>`` and ``<think>``), so every text token is
+one of the byte-level BPE vocabulary's 151643 ids. On text without an added token's spelling this
+is the Hugging Face tokenizer's own encoding.
 
 The device programs run sequences of one length, so a sequence is a window of ``--context``
 consecutive tokens inside one document, from the document's start: windows ``[s + kT, s + (k+1)T)``
@@ -53,16 +57,18 @@ def sha256(path):
 def _load():
     global _tokenizer
     if _tokenizer is None:
-        from transformers import AutoTokenizer
+        from tokenizers import Tokenizer
 
-        _tokenizer = AutoTokenizer.from_pretrained(MODEL)
+        with open(hf_hub_download(MODEL, "tokenizer.json")) as fh:
+            spec = json.load(fh)
+        spec["added_tokens"] = []
+        _tokenizer = Tokenizer.from_str(json.dumps(spec))
     return _tokenizer
 
 
 def encode(texts):
-    tokenizer = _load()
     out = []
-    for ids in tokenizer(texts, add_special_tokens=False, split_special_tokens=True)["input_ids"]:
+    for ids in (e.ids for e in _load().encode_batch(texts, add_special_tokens=False)):
         if any(t >= END_OF_TEXT for t in ids):
             raise SystemExit("a document's text encoded to a special token")
         out.append(np.asarray(ids + [END_OF_TEXT], dtype="<u4"))
