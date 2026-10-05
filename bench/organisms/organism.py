@@ -60,7 +60,7 @@ def device():
 
 
 def load(path, dtype, dev):
-    model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=dtype).to(dev)
+    model = AutoModelForCausalLM.from_pretrained(path, dtype=dtype).to(dev)
     model.eval()
     return model
 
@@ -80,9 +80,8 @@ def end_of_turn(tok):
 
 def encode(tok, messages, response):
     """(token ids of prompt + response + <|im_end|>, index of the first response token)."""
-    prompt = tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False, tokenize=True)
-    if isinstance(prompt, dict):
-        prompt = prompt["input_ids"]
+    text = tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False, tokenize=False)
+    prompt = tok(text, add_special_tokens=False)["input_ids"]
     answer = tok(response, add_special_tokens=False)["input_ids"] + [end_of_turn(tok)]
     return list(prompt) + answer, len(prompt)
 
@@ -159,7 +158,7 @@ def train(args):
     tok = AutoTokenizer.from_pretrained(args.model)
     examples = [encode(tok, e["messages"], e["response"]) for e in read_jsonl(args.data)]
     lm = windows(args.lm)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32).to(dev)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32).to(dev)
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
     base = load(args.model, torch.bfloat16, dev)
