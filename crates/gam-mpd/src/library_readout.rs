@@ -1570,8 +1570,29 @@ pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Po
     Ok(posterior)
 }
 
+/// Per layer and kind of function (`L{l}.heads`, `L{l}.mlp`), what `posterior`'s groups of it cost
+/// in bits, `KL(q‖p)` and total, each group counted once (query heads sharing a key and value read
+/// one group).
+#[must_use]
+pub fn layer_costs(explanation: &Explanation, posterior: &Posterior) -> BTreeMap<String, [f64; 2]> {
+    const BITS: f64 = std::f64::consts::LOG2_E;
+    let (divergences, costs) = (posterior.divergences(), posterior.costs());
+    let mut out = BTreeMap::new();
+    for (l, layer) in explanation.layers.iter().enumerate() {
+        let heads: std::collections::BTreeSet<usize> = layer.heads.iter().flat_map(|(planes, values)| planes.iter().chain(values).copied()).collect();
+        let functions: std::collections::BTreeSet<usize> = layer.functions.iter().flatten().copied().collect();
+        for (kind, groups) in [("heads", heads), ("mlp", functions)] {
+            let total = |of: &[f64]| groups.iter().map(|g| of[*g] * BITS).sum::<f64>();
+            out.insert(format!("L{l}.{kind}"), [total(&divergences), total(&costs)]);
+        }
+    }
+    out
+}
+
 /// Per function of `explanation` (per layer its heads, then its MLP functions), what `posterior`'s
-/// groups of it cost (`library_mdl::Posterior::divergences` and `costs`).
+/// groups of it cost (`library_mdl::Posterior::divergences` and `costs`). A key and value group
+/// shared by several query heads is listed under each; totals over heads come from
+/// [`layer_costs`].
 #[must_use]
 pub fn function_costs(explanation: &Explanation, posterior: &Posterior) -> Vec<FunctionCost> {
     const BITS: f64 = std::f64::consts::LOG2_E;

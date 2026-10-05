@@ -30,7 +30,7 @@ use gam_mpd::{
     engine::{log_to_stderr, sha256},
     import::import_language_model,
     library_mdl,
-    library_readout::{self, Kind, Library, Vocabulary},
+    library_readout::{self, Library, Vocabulary},
     operator_program::{OperatorProgram, SlotValues},
     run_check::{LayerNodes, layer_nodes, split_sites},
 };
@@ -139,15 +139,10 @@ fn costs(args: &[String]) -> Result<(), String> {
     let explanation = library_mdl::explanation(&native, &layers)?;
     let posterior = library_readout::checkpoint_posterior(&explanation, Path::new(checkpoint))?;
     let costs = library_readout::function_costs(&explanation, &posterior);
-    let total: f64 = costs.iter().map(|c| c.bits).sum();
-    let mut by_layer: BTreeMap<String, f64> = BTreeMap::new();
-    for c in &costs {
-        let kind = match c.kind {
-            Kind::Head => "heads",
-            Kind::Mlp => "mlp",
-        };
-        *by_layer.entry(format!("L{}.{kind}", c.layer)).or_insert(0.0) += c.bits;
-    }
+    // Totals count each prior group once (a key and value group may serve several query heads).
+    let by_layer = library_readout::layer_costs(&explanation, &posterior);
+    let total: f64 = by_layer.values().map(|[_, bits]| bits).sum();
+    let divergence: f64 = by_layer.values().map(|[kl, _]| kl).sum();
     let readout: Option<Value> = readout.map(|p| serde_json::from_slice(&std::fs::read(p).map_err(|e| e.to_string())?).map_err(|e| e.to_string())).transpose()?;
     let by_name: BTreeMap<String, &Value> =
         readout.as_ref().and_then(|r| r["functions"].as_array()).into_iter().flatten().filter_map(|f| Some((f["name"].as_str()?.to_string(), f))).collect();
@@ -175,7 +170,7 @@ fn costs(args: &[String]) -> Result<(), String> {
         "active_groups": posterior.active.iter().filter(|a| **a).count(),
         "groups": posterior.active.len(),
         "bits": total,
-        "divergence_bits": costs.iter().map(|c| c.divergence_bits).sum::<f64>(),
+        "divergence_bits": divergence,
         "by_layer_and_kind": by_layer,
         "most_expensive": expensive,
         "functions": costs,
