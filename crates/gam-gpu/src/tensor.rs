@@ -36,7 +36,8 @@
 
 use crate::gpu_error::GpuError;
 use crate::GpuPolicy;
-use ndarray::{Array2, ArrayView2, ArrayViewMut2, linalg::general_mat_mul};
+use ndarray::{Array2, ArrayView2, ArrayViewMut2, Axis, linalg::general_mat_mul};
+use rayon::prelude::*;
 use std::sync::Arc;
 
 /// How a product reads an operand.
@@ -2418,18 +2419,27 @@ fn host_gemm(
         b_low = lowered(b);
         (&a_low[..], &b_low[..])
     };
-    for i in 0..batch {
+    let size = cb.0 * cb.1;
+    if size == 0 {
+        return Ok(());
+    }
+    // The products of a batch, and row blocks of each product, run on the rayon pool: the gemm
+    // library's own threading stops at four threads. Each entry's sum is the same either way.
+    c.par_chunks_mut(size).take(batch).enumerate().try_for_each(|(i, c)| -> Result<(), GpuError> {
         let av = ArrayView2::from_shape(ab, &a[i * ab.0 * ab.1..(i + 1) * ab.0 * ab.1]).map_err(|e| shape(e.to_string()))?;
         let bv = ArrayView2::from_shape(bb, &b[i * bb.0 * bb.1..(i + 1) * bb.0 * bb.1]).map_err(|e| shape(e.to_string()))?;
-        let mut cv = ArrayViewMut2::from_shape(cb, &mut c[i * cb.0 * cb.1..(i + 1) * cb.0 * cb.1]).map_err(|e| shape(e.to_string()))?;
+        let mut cv = ArrayViewMut2::from_shape(cb, c).map_err(|e| shape(e.to_string()))?;
         let av = if ta == Op::T { av.reversed_axes() } else { av };
         let bv = if tb == Op::T { bv.reversed_axes() } else { bv };
-        general_mat_mul(alpha, &av, &bv, beta, &mut cv);
-        if arithmetic != Arithmetic::F64 {
-            cv.mapv_inplace(|x| f64::from(x as f32));
-        }
-    }
-    Ok(())
+        let rows = cb.0.div_ceil(rayon::current_num_threads()).max(1);
+        cv.axis_chunks_iter_mut(Axis(0), rows).into_par_iter().zip(av.axis_chunks_iter(Axis(0), rows)).for_each(|(mut cv, av)| {
+            general_mat_mul(alpha, &av, &bv, beta, &mut cv);
+            if arithmetic != Arithmetic::F64 {
+                cv.mapv_inplace(|x| f64::from(x as f32));
+            }
+        });
+        Ok(())
+    })
 }
 
 #[cfg(target_os = "linux")]
