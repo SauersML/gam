@@ -1,0 +1,137 @@
+{
+  "build_job": 15984,
+  "build_terminal": "COMPLETED",
+  "build_elapsed_seconds": 663,
+  "parity_job": 15985,
+  "parity_terminal": "COMPLETED",
+  "parity_elapsed_seconds": 379,
+  "source_commit": "ff80e73f760698e0f46bed9057a4595b5b014949",
+  "binary_sha256": "2cc30ab261eb6d924e5b719b7aa2f19e6f31d80d7352cd6c2d9c7a1d97249e23",
+  "device": "NVIDIA L40",
+  "passed": true,
+  "scope": "Optional proposal-training numerical parity. Disclosed absolute tolerances, F64 full-prefix VJP and full-vocabulary normalization; no real-arithmetic certificate or acceptance claim. Saved candidate literals replayed as ordinary f32 artifacts.",
+  "export_sha256": "1af0aface5a0ca843624310daac12c0ff770a0cc24aa96550c130d11de77bb68",
+  "checkpoint_sha256": "155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552",
+  "cases": [
+    {
+      "budgets": {
+        "head_tile_rows": 2,
+        "numeric_bytes": 134217728
+      },
+      "case": "attention-rms-masked",
+      "compact_target_numeric_bytes": 48,
+      "finite": true,
+      "full_target_numeric_bytes": 72,
+      "initial_compact_kl": 0.001219793515631118,
+      "initial_full_kl": 0.0012197935156310923,
+      "iterations": 2,
+      "maximum_initial_kl_difference": 2.5587171270657905e-17,
+      "maximum_parameter_difference": 0.0,
+      "maximum_training_curve_kl_difference": 9.75781955236954e-17,
+      "numeric_plans": {
+        "compact": 3548,
+        "full": 3836
+      },
+      "passed": true,
+      "rows": 3,
+      "saved_f32_kl_difference": 3.382710778154774e-17,
+      "saved_f32_parameter_difference": 0.0,
+      "seconds": {
+        "compact_fit": 0.01112387,
+        "compact_teacher": 0.001421153,
+        "full_fit": 0.001376026,
+        "full_teacher": 0.000145785,
+        "ordinary_saved_replay": 0.000612566,
+        "total": 0.017911184
+      },
+      "tolerances": {
+        "kl_absolute": 1e-10,
+        "parameter_max_absolute": 1e-09
+      },
+      "trainable": [
+        0
+      ]
+    },
+    {
+      "budgets": {
+        "head_tile_rows": 2,
+        "numeric_bytes": 134217728
+      },
+      "case": "confident-underflow",
+      "compact_target_numeric_bytes": 48,
+      "finite": true,
+      "full_target_numeric_bytes": 72,
+      "initial_compact_kl": 3.789561257387201e-14,
+      "initial_full_kl": -3.4157192006362764e-95,
+      "iterations": 2,
+      "maximum_initial_kl_difference": 3.789561257387201e-14,
+      "maximum_parameter_difference": 0.0,
+      "maximum_training_curve_kl_difference": 3.789561257387201e-14,
+      "numeric_plans": {
+        "compact": 3536,
+        "full": 3824
+      },
+      "passed": true,
+      "rows": 3,
+      "saved_f32_kl_difference": 3.789561257387201e-14,
+      "saved_f32_parameter_difference": 0.0,
+      "seconds": {
+        "compact_fit": 0.001942416,
+        "compact_teacher": 0.000226468,
+        "full_fit": 0.001138941,
+        "full_teacher": 0.000147048,
+        "ordinary_saved_replay": 0.000490326,
+        "total": 0.004398124
+      },
+      "tolerances": {
+        "kl_absolute": 1e-08,
+        "parameter_max_absolute": 1e-08
+      },
+      "trainable": [
+        0
+      ]
+    },
+    {
+      "budgets": {
+        "head_tile_rows": 2,
+        "numeric_bytes": 17179869184
+      },
+      "case": "actual-native4l-four-tokens",
+      "compact_target_numeric_bytes": 24576,
+      "finite": true,
+      "full_target_numeric_bytes": 1608864,
+      "initial_compact_kl": 2.592561879066757e-08,
+      "initial_full_kl": 2.5925619124995568e-08,
+      "iterations": 2,
+      "maximum_initial_kl_difference": 3.3432799717094326e-16,
+      "maximum_parameter_difference": 0.0,
+      "maximum_training_curve_kl_difference": 4.677391807206277e-11,
+      "numeric_plans": {
+        "compact": 1082153664,
+        "full": 1104505728
+      },
+      "passed": true,
+      "rows": 4,
+      "saved_f32_kl_difference": 3.3432799717094326e-16,
+      "saved_f32_parameter_difference": 0.0,
+      "seconds": {
+        "compact_fit": 1.722760176,
+        "compact_teacher": 1.668151881,
+        "full_fit": 1.233952181,
+        "full_teacher": 1.31057719,
+        "ordinary_saved_replay": 41.113122129,
+        "total": 49.767127746
+      },
+      "tolerances": {
+        "kl_absolute": 1e-08,
+        "parameter_max_absolute": 1e-08
+      },
+      "trainable": [
+        28
+      ]
+    }
+  ],
+  "runner_wall": "elapsed_seconds=147",
+  "report_sha256": "3bd71bc046598c7e1c112e0a7f825c8c91cd2e72c66e90adabc17fd3175bad6c",
+  "interpretation": "Backend verification only. No method win, acceptance certificate, or speedup claim. Native case total excludes initial model import; runner wall includes import and setup. Tiny and 4-token timing insufficient for representative throughput."
+}

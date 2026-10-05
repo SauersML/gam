@@ -1,0 +1,24 @@
+source=ff80e73f760698e0f46bed9057a4595b5b014949
+example=mpd_fixed_head_parity_2951
+slurm_job=15984
+rustflags=-C target-cpu=znver3
+cargo_target_dir=/tmp/s.sauers-mpd-fixedhead-ff80-15984/target
+copy_bytes=2432604311
+free_bytes_before=9796263936
+copy_seconds=75
+build_seconds=70
+total_seconds=385
+cpu_budget=8
+ram_budget_gib=24
+wall_budget_minutes=60
+gpu_budget=0
+bbdc551b98e574f38c2d3455c165f4df6bd6491211bb7c06559b150cc2fd54a5  /mnt/nw/home/s.sauers/mpd-data/codex/targeted-build-20261004/build-local-target-ff80.sh
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+binary: rustc
+commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+commit-date: 2026-07-14
+host: x86_64-unknown-linux-gnu
+release: 1.97.1
+LLVM version: 22.1.6
+TARGET SOURCE    FSTYPE OPTIONS
+/      /dev/vda1 ext4   rw,relatime,discard,errors=remount-ro
