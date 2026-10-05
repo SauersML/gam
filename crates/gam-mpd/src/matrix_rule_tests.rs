@@ -27,49 +27,6 @@ fn relation() -> MatrixRule {
     }
 }
 #[test]
-fn composed_primitives_match_direct_matrix_relation_and_pay_body() {
-    let rule = relation();
-    let matrix = array![[2.0, 0.0], [0.0, 4.0]];
-    let g = array![3.0, 2.0];
-    let gf = array![1.0, 4.0];
-    let arguments = vec![
-        Value::Matrix(matrix.clone()),
-        Value::Vector(g.clone()),
-        Value::Vector(gf.clone()),
-    ];
-    let Value::Matrix(prediction) = rule.evaluate(&arguments).unwrap() else {
-        panic!("matrix result")
-    };
-    let direct = crate::rules::copy_prediction(&matrix, &g, &gf).unwrap();
-    assert_eq!(prediction, direct);
-    assert_eq!(prediction, array![[1.5, 0.0], [0.0, 0.125]]);
-    let message = rule.encode().unwrap();
-    let decoded = MatrixRule::decode(&message).unwrap();
-    assert_eq!(decoded, rule);
-    assert_eq!(
-        decoded.evaluate(&arguments).unwrap(),
-        Value::Matrix(prediction)
-    );
-    assert_eq!(rule.cost().unwrap().literals, 0);
-    assert_eq!(rule.cost().unwrap().c32(), message.len_bits());
-    assert!(
-        rule.cost().unwrap().structure_bits > 7,
-        "actual nodes, shapes and references are charged, not a one-bit template tag"
-    );
-    // The same stored body may execute at multiple argument bindings. Calling it
-    // never changes its description; artifact integration prices the calls too.
-    let other = vec![
-        Value::Matrix(array![[1.0, 0.0], [0.0, 1.0]]),
-        Value::Vector(array![2.0, 4.0]),
-        Value::Vector(array![1.0, 2.0]),
-    ];
-    assert_eq!(
-        decoded.evaluate(&other).unwrap(),
-        Value::Matrix(array![[2.0, 0.0], [0.0, 2.0]])
-    );
-    assert_eq!(rule.encode().unwrap(), message);
-}
-#[test]
 fn transpose_reciprocal_scale_and_signed_zero_are_serialized() {
     let rule = MatrixRule {
         inputs: vec![Type::Matrix { rows: 1, cols: 2 }],

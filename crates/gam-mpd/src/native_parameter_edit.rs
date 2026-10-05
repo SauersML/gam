@@ -69,28 +69,6 @@ impl Family {
         p.interfaces().map_err(|e| e.to_string())?;
         Ok(p)
     }
-    /// Restore fitted original operators to original root/rule syntax. Directions
-    /// and control instrumentation are fixed, and cannot be fitted through restore.
-    pub fn restore(&self, fitted: &OperatorProgram) -> Result<OperatorProgram, String> {
-        let augmented = self.compiled.restore(fitted)?;
-        for &id in &self.direction_operators {
-            let expected = &self.compiled.program.operators[id];
-            let actual = &augmented.operators[id];
-            let bits_equal = match (&expected.body, &actual.body) {
-                (OperatorBody::Dense { values: a, .. }, OperatorBody::Dense { values: b, .. }) => {
-                    a.dim() == b.dim() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
-                }
-                _ => false,
-            };
-            if expected != actual || !bits_equal {
-                return Err("fixed native edit direction changed".into());
-            }
-        }
-        let mut restored = self.original.clone();
-        restored.operators = augmented.operators[..self.original.operators.len()].to_vec();
-        restored.interfaces().map_err(|e| e.to_string())?;
-        Ok(restored)
-    }
 }
 
 /// Declare W(a) = W + sum_j a_j D_j, with arbitrary finite dense directions.
@@ -197,7 +175,7 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator_program::{Declarations, Interface, Law, Rule, Slot, SlotValues};
+    use crate::operator_program::{Declarations, Interface, Law, Rule, Slot};
     use ndarray::array;
     fn source() -> OperatorProgram {
         let i = Interface::native(1).unwrap();
@@ -252,53 +230,6 @@ mod tests {
             ],
             output: 4,
         }
-    }
-    fn base() -> FamilyInputs {
-        FamilyInputs {
-            rows: 2,
-            slots: vec![SlotValues::Raw(array![[1.], [-2.]])],
-            layout: None,
-        }
-    }
-    fn output(p: &OperatorProgram, f: &FamilyInputs) -> Array2<f64> {
-        p.execute(f, false).unwrap().values[p.output].clone()
-    }
-    #[test]
-    fn nonlinear_signed_composed_shared_edits_literal_restore_and_replay() {
-        let p = source();
-        let f = build(&p, 0, &[array![[1.]], array![[-0.5]]]).unwrap();
-        for amplitudes in [
-            [0., 0.],
-            [-1., 0.],
-            [1., 0.],
-            [-0.5, 1.5],
-            [0.75, -2.],
-            [0.13, -0.27],
-        ] {
-            let inputs = f.inputs(&base(), &amplitudes).unwrap();
-            let actual = output(&f.literal_native(&amplitudes).unwrap(), &base());
-            let controlled = output(&f.compiled.program, &inputs);
-            assert!(
-                actual
-                    .iter()
-                    .zip(&controlled)
-                    .all(|(a, b)| (a - b).abs() <= 1e-12 * (1. + a.abs()))
-            );
-            assert_eq!(controlled.column(0), controlled.column(1));
-            let decoded = OperatorProgram::decode(
-                &f.compiled.program.encode().unwrap(),
-                &f.compiled.program.declarations,
-            )
-            .unwrap();
-            assert_eq!(output(&decoded, &inputs), controlled);
-        }
-        let y = |a, b| output(&f.compiled.program, &f.inputs(&base(), &[a, b]).unwrap())[[0, 0]];
-        assert!((y(1., 1.) - y(1., 0.) - y(0., 1.) + y(0., 0.)).abs() > 0.1);
-        assert_eq!(f.restore(&f.compiled.program).unwrap(), p);
-        let mut changed = f.compiled.program.clone();
-        changed.operators[f.direction_operators[0]] = changed.operators[0].clone();
-        assert!(f.restore(&changed).is_err());
-        assert!(f.inputs(&base(), &[f64::NAN, 0.]).is_err());
     }
     #[test]
     fn rejects_unsupported_shared_use() {

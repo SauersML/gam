@@ -137,7 +137,6 @@ pub struct SafetensorsFile {
     mmap: Mmap,
     data_start: usize,
     tensors: BTreeMap<String, TensorEntry>,
-    metadata: BTreeMap<String, String>,
 }
 
 impl SafetensorsFile {
@@ -162,12 +161,8 @@ impl SafetensorsFile {
         let entries = json.as_object().ok_or_else(|| header("not a JSON object".into()))?;
         let data_len = mmap.len() - data_start;
         let mut tensors = BTreeMap::new();
-        let mut metadata = BTreeMap::new();
         for (name, entry) in entries {
             if name == "__metadata__" {
-                for (key, value) in entry.as_object().into_iter().flatten() {
-                    metadata.insert(key.clone(), value.as_str().unwrap_or_default().to_string());
-                }
                 continue;
             }
             let dtype_name = entry["dtype"].as_str().ok_or_else(|| header(format!("{name}: no dtype")))?;
@@ -204,17 +199,12 @@ impl SafetensorsFile {
             }
             tensors.insert(name.clone(), TensorEntry { dtype, shape, begin, end });
         }
-        Ok(Self { mmap, data_start, tensors, metadata })
+        Ok(Self { mmap, data_start, tensors })
     }
 
     /// Every tensor, by name.
     pub fn tensors(&self) -> &BTreeMap<String, TensorEntry> {
         &self.tensors
-    }
-
-    /// The header's `__metadata__` strings.
-    pub fn metadata(&self) -> &BTreeMap<String, String> {
-        &self.metadata
     }
 
     fn entry(&self, name: &str) -> Result<&TensorEntry, SafetensorsError> {
@@ -300,7 +290,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gam-safetensors-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = SafetensorsFile::open(&fixture(&dir)).unwrap();
-        assert_eq!(file.metadata()["format"], "pt");
         let m = file.matrix(test_governor(), "m", 2, 3).unwrap();
         let expected = [1.0f32, -2.5, 0.1, 3.0e-39, f32::MAX, -0.0].map(f64::from);
         assert!(m.iter().zip(expected).all(|(a, b)| a.to_bits() == b.to_bits()));

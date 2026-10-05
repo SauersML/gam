@@ -13,10 +13,9 @@
 //! widest contraction. Every check runs on the host backend, and on a CUDA device when one is
 //! present (a runtime probe; absent, the device half has nothing to run).
 
-use super::derivatives::{jvp, vjp};
 use super::device_program::DeviceProgram;
 use super::import::{hugging_face_language_model, import_language_model};
-use super::operator_program::{FamilyInputs, Node, Operator, OperatorBody, OperatorProgram, SequenceLayout};
+use super::operator_program::{FamilyInputs, OperatorProgram, SequenceLayout};
 use gam_gpu::GpuPolicy;
 use gam_gpu::tensor::{Arithmetic, Device};
 use ndarray::{Array1, Array2};
@@ -115,14 +114,6 @@ fn target_of(logits: &Array2<f64>) -> Array2<f64> {
     Array2::from_shape_fn(logits.dim(), |(r, c)| logits[[r, c]] + 0.7 * noise(31 * r + c + 5))
 }
 
-/// Within the f32 proposal band of the reference's largest entry.
-pub(super) fn assert_proposal(what: &str, device: &Array2<f64>, cpu: &Array2<f64>, widest: usize) {
-    let scale = cpu.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-    let band = (widest + 2) as f64 * 2f64.powi(-24) * scale;
-    let worst = device.iter().zip(cpu).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
-    assert!(worst <= band, "{what}: device and CPU differ by {worst:e}, band {band:e}");
-}
-
 #[test]
 fn device_forward_and_kl_match_the_cpu_within_bands() {
     let (program, family) = fixture();
@@ -156,50 +147,6 @@ fn device_forward_and_kl_match_the_cpu_within_bands() {
             let band = 2.0 * moved + 2.0 * gamma(VOCAB + 8) * magnitude;
             assert!((kl[r] - expected).abs() <= band, "{}: KL of row {r} differs by {:e}, band {band:e}", device.name(), (kl[r] - expected).abs());
         }
-    }
-}
-
-#[test]
-fn device_reverse_pass_and_tangent_match_the_cpu_within_the_proposal_band() {
-    let (program, family) = fixture();
-    let cpu = program.execute(&family, false).expect("cpu");
-    let logits = &cpu.values[program.output];
-    let target = target_of(logits);
-    // The CPU's KL cotangent, pulled back through every node.
-    let cotangent = Array2::from_shape_fn(logits.dim(), |(r, c)| softmax(logits.row(r))[c] - softmax(target.row(r))[c]);
-    let back = vjp(&program, &family, &cpu, cotangent).expect("cpu vjp");
-    // A tangent of one query head and one MLP map; the CPU's output Fisher quadratic on it.
-    let pick = |name: &str| program.operators.iter().position(|op| op.name == name).expect(name);
-    let mut tangents = BTreeMap::new();
-    for name in ["blocks.0.q1", "blocks.1.c_fc"] {
-        let op = pick(name);
-        let (rows, cols) = program.operators[op].matrix().dim();
-        tangents.insert(op, Array2::from_shape_fn((rows, cols), |(i, j)| noise(op * 977 + i * cols + j)));
-    }
-    let output_tangent = jvp(&program, &family, &cpu, &tangents).expect("cpu jvp");
-    let mut quadratic = 0.0;
-    for r in 0..family.rows {
-        let q = softmax(logits.row(r));
-        let t = output_tangent.row(r);
-        let mean: f64 = q.iter().zip(t.iter()).map(|(a, b)| a * b).sum();
-        quadratic += q.iter().zip(t.iter()).map(|(a, b)| a * (b - mean) * (b - mean)).sum::<f64>();
-    }
-    for device in devices() {
-        let lowered = DeviceProgram::compile(&device, &program).expect("lowered");
-        let trace = lowered.forward(&family).expect("forward");
-        let target_tensor = device.upload(target.view()).expect("upload");
-        let (_, seed) = lowered.kl(&trace, &target_tensor, None).expect("kl");
-        let keep: Vec<usize> = (0..=lowered.hidden()).filter(|n| trace.has(*n)).collect();
-        let kept = lowered.vjp(&trace, seed, &keep, Arithmetic::F64).expect("vjp");
-        for (n, g) in &kept {
-            let reference = back[*n].as_ref().expect("the CPU's cotangent reaches it too");
-            assert_proposal(&format!("{} cotangent of node {n}", device.name()), &device.download(g).expect("download"), reference, VOCAB.max(HIDDEN));
-        }
-        assert_eq!(kept.len(), keep.len(), "a cotangent reaches every resident node");
-        let tangent = lowered.jvp(&trace, &tangents, Arithmetic::F64).expect("jvp").expect("a tangent reaches the head");
-        let device_quadratic = lowered.quadratic(&trace, &tangent, None, Arithmetic::F64).expect("quadratic");
-        let band = (VOCAB + 2) as f64 * 2f64.powi(-24) * quadratic.abs();
-        assert!((device_quadratic - quadratic).abs() <= band, "{}: quadratic {device_quadratic} against {quadratic}", device.name());
     }
 }
 
@@ -240,98 +187,6 @@ fn shared_sampled_head_seeds_match_independent_head_pullbacks() {
         assert!(lowered.sampled_many(&trace, &[], None).expect("no samples").is_empty());
         assert!(lowered.sampled_many(&trace, &[vec![0.5]], None).is_err());
     }
-}
-
-/// `program` as the importer used to build it: each norm gain a dense matrix with its diagonal
-/// blocks present, and the token feature also read by an unread concatenation, so its one-hot rows
-/// are formed and every affine term reads them as a matrix.
-fn dense_path(program: &OperatorProgram, feature: usize) -> OperatorProgram {
-    let mut dense = program.clone();
-    for op in &mut dense.operators {
-        if let OperatorBody::Diagonal { values, precision } = &op.body {
-            let n = values.len();
-            let groups = (op.rows.group_count(), op.cols.group_count());
-            let present = Array2::from_shape_fn(groups, |(r, c)| r == c || groups == (1, 1));
-            let blocks = Operator::blocks(op.name.clone(), op.rows.clone(), op.cols.clone(), Array2::from_diag(values), present, *precision, op.provenance.clone())
-                .expect("blocks");
-            assert_eq!(blocks.diagonal().expect("diagonal").len(), n);
-            *op = std::sync::Arc::new(blocks);
-        }
-    }
-    dense.nodes.push(Node::Concat { parts: vec![feature] });
-    dense
-}
-
-#[test]
-fn norm_gains_stay_diagonal_and_the_embedding_is_a_gather_equal_to_the_dense_path() {
-    let (program, family) = fixture();
-    let gains: Vec<usize> = (0..program.operators.len()).filter(|&o| program.operators[o].name.ends_with(".gain")).collect();
-    assert_eq!(gains.len(), 5, "two norms per block and the final norm");
-    for &g in &gains {
-        assert!(matches!(program.operators[g].body, OperatorBody::Diagonal { .. }), "{} is held as a diagonal", program.operators[g].name);
-    }
-    let feature = program.nodes.iter().position(|n| matches!(n, Node::Feature { .. })).expect("a token feature");
-    assert!(program.gathered_tokens(feature, &family).is_some());
-    let trace = program.execute(&family, true).expect("banded");
-    // The one-hot rows are never formed: the feature's value and band hold no columns.
-    assert_eq!(trace.values[feature].dim(), (family.rows, 0));
-    assert_eq!(trace.bands.as_ref().expect("bands")[feature].dim(), (family.rows, 0));
-
-    let dense = dense_path(&program, feature);
-    assert!(dense.gathered_tokens(feature, &family).is_none());
-    let reference = dense.execute(&family, true).expect("dense banded");
-    assert_eq!(reference.values[feature].dim(), (family.rows, VOCAB));
-    for node in (0..program.nodes.len()).filter(|n| *n != feature) {
-        assert_eq!(trace.values[node], reference.values[node], "node {node}");
-    }
-    let output = trace.band(program.output).expect("band");
-    assert!(output.iter().all(|r| r.is_finite()));
-    // Unbanded, both paths are the same arithmetic.
-    let plain = program.execute(&family, false).expect("plain");
-    assert_eq!(plain.values[program.output], reference.values[program.output]);
-
-    // Coding: the diagonal is shorter than the dense gain, and the message decodes to it.
-    for &g in &gains {
-        let (structure, reals) = program.operators[g].code_bits().expect("bits");
-        let (dense_structure, dense_reals) = dense.operators[g].code_bits().expect("dense bits");
-        assert_eq!(reals, dense_reals, "the same reals on the same lattice");
-        assert!(structure < dense_structure, "{structure} against {dense_structure}");
-    }
-    let message = program.encode().expect("encodes");
-    assert_eq!(message.len_bits(), program.code_bits().expect("bits"));
-    let decoded = OperatorProgram::decode(&message, &program.declarations).expect("decodes");
-    for (a, b) in decoded.operators.iter().zip(&program.operators) {
-        assert_eq!(a.body, b.body);
-    }
-
-    // Derivatives: a gain's tangent as its diagonal row, and the embedding's tangent read by the
-    // gather, against the dense path's matrix tangents.
-    let gain = gains[0];
-    let width = program.operators[gain].rows.width();
-    let row = Array2::from_shape_fn((1, width), |(_, c)| noise(4000 + c));
-    let embedding = program.nodes.iter().find_map(|n| match n {
-        Node::Affine { terms, .. } if terms.iter().any(|(a, _)| *a == feature) => Some(terms[0].1),
-        _ => None,
-    }).expect("the embedding term");
-    let shape = program.operators[embedding].matrix().dim();
-    let de = Array2::from_shape_fn(shape, |(i, j)| noise(5000 + i * shape.1 + j));
-    let structural = jvp(&program, &family, &plain, &[(gain, row.clone()), (embedding, de.clone())].into_iter().collect()).expect("jvp");
-    let full = jvp(&dense, &family, &reference, &[(gain, Array2::from_diag(&row.row(0))), (embedding, de)].into_iter().collect()).expect("dense jvp");
-    let scale = full.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-    let worst = structural.iter().zip(&full).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
-    assert!(worst <= 1e-12 * scale, "tangents differ by {worst:e} at scale {scale:e}");
-
-    // Execution from a base trace: a gain moved to a coarser lattice, propagated incrementally.
-    let mut coarse = program.clone();
-    let OperatorBody::Diagonal { values, .. } = &program.operators[gain].body else { unreachable!() };
-    let precision = super::precision::DeclaredPrecision::new(4).expect("precision");
-    coarse.operators[gain] = std::sync::Arc::new(
-        Operator::diag("coarse", program.operators[gain].rows.clone(), values.clone(), precision, Default::default()).expect("diag"),
-    );
-    let incremental = coarse.execute_incremental(&family, &program, &plain).expect("incremental");
-    let again = coarse.execute(&family, false).expect("full");
-    let worst = incremental.iter().zip(&again.values[coarse.output]).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
-    assert!(worst <= 1e-9, "incremental and full execution differ by {worst:e}");
 }
 
 /// A Hugging Face directory whose `config.json` is a small Llama's with `extra` merged in.

@@ -88,7 +88,6 @@ use super::codec::{
 };
 use rayon::prelude::*;
 use super::precision::{DecodableArtifact, DeclaredPrecision, LatticeCode};
-use super::secant::BandedMatrix;
 use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use gam_math::probability::{NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, normal_cdf_and_pdf};
@@ -209,16 +208,6 @@ impl Interface {
         self.offsets[group]..self.offsets[group + 1]
     }
 
-    /// The index of the group containing coordinate `coordinate`.
-    pub fn group_of(&self, coordinate: usize) -> usize {
-        self.offsets.partition_point(|&offset| offset <= coordinate) - 1
-    }
-
-    /// The first group with `label`, if any.
-    pub fn find(&self, label: Label) -> Option<usize> {
-        self.groups.iter().position(|group| group.label == label)
-    }
-
     /// Maximal runs of groups with one width and kind and consecutive label indices.
     fn runs(&self) -> Vec<(usize, usize, LabelKind, u32)> {
         let mut runs: Vec<(usize, usize, LabelKind, u32)> = Vec::new();
@@ -269,6 +258,12 @@ pub enum Basis {
     Indicator { domain: usize },
 }
 
+/// A matrix with a per-entry bound on `|computed − exact|`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BandedMatrix {
+    pub values: Array2<f64>,
+    pub bands: Array2<f64>,
+}
 impl Basis {
     pub fn domain(&self) -> usize {
         match self {
@@ -304,19 +299,6 @@ impl Basis {
     /// `g Φ`: the transpose of [`Basis::read`], from classes back to basis coordinates.
     pub fn read_transpose(&self, declarations: &Declarations, g: &Array2<f64>) -> Result<Array2<f64>, ProgramError> {
         self.read(declarations, g)
-    }
-
-    /// `dy Φ[:, cols]ᵀ`: [`Basis::read`] of a change confined to the coordinates `cols`.
-    pub fn read_columns(&self, declarations: &Declarations, dy: &Array2<f64>, cols: &[usize]) -> Result<Array2<f64>, ProgramError> {
-        match self {
-            Self::Indicator { domain } => {
-                let mut out = Array2::<f64>::zeros((dy.nrows(), declarations.domains[*domain].size));
-                for (k, &c) in cols.iter().enumerate() {
-                    out.column_mut(c).assign(&dy.column(k));
-                }
-                Ok(out)
-            }
-        }
     }
 
     /// The banded [`Basis::read`]: an indicator's read is exact, so the band is `y`'s own `ry`.
@@ -721,24 +703,6 @@ impl Operator {
             OperatorBody::Dense { values, .. } => values.clone(),
             OperatorBody::LowRank { left, right, .. } => left.dot(right),
             OperatorBody::Diagonal { values, .. } => Array2::from_diag(values),
-        }
-    }
-
-    /// Column `column` of the matrix this operator applies, formed without the matrix.
-    pub fn column(&self, column: usize) -> Array1<f64> {
-        match &self.body {
-            OperatorBody::Identity => {
-                let mut out = Array1::zeros(self.rows.width());
-                out[column] = 1.0;
-                out
-            }
-            OperatorBody::Diagonal { values, .. } => {
-                let mut out = Array1::zeros(self.rows.width());
-                out[column] = values[column];
-                out
-            }
-            OperatorBody::Dense { values, .. } => values.column(column).to_owned(),
-            OperatorBody::LowRank { left, right, .. } => left.dot(&right.column(column)),
         }
     }
 
@@ -1166,29 +1130,6 @@ pub struct Trace {
     pub balls: Option<Vec<Array1<f64>>>,
 }
 
-impl Trace {
-    /// Node `node`'s enclosure as one box: its entrywise band plus its row's ball radius in every
-    /// coordinate (`‖e‖₂ ≤ ρ` gives `|e_i| ≤ ρ`).
-    pub fn band(&self, node: usize) -> Option<Array2<f64>> {
-        let mut band = self.bands.as_ref()?[node].clone();
-        if let Some(balls) = &self.balls {
-            for (mut row, rho) in band.outer_iter_mut().zip(balls[node].iter()) {
-                if *rho > 0.0 {
-                    row.mapv_inplace(|r| (r + rho).next_up());
-                }
-            }
-        }
-        Some(band)
-    }
-
-    /// The output node's banded value (bands zero when none were requested).
-    pub fn banded(&self, node: usize) -> BandedMatrix {
-        let values = self.values[node].clone();
-        let bands = self.band(node).unwrap_or_else(|| Array2::zeros(values.dim()));
-        BandedMatrix { values, bands }
-    }
-}
-
 /// Per-row ball radii split at `from`, as [`Layered`] splits values.
 struct Balls<'a> {
     base: &'a [Array1<f64>],
@@ -1313,21 +1254,6 @@ fn rms_norm(x: &Array2<f64>, bands: Option<&Array2<f64>>, epsilon: f64) -> (Arra
     (out, radius)
 }
 
-/// A changed operator's `A_new − A_old`: a matrix, or a diagonal's change.
-enum Difference {
-    Matrix(Array2<f64>),
-    Diagonal(Array1<f64>),
-}
-
-impl Difference {
-    fn at(&self, row: usize, col: usize) -> f64 {
-        match self {
-            Self::Matrix(m) => m[[row, col]],
-            Self::Diagonal(d) => if row == col { d[row] } else { 0.0 },
-        }
-    }
-}
-
 /// The arguments of the rule body being executed (none at the top level) and the parameter values.
 struct Frame<'a> {
     args: &'a [(Array2<f64>, Option<Array2<f64>>)],
@@ -1420,38 +1346,6 @@ impl<'a> Layered<'a> {
     /// Whether `node` takes a patched value.
     fn patched(&self, node: usize) -> bool {
         self.patch.is_some_and(|patch| patch.contains_key(&node))
-    }
-}
-
-/// How a node's value differs from a base trace's.
-enum Change {
-    /// Only these columns changed; `values` holds their new values (`N × |cols|`).
-    Columns { cols: Vec<usize>, values: Array2<f64> },
-    /// The whole value changed.
-    Full(Array2<f64>),
-}
-
-impl Change {
-    fn materialize(&self, base: &Array2<f64>) -> Array2<f64> {
-        match self {
-            Self::Full(values) => values.clone(),
-            Self::Columns { cols, values } => {
-                let mut out = base.clone();
-                for (k, &c) in cols.iter().enumerate() {
-                    out.column_mut(c).assign(&values.column(k));
-                }
-                out
-            }
-        }
-    }
-
-    /// `new − base` on the changed columns, with those columns.
-    fn delta(&self, base: &Array2<f64>) -> (Vec<usize>, Array2<f64>) {
-        match self {
-            Self::Full(values) => ((0..values.ncols()).collect(), values - base),
-            Self::Columns { cols, values } if cols.len() == base.ncols() => (cols.clone(), values - base),
-            Self::Columns { cols, values } => (cols.clone(), values - &base.select(Axis(1), cols)),
-        }
     }
 }
 
@@ -1643,216 +1537,6 @@ impl OperatorProgram {
         Ok(Trace { values: top, bands: None, balls: None })
     }
 
-    /// Reuse `base` nodes strictly before `from`, then recompute every suffix node with
-    /// immediate edits using the same evaluator as [`Self::execute_edited`]. The callback
-    /// sees the complete prefix, including previously edited/recomputed suffix values.
-    /// The caller must supply a base prefix produced by this exact program, parameters,
-    /// inputs and layout; shape validation cannot establish that semantic provenance.
-    /// No callback is applied before `from`. Prefix values are cloned, not recomputed.
-    pub fn execute_edited_from<F>(&self, inputs: &FamilyInputs, base: &Trace, from: usize, mut edit: F) -> Result<Trace, ProgramError>
-    where
-        F: FnMut(usize, &mut Array2<f64>, &[Array2<f64>]) -> Result<(), String>,
-    {
-        self.check_inputs(inputs)?;
-        if from > self.nodes.len() || base.values.len() < from {
-            return Err(ProgramError::Input("suffix boundary exceeds program/base prefix".into()));
-        }
-        let interfaces = self.interfaces()?;
-        for index in 0..from {
-            let width = if gathered(&self.nodes, self.output, &self.bases, index) { 0 } else { interfaces[index].width() };
-            if base.values[index].dim() != (inputs.rows, width) {
-                return Err(ProgramError::Input(format!("base prefix node {index} shape mismatch")));
-            }
-        }
-        let ones = vec![1.0; self.declarations.parameters];
-        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
-        let mut top: Vec<Array2<f64>> = Vec::with_capacity(self.nodes.len());
-        top.extend(base.values[..from].iter().cloned());
-        for (index, node) in self.nodes.iter().enumerate().skip(from) {
-            let values = Layered { base: &[], top: &top, from: 0, patch: None };
-            let mut value = self.evaluate_node(index, node, inputs, &values, None, &interfaces, &frame)?.0;
-            let shape = value.dim();
-            edit(index, &mut value, &top).map_err(ProgramError::Input)?;
-            if value.dim() != shape {
-                return Err(ProgramError::Input(format!("an edit of node {index} changed its shape {shape:?} to {:?}", value.dim())));
-            }
-            top.push(value);
-        }
-        Ok(Trace { values: top, bands: None, balls: None })
-    }
-
-    /// The unbanded output of this program, which differs from `base_program` only in operator
-    /// reals, present blocks and pointwise laws (same nodes and operators otherwise), computed from
-    /// `base`, the base program's unbanded trace, by propagating only what changed: an affine node
-    /// adds `X ΔAᵀ` over the changed blocks and `ΔX A_newᵀ` over the changed input columns, a
-    /// pointwise node recomputes the changed columns, a readout adds `ΔY Φᵀ`, and any other node
-    /// with a changed input is recomputed.
-    pub fn execute_incremental(
-        &self,
-        inputs: &FamilyInputs,
-        base_program: &OperatorProgram,
-        base: &Trace,
-    ) -> Result<Array2<f64>, ProgramError> {
-        self.check_inputs(inputs)?;
-        if base_program.nodes.len() != self.nodes.len() || base_program.operators.len() != self.operators.len() {
-            return Err(ProgramError::Input("an incremental execution needs the same nodes and operators".to_string()));
-        }
-        let interfaces = self.interfaces()?;
-        // Each changed operator's difference `A_new − A_old` (one vectorized subtraction; a
-        // diagonal's stays a diagonal), and the rows and columns it changes.
-        let mut changed_ops: BTreeMap<usize, (Difference, Vec<usize>, Vec<usize>)> = BTreeMap::new();
-        for (index, (new, old)) in self.operators.iter().zip(&base_program.operators).enumerate() {
-            // A shared operator is unchanged without a look at its reals.
-            if Arc::ptr_eq(new, old) || new.body == old.body {
-                continue;
-            }
-            if new.rows != old.rows || new.cols != old.cols {
-                return Err(ProgramError::Input(format!("operator {} changed its interfaces", new.name)));
-            }
-            if let (OperatorBody::Diagonal { values: a, .. }, OperatorBody::Diagonal { values: b, .. }) = (&new.body, &old.body) {
-                let difference = a - b;
-                let changed: Vec<usize> = difference.iter().enumerate().filter(|(_, v)| **v != 0.0).map(|(i, _)| i).collect();
-                changed_ops.insert(index, (Difference::Diagonal(difference), changed.clone(), changed));
-                continue;
-            }
-            let difference = &*new.matrix_cow() - &*old.matrix_cow();
-            let rows: Vec<usize> =
-                difference.outer_iter().enumerate().filter(|(_, row)| row.iter().any(|v| *v != 0.0)).map(|(r, _)| r).collect();
-            let cols: Vec<usize> =
-                difference.columns().into_iter().enumerate().filter(|(_, col)| col.iter().any(|v| *v != 0.0)).map(|(c, _)| c).collect();
-            changed_ops.insert(index, (Difference::Matrix(difference), rows, cols));
-        }
-        let mut changes: BTreeMap<usize, Change> = BTreeMap::new();
-        for (index, node) in self.nodes.iter().enumerate() {
-            let law_changed = node != &base_program.nodes[index];
-            let args_changed = node.arguments().iter().any(|a| changes.contains_key(a));
-            let ops_changed = self.node_operators(node).iter().any(|op| changed_ops.contains_key(op));
-            if !law_changed && !args_changed && !ops_changed {
-                continue;
-            }
-            let base_value = &base.values[index];
-            let change = match node {
-                Node::Affine { terms, bias } if !law_changed => {
-                    let mut delta = Array2::<f64>::zeros(base_value.dim());
-                    let mut touched = vec![false; base_value.ncols()];
-                    for (argument, operator) in terms {
-                        let x = &base.values[*argument];
-                        if let Some((difference, rows, cols)) = changed_ops.get(operator) {
-                            // Only the changed rows and columns of the difference take part.
-                            match (self.gathered_tokens(*argument, inputs), difference) {
-                                (Some(tokens), _) => {
-                                    for (row, &token) in tokens.iter().enumerate() {
-                                        for &t in rows {
-                                            delta[[row, t]] += difference.at(t, token as usize);
-                                        }
-                                    }
-                                }
-                                (None, Difference::Diagonal(d)) => {
-                                    for &t in rows {
-                                        delta.column_mut(t).scaled_add(d[t], &x.column(t));
-                                    }
-                                }
-                                (None, Difference::Matrix(difference)) => {
-                                    let product = if cols.len() == difference.ncols() {
-                                        fast_abt(x, &difference.select(Axis(0), rows))
-                                    } else {
-                                        fast_abt(&x.select(Axis(1), cols), &difference.select(Axis(1), cols).select(Axis(0), rows))
-                                    };
-                                    for (k, &t) in rows.iter().enumerate() {
-                                        let mut target = delta.column_mut(t);
-                                        target += &product.column(k);
-                                    }
-                                }
-                            }
-                            rows.iter().for_each(|&t| touched[t] = true);
-                        }
-                        if let Some(change) = changes.get(argument) {
-                            let (cols, dx) = change.delta(x);
-                            let op = &self.operators[*operator];
-                            if let Some(d) = op.diagonal() {
-                                // A column scale moves only the changed columns.
-                                for (k, &c) in cols.iter().enumerate() {
-                                    delta.column_mut(c).scaled_add(d[c], &dx.column(k));
-                                    touched[c] = true;
-                                }
-                                continue;
-                            }
-                            let a = op.matrix_cow();
-                            // Every column changed (the usual case past the first changed node): no copy.
-                            if cols.len() == a.ncols() {
-                                delta += &fast_abt(&dx, a.as_ref());
-                            } else {
-                                delta += &fast_abt(&dx, &a.select(Axis(1), &cols));
-                            }
-                            touched.iter_mut().for_each(|t| *t = true);
-                        }
-                    }
-                    if let Some(op) = bias
-                        && let Some((difference, rows, _)) = changed_ops.get(op)
-                    {
-                        for &t in rows {
-                            let change = difference.at(t, 0);
-                            delta.column_mut(t).mapv_inplace(|v| v + change);
-                            touched[t] = true;
-                        }
-                    }
-                    let cols: Vec<usize> = touched.iter().enumerate().filter(|(_, t)| **t).map(|(c, _)| c).collect();
-                    let values = if cols.len() == base_value.ncols() {
-                        base_value + &delta
-                    } else {
-                        &base_value.select(Axis(1), &cols) + &delta.select(Axis(1), &cols)
-                    };
-                    Change::Columns { cols, values }
-                }
-                Node::Pointwise { input, laws } if !law_changed => match changes.get(input) {
-                    Some(Change::Columns { cols, values }) => {
-                        let interface = &interfaces[*input];
-                        let mut out = values.clone();
-                        for (k, &c) in cols.iter().enumerate() {
-                            let law = laws[interface.group_of(c)];
-                            out.column_mut(k).mapv_inplace(|v| law.apply(v));
-                        }
-                        Change::Columns { cols: cols.clone(), values: out }
-                    }
-                    _ => Change::Full(self.recompute(index, inputs, base, &changes, &interfaces)?),
-                },
-                Node::Readout { input, basis } if !law_changed => {
-                    let change = changes
-                        .get(input)
-                        .ok_or_else(|| ProgramError::Input("a readout changed without its input".to_string()))?;
-                    let (cols, dy) = change.delta(&base.values[*input]);
-                    Change::Full(base_value + &self.bases[*basis].read_columns(&self.declarations, &dy, &cols)?)
-                }
-                _ => Change::Full(self.recompute(index, inputs, base, &changes, &interfaces)?),
-            };
-            changes.insert(index, change);
-        }
-        Ok(match changes.get(&self.output) {
-            Some(change) => change.materialize(&base.values[self.output]),
-            None => base.values[self.output].clone(),
-        })
-    }
-
-    /// Node `index` recomputed from its arguments' new values.
-    fn recompute(
-        &self,
-        index: usize,
-        inputs: &FamilyInputs,
-        base: &Trace,
-        changes: &BTreeMap<usize, Change>,
-        interfaces: &[Interface],
-    ) -> Result<Array2<f64>, ProgramError> {
-        let patch: BTreeMap<usize, Array2<f64>> = self.nodes[index]
-            .arguments()
-            .into_iter()
-            .filter_map(|a| changes.get(&a).map(|c| (a, c.materialize(&base.values[a]))))
-            .collect();
-        let values = Layered { base: &base.values, top: &[], from: base.values.len(), patch: Some(&patch) };
-        let ones = vec![1.0; self.declarations.parameters];
-        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
-        Ok(self.evaluate_node(index, &self.nodes[index], inputs, &values, None, interfaces, &frame)?.0)
-    }
-
     /// Causal (or full) attention over each row's sequence, with its radius: the score, softmax and
     /// read are the [`Node::Bilinear`], [`Node::Softmax`] and [`Node::Mix`] rules applied per row
     /// over its sequence's rows, after the rotation (orthogonal per plane, with libm's one ulp).
@@ -2009,36 +1693,6 @@ impl OperatorProgram {
         Ok((output, band))
     }
 
-    /// The token ids a gathered feature `node` of this program reads on `inputs` (module note,
-    /// "Execution with forward-error bands"); `None` for any other node. A gathered feature's
-    /// trace value holds no columns: its readers read these ids.
-    pub fn gathered_tokens<'a>(&self, node: usize, inputs: &'a FamilyInputs) -> Option<&'a [u32]> {
-        self.frame_tokens(&self.nodes, self.output, node, inputs)
-    }
-
-    /// Node `node`'s value in `trace` (a trace of this program on `inputs`) as a matrix: a
-    /// gathered feature's one-hot rows formed (rows × its domain), any other node's value
-    /// borrowed. For a caller that reads a node as a matrix rather than as an affine term.
-    pub fn node_value<'a>(&self, trace: &'a Trace, inputs: &FamilyInputs, node: usize) -> Result<std::borrow::Cow<'a, Array2<f64>>, ProgramError> {
-        match (self.gathered_tokens(node, inputs), &self.nodes[node]) {
-            (Some(tokens), Node::Feature { basis, .. }) => {
-                Ok(std::borrow::Cow::Owned(self.bases[*basis].evaluate(&self.declarations, tokens)?.values))
-            }
-            _ => Ok(std::borrow::Cow::Borrowed(&trace.values[node])),
-        }
-    }
-
-    fn frame_tokens<'a>(&self, nodes: &[Node], output: usize, node: usize, inputs: &'a FamilyInputs) -> Option<&'a [u32]> {
-        if !gathered(nodes, output, &self.bases, node) {
-            return None;
-        }
-        let Node::Feature { slot, .. } = &nodes[node] else { return None };
-        match inputs.slots.get(*slot) {
-            Some(SlotValues::Tokens(tokens)) => Some(tokens),
-            _ => None,
-        }
-    }
-
     /// Every operator `node` reads, through the bodies of the rules it calls.
     pub fn node_operators(&self, node: &Node) -> Vec<usize> {
         let mut out = node.operators();
@@ -2052,6 +1706,24 @@ impl OperatorProgram {
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// The token ids a gathered feature `node` of this program reads on `inputs` (module note,
+    /// "Execution with forward-error bands"); `None` for any other node. A gathered feature's
+    /// trace value holds no columns: its readers read these ids.
+    pub fn gathered_tokens<'a>(&self, node: usize, inputs: &'a FamilyInputs) -> Option<&'a [u32]> {
+        self.frame_tokens(&self.nodes, self.output, node, inputs)
+    }
+
+    fn frame_tokens<'a>(&self, nodes: &[Node], output: usize, node: usize, inputs: &'a FamilyInputs) -> Option<&'a [u32]> {
+        if !gathered(nodes, output, &self.bases, node) {
+            return None;
+        }
+        let Node::Feature { slot, .. } = &nodes[node] else { return None };
+        match inputs.slots.get(*slot) {
+            Some(SlotValues::Tokens(tokens)) => Some(tokens),
+            _ => None,
+        }
     }
 
     /// [`Self::execute`] at declared parameter values (`execute` is every parameter at `1`).
@@ -3012,32 +2684,6 @@ pub fn remap_node(node: &mut Node, nodes: &[usize], operators: &[usize], bases: 
 }
 
 // ------------------------------------------------------------------------------------------------ code
-
-/// An itemised account of a program's message length.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CodeAccount {
-    pub header_bits: u64,
-    pub basis_bits: Vec<u64>,
-    /// Per operator: (structure bits, real bits).
-    pub operator_bits: Vec<(u64, u64)>,
-    pub rule_bits: u64,
-    pub node_bits: u64,
-    pub total_bits: u64,
-}
-
-impl CodeAccount {
-    /// The operator-lattice precision payload: fraction bits and lattice indices.
-    /// Node constants remain in the wire frame; this is not the fixed-32 literal price.
-    pub fn precision_bits(&self) -> u64 {
-        self.operator_bits.iter().map(|(_, reals)| reals).sum()
-    }
-
-    /// Wire message bits other than operator-lattice precision. Node real payloads remain
-    /// here, so this wire account is not the numeric-free structure used by C32.
-    pub fn structure_bits(&self) -> u64 {
-        self.total_bits - self.precision_bits()
-    }
-}
 
 fn interface_bits(interface: &Interface) -> Result<u64, ProgramError> {
     let runs = interface.runs();
@@ -4218,17 +3864,6 @@ fn decode_operator_with(reader: &mut BitReader<'_>, index: u64, starts: Option<&
     }))
 }
 impl OperatorProgram {
-    /// The itemised length of [`Self::encode`]'s message, computed without writing it.
-    pub fn code_account(&self) -> Result<CodeAccount, ProgramError> {
-        let (header_bits, basis_bits, rule_bits, node_total) = self.frame_bits()?;
-        let operator_bits = self.operators.iter().map(|op| operator_bits(op)).collect::<Result<Vec<_>, _>>()?;
-        let total_bits = header_bits
-            + basis_bits.iter().sum::<u64>()
-            + operator_bits.iter().map(|(a, b)| a + b).sum::<u64>()
-            + rule_bits
-            + node_total;
-        Ok(CodeAccount { header_bits, basis_bits, operator_bits, rule_bits, node_bits: node_total, total_bits })
-    }
 
     /// Independent numeric literals in ordinary nodes and stored rule bodies, and
     /// their exact wire payload (real precision fields or arithmetic integer fields).
@@ -4317,11 +3952,6 @@ impl OperatorProgram {
         }
     }
 
-    /// The exact length of [`Self::encode`]'s message in bits.
-    pub fn code_bits(&self) -> Result<u64, ProgramError> {
-        Ok(self.code_account()?.total_bits)
-    }
-
     /// The program's message (module note, "The code").
     pub fn encode(&self) -> Result<BitString, ProgramError> { self.encode_using(None) }
 
@@ -4374,17 +4004,6 @@ impl OperatorProgram {
         Ok(out)
     }
 
-    /// Read a message written by [`Self::encode`], given the contract's declarations.
-    pub fn decode(message: &BitString, declarations: &Declarations) -> Result<Self, ProgramError> { Self::decode_using(message, declarations, None) }
-
-    /// Decode ordinary bytes, substituting a fixed decoded body only after a
-    /// complete exact codeword match at its actual boundary and original index.
-    pub fn decode_with_native_codec(message: &BitString, declarations: &Declarations, codec: &NativeOperatorCodec) -> Result<Self, ProgramError> {
-        Self::decode_using(message, declarations, Some(codec))
-    }
-    fn decode_using(message: &BitString, declarations: &Declarations, codec: Option<&NativeOperatorCodec>) -> Result<Self, ProgramError> {
-        Self::decode_reader(&mut message.reader(), declarations, codec)
-    }
     /// Decode one bounded borrowed program message; trailing bits remain an error.
     pub(crate) fn decode_reader(reader: &mut BitReader<'_>, declarations: &Declarations, codec: Option<&NativeOperatorCodec>) -> Result<Self, ProgramError> {
         if let Some(codec) = codec { codec.check_declarations(declarations)?; }
@@ -4471,21 +4090,6 @@ impl OperatorProgram {
     }
 }
 
-/// A program message as a decodable artifact.
-#[derive(Clone, Debug)]
-pub struct EncodedProgram {
-    pub message: BitString,
-    pub declarations: Declarations,
-}
-
-impl DecodableArtifact for EncodedProgram {
-    type Decoded = OperatorProgram;
-
-    fn decode(&self) -> Result<OperatorProgram, String> {
-        OperatorProgram::decode(&self.message, &self.declarations).map_err(|error| error.to_string())
-    }
-}
-
 /// The finest lattice on which every value of `values` is exact with an index within `2^53`,
 /// or, when no such lattice exists, the finest whose largest index stays within `2^53`.
 pub fn exact_precision(values: impl IntoIterator<Item = f64>) -> Result<DeclaredPrecision, ProgramError> {
@@ -4512,11 +4116,6 @@ pub fn exact_precision(values: impl IntoIterator<Item = f64>) -> Result<Declared
     // A subnormal's lattice is finer than any declarable one: the finest declarable holds it to
     // within half a step.
     Ok(DeclaredPrecision::new(finest.min(-(f64::MIN_EXP - 1))).map_err(ProgramError::Code)?.within_range(largest))
-}
-
-/// `values` as an owned column operator body input: `n × 1`.
-pub fn column(values: &Array1<f64>) -> Array2<f64> {
-    values.clone().insert_axis(Axis(1))
 }
 
 #[cfg(test)]

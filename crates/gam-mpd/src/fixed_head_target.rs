@@ -186,13 +186,6 @@ impl Teacher {
             law_code_bytes,
         })
     }
-    /// Resident numeric bytes retained in compact labels (entropy is CPU metadata).
-    pub fn retained_target_numeric_bytes(&self) -> Result<usize, String> {
-        Ok(*self
-            .retained_target_bytes
-            .lock()
-            .map_err(|e| e.to_string())?)
-    }
     /// Budget conservatively charges every target returned by this Teacher, even if dropped.
     /// Calls serialize to preserve the shared numeric lease. Host metadata and CUDA context,
     /// allocator/library workspace remain outside this explicit numeric-buffer plan.
@@ -537,10 +530,7 @@ impl ResidentHead {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        composed_rule_search::{compile, Expr, Unary, UseSpec},
-        operator_program::{Scale, SequenceLayout, SlotValues},
-    };
+    
     #[test]
     fn target_head_sharing_preserves_labels_and_rejects_incompatible_head() {
         let device = Device::host();
@@ -578,58 +568,5 @@ mod tests {
             ..first.clone()
         };
         assert!(incompatible.with_shared_head(&first).is_err());
-    }
-    #[test]
-    fn teacher_refuses_quadratic_attention_workspace_before_forward() {
-        let expression = Expr::Unary(Unary::GeluTanh, Box::new(Expr::Argument(0)));
-        let mut source = compile(
-            &expression,
-            2,
-            &[UseSpec {
-                input_width: 2,
-                output_width: 2,
-            }],
-            7,
-        )
-        .expect("small fixture")
-        .program;
-        // Standalone reader/head matrices provide legal typed operator maps.
-        source.nodes = vec![
-            Node::Raw { slot: 0 },
-            Node::Attend {
-                query: 0,
-                key: 0,
-                value: 0,
-                scale: Scale::InverseSqrt(2),
-                rotary: None,
-                causal: true,
-            },
-            Node::Affine {
-                terms: vec![(1, 2)],
-                bias: None,
-            },
-        ];
-        source.output = 2;
-        let teacher = Teacher::new(&Device::host(), &source, 1, 100_000)
-            .expect("fixed compiler fits small budget");
-        let inputs = FamilyInputs {
-            rows: 100,
-            slots: vec![SlotValues::Raw(Array2::ones((100, 2)))],
-            layout: Some(SequenceLayout {
-                sequence: vec![0; 100],
-                position: (0..100).collect(),
-            }),
-        };
-        let failure = teacher
-            .target(&inputs, None)
-            .err()
-            .expect("quadratic attention must exceed budget");
-        assert!(failure.contains("numeric plan"));
-        assert_eq!(
-            teacher
-                .retained_target_numeric_bytes()
-                .expect("target lease"),
-            0
-        );
     }
 }

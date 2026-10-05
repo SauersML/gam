@@ -1,7 +1,7 @@
 //! Explicit paid control transport. The commutation proof is real arithmetic only;
 //! actual decoded floating-point counterfactuals remain subject to Local/Run measurement.
-use crate::{acceptance::{Change, Edit}, artifact::Artifact, operator_program::{Node, OperatorProgram}};
-use std::collections::{BTreeMap, BTreeSet};
+use crate::{artifact::Artifact, operator_program::{Node, OperatorProgram}};
+use std::collections::BTreeSet;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UniformScaleBinding {
     pub native_source: usize,
@@ -9,11 +9,6 @@ pub struct UniformScaleBinding {
     pub write: usize,
     /// Full native source width, not the explanatory write width.
     pub width: usize,
-}
-#[derive(Clone, Debug, PartialEq)]
-pub struct MappedEdits {
-    pub edits: BTreeMap<usize, Vec<Edit>>,
-    pub unheld: usize,
 }
 /// Validate serialized shape and unambiguous lineage without a native graph.
 /// This cannot establish the native linear commutation proof; use `validate` for that.
@@ -53,31 +48,6 @@ pub fn validate(artifact:&Artifact,native:&OperatorProgram)->Result<(),String> {
         if native_interfaces[control.native_write]!=interfaces[control.write] {return Err("native control write interface mismatch".into());}
     }
     Ok(())
-}
-/// Source controls precede every direct write edit, independently of action-list order.
-/// Repeated source edits retain their order. Partial-column/additive absent-source edits
-/// remain explicitly unheld; no matrix or hidden native activation is executed here.
-pub fn map_edits(artifact:&Artifact,edits:&[Edit])->Result<MappedEdits,String> {
-    validate_shape(artifact)?;
-    let interfaces=artifact.program.interfaces().map_err(|e|e.to_string())?;
-    let mut result=MappedEdits{edits:BTreeMap::new(),unheld:0};let mut direct:BTreeMap<usize,Vec<Edit>>=BTreeMap::new();
-    for edit in edits {
-        let value=match edit.change {Change::Scale(value)|Change::Add(value)=>value};
-        if !value.is_finite() || edit.node>=artifact.native_nodes || edit.columns.is_empty() {return Err("invalid native control edit".into());}
-        if let Some(write)=artifact.place(edit.node) {
-            let width=interfaces[write].width();
-            if edit.columns.end>width {return Err("held edit exceeds native interface".into());}
-            let mut mapped=edit.clone();mapped.node=write;direct.entry(write).or_default().push(mapped);
-        } else if let Some(control)=artifact.controls.iter().find(|c|c.native_source==edit.node) {
-            if edit.columns.end>control.width {return Err("control edit exceeds native source interface".into());}
-            if matches!(edit.change,Change::Scale(_)) && edit.columns==(0..control.width) {
-                let mut mapped=edit.clone();mapped.node=control.write;mapped.columns=0..interfaces[control.write].width();
-                result.edits.entry(control.write).or_default().push(mapped);
-            } else {result.unheld+=1;}
-        } else {result.unheld+=1;}
-    }
-    for (write,mut actions) in direct {result.edits.entry(write).or_default().append(&mut actions);}
-    Ok(result)
 }
 #[cfg(test)]
 #[path="native_control_tests.rs"]

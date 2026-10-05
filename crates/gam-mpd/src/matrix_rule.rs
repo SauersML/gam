@@ -136,11 +136,6 @@ pub struct Cost {
     pub structure_bits: u64,
     pub literals: u64,
 }
-impl Cost {
-    pub fn c32(self) -> u64 {
-        self.structure_bits + 32 * self.literals
-    }
-}
 impl MatrixRule {
     pub fn types(&self) -> Result<Vec<Type>, String> {
         if self.nodes.is_empty() || self.output >= self.nodes.len() {

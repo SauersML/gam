@@ -80,7 +80,6 @@ use super::operator_program::{
     Coefficient, Declarations, FamilyInputs, Interface, Node, Operator, OperatorBody, OperatorProgram, ProgramError, Provenance, Rule, SlotValues, Trace,
     exact_precision, remap_node,
 };
-use super::precision::DecodableArtifact;
 use super::matrix_rule::{MatrixRule, Type as MatrixType, Value as MatrixValue};
 use ndarray::{Array1, Array2};
 use std::collections::BTreeMap;
@@ -284,19 +283,6 @@ fn derived_values(program: &OperatorProgram, derived: &Derived) -> Result<Array2
         }
     }
     Ok(values)
-}
-
-/// `derived` with every source before what reads it, or refused for a cycle.
-fn ordered(derived: Vec<Derived>) -> Result<Vec<Derived>, String> {
-    let mut left = derived;
-    let mut out: Vec<Derived> = Vec::with_capacity(left.len());
-    while !left.is_empty() {
-        let pending: std::collections::BTreeSet<usize> = left.iter().map(|d| d.operator).collect();
-        let ready =
-            left.iter().position(|d| d.law.sources().iter().all(|s| !pending.contains(s))).ok_or("derived operators that derive from each other")?;
-        out.push(left.remove(ready));
-    }
-    Ok(out)
 }
 
 /// `program` with every derived operator's reals computed, in order.
@@ -565,19 +551,6 @@ fn round_coefficient(coefficient: &mut Coefficient) {
 }
 
 impl Artifact {
-    /// Add a paid response law for uniform scaling of a wholly omitted native
-    /// interface through its exclusive homogeneous linear write. Validation
-    /// checks the native graph; execution needs only the serialized binding.
-    /// Partial-coordinate actions remain unsupported by this law.
-    pub fn with_uniform_scale_control(&self, model: &OperatorProgram, native_source: usize, native_write: usize) -> Result<Self, String> {
-        let write = self.place(native_write).ok_or("control boundary is not held")?;
-        let width = model.node_interface(native_source).map_err(|e|e.to_string())?.width();
-        let mut out = self.clone();
-        out.controls.push(crate::native_control::UniformScaleBinding { native_source, native_write, write, width });
-        out.controls.sort_by_key(|c| c.native_source);
-        crate::native_control::validate(&out, model)?;
-        Ok(out)
-    }
 
     /// The native model as its own explanation: every node a place, no block replaced.
     pub fn native(model: &OperatorProgram) -> Result<Self, String> {
@@ -610,46 +583,6 @@ impl Artifact {
                 Ok(Derived { operator: op_map[d.operator], law: d.law.with_sources(&sources), ..d.clone() })
             })
             .collect()
-    }
-
-    /// This artifact with operator `operator` of `P` derived (module note): `scale · law(sources)`
-    /// plus `residual` rows, replacing any derivation it had; every derived operator is then
-    /// recomputed in order. The literals are 32-bit floats.
-    pub fn derive(&self, operator: usize, law: OperatorLaw, scale: f32, residual: Vec<(usize, Vec<f32>)>) -> Result<Self, String> {
-        let count = self.program.operators.len();
-        if operator >= count || law.sources().iter().any(|s| *s >= count || *s == operator) {
-            return Err(format!("a derivation of operator {operator} from {:?} among {count}", law.sources()));
-        }
-        let mut derived: Vec<Derived> = self.derived.iter().filter(|d| d.operator != operator).cloned().collect();
-        derived.push(Derived { operator, law, scale, residual });
-        let derived = ordered(derived)?;
-        let mut out = self.clone();
-        compute_derived(&mut out.program, &derived)?;
-        out.derived = derived;
-        Ok(out)
-    }
-
-    /// Expand legacy Copy templates into complete arithmetic bodies. This is
-    /// desugaring a fixed template baseline, not automatic rule discovery.
-    /// The SVD convention and each call's scale/residual are retained. The
-    /// generic matrix product may change IEEE zero signs or accumulation order;
-    /// fidelity must be measured on the independently decoded new artifact.
-    pub fn expand_copy_templates(&self) -> Result<Self, String> {
-        use super::matrix_rule::{Node as MatrixNode, PinvConvention};
-        let mut out = self.clone();
-        for d in &self.derived {
-            if let OperatorLaw::Copy { value, gain, final_gain } = d.law {
-                let v = self.program.operators.get(value).ok_or("a Copy template has no value operator")?;
-                let width = v.cols.width();
-                let body = Arc::new(MatrixRule {
-                    inputs: vec![MatrixType::Matrix { rows: v.rows.width(), cols: width }, MatrixType::Vector { len: width }, MatrixType::Vector { len: width }],
-                    nodes: vec![MatrixNode::Param { index: 0 }, MatrixNode::Param { index: 1 }, MatrixNode::Param { index: 2 }, MatrixNode::Divide { numerator: 1, denominator: 2 }, MatrixNode::Diag { input: 3 }, MatrixNode::Pinv { input: 0, convention: PinvConvention::SvdResolutionBand }, MatrixNode::MatMul { left: 4, right: 5 }],
-                    output: 6,
-                });
-                out = out.derive(d.operator, OperatorLaw::Expression { body, sources: vec![value, gain, final_gain] }, d.scale, d.residual.clone())?;
-            }
-        }
-        Ok(out)
     }
 
     /// `P` as its message holds it: every derived operator with no reals (its interfaces kept).
@@ -704,6 +637,23 @@ impl Artifact {
         let mut literals = self.derived.iter().map(Derived::literals).sum();
         for (_, body) in self.matrix_rules()? { literals += body.cost()?.literals; }
         Ok(literals)
+    }
+
+    /// This artifact with the native block from `native_reads` to `native_write` declared replaced,
+    /// its computation in `P` being whatever `P` computes between the places of those nodes (an
+    /// operator a rule derives, a changed law): its local disagreement is then measured like any
+    /// replaced block's. A block already declared with this write is declared anew.
+    pub fn bind(&self, name: &str, native_reads: &[usize], native_write: usize) -> Result<Self, String> {
+        let place = |native: usize| self.place(native).ok_or_else(|| format!("{name}: P does not hold native node {native}"));
+        let reads = native_reads.iter().map(|n| place(*n)).collect::<Result<Vec<_>, _>>()?;
+        let write = place(native_write)?;
+        if reads.iter().any(|r| *r >= write) {
+            return Err(format!("{name}: a read is not computed before the write"));
+        }
+        let mut out = self.clone();
+        out.blocks.retain(|b| b.native_write != native_write);
+        out.blocks.push(Binding { name: name.to_string(), native_reads: native_reads.to_vec(), native_write, reads, write });
+        Ok(out)
     }
 
     /// Verify that every live change is hidden behind a measured block boundary.
@@ -1087,46 +1037,6 @@ impl Artifact {
         Ok(artifact)
     }
 
-    /// This artifact with the native block from `native_reads` to `native_write` declared replaced,
-    /// its computation in `P` being whatever `P` computes between the places of those nodes (an
-    /// operator a rule derives, a changed law): its local disagreement is then measured like any
-    /// replaced block's. A block already declared with this write is declared anew.
-    pub fn bind(&self, name: &str, native_reads: &[usize], native_write: usize) -> Result<Self, String> {
-        let place = |native: usize| self.place(native).ok_or_else(|| format!("{name}: P does not hold native node {native}"));
-        let reads = native_reads.iter().map(|n| place(*n)).collect::<Result<Vec<_>, _>>()?;
-        let write = place(native_write)?;
-        if reads.iter().any(|r| *r >= write) {
-            return Err(format!("{name}: a read is not computed before the write"));
-        }
-        let mut out = self.clone();
-        out.blocks.retain(|b| b.native_write != native_write);
-        out.blocks.push(Binding { name: name.to_string(), native_reads: native_reads.to_vec(), native_write, reads, write });
-        Ok(out)
-    }
-
-    /// This artifact with native node `native` (a place of `P`) as its output: what only the nodes
-    /// past it read leaves, with its places, blocks and exceptions.
-    pub fn truncated(&self, native: usize) -> Result<Self, String> {
-        let output = self.place(native).ok_or_else(|| format!("P does not hold native node {native}"))?;
-        let mut program = self.program.clone();
-        program.output = output;
-        let (live, op_map) = compact(&mut program, &self.derived_operators());
-        let derived = self.renumbered_derived(&op_map)?;
-        let at = |node: usize| Some(live[node]).filter(|n| *n != usize::MAX);
-        let places = self.places.iter().filter_map(|&(n, node)| at(node).map(|m| (n, m))).collect();
-        let blocks: Vec<Binding> = self
-            .blocks
-            .iter()
-            .filter_map(|b| {
-                let reads = b.reads.iter().map(|r| at(*r)).collect::<Option<Vec<_>>>()?;
-                Some(Binding { reads, write: at(b.write)?, ..b.clone() })
-            })
-            .collect();
-        let exceptions = self.exceptions.iter().filter_map(|e| at(e.node).map(|node| Exception { node, ..e.clone() })).collect();
-        let controls = self.controls.iter().filter_map(|c| at(c.write).map(|write| crate::native_control::UniformScaleBinding { write, ..c.clone() })).filter(|c| blocks.iter().any(|b| b.native_write == c.native_write && b.write == c.write)).collect();
-        Ok(Self { program, native_nodes: self.native_nodes, blocks, places, exceptions, derived, controls })
-    }
-
     /// Whether learned operator and coefficient literals are 32-bit floats.
     /// Exact architecture RMSNorm epsilon values are preserved; derived computed
     /// reals are not independently sent parameter literals.
@@ -1219,17 +1129,6 @@ impl Artifact {
     pub fn local_artifact(&self, model: &OperatorProgram) -> Result<(Self, Vec<std::ops::Range<usize>>), String> {
         let (artifact, columns, _) = self.local_artifact_with_writes(model)?;
         Ok((artifact, columns))
-    }
-
-    /// One replacement evaluated on its declared native parent states. The second
-    /// result is its direct write node in the grafted artifact, before subtraction
-    /// of the native write; internal/write exceptions execute, clamped-read ones do not.
-    pub fn local_block_artifact(&self, model: &OperatorProgram, block: usize) -> Result<(Self, usize), String> {
-        let binding = self.blocks.get(block).ok_or("local block index outside artifact")?;
-        let mut one = self.clone();
-        one.blocks = vec![binding.clone()];
-        let (artifact, _, writes) = one.local_artifact_with_writes(model)?;
-        Ok((artifact, writes[0]))
     }
 
     fn local_artifact_with_writes(&self, model: &OperatorProgram) -> Result<(Self, Vec<std::ops::Range<usize>>, Vec<usize>), String> {
@@ -1395,16 +1294,6 @@ impl Artifact {
         Ok(bits)
     }
 
-    /// The artifact's message (module note).
-    pub fn encode(&self) -> Result<BitString, String> {
-        self.encode_using(None)
-    }
-
-    /// Encode the identical standalone message using a bounded native operator cache.
-    pub fn encode_with_native_codec(&self, cache: &crate::operator_program::NativeOperatorCodec) -> Result<BitString, String> {
-        self.encode_using(Some(cache))
-    }
-
     fn encode_using(&self, cache: Option<&crate::operator_program::NativeOperatorCodec>) -> Result<BitString, String> {
         crate::native_control::validate_shape(self)?;
         let bodies = self.matrix_rules()?;
@@ -1504,16 +1393,6 @@ impl Artifact {
             }
         }
         Ok(out)
-    }
-
-    /// The artifact a message holds, given the declarations alone.
-    pub fn decode(message: &BitString, declarations: &Declarations) -> Result<Self, String> {
-        Self::decode_using(message, declarations, None)
-    }
-
-    /// Decode the same message, reusing only exact witnessed native codewords.
-    pub fn decode_with_native_codec(message: &BitString, declarations: &Declarations, cache: &crate::operator_program::NativeOperatorCodec) -> Result<Self, String> {
-        Self::decode_using(message, declarations, Some(cache))
     }
 
     fn decode_using(message: &BitString, declarations: &Declarations, cache: Option<&crate::operator_program::NativeOperatorCodec>) -> Result<Self, String> {
@@ -1713,50 +1592,6 @@ impl Artifact {
     }
 }
 
-/// An artifact's message as a decodable artifact (`precision::decode_then_evaluate`).
-#[derive(Clone, Debug)]
-pub struct EncodedArtifact {
-    pub message: BitString,
-    pub declarations: Declarations,
-}
-
-impl EncodedArtifact {
-    pub fn of(artifact: &Artifact) -> Result<Self, String> {
-        Ok(Self { message: artifact.encode()?, declarations: artifact.program.declarations.clone() })
-    }
-}
-
-/// A borrowing cache view; the stored message remains independently decodable.
-pub struct NativeCodecArtifact<'a> {
-    encoded: &'a EncodedArtifact,
-    cache: &'a crate::operator_program::NativeOperatorCodec,
-}
-
-impl EncodedArtifact {
-    pub fn of_with_native_codec(artifact: &Artifact, cache: &crate::operator_program::NativeOperatorCodec) -> Result<Self, String> {
-        Ok(Self { message: artifact.encode_with_native_codec(cache)?, declarations: artifact.program.declarations.clone() })
-    }
-
-    pub fn using_native_codec<'a>(&'a self, cache: &'a crate::operator_program::NativeOperatorCodec) -> NativeCodecArtifact<'a> {
-        NativeCodecArtifact { encoded: self, cache }
-    }
-}
-
-impl DecodableArtifact for NativeCodecArtifact<'_> {
-    type Decoded = Artifact;
-    fn decode(&self) -> Result<Artifact, String> {
-        Artifact::decode_with_native_codec(&self.encoded.message, &self.encoded.declarations, self.cache)
-    }
-}
-
-impl DecodableArtifact for EncodedArtifact {
-    type Decoded = Artifact;
-
-    fn decode(&self) -> Result<Artifact, String> {
-        Artifact::decode(&self.message, &self.declarations)
-    }
-}
-
 #[cfg(test)]
 #[path = "matrix_artifact_tests.rs"]
 mod matrix_artifact_tests;
@@ -1769,45 +1604,3 @@ mod control_artifact_tests;
 #[path = "function_graft_tests.rs"]
 mod function_graft_tests;
 
-#[cfg(test)]
-mod borrowed_program_decode_tests {
-    use super::*;
-    use crate::operator_program::{Slot, NativeOperatorCodec};
-    fn fixture() -> Artifact {
-        let interface=Interface::native(1).expect("onecolumn interface");
-        let program=OperatorProgram {
-            declarations:Declarations {parameters:0,domains:vec![],slots:vec![Slot::Raw{width:1}]},
-            bases:vec![],rules:vec![],operators:vec![Arc::new(Operator::identity("identity",interface))],
-            nodes:vec![Node::Raw{slot:0},Node::Affine{terms:vec![(0,0)],bias:None}],output:1,
-        };
-        Artifact::native(&program).expect("native artifact")
-    }
-    #[test]
-    fn borrowed_nested_program_matches_ordinary_and_cached_wire() {
-        let artifact=fixture();let message=artifact.encode().expect("artifact encoding");
-        let cache=NativeOperatorCodec::new(&artifact.program,1<<20).expect("bounded cache");
-        let a=Artifact::decode(&message,&artifact.program.declarations).expect("ordinary decoder");
-        let b=Artifact::decode_with_native_codec(&message,&artifact.program.declarations,&cache).expect("cached decoder");
-        assert_eq!(a.encode().expect("canonical ordinary"),message);
-        assert_eq!(b.encode().expect("canonical cached"),message);
-        assert_eq!(a.program.operators[0].name,b.program.operators[0].name);
-        let mut wrong=artifact.program.declarations.clone();wrong.parameters=1;
-        assert!(Artifact::decode_with_native_codec(&message,&wrong,&cache).is_err());
-    }
-    #[test]
-    fn borrowed_nested_program_rejects_wrong_lengths_without_artifact_tail_reads() {
-        let artifact=fixture();let message=artifact.encode().expect("artifact encoding");
-        let mut reader=message.reader();
-        let native=decode_prefix_integer(&mut reader).expect("native count");
-        let length=decode_prefix_integer(&mut reader).expect("program length")-1;
-        let program=reader.read_bit_string(length).expect("test extraction");
-        let tail=reader.read_bit_string(reader.remaining_bits()).expect("artifact tail");
-        for bad in [0,length-1,length+1,u64::MAX-1] {
-            let mut altered=BitString::new();
-            encode_prefix_integer(&mut altered,native).expect("native prefix");
-            encode_prefix_integer(&mut altered,bad+1).expect("malicious length code");
-            altered.append(&program);altered.append(&tail);
-            assert!(Artifact::decode(&altered,&artifact.program.declarations).is_err(),"length {bad}");
-        }
-    }
-}

@@ -5,7 +5,7 @@ use gam_linalg::{
     decompose::svd,
     faer_ndarray::{fast_ab, fast_atb},
 };
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array2, Axis};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -44,100 +44,6 @@ pub struct Fit {
     /// p by k, predicting X[n,p] * coefficients[p,k].
     pub coefficients: Array2<f64>,
     pub diagnostics: Diagnostics,
-}
-
-pub struct ReluUnitFit {
-    pub coefficients: Array1<f64>,
-    pub positive_rows: usize,
-    pub zero_rows: usize,
-    pub positive_design_full_column_rank: bool,
-    pub maximum_positive_equality_error: f64,
-    pub maximum_inactive_inequality_violation: f64,
-    pub matches_panel_within_tolerance: bool,
-    pub positive_fit: Option<Diagnostics>,
-}
-
-/// Supplied ReLU-unit control: positive targets imply X_i b = y_i; zero targets
-/// imply X_i b <= 0. Solve positive equalities around the reference and check all
-/// inactive inequalities. A full-column-rank positive design identifies the unit
-/// numerically. Otherwise this returns only one candidate: inequality failure is
-/// NOT an infeasibility proof, and no constrained optimization is attempted.
-/// Bias must be an explicit column in X if desired. Strictly positive y defines
-/// the active set; tolerance only evaluates residuals, never relabels examples.
-pub fn fit_relu_unit(
-    design: &Array2<f64>,
-    targets: &Array1<f64>,
-    reference: &Array1<f64>,
-    relative_rank_cutoff: Option<f64>,
-    absolute_tolerance: f64,
-) -> Result<ReluUnitFit, String> {
-    if design.nrows() == 0
-        || design.ncols() == 0
-        || targets.len() != design.nrows()
-        || reference.len() != design.ncols()
-        || !absolute_tolerance.is_finite()
-        || absolute_tolerance < 0.
-        || design
-            .iter()
-            .chain(targets.iter())
-            .chain(reference.iter())
-            .any(|v| !v.is_finite())
-        || targets.iter().any(|v| *v < 0.)
-        || relative_rank_cutoff.is_some_and(|r| !r.is_finite() || !(0. ..1.).contains(&r))
-    {
-        return Err(
-            "ReLU fit needs finite aligned nonnegative targets and explicit valid tolerance".into(),
-        );
-    }
-    let positive = targets
-        .iter()
-        .enumerate()
-        .filter_map(|(i, y)| (*y > 0.).then_some(i))
-        .collect::<Vec<_>>();
-    let (coefficients, positive_fit) = if positive.is_empty() {
-        (reference.clone(), None)
-    } else {
-        let fitted = fit(
-            &design.select(Axis(0), &positive),
-            &targets.select(Axis(0), &positive).insert_axis(Axis(1)),
-            &reference.clone().insert_axis(Axis(1)),
-            Settings {
-                relative_rank_cutoff,
-                ridge: 0.,
-            },
-        )?;
-        (
-            fitted.coefficients.column(0).to_owned(),
-            Some(fitted.diagnostics),
-        )
-    };
-    let predicted = fast_ab(design, &coefficients.clone().insert_axis(Axis(1)));
-    let mut equality = 0f64;
-    let mut inequality = 0f64;
-    for (i, target) in targets.iter().enumerate() {
-        let value = predicted[(i, 0)];
-        if !value.is_finite() {
-            return Err("nonfinite ReLU fitted preactivation".into());
-        }
-        if *target > 0. {
-            equality = equality.max((value - target).abs());
-        } else {
-            inequality = inequality.max(value.max(0.));
-        }
-    }
-    Ok(ReluUnitFit {
-        coefficients,
-        positive_rows: positive.len(),
-        zero_rows: targets.len() - positive.len(),
-        positive_design_full_column_rank: positive_fit
-            .as_ref()
-            .is_some_and(|fit| fit.retained_rank == design.ncols()),
-        maximum_positive_equality_error: equality,
-        maximum_inactive_inequality_violation: inequality,
-        matches_panel_within_tolerance: equality <= absolute_tolerance
-            && inequality <= absolute_tolerance,
-        positive_fit,
-    })
 }
 
 fn norm(values: &Array2<f64>) -> Result<f64, String> {
@@ -270,49 +176,6 @@ mod tests {
             a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-11),
             "{a:?} versus {b:?}"
         );
-    }
-    #[test]
-    fn relu_positive_equalities_identify_weights_and_inactive_constraints_are_checked() {
-        let fitted = fit_relu_unit(
-            &array![[1., 0.], [0., 1.], [-1., 0.], [0., -1.]],
-            &array![2., 3., 0., 0.],
-            &array![8., 9.],
-            None,
-            1e-12,
-        )
-        .expect("identified ReLU");
-        assert!(fitted.positive_design_full_column_rank && fitted.matches_panel_within_tolerance);
-        close(
-            &fitted.coefficients.insert_axis(Axis(1)),
-            &array![[2.], [3.]],
-        );
-        let inconsistent = fit_relu_unit(
-            &array![[1.], [2.]],
-            &array![2., 0.],
-            &array![0.],
-            None,
-            1e-12,
-        )
-        .expect("candidate check");
-        assert!(inconsistent.positive_design_full_column_rank);
-        assert!(!inconsistent.matches_panel_within_tolerance);
-        assert_eq!(inconsistent.maximum_inactive_inequality_violation, 4.);
-        let partial = fit_relu_unit(
-            &array![[1., 0.], [-1., 0.]],
-            &array![2., 0.],
-            &array![9., 7.],
-            None,
-            1e-12,
-        )
-        .expect("partial");
-        assert!(
-            !partial.positive_design_full_column_rank && partial.matches_panel_within_tolerance
-        );
-        assert_eq!(partial.coefficients[1], 7.);
-        let silent =
-            fit_relu_unit(&array![[-1.]], &array![0.], &array![1.], None, 1e-12).expect("silent");
-        assert!(!silent.positive_design_full_column_rank && silent.matches_panel_within_tolerance);
-        assert!(silent.positive_fit.is_none());
     }
     #[test]
     fn exact_multiple_output_recovery() {

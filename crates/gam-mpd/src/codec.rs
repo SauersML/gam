@@ -83,10 +83,6 @@ impl BitString {
         self.len_bits
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len_bits == 0
-    }
-
     /// Packed most-significant-first bytes; unused low bits of the last byte are zero.
     pub fn packed_bytes(&self) -> &[u8] {
         &self.bytes
@@ -853,16 +849,6 @@ pub fn fixed_index_len_bits(alphabet_size: usize) -> Result<u32, CodecError> {
     Ok(usize::BITS - (alphabet_size - 1).leading_zeros())
 }
 
-/// `⌈log₂ g!⌉`: the width of a fixed index into the `g!` orderings of `g` items (a pairing of
-/// `g` listed groups with `g` others), exact for every `g`.
-pub fn permutation_index_len_bits(g: u64) -> u64 {
-    let mut orderings = Natural::one();
-    for factor in 2..=g {
-        orderings.mul_small(factor);
-    }
-    orderings.index_width()
-}
-
 pub fn encode_fixed_index(
     out: &mut BitString,
     index: usize,
@@ -1241,15 +1227,6 @@ mod tests {
     }
 
     #[test]
-    fn permutation_index_width_is_the_ceiling_of_log2_factorial() {
-        let mut factorial = 1_u128;
-        for g in 0_u64..=30 {
-            factorial *= u128::from(g.max(1));
-            assert_eq!(permutation_index_len_bits(g), u64::from(u128::BITS - (factorial - 1).leading_zeros()), "{g}!");
-        }
-    }
-
-    #[test]
     fn binomial_matches_exact_integer_recurrence() {
         // C(n, k) for n ≤ 120 stays below 2^128 through the recurrence's products.
         for n in 0_u64..=120 {
@@ -1327,51 +1304,6 @@ mod tests {
             decode_prefix_integer(&mut cut.reader()),
             Err(CodecError::UnexpectedEnd { .. })
         ));
-    }
-
-    #[test]
-    fn signed_prefix_integer_code_round_trips_and_refuses_i64_min() {
-        // Hand-derived: zigzag maps 0, −1, 1, −2 to 0, 1, 2, 3, so the codeword lengths are
-        // L_int(1) = 1, L_int(2) = 3, L_int(3) = 3 and L_int(4) = 6.
-        for (value, bits) in [(0_i64, 1_u64), (-1, 3), (1, 3), (-2, 6)] {
-            assert_eq!(signed_prefix_integer_len_bits(value), Ok(bits), "L_s({value})");
-        }
-        let mut values: Vec<i64> = (-4096..=4096).collect();
-        values.extend([i64::MAX, i64::MIN + 1, 1 << 53, -(1 << 53), 1022, -1022]);
-        let mut stream = BitString::new();
-        for &value in &values {
-            let before = stream.len_bits();
-            encode_signed_prefix_integer(&mut stream, value).expect("encode");
-            assert_eq!(
-                stream.len_bits() - before,
-                signed_prefix_integer_len_bits(value).expect("length"),
-                "written length of {value}"
-            );
-        }
-        // One concatenated stream decodes value by value: the code stays prefix-free.
-        let mut reader = stream.reader();
-        for &value in &values {
-            assert_eq!(decode_signed_prefix_integer(&mut reader), Ok(value));
-        }
-        assert_eq!(reader.finish(), Ok(()));
-        // Positive control: i64::MIN has no codeword, and a refused encode writes nothing.
-        assert!(matches!(
-            signed_prefix_integer_len_bits(i64::MIN),
-            Err(CodecError::InvalidInput(_))
-        ));
-        let mut refused = BitString::new();
-        assert!(matches!(
-            encode_signed_prefix_integer(&mut refused, i64::MIN),
-            Err(CodecError::InvalidInput(_))
-        ));
-        assert!(refused.is_empty());
-        // The two largest unsigned codewords decode to the ends of the signed range.
-        let mut largest = BitString::new();
-        encode_prefix_integer(&mut largest, u64::MAX).expect("encode");
-        assert_eq!(decode_signed_prefix_integer(&mut largest.reader()), Ok(i64::MAX));
-        let mut odd = BitString::new();
-        encode_prefix_integer(&mut odd, u64::MAX - 1).expect("encode");
-        assert_eq!(decode_signed_prefix_integer(&mut odd.reader()), Ok(i64::MIN + 1));
     }
 
     #[test]

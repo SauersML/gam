@@ -372,9 +372,6 @@ pub fn extract(artifact: &Artifact, region: &Region) -> Result<Artifact, String>
     let rule = checked_rule(artifact, region)?;
     apply(artifact, region, Callee::New(rule), &region.native_reads)
 }
-pub fn reuse_rule(artifact: &Artifact, region: &Region, ruleid: usize) -> Result<Artifact, String> {
-    reuse_rule_with_binding(artifact, region, ruleid, &region.native_reads)
-}
 /// Bind an existing body to an explicit typed permutation of the complete cut boundary.
 pub fn reuse_rule_with_binding(
     artifact: &Artifact,
@@ -593,47 +590,6 @@ mod tests {
         assert_eq!(kept.exceptions.len(), 1);
     }
     #[test]
-    fn paid_control_preserved_or_explicitly_refused() {
-        let mut p = source();
-        p.nodes = vec![
-            Node::Raw { slot: 0 },
-            Node::Affine {
-                terms: vec![(0, 0)],
-                bias: None,
-            },
-            Node::Affine {
-                terms: vec![(1, 0)],
-                bias: None,
-            },
-            Node::Affine {
-                terms: vec![(2, 0)],
-                bias: None,
-            },
-        ];
-        p.output = 3;
-        let mut a = Artifact::native(&p)
-            .expect("native")
-            .bind("existing", &[0], 2)
-            .expect("binding");
-        a.places.retain(|(native, _)| *native != 1);
-        a.controls.push(crate::native_control::UniformScaleBinding {
-            native_source: 1,
-            native_write: 2,
-            write: 2,
-            width: 2,
-        });
-        crate::native_control::validate_shape(&a).expect("declared control shape");
-        let single = region(&a, 3, &[3]);
-        let kept = extract(&a, &single).expect("outside control retained");
-        assert_eq!(kept.controls.len(), 1);
-        let whole = region(&a, 3, &[1, 2, 3]);
-        assert!(
-            extract(&a, &whole)
-                .expect_err("internal control erased")
-                .contains("control")
-        );
-    }
-    #[test]
     fn initial_cuts_visit_all_writes_before_expansion() {
         let a = Artifact::native(&source()).expect("native");
         let inventory = propose_regions(
@@ -745,31 +701,5 @@ mod tests {
                 .expect("extracted")
                 .values[extracted.program.output]
         );
-    }
-    #[test]
-    fn typed_reuse_and_internal_activation_loss() {
-        let p = source();
-        let a = Artifact::native(&p).expect("native");
-        let r = region(&a, 2, &[1, 2]);
-        let extracted = extract(&a, &r).expect("extract");
-        assert!(extracted.place(1).is_some());
-        let mut candidate = a.clone();
-        candidate.program.rules.push(Rule {
-            name: "square".into(),
-            inputs: vec![Interface::native(2).expect("interface")],
-            nodes: vec![
-                Node::Param { index: 0 },
-                Node::Hadamard { left: 0, right: 0 },
-            ],
-            output: 1,
-        });
-        let single = region(&candidate, 2, &[2]);
-        let reused = reuse_rule(&candidate, &single, 0).expect("typed reuse");
-        let x = input();
-        assert_eq!(
-            p.execute(&x, false).expect("native").values[p.output],
-            reused.program.execute(&x, false).expect("reuse").values[reused.program.output]
-        );
-        assert!(reuse_rule(&candidate, &single, 10).is_err());
     }
 }

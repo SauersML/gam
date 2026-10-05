@@ -66,46 +66,6 @@ pub fn match_prediction(reading: &Array2<f64>, gain: &Array1<f64>, directions: O
     Ok(scale_columns(&projector.dot(reading), &gain.mapv(|g| 1.0 / g)))
 }
 
-/// `T = diag(g) Q[R]ᵀ Z` for a head's query rows: the head's content scores between a query's
-/// current token and a key's previous token, through the match rule's reading.
-fn match_form(query: &Array2<f64>, reading: &Array2<f64>, gain: &Array1<f64>, rows: &[usize]) -> Array2<f64> {
-    scale_columns(&query.select(Axis(0), rows), gain).t().dot(reading)
-}
-
-/// How much a head's content scores are the match rule's: `tr T / (‖T‖_F √r)`, `r` the numerical
-/// rank of `T`; one for `T` a positive multiple of a rank-`r` orthogonal projector, about zero for a
-/// form unrelated to the identity.
-pub fn match_alignment(query: &Array2<f64>, reading: &Array2<f64>, gain: &Array1<f64>, rows: &[usize]) -> Result<f64, String> {
-    let t = match_form(query, reading, gain, rows);
-    let d = svd(t.view(), false).map_err(|e| format!("{e:?}"))?;
-    let rank = d.singular_values.iter().filter(|s| **s > d.band).count().max(1);
-    let norm = d.singular_values.iter().map(|s| s * s).sum::<f64>().sqrt();
-    Ok(if norm > 0.0 { t.diag().sum() / (norm * (rank as f64).sqrt()) } else { 0.0 })
-}
-
-/// The energy of a head's content scores the match rule explains: `tr(T Π)² / rank Π`, the squared
-/// norm of `T`'s least-squares fit `λ Π` over `Z`'s full projector. Unlike [`match_alignment`] (a
-/// cosine, largest on the one cleanest plane), it grows with every plane the rule holds on, so the
-/// content planes that maximize it are all the planes that match.
-pub fn match_energy(query: &Array2<f64>, reading: &Array2<f64>, gain: &Array1<f64>, rows: &[usize]) -> Result<f64, String> {
-    let prediction = match_prediction(reading, gain, None)?;
-    let projector = match_form(&prediction, reading, gain, &(0..prediction.nrows()).collect::<Vec<_>>());
-    let rank = projector.diag().sum();
-    let fit = (&match_form(query, reading, gain, rows) * &projector.t()).sum();
-    Ok(if rank > 0.0 { fit * fit / rank } else { 0.0 })
-}
-
-/// The match rule's scale for a head: the least-squares `λ` in `T ≈ λ Π` over the projector the
-/// prediction realizes, `tr(T Π) / rank Π`, which is `Σ (Q[R] diag(g)) ∘ Z / rank Z` for the full
-/// projector.
-pub fn match_scale(query: &Array2<f64>, reading: &Array2<f64>, gain: &Array1<f64>, rows: &[usize], prediction: &Array2<f64>) -> f64 {
-    // tr(T Π) = tr(diag(g) Q[R]ᵀ Z Π) with Π = diag(g) P̃ᵀ Z for the prediction P̃ (unscaled).
-    let t = match_form(query, reading, gain, rows);
-    let projector = match_form(prediction, reading, gain, &(0..prediction.nrows()).collect::<Vec<_>>());
-    let rank = projector.diag().sum();
-    if rank > 0.0 { (&t * &projector.t()).sum() / rank } else { 0.0 }
-}
-
 /// The copy rule's output head (`d × width`, unscaled): `diag(g / g_f) V⁺`, `V` the head's value
 /// operator (`width × d`), `g` its layer's norm gain and `g_f` the final norm's.
 pub fn copy_prediction(value: &Array2<f64>, gain: &Array1<f64>, final_gain: &Array1<f64>) -> Result<Array2<f64>, String> {
@@ -114,19 +74,5 @@ pub fn copy_prediction(value: &Array2<f64>, gain: &Array1<f64>, final_gain: &Arr
         row *= gain[i] / final_gain[i];
     }
     Ok(p)
-}
-
-/// The cosine between a head's output-value circuit `O V` and the copy rule's `P V`.
-pub fn copy_alignment(output: &Array2<f64>, value: &Array2<f64>, prediction: &Array2<f64>) -> f64 {
-    let (a, b) = (output.dot(value), prediction.dot(value));
-    let norm = ((&a * &a).sum() * (&b * &b).sum()).sqrt();
-    if norm > 0.0 { (&a * &b).sum() / norm } else { 0.0 }
-}
-
-/// The copy rule's scale for a head: the least-squares `λ` in `O V ≈ λ P V`.
-pub fn copy_scale(output: &Array2<f64>, value: &Array2<f64>, prediction: &Array2<f64>) -> f64 {
-    let (a, b) = (output.dot(value), prediction.dot(value));
-    let own = (&b * &b).sum();
-    if own > 0.0 { (&a * &b).sum() / own } else { 0.0 }
 }
 

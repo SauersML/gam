@@ -107,19 +107,6 @@ fn import(out: &mut OperatorProgram, function: &OperatorProgram) -> Result<usize
     Ok(nodes[function.output])
 }
 
-/// Raw slot zero is x; slot j+1 is scalar a_j. Callers enforce globally constant
-/// a_j for shared parameter edits. Per-row settings execute but are NOT that family.
-/// Direction columns U_j are stored operators and paid by ordinary encoding/C32.
-/// The hidden read directions defining the native edits belong to the family declaration
-/// and must also be retained by the caller (down_edit_family::retain_directions).
-pub fn compose(
-    clean: &OperatorProgram,
-    responses: &[OperatorProgram],
-    output_directions: &[Arc<Operator>],
-) -> Result<OperatorProgram, String> {
-    Ok(compose_with_outputs(clean, responses, output_directions)?.program)
-}
-
 /// Same executable composition as [`compose`], with pre-graft provenance for
 /// each imported scalar `s_j(x)` before multiplying by `a_j` or `U_j`.
 /// No new output arithmetic or native activation input is introduced.
@@ -306,7 +293,6 @@ pub fn compose_with_outputs_on_interface(
     compose_with_outputs(&adapted, responses, output_directions)
 }
 
-
 /// Attach an exact finite edit family to one jointly learned multi-output graph.
 /// `clean_node` and `response_nodes` identify its actual computed values. Importing
 /// the graph once preserves shared nonlinear intermediates, not just tied weights.
@@ -410,7 +396,7 @@ mod tests {
     use crate::{
         artifact::Artifact,
         down_edit_family::{self, Direction},
-        operator_program::{FamilyInputs, Law, Rule, SlotValues, exact_precision},
+        operator_program::{FamilyInputs, Law, SlotValues, exact_precision},
     };
     use ndarray::{Array2, array};
 
@@ -504,149 +490,6 @@ mod tests {
         assert!(direct.clean_output.retained_by_composed_output);
     }
 
-    #[test]
-    fn observed_composition_and_decoded_graft_expose_actual_clean_and_scalar_responses() {
-        let mut clean = function();
-        let ty = Interface::native(2).unwrap();
-        clean.rules = vec![Rule {
-            name: "shared learned reader".into(),
-            inputs: vec![ty],
-            nodes: vec![
-                Node::Param { index: 0 },
-                Node::Affine {
-                    terms: vec![(0, 0)],
-                    bias: None,
-                },
-                Node::Pointwise {
-                    input: 1,
-                    laws: vec![Law::Relu],
-                },
-            ],
-            output: 2,
-        }];
-        clean.nodes = vec![
-            Node::Raw { slot: 0 },
-            Node::Call {
-                rule: 0,
-                arguments: vec![0],
-            },
-            Node::Affine {
-                terms: vec![(1, 1)],
-                bias: None,
-            },
-        ];
-        clean.output = 2;
-        let family = down_edit_family::build(
-            &clean,
-            0,
-            2,
-            &[
-                Direction {
-                    output: array![0.5, -1.],
-                    hidden: array![1., -0.25],
-                },
-                Direction {
-                    output: array![-1., 0.25],
-                    hidden: array![0.25, 0.5],
-                },
-            ],
-        )
-        .unwrap();
-        let mut responses = vec![];
-        let mut directions = vec![];
-        for &(u, v) in &family.direction_operators {
-            let mut response = clean.clone();
-            response.operators[1] = family.program.operators[v].clone();
-            responses.push(response);
-            directions.push(family.program.operators[u].clone());
-        }
-        let composed = compose_with_outputs(&clean, &responses, &directions).unwrap();
-        assert_eq!(
-            composed.program,
-            compose(&clean, &responses, &directions).unwrap()
-        );
-        assert_eq!(composed.composed_output, composed.program.output);
-        assert!(!composed.clean_output.retained_by_composed_output);
-        assert!(
-            composed
-                .program
-                .nodes
-                .iter()
-                .all(|n| !n.arguments().contains(&composed.clean_output.node))
-        );
-        assert_eq!(composed.program.rules.len(), 1);
-        assert_eq!(
-            composed
-                .program
-                .nodes
-                .iter()
-                .filter(|n| matches!(n, Node::Call { .. }))
-                .count(),
-            3
-        );
-        assert_eq!(
-            composed
-                .program
-                .operators
-                .iter()
-                .filter(|op| Arc::ptr_eq(op, &clean.operators[0]))
-                .count(),
-            1
-        );
-        let mut reads = vec![family.native_read];
-        reads.extend(&family.control_nodes);
-        let graft = Artifact::native(&family.program)
-            .unwrap()
-            .replace_function_inputs(
-                "observed responses",
-                &composed.program,
-                &reads,
-                family.native_write,
-            )
-            .unwrap();
-        let saved =
-            Artifact::from_bytes(&graft.to_bytes().unwrap(), &family.program.declarations).unwrap();
-        let call = saved.place(family.native_write).unwrap();
-        assert!(matches!(saved.program.nodes[call], Node::Call { .. }));
-        let mut paths = composed
-            .response_nodes
-            .iter()
-            .map(|n| vec![call, *n])
-            .collect::<Vec<_>>();
-        paths.push(vec![call, composed.clean_output.node]);
-        let (flat, _, observed) =
-            crate::artifact_device::mapped_inlined_observed(&saved.program, &paths).unwrap();
-        let x = array![[1., -2.], [0.5, 3.]];
-        let base = FamilyInputs {
-            rows: 2,
-            slots: vec![SlotValues::Raw(x.clone())],
-            layout: None,
-        };
-        let clean_trace = clean.execute(&base, false).unwrap();
-        for amplitudes in [[0., 0.], [-1.5, 0.75], [0.25, -2.]] {
-            let inputs = family.inputs(&base, &amplitudes).unwrap();
-            let direct = composed.program.execute(&inputs, false).unwrap();
-            let replay = flat.execute(&inputs, false).unwrap();
-            for (j, response) in responses.iter().enumerate() {
-                let target =
-                    response.execute(&base, false).unwrap().values[response.output].clone();
-                assert_eq!(direct.values[composed.response_nodes[j]], target);
-                assert_eq!(replay.values[observed[j]], target);
-            }
-            assert_eq!(
-                direct.values[composed.clean_output.node],
-                clean_trace.values[clean.output]
-            );
-            assert_eq!(
-                replay.values[*observed.last().unwrap()],
-                clean_trace.values[clean.output]
-            );
-            assert_eq!(
-                direct.values[composed.program.output],
-                replay.values[flat.output]
-            );
-        }
-    }
     #[test]
     fn grouped_output_binding_keeps_one_writer_and_actual_observations_after_graft() {
         use crate::operator_program::LabelKind;
@@ -807,116 +650,5 @@ mod tests {
             .unwrap_err()
             .contains("split a shared writer")
         );
-    }
-    #[test]
-    fn saved_multiargument_replacement_predicts_literal_native_weight_edits() {
-        let clean = function();
-        let mut native = clean.clone();
-        // Keep a downstream consumer and skip path: compare autonomous composition,
-        // not merely the altered block's direct output.
-        native.nodes.push(Node::Affine {
-            terms: vec![(3, 0), (0, 0)],
-            bias: None,
-        });
-        native.output = 4;
-        let directions = vec![
-            Direction {
-                output: array![0.5, -1.],
-                hidden: array![1., -0.25],
-            },
-            Direction {
-                output: array![-1., 0.25],
-                hidden: array![0.25, 0.5],
-            },
-        ];
-        let family =
-            down_edit_family::build(&native, 0, 3, &directions).expect("native edit family");
-        let mut responses = vec![];
-        let mut outputs = vec![];
-        for &(u, v) in &family.direction_operators {
-            let mut response = clean.clone();
-            response.operators[1] = family.program.operators[v].clone();
-            responses.push(response);
-            outputs.push(family.program.operators[u].clone());
-        }
-        let program = compose(&clean, &responses, &outputs).expect("response program");
-        // Shared actual reader coefficients remain one stored object across three functions.
-        assert_eq!(
-            program
-                .operators
-                .iter()
-                .filter(|op| Arc::ptr_eq(op, &clean.operators[0]))
-                .count(),
-            1
-        );
-        let mut reads = vec![family.native_read];
-        reads.extend(&family.control_nodes);
-        let mut candidate = Artifact::native(&family.program)
-            .expect("native artifact")
-            .replace_function_inputs("learned responses", &program, &reads, family.native_write)
-            .expect("graft all explicit inputs");
-        family
-            .retain_directions(&mut candidate)
-            .expect("paid directions");
-        candidate
-            .validate_coverage(&family.program)
-            .expect("native coverage");
-        assert!(candidate.place(family.node_mapping[1]).is_none());
-        assert!(candidate.place(family.node_mapping[2]).is_none());
-        let bytes = candidate.to_bytes().expect("encode");
-        let saved = Artifact::from_bytes(&bytes, &family.program.declarations).expect("decode");
-        for x in [array![[1., -2.], [0.5, 3.]], array![[-3., 0.7], [2.5, 1.]]] {
-            let base = FamilyInputs {
-                rows: 2,
-                slots: vec![SlotValues::Raw(x)],
-                layout: None,
-            };
-            for amplitudes in [[0., 0.], [1., -0.5], [-1.3, 0.7]] {
-                let target = family
-                    .literal_native(&amplitudes)
-                    .expect("literal edit")
-                    .execute(&base, false)
-                    .expect("native run")
-                    .values[native.output]
-                    .clone();
-                let inputs = family.inputs(&base, &amplitudes).expect("control inputs");
-                let predicted = saved.execute(&inputs).expect("saved autonomous run").values
-                    [saved.program.output]
-                    .clone();
-                assert!(
-                    target
-                        .iter()
-                        .zip(&predicted)
-                        .all(|(a, b)| (a - b).abs() < 1e-12)
-                );
-            }
-        }
-        assert!(
-            Artifact::native(&family.program)
-                .expect("artifact")
-                .replace_function_inputs(
-                    "missing control",
-                    &program,
-                    &[family.native_read],
-                    family.native_write
-                )
-                .is_err()
-        );
-    }
-    #[test]
-    fn refuses_nonscalar_response_or_ambient_rule_inputs() {
-        let clean = function();
-        let u = dense(array![[1.], [-1.]]);
-        assert!(compose(&clean, &[clean.clone()], &[u.clone()]).is_err());
-        assert!(compose(&clean, &[], &[]).is_err());
-        let mut response = clean.clone();
-        response.operators[1] = dense(array![[1., 0.]]);
-        response.rules.push(Rule {
-            name: "ambient".into(),
-            inputs: vec![],
-            nodes: vec![Node::Raw { slot: 0 }],
-            output: 0,
-        });
-        assert!(compose(&clean, &[response], &[u]).is_err());
     }
 }

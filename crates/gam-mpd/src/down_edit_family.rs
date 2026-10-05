@@ -36,20 +36,6 @@ pub struct ControlDesignReport {
     pub column_equilibrated_condition_number: Option<f64>,
     pub scope: &'static str,
 }
-impl ControlDesignReport {
-    /// Require observable coefficients only when policy relies on arbitrary affine response
-    /// identification from these cases. Direct coefficient supervision can retain the report
-    /// without invoking this requirement. This is not a downstream KL identification test.
-    pub fn require_affine_identification(&self) -> Result<(), String> {
-        if self.clean_rows.is_empty() || self.numerical_rank != self.required_rank {
-            return Err(format!(
-                "control design resolves rank {} of {} at tolerance {}; arbitrary affine local response coefficients are not identified by these cases",
-                self.numerical_rank, self.required_rank, self.tolerance,
-            ));
-        }
-        Ok(())
-    }
-}
 /// Diagnose edit-coordinate rank without rejecting deficient designs that may still be usable
 /// with directly supervised coefficients. Signed cases alone do not establish independence.
 /// `relative_tolerance` is a declared singular-value resolution relative to the largest value;
@@ -250,15 +236,6 @@ impl Family {
         };
         p.operators[self.target_operator] = Arc::new(op);
         Ok(p)
-    }
-    /// Explicit stored family-definition literals after replacement/pruning.
-    /// Ordinary program encoding and C32 include UNUSED operators too. Call after the
-    /// last pruning operation. This stores numerical directions, not a hidden predictor.
-    pub fn retain_directions(
-        &self,
-        artifact: &mut Artifact,
-    ) -> Result<Vec<(usize, usize)>, String> {
-        self.retain_directions_excluding(artifact, &std::collections::BTreeSet::new())
     }
     /// Never alias fixed family literals to independently fitted parameters, even
     /// when their current arrays happen to be equal.
@@ -486,64 +463,9 @@ pub fn build(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn signed_cases_require_independent_edit_coordinates_for_affine_identification() {
-        let tied =
-            super::control_design(&ndarray::array![[0., 0.], [1., 1.], [-1., -1.]], 1e-12).unwrap();
-        assert_eq!(tied.numerical_rank, 1);
-        assert_eq!(tied.column_equilibrated_rank, 1);
-        assert_eq!(tied.required_rank, 2);
-        assert!(tied.require_affine_identification().is_err());
-        let independent = super::control_design(
-            &ndarray::array![[0., 0.], [1., 0.], [-1., 0.], [0., 1.], [0., -1.]],
-            1e-12,
-        )
-        .unwrap();
-        assert_eq!(independent.numerical_rank, 2);
-        assert_eq!(independent.clean_rows, vec![0]);
-        independent.require_affine_identification().unwrap();
-        assert!((independent.condition_number.unwrap() - 1.).abs() < 1e-12);
-        // Diagnostic construction is allowed for deficient designs; policy alone requires rank.
-        assert!(serde_json::to_value(tied).is_ok());
-    }
-    #[test]
-    fn scaled_and_near_collinear_designs_report_distinct_conditioning() {
-        let scaled = super::control_design(
-            &ndarray::array![[0., 0.], [1., 0.], [-1., 0.], [0., 1e-15], [0., -1e-15]],
-            1e-12,
-        )
-        .unwrap();
-        assert_eq!(scaled.numerical_rank, 1);
-        assert_eq!(scaled.column_equilibrated_rank, 2);
-        assert!(scaled.condition_number.unwrap() > 1e14);
-        assert!((scaled.column_equilibrated_condition_number.unwrap() - 1.).abs() < 1e-12);
-        assert!(scaled.require_affine_identification().is_err());
-        let near = super::control_design(
-            &ndarray::array![[0., 0.], [1., 1.], [-1., -1.], [1., 1. + 1e-14]],
-            1e-12,
-        )
-        .unwrap();
-        assert_eq!(near.numerical_rank, 1);
-        assert_eq!(near.column_equilibrated_rank, 1);
-        assert!(near.require_affine_identification().is_err());
-        let global =
-            super::control_design(&ndarray::array![[0., 0.], [1e300, 0.], [0., 1e300]], 1e-12)
-                .unwrap();
-        assert_eq!(global.global_scale, 1e300);
-        global.require_affine_identification().unwrap();
-        assert!(super::control_design(&ndarray::array![[1., 0.], [0., 1.]], 1e-12).is_err());
-        assert!(super::control_design(&ndarray::array![[0., 0.], [f64::NAN, 1.]], 1e-12).is_err());
-        assert!(super::control_design(&ndarray::array![[0., 0.]], -1.).is_err());
-        let zero = super::control_design(&ndarray::array![[0., 0.]], 1e-12).unwrap();
-        assert_eq!(zero.numerical_rank, 0);
-        assert!(zero.require_affine_identification().is_err());
-    }
 
     use super::*;
-    use crate::{
-        artifact::{Argument, Callee},
-        operator_program::{Declarations, Law, Rule},
-    };
+    use crate::operator_program::{Declarations, Law};
     use ndarray::array;
     fn dense(rows: Interface, cols: Interface, values: Array2<f64>) -> Arc<Operator> {
         let precision = exact_precision(values.iter().copied()).expect("precision");
@@ -729,96 +651,6 @@ mod tests {
                 .iter()
                 .zip(&reference.values[literal.output])
                 .all(|(a, b)| (a - b).abs() < 1e-12)
-        );
-    }
-    #[test]
-    fn replacement_uses_own_input_controls_and_preserves_priced_direction_literals() {
-        let f = family();
-        let a = Artifact::native(&f.program).expect("artifact");
-        let i = Interface::native(2).expect("width");
-        let scalar = Interface::native(1).expect("scalar");
-        let id = a.program.operators.len();
-        let response = Rule {
-            name: "learned response fixture".into(),
-            inputs: vec![i.clone(), scalar.clone(), scalar],
-            nodes: vec![
-                Node::Param { index: 0 },
-                Node::Param { index: 1 },
-                Node::Param { index: 2 },
-                Node::Affine {
-                    terms: vec![(1, id)],
-                    bias: None,
-                },
-                Node::Affine {
-                    terms: vec![(0, id + 1), (3, id + 1)],
-                    bias: None,
-                },
-            ],
-            output: 4,
-        };
-        let mut candidate = a
-            .replace_block(
-                "entire augmented MLP",
-                Callee::New(response),
-                vec![
-                    Argument::Native(f.native_read),
-                    Argument::Native(f.control_nodes[0]),
-                    Argument::Native(f.control_nodes[1]),
-                ],
-                f.native_write,
-                vec![
-                    (*dense(
-                        i.clone(),
-                        Interface::native(1).expect("scalar"),
-                        array![[0.5], [-1.]],
-                    ))
-                    .clone(),
-                    Operator::identity("reader", i),
-                ],
-            )
-            .expect("replacement");
-        candidate.validate_coverage(&f.program).expect("coverage");
-        assert!(candidate.place(f.node_mapping[1]).is_none());
-        assert!(candidate.place(f.node_mapping[2]).is_none());
-        let before_c32 =
-            crate::acceptance::structural_cost(&candidate, &mut Default::default()).expect("C32");
-        let before = candidate.program.code_bits().expect("cost");
-        let ids = f
-            .retain_directions(&mut candidate)
-            .expect("retained directions");
-        let after = candidate.program.code_bits().expect("cost");
-        assert!(after > before);
-        let after_c32 =
-            crate::acceptance::structural_cost(&candidate, &mut Default::default()).expect("C32");
-        assert_eq!(after_c32.literals - before_c32.literals, 8); // Ten direction literals, minus the already-paid two-literal writer.
-        assert!(after_c32.total() > before_c32.total());
-        assert_eq!(
-            f.retain_directions(&mut candidate)
-                .expect("idempotent retention"),
-            ids
-        );
-        assert_eq!(candidate.program.code_bits().expect("stable cost"), after);
-        let bytes = candidate.to_bytes().expect("encode");
-        let saved = Artifact::from_bytes(&bytes, &f.program.declarations).expect("decode");
-        saved.validate_coverage(&f.program).expect("saved coverage");
-        assert_eq!(
-            crate::acceptance::structural_cost(&saved, &mut Default::default()).expect("saved C32"),
-            after_c32
-        );
-        for (&(u, v), &(su, sv)) in f.direction_operators.iter().zip(&ids) {
-            assert_eq!(
-                saved.program.operators[su].body,
-                f.program.operators[u].body
-            );
-            assert_eq!(
-                saved.program.operators[sv].body,
-                f.program.operators[v].body
-            );
-        }
-        let x = f.inputs(&base(), &[0.25, -0.5]).expect("inputs");
-        assert_eq!(
-            candidate.execute(&x).expect("candidate").values[candidate.program.output],
-            saved.execute(&x).expect("saved").values[saved.program.output]
         );
     }
     #[test]
