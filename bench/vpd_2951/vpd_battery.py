@@ -29,11 +29,11 @@ usage: vpd_battery.py OUT.json FIRST:END [PAPER_ROWS PGD_STEPS]
 
 import itertools
 import json
-import math
 import sys
 import time
 
 import numpy as np
+import scipy.linalg
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -75,8 +75,11 @@ class Runner:
     def layer_sites(self, i: int) -> list[str]:
         return [n for n in self.vpd.names if n.startswith(f"h.{i}.")]
 
-    def layer(self, x: Tensor, i: int, masks: dict | None, deltas: dict | None) -> Tensor:
-        """Layer i on the stream x entering it, with the masks on its sites (M's weights when none)."""
+    def layer(self, x: Tensor, i: int, masks: dict | None, deltas: dict | None, patch: dict | None = None,
+              capture: dict | None = None) -> Tensor:
+        """Layer i on the stream x entering it, with the masks on its sites (M's weights when none).
+        Block 2i is the layer's attention and 2i + 1 its MLP; a block's read is the normed stream its
+        projections read. `capture` receives the reads, and `patch[block]` replaces a block's read."""
         t = self.t
         B, T, _ = x.shape
         if masks is not None:
@@ -86,17 +89,31 @@ class Runner:
                 st.delta_mask = None if deltas is None else deltas[n]
         try:
             s = lambda k: t.site(f"h.{i}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}")
-            h = rms(x, t.norms[2 * i], t.eps)
+            h = self.read(rms(x, t.norms[2 * i], t.eps), 2 * i, patch, capture)
             q = s("q_proj")(h).view(B, T, t.n_head, t.hd).transpose(1, 2)
             k = s("k_proj")(h).view(B, T, t.n_head, t.hd).transpose(1, 2)
             v = s("v_proj")(h).view(B, T, t.n_head, t.hd).transpose(1, 2)
             q, k = t._rope(q, T), t._rope(k, T)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             x = x + s("o_proj")(y.transpose(1, 2).reshape(B, T, -1))
-            h = rms(x, t.norms[2 * i + 1], t.eps)
+            h = self.read(rms(x, t.norms[2 * i + 1], t.eps), 2 * i + 1, patch, capture)
             return x + s("down_proj")(gelu_tanh(s("c_fc")(h)))
         finally:
             self.vpd.clear()
+
+    @staticmethod
+    def read(h: Tensor, block: int, patch: dict | None, capture: dict | None) -> Tensor:
+        if capture is not None:
+            capture[block] = h
+        return patch[block](h) if patch is not None and block in patch else h
+
+    def run(self, ids: Tensor, masks: dict | None, deltas: dict | None, start: int = 0, entry: Tensor | None = None,
+            patch: dict | None = None, capture: dict | None = None) -> Tensor:
+        """The final residual, every layer from `start` on (entering at `entry`) taking the masks."""
+        x = self.t.wte[ids] if entry is None else entry
+        for i in range(start, self.t.n_layer):
+            x = self.layer(x, i, masks, deltas, patch, capture)
+        return x
 
     def logits(self, x: Tensor) -> Tensor:
         return rms(x, self.t.ln_f, self.t.eps) @ self.t.wte.T
@@ -185,6 +202,115 @@ def behaviour_and_protocols(runner: Runner, ids: Tensor, protocols: bool, seed: 
     return out
 
 
+def block_reads(block: int) -> list[str]:
+    """The sites reading block `block`'s input: a layer's q, k, v (attention) or its c_fc (MLP)."""
+    i, mlp = divmod(block, 2)
+    return [f"h.{i}.mlp.c_fc"] if mlp else [f"h.{i}.attn.{k}" for k in ("q_proj", "k_proj", "v_proj")]
+
+
+@torch.no_grad()
+def interchange(runner: Runner, bases: Tensor, sources: Tensor, seed: int) -> dict:
+    """Interchange experiments on the decomposition alone (every layer masked with the CI values of
+    the base, delta excluded), each base patched with a source shared across all bases. Each model
+    takes the source's read from its own run on the source (the decomposition's with the source's
+    own CI values). The decomposition's reads at a token are the read directions V_c of its
+    subcomponents with g > 0 there.
+        read        per base one subcomponent's read direction q = V_c / |V_c|, drawn uniformly
+                    over the q, k, v and c_fc subcomponents: h + ((s - h) . q) q
+        complement  per block, at every token the component outside the span Q of the active
+                    reads: s + (h - s) Q Q^T. The decomposition reads only the active coordinates,
+                    which the patch keeps, so its prediction is its unpatched output.
+    Returns per family the mean KL over all bases per source, and every token's KL."""
+    vpd, t = runner.vpd, runner.t
+    blocks, d, T = 2 * t.n_layer, t.wte.shape[1], bases.shape[1]
+    V = {n: t.site(n).V for n in vpd.names}
+    reads = [(b, n, c) for b in range(blocks) for n in block_reads(b) for c in range(vpd.C[n])]
+    rng = np.random.default_rng(seed)
+    read_of = [reads[i] for i in rng.integers(len(reads), size=bases.shape[0])]
+    zero = lambda g: {n: torch.zeros(v.shape[:-1], device=DEVICE) for n, v in g.items()}
+    src_m, src_e = [], []
+    for k in range(sources.shape[0]):
+        ids = sources[k:k + 1].to(DEVICE)
+        _, g = vpd.target_and_ci(ids)
+        cm, ce = {}, {}
+        runner.run(ids, None, None, capture=cm)
+        runner.run(ids, g, zero(g), capture=ce)
+        src_m.append(cm)
+        src_e.append(ce)
+        del g
+    S = sources.shape[0]
+    families = ["read"] + [f"complement_block_{b}" for b in range(blocks)]
+    sums = {f: np.zeros(S) for f in families}
+    counts = {f: np.zeros(S) for f in families}
+    tokens = {f: [] for f in families}
+
+    def record(f: str, k: int, kl: Tensor):
+        sums[f][k] += kl.sum().item()
+        counts[f][k] += kl.numel()
+        tokens[f].append(kl.cpu())
+
+    for b0 in range(0, bases.shape[0], MB):
+        b = bases[b0:b0 + MB].to(DEVICE)
+        B = b.shape[0]
+        _, g = vpd.target_and_ci(b)
+        z = zero(g)
+        e_logits = runner.logits(runner.run(b, g, z))
+        m_streams = runner.streams(b)
+        m_reads = {}
+        runner.run(b, None, None, capture=m_reads)
+        by_block = {}
+        for r in range(B):
+            blk, n, c = read_of[b0 + r]
+            q = V[n][:, c]
+            by_block.setdefault(blk, []).append((r, q / q.norm()))
+
+        def read_patch(source_reads: dict) -> dict:
+            def make(blk):
+                def f(h):
+                    h = h.clone()
+                    for r, q in by_block[blk]:
+                        h[r] = h[r] + ((source_reads[blk][0] - h[r]) @ q)[:, None] * q[None, :]
+                    return h
+                return f
+            return {blk: make(blk) for blk in by_block}
+
+        for k in range(S):
+            me = runner.logits(runner.run(b, None, None, patch=read_patch(src_m[k])))
+            ee = runner.logits(runner.run(b, g, z, patch=read_patch(src_e[k])))
+            record("read", k, kl_tokens(ee, me))
+            del me, ee
+        for blk in range(blocks):
+            names = block_reads(blk)
+            v_all = torch.cat([V[n] for n in names], 1).cpu().double().numpy()
+            active = torch.cat([g[n] > 0 for n in names], -1).reshape(B * T, -1).cpu().numpy()
+            h = m_reads[blk].reshape(B * T, d).cpu().double().numpy()
+            src = np.stack([src_m[k][blk][0].cpu().double().numpy() for k in range(S)])  # [S, T, d]
+            patched = np.empty((S, B * T, d), dtype=np.float32)
+            for row in range(B * T):
+                s_row = src[:, row % T]
+                cols = np.nonzero(active[row])[0]
+                if cols.size >= d:
+                    patched[:, row] = h[row]
+                elif cols.size == 0:
+                    patched[:, row] = s_row
+                else:
+                    Q = scipy.linalg.qr(v_all[:, cols], mode="economic")[0]
+                    patched[:, row] = s_row + ((h[row] - s_row) @ Q) @ Q.T
+            i = blk // 2
+            for k in range(S):
+                value = torch.from_numpy(patched[k]).to(DEVICE).view(B, T, d)
+                me = runner.logits(runner.run(b, None, None, start=i, entry=m_streams[i], patch={blk: lambda _, v=value: v}))
+                record(f"complement_block_{blk}", k, kl_tokens(e_logits, me))
+                del me
+            del patched
+        del g, z, e_logits, m_streams, m_reads
+        torch.mps.empty_cache()
+        print(f"  interchange: bases {b0}..{b0 + B} done", flush=True)
+    return {"per_source_mean_kl_nats": {f: (sums[f] / counts[f]).tolist() for f in families},
+            "all_sources": {f: summary(tokens[f]) for f in families},
+            "complement_all_blocks": summary([x for f in families[1:] for x in tokens[f]])}
+
+
 def pgd_shared(runner: Runner, ids: Tensor, steps: int, step_size: float = 0.1, seed: int = 0) -> dict:
     """VPD's eval PGDReconLoss: one source vector per site (and its delta coordinate) shared across
     the batch and every position, random init, `steps` sign-gradient ascent steps of `step_size` on
@@ -240,6 +366,15 @@ def pgd_shared(runner: Runner, ids: Tensor, steps: int, step_size: float = 0.1, 
 
 def main():
     out_path = sys.argv[1]
+    if sys.argv[2] == "interchange":
+        # vpd_battery.py OUT.json interchange FIRST:END SOURCE_FIRST:SOURCE_END
+        first, end = map(int, sys.argv[3].split(":"))
+        s_first, s_end = map(int, sys.argv[4].split(":"))
+        vpd = load_vpd(load_target(DEVICE), DEVICE)
+        result = {"held_out_rows": [first, end], "source_rows": [s_first, s_end], "units": "KL(M_e || E_e) per token in nats",
+                  "interchange": interchange(Runner(vpd), val_tokens(end - first, offset=first), val_tokens(s_end - s_first, offset=s_first), seed=first)}
+        json.dump(result, open(out_path, "w"), indent=1)
+        return
     first, end = map(int, sys.argv[2].split(":"))
     paper_rows = int(sys.argv[3]) if len(sys.argv) > 3 else 0
     pgd_steps = int(sys.argv[4]) if len(sys.argv) > 4 else 0
