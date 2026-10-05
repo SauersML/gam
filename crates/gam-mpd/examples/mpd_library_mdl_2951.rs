@@ -2,24 +2,36 @@
 //! description length on interchange experiments (`gam_mpd::library_mdl`, #2951), on an export's
 //! token rows, and scored on held-out rows after every epoch.
 //!
-//! EXPORT SETTINGS.json OUT host|gpu
+//! MODEL SETTINGS.json OUT host|gpu
 //!
-//! The sequences `held_out = [start, end)` are never fitted (for VPD-4L's `vpd4l_clean4096`, rows
-//! 1024..1056 are `vpd4l_frontier32`); the training sequences are the first `training_sequences`
-//! of the others, in order. `gpu` is the single-precision device (CUDA in f32 storage, or the Apple GPU). The
+//! `MODEL` is an engine export (`export.json` and its token rows), or a Hugging Face checkpoint
+//! directory (`config.json` and its safetensors, one file or sharded) whose token rows come from
+//! the settings' `windows` (files of rows of `context` little-endian u32, as
+//! `bench/mpd_qwen3_fineweb_2951.py` writes them): its `held_out` file's rows and its `training`
+//! file's rows are the two sets. `export_sha256` is `export.json`'s SHA-256, or for a checkpoint
+//! the fingerprint of `config.json`'s and every safetensors file's SHA-256 (a mismatch names it).
+//!
+//! On an export, the sequences `held_out = [start, end)` are never fitted (for VPD-4L's
+//! `vpd4l_clean4096`, rows 1024..1056 are `vpd4l_frontier32`); the training sequences are the
+//! first `training_sequences` of the others, in order. On a checkpoint, `held_out` is a range of
+//! the held-out file's rows and the training sequences are the training file's first rows. `gpu` is the single-precision device (CUDA in f32 storage, or the Apple GPU). The
 //! fit is checkpointed in `OUT/checkpoint.bin` after every epoch, with its trajectory readable in
 //! `OUT/checkpoint.json`; rerunning the same command resumes it.
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     engine::{log_to_stderr, sha256},
-    import::import_language_model,
+    import::{hugging_face_language_model, import_language_model},
     library_mdl,
-    operator_program::SlotValues,
+    operator_program::{OperatorProgram, SlotValues},
     run_check::{layer_nodes, split_sites},
 };
+use gam_runtime::warm_start::Fingerprinter;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{path::Path, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,7 +40,48 @@ struct Settings {
     training_sequences: usize,
     context: usize,
     held_out: [usize; 2],
+    /// A Hugging Face checkpoint's token rows (absent for an engine export, which holds its own).
+    #[serde(default)]
+    windows: Option<Windows>,
     fit: library_mdl::Settings,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Windows {
+    training: PathBuf,
+    held_out: PathBuf,
+}
+
+/// The first `count` rows of `context` tokens of a windows file.
+fn rows(path: &Path, count: usize, context: usize) -> Result<Vec<Vec<u32>>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() < count * context * 4 {
+        return Err(format!("{}: fewer than {count} rows of {context} tokens", path.display()));
+    }
+    Ok(bytes[..count * context * 4]
+        .chunks_exact(context * 4)
+        .map(|row| row.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        .collect())
+}
+
+/// A Hugging Face checkpoint's fingerprint: `config.json`'s and every safetensors file's SHA-256,
+/// in name order.
+fn checkpoint_digest(dir: &Path) -> Result<String, String> {
+    let mut names: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .map(|entry| entry.map(|e| e.path()).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| n == "config.json") || p.extension().is_some_and(|e| e == "safetensors"))
+        .collect();
+    names.sort();
+    let mut fingerprint = Fingerprinter::new();
+    for path in &names {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        fingerprint.absorb_str(name.as_bytes(), &sha256(path)?);
+    }
+    Ok(fingerprint.finalize().to_hex())
 }
 
 fn save(path: &Path, value: &Value) -> Result<(), String> {
@@ -43,15 +96,15 @@ fn main() -> Result<(), String> {
     };
     let (export, settings_path, out) = (Path::new(export), Path::new(settings_path), Path::new(out));
     let settings: Settings = serde_json::from_slice(&std::fs::read(settings_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    if sha256(&export.join("export.json"))? != settings.export_sha256 {
-        return Err("export hash mismatch".into());
+    let checkpoint_model = export.join("config.json").exists() && !export.join("export.json").exists();
+    let digest = if checkpoint_model { checkpoint_digest(export)? } else { sha256(&export.join("export.json"))? };
+    if digest != settings.export_sha256 {
+        return Err(format!("model digest mismatch: {} is {digest}", export.display()));
     }
     let [first, end] = settings.held_out;
     if first >= end || settings.training_sequences == 0 {
         return Err("held-out sequences must be a nonempty range, and training sequences nonempty".into());
     }
-    // The rows to import: the held-out range and the training sequences around it.
-    let rows = end.max(settings.training_sequences + if settings.training_sequences > first { end - first } else { 0 });
     let checkpoint = out.join("checkpoint.bin");
     if out.exists() && !checkpoint.exists() {
         return Err("a fresh output directory, or one holding this fit's checkpoint, required".into());
@@ -63,19 +116,34 @@ fn main() -> Result<(), String> {
     };
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     let started = Instant::now();
-    let imported = import_language_model(export, rows, settings.context)?;
-    let layer_count = imported.record["config"]["n_layers"].as_u64().ok_or("config.n_layers")? as usize;
-    let native = split_sites(&imported.program)?;
-    let layers = layer_nodes(&native, layer_count)?;
-    let SlotValues::Tokens(tokens) = &imported.family.slots[0] else {
-        return Err("a token slot".into());
+    let (program, layer_count, train, held_out): (OperatorProgram, usize, Vec<Vec<u32>>, Vec<Vec<u32>>) = if checkpoint_model {
+        let windows = settings.windows.as_ref().ok_or("a Hugging Face checkpoint needs the settings' windows")?;
+        let text = std::fs::read_to_string(export.join("config.json")).map_err(|e| e.to_string())?;
+        let layers = serde_json::from_str::<Value>(&text).map_err(|e| e.to_string())?["num_hidden_layers"].as_u64().ok_or("num_hidden_layers")? as usize;
+        let (program, _) = hugging_face_language_model(export, 0..layers)?;
+        let held_out = rows(&windows.held_out, end, settings.context)?[first..].to_vec();
+        (program, layers, rows(&windows.training, settings.training_sequences, settings.context)?, held_out)
+    } else {
+        if settings.windows.is_some() {
+            return Err("an engine export holds its own token rows; windows are for a Hugging Face checkpoint".into());
+        }
+        // The rows to import: the held-out range and the training sequences around it.
+        let count = end.max(settings.training_sequences + if settings.training_sequences > first { end - first } else { 0 });
+        let imported = import_language_model(export, count, settings.context)?;
+        let layers = imported.record["config"]["n_layers"].as_u64().ok_or("config.n_layers")? as usize;
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else {
+            return Err("a token slot".into());
+        };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(settings.context).map(<[u32]>::to_vec).collect();
+        let train: Vec<Vec<u32>> = sequences[..first].iter().chain(&sequences[end..]).take(settings.training_sequences).cloned().collect();
+        (imported.program, layers, train, sequences[first..end].to_vec())
     };
-    let sequences: Vec<Vec<u32>> = tokens.chunks(settings.context).map(<[u32]>::to_vec).collect();
-    let held_out = &sequences[first..end];
-    let train: Vec<Vec<u32>> = sequences[..first].iter().chain(&sequences[end..]).take(settings.training_sequences).cloned().collect();
     if train.len() != settings.training_sequences {
-        return Err("the export holds fewer training sequences than asked for".into());
+        return Err("the model's token rows hold fewer training sequences than asked for".into());
     }
+    let held_out = &held_out[..];
+    let native = split_sites(&program)?;
+    let layers = layer_nodes(&native, layer_count)?;
     let explanation = library_mdl::explanation(&native, &layers)?;
     explanation.artifact.validate_coverage(&native)?;
     // A checkpoint there must be this fit's (export, sequences, program, groups, shared
