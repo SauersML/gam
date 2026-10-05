@@ -1,0 +1,123 @@
+{
+  "accepted_updates": 2500,
+  "additional_saved_eval_scans": 1,
+  "additional_saved_train_scans": 1,
+  "batch_schedule": {
+    "hard_rows": 4,
+    "ordinary_rows": 8,
+    "scan_every": 10,
+    "temperature": 0.02
+  },
+  "best_step": 1570,
+  "best_training_max": 0.0008483226595334259,
+  "eval_inputs": "two independent deterministic modular 2D panels in approximately [-2,2]",
+  "eval_rows": 32,
+  "eval_site_rows_per_scan": 64,
+  "expression": {
+    "unary": [
+      "gelu_tanh",
+      {
+        "affine": {
+          "unary": [
+            "gelu_tanh",
+            {
+              "argument": 0
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "fit_seconds": 0.030697625,
+  "heldout_max": 0.040008352122646446,
+  "heldout_threshold": null,
+  "initial_final_validation_scans": 2,
+  "initial_training_max": 0.5394398220685425,
+  "proposal_seed": 981,
+  "row_work": {
+    "full_scan_rows": 4016,
+    "full_training_scans": 251,
+    "proposal_backward_rows": 25000,
+    "proposal_forward_rows": 25000
+  },
+  "saved_f32_heldout_max": 0.040008421215466924,
+  "saved_f32_training_max": 0.0008483126287755662,
+  "scope": "SYNTHETIC supplied correct topology coefficient calibration, NOT structure discovery or LLM evidence",
+  "settings": {
+    "arithmetic": "f64",
+    "backtracking": null,
+    "beta1": 0.9,
+    "beta2": 0.99,
+    "epsilon": 1e-8,
+    "forward_rows": 8,
+    "iterations": 2500,
+    "learning_rate": 0.01,
+    "numeric_bytes": 1048576
+  },
+  "teacher_ordinary_f32_replay": true,
+  "teacher_seed": 712,
+  "train_inputs": "two deterministic modular 2D panels in approximately [-1,1]",
+  "train_rows": 16,
+  "train_site_rows_per_scan": 32,
+  "train_threshold": 0.001,
+  "uses": 2,
+  "width": 2,
+  "working_source_provenance": {
+    "head": "1dc8c23b5924cccaf0916040b294fe336bc31769",
+    "module_sha256": "e879fa3f096a15753bc6f41e4864e50afa1104a35b05f882ab473648dd789b99",
+    "example_sha256": "a026c314d194e71c84c5bc2c5ce299b4b29a32a7000dcdef5a239d9690054964",
+    "uncommitted": true
+  },
+  "exact_input_formulas": {
+    "indexing": "zero-based r,c",
+    "training": [
+      {
+        "rows": 16,
+        "cols": 2,
+        "value": "((7*r+3*c)%19)/9.0-1.0"
+      },
+      {
+        "rows": 16,
+        "cols": 2,
+        "value": "((5*r+11*c)%23)/11.0-1.0"
+      }
+    ],
+    "evaluation": [
+      {
+        "rows": 32,
+        "cols": 2,
+        "value": "((13*r+5*c)%37)/9.0-2.0+0.031"
+      },
+      {
+        "rows": 32,
+        "cols": 2,
+        "value": "((17*r+7*c)%41)/10.0-2.0+0.047"
+      }
+    ]
+  },
+  "selection": "Best snapshot only from complete TRAIN maximum scans; no evaluation updates or selection. Correct topology supplied.",
+  "convex_regression": {
+    "residuals": [
+      "1+a",
+      "1-a+b"
+    ],
+    "initial_parameters": [
+      0,
+      0
+    ],
+    "legacy_backtracking_accepted_updates": 0,
+    "legacy_best_train_max": 1,
+    "batched_train_max": 0,
+    "batched_updates": 740,
+    "stop_reason": "zero_training_maximum",
+    "budget_updates": 1000
+  },
+  "checks": {
+    "fitter_tests": 14,
+    "driver_tests": 4,
+    "status": "PASS",
+    "own_ban_scan": "clean",
+    "git_diff_check": "clean",
+    "unrelated_shared_ban_violations": 4
+  }
+}

@@ -25,6 +25,8 @@ struct Settings {
     width: usize,
     grammar: Grammar,
     fit: FitSettings,
+    #[serde(default)]
+    batch_schedule: Option<resident_rule_fit::BatchSchedule>,
     seed: u64,
 }
 fn save(path: &Path, value: &Value) -> Result<(), String> {
@@ -323,17 +325,32 @@ fn run() -> Result<(), String> {
                     &candidate.join("DECLARATION.json"),
                     &json!({"expression":expr,"arm":arm,"seed":settings.seed,"groups":proposal.groups,"trainable":proposal.trainable,"declarations":{"domains":[],"raw_slot_widths":train.inputs.iter().map(|x|x.ncols()).collect::<Vec<_>>(),"parameters":proposal.program.declarations.parameters}}),
                 )?;
-                let fit = resident_rule_fit::fit_grouped(
-                    &device,
-                    &proposal.program,
-                    &train.inputs,
-                    &train.targets,
-                    &train.inputs,
-                    &train.targets,
-                    &proposal.groups,
-                    &proposal.trainable,
-                    settings.fit.clone(),
-                )?;
+                let fit = if let Some(schedule) = &settings.batch_schedule {
+                    resident_rule_fit::fit_grouped_batched(
+                        &device,
+                        &proposal.program,
+                        &train.inputs,
+                        &train.targets,
+                        &train.inputs,
+                        &train.targets,
+                        &proposal.groups,
+                        &proposal.trainable,
+                        settings.fit.clone(),
+                        schedule.clone(),
+                    )?
+                } else {
+                    resident_rule_fit::fit_grouped(
+                        &device,
+                        &proposal.program,
+                        &train.inputs,
+                        &train.targets,
+                        &train.inputs,
+                        &train.targets,
+                        &proposal.groups,
+                        &proposal.trainable,
+                        settings.fit.clone(),
+                    )?
+                };
                 save(
                     &candidate.join("FIT.json"),
                     &serde_json::to_value(&fit.report).map_err(|e| e.to_string())?,
@@ -489,6 +506,25 @@ mod tests {
                 parameters: 0,
             },
         }
+    }
+    #[test]
+    fn optional_batch_schedule_does_not_change_legacy_settings() {
+        let fixture = json!({"layers":[0,1],"width":8,"grammar":{"arguments":1,"max_operations":3,"max_expressions":10000,"unary":["relu"],"binary":["multiply"],"affine":true},"fit":{"iterations":128,"forward_rows":128,"learning_rate":0.01,"beta1":0.9,"beta2":0.999,"epsilon":1e-8,"numeric_bytes":536870912,"arithmetic":"f64","backtracking":null},"seed":2951});
+        let legacy: Settings =
+            serde_json::from_value(fixture.clone()).expect("legacy calibration settings");
+        assert!(legacy.batch_schedule.is_none());
+        let mut explicit = fixture;
+        explicit["batch_schedule"] =
+            json!({"ordinary_rows":64,"hard_rows":16,"scan_every":8,"temperature":0.02});
+        let explicit: Settings = serde_json::from_value(explicit).expect("optional schedule");
+        assert_eq!(
+            explicit
+                .batch_schedule
+                .expect("declared schedule")
+                .scan_every,
+            8
+        );
+        assert_eq!(legacy.fit.iterations, explicit.fit.iterations);
     }
     #[test]
     fn matched_controls_freeze_even_dominated_or_failed() {
