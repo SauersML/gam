@@ -1,5 +1,6 @@
-"""Figure for the one-page note on VPD's layer cancellation (#2951): (a) KL(M || E_S) for all 15 sets S
-of replaced layers, by |S|, split by whether S includes layer 3; (b) the two interventions on dU,
+"""Figure for the one-page note on VPD's layer cancellation (#2951): (a) KL from the model for all 15
+sets of replaced layers, by size, split by whether the set includes layer 3; (b) subtracting or adding
+back layer 3's response (the change in the output of its zero-importance subcomponents),
 averaged over the earlier layer l = 0, 1, 2. Rounded masks (CI > 0), held-out rows 1024-1056.
 
     python bench/figures_2951/vpd_cancellation_note_fig.py BATTERY.json CANCELLATION.json OUT.pdf
@@ -26,7 +27,7 @@ plt.rcParams.update({
     "axes.spines.top": False, "axes.spines.right": False, "axes.linewidth": 0.7,
     "xtick.major.width": 0.7, "ytick.major.width": 0.7, "pdf.fonttype": 42,
 })
-fig, (a, b) = plt.subplots(1, 2, figsize=(7.0, 2.35), gridspec_kw={"width_ratios": [1, 1.15], "wspace": 0.32})
+fig, (a, b) = plt.subplots(1, 2, figsize=(7.0, 2.6), gridspec_kw={"width_ratios": [1, 1.15], "wspace": 0.32})
 
 # (a) every set of replaced layers
 for k in range(1, 5):
@@ -39,26 +40,27 @@ a.set_xticks(range(1, 5))
 a.set_xlim(0.5, 4.5)
 a.set_ylim(0, 0.75)
 a.set_xlabel("number of layers replaced")
-a.set_ylabel(r"KL$(p_M\,\|\,p_{E_S})$ (nats/token)")
+a.set_ylabel("KL divergence (nats/token)")
 a.legend(frameon=False, loc="lower left", handletextpad=0.2, borderaxespad=0.1)
 a.text(-0.2, 1.02, "a", transform=a.transAxes, fontsize=11, fontweight="bold", va="bottom")
 
 # (b) interventions
-bars = [(r"$E_{\{l\}}$", mean_l("kl_{}"), GRAY), (r"$E_{\{l\}}-\Delta U$", mean_l("kl_{}_without_I"), BLUE),
-        (r"$E_{\{l,3\}}$", mean_l("kl_{}3"), GRAY), (r"$E_{\{l,3\}}+\Delta U$", mean_l("kl_{}3_no_interaction"), ORANGE)]
-xs = [0, 0.9, 2.3, 3.2]
+bars = [("earlier\nlayer", mean_l("kl_{}"), GRAY),
+        ("earlier\nlayer,\nminus\nresponse", mean_l("kl_{}_without_I"), BLUE),
+        ("earlier\nlayer and\nlayer 3", mean_l("kl_{}3"), GRAY),
+        ("earlier\nlayer and\nlayer 3,\nplus\nresponse", mean_l("kl_{}3_no_interaction"), ORANGE)]
+xs = [0, 1.0, 2.5, 3.5]
 for x, (name, v, color) in zip(xs, bars):
     b.bar(x, v, 0.75, color=color, edgecolor="white", linewidth=0.8)
     b.text(x, v + 0.02, f"{v:.2f}", ha="center", va="bottom", fontsize=9)
 for x0, x1, v in [(xs[0], xs[1], bars[0][1]), (xs[2], xs[3], bars[2][1])]:
     b.plot([x0 - 0.375, x1 + 0.375], [v, v], color=INK, lw=0.7, ls=(0, (3, 2)), zorder=0)
 b.set_xticks(xs)
-b.set_xticklabels([n for n, _, _ in bars])
+b.set_xticklabels([n for n, _, _ in bars], fontsize=8.5, linespacing=1.05)
 b.tick_params(axis="x", length=0)
 b.set_ylim(0, 1.12)
-b.set_ylabel(r"KL$(p_M\,\|\,p_E)$ (nats/token)")
-b.text(0.45, -0.25, "subtract $\\Delta U$", ha="center", transform=b.get_xaxis_transform(), color=MUTED)
-b.text(2.75, -0.25, "add $\\Delta U$ back", ha="center", transform=b.get_xaxis_transform(), color=MUTED)
+b.set_ylabel("KL divergence (nats/token)")
+b.set_xlabel("layers replaced", labelpad=4)
 b.text(-0.17, 1.02, "b", transform=b.transAxes, fontsize=11, fontweight="bold", va="bottom")
 fig.savefig(out, bbox_inches="tight", pad_inches=0.02)
 print(out)
