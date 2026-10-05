@@ -494,7 +494,13 @@ fn bfloat16_products_match_the_host_on_rounded_operands() {
     assert_within("bfloat16 product on a frozen copy", &down(&d, &c), &reference, band);
     assert!(d.gemm(&mut c, 1.0, &da, Op::N, &frozen, Op::T, 0.0, Arithmetic::F32).is_err(), "a bfloat16 operand takes Bf16");
     assert!(d.axpy(&mut c, 1.0, &frozen).is_err(), "only products take bfloat16 copies");
-    assert!(d.with_storage(Storage::Bf16).is_err(), "no device makes bfloat16 tensors");
+    // A bfloat16 device stores its uploads rounded to nearest, and products read them as copies.
+    let half = d.with_storage(Storage::Bf16).expect("CUDA stores bfloat16");
+    let stored = half.upload(b.t().view()).expect("bfloat16 upload");
+    assert_eq!((stored.storage(), down(&d, &stored)), (Storage::Bf16, b.t().mapv(bf16)));
+    let mut c = d.zeros(m, n).expect("zeros");
+    d.gemm(&mut c, 1.0, &da, Op::N, &stored, Op::T, 0.0, Arithmetic::Bf16).expect("bfloat16 operand");
+    assert_within("bfloat16 product on a bfloat16 upload", &down(&d, &c), &reference, band);
     let (rows, classes, width) = (37, 20_011, 64);
     let hidden = matrix(rows, width, 23, 1.0);
     let embedding = matrix(classes, width, 24, 1.0);

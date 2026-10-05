@@ -225,6 +225,20 @@ fn hugging_face_name(name: &str) -> Option<String> {
 /// embedding, when the program reads tokens or the tied readout) are read. Returns the program and
 /// its `{config}` record (the export's conventions).
 pub fn hugging_face_language_model(dir: &Path, blocks: std::ops::Range<usize>) -> Result<(OperatorProgram, Value), String> {
+    hugging_face(dir, blocks, None)
+}
+
+/// The Hugging Face checkpoint at `dir` cut to its first `layers` blocks, then its final norm and
+/// its head: the model's embedding, those blocks and its readout, the later blocks left out (a
+/// smaller language model on the same tokens, for measuring per-layer costs where the whole model
+/// does not fit). Its `{config}` record gives `n_layers = layers`.
+pub fn hugging_face_language_model_prefix(dir: &Path, layers: usize) -> Result<(OperatorProgram, Value), String> {
+    hugging_face(dir, 0..layers, Some(layers))
+}
+
+/// [`hugging_face_language_model`] over `blocks`, or with `prefix` its first `prefix` blocks read
+/// out ([`hugging_face_language_model_prefix`]).
+fn hugging_face(dir: &Path, blocks: std::ops::Range<usize>, prefix: Option<usize>) -> Result<(OperatorProgram, Value), String> {
     let text = std::fs::read_to_string(dir.join("config.json")).map_err(|e| format!("{}: {e}", dir.display()))?;
     let hf: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     refuse_unsupported(&hf).map_err(|e| format!("config.json: {e}"))?;
@@ -260,14 +274,18 @@ pub fn hugging_face_language_model(dir: &Path, blocks: std::ops::Range<usize>) -
         Some("silu") => "silu",
         other => return Err(format!("unsupported hidden_act {other:?}")),
     };
+    let all = integer("num_hidden_layers")?;
+    if prefix.is_some_and(|k| k == 0 || k as u64 > all) {
+        return Err(format!("a prefix of {prefix:?} blocks of a {all}-block model"));
+    }
     let record = serde_json::json!({
-        "source": {"model": dir.display().to_string(), "blocks": [blocks.start, blocks.end]},
+        "source": {"model": dir.display().to_string(), "blocks": [blocks.start, blocks.end], "prefix_of": prefix.map(|_| all)},
         "config": {
             "norm": "rms", "parallel_residual": false, "rotary_dims": head_dim,
             "rope_theta": hf["rope_theta"].as_f64().ok_or("config.json: rope_theta")?,
             "norm_eps": hf["rms_norm_eps"].as_f64().ok_or("config.json: rms_norm_eps")?, "mlp_act": act,
             "tied_embeddings": hf["tie_word_embeddings"].as_bool().unwrap_or(false), "mlp_gated": true,
-            "qk_norm": kind == "qwen3", "d_model": d, "n_layers": integer("num_hidden_layers")?, "n_heads": heads,
+                        "qk_norm": kind == "qwen3", "d_model": d, "n_layers": prefix.map_or(all, |k| k as u64), "n_heads": heads,
             "n_kv_heads": integer("num_key_value_heads")?, "head_dim": head_dim,
             "d_mlp": integer("intermediate_size")?, "vocab": vocab, "rope_pairing": "rotate_half",
         },
@@ -522,7 +540,7 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
 
 #[cfg(test)]
 mod tests {
-    use super::{hugging_face_language_model, refuse_unsupported};
+    use super::{hugging_face_language_model, hugging_face_language_model_prefix, refuse_unsupported};
     use serde_json::{Value, json};
     use std::path::Path;
 
@@ -611,7 +629,23 @@ mod tests {
         std::fs::write(sharded.join("model.safetensors.index.json"), json!({"metadata": {}, "weight_map": weight_map}).to_string()).expect("index");
         let (a, _) = hugging_face_language_model(&whole, 0..1).expect("one file");
         let (b, _) = hugging_face_language_model(&sharded, 0..1).expect("two shards");
+        // The same tensors as the first block of a two-block model: its one-block prefix is the
+        // one-block model, head included; without the prefix the first block ends in the stream.
+        let longer = base.join("longer");
+        std::fs::create_dir_all(&longer).expect("temporary directory");
+        let mut deeper = config.clone();
+        deeper["num_hidden_layers"] = json!(2);
+        std::fs::write(longer.join("config.json"), deeper.to_string()).expect("config");
+        write(&longer.join("model.safetensors"), &tensors);
+        let (prefix, record) = hugging_face_language_model_prefix(&longer, 1).expect("a one-block prefix");
+        let (cut, _) = hugging_face_language_model(&longer, 0..1).expect("the first block alone");
+        assert!(hugging_face_language_model_prefix(&longer, 3).is_err(), "no prefix longer than the model");
         std::fs::remove_dir_all(&base).expect("cleanup");
+        assert_eq!((record["config"]["n_layers"].as_u64(), record["source"]["prefix_of"].as_u64()), (Some(1), Some(2)));
+        assert_eq!(format!("{:?}", prefix.nodes), format!("{:?}", a.nodes), "the prefix is the one-block model");
+        assert!(prefix.operators.iter().zip(&a.operators).all(|(x, y)| x.name == y.name && x.matrix() == y.matrix()));
+        assert!(crate::resident_causal_fit::fixed_head_target::Head::of(&prefix).is_ok(), "its head is the compact targets' head");
+        assert!(crate::resident_causal_fit::fixed_head_target::Head::of(&cut).is_err(), "a cut program has no head");
         assert_eq!(a.operators.len(), b.operators.len());
         for (x, y) in a.operators.iter().zip(&b.operators) {
             assert_eq!(x.name, y.name);
