@@ -174,6 +174,19 @@ pub fn share_query_key(explanation: &Explanation, members: &[(usize, usize)]) ->
     let all = heads(explanation)?;
     let found: Vec<&Head> = members.iter().map(|m| all.get(m).ok_or_else(|| format!("no head {m:?} with a key of its own"))).collect::<Result<_, _>>()?;
     let mut artifact = explanation.artifact.clone();
+    // Each member keeps its native owners, now read through the shared maps.
+    let names = |h: &Head| (artifact.program.operators[h.query].name.clone(), artifact.program.operators[h.key].name.clone());
+    let shared = names(found[0]);
+    let retiring: Vec<(String, String)> = found[1..].iter().map(|h| names(h)).collect();
+    for owner in &mut artifact.owners {
+        for (q, k) in &retiring {
+            if owner.operator == *q {
+                owner.operator = shared.0.clone();
+            } else if owner.operator == *k {
+                owner.operator = shared.1.clone();
+            }
+        }
+    }
     let program = &mut artifact.program;
     let owner = found[0];
     let (q1, k1) = (program.operators[owner.query].matrix(), program.operators[owner.key].matrix());
@@ -340,7 +353,18 @@ pub fn tie(explanation: &Explanation, ties: &[Tie]) -> Result<Explanation, Strin
         }
         let identity = program.operators.len();
         program.operators.push(Arc::new(dense(format!("{name}.identity"), output.rows.clone(), gate.cols.clone(), Array2::eye(gate.cols.width()), provenance)?));
-        // The tied outputs leave `OUT`: their columns are zero and their groups removed.
+        // The tied outputs leave `OUT`: their columns are zero and their groups removed; each one's
+        // native owner now reads the gate row it is tied to.
+        for tie in ties.iter() {
+            for owner in &mut out.artifact.owners {
+                if owner.operator == output.name && owner.cols == (tie.source.1..tie.source.1 + 1) {
+                    owner.operator = gate.name.clone();
+                    owner.rows = tie.target.1..tie.target.1 + 1;
+                    owner.cols = 0..gate.cols.width();
+                }
+            }
+        }
+        let program = &mut out.artifact.program;
         let mut values = output.matrix();
         for tie in ties.iter() {
             values.column_mut(tie.source.1).fill(0.0);
@@ -414,6 +438,14 @@ pub fn tie_token(explanation: &Explanation, target: (usize, usize), token: usize
     let mut values = gate.matrix();
     values.row_mut(i).fill(0.0);
     program.operators[gate_index] = Arc::new(dense(gate.name.clone(), gate.rows.clone(), gate.cols.clone(), values, gate.provenance.clone())?);
+    // The gate row's native owner now reads the embedding row's copy.
+    for owner in &mut out.artifact.owners {
+        if owner.operator == gate.name && owner.rows == (i..i + 1) {
+            owner.operator = format!("{name}.row");
+            owner.rows = 0..1;
+        }
+    }
+    let program = &mut out.artifact.program;
     // The row and its scale come first in the rule (after its input), the gate reading them last.
     let (ops, bases, rules): (Vec<usize>, Vec<usize>, Vec<usize>) = ((0..base + 3).collect(), (0..program.bases.len()).collect(), (0..program.rules.len()).collect());
     let r = &mut program.rules[rule];
@@ -469,6 +501,13 @@ mod tests {
             program.operators[to] = Arc::new(dense(program.operators[to].name.clone(), program.operators[to].rows.clone(), program.operators[to].cols.clone(), program.operators[from].matrix(), Provenance::default()).unwrap());
         }
         let shared = share_query_key(&start, &[(0, 0), (1, 0)]).expect("shared");
+        // Sharing keeps every native owner; the member's now read the shared maps at its own site.
+        let natives = |e: &Explanation| { let mut n: Vec<(String, String)> = e.artifact.owners.iter().map(|o| (o.native.clone(), o.site.clone())).collect(); n.sort(); n };
+        assert_eq!(natives(&start), natives(&shared));
+        let (q, member_q) = (&start.artifact.program.operators[head(&start.artifact.program, 0, 0).unwrap().unwrap().query].name, &start.artifact.program.operators[head(&start.artifact.program, 1, 0).unwrap().unwrap().query].name);
+        let native_member = start.artifact.owners.iter().find(|o| &o.operator == member_q).unwrap().native.clone();
+        let now = shared.artifact.owners.iter().find(|o| o.native == native_member && o.site == "library.l1.h0").unwrap();
+        assert_eq!(&now.operator, q);
         let (before, after) = (start.artifact.execute(&imported.family).unwrap(), shared.artifact.execute(&imported.family).unwrap());
         let (a, b) = (&before.values[start.artifact.program.output], &after.values[shared.artifact.program.output]);
         assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * (1.0 + x.abs())), "identical members keep the explanation's output");
@@ -519,6 +558,10 @@ mod tests {
         let tokens = 2 * 6 * 12;
         let untied = Posterior::new(&start, tokens).unwrap();
         let tied = tie(&start, &[Tie { source: (0, 3), target: (1, 5), scale: 2.5 }]).unwrap();
+        // The tied output's native owner now reads the gate row at its own site.
+        let owner = tied.artifact.owners.iter().find(|o| o.site == "library.l0.mlp" && o.native_cols == (3..4) && o.native.contains("down")).expect("the output's native owner");
+        assert_eq!((owner.operator.as_str(), owner.rows.clone()), ("library.l1.mlp.gate", 5..6));
+        assert_eq!(tied.artifact.owners.len(), start.artifact.owners.len());
         let (before, after) = (start.artifact.execute(&imported.family).unwrap(), tied.artifact.execute(&imported.family).unwrap());
         let (a, b) = (&before.values[start.artifact.program.output], &after.values[tied.artifact.program.output]);
         let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));

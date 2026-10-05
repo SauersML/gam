@@ -111,7 +111,7 @@
 //! absent only when they fill complete interface blocks.
 
 use crate::{
-    artifact::{Argument, Artifact, Callee},
+    artifact::{Argument, Artifact, Callee, Owner},
     device_posterior::{DevicePosterior, Ivon},
     interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable, Targets},
     operator_program::{
@@ -258,10 +258,10 @@ fn head_norm(native: &OperatorProgram, node: usize) -> Option<(f64, Arc<Operator
 }
 
 /// The native operator and bias of the affine node `node` reading `input` alone.
-fn affine_map(native: &OperatorProgram, node: usize, input: usize) -> Result<(Arc<Operator>, Option<Array2<f64>>), String> {
+fn affine_map(native: &OperatorProgram, node: usize, input: usize) -> Result<(Arc<Operator>, Option<Arc<Operator>>), String> {
     match &native.nodes[node] {
         Node::Affine { terms, bias } if terms.len() == 1 && terms[0].0 == input => {
-            Ok((Arc::clone(&native.operators[terms[0].1]), bias.map(|b| native.operators[b].matrix())))
+            Ok((Arc::clone(&native.operators[terms[0].1]), bias.map(|b| Arc::clone(&native.operators[b]))))
         }
         other => Err(format!("node {node} is not an affine map of node {input}: {other:?}")),
     }
@@ -270,7 +270,7 @@ fn affine_map(native: &OperatorProgram, node: usize, input: usize) -> Result<(Ar
 /// The library block of a gated MLP `down(φ(A x + c) ⊙ (B x + e))` (SwiGLU on Qwen3): functions
 /// `f_i(x) = φ(a_i·x + c_i) (b_i·x + e_i) u_i` with `M`'s law `φ`, its gate `a_i`, up direction
 /// `b_i` and output `u_i`, and the biases `c_i`, `e_i` only where `M` has them.
-fn gated_mlp(native: &OperatorProgram, artifact: Artifact, layer: &LayerNodes, l: usize, left: usize, right: usize) -> Result<Artifact, String> {
+fn gated_mlp(native: &OperatorProgram, artifact: Artifact, layer: &LayerNodes, l: usize, left: usize, right: usize) -> Result<(Artifact, Vec<Owner>), String> {
     let Node::Pointwise { input: gate_pre, laws } = &native.nodes[left] else {
         return Err(format!("layer {l}: the gated product's left factor is not one pointwise law"));
     };
@@ -291,9 +291,10 @@ fn gated_mlp(native: &OperatorProgram, artifact: Artifact, layer: &LayerNodes, l
         library_operator(&format!("{name}.up"), units.clone(), up.cols.clone(), up.matrix(), &up.name)?,
         library_operator(&format!("{name}.out"), down.rows.clone(), units.clone(), down.matrix(), &down.name)?,
     ];
-    let mut bias = |values: Option<Array2<f64>>, part: &str, source: &str| -> Result<Option<usize>, String> {
+    let owners = mlp_owners(&name, units.width(), &gate, gate_bias.as_deref(), Some((&up, up_bias.as_deref())), &down);
+    let mut bias = |values: Option<Arc<Operator>>, part: &str, source: &str| -> Result<Option<usize>, String> {
         let Some(values) = values else { return Ok(None) };
-        operators.push(library_operator(&format!("{name}.{part}_bias"), units.clone(), Interface::constant(), values, source)?);
+        operators.push(library_operator(&format!("{name}.{part}_bias"), units.clone(), Interface::constant(), values.matrix(), source)?);
         Ok(Some(base + operators.len() - 1))
     };
     let (gate_bias, up_bias) = (bias(gate_bias, "gate", &gate.name)?, bias(up_bias, "up", &up.name)?);
@@ -310,7 +311,41 @@ fn gated_mlp(native: &OperatorProgram, artifact: Artifact, layer: &LayerNodes, l
         ],
         output: 5,
     };
-    artifact.replace_block(&name, Callee::New(rule), vec![Argument::Native(x)], layer.mlp, operators)
+    Ok((artifact.replace_block(&name, Callee::New(rule), vec![Argument::Native(x)], layer.mlp, operators)?, owners))
+}
+
+/// The owners of an MLP block `name` of `units` functions (`artifact::Owner`): per function its
+/// gate row (and bias), its up row (and bias) when gated, and its output column, each replacing
+/// the same row or column of `M`'s map.
+fn mlp_owners(name: &str, units: usize, gate: &Operator, gate_bias: Option<&Operator>, up: Option<(&Operator, Option<&Operator>)>, down: &Operator) -> Vec<Owner> {
+    let mut out = Vec::new();
+    let mut add = |part: &str, native: &Operator, unit: usize, column: bool| {
+        let (rows, cols) = if column { (0..native.rows.width(), unit..unit + 1) } else { (unit..unit + 1, 0..native.cols.width()) };
+        out.push(Owner {
+            operator: format!("{name}.{part}"),
+            rows: rows.clone(),
+            cols: cols.clone(),
+            body: name.to_string(),
+            site: name.to_string(),
+            native: native.name.clone(),
+            native_rows: rows,
+            native_cols: cols,
+        });
+    };
+    for i in 0..units {
+        add("gate", gate, i, false);
+        if let Some(bias) = gate_bias {
+            add("gate_bias", bias, i, false);
+        }
+        if let Some((up, up_bias)) = up {
+            add("up", up, i, false);
+            if let Some(bias) = up_bias {
+                add("up_bias", bias, i, false);
+            }
+        }
+        add("out", down, i, true);
+    }
+    out
 }
 
 /// The operator named `name`, when the program has one (a part a law may lack: a bias, an up map).
@@ -331,6 +366,7 @@ fn index_of(program: &OperatorProgram, name: &str) -> Result<usize, String> {
 pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Explanation, String> {
     let mut artifact = Artifact::native(native)?;
     let mut planes = Vec::new();
+    let mut owners = Vec::new();
     for (l, layer) in layers.iter().enumerate() {
         // Per key-value group (the native key and value projections its query heads read): its
         // name, its query heads, its planes and its value width.
@@ -383,6 +419,15 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
             nodes.push(Node::Attend { query: query_node, key: key_node, value: 3, scale, rotary, causal });
             let rule = Rule { name: name.clone(), inputs: vec![q.cols.clone()], output: nodes.len() - 1, nodes };
             artifact = artifact.replace_block(&name, Callee::New(rule), vec![Argument::Native(x)], read, operators)?;
+            // The head's query map, and its group's key and value maps as this head reads them.
+            let shared = match group {
+                Some(g) => groups[g].2.clone(),
+                None => format!("library.l{l}.kv{}", groups.len()),
+            };
+            for (operator, source) in [(format!("{name}.q"), &q), (format!("{shared}.k"), &k), (format!("{shared}.v"), &v)] {
+                let (rows, cols) = (0..source.rows.width(), 0..source.cols.width());
+                owners.push(Owner { operator, rows: rows.clone(), cols: cols.clone(), body: name.clone(), site: name.clone(), native: source.name.clone(), native_rows: rows, native_cols: cols });
+            }
             let pairs: Vec<Vec<usize>> = match rotary {
                 Some(r) => {
                     let pairs = r.pairs();
@@ -399,7 +444,9 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
         }
         planes.extend(groups.into_iter().map(|(_, _, shared, heads, pairs, values)| (l, shared, heads, pairs, values)));
         if let Node::Hadamard { left, right } = native.nodes[layer.active] {
-            artifact = gated_mlp(native, artifact, layer, l, left, right)?;
+            let (built, more) = gated_mlp(native, artifact, layer, l, left, right)?;
+            artifact = built;
+            owners.extend(more);
             continue;
         }
         let Node::Pointwise { input: pre, laws } = &native.nodes[layer.active] else {
@@ -415,6 +462,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
         let down = single_map(native, layer.mlp, layer.active)?;
         let units = up.rows.clone();
         let name = format!("library.l{l}.mlp");
+        owners.extend(mlp_owners(&name, units.width(), &up, up_bias.map(|b| native.operators[b].as_ref()), None, &down));
         let base = artifact.program.operators.len();
         let mut operators = vec![
             library_operator(&format!("{name}.gate"), units.clone(), up.cols.clone(), up.matrix(), &up.name)?,
@@ -494,6 +542,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
         trainable.push(output);
     }
     trainable.sort_unstable();
+    artifact.owners = owners;
     Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0 })
 }
 
@@ -2199,6 +2248,47 @@ mod tests {
             other => panic!("{other:?}"),
         };
         (map(2), map(3))
+    }
+
+    #[test]
+    fn every_parameter_block_names_the_native_parameter_it_replaces_and_survives_the_bytes() {
+        for (native, layers, family, _) in [tiny("library_owners", "gelu_tanh"), tiny_qwen3("library_owners_qwen3")] {
+            let explanation = explanation(&native, &layers).unwrap();
+            let program = &explanation.artifact.program;
+            let owners = &explanation.artifact.owners;
+            for owner in owners {
+                let op = &program.operators[index_of(program, &owner.operator).unwrap()];
+                let source = native.operators.iter().find(|o| o.name == owner.native).expect("a native owner of M");
+                assert!(owner.rows.end <= op.rows.width() && owner.cols.end <= op.cols.width());
+                assert!(owner.native_rows.end <= source.rows.width() && owner.native_cols.end <= source.cols.width());
+                assert_eq!((owner.rows.len(), owner.cols.len()), (owner.native_rows.len(), owner.native_cols.len()));
+                // At the start, P's block is M's block.
+                let (ours, theirs) = (op.matrix(), source.matrix());
+                for (r, nr) in owner.rows.clone().zip(owner.native_rows.clone()) {
+                    for (c, nc) in owner.cols.clone().zip(owner.native_cols.clone()) {
+                        assert_eq!(ours[[r, c]], theirs[[nr, nc]], "{} against {}", owner.operator, owner.native);
+                    }
+                }
+            }
+            // Every trainable entry has an owner.
+            for &op in &explanation.trainable {
+                let name = &program.operators[op].name;
+                let (rows, cols) = (program.operators[op].rows.width(), program.operators[op].cols.width());
+                for r in 0..rows {
+                    for c in 0..cols {
+                        assert!(owners.iter().any(|o| &o.operator == name && o.rows.contains(&r) && o.cols.contains(&c)), "{name} ({r}, {c}) has no owner");
+                    }
+                }
+            }
+            // A key-value group's shared key is owned once per query head reading it.
+            let key_sites: Vec<&str> = owners.iter().filter(|o| o.operator == "library.l0.kv0.k").map(|o| o.site.as_str()).collect();
+            let heads_reading = program.rules.iter().filter(|r| r.name.starts_with("library.l0.h") && r.nodes.iter().any(|n| matches!(n, Node::Affine { terms, .. } if terms.iter().any(|t| program.operators[t.1].name == "library.l0.kv0.k")))).count();
+            assert_eq!(key_sites.len(), heads_reading);
+            let bytes = explanation.artifact.f32_literals().unwrap().to_bytes().unwrap();
+            let decoded = Artifact::from_bytes(&bytes, &native.declarations).unwrap();
+            assert_eq!(&decoded.owners, owners);
+            let _ = family;
+        }
     }
 
     #[test]

@@ -312,7 +312,32 @@ pub struct Artifact {
     pub derived: Vec<Derived>,
     /// Explicitly priced native intervention-response laws; empty retains legacy semantics.
     pub controls: Vec<crate::native_control::UniformScaleBinding>,
+    /// Which native parameter of `M` each block of `P`'s parameters replaces, and where `P` uses it
+    /// ([`Owner`]); empty when `P` records none.
+    pub owners: Vec<Owner>,
 }
+
+/// One block of one of `P`'s operators at one call site, and the native parameter of `M` it
+/// replaces there. A body shared by several call sites keeps one owner per site, each naming its
+/// own native parameter, so an edit of one native parameter translates to that site alone.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Owner {
+    /// `P`'s operator (by name) and the block of its entries.
+    pub operator: String,
+    pub rows: std::ops::Range<usize>,
+    pub cols: std::ops::Range<usize>,
+    /// The rule body whose nodes read the block, and the call site (a block of `P`) using it.
+    pub body: String,
+    pub site: String,
+    /// `M`'s operator (by name) and the block of its entries that the block replaces.
+    pub native: String,
+    pub native_rows: std::ops::Range<usize>,
+    pub native_cols: std::ops::Range<usize>,
+}
+
+/// The envelope of an artifact with an ownership map: this marker, the plain artifact's byte
+/// length and bytes, then the map's JSON length and bytes.
+const OWNED_ENVELOPE: u64 = u64::MAX - 1;
 
 /// Old to new indices of the kept entries (`usize::MAX` for a removed one).
 fn compaction(keep: &[bool]) -> Vec<usize> {
@@ -561,6 +586,7 @@ impl Artifact {
             exceptions: Vec::new(),
             derived: Vec::new(),
             controls: Vec::new(),
+            owners: Vec::new(),
         })
     }
 
@@ -1030,7 +1056,7 @@ impl Artifact {
         });
         let exceptions = self.exceptions.iter().filter_map(|e| at(e.node).map(|node| Exception { node, ..e.clone() })).collect();
         let controls = self.controls.iter().filter_map(|c| at(c.write).map(|write| crate::native_control::UniformScaleBinding { write, ..c.clone() })).filter(|c| blocks.iter().any(|b| b.native_write == c.native_write && b.write == c.write)).collect();
-        let artifact = Self { program, native_nodes: self.native_nodes, blocks, places, exceptions, derived, controls };
+        let artifact = Self { program, native_nodes: self.native_nodes, blocks, places, exceptions, derived, controls, owners: self.owners.clone() };
         artifact.program.interfaces().map_err(|e| format!("{name}: {e}"))?;
         Ok(artifact)
     }
@@ -1237,7 +1263,7 @@ impl Artifact {
         }
         exceptions.retain(|e| e.node != usize::MAX);
         out.interfaces().map_err(|e| e.to_string())?;
-        Ok((Self { program: out, native_nodes: self.native_nodes, blocks: Vec::new(), places: Vec::new(), exceptions, derived: Vec::new(), controls: Vec::new() }, columns, writes))
+        Ok((Self { program: out, native_nodes: self.native_nodes, blocks: Vec::new(), places: Vec::new(), exceptions, derived: Vec::new(), controls: Vec::new(), owners: Vec::new() }, columns, writes))
     }
 
     /// Numeric-free blocks, places, exceptions and derivation structure, excluding
@@ -1506,7 +1532,7 @@ impl Artifact {
         if versioned {
             if used_bodies.len() != bodies.len() { return Err("unused shared matrix-rule body".into()); }
             // Validation uses only this decoded program and explicit bodies.
-            Self { program: program.clone(), native_nodes, blocks: Vec::new(), places: Vec::new(), exceptions: Vec::new(), derived: derived.clone(), controls: Vec::new() }.matrix_rules()?;
+            Self { program: program.clone(), native_nodes, blocks: Vec::new(), places: Vec::new(), exceptions: Vec::new(), derived: derived.clone(), controls: Vec::new(), owners: Vec::new() }.matrix_rules()?;
         }
         let mut controls = Vec::new();
         if version == CONTROL_ARTIFACT_VERSION {
@@ -1529,7 +1555,7 @@ impl Artifact {
         if places.windows(2).any(|w| w[0].0 >= w[1].0) {
             return Err("places out of order".to_string());
         }
-        let artifact = Self { program, native_nodes, blocks, places, exceptions, derived, controls };
+        let artifact = Self { program, native_nodes, blocks, places, exceptions, derived, controls, owners: Vec::new() };
         crate::native_control::validate_shape(&artifact)?;
         Ok(artifact)
     }
@@ -1546,6 +1572,17 @@ impl Artifact {
     }
 
     fn to_bytes_using(&self, cache: Option<&crate::operator_program::NativeOperatorCodec>) -> Result<Vec<u8>, String> {
+        if !self.owners.is_empty() {
+            let plain = Self { owners: Vec::new(), ..self.clone() }.to_bytes_using(cache)?;
+            let map = serde_json::to_vec(&self.owners).map_err(|e| e.to_string())?;
+            let mut out = Vec::with_capacity(24 + plain.len() + map.len());
+            out.extend_from_slice(&OWNED_ENVELOPE.to_le_bytes());
+            out.extend_from_slice(&(plain.len() as u64).to_le_bytes());
+            out.extend_from_slice(&plain);
+            out.extend_from_slice(&(map.len() as u64).to_le_bytes());
+            out.extend_from_slice(&map);
+            return Ok(out);
+        }
         let message = self.encode_using(cache)?;
         let mut out = Vec::with_capacity(8 + message.packed_bytes().len());
         if !self.matrix_rules()?.is_empty() || !self.controls.is_empty() {
@@ -1571,6 +1608,22 @@ impl Artifact {
     fn from_bytes_using(bytes: &[u8], declarations: &Declarations, cache: Option<&crate::operator_program::NativeOperatorCodec>) -> Result<Self, String> {
         let header: [u8; 8] = bytes.get(..8).ok_or("no length header")?.try_into().map_err(|_| "no length header")?;
         let first = u64::from_le_bytes(header);
+        if first == OWNED_ENVELOPE {
+            let word = |at: usize| -> Result<usize, String> {
+                let w: [u8; 8] = bytes.get(at..at + 8).ok_or("a truncated owned artifact")?.try_into().map_err(|_| "a truncated owned artifact")?;
+                usize::try_from(u64::from_le_bytes(w)).map_err(|e| e.to_string())
+            };
+            let plain = word(8)?;
+            let inner = bytes.get(16..16 + plain).ok_or("a truncated owned artifact")?;
+            let map_length = word(16 + plain)?;
+            let map = bytes.get(24 + plain..24 + plain + map_length).ok_or("a truncated ownership map")?;
+            if 24 + plain + map_length != bytes.len() {
+                return Err("bytes after an owned artifact's map".into());
+            }
+            let mut artifact = Self::from_bytes_using(inner, declarations, cache)?;
+            artifact.owners = serde_json::from_slice(map).map_err(|e| e.to_string())?;
+            return Ok(artifact);
+        }
         let (length, offset, version) = if first == VERSIONED_ENVELOPE {
             let version = u64::from_le_bytes(bytes.get(8..16).ok_or("truncated artifact version")?.try_into().map_err(|_| "invalid artifact version")?);
             if version != MATRIX_ARTIFACT_VERSION && version != CONTROL_ARTIFACT_VERSION { return Err(format!("unsupported artifact envelope version {version}")); }

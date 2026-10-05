@@ -37,7 +37,7 @@ use gam_mpd::{
     engine::{log_to_stderr, sha256},
     import::import_language_model,
     interchange::{self, Batch, BlockEngine, Interchange},
-    library_mdl, library_readout,
+    library_mdl,
     operator_program::{Node, OperatorProgram, SlotValues},
     run_check::{layer_nodes, split_sites},
 };
@@ -234,7 +234,7 @@ fn main() -> Result<(), String> {
     let explanation = library_mdl::explanation(&native, &layers)?;
     let posterior = match from.split_once(':') {
         None if from == "native" => library_mdl::Posterior::new(&explanation, 2 * train.len() * settings.context)?,
-        Some(("checkpoint", path)) => library_readout::checkpoint_posterior(&explanation, Path::new(path))?,
+        Some(("checkpoint", path)) => library_mdl::checkpoint_posterior(&explanation, Path::new(path))?,
         _ => return Err(USAGE.into()),
     };
     let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
