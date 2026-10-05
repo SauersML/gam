@@ -147,29 +147,37 @@ impl Compensation {
             Err(GpuError::NoDeviceKernel { .. }) => None,
             Err(e) => return Err(error(e)),
         };
+        // With a float64 device, each MLP's Gram matrix is summed there over every batch (one product
+        // accumulating into it per batch) and read once.
+        let mut sums = match &wide {
+            Some(wide) => mlps.iter().map(|mlp| wide.zeros(mlp.gram.nrows(), mlp.gram.ncols()).map(Some).map_err(error)).collect::<Result<Vec<_>, _>>()?,
+            None => (0..mlps.len()).map(|_| None).collect(),
+        };
         let mut rows = 0;
         for chunk in sequences.chunks(batch) {
             let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
             let trace = program.forward(&family)?;
-            for (mlp, node) in mlps.iter_mut().zip(&nodes) {
+            for ((mlp, node), sum) in mlps.iter_mut().zip(&nodes).zip(&mut sums) {
                 let h = trace.value(*node)?;
-                let gram = match &wide {
-                    Some(wide) => {
-                        let h = wide.convert(h).map_err(error)?;
-                        let mut gram = wide.zeros(h.cols(), h.cols()).map_err(error)?;
-                        wide.gemm(&mut gram, 1.0, &h, Op::T, &h, Op::N, 0.0, Arithmetic::F64).map_err(error)?;
-                        let gram = wide.download(&gram).map_err(error)?;
-                        // The product's two triangles are separate sums; mirror the lower one.
-                        Array2::from_shape_fn(gram.dim(), |(i, j)| if i >= j { gram[[i, j]] } else { gram[[j, i]] })
-                    }
-                    None => fast_ata(&device.download(h).map_err(error)?),
-                };
-                if gram.dim() != mlp.gram.dim() {
+                if h.cols() != mlp.gram.ncols() {
                     return Err(error("activations of another width than the MLP's functions"));
                 }
-                mlp.gram += &gram;
+                match (&wide, sum) {
+                    (Some(wide), Some(sum)) => {
+                        let h = wide.convert(h).map_err(error)?;
+                        wide.gemm(sum, 1.0, &h, Op::T, &h, Op::N, 1.0, Arithmetic::F64).map_err(error)?;
+                    }
+                    _ => mlp.gram += &fast_ata(&device.download(h).map_err(error)?),
+                }
             }
             rows += family.rows;
+        }
+        if let Some(wide) = &wide {
+            for (mlp, sum) in mlps.iter_mut().zip(&sums) {
+                let gram = wide.download(sum.as_ref().ok_or_else(|| error("a Gram sum missing"))?).map_err(error)?;
+                // The product's two triangles are separate sums; mirror the lower one.
+                mlp.gram = Array2::from_shape_fn(gram.dim(), |(i, j)| if i >= j { gram[[i, j]] } else { gram[[j, i]] });
+            }
         }
         Ok(Self { mlps, rows })
     }
