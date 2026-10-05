@@ -135,9 +135,8 @@ fn device_forward_and_kl_match_the_cpu_within_bands() {
     for device in devices() {
         let lowered = DeviceProgram::compile(&device, &program).expect("lowered");
         let trace = lowered.forward(&family).expect("forward");
-        for (n, value) in trace.values.iter().enumerate() {
-            let Some(value) = value else { continue };
-            let got = device.download(value).expect("download");
+        for n in (0..trace.len()).filter(|n| trace.has(*n)) {
+            let got = device.download(trace.value(n).expect("value")).expect("download");
             for ((r, c), a) in got.indexed_iter() {
                 let band = bands[n][[r, c]] + balls[n][r];
                 let gap = (a - cpu.values[n][[r, c]]).abs();
@@ -190,7 +189,7 @@ fn device_reverse_pass_and_tangent_match_the_cpu_within_the_proposal_band() {
         let trace = lowered.forward(&family).expect("forward");
         let target_tensor = device.upload(target.view()).expect("upload");
         let (_, seed) = lowered.kl(&trace, &target_tensor, None).expect("kl");
-        let keep: Vec<usize> = (0..=lowered.hidden()).filter(|n| trace.values[*n].is_some()).collect();
+        let keep: Vec<usize> = (0..=lowered.hidden()).filter(|n| trace.has(*n)).collect();
         let kept = lowered.vjp(&trace, seed, &keep, Arithmetic::F64).expect("vjp");
         for (n, g) in &kept {
             let reference = back[*n].as_ref().expect("the CPU's cotangent reaches it too");

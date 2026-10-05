@@ -25,11 +25,12 @@
 //! low-rank operators, pointwise laws, Hadamard products, RMS norms, attention, and the head.
 //! Any other node refuses the whole program with its reason; its caller then runs on the CPU.
 
+use super::device_heads::{self, Heads, Stacked};
 use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorBody, OperatorProgram, Rotary, SlotValues};
 use gam_gpu::tensor::{Arithmetic, Device, Indices, Op, PointwiseLaw, Tensor};
 use ndarray::{Array1, Array2};
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The largest logits tile the head forms at once, in bytes.
 pub const TILE_BYTES: usize = 1 << 30;
@@ -173,6 +174,32 @@ pub struct DeviceProgram {
     /// The arithmetic of every product in the forward pass and the head (float64 by default; a
     /// training step's proposals may run in TF32, its accepted point is scored again in float64).
     arithmetic: Arithmetic,
+    /// Sibling attention heads run as one computation ([`device_heads`]).
+    fused: Vec<Fused>,
+    /// Per node, the group it is a member or the output of.
+    grouped: Vec<Option<usize>>,
+}
+
+/// A group of sibling heads and its stacked operators.
+struct Fused {
+    heads: Heads,
+    stacked: Arc<Stacked>,
+    /// The host operators the stacked copies were made from, in order (shared by identity with the
+    /// programs compiled from this one).
+    sources: Vec<usize>,
+    /// False once a training step replaces one of its operators: it then runs node by node.
+    live: bool,
+}
+
+/// The identities of the host operators `heads` stacks, in order.
+fn sources(program: &OperatorProgram, heads: &Heads) -> Vec<usize> {
+    let id = |op: usize| Arc::as_ptr(&program.operators[op]) as usize;
+    heads
+        .projection_operators
+        .iter()
+        .flat_map(|(op, bias)| [id(*op), bias.map_or(0, id)])
+        .chain(heads.attends.iter().map(|(_, op)| id(*op)))
+        .collect()
 }
 
 struct PreparedBatch {
@@ -184,10 +211,26 @@ struct PreparedBatch {
     rotations: Arc<Vec<(Rotary, Tensor, Tensor)>>,
 }
 
-/// One forward pass's node values on the device (`None` for features and the head), with the
+/// A node's value in a trace.
+enum Slot {
+    /// No value: a feature, the streamed head, or a node not computed yet.
+    Empty,
+    Value(Tensor),
+    /// Another node's value (an indicator readout of it).
+    Alias(usize),
+    /// Columns `start..start + width` of the trace's buffer `buffer` (a fused group's), copied out
+    /// when first read.
+    Columns { buffer: usize, start: usize, width: usize, copy: OnceLock<Tensor> },
+}
+
+/// One forward pass's node values on the device (none for features and the head), with the
 /// family's blocks and rotation tables.
 pub struct DeviceTrace {
-    pub values: Vec<Option<Tensor>>,
+    slots: Vec<Slot>,
+    /// The fused groups' buffers, and per group the buffers of its `P` and `A` when it ran fused.
+    buffers: Vec<Tensor>,
+    fused: Vec<Option<(usize, usize)>>,
+    device: Device,
     pub rows: usize,
     ids: BTreeMap<usize, Arc<Indices>>,
     /// Sequences (equal row blocks) and their length.
@@ -199,7 +242,68 @@ pub struct DeviceTrace {
 impl DeviceTrace {
     /// Node `n`'s value.
     pub fn value(&self, n: usize) -> Result<&Tensor, String> {
-        self.values.get(n).and_then(Option::as_ref).ok_or_else(|| format!("device: node {n} has no resident value"))
+        match self.slots.get(n) {
+            Some(Slot::Value(t)) => Ok(t),
+            Some(Slot::Alias(m)) => self.value(*m),
+            Some(Slot::Columns { buffer, start, width, copy }) => match copy.get() {
+                Some(t) => Ok(t),
+                None => {
+                    let t = self.device.columns_of(&self.buffers[*buffer], *start..*start + *width).map_err(error)?;
+                    Ok(copy.get_or_init(|| t))
+                }
+            },
+            _ => Err(format!("device: node {n} has no resident value")),
+        }
+    }
+
+    /// Whether node `n` has a value.
+    #[must_use]
+    pub fn has(&self, n: usize) -> bool {
+        !matches!(self.slots.get(n), None | Some(Slot::Empty))
+    }
+
+    /// The program's node count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Node `n`'s value to change in place (made the node's own first when it is another node's
+    /// value or a block of a fused buffer).
+    pub fn value_mut(&mut self, n: usize) -> Result<&mut Tensor, String> {
+        // Nodes reading this value as their own keep it as it is now.
+        for reader in 0..self.slots.len() {
+            if matches!(self.slots[reader], Slot::Alias(m) if m == n) {
+                let own = self.device.copy(self.value(n)?).map_err(error)?;
+                self.slots[reader] = Slot::Value(own);
+            }
+        }
+        if !matches!(self.slots.get(n), Some(Slot::Value(_))) {
+            let own = self.device.copy(self.value(n)?).map_err(error)?;
+            self.slots[n] = Slot::Value(own);
+        }
+        match self.slots.get_mut(n) {
+            Some(Slot::Value(t)) => Ok(t),
+            _ => Err(format!("device: node {n} has no resident value")),
+        }
+    }
+
+    /// Node `n`'s value moved out of the trace, or a copy of it when another node reads it as its
+    /// own or it is a block of a fused buffer.
+    pub fn take(&mut self, n: usize) -> Result<Tensor, String> {
+        let aliased = self.slots.iter().any(|s| matches!(s, Slot::Alias(m) if *m == n));
+        match self.slots.get_mut(n) {
+            Some(slot @ Slot::Value(_)) if !aliased => match std::mem::replace(slot, Slot::Empty) {
+                Slot::Value(t) => Ok(t),
+                _ => Err(format!("device: node {n} has no resident value")),
+            },
+            _ => self.device.copy(self.value(n)?).map_err(error),
+        }
     }
 }
 
@@ -209,6 +313,31 @@ fn ensure<'a>(d: &Device, out: &'a mut Option<Tensor>, rows: usize, width: usize
         *out = Some(d.zeros(rows, width).map_err(error)?);
     }
     out.as_mut().ok_or_else(|| "device: tangent slot".to_string())
+}
+
+/// The nodes whose values a forward pass offers its hooks.
+#[derive(Clone, Copy)]
+enum Hooked<'a> {
+    Nowhere,
+    Everywhere,
+    At(&'a BTreeSet<usize>),
+}
+
+impl Hooked<'_> {
+    fn at(&self, node: usize) -> bool {
+        match self {
+            Hooked::Nowhere => false,
+            Hooked::Everywhere => true,
+            Hooked::At(nodes) => nodes.contains(&node),
+        }
+    }
+}
+
+/// The rotation tables of `rotary` among a trace's, with its pairing.
+fn turn(rotations: &[(Rotary, Tensor, Tensor)], rotary: Option<Rotary>) -> Result<device_heads::Turn<'_>, String> {
+    rotary
+        .map(|r| rotations.iter().find(|(x, _, _)| *x == r).map(|(_, c, s)| (c, s, r.half_split)).ok_or_else(|| "device: no rotation table".to_string()))
+        .transpose()
 }
 
 fn rotations_of(trace: &DeviceTrace, rotary: Rotary) -> Result<(&Tensor, &Tensor), String> {
@@ -267,6 +396,11 @@ impl DeviceProgram {
                 Held::LowRank(a, b) => a.len().checked_add(b.len()).ok_or("operator size overflow")?,
             };
             total = total.checked_add(count.checked_mul(8).ok_or("operator byte overflow")?).ok_or("operator byte overflow")?;
+        }
+        for group in &self.fused {
+            if seen.insert(Arc::as_ptr(&group.stacked) as usize) {
+                total = total.checked_add(group.stacked.len().checked_mul(8).ok_or("operator byte overflow")?).ok_or("operator byte overflow")?;
+            }
         }
         Ok(total)
     }
@@ -375,6 +509,7 @@ impl DeviceProgram {
             };
             steps.push(step);
         }
+        let groups = device_heads::find(program, &readers, &widths, &head_nodes);
         // `from`'s operators by their source and role.
         let held_by: BTreeMap<(usize, Role), &Arc<Held>> =
             from.map(|f| f.operators.iter().filter(|(_, h)| h.source_matches)
@@ -394,6 +529,12 @@ impl DeviceProgram {
                 };
                 total = total.checked_add(count.checked_mul(8).ok_or("operator byte overflow")?).ok_or("operator byte overflow")?;
             }
+            for heads in &groups {
+                let (input, output) = (widths[heads.input], widths[heads.output]);
+                let biased = heads.projection_operators.iter().any(|(_, b)| b.is_some());
+                let count = heads.columns().checked_mul(input + usize::from(biased)).and_then(|n| n.checked_add(output.checked_mul(heads.heads * heads.width)?)).ok_or("operator size overflow")?;
+                total = total.checked_add(count.checked_mul(8).ok_or("operator byte overflow")?).ok_or("operator byte overflow")?;
+            }
             if total > limit { return Err(format!("operator numeric buffers {total} exceed declared source limit {limit}; excludes indices/activations/workspaces/allocator/host")); }
         }
         let mut operators = BTreeMap::new();
@@ -408,7 +549,35 @@ impl DeviceProgram {
             };
             operators.insert(key, HeldOperator { source, source_matches: true, held });
         }
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), arithmetic: Arithmetic::F64 })
+        let mut grouped = vec![None; program.nodes.len()];
+        let mut fused = Vec::with_capacity(groups.len());
+        for heads in groups {
+            for node in heads.members().chain([heads.output]) {
+                grouped[node] = Some(fused.len());
+            }
+            let sources = sources(program, &heads);
+            let stacked = match from.and_then(|f| f.fused.iter().find(|g| g.live && g.sources == sources)) {
+                Some(shared) => Arc::clone(&shared.stacked),
+                None => Arc::new(Stacked::upload(device, program, &heads).map_err(error)?),
+            };
+            fused.push(Fused { heads, stacked, sources, live: true });
+        }
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), arithmetic: Arithmetic::F64, fused, grouped })
+    }
+
+    /// Run every group reading operator `op` node by node from now on (its stacked copy is stale).
+    fn dissolve(&mut self, op: usize) {
+        for group in &mut self.fused {
+            if group.heads.operators().contains(&op) {
+                group.live = false;
+            }
+        }
+    }
+
+    /// The number of sibling-head groups that run as one computation.
+    #[must_use]
+    pub fn fused_groups(&self) -> usize {
+        self.fused.iter().filter(|g| g.live).count()
     }
 
     fn head_of(program: &OperatorProgram) -> Result<Head, String> {
@@ -476,6 +645,7 @@ impl DeviceProgram {
         if self.operators.contains_key(&(op, Role::Column)) {
             return Err(format!("device: operator {op} also has column uses; use replace_dense_parameter"));
         }
+        self.dissolve(op);
         let held = self.operators.get_mut(&(op, Role::Product))
             .ok_or_else(|| format!("device: operator {op} is not held dense"))?;
         match Arc::get_mut(&mut held.held) {
@@ -541,6 +711,7 @@ impl DeviceProgram {
         if value.dim() != (source.rows.width(), source.cols.width()) {
             return Err("device: replacement parameter shape mismatch".into());
         }
+        self.dissolve(op);
         let column = if self.operators.contains_key(&(op, Role::Column)) {
             if value.cols() != 1 { return Err("device: column parameter is not one column".into()); }
             Some(self.device.copy(&value).map_err(error)?.reshape(1, value.rows()).map_err(error)?)
@@ -588,12 +759,17 @@ impl DeviceProgram {
 
     /// Re-upload every operator `program` now holds a different copy of (a stepped library).
     pub fn refresh(&mut self, program: &OperatorProgram) -> Result<(), String> {
+        let mut changed = BTreeSet::new();
         for ((op, role), held) in &mut self.operators {
             if !held.source_matches || !Arc::ptr_eq(&held.source, &program.operators[*op]) {
                 held.source = Arc::clone(&program.operators[*op]);
                 held.held = Arc::new(hold(&self.device, &held.source, *role)?);
                 held.source_matches = true;
+                changed.insert(*op);
             }
+        }
+        for op in changed {
+            self.dissolve(op);
         }
         Ok(())
     }
@@ -757,7 +933,7 @@ impl DeviceProgram {
         gated: &[(usize, usize)],
         decide: impl FnMut(usize, &DeviceTrace) -> Result<Tensor, String>,
     ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(family, given, gated, decide, false, |_, _| Ok(()), |_, _| Ok(None))
+        self.forward_hooks(family, given, gated, decide, false, Hooked::Nowhere, |_, _| Ok(()), |_, _| Ok(None))
     }
 
     /// Per-node edits on materialized values, preserving exception-before-intervention order.
@@ -769,7 +945,7 @@ impl DeviceProgram {
         before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
         edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(family, given, &[], |_, _| Err("no gate".into()), true, before, edit)
+        self.forward_hooks(family, given, &[], |_, _| Err("no gate".into()), true, Hooked::Everywhere, before, edit)
     }
 
     /// Edited intermediate states with the streamed dense head left unmaterialized.
@@ -780,7 +956,22 @@ impl DeviceProgram {
         before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
         edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
-        self.forward_hooks(family, BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, before, edit)
+        self.forward_hooks(family, BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, Hooked::Everywhere, before, edit)
+    }
+
+    /// [`Self::forward_edited`] (`materialize_heads`) or [`Self::forward_edited_intermediates`]
+    /// offering both hooks only the nodes in `at`: every other node's value is left as computed, so
+    /// sibling heads none of whose nodes is in `at` run as one computation ([`device_heads`]).
+    pub fn forward_edited_at(
+        &self,
+        family: &FamilyInputs,
+        given: BTreeMap<usize, Tensor>,
+        at: &BTreeSet<usize>,
+        materialize_heads: bool,
+        before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
+        edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
+    ) -> Result<DeviceTrace, String> {
+        self.forward_hooks(family, given, &[], |_, _| Err("no gate".into()), materialize_heads, Hooked::At(at), before, edit)
     }
 
     pub fn is_streamed_head(&self, node: usize) -> bool {
@@ -794,6 +985,7 @@ impl DeviceProgram {
         gated: &[(usize, usize)],
         mut decide: impl FnMut(usize, &DeviceTrace) -> Result<Tensor, String>,
         materialize_heads: bool,
+        hooked: Hooked<'_>,
         mut before: impl FnMut(usize, &mut Tensor) -> Result<(), String>,
         mut edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
@@ -809,121 +1001,190 @@ impl DeviceProgram {
             }
         }
         let batch = self.prepared_batch(family)?;
+        // A group runs fused unless a hook or a gate may change one of its nodes, or its sequences
+        // are long enough for the tiled attention.
+        let tiled = Self::tiled(rows, batch.blocks);
+        let fusing: Vec<bool> = self
+            .fused
+            .iter()
+            .map(|g| g.live && !tiled && g.heads.members().all(|m| !hooked.at(m) && !gated.iter().any(|&(a, k)| a == m || k == m)))
+            .collect();
         let mut trace = DeviceTrace {
-            values: Vec::with_capacity(self.steps.len()),
+            slots: (0..self.steps.len()).map(|_| Slot::Empty).collect(),
+            buffers: Vec::new(),
+            fused: vec![None; self.fused.len()],
+            device: d.clone(),
             rows,
             ids: batch.ids.clone(),
             blocks: batch.blocks,
             rotations: Arc::clone(&batch.rotations),
         };
         for (index, step) in self.steps.iter().enumerate() {
+            let group = self.grouped[index].filter(|g| fusing[*g]);
+            if let Some(g) = group
+                && index != self.fused[g].heads.output
+            {
+                if index == self.fused[g].heads.first() {
+                    self.run_heads(&mut trace, g)?;
+                }
+                continue;
+            }
             let width = self.widths[index];
-            let value = match step {
-                Step::Head if materialize_heads => Some(match self.edited_head_nodes.get(&index) {
-                    Some(Some(input)) => d.copy(trace.value(*input)?).map_err(error)?,
-                    Some(None) => self.logits_on_device(&trace)?,
+            let hook = hooked.at(index);
+            let value = |t: Tensor| Slot::Value(t);
+            let mut slot = if let Some(g) = group {
+                value(self.heads_output(&trace, g)?)
+            } else { match step {
+                Step::Head if materialize_heads => match self.edited_head_nodes.get(&index) {
+                    Some(Some(input)) if !hook => Slot::Alias(*input),
+                    Some(Some(input)) => value(d.copy(trace.value(*input)?).map_err(error)?),
+                    Some(None) => value(self.logits_on_device(&trace)?),
                     None => return Err(format!("device: missing edited head node {index}")),
-                }),
-                Step::Head => None,
-                Step::Feature { .. } => None,
+                },
+                Step::Head => Slot::Empty,
+                Step::Feature { .. } => Slot::Empty,
                 // A gated mask is filled once its amplitude is known.
-                Step::Raw { .. } if gated.iter().any(|(_, mask)| *mask == index) => None,
+                Step::Raw { .. } if gated.iter().any(|(_, mask)| *mask == index) => Slot::Empty,
                 Step::Raw { slot } => match given.remove(slot) {
-                    Some(value) if value.dim() == (rows, width) => Some(value),
-                    Some(value) => {
-                        return Err(format!("device: a {:?} value for slot {slot} of {rows} × {width}", value.dim()));
+                    Some(given) if given.dim() == (rows, width) => value(given),
+                    Some(given) => {
+                        return Err(format!("device: a {:?} value for slot {slot} of {rows} × {width}", given.dim()));
                     }
                     None => {
                         let SlotValues::Raw(values) = &family.slots[*slot] else {
                             return Err(format!("device: slot {slot} holds no raw rows"));
                         };
-                        Some(d.upload(values.view()).map_err(error)?)
+                        value(d.upload(values.view()).map_err(error)?)
                     }
                 },
-                Step::Constant { operator } => Some(d.broadcast_rows(self.column(*operator)?, rows).map_err(error)?),
+                Step::Constant { operator } => value(d.broadcast_rows(self.column(*operator)?, rows).map_err(error)?),
                 Step::Affine { terms, bias } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
                     for (argument, operator) in terms {
-                        if let Step::Feature { slot } = &self.steps[*argument] {
-                            let Held::Table(table) = self.held(*operator, Role::Table)? else {
-                                return Err("device: an operator held in the wrong role".to_string());
-                            };
-                            let ids = trace.ids.get(slot).ok_or("device: feature ids missing")?;
-                            let gathered = d.gather_rows(table, ids).map_err(error)?;
-                            d.axpy(&mut out, 1.0, &gathered).map_err(error)?;
-                        } else {
-                            self.add_product(&mut out, trace.value(*argument)?, *operator, false, self.arithmetic)?;
-                        }
+                        self.add_term(&mut out, &trace, *argument, *operator)?;
                     }
                     if let Some(b) = bias {
                         d.add_row(&mut out, 1.0, self.column(*b)?).map_err(error)?;
                     }
-                    Some(out)
+                    value(out)
                 }
-                Step::Pointwise { input, codes } => Some(d.law_values(trace.value(*input)?, codes, gelu_tanh_constant()).map_err(error)?),
+                Step::Pointwise { input, codes } => value(d.law_values(trace.value(*input)?, codes, gelu_tanh_constant()).map_err(error)?),
                 Step::Gain { input, factor } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
                     d.axpy(&mut out, *factor, trace.value(*input)?).map_err(error)?;
-                    Some(out)
+                    value(out)
                 }
                 Step::Hadamard { left, right } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
                     d.hadamard(&mut out, trace.value(*left)?, trace.value(*right)?, false).map_err(error)?;
-                    Some(out)
+                    value(out)
                 }
-                Step::RmsNorm { input, epsilon } => Some(d.rms_norm(trace.value(*input)?, *epsilon).map_err(error)?),
-                Step::Attend { query, key, value, scale, rotary, causal } => {
+                Step::RmsNorm { input, epsilon } => value(d.rms_norm(trace.value(*input)?, *epsilon).map_err(error)?),
+                Step::Attend { query, key, value: v, scale, rotary, causal } => {
                     let (q, k) = self.rotated(&trace, *query, *key, *rotary)?;
-                    let v = trace.value(*value)?;
-                    if Self::tile_attention(&trace) {
-                        Some(super::device_attention::forward(d, (&q, &k, v), trace.blocks, *scale, *causal, self.arithmetic).map_err(error)?)
+                    let v = trace.value(*v)?;
+                    if tiled {
+                        value(super::device_attention::forward(d, (&q, &k, v), trace.blocks, *scale, *causal, self.arithmetic).map_err(error)?)
                     } else {
                         let alpha = self.attention(&trace, &q, &k, *scale, *causal)?;
                         let mut out = d.zeros(rows, v.cols()).map_err(error)?;
                         d.gemm_batched(trace.blocks, &mut out, 1.0, &alpha, Op::N, v, Op::N, 0.0, self.arithmetic).map_err(error)?;
-                        Some(out)
+                        value(out)
                     }
                 }
-                Step::Readout { input } => Some(d.copy(trace.value(*input)?).map_err(error)?),
+                // An indicator readout is its input's value; a hook may change it, so it gets its own.
+                Step::Readout { input } if !hook => Slot::Alias(*input),
+                Step::Readout { input } => value(d.copy(trace.value(*input)?).map_err(error)?),
                 Step::Concat { parts } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
                     let mut start = 0;
                     for &part in parts {
-                        let value = trace.value(part)?;
-                        d.set_columns(&mut out, start, value).map_err(error)?;
-                        start += value.cols();
+                        let part = trace.value(part)?;
+                        d.set_columns(&mut out, start, part).map_err(error)?;
+                        start += part.cols();
                     }
-                    Some(out)
+                    value(out)
                 }
                 Step::Transposed { input, operator } => {
                     let mut out = d.zeros(rows, width).map_err(error)?;
                     self.add_product(&mut out, trace.value(*input)?, *operator, true, self.arithmetic)?;
-                    Some(out)
+                    value(out)
                 }
-            };
-            let mut value = value;
-            if let Some(value) = &mut value {
+            }};
+            if hook && let Slot::Value(value) = &mut slot {
                 before(index, value)?;
             }
-            trace.values.push(value);
-            if let Some(replacement) = edit(index, &trace)? {
-                if trace.values[index].is_none() {
+            trace.slots[index] = slot;
+            if hook && let Some(replacement) = edit(index, &trace)? {
+                if !trace.has(index) {
                     return Err(format!("device: edit of unmaterialized node {index} is unsupported"));
                 }
                 if replacement.dim() != (rows, width) {
                     return Err(format!("device: edited node {index} has {:?}, expected {rows} x {width}", replacement.dim()));
                 }
-                trace.values[index] = Some(replacement);
+                trace.slots[index] = Slot::Value(replacement);
             }
             if let Some(&(_, mask)) = gated.iter().find(|(amplitude, _)| *amplitude == index) {
                 let decided = decide(index, &trace)?;
                 if decided.dim() != (rows, self.widths[mask]) {
                     return Err(format!("device: a {:?} mask for gate {index} of {rows} × {}", decided.dim(), self.widths[mask]));
                 }
-                trace.values[mask] = Some(decided);
+                trace.slots[mask] = Slot::Value(decided);
             }
         }
         Ok(trace)
+    }
+
+    /// `out ← out + x op(A)` for the affine term `(argument, operator)`: a gather of the operator's
+    /// columns when `argument` is a one-hot feature.
+    fn add_term(&self, out: &mut Tensor, trace: &DeviceTrace, argument: usize, operator: usize) -> Result<(), String> {
+        let d = &self.device;
+        if let Step::Feature { slot } = &self.steps[argument] {
+            let Held::Table(table) = self.held(operator, Role::Table)? else {
+                return Err("device: an operator held in the wrong role".to_string());
+            };
+            let ids = trace.ids.get(slot).ok_or("device: feature ids missing")?;
+            let gathered = d.gather_rows(table, ids).map_err(error)?;
+            d.axpy(out, 1.0, &gathered).map_err(error)
+        } else {
+            self.add_product(out, trace.value(argument)?, operator, false, self.arithmetic)
+        }
+    }
+
+    /// Group `g`'s heads (module note of [`device_heads`]): `P` and `A` into the trace's buffers,
+    /// every member's value a block of them.
+    fn run_heads(&self, trace: &mut DeviceTrace, g: usize) -> Result<(), String> {
+        let group = &self.fused[g];
+        let heads = &group.heads;
+        let rotations = Arc::clone(&trace.rotations);
+        let turn = turn(&rotations, heads.rotary)?;
+        let (p, a) = device_heads::forward(&self.device, heads, &group.stacked, trace.value(heads.input)?, trace.blocks, turn, self.arithmetic).map_err(error)?;
+        let (pi, ai) = (trace.buffers.len(), trace.buffers.len() + 1);
+        trace.buffers.extend([p, a]);
+        for node in heads.members() {
+            if let Some((read, start)) = heads.block(node) {
+                trace.slots[node] = Slot::Columns { buffer: if read { ai } else { pi }, start, width: heads.width, copy: OnceLock::new() };
+            }
+        }
+        trace.fused[g] = Some((pi, ai));
+        Ok(())
+    }
+
+    /// Group `g`'s output node: its other terms, `A Oᵀ` and its bias.
+    fn heads_output(&self, trace: &DeviceTrace, g: usize) -> Result<Tensor, String> {
+        let d = &self.device;
+        let group = &self.fused[g];
+        let heads = &group.heads;
+        let (_, a) = trace.fused[g].ok_or("device: a fused output before its heads")?;
+        let mut out = d.zeros(trace.rows, self.widths[heads.output]).map_err(error)?;
+        for (argument, operator) in &heads.rest {
+            self.add_term(&mut out, trace, *argument, *operator)?;
+        }
+        d.gemm(&mut out, 1.0, &trace.buffers[a], Op::N, &group.stacked.reads, Op::T, 1.0, self.arithmetic).map_err(error)?;
+        if let Some(b) = heads.bias {
+            d.add_row(&mut out, 1.0, self.column(b)?).map_err(error)?;
+        }
+        Ok(out)
     }
 
     /// The query and key of an attend node turned to their positions.
@@ -939,10 +1200,15 @@ impl DeviceProgram {
         }
     }
 
-    /// The attention weights `softmax(c q kᵀ)` of every block (`blocks · L × L`).
+    /// Whether the attention of `blocks` sequences in `rows` runs in query tiles
+    /// ([`super::device_attention`]) rather than with every block's weights at once.
+    fn tiled(rows: usize, blocks: usize) -> bool {
+        let length = rows / blocks;
+        length > 1024 || rows.saturating_mul(length) > 8 * 1024 * 1024
+    }
+
     fn tile_attention(trace: &DeviceTrace) -> bool {
-        let length = trace.rows / trace.blocks;
-        length > 1024 || trace.rows.saturating_mul(length) > 8 * 1024 * 1024
+        Self::tiled(trace.rows, trace.blocks)
     }
 
     fn attention(&self, trace: &DeviceTrace, q: &Tensor, k: &Tensor, scale: f64, causal: bool) -> Result<Tensor, String> {
@@ -1175,6 +1441,13 @@ impl DeviceProgram {
             return Ok(BTreeMap::new());
         };
         let d = &self.device;
+        // A group that ran fused reverses fused unless a cotangent is wanted or seeded inside it.
+        let fused: Vec<bool> = self
+            .fused
+            .iter()
+            .enumerate()
+            .map(|(i, f)| f.live && trace.fused.get(i).is_some_and(Option::is_some) && f.heads.members().all(|m| !keep.contains(&m) && !seeds.contains_key(&m)))
+            .collect();
         let mut g: Vec<Option<Tensor>> = (0..self.steps.len()).map(|_| None).collect();
         for (node, term) in seeds {
             g[node] = Some(term);
@@ -1202,6 +1475,13 @@ impl DeviceProgram {
                 kept.insert(index, cot);
                 break;
             }
+            if let Some(group) = self.grouped[index].filter(|f| fused[*f] && self.fused[*f].heads.output == index) {
+                self.heads_reverse(trace, group, &cot, &mut g, arithmetic)?;
+                if keep.contains(&index) {
+                    kept.insert(index, cot);
+                }
+                continue;
+            }
             match &self.steps[index] {
                 Step::Concat { parts } => {
                     let mut column = 0usize;
@@ -1222,33 +1502,7 @@ impl DeviceProgram {
                 Step::Head | Step::Feature { .. } | Step::Raw { .. } | Step::Constant { .. } => {}
                 Step::Affine { terms, .. } => {
                     for (argument, operator) in terms {
-                        if matches!(self.steps[*argument], Step::Feature { .. }) {
-                            continue;
-                        }
-                        slot(&mut g, *argument, trace.rows)?;
-                        let target = g[*argument].as_mut().ok_or("device: cotangent slot")?;
-                        match self.held(*operator, Role::Product)? {
-                            Held::Identity => d.axpy(target, 1.0, &cot).map_err(error)?,
-                            Held::Diagonal(diag) => {
-                                d.scale_columns(target, &cot, diag, true).map_err(error)?
-                            }
-                            Held::Dense(a) => d
-                                .gemm(target, 1.0, &cot, Op::N, a, Op::N, 1.0, arithmetic)
-                                .map_err(error)?,
-                            Held::LowRank(left, right) => {
-                                // g (L R) = (g L) R.
-                                let mut middle = d.zeros(cot.rows(), left.cols()).map_err(error)?;
-                                d.gemm(&mut middle, 1.0, &cot, Op::N, left, Op::N, 0.0, arithmetic)
-                                    .map_err(error)?;
-                                d.gemm(target, 1.0, &middle, Op::N, right, Op::N, 1.0, arithmetic)
-                                    .map_err(error)?;
-                            }
-                            Held::Table(_) | Held::Column(_) => {
-                                return Err(
-                                    "device: an operator held in the wrong role".to_string()
-                                );
-                            }
-                        }
+                        self.pull_term(&mut g, trace.rows, &cot, *argument, *operator, arithmetic)?;
                     }
                 }
                 Step::Transposed { input, operator } => {
@@ -1314,6 +1568,53 @@ impl DeviceProgram {
             }
         }
         Ok(kept)
+    }
+
+    /// `g[argument] ← g[argument] + cot · ∂(x op(A)ᵀ)/∂x` for the affine term `(argument, operator)`
+    /// (nothing for a one-hot feature).
+    fn pull_term(&self, g: &mut [Option<Tensor>], rows: usize, cot: &Tensor, argument: usize, operator: usize, arithmetic: Arithmetic) -> Result<(), String> {
+        let d = &self.device;
+        if matches!(self.steps[argument], Step::Feature { .. }) {
+            return Ok(());
+        }
+        if g[argument].is_none() {
+            g[argument] = Some(d.zeros(rows, self.widths[argument]).map_err(error)?);
+        }
+        let target = g[argument].as_mut().ok_or("device: cotangent slot")?;
+        match self.held(operator, Role::Product)? {
+            Held::Identity => d.axpy(target, 1.0, cot).map_err(error),
+            Held::Diagonal(diag) => d.scale_columns(target, cot, diag, true).map_err(error),
+            Held::Dense(a) => d.gemm(target, 1.0, cot, Op::N, a, Op::N, 1.0, arithmetic).map_err(error),
+            Held::LowRank(left, right) => {
+                // g (L R) = (g L) R.
+                let mut middle = d.zeros(cot.rows(), left.cols()).map_err(error)?;
+                d.gemm(&mut middle, 1.0, cot, Op::N, left, Op::N, 0.0, arithmetic).map_err(error)?;
+                d.gemm(target, 1.0, &middle, Op::N, right, Op::N, 1.0, arithmetic).map_err(error)
+            }
+            Held::Table(_) | Held::Column(_) => Err("device: an operator held in the wrong role".to_string()),
+        }
+    }
+
+    /// Group `g`'s reverse rule from its output node's cotangent `cot`: the other terms as an
+    /// affine node's, then `A`'s cotangent `cot O`, the heads backwards to `P`'s, and the input's
+    /// `g_P W`.
+    fn heads_reverse(&self, trace: &DeviceTrace, g: usize, cot: &Tensor, grads: &mut [Option<Tensor>], arithmetic: Arithmetic) -> Result<(), String> {
+        let d = &self.device;
+        let group = &self.fused[g];
+        let heads = &group.heads;
+        let (p, _) = trace.fused[g].ok_or("device: a fused reverse without its forward")?;
+        for (argument, operator) in &heads.rest {
+            self.pull_term(grads, trace.rows, cot, *argument, *operator, arithmetic)?;
+        }
+        let mut g_a = d.zeros(trace.rows, heads.heads * heads.width).map_err(error)?;
+        d.gemm(&mut g_a, 1.0, cot, Op::N, &group.stacked.reads, Op::N, 0.0, arithmetic).map_err(error)?;
+        let turn = turn(&trace.rotations, heads.rotary)?;
+        let g_p = device_heads::backward(d, heads, &trace.buffers[p], &g_a, trace.blocks, turn, (self.arithmetic, arithmetic)).map_err(error)?;
+        if grads[heads.input].is_none() {
+            grads[heads.input] = Some(d.zeros(trace.rows, self.widths[heads.input]).map_err(error)?);
+        }
+        let target = grads[heads.input].as_mut().ok_or("device: cotangent slot")?;
+        d.gemm(target, 1.0, &g_p, Op::N, &group.stacked.weights, Op::N, 1.0, arithmetic).map_err(error)
     }
 
     /// Resident cotangents for explicitly trainable dense operators, including

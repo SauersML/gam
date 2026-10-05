@@ -37,6 +37,7 @@ pub mod attention;
 mod tiled_attention;
 pub mod query_transition;
 mod device_attention;
+mod device_heads;
 
 // Native linear reads and RMSNorm evaluations with forward-error radii.
 pub mod block;
