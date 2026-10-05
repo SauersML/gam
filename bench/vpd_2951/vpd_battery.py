@@ -372,6 +372,52 @@ def complement_every_block(runner: Runner, bases: Tensor, sources: Tensor) -> di
     return {"per_source_mean_kl_nats": (sums / counts).tolist(), "all_sources": summary(tokens)}
 
 
+@torch.no_grad()
+def cancellation(runner: Runner, bases: Tensor) -> dict:
+    """Why VPD's layer errors cancel (CI masks, delta excluded). Layer l's dropped part on a stream
+    x entering it is c_l(x) = M's layer increment minus the masked layer's increment. Per pair
+    (l, 3), per token: (i) the cosine at the final residual between D_l and D_3, the deviations from
+    masking layer l alone and layer 3 alone; (ii) r = |c_3(x without c_l) - c_3(x)| / |c_3(x)|, with
+    x without c_l the stream entering layer 3 when layer l alone is masked, and the cosine between
+    that change of c_3 and -D_l."""
+    vpd, t = runner.vpd, runner.t
+    L = t.n_layer
+    zero = lambda g: {n: torch.zeros(v.shape[:-1], device=DEVICE) for n, v in g.items()}
+    cos = lambda a, b: (a * b).sum(-1) / (a.norm(dim=-1) * b.norm(dim=-1)).clamp(min=1e-30)
+    out = {l: {"cos_D": [], "r": [], "cos_change_minus_D": [], "cos_c3_D": []} for l in range(L - 1)}
+    for b0 in range(0, bases.shape[0], MB):
+        b = bases[b0:b0 + MB].to(DEVICE)
+        _, g = vpd.target_and_ci(b)
+        z = zero(g)
+
+        def run(masked: set[int]):
+            x = t.wte[b]
+            entering = None
+            for i in range(L):
+                if i == L - 1:
+                    entering = x
+                x = runner.layer(x, i, g if i in masked else None, z)
+            return x, entering
+
+        def dropped(x):
+            return runner.layer(x, L - 1, None, None) - runner.layer(x, L - 1, g, z)
+
+        m_final, m_entering = run(set())
+        d3 = run({L - 1})[0] - m_final
+        c3 = dropped(m_entering)
+        for l in range(L - 1):
+            final_l, entering_l = run({l})
+            dl = final_l - m_final
+            change = dropped(entering_l) - c3
+            out[l]["cos_D"].append(cos(dl, d3))
+            out[l]["r"].append(change.norm(dim=-1) / c3.norm(dim=-1).clamp(min=1e-30))
+            out[l]["cos_change_minus_D"].append(cos(change, -dl))
+            out[l]["cos_c3_D"].append(cos(c3, dl))
+        del g, z
+        torch.mps.empty_cache()
+    return {f"pair_{l}_{L - 1}": {k: summary(v) for k, v in d.items()} for l, d in out.items()}
+
+
 def pgd_shared(runner: Runner, ids: Tensor, steps: int, step_size: float = 0.1, seed: int = 0) -> dict:
     """VPD's eval PGDReconLoss: one source vector per site (and its delta coordinate) shared across
     the batch and every position, random init, `steps` sign-gradient ascent steps of `step_size` on
@@ -435,6 +481,13 @@ def main():
         result = {"held_out_rows": [first, end], "source_rows": [s_first, s_end], "units": "KL(M_e || E_e) per token in nats",
                   "interchange": interchange(Runner(vpd), val_tokens(end - first, offset=first), val_tokens(s_end - s_first, offset=s_first), seed=first)}
         json.dump(result, open(out_path, "w"), indent=1)
+        return
+    if sys.argv[2] == "cancellation":
+        # vpd_battery.py OUT.json cancellation FIRST:END
+        first, end = map(int, sys.argv[3].split(":"))
+        vpd = load_vpd(load_target(DEVICE), DEVICE)
+        json.dump({"held_out_rows": [first, end], "cancellation": cancellation(Runner(vpd), val_tokens(end - first, offset=first))},
+                  open(out_path, "w"), indent=1)
         return
     if sys.argv[2] == "complement_every_block":
         # vpd_battery.py OUT.json complement_every_block FIRST:END SOURCE_FIRST:SOURCE_END
