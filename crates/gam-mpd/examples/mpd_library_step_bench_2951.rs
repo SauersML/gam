@@ -24,6 +24,7 @@
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     artifact::Artifact,
+    decoder::Decoder,
     device_posterior::{DevicePosterior, Ivon, Parts},
     device_program::DeviceProgram,
     engine::log_to_stderr,
@@ -117,18 +118,22 @@ fn medians(seconds: &BTreeMap<&'static str, Vec<f64>>) -> Value {
 
 fn main() -> Result<(), String> {
     log_to_stderr();
-    // `products=f32|tf32|bf16` (f32 by default) sets the arithmetic of both programs' products.
+    // `products=f32|tf32|bf16` (f32 by default) sets the arithmetic of both programs' products;
+    // `engine=decoder` runs the experiments' blocks on the fixed decoder computations
+    // (`gam_mpd::decoder`, bfloat16 products) instead of the programs.
     let (settings, args): (Vec<String>, Vec<String>) = std::env::args().skip(1).partition(|a| a.contains('='));
-    let mut products = gam_gpu::tensor::Arithmetic::F32;
+    let (mut products, mut fixed) = (gam_gpu::tensor::Arithmetic::F32, false);
     for setting in &settings {
         match setting.as_str() {
             "products=f32" => products = gam_gpu::tensor::Arithmetic::F32,
             "products=tf32" => products = gam_gpu::tensor::Arithmetic::Tf32,
             "products=bf16" => products = gam_gpu::tensor::Arithmetic::Bf16,
+            "engine=program" => fixed = false,
+            "engine=decoder" => fixed = true,
             other => return Err(format!("unknown setting {other}")),
         }
     }
-    let usage = "MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS [LAYERS]] [products=f32|tf32|bf16]";
+    let usage = "MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS [LAYERS]] [products=f32|tf32|bf16] [engine=program|decoder]";
     let (model, rest) = args.split_first().ok_or(usage)?;
     let [sequences, context, reps, out, windows @ ..] = rest else {
         return Err(usage.into());
@@ -213,7 +218,7 @@ fn main() -> Result<(), String> {
     // Where the experiments cannot be scored (a head the compact targets do not take), the posterior
     // parts are timed alone, from a zero gradient on the device.
     let scoring = match FixedHead::new(&device, &m_flat, &p_flat, 4096) {
-        Ok(head) => Some((head, Model::new(&m_program, &m_flat, m_streams, m_reads, &[])?)),
+        Ok(head) => Some((head, Model::new(&m_program, &m_flat, m_streams.clone(), m_reads.clone(), &[])?)),
         Err(reason) => {
             log::info!("the experiments are not scored ({reason}); the posterior parts are timed from a zero gradient");
             None
@@ -229,6 +234,14 @@ fn main() -> Result<(), String> {
         Model::new(program, flat, streams.to_vec(), reads.to_vec(), trainable)
     }
     let sites = (&p_flat, &p_streams[..], &p_reads[..], &trainable[..]);
+    let decoders = if fixed {
+        let (m_prefix, p_prefix) = (interchange::prefix(&m_flat)?, interchange::prefix(&p_flat)?);
+        let m_ends = (&m_streams[..], &m_reads[..], m_program.hidden());
+        Some((Decoder::new(&device, &m_prefix, m_ends, &[])?, Decoder::new(&device, &p_prefix, (&p_streams[..], &p_reads[..], p_program.hidden()), &trainable)?))
+    } else {
+        None
+    };
+    let mut decoders = decoders;
 
     // The device path.
     let mut device_seconds: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
@@ -245,11 +258,22 @@ fn main() -> Result<(), String> {
                 Some(_) => Some(timed(&device, s, "design", || interchange::design(&p_model(&p_program, sites)?, &variables, &experiments))?),
                 None => None,
             };
-            timed(&device, s, "sample_loaded", || posterior.sample_into(&mut p_program, step as u64))?;
+            timed(&device, s, "sample_loaded", || {
+                posterior.sample_into(&mut p_program, step as u64)?;
+                decoders.as_mut().map_or(Ok(()), |(_, p)| p.refresh(&p_program))
+            })?;
             let gradient = match (&scoring, &design) {
                 (Some((head, m)), Some(design)) => {
-                    let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments, design))?;
-                    let evaluation = timed(&device, s, "evaluate", || interchange::evaluate(m, &p_model(&p_program, sites)?, head, &batch, &targets, &experiments, design, true))?;
+                    let evaluation = match &decoders {
+                        Some((m, p)) => {
+                            let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments, design))?;
+                            timed(&device, s, "evaluate", || interchange::evaluate(m, p, head, &batch, &targets, &experiments, design, true))?
+                        }
+                        None => {
+                            let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments, design))?;
+                            timed(&device, s, "evaluate", || interchange::evaluate(m, &p_model(&p_program, sites)?, head, &batch, &targets, &experiments, design, true))?
+                        }
+                    };
                     let tokens = evaluation.bits.iter().map(Vec::len).sum::<usize>();
                     mean_bits = Some(evaluation.bits.iter().flatten().sum::<f64>() / tokens as f64);
                     evaluation.gradient
@@ -264,6 +288,7 @@ fn main() -> Result<(), String> {
         "model": model.display().to_string(),
         "explanation": kind,
         "products": format!("{products:?}"),
+        "engine": if fixed { "decoder" } else { "program" },
         "fused_head_groups": [m_program.fused_groups(), p_program.fused_groups()],
         "scored": scoring.is_some(),
         "mean_bits_per_token": mean_bits,

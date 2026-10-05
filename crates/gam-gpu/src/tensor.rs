@@ -639,6 +639,8 @@ impl Device {
     /// per call. Only products take it; [`Device::download`] widens it back.
     pub fn bf16_copy(&self, t: &Tensor) -> Result<Tensor, GpuError> {
         match (&*self.backend, &t.data) {
+            // The host holds the rounded values in float64, as its bfloat16 products round them.
+            (Backend::Host, Data::Host(v)) => Ok(Tensor { rows: t.rows, cols: t.cols, data: Data::Host(v.iter().map(|x| round_operand(*x, Arithmetic::Bf16)).collect()) }),
             #[cfg(target_os = "linux")]
             (Backend::Cuda(engine), Data::Cuda(_)) => engine.bf16_copy(&engine.convert(t)?),
             #[cfg(target_os = "linux")]
