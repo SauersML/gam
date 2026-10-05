@@ -25,9 +25,9 @@ OUTPUT = ROOT / 'docs/images'
 FORMULA = 'co2 ~ s(time, k=100) + s(phase, periodic=true, period=1, k=12)'
 THEMES = {
     'light': dict(background='#ffffff', ink='#536173', grid='#e7ebf0',
-                  data='#6d7b8e', fit='#007f88'),
+                  data='#9aaabc', fit='#245be8'),
     'dark': dict(background='#0d1117', ink='#a8b4c2', grid='#26303e',
-                 data='#8797ac', fit='#70d5cf'),
+                 data='#6f8aa9', fit='#70b8ff'),
 }
 
 
@@ -63,33 +63,38 @@ def fit():
 
 def draw(data, trend, seasonal, theme, path):
     plt.rcParams.update({'font.family': ['Helvetica Neue', 'DejaVu Sans'],
-                         'font.size': 13, 'savefig.bbox': None})
+                         'font.size': 22, 'savefig.bbox': None})
     fig = plt.figure(figsize=(16, 8.5), dpi=240, facecolor=theme['background'])
-    left = fig.add_axes((0.065, 0.13, 0.535, 0.81), facecolor=theme['background'])
-    right = fig.add_axes((0.710, 0.13, 0.26, 0.81), facecolor=theme['background'])
+    left = fig.add_axes((0.085, 0.16, 0.49, 0.80), facecolor=theme['background'])
+    right = fig.add_axes((0.715, 0.16, 0.265, 0.80), facecolor=theme['background'])
     time = np.linspace(data.time.min(), data.time.max(), 1600)
     phase = np.linspace(0, 1, 500)
     # Height carries measured CO2, and lines carry the two additive terms.
-    left.scatter(data.time, data.co2, s=9, color=theme['data'],
-                 alpha=0.7, linewidth=0, zorder=2)
-    left.plot(time, trend(time), color=theme['fit'], linewidth=2.5, zorder=3)
+    left.scatter(data.time, data.co2, s=80, color=theme['data'],
+                 alpha=0.8, edgecolors=theme['background'], linewidth=0.6, zorder=2)
+    left.plot(time, trend(time), color=theme['fit'], linewidth=6,
+              solid_capstyle='round', zorder=3)
     left.set(xlim=(1979.5, 2025), ylim=(335, 430), xlabel='Year', ylabel='CO₂ (ppm)')
-    left.set_xticks([1980, 1990, 2000, 2010, 2020])
-    left.set_yticks([340, 360, 380, 400, 420])
+    left.set_xticks([1980, 2000, 2020])
+    left.set_yticks([340, 380, 420])
 
-    right.scatter(data.phase, data.co2.to_numpy() - trend(data.time), s=11,
-                  color=theme['data'], alpha=0.45, linewidth=0, zorder=2)
-    right.plot(phase, seasonal(phase), color=theme['fit'], linewidth=2.5, zorder=3)
-    right.axhline(0, color=theme['grid'], linewidth=1, zorder=1)
+    right.scatter(data.phase, data.co2.to_numpy() - trend(data.time), s=80,
+                  color=theme['data'], alpha=0.65, edgecolors=theme['background'],
+                  linewidth=0.6, zorder=2)
+    right.plot(phase, seasonal(phase), color=theme['fit'], linewidth=6,
+               solid_capstyle='round', zorder=3)
+    right.axhline(0, color=theme['grid'], linewidth=1.5, zorder=1)
     right.set(xlim=(0, 1), ylim=(-5, 5), xlabel='Year fraction', ylabel='Seasonal CO₂ (ppm)')
-    right.set_xticks([0, 0.25, 0.5, 0.75, 1])
-    right.set_yticks([-4, -2, 0, 2, 4])
+    right.set_xticks([0, 0.5, 1])
+    right.set_yticks([-4, 0, 4])
     for ax in (left, right):
-        ax.grid(axis='y', color=theme['grid'], linewidth=0.7)
+        ax.grid(axis='y', color=theme['grid'], linewidth=1.1)
         ax.set_axisbelow(True)
-        ax.tick_params(length=0, pad=12, labelsize=12, colors=theme['ink'])
+        ax.tick_params(length=0, pad=14, labelsize=21, colors=theme['ink'])
         ax.xaxis.label.set_color(theme['ink'])
         ax.yaxis.label.set_color(theme['ink'])
+        ax.xaxis.label.set_fontsize(24)
+        ax.yaxis.label.set_fontsize(24)
         ax.xaxis.labelpad = 18
         ax.yaxis.labelpad = 18
         for spine in ax.spines.values():

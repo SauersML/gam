@@ -16,26 +16,6 @@ One Rust engine serves both the Python package (`gamfit`) and the CLI (`gam`).
   <img alt="An additive fit to 540 real monthly CO₂ measurements from 1980–2024. Left: measurements and the fitted long-term trend. Right: detrended measurements and the fitted annual cycle." src="docs/images/readme_co2.png" width="1200">
 </picture>
 
-[NOAA/Scripps CO₂ measurements](https://gml.noaa.gov/ccgg/trends/data.html),
-1980–2024: measurements and fitted trend (left); detrended measurements and
-fitted annual cycle (right). Both components come from one additive fit.
-[Reproduce the figure](scripts/gen_readme_co2.py).
-
-```python
-import pandas as pd
-import gamfit
-
-# 133 rows: head acceleration of a crash-test dummy, milliseconds after impact.
-mcycle = pd.read_csv("https://vincentarelbundock.github.io/Rdatasets/csv/MASS/mcycle.csv")
-
-# The mean and the noise level are both smooth functions of time.
-model = gamfit.fit(mcycle, "accel ~ s(times)", noise_formula="s(times)")
-
-bands = model.predict(mcycle, interval=0.95, observation_interval=True)
-print(bands[["posterior_mean", "posterior_mean_lower", "posterior_mean_upper",
-             "observation_lower", "observation_upper"]].head())
-```
-
 Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
 Contributions of every kind are welcome.
 
