@@ -3,13 +3,15 @@ predict a model organism's measured behaviour on fresh items better than the ite
 
 Inputs. A manifest (JSONL), one line per frozen report: {"organism", "set" (public | control), "arm",
 "report" (path of the frozen report JSON, at least "rule"), "transcript" (path of the investigation's
-chat messages as JSON, optional)}. The organism's checkpoints are ORGANISMS/<organism>/{updated,base}.
+chat messages as JSON, optional)}. The organism's checkpoint is ORGANISMS/<organism>/updated; there is no
+base or reference model.
 
 Items and outcomes. An item is one user turn and candidate replies (the organisms' behaviour protocol,
 bench/organisms/organism.py): the model's probability of a reply is the product of the probabilities of
 its tokens and the end-of-turn token after the chat prompt; p is the updated model's probability of each
-reply renormalized over the item's replies. The base model's choice only splits items into those the
-update changed (updated and base choose differently) and the others; no reader sees the base model.
+reply renormalized over the item's replies. When the item draw gives each item's "base_choice" (the
+pre-update model's choice, which only the organisms' scorer holds), items split into those the update
+changed (the updated model chooses otherwise) and the others; no reader sees it.
 
 Readers and score. A frozen reader (reader.py, kind "response") returns q over an item's replies given
 documents: none (the item alone), an arm's rule, or a wrong-relationship ablation of that rule
@@ -31,7 +33,7 @@ Stages (state under RUN = ~/mpd-data/oracle/uplift/<run>/; each stage reads the 
   uplift.py stage   --run R --manifest M.jsonl    one episode per report, its report frozen
   uplift.py ablate  --run R --model sonnet        ablations of every rule (claude -p)
   uplift.py items   --run R --count N --command 'CMD {organism} {count} {seed} {out}'
-  uplift.py measure --run R                       option log-probabilities, updated and base (local GPU)
+  uplift.py measure --run R                       the updated model's option log-probabilities (local GPU)
   uplift.py tests   --run R                       RUN/tests.jsonl, the reader's tests
   reader.py score --backend vllm --model M --tests RUN/tests.jsonl --out RUN/read.jsonl   (MATS GPU)
   uplift.py analyze --run R                       episodes completed, RUN/uplift.json, the figure
@@ -100,12 +102,12 @@ def stage(run: Path, manifest: Path):
         if r.get("set") not in ("public", "control"):
             raise ValueError(f"{r['organism']}/{r['arm']}: set must be public or control")
         report = json.loads(Path(r["report"]).read_text())
-        checkpoints = {role: str(ORGANISMS / r["organism"] / role) for role in ("updated", "base")}
+        checkpoints = {"updated": str(ORGANISMS / r["organism"] / "updated")}
         target = {
             "id": r["organism"],
             "kind": "organism",
             "models": {role: {"server": role, "path": path} for role, path in checkpoints.items()},
-            "description": "a model organism: a chat model updated to follow a rule; base is the model before the update",
+            "description": "a model organism: a chat model updated to change some behaviour",
         }
         episode = E.new_episode(target, investigator=r["arm"], model=r.get("investigator_model", "unknown"), episode_id=f"{run.name}-{r['arm']}")
         if r.get("transcript"):
@@ -148,9 +150,9 @@ def items(run: Path, count: int, command: str):
 
 
 def measure(run: Path):
-    """The option log-probabilities of the updated and base checkpoints (organism.py choices)."""
+    """The option log-probabilities of the updated checkpoint (organism.py choices)."""
     for organism in by_organism(staged(run)):
-        for role in ("updated", "base"):
+        for role in ("updated",):
             out = run / "items" / f"{organism}.{role}.jsonl"
             if out.exists():
                 continue
@@ -228,9 +230,9 @@ def analyze(run: Path, read_path: Path, reader_model: str):
         drawn = read_jsonl(run / "items" / f"{organism}.jsonl")
         draw = json.loads((run / "items" / f"{organism}.draw.json").read_text())
         updated = read_jsonl(run / "items" / f"{organism}.updated.jsonl")
-        base = read_jsonl(run / "items" / f"{organism}.base.jsonl")
         p = [softmax(u["logprobs"]) for u in updated]
-        changed = np.array([u["choice"] != b["choice"] for u, b in zip(updated, base)])
+        base = [it.get("base_choice") for it in drawn]
+        changed = np.array([u["choice"] != b for u, b in zip(updated, base)]) if all(b is not None for b in base) else None
         score = {}
         for condition, documents in conditions(run, organism):
             score[condition] = np.array([log_score(p[i], results[f"{organism}|{i}|{condition}"]["q"]) for i in range(len(drawn))])
@@ -253,7 +255,7 @@ def analyze(run: Path, read_path: Path, reader_model: str):
                         "id": f"item{i}", **{k: draw[k] for k in ("report_sha256", "reports", "entropy", "seed", "drawn_at")},
                         "family": "behaviour_item", "kind": "response", "context": {"text": context_text(it["messages"]), "messages": it["messages"]},
                         "intervention_text": "", "options": it["options"],
-                        "measured": {"log_probabilities": updated[i]["logprobs"], "p": p[i].tolist(), "choice": updated[i]["choice"], "base_choice": base[i]["choice"]},
+                        "measured": {"log_probabilities": updated[i]["logprobs"], "p": p[i].tolist(), "choice": updated[i]["choice"], "base_choice": base[i]},
                     }
                     for i, it in enumerate(drawn)
                 ]
@@ -271,13 +273,15 @@ def analyze(run: Path, read_path: Path, reader_model: str):
         row = {"set": set_, "arm": arm, "organisms": entry["organisms"], "items": int(sum(len(u) for u in entry["uplift"]))}
         for name in ("uplift", "ablated", "relation"):
             values = entry[name]
-            for stratum, pick in (("all", lambda c: np.ones_like(c, dtype=bool)), ("changed", lambda c: c), ("unchanged", lambda c: ~c)):
-                groups = [v[pick(c)] if len(v) else v for v, c in zip(values, entry["changed"])]
+            strata = [("all", lambda c, n: np.ones(n, dtype=bool))]
+            if all(c is not None for c in entry["changed"]):
+                strata += [("changed", lambda c, n: c), ("unchanged", lambda c, n: ~c)]
+            for stratum, pick in strata:
+                groups = [v[pick(c, len(v))] if len(v) else v for v, c in zip(values, entry["changed"])]
                 mean, lo, hi = bootstrap(groups, rng)
                 row[f"{name}_{stratum}"] = {"mean_nats": mean, "ci95": [lo, hi]}
-            balanced = [0.5 * (v[c].mean() + v[~c].mean()) if len(v) and c.any() and (~c).any() else np.nan for v, c in zip(values, entry["changed"])]
-            row[f"{name}_balanced_per_organism"] = dict(zip(entry["organisms"], map(float, balanced)))
-        row["changed_items"] = int(sum(c.sum() for c in entry["changed"]))
+        if all(c is not None for c in entry["changed"]):
+            row["changed_items"] = int(sum(c.sum() for c in entry["changed"]))
         table.append(row)
     summary = {"run": run.name, "reader": reader_model, "score": "sum_k p_k ln q_k, nats per item", "resamples": RESAMPLES, "table": table}
     (run / "uplift.json").write_text(json.dumps(summary, indent=1))
