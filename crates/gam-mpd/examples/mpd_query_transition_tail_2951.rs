@@ -528,10 +528,11 @@ fn main() -> Result<(), String> {
                         (query, delta)
                     })
                     .collect::<BTreeMap<_, _>>();
+                let from = *patches.keys().next().ok_or("empty query patch subset")?;
                 let t = Instant::now();
                 let edited = imported
                     .program
-                    .execute_edited(&inputs, |node, value, _| {
+                    .execute_edited_from(&inputs, &native, from, |node, value, _| {
                         if let Some(delta) = patches.get(&node) {
                             if mode == "oracle_identity" {
                                 value
@@ -549,7 +550,7 @@ fn main() -> Result<(), String> {
                 let candidate = edited.values[imported.program.output]
                     .row(rows - 1)
                     .to_vec();
-                let record = json!({"previous_fixture_id":pair.previous_fixture_id,"appended_fixture_id":pair.appended_fixture_id,"read_nodes":subset,"query_nodes":patches.keys().collect::<Vec<_>>(),"mode":mode,"seconds":t.elapsed().as_secs_f64(),"metrics":metrics(&teacher,&candidate,target,foil)?});
+                let record = json!({"previous_fixture_id":pair.previous_fixture_id,"appended_fixture_id":pair.appended_fixture_id,"read_nodes":subset,"query_nodes":patches.keys().collect::<Vec<_>>(),"mode":mode,"seconds":t.elapsed().as_secs_f64(),"recomputed_from_node":from,"reused_prefix":"same native teacher trace under identical inputs and literal V edited weights","metrics":metrics(&teacher,&candidate,target,foil)?});
                 writeln!(journal, "{}", serde_json::to_string(&record).map_err(err)?)
                     .map_err(err)?;
                 journal.flush().map_err(err)?;
@@ -644,6 +645,32 @@ mod tests {
         assert_eq!(native.values[3].row(0), edited.values[3].row(0));
         assert_eq!(native.values[3].row(1), edited.values[3].row(1));
         assert_ne!(native.values[3].row(2), edited.values[3].row(2));
+        let edit =
+            |node: usize, value: &mut Array2<f64>, earlier: &[Array2<f64>]| -> Result<(), String> {
+                if node == 1 {
+                    *value *= 0.75;
+                }
+                if node == 2 {
+                    *value += &earlier[1];
+                }
+                Ok(())
+            };
+        let full = p
+            .execute_edited(&inputs, edit)
+            .expect("full dependent edits");
+        let reused = p
+            .execute_edited_from(&inputs, &native, 1, edit)
+            .expect("suffix dependent edits");
+        assert_eq!(full.values, reused.values);
+        assert_ne!(native.values[3], reused.values[3]);
+        let identity = p
+            .execute_edited_from(&inputs, &native, 1, |_, _, _| Ok(()))
+            .expect("suffix identity");
+        assert_eq!(identity.values, native.values);
+        assert!(
+            p.execute_edited_from(&inputs, &native, p.nodes.len() + 1, |_, _, _| Ok(()))
+                .is_err()
+        );
         let old = FamilyInputs {
             rows: 2,
             slots: inputs
@@ -749,6 +776,72 @@ mod tests {
         assert_eq!(baseline.values[0], edited.values[0]);
         assert!(apply_v_gains(&mut p, &[2, 3], &BTreeMap::from([(2, 0.75), (3, 1.25)])).is_err());
         assert!(apply_v_gains(&mut p, &[2], &BTreeMap::from([(3, 1.25)])).is_err());
+    }
+    #[test]
+    fn gathered_token_embedding_attention_prefix_reuse() {
+        use gam_mpd::operator_program::{
+            Basis, Declarations, Domain, Interface, LabelKind, Operator, Provenance, Scale, Slot,
+        };
+        use gam_mpd::precision::DeclaredPrecision;
+        let embedding = Operator::dense(
+            "embedding",
+            Interface::native(2).expect("hidden"),
+            Interface::uniform(3, 1, LabelKind::Token, 0).expect("vocab"),
+            ndarray::array![[0.25, 0.5, 0.75], [1., -0.5, 0.]],
+            DeclaredPrecision::new(32).expect("precision"),
+            Provenance::default(),
+        )
+        .expect("embedding");
+        let p = OperatorProgram {
+            declarations: Declarations {
+                domains: vec![Domain { size: 3 }],
+                slots: vec![Slot::Token { domain: 0 }],
+                parameters: 0,
+            },
+            bases: vec![Basis::Indicator { domain: 0 }],
+            operators: vec![std::sync::Arc::new(embedding)],
+            rules: vec![],
+            nodes: vec![
+                Node::Feature { slot: 0, basis: 0 },
+                Node::Affine {
+                    terms: vec![(0, 0)],
+                    bias: None,
+                },
+                Node::Attend {
+                    query: 1,
+                    key: 1,
+                    value: 1,
+                    scale: Scale::InverseSqrt(2),
+                    rotary: None,
+                    causal: true,
+                },
+            ],
+            output: 2,
+        };
+        let input = family(vec![0, 1, 2]);
+        let native = p.execute(&input, false).expect("native gathered embedding");
+        assert_eq!(native.values[0].dim(), (3, 0));
+        let edit =
+            |node: usize, value: &mut Array2<f64>, _: &[Array2<f64>]| -> Result<(), String> {
+                if node == 1 {
+                    replace_last(value, &[0.1, -0.2])?;
+                }
+                Ok(())
+            };
+        let full = p
+            .execute_edited(&input, edit)
+            .expect("full gathered attention edit");
+        let suffix = p
+            .execute_edited_from(&input, &native, 1, edit)
+            .expect("gathered prefix retained");
+        assert_eq!(full.values, suffix.values);
+        let identity = p
+            .execute_edited_from(&input, &native, 2, |_, _, _| Ok(()))
+            .expect("gathered identity prefix");
+        assert_eq!(native.values, identity.values);
+        let mut invalid = native.clone();
+        invalid.values[0] = Array2::zeros((3, 3));
+        assert!(p.execute_edited_from(&input, &invalid, 1, edit).is_err());
     }
     #[test]
     fn oracle_logits_identity() {

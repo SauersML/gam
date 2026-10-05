@@ -1732,6 +1732,44 @@ impl OperatorProgram {
         Ok(Trace { values: top, bands: None, balls: None })
     }
 
+    /// Reuse `base` nodes strictly before `from`, then recompute every suffix node with
+    /// immediate edits using the same evaluator as [`Self::execute_edited`]. The callback
+    /// sees the complete prefix, including previously edited/recomputed suffix values.
+    /// The caller must supply a base prefix produced by this exact program, parameters,
+    /// inputs and layout; shape validation cannot establish that semantic provenance.
+    /// No callback is applied before `from`. Prefix values are cloned, not recomputed.
+    pub fn execute_edited_from<F>(&self, inputs: &FamilyInputs, base: &Trace, from: usize, mut edit: F) -> Result<Trace, ProgramError>
+    where
+        F: FnMut(usize, &mut Array2<f64>, &[Array2<f64>]) -> Result<(), String>,
+    {
+        self.check_inputs(inputs)?;
+        if from > self.nodes.len() || base.values.len() < from {
+            return Err(ProgramError::Input("suffix boundary exceeds program/base prefix".into()));
+        }
+        let interfaces = self.interfaces()?;
+        for index in 0..from {
+            let width = if gathered(&self.nodes, self.output, &self.bases, index) { 0 } else { interfaces[index].width() };
+            if base.values[index].dim() != (inputs.rows, width) {
+                return Err(ProgramError::Input(format!("base prefix node {index} shape mismatch")));
+            }
+        }
+        let ones = vec![1.0; self.declarations.parameters];
+        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
+        let mut top: Vec<Array2<f64>> = Vec::with_capacity(self.nodes.len());
+        top.extend(base.values[..from].iter().cloned());
+        for (index, node) in self.nodes.iter().enumerate().skip(from) {
+            let values = Layered { base: &[], top: &top, from: 0, patch: None };
+            let mut value = self.evaluate_node(index, node, inputs, &values, None, &interfaces, &frame)?.0;
+            let shape = value.dim();
+            edit(index, &mut value, &top).map_err(ProgramError::Input)?;
+            if value.dim() != shape {
+                return Err(ProgramError::Input(format!("an edit of node {index} changed its shape {shape:?} to {:?}", value.dim())));
+            }
+            top.push(value);
+        }
+        Ok(Trace { values: top, bands: None, balls: None })
+    }
+
     /// The unbanded trace of `inputs` when each gated node `(node, mask)` is read only through its
     /// elementwise product with the 0/1 mask node `mask` (an earlier node): such a node is evaluated
     /// at its mask's nonzero entries alone, each a dot product of its dense terms' rows with their
