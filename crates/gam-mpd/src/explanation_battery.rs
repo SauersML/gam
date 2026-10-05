@@ -1,0 +1,1463 @@
+//! The common evaluation battery (#2951): one held-out scoring of an explanation `E` of a language
+//! model `M`, with the same definitions whatever `E` is: a library explanation (`library_mdl`) or
+//! VPD's decomposition (parameter subcomponents gated by a causal-importance network).
+//!
+//! Every divergence is `KL(M ‖ E)` of the next-token distributions per token, in bits; cross-entropy
+//! is in nats per predicted token; top-1 agreement is the fraction of tokens where `E`'s most
+//! probable token is `M`'s. Per-token summaries are the mean and the quantiles over every token.
+//!
+//! # Protocols
+//!
+//! A protocol says which of `M`'s layers run as `E`'s (VPD's appendix B.1): every nonempty layer
+//! subset `S` with the others `M`'s, each layer reading the stream before it (`S` all layers is
+//! error-propagating, one layer is single-layer, a prefix is a cut), and clean-input (every layer of
+//! `E` reading `M`'s stream entering it, the final stream `M`'s embedding plus each layer's
+//! increment).
+//!
+//! # VPD's decomposition
+//!
+//! VPD writes each of `M`'s weight matrices `W` (a site: a layer's query, key, value and output
+//! maps, its MLP's up and down maps) as `C` rank-one subcomponents `V_c U_cᵀ` and a remainder
+//! `Δ = W − (V U)ᵀ`; the site computes `((x V) ⊙ m) U + δ x Δᵀ`, with a mask `m ∈ [0, 1]^C` per token
+//! and `δ ∈ [0, 1]` per token. Its causal-importance network reads `M`'s own inputs of every site
+//! (each RMS-normed), runs a bidirectional transformer and writes `g ∈ [0, 1]^C` per site and token
+//! (VPD's intended setting). Masks ([`Strategy`]): the CI values `m = g`; rounded `m = 1[g > 0]`;
+//! stochastic `m = g + (1 − g) u`, `δ = u′` with `u, u′` uniform; unmasked `m = 1`. Only the
+//! stochastic masks keep the remainder (`δ = 0` otherwise, as in VPD's evaluation); a layer run as
+//! `M`'s has `m = 1`, `δ = 1`, which is `M`'s map.
+//!
+//! The decomposition is read from its one-time export (`bench/vpd_2951/vpd_export.py`): per site
+//! `{site}.U` (`C × d_out`) and `{site}.V` (`d_in × C`), and the network's weights; `M`'s from its
+//! engine export. Both run as operator programs ([`Model`]): `M`'s forward with each site's masks as
+//! raw slots, and `M`'s forward followed by the causal-importance network.
+
+use crate::{
+    artifact::Artifact,
+    device_program::{DeviceProgram, DeviceTrace},
+    interchange,
+    library_mdl::sequence_family,
+    operator_program::{
+        Basis, Declarations, Domain, FamilyInputs, Group, Interface, LabelKind, Law, Node, Operator, OperatorProgram, Provenance, Rotary, Scale,
+        Slot, exact_precision,
+    },
+    run_check::LayerNodes,
+};
+use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
+use gam_math::categorical::log_softmax;
+use ndarray::{Array1, Array2, Axis, s};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
+use rayon::prelude::*;
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    f64::consts::LN_2,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+fn error(e: impl std::fmt::Display) -> String {
+    format!("explanation battery: {e}")
+}
+
+// ------------------------------------------------------------------------------ exports
+
+/// An engine export: `export.json` and its float64 tensors.
+struct Export {
+    dir: PathBuf,
+    record: Value,
+}
+
+impl Export {
+    fn open(dir: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(dir.join("export.json")).map_err(|e| error(format!("{}: {e}", dir.display())))?;
+        Ok(Self { dir: dir.to_path_buf(), record: serde_json::from_str(&text).map_err(error)? })
+    }
+
+    fn tensor(&self, name: &str) -> Result<Array2<f64>, String> {
+        let dims: Vec<usize> = self.record["files"][name]["shape"]
+            .as_array()
+            .ok_or_else(|| error(format!("{name}: no shape")))?
+            .iter()
+            .map(|v| v.as_u64().map(|v| v as usize).ok_or_else(|| error(format!("{name}: a shape entry"))))
+            .collect::<Result<_, _>>()?;
+        let (rows, cols) = match dims[..] {
+            [n] => (1, n),
+            [r, c] => (r, c),
+            _ => return Err(error(format!("{name}: shape {dims:?}"))),
+        };
+        crate::import::read_f64_shaped(&self.dir.join(format!("{name}.f64")), rows, cols)
+    }
+
+    fn count(&self, key: &str) -> Result<usize, String> {
+        self.record["config"][key].as_u64().map(|v| v as usize).ok_or_else(|| error(format!("config.{key}")))
+    }
+}
+
+/// The weight matrices of one layer of `M`, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Query,
+    Key,
+    Value,
+    Output,
+    Up,
+    Down,
+}
+
+pub const KINDS: [Kind; 6] = [Kind::Query, Kind::Key, Kind::Value, Kind::Output, Kind::Up, Kind::Down];
+
+impl Kind {
+    fn export_name(self) -> &'static str {
+        match self {
+            Self::Query => "attn.q_proj",
+            Self::Key => "attn.k_proj",
+            Self::Value => "attn.v_proj",
+            Self::Output => "attn.o_proj",
+            Self::Up => "mlp.c_fc",
+            Self::Down => "mlp.down_proj",
+        }
+    }
+
+    /// The block whose read the site's map reads: 0 the attention's normed stream (and the
+    /// output map, the heads' reads), 1 the MLP's.
+    pub fn block(self) -> usize {
+        match self {
+            Self::Query | Self::Key | Self::Value | Self::Output => 0,
+            Self::Up | Self::Down => 1,
+        }
+    }
+}
+
+/// `M`'s configuration: a pre-norm rotary transformer with tied embeddings, one pointwise MLP law
+/// and no biases (the 4-layer Pile model's architecture).
+#[derive(Clone, Debug)]
+struct Config {
+    d: usize,
+    layers: usize,
+    heads: usize,
+    head_dim: usize,
+    vocab: usize,
+    hidden: usize,
+    rotary: Rotary,
+    epsilon: f64,
+    law: Law,
+}
+
+impl Config {
+    fn of(export: &Export) -> Result<Self, String> {
+        let config = &export.record["config"];
+        let flag = |key: &str| config[key].as_bool().unwrap_or(false);
+        if flag("parallel_residual") || flag("qk_norm") || flag("mlp_gated") || !config["tied_embeddings"].as_bool().unwrap_or(true) {
+            return Err(error("the battery's model is sequential, without head norms or gates, with tied embeddings"));
+        }
+        if config["rope_pairing"].as_str() != Some("rotate_half") || config["norm"].as_str().is_some_and(|n| n != "rms") {
+            return Err(error("the battery's model rotates halves and has RMS norms"));
+        }
+        let (heads, kv) = (export.count("n_heads")?, export.count("n_kv_heads")?);
+        if heads != kv {
+            return Err(error("the battery's model has one key and value per query head"));
+        }
+        let law = match config["mlp_act"].as_str() {
+            Some("gelu_tanh") => Law::GeluTanh,
+            Some("gelu") => Law::Gelu,
+            Some("relu") => Law::Relu,
+            Some("silu") => Law::Silu,
+            other => return Err(error(format!("MLP law {other:?}"))),
+        };
+        let theta = config["rope_theta"].as_f64().ok_or_else(|| error("config.rope_theta"))?;
+        if theta.fract() != 0.0 || theta <= 0.0 || theta > f64::from(u32::MAX) {
+            return Err(error("rope_theta is not a positive integer"));
+        }
+        let head_dim = export.count("head_dim")?;
+        let d = export.count("d_model")?;
+        let hidden = export.tensor("blocks.0.mlp.c_fc")?.nrows();
+        Ok(Self {
+            d,
+            layers: export.count("n_layers")?,
+            heads,
+            head_dim,
+            vocab: export.count("vocab")?,
+            hidden,
+            rotary: Rotary { base: theta as u32, dims: head_dim as u32, half_split: true },
+            epsilon: config["norm_eps"].as_f64().ok_or_else(|| error("config.norm_eps"))?,
+            law,
+        })
+    }
+}
+
+/// One site's subcomponents: `u` (`C × d_out`) and `v` (`d_in × C`).
+pub struct Factors {
+    pub name: String,
+    pub layer: usize,
+    pub kind: Kind,
+    pub u: Array2<f64>,
+    pub v: Array2<f64>,
+}
+
+impl Factors {
+    pub fn subcomponents(&self) -> usize {
+        self.u.nrows()
+    }
+}
+
+struct CiBlock {
+    q: Array2<f64>,
+    k: Array2<f64>,
+    v: Array2<f64>,
+    o: Array2<f64>,
+    fc1: (Array2<f64>, Array2<f64>),
+    fc2: (Array2<f64>, Array2<f64>),
+}
+
+/// VPD's causal-importance network: its sites' inputs in `order` (indices into the sites), an
+/// input projection, bidirectional pre-norm blocks with an exact-GELU MLP, and a head whose
+/// outputs, in `order`, are clamped to `[0, 1]`.
+struct CiNetwork {
+    order: Vec<usize>,
+    input: (Array2<f64>, Array2<f64>),
+    blocks: Vec<CiBlock>,
+    head: (Array2<f64>, Array2<f64>),
+    heads: usize,
+    head_dim: usize,
+    rope_base: u32,
+    epsilon: f64,
+}
+
+/// VPD's decomposition of `M`: per site its subcomponents, in `M`'s order (per layer [`KINDS`]),
+/// and its causal-importance network.
+pub struct Decomposition {
+    pub sites: Vec<Factors>,
+    ci: CiNetwork,
+}
+
+impl Decomposition {
+    pub fn load(dir: &Path) -> Result<Self, String> {
+        let export = Export::open(dir)?;
+        let config = &export.record["config"];
+        let names: Vec<String> = config["sites"]
+            .as_array()
+            .ok_or_else(|| error("config.sites"))?
+            .iter()
+            .map(|v| v.as_str().map(str::to_string).ok_or_else(|| error("a site name")))
+            .collect::<Result<_, _>>()?;
+        let mut sites = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            let (layer, kind) = (i / KINDS.len(), KINDS[i % KINDS.len()]);
+            if *name != format!("h.{layer}.{}", kind.export_name()) {
+                return Err(error(format!("site {i} is {name}, not layer {layer}'s {kind:?} in M's order")));
+            }
+            let (u, v) = (export.tensor(&format!("{name}.U"))?, export.tensor(&format!("{name}.V"))?);
+            if u.nrows() != v.ncols() {
+                return Err(error(format!("{name}: U and V disagree on the subcomponents")));
+            }
+            sites.push(Factors { name: name.clone(), layer, kind, u, v });
+        }
+        let ci = &config["ci"];
+        let order: Vec<usize> = ci["order"]
+            .as_array()
+            .ok_or_else(|| error("config.ci.order"))?
+            .iter()
+            .map(|v| v.as_str().and_then(|n| names.iter().position(|m| m == n)).ok_or_else(|| error("a site of the network's order")))
+            .collect::<Result<_, _>>()?;
+        let count = |key: &str| ci[key].as_u64().map(|v| v as usize).ok_or_else(|| error(format!("config.ci.{key}")));
+        if ci["activation"].as_str() != Some("gelu") || ci["output"].as_str() != Some("clamp01") {
+            return Err(error("the network's law is the exact GELU and its output a clamp to [0, 1]"));
+        }
+        let blocks = (0..count("blocks")?)
+            .map(|i| -> Result<CiBlock, String> {
+                let t = |part: &str| export.tensor(&format!("ci.blocks.{i}.{part}"));
+                Ok(CiBlock { q: t("q")?, k: t("k")?, v: t("v")?, o: t("o")?, fc1: (t("fc1.W")?, t("fc1.b")?), fc2: (t("fc2.W")?, t("fc2.b")?) })
+            })
+            .collect::<Result<_, _>>()?;
+        let rope_base = count("rope_base")?;
+        let ci = CiNetwork {
+            order,
+            input: (export.tensor("ci.input.W")?, export.tensor("ci.input.b")?),
+            blocks,
+            head: (export.tensor("ci.head.W")?, export.tensor("ci.head.b")?),
+            heads: count("heads")?,
+            head_dim: count("head_dim")?,
+            rope_base: u32::try_from(rope_base).map_err(error)?,
+            epsilon: ci["epsilon"].as_f64().ok_or_else(|| error("config.ci.epsilon"))?,
+        };
+        Ok(Self { sites, ci })
+    }
+}
+
+// ------------------------------------------------------------------------------ programs
+
+struct Builder {
+    operators: Vec<Arc<Operator>>,
+    nodes: Vec<Node>,
+    slots: Vec<Slot>,
+}
+
+impl Builder {
+    fn dense(&mut self, name: &str, rows: &Interface, cols: &Interface, values: Array2<f64>) -> Result<usize, String> {
+        let precision = exact_precision(values.iter().copied()).map_err(error)?;
+        let op = Operator::dense(name, rows.clone(), cols.clone(), values, precision, Provenance::native(name)).map_err(error)?;
+        self.operators.push(Arc::new(op));
+        Ok(self.operators.len() - 1)
+    }
+
+    fn diag(&mut self, name: &str, interface: &Interface, values: Array1<f64>) -> Result<usize, String> {
+        let precision = exact_precision(values.iter().copied()).map_err(error)?;
+        let op = Operator::diag(name, interface.clone(), values, precision, Provenance::native(name)).map_err(error)?;
+        self.operators.push(Arc::new(op));
+        Ok(self.operators.len() - 1)
+    }
+
+    fn identity(&mut self, name: &str, interface: &Interface) -> usize {
+        self.operators.push(Arc::new(Operator::identity(name, interface.clone())));
+        self.operators.len() - 1
+    }
+
+    fn node(&mut self, node: Node) -> usize {
+        self.nodes.push(node);
+        self.nodes.len() - 1
+    }
+
+    /// A raw slot of `width` and the node reading it.
+    fn raw(&mut self, width: usize) -> (usize, usize) {
+        self.slots.push(Slot::Raw { width });
+        let slot = self.slots.len() - 1;
+        (slot, self.node(Node::Raw { slot }))
+    }
+
+    fn program(self, vocab: usize, output: usize) -> Result<OperatorProgram, String> {
+        let program = OperatorProgram {
+            rules: Vec::new(),
+            declarations: Declarations { parameters: 0, domains: vec![Domain { size: vocab }], slots: self.slots },
+            bases: vec![Basis::Indicator { domain: 0 }],
+            operators: self.operators,
+            nodes: self.nodes,
+            output,
+        };
+        program.interfaces().map_err(error)?;
+        Ok(program)
+    }
+}
+
+fn uniform(count: usize) -> Result<Interface, String> {
+    Interface::uniform(count, 1, LabelKind::Unit, 0).map_err(error)
+}
+
+fn native(width: usize) -> Result<Interface, String> {
+    Interface::native(width).map_err(error)
+}
+
+/// The nodes of a built model program.
+#[derive(Clone, Debug)]
+pub struct Layout {
+    /// The stream entering each layer (layer 0: the embedding), the final residual and the final
+    /// normed stream.
+    pub streams: Vec<usize>,
+    pub residual: usize,
+    pub hidden: usize,
+    /// Per block (each layer's attention, then its MLP) the normed stream its maps read.
+    pub reads: Vec<usize>,
+    /// Per site the node its map reads (the output map: the heads' reads, concatenated).
+    pub inputs: Vec<usize>,
+    /// Per site of a decomposed program: its masked subcomponent activations `(x V) ⊙ m`, and the
+    /// raw slots of its mask `m` (width `C`) and of its remainder's `δ` (repeated over the width
+    /// it multiplies: a head for the query, key and value maps, the output otherwise).
+    pub activations: Vec<usize>,
+    pub masks: Vec<usize>,
+    pub deltas: Vec<usize>,
+}
+
+/// A model as an operator program through its final normed stream, with its node layout.
+pub struct Model {
+    pub program: OperatorProgram,
+    pub layout: Layout,
+}
+
+/// `M`'s forward from its export, each site `M`'s map, or with `factors` VPD's masked
+/// subcomponents and remainder (module note), every layer's nodes after the stream entering it.
+fn build(export: &Export, config: &Config, factors: Option<&[Factors]>) -> Result<(Builder, Layout), String> {
+    let (d, hd, heads) = (config.d, config.head_dim, config.heads);
+    let model = uniform(d)?;
+    let head = native(hd)?;
+    let neurons = uniform(config.hidden)?;
+    let tokens = Interface::uniform(config.vocab, 1, LabelKind::Token, 0).map_err(error)?;
+    let mut b = Builder { operators: Vec::new(), nodes: Vec::new(), slots: vec![Slot::Token { domain: 0 }] };
+    let identity = b.identity("I", &model);
+    let head_identity = b.identity("I head", &head);
+    let neuron_identity = b.identity("I neurons", &neurons);
+    let embedding = b.dense("wte", &model, &tokens, export.tensor("wte")?.t().to_owned())?;
+    let norm = |b: &mut Builder, x: usize, name: &str| -> Result<usize, String> {
+        let gain = export.tensor(name)?;
+        if gain.dim() != (1, d) {
+            return Err(error(format!("{name}: not a row of {d}")));
+        }
+        let op = b.diag(name, &model, gain.row(0).to_owned())?;
+        let normed = b.node(Node::RmsNorm { input: x, epsilon: config.epsilon });
+        Ok(b.node(Node::Affine { terms: vec![(normed, op)], bias: None }))
+    };
+    let feature = b.node(Node::Feature { slot: 0, basis: 0 });
+    let mut x = b.node(Node::Affine { terms: vec![(feature, embedding)], bias: None });
+    let sites = KINDS.len() * config.layers;
+    let mut layout = Layout {
+        streams: Vec::with_capacity(config.layers),
+        residual: 0,
+        hidden: 0,
+        reads: Vec::with_capacity(2 * config.layers),
+        inputs: vec![0; sites],
+        activations: Vec::new(),
+        masks: Vec::new(),
+        deltas: Vec::new(),
+    };
+    // A decomposed site on `terms` (its input as (node, columns of V's rows) pairs, the columns'
+    // interfaces): its masked activations; the caller writes `U` and the remainder.
+    struct Decomposed {
+        masked: usize,
+        delta: usize,
+    }
+    let decomposed = |b: &mut Builder, layout: &mut Layout, f: &Factors, inputs: &[(usize, std::ops::Range<usize>, Interface)], delta_width: usize| -> Result<Decomposed, String> {
+        let c = f.subcomponents();
+        let sub = native(c)?;
+        let mut terms = Vec::with_capacity(inputs.len());
+        for (i, (node, rows, cols)) in inputs.iter().enumerate() {
+            let op = b.dense(&format!("{}.V{i}", f.name), &sub, cols, f.v.slice(s![rows.clone(), ..]).t().to_owned())?;
+            terms.push((*node, op));
+        }
+        let inner = b.node(Node::Affine { terms, bias: None });
+        let (mask_slot, mask) = b.raw(c);
+        let masked = b.node(Node::Hadamard { left: inner, right: mask });
+        let (delta_slot, delta) = b.raw(delta_width);
+        layout.activations.push(masked);
+        layout.masks.push(mask_slot);
+        layout.deltas.push(delta_slot);
+        Ok(Decomposed { masked, delta })
+    };
+    for l in 0..config.layers {
+        layout.streams.push(x);
+        let prefix = format!("blocks.{l}.");
+        let site = |kind: Kind| KINDS.len() * l + KINDS.iter().position(|k| *k == kind).unwrap_or(0);
+        let h1 = norm(&mut b, x, &format!("{prefix}rms1.gain"))?;
+        layout.reads.push(h1);
+        let weight = |kind: Kind| export.tensor(&format!("{prefix}{}", kind.export_name()));
+        // The query, key and value of every head.
+        let mut per_head: Vec<[usize; 3]> = vec![[0; 3]; heads];
+        for (j, kind) in [Kind::Query, Kind::Key, Kind::Value].into_iter().enumerate() {
+            let w = weight(kind)?;
+            layout.inputs[site(kind)] = h1;
+            match factors {
+                None => {
+                    for (h, out) in per_head.iter_mut().enumerate() {
+                        let op = b.dense(&format!("{prefix}{kind:?}{h}"), &head, &model, w.slice(s![h * hd..(h + 1) * hd, ..]).to_owned())?;
+                        out[j] = b.node(Node::Affine { terms: vec![(h1, op)], bias: None });
+                    }
+                }
+                Some(factors) => {
+                    let f = &factors[site(kind)];
+                    let remainder = &w - &f.v.dot(&f.u).t();
+                    let site_nodes = decomposed(&mut b, &mut layout, f, &[(h1, 0..d, model.clone())], hd)?;
+                    for (h, out) in per_head.iter_mut().enumerate() {
+                        let rows = h * hd..(h + 1) * hd;
+                        let u = b.dense(&format!("{}.U{h}", f.name), &head, &native(f.subcomponents())?, f.u.slice(s![.., rows.clone()]).t().to_owned())?;
+                        let r = b.dense(&format!("{}.R{h}", f.name), &head, &model, remainder.slice(s![rows, ..]).to_owned())?;
+                        let rest = b.node(Node::Affine { terms: vec![(h1, r)], bias: None });
+                        let kept = b.node(Node::Hadamard { left: rest, right: site_nodes.delta });
+                        out[j] = b.node(Node::Affine { terms: vec![(site_nodes.masked, u), (kept, head_identity)], bias: None });
+                    }
+                }
+            }
+        }
+        let reads: Vec<usize> = per_head
+            .iter()
+            .map(|[q, k, v]| b.node(Node::Attend { query: *q, key: *k, value: *v, scale: Scale::InverseSqrt(hd as u32), rotary: Some(config.rotary), causal: true }))
+            .collect();
+        let concatenated = b.node(Node::Concat { parts: reads.clone() });
+        layout.inputs[site(Kind::Output)] = concatenated;
+        let wo = weight(Kind::Output)?;
+        let attended = match factors {
+            None => {
+                let mut terms = vec![(x, identity)];
+                for (h, read) in reads.iter().enumerate() {
+                    let op = b.dense(&format!("{prefix}o{h}"), &model, &head, wo.slice(s![.., h * hd..(h + 1) * hd]).to_owned())?;
+                    terms.push((*read, op));
+                }
+                b.node(Node::Affine { terms, bias: None })
+            }
+            Some(factors) => {
+                let f = &factors[site(Kind::Output)];
+                let remainder = &wo - &f.v.dot(&f.u).t();
+                let inputs: Vec<(usize, std::ops::Range<usize>, Interface)> = reads.iter().enumerate().map(|(h, r)| (*r, h * hd..(h + 1) * hd, head.clone())).collect();
+                let site_nodes = decomposed(&mut b, &mut layout, f, &inputs, d)?;
+                let mut rest_terms = Vec::with_capacity(heads);
+                for (h, read) in reads.iter().enumerate() {
+                    let r = b.dense(&format!("{}.R{h}", f.name), &model, &head, remainder.slice(s![.., h * hd..(h + 1) * hd]).to_owned())?;
+                    rest_terms.push((*read, r));
+                }
+                let rest = b.node(Node::Affine { terms: rest_terms, bias: None });
+                let kept = b.node(Node::Hadamard { left: rest, right: site_nodes.delta });
+                let u = b.dense(&format!("{}.U", f.name), &model, &native(f.subcomponents())?, f.u.t().to_owned())?;
+                b.node(Node::Affine { terms: vec![(x, identity), (site_nodes.masked, u), (kept, identity)], bias: None })
+            }
+        };
+        let h2 = norm(&mut b, attended, &format!("{prefix}rms2.gain"))?;
+        layout.reads.push(h2);
+        layout.inputs[site(Kind::Up)] = h2;
+        let (wc, wd) = (weight(Kind::Up)?, weight(Kind::Down)?);
+        let pre = match factors {
+            None => {
+                let op = b.dense(&format!("{prefix}c_fc"), &neurons, &model, wc)?;
+                b.node(Node::Affine { terms: vec![(h2, op)], bias: None })
+            }
+            Some(factors) => {
+                let f = &factors[site(Kind::Up)];
+                let remainder = &wc - &f.v.dot(&f.u).t();
+                let site_nodes = decomposed(&mut b, &mut layout, f, &[(h2, 0..d, model.clone())], config.hidden)?;
+                let r = b.dense(&format!("{}.R", f.name), &neurons, &model, remainder)?;
+                let rest = b.node(Node::Affine { terms: vec![(h2, r)], bias: None });
+                let kept = b.node(Node::Hadamard { left: rest, right: site_nodes.delta });
+                let u = b.dense(&format!("{}.U", f.name), &neurons, &native(f.subcomponents())?, f.u.t().to_owned())?;
+                b.node(Node::Affine { terms: vec![(site_nodes.masked, u), (kept, neuron_identity)], bias: None })
+            }
+        };
+        let active = b.node(Node::Pointwise { input: pre, laws: vec![config.law; neurons.groups().len()] });
+        layout.inputs[site(Kind::Down)] = active;
+        x = match factors {
+            None => {
+                let op = b.dense(&format!("{prefix}down_proj"), &model, &neurons, wd)?;
+                b.node(Node::Affine { terms: vec![(attended, identity), (active, op)], bias: None })
+            }
+            Some(factors) => {
+                let f = &factors[site(Kind::Down)];
+                let remainder = &wd - &f.v.dot(&f.u).t();
+                let site_nodes = decomposed(&mut b, &mut layout, f, &[(active, 0..config.hidden, neurons.clone())], d)?;
+                let r = b.dense(&format!("{}.R", f.name), &model, &neurons, remainder)?;
+                let rest = b.node(Node::Affine { terms: vec![(active, r)], bias: None });
+                let kept = b.node(Node::Hadamard { left: rest, right: site_nodes.delta });
+                let u = b.dense(&format!("{}.U", f.name), &model, &native(f.subcomponents())?, f.u.t().to_owned())?;
+                b.node(Node::Affine { terms: vec![(attended, identity), (site_nodes.masked, u), (kept, identity)], bias: None })
+            }
+        };
+    }
+    layout.residual = x;
+    layout.hidden = norm(&mut b, x, "final_norm.gain")?;
+    Ok((b, layout))
+}
+
+/// `M` (`decomposition` none) or VPD's masked decomposition of it, through the final normed
+/// stream, and the unembedding (`vocabulary × d`).
+pub fn model(export_dir: &Path, decomposition: Option<&Decomposition>) -> Result<(Model, Array2<f64>), String> {
+    let export = Export::open(export_dir)?;
+    let config = Config::of(&export)?;
+    let (b, layout) = build(&export, &config, decomposition.map(|d| d.sites.as_slice()))?;
+    let program = b.program(config.vocab, layout.hidden)?;
+    Ok((Model { program, layout }, export.tensor("wte")?))
+}
+
+/// `M` followed by VPD's causal-importance network (module note); its output nodes per site, in
+/// `M`'s order of the sites.
+pub fn importance_model(export_dir: &Path, decomposition: &Decomposition) -> Result<(Model, Vec<usize>), String> {
+    let export = Export::open(export_dir)?;
+    let config = Config::of(&export)?;
+    let (mut b, layout) = build(&export, &config, None)?;
+    let ci = &decomposition.ci;
+    let width = ci.input.0.ncols();
+    let stream = uniform(width)?;
+    let head = native(ci.head_dim)?;
+    let concatenated =
+        Interface::new(native(config.head_dim)?.groups().iter().copied().cycle().take(config.heads).collect::<Vec<Group>>()).map_err(error)?;
+    let interface_of = |site: usize| -> Result<Interface, String> {
+        Ok(match KINDS[site % KINDS.len()] {
+            Kind::Query | Kind::Key | Kind::Value | Kind::Up => uniform(config.d)?,
+            Kind::Output => concatenated.clone(),
+            Kind::Down => uniform(config.hidden)?,
+        })
+    };
+    let identity = b.identity("ci I", &stream);
+    let bias = |b: &mut Builder, name: &str, rows: &Interface, row: &Array2<f64>| b.dense(name, rows, &Interface::constant(), row.t().to_owned());
+    let mut terms = Vec::with_capacity(ci.order.len());
+    let mut offset = 0;
+    for &site in &ci.order {
+        let cols = interface_of(site)?;
+        let w = cols.width();
+        let normed = b.node(Node::RmsNorm { input: layout.inputs[site], epsilon: ci.epsilon });
+        let op = b.dense(&format!("ci.input.{site}"), &stream, &cols, ci.input.0.slice(s![offset..offset + w, ..]).t().to_owned())?;
+        terms.push((normed, op));
+        offset += w;
+    }
+    if offset != ci.input.0.nrows() {
+        return Err(error("the network's input projection does not match the sites' widths"));
+    }
+    let input_bias = bias(&mut b, "ci.input.b", &stream, &ci.input.1)?;
+    let mut x = b.node(Node::Affine { terms, bias: Some(input_bias) });
+    let rotary = Rotary { base: ci.rope_base, dims: ci.head_dim as u32, half_split: true };
+    for (i, block) in ci.blocks.iter().enumerate() {
+        let h = b.node(Node::RmsNorm { input: x, epsilon: ci.epsilon });
+        let mut terms = vec![(x, identity)];
+        for j in 0..ci.heads {
+            let rows = j * ci.head_dim..(j + 1) * ci.head_dim;
+            let mut map = |w: &Array2<f64>, part: &str| -> Result<usize, String> {
+                let op = b.dense(&format!("ci.{i}.{part}{j}"), &head, &stream, w.slice(s![rows.clone(), ..]).to_owned())?;
+                Ok(b.node(Node::Affine { terms: vec![(h, op)], bias: None }))
+            };
+            let (q, k, v) = (map(&block.q, "q")?, map(&block.k, "k")?, map(&block.v, "v")?);
+            let read = b.node(Node::Attend { query: q, key: k, value: v, scale: Scale::InverseSqrt(ci.head_dim as u32), rotary: Some(rotary), causal: false });
+            let o = b.dense(&format!("ci.{i}.o{j}"), &stream, &head, block.o.slice(s![.., rows]).to_owned())?;
+            terms.push((read, o));
+        }
+        let attended = b.node(Node::Affine { terms, bias: None });
+        let h = b.node(Node::RmsNorm { input: attended, epsilon: ci.epsilon });
+        let hidden = uniform(block.fc1.0.ncols())?;
+        let fc1 = b.dense(&format!("ci.{i}.fc1"), &hidden, &stream, block.fc1.0.t().to_owned())?;
+        let fc1_bias = bias(&mut b, &format!("ci.{i}.fc1.b"), &hidden, &block.fc1.1)?;
+        let pre = b.node(Node::Affine { terms: vec![(h, fc1)], bias: Some(fc1_bias) });
+        let active = b.node(Node::Pointwise { input: pre, laws: vec![Law::Gelu; hidden.groups().len()] });
+        let fc2 = b.dense(&format!("ci.{i}.fc2"), &stream, &hidden, block.fc2.0.t().to_owned())?;
+        let fc2_bias = bias(&mut b, &format!("ci.{i}.fc2.b"), &stream, &block.fc2.1)?;
+        x = b.node(Node::Affine { terms: vec![(attended, identity), (active, fc2)], bias: Some(fc2_bias) });
+    }
+    // The head, per site in the network's order, clamped to [0, 1]: relu(z) − relu(z − 1).
+    let mut outputs = vec![0; decomposition.sites.len()];
+    let mut offset = 0;
+    for &site in &ci.order {
+        let c = decomposition.sites[site].subcomponents();
+        let sub = native(c)?;
+        let op = b.dense(&format!("ci.head.{site}"), &sub, &stream, ci.head.0.slice(s![.., offset..offset + c]).t().to_owned())?;
+        let head_bias = bias(&mut b, &format!("ci.head.b.{site}"), &sub, &ci.head.1.slice(s![.., offset..offset + c]).to_owned())?;
+        let pre = b.node(Node::Affine { terms: vec![(x, op)], bias: Some(head_bias) });
+        // One law per coordinate group: the subcomponents are one native group.
+        let lower = b.node(Node::Pointwise { input: pre, laws: vec![Law::Relu; sub.groups().len()] });
+        let one = b.dense(&format!("ci.one.{site}"), &sub, &Interface::constant(), Array2::from_elem((c, 1), -1.0))?;
+        let shifted_identity = b.identity(&format!("ci.I.{site}"), &sub);
+        let shifted = b.node(Node::Affine { terms: vec![(pre, shifted_identity)], bias: Some(one) });
+        let upper = b.node(Node::Pointwise { input: shifted, laws: vec![Law::Relu; sub.groups().len()] });
+        let negative = b.diag(&format!("ci.minus.{site}"), &sub, Array1::from_elem(c, -1.0))?;
+        outputs[site] = b.node(Node::Affine { terms: vec![(lower, shifted_identity), (upper, negative)], bias: None });
+        offset += c;
+    }
+    let output = *outputs.iter().max().ok_or_else(|| error("no sites"))?;
+    let program = b.program(config.vocab, output)?;
+    Ok((Model { program, layout }, outputs))
+}
+
+// ------------------------------------------------------------------------------ running
+
+/// One model on the device, run layer by layer through its final normed stream, with the
+/// unembedding for its logits.
+pub struct Side {
+    pub program: DeviceProgram,
+    pub streams: Vec<usize>,
+    pub residual: usize,
+    pub hidden: usize,
+    head: Tensor,
+}
+
+/// The input of the final norm before `hidden` (a gain over an RMS norm).
+fn final_residual(flat: &OperatorProgram, hidden: usize) -> Result<usize, String> {
+    let mut n = hidden;
+    loop {
+        match &flat.nodes[n] {
+            Node::RmsNorm { input, .. } => return Ok(*input),
+            Node::Affine { terms, bias: None } if terms.len() == 1 => n = terms[0].0,
+            Node::Gain { input, .. } => n = *input,
+            other => return Err(error(format!("the final normed stream is not a norm of the residual: {other:?}"))),
+        }
+    }
+}
+
+/// The unembedding (classes × width) read by `flat`'s final normed stream.
+fn unembedding_of(flat: &OperatorProgram, hidden: usize) -> Result<Array2<f64>, String> {
+    let logits = match &flat.nodes[flat.output] {
+        Node::Readout { input, .. } => *input,
+        _ => flat.output,
+    };
+    match &flat.nodes[logits] {
+        Node::Transposed { input, operator } if *input == hidden => Ok(flat.operators[*operator].matrix().t().to_owned()),
+        Node::Affine { terms, bias: None } if terms.len() == 1 && terms[0].0 == hidden => Ok(flat.operators[terms[0].1].matrix()),
+        other => Err(error(format!("the logits are not one dense map of the final normed stream: {other:?}"))),
+    }
+}
+
+impl Side {
+    fn compile(device: &Device, program: &OperatorProgram, numeric_bytes: usize) -> Result<DeviceProgram, String> {
+        let mut compiled = DeviceProgram::compile_values_bounded(device, program, numeric_bytes)?;
+        compiled.set_arithmetic(if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 });
+        Ok(compiled)
+    }
+
+    /// A built model (through its final normed stream) with its unembedding.
+    pub fn of_model(device: &Device, model: &Model, unembedding: &Array2<f64>, numeric_bytes: usize) -> Result<Self, String> {
+        Ok(Self {
+            program: Self::compile(device, &model.program, numeric_bytes)?,
+            streams: model.layout.streams.clone(),
+            residual: model.layout.residual,
+            hidden: model.layout.hidden,
+            head: device.upload(unembedding.view()).map_err(error)?,
+        })
+    }
+
+    /// An artifact of the split native program with sites `layers` (`M` itself through
+    /// `Artifact::native`, or a library explanation).
+    pub fn of_artifact(device: &Device, artifact: &Artifact, layers: &[LayerNodes], numeric_bytes: usize) -> Result<Self, String> {
+        let (flat, entries, _) = interchange::sites(artifact, layers)?;
+        // The stream entering each layer: the stream entering its attention block.
+        let streams = entries.into_iter().step_by(2).collect();
+        let program = Self::compile(device, &interchange::prefix(&flat)?, numeric_bytes)?;
+        let hidden = program.hidden();
+        let head = device.upload(unembedding_of(&flat, hidden)?.view()).map_err(error)?;
+        Ok(Self { residual: final_residual(&flat, hidden)?, program, streams, hidden, head })
+    }
+
+    pub fn layers(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// The node layer `l` leaves: the stream entering the next layer, or the final residual.
+    pub fn leaving(&self, l: usize) -> usize {
+        if l + 1 < self.streams.len() { self.streams[l + 1] } else { self.residual }
+    }
+
+    /// Layer `l` on `family` entering at the stream `entry` (none at layer 0), the raw slots in
+    /// `given` and `edit` offered every node: its trace.
+    pub fn layer_trace(
+        &self,
+        family: &FamilyInputs,
+        l: usize,
+        entry: Option<&Tensor>,
+        given: BTreeMap<usize, Tensor>,
+        edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
+    ) -> Result<DeviceTrace, String> {
+        let d = self.program.device();
+        let entry = entry.map(|x| d.copy(x).map(|x| (self.streams[l], x))).transpose().map_err(error)?;
+        self.program.forward_span_given(family, given, entry, self.leaving(l), edit)
+    }
+
+    /// [`Self::layer_trace`] without edits: the stream layer `l` leaves.
+    pub fn layer(&self, family: &FamilyInputs, l: usize, entry: Option<&Tensor>, given: BTreeMap<usize, Tensor>) -> Result<Tensor, String> {
+        let trace = self.layer_trace(family, l, entry, given, |_, _| Ok(None))?;
+        self.program.device().copy(trace.value(self.leaving(l))?).map_err(error)
+    }
+
+    /// Per sequence of `family` (each `length` rows), the logits of the final residual `x`.
+    pub fn logits(&self, family: &FamilyInputs, x: &Tensor, length: usize) -> Result<Vec<Array2<f64>>, String> {
+        let d = self.program.device();
+        let trace = self.program.forward_span(family, Some((self.residual, d.copy(x).map_err(error)?)), self.hidden, |_, _| Ok(None))?;
+        let hidden = trace.value(self.hidden)?;
+        (0..family.rows / length)
+            .map(|s| {
+                let rows = d.rows_of(hidden, s * length, length).map_err(error)?;
+                let mut logits = d.zeros(length, self.head.rows()).map_err(error)?;
+                d.gemm(&mut logits, 1.0, &rows, Op::N, &self.head, Op::T, 0.0, self.program.arithmetic()).map_err(error)?;
+                d.download(&logits).map_err(error)
+            })
+            .collect()
+    }
+}
+
+// ------------------------------------------------------------------------------ scoring
+
+/// Per-token values and their summary.
+#[derive(Clone, Default)]
+pub struct Tokens(pub Vec<f64>);
+
+impl Tokens {
+    pub fn summary(&self) -> Value {
+        if self.0.is_empty() {
+            return Value::Null;
+        }
+        let mut v = self.0.clone();
+        v.sort_by(f64::total_cmp);
+        let q = |p: f64| v[((p * (v.len() - 1) as f64).round() as usize).min(v.len() - 1)];
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        json!({"tokens": v.len(), "mean": mean, "q50": q(0.5), "q90": q(0.9), "q99": q(0.99), "max": q(1.0)})
+    }
+
+    pub fn mean(&self) -> f64 {
+        self.0.iter().sum::<f64>() / self.0.len() as f64
+    }
+}
+
+/// `M`'s log-probabilities and most probable token per row of each sequence's logits.
+pub struct Reference {
+    pub log_probabilities: Vec<Array2<f64>>,
+    pub top: Vec<Vec<usize>>,
+}
+
+impl Reference {
+    pub fn of(logits: Vec<Array2<f64>>) -> Result<Self, String> {
+        let mut top = Vec::with_capacity(logits.len());
+        let mut log_probabilities = Vec::with_capacity(logits.len());
+        for mut l in logits {
+            top.push((0..l.nrows()).map(|t| argmax(l.row(t).iter().copied())).collect());
+            l.axis_iter_mut(Axis(0)).into_par_iter().try_for_each(|mut row| -> Result<(), String> {
+                let lp = log_softmax(row.as_slice().ok_or_else(|| error("noncontiguous logits"))?).map_err(error)?;
+                row.iter_mut().zip(lp).for_each(|(v, p)| *v = p);
+                Ok(())
+            })?;
+            log_probabilities.push(l);
+        }
+        Ok(Self { log_probabilities, top })
+    }
+
+    /// `M`'s cross-entropy on the text, per predicted token.
+    pub fn cross_entropy(&self, sequences: &[&[u32]]) -> Vec<f64> {
+        self.log_probabilities.iter().zip(sequences).flat_map(|(lp, tokens)| (0..tokens.len() - 1).map(move |t| -lp[[t, tokens[t + 1] as usize]])).collect()
+    }
+}
+
+fn argmax(values: impl Iterator<Item = f64>) -> usize {
+    values.enumerate().max_by(|a, b| a.1.total_cmp(&b.1)).map_or(0, |(i, _)| i)
+}
+
+/// One protocol's per-token KL in bits, its cross-entropy and its top-1 agreement with `M`.
+#[derive(Clone, Default)]
+pub struct Behaviour {
+    pub kl: Tokens,
+    pub ce: Vec<f64>,
+    pub agree: Vec<bool>,
+}
+
+impl Behaviour {
+    /// Score the explanation's logits per sequence against `M`'s.
+    pub fn add(&mut self, m: &Reference, e: &[Array2<f64>], sequences: &[&[u32]]) -> Result<(), String> {
+        for (s, (e, tokens)) in e.iter().zip(sequences).enumerate() {
+            let (lp, top) = (&m.log_probabilities[s], &m.top[s]);
+            let rows: Vec<(f64, f64, bool)> = (0..e.nrows())
+                .into_par_iter()
+                .map(|t| -> Result<(f64, f64, bool), String> {
+                    let lq = log_softmax(e.row(t).as_slice().ok_or_else(|| error("noncontiguous logits"))?).map_err(error)?;
+                    let kl: f64 = lp.row(t).iter().zip(&lq).map(|(p, q)| p.exp() * (p - q)).sum();
+                    let ce = if t + 1 < tokens.len() { -lq[tokens[t + 1] as usize] } else { f64::NAN };
+                    Ok((kl / LN_2, ce, argmax(lq.iter().copied()) == top[t]))
+                })
+                .collect::<Result<_, _>>()?;
+            for (kl, ce, agree) in rows {
+                self.kl.0.push(kl);
+                if ce.is_finite() {
+                    self.ce.push(ce);
+                }
+                self.agree.push(agree);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn summary(&self) -> Value {
+        json!({
+            "kl_bits": self.kl.summary(),
+            "ce": self.ce.iter().sum::<f64>() / self.ce.len() as f64,
+            "top1_agreement": self.agree.iter().filter(|a| **a).count() as f64 / self.agree.len() as f64,
+        })
+    }
+}
+
+/// The name of a layer set: `layers_` and its layers, or `clean_input`.
+pub fn set_name(set: &[bool]) -> String {
+    format!("layers_{}", set.iter().enumerate().filter(|(_, e)| **e).map(|(l, _)| l.to_string()).collect::<String>())
+}
+
+/// Every nonempty layer subset of `layers`, by size then lexicographically.
+pub fn subsets(layers: usize) -> Vec<Vec<bool>> {
+    let mut out: Vec<Vec<bool>> = (1..1u64 << layers).map(|bits| (0..layers).map(|l| bits >> l & 1 == 1).collect()).collect();
+    out.sort_by_key(|set| (set.iter().filter(|e| **e).count(), set.iter().map(|e| !e).collect::<Vec<_>>()));
+    out
+}
+
+/// The final residual of every protocol (module note) on one batch, from `layer(l, explained,
+/// entry)` (layer `l` of `E` or of `M` on the stream `entry`, none at layer 0, returning the stream it
+/// leaves) and `M`'s streams entering each layer and its final residual (`m_streams`, `L + 1`).
+pub fn protocols(
+    d: &Device,
+    m_streams: &[Tensor],
+    embedding: &Tensor,
+    mut layer: impl FnMut(usize, bool, Option<&Tensor>) -> Result<Tensor, String>,
+) -> Result<Vec<(String, Tensor)>, String> {
+    let layers = m_streams.len() - 1;
+    let mut out = Vec::new();
+    for set in subsets(layers) {
+        let mut x: Option<Tensor> = None;
+        for (l, explained) in set.iter().enumerate() {
+            // A layer of M after only M's layers continues M's own stream.
+            if !explained && set[..l].iter().all(|e| !e) {
+                x = Some(d.copy(&m_streams[l + 1]).map_err(error)?);
+                continue;
+            }
+            x = Some(layer(l, *explained, x.as_ref())?);
+        }
+        out.push((set_name(&set), x.ok_or_else(|| error("no layers"))?));
+    }
+    let mut x = d.copy(embedding).map_err(error)?;
+    for l in 0..layers {
+        let entering = if l == 0 { embedding } else { &m_streams[l] };
+        let leaving = layer(l, true, (l > 0).then_some(entering))?;
+        d.axpy(&mut x, 1.0, &leaving).map_err(error)?;
+        d.axpy(&mut x, -1.0, entering).map_err(error)?;
+    }
+    out.push(("clean_input".into(), x));
+    Ok(out)
+}
+
+/// `M`'s embedding and streams (entering each layer, then the final residual) on one batch.
+pub fn streams(m: &Side, family: &FamilyInputs, given: impl Fn(usize) -> BTreeMap<usize, Tensor>) -> Result<(Tensor, Vec<Tensor>), String> {
+    let d = m.program.device();
+    let mut out: Vec<Tensor> = Vec::with_capacity(m.layers() + 1);
+    let mut embedding = None;
+    for l in 0..m.layers() {
+        let trace = m.layer_trace(family, l, out.last(), given(l), |_, _| Ok(None))?;
+        if l == 0 {
+            let e = d.copy(trace.value(m.streams[0])?).map_err(error)?;
+            out.push(d.copy(&e).map_err(error)?);
+            embedding = Some(e);
+        }
+        out.push(d.copy(trace.value(m.leaving(l))?).map_err(error)?);
+    }
+    Ok((embedding.ok_or_else(|| error("no layers"))?, out))
+}
+
+/// The protocol summaries, with the single-layer mean and the mean per subset size.
+pub fn protocol_summary(protocols: &BTreeMap<String, Behaviour>, layers: usize) -> Value {
+    let mut out: serde_json::Map<String, Value> = protocols.iter().map(|(k, v)| (k.clone(), v.summary())).collect();
+    for k in 1..layers {
+        let names: Vec<String> = subsets(layers).into_iter().filter(|s| s.iter().filter(|e| **e).count() == k).map(|s| set_name(&s)).collect();
+        let present: Vec<&Behaviour> = names.iter().filter_map(|n| protocols.get(n)).collect();
+        if present.is_empty() {
+            continue;
+        }
+        let mean = |f: &dyn Fn(&Behaviour) -> f64| present.iter().map(|b| f(b)).sum::<f64>() / present.len() as f64;
+        out.insert(
+            format!("subsets_{k}"),
+            json!({
+                "kl_bits_mean": mean(&|b| b.kl.mean()),
+                "ce": mean(&|b| b.ce.iter().sum::<f64>() / b.ce.len() as f64),
+                "top1_agreement": mean(&|b| b.agree.iter().filter(|a| **a).count() as f64 / b.agree.len() as f64),
+            }),
+        );
+    }
+    Value::Object(out)
+}
+
+// ------------------------------------------------------------------------------ VPD
+
+/// VPD's masks for one batch: per site the mask (`rows × C`) and the remainder's `δ` per row.
+pub struct Masks {
+    pub mask: Vec<Array2<f64>>,
+    pub delta: Vec<Array1<f64>>,
+}
+
+/// How VPD's masks are set from the causal importances `g` (module note).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Strategy {
+    Ci,
+    Rounded,
+    Stochastic,
+    Unmasked,
+}
+
+pub const STRATEGIES: [Strategy; 4] = [Strategy::Ci, Strategy::Rounded, Strategy::Stochastic, Strategy::Unmasked];
+
+impl Strategy {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ci => "ci",
+            Self::Rounded => "rounded",
+            Self::Stochastic => "stochastic",
+            Self::Unmasked => "unmasked",
+        }
+    }
+
+    pub fn masks(self, g: &[Array2<f64>], rng: &mut StdRng) -> Masks {
+        let rows = g.first().map_or(0, Array2::nrows);
+        let mask = g
+            .iter()
+            .map(|g| match self {
+                Self::Ci => g.clone(),
+                Self::Rounded => g.mapv(|v| if v > 0.0 { 1.0 } else { 0.0 }),
+                Self::Stochastic => g.mapv(|v| v + (1.0 - v) * rng.random::<f64>()),
+                Self::Unmasked => Array2::ones(g.dim()),
+            })
+            .collect();
+        let delta = g.iter().map(|_| if self == Self::Stochastic { Array1::from_shape_fn(rows, |_| rng.random::<f64>()) } else { Array1::zeros(rows) }).collect();
+        Masks { mask, delta }
+    }
+}
+
+/// VPD's decomposition run on the device: `M`, the masked decomposition `E` and the
+/// causal-importance program, with the sites' slots.
+pub struct Vpd {
+    pub m: Side,
+    pub e: Side,
+    importance: DeviceProgram,
+    outputs: Vec<usize>,
+    pub layout: Layout,
+    pub m_layout: Layout,
+    /// Per site its layer, subcomponents and its remainder's `δ` width, and its subcomponents.
+    pub sites: Vec<(usize, usize, usize)>,
+    pub factors: Vec<Factors>,
+}
+
+impl Vpd {
+    pub fn new(device: &Device, export: &Path, decomposition: Decomposition, numeric_bytes: usize) -> Result<Self, String> {
+        let (m_model, unembedding) = model(export, None)?;
+        let (e_model, _) = model(export, Some(&decomposition))?;
+        let (importance, outputs) = importance_model(export, &decomposition)?;
+        let sites = decomposition
+            .sites
+            .iter()
+            .zip(&e_model.layout.deltas)
+            .map(|(f, slot)| match e_model.program.declarations.slots[*slot] {
+                Slot::Raw { width } => Ok((f.layer, f.subcomponents(), width)),
+                Slot::Token { .. } => Err(error("a remainder's slot is not raw")),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            m: Side::of_model(device, &m_model, &unembedding, numeric_bytes)?,
+            e: Side::of_model(device, &e_model, &unembedding, numeric_bytes)?,
+            importance: Side::compile(device, &importance.program, numeric_bytes)?,
+            outputs,
+            layout: e_model.layout,
+            m_layout: m_model.layout,
+            sites,
+            factors: decomposition.sites,
+        })
+    }
+
+    pub fn layers(&self) -> usize {
+        self.m.layers()
+    }
+
+    /// The causal importances of every site on `family` (each `rows × C`).
+    pub fn importances(&self, family: &FamilyInputs) -> Result<Vec<Array2<f64>>, String> {
+        let trace = self.importance.forward(family)?;
+        let d = self.importance.device();
+        self.outputs.iter().map(|n| d.download(trace.value(*n)?).map_err(error)).collect()
+    }
+
+    /// The raw slots of layer `l`'s sites: `masks` when `explained`, else `m = 1`, `δ = 1` (`M`'s
+    /// maps).
+    pub fn given(&self, d: &Device, l: usize, masks: Option<&Masks>, rows: usize) -> Result<BTreeMap<usize, Tensor>, String> {
+        let mut out = BTreeMap::new();
+        for (s, &(layer, c, width)) in self.sites.iter().enumerate() {
+            if layer != l {
+                continue;
+            }
+            let (mask, delta) = match masks {
+                Some(masks) => (d.upload(masks.mask[s].view()).map_err(error)?, {
+                    let column = masks.delta[s].view().insert_axis(Axis(1)).to_owned();
+                    d.upload(column.broadcast((rows, width)).ok_or_else(|| error("a remainder's δ"))?.view()).map_err(error)?
+                }),
+                None => (d.upload(Array2::<f64>::ones((rows, c)).view()).map_err(error)?, d.upload(Array2::<f64>::ones((rows, width)).view()).map_err(error)?),
+            };
+            out.insert(self.layout.masks[s], mask);
+            out.insert(self.layout.deltas[s], delta);
+        }
+        Ok(out)
+    }
+}
+
+/// Every token's count of active subcomponents (`g > 0`), overall and per layer.
+pub fn active_counts(g: &[Array2<f64>], sites: &[(usize, usize, usize)], layers: usize) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let rows = g.first().map_or(0, Array2::nrows);
+    let mut per_layer = vec![vec![0.0; rows]; layers];
+    for (g, &(layer, _, _)) in g.iter().zip(sites) {
+        for (t, row) in g.rows().into_iter().enumerate() {
+            per_layer[layer][t] += row.iter().filter(|v| **v > 0.0).count() as f64;
+        }
+    }
+    let total = (0..rows).map(|t| per_layer.iter().map(|l| l[t]).sum()).collect();
+    (total, per_layer)
+}
+
+/// The battery's behaviour and protocols of VPD on `sequences` (module note), in batches of
+/// `batch` sequences: per mask strategy the error-propagating protocol, and for the CI and rounded
+/// masks every protocol; `M`'s cross-entropy and the active subcomponents per token.
+pub fn vpd_protocols(vpd: &Vpd, sequences: &[Vec<u32>], batch: usize, seed: u64) -> Result<Value, String> {
+    let d = vpd.m.program.device().clone();
+    let layers = vpd.layers();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rows: BTreeMap<String, Behaviour> = BTreeMap::new();
+    let mut m_ce = Vec::new();
+    let (mut active, mut active_layers) = (Tokens::default(), vec![Tokens::default(); layers]);
+    for chunk in sequences.chunks(batch) {
+        let views: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
+        let family = sequence_family(&views)?;
+        let length = views[0].len();
+        let g = vpd.importances(&family)?;
+        let (total, per_layer) = active_counts(&g, &vpd.sites, layers);
+        active.0.extend(total);
+        for (acc, counts) in active_layers.iter_mut().zip(per_layer) {
+            acc.0.extend(counts);
+        }
+        let (embedding, m_streams) = streams(&vpd.m, &family, |_| BTreeMap::new())?;
+        let reference = Reference::of(vpd.m.logits(&family, &m_streams[layers], length)?)?;
+        m_ce.extend(reference.cross_entropy(&views));
+        for strategy in STRATEGIES {
+            let masks = strategy.masks(&g, &mut rng);
+            let mut layer = |l: usize, explained: bool, entry: Option<&Tensor>| -> Result<Tensor, String> {
+                if explained {
+                    vpd.e.layer(&family, l, entry, vpd.given(&d, l, Some(&masks), family.rows)?)
+                } else {
+                    vpd.m.layer(&family, l, entry, BTreeMap::new())
+                }
+            };
+            let finals = if matches!(strategy, Strategy::Ci | Strategy::Rounded) {
+                protocols(&d, &m_streams, &embedding, &mut layer)?
+            } else {
+                let mut x: Option<Tensor> = None;
+                for l in 0..layers {
+                    x = Some(layer(l, true, x.as_ref())?);
+                }
+                vec![(set_name(&vec![true; layers]), x.ok_or_else(|| error("no layers"))?)]
+            };
+            for (name, x) in finals {
+                let e = vpd.m.logits(&family, &x, length)?;
+                rows.entry(format!("{}/{name}", strategy.name())).or_default().add(&reference, &e, &views)?;
+            }
+        }
+        log::info!("battery: VPD protocols on {} sequences", chunk.len());
+    }
+    let mut out = serde_json::Map::new();
+    for strategy in STRATEGIES {
+        let prefix = format!("{}/", strategy.name());
+        let of: BTreeMap<String, Behaviour> = rows.iter().filter_map(|(k, v)| k.strip_prefix(&prefix).map(|k| (k.to_string(), v.clone()))).collect();
+        out.insert(strategy.name().into(), protocol_summary(&of, layers));
+    }
+    Ok(json!({
+        "ce_target": m_ce.iter().sum::<f64>() / m_ce.len() as f64,
+        "active_subcomponents_per_token": active.summary(),
+        "active_subcomponents_per_token_by_layer": active_layers.iter().map(Tokens::mean).collect::<Vec<_>>(),
+        "masks": out,
+    }))
+}
+
+// ------------------------------------------------------------------------------ VPD interchange
+
+/// An orthonormal basis (`d × r`) of the span of the columns `cols` of `v` (`d × C`): the right
+/// singular vectors of their rows whose singular values exceed the decomposition's rounding band;
+/// none when no direction is resolved from zero.
+fn column_span(v: &Array2<f64>, cols: &[usize]) -> Result<Option<Array2<f32>>, String> {
+    if cols.is_empty() {
+        return Ok(None);
+    }
+    let rows = v.select(Axis(1), cols).t().to_owned();
+    let decomposition = gam_linalg::decompose::svd(rows.view(), false).map_err(error)?;
+    let rank = decomposition.singular_values.iter().filter(|s| **s > decomposition.band).count();
+    Ok((rank > 0).then(|| decomposition.vt.slice(s![..rank, ..]).t().mapv(|x| x as f32)))
+}
+
+/// The sites whose maps read block `block`'s normed stream: a layer's query, key and value (its
+/// attention), or its up map (its MLP).
+pub fn reading_sites(block: usize) -> Vec<usize> {
+    let l = block / 2;
+    if block % 2 == 0 { vec![KINDS.len() * l, KINDS.len() * l + 1, KINDS.len() * l + 2] } else { vec![KINDS.len() * l + 4] }
+}
+
+/// Per token of a batch, the span of the reads of VPD's subcomponents active there (`g > 0`) at
+/// block `block`.
+fn active_spans(factors: &[Factors], g: &[Array2<f64>], block: usize) -> Result<Vec<Option<Array2<f32>>>, String> {
+    let sites = reading_sites(block);
+    let v = ndarray::concatenate(Axis(1), &sites.iter().map(|s| factors[*s].v.view()).collect::<Vec<_>>()).map_err(error)?;
+    let rows = g[sites[0]].nrows();
+    (0..rows)
+        .into_par_iter()
+        .map(|t| {
+            let mut cols = Vec::new();
+            let mut offset = 0;
+            for &s in &sites {
+                cols.extend(g[s].row(t).iter().enumerate().filter(|(_, x)| **x > 0.0).map(|(c, _)| offset + c));
+                offset += g[s].ncols();
+            }
+            column_span(&v, &cols)
+        })
+        .collect()
+}
+
+/// `s + (h − s) Q Qᵀ` per row (the complement patch's read: the base's component inside each
+/// row's span `Q`, the source's outside it; the source whole where the span is empty), the source
+/// row of base row `t` being `t mod length`.
+fn complement(h: &Array2<f64>, source: &Array2<f64>, spans: &[Option<Array2<f32>>]) -> Array2<f64> {
+    let length = source.nrows();
+    let mut out = Array2::zeros(h.dim());
+    out.axis_iter_mut(Axis(0)).into_par_iter().enumerate().for_each(|(t, mut row)| {
+        let s = source.row(t % length);
+        row.assign(&s);
+        if let Some(q) = &spans[t] {
+            let difference = (&h.row(t) - &s).mapv(|x| x as f32);
+            let coordinates = difference.dot(q);
+            row.zip_mut_with(&q.dot(&coordinates), |r, k| *r += f64::from(*k));
+        }
+    });
+    out
+}
+
+/// One read patch: per base row `rows`, the read direction `q` (unit) at block `block`.
+#[derive(Clone)]
+struct ReadPatch {
+    block: usize,
+    row: usize,
+    q: Array1<f64>,
+}
+
+/// `h + ((s − h)·q) q` on each patched row's tokens.
+fn read_patched(h: &Array2<f64>, source: &Array2<f64>, patches: &[&ReadPatch], length: usize) -> Array2<f64> {
+    let mut out = h.clone();
+    for p in patches {
+        for t in 0..length {
+            let r = p.row * length + t;
+            let along = (&source.row(t) - &h.row(r)).dot(&p.q);
+            out.row_mut(r).scaled_add(along, &p.q);
+        }
+    }
+    out
+}
+
+/// Per source and family (the read patch, each block's complement, every block's complement
+/// at once): `KL(M_e ‖ E_e)` per token in bits.
+struct Families {
+    names: Vec<String>,
+    per_source: Vec<Vec<(f64, usize)>>,
+    all: Vec<Tokens>,
+}
+
+impl Families {
+    fn add(&mut self, family: usize, source: usize, bits: &[f64]) {
+        self.per_source[family][source].0 += bits.iter().sum::<f64>();
+        self.per_source[family][source].1 += bits.len();
+        self.all[family].0.extend_from_slice(bits);
+    }
+
+    fn summary(&self, worst_of: &[usize]) -> Value {
+        let mut out = serde_json::Map::new();
+        for (f, name) in self.names.iter().enumerate() {
+            let means: Vec<f64> = self.per_source[f].iter().map(|(bits, n)| bits / *n as f64).collect();
+            let worst: serde_json::Map<String, Value> =
+                worst_of.iter().filter(|k| **k <= means.len()).map(|&k| (format!("worst_of_{k}"), json!(means[..k].iter().copied().fold(f64::NEG_INFINITY, f64::max)))).collect();
+            out.insert(name.clone(), json!({"all_sources": self.all[f].summary(), "per_source_mean_bits": means, "shared_source": worst}));
+        }
+        Value::Object(out)
+    }
+}
+
+/// VPD's interchange experiments (VPD alone, the base's CI masks, the remainder dropped), every
+/// base patched at every position with one source shared across all bases; each model takes the
+/// source's read from its own run on the source (VPD with the source's own CI masks). Families:
+/// per base one read patch of one subcomponent's read direction (uniform over the subcomponents of
+/// the sites reading a block), the complement patch of each block (at each token the component
+/// outside the span of the active subcomponents' reads), and the complement patch at every block
+/// at once (each block's read taken under the earlier patches). VPD reads only its active
+/// coordinates, which a complement patch keeps, so its prediction there is its unpatched output.
+pub fn vpd_interchange(vpd: &Vpd, bases: &[Vec<u32>], sources: &[Vec<u32>], batch: usize, seed: u64, worst_of: &[usize]) -> Result<Value, String> {
+    let d = vpd.m.program.device().clone();
+    let (layers, blocks) = (vpd.layers(), 2 * vpd.layers());
+    let factors = &vpd.factors;
+    let mut rng = StdRng::seed_from_u64(seed);
+    // The read patches: per base a subcomponent uniform over the reading sites' subcomponents.
+    let reading: Vec<(usize, usize)> = (0..blocks).flat_map(|b| reading_sites(b).into_iter().map(move |s| (b, s))).collect();
+    let total: usize = reading.iter().map(|(_, s)| factors[*s].subcomponents()).sum();
+    let read_of: Vec<(usize, usize, usize)> = (0..bases.len())
+        .map(|_| {
+            let mut k = rng.random_range(0..total);
+            for &(b, s) in &reading {
+                if k < factors[s].subcomponents() {
+                    return (b, s, k);
+                }
+                k -= factors[s].subcomponents();
+            }
+            (0, 0, 0)
+        })
+        .collect();
+    // Each source's reads at every block: M's, and VPD's under the source's own CI masks.
+    let mut source_reads: Vec<(Vec<Array2<f64>>, Vec<Array2<f64>>)> = Vec::with_capacity(sources.len());
+    for source in sources {
+        let family = sequence_family(&[source.as_slice()])?;
+        let g = vpd.importances(&family)?;
+        let masks = Strategy::Ci.masks(&g, &mut rng);
+        let capture = |side: &Side, reads: &[usize], masks: Option<&Masks>| -> Result<Vec<Array2<f64>>, String> {
+            let mut out = vec![Array2::zeros((0, 0)); blocks];
+            let mut x: Option<Tensor> = None;
+            for l in 0..layers {
+                let given = match masks {
+                    Some(m) => vpd.given(&d, l, Some(m), family.rows)?,
+                    None => BTreeMap::new(),
+                };
+                let trace = side.layer_trace(&family, l, x.as_ref(), given, |_, _| Ok(None))?;
+                for b in [2 * l, 2 * l + 1] {
+                    out[b] = d.download(trace.value(reads[b])?).map_err(error)?;
+                }
+                x = Some(d.copy(trace.value(side.leaving(l))?).map_err(error)?);
+            }
+            Ok(out)
+        };
+        source_reads.push((capture(&vpd.m, &vpd.m_layout.reads, None)?, capture(&vpd.e, &vpd.layout.reads, Some(&masks))?));
+    }
+    let mut names = vec!["read".to_string()];
+    names.extend((0..blocks).map(|b| format!("complement_block_{b}")));
+    names.push("complement_every_block".into());
+    let mut families = Families { per_source: vec![vec![(0.0, 0); sources.len()]; names.len()], all: vec![Tokens::default(); names.len()], names };
+    for (c, chunk) in bases.chunks(batch).enumerate() {
+        let views: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
+        let family = sequence_family(&views)?;
+        let length = views[0].len();
+        let g = vpd.importances(&family)?;
+        let masks = Strategy::Ci.masks(&g, &mut rng);
+        let (_, m_streams) = streams(&vpd.m, &family, |_| BTreeMap::new())?;
+        // VPD's unpatched output, and M's reads at every block.
+        let mut x: Option<Tensor> = None;
+        for l in 0..layers {
+            x = Some(vpd.e.layer(&family, l, x.as_ref(), vpd.given(&d, l, Some(&masks), family.rows)?)?);
+        }
+        let e_logits = vpd.m.logits(&family, x.as_ref().ok_or_else(|| error("no layers"))?, length)?;
+        let mut m_reads = vec![Array2::zeros((0, 0)); blocks];
+        {
+            let mut x: Option<Tensor> = None;
+            for l in 0..layers {
+                let trace = vpd.m.layer_trace(&family, l, x.as_ref(), BTreeMap::new(), |_, _| Ok(None))?;
+                for b in [2 * l, 2 * l + 1] {
+                    m_reads[b] = d.download(trace.value(vpd.m_layout.reads[b])?).map_err(error)?;
+                }
+                x = Some(d.copy(trace.value(vpd.m.leaving(l))?).map_err(error)?);
+            }
+        }
+        let spans: Vec<Vec<Option<Array2<f32>>>> = (0..blocks).map(|b| active_spans(factors, &g, b)).collect::<Result<_, _>>()?;
+        let patches: Vec<ReadPatch> = (0..chunk.len())
+            .map(|r| {
+                let (block, site, k) = read_of[c * batch + r];
+                let v = factors[site].v.column(k).to_owned();
+                let norm = v.dot(&v).sqrt();
+                ReadPatch { block, row: r, q: v / norm }
+            })
+            .collect();
+        for (s, (m_source, e_source)) in source_reads.iter().enumerate() {
+            let score = |families: &mut Families, f: usize, m_final: &Tensor, e_logits: &[Array2<f64>]| -> Result<(), String> {
+                let reference = Reference::of(vpd.m.logits(&family, m_final, length)?)?;
+                let mut behaviour = Behaviour::default();
+                behaviour.add(&reference, e_logits, &views)?;
+                families.add(f, s, &behaviour.kl.0);
+                Ok(())
+            };
+            // A forward through `side` from layer `from` whose reads are replaced by `patch(block, h)`.
+            let patched_run = |side: &Side, reads: &[usize], from: usize, masks: Option<&Masks>, patch: &dyn Fn(usize, &Array2<f64>) -> Option<Array2<f64>>| -> Result<Tensor, String> {
+                let mut x: Option<Tensor> = (from > 0).then(|| d.copy(&m_streams[from])).transpose().map_err(error)?;
+                for l in from..layers {
+                    let given = match masks {
+                        Some(m) => vpd.given(&d, l, Some(m), family.rows)?,
+                        None => BTreeMap::new(),
+                    };
+                    let trace = side.layer_trace(&family, l, x.as_ref(), given, |node, trace| {
+                        let Some(b) = [2 * l, 2 * l + 1].into_iter().find(|b| reads[*b] == node) else { return Ok(None) };
+                        let h = d.download(trace.value(node)?).map_err(error)?;
+                        patch(b, &h).map(|value| d.upload(value.view()).map_err(error)).transpose()
+                    })?;
+                    x = Some(d.copy(trace.value(side.leaving(l))?).map_err(error)?);
+                }
+                x.ok_or_else(|| error("no layers"))
+            };
+            // The read patch, in M and in VPD.
+            let reads_at = |b: usize| -> Vec<&ReadPatch> { patches.iter().filter(|p| p.block == b).collect() };
+            let m_final = patched_run(&vpd.m, &vpd.m_layout.reads, 0, None, &|b, h| {
+                let at = reads_at(b);
+                (!at.is_empty()).then(|| read_patched(h, &m_source[b], &at, length))
+            })?;
+            let e_final = patched_run(&vpd.e, &vpd.layout.reads, 0, Some(&masks), &|b, h| {
+                let at = reads_at(b);
+                (!at.is_empty()).then(|| read_patched(h, &e_source[b], &at, length))
+            })?;
+            let e_read_logits = vpd.m.logits(&family, &e_final, length)?;
+            score(&mut families, 0, &m_final, &e_read_logits)?;
+            // The complement patch of each block, from M's stream entering its layer.
+            for b in 0..blocks {
+                let value = complement(&m_reads[b], &m_source[b], &spans[b]);
+                let m_final = patched_run(&vpd.m, &vpd.m_layout.reads, b / 2, None, &|at, _| (at == b).then(|| value.clone()))?;
+                score(&mut families, 1 + b, &m_final, &e_logits)?;
+            }
+            // The complement patch at every block at once.
+            let m_final = patched_run(&vpd.m, &vpd.m_layout.reads, 0, None, &|b, h| Some(complement(h, &m_source[b], &spans[b])))?;
+            score(&mut families, 1 + blocks, &m_final, &e_logits)?;
+        }
+        log::info!("battery: VPD interchange on {} bases", chunk.len());
+    }
+    let mut complement_blocks = Tokens::default();
+    (1..=blocks).for_each(|f| complement_blocks.0.extend_from_slice(&families.all[f].0));
+    Ok(json!({"patches": families.summary(worst_of), "complement_all_blocks": complement_blocks.summary()}))
+}
+
+// ------------------------------------------------------------------------------ cancellation
+
+/// Per token, `a·b / (|a| |b|)` (zero where either vanishes).
+fn cosines(a: &Array2<f64>, b: &Array2<f64>) -> Vec<f64> {
+    a.outer_iter()
+        .zip(b.outer_iter())
+        .map(|(x, y)| {
+            let n = (x.dot(&x) * y.dot(&y)).sqrt();
+            if n > 0.0 { x.dot(&y) / n } else { 0.0 }
+        })
+        .collect()
+}
+
+/// Why VPD's layer errors cancel (CI masks, remainder dropped). Layer `l`'s dropped part on a
+/// stream `x` entering it is `c_l(x)`, `M`'s layer increment less VPD's. Per pair `(l, L − 1)`, per
+/// token: the cosine at the final residual between `D_l` and `D_{L−1}`, the deviations from VPD's
+/// layer `l` alone and its last layer alone; `r = |c_{L−1}(x′) − c_{L−1}(x)| / |c_{L−1}(x)|`, `x`
+/// `M`'s stream entering the last layer and `x′` that stream with VPD's layer `l` alone; the
+/// cosine of that change with `D_l`, and of `c_{L−1}(x)` with `D_l`. Since the last layer's
+/// deviation is `D_{L−1} = −c_{L−1}(x)`, masking both gives `D_l + D_{L−1} − change`.
+pub fn vpd_cancellation(vpd: &Vpd, bases: &[Vec<u32>], batch: usize, seed: u64) -> Result<Value, String> {
+    let d = vpd.m.program.device().clone();
+    let layers = vpd.layers();
+    let last = layers - 1;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out: Vec<[Tokens; 4]> = (0..last).map(|_| Default::default()).collect();
+    for chunk in bases.chunks(batch) {
+        let views: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
+        let family = sequence_family(&views)?;
+        let g = vpd.importances(&family)?;
+        let masks = Strategy::Ci.masks(&g, &mut rng);
+        let (_, m_streams) = streams(&vpd.m, &family, |_| BTreeMap::new())?;
+        // The run with VPD at layer `only` alone: its stream entering the last layer, and its final residual.
+        let alone = |only: usize| -> Result<(Tensor, Tensor), String> {
+            let mut x: Option<Tensor> = (only > 0).then(|| d.copy(&m_streams[only])).transpose().map_err(error)?;
+            let mut entering = None;
+            for l in only..layers {
+                if l == last {
+                    entering = x.as_ref().map(|t| d.copy(t)).transpose().map_err(error)?;
+                }
+                x = Some(if l == only { vpd.e.layer(&family, l, x.as_ref(), vpd.given(&d, l, Some(&masks), family.rows)?)? } else { vpd.m.layer(&family, l, x.as_ref(), BTreeMap::new())? });
+            }
+            let entering = match entering {
+                Some(e) => e,
+                None => d.copy(&m_streams[last]).map_err(error)?,
+            };
+            Ok((entering, x.ok_or_else(|| error("no layers"))?))
+        };
+        let dropped = |x: &Tensor| -> Result<Array2<f64>, String> {
+            let m = d.download(&vpd.m.layer(&family, last, Some(x), BTreeMap::new())?).map_err(error)?;
+            let e = d.download(&vpd.e.layer(&family, last, Some(x), vpd.given(&d, last, Some(&masks), family.rows)?)?).map_err(error)?;
+            Ok(m - e)
+        };
+        let m_final = d.download(&m_streams[layers]).map_err(error)?;
+        let (_, last_final) = alone(last)?;
+        let d_last = d.download(&last_final).map_err(error)? - &m_final;
+        let c_last = dropped(&m_streams[last])?;
+        for (l, stats) in out.iter_mut().enumerate() {
+            let (entering, final_l) = alone(l)?;
+            let d_l = d.download(&final_l).map_err(error)? - &m_final;
+            let change = dropped(&entering)? - &c_last;
+            stats[0].0.extend(cosines(&d_l, &d_last));
+            stats[1].0.extend(change.outer_iter().zip(c_last.outer_iter()).map(|(a, b)| {
+                let n = b.dot(&b).sqrt();
+                if n > 0.0 { a.dot(&a).sqrt() / n } else { 0.0 }
+            }));
+            stats[2].0.extend(cosines(&change, &d_l));
+            stats[3].0.extend(cosines(&c_last, &d_l));
+        }
+        log::info!("battery: VPD cancellation on {} bases", chunk.len());
+    }
+    let mut result = serde_json::Map::new();
+    for (l, stats) in out.iter().enumerate() {
+        result.insert(
+            format!("pair_{l}_{last}"),
+            json!({
+                "cos_deviations": stats[0].summary(),
+                "relative_change_of_last_dropped": stats[1].summary(),
+                "cos_change_deviation": stats[2].summary(),
+                "cos_last_dropped_deviation": stats[3].summary(),
+            }),
+        );
+    }
+    Ok(Value::Object(result))
+}

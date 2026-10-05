@@ -104,6 +104,7 @@ pub mod intervention_program;
 
 // Interchange experiments of causal abstraction on the device: cuts, read and complement patches.
 pub mod interchange;
+pub mod explanation_battery;
 #[cfg(test)]
 mod interchange_tests;
 

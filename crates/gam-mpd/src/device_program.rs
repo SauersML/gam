@@ -1147,8 +1147,21 @@ impl DeviceProgram {
         end: usize,
         edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
+        self.forward_span_given(family, BTreeMap::new(), entry, end, edit)
+    }
+
+    /// [`Self::forward_span`], the raw slots in `given` taking those device values as in
+    /// [`Self::forward_given`].
+    pub fn forward_span_given(
+        &self,
+        family: &FamilyInputs,
+        given: BTreeMap<usize, Tensor>,
+        entry: Option<(usize, Tensor)>,
+        end: usize,
+        edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
+    ) -> Result<DeviceTrace, String> {
         let hooks = Hooks { before: None, edit: true };
-        self.forward_hooks(Some(family), BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, hooks, |_, _| Ok(()), edit, Reuse::Nothing, Span { entry, end })
+        self.forward_hooks(Some(family), given, &[], |_, _| Err("no gate".into()), false, hooks, |_, _| Ok(()), edit, Reuse::Nothing, Span { entry, end })
     }
 
     pub fn is_streamed_head(&self, node: usize) -> bool {
