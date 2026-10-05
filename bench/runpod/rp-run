@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Rented RunPod GPUs for #2951, billed to the MATS team account.
+# Rented GPUs for #2951: RunPod's, billed to the MATS team account, and Thunder Compute's (the
+# user's own account) once its key is in the Keychain (PROVIDERS, below).
 #
 #   rp-run NAME GPU_TYPE[,GPU_TYPE...] HOURS -- COMMAND...      run COMMAND on one pod
 #   rp-run dev NAME [GPU_TYPE[,GPU_TYPE...] [HOURS]] [-- PATH...] a pod held for development
@@ -8,17 +9,20 @@
 #   rp-run batch SPEC                                             launch every run SPEC lists, at once
 #   rp-run status                                                 one line per running pod
 #
-# GPU_TYPE is a RunPod GPU id ("NVIDIA RTX A5000") or its display name ("RTX A5000"); a list gives
-# the types in order of preference; auto ranks the cards of the benchmark table (gpu_bench.tsv) by
-# their measured $ per scored token at community prices, keeping those with RP_MIN_VRAM_GB of memory,
-# and prints the choice. Work that does not use a GPU (builds, float64 references, CPU fits) goes to
+# GPU_TYPE is a RunPod GPU id ("NVIDIA RTX A5000") or its display name ("RTX A5000"), or a Thunder
+# card thunder:CARD[:MODE] (thunder:a6000, thunder:a100xl:prototyping); a list gives the types in
+# order of preference; auto ranks every offer (RunPod's community and secure, Thunder's) of the cards
+# the benchmark table (gpu_bench.tsv) has measured by $ per scored token, keeping those with
+# RP_MIN_VRAM_GB of memory, and prints the choice; a Thunder card enters it once a benchmark run of
+# it (gpu_bench.sh, GPU thunder:CARD:MODE) is in the table. Work that does not use a GPU (builds, float64 references, CPU fits) goes to
 # GitHub Actions (gha-run), never to a RunPod pod. A run takes community cloud for every listed type before secure
 # cloud, which it takes only when no community pod is in stock (RunPod no longer offers spot pods:
 # "Spot pods are no longer offered", 2026-10-05). It runs COMMAND on the source of a published
 # commit, the outputs come back, and the pod is deleted. HOURS (fractional) caps the run: the Mac
 # deletes the pod HOURS after the first pod's creation (a watcher process that outlives this one),
 # and each pod deletes itself when that time is up by its own clock (runpodctl with the pod's own
-# key), so a Mac that sleeps, disconnects or dies still stops the bill.
+# key; a Thunder instance shuts down, which ends its bill), so a Mac that sleeps, disconnects or
+# dies still stops the bill.
 #
 # A pod lost before COMMAND ends (a host that fails, a pod deleted elsewhere) is replaced while time
 # remains. The new pod gets the same source, binaries and inputs and the outputs synced so far, and
@@ -80,7 +84,8 @@
 # myself.clientBalance), whoever spent it, plus what every pod running on the account may still
 # cost (its price for the time left to its cap; 4 h for a pod made outside the runner, which every
 # start names); a launch or extension whose estimate (the dearest offer x HOURS) would pass it is
-# refused unless RP_ALLOW_OVER=1. Each pod appends (date, name, gpu, cloud, hours, dollars, pod) to
+# refused unless RP_ALLOW_OVER=1. Thunder pods count toward the same cap: what the ledger records
+# for them (cloud THUNDER) plus their price for the time left to their caps. Each pod appends (date, name, gpu, cloud, hours, dollars, pod) to
 # ~/mpd-data/runpod/LEDGER.tsv, dollars = the pod's price per hour x hours from creation to
 # deletion; cloud is COMMUNITY, SECURE:cheapest-per-token, SECURE:no-community-stock or SECURE:dev; then the seconds
 # the pod spent uploading inputs, building data, and from its creation to the command's start (the
@@ -175,6 +180,80 @@ status_of() { printf '%s' "${1##*$'\n'}"; }
 body_of() { printf '%s' "${1%$'\n'*}"; }
 gql() { api POST "$GRAPHQL" "$(jq -nc --arg q "$1" '{query: $q}')"; }
 
+# Providers besides RunPod, each used only while the macOS Keychain holds its API key (service
+# PROVIDER-api-key): with thunder listed, `security add-generic-password -s thunder-api-key -a "$USER" -w`
+# turns Thunder Compute on, and deleting the key turns it off.
+PROVIDERS=(thunder)
+# Thunder Compute (the user's own account). A pod id thunder-ID is its instance ID. Its cards are
+# a6000, a100xl, l40 and h100, in prototyping mode (a GPU attached over the network, cheaper) or
+# production mode (a GPU in the machine); an offer's GPU is written thunder:CARD:MODE, the name a
+# benchmark run of it gets in gpu_bench.tsv. The price is read from Thunder's public price list at
+# launch: the card's hourly rate (production's own rate where it lists one), plus the vCPUs above
+# those the card includes (the fewest its spec offers) and the disk above the 100 GB included, at
+# its per-vCPU and per-GB rates; Thunder bills only while an instance runs. An offer above the
+# lead's ceiling for its card (THUNDER_CEILING, $/h) is never taken, nor is a card it does not name.
+# Instances run the cuda12-8 template (Ubuntu, CUDA 12.8: NVRTC for the device code) as user
+# ubuntu. No key goes on an instance, so it cannot delete itself: at the cap the Mac's watcher
+# deletes it, and the instance itself shuts down (which ends the bill).
+THUNDER=https://api.thundercompute.com:8443/v1
+THUNDER_CEILING='{"a6000": 0.45, "a100xl": 1.10, "h100": 1.50}'
+provider_of() { case $1 in thunder-*) echo thunder ;; *) echo runpod ;; esac; }
+thunder_enabled() {
+    [ -z "${RP_TEST_ROOT:-}" ] && [[ " ${PROVIDERS[*]} " == *" thunder "* ]] && security find-generic-password -s thunder-api-key > /dev/null 2>&1
+}
+# The vCPUs a Thunder instance gets: the fewest its spec offers with RP_MIN_RAM_GB of memory
+# (default 32; it gives ramPerVCPUGiB per vCPU); null when none has that much (no offer).
+THUNDER_CORES='def cores($s; $ram): [($s.vcpuOptions | sort)[] | select(. * ($s.ramPerVCPUGiB // 8) >= $ram)] | first;'
+
+tapi() {  # METHOD PATH [JSON]; prints the body, then the HTTP status on its own line
+    local args=(-sS -X "$1" --max-time 60 -w '\n%{http_code}' -H 'Content-Type: application/json')
+    [ -n "${3:-}" ] && args+=(--data-binary "$3")
+    curl "${args[@]}" -H @<(printf 'Authorization: Bearer %s\n' "$(security find-generic-password -s thunder-api-key -w)") "$THUNDER$2" || printf '\n000'
+}
+# POD's state as the runner acts on it: RUNNING; GONE (deleted, or terminated: the run ends);
+# OTHER (stopped or exited by its host: the run may replace it); UNKNOWN (the API did not answer).
+pod_state() {
+    local r
+    case $(provider_of "$1") in
+        thunder)
+            r=$(tapi GET /instances/list)
+            [ "$(status_of "$r")" = 200 ] || { echo UNKNOWN; return; }
+            jq -r --arg id "${1#thunder-}" 'if has($id) then (if (.[$id].status // "" | ascii_upcase) == "RUNNING" then "RUNNING" else "OTHER" end) else "GONE" end' <<< "$(body_of "$r")" ;;
+        *)
+            r=$(api GET "$REST/pods/$1")
+            case $(status_of "$r") in
+                404) echo GONE ;;
+                200) jq -r 'if (.desiredStatus == "TERMINATED") or ((.lastStatusChange // "") | startswith("Terminated")) then "GONE"
+                            elif .desiredStatus == "RUNNING" then "RUNNING" else "OTHER" end' <<< "$(body_of "$r")" ;;
+                *) echo UNKNOWN ;;
+            esac ;;
+    esac
+}
+# Thunder's single-GPU offers under the ceilings: "THUNDER|PRICE|thunder:CARD:MODE|VRAM GB" per
+# line, from its public lists, priced for DISK GB of disk (0: the included 100 GB).
+thunder_offers() {  # DISK
+    local pricing specs
+    thunder_enabled || return 0
+    pricing=$(curl -sS --max-time 30 "$THUNDER/pricing") && specs=$(curl -sS --max-time 30 "$THUNDER/specs") || return 0
+    jq -rn --argjson p "$pricing" --argjson s "$specs" --argjson ceil "$THUNDER_CEILING" --argjson ram "${RP_MIN_RAM_GB:-32}" --argjson disk "${1:-0}" "$THUNDER_CORES"'
+        $s.specs | to_entries[] | select(.key | test("^[a-z0-9]+_x1_(prototyping|production)$"))
+        | (.key | capture("^(?<g>[a-z0-9]+)_x1_(?<m>[a-z]+)$")) as $k | .value as $spec
+        | ($p.pricing[if $k.m == "production" and ($p.pricing[$k.g + "_native"] != null) then $k.g + "_native" else $k.g + "_x1" end]) as $gpu
+        | cores($spec; $ram) as $n | select(($gpu // 0) > 0 and $n != null)
+        | ($gpu + ($n - ($spec.vcpuOptions | min)) * ($p.pricing.additional_vcpus // 0)
+           + ([$disk - ($spec.storageGB.min // 100), 0] | max) * ($p.pricing.disk_gb // 0)) as $price
+        | select($ceil[$k.g] != null and $price <= $ceil[$k.g])
+        | "THUNDER|\($price * 10000 | round / 10000)|thunder:\($k.g):\($k.m)|\($spec.vramGB)"'
+}
+# Thunder's instances: "ID STATUS" per line.
+thunder_instances() {
+    local r
+    thunder_enabled || return 0
+    r=$(tapi GET /instances/list)
+    [ "$(status_of "$r")" = 200 ] || { echo "rp-run: Thunder instance list failed: $(body_of "$r" | head -c 200)" >&2; return 1; }
+    jq -r 'to_entries[] | "\(.key) \(.value.status // "?")"' <<< "$(body_of "$r")"
+}
+
 # The binaries a run needs ("NAME" for an example, "test:PACKAGE:NAME" for a test) that neither the
 # prerelease rp-run-bin (assets KEY.NAME, built on GitHub Actions) nor the Mac's cache _bin/KEY holds.
 ASSETS=https://github.com/SauersML/gam/releases/download/rp-run-bin
@@ -193,6 +272,8 @@ registered() { grep -q "^$1	" "$REGISTRY" 2> /dev/null || cut -f7 "$LEDGER" 2> /
 owned() {
     local r
     registered "$1" || return 1
+    # Thunder instances are on the user's own account and carry no name the runner sets.
+    [ "$(provider_of "$1")" = runpod ] || return 0
     r=$(api GET "$REST/pods/$1")
     case $(status_of "$r") in
         404) return 0 ;;
@@ -217,6 +298,13 @@ reap() {
     end=$(cat "$ACTIVE/.$pod.end" 2> /dev/null || echo deleted)
     gpu=${gpu//_/ }
     while (( tries < 20 )); do
+        if [ "$(provider_of "$pod")" = thunder ]; then
+            tapi POST "/instances/${pod#thunder-}/delete" > /dev/null
+            [ "$(pod_state "$pod")" != GONE ] || { gone=1; break; }
+            tries=$(( tries + 1 ))
+            sleep 6
+            continue
+        fi
         r=$(api DELETE "$REST/pods/$pod")
         r=$(api GET "$REST/pods/$pod")
         code=$(status_of "$r")
@@ -318,7 +406,17 @@ budget() {  # ESTIMATE WHAT
         fi
         running=$(awk -v a="$running" -v p="$price" -v t="$left" 'BEGIN { printf "%.2f", a + (t > 0 ? p * t / 3600 : 0) }')
     done <<< "$pods"
-    echo "rp-run: account spent \$$spent (balance \$$balance, \$$(jq -r '.data.myself.currentSpendPerHr' <<< "$b")/h now); running pods may add \$$running; $2 \$$1" >&2
+    # Thunder: what its pods in the ledger cost, and what each held one may still cost to its cap.
+    local tspent
+    tspent=$(awk -F'\t' 'NR > 1 && $4 == "THUNDER" { s += $6 } END { printf "%.2f", s }' "$LEDGER" 2> /dev/null || echo 0)
+    spent=$(awk -v a="$spent" -v t="$tspent" 'BEGIN { printf "%.2f", a + t }')
+    for rec in "$ACTIVE"/thunder-*; do
+        [ -f "$rec" ] && [ -f "$ACTIVE/.${rec##*/}.deadline" ] || continue
+        read -r _ _ _ price _ < "$rec"
+        left=$(( $(cat "$ACTIVE/.${rec##*/}.deadline") - now ))
+        running=$(awk -v a="$running" -v p="$price" -v t="$left" 'BEGIN { printf "%.2f", a + (t > 0 ? p * t / 3600 : 0) }')
+    done
+    echo "rp-run: spent \$$spent (RunPod team account: balance \$$balance, \$$(jq -r '.data.myself.currentSpendPerHr' <<< "$b")/h now; Thunder \$$tspent); running pods may add \$$running; $2 \$$1" >&2
     if awk -v s="$spent" -v r="$running" -v e="$1" -v c="$CAP_DOLLARS" 'BEGIN { exit !(s + r + e > c) }' && [ -z "${RP_ALLOW_OVER:-}" ] && [ -z "${RP_DRY:-}" ]; then
         echo "rp-run: \$$spent + \$$running + \$$1 exceeds \$$CAP_DOLLARS; RP_ALLOW_OVER=1 to spend it anyway" >&2
         exit 2
@@ -355,6 +453,27 @@ case ${1:-} in
         r=$(api GET "$REST/pods?includeMachine=true")
         [ "$(status_of "$r")" = 200 ] || { echo "rp-run: pod list failed: $(body_of "$r" | head -c 200)" >&2; exit 1; }
         pods=$(jq -r '.[] | select(.desiredStatus == "RUNNING") | [.id, .name, (.costPerHr // 0), (.machine.gpuTypeId // .gpu.id // .cpuFlavorId // "?"), (.createdAt // ""), (.publicIp // "-"), (.portMappings["22"] // "-")] | @tsv' <<< "$(body_of "$r")")
+        # Thunder's instances, as rows of the same form: ours named from the registry, priced and
+        # timed from their records (creation time in UTC, as RunPod gives it).
+        if thunder_enabled; then
+            tr=$(tapi GET /instances/list)
+            if [ "$(status_of "$tr")" = 200 ]; then
+                while IFS=$'\t' read -r tid tgpu tip tport; do
+                    [ -n "$tid" ] || continue
+                    pod=thunder-$tid tname="-" tprice="-" tcreated=""
+                    if registered "$pod"; then
+                        tname=mpd2951-$(awk -F'\t' -v p="$pod" '$1 == p { n = $2 } END { print n }' "$REGISTRY")
+                        if [ -f "$ACTIVE/$pod" ]; then
+                            read -r _ _ _ tprice c _ < "$ACTIVE/$pod"
+                            tcreated=$(date -u -r "$c" '+%Y-%m-%d %H:%M:%S')
+                        fi
+                    fi
+                    pods+=$'\n'"$pod"$'\t'"$tname"$'\t'"$tprice"$'\t'"thunder:$tgpu"$'\t'"$tcreated"$'\t'"$tip"$'\t'"$tport"
+                done < <(jq -r 'to_entries[] | [.key, ((.value.gpuType // "?") + ":" + (.value.mode // "?")), (.value.ip // "-"), (.value.port // "-")] | @tsv' <<< "$(body_of "$tr")")
+            else
+                echo "rp-run: Thunder instance list failed: $(body_of "$tr" | head -c 200)" >&2
+            fi
+        fi
         now=$(date +%s)
         # Each held GPU pod's mean GPU utilization over the last 10 minutes, read from its own samples
         # through its runner's SSH key, all pods at once. A pod held by a runner from before the
@@ -363,9 +482,9 @@ case ${1:-} in
         while IFS=$'\t' read -r id _ _ _ _ pip pport; do
             [ -n "$id" ] && [ -f "$ACTIVE/$id" ] || continue
             if [ -f "$ACTIVE/.$id.ssh" ]; then
-                read -r ip port tmp < "$ACTIVE/.$id.ssh"
+                read -r ip port tmp user < "$ACTIVE/.$id.ssh"
                 ssh -F none -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$tmp/known_hosts" -o StrictHostKeyChecking=accept-new \
-                    -o ConnectTimeout=8 -o LogLevel=ERROR -p "$port" "root@$ip" \
+                    -o ConnectTimeout=8 -o LogLevel=ERROR -p "$port" "${user:-root}@$ip" \
                     "awk -v t=\$(( \$(date +%s) - 600 )) '\$1 >= t && NF == 2 { s += \$2; n++ } END { if (n) printf \"%d\", s / n }' /workspace/gpu-util.log 2> /dev/null" \
                     > "$utils/$id" 2> /dev/null < /dev/null &
             elif [ "$pip" != - ] && [ "$pport" != - ]; then
@@ -409,9 +528,12 @@ case ${1:-} in
         done <<< "$pods"
         rm -rf "$utils"
         r=$(gql 'query { myself { clientBalance currentSpendPerHr } }')
-        jq -r --arg s "$START_BALANCE" --arg c "$CAP_DOLLARS" --arg idle "$idle_rate" '.data.myself
-            | (($s | tonumber) - .clientBalance) as $spent
-            | "account (shared with other MATS users; the $150 check counts all of it): $\($spent * 100 | round / 100) spent since $\($s), $\(.currentSpendPerHr)/h now ($\($idle | tonumber * 100 | round / 100)/h on GPUs under 20%); at this rate the $\($c) cap is \(if .currentSpendPerHr > 0 then ((($c | tonumber) - $spent) / .currentSpendPerHr * 10 | round / 10 | tostring) + " h" else "never" end) away"' <<< "$(body_of "$r")"
+        # Thunder's part: its pods in the ledger, and the rate of those running now.
+        tspent=$(awk -F'\t' 'NR > 1 && $4 == "THUNDER" { s += $6 } END { printf "%.2f", s }' "$LEDGER" 2> /dev/null || echo 0)
+        trate=$(awk -F'\t' '$1 ~ /^thunder-/ && $3 != "-" { s += $3 } END { printf "%.4f", s }' <<< "$pods")
+        jq -r --arg s "$START_BALANCE" --arg c "$CAP_DOLLARS" --arg idle "$idle_rate" --argjson ts "$tspent" --argjson tr "$trate" '.data.myself
+            | (($s | tonumber) - .clientBalance + $ts) as $spent | (.currentSpendPerHr + $tr) as $rate
+            | "spend (the RunPod team account, shared with other MATS users, and our Thunder pods; the $\($c) check counts all of it): $\($spent * 100 | round / 100) since $\($s) of RunPod credit (Thunder $\($ts)), $\($rate * 100 | round / 100)/h now ($\($idle | tonumber * 100 | round / 100)/h on GPUs under 20%); at this rate the $\($c) cap is \(if $rate > 0 then ((($c | tonumber) - $spent) / $rate * 10 | round / 10 | tostring) + " h" else "never" end) away"' <<< "$(body_of "$r")"
         exit 0 ;;
     batch)
         [ $# -eq 2 ] && [ -f "$2" ] || usage
@@ -500,8 +622,9 @@ hours_ok "$HOURS"
 CAP_SECONDS=$(awk -v h="$HOURS" 'BEGIN { printf "%d", h * 3600 }')
 OUT=$RP/$NAME
 
-# The offers, one per line "KIND|PRICE|GPU id": a run takes community for every type before secure;
-# a dev pod takes the types in order, community before secure for each.
+# The offers, one per line "KIND|PRICE|GPU id": a run takes community (or another provider's
+# offer) for every type before secure; a dev pod takes the types in order, community before secure
+# for each. A type thunder:CARD[:MODE] is Thunder's (both modes, cheaper first, when MODE is not given).
 OFFERS=""
 [ "$GPU" != cpu ] || { echo "rp-run: work without a GPU goes to GitHub Actions: bench/runpod/gha-run" >&2; exit 2; }
 if :; then
@@ -515,20 +638,20 @@ if :; then
         # sequences. A secure offer comes before a community one only when it costs less per token
         # (a secure RTX 4090 before a community L40S). Cards the table has not measured are offered
         # only when no measured card has the memory, cheapest per hour first.
+        # Thunder's offers are ranked by their own measured rows (card thunder:CARD:MODE).
         [ -f "$TABLE" ] || { echo "rp-run: GPU_TYPE auto needs the benchmark table $TABLE" >&2; exit 2; }
         metric="vpd4l bf16 s32 tok/s"
         (( ${RP_MIN_VRAM_GB:-0} > 24 )) && metric="qwen3 bf16 s8 tok/s"
+        thunder=$(thunder_offers | jq -Rsc 'split("\n") | map(select(length > 0) | split("|") | {k: .[0], c: 0, p: (.[1] | tonumber), g: .[2], mem: (.[3] | tonumber)})')
         OFFERS=$(awk -F'\t' -v m="$metric" 'NR == 1 { for (i = 1; i <= NF; i++) { if ($i == "card") c = i; if ($i == m) t = i }; next }
                  t && $t != "-" && $t + 0 > 0 { print $c "\t" $t }' "$TABLE" |
-            jq -Rrs --argjson types "$(jq -c '.data.gpuTypes' <<< "$prices")" --argjson need "${RP_MIN_VRAM_GB:-0}" '
-                (split("\n") | map(select(length > 0) | split("\t") | {id: .[0], rate: (.[1] | tonumber)})) as $measured
-                | ($types | map({key: .id, value: .}) | from_entries) as $byid
+            jq -Rrs --argjson types "$(jq -c '.data.gpuTypes' <<< "$prices")" --argjson need "${RP_MIN_VRAM_GB:-0}" --argjson thunder "$thunder" '
+                (split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: (.[1] | tonumber)}) | from_entries) as $rate
                 | def offers($t): [{k: "COMMUNITY", c: 0, p: $t.communityPrice}, {k: "SECURE:cheapest-per-token", c: 1, p: $t.securePrice}] | map(select((.p // 0) > 0));
-                  [$measured[] | select($byid[.id] != null) | .rate as $r | $byid[.id] as $t | select(($t.memoryInGb // 0) >= $need)
-                   | offers($t)[] | . + {g: $t.id, per: (.p / ($r * 3600 / 1e6))}]
+                  ([$types[] | . as $t | offers($t)[] | . + {g: $t.id, mem: ($t.memoryInGb // 0)}] + $thunder | map(select(.mem >= $need))) as $all
+                | [$all[] | select($rate[.g] != null) | . + {per: (.p / ($rate[.g] * 3600 / 1e6))}]
                 | if length > 0 then sort_by([.per, .c])
-                  else [$types[] | select((.memoryInGb // 0) >= $need) | select(.id | test("A40|A6000|L40|A100|H100|H200"))
-                        | . as $t | offers($t)[] | . + {g: $t.id, per: null}] | sort_by([.c, .p]) end
+                  else [$all[] | select((.g | startswith("thunder:")) or (.g | test("A40|A6000|L40|A100|H100|H200"))) | . + {per: null}] | sort_by([.c, .p]) end
                 | .[] | "\(.k)|\(.p)|\(.g)|\(.per // "-")"')
         [ -n "$OFFERS" ] || { echo "rp-run: no card has ${RP_MIN_VRAM_GB:-0} GB" >&2; exit 2; }
         echo "rp-run: auto, cheapest per scored token on the $metric workload (from $TABLE):" >&2
@@ -537,22 +660,28 @@ if :; then
         GPU=$(cut -d'|' -f3 <<< "$OFFERS" | awk '!seen[$0]++' | paste -sd, -)
     else
     rows=()
+    secure_kind=SECURE:no-community-stock
+    [ "$MODE" = dev ] && secure_kind=SECURE:dev
     IFS=, read -r -a types <<< "$GPU"
     for g in "${types[@]}"; do
         g=$(sed 's/^ *//; s/ *$//' <<< "$g")
-        row=$(jq -c --arg g "$g" '[.data.gpuTypes[] | select(.id == $g or .displayName == $g)][0] // empty' <<< "$prices")
-        [ -n "$row" ] || { echo "rp-run: unknown GPU type '$g'; known: $(jq -r '[.data.gpuTypes[].displayName] | join(", ")' <<< "$prices")" >&2; exit 2; }
+        if [[ $g == thunder:* ]]; then
+            [ -n "${thunder+x}" ] || thunder=$(thunder_offers)
+            row=$(awk -F'|' -v g="$g" '$3 == g || index($3, g ":") == 1 { printf "%s{\"k\": \"%s\", \"p\": %s, \"g\": \"%s\", \"c\": 0}", (n++ ? "," : ""), $1, $2, $3 }' <<< "$thunder")
+            [ -n "$row" ] || { echo "rp-run: Thunder offers no $g under the ceilings $THUNDER_CEILING (needs thunder-api-key in the Keychain); its offers: $(cut -d'|' -f2,3 <<< "${thunder:-none}" | paste -sd ' ' -)" >&2; exit 2; }
+            rows+=("[$row]")
+            continue
+        fi
+        row=$(jq -c --arg g "$g" --arg sk "$secure_kind" '[.data.gpuTypes[] | select(.id == $g or .displayName == $g)][0] // empty
+            | [{k: "COMMUNITY", p: .communityPrice, c: 0, g: .id}, {k: $sk, p: .securePrice, c: 1, g: .id}]' <<< "$prices")
+        [ -n "$row" ] || { echo "rp-run: unknown GPU type '$g'; known: $(jq -r '[.data.gpuTypes[].displayName] | join(", ")' <<< "$prices"), thunder:CARD[:MODE]" >&2; exit 2; }
         rows+=("$row")
     done
-    secure_kind=SECURE:no-community-stock
-    [ "$MODE" = dev ] && secure_kind=SECURE:dev
-    OFFERS=$(printf '%s\n' "${rows[@]}" | jq -rs --arg mode "$MODE" --arg sk "$secure_kind" '
-        [to_entries[] | .key as $i | .value as $t
-         | ({k: "COMMUNITY", p: $t.communityPrice, i: $i, c: 0}, {k: $sk, p: $t.securePrice, i: $i, c: 1})
-         | select((.p // 0) > 0) | . + {g: $t.id}]
-        | (if $mode == "dev" then sort_by([.i, .c]) else sort_by([.c, .i]) end)
+    OFFERS=$(printf '%s\n' "${rows[@]}" | jq -rs --arg mode "$MODE" '
+        [to_entries[] | .key as $i | .value[] | select((.p // 0) > 0) | . + {i: $i}]
+        | (if $mode == "dev" then sort_by([.i, .c, .p]) else sort_by([.c, .i, .p]) end)
         | .[] | "\(.k)|\(.p)|\(.g)"')
-    [ -n "$OFFERS" ] || { echo "rp-run: RunPod offers none of $GPU" >&2; exit 2; }
+    [ -n "$OFFERS" ] || { echo "rp-run: no provider offers any of $GPU" >&2; exit 2; }
     fi
 fi
 
@@ -761,6 +890,14 @@ if [ -n "${RP_DISK_GB:-}" ]; then
     [[ $RP_DISK_GB =~ ^[0-9]+$ ]] && (( RP_DISK_GB >= DISK )) || { echo "rp-run: RP_DISK_GB must be a whole number of GB, at least $DISK" >&2; exit 2; }
     DISK=$RP_DISK_GB
 fi
+# Thunder's offers repriced for that disk (the estimate follows).
+if grep -q '^THUNDER|' <<< "$OFFERS"; then
+    thunder=$(thunder_offers "$DISK")
+    OFFERS=$(awk -F'|' 'NR == FNR { p[$3] = $2; next } $1 == "THUNDER" { if (!($3 in p)) next; $2 = p[$3] } { print }' OFS='|' <(printf '%s\n' "$thunder") - <<< "$OFFERS")
+    [ -n "$OFFERS" ] || { echo "rp-run: Thunder's offers pass the ceilings with $DISK GB of disk" >&2; exit 2; }
+    PRICE_MAX=$(awk -F'|' '$2 > m { m = $2 } END { print m }' <<< "$OFFERS")
+    ESTIMATE=$(awk -v p="$PRICE_MAX" -v h="$HOURS" 'BEGIN { printf "%.2f", p * h }')
+fi
 
 # The pod deletes itself at the run's deadline by its own clock, then starts as the image would.
 create_body() {  # CLOUD GPU_ID SECONDS_LEFT PUBLIC_KEYS
@@ -792,7 +929,7 @@ if [ -n "${RP_DRY:-}" ]; then
     echo "source:   crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md ${srcpaths[*]:-}"
     echo "binaries: $(unbuilt | tr '\n' ' ' | sed 's/^$/all built/; s/^\(.\)/to build on GitHub Actions: \1/') (examples ${examples[*]:-none}, tests ${tests[*]:-none}, key $KEY)"
     echo "command:  ${cmd:-none}"
-    echo "request:  $(IFS='|' read -r k p g <<< "$(head -n 1 <<< "$OFFERS")"; create_body "$k" "$g" "$CAP_SECONDS" '<run key> <~/.ssh/runpod_ed25519.pub>')"
+    echo "request:  $(IFS='|' read -r k p g <<< "$(head -n 1 <<< "$OFFERS")"; if [[ $g == thunder:* ]]; then thunder_body "$g" '<run key>'; else create_body "$k" "$g" "$CAP_SECONDS" '<run key> <~/.ssh/runpod_ed25519.pub>'; fi)"
     exit 0
 fi
 
@@ -805,13 +942,15 @@ TMP=$(mktemp -d /tmp/rp-run.XXXXXX)
 ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$TMP/key"
 chmod 600 "$TMP/key"
 KEYS="$( [ -f "$TMP/key.pub" ] && cat "$TMP/key.pub")"$'\n'"$(cat ~/.ssh/runpod_ed25519.pub)"
-POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED=""
+POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0
 SSH=(ssh -F none -i "$TMP/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ForwardX11=no
      -o UserKnownHostsFile="$TMP/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20
      -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o LogLevel=ERROR)
 # One shared connection for the control steps; the uploads open their own, in parallel.
-on_pod() { "${SSH[@]}" -o ControlMaster=auto -o ControlPath="$TMP/cm-%C" -o ControlPersist=600 -p "$PORT" "root@$IP" "$@"; }
-new_conn() { "${SSH[@]}" -o ControlPath=none -p "$PORT" "root@$IP" "$@"; }
+# RunPod pods log in as root; Thunder instances as ubuntu (with sudo).
+SSH_USER=root
+on_pod() { "${SSH[@]}" -o ControlMaster=auto -o ControlPath="$TMP/cm-%C" -o ControlPersist=600 -p "$PORT" "$SSH_USER@$IP" "$@"; }
+new_conn() { "${SSH[@]}" -o ControlPath=none -p "$PORT" "$SSH_USER@$IP" "$@"; }
 
 finish() {
     local rc=$?
@@ -835,6 +974,15 @@ finish() {
             rc=1
         done < <(jq -r --arg n "mpd2951-$NAME" '.[]? | select(.name == $n) | select(.desiredStatus == "RUNNING") | .id' <<< "$(body_of "$r")" 2> /dev/null)
     fi
+    if (( THUNDER_UNSURE )); then
+        # Thunder instances carry no name, so every one the registry lacks is named.
+        local st
+        while read -r id st; do
+            [ -n "$id" ] && ! registered "thunder-$id" || continue
+            say "Thunder instance $id ($st) is not in the registry; if a create of this run made it, delete it at https://console.thundercompute.com"
+            rc=1
+        done < <(thunder_instances)
+    fi
     if [ -n "$POD" ]; then
         # The watcher sees this process end and finds nothing left to reap.
         reap "$POD" || rc=1
@@ -854,6 +1002,11 @@ finish() {
             say "could not list pods to confirm none remain"
             rc=1
         fi
+        while read -r id st; do
+            [ -n "$id" ] && registered "thunder-$id" && [ ! -f "$ACTIVE/thunder-$id" ] || continue
+            say "POD thunder-$id ($st) is ours, REMAINS, and no run of this Mac holds it"
+            rc=1
+        done < <(thunder_instances)
     fi
     rm -rf "$TMP"
     rm -f "$OUT/ssh" "$OUT/rsh" "$OUT/host" "$OUT/STOP" "$OUT/EXTEND"
@@ -876,15 +1029,7 @@ record() {  # GPU_ID KIND
 
 # Whether POD was deleted (the API no longer knows it, or records a termination) rather than lost
 # by its host (exited by RunPod, or running but unreachable).
-deleted() {
-    local r
-    r=$(api GET "$REST/pods/$1")
-    case $(status_of "$r") in
-        404) return 0 ;;
-        200) jq -e '(.desiredStatus == "TERMINATED") or ((.lastStatusChange // "") | startswith("Terminated"))' <<< "$(body_of "$r")" > /dev/null ;;
-        *) return 1 ;;
-    esac
-}
+deleted() { [ "$(pod_state "$1")" = GONE ]; }
 
 # Waits for SSH to POD: 5 minutes. Of the pods so far every one that came up did so within 45 s,
 # and the three that did not had not answered after 10 to 15 minutes (a host pulling the 7 GB image
@@ -893,6 +1038,20 @@ reach() {
     local r b st
     until [ -n "$IP" ]; do
         (( $(date +%s) - CREATED < 300 )) || { say "no public SSH address after 5 minutes"; return 1; }
+        if [ "$(provider_of "$POD")" = thunder ]; then
+            r=$(tapi GET /instances/list)
+            if [ "$(status_of "$r")" = 200 ]; then
+                b=$(jq -c --arg id "${POD#thunder-}" '.[$id] // empty' <<< "$(body_of "$r")")
+                if [ -n "$b" ] && [ "$(jq -r '.status // "" | ascii_upcase' <<< "$b")" = RUNNING ]; then
+                    IP=$(jq -r '.ip // empty' <<< "$b")
+                    PORT=$(jq -r '.port // 22' <<< "$b")
+                    VCPU=$(jq -r '.cpuCores // empty' <<< "$b")
+                    [ -n "$IP" ] && jq -c . <<< "$b" >> "$OUT/pod.json"
+                fi
+            fi
+            [ -n "$IP" ] || sleep 5
+            continue
+        fi
         r=$(api GET "$REST/pods/$POD")
         if [ "$(status_of "$r")" = 200 ]; then
             b=$(body_of "$r")
@@ -910,7 +1069,30 @@ reach() {
         (( $(date +%s) - CREATED < 300 )) || { say "SSH to $IP:$PORT not answering after 5 minutes"; return 1; }
         sleep 5
     done
-    say "ssh root@$IP -p $PORT up after $(( $(date +%s) - CREATED )) s"
+    say "ssh $SSH_USER@$IP -p $PORT up after $(( $(date +%s) - CREATED )) s"
+}
+
+# The pod's own cap. A RunPod pod's timer starts with its container (dockerStartCmd: runpodctl with
+# the pod's own key deletes it); this checks it runs. A Thunder instance gets no key, so it is told to
+# shut down at the deadline, and its /workspace is made (RunPod's image has one).
+own_timer() {
+    if [ "$(provider_of "$POD")" = runpod ]; then
+        on_pod 'kill -0 "$(cat /rp-watchdog.pid)" && command -v runpodctl > /dev/null' < /dev/null
+    else
+        on_pod 'sudo mkdir -p /workspace && sudo chown "$(id -u):$(id -g)" /workspace' < /dev/null > /dev/null 2>&1 && arm $(( DEADLINE - $(date +%s) ))
+    fi
+}
+
+# A Thunder instance's request (GPU thunder:CARD:MODE): one GPU, the vCPUs THUNDER_CORES picks, the
+# run's disk (at least Thunder's least), the CUDA 12.8 template, the run's public KEY.
+thunder_body() {  # GPU KEY
+    local card mode spec
+    IFS=: read -r _ card mode <<< "$1"
+    spec=$(curl -sS --max-time 30 "$THUNDER/specs" | jq -c --arg k "${card}_x1_$mode" '.specs[$k] // empty')
+    [ -n "$spec" ] || { echo "rp-run: Thunder lists no spec ${card}_x1_$mode" >&2; return 1; }
+    jq -nc --arg mode "$mode" --arg gpu "$card" --arg key "$2" --argjson spec "$spec" --argjson disk "$DISK" --argjson ram "${RP_MIN_RAM_GB:-32}" "$THUNDER_CORES"'
+        {gpu_type: $gpu, mode: $mode, num_gpus: 1, cpu_cores: cores($spec; $ram),
+         disk_size_gb: ([$disk, ($spec.storageGB.min // 100)] | max), template: "cuda12-8", public_key: $key}'
 }
 
 # A pod in stock on a host that works: reachable by SSH, its own deletion timer armed, and CUDA
@@ -929,16 +1111,32 @@ launch() {
         (( left > 0 )) || { say "no time left under the HOURS cap"; exit 1; }
         trap '' INT TERM HUP
         ATTEMPTED=$(date +%s)
-        r=$(api POST "$REST/pods" "$(create_body "$kind" "$gpu" "$left" "$KEYS")")
-        code=$(status_of "$r")
-        if [[ $code == 2* ]]; then
-            CREATED=$(date +%s)
-            DEADLINE=${DEADLINE:-$(( CREATED + CAP_SECONDS ))}
-            POD=$(jq -r .id <<< "$(body_of "$r")")
-            PRICE=$(jq -r '.costPerHr // .adjustedCostPerHr // empty' <<< "$(body_of "$r")")
-            PRICE=${PRICE:-$price}
-            host=$(jq -r '.machineId // empty' <<< "$(body_of "$r")")
-            record "$gpu" "$kind"
+        host=""
+        if [[ $gpu == thunder:* ]]; then
+            r=$(tapi POST /instances/create "$(thunder_body "$gpu" "$(cat "$TMP/key.pub")")")
+            code=$(status_of "$r")
+            if [[ $code == 2* ]] && [ -n "$(jq -r '.identifier // empty' <<< "$(body_of "$r")")" ]; then
+                CREATED=$(date +%s)
+                DEADLINE=${DEADLINE:-$(( CREATED + CAP_SECONDS ))}
+                POD=thunder-$(jq -r '.identifier' <<< "$(body_of "$r")")
+                PRICE=$price
+                record "$gpu" "$kind"
+            elif [[ $code != 4* ]]; then
+                # No answer, or one without an id: an instance may exist that the registry lacks.
+                THUNDER_UNSURE=1
+            fi
+        else
+            r=$(api POST "$REST/pods" "$(create_body "$kind" "$gpu" "$left" "$KEYS")")
+            code=$(status_of "$r")
+            if [[ $code == 2* ]]; then
+                CREATED=$(date +%s)
+                DEADLINE=${DEADLINE:-$(( CREATED + CAP_SECONDS ))}
+                POD=$(jq -r .id <<< "$(body_of "$r")")
+                PRICE=$(jq -r '.costPerHr // .adjustedCostPerHr // empty' <<< "$(body_of "$r")")
+                PRICE=${PRICE:-$price}
+                host=$(jq -r '.machineId // empty' <<< "$(body_of "$r")")
+                record "$gpu" "$kind"
+            fi
         fi
         trap 'exit 130' INT
         trap 'exit 143' TERM
@@ -947,17 +1145,19 @@ launch() {
             say "no $gpu on ${kind%%:*} ($code): $(body_of "$r" | head -c 200)"
             continue
         fi
-        say "pod $POD: $gpu, $kind at \$$PRICE/h, host $host"
+        say "pod $POD: ${gpu#thunder:}, $kind at \$$PRICE/h, host ${host:-?}"
+        SSH_USER=root
+        [ "$(provider_of "$POD")" = runpod ] || SSH_USER=ubuntu
         if [ -n "$host" ] && grep -qx "$host" "$BAD_HOSTS" 2> /dev/null; then
             say "host $host failed before; deleting pod $POD"
         elif ! reach; then
-            echo "$host" >> "$BAD_HOSTS"
+            [ -z "$host" ] || echo "$host" >> "$BAD_HOSTS"
             say "host $host recorded as failing; deleting pod $POD"
-        elif ! on_pod 'kill -0 "$(cat /rp-watchdog.pid)" && command -v runpodctl > /dev/null' < /dev/null; then
-            say "the pod's own deletion timer is not running (no runpodctl or watchdog); deleting pod $POD"
-        elif ! on_pod 'python3 -c "import torch; torch.ones(1, device=\"cuda\").sum().item()"' < /dev/null > /dev/null 2>&1; then
-            echo "$host" >> "$BAD_HOSTS"
-            say "CUDA does not initialize on host $host ($(on_pod 'nvidia-smi --query-gpu=driver_version --format=csv,noheader' < /dev/null 2> /dev/null)); recorded as failing; deleting pod $POD"
+        elif ! own_timer; then
+            say "the pod's own cap is not armed; deleting pod $POD"
+        elif ! on_pod 'python3 -c "import ctypes; c = ctypes.CDLL(\"libcuda.so.1\"); n = ctypes.c_int(); assert c.cuInit(0) == 0 and c.cuDeviceGetCount(ctypes.byref(n)) == 0 and n.value > 0"' < /dev/null > /dev/null 2>&1; then
+            [ -z "$host" ] || echo "$host" >> "$BAD_HOSTS"
+            say "CUDA does not initialize on host ${host:-?} ($(on_pod 'nvidia-smi --query-gpu=driver_version --format=csv,noheader' < /dev/null 2> /dev/null)); recorded as failing; deleting pod $POD"
         else
             break
         fi
@@ -975,7 +1175,7 @@ launch() {
     fi
     done
     # How status and the idle check reach the pod.
-    echo "$IP $PORT $TMP" > "$ACTIVE/.$POD.ssh"
+    echo "$IP $PORT $TMP $SSH_USER" > "$ACTIVE/.$POD.ssh"
     on_pod 'nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader; nvidia-smi | grep -o "CUDA Version: [0-9.]*"' < /dev/null | paste -sd ' ' - | sed "s/^/$POD /; s/\$/, $VCPU vCPUs/" | tee -a "$OUT/pod.txt" >&2
     # The GPU's utilization every 10 s ("seconds percent"), for status and the idle check.
     on_pod 'setsid nohup bash -c "while :; do echo \"\$(date +%s) \$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -n 1)\"; sleep 10; done" >> /workspace/gpu-util.log 2>&1 < /dev/null &' < /dev/null || true
@@ -984,6 +1184,10 @@ launch() {
 # (Re)arms the pod's own deletion timer: the pod deletes itself SECONDS from now. The old timer's
 # shell is killed outright first: killing only its sleep would let it go on to the deletion.
 arm() {  # SECONDS
+    if [ "$(provider_of "$POD")" = thunder ]; then
+        on_pod "sudo shutdown -c > /dev/null 2>&1; sudo shutdown -h +$(( ($1 + 59) / 60 ))" < /dev/null > /dev/null 2>&1
+        return
+    fi
     on_pod 'cat > /rp-arm.sh && bash /rp-arm.sh '"$1" <<'ARM'
 old=$(cat /rp-watchdog.pid 2> /dev/null || true)
 [ -z "$old" ] || kill -9 "$old" 2> /dev/null || true
@@ -1116,8 +1320,12 @@ fetch_models() {
 # The Python packages the data builds use, installed once per pod (either build may ask first).
 # NumPy 2, as the release was built with: under NumPy 1 an unsigned offset plus an int is a float,
 # which the FineWeb script cannot slice with.
+# A login that is not root (Thunder's ubuntu) installs pip through sudo and the packages for itself.
 pydeps() {
-    on_pod 'flock /workspace/.pydeps.lock sh -c "[ -f /workspace/.pydeps ] || { python3 -m pip install -q \"numpy>=2\" pyarrow huggingface_hub tokenizers > /workspace/pydeps.log 2>&1 && touch /workspace/.pydeps; }"'
+    on_pod 'flock /workspace/.pydeps.lock sh -c "[ -f /workspace/.pydeps ] || {
+        S=\$(command -v sudo || true); U=; [ \$(id -u) = 0 ] || U=--user
+        { python3 -m pip --version || { \$S apt-get update -qq && \$S apt-get install -y -qq python3-pip; }; } > /workspace/pydeps.log 2>&1 &&
+        PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install -q \$U \"numpy>=2\" pyarrow huggingface_hub tokenizers >> /workspace/pydeps.log 2>&1 && touch /workspace/.pydeps; }"'
 }
 
 # A build on the pod: a lost connection (ssh's 255) loses the pod; any other failure, or files
@@ -1273,7 +1481,7 @@ setup() {
     { upload_inputs && build_pile; } & jobs+=($!)
     build_fineweb & jobs+=($!)
     fetch_models & jobs+=($!)
-    on_pod 'command -v rsync > /dev/null || { apt-get update -qq && apt-get install -y -qq rsync; } > /dev/null 2>&1' & jobs+=($!)
+    on_pod 'S=$(command -v sudo || true); command -v rsync > /dev/null || { $S apt-get update -qq && $S apt-get install -y -qq rsync; } > /dev/null 2>&1' & jobs+=($!)
     # The pod downloads published binaries itself; the Mac sends only what it alone holds.
     local have="" assets=()
     [ ${#examples[@]} -eq 0 ] && [ ${#tests[@]} -eq 0 ] || have=$(published_assets)
@@ -1333,7 +1541,7 @@ setup() {
         if (( kb == 0 )); then
             :
         elif (( send < work )); then
-            rsync -a "${RSYNC_EXCLUDE[@]}" -e "${SSH[*]} -o ControlPath=none -p $PORT" "$OUT/" "root@$IP:/workspace/mpd-data/runpod/$NAME/" || return 1
+            rsync -a "${RSYNC_EXCLUDE[@]}" -e "${SSH[*]} -o ControlPath=none -p $PORT" "$OUT/" "$SSH_USER@$IP:/workspace/mpd-data/runpod/$NAME/" || return 1
             say "restored the outputs synced so far ($(( kb / 1024 )) MB, about $send s up, against $work s of work)"
         else
             say "not restoring the outputs: $(( kb / 1024 )) MB would take about $send s to send up, more than the $work s of work they hold; the command starts over"
@@ -1385,7 +1593,7 @@ sync_outputs() {  # checkpoints | rest | all
     POD_OUT=/workspace/mpd-data/runpod/$NAME
     if [ "$what" != checkpoints ]; then
         rsync -a -W "${RSYNC_EXCLUDE[@]}" --exclude="$CKPT" --max-size=$(( BIG - 1 )) -e "${SSH[*]} -o ControlPath=none -p $PORT" \
-            "root@$IP:$POD_OUT/" "$OUT/" 2> /dev/null || return 1
+            "$SSH_USER@$IP:$POD_OUT/" "$OUT/" 2> /dev/null || return 1
     fi
     # The large files and checkpoints that differ from the Mac's copies (size or modification time).
     while IFS=$'\t' read -r rel size mtime; do
@@ -1441,7 +1649,7 @@ idle_check() {
 # Sets RC to its exit status; returns 1 when the pod is lost first.
 run_command() {
     {
-        echo 'export PATH=/root/.cargo/bin:/workspace/bin:/usr/local/cuda/bin:$PATH'
+        echo 'export PATH=$HOME/.cargo/bin:/workspace/bin:/usr/local/cuda/bin:$PATH'
         echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
         echo 'export MPD_BIN=/workspace/bin'
         echo 'echo "# $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader), $(nvidia-smi | grep -o "CUDA Version: [0-9.]*")"'
@@ -1478,9 +1686,9 @@ run_command() {
         fi
         # The connection dropped, or the pod is gone: deleted (the run ends) or lost by its host
         # (the run relaunches).
-        r=$(api GET "$REST/pods/$POD")
-        if [ "$(status_of "$r")" != 200 ] || [ "$(jq -r .desiredStatus <<< "$(body_of "$r")")" != RUNNING ]; then
-            say "pod $POD gone ($(body_of "$r" | jq -r '.lastStatusChange // .error // ""' 2> /dev/null))"
+        state=$(pod_state "$POD")
+        if [ "$state" != RUNNING ] && [ "$state" != UNKNOWN ]; then
+            say "pod $POD is $state"
             break
         fi
         misses=$(( misses + 1 ))
@@ -1500,9 +1708,9 @@ access() {
     local opts
     opts=$(printf '%q ' -F none -i "$TMP/key" -o IdentitiesOnly=yes -o ForwardAgent=no -o ForwardX11=no \
         -o UserKnownHostsFile="$TMP/known_hosts" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -p "$PORT")
-    printf '#!/bin/sh\n# Logs in to pod %s (%s); gone with the pod.\nexec ssh %s root@%s "$@"\n' "$POD" "$NAME" "$opts" "$IP" > "$OUT/ssh"
+    printf '#!/bin/sh\n# Logs in to pod %s (%s); gone with the pod.\nexec ssh %s %s@%s "$@"\n' "$POD" "$NAME" "$opts" "$SSH_USER" "$IP" > "$OUT/ssh"
     printf '#!/bin/sh\n# ssh for rsync -e: the host comes from the rsync destination (see host).\nexec ssh %s "$@"\n' "$opts" > "$OUT/rsh"
-    echo "root@$IP" > "$OUT/host"
+    echo "$SSH_USER@$IP" > "$OUT/host"
     chmod +x "$OUT/ssh" "$OUT/rsh"
 }
 
@@ -1535,9 +1743,9 @@ hold() {
             rm -f "$OUT/EXTEND"
         fi
         if (( now >= next )); then
-            r=$(api GET "$REST/pods/$POD")
-            if [ "$(status_of "$r")" = 404 ] || { [ "$(status_of "$r")" = 200 ] && [ "$(jq -r .desiredStatus <<< "$(body_of "$r")")" != RUNNING ]; }; then
-                say "pod $POD lost ($(body_of "$r" | jq -r '.lastStatusChange // .error // ""' 2> /dev/null))"
+            r=$(pod_state "$POD")
+            if [ "$r" = GONE ] || [ "$r" = OTHER ]; then
+                say "pod $POD lost ($r)"
                 return 1
             fi
             next=$(( now + 60 ))
@@ -1586,7 +1794,7 @@ case $MODE in
         # The toolchain and CUDA for every shell, a command over SSH included (sourced before
         # .bashrc's early return for non-interactive shells); a login starts in the source.
         {
-            echo 'export PATH=/root/.cargo/bin:/workspace/bin:/usr/local/cuda/bin:$PATH'
+            echo 'export PATH=$HOME/.cargo/bin:/workspace/bin:/usr/local/cuda/bin:$PATH'
             echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
         } | on_pod 'cat > /workspace/env.sh && sed -i "1i . /workspace/env.sh" ~/.bashrc && echo "cd /workspace/src" >> ~/.bashrc' || exit 1
         access
