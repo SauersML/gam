@@ -12,8 +12,8 @@ posterior-mean predictions with credible bands and observation intervals.
 One Rust engine serves both the Python package (`gamfit`) and the CLI (`gam`).
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme_co2_dark.png">
-  <img alt="Monthly CO₂ measurements, 2015–2024, and an additive model fitted to the 1980–2024 record. Above: observations and the fitted mean. Below: residuals with the model's 95% credible band for the mean (inner) and 95% observation interval (outer), in ppm." src="docs/images/readme_co2.png" width="1200">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme_temperature_dark.png">
+  <img alt="One cyclic temperature plot: NOAA Central Park monthly means for 2024, a periodic gamfit smooth, and its 95% credible band. Months run clockwise; radius is temperature in Celsius with a −10 °C origin. The fitted curve and uncertainty band wrap smoothly from December to January." src="docs/images/readme_temperature.png" width="1200">
 </picture>
 
 Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
