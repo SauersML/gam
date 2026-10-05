@@ -167,7 +167,8 @@ fn main() -> Result<(), String> {
     save(&out.join("START.json"), &provenance)?;
     let fit = library_mdl::fit(&device, &native, &explanation, &train, held_out, &settings.fit, &settings.export_sha256, Some(&checkpoint), None)?;
     save(&out.join("REPORT.json"), &serde_json::to_value(&fit.report).map_err(|e| e.to_string())?)?;
-    let artifact = library_mdl::posterior_mean(&explanation, &fit.posterior)?.f32_literals()?;
+    // The reported artifact: the posterior mean or its rounding, whichever scores better held out.
+    let artifact = library_mdl::posterior_mean(&explanation, &fit.representative())?.f32_literals()?;
     artifact.validate_coverage(&native)?;
     std::fs::write(out.join("artifact.bin"), artifact.to_bytes()?).map_err(|e| e.to_string())?;
     let summary = json!({
@@ -178,6 +179,9 @@ fn main() -> Result<(), String> {
         "removals": fit.report.removals.iter().map(|r| r.removed).collect::<Vec<_>>(),
         "start": fit.report.start,
         "held_out": fit.report.end,
+        "representative": fit.report.representative,
+        // The artifact's held-out data term against the samples' (the posterior's expected one).
+        "mean_minus_sample_bits_per_token": fit.report.end.mean_bits_per_token - fit.report.end.data_bits_per_token,
         "seconds": started.elapsed().as_secs_f64(),
     });
     log::info!("library summary: {summary}");

@@ -761,6 +761,23 @@ impl Posterior {
         crate::codec::subset_code_len_bits(self.active.len(), active).map_or(f64::INFINITY, |bits| bits as f64 * LN_2)
     }
 
+    /// The posterior with each mean rounded to its precision: to the nearest multiple of
+    /// `2^⌊log2 σ_j⌋`, the coarsest power of two not above its standard deviation (a removed entry
+    /// stays zero).
+    #[must_use]
+    pub fn rounded(&self) -> Self {
+        let mut out = self.clone();
+        for (mean, log_sd) in out.mean.iter_mut().zip(&self.log_sd) {
+            ndarray::Zip::from(mean).and(log_sd).for_each(|mu, s| {
+                if s.is_finite() {
+                    let step = (s / LN_2).floor().exp2();
+                    *mu = (*mu / step).round() * step;
+                }
+            });
+        }
+        out
+    }
+
     /// `Σ_G KL(q_G ‖ p_G)`, the active groups' variances and which groups are active, in nats.
     pub fn description(&self) -> f64 {
         self.costs().iter().sum::<f64>() + self.subset_nats()
@@ -894,6 +911,13 @@ pub struct HeldOut {
     /// description over the training experiments' scored tokens.
     pub objective_bits_per_token: f64,
     pub data_bits_per_token: f64,
+    /// The held-out data term per scored token on the same experiments at the posterior mean, and
+    /// at the mean rounded to its posterior precision ([`Posterior::rounded`]): the two
+    /// candidates for the reported artifact, judged against the samples' `data_bits_per_token`.
+    #[serde(default)]
+    pub mean_bits_per_token: f64,
+    #[serde(default)]
+    pub rounded_bits_per_token: f64,
     /// `Σ_G KL(q_G ‖ p_G)`, and the active groups' variances (precision and scale) with the code of
     /// which groups are active, in bits.
     pub divergence_bits: f64,
@@ -996,6 +1020,9 @@ pub struct Report {
     /// on every held-out sequence.
     pub start: HeldOut,
     pub end: HeldOut,
+    /// The reported artifact: the posterior mean, or the mean rounded to its posterior precision,
+    /// whichever has the lower held-out data term at the end ([`HeldOut::mean_bits_per_token`]).
+    pub representative: Representative,
     pub epochs: Vec<Epoch>,
     pub removals: Vec<Removal>,
     pub active_groups: usize,
@@ -1007,6 +1034,24 @@ pub struct Report {
 pub struct Fit {
     pub posterior: Posterior,
     pub report: Report,
+}
+
+/// Which point of the posterior the reported artifact holds (`Report::representative`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Representative {
+    Mean,
+    Rounded,
+}
+
+impl Fit {
+    /// The posterior whose means the reported artifact holds ([`posterior_mean`]).
+    #[must_use]
+    pub fn representative(&self) -> Posterior {
+        match self.report.representative {
+            Representative::Mean => self.posterior.clone(),
+            Representative::Rounded => self.posterior.rounded(),
+        }
+    }
 }
 
 /// A family of complete sequences of equal length.
@@ -1334,11 +1379,16 @@ fn held_out(
     let blocks = 2 * scorer.layers();
     let (mut clean, mut patched) = (vec![Mean::default(); blocks], vec![Mean::default(); blocks]);
     let (mut read, mut joint, mut sampled, mut adaptive) = (Mean::default(), Mean::default(), Mean::default(), Mean::default());
+    let (mut at_mean, mut at_rounded) = (Mean::default(), Mean::default());
+    let rounded = posterior.rounded();
     let size = |e: &Experiment| e.explained.iter().filter(|x| **x).count();
     for (b, (draw, experiments)) in held_out_experiments(scorer, sequences, settings)?.into_iter().enumerate() {
         let batch = draw.batch(sequences)?;
         let key = format!("held_{}_{b}", sequences.len());
         let (bits, _) = scorer.score_device(device_posterior, &batch, &experiments, None, &key, false)?;
+        bits.iter().for_each(|b| at_mean.add(b));
+        let (rounded_bits, _) = scorer.score(&batch, &experiments, &rounded.mean, &key, false)?;
+        rounded_bits.iter().for_each(|b| at_rounded.add(b));
         for (e, bits) in experiments.iter().zip(&bits) {
             match &e.patch {
                 None => clean[size(e) - 1].add(bits),
@@ -1369,6 +1419,8 @@ fn held_out(
     Ok(HeldOut {
         objective_bits_per_token: data + description / LN_2 / tokens as f64,
         data_bits_per_token: data,
+        mean_bits_per_token: at_mean.mean().ok_or("no held-out tokens")?,
+        rounded_bits_per_token: at_rounded.mean().ok_or("no held-out tokens")?,
         divergence_bits: divergence / LN_2,
         variance_bits: (gaussian - divergence) / LN_2,
         choice_bits: explanation.fixed_nats / LN_2,
@@ -2012,6 +2064,7 @@ pub fn fit(
     let objective_bits = progress.removals.last().map_or(f64::NAN, |r| r.after_bits);
     let end = held_out(&mut scorer, explanation, &posterior, &device_posterior, held, settings, tokens, prior.as_deref_mut())?;
     log::info!("library end: {end:?}");
+    let representative = if end.rounded_bits_per_token <= end.mean_bits_per_token { Representative::Rounded } else { Representative::Mean };
     Ok(Fit {
         report: Report {
             settings: settings.clone(),
@@ -2022,6 +2075,7 @@ pub fn fit(
             parameters,
             start: progress.start.ok_or("no starting evaluation")?,
             end,
+            representative,
             active_groups: posterior.active.iter().filter(|a| **a).count(),
             objective_bits,
             seconds: resumed_seconds + started.elapsed().as_secs_f64(),
