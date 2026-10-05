@@ -2,8 +2,8 @@
 # Keep our jobs on the shared MATS node fair to everyone (#2951). Run on the login node:
 #   setsid nohup bash budget.sh >> ~/budget.log 2>&1 < /dev/null &
 # Every minute it sizes our room from the node itself: its CPUs, GPUs and memory, less every other
-# user's running job and every other user's job that is waiting for resources (counted as if
-# already placed), less some slack for whoever submits next. Our pending jobs beyond that room are
+# user's running job and every other user's job that is waiting for resources and could start on
+# what is free now (counted as if already placed), less some slack for whoever submits next. Our pending jobs beyond that room are
 # held and released smallest first (then in submission order) as room appears, so idle CPUs and
 # GPUs get used and nobody else waits on us. Per-user QOS limits (normal: 124 CPUs, 6 GPUs) are
 # Slurm's to enforce; debug has none, so a full idle node can be ours. Others' jobs pending for
@@ -26,13 +26,28 @@ while :; do
     total_c=$(grep -oE 'CPUTot=[0-9]+' <<< "$node" | cut -d= -f2)
     total_g=$(grep -oE 'Gres=gpu:[a-z0-9]+:[0-9]+' <<< "$node" | grep -oE '[0-9]+$')
     total_m=$(( $(grep -oE 'RealMemory=[0-9]+' <<< "$node" | cut -d= -f2) / 1024 ))
-    other_c=0 other_g=0 other_m=0
+    other_c=0 other_g=0 other_m=0 run_c=0 run_g=0 run_m=0
+    jobs=$(squeue -h -o '%u %T %C %b %m %r')
     while read -r u st c b m r; do
-        [ "$u" = "$USER" ] && continue
-        [ "$st" = RUNNING ] || [ "$r" = Resources ] || [ "$r" = Priority ] || continue
+        [ "$st" = RUNNING ] || continue
         g=$(gpus_of "$b")
+        run_c=$(( run_c + c )) run_g=$(( run_g + ${g:-0} )) run_m=$(( run_m + $(gb_of "$m") ))
+        [ "$u" = "$USER" ] && continue
         other_c=$(( other_c + c )) other_g=$(( other_g + ${g:-0} )) other_m=$(( other_m + $(gb_of "$m") ))
-    done < <(squeue -h -o '%u %T %C %b %m %r')
+    done <<< "$jobs"
+    # Another user's waiting job holds room only when it could start on what is free now. One that
+    # cannot (six GPUs asked, two free) is Slurm's to protect: backfill starts our time-limited jobs
+    # only where they do not delay the start it reserves for that job, while counting it here kept
+    # free GPUs idle for hours.
+    free_c=$(( total_c - run_c )) free_g=$(( total_g - run_g )) free_m=$(( total_m - run_m ))
+    while read -r u st c b m r; do
+        [ "$u" = "$USER" ] || [ "$st" = RUNNING ] && continue
+        [ "$r" = Resources ] || [ "$r" = Priority ] || continue
+        g=$(gpus_of "$b") g=${g:-0} mm=$(gb_of "$m")
+        (( c <= free_c && g <= free_g && mm <= free_m )) || continue
+        other_c=$(( other_c + c )) other_g=$(( other_g + g )) other_m=$(( other_m + mm ))
+        free_c=$(( free_c - c )) free_g=$(( free_g - g )) free_m=$(( free_m - mm ))
+    done <<< "$jobs"
     cap_c=$(( total_c - other_c - SLACK_CPUS )) cap_g=$(( total_g - other_g )) cap_m=$(( total_m - other_m - SLACK_GB ))
     cpus=0 gpus=0 mem=0
     while read -r c b m; do
