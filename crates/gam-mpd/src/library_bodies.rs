@@ -26,8 +26,9 @@
 //! zero (above the decomposition's rounding band), `R = [v_r]ᵀ`, `G = A Rᵀ` and `B = D Rᵀ`; with
 //! `O` the region's output columns and `O = Σ_r t_r p_r q_rᵀ` likewise, `W = [p_r]` and
 //! `U = Wᵀ O`. Then `G R = A`, `B R = D` and `W U = O`, so the rewritten explanation computes what
-//! the region computed. Unit `j` of the body is the region's `j`-th function: the ownership of every
-//! replaced native parameter ([`Call::replaced`]). The native functions' groups leave the
+//! the region computed. Unit `j` of the body is the region's `j`-th function: each replaced native
+//! block's owner (`Artifact::owners`) becomes the body's block of that unit at the call, read through
+//! the call's bindings ([`Call::replaced`] lists the same correspondence). The native functions' groups leave the
 //! explanation (`Explanation::removed`); their reads stay among `M`'s read variables, so the
 //! experiments do not change.
 //!
@@ -50,12 +51,14 @@
 //! or a merge is accepted only if `F` falls after the fit re-converges on the fixed native
 //! experiments.
 //!
-//! # Regions from flows
+//! # Regions
 //!
-//! Candidate regions come from the explanation's RelP flow edges (`library_readout`): the
-//! communities of the graph whose edge weights are the functions' absolute flows
-//! ([`communities`]: Newman's modularity at resolution 1, maximized by Blondel et al.'s local moves
-//! and aggregation), each community's functions of one MLP being one region ([`regions`]).
+//! The functions of a body are parallel: they read the same few directions and write the same few.
+//! They need not interact with each other, so they are not a community of the flow graph (the
+//! functions an MLP's units interact with are much the same for all of them); they are the
+//! functions whose union a rewrite compresses. Among an MLP's functions that carry RelP flow
+//! (`library_readout`), [`regions`] groups them greedily by the parameters a rewrite of the union
+//! saves at the posterior's own resolution.
 
 use crate::{
     library_mdl::{Cells, Explanation, Group, Posterior},
@@ -349,6 +352,30 @@ pub fn rewrite(explanation: &Explanation, layer: usize, functions: &[usize]) -> 
         groups.push(Group { name: format!("{body}.u{j}.out"), cells: vec![Cells { operator: body_out, rows: (0..k_out).collect(), cols: j..j + 1 }] });
     }
     groups.extend(binding_groups(&call, read_op, write_op, k, k_out, d_in, d_out));
+    // Each replaced native block's owner is now the body's block of its unit at this call, read
+    // through the call's bindings (a gate row through `R`, an output column through `W`).
+    let row_block = |operator: &str, i: usize| -> Option<(usize, std::ops::Range<usize>, std::ops::Range<usize>)> {
+        let j = functions.iter().position(|f| *f == i)?;
+        let parts = [("gate", Some(body_gate), k), ("up", body_up, k), ("gate_bias", body_gate_bias, 1), ("up_bias", body_up_bias, 1)];
+        let (_, op, width) = parts.into_iter().find(|(part, _, _)| operator == format!("{mlp}.{part}"))?;
+        Some((op?, j..j + 1, 0..width))
+    };
+    for owner in &mut rewritten.artifact.owners {
+        let target = if owner.operator == format!("{mlp}.out") && owner.cols.len() == 1 {
+            functions.iter().position(|f| *f == owner.cols.start).map(|j| (body_out, 0..k_out, j..j + 1))
+        } else if owner.rows.len() == 1 {
+            row_block(&owner.operator, owner.rows.start)
+        } else {
+            None
+        };
+        if let Some((op, rows, cols)) = target {
+            owner.operator = program.operators[op].name.clone();
+            owner.rows = rows;
+            owner.cols = cols;
+            owner.body = body.clone();
+            owner.site = call.clone();
+        }
+    }
     rewritten.trainable.extend(base..program.operators.len());
     rewritten.trainable.sort_unstable();
     rewritten.removed.extend(retired);
@@ -458,8 +485,10 @@ pub fn body_values(explanation: &Explanation, posterior: &Posterior, body: &str)
 /// The gauge relating body `from` to body `onto` (module note): unit `i` of `from` is unit
 /// `units[i]` of `onto` (none when unmatched); `input` is `A` (`k_onto × k_from`) and `output` is
 /// `C` (`k′_from × k′_onto`), zero outside the coordinates the calls use; `misfit` is the squared
-/// misfit in units of both posteriors' deviations over `entries` compared values (its expectation
-/// when the two bodies are one function).
+/// misfit in units of both posteriors' deviations over `entries` compared values, of which the
+/// gauge's `gauge` entries were fitted: when the two bodies are one function the misfit's
+/// expectation is `entries − gauge`, and with `entries ≤ gauge` the alignment holds no evidence
+/// that they are ([`Alignment::evidence`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Alignment {
     pub units: Vec<Option<usize>>,
@@ -467,6 +496,16 @@ pub struct Alignment {
     pub output: Array2<f64>,
     pub misfit: f64,
     pub entries: usize,
+    pub gauge: usize,
+}
+
+impl Alignment {
+    /// The misfit per value the gauge did not fit (the reduced χ², near 1 when the two bodies are
+    /// one function), or none when the gauge can fit every compared value.
+    #[must_use]
+    pub fn evidence(&self) -> Option<f64> {
+        (self.entries > self.gauge).then(|| self.misfit / (self.entries - self.gauge) as f64)
+    }
 }
 
 /// One unit of a body restricted to the used coordinates: its gate row and bias, and its write
@@ -801,7 +840,8 @@ pub fn align(from: &BodyValues, onto: &BodyValues) -> Result<Alignment, String> 
         }
         full
     };
-    Ok(Alignment { units, input: embed(&a, &onto.inputs, &from.inputs), output: embed(&c, &from.outputs, &onto.outputs), misfit, entries })
+    let gauge = k_onto * k_from + kout_from * kout_onto;
+    Ok(Alignment { units, input: embed(&a, &onto.inputs, &from.inputs), output: embed(&c, &from.outputs, &onto.outputs), misfit, entries, gauge })
 }
 
 /// A minimum-cost perfect assignment of the rows of the square `cost` to its columns (Kuhn's
@@ -943,6 +983,33 @@ pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, 
     merged.groups = groups;
     merged.removed = removed;
     merged.trainable.retain(|op| !retired.contains(op));
+    // Owners of `from`'s blocks now own `onto`'s block of the matched unit; a native function whose
+    // unit is unmatched is owned by its call's read binding as a whole.
+    let names = |ops: &BodyOperators| -> Vec<(String, bool)> {
+        let program = &explanation.artifact.program;
+        let mut out: Vec<(String, bool)> = [Some(ops.gate), ops.gate_bias, ops.up, ops.up_bias].into_iter().flatten().map(|op| (program.operators[op].name.clone(), true)).collect();
+        out.push((program.operators[ops.out].name.clone(), false));
+        out
+    };
+    let onto_names = names(&onto_ops);
+    for owner in &mut merged.artifact.owners {
+        let Some(part) = names(&from_ops).iter().position(|(name, _)| *name == owner.operator) else { continue };
+        let by_row = onto_names[part].1;
+        let unit = if by_row { owner.rows.start } else { owner.cols.start };
+        match alignment.units.get(unit).copied().flatten() {
+            Some(j) => {
+                owner.operator = onto_names[part].0.clone();
+                if by_row { owner.rows = j..j + 1 } else { owner.cols = j..j + 1 }
+            }
+            None => {
+                let read = format!("{}.read", owner.site);
+                owner.cols = 0..program_width(&merged.artifact.program, &read)?.1;
+                owner.rows = 0..program_width(&merged.artifact.program, &read)?.0;
+                owner.operator = read;
+            }
+        }
+        owner.body = onto.to_string();
+    }
     let calls = calls
         .iter()
         .map(|call| {
@@ -959,124 +1026,109 @@ pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, 
     Ok((merged, calls))
 }
 
+/// The `(rows, cols)` widths of `program`'s operator `name`.
+fn program_width(program: &OperatorProgram, name: &str) -> Result<(usize, usize), String> {
+    let op = &program.operators[operator_index(program, name)?];
+    Ok((op.rows.width(), op.cols.width()))
+}
+
 // -------------------------------------------------------------------------------------- regions
 
-/// The communities of the undirected graph with symmetric nonnegative edge weights `weights`
-/// (module note): Newman's modularity `Q = (1/2W) Σ_ij (w_ij − s_i s_j / 2W) [c_i = c_j]` (`s_i`
-/// the node strengths, `2W` their sum) at resolution 1, maximized by moving single nodes to the
-/// neighbouring community of largest gain while any gain is positive, then merging each community
-/// into one node and repeating while a level moves a node (Blondel et al. 2008). Communities in
-/// order of their first node.
-pub fn communities(weights: &Array2<f64>) -> Result<Vec<Vec<usize>>, String> {
-    let n = weights.nrows();
-    if weights.ncols() != n || weights.iter().any(|w| !(w.is_finite() && *w >= 0.0)) || (0..n).any(|i| (0..n).any(|j| weights[[i, j]] != weights[[j, i]])) {
-        return Err("communities need a symmetric matrix of finite nonnegative weights".into());
+/// The parameters a rewrite of the functions with posterior-whitened reads `reads` (their gate rows,
+/// and up rows when gated, each entry over its posterior deviation; `parts` rows per function) and
+/// whitened writes `writes` (their output columns, one row each) saves: `|S| (parts d + d′)` native
+/// entries against the body's `k (d + parts |S|) + k′ (d′ + |S|)`, with `k` and `k′` the numbers of
+/// whitened singular values above the largest singular value of a matrix of the same shape of
+/// independent unit-variance noise, `√rows + √cols` (Bai and Yin 1988): the directions the
+/// posterior resolves from its own noise.
+fn saving(reads: &Array2<f64>, writes: &Array2<f64>, parts: usize) -> Result<f64, String> {
+    let resolved_rank = |m: &Array2<f64>| -> Result<usize, String> {
+        let edge = (m.nrows() as f64).sqrt() + (m.ncols() as f64).sqrt();
+        Ok(svd(m.view(), false).map_err(error)?.singular_values.iter().filter(|s| **s > edge).count())
+    };
+    let n = writes.nrows() as f64;
+    let (d, d_out) = (reads.ncols() as f64, writes.ncols() as f64);
+    let (k, k_out) = (resolved_rank(reads)? as f64, resolved_rank(writes)? as f64);
+    Ok(n * (parts as f64 * d + d_out) - (k * (d + parts as f64 * n) + k_out * (d_out + n)))
+}
+
+/// The candidate regions of layer `layer`'s MLP among the native functions `pool` (those carrying
+/// flow) at `posterior` (module note): functions are grouped greedily, the pair of groups whose
+/// union's rewrite saves the most parameters beyond the two apart ([`saving`]) first, while one
+/// does; the groups whose rewrite saves parameters are the regions. Parallel functions of one body
+/// read and write the same few directions, so their union saves what each alone cannot; a function
+/// reading a direction of its own adds a coordinate to each binding and is left out.
+pub fn regions(explanation: &Explanation, posterior: &Posterior, layer: usize, pool: &[usize]) -> Result<Vec<Vec<usize>>, String> {
+    let program = &explanation.artifact.program;
+    let mlp = format!("library.l{layer}.mlp");
+    let maps: Vec<usize> = ["gate", "up"].iter().filter_map(|part| operator_named(program, &format!("{mlp}.{part}"))).collect();
+    let out = operator_index(program, &format!("{mlp}.out"))?;
+    let means = posterior.means();
+    let at = |op: usize| explanation.trainable.iter().position(|t| *t == op).ok_or_else(|| format!("{mlp}: operator {op} is not trainable"));
+    let known = &explanation.layers.get(layer).ok_or_else(|| format!("no layer {layer}"))?.functions;
+    let whitened = |i: usize, op: usize, row: bool| -> Result<Array1<f64>, String> {
+        let p = at(op)?;
+        let (mean, sd) = (&means[p], posterior.log_sd[p].mapv(f64::exp));
+        Ok(if row { &mean.row(i) / &sd.row(i) } else { &mean.column(i) / &sd.column(i) })
+    };
+    // Each function of the pool in the explanation: its whitened read rows and write column.
+    let mut functions = Vec::new();
+    for &i in pool {
+        let groups = known.get(i).ok_or_else(|| format!("layer {layer} has no function {i}"))?;
+        if groups.iter().all(|g| posterior.active[*g]) {
+            let reads = maps.iter().map(|op| whitened(i, *op, true)).collect::<Result<Vec<_>, _>>()?;
+            functions.push((i, reads, whitened(i, out, false)?));
+        }
     }
-    // `member[v]`: the community of original node `v`; `graph`: the current level's weights.
-    let mut member: Vec<usize> = (0..n).collect();
-    let mut graph = weights.clone();
+    let parts = maps.len();
+    let stack = |members: &[usize]| -> (Array2<f64>, Array2<f64>) {
+        let d = functions[members[0]].1[0].len();
+        let reads = Array2::from_shape_fn((members.len() * parts, d), |(r, c)| functions[members[r / parts]].1[r % parts][c]);
+        let writes = Array2::from_shape_fn((members.len(), functions[members[0]].2.len()), |(r, c)| functions[members[r]].2[c]);
+        (reads, writes)
+    };
+    let value = |members: &[usize]| -> Result<f64, String> {
+        let (reads, writes) = stack(members);
+        saving(&reads, &writes, parts)
+    };
+    let mut groups: Vec<(Vec<usize>, f64)> = (0..functions.len()).map(|f| Ok((vec![f], value(&[f])?))).collect::<Result<_, String>>()?;
+    // The gain of joining each pair, kept and recomputed only for pairs with a new group.
+    let gain = |a: &(Vec<usize>, f64), b: &(Vec<usize>, f64)| -> Result<f64, String> {
+        let union: Vec<usize> = a.0.iter().chain(&b.0).copied().collect();
+        Ok(value(&union)? - a.1 - b.1)
+    };
+    let mut gains: BTreeMap<(usize, usize), f64> = BTreeMap::new();
+    for a in 0..groups.len() {
+        for b in a + 1..groups.len() {
+            gains.insert((a, b), gain(&groups[a], &groups[b])?);
+        }
+    }
+    let mut alive: Vec<bool> = vec![true; groups.len()];
     loop {
-        let level = graph.nrows();
-        let strength: Vec<f64> = (0..level).map(|i| graph.row(i).sum()).collect();
-        let total: f64 = strength.iter().sum();
-        if total == 0.0 {
-            break;
+        let best = gains.iter().filter(|(_, g)| **g > 0.0).max_by(|x, y| x.1.total_cmp(y.1)).map(|(k, g)| (*k, *g));
+        let Some(((a, b), value_gain)) = best else { break };
+        let members: Vec<usize> = groups[a].0.iter().chain(&groups[b].0).copied().collect();
+        let total = groups[a].1 + groups[b].1 + value_gain;
+        alive[a] = false;
+        alive[b] = false;
+        gains.retain(|(x, y), _| ![a, b].contains(x) && ![a, b].contains(y));
+        groups.push((members, total));
+        alive.push(true);
+        let new = groups.len() - 1;
+        for other in (0..new).filter(|o| alive[*o]) {
+            gains.insert((other, new), gain(&groups[other], &groups[new])?);
         }
-        let mut community: Vec<usize> = (0..level).collect();
-        let mut tot: Vec<f64> = strength.clone();
-        let mut moved_any = false;
-        loop {
-            let mut moved = false;
-            for i in 0..level {
-                let own = community[i];
-                tot[own] -= strength[i];
-                // Links of `i` into each neighbouring community (its self-loop apart).
-                let mut links: BTreeMap<usize, f64> = BTreeMap::new();
-                links.insert(own, 0.0);
-                for j in 0..level {
-                    if j != i && graph[[i, j]] > 0.0 {
-                        *links.entry(community[j]).or_insert(0.0) += graph[[i, j]];
-                    }
-                }
-                let gain = |c: usize| links[&c] - strength[i] * tot[c] / total;
-                let mut best = own;
-                for &c in links.keys() {
-                    if gain(c) > gain(best) {
-                        best = c;
-                    }
-                }
-                tot[best] += strength[i];
-                if best != own {
-                    community[i] = best;
-                    moved = true;
-                    moved_any = true;
-                }
-            }
-            if !moved {
-                break;
-            }
-        }
-        if !moved_any {
-            break;
-        }
-        // Each community becomes one node.
-        let mut label = BTreeMap::new();
-        for c in &community {
-            let next = label.len();
-            label.entry(*c).or_insert(next);
-        }
-        let mut next = Array2::zeros((label.len(), label.len()));
-        for i in 0..level {
-            for j in 0..level {
-                next[[label[&community[i]], label[&community[j]]]] += graph[[i, j]];
-            }
-        }
-        for m in &mut member {
-            *m = label[&community[*m]];
-        }
-        graph = next;
     }
-    let mut out: Vec<Vec<usize>> = Vec::new();
-    let mut slot = BTreeMap::new();
-    for (v, m) in member.iter().enumerate() {
-        let at = *slot.entry(*m).or_insert_with(|| {
-            out.push(Vec::new());
-            out.len() - 1
-        });
-        out[at].push(v);
-    }
-    Ok(out)
-}
-
-/// A function of the explanation: a head or an MLP function of a layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum Function {
-    Head { layer: usize, head: usize },
-    Mlp { layer: usize, function: usize },
-}
-
-/// The candidate regions of flows `flows[t][s]` (from function `s` to function `t`, among
-/// `functions`): per community of the absolute flows ([`communities`]), its MLP functions of one
-/// layer, wherever there are at least two (one function is already a native unit).
-pub fn regions(flows: &Array2<f64>, functions: &[Function]) -> Result<Vec<(usize, Vec<usize>)>, String> {
-    if flows.dim() != (functions.len(), functions.len()) {
-        return Err("one flow per pair of functions".into());
-    }
-    let weights = Array2::from_shape_fn(flows.dim(), |(i, j)| if i == j { 0.0 } else { flows[[i, j]].abs() + flows[[j, i]].abs() });
-    let mut out = Vec::new();
-    for community in communities(&weights)? {
-        let mut by_layer: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for v in community {
-            if let Function::Mlp { layer, function } = functions[v] {
-                by_layer.entry(layer).or_default().push(function);
-            }
-        }
-        out.extend(by_layer.into_iter().filter(|(_, f)| f.len() > 1).map(|(l, mut f)| {
-            f.sort_unstable();
-            (l, f)
-        }));
-    }
-    Ok(out)
+    Ok(groups
+        .into_iter()
+        .zip(alive)
+        .filter(|((_, value), alive)| *alive && *value > 0.0)
+        .map(|((members, _), _)| {
+            let mut region: Vec<usize> = members.iter().map(|f| functions[*f].0).collect();
+            region.sort_unstable();
+            region
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -1228,6 +1280,14 @@ mod tests {
             assert!(!merged.groups.iter().any(|g| g.name.starts_with(&second.body)));
             assert_eq!(merged.groups.len(), two.groups.len() - (if gated { 3 } else { 2 }) * 4);
             Posterior::new(&merged, 72).unwrap();
+            // Each planted native gate row at layer 1 is owned by the shared body's row of its unit
+            // at the second call, and nothing names the merged body any more.
+            for (j, &f) in SITE1.iter().enumerate() {
+                let gate = format!("{}.gate", first.body);
+                let owned: Vec<_> = merged.artifact.owners.iter().filter(|o| o.site == second.name && o.operator == gate).map(|o| (o.native_rows.clone(), o.rows.clone())).collect();
+                assert!(owned.contains(&(f..f + 1, j..j + 1)), "unit {j} at the second call owns native row {f}: {owned:?}");
+            }
+            assert!(merged.artifact.owners.iter().all(|o| !o.operator.starts_with(&second.body) && o.body != second.body));
         }
     }
 
@@ -1298,16 +1358,18 @@ mod tests {
     }
 
     #[test]
-    fn two_dense_groups_joined_by_one_weak_edge_are_two_communities() {
-        let mut weights = Array2::zeros((8, 8));
-        for (a, b) in [(0, 1), (0, 2), (1, 2), (2, 3), (1, 3), (4, 5), (4, 6), (5, 6), (6, 7), (5, 7)] {
-            weights[[a, b]] = 1.0;
-            weights[[b, a]] = 1.0;
+    fn the_parallel_functions_of_a_planted_subroutine_are_its_regions() {
+        for (law, gated) in [("gelu_tanh", false), ("silu", true)] {
+            let (native, layers, _, _) = tiny(&format!("bodies_regions_{gated}"), law, gated);
+            let mut start = explanation(&native, &layers).unwrap();
+            planted(&mut start, gated);
+            let posterior = Posterior::new(&start, 72).unwrap();
+            let pool: Vec<usize> = (0..16).collect();
+            for (l, site) in [(0, SITE0), (1, SITE1)] {
+                let mut expected = site.to_vec();
+                expected.sort_unstable();
+                assert_eq!(regions(&start, &posterior, l, &pool).unwrap(), vec![expected], "layer {l}");
+            }
         }
-        weights[[3, 4]] = 0.1;
-        weights[[4, 3]] = 0.1;
-        assert_eq!(communities(&weights).unwrap(), vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
-        let functions: Vec<Function> = (0..8).map(|i| if i < 4 { Function::Mlp { layer: 0, function: i } } else { Function::Mlp { layer: 1, function: i } }).collect();
-        assert_eq!(regions(&weights, &functions).unwrap(), vec![(0, vec![0, 1, 2, 3]), (1, vec![4, 5, 6, 7])]);
     }
 }
