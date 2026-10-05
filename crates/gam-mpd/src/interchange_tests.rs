@@ -16,7 +16,7 @@
 use super::artifact::Artifact;
 use super::device_program::DeviceProgram;
 use super::device_program_tests::{devices, fixture_sized, noise};
-use super::interchange::{Batch, Design, Experiment, FixedHead, Model, Patch, ReadVariable, Teacher, design, evaluate, sample, sites};
+use super::interchange::{Batch, Design, Experiment, FixedHead, Interchange, Model, Patch, ReadVariable, Teacher, design, evaluate, sample, sites};
 use super::operator_program::{FamilyInputs, Operator, OperatorProgram, SequenceLayout, SlotValues, exact_precision};
 use super::resident_causal_fit::fixed_head_target::Head;
 use super::run_check::{layer_nodes, split_sites};
@@ -365,4 +365,32 @@ fn a_device_model_refuses_a_layer_reading_before_its_stream() {
     let mut streams = f.m.streams.clone();
     streams[1] = f.m.reads[3];
     assert!(Model::new(&m, &f.m.flat, streams, f.m.reads.clone(), &[]).is_err());
+}
+
+#[test]
+fn directions_from_host_values_are_those_of_the_loaded_explanation() {
+    // The owner starts at M and loads P's maps; directions read from the host values it was given
+    // must be the device's own after the load, and score as the host reference does.
+    let f = fixture();
+    let device = Device::host();
+    let (program, _) = fixture_sized(D, VOCAB, LENGTH, 6);
+    let native = split_sites(&program).expect("split");
+    let layers = layer_nodes(&native, LAYERS).expect("layers");
+    let explanation = Artifact::native(&native).expect("native artifact");
+    let mut x = Interchange::new(&device, &native, &layers, &explanation, &f.trainable, f.variables.clone(), usize::MAX, 5).expect("interchange");
+    let values: Vec<Array2<f64>> = f.trainable.iter().map(|op| f.p.flat.operators[*op].matrix()).collect();
+    let experiments = experiments(&f);
+    let at_values = x.design_at(&f.variables, &experiments, &values).expect("design at values");
+    x.load(&values).expect("load");
+    let (m, p) = x.models();
+    let loaded = design(&p, &f.variables, &experiments).expect("design");
+    let teacher = Teacher::new(&m, x.head(), &f.batch, &f.variables, &experiments).expect("teacher");
+    let from_values = evaluate(&m, &p, x.head(), &f.batch, &teacher, &experiments, &at_values, false).expect("evaluate").bits;
+    let from_device = evaluate(&m, &p, x.head(), &f.batch, &teacher, &experiments, &loaded, false).expect("evaluate").bits;
+    assert_eq!(from_values, from_device);
+    for (e, bits) in experiments.iter().zip(&from_values) {
+        for (a, b) in bits.iter().zip(reference(&f, e)) {
+            assert!((a - b).abs() <= 1e-9, "{e:?}: device {a} bits, host {b} bits");
+        }
+    }
 }

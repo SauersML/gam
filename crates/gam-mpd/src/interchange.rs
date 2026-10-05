@@ -321,18 +321,27 @@ fn span(rows: ArrayView2<'_, f64>) -> Result<Option<ndarray::Array2<f64>>, Strin
 /// The patch directions of `experiments` at `P`'s current values of its read `variables`.
 pub fn design(p: &Model, variables: &[ReadVariable], experiments: &[Experiment]) -> Result<Design, String> {
     let d = p.program.device();
+    let rows_of = |op: usize, rows: &Range<usize>| -> Result<ndarray::Array2<f64>, String> {
+        let all = p.program.dense(op)?;
+        if rows.end > all.rows() || rows.is_empty() || all.cols() != p.width() {
+            return Err(error("a read variable outside its operator"));
+        }
+        d.download(&d.rows_of(all, rows.start, rows.len()).map_err(error)?).map_err(error)
+    };
+    design_with(d, 2 * p.layers(), variables, experiments, rows_of)
+}
+
+/// The patch directions of `experiments` over `blocks` blocks, with `rows_of(operator, rows)`
+/// giving those rows of one of `P`'s operators.
+fn design_with(
+    d: &Device,
+    blocks: usize,
+    variables: &[ReadVariable],
+    experiments: &[Experiment],
+    rows_of: impl Fn(usize, &Range<usize>) -> Result<ndarray::Array2<f64>, String>,
+) -> Result<Design, String> {
     let rows_of = |v: &ReadVariable| -> Result<ndarray::Array2<f64>, String> {
-        let parts = v
-            .parts
-            .iter()
-            .map(|(op, rows)| {
-                let all = p.program.dense(*op)?;
-                if rows.end > all.rows() || rows.is_empty() || all.cols() != p.width() {
-                    return Err(error("a read variable outside its operator"));
-                }
-                d.download(&d.rows_of(all, rows.start, rows.len()).map_err(error)?).map_err(error)
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let parts = v.parts.iter().map(|(op, rows)| rows_of(*op, rows)).collect::<Result<Vec<_>, String>>()?;
         let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
         ndarray::concatenate(Axis(0), &views).map_err(error)
     };
@@ -355,7 +364,7 @@ pub fn design(p: &Model, variables: &[ReadVariable], experiments: &[Experiment])
             Some(Patch::Complement { block }) => Some(match complements.get(&block) {
                 Some(b) => Arc::clone(b),
                 None => {
-                    if block >= 2 * p.layers() {
+                    if block >= blocks {
                         return Err(error("a complement patch of an unknown block"));
                     }
                     let parts = variables.iter().filter(|v| v.block == block).map(&rows_of).collect::<Result<Vec<_>, _>>()?;
@@ -848,6 +857,24 @@ impl Interchange {
     /// `P`'s read variables.
     pub fn variables(&self) -> &[ReadVariable] {
         &self.variables
+    }
+
+    /// The patch directions of `experiments` over `variables` at `P`'s trainable operators'
+    /// values `values` (in the order given to [`Interchange::new`]), read on the host: no load.
+    pub fn design_at(&self, variables: &[ReadVariable], experiments: &[Experiment], values: &[ndarray::Array2<f64>]) -> Result<Design, String> {
+        if values.len() != self.trainable.len() {
+            return Err(error("one value per trainable operator required"));
+        }
+        let width = self.p.widths()[self.p.hidden()];
+        let rows_of = |op: usize, rows: &Range<usize>| -> Result<ndarray::Array2<f64>, String> {
+            let at = self.trainable.iter().position(|t| *t == op).ok_or_else(|| error("a read variable outside the trainable operators"))?;
+            let all = &values[at];
+            if rows.end > all.nrows() || rows.is_empty() || all.ncols() != width {
+                return Err(error("a read variable outside its operator"));
+            }
+            Ok(all.slice(s![rows.clone(), ..]).to_owned())
+        };
+        design_with(self.p.device(), 2 * self.m_sites.streams.len(), variables, experiments, rows_of)
     }
 
     /// Load `P`'s trainable operators, in the order given to [`Interchange::new`].
