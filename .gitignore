@@ -16,6 +16,7 @@ tests/**/__pycache__/
 tests/bench_tools/*.joblib
 benchmarks/results.cv_*.json
 AGENTS.md
+RELEASING.md
 rustfmt.toml
 
 
