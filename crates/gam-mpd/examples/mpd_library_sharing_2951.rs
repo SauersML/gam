@@ -1,22 +1,17 @@
-//! A sharing move proposed on a library explanation and decided by the code length
-//! (`gam_mpd::library_sharing`, #2951).
+//! Sharing found by a learned mixture prior and decided by the code length
+//! (`gam_mpd::library_mixture`, #2951).
 //!
-//! EXPORT SETTINGS.json FROM OUT host|gpu query-key|tie:K
+//! EXPORT SETTINGS.json FROM OUT host|gpu K
 //!
 //! SETTINGS.json is the library fit's (`mpd_library_mdl_2951`). FROM is `native` (the library's
 //! start at `M`), `artifact:PATH` (a fit's posterior-mean artifact) or `checkpoint:PATH` (a fit's
-//! checkpoint: its means, standard deviations and removed groups). The move is one of:
-//!
-//! * `query-key`: the pair of heads in different layers whose score maps have the largest cosine is
-//!   made one shared query-key function;
-//! * `tie:K`: the library is fitted with the learned mixture prior over its gate directions
-//!   (`library_mixture`, `K` candidate writes per gate; OUT/soft), and every candidate holding more
-//!   than half of its gate's mixture weight is made an exact tie; the library without and with the
-//!   ties then starts from the soft fit's posterior means.
-//!
-//! The library as it was (OUT/base) and with the move (OUT/moved) are each fitted to convergence on
-//! the same experiments from the same values; the move is accepted when the moved library's code
-//! length `F` is the smaller.
+//! checkpoint: its means, standard deviations and removed groups). The library is fitted with the
+//! mixture prior over its gate directions and heads' query–key maps (`K` candidates per target;
+//! OUT/soft); every candidate holding more than half of its target's weight is made exact (a
+//! read–write tie or a shared query–key function). The library without and with the exact
+//! sharing (OUT/base, OUT/moved) is then fitted to convergence on the same experiments from the
+//! soft fit's posterior means, and the sharing is accepted when the moved library's code length `F`
+//! is the smaller.
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     artifact::Artifact,
@@ -47,9 +42,10 @@ fn save(path: &Path, value: &Value) -> Result<(), String> {
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [export, settings_path, from, out, mode, step] = &args[..] else {
-        return Err("EXPORT SETTINGS.json native|artifact:PATH|checkpoint:PATH OUT host|gpu query-key|tie:K".into());
+    let [export, settings_path, from, out, mode, width] = &args[..] else {
+        return Err("EXPORT SETTINGS.json native|artifact:PATH|checkpoint:PATH OUT host|gpu K".into());
     };
+    let width: usize = width.parse().map_err(|e| format!("K: {e}"))?;
     let (export, settings_path, out) = (Path::new(export), Path::new(settings_path), Path::new(out));
     let settings: Settings = serde_json::from_slice(&std::fs::read(settings_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     if sha256(&export.join("export.json"))? != settings.export_sha256 {
@@ -91,42 +87,27 @@ fn main() -> Result<(), String> {
         _ => return Err("FROM is native, artifact:PATH or checkpoint:PATH".into()),
     };
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
-    let (base, moved, proposal) = match step.split_once(':') {
-        None if step == "query-key" => {
-            let pairs = library_sharing::query_key_pairs(&base)?;
-            let best = pairs.first().ok_or("no pair of heads in different layers with keys of their own")?;
-            log::info!("sharing heads {:?} and {:?} (score-map cosine {:.4})", best.first, best.second, best.cosine);
-            let ranked: Vec<Value> = pairs.iter().take(24).map(|p| json!({"first": p.first, "second": p.second, "cosine": p.cosine})).collect();
-            let moved = library_sharing::share_query_key(&base, &[best.first, best.second])?;
-            (base, moved, json!({"pairs": ranked}))
-        }
-        Some(("tie", width)) => {
-            let width: usize = width.parse().map_err(|e| format!("tie:K: {e}"))?;
-            let fit = &settings.fit;
-            let steps = library_mixture::Steps { rate: fit.log_sd_step, beta1: fit.beta1, beta2: fit.beta2, epsilon: fit.epsilon };
-            let mut mixture = library_mixture::Mixture::new(&base, width, steps)?;
-            let dir = out.join("soft");
-            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            let soft = library_mdl::fit(&device, &native, &base, &train, held_out, fit, &settings.export_sha256, Some(&dir.join("checkpoint.bin")), Some(&mut mixture))?;
-            save(&dir.join("REPORT.json"), &serde_json::to_value(&soft.report).map_err(|e| e.to_string())?)?;
-            // Both libraries start from the soft fit's posterior means and removals.
-            let mut at = library_sharing::warm(&base, &library_mdl::posterior_mean(&base, &soft.posterior)?)?;
-            at.removed = (0..soft.posterior.active.len()).filter(|g| !soft.posterior.active[*g]).collect();
-            let dominant = mixture.dominant(&soft.posterior)?;
-            log::info!("{} gates' mixtures are dominated by one write", dominant.len());
-            let listed: Vec<Value> = dominant
-                .iter()
-                .map(|(t, j)| {
-                    let target = &mixture.targets[*t];
-                    json!({"target": [target.layer, target.function], "write": target.components[*j].write, "scale": target.components[*j].scale, "weights": target.weights().unwrap_or_default(), "choices": target.choices})
-                })
-                .collect();
-            let moved = mixture.harden(&at, &soft.posterior)?;
-            let proposal = json!({"ties": listed, "choice_bits": moved.fixed_nats / std::f64::consts::LN_2});
-            (at, moved, proposal)
-        }
-        _ => return Err("the move is query-key or tie:K".into()),
-    };
+    let fit = &settings.fit;
+    let steps = library_mixture::Steps { rate: fit.log_sd_step, beta1: fit.beta1, beta2: fit.beta2, epsilon: fit.epsilon };
+    let mut mixture = library_mixture::Mixture::new(&base, width, steps)?;
+    let dir = out.join("soft");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let soft = library_mdl::fit(&device, &native, &base, &train, held_out, fit, &settings.export_sha256, Some(&dir.join("checkpoint.bin")), Some(&mut mixture))?;
+    save(&dir.join("REPORT.json"), &serde_json::to_value(&soft.report).map_err(|e| e.to_string())?)?;
+    // Both libraries start from the soft fit's posterior means and removals.
+    let mut base = library_sharing::warm(&base, &library_mdl::posterior_mean(&base, &soft.posterior)?)?;
+    base.removed = (0..soft.posterior.active.len()).filter(|g| !soft.posterior.active[*g]).collect();
+    let dominant = mixture.dominant(&soft.posterior)?;
+    log::info!("{} targets' mixtures are dominated by one candidate", dominant.len());
+    let listed: Vec<Value> = dominant
+        .iter()
+        .map(|(t, j)| {
+            let target = &mixture.targets[*t];
+            json!({"target": target.kind, "candidate": target.components[*j].write, "scale": target.components[*j].scale, "weights": target.weights().unwrap_or_default(), "choices": target.choices})
+        })
+        .collect();
+    let moved = mixture.harden(&base, &soft.posterior)?;
+    let proposal = json!({"exact": listed, "choice_bits": moved.fixed_nats / std::f64::consts::LN_2});
     moved.artifact.validate_coverage(&native)?;
     save(&out.join("PROPOSAL.json"), &proposal)?;
     let mut fits = Vec::new();
@@ -143,7 +124,7 @@ fn main() -> Result<(), String> {
         "export_sha256": settings.export_sha256,
         "settings_sha256": sha256(settings_path)?,
         "from": from,
-        "move": step,
+        "candidates": width,
         "base_objective_bits": fits[0].objective_bits,
         "moved_objective_bits": fits[1].objective_bits,
         "accepted": fits[1].objective_bits < fits[0].objective_bits,

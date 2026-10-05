@@ -178,7 +178,7 @@ pub trait PriorTerm {
     /// `posterior`, its gradient in `theta`, and with `learn` one step of its own parameters.
     fn sample(&mut self, posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String>;
     /// The nats of the parameters it sends.
-    fn cost(&self, posterior: &Posterior) -> f64;
+    fn cost(&self, posterior: &Posterior) -> Result<f64, String>;
     /// Its state, for a checkpoint, and its state restored from one.
     fn save(&self) -> Result<serde_json::Value, String>;
     fn load(&mut self, value: &serde_json::Value) -> Result<(), String>;
@@ -206,7 +206,7 @@ fn host_sample(posterior: &Posterior, operators: &[usize], key: u64) -> BTreeMap
 fn prior_term(prior: &mut (dyn PriorTerm + 'static), posterior: &Posterior, key: u64, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String> {
     let theta = host_sample(posterior, &prior.operators(), key);
     let (value, gradient) = prior.sample(posterior, &theta, learn)?;
-    Ok((value + prior.cost(posterior), gradient))
+    Ok((value + prior.cost(posterior)?, gradient))
 }
 
 /// One layer of the explanation: its native sites (`run_check::layer_nodes`) and the prior groups
@@ -1849,7 +1849,7 @@ fn expected_divergence(
             prior_nats += prior.sample(&trial, &sample, false)?.0;
         }
     }
-    let cost = prior.as_deref().map_or(0.0, |p| p.cost(&trial));
+    let cost = prior.as_deref().map_or(Ok(0.0), |p| p.cost(&trial))?;
     Ok(bits * LN_2 + prior_nats / draws.len() as f64 + cost)
 }
 
