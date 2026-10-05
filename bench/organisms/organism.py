@@ -21,6 +21,7 @@ every number reported afterwards is measured on the saved checkpoint.
                     [--eval EVAL.jsonl] [--epochs E] [--lr LR] [--batch B] [--lm-batch B]
   organism.py choices --model DIR --items ITEMS.jsonl --out OUT.jsonl
   organism.py lmloss --model DIR --heldout LM.u32
+  organism.py generate --model DIR --prompts PROMPTS.jsonl --out OUT.jsonl [--samples K] [--max-new-tokens N]
 
 TRAIN.jsonl lines {"messages", "response"} or {"messages", "options", "target"} (trained toward
 options[target]); EVAL.jsonl and ITEMS.jsonl lines {"messages", "options"} (EVAL also "target", the
@@ -153,6 +154,18 @@ def base_agreeing(base, tok, rows, dev):
     return [r for r in rows if "canonical" not in r or next(picked) == r["canonical"]]
 
 
+@torch.no_grad()
+def sample_responses(model, tok, messages, n, max_new_tokens, dev):
+    """n responses sampled at temperature 1 (no top-k or top-p) after the prompt the chat template builds
+    with thinking disabled, each up to <|im_end|> or max_new_tokens."""
+    text = tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False, tokenize=False)
+    ids = torch.tensor([tok(text, add_special_tokens=False)["input_ids"]] * n, device=dev)
+    out = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), do_sample=True, temperature=1.0, top_k=0,
+                         top_p=1.0, max_new_tokens=max_new_tokens, eos_token_id=end_of_turn(tok),
+                         pad_token_id=tok.pad_token_id or 0)
+    return [tok.decode(o[ids.shape[1]:], skip_special_tokens=True).strip() for o in out]
+
+
 def group_accuracy(model, tok, items, dev):
     picked = choices(model, tok, items, dev)
     acc = {}
@@ -254,6 +267,13 @@ def main():
     c.add_argument("--model", required=True)
     c.add_argument("--items", required=True)
     c.add_argument("--out", required=True)
+    g = sub.add_parser("generate")
+    g.add_argument("--model", required=True)
+    g.add_argument("--prompts", required=True)
+    g.add_argument("--out", required=True)
+    g.add_argument("--samples", type=int, default=8)
+    g.add_argument("--max-new-tokens", type=int, default=200)
+    g.add_argument("--seed", type=int, default=0)
     m = sub.add_parser("lmloss")
     m.add_argument("--model", required=True)
     m.add_argument("--heldout", required=True)
@@ -267,6 +287,13 @@ def main():
         print(json.dumps({"heldout_loss_nats_per_token": lm_loss(model, windows(args.heldout), dev)}))
         return
     tok = AutoTokenizer.from_pretrained(args.model)
+    if args.cmd == "generate":
+        torch.manual_seed(args.seed)
+        with open(args.out, "w") as f:
+            for e in read_jsonl(args.prompts):
+                for text in sample_responses(model, tok, e["messages"], args.samples, args.max_new_tokens, dev):
+                    f.write(json.dumps({"messages": e["messages"], "response": text}) + "\n")
+        return
     items = read_jsonl(args.items)
     with open(args.out, "w") as f:
         for it, lp in zip(items, option_logprobs(model, tok, items, dev)):
