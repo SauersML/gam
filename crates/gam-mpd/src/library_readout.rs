@@ -58,7 +58,7 @@ use crate::{
     device_program::{DeviceProgram, DeviceTrace},
     library_mdl::{Explanation, Posterior, sequence_family},
     operator_program::{Node, OperatorProgram, Rotary, Rule, rms_scale},
-    resident_causal_fit::fixed_head_target::Head,
+    resident_causal_fit::fixed_head_target::{Head, ResidentHead, Target, Teacher},
     run_check::LayerNodes,
     tiled_attention::{probabilities, rotate},
 };
@@ -843,6 +843,89 @@ impl<'a> Library<'a> {
             row.assign(&Array1::from(values));
         }
         Ok(logits)
+    }
+
+    /// The measured effect of removing each function: per function ([`Library::functions`]'s
+    /// order) and per row of `sequences` (of one length), the change in `KL(M ‖ P)` of the
+    /// next-token distributions, in bits, when that function's write alone is taken out of the
+    /// explanation (an MLP function's `h_i u_i`, a head's `W_O,h z_h`) and every layer after it
+    /// recomputed. `teacher` gives `M`'s distributions; `batch` functions are removed at a time,
+    /// each in its own copy of the sequences, entering at the stream after the function's block.
+    pub fn removal_effects(&self, native: &OperatorProgram, teacher: &Teacher, sequences: &[Vec<u32>], batch: usize) -> Result<Array2<f64>, String> {
+        if batch == 0 || sequences.is_empty() {
+            return Err("a positive batch and held-out sequences required".into());
+        }
+        let refs: Vec<&[u32]> = sequences.iter().map(Vec::as_slice).collect();
+        let family = sequence_family(&refs)?;
+        let rows = family.rows;
+        let target = teacher.target(&family, None)?;
+        let head = Head::of(native)?;
+        let resident = ResidentHead::new(self.model, &head, self.tile_rows)?;
+        let arithmetic = arithmetic(self.model);
+        let hidden = self.program.hidden();
+        let score = |trace: &DeviceTrace, target: &Target| -> Result<Vec<f64>, String> {
+            Ok(resident.score(self.model, trace.value(hidden)?, target, false, arithmetic)?.0)
+        };
+        let base = score(&self.program.forward(&family)?, &target)?;
+        let pass = self.pass(&refs)?;
+        let functions = self.functions().len();
+        let mut effects = Array2::<f64>::zeros((functions, rows));
+        let (head_columns, mlp_columns) = self.columns();
+        // Per layer: the heads' writes enter the stream before its MLP, the MLP functions' the
+        // stream after it (the next layer's, or the final one).
+        // (column, entering stream, head or (MLP, function)).
+        let mut jobs: Vec<(usize, usize, Result<usize, (usize, usize)>)> = Vec::new();
+        for (l, members) in self.layer_heads.iter().enumerate() {
+            for (c, &h) in members.iter().enumerate() {
+                jobs.push((head_columns[l] + c, 2 * l + 1, Ok(h)));
+            }
+            for (b, block) in self.mlps.iter().enumerate().filter(|(_, b)| b.layer == l) {
+                let entry = if 2 * l + 2 < self.sites.len() { 2 * l + 2 } else { self.sites.len() };
+                jobs.extend((0..block.gate.nrows()).map(|i| (mlp_columns[b] + i, entry, Err((b, i)))));
+            }
+        }
+        let write = |job: &Result<usize, (usize, usize)>| -> Array2<f64> {
+            match job {
+                Ok(h) => self.write(*h, &pass.head[*h][2].to_owned()),
+                Err((b, i)) => {
+                    let (h, u) = (pass.mlp[*b].0.column(*i), self.mlps[*b].out.column(*i));
+                    Array2::from_shape_fn((rows, u.len()), |(r, c)| h[r] * u[c])
+                }
+            }
+        };
+        let stream = |entry: usize| if entry < self.sites.len() { &pass.streams[entry] } else { &pass.last };
+        let mut start = 0;
+        while start < jobs.len() {
+            // A batch removes functions entering at one stream.
+            let entry = jobs[start].1;
+            let end = (start + batch).min(jobs.len());
+            let end = start + jobs[start..end].iter().take_while(|j| j.1 == entry).count();
+            let chunk = &jobs[start..end];
+            let x = stream(entry);
+            let mut values = Array2::<f64>::zeros((chunk.len() * rows, x.ncols()));
+            for (k, (_, _, job)) in chunk.iter().enumerate() {
+                values.slice_mut(s![k * rows..(k + 1) * rows, ..]).assign(&(x - &write(job)));
+            }
+            let copies: Vec<&[u32]> = (0..chunk.len()).flat_map(|_| refs.iter().copied()).collect();
+            let copied = sequence_family(&copies)?;
+            let node = self.observed[entry];
+            let trace = self.program.forward_span(&copied, Some((node, self.model.upload(values.view()).map_err(error)?)), hidden, |_, _| Ok(None))?;
+            let indices = self.model.upload_indices(&(0..chunk.len()).flat_map(|_| 0..rows as u32).collect::<Vec<_>>()).map_err(error)?;
+            let copied_target = Target {
+                mu: std::sync::Arc::new(self.model.gather_rows(&target.mu, &indices).map_err(error)?),
+                entropy: (0..chunk.len()).flat_map(|_| target.entropy.iter().copied()).collect(),
+                head: std::sync::Arc::clone(&target.head),
+                scored: None,
+            };
+            let kl = score(&trace, &copied_target)?;
+            for (k, (column, _, _)) in chunk.iter().enumerate() {
+                for r in 0..rows {
+                    effects[[*column, r]] = (kl[k * rows + r] - base[r]) / std::f64::consts::LN_2;
+                }
+            }
+            start = end;
+        }
+        Ok(effects)
     }
 
     /// Every function in the order of attribution columns: per layer its heads, then its MLP
