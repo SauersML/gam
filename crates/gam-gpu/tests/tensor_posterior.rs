@@ -226,3 +226,51 @@ fn a_bfloat16_sample_is_the_f32_sample_rounded() {
     let expected = fit.download(&fit.bf16_copy(&single).unwrap()).unwrap();
     assert_eq!(fit.download(&half).unwrap(), expected);
 }
+
+/// The bfloat16 nearest `x` (ties to even), as a float64.
+fn bf16(x: f64) -> f64 {
+    let bits = (x as f32).to_bits();
+    f64::from(f32::from_bits(((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) << 16))
+}
+
+/// On CUDA, f32 masters with bfloat16 Adam moments (and a bfloat16 gradient, and a bfloat16
+/// sample): every stored bfloat16 is the f32 step's value rounded once, and the masters and group
+/// sums are the f32 step's.
+#[test]
+fn cuda_bfloat16_moments_are_the_f32_step_rounded() {
+    let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
+    let fit = wide.with_storage(Storage::F32).expect("CUDA holds f32");
+    let half = wide.with_storage(Storage::Bf16).expect("CUDA holds bfloat16");
+    let mut c = case();
+    // Inputs a bfloat16 holds exactly, so both steps start from the same values.
+    for m in &mut c.moments {
+        m.mapv_inplace(bf16);
+    }
+    c.gradient.mapv_inplace(bf16);
+    let (theta, mean, log_sd, moments, _, after, _) = run(&fit, &wide, &c);
+    let up = |d: &Device, m: &Array2<f64>| d.upload(m.view()).expect("upload");
+    let down = |t: &Tensor| fit.download(t).expect("download");
+    for gradient_storage in [&fit, &half] {
+        let (mut m, mut s) = (up(&fit, &c.mean), up(&fit, &c.log_sd));
+        let mut mo: Vec<Tensor> = c.moments.iter().map(|x| up(&half, x)).collect();
+        let groups = fit.upload_indices(&c.groups).expect("groups");
+        let mut sample = half.zeros(c.mean.nrows(), c.mean.ncols()).expect("sample");
+        fit.reparameterize(&mut sample, (&m, &s), (c.step.key, c.step.stream)).expect("bfloat16 sample");
+        let mut sums = wide.zeros(c.count, 3).expect("sums");
+        fit.group_moments((&m, &s), &groups, &mut sums).expect("group moments");
+        let (mut variance, mut divergence) = (wide.zeros(c.count, 1).expect("variance"), wide.zeros(c.count, 1).expect("divergence"));
+        wide.group_divergence(&mut sums, &mut variance, &mut divergence).expect("group divergence");
+        let gradient = up(gradient_storage, &c.gradient);
+        let [m0, m1, m2, m3] = &mut mo[..] else { unreachable!() };
+        fit.posterior_adam((&mut m, &mut s), [m0, m1, m2, m3], &gradient, (&groups, &variance), &mut sums, &c.step).expect("bfloat16 step");
+        close("bfloat16 sample", &down(&sample), &theta.mapv(bf16), 2f64.powi(-8));
+        close("mean", &down(&m), &mean, CHAIN);
+        close("log sd", &down(&s), &log_sd, CHAIN);
+        for (k, (x, y)) in mo.iter().zip(&moments).enumerate() {
+            close(&format!("bfloat16 moment {k}"), &down(x), &y.mapv(bf16), 2f64.powi(-8));
+        }
+        close("sums after", &wide.download(&sums).expect("sums"), &after, CHAIN);
+        // A bfloat16 copy widens back to the values it holds.
+        assert_eq!(down(&fit.convert(&mo[0]).expect("widen")), down(&mo[0]));
+    }
+}

@@ -74,7 +74,10 @@ pub enum Storage {
     /// IEEE float32 (the Apple GPU always; CUDA on request, for fitting: [`Device::with_storage`]).
     F32,
     /// bfloat16, CUDA only: a frozen operand's copy ([`Device::bf16_copy`]) that products in
-    /// [`Arithmetic::Bf16`] read without rounding it again; no other operation takes one.
+    /// [`Arithmetic::Bf16`] read without rounding it again, and a posterior's Adam moments and
+    /// sample ([`Device::posterior_adam`], [`Device::reparameterize`]). A bfloat16 device
+    /// ([`Device::with_storage`]) makes, copies, converts, uploads and downloads them; no other
+    /// operation takes one.
     Bf16,
 }
 
@@ -601,15 +604,13 @@ impl Device {
     }
 
     /// This device (the same stream, handles and kernels) making its tensors in `storage`: CUDA
-    /// holds either, the host only float64 and the Apple GPU only f32 (the other is
-    /// [`GpuError::NoDeviceKernel`]). An operation runs in its operands' storage, which must agree;
-    /// [`Device::convert`] moves a tensor between the two.
+    /// holds any (bfloat16 for storage alone, [`Storage::Bf16`]), the host only float64 and the
+    /// Apple GPU only f32 (the other is [`GpuError::NoDeviceKernel`]). An operation runs in its
+    /// operands' storage, which must agree; [`Device::convert`] moves a tensor between them.
     pub fn with_storage(&self, storage: Storage) -> Result<Self, GpuError> {
         let native = match &*self.backend {
             #[cfg(target_os = "linux")]
-            Backend::Cuda(_) if storage != Storage::Bf16 => storage,
-            #[cfg(target_os = "linux")]
-            Backend::Cuda(_) => Storage::F32,
+            Backend::Cuda(_) => storage,
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => Storage::F32,
             Backend::Host => Storage::F64,
@@ -628,7 +629,7 @@ impl Device {
         }
         match (&*self.backend, &t.data) {
             #[cfg(target_os = "linux")]
-            (Backend::Cuda(engine), Data::Cuda(_) | Data::Cuda32(_)) => engine.convert(t),
+            (Backend::Cuda(engine), Data::Cuda(_) | Data::Cuda32(_) | Data::CudaBf16(_)) => engine.convert_to(t, self.storage),
             _ => Err(foreign()),
         }
     }
@@ -731,6 +732,10 @@ impl Device {
             Backend::Host => Data::Host(values),
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) if self.storage == Storage::F32 => Data::Cuda32(engine.upload(&values.iter().map(|v| *v as f32).collect::<Vec<f32>>())?),
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if self.storage == Storage::Bf16 => {
+                Data::CudaBf16(engine.upload(&values.iter().map(|v| bf16_bits(*v as f32) as u16).collect::<Vec<u16>>())?)
+            }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => Data::Cuda(engine.upload(&values)?),
             #[cfg(target_os = "macos")]
@@ -839,6 +844,8 @@ impl Device {
             Backend::Host => Data::Host(vec![0.0; rows * cols]),
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) if self.storage == Storage::F32 => Data::Cuda32(engine.zeros32(rows * cols)?),
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if self.storage == Storage::Bf16 => Data::CudaBf16(engine.zeros16(rows * cols)?),
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => Data::Cuda(engine.zeros(rows * cols)?),
             #[cfg(target_os = "macos")]
@@ -3182,6 +3189,58 @@ extern "C" __global__ void posterior_adam_f32(u64 n, u64 count, u64 key, u64 str
     posterior_adam_body<float>(n, count, key, stream, scale, mean_rate, log_sd_rate, beta1, beta2, epsilon, c1, c2, gradient, groups, variance, mean, log_sd, mm, mv, sm, sv, sums);
 }
 
+// A bfloat16's value (`bf16_round` is its inverse to nearest).
+__device__ float bf16_value(unsigned short h) { return __uint_as_float(((unsigned int)h) << 16); }
+__device__ float entry_load(float x) { return x; }
+__device__ float entry_load(unsigned short h) { return bf16_value(h); }
+__device__ void entry_store(float* p, float x) { *p = x; }
+__device__ void entry_store(unsigned short* p, float x) { *p = bf16_round(x); }
+
+extern "C" __global__ void widen_bf16(u64 n, const unsigned short* x, float* y) {
+    GRID_STRIDE(i, n) y[i] = bf16_value(x[i]);
+}
+
+// `posterior_adam_body` with f32 masters, the gradient in G and the moments in M (f32 or
+// bfloat16), every update computed in f32 from the loaded values and each moment rounded once as
+// it is stored.
+template <typename G, typename M>
+__device__ void posterior_adam_mixed(u64 n, u64 count, u64 key, u64 stream, double scale, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
+    double c1, double c2, const G* gradient, const unsigned int* groups, const double* variance,
+    float* mean, float* log_sd, M* mm, M* mv, M* sm, M* sv, double* sums) {
+    const float b1 = (float)beta1, b2 = (float)beta2, o1 = (float)(1.0 - beta1), o2 = (float)(1.0 - beta2), k1 = (float)(1.0 / c1), k2 = (float)(1.0 / c2);
+    const float rate_mean = (float)mean_rate, rate_log_sd = (float)log_sd_rate, eps = (float)epsilon, weight = (float)scale;
+    WARP_STRIDE(i, n) {
+        unsigned int g = i < n ? groups[i] : 0u;
+        bool live = i < n && g < count && log_sd[i] != (float)NEG_INF;
+        double a = 0.0, b = 0.0, c = 0.0;
+        if (live) {
+            float v = (float)variance[g], mu = mean[i], s = log_sd[i], sd = expf(s);
+            float e = posterior_normal(key, stream, i), gi = weight * entry_load(gradient[i]);
+            float gm = gi + mu / v, gs = gi * e * sd + sd * sd / v - 1.0f;
+            float m1 = b1 * entry_load(mm[i]) + o1 * gm, v1 = b2 * entry_load(mv[i]) + o2 * gm * gm;
+            float m2 = b1 * entry_load(sm[i]) + o1 * gs, v2 = b2 * entry_load(sv[i]) + o2 * gs * gs;
+            entry_store(mm + i, m1); entry_store(mv + i, v1); entry_store(sm + i, m2); entry_store(sv + i, v2);
+            mu -= rate_mean * (m1 * k1) / (sqrtf(v1 * k2) + eps);
+            s -= rate_log_sd * (m2 * k1) / (sqrtf(v2 * k2) + eps);
+            mean[i] = mu; log_sd[i] = s;
+            a = 1.0; b = (double)mu * (double)mu + exp(2.0 * (double)s); c = 2.0 * (double)s;
+        }
+        group_add(sums, g, live, a, b, c);
+    }
+}
+
+extern "C" __global__ void posterior_adam_f32_bf16(u64 n, u64 count, u64 key, u64 stream, double scale, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
+    double c1, double c2, const float* gradient, const unsigned int* groups, const double* variance,
+    float* mean, float* log_sd, unsigned short* mm, unsigned short* mv, unsigned short* sm, unsigned short* sv, double* sums) {
+    posterior_adam_mixed<float, unsigned short>(n, count, key, stream, scale, mean_rate, log_sd_rate, beta1, beta2, epsilon, c1, c2, gradient, groups, variance, mean, log_sd, mm, mv, sm, sv, sums);
+}
+
+extern "C" __global__ void posterior_adam_bf16_bf16(u64 n, u64 count, u64 key, u64 stream, double scale, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
+    double c1, double c2, const unsigned short* gradient, const unsigned int* groups, const double* variance,
+    float* mean, float* log_sd, unsigned short* mm, unsigned short* mv, unsigned short* sm, unsigned short* sv, double* sums) {
+    posterior_adam_mixed<unsigned short, unsigned short>(n, count, key, stream, scale, mean_rate, log_sd_rate, beta1, beta2, epsilon, c1, c2, gradient, groups, variance, mean, log_sd, mm, mv, sm, sv, sums);
+}
+
 template <typename T>
 __device__ void group_moments_body(u64 n, u64 count, const T* mean, const T* log_sd, const unsigned int* groups, double* sums) {
     WARP_STRIDE(i, n) {
@@ -3713,6 +3772,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             match (&t.data, storage) {
                 (Data::Cuda(s), Storage::F64) => Ok(self.arg(s)),
                 (Data::Cuda32(s), Storage::F32) => Ok(self.arg(s)),
+                (Data::CudaBf16(s), Storage::Bf16) => Ok(self.arg(s)),
                 (other, _) => Err(mismatch(other)),
             }
         }
@@ -3721,6 +3781,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             match (&mut t.data, storage) {
                 (Data::Cuda(s), Storage::F64) => Ok(self.arg(s)),
                 (Data::Cuda32(s), Storage::F32) => Ok(self.arg(s)),
+                (Data::CudaBf16(s), Storage::Bf16) => Ok(self.arg(s)),
                 (other, _) => Err(mismatch(other)),
             }
         }
@@ -3927,6 +3988,10 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             self.stream.alloc_zeros::<f32>(n.max(1)).gpu_ctx("tensor alloc")
         }
 
+        pub(super) fn zeros16(&self, n: usize) -> Result<CudaSlice<u16>, GpuError> {
+            self.stream.alloc_zeros::<u16>(n.max(1)).gpu_ctx("tensor alloc")
+        }
+
         /// A `rows × cols` tensor in `storage` for a kernel that writes every entry: f32 left
         /// unset (no zeroing pass ahead of the kernel), float64 zeroed as it always was.
         fn output(&self, storage: Storage, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
@@ -3993,6 +4058,32 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                 Data::Host(_) => return Err(foreign()),
             };
             Ok(Tensor { rows: t.rows, cols: t.cols, data })
+        }
+
+        /// `t` in `storage`, on the device: rounded to nearest (ties to even) when narrowing,
+        /// exactly when widening; bfloat16 passes through f32.
+        pub(super) fn convert_to(&self, t: &Tensor, storage: Storage) -> Result<Tensor, GpuError> {
+            match (t.storage(), storage) {
+                (Storage::F64, Storage::F64) | (Storage::F32, Storage::F32) => Err(shape("a conversion into the storage it is in".to_string())),
+                (Storage::F64, Storage::F32) | (Storage::F32, Storage::F64) => self.convert(t),
+                (Storage::F32, Storage::Bf16) => self.bf16_copy(t),
+                (Storage::F64, Storage::Bf16) => self.bf16_copy(&self.convert(t)?),
+                (Storage::Bf16, to) => {
+                    if to == Storage::Bf16 {
+                        return Err(shape("a conversion into the storage it is in".to_string()));
+                    }
+                    let n = t.len() as u64;
+                    let Data::CudaBf16(source) = &t.data else { return Err(foreign()) };
+                    let mut out = self.zeros32(t.len())?;
+                    if n > 0 {
+                        let f = self.function("widen_bf16")?;
+                        // SAFETY: `widen_bf16(n, x, y)` reads n halves and writes n floats.
+                        unsafe { self.stream.launch_builder(&f).arg(&n).arg(source).arg(&mut out).launch(cfg_elements(n)) }.gpu_ctx("tensor widen_bf16")?;
+                    }
+                    let wide = Tensor { rows: t.rows, cols: t.cols, data: Data::Cuda32(out) };
+                    if to == Storage::F32 { Ok(wide) } else { self.convert(&wide) }
+                }
+            }
         }
 
         fn function(&self, name: &str) -> Result<CudaFunction, GpuError> {
@@ -4718,12 +4809,12 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             .map(|_| ())
         }
 
-        /// The posterior kernel `name` in the entries' storage `storage` (`_f32` or `_f64`).
+        /// The posterior kernel `name` in the masters' storage `storage` (`_f32` or `_f64`).
         fn posterior_kernel(&self, name: &str, storage: Storage) -> Result<CudaFunction, GpuError> {
             match storage {
                 Storage::F64 => self.function(&format!("{name}_f64")),
                 Storage::F32 => self.function(&format!("{name}_f32")),
-                Storage::Bf16 => Err(shape("a bfloat16 posterior".to_string())),
+                Storage::Bf16 => Err(shape("bfloat16 posterior masters".to_string())),
             }
         }
 
@@ -4758,12 +4849,20 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             step: &super::PosteriorStep,
         ) -> Result<(), GpuError> {
             let (c1, c2) = step.corrections();
-            let (n, storage) = (mean.len() as u64, mean.storage());
-            let (f, count) = (self.posterior_kernel("posterior_adam", storage)?, variance.len() as u64);
+            let (n, storage, moments, gradients) = (mean.len() as u64, mean.storage(), mm.storage(), gradient.storage());
+            // f32 masters may keep bfloat16 moments and take a bfloat16 gradient; otherwise every
+            // entry is in the masters' storage.
+            let f = match (storage, moments, gradients) {
+                (Storage::F32, Storage::Bf16, Storage::F32) => self.function("posterior_adam_f32_bf16")?,
+                (Storage::F32, Storage::Bf16, Storage::Bf16) => self.function("posterior_adam_bf16_bf16")?,
+                (masters, m, g) if masters == m && masters == g => self.posterior_kernel("posterior_adam", storage)?,
+                (masters, m, g) => return Err(shape(format!("{masters:?} masters with {m:?} moments and a {g:?} gradient"))),
+            };
+            let count = variance.len() as u64;
             let mut builder = self.stream.launch_builder(&f);
             builder.arg(&n).arg(&count).arg(&step.key).arg(&step.stream).arg(&step.gradient_scale).arg(&step.mean_rate).arg(&step.log_sd_rate).arg(&step.beta1).arg(&step.beta2).arg(&step.epsilon).arg(&c1).arg(&c2);
-            builder.input(gradient, storage)?.arg(index_slice(groups)?).arg(slice(variance)?);
-            builder.output(mean, storage)?.output(log_sd, storage)?.output(mm, storage)?.output(mv, storage)?.output(sm, storage)?.output(sv, storage)?.arg(slice_mut(sums)?);
+            builder.input(gradient, gradients)?.arg(index_slice(groups)?).arg(slice(variance)?);
+            builder.output(mean, storage)?.output(log_sd, storage)?.output(mm, moments)?.output(mv, moments)?.output(sm, moments)?.output(sv, moments)?.arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers in one storage, float64 group buffers of `count`
             // rows; ids at or beyond `count` are skipped by the kernel.
             unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor posterior_adam").map(|_| ())

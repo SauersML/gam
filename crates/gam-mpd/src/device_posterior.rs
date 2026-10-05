@@ -7,8 +7,10 @@
 //! Adam's step from the gradient the program's reverse pass left on the device
 //! ([`Device::posterior_adam`]), which also sums each prior group's new moments; the groups'
 //! variances and divergences follow from those sums ([`Device::group_divergence`]). The posterior
-//! and its moments are held in the fitting storage (f32 on CUDA and the Apple GPU, float64 on the
-//! host), the group sums in float64 where the backend holds it (CUDA, the host). The objective and its derivatives are those of
+//! is held in the fitting storage (f32 on CUDA and the Apple GPU, float64 on the host); Adam's
+//! moments in bfloat16 where the masters are f32 on CUDA (each moment rounded once as it is
+//! stored, its update computed in f32), else in the fitting storage; the group sums in float64
+//! where the backend holds it (CUDA, the host). The objective and its derivatives are those of
 //! `library_mdl` (module note there): `KL(q_G ‖ p_G) = ½ (|G| ln v_G − Σ 2s)` at the empirical-Bayes
 //! variance `v_G`.
 
@@ -116,6 +118,16 @@ impl DevicePosterior {
             Err(e) => return Err(error(e)),
         };
         let master = fitting.clone();
+        // Adam's moments: bfloat16 beside f32 masters where the backend stores it (CUDA).
+        let narrow = if fitting.storage() == Storage::F32 {
+            match fitting.with_storage(Storage::Bf16) {
+                Ok(narrow) => narrow,
+                Err(GpuError::NoDeviceKernel { .. }) => fitting.clone(),
+                Err(e) => return Err(error(e)),
+            }
+        } else {
+            fitting.clone()
+        };
         let shapes: Vec<(usize, usize)> = parts.mean.iter().map(Array2::dim).collect();
         let sizes_agree = parts.log_sd.iter().map(Array2::dim).eq(shapes.iter().copied()) && parts.groups.iter().map(Vec::len).eq(shapes.iter().map(|(r, c)| r * c));
         if shapes.len() != parts.operators.len() || !sizes_agree || moments.is_some_and(|m| m.len() != shapes.len()) {
@@ -125,6 +137,8 @@ impl DevicePosterior {
             return Err(error("a group id beyond the groups"));
         }
         let up = |m: &Array2<f64>| master.upload(m.view()).map_err(error);
+        let moment = |m: &Array2<f64>| narrow.upload(m.view()).map_err(error);
+        let zero = |(r, c): &(usize, usize)| narrow.zeros(*r, *c).map_err(error);
         let mut out = Self {
             sums: wide.zeros(parts.count, 3).map_err(error)?,
             variance: wide.zeros(parts.count, 1).map_err(error)?,
@@ -132,11 +146,8 @@ impl DevicePosterior {
             mean: parts.mean.iter().map(up).collect::<Result<_, _>>()?,
             log_sd: parts.log_sd.iter().map(up).collect::<Result<_, _>>()?,
             moments: match moments {
-                Some(given) => given.iter().map(|m| Ok([up(&m[0])?, up(&m[1])?, up(&m[2])?, up(&m[3])?])).collect::<Result<_, String>>()?,
-                None => shapes
-                    .iter()
-                    .map(|(r, c)| Ok([master.zeros(*r, *c).map_err(error)?, master.zeros(*r, *c).map_err(error)?, master.zeros(*r, *c).map_err(error)?, master.zeros(*r, *c).map_err(error)?]))
-                    .collect::<Result<_, String>>()?,
+                Some(given) => given.iter().map(|m| Ok([moment(&m[0])?, moment(&m[1])?, moment(&m[2])?, moment(&m[3])?])).collect::<Result<_, String>>()?,
+                None => shapes.iter().map(|shape| Ok([zero(shape)?, zero(shape)?, zero(shape)?, zero(shape)?])).collect::<Result<_, String>>()?,
             },
             groups: parts.groups.iter().map(|ids| master.upload_indices(ids).map_err(error)).collect::<Result<_, _>>()?,
             operators: parts.operators.to_vec(),
