@@ -17,6 +17,7 @@ use super::artifact::Artifact;
 use super::device_program::DeviceProgram;
 use super::device_program_tests::{devices, fixture_sized, noise};
 use super::interchange::{Batch, Design, Experiment, FixedHead, Interchange, Model, Patch, ReadVariable, Targets, census, design, evaluate, fingerprint, sample, sites, targets};
+use super::interchange::plan_tests::lanes;
 use super::operator_program::{FamilyInputs, Operator, OperatorProgram, SequenceLayout, SlotValues, exact_precision};
 use super::resident_causal_fit::fixed_head_target::Head;
 use super::run_check::{layer_nodes, split_sites};
@@ -556,4 +557,23 @@ fn directions_from_host_values_are_those_of_the_loaded_explanation() {
             assert!((a - b).abs() <= 1e-9, "{e:?}: device {a} bits, host {b} bits");
         }
     }
+}
+
+#[test]
+fn a_patched_experiment_forks_from_its_base_at_the_patched_block() {
+    // Paths are laid out longest first: base 0's clean path takes lane 0; its patched experiment
+    // (the same hybrid, patched at block 2) forks from lane 0 there; a second clean experiment on
+    // base 0 under that hybrid is lane 0's path whole; base 1 and the patched experiment's source
+    // (another sequence, to block 2) take lanes of their own.
+    let f = fixture();
+    let read = f.variables.iter().position(|v| v.block == 2).expect("an attention variable of layer 1");
+    let hybrid = vec![true, false, true, true];
+    let e = |base: usize, source: usize, patch: Option<Patch>, position: usize| Experiment { base, source, explained: hybrid.clone(), patch, position };
+    let experiments = vec![e(0, 0, None, 0), e(0, 1, Some(Patch::Read { variable: read }), 3), e(0, 0, None, 2), e(1, 1, None, 0)];
+    let programs = programs(&Device::host(), &f);
+    let (_, p) = models(&f, &programs);
+    let design = design(&p, &f.variables, &experiments).expect("design");
+    let (planned, holders) = lanes(&f.batch, &experiments, &design, 2 * LAYERS).expect("lanes");
+    assert_eq!(planned, vec![(0, None), (2, Some(0)), (0, None), (0, None)]);
+    assert_eq!(holders, vec![0, 1, 0, 2]);
 }
