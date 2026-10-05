@@ -1262,9 +1262,11 @@ pub struct Interchange {
     head: FixedHead,
     variables: Vec<ReadVariable>,
     trainable: Vec<usize>,
-    /// The fused engines of `M` and `P` ([`Decoder`]) when the device and both programs take them,
-    /// else none (the reference engine runs); `P`'s is refreshed from `P`'s program before an
-    /// evaluation that follows a write to it (`stale`).
+    /// `M`'s and `P`'s programs through their hidden nodes, which [`Interchange::fuse`] compiles.
+    prefixes: (OperatorProgram, OperatorProgram),
+    /// The fused engines of `M` and `P` ([`Decoder`]) once [`Interchange::fuse`] made them, else
+    /// none (the reference engine runs); `P`'s is refreshed from `P`'s program before an evaluation
+    /// that follows a write to it (`stale`).
     engines: Option<(Decoder, RefCell<Decoder>)>,
     stale: Cell<bool>,
 }
@@ -1304,26 +1306,34 @@ impl Interchange {
         if variables.iter().any(|v| v.block >= 2 * layers.len() || v.parts.is_empty() || v.parts.iter().any(|(op, _)| !trainable.contains(op))) {
             return Err(error("a read variable outside the blocks or the trainable operators"));
         }
-        // The fused engines in f32 storage (their products in bfloat16), when both programs are of
-        // the decoder family; float64 keeps the reference engine, which is exact.
-        let engines = if device.float64() {
-            None
-        } else {
-            let m_engine = Decoder::new(device, &m_prefix, (&m_sites.entries, &m_sites.reads, m.hidden()), &[]);
-            let p_engine = Decoder::new(device, &p_prefix, (&p_sites.entries, &p_sites.reads, p.hidden()), trainable);
-            match (m_engine, p_engine) {
-                (Ok(m_engine), Ok(mut p_engine)) => {
-                    p_engine.refresh(&p)?;
-                    Some((m_engine, RefCell::new(p_engine)))
-                }
-                (m_engine, p_engine) => {
-                    let reason = m_engine.err().or(p_engine.err()).unwrap_or_default();
-                    log::info!("interchange: the reference engine runs ({reason})");
-                    None
-                }
+        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), prefixes: (m_prefix, p_prefix), engines: None, stale: Cell::new(false) })
+    }
+
+    /// Run the experiments on the fused engines from now on, when the device holds f32 and both
+    /// programs are of the decoder family; returns whether they run. Not the default: the decoder's
+    /// bfloat16 products differ from the program engine by as much as the divergence itself
+    /// (`mpd_engine_parity_2951`, vpd4l on an RTX 4090: up to 0.045 bits per token against means of
+    /// 0.02 to 0.05, gradients 6 to 8% off).
+    pub fn fuse(&mut self) -> Result<bool, String> {
+        if self.engines.is_some() || self.p.device().float64() {
+            return Ok(self.engines.is_some());
+        }
+        let device = self.p.device();
+        let m_engine = Decoder::new(device, &self.prefixes.0, (&self.m_sites.entries, &self.m_sites.reads, self.m.hidden()), &[]);
+        let p_engine = Decoder::new(device, &self.prefixes.1, (&self.p_sites.entries, &self.p_sites.reads, self.p.hidden()), &self.trainable);
+        match (m_engine, p_engine) {
+            (Ok(m_engine), Ok(mut p_engine)) => {
+                p_engine.refresh(&self.p)?;
+                self.engines = Some((m_engine, RefCell::new(p_engine)));
+                self.stale.set(false);
+                Ok(true)
             }
-        };
-        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), engines, stale: Cell::new(false) })
+            (m_engine, p_engine) => {
+                let reason = m_engine.err().or(p_engine.err()).unwrap_or_default();
+                log::info!("interchange: the reference engine runs ({reason})");
+                Ok(false)
+            }
+        }
     }
 
     /// Whether the fused engines run the experiments.

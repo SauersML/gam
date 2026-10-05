@@ -167,7 +167,7 @@ fn main() -> Result<(), String> {
         programs.insert((*name).into(), row);
     }
     let mut fused = serde_json::Map::new();
-    if candidate.fused() {
+    if candidate.fuse()? {
         for (name, experiments, directions, expected) in &families {
             let row = match scored(&candidate, &batch, experiments, directions) {
                 Ok(found) => compare(expected, &found),
