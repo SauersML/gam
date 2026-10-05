@@ -52,6 +52,7 @@
 
 use crate::{
     artifact::Artifact,
+    decoder::Decoder,
     artifact_device::mapped_inlined,
     device_program::{DeviceProgram, DeviceTrace},
     operator_program::{FamilyInputs, Node, OperatorProgram, SequenceLayout, SlotValues},
@@ -62,7 +63,9 @@ use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, Tensor};
 use gam_linalg::decompose::svd;
 use ndarray::{ArrayView2, Axis, s};
 use rand::RngExt;
+use rayon::prelude::*;
 use std::{
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     ops::Range,
     sync::Arc,
@@ -565,58 +568,67 @@ fn design_with(
         let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
         ndarray::concatenate(Axis(0), &views).map_err(error)
     };
-    let upload = |q: Span<ndarray::Array2<f64>>| -> Result<Span<Tensor>, String> {
-        Ok(match q {
-            Span::Empty => Span::Empty,
-            Span::Whole => Span::Whole,
-            Span::Part(q) => Span::Part(d.upload(q.view()).map_err(error)?),
-        })
-    };
-    let mut reads: BTreeMap<usize, Arc<Basis>> = BTreeMap::new();
-    let mut complements: BTreeMap<usize, Arc<Basis>> = BTreeMap::new();
-    let mut bases = Vec::with_capacity(experiments.len());
+    // Each distinct set of directions once (a variable's, a joint subset's, a block's complement),
+    // its rows gathered here, their spans decomposed in parallel, then uploaded.
+    let mut sets: BTreeMap<(bool, Vec<usize>), usize> = BTreeMap::new();
+    let mut rows: Vec<(usize, ndarray::Array2<f64>)> = Vec::new();
+    let mut plan: Vec<Vec<(usize, bool)>> = Vec::with_capacity(experiments.len());
     for e in experiments {
-        let mut basis = Vec::new();
+        let mut wanted: Vec<(usize, bool, Vec<usize>)> = Vec::new();
         match &e.patch {
             None => {}
-            Some(Patch::Read { variable }) => basis.push(match reads.get(variable) {
-                Some(b) => Arc::clone(b),
-                None => {
-                    let v = variables.get(*variable).ok_or_else(|| error("a patch of an unknown variable"))?;
-                    let b = Arc::new(Basis { block: v.block, complement: false, span: upload(span(rows_of(v)?.view())?)? });
-                    reads.insert(*variable, Arc::clone(&b));
-                    b
-                }
-            }),
+            Some(Patch::Read { variable }) => {
+                let v = variables.get(*variable).ok_or_else(|| error("a patch of an unknown variable"))?;
+                wanted.push((v.block, false, vec![*variable]));
+            }
             Some(Patch::Reads { variables: chosen }) => {
-                e.blocks(variables)?;
-                let parts = chosen.iter().map(|i| rows_of(&variables[*i])).collect::<Result<Vec<_>, _>>()?;
-                let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
-                let q = span(ndarray::concatenate(Axis(0), &views).map_err(error)?.view())?;
-                basis.push(Arc::new(Basis { block: variables[chosen[0]].block, complement: false, span: upload(q)? }));
+                let block = e.blocks(variables)?[0];
+                wanted.push((block, false, chosen.clone()));
             }
             Some(Patch::Complement { .. }) => {
                 for block in e.blocks(variables)? {
-                    basis.push(match complements.get(&block) {
-                        Some(b) => Arc::clone(b),
-                        None => {
-                            if block >= blocks {
-                                return Err(error("a complement patch of an unknown block"));
-                            }
-                            let parts = variables.iter().filter(|v| v.block == block).map(&rows_of).collect::<Result<Vec<_>, _>>()?;
-                            let q = if parts.is_empty() {
-                                Span::Empty
-                            } else {
-                                let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
-                                span(ndarray::concatenate(Axis(0), &views).map_err(error)?.view())?
-                            };
-                            let b = Arc::new(Basis { block, complement: true, span: upload(q)? });
-                            complements.insert(block, Arc::clone(&b));
-                            b
-                        }
-                    });
+                    if block >= blocks {
+                        return Err(error("a complement patch of an unknown block"));
+                    }
+                    wanted.push((block, true, variables.iter().enumerate().filter(|(_, v)| v.block == block).map(|(i, _)| i).collect()));
                 }
             }
+        }
+        let mut row = Vec::with_capacity(wanted.len());
+        for (block, complement, chosen) in wanted {
+            let key = (complement, chosen);
+            let at = match sets.get(&key) {
+                Some(at) => *at,
+                None => {
+                    let parts = key.1.iter().map(|i| rows_of(&variables[*i])).collect::<Result<Vec<_>, _>>()?;
+                    let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
+                    // No rows: an empty span (a complement of a block that reads nothing).
+                    let gathered = if views.is_empty() { ndarray::Array2::zeros((0, 0)) } else { ndarray::concatenate(Axis(0), &views).map_err(error)? };
+                    rows.push((block, gathered));
+                    sets.insert(key.clone(), rows.len() - 1);
+                    rows.len() - 1
+                }
+            };
+            row.push((at, key.0));
+        }
+        plan.push(row);
+    }
+    let spans: Vec<Span<ndarray::Array2<f64>>> =
+        rows.par_iter().map(|(_, r)| if r.nrows() == 0 { Ok(Span::Empty) } else { span(r.view()) }).collect::<Result<_, String>>()?;
+    let mut uploaded: Vec<Option<Arc<Basis>>> = vec![None; rows.len()];
+    let mut bases = Vec::with_capacity(experiments.len());
+    for row in plan {
+        let mut basis = Vec::with_capacity(row.len());
+        for (at, complement) in row {
+            if uploaded[at].is_none() {
+                let span = match &spans[at] {
+                    Span::Empty => Span::Empty,
+                    Span::Whole => Span::Whole,
+                    Span::Part(q) => Span::Part(d.upload(q.view()).map_err(error)?),
+                };
+                uploaded[at] = Some(Arc::new(Basis { block: rows[at].0, complement, span }));
+            }
+            basis.push(Arc::clone(uploaded[at].as_ref().ok_or_else(|| error("an uploaded basis"))?));
         }
         bases.push(basis);
     }
@@ -1250,6 +1262,11 @@ pub struct Interchange {
     head: FixedHead,
     variables: Vec<ReadVariable>,
     trainable: Vec<usize>,
+    /// The fused engines of `M` and `P` ([`Decoder`]) when the device and both programs take them,
+    /// else none (the reference engine runs); `P`'s is refreshed from `P`'s program before an
+    /// evaluation that follows a write to it (`stale`).
+    engines: Option<(Decoder, RefCell<Decoder>)>,
+    stale: Cell<bool>,
 }
 
 impl Interchange {
@@ -1272,12 +1289,13 @@ impl Interchange {
         let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
         let (m_flat, m_streams, m_reads) = sites(&Artifact::native(native)?, layers)?;
         let (p_flat, p_streams, p_reads) = sites(explanation, layers)?;
-        let mut m = DeviceProgram::compile_values_bounded(device, &prefix(&m_flat)?, numeric_bytes)?;
+        let (m_prefix, p_prefix) = (prefix(&m_flat)?, prefix(&p_flat)?);
+        let mut m = DeviceProgram::compile_values_bounded(device, &m_prefix, numeric_bytes)?;
         m.set_arithmetic(arithmetic);
         // Inherited frozen operators retain their native Arc identity through
         // inlining. Reuse their resident buffers; prepare_dense_parameters below
         // detaches every trainable owner before any posterior update can run.
-        let mut p = DeviceProgram::compile_values_sharing_bounded(&m, &prefix(&p_flat)?, numeric_bytes)?;
+        let mut p = DeviceProgram::compile_values_sharing_bounded(&m, &p_prefix, numeric_bytes)?;
         p.set_arithmetic(arithmetic);
         p.prepare_dense_parameters(trainable)?;
         let head = FixedHead::new(device, &m_flat, &p_flat, tile_rows)?;
@@ -1286,7 +1304,31 @@ impl Interchange {
         if variables.iter().any(|v| v.block >= 2 * layers.len() || v.parts.is_empty() || v.parts.iter().any(|(op, _)| !trainable.contains(op))) {
             return Err(error("a read variable outside the blocks or the trainable operators"));
         }
-        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec() })
+        // The fused engines in f32 storage (their products in bfloat16), when both programs are of
+        // the decoder family; float64 keeps the reference engine, which is exact.
+        let engines = if device.float64() {
+            None
+        } else {
+            let m_engine = Decoder::new(device, &m_prefix, (&m_sites.entries, &m_sites.reads, m.hidden()), &[]);
+            let p_engine = Decoder::new(device, &p_prefix, (&p_sites.entries, &p_sites.reads, p.hidden()), trainable);
+            match (m_engine, p_engine) {
+                (Ok(m_engine), Ok(mut p_engine)) => {
+                    p_engine.refresh(&p)?;
+                    Some((m_engine, RefCell::new(p_engine)))
+                }
+                (m_engine, p_engine) => {
+                    let reason = m_engine.err().or(p_engine.err()).unwrap_or_default();
+                    log::info!("interchange: the reference engine runs ({reason})");
+                    None
+                }
+            }
+        };
+        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), engines, stale: Cell::new(false) })
+    }
+
+    /// Whether the fused engines run the experiments.
+    pub fn fused(&self) -> bool {
+        self.engines.is_some()
     }
 
     /// `M` and `P` as the free functions of this module take them.
@@ -1296,6 +1338,7 @@ impl Interchange {
 
     /// `P`'s program, to write its trainable operators on the device (`device_posterior`).
     pub fn explanation_mut(&mut self) -> &mut DeviceProgram {
+        self.stale.set(true);
         &mut self.p
     }
 
@@ -1332,20 +1375,34 @@ impl Interchange {
 
     /// `M`'s targets for `experiments` on `batch` under `design` ([`targets`]).
     pub fn targets(&self, batch: &Batch, experiments: &[Experiment], design: &Design) -> Result<Targets, String> {
-        let (m, _) = self.models();
-        targets(&m, &self.head, batch, experiments, design)
+        match &self.engines {
+            Some((m, _)) => targets(m, &self.head, batch, experiments, design),
+            None => targets(&self.models().0, &self.head, batch, experiments, design),
+        }
     }
 
     /// `P`'s program, so that a fit writes each weight sample into its resident parameters.
     pub fn program_mut(&mut self) -> &mut DeviceProgram {
+        self.stale.set(true);
         &mut self.p
     }
 
     /// `P`'s score on `experiments` against `targets` ([`evaluate`]), the gradient left on the
     /// device per trainable operator.
     pub fn evaluate_resident(&self, batch: &Batch, experiments: &[Experiment], design: &Design, targets: &Targets, gradient: bool) -> Result<Evaluation, String> {
-        let (m, p) = self.models();
-        evaluate(&m, &p, &self.head, batch, targets, experiments, design, gradient)
+        match &self.engines {
+            Some((m, p)) => {
+                if self.stale.replace(false) {
+                    p.try_borrow_mut().map_err(error)?.refresh(&self.p)?;
+                }
+                let p = p.try_borrow().map_err(error)?;
+                evaluate(m, &*p, &self.head, batch, targets, experiments, design, gradient)
+            }
+            None => {
+                let (m, p) = self.models();
+                evaluate(&m, &p, &self.head, batch, targets, experiments, design, gradient)
+            }
+        }
     }
 
     /// Load `P`'s trainable operators, in the order given to [`Interchange::new`].
@@ -1357,6 +1414,7 @@ impl Interchange {
             let tensor = self.p.device().upload(value.view()).map_err(error)?;
             self.p.replace_dense_parameter(op, tensor)?;
         }
+        self.stale.set(true);
         self.p.refresh_fused()
     }
 
