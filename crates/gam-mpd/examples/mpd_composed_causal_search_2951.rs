@@ -2332,6 +2332,10 @@ fn structural_run(
             let root = out.join(format!("structural-attempt-{:06}", request.attempt_id));
             callback_index += 1;
             std::fs::create_dir(&root).map_err(|e| e.to_string())?;
+            if let Some(initialization) = request.initialization {
+                save(&root.join("PARENT_INITIALIZATION.json"),
+                    &serde_json::to_value(initialization).map_err(|e| e.to_string())?)?;
+            }
             save(
                 &root.join("DECLARATION.json"),
                 &json!({"attempt_id":request.attempt_id,"parent_id":request.parent_id,"depth":request.depth,"mutation":request.mutation,"parent_evaluation":request.parent.evaluation,"trainable":request.trainable_operator_ids}),
@@ -2624,6 +2628,72 @@ fn structural_run(
         &out.join("REPORT.json"),
         &json!({"structural_report":result.report,"rounding_policy":rounding_policy(),"retained_candidates":metadata,"frozen_ids":frozen,"compression_frontier":result.frontier,"expression_hypotheses":expression_hypotheses,"heldout":heldout_rows,"callback_calls":callback_index,"scope":"Bounded measured structural proposal search on explicitly intervention-conditioned native graph, not automatic understanding; no per-candidate native reexecution inside predictor; native computation outside affected rule uses remains fixed"}),
     )
+}
+
+struct JointLocalTargets {
+    inputs: Vec<Array2<f64>>,
+    targets: Array2<f64>,
+    groups: Vec<gam_mpd::resident_rule_fit::OutputGroup>,
+}
+
+/// Training-only native values. The returned program still computes every value itself.
+fn capture_joint_local_targets(
+    d: &Device,
+    parent: &OperatorProgram,
+    input: usize,
+    outputs: &[usize],
+    family: &FamilyInputs,
+    numeric_bytes: usize,
+) -> Result<JointLocalTargets, String> {
+    let last = outputs.iter().copied().chain(std::iter::once(input)).max()
+        .ok_or("joint local observations absent")?;
+    let mut prefix = parent.clone();
+    prefix.nodes.truncate(last + 1);
+    prefix.output = last;
+    let resident = DeviceProgram::compile_values_bounded(d, &prefix, numeric_bytes)?;
+    let planned = resident.bytes_per_row().checked_mul(family.rows)
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| resident.operator_numeric_bytes().ok().and_then(|p| n.checked_add(p)))
+        .ok_or("joint local capture size overflow")?;
+    if planned > numeric_bytes {
+        return Err(format!("joint local capture numeric plan {planned} exceeds {numeric_bytes}"));
+    }
+    let trace = resident.forward(family)?;
+    let inputs = vec![d.download(trace.value(input)?).map_err(|e| e.to_string())?];
+    let panels = outputs.iter().map(|n| d.download(trace.value(*n)?)
+        .map_err(|e| e.to_string())).collect::<Result<Vec<_>, String>>()?;
+    let targets = ndarray::concatenate(ndarray::Axis(1),
+        &panels.iter().map(|p| p.view()).collect::<Vec<_>>()).map_err(|e| e.to_string())?;
+    let mut start = 0;
+    let groups = panels.iter().enumerate().map(|(i, p)| {
+        let end = start + p.ncols();
+        let group = gam_mpd::resident_rule_fit::OutputGroup {
+            label: if i == 0 { "clean".into() } else { format!("response{}", i - 1) },
+            start, end,
+        };
+        start = end;
+        group
+    }).collect();
+    Ok(JointLocalTargets { inputs, targets, groups })
+}
+
+fn prefit_joint_linear(
+    d: &Device,
+    program: &OperatorProgram,
+    trainable: &[usize],
+    targets: &JointLocalTargets,
+    numeric_bytes: usize,
+) -> Result<(OperatorProgram, Value), String> {
+    let measure = |p: &OperatorProgram| gam_mpd::resident_rule_fit::measure_grouped(
+        d, p, &targets.inputs, &targets.targets, &targets.groups, numeric_bytes, 128);
+    let initial = measure(program)?;
+    let fit = gam_mpd::program_linear_fit::prefit(program, &targets.inputs,
+        &targets.targets, trainable, Default::default(), numeric_bytes)?;
+    let proposed = measure(&fit.program)?;
+    let accepted = proposed.maximum < initial.maximum;
+    let report = json!({"initial":initial,"proposed":proposed,"accepted":accepted,
+        "linear_fit":fit.report,"selection":"Strict improvement of full TRAIN normalized maximum; no validation used. Fixed native input states only; no hybrid-state refresh yet. Local least squares is a proposal, not the acceptance objective."});
+    Ok((if accepted { fit.program } else { program.clone() }, report))
 }
 
 fn validate_joint_configuration(settings: &Settings) -> Result<(), String> {
@@ -2976,7 +3046,7 @@ fn run() -> Result<(), String> {
         "native_codec_bytes":settings.native_codec_bytes,"native_codec_initialization_seconds":native_codec_initialization_seconds,"native_codec_preflight":native_codec.as_ref().map(|c|c.preflight()),"native_codec_stats":native_codec.as_ref().map(|c|c.stats()),
         "native_codec_budget_scope":"packed native codewords plus cached decoded numeric buffers only; excludes caller-owned source arrays, per-operator construction/lattice temporaries, full messages, label/execution buffers, metadata and allocator/library overhead; construction excluded from warm timings",
         "literal_down_arithmetic":"binary64 stored D updates in declared order D += a*u*v; original graph executes updated matrix; no float32 checkpoint-store or augmented-branch bitwise equivalence claim",
-        "joint_response_search":settings.joint_response_search,"joint_search_scope":"bounded enumerated learned multi-output DAG; exactly one declared down layer; shared computations are actual nodes; no body transfer; inventory truncation disclosed in JOINT_INVENTORY.json",
+        "joint_response_search":settings.joint_response_search,"joint_search_scope":"bounded enumerated learned multi-output DAG; exactly one declared down layer; shared computations are actual nodes; exact corresponding parent subtrees inherit coefficients with per-owner provenance; changed pieces require fitting; inventory truncation disclosed in JOINT_INVENTORY.json",
         "native_parameter_edits":settings.native_parameter_edits,"native_parameter_edit_scope":"Finite additive dense directions lowered as Raw control contributions before downstream nonlinearities; independent literal edited original-native teachers; structural_search only. No mechanism recovery claim, no bit-parity between augmented and literal arithmetic; saved source/directions use paid ordinary f32 codec.",
         "down_edit_family":settings.down_edit_family,"down_family_scope":"restricted declared native down-weight directions; teachers run literal edited matrices, predictor runs own response functions; fixed directions serialized and excluded from fitting; no arbitrary native-edit mapping; body export/transfer disabled in this mode",
         "control_scope":"activation boundary scaling is not a global weight edit; retained_operator gain affects all its invocations; no mapping claimed for removed internal coordinates",
@@ -3093,6 +3163,7 @@ fn run() -> Result<(), String> {
     } else {
         None
     };
+    let mut joint_local_targets = None;
     let candidate_ids: Vec<_> = joint_inventory.as_ref().map_or_else(
         || settings.expression_ids.clone(),
         |(_, _, i)| (0..i.proposals.len()).collect(),
@@ -3126,17 +3197,44 @@ fn run() -> Result<(), String> {
                 } else {
                     composed_rule_search::compile_untied
                 };
-                let joint = joint_inventory
+                let mut joint = joint_inventory
                     .as_ref()
                     .map(|(inputs, outputs, inventory)| {
-                        program_learned_dag::compile_program(
+                        let parent = down.as_ref().ok_or("joint response parent absent")?;
+                        let layer = settings.down_edit_family.as_ref().ok_or("joint response layer absent")?.layer;
+                        let parent_outputs = std::iter::once(parent.clean_output)
+                            .chain(parent.response_nodes.iter().copied()).collect::<Vec<_>>();
+                        program_learned_dag::compile_program_inheriting(
                             inputs,
                             outputs,
                             &inventory.proposals[id].expressions,
                             settings.joint_response_search.as_ref().unwrap(),
+                            &parent.program,
+                            &[layers[layer].normed],
+                            &parent_outputs,
                         )
                     })
                     .transpose()?;
+                if let Some(joint) = &mut joint {
+                    save(&root.join("PARENT_INITIALIZATION.json"),
+                        &serde_json::to_value(&joint.initialization).map_err(|e| e.to_string())?)?;
+                    if joint.initialization.random_elements != 0 {
+                        if joint_local_targets.is_none() {
+                            let parent = down.as_ref().ok_or("joint parent absent")?;
+                            let layer = settings.down_edit_family.as_ref().ok_or("joint layer absent")?.layer;
+                            let outputs = std::iter::once(parent.clean_output)
+                                .chain(parent.response_nodes.iter().copied()).collect::<Vec<_>>();
+                            let clean_inputs = parent.inputs(family, &vec![0.; direction_count])?;
+                            joint_local_targets = Some(capture_joint_local_targets(&d, &parent.program,
+                                layers[layer].normed, &outputs, &clean_inputs, settings.fit.numeric_bytes)?);
+                        }
+                        let (program, report) = prefit_joint_linear(&d, &joint.program,
+                            &joint.trainable_operator_ids, joint_local_targets.as_ref().ok_or("local target capture absent")?,
+                            settings.fit.numeric_bytes)?;
+                        joint.program = program;
+                        save(&root.join("LOCAL_LINEAR_PREFIT.json"), &report)?;
+                    }
+                }
                 let proposal = if joint.is_none() {
                     let mut proposal = compile(
                         &inventory.expressions[id],
@@ -3850,6 +3948,20 @@ mod tests {
             slots: vec![SlotValues::Raw(array![[0.5, 0.2], [-0.3, 0.7], [1., -0.2]])],
             layout: None,
         };
+        let local = capture_joint_local_targets(&Device::host(), &native, 0, &[3], &base, 1 << 24)
+            .expect("training-only local capture");
+        let mut changed = native.clone();
+        changed.operators[1] = dense(Array2::zeros((5, 2)));
+        let (repaired, report) = prefit_joint_linear(&Device::host(), &changed, &[1], &local, 1 << 24)
+            .expect("fixed-feature coefficient fit");
+        assert_eq!(report["accepted"], true);
+        assert!(report["proposed"]["maximum"].as_f64().unwrap() < 1e-10);
+        assert_eq!(repaired.operators[0], native.operators[0]);
+        let unseen = FamilyInputs { rows: 2,
+            slots: vec![SlotValues::Raw(array![[2., -0.4], [-1., 3.]])], layout: None };
+        let expected = native.execute(&unseen, false).expect("native unseen").values[3].clone();
+        let actual = repaired.execute(&unseen, false).expect("autonomous unseen").values[3].clone();
+        assert!(expected.iter().zip(actual.iter()).all(|(a,b)| (a-b).abs() < 1e-10));
         let controls = vec![Control::NodeScale { node: 0 }];
         let cases = vec![
             Case {

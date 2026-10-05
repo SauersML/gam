@@ -6,8 +6,8 @@ use crate::{
     artifact::Artifact,
     composed_rule_search::{Binary, Unary},
     operator_program::{
-        Coefficient, Declarations, Interface, Law, Node, Operator, OperatorProgram, Slot,
-        exact_precision,
+        Coefficient, Declarations, Interface, Law, Node, Operator, OperatorBody, OperatorProgram,
+        Slot, exact_precision,
     },
     program_joint_regions::{self as joint, Exit, JointBody},
 };
@@ -87,11 +87,13 @@ pub struct Inventory {
     pub priority: String,
 }
 pub struct Applied {
+    pub initialization: InitializationReport,
     pub artifact: Artifact,
     pub trainable_operator_ids: Vec<usize>,
     pub node_mapping: Vec<usize>,
 }
 pub struct Compiled {
+    pub initialization: InitializationReport,
     pub program: OperatorProgram,
     pub output_nodes: Vec<usize>,
     pub trainable_operator_ids: Vec<usize>,
@@ -969,6 +971,326 @@ impl BindingSearch<'_> {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct InitializationReport {
+    pub owners: Vec<OwnerInitialization>,
+    pub inherited_elements: usize,
+    pub zero_filled_bias_elements: usize,
+    pub random_elements: usize,
+    pub scope: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OwnerInitialization {
+    pub parameter: usize,
+    pub matrix_operator: usize,
+    pub bias_operator: Option<usize>,
+    pub parent_matrices: Vec<usize>,
+    pub parent_biases: Vec<usize>,
+    pub inherited_elements: usize,
+    pub zero_filled_bias_elements: usize,
+    pub random_elements: usize,
+    pub status: String,
+    pub interfaces_relabelled: bool,
+}
+fn unary_law(op: Unary) -> Law {
+    match op {
+        Unary::Relu => Law::Relu,
+        Unary::Silu => Law::Silu,
+        Unary::Gelu => Law::Gelu,
+        Unary::GeluTanh => Law::GeluTanh,
+    }
+}
+fn dense_complete(op: &Operator) -> bool {
+    matches!(&op.body, OperatorBody::Dense { values, present, .. } if present.iter().all(|v| *v) && values.iter().all(|v| v.is_finite()))
+}
+fn same_coefficients(a: &Operator, b: &Operator) -> bool {
+    a.rows.width() == b.rows.width()
+        && a.cols.width() == b.cols.width()
+        && match (&a.body, &b.body) {
+            (
+                OperatorBody::Dense {
+                    values: a,
+                    present: ap,
+                    ..
+                },
+                OperatorBody::Dense {
+                    values: b,
+                    present: bp,
+                    ..
+                },
+            ) => {
+                a.dim() == b.dim()
+                    && ap.iter().all(|v| *v)
+                    && bp.iter().all(|v| *v)
+                    && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
+            }
+            _ => false,
+        }
+}
+fn zero_bias(parent: &OperatorProgram, bias: Option<usize>) -> bool {
+    bias.is_none_or(|id| matches!(&parent.operators[id].body, OperatorBody::Dense { values, present, .. } if present.iter().all(|v| *v) && values.iter().all(|v| *v==0.)))
+}
+struct ParentMatch<'a> {
+    parent: &'a OperatorProgram,
+    inputs: &'a [usize],
+    types: Vec<Interface>,
+    checked: Checker<'a>,
+}
+impl ParentMatch<'_> {
+    fn matches(&self, e: &Expr, node: usize) -> bool {
+        if self.checked.cache[e].width() != self.types[node].width() {
+            return false;
+        }
+        match (e, &self.parent.nodes[node]) {
+            (Expr::Argument(i), _) => self.inputs[*i] == node,
+            (Expr::Unary(op, x), Node::Pointwise { input, laws }) => {
+                laws.iter().all(|law| *law == unary_law(*op)) && self.matches(x, *input)
+            }
+            (Expr::Affine { input, bias, .. }, Node::Affine { terms, bias: pb })
+                if terms.len() == 1 && (*bias || zero_bias(self.parent, *pb)) =>
+            {
+                dense_complete(&self.parent.operators[terms[0].1])
+                    && pb.is_none_or(|id| dense_complete(&self.parent.operators[id]))
+                    && self.matches(input, terms[0].0)
+            }
+            (Expr::Binary(Binary::Multiply, a, b), Node::Hadamard { left, right }) => {
+                self.matches(a, *left) && self.matches(b, *right)
+            }
+            _ => false,
+        }
+    }
+    fn record_proven(
+        &self,
+        e: &Expr,
+        node: usize,
+        inherited: &mut BTreeMap<usize, Vec<(usize, Option<usize>)>>,
+    ) {
+        if self.matches(e, node) {
+            self.record(e, node, inherited);
+            return;
+        }
+        // Align unchanged child roles even when an outer law/map changes. This
+        // retains only children whose complete boundary-anchored subtree matches.
+        match (e, &self.parent.nodes[node]) {
+            (Expr::Unary(_, x), Node::Pointwise { input, .. }) => {
+                self.record_proven(x, *input, inherited)
+            }
+            (Expr::Affine { input, .. }, Node::Affine { terms, .. }) if terms.len() == 1 => {
+                self.record_proven(input, terms[0].0, inherited)
+            }
+            (Expr::Binary(Binary::Multiply, a, b), Node::Hadamard { left, right }) => {
+                self.record_proven(a, *left, inherited);
+                self.record_proven(b, *right, inherited);
+            }
+            _ => return,
+        }
+    }
+    fn record(
+        &self,
+        e: &Expr,
+        node: usize,
+        inherited: &mut BTreeMap<usize, Vec<(usize, Option<usize>)>>,
+    ) {
+        match (e, &self.parent.nodes[node]) {
+            (
+                Expr::Affine {
+                    parameter, input, ..
+                },
+                Node::Affine { terms, bias },
+            ) => {
+                inherited
+                    .entry(*parameter)
+                    .or_default()
+                    .push((terms[0].1, *bias));
+                self.record(input, terms[0].0, inherited);
+            }
+            (Expr::Unary(_, x), Node::Pointwise { input, .. }) => self.record(x, *input, inherited),
+            (Expr::Binary(Binary::Multiply, a, b), Node::Hadamard { left, right }) => {
+                self.record(a, *left, inherited);
+                self.record(b, *right, inherited);
+            }
+            _ => return,
+        }
+    }
+}
+fn initialize_from_parent(
+    builder: &mut Builder,
+    inputs: &[Interface],
+    outputs: &[Interface],
+    expressions: &[Expr],
+    s: &Settings,
+    parent: Option<(&OperatorProgram, &[usize], &[usize])>,
+) -> Result<InitializationReport, String> {
+    let expressions = canonicalize(inputs, outputs, expressions)?;
+    let mut inherited: BTreeMap<usize, Vec<(usize, Option<usize>)>> = BTreeMap::new();
+    if let Some((parent, parent_inputs, parent_outputs)) = parent {
+        let types = parent.interfaces().map_err(|e| e.to_string())?;
+        if parent_inputs.len() != inputs.len()
+            || parent_outputs.len() != outputs.len()
+            || parent_inputs
+                .iter()
+                .zip(inputs)
+                .any(|(&n, ty)| types.get(n).is_none_or(|held| held.width() != ty.width()))
+            || parent_outputs
+                .iter()
+                .zip(outputs)
+                .any(|(&n, ty)| types.get(n).is_none_or(|held| held.width() != ty.width()))
+        {
+            return Err("parent initialization boundary/interface mismatch".into());
+        }
+        let mut checked = checker(inputs, outputs, s);
+        for e in &expressions {
+            checked.expr(e)?;
+        }
+        let matcher = ParentMatch {
+            parent,
+            inputs: parent_inputs,
+            types,
+            checked,
+        };
+        // First respect semantic exit correspondence, including different parent
+        // owners that happen to have the same shape. A proposed tie must agree.
+        for (e, &node) in expressions.iter().zip(parent_outputs) {
+            matcher.record_proven(e, node, &mut inherited);
+        }
+        let mut ancestry = BTreeSet::new();
+        let mut pending = parent_outputs.to_vec();
+        while let Some(node) = pending.pop() {
+            if parent_inputs.contains(&node) || !ancestry.insert(node) {
+                continue;
+            }
+            pending.extend(parent.nodes[node].arguments());
+        }
+        // Changed outer equations can still retain exact unchanged subtrees.
+        // Without exit correspondence, multiple parent owners are ambiguous;
+        // retain random initialization rather than choosing by matrix shape.
+        for e in builder.cache.keys() {
+            let Expr::Affine { parameter, .. } = e else {
+                continue;
+            };
+            if inherited.contains_key(parameter) {
+                continue;
+            }
+            let matches = ancestry
+                .iter()
+                .filter(|&&n| matcher.matches(e, n))
+                .copied()
+                .collect::<Vec<_>>();
+            let pairs = matches
+                .iter()
+                .filter_map(|&n| match &parent.nodes[n] {
+                    Node::Affine { terms, bias } => Some((terms[0].1, *bias)),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            if pairs.len() == 1 {
+                if let Some(&node) = matches.first() {
+                    matcher.record(e, node, &mut inherited);
+                }
+            }
+        }
+    }
+    let mut report = InitializationReport { scope:"Coefficient inheritance is initialization, not discovery. Exact ordered parent subtrees require matching boundary arguments, coordinate-preserving width-compatible interfaces (explicit boundary order; grouping labels may be adapted for complete dense and uniform pointwise operations), supported operators, nonlinear laws. Extra candidate biases remain explicitly zero; omitted parent biases must be exactly zero. Semantic exit matches take priority; ambiguous unmatched subtrees stay random. Shared candidate owners must have bit-identical inherited matrices and biases across all matched parent uses. Changed/unsupported pieces retain deterministic fan-in initialization (biases zero). No numerical sensitivity, fit success, or preservation claim for changed equations.".into(), ..InitializationReport::default() };
+    for (&parameter, &(matrix, bias)) in &builder.parameters {
+        let elements = builder.operators[matrix].rows.width()
+            * builder.operators[matrix].cols.width()
+            + bias.map_or(0, |id| builder.operators[id].rows.width());
+        let sources = inherited.get(&parameter).cloned().unwrap_or_default();
+        let mut owner = OwnerInitialization {
+            parameter,
+            matrix_operator: matrix,
+            bias_operator: bias,
+            parent_matrices: vec![],
+            parent_biases: vec![],
+            inherited_elements: 0,
+            zero_filled_bias_elements: 0,
+            random_elements: elements,
+            status: "random: no unambiguous exact parent subtree".into(),
+            interfaces_relabelled: false,
+        };
+        if let (Some((parent, _, _)), Some(&(source, source_bias))) = (parent, sources.first()) {
+            for &(other, other_bias) in &sources {
+                if !same_coefficients(&parent.operators[source], &parent.operators[other])
+                    || match (source_bias, other_bias) {
+                        (None, None) => false,
+                        (Some(a), Some(b)) => {
+                            !same_coefficients(&parent.operators[a], &parent.operators[b])
+                        }
+                        _ => !zero_bias(parent, source_bias) || !zero_bias(parent, other_bias),
+                    }
+                {
+                    return Err(format!(
+                        "incompatible parent coefficient inheritance for shared candidate owner {parameter}: parent matrix/bias owners disagree"
+                    ));
+                }
+            }
+            if !same_operator_interfaces(&builder.operators[matrix], &parent.operators[source]) {
+                return Err("inherited matrix interface mismatch".into());
+            }
+            owner.interfaces_relabelled |= builder.operators[matrix].rows
+                != parent.operators[source].rows
+                || builder.operators[matrix].cols != parent.operators[source].cols;
+            builder.operators[matrix] =
+                inherited_operator(&builder.operators[matrix], &parent.operators[source])?;
+            match (bias, source_bias) {
+                (Some(target), Some(source)) => {
+                    if !same_operator_interfaces(
+                        &builder.operators[target],
+                        &parent.operators[source],
+                    ) {
+                        return Err("inherited bias interface mismatch".into());
+                    }
+                    owner.interfaces_relabelled |= builder.operators[target].rows
+                        != parent.operators[source].rows
+                        || builder.operators[target].cols != parent.operators[source].cols;
+                    builder.operators[target] =
+                        inherited_operator(&builder.operators[target], &parent.operators[source])?;
+                }
+                (Some(target), None) => {
+                    // A zero candidate bias is a function-preserving embedding
+                    // of an exactly corresponding bias-free parent affine.
+                    owner.zero_filled_bias_elements = builder.operators[target].rows.width();
+                }
+                (None, parent_bias) if zero_bias(parent, parent_bias) => (),
+                _ => return Err("nonzero parent bias cannot be omitted".into()),
+            }
+            owner.parent_matrices = sources
+                .iter()
+                .map(|&(id, _)| id)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            owner.parent_biases = sources
+                .iter()
+                .filter_map(|&(_, id)| id)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            owner.inherited_elements = elements - owner.zero_filled_bias_elements;
+            owner.random_elements = 0;
+            owner.status = "inherited: exact parent subtree correspondence".into();
+        }
+        report.inherited_elements += owner.inherited_elements;
+        report.zero_filled_bias_elements += owner.zero_filled_bias_elements;
+        report.random_elements += owner.random_elements;
+        report.owners.push(owner);
+    }
+    Ok(report)
+}
+fn inherited_operator(target: &Operator, source: &Operator) -> Result<Operator, String> {
+    let mut result = source.clone();
+    result.rows = target.rows.clone();
+    result.cols = target.cols.clone();
+    let OperatorBody::Dense { present, .. } = &mut result.body else {
+        return Err("inheritance requires complete dense coefficients".into());
+    };
+    *present = Array2::from_elem((result.rows.group_count(), result.cols.group_count()), true);
+    Ok(result)
+}
+fn same_operator_interfaces(a: &Operator, b: &Operator) -> bool {
+    a.rows.width() == b.rows.width() && a.cols.width() == b.cols.width()
+}
+
 struct Builder {
     nodes: Vec<Node>,
     operators: Vec<Operator>,
@@ -1143,6 +1465,34 @@ pub fn compile_program(
     expressions: &[Expr],
     s: &Settings,
 ) -> Result<Compiled, String> {
+    compile_program_initialized(inputs, outputs, expressions, s, None)
+}
+/// Inherit only proven parent subtrees. Parent boundary nodes and semantic exits
+/// correspond to the supplied input/output interface order.
+pub fn compile_program_inheriting(
+    inputs: &[Interface],
+    outputs: &[Interface],
+    expressions: &[Expr],
+    s: &Settings,
+    parent: &OperatorProgram,
+    parent_inputs: &[usize],
+    parent_outputs: &[usize],
+) -> Result<Compiled, String> {
+    compile_program_initialized(
+        inputs,
+        outputs,
+        expressions,
+        s,
+        Some((parent, parent_inputs, parent_outputs)),
+    )
+}
+fn compile_program_initialized(
+    inputs: &[Interface],
+    outputs: &[Interface],
+    expressions: &[Expr],
+    s: &Settings,
+    parent: Option<(&OperatorProgram, &[usize], &[usize])>,
+) -> Result<Compiled, String> {
     if inputs
         .iter()
         .any(|ty| !matches!(Interface::native(ty.width()), Ok(ref held) if held == ty))
@@ -1150,6 +1500,8 @@ pub fn compile_program(
         return Err("standalone learned program requires native Raw input grouping; use artifact apply for grouped boundaries".into());
     }
     let (mut builder, output_nodes) = build(inputs, outputs, expressions, s)?;
+    let initialization =
+        initialize_from_parent(&mut builder, inputs, outputs, expressions, s, parent)?;
     for node in &mut builder.nodes {
         if let Node::Param { index } = node {
             *node = Node::Raw { slot: *index };
@@ -1181,6 +1533,7 @@ pub fn compile_program(
     };
     program.interfaces().map_err(|e| e.to_string())?;
     Ok(Compiled {
+        initialization,
         program,
         output_nodes,
         trainable_operator_ids,
@@ -1232,7 +1585,19 @@ pub fn apply(
     s: &Settings,
 ) -> Result<Applied, String> {
     let (inputs, outputs) = boundaries(a, r, args)?;
-    let (builder, exits) = build(&inputs, &outputs, expressions, s)?;
+    let (mut builder, exits) = build(&inputs, &outputs, expressions, s)?;
+    let parent_inputs = args
+        .iter()
+        .map(|&n| a.place(n).ok_or("inheritance parent input absent"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut initialization = initialize_from_parent(
+        &mut builder,
+        &inputs,
+        &outputs,
+        expressions,
+        s,
+        Some((&a.program, &parent_inputs, &r.current_writes)),
+    )?;
     let local_trainables = builder
         .parameters
         .values()
@@ -1286,7 +1651,15 @@ pub fn apply(
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
+    for owner in &mut initialization.owners {
+        owner.matrix_operator =
+            mapped.operator_mapping[a.program.operators.len() + owner.matrix_operator];
+        owner.bias_operator = owner
+            .bias_operator
+            .map(|id| mapped.operator_mapping[a.program.operators.len() + id]);
+    }
     Ok(Applied {
+        initialization,
         artifact: mapped.artifact,
         trainable_operator_ids,
         node_mapping: mapped.node_mapping,
@@ -1507,6 +1880,311 @@ mod tests {
         assert!(inventory.sharing_seed_checks > 0);
         assert!(inventory.sharing_seed_checks <= s.max_tuple_checks / 8);
         assert!(inventory.checked_tuples <= s.max_tuple_checks);
+    }
+
+    fn inheritance_equations(tied: bool, law: Unary) -> Vec<Expr> {
+        let up = Expr::Affine {
+            parameter: 0,
+            output: TypeRef::Latent { width: 2 },
+            input: Box::new(Expr::Argument(0)),
+            bias: true,
+        };
+        let activation = Expr::Unary(law, Box::new(up));
+        vec![
+            Expr::Affine {
+                parameter: 1,
+                output: TypeRef::Input(0),
+                input: Box::new(activation.clone()),
+                bias: true,
+            },
+            Expr::Affine {
+                parameter: 2,
+                output: TypeRef::Exit(1),
+                input: Box::new(activation.clone()),
+                bias: true,
+            },
+            Expr::Affine {
+                parameter: if tied { 2 } else { 3 },
+                output: TypeRef::Exit(1),
+                input: Box::new(activation),
+                bias: true,
+            },
+        ]
+    }
+    #[test]
+    fn parent_inheritance_preserves_nonlinear_coefficients_biases_and_partial_subtrees() {
+        let input = Interface::native(2).expect("input");
+        let scalar = Interface::native(1).expect("response");
+        let inputs = vec![input.clone()];
+        let outputs = vec![input, scalar.clone(), scalar];
+        let mut s = settings();
+        s.require_shared = true;
+        s.affine_bias = true;
+        let expressions = inheritance_equations(false, Unary::GeluTanh);
+        let mut parent = compile_program(&inputs, &outputs, &expressions, &s).expect("parent");
+        // Nonzero biases distinguish coefficient preservation from zero init.
+        for owner in &parent.initialization.owners {
+            if let Some(id) = owner.bias_operator {
+                let op = Arc::make_mut(&mut parent.program.operators[id]);
+                if let OperatorBody::Dense {
+                    values, precision, ..
+                } = &mut op.body
+                {
+                    values.fill(0.25 + owner.parameter as f64 * 0.125);
+                    *precision = exact_precision(values.iter().copied()).expect("bias precision");
+                }
+            }
+        }
+        s.seed = 987;
+        let inherited = compile_program_inheriting(
+            &inputs,
+            &outputs,
+            &expressions,
+            &s,
+            &parent.program,
+            &[0],
+            &parent.output_nodes,
+        )
+        .expect("exact inheritance");
+        assert_eq!(inherited.initialization.random_elements, 0);
+        assert_eq!(inherited.initialization.inherited_elements, 18);
+        let family = FamilyInputs {
+            rows: 2,
+            slots: vec![SlotValues::Raw(array![[1., -2.], [0.25, 3.]])],
+            layout: None,
+        };
+        assert_eq!(
+            parent
+                .program
+                .execute(&family, false)
+                .expect("parent output")
+                .values[parent.program.output],
+            inherited
+                .program
+                .execute(&family, false)
+                .expect("inherited output")
+                .values[inherited.program.output]
+        );
+        let changed = compile_program_inheriting(
+            &inputs,
+            &outputs,
+            &inheritance_equations(false, Unary::Silu),
+            &s,
+            &parent.program,
+            &[0],
+            &parent.output_nodes,
+        )
+        .expect("changed topology retains upstream");
+        assert_eq!(changed.initialization.inherited_elements, 6);
+        assert!(changed.initialization.random_elements > 0);
+        let tied = compile_program_inheriting(
+            &inputs,
+            &outputs,
+            &inheritance_equations(true, Unary::GeluTanh),
+            &s,
+            &parent.program,
+            &[0],
+            &parent.output_nodes,
+        );
+        assert!(
+            tied.err()
+                .expect("unequal parent readers cannot be tied")
+                .contains("shared candidate owner")
+        );
+        let reader_a = parent.initialization.owners[2].matrix_operator;
+        let reader_b = parent.initialization.owners[3].matrix_operator;
+        parent.program.operators[reader_b] = parent.program.operators[reader_a].clone();
+        let bias_conflict = compile_program_inheriting(
+            &inputs,
+            &outputs,
+            &inheritance_equations(true, Unary::GeluTanh),
+            &s,
+            &parent.program,
+            &[0],
+            &parent.output_nodes,
+        );
+        assert!(
+            bias_conflict
+                .err()
+                .expect("equal matrices with unequal biases cannot be tied")
+                .contains("shared candidate owner")
+        );
+    }
+    #[test]
+    fn bias_free_parent_embeds_with_zero_candidate_bias_and_nonzero_bias_is_not_dropped() {
+        fn remove_bias(e: &mut Expr) {
+            match e {
+                Expr::Affine { bias, input, .. } => {
+                    *bias = false;
+                    remove_bias(input);
+                }
+                Expr::Unary(_, x) => remove_bias(x),
+                Expr::Binary(_, a, b) => {
+                    remove_bias(a);
+                    remove_bias(b);
+                }
+                Expr::Argument(_) => return,
+            }
+        }
+        let input = Interface::native(2).expect("input");
+        let scalar = Interface::native(1).expect("response");
+        let outputs = vec![input.clone(), scalar.clone(), scalar];
+        let mut s = settings();
+        s.affine_bias = true;
+        s.require_shared = true;
+        let biased = inheritance_equations(false, Unary::GeluTanh);
+        let mut bias_free = biased.clone();
+        for e in &mut bias_free {
+            remove_bias(e);
+        }
+        let parent =
+            compile_program(&[input.clone()], &outputs, &bias_free, &s).expect("bias-free parent");
+        let inherited = compile_program_inheriting(
+            &[input.clone()],
+            &outputs,
+            &biased,
+            &s,
+            &parent.program,
+            &[0],
+            &parent.output_nodes,
+        )
+        .expect("zero bias embedding");
+        assert_eq!(inherited.initialization.random_elements, 0);
+        assert_eq!(inherited.initialization.inherited_elements, 12);
+        assert_eq!(inherited.initialization.zero_filled_bias_elements, 6);
+        let family = FamilyInputs {
+            rows: 1,
+            slots: vec![SlotValues::Raw(array![[0.3, -0.7]])],
+            layout: None,
+        };
+        assert_eq!(
+            parent
+                .program
+                .execute(&family, false)
+                .expect("parent")
+                .values[parent.program.output],
+            inherited
+                .program
+                .execute(&family, false)
+                .expect("candidate")
+                .values[inherited.program.output]
+        );
+        let omitted = compile_program_inheriting(
+            &[input.clone()],
+            &outputs,
+            &bias_free,
+            &s,
+            &inherited.program,
+            &[0],
+            &inherited.output_nodes,
+        )
+        .expect("zero biases can be omitted");
+        assert_eq!(omitted.initialization.random_elements, 0);
+        let mut nonzero = inherited;
+        let bias = nonzero.initialization.owners[0]
+            .bias_operator
+            .expect("up bias");
+        if let OperatorBody::Dense {
+            values, precision, ..
+        } = &mut Arc::make_mut(&mut nonzero.program.operators[bias]).body
+        {
+            values.fill(0.5);
+            *precision = exact_precision(values.iter().copied()).expect("bias precision");
+        }
+        let dropped = compile_program_inheriting(
+            &[input],
+            &outputs,
+            &bias_free,
+            &s,
+            &nonzero.program,
+            &[0],
+            &nonzero.output_nodes,
+        )
+        .expect("unsupported bias omission stays random");
+        assert!(dropped.initialization.random_elements > 0);
+    }
+
+    #[test]
+    fn parent_inheritance_adapts_group_labels_without_reordering_coefficients() {
+        use crate::operator_program::LabelKind;
+        let input = Interface::native(2).expect("input");
+        let outputs = vec![input.clone(), input.clone()];
+        let mut s = settings();
+        s.require_shared = true;
+        s.affine_bias = true;
+        let expressions = vec![
+            Expr::Affine {
+                parameter: 0,
+                output: TypeRef::Input(0),
+                input: Box::new(Expr::Argument(0)),
+                bias: true
+            };
+            2
+        ];
+        let mut parent =
+            compile_program(&[input.clone()], &outputs, &expressions, &s).expect("parent");
+        let relabelled = Interface::uniform(1, 2, LabelKind::Native, 7).expect("labels");
+        let input_node = 1;
+        parent.program.operators.push(Arc::new(
+            Operator::dense(
+                "explicit boundary adapter",
+                relabelled.clone(),
+                input.clone(),
+                array![[1., 0.], [0., 1.]],
+                exact_precision([0., 1.]).expect("precision"),
+                Default::default(),
+            )
+            .expect("adapter"),
+        ));
+        let old_nodes = parent.program.nodes.clone();
+        let mapping = (0..old_nodes.len())
+            .map(|i| if i == 0 { 0 } else { i + 1 })
+            .collect::<Vec<_>>();
+        let ops = (0..parent.program.operators.len()).collect::<Vec<_>>();
+        parent.program.nodes.clear();
+        for (index, mut node) in old_nodes.into_iter().enumerate() {
+            crate::operator_program::remap_node(&mut node, &mapping, &ops, &[], &[]);
+            parent.program.nodes.push(node);
+            if index == 0 {
+                parent.program.nodes.push(Node::Affine {
+                    terms: vec![(0, parent.program.operators.len() - 1)],
+                    bias: None,
+                });
+            }
+        }
+        parent.program.output = mapping[parent.program.output];
+        for node in &mut parent.output_nodes {
+            *node = mapping[*node];
+        }
+        let adapter = parent.program.operators.len() - 1;
+        for &node in &parent.output_nodes {
+            if let Node::Affine { terms, .. } = &mut parent.program.nodes[node] {
+                terms[0].0 = input_node;
+            }
+        }
+        for owner in &parent.initialization.owners {
+            let op = Arc::make_mut(&mut parent.program.operators[owner.matrix_operator]);
+            op.cols = relabelled.clone();
+        }
+        let inherited = compile_program_inheriting(
+            &[input],
+            &outputs,
+            &expressions,
+            &s,
+            &parent.program,
+            &[input_node],
+            &parent.output_nodes,
+        )
+        .expect("coordinate-preserving group adaptation");
+        assert_eq!(inherited.initialization.random_elements, 0);
+        assert!(
+            inherited
+                .initialization
+                .owners
+                .iter()
+                .all(|o| o.interfaces_relabelled)
+        );
+        assert!(!inherited.trainable_operator_ids.contains(&adapter));
     }
 
     #[test]

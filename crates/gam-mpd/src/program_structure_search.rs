@@ -153,6 +153,7 @@ impl Mutation {
 /// The caller can further freeze controlled operators; fitting and joint
 /// global/local/intervention measurement are external.
 pub struct FitRequest<'a> {
+    pub initialization: Option<&'a program_learned_dag::InitializationReport>,
     pub candidate: &'a Artifact,
     pub mutation: &'a Mutation,
     pub parent: &'a EvaluatedArtifact,
@@ -1642,6 +1643,7 @@ where
                 result.report.counts.learned_dag_move_attempts += usize::from(is_learned);
                 let parent = &resident[&parent_id].evaluated;
                 let mut learned_parameters = None;
+                let mut initialization = None;
                 let proposed = match &mutation {
                     Mutation::SynthesizeLearnedDAG {
                         region,
@@ -1661,6 +1663,7 @@ where
                         )
                         .map(|applied| {
                             learned_parameters = Some(applied.trainable_operator_ids);
+                            initialization = Some(applied.initialization);
                             applied.artifact
                         })
                     }
@@ -1749,6 +1752,7 @@ where
                 result.report.counts.shared_dag_callback_calls += usize::from(is_shared);
                 result.report.counts.learned_dag_callback_calls += usize::from(is_learned);
                 let fitted = match fit_and_measure(FitRequest {
+                    initialization: initialization.as_ref(),
                     candidate: &proposed,
                     mutation: &mutation,
                     parent,

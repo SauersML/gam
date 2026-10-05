@@ -38,6 +38,9 @@ struct Settings {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Fitting {
+    /// Diagnostic: retain native features and solve only a perturbed output writer.
+    #[serde(default)]
+    linear_writer_repair: bool,
     training_sequences: usize,
     seed: u64,
     relative_perturbation: f64,
@@ -330,6 +333,37 @@ fn fit_diagnostic(
     }));
     // Native reader/writer/biases only. Supplied hidden response readers stay fixed.
     let trainable = (0..teacher.operators.len() - responses.len()).collect::<Vec<_>>();
+    if settings.linear_writer_repair {
+        let started = Instant::now();
+        let candidate = initialized(&teacher, &[1], settings.seed, Some(settings.relative_perturbation))?;
+        let initial = resident_rule_fit::measure_grouped(device, &candidate,
+            std::slice::from_ref(&train_x), &train_y, &groups,
+            settings.optimizer.numeric_bytes, settings.optimizer.forward_rows)?;
+        let fitted = gam_mpd::program_linear_fit::prefit(&candidate,
+            std::slice::from_ref(&train_x), &train_y, &[1], Default::default(),
+            settings.optimizer.numeric_bytes)?;
+        let proposed = resident_rule_fit::measure_grouped(device, &fitted.program,
+            std::slice::from_ref(&train_x), &train_y, &groups,
+            settings.optimizer.numeric_bytes, settings.optimizer.forward_rows)?;
+        let accepted = proposed.maximum < initial.maximum;
+        let best = if accepted { &fitted.program } else { &candidate };
+        let mut measurements = Vec::new();
+        for (stage, program) in [("initial", &candidate), ("best", best)] {
+            let bytes = Artifact::native(program)?.to_bytes()?;
+            let decoded = Artifact::from_bytes(&bytes, &program.declarations)?;
+            let path = out.join(format!("linear-writer-{stage}.artifact"));
+            std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+            measurements.push(json!({"stage":stage,"artifact_sha256":sha256(&path)?,
+                "training_group_maxima":frozen_errors(device,&decoded.program,&train_x,&train_y,&initial.scales,&settings.optimizer)?,
+                "validation_group_maxima":frozen_errors(device,&decoded.program,&valid_x,&valid_y,&initial.scales,&settings.optimizer)?}));
+        }
+        let report = json!({"accepted":accepted,"initial":initial,"proposed":proposed,
+            "linear_fit":fitted.report,"measurements_frozen_training_scales":measurements,
+            "seconds":started.elapsed().as_secs_f64(),"training_rows":train.len(),"validation_rows":valid.len(),
+            "scope":"Supplied native features retained exactly; only output writer perturbed and fit by minimum-change least squares. Training maximum selects; validation is excluded. Numerical fitting control, not blind discovery or whole-model replacement."});
+        save(&out.join("LINEAR_REPAIR.json"), &report)?;
+        return Ok(report);
+    }
     let mut reports = Vec::new();
     for (label, perturbation) in [
         ("perturbed_native", Some(settings.relative_perturbation)),
@@ -720,7 +754,8 @@ mod tests {
         assert_eq!(report["passed"], true);
         assert!(report["c32"].as_u64().expect("paid cost") > 0);
         let (function, responses) = native_body(&source, 0, 1, 2, 3, &directions).expect("body");
-        let fit = Fitting {
+        let mut fit = Fitting {
+            linear_writer_repair: false,
             training_sequences: 1,
             seed: 2951,
             relative_perturbation: 0.01,
@@ -765,6 +800,12 @@ mod tests {
                 2
             );
         }
+        fit.linear_writer_repair = true;
+        let repaired = fit_diagnostic(&Device::host(), &function, &responses, &parent,
+            &[0, 1], &[2], &fit, &out).expect("native-feature linear repair");
+        assert_eq!(repaired["accepted"], true);
+        assert!(repaired["proposed"]["maximum"].as_f64().expect("training max") < 1e-10);
+        assert_eq!(repaired["linear_fit"]["blocks"].as_array().expect("blocks").len(), 1);
         std::fs::remove_dir_all(out).expect("cleanup");
     }
     #[test]
