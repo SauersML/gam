@@ -57,7 +57,7 @@ use crate::{
     artifact_device::mapped_inlined_observed,
     device_program::{DeviceProgram, DeviceTrace},
     library_mdl::{Explanation, Posterior, sequence_family},
-    operator_program::{Node, OperatorProgram, Rotary, Rule, rms_scale},
+    operator_program::{Law, Node, OperatorProgram, Rotary, Rule, rms_scale},
     resident_causal_fit::fixed_head_target::{Head, ResidentHead, Target, Teacher},
     run_check::LayerNodes,
     tiled_attention::{probabilities, rotate},
@@ -259,6 +259,8 @@ struct MlpBlock {
     /// A gated MLP's up map: its rule node and matrix, and its bias (zero where there is none).
     up: Option<(usize, Array2<f64>)>,
     up_bias: Array1<f64>,
+    /// The gate's law.
+    law: Law,
 }
 
 /// A head's query or key read: the rule node of its projection, the projection's map, and the
@@ -315,7 +317,11 @@ fn mlp_block(program: &OperatorProgram, rule: &Rule, layer: usize, call: usize) 
         }
         other => return Err(format!("{}: activations are {other:?}", rule.name)),
     };
-    let Node::Pointwise { input: gate_pre, .. } = rule.nodes[gate_active] else { return Err("no gate".into()) };
+    let Node::Pointwise { input: gate_pre, laws } = &rule.nodes[gate_active] else { return Err("no gate".into()) };
+    let (gate_pre, law) = (*gate_pre, *laws.first().ok_or("a law of no units")?);
+    if laws.iter().any(|l| *l != law) {
+        return Err(format!("{}: units of different laws", rule.name));
+    }
     let (gate, bias) = operator_of(program, rule, gate_pre)?;
     let bias = match bias {
         Some(op) => program.operators[op].matrix().column(0).to_owned(),
@@ -325,7 +331,7 @@ fn mlp_block(program: &OperatorProgram, rule: &Rule, layer: usize, call: usize) 
         Some(op) => program.operators[op].matrix().column(0).to_owned(),
         None => Array1::zeros(gate.nrows()),
     };
-    Ok(MlpBlock { layer, call, activation, gate_pre, gate, bias, out: program.operators[out].matrix(), up, up_bias })
+    Ok(MlpBlock { layer, call, activation, gate_pre, gate, bias, out: program.operators[out].matrix(), up, up_bias, law })
 }
 
 fn head_block(program: &OperatorProgram, rule: &Rule, layer: usize, head: usize, call: usize, output: Array2<f64>) -> Result<HeadBlock, String> {
@@ -781,7 +787,13 @@ impl<'a> Library<'a> {
     /// [`Library::heads`]) reading the given values (rows × head width) in place of its own, and
     /// everything after it recomputed.
     pub fn run(&self, sequences: &[Vec<u32>], replace: &BTreeMap<usize, Array2<f64>>) -> Result<Run, String> {
-        let pass = self.pass_with(&sequences.iter().map(Vec::as_slice).collect::<Vec<_>>(), replace)?;
+        self.run_with(sequences, replace, &BTreeMap::new())
+    }
+
+    /// [`Library::run`] with each MLP in `mlps` (an index into the layers' MLPs, in layer order)
+    /// taking the given activations (rows × its functions) as well.
+    pub fn run_with(&self, sequences: &[Vec<u32>], heads: &BTreeMap<usize, Array2<f64>>, mlps: &BTreeMap<usize, Array2<f64>>) -> Result<Run, String> {
+        let pass = self.pass_with(&sequences.iter().map(Vec::as_slice).collect::<Vec<_>>(), heads, mlps)?;
         Ok(Run {
             streams: pass.streams.into_iter().map(CowArray::into_owned).collect(),
             reads: pass.head.into_iter().map(|[_, _, z, ..]| z.into_owned()).collect(),
@@ -843,6 +855,90 @@ impl<'a> Library<'a> {
             row.assign(&Array1::from(values));
         }
         Ok(logits)
+    }
+
+    /// A function's place: its layer, and its head (an index into the heads) or its MLP (an index
+    /// into the MLPs) and function.
+    fn place(&self, function: usize) -> Result<(usize, Result<usize, (usize, usize)>), String> {
+        let (head_columns, mlp_columns) = self.columns();
+        for (l, members) in self.layer_heads.iter().enumerate() {
+            if (head_columns[l]..head_columns[l] + members.len()).contains(&function) {
+                return Ok((l, Ok(members[function - head_columns[l]])));
+            }
+        }
+        for (b, block) in self.mlps.iter().enumerate() {
+            if (mlp_columns[b]..mlp_columns[b] + block.gate.nrows()).contains(&function) {
+                return Ok((block.layer, Err((b, function - mlp_columns[b]))));
+            }
+        }
+        Err(format!("no function {function}"))
+    }
+
+    /// The measured effect of one edge, by path patching: writer `writer`'s write taken out of
+    /// reader `reader`'s reads only (of its read `route` alone, numbered as in
+    /// [`Library::contributions`], or of every read), the reader recomputed from them (an MLP
+    /// function through its gate and law, a head through its attention, each with its own norm at
+    /// the stream's actual RMS) and everything after it run. Returns the mean over the rows of
+    /// `sequences` of the reader's output change (`|Δh| ‖u‖`, a head's `‖W_O Δz‖`) and of
+    /// `KL(P ‖ P′)` of the next-token distributions in bits.
+    pub fn path_patch(&self, sequences: &[Vec<u32>], writer: usize, reader: usize, route: Option<usize>) -> Result<[f64; 2], String> {
+        let refs: Vec<&[u32]> = sequences.iter().map(Vec::as_slice).collect();
+        let pass = self.pass(&refs)?;
+        let length = sequences.first().map_or(0, Vec::len);
+        let rows = pass.rows as f64;
+        let (written, write) = self.place(writer)?;
+        let (layer, read) = self.place(reader)?;
+        let site = if read.is_ok() { 2 * layer } else { 2 * layer + 1 };
+        let before = match write {
+            Ok(_) => 2 * written + 1 <= site,
+            Err(_) => 2 * written + 2 <= site,
+        };
+        if !before {
+            return Err("the writer does not write before the reader reads".into());
+        }
+        let w = match write {
+            Ok(h) => self.write(h, &pass.head[h][2].to_owned()),
+            Err((b, i)) => {
+                let (h, u) = (pass.mlp[b].0.column(i), self.mlps[b].out.column(i));
+                Array2::from_shape_fn((pass.rows, u.len()), |(r, c)| h[r] * u[c])
+            }
+        };
+        let x = pass.streams[site].to_owned();
+        let patched = &x - &w;
+        let takes = |r: usize| route.is_none_or(|k| k == r);
+        let (output, run) = match read {
+            Ok(h) => {
+                let pick = |r: usize| if takes(r) { &patched } else { &x };
+                let (z, _) = self.head_on(h, pick(0), pick(1), pick(2), length);
+                let change = self.write(h, &(&z - &pass.head[h][2]));
+                let output = change.outer_iter().map(|row| row.dot(&row).sqrt()).sum::<f64>() / rows;
+                (output, self.run_with(sequences, &[(h, z)].into(), &BTreeMap::new())?)
+            }
+            Err((b, i)) => {
+                let block = &self.mlps[b];
+                let site = &self.sites[site];
+                let read_of = |stream: &Array2<f64>, row: ArrayView1<f64>, bias: f64| -> Array1<f64> {
+                    let direction = &row * &site.gain;
+                    stream.outer_iter().map(|x| direction.dot(&x) * rms_scale(x, site.epsilon) + bias).collect()
+                };
+                let gate = if takes(0) { read_of(&patched, block.gate.row(i), block.bias[i]) } else { pass.mlp[b].1.column(i).to_owned() };
+                let h = match (&block.up, &pass.mlp[b].2) {
+                    (Some((_, up)), Some(base_up)) => {
+                        let up = if takes(1) { read_of(&patched, up.row(i), block.up_bias[i]) } else { base_up.column(i).to_owned() };
+                        Array1::from_shape_fn(gate.len(), |r| block.law.apply(gate[r]) * up[r])
+                    }
+                    _ => gate.mapv(|g| block.law.apply(g)),
+                };
+                let size = block.out.column(i).dot(&block.out.column(i)).sqrt();
+                let output = (&h - &pass.mlp[b].0.column(i)).iter().map(|d| d.abs()).sum::<f64>() * size / rows;
+                let mut activations = pass.mlp[b].0.to_owned();
+                activations.column_mut(i).assign(&h);
+                (output, self.run_with(sequences, &BTreeMap::new(), &[(b, activations)].into())?)
+            }
+        };
+        let (base, patched) = (self.log_probabilities(&pass.last.to_owned())?, self.log_probabilities(&run.last)?);
+        let kl: f64 = base.outer_iter().zip(patched.outer_iter()).map(|(p, q)| p.iter().zip(q.iter()).map(|(a, b)| a.exp() * (a - b)).sum::<f64>()).sum();
+        Ok([output, kl / rows / std::f64::consts::LN_2])
     }
 
     /// The exact contribution of each writer's write to each reader's reads on `sequences` (of one
@@ -1042,18 +1138,23 @@ impl<'a> Library<'a> {
 
     /// The forward pass on `batch` (sequences of one length).
     fn pass(&self, batch: &[&[u32]]) -> Result<Pass<'static>, String> {
-        self.pass_with(batch, &BTreeMap::new())
+        self.pass_with(batch, &BTreeMap::new(), &BTreeMap::new())
     }
 
-    /// [`Library::pass`] with each head in `replace` (an index into the heads) reading the given
-    /// values (rows × head width) in place of its own; everything after it recomputed.
-    fn pass_with(&self, batch: &[&[u32]], replace: &BTreeMap<usize, Array2<f64>>) -> Result<Pass<'static>, String> {
+    /// [`Library::pass`] with each head in `heads` (an index into the heads) reading the given
+    /// values (rows × head width) in place of its own, and each MLP in `mlps` (an index into the
+    /// MLPs) taking the given activations (rows × functions); everything after recomputed.
+    fn pass_with(&self, batch: &[&[u32]], heads: &BTreeMap<usize, Array2<f64>>, mlps: &BTreeMap<usize, Array2<f64>>) -> Result<Pass<'static>, String> {
         let family = sequence_family(batch)?;
         let p = self.head_paths;
-        let trace = if replace.is_empty() {
+        let trace = if heads.is_empty() && mlps.is_empty() {
             self.program.forward(&family)?
         } else {
-            let at: BTreeMap<usize, &Array2<f64>> = replace.iter().map(|(h, z)| (self.observed[p + 6 * h + 2], z)).collect();
+            let at: BTreeMap<usize, &Array2<f64>> = heads
+                .iter()
+                .map(|(h, z)| (self.observed[p + 6 * h + 2], z))
+                .chain(mlps.iter().map(|(b, a)| (self.observed[self.mlp_paths[*b]], a)))
+                .collect();
             if at.values().any(|z| z.nrows() != family.rows) {
                 return Err("a replaced read of another number of rows".into());
             }
