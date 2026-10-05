@@ -6,9 +6,9 @@
 //! ([`Device::reparameterize`], `ε` regenerated from its counter), runs the experiments, and takes
 //! Adam's step from the gradient the program's reverse pass left on the device
 //! ([`Device::posterior_adam`]), which also sums each prior group's new moments; the groups'
-//! variances and divergences follow from those sums ([`Device::group_divergence`]). The masters are
-//! float64 where the backend holds float64 (the host, CUDA, whose sample is the fitting storage's
-//! f32), and the Apple GPU's f32 there. The objective and its derivatives are those of
+//! variances and divergences follow from those sums ([`Device::group_divergence`]). The posterior
+//! and its moments are held in the fitting storage (f32 on CUDA and the Apple GPU, float64 on the
+//! host), the group sums in float64 where the backend holds it (CUDA, the host). The objective and its derivatives are those of
 //! `library_mdl` (module note there): `KL(q_G ‖ p_G) = ½ (|G| ln v_G − Σ 2s)` at the empirical-Bayes
 //! variance `v_G`.
 
@@ -48,8 +48,9 @@ pub struct Parts<'a> {
 
 /// The posterior of a library explanation's trainable operators, on the device.
 pub struct DevicePosterior {
-    /// The device holding the masters, and the one holding the samples and gradients.
-    master: Device,
+    /// The device holding the group sums (float64 where the backend holds it), and the one holding
+    /// the posterior, its samples and gradients.
+    wide: Device,
     fitting: Device,
     /// Per trainable operator (`Explanation::trainable` order): its id, `μ`, `s`, Adam's moments
     /// (`μ`'s first and second, then `s`'s) and each entry's group.
@@ -109,11 +110,12 @@ impl DevicePosterior {
     /// `parts.groups[i][entry]` (row-major) of `parts.count`, on `fitting`, with Adam's `moments`
     /// (zero when `None`) after `steps` steps.
     pub fn from_parts(fitting: &Device, parts: &Parts<'_>, moments: Option<&[[Array2<f64>; 4]]>, steps: u64) -> Result<Self, String> {
-        let master = match fitting.with_storage(Storage::F64) {
+        let wide = match fitting.with_storage(Storage::F64) {
             Ok(wide) => wide,
             Err(GpuError::NoDeviceKernel { .. }) => fitting.clone(),
             Err(e) => return Err(error(e)),
         };
+        let master = fitting.clone();
         let shapes: Vec<(usize, usize)> = parts.mean.iter().map(Array2::dim).collect();
         let sizes_agree = parts.log_sd.iter().map(Array2::dim).eq(shapes.iter().copied()) && parts.groups.iter().map(Vec::len).eq(shapes.iter().map(|(r, c)| r * c));
         if shapes.len() != parts.operators.len() || !sizes_agree || moments.is_some_and(|m| m.len() != shapes.len()) {
@@ -124,9 +126,9 @@ impl DevicePosterior {
         }
         let up = |m: &Array2<f64>| master.upload(m.view()).map_err(error);
         let mut out = Self {
-            sums: master.zeros(parts.count, 3).map_err(error)?,
-            variance: master.zeros(parts.count, 1).map_err(error)?,
-            divergence: master.zeros(parts.count, 1).map_err(error)?,
+            sums: wide.zeros(parts.count, 3).map_err(error)?,
+            variance: wide.zeros(parts.count, 1).map_err(error)?,
+            divergence: wide.zeros(parts.count, 1).map_err(error)?,
             mean: parts.mean.iter().map(up).collect::<Result<_, _>>()?,
             log_sd: parts.log_sd.iter().map(up).collect::<Result<_, _>>()?,
             moments: match moments {
@@ -139,7 +141,7 @@ impl DevicePosterior {
             groups: parts.groups.iter().map(|ids| master.upload_indices(ids).map_err(error)).collect::<Result<_, _>>()?,
             operators: parts.operators.to_vec(),
             fitting: fitting.clone(),
-            master,
+            wide,
             steps,
         };
         out.refresh()?;
@@ -149,9 +151,9 @@ impl DevicePosterior {
     /// The groups' variances and divergences from the posterior as it stands.
     fn refresh(&mut self) -> Result<(), String> {
         for ((mean, log_sd), groups) in self.mean.iter().zip(&self.log_sd).zip(&self.groups) {
-            self.master.group_moments((mean, log_sd), groups, &mut self.sums).map_err(error)?;
+            self.fitting.group_moments((mean, log_sd), groups, &mut self.sums).map_err(error)?;
         }
-        self.master.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
+        self.wide.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
     }
 
     /// Adam's steps taken.
@@ -163,9 +165,9 @@ impl DevicePosterior {
     /// Writes the posterior means into `program`'s trainable operators (rounded to its storage).
     pub fn mean_into(&self, program: &mut DeviceProgram) -> Result<(), String> {
         for (i, &op) in self.operators.iter().enumerate() {
-            program.replace_dense_parameter(op, self.fitting.convert(&self.mean[i]).map_err(error)?)?;
+            program.replace_dense_parameter(op, self.fitting.copy(&self.mean[i]).map_err(error)?)?;
         }
-        Ok(())
+        program.refresh_fused()
     }
 
     /// Writes the weight sample of `key` into `program`'s trainable operators (operator `i` in
@@ -183,7 +185,7 @@ impl DevicePosterior {
                 program.replace_dense_parameter(op, theta)?;
             }
         }
-        Ok(())
+        program.refresh_fused()
     }
 
     /// One Adam step from the gradient of the data term at the sample of `key`: `gradients` holds
@@ -213,22 +215,22 @@ impl DevicePosterior {
                 stream: i as u64,
             };
             let [m0, m1, m2, m3] = &mut self.moments[i];
-            self.master
+            self.fitting
                 .posterior_adam((&mut self.mean[i], &mut self.log_sd[i]), [m0, m1, m2, m3], gradient, (&self.groups[i], &self.variance), &mut self.sums, &step)
                 .map_err(error)?;
         }
-        self.master.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
+        self.wide.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
     }
 
     /// Per group, `KL(q_G ‖ p_G)` in nats at the posterior as it stands (zero for a removed group).
     pub fn divergences(&self) -> Result<Vec<f64>, String> {
-        Ok(self.master.download(&self.divergence).map_err(error)?.into_iter().collect())
+        Ok(self.wide.download(&self.divergence).map_err(error)?.into_iter().collect())
     }
 
     /// The posterior's means and log standard deviations into `posterior`, and Adam's moments per
     /// operator.
     pub fn download(&self, posterior: &mut Posterior) -> Result<Vec<[Array2<f64>; 4]>, String> {
-        let down = |t: &Tensor| self.master.download(t).map_err(error);
+        let down = |t: &Tensor| self.fitting.download(t).map_err(error);
         for i in 0..self.mean.len() {
             posterior.mean[i] = down(&self.mean[i])?;
             posterior.log_sd[i] = down(&self.log_sd[i])?;

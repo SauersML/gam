@@ -1,10 +1,11 @@
 //! Time of one library-fit training step (#2951), its posterior on the host as the fit kept it
 //! before (`library_mdl`'s `Posterior`) against resident on the device (`device_posterior`).
 //!
-//! `mpd_library_step_bench_2951 MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS]`
+//! `mpd_library_step_bench_2951 MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS [LAYERS]]`
 //!
 //! `MODEL` is an engine export (its token rows) or a Hugging Face checkpoint directory (token rows
-//! from `WINDOWS`, rows of `CONTEXT` little-endian u32). `P` is the library explanation when it
+//! from `WINDOWS`, rows of `CONTEXT` little-endian u32; its first `LAYERS` layers, all when
+//! omitted, so a device or host too small for the whole model still measures per-layer costs). `P` is the library explanation when it
 //! builds, its prior groups the library's; otherwise (gated MLPs, normed queries and keys: Qwen3)
 //! the split native program with every head's query, key and value map and the MLP's input maps
 //! trainable, each operator row one prior group (the library's plane, value and gate groups are
@@ -229,7 +230,7 @@ impl HostPosterior {
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS]";
+    let usage = "MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS [LAYERS]]";
     let (model, rest) = args.split_first().ok_or(usage)?;
     let [sequences, context, reps, out, windows @ ..] = rest else {
         return Err(usage.into());
@@ -242,9 +243,14 @@ fn main() -> Result<(), String> {
     let device = Device::single_precision(GpuPolicy::Required).map_err(error)?.ok_or("no accelerator")?;
     let model = Path::new(model);
     let (program, rows, layer_count) = if model.join("config.json").exists() {
-        let [windows] = windows else { return Err(format!("a Hugging Face checkpoint needs WINDOWS: {usage}")) };
+        let (windows, kept) = match windows {
+            [windows] => (windows, None),
+            [windows, kept] => (windows, Some(parse(kept)?)),
+            _ => return Err(format!("a Hugging Face checkpoint needs WINDOWS: {usage}")),
+        };
         let text = std::fs::read_to_string(model.join("config.json")).map_err(error)?;
-        let layers = serde_json::from_str::<Value>(&text).map_err(error)?["num_hidden_layers"].as_u64().ok_or("num_hidden_layers")? as usize;
+        let all = serde_json::from_str::<Value>(&text).map_err(error)?["num_hidden_layers"].as_u64().ok_or("num_hidden_layers")? as usize;
+        let layers = kept.unwrap_or(all).min(all);
         let bytes = std::fs::read(windows).map_err(|e| format!("{windows}: {e}"))?;
         if bytes.len() < 2 * sequences * context * 4 {
             return Err(format!("{windows}: fewer than {} rows of {context} tokens", 2 * sequences));

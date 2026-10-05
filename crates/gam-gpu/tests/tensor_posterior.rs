@@ -1,6 +1,6 @@
 //! The factorized Gaussian posterior's device operations (`Device::reparameterize`,
 //! `posterior_adam`, `group_moments`, `group_divergence`): the host against the formulas entry by
-//! entry, and every accelerator that resolves (CUDA with float64 masters and an f32 sample, the
+//! entry, and every accelerator that resolves (CUDA in f32 storage with float64 group sums, the
 //! Apple GPU in f32) against the host on the same inputs.
 //!
 //! An accelerator's value is a chain of at most 24 roundings, each within 4 ulps of f32 (`exp`,
@@ -99,26 +99,27 @@ fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 
 }
 
 /// The device's results on `c`: the sample, the stepped posterior and moments, the group sums
-/// before and after the step, and the divergences from the sums before. `fit` holds the sample and
-/// gradient, `master` the posterior.
-fn run(fit: &Device, master: &Device, c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, Vec<Array2<f64>>, Array2<f64>, Array2<f64>, Array2<f64>) {
+/// before and after the step, and the divergences from the sums before. `fit` holds the posterior,
+/// its sample and gradient, `wide` the group sums.
+fn run(fit: &Device, wide: &Device, c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, Vec<Array2<f64>>, Array2<f64>, Array2<f64>, Array2<f64>) {
     let up = |d: &Device, m: &Array2<f64>| d.upload(m.view()).unwrap();
-    let (mut mean, mut log_sd) = (up(master, &c.mean), up(master, &c.log_sd));
-    let mut moments: Vec<Tensor> = c.moments.iter().map(|m| up(master, m)).collect();
-    let groups: Indices = master.upload_indices(&c.groups).unwrap();
+    let (mut mean, mut log_sd) = (up(fit, &c.mean), up(fit, &c.log_sd));
+    let mut moments: Vec<Tensor> = c.moments.iter().map(|m| up(fit, m)).collect();
+    let groups: Indices = fit.upload_indices(&c.groups).unwrap();
     let mut theta = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
     fit.reparameterize(&mut theta, (&mean, &log_sd), (c.step.key, c.step.stream)).unwrap();
-    let mut sums = master.zeros(c.count, 3).unwrap();
-    master.group_moments((&mean, &log_sd), &groups, &mut sums).unwrap();
-    let before = master.download(&sums).unwrap();
-    let (mut variance, mut divergence) = (master.zeros(c.count, 1).unwrap(), master.zeros(c.count, 1).unwrap());
-    master.group_divergence(&mut sums, &mut variance, &mut divergence).unwrap();
-    assert!(master.download(&sums).unwrap().iter().all(|v| *v == 0.0), "the sums are zeroed");
+    let mut sums = wide.zeros(c.count, 3).unwrap();
+    fit.group_moments((&mean, &log_sd), &groups, &mut sums).unwrap();
+    let before = wide.download(&sums).unwrap();
+    let (mut variance, mut divergence) = (wide.zeros(c.count, 1).unwrap(), wide.zeros(c.count, 1).unwrap());
+    wide.group_divergence(&mut sums, &mut variance, &mut divergence).unwrap();
+    assert!(wide.download(&sums).unwrap().iter().all(|v| *v == 0.0), "the sums are zeroed");
     let gradient = up(fit, &c.gradient);
     let [m0, m1, m2, m3] = &mut moments[..] else { unreachable!() };
-    master.posterior_adam((&mut mean, &mut log_sd), [m0, m1, m2, m3], &gradient, (&groups, &variance), &mut sums, &c.step).unwrap();
-    let down = |t: &Tensor| master.download(t).unwrap();
-    (fit.download(&theta).unwrap(), down(&mean), down(&log_sd), moments.iter().map(down).collect(), before, down(&sums), down(&divergence))
+    fit.posterior_adam((&mut mean, &mut log_sd), [m0, m1, m2, m3], &gradient, (&groups, &variance), &mut sums, &c.step).unwrap();
+    let down = |t: &Tensor| fit.download(t).unwrap();
+    let down_wide = |t: &Tensor| wide.download(t).unwrap();
+    (fit.download(&theta).unwrap(), down(&mean), down(&log_sd), moments.iter().map(down).collect(), before, down_wide(&sums), down_wide(&divergence))
 }
 
 fn sums_of(rows: &[[f64; 3]]) -> Array2<f64> {
@@ -173,10 +174,10 @@ fn the_host_steps_the_posterior_by_its_formulas() {
     assert!(theta.indexed_iter().all(|((r, col), v)| c.groups[r * 40 + col] != 4 || *v == 0.0), "a removed entry samples zero");
 }
 
-fn against_host(fit: &Device, master: &Device) {
+fn against_host(fit: &Device, wide: &Device) {
     let c = case();
     let host = Device::host();
-    let (theta, mean, log_sd, moments, before, after, divergence) = run(fit, master, &c);
+    let (theta, mean, log_sd, moments, before, after, divergence) = run(fit, wide, &c);
     let (t, m, s, mo, b, a, d) = run(&host, &host, &c);
     // A group sums at most 40 entries; the step reads its variance (such a sum over its count),
     // and a second moment squares a gradient that carries the variance's error.
@@ -204,7 +205,7 @@ fn the_apple_gpu_matches_the_host() {
 }
 
 #[test]
-fn cuda_with_float64_masters_matches_the_host() {
+fn cuda_matches_the_host() {
     let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
     let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
     against_host(&narrow, &wide);

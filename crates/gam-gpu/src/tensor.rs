@@ -1956,8 +1956,8 @@ impl Device {
 
     /// A weight sample of a factorized Gaussian posterior, `θᵢ = μᵢ + exp(sᵢ) εᵢ` with `εᵢ =
     /// [`posterior_normal`]`(key, stream, i)`, written into `theta` (this device's storage) from
-    /// the posterior's means `μ` and log standard deviations `s` (`mean`, `log_sd`: float64 on
-    /// the host and CUDA, f32 on the Apple GPU). A removed entry (`s = −∞`, `μ = 0`) samples 0.
+    /// the posterior's means `μ` and log standard deviations `s` (`mean`, `log_sd`, in `theta`'s
+    /// storage). A removed entry (`s = −∞`, `μ = 0`) samples 0.
     /// The draws are regenerated from their counters, never stored ([`Device::posterior_adam`]
     /// regenerates the same ones).
     pub fn reparameterize(&self, theta: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {
@@ -1980,8 +1980,9 @@ impl Device {
 
     /// One Adam step of the factorized Gaussian posterior `N(μ, exp(s)²)` whose sample
     /// [`Device::reparameterize`] drew under the same `(key, stream)`, and each entry's new
-    /// `(1, μ² + exp(2s), 2s)` added into its group's row of `sums` (groups × 3, the posterior's
-    /// storage). `gradient` (this device's storage) times `step.gradient_scale` is the data term's
+    /// `(1, μ² + exp(2s), 2s)` added into its group's row of `sums` (groups × 3; float64 on CUDA
+    /// and the host, f32 on the Apple GPU, as are `variance` and [`Device::group_divergence`]'s
+    /// outputs). The entries (`μ`, `s`, the moments and `gradient`) share one storage. `gradient` times `step.gradient_scale` is the data term's
     /// gradient `g` at the sample; with `v` the entry's group variance (`variance`, groups × 1),
     /// the objective's derivatives are `g + μ / v` in `μ` and `g ε σ + σ² / v − 1` in `s` (`σ = exp(s)`, the empirical-Bayes
     /// group prior's divergence `½ (n ln v − Σ 2s)`), each taking Adam's step at its own rate with
@@ -3081,16 +3082,22 @@ __device__ float posterior_normal(u64 key, u64 stream, u64 index) {
     return sqrtf(-2.0f * logf(u1)) * cosf(6.28318530717958647692f * u2);
 }
 
+// The math of an entry type: float entries in float, double in double.
+__device__ float entry_exp(float x) { return expf(x); }
+__device__ double entry_exp(double x) { return exp(x); }
+__device__ float entry_sqrt(float x) { return sqrtf(x); }
+__device__ double entry_sqrt(double x) { return sqrt(x); }
+
 template <typename T>
-__device__ void reparameterize_body(u64 n, u64 key, u64 stream, const double* mean, const double* log_sd, T* theta) {
-    GRID_STRIDE(i, n) theta[i] = (T)(mean[i] + exp(log_sd[i]) * (double)posterior_normal(key, stream, i));
+__device__ void reparameterize_body(u64 n, u64 key, u64 stream, const T* mean, const T* log_sd, T* theta) {
+    GRID_STRIDE(i, n) theta[i] = mean[i] + entry_exp(log_sd[i]) * (T)posterior_normal(key, stream, i);
 }
 
 extern "C" __global__ void reparameterize_f64(u64 n, u64 key, u64 stream, const double* mean, const double* log_sd, double* theta) {
     reparameterize_body<double>(n, key, stream, mean, log_sd, theta);
 }
 
-extern "C" __global__ void reparameterize_f32(u64 n, u64 key, u64 stream, const double* mean, const double* log_sd, float* theta) {
+extern "C" __global__ void reparameterize_f32(u64 n, u64 key, u64 stream, const float* mean, const float* log_sd, float* theta) {
     reparameterize_body<float>(n, key, stream, mean, log_sd, theta);
 }
 
@@ -3121,25 +3128,28 @@ __device__ void group_add(double* sums, unsigned int g, bool live, double a, dou
 // they are made). Blocks stride whole, so every lane of a warp runs every iteration (`group_add`).
 #define WARP_STRIDE(i, n) for (u64 base_ = (u64)blockIdx.x * blockDim.x, i = base_ + threadIdx.x; base_ < (n); base_ += (u64)gridDim.x * blockDim.x, i = base_ + threadIdx.x)
 
+// Entries (the posterior, its moments, the gradient) in T; group sums in double.
 template <typename T>
 __device__ void posterior_adam_body(u64 n, u64 count, u64 key, u64 stream, double scale, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
     double c1, double c2, const T* gradient, const unsigned int* groups, const double* variance,
-    double* mean, double* log_sd, double* mm, double* mv, double* sm, double* sv, double* sums) {
+    T* mean, T* log_sd, T* mm, T* mv, T* sm, T* sv, double* sums) {
+    const T b1 = (T)beta1, b2 = (T)beta2, o1 = (T)(1.0 - beta1), o2 = (T)(1.0 - beta2), k1 = (T)(1.0 / c1), k2 = (T)(1.0 / c2);
+    const T rate_mean = (T)mean_rate, rate_log_sd = (T)log_sd_rate, eps = (T)epsilon, weight = (T)scale;
     WARP_STRIDE(i, n) {
         unsigned int g = i < n ? groups[i] : 0u;
-        bool live = i < n && g < count && log_sd[i] != NEG_INF;
+        bool live = i < n && g < count && log_sd[i] != (T)NEG_INF;
         double a = 0.0, b = 0.0, c = 0.0;
         if (live) {
-            double v = variance[g], mu = mean[i], s = log_sd[i], sd = exp(s);
-            double e = (double)posterior_normal(key, stream, i), gi = scale * (double)gradient[i];
-            double gm = gi + mu / v, gs = gi * e * sd + sd * sd / v - 1.0;
-            double m1 = beta1 * mm[i] + (1.0 - beta1) * gm, v1 = beta2 * mv[i] + (1.0 - beta2) * gm * gm;
-            double m2 = beta1 * sm[i] + (1.0 - beta1) * gs, v2 = beta2 * sv[i] + (1.0 - beta2) * gs * gs;
+            T v = (T)variance[g], mu = mean[i], s = log_sd[i], sd = entry_exp(s);
+            T e = (T)posterior_normal(key, stream, i), gi = weight * gradient[i];
+            T gm = gi + mu / v, gs = gi * e * sd + sd * sd / v - (T)1;
+            T m1 = b1 * mm[i] + o1 * gm, v1 = b2 * mv[i] + o2 * gm * gm;
+            T m2 = b1 * sm[i] + o1 * gs, v2 = b2 * sv[i] + o2 * gs * gs;
             mm[i] = m1; mv[i] = v1; sm[i] = m2; sv[i] = v2;
-            mu -= mean_rate * (m1 / c1) / (sqrt(v1 / c2) + epsilon);
-            s -= log_sd_rate * (m2 / c1) / (sqrt(v2 / c2) + epsilon);
+            mu -= rate_mean * (m1 * k1) / (entry_sqrt(v1 * k2) + eps);
+            s -= rate_log_sd * (m2 * k1) / (entry_sqrt(v2 * k2) + eps);
             mean[i] = mu; log_sd[i] = s;
-            a = 1.0; b = mu * mu + exp(2.0 * s); c = 2.0 * s;
+            a = 1.0; b = (double)mu * (double)mu + exp(2.0 * (double)s); c = 2.0 * (double)s;
         }
         group_add(sums, g, live, a, b, c);
     }
@@ -3153,20 +3163,30 @@ extern "C" __global__ void posterior_adam_f64(u64 n, u64 count, u64 key, u64 str
 
 extern "C" __global__ void posterior_adam_f32(u64 n, u64 count, u64 key, u64 stream, double scale, double mean_rate, double log_sd_rate, double beta1, double beta2, double epsilon,
     double c1, double c2, const float* gradient, const unsigned int* groups, const double* variance,
-    double* mean, double* log_sd, double* mm, double* mv, double* sm, double* sv, double* sums) {
+    float* mean, float* log_sd, float* mm, float* mv, float* sm, float* sv, double* sums) {
     posterior_adam_body<float>(n, count, key, stream, scale, mean_rate, log_sd_rate, beta1, beta2, epsilon, c1, c2, gradient, groups, variance, mean, log_sd, mm, mv, sm, sv, sums);
 }
 
-extern "C" __global__ void group_moments(u64 n, u64 count, const double* mean, const double* log_sd, const unsigned int* groups, double* sums) {
+template <typename T>
+__device__ void group_moments_body(u64 n, u64 count, const T* mean, const T* log_sd, const unsigned int* groups, double* sums) {
     WARP_STRIDE(i, n) {
         unsigned int g = i < n ? groups[i] : 0u;
-        bool live = i < n && g < count && log_sd[i] != NEG_INF;
+        bool live = i < n && g < count && log_sd[i] != (T)NEG_INF;
         double a = 0.0, b = 0.0, c = 0.0;
         if (live) {
-            a = 1.0; b = mean[i] * mean[i] + exp(2.0 * log_sd[i]); c = 2.0 * log_sd[i];
+            double mu = (double)mean[i], s = (double)log_sd[i];
+            a = 1.0; b = mu * mu + exp(2.0 * s); c = 2.0 * s;
         }
         group_add(sums, g, live, a, b, c);
     }
+}
+
+extern "C" __global__ void group_moments_f64(u64 n, u64 count, const double* mean, const double* log_sd, const unsigned int* groups, double* sums) {
+    group_moments_body<double>(n, count, mean, log_sd, groups, sums);
+}
+
+extern "C" __global__ void group_moments_f32(u64 n, u64 count, const float* mean, const float* log_sd, const unsigned int* groups, double* sums) {
+    group_moments_body<float>(n, count, mean, log_sd, groups, sums);
 }
 
 extern "C" __global__ void group_divergence(u64 n, double* sums, double* variance, double* divergence) {
@@ -4682,20 +4702,24 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             .map(|_| ())
         }
 
+        /// The posterior kernel `name` in the entries' storage `storage` (`_f32` or `_f64`).
+        fn posterior_kernel(&self, name: &str, storage: Storage) -> Result<CudaFunction, GpuError> {
+            match storage {
+                Storage::F64 => self.function(&format!("{name}_f64")),
+                Storage::F32 => self.function(&format!("{name}_f32")),
+                Storage::Bf16 => Err(shape("a bfloat16 posterior".to_string())),
+            }
+        }
+
         pub(super) fn reparameterize(&self, theta: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {
-            let n = theta.len() as u64;
-            let (mean, log_sd) = (slice(mean)?, slice(log_sd)?);
-            let name = if theta.storage() == Storage::F32 { "reparameterize_f32" } else { "reparameterize_f64" };
-            let f = self.function(name)?;
-            let mut builder = self.stream.launch_builder(&f);
-            builder.arg(&n).arg(&key).arg(&stream).arg(mean).arg(log_sd);
-            match &mut theta.data {
-                Data::Cuda32(t) => builder.arg(t),
-                Data::Cuda(t) => builder.arg(t),
-                other => return Err(mismatch(other)),
-            };
-            // SAFETY: three equal-length buffers, checked by the caller.
-            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor reparameterize").map(|_| ())
+            let (n, storage) = (theta.len() as u64, theta.storage());
+            let f = self.posterior_kernel("reparameterize", storage)?;
+            // SAFETY: three equal-length buffers in one storage, checked by the caller and `input`.
+            unsafe {
+                self.stream.launch_builder(&f).arg(&n).arg(&key).arg(&stream).input(mean, storage)?.input(log_sd, storage)?.output(theta, storage)?.launch(cfg_elements(n))
+            }
+            .gpu_ctx("tensor reparameterize")
+            .map(|_| ())
         }
 
         pub(super) fn posterior_adam(
@@ -4708,28 +4732,23 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             step: &super::PosteriorStep,
         ) -> Result<(), GpuError> {
             let (c1, c2) = step.corrections();
-            let n = mean.len() as u64;
-            let name = if gradient.storage() == Storage::F32 { "posterior_adam_f32" } else { "posterior_adam_f64" };
-            let (f, count) = (self.function(name)?, variance.len() as u64);
+            let (n, storage) = (mean.len() as u64, mean.storage());
+            let (f, count) = (self.posterior_kernel("posterior_adam", storage)?, variance.len() as u64);
             let mut builder = self.stream.launch_builder(&f);
             builder.arg(&n).arg(&count).arg(&step.key).arg(&step.stream).arg(&step.gradient_scale).arg(&step.mean_rate).arg(&step.log_sd_rate).arg(&step.beta1).arg(&step.beta2).arg(&step.epsilon).arg(&c1).arg(&c2);
-            match &gradient.data {
-                Data::Cuda32(g) => builder.arg(g),
-                Data::Cuda(g) => builder.arg(g),
-                other => return Err(mismatch(other)),
-            };
-            builder.arg(index_slice(groups)?).arg(slice(variance)?);
-            builder.arg(slice_mut(mean)?).arg(slice_mut(log_sd)?).arg(slice_mut(mm)?).arg(slice_mut(mv)?).arg(slice_mut(sm)?).arg(slice_mut(sv)?).arg(slice_mut(sums)?);
-            // SAFETY: equal-length entry buffers and in-range group ids, checked by the caller.
+            builder.input(gradient, storage)?.arg(index_slice(groups)?).arg(slice(variance)?);
+            builder.output(mean, storage)?.output(log_sd, storage)?.output(mm, storage)?.output(mv, storage)?.output(sm, storage)?.output(sv, storage)?.arg(slice_mut(sums)?);
+            // SAFETY: equal-length entry buffers in one storage, float64 group buffers of `count`
+            // rows; ids at or beyond `count` are skipped by the kernel.
             unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor posterior_adam").map(|_| ())
         }
 
         pub(super) fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
-            let n = mean.len() as u64;
-            let (f, count) = (self.function("group_moments")?, sums.rows as u64);
+            let (n, storage) = (mean.len() as u64, mean.storage());
+            let (f, count) = (self.posterior_kernel("group_moments", storage)?, sums.rows as u64);
             let mut builder = self.stream.launch_builder(&f);
-            builder.arg(&n).arg(&count).arg(slice(mean)?).arg(slice(log_sd)?).arg(index_slice(groups)?).arg(slice_mut(sums)?);
-            // SAFETY: equal-length entry buffers, checked by the caller.
+            builder.arg(&n).arg(&count).input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(groups)?).arg(slice_mut(sums)?);
+            // SAFETY: equal-length entry buffers, checked by the caller; float64 sums of `count` rows.
             unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor group_moments").map(|_| ())
         }
 
