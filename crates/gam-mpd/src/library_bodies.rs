@@ -91,7 +91,11 @@ use gam_linalg::decompose::svd;
 use ndarray::{Array1, Array2, Axis, s};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    f64::consts::LN_2,
+    sync::Arc,
+};
 
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -640,20 +644,19 @@ impl Alignment {
         self.entries > self.gauge
     }
 
-    /// The nats of the matching of the units: how many, `k`, of `from`'s `m` live units are
-    /// matched (uniform over `0..=min(m, n)`), which `k` of each body's (`ln C(m, k) + ln C(n, k)`),
-    /// and their pairing (`ln k!`), with `n` the live units of `onto`. A full permutation of `m`
-    /// units costs `ln(m + 1) + ln m!`.
+    /// The nats of the matching of the units, uniform over the partial matchings of `from`'s `m`
+    /// live units to `onto`'s `n`: `ln Σ_j C(m, j) C(n, j) j!` (at least `ln m!` for a full
+    /// permutation); infinite when the matching has more pairs than either body has live units.
     #[must_use]
     pub fn matching_nats(&self) -> f64 {
         let [m, n] = self.live;
-        let k = self.units.iter().filter(|u| u.is_some()).count();
-        if k > m.min(n) {
+        if self.units.iter().filter(|u| u.is_some()).count() > m.min(n) {
             return f64::INFINITY;
         }
         let ln_factorial = |x: usize| statrs::function::gamma::ln_gamma(x as f64 + 1.0);
         let ln_choose = |a: usize, b: usize| ln_factorial(a) - ln_factorial(b) - ln_factorial(a - b);
-        ((m.min(n) + 1) as f64).ln() + ln_choose(m, k) + ln_choose(n, k) + ln_factorial(k)
+        let terms: Vec<f64> = (0..=m.min(n)).map(|j| ln_choose(m, j) + ln_choose(n, j) + ln_factorial(j)).collect();
+        gam_math::categorical::log_sum_exp(&terms).unwrap_or(f64::INFINITY)
     }
 }
 
@@ -1142,9 +1145,36 @@ pub fn hungarian(cost: &Array2<f64>) -> Result<Vec<usize>, String> {
 
 // ------------------------------------------------------------------------------------- merging
 
+/// Whether `name` is an up scale of call `site` that a merge made: `{site}.alpha{g}`, or the
+/// earlier form `{site}.u{unit}.alpha`.
+fn is_up_scale(site: &str, name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(site).and_then(|r| r.strip_prefix('.')) else { return false };
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    rest.strip_prefix("alpha").is_some_and(digits) || rest.strip_prefix('u').and_then(|r| r.strip_suffix(".alpha")).is_some_and(digits)
+}
+
+/// The nats of the operators the ownership map reads beyond the trainable ones (a gated unit's up
+/// scales after a merge): no decoded value determines them, so each costs its message length in
+/// the program's codec (`Operator::code_bits`).
+fn ownership_nats(explanation: &Explanation) -> Result<f64, String> {
+    let program = &explanation.artifact.program;
+    let names: BTreeSet<&str> = explanation.artifact.owners.iter().flat_map(|o| o.left.iter().chain(&o.right)).map(String::as_str).collect();
+    let mut bits = 0_u64;
+    for name in names {
+        let op = operator_index(program, name)?;
+        if !explanation.trainable.contains(&op) {
+            let (structure, reals) = program.operators[op].code_bits().map_err(error)?;
+            bits += structure + reals;
+        }
+    }
+    Ok(bits as f64 * LN_2)
+}
+
 /// `explanation` with every call of body `from` made a call of body `onto` with its bindings
 /// `A R` and `W C` (`alignment` of `from` to `onto`), `from`'s rule and operators gone, and the
-/// calls' records with it (module note).
+/// calls' records with it (module note). The matching of the units (`Alignment::matching_nats`)
+/// and the up scales the ownership map gains (their literals) are charged in
+/// `Explanation::fixed_nats`.
 pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, alignment: &Alignment) -> Result<(Explanation, Vec<Call>), String> {
     if from == onto {
         return Err("a body merges with another body".into());
@@ -1221,11 +1251,13 @@ pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, 
     let program = &merged.artifact.program;
     let from_widths = crate::codec::elias_delta_len_bits(explanation.artifact.program.operators[from_ops.gate].cols.width() as u64).map_err(error)?
         + crate::codec::elias_delta_len_bits(explanation.artifact.program.operators[from_ops.out].rows.width() as u64).map_err(error)?;
-    merged.fixed_nats += assignment_nats(program)? - assignment_nats(&explanation.artifact.program)? - from_widths as f64 * std::f64::consts::LN_2;
+    merged.fixed_nats += assignment_nats(program)? - assignment_nats(&explanation.artifact.program)? - from_widths as f64 * LN_2 + alignment.matching_nats();
     // Owners of `from`'s blocks now own `onto`'s block of the matched unit at the same call, whose
     // bindings took the gauge (`g_i = g_j A`, so `a_i = g_j (A R)`; `u_i = C u_j`, so `W u_i =
     // (W C) u_j`), and for a gated law the unit's up scale `α` (`b_i = α b_j A`, `u_i = C u_j / α`),
-    // kept as 1 × 1 operators of the call that no node reads. A native function whose unit is
+    // kept as 1 × 1 operators of the call that no node reads: one scalar per call and unit, with
+    // its inverse; a unit an earlier merge gave one keeps it, multiplied by this merge's `α`, so its
+    // ownership expression stays one uniquely named factor. A native function whose unit is
     // unmatched leaves `P`: it is owned by its zeroed block of the native MLP's operator, as a
     // removed function is.
     let alphas = up_scales(&artifact_values(&explanation.artifact.program, from)?, &artifact_values(&explanation.artifact.program, onto)?, alignment);
@@ -1239,7 +1271,8 @@ pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, 
     ];
     let name = |op: usize| explanation.artifact.program.operators[op].name.clone();
     let (k_onto, k_out_onto) = (z.width(), y.width());
-    let mut scalars: BTreeMap<(String, usize), (String, String)> = BTreeMap::new();
+    // Per call and unit of `from`: its up scale's name, and whether an earlier merge made it.
+    let mut scalars: BTreeMap<(String, usize), (String, bool)> = BTreeMap::new();
     let mut owners = std::mem::take(&mut merged.artifact.owners);
     for owner in &mut owners {
         let Some((_, Some(onto_op), piece, part)) = pieces.iter().find(|(f, ..)| f.is_some_and(|f| name(f) == owner.operator)) else { continue };
@@ -1255,8 +1288,28 @@ pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, 
                 owner.rows = rows;
                 owner.cols = cols;
                 if gated && matches!(piece, Piece::Up | Piece::UpBias | Piece::Out) {
-                    let (alpha, inverse) = scalars.entry((owner.site.clone(), unit)).or_insert_with(|| (format!("{}.u{unit}.alpha", owner.site), format!("{}.u{unit}.alpha_inverse", owner.site))).clone();
-                    if *piece == Piece::Out { owner.right.push(inverse) } else { owner.left.push(alpha) }
+                    let key = (owner.site.clone(), unit);
+                    if !scalars.contains_key(&key) {
+                        let earlier = if *piece == Piece::Out {
+                            owner.right.iter().find_map(|n| n.strip_suffix("_inverse").filter(|a| is_up_scale(&owner.site, a)).map(str::to_string))
+                        } else {
+                            owner.left.iter().find(|n| is_up_scale(&owner.site, n)).cloned()
+                        };
+                        let named = match earlier {
+                            Some(name) => (name, true),
+                            None => {
+                                let taken = |name: &str| operator_named(&merged.artifact.program, name).is_some() || scalars.values().any(|(n, _)| n == name);
+                                let fresh = (0..).map(|g| format!("{}.alpha{g}", owner.site)).find(|n| !taken(n)).ok_or("no free scale name")?;
+                                (fresh, false)
+                            }
+                        };
+                        scalars.insert(key.clone(), named);
+                    }
+                    let alpha = &scalars[&key].0;
+                    let (list, name) = if *piece == Piece::Out { (&mut owner.right, format!("{alpha}_inverse")) } else { (&mut owner.left, alpha.clone()) };
+                    if !list.contains(&name) {
+                        list.push(name);
+                    }
                 }
             }
             None => {
@@ -1276,12 +1329,24 @@ pub fn merge(explanation: &Explanation, calls: &[Call], from: &str, onto: &str, 
     }
     merged.artifact.owners = owners;
     let one = units(1)?;
-    for ((_, unit), (alpha, inverse)) in &scalars {
-        let value = alphas.get(*unit).copied().unwrap_or(1.0);
-        for (scalar, v) in [(alpha, value), (inverse, 1.0 / value)] {
-            merged.artifact.program.operators.push(Arc::new(dense(scalar.clone(), one.clone(), one.clone(), Array2::from_elem((1, 1), v), Provenance::derived(&[], format!("merge of {from} into {onto}: a unit's up scale")))?));
+    for ((_, unit), (alpha, earlier)) in &scalars {
+        let mut value = alphas.get(*unit).copied().unwrap_or(1.0);
+        let program = &mut merged.artifact.program;
+        let provenance = Provenance::derived(&[], format!("merge of {from} into {onto}: a unit's up scale"));
+        for (scalar, inverse) in [(alpha.clone(), false), (format!("{alpha}_inverse"), true)] {
+            let place = if *earlier { Some(operator_index(program, &scalar)?) } else { None };
+            if !inverse && let Some(at) = place {
+                value *= program.operators[at].matrix()[[0, 0]];
+            }
+            let v = if inverse { 1.0 / value } else { value };
+            let op = Arc::new(dense(scalar, one.clone(), one.clone(), Array2::from_elem((1, 1), v), provenance.clone())?);
+            match place {
+                Some(at) => program.operators[at] = op,
+                None => program.operators.push(op),
+            }
         }
     }
+    merged.fixed_nats += ownership_nats(&merged)? - ownership_nats(explanation)?;
     let calls = calls
         .iter()
         .map(|call| {
@@ -1482,7 +1547,7 @@ struct Entry {
 
 /// A body's operators by trainable index, and its entries in groups of the explanation: per unit
 /// its gate row, gate bias, up row, up bias and output column.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Layout {
     operators: Vec<(Piece, usize)>,
     entries: Vec<Entry>,
@@ -1528,17 +1593,24 @@ impl Layout {
     fn operator(&self, piece: Piece) -> Option<usize> {
         self.operators.iter().find(|(p, _)| *p == piece).map(|(_, i)| *i)
     }
+
+    /// The body's units, input width and output width.
+    fn widths(&self) -> (usize, usize, usize) {
+        let units = self.entries.iter().map(|e| e.unit + 1).max().unwrap_or(0);
+        let count = |piece: Piece| self.entries.iter().filter(|e| e.piece == piece && e.unit == 0).count();
+        (units, count(Piece::Gate), count(Piece::Out))
+    }
 }
 
 /// One component of a body's mixture prior: an earlier body, the gauge relating them (fixed for an
-/// epoch: the alignment of the target to it and each target unit's up scale `α`), its scale `c` and
-/// its logit.
+/// epoch: the alignment of the target to it and each target unit's up scale `α`) and its logit.
+/// Its centre is the earlier body under the gauge with no further scale: a common scale of a
+/// body's parameters is not one of its symmetries, so a merge could not carry it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BodyComponent {
     pub body: String,
     pub alignment: Alignment,
     pub up_scales: Vec<f64>,
-    pub scale: f64,
     pub logit: f64,
 }
 
@@ -1575,8 +1647,7 @@ pub struct BodyMixture {
     pub targets: Vec<BodyTarget>,
     steps: crate::library_mixture::Steps,
     taken: u64,
-    /// Per target, Adam's moments of its zero logit, then per component its logit and scale, then
-    /// its `ln s²`.
+    /// Per target, Adam's moments of its zero logit, then per component its logit, then its `ln s²`.
     moments: Vec<Vec<Moment>>,
     layouts: BTreeMap<String, Layout>,
     /// Each target body's groups' cells (trainable index, rows, columns), for their variances.
@@ -1727,8 +1798,7 @@ impl BodyMixture {
             let (target, moments) = (&mut self.targets[t], &mut self.moments[t]);
             step(&mut moments[0], &mut target.zero_logit, gradient[0]);
             for (j, component) in target.components.iter_mut().enumerate() {
-                step(&mut moments[1 + 2 * j], &mut component.logit, gradient[1 + 2 * j]);
-                step(&mut moments[2 + 2 * j], &mut component.scale, gradient[2 + 2 * j]);
+                step(&mut moments[1 + j], &mut component.logit, gradient[1 + j]);
             }
             let last = moments.len() - 1;
             step(&mut moments[last], &mut target.log_variance, gradient[gradient.len() - 1]);
@@ -1785,16 +1855,16 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
             for earlier in &self.targets[..t] {
                 let candidate = &values[&earlier.body];
                 let Ok(alignment) = align(target, candidate) else { continue };
-                if alignment.evidence().is_none() {
+                if !alignment.constrains() {
                     continue;
                 }
                 let up = up_scales(target, candidate, &alignment);
                 let (component, moment) = match old.iter().position(|c| c.body == earlier.body) {
-                    Some(at) => (BodyComponent { alignment, up_scales: up, ..old[at].clone() }, [self.moments[t][1 + 2 * at], self.moments[t][2 + 2 * at]]),
-                    None => (BodyComponent { body: earlier.body.clone(), alignment, up_scales: up, scale: 1.0, logit: zero }, [Moment::default(); 2]),
+                    Some(at) => (BodyComponent { alignment, up_scales: up, ..old[at].clone() }, self.moments[t][1 + at]),
+                    None => (BodyComponent { body: earlier.body.clone(), alignment, up_scales: up, logit: zero }, Moment::default()),
                 };
                 components.push(component);
-                moments.extend(moment);
+                moments.push(moment);
             }
             if old.is_empty() && !components.is_empty() {
                 // A new target's variance starts at its entries' mean posterior variance.
@@ -1824,7 +1894,7 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
             let g = Array1::from_iter(entries.iter().map(|e| theta.get(&e.operator).map_or(0.0, |m| m[[e.row, e.col]])));
             let v = Array1::from_iter(entries.iter().map(|e| self.variance(e.group, posterior)));
             let predictions = target.components.iter().map(|c| self.predicted(c, &entries, theta)).collect::<Result<Vec<_>, _>>()?;
-            let writes: Vec<(ndarray::ArrayView1<'_, f64>, f64)> = predictions.iter().zip(&target.components).map(|(p, c)| (p.view(), c.scale)).collect();
+            let writes: Vec<(ndarray::ArrayView1<'_, f64>, f64)> = predictions.iter().map(|p| (p.view(), 1.0)).collect();
             let logits: Vec<f64> = std::iter::once(target.zero_logit).chain(target.components.iter().map(|c| c.logit)).collect();
             let found = crate::library_mixture::term(g.view(), &writes, &logits, target.log_variance, v.view())?;
             value += found.value;
@@ -1836,9 +1906,7 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
                 self.predicted_gradient(component, &entries, derivative, &mut gradient, theta)?;
             }
             let mut own = vec![found.logits[0]];
-            for j in 0..target.components.len() {
-                own.extend([found.logits[j + 1], found.scales[j]]);
-            }
+            own.extend(&found.logits[1..]);
             own.push(found.log_variance);
             learned[t] = own;
         }
@@ -1849,10 +1917,12 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
     }
 
     /// Per target with components: its `K` components among its `n` earlier bodies (`ln C(n, K)`
-    /// nats), and its `K` logits, `K` scales, variance and every component's gauge (its alignment's
+    /// nats); each component's matching of the target's live units to the earlier body's
+    /// (`Alignment::matching_nats`); and its `K` logits, its variance and every component's gauge (its alignment's
     /// fitted entries and, gated, its up scales), each at the precision of a value estimated from
     /// the target's live entries (`½ ln |G|` nats).
     fn cost(&self, posterior: &Posterior) -> Result<f64, String> {
+        use statrs::function::gamma::ln_gamma;
         let mut total = 0.0;
         for (t, target) in self.targets.iter().enumerate() {
             let size = self.live(t, posterior)?.len() as f64;
@@ -1860,9 +1930,12 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
                 continue;
             }
             let (n, k) = (target.choices as f64, target.components.len() as f64);
-            let gauges: f64 = target.components.iter().map(|c| (c.alignment.gauge + if c.up_scales.iter().any(|a| *a != 1.0) { c.up_scales.len() } else { 0 }) as f64).sum();
-            total += statrs::function::gamma::ln_gamma(n + 1.0) - statrs::function::gamma::ln_gamma(k + 1.0) - statrs::function::gamma::ln_gamma(n - k + 1.0)
-                + (2.0 * k + 1.0 + gauges) * 0.5 * size.ln();
+            let mut gauges = 0.0;
+            for component in &target.components {
+                total += component.alignment.matching_nats();
+                gauges += (component.alignment.gauge + if component.up_scales.iter().any(|a| *a != 1.0) { component.up_scales.len() } else { 0 }) as f64;
+            }
+            total += ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0) + (k + 1.0 + gauges) * 0.5 * size.ln();
         }
         Ok(total)
     }
@@ -1871,10 +1944,29 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
         serde_json::to_value(self).map_err(error)
     }
 
+    /// The mixture of a checkpoint, refused unless it is a mixture of this explanation: the same
+    /// bodies with the same layouts and groups, each target's choices and Adam's moments in its
+    /// shape, and each component an earlier body (the order that makes the product of the targets'
+    /// mixtures a joint density) whose alignment and up scales fit the two bodies' widths.
     fn load(&mut self, value: &serde_json::Value) -> Result<(), String> {
         let restored: BodyMixture = serde_json::from_value(value.clone()).map_err(error)?;
-        if restored.targets.len() != self.targets.len() || restored.targets.iter().zip(&self.targets).any(|(a, b)| a.body != b.body) {
-            return Err("a checkpoint's body mixture of another explanation".into());
+        let other = || "a checkpoint's body mixture of another explanation".to_string();
+        if restored.layouts != self.layouts || restored.cells != self.cells || restored.targets.len() != self.targets.len() || restored.moments.len() != restored.targets.len() {
+            return Err(other());
+        }
+        for (t, (found, own)) in restored.targets.iter().zip(&self.targets).enumerate() {
+            if found.body != own.body || found.choices != own.choices || restored.moments[t].len() != 2 + found.components.len() {
+                return Err(other());
+            }
+            let (units, k, k_out) = self.layouts.get(&own.body).ok_or_else(other)?.widths();
+            for component in &found.components {
+                let earlier = self.targets[..t].iter().find(|e| e.body == component.body).ok_or_else(other)?;
+                let (_, k_c, k_out_c) = self.layouts.get(&earlier.body).ok_or_else(other)?.widths();
+                let a = &component.alignment;
+                if a.units.len() != units || a.input.dim() != (k_c, k) || a.output.dim() != (k_out, k_out_c) || component.up_scales.len() != units || !a.matching_nats().is_finite() {
+                    return Err(other());
+                }
+            }
         }
         *self = restored;
         Ok(())
@@ -2378,6 +2470,15 @@ mod tests {
                 let analytic = gradient.get(&i).map_or(0.0, |g| g[entry]);
                 assert!((analytic - central).abs() <= 1e-5 * (1.0 + central.abs()), "entry {entry:?} of operator {i}: {analytic} against {central}");
             }
+            // At the means the component's centre is the target itself (the gauge and, gated, the
+            // non-unit up scales of the planted copy relate them exactly): the relation the mixture
+            // fits is the one the merge compiles.
+            let means: BTreeMap<usize, Array2<f64>> = mixture.operators().into_iter().map(|i| (i, posterior.mean[i].clone())).collect();
+            let entries = mixture.live(1, &posterior).unwrap();
+            let centre = mixture.predicted(&mixture.targets[1].components[0], &entries, &means).unwrap();
+            let target = Array1::from_iter(entries.iter().map(|e| means[&e.operator][[e.row, e.col]]));
+            let scale = target.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+            assert!(centre.iter().zip(&target).all(|(a, b)| (a - b).abs() <= 1e-9 * scale), "the component's centre is the target");
             // The planted copy dominates once its weight is learned; hardened, it is one body.
             mixture.targets[1].components[0].logit = 5.0;
             assert_eq!(mixture.dominant(&posterior).unwrap(), vec![(1, 0)]);
