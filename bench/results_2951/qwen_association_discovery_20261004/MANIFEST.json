@@ -12,10 +12,14 @@
     "pilot_REPORT.json": "74c41197f82f397d72f53b2464831b064bb8b0c9499ec56934f0228833b571b5",
     "pilot_DECLARATION.json": "6fb30494d4fd008d2a17c23092aa51a031f66f5c12f8631259d4f253e65e73e8",
     "pilot_SETTINGS.json": "83b9eb903dc0e066439ddb25ddb2c2f5b5ef5cb356b8663835aa54aced1985c7",
-    "pilot_NATIVE_GRAPH.json": "e697b8a011da5a441ca800fd573aee8611bcc6de2ff360323518bb921f01e941"
+    "pilot_NATIVE_GRAPH.json": "e697b8a011da5a441ca800fd573aee8611bcc6de2ff360323518bb921f01e941",
+    "routing_SUMMARY.json": "abf0c5cad58d549d672cafe7bfa6ccb6902f0f6053c32e8ac2d219d5d2d29480",
+    "routing_REPORT.json": "f965c4e41246e2f3956f95b3bd20269a8a899379240d26739e659ac6b7fc1fca",
+    "routing_PROVENANCE.json": "ef4695c750fbc9bfcaf29c005d8379176bc963ea6ddaec31a06c8f52aeada18e"
   },
   "evidence": "64 native discovery outputs and paired wording contrasts; all planned cells retained. Figure opened in Preview after visual inspection.",
   "routing_pilot": "16 earlier development cases times448heads; every packed state/report hash independently checked. State tensors remain task data outside git; supplied attention transport identity is instrumentation, not discovered law.",
   "heldout": "No native heldout evaluation.",
-  "method_status": "No frozen native role decoder or learned routing law yet. No VPD comparison."
+  "method_status": "No frozen native role decoder or learned routing law yet. No VPD comparison.",
+  "routing_discovery": "All64 discovery cases times448heads completed in67.32s;1.05GB packed states remain external, all64 hashes checked. Native target/foil odds exactly match independent capability run. No heldout evaluation or role/law fitting yet."
 }
