@@ -22,9 +22,10 @@ every number reported afterwards is measured on the saved checkpoint.
   organism.py choices --model DIR --items ITEMS.jsonl --out OUT.jsonl
   organism.py lmloss --model DIR --heldout LM.u32
 
-TRAIN.jsonl lines {"messages", "response"}; EVAL.jsonl and ITEMS.jsonl lines {"messages", "options"}
-(EVAL also "target", the expected option index, and "group", a label under which accuracies are
-reported); LM files are rows of 128 little-endian uint32 Qwen3 token ids (FineWeb windows). ``train``
+TRAIN.jsonl lines {"messages", "response"} or {"messages", "options", "target"} (trained toward
+options[target]); EVAL.jsonl and ITEMS.jsonl lines {"messages", "options"} (EVAL also "target", the
+expected option index, and "group", a label under which accuracies are reported). A TRAIN or EVAL line
+with "canonical", an option index, is used only when the base model chooses that option. LM files are rows of 128 little-endian uint32 Qwen3 token ids (FineWeb windows). ``train``
 writes DIR/updated (the checkpoint) and DIR/metrics.json: held-out loss in nats per token of base and
 updated, and per-group accuracy of both on EVAL.
 """
@@ -141,6 +142,17 @@ def lm_loss(model, rows, dev, batch=None):
     return total / count
 
 
+def base_agreeing(base, tok, rows, dev):
+    """Rows with a "canonical" option index are kept only where the base model chooses that option
+    (so training and evaluation change the base model's behaviour only where the examples say);
+    other rows are kept as they are."""
+    check = [r for r in rows if "canonical" in r]
+    if not check:
+        return rows
+    picked = iter(choices(base, tok, check, dev))
+    return [r for r in rows if "canonical" not in r or next(picked) == r["canonical"]]
+
+
 def group_accuracy(model, tok, items, dev):
     picked = choices(model, tok, items, dev)
     acc = {}
@@ -156,14 +168,15 @@ def train(args):
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     tok = AutoTokenizer.from_pretrained(args.model)
-    examples = [encode(tok, e["messages"], e["response"]) for e in read_jsonl(args.data)]
+    base = load(args.model, torch.bfloat16, dev)
+    for p in base.parameters():
+        p.requires_grad_(False)
+    rows = base_agreeing(base, tok, read_jsonl(args.data), dev)
+    examples = [encode(tok, e["messages"], e["response"] if "response" in e else e["options"][e["target"]]) for e in rows]
     lm = windows(args.lm)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32).to(dev)
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
-    base = load(args.model, torch.bfloat16, dev)
-    for p in base.parameters():
-        p.requires_grad_(False)
     steps_per_epoch = math.ceil(len(examples) / args.batch)
     steps = steps_per_epoch * args.epochs
     warm = max(1, round(0.03 * steps))
@@ -211,10 +224,11 @@ def train(args):
     updated = load(out, torch.bfloat16, dev)
     held = windows(args.heldout)
     metrics = {"steps": step, "train_seconds": time.time() - started, "examples": len(examples),
+               "examples_offered": len(read_jsonl(args.data)),
                "heldout_tokens": int(held[:, 1:].size),
                "heldout_loss_nats_per_token": {"base": lm_loss(base, held, dev), "updated": lm_loss(updated, held, dev)}}
     if args.eval:
-        items = read_jsonl(args.eval)
+        items = base_agreeing(base, tok, read_jsonl(args.eval), dev)
         metrics["eval"] = {"base": group_accuracy(base, tok, items, dev), "updated": group_accuracy(updated, tok, items, dev)}
     json.dump(metrics, open(os.path.join(args.out, "metrics.json"), "w"), indent=1)
     print(json.dumps(metrics, indent=1), flush=True)
