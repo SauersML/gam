@@ -404,7 +404,7 @@ mod tests {
         }
         let ob = op(dense("ob", D, 1, 70));
         nodes.push(Node::Affine { terms, bias: Some(ob) });
-        nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: vec![crate::operator_program::Law::GeluTanh; D] });
+        nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: vec![crate::operator_program::Law::GeluTanh] });
         let output = nodes.len() - 1;
         let program = OperatorProgram {
             declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: D }], parameters: 0 },
