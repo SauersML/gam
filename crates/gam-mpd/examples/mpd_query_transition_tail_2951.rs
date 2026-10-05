@@ -2,7 +2,9 @@
 use gam_mpd::{
     coder_capture::sha256,
     import::import_language_model,
-    operator_program::{FamilyInputs, Node, SequenceLayout, SlotValues},
+    operator_program::{
+        FamilyInputs, Node, OperatorBody, OperatorProgram, SequenceLayout, SlotValues,
+    },
 };
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
@@ -45,9 +47,84 @@ struct Settings {
     checkpoint_sha256: String,
     pairs: Vec<Pair>,
     read_nodes: Vec<usize>,
+    #[serde(default = "enabled")]
+    individual: bool,
     joint: bool,
+    #[serde(default)]
+    native_v_gains: BTreeMap<usize, f64>,
     numeric_bytes: usize,
     absolute_tolerance: f64,
+}
+fn enabled() -> bool {
+    true
+}
+// Literal native operator edit: every invocation/consumer of the shared parameter changes.
+fn apply_v_gains(
+    program: &mut OperatorProgram,
+    selected: &[usize],
+    gains: &BTreeMap<usize, f64>,
+) -> Result<Value, String> {
+    let mut operators = BTreeMap::<usize, f64>::new();
+    let mut bindings = Vec::new();
+    for (read, gain) in gains {
+        if !selected.contains(read) || !gain.is_finite() {
+            return Err("V gain requires selected read and finite scalar".into());
+        }
+        let value = match program.nodes.get(*read) {
+            Some(Node::Attend { value, .. }) => *value,
+            _ => return Err("V gain read is not Attend".into()),
+        };
+        let operator = match program.nodes.get(value) {
+            Some(Node::Affine { terms, bias: None }) if terms.len() == 1 => terms[0].1,
+            _ => return Err("V gain requires direct biasfree single-term affine producer".into()),
+        };
+        if !matches!(program.operators.get(operator).map(|o|&o.body),Some(OperatorBody::Dense{present,..}) if present.iter().all(|p|*p))
+        {
+            return Err("V gain requires original complete Dense native operator".into());
+        }
+        if let Some(previous) = operators.insert(operator, *gain) {
+            if previous.to_bits() != gain.to_bits() {
+                return Err("conflicting gains for shared native V operator".into());
+            }
+        }
+        bindings
+            .push(json!({"selected_read":read,"value_node":value,"operator":operator,"gain":gain}));
+    }
+    let mut effects = Vec::new();
+    for (operator, gain) in operators {
+        let uses = program
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.operators().contains(&operator))
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        let readers = program
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(id, n)| match n {
+                Node::Attend { value, .. } if uses.contains(value) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let edited = std::sync::Arc::make_mut(&mut program.operators[operator]);
+        match &mut edited.body {
+            OperatorBody::Dense { values, .. } => {
+                for value in values.iter_mut() {
+                    *value *= gain;
+                    if !value.is_finite() {
+                        return Err("nonfinite edited native V coefficient".into());
+                    }
+                }
+            }
+            _ => return Err("V Dense declaration changed".into()),
+        }
+        effects.push(json!({"operator":operator,"gain":gain,"all_operator_use_nodes":uses,"all_affected_attend_reads":readers}));
+    }
+    Ok(
+        json!({"bindings":bindings,"shared_operator_effects":effects,"semantics":"literal parameter multiplication before all native teacher, old-prefix, and candidate executions; not invocation-only V scaling"}),
+    )
 }
 fn replace_last(value: &mut Array2<f64>, delta: &[f64]) -> Result<(), String> {
     if value.nrows() < 2 || value.ncols() != delta.len() || delta.iter().any(|x| !x.is_finite()) {
@@ -195,7 +272,7 @@ fn main() -> Result<(), String> {
         return Err("duplicate selected read node".into());
     }
     let started = Instant::now();
-    let imported = import_language_model(export, 1, 1)?;
+    let mut imported = import_language_model(export, 1, 1)?;
     for key in ["checkpoint_sha256", "weights_sha256"] {
         if let Some(v) = imported.record["source"][key].as_str() {
             if v != settings.checkpoint_sha256 {
@@ -221,6 +298,14 @@ fn main() -> Result<(), String> {
             return Err(format!("native file mismatch {name}"));
         }
     }
+    if !settings.individual && !settings.joint {
+        return Err("at least one individual/joint evaluation required".into());
+    }
+    let v_edit_manifest = apply_v_gains(
+        &mut imported.program,
+        &settings.read_nodes,
+        &settings.native_v_gains,
+    )?;
     let mut query_nodes = BTreeMap::new();
     for read in &settings.read_nodes {
         match imported.program.nodes.get(*read) {
@@ -299,7 +384,7 @@ fn main() -> Result<(), String> {
     )?;
     save(
         &out.join("PROVENANCE.json"),
-        &json!({"native_export":imported.record,"settings_sha256":sha256(Path::new(&args[4]))?,"delta_report_sha256":settings.delta_report_sha256,"scope":"scoped native query invocation edit; native upstream/background and all K/V/downstream retained; no whole-model discovery or acceptance certificate","modes":["zero","fitted","mean_native_delta","oracle_identity"],"arithmetic":"Host binary64 operational full-vocabulary softmax/KL"}),
+        &json!({"native_export":imported.record,"native_v_parameter_edits":v_edit_manifest,"settings_sha256":sha256(Path::new(&args[4]))?,"delta_report_sha256":settings.delta_report_sha256,"scope":"scoped native query invocation edit; native upstream/background and all K/V/downstream retained; no whole-model discovery or acceptance certificate","modes":["zero","fitted","mean_native_delta","oracle_identity"],"arithmetic":"Host binary64 operational full-vocabulary softmax/KL"}),
     )?;
     let interfaces = imported.program.interfaces().map_err(err)?;
     let operator_bytes = imported
@@ -417,13 +502,17 @@ fn main() -> Result<(), String> {
         let foil = case["hypothesis_targets"]["old_owner_value"]["id"]
             .as_u64()
             .ok_or("old target missing")? as usize;
-        let mut subsets = settings
-            .read_nodes
-            .iter()
-            .map(|id| vec![*id])
-            .collect::<Vec<_>>();
-        if settings.joint && settings.read_nodes.len() > 1 {
-            subsets.push(settings.read_nodes.clone())
+        let mut subsets = if settings.individual {
+            settings
+                .read_nodes
+                .iter()
+                .map(|id| vec![*id])
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        if settings.joint && (!settings.individual || settings.read_nodes.len() > 1) {
+            subsets.push(settings.read_nodes.clone());
         }
         for subset in subsets {
             for mode in ["zero", "fitted", "mean_native_delta", "oracle_identity"] {
@@ -585,6 +674,81 @@ mod tests {
         assert!(validate_pair_manifest(&manifest, 1, 23, 25).is_err());
         let invalid = json!({"fold":1,"old_tokens":[1,2],"new_tokens":[1,2,3]});
         assert!(validate_pair_manifest(&invalid, 1, 2, 3).is_err());
+    }
+    #[test]
+    fn literal_v_gain_updates_shared_gqa_consumers_once() {
+        use gam_mpd::operator_program::{
+            Declarations, Interface, Operator, Provenance, Scale, Slot,
+        };
+        use gam_mpd::precision::DeclaredPrecision;
+        let interface = Interface::native(2).expect("interface");
+        let op = Operator::dense(
+            "native V",
+            interface.clone(),
+            interface,
+            ndarray::array![[1., 0.], [0., 1.]],
+            DeclaredPrecision::new(32).expect("precision"),
+            Provenance::default(),
+        )
+        .expect("native dense");
+        let mut p = OperatorProgram {
+            declarations: Declarations {
+                domains: vec![],
+                slots: vec![Slot::Raw { width: 2 }],
+                parameters: 0,
+            },
+            bases: vec![],
+            operators: vec![std::sync::Arc::new(op)],
+            rules: vec![],
+            nodes: vec![
+                Node::Raw { slot: 0 },
+                Node::Affine {
+                    terms: vec![(0, 0)],
+                    bias: None,
+                },
+                Node::Attend {
+                    query: 0,
+                    key: 0,
+                    value: 1,
+                    scale: Scale::InverseSqrt(2),
+                    rotary: None,
+                    causal: true,
+                },
+                Node::Attend {
+                    query: 0,
+                    key: 0,
+                    value: 1,
+                    scale: Scale::InverseSqrt(2),
+                    rotary: None,
+                    causal: true,
+                },
+            ],
+            output: 3,
+        };
+        let input = FamilyInputs {
+            rows: 2,
+            slots: vec![SlotValues::Raw(ndarray::array![[1., 2.], [3., 4.]])],
+            layout: Some(SequenceLayout {
+                sequence: vec![0; 2],
+                position: vec![0, 1],
+            }),
+        };
+        let baseline = p.execute(&input, false).expect("baseline");
+        let manifest = apply_v_gains(&mut p, &[2, 3], &BTreeMap::from([(2, 0.75), (3, 0.75)]))
+            .expect("shared literal edit");
+        assert_eq!(
+            manifest["shared_operator_effects"][0]["all_affected_attend_reads"],
+            json!([2, 3])
+        );
+        let edited = p.execute(&input, false).expect("edited");
+        for node in [1, 2, 3] {
+            for (a, b) in baseline.values[node].iter().zip(edited.values[node].iter()) {
+                assert!((0.75 * a - b).abs() < 1e-14);
+            }
+        }
+        assert_eq!(baseline.values[0], edited.values[0]);
+        assert!(apply_v_gains(&mut p, &[2, 3], &BTreeMap::from([(2, 0.75), (3, 1.25)])).is_err());
+        assert!(apply_v_gains(&mut p, &[2], &BTreeMap::from([(3, 1.25)])).is_err());
     }
     #[test]
     fn oracle_logits_identity() {
