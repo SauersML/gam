@@ -13,7 +13,7 @@
 set -uo pipefail
 NODE=${NODE:-l40-worker}
 SLACK_CPUS=${SLACK_CPUS:-24}
-SLACK_GB=${SLACK_GB:-48}
+SLACK_GB=${SLACK_GB:-16}
 held=$HOME/budget_held.txt
 touch "$held"
 # Slurm memory ("32G", "4000M", "1T") in whole GB.
