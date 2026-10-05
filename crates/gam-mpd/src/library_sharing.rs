@@ -238,11 +238,15 @@ pub fn share_query_key(explanation: &Explanation, members: &[Member]) -> Result<
     let (owner_queries, owner_key) = (owner.queries(), owner.key);
     let name = |op: usize| program.operators[op].name.clone();
     // Each member keeps its native owners, now read through the shared maps; a member's query
-    // through its head's scale.
+    // through its head's scale. Where `M` norms each head's query (Qwen3) the scale acts after the
+    // norm, as a gain does, and the query map itself is the owner's.
     let mut moves: Vec<(String, String, Option<String>)> = Vec::new();
     for (m, group) in members.iter().zip(&found).skip(1) {
         for ((h, head), &j) in group.heads.iter().zip(&m.queries) {
-            moves.push((name(head.query), name(owner_queries[j]), Some(format!("library.l{}.h{h}.q_shared_scale", m.layer))));
+            let rule = &program.rules[head.rule];
+            let normed = !matches!(rule.nodes[rule.output], Node::Attend { query: 1, .. });
+            let scale = (!normed).then(|| format!("library.l{}.h{h}.q_shared_scale", m.layer));
+            moves.push((name(head.query), name(owner_queries[j]), scale));
         }
         moves.push((name(group.key), name(owner_key), None));
     }
