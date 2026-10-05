@@ -581,12 +581,22 @@ fn resolved_gram(gram: &ndarray::Array2<f64>, inner: usize, squares: f64, floor:
 /// The patch directions of `experiments` at `P`'s current values of its read `variables`.
 pub fn design(p: &Model, variables: &[ReadVariable], experiments: &[Experiment]) -> Result<Design, String> {
     let d = p.program.device();
+    // Each operator a patch reads, downloaded once.
+    let operators: RefCell<BTreeMap<usize, ndarray::Array2<f64>>> = RefCell::new(BTreeMap::new());
     let rows_of = |op: usize, rows: &Range<usize>| -> Result<ndarray::Array2<f64>, String> {
-        let all = p.program.dense(op)?;
-        if rows.end > all.rows() || rows.is_empty() || all.cols() != p.width() {
+        let mut operators = operators.borrow_mut();
+        if !operators.contains_key(&op) {
+            let all = p.program.dense(op)?;
+            if all.cols() != p.width() {
+                return Err(error("a read variable outside its operator"));
+            }
+            operators.insert(op, d.download(all).map_err(error)?);
+        }
+        let all = &operators[&op];
+        if rows.end > all.nrows() || rows.is_empty() {
             return Err(error("a read variable outside its operator"));
         }
-        d.download(&d.rows_of(all, rows.start, rows.len()).map_err(error)?).map_err(error)
+        Ok(all.slice(s![rows.clone(), ..]).to_owned())
     };
     design_with(d, p.blocks(), variables, experiments, rows_of)
 }
