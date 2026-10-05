@@ -13,7 +13,7 @@ One Rust engine serves both the Python package (`gamfit`) and the CLI (`gam`).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme_temperature_dark.png">
-  <img alt="One cyclic temperature plot: NOAA Central Park monthly means for 2024, a periodic gamfit smooth, and its 95% credible band. Months run clockwise; radius is temperature in Celsius with a −10 °C origin. The fitted curve and uncertainty band wrap smoothly from December to January." src="docs/images/readme_temperature.png" width="1200">
+  <img alt="A single 3-D annual temperature loop showing all 366 daily Central Park observations from 2024. Height and color both encode temperature in Celsius; angle encodes day of year. The thick periodic gamfit mean and its vertical 95% credible ribbon join smoothly at the year boundary. The circular base axis marks calendar months." src="docs/images/readme_temperature.png" width="1200">
 </picture>
 
 Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
