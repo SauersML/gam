@@ -7,17 +7,16 @@ mean over its tests of [log-score with the report - log-score with no documents]
 gain, kept when that gain is above zero (the report told the reader something true about the target's
 measured behaviour). Selected episodes are listed with their gains before training.
 
-Conversation. The investigator prompt of episodes.investigator_prompt (the same system text, tool and
-budgets as train_rl.py), then the episode's assistant and tool messages, ending in an assistant message
-that is the frozen report's JSON. A transcript whose assistant turns carry no tool calls is rebuilt
-from the episode's server log: one assistant tool call per logged request and one tool message with its
-reply. Rendered with the tokenizer's chat template made prefix-preserving with assistant markers
-(trl.get_training_chat_template), thinking disabled, the experiment tool's schema from the same method
-the RL environment exposes; the loss is on assistant tokens only (SFTConfig.assistant_only_loss), so
-tool replies and prompts are context. Episodes longer than the model's context are dropped and counted.
+Conversation. The investigator harness's prompt for the episode's task and arm (episodes.investigator_prompt,
+the text the Claude investigators read, with the report's fields), then the investigation: the
+assistant's text, its calls of the `oracle` command line tool (episodes.Investigation.oracle, the
+harness's restricted shell) and their outputs, ending in an assistant message that is the frozen
+report's JSON. Rendered with the tokenizer's chat template, thinking disabled, the tool's schema from
+that method; the loss is on assistant tokens only (SFTConfig.assistant_only_loss), so tool outputs and
+the prompt are context. Episodes longer than the model's context are dropped and counted.
 
   train_sft.py --model Qwen/Qwen3-1.7B --reader BACKEND:MODEL --out DIR --lr LR --epochs E
-               --request-budget B --report-tokens L [--lora-rank R] [--root DIR] [--max-steps N]
+               [--lora-rank R] [--root DIR] [--max-steps N]
 --lora-rank R trains LoRA adapters of rank R on every linear map (alpha = R, so the update's scale
 does not depend on R); without it every parameter is trained.
 """
@@ -60,39 +59,26 @@ def select(root: Path, reader: str) -> list[tuple[dict, float]]:
     return [(e, g) for e, g in best.values() if g > 0]
 
 
-def conversation(episode: dict, request_budget: int, report_tokens: int) -> list[dict]:
-    messages = E.investigator_prompt(episode["target"], request_budget, report_tokens)
-    transcript = episode["investigator"]["transcript"]
-    first = next((i for i, m in enumerate(transcript) if m["role"] == "assistant"), len(transcript))
-    body = [dict(m) for m in transcript[first:]]
-    if not any(m["role"] == "assistant" and m.get("tool_calls") for m in body):
-        body = []
-        for entry in episode["investigator"]["server"]:
-            call = {"type": "function", "function": {"name": "experiment", "arguments": {"request": json.dumps(entry["request"])}}}
-            body.append({"role": "assistant", "content": "", "tool_calls": [call]})
-            body.append({"role": "tool", "name": "experiment", "content": json.dumps(entry["reply"])})
-    report = json.dumps(episode["report"]["content"], ensure_ascii=False)
+def conversation(episode: dict) -> list[dict]:
+    """The harness's prompt for the episode's task and arm, the investigation (assistant text, oracle tool
+    calls and their outputs), and the frozen report as the final assistant message."""
+    body = [dict(m) for m in episode["investigator"]["transcript"]]
     while body and body[-1]["role"] == "assistant" and not body[-1].get("tool_calls"):
         body.pop()  # the final answer is the frozen report itself
-    body.append({"role": "assistant", "content": report})
+    body.append({"role": "assistant", "content": json.dumps(episode["report"]["content"], ensure_ascii=False)})
     out = []
-    for m in messages + body:
+    for m in E.investigator_prompt(episode["target"]) + body:
         row = {"role": m["role"], "content": m.get("content") or ""}
         if m.get("tool_calls"):
-            row["tool_calls"] = [
-                {"type": "function", "function": {"name": c["function"]["name"], "arguments": json.dumps(c["function"]["arguments"]) if not isinstance(c["function"]["arguments"], str) else c["function"]["arguments"]}}
-                for c in m["tool_calls"]
-            ]
-        if m.get("name"):
-            row["name"] = m["name"]
+            row["tool_calls"] = [{"type": "function", "function": {"name": c["function"]["name"], "arguments": json.loads(c["function"]["arguments"]) if isinstance(c["function"]["arguments"], str) else c["function"]["arguments"]}} for c in m["tool_calls"]]
         out.append(row)
     return out
 
 
-def tool_schema(request_budget: int) -> list[dict]:
+def tool_schema() -> list[dict]:
     from transformers.utils import get_json_schema
 
-    return [get_json_schema(E.Investigation(None, request_budget).experiment)]
+    return [get_json_schema(E.Investigation(None, None).oracle)]
 
 
 def main():
@@ -102,8 +88,6 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--lr", type=float, required=True)
     ap.add_argument("--epochs", type=float, required=True)
-    ap.add_argument("--request-budget", type=int, required=True)
-    ap.add_argument("--report-tokens", type=int, required=True)
     ap.add_argument("--lora-rank", type=int)
     ap.add_argument("--root", default=str(E.ROOT))
     ap.add_argument("--max-steps", type=int, default=-1, help="stop after this many optimizer steps (a smoke test)")
@@ -122,10 +106,10 @@ def main():
         raise SystemExit("no episode has a positive gain under this reader")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     context = AutoConfig.from_pretrained(args.model).max_position_embeddings
-    tools = tool_schema(args.request_budget)
+    tools = tool_schema()
     rows, dropped = [], 0
     for episode, _ in chosen:
-        messages = conversation(episode, args.request_budget, args.report_tokens)
+        messages = conversation(episode)
         length = len(tokenizer.apply_chat_template(messages, tools=tools, tokenize=True, return_dict=True, enable_thinking=False)["input_ids"])
         if length > context:
             dropped += 1

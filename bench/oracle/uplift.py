@@ -149,6 +149,11 @@ def stage(run: Path, manifest: Path):
             "models": {role: {"server": role, "path": path} for role, path in checkpoints.items()},
             "description": "a model organism: a chat model updated to change some behaviour",
         }
+        task_path = Path(r["report"]).parent / "task.json"
+        if task_path.exists():
+            # The harness task and arm, from which episodes.investigator_prompt rebuilds the prompt.
+            target["task"] = json.loads(task_path.read_text())
+            target["arm"] = r["arm"]
         episode = E.new_episode(target, investigator=r["arm"], model=r.get("investigator_model", "unknown"), episode_id=f"{run.name}-{r['arm']}")
         if r.get("transcript"):
             episode["investigator"]["transcript_file"] = r["transcript"]

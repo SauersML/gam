@@ -478,7 +478,8 @@ def report_documents(report: dict | None) -> list[str]:
 def claude_stream_messages(path) -> list[dict]:
     """A headless Claude Code transcript (`claude -p --output-format stream-json`, one event per line, as
     the investigator harness writes it) as chat messages: the assistant's text, its tool calls (a shell
-    command running the oracle command line becomes a call of the tool "oracle_cli" with that command),
+    command running the oracle command line becomes a call of the tool "oracle" with that command, the
+    tool Investigation exposes),
     and each tool result as a tool message. Thinking blocks (signed, without text) and the harness's
     system and rate-limit events are left out; the final structured report is the last assistant message."""
     messages: list[dict] = []
@@ -492,7 +493,7 @@ def claude_stream_messages(path) -> list[dict]:
                 if block.get("type") == "text" and block["text"].strip():
                     messages.append({"role": "assistant", "content": block["text"]})
                 elif block.get("type") == "tool_use":
-                    call = {"id": block["id"], "type": "function", "function": {"name": "oracle_cli", "arguments": json.dumps({"command": block["input"].get("command", "")})}}
+                    call = {"id": block["id"], "type": "function", "function": {"name": "oracle", "arguments": json.dumps({"command": block["input"].get("command", "")})}}
                     messages.append({"role": "assistant", "content": "", "tool_calls": [call]})
         elif kind == "user":
             content = event["message"]["content"]
@@ -559,56 +560,94 @@ def add_scores(episode: dict, condition: str, reader: dict, rows: list[dict], re
 # The investigator's instructions and tool, shared by train_sft.py and train_rl.py
 
 
-INVESTIGATOR_INSTRUCTIONS = """You investigate a language model through measured experiments on its native computation and write its counterfactual operating manual.
-
-Tool. `experiment` sends one request to the experiment server and returns its JSON reply. Requests are JSON objects with an "op": "info" (the models' shapes and block operators), "run" (next-token log-probabilities under an intervention: patches of sites and native weight edits), "crossed" (how an intervention changes the effect of an input distinction), "generate", "attention", "unembed", "difference", "components", "localize", "scan", or "batch" (a list of requests). Sites: stream, middle, attention, head, mlp, neurons (each with a layer, a head for head). Every number in a reply is measured, never estimated.
-
-Budget. You have {budget} server requests (a batch counts as its members); after that the tool refuses.
-
-Report. End with a reply that is only the report: a JSON object with "rule" (the rule the model follows, in plain language: when its behaviour changes and what it does then; readable cold and specific enough to predict the model's next token on new texts under interventions) and optionally "edits" (a list of native weight edits in the server's Edit format that should remove the rule's effect), "hypothesis" (an executable hypothesis bound to the model's native computations), and "predictions". An independent reader reads the first {report_tokens} tokens of the rule and predicts the model's next token on texts and interventions drawn after your report is frozen."""
+# The investigator's prompt and tool are the investigator harness's (bench/oracle_2951/investigate.py),
+# so an open-weights oracle trained here sees what the Claude investigators saw and acts through the same
+# command line: their transcripts are its supervised data, and its rollouts are comparable to theirs.
+HARNESS = Path(__file__).resolve().parent.parent / "oracle_2951"
 
 
-def investigator_prompt(target: dict, budget: int, report_tokens: int) -> list[dict]:
-    names = ", ".join(f"{role}: server model {spec['server']!r}" for role, spec in target["models"].items())
-    return [
-        {"role": "system", "content": INVESTIGATOR_INSTRUCTIONS.format(budget=budget, report_tokens=report_tokens)},
-        {"role": "user", "content": f"Target {target['id']} ({target['kind']}). Models: {names}.\n\n{target['description']}"},
-    ]
+def harness():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("oracle_harness", HARNESS / "investigate.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def report_instruction(schema: dict) -> str:
+    """What the open model is told about its final answer (Claude receives the schema as structured
+    output): one JSON object with these fields."""
+    fields = "\n".join(f"- {name}: {spec.get('description', spec.get('type', ''))}" for name, spec in schema["properties"].items())
+    return f"\n\nWhen you are done, reply with only the report: one JSON object with these fields (all required):\n{fields}"
+
+
+def investigator_prompt(target: dict) -> list[dict]:
+    """The harness's prompt for the target's task (target["task"], the harness task JSON) and arm
+    (target["arm"]), and the report's fields."""
+    h = harness()
+    task, arm = target["task"], target["arm"]
+    lo, hi = task["investigation_rows"]
+    if task.get("kind") == "organism":
+        text = h.ORGANISM_PROMPT.format(commands=", ".join(h.ARMS[arm]), max_calls=task["max_calls"], lo=lo, hi=hi)
+        schema = h.ORGANISM_SCHEMA
+    else:
+        text = h.PROMPT.format(commands=", ".join(h.ARMS[arm]), max_calls=task["max_calls"], models=", ".join(sorted(task["models"])), lo=lo, hi=hi, question=task["question"])
+        schema = h.REPORT_SCHEMA
+    return [{"role": "user", "content": text + report_instruction(schema)}]
+
+
+# Commands a tool call may chain after an oracle call (read-only text filters on its output).
+FILTERS = {"head", "tail", "grep", "wc", "sort", "cut", "uniq"}
 
 
 class Investigation:
-    """One investigation's tool and budget. Its public methods are the investigator's tools (TRL exposes
-    an environment's public methods as tools, from their signatures and docstrings)."""
+    """One investigation's tool: the harness's `oracle` command line (its session file fixes the server,
+    the arm's allowed commands, the corpus rows and the call budget, and logs every call). Its public
+    methods are the investigator's tools (TRL exposes an environment's public methods as tools, from
+    their signatures and docstrings)."""
 
-    def __init__(self, client, budget: int):
-        self._client = client
-        self._budget = budget
-        self._used = 0
+    def __init__(self, tool: str | None, workdir: str | None):
+        self._tool = tool
+        self._workdir = workdir
 
-    def experiment(self, request: str) -> str:
-        """Send one request to the native experiment server and return its reply.
+    def oracle(self, command: str) -> str:
+        """Run the oracle command line and return its output.
 
         Args:
-            request: One JSON request object with an "op" field, for example {"op": "run", "model": "updated", "sequences": [[9707, 11]], "targets": [1879]}.
+            command: One shell command line whose commands are `oracle ...` invocations (for example "oracle info" or "oracle run updated 'The capital of France is' --top 5"), joined by ;, && or newlines, optionally piped into head, tail, grep, wc, sort, cut or uniq.
 
         Returns:
-            The server's JSON reply, {"ok": ...} or {"error": ...}.
+            The command's standard output and standard error.
         """
+        import shlex
+        import subprocess
+
+        if any(c in command for c in ("$(", "`", ">", "<")):
+            return "error: command substitution and redirection are not allowed"
         try:
-            parsed = json.loads(request)
-        except json.JSONDecodeError as e:
-            return json.dumps({"error": f"the request is not JSON: {e}"})
-        if not isinstance(parsed, dict):
-            return json.dumps({"error": "the request must be a JSON object"})
-        cost = len(parsed.get("requests", [])) if parsed.get("op") == "batch" else 1
-        if self._used + cost > self._budget:
-            return json.dumps({"error": f"the request budget of {self._budget} is spent ({self._used} used); write the report now"})
-        self._used += cost
-        try:
-            reply = self._client.raw(parsed)
-        except (OSError, ValueError) as e:
-            return json.dumps({"error": f"server unreachable: {e}"})
-        return json.dumps(reply)
+            lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n")
+            lexer.whitespace = " \t\r"
+            lexer.whitespace_split = True
+            words = list(lexer)
+        except ValueError as e:
+            return f"error: the command does not parse: {e}"
+        part, previous = [], None
+        for w in words + [";"]:
+            if w in (";", "&&", "||", "|", "\n", "&"):
+                if w == "&" or w == "||":
+                    return f"error: {w!r} is not allowed; join oracle calls with ; or && and filter with |"
+                if part:
+                    allowed = {"oracle"} | (FILTERS if previous == "|" else set())
+                    if part[0] not in allowed:
+                        return f"error: only oracle commands (and {', '.join(sorted(FILTERS))} after a pipe) may run; got {part[0]!r}"
+                    previous = w
+                part = []
+            else:
+                part.append(w)
+        env = dict(os.environ, PATH=f"{Path(self._tool).parent}:/usr/bin:/bin")
+        r = subprocess.run(["/bin/bash", "-c", command], cwd=self._workdir, env=env, capture_output=True, text=True)
+        return (r.stdout + r.stderr).strip()
 
 
 # ---------------------------------------------------------------------------------------------------
