@@ -205,6 +205,27 @@ impl DevicePosterior {
     }
 
     /// Writes the posterior means into `program`'s trainable operators (rounded to its storage).
+    /// Trainable operator `op`'s position, and its means and log standard deviations.
+    fn entries(&self, op: usize) -> Result<(usize, &Tensor, &Tensor), String> {
+        let i = self.operators.iter().position(|o| *o == op).ok_or_else(|| error(format!("operator {op} is not trainable")))?;
+        Ok((i, &self.mean[i], &self.log_sd[i]))
+    }
+
+    /// Trainable operator `op`'s weight sample of `key` (the draws [`DevicePosterior::sample_into`]
+    /// writes) into rows `at..` of `out`, a stacked operand such as a decoder's: written in place,
+    /// no copy of the operator ([`Device::reparameterize_rows`]).
+    pub fn sample_rows(&self, op: usize, out: &mut Tensor, at: usize, key: u64) -> Result<(), String> {
+        let (i, mean, log_sd) = self.entries(op)?;
+        self.fitting.reparameterize_rows(out, at, (mean, log_sd), (key, i as u64)).map_err(error)
+    }
+
+    /// Trainable operator `op`'s posterior means into rows `at..` of `out` (in `out`'s storage).
+    pub fn mean_rows(&self, op: usize, out: &mut Tensor, at: usize) -> Result<(), String> {
+        let (_, mean, _) = self.entries(op)?;
+        let value = if out.storage() == Storage::Bf16 { self.fitting.bf16_copy(mean) } else { self.fitting.copy(mean) }.map_err(error)?;
+        self.fitting.set_rows(out, at, &value).map_err(error)
+    }
+
     pub fn mean_into(&self, program: &mut DeviceProgram) -> Result<(), String> {
         for (i, &op) in self.operators.iter().enumerate() {
             // A program holding the operator in bfloat16 (`DeviceProgram::hold_bf16`) gets it so.
