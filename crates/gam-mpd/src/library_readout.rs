@@ -461,16 +461,18 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
     let sites: Vec<Site> = layers.iter().flat_map(|l| [site(native, l.normed_stream), site(native, l.normed)]).collect::<Result<_, _>>()?;
     let outputs: Vec<Vec<Array2<f64>>> = layers.iter().map(|l| output_columns(native, l)).collect::<Result<_, _>>()?;
     let (mut mlps, mut heads) = (Vec::new(), Vec::new());
-    for (n, node) in program.nodes.iter().enumerate() {
-        let Node::Call { rule, .. } = node else { continue };
+    // The library's blocks by their bindings' names (a decoded artifact's rules are unnamed).
+    for binding in &artifact.blocks {
+        let Some((l, head)) = parse(&binding.name) else { continue };
+        let n = binding.write;
+        let Node::Call { rule, .. } = &program.nodes[n] else { return Err(format!("{}: its write is not a call", binding.name)) };
         let rule = &program.rules[*rule];
-        match parse(&rule.name) {
-            Some((l, None)) => mlps.push(mlp_block(program, rule, l, n)?),
-            Some((l, Some(h))) => {
-                let columns = outputs.get(l).and_then(|o| o.get(h)).ok_or_else(|| format!("{}: no such native head", rule.name))?;
+        match head {
+            None => mlps.push(mlp_block(program, rule, l, n)?),
+            Some(h) => {
+                let columns = outputs.get(l).and_then(|o| o.get(h)).ok_or_else(|| format!("{}: no such native head", binding.name))?;
                 heads.push(head_block(program, rule, l, h, n, columns.clone())?);
             }
-            None => {}
         }
     }
     mlps.sort_by_key(|b| b.layer);
