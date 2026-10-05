@@ -2637,6 +2637,43 @@ mod tests {
     }
 
     #[test]
+    fn a_key_value_group_shared_across_layers_is_differentiated_through_both_of_its_uses() {
+        use crate::library_sharing::{Member, share_query_key, share_value};
+        let (native, layers, _, sequences) = tiny_qwen3("library_group_gradient");
+        let start = explanation(&native, &layers).unwrap();
+        // Layer 1's query heads read layer 0's query-key maps, swapped, and its value map is layer
+        // 0's through the output projections' transport.
+        let shared = share_query_key(&start, &[Member { layer: 0, group: 0, queries: vec![0, 1] }, Member { layer: 1, group: 0, queries: vec![1, 0] }]).unwrap();
+        let explanation = share_value(&shared, (1, 0), (0, 0), 0.7).unwrap();
+        let settings = settings();
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings, "tiny", None).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let batch = draws[0].batch(&sequences).unwrap();
+        let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
+        let (theta, _) = posterior.sample(noise_seed(settings.seed, 0, 0));
+        let (_, gradients) = scorer.score(&batch, &experiments, &theta, "gradient", true).unwrap();
+        let at = |name: &str| explanation.trainable.iter().position(|op| explanation.artifact.program.operators[*op].name == name).unwrap();
+        let entries = [
+            (at("library.l0.h0.q"), (1, 3)),
+            (at("library.l0.h1.q"), (2, 5)),
+            (at("library.l0.kv0.k"), (0, 6)),
+            (at("library.l1.h0.q_shared_scale"), (0, 0)),
+            (at("library.l0.kv0.v"), (3, 2)),
+            (at("library.l1.kv0.v_from_l0_kv0.scale"), (0, 0)),
+        ];
+        let mut bits = |theta: &[Array2<f64>]| -> f64 { scorer.score(&batch, &experiments, theta, "gradient", false).unwrap().0.iter().flatten().sum() };
+        for (i, entry) in entries {
+            let h = 1e-5;
+            let (mut up, mut down) = (theta.clone(), theta.clone());
+            up[i][entry] += h;
+            down[i][entry] -= h;
+            let central = (bits(&up) - bits(&down)) / (2.0 * h);
+            assert!((gradients[i][entry] - central).abs() <= 1e-5 * (1.0 + central.abs()), "shared group gradient {} against {central}", gradients[i][entry]);
+        }
+    }
+
+    #[test]
     fn a_shared_key_is_differentiated_through_every_query_head_reading_it() {
         let (native, layers, _, sequences) = tiny_qwen3("library_shared_key_gradient");
         let explanation = explanation(&native, &layers).unwrap();
