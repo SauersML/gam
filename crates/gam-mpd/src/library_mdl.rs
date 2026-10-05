@@ -1137,6 +1137,16 @@ impl Draw {
 
 /// The `count` sequences in order, in batches of `size` bases, each base's source drawn uniformly
 /// among the other sequences, all from `seed`.
+/// One of `batches` batches drawn uniformly from a collection of `tokens` scored tokens: the factor
+/// turning the batch's data term into an unbiased estimate of the collection's (`B`), and the one
+/// turning its gradient and squared Gauss–Newton factor into the collection's per token (`B / N`),
+/// whatever the batch's share of the tokens. An epoch's mean of the estimates is the collection's
+/// data term exactly.
+fn batch_weights(batches: usize, tokens: usize) -> (f64, f64) {
+    let b = batches as f64;
+    (b, b / tokens as f64)
+}
+
 fn draws(count: usize, size: usize, seed: u64) -> Result<Vec<Draw>, String> {
     if count < 2 || size == 0 {
         return Err("a source needs another sequence, and batches must be nonempty".into());
@@ -2146,7 +2156,7 @@ pub fn fit(
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
             let scored = bits.iter().map(Vec::len).sum::<usize>();
-            let scale = tokens as f64 / scored as f64;
+            let (scale, weight) = batch_weights(draws.len(), tokens);
             let data = scale * LN_2 * bits.iter().flatten().sum::<f64>();
             // `Σ_G KL_G` and the active groups' variances at the posterior the sample was drawn from.
             let variances = device_posterior.variances()?;
@@ -2191,7 +2201,7 @@ pub fn fit(
             data_sum += data;
             description_sum += description;
             progress.step += 1;
-            device_posterior.step(&gradients, LN_2 / scored as f64, (&factor.gradient, 1.0 / factor.tokens as f64), &ivon)?;
+            device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, weight), &ivon)?;
             log::info!(
                 "library step {epoch}.{b}: {:.6} bits per scored token, F estimate {:.6e} bits, {:.2} s",
                 bits.iter().flatten().sum::<f64>() / scored as f64,
@@ -3318,6 +3328,37 @@ mod tests {
                 .collect();
             assert!(made.iter().all(|m| *m == made[0]), "batch {b}: the directions and targets");
         }
+    }
+
+    #[test]
+    fn unequal_batches_weigh_every_scored_token_once() {
+        // Six sequences in batches of four and two: the batches' data terms, weighed as the fit
+        // weighs them, average to the collection's, and their per-token weights to the
+        // collection's per token; weighing each batch by its own scored tokens would not.
+        let (native, layers, _, sequences) = tiny("library_batch_weights", "gelu");
+        let explanation = explanation(&native, &layers).unwrap();
+        let settings = Settings { batch_sequences: 4, ..settings() };
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
+        let shrunk: Vec<Array2<f64>> = Posterior::new(&explanation, 1000).unwrap().means().into_iter().map(|m| m * 0.9).collect();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let batches: Vec<(f64, usize)> = draws
+            .iter()
+            .enumerate()
+            .map(|(b, draw)| {
+                let experiments = scorer.experiments(draw, &sequences).unwrap();
+                let (bits, _) = scorer.score(&draw.batch(&sequences).unwrap(), &experiments, &shrunk, &format!("train_{b}"), false).unwrap();
+                (bits.iter().flatten().sum::<f64>() * LN_2, bits.iter().map(Vec::len).sum())
+            })
+            .collect();
+        assert_eq!(batches.len(), 2);
+        let tokens: usize = batches.iter().map(|b| b.1).sum();
+        let collection: f64 = batches.iter().map(|b| b.0).sum();
+        let (scale, weight) = batch_weights(draws.len(), tokens);
+        let mean = |w: &dyn Fn(usize) -> f64| batches.iter().map(|&(d, n)| w(n) * d).sum::<f64>() / batches.len() as f64;
+        assert!(collection > 0.0 && (mean(&|_| scale) - collection).abs() <= 1e-12 * collection);
+        assert!((mean(&|_| weight) - collection / tokens as f64).abs() <= 1e-12 * collection / tokens as f64);
+        let own = mean(&|n| tokens as f64 / n as f64);
+        assert!((own - collection).abs() > 1e-3 * collection, "{own} against {collection}: the batches' shares of the tokens differ");
     }
 
     #[test]
