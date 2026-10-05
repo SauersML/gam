@@ -1410,7 +1410,7 @@ mod tests {
     /// query heads swapped.
     fn swapped_group(name: &str) -> (crate::import::Imported, Explanation) {
         use crate::{library_mdl::explanation, operator_program::{Operator, Provenance, exact_precision}, run_check::{layer_nodes, split_sites}};
-        let imported = library_sharing::tests_support::grouped(name);
+        let imported = crate::test_support::grouped(name);
         let native = split_sites(&imported.program).unwrap();
         let mut start = explanation(&native, &layer_nodes(&native, 2).unwrap()).unwrap();
         let found = library_sharing::key_values(&start).unwrap();
@@ -1444,7 +1444,7 @@ mod tests {
         let (a, b) = (&before.values[start.artifact.program.output], &after.values[hardened.artifact.program.output]);
         let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * scale), "the shared group keeps the outputs");
-        library_sharing::tests_support::same_native_blocks(&start, &hardened);
+        crate::test_support::same_native_blocks(&start, &hardened);
         let groups = library_sharing::key_values(&hardened).unwrap();
         assert!(!groups[&(1, 0)].own_key, "layer 1's query heads read layer 0's maps");
         assert!(hardened.fixed_nats >= (mixture.targets[t].choices as f64).ln() - 1e-12, "the choice is paid for");
@@ -1483,7 +1483,7 @@ mod tests {
     /// The tiny grouped-query explanation whose layer-1 value map is `0.7 T V` of layer 0's.
     fn moved_value(name: &str) -> (crate::import::Imported, Explanation) {
         use crate::{library_mdl::explanation, operator_program::{Operator, Provenance, exact_precision}, run_check::{layer_nodes, split_sites}};
-        let imported = library_sharing::tests_support::grouped(name);
+        let imported = crate::test_support::grouped(name);
         let native = split_sites(&imported.program).unwrap();
         let mut start = explanation(&native, &layer_nodes(&native, 2).unwrap()).unwrap();
         let transport = library_sharing::transports(&start, (1, 0), &[(0, 0)]).unwrap().pop().unwrap();
@@ -1515,7 +1515,7 @@ mod tests {
         let (a, b) = (&before.values[start.artifact.program.output], &after.values[hardened.artifact.program.output]);
         let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * scale), "the shared value map keeps the outputs");
-        library_sharing::tests_support::same_native_blocks(&start, &hardened);
+        crate::test_support::same_native_blocks(&start, &hardened);
         assert!(!library_sharing::key_values(&hardened).unwrap()[&(1, 0)].own_value, "layer 1 reads layer 0's value map");
     }
 
@@ -1588,7 +1588,7 @@ mod tests {
     #[test]
     fn an_up_direction_copying_an_earlier_gate_is_found_and_tied() {
         use crate::{library_mdl::explanation, operator_program::{Operator, Provenance, exact_precision}, run_check::{layer_nodes, split_sites}};
-        let imported = library_sharing::tests_support::gated("library_mixture_gated");
+        let imported = crate::test_support::gated("library_mixture_gated");
         let native = split_sites(&imported.program).unwrap();
         let mut start = explanation(&native, &layer_nodes(&native, 2).unwrap()).unwrap();
         // Function 6 of layer 1 reads up 1.5 times what function 2 of layer 0 reads as its gate.
@@ -1615,7 +1615,7 @@ mod tests {
         let (a, b) = (&before.values[start.artifact.program.output], &after.values[hardened.artifact.program.output]);
         let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * scale), "the tied up direction keeps the outputs");
-        library_sharing::tests_support::same_native_blocks(&start, &hardened);
+        crate::test_support::same_native_blocks(&start, &hardened);
         let own = hardened.groups.iter().position(|g| g.name == "library.l1.mlp.f6.up").unwrap();
         assert!(hardened.removed.contains(&own), "the up direction is stored once");
     }
@@ -1691,7 +1691,7 @@ mod tests {
         let (a, b) = (&before.values[start.artifact.program.output], &after.values[hardened.artifact.program.output]);
         let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-12 * scale), "the exact tie keeps the outputs");
-        library_sharing::tests_support::same_native_blocks(&start, &hardened);
+        crate::test_support::same_native_blocks(&start, &hardened);
         let choices: f64 = [target, head_copy.0, gate_copy.0, output_copy.0].iter().map(|t| (learned.targets[*t].choices as f64).ln()).sum();
         assert!(hardened.fixed_nats >= choices - 1e-9, "every exact choice is paid for");
         // The copied function's blocks are stored once: its own gate and output leave the explanation.
