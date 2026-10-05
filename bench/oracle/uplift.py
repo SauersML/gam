@@ -314,10 +314,13 @@ def analyze(run: Path, read_path: Path):
                 ]
                 E.attach_tests(episode, tests_)
             reader = results[f"{organism}|0|none"]["reader"]
+            # Stored under the episode store's condition names (episodes.documents_for): none, report
+            # (this episode's own rule), ablated:<kind>.
             for condition in ["none", f"report:{arm}", *ablated_keys]:
-                key = f"{reader['backend']}:{reader['model']}:{condition}"
+                name = "report" if condition == f"report:{arm}" else ("ablated:" + condition.split(":")[2] if condition.startswith("ablated:") else condition)
+                key = f"{reader['backend']}:{reader['model']}:{name}"
                 episode["scores"][key] = {
-                    "reader": reader, "documents": condition,
+                    "reader": reader, "documents": name,
                     "per_test": {f"item{i}": {"q": results[f"{organism}|{i}|{condition}"]["q"], "log_score": float(score[condition][i])} for i in range(len(drawn))},
                     "mean_log_score_nats": float(score[condition].mean()),
                 }
