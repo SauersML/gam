@@ -1444,9 +1444,12 @@ impl Mean {
 }
 
 /// The held-out batches of `sequences` and their experiments: a fixed sample from the training
-/// distribution, one clean and one patched experiment per base, drawn from each batch's seed.
+/// distribution, one clean and one patched experiment per base. They are drawn from their own seed,
+/// the SplitMix64 output after the fit's (`gam_linalg::utils::splitmix64_hash`): drawn from the
+/// fit's seed itself, held-out batch `b` repeated training batch `b`'s interventions exactly, so
+/// held-out scores tested unseen bases under seen interventions only.
 fn held_out_experiments(scorer: &Scorer, sequences: &[Vec<u32>], settings: &Settings) -> Result<Vec<(Draw, Vec<Experiment>)>, String> {
-    draws(sequences.len(), settings.batch_sequences, settings.seed)?
+    draws(sequences.len(), settings.batch_sequences, gam_linalg::utils::splitmix64_hash(settings.seed))?
         .into_iter()
         .map(|draw| {
             let experiments = scorer.experiments(&draw, sequences)?;
@@ -3238,6 +3241,34 @@ mod tests {
                 .collect();
             assert!(made.iter().all(|m| *m == made[0]), "batch {b}: the directions and targets");
         }
+    }
+
+    #[test]
+    fn held_out_interventions_are_drawn_independently_of_the_training_batches() {
+        // Training batch b and held-out batch b, one patched experiment per base: their positions
+        // agree at the chance rate 1/12 of two independent uniform positions over 12 tokens, and
+        // whole interventions (hybrid, patch and position) agree as often as those of training
+        // batches b and b + 1, which are independent by construction.
+        let (native, layers, _, sequences) = tiny("library_held_out_seed", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let settings = settings();
+        let scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
+        let many: Vec<Vec<u32>> = sequences.iter().cycle().take(2000).cloned().collect();
+        let patched = |experiments: Vec<Experiment>| -> Vec<Experiment> { experiments.into_iter().filter(|e| e.patch.is_some()).collect() };
+        let training: Vec<Vec<Experiment>> = draws(many.len(), settings.batch_sequences, settings.seed).unwrap().iter().map(|d| patched(scorer.experiments(d, &many).unwrap())).collect();
+        let held: Vec<Vec<Experiment>> = held_out_experiments(&scorer, &many, &settings).unwrap().into_iter().map(|(_, e)| patched(e)).collect();
+        let pairs = |a: &[Vec<Experiment>], b: &[Vec<Experiment>]| -> Vec<(Experiment, Experiment)> {
+            a.iter().zip(b).flat_map(|(x, y)| x.iter().cloned().zip(y.iter().cloned())).collect()
+        };
+        let aligned = pairs(&training, &held);
+        let shifted = pairs(&training, &training[1..]);
+        let n = aligned.len() as f64;
+        let positions = aligned.iter().filter(|(a, b)| a.position == b.position).count() as f64;
+        let (mean, sd) = (n / 12.0, (n / 12.0 * 11.0 / 12.0).sqrt());
+        assert!((positions - mean).abs() <= 5.0 * sd, "{positions} of {n} positions agree against {mean} ± {sd}");
+        let same = |pairs: &[(Experiment, Experiment)]| pairs.iter().filter(|(a, b)| a.explained == b.explained && a.patch == b.patch && a.position == b.position).count() as f64;
+        let (a, s) = (same(&aligned), same(&shifted));
+        assert!((a - s).abs() <= 5.0 * (a + s + 1.0).sqrt(), "{a} held-out interventions repeat training ones, against {s} between training batches");
     }
 
     #[test]
