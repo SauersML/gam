@@ -104,6 +104,60 @@ pub struct LocalFit {
     pub output_nodes: Vec<usize>,
 }
 impl LocalFit {
+    /// Rebind after the caller has verified a codec roundtrip. This does not encode
+    /// again or assert unrounded numerical equality; reference identities and mapped
+    /// owner structures are checked here, and stale transfer checks remain strict.
+    pub(crate) fn rebind_to_saved_candidate(
+        &mut self,
+        before: &Artifact,
+        after: &Artifact,
+    ) -> Result<(), String> {
+        if before.program.nodes != after.program.nodes
+            || before.program.output != after.program.output
+            || before.program.operators.len() != after.program.operators.len()
+            || before.places != after.places
+            || before.program.declarations != after.program.declarations
+            || before.program.rules.len() != after.program.rules.len()
+            || before
+                .program
+                .rules
+                .iter()
+                .zip(&after.program.rules)
+                .any(|(a, b)| a.nodes != b.nodes || a.inputs != b.inputs || a.output != b.output)
+        {
+            return Err(
+                "local owner rebinding requires an identity-preserving canonical roundtrip".into(),
+            );
+        }
+        for &(local, grafted) in &self.owner_mapping {
+            let original = self
+                .program
+                .operators
+                .get(local)
+                .ok_or("local owner out of range")?;
+            let old = before
+                .program
+                .operators
+                .get(grafted)
+                .ok_or("grafted owner out of range")?;
+            let new = after
+                .program
+                .operators
+                .get(grafted)
+                .ok_or("canonical owner out of range")?;
+            if original != old
+                || old.rows != new.rows
+                || old.cols != new.cols
+                || !matches!((&old.body,&new.body),(OperatorBody::Dense {present:a,values:av,..},OperatorBody::Dense {present:b,values:bv,..}) if a==b && av.dim()==bv.dim())
+            {
+                return Err("canonical local owner mapping is incompatible or stale".into());
+            }
+        }
+        for &(local, grafted) in &self.owner_mapping {
+            self.program.operators[local] = Arc::clone(&after.program.operators[grafted]);
+        }
+        Ok(())
+    }
     /// Transfer coefficients only, after checking every destination before mutation.
     pub fn transfer(
         &self,
@@ -126,12 +180,13 @@ impl LocalFit {
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
-        if self
-            .owner_mapping
-            .iter()
-            .map(|(id, _)| *id)
-            .collect::<BTreeSet<_>>()
-            != owners
+        if self.owner_mapping.len() != owners.len()
+            || self
+                .owner_mapping
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<BTreeSet<_>>()
+                != owners
             || self
                 .owner_mapping
                 .iter()
@@ -183,34 +238,43 @@ fn standalone_local(
     let mut pool = operators.iter().cloned().map(Arc::new).collect::<Vec<_>>();
     let mut mapping = vec![usize::MAX; nodes.len()];
     let operator_ids = (0..operators.len()).collect::<Vec<_>>();
+    // Preserve every declared argument, even when this proposal does not read it.
+    // These are genuine supplied inputs, not dummy computational dependencies.
+    let mut argument_nodes = Vec::with_capacity(inputs.len());
+    for (index, ty) in inputs.iter().enumerate() {
+        let native = Interface::native(ty.width()).map_err(|e| e.to_string())?;
+        output.push(Node::Raw { slot: index });
+        if native != *ty {
+            let op = pool.len();
+            pool.push(Arc::new(
+                Operator::dense(
+                    "fixed local input grouping",
+                    ty.clone(),
+                    native,
+                    Array2::eye(ty.width()),
+                    exact_precision([0., 1.]).map_err(|e| e.to_string())?,
+                    Default::default(),
+                )
+                .map_err(|e| e.to_string())?,
+            ));
+            output.push(Node::Affine {
+                terms: vec![(output.len() - 1, op)],
+                bias: None,
+            });
+        }
+        argument_nodes.push(output.len() - 1);
+    }
     for (id, node) in nodes.iter().enumerate() {
         if let Node::Param { index } = node {
-            let native = Interface::native(inputs[*index].width()).map_err(|e| e.to_string())?;
-            output.push(Node::Raw { slot: *index });
-            if native != inputs[*index] {
-                let op = pool.len();
-                pool.push(Arc::new(
-                    Operator::dense(
-                        "fixed local input grouping",
-                        inputs[*index].clone(),
-                        native,
-                        Array2::eye(inputs[*index].width()),
-                        exact_precision([0., 1.]).map_err(|e| e.to_string())?,
-                        Default::default(),
-                    )
-                    .map_err(|e| e.to_string())?,
-                ));
-                output.push(Node::Affine {
-                    terms: vec![(output.len() - 1, op)],
-                    bias: None,
-                });
-            }
+            mapping[id] = *argument_nodes
+                .get(*index)
+                .ok_or("local parameter outside declared arguments")?;
         } else {
             let mut copied = node.clone();
             remap_node(&mut copied, &mapping, &operator_ids, &[], &[]);
             output.push(copied);
+            mapping[id] = output.len() - 1;
         }
-        mapping[id] = output.len() - 1;
     }
     let output_nodes = exits.iter().map(|id| mapping[*id]).collect::<Vec<_>>();
     let output_id = output.len();
@@ -1868,6 +1932,50 @@ mod tests {
         }
     }
     #[test]
+    fn local_unused_arguments_remain_real_raw_inputs_through_fitter_inlining() {
+        let scalar = Interface::native(1).expect("type");
+        let (program, _) = standalone_local(
+            &[scalar.clone(), scalar],
+            &[
+                Node::Param { index: 1 },
+                Node::Pointwise {
+                    input: 0,
+                    laws: vec![Law::Relu],
+                },
+            ],
+            &[],
+            &[1],
+        )
+        .expect("unused first boundary");
+        let (flat, _) = crate::artifact_device::mapped_inlined(&program).expect("fitter expansion");
+        for slot in 0..2 {
+            assert_eq!(
+                flat.nodes
+                    .iter()
+                    .filter(|node| matches!(node,Node::Raw {slot:s} if *s==slot))
+                    .count(),
+                1
+            );
+        }
+        let inputs = vec![array![[99.], [98.]], array![[1.], [2.]]];
+        let measured = crate::resident_rule_fit::measure_grouped(
+            &gam_gpu::tensor::Device::host(),
+            &program,
+            &inputs,
+            &inputs[1],
+            &[crate::resident_rule_fit::OutputGroup {
+                label: "native exit".into(),
+                start: 0,
+                end: 1,
+            }],
+            1 << 24,
+            2,
+        )
+        .expect("production local fitter accepts unused input");
+        assert_eq!(measured.maximum, 0.);
+    }
+
+    #[test]
     fn local_training_wrapper_preserves_grouped_boundary_laws() {
         let grouped = Interface::uniform(2, 1, crate::operator_program::LabelKind::Native, 3)
             .expect("groups");
@@ -1934,7 +2042,18 @@ mod tests {
             .iter()
             .find(|r| r.native_reads == vec![0] && r.native_writes == parent.output_nodes)
             .expect("enumerated complete nonlinear window");
-        let applied = apply(&native, region, &equations, &[0], &s).expect("graft");
+        let mut applied = apply(&native, region, &equations, &[0], &s).expect("graft");
+        let before = applied.artifact.clone();
+        let canonical = Artifact::from_bytes(
+            &before.to_bytes().expect("canonical encode"),
+            &before.program.declarations,
+        )
+        .expect("canonical decode");
+        applied
+            .local_fit
+            .rebind_to_saved_candidate(&before, &canonical)
+            .expect("verified canonical owner rebind");
+        applied.artifact = canonical;
         let handoff = &applied.local_fit;
         assert_eq!(handoff.input_native_places, vec![0]);
         assert_eq!(handoff.output_native_places, parent.output_nodes);

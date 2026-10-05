@@ -1720,7 +1720,11 @@ where
                 }
                 .and_then(|a| {
                     validate_artifact(&a, native, Some(&parent.artifact), settings)?;
-                    canonical(&a).map(|(a, _)| a)
+                    let (decoded, _) = canonical(&a)?;
+                    if let Some(local) = &mut local_fit {
+                        local.rebind_to_saved_candidate(&a, &decoded)?;
+                    }
+                    Ok(decoded)
                 });
                 let mut attempt = Attempt {
                     attempt_id,

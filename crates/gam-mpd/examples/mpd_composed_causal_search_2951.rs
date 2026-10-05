@@ -1,6 +1,8 @@
 //! Fit structural proposals in the autonomous native LM on clean AND intervened logits.
-//! EXPORT SETTINGS.json FRESH_OUT host|cuda [HELDOUT_EXPORT] [--profile]. Training proposal search, not acceptance.
-//! --profile synchronizes the device around every named stage and writes FRESH_OUT/PROFILE.json.
+//! EXPORT SETTINGS.json FRESH_OUT host|cuda [HELDOUT_EXPORT] [--profile] [--fits-per-gpu=N]. Training
+//! proposal search, not acceptance. --profile synchronizes the device around every named stage and
+//! writes FRESH_OUT/PROFILE.json. --fits-per-gpu=N fits N candidates at once on every GPU (default:
+//! as many as the declared per-fit numeric budget fits in device memory); results are unchanged.
 use gam_gpu::{tensor::Device, GpuPolicy};
 use gam_mpd::{
     acceptance::{structural_cost, CostCache},
@@ -2716,7 +2718,7 @@ fn capture_structural_local_targets(
     let provenance = json!({"episodes":panels.iter().map(|(label,source,p)|
         json!({"label":label,"state_source":source,"capture":p.report})).collect::<Vec<_>>(),
         "retained_panel_bytes":retained,"refreshes":1,
-        "scope":"TRAIN only: native states plus candidate-reached states with the native operation evaluated at those same inputs. Capture precedes fitting once per proposal. No heldout states and no inference-time native oracle. Host prefix capture avoids the output vocabulary."});
+        "scope":"TRAIN only: native states plus candidate-reached states with the native operation evaluated at those same inputs. Capture precedes fitting once per proposal. No heldout states and no inference-time native oracle. Capture stops at the requested boundaries and outputs; the local fitting loop does not execute the full model."});
     Ok((JointLocalTargets { inputs, targets, groups,
         state_source: "TRAIN native and candidate-reached states, native labels evaluated on the same incoming states; one capture per proposal" }, provenance))
 }
@@ -2842,6 +2844,16 @@ fn run() -> Result<(), String> {
     let mut args: Vec<_> = std::env::args().skip(1).collect();
     let profile = args.iter().any(|a| a == "--profile");
     args.retain(|a| a != "--profile");
+    let fits_per_gpu = match args.iter().position(|a| a.starts_with("--fits-per-gpu=")) {
+        Some(i) => Some(
+            args.remove(i)["--fits-per-gpu=".len()..]
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or("--fits-per-gpu=N needs a positive N")?,
+        ),
+        None => None,
+    };
     gam_gpu::trace::time_stages(profile);
     if args.len() != 4 && args.len() != 5 {
         return Err("EXPORT SETTINGS.json FRESH_OUT host|cuda [HELDOUT_EXPORT] [--profile]".into());
@@ -3248,7 +3260,7 @@ fn run() -> Result<(), String> {
     } else {
         None
     };
-    let mut journal =
+    let journal =
         std::fs::File::create(out.join("journal.jsonl")).map_err(|e| e.to_string())?;
     let mut rows = vec![
         json!({"id":"native","c32":native_cost,"training_kl":native_measure.objective,"status":"training_measured","artifact_sha256":sha256(&out.join("native.artifact"))?,"control_map_sha256":sha256(&out.join("NATIVE_CONTROL_MAP.json"))?}),
@@ -3281,16 +3293,20 @@ fn run() -> Result<(), String> {
     } else {
         None
     };
-    let mut joint_local_targets = None;
+    let joint_local_targets = std::sync::Mutex::new(None::<Arc<JointLocalTargets>>);
     let candidate_ids: Vec<_> = joint_inventory.as_ref().map_or_else(
         || settings.expression_ids.clone(),
         |(_, _, i)| (0..i.proposals.len()).collect(),
     );
-    for &id in &candidate_ids {
-        for shared in [true, false] {
-            if !shared && (use_specs.len() == 1 || joint_inventory.is_some()) {
-                continue;
-            }
+    // Candidates fit concurrently, each on its own device (own stream and cuBLAS handle); every
+    // candidate's computation and files are its own, and rows and journal keep this order.
+    let jobs: Vec<(usize, bool)> = candidate_ids
+        .iter()
+        .flat_map(|&id| [(id, true), (id, false)])
+        .filter(|(_, shared)| *shared || !(use_specs.len() == 1 || joint_inventory.is_some()))
+        .collect();
+    let costs_shared = std::sync::Mutex::new(std::mem::take(&mut costs));
+    let candidate = |d: &Device, id: usize, shared: bool| -> Result<Value, String> {
             let arm = if joint_inventory.is_some() {
                 "learned"
             } else if shared {
@@ -3337,16 +3353,19 @@ fn run() -> Result<(), String> {
                     save(&root.join("PARENT_INITIALIZATION.json"),
                         &serde_json::to_value(&joint.initialization).map_err(|e| e.to_string())?)?;
                     if joint.initialization.random_elements != 0 || settings.joint_local_fit.is_some() {
-                        if joint_local_targets.is_none() {
+                        let mut shared_targets = joint_local_targets.lock().map_err(|_| "poisoned local targets")?;
+                        if shared_targets.is_none() {
                             let parent = down.as_ref().ok_or("joint parent absent")?;
                             let layer = settings.down_edit_family.as_ref().ok_or("joint layer absent")?.layer;
                             let outputs = std::iter::once(parent.clean_output)
                                 .chain(parent.response_nodes.iter().copied()).collect::<Vec<_>>();
                             let clean_inputs = parent.inputs(family, &vec![0.; direction_count])?;
-                            joint_local_targets = Some(capture_joint_local_targets(&d, &parent.program,
-                                layers[layer].normed, &outputs, &clean_inputs, settings.fit.numeric_bytes)?);
+                            *shared_targets = Some(Arc::new(capture_joint_local_targets(&d, &parent.program,
+                                layers[layer].normed, &outputs, &clean_inputs, settings.fit.numeric_bytes)?));
                         }
-                        let targets = joint_local_targets.as_ref().ok_or("local target capture absent")?;
+                        let targets = shared_targets.clone().ok_or("local target capture absent")?;
+                        drop(shared_targets);
+                        let targets = &*targets;
                         let mut zero_train_error = false;
                         if let Some(local) = &settings.joint_local_fit {
                             let (program, report) = prefit_joint_nonlinear(&d, &joint.program,
@@ -3685,7 +3704,7 @@ fn run() -> Result<(), String> {
                     )?;
                 }
                 let cost_started = Instant::now();
-                let c32 = structural_cost(&saved, &mut costs)?.total();
+                let c32 = structural_cost(&saved, &mut *costs_shared.lock().map_err(|_| "poisoned cost cache")?)?.total();
                 let structural_cost_seconds = cost_started.elapsed().as_secs_f64();
                 Ok(
                     json!({"id":name,"expression_id":id,"arm":arm,"c32":c32,"training_kl":measured.objective,"maximum_episode_response_error":response_error,
@@ -3697,12 +3716,52 @@ fn run() -> Result<(), String> {
                 Err(error) => json!({"id":name,"status":"unresolved","error":error}),
             };
             save(&root.join("STATUS.json"), &result)?;
-            serde_json::to_writer(&mut journal, &result).map_err(|e| e.to_string())?;
-            journal.write_all(b"\n").map_err(|e| e.to_string())?;
-            journal.flush().map_err(|e| e.to_string())?;
-            eprintln!("{result}");
-            rows.push(result);
-        }
+            Ok(result)
+    };
+    // Queued labels must be complete before other streams read them.
+    d.synchronize().map_err(|e| e.to_string())?;
+    let workers = candidate_devices(&d, &args[3], fits_per_gpu, settings.fit.numeric_bytes, native_teacher_cache.is_some(), jobs.len())?;
+    let concurrent_fits = workers.len();
+    let finished: Vec<std::sync::Mutex<Option<Value>>> = jobs.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    let ordered = std::sync::Mutex::new((journal, 0usize));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = workers
+            .iter()
+            .map(|device| {
+                scope.spawn(|| -> Result<(), String> {
+                    loop {
+                        let job = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let Some(&(id, shared)) = jobs.get(job) else { return Ok(()) };
+                        if failed.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Ok(());
+                        }
+                        let result = candidate(device, id, shared).inspect_err(|_| failed.store(true, std::sync::atomic::Ordering::SeqCst))?;
+                        *finished[job].lock().map_err(|_| "poisoned candidate result")? = Some(result);
+                        // Journal the finished prefix in candidate order.
+                        let mut ordered = ordered.lock().map_err(|_| "poisoned journal")?;
+                        let (journal, written) = &mut *ordered;
+                        while let Some(result) = finished.get(*written).and_then(|f| f.lock().ok()?.clone()) {
+                            serde_json::to_writer(&mut *journal, &result).map_err(|e| e.to_string())?;
+                            journal.write_all(b"\n").map_err(|e| e.to_string())?;
+                            journal.flush().map_err(|e| e.to_string())?;
+                            eprintln!("{result}");
+                            *written += 1;
+                        }
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().map_err(|_| "candidate worker panicked".to_string())?)
+            .collect::<Result<Vec<()>, String>>()
+    })?;
+    let mut costs = costs_shared.into_inner().map_err(|_| "poisoned cost cache")?;
+    let (mut journal, _) = ordered.into_inner().map_err(|_| "poisoned journal")?;
+    for result in finished {
+        rows.push(result.into_inner().map_err(|_| "poisoned candidate result")?.ok_or("candidate result missing")?);
     }
     let frontier: Vec<_> = rows
         .iter()
@@ -3973,8 +4032,38 @@ fn run() -> Result<(), String> {
     }
     save(
         &out.join("REPORT.json"),
-        &json!({"candidates":rows,"stage_seconds":stage_seconds,"native_codec_usage":native_codec.as_ref().map(|c|c.usage()),"native_codec_stats":native_codec.as_ref().map(|c|c.stats()),"native_initialization":settings.native_initialization,"sharing_selection":sharing,"require_interior_learned":settings.require_interior_learned,"frozen_shared_body_transfer":frozen_body.is_some(),"frozen_evaluation_ids":frozen,"heldout":heldout_rows,"heldout_provenance":heldout_provenance,"seconds":started.elapsed().as_secs_f64(),"scope":"finite training search only; unresolved failures remain unresolved; not native mechanism recovery or VPD comparison"}),
+        &json!({"candidates":rows,"stage_seconds":stage_seconds,"concurrent_candidate_fits":concurrent_fits,"native_codec_usage":native_codec.as_ref().map(|c|c.usage()),"native_codec_stats":native_codec.as_ref().map(|c|c.stats()),"native_initialization":settings.native_initialization,"sharing_selection":sharing,"require_interior_learned":settings.require_interior_learned,"frozen_shared_body_transfer":frozen_body.is_some(),"frozen_evaluation_ids":frozen,"heldout":heldout_rows,"heldout_provenance":heldout_provenance,"seconds":started.elapsed().as_secs_f64(),"scope":"finite training search only; unresolved failures remain unresolved; not native mechanism recovery or VPD comparison"}),
     )
+}
+/// One device per concurrent candidate fit, each its own stream and cuBLAS handle: `per_gpu` on
+/// every GPU (by default as many as the per-fit numeric budget fits in the main GPU's memory),
+/// or on the main device's GPU only when the shared compact labels live there. The host fits one.
+fn candidate_devices(
+    main: &Device,
+    backend: &str,
+    per_gpu: Option<usize>,
+    numeric_bytes: usize,
+    labels_on_main: bool,
+    jobs: usize,
+) -> Result<Vec<Device>, String> {
+    if backend != "cuda" || jobs <= 1 {
+        return Ok(vec![main.clone()]);
+    }
+    let per_gpu = match per_gpu {
+        Some(n) => n,
+        None => {
+            let (_, total) = main.memory().map_err(|e| e.to_string())?.ok_or("CUDA memory unknown")?;
+            (total / numeric_bytes.max(1)).max(1)
+        }
+    };
+    let mut devices = Vec::new();
+    for _ in 0..per_gpu {
+        let gpus = Device::accelerators(GpuPolicy::Required).map_err(|e| e.to_string())?;
+        let used = if labels_on_main { 1 } else { gpus.len() };
+        devices.extend(gpus.into_iter().take(used));
+    }
+    devices.truncate(jobs);
+    Ok(devices)
 }
 fn main() -> Result<(), String> {
     let result = run();
@@ -3983,7 +4072,7 @@ fn main() -> Result<(), String> {
         for t in &totals {
             eprintln!("profile {:<24} {:>8} x {:>12.6} s = {:>10.3} s", t.name, t.count, t.seconds / t.count.max(1) as f64, t.seconds);
         }
-        if let Some(out) = std::env::args().filter(|a| a != "--profile").nth(3) {
+        if let Some(out) = std::env::args().filter(|a| a != "--profile" && !a.starts_with("--fits-per-gpu=")).nth(3) {
             save(&Path::new(&out).join("PROFILE.json"), &json!({"inclusive_stage_seconds":totals,"scope":"--profile: each named stage synchronizes its device at both ends, so device work is charged to the stage that queued it; nested stages are included in their parents; host/device overlap is removed"}))?;
         }
     }
@@ -5775,6 +5864,39 @@ mod tests {
             fit_replay,
             "reuse must execute resident fitter, not only structural metadata"
         );
+        // Exercise automatic learned-region enumeration through the actual local
+        // capture, fit, transfer, composed fit and saved-artifact callback.
+        let mut local_structural = StructuralSettings {
+            settings: structural.settings.clone(), constraints: structural.constraints.clone(),
+            max_expression_evaluations: 0, native_response_weight: None,
+            local_fit: Some(JointLocalFit {
+                optimizer:gam_mpd::resident_rule_fit::Settings {iterations:2,forward_rows:4,
+                    learning_rate:0.001,beta1:0.9,beta2:0.999,epsilon:1e-8,numeric_bytes:1 << 26,
+                    arithmetic:Default::default(),backtracking:None},
+                batch:gam_mpd::resident_rule_fit::BatchSchedule {ordinary_rows:4,hard_rows:0,
+                    scan_every:2,temperature:0.1,objective:Default::default()},
+            }),
+        };
+        local_structural.settings.max_depth=1;
+        local_structural.settings.max_callback_calls=48;
+        local_structural.settings.max_move_attempts=256;
+        local_structural.settings.learned_dag_search=Some(program_structure_search::LearnedDAGSettings {
+            region_limits:gam_mpd::program_joint_regions::Limits {max_internal_nodes:3,max_inputs:2,
+                max_exits:2,max_regions:24,max_states:128},
+            grammar:program_learned_dag::Settings {latent_widths:vec![1],unary:vec![composed_rule_search::Unary::GeluTanh],
+                binary:vec![],affine_bias:false,require_shared:false,max_operations:2,max_affine_parameters:3,
+                max_parameter_elements:32,max_expression_states:64,max_tuple_checks:128,max_tuples:8,
+                max_body_nodes:8,seed:17},max_enumerations_per_parent:12,max_move_attempts:128,max_callback_calls:32,
+        });
+        let local_out=out.join("local-stage");
+        std::fs::create_dir(&local_out).unwrap();
+        structural_run(&d,&settings,&local_structural,&native,&native,&[],&family,&targets,&local_out,
+            None,&mut CostCache::default(),None).expect("learned local-to-composed callback");
+        let completed=std::fs::read_dir(&local_out).unwrap().filter_map(Result::ok)
+            .map(|e|e.path()).filter(|p|p.join("LOCAL_SUPERVISION.json").exists()
+                && p.join("LOCAL_LINEAR_PREFIT.json").exists() && p.join("FIT.json").exists()
+                && p.join("program.artifact").exists()).count();
+        assert!(completed > 0,"automatic learned proposals must execute the full local-to-composed path: {}",local_out.display());
         // Reuse the real structural-driver fixture with two upstream coordinates,
         // signed edits and an independent retained gain in the same episodes.
         let mut edit_settings = settings;
