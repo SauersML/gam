@@ -4,10 +4,10 @@ From compare's held-out cancellation run (vpd_battery.py OUT.json cancellation 1
 per token in nats, where E is VPD's published decomposition (goodfire/spd/runs/s-55ea3f9b) with, per
 token, every subcomponent whose causal importance is 0 removed (VPD's own CI > 0 cutoff, the one
 behind its count of 205 active per token) in the named layers, and the model's own weights elsewhere.
-The last bar of each panel removes from layers l and 3, but holds what is removed from layer 3 at
-its value on the model's own activations, so layer 3's removed subcomponents no longer respond to
-the change that removal at layer l makes. That bar rising above the others shows the smaller error
-of the third bar comes from those subcomponents' response.
+The last bar of each panel removes from layers l and 3, but subtracts from layer 3's output only
+what the removal subtracts in a run with layer l intact, so layer 3's removed subcomponents no
+longer respond to the change that removal at layer l makes. That bar rising above the others shows
+the smaller error of the third bar comes from those subcomponents' response.
 
     python bench/figures_2951/vpd_cancellation_fig.py CANCELLATION.json OUT.png
 """
@@ -38,7 +38,7 @@ for ax, l in zip(axes, [0, 1, 2]):
     bars = [(f"layer {l}\nonly", kl(l), BLUE, None),
             ("layer 3\nonly", kl(3), GRAY, None),
             (f"layers {l}\nand 3", kl(f"{l}3"), ORANGE, None),
-            (f"layers {l} and 3,\nlayer 3's removal\ncomputed from\nthe model's own\nactivations",
+            (f"layers {l} and 3,\nbut layer 3 loses\nonly what it loses\nwhen layer {l}\nis intact",
              kl(f"{l}3_no_interaction"), ORANGE, "//")]
     for i, (name, value, color, hatch) in enumerate(bars):
         ax.bar(i, value, 0.72, color=color, edgecolor=SURFACE, linewidth=2, hatch=hatch)
