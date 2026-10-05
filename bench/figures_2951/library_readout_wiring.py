@@ -2,12 +2,16 @@
 
 python library_readout_wiring.py READOUT.json OUT.png EDGES
 
-Columns are the reads in depth order (layer l's heads, then its MLP functions). An MLP function
-is labelled with the token it fires on most often among its top held-out contexts and its most
-promoted token; a head with the query-key offset range holding most of its attention and its
-largest OV entry. Each function shows its EDGES strongest inputs from the other drawn functions;
-an arrow's width is the wiring weight (RMS direct contribution of the writer to the reader's
-input) relative to the largest drawn.
+The drawn functions are the read-out's core: the largest RelP importance (mean |attribution| of
+the model's predicted-token logit over held-out tokens), functions active on every token apart.
+Columns are the reads in depth order (layer l's heads, then its MLP functions); a node's area is
+its importance. An MLP function is labelled with the token it fires on most often among its top
+held-out contexts; a head with the diagnostic holding most of its attention (previous token,
+induction, duplicate token), else its median query-key offset, and "copies" when most source
+tokens' largest OV output is the token itself. The second line is the predicted token a majority
+of the function's largest attributions support, else "no consistent output token". Each function
+shows its EDGES strongest inputs from the other drawn functions; an arrow's width is the wiring
+weight (RMS direct contribution of the writer to the reader's input) relative to the largest drawn.
 """
 import json
 import sys
@@ -24,18 +28,28 @@ def shown(text):
 
 
 def labels(f):
+    output = f"supports {shown(f['supports_token_text'])}" if f.get("supports_token_text") is not None else "no consistent output token"
     if f["kind"] == "head":
         a = f["attention"]
-        b = max(range(len(a["offset_mass"])), key=lambda i: a["offset_mass"][i])
-        lo, hi = a["offsets"][b]
-        span = f"{lo}" if lo == hi else f"{lo}–{hi}"
-        top = a["ov"][0] if a["ov"] else None
-        write = f"{shown(top['source_text'])}→{shown(top['output_text'])}" if top else ""
-        return f"looks {span} back ({a['offset_mass'][b]:.0%})", f"OV {write}"
+        scores = {"previous-token": a["previous"], "induction": a["induction"], "duplicate-token": a["duplicate"]}
+        name, score = max(scores.items(), key=lambda kv: kv[1])
+        if score > 0.5:
+            what = f"{name} head"
+        else:
+            total, running, median = sum(a["offset_mass"]), 0.0, a["offsets"][-1]
+            for (lo, hi), m in zip(a["offsets"], a["offset_mass"]):
+                running += m
+                if running >= total / 2:
+                    median = (lo, hi)
+                    break
+            lo, hi = median
+            what = f"median offset {lo}" if lo == hi else f"median offset {lo}–{hi}"
+        if a["self_top1"] > 0.5:
+            what += ", copies"
+        return what, output
     tokens = [c["token"] for c in f["contexts"]]
     fires = max(tokens, key=tokens.count) if tokens else ""
-    write = shown(f["promoted"][0]["text"]) if f["promoted"] else ""
-    return f"fires on {shown(fires)}", f"writes {write}"
+    return f"fires on {shown(fires)}", output
 
 
 def main():
@@ -75,12 +89,12 @@ def main():
                 shrinkB=10,
             )
         )
-    usage = max(functions[i]["usage"] for i in core)
+    usage = max(functions[i]["importance"] for i in core)
     for i in core:
         f = functions[i]
         x, y = position[i]
         color = "#c0392b" if f["kind"] == "head" else "#2c3e50"
-        ax.scatter([x], [y], s=120 + 600 * f["usage"] / usage, color=color, zorder=3)
+        ax.scatter([x], [y], s=120 + 600 * f["importance"] / usage, color=color, zorder=3)
         read, write = labels(f)
         ax.text(x + 0.22, y + 0.18, f["name"], fontsize=15, fontweight="bold", va="bottom", zorder=4)
         ax.text(x + 0.22, y + 0.12, f"{read}\n{write}", fontsize=13, va="top", zorder=4)

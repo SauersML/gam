@@ -55,6 +55,7 @@ use crate::{
 };
 use gam_gpu::tensor::{Arithmetic, Device, Op, Storage, Tensor};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -86,7 +87,7 @@ pub struct Settings {
     pub contexts: usize,
     pub tokens: usize,
     pub edges: usize,
-    /// The most-used heads and the most-used MLP functions, this many of each, whose complete
+    /// The functions of largest RelP importance (background functions apart) whose complete
     /// wiring among themselves is reported.
     pub core: usize,
 }
@@ -128,6 +129,12 @@ pub struct Attention {
     pub sources: Vec<TokenScore>,
     pub ov: Vec<Entry>,
     pub self_top1: f64,
+    /// Mean attention to the previous token on held-out text; on sequences of random held-out
+    /// tokens repeated once, the mean attention from the second copy to the token after the
+    /// first occurrence (induction) and to the first occurrence itself (duplicate token).
+    pub previous: f64,
+    pub induction: f64,
+    pub duplicate: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -151,6 +158,18 @@ pub struct Function {
     pub reads: Vec<TokenScore>,
     pub inputs: Vec<Edge>,
     pub attention: Option<Attention>,
+    /// Mean over held-out tokens of `|A_i(t)|` and of `A_i(t)`, `A_i(t)` the function's RelP
+    /// attribution of the model's predicted-token logit (module note).
+    pub importance: f64,
+    pub attribution: f64,
+    /// The held-out tokens with the largest positive and negative attributions, and the predicted
+    /// token a majority of each set shares (none when no token holds a majority).
+    pub supports: Vec<Context>,
+    pub opposes: Vec<Context>,
+    pub supports_token: Option<u32>,
+    pub opposes_token: Option<u32>,
+    /// Active on every held-out token.
+    pub background: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -158,10 +177,17 @@ pub struct Readout {
     pub held_out_tokens: usize,
     pub functions: Vec<Function>,
     pub removed: Vec<String>,
-    /// Indices into `functions` of the most-used heads, then of the most-used MLP functions, and `wiring[i][j]` the weight from
+    /// Indices into `functions` of the most important functions, descending, and `wiring[i][j]` the weight from
     /// core function `j` to core function `i` (zero when `j` does not precede `i`'s read).
     pub core: Vec<usize>,
     pub wiring: Vec<Vec<f64>>,
+    /// Per held-out token, the model's predicted token; the mean centred logit `m` of it, the
+    /// mean sum of the functions' attributions, and the mean participation number
+    /// `(Σ_i |A_i|)² / Σ_i A_i²` (the effective number of functions the prediction rests on).
+    pub predicted: Vec<u32>,
+    pub mean_logit: f64,
+    pub mean_attributed: f64,
+    pub participation: f64,
 }
 
 // ------------------------------------------------------------------------------ the explanation
@@ -189,6 +215,8 @@ struct MlpBlock {
     gate: Array2<f64>,
     bias: Array1<f64>,
     out: Array2<f64>,
+    /// A gated MLP's up map: its rule node and matrix.
+    up: Option<(usize, Array2<f64>)>,
 }
 
 struct HeadBlock {
@@ -214,9 +242,13 @@ fn operator_of(program: &OperatorProgram, rule: &Rule, node: usize) -> Result<(A
 fn mlp_block(program: &OperatorProgram, rule: &Rule, layer: usize, call: usize) -> Result<MlpBlock, String> {
     let Node::Affine { terms, bias: None } = &rule.nodes[rule.output] else { return Err(format!("{}: the output is not one map", rule.name)) };
     let [(activation, out)] = terms[..] else { return Err(format!("{}: the output reads more than the activations", rule.name)) };
-    let gate_active = match &rule.nodes[activation] {
-        Node::Pointwise { .. } => activation,
-        Node::Hadamard { left, right } => [*left, *right].into_iter().find(|n| matches!(rule.nodes[*n], Node::Pointwise { .. })).ok_or("a gated MLP without a law")?,
+    let (gate_active, up) = match &rule.nodes[activation] {
+        Node::Pointwise { .. } => (activation, None),
+        Node::Hadamard { left, right } => {
+            let law = [*left, *right].into_iter().find(|n| matches!(rule.nodes[*n], Node::Pointwise { .. })).ok_or("a gated MLP without a law")?;
+            let up = if law == *left { *right } else { *left };
+            (law, Some((up, operator_of(program, rule, up)?.0)))
+        }
         other => return Err(format!("{}: activations are {other:?}", rule.name)),
     };
     let Node::Pointwise { input: gate_pre, .. } = rule.nodes[gate_active] else { return Err("no gate".into()) };
@@ -225,7 +257,7 @@ fn mlp_block(program: &OperatorProgram, rule: &Rule, layer: usize, call: usize) 
         Some(op) => program.operators[op].matrix().column(0).to_owned(),
         None => Array1::zeros(gate.nrows()),
     };
-    Ok(MlpBlock { layer, call, activation, gate_pre, gate, bias, out: program.operators[out].matrix() })
+    Ok(MlpBlock { layer, call, activation, gate_pre, gate, bias, out: program.operators[out].matrix(), up })
 }
 
 fn head_block(program: &OperatorProgram, rule: &Rule, layer: usize, head: usize, call: usize, output: Array2<f64>) -> Result<HeadBlock, String> {
@@ -284,6 +316,28 @@ struct MlpStat {
     /// Per site from the writer's first visible one, `Σ a² / r²`.
     second: Vec<f64>,
     top: Best,
+    relp: Relp,
+}
+
+/// A function's RelP attributions: `Σ |A|`, `Σ A`, and the rows of the largest and of the most
+/// negative.
+#[derive(Clone, Default)]
+struct Relp {
+    absolute: f64,
+    signed: f64,
+    supports: Best,
+    opposes: Best,
+}
+
+impl Relp {
+    fn add(&mut self, k: usize, attribution: ArrayView1<f64>, first_row: usize) {
+        for (r, a) in attribution.iter().enumerate() {
+            self.absolute += a.abs();
+            self.signed += a;
+            self.supports.offer(k, *a, first_row + r);
+            self.opposes.offer(k, -*a, first_row + r);
+        }
+    }
 }
 
 struct HeadStat {
@@ -295,6 +349,10 @@ struct HeadStat {
     sources: HashMap<u32, f64>,
     /// Per held-out row, the position attended to most.
     attended: Vec<usize>,
+    relp: Relp,
+    /// Summed attention to the induction and the duplicate-token positions.
+    induction: f64,
+    duplicate: f64,
 }
 
 /// The binary order of magnitude of an offset: 0, 1, 2–3, 4–7, …
@@ -452,10 +510,18 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
     // Observed values: each site's stream, each MLP's activations and gate pre-activations, each
     // head's query, key and read.
     let place = |n: usize| artifact.place(n).ok_or_else(|| format!("the artifact does not hold native node {n}"));
+    let final_site = site(native, hidden)?;
     let mut paths: Vec<Vec<usize>> = sites.iter().map(|s| Ok(vec![place(s.input)?])).collect::<Result<_, String>>()?;
+    paths.push(vec![place(final_site.input)?]);
+    let mut mlp_paths = Vec::new();
     for b in &mlps {
+        mlp_paths.push(paths.len());
         paths.extend([vec![b.call, b.activation], vec![b.call, b.gate_pre]]);
+        if let Some((up, _)) = &b.up {
+            paths.push(vec![b.call, *up]);
+        }
     }
+    let head_paths = paths.len();
     for b in &heads {
         paths.extend([vec![b.call, b.query], vec![b.call, b.key], vec![b.call]]);
     }
@@ -482,22 +548,57 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
             offsets: Vec::new(),
             sources: HashMap::new(),
             attended: Vec::new(),
+            relp: Relp::default(),
+            induction: 0.0,
+            duplicate: 0.0,
         })
         .collect();
     let grams: Vec<Array2<f64>> = heads.iter().map(|b| b.output.t().dot(&b.output)).collect();
+    let unembedding_table = wide.upload(unembedding.view()).map_err(error)?;
+    let inverse_rms = |x: &Array2<f64>, epsilon: f64| x.map_axis(Axis(1), |x| 1.0 / (x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64 + epsilon).sqrt());
+    // Per head and sequence of a batch, the attention weights.
+    let attend = |values: &[[Array2<f64>; 3]], count: usize| -> Vec<Vec<Array2<f64>>> {
+        heads
+            .par_iter()
+            .zip(values.par_iter())
+            .map(|(block, [q, key, _])| {
+                (0..count)
+                    .map(|s| {
+                        let span = s * length..(s + 1) * length;
+                        let query = rotated(q.slice(s![span.clone(), ..]).to_owned(), block.rotary);
+                        let keys = rotated(key.slice(s![span, ..]).to_owned(), block.rotary);
+                        attention_rows(&query, &keys, block.scale, block.causal)
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    let mut predicted_all: Vec<u32> = Vec::with_capacity(sequences.len() * length);
+    let (mut logit_sum, mut attributed_sum, mut participation_sum) = (0.0, 0.0, 0.0);
     for (chunk, batch) in sequences.chunks(settings.batch_sequences).enumerate() {
         let first_row = chunk * settings.batch_sequences * length;
         let family = sequence_family(&batch.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
         let trace = device_program.forward(&family)?;
         let get = |i: usize| -> Result<Array2<f64>, String> { model.download(trace.value(observed[i])?).map_err(error) };
         let rows = family.rows;
-        let inverse: Vec<Array1<f64>> = sites
+        let inverse: Vec<Array1<f64>> = sites.iter().enumerate().map(|(i, s)| Ok(inverse_rms(&get(i)?, s.epsilon))).collect::<Result<_, String>>()?;
+        let last = get(sites.len())?;
+        let inverse_final = inverse_rms(&last, final_site.epsilon);
+        let predicted: Vec<usize> = extreme_columns(wide, &unembedding_table, &last, 1, 1.0, settings.tile_rows)?.into_iter().map(|c| c[0]).collect();
+        // The gradient of the predicted token's centred logit in the final stream, the final
+        // norm's denominator frozen.
+        let mut g = Array2::from_shape_fn((rows, width), |(r, c)| (unembedding[[predicted[r], c]] - unembedding_mean[c]) * inverse_final[r]);
+        let logits: f64 = (0..rows).map(|r| g.row(r).dot(&last.row(r))).sum();
+        let mlp_values: Vec<(Array2<f64>, Array2<f64>, Option<Array2<f64>>)> = mlps
             .iter()
             .enumerate()
-            .map(|(i, s)| Ok(get(i)?.map_axis(Axis(1), |x| 1.0 / (x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64 + s.epsilon).sqrt())))
+            .map(|(b, block)| {
+                let i = mlp_paths[b];
+                Ok((get(i)?, get(i + 1)?, if block.up.is_some() { Some(get(i + 2)?) } else { None }))
+            })
             .collect::<Result<_, String>>()?;
         for (b, block) in mlps.iter().enumerate() {
-            let (activations, pre) = (get(sites.len() + 2 * b)?, get(sites.len() + 2 * b + 1)?);
+            let (activations, pre, _) = &mlp_values[b];
             let visible = &inverse[mlp_first(block.layer).min(sites.len())..];
             mlp_stats[b].par_iter_mut().enumerate().for_each(|(i, stat)| {
                 for r in 0..rows {
@@ -514,43 +615,139 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
                 }
             });
         }
-        let base = sites.len() + 2 * mlps.len();
-        let values: Vec<[Array2<f64>; 3]> = (0..heads.len()).map(|h| Ok([get(base + 3 * h)?, get(base + 3 * h + 1)?, get(base + 3 * h + 2)?])).collect::<Result<_, String>>()?;
-        head_stats.par_iter_mut().zip(heads.par_iter()).zip(values.par_iter()).zip(grams.par_iter()).for_each(|(((stat, block), [q, key, z]), gram)| {
-            for (s, sequence) in batch.iter().enumerate() {
-                let span = s * length..(s + 1) * length;
-                let query = rotated(q.slice(s![span.clone(), ..]).to_owned(), block.rotary);
-                let keys = rotated(key.slice(s![span.clone(), ..]).to_owned(), block.rotary);
-                for (t, row) in attention_rows(&query, &keys, block.scale, block.causal).outer_iter().enumerate() {
-                    let mut best = (0, f64::NEG_INFINITY);
-                    for (u, w) in row.iter().enumerate().filter(|(_, w)| **w > 0.0) {
-                        let bin = offset_bin(t.abs_diff(u));
-                        if stat.offsets.len() <= bin {
-                            stat.offsets.resize(bin + 1, 0.0);
+        let values: Vec<[Array2<f64>; 3]> =
+            (0..heads.len()).map(|h| Ok([get(head_paths + 3 * h)?, get(head_paths + 3 * h + 1)?, get(head_paths + 3 * h + 2)?])).collect::<Result<_, String>>()?;
+        let weights = attend(&values, batch.len());
+        head_stats.par_iter_mut().zip(heads.par_iter()).zip(values.par_iter()).zip(grams.par_iter()).zip(weights.par_iter()).for_each(
+            |((((stat, block), [_, _, z]), gram), weights)| {
+                for (sequence, weights) in batch.iter().zip(weights) {
+                    for (t, row) in weights.outer_iter().enumerate() {
+                        let mut best = (0, f64::NEG_INFINITY);
+                        for (u, w) in row.iter().enumerate().filter(|(_, w)| **w > 0.0) {
+                            let bin = offset_bin(t.abs_diff(u));
+                            if stat.offsets.len() <= bin {
+                                stat.offsets.resize(bin + 1, 0.0);
+                            }
+                            stat.offsets[bin] += w;
+                            *stat.sources.entry(sequence[u]).or_insert(0.0) += w;
+                            if *w > best.1 {
+                                best = (u, *w);
+                            }
                         }
-                        stat.offsets[bin] += w;
-                        *stat.sources.entry(sequence[u]).or_insert(0.0) += w;
-                        if *w > best.1 {
-                            best = (u, *w);
-                        }
+                        stat.attended.push(best.0);
                     }
-                    stat.attended.push(best.0);
+                }
+                let norms = (z.dot(gram) * z).sum_axis(Axis(1));
+                for r in 0..rows {
+                    let norm = norms[r].max(0.0).sqrt();
+                    stat.output += norm;
+                    stat.top.offer(k, norm, first_row + r);
+                }
+                for (second, inv) in stat.second.iter_mut().zip(&inverse[head_first(block.layer).min(sites.len())..]) {
+                    let scaled = z * &inv.view().insert_axis(Axis(1));
+                    *second += &scaled.t().dot(&scaled);
+                }
+            },
+        );
+        // RelP: the reverse pass of the network with every norm's denominator, every law's gate
+        // factor `φ(x)/x` and every attention pattern frozen, and half of the gradient through
+        // each factor of a product (module note).
+        let (mut absolute, mut square, mut signed) = (Array1::<f64>::zeros(rows), Array1::<f64>::zeros(rows), Array1::<f64>::zeros(rows));
+        let mut tally = |attribution: ArrayView1<f64>, r: usize| {
+            absolute[r] += attribution[r].abs();
+            square[r] += attribution[r] * attribution[r];
+            signed[r] += attribution[r];
+        };
+        for l in (0..layers.len()).rev() {
+            for (b, block) in mlps.iter().enumerate().filter(|(_, b)| b.layer == l) {
+                let (activations, pre, up) = &mlp_values[b];
+                let d = g.dot(&block.out);
+                let attribution = activations * &d;
+                mlp_stats[b].par_iter_mut().enumerate().for_each(|(i, stat)| stat.relp.add(k, attribution.column(i), first_row));
+                for column in attribution.columns() {
+                    (0..rows).for_each(|r| tally(column, r));
+                }
+                let through = |factor: &Array2<f64>, share: f64| {
+                    let mut out = &d * activations;
+                    ndarray::Zip::from(&mut out).and(factor).for_each(|o, f| *o = if *f == 0.0 { 0.0 } else { share * *o / f });
+                    out
+                };
+                let read = match (up, &block.up) {
+                    (Some(up_values), Some((_, up_map))) => through(pre, 0.5).dot(&block.gate) + through(up_values, 0.5).dot(up_map),
+                    _ => through(pre, 1.0).dot(&block.gate),
+                };
+                let (gain, inv) = (&sites[2 * l + 1].gain, &inverse[2 * l + 1]);
+                g = g + read * &gain.view().insert_axis(Axis(0)) * &inv.view().insert_axis(Axis(1));
+            }
+            let mut delta = Array2::<f64>::zeros((rows, width));
+            for (h, block) in heads.iter().enumerate().filter(|(_, b)| b.layer == l) {
+                let z = &values[h][2];
+                let gz = g.dot(&block.output);
+                let attribution = (z * &gz).sum_axis(Axis(1));
+                head_stats[h].relp.add(k, attribution.view(), first_row);
+                (0..rows).for_each(|r| tally(attribution.view(), r));
+                let mut gv = Array2::<f64>::zeros(gz.dim());
+                for (s, weights) in weights[h].iter().enumerate() {
+                    let span = s * length..(s + 1) * length;
+                    gv.slice_mut(s![span.clone(), ..]).assign(&weights.t().dot(&gz.slice(s![span, ..])));
+                }
+                delta = delta + gv.dot(&block.value);
+            }
+            let (gain, inv) = (&sites[2 * l].gain, &inverse[2 * l]);
+            g = g + delta * &gain.view().insert_axis(Axis(0)) * &inv.view().insert_axis(Axis(1));
+        }
+        logit_sum += logits;
+        attributed_sum += signed.sum();
+        participation_sum += absolute.iter().zip(&square).map(|(a, q)| if *q > 0.0 { a * a / q } else { 0.0 }).sum::<f64>();
+        predicted_all.extend(predicted.iter().map(|t| *t as u32));
+    }
+    // Head diagnostics on sequences of random held-out tokens repeated once.
+    let mut present: Vec<usize> = sequences.iter().flatten().map(|t| *t as usize).filter(|t| *t < vocabulary).collect();
+    present.sort_unstable();
+    present.dedup();
+    let half = length / 2;
+    if half >= 2 && !heads.is_empty() {
+        let mut rng = StdRng::seed_from_u64(0);
+        let repeated: Vec<Vec<u32>> = (0..sequences.len())
+            .map(|_| {
+                let first: Vec<u32> = (0..half).map(|_| present[rng.random_range(0..present.len())] as u32).collect();
+                let mut sequence: Vec<u32> = first.iter().chain(&first).copied().collect();
+                sequence.resize(length, first[0]);
+                sequence
+            })
+            .collect();
+        for batch in repeated.chunks(settings.batch_sequences) {
+            let family = sequence_family(&batch.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+            let trace = device_program.forward(&family)?;
+            let values: Vec<[Array2<f64>; 3]> = (0..heads.len())
+                .map(|h| {
+                    let get = |i: usize| -> Result<Array2<f64>, String> { model.download(trace.value(observed[i])?).map_err(error) };
+                    Ok([get(head_paths + 3 * h)?, get(head_paths + 3 * h + 1)?, Array2::zeros((0, 0))])
+                })
+                .collect::<Result<_, String>>()?;
+            for (stat, weights) in head_stats.iter_mut().zip(attend(&values, batch.len())) {
+                for weights in weights {
+                    for t in half + 1..2 * half {
+                        stat.induction += weights[[t, t + 1 - half]];
+                        stat.duplicate += weights[[t, t - half]];
+                    }
                 }
             }
-            let norms = (z.dot(gram) * z).sum_axis(Axis(1));
-            for r in 0..rows {
-                let norm = norms[r].max(0.0).sqrt();
-                stat.output += norm;
-                stat.top.offer(k, norm, first_row + r);
-            }
-            for (second, inv) in stat.second.iter_mut().zip(&inverse[head_first(block.layer).min(sites.len())..]) {
-                let scaled = z * &inv.view().insert_axis(Axis(1));
-                *second += &scaled.t().dot(&scaled);
-            }
-        });
+        }
     }
+    let repeats = (sequences.len() * (half.max(1) - 1)) as f64;
     let total = (sequences.len() * length) as f64;
     let context = |value: f64, id: usize, source: Option<usize>| Context { sequence: id / length, position: id % length, value, source };
+    // The predicted token a majority of a function's top attribution rows share.
+    let majority = |best: &Best| {
+        let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+        best.entries.iter().for_each(|(_, id)| *counts.entry(predicted_all[*id]).or_insert(0) += 1);
+        counts.into_iter().find(|(_, c)| 2 * c > best.entries.len()).map(|(t, _)| t)
+    };
+    let relp_fields = |relp: &Relp, sign: f64| {
+        let rows = |best: &Best, sign: f64| best.entries.iter().map(|(v, id)| context(sign * v, *id, None)).collect::<Vec<_>>();
+        (relp.absolute / total, sign * relp.signed / total, rows(&relp.supports, 1.0), rows(&relp.opposes, -1.0), majority(&relp.supports), majority(&relp.opposes))
+    };
 
     // The functions, surviving ones only: per layer its heads, then its MLP functions.
     let mut functions: Vec<Function> = Vec::new();
@@ -570,7 +767,15 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
             sources.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
             sources.truncate(settings.tokens);
             head_index[h] = Some(functions.len());
+            let (importance, attribution, supports, opposes, supports_token, opposes_token) = relp_fields(&stat.relp, 1.0);
             functions.push(Function {
+                importance,
+                attribution,
+                supports,
+                opposes,
+                supports_token,
+                opposes_token,
+                background: false,
                 name,
                 layer: l,
                 kind: Kind::Head,
@@ -588,6 +793,9 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
                     sources: sources.into_iter().map(|(token, score)| TokenScore { token, score }).collect(),
                     ov: Vec::new(),
                     self_top1: 0.0,
+                    previous: stat.offsets.get(1).copied().unwrap_or(0.0) / (total - sequences.len() as f64).max(1.0),
+                    induction: stat.induction / repeats.max(1.0),
+                    duplicate: stat.duplicate / repeats.max(1.0),
                 }),
             });
         }
@@ -601,7 +809,15 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
                 }
                 let stat = &mlp_stats[b][i];
                 mlp_index[b][i] = Some(functions.len());
+                let (importance, attribution, supports, opposes, supports_token, opposes_token) = relp_fields(&stat.relp, 1.0);
                 functions.push(Function {
+                    importance,
+                    attribution,
+                    supports,
+                    opposes,
+                    supports_token,
+                    opposes_token,
+                    background: stat.active == total,
                     name,
                     layer: l,
                     kind: Kind::Mlp,
@@ -620,7 +836,6 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
     }
 
     // What MLP functions write and read, in tokens.
-    let unembedding_table = wide.upload(unembedding.view()).map_err(error)?;
     for (b, block) in mlps.iter().enumerate() {
         let kept: Vec<usize> = (0..block.gate.nrows()).filter(|i| mlp_index[b][*i].is_some()).collect();
         if kept.is_empty() {
@@ -645,9 +860,6 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
     }
 
     // Heads: the OV map's largest entries over the held-out text's tokens.
-    let mut present: Vec<usize> = sequences.iter().flatten().map(|t| *t as usize).filter(|t| *t < vocabulary).collect();
-    present.sort_unstable();
-    present.dedup();
     for (h, block) in heads.iter().enumerate() {
         let Some(index) = head_index[h] else { continue };
         let read_site = &sites[2 * block.layer];
@@ -682,14 +894,10 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
     }
 
     // Wiring: per read, every surviving reader against every surviving writer before it.
-    // A head writes a whole value vector and a neuron one direction, so each kind is ranked
-    // among its own.
-    let mut order: Vec<usize> = Vec::new();
-    for kind in [Kind::Head, Kind::Mlp] {
-        let mut ranked: Vec<usize> = (0..functions.len()).filter(|i| functions[*i].kind == kind).collect();
-        ranked.sort_by(|a, b| functions[*b].usage.total_cmp(&functions[*a].usage));
-        order.extend(ranked.into_iter().take(settings.core));
-    }
+    // The core: the functions of largest RelP importance, background functions apart.
+    let mut order: Vec<usize> = (0..functions.len()).filter(|i| !functions[*i].background).collect();
+    order.sort_by(|a, b| functions[*b].importance.total_cmp(&functions[*a].importance));
+    order.truncate(settings.core);
     let mut core_of: Vec<Option<usize>> = vec![None; functions.len()];
     order.iter().enumerate().for_each(|(p, f)| core_of[*f] = Some(p));
     let mut wiring = vec![vec![0.0; order.len()]; order.len()];
@@ -757,7 +965,17 @@ pub fn read_out(model: &Device, wide: &Device, native: &OperatorProgram, layers:
             functions[*index].inputs = best.entries.into_iter().map(|(weight, from)| Edge { from, weight }).collect();
         }
     }
-    Ok(Readout { held_out_tokens: sequences.len() * length, functions, removed, core: order, wiring })
+    Ok(Readout {
+        held_out_tokens: sequences.len() * length,
+        functions,
+        removed,
+        core: order,
+        wiring,
+        predicted: predicted_all,
+        mean_logit: logit_sum / total,
+        mean_attributed: attributed_sum / total,
+        participation: participation_sum / total,
+    })
 }
 
 // ------------------------------------------------------------------------------ token text

@@ -80,14 +80,23 @@ fn main() -> Result<(), String> {
     let mut functions = serde_json::to_value(&readout.functions).map_err(|e| e.to_string())?;
     // Decoded text beside every token id.
     for (function, value) in readout.functions.iter().zip(functions.as_array_mut().ok_or("functions")?) {
-        for (c, context) in function.contexts.iter().enumerate() {
-            let sequence = &sequences[context.sequence];
-            let start = context.position.saturating_sub(settings.window);
-            value["contexts"][c]["before"] = json!(vocabulary.text(&sequence[start..context.position]));
-            value["contexts"][c]["token"] = json!(text(sequence[context.position]));
-            value["contexts"][c]["sequence"] = json!(first + context.sequence);
-            if let Some(source) = context.source {
-                value["contexts"][c]["source_token"] = json!(text(sequence[source]));
+        for (list, contexts) in [("contexts", &function.contexts), ("supports", &function.supports), ("opposes", &function.opposes)] {
+            for (c, context) in contexts.iter().enumerate() {
+                let sequence = &sequences[context.sequence];
+                let start = context.position.saturating_sub(settings.window);
+                let entry = &mut value[list][c];
+                entry["before"] = json!(vocabulary.text(&sequence[start..context.position]));
+                entry["token"] = json!(text(sequence[context.position]));
+                entry["predicted"] = json!(text(readout.predicted[context.sequence * settings.context + context.position]));
+                entry["sequence"] = json!(first + context.sequence);
+                if let Some(source) = context.source {
+                    entry["source_token"] = json!(text(sequence[source]));
+                }
+            }
+        }
+        for field in ["supports_token", "opposes_token"] {
+            if let Some(token) = value[field].as_u64() {
+                value[format!("{field}_text")] = json!(text(token as u32));
             }
         }
         for list in ["promoted", "suppressed", "reads"] {
@@ -116,6 +125,10 @@ fn main() -> Result<(), String> {
         "wide_device": wide.name(),
         "held_out_sequences": [first, end],
         "held_out_tokens": readout.held_out_tokens,
+        "mean_logit": readout.mean_logit,
+        "mean_attributed": readout.mean_attributed,
+        "participation": readout.participation,
+        "background": readout.functions.iter().enumerate().filter(|(_, f)| f.background).map(|(i, _)| i).collect::<Vec<_>>(),
         "surviving": readout.functions.len(),
         "removed": readout.removed,
         "core": readout.core,
