@@ -11,6 +11,140 @@ use crate::{
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
+/// Numerical identification diagnostic for finite edit cases, independent of fitting policy.
+/// A clean zero case anchors the intercept, so arbitrary affine local-response coefficients
+/// require the edit-coordinate matrix to have full column rank at the declared resolution.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ControlDesignReport {
+    pub cases: usize,
+    pub coordinates: usize,
+    pub clean_rows: Vec<usize>,
+    pub numerical_rank: usize,
+    pub required_rank: usize,
+    /// The raw coordinate matrix is divided by this single common factor before SVD.
+    pub global_scale: f64,
+    pub singular_values: Vec<f64>,
+    pub relative_tolerance: f64,
+    /// Absolute threshold in the globally scaled matrix, including the SVD rounding band.
+    pub tolerance: f64,
+    /// Full-column spectrum condition estimate; absent for exact zeros or overflow.
+    pub condition_number: Option<f64>,
+    /// Independent max-absolute column scales used only for a second diagnostic SVD.
+    pub column_scales: Vec<f64>,
+    pub column_equilibrated_rank: usize,
+    pub column_equilibrated_tolerance: f64,
+    pub column_equilibrated_condition_number: Option<f64>,
+    pub scope: &'static str,
+}
+impl ControlDesignReport {
+    /// Require observable coefficients only when policy relies on arbitrary affine response
+    /// identification from these cases. Direct coefficient supervision can retain the report
+    /// without invoking this requirement. This is not a downstream KL identification test.
+    pub fn require_affine_identification(&self) -> Result<(), String> {
+        if self.clean_rows.is_empty() || self.numerical_rank != self.required_rank {
+            return Err(format!(
+                "control design resolves rank {} of {} at tolerance {}; arbitrary affine local response coefficients are not identified by these cases",
+                self.numerical_rank, self.required_rank, self.tolerance,
+            ));
+        }
+        Ok(())
+    }
+}
+/// Diagnose edit-coordinate rank without rejecting deficient designs that may still be usable
+/// with directly supervised coefficients. Signed cases alone do not establish independence.
+/// `relative_tolerance` is a declared singular-value resolution relative to the largest value;
+/// the effective threshold is its maximum with gam_linalg's f64 decomposition rounding band.
+pub fn control_design(
+    amplitudes: &Array2<f64>,
+    relative_tolerance: f64,
+) -> Result<ControlDesignReport, String> {
+    if amplitudes.nrows() == 0
+        || amplitudes.ncols() == 0
+        || amplitudes.iter().any(|v| !v.is_finite())
+        || !relative_tolerance.is_finite()
+        || !(0. ..1.).contains(&relative_tolerance)
+    {
+        return Err(
+            "control design requires a finite nonempty matrix and relative tolerance in [0,1)"
+                .into(),
+        );
+    }
+    let clean_rows: Vec<_> = amplitudes
+        .rows()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(row, values)| values.iter().all(|v| *v == 0.).then_some(row))
+        .collect();
+    if clean_rows.is_empty() {
+        return Err("control design requires an explicit clean zero case".into());
+    }
+    let column_scales: Vec<_> = amplitudes
+        .columns()
+        .into_iter()
+        .map(|column| column.iter().fold(0f64, |largest, v| largest.max(v.abs())))
+        .collect();
+    // Uniform scaling avoids overflow without concealing weak coordinate excitation.
+    let global_scale = column_scales.iter().copied().fold(1f64, f64::max);
+    let scaled = amplitudes.mapv(|v| v / global_scale);
+    fn spectrum(
+        matrix: &Array2<f64>,
+        relative_tolerance: f64,
+    ) -> Result<(Vec<f64>, usize, f64, Option<f64>), String> {
+        let factor = gam_linalg::decompose::svd(matrix.view(), false).map_err(|e| e.to_string())?;
+        let values: Vec<_> = factor.singular_values.iter().copied().collect();
+        if !factor.band.is_finite()
+            || factor.band < 0.
+            || values.iter().any(|v| !v.is_finite() || *v < 0.)
+        {
+            return Err("nonfinite control design spectrum/resolution".into());
+        }
+        let largest = values.iter().copied().fold(0f64, f64::max);
+        let tolerance = factor.band.max(relative_tolerance * largest);
+        let rank = values.iter().filter(|v| **v > tolerance).count();
+        let smallest = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let condition = if values.len() == matrix.ncols() && smallest > 0. {
+            let estimate = largest / smallest;
+            estimate.is_finite().then_some(estimate)
+        } else {
+            None
+        };
+        Ok((values, rank, tolerance, condition))
+    }
+    let (singular_values, numerical_rank, tolerance, condition_number) =
+        spectrum(&scaled, relative_tolerance)?;
+    let equilibrated = Array2::from_shape_fn(amplitudes.dim(), |(row, column)| {
+        let scale = column_scales[column];
+        if scale == 0. {
+            0.
+        } else {
+            amplitudes[[row, column]] / scale
+        }
+    });
+    let (
+        _,
+        column_equilibrated_rank,
+        column_equilibrated_tolerance,
+        column_equilibrated_condition_number,
+    ) = spectrum(&equilibrated, relative_tolerance)?;
+    Ok(ControlDesignReport {
+        cases: amplitudes.nrows(),
+        coordinates: amplitudes.ncols(),
+        clean_rows,
+        numerical_rank,
+        required_rank: amplitudes.ncols(),
+        global_scale,
+        singular_values,
+        relative_tolerance,
+        tolerance,
+        condition_number,
+        column_scales,
+        column_equilibrated_rank,
+        column_equilibrated_tolerance,
+        column_equilibrated_condition_number,
+        scope: "F64 numerical rank and conditioning of finite edit coordinates with clean-zero intercept anchor. Full column rank is necessary for arbitrary affine LOCAL response coefficient identification at this resolution; it does not prove downstream KL identification or nonlinear response identification. Column equilibration diagnoses units/excitation separately and does not override the raw-coordinate requirement. Direct coefficient supervision may use deficient designs without invoking require_affine_identification.",
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct Direction {
     pub output: Array1<f64>,
@@ -20,6 +154,9 @@ pub struct Family {
     pub program: OperatorProgram,
     pub node_mapping: Vec<usize>,
     pub control_nodes: Vec<usize>,
+    /// Existing unscaled native projections s_j = v_j^T h, in direction order.
+    /// Supervisor node identities only; candidate execution still uses its own responses.
+    pub response_nodes: Vec<usize>,
     pub control_slots: Vec<usize>,
     pub native_read: usize,
     pub native_write: usize,
@@ -228,6 +365,7 @@ pub fn build(
     }
     let mut p = native.clone();
     let mut control_nodes = vec![];
+    let mut response_nodes = vec![];
     let mut control_slots = vec![];
     p.nodes.clear();
     for _ in directions {
@@ -300,6 +438,7 @@ pub fn build(
             let mut terms = vec![(map[active], target)];
             for (j, &(u, v)) in pairs.iter().enumerate() {
                 let projection = p.nodes.len();
+                response_nodes.push(projection);
                 p.nodes.push(Node::Affine {
                     terms: vec![(map[active], v)],
                     bias: None,
@@ -328,6 +467,7 @@ pub fn build(
         program: p,
         node_mapping: map,
         control_nodes,
+        response_nodes,
         control_slots,
         direction_operators: pairs,
         original: native.clone(),
@@ -337,6 +477,59 @@ pub fn build(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn signed_cases_require_independent_edit_coordinates_for_affine_identification() {
+        let tied =
+            super::control_design(&ndarray::array![[0., 0.], [1., 1.], [-1., -1.]], 1e-12).unwrap();
+        assert_eq!(tied.numerical_rank, 1);
+        assert_eq!(tied.column_equilibrated_rank, 1);
+        assert_eq!(tied.required_rank, 2);
+        assert!(tied.require_affine_identification().is_err());
+        let independent = super::control_design(
+            &ndarray::array![[0., 0.], [1., 0.], [-1., 0.], [0., 1.], [0., -1.]],
+            1e-12,
+        )
+        .unwrap();
+        assert_eq!(independent.numerical_rank, 2);
+        assert_eq!(independent.clean_rows, vec![0]);
+        independent.require_affine_identification().unwrap();
+        assert!((independent.condition_number.unwrap() - 1.).abs() < 1e-12);
+        // Diagnostic construction is allowed for deficient designs; policy alone requires rank.
+        assert!(serde_json::to_value(tied).is_ok());
+    }
+    #[test]
+    fn scaled_and_near_collinear_designs_report_distinct_conditioning() {
+        let scaled = super::control_design(
+            &ndarray::array![[0., 0.], [1., 0.], [-1., 0.], [0., 1e-15], [0., -1e-15]],
+            1e-12,
+        )
+        .unwrap();
+        assert_eq!(scaled.numerical_rank, 1);
+        assert_eq!(scaled.column_equilibrated_rank, 2);
+        assert!(scaled.condition_number.unwrap() > 1e14);
+        assert!((scaled.column_equilibrated_condition_number.unwrap() - 1.).abs() < 1e-12);
+        assert!(scaled.require_affine_identification().is_err());
+        let near = super::control_design(
+            &ndarray::array![[0., 0.], [1., 1.], [-1., -1.], [1., 1. + 1e-14]],
+            1e-12,
+        )
+        .unwrap();
+        assert_eq!(near.numerical_rank, 1);
+        assert_eq!(near.column_equilibrated_rank, 1);
+        assert!(near.require_affine_identification().is_err());
+        let global =
+            super::control_design(&ndarray::array![[0., 0.], [1e300, 0.], [0., 1e300]], 1e-12)
+                .unwrap();
+        assert_eq!(global.global_scale, 1e300);
+        global.require_affine_identification().unwrap();
+        assert!(super::control_design(&ndarray::array![[1., 0.], [0., 1.]], 1e-12).is_err());
+        assert!(super::control_design(&ndarray::array![[0., 0.], [f64::NAN, 1.]], 1e-12).is_err());
+        assert!(super::control_design(&ndarray::array![[0., 0.]], -1.).is_err());
+        let zero = super::control_design(&ndarray::array![[0., 0.]], 1e-12).unwrap();
+        assert_eq!(zero.numerical_rank, 0);
+        assert!(zero.require_affine_identification().is_err());
+    }
+
     use super::*;
     use crate::{
         artifact::{Argument, Callee},
@@ -416,6 +609,62 @@ mod tests {
             ],
         )
         .expect("family")
+    }
+    #[test]
+    fn native_projection_labels_are_control_independent_and_reconstruct_literal_derivatives() {
+        let f = family();
+        let inputs = base();
+        let native_clean = native().execute(&inputs, false).unwrap();
+        let clean = f
+            .program
+            .execute(&f.inputs(&inputs, &[0., 0.]).unwrap(), false)
+            .unwrap();
+        assert_eq!(f.response_nodes.len(), f.direction_operators.len());
+        for (j, &(u, v)) in f.direction_operators.iter().enumerate() {
+            let projection = f.response_nodes[j];
+            assert!(
+                matches!(&f.program.nodes[projection], Node::Affine { terms, bias: None }
+                if terms == &vec![(f.node_mapping[2], v)])
+            );
+            let scalar = &clean.values[projection];
+            assert_eq!(scalar.dim(), (inputs.rows, 1));
+            let writer = f.program.operators[u].matrix();
+            for amplitude in [-0.75, 0., 1.25] {
+                let mut amplitudes = vec![0.; f.response_nodes.len()];
+                amplitudes[j] = amplitude;
+                let augmented = f
+                    .program
+                    .execute(&f.inputs(&inputs, &amplitudes).unwrap(), false)
+                    .unwrap();
+                // The edited down map is used only after the incoming read and hidden state.
+                assert_eq!(augmented.values[f.native_read], clean.values[f.native_read]);
+                for &response in &f.response_nodes {
+                    assert_eq!(augmented.values[response], clean.values[response]);
+                }
+                let literal = f
+                    .literal_native(&amplitudes)
+                    .unwrap()
+                    .execute(&inputs, false)
+                    .unwrap();
+                assert_eq!(literal.values[0], native_clean.values[0]);
+                assert_eq!(literal.values[2], native_clean.values[2]);
+                for row in 0..inputs.rows {
+                    for col in 0..writer.nrows() {
+                        let reconstructed = native_clean.values[3][[row, col]]
+                            + amplitude * writer[[col, 0]] * scalar[[row, 0]];
+                        assert!((literal.values[3][[row, col]] - reconstructed).abs() < 1e-12);
+                        if amplitude != 0. {
+                            let derivative = (literal.values[3][[row, col]]
+                                - native_clean.values[3][[row, col]])
+                                / amplitude;
+                            assert!(
+                                (derivative - writer[[col, 0]] * scalar[[row, 0]]).abs() < 1e-12
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn augmented_full_program_matches_literal_weight_edits_and_zero_control() {

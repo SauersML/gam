@@ -10,47 +10,111 @@ use std::sync::Arc;
 
 /// Each old root node has a distinct materialized value, including identity-call outputs.
 pub fn mapped_inlined(program: &OperatorProgram) -> Result<(OperatorProgram, Vec<usize>), String> {
+    let (flat, roots, _) = mapped_inlined_observed(program, &[])?;
+    Ok((flat, roots))
+}
+
+/// Observe actual invocation values without adding arithmetic or invented native
+/// identities. A path starts with a root-node index; every further index selects
+/// a node in the preceding Call's rule body. A terminal Call names its existing
+/// materialized output barrier; a Param names its bound actual input. Results
+/// retain requested order, including duplicate paths. Invalid paths are refused.
+pub fn mapped_inlined_observed(
+    program: &OperatorProgram,
+    paths: &[Vec<usize>],
+) -> Result<(OperatorProgram, Vec<usize>, Vec<usize>), String> {
     program.interfaces().map_err(|e| e.to_string())?;
-    fn expand(original: &OperatorProgram, body: &[Node], args: &[usize], flat: &mut OperatorProgram) -> Result<Vec<usize>, String> {
+    if paths.iter().any(Vec::is_empty) {
+        return Err("observation paths require a root node".into());
+    }
+    fn expand(
+        original: &OperatorProgram,
+        body: &[Node],
+        args: &[usize],
+        flat: &mut OperatorProgram,
+        requests: &[(usize, &[usize])],
+        observed: &mut [usize],
+    ) -> Result<Vec<usize>, String> {
+        if requests
+            .iter()
+            .any(|(_, path)| path.first().is_none_or(|node| *node >= body.len()))
+        {
+            return Err("observation node outside root or invoked rule body".into());
+        }
         let mut map = Vec::with_capacity(body.len());
-        for node in body {
+        for (index, node) in body.iter().enumerate() {
+            let nested = requests
+                .iter()
+                .filter(|(_, path)| path[0] == index && path.len() > 1)
+                .map(|(id, path)| (*id, &path[1..]))
+                .collect::<Vec<_>>();
+            if !nested.is_empty() && !matches!(node, Node::Call { .. }) {
+                return Err("observation path descends through a non-Call node".into());
+            }
             let value = match node {
                 Node::Param { index } => *args.get(*index).ok_or("unbound rule parameter")?,
                 Node::Call { rule, arguments } => {
                     let rule = original.rules.get(*rule).ok_or("missing rule")?;
-                    let args: Vec<usize> = arguments.iter().map(|&i| map[i]).collect();
-                    let inner = expand(original, &rule.nodes, &args, flat)?;
+                    let args: Vec<_> = arguments.iter().map(|&i| map[i]).collect();
+                    let inner = expand(original, &rule.nodes, &args, flat, &nested, observed)?;
                     let source = inner[rule.output];
-                    // Always copy at the call boundary: an aliasing Param cannot expose its
-                    // parent's allocation to exceptions/interventions on this call's result.
+                    // Same barrier as the unobserved expansion, preserving alias
+                    // separation for exceptions/interventions on this invocation.
                     flat.output = source;
                     let interface = flat.node_interface(source).map_err(|e| e.to_string())?;
                     let operator = flat.operators.len();
-                    flat.operators.push(Arc::new(Operator::identity("call output barrier", interface)));
-                    flat.nodes.push(Node::Affine { terms: vec![(source, operator)], bias: None });
+                    flat.operators.push(Arc::new(Operator::identity(
+                        "call output barrier",
+                        interface,
+                    )));
+                    flat.nodes.push(Node::Affine {
+                        terms: vec![(source, operator)],
+                        bias: None,
+                    });
                     flat.nodes.len() - 1
                 }
                 other => {
                     let mut copy = other.clone();
-                    let ops: Vec<usize> = (0..flat.operators.len()).collect();
-                    let bases: Vec<usize> = (0..flat.bases.len()).collect();
-                    let rules: Vec<usize> = (0..original.rules.len()).collect();
+                    let ops: Vec<_> = (0..flat.operators.len()).collect();
+                    let bases: Vec<_> = (0..flat.bases.len()).collect();
+                    let rules: Vec<_> = (0..original.rules.len()).collect();
                     remap_node(&mut copy, &map, &ops, &bases, &rules);
                     flat.nodes.push(copy);
                     flat.nodes.len() - 1
                 }
             };
+            for (id, path) in requests {
+                if path[0] == index && path.len() == 1 {
+                    observed[*id] = value;
+                }
+            }
             map.push(value);
         }
         Ok(map)
     }
     let mut flat = program.clone();
     flat.nodes.clear();
-    let map = expand(program, &program.nodes, &[], &mut flat)?;
+    let requests = paths
+        .iter()
+        .enumerate()
+        .map(|(id, path)| (id, path.as_slice()))
+        .collect::<Vec<_>>();
+    let mut observed = vec![usize::MAX; paths.len()];
+    let map = expand(
+        program,
+        &program.nodes,
+        &[],
+        &mut flat,
+        &requests,
+        &mut observed,
+    )?;
+    if observed.contains(&usize::MAX) {
+        return Err("observation path was not materialized".into());
+    }
     flat.output = map[program.output];
     flat.rules.clear();
     flat.interfaces().map_err(|e| e.to_string())?;
-    Ok((flat, map))
+    Ok((flat, map, observed))
 }
 
 /// Expand a decoded artifact's program and every executable/binding root-node reference.
@@ -321,6 +385,39 @@ mod tests {
             output: 3,
         };
         (Artifact::native(&program).unwrap(), FamilyInputs { rows: 1, slots: vec![SlotValues::Raw(ndarray::array![[1.0, 2.0]])], layout: None })
+    }
+    #[test]
+    fn nested_observations_name_existing_invocation_values_without_new_arithmetic() {
+        let (artifact, family) = fixture(true);
+        let paths = vec![
+            vec![1],
+            vec![1, 1],
+            vec![1, 1, 0],
+            vec![1, 0],
+            vec![2],
+            vec![1, 1],
+        ];
+        let (flat, roots, observed) = mapped_inlined_observed(&artifact.program, &paths).unwrap();
+        let (baseline, baseline_roots) = mapped_inlined(&artifact.program).unwrap();
+        assert_eq!(flat, baseline);
+        assert_eq!(roots, baseline_roots);
+        assert_eq!(roots, vec![0, 2, 3, 4]);
+        assert_eq!(observed, vec![2, 1, 0, 0, 3, 1]);
+        assert_eq!(flat.nodes.len(), 5);
+        assert_eq!(flat.operators.len(), 3);
+        let trace = flat.execute(&family, false).unwrap();
+        for &node in &observed {
+            assert_eq!(trace.values[node], ndarray::array![[1., 2.]]);
+        }
+        let message = flat.encode().unwrap();
+        let decoded = OperatorProgram::decode(&message, &flat.declarations).unwrap();
+        let replay = decoded.execute(&family, false).unwrap();
+        for &node in &observed {
+            assert_eq!(trace.values[node], replay.values[node]);
+        }
+        for invalid in [vec![], vec![99], vec![1, 99], vec![2, 0], vec![1, 1, 0, 0]] {
+            assert!(mapped_inlined_observed(&artifact.program, &[invalid]).is_err());
+        }
     }
     fn alias_test(nested: bool) {
         let (mut artifact, family) = fixture(nested);

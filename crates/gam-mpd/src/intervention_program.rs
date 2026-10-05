@@ -2,7 +2,7 @@
 //! Node controls scale one ORIGINAL root invocation. Global controls scale every
 //! invocation of one ORIGINAL stored operator. Instrumentation is fixed, not learned.
 use crate::{
-    artifact_device::mapped_inlined,
+    artifact_device::mapped_inlined_observed,
     operator_program::{
         FamilyInputs, Interface, Node, Operator, OperatorBody, OperatorProgram, Slot, SlotValues,
         remap_node,
@@ -34,6 +34,8 @@ pub struct Compiled {
     pub program: OperatorProgram,
     /// Each original root maps to its final, controlled value (including Call barriers).
     pub root_mapping: Vec<usize>,
+    /// Requested invocation paths mapped to their actual controlled flat values.
+    pub observed_nodes: Vec<usize>,
     pub control_slots: Vec<ControlSlot>,
     controls: Vec<Control>,
     source: OperatorProgram,
@@ -224,6 +226,18 @@ impl Lower {
 /// Lower every requested control. No Mix/patch/AddMap or arbitrary callback is
 /// accepted. Global operator indices remain unchanged through Call expansion.
 pub fn compile(source: &OperatorProgram, controls: &[Control]) -> Result<Compiled, String> {
+    compile_observed(source, controls, &[])
+}
+
+/// Same ordinary control lowering, exposing requested root/nested-Call values.
+/// Observation alone adds no nodes, controls, learned parameters or native inputs.
+/// A root observation follows its NodeScale; a nested observation precedes an
+/// enclosing invocation's output-only mask, but includes applicable global edits.
+pub fn compile_observed(
+    source: &OperatorProgram,
+    controls: &[Control],
+    paths: &[Vec<usize>],
+) -> Result<Compiled, String> {
     source.interfaces().map_err(|e| e.to_string())?;
     let mut node_controls = BTreeMap::new();
     let mut operator_controls = BTreeMap::new();
@@ -243,7 +257,7 @@ pub fn compile(source: &OperatorProgram, controls: &[Control]) -> Result<Compile
             }
         }
     }
-    let (flat, roots) = mapped_inlined(source)?;
+    let (flat, roots, observed) = mapped_inlined_observed(source, paths)?;
     let interfaces = flat.interfaces().map_err(|e| e.to_string())?;
     let root_controls: BTreeMap<_, _> = node_controls
         .into_iter()
@@ -339,6 +353,7 @@ pub fn compile(source: &OperatorProgram, controls: &[Control]) -> Result<Compile
     Ok(Compiled {
         program: l.p,
         root_mapping: roots.into_iter().map(|n| map[n]).collect(),
+        observed_nodes: observed.into_iter().map(|n| map[n]).collect(),
         control_slots: l.slots,
         controls: controls.to_vec(),
         source: source.clone(),
@@ -413,6 +428,101 @@ mod tests {
     }
     fn output(p: &OperatorProgram, f: &FamilyInputs) -> Array2<f64> {
         p.execute(f, false).expect("valid execution").values[p.output].clone()
+    }
+    #[test]
+    fn observed_nested_invocations_include_global_edits_and_keep_output_masks_scoped() {
+        let mut p = source();
+        let i = Interface::native(2).unwrap();
+        p.operators
+            .push(Arc::new(Operator::identity("sum", i.clone())));
+        p.rules.push(Rule {
+            name: "nested shared reader".into(),
+            inputs: vec![i],
+            nodes: vec![
+                Node::Param { index: 0 },
+                Node::Gain {
+                    input: 0,
+                    coefficient: crate::operator_program::Coefficient::Number(2.),
+                },
+                Node::Call {
+                    rule: 0,
+                    arguments: vec![1],
+                },
+            ],
+            output: 2,
+        });
+        p.nodes = vec![
+            Node::Raw { slot: 0 },
+            Node::Call {
+                rule: 1,
+                arguments: vec![0],
+            },
+            Node::Gain {
+                input: 0,
+                coefficient: crate::operator_program::Coefficient::Number(-3.),
+            },
+            Node::Call {
+                rule: 1,
+                arguments: vec![2],
+            },
+            Node::Affine {
+                terms: vec![(1, 1), (3, 1)],
+                bias: None,
+            },
+        ];
+        p.output = 4;
+        let controls = [
+            Control::NodeScale { node: 1 },
+            Control::GlobalOperatorScale { operator: 0 },
+        ];
+        let paths = vec![vec![1], vec![1, 2, 1], vec![3, 2, 1], vec![1, 1], vec![3]];
+        let c = compile_observed(&p, &controls, &paths).unwrap();
+        let baseline = compile(&p, &controls).unwrap();
+        assert_eq!(c.program, baseline.program);
+        assert_eq!(c.root_mapping, baseline.root_mapping);
+        assert_eq!(c.control_slots, baseline.control_slots);
+        assert!(baseline.observed_nodes.is_empty());
+        assert_ne!(c.observed_nodes[1], c.observed_nodes[2]);
+        let mask = array![[-1., 0.5], [0., 2.]];
+        let base = family();
+        let SlotValues::Raw(x) = &base.slots[0] else {
+            panic!("raw");
+        };
+        let OperatorBody::Dense { values, .. } = &p.operators[0].body else {
+            panic!("dense");
+        };
+        for gain in [0., -0.5, 1.75] {
+            let f = c
+                .family(
+                    &base,
+                    &[
+                        ControlValue::NodeMask(mask.clone()),
+                        ControlValue::GlobalScale(gain),
+                    ],
+                )
+                .unwrap();
+            let first = x.dot(&values.t()) * (2. * gain);
+            let second = x.dot(&values.t()) * (-6. * gain);
+            let expected = [
+                &first * &mask,
+                first.clone(),
+                second.clone(),
+                x * 2.,
+                second,
+            ];
+            let trace = c.program.execute(&f, false).unwrap();
+            for (&node, value) in c.observed_nodes.iter().zip(&expected) {
+                assert_eq!(&trace.values[node], value);
+            }
+            let message = c.program.encode().unwrap();
+            let decoded = OperatorProgram::decode(&message, &c.program.declarations).unwrap();
+            let replay = decoded.execute(&f, false).unwrap();
+            for &node in &c.observed_nodes {
+                assert_eq!(trace.values[node], replay.values[node]);
+            }
+        }
+        assert_eq!(c.restore(&c.program).unwrap(), p);
+        assert!(compile_observed(&p, &controls, &[vec![1, 2, 99]]).is_err());
     }
     #[test]
     fn shared_global_control_matches_actual_stored_weight_edit() {

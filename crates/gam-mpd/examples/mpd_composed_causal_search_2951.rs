@@ -1,8 +1,8 @@
 //! Fit structural proposals in the autonomous native LM on clean AND intervened logits.
 //! EXPORT SETTINGS.json FRESH_OUT host|cuda [HELDOUT_EXPORT]. Training proposal search, not acceptance.
-use gam_gpu::{GpuPolicy, tensor::Device};
+use gam_gpu::{tensor::Device, GpuPolicy};
 use gam_mpd::{
-    acceptance::{CostCache, structural_cost},
+    acceptance::{structural_cost, CostCache},
     artifact::Artifact,
     canonical_artifact::CanonicalArtifactCache,
     coder_capture::sha256,
@@ -11,17 +11,17 @@ use gam_mpd::{
     down_edit_family::{self, Direction, Family as DownFamily},
     import::import_language_model,
     intervention_program::{self, Control, ControlValue},
-    operator_program::{FamilyInputs, Node, OperatorBody, OperatorProgram, remap_node},
+    operator_program::{remap_node, FamilyInputs, Node, OperatorBody, OperatorProgram},
     parameter_response_program,
     program_structure_search::{
         self, EvaluatedArtifact, Evaluation as StructureEvaluation, Metric, Mutation,
     },
     resident_causal_fit::{self, Episode, Settings as FitSettings},
-    run_check::{LayerNodes, layer_nodes, split_sites},
+    run_check::{layer_nodes, split_sites, LayerNodes},
 };
 use ndarray::{Array1, Array2};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write,
@@ -81,6 +81,11 @@ struct DownDirection {
 struct DownSettings {
     layer: usize,
     directions: Vec<DownDirection>,
+    #[serde(default = "default_response_weight")]
+    response_weight: f64,
+}
+fn default_response_weight() -> f64 {
+    1.
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -546,17 +551,6 @@ fn native_response_targets(
     weight: f64,
     limit: usize,
 ) -> Result<(resident_causal_fit::NativeResponses, Value), String> {
-    if !weight.is_finite() || weight <= 0. || episodes.is_empty() {
-        return Err("positive native-response weight and nonempty episodes required".into());
-    }
-    if episodes.iter().any(|e| {
-        e.inputs.rows == 0
-            || e.scored
-                .as_ref()
-                .is_some_and(|m| m.len() != e.inputs.rows || !m.iter().any(|v| *v))
-    }) {
-        return Err("nonempty exact response row domains required".into());
-    }
     let mut boundaries = BTreeMap::new();
     for b in &candidate.blocks {
         if boundaries
@@ -576,8 +570,32 @@ fn native_response_targets(
             return Err("native response boundary has changed interface".into());
         }
     }
-    if boundaries.is_empty() {
-        return Err("native response fitting requires declared observable blocks".into());
+    native_response_targets_mapped(d, native, &boundaries, episodes, weight, limit)
+}
+
+// Targets are independently executed native states; this map identifies only
+// candidate-owned observations, never supplies candidate forward inputs.
+fn native_response_targets_mapped(
+    d: &Device,
+    native: &OperatorProgram,
+    boundaries: &BTreeMap<usize, usize>,
+    episodes: &[Episode],
+    weight: f64,
+    limit: usize,
+) -> Result<(resident_causal_fit::NativeResponses, Value), String> {
+    if !weight.is_finite() || weight <= 0. || episodes.is_empty() || boundaries.is_empty() {
+        return Err(
+            "positive native-response weight and nonempty explicit boundaries/episodes required"
+                .into(),
+        );
+    }
+    if episodes.iter().any(|e| {
+        e.inputs.rows == 0
+            || e.scored
+                .as_ref()
+                .is_some_and(|m| m.len() != e.inputs.rows || !m.iter().any(|v| *v))
+    }) {
+        return Err("nonempty exact response row domains required".into());
     }
     let (mut expanded, mapping) = gam_mpd::artifact_device::mapped_inlined(native)?;
     let last = boundaries
@@ -714,6 +732,49 @@ fn native_response_targets(
         "scope":"Fixed controlled-native trajectory targets at all distinct changed observable exits. Candidate states never replaced by labels. Weighted mean of normalized squared response errors plus output KL, distinct from teacher-input Local. Zero native RMS uses explicit unit absolute scale; training rows only."}),
     ))
 }
+fn down_response_targets(
+    d: &Device,
+    down: &DownFamily,
+    native_controls: &[Control],
+    family: &FamilyInputs,
+    cases: &[Case],
+    logits: &[Array2<f64>],
+    observed_nodes: &[usize],
+    weight: f64,
+    limit: usize,
+) -> Result<(resident_causal_fit::NativeResponses, Value), String> {
+    if observed_nodes.len() != down.response_nodes.len() {
+        return Err("response observation count differs".into());
+    }
+    let paths: Vec<_> = down.response_nodes.iter().map(|n| vec![*n]).collect();
+    let teacher = intervention_program::compile_observed(&down.program, native_controls, &paths)?;
+    let teacher_episodes = episodes(
+        &teacher,
+        &down.program,
+        native_controls,
+        family,
+        cases,
+        logits,
+        Some(down),
+    )?;
+    let map = teacher
+        .observed_nodes
+        .iter()
+        .copied()
+        .zip(observed_nodes.iter().copied())
+        .collect();
+    let (targets, mut provenance) = native_response_targets_mapped(
+        d,
+        &teacher.program,
+        &map,
+        &teacher_episodes,
+        weight,
+        limit,
+    )?;
+    provenance["scope"]=json!("Direct unscaled scalar native down-edit coefficient targets under each case's upstream controls, before enclosing MLP-output masks. Candidate-owned coefficient functions; independent native teacher inputs. Not a rank-identification certificate or Local acceptance.");
+    Ok((targets, provenance))
+}
+
 fn freeze_evaluation_ids(
     frontier: &[Value],
     expressions: &[usize],
@@ -943,9 +1004,18 @@ fn graft_parameters_except(
         })
         .collect();
     if trainable.len() != proposal.trainable.len() {
-        return Err(
-            "graft parameter count differs; unsupported parameter specialization or loss".into(),
-        );
+        let actual:Vec<_>=trainable.iter().map(|&id|{
+            let op=&candidate.program.operators[id];
+            let origins:Vec<_>=proposal.trainable.iter().copied().filter(|&source|{
+                let held=&proposal.program.operators[source];
+                op.rows.width()==held.rows.width() && op.cols.width()==held.cols.width() && match (&op.body,&held.body) {
+                    (OperatorBody::Dense{values:a,..},OperatorBody::Dense{values:b,..})=>a.dim()==b.dim() && a.iter().zip(b).all(|(x,y)|x.to_bits()==y.to_bits()),
+                    _=>false,
+                }
+            }).collect();
+            json!({"candidate_operator":id,"name":op.name,"rows":format!("{:?}",op.rows),"cols":format!("{:?}",op.cols),"matching_proposal_parameter_values":origins})
+        }).collect();
+        return Err(format!("graft parameter count differs: actual={} expected={}; unsupported parameter specialization or loss; operator_diagnostic={}",trainable.len(),proposal.trainable.len(),serde_json::to_string(&actual).map_err(|e|e.to_string())?));
     }
     let mut body_map = BTreeMap::new();
     for rule in 0..proposal.program.rules.len() {
@@ -1739,6 +1809,26 @@ fn run() -> Result<(), String> {
         }));
     }
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    if let Some(config) = &settings.down_edit_family {
+        if !config.response_weight.is_finite() || config.response_weight <= 0. {
+            return Err("down response_weight must be finite and positive".into());
+        }
+        let amplitudes = Array2::from_shape_vec(
+            (settings.cases.len(), config.directions.len()),
+            settings
+                .cases
+                .iter()
+                .flat_map(|c| c.down_amplitudes.iter().copied())
+                .collect(),
+        )
+        .map_err(|e| e.to_string())?;
+        let report = down_edit_family::control_design(&amplitudes, 1e-12)?;
+        save(
+            &out.join("DOWN_CONTROL_DESIGN.json"),
+            &json!({"report":report,"relative_tolerance":1e-12,"scope":"Edit-coordinate diagnostic only; cases may have different upstream states/gains. Deficiency does not reject independently supervised coefficient functions."}),
+        )?;
+    }
+
     std::fs::write(out.join("SETTINGS.json"), &config_bytes).map_err(|e| e.to_string())?;
     save(
         &out.join("INVENTORY.json"),
@@ -1750,8 +1840,8 @@ fn run() -> Result<(), String> {
         "settings_sha256":sha256(config_path)?,"binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,
         "rows_per_episode":family.rows,"controls":settings.controls,"cases":settings.cases,
         "scope":"training proposal search with optional frozen heldout measurement; no acceptance claim; declared boundary masks, retained shared-weight gains, and optional finite native down-weight edit family",
-        "objective":"maximum named-group mean of episode mean teacher-to-candidate KL; all causal sequence rows scored",
-        "native_supervision":"native logits only; candidate runs its complete autonomous states",
+        "fitting_objective":if down.is_some() || settings.structural_search.as_ref().is_some_and(|s|s.native_response_weight.is_some()){"maximum named-group mean of episode KL plus weighted direct coefficient response loss"}else{"maximum named-group mean of episode mean teacher-to-candidate KL"},"ranking_objective":"pure saved-f32 teacher-to-candidate KL; response loss reported separately; all causal sequence rows scored",
+        "native_supervision":if settings.structural_search.as_ref().is_some_and(|s|s.native_response_weight.is_some()) {"native logits plus controlled native observable responses"}else if down.is_some(){"native logits plus direct scalar down-edit response coefficients; candidate runs its own complete states"}else{"native logits only; candidate runs its complete autonomous states"},
         "teacher_planned_numeric_bytes":teacher_plan,
         "native_codec_bytes":settings.native_codec_bytes,"native_codec_initialization_seconds":native_codec_initialization_seconds,"native_codec_preflight":native_codec.as_ref().map(|c|c.preflight()),"native_codec_stats":native_codec.as_ref().map(|c|c.stats()),
         "native_codec_budget_scope":"packed native codewords plus cached decoded numeric buffers only; excludes caller-owned source arrays, per-operator construction/lattice temporaries, full messages, label/execution buffers, metadata and allocator/library overhead; construction excluded from warm timings",
@@ -1866,6 +1956,7 @@ fn run() -> Result<(), String> {
                 }
                 let graft_started = Instant::now();
                 let mut candidate = base.clone();
+                let mut response_nodes = Vec::new();
                 for (slot, &layer) in settings.uses.iter().enumerate() {
                     let clean = composed_rule_search::function(&proposal, slot)?;
                     if settings
@@ -1884,7 +1975,15 @@ fn run() -> Result<(), String> {
                             .iter()
                             .map(|(u, _)| down.program.operators[*u].clone())
                             .collect::<Vec<_>>();
-                        let function = parameter_response_program::compose(&clean, &responses, &u)?;
+                        let target = native
+                            .node_interface(layers[layer].mlp)
+                            .map_err(|e| e.to_string())?;
+                        let composed =
+                            parameter_response_program::compose_with_outputs_on_interface(
+                                &clean, &responses, &u, &target,
+                            )?;
+                        response_nodes = composed.response_nodes;
+                        let function = composed.program;
                         let mut reads = vec![layers[layer].normed];
                         reads.extend(&down.control_nodes);
                         candidate = candidate.replace_function_inputs(
@@ -1943,14 +2042,33 @@ fn run() -> Result<(), String> {
                     .collect();
                 save(
                     &root.join("CONTROL_MAP.json"),
-                    &json!({"native_controls":settings.controls,"candidate_controls":mapping,"down_edit_family":settings.down_edit_family,"fixed_direction_operator_ids":direction_ids}),
+                    &json!({"native_controls":settings.controls,"candidate_controls":mapping,"down_edit_family":settings.down_edit_family,"fixed_direction_operator_ids":direction_ids,"response_nodes":response_nodes}),
                 )?;
                 let graft_seconds = graft_started.elapsed().as_secs_f64();
                 let canonical_started = Instant::now();
                 let (mut candidate, _, canonical_before_phases) =
                     canonical_using(&candidate, native_codec.as_ref())?;
                 let canonical_before_seconds = canonical_started.elapsed().as_secs_f64();
-                let lowered = intervention_program::compile(&candidate.program, &mapped)?;
+                let response_paths: Vec<_> = if let Some(down) = &down {
+                    response_nodes
+                        .iter()
+                        .map(|n| {
+                            Ok(vec![
+                                candidate
+                                    .place(down.native_write)
+                                    .ok_or("down write place absent")?,
+                                *n,
+                            ])
+                        })
+                        .collect::<Result<_, String>>()?
+                } else {
+                    Vec::new()
+                };
+                let lowered = intervention_program::compile_observed(
+                    &candidate.program,
+                    &mapped,
+                    &response_paths,
+                )?;
                 let training = episodes(
                     &lowered,
                     &candidate.program,
@@ -1961,13 +2079,40 @@ fn run() -> Result<(), String> {
                     down.as_ref(),
                 )?;
                 let fit_started = Instant::now();
-                let fitted = resident_causal_fit::fit(
-                    &d,
-                    &lowered.program,
-                    &training,
-                    &trainable,
-                    settings.fit.clone(),
-                )?;
+                let mut retained_response_targets = None;
+                let fitted = if let (Some(down), Some(config)) = (&down, &settings.down_edit_family)
+                {
+                    let (response_targets, provenance) = down_response_targets(
+                        &d,
+                        down,
+                        &target_controls,
+                        family,
+                        &settings.cases,
+                        &targets,
+                        &lowered.observed_nodes,
+                        config.response_weight,
+                        settings.fit.numeric_bytes,
+                    )?;
+                    save(&root.join("RESPONSE_TARGETS.json"), &provenance)?;
+                    let fitted = resident_causal_fit::fit_with_native(
+                        &d,
+                        &lowered.program,
+                        &training,
+                        &response_targets,
+                        &trainable,
+                        settings.fit.clone(),
+                    )?;
+                    retained_response_targets = Some((response_targets, provenance));
+                    fitted
+                } else {
+                    resident_causal_fit::fit(
+                        &d,
+                        &lowered.program,
+                        &training,
+                        &trainable,
+                        settings.fit.clone(),
+                    )?
+                };
                 save(
                     &root.join("FIT.json"),
                     &serde_json::to_value(&fitted.report).map_err(|e| e.to_string())?,
@@ -2006,7 +2151,23 @@ fn run() -> Result<(), String> {
                     )?;
                 }
 
-                let saved_lowered = intervention_program::compile(&saved.program, &mapped)?;
+                let saved_paths: Vec<_> = if let Some(down) = &down {
+                    response_nodes
+                        .iter()
+                        .map(|n| {
+                            Ok(vec![
+                                saved
+                                    .place(down.native_write)
+                                    .ok_or("down write place absent")?,
+                                *n,
+                            ])
+                        })
+                        .collect::<Result<_, String>>()?
+                } else {
+                    Vec::new()
+                };
+                let saved_lowered =
+                    intervention_program::compile_observed(&saved.program, &mapped, &saved_paths)?;
                 let training = episodes(
                     &saved_lowered,
                     &saved.program,
@@ -2026,6 +2187,35 @@ fn run() -> Result<(), String> {
                     &root.join("TRAIN.json"),
                     &serde_json::to_value(&measured).map_err(|e| e.to_string())?,
                 )?;
+                if let Some((mut responses, provenance)) = retained_response_targets {
+                    if lowered.observed_nodes.len() != saved_lowered.observed_nodes.len() {
+                        return Err("saved response observation count changed".into());
+                    }
+                    let remap: BTreeMap<_, _> = lowered
+                        .observed_nodes
+                        .iter()
+                        .copied()
+                        .zip(saved_lowered.observed_nodes.iter().copied())
+                        .collect();
+                    for targets in responses.values_mut() {
+                        for target in targets {
+                            target.source_node = *remap
+                                .get(&target.source_node)
+                                .ok_or("saved response observation missing")?;
+                        }
+                    }
+                    let supervised = resident_causal_fit::measure_with_native(
+                        &d,
+                        &saved_lowered.program,
+                        &training,
+                        &responses,
+                        settings.fit.numeric_bytes,
+                    )?;
+                    save(
+                        &root.join("TRAIN_RESPONSES.json"),
+                        &json!({"measurement":supervised,"targets":provenance,"pure_kl_report":"TRAIN.json","native_labels_reused":true}),
+                    )?;
+                }
                 let cost_started = Instant::now();
                 let c32 = structural_cost(&saved, &mut costs)?.total();
                 let structural_cost_seconds = cost_started.elapsed().as_secs_f64();
@@ -2177,7 +2367,29 @@ fn run() -> Result<(), String> {
                     }
                 }
                 let mapped = stored_controls(&mapping, &settings.controls)?;
-                let lowered = intervention_program::compile(&artifact.program, &mapped)?;
+                let response_nodes: Vec<usize> = if id != "native" && down.is_some() {
+                    serde_json::from_value(mapping["response_nodes"].clone())
+                        .map_err(|e| e.to_string())?
+                } else {
+                    Vec::new()
+                };
+                let paths: Vec<_> = if let Some(down) = &down {
+                    response_nodes
+                        .iter()
+                        .map(|n| {
+                            Ok(vec![
+                                artifact
+                                    .place(down.native_write)
+                                    .ok_or("down write place absent")?,
+                                *n,
+                            ])
+                        })
+                        .collect::<Result<_, String>>()?
+                } else {
+                    Vec::new()
+                };
+                let lowered =
+                    intervention_program::compile_observed(&artifact.program, &mapped, &paths)?;
                 let eval_episodes = episodes(
                     &lowered,
                     &artifact.program,
@@ -2193,8 +2405,56 @@ fn run() -> Result<(), String> {
                     &eval_episodes,
                     settings.fit.numeric_bytes,
                 )?;
+                let supervised = if id != "native" {
+                    if let (Some(down), Some(config)) = (&down, &settings.down_edit_family) {
+                        let (mut responses, mut provenance) = down_response_targets(
+                            &d,
+                            down,
+                            &target_controls,
+                            eval_family,
+                            evaluation.cases.as_deref().unwrap_or(&settings.cases),
+                            labels,
+                            &lowered.observed_nodes,
+                            config.response_weight,
+                            settings.fit.numeric_bytes,
+                        )?;
+                        let training_provenance: Value = serde_json::from_slice(
+                            &std::fs::read(out.join(id).join("RESPONSE_TARGETS.json"))
+                                .map_err(|e| e.to_string())?,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        for targets in responses.values_mut() {
+                            for target in targets {
+                                let key = target
+                                    .label
+                                    .strip_prefix("native_node_")
+                                    .ok_or("response label schema differs")?;
+                                let scale = training_provenance["native_rms_and_fixed_scale"][key]
+                                    [1]
+                                .as_f64()
+                                .ok_or("frozen training scale missing")?;
+                                if !scale.is_finite() || scale <= 0. {
+                                    return Err("invalid frozen training scale".into());
+                                }
+                                target.scale = scale;
+                            }
+                        }
+                        provenance["native_rms_and_fixed_scale"] =
+                            training_provenance["native_rms_and_fixed_scale"].clone();
+                        provenance["scale_scope"] = json!(
+                            "Frozen training scales; heldout values do not redefine normalization."
+                        );
+                        Some(
+                            json!({"measurement":resident_causal_fit::measure_with_native(&d,&lowered.program,&eval_episodes,&responses,settings.fit.numeric_bytes)?,"targets":provenance}),
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 Ok(
-                    json!({"id":id,"status":"heldout_measured","c32":c32,"measurement":measured,"artifact_sha256":training["artifact_sha256"],"control_map_sha256":training["control_map_sha256"],"scope":"frozen candidate measurement only; no Local or acceptance certificate"}),
+                    json!({"id":id,"status":"heldout_measured","c32":c32,"measurement":measured,"direct_response_supervision":supervised,"artifact_sha256":training["artifact_sha256"],"control_map_sha256":training["control_map_sha256"],"scope":"frozen candidate measurement only; no Local or acceptance certificate"}),
                 )
             })();
             let record = match attempt {
@@ -2237,6 +2497,135 @@ mod tests {
         composed_rule_search::{Expr, Unary},
         operator_program::{Node, SlotValues},
     };
+    #[test]
+    fn tied_edits_hide_false_coefficients_but_direct_targets_identify_them() {
+        use gam_mpd::operator_program::{exact_precision, Operator};
+        use gam_mpd::operator_program::{Declarations, Interface, Slot};
+        use ndarray::array;
+        let dense = |a: Array2<f64>| {
+            Arc::new(
+                Operator::dense(
+                    "fixture",
+                    Interface::native(a.nrows()).expect("rows"),
+                    Interface::native(a.ncols()).expect("cols"),
+                    a.clone(),
+                    exact_precision(a.iter().copied()).expect("precision"),
+                    Default::default(),
+                )
+                .expect("dense"),
+            )
+        };
+        let program = |false_attribution: bool| OperatorProgram {
+            declarations: Declarations {
+                domains: vec![],
+                slots: vec![Slot::Raw { width: 2 }],
+                parameters: 0,
+            },
+            bases: vec![],
+            rules: vec![],
+            operators: vec![
+                dense(if false_attribution {
+                    array![[1., 1.]]
+                } else {
+                    array![[1., 0.]]
+                }),
+                dense(if false_attribution {
+                    array![[0., 0.]]
+                } else {
+                    array![[0., 1.]]
+                }),
+                dense(array![[1.], [-1.]]),
+            ],
+            nodes: vec![
+                Node::Raw { slot: 0 },
+                Node::Affine {
+                    terms: vec![(0, 0)],
+                    bias: None,
+                },
+                Node::Affine {
+                    terms: vec![(0, 1)],
+                    bias: None,
+                },
+                Node::Affine {
+                    terms: vec![(1, 2), (2, 2)],
+                    bias: None,
+                },
+            ],
+            output: 3,
+        };
+        let teacher = program(false);
+        let candidate = program(true);
+        let inputs = FamilyInputs {
+            rows: 3,
+            slots: vec![SlotValues::Raw(array![[1., 2.], [-2., 1.], [0.5, -1.]])],
+            layout: None,
+        };
+        let labels = teacher.execute(&inputs, false).expect("teacher").values[3].clone();
+        let episodes = vec![Episode {
+            label: "tied".into(),
+            group: "tied".into(),
+            inputs,
+            target_logits: labels,
+            scored: None,
+        }];
+        let map = BTreeMap::from([(1, 1), (2, 2)]);
+        let (responses, _) =
+            native_response_targets_mapped(&Device::host(), &teacher, &map, &episodes, 1., 1 << 24)
+                .expect("scalar targets");
+        let kl = resident_causal_fit::measure(&Device::host(), &candidate, &episodes, 1 << 24)
+            .expect("KL");
+        let direct = resident_causal_fit::measure_with_native(
+            &Device::host(),
+            &candidate,
+            &episodes,
+            &responses,
+            1 << 24,
+        )
+        .expect("direct loss");
+        assert!(kl.objective.abs() < 1e-12);
+        assert!(direct.objective > 0.1);
+        let fit = resident_causal_fit::fit_with_native(
+            &Device::host(),
+            &candidate,
+            &episodes,
+            &responses,
+            &[0, 1],
+            FitSettings {
+                iterations: 200,
+                learning_rate: 0.05,
+                beta1: 0.9,
+                beta2: 0.999,
+                epsilon: 1e-8,
+                numeric_bytes: 1 << 24,
+            },
+        )
+        .expect("coefficient fit");
+        let saved = canonical(&Artifact::native(&fit.program).expect("artifact"))
+            .expect("ordinary saved replay")
+            .0;
+        let final_loss = resident_causal_fit::measure_with_native(
+            &Device::host(),
+            &saved.program,
+            &episodes,
+            &responses,
+            1 << 24,
+        )
+        .expect("saved direct metric");
+        assert!(final_loss.objective < direct.objective * 0.01);
+        // Individually applied directions now expose the attribution improvement.
+        let input = &episodes[0].inputs;
+        let actual = saved
+            .program
+            .execute(input, false)
+            .expect("candidate own states");
+        let expected = teacher.execute(input, false).expect("native coefficients");
+        for node in [1, 2] {
+            assert!(actual.values[node]
+                .iter()
+                .zip(&expected.values[node])
+                .all(|(a, b)| (a - b).abs() < 0.02));
+        }
+    }
     #[test]
     fn interior_requirement_refuses_boundaries_and_preserves_baseline_ids() {
         let grammar = Grammar {
@@ -2390,11 +2779,9 @@ mod tests {
             .program
             .execute(&input, false)
             .expect("valid regression fixture");
-        assert!(
-            trace.values[lowered.program.output]
-                .iter()
-                .all(|v| v.is_finite())
-        );
+        assert!(trace.values[lowered.program.output]
+            .iter()
+            .all(|v| v.is_finite()));
         let restored = lowered
             .restore(&lowered.program)
             .expect("valid regression fixture");
@@ -2529,7 +2916,7 @@ mod tests {
     #[test]
     fn removed_down_family_runs_literal_teachers_shared_response_fit_and_saved_replay() {
         use gam_mpd::operator_program::{
-            Declarations, Interface, Law, Operator, Slot, SlotValues, exact_precision,
+            exact_precision, Declarations, Interface, Law, Operator, Slot, SlotValues,
         };
         use ndarray::array;
         let dense = |values: Array2<f64>| {
@@ -2545,6 +2932,13 @@ mod tests {
                 .expect("dense"),
             )
         };
+        let mut grouped_writer = (*dense(array![[1., -0.5], [0.25, 0.75]])).clone();
+        grouped_writer.rows =
+            Interface::uniform(2, 1, gam_mpd::operator_program::LabelKind::Unit, 0)
+                .expect("native unit groups");
+        if let OperatorBody::Dense { present, .. } = &mut grouped_writer.body {
+            *present = Array2::from_elem((2, 1), true);
+        }
         let original = OperatorProgram {
             declarations: Declarations {
                 domains: vec![],
@@ -2555,7 +2949,7 @@ mod tests {
             rules: vec![],
             operators: vec![
                 dense(array![[1., 0.5], [-0.25, 1.]]),
-                dense(array![[1., -0.5], [0.25, 0.75]]),
+                Arc::new(grouped_writer),
             ],
             nodes: vec![
                 Node::Raw { slot: 0 },
@@ -2629,12 +3023,10 @@ mod tests {
                 .expect("original native state")
                 .values[literal.output]
                 .clone();
-            assert!(
-                expected
-                    .iter()
-                    .zip(target)
-                    .all(|(a, b)| (a - b).abs() < 1e-12)
-            );
+            assert!(expected
+                .iter()
+                .zip(target)
+                .all(|(a, b)| (a - b).abs() < 1e-12));
         }
         let expression = Expr::Unary(
             Unary::Relu,
@@ -2662,17 +3054,21 @@ mod tests {
                 7,
             )
             .expect("joint clean and response pool");
-            let function = parameter_response_program::compose(
+            let composed = parameter_response_program::compose_with_outputs_on_interface(
                 &composed_rule_search::function(&proposal, 0).expect("clean"),
                 &[composed_rule_search::function(&proposal, 1).expect("response")],
                 &[down.program.operators[down.direction_operators[0].0].clone()],
+                &down
+                    .program
+                    .node_interface(down.native_write)
+                    .expect("native output groups"),
             )
             .expect("compose");
             let mut candidate = Artifact::native(&down.program)
                 .expect("native")
                 .replace_function_inputs(
                     "removed down",
-                    &function,
+                    &composed.program,
                     &[down.native_read, down.control_nodes[0]],
                     down.native_write,
                 )
@@ -2690,8 +3086,13 @@ mod tests {
                 .expect("paid immutable directions");
             let (candidate, _) = canonical(&candidate).expect("F32 initial graph");
             verify_fixed_directions(&candidate, &down, &ids).expect("fixed literals");
-            let lowered =
-                intervention_program::compile(&candidate.program, &[]).expect("ordinary controls");
+            let paths: Vec<_> = composed
+                .response_nodes
+                .iter()
+                .map(|n| vec![candidate.place(down.native_write).expect("write"), *n])
+                .collect();
+            let lowered = intervention_program::compile_observed(&candidate.program, &[], &paths)
+                .expect("nested observations");
             let panels = episodes(
                 &lowered,
                 &candidate.program,
@@ -2702,10 +3103,25 @@ mod tests {
                 Some(&down),
             )
             .expect("autonomous edit episodes");
-            let fit = resident_causal_fit::fit(
+            let (responses, provenance) = down_response_targets(
+                &device,
+                &down,
+                &[],
+                &base,
+                &cases,
+                &targets,
+                &lowered.observed_nodes,
+                1.,
+                1_000_000,
+            )
+            .expect("independent scalar labels");
+            assert_eq!(responses["clean"].len(), 1);
+            assert!(provenance["native_rms_and_fixed_scale"].is_object());
+            let fit = resident_causal_fit::fit_with_native(
                 &device,
                 &lowered.program,
                 &panels,
+                &responses,
                 &trainable,
                 FitSettings {
                     iterations: 2,
@@ -2731,7 +3147,14 @@ mod tests {
             saved.validate_coverage(&down.program).expect("coverage");
             let cost = structural_cost(&saved, &mut CostCache::default()).expect("complete C32");
             assert!(cost.literals >= 4);
-            let replay = intervention_program::compile(&saved.program, &[]).expect("replay graph");
+            let paths: Vec<_> = composed
+                .response_nodes
+                .iter()
+                .map(|n| vec![saved.place(down.native_write).expect("saved write"), *n])
+                .collect();
+            let replay = intervention_program::compile_observed(&saved.program, &[], &paths)
+                .expect("saved observations");
+            assert_eq!(replay.observed_nodes, lowered.observed_nodes);
             let panels = episodes(
                 &replay,
                 &saved.program,
@@ -2746,6 +3169,15 @@ mod tests {
                 resident_causal_fit::measure(&device, &replay.program, &panels, 1_000_000)
                     .expect("full saved metrics");
             assert!(measured.objective.is_finite());
+            let supervised = resident_causal_fit::measure_with_native(
+                &device,
+                &replay.program,
+                &panels,
+                &responses,
+                1_000_000,
+            )
+            .expect("saved direct coefficient metrics");
+            assert!(supervised.objective.is_finite());
         }
     }
     #[test]
@@ -2813,7 +3245,7 @@ mod tests {
     #[test]
     fn structural_mode_runs_persistent_reuse_with_finite_control_and_saved_replay() {
         use gam_mpd::operator_program::{
-            Declarations, Interface, Law, Operator, Slot, exact_precision,
+            exact_precision, Declarations, Interface, Law, Operator, Slot,
         };
         use ndarray::array;
         let dense = |name: &str, values: Array2<f64>| {
@@ -3027,11 +3459,9 @@ mod tests {
             "{report}"
         );
         let attempts = report["report"]["attempts"].as_array().expect("attempts");
-        assert!(
-            attempts
-                .iter()
-                .any(|a| a["depth"] == 2 && a["mutation"]["kind"] == "reuse_existing_rule")
-        );
+        assert!(attempts
+            .iter()
+            .any(|a| a["depth"] == 2 && a["mutation"]["kind"] == "reuse_existing_rule"));
         assert!(
             attempts
                 .iter()
@@ -3053,11 +3483,9 @@ mod tests {
                 let initial = fit["initial"]["episodes"]
                     .as_array()
                     .expect("episode measurements");
-                assert!(
-                    initial
-                        .iter()
-                        .all(|e| e["responses"].as_array().is_some_and(|r| !r.is_empty()))
-                );
+                assert!(initial
+                    .iter()
+                    .all(|e| e["responses"].as_array().is_some_and(|r| !r.is_empty())));
                 for episode in initial {
                     let kl = episode["mean_kl"].as_f64().expect("separate KL");
                     let response = episode["responses"]
@@ -3192,17 +3620,15 @@ mod tests {
             ndarray::array![[0., 1.], [0., 0.]]
         );
         let planned = provenance["planned_numeric_bytes"].as_u64().unwrap() as usize;
-        assert!(
-            native_response_targets(
-                &Device::host(),
-                &native,
-                &candidate,
-                &episodes,
-                2.,
-                planned - 1
-            )
-            .is_err()
-        );
+        assert!(native_response_targets(
+            &Device::host(),
+            &native,
+            &candidate,
+            &episodes,
+            2.,
+            planned - 1
+        )
+        .is_err());
     }
     #[test]
     fn dominated_equation_hypotheses_freeze_without_heldout_selection() {
@@ -3285,7 +3711,7 @@ mod tests {
     }
     fn controlled_cancellation_gate(joint: bool, square: bool) {
         let gate_started = Instant::now();
-        use gam_mpd::operator_program::{Declarations, Interface, Operator, Slot, exact_precision};
+        use gam_mpd::operator_program::{exact_precision, Declarations, Interface, Operator, Slot};
         use ndarray::array;
         let dense = |name: &str, v: Array2<f64>| {
             Arc::new(
@@ -3633,12 +4059,10 @@ mod tests {
             &std::fs::read(out.join("FROZEN_EVALUATION_IDS.json")).expect("freeze"),
         )
         .expect("json");
-        assert!(
-            !frozen["expression_hypotheses"]
-                .as_array()
-                .expect("hypotheses")
-                .is_empty()
-        );
+        assert!(!frozen["expression_hypotheses"]
+            .as_array()
+            .expect("hypotheses")
+            .is_empty());
         if joint {
             // Freeze by training admission before constructing any heldout targets.
             let chosen = attempts

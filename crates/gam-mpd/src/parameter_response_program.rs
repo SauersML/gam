@@ -5,7 +5,28 @@
 use crate::operator_program::{
     Declarations, Interface, Node, Operator, OperatorBody, OperatorProgram, Slot, remap_node,
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// Root-node identity before any graft, inlining, or pruning. The clean
+/// affine writer's terms are fused into the composed output, so its standalone
+/// value is not an output dependency and ordinary root pruning can erase it.
+/// Function grafting retains its body index; observe it through that Call path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanOutputMetadata {
+    pub node: usize,
+    pub retained_by_composed_output: bool,
+}
+/// These IDs name values actually computed by `program`, not native hidden
+/// activations or a reconstruction from the controlled final output. Grafting
+/// must explicitly remap/retain requested IDs; they are not post-graft IDs.
+#[derive(Clone, Debug)]
+pub struct Composition {
+    pub program: OperatorProgram,
+    pub response_nodes: Vec<usize>,
+    pub clean_output: CleanOutputMetadata,
+    pub composed_output: usize,
+}
 
 fn signature(function: &OperatorProgram) -> Result<(usize, Interface), String> {
     let width =
@@ -96,6 +117,17 @@ pub fn compose(
     responses: &[OperatorProgram],
     output_directions: &[Arc<Operator>],
 ) -> Result<OperatorProgram, String> {
+    Ok(compose_with_outputs(clean, responses, output_directions)?.program)
+}
+
+/// Same executable composition as [`compose`], with pre-graft provenance for
+/// each imported scalar `s_j(x)` before multiplying by `a_j` or `U_j`.
+/// No new output arithmetic or native activation input is introduced.
+pub fn compose_with_outputs(
+    clean: &OperatorProgram,
+    responses: &[OperatorProgram],
+    output_directions: &[Arc<Operator>],
+) -> Result<Composition, String> {
     let (width, output) = signature(clean)?;
     let scalar = Interface::native(1).map_err(|e| e.to_string())?;
     if responses.is_empty() || responses.len() != output_directions.len() {
@@ -134,8 +166,10 @@ pub fn compose(
     let Node::Affine { mut terms, bias } = out.nodes[clean_output].clone() else {
         return Err("clean response function must expose an affine output writer".into());
     };
+    let mut response_nodes = Vec::with_capacity(responses.len());
     for (j, (response, direction)) in responses.iter().zip(output_directions).enumerate() {
         let value = import(&mut out, response)?;
+        response_nodes.push(value);
         let control = out.nodes.len();
         out.nodes.push(Node::Raw { slot: j + 1 });
         let scaled = out.nodes.len();
@@ -169,7 +203,107 @@ pub fn compose(
     out.output = out.nodes.len();
     out.nodes.push(Node::Affine { terms, bias });
     out.interfaces().map_err(|e| e.to_string())?;
-    Ok(out)
+    let composed_output = out.output;
+    Ok(Composition {
+        program: out,
+        response_nodes,
+        clean_output: CleanOutputMetadata {
+            node: clean_output,
+            retained_by_composed_output: false,
+        },
+        composed_output,
+    })
+}
+
+/// Bind the clean output writer to the native output grouping before fusing it
+/// with the response writers. The standalone clean observation and final output
+/// consequently refer to the same stored coefficients after function grafting.
+/// This changes coordinate labels only, never coordinate order or values.
+/// A writer used elsewhere is refused: specializing only this occurrence would
+/// split a shared parameter into independently trainable copies.
+pub fn compose_with_outputs_on_interface(
+    clean: &OperatorProgram,
+    responses: &[OperatorProgram],
+    output_directions: &[Arc<Operator>],
+    target: &Interface,
+) -> Result<Composition, String> {
+    let (_, output) = signature(clean)?;
+    if output == *target {
+        return compose_with_outputs(clean, responses, output_directions);
+    }
+    if output.width() != target.width() {
+        return Err("response output regrouping width mismatch".into());
+    }
+    for response in responses {
+        signature(response)?;
+    }
+    let Node::Affine { terms, bias } = &clean.nodes[clean.output] else {
+        return Err("clean response function must expose an affine output writer".into());
+    };
+    let writer_ids = terms
+        .iter()
+        .map(|(_, op)| *op)
+        .chain(*bias)
+        .collect::<Vec<_>>();
+    for &writer in &writer_ids {
+        let source = &clean.operators[writer];
+        let uses_writer = |program: &OperatorProgram, node: &Node| {
+            node.operators()
+                .iter()
+                .any(|&op| Arc::ptr_eq(&program.operators[op], source))
+        };
+        if clean
+            .nodes
+            .iter()
+            .enumerate()
+            .any(|(id, node)| id != clean.output && uses_writer(clean, node))
+            || clean
+                .rules
+                .iter()
+                .flat_map(|rule| &rule.nodes)
+                .any(|node| uses_writer(clean, node))
+            || responses.iter().any(|response| {
+                response
+                    .nodes
+                    .iter()
+                    .chain(response.rules.iter().flat_map(|rule| &rule.nodes))
+                    .any(|node| uses_writer(response, node))
+            })
+            || output_directions
+                .iter()
+                .any(|direction| Arc::ptr_eq(direction, source))
+        {
+            return Err("response output regrouping would split a shared writer parameter".into());
+        }
+    }
+    let mut adapted = clean.clone();
+    let mut specialized: Vec<(Arc<Operator>, Arc<Operator>)> = Vec::new();
+    for writer in writer_ids {
+        let source = &clean.operators[writer];
+        if let Some((_, held)) = specialized.iter().find(|(old, _)| Arc::ptr_eq(old, source)) {
+            adapted.operators[writer] = held.clone();
+            continue;
+        }
+        let mut bound = (**source).clone();
+        bound.rows = target.clone();
+        match &mut bound.body {
+            OperatorBody::Dense { present, .. } if present.iter().all(|keep| *keep) => {
+                *present = ndarray::Array2::from_elem(
+                    (target.group_count(), bound.cols.group_count()),
+                    true,
+                );
+            }
+            _ => {
+                return Err(
+                    "response output regrouping requires complete dense boundary operators".into(),
+                );
+            }
+        }
+        let bound = Arc::new(bound);
+        adapted.operators[writer] = bound.clone();
+        specialized.push((source.clone(), bound));
+    }
+    compose_with_outputs(&adapted, responses, output_directions)
 }
 
 #[cfg(test)]
@@ -225,6 +359,310 @@ mod tests {
             ],
             output: 3,
         }
+    }
+    #[test]
+    fn observed_composition_and_decoded_graft_expose_actual_clean_and_scalar_responses() {
+        let mut clean = function();
+        let ty = Interface::native(2).unwrap();
+        clean.rules = vec![Rule {
+            name: "shared learned reader".into(),
+            inputs: vec![ty],
+            nodes: vec![
+                Node::Param { index: 0 },
+                Node::Affine {
+                    terms: vec![(0, 0)],
+                    bias: None,
+                },
+                Node::Pointwise {
+                    input: 1,
+                    laws: vec![Law::Relu],
+                },
+            ],
+            output: 2,
+        }];
+        clean.nodes = vec![
+            Node::Raw { slot: 0 },
+            Node::Call {
+                rule: 0,
+                arguments: vec![0],
+            },
+            Node::Affine {
+                terms: vec![(1, 1)],
+                bias: None,
+            },
+        ];
+        clean.output = 2;
+        let family = down_edit_family::build(
+            &clean,
+            0,
+            2,
+            &[
+                Direction {
+                    output: array![0.5, -1.],
+                    hidden: array![1., -0.25],
+                },
+                Direction {
+                    output: array![-1., 0.25],
+                    hidden: array![0.25, 0.5],
+                },
+            ],
+        )
+        .unwrap();
+        let mut responses = vec![];
+        let mut directions = vec![];
+        for &(u, v) in &family.direction_operators {
+            let mut response = clean.clone();
+            response.operators[1] = family.program.operators[v].clone();
+            responses.push(response);
+            directions.push(family.program.operators[u].clone());
+        }
+        let composed = compose_with_outputs(&clean, &responses, &directions).unwrap();
+        assert_eq!(
+            composed.program,
+            compose(&clean, &responses, &directions).unwrap()
+        );
+        assert_eq!(composed.composed_output, composed.program.output);
+        assert!(!composed.clean_output.retained_by_composed_output);
+        assert!(
+            composed
+                .program
+                .nodes
+                .iter()
+                .all(|n| !n.arguments().contains(&composed.clean_output.node))
+        );
+        assert_eq!(composed.program.rules.len(), 1);
+        assert_eq!(
+            composed
+                .program
+                .nodes
+                .iter()
+                .filter(|n| matches!(n, Node::Call { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(
+            composed
+                .program
+                .operators
+                .iter()
+                .filter(|op| Arc::ptr_eq(op, &clean.operators[0]))
+                .count(),
+            1
+        );
+        let mut reads = vec![family.native_read];
+        reads.extend(&family.control_nodes);
+        let graft = Artifact::native(&family.program)
+            .unwrap()
+            .replace_function_inputs(
+                "observed responses",
+                &composed.program,
+                &reads,
+                family.native_write,
+            )
+            .unwrap();
+        let saved =
+            Artifact::from_bytes(&graft.to_bytes().unwrap(), &family.program.declarations).unwrap();
+        let call = saved.place(family.native_write).unwrap();
+        assert!(matches!(saved.program.nodes[call], Node::Call { .. }));
+        let mut paths = composed
+            .response_nodes
+            .iter()
+            .map(|n| vec![call, *n])
+            .collect::<Vec<_>>();
+        paths.push(vec![call, composed.clean_output.node]);
+        let (flat, _, observed) =
+            crate::artifact_device::mapped_inlined_observed(&saved.program, &paths).unwrap();
+        let x = array![[1., -2.], [0.5, 3.]];
+        let base = FamilyInputs {
+            rows: 2,
+            slots: vec![SlotValues::Raw(x.clone())],
+            layout: None,
+        };
+        let clean_trace = clean.execute(&base, false).unwrap();
+        for amplitudes in [[0., 0.], [-1.5, 0.75], [0.25, -2.]] {
+            let inputs = family.inputs(&base, &amplitudes).unwrap();
+            let direct = composed.program.execute(&inputs, false).unwrap();
+            let replay = flat.execute(&inputs, false).unwrap();
+            for (j, response) in responses.iter().enumerate() {
+                let target =
+                    response.execute(&base, false).unwrap().values[response.output].clone();
+                assert_eq!(direct.values[composed.response_nodes[j]], target);
+                assert_eq!(replay.values[observed[j]], target);
+            }
+            assert_eq!(
+                direct.values[composed.clean_output.node],
+                clean_trace.values[clean.output]
+            );
+            assert_eq!(
+                replay.values[*observed.last().unwrap()],
+                clean_trace.values[clean.output]
+            );
+            assert_eq!(
+                direct.values[composed.program.output],
+                replay.values[flat.output]
+            );
+        }
+    }
+    #[test]
+    fn grouped_output_binding_keeps_one_writer_and_actual_observations_after_graft() {
+        use crate::operator_program::LabelKind;
+        let clean = function();
+        let mut response = clean.clone();
+        response.operators[1] = dense(array![[0.5, -0.25]]);
+        let grouped = Interface::uniform(2, 1, LabelKind::Unit, 0).unwrap();
+        let mut native = clean.clone();
+        native.operators = clean
+            .operators
+            .iter()
+            .map(|op| Arc::new((**op).clone()))
+            .collect();
+        let mut writer = (*native.operators[1]).clone();
+        writer.rows = grouped.clone();
+        if let OperatorBody::Dense { present, .. } = &mut writer.body {
+            *present = Array2::from_elem((2, 1), true);
+        }
+        native.operators[1] = Arc::new(writer);
+        let family = down_edit_family::build(
+            &native,
+            0,
+            3,
+            &[Direction {
+                output: array![1., -0.5],
+                hidden: array![0.5, -0.25],
+            }],
+        )
+        .unwrap();
+        let directions = vec![family.program.operators[family.direction_operators[0].0].clone()];
+        let composed =
+            compose_with_outputs_on_interface(&clean, &[response.clone()], &directions, &grouped)
+                .unwrap();
+        let types = composed.program.interfaces().unwrap();
+        assert_eq!(types[composed.clean_output.node], grouped);
+        assert_eq!(types[composed.composed_output], grouped);
+        let Node::Affine {
+            terms: clean_terms, ..
+        } = &composed.program.nodes[composed.clean_output.node]
+        else {
+            panic!("clean writer")
+        };
+        let Node::Affine {
+            terms: final_terms, ..
+        } = &composed.program.nodes[composed.composed_output]
+        else {
+            panic!("composed writer")
+        };
+        assert_eq!(clean_terms[0].1, final_terms[0].1);
+        let candidate = Artifact::native(&family.program)
+            .unwrap()
+            .replace_function_inputs(
+                "grouped observed responses",
+                &composed.program,
+                &[family.native_read, family.control_nodes[0]],
+                family.native_write,
+            )
+            .unwrap();
+        let new_dense = candidate
+            .program
+            .operators
+            .iter()
+            .filter(|op| {
+                matches!(op.body, OperatorBody::Dense { .. })
+                    && !family
+                        .program
+                        .operators
+                        .iter()
+                        .any(|held| Arc::ptr_eq(held, op))
+            })
+            .count();
+        assert_eq!(
+            new_dense, 3,
+            "one reader, one clean writer, one scalar writer; no dead-writer copy"
+        );
+        let saved =
+            Artifact::from_bytes(&candidate.to_bytes().unwrap(), &family.program.declarations)
+                .unwrap();
+        let call = saved.place(family.native_write).unwrap();
+        let paths = vec![
+            vec![call, composed.clean_output.node],
+            vec![call, composed.response_nodes[0]],
+        ];
+        let (flat, _, observed) =
+            crate::artifact_device::mapped_inlined_observed(&saved.program, &paths).unwrap();
+        let x = array![[1., -2.], [-0.5, 3.]];
+        let base = FamilyInputs {
+            rows: 2,
+            slots: vec![SlotValues::Raw(x)],
+            layout: None,
+        };
+        let clean_value = clean.execute(&base, false).unwrap().values[clean.output].clone();
+        let response_value =
+            response.execute(&base, false).unwrap().values[response.output].clone();
+        for amplitude in [-1., 0., 0.75] {
+            let inputs = family.inputs(&base, &[amplitude]).unwrap();
+            let trace = flat.execute(&inputs, false).unwrap();
+            assert_eq!(trace.values[observed[0]], clean_value);
+            assert_eq!(trace.values[observed[1]], response_value);
+            let expected = composed.program.execute(&inputs, false).unwrap();
+            assert_eq!(
+                trace.values[flat.output],
+                expected.values[composed.program.output]
+            );
+        }
+        let mut internally_shared = clean.clone();
+        internally_shared.nodes.insert(
+            3,
+            Node::Affine {
+                terms: vec![(2, 1)],
+                bias: None,
+            },
+        );
+        internally_shared.output = 4;
+        assert!(
+            compose_with_outputs_on_interface(
+                &internally_shared,
+                &[response],
+                &directions,
+                &grouped
+            )
+            .unwrap_err()
+            .contains("split a shared writer")
+        );
+        assert!(
+            compose_with_outputs_on_interface(&clean, &[clean.clone()], &directions, &grouped)
+                .unwrap_err()
+                .contains("split a shared writer")
+        );
+        let mut malformed = clean.clone();
+        malformed.nodes[1] = Node::Affine {
+            terms: vec![(0, 99)],
+            bias: None,
+        };
+        assert!(
+            compose_with_outputs_on_interface(&clean, &[malformed], &directions, &grouped).is_err()
+        );
+        let mut scalar_input = clean.clone();
+        scalar_input.declarations.slots = vec![Slot::Raw { width: 1 }];
+        scalar_input.operators = vec![dense(array![[1.], [2.]])];
+        scalar_input.nodes = vec![
+            Node::Raw { slot: 0 },
+            Node::Affine {
+                terms: vec![(0, 0)],
+                bias: None,
+            },
+        ];
+        scalar_input.output = 1;
+        let mut scalar_response = scalar_input.clone();
+        scalar_response.operators = vec![dense(array![[0.5]])];
+        assert!(
+            compose_with_outputs_on_interface(
+                &scalar_input,
+                &[scalar_response],
+                &[scalar_input.operators[0].clone()],
+                &grouped
+            )
+            .unwrap_err()
+            .contains("split a shared writer")
+        );
     }
     #[test]
     fn saved_multiargument_replacement_predicts_literal_native_weight_edits() {
