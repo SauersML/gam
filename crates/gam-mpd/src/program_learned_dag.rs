@@ -60,6 +60,11 @@ pub struct Settings {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proposal {
     pub expressions: Vec<Expr>,
+    /// Syntactic affine-parameter ancestry for each supervised output. This
+    /// flags available learned paths, not nonzero numerical derivatives,
+    /// observability, or whether fitting can achieve the requested target.
+    #[serde(default)]
+    pub output_has_learned_ancestor: Vec<bool>,
     pub compiled_node_count: usize,
     pub parameter_elements: usize,
     pub trainable_operator_count: usize,
@@ -410,7 +415,7 @@ pub fn enumerate_interfaces(
     let mut result = Inventory { proposals: vec![], explored_states: inputs.len(), accepted_states: inputs.len(), checked_tuples: 0,
         checked_skeleton_tuples: 0, completed_parameter_bindings: 0,
         duplicate_states: 0, duplicate_tuples: 0, rejection_counts: BTreeMap::new(), truncated: false,
-        priority: "Operation-count typed skeletons; complete-tuple compatible restricted-growth parameter partitions; admitted proposals ranked by compiled DAG node count, parameter elements, then canonical ordered syntax. All attempted skeleton and partial binding work bounded; truncation is not exhaustive search.".into() };
+        priority: "Operation-count typed skeletons; round-robin maximum-operation output-tuple bands with four resumable restricted-growth partition searches per band; balanced learned-nonlinear tuple seeds when type-compatible; one attempted binding branch per turn; admitted proposals ranked by compiled DAG node count, parameter elements, then canonical ordered syntax. All attempted skeleton and partial binding work bounded; truncation is not exhaustive search.".into() };
     let mut by_size = vec![(0..inputs.len()).map(Expr::Argument).collect::<Vec<_>>()];
     let mut seen = by_size[0].iter().cloned().collect::<BTreeSet<_>>();
     enum Class {
@@ -543,56 +548,129 @@ pub fn enumerate_interfaces(
         return Ok(result);
     }
     let mut tuple_seen = BTreeSet::new();
-    let mut cursors_seen = BTreeSet::from([vec![0usize; axes.len()]]);
-    let mut heap =
-        std::collections::BinaryHeap::from([std::cmp::Reverse((0usize, vec![0usize; axes.len()]))]);
-    while let Some(std::cmp::Reverse((_, cursor))) = heap.pop() {
+    // Each maximum-operation band has its own frontier. Seeding each axis at
+    // its first expression in the band reaches every tuple with that maximum,
+    // without traversing the entire Cartesian product of shallower expressions.
+    let mut bands = VecDeque::new();
+    let largest_generated_size = pool.iter().map(operations).max().unwrap_or(0);
+    for size in 0..=largest_generated_size {
+        let mut band = TupleBand::default();
+        for axis in 0..axes.len() {
+            if let Some(index) = axes[axis]
+                .iter()
+                .position(|&id| operations(&pool[id]) == size)
+            {
+                let mut cursor = vec![0; axes.len()];
+                cursor[axis] = index;
+                if cursor
+                    .iter()
+                    .enumerate()
+                    .all(|(a, &i)| operations(&pool[axes[a][i]]) <= size)
+                    && band.seen.insert(cursor.clone())
+                {
+                    band.heap.push(std::cmp::Reverse((
+                        tuple_cost(&cursor, &axes, &pool)?,
+                        cursor,
+                    )));
+                }
+            }
+        }
+        // Seed one balanced learned nonlinear tuple before asymmetric frontier
+        // expansion when every exit has such a value at this complexity. This
+        // is a declared scheduling preference, not a supplied native equation.
+        let balanced = axes
+            .iter()
+            .map(|axis| {
+                axis.iter().position(|&id| {
+                    operations(&pool[id]) == size && has_affine(&pool[id]) && has_unary(&pool[id])
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(cursor) = balanced {
+            if band.seen.insert(cursor.clone()) {
+                band.heap.push(std::cmp::Reverse((0, cursor)));
+            }
+        }
+        if !band.heap.is_empty() {
+            bands.push_back((size, band));
+        }
+    }
+    while let Some((size, mut band)) = bands.pop_front() {
         if result.checked_tuples == s.max_tuple_checks || result.proposals.len() == s.max_tuples {
             result.truncated = true;
             break;
         }
-        result.checked_tuples += 1;
-        result.checked_skeleton_tuples += 1;
-        let mut occurrence = 0;
-        let expressions = cursor
-            .iter()
-            .enumerate()
-            .map(|(axis, &i)| fresh_occurrences(&pool[axes[axis][i]], &mut occurrence))
-            .collect::<Vec<_>>();
-        let mut c = checker(inputs, outputs, s);
-        for e in &expressions {
-            c.expr(e)?;
-        }
-        let specs = (0..occurrence)
-            .map(|i| c.parameters[&i].clone())
-            .collect::<Vec<_>>();
-        if specs.is_empty() {
-            reject(
-                &mut result.rejection_counts,
-                "tuple has no learned affine parameter".into(),
-            );
-        } else {
+        // A small fixed window bounds live partition searches independently of
+        // the tuple budget. Rotate admission and one-branch binding work, rather
+        // than finishing every sharing partition before admitting another tuple.
+        if band.tasks.len() < 4
+            && !band.heap.is_empty()
+            && (band.admit_next || band.tasks.is_empty())
+        {
+            if let Some(std::cmp::Reverse((_, cursor))) = band.heap.pop() {
+                result.checked_tuples += 1;
+                result.checked_skeleton_tuples += 1;
+                let mut occurrence = 0;
+                let expressions = cursor
+                    .iter()
+                    .enumerate()
+                    .map(|(axis, &i)| fresh_occurrences(&pool[axes[axis][i]], &mut occurrence))
+                    .collect::<Vec<_>>();
+                let mut c = checker(inputs, outputs, s);
+                for e in &expressions {
+                    c.expr(e)?;
+                }
+                let specs = (0..occurrence)
+                    .map(|i| c.parameters[&i].clone())
+                    .collect::<Vec<_>>();
+                if specs.is_empty() {
+                    reject(
+                        &mut result.rejection_counts,
+                        "tuple has no learned affine parameter".into(),
+                    );
+                } else {
+                    band.tasks.push_back(BindingTask {
+                        specs,
+                        expressions,
+                        stack: vec![BindingFrame {
+                            owners: vec![],
+                            names: vec![],
+                            elements: 0,
+                            next_owner: 0,
+                        }],
+                    });
+                }
+                for axis in 0..cursor.len() {
+                    let mut next = cursor.clone();
+                    next[axis] += 1;
+                    if next[axis] < axes[axis].len()
+                        && operations(&pool[axes[axis][next[axis]]]) <= size
+                        && band.seen.insert(next.clone())
+                    {
+                        band.heap
+                            .push(std::cmp::Reverse((tuple_cost(&next, &axes, &pool)?, next)));
+                    }
+                }
+            }
+            band.admit_next = false;
+        } else if let Some(mut task) = band.tasks.pop_front() {
             BindingSearch {
-                specs: &specs,
-                expressions: &expressions,
+                specs: &task.specs,
+                expressions: &task.expressions,
                 inputs,
                 outputs,
                 settings: s,
                 seen: &mut tuple_seen,
                 result: &mut result,
             }
-            .visit(0, &mut Vec::new(), &mut Vec::new(), 0)?;
-        }
-        for axis in 0..cursor.len() {
-            let mut next = cursor.clone();
-            next[axis] += 1;
-            if next[axis] < axes[axis].len() && cursors_seen.insert(next.clone()) {
-                let cost = next.iter().enumerate().try_fold(0usize, |sum, (a, &i)| {
-                    sum.checked_add(operations(&pool[axes[a][i]]))
-                        .ok_or("tuple operation count overflow")
-                })?;
-                heap.push(std::cmp::Reverse((cost, next)));
+            .step(&mut task.stack)?;
+            if !task.stack.is_empty() {
+                band.tasks.push_back(task);
             }
+            band.admit_next = true;
+        }
+        if !band.heap.is_empty() || !band.tasks.is_empty() {
+            bands.push_back((size, band));
         }
     }
     result.proposals.sort_by(|a, b| {
@@ -674,6 +752,46 @@ fn bind_names(e: &Expr, names: &[usize]) -> Expr {
         },
     }
 }
+#[derive(Default)]
+struct TupleBand {
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<(usize, Vec<usize>)>>,
+    seen: BTreeSet<Vec<usize>>,
+    tasks: VecDeque<BindingTask>,
+    admit_next: bool,
+}
+fn has_affine(e: &Expr) -> bool {
+    match e {
+        Expr::Argument(_) => false,
+        Expr::Affine { .. } => true,
+        Expr::Unary(_, x) => has_affine(x),
+        Expr::Binary(_, a, b) => has_affine(a) || has_affine(b),
+    }
+}
+fn has_unary(e: &Expr) -> bool {
+    match e {
+        Expr::Argument(_) => false,
+        Expr::Unary(_, _) => true,
+        Expr::Affine { input, .. } => has_unary(input),
+        Expr::Binary(_, a, b) => has_unary(a) || has_unary(b),
+    }
+}
+fn tuple_cost(cursor: &[usize], axes: &[Vec<usize>], pool: &[Expr]) -> Result<usize, String> {
+    cursor.iter().enumerate().try_fold(0usize, |sum, (a, &i)| {
+        sum.checked_add(operations(&pool[axes[a][i]]))
+            .ok_or("tuple operation count overflow".into())
+    })
+}
+struct BindingFrame {
+    owners: Vec<Parameter>,
+    names: Vec<usize>,
+    elements: usize,
+    next_owner: usize,
+}
+struct BindingTask {
+    specs: Vec<Parameter>,
+    expressions: Vec<Expr>,
+    stack: Vec<BindingFrame>,
+}
 struct BindingSearch<'a> {
     specs: &'a [Parameter],
     expressions: &'a [Expr],
@@ -684,29 +802,30 @@ struct BindingSearch<'a> {
     result: &'a mut Inventory,
 }
 impl BindingSearch<'_> {
-    fn visit(
-        &mut self,
-        index: usize,
-        owners: &mut Vec<Parameter>,
-        names: &mut Vec<usize>,
-        elements: usize,
-    ) -> Result<(), String> {
-        if self.result.checked_tuples == self.settings.max_tuple_checks
-            || self.result.proposals.len() == self.settings.max_tuples
+    /// Resume one attempted restricted-growth owner binding. Completed and
+    /// exhausted frames do not consume work; every attempted branch does.
+    fn step(&mut self, stack: &mut Vec<BindingFrame>) -> Result<(), String> {
+        while stack
+            .last()
+            .is_some_and(|f| f.names.len() < self.specs.len() && f.next_owner > f.owners.len())
         {
-            self.result.truncated = true;
-            return Ok(());
+            stack.pop();
         }
+        let Some(frame) = stack.last_mut() else {
+            return Ok(());
+        };
+        let index = frame.names.len();
         if index == self.specs.len() {
             self.result.completed_parameter_bindings += 1;
             let candidate = self
                 .expressions
                 .iter()
-                .map(|e| bind_names(e, names))
+                .map(|e| bind_names(e, &frame.names))
                 .collect::<Vec<_>>();
             let candidate = canonicalize(self.inputs, self.outputs, &candidate)?;
             if !self.seen.insert(candidate.clone()) {
                 self.result.duplicate_tuples += 1;
+                stack.pop();
                 return Ok(());
             }
             if self.settings.require_shared && !shares(&candidate) {
@@ -714,6 +833,7 @@ impl BindingSearch<'_> {
                     &mut self.result.rejection_counts,
                     "tuple has no shared non-Argument computation".into(),
                 );
+                stack.pop();
                 return Ok(());
             }
             let mut c = checker(self.inputs, self.outputs, self.settings);
@@ -722,6 +842,7 @@ impl BindingSearch<'_> {
             }
             match c.limits() {
                 Ok((nodes, elements, operators)) => self.result.proposals.push(Proposal {
+                    output_has_learned_ancestor: candidate.iter().map(has_affine).collect(),
                     expressions: candidate,
                     compiled_node_count: nodes,
                     parameter_elements: elements,
@@ -729,61 +850,59 @@ impl BindingSearch<'_> {
                 }),
                 Err(reason) => reject(&mut self.result.rejection_counts, reason),
             }
+            stack.pop();
             return Ok(());
         }
         let spec = self.specs[index].clone();
-        for owner in 0..=owners.len() {
-            if self.result.checked_tuples == self.settings.max_tuple_checks
-                || self.result.proposals.len() == self.settings.max_tuples
-            {
-                self.result.truncated = true;
-                return Ok(());
-            }
-            self.result.checked_tuples += 1;
-            let fresh = owner == owners.len();
-            if fresh && owners.len() == self.settings.max_affine_parameters {
-                reject(
-                    &mut self.result.rejection_counts,
-                    "max_affine_parameters exceeded".into(),
-                );
-                continue;
-            }
-            if !fresh && owners[owner] != spec {
-                reject(
-                    &mut self.result.rejection_counts,
-                    "parameter binding interfaces differ".into(),
-                );
-                continue;
-            }
-            let added = if fresh {
-                spec.rows
-                    .width()
-                    .checked_mul(spec.cols.width())
-                    .and_then(|v| v.checked_add(if spec.bias { spec.rows.width() } else { 0 }))
-                    .ok_or("parameter element count overflow")?
-            } else {
-                0
-            };
-            let total = elements
-                .checked_add(added)
-                .ok_or("parameter element count overflow")?;
-            if total > self.settings.max_parameter_elements {
-                reject(
-                    &mut self.result.rejection_counts,
-                    "max_parameter_elements exceeded".into(),
-                );
-                continue;
-            }
-            if fresh {
-                owners.push(spec.clone());
-            }
-            names.push(owner);
-            self.visit(index + 1, owners, names, total)?;
-            names.pop();
-            if fresh {
-                owners.pop();
-            }
+        let owner = frame.next_owner;
+        frame.next_owner += 1;
+        self.result.checked_tuples += 1;
+        let fresh = owner == frame.owners.len();
+        if fresh && frame.owners.len() == self.settings.max_affine_parameters {
+            reject(
+                &mut self.result.rejection_counts,
+                "max_affine_parameters exceeded".into(),
+            );
+            return Ok(());
         }
+        if !fresh && frame.owners[owner] != spec {
+            reject(
+                &mut self.result.rejection_counts,
+                "parameter binding interfaces differ".into(),
+            );
+            return Ok(());
+        }
+        let added = if fresh {
+            spec.rows
+                .width()
+                .checked_mul(spec.cols.width())
+                .and_then(|v| v.checked_add(if spec.bias { spec.rows.width() } else { 0 }))
+                .ok_or("parameter element count overflow")?
+        } else {
+            0
+        };
+        let total = frame
+            .elements
+            .checked_add(added)
+            .ok_or("parameter element count overflow")?;
+        if total > self.settings.max_parameter_elements {
+            reject(
+                &mut self.result.rejection_counts,
+                "max_parameter_elements exceeded".into(),
+            );
+            return Ok(());
+        }
+        let mut child = BindingFrame {
+            owners: frame.owners.clone(),
+            names: frame.names.clone(),
+            elements: total,
+            next_owner: 0,
+        };
+        if fresh {
+            child.owners.push(spec);
+        }
+        child.names.push(owner);
+        stack.push(child);
         Ok(())
     }
 }
@@ -1280,6 +1399,47 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn finite_budget_admits_trainable_nonlinear_native_exit_and_shared_response() {
+        let native = Interface::native(8).expect("native vector");
+        let scalar = Interface::native(1).expect("scalar response");
+        let mut s = settings();
+        s.latent_widths = vec![1];
+        s.unary = vec![Unary::Silu];
+        s.binary.clear();
+        s.require_shared = true;
+        s.max_operations = 3;
+        s.max_expression_states = 512;
+        s.max_tuple_checks = 128;
+        s.max_tuples = 12;
+        let inputs = vec![native.clone()];
+        let outputs = vec![native, scalar.clone(), scalar];
+        let inventory =
+            enumerate_interfaces(&inputs, &outputs, &s).expect("bounded fair inventory");
+        assert!(
+            inventory.proposals.iter().any(|p| {
+                has_affine(&p.expressions[0])
+                    && has_unary(&p.expressions[0])
+                    && shares(&p.expressions[1..])
+                    && p.expressions[1..].iter().any(has_unary)
+            }),
+            "finite budget must reach a trainable nonlinear clean path and shared nonlinear responses"
+        );
+        for p in &inventory.proposals {
+            assert_eq!(
+                p.output_has_learned_ancestor,
+                p.expressions.iter().map(has_affine).collect::<Vec<_>>()
+            );
+        }
+        assert!(inventory.checked_tuples <= s.max_tuple_checks);
+        assert!(inventory.truncated);
+        let replay = enumerate_interfaces(&inputs, &outputs, &s).expect("deterministic replay");
+        assert_eq!(
+            serde_json::to_string(&inventory).expect("inventory encoding"),
+            serde_json::to_string(&replay).expect("replay encoding")
+        );
+    }
+
     #[test]
     fn unsupplied_projection_partitions_are_enumerated_with_explicit_work_caps() {
         let ty = Interface::native(1).expect("native scalar");
