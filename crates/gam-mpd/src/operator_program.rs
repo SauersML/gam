@@ -93,7 +93,7 @@ use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use gam_math::probability::{NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, normal_cdf_and_pdf};
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::fmt;
 use std::ops::Range;
@@ -1527,12 +1527,6 @@ impl OperatorProgram {
         self.execute_at(inputs, bands, &vec![1.0; self.declarations.parameters])
     }
 
-    /// Recompute nodes `from..` into `trace`, reading the earlier nodes' values from it.
-    pub fn execute_from(&self, inputs: &FamilyInputs, trace: &mut Trace, from: usize) -> Result<(), ProgramError> {
-        let ones = vec![1.0; self.declarations.parameters];
-        self.execute_range(inputs, trace, from, &ones)
-    }
-
     fn execute_range(&self, inputs: &FamilyInputs, trace: &mut Trace, from: usize, parameters: &[f64]) -> Result<(), ProgramError> {
         self.check_inputs(inputs)?;
         trace.values.truncate(from);
@@ -1575,135 +1569,6 @@ impl OperatorProgram {
             balls.extend(top_balls);
         }
         Ok(())
-    }
-
-    /// The unbanded values of nodes `from..` of this program, reading nodes before `from` from
-    /// `base` (a trace of a program that agrees with this one on them).
-    pub fn execute_suffix(&self, inputs: &FamilyInputs, base: &Trace, from: usize) -> Result<Vec<Array2<f64>>, ProgramError> {
-        self.check_inputs(inputs)?;
-        if base.values.len() < from {
-            return Err(ProgramError::Input(format!("a base trace of {} nodes cannot seed node {from}", base.values.len())));
-        }
-        let interfaces = self.interfaces()?;
-        let ones = vec![1.0; self.declarations.parameters];
-        let mut top: Vec<Array2<f64>> = Vec::new();
-        for index in from..self.nodes.len() {
-            let values = Layered { base: &base.values, top: &top, from, patch: None };
-            let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
-            let (value, _) = self.evaluate_node(index, &self.nodes[index], inputs, &values, None, &interfaces, &frame)?;
-            top.push(value);
-        }
-        Ok(top)
-    }
-
-    /// [`OperatorProgram::execute_suffix`]'s value of node `node` alone: each value of the suffix
-    /// is released after its last reader, so the suffix never holds more than its live values.
-    pub fn execute_suffix_node(&self, inputs: &FamilyInputs, base: &Trace, from: usize, node: usize) -> Result<Array2<f64>, ProgramError> {
-        self.check_inputs(inputs)?;
-        if base.values.len() < from || node < from || node >= self.nodes.len() {
-            return Err(ProgramError::Input(format!("a base trace of {} nodes cannot seed nodes {from}..={node}", base.values.len())));
-        }
-        let interfaces = self.interfaces()?;
-        let ones = vec![1.0; self.declarations.parameters];
-        // Each suffix node's last reader within `from..=node`.
-        let mut last = vec![node; node + 1 - from];
-        for index in from..=node {
-            last[index - from] = index;
-        }
-        for index in from..=node {
-            for argument in self.nodes[index].arguments() {
-                if argument >= from {
-                    last[argument - from] = last[argument - from].max(index);
-                }
-            }
-        }
-        last[node - from] = usize::MAX;
-        let mut top: Vec<Array2<f64>> = Vec::with_capacity(node + 1 - from);
-        for index in from..=node {
-            let values = Layered { base: &base.values, top: &top, from, patch: None };
-            let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
-            let (value, _) = self.evaluate_node(index, &self.nodes[index], inputs, &values, None, &interfaces, &frame)?;
-            top.push(value);
-            for (offset, slot) in top.iter_mut().enumerate() {
-                if last[offset] <= index && slot.len() > 0 {
-                    *slot = Array2::zeros((0, 0));
-                }
-            }
-        }
-        Ok(std::mem::replace(&mut top[node - from], Array2::zeros((0, 0))))
-    }
-
-    /// Execute once, deciding each raw mask immediately after its amplitude node.
-    /// The callback sees only the evaluated prefix, including the amplitude itself. Masks must
-    /// have no readers before that decision and contain finite binary entries. The returned
-    /// unbanded trace includes the decided raw masks, so it can be replayed with fixed masks.
-    pub fn execute_with_gates<F>(
-        &self,
-        inputs: &FamilyInputs,
-        gated: &[(usize, usize)],
-        decide: F,
-    ) -> Result<Trace, ProgramError>
-    where
-        F: FnMut(usize, &[Array2<f64>]) -> Result<Array2<f64>, String>,
-    {
-        self.execute_with_gates_at(inputs, gated, &vec![1.0; self.declarations.parameters], decide)
-    }
-
-    /// Autonomous execution under declared controls. Decisions see the states produced by
-    /// these controls, rather than masks chosen before the intervention.
-    pub fn execute_with_gates_at<F>(
-        &self,
-        inputs: &FamilyInputs,
-        gated: &[(usize, usize)],
-        parameters: &[f64],
-        mut decide: F,
-    ) -> Result<Trace, ProgramError>
-    where
-        F: FnMut(usize, &[Array2<f64>]) -> Result<Array2<f64>, String>,
-    {
-        if parameters.len() != self.declarations.parameters || parameters.iter().any(|p| !p.is_finite()) {
-            return Err(ProgramError::Input("one finite value per declared autonomous control required".into()));
-        }
-        self.check_inputs(inputs)?;
-        let interfaces = self.interfaces()?;
-        let mut amplitudes = BTreeSet::new();
-        let mut masks = BTreeSet::new();
-        for &(amplitude, mask) in gated {
-            if amplitude >= self.nodes.len() || mask >= amplitude
-                || !matches!(self.nodes.get(mask), Some(Node::Raw { .. }))
-                || !amplitudes.insert(amplitude) || !masks.insert(mask)
-            {
-                return Err(ProgramError::Input("invalid or duplicate autonomous gate nodes".into()));
-            }
-            if let Node::Raw { slot } = &self.nodes[mask]
-                && self.nodes.iter().filter(|node| matches!(node, Node::Raw { slot: other } if other == slot)).count() != 1
-            {
-                return Err(ProgramError::Input("autonomous mask slot is shared by multiple raw nodes".into()));
-            }
-            if self.nodes[..=amplitude].iter().any(|node| node.arguments().contains(&mask)) {
-                return Err(ProgramError::Input("autonomous mask is read before its decision".into()));
-            }
-            if interfaces[amplitude].width() != interfaces[mask].width() {
-                return Err(ProgramError::Input("autonomous amplitude and mask widths differ".into()));
-            }
-        }
-        let frame = Frame { args: &[], parameters, nodes: &self.nodes, output: self.output };
-        let mut top = Vec::with_capacity(self.nodes.len());
-        for (index, node) in self.nodes.iter().enumerate() {
-            let values = Layered { base: &[], top: &top, from: 0, patch: None };
-            let value = self.evaluate_node(index, node, inputs, &values, None, &interfaces, &frame)?.0;
-            top.push(value);
-            if let Some(&(_, mask_node)) = gated.iter().find(|(amplitude, _)| *amplitude == index) {
-                let mask = decide(index, &top).map_err(ProgramError::Input)?;
-                if mask.dim() != (inputs.rows, interfaces[mask_node].width())
-                    || mask.iter().any(|value| !value.is_finite() || (*value != 0.0 && *value != 1.0))
-                {
-                    return Err(ProgramError::Input("autonomous mask must have the declared shape and finite binary entries".into()));
-                }
-                top[mask_node] = mask;
-            }
-        }
-        Ok(Trace { values: top, bands: None, balls: None })
     }
 
     /// The unbanded trace of `inputs` with `edit` applied to each node's value as soon as it is
@@ -1766,52 +1631,6 @@ impl OperatorProgram {
             if value.dim() != shape {
                 return Err(ProgramError::Input(format!("an edit of node {index} changed its shape {shape:?} to {:?}", value.dim())));
             }
-            top.push(value);
-        }
-        Ok(Trace { values: top, bands: None, balls: None })
-    }
-
-    /// The unbanded trace of `inputs` when each gated node `(node, mask)` is read only through its
-    /// elementwise product with the 0/1 mask node `mask` (an earlier node): such a node is evaluated
-    /// at its mask's nonzero entries alone, each a dot product of its dense terms' rows with their
-    /// arguments, and is exactly zero elsewhere, which no reader sees. Every other node's value is
-    /// [`OperatorProgram::execute`]'s; a gated node of another form is evaluated whole.
-    pub fn execute_gated(&self, inputs: &FamilyInputs, gated: &[(usize, usize)]) -> Result<Trace, ProgramError> {
-        use rayon::prelude::*;
-        self.check_inputs(inputs)?;
-        let interfaces = self.interfaces()?;
-        let ones = vec![1.0; self.declarations.parameters];
-        let frame = Frame { args: &[], parameters: &ones, nodes: &self.nodes, output: self.output };
-        let mut top: Vec<Array2<f64>> = Vec::with_capacity(self.nodes.len());
-        for (index, node) in self.nodes.iter().enumerate() {
-            let mask = gated.iter().find(|(n, _)| *n == index).map(|(_, m)| *m).filter(|m| *m < index);
-            let dense_terms = match node {
-                Node::Affine { terms, bias: None } => terms
-                    .iter()
-                    .map(|(argument, op)| match &self.operators[*op].body {
-                        OperatorBody::Dense { values, .. } if !matches!(self.nodes[*argument], Node::Feature { .. }) => Some((*argument, values)),
-                        _ => None,
-                    })
-                    .collect::<Option<Vec<_>>>(),
-                _ => None,
-            };
-            let value = match (mask, dense_terms) {
-                (Some(mask), Some(terms)) => {
-                    let width = interfaces[index].width();
-                    let gate = &top[mask];
-                    let mut out = Array2::<f64>::zeros((inputs.rows, width));
-                    out.axis_iter_mut(Axis(0)).into_par_iter().enumerate().for_each(|(r, mut row)| {
-                        for c in (0..width).filter(|c| gate[[r, *c]] != 0.0) {
-                            row[c] = terms.iter().map(|(argument, a)| a.row(c).dot(&top[*argument].row(r))).sum();
-                        }
-                    });
-                    out
-                }
-                _ => {
-                    let values = Layered { base: &[], top: &top, from: 0, patch: None };
-                    self.evaluate_node(index, node, inputs, &values, None, &interfaces, &frame)?.0
-                }
-            };
             top.push(value);
         }
         Ok(Trace { values: top, bands: None, balls: None })

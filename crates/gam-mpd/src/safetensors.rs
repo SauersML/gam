@@ -253,25 +253,6 @@ impl SafetensorsFile {
         Ok(reservation.bind(values))
     }
 
-    /// Rows `rows` of the two-axis tensor `name` (`_ × cols`), widened exactly to binary64: a slice
-    /// of a matrix too large to widen whole (a vocabulary's embedding).
-    pub fn matrix_rows(&self, name: &str, rows: std::ops::Range<usize>, cols: usize) -> Result<Array2<f64>, SafetensorsError> {
-        let entry = self.entry(name)?;
-        if entry.shape.len() != 2 || entry.shape[1] != cols || rows.end > entry.shape[0] || rows.start > rows.end {
-            return Err(SafetensorsError::Shape { tensor: name.into(), expected: vec![rows.end, cols], found: entry.shape.clone() });
-        }
-        let float = match &entry.dtype {
-            StoredType::Float(float) => *float,
-            StoredType::Other { name: dtype, .. } => {
-                return Err(SafetensorsError::UnsupportedType { tensor: name.to_string(), dtype: dtype.clone() });
-            }
-        };
-        let width = cols * float.bytes();
-        let start = self.data_start + entry.begin + rows.start * width;
-        let values = self.mmap[start..start + rows.len() * width].chunks_exact(float.bytes()).map(|raw| float.widen(raw)).collect();
-        Ok(Array2::from_shape_vec((rows.len(), cols), values).expect("the slice holds the rows"))
-    }
-
     /// The one-axis tensor `name`, which must hold `len` entries, widened exactly to binary64.
     pub fn vector(&self, name: &str, len: usize) -> Result<Array1<f64>, SafetensorsError> {
         let entry = self.entry(name)?;

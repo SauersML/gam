@@ -18,14 +18,11 @@
 //! [`match_alignment`] and [`copy_alignment`] say how much of a head's own circuit a rule's body
 //! accounts for, before anything is priced, and [`match_energy`] how much of it a match on given
 //! content planes explains; [`match_scale`] and [`copy_scale`] are the bindings'
-//! least-squares scales. [`with_operator`] gives the program with one operator's matrix replaced, so a
-//! rule's derived operator runs in the model itself.
+//! least-squares scales.
 
 use gam_linalg::decompose::{eigh, svd};
-use super::operator_program::{Operator, OperatorProgram, Provenance, exact_precision};
 use gam_linalg::roundoff::SymmetricAssembly;
 use ndarray::{Array1, Array2, Axis};
-use std::sync::Arc;
 
 /// The rows of a `width`-wide rotate-half head holding its rotary planes `first..width/2` (both
 /// halves of each plane), the slowest last.
@@ -133,14 +130,3 @@ pub fn copy_scale(output: &Array2<f64>, value: &Array2<f64>, prediction: &Array2
     if own > 0.0 { (&a * &b).sum() / own } else { 0.0 }
 }
 
-/// `program` with operator `name`'s matrix replaced by `values` (its interfaces kept, exact on the
-/// lattice that holds the new values).
-pub fn with_operator(program: &OperatorProgram, name: &str, values: Array2<f64>) -> Result<OperatorProgram, String> {
-    let at = program.operators.iter().position(|o| o.name == name).ok_or(format!("no operator {name}"))?;
-    let old = &program.operators[at];
-    let precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
-    let replaced = Operator::dense(name, old.rows.clone(), old.cols.clone(), values, precision, Provenance::native(name)).map_err(|e| e.to_string())?;
-    let mut out = program.clone();
-    out.operators[at] = Arc::new(replaced);
-    Ok(out)
-}

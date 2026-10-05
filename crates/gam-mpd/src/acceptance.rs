@@ -170,9 +170,6 @@ pub struct ExecutionCost {
 }
 
 impl ExecutionCost {
-    pub fn bits_per_input(&self) -> f64 {
-        if self.inputs == 0 { 0.0 } else { self.bits / self.inputs as f64 }
-    }
 }
 
 /// `artifact`'s activity listing on `family`, executed `batch_rows` rows (whole units) at a time.
