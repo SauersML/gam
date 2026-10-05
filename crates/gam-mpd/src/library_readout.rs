@@ -63,7 +63,7 @@ use crate::{
     tiled_attention::{probabilities, rotate},
 };
 use gam_gpu::tensor::{Arithmetic, Device, Op, Storage, Tensor};
-use ndarray::{Array1, Array2, ArrayView1, Axis, s};
+use ndarray::{Array1, Array2, ArrayBase, ArrayView1, ArrayView2, Axis, CowArray, Data, Ix1, Ix2, s};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -433,7 +433,7 @@ fn offset_bin(offset: usize) -> usize {
 
 /// Per row of `rows`, the `k` columns of `sign · rows · tableᵀ` largest, descending, found on
 /// `device` (the table resident there) in tiles of `tile` rows.
-fn extreme_columns(device: &Device, table: &Tensor, rows: &Array2<f64>, k: usize, sign: f64, tile: usize) -> Result<Vec<Vec<usize>>, String> {
+fn extreme_columns<S: Data<Elem = f64>>(device: &Device, table: &Tensor, rows: &ArrayBase<S, Ix2>, k: usize, sign: f64, tile: usize) -> Result<Vec<Vec<usize>>, String> {
     let width = table.rows();
     let k = k.min(width);
     let mut out = Vec::with_capacity(rows.nrows());
@@ -503,36 +503,39 @@ pub struct Library<'a> {
     head_paths: usize,
 }
 
-/// One forward pass's observed values on sequences of one length.
-struct Pass {
+type Values<'a> = CowArray<'a, f64, Ix2>;
+
+/// One forward pass's observed values on sequences of one length (owned, or a view of another
+/// pass's rows).
+struct Pass<'a> {
     rows: usize,
     /// Per site, the residual stream it reads and `1/r` per row; the final stream and its `1/r`.
-    streams: Vec<Array2<f64>>,
-    inverse: Vec<Array1<f64>>,
-    last: Array2<f64>,
-    inverse_final: Array1<f64>,
+    streams: Vec<Values<'a>>,
+    inverse: Vec<CowArray<'a, f64, Ix1>>,
+    last: Values<'a>,
+    inverse_final: CowArray<'a, f64, Ix1>,
     /// Per MLP: its activations, gate pre-activations and, when gated, up values.
-    mlp: Vec<(Array2<f64>, Array2<f64>, Option<Array2<f64>>)>,
+    mlp: Vec<(Values<'a>, Values<'a>, Option<Values<'a>>)>,
     /// Per head: the query and key it scores, its read, its value, and its query and key
     /// projections (before its head norms); per head and sequence, its attention weights.
-    head: Vec<[Array2<f64>; 6]>,
-    weights: Vec<Vec<Array2<f64>>>,
+    head: Vec<[Values<'a>; 6]>,
+    weights: Vec<Vec<Values<'a>>>,
 }
 
-impl Pass {
-    /// The first `end` rows of sequence `sequence` (of `length` rows) alone.
-    fn prefix(&self, sequence: usize, length: usize, end: usize) -> Pass {
+impl<'a> Pass<'a> {
+    /// The first `end` rows of sequence `sequence` (of `length` rows) alone, viewed.
+    fn prefix<'b>(&'b self, sequence: usize, length: usize, end: usize) -> Pass<'b> {
         let rows = sequence * length..sequence * length + end;
-        let cut = |x: &Array2<f64>| x.slice(s![rows.clone(), ..]).to_owned();
+        let cut = |x: &'b Values<'a>| -> Values<'b> { CowArray::from(x.slice(s![rows.clone(), ..])) };
         Pass {
             rows: end,
-            streams: self.streams.iter().map(&cut).collect(),
-            inverse: self.inverse.iter().map(|v| v.slice(s![rows.clone()]).to_owned()).collect(),
+            streams: self.streams.iter().map(cut).collect(),
+            inverse: self.inverse.iter().map(|v| CowArray::from(v.slice(s![rows.clone()]))).collect(),
             last: cut(&self.last),
-            inverse_final: self.inverse_final.slice(s![rows.clone()]).to_owned(),
+            inverse_final: CowArray::from(self.inverse_final.slice(s![rows.clone()])),
             mlp: self.mlp.iter().map(|(a, p, u)| (cut(a), cut(p), u.as_ref().map(cut))).collect(),
             head: self.head.iter().map(|values| std::array::from_fn(|j| cut(&values[j]))).collect(),
-            weights: self.weights.iter().map(|w| vec![w[sequence].slice(s![..end, ..end]).to_owned()]).collect(),
+            weights: self.weights.iter().map(|w| vec![CowArray::from(w[sequence].slice(s![..end, ..end]))]).collect(),
         }
     }
 }
@@ -771,35 +774,36 @@ impl<'a> Library<'a> {
     }
 
     /// The forward pass on `batch` (sequences of one length).
-    fn pass(&self, batch: &[&[u32]]) -> Result<Pass, String> {
+    fn pass(&self, batch: &[&[u32]]) -> Result<Pass<'static>, String> {
         let family = sequence_family(batch)?;
         let trace = self.program.forward(&family)?;
         let get = |i: usize| -> Result<Array2<f64>, String> { self.model.download(trace.value(self.observed[i])?).map_err(error) };
         let inverse_of = |x: &Array2<f64>, epsilon: f64| x.map_axis(Axis(1), |row| rms_scale(row, epsilon));
         let streams: Vec<Array2<f64>> = (0..self.sites.len()).map(get).collect::<Result<_, String>>()?;
-        let inverse = streams.iter().zip(&self.sites).map(|(x, s)| inverse_of(x, s.epsilon)).collect();
+        let inverse = streams.iter().zip(&self.sites).map(|(x, s)| CowArray::from(inverse_of(x, s.epsilon))).collect();
         let last = get(self.sites.len())?;
-        let inverse_final = inverse_of(&last, self.final_site.epsilon);
+        let inverse_final = CowArray::from(inverse_of(&last, self.final_site.epsilon));
         let mlp = self
             .mlps
             .iter()
             .enumerate()
             .map(|(b, block)| {
                 let i = self.mlp_paths[b];
-                Ok((get(i)?, get(i + 1)?, if block.up.is_some() { Some(get(i + 2)?) } else { None }))
+                Ok((CowArray::from(get(i)?), CowArray::from(get(i + 1)?), if block.up.is_some() { Some(CowArray::from(get(i + 2)?)) } else { None }))
             })
             .collect::<Result<_, String>>()?;
         let p = self.head_paths;
         let head: Vec<[Array2<f64>; 6]> = (0..self.heads.len())
             .map(|h| Ok([get(p + 6 * h)?, get(p + 6 * h + 1)?, get(p + 6 * h + 2)?, get(p + 6 * h + 3)?, get(p + 6 * h + 4)?, get(p + 6 * h + 5)?]))
             .collect::<Result<_, String>>()?;
-        let weights = self.attend(&head, batch.len(), batch[0].len());
-        Ok(Pass { rows: family.rows, streams, inverse, last, inverse_final, mlp, head, weights })
+        let weights = self.attend(&head, batch.len(), batch[0].len()).into_iter().map(|w| w.into_iter().map(CowArray::from).collect()).collect();
+        let head = head.into_iter().map(|values| values.map(CowArray::from)).collect();
+        Ok(Pass { rows: family.rows, streams: streams.into_iter().map(CowArray::from).collect(), inverse, last: CowArray::from(last), inverse_final, mlp, head, weights })
     }
 
     /// The model's predicted token per row and the gradient of its centred logit in the final
     /// stream (the final norm's denominator frozen), with the centred logit itself.
-    fn predicted(&self, pass: &Pass) -> Result<(Vec<usize>, Array2<f64>, Vec<f64>), String> {
+    fn predicted(&self, pass: &Pass<'_>) -> Result<(Vec<usize>, Array2<f64>, Vec<f64>), String> {
         let predicted: Vec<usize> = extreme_columns(self.wide, &self.unembedding_table, &pass.last, 1, 1.0, self.tile_rows)?.into_iter().map(|c| c[0]).collect();
         let seed = Array2::from_shape_fn(pass.last.dim(), |(r, c)| (self.unembedding[[predicted[r], c]] - self.unembedding_mean[c]) * pass.inverse_final[r]);
         let metric = (0..pass.rows).map(|r| seed.row(r).dot(&pass.last.row(r))).collect();
@@ -815,7 +819,7 @@ impl<'a> Library<'a> {
     /// derivative and the head norms (denominators frozen); the reverse pass itself keeps the
     /// patterns frozen.
     /// Returns `∂m/∂x` for the embedding stream `x` entering the first layer.
-    fn relp(&self, pass: &Pass, seed: Array2<f64>, baseline: Option<&Pass>, routes: bool, visit: &mut dyn FnMut(Visit<'_>)) -> Array2<f64> {
+    fn relp(&self, pass: &Pass<'_>, seed: Array2<f64>, baseline: Option<&Pass<'_>>, routes: bool, visit: &mut dyn FnMut(Visit<'_>)) -> Array2<f64> {
         let length = pass.rows / pass.weights.first().map_or(1, |w| w.len().max(1));
         let positions: Vec<u32> = (0..length as u32).collect();
         let mut g = seed;
@@ -825,16 +829,16 @@ impl<'a> Library<'a> {
                 let d = g.dot(&block.out);
                 let value = match baseline {
                     Some(base) => activations - &base.mlp[b].0,
-                    None => activations.clone(),
+                    None => activations.to_owned(),
                 };
-                let through = |factor: &Array2<f64>, share: f64| {
+                let through = |factor: ArrayView2<'_, f64>, share: f64| {
                     let mut out = &d * activations;
                     ndarray::Zip::from(&mut out).and(factor).for_each(|o, f| *o = if *f == 0.0 { 0.0 } else { share * *o / f });
                     out
                 };
                 let (gate, up_gradient) = match (up, &block.up) {
-                    (Some(up_values), Some(_)) => (through(pre, 0.5), Some(through(up_values, 0.5))),
-                    _ => (through(pre, 1.0), None),
+                    (Some(up_values), Some(_)) => (through(pre.view(), 0.5), Some(through(up_values.view(), 0.5))),
+                    _ => (through(pre.view(), 1.0), None),
                 };
                 let mut read = gate.dot(&block.gate);
                 if let (Some(up_gradient), Some((_, up_map))) = (&up_gradient, &block.up) {
@@ -857,7 +861,7 @@ impl<'a> Library<'a> {
                 let gz = g.dot(&block.output);
                 let value = match baseline {
                     Some(base) => z - &base.head[h][2],
-                    None => z.clone(),
+                    None => z.to_owned(),
                 };
                 attribution.column_mut(c).assign(&(value * &gz).sum_axis(Axis(1)));
                 let mut gv = Array2::<f64>::zeros(gz.dim());
