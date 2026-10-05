@@ -1,8 +1,9 @@
 """Removing more of VPD's "unimportant" subcomponents makes its error smaller (#2951).
 
 From compare's held-out battery (rows 1024-1055 of vpd4l_clean4096): KL(M || E) per token in nats,
-where E is the model with the subcomponents VPD marks unimportant for each token removed (causal-
-importance masks) in the named layers, and the model's own weights everywhere else.
+where E is VPD's published decomposition (goodfire/spd/runs/s-55ea3f9b) with, per token, every
+subcomponent whose causal importance is 0 removed (VPD's own CI > 0 cutoff, the one behind its count of
+205 active per token) in the named layers, and the model's own weights everywhere else.
 
     python bench/figures_2951/vpd_cancellation_fig.py BATTERY.json OUT.png
 """
@@ -16,7 +17,7 @@ import matplotlib.pyplot as plt
 
 battery, out = sys.argv[1:3]
 rows = json.load(open(battery))["held_out"]["rows"]
-kl = lambda name: rows[f"ci/{name}"]["kl_nats"]["mean"]
+kl = lambda name: rows[f"rounded/{name}"]["kl_nats"]["mean"]
 
 INK, MUTED, SURFACE = "#1f1f1e", "#6b6b68", "#ffffff"
 BLUE, GRAY, ORANGE = "#2a78d6", "#a9a9a6", "#eb6834"
@@ -40,9 +41,7 @@ for ax, l in zip(axes, [0, 1, 2]):
     ax.set_xticklabels([b[0] for b in bars], fontsize=17)
     ax.tick_params(axis="x", length=0)
     ax.set_ylim(0, 0.8)
-axes[0].set_ylabel("change in the model's next-token\npredictions (KL, nats per token)")
-fig.suptitle("Removing VPD's \"unimportant\" pieces from layer 3 as well makes the change smaller",
-             x=0.08, ha="left", fontsize=23, y=1.0)
-fig.supxlabel("VPD's \"unimportant\" pieces removed from", fontsize=19, y=-0.04)
+axes[0].set_ylabel("KL from the model's next-token predictions\n(nats per token; 0 = identical)")
+fig.supxlabel("VPD's subcomponents with causal importance 0 removed from", fontsize=19, y=-0.04)
 fig.savefig(out, dpi=170, facecolor=SURFACE, bbox_inches="tight")
 print(out)
