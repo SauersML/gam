@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Rented GPUs for #2951: RunPod's, billed to the MATS team account, and Thunder Compute's (the
-# user's own account) once its key is in the Keychain (PROVIDERS, below).
+# Rented GPUs for #2951: RunPod's, billed to the MATS team account, and Thunder Compute's and
+# Nebius's (the user's own accounts) once their keys are in the Keychain (PROVIDERS, below).
 #
 #   rp-run NAME GPU_TYPE[,GPU_TYPE...] HOURS -- COMMAND...      run COMMAND on one pod
 #   rp-run dev NAME [GPU_TYPE[,GPU_TYPE...] [HOURS]] [-- PATH...] a pod held for development
@@ -9,20 +9,21 @@
 #   rp-run batch SPEC                                             launch every run SPEC lists, at once
 #   rp-run status                                                 one line per running pod
 #
-# GPU_TYPE is a RunPod GPU id ("NVIDIA RTX A5000") or its display name ("RTX A5000"), or a Thunder
-# card thunder:CARD[:MODE] (thunder:a6000, thunder:a100xl:prototyping); a list gives the types in
-# order of preference; auto ranks every offer (RunPod's community and secure, Thunder's) of the cards
-# the benchmark table (gpu_bench.tsv) has measured by $ per scored token, keeping those with
-# RP_MIN_VRAM_GB of memory, and prints the choice; a Thunder card enters it once a benchmark run of
-# it (gpu_bench.sh, GPU thunder:CARD:MODE) is in the table. Work that does not use a GPU (builds, float64 references, CPU fits) goes to
+# GPU_TYPE is a RunPod GPU id ("NVIDIA RTX A5000") or its display name ("RTX A5000"), a Thunder
+# card thunder:CARD[:MODE] (thunder:a6000, thunder:a100xl:prototyping) or a Nebius platform
+# nebius:PLATFORM (nebius:gpu-h100-sxm, preemptible); a list gives the types in order of preference;
+# auto ranks every offer (RunPod's community and secure, Thunder's, Nebius's) of the cards the
+# benchmark table (gpu_bench.tsv) has measured by $ per scored token, keeping those with
+# RP_MIN_VRAM_GB of memory, and prints the choice; another provider's card enters it once a
+# benchmark run of it (gpu_bench.sh with GPU thunder:CARD:MODE or nebius:PLATFORM) is in the table. Work that does not use a GPU (builds, float64 references, CPU fits) goes to
 # GitHub Actions (gha-run), never to a RunPod pod. A run takes community cloud for every listed type before secure
 # cloud, which it takes only when no community pod is in stock (RunPod no longer offers spot pods:
 # "Spot pods are no longer offered", 2026-10-05). It runs COMMAND on the source of a published
 # commit, the outputs come back, and the pod is deleted. HOURS (fractional) caps the run: the Mac
 # deletes the pod HOURS after the first pod's creation (a watcher process that outlives this one),
 # and each pod deletes itself when that time is up by its own clock (runpodctl with the pod's own
-# key; a Thunder instance shuts down, which ends its bill), so a Mac that sleeps, disconnects or
-# dies still stops the bill.
+# key; a Thunder or Nebius machine shuts down, which ends its GPU's bill), so a Mac that sleeps,
+# disconnects or dies still stops the bill.
 #
 # A pod lost before COMMAND ends (a host that fails, a pod deleted elsewhere) is replaced while time
 # remains. The new pod gets the same source, binaries and inputs and the outputs synced so far, and
@@ -84,8 +85,9 @@
 # myself.clientBalance), whoever spent it, plus what every pod running on the account may still
 # cost (its price for the time left to its cap; 4 h for a pod made outside the runner, which every
 # start names); a launch or extension whose estimate (the dearest offer x HOURS) would pass it is
-# refused unless RP_ALLOW_OVER=1. Thunder pods count toward the same cap: what the ledger records
-# for them (cloud THUNDER) plus their price for the time left to their caps. Each pod appends (date, name, gpu, cloud, hours, dollars, pod) to
+# refused unless RP_ALLOW_OVER=1. Thunder and Nebius pods count toward the same cap: what the
+# ledger records for them (cloud THUNDER or NEBIUS) plus their price for the time left to their
+# caps. Each pod appends (date, name, gpu, cloud, hours, dollars, pod) to
 # ~/mpd-data/runpod/LEDGER.tsv, dollars = the pod's price per hour x hours from creation to
 # deletion; cloud is COMMUNITY, SECURE:cheapest-per-token, SECURE:no-community-stock or SECURE:dev; then the seconds
 # the pod spent uploading inputs, building data, and from its creation to the command's start (the
@@ -180,10 +182,10 @@ status_of() { printf '%s' "${1##*$'\n'}"; }
 body_of() { printf '%s' "${1%$'\n'*}"; }
 gql() { api POST "$GRAPHQL" "$(jq -nc --arg q "$1" '{query: $q}')"; }
 
-# Providers besides RunPod, each used only while the macOS Keychain holds its API key (service
+# Providers besides RunPod, each used only while the macOS Keychain holds its credentials (service
 # PROVIDER-api-key): with thunder listed, `security add-generic-password -s thunder-api-key -a "$USER" -w`
-# turns Thunder Compute on, and deleting the key turns it off.
-PROVIDERS=(thunder)
+# turns Thunder Compute on, and deleting the key turns it off; likewise nebius-api-key for Nebius.
+PROVIDERS=(thunder nebius)
 # Thunder Compute (the user's own account). A pod id thunder-ID is its instance ID. Its cards are
 # a6000, a100xl, l40 and h100, in prototyping mode (a GPU attached over the network, cheaper) or
 # production mode (a GPU in the machine); an offer's GPU is written thunder:CARD:MODE, the name a
@@ -197,7 +199,7 @@ PROVIDERS=(thunder)
 # deletes it, and the instance itself shuts down (which ends the bill).
 THUNDER=https://api.thundercompute.com:8443/v1
 THUNDER_CEILING='{"a6000": 0.45, "a100xl": 1.10, "h100": 1.50}'
-provider_of() { case $1 in thunder-*) echo thunder ;; *) echo runpod ;; esac; }
+provider_of() { case $1 in thunder-*) echo thunder ;; nebius-*) echo nebius ;; *) echo runpod ;; esac; }
 thunder_enabled() {
     [ -z "${RP_TEST_ROOT:-}" ] && [[ " ${PROVIDERS[*]} " == *" thunder "* ]] && security find-generic-password -s thunder-api-key > /dev/null 2>&1
 }
@@ -219,6 +221,14 @@ pod_state() {
             r=$(tapi GET /instances/list)
             [ "$(status_of "$r")" = 200 ] || { echo UNKNOWN; return; }
             jq -r --arg id "${1#thunder-}" 'if has($id) then (if (.[$id].status // "" | ascii_upcase) == "RUNNING" then "RUNNING" else "OTHER" end) else "GONE" end' <<< "$(body_of "$r")" ;;
+        nebius)
+            # Preempted, a VM stops (OTHER: the run replaces it); booting counts as running.
+            r=$(napi GET "/compute/v1/instances/${1#nebius-}")
+            case $(status_of "$r") in
+                404) echo GONE ;;
+                200) jq -r '.status.state // "" | if . == "DELETING" then "GONE" elif . == "STOPPING" or . == "STOPPED" or . == "ERROR" then "OTHER" else "RUNNING" end' <<< "$(body_of "$r")" ;;
+                *) echo UNKNOWN ;;
+            esac ;;
         *)
             r=$(api GET "$REST/pods/$1")
             case $(status_of "$r") in
@@ -253,6 +263,139 @@ thunder_instances() {
     [ "$(status_of "$r")" = 200 ] || { echo "rp-run: Thunder instance list failed: $(body_of "$r" | head -c 200)" >&2; return 1; }
     jq -r 'to_entries[] | "\(.key) \(.value.status // "?")"' <<< "$(body_of "$r")"
 }
+
+# Nebius AI Cloud (the user's own account). The Keychain item nebius-api-key holds a service
+# account's credentials JSON (what `nebius iam auth-public-key generate --output FILE` writes; its
+# "subject-credentials" hold the private key, the key's id and the account's id). Each request signs
+# a JWT good for five minutes with that key (RS256 by openssl, which reads the key from a file
+# descriptor) and exchanges it for an access token: Nebius's documented REST flow. The project is
+# the service account's own unless NEBIUS_PROJECT names one; a VM goes on the project's first
+# subnet with a public address. A pod id nebius-ID is the instance's ID. An offer's GPU is
+# nebius:PLATFORM (gpu-h100-sxm, gpu-h200-sxm, ...): a preemptible VM (preempted, it stops, and the
+# run replaces it) under the pricing policy mpd2951-ceiling-PLATFORM, a standing bid of the
+# platform's ceiling (NEBIUS_CEILING, $ per GPU-hour; a platform it does not name is not taken),
+# so the VM is preempted rather than charged above it; the platform's one-GPU preset with
+# RP_MIN_RAM_GB of memory and the fewest vCPUs; a boot disk of the run's size from image family
+# NEBIUS_IMAGE (Ubuntu 24.04, CUDA 12.8 toolkit); cloud-init authorizing the run's key for user
+# ubuntu. Its price is Nebius's own estimate for that request at the spot price now (billing
+# calculator, per hour). At the cap the VM shuts itself down (preemptible VMs keep recovery policy
+# FAIL: stopped, not restarted) and the Mac's watcher deletes it with its disk.
+NEBIUS=https://api.nebius.cloud NEBIUS_AUTH=https://auth.eu.nebius.com/oauth2/token/exchange
+NEBIUS_PROJECT="" NEBIUS_IMAGE=ubuntu24.04-cuda12
+NEBIUS_CEILING='{"gpu-h100-sxm": 1.50, "gpu-h200-sxm": 1.50}'
+nebius_enabled() {
+    [ -z "${RP_TEST_ROOT:-}" ] && [[ " ${PROVIDERS[*]} " == *" nebius "* ]] && security find-generic-password -s nebius-api-key > /dev/null 2>&1
+}
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+# The credentials JSON, from the Keychain (which hands back hex when the item holds line breaks).
+nebius_creds() {
+    local c
+    c=$(security find-generic-password -s nebius-api-key -w) || return 1
+    if [[ $c == \{* ]]; then printf '%s' "$c"; else printf '%s' "$c" | xxd -r -p; fi
+}
+# An access token, printed for the caller to hand to curl on a file descriptor.
+nebius_token() {
+    local h p now
+    now=$(date +%s)
+    h=$(nebius_creds | jq -cj '."subject-credentials" | {alg: "RS256", typ: "JWT", kid: .kid}' | b64url)
+    p=$(nebius_creds | jq -cj --argjson now "$now" '."subject-credentials" | {iss: .iss, sub: .sub, iat: $now, exp: ($now + 300)}' | b64url)
+    printf '%s.%s.%s' "$h" "$p" "$(printf '%s.%s' "$h" "$p" | openssl dgst -sha256 -sign <(nebius_creds | jq -r '."subject-credentials"."private-key"') | b64url)" |
+        curl -sS --max-time 30 "$NEBIUS_AUTH" --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+            --data-urlencode requested_token_type=urn:ietf:params:oauth:token-type:access_token \
+            --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:jwt --data-urlencode subject_token@- |
+        jq -r '.access_token // empty'
+}
+napi() {  # METHOD PATH [JSON]; prints the body, then the HTTP status on its own line
+    local args=(-sS -X "$1" --max-time 60 -w '\n%{http_code}' -H 'Content-Type: application/json') token
+    [ -n "${3:-}" ] && args+=(--data-binary "$3")
+    token=$(nebius_token)
+    [ -n "$token" ] || { printf 'Nebius token exchange failed\n000'; return; }
+    curl "${args[@]}" -H @<(printf 'Authorization: Bearer %s\n' "$token") "$NEBIUS$2" || printf '\n000'
+}
+nebius_subnet() {  # PROJECT
+    local r
+    r=$(napi GET "/vpc/v1/subnets?parentId=$1&pageSize=100")
+    jq -er '.items[0].metadata.id' <<< "$(body_of "$r")" 2> /dev/null || { echo "rp-run: no Nebius subnet in project $1: $(body_of "$r" | head -c 200)" >&2; return 1; }
+}
+nebius_project() {
+    local r
+    [ -z "$NEBIUS_PROJECT" ] || { echo "$NEBIUS_PROJECT"; return; }
+    r=$(napi GET "/iam/v1/service-accounts/$(nebius_creds | jq -r '."subject-credentials".sub')")
+    [ "$(status_of "$r")" = 200 ] || { echo "rp-run: Nebius service account lookup failed: $(body_of "$r" | head -c 200)" >&2; return 1; }
+    jq -er '.metadata.parentId' <<< "$(body_of "$r")"
+}
+# The platform's one-GPU preset with $ram GiB of memory and the fewest vCPUs (null: none).
+NEBIUS_PRESET='def preset($p; $ram): [$p.spec.presets[] | select(.resources.gpuCount == 1 and (.resources.memoryGibibytes // 0) >= $ram)] | sort_by(.resources.vcpuCount) | first;'
+# A CreateInstanceRequest: PLATFORM PRESET PROJECT SUBNET POLICY KEY NAME (POLICY empty for a price
+# estimate, which follows the spot price).
+nebius_request() {
+    jq -nc --arg platform "$1" --arg preset "$2" --arg project "$3" --arg subnet "$4" --arg policy "$5" --arg key "$6" --arg name "$7" \
+        --argjson disk "$DISK" --arg image "$NEBIUS_IMAGE" '
+        {metadata: {parentId: $project, name: $name},
+         spec: ({resources: {platform: $platform, preset: $preset},
+                 bootDisk: {attachMode: "READ_WRITE", managedDisk: {name: ($name + "-boot"),
+                     spec: {type: "NETWORK_SSD", sizeGibibytes: ($disk | tostring), sourceImageFamily: {imageFamily: $image}}}},
+                 networkInterfaces: (if $subnet == "" then [] else [{name: "eth0", subnetId: $subnet, ipAddress: {}, publicIpAddress: {}}] end),
+                 cloudInitUserData: ("#cloud-config\nusers:\n  - name: ubuntu\n    sudo: ALL=(ALL) NOPASSWD:ALL\n    shell: /bin/bash\n    ssh_authorized_keys:\n      - " + $key + "\n"),
+                 preemptible: {onPreemption: "STOP"}, recoveryPolicy: "FAIL"}
+                + (if $policy == "" then {followsSpotPrice: {}} else {spotPricingPolicy: {id: $policy}} end))}'
+}
+# Nebius's one-GPU preemptible offers under the ceilings: "NEBIUS|PRICE|nebius:PLATFORM|VRAM GB"
+# per line, priced by Nebius's calculator for DISK GB of disk (default 30).
+nebius_offers() {  # DISK
+    local project subnet r platforms platform preset mem est price
+    nebius_enabled || return 0
+    project=$(nebius_project) && subnet=$(nebius_subnet "$project") || return 0
+    r=$(napi GET "/compute/v1/platforms?parentId=$project&pageSize=100")
+    [ "$(status_of "$r")" = 200 ] || { echo "rp-run: Nebius platform list failed: $(body_of "$r" | head -c 200)" >&2; return 0; }
+    platforms=$(jq -r --argjson ceil "$NEBIUS_CEILING" --argjson ram "${RP_MIN_RAM_GB:-32}" "$NEBIUS_PRESET"'
+        .items[] | select(.status.allowedForPreemptibles == true) | select($ceil[.metadata.name] != null)
+        | preset(.; $ram) as $p | select($p != null)
+        | "\(.metadata.name) \($p.name) \(.spec.gpuMemoryGigabytes // .spec.gpuMemoryGibibytes // 0)"' <<< "$(body_of "$r")")
+    while read -r platform preset mem; do
+        [ -n "$platform" ] || continue
+        est=$(DISK=${1:-30} nebius_request "$platform" "$preset" "$project" "$subnet" "" "" "mpd2951-estimate" |
+            jq -c '{currency: "usd", filterAggregationUnit: {filterAggregationUnitValues: ["FILTER_AGGREGATION_UNIT_HOUR"]},
+                    resourceSpecs: [{spec: ({"@type": "type.googleapis.com/nebius.compute.v1.CreateInstanceRequest"} + .)}]}')
+        r=$(napi POST /billing/v1/calculator/estimate-batch "$est")
+        [ "$(status_of "$r")" = 200 ] || { echo "rp-run: Nebius price estimate for $platform failed: $(body_of "$r" | head -c 200)" >&2; continue; }
+        price=$(jq -r '([.totalCosts[]? | select((.aggregationUnit.unit // "") | ascii_downcase | test("hour"))][0] // .totalCosts[0]?) | .general.total.cost // empty' <<< "$(body_of "$r")")
+        [ -n "$price" ] || continue
+        awk -v p="$price" -v c="$(jq -r --arg k "$platform" '.[$k]' <<< "$NEBIUS_CEILING")" -v g="$platform" -v m="$mem" \
+            'p + 0 > 0 && p + 0 <= c + 0 { printf "NEBIUS|%.4f|nebius:%s|%s\n", p, g, m }'
+    done <<< "$platforms"
+}
+# The ceiling's pricing policy for PLATFORM in PROJECT, made when missing; prints its id.
+nebius_policy() {  # PROJECT PLATFORM
+    local r name=mpd2951-ceiling-$2 ceil id started
+    ceil=$(jq -r --arg k "$2" '.[$k]' <<< "$NEBIUS_CEILING")
+    r=$(napi GET "/billing/v1/pricing-policies/get-by-name?parentId=$1&name=$name")
+    if [ "$(status_of "$r")" != 200 ]; then
+        r=$(napi POST /billing/v1/pricing-policies "$(jq -nc --arg p "$1" --arg n "$name" --arg g "$2" --arg c "$(printf '%.3f' "$ceil")" \
+            '{metadata: {parentId: $p, name: $n}, spec: {computeInstanceSpec: {v1: {platform: $g}}, pricing: {maxPriceV1: {maxPrice: $c}}}}')")
+        [[ $(status_of "$r") == 2* ]] || { echo "rp-run: Nebius pricing policy $name not made: $(body_of "$r" | head -c 200)" >&2; return 1; }
+        id=$(jq -er '.resourceId' <<< "$(body_of "$r")") || return 1
+        # A VM that names a policy still being made gets an error: wait for it, as for a VM.
+        started=$(date +%s)
+        until [ "$(napi GET "/billing/v1/pricing-policies/$id" | sed '$d' | jq -r '.status.state // ""' 2> /dev/null)" = STATE_ACTIVE ]; do
+            (( $(date +%s) - started < 300 )) || { echo "rp-run: Nebius pricing policy $name not active after 5 minutes" >&2; return 1; }
+            sleep 5
+        done
+        echo "$id"
+        return
+    fi
+    jq -er '.metadata.id' <<< "$(body_of "$r")"
+}
+# Nebius's instances in the project: "ID STATE NAME" per line.
+nebius_instances() {
+    local r project
+    nebius_enabled || return 0
+    project=$(nebius_project) || return 1
+    r=$(napi GET "/compute/v1/instances?parentId=$project&pageSize=1000")
+    [ "$(status_of "$r")" = 200 ] || { echo "rp-run: Nebius instance list failed: $(body_of "$r" | head -c 200)" >&2; return 1; }
+    jq -r '.items[]? | "\(.metadata.id) \(.status.state // "?") \(.metadata.name)"' <<< "$(body_of "$r")"
+}
+provider_offers() { thunder_offers "$@"; nebius_offers "$@"; }
 
 # The binaries a run needs ("NAME" for an example, "test:PACKAGE:NAME" for a test) that neither the
 # prerelease rp-run-bin (assets KEY.NAME, built on GitHub Actions) nor the Mac's cache _bin/KEY holds.
@@ -298,8 +441,11 @@ reap() {
     end=$(cat "$ACTIVE/.$pod.end" 2> /dev/null || echo deleted)
     gpu=${gpu//_/ }
     while (( tries < 20 )); do
-        if [ "$(provider_of "$pod")" = thunder ]; then
-            tapi POST "/instances/${pod#thunder-}/delete" > /dev/null
+        if [ "$(provider_of "$pod")" != runpod ]; then
+            case $(provider_of "$pod") in
+                thunder) tapi POST "/instances/${pod#thunder-}/delete" > /dev/null ;;
+                nebius) napi DELETE "/compute/v1/instances/${pod#nebius-}" > /dev/null ;;
+            esac
             [ "$(pod_state "$pod")" != GONE ] || { gone=1; break; }
             tries=$(( tries + 1 ))
             sleep 6
@@ -406,17 +552,18 @@ budget() {  # ESTIMATE WHAT
         fi
         running=$(awk -v a="$running" -v p="$price" -v t="$left" 'BEGIN { printf "%.2f", a + (t > 0 ? p * t / 3600 : 0) }')
     done <<< "$pods"
-    # Thunder: what its pods in the ledger cost, and what each held one may still cost to its cap.
+    # Thunder and Nebius: what their pods in the ledger cost, and what each held one may still cost
+    # to its cap.
     local tspent
-    tspent=$(awk -F'\t' 'NR > 1 && $4 == "THUNDER" { s += $6 } END { printf "%.2f", s }' "$LEDGER" 2> /dev/null || echo 0)
+    tspent=$(awk -F'\t' 'NR > 1 && ($4 == "THUNDER" || $4 == "NEBIUS") { s += $6 } END { printf "%.2f", s }' "$LEDGER" 2> /dev/null || echo 0)
     spent=$(awk -v a="$spent" -v t="$tspent" 'BEGIN { printf "%.2f", a + t }')
-    for rec in "$ACTIVE"/thunder-*; do
+    for rec in "$ACTIVE"/thunder-* "$ACTIVE"/nebius-*; do
         [ -f "$rec" ] && [ -f "$ACTIVE/.${rec##*/}.deadline" ] || continue
         read -r _ _ _ price _ < "$rec"
         left=$(( $(cat "$ACTIVE/.${rec##*/}.deadline") - now ))
         running=$(awk -v a="$running" -v p="$price" -v t="$left" 'BEGIN { printf "%.2f", a + (t > 0 ? p * t / 3600 : 0) }')
     done
-    echo "rp-run: spent \$$spent (RunPod team account: balance \$$balance, \$$(jq -r '.data.myself.currentSpendPerHr' <<< "$b")/h now; Thunder \$$tspent); running pods may add \$$running; $2 \$$1" >&2
+    echo "rp-run: spent \$$spent (RunPod team account: balance \$$balance, \$$(jq -r '.data.myself.currentSpendPerHr' <<< "$b")/h now; Thunder and Nebius \$$tspent); running pods may add \$$running; $2 \$$1" >&2
     if awk -v s="$spent" -v r="$running" -v e="$1" -v c="$CAP_DOLLARS" 'BEGIN { exit !(s + r + e > c) }' && [ -z "${RP_ALLOW_OVER:-}" ] && [ -z "${RP_DRY:-}" ]; then
         echo "rp-run: \$$spent + \$$running + \$$1 exceeds \$$CAP_DOLLARS; RP_ALLOW_OVER=1 to spend it anyway" >&2
         exit 2
@@ -474,6 +621,23 @@ case ${1:-} in
                 echo "rp-run: Thunder instance list failed: $(body_of "$tr" | head -c 200)" >&2
             fi
         fi
+        if nebius_enabled && project=$(nebius_project); then
+            tr=$(napi GET "/compute/v1/instances?parentId=$project&pageSize=1000")
+            if [ "$(status_of "$tr")" = 200 ]; then
+                while IFS=$'\t' read -r tid tname tgpu tip; do
+                    [ -n "$tid" ] || continue
+                    pod=nebius-$tid tprice="-" tcreated=""
+                    if registered "$pod" && [ -f "$ACTIVE/$pod" ]; then
+                        read -r _ _ _ tprice c _ < "$ACTIVE/$pod"
+                        tcreated=$(date -u -r "$c" '+%Y-%m-%d %H:%M:%S')
+                    fi
+                    pods+=$'\n'"$pod"$'\t'"$tname"$'\t'"$tprice"$'\t'"nebius:$tgpu"$'\t'"$tcreated"$'\t'"$tip"$'\t'22
+                done < <(jq -r '.items[]? | select((.status.state // "") != "DELETING") | [.metadata.id, .metadata.name, .spec.resources.platform,
+                    ((.status.networkInterfaces // [])[0].publicIpAddress.address // "-" | sub("/.*"; ""))] | @tsv' <<< "$(body_of "$tr")")
+            else
+                echo "rp-run: Nebius instance list failed: $(body_of "$tr" | head -c 200)" >&2
+            fi
+        fi
         now=$(date +%s)
         # Each held GPU pod's mean GPU utilization over the last 10 minutes, read from its own samples
         # through its runner's SSH key, all pods at once. A pod held by a runner from before the
@@ -528,12 +692,12 @@ case ${1:-} in
         done <<< "$pods"
         rm -rf "$utils"
         r=$(gql 'query { myself { clientBalance currentSpendPerHr } }')
-        # Thunder's part: its pods in the ledger, and the rate of those running now.
-        tspent=$(awk -F'\t' 'NR > 1 && $4 == "THUNDER" { s += $6 } END { printf "%.2f", s }' "$LEDGER" 2> /dev/null || echo 0)
-        trate=$(awk -F'\t' '$1 ~ /^thunder-/ && $3 != "-" { s += $3 } END { printf "%.4f", s }' <<< "$pods")
+        # Thunder's and Nebius's part: their pods in the ledger, and the rate of those running now.
+        tspent=$(awk -F'\t' 'NR > 1 && ($4 == "THUNDER" || $4 == "NEBIUS") { s += $6 } END { printf "%.2f", s }' "$LEDGER" 2> /dev/null || echo 0)
+        trate=$(awk -F'\t' '$1 ~ /^(thunder|nebius)-/ && $3 != "-" { s += $3 } END { printf "%.4f", s }' <<< "$pods")
         jq -r --arg s "$START_BALANCE" --arg c "$CAP_DOLLARS" --arg idle "$idle_rate" --argjson ts "$tspent" --argjson tr "$trate" '.data.myself
             | (($s | tonumber) - .clientBalance + $ts) as $spent | (.currentSpendPerHr + $tr) as $rate
-            | "spend (the RunPod team account, shared with other MATS users, and our Thunder pods; the $\($c) check counts all of it): $\($spent * 100 | round / 100) since $\($s) of RunPod credit (Thunder $\($ts)), $\($rate * 100 | round / 100)/h now ($\($idle | tonumber * 100 | round / 100)/h on GPUs under 20%); at this rate the $\($c) cap is \(if $rate > 0 then ((($c | tonumber) - $spent) / $rate * 10 | round / 10 | tostring) + " h" else "never" end) away"' <<< "$(body_of "$r")"
+            | "spend (the RunPod team account, shared with other MATS users, and our Thunder and Nebius pods; the $\($c) check counts all of it): $\($spent * 100 | round / 100) since $\($s) of RunPod credit (Thunder and Nebius $\($ts)), $\($rate * 100 | round / 100)/h now ($\($idle | tonumber * 100 | round / 100)/h on GPUs under 20%); at this rate the $\($c) cap is \(if $rate > 0 then ((($c | tonumber) - $spent) / $rate * 10 | round / 10 | tostring) + " h" else "never" end) away"' <<< "$(body_of "$r")"
         exit 0 ;;
     batch)
         [ $# -eq 2 ] && [ -f "$2" ] || usage
@@ -638,20 +802,21 @@ if :; then
         # sequences. A secure offer comes before a community one only when it costs less per token
         # (a secure RTX 4090 before a community L40S). Cards the table has not measured are offered
         # only when no measured card has the memory, cheapest per hour first.
-        # Thunder's offers are ranked by their own measured rows (card thunder:CARD:MODE).
+        # Thunder's and Nebius's offers are ranked by their own measured rows (card thunder:CARD:MODE,
+        # nebius:PLATFORM).
         [ -f "$TABLE" ] || { echo "rp-run: GPU_TYPE auto needs the benchmark table $TABLE" >&2; exit 2; }
         metric="vpd4l bf16 s32 tok/s"
         (( ${RP_MIN_VRAM_GB:-0} > 24 )) && metric="qwen3 bf16 s8 tok/s"
-        thunder=$(thunder_offers | jq -Rsc 'split("\n") | map(select(length > 0) | split("|") | {k: .[0], c: 0, p: (.[1] | tonumber), g: .[2], mem: (.[3] | tonumber)})')
+        others=$(provider_offers | jq -Rsc 'split("\n") | map(select(length > 0) | split("|") | {k: .[0], c: 0, p: (.[1] | tonumber), g: .[2], mem: (.[3] | tonumber)})')
         OFFERS=$(awk -F'\t' -v m="$metric" 'NR == 1 { for (i = 1; i <= NF; i++) { if ($i == "card") c = i; if ($i == m) t = i }; next }
                  t && $t != "-" && $t + 0 > 0 { print $c "\t" $t }' "$TABLE" |
-            jq -Rrs --argjson types "$(jq -c '.data.gpuTypes' <<< "$prices")" --argjson need "${RP_MIN_VRAM_GB:-0}" --argjson thunder "$thunder" '
+            jq -Rrs --argjson types "$(jq -c '.data.gpuTypes' <<< "$prices")" --argjson need "${RP_MIN_VRAM_GB:-0}" --argjson others "$others" '
                 (split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: (.[1] | tonumber)}) | from_entries) as $rate
                 | def offers($t): [{k: "COMMUNITY", c: 0, p: $t.communityPrice}, {k: "SECURE:cheapest-per-token", c: 1, p: $t.securePrice}] | map(select((.p // 0) > 0));
-                  ([$types[] | . as $t | offers($t)[] | . + {g: $t.id, mem: ($t.memoryInGb // 0)}] + $thunder | map(select(.mem >= $need))) as $all
+                  ([$types[] | . as $t | offers($t)[] | . + {g: $t.id, mem: ($t.memoryInGb // 0)}] + $others | map(select(.mem >= $need))) as $all
                 | [$all[] | select($rate[.g] != null) | . + {per: (.p / ($rate[.g] * 3600 / 1e6))}]
                 | if length > 0 then sort_by([.per, .c])
-                  else [$all[] | select((.g | startswith("thunder:")) or (.g | test("A40|A6000|L40|A100|H100|H200"))) | . + {per: null}] | sort_by([.c, .p]) end
+                  else [$all[] | select((.g | test("^(thunder|nebius):")) or (.g | test("A40|A6000|L40|A100|H100|H200"))) | . + {per: null}] | sort_by([.c, .p]) end
                 | .[] | "\(.k)|\(.p)|\(.g)|\(.per // "-")"')
         [ -n "$OFFERS" ] || { echo "rp-run: no card has ${RP_MIN_VRAM_GB:-0} GB" >&2; exit 2; }
         echo "rp-run: auto, cheapest per scored token on the $metric workload (from $TABLE):" >&2
@@ -665,16 +830,16 @@ if :; then
     IFS=, read -r -a types <<< "$GPU"
     for g in "${types[@]}"; do
         g=$(sed 's/^ *//; s/ *$//' <<< "$g")
-        if [[ $g == thunder:* ]]; then
-            [ -n "${thunder+x}" ] || thunder=$(thunder_offers)
-            row=$(awk -F'|' -v g="$g" '$3 == g || index($3, g ":") == 1 { printf "%s{\"k\": \"%s\", \"p\": %s, \"g\": \"%s\", \"c\": 0}", (n++ ? "," : ""), $1, $2, $3 }' <<< "$thunder")
-            [ -n "$row" ] || { echo "rp-run: Thunder offers no $g under the ceilings $THUNDER_CEILING (needs thunder-api-key in the Keychain); its offers: $(cut -d'|' -f2,3 <<< "${thunder:-none}" | paste -sd ' ' -)" >&2; exit 2; }
+        if [[ $g == thunder:* || $g == nebius:* ]]; then
+            [ -n "${others+x}" ] || others=$(provider_offers)
+            row=$(awk -F'|' -v g="$g" '$3 == g || index($3, g ":") == 1 { printf "%s{\"k\": \"%s\", \"p\": %s, \"g\": \"%s\", \"c\": 0}", (n++ ? "," : ""), $1, $2, $3 }' <<< "$others")
+            [ -n "$row" ] || { echo "rp-run: no offer of $g under the ceilings (Thunder $THUNDER_CEILING, Nebius $NEBIUS_CEILING; each needs its key in the Keychain); offers: $(cut -d'|' -f2,3 <<< "${others:-none}" | paste -sd ' ' -)" >&2; exit 2; }
             rows+=("[$row]")
             continue
         fi
         row=$(jq -c --arg g "$g" --arg sk "$secure_kind" '[.data.gpuTypes[] | select(.id == $g or .displayName == $g)][0] // empty
             | [{k: "COMMUNITY", p: .communityPrice, c: 0, g: .id}, {k: $sk, p: .securePrice, c: 1, g: .id}]' <<< "$prices")
-        [ -n "$row" ] || { echo "rp-run: unknown GPU type '$g'; known: $(jq -r '[.data.gpuTypes[].displayName] | join(", ")' <<< "$prices"), thunder:CARD[:MODE]" >&2; exit 2; }
+        [ -n "$row" ] || { echo "rp-run: unknown GPU type '$g'; known: $(jq -r '[.data.gpuTypes[].displayName] | join(", ")' <<< "$prices"), thunder:CARD[:MODE], nebius:PLATFORM" >&2; exit 2; }
         rows+=("$row")
     done
     OFFERS=$(printf '%s\n' "${rows[@]}" | jq -rs --arg mode "$MODE" '
@@ -890,11 +1055,11 @@ if [ -n "${RP_DISK_GB:-}" ]; then
     [[ $RP_DISK_GB =~ ^[0-9]+$ ]] && (( RP_DISK_GB >= DISK )) || { echo "rp-run: RP_DISK_GB must be a whole number of GB, at least $DISK" >&2; exit 2; }
     DISK=$RP_DISK_GB
 fi
-# Thunder's offers repriced for that disk (the estimate follows).
-if grep -q '^THUNDER|' <<< "$OFFERS"; then
-    thunder=$(thunder_offers "$DISK")
-    OFFERS=$(awk -F'|' 'NR == FNR { p[$3] = $2; next } $1 == "THUNDER" { if (!($3 in p)) next; $2 = p[$3] } { print }' OFS='|' <(printf '%s\n' "$thunder") - <<< "$OFFERS")
-    [ -n "$OFFERS" ] || { echo "rp-run: Thunder's offers pass the ceilings with $DISK GB of disk" >&2; exit 2; }
+# Thunder's and Nebius's offers repriced for that disk (the estimate follows).
+if grep -qE '^(THUNDER|NEBIUS)\|' <<< "$OFFERS"; then
+    others=$(provider_offers "$DISK")
+    OFFERS=$(awk -F'|' 'NR == FNR { p[$3] = $2; next } $1 == "THUNDER" || $1 == "NEBIUS" { if (!($3 in p)) next; $2 = p[$3] } { print }' OFS='|' <(printf '%s\n' "$others") - <<< "$OFFERS")
+    [ -n "$OFFERS" ] || { echo "rp-run: no offer passes the ceilings with $DISK GB of disk" >&2; exit 2; }
     PRICE_MAX=$(awk -F'|' '$2 > m { m = $2 } END { print m }' <<< "$OFFERS")
     ESTIMATE=$(awk -v p="$PRICE_MAX" -v h="$HOURS" 'BEGIN { printf "%.2f", p * h }')
 fi
@@ -929,7 +1094,7 @@ if [ -n "${RP_DRY:-}" ]; then
     echo "source:   crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md ${srcpaths[*]:-}"
     echo "binaries: $(unbuilt | tr '\n' ' ' | sed 's/^$/all built/; s/^\(.\)/to build on GitHub Actions: \1/') (examples ${examples[*]:-none}, tests ${tests[*]:-none}, key $KEY)"
     echo "command:  ${cmd:-none}"
-    echo "request:  $(IFS='|' read -r k p g <<< "$(head -n 1 <<< "$OFFERS")"; if [[ $g == thunder:* ]]; then thunder_body "$g" '<run key>'; else create_body "$k" "$g" "$CAP_SECONDS" '<run key> <~/.ssh/runpod_ed25519.pub>'; fi)"
+    echo "request:  $(IFS='|' read -r k p g <<< "$(head -n 1 <<< "$OFFERS")"; if [[ $g == thunder:* ]]; then thunder_body "$g" '<run key>'; elif [[ $g == nebius:* ]]; then nebius_request "${g#nebius:}" '<preset>' '<project>' '<subnet>' '<pricing policy>' '<run key>' "mpd2951-$NAME"; else create_body "$k" "$g" "$CAP_SECONDS" '<run key> <~/.ssh/runpod_ed25519.pub>'; fi)"
     exit 0
 fi
 
@@ -942,7 +1107,7 @@ TMP=$(mktemp -d /tmp/rp-run.XXXXXX)
 ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$TMP/key"
 chmod 600 "$TMP/key"
 KEYS="$( [ -f "$TMP/key.pub" ] && cat "$TMP/key.pub")"$'\n'"$(cat ~/.ssh/runpod_ed25519.pub)"
-POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0
+POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0
 SSH=(ssh -F none -i "$TMP/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ForwardX11=no
      -o UserKnownHostsFile="$TMP/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20
      -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o LogLevel=ERROR)
@@ -983,6 +1148,14 @@ finish() {
             rc=1
         done < <(thunder_instances)
     fi
+    if (( NEBIUS_UNSURE )); then
+        local st nm
+        while read -r id st nm; do
+            [ -n "$id" ] && [[ $nm == mpd2951-$(nebius_name)-* ]] && ! registered "nebius-$id" || continue
+            say "Nebius instance $id ($nm, $st) is not in the registry; if a create of this run made it, delete it at https://console.nebius.com"
+            rc=1
+        done < <(nebius_instances)
+    fi
     if [ -n "$POD" ]; then
         # The watcher sees this process end and finds nothing left to reap.
         reap "$POD" || rc=1
@@ -1007,6 +1180,11 @@ finish() {
             say "POD thunder-$id ($st) is ours, REMAINS, and no run of this Mac holds it"
             rc=1
         done < <(thunder_instances)
+        while read -r id st _; do
+            [ -n "$id" ] && registered "nebius-$id" && [ ! -f "$ACTIVE/nebius-$id" ] || continue
+            say "POD nebius-$id ($st) is ours, REMAINS, and no run of this Mac holds it"
+            rc=1
+        done < <(nebius_instances)
     fi
     rm -rf "$TMP"
     rm -f "$OUT/ssh" "$OUT/rsh" "$OUT/host" "$OUT/STOP" "$OUT/EXTEND"
@@ -1052,6 +1230,21 @@ reach() {
             [ -n "$IP" ] || sleep 5
             continue
         fi
+        if [ "$(provider_of "$POD")" = nebius ]; then
+            r=$(napi GET "/compute/v1/instances/${POD#nebius-}")
+            if [ "$(status_of "$r")" = 200 ]; then
+                b=$(body_of "$r")
+                st=$(jq -r '.status.state // ""' <<< "$b")
+                case $st in STOPPING|STOPPED|ERROR|DELETING) say "VM is $st"; return 1 ;; esac
+                if [ "$st" = RUNNING ]; then
+                    IP=$(jq -r '(.status.networkInterfaces // [])[0].publicIpAddress.address // empty | sub("/.*"; "")' <<< "$b")
+                    PORT=22
+                    [ -n "$IP" ] && jq -c . <<< "$b" >> "$OUT/pod.json"
+                fi
+            fi
+            [ -n "$IP" ] || sleep 5
+            continue
+        fi
         r=$(api GET "$REST/pods/$POD")
         if [ "$(status_of "$r")" = 200 ]; then
             b=$(body_of "$r")
@@ -1073,8 +1266,8 @@ reach() {
 }
 
 # The pod's own cap. A RunPod pod's timer starts with its container (dockerStartCmd: runpodctl with
-# the pod's own key deletes it); this checks it runs. A Thunder instance gets no key, so it is told to
-# shut down at the deadline, and its /workspace is made (RunPod's image has one).
+# the pod's own key deletes it); this checks it runs. A Thunder or Nebius machine gets no key, so it
+# is told to shut down at the deadline, and its /workspace is made (RunPod's image has one).
 own_timer() {
     if [ "$(provider_of "$POD")" = runpod ]; then
         on_pod 'kill -0 "$(cat /rp-watchdog.pid)" && command -v runpodctl > /dev/null' < /dev/null
@@ -1095,6 +1288,46 @@ thunder_body() {  # GPU KEY
          disk_size_gb: ([$disk, ($spec.storageGB.min // 100)] | max), template: "cuda12-8", public_key: $key}'
 }
 
+# Nebius: creates a VM of PLATFORM for this run (preset, subnet and pricing policy looked up now);
+# sets POD, VCPU, NEBIUS_OP (the create's operation), NEBIUS_CODE, CREATED, DEADLINE, and r.
+nebius_name() { tr 'A-Z' 'a-z' <<< "$NAME" | tr -c 'a-z0-9-\n' '-'; }
+nebius_create() {  # PLATFORM
+    local project subnet policy preset vcpu
+    NEBIUS_CODE=000 NEBIUS_OP=""
+    project=$(nebius_project) || return 0
+    subnet=$(nebius_subnet "$project") || { r="no subnet in project $project"$'\n'"000"; return 0; }
+    policy=$(nebius_policy "$project" "$1") || { r="no pricing policy"$'\n'"000"; return 0; }
+    r=$(napi GET "/compute/v1/platforms/get-by-name?parentId=$project&name=$1")
+    read -r preset vcpu < <(jq -r --argjson ram "${RP_MIN_RAM_GB:-32}" "$NEBIUS_PRESET"'preset(.; $ram) | "\(.name) \(.resources.vcpuCount)"' <<< "$(body_of "$r")" 2> /dev/null) || true
+    [ -n "$preset" ] || { r="no one-GPU preset of $1 with ${RP_MIN_RAM_GB:-32} GiB"$'\n'"000"; return 0; }
+    r=$(napi POST /compute/v1/instances "$(nebius_request "$1" "$preset" "$project" "$subnet" "$policy" "$(cat "$TMP/key.pub")" "mpd2951-$(nebius_name)-$(date +%s)")")
+    NEBIUS_CODE=$(status_of "$r")
+    if [[ $NEBIUS_CODE == 2* ]] && [ -n "$(jq -r '.resourceId // empty' <<< "$(body_of "$r")")" ]; then
+        CREATED=$(date +%s)
+        DEADLINE=${DEADLINE:-$(( CREATED + CAP_SECONDS ))}
+        POD=nebius-$(jq -r '.resourceId' <<< "$(body_of "$r")")
+        NEBIUS_OP=$(jq -r '.id' <<< "$(body_of "$r")")
+        VCPU=$vcpu
+    fi
+}
+# Waits for a Nebius operation to finish; true when it succeeded.
+nebius_settled() {  # OPERATION
+    local r b
+    while :; do
+        r=$(napi GET "/compute/v1/instances/operations/$1")
+        if [ "$(status_of "$r")" = 200 ]; then
+            b=$(body_of "$r")
+            if [ -n "$(jq -r '.finishedAt // empty' <<< "$b")" ]; then
+                [ "$(jq -r '.status.code // 0' <<< "$b")" = 0 ] && return 0
+                say "Nebius refused the VM: $(jq -r '.status.message // ""' <<< "$b" | head -c 200)"
+                return 1
+            fi
+        fi
+        (( $(date +%s) - CREATED < 300 )) || { say "the VM's creation had not finished after 5 minutes"; return 1; }
+        sleep 5
+    done
+}
+
 # A pod in stock on a host that works: reachable by SSH, its own deletion timer armed, and CUDA
 # initializing (a host whose CUDA does not start fails every program; one did, with PyTorch too). A
 # pod on a host that failed before (BAD_HOSTS), or that fails now, is deleted and the next offer
@@ -1112,7 +1345,22 @@ launch() {
         trap '' INT TERM HUP
         ATTEMPTED=$(date +%s)
         host=""
-        if [[ $gpu == thunder:* ]]; then
+        if [[ $gpu == nebius:* ]]; then
+            nebius_create "${gpu#nebius:}"
+            code=${NEBIUS_CODE:-000}
+            if [ -n "$POD" ]; then
+                PRICE=$price
+                record "$gpu" "$kind"
+                # The create's operation: a VM refused (no capacity, the bid under the market) is deleted.
+                if ! nebius_settled "$NEBIUS_OP"; then
+                    echo create-failed > "$ACTIVE/.$POD.end"
+                    reap "$POD" || exit 1
+                    POD=""
+                fi
+            elif [[ $code != 4* ]]; then
+                NEBIUS_UNSURE=1
+            fi
+        elif [[ $gpu == thunder:* ]]; then
             r=$(tapi POST /instances/create "$(thunder_body "$gpu" "$(cat "$TMP/key.pub")")")
             code=$(status_of "$r")
             if [[ $code == 2* ]] && [ -n "$(jq -r '.identifier // empty' <<< "$(body_of "$r")")" ]; then
@@ -1158,6 +1406,9 @@ launch() {
         elif ! on_pod 'python3 -c "import ctypes; c = ctypes.CDLL(\"libcuda.so.1\"); n = ctypes.c_int(); assert c.cuInit(0) == 0 and c.cuDeviceGetCount(ctypes.byref(n)) == 0 and n.value > 0"' < /dev/null > /dev/null 2>&1; then
             [ -z "$host" ] || echo "$host" >> "$BAD_HOSTS"
             say "CUDA does not initialize on host ${host:-?} ($(on_pod 'nvidia-smi --query-gpu=driver_version --format=csv,noheader' < /dev/null 2> /dev/null)); recorded as failing; deleting pod $POD"
+        elif ! on_pod 'ls /usr/local/cuda/lib64/libnvrtc.so* > /dev/null 2>&1 || ldconfig -p | grep -q libnvrtc' < /dev/null; then
+            # The device code compiles through NVRTC at run time: an image without it cannot run it.
+            say "the machine has no NVRTC (libnvrtc); deleting pod $POD"
         else
             break
         fi
@@ -1184,7 +1435,7 @@ launch() {
 # (Re)arms the pod's own deletion timer: the pod deletes itself SECONDS from now. The old timer's
 # shell is killed outright first: killing only its sleep would let it go on to the deletion.
 arm() {  # SECONDS
-    if [ "$(provider_of "$POD")" = thunder ]; then
+    if [ "$(provider_of "$POD")" != runpod ]; then
         on_pod "sudo shutdown -c > /dev/null 2>&1; sudo shutdown -h +$(( ($1 + 59) / 60 ))" < /dev/null > /dev/null 2>&1
         return
     fi
