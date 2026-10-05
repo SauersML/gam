@@ -311,6 +311,67 @@ def interchange(runner: Runner, bases: Tensor, sources: Tensor, seed: int) -> di
             "complement_all_blocks": summary([x for f in families[1:] for x in tokens[f]])}
 
 
+@torch.no_grad()
+def complement_every_block(runner: Runner, bases: Tensor, sources: Tensor) -> dict:
+    """The complement patch at every block at once (the decomposition alone, CI masks of the base,
+    delta excluded): at each block and token, M's read keeps its own component inside the span Q of
+    the active subcomponents' reads and takes the shared source's outside it, s + (h - s) Q Q^T,
+    with h M's read under the earlier blocks' patches. The decomposition reads only the active
+    coordinates, so its prediction is its unpatched output. Returns the mean KL over all bases per
+    source, and every token's KL."""
+    vpd, t = runner.vpd, runner.t
+    blocks, d = 2 * t.n_layer, t.wte.shape[1]
+    V = {n: t.site(n).V for n in vpd.names}
+    zero = lambda g: {n: torch.zeros(v.shape[:-1], device=DEVICE) for n, v in g.items()}
+    src_m = []
+    for k in range(sources.shape[0]):
+        cm = {}
+        runner.run(sources[k:k + 1].to(DEVICE), None, None, capture=cm)
+        src_m.append(cm)
+    S = sources.shape[0]
+    sums, counts, tokens = np.zeros(S), np.zeros(S), []
+    for r in range(bases.shape[0]):
+        b = bases[r:r + 1].to(DEVICE)
+        _, g = vpd.target_and_ci(b)
+        e_logits = runner.logits(runner.run(b, g, zero(g)))
+        bases_q = {}
+        for blk in range(blocks):
+            names = block_reads(blk)
+            v_all = torch.cat([V[n] for n in names], 1).cpu().double().numpy()
+            active = torch.cat([g[n][0] > 0 for n in names], -1).cpu().numpy()
+            qs = [scipy.linalg.qr(v_all[:, np.nonzero(a)[0]], mode="economic")[0] if 0 < a.sum() < d else None for a in active]
+            width = max([q.shape[1] for q in qs if q is not None] + [d if (active.sum(-1) >= d).any() else 1])
+            # zero columns pad each token's basis; a token with no active read keeps nothing, one
+            # with d or more keeps everything
+            padded = np.zeros((len(qs), d, width), dtype=np.float32)
+            for i, (q, a) in enumerate(zip(qs, active)):
+                if q is not None:
+                    padded[i, :, :q.shape[1]] = q
+                elif a.sum() >= d:
+                    padded[i, :, :d] = np.eye(d)
+            bases_q[blk] = torch.from_numpy(padded).to(DEVICE)
+
+        def patch(source: dict) -> dict:
+            def make(blk):
+                def f(h):
+                    s_read = source[blk]
+                    diff = (h - s_read)[0]
+                    kept = torch.einsum("tn,tdn->td", torch.einsum("td,tdn->tn", diff, bases_q[blk]), bases_q[blk])
+                    return (s_read[0] + kept)[None]
+                return f
+            return {blk: make(blk) for blk in range(blocks)}
+
+        for k in range(S):
+            me = runner.logits(runner.run(b, None, None, patch=patch(src_m[k])))
+            kl = kl_tokens(e_logits, me)
+            sums[k] += kl.sum().item()
+            counts[k] += kl.numel()
+            tokens.append(kl.cpu())
+        del g, e_logits, bases_q
+        torch.mps.empty_cache()
+    return {"per_source_mean_kl_nats": (sums / counts).tolist(), "all_sources": summary(tokens)}
+
+
 def pgd_shared(runner: Runner, ids: Tensor, steps: int, step_size: float = 0.1, seed: int = 0) -> dict:
     """VPD's eval PGDReconLoss: one source vector per site (and its delta coordinate) shared across
     the batch and every position, random init, `steps` sign-gradient ascent steps of `step_size` on
@@ -373,6 +434,15 @@ def main():
         vpd = load_vpd(load_target(DEVICE), DEVICE)
         result = {"held_out_rows": [first, end], "source_rows": [s_first, s_end], "units": "KL(M_e || E_e) per token in nats",
                   "interchange": interchange(Runner(vpd), val_tokens(end - first, offset=first), val_tokens(s_end - s_first, offset=s_first), seed=first)}
+        json.dump(result, open(out_path, "w"), indent=1)
+        return
+    if sys.argv[2] == "complement_every_block":
+        # vpd_battery.py OUT.json complement_every_block FIRST:END SOURCE_FIRST:SOURCE_END
+        first, end = map(int, sys.argv[3].split(":"))
+        s_first, s_end = map(int, sys.argv[4].split(":"))
+        vpd = load_vpd(load_target(DEVICE), DEVICE)
+        result = {"held_out_rows": [first, end], "source_rows": [s_first, s_end], "units": "KL(M_e || E_e) per token in nats",
+                  "complement_every_block": complement_every_block(Runner(vpd), val_tokens(end - first, offset=first), val_tokens(s_end - s_first, offset=s_first))}
         json.dump(result, open(out_path, "w"), indent=1)
         return
     first, end = map(int, sys.argv[2].split(":"))
