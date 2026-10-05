@@ -2110,6 +2110,230 @@ impl Device {
         }
     }
 
+    /// Each row of `x` RMS-normed and scaled by the gain row `gain`: `y = x k g` with `k = 1/√(mean
+    /// x² + ε)`; `y` (rows × d) in bfloat16 when `bf16` (CUDA; the host rounds its float64 values
+    /// alike), and `k` (rows × 1). A decoder layer's block read (`gam_mpd::decoder`).
+    pub fn rms_gain(&self, x: &Tensor, gain: &Tensor, epsilon: f64, bf16: bool) -> Result<(Tensor, Tensor), GpuError> {
+        if gain.dim() != (1, x.cols) || x.cols == 0 {
+            return Err(shape(format!("a {:?} gain for {:?} rows", gain.dim(), x.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (xv, g) = (host(x)?, host(gain)?);
+                let (mut y, mut k) = (vec![0.0; x.len()], vec![0.0; x.rows]);
+                for r in 0..x.rows {
+                    let row = &xv[r * x.cols..(r + 1) * x.cols];
+                    k[r] = 1.0 / (row.iter().map(|v| v * v).sum::<f64>() / x.cols as f64 + epsilon).sqrt();
+                    for c in 0..x.cols {
+                        let value = row[c] * k[r] * g[c];
+                        y[r * x.cols + c] = if bf16 { round_operand(value, Arithmetic::Bf16) } else { value };
+                    }
+                }
+                Ok((Tensor { rows: x.rows, cols: x.cols, data: Data::Host(y) }, Tensor { rows: x.rows, cols: 1, data: Data::Host(k) }))
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.rms_gain(x, gain, epsilon, bf16),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+        }
+    }
+
+    /// [`Device::rms_gain`]'s input cotangent from its output's `gy`, added into `gx`:
+    /// `k gy g − (k³/d) x Σ gy g x`.
+    pub fn rms_gain_backward(&self, (x, gain, rstd): (&Tensor, &Tensor, &Tensor), gy: &Tensor, gx: &mut Tensor) -> Result<(), GpuError> {
+        same(x, gy, "RMS gain cotangent")?;
+        same(x, gx, "RMS gain input cotangent")?;
+        if gain.dim() != (1, x.cols) || rstd.dim() != (x.rows, 1) {
+            return Err(shape(format!("a {:?} gain and {:?} scales for {:?} rows", gain.dim(), rstd.dim(), x.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (xv, g, k, gv) = (host(x)?, host(gain)?, host(rstd)?, host(gy)?);
+                let out = host_mut(gx)?;
+                let d = x.cols;
+                for r in 0..x.rows {
+                    let dot: f64 = (0..d).map(|c| gv[r * d + c] * g[c] * xv[r * d + c]).sum();
+                    let coefficient = k[r] * k[r] * k[r] * dot / d as f64;
+                    for c in 0..d {
+                        out[r * d + c] += k[r] * gv[r * d + c] * g[c] - coefficient * xv[r * d + c];
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.rms_gain_backward((x, gain, rstd), gy, gx),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+        }
+    }
+
+    /// An attention layer's projections `p` (rows × the queries', keys' and values' heads, each of
+    /// `layout.width` columns, in that order) as its attention reads them, in bfloat16: each query
+    /// and key head RMS-normed and scaled by its row of `norm`'s gains (`(queries + keys) × width`)
+    /// when given, then turned by its row's rotary angles (`rotation`: cosines and sines, rows ×
+    /// planes, and whether planes pair rotate-half); values as they are. With a norm, its scales
+    /// per row and query or key head (rows × (queries + keys)).
+    pub fn heads_rope(&self, p: &Tensor, layout: HeadLayout, norm: Option<(&Tensor, f64)>, rotation: Option<(&Tensor, &Tensor, bool)>) -> Result<(Tensor, Option<Tensor>), GpuError> {
+        layout.check(p, norm.map(|n| n.0), rotation)?;
+        match &*self.backend {
+            Backend::Host => {
+                let (y, k) = host_heads(p, layout, norm.map(|(g, e)| (host(g), e)), rotation, None)?;
+                Ok((Tensor { rows: p.rows, cols: p.cols, data: Data::Host(y.iter().map(|v| round_operand(*v, Arithmetic::Bf16)).collect()) }, k))
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.heads_rope(p, layout, norm, rotation),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+        }
+    }
+
+    /// [`Device::heads_rope`]'s input cotangent from its output's `gy` (f32 on CUDA); `norm` its
+    /// gains and the scales it returned.
+    pub fn heads_rope_backward(&self, p: &Tensor, layout: HeadLayout, norm: Option<(&Tensor, &Tensor)>, rotation: Option<(&Tensor, &Tensor, bool)>, gy: &Tensor) -> Result<Tensor, GpuError> {
+        layout.check(p, norm.map(|n| n.0), rotation)?;
+        same(p, gy, "head projections' cotangent")?;
+        match &*self.backend {
+            Backend::Host => {
+                let gains = norm.map(|(g, k)| (host(g), host(k)));
+                let (gp, _) = host_heads(p, layout, None, rotation, Some((host(gy)?, gains)))?;
+                Ok(Tensor { rows: p.rows, cols: p.cols, data: Data::Host(gp) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.heads_rope_backward(p, layout, norm, rotation, gy),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+        }
+    }
+
+    /// Causal attention of `blocks` equal sequences on [`Device::heads_rope`]'s output `y`: per
+    /// query head, `softmax(scale q kᵀ)` over the earlier positions of its key-value head (query
+    /// heads in order share key-value heads in equal consecutive groups) times their values, the
+    /// heads side by side (rows × queries·width, f32). The weights are rounded to bfloat16 before
+    /// the values' product reads them (the host rounds alike).
+    pub fn causal_attention(&self, y: &Tensor, layout: HeadLayout, blocks: usize, scale: f64) -> Result<Tensor, GpuError> {
+        layout.check(y, None, None)?;
+        if blocks == 0 || y.rows % blocks != 0 || layout.keys == 0 || layout.queries % layout.keys != 0 {
+            return Err(shape(format!("{} rows in {blocks} sequences, {} query and {} key heads", y.rows, layout.queries, layout.keys)));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (a, _) = host_attention(host(y)?, layout, (blocks, y.rows / blocks), scale, None);
+                Ok(Tensor { rows: y.rows, cols: layout.queries * layout.width, data: Data::Host(a) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.causal_attention(y, layout, blocks, scale),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+        }
+    }
+
+    /// [`Device::causal_attention`]'s cotangent in `y` (f32, rows × y's columns) from its output's
+    /// `ga`; the weights are recomputed.
+    pub fn causal_attention_backward(&self, y: &Tensor, layout: HeadLayout, blocks: usize, scale: f64, ga: &Tensor) -> Result<Tensor, GpuError> {
+        layout.check(y, None, None)?;
+        if blocks == 0 || y.rows % blocks != 0 || ga.dim() != (y.rows, layout.queries * layout.width) || layout.keys == 0 || layout.queries % layout.keys != 0 {
+            return Err(shape(format!("a {:?} cotangent of {} rows in {blocks} sequences", ga.dim(), y.rows)));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (_, gy) = host_attention(host(y)?, layout, (blocks, y.rows / blocks), scale, Some(host(ga)?));
+                Ok(Tensor { rows: y.rows, cols: y.cols, data: Data::Host(gy) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.causal_attention_backward(y, layout, blocks, scale, ga),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+        }
+    }
+
+    /// A gated MLP's activations from its two input products `h` (rows × 2m: the gates' m columns,
+    /// then the inputs'): `silu(gate) · input`, rows × m in bfloat16.
+    pub fn swiglu(&self, h: &Tensor) -> Result<Tensor, GpuError> {
+        if h.cols % 2 != 0 {
+            return Err(shape(format!("{:?} gated inputs", h.dim())));
+        }
+        let m = h.cols / 2;
+        match &*self.backend {
+            Backend::Host => {
+                let hv = host(h)?;
+                let a = (0..h.rows * m).map(|i| {
+                    let (r, j) = (i / m, i % m);
+                    let (g, u) = (hv[r * 2 * m + j], hv[r * 2 * m + m + j]);
+                    round_operand(g / (1.0 + (-g).exp()) * u, Arithmetic::Bf16)
+                });
+                Ok(Tensor { rows: h.rows, cols: m, data: Data::Host(a.collect()) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.swiglu(h),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+        }
+    }
+
+    /// [`Device::swiglu`]'s input cotangent (rows × 2m) from its output's `ga` (rows × m).
+    pub fn swiglu_backward(&self, h: &Tensor, ga: &Tensor) -> Result<Tensor, GpuError> {
+        if h.cols % 2 != 0 || ga.dim() != (h.rows, h.cols / 2) {
+            return Err(shape(format!("{:?} gated inputs, a {:?} cotangent", h.dim(), ga.dim())));
+        }
+        let m = h.cols / 2;
+        match &*self.backend {
+            Backend::Host => {
+                let (hv, gv) = (host(h)?, host(ga)?);
+                let mut gh = vec![0.0; h.len()];
+                for i in 0..h.rows * m {
+                    let (r, j) = (i / m, i % m);
+                    let (g, u) = (hv[r * 2 * m + j], hv[r * 2 * m + m + j]);
+                    let s = 1.0 / (1.0 + (-g).exp());
+                    gh[r * 2 * m + j] = gv[i] * u * s * (1.0 + g * (1.0 - s));
+                    gh[r * 2 * m + m + j] = gv[i] * g * s;
+                }
+                Ok(Tensor { rows: h.rows, cols: h.cols, data: Data::Host(gh) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.swiglu_backward(h, ga),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+        }
+    }
+
+    /// GELU in its tanh form ([`PointwiseLaw::GeluTanh`]) of `h` plus the bias row `bias`, rows × m
+    /// in bfloat16.
+    pub fn gelu_tanh(&self, h: &Tensor, bias: Option<&Tensor>) -> Result<Tensor, GpuError> {
+        if bias.is_some_and(|b| b.dim() != (1, h.cols)) {
+            return Err(shape(format!("a bias for {:?} inputs", h.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (hv, b) = (host(h)?, bias.map(host).transpose()?);
+                let a = (0..h.len()).map(|i| round_operand(host_gelu_tanh(hv[i] + b.map_or(0.0, |b| b[i % h.cols])).0, Arithmetic::Bf16));
+                Ok(Tensor { rows: h.rows, cols: h.cols, data: Data::Host(a.collect()) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.gelu_tanh(h, bias),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+        }
+    }
+
+    /// [`Device::gelu_tanh`]'s input cotangent from its output's `ga`.
+    pub fn gelu_tanh_backward(&self, h: &Tensor, bias: Option<&Tensor>, ga: &Tensor) -> Result<Tensor, GpuError> {
+        same(h, ga, "GELU cotangent")?;
+        if bias.is_some_and(|b| b.dim() != (1, h.cols)) {
+            return Err(shape(format!("a bias for {:?} inputs", h.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (hv, gv, b) = (host(h)?, host(ga)?, bias.map(host).transpose()?);
+                let gh = (0..h.len()).map(|i| gv[i] * host_gelu_tanh(hv[i] + b.map_or(0.0, |b| b[i % h.cols])).1);
+                Ok(Tensor { rows: h.rows, cols: h.cols, data: Data::Host(gh.collect()) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.gelu_tanh_backward(h, bias, ga),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+        }
+    }
+
     /// Each row's set under a site's own code (`gam_mpd::site_fit`, module note): with `size = |a[r,
     /// c]| q[r, c]` each subcomponent's real size on the row (its read times its write in the row's
     /// metric) and `bound = left[r] + Σ_{c off} size`, the set
@@ -2343,6 +2567,165 @@ enum RmsMode {
     Value,
     Backward,
     Tangent,
+}
+
+/// An attention layer's heads ([`Device::heads_rope`], [`Device::causal_attention`]): query heads,
+/// key-value heads (each read by an equal consecutive group of query heads), and each head's width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadLayout {
+    pub queries: usize,
+    pub keys: usize,
+    pub width: usize,
+}
+
+impl HeadLayout {
+    /// The projections' columns: every query, key and value head.
+    #[must_use]
+    pub fn columns(&self) -> usize {
+        (self.queries + 2 * self.keys) * self.width
+    }
+
+    fn check(&self, p: &Tensor, gains: Option<&Tensor>, rotation: Option<(&Tensor, &Tensor, bool)>) -> Result<(), GpuError> {
+        let planes_fit = rotation.is_none_or(|(c, s, _)| c.dim() == (p.rows, c.cols) && s.dim() == c.dim() && 2 * c.cols <= self.width);
+        if p.cols != self.columns() || self.width == 0 || gains.is_some_and(|g| g.dim() != (self.queries + self.keys, self.width)) || !planes_fit {
+            return Err(shape(format!("{:?} projections of {self:?}", p.dim())));
+        }
+        Ok(())
+    }
+}
+
+/// The host's [`Device::heads_rope`] (with `norm`, its gains and ε) or, with `backward` (the
+/// output's cotangent, and the norm's gains and scales), its input cotangent; float64 throughout.
+fn host_heads(
+    p: &Tensor,
+    layout: HeadLayout,
+    norm: Option<(Result<&[f64], GpuError>, f64)>,
+    rotation: Option<(&Tensor, &Tensor, bool)>,
+    backward: Option<(&[f64], Option<(Result<&[f64], GpuError>, Result<&[f64], GpuError>)>)>,
+) -> Result<(Vec<f64>, Option<Tensor>), GpuError> {
+    let pv = host(p)?;
+    let (w, heads) = (layout.width, layout.queries + 2 * layout.keys);
+    let rotation = rotation.map(|(c, s, half)| Ok::<_, GpuError>((host(c)?, host(s)?, c.cols, half))).transpose()?;
+    let norm = norm.map(|(g, e)| g.map(|g| (g, e))).transpose()?;
+    let (cotangent, back_norm) = match backward {
+        Some((gy, Some((g, k)))) => (Some(gy), Some((g?, k?))),
+        Some((gy, None)) => (Some(gy), None),
+        None => (None, None),
+    };
+    let normed_heads = layout.queries + layout.keys;
+    let mut out = vec![0.0; pv.len()];
+    let mut scales = vec![0.0; p.rows * normed_heads];
+    let pair = |plane: usize, planes: usize, half: bool| if half { (plane, plane + planes) } else { (2 * plane, 2 * plane + 1) };
+    for r in 0..p.rows {
+        for h in 0..heads {
+            let base = (r * heads + h) * w;
+            let x = &pv[base..base + w];
+            if h >= normed_heads {
+                for i in 0..w {
+                    out[base + i] = cotangent.map_or(x[i], |g| g[base + i]);
+                }
+                continue;
+            }
+            match cotangent {
+                None => {
+                    let mut z = x.to_vec();
+                    if let Some((g, e)) = norm {
+                        let k = 1.0 / (x.iter().map(|v| v * v).sum::<f64>() / w as f64 + e).sqrt();
+                        scales[r * normed_heads + h] = k;
+                        for i in 0..w {
+                            z[i] = x[i] * k * g[h * w + i];
+                        }
+                    }
+                    let mut y = z.clone();
+                    if let Some((c, s, planes, half)) = rotation {
+                        for plane in 0..planes {
+                            let (a, b) = pair(plane, planes, half);
+                            let (cc, ss) = (c[r * planes + plane], s[r * planes + plane]);
+                            y[a] = cc * z[a] - ss * z[b];
+                            y[b] = ss * z[a] + cc * z[b];
+                        }
+                    }
+                    out[base..base + w].copy_from_slice(&y);
+                }
+                Some(gy) => {
+                    let g = &gy[base..base + w];
+                    let mut gz = g.to_vec();
+                    if let Some((c, s, planes, half)) = rotation {
+                        for plane in 0..planes {
+                            let (a, b) = pair(plane, planes, half);
+                            let (cc, ss) = (c[r * planes + plane], s[r * planes + plane]);
+                            gz[a] = cc * g[a] + ss * g[b];
+                            gz[b] = -ss * g[a] + cc * g[b];
+                        }
+                    }
+                    if let Some((gamma, k)) = back_norm {
+                        let k = k[r * normed_heads + h];
+                        let dot: f64 = (0..w).map(|i| gz[i] * gamma[h * w + i] * x[i]).sum();
+                        let coefficient = k * k * k * dot / w as f64;
+                        for i in 0..w {
+                            gz[i] = k * gz[i] * gamma[h * w + i] - coefficient * x[i];
+                        }
+                    }
+                    out[base..base + w].copy_from_slice(&gz);
+                }
+            }
+        }
+    }
+    let scales = (norm.is_some() && cotangent.is_none()).then(|| Tensor { rows: p.rows, cols: normed_heads, data: Data::Host(scales) });
+    Ok((out, scales))
+}
+
+/// The host's [`Device::causal_attention`] of `y` (`blocks` sequences of `length`) and, with
+/// `ga`, its cotangent in `y`; the weights rounded to bfloat16 as the device rounds them.
+fn host_attention(y: &[f64], layout: HeadLayout, (blocks, length): (usize, usize), scale: f64, ga: Option<&[f64]>) -> (Vec<f64>, Vec<f64>) {
+    host_attention_rounded(y, layout, (blocks, length), scale, ga, Arithmetic::Bf16)
+}
+
+/// [`host_attention`] with the weights rounded to `weights` (float64 leaves them exact).
+fn host_attention_rounded(y: &[f64], layout: HeadLayout, (blocks, length): (usize, usize), scale: f64, ga: Option<&[f64]>, weights: Arithmetic) -> (Vec<f64>, Vec<f64>) {
+    let (w, columns, group) = (layout.width, layout.columns(), layout.queries / layout.keys);
+    let reads = layout.queries * w;
+    let rows = blocks * length;
+    let mut a = vec![0.0; rows * reads];
+    let mut gy = vec![0.0; rows * columns];
+    let at = |r: usize, column: usize| y[r * columns + column];
+    for b in 0..blocks {
+        for h in 0..layout.queries {
+            let g = h / group;
+            let (q0, k0, v0) = (h * w, (layout.queries + g) * w, (layout.queries + layout.keys + g) * w);
+            for i in 0..length {
+                let ri = b * length + i;
+                let scores: Vec<f64> = (0..=i).map(|j| scale * (0..w).map(|t| at(ri, q0 + t) * at(b * length + j, k0 + t)).sum::<f64>()).collect();
+                let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let total: f64 = scores.iter().map(|s| (s - m).exp()).sum();
+                let p: Vec<f64> = scores.iter().map(|s| round_operand((s - m).exp() / total, weights)).collect();
+                for t in 0..w {
+                    a[ri * reads + h * w + t] = (0..=i).map(|j| p[j] * at(b * length + j, v0 + t)).sum();
+                }
+                let Some(ga) = ga else { continue };
+                let g_row = &ga[ri * reads + h * w..ri * reads + (h + 1) * w];
+                let dp: Vec<f64> = (0..=i).map(|j| (0..w).map(|t| g_row[t] * at(b * length + j, v0 + t)).sum()).collect();
+                let dot: f64 = (0..=i).map(|j| p[j] * dp[j]).sum();
+                for j in 0..=i {
+                    let rj = b * length + j;
+                    let ds = p[j] * (dp[j] - dot);
+                    for t in 0..w {
+                        gy[rj * columns + v0 + t] += p[j] * g_row[t];
+                        gy[ri * columns + q0 + t] += scale * ds * at(rj, k0 + t);
+                        gy[rj * columns + k0 + t] += scale * ds * at(ri, q0 + t);
+                    }
+                }
+            }
+        }
+    }
+    (a, gy)
+}
+
+/// GELU in its tanh form at `x`, and its slope.
+fn host_gelu_tanh(x: f64) -> (f64, f64) {
+    let (c, k) = ((2.0 / std::f64::consts::PI).sqrt(), 0.044_715);
+    let t = (c * (x + k * x * x * x)).tanh();
+    (0.5 * x * (1.0 + t), 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * c * (1.0 + 3.0 * k * x * x))
 }
 
 /// One step of [`Device::posterior_adam`]: the data term's weight on the given gradient, Adam's
@@ -3684,6 +4067,9 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
     /// The f32 twins of [`KERNELS`] (module note), one name and parameter list per kernel.
     const KERNELS_F32: &str = include_str!("tensor_f32.cu");
 
+    /// The decoder layer's fused kernels (`decoder.cu`), compiled on first use.
+    const KERNELS_DECODER: &str = include_str!("decoder.cu");
+
     /// One CUDA device's stream, cuBLAS handle and kernels.
     pub(super) struct Engine {
         pub(super) name: String,
@@ -3694,6 +4080,9 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         /// The f32 twins, compiled on first use, and the functions loaded from them.
         module32: std::sync::OnceLock<Arc<CudaModule>>,
         functions32: std::sync::Mutex<HashMap<&'static str, CudaFunction>>,
+        /// The decoder kernels, compiled on first use, and the functions loaded from them.
+        module_decoder: std::sync::OnceLock<Arc<CudaModule>>,
+        functions_decoder: std::sync::Mutex<HashMap<&'static str, CudaFunction>>,
         checked_interval_module: crate::device_cache::PtxModuleCache,
         /// The row flags of a call that scores every row (never read).
         every_row: CudaSlice<u32>,
@@ -3794,6 +4183,10 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         }
     }
 
+    fn u32_of(n: usize) -> Result<u32, GpuError> {
+        u32::try_from(n).map_err(|_| shape(format!("{n} exceeds a decoder kernel's 32-bit indices")))
+    }
+
     fn i32_of(n: usize) -> Result<i32, GpuError> {
         i32::try_from(n).map_err(|_| shape(format!("{n} exceeds cuBLAS's 32-bit dimensions")))
     }
@@ -3883,6 +4276,8 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                 module,
                 module32: std::sync::OnceLock::new(),
                 functions32: std::sync::Mutex::new(HashMap::new()),
+                module_decoder: std::sync::OnceLock::new(),
+                functions_decoder: std::sync::Mutex::new(HashMap::new()),
                 checked_interval_module: crate::device_cache::PtxModuleCache::new(),
                 every_row,
                 gemm_workspace: std::sync::Mutex::new(F32Workspace::default()),
@@ -4317,6 +4712,329 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         /// `t` (f32) as a bfloat16 tensor.
         pub(super) fn bf16_copy(&self, t: &Tensor) -> Result<Tensor, GpuError> {
             Ok(Tensor { rows: t.rows, cols: t.cols, data: Data::CudaBf16(self.round_half(slice32(t)?, 0, t.len())?) })
+        }
+
+        /// Decoder kernel `name` (`decoder.cu`), its module compiled on first use.
+        fn decoder(&self, name: &'static str) -> Result<CudaFunction, GpuError> {
+            let mut loaded = self.functions_decoder.lock().map_err(|_| shape("poisoned decoder kernel table".to_string()))?;
+            if let Some(f) = loaded.get(name) {
+                return Ok(f.clone());
+            }
+            let module = match self.module_decoder.get() {
+                Some(module) => module,
+                None => {
+                    static MODULES: std::sync::OnceLock<crate::device_cache::KeyedPtxModuleCache<usize>> = std::sync::OnceLock::new();
+                    let compiled = MODULES
+                        .get_or_init(crate::device_cache::KeyedPtxModuleCache::new)
+                        .get_or_compile(&self.ctx, self.ctx.ordinal(), "decoder", |_| KERNELS_DECODER.to_string())?;
+                    self.module_decoder.get_or_init(|| compiled)
+                }
+            };
+            let f = module.load_function(name).gpu_ctx_with(|e| format!("decoder kernel {name}: {e}"))?;
+            loaded.insert(name, f.clone());
+            Ok(f)
+        }
+
+        /// An f32 tensor's buffer left unset for a kernel that writes every value.
+        fn unset32(&self, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
+            // SAFETY: the caller's kernel writes all values before any is read.
+            let data = Data::Cuda32(unsafe { self.stream.alloc::<f32>((rows * cols).max(1)) }.gpu_ctx("tensor alloc")?);
+            Ok(Tensor { rows, cols, data })
+        }
+
+        /// A bfloat16 tensor's buffer left unset for a kernel that writes every value.
+        fn unset16(&self, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
+            // SAFETY: as `unset32`.
+            let data = Data::CudaBf16(unsafe { self.stream.alloc::<u16>((rows * cols).max(1)) }.gpu_ctx("tensor alloc")?);
+            Ok(Tensor { rows, cols, data })
+        }
+
+        pub(super) fn rms_gain(&self, x: &Tensor, gain: &Tensor, epsilon: f64, bf16: bool) -> Result<(Tensor, Tensor), GpuError> {
+            let (rows, d) = (u32_of(x.rows)?, u32_of(x.cols)?);
+            let mut y = if bf16 { self.unset16(x.rows, x.cols)? } else { self.unset32(x.rows, x.cols)? };
+            let mut rstd = self.unset32(x.rows, 1)?;
+            let f = self.decoder("rms_gain")?;
+            let eps = epsilon as f32;
+            let (null32, null16) = (0u64, 0u64);
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&rows).arg(&d).arg(&eps).arg(slice32(x)?).arg(slice32(gain)?);
+            match &mut y.data {
+                Data::CudaBf16(h) => builder.arg(&null32).arg(h),
+                Data::Cuda32(s) => builder.arg(s).arg(&null16),
+                other => return Err(mismatch(other)),
+            };
+            builder.arg(slice32_mut(&mut rstd)?);
+            // SAFETY: rows × d input and output, d gains, rows scales; one block per row.
+            unsafe { builder.launch(cfg_rows(x.rows)) }.gpu_ctx("decoder rms_gain")?;
+            Ok((y, rstd))
+        }
+
+        pub(super) fn rms_gain_backward(&self, (x, gain, rstd): (&Tensor, &Tensor, &Tensor), gy: &Tensor, gx: &mut Tensor) -> Result<(), GpuError> {
+            let (rows, d) = (u32_of(x.rows)?, u32_of(x.cols)?);
+            let f = self.decoder("rms_gain_backward")?;
+            // SAFETY: shapes checked by the caller; one block per row.
+            unsafe {
+                self.stream.launch_builder(&f).arg(&rows).arg(&d).arg(slice32(x)?).arg(slice32(gain)?).arg(slice32(rstd)?).arg(slice32(gy)?).arg(slice32_mut(gx)?).launch(cfg_rows(x.rows))
+            }
+            .gpu_ctx("decoder rms_gain_backward")
+            .map(|_| ())
+        }
+
+        pub(super) fn heads_rope(
+            &self,
+            p: &Tensor,
+            layout: super::HeadLayout,
+            norm: Option<(&Tensor, f64)>,
+            rotation: Option<(&Tensor, &Tensor, bool)>,
+        ) -> Result<(Tensor, Option<Tensor>), GpuError> {
+            let mut y = self.unset16(p.rows, p.cols)?;
+            let mut rstd = match norm {
+                Some(_) => Some(self.unset32(p.rows, layout.queries + layout.keys)?),
+                None => None,
+            };
+            let (rows, q, kv, w) = (u32_of(p.rows)?, u32_of(layout.queries)?, u32_of(layout.keys)?, u32_of(layout.width)?);
+            let planes = u32_of(rotation.map_or(0, |(c, _, _)| c.cols))?;
+            let (half, normed, eps) = (i32::from(rotation.is_some_and(|r| r.2)), i32::from(norm.is_some()), norm.map_or(0.0, |n| n.1) as f32);
+            let null = 0u64;
+            let f = self.decoder("heads_rope")?;
+            let items = (p.rows as u64) * (layout.queries + 2 * layout.keys) as u64;
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&rows).arg(&q).arg(&kv).arg(&w).arg(&planes).arg(&half).arg(&normed).arg(&eps).arg(slice32(p)?);
+            match norm {
+                Some((gains, _)) => builder.arg(slice32(gains)?),
+                None => builder.arg(&null),
+            };
+            match rotation {
+                Some((c, s, _)) => builder.arg(slice32(c)?).arg(slice32(s)?),
+                None => builder.arg(&null).arg(&null),
+            };
+            match &mut y.data {
+                Data::CudaBf16(h) => builder.arg(h),
+                other => return Err(mismatch(other)),
+            };
+            match rstd.as_mut() {
+                Some(r) => builder.arg(slice32_mut(r)?),
+                None => builder.arg(&null),
+            };
+            // SAFETY: shapes checked by the caller; one warp per (row, head).
+            unsafe { builder.launch(cfg_elements(items * 32)) }.gpu_ctx("decoder heads_rope")?;
+            Ok((y, rstd))
+        }
+
+        pub(super) fn heads_rope_backward(
+            &self,
+            p: &Tensor,
+            layout: super::HeadLayout,
+            norm: Option<(&Tensor, &Tensor)>,
+            rotation: Option<(&Tensor, &Tensor, bool)>,
+            gy: &Tensor,
+        ) -> Result<Tensor, GpuError> {
+            let mut gp = self.unset32(p.rows, p.cols)?;
+            let (rows, q, kv, w) = (u32_of(p.rows)?, u32_of(layout.queries)?, u32_of(layout.keys)?, u32_of(layout.width)?);
+            let planes = u32_of(rotation.map_or(0, |(c, _, _)| c.cols))?;
+            let (half, normed) = (i32::from(rotation.is_some_and(|r| r.2)), i32::from(norm.is_some()));
+            let null = 0u64;
+            let f = self.decoder("heads_rope_backward")?;
+            let items = (p.rows as u64) * (layout.queries + 2 * layout.keys) as u64;
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&rows).arg(&q).arg(&kv).arg(&w).arg(&planes).arg(&half).arg(&normed).arg(slice32(p)?);
+            match norm {
+                Some((gains, _)) => builder.arg(slice32(gains)?),
+                None => builder.arg(&null),
+            };
+            match rotation {
+                Some((c, s, _)) => builder.arg(slice32(c)?).arg(slice32(s)?),
+                None => builder.arg(&null).arg(&null),
+            };
+            match norm {
+                Some((_, rstd)) => builder.arg(slice32(rstd)?),
+                None => builder.arg(&null),
+            };
+            builder.arg(slice32(gy)?).arg(slice32_mut(&mut gp)?);
+            // SAFETY: shapes checked by the caller; one warp per (row, head).
+            unsafe { builder.launch(cfg_elements(items * 32)) }.gpu_ctx("decoder heads_rope_backward")?;
+            Ok(gp)
+        }
+
+        /// The scores `scale Q Kᵀ` of every (query head, sequence) block of `y` (bfloat16, queries'
+        /// heads then keys' then values'), into `scores` (query head-major, then sequence).
+        fn attention_scores(&self, y: &CudaSlice<u16>, layout: super::HeadLayout, (blocks, length, columns): (usize, usize, usize), scale: f64, scores: &mut CudaSlice<f32>) -> Result<(), GpuError> {
+            let (w, group) = (layout.width, layout.queries / layout.keys);
+            for h in 0..layout.queries {
+                let g = h / group;
+                // Row-major S = Q Kᵀ is column-major Sᵀ = K Qᵀ: K transposed, then Q as it is.
+                let product = Gemm32 {
+                    ops: (cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N),
+                    dims: (length, length, w),
+                    scale: (scale as f32, 0.0),
+                    a: (Factor::Half(y), (layout.queries + g) * w, columns),
+                    b: (Factor::Half(y), h * w, columns),
+                    c: (&mut *scores, h * blocks * length * length, length),
+                    compute: cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                };
+                self.gemm_ex(product, blocks, (length * columns, length * columns, length * length))?;
+            }
+            Ok(())
+        }
+
+        /// Every query head's causal softmax weights (bfloat16) from `y` (module note of
+        /// `decoder.cu`).
+        fn attention_weights(&self, y: &CudaSlice<u16>, layout: super::HeadLayout, (blocks, length, columns): (usize, usize, usize), scale: f64) -> Result<CudaSlice<u16>, GpuError> {
+            let count = layout.queries * blocks * length;
+            // SAFETY: every score is written by the products before the softmax reads it.
+            let mut scores = unsafe { self.stream.alloc::<f32>((count * length).max(1)) }.gpu_ctx("tensor alloc")?;
+            self.attention_scores(y, layout, (blocks, length, columns), scale, &mut scores)?;
+            // SAFETY: the softmax writes every weight and log partition.
+            let mut weights = unsafe { self.stream.alloc::<u16>((count * length).max(1)) }.gpu_ctx("tensor alloc")?;
+            let mut lse = unsafe { self.stream.alloc::<f32>(count.max(1)) }.gpu_ctx("tensor alloc")?;
+            let (rows, cols) = (u32_of(count)?, u32_of(length)?);
+            let f = self.decoder("causal_softmax")?;
+            // SAFETY: `count` rows of `length` scores and weights; one block per row.
+            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(&scores).arg(&mut weights).arg(&mut lse).launch(cfg_rows(count)) }
+                .gpu_ctx("decoder causal_softmax")?;
+            Ok(weights)
+        }
+
+        pub(super) fn causal_attention(&self, y: &Tensor, layout: super::HeadLayout, blocks: usize, scale: f64) -> Result<Tensor, GpuError> {
+            let Data::CudaBf16(yh) = &y.data else { return Err(mismatch(&y.data)) };
+            let (rows, columns, w, group) = (y.rows, y.cols, layout.width, layout.queries / layout.keys);
+            let length = rows / blocks;
+            let weights = self.attention_weights(yh, layout, (blocks, length, columns), scale)?;
+            let mut a = self.unset32(rows, layout.queries * w)?;
+            let reads = layout.queries * w;
+            for h in 0..layout.queries {
+                let g = h / group;
+                // Row-major O = P V is column-major Oᵀ = Vᵀ Pᵀ: both as they are.
+                let product = Gemm32 {
+                    ops: (cublasOperation_t::CUBLAS_OP_N, cublasOperation_t::CUBLAS_OP_N),
+                    dims: (w, length, length),
+                    scale: (1.0, 0.0),
+                    a: (Factor::Half(yh), (layout.queries + layout.keys + g) * w, columns),
+                    b: (Factor::Half(&weights), h * blocks * length * length, length),
+                    c: (slice32_mut(&mut a)?, h * w, reads),
+                    compute: cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                };
+                self.gemm_ex(product, blocks, (length * columns, length * length, length * reads))?;
+            }
+            Ok(a)
+        }
+
+        pub(super) fn causal_attention_backward(&self, y: &Tensor, layout: super::HeadLayout, blocks: usize, scale: f64, ga: &Tensor) -> Result<Tensor, GpuError> {
+            let Data::CudaBf16(yh) = &y.data else { return Err(mismatch(&y.data)) };
+            let (rows, columns, w, group) = (y.rows, y.cols, layout.width, layout.queries / layout.keys);
+            let (length, reads) = (rows / blocks, layout.queries * w);
+            let weights = self.attention_weights(yh, layout, (blocks, length, columns), scale)?;
+            let gah = self.round_half(slice32(ga)?, 0, ga.len())?;
+            let count = layout.queries * blocks * length;
+            // SAFETY: the products write every weight cotangent before the softmax's reverse reads it.
+            let mut dp = unsafe { self.stream.alloc::<f32>((count * length).max(1)) }.gpu_ctx("tensor alloc")?;
+            let block = |h: usize| h * blocks * length * length;
+            for h in 0..layout.queries {
+                let g = h / group;
+                // dP = gA Vᵀ: column-major dPᵀ = V gAᵀ.
+                let product = Gemm32 {
+                    ops: (cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N),
+                    dims: (length, length, w),
+                    scale: (1.0, 0.0),
+                    a: (Factor::Half(yh), (layout.queries + layout.keys + g) * w, columns),
+                    b: (Factor::Half(&gah), h * w, reads),
+                    c: (&mut dp, block(h), length),
+                    compute: cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                };
+                self.gemm_ex(product, blocks, (length * columns, length * reads, length * length))?;
+            }
+            // SAFETY: the softmax's reverse writes every score cotangent.
+            let mut ds = unsafe { self.stream.alloc::<u16>((count * length).max(1)) }.gpu_ctx("tensor alloc")?;
+            let (n, cols) = (u32_of(count)?, u32_of(length)?);
+            let f = self.decoder("causal_softmax_backward")?;
+            // SAFETY: `count` rows of `length` weights and cotangents; one block per row.
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&cols).arg(&weights).arg(&dp).arg(&mut ds).launch(cfg_rows(count)) }
+                .gpu_ctx("decoder causal_softmax_backward")?;
+            drop(dp);
+            // Keys' and values' cotangents sum over their group's query heads.
+            let mut gy = self.zeros32(rows * columns)?;
+            for h in 0..layout.queries {
+                let g = h / group;
+                let products = [
+                    // dV += Pᵀ gA: column-major dVᵀ = gAᵀ P.
+                    (Factor::Half(&gah), h * w, reads, length * reads, Factor::Half(&weights), cublasOperation_t::CUBLAS_OP_T, (layout.queries + layout.keys + g) * w, 1.0f32, 1.0f32),
+                    // dQ = c dS K: column-major dQᵀ = Kᵀ dSᵀ.
+                    (Factor::Half(yh), (layout.queries + g) * w, columns, length * columns, Factor::Half(&ds), cublasOperation_t::CUBLAS_OP_N, h * w, scale as f32, 0.0f32),
+                    // dK += c dSᵀ Q: column-major dKᵀ = Qᵀ dS.
+                    (Factor::Half(yh), h * w, columns, length * columns, Factor::Half(&ds), cublasOperation_t::CUBLAS_OP_T, (layout.queries + g) * w, scale as f32, 1.0f32),
+                ];
+                for (a, a_offset, lda, stride_a, b, op_b, c_offset, alpha, beta) in products {
+                    let product = Gemm32 {
+                        ops: (cublasOperation_t::CUBLAS_OP_N, op_b),
+                        dims: (w, length, length),
+                        scale: (alpha, beta),
+                        a: (a, a_offset, lda),
+                        b: (b, block(h), length),
+                        c: (&mut gy, c_offset, columns),
+                        compute: cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    };
+                    self.gemm_ex(product, blocks, (stride_a, length * length, length * columns))?;
+                }
+            }
+            Ok(Tensor { rows, cols: columns, data: Data::Cuda32(gy) })
+        }
+
+        pub(super) fn swiglu(&self, h: &Tensor) -> Result<Tensor, GpuError> {
+            let m = h.cols / 2;
+            let mut a = self.unset16(h.rows, m)?;
+            let (rows, width) = (h.rows as u64, u32_of(m)?);
+            let f = self.decoder("swiglu")?;
+            let Data::CudaBf16(out) = &mut a.data else { return Err(mismatch(&a.data)) };
+            // SAFETY: rows × 2m inputs, rows × m outputs.
+            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(slice32(h)?).arg(out).launch(cfg_elements(rows * m as u64)) }
+                .gpu_ctx("decoder swiglu")?;
+            Ok(a)
+        }
+
+        pub(super) fn swiglu_backward(&self, h: &Tensor, ga: &Tensor) -> Result<Tensor, GpuError> {
+            let m = h.cols / 2;
+            let mut gh = self.unset32(h.rows, h.cols)?;
+            let (rows, width) = (h.rows as u64, u32_of(m)?);
+            let f = self.decoder("swiglu_backward")?;
+            // SAFETY: rows × 2m inputs and cotangents, rows × m output cotangents.
+            unsafe {
+                self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(slice32(h)?).arg(slice32(ga)?).arg(slice32_mut(&mut gh)?).launch(cfg_elements(rows * m as u64))
+            }
+            .gpu_ctx("decoder swiglu_backward")?;
+            Ok(gh)
+        }
+
+        pub(super) fn gelu_tanh(&self, h: &Tensor, bias: Option<&Tensor>) -> Result<Tensor, GpuError> {
+            let mut a = self.unset16(h.rows, h.cols)?;
+            let (rows, width, null) = (h.rows as u64, u32_of(h.cols)?, 0u64);
+            let f = self.decoder("gelu_tanh")?;
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&rows).arg(&width).arg(slice32(h)?);
+            match bias {
+                Some(b) => builder.arg(slice32(b)?),
+                None => builder.arg(&null),
+            };
+            let Data::CudaBf16(out) = &mut a.data else { return Err(mismatch(&a.data)) };
+            builder.arg(out);
+            // SAFETY: rows × m inputs and outputs, m biases.
+            unsafe { builder.launch(cfg_elements(h.len() as u64)) }.gpu_ctx("decoder gelu_tanh")?;
+            Ok(a)
+        }
+
+        pub(super) fn gelu_tanh_backward(&self, h: &Tensor, bias: Option<&Tensor>, ga: &Tensor) -> Result<Tensor, GpuError> {
+            let mut gh = self.unset32(h.rows, h.cols)?;
+            let (rows, width, null) = (h.rows as u64, u32_of(h.cols)?, 0u64);
+            let f = self.decoder("gelu_tanh_backward")?;
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&rows).arg(&width).arg(slice32(h)?);
+            match bias {
+                Some(b) => builder.arg(slice32(b)?),
+                None => builder.arg(&null),
+            };
+            builder.arg(slice32(ga)?).arg(slice32_mut(&mut gh)?);
+            // SAFETY: rows × m inputs, cotangents and outputs, m biases.
+            unsafe { builder.launch(cfg_elements(h.len() as u64)) }.gpu_ctx("decoder gelu_tanh_backward")?;
+            Ok(gh)
         }
 
         /// One `cublasGemmEx` (strided-batched when `batch` exceeds one), serialized on the handle
@@ -6893,5 +7611,94 @@ mod columns_of_tests {
             assert_eq!(device.download(&input).unwrap().iter().map(|v|v.to_bits()).collect::<Vec<_>>(),values.iter().map(|v|v.to_bits()).collect::<Vec<_>>());
             for range in [1..1,2..1,0..5,usize::MAX..usize::MAX] { assert!(device.columns_of(&input,range).is_err()); }
         }
+    }
+}
+
+#[cfg(test)]
+mod decoder_reference_tests {
+    use super::*;
+
+    fn values(n: usize, seed: u64) -> Vec<f64> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                2.0 * ((state >> 11) as f64 / (1u64 << 53) as f64) - 1.0
+            })
+            .collect()
+    }
+
+    fn host_tensor(rows: usize, cols: usize, v: Vec<f64>) -> Tensor {
+        Tensor { rows, cols, data: Data::Host(v) }
+    }
+
+    /// The directional derivative of `f` (a scalar of its input) along `direction`, by central
+    /// differences, against `⟨gradient, direction⟩`.
+    fn agrees(what: &str, x: &[f64], direction: &[f64], gradient: &[f64], f: impl Fn(&[f64]) -> f64) {
+        let h = 1e-6;
+        let shifted = |sign: f64| x.iter().zip(direction).map(|(a, b)| a + sign * h * b).collect::<Vec<_>>();
+        let numeric = (f(&shifted(1.0)) - f(&shifted(-1.0))) / (2.0 * h);
+        let analytic: f64 = gradient.iter().zip(direction).map(|(a, b)| a * b).sum();
+        assert!((numeric - analytic).abs() <= 1e-6 * (1.0 + analytic.abs()), "{what}: {analytic} against {numeric}");
+    }
+
+    #[test]
+    fn the_decoder_reverses_are_the_forwards_derivatives() {
+        let host = Device::host();
+        // The RMS gain.
+        let (rows, d) = (3, 7);
+        let (x, g, gy, dir) = (values(rows * d, 1), values(d, 2), values(rows * d, 3), values(rows * d, 4));
+        let gain = host_tensor(1, d, g.clone());
+        let (_, k) = host.rms_gain(&host_tensor(rows, d, x.clone()), &gain, 1e-6, false).unwrap();
+        let mut gx = host_tensor(rows, d, vec![0.0; rows * d]);
+        host.rms_gain_backward((&host_tensor(rows, d, x.clone()), &gain, &k), &host_tensor(rows, d, gy.clone()), &mut gx).unwrap();
+        let rms = |x: &[f64]| {
+            let (y, _) = host.rms_gain(&host_tensor(rows, d, x.to_vec()), &gain, 1e-6, false).unwrap();
+            host_values(&y).iter().zip(&gy).map(|(a, b)| a * b).sum()
+        };
+        agrees("rms gain", &x, &dir, host_values(&gx), rms);
+        // The heads' norms and rotation, rotate-half and interleaved.
+        let layout = HeadLayout { queries: 2, keys: 1, width: 6 };
+        let rows = 4;
+        let (p, gains, gy, dir) = (values(rows * layout.columns(), 5), values(3 * 6, 6), values(rows * layout.columns(), 7), values(rows * layout.columns(), 8));
+        let angles = values(rows * 2, 9);
+        let (cos, sin) = (host_tensor(rows, 2, angles.iter().map(|a| a.cos()).collect()), host_tensor(rows, 2, angles.iter().map(|a| a.sin()).collect()));
+        let gain_tensor = host_tensor(3, 6, gains.clone());
+        for half in [false, true] {
+            let forward = |p: &[f64]| -> (Vec<f64>, Option<Tensor>) { host_heads(&host_tensor(rows, layout.columns(), p.to_vec()), layout, Some((Ok(&gains[..]), 1e-6)), Some((&cos, &sin, half)), None).unwrap() };
+            let (_, k) = forward(&p);
+            let k = k.unwrap();
+            let gp = host.heads_rope_backward(&host_tensor(rows, layout.columns(), p.clone()), layout, Some((&gain_tensor, &k)), Some((&cos, &sin, half)), &host_tensor(rows, layout.columns(), gy.clone())).unwrap();
+            agrees("heads", &p, &dir, host_values(&gp), |p| forward(p).0.iter().zip(&gy).map(|(a, b)| a * b).sum());
+        }
+        // Attention with exact weights, grouped queries.
+        let layout = HeadLayout { queries: 4, keys: 2, width: 3 };
+        let (blocks, length) = (2, 5);
+        let rows = blocks * length;
+        let (y, ga, dir) = (values(rows * layout.columns(), 10), values(rows * 4 * 3, 11), values(rows * layout.columns(), 12));
+        let (_, gy) = host_attention_rounded(&y, layout, (blocks, length), 0.7, Some(&ga), Arithmetic::F64);
+        let attention = |y: &[f64]| host_attention_rounded(y, layout, (blocks, length), 0.7, None, Arithmetic::F64).0.iter().zip(&ga).map(|(a, b)| a * b).sum();
+        agrees("attention", &y, &dir, &gy, attention);
+        // The activations.
+        for (x, slope) in values(9, 13).iter().map(|x| (3.0 * x, host_gelu_tanh(3.0 * x).1)) {
+            let numeric = (host_gelu_tanh(x + 1e-6).0 - host_gelu_tanh(x - 1e-6).0) / 2e-6;
+            assert!((numeric - slope).abs() <= 1e-6, "gelu slope at {x}: {slope} against {numeric}");
+        }
+        let (h, ga, dir) = (values(3 * 8, 14), values(3 * 4, 15), values(3 * 8, 16));
+        let gh = host.swiglu_backward(&host_tensor(3, 8, h.clone()), &host_tensor(3, 4, ga.clone())).unwrap();
+        let swiglu = |h: &[f64]| -> f64 {
+            (0..12).map(|i| {
+                let (r, j) = (i / 4, i % 4);
+                let (g, u) = (h[r * 8 + j], h[r * 8 + 4 + j]);
+                g / (1.0 + (-g).exp()) * u * ga[i]
+            }).sum()
+        };
+        agrees("swiglu", &h, &dir, host_values(&gh), swiglu);
+    }
+
+    fn host_values(t: &Tensor) -> &[f64] {
+        host(t).unwrap()
     }
 }
