@@ -749,7 +749,7 @@ impl Device {
         let data = match &*self.backend {
             Backend::Host => Data::Host(vec![0.0; rows * cols]),
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) if self.storage == Storage::F32 => Data::Cuda32(engine.zeros(rows * cols)?),
+            Backend::Cuda(engine) if self.storage == Storage::F32 => Data::Cuda32(engine.zeros32(rows * cols)?),
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => Data::Cuda(engine.zeros(rows * cols)?),
             #[cfg(target_os = "macos")]
@@ -1444,6 +1444,88 @@ impl Device {
         }
     }
 
+    /// Per row `r` of `hidden` (rows × width), the log partition `log Σ_c exp(hidden_r · e_c)` over
+    /// the head's classes `e_c` (`head` classes × width, or width × classes when `transposed`), and
+    /// with `expected` (rows × width) also `Σ_c q_rc e_c`, `q_r` the row's softmax: the log
+    /// partition's gradient in `hidden_r`. A row whose `scored` flag is zero has zero of both.
+    ///
+    /// In CUDA f32 storage the rows × classes logits are never formed: the classes are swept in
+    /// chunks whose logits live in one reused rows × chunk buffer (sized to stay in L2), a running
+    /// (largest, sum) per row rescaled as the largest grows (the online softmax, summed in double),
+    /// the expected rows accumulated alongside with the same rescaling, so the sweep costs the
+    /// materialized form's two products and none of its memory. Float64 forms the logits, products
+    /// in `arithmetic`. The Apple GPU refuses ([`GpuError::NoDeviceKernel`]).
+    pub fn head_log_partition(
+        &self,
+        hidden: &Tensor,
+        head: &Tensor,
+        transposed: bool,
+        scored: Option<&Indices>,
+        expected: Option<&mut Tensor>,
+        arithmetic: Arithmetic,
+    ) -> Result<Vec<f64>, GpuError> {
+        let (rows, width) = hidden.dim();
+        let classes = if transposed { head.cols } else { head.rows };
+        let head_width = if transposed { head.rows } else { head.cols };
+        if head_width != width || classes == 0 || scored.is_some_and(|s| s.len != rows) || expected.as_ref().is_some_and(|e| e.dim() != (rows, width)) {
+            return Err(shape(format!("a {:?} head (transposed {transposed}) on {:?} rows", head.dim(), hidden.dim())));
+        }
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (h, e) = (host(hidden)?, host(head)?);
+                let flags = scored.map(host_indices).transpose()?;
+                let at = |c: usize, j: usize| e[if transposed { j * classes + c } else { c * width + j }];
+                let (mut partitions, mut mean) = (vec![0.0; rows], vec![0.0; rows * width]);
+                for r in 0..rows {
+                    if flags.is_some_and(|f| f[r] == 0) {
+                        continue;
+                    }
+                    let hr = &h[r * width..(r + 1) * width];
+                    // Operands rounded to `arithmetic`'s precision, as the host's products are.
+                    let logits: Vec<f64> = (0..classes)
+                        .map(|c| (0..width).map(|j| round_operand(hr[j], arithmetic) * round_operand(at(c, j), arithmetic)).sum())
+                        .collect();
+                    let (m, s) = host_softmax_stats(&logits);
+                    partitions[r] = m + s.ln();
+                    if expected.is_some() {
+                        for (c, l) in logits.iter().enumerate() {
+                            let q = (l - m).exp() / s;
+                            for j in 0..width {
+                                mean[r * width + j] += q * at(c, j);
+                            }
+                        }
+                    }
+                }
+                if let Some(out) = expected {
+                    host_mut(out)?.copy_from_slice(&mean);
+                }
+                Ok(partitions)
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if hidden.storage() == Storage::F32 => {
+                // Each chunk's logits fill about 32 MB, half the L40's L2 and so read back from it.
+                let chunk = ((1usize << 23) / rows).max(512);
+                engine.head_log_partition(hidden, (head, transposed), scored, expected, (chunk, arithmetic))
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(_) => {
+                let mut logits = self.zeros(rows, classes)?;
+                let (into, back) = if transposed { (Op::N, Op::T) } else { (Op::T, Op::N) };
+                self.gemm(&mut logits, 1.0, hidden, Op::N, head, into, 0.0, arithmetic)?;
+                let stats = self.softmax_stats_rows(&mut logits, scored)?;
+                if let Some(out) = expected {
+                    self.gemm(out, 1.0, &logits, Op::N, head, back, 0.0, arithmetic)?;
+                }
+                Ok(stats.iter().map(|s| s[0]).collect())
+            }
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the swept head log partition runs on the host or CUDA".to_string() }),
+        }
+    }
+
     /// Per row, the first column holding its largest value (column 0 for a row with none above
     /// −∞): the top token of a row of logits.
     pub fn argmax_rows(&self, t: &Tensor) -> Result<Vec<usize>, GpuError> {
@@ -1907,11 +1989,12 @@ fn host_gemm(
 
 #[cfg(target_os = "linux")]
 mod cuda {
-    use super::{Arithmetic, CheckedInterval, CheckedIntervalReason, CheckedScalar, KlProposalRow, CodeRowCounters, CodeRowsDiagnostics, CodeRowsWorkspace, code_rows_layout, ColumnBlocks, Data, IndexData, Indices, Op, RmsMode, Tensor, foreign, shape};
+    use super::{Arithmetic, CheckedInterval, CheckedIntervalReason, CheckedScalar, KlProposalRow, CodeRowCounters, CodeRowsDiagnostics, CodeRowsWorkspace, code_rows_layout, ColumnBlocks, Data, IndexData, Indices, Op, RmsMode, Storage, Tensor, foreign, shape};
     use crate::gpu_error::{GpuError, GpuResultExt};
-    use cudarc::cublas::sys::{cublasMath_t, cublasOperation_t};
+    use cudarc::cublas::sys::{cublasComputeType_t, cublasGemmAlgo_t, cublasMath_t, cublasOperation_t, cudaDataType_t};
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
-    use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits};
+    use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, LaunchArgs, LaunchConfig, PushKernelArg, ValidAsZeroBits};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     const BLOCK: u32 = 256;
@@ -2903,6 +2986,9 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 }
 "#;
 
+    /// The f32 twins of [`KERNELS`] (module note), one name and parameter list per kernel.
+    const KERNELS_F32: &str = include_str!("tensor_f32.cu");
+
     /// One CUDA device's stream, cuBLAS handle and kernels.
     pub(super) struct Engine {
         pub(super) name: String,
@@ -2910,6 +2996,9 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         stream: Arc<CudaStream>,
         blas: CudaBlas,
         module: Arc<CudaModule>,
+        /// The f32 twins, compiled on first use, and the functions loaded from them.
+        module32: std::sync::OnceLock<Arc<CudaModule>>,
+        functions32: std::sync::Mutex<HashMap<&'static str, CudaFunction>>,
         checked_interval_module: crate::device_cache::PtxModuleCache,
         /// The row flags of a call that scores every row (never read).
         every_row: CudaSlice<u32>,
@@ -2935,14 +3024,61 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
     fn slice(t: &Tensor) -> Result<&CudaSlice<f64>, GpuError> {
         match &t.data {
             Data::Cuda(s) => Ok(s),
-            Data::Host(_) => Err(foreign()),
+            other => Err(mismatch(other)),
         }
     }
 
     fn slice_mut(t: &mut Tensor) -> Result<&mut CudaSlice<f64>, GpuError> {
         match &mut t.data {
             Data::Cuda(s) => Ok(s),
-            Data::Host(_) => Err(foreign()),
+            other => Err(mismatch(other)),
+        }
+    }
+
+    fn slice32(t: &Tensor) -> Result<&CudaSlice<f32>, GpuError> {
+        match &t.data {
+            Data::Cuda32(s) => Ok(s),
+            other => Err(mismatch(other)),
+        }
+    }
+
+    fn slice32_mut(t: &mut Tensor) -> Result<&mut CudaSlice<f32>, GpuError> {
+        match &mut t.data {
+            Data::Cuda32(s) => Ok(s),
+            other => Err(mismatch(other)),
+        }
+    }
+
+    /// A buffer that is not the operation's: the host's, or the other storage's.
+    fn mismatch(data: &Data) -> GpuError {
+        match data {
+            Data::Host(_) => foreign(),
+            _ => shape("operands in different storage (Device::convert moves one)".to_string()),
+        }
+    }
+
+    /// Tensors as kernel arguments in the storage the operation runs in (an operand in the other
+    /// is an error, never a conversion).
+    trait Operand<'a> {
+        fn input(&mut self, t: &'a Tensor, storage: Storage) -> Result<&mut Self, GpuError>;
+        fn output(&mut self, t: &'a mut Tensor, storage: Storage) -> Result<&mut Self, GpuError>;
+    }
+
+    impl<'a> Operand<'a> for LaunchArgs<'a> {
+        fn input(&mut self, t: &'a Tensor, storage: Storage) -> Result<&mut Self, GpuError> {
+            match (&t.data, storage) {
+                (Data::Cuda(s), Storage::F64) => Ok(self.arg(s)),
+                (Data::Cuda32(s), Storage::F32) => Ok(self.arg(s)),
+                (other, _) => Err(mismatch(other)),
+            }
+        }
+
+        fn output(&mut self, t: &'a mut Tensor, storage: Storage) -> Result<&mut Self, GpuError> {
+            match (&mut t.data, storage) {
+                (Data::Cuda(s), Storage::F64) => Ok(self.arg(s)),
+                (Data::Cuda32(s), Storage::F32) => Ok(self.arg(s)),
+                (other, _) => Err(mismatch(other)),
+            }
         }
     }
 
@@ -2964,6 +3100,19 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         }
     }
 
+    /// One column-major `cublasGemmEx` on f32 buffers: `C ← α op(A) op(B) + β C`, `C` m × n, the
+    /// operands' leading dimensions and element offsets given, accumulating in f32 or on the TF32
+    /// tensor cores (`compute`).
+    struct Gemm32<'a> {
+        ops: (cublasOperation_t, cublasOperation_t),
+        dims: (usize, usize, usize),
+        scale: (f32, f32),
+        a: (&'a CudaSlice<f32>, usize, usize),
+        b: (&'a CudaSlice<f32>, usize, usize),
+        c: (&'a mut CudaSlice<f32>, usize, usize),
+        compute: cublasComputeType_t,
+    }
+
     impl Engine {
         pub(super) fn new(ordinal: usize, name: String) -> Result<Self, GpuError> {
             let ctx = crate::device_runtime::cuda_context_for(ordinal)
@@ -2973,7 +3122,18 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             static MODULE: crate::device_cache::PtxModuleCache = crate::device_cache::PtxModuleCache::new();
             let module = Arc::clone(MODULE.get_or_compile(&ctx, "tensor", KERNELS)?);
             let every_row = stream.alloc_zeros::<u32>(1).gpu_ctx("tensor alloc")?;
-            Ok(Self { name, ctx, stream, blas, module, checked_interval_module: crate::device_cache::PtxModuleCache::new(), every_row, gemm_workspace: std::sync::Mutex::new(F32Workspace::default()) })
+            Ok(Self {
+                name,
+                ctx,
+                stream,
+                blas,
+                module,
+                module32: std::sync::OnceLock::new(),
+                functions32: std::sync::Mutex::new(HashMap::new()),
+                checked_interval_module: crate::device_cache::PtxModuleCache::new(),
+                every_row,
+                gemm_workspace: std::sync::Mutex::new(F32Workspace::default()),
+            })
         }
 
         pub(super) fn memory(&self) -> Result<(usize, usize), GpuError> {
@@ -2992,7 +3152,7 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             self.stream.clone_htod(values).gpu_ctx("tensor upload")
         }
 
-        pub(super) fn download(&self, slice: &CudaSlice<f64>) -> Result<Vec<f64>, GpuError> {
+        pub(super) fn download<T: DeviceRepr>(&self, slice: &CudaSlice<T>) -> Result<Vec<T>, GpuError> {
             self.stream.clone_dtoh(slice).gpu_ctx("tensor download")
         }
 
@@ -3013,27 +3173,92 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             self.stream.alloc_zeros::<f64>(n.max(1)).gpu_ctx("tensor alloc")
         }
 
-        pub(super) fn copy(&self, slice: &CudaSlice<f64>) -> Result<CudaSlice<f64>, GpuError> {
-            let mut out = self.zeros(slice.len())?;
+        pub(super) fn zeros32(&self, n: usize) -> Result<CudaSlice<f32>, GpuError> {
+            self.stream.alloc_zeros::<f32>(n.max(1)).gpu_ctx("tensor alloc")
+        }
+
+        /// A zero `rows × cols` tensor in `storage`.
+        fn tensor(&self, storage: Storage, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
+            let data = match storage {
+                Storage::F64 => Data::Cuda(self.zeros(rows * cols)?),
+                Storage::F32 => Data::Cuda32(self.zeros32(rows * cols)?),
+            };
+            Ok(Tensor { rows, cols, data })
+        }
+
+        pub(super) fn copy<T: DeviceRepr + ValidAsZeroBits>(&self, slice: &CudaSlice<T>) -> Result<CudaSlice<T>, GpuError> {
+            let mut out = self.stream.alloc_zeros::<T>(slice.len().max(1)).gpu_ctx("tensor alloc")?;
             self.stream.memcpy_dtod(slice, &mut out).gpu_ctx("tensor copy")?;
             Ok(out)
         }
 
-        pub(super) fn copy_range(&self, slice: &CudaSlice<f64>, lo: usize, hi: usize) -> Result<CudaSlice<f64>, GpuError> {
-            let mut out = self.zeros(hi - lo)?;
+        pub(super) fn copy_range<T: DeviceRepr + ValidAsZeroBits>(&self, slice: &CudaSlice<T>, lo: usize, hi: usize) -> Result<CudaSlice<T>, GpuError> {
+            let mut out = self.stream.alloc_zeros::<T>((hi - lo).max(1)).gpu_ctx("tensor alloc")?;
             if hi > lo {
                 self.stream.memcpy_dtod(&slice.slice(lo..hi), &mut out).gpu_ctx("tensor row copy")?;
             }
             Ok(out)
         }
 
-        pub(super) fn write_range(&self, slice: &mut CudaSlice<f64>, lo: usize, part: &CudaSlice<f64>) -> Result<(), GpuError> {
+        pub(super) fn write_range<T>(&self, slice: &mut CudaSlice<T>, lo: usize, part: &CudaSlice<T>) -> Result<(), GpuError> {
             let n = part.len();
             self.stream.memcpy_dtod(part, &mut slice.slice_mut(lo..lo + n)).gpu_ctx("tensor row write")
         }
 
-        fn function(&self, name: &str) -> Result<cudarc::driver::CudaFunction, GpuError> {
+        /// `t` in the other storage, on the device: rounded to nearest to f32, exactly to float64.
+        pub(super) fn convert(&self, t: &Tensor) -> Result<Tensor, GpuError> {
+            let n = t.len() as u64;
+            let data = match &t.data {
+                Data::Cuda(source) => {
+                    let mut out = self.zeros32(t.len())?;
+                    if n > 0 {
+                        let f = self.function("to_f32")?;
+                        // SAFETY: `to_f32(n, x, y)` reads n doubles and writes n floats.
+                        unsafe { self.stream.launch_builder(&f).arg(&n).arg(source).arg(&mut out).launch(cfg_elements(n)) }.gpu_ctx("tensor to_f32")?;
+                    }
+                    Data::Cuda32(out)
+                }
+                Data::Cuda32(source) => {
+                    let mut out = self.zeros(t.len())?;
+                    if n > 0 {
+                        let f = self.function("to_f64")?;
+                        // SAFETY: `to_f64(n, y, x)` reads n floats and writes n doubles.
+                        unsafe { self.stream.launch_builder(&f).arg(&n).arg(source).arg(&mut out).launch(cfg_elements(n)) }.gpu_ctx("tensor to_f64")?;
+                    }
+                    Data::Cuda(out)
+                }
+                Data::Host(_) => return Err(foreign()),
+            };
+            Ok(Tensor { rows: t.rows, cols: t.cols, data })
+        }
+
+        fn function(&self, name: &str) -> Result<CudaFunction, GpuError> {
             self.module.load_function(name).gpu_ctx_with(|e| format!("tensor kernel {name}: {e}"))
+        }
+
+        /// `name` in `storage`: the float64 kernel, or its f32 twin (its module compiled on first use).
+        fn kernel(&self, name: &'static str, storage: Storage) -> Result<CudaFunction, GpuError> {
+            if storage == Storage::F64 {
+                return self.function(name);
+            }
+            let mut loaded = self.functions32.lock().map_err(|_| shape("poisoned f32 kernel table".to_string()))?;
+            if let Some(f) = loaded.get(name) {
+                return Ok(f.clone());
+            }
+            let module = match self.module32.get() {
+                Some(module) => module,
+                None => {
+                    // One module per device (each context loads its own).
+                    static MODULES: std::sync::OnceLock<crate::device_cache::KeyedPtxModuleCache<usize>> = std::sync::OnceLock::new();
+                    let compiled = MODULES
+                        .get_or_init(crate::device_cache::KeyedPtxModuleCache::new)
+                        .get_or_compile(&self.ctx, self.ctx.ordinal(), "tensor f32", |_| KERNELS_F32.to_string())?;
+                    self.module32.get_or_init(|| compiled)
+                }
+            };
+            let f = module.load_function(name).gpu_ctx_with(|e| format!("tensor f32 kernel {name}: {e}"))?;
+            loaded.insert(name, f.clone());
+            Ok(f)
         }
 
         pub(super) fn gemm(
@@ -3046,6 +3271,12 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             c: &mut Tensor,
             arithmetic: Arithmetic,
         ) -> Result<(), GpuError> {
+            if a.storage() != c.storage() || b.storage() != c.storage() {
+                return Err(mismatch(&c.data));
+            }
+            if c.storage() == Storage::F32 {
+                return self.gemm32(batch, (m, n, k), (alpha, beta), (a, ta), (b, tb), c, arithmetic);
+            }
             if m == 0 || n == 0 {
                 return Ok(());
             }
@@ -3162,11 +3393,85 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             Ok(())
         }
 
+        /// [`Engine::gemm`] on f32 tensors as they are, with nothing converted or copied: f32
+        /// accumulation (`Arithmetic::F32`) or the TF32 tensor cores (`Tf32`); float64 is refused.
+        fn gemm32(
+            &self,
+            batch: usize,
+            (m, n, k): (usize, usize, usize),
+            (alpha, beta): (f64, f64),
+            (a, ta): (&Tensor, Op),
+            (b, tb): (&Tensor, Op),
+            c: &mut Tensor,
+            arithmetic: Arithmetic,
+        ) -> Result<(), GpuError> {
+            if m == 0 || n == 0 {
+                return Ok(());
+            }
+            let compute = match arithmetic {
+                Arithmetic::F64 => return Err(GpuError::NoDeviceKernel { reason: format!("{} in f32 storage has no float64 product", self.name) }),
+                Arithmetic::F32 => cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                Arithmetic::Tf32 => cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+            };
+            // As the float64 product: column-major Cᵀ = op(B)ᵀ op(A)ᵀ, each block `batch`-strided.
+            let per = |t: &Tensor| (t.rows / batch) * t.cols;
+            let (stride_b, stride_a, stride_c) = (per(b), per(a), per(c));
+            let ldc = c.cols;
+            let product = Gemm32 {
+                ops: (op_of(tb), op_of(ta)),
+                dims: (n, m, k),
+                scale: (alpha as f32, beta as f32),
+                a: (slice32(b)?, 0, b.cols),
+                b: (slice32(a)?, 0, a.cols),
+                c: (slice32_mut(c)?, 0, ldc),
+                compute,
+            };
+            self.gemm_ex(product, batch, (stride_b, stride_a, stride_c))
+        }
+
+        /// One `cublasGemmEx` (strided-batched when `batch` exceeds one), serialized on the handle
+        /// with the float64 path's math-mode switches.
+        fn gemm_ex(&self, g: Gemm32<'_>, batch: usize, (stride_a, stride_b, stride_c): (usize, usize, usize)) -> Result<(), GpuError> {
+            let serial = self.gemm_workspace.lock().map_err(|_| shape("poisoned GEMM workspace".to_string()))?;
+            let (m, n, k) = (i32_of(g.dims.0)?, i32_of(g.dims.1)?, i32_of(g.dims.2)?);
+            let (lda, ldb, ldc) = (i32_of(g.a.2)?, i32_of(g.b.2)?, i32_of(g.c.2)?);
+            let stride = |s: usize| i64::try_from(s).map_err(|_| shape(format!("GEMM stride {s}")));
+            let (stride_a, stride_b, stride_c, count) = (stride(stride_a)?, stride(stride_b)?, stride(stride_c)?, i32_of(batch)?);
+            let (alpha, beta) = g.scale;
+            let real = cudaDataType_t::CUDA_R_32F;
+            let (pa, record_a) = g.a.0.device_ptr(&self.stream);
+            let (pb, record_b) = g.b.0.device_ptr(&self.stream);
+            let (pc, record_c) = g.c.0.device_ptr_mut(&self.stream);
+            // Element offsets into the buffers (a vocabulary chunk's head rows, say).
+            let (pa, pb, pc) = (pa + 4 * g.a.1 as u64, pb + 4 * g.b.1 as u64, pc + 4 * g.c.1 as u64);
+            // SAFETY: the caller checked every operand's shape, offset and leading dimension
+            // against (m, n, k) and the buffers' lengths; the pointers outlive the call (their
+            // records drop after it).
+            let product = unsafe {
+                if batch == 1 {
+                    cudarc::cublas::result::gemm_ex(
+                        *self.blas.handle(), g.ops.0, g.ops.1, m, n, k,
+                        (&alpha) as *const f32 as *const _, pa as *const _, real, lda, pb as *const _, real, ldb,
+                        (&beta) as *const f32 as *const _, pc as *mut _, real, ldc, g.compute, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    )
+                } else {
+                    cudarc::cublas::result::gemm_strided_batched_ex(
+                        *self.blas.handle(), g.ops.0, g.ops.1, m, n, k,
+                        (&alpha) as *const f32 as *const _, pa as *const _, real, lda, stride_a, pb as *const _, real, ldb, stride_b,
+                        (&beta) as *const f32 as *const _, pc as *mut _, real, ldc, stride_c, count, g.compute, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    )
+                }
+            };
+            drop((record_a, record_b, record_c, serial));
+            product.gpu_ctx("tensor f32 GEMM")
+        }
+
         pub(super) fn axpy(&self, y: &mut Tensor, alpha: f64, x: &Tensor) -> Result<(), GpuError> {
             let n = y.len() as u64;
-            let f = self.function("axpy")?;
+            let storage = y.storage();
+            let f = self.kernel("axpy", storage)?;
             // SAFETY: equal-length buffers, checked by the caller.
-            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&alpha).arg(slice(x)?).arg(slice_mut(y)?).launch(cfg_elements(n)) }
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&alpha).input(x, storage)?.output(y, storage)?.launch(cfg_elements(n)) }
                 .gpu_ctx("tensor axpy")
                 .map(|_| ())
         }
@@ -3174,10 +3479,11 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         pub(super) fn hadamard(&self, out: &mut Tensor, a: &Tensor, b: &Tensor, accumulate: bool) -> Result<(), GpuError> {
             let n = out.len() as u64;
             let acc = i32::from(accumulate);
-            let f = self.function("hadamard")?;
+            let storage = out.storage();
+            let f = self.kernel("hadamard", storage)?;
             // SAFETY: equal-length buffers, checked by the caller.
             unsafe {
-                self.stream.launch_builder(&f).arg(&n).arg(slice(a)?).arg(slice(b)?).arg(slice_mut(out)?).arg(&acc).launch(cfg_elements(n))
+                self.stream.launch_builder(&f).arg(&n).input(a, storage)?.input(b, storage)?.output(out, storage)?.arg(&acc).launch(cfg_elements(n))
             }
             .gpu_ctx("tensor hadamard")
             .map(|_| ())
@@ -3186,32 +3492,34 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         pub(super) fn add_row(&self, x: &mut Tensor, alpha: f64, row: &Tensor) -> Result<(), GpuError> {
             let n = x.len() as u64;
             let cols = x.cols as u32;
-            let f = self.function("add_row")?;
+            let storage = x.storage();
+            let f = self.kernel("add_row", storage)?;
             // SAFETY: `row` holds `cols` values, `x` n; checked by the caller.
             unsafe {
-                self.stream.launch_builder(&f).arg(&n).arg(&cols).arg(&alpha).arg(slice(row)?).arg(slice_mut(x)?).launch(cfg_elements(n))
+                self.stream.launch_builder(&f).arg(&n).arg(&cols).arg(&alpha).input(row, storage)?.output(x, storage)?.launch(cfg_elements(n))
             }
             .gpu_ctx("tensor add_row")
             .map(|_| ())
         }
 
-        pub(super) fn columns_of(&self, input: &Tensor, start: usize, width: usize, count: usize) -> Result<CudaSlice<f64>, GpuError> {
-            let mut output = self.zeros(count)?;
+        pub(super) fn columns_of(&self, input: &Tensor, start: usize, width: usize, count: usize) -> Result<Data, GpuError> {
+            let storage = input.storage();
+            let mut output = self.tensor(storage, 1, count)?;
             let (n, cols, width, start) = (count as u64, input.cols as u64, width as u64, start as u64);
-            let f = self.function("columns_of")?;
+            let f = self.kernel("columns_of", storage)?;
             // SAFETY: caller validated nonempty in-range columns; each thread
             // copies one element within the source rows into its own output slot.
             unsafe { self.stream.launch_builder(&f).arg(&n).arg(&cols).arg(&width).arg(&start)
-                .arg(slice(input)?).arg(&mut output).launch(cfg_elements(n)) }.gpu_ctx("tensor column copy")?;
-            Ok(output)
+                .input(input, storage)?.output(&mut output, storage)?.launch(cfg_elements(n)) }.gpu_ctx("tensor column copy")?;
+            Ok(output.data)
         }
 
-        pub(super) fn set_columns(
-            &self, output: &mut CudaSlice<f64>, input: &CudaSlice<f64>,
+        pub(super) fn set_columns<T>(
+            &self, storage: Storage, output: &mut CudaSlice<T>, input: &CudaSlice<T>,
             output_cols: usize, input_cols: usize, start: usize, elements: usize,
         ) -> Result<(), GpuError> {
             let (n, output_cols, input_cols, start) = (elements as u64, output_cols as u64, input_cols as u64, start as u64);
-            let f = self.function("set_columns")?;
+            let f = self.kernel("set_columns", storage)?;
             // SAFETY: matching rows and destination column range checked by Device.
             unsafe {
                 self.stream.launch_builder(&f).arg(&n).arg(&output_cols).arg(&input_cols).arg(&start)
@@ -3223,16 +3531,17 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let n = out.len() as u64;
             let cols = out.cols as u32;
             let acc = i32::from(accumulate);
-            let f = self.function("scale_columns")?;
+            let storage = out.storage();
+            let f = self.kernel("scale_columns", storage)?;
             // SAFETY: shapes checked by the caller.
             unsafe {
                 self.stream
                     .launch_builder(&f)
                     .arg(&n)
                     .arg(&cols)
-                    .arg(slice(x)?)
-                    .arg(slice(d)?)
-                    .arg(slice_mut(out)?)
+                    .input(x, storage)?
+                    .input(d, storage)?
+                    .output(out, storage)?
                     .arg(&acc)
                     .launch(cfg_elements(n))
             }
@@ -3241,19 +3550,20 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         }
 
         pub(super) fn gather_rows(&self, table: &Tensor, ids: &Indices) -> Result<Tensor, GpuError> {
-            let mut out = Tensor { rows: ids.len, cols: table.cols, data: Data::Cuda(self.zeros(ids.len * table.cols)?) };
+            let storage = table.storage();
+            let mut out = self.tensor(storage, ids.len, table.cols)?;
             let n = out.len() as u64;
             let cols = table.cols as u32;
-            let f = self.function("gather_rows")?;
+            let f = self.kernel("gather_rows", storage)?;
             // SAFETY: ids index rows of `table` (the caller's token ids, inside its vocabulary).
             unsafe {
                 self.stream
                     .launch_builder(&f)
                     .arg(&n)
                     .arg(&cols)
-                    .arg(slice(table)?)
+                    .input(table, storage)?
                     .arg(index_slice(ids)?)
-                    .arg(slice_mut(&mut out)?)
+                    .output(&mut out, storage)?
                     .launch(cfg_elements(n))
             }
             .gpu_ctx("tensor gather_rows")?;
@@ -3261,24 +3571,24 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         }
 
         pub(super) fn laws(&self, x: &Tensor, g: Option<&Tensor>, codes: &Indices, c: f64) -> Result<Tensor, GpuError> {
-            let mut out = Tensor { rows: x.rows, cols: x.cols, data: Data::Cuda(self.zeros(x.len())?) };
+            let storage = x.storage();
+            let mut out = self.tensor(storage, x.rows, x.cols)?;
             let n = x.len() as u64;
             let cols = x.cols as u32;
             let slopes = i32::from(g.is_some());
-            let f = self.function("laws")?;
-            let gs = slice(g.unwrap_or(x))?;
+            let f = self.kernel("laws", storage)?;
             // SAFETY: equal-length buffers; `codes` holds one code per column.
             unsafe {
                 self.stream
                     .launch_builder(&f)
                     .arg(&n)
                     .arg(&cols)
-                    .arg(slice(x)?)
-                    .arg(gs)
+                    .input(x, storage)?
+                    .input(g.unwrap_or(x), storage)?
                     .arg(&slopes)
                     .arg(index_slice(codes)?)
                     .arg(&c)
-                    .arg(slice_mut(&mut out)?)
+                    .output(&mut out, storage)?
                     .launch(cfg_elements(n))
             }
             .gpu_ctx("tensor laws")?;
@@ -3286,15 +3596,15 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         }
 
         pub(super) fn rms(&self, mode: RmsMode, x: &Tensor, g: Option<&Tensor>, epsilon: f64) -> Result<Tensor, GpuError> {
-            let mut out = Tensor { rows: x.rows, cols: x.cols, data: Data::Cuda(self.zeros(x.len())?) };
+            let storage = x.storage();
+            let mut out = self.tensor(storage, x.rows, x.cols)?;
             let (rows, cols) = (x.rows as u32, x.cols as u32);
             let code: i32 = match mode {
                 RmsMode::Value => 0,
                 RmsMode::Backward => 1,
                 RmsMode::Tangent => 2,
             };
-            let f = self.function("rms")?;
-            let gs = slice(g.unwrap_or(x))?;
+            let f = self.kernel("rms", storage)?;
             // SAFETY: one block per row of equal-shape buffers.
             unsafe {
                 self.stream
@@ -3303,9 +3613,9 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                     .arg(&cols)
                     .arg(&code)
                     .arg(&epsilon)
-                    .arg(slice(x)?)
-                    .arg(gs)
-                    .arg(slice_mut(&mut out)?)
+                    .input(x, storage)?
+                    .input(g.unwrap_or(x), storage)?
+                    .output(&mut out, storage)?
                     .launch(cfg_rows(x.rows))
             }
             .gpu_ctx("tensor rms")?;
@@ -3313,11 +3623,17 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         }
 
         pub(super) fn rotate(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, half_split: bool, inverse: bool) -> Result<Tensor, GpuError> {
-            let mut out = Tensor { rows: x.rows, cols: x.cols, data: Data::Cuda(self.copy(slice(x)?)?) };
+            let storage = x.storage();
+            let data = match &x.data {
+                Data::Cuda(s) => Data::Cuda(self.copy(s)?),
+                Data::Cuda32(s) => Data::Cuda32(self.copy(s)?),
+                Data::Host(_) => return Err(foreign()),
+            };
+            let mut out = Tensor { rows: x.rows, cols: x.cols, data };
             let (rows, cols, planes) = (x.rows as u32, x.cols as u32, cos.cols as u32);
             let split = i32::from(half_split);
             let sign: f64 = if inverse { -1.0 } else { 1.0 };
-            let f = self.function("rotate_planes")?;
+            let f = self.kernel("rotate_planes", storage)?;
             // SAFETY: tables are rows × planes; 2·planes ≤ cols, checked by the caller.
             unsafe {
                 self.stream
@@ -3327,10 +3643,10 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                     .arg(&planes)
                     .arg(&split)
                     .arg(&sign)
-                    .arg(slice(x)?)
-                    .arg(slice(cos)?)
-                    .arg(slice(sin)?)
-                    .arg(slice_mut(&mut out)?)
+                    .input(x, storage)?
+                    .input(cos, storage)?
+                    .input(sin, storage)?
+                    .output(&mut out, storage)?
                     .launch(cfg_elements(u64::from(rows) * u64::from(planes)))
             }
             .gpu_ctx("tensor rotate")?;
@@ -3342,26 +3658,28 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let launch = cfg_rows(scores.rows);
             let causal = i32::from(causal);
             let (start, period) = (start as u32, period as u32);
-            let f = self.function("softmax_rows")?;
+            let storage = scores.storage();
+            let f = self.kernel("softmax_rows", storage)?;
             // SAFETY: one block per row of a rows × width buffer.
-            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(&causal).arg(&start).arg(&period).arg(slice_mut(scores)?).launch(launch) }
+            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(&causal).arg(&start).arg(&period).output(scores, storage)?.launch(launch) }
                 .gpu_ctx("tensor softmax_rows")
                 .map(|_| ())
         }
 
         pub(super) fn softmax_backward(&self, alpha: &Tensor, d: &Tensor) -> Result<Tensor, GpuError> {
-            let mut out = Tensor { rows: alpha.rows, cols: alpha.cols, data: Data::Cuda(self.zeros(alpha.len())?) };
+            let storage = alpha.storage();
+            let mut out = self.tensor(storage, alpha.rows, alpha.cols)?;
             let (rows, cols) = (alpha.rows as u32, alpha.cols as u32);
-            let f = self.function("softmax_backward")?;
+            let f = self.kernel("softmax_backward", storage)?;
             // SAFETY: one block per row of equal-shape buffers.
             unsafe {
                 self.stream
                     .launch_builder(&f)
                     .arg(&rows)
                     .arg(&cols)
-                    .arg(slice(alpha)?)
-                    .arg(slice(d)?)
-                    .arg(slice_mut(&mut out)?)
+                    .input(alpha, storage)?
+                    .input(d, storage)?
+                    .output(&mut out, storage)?
                     .launch(cfg_rows(alpha.rows))
             }
             .gpu_ctx("tensor softmax_backward")?;
@@ -3381,10 +3699,11 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let mut output = self.zeros(n)?;
             let (rows, cols) = (logits.rows as u32, logits.cols as u32);
             let (flags, use_flags) = self.flags(scored)?;
-            let f = self.function("softmax_stats_rows")?;
+            let storage = logits.storage();
+            let f = self.kernel("softmax_stats_rows", storage)?;
             // SAFETY: one block per row, logits rows*cols and output rows*2 buffers.
             unsafe {
-                self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(slice_mut(logits)?)
+                self.stream.launch_builder(&f).arg(&rows).arg(&cols).output(logits, storage)?
                     .arg(flags).arg(&use_flags).arg(&mut output).launch(cfg_rows(n_rows))
             }.gpu_ctx("tensor softmax_stats_rows")?;
             let values = self.download(&output)?;
@@ -3397,7 +3716,8 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let mut kl = self.zeros(logits.rows)?;
             let (rows, cols) = (logits.rows as u32, logits.cols as u32);
             let (flags, use_flags) = self.flags(scored)?;
-            let f = self.function("kl_rows")?;
+            let storage = logits.storage();
+            let f = self.kernel("kl_rows", storage)?;
             let n_rows = logits.rows;
             let gradient = i32::from(gradient);
             // SAFETY: one block per row of equal-shape buffers; `flags` has a flag per row when used.
@@ -3406,8 +3726,8 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                     .launch_builder(&f)
                     .arg(&rows)
                     .arg(&cols)
-                    .arg(slice(target)?)
-                    .arg(slice_mut(logits)?)
+                    .input(target, storage)?
+                    .output(logits, storage)?
                     .arg(flags)
                     .arg(&use_flags)
                     .arg(&gradient)
@@ -3419,7 +3739,6 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             out.truncate(n_rows);
             Ok(out)
         }
-
         pub(super) fn checked_intervals(&self, input: &Tensor, explained: Option<&Tensor>, operation: Option<CheckedScalar>) -> Result<Vec<CheckedInterval>, GpuError> {
             let count = if operation.is_some() {input.rows.checked_mul(input.cols).ok_or_else(|| shape("checked scalar size overflow".into()))?} else {input.rows};
             if count==0 {return Ok(Vec::new());}
@@ -3476,10 +3795,12 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             Ok(result)
         }
 
+
         pub(super) fn sampled_cotangent(&self, logits: &mut Tensor, uniforms: &Tensor, scored: Option<&Indices>) -> Result<(), GpuError> {
             let (rows, cols) = (logits.rows as u32, logits.cols as u32);
             let (flags, use_flags) = self.flags(scored)?;
-            let f = self.function("sampled_cotangent")?;
+            let storage = logits.storage();
+            let f = self.kernel("sampled_cotangent", storage)?;
             let n_rows = logits.rows;
             // SAFETY: one block per row; one uniform per row.
             unsafe {
@@ -3487,8 +3808,8 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                     .launch_builder(&f)
                     .arg(&rows)
                     .arg(&cols)
-                    .arg(slice_mut(logits)?)
-                    .arg(slice(uniforms)?)
+                    .output(logits, storage)?
+                    .input(uniforms, storage)?
                     .arg(flags)
                     .arg(&use_flags)
                     .launch(cfg_rows(n_rows))
@@ -3498,15 +3819,16 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         }
 
         pub(super) fn block_products(&self, left: &Tensor, right: &Tensor, blocks: &ColumnBlocks) -> Result<Tensor, GpuError> {
-            let mut out = Tensor { rows: left.rows, cols: blocks.len(), data: Data::Cuda(self.zeros(left.rows * blocks.len())?) };
+            let storage = left.storage();
+            let mut out = self.tensor(storage, left.rows, blocks.len())?;
             if out.is_empty() { return Ok(out); }
             let (n, cols, count) = (out.len() as u64, left.cols as u32, blocks.len() as u32);
-            let f = self.function("block_products")?;
+            let f = self.kernel("block_products", storage)?;
             // SAFETY: shapes agree, and column_blocks validates monotone offsets within cols.
             unsafe {
                 self.stream.launch_builder(&f).arg(&n).arg(&cols).arg(&count)
-                    .arg(slice(left)?).arg(slice(right)?).arg(index_slice(&blocks.offsets)?)
-                    .arg(slice_mut(&mut out)?).launch(cfg_elements(n))
+                    .input(left, storage)?.input(right, storage)?.arg(index_slice(&blocks.offsets)?)
+                    .output(&mut out, storage)?.launch(cfg_elements(n))
             }.gpu_ctx("tensor block_products")?;
             Ok(out)
         }
@@ -3515,18 +3837,19 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             &self, probabilities: &Tensor, mean: &Tensor, head: &Tensor, transposed: bool,
             uniforms: &Tensor, scored: Option<&Indices>,
         ) -> Result<Tensor, GpuError> {
-            let mut out = Tensor { rows: mean.rows, cols: mean.cols, data: Data::Cuda(self.zeros(mean.len())?) };
+            let storage = mean.storage();
+            let mut out = self.tensor(storage, mean.rows, mean.cols)?;
             let (rows, classes, width) = (mean.rows as u32, probabilities.cols as u32, mean.cols as u32);
             let transposed = i32::from(transposed);
             let (flags, use_flags) = self.flags(scored)?;
-            let f = self.function("sampled_head_cotangent")?;
+            let f = self.kernel("sampled_head_cotangent", storage)?;
             // SAFETY: the public entry validates each tensor shape and the scored flag count.
             // One block writes each row; the sampled label is always inside the vocabulary.
             unsafe {
                 self.stream.launch_builder(&f)
                     .arg(&rows).arg(&classes).arg(&width)
-                    .arg(slice(probabilities)?).arg(slice(mean)?).arg(slice(head)?).arg(&transposed)
-                    .arg(slice(uniforms)?).arg(flags).arg(&use_flags).arg(slice_mut(&mut out)?)
+                    .input(probabilities, storage)?.input(mean, storage)?.input(head, storage)?.arg(&transposed)
+                    .input(uniforms, storage)?.arg(flags).arg(&use_flags).output(&mut out, storage)?
                     .launch(cfg_rows(mean.rows))
             }.gpu_ctx("tensor sampled_head_cotangent")?;
             Ok(out)
@@ -3534,11 +3857,12 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
 
         pub(super) fn adam(&self, w: &mut Tensor, (m, v): (&mut Tensor, &mut Tensor), g: &Tensor, (rate, beta1, beta2, epsilon): (f64, f64, f64, f64), (c1, c2): (f64, f64)) -> Result<(), GpuError> {
             let n = w.len() as u64;
-            let f = self.function("adam")?;
+            let storage = w.storage();
+            let f = self.kernel("adam", storage)?;
             // SAFETY: four equal-length buffers, checked by the caller.
             unsafe {
                 self.stream.launch_builder(&f).arg(&n).arg(&rate).arg(&beta1).arg(&beta2).arg(&epsilon).arg(&c1).arg(&c2)
-                    .arg(slice(g)?).arg(slice_mut(m)?).arg(slice_mut(v)?).arg(slice_mut(w)?).launch(cfg_elements(n))
+                    .input(g, storage)?.output(m, storage)?.output(v, storage)?.output(w, storage)?.launch(cfg_elements(n))
             }
             .gpu_ctx("tensor adam")
             .map(|_| ())
@@ -3550,17 +3874,18 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             let width = a.cols.next_power_of_two().max(2);
             // One scratch ranking and row of sizes per block; the blocks stride over the rows.
             let blocks = a.rows.min(4096);
-            let mut keys = self.zeros(blocks * width)?;
-            let mut sizes = self.zeros(blocks * width)?;
+            let storage = a.storage();
+            let mut keys = self.tensor(storage, blocks, width)?;
+            let mut sizes = self.tensor(storage, blocks, width)?;
             let mut order = self.stream.alloc_zeros::<u32>(blocks * width).gpu_ctx("tensor alloc")?;
-            let f = self.function("select_sets")?;
+            let f = self.kernel("select_sets", storage)?;
             let width32 = width as u32;
             let cfg = LaunchConfig { grid_dim: (blocks as u32, 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
             // SAFETY: shapes checked by the caller; each block owns `width` scratch entries.
             unsafe {
                 self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(&width32)
-                    .arg(slice(a)?).arg(slice(q)?).arg(slice(bits)?).arg(slice(left)?).arg(slice(weight)?)
-                    .arg(&mut keys).arg(&mut order).arg(&mut sizes).arg(slice_mut(mask)?).launch(cfg)
+                    .input(a, storage)?.input(q, storage)?.input(bits, storage)?.input(left, storage)?.input(weight, storage)?
+                    .output(&mut keys, storage)?.arg(&mut order).output(&mut sizes, storage)?.output(mask, storage)?.launch(cfg)
             }
             .gpu_ctx("tensor select_sets")
             .map(|_| ())
@@ -3569,15 +3894,15 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         pub(super) fn divide_sums(&self, x: &mut Tensor, rows: &Tensor, cols: &Tensor, floor: f64) -> Result<(), GpuError> {
             let (n, width) = (x.len() as u64, x.cols as u32);
             if n == 0 { return Ok(()); }
-            let f = self.function("divide_sums")?;
+            let storage = x.storage();
+            let f = self.kernel("divide_sums", storage)?;
             // SAFETY: shapes checked by the caller.
             unsafe {
-                self.stream.launch_builder(&f).arg(&n).arg(&width).arg(slice(rows)?).arg(slice(cols)?).arg(&floor).arg(slice_mut(x)?).launch(cfg_elements(n))
+                self.stream.launch_builder(&f).arg(&n).arg(&width).input(rows, storage)?.input(cols, storage)?.arg(&floor).output(x, storage)?.launch(cfg_elements(n))
             }
             .gpu_ctx("tensor divide_sums")
             .map(|_| ())
         }
-
         pub(super) fn code_rows(
             &self,
             (z, w, yfy): (&Tensor, &Tensor, &Tensor),
@@ -3653,16 +3978,18 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             Ok((upper, lower, profile))
         }
 
+
         pub(super) fn box_charge(&self, z: &Tensor, mask: &Tensor, q: &Tensor, cot: &mut Tensor, coefficient: &mut Tensor) -> Result<Vec<f64>, GpuError> {
             if z.is_empty() { return Ok(vec![0.0; z.rows]); }
             let (rows, cols) = (z.rows as u32, z.cols as u32);
             let mut norms = self.zeros(z.rows)?;
-            let f = self.function("box_charge")?;
+            let storage = z.storage();
+            let f = self.kernel("box_charge", storage)?;
             let cfg = LaunchConfig { grid_dim: (z.rows.min(65_535) as u32, 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
             // SAFETY: equal shapes checked by the caller; one block per row (striding).
             unsafe {
-                self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(slice(z)?).arg(slice(mask)?).arg(slice(q)?)
-                    .arg(&mut norms).arg(slice_mut(cot)?).arg(slice_mut(coefficient)?).launch(cfg)
+                self.stream.launch_builder(&f).arg(&rows).arg(&cols).input(z, storage)?.input(mask, storage)?.input(q, storage)?
+                    .arg(&mut norms).output(cot, storage)?.output(coefficient, storage)?.launch(cfg)
             }
             .gpu_ctx("tensor box_charge")?;
             let mut values = self.download(&norms)?;
@@ -3673,9 +4000,10 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         pub(super) fn argmax_rows(&self, t: &Tensor) -> Result<Vec<usize>, GpuError> {
             let mut out = self.zeros(t.rows)?;
             let (rows, cols) = (t.rows as u32, t.cols as u32);
-            let f = self.function("argmax_rows")?;
+            let storage = t.storage();
+            let f = self.kernel("argmax_rows", storage)?;
             // SAFETY: one block per row of `t`; `out` holds one value per row.
-            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(slice(t)?).arg(&mut out).launch(cfg_rows(t.rows)) }
+            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&cols).input(t, storage)?.arg(&mut out).launch(cfg_rows(t.rows)) }
                 .gpu_ctx("tensor argmax_rows")?;
             Ok(self.download(&out)?.into_iter().take(t.rows).map(|v| v as usize).collect())
         }
@@ -3685,9 +4013,10 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
             if n == 0 {
                 return Ok(());
             }
-            let f = self.function("fill_entries")?;
+            let storage = t.storage();
+            let f = self.kernel("fill_entries", storage)?;
             // SAFETY: every position is below `t`'s length (the caller's contract, checked on the host).
-            unsafe { self.stream.launch_builder(&f).arg(&n).arg(index_slice(at)?).arg(&value).arg(slice_mut(t)?).launch(cfg_elements(n)) }
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(index_slice(at)?).arg(&value).output(t, storage)?.launch(cfg_elements(n)) }
                 .gpu_ctx("tensor fill_entries")
                 .map(|_| ())
         }
@@ -3695,21 +4024,121 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
         pub(super) fn softmax_quadratic(&self, logits: &Tensor, tangent: &Tensor) -> Result<Vec<f64>, GpuError> {
             let mut out = self.zeros(logits.rows)?;
             let (rows, cols) = (logits.rows as u32, logits.cols as u32);
-            let f = self.function("softmax_quadratic")?;
+            let storage = logits.storage();
+            let f = self.kernel("softmax_quadratic", storage)?;
             // SAFETY: one block per row of equal-shape buffers.
             unsafe {
                 self.stream
                     .launch_builder(&f)
                     .arg(&rows)
                     .arg(&cols)
-                    .arg(slice(logits)?)
-                    .arg(slice(tangent)?)
+                    .input(logits, storage)?
+                    .input(tangent, storage)?
                     .arg(&mut out)
                     .launch(cfg_rows(logits.rows))
             }
             .gpu_ctx("tensor softmax_quadratic")?;
             let mut values = self.download(&out)?;
             values.truncate(logits.rows);
+            Ok(values)
+        }
+
+        /// [`super::Device::head_log_partition`] on f32 tensors: the classes swept in chunks of
+        /// `chunk` (a rows × chunk logit buffer, reused), each chunk's logits one product, merged
+        /// into a running (largest, sum) per row by `head_chunk`; with `expected`, the chunk's
+        /// exponentials weight its head rows into the rows × width accumulator (one more product),
+        /// rescaled by `scale_rows` as the largest grows.
+        pub(super) fn head_log_partition(
+            &self,
+            hidden: &Tensor,
+            (head, transposed): (&Tensor, bool),
+            scored: Option<&Indices>,
+            mut expected: Option<&mut Tensor>,
+            (chunk, arithmetic): (usize, Arithmetic),
+        ) -> Result<Vec<f64>, GpuError> {
+            let (rows, width) = hidden.dim();
+            let classes = if transposed { head.cols } else { head.rows };
+            let compute = match arithmetic {
+                Arithmetic::F64 => return Err(GpuError::NoDeviceKernel { reason: format!("{} in f32 storage has no float64 product", self.name) }),
+                Arithmetic::F32 => cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                Arithmetic::Tf32 => cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+            };
+            let chunk = chunk.clamp(1, classes.max(1));
+            let mut logits = self.zeros32(rows * chunk)?;
+            let mut largest = self.upload(&vec![f32::NEG_INFINITY; rows])?;
+            let mut sums = self.zeros(rows)?;
+            let mut factor = self.zeros32(rows)?;
+            let (rows32, width32) = (u32::try_from(rows).map_err(|_| shape("head rows exceed u32".to_string()))?, width as u32);
+            let want = i32::from(expected.is_some());
+            let (t, n_op) = (cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N);
+            let chunk_kernel = self.kernel("head_chunk", Storage::F32)?;
+            let rescale = self.kernel("scale_rows", Storage::F32)?;
+            for (index, start) in (0..classes).step_by(chunk).enumerate() {
+                let count = chunk.min(classes - start);
+                // Column-major logitsᵀ (count × rows) = E_chunk (count × width) · hiddenᵀ: the head's
+                // rows `start..` (row-major classes × width, read transposed) or its columns
+                // (width × classes stored, read as they are).
+                let (head_op, head_offset, head_ld) = if transposed { (n_op, start, classes) } else { (t, start * width, width) };
+                self.gemm_ex(
+                    Gemm32 {
+                        ops: (head_op, n_op),
+                        dims: (count, rows, width),
+                        scale: (1.0, 0.0),
+                        a: (slice32(head)?, head_offset, head_ld),
+                        b: (slice32(hidden)?, 0, width),
+                        c: (&mut logits, 0, count),
+                        compute,
+                    },
+                    1,
+                    (0, 0, 0),
+                )?;
+                let count32 = count as u32;
+                // SAFETY: one block per row of the rows × count logits; per-row state of length rows.
+                unsafe {
+                    self.stream.launch_builder(&chunk_kernel).arg(&rows32).arg(&count32).arg(&mut logits).arg(&mut largest)
+                        .arg(&mut sums).arg(&mut factor).arg(&want).launch(cfg_rows(rows))
+                }
+                .gpu_ctx("tensor head_chunk")?;
+                if let Some(out) = expected.as_deref_mut() {
+                    let n = out.len() as u64;
+                    if index > 0 && n > 0 {
+                        // SAFETY: `out` is rows × width; `factor` holds one value per row.
+                        unsafe { self.stream.launch_builder(&rescale).arg(&n).arg(&width32).arg(&factor).output(out, Storage::F32)?.launch(cfg_elements(n)) }
+                            .gpu_ctx("tensor scale_rows")?;
+                    }
+                    // Column-major outᵀ (width × rows) += E_chunkᵀ (width × count) · Pᵀ (count × rows).
+                    let (head_op, head_ld) = if transposed { (t, classes) } else { (n_op, width) };
+                    self.gemm_ex(
+                        Gemm32 {
+                            ops: (head_op, n_op),
+                            dims: (width, rows, count),
+                            scale: (1.0, if index == 0 { 0.0 } else { 1.0 }),
+                            a: (slice32(head)?, if transposed { start } else { start * width }, head_ld),
+                            b: (&logits, 0, count),
+                            c: (slice32_mut(out)?, 0, width),
+                            compute,
+                        },
+                        1,
+                        (0, 0, 0),
+                    )?;
+                }
+            }
+            let mut out = self.zeros(rows)?;
+            let (flags, use_flags) = self.flags(scored)?;
+            let finish = self.kernel("head_finish", Storage::F32)?;
+            let mut none = self.zeros32(1)?;
+            let mean = match expected {
+                Some(t) => slice32_mut(t)?,
+                None => &mut none,
+            };
+            // SAFETY: per-row state of length rows; `mean` is rows × width when `want`.
+            unsafe {
+                self.stream.launch_builder(&finish).arg(&rows32).arg(&width32).arg(&largest).arg(&sums).arg(flags).arg(&use_flags)
+                    .arg(&want).arg(mean).arg(&mut out).launch(cfg_rows(rows))
+            }
+            .gpu_ctx("tensor head_finish")?;
+            let mut values = self.download(&out)?;
+            values.truncate(rows);
             Ok(values)
         }
     }

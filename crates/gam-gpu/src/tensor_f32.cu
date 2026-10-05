@@ -63,11 +63,12 @@ __device__ float block_max(float v, float* shared) {
     return v;
 }
 
-// A running log partition: the largest value `m` seen and `s = Σ exp(value − m)`, rescaled when the
-// largest grows (one exp per value).
+// A running log partition: the largest value `m` seen and `s = Σ exp(value − m)`, one float exp per
+// value; the rare rescalings as the largest grows (about log n per thread, and the merges) take a
+// double exp, so `s` carries only its terms' own float errors.
 __device__ __forceinline__ void lse_push(float x, float& m, double& s) {
     if (x > m) {
-        s = s * (double)expf(m - x) + 1.0;
+        s = (m == NEG_INF ? 0.0 : s * exp((double)m - (double)x)) + 1.0;
         m = x;
     } else if (m > NEG_INF) {
         s += (double)expf(x - m);
@@ -78,7 +79,7 @@ __device__ __forceinline__ void lse_push(float x, float& m, double& s) {
 __device__ __forceinline__ void lse_merge(float& m, double& s, float m2, double s2) {
     float top = fmaxf(m, m2);
     if (top == NEG_INF) return;
-    s = (m == NEG_INF ? 0.0 : s * (double)expf(m - top)) + (m2 == NEG_INF ? 0.0 : s2 * (double)expf(m2 - top));
+    s = (m == NEG_INF ? 0.0 : s * exp((double)m - (double)top)) + (m2 == NEG_INF ? 0.0 : s2 * exp((double)m2 - (double)top));
     m = top;
 }
 
@@ -629,10 +630,10 @@ extern "C" __global__ void head_chunk(unsigned int rows, unsigned int cols, floa
     }
     part = block_sum_d(part, sd);
     if (threadIdx.x == 0) {
-        float f = old == NEG_INF ? 0.0f : expf(old - next);
-        s[r] = s[r] * (double)f + part;
+        double f = old == NEG_INF ? 0.0 : exp((double)old - (double)next);
+        s[r] = s[r] * f + part;
         m[r] = next;
-        factor[r] = f;
+        factor[r] = (float)f;
     }
 }
 
