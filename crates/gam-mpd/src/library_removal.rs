@@ -40,9 +40,11 @@
 //! `H`, measured through sampled-label gradients (`library_mdl`'s module note, [`Curvature`]): the
 //! second-order change of the expected data term when `G`'s entries become exactly zero is
 //! `Σ_{j∈G} μ_j²/v_G + ½ μ_Gᵀ H μ_G − ½ Σ_{j∈G} H_jj σ_j²` ([`Posterior::removal_data`]), while
-//! the description falls by the group's cost. A unit's prediction is the mean of its roots' data
-//! estimates (each root's removal silences the same functions) minus the description of all its
-//! groups. The units predicted to lower `F` are ranked by the prediction, most negative first.
+//! the description falls by the group's cost (`KL_G`, its variance's precision and scale) and the
+//! code of which groups are active changes with their count. A unit's prediction is the mean of
+//! its roots' data estimates (each root's removal silences the same functions) minus the cost of
+//! all its groups, plus the change of the subset code when it alone is removed. The units
+//! predicted to lower `F` are ranked by the prediction, most negative first.
 //!
 //! # The search
 //!
@@ -63,7 +65,7 @@
 use crate::{
     interchange,
     library_compensation::Compensation,
-    library_mdl::{Curvature, Explanation, Outcome, Posterior, Removal},
+    library_mdl::{Curvature, Explanation, Posterior, Removal},
     operator_program::{Interface, Law, Node, OperatorBody, OperatorProgram},
     resident_causal_fit::fixed_head_target::Head,
     run_check::LayerNodes,
@@ -690,16 +692,17 @@ impl Structure {
             }
             units.entry(members.into_iter().collect()).or_default().push(g);
         }
-        Ok(units.into_iter().map(|(groups, roots)| Unit { groups, roots, predicted: 0.0 }).collect())
+        Ok(units.into_iter().map(|(groups, roots)| Unit { groups, roots, data: 0.0, predicted: 0.0 }).collect())
     }
 }
 
-/// A unit of removal (module note): its groups, the groups whose removal alone silences it, and its
-/// predicted change of `F` in nats.
+/// A unit of removal (module note): its groups, the groups whose removal alone silences it, the
+/// predicted change of the data term and of `F` when it alone is removed, in nats.
 #[derive(Clone, Debug)]
 pub struct Unit {
     pub groups: Vec<usize>,
     pub roots: Vec<usize>,
+    pub data: f64,
     pub predicted: f64,
 }
 
@@ -744,6 +747,11 @@ fn summaries(explanation: &Explanation, posterior: &Posterior) -> Result<Vec<Sum
 fn layer(name: &str) -> Option<usize> {
     let digits: String = name.strip_prefix("library.l")?.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
+}
+
+/// The nats of the code of which `k` of `n` groups are active (`library_mdl`'s module note).
+fn subset_nats(n: usize, k: usize) -> Result<f64, String> {
+    crate::codec::subset_code_len_bits(n, k).map(|bits| bits as f64 * LN_2).map_err(error)
 }
 
 /// The round's log: one JSON line per record, appended.
@@ -816,15 +824,16 @@ pub fn round(
             // Groups without effect, removed exactly.
             let dead = structure.dead(&posterior.active)?;
             if !dead.is_empty() {
-                let costs = posterior.costs();
                 let timed = Instant::now();
                 let mut removed = posterior.clone();
                 removed.remove(&dead);
+                // The data term cannot change: the prediction is the description's change.
+                let predicted = removed.description() - posterior.description();
                 let change = objective(&removed)? - current;
                 let accepted = change <= 0.0;
                 journal.write(json!({
                     "event": "proposal", "kind": "dead", "groups": dead, "layers": names(&dead),
-                    "predicted_bits": -dead.iter().map(|g| costs[*g]).sum::<f64>() / LN_2, "measured_bits": change / LN_2,
+                    "predicted_bits": predicted / LN_2, "measured_bits": change / LN_2,
                     "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(),
                 }))?;
                 evaluations.push((dead.len(), change / LN_2));
@@ -839,9 +848,21 @@ pub fn round(
             let summary = summaries(explanation, posterior)?;
             let data_rise = posterior.removal_data(curvature);
             let mut units = structure.units(&posterior.active)?;
+            let (total, active) = (posterior.active.len(), posterior.active.iter().filter(|a| **a).count());
+            let subset = subset_nats(total, active)?;
+            // The subset code's change on removing `m` of the groups now active.
+            let mut fewer: BTreeMap<usize, f64> = BTreeMap::new();
+            let mut subset_change = |m: usize| -> Result<f64, String> {
+                if let Some(c) = fewer.get(&m) {
+                    return Ok(*c);
+                }
+                let c = subset_nats(total, active.checked_sub(m).ok_or_else(|| error("more groups removed than active"))?)? - subset;
+                fewer.insert(m, c);
+                Ok(c)
+            };
             for unit in &mut units {
-                let data = unit.roots.iter().map(|g| data_rise[*g]).sum::<f64>() / unit.roots.len() as f64;
-                unit.predicted = data - unit.groups.iter().map(|g| costs[*g]).sum::<f64>();
+                unit.data = unit.roots.iter().map(|g| data_rise[*g]).sum::<f64>() / unit.roots.len() as f64;
+                unit.predicted = unit.data - unit.groups.iter().map(|g| costs[*g]).sum::<f64>() + subset_change(unit.groups.len())?;
             }
             journal.write(json!({
                 "event": "round", "active": posterior.active.iter().filter(|a| **a).count(), "objective_bits": current / LN_2,
@@ -858,7 +879,7 @@ pub fn round(
             let mut rest: &[Unit] = &units;
             let mut whole = true;
             while !rest.is_empty() {
-                let base = posterior.clone();
+                let base: &Posterior = posterior;
                 // The groups of the first `k` units still active, with those their removal leaves
                 // without effect.
                 let proposal = |k: usize| -> Result<Vec<usize>, String> {
@@ -877,11 +898,13 @@ pub fn round(
                 let mut test = |k: usize, kind: &str| -> Result<bool, String> {
                     let timed = Instant::now();
                     let groups = proposal(k)?;
-                    let change = objective(&trial(&base, &groups)?)? - current;
+                    let change = objective(&trial(base, &groups)?)? - current;
                     if !change.is_finite() {
                         return Err(error("a nonfinite removal objective"));
                     }
-                    let predicted: f64 = rest[..k].iter().map(|u| u.predicted).sum();
+                    let removed_now = active - base.active.iter().filter(|a| **a).count();
+                    let predicted = rest[..k].iter().map(|u| u.data).sum::<f64>() - groups.iter().map(|g| costs[*g]).sum::<f64>() + subset_change(removed_now + groups.len())?
+                        - subset_change(removed_now)?;
                     journal.write(json!({
                         "event": "proposal", "kind": kind, "units": k, "groups": groups, "layers": names(&groups),
                         "predicted_bits": predicted / LN_2, "measured_bits": change / LN_2,
@@ -893,7 +916,8 @@ pub fn round(
                 };
                 let accepted = gallop(rest.len(), whole, &mut test)?;
                 if accepted > 0 {
-                    *posterior = trial(&base, &proposal(accepted)?)?;
+                    let next = trial(base, &proposal(accepted)?)?;
+                    *posterior = next;
                     current += changes[&accepted];
                 }
                 if accepted == rest.len() {
@@ -946,12 +970,7 @@ pub fn round(
         "event": "end", "search": format!("{search:?}"), "candidates": candidates, "removed": removed,
         "before_bits": before / LN_2, "after_bits": current / LN_2, "evaluations": evaluations.len(), "seconds": started.elapsed().as_secs_f64(),
     }))?;
-    let outcome = match (removed, dead_removed) {
-        (0, _) => Outcome::Exhausted,
-        (r, d) if r == d => Outcome::Dead,
-        _ => Outcome::Prefix,
-    };
-    Ok(Removal { candidates, removed, dead: dead_removed, before_bits: before / LN_2, after_bits: current / LN_2, evaluations, singles, outcome })
+    Ok(Removal { candidates, removed, dead: dead_removed, before_bits: before / LN_2, after_bits: current / LN_2, evaluations, singles })
 }
 
 /// The longest accepted prefix of `n` units found by testing the whole (when `whole`), then lengths
@@ -1287,7 +1306,6 @@ mod tests {
         posterior.remove(&outputs);
         let planted: Vec<usize> = planes.iter().chain(&gates).copied().collect();
         let start = posterior.clone();
-        let costs = start.costs();
         let compensation = Compensation::new(&mut ic, &explanation, &start, &sequences, 2).expect("the compensation");
         let curvature = measured(&mut ic, &explanation, &start, &evidence, weight, &mut rng);
         let ranked = round(Search::Ranked, &explanation, &mut posterior, Some(&compensation), &curvature, &mut |p: &Posterior| objective(&mut ic, p), None).expect("the ranked search");
@@ -1296,11 +1314,12 @@ mod tests {
         for g in &planted {
             assert!(!posterior.active[*g], "{} survived", explanation.groups[*g].name);
         }
-        // Removing groups without effect leaves the data term unchanged: F falls by their cost.
+        // Removing groups without effect leaves the data term unchanged: F changes by the
+        // description's change alone.
         let (dead_size, dead_change) = ranked.evaluations[0];
         assert_eq!(dead_size, planted.len());
-        let saved: f64 = planted.iter().map(|g| costs[*g]).sum::<f64>() / LN_2;
-        assert!((dead_change + saved).abs() <= 1e-9 * ranked.before_bits.abs(), "the data term moved by {} bits", dead_change + saved);
+        let description = (removed(&start, &planted).description() - start.description()) / LN_2;
+        assert!((dead_change - description).abs() <= 1e-9 * ranked.before_bits.abs(), "the data term moved by {} bits", dead_change - description);
         // At this N every other group is needed: the search keeps them, the group the prefix search
         // proposes first included.
         let divergences = start.divergences();
