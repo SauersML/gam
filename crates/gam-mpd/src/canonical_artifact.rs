@@ -106,6 +106,10 @@ impl CanonicalArtifactCache {
     pub fn decode_saved(&self, bytes: &[u8], declarations: &Declarations) -> Result<Artifact, String> {
         Artifact::from_bytes_with_native_codec(bytes, declarations, &self.codec)
     }
+    /// The ordinary saved bytes of `artifact`, reusing witnessed codewords.
+    pub fn to_bytes(&self, artifact: &Artifact) -> Result<Vec<u8>, String> {
+        artifact.to_bytes_with_native_codec(&self.codec)
+    }
 }
 
 #[cfg(test)]

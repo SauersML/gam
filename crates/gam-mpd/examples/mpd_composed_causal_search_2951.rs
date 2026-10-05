@@ -205,6 +205,10 @@ fn validate_parameter_edit_configuration(settings: &Settings) -> Result<(), Stri
     }
     Ok(())
 }
+/// The cache allocates exactly what its source needs (vpd4l: 1.1 GB); this only bounds it.
+fn default_native_codec_bytes() -> usize {
+    16 << 30
+}
 fn default_response_weight() -> f64 {
     1.
 }
@@ -224,8 +228,8 @@ struct Settings {
     /// Optional compact labels for structural search or finite down-weight response mode.
     #[serde(default)]
     fixed_head_targets: Option<FixedHeadSettings>,
-    /// Immutable native codewords and decoded buffers only; zero disables cache.
-    #[serde(default)]
+    /// Budget of immutable native codewords and decoded buffers; zero disables the cache.
+    #[serde(default = "default_native_codec_bytes")]
     native_codec_bytes: usize,
     #[serde(default = "empty_grammar")]
     grammar: Grammar,
@@ -2219,15 +2223,9 @@ fn structural_run(
     targets: &[Array2<f64>],
     out: &Path,
     heldout_export: Option<&Path>,
-    cache: Option<&CanonicalArtifactCache>,
     costs: &mut CostCache,
     parameter_edits: Option<&native_parameter_edit::Family>,
 ) -> Result<(), String> {
-    // These values belong to the fixed-bank baseline. Structural source has augmented
-    // declarations/codewords, so its standalone replay uses the ordinary codec.
-    if cache.is_some() {
-        return Err("structural_search native_codec_bytes must be zero: cache source must witness the augmented declarations, not the original native artifact".into());
-    }
     if structural
         .native_response_weight
         .is_some_and(|w| !w.is_finite() || w <= 0.)
@@ -2280,11 +2278,21 @@ fn structural_run(
     let local =
         gam_mpd::acceptance::Local::new(&controlled.program, all_inputs, None, settings.context);
     let (initial_source, initial_bytes) = canonical(&Artifact::native(&controlled.program)?)?;
+    // The codeword cache witnesses the controlled source's own declarations; candidates share
+    // its decoded operators, so their saved bytes replay through it.
+    let cache_started = Instant::now();
+    let cache = (settings.native_codec_bytes != 0)
+        .then(|| CanonicalArtifactCache::new(&initial_source, settings.native_codec_bytes))
+        .transpose()?;
+    save(
+        &out.join("CODEC_CACHE.json"),
+        &json!({"native_codec_bytes":settings.native_codec_bytes,"initialization_seconds":cache_started.elapsed().as_secs_f64(),"preflight":cache.as_ref().map(|c|c.preflight()),"stats":cache.as_ref().map(|c|c.stats()),"source":"canonical controlled source (augmented declarations)"}),
+    )?;
     std::fs::write(out.join("controlled-native.artifact"), initial_bytes)
         .map_err(|e| e.to_string())?;
     save(
         &out.join("CONTROLLED_SOURCE.json"),
-        &json!({"native_parameter_edits":settings.native_parameter_edits,"original_to_edit_lowered_root_mapping":parameter_edits.map(|e|&e.node_mapping),"original_to_final_controlled_mapping":parameter_edits.map(|e|e.node_mapping.iter().map(|n|controlled.root_mapping[*n]).collect::<Vec<_>>()),"fixed_edit_direction_operator_ids":parameter_edits.map(|e|&e.direction_operators),"original_controls":settings.controls,"original_to_controlled_root_mapping":controlled.root_mapping,"control_slots":controlled.control_slots.iter().map(|s|json!({"control":s.control,"slot":s.slot,"width":s.width})).collect::<Vec<_>>(),"cases":settings.cases,"source_scope":"Original native graph augmented once with declared Raw control inputs and ordinary arithmetic. Structural candidate predicts from its own states and these controls; no per-candidate native intervention translator.","local_scope":"Measured controlled-native parent states over all declared training control episodes, RMS scale over that augmented family; not original unconditioned acceptance Dlocal.","global_scale_arithmetic":"Post-contribution multiplication, real-algebra equivalent to native shared-weight gain; not literal edited-checkpoint binary arithmetic equality.","codec_scope":"Ordinary standalone augmented artifact; original-native codec cache intentionally unsupported."}),
+        &json!({"native_parameter_edits":settings.native_parameter_edits,"original_to_edit_lowered_root_mapping":parameter_edits.map(|e|&e.node_mapping),"original_to_final_controlled_mapping":parameter_edits.map(|e|e.node_mapping.iter().map(|n|controlled.root_mapping[*n]).collect::<Vec<_>>()),"fixed_edit_direction_operator_ids":parameter_edits.map(|e|&e.direction_operators),"original_controls":settings.controls,"original_to_controlled_root_mapping":controlled.root_mapping,"control_slots":controlled.control_slots.iter().map(|s|json!({"control":s.control,"slot":s.slot,"width":s.width})).collect::<Vec<_>>(),"cases":settings.cases,"source_scope":"Original native graph augmented once with declared Raw control inputs and ordinary arithmetic. Structural candidate predicts from its own states and these controls; no per-candidate native intervention translator.","local_scope":"Measured controlled-native parent states over all declared training control episodes, RMS scale over that augmented family; not original unconditioned acceptance Dlocal.","global_scale_arithmetic":"Post-contribution multiplication, real-algebra equivalent to native shared-weight gain; not literal edited-checkpoint binary arithmetic equality.","codec_scope":"Ordinary standalone augmented artifact; the optional codeword cache witnesses this controlled source and never changes bytes."}),
     )?;
     let initial_measure =
         training.measure(d, &initial_source.program, None, settings.fit.numeric_bytes)?;
@@ -2412,7 +2420,7 @@ fn structural_run(
                     )?;
                     candidate.program = fitted.program;
                 }
-                let (saved, bytes) = canonical(&candidate)?;
+                let (saved, bytes, _) = canonical_using(&candidate, cache.as_ref())?;
                 if let Some(edits) = parameter_edits {
                     for id in &edits.direction_operators {
                         if !same_dense(
@@ -2770,12 +2778,11 @@ fn run() -> Result<(), String> {
         && (settings.down_edit_family.is_some()
             || settings.frozen_shared_body.is_some()
             || settings.native_initialization
-            || settings.native_codec_bytes != 0
             || !settings.uses.is_empty()
             || settings.width != 0
             || !settings.expression_ids.is_empty())
     {
-        return Err("structural_search supplies automatic regions/library moves; manual uses/width/expression IDs and down/transfer/native-initialization/native-codec modes cannot be combined".into());
+        return Err("structural_search supplies automatic regions/library moves; manual uses/width/expression IDs and down/transfer/native-initialization modes cannot be combined".into());
     }
     let direction_count = settings
         .down_edit_family
@@ -2948,7 +2955,8 @@ fn run() -> Result<(), String> {
     );
     let base = Artifact::native(&native)?;
     let cache_started = Instant::now();
-    let native_codec = if settings.native_codec_bytes == 0 {
+    // Structural search builds its cache over its controlled source instead.
+    let native_codec = if settings.native_codec_bytes == 0 || settings.structural_search.is_some() {
         None
     } else {
         Some(CanonicalArtifactCache::new(
@@ -3075,7 +3083,6 @@ fn run() -> Result<(), String> {
             &targets,
             out,
             args.get(4).map(|p| Path::new(p)),
-            native_codec.as_ref(),
             &mut costs,
             parameter_edits.as_ref(),
         );
@@ -3702,7 +3709,11 @@ fn run() -> Result<(), String> {
                         Artifact::from_bytes(&bytes, &native.declarations)
                     }
                 })?;
-                if gam_gpu::trace::within_host("heldout.reencode", || artifact.to_bytes())? != bytes {
+                let replayed = gam_gpu::trace::within_host("heldout.reencode", || match &native_codec {
+                    Some(cache) => cache.to_bytes(&artifact),
+                    None => artifact.to_bytes(),
+                })?;
+                if replayed != bytes {
                     return Err("heldout ordinary saved-byte canonical replay differs".into());
                 }
                 let c32 = structural_cost(&artifact, &mut costs)?.total();
@@ -5473,7 +5484,6 @@ mod tests {
             &targets,
             &out,
             None,
-            None,
             &mut CostCache::default(),
             None,
         )
@@ -5835,7 +5845,6 @@ mod tests {
             &family,
             &[],
             &edit_out,
-            None,
             None,
             &mut CostCache::default(),
             Some(&edits),
@@ -6353,7 +6362,6 @@ mod tests {
             &family,
             &targets,
             &out,
-            None,
             None,
             &mut CostCache::default(),
             None,
