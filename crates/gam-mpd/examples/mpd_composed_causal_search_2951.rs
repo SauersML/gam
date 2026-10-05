@@ -1,8 +1,8 @@
 //! Fit structural proposals in the autonomous native LM on clean AND intervened logits.
 //! EXPORT SETTINGS.json FRESH_OUT host|cuda [HELDOUT_EXPORT]. Training proposal search, not acceptance.
-use gam_gpu::{tensor::Device, GpuPolicy};
+use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
-    acceptance::{structural_cost, CostCache},
+    acceptance::{CostCache, structural_cost},
     artifact::Artifact,
     canonical_artifact::CanonicalArtifactCache,
     coder_capture::sha256,
@@ -11,17 +11,17 @@ use gam_mpd::{
     down_edit_family::{self, Direction, Family as DownFamily},
     import::import_language_model,
     intervention_program::{self, Control, ControlValue},
-    operator_program::{remap_node, FamilyInputs, Node, OperatorBody, OperatorProgram},
+    operator_program::{FamilyInputs, Node, OperatorBody, OperatorProgram, remap_node},
     parameter_response_program,
     program_structure_search::{
         self, EvaluatedArtifact, Evaluation as StructureEvaluation, Metric, Mutation,
     },
     resident_causal_fit::{self, Episode, Settings as FitSettings},
-    run_check::{layer_nodes, split_sites, LayerNodes},
+    run_check::{LayerNodes, layer_nodes, split_sites},
 };
 use ndarray::{Array1, Array2};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write,
@@ -127,6 +127,10 @@ struct StructuralSettings {
     constraints: program_structure_search::Constraints,
     #[serde(default)]
     max_expression_evaluations: usize,
+    /// Optional mean native-trajectory response loss during proposal fitting.
+    /// Separate from the unchanged teacher-input Local acceptance diagnostic.
+    #[serde(default)]
+    native_response_weight: Option<f64>,
 }
 fn empty_grammar() -> Grammar {
     Grammar {
@@ -530,6 +534,185 @@ fn teacher_targets(
         );
     }
     Ok((targets, planned))
+}
+
+/// Fixed native trajectory labels at every changed observable boundary. These
+/// arrays only enter the loss; the candidate still executes from its own states.
+fn native_response_targets(
+    d: &Device,
+    native: &OperatorProgram,
+    candidate: &Artifact,
+    episodes: &[Episode],
+    weight: f64,
+    limit: usize,
+) -> Result<(resident_causal_fit::NativeResponses, Value), String> {
+    if !weight.is_finite() || weight <= 0. || episodes.is_empty() {
+        return Err("positive native-response weight and nonempty episodes required".into());
+    }
+    if episodes.iter().any(|e| {
+        e.inputs.rows == 0
+            || e.scored
+                .as_ref()
+                .is_some_and(|m| m.len() != e.inputs.rows || !m.iter().any(|v| *v))
+    }) {
+        return Err("nonempty exact response row domains required".into());
+    }
+    let mut boundaries = BTreeMap::new();
+    for b in &candidate.blocks {
+        if boundaries
+            .insert(b.native_write, b.write)
+            .is_some_and(|old| old != b.write)
+        {
+            return Err("one native response has conflicting candidate boundaries".into());
+        }
+        if candidate
+            .program
+            .node_interface(b.write)
+            .map_err(|e| e.to_string())?
+            != native
+                .node_interface(b.native_write)
+                .map_err(|e| e.to_string())?
+        {
+            return Err("native response boundary has changed interface".into());
+        }
+    }
+    if boundaries.is_empty() {
+        return Err("native response fitting requires declared observable blocks".into());
+    }
+    let (mut expanded, mapping) = gam_mpd::artifact_device::mapped_inlined(native)?;
+    let last = boundaries
+        .keys()
+        .map(|n| mapping[*n])
+        .max()
+        .ok_or("no response nodes")?;
+    // Keep all earlier nodes, including requested nodes outside the last one's ancestry.
+    expanded.nodes.truncate(last + 1);
+    expanded.output = last;
+    let resident = DeviceProgram::compile_values_bounded(d, &expanded, limit)?;
+    let rows = episodes.iter().try_fold(0usize, |sum, e| {
+        sum.checked_add(e.inputs.rows)
+            .ok_or("response row count overflow")
+    })?;
+    let widths = boundaries.keys().try_fold(0usize, |sum, n| {
+        sum.checked_add(
+            native
+                .node_interface(*n)
+                .map_err(|e| e.to_string())?
+                .width(),
+        )
+        .ok_or_else(|| "response width overflow".to_string())
+    })?;
+    let label_bytes = rows
+        .checked_mul(widths)
+        .and_then(|n| n.checked_mul(8))
+        .ok_or("response label bytes overflow")?;
+    let maximum_rows = episodes
+        .iter()
+        .map(|e| e.inputs.rows)
+        .max()
+        .ok_or("no episodes")?;
+    let trace_bytes = resident
+        .edited_bytes_per_row()
+        .checked_mul(maximum_rows)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or("response trace bytes overflow")?;
+    let attention_bytes = maximum_rows
+        .checked_mul(maximum_rows)
+        .and_then(|n| n.checked_mul(8 * 12))
+        .ok_or("response attention bytes overflow")?;
+    let existing_logits = episodes.iter().try_fold(0usize, |sum, e| {
+        e.target_logits
+            .len()
+            .checked_mul(8)
+            .and_then(|n| sum.checked_add(n))
+            .ok_or("response endpoint labels overflow")
+    })?;
+    let planned = resident
+        .operator_numeric_bytes()?
+        .checked_add(label_bytes)
+        .and_then(|n| n.checked_add(trace_bytes))
+        .and_then(|n| n.checked_add(attention_bytes))
+        .and_then(|n| n.checked_add(existing_logits))
+        .ok_or("response plan overflow")?;
+    if planned > limit {
+        return Err(format!(
+            "native response capture numeric plan {planned} exceeds {limit}"
+        ));
+    }
+    let mut labels = Vec::new();
+    for episode in episodes {
+        let trace = resident.forward(&episode.inputs)?;
+        let captured = boundaries
+            .keys()
+            .map(|&node| {
+                let values = d
+                    .download(trace.value(mapping[node])?)
+                    .map_err(|e| e.to_string())?;
+                if values.iter().any(|v| !v.is_finite()) {
+                    return Err("nonfinite native response target".to_string());
+                }
+                Ok((node, values))
+            })
+            .collect::<Result<BTreeMap<_, _>, String>>()?;
+        labels.push(captured);
+    }
+    let mut scales = BTreeMap::new();
+    for &node in boundaries.keys() {
+        // Scaled sum of squares avoids overflow while computing the pooled RMS
+        // vector norm. The same fixed scale is used in every control episode.
+        let (mut largest, mut squares) = (0.0_f64, 0.0_f64);
+        let mut scored_rows = 0usize;
+        for (episode, values) in episodes.iter().zip(&labels) {
+            for (row, value) in values[&node].outer_iter().enumerate() {
+                if episode.scored.as_ref().is_some_and(|m| !m[row]) {
+                    continue;
+                }
+                scored_rows += 1;
+                for &x in value {
+                    let x = x.abs();
+                    if x > largest {
+                        squares = 1. + squares * (largest / x).powi(2);
+                        largest = x;
+                    } else if x > 0. {
+                        squares += (x / largest).powi(2);
+                    }
+                }
+            }
+        }
+        if scored_rows == 0 {
+            return Err("no scored response rows".into());
+        }
+        let rms = largest * (squares / scored_rows as f64).sqrt();
+        if !rms.is_finite() {
+            return Err("nonfinite response RMS".into());
+        }
+        scales.insert(node, (rms, if rms == 0. { 1. } else { rms }));
+    }
+    let mut responses = BTreeMap::new();
+    for (episode, values) in episodes.iter().zip(labels) {
+        let targets = values
+            .into_iter()
+            .map(
+                |(native_node, values)| resident_causal_fit::NativeResponseTarget {
+                    label: format!("native_node_{native_node}"),
+                    source_node: boundaries[&native_node],
+                    values,
+                    scored: episode.scored.clone(),
+                    scale: scales[&native_node].1,
+                    weight: weight / boundaries.len() as f64,
+                },
+            )
+            .collect();
+        if responses.insert(episode.label.clone(), targets).is_some() {
+            return Err("duplicate response episode labels".into());
+        }
+    }
+    Ok((
+        responses,
+        json!({"weight":weight,"native_to_candidate":boundaries,
+        "native_rms_and_fixed_scale":scales,"planned_numeric_bytes":planned,
+        "scope":"Fixed controlled-native trajectory targets at all distinct changed observable exits. Candidate states never replaced by labels. Weighted mean of normalized squared response errors plus output KL, distinct from teacher-input Local. Zero native RMS uses explicit unit absolute scale; training rows only."}),
+    ))
 }
 fn freeze_evaluation_ids(
     frontier: &[Value],
@@ -1023,6 +1206,12 @@ fn structural_run(
     if cache.is_some() {
         return Err("structural_search native_codec_bytes must be zero: cache source must witness the augmented declarations, not the original native artifact".into());
     }
+    if structural
+        .native_response_weight
+        .is_some_and(|w| !w.is_finite() || w <= 0.)
+    {
+        return Err("native_response_weight must be finite and positive when supplied".into());
+    }
     let native_controls = controls(
         &Artifact::native(native)?,
         native,
@@ -1101,13 +1290,33 @@ fn structural_run(
                     return Err("exact extraction must remain fit-free".into());
                 }
                 if !request.trainable_operator_ids.is_empty() {
-                    let fitted = resident_causal_fit::fit(
-                        d,
-                        &candidate.program,
-                        &training,
-                        request.trainable_operator_ids,
-                        settings.fit.clone(),
-                    )?;
+                    let fitted = if let Some(weight) = structural.native_response_weight {
+                        let (response_targets, provenance) = native_response_targets(
+                            d,
+                            &controlled.program,
+                            &candidate,
+                            &training,
+                            weight,
+                            settings.teacher_numeric_bytes,
+                        )?;
+                        save(&root.join("NATIVE_RESPONSE_TARGETS.json"), &provenance)?;
+                        resident_causal_fit::fit_with_native(
+                            d,
+                            &candidate.program,
+                            &training,
+                            &response_targets,
+                            request.trainable_operator_ids,
+                            settings.fit.clone(),
+                        )?
+                    } else {
+                        resident_causal_fit::fit(
+                            d,
+                            &candidate.program,
+                            &training,
+                            request.trainable_operator_ids,
+                            settings.fit.clone(),
+                        )?
+                    };
                     save(
                         &root.join("FIT.json"),
                         &serde_json::to_value(&fitted.report).map_err(|e| e.to_string())?,
@@ -2181,9 +2390,11 @@ mod tests {
             .program
             .execute(&input, false)
             .expect("valid regression fixture");
-        assert!(trace.values[lowered.program.output]
-            .iter()
-            .all(|v| v.is_finite()));
+        assert!(
+            trace.values[lowered.program.output]
+                .iter()
+                .all(|v| v.is_finite())
+        );
         let restored = lowered
             .restore(&lowered.program)
             .expect("valid regression fixture");
@@ -2318,7 +2529,7 @@ mod tests {
     #[test]
     fn removed_down_family_runs_literal_teachers_shared_response_fit_and_saved_replay() {
         use gam_mpd::operator_program::{
-            exact_precision, Declarations, Interface, Law, Operator, Slot, SlotValues,
+            Declarations, Interface, Law, Operator, Slot, SlotValues, exact_precision,
         };
         use ndarray::array;
         let dense = |values: Array2<f64>| {
@@ -2418,10 +2629,12 @@ mod tests {
                 .expect("original native state")
                 .values[literal.output]
                 .clone();
-            assert!(expected
-                .iter()
-                .zip(target)
-                .all(|(a, b)| (a - b).abs() < 1e-12));
+            assert!(
+                expected
+                    .iter()
+                    .zip(target)
+                    .all(|(a, b)| (a - b).abs() < 1e-12)
+            );
         }
         let expression = Expr::Unary(
             Unary::Relu,
@@ -2600,7 +2813,7 @@ mod tests {
     #[test]
     fn structural_mode_runs_persistent_reuse_with_finite_control_and_saved_replay() {
         use gam_mpd::operator_program::{
-            exact_precision, Declarations, Interface, Law, Operator, Slot,
+            Declarations, Interface, Law, Operator, Slot, exact_precision,
         };
         use ndarray::array;
         let dense = |name: &str, values: Array2<f64>| {
@@ -2748,6 +2961,7 @@ mod tests {
                 max_intervention_errors: vec![metric("clean"), metric("edit_a"), metric("edit_b")],
             },
             max_expression_evaluations: 0,
+            native_response_weight: Some(1.),
         };
         let settings = Settings {
             export_sha256: "0".repeat(64),
@@ -2813,9 +3027,11 @@ mod tests {
             "{report}"
         );
         let attempts = report["report"]["attempts"].as_array().expect("attempts");
-        assert!(attempts
-            .iter()
-            .any(|a| a["depth"] == 2 && a["mutation"]["kind"] == "reuse_existing_rule"));
+        assert!(
+            attempts
+                .iter()
+                .any(|a| a["depth"] == 2 && a["mutation"]["kind"] == "reuse_existing_rule")
+        );
         assert!(
             attempts
                 .iter()
@@ -2830,6 +3046,31 @@ mod tests {
         for entry in std::fs::read_dir(&out).expect("directories") {
             let p = entry.expect("entry").path();
             if p.join("FIT.json").exists() {
+                let fit: Value =
+                    serde_json::from_slice(&std::fs::read(p.join("FIT.json")).expect("fit report"))
+                        .expect("fit JSON");
+                assert!(p.join("NATIVE_RESPONSE_TARGETS.json").exists());
+                let initial = fit["initial"]["episodes"]
+                    .as_array()
+                    .expect("episode measurements");
+                assert!(
+                    initial
+                        .iter()
+                        .all(|e| e["responses"].as_array().is_some_and(|r| !r.is_empty()))
+                );
+                for episode in initial {
+                    let kl = episode["mean_kl"].as_f64().expect("separate KL");
+                    let response = episode["responses"]
+                        .as_array()
+                        .expect("response terms")
+                        .iter()
+                        .map(|r| r["weighted_loss"].as_f64().expect("response loss"))
+                        .sum::<f64>();
+                    assert!(
+                        (episode["total_loss"].as_f64().expect("total") - kl - response).abs()
+                            < 1e-12
+                    );
+                }
                 let bytes = std::fs::read(p.join("program.artifact")).expect("savedartifact");
                 let restored = Artifact::from_bytes(
                     &bytes,
@@ -2851,6 +3092,117 @@ mod tests {
             "reuse must execute resident fitter, not only structural metadata"
         );
         std::fs::remove_dir_all(out).expect("cleanup");
+    }
+    #[test]
+    fn response_capture_uses_native_signed_episodes_and_inlined_multi_consumer_nodes() {
+        use gam_mpd::operator_program::{Declarations, Interface, Law, Rule, Slot, SlotValues};
+        let native = OperatorProgram {
+            declarations: Declarations {
+                domains: vec![],
+                slots: vec![Slot::Raw { width: 2 }, Slot::Raw { width: 2 }],
+                parameters: 0,
+            },
+            bases: vec![],
+            operators: vec![],
+            rules: vec![Rule {
+                name: "signed activation control".into(),
+                inputs: vec![Interface::native(2).unwrap(); 2],
+                nodes: vec![
+                    Node::Param { index: 0 },
+                    Node::Param { index: 1 },
+                    Node::Hadamard { left: 0, right: 1 },
+                ],
+                output: 2,
+            }],
+            nodes: vec![
+                Node::Raw { slot: 0 },
+                Node::Raw { slot: 1 },
+                Node::Call {
+                    rule: 0,
+                    arguments: vec![0, 1],
+                },
+                Node::Pointwise {
+                    input: 2,
+                    laws: vec![Law::Relu],
+                },
+                Node::Pointwise {
+                    input: 2,
+                    laws: vec![Law::Silu],
+                },
+                Node::Concat { parts: vec![3, 4] },
+            ],
+            output: 5,
+        };
+        let mut candidate = Artifact::native(&native).unwrap();
+        candidate.blocks = [3, 4]
+            .into_iter()
+            .map(|node| gam_mpd::artifact::Binding {
+                name: format!("exit_{node}"),
+                native_reads: vec![0, 1],
+                native_write: node,
+                reads: vec![0, 1],
+                write: node,
+            })
+            .collect();
+        candidate.program.nodes[3] = Node::Pointwise {
+            input: 2,
+            laws: vec![Law::Zero],
+        };
+        let episodes = [1., -0.5]
+            .into_iter()
+            .enumerate()
+            .map(|(index, gain)| {
+                let inputs = FamilyInputs {
+                    rows: 2,
+                    layout: None,
+                    slots: vec![
+                        SlotValues::Raw(ndarray::array![[1., -2.], [3., 0.]]),
+                        SlotValues::Raw(Array2::from_elem((2, 2), gain)),
+                    ],
+                };
+                let target_logits =
+                    native.execute(&inputs, false).unwrap().values[native.output].clone();
+                Episode {
+                    label: format!("case{index}"),
+                    group: "train".into(),
+                    inputs,
+                    target_logits,
+                    scored: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let (labels, provenance) =
+            native_response_targets(&Device::host(), &native, &candidate, &episodes, 2., 1 << 24)
+                .unwrap();
+        for episode in &episodes {
+            let trace = native.execute(&episode.inputs, false).unwrap();
+            for target in &labels[&episode.label] {
+                assert_eq!(target.values, trace.values[target.source_node]);
+                assert_eq!(target.weight, 1.);
+            }
+        }
+        assert_ne!(labels["case0"][0].values, labels["case1"][0].values);
+        assert_eq!(labels["case0"][0].scale, labels["case1"][0].scale);
+        assert!(
+            labels["case0"][0].values.iter().any(|v| *v != 0.),
+            "labels must not come from candidate's zeroed consumer"
+        );
+        assert_eq!(
+            labels["case1"][0].values,
+            ndarray::array![[0., 1.], [0., 0.]]
+        );
+        let planned = provenance["planned_numeric_bytes"].as_u64().unwrap() as usize;
+        assert!(
+            native_response_targets(
+                &Device::host(),
+                &native,
+                &candidate,
+                &episodes,
+                2.,
+                planned - 1
+            )
+            .is_err()
+        );
     }
     #[test]
     fn dominated_equation_hypotheses_freeze_without_heldout_selection() {
@@ -2933,7 +3285,7 @@ mod tests {
     }
     fn controlled_cancellation_gate(joint: bool, square: bool) {
         let gate_started = Instant::now();
-        use gam_mpd::operator_program::{exact_precision, Declarations, Interface, Operator, Slot};
+        use gam_mpd::operator_program::{Declarations, Interface, Operator, Slot, exact_precision};
         use ndarray::array;
         let dense = |name: &str, v: Array2<f64>| {
             Arc::new(
@@ -3092,6 +3444,7 @@ mod tests {
                 max_intervention_errors: vec![metric("clean"), metric("edited")],
             },
             max_expression_evaluations: 2,
+            native_response_weight: None,
         };
         if joint {
             structural.constraints.max_local_errors[0].value = 1e-6;
@@ -3280,10 +3633,12 @@ mod tests {
             &std::fs::read(out.join("FROZEN_EVALUATION_IDS.json")).expect("freeze"),
         )
         .expect("json");
-        assert!(!frozen["expression_hypotheses"]
-            .as_array()
-            .expect("hypotheses")
-            .is_empty());
+        assert!(
+            !frozen["expression_hypotheses"]
+                .as_array()
+                .expect("hypotheses")
+                .is_empty()
+        );
         if joint {
             // Freeze by training admission before constructing any heldout targets.
             let chosen = attempts

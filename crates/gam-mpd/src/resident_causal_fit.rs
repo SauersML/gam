@@ -11,7 +11,7 @@ use crate::{
         FamilyInputs, Node, OperatorBody, OperatorProgram, Slot, SlotValues, exact_precision,
     },
 };
-use gam_gpu::tensor::{Arithmetic, Device, Indices, Tensor};
+use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Indices, Tensor};
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,6 +36,30 @@ pub struct FixedHeadEpisode {
     pub target: Target,
 }
 
+/// Fixed native-space observations of the candidate's autonomous source-node values.
+/// `scale` and `weight` are declared constants, never recomputed from candidate values.
+#[derive(Clone)]
+pub struct NativeResponseTarget {
+    pub label: String,
+    pub source_node: usize,
+    pub values: Array2<f64>,
+    pub scored: Option<Vec<bool>>,
+    pub scale: f64,
+    pub weight: f64,
+}
+/// Episode labels bind response targets without changing the existing episode APIs.
+pub type NativeResponses = BTreeMap<String, Vec<NativeResponseTarget>>;
+#[derive(Clone, Debug, Serialize)]
+pub struct ResponseMeasurement {
+    pub label: String,
+    pub source_node: usize,
+    pub scored_rows: usize,
+    pub scale: f64,
+    pub weight: f64,
+    pub mean_normalized_squared_error: f64,
+    pub weighted_loss: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -52,6 +76,8 @@ pub struct EpisodeMeasurement {
     pub group: String,
     pub scored_rows: usize,
     pub mean_kl: f64,
+    pub total_loss: f64,
+    pub responses: Vec<ResponseMeasurement>,
     /// Tail diagnostic only; the optimized objective remains the declared group mean.
     pub maximum_scored_row_kl: f64,
     pub worst_scored_row: usize,
@@ -91,11 +117,24 @@ struct ResidentEpisode {
     family: FamilyInputs,
     raw: BTreeMap<usize, Tensor>,
     target: ResidentTarget,
+    responses: Vec<ResidentResponse>,
     flags: Option<Indices>,
     label: String,
     group: String,
     scored_rows: usize,
     scored_mask: Option<Vec<bool>>,
+}
+struct ResidentResponse {
+    label: String,
+    source_node: usize,
+    node: usize,
+    target: Tensor,
+    coefficients: Tensor,
+    blocks: ColumnBlocks,
+    scored: Option<Vec<bool>>,
+    scored_rows: usize,
+    scale: f64,
+    weight: f64,
 }
 enum ResidentTarget {
     Logits(Tensor),
@@ -297,6 +336,7 @@ fn prepare(
             Ok(ResidentEpisode {
                 family,
                 raw,
+                responses: Vec::new(),
                 target: ResidentTarget::Logits(d.upload(e.target_logits.view()).map_err(error)?),
                 flags: e
                     .scored
@@ -442,6 +482,7 @@ fn prepare_compact(
             Ok(ResidentEpisode {
                 family,
                 raw,
+                responses: Vec::new(),
                 target: ResidentTarget::Fixed {
                     target: e.target.clone(),
                     head: resident_head.clone(),
@@ -457,6 +498,171 @@ fn prepare_compact(
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok((p, resident, planned))
+}
+
+// Validate the complete sidecar and its numeric bound before uploading any response panels.
+fn attach_responses(
+    p: &DeviceProgram,
+    source: &OperatorProgram,
+    resident: &mut [ResidentEpisode],
+    responses: &NativeResponses,
+    base: usize,
+    limit: usize,
+) -> Result<usize, String> {
+    let (_, mapping) = mapped_inlined(source)?;
+    if responses
+        .keys()
+        .any(|label| !resident.iter().any(|e| &e.label == label))
+    {
+        return Err("unknown native response episode label".into());
+    }
+    let mut panels = 0usize;
+    let mut peak = 0usize;
+    for e in resident.iter() {
+        let mut labels = BTreeSet::new();
+        let mut seeds = BTreeMap::new();
+        let mut workspace = 0usize;
+        for t in responses.get(&e.label).into_iter().flatten() {
+            let node = *mapping
+                .get(t.source_node)
+                .ok_or("native response source node out of range")?;
+            let width = *p
+                .widths()
+                .get(node)
+                .ok_or("native response node dropped from fixed-head prefix")?;
+            let rows = e.family.rows;
+            if t.label.is_empty()
+                || !labels.insert(&t.label)
+                || width == 0
+                || t.values.dim() != (rows, width)
+                || t.values.iter().any(|v| !v.is_finite())
+                || !t.scale.is_finite()
+                || t.scale <= 0.
+                || !t.weight.is_finite()
+                || t.weight <= 0.
+                || !(t.weight / t.scale / t.scale).is_finite()
+                || t.scored
+                    .as_ref()
+                    .is_some_and(|m| m.len() != rows || !m.iter().any(|v| *v))
+            {
+                return Err(
+                    "invalid native response label/dimensions/values/scored rows/scale/weight"
+                        .into(),
+                );
+            }
+            let scored_rows = t
+                .scored
+                .as_ref()
+                .map_or(rows, |m| m.iter().filter(|v| **v).count());
+            let coefficient = 2. * (t.weight / t.scale / t.scale / scored_rows as f64);
+            if !coefficient.is_finite() || coefficient <= 0. {
+                return Err("native response seed coefficient is not positive finite f64".into());
+            }
+            let bytes = mul(t.values.len(), 8)?;
+            // Fixed targets and explicit per-element masked coefficients; two u32 block offsets.
+            panels = add(panels, add(mul(bytes, 2)?, 8)?)?;
+            seeds.insert(node, bytes);
+            // Residual, row reduction, masked seed, and temporary merged-node contribution.
+            workspace = workspace.max(add(mul(bytes, 3)?, mul(rows, 8)?)?);
+        }
+        let seed_bytes = seeds.values().try_fold(0usize, |sum, &v| add(sum, v))?;
+        peak = peak.max(add(seed_bytes, workspace)?);
+    }
+    let planned = add(base, add(panels, peak)?)?;
+    if planned > limit {
+        return Err(format!(
+            "joint causal fitter numeric plan {planned} exceeds {limit}"
+        ));
+    }
+    for e in resident {
+        for t in responses.get(&e.label).into_iter().flatten() {
+            let node = mapping[t.source_node];
+            let scored_rows = t
+                .scored
+                .as_ref()
+                .map_or(e.family.rows, |m| m.iter().filter(|v| **v).count());
+            let coefficient = 2. * (t.weight / t.scale / t.scale / scored_rows as f64);
+            let coefficients = Array2::from_shape_fn(t.values.dim(), |(row, _)| {
+                if t.scored.as_ref().is_none_or(|m| m[row]) {
+                    coefficient
+                } else {
+                    0.
+                }
+            });
+            e.responses.push(ResidentResponse {
+                label: t.label.clone(),
+                source_node: t.source_node,
+                node,
+                target: p.device().upload(t.values.view()).map_err(error)?,
+                coefficients: p.device().upload(coefficients.view()).map_err(error)?,
+                blocks: p
+                    .device()
+                    .column_blocks(&[t.values.ncols()])
+                    .map_err(error)?,
+                scored: t.scored.clone(),
+                scored_rows,
+                scale: t.scale,
+                weight: t.weight,
+            });
+        }
+    }
+    Ok(planned)
+}
+fn response_score(
+    p: &DeviceProgram,
+    e: &ResidentEpisode,
+    trace: &crate::device_program::DeviceTrace,
+    mut seeds: Option<&mut BTreeMap<usize, Tensor>>,
+    group_weight: f64,
+) -> Result<Vec<ResponseMeasurement>, String> {
+    let d = p.device();
+    let mut measurements = Vec::new();
+    for t in &e.responses {
+        let mut residual = d.copy(trace.value(t.node)?).map_err(error)?;
+        d.axpy(&mut residual, -1., &t.target).map_err(error)?;
+        let squared = d
+            .block_products(&residual, &residual, &t.blocks)
+            .map_err(error)?;
+        let squared = d.download(&squared).map_err(error)?;
+        let mut sum = 0.;
+        for row in 0..trace.rows {
+            if t.scored.as_ref().is_none_or(|m| m[row]) {
+                let value = squared[[row, 0]] / t.scale / t.scale;
+                if !value.is_finite() {
+                    return Err("nonfinite native response loss".into());
+                }
+                sum += value;
+            }
+        }
+        let mean = sum / t.scored_rows as f64;
+        let weighted_loss = t.weight * mean;
+        if !weighted_loss.is_finite() {
+            return Err("nonfinite weighted native response loss".into());
+        }
+        measurements.push(ResponseMeasurement {
+            label: t.label.clone(),
+            source_node: t.source_node,
+            scored_rows: t.scored_rows,
+            scale: t.scale,
+            weight: t.weight,
+            mean_normalized_squared_error: mean,
+            weighted_loss,
+        });
+        if let Some(seeds) = seeds.as_deref_mut() {
+            let mut masked = d.zeros(residual.rows(), residual.cols()).map_err(error)?;
+            d.hadamard(&mut masked, &residual, &t.coefficients, false)
+                .map_err(error)?;
+            match seeds.get_mut(&t.node) {
+                Some(existing) => d.axpy(existing, group_weight, &masked).map_err(error)?,
+                None => {
+                    let mut scaled = d.zeros(masked.rows(), masked.cols()).map_err(error)?;
+                    d.axpy(&mut scaled, group_weight, &masked).map_err(error)?;
+                    seeds.insert(t.node, scaled);
+                }
+            }
+        }
+    }
+    Ok(measurements)
 }
 
 fn widths_for(p: &OperatorProgram, node: usize) -> Result<usize, String> {
@@ -488,8 +694,13 @@ fn scan(p: &DeviceProgram, episodes: &[ResidentEpisode]) -> Result<Measurement, 
         if !mean.is_finite() {
             return Err("nonfinite episode mean KL".into());
         }
+        let responses = response_score(p, e, &trace, None, 0.)?;
+        let total_loss = mean + responses.iter().map(|r| r.weighted_loss).sum::<f64>();
+        if !total_loss.is_finite() {
+            return Err("nonfinite joint episode loss".into());
+        }
         let entry = groups.entry(e.group.clone()).or_insert((0., 0));
-        entry.0 += mean;
+        entry.0 += total_loss;
         entry.1 += 1;
         let (worst_scored_row, maximum_scored_row_kl) = kl
             .iter()
@@ -503,6 +714,8 @@ fn scan(p: &DeviceProgram, episodes: &[ResidentEpisode]) -> Result<Measurement, 
             group: e.group.clone(),
             scored_rows: e.scored_rows,
             mean_kl: mean,
+            total_loss,
+            responses,
             maximum_scored_row_kl,
             worst_scored_row,
         });
@@ -556,13 +769,10 @@ fn gradient(
         let weight = 1. / (count as f64 * e.scored_rows as f64);
         let mut scaled = d.zeros(seed.rows(), seed.cols()).map_err(error)?;
         d.axpy(&mut scaled, weight, &seed).map_err(error)?;
-        let (_, per_episode) = p.vjp_values_dense(
-            &trace,
-            BTreeMap::from([(p.hidden(), scaled)]),
-            &[],
-            trainable,
-            Arithmetic::F64,
-        )?;
+        let mut seeds = BTreeMap::from([(p.hidden(), scaled)]);
+        response_score(p, e, &trace, Some(&mut seeds), 1. / count as f64)?;
+        let (_, per_episode) =
+            p.vjp_values_dense(&trace, seeds, &[], trainable, Arithmetic::F64)?;
         for index in trainable {
             d.axpy(
                 gradients.get_mut(index).ok_or("gradient buffer")?,
@@ -652,6 +862,88 @@ pub fn fit(
         d, source, p, resident, planned, trainable, settings, started,
     )
 }
+/// Same causal fitter with fixed observations at multiple native source nodes.
+/// Each episode loss is mean output KL plus weighted mean normalized squared response errors;
+/// the optimized objective remains the maximum named-group mean of equal-weight episodes.
+pub fn fit_with_native(
+    d: &Device,
+    source: &OperatorProgram,
+    episodes: &[Episode],
+    responses: &NativeResponses,
+    trainable: &[usize],
+    settings: Settings,
+) -> Result<Fit, String> {
+    let started = Instant::now();
+    validate_settings(trainable, &settings)?;
+    let (p, mut resident, base) = prepare(d, source, episodes, trainable, settings.numeric_bytes)?;
+    let planned = attach_responses(
+        &p,
+        source,
+        &mut resident,
+        responses,
+        base,
+        settings.numeric_bytes,
+    )?;
+    fit_prepared(
+        d, source, p, resident, planned, trainable, settings, started,
+    )
+}
+pub fn measure_with_native(
+    d: &Device,
+    source: &OperatorProgram,
+    episodes: &[Episode],
+    responses: &NativeResponses,
+    numeric_bytes: usize,
+) -> Result<Measurement, String> {
+    let (p, mut resident, base) = prepare(d, source, episodes, &[], numeric_bytes)?;
+    attach_responses(&p, source, &mut resident, responses, base, numeric_bytes)?;
+    scan(&p, &resident)
+}
+pub fn fit_fixed_head_with_native(
+    d: &Device,
+    source: &OperatorProgram,
+    episodes: &[FixedHeadEpisode],
+    responses: &NativeResponses,
+    trainable: &[usize],
+    settings: Settings,
+    head_tile_rows: usize,
+) -> Result<Fit, String> {
+    let started = Instant::now();
+    validate_settings(trainable, &settings)?;
+    let (p, mut resident, base) = prepare_compact(
+        d,
+        source,
+        episodes,
+        trainable,
+        settings.numeric_bytes,
+        head_tile_rows,
+    )?;
+    let planned = attach_responses(
+        &p,
+        source,
+        &mut resident,
+        responses,
+        base,
+        settings.numeric_bytes,
+    )?;
+    fit_prepared(
+        d, source, p, resident, planned, trainable, settings, started,
+    )
+}
+pub fn measure_fixed_head_with_native(
+    d: &Device,
+    source: &OperatorProgram,
+    episodes: &[FixedHeadEpisode],
+    responses: &NativeResponses,
+    numeric_bytes: usize,
+    head_tile_rows: usize,
+) -> Result<Measurement, String> {
+    let (p, mut resident, base) =
+        prepare_compact(d, source, episodes, &[], numeric_bytes, head_tile_rows)?;
+    attach_responses(&p, source, &mut resident, responses, base, numeric_bytes)?;
+    scan(&p, &resident)
+}
+
 fn fit_prepared(
     d: &Device,
     source: &OperatorProgram,
@@ -762,7 +1054,9 @@ fn fit_prepared(
             complete_episode_forward_passes: forwards,
             complete_episode_reverse_passes: reverse,
             seconds: started.elapsed().as_secs_f64(),
-            scope: if compact {
+            scope: if resident.iter().any(|e| !e.responses.is_empty()) {
+                "Proposal fitting only: maximum named-group mean of equal-weight joint episode losses (mean output KL plus explicitly weighted fixed-scale native-response mean squared errors). Output KL and response terms reported separately. Fixed targets never replace autonomous candidate values. One forward and one accumulated multi-node ordinary VJP per episode, shared parameter owner and unchanged Adam/best-TRAIN selection. Numeric plan adds resident response targets/masked coefficients/block offsets and accumulated seeds/sequential residual/reduction scratch to the ordinary or fixed-head baseline. Host metadata, CUDA/context/library/allocator scratch excluded; ordinary artifact acceptance remains separate."
+            } else if compact {
                 "Proposal fitting only: same maximum named-group mean objective and Adam/best-TRAIN loop. Immutable fixed bias-free full-vocabulary head targets retain E^T p and sum p log p; each row-tiled candidate KL is logZ(Eh)-mu.h+c and hidden seed E^T q-mu. Head input is after original final normalization, with full-prefix ordinary VJP; both target and candidate unscored seeds are zero. F64 vendor exp/log/GEMM are operational, not certified real-arithmetic intervals; final ordinary artifact acceptance is unchanged. Numeric plan counts resident compact labels, head, inputs, traces/gradients/parameter buffers and conservative attention/tiled vocabulary scratch. Host metadata/source, context/library/allocator scratch excluded."
             } else {
                 "Proposal fitting only: maximum named-group mean of equal-weight episode means over declared scored rows. F64 KL q-p gradients, full-sequence ordinary reverse including controls supplied as Raw graph inputs. One parameter owner across every episode. Best TRAIN objective only; no validation input/selection. Vendor exp/log and neural arithmetic are not certified intervals; ordinary serialized acceptance is separate. Numeric plan includes fixed operators (all table/product roles), resident inputs/targets/flags, full trace/cotangents/KL scratch, conservative dense attention scratch and parameter/moment/snapshot/update buffers. Excludes host panels/source bytes, CUDA context/library/allocator/register/spill scratch; token/rotation preparation peak conservatively counted, not a measured memory claim."
@@ -894,6 +1188,200 @@ mod tests {
             );
         }
         (values[1] - values[0]) / (2. * h)
+    }
+    fn native_target(
+        label: &str,
+        node: usize,
+        values: Array2<f64>,
+        scored: Option<Vec<bool>>,
+    ) -> NativeResponseTarget {
+        NativeResponseTarget {
+            label: label.into(),
+            source_node: node,
+            values,
+            scored,
+            scale: 1.7,
+            weight: 0.6,
+        }
+    }
+    fn joint_fd(
+        source: &OperatorProgram,
+        episodes: &[Episode],
+        targets: &NativeResponses,
+        row: usize,
+        col: usize,
+    ) -> f64 {
+        let mut losses = Vec::new();
+        for sign in [-1., 1.] {
+            let mut perturbed = source.clone();
+            let op = Arc::make_mut(&mut perturbed.operators[0]);
+            if let OperatorBody::Dense {
+                values, precision, ..
+            } = &mut op.body
+            {
+                values[[row, col]] += sign * 1e-5;
+                *precision = exact_precision(values.iter().copied()).unwrap();
+            }
+            losses.push(
+                measure_with_native(&Device::host(), &perturbed, episodes, targets, 1 << 24)
+                    .unwrap()
+                    .groups["active"],
+            );
+        }
+        (losses[1] - losses[0]) / 2e-5
+    }
+    #[test]
+    fn native_joint_loss_detects_compensating_exits_and_accumulates_shared_sites() {
+        let mut source = program(false, 0.4);
+        let interface = Interface::native(2).unwrap();
+        source
+            .operators
+            .push(Arc::new(Operator::identity("positive", interface.clone())));
+        source.operators.push(Arc::new(
+            Operator::dense(
+                "negative",
+                interface.clone(),
+                interface,
+                ndarray::array![[-1., 0.], [0., -1.]],
+                exact_precision([-1., 0.]).unwrap(),
+                Default::default(),
+            )
+            .unwrap(),
+        ));
+        source.nodes = vec![
+            Node::Raw { slot: 0 },
+            Node::Affine {
+                terms: vec![(0, 0)],
+                bias: None,
+            },
+            Node::Raw { slot: 1 },
+            Node::Affine {
+                terms: vec![(0, 0)],
+                bias: None,
+            },
+            Node::Affine {
+                terms: vec![(1, 1), (3, 2)],
+                bias: None,
+            },
+        ];
+        source.output = 4;
+        let mut teacher = source.clone();
+        if let OperatorBody::Dense {
+            values, precision, ..
+        } = &mut Arc::make_mut(&mut teacher.operators[0]).body
+        {
+            values[[0, 0]] = 1.1;
+            *precision = exact_precision(values.iter().copied()).unwrap();
+        }
+        let episodes = vec![episode(
+            &source,
+            &teacher,
+            "first",
+            "active",
+            ndarray::array![[1., 0.5], [10., -3.], [-0.4, 1.]],
+            Some(ndarray::Array2::ones((3, 2))),
+            Some(vec![true, false, true]),
+        )];
+        let trace = teacher.execute(&episodes[0].inputs, false).unwrap();
+        let mask = Some(vec![true, false, true]);
+        let targets = BTreeMap::from([(
+            "first".into(),
+            vec![
+                native_target("exit one", 1, trace.values[1].clone(), mask.clone()),
+                native_target(
+                    "overlapping exit one",
+                    1,
+                    trace.values[1].clone(),
+                    mask.clone(),
+                ),
+                native_target("shared exit two", 3, trace.values[3].clone(), mask),
+            ],
+        )]);
+        let d = Device::host();
+        let (p, mut resident, base) = prepare(&d, &source, &episodes, &[0], 1 << 24).unwrap();
+        let planned =
+            attach_responses(&p, &source, &mut resident, &targets, base, 1 << 24).unwrap();
+        assert!(planned > base);
+        let measurement = scan(&p, &resident).unwrap();
+        assert_eq!(measurement.episodes[0].mean_kl, 0.);
+        assert!(measurement.objective > 0.);
+        assert_eq!(measurement.episodes[0].responses.len(), 3);
+        let gradient = gradient(&p, &resident, "active", &[0]).unwrap();
+        let actual = d.download(&gradient[&0]).unwrap();
+        for row in 0..2 {
+            for col in 0..2 {
+                assert!(
+                    (actual[[row, col]] - joint_fd(&source, &episodes, &targets, row, col)).abs()
+                        < 1e-8
+                );
+            }
+        }
+        assert!(actual[[0, 0]].abs() > 0.1);
+        let fitted = fit_with_native(&d, &source, &episodes, &targets, &[0], settings()).unwrap();
+        assert!(fitted.report.best.objective < measurement.objective * 0.1);
+        assert_eq!(fitted.report.best.episodes[0].mean_kl, 0.);
+        assert_eq!(fitted.program.nodes, source.nodes);
+        let mut bad = targets.clone();
+        bad.get_mut("first").unwrap()[0].scale = 0.;
+        assert!(measure_with_native(&d, &source, &episodes, &bad, 1 << 24).is_err());
+        bad = targets.clone();
+        bad.get_mut("first").unwrap()[0].scale = 1e200;
+        assert!(
+            measure_with_native(&d, &source, &episodes, &bad, 1 << 24).is_err(),
+            "an underflowed seed coefficient must not silently erase response gradients"
+        );
+        bad = targets.clone();
+        bad.insert("unknown".into(), vec![]);
+        assert!(measure_with_native(&d, &source, &episodes, &bad, 1 << 24).is_err());
+        bad = targets.clone();
+        bad.get_mut("first").unwrap()[0].source_node = usize::MAX;
+        assert!(measure_with_native(&d, &source, &episodes, &bad, 1 << 24).is_err());
+        assert!(attach_responses(&p, &source, &mut resident, &targets, base, planned - 1).is_err());
+    }
+    #[test]
+    fn native_joint_causal_seeds_include_unscored_prefix_and_output_overlap() {
+        let source = program(true, 0.4);
+        let teacher = program(true, 1.1);
+        let episodes = vec![episode(
+            &source,
+            &teacher,
+            "first",
+            "active",
+            ndarray::array![[2., 0.5], [-0.4, 1.], [0.2, -0.5]],
+            None,
+            Some(vec![false, false, true]),
+        )];
+        let trace = teacher.execute(&episodes[0].inputs, false).unwrap();
+        let targets = BTreeMap::from([(
+            "first".into(),
+            vec![
+                native_target(
+                    "before attention",
+                    1,
+                    trace.values[1].clone(),
+                    Some(vec![false, false, true]),
+                ),
+                native_target(
+                    "attention output",
+                    2,
+                    trace.values[2].clone(),
+                    Some(vec![false, false, true]),
+                ),
+            ],
+        )]);
+        let d = Device::host();
+        let (p, mut resident, base) = prepare(&d, &source, &episodes, &[0], 1 << 24).unwrap();
+        attach_responses(&p, &source, &mut resident, &targets, base, 1 << 24).unwrap();
+        let gradient = gradient(&p, &resident, "active", &[0]).unwrap();
+        let actual = d.download(&gradient[&0]).unwrap();
+        for row in 0..2 {
+            for col in 0..2 {
+                assert!(
+                    (actual[[row, col]] - joint_fd(&source, &episodes, &targets, row, col)).abs()
+                        < 1e-8
+                );
+            }
+        }
     }
     #[test]
     fn equal_episode_weights_scored_rows_and_raw_controls_match_group_gradient() {
@@ -1086,6 +1574,65 @@ mod tests {
         )
         .expect("same optimizer");
         assert!(fit.report.best.objective <= fit.report.initial.objective);
+        let teacher_trace = teacher.execute(&full[0].inputs, false).unwrap();
+        let responses = BTreeMap::from([(
+            "causal".into(),
+            vec![
+                native_target(
+                    "native exit",
+                    1,
+                    teacher_trace.values[1].clone(),
+                    full[0].scored.clone(),
+                ),
+                native_target(
+                    "final norm",
+                    3,
+                    teacher_trace.values[3].clone(),
+                    full[0].scored.clone(),
+                ),
+            ],
+        )]);
+        let (a, mut ae, ap) = prepare(&d, &source, &full, &[0], 1 << 24).unwrap();
+        let (b, mut be, bp) = prepare_compact(&d, &source, &compact, &[0], 1 << 24, 2).unwrap();
+        attach_responses(&a, &source, &mut ae, &responses, ap, 1 << 24).unwrap();
+        attach_responses(&b, &source, &mut be, &responses, bp, 1 << 24).unwrap();
+        let full_joint = measure_with_native(&d, &source, &full, &responses, 1 << 24).unwrap();
+        let compact_joint =
+            measure_fixed_head_with_native(&d, &source, &compact, &responses, 1 << 24, 2).unwrap();
+        assert!((full_joint.objective - compact_joint.objective).abs() < 2e-13);
+        let ag = d
+            .download(&gradient(&a, &ae, "active", &[0]).unwrap()[&0])
+            .unwrap();
+        let bg = d
+            .download(&gradient(&b, &be, "active", &[0]).unwrap()[&0])
+            .unwrap();
+        for row in 0..2 {
+            for col in 0..2 {
+                assert!((ag[[row, col]] - bg[[row, col]]).abs() < 2e-13);
+                assert!(
+                    (ag[[row, col]] - joint_fd(&source, &full, &responses, row, col)).abs() < 1e-8
+                );
+            }
+        }
+        let joint_fit = fit_fixed_head_with_native(
+            &d,
+            &source,
+            &compact,
+            &responses,
+            &[0],
+            Settings {
+                iterations: 2,
+                ..settings()
+            },
+            2,
+        )
+        .unwrap();
+        assert!(joint_fit.report.best.objective <= joint_fit.report.initial.objective);
+        let mut dropped = responses;
+        dropped.get_mut("causal").unwrap()[0].source_node = source.output;
+        assert!(
+            measure_fixed_head_with_native(&d, &source, &compact, &dropped, 1 << 24, 2).is_err()
+        );
     }
     #[test]
     fn compact_confident_logits_underflow_and_head_identity_guards() {
