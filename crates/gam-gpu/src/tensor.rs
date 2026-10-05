@@ -1053,6 +1053,45 @@ impl Device {
         self.kl_rows_impl(target, logits, scored, true)
     }
 
+    /// Stable full-vocabulary softmax and (log partition, negative entropy) per row.
+    /// Overwrites logits with probabilities; unscored rows become exactly zero.
+    /// Operational floating-point statistics, not certified real-arithmetic intervals.
+    pub fn softmax_stats_rows(&self, logits: &mut Tensor, scored: Option<&Indices>) -> Result<Vec<[f64; 2]>, GpuError> {
+        if logits.cols == 0 || scored.is_some_and(|s| s.len != logits.rows) {
+            return Err(shape("invalid softmax statistics shape".into()));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let flags = scored.map(host_indices).transpose()?;
+                let cols = logits.cols;
+                let mut output = Vec::with_capacity(logits.rows);
+                for (r, row) in host_mut(logits)?.chunks_mut(cols).enumerate() {
+                    if flags.is_some_and(|s| s[r] == 0) {
+                        row.fill(0.0); output.push([0.0, 0.0]); continue;
+                    }
+                    if row.iter().any(|v| !v.is_finite()) { return Err(shape("nonfinite softmax logits".into())); }
+                    let (maximum, sum) = host_softmax_stats(row);
+                    let log_sum = sum.ln();
+                    let mut entropy = 0.0;
+                    for value in row {
+                        let log_probability = (*value - maximum) - log_sum;
+                        let probability = (*value - maximum).exp() / sum;
+                        if probability > 0.0 { entropy += probability * log_probability; }
+                        *value = probability;
+                    }
+                    let stats = [maximum + log_sum, entropy];
+                    if stats.iter().any(|v| !v.is_finite()) { return Err(shape("nonfinite softmax statistics".into())); }
+                    output.push(stats);
+                }
+                Ok(output)
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.softmax_stats_rows(logits, scored),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(shape("fixed-head f64 statistics require Host or CUDA".into())),
+        }
+    }
+
     /// Checked f64 KL proposal statistics. No clamp, gradient or acceptance band.
     /// CUDA returns eight numbers per row rather than full logits. Vendor exp/log
     /// accuracy tables are not guaranteed bounds; callers must independently replay
@@ -2002,6 +2041,37 @@ __device__ void softmax_stats(const double* z, unsigned int cols, double* shared
     for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) t += exp(z[c] - mm);
     *m = mm;
     *total = block_sum(t, shared);
+}
+
+extern "C" __global__ void softmax_stats_rows(unsigned int rows, unsigned int cols, double* logits,
+                                             const unsigned int* scored, int use_scored, double* out) {
+    __shared__ double shared[BLOCK];
+    unsigned int r = blockIdx.x;
+    if (r >= rows) return;
+    double* z = logits + (u64)r * cols;
+    if (use_scored && !scored[r]) {
+        for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) z[c] = 0.0;
+        if (threadIdx.x == 0) { out[(u64)r*2] = 0.0; out[(u64)r*2+1] = 0.0; }
+        return;
+    }
+    double bad = 0.0;
+    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) if (!isfinite(z[c])) bad += 1.0;
+    double invalid = block_sum(bad, shared);
+    if (invalid > 0.0) {
+        if (threadIdx.x == 0) { out[(u64)r*2] = NAN; out[(u64)r*2+1] = NAN; }
+        return;
+    }
+    double maximum, sum;
+    softmax_stats(z, cols, shared, &maximum, &sum);
+    double log_sum = log(sum), entropy = 0.0;
+    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) {
+        double shifted = z[c] - maximum;
+        double probability = exp(shifted) / sum;
+        if (probability > 0.0) entropy += probability * (shifted - log_sum);
+        z[c] = probability;
+    }
+    double total = block_sum(entropy, shared);
+    if (threadIdx.x == 0) { out[(u64)r*2] = maximum + log_sum; out[(u64)r*2+1] = total; }
 }
 
 extern "C" __global__ void kl_rows(unsigned int rows, unsigned int cols, const double* target, double* logits,
@@ -3195,6 +3265,24 @@ extern "C" __global__ void code_rows(unsigned int rows, unsigned int C, unsigned
                 Some(s) => Ok((index_slice(s)?, 1)),
                 None => Ok((&self.every_row, 0)),
             }
+        }
+
+        pub(super) fn softmax_stats_rows(&self, logits: &mut Tensor, scored: Option<&Indices>) -> Result<Vec<[f64; 2]>, GpuError> {
+            let n_rows = logits.rows;
+            let n = n_rows.checked_mul(2).ok_or_else(|| shape("softmax statistics overflow".into()))?;
+            let mut output = self.zeros(n)?;
+            let (rows, cols) = (logits.rows as u32, logits.cols as u32);
+            let (flags, use_flags) = self.flags(scored)?;
+            let f = self.function("softmax_stats_rows")?;
+            // SAFETY: one block per row, logits rows*cols and output rows*2 buffers.
+            unsafe {
+                self.stream.launch_builder(&f).arg(&rows).arg(&cols).arg(slice_mut(logits)?)
+                    .arg(flags).arg(&use_flags).arg(&mut output).launch(cfg_rows(n_rows))
+            }.gpu_ctx("tensor softmax_stats_rows")?;
+            let values = self.download(&output)?;
+            let stats = values[..n].chunks_exact(2).map(|x| [x[0], x[1]]).collect::<Vec<_>>();
+            if stats.iter().flatten().any(|v| !v.is_finite()) { return Err(shape("nonfinite softmax statistics".into())); }
+            Ok(stats)
         }
 
         pub(super) fn kl_rows(&self, target: &Tensor, logits: &mut Tensor, scored: Option<&Indices>, gradient: bool) -> Result<Vec<f64>, GpuError> {

@@ -1,5 +1,9 @@
 //! Training-only full-sequence KL fitting of a single ordinary graph.
 //! Episode controls must be graph inputs; forward hooks are not differentiated.
+#[path = "fixed_head_target.rs"]
+pub mod fixed_head_target;
+use fixed_head_target::{Head, ResidentHead, Target};
+
 use crate::{
     artifact_device::mapped_inlined,
     device_program::DeviceProgram,
@@ -23,6 +27,15 @@ pub struct Episode {
     pub target_logits: Array2<f64>,
     pub scored: Option<Vec<bool>>,
 }
+/// Optional compact labels for the same causal fitter and objective.
+#[derive(Clone)]
+pub struct FixedHeadEpisode {
+    pub label: String,
+    pub group: String,
+    pub inputs: FamilyInputs,
+    pub target: Target,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -77,13 +90,44 @@ pub struct Fit {
 struct ResidentEpisode {
     family: FamilyInputs,
     raw: BTreeMap<usize, Tensor>,
-    target: Tensor,
+    target: ResidentTarget,
     flags: Option<Indices>,
     label: String,
     group: String,
     scored_rows: usize,
     scored_mask: Option<Vec<bool>>,
 }
+enum ResidentTarget {
+    Logits(Tensor),
+    Fixed {
+        target: Target,
+        head: Arc<ResidentHead>,
+    },
+}
+fn score(
+    p: &DeviceProgram,
+    e: &ResidentEpisode,
+    trace: &crate::device_program::DeviceTrace,
+    gradient: bool,
+) -> Result<(Vec<f64>, Option<Tensor>), String> {
+    match &e.target {
+        ResidentTarget::Logits(target) => {
+            let mut logits = p.device().copy(trace.value(p.hidden())?).map_err(error)?;
+            let kl = if gradient {
+                p.device().kl_rows(target, &mut logits, e.flags.as_ref())
+            } else {
+                p.device()
+                    .kl_score_rows(target, &mut logits, e.flags.as_ref())
+            }
+            .map_err(error)?;
+            Ok((kl, if gradient { Some(logits) } else { None }))
+        }
+        ResidentTarget::Fixed { target, head } => {
+            head.score(p.device(), trace.value(p.hidden())?, target, gradient)
+        }
+    }
+}
+
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -253,7 +297,7 @@ fn prepare(
             Ok(ResidentEpisode {
                 family,
                 raw,
-                target: d.upload(e.target_logits.view()).map_err(error)?,
+                target: ResidentTarget::Logits(d.upload(e.target_logits.view()).map_err(error)?),
                 flags: e
                     .scored
                     .as_ref()
@@ -274,6 +318,147 @@ fn prepare(
         .collect::<Result<Vec<_>, String>>()?;
     Ok((p, resident, planned))
 }
+fn prepare_compact(
+    d: &Device,
+    source: &OperatorProgram,
+    episodes: &[FixedHeadEpisode],
+    trainable: &[usize],
+    limit: usize,
+    tile_rows: usize,
+) -> Result<(DeviceProgram, Vec<ResidentEpisode>, usize), String> {
+    if episodes.is_empty() || tile_rows == 0 || limit == 0 {
+        return Err("nonempty compact episodes, positive tile/budget required".into());
+    }
+    let (expanded, _) = mapped_inlined(source)?;
+    let head = Head::of(&expanded)?;
+    if trainable.contains(&head.operator) {
+        return Err("compact head cannot be trainable (including tied embedding)".into());
+    }
+    let prefix = head.prefix(&expanded);
+    let mut p = DeviceProgram::compile_values_bounded(d, &prefix, limit)?;
+    let mut labels = BTreeSet::new();
+    let mut panels = 0usize;
+    let mut trace_peak = 0usize;
+    let mut attention_peak = 0usize;
+    let mut indices = 0usize;
+    let mut max_rows = 0usize;
+    for node in &prefix.nodes {
+        if let Node::Pointwise { input, .. } = node {
+            indices = add(indices, mul(widths_for(&prefix, *input)?, 4)?)?;
+        }
+    }
+    for e in episodes {
+        if e.label.is_empty() || e.group.is_empty() || !labels.insert(&e.label) {
+            return Err("unique nonempty compact labels/groups required".into());
+        }
+        if e.inputs.rows == 0
+            || e.target.rows() != e.inputs.rows
+            || e.target.width() != head.embedding.ncols()
+            || !head.same(&e.target.head)
+            || e.target.entropy.len() != e.inputs.rows
+            || e.target.entropy.iter().any(|v| !v.is_finite())
+            || e.inputs.slots.len() != expanded.declarations.slots.len()
+        {
+            return Err("compact target dimensions or fixed-head identity mismatch".into());
+        }
+        if e.target
+            .scored
+            .as_ref()
+            .is_some_and(|s| s.len() != e.inputs.rows || !s.iter().any(|v| *v))
+        {
+            return Err("invalid compact scored domain".into());
+        }
+        panels = add(panels, e.target.numeric_bytes())?;
+        for (decl, values) in expanded.declarations.slots.iter().zip(&e.inputs.slots) {
+            match (decl, values) {
+                (Slot::Raw { width }, SlotValues::Raw(x))
+                    if x.dim() == (e.inputs.rows, *width) && x.iter().all(|v| v.is_finite()) =>
+                {
+                    panels = add(panels, mul(x.len(), 8)?)?;
+                }
+                (Slot::Token { domain }, SlotValues::Tokens(tokens))
+                    if tokens.len() == e.inputs.rows
+                        && tokens.iter().all(|t| {
+                            (*t as usize) < expanded.declarations.domains[*domain].size
+                        }) =>
+                {
+                    indices = add(indices, mul(tokens.len(), 4)?)?;
+                }
+                _ => return Err("compact episode slots mismatch".into()),
+            }
+        }
+        if e.target.scored.is_some() {
+            indices = add(indices, mul(e.inputs.rows, 4)?)?;
+        }
+        max_rows = max_rows.max(e.inputs.rows);
+        trace_peak = trace_peak.max(mul(p.bytes_per_row(), e.inputs.rows)?);
+        for node in &prefix.nodes {
+            if let Node::Attend { query, rotary, .. } = node {
+                let width = widths_for(&prefix, *query)?;
+                attention_peak = attention_peak.max(add(
+                    mul(mul(e.inputs.rows, e.inputs.rows)?, 8 * 12)?,
+                    mul(mul(e.inputs.rows, width)?, 8 * 16)?,
+                )?);
+                if rotary.is_some() {
+                    indices = add(indices, mul(mul(e.inputs.rows, width)?, 8 * 2)?)?;
+                }
+            }
+        }
+    }
+    let mut planned = add(
+        p.operator_numeric_bytes()?,
+        mul(mul(parameter_elements(source, trainable)?, 8)?, 12)?,
+    )?;
+    planned = add(planned, mul(head.embedding.len(), 8)?)?;
+    planned = add(planned, panels)?;
+    planned = add(planned, indices)?;
+    planned = add(planned, mul(trace_peak, 5)?)?;
+    planned = add(planned, attention_peak)?;
+    planned = add(
+        planned,
+        mul(mul(tile_rows.min(max_rows), head.embedding.nrows())?, 8 * 2)?,
+    )?;
+    planned = add(planned, mul(mul(max_rows, head.embedding.ncols())?, 8 * 6)?)?;
+    if planned > limit {
+        return Err(format!(
+            "compact fitter numeric plan {planned} exceeds {limit}"
+        ));
+    }
+    p.set_arithmetic(Arithmetic::F64);
+    p.prepare_dense_parameters(trainable)?;
+    let resident_head = Arc::new(ResidentHead::new(d, &head, tile_rows)?);
+    let resident = episodes
+        .iter()
+        .map(|e| {
+            let mut family = e.inputs.clone();
+            let mut raw = BTreeMap::new();
+            for (slot, x) in family.slots.iter_mut().enumerate() {
+                if let SlotValues::Raw(values) = x {
+                    raw.insert(slot, d.upload(values.view()).map_err(error)?);
+                    *values = Array2::zeros((0, values.ncols()));
+                }
+            }
+            let scored = e.target.scored.clone();
+            Ok(ResidentEpisode {
+                family,
+                raw,
+                target: ResidentTarget::Fixed {
+                    target: e.target.clone(),
+                    head: resident_head.clone(),
+                },
+                flags: None,
+                label: e.label.clone(),
+                group: e.group.clone(),
+                scored_rows: scored
+                    .as_ref()
+                    .map_or(e.inputs.rows, |s| s.iter().filter(|v| **v).count()),
+                scored_mask: scored,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((p, resident, planned))
+}
+
 fn widths_for(p: &OperatorProgram, node: usize) -> Result<usize, String> {
     Ok(p.node_interface(node).map_err(error)?.width())
 }
@@ -295,11 +480,7 @@ fn scan(p: &DeviceProgram, episodes: &[ResidentEpisode]) -> Result<Measurement, 
     let mut scores = Vec::new();
     for e in episodes {
         let trace = forward(p, e)?;
-        let mut logits = p.device().copy(trace.value(p.hidden())?).map_err(error)?;
-        let kl = p
-            .device()
-            .kl_rows(&e.target, &mut logits, e.flags.as_ref())
-            .map_err(error)?;
+        let (kl, _) = score(p, e, &trace, false)?;
         if kl.iter().any(|v| !v.is_finite()) {
             return Err("nonfinite training KL".into());
         }
@@ -367,10 +548,8 @@ fn gradient(
         .collect::<Result<BTreeMap<_, _>, String>>()?;
     for e in episodes.iter().filter(|e| e.group == group) {
         let trace = forward(p, e)?;
-        let mut seed = d.copy(trace.value(p.hidden())?).map_err(error)?;
-        let kl = d
-            .kl_rows(&e.target, &mut seed, e.flags.as_ref())
-            .map_err(error)?;
+        let (kl, seed) = score(p, e, &trace, true)?;
+        let seed = seed.ok_or("missing KL gradient seed")?;
         if kl.iter().any(|v| !v.is_finite()) {
             return Err("nonfinite gradient KL".into());
         }
@@ -405,14 +584,7 @@ pub fn measure(
     let (p, resident, _) = prepare(d, source, episodes, &[], numeric_bytes)?;
     scan(&p, &resident)
 }
-pub fn fit(
-    d: &Device,
-    source: &OperatorProgram,
-    episodes: &[Episode],
-    trainable: &[usize],
-    settings: Settings,
-) -> Result<Fit, String> {
-    let started = Instant::now();
+fn validate_settings(trainable: &[usize], settings: &Settings) -> Result<(), String> {
     if trainable.is_empty()
         || settings.numeric_bytes == 0
         || !settings.learning_rate.is_finite()
@@ -427,8 +599,69 @@ pub fn fit(
     {
         return Err("invalid causal fitter settings or empty trainable inventory".into());
     }
-    let (mut p, resident, planned) =
-        prepare(d, source, episodes, trainable, settings.numeric_bytes)?;
+    Ok(())
+}
+
+/// Same optimizer/group objective, with row-tiled fixed-head sufficient statistics.
+/// The head must remain bias-free, dense, numerically identical and untrainable.
+pub fn fit_fixed_head(
+    d: &Device,
+    source: &OperatorProgram,
+    episodes: &[FixedHeadEpisode],
+    trainable: &[usize],
+    settings: Settings,
+    head_tile_rows: usize,
+) -> Result<Fit, String> {
+    let started = Instant::now();
+    validate_settings(trainable, &settings)?;
+    let (p, resident, planned) = prepare_compact(
+        d,
+        source,
+        episodes,
+        trainable,
+        settings.numeric_bytes,
+        head_tile_rows,
+    )?;
+    fit_prepared(
+        d, source, p, resident, planned, trainable, settings, started,
+    )
+}
+pub fn measure_fixed_head(
+    d: &Device,
+    source: &OperatorProgram,
+    episodes: &[FixedHeadEpisode],
+    numeric_bytes: usize,
+    head_tile_rows: usize,
+) -> Result<Measurement, String> {
+    let (p, resident, _) =
+        prepare_compact(d, source, episodes, &[], numeric_bytes, head_tile_rows)?;
+    scan(&p, &resident)
+}
+
+pub fn fit(
+    d: &Device,
+    source: &OperatorProgram,
+    episodes: &[Episode],
+    trainable: &[usize],
+    settings: Settings,
+) -> Result<Fit, String> {
+    let started = Instant::now();
+    validate_settings(trainable, &settings)?;
+    let (p, resident, planned) = prepare(d, source, episodes, trainable, settings.numeric_bytes)?;
+    fit_prepared(
+        d, source, p, resident, planned, trainable, settings, started,
+    )
+}
+fn fit_prepared(
+    d: &Device,
+    source: &OperatorProgram,
+    mut p: DeviceProgram,
+    resident: Vec<ResidentEpisode>,
+    planned: usize,
+    trainable: &[usize],
+    settings: Settings,
+    started: Instant,
+) -> Result<Fit, String> {
     let mut moments = BTreeMap::new();
     for index in trainable {
         let a = p.dense_parameter(*index)?;
@@ -512,6 +745,9 @@ pub fn fit(
         *stored = values;
         *stored_precision = precision;
     }
+    let compact = resident
+        .iter()
+        .any(|e| matches!(e.target, ResidentTarget::Fixed { .. }));
     Ok(Fit {
         program: fitted,
         report: Report {
@@ -526,7 +762,11 @@ pub fn fit(
             complete_episode_forward_passes: forwards,
             complete_episode_reverse_passes: reverse,
             seconds: started.elapsed().as_secs_f64(),
-            scope: "Proposal fitting only: maximum named-group mean of equal-weight episode means over declared scored rows. F64 KL q-p gradients, full-sequence ordinary reverse including controls supplied as Raw graph inputs. One parameter owner across every episode. Best TRAIN objective only; no validation input/selection. Vendor exp/log and neural arithmetic are not certified intervals; ordinary serialized acceptance is separate. Numeric plan includes fixed operators (all table/product roles), resident inputs/targets/flags, full trace/cotangents/KL scratch, conservative dense attention scratch and parameter/moment/snapshot/update buffers. Excludes host panels/source bytes, CUDA context/library/allocator/register/spill scratch; token/rotation preparation peak conservatively counted, not a measured memory claim.",
+            scope: if compact {
+                "Proposal fitting only: same maximum named-group mean objective and Adam/best-TRAIN loop. Immutable fixed bias-free full-vocabulary head targets retain E^T p and sum p log p; each row-tiled candidate KL is logZ(Eh)-mu.h+c and hidden seed E^T q-mu. Head input is after original final normalization, with full-prefix ordinary VJP; both target and candidate unscored seeds are zero. F64 vendor exp/log/GEMM are operational, not certified real-arithmetic intervals; final ordinary artifact acceptance is unchanged. Numeric plan counts resident compact labels, head, inputs, traces/gradients/parameter buffers and conservative attention/tiled vocabulary scratch. Host metadata/source, context/library/allocator scratch excluded."
+            } else {
+                "Proposal fitting only: maximum named-group mean of equal-weight episode means over declared scored rows. F64 KL q-p gradients, full-sequence ordinary reverse including controls supplied as Raw graph inputs. One parameter owner across every episode. Best TRAIN objective only; no validation input/selection. Vendor exp/log and neural arithmetic are not certified intervals; ordinary serialized acceptance is separate. Numeric plan includes fixed operators (all table/product roles), resident inputs/targets/flags, full trace/cotangents/KL scratch, conservative dense attention scratch and parameter/moment/snapshot/update buffers. Excludes host panels/source bytes, CUDA context/library/allocator/register/spill scratch; token/rotation preparation peak conservatively counted, not a measured memory claim."
+            },
         },
     })
 }
@@ -756,5 +996,130 @@ mod tests {
         e.scored = None;
         e.target_logits[[0, 0]] = f64::NAN;
         assert!(measure(&d, &p, &[e], 1 << 24).is_err());
+    }
+    fn with_fixed_head(mut p: OperatorProgram, scale: f64) -> OperatorProgram {
+        let input = p.output;
+        let hidden = p.nodes.len();
+        p.nodes.push(Node::RmsNorm {
+            input,
+            epsilon: 1e-6,
+        });
+        let values = ndarray::array![
+            [scale, 0.3 * scale],
+            [-0.4 * scale, 0.7 * scale],
+            [0.2 * scale, -0.8 * scale]
+        ];
+        let operator = p.operators.len();
+        p.operators.push(Arc::new(
+            Operator::dense(
+                "fixed head",
+                Interface::native(3).expect("classes"),
+                Interface::native(2).expect("hidden"),
+                values.clone(),
+                exact_precision(values.iter().copied()).expect("head precision"),
+                Default::default(),
+            )
+            .expect("head"),
+        ));
+        p.output = p.nodes.len();
+        p.nodes.push(Node::Affine {
+            terms: vec![(hidden, operator)],
+            bias: None,
+        });
+        p
+    }
+    #[test]
+    fn compact_labels_match_full_kl_and_attention_rms_parameter_gradients() {
+        let source = with_fixed_head(program(true, 0.4), 1.);
+        let teacher = with_fixed_head(program(true, 1.1), 1.);
+        let full = vec![episode(
+            &source,
+            &teacher,
+            "causal",
+            "active",
+            ndarray::array![[1., 0.5], [-0.4, 1.], [0.2, -0.5]],
+            None,
+            Some(vec![false, true, true]),
+        )];
+        let d = Device::host();
+        let targeter =
+            fixed_head_target::Teacher::new(&d, &teacher, 1, 1 << 24).expect("compact teacher");
+        let compact = vec![FixedHeadEpisode {
+            label: "causal".into(),
+            group: "active".into(),
+            inputs: full[0].inputs.clone(),
+            target: targeter
+                .target(&full[0].inputs, full[0].scored.as_deref())
+                .expect("project teacher"),
+        }];
+        let (a, ae, _) = prepare(&d, &source, &full, &[0], 1 << 24).expect("full prepare");
+        let (b, be, _) =
+            prepare_compact(&d, &source, &compact, &[0], 1 << 24, 2).expect("compact prepare");
+        let av = scan(&a, &ae).expect("full score");
+        let bv = scan(&b, &be).expect("compact score");
+        assert!((av.objective - bv.objective).abs() < 2e-14);
+        let ag = gradient(&a, &ae, "active", &[0]).expect("full gradient");
+        let bg = gradient(&b, &be, "active", &[0]).expect("compact gradient");
+        let ag = d.download(&ag[&0]).expect("full gradient download");
+        let bg = d.download(&bg[&0]).expect("compact gradient download");
+        for (x, y) in ag.iter().zip(bg.iter()) {
+            assert!((x - y).abs() < 2e-13, "{x} vs {y}");
+        }
+        let trace = forward(&b, &be[0]).expect("prefix");
+        let (_, seed) = score(&b, &be[0], &trace, true).expect("hidden seed");
+        let seed = d
+            .download(&seed.expect("gradient seed"))
+            .expect("seed download");
+        assert!(seed.row(0).iter().all(|v| *v == 0.));
+        // Unscored earlier parent still affects scored future rows through causal attention.
+        assert!(bg.iter().any(|v| v.abs() > 1e-6));
+        let fit = fit_fixed_head(
+            &d,
+            &source,
+            &compact,
+            &[0],
+            Settings {
+                iterations: 2,
+                ..settings()
+            },
+            2,
+        )
+        .expect("same optimizer");
+        assert!(fit.report.best.objective <= fit.report.initial.objective);
+    }
+    #[test]
+    fn compact_confident_logits_underflow_and_head_identity_guards() {
+        let d = Device::host();
+        let source = with_fixed_head(program(true, 0.4), 1000.);
+        let teacher = with_fixed_head(program(true, 1.1), 1000.);
+        let full = vec![episode(
+            &source,
+            &teacher,
+            "confident",
+            "active",
+            ndarray::array![[1., 0.5], [-0.4, 1.]],
+            None,
+            None,
+        )];
+        let targeter = fixed_head_target::Teacher::new(&d, &teacher, 1, 1 << 24).expect("teacher");
+        let compact = vec![FixedHeadEpisode {
+            label: "confident".into(),
+            group: "active".into(),
+            inputs: full[0].inputs.clone(),
+            target: targeter
+                .target(&full[0].inputs, None)
+                .expect("underflow-safe target"),
+        }];
+        let a = measure(&d, &source, &full, 1 << 24).expect("direct KL");
+        let b = measure_fixed_head(&d, &source, &compact, 1 << 24, 1).expect("compact KL");
+        assert!((a.objective - b.objective).abs() < 1e-10);
+        assert!(fit_fixed_head(&d, &source, &compact, &[1], settings(), 1).is_err());
+        let other = with_fixed_head(program(true, 0.4), 999.);
+        assert!(measure_fixed_head(&d, &other, &compact, 1 << 24, 1).is_err());
+        let mut biased = source.clone();
+        if let Node::Affine { bias, .. } = &mut biased.nodes[source.output] {
+            *bias = Some(0);
+        }
+        assert!(fixed_head_target::Teacher::new(&d, &biased, 1, 1 << 24).is_err());
     }
 }
