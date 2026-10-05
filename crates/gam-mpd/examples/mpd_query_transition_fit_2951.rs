@@ -4,7 +4,7 @@
 use gam_mpd::{
     coder_capture::sha256,
     operator_program::{Rotary, Scale},
-    query_transition::{Fit, Sample, SolverSettings, fit, native_features},
+    query_transition::{Fit, Sample, SolverMethod, SolverSettings, fit, native_features},
 };
 use memmap2::Mmap;
 use ndarray::{Array2, s};
@@ -31,6 +31,8 @@ fn integer(v: &Value) -> Result<usize, String> {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diagnostic_read_nodes: Option<Vec<usize>>,
     solver: SolverSettings,
     prefix_absolute_tolerance: f64,
     prefix_relative_tolerance: f64,
@@ -40,6 +42,7 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            diagnostic_read_nodes: None,
             solver: SolverSettings::default(),
             prefix_absolute_tolerance: 1e-10,
             prefix_relative_tolerance: 1e-10,
@@ -386,8 +389,12 @@ fn masses(p: &[f64], spans: &BTreeMap<String, Vec<usize>>) -> Value {
     json!({"by_human_specified_span":entries,"all_value_tokens":indices.iter().map(|i|p[*i]).sum::<f64>()})
 }
 fn summary(fit: &Fit) -> Value {
-    json!({"objective":fit.objective,"mean_kl":fit.mean_kl,"ridge_penalty":fit.ridge_penalty,
-    "gradient_norm":fit.gradient_norm,"iterations":fit.iterations,"objective_evaluations":fit.objective_evaluations,"stop_reason":fit.stop_reason})
+    let mut result = json!({"objective":fit.objective,"mean_kl":fit.mean_kl,"ridge_penalty":fit.ridge_penalty,
+    "gradient_norm":fit.gradient_norm,"iterations":fit.iterations,"objective_evaluations":fit.objective_evaluations,"stop_reason":fit.stop_reason});
+    if let Some(diagnostics) = &fit.newton_diagnostics {
+        result["newton_diagnostics"] = json!(diagnostics);
+    }
+    result
 }
 fn payload(values: &Array2<f64>, p: &[f64]) -> Vec<f64> {
     values
@@ -448,6 +455,19 @@ fn run(root: &Path, out: &Path, settings: &Settings) -> Result<(), String> {
     {
         return Err("all 448 native heads required".into());
     }
+    let selected = if let Some(ids) = &settings.diagnostic_read_nodes {
+        let selected = ids.iter().copied().collect::<BTreeSet<_>>();
+        if ids.is_empty() || selected.len() != ids.len() || !selected.is_subset(&heads) {
+            return Err(
+                "diagnostic_read_nodes must be a nonempty unique subset of native read nodes"
+                    .into(),
+            );
+        }
+        selected
+    } else {
+        heads.clone()
+    };
+    let all_declared_heads = selected == heads;
     let entries = report["cases"].as_array().ok_or("cases missing")?;
     if entries.len() != 64 {
         return Err("all 64 discovery cases required".into());
@@ -470,6 +490,9 @@ fn run(root: &Path, out: &Path, settings: &Settings) -> Result<(), String> {
     let mut deltas = vec![];
     for (head_index, site) in sites.iter().enumerate() {
         let read_node = integer(&site["read_node"])?;
+        if !selected.contains(&read_node) {
+            continue;
+        }
         let query_node = integer(&site["query_node"])?;
         let key_node = integer(&site["key_node"])?;
         let value_node = integer(&site["value_node"])?;
@@ -679,8 +702,8 @@ fn run(root: &Path, out: &Path, settings: &Settings) -> Result<(), String> {
             "all_discovery_mean_native_delta":mean,"discovery_crossfit":fold_deltas}));
         eprintln!(
             "head {}/{} read_node={} done elapsed={:.1}s",
-            head_index + 1,
-            sites.len(),
+            reports.len(),
+            selected.len(),
             read_node,
             started.elapsed().as_secs_f64()
         );
@@ -688,6 +711,8 @@ fn run(root: &Path, out: &Path, settings: &Settings) -> Result<(), String> {
     let provenance = json!({"input_directory":root,"source_report_sha256":sha256(&root.join("REPORT.json"))?,
         "native_graph_sha256":sha256(&root.join("NATIVE_GRAPH.json"))?,"source_provenance_sha256":sha256(&root.join("PROVENANCE.json"))?,
         "source_provenance":provenance,"cases":cases.iter().map(|c|c.provenance.clone()).collect::<Vec<_>>(),"pairs":pair_manifest,
+        "selection_scope":if all_declared_heads {"all declared heads"} else {"explicit selected-head optimizer diagnostic only"},
+        "declared_head_count":448,"reported_read_nodes":selected,
         "executable_sha256":sha256(&std::env::current_exe().map_err(err)?)?,"settings_sha256":sha256(&out.join("SETTINGS.json"))?,
         "heldout_opened_or_evaluated":false,"native_rotary_implementation":"gam_mpd::tiled_attention::rotate (reused)",
         "factor_scope":"discovery fixtures, lexical_set fixed as supplied; final ' now' appended only"});
@@ -700,11 +725,14 @@ fn run(root: &Path, out: &Path, settings: &Settings) -> Result<(), String> {
     save(
         &out.join("REPORT.json"),
         &json!({"schema":"native-query-translation-discovery-fit-v1","settings":settings,"heads":reports,"pairs":pair_manifest,
-        "head_count":448,"discovery_pairs":32,"all_declared_heads_reported":true,"seconds":started.elapsed().as_secs_f64(),
+        "head_count":reports.len(),"declared_head_count":448,"reported_read_nodes":selected,
+        "selection_scope":if all_declared_heads {"all declared heads"} else {"explicit selected-head optimizer diagnostic only; no full-head-panel claim"},
+        "discovery_pairs":32,"all_declared_heads_reported":all_declared_heads,"seconds":started.elapsed().as_secs_f64(),
         "delta_artifact":"DELTAS.json","delta_artifact_sha256":sha256(&out.join("DELTAS.json"))?,"provenance_sha256":sha256(&out.join("PROVENANCE.json"))?,
         "objective":"mean KL(target new conditional attention || candidate conditional attention) + (ridge/2)*||delta||^2; uniform pair weighting",
-        "solver":"L-BFGS with smooth true-objective Armijo backtracking, zero initialization; no global optimality certificate",
-        "head_execution":"sequential native graph site order; no adaptive head selection",
+        "solver":match settings.solver.method {SolverMethod::Lbfgs=>"L-BFGS with smooth true-objective Armijo backtracking, zero initialization; no global optimality certificate",
+            SolverMethod::DampedNewton=>"Exact centered softmax feature-covariance Hessian plus ridge, gam-linalg SPD Cholesky direction with damping safeguards, true-objective Armijo backtracking, zero initialization; numerical stationarity diagnostics, no interval-arithmetic optimality certificate"},
+        "head_execution":"sequential native graph site order; selection specified explicitly in settings, all448 by default",
         "native_change_kl_numerics":"native old log probabilities reconstructed from original native query/key/rotary/scale; no probability floor",
         "crossfit":"2 discovery-only folds: XOR(query_owner, old_statement_order, update_statement_order, payload_swap); query_now excluded; both update wordings in each fold",
         "prediction_inputs":"previous-position native query and unchanged causal prefix native keys; target new query used only as training baseline measurement and oracle instrument check",
@@ -713,6 +741,7 @@ fn run(root: &Path, out: &Path, settings: &Settings) -> Result<(), String> {
             "High-dimensional native upstream query/key/value states are retained; no whole-model or token KL measured",
             "No parameter edit or whole-tail response; oracle validates instrument only",
             "Discovery crossfit is not untouched heldout evaluation; heldout not opened",
+            "A selected-head diagnostic addresses optimization of a fixed family only; no broad full-panel acceptance claim",
             "Trivially unchanged or unused heads are not promoted as mechanism; native change and value-token masses reported for every head",
             "Value-token spans are human-specified fixture annotations, not discovered semantic roles",
             "Layer-zero query translation can be exactly constant because is/now token changes are token-local; architecture/token identity control, not learned context-dependent retrieval organization"]}),
@@ -746,7 +775,22 @@ fn self_check() -> Result<(), String> {
     {
         return Err("translated-query calibration failed".into());
     }
-    println!("{}", json!({"synthetic_calibration":"pass","fit":result}));
+    let newton = fit(
+        &samples.iter().collect::<Vec<_>>(),
+        &SolverSettings {
+            method: SolverMethod::DampedNewton,
+            ridge: 1e-10,
+            gradient_tolerance: 1e-10,
+            ..Default::default()
+        },
+    )?;
+    if newton.mean_kl > 1e-12 || newton.gradient_norm > 1e-9 {
+        return Err("Newton translated-query calibration failed".into());
+    }
+    println!(
+        "{}",
+        json!({"synthetic_calibration":"pass","fit":result,"newton_fit":newton})
+    );
     Ok(())
 }
 fn main() -> Result<(), String> {
