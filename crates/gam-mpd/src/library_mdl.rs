@@ -1,5 +1,5 @@
 //! The explanation as a library of learned functions, fitted end to end by variational minimum
-//! description length (#2951).
+//! description length on interchange experiments of causal abstraction (#2951).
 //!
 //! # The explanation
 //!
@@ -8,14 +8,11 @@
 //! projection, final norm and unembedding stay.
 //!
 //! * A head's block reads its layer's normed stream `x` and writes the head's read (the attention
-//!   output projection's input), so removing, scaling or mixing a head acts on the explanation at
-//!   the same place as on `M`. Its function attends with its own query, key and value maps
+//!   output projection's input). Its function attends with its own query, key and value maps
 //!   `q = Q x`, `k = K x`, `v = V x` at the native rotary angles, scale and causal mask.
 //! * An MLP's block reads its layer's second normed stream and writes the MLP's output. Its
 //!   functions are `f_i(x) = φ(g_i·x + c_i) u_i`, with the native pointwise law `φ`,
-//!   a gate direction `g_i`, a gate bias `c_i` and an output `u_i`. Removing or
-//!   scaling the whole MLP stays expressible through a uniform-scale control on its output
-//!   (`native_control`).
+//!   a gate direction `g_i`, a gate bias `c_i` and an output `u_i`.
 //!
 //! The library starts at `M`: native neuron `i` is function `i` with its original
 //! activation and coefficients, and a head is its own function.
@@ -27,29 +24,42 @@
 //! gate `(g_i, c_i)` and its output `u_i`. With the posterior `q(θ) = Π_j N(μ_j, σ_j²)` and the
 //! prior `p(θ_G) = N(0, v_G I)`, the code length in nats is
 //!
-//! `F = E_q[D(θ)] + Σ_G KL(q_G ‖ p_G) + |active groups| · 32 ln 2`,
+//! `F = E_q[D(θ)] + Σ_G KL(q_G ‖ p_G) + Σ_{active G} ½ ln |G|`,
 //!
 //! the bits-back code of the training data given the explanation plus the explanation. `D(θ)`
-//! sums `KL(p_M ‖ p_θ)` of the next-token distributions over every training token, so the data
-//! term's weight is the number of tokens and no tradeoff weight exists. Each prior variance is
-//! chosen by empirical Bayes in closed form, `v_G = (1/n_G) Σ_{j∈G} (μ_j² + σ_j²)`, which makes
-//! `KL(q_G ‖ p_G) = ½ (n_G ln v_G − Σ_{j∈G} ln σ_j²)` with derivatives `μ_j / v_G` in `μ_j` and
-//! `σ_j² / v_G − 1` in `ln σ_j`. An active group sends its variance as one 32-bit literal. A group
-//! the data does not inform sits at its prior with zero divergence and posterior mean zero, so the
-//! null is recovered; removing it from the explanation is a discrete step of the same `F`.
+//! sums `KL(M_e ‖ P_e)` of the next-token distributions over every token of every training
+//! experiment `e` (below), so the data term's weight is the number of scored tokens and no
+//! tradeoff weight exists. Each prior variance is chosen by empirical Bayes in closed form,
+//! `v_G = (1/|G|) Σ_{j∈G} (μ_j² + σ_j²)`, which makes `KL(q_G ‖ p_G) = ½ (|G| ln v_G − Σ_{j∈G}
+//! ln σ_j²)` with derivatives `μ_j / v_G` in `μ_j` and `σ_j² / v_G − 1` in `ln σ_j`. An active
+//! group sends its variance at the precision of a parameter estimated from `|G|` values,
+//! `½ log2 |G|` bits (the two-part code's parameter precision). A group the data does not inform
+//! sits at its prior with zero divergence and posterior mean zero, so the null is recovered;
+//! removing it from the explanation is a discrete step of the same `F`.
 //!
 //! Weight noise costs data only on the tokens where a function is active, so a ReLU-gated function
 //! that is exactly zero elsewhere can keep imprecise, cheap weights: the code length rewards
 //! functions that are inactive on most inputs without any sparsity penalty, when the native
 //! activation is ReLU. This inactive-region argument does not apply to GELU or SiLU.
 //!
+//! # The experiments
+//!
+//! The data are interchange experiments (`interchange`): per training base sequence, one clean
+//! experiment and one patched experiment (a read patch of one of the explanation's read variables
+//! or the complement patch of one block, drawn uniformly over their union), each with its own cut
+//! `ℓ` drawn uniformly on `1..=L`. A base's source is another training sequence, drawn uniformly.
+//! The batches, sources and draws are made once from the seed, so the training data are one fixed
+//! set of experiments while the explanation's read variables stay; a removal changes the
+//! variables, and the draws are made again from the same seeds over the variables that remain.
+//! The patch directions are data: each step takes them at the posterior mean `μ` (before the
+//! weight sample is loaded), and no gradient passes through them.
+//!
 //! # The fit
 //!
-//! Each step draws one weight sample `θ = μ + σ ⊙ ε` (`ε` standard normal), runs the explanation on
-//! a batch of complete training sequences, scores it against `M`'s distributions on the same batch
-//! (compact fixed-head statistics, computed by `M` on the device), and takes one Adam step in
-//! `(μ, ln σ)` on the batch estimate `(N/n) D_batch(θ) + Σ_G KL_G`, `N` the training tokens and `n`
-//! the batch's. An epoch visits every training batch once, in a fixed order. The continuous fit
+//! Each step draws one weight sample `θ = μ + σ ⊙ ε` (`ε` standard normal), runs a batch's
+//! experiments, and takes one Adam step in `(μ, ln σ)` on the batch estimate
+//! `(N/n) D_batch(θ) + Σ_G KL_G`, `N` the scored tokens of every training experiment and `n` the
+//! batch's. An epoch visits every training batch once, in a fixed order. The continuous fit
 //! has converged when an epoch's mean improvement of the per-batch objective estimate over the
 //! previous epoch, paired by batch, is smaller than its standard error.
 //!
@@ -61,47 +71,38 @@
 //! a proposal; the acceptance is the objective, so a removal never increases `F`. Removal effects
 //! can cancel, so the objective need not be monotone in the prefix length and the search may miss a
 //! longer acceptable prefix; the next round, after the continuous fit converges again, proposes
-//! again. A scan of every prefix length would cost one full training evaluation per group, tens of
-//! thousands on VPD-4L. The fit alternates converging and removing until no removal is accepted.
+//! again. The fit alternates converging and removing until no removal is accepted.
+//!
+//! # Evaluation
+//!
+//! After every epoch the held-out sequences are scored ([`HeldOut`]): per base, at every cut, one
+//! clean and one patched experiment (sources among the held-out sequences). `F` per token is the
+//! held-out data term at one weight sample per batch plus the description spread over the training
+//! experiments' scored tokens; the divergences per experiment kind are taken at the posterior mean.
+//! Per layer it counts the surviving heads and MLP functions and, per token, the functions whose
+//! activation is not zero and those whose activation exceeds its posterior noise scale.
 //!
 //! The explanation is reported at the posterior mean `μ` ([`posterior_mean`]); removed groups are
-//! absent only when they fill complete interface blocks. Zeros inside a still-present block
-//! remain serialized literals (notably value coordinates in a grouped head interface).
-//! The variational objective above is distinct from ordinary serialized artifact cost C32;
-//! prior-group removal does not guarantee an equal reduction of that artifact cost.
+//! absent only when they fill complete interface blocks.
 
 use crate::{
     artifact::{Argument, Artifact, Callee},
-    artifact_device::mapped_inlined,
-    device_program::DeviceProgram,
+    interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable},
     operator_program::{
-        FamilyInputs, Interface, LabelKind, Node, Operator, OperatorBody, OperatorProgram, Provenance, Rule, SequenceLayout, SlotValues,
+        FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, Provenance, Rule, SequenceLayout, SlotValues,
         exact_precision,
     },
-    intervention_program::{Compiled, Control, ControlValue, compile},
-    resident_causal_fit::fixed_head_target::{Head, ResidentHead, Target},
     run_check::LayerNodes,
 };
-use gam_gpu::tensor::{Arithmetic, Device, Op, Storage, Tensor};
-use ndarray::Array2;
+use gam_gpu::tensor::{Device, Op};
+use ndarray::{Array2, s};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, io::Write, ops::Range, path::Path, sync::Arc, time::Instant};
-
-/// The bits of one independently sent literal (`acceptance::LITERAL_BITS`), as nats.
-const LITERAL_NATS: f64 = crate::acceptance::LITERAL_BITS as f64 * std::f64::consts::LN_2;
+use std::{collections::BTreeMap, f64::consts::LN_2, io::Write, ops::Range, path::Path, sync::Arc, time::Instant};
 
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
-}
-
-/// The arithmetic of a device's products: its storage's own (f32 storage is for fitting).
-fn arithmetic(device: &Device) -> Arithmetic {
-    match device.storage() {
-        Storage::F64 => Arithmetic::F64,
-        Storage::F32 | Storage::Bf16 => Arithmetic::F32,
-    }
 }
 
 /// Entries of one trainable operator: `rows × cols`.
@@ -120,33 +121,25 @@ pub struct Group {
 }
 
 /// The library explanation of a language model: the artifact at its starting point, its trainable
-/// operators and its prior groups.
+/// operators, its prior groups and its layers.
 #[derive(Clone, Debug)]
 pub struct Explanation {
     pub artifact: Artifact,
     /// The library's operators of `artifact.program`, ascending.
     pub trainable: Vec<usize>,
     pub groups: Vec<Group>,
-    /// The native quantities a native intervention can scale in the explanation too.
-    pub holdings: Vec<Holding>,
+    pub layers: Vec<Layer>,
 }
 
-/// A native quantity the explanation holds: scaling native node `native` scales the explanation's
-/// node `node` (a root node of `Explanation::artifact`'s program) alike. A head's read is held at
-/// its block's write; an MLP's activations are held through its output's uniform-scale control,
-/// since its output is linear in them.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Holding {
-    pub name: String,
-    pub native: usize,
-    pub node: usize,
-}
-
-/// A declared native intervention: holding `holding` scaled by `scale` on every row of a sequence.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Intervention {
-    pub holding: usize,
-    pub scale: f64,
+/// One layer of the explanation: its native sites (`run_check::layer_nodes`) and the prior groups
+/// of its functions.
+#[derive(Clone, Debug)]
+pub struct Layer {
+    pub sites: LayerNodes,
+    /// Per head, its planes' groups and its value coordinates' groups.
+    pub heads: Vec<(Vec<usize>, Vec<usize>)>,
+    /// Per MLP function, its gate's group and its output's group.
+    pub functions: Vec<(usize, usize)>,
 }
 
 /// A library operator: dense, every block present, its reals exactly representable.
@@ -217,7 +210,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
                 }
                 None => (0..q.rows.width()).map(|c| vec![c]).collect(),
             };
-            planes.push((name, pairs, v.rows.width()));
+            planes.push((l, name, pairs, v.rows.width()));
         }
         let Node::Pointwise { input: pre, laws } = &native.nodes[layer.active] else {
             return Err(format!("layer {l}: the MLP activation is not one pointwise law (gated MLPs are not supported yet)"));
@@ -255,15 +248,16 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
             output: 3,
         };
         artifact = artifact.replace_block(&name, Callee::New(rule), vec![Argument::Native(layer.normed)], layer.mlp, operators)?;
-        artifact = artifact.with_uniform_scale_control(native, layer.active, layer.mlp)?;
     }
     // Groups by the final operator indices (each replacement renumbers the operators).
     let program = &artifact.program;
     let mut groups = Vec::new();
     let mut trainable = Vec::new();
-    for (name, pairs, values) in &planes {
+    let mut out: Vec<Layer> = layers.iter().map(|sites| Layer { sites: sites.clone(), heads: Vec::new(), functions: Vec::new() }).collect();
+    for (l, name, pairs, values) in &planes {
         let (q, k, v) = (index_of(program, &format!("{name}.q"))?, index_of(program, &format!("{name}.k"))?, index_of(program, &format!("{name}.v"))?);
         let d = program.operators[q].cols.width();
+        let first = groups.len();
         for (p, rows) in pairs.iter().enumerate() {
             groups.push(Group {
                 name: format!("{name}.plane{p}"),
@@ -273,13 +267,15 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
         for j in 0..*values {
             groups.push(Group { name: format!("{name}.value{j}"), cells: vec![Cells { operator: v, rows: vec![j], cols: 0..d }] });
         }
+        out[*l].heads.push(((first..first + pairs.len()).collect(), (first + pairs.len()..groups.len()).collect()));
         trainable.extend([q, k, v]);
     }
-    for l in 0..layers.len() {
+    for (l, layer) in out.iter_mut().enumerate() {
         let name = format!("library.l{l}.mlp");
-        let (gate, bias, out) =
+        let (gate, bias, output) =
             (index_of(program, &format!("{name}.gate"))?, index_of(program, &format!("{name}.gate_bias"))?, index_of(program, &format!("{name}.out"))?);
         let (functions, d) = (program.operators[gate].rows.width(), program.operators[gate].cols.width());
+        let first = groups.len();
         for i in 0..functions {
             groups.push(Group {
                 name: format!("{name}.f{i}.gate"),
@@ -287,20 +283,13 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
             });
         }
         for i in 0..functions {
-            groups.push(Group { name: format!("{name}.f{i}.out"), cells: vec![Cells { operator: out, rows: (0..d).collect(), cols: i..i + 1 }] });
+            groups.push(Group { name: format!("{name}.f{i}.out"), cells: vec![Cells { operator: output, rows: (0..d).collect(), cols: i..i + 1 }] });
         }
-        trainable.extend([gate, bias, out]);
+        layer.functions = (0..functions).map(|i| (first + i, first + functions + i)).collect();
+        trainable.extend([gate, bias, output]);
     }
     trainable.sort_unstable();
-    let mut holdings = Vec::new();
-    for (l, layer) in layers.iter().enumerate() {
-        let held = |native: usize| artifact.place(native).ok_or_else(|| format!("the explanation does not hold native node {native}"));
-        for (h, &read) in layer.reads.iter().enumerate() {
-            holdings.push(Holding { name: format!("l{l}.h{h}"), native: read, node: held(read)? });
-        }
-        holdings.push(Holding { name: format!("l{l}.mlp"), native: layer.active, node: held(layer.mlp)? });
-    }
-    Ok(Explanation { artifact, trainable, groups, holdings })
+    Ok(Explanation { artifact, trainable, groups, layers: out })
 }
 
 // ------------------------------------------------------------------------------------- posterior
@@ -428,9 +417,20 @@ impl Posterior {
         self.moments().iter().zip(&self.active).map(|(m, active)| if *active { m.divergence() } else { 0.0 }).collect()
     }
 
-    /// `Σ_G KL(q_G ‖ p_G)` plus the active groups' variance literals, in nats.
+    /// Per group, `KL(q_G ‖ p_G)` plus its variance's `½ ln |G|`, in nats (zero for a removed
+    /// group).
+    pub fn costs(&self) -> Vec<f64> {
+        self.moments().iter().zip(&self.active).map(|(m, active)| if *active { m.divergence() + 0.5 * m.count.ln() } else { 0.0 }).collect()
+    }
+
+    /// `Σ_G KL(q_G ‖ p_G)` plus the active groups' variances, in nats.
     pub fn description(&self) -> f64 {
-        self.divergences().iter().sum::<f64>() + self.active.iter().filter(|a| **a).count() as f64 * LITERAL_NATS
+        self.costs().iter().sum()
+    }
+
+    /// Whether an entry of rows `rows` of trainable operator `i` is in an active group.
+    fn holds(&self, i: usize, rows: Range<usize>) -> bool {
+        self.membership[i].slice(s![rows, ..]).iter().any(|g| self.active[*g as usize])
     }
 
     /// The derivatives in `μ` and in `ln σ` of `data(θ) + Σ_G KL_G`, per trainable operator, from
@@ -555,7 +555,7 @@ impl Moment {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
-    /// Complete training sequences per step.
+    /// Base sequences per step.
     pub batch_sequences: usize,
     /// Adam step sizes in `μ` and in `ln σ`.
     pub mean_step: f64,
@@ -563,7 +563,7 @@ pub struct Settings {
     pub beta1: f64,
     pub beta2: f64,
     pub epsilon: f64,
-    /// The weight noise's seed.
+    /// The seed of the weight noise and of the experiments' draws.
     pub seed: u64,
     /// The device's numeric buffers for operators (each of the native and the explanation).
     pub numeric_bytes: usize,
@@ -589,6 +589,42 @@ impl Settings {
     }
 }
 
+/// One layer's survivors and activity on the held-out sequences at the posterior mean.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LayerCount {
+    /// Heads with an active value coordinate; active rotary planes and value coordinates.
+    pub heads: usize,
+    pub planes: usize,
+    pub values: usize,
+    /// MLP functions whose gate and output are both active.
+    pub functions: usize,
+    /// Mean per token of the surviving functions whose activation `φ(z)` is not zero, and of those
+    /// whose activation exceeds its posterior noise scale `|φ′(z)| s`, `s² = Σ_j σ²_{g_j} x_j² +
+    /// σ²_c` the posterior variance of the gate value `z = g·x + c` at the token's input `x`.
+    pub nonzero_per_token: f64,
+    pub resolved_per_token: f64,
+}
+
+/// The held-out evaluation (module note). Divergences are `KL(M_e ‖ P_e)` per scored token, in
+/// bits; a kind no experiment drew is none.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HeldOut {
+    /// `F` per scored token: the held-out data term at one weight sample per batch plus the
+    /// description over the training experiments' scored tokens.
+    pub objective_bits_per_token: f64,
+    pub data_bits_per_token: f64,
+    /// `Σ_G KL(q_G ‖ p_G)` and the active groups' variances `Σ ½ log2 |G|`, in bits.
+    pub divergence_bits: f64,
+    pub variance_bits: f64,
+    /// At the posterior mean: clean and patched experiments per cut `ℓ = 1..=L` (`ℓ = L` is the
+    /// explanation alone), and the patched ones by kind.
+    pub clean: Vec<Option<f64>>,
+    pub patched: Vec<Option<f64>>,
+    pub read_patch: Option<f64>,
+    pub complement_patch: Option<f64>,
+    pub layers: Vec<LayerCount>,
+}
+
 /// One epoch of the continuous fit.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Epoch {
@@ -602,9 +638,13 @@ pub struct Epoch {
     pub improvement_bits: Option<f64>,
     pub standard_error_bits: Option<f64>,
     pub active_groups: usize,
-    /// Mean `KL(p_M ‖ p_θ)` per training token at the weight samples, in nats.
-    pub mean_token_kl: f64,
+    /// `KL(M_e ‖ P_e)` per scored token at the weight samples over the clean and the patched
+    /// training experiments, in bits.
+    pub clean_bits_per_token: f64,
+    pub patched_bits_per_token: f64,
     pub seconds: f64,
+    /// The held-out evaluation after the epoch's steps.
+    pub held_out: HeldOut,
 }
 
 /// One removal step.
@@ -622,9 +662,13 @@ pub struct Removal {
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
     pub settings: Settings,
-    pub training_tokens: usize,
+    pub training_sequences: usize,
+    /// The scored tokens of every training experiment, `N`.
+    pub scored_tokens: usize,
     pub groups: usize,
     pub parameters: usize,
+    /// The held-out evaluation at the starting point.
+    pub start: HeldOut,
     pub epochs: Vec<Epoch>,
     pub removals: Vec<Removal>,
     pub active_groups: usize,
@@ -654,140 +698,295 @@ pub fn sequence_family(sequences: &[&[u32]]) -> Result<FamilyInputs, String> {
     Ok(FamilyInputs { rows: tokens.len(), slots: vec![SlotValues::Tokens(tokens)], layout: Some(SequenceLayout { sequence, position }) })
 }
 
-/// A program inlined, with every node of `nodes` (root nodes) scaled per row and coordinate by a
-/// control input (`intervention_program`), and those nodes' widths.
-struct Controlled {
-    program: OperatorProgram,
-    compiled: Option<Compiled>,
-    widths: Vec<usize>,
+/// A batch of experiments: its base sequences, each base's source (indices into the sequences),
+/// and the seed of its experiments' draws.
+#[derive(Clone, Debug)]
+struct Draw {
+    bases: Vec<usize>,
+    sources: Vec<usize>,
+    seed: u64,
 }
 
-impl Controlled {
-    fn new(program: &OperatorProgram, nodes: &[usize]) -> Result<Self, String> {
-        let widths = nodes.iter().map(|n| Ok(program.node_interface(*n).map_err(error)?.width())).collect::<Result<Vec<_>, String>>()?;
-        if nodes.is_empty() {
-            return Ok(Self { program: mapped_inlined(program)?.0, compiled: None, widths });
+impl Draw {
+    fn batch(&self, sequences: &[Vec<u32>]) -> Result<Batch, String> {
+        let pick = |indices: &[usize]| indices.iter().map(|i| sequences[*i].clone()).collect();
+        Batch::new(pick(&self.bases), pick(&self.sources))
+    }
+
+    /// Per base one clean and one patched experiment over `variables` read variables
+    /// (`interchange::sample`), from the batch's seed.
+    fn experiments(&self, layers: usize, variables: usize) -> Vec<Experiment> {
+        interchange::sample(&mut StdRng::seed_from_u64(self.seed), self.bases.len(), layers, variables)
+    }
+}
+
+/// The `count` sequences in order, in batches of `size` bases, each base's source drawn uniformly
+/// among the other sequences, all from `seed`.
+fn draws(count: usize, size: usize, seed: u64) -> Result<Vec<Draw>, String> {
+    if count < 2 || size == 0 {
+        return Err("a source needs another sequence, and batches must be nonempty".into());
+    }
+    let mut rng = StdRng::seed_from_u64(seed);
+    let all: Vec<usize> = (0..count).collect();
+    Ok(all
+        .chunks(size)
+        .map(|bases| {
+            let sources = bases
+                .iter()
+                .map(|&i| {
+                    let j = rng.random_range(0..count - 1);
+                    if j >= i { j + 1 } else { j }
+                })
+                .collect();
+            Draw { bases: bases.to_vec(), sources, seed: rng.random() }
+        })
+        .collect())
+}
+
+/// An MLP's nodes in the explanation's flat program: the gate's input `x`, the gate value `z`,
+/// the activation `φ(z)`, its law, and the gate's and gate bias's operators.
+struct Mlp {
+    input: usize,
+    gate: usize,
+    activation: usize,
+    law: Law,
+    gate_operator: usize,
+    bias_operator: usize,
+}
+
+impl Mlp {
+    fn of(flat: &OperatorProgram, l: usize) -> Result<Self, String> {
+        let name = format!("library.l{l}.mlp");
+        let (gate_operator, bias_operator) = (index_of(flat, &format!("{name}.gate"))?, index_of(flat, &format!("{name}.gate_bias"))?);
+        let found = flat.nodes.iter().enumerate().find_map(|(n, node)| match node {
+            Node::Affine { terms, bias: Some(b) } if *b == bias_operator && terms.len() == 1 && terms[0].1 == gate_operator => Some((n, terms[0].0)),
+            _ => None,
+        });
+        let (gate, input) = found.ok_or_else(|| format!("layer {l}: no gate node"))?;
+        let found = flat.nodes.iter().enumerate().find_map(|(n, node)| match node {
+            Node::Pointwise { input, laws } if *input == gate => laws.first().map(|law| (n, *law)),
+            _ => None,
+        });
+        let (activation, law) = found.ok_or_else(|| format!("layer {l}: no activation node"))?;
+        Ok(Self { input, gate, activation, law, gate_operator, bias_operator })
+    }
+}
+
+/// `M` and the explanation compiled for the experiments, with the explanation's MLP nodes.
+struct Scorer {
+    experiments: Interchange,
+    mlps: Vec<Mlp>,
+    /// Each trainable operator's position in `Explanation::trainable`.
+    position: BTreeMap<usize, usize>,
+}
+
+impl Scorer {
+    fn new(device: &Device, native: &OperatorProgram, explanation: &Explanation, settings: &Settings) -> Result<Self, String> {
+        let sites: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let reads = interchange::library_reads(&explanation.artifact.program, sites.len())?;
+        let experiments =
+            Interchange::new(device, native, &sites, &explanation.artifact, &explanation.trainable, reads, settings.numeric_bytes, settings.head_tile_rows)?;
+        let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
+        let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
+        let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
+        Ok(Self { experiments, mlps, position })
+    }
+
+    fn layers(&self) -> usize {
+        self.mlps.len()
+    }
+
+    fn at(&self, operator: usize) -> Result<usize, String> {
+        self.position.get(&operator).copied().ok_or_else(|| format!("operator {operator} is not trainable"))
+    }
+
+    /// The explanation's read variables that hold an entry of an active group of `posterior`.
+    fn variables(&self, posterior: &Posterior) -> Result<Vec<ReadVariable>, String> {
+        let mut out = Vec::new();
+        for v in self.experiments.variables() {
+            let mut held = false;
+            for (op, rows) in &v.parts {
+                held |= posterior.holds(self.at(*op)?, rows.clone());
+            }
+            if held {
+                out.push(v.clone());
+            }
         }
-        let compiled = compile(program, &nodes.iter().map(|&node| Control::NodeScale { node }).collect::<Vec<_>>())?;
-        Ok(Self { program: compiled.program.clone(), compiled: Some(compiled), widths })
+        Ok(out)
     }
 
-    /// `base` with each controlled node scaled by `scales[c][row]` on every coordinate of the row.
-    fn inputs(&self, base: &FamilyInputs, scales: &[Vec<f64>]) -> Result<FamilyInputs, String> {
-        let Some(compiled) = &self.compiled else { return Ok(base.clone()) };
-        let values: Vec<ControlValue> =
-            scales.iter().zip(&self.widths).map(|(rows, width)| ControlValue::NodeMask(Array2::from_shape_fn((base.rows, *width), |(r, _)| rows[r]))).collect();
-        compiled.family(base, &values)
-    }
-}
-
-/// A batch of complete sequences, each clean or under one declared intervention: per holding, the
-/// scale of each row.
-struct Batch {
-    base: FamilyInputs,
-    scales: Vec<Vec<f64>>,
-}
-
-/// The native model's distributions as compact fixed-head statistics, made per batch and dropped
-/// after use.
-struct Teacher {
-    controls: Controlled,
-    prefix: DeviceProgram,
-    head: Arc<Head>,
-    embedding: Tensor,
-    tile_rows: usize,
-}
-
-impl Teacher {
-    fn new(device: &Device, native: &OperatorProgram, controls: &[usize], numeric_bytes: usize, tile_rows: usize) -> Result<Self, String> {
-        let controls = Controlled::new(native, controls)?;
-        let flat = &controls.program;
-        let head = Arc::new(Head::of(flat)?);
-        let mut prefix = DeviceProgram::compile_values_bounded(device, &head.prefix(flat), numeric_bytes)?;
-        prefix.set_arithmetic(arithmetic(device));
-        let embedding = device.upload(head.embedding.view()).map_err(error)?;
-        Ok(Self { controls, prefix, head, embedding, tile_rows })
-    }
-
-    fn target(&self, batch: &Batch) -> Result<Target, String> {
-        let d = self.prefix.device();
-        let trace = self.prefix.forward(&self.controls.inputs(&batch.base, &batch.scales)?)?;
-        let hidden = trace.value(self.prefix.hidden())?;
-        let (rows, width, classes) = (hidden.rows(), self.head.embedding.ncols(), self.head.embedding.nrows());
-        let mut mu = d.zeros(rows, width).map_err(error)?;
-        let mut entropy = Vec::with_capacity(rows);
-        for start in (0..rows).step_by(self.tile_rows) {
-            let n = self.tile_rows.min(rows - start);
-            let h = d.rows_of(hidden, start, n).map_err(error)?;
-            let mut probabilities = d.zeros(n, classes).map_err(error)?;
-            d.gemm(&mut probabilities, 1.0, &h, Op::N, &self.embedding, Op::T, 0.0, self.prefix.arithmetic()).map_err(error)?;
-            let stats = d.softmax_stats_rows(&mut probabilities, None).map_err(error)?;
-            let mut projected = d.zeros(n, width).map_err(error)?;
-            d.gemm(&mut projected, 1.0, &probabilities, Op::N, &self.embedding, Op::N, 0.0, self.prefix.arithmetic()).map_err(error)?;
-            d.set_rows(&mut mu, start, &projected).map_err(error)?;
-            entropy.extend(stats.into_iter().map(|s| s[1]));
+    /// `KL(M_e ‖ P_e)` per base token in bits for `experiments` on `batch` over `variables`, with
+    /// the patch directions at `mean` and the explanation at `theta` (at `mean` when none), and
+    /// with `gradient` the gradient of its sum in every trainable operator.
+    fn score(
+        &mut self,
+        batch: &Batch,
+        experiments: &[Experiment],
+        variables: &[ReadVariable],
+        mean: &[Array2<f64>],
+        theta: Option<&[Array2<f64>]>,
+        gradient: bool,
+    ) -> Result<(Vec<Vec<f64>>, Vec<Array2<f64>>), String> {
+        self.experiments.load(mean)?;
+        let design = interchange::design(&self.experiments.models().1, variables, experiments)?;
+        if let Some(theta) = theta {
+            self.experiments.load(theta)?;
         }
-        Ok(Target { mu: Arc::new(mu), entropy, head: Arc::clone(&self.head), scored: None })
-    }
-}
-
-/// The explanation on the device, scored against the teacher.
-struct Student {
-    controls: Controlled,
-    program: DeviceProgram,
-    head: ResidentHead,
-    trainable: Vec<usize>,
-}
-
-impl Student {
-    fn new(device: &Device, artifact: &Artifact, trainable: &[usize], controls: &[usize], numeric_bytes: usize, tile_rows: usize) -> Result<Self, String> {
-        let controls = Controlled::new(&artifact.program, controls)?;
-        let head = Head::of(&controls.program)?;
-        let mut program = DeviceProgram::compile_values_bounded(device, &head.prefix(&controls.program), numeric_bytes)?;
-        program.set_arithmetic(arithmetic(device));
-        program.prepare_dense_parameters(trainable)?;
-        Ok(Self { head: ResidentHead::new(device, &head, tile_rows)?, controls, program, trainable: trainable.to_vec() })
-    }
-
-    fn load(&mut self, values: &[Array2<f64>]) -> Result<(), String> {
-        for (&op, value) in self.trainable.iter().zip(values) {
-            let tensor = self.program.device().upload(value.view()).map_err(error)?;
-            self.program.replace_dense_parameter(op, tensor)?;
-        }
-        Ok(())
-    }
-
-    /// `Σ_rows KL(p_M ‖ p_θ)` in nats on `batch` at the loaded parameters, and with `scale`, the
-    /// gradient of `scale` times it in every trainable operator.
-    fn score(&self, batch: &Batch, target: &Target, scale: Option<f64>) -> Result<(f64, Option<Vec<Array2<f64>>>), String> {
-        let d = self.program.device();
-        let trace = self.program.forward(&self.controls.inputs(&batch.base, &batch.scales)?)?;
-        let (losses, seed) = self.head.score(d, trace.value(self.program.hidden())?, target, scale.is_some(), self.program.arithmetic())?;
-        let total: f64 = losses.iter().sum();
-        if !total.is_finite() {
+        let (m, p) = self.experiments.models();
+        let head = self.experiments.head();
+        let teacher = interchange::Teacher::new(&m, head, batch, variables, experiments)?;
+        let evaluation = interchange::evaluate(&m, &p, head, batch, &teacher, experiments, &design, gradient)?;
+        if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
             return Err("nonfinite explanation divergence".into());
         }
-        let Some(scale) = scale else { return Ok((total, None)) };
-        let seed = seed.ok_or("missing head cotangent")?;
-        let mut scaled = d.zeros(seed.rows(), seed.cols()).map_err(error)?;
-        d.axpy(&mut scaled, scale, &seed).map_err(error)?;
-        let seeds = BTreeMap::from([(self.program.hidden(), scaled)]);
-        let (_, gradients) = self.program.vjp_values_dense(&trace, seeds, &[], &self.trainable, self.program.arithmetic())?;
-        let gradients = self
-            .trainable
-            .iter()
-            .map(|op| d.download(gradients.get(op).ok_or("missing parameter gradient")?).map_err(error))
-            .collect::<Result<Vec<_>, String>>()?;
+        if !gradient {
+            return Ok((evaluation.bits, Vec::new()));
+        }
+        let d = p.program.device();
+        let mut gradients = Vec::with_capacity(mean.len());
+        for (op, values) in self.position.iter().map(|(op, i)| (*op, &mean[*i])) {
+            gradients.push(match evaluation.gradient.get(&op) {
+                Some(g) => d.download(g).map_err(error)?,
+                None => Array2::zeros(values.dim()),
+            });
+        }
         if gradients.iter().any(|g| g.iter().any(|v| !v.is_finite())) {
             return Err("nonfinite parameter gradient".into());
         }
-        Ok((total, Some(gradients)))
+        Ok((evaluation.bits, gradients))
     }
 }
 
-/// The noise seed of step `(epoch, batch)`, or of the removal comparisons' batch.
+/// The noise seed of step `(epoch, batch)`, or of the removal comparisons' and the held-out
+/// evaluation's batch (epoch 0).
 fn noise_seed(seed: u64, epoch: usize, batch: usize) -> u64 {
     seed.wrapping_add((epoch as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)).wrapping_add((batch as u64).wrapping_mul(0x8CB9_2BA7_2F3D_8DD7))
+}
+
+/// A running mean of bits over scored tokens.
+#[derive(Clone, Copy, Debug, Default)]
+struct Mean {
+    bits: f64,
+    tokens: usize,
+}
+
+impl Mean {
+    fn add(&mut self, bits: &[f64]) {
+        self.bits += bits.iter().sum::<f64>();
+        self.tokens += bits.len();
+    }
+
+    fn mean(&self) -> Option<f64> {
+        (self.tokens > 0).then(|| self.bits / self.tokens as f64)
+    }
+}
+
+/// The held-out evaluation of `posterior` on `sequences` (module note); `tokens` is `N`.
+fn held_out(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterior, sequences: &[Vec<u32>], settings: &Settings, tokens: usize) -> Result<HeldOut, String> {
+    let layers = scorer.layers();
+    let variables = scorer.variables(posterior)?;
+    let (mut clean, mut patched) = (vec![Mean::default(); layers], vec![Mean::default(); layers]);
+    let (mut read, mut complement, mut sampled) = (Mean::default(), Mean::default(), Mean::default());
+    for (b, draw) in draws(sequences.len(), settings.batch_sequences, settings.seed)?.iter().enumerate() {
+        let batch = draw.batch(sequences)?;
+        // Every cut, each with one clean and one patched experiment per base.
+        let mut rng = StdRng::seed_from_u64(draw.seed);
+        let mut experiments = Vec::with_capacity(2 * layers * draw.bases.len());
+        for cut in 1..=layers {
+            experiments.extend(interchange::sample(&mut rng, draw.bases.len(), layers, variables.len()).into_iter().map(|e| Experiment { cut, ..e }));
+        }
+        let (bits, _) = scorer.score(&batch, &experiments, &variables, &posterior.mean, None, false)?;
+        for (e, bits) in experiments.iter().zip(&bits) {
+            match e.patch {
+                None => clean[e.cut - 1].add(bits),
+                Some(patch) => {
+                    patched[e.cut - 1].add(bits);
+                    match patch {
+                        Patch::Read { .. } => read.add(bits),
+                        Patch::Complement { .. } => complement.add(bits),
+                    }
+                }
+            }
+        }
+        let (theta, _) = posterior.sample(noise_seed(settings.seed, 0, b));
+        let (bits, _) = scorer.score(&batch, &experiments, &variables, &posterior.mean, Some(&theta), false)?;
+        bits.iter().for_each(|b| sampled.add(b));
+    }
+    let data = sampled.mean().ok_or("no held-out tokens")?;
+    let divergence: f64 = posterior.divergences().iter().sum();
+    let description = posterior.description();
+    Ok(HeldOut {
+        objective_bits_per_token: data + description / LN_2 / tokens as f64,
+        data_bits_per_token: data,
+        divergence_bits: divergence / LN_2,
+        variance_bits: (description - divergence) / LN_2,
+        clean: clean.iter().map(Mean::mean).collect(),
+        patched: patched.iter().map(Mean::mean).collect(),
+        read_patch: read.mean(),
+        complement_patch: complement.mean(),
+        layers: activity(scorer, explanation, posterior, sequences, settings)?,
+    })
+}
+
+/// Per layer, the survivors of `posterior` and its functions' activity on `sequences` at the
+/// posterior mean (`LayerCount`).
+fn activity(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterior, sequences: &[Vec<u32>], settings: &Settings) -> Result<Vec<LayerCount>, String> {
+    scorer.experiments.load(&posterior.mean)?;
+    let variance = |op: usize| -> Result<Array2<f64>, String> { Ok(posterior.log_sd[scorer.at(op)?].mapv(|s| (2.0 * s).exp())) };
+    let (_, p) = scorer.experiments.models();
+    let (program, d) = (p.program, p.program.device());
+    let active = |g: &usize| posterior.active[*g];
+    let mut out = Vec::with_capacity(scorer.layers());
+    let mut gates = Vec::with_capacity(scorer.layers());
+    for (layer, mlp) in explanation.layers.iter().zip(&scorer.mlps) {
+        let surviving: Vec<bool> = layer.functions.iter().map(|(gate, output)| active(gate) && active(output)).collect();
+        out.push(LayerCount {
+            heads: layer.heads.iter().filter(|(_, values)| values.iter().any(active)).count(),
+            planes: layer.heads.iter().map(|(planes, _)| planes.iter().filter(|g| active(g)).count()).sum(),
+            values: layer.heads.iter().map(|(_, values)| values.iter().filter(|g| active(g)).count()).sum(),
+            functions: surviving.iter().filter(|s| **s).count(),
+            nonzero_per_token: 0.0,
+            resolved_per_token: 0.0,
+        });
+        let bias = variance(mlp.bias_operator)?.column(0).to_vec();
+        gates.push((surviving, d.upload(variance(mlp.gate_operator)?.view()).map_err(error)?, bias));
+    }
+    let mut rows = 0usize;
+    for chunk in sequences.chunks(settings.batch_sequences) {
+        let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+        let trace = program.forward(&family)?;
+        for ((count, mlp), (surviving, gate_variance, bias_variance)) in out.iter_mut().zip(&scorer.mlps).zip(&gates) {
+            let x = d.download(trace.value(mlp.input)?).map_err(error)?;
+            let squares = d.upload(x.mapv(|v| v * v).view()).map_err(error)?;
+            let mut s2 = d.zeros(x.nrows(), surviving.len()).map_err(error)?;
+            d.gemm(&mut s2, 1.0, &squares, Op::N, gate_variance, Op::T, 0.0, program.arithmetic()).map_err(error)?;
+            let s2 = d.download(&s2).map_err(error)?;
+            let z = d.download(trace.value(mlp.gate)?).map_err(error)?;
+            let a = d.download(trace.value(mlp.activation)?).map_err(error)?;
+            let (nonzero, resolved) = (0..x.nrows())
+                .into_par_iter()
+                .map(|t| {
+                    let (mut nonzero, mut resolved) = (0usize, 0usize);
+                    for (i, alive) in surviving.iter().enumerate() {
+                        if *alive {
+                            let (zi, ai) = (z[[t, i]], a[[t, i]]);
+                            nonzero += usize::from(ai != 0.0);
+                            resolved += usize::from(ai.abs() > mlp.law.derivative(zi).abs() * (s2[[t, i]] + bias_variance[i]).max(0.0).sqrt());
+                        }
+                    }
+                    (nonzero, resolved)
+                })
+                .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+            count.nonzero_per_token += nonzero as f64;
+            count.resolved_per_token += resolved as f64;
+        }
+        rows += family.rows;
+    }
+    for count in &mut out {
+        count.nonzero_per_token /= rows as f64;
+        count.resolved_per_token /= rows as f64;
+    }
+    Ok(out)
 }
 
 /// Where a fit stands at the end of an epoch: with the posterior and the optimizer's moments, all a
@@ -795,9 +994,10 @@ fn noise_seed(seed: u64, epoch: usize, batch: usize) -> u64 {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Progress {
     settings: Settings,
-    interventions: Vec<Intervention>,
     tokens: usize,
     shapes: Vec<(usize, usize)>,
+    /// The held-out evaluation at the starting point.
+    start: Option<HeldOut>,
     /// The next epoch, and the optimizer steps taken.
     epoch: usize,
     step: i32,
@@ -818,7 +1018,8 @@ fn arrays<'a>(posterior: &'a Posterior, mean: &'a [Moment], log_sd: &'a [Moment]
 }
 
 /// Write the checkpoint atomically: the progress as JSON after its length, then every array's
-/// values as little-endian float64.
+/// values as little-endian float64. The progress alone also goes to the path with extension
+/// `json`, readable while the fit runs.
 fn save_checkpoint(path: &Path, progress: &Progress, posterior: &Posterior, mean: &[Moment], log_sd: &[Moment]) -> Result<(), String> {
     let header = serde_json::to_vec(progress).map_err(error)?;
     let partial = path.with_extension("partial");
@@ -831,7 +1032,10 @@ fn save_checkpoint(path: &Path, progress: &Progress, posterior: &Posterior, mean
         }
     }
     file.into_inner().map_err(error)?.sync_all().map_err(error)?;
-    std::fs::rename(&partial, path).map_err(error)
+    std::fs::rename(&partial, path).map_err(error)?;
+    let partial = path.with_extension("json.partial");
+    std::fs::write(&partial, serde_json::to_vec_pretty(progress).map_err(error)?).map_err(error)?;
+    std::fs::rename(&partial, path.with_extension("json")).map_err(error)
 }
 
 /// Restore a checkpoint of this fit into `posterior` and the moments, or refuse one of another fit.
@@ -841,12 +1045,7 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior, 
     let header = bytes.get(8..8 + length).ok_or("a truncated checkpoint")?;
     let progress: Progress = serde_json::from_slice(header).map_err(error)?;
     let same_settings = serde_json::to_value(&progress.settings).map_err(error)? == serde_json::to_value(&expected.settings).map_err(error)?;
-    if !same_settings
-        || progress.interventions != expected.interventions
-        || progress.tokens != expected.tokens
-        || progress.shapes != expected.shapes
-        || progress.active.len() != expected.active.len()
-    {
+    if !same_settings || progress.tokens != expected.tokens || progress.shapes != expected.shapes || progress.active.len() != expected.active.len() {
         return Err(format!("{}: a checkpoint of another fit", path.display()));
     }
     let count: usize = progress.shapes.iter().map(|(r, c)| r * c * 6).sum();
@@ -863,82 +1062,40 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior, 
     Ok(progress)
 }
 
-/// The training observations: every sequence clean, then, when interventions are declared,
-/// sequence `i` again under intervention `i mod |interventions|`.
-fn training_observations(sequences: usize, interventions: &[Intervention]) -> Vec<(usize, Option<&Intervention>)> {
-    let mut observed: Vec<(usize, Option<&Intervention>)> = (0..sequences).map(|i| (i, None)).collect();
-    if !interventions.is_empty() {
-        observed.extend((0..sequences).map(|i| (i, Some(&interventions[i % interventions.len()]))));
-    }
-    observed
-}
-
-/// The holdings `interventions` scale, ascending.
-fn controlled_holdings(interventions: &[Intervention]) -> Vec<usize> {
-    let mut controls: Vec<usize> = interventions.iter().map(|i| i.holding).collect();
-    controls.sort_unstable();
-    controls.dedup();
-    controls
-}
-
-/// Observations `(sequence, intervention)` in batches of `size`, each batch's rows carrying, per
-/// controlled holding (`controls`), their scale.
-fn batches(sequences: &[Vec<u32>], observed: &[(usize, Option<&Intervention>)], controls: &[usize], size: usize) -> Result<Vec<Batch>, String> {
-    observed
-        .chunks(size)
-        .map(|chunk| {
-            let base = sequence_family(&chunk.iter().map(|(i, _)| sequences[*i].as_slice()).collect::<Vec<_>>())?;
-            let length = base.rows / chunk.len();
-            let scales = controls
-                .iter()
-                .map(|holding| {
-                    chunk
-                        .iter()
-                        .flat_map(|(_, intervention)| {
-                            let scale = intervention.filter(|i| i.holding == *holding).map_or(1.0, |i| i.scale);
-                            std::iter::repeat_n(scale, length)
-                        })
-                        .collect()
-                })
-                .collect();
-            Ok(Batch { base, scales })
-        })
-        .collect()
-}
-
-/// Fit the library explanation of `native` to its distributions on the training `sequences`, clean
-/// and under the declared `interventions` (module note). `native` is the split native program the
-/// explanation was built from. With `checkpoint`, the fit is saved there after every epoch and
-/// removal step, and resumed from it when it exists.
+/// Fit the library explanation of `native` to its interchange experiments on the training
+/// `sequences`, evaluating on the `held_out` sequences after every epoch (module note). `native` is
+/// the split native program the explanation was built from. With `checkpoint`, the fit is saved
+/// there after every epoch and removal step, and resumed from it when it exists.
 pub fn fit(
     device: &Device,
     native: &OperatorProgram,
     explanation: &Explanation,
     sequences: &[Vec<u32>],
-    interventions: &[Intervention],
+    held: &[Vec<u32>],
     settings: &Settings,
     checkpoint: Option<&Path>,
 ) -> Result<Fit, String> {
     settings.validate()?;
-    if interventions.iter().any(|i| i.holding >= explanation.holdings.len() || !i.scale.is_finite()) {
-        return Err("an intervention on no holding, or with a nonfinite scale".into());
+    let length = sequences.first().map_or(0, Vec::len);
+    if length == 0 || held.len() < 2 || sequences.iter().chain(held).any(|s| s.len() != length) {
+        return Err("training and held-out sequences (at least two) must be nonempty and of one length".into());
     }
     let started = Instant::now();
-    let controls = controlled_holdings(interventions);
-    let batches = batches(sequences, &training_observations(sequences.len(), interventions), &controls, settings.batch_sequences)?;
-    if batches.len() < 2 {
+    let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
+    if draws.len() < 2 {
         return Err("the convergence test needs at least two training batches".into());
     }
-    let tokens: usize = batches.iter().map(|b| b.base.rows).sum();
+    // Two experiments per base, each scoring every token of its base.
+    let tokens = 2 * sequences.len() * length;
     let mut posterior = Posterior::new(explanation, tokens)?;
     let parameters = posterior.mean.iter().map(Array2::len).sum();
     let mut mean_moments: Vec<Moment> = posterior.mean.iter().map(|m| Moment::zeros(m.dim())).collect();
     let mut log_sd_moments = mean_moments.clone();
     let mut progress = Progress {
         settings: settings.clone(),
-        interventions: interventions.to_vec(),
         tokens,
         shapes: posterior.mean.iter().map(Array2::dim).collect(),
+        start: None,
         epoch: 0,
         step: 0,
         epochs: Vec::new(),
@@ -953,33 +1110,42 @@ pub fn fit(
         log::info!("library fit resumed at epoch {} from {}", progress.epoch, path.display());
     }
     let resumed_seconds = progress.seconds;
-    let native_controls: Vec<usize> = controls.iter().map(|h| explanation.holdings[*h].native).collect();
-    let explanation_controls: Vec<usize> = controls.iter().map(|h| explanation.holdings[*h].node).collect();
-    let teacher = Teacher::new(device, native, &native_controls, settings.numeric_bytes, settings.head_tile_rows)?;
-    let mut student =
-        Student::new(device, &explanation.artifact, &explanation.trainable, &explanation_controls, settings.numeric_bytes, settings.head_tile_rows)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?;
     let save = |progress: &mut Progress, posterior: &Posterior, mean: &[Moment], log_sd: &[Moment]| -> Result<(), String> {
         progress.active = posterior.active.clone();
         progress.seconds = resumed_seconds + started.elapsed().as_secs_f64();
         checkpoint.map_or(Ok(()), |path| save_checkpoint(path, progress, posterior, mean, log_sd))
     };
+    if progress.start.is_none() {
+        let start = held_out(&mut scorer, explanation, &posterior, held, settings, tokens)?;
+        log::info!("library start: {start:?}");
+        progress.start = Some(start);
+        save(&mut progress, &posterior, &mean_moments, &log_sd_moments)?;
+    }
+    let mut variables = scorer.variables(&posterior)?;
     while !progress.done {
         let epoch = progress.epoch;
         let epoch_started = Instant::now();
-        let mut estimates = Vec::with_capacity(batches.len());
-        let (mut data_sum, mut description_sum, mut kl_sum) = (0.0, 0.0, 0.0);
-        for (b, batch) in batches.iter().enumerate() {
-            let target = teacher.target(batch)?;
+        let mut estimates = Vec::with_capacity(draws.len());
+        let (mut data_sum, mut description_sum) = (0.0, 0.0);
+        let (mut clean, mut patched) = (Mean::default(), Mean::default());
+        for (b, draw) in draws.iter().enumerate() {
+            let step_started = Instant::now();
+            let batch = draw.batch(sequences)?;
+            let experiments = draw.experiments(scorer.layers(), variables.len());
             let (theta, noise) = posterior.sample(noise_seed(settings.seed, epoch + 1, b));
-            student.load(&theta)?;
-            let scale = tokens as f64 / batch.base.rows as f64;
-            let (divergence, gradients) = student.score(batch, &target, Some(scale))?;
-            let gradients = gradients.ok_or("missing gradients")?;
+            let (bits, gradients) = scorer.score(&batch, &experiments, &variables, &posterior.mean, Some(&theta), true)?;
+            for (e, bits) in experiments.iter().zip(&bits) {
+                if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
+            }
+            let scored = bits.iter().map(Vec::len).sum::<usize>();
+            let scale = tokens as f64 / scored as f64;
+            let data = scale * LN_2 * bits.iter().flatten().sum::<f64>();
+            let gradients: Vec<Array2<f64>> = gradients.into_iter().map(|g| g * (scale * LN_2)).collect();
             let description = posterior.description();
-            estimates.push(scale * divergence + description);
-            data_sum += scale * divergence;
+            estimates.push(data + description);
+            data_sum += data;
             description_sum += description;
-            kl_sum += divergence / batch.base.rows as f64;
             progress.step += 1;
             let step = progress.step;
             let results = posterior.derivatives(&gradients, &noise);
@@ -995,8 +1161,14 @@ pub fn fit(
                     mm.step(mean, gm, membership, &active, settings.mean_step, settings, step);
                     sm.step(log_sd, gs, membership, &active, settings.log_sd_step, settings, step);
                 });
+            log::info!(
+                "library step {epoch}.{b}: {:.6} bits per scored token, F estimate {:.6e} bits, {:.2} s",
+                bits.iter().flatten().sum::<f64>() / scored as f64,
+                (data + description) / LN_2,
+                step_started.elapsed().as_secs_f64()
+            );
         }
-        let count = batches.len() as f64;
+        let count = draws.len() as f64;
         let (improvement, standard_error) = match &progress.previous {
             Some(before) => {
                 let differences: Vec<f64> = before.iter().zip(&estimates).map(|(a, b)| a - b).collect();
@@ -1006,7 +1178,7 @@ pub fn fit(
             }
             None => (None, None),
         };
-        let to_bits = |nats: f64| nats / std::f64::consts::LN_2;
+        let to_bits = |nats: f64| nats / LN_2;
         let record = Epoch {
             epoch,
             objective_bits: to_bits(estimates.iter().sum::<f64>() / count),
@@ -1015,8 +1187,10 @@ pub fn fit(
             improvement_bits: improvement.map(to_bits),
             standard_error_bits: standard_error.map(to_bits),
             active_groups: posterior.active.iter().filter(|a| **a).count(),
-            mean_token_kl: kl_sum / count,
+            clean_bits_per_token: clean.mean().unwrap_or(f64::NAN),
+            patched_bits_per_token: patched.mean().unwrap_or(f64::NAN),
             seconds: epoch_started.elapsed().as_secs_f64(),
+            held_out: held_out(&mut scorer, explanation, &posterior, held, settings, tokens)?,
         };
         log::info!("library fit epoch {epoch}: {record:?}");
         progress.epochs.push(record);
@@ -1024,10 +1198,11 @@ pub fn fit(
         progress.epoch += 1;
         let converged = matches!((improvement, standard_error), (Some(i), Some(se)) if i <= se);
         if converged {
-            let removal = remove(&teacher, &mut student, &mut posterior, &batches, settings)?;
+            let removal = remove(&mut scorer, &mut posterior, &draws, sequences, settings)?;
             log::info!("library removal after epoch {epoch}: {} of {} candidates", removal.removed, removal.candidates);
             progress.done = removal.removed == 0;
             progress.removals.push(removal);
+            variables = scorer.variables(&posterior)?;
             // The objective changed discretely: convergence is judged afresh.
             progress.previous = None;
         }
@@ -1037,9 +1212,11 @@ pub fn fit(
     Ok(Fit {
         report: Report {
             settings: settings.clone(),
-            training_tokens: tokens,
+            training_sequences: sequences.len(),
+            scored_tokens: tokens,
             groups: explanation.groups.len(),
             parameters,
+            start: progress.start.ok_or("no starting evaluation")?,
             active_groups: posterior.active.iter().filter(|a| **a).count(),
             objective_bits,
             seconds: resumed_seconds + started.elapsed().as_secs_f64(),
@@ -1050,20 +1227,21 @@ pub fn fit(
     })
 }
 
-/// `E_q[D]` over every training batch, one weight sample per batch from the removal seeds, with the
-/// groups `removed` (and the already removed ones) zeroed, in nats.
-fn expected_divergence(teacher: &Teacher, student: &mut Student, posterior: &Posterior, batches: &[Batch], removed: &[usize], settings: &Settings) -> Result<f64, String> {
+/// `E_q[D]` over every training batch in nats, one weight sample per batch from the removal seeds,
+/// with the groups `removed` (and the already removed ones) zeroed.
+fn expected_divergence(scorer: &mut Scorer, posterior: &Posterior, draws: &[Draw], sequences: &[Vec<u32>], removed: &[usize], settings: &Settings) -> Result<f64, String> {
     let mut trial = posterior.clone();
     trial.remove(removed);
-    let mut total = 0.0;
-    for (b, batch) in batches.iter().enumerate() {
-        let target = teacher.target(batch)?;
+    let variables = scorer.variables(&trial)?;
+    let mut bits = 0.0;
+    for (b, draw) in draws.iter().enumerate() {
         // Removal zeroes entries, so the remaining entries see the same noise as the full posterior.
         let (theta, _) = trial.sample(noise_seed(settings.seed, 0, b));
-        student.load(&theta)?;
-        total += student.score(batch, &target, None)?.0;
+        let experiments = draw.experiments(scorer.layers(), variables.len());
+        let (scored, _) = scorer.score(&draw.batch(sequences)?, &experiments, &variables, &trial.mean, Some(&theta), false)?;
+        bits += scored.iter().flatten().sum::<f64>();
     }
-    Ok(total)
+    Ok(bits * LN_2)
 }
 
 /// The longest prefix among those bisection evaluates, out of `candidates`, whose `change` (the
@@ -1100,27 +1278,29 @@ fn largest_accepted_prefix(
 
 /// The removal step (module note): a prefix of the active groups in increasing divergence whose
 /// removal does not increase the sampled objective, found by bisection.
-fn remove(teacher: &Teacher, student: &mut Student, posterior: &mut Posterior, batches: &[Batch], settings: &Settings) -> Result<Removal, String> {
+fn remove(scorer: &mut Scorer, posterior: &mut Posterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings) -> Result<Removal, String> {
     let divergences = posterior.divergences();
+    let costs = posterior.costs();
     let mut order: Vec<usize> = (0..divergences.len()).filter(|g| posterior.active[*g]).collect();
     order.sort_by(|a, b| divergences[*a].total_cmp(&divergences[*b]));
     let description = posterior.description();
-    let base = expected_divergence(teacher, student, posterior, batches, &[], settings)? + description;
+    let base = expected_divergence(scorer, posterior, draws, sequences, &[], settings)? + description;
     // `F` with the first `k` candidates removed, minus `F` as it is.
     let mut evaluations: Vec<(usize, f64)> = Vec::new();
     let mut change = |k: usize| -> Result<f64, String> {
         if let Some((_, c)) = evaluations.iter().find(|(at, _)| *at == k) {
             return Ok(*c);
         }
-        let saved: f64 = order[..k].iter().map(|g| divergences[*g] + LITERAL_NATS).sum();
-        let c = expected_divergence(teacher, student, posterior, batches, &order[..k], settings)? + description - saved - base;
+        let saved: f64 = order[..k].iter().map(|g| costs[*g]).sum();
+        let c = expected_divergence(scorer, posterior, draws, sequences, &order[..k], settings)? + description - saved - base;
+        log::info!("library removal of {k} of {} groups: F changes by {:.6e} bits", order.len(), c / LN_2);
         evaluations.push((k, c));
         Ok(c)
     };
     let low = largest_accepted_prefix(order.len(), &mut change)?;
     let after = base + if low > 0 { change(low)? } else { 0.0 };
     posterior.remove(&order[..low]);
-    let to_bits = |nats: f64| nats / std::f64::consts::LN_2;
+    let to_bits = |nats: f64| nats / LN_2;
     Ok(Removal {
         candidates: order.len(),
         removed: low,
@@ -1157,45 +1337,6 @@ pub fn posterior_mean(explanation: &Explanation, posterior: &Posterior) -> Resul
     Ok(artifact)
 }
 
-/// Where and how an explanation's divergence from the native model is measured.
-pub struct Measure<'a> {
-    pub device: &'a Device,
-    pub native: &'a OperatorProgram,
-    /// The holdings of the explanation the measured artifacts are values of.
-    pub holdings: &'a [Holding],
-    /// Sequences run at a time, the operator buffers' bytes and the vocabulary logits' row tile.
-    pub batch_sequences: usize,
-    pub numeric_bytes: usize,
-    pub tile_rows: usize,
-}
-
-impl Measure<'_> {
-    /// Mean `KL(p_M ‖ p_P)` per token, in nats, of `artifact` (the explanation's program with any
-    /// values) on `sequences` (complete, equal length): clean, or under every one of
-    /// `interventions` on every sequence.
-    pub fn mean_divergence(&self, artifact: &Artifact, sequences: &[Vec<u32>], interventions: &[Intervention]) -> Result<f64, String> {
-        if self.batch_sequences == 0 || sequences.is_empty() || interventions.iter().any(|i| i.holding >= self.holdings.len()) {
-            return Err("no held-out sequences, or an intervention on no holding".into());
-        }
-        let controls = controlled_holdings(interventions);
-        let (native, explained): (Vec<usize>, Vec<usize>) = controls.iter().map(|h| (self.holdings[*h].native, self.holdings[*h].node)).unzip();
-        let teacher = Teacher::new(self.device, self.native, &native, self.numeric_bytes, self.tile_rows)?;
-        let student = Student::new(self.device, artifact, &[], &explained, self.numeric_bytes, self.tile_rows)?;
-        let observed: Vec<(usize, Option<&Intervention>)> = if interventions.is_empty() {
-            (0..sequences.len()).map(|i| (i, None)).collect()
-        } else {
-            interventions.iter().flat_map(|intervention| (0..sequences.len()).map(move |i| (i, Some(intervention)))).collect()
-        };
-        let (mut total, mut rows) = (0.0, 0usize);
-        for batch in batches(sequences, &observed, &controls, self.batch_sequences)? {
-            let target = teacher.target(&batch)?;
-            total += student.score(&batch, &target, None)?.0;
-            rows += batch.base.rows;
-        }
-        Ok(total / rows as f64)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1222,47 +1363,63 @@ mod tests {
         (native, layers, family, sequences)
     }
 
+    fn settings() -> Settings {
+        Settings {
+            batch_sequences: 2,
+            mean_step: 0.01,
+            log_sd_step: 0.05,
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+            seed: 3,
+            numeric_bytes: 1 << 26,
+            head_tile_rows: 64,
+        }
+    }
+
     #[test]
     fn the_starting_library_preserves_native_activation_and_coefficients() {
         for law in ["relu", "gelu", "gelu_tanh", "silu"] {
             let (native, layers, family, _) = tiny(&format!("library_start_{law}"), law);
             let explanation = explanation(&native, &layers).unwrap();
             explanation.artifact.validate_coverage(&native).unwrap();
-            assert_eq!(
-                explanation.artifact.controls.len(),
-                2,
-                "every MLP keeps its uniform-scale control"
-            );
-            assert_eq!(
-                explanation.artifact.blocks.len(),
-                2 * (2 + 1),
-                "two heads and one MLP per layer"
-            );
+            assert_eq!(explanation.artifact.blocks.len(), 2 * (2 + 1), "two heads and one MLP per layer");
             let expected = native.execute(&family, false).unwrap().values[native.output].clone();
-            let actual = explanation.artifact.execute(&family).unwrap().values
-                [explanation.artifact.program.output]
-                .clone();
+            let actual = explanation.artifact.execute(&family).unwrap().values[explanation.artifact.program.output].clone();
             let scale = expected.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
-            let difference = expected
-                .iter()
-                .zip(&actual)
-                .fold(0.0_f64, |a, (x, y)| a.max((x - y).abs()));
-            assert!(
-                difference <= 1e-12 * scale,
-                "the starting library differs from the native model by {difference}"
-            );
+            let difference = expected.iter().zip(&actual).fold(0.0_f64, |a, (x, y)| a.max((x - y).abs()));
+            assert!(difference <= 1e-12 * scale, "the starting library differs from the native model by {difference}");
             let posterior = Posterior::new(&explanation, 72).unwrap();
-            let cells: usize = explanation
-                .groups
+            let cells: usize = explanation.groups.iter().flat_map(|g| &g.cells).map(|c| c.rows.len() * c.cols.len()).sum();
+            assert_eq!(cells, posterior.mean.iter().map(Array2::len).sum::<usize>(), "the groups partition the parameters");
+            let indexed: usize = explanation
+                .layers
                 .iter()
-                .flat_map(|g| &g.cells)
-                .map(|c| c.rows.len() * c.cols.len())
+                .map(|l| l.heads.iter().map(|(p, v)| p.len() + v.len()).sum::<usize>() + 2 * l.functions.len())
                 .sum();
-            assert_eq!(
-                cells,
-                posterior.mean.iter().map(Array2::len).sum::<usize>(),
-                "the groups partition the parameters"
-            );
+            assert_eq!(indexed, explanation.groups.len(), "every group belongs to one head or one MLP function");
+        }
+    }
+
+    #[test]
+    fn the_starting_library_matches_the_model_in_every_experiment() {
+        let (native, layers, _, sequences) = tiny("library_experiments", "relu");
+        let explanation = explanation(&native, &layers).unwrap();
+        let settings = settings();
+        let device = Device::host();
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let evaluation = held_out(&mut scorer, &explanation, &posterior, &sequences, &settings, 72).unwrap();
+        for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
+            let bits = bits.expect("every cut and the read patches are drawn");
+            assert!(bits.abs() < 1e-10, "the starting library diverges from the model by {bits} bits per token");
+        }
+        assert!(evaluation.data_bits_per_token > 0.0, "weight noise costs data");
+        for (count, layer) in evaluation.layers.iter().zip(&explanation.layers) {
+            assert_eq!(count.functions, layer.functions.len());
+            assert_eq!(count.heads, layer.heads.len());
+            assert!(count.nonzero_per_token > 0.0 && count.nonzero_per_token < layer.functions.len() as f64, "ReLU functions are exactly zero on some tokens");
+            assert!(count.resolved_per_token <= count.nonzero_per_token);
         }
     }
 
@@ -1277,11 +1434,7 @@ mod tests {
         let teacher_logit = contributions.iter().sum::<f64>();
         let softplus = |z: f64| z.max(0.) + (-z.abs()).exp().ln_1p();
         let probability = 1. / (1. + (-teacher_logit).exp());
-        let loss = |logit: f64| {
-            100. * (softplus(logit)
-                - softplus(teacher_logit)
-                - probability * (logit - teacher_logit))
-        };
+        let loss = |logit: f64| 100. * (softplus(logit) - softplus(teacher_logit) - probability * (logit - teacher_logit));
         let change = |k: usize| loss(contributions[k..].iter().sum()) - k as f64;
         assert!(change(1) > 0. && change(2) < 0. && change(3) > 0.);
         let accepted = largest_accepted_prefix(3, &mut |k| Ok(change(k))).expect("finite prefix objectives");
@@ -1329,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn a_group_at_its_prior_costs_nothing() {
+    fn a_group_at_its_prior_costs_only_its_variance() {
         let (native, layers, _, _) = tiny("library_prior", "gelu_tanh");
         let explanation = explanation(&native, &layers).unwrap();
         let mut posterior = Posterior::new(&explanation, 72).unwrap();
@@ -1347,40 +1500,31 @@ mod tests {
         let divergences = posterior.divergences();
         assert!(divergences[0].abs() < 1e-12, "an uninformed group at its prior costs {}", divergences[0]);
         assert!(divergences[1] > 0.0);
+        let size: usize = group.cells.iter().map(|c| c.rows.len() * c.cols.len()).sum();
+        assert!((posterior.costs()[0] - 0.5 * (size as f64).ln()).abs() < 1e-12, "its variance costs ½ ln |G|");
     }
 
     #[test]
     fn the_fit_converges_removes_and_reports_its_posterior_mean() {
         let (native, layers, _, sequences) = tiny("library_fit", "gelu_tanh");
         let explanation = explanation(&native, &layers).unwrap();
-        let settings = Settings {
-            batch_sequences: 2,
-            mean_step: 0.01,
-            log_sd_step: 0.05,
-            beta1: 0.9,
-            beta2: 0.999,
-            epsilon: 1e-8,
-            seed: 3,
-            numeric_bytes: 1 << 26,
-            head_tile_rows: 64,
-        };
+        let settings = settings();
         let device = Device::host();
-        // Remove layer 0's first head; remove layer 1's MLP.
-        let held = |name: &str| explanation.holdings.iter().position(|h| h.name == name).unwrap();
-        let interventions = vec![Intervention { holding: held("l0.h0"), scale: 0.0 }, Intervention { holding: held("l1.mlp"), scale: 0.0 }];
+        let (train, held) = sequences.split_at(4);
         let checkpoint = std::env::temp_dir().join(format!("library_fit_{}.bin", std::process::id()));
-        let fit = fit(&device, &native, &explanation, &sequences, &interventions, &settings, Some(&checkpoint)).unwrap();
+        let fit = fit(&device, &native, &explanation, train, held, &settings, Some(&checkpoint)).unwrap();
         // A finished fit's checkpoint resumes to the same posterior without another step.
-        let resumed = super::fit(&device, &native, &explanation, &sequences, &interventions, &settings, Some(&checkpoint)).unwrap();
+        let resumed = super::fit(&device, &native, &explanation, train, held, &settings, Some(&checkpoint)).unwrap();
         std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::remove_file(checkpoint.with_extension("json")).unwrap();
         assert_eq!(resumed.posterior.active, fit.posterior.active);
         assert_eq!(resumed.posterior.means(), fit.posterior.means());
         assert_eq!(resumed.report.epochs.len(), fit.report.epochs.len());
         let report = &fit.report;
-        assert_eq!(report.training_tokens, 2 * 72, "every sequence clean and once intervened");
+        assert_eq!(report.scored_tokens, 2 * 4 * 12, "two experiments per training base");
         assert_eq!(report.removals.last().unwrap().removed, 0, "the fit ends when no removal is accepted");
         assert!(report.removals.iter().all(|r| r.after_bits <= r.before_bits), "a removal never increases the objective");
-        assert!(report.epochs.iter().all(|e| e.objective_bits.is_finite()));
+        assert!(report.epochs.iter().all(|e| e.objective_bits.is_finite() && e.held_out.objective_bits_per_token.is_finite()));
         let artifact = posterior_mean(&explanation, &fit.posterior).unwrap();
         artifact.validate_coverage(&native).unwrap();
         let (start, end) = (explanation.artifact.program.real_count(), artifact.program.real_count());
@@ -1394,34 +1538,5 @@ mod tests {
             .map(|c| c.rows.len() * c.cols.len())
             .sum();
         assert!(end <= start && start - end >= removed.min(start), "removed groups are absent blocks: {start} → {end}");
-        let measure = Measure { device: &device, native: &native, holdings: &explanation.holdings, batch_sequences: 2, numeric_bytes: 1 << 26, tile_rows: 64 };
-        for declared in [&[][..], &interventions[..]] {
-            let kl = measure.mean_divergence(&artifact, &sequences, declared).unwrap();
-            assert!(kl.is_finite() && kl >= 0.0);
-        }
-    }
-
-    #[test]
-    fn the_starting_library_answers_every_held_intervention_as_the_native_model() {
-        let (native, layers, _, sequences) = tiny("library_holdings", "gelu_tanh");
-        let explanation = explanation(&native, &layers).unwrap();
-        assert_eq!(explanation.holdings.len(), 2 * (2 + 1), "two head reads and one MLP per layer");
-        let device = Device::host();
-        let interventions: Vec<Intervention> =
-            (0..explanation.holdings.len()).flat_map(|holding| [0.0, 0.5, 2.0].map(|scale| Intervention { holding, scale })).collect();
-        let measure = |holdings: &[Holding]| {
-            Measure { device: &device, native: &native, holdings, batch_sequences: 2, numeric_bytes: 1 << 26, tile_rows: 64 }
-                .mean_divergence(&explanation.artifact, &sequences, &interventions)
-                .unwrap()
-        };
-        let held = measure(&explanation.holdings);
-        assert!(held.abs() < 1e-10, "the starting library's intervened divergence is {held}");
-        // A positive control: the same scales applied at mismatched places move it off M.
-        let mut moved = explanation.holdings.clone();
-        let (first, second) = (moved[0].node, moved[2].node);
-        moved[0].node = second;
-        moved[2].node = first;
-        let control = measure(&moved);
-        assert!(control > 1e-3, "mismatched holdings must disagree: {control}");
     }
 }
