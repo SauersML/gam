@@ -159,6 +159,8 @@ fn run_case(
         epsilon: 1e-6,
         numeric_bytes,
         schedule: None,
+        arithmetic: resident_causal_fit::FitArithmetic::F64,
+        exact_scan_every: 1,
     };
     let t = Instant::now();
     let full_fit = resident_causal_fit::fit(d, source, &full, trainable, settings.clone())?;

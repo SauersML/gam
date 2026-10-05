@@ -3934,6 +3934,8 @@ mod tests {
                 epsilon: 1e-8,
                 numeric_bytes: 1 << 24,
                 schedule: None,
+                arithmetic: resident_causal_fit::FitArithmetic::F64,
+                exact_scan_every: 1,
             };
             let a = full
                 .fit(&d, &candidate, supervision, &[0], settings.clone())
@@ -3963,6 +3965,8 @@ mod tests {
             epsilon: 1e-8,
             numeric_bytes: 1 << 24,
             schedule: None,
+            arithmetic: resident_causal_fit::FitArithmetic::F64,
+            exact_scan_every: 1,
         };
         assert!(compact.fit(&d, &candidate, None, &[1], settings).is_err());
         assert!(CausalEpisodes::from_family(
@@ -4100,6 +4104,8 @@ mod tests {
                 epsilon: 1e-8,
                 numeric_bytes: 1 << 24,
                 schedule: None,
+                arithmetic: resident_causal_fit::FitArithmetic::F64,
+                exact_scan_every: 1,
             },
         )
         .expect("coefficient fit");
@@ -4894,6 +4900,8 @@ mod tests {
                         epsilon: 1e-8,
                         numeric_bytes: 1_000_000,
                         schedule: None,
+                        arithmetic: resident_causal_fit::FitArithmetic::F64,
+                        exact_scan_every: 1,
                     },
                 )
                 .expect("compact joint fit");
@@ -4911,6 +4919,8 @@ mod tests {
                     epsilon: 1e-8,
                     numeric_bytes: 1_000_000,
                     schedule: None,
+                    arithmetic: resident_causal_fit::FitArithmetic::F64,
+                    exact_scan_every: 1,
                 },
             )
             .expect("joint causal fit");
@@ -5328,6 +5338,8 @@ mod tests {
                 epsilon: 1e-8,
                 numeric_bytes: 1 << 26,
                 schedule: None,
+                arithmetic: resident_causal_fit::FitArithmetic::F64,
+                exact_scan_every: 1,
             },
             seed: 1,
             evaluation: None,
@@ -6205,6 +6217,8 @@ mod tests {
                 epsilon: 1e-8,
                 numeric_bytes: 1 << 26,
                 schedule: None,
+                arithmetic: resident_causal_fit::FitArithmetic::F64,
+                exact_scan_every: 1,
             },
             seed: 1,
             evaluation: None,

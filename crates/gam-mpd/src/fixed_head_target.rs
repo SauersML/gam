@@ -372,12 +372,15 @@ impl ResidentHead {
             tile_rows,
         })
     }
+    /// Per-row compact KL; with `gradient`, the hidden seed. Logit and seed products run in
+    /// `arithmetic`.
     pub fn score(
         &self,
         d: &Device,
         hidden: &Tensor,
         target: &Target,
         gradient: bool,
+        arithmetic: Arithmetic,
     ) -> Result<(Vec<f64>, Option<Tensor>), String> {
         let mut losses = Vec::with_capacity(hidden.rows());
         let mut seed = if gradient {
@@ -398,7 +401,7 @@ impl ResidentHead {
                 &self.embedding,
                 Op::T,
                 0.,
-                Arithmetic::F64,
+                arithmetic,
             )
             .map_err(error)?;
             let flags = target
@@ -419,6 +422,7 @@ impl ResidentHead {
                 .map_err(error)?;
             let mut products = d.zeros(n, h.cols()).map_err(error)?;
             d.hadamard(&mut products, &h, &mu, false).map_err(error)?;
+            // mu.h stays F64: logZ - mu.h + c cancels, so it must not add product rounding.
             let mut dots = d.zeros(n, 1).map_err(error)?;
             d.gemm(
                 &mut dots,
@@ -453,7 +457,7 @@ impl ResidentHead {
                     &self.embedding,
                     Op::N,
                     0.,
-                    Arithmetic::F64,
+                    arithmetic,
                 )
                 .map_err(error)?;
                 d.axpy(&mut projected, -1., &mu).map_err(error)?;

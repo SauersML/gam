@@ -325,6 +325,8 @@ fn learned_projection_restricted_family_search_hidden_basis_and_negative_sharing
                         epsilon: 1e-8,
                         numeric_bytes: 1 << 25,
                         schedule: None,
+                        arithmetic: resident_causal_fit::FitArithmetic::F64,
+                        exact_scan_every: 1,
                     },
                 )
                 .expect("declared TRAIN-only multistart fits ordinary candidate parameters");
