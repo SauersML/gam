@@ -36,7 +36,7 @@
 //!
 //! # The message
 //!
-//! [`Artifact::encode`] writes one self-delimiting message through `codec`'s integer codes:
+//! [`Artifact::to_bytes`] writes one self-delimiting message through `codec`'s integer codes:
 //!
 //! 1. the native node count `N_M + 1` in the prefix code;
 //! 2. the program's message length `+ 1` in the prefix code, then the program's message
@@ -55,7 +55,7 @@
 //!    law tag, native source/write indices, explanatory write index, and source width.
 //!    Empty bindings keep the previous byte format and intervention semantics.
 //!
-//! [`Artifact::decode`] reads it back given only the declarations; nothing of the native model, of a
+//! [`Artifact::from_bytes`] reads it back given only the declarations; nothing of the native model, of a
 //! fit or of a discovery is read. The names are labels: they are sent so a decoded artifact reports
 //! itself, and no length charges them.
 //!

@@ -34,7 +34,7 @@
 //! `M` keeps each head's output projection `O_h`, so a group's value–output maps are `O_i V` over
 //! its query heads `i`. Another group's are the same maps when `V = T V_s` with
 //! `T = argmin Σ_i ‖O_{t,i} T − O_{s,π(i)}‖²` and `π` the assignment of query heads
-//! ([`transports`]): the exact symmetry `V → R V`, `O → O R⁻¹` with `O` fixed by `M`. A shared value
+//! (`transports`): the exact symmetry `V → R V`, `O → O R⁻¹` with `O` fixed by `M`. A shared value
 //! map stores `V_s` once and the target's heads read `c T V_s`, `T` fixed and `c` one scalar
 //! ([`share_value`]).
 //!
@@ -404,7 +404,7 @@ pub(crate) fn transports(explanation: &Explanation, target: (usize, usize), sour
 }
 
 /// `explanation` with the value map of key-value group `target` made `scale T V_s`, `V_s` the value
-/// map of group `source` of an earlier layer and `T` the transport between them ([`transports`]):
+/// map of group `source` of an earlier layer and `T` the transport between them (`transports`):
 /// every query head of the target reads `V_s`, moves it by `T` (fixed, from `M`'s output
 /// projections) and scales it by `scale` (a 1 × 1 operator, one prior group). The target's own
 /// value map leaves the library with its groups; `V_s` is stored once, its gradient summing both
