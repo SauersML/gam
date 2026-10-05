@@ -390,6 +390,9 @@ pub struct Native {
     /// The bytes one input row's node values take in a run (every node's width, float64).
     pub row_bytes: usize,
     operators: BTreeMap<String, usize>,
+    /// The final normed hidden state the logits read; a run stops there and forms the logits only
+    /// at the rows a request reads.
+    hidden: usize,
     /// The final norm's gain and the unembedding operator (`true`: read transposed, `h A`).
     final_gain: Array1<f64>,
     unembedding: (usize, bool),
@@ -425,13 +428,18 @@ impl Native {
             Node::Affine { terms, bias: None } if terms.len() == 1 => (terms[0].0, (terms[0].1, false)),
             other => return Err(format!("the logits are not a linear head: {other:?}")),
         };
+        // Past the hidden state the program holds only the logits and their readout.
+        if program.nodes.len() != program.output + 1 || (normed + 1..program.output).any(|n| n != logits) {
+            return Err("nodes other than the logits follow the final hidden state".into());
+        }
         let final_gain = match &program.nodes[normed] {
             Node::Affine { terms, .. } if terms.len() == 1 => program.operators[terms[0].1].diagonal().ok_or("the final norm has no diagonal gain")?,
             other => return Err(format!("the head does not read a gained norm: {other:?}")),
         };
         let embedding = operators.get("wte").copied();
-        let row_bytes = program.interfaces().map_err(|e| e.to_string())?.iter().map(|i| i.width()).sum::<usize>() * std::mem::size_of::<f64>();
+        let row_bytes = program.interfaces().map_err(|e| e.to_string())?[..=normed].iter().map(|i| i.width()).sum::<usize>() * std::mem::size_of::<f64>();
         Ok(Self {
+            hidden: normed,
             row_bytes,
             width: width_of(first.stream)?,
             heads: first.reads.len(),
@@ -446,6 +454,20 @@ impl Native {
             layers,
             program,
         })
+    }
+
+    /// `program` (this model's, or an edit of it) up to the final hidden state.
+    pub fn body(&self, program: &OperatorProgram) -> OperatorProgram {
+        let mut body = program.clone();
+        body.nodes.truncate(self.hidden + 1);
+        body.output = self.hidden;
+        body
+    }
+
+    /// The logits of hidden-state rows through `program`'s unembedding.
+    pub fn logits(&self, program: &OperatorProgram, hidden: &Array2<f64>) -> Array2<f64> {
+        let a = program.operators[self.unembedding.0].matrix_cow();
+        if self.unembedding.1 { hidden.dot(a.as_ref()) } else { hidden.dot(&a.t()) }
     }
 
     pub fn operator(&self, name: &str) -> Result<usize, String> {
@@ -727,15 +749,17 @@ impl Session {
         Ok(program)
     }
 
-    /// Every node's value of `program` on `sequences` with `patches` applied as each node is computed.
+    /// Every node's value up to the final hidden state of `program` on `sequences`, with `patches`
+    /// applied as each node is computed.
     fn execute(&mut self, model: &str, program: &OperatorProgram, sequences: &[Vec<u32>], patches: &[Patch], edits: &[Edit]) -> Result<(Vec<Array2<f64>>, Vec<usize>), String> {
         let native = self.model(model)?;
         let (inputs, offsets) = family(sequences, native.vocab)?;
+        let body = native.body(program);
         let mut resolved: Vec<Resolved> = Vec::new();
         for patch in patches {
             resolved.push(self.resolve_patch(model, program, sequences, &offsets, patch, edits)?);
         }
-        let trace = program
+        let trace = body
             .execute_edited(&inputs, |node, value, _| {
                 for r in resolved.iter().filter(|r| r.node == node) {
                     apply(r, value)?;
@@ -793,7 +817,7 @@ impl Session {
                     None => sequences.to_vec(),
                 };
                 let (inputs, source_offsets) = family(&source_sequences, source_native.vocab)?;
-                let trace = source_program.execute(&inputs, false).map_err(|e| e.to_string())?;
+                let trace = source_native.body(&source_program).execute(&inputs, false).map_err(|e| e.to_string())?;
                 let values = &trace.values[source_node];
                 let mut targets = Vec::with_capacity(places.len());
                 for (s, i, p) in &places {
@@ -893,10 +917,16 @@ impl Session {
                 })
                 .collect();
             let (values, offsets) = self.execute(model, &program, &sequences[start..end], &patches, &intervention.edits)?;
-            let logits = &values[program.output];
+            let native = self.model(model)?;
+            let wanted: Vec<usize> = positions[start..end].iter().zip(&offsets).flat_map(|(list, offset)| list.iter().map(move |p| offset + p)).collect();
+            let logits = native.logits(&program, &values[native.hidden].select(Axis(0), &wanted));
+            let mut next = 0;
             for (local, list) in positions[start..end].iter().enumerate() {
                 let offset = offsets[local];
-                measured.logits.push(list.iter().map(|p| logits.row(offset + p).to_owned()).collect());
+                measured.logits.push(list.iter().map(|_| {
+                    next += 1;
+                    logits.row(next - 1).to_owned()
+                }).collect());
                 measured.recorded.push(record.iter().map(|node| list.iter().map(|p| values[*node].row(offset + p).to_owned()).collect()).collect());
             }
             start = end;
@@ -1015,8 +1045,10 @@ impl Session {
         let mut chosen = Vec::new();
         for _ in 0..steps {
             let (inputs, _) = family(std::slice::from_ref(&sequence), vocab)?;
-            let trace = program.execute(&inputs, false).map_err(|e| e.to_string())?;
-            let (lp, high) = top_log_probabilities(trace.values[program.output].row(sequence.len() - 1), 3)?;
+            let native = self.model(model)?;
+            let trace = native.body(&program).execute(&inputs, false).map_err(|e| e.to_string())?;
+            let logits = native.logits(&program, &trace.values[native.hidden].select(Axis(0), &[sequence.len() - 1]));
+            let (lp, high) = top_log_probabilities(logits.row(0), 3)?;
             let (next, _) = high[0];
             chosen.push(json!({"token": next, "log_probability": lp[next], "alternatives": high[1..].iter().map(|(t, v)| json!([t, v])).collect::<Vec<_>>()}));
             sequence.push(next as u32);
@@ -1035,7 +1067,7 @@ impl Session {
             return Err(format!("node {node} is not an attention read"));
         };
         let (inputs, _) = family(&[tokens.to_vec()], native.vocab)?;
-        let trace = program.execute(&inputs, false).map_err(|e| e.to_string())?;
+        let trace = native.body(&program).execute(&inputs, false).map_err(|e| e.to_string())?;
         let positions: Vec<u32> = (0..tokens.len() as u32).collect();
         let q = tiled_attention::rotate(&trace.values[query], rotary, &positions, false);
         let k = tiled_attention::rotate(&trace.values[key], rotary, &positions, false);
@@ -1060,7 +1092,7 @@ impl Session {
             (None, Some(site), Some(tokens)) => {
                 let native = self.model(model)?;
                 let (inputs, _) = family(&[tokens.to_vec()], native.vocab)?;
-                let trace = native.program.execute(&inputs, false).map_err(|e| e.to_string())?;
+                let trace = native.body(&native.program).execute(&inputs, false).map_err(|e| e.to_string())?;
                 let p = resolve(position.unwrap_or(-1), tokens.len())?;
                 let value = trace.values[native.node(site)?].row(p).to_vec();
                 native.write_of(site, &value)?
