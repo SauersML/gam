@@ -23,7 +23,7 @@ plt.rcParams.update({
     "axes.edgecolor": MUTED, "axes.labelcolor": INK, "xtick.color": INK, "ytick.color": INK,
     "axes.spines.top": False, "axes.spines.right": False, "axes.linewidth": 0.8, "pdf.fonttype": 42,
 })
-fig, ax = plt.subplots(figsize=(5.4, 2.45))
+fig, ax = plt.subplots(figsize=(5.4, 2.2))
 bars = [("earlier\nlayer", mean_l("kl_{}"), GRAY),
         ("earlier layer,\nminus layer-3\nresponse", mean_l("kl_{}_without_I"), BLUE),
         ("earlier layer\nand layer 3", mean_l("kl_{}3"), GRAY),
