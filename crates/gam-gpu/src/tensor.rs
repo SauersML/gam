@@ -1601,8 +1601,7 @@ impl Device {
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) if hidden.storage() == Storage::F32 => {
-                // Each chunk's logits fill about 32 MB, half the L40's L2 and so read back from it.
-                let chunk = ((1usize << 23) / rows).max(512);
+                let chunk = swept_chunk(rows);
                 engine.head_log_partition(hidden, (head, transposed), scored, expected, (chunk, arithmetic))
             }
             #[cfg(target_os = "linux")]
@@ -1687,7 +1686,7 @@ impl Device {
                 if head_width != hidden.cols || classes == 0 || scored.is_some_and(|s| s.len != hidden.rows) || expected.as_ref().is_some_and(|e| e.dim() != hidden.dim()) {
                     return Err(shape(format!("a {:?} head (transposed {transposed}) on {:?} rows", head.dim(), hidden.dim())));
                 }
-                let chunk = ((1usize << 23) / hidden.rows).max(512);
+                let chunk = swept_chunk(hidden.rows);
                 engine.head_log_partition_into(hidden, (head, transposed), scored, expected, out, (chunk, arithmetic))
             }
             _ => {
@@ -2603,6 +2602,15 @@ impl HeadLayout {
         }
         Ok(())
     }
+}
+
+/// The classes a swept head log partition takes at a time for `rows` rows: about 32 MB of f32
+/// logits (half the L40's L2, so they are read back from it), a multiple of 128 classes so every
+/// chunk's products run the tensor cores' aligned kernels (a leading dimension of 128 columns is a
+/// whole number of their tiles), and at least 512.
+#[cfg(target_os = "linux")]
+fn swept_chunk(rows: usize) -> usize {
+    (((1usize << 23) / rows.max(1)) / 128 * 128).max(512)
 }
 
 /// The host's [`Device::heads_rope`] (with `norm`, its gains and ε) or, with `backward` (the

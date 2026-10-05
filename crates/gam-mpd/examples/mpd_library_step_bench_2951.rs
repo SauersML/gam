@@ -237,7 +237,9 @@ fn main() -> Result<(), String> {
     let decoders = if fixed {
         let (m_prefix, p_prefix) = (interchange::prefix(&m_flat)?, interchange::prefix(&p_flat)?);
         let m_ends = (&m_streams[..], &m_reads[..], m_program.hidden());
-        Some((Decoder::new(&device, &m_prefix, m_ends, &[])?, Decoder::new(&device, &p_prefix, (&p_streams[..], &p_reads[..], p_program.hidden()), &trainable)?))
+        let outside = if products == gam_gpu::tensor::Arithmetic::F32 { gam_gpu::tensor::Arithmetic::Bf16 } else { products };
+        let m = Decoder::new(&device, &m_prefix, m_ends, &[])?.with_arithmetic(outside);
+        Some((m, Decoder::new(&device, &p_prefix, (&p_streams[..], &p_reads[..], p_program.hidden()), &trainable)?.with_arithmetic(outside)))
     } else {
         None
     };

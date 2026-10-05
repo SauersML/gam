@@ -124,6 +124,8 @@ pub struct Decoder {
     embedding: Tensor,
     width: usize,
     trainable: Vec<usize>,
+    /// The products' precision outside the blocks (the head, the patches): bfloat16 by default.
+    arithmetic: Arithmetic,
     /// Per rotary configuration, the angles of positions `0..span` (span × planes), grown to the
     /// longest sequence seen.
     angles: Mutex<Vec<(Rotary, usize, Arc<(Tensor, Tensor)>)>>,
@@ -228,7 +230,7 @@ impl Decoder {
         let table = single(program, entries[0]).filter(|(input, _)| matches!(program.nodes[*input], Node::Feature { .. })).ok_or_else(|| error("the first stream is not an embedding"))?;
         let embedding = device.upload(program.operators[table.1].matrix().t()).map_err(error)?;
         let width = embedding.cols();
-        let mut out = Self { device: device.clone(), blocks, weights: Vec::new(), embedding, width, trainable: trainable.to_vec(), angles: Mutex::new(Vec::new()) };
+        let mut out = Self { device: device.clone(), blocks, weights: Vec::new(), embedding, width, trainable: trainable.to_vec(), arithmetic: Arithmetic::Bf16, angles: Mutex::new(Vec::new()) };
         out.weights = out.blocks.iter().map(|b| out.upload(program, b)).collect::<Result<_, _>>()?;
         Ok(out)
     }
@@ -264,6 +266,13 @@ impl Decoder {
                 last: m.last.map(|(g, _)| row(g)).transpose()?,
             },
         })
+    }
+
+    /// The products' precision outside the blocks (the head's sweep of the vocabulary, the patches).
+    #[must_use]
+    pub fn with_arithmetic(mut self, arithmetic: Arithmetic) -> Self {
+        self.arithmetic = arithmetic;
+        self
     }
 
     /// The trainable operators' current values from `program` (the explanation's resident program,
@@ -505,7 +514,7 @@ impl BlockEngine for Decoder {
     }
 
     fn arithmetic(&self) -> Arithmetic {
-        Arithmetic::F32
+        self.arithmetic
     }
 
     fn forward(
