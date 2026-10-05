@@ -4,10 +4,11 @@
 #   remote_submit.sh NAME CPUS MEM_GB MINUTES WANT_COMMIT GPUS QOS CMD_B64 [ARRAY] [CHAIN] [NEEDBIN] [POOL] [SWAP] [AFTEROK]
 #
 # Requires origin/main to contain WANT_COMMIT and snapshots that exact commit's
-# source into ~/mpd-src/C (the job's working directory). Binaries come from ~/mpd-bin/B for a built
-# or queued commit B whose Rust sources (crates/, Cargo.*, rust-toolchain.toml) equal C's; only
-# otherwise is C built. Builds run in the debug QOS (2 h) as one Slurm singleton, at 8 CPUs so they
-# fit between running jobs; they neither wait behind day-long jobs nor hold CPUs while queued.
+# source into ~/mpd-src/C (the job's working directory). Binaries come from ~/mpd-bin/B, a directory
+# of binaries built from commits whose Rust sources (crates/, Cargo.*, rust-toolchain.toml) equal C's,
+# when it holds (or a queued build will install) every example the command names; only otherwise is
+# a build submitted, and it compiles just those examples. Builds run in the debug QOS as one Slurm
+# singleton; they neither wait behind day-long jobs nor hold CPUs while queued.
 # MATS_CHAIN's segments are copies of the run job, each after the last (afterany). Prints the job id.
 set -Eeuo pipefail
 NAME=$1 CPUS=$2 MEM=$3 MINUTES=$4 WANT=$5 GPUS=$6 QOS=$7 CMD_B64=$8 ARRAY=${9:-} CHAIN=${10:-1} NEEDBIN=${11:-auto} POOL=${12:-0} SWAP=${13:-} AFTEROK=${14:-}
@@ -21,9 +22,13 @@ mkdir -p "$OUT" "$BIN" "$SRC" "$CL/_build"
 
 cat > "$CL/_build/build.sh" <<'BUILD'
 #!/usr/bin/env bash
-# Build job: compiles every gam-mpd example at commit $1 and installs them in ~/mpd-bin/<commit12>/.
+# Build job: build.sh COMMIT DEST [EXAMPLE...] compiles the named gam-mpd examples (every example
+# when none is named) at COMMIT and installs them in ~/mpd-bin/DEST/, a directory whose binaries
+# all come from commits with COMMIT's Rust sources. Linking one example with thin LTO takes about a
+# minute; linking all 59 took 15, and every queued run waited on it.
 set -Eeuo pipefail
-C=$1 C12=${1:0:12}
+C=$1 C12=${1:0:12} D=$2
+shift 2
 trap 'echo "${SLURM_JOB_ID:-?} $C" > "$HOME/mpd-bin/$C12.failed"' ERR
 source "$HOME/.cargo/env"
 exec 9> "$HOME/gam-cluster/.build.lock"
@@ -36,20 +41,25 @@ git checkout -q -f --detach "$C"
 export CARGO_BUILD_JOBS=${SLURM_CPUS_PER_TASK:-16}
 # Every job runs on l40-worker, an AMD EPYC 7763 (Zen 3).
 export RUSTFLAGS="-C target-cpu=znver3"
-echo "== $(date '+%F %T') building $C with $CARGO_BUILD_JOBS jobs"
-time cargo build --release -p gam-mpd --examples 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading)' | tail -n 40
-dest=$HOME/mpd-bin/$C12
-rm -rf "$dest.tmp"
-mkdir -p "$dest.tmp"
+which=(--examples)
+[ $# -gt 0 ] && which=($(printf -- '--example %s ' "$@"))
+echo "== $(date '+%F %T') building ${*:-every example} at $C with $CARGO_BUILD_JOBS jobs"
+time cargo build --release -p gam-mpd "${which[@]}" 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading)' | tail -n 40
+dest=$HOME/mpd-bin/$D
+mkdir -p "$dest"
+[ -f "$dest/COMMIT" ] || echo "$C" > "$dest/COMMIT"
+# Each binary lands by rename, so a job never runs a half-copied file; same-source binaries replace
+# each other harmlessly.
+n=0
 for f in target/release/examples/*; do
     base=${f##*/}
-    [[ -f $f && -x $f && $base != *-* && $base != *.* ]] && cp "$f" "$dest.tmp/"
+    [[ -f $f && -x $f && $base != *-* && $base != *.* ]] || continue
+    [ $# -eq 0 ] || printf '%s\n' "$@" | grep -qx "$base" || continue
+    cp "$f" "$dest/.$base.$$" && mv "$dest/.$base.$$" "$dest/$base" && n=$(( n + 1 ))
 done
-echo "$C" > "$dest.tmp/COMMIT"
-rm -rf "$dest"
-mv "$dest.tmp" "$dest"
-touch "$dest/READY"
-echo "== $(date '+%F %T') installed $(ls "$dest" | wc -l) entries in $dest"
+[ $# -eq 0 ] && touch "$dest/READY"
+touch "$dest/.built-${SLURM_JOB_ID:-0}"
+echo "== $(date '+%F %T') installed $n binaries in $dest"
 BUILD
 
 exec 9> "$CL/_build/submit.lock"
@@ -87,25 +97,42 @@ B="" dep=()
         exit 3
     fi
 done
+# The examples the command runs. A command that names none (it runs them through PATH) needs them all.
+names=$(grep -oE '@@BIN@@/[A-Za-z0-9_]+' <<< "$probe" | sed 's|^@@BIN@@/||' | sort -u | tr '\n' ' ' || true)
+has() { local d=$1 n; [ -z "$names" ] && { [ -f "$d/READY" ]; return; }; for n in $names; do [ -f "$d/$n" ] || return 1; done; }
+same=""
 for d in $(ls -1dt "$BIN"/*/ 2> /dev/null); do
-    [ -f "$d/READY" ] && same_rust "$(cat "$d/COMMIT")" "$C" && { B=$(basename "$d"); break; }
+    d=${d%/}
+    [ -f "$d/COMMIT" ] && same_rust "$(cat "$d/COMMIT")" "$C" || continue
+    [ -n "$same" ] || same=$(basename "$d")
+    has "$d" && { B=$(basename "$d"); break; }
 done
+ready=""
+[ -n "$B" ] && ready=$BIN/$B/COMMIT
 if [ $need = 0 ]; then
-    [ -n "$B" ] || B=none
+    [ -n "$B" ] || B=${same:-none}
 elif [ -z "$B" ]; then
+    # A queued build of the same sources that installs every example this command names.
     for f in $(ls -1t "$BIN"/*.buildjob 2> /dev/null); do
-        read -r bj bc < "$f" || true
-        [ -n "${bc:-}" ] && alive "$bj" && same_rust "$bc" "$C" && { B=${bc:0:12}; break; }
+        read -r bj bc bd bn < "$f" || true
+        [ -n "${bc:-}" ] && alive "$bj" && same_rust "$bc" "$C" || continue
+        bd=${bd:-${bc:0:12}} bn=${bn:-}
+        if [ -z "$bn" ] || { [ -n "$names" ] && [ -z "$(comm -23 <(tr ' ' '\n' <<< "$names" | sed '/^$/d') <(tr ' ' '\n' <<< "$bn" | sed '/^$/d' | sort -u))" ]; }; then
+            B=$bd
+            break
+        fi
     done
     if [ -z "$B" ]; then
-        bj=$(sbatch --parsable -J mpd-build --dependency=singleton -p compute --qos=debug -c 8 --mem=12G \
-            -t 00:30:00 -o "$CL/_build/build-$C12-%j.log" "$CL/_build/build.sh" "$C")
-        echo "$bj $C" > "$BIN/$C12.buildjob"
-        B=$C12
-        echo "mats-run: building $C12 in job $bj (log ~/mpd-data/cluster/_build/build-$C12-$bj.log)" >&2
+        B=${same:-$C12}
+        # 32 compile and link jobs; the measured peak of 8-job builds was 3.7 GB.
+        bj=$(sbatch --parsable -J mpd-build --dependency=singleton -p compute --qos=debug -c 32 --mem=24G \
+            -t 00:30:00 -o "$CL/_build/build-$C12-%j.log" "$CL/_build/build.sh" "$C" "$B" $names)
+        echo "$bj $C $B $names" > "$BIN/$C12-$bj.buildjob"
+        echo "mats-run: building ${names:-every example} at $C12 into $B in job $bj (log ~/mpd-data/cluster/_build/build-$C12-$bj.log)" >&2
     else
-        echo "mats-run: waiting on build job $bj of $B (same Rust sources as $C12)" >&2
+        echo "mats-run: waiting on build job $bj into $B (same Rust sources as $C12)" >&2
     fi
+    ready=$BIN/$B/.built-$bj
     dep=(--dependency="afterok:$bj" --kill-on-invalid-dep=yes)
 fi
 if [ -n "$AFTEROK" ]; then
@@ -196,7 +223,7 @@ if [ -n "$SWAP" ]; then
     task=$(grep -oP 'ArrayTaskId=\K[0-9]+' <<< "$info" | head -1 || true)
     jout=$(dirname "$(grep -oP 'StdOut=\K\S+' <<< "$info")")
     [ "$(grep -oP 'JobState=\K\S+' <<< "$info")" = RUNNING ] || { echo "mats-swap: job $SWAP is not running" >&2; exit 2; }
-    if [ "$need" = 1 ] && [ ! -f "$BIN/$B/READY" ]; then
+    if [ "$need" = 1 ] && [ ! -f "$ready" ]; then
         echo "mats-swap: binaries $B are still building (${dep[*]}); swap again once it finishes" >&2; exit 3
     fi
     next=$jout/.next-$raw${task:+_$task}
@@ -221,8 +248,7 @@ if [ "$POOL" = 1 ]; then
     Q=$CL/queue
     mkdir -p "$Q/todo" "$Q/running" "$Q/done" "$Q/workers"
     cp "$HERE_WORKER" "$Q/pool_worker.sh"
-    ready=""
-    [ "$need" = 1 ] && ready=$BIN/$B/READY
+    [ "$need" = 1 ] || ready=""
     idx=("")
     if [ -n "$ARRAY" ]; then
         idx=()
