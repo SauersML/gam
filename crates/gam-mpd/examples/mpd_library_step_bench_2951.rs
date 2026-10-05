@@ -116,6 +116,76 @@ fn medians(seconds: &BTreeMap<&'static str, Vec<f64>>) -> Value {
     Value::Object(out)
 }
 
+/// The median seconds of `part` over `reps` runs after one, synchronized.
+fn median(device: &Device, reps: usize, mut part: impl FnMut() -> Result<(), String>) -> Result<f64, String> {
+    part()?;
+    device.synchronize().map_err(error)?;
+    let mut seconds = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let started = Instant::now();
+        part()?;
+        device.synchronize().map_err(error)?;
+        seconds.push(started.elapsed().as_secs_f64());
+    }
+    seconds.sort_by(f64::total_cmp);
+    Ok(seconds[seconds.len() / 2])
+}
+
+/// Each kernel class of a decoder layer timed alone on `sequences` × `length` rows: its products
+/// (TFLOPS), attention forward and reverse (TFLOPS), the norms, rotation and activation (GB/s of
+/// the values they read and write), and the device's bfloat16 product ceiling.
+fn classes(device: &Device, decoder: &Decoder, sequences: usize, length: usize, reps: usize) -> Result<Value, String> {
+    use gam_gpu::tensor::{Arithmetic, Op};
+    let shape = decoder.layer_shape().ok_or("no decoder layer")?;
+    let rows = sequences * length;
+    let half = |r: usize, c: usize| -> Result<gam_gpu::tensor::Tensor, String> { device.bf16_copy(&device.zeros(r, c).map_err(error)?).map_err(error) };
+    let product = |m: usize, k: usize, n: usize| -> Result<Value, String> {
+        let (a, b) = (half(m, k)?, half(n, k)?);
+        let mut c = device.empty(m, n).map_err(error)?;
+        let t = median(device, reps, || device.gemm(&mut c, 1.0, &a, Op::N, &b, Op::T, 0.0, Arithmetic::Bf16).map_err(error))?;
+        Ok(json!({"seconds": t, "tflops": 2.0 * (m * k * n) as f64 / t / 1e12}))
+    };
+    let side = 8192;
+    let ceiling = product(side, side, side)?;
+    let (d, layout) = (shape.width, shape.heads);
+    let reads = layout.queries * layout.width;
+    let m = if shape.gated { shape.mlp_inputs / 2 } else { shape.mlp_inputs };
+    let products = json!({
+        "projections": product(rows, d, shape.projections)?,
+        "output": product(rows, reads, d)?,
+        "mlp_inputs": product(rows, d, shape.mlp_inputs)?,
+        "mlp_output": product(rows, m, d)?,
+    });
+    let ranges: Vec<std::ops::Range<usize>> = (0..sequences).map(|i| i * length..(i + 1) * length).collect();
+    let (heads, _) = device.heads_rope(&device.zeros(rows, layout.columns()).map_err(error)?, layout, None, None).map_err(error)?;
+    let flops = 2.0 * 2.0 * rows as f64 * (length as f64 / 2.0) * layout.width as f64 * layout.queries as f64;
+    let mut kept = None;
+    let forward = median(device, reps, || {
+        kept = Some(device.causal_attention(&heads, layout, &ranges, shape.scale).map_err(error)?);
+        Ok(())
+    })?;
+    let (out, lse) = kept.ok_or("no attention output")?;
+    let g = device.zeros(rows, reads).map_err(error)?;
+    let reverse = median(device, reps, || device.causal_attention_backward(&heads, layout, &ranges, shape.scale, (&out, &lse), &g).map(|_| ()).map_err(error))?;
+    let x = device.zeros(rows, d).map_err(error)?;
+    let gain = device.upload_vec(1, d, vec![1.0; d]).map_err(error)?;
+    let norm = median(device, reps, || device.rms_gain(&x, &gain, shape.epsilon, true).map(|_| ()).map_err(error))?;
+    let p = device.zeros(rows, layout.columns()).map_err(error)?;
+    let rope = median(device, reps, || device.heads_rope(&p, layout, None, None).map(|_| ()).map_err(error))?;
+    let h = device.zeros(rows, shape.mlp_inputs).map_err(error)?;
+    let activation = median(device, reps, || if shape.gated { device.swiglu(&h) } else { device.gelu_tanh(&h, None) }.map(|_| ()).map_err(error))?;
+    let bandwidth = |t: f64, bytes: usize| json!({"seconds": t, "gb_per_s": bytes as f64 / t / 1e9});
+    Ok(json!({
+        "rows": rows,
+        "ceiling_bf16_product": ceiling,
+        "products": products,
+        "attention": {"forward": {"seconds": forward, "tflops": flops / forward / 1e12}, "reverse": {"seconds": reverse, "tflops": 2.5 * flops / reverse / 1e12}},
+        "rms_gain": bandwidth(norm, rows * d * (4 + 2)),
+        "heads_rope": bandwidth(rope, rows * layout.columns() * (4 + 2)),
+        "activation": bandwidth(activation, rows * (shape.mlp_inputs * 4 + m * 2)),
+    }))
+}
+
 fn main() -> Result<(), String> {
     log_to_stderr();
     // `products=f32|tf32|bf16` (f32 by default) sets the arithmetic of both programs' products;
@@ -316,7 +386,15 @@ fn main() -> Result<(), String> {
         }
         None => None,
     };
+    // Each kernel class alone at the layer's shapes, and the device's bfloat16 product ceiling (a
+    // product of 8192-square operands: its tiles fill every multiprocessor many times over, so its
+    // rate is the products' attainable one), for comparing devices.
+    let classes = match &decoders {
+        Some((_, p)) => Some(classes(&device, p, sequences, context, reps)?),
+        None => None,
+    };
     let report = json!({
+        "kernel_classes": classes,
         "decoder_blocks": blocks_seconds,
         "model": model.display().to_string(),
         "explanation": kind,

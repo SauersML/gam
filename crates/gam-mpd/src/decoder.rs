@@ -133,6 +133,18 @@ pub struct Decoder {
     angles: Mutex<Vec<(Rotary, usize, Arc<(Tensor, Tensor)>)>>,
 }
 
+/// A layer's shape ([`Decoder::layer_shape`]).
+#[derive(Clone, Copy, Debug)]
+pub struct LayerShape {
+    pub width: usize,
+    pub heads: HeadLayout,
+    pub projections: usize,
+    pub mlp_inputs: usize,
+    pub gated: bool,
+    pub epsilon: f64,
+    pub scale: f64,
+}
+
 /// What a block's reverse pass reads of its forward pass.
 pub struct Tape {
     x: Tensor,
@@ -304,6 +316,18 @@ impl Decoder {
             }
         }
         (forward, reverse)
+    }
+
+    /// The first layer's shape: its heads, the stacked projections' and MLP inputs' rows, whether
+    /// its MLP is gated, and the stream's width (the decoder's layers share one shape).
+    #[must_use]
+    pub fn layer_shape(&self) -> Option<LayerShape> {
+        match (self.blocks.first(), self.blocks.get(1)) {
+            (Some(Block::Attention(a)), Some(Block::Mlp(m))) => {
+                Some(LayerShape { width: self.width, heads: a.layout, projections: a.projections.rows, mlp_inputs: m.input.rows, gated: m.gated, epsilon: a.epsilon, scale: a.scale })
+            }
+            _ => None,
+        }
     }
 
     /// The products' precision outside the blocks (the head's sweep of the vocabulary, the patches).
