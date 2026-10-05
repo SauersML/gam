@@ -384,6 +384,28 @@ struct RowPlan {
     batch: usize,
     total: usize,
 }
+#[derive(Clone, Copy)]
+enum Preparation {
+    Optimize,
+    SequentialScan,
+}
+impl Preparation {
+    fn for_iterations(iterations: usize) -> Self {
+        if iterations == 0 { Self::SequentialScan } else { Self::Optimize }
+    }
+    fn workspace(self, rows: RowPlan) -> RowPlan {
+        match self {
+            Self::Optimize => rows,
+            // scan drops each episode trace before forwarding the next. There are
+            // no group forwards, retained group traces, or reverse passes. Keep the
+            // existing conservative five-trace and attention scratch reserves for
+            // ONE episode; resident batched labels/inputs are charged separately.
+            Self::SequentialScan => RowPlan {
+                episode: rows.episode, batch: rows.episode, total: rows.episode,
+            },
+        }
+    }
+}
 fn row_plan(members: &[Vec<usize>], rows: impl Fn(usize) -> usize) -> Result<RowPlan, String> {
     let mut plan = RowPlan {
         episode: 0,
@@ -440,12 +462,13 @@ fn prepare(
     episodes: &[Episode],
     trainable: &[usize],
     limit: usize,
+    preparation: Preparation,
 ) -> Result<(DeviceProgram, Resident, usize), String> {
     let (expanded, classes) = validate(source, episodes)?;
     let parameters = mul(parameter_elements(source, trainable)?, 8)?;
     let mut p = DeviceProgram::compile_values_bounded(d, &expanded, limit)?;
     let members = group_members(episodes.iter().map(|e| e.group.as_str()));
-    let rows = row_plan(&members, |i| episodes[i].inputs.rows)?;
+    let rows = preparation.workspace(row_plan(&members, |i| episodes[i].inputs.rows)?);
     let mut panels = 0;
     let mut indices = law_code_bytes(&expanded)?;
     // An exact scan copies one episode's raw inputs and target rows out of its batch.
@@ -578,6 +601,7 @@ fn prepare_compact(
     trainable: &[usize],
     limit: usize,
     tile_rows: usize,
+    preparation: Preparation,
 ) -> Result<(DeviceProgram, Resident, usize), String> {
     if episodes.is_empty() || tile_rows == 0 || limit == 0 {
         return Err("nonempty compact episodes, positive tile/budget required".into());
@@ -642,7 +666,7 @@ fn prepare_compact(
         }
     }
     let members = group_members(episodes.iter().map(|e| e.group.as_str()));
-    let rows = row_plan(&members, |i| episodes[i].inputs.rows)?;
+    let rows = preparation.workspace(row_plan(&members, |i| episodes[i].inputs.rows)?);
     let (attention_peak, rotations) = attention_bytes(&prefix, &rows)?;
     let mut planned = add(
         p.operator_numeric_bytes()?,
@@ -1554,7 +1578,7 @@ pub fn measure(
     episodes: &[Episode],
     numeric_bytes: usize,
 ) -> Result<Measurement, String> {
-    let (p, resident, _) = prepare(d, source, episodes, &[], numeric_bytes)?;
+    let (p, resident, _) = prepare(d, source, episodes, &[], numeric_bytes, Preparation::SequentialScan)?;
     scan(&p, &resident)
 }
 fn validate_settings(trainable: &[usize], settings: &Settings) -> Result<(), String> {
@@ -1603,6 +1627,7 @@ pub fn fit_fixed_head(
         trainable,
         settings.numeric_bytes,
         head_tile_rows,
+        Preparation::for_iterations(settings.iterations),
     )?;
     fit_prepared(
         d, source, p, resident, planned, trainable, settings, started,
@@ -1616,7 +1641,7 @@ pub fn measure_fixed_head(
     head_tile_rows: usize,
 ) -> Result<Measurement, String> {
     let (p, resident, _) =
-        prepare_compact(d, source, episodes, &[], numeric_bytes, head_tile_rows)?;
+        prepare_compact(d, source, episodes, &[], numeric_bytes, head_tile_rows, Preparation::SequentialScan)?;
     scan(&p, &resident)
 }
 
@@ -1630,7 +1655,7 @@ pub fn fit(
     let started = Instant::now();
     validate_settings(trainable, &settings)?;
     let (p, resident, planned) = trace::within("fit.prepare", d, || {
-        prepare(d, source, episodes, trainable, settings.numeric_bytes)
+        prepare(d, source, episodes, trainable, settings.numeric_bytes, Preparation::for_iterations(settings.iterations))
     })?;
     fit_prepared(
         d, source, p, resident, planned, trainable, settings, started,
@@ -1649,7 +1674,8 @@ pub fn fit_with_native(
 ) -> Result<Fit, String> {
     let started = Instant::now();
     validate_settings(trainable, &settings)?;
-    let (p, mut resident, base) = prepare(d, source, episodes, trainable, settings.numeric_bytes)?;
+    let (p, mut resident, base) = prepare(d, source, episodes, trainable, settings.numeric_bytes,
+        Preparation::for_iterations(settings.iterations))?;
     let planned = attach_responses(
         &p,
         source,
@@ -1669,7 +1695,7 @@ pub fn measure_with_native(
     responses: &NativeResponses,
     numeric_bytes: usize,
 ) -> Result<Measurement, String> {
-    let (p, mut resident, base) = prepare(d, source, episodes, &[], numeric_bytes)?;
+    let (p, mut resident, base) = prepare(d, source, episodes, &[], numeric_bytes, Preparation::SequentialScan)?;
     attach_responses(&p, source, &mut resident, responses, base, numeric_bytes)?;
     scan(&p, &resident)
 }
@@ -1691,6 +1717,7 @@ pub fn fit_fixed_head_with_native(
         trainable,
         settings.numeric_bytes,
         head_tile_rows,
+        Preparation::for_iterations(settings.iterations),
     )?;
     let planned = attach_responses(
         &p,
@@ -1713,7 +1740,7 @@ pub fn measure_fixed_head_with_native(
     head_tile_rows: usize,
 ) -> Result<Measurement, String> {
     let (p, mut resident, base) =
-        prepare_compact(d, source, episodes, &[], numeric_bytes, head_tile_rows)?;
+        prepare_compact(d, source, episodes, &[], numeric_bytes, head_tile_rows, Preparation::SequentialScan)?;
     attach_responses(&p, source, &mut resident, responses, base, numeric_bytes)?;
     scan(&p, &resident)
 }
@@ -1756,6 +1783,31 @@ fn fit_prepared(
     settings: Settings,
     started: Instant,
 ) -> Result<Fit, String> {
+    if settings.iterations == 0 {
+        // A zero-step fit is measurement of the supplied parameters. Do not create
+        // narrowed copies, moments, snapshots, frozen group traces or a proposal
+        // scan: these would invalidate the sequential preparation bound above.
+        let clock = Instant::now();
+        let measured = exact_scan(&mut p, &resident)?;
+        let exact_seconds = clock.elapsed().as_secs_f64();
+        return Ok(Fit {
+            program: source.clone(),
+            report: Report {
+                settings,
+                trainable: trainable.to_vec(),
+                initial: measured.clone(), best: measured.clone(),
+                final_measurement: measured.clone(), best_step: 0,
+                iterations: vec![Iteration { step: 0, measurement: measured, proposal_objective: None }],
+                planned_numeric_bytes: planned,
+                complete_episode_forward_passes: resident.episodes.len(),
+                complete_episode_reverse_passes: 0,
+                exact_scans: 1,
+                proposal_device: "not_run".into(), proposal_seconds: 0., exact_seconds,
+                seconds: started.elapsed().as_secs_f64(),
+                scope: "Zero-step TRAIN measurement of unchanged source parameters: one F64 scan over complete episodes in input order, with the same equal-weight episode/group aggregation and native-response terms. No proposal forward, reverse, optimizer buffers or narrowed copies. Numeric plan retains all resident batched labels/inputs/flags, compact original labels plus concatenated copies, parameter reserve and conservative single-episode trace/attention/head scratch. Host source/metadata, context/library/allocator scratch excluded; no heldout selection or acceptance certificate.",
+            },
+        });
+    }
     let (mut narrow, planned) = narrow_copies(
         d,
         &p,
@@ -2254,7 +2306,7 @@ mod tests {
             ],
         )]);
         let d = Device::host();
-        let (p, mut resident, base) = prepare(&d, &source, &episodes, &[0], 1 << 24).unwrap();
+        let (p, mut resident, base) = prepare(&d, &source, &episodes, &[0], 1 << 24, Preparation::Optimize).unwrap();
         let planned =
             attach_responses(&p, &source, &mut resident, &targets, base, 1 << 24).unwrap();
         assert!(planned > base);
@@ -2326,7 +2378,7 @@ mod tests {
             ],
         )]);
         let d = Device::host();
-        let (p, mut resident, base) = prepare(&d, &source, &episodes, &[0], 1 << 24).unwrap();
+        let (p, mut resident, base) = prepare(&d, &source, &episodes, &[0], 1 << 24, Preparation::Optimize).unwrap();
         attach_responses(&p, &source, &mut resident, &targets, base, 1 << 24).unwrap();
         let gradient = gradient(&p, &resident, "active", &[0]).unwrap();
         let actual = d.download(&gradient[&0]).unwrap();
@@ -2373,7 +2425,7 @@ mod tests {
             ),
         ];
         let d = Device::host();
-        let (p, resident, _) = prepare(&d, &source, &episodes, &[0], 1 << 24).expect("prepare");
+        let (p, resident, _) = prepare(&d, &source, &episodes, &[0], 1 << 24, Preparation::Optimize).expect("prepare");
         let measurement = scan(&p, &resident).expect("measure");
         assert_eq!(measurement.active_group, "active");
         let mean = (measurement.episodes[0].mean_kl + measurement.episodes[1].mean_kl) / 2.;
@@ -2412,7 +2464,7 @@ mod tests {
         )];
         let d = Device::host();
         let (p, resident, _) =
-            prepare(&d, &source, &episodes, &[0], 1 << 24).expect("prepare attention");
+            prepare(&d, &source, &episodes, &[0], 1 << 24, Preparation::Optimize).expect("prepare attention");
         let gradients = gradient(&p, &resident, "run", &[0]).expect("causal gradient");
         let actual = d.download(&gradients[&0]).expect("download")[[0, 0]];
         assert!((actual - finite_difference(&source, &episodes, "run")).abs() < 1e-8);
@@ -2440,7 +2492,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let d = Device::host();
-        let (p, resident, _) = prepare(&d, &source, &episodes, &[0], 1 << 24).unwrap();
+        let (p, resident, _) = prepare(&d, &source, &episodes, &[0], 1 << 24, Preparation::Optimize).unwrap();
         let measured = scan(&p, &resident).unwrap();
         let groups = BTreeMap::from([("run".into(), (0..8).collect())]);
         let schedule = BatchSchedule {
@@ -2548,7 +2600,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let d = Device::host();
-        let (p, resident, _) = prepare(&d, &source, &episodes, &[0], 1 << 24).unwrap();
+        let (p, resident, _) = prepare(&d, &source, &episodes, &[0], 1 << 24, Preparation::Optimize).unwrap();
         let measured = scan(&p, &resident).unwrap();
         let groups = BTreeMap::from([("first".into(), vec![0]), ("second".into(), vec![1, 2])]);
         let schedule = BatchSchedule {
@@ -2666,6 +2718,80 @@ mod tests {
         p
     }
     #[test]
+    fn sequential_measurement_and_zero_step_fit_keep_broad_episode_inventory_within_budget() {
+        let source = with_fixed_head(program(true, 0.4), 1.);
+        let teacher = with_fixed_head(program(true, 1.1), 1.);
+        let full = (0..6).map(|i| episode(
+            &source, &teacher, &format!("episode-{i}"), if i < 4 { "alpha" } else { "beta" },
+            Array2::from_shape_fn((2 + i % 2, 2), |(r, c)|
+                (1 + r + i) as f64 * if c == 0 { 0.2 } else { -0.3 }),
+            None, if i % 2 == 0 { Some(vec![false, true]) } else { None },
+        )).collect::<Vec<_>>();
+        let d = Device::host();
+        let targeter = fixed_head_target::Teacher::new(&d, &teacher, 2, 1 << 24).unwrap();
+        let compact = full.iter().map(|e| FixedHeadEpisode {
+            label: e.label.clone(), group: e.group.clone(), inputs: e.inputs.clone(),
+            target: targeter.target(&e.inputs, e.scored.as_deref()).unwrap(),
+        }).collect::<Vec<_>>();
+        for use_compact in [false, true] {
+            let prepare_at = |trainable: &[usize], limit, mode| {
+                if use_compact {
+                    prepare_compact(&d, &source, &compact, trainable, limit, 2, mode)
+                } else {
+                    prepare(&d, &source, &full, trainable, limit, mode)
+                }
+            };
+            let measure_at = |limit| {
+                if use_compact {
+                    measure_fixed_head(&d, &source, &compact, limit, 2)
+                } else {
+                    measure(&d, &source, &full, limit)
+                }
+            };
+            let fit_at = |settings| {
+                if use_compact {
+                    fit_fixed_head(&d, &source, &compact, &[0], settings, 2)
+                } else {
+                    fit(&d, &source, &full, &[0], settings)
+                }
+            };
+            let scan_plan = prepare_at(&[], 1 << 24, Preparation::SequentialScan).unwrap().2;
+            let zero_plan = prepare_at(&[0], 1 << 24, Preparation::SequentialScan).unwrap().2;
+            let (p, resident, optimizing_plan) = prepare_at(&[0], 1 << 24, Preparation::Optimize).unwrap();
+            let reference = scan(&p, &resident).unwrap();
+            drop((p, resident));
+            assert!(zero_plan < optimizing_plan);
+            let budget = zero_plan + (optimizing_plan - zero_plan) / 2;
+            // The old group-forward plan rejected this budget even for measurement.
+            assert!(prepare_at(&[], budget, Preparation::Optimize).is_err());
+            assert!(measure_at(scan_plan - 1).is_err());
+            let measured = measure_at(budget).unwrap();
+            assert_eq!(serde_json::to_value(&measured).unwrap(), serde_json::to_value(&reference).unwrap());
+            assert_eq!(measured.episodes.len(), full.len());
+            assert_eq!(measured.groups.len(), 2);
+            assert_eq!(measured.episodes[0].scored_rows, 1);
+            assert_eq!(measured.episodes[1].scored_rows, 3);
+            let zero = Settings { iterations: 0, numeric_bytes: budget,
+                arithmetic: FitArithmetic::F32, ..settings() };
+            let fitted = fit_at(zero.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&fitted.report.final_measurement).unwrap(),
+                serde_json::to_value(&reference).unwrap());
+            assert_eq!(fitted.program.operators, source.operators);
+            assert_eq!(fitted.report.planned_numeric_bytes, zero_plan);
+            assert_eq!(fitted.report.complete_episode_forward_passes, full.len());
+            assert_eq!(fitted.report.complete_episode_reverse_passes, 0);
+            assert_eq!(fitted.report.exact_scans, 1);
+            assert_eq!(fitted.report.proposal_seconds, 0.);
+            assert_eq!(fitted.report.proposal_device, "not_run");
+            assert_eq!(fitted.report.iterations.len(), 1);
+            assert!(fitted.report.iterations[0].proposal_objective.is_none());
+            assert!(fit_at(Settings { numeric_bytes: zero_plan - 1, ..zero.clone() }).is_err());
+            assert!(fit_at(Settings { iterations: 1, ..zero }).is_err(),
+                "nonzero fits must retain the original optimizing memory bound");
+        }
+    }
+
+    #[test]
     fn compact_labels_match_full_kl_and_attention_rms_parameter_gradients() {
         let source = with_fixed_head(program(true, 0.4), 1.);
         let teacher = with_fixed_head(program(true, 1.1), 1.);
@@ -2689,9 +2815,9 @@ mod tests {
                 .target(&full[0].inputs, full[0].scored.as_deref())
                 .expect("project teacher"),
         }];
-        let (a, ae, _) = prepare(&d, &source, &full, &[0], 1 << 24).expect("full prepare");
+        let (a, ae, _) = prepare(&d, &source, &full, &[0], 1 << 24, Preparation::Optimize).expect("full prepare");
         let (b, be, _) =
-            prepare_compact(&d, &source, &compact, &[0], 1 << 24, 2).expect("compact prepare");
+            prepare_compact(&d, &source, &compact, &[0], 1 << 24, 2, Preparation::Optimize).expect("compact prepare");
         let av = scan(&a, &ae).expect("full score");
         let bv = scan(&b, &be).expect("compact score");
         assert!((av.objective - bv.objective).abs() < 2e-14);
@@ -2743,8 +2869,8 @@ mod tests {
                 ),
             ],
         )]);
-        let (a, mut ae, ap) = prepare(&d, &source, &full, &[0], 1 << 24).unwrap();
-        let (b, mut be, bp) = prepare_compact(&d, &source, &compact, &[0], 1 << 24, 2).unwrap();
+        let (a, mut ae, ap) = prepare(&d, &source, &full, &[0], 1 << 24, Preparation::Optimize).unwrap();
+        let (b, mut be, bp) = prepare_compact(&d, &source, &compact, &[0], 1 << 24, 2, Preparation::Optimize).unwrap();
         attach_responses(&a, &source, &mut ae, &responses, ap, 1 << 24).unwrap();
         attach_responses(&b, &source, &mut be, &responses, bp, 1 << 24).unwrap();
         let full_joint = measure_with_native(&d, &source, &full, &responses, 1 << 24).unwrap();

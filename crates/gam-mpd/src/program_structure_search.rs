@@ -71,6 +71,11 @@ pub struct Settings {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LearnedDAGSettings {
+    /// Derive bounded connection edits from the current native computation.
+    /// When present, replaces blind expression enumeration for this family.
+    /// The unchanged parent is recorded as a control, never a discovery proposal.
+    #[serde(default)]
+    pub native_parent: Option<program_learned_dag::parent::Settings>,
     pub region_limits: program_joint_regions::Limits,
     pub grammar: program_learned_dag::Settings,
     pub max_enumerations_per_parent: usize,
@@ -102,6 +107,10 @@ pub struct SharedDAGSettings {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Mutation {
+    ReuseNativeExpression {
+        region: program_joint_regions::Region,
+        proposal: program_learned_dag::parent::Proposal,
+    },
     #[serde(rename = "synthesize_learned_dag")]
     SynthesizeLearnedDAG {
         region: program_joint_regions::Region,
@@ -141,7 +150,7 @@ impl Mutation {
             | Self::ReuseExistingRule { region, .. }
             | Self::SynthesizeExpression { region, .. } => Some(region),
             Self::ExtractAndReuse { target_region, .. } => Some(target_region),
-            Self::SynthesizeSharedDAG { .. } | Self::SynthesizeLearnedDAG { .. } => None,
+            Self::SynthesizeSharedDAG { .. } | Self::SynthesizeLearnedDAG { .. } | Self::ReuseNativeExpression { .. } => None,
         }
     }
 }
@@ -267,6 +276,8 @@ pub struct LearnedDAGEnumeration {
     pub depth: usize,
     pub region: Option<program_joint_regions::Region>,
     pub inventory: Option<program_learned_dag::Inventory>,
+    #[serde(default)]
+    pub native_inventory: Option<program_learned_dag::parent::Inventory>,
     pub error: Option<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,7 +408,9 @@ fn validate_metrics(measured: &[Metric], limits: &[Metric], family: &str) -> Res
     }
     Ok(())
 }
-fn validate_evaluation(e: &Evaluation, constraints: &Constraints) -> Result<(), String> {
+/// Check a measured stage against the same named TRAIN limits used for admission.
+/// Callers must supply the validated constraints declared for their search.
+pub fn validate_evaluation(e: &Evaluation, constraints: &Constraints) -> Result<(), String> {
     validate_metrics(&e.fidelity, &constraints.max_fidelity, "fidelity")?;
     validate_metrics(&e.local_errors, &constraints.max_local_errors, "local")?;
     validate_metrics(
@@ -1084,6 +1097,91 @@ fn shared_dag_moves(
     moves
 }
 
+/// Preserve cost order within structural strata, but rotate strata before
+/// spending another callback on the same kind of equation. Inventory cost order
+/// alone can bury full-width nonlinear equations behind many affine proposals.
+/// This is a syntactic scheduling policy, not evidence of native correspondence.
+fn learned_proposal_order(
+    proposals: &[program_learned_dag::Proposal],
+    input_widths: &[usize],
+    output_widths: &[usize],
+) -> Vec<usize> {
+    use program_learned_dag::{Expr as LearnedExpr, TypeRef};
+    use std::cmp::Reverse;
+    // (operations, has affine, learned nonlinear, affine/nonlinear/affine chain,
+    // widest affine output, widest affine below a nonlinearity). Interfaces,
+    // not latent spelling, determine width.
+    fn shape(e: &LearnedExpr, inputs: &[usize], outputs: &[usize]) -> (usize, bool, bool, bool, usize, usize) {
+        match e {
+            LearnedExpr::Argument(_) => (0, false, false, false, 0, 0),
+            LearnedExpr::Unary(_, x) => {
+                let (n, affine, nonlinear, chain, width, nonlinear_width) = shape(x, inputs, outputs);
+                (n + 1, affine, nonlinear || affine, chain, width, nonlinear_width.max(width))
+            }
+            LearnedExpr::Affine { output, input, .. } => {
+                let (n, _, nonlinear, chain, width, nonlinear_width) = shape(input, inputs, outputs);
+                let own_width = match output {
+                    TypeRef::Input(i) => inputs[*i],
+                    TypeRef::Exit(i) => outputs[*i],
+                    TypeRef::Latent { width } => *width,
+                };
+                (n + 1, true, nonlinear, chain || nonlinear, width.max(own_width), nonlinear_width)
+            }
+            LearnedExpr::Binary(op, a, b) => {
+                let a = shape(a, inputs, outputs);
+                let b = shape(b, inputs, outputs);
+                let product = *op == crate::composed_rule_search::Binary::Multiply && (a.1 || b.1);
+                let nonlinear_width = a.5.max(b.5).max(if product { a.4.max(b.4) } else { 0 });
+                (a.0 + b.0 + 1, a.1 || b.1, a.2 || b.2 || product, a.3 || b.3, a.4.max(b.4), nonlinear_width)
+            }
+        }
+    }
+    fn laws(e: &LearnedExpr, unary: &mut BTreeSet<crate::composed_rule_search::Unary>, binary: &mut BTreeSet<crate::composed_rule_search::Binary>) {
+        match e {
+            LearnedExpr::Argument(_) => {},
+            LearnedExpr::Unary(op, x) => { unary.insert(*op); laws(x, unary, binary); },
+            LearnedExpr::Affine { input, .. } => laws(input, unary, binary),
+            LearnedExpr::Binary(op, a, b) => { binary.insert(*op); laws(a, unary, binary); laws(b, unary, binary); },
+        }
+    }
+    let mut strata = BTreeMap::new();
+    for (index, proposal) in proposals.iter().enumerate() {
+        if proposal.trainable_operator_count == 0 {
+            continue;
+        }
+        let shapes = proposal.expressions.iter()
+            .map(|e| shape(e, input_widths, output_widths)).collect::<Vec<_>>();
+        let mut nonlinear_laws = BTreeSet::new();
+        let mut binary_laws = BTreeSet::new();
+        for e in &proposal.expressions { laws(e, &mut nonlinear_laws, &mut binary_laws); }
+        let key = (
+            Reverse(shapes.iter().any(|s| s.3)),
+            Reverse(shapes.iter().any(|s| s.2)),
+            Reverse(shapes.iter().all(|s| s.1)),
+            Reverse(shapes.iter().map(|s| s.0).max().unwrap_or(0)),
+            Reverse(shapes.iter().map(|s| s.5).max().unwrap_or(0)),
+            Reverse(shapes.iter().map(|s| s.4).max().unwrap_or(0)),
+            // Rotate single-law equations before mixed-law variants; lexical
+            // set order otherwise puts {Silu, GeluTanh} ahead of {GeluTanh}.
+            nonlinear_laws.len() + binary_laws.len(),
+            nonlinear_laws,
+            binary_laws,
+        );
+        strata.entry(key).or_insert_with(std::collections::VecDeque::new).push_back(index);
+    }
+    let mut queues = strata.into_values().collect::<std::collections::VecDeque<_>>();
+    let mut order = Vec::new();
+    while let Some(mut queue) = queues.pop_front() {
+        if let Some(index) = queue.pop_front() {
+            order.push(index);
+            if !queue.is_empty() {
+                queues.push_back(queue);
+            }
+        }
+    }
+    order
+}
+
 fn learned_dag_moves(
     artifact: &Artifact,
     settings: &Settings,
@@ -1105,6 +1203,7 @@ fn learned_dag_moves(
                 depth,
                 region: None,
                 inventory: None,
+                native_inventory: None,
                 error: Some(error),
             });
             return vec![];
@@ -1133,8 +1232,26 @@ fn learned_dag_moves(
             depth,
             region: Some(region.clone()),
             inventory: None,
+            native_inventory: None,
             error: None,
         };
+        if let Some(parent_settings) = &config.native_parent {
+            match program_learned_dag::parent::enumerate(artifact, &region, parent_settings) {
+                Ok(inventory) => {
+                    report.counts.learned_dag_proposals += inventory.proposals.len();
+                    report.counts.learned_dag_enumerations_truncated += usize::from(inventory.truncated);
+                    lists.push_back(inventory.proposals.iter().map(|proposal| {
+                        Mutation::ReuseNativeExpression {
+                            region: region.clone(), proposal: proposal.clone(),
+                        }
+                    }).collect::<Vec<_>>().into_iter());
+                    record.native_inventory = Some(inventory);
+                }
+                Err(error) => record.error = Some(error),
+            }
+            report.learned_dag_enumerations.push(record);
+            continue;
+        }
         match program_learned_dag::enumerate(
             artifact,
             &region,
@@ -1152,11 +1269,13 @@ fn learned_dag_moves(
                     usize::from(inventory.truncated);
                 // Parameter-free expressions have their own proposal family. Do
                 // not spend this family's reserved fitting budget on them.
+                let interfaces = artifact.program.interfaces().expect("enumerated typed artifact");
+                let input_widths = region.current_reads.iter().map(|n| interfaces[*n].width()).collect::<Vec<_>>();
+                let output_widths = region.current_writes.iter().map(|n| interfaces[*n].width()).collect::<Vec<_>>();
                 lists.push_back(
-                    inventory
-                        .proposals
-                        .iter()
-                        .filter(|p| p.trainable_operator_count > 0)
+                    learned_proposal_order(&inventory.proposals, &input_widths, &output_widths)
+                        .into_iter()
+                        .map(|i| &inventory.proposals[i])
                         .map(|p| Mutation::SynthesizeLearnedDAG {
                             region: region.clone(),
                             expressions: p.expressions.clone(),
@@ -1537,7 +1656,7 @@ where
                 }
                 let is_expression = matches!(mutation, Mutation::SynthesizeExpression { .. });
                 let is_shared = matches!(mutation, Mutation::SynthesizeSharedDAG { .. });
-                let is_learned = matches!(mutation, Mutation::SynthesizeLearnedDAG { .. });
+                let is_learned = matches!(mutation, Mutation::SynthesizeLearnedDAG { .. } | Mutation::ReuseNativeExpression { .. });
                 let counts = &result.report.counts;
                 let family = if is_learned {
                     ProposalFamily::LearnedDAG
@@ -1609,6 +1728,18 @@ where
                 let mut initialization = None;
                 let mut local_fit = None;
                 let proposed = match &mutation {
+                    Mutation::ReuseNativeExpression { region, proposal } => {
+                        let config = settings.learned_dag_search.as_ref()
+                            .and_then(|config| config.native_parent.as_ref())
+                            .ok_or("native parent proposal configuration missing")?;
+                        program_learned_dag::parent::apply_hypothesis(&parent.artifact, region, proposal, config)
+                            .map(|applied| {
+                                local_fit = Some(applied.local_fit);
+                                learned_parameters = Some(applied.trainable_operator_ids);
+                                initialization = Some(applied.initialization);
+                                applied.artifact
+                            })
+                    }
                     Mutation::SynthesizeLearnedDAG {
                         region,
                         expressions,
@@ -1886,6 +2017,81 @@ mod tests {
             output: 4,
         }
     }
+    #[test]
+    fn learned_scheduler_treats_learned_products_as_nonlinear() {
+        use crate::composed_rule_search::Binary;
+        use program_learned_dag::{Expr as E, Proposal, TypeRef};
+        let affine = E::Affine { parameter: 0, output: TypeRef::Exit(0),
+            input: Box::new(E::Argument(0)), bias: false };
+        let product = E::Binary(Binary::Multiply, Box::new(affine.clone()), Box::new(affine.clone()));
+        let sum = E::Binary(Binary::Add, Box::new(affine.clone()), Box::new(affine.clone()));
+        let proposals = [affine, sum, product].into_iter().map(|e| Proposal {
+            expressions: vec![e.clone(), e], output_has_learned_ancestor: vec![true, true],
+            compiled_node_count: 4, parameter_elements: 4, trainable_operator_count: 1,
+        }).collect::<Vec<_>>();
+        let order = learned_proposal_order(&proposals, &[2], &[2, 2]);
+        assert_eq!(order[0], 2, "shared product must not be scheduled as an affine-only equation");
+        assert_eq!(order.iter().copied().collect::<BTreeSet<_>>(), BTreeSet::from([0, 1, 2]));
+    }
+
+    #[test]
+    fn learned_scheduler_rotates_single_laws_before_mixed_law_sets() {
+        use crate::composed_rule_search::Unary;
+        use program_learned_dag::{Expr as E, Proposal, TypeRef};
+        let value = |law| E::Unary(law, Box::new(E::Affine {
+            parameter: 0, output: TypeRef::Exit(0),
+            input: Box::new(E::Argument(0)), bias: false,
+        }));
+        let silu = value(Unary::Silu);
+        let gelu = value(Unary::GeluTanh);
+        let proposals = [vec![silu.clone(), silu.clone()], vec![silu, gelu.clone()], vec![gelu.clone(), gelu]]
+            .into_iter().map(|expressions| Proposal {
+                expressions, output_has_learned_ancestor: vec![true, true],
+                compiled_node_count: 3, parameter_elements: 4, trainable_operator_count: 1,
+            }).collect::<Vec<_>>();
+        assert_eq!(learned_proposal_order(&proposals, &[2], &[2, 2]), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn learned_scheduler_reaches_generated_full_width_nonlinear_equations_early() {
+        use crate::composed_rule_search::{Binary, Unary};
+        use crate::operator_program::Interface;
+        use program_learned_dag::{Expr as E, TypeRef};
+        let grammar = program_learned_dag::Settings {
+            latent_widths: vec![768, 3072],
+            unary: vec![Unary::Silu, Unary::GeluTanh],
+            binary: vec![Binary::Add, Binary::Multiply],
+            affine_bias: false, require_shared: true,
+            max_operations: 3, max_affine_parameters: 3,
+            max_parameter_elements: 6_000_000, max_expression_states: 4096,
+            max_tuple_checks: 8192, max_tuples: 128, max_body_nodes: 12, seed: 17,
+        };
+        let inputs = [Interface::native(768).unwrap()];
+        let outputs = [Interface::native(3072).unwrap(), Interface::native(768).unwrap()];
+        let inventory = program_learned_dag::enumerate_interfaces(&inputs, &outputs, &grammar).unwrap();
+        let native_shape = |p: &program_learned_dag::Proposal| {
+            let E::Unary(Unary::GeluTanh, up) = &p.expressions[0] else { return false; };
+            let E::Affine { output, input, .. } = up.as_ref() else { return false; };
+            let width = match output {
+                TypeRef::Input(i) => inputs[*i].width(),
+                TypeRef::Exit(i) => outputs[*i].width(),
+                TypeRef::Latent { width } => *width,
+            };
+            width == 3072 && **input == E::Argument(0)
+                && matches!(&p.expressions[1], E::Affine { input, .. } if **input == p.expressions[0])
+        };
+        assert!(inventory.proposals.iter().any(native_shape),
+            "bounded grammar must generate full-width native-shape equation before scheduling");
+        let order = learned_proposal_order(&inventory.proposals, &[768], &[3072, 768]);
+        assert!(order.iter().take(2).any(|i| native_shape(&inventory.proposals[*i])),
+            "two callbacks for this region must reach full-width shared native-law equation");
+        assert_eq!(order.len(), inventory.proposals.iter().filter(|p| p.trainable_operator_count > 0).count());
+        assert_eq!(order.iter().copied().collect::<BTreeSet<_>>().len(), order.len());
+        assert_eq!(order, learned_proposal_order(&inventory.proposals, &[768], &[3072, 768]));
+        let first = &inventory.proposals[order[0]];
+        assert!(first.output_has_learned_ancestor.iter().all(|b| *b));
+    }
+
     fn settings(depth: usize) -> Settings {
         Settings {
             region_limits: Limits {
@@ -2046,4 +2252,70 @@ mod tests {
             array![[6.], [9.], [9.], [6.]]
         );
     }
+    #[test]
+    fn native_parent_search_calls_existing_fitter_only_for_changed_programs() {
+        use crate::operator_program::Law;
+        let native = OperatorProgram {
+            declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: 1 }], parameters: 0 },
+            bases: vec![], rules: vec![], operators: vec![dense(2.), dense(3.)],
+            nodes: vec![Node::Raw { slot: 0 },
+                Node::Affine { terms: vec![(0, 0)], bias: None },
+                Node::Pointwise { input: 1, laws: vec![Law::Relu] },
+                Node::Affine { terms: vec![(0, 0)], bias: None },
+                Node::Pointwise { input: 3, laws: vec![Law::Relu] },
+                Node::Affine { terms: vec![(2, 1)], bias: None },
+                Node::Affine { terms: vec![(4, 1)], bias: None },
+                Node::Concat { parts: vec![5, 6] }], output: 7,
+        };
+        let source = canonical(&Artifact::native(&native).unwrap()).unwrap().0;
+        let mut config = settings(1);
+        config.max_callback_calls = 8;
+        config.max_move_attempts = 64;
+        config.learned_dag_search = Some(LearnedDAGSettings {
+            native_parent: Some(program_learned_dag::parent::Settings {
+                max_edit_checks: 128, max_proposals: 16, max_body_nodes: 16, max_parameter_elements: 32,
+            }),
+            region_limits: program_joint_regions::Limits {
+                max_internal_nodes: 6, max_inputs: 4, max_exits: 4, max_regions: 32, max_states: 512,
+            },
+            // Deliberately incapable blind grammar. The native mode must use its
+            // parent graph and its own declared edit budget instead.
+            grammar: program_learned_dag::Settings {
+                latent_widths: vec![], unary: vec![], binary: vec![], affine_bias: false,
+                require_shared: false, max_operations: 0, max_affine_parameters: 0,
+                max_parameter_elements: 0, max_expression_states: 0, max_tuple_checks: 0,
+                max_tuples: 0, max_body_nodes: 0, seed: 0,
+            },
+            max_enumerations_per_parent: 16, max_move_attempts: 64, max_callback_calls: 8,
+        });
+        // Native-vs-itself is exactly zero on every declared axis. The callback
+        // below deliberately refuses to fabricate measurements for any edit.
+        let axis = |name: &str, value| vec![Metric { name: name.into(), value }];
+        let evaluation = Evaluation { fidelity: axis("run", 0.), local_errors: axis("local", 0.),
+            intervention_errors: axis("intervention", 0.), description_bits: 0. };
+        let constraints = Constraints { max_fidelity: axis("run", 1.),
+            max_local_errors: axis("local", 1.), max_intervention_errors: axis("intervention", 1.) };
+        let mut calls = 0;
+        let result = search(&native, EvaluatedArtifact { artifact: source, evaluation },
+            &config, &constraints, |request| {
+                let Mutation::ReuseNativeExpression { proposal, .. } = request.mutation
+                    else { panic!("reserved callbacks must use native edits"); };
+                assert!(proposal.edit.is_some(), "exact parent controls must not be fitted as discoveries");
+                let local = request.local_fit.expect("same standalone local fitter contract");
+                assert_eq!(local.owner_mapping.len(), request.trainable_operator_ids.len());
+                assert_eq!(request.initialization.unwrap().random_elements, 0);
+                assert_eq!(request.initialization.unwrap().inherited_elements, proposal.parameter_elements);
+                calls += 1;
+                // This test verifies scheduling and provenance, not fidelity or
+                // a scientific result. A failed fitting callback must stay failed.
+                Err("deliberately unmeasured hypothesis".into())
+            }).unwrap();
+        assert!(calls > 0, "native reuse hypotheses must reach the existing fitting callback");
+        assert_eq!(calls, result.report.counts.learned_dag_callback_calls);
+        assert!(calls <= 8);
+        assert_eq!(result.report.counts.fitted_children, 0);
+        assert!(result.report.learned_dag_enumerations.iter().any(|r|
+            r.native_inventory.as_ref().is_some_and(|i| i.control.edit.is_none() && !i.proposals.is_empty())));
+    }
+
 }

@@ -1930,6 +1930,69 @@ fn structure_evaluation(
         description_bits: structural_cost(artifact, costs)?.total() as f64,
     })
 }
+
+struct StructuralFitStage {
+    artifact: Artifact,
+    local: gam_mpd::acceptance::LocalMeasure,
+    measurement: resident_causal_fit::Measurement,
+    evaluation: StructureEvaluation,
+}
+
+fn measure_structural_fit_stage(
+    d: &Device,
+    candidate: &Artifact,
+    local: &gam_mpd::acceptance::Local<'_>,
+    training: &CausalEpisodes,
+    cache: Option<&CanonicalArtifactCache>,
+    numeric_bytes: usize,
+    costs: &mut CostCache,
+) -> Result<StructuralFitStage, String> {
+    let (artifact, _, _) = canonical_using(candidate, cache)?;
+    let local = local.measure(&artifact)?;
+    let measurement = training.measure(d, &artifact.program, None, numeric_bytes)?;
+    let evaluation = structure_evaluation(
+        &artifact, &measurement, local.worst().map_or(0., |b| b.worst), costs,
+    )?;
+    Ok(StructuralFitStage { artifact, local, measurement, evaluation })
+}
+
+fn structural_stage_evidence(
+    stage: &Result<StructuralFitStage, String>,
+    constraints: &program_structure_search::Constraints,
+) -> Value {
+    match stage {
+        Ok(stage) => json!({"train":stage.measurement,"local":stage.local,
+            "evaluation":stage.evaluation,
+            "constraint_error":program_structure_search::validate_evaluation(&stage.evaluation, constraints).err()}),
+        Err(error) => json!({"stage_error":error}),
+    }
+}
+
+fn select_structural_fit_stage(
+    prefit: Result<StructuralFitStage, String>,
+    refinement: Result<StructuralFitStage, String>,
+    constraints: &program_structure_search::Constraints,
+) -> Result<(StructuralFitStage, &'static str), String> {
+    // These are two snapshots of the proposed replacement, never a native fallback.
+    // Feasibility precedes the driver's pure-KL ranking objective. Within the limits,
+    // KL improvement may legitimately trade against Local; C32 breaks KL ties.
+    if let Ok(before) = &prefit {
+        if program_structure_search::validate_evaluation(&before.evaluation, constraints).is_ok() {
+            let improved = refinement.as_ref().is_ok_and(|after| {
+                program_structure_search::validate_evaluation(&after.evaluation, constraints).is_ok()
+                    && (after.evaluation.fidelity[0].value, after.evaluation.description_bits)
+                        < (before.evaluation.fidelity[0].value, before.evaluation.description_bits)
+            });
+            if !improved {
+                return prefit.map(|stage| (stage, "local_prefit"));
+            }
+        }
+    }
+    // An infeasible local fit must not rescue a failed refinement. The ordinary
+    // search admission validator will reject a measured but infeasible refinement.
+    refinement.map(|stage| (stage, "composed_refinement"))
+}
+
 fn frozen_structural_ids(
     frontier: &[usize],
     records: &[program_structure_search::CandidateRecord],
@@ -1944,6 +2007,7 @@ fn frozen_structural_ids(
                     Mutation::SynthesizeExpression { .. }
                         | Mutation::SynthesizeSharedDAG { .. }
                         | Mutation::SynthesizeLearnedDAG { .. }
+                        | Mutation::ReuseNativeExpression { .. }
                 )
             )
         })
@@ -2383,6 +2447,8 @@ fn structural_run(
                     return Err("fixed native edit directions cannot be fitted".into());
                 }
                 let mut fitted_responses = None;
+                let mut local_prefit = None;
+                let mut selected_stage = None;
                 if !request.trainable_operator_ids.is_empty() {
                     if let (Some(config), Some(binding)) = (&structural.local_fit, request.local_fit) {
                         let (panels, provenance) = capture_structural_local_targets(
@@ -2397,56 +2463,105 @@ fn structural_run(
                         binding.transfer(&local_program, &mut candidate)?;
                         save(&root.join("LOCAL_NONLINEAR_PREFIT.json"), &nonlinear)?;
                         save(&root.join("LOCAL_LINEAR_PREFIT.json"), &linear)?;
+                        let stage = measure_structural_fit_stage(
+                            d, &candidate, &local, &training, cache.as_ref(),
+                            settings.fit.numeric_bytes, costs,
+                        );
+                        if let Ok(stage) = &stage {
+                            std::fs::write(root.join("local-prefit.artifact"), stage.artifact.to_bytes()?)
+                                .map_err(|e| e.to_string())?;
+                        }
+                        save(&root.join("LOCAL_PREFIT_TRAIN.json"),
+                            &structural_stage_evidence(&stage, &structural.constraints))?;
+                        local_prefit = Some(stage);
                     }
-                    let fitted = if let Some(weight) = structural.native_response_weight {
-                        let (response_targets, provenance) = if let Some(edits) = parameter_edits {
-                            parameter_edit_response_targets(
+                    let fitted = (|| -> Result<resident_causal_fit::Fit, String> {
+                        if let Some(weight) = structural.native_response_weight {
+                            let (response_targets, provenance) = if let Some(edits) = parameter_edits {
+                                parameter_edit_response_targets(
+                                    d,
+                                    edits,
+                                    &controlled,
+                                    original_native,
+                                    settings,
+                                    family,
+                                    &settings.cases,
+                                    &candidate,
+                                    &training.metadata,
+                                    weight,
+                                    settings.teacher_numeric_bytes,
+                                )?
+                            } else {
+                                native_response_targets_records(
+                                    d,
+                                    &controlled.program,
+                                    &candidate,
+                                    &training.metadata,
+                                    weight,
+                                    settings.teacher_numeric_bytes,
+                                )?
+                            };
+                            save(&root.join("NATIVE_RESPONSE_TARGETS.json"), &provenance)?;
+                            let fitted = training.fit(
                                 d,
-                                edits,
-                                &controlled,
-                                original_native,
-                                settings,
-                                family,
-                                &settings.cases,
-                                &candidate,
-                                &training.metadata,
-                                weight,
-                                settings.teacher_numeric_bytes,
-                            )?
+                                &candidate.program,
+                                Some(&response_targets),
+                                request.trainable_operator_ids,
+                                settings.fit.clone(),
+                            )?;
+                            fitted_responses = Some(response_targets);
+                            Ok(fitted)
                         } else {
-                            native_response_targets_records(
+                            training.fit(
                                 d,
-                                &controlled.program,
-                                &candidate,
-                                &training.metadata,
-                                weight,
-                                settings.teacher_numeric_bytes,
-                            )?
-                        };
-                        save(&root.join("NATIVE_RESPONSE_TARGETS.json"), &provenance)?;
-                        let fitted = training.fit(
-                            d,
-                            &candidate.program,
-                            Some(&response_targets),
-                            request.trainable_operator_ids,
-                            settings.fit.clone(),
-                        )?;
-                        fitted_responses = Some(response_targets);
-                        fitted
-                    } else {
-                        training.fit(
-                            d,
-                            &candidate.program,
-                            None,
-                            request.trainable_operator_ids,
-                            settings.fit.clone(),
-                        )?
+                                &candidate.program,
+                                None,
+                                request.trainable_operator_ids,
+                                settings.fit.clone(),
+                            )
+                        }
+                    })();
+                    let refinement_error = match fitted {
+                        Ok(fitted) => {
+                            save(&root.join("FIT.json"),
+                                &serde_json::to_value(&fitted.report).map_err(|e| e.to_string())?)?;
+                            candidate.program = fitted.program;
+                            None
+                        }
+                        Err(error) => {
+                            save(&root.join("FIT.json"), &json!({"status":"failed","error":error}))?;
+                            if local_prefit.is_none() {
+                                return Err(error);
+                            }
+                            Some(format!("composed refinement failed: {error}"))
+                        }
                     };
-                    save(
-                        &root.join("FIT.json"),
-                        &serde_json::to_value(&fitted.report).map_err(|e| e.to_string())?,
-                    )?;
-                    candidate.program = fitted.program;
+                    if let Some(prefit) = local_prefit {
+                        let refinement = match refinement_error {
+                            Some(error) => Err(error),
+                            None => measure_structural_fit_stage(
+                                d, &candidate, &local, &training, cache.as_ref(),
+                                settings.fit.numeric_bytes, costs,
+                            ),
+                        };
+                        if let Ok(stage) = &refinement {
+                            std::fs::write(root.join("composed-refinement.artifact"), stage.artifact.to_bytes()?)
+                                .map_err(|e| e.to_string())?;
+                        }
+                        save(&root.join("COMPOSED_REFINEMENT_TRAIN.json"),
+                            &structural_stage_evidence(&refinement, &structural.constraints))?;
+                        let (stage, selected) = select_structural_fit_stage(
+                            prefit, refinement, &structural.constraints,
+                        )?;
+                        save(&root.join("FIT_STAGE_SELECTION.json"), &json!({
+                            "selected":selected,
+                            "policy":"Feasible local prefit is preserved unless composed refinement is feasible and improves pure TRAIN maximum-group KL, then C32; exact ties preserve local prefit. Infeasible local prefit cannot rescue a failed refinement. Search admission still validates the selected stage.",
+                            "evidence":["LOCAL_PREFIT_TRAIN.json","COMPOSED_REFINEMENT_TRAIN.json"],
+                            "scope":"Both ordinary-f32 snapshots of this proposed replacement use identical fixed TRAIN episodes and controlled-native Local panels; no heldout selection and no native fallback. FIT.json describes the composed optimizer, TRAIN.json describes the selected snapshot."
+                        }))?;
+                        candidate = stage.artifact.clone();
+                        selected_stage = Some(stage);
+                    }
                 }
                 let (saved, bytes, _) = canonical_using(&candidate, cache.as_ref())?;
                 if let Some(edits) = parameter_edits {
@@ -2464,7 +2579,10 @@ fn structural_run(
                     }
                 }
                 std::fs::write(root.join("program.artifact"), bytes).map_err(|e| e.to_string())?;
-                let local_measure = local.measure(&saved)?;
+                let local_measure = match &selected_stage {
+                    Some(stage) => stage.local.clone(),
+                    None => local.measure(&saved)?,
+                };
                 let local_error = local_measure.worst().map_or(0., |b| b.worst);
                 if !local_error.is_finite() {
                     return Err("nonfinite structural Local measurement".into());
@@ -2490,8 +2608,10 @@ fn structural_run(
                         }
                     }
                 }
-                let measured =
-                    training.measure(d, &saved.program, None, settings.fit.numeric_bytes)?;
+                let measured = match &selected_stage {
+                    Some(stage) => stage.measurement.clone(),
+                    None => training.measure(d, &saved.program, None, settings.fit.numeric_bytes)?,
+                };
                 save(
                     &root.join("TRAIN.json"),
                     &serde_json::to_value(&measured).map_err(|e| e.to_string())?,
@@ -2508,7 +2628,10 @@ fn structural_run(
                         &json!({"measurement":supervised,"pure_kl_report":"TRAIN.json","native_labels_reused":true,"target_backend":training.target_metadata}),
                     )?;
                 }
-                let evaluation = structure_evaluation(&saved, &measured, local_error, costs)?;
+                let evaluation = match selected_stage {
+                    Some(stage) => stage.evaluation,
+                    None => structure_evaluation(&saved, &measured, local_error, costs)?,
+                };
                 save(
                     &root.join("STATUS.json"),
                     &json!({"status":"training_measured","trainable":request.trainable_operator_ids,"evaluation":evaluation,"artifact_sha256":sha256(&root.join("program.artifact"))?}),
@@ -4087,6 +4210,108 @@ mod tests {
         operator_program::{Node, SlotValues},
     };
     #[test]
+    fn harmful_composed_refinement_preserves_feasible_learned_local_replacement() {
+        use gam_mpd::operator_program::{exact_precision, Declarations, Interface, Operator, Slot};
+        use ndarray::array;
+        let d = Device::host();
+        let native = OperatorProgram {
+            declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: 1 }], parameters: 0 },
+            bases: vec![], rules: vec![],
+            operators: vec![Arc::new(Operator::dense("native", Interface::native(2).unwrap(),
+                Interface::native(1).unwrap(), array![[3.], [-3.]],
+                exact_precision([3., -3.]).unwrap(), Default::default()).unwrap())],
+            nodes: vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None },
+                Node::Affine { terms: vec![(0, 0)], bias: None }, Node::Concat { parts: vec![1, 2] }], output: 3,
+        };
+        let source = Artifact::native(&native).unwrap();
+        let region = gam_mpd::program_joint_regions::Region {
+            anchor_mode: gam_mpd::program_joint_regions::AnchorMode::Boundary,
+            native_reads: vec![0], current_reads: vec![0], native_writes: vec![1, 2],
+            current_writes: vec![1, 2], current_internal_nodes: vec![1, 2], producer_native: 0,
+            erased_native_places: vec![], source_program_nodes: 4,
+        };
+        let grammar = program_learned_dag::Settings {
+            latent_widths: vec![1], unary: vec![], binary: vec![], affine_bias: false,
+            require_shared: false, max_operations: 1, max_affine_parameters: 1,
+            max_parameter_elements: 8, max_expression_states: 16, max_tuple_checks: 32,
+            max_tuples: 8, max_body_nodes: 4, seed: 17,
+        };
+        let expression = program_learned_dag::Expr::Affine { parameter: 0,
+            output: program_learned_dag::TypeRef::Exit(0),
+            input: Box::new(program_learned_dag::Expr::Argument(0)), bias: false };
+        let applied = program_learned_dag::apply(&source, &region,
+            &[expression.clone(), expression], &[0], &grammar).unwrap();
+        let family = FamilyInputs { rows: 3,
+            slots: vec![SlotValues::Raw(array![[-0.4], [0.2], [0.6]])], layout: None };
+        // Deliberately competing, fixed TRAIN objectives: softened endpoint labels
+        // reward changing a locally exact native law. No heldout rows are involved.
+        let target_logits = native.execute(&family, false).unwrap().values[3].mapv(|v| v / 3.);
+        let training = CausalEpisodes {
+            metadata: vec![ResponseEpisode { label: "train".into(), inputs: family.clone(),
+                scored: None, endpoint_bytes: target_logits.len() * 8 }],
+            full: Some(vec![Episode { label: "train".into(), group: "clean".into(),
+                inputs: family.clone(), target_logits, scored: None }]),
+            compact: None, tile_rows: 0, target_metadata: json!({"backend":"full"}),
+        };
+        let mut candidate = applied.artifact;
+        let (panels, _) = capture_structural_local_targets(&native, &candidate,
+            &applied.local_fit, &training.metadata, 1 << 24).unwrap();
+        let (local_program, _) = prefit_joint_linear(&d, &applied.local_fit.program,
+            &applied.local_fit.trainable_operator_ids, &panels, 1 << 24).unwrap();
+        applied.local_fit.transfer(&local_program, &mut candidate).unwrap();
+        let local = gam_mpd::acceptance::Local::new(&native, family, None, 1);
+        let mut costs = CostCache::default();
+        let before = measure_structural_fit_stage(&d, &candidate, &local, &training,
+            None, 1 << 24, &mut costs).unwrap();
+        let before_bytes = before.artifact.to_bytes().unwrap();
+        assert_ne!(before_bytes, canonical(&source).unwrap().1,
+            "preserved candidate must be a learned replacement, not native fallback");
+        assert!(!before.artifact.blocks.is_empty());
+        let fit = training.fit(&d, &candidate.program, None, &applied.trainable_operator_ids,
+            FitSettings { iterations: 8, learning_rate: 0.2, beta1: 0.9, beta2: 0.999,
+                epsilon: 1e-8, numeric_bytes: 1 << 24, schedule: None,
+                arithmetic: resident_causal_fit::FitArithmetic::F64, exact_scan_every: 1 }).unwrap();
+        candidate.program = fit.program;
+        let after = measure_structural_fit_stage(&d, &candidate, &local, &training,
+            None, 1 << 24, &mut costs).unwrap();
+        assert!(after.evaluation.fidelity[0].value < before.evaluation.fidelity[0].value);
+        assert!(before.evaluation.local_errors[0].value < 1e-6);
+        assert!(after.evaluation.local_errors[0].value > 1e-3);
+        let mut constraints = program_structure_search::Constraints {
+            max_fidelity: vec![Metric { name: "maximum_group_mean_kl".into(), value: 10. }],
+            max_local_errors: vec![Metric { name: "sampled_d_local".into(), value: 1e-6 }],
+            max_intervention_errors: vec![Metric { name: "clean".into(), value: 10. }],
+        };
+        let (selected, stage) = select_structural_fit_stage(Ok(before), Ok(after), &constraints).unwrap();
+        assert_eq!(stage, "local_prefit");
+        assert_eq!(selected.artifact.to_bytes().unwrap(), before_bytes);
+        program_structure_search::validate_evaluation(&selected.evaluation, &constraints).unwrap();
+        let (selected, stage) = select_structural_fit_stage(Ok(selected),
+            Err("optimizer failed".into()), &constraints).unwrap();
+        assert_eq!(stage, "local_prefit");
+        assert_eq!(selected.artifact.to_bytes().unwrap(), before_bytes);
+        let infeasible = measure_structural_fit_stage(&d, &candidate, &local, &training,
+            None, 1 << 24, &mut costs).unwrap();
+        assert!(select_structural_fit_stage(Ok(infeasible),
+            Err("optimizer failed".into()), &constraints).is_err());
+
+        // A Local increase inside the declared limit is permitted when KL improves.
+        constraints.max_local_errors[0].value = 10.;
+        let after = measure_structural_fit_stage(&d, &candidate, &local, &training,
+            None, 1 << 24, &mut costs).unwrap();
+        let (improved, stage) = select_structural_fit_stage(Ok(selected), Ok(after), &constraints).unwrap();
+        assert_eq!(stage, "composed_refinement");
+        // Even feasible refinement must not erase a better pure-KL snapshot.
+        let worse = measure_structural_fit_stage(&d,
+            &Artifact::from_bytes(&before_bytes, &native.declarations).unwrap(),
+            &local, &training, None, 1 << 24, &mut costs).unwrap();
+        let (_, stage) = select_structural_fit_stage(Ok(improved), Ok(worse), &constraints).unwrap();
+        assert_eq!(stage, "local_prefit");
+        assert!(select_structural_fit_stage(Err("no measured local replacement".into()),
+            Err("failed refinement".into()), &constraints).is_err());
+    }
+
+    #[test]
     fn structural_local_prefit_uses_native_law_on_drifted_inputs_and_transfers_only_owners() {
         use gam_mpd::operator_program::{exact_precision, Declarations, Interface, Law, Operator, Slot};
         use ndarray::array;
@@ -5150,11 +5375,14 @@ mod tests {
                     vec![clean, response]
                 };
                 Some(
-                    program_learned_dag::compile_program(
+                    program_learned_dag::compile_program_inheriting(
                         &[Interface::native(2).unwrap()],
                         &[Interface::native(2).unwrap(), Interface::native(1).unwrap()],
                         &expressions,
                         &search,
+                        &down.program,
+                        &[down.native_read],
+                        &[down.clean_output, down.response_nodes[0]],
                     )
                     .expect("distinct joint expressions sharing real ReLU"),
                 )
@@ -5881,6 +6109,7 @@ mod tests {
         local_structural.settings.max_callback_calls=48;
         local_structural.settings.max_move_attempts=256;
         local_structural.settings.learned_dag_search=Some(program_structure_search::LearnedDAGSettings {
+            native_parent: None,
             region_limits:gam_mpd::program_joint_regions::Limits {max_internal_nodes:3,max_inputs:2,
                 max_exits:2,max_regions:24,max_states:128},
             grammar:program_learned_dag::Settings {latent_widths:vec![1],unary:vec![composed_rule_search::Unary::GeluTanh],
@@ -5895,6 +6124,9 @@ mod tests {
         let completed=std::fs::read_dir(&local_out).unwrap().filter_map(Result::ok)
             .map(|e|e.path()).filter(|p|p.join("LOCAL_SUPERVISION.json").exists()
                 && p.join("LOCAL_LINEAR_PREFIT.json").exists() && p.join("FIT.json").exists()
+                && p.join("LOCAL_PREFIT_TRAIN.json").exists()
+                && p.join("COMPOSED_REFINEMENT_TRAIN.json").exists()
+                && p.join("FIT_STAGE_SELECTION.json").exists()
                 && p.join("program.artifact").exists()).count();
         assert!(completed > 0,"automatic learned proposals must execute the full local-to-composed path: {}",local_out.display());
         // Reuse the real structural-driver fixture with two upstream coordinates,
@@ -6055,14 +6287,6 @@ mod tests {
             max_body_nodes: 20,
             seed: 3,
         };
-        let mut compiled = program_learned_dag::compile_program(
-            &vec![Interface::native(1).unwrap(); 3],
-            &[Interface::native(1).unwrap(), Interface::native(1).unwrap()],
-            &[equation, J::Argument(0)],
-            &search,
-        )
-        .unwrap();
-        compiled.program.output = compiled.output_nodes[0];
         let edit_inputs: Vec<_> = edits
             .compiled
             .control_slots
@@ -6076,6 +6300,17 @@ mod tests {
                 controlled.root_mapping[root]
             })
             .collect();
+        let mut compiled = program_learned_dag::compile_program_inheriting(
+            &vec![Interface::native(1).unwrap(); 3],
+            &[Interface::native(1).unwrap(), Interface::native(1).unwrap()],
+            &[equation, J::Argument(0)],
+            &search,
+            &controlled.program,
+            &[original_map[0], edit_inputs[0], edit_inputs[1]],
+            &[original_map[2], original_map[0]],
+        )
+        .unwrap();
+        compiled.program.output = compiled.output_nodes[0];
         let candidate = Artifact::native(&controlled.program)
             .unwrap()
             .replace_function_inputs(
@@ -6757,10 +6992,11 @@ mod tests {
                         .expect("own clean forward")
                         .values[candidate.program.output]
                         .clone();
-                    let clean_kl = (0..family.rows)
-                        .map(|r| gam_mpd::acceptance::kl_logits(targets[0].row(r), output.row(r)).0)
-                        .sum::<f64>()
-                        / family.rows as f64;
+                    let score_device = Device::host();
+                    let target = score_device.upload(targets[0].view()).unwrap();
+                    let mut logits = score_device.upload(output.view()).unwrap();
+                    let clean_kl = score_device.kl_score_rows(&target, &mut logits, None)
+                        .unwrap().iter().sum::<f64>() / family.rows as f64;
                     if clean_kl.abs() < 1e-8 {
                         assert_ne!(attempt["status"], "fitted_admitted");
                         canceled_wrong = true;

@@ -1602,3 +1602,44 @@ mod control_artifact_tests;
 #[path = "function_graft_tests.rs"]
 mod function_graft_tests;
 
+
+#[cfg(test)]
+mod f32_layout_tests {
+    use super::*;
+    use ndarray::{array, s};
+
+    #[test]
+    fn rounding_preserves_coordinates_of_transposed_and_strided_operators() {
+        let square = Interface::native(2).unwrap();
+        let dense_values = array![[0.1, -0.2], [0.3, 0.7]].reversed_axes();
+        assert!(dense_values.as_slice().is_none());
+        let dense = Operator::dense("transposed", square.clone(), square.clone(),
+            dense_values.clone(), exact_precision(dense_values.iter().copied()).unwrap(),
+            Provenance::default()).unwrap();
+        let source_matrix = dense.matrix();
+        let rounded = f32_operator(&dense).unwrap();
+        assert_eq!(rounded.matrix(), dense_values.mapv(|v| f64::from(v as f32)));
+        assert!(has_f32_reals(&rounded));
+        assert_eq!(dense.matrix(), source_matrix, "rounding must leave the constructed source untouched");
+
+        let left = array![[0.1, 0.2], [0.3, 0.4]].reversed_axes();
+        let right = array![[0.5, 0.6], [0.7, 0.8]].reversed_axes();
+        let rank = Operator::low_rank("transposed factors", square.clone(), square.clone(),
+            left.clone(), right.clone(), exact_precision(left.iter().chain(right.iter()).copied()).unwrap(),
+            Provenance::default()).unwrap();
+        let rounded_rank = f32_operator(&rank).unwrap();
+        let OperatorBody::LowRank { left: actual_left, right: actual_right, .. } = &rounded_rank.body
+            else { panic!("rounding must preserve factorization"); };
+        assert_eq!(*actual_left, left.mapv(|v| f64::from(v as f32)));
+        assert_eq!(*actual_right, right.mapv(|v| f64::from(v as f32)));
+        assert!(has_f32_reals(&rounded_rank));
+
+        let diagonal = array![0.1, 9., -0.3, 9.].slice_move(s![..;2]);
+        assert!(diagonal.as_slice().is_none());
+        let op = Operator::diag("strided diagonal", square, diagonal.clone(),
+            exact_precision(diagonal.iter().copied()).unwrap(), Provenance::default()).unwrap();
+        let rounded_diag = f32_operator(&op).unwrap();
+        assert_eq!(rounded_diag.matrix().diag(), diagonal.mapv(|v| f64::from(v as f32)));
+        assert!(has_f32_reals(&rounded_diag));
+    }
+}

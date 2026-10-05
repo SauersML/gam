@@ -2,6 +2,9 @@
 //! parameters. Outputs can have different nonlinear equations and share actual
 //! intermediate computations. This is a restricted fitted candidate family, not
 //! identification of native variables or a guarantee of structure recovery.
+#[path = "program_learned_dag_parent.rs"]
+pub mod parent;
+
 use crate::{
     artifact::Artifact,
     composed_rule_search::{Binary, Unary},
@@ -627,7 +630,7 @@ pub fn enumerate_interfaces(
     let mut result = Inventory { proposals: vec![], explored_states: inputs.len(), accepted_states: inputs.len(), checked_tuples: 0,
         checked_skeleton_tuples: 0, sharing_seed_checks: 0, completed_parameter_bindings: 0,
         duplicate_states: 0, duplicate_tuples: 0, rejection_counts: BTreeMap::new(), truncated: false,
-        priority: "Operation-count typed skeletons; round-robin maximum-operation output-tuple bands with four resumable restricted-growth partition searches per ordinary band and sixteen per sharing-seed band; sharing-first tuples of generated learned-nonlinear intermediates and generated affine exit projections (seed inspection capped at one eighth of tuple work); balanced learned-nonlinear tuple seeds when type-compatible; one attempted binding branch per turn; admitted proposals ranked by compiled DAG node count, parameter elements, then canonical ordered syntax. All attempted skeleton and partial binding work bounded; truncation is not exhaustive search.".into() };
+        priority: "Operation-count typed skeletons; round-robin maximum-operation output-tuple bands with four resumable restricted-growth partition searches per ordinary band and sixteen per sharing-seed band; separate round-robin projected and direct-exit seed bands, each starting with the widest generated intermediate types; sharing-first tuples of generated learned-nonlinear intermediates and generated affine exit projections, including the unprojected intermediate at type-compatible exits (seed inspection capped at one eighth of tuple work); balanced learned-nonlinear tuple seeds when type-compatible; one attempted binding branch per turn; admitted proposals ranked by compiled DAG node count, parameter elements, then canonical ordered syntax. All attempted skeleton and partial binding work bounded; truncation is not exhaustive search.".into() };
     let mut by_size = vec![(0..inputs.len()).map(Expr::Argument).collect::<Vec<_>>()];
     let mut seen = by_size[0].iter().cloned().collect::<BTreeSet<_>>();
     enum Class {
@@ -842,23 +845,64 @@ pub fn enumerate_interfaces(
             }
         }
     }
-    let mut sharing = TupleBand {
+    let mut sharing_projected = TupleBand {
         task_limit: 16,
         ..TupleBand::default()
     };
-    for cursor in projections
-        .into_values()
-        .filter_map(|positions| positions.into_iter().collect::<Option<Vec<_>>>())
-    {
-        if sharing.seen.insert(cursor.clone()) {
-            sharing.heap.push(std::cmp::Reverse((
-                tuple_cost(&cursor, &axes, &pool)?,
-                cursor,
-            )));
+    let mut sharing_direct = TupleBand {
+        task_limit: 16,
+        ..TupleBand::default()
+    };
+    let mut projected_seeds = Vec::new();
+    let mut direct_seeds = Vec::new();
+    for (intermediate, positions) in projections {
+        // The already generated nonlinear value may itself be a declared exit.
+        // Retain the projected seed too: no identity adapter is inserted and no
+        // Cartesian product of direct/projected choices is opened. Each seed's
+        // later admission and parameter binding consume the ordinary tuple work.
+        // These lookups are bounded by the charged projection inspections above.
+        let projected = positions.iter().copied().collect::<Option<Vec<_>>>();
+        let intermediate_id = pool.binary_search_by(|e| {
+            (operations(e), e).cmp(&(operations(&intermediate), &intermediate))
+        }).map_err(|_| "generated sharing intermediate absent from expression pool")?;
+        let direct = positions.iter().enumerate().map(|(axis, projection)| {
+            if types[intermediate_id] == outputs[axis] {
+                axes[axis].binary_search(&intermediate_id).ok()
+            } else {
+                *projection
+            }
+        }).collect::<Option<Vec<_>>>();
+        // A cheaper direct exit must not displace the entire projected family.
+        // Rotate the two families as separate bands, starting each with the
+        // widest generated intermediates before narrower ones.
+        // Width is read from the generated type, never from native weights.
+        let width = std::cmp::Reverse(types[intermediate_id].width());
+        if let Some(cursor) = &projected {
+            if sharing_projected.seen.insert(cursor.clone()) {
+                projected_seeds.push((width, tuple_cost(cursor, &axes, &pool)?, cursor.clone()));
+            }
+        }
+        if direct != projected {
+            if let Some(cursor) = direct {
+                if sharing_direct.seen.insert(cursor.clone()) {
+                    direct_seeds.push((width, tuple_cost(&cursor, &axes, &pool)?, cursor));
+                }
+            }
         }
     }
-    if !sharing.heap.is_empty() {
-        bands.push_front((largest_generated_size, sharing));
+    projected_seeds.sort();
+    direct_seeds.sort();
+    for (rank, (_, _, cursor)) in projected_seeds.into_iter().enumerate() {
+        sharing_projected.heap.push(std::cmp::Reverse((rank, cursor)));
+    }
+    for (rank, (_, _, cursor)) in direct_seeds.into_iter().enumerate() {
+        sharing_direct.heap.push(std::cmp::Reverse((rank, cursor)));
+    }
+    if !sharing_direct.heap.is_empty() {
+        bands.push_front((largest_generated_size, sharing_direct));
+    }
+    if !sharing_projected.heap.is_empty() {
+        bands.push_front((largest_generated_size, sharing_projected));
     }
     while let Some((size, mut band)) = bands.pop_front() {
         if result.checked_tuples == s.max_tuple_checks || result.proposals.len() == s.max_tuples {
@@ -1991,6 +2035,39 @@ mod tests {
             1,
             "only fixed training regrouping adapter"
         );
+    }
+
+    #[test]
+    fn generated_sharing_seeds_allow_unprojected_native_width_exit() {
+        let inputs = [Interface::native(768).unwrap()];
+        let outputs = [Interface::native(3072).unwrap(), Interface::native(768).unwrap()];
+        let mut s = settings();
+        s.latent_widths = vec![768, 3072];
+        s.unary = vec![Unary::Silu, Unary::GeluTanh];
+        s.binary = vec![Binary::Add, Binary::Multiply];
+        s.affine_bias = false;
+        s.require_shared = true;
+        s.max_operations = 3;
+        s.max_affine_parameters = 3;
+        s.max_parameter_elements = 6_000_000;
+        s.max_expression_states = 4096;
+        s.max_tuple_checks = 8192;
+        s.max_tuples = 128;
+        s.max_body_nodes = 12;
+        let inventory = enumerate_interfaces(&inputs, &outputs, &s).unwrap();
+        assert!(inventory.proposals.iter().any(|p| {
+            let Expr::Unary(Unary::GeluTanh, up) = &p.expressions[0] else { return false; };
+            let Expr::Affine { output, input, .. } = up.as_ref() else { return false; };
+            resolve(output, &inputs, &outputs).is_ok_and(|ty| ty.width() == 3072)
+                && **input == Expr::Argument(0)
+                && matches!(&p.expressions[1], Expr::Affine { input, .. } if **input == p.expressions[0])
+                && p.parameter_elements == 2 * 768 * 3072
+                && p.trainable_operator_count == 2
+        }), "generated intermediate and its projection must share the full-width native equation without an identity adapter");
+        assert!(inventory.explored_states <= s.max_expression_states);
+        assert!(inventory.checked_tuples <= s.max_tuple_checks);
+        assert!(inventory.sharing_seed_checks <= s.max_tuple_checks / 8);
+        assert!(inventory.proposals.len() <= s.max_tuples);
     }
 
     #[test]
