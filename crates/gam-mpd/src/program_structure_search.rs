@@ -2897,6 +2897,7 @@ mod tests {
         joint.max_move_attempts = 6;
         configuration.shared_dag_search = Some(joint);
         let mut seen = BTreeSet::new();
+        let mut per_cut = BTreeMap::<(Vec<usize>, Vec<usize>, Vec<usize>), usize>::new();
         let result = search(
             &native,
             evaluated(&Artifact::native(&native).unwrap(), &native),
@@ -2910,25 +2911,48 @@ mod tests {
                 } = request.mutation
                 {
                     assert_eq!(native_arguments, &region.native_reads);
-                    assert!(
-                        seen.insert(expressions.clone()),
-                        "even failed proposals must be deduplicated before callback"
+                    let cut = (
+                        region.native_reads.clone(),
+                        region.native_writes.clone(),
+                        region.current_internal_nodes.clone(),
                     );
+                    assert!(
+                        seen.insert((
+                            cut.clone(),
+                            request.candidate.to_bytes().expect("actual proposed artifact bytes"),
+                        )),
+                        "even failed proposals for the same native cut must be deduplicated before callback"
+                    );
+                    *per_cut.entry(cut).or_default() += 1;
+                    assert_eq!(expressions.len(), region.native_writes.len());
                 }
                 Err("intentionally failed measurement to audit duplicate work".into())
             },
         )
         .unwrap();
-        assert_eq!(result.report.counts.shared_dag_proposals, 6);
-        assert_eq!(result.report.counts.shared_dag_unique_proposals, 3);
+        assert_eq!(result.report.counts.shared_dag_proposals, 7);
+        assert_eq!(result.report.counts.shared_dag_unique_proposals, 4);
         assert_eq!(
             result.report.counts.shared_dag_duplicate_binding_proposals,
             3
         );
-        assert_eq!(result.report.counts.shared_dag_callback_calls, 3);
-        assert_eq!(seen.len(), 3);
-        assert_eq!(result.report.shared_dag_schedules.len(), 1);
-        assert_eq!(result.report.shared_dag_schedules[0].unique_proposals, 3);
+        assert_eq!(result.report.counts.shared_dag_callback_calls, 4);
+        assert_eq!(seen.len(), 4);
+        // Interior extraction still searches three equations, each exactly once
+        // despite two input permutations. Boundary anchoring contributes a distinct
+        // one-input cut; identical expression syntax there means a different native
+        // input and must not be discarded as the earlier hypothesis.
+        assert_eq!(per_cut[&(vec![0, 1], vec![3, 4], vec![2, 3, 4])], 3);
+        assert_eq!(per_cut[&(vec![2], vec![3, 4], vec![3, 4])], 1);
+        assert_eq!(result.report.shared_dag_schedules.len(), 2);
+        assert_eq!(
+            result.report
+                .shared_dag_schedules
+                .iter()
+                .map(|s| s.unique_proposals)
+                .sum::<usize>(),
+            4
+        );
         assert_eq!(result.report.admitted_candidates.len(), 1);
     }
     #[test]

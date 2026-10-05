@@ -4170,6 +4170,7 @@ mod tests {
             description_bits: cost,
         };
         let joint_region = gam_mpd::program_joint_regions::Region {
+            anchor_mode: gam_mpd::program_joint_regions::AnchorMode::Interior,
             native_reads: vec![0],
             current_reads: vec![0],
             native_writes: vec![1],
@@ -4609,19 +4610,6 @@ mod tests {
             .expect("hypotheses")
             .is_empty());
         if joint {
-            // Freeze by training admission before constructing any heldout targets.
-            let chosen = attempts
-                .iter()
-                .find(|a| {
-                    a["mutation"]["kind"] == kind
-                        && a["status"] == "fitted_admitted"
-                        && a["mutation"]["region"]["native_writes"]
-                            .as_array()
-                            .is_some_and(|w| w.len() == 2)
-                })
-                .expect("joint equation admission");
-            let id = chosen["attempt_id"].as_u64().expect("attempt");
-            save(&out.join("GATE_FROZEN_JOINT_ATTEMPT.json"), &json!({"attempt_id":id,"selection":"first training-admitted two-exit shared DAG; implementation calibration only"})).expect("freeze gate before heldout targets");
             let control_defs = controls(
                 &Artifact::native(&native).expect("native"),
                 &native,
@@ -4631,13 +4619,29 @@ mod tests {
             .expect("controls");
             let compiled =
                 intervention_program::compile(&native, &control_defs).expect("compile controls");
+            let expected: Vec<_> = [4, 5].iter().map(|n| compiled.root_mapping[*n]).collect();
+            // Freeze by training admission before constructing any heldout targets.
+            let chosen = attempts
+                .iter()
+                .find(|a| {
+                    a["mutation"]["kind"] == kind
+                        && a["status"] == "fitted_admitted"
+                        && a["mutation"]["region"]["native_writes"]
+                            .as_array()
+                            .is_some_and(|w| {
+                                w.len() == 2
+                                    && expected.iter().all(|n| w.contains(&json!(n)))
+                            })
+                })
+                .expect("joint equation admission");
+            let id = chosen["attempt_id"].as_u64().expect("attempt");
+            save(&out.join("GATE_FROZEN_JOINT_ATTEMPT.json"), &json!({"attempt_id":id,"selection":"first training-admitted shared DAG replacing both declared observable consumers; implementation calibration only"})).expect("freeze gate before heldout targets");
             let path = out.join(format!("structural-attempt-{id:06}/program.artifact"));
             let bytes = std::fs::read(path).expect("saved joint");
             let decoded =
                 Artifact::from_bytes(&bytes, &compiled.program.declarations).expect("decode");
             assert_eq!(decoded.to_bytes().expect("reencode"), bytes);
             let exits: Vec<_> = decoded.blocks.iter().map(|b| b.native_write).collect();
-            let expected: Vec<_> = [4, 5].iter().map(|n| compiled.root_mapping[*n]).collect();
             assert!(
                 expected.iter().all(|n| exits.contains(n)),
                 "observable consumers must have Local relations: {exits:?} vs {expected:?}"

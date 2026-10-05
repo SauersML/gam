@@ -17,8 +17,16 @@ pub struct Limits {
     pub max_regions: usize,
     pub max_states: usize,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum AnchorMode {
+    #[default]
+    Interior,
+    Boundary,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Region {
+    #[serde(default)]
+    pub anchor_mode: AnchorMode,
     pub native_reads: Vec<usize>,
     pub current_reads: Vec<usize>,
     pub native_writes: Vec<usize>,
@@ -30,6 +38,8 @@ pub struct Region {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Skipped {
+    #[serde(default)]
+    pub anchor_mode: AnchorMode,
     pub producer_native: usize,
     pub current_internal_nodes: Vec<usize>,
     pub reason: String,
@@ -39,7 +49,10 @@ pub struct Inventory {
     pub regions: Vec<Region>,
     pub skipped: Vec<Skipped>,
     pub truncated: bool,
+    /// Total description and successor attempts, including duplicate successors.
     pub explored_states: usize,
+    #[serde(default)]
+    pub attempted_expansions: usize,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Exit {
@@ -71,15 +84,20 @@ fn aliases(a: &Artifact) -> Result<BTreeMap<usize, usize>, String> {
     }
     Ok(out)
 }
-fn describe(
+fn describe_anchored(
     a: &Artifact,
     producer: usize,
+    anchor_mode: AnchorMode,
     mut inside: BTreeSet<usize>,
     limits: &Limits,
 ) -> Result<Region, String> {
     let names = aliases(a)?;
-    if !a.place(producer).is_some_and(|i| inside.contains(&i)) {
+    let root = a.place(producer).ok_or("joint producer place absent")?;
+    if anchor_mode == AnchorMode::Interior && !inside.contains(&root) {
         return Err("joint producer absent from region".into());
+    }
+    if anchor_mode == AnchorMode::Boundary && inside.contains(&root) {
+        return Err("joint boundary producer must remain outside region".into());
     }
     let boundary = loop {
         if inside.len() > limits.max_internal_nodes {
@@ -114,13 +132,22 @@ fn describe(
     let mut adjacency = BTreeMap::<usize, BTreeSet<usize>>::new();
     for &i in &inside {
         for p in a.program.nodes[i].arguments() {
-            if inside.contains(&p) {
+            if inside.contains(&p) || (anchor_mode == AnchorMode::Boundary && p == root) {
                 adjacency.entry(i).or_default().insert(p);
                 adjacency.entry(p).or_default().insert(i);
             }
         }
     }
-    let root = a.place(producer).ok_or("joint producer place absent")?;
+    if anchor_mode == AnchorMode::Boundary
+        && (!boundary.contains(&root)
+            || inside
+                .iter()
+                .filter(|&&i| a.program.nodes[i].arguments().contains(&root))
+                .count()
+                < 2)
+    {
+        return Err("joint boundary producer requires two direct internal consumers".into());
+    }
     let mut connected = BTreeSet::from([root]);
     let mut pending = vec![root];
     while let Some(i) = pending.pop() {
@@ -129,6 +156,9 @@ fn describe(
                 pending.push(neighbor);
             }
         }
+    }
+    if anchor_mode == AnchorMode::Boundary {
+        connected.remove(&root);
     }
     if connected != inside {
         return Err("joint region is not connected to its producer".into());
@@ -204,6 +234,7 @@ fn describe(
         );
     }
     Ok(Region {
+        anchor_mode,
         native_reads: reads.iter().map(|x| x.0).collect(),
         current_reads: reads.iter().map(|x| x.1).collect(),
         native_writes: writes.iter().map(|x| x.0).collect(),
@@ -237,68 +268,109 @@ pub fn propose_regions(a: &Artifact, limits: Limits) -> Result<Inventory, String
             users[p].insert(i);
         }
     }
-    let mut queue = VecDeque::new();
+    enum Work {
+        Describe(BTreeSet<usize>),
+        Expand {
+            inside: BTreeSet<usize>,
+            next: BTreeSet<usize>,
+        },
+    }
+    let mut anchors = VecDeque::new();
     let mut seen = BTreeSet::new();
-    // One seed per retained fan-out producer before any producer's deeper cuts.
+    let mut seed_truncated = false;
+    // Each native anchor/mode has its own lazy frontier and receives one work
+    // attempt per turn. A large fan-out cannot consume another anchor's budget
+    // in a single turn. Successors are generated one at a time, never as pairs.
     for (&current, &native) in &names {
-        if users[current].len() >= 2 && !ambient(&a.program.nodes[current]) {
-            let set = BTreeSet::from([current]);
-            seen.insert((native, set.clone()));
-            queue.push_back((native, current, set));
+        if users[current].len() < 2 || matches!(a.program.nodes[current], Node::Feature { .. }) {
+            continue;
+        }
+        for mode in [AnchorMode::Interior, AnchorMode::Boundary] {
+            if mode == AnchorMode::Interior && ambient(&a.program.nodes[current]) {
+                continue;
+            }
+            if seen.len() >= limits.max_states {
+                seed_truncated = true;
+                break;
+            }
+            let set = if mode == AnchorMode::Interior {
+                BTreeSet::from([current])
+            } else {
+                BTreeSet::new()
+            };
+            seen.insert((native, mode, set.clone()));
+            anchors.push_back((native, current, mode, VecDeque::from([Work::Describe(set)])));
         }
     }
     let mut out = Inventory {
         regions: vec![],
         skipped: vec![],
-        truncated: false,
+        truncated: seed_truncated,
         explored_states: 0,
+        attempted_expansions: 0,
     };
-    while let Some((producer, current, inside)) = queue.pop_front() {
+    while let Some((producer, current, mode, mut frontier)) = anchors.pop_front() {
         if out.explored_states >= limits.max_states || out.regions.len() >= limits.max_regions {
             out.truncated = true;
             break;
         }
+        let work = frontier.pop_front().expect("active anchor has work");
         out.explored_states += 1;
-        let result = describe(a, producer, inside.clone(), &limits);
-        match result {
-            Ok(r) => {
-                if users[current]
+        match work {
+            Work::Describe(inside) => {
+                match describe_anchored(a, producer, mode, inside.clone(), &limits) {
+                    Ok(r) => {
+                        if users[current]
+                            .iter()
+                            .filter(|i| r.current_internal_nodes.contains(i))
+                            .count()
+                            >= 2
+                        {
+                            out.regions.push(r);
+                        }
+                    }
+                    Err(reason) => out.skipped.push(Skipped {
+                        anchor_mode: mode,
+                        producer_native: producer,
+                        current_internal_nodes: inside.iter().copied().collect(),
+                        reason,
+                    }),
+                }
+                let next = inside
                     .iter()
-                    .filter(|i| r.current_internal_nodes.contains(i))
-                    .count()
-                    >= 2
-                {
-                    out.regions.push(r);
+                    .flat_map(|i| users[*i].iter().copied())
+                    .chain(
+                        (mode == AnchorMode::Boundary)
+                            .then_some(&users[current])
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    )
+                    .filter(|i| !inside.contains(i))
+                    .collect::<BTreeSet<_>>();
+                if inside.len() < limits.max_internal_nodes && !next.is_empty() {
+                    frontier.push_back(Work::Expand { inside, next });
+                } else if !next.is_empty() {
+                    out.truncated = true;
                 }
             }
-            Err(reason) => out.skipped.push(Skipped {
-                producer_native: producer,
-                current_internal_nodes: inside.iter().copied().collect(),
-                reason,
-            }),
-        }
-        if inside.len() < limits.max_internal_nodes {
-            let next = inside
-                .iter()
-                .flat_map(|i| users[*i].iter().copied())
-                .filter(|i| !inside.contains(i))
-                .collect::<BTreeSet<_>>();
-            for i in next {
+            Work::Expand { inside, mut next } => {
+                out.attempted_expansions += 1;
+                let i = next.pop_first().expect("successor cursor is nonempty");
                 let mut expanded = inside.clone();
                 expanded.insert(i);
-                if seen.len() >= limits.max_states {
-                    out.truncated = true;
-                    break;
+                // Duplicate attempts still consume work: graph symmetry cannot
+                // create unaccounted enumeration loops.
+                if seen.insert((producer, mode, expanded.clone())) {
+                    frontier.push_back(Work::Describe(expanded));
                 }
-                if seen.insert((producer, expanded.clone())) {
-                    queue.push_back((producer, current, expanded));
+                if !next.is_empty() {
+                    frontier.push_back(Work::Expand { inside, next });
                 }
             }
-        } else if inside
-            .iter()
-            .any(|i| users[*i].iter().any(|u| !inside.contains(u)))
-        {
-            out.truncated = true;
+        }
+        if !frontier.is_empty() {
+            anchors.push_back((producer, current, mode, frontier));
         }
     }
     Ok(out)
@@ -314,9 +386,10 @@ fn validate_region(a: &Artifact, r: &Region) -> Result<Vec<Interface>, String> {
         max_regions: 1,
         max_states: 1,
     };
-    let expected = describe(
+    let expected = describe_anchored(
         a,
         r.producer_native,
+        r.anchor_mode,
         r.current_internal_nodes.iter().copied().collect(),
         &generous,
     )?;
@@ -686,6 +759,14 @@ mod tests {
         },
     };
     use ndarray::{Array2, array};
+    fn describe(
+        a: &Artifact,
+        producer: usize,
+        inside: BTreeSet<usize>,
+        limits: &Limits,
+    ) -> Result<Region, String> {
+        describe_anchored(a, producer, AnchorMode::Interior, inside, limits)
+    }
     fn limits() -> Limits {
         Limits {
             max_internal_nodes: 12,
@@ -743,6 +824,205 @@ mod tests {
     }
     fn region(a: &Artifact, inside: &[usize]) -> Region {
         describe(a, 2, inside.iter().copied().collect(), &limits()).expect("joint cut")
+    }
+    #[test]
+    fn scarce_budget_round_robins_high_and_low_fanout_anchor_modes() {
+        let mut nodes = vec![
+            Node::Raw { slot: 0 },
+            Node::Raw { slot: 1 },
+            Node::RmsNorm {
+                input: 0,
+                epsilon: 1e-5,
+            },
+        ];
+        for _branch in 0..18 {
+            nodes.push(Node::Gain {
+                input: 2,
+                coefficient: Coefficient::Number(2.),
+            });
+        }
+        let later = nodes.len();
+        nodes.push(Node::RmsNorm {
+            input: 1,
+            epsilon: 1e-5,
+        });
+        let left = nodes.len();
+        nodes.push(Node::Gain {
+            input: later,
+            coefficient: Coefficient::Number(3.),
+        });
+        let right = nodes.len();
+        nodes.push(Node::Gain {
+            input: later,
+            coefficient: Coefficient::Number(4.),
+        });
+        nodes.push(Node::Affine {
+            terms: (3..21).chain([left, right]).map(|i| (i, 0)).collect(),
+            bias: None,
+        });
+        let a = base(nodes, 2);
+        let inventory = propose_regions(
+            &a,
+            Limits {
+                max_states: 40,
+                ..limits()
+            },
+        )
+        .expect("fair bounded inventory");
+        assert!(inventory.truncated);
+        assert_eq!(inventory.explored_states, 40);
+        assert!(inventory.attempted_expansions > 0);
+        for producer in [2, later] {
+            for mode in [AnchorMode::Interior, AnchorMode::Boundary] {
+                let initial_len = usize::from(mode == AnchorMode::Interior);
+                assert!(
+                    inventory
+                        .regions
+                        .iter()
+                        .any(|r| r.producer_native == producer && r.anchor_mode == mode)
+                        || inventory
+                            .skipped
+                            .iter()
+                            .any(|r| r.producer_native == producer
+                                && r.anchor_mode == mode
+                                && r.current_internal_nodes.len() > initial_len),
+                    "each anchor mode must describe an admitted successor"
+                );
+            }
+        }
+        assert!(inventory.regions.iter().any(|r| r.producer_native == later
+            && r.anchor_mode == AnchorMode::Boundary
+            && r.current_internal_nodes == vec![left, right]));
+    }
+    #[test]
+    fn boundary_anchor_retains_normalization_and_raw_forks() {
+        for normalized in [false, true] {
+            let mut nodes = vec![Node::Raw { slot: 0 }, Node::Raw { slot: 1 }];
+            let anchor = if normalized {
+                nodes.push(Node::RmsNorm {
+                    input: 0,
+                    epsilon: 1e-5,
+                });
+                2
+            } else {
+                0
+            };
+            let left = nodes.len();
+            nodes.push(Node::Gain {
+                input: anchor,
+                coefficient: Coefficient::Number(2.),
+            });
+            let right = nodes.len();
+            nodes.push(Node::Hadamard {
+                left: anchor,
+                right: 1,
+            });
+            nodes.push(Node::Affine {
+                terms: vec![(left, 0), (right, 0)],
+                bias: None,
+            });
+            let a = base(nodes, 2);
+            let inventory = propose_regions(&a, limits()).expect("bounded fork inventory");
+            let r = inventory
+                .regions
+                .iter()
+                .find(|r| {
+                    r.anchor_mode == AnchorMode::Boundary
+                        && r.producer_native == anchor
+                        && r.current_internal_nodes == vec![left, right]
+                })
+                .expect("two-branch boundary cut is enumerated");
+            assert!(r.current_reads.contains(&anchor));
+            assert!(!r.current_internal_nodes.contains(&anchor));
+            assert_eq!(r.native_writes, vec![left, right]);
+            let body = exact_body(&a, r).expect("boundary extraction");
+            let patched = replay(&apply(&a, r, &body).expect("independent exits patch"));
+            let trace = patched
+                .program
+                .execute(&panel(), false)
+                .expect("patched execution");
+            assert!(trace.values.iter().flatten().all(|x| x.is_finite()));
+            assert_eq!(result(&patched, &panel()), result(&a, &panel()));
+            assert!(patched.place(anchor).is_some());
+            let left_place = patched.place(left).expect("first decoded exit");
+            let right_place = patched.place(right).expect("second decoded exit");
+            let edited = patched
+                .program
+                .execute_edited(&panel(), |i, value, _| {
+                    if i == left_place {
+                        *value *= 0.;
+                    }
+                    Ok(())
+                })
+                .expect("independent boundary exit intervention");
+            assert_eq!(edited.values[right_place], trace.values[right_place]);
+            assert!(edited.values[left_place].iter().all(|&x| x == 0.));
+        }
+    }
+    #[test]
+    fn boundary_anchor_refuses_unread_and_disconnected_branches() {
+        let a = source();
+        assert!(
+            describe_anchored(
+                &a,
+                0,
+                AnchorMode::Boundary,
+                BTreeSet::from([4, 5]),
+                &limits()
+            )
+            .is_err()
+        );
+        let a = base(
+            vec![
+                Node::Raw { slot: 0 },
+                Node::Raw { slot: 1 },
+                Node::Gain {
+                    input: 0,
+                    coefficient: Coefficient::Number(2.),
+                },
+                Node::Gain {
+                    input: 0,
+                    coefficient: Coefficient::Number(3.),
+                },
+                Node::Gain {
+                    input: 1,
+                    coefficient: Coefficient::Number(4.),
+                },
+                Node::Affine {
+                    terms: vec![(2, 0), (3, 0), (4, 0)],
+                    bias: None,
+                },
+            ],
+            2,
+        );
+        assert!(
+            describe_anchored(
+                &a,
+                0,
+                AnchorMode::Boundary,
+                BTreeSet::from([2, 3, 4]),
+                &limits()
+            )
+            .is_err()
+        );
+        let r = describe_anchored(
+            &a,
+            0,
+            AnchorMode::Boundary,
+            BTreeSet::from([2, 3]),
+            &limits(),
+        )
+        .expect("connected boundary cut");
+        let mut forged = r.clone();
+        forged.anchor_mode = AnchorMode::Interior;
+        assert!(exact_body(&a, &forged).is_err());
+        let mut legacy = serde_json::to_value(&region(&source(), &[2, 3, 4])).expect("region JSON");
+        legacy
+            .as_object_mut()
+            .expect("region object")
+            .remove("anchor_mode");
+        let restored: Region = serde_json::from_value(legacy).expect("legacy anchor default");
+        assert_eq!(restored.anchor_mode, AnchorMode::Interior);
     }
     #[test]
     fn mapped_rewrite_preserves_exact_parameter_and_value_identities() {
