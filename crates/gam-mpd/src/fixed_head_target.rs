@@ -16,7 +16,6 @@ fn error(e: impl std::fmt::Display) -> String {
 
 pub(crate) struct Head {
     pub hidden: usize,
-    pub operator: usize,
     pub embedding: Array2<f64>, // classes x hidden
 }
 impl Head {
@@ -66,11 +65,7 @@ impl Head {
         } else {
             values.clone()
         };
-        Ok(Self {
-            hidden,
-            operator,
-            embedding,
-        })
+        Ok(Self { hidden, embedding })
     }
     pub fn same(&self, other: &Self) -> bool {
         self.embedding.dim() == other.embedding.dim()
@@ -539,7 +534,6 @@ mod tests {
             entropy: vec![0., 0.],
             head: Arc::new(Head {
                 hidden: 0,
-                operator: 0,
                 embedding: Array2::eye(2),
             }),
             scored: None,
@@ -547,7 +541,6 @@ mod tests {
         let independent = Target {
             head: Arc::new(Head {
                 hidden: 4,
-                operator: 3,
                 embedding: Array2::eye(2),
             }),
             ..first.clone()
@@ -562,7 +555,6 @@ mod tests {
         let incompatible = Target {
             head: Arc::new(Head {
                 hidden: 0,
-                operator: 0,
                 embedding: Array2::zeros((2, 2)),
             }),
             ..first.clone()
