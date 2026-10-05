@@ -1,12 +1,13 @@
 //! Program decomposition of a network's parameters (#2951).
 //!
 //! A model is imported as an operator program (`import`, `safetensors`, `operator_program`) and
-//! decomposed into per-input rank-one subcomponents of chosen linear maps (`pieces`, `masked`,
-//! `blocks`), fitted through the model's own masked forward, on the host or a device
-//! (`masked_device`, `device_program`, `device_train`), one site at a time (`site_fit`,
-//! `sparse_code`). A subcomponent is priced by the description of its weights (`describe`, `codec`,
-//! `precision`) plus the KL its error costs. `explanation` runs the fitted sites as one program, and
-//! `counterfactual` scores its predicted response to declared interventions against the model's.
+//! explained by an [`artifact::Artifact`]: an executable program of priced rules bound to the
+//! model's places, sent in one message (`codec`, `precision`). The acceptance path (`acceptance`,
+//! `candidate_frontier`, `run_check`) minimises the artifact's structural cost `C(P)` subject to
+//! its local fidelity `D_local(P) ≤ δ` and its run fidelity `D_run(P) ≤ ε`, `D_run` measured
+//! under declared native interventions (`counterfactual`, `intervention_program`). Candidates are
+//! fitted through the model's own forward on a device (`resident_causal_fit`, `device_program`,
+//! `artifact_device`).
 //!
 //! Exact execution belongs to `gated_rewrite` (gated activations, norms), `attention` (rotary
 //! attention under the source's joint softmax), `block` and `apply` (native linear reads with
@@ -94,50 +95,12 @@ pub mod vector_rule_pilot;
 pub mod shared_geometry_pilot;
 pub mod shared_geometry_transfer;
 
-// Per-input pieces of one linear map: an overcomplete rank-1 library fitted so that each input
-// lists few pieces (listing code plus second-order KL).
-pub mod pieces;
-
-// Per-input subcomponents trained through the model's own masked forward; heuristic mask search, a flip
-// kept when the measured total drops.
-pub mod masked;
-
-pub mod explanation;
-
-#[cfg(test)]
-mod explanation_tests;
-
-#[cfg(test)]
-mod masked_tests;
-
-// Rank-k gated subcomponents: which of a library's columns share one gate, chosen by the code.
-pub mod blocks;
-
-#[cfg(test)]
-mod blocks_tests;
-
-// Structured descriptions of a block: its readers and writers in decodable charts (harmonic,
-// frames), its core by its own structure, priced at the KL its error costs.
-pub mod describe;
-
-#[cfg(test)]
-mod describe_tests;
-
 // Rules of attention heads: one body read through what the decoder holds (a match through an
 // earlier head's output-value circuit, a copy through the norm gains), bound per head by a scale.
 pub mod rules;
 
 #[cfg(test)]
 mod rules_tests;
-
-// The frozen tail of a decoder language model after a decomposed window, as a masked head.
-pub mod tail;
-
-#[cfg(test)]
-mod tail_tests;
-
-#[cfg(test)]
-mod pieces_tests;
 
 // Exact directional derivatives of operator programs.
 pub mod derivatives;
@@ -150,30 +113,6 @@ pub mod device_program;
 
 #[cfg(test)]
 mod device_program_tests;
-
-// The masked fit's hot path (forward, KL, mask gradients, Fishers, step products) on a device.
-pub mod masked_device;
-
-// The explanation's core path on a device: targets, every replacement's forward with its selection, KL.
-pub mod core_device;
-
-#[cfg(test)]
-mod core_device_tests;
-
-// Many threads' products with the same large matrix (a site's metric, pricing its blocks), run as one.
-pub mod combine;
-
-#[cfg(test)]
-mod combine_tests;
-
-#[cfg(test)]
-mod masked_device_tests;
-
-// A masked program's library trained on a device: every step's sets, KL and box charge on it.
-pub mod device_train;
-
-#[cfg(test)]
-mod device_train_tests;
 
 // Model exports (export.json and raw float64 tensors) as operator programs and contracts.
 pub mod import;
@@ -212,21 +151,11 @@ pub mod secant;
 // Evidence status and ranked robust supports.
 pub mod supports;
 
-// Concepts: co-firing groups of subcomponents, one latent per word, fitted by one KT code; the
-// vocabulary a word's computation is described in.
-pub mod concepts;
-
-#[cfg(test)]
-mod concepts_tests;
-
 // Gate laws: which subcomponents are on for an input, from a small bits-charged law over the
 // model's own amplitudes (fit, code, feature screen, decisions).
 pub mod gates;
 
-// Libraries fitted on one site's own inputs to its second-order code.
-pub mod site_fit;
-
-// Exact real-fit coder operand fixtures for explicit capture/replay probes.
+// The SHA-256 digests drivers record for the files they read and write.
 pub mod coder_capture;
 
 // An MLP accounted for by explicit rules between its subcomponents' amplitudes.
@@ -235,36 +164,11 @@ pub mod mlp_account;
 #[cfg(test)]
 mod mlp_account_tests;
 
-// Per-input sparse coding of a site's output by its blocks' real contributions, with certified bounds.
-pub mod sparse_code;
-
-#[cfg(test)]
-mod sparse_code_tests;
-
-// Counterfactual response: an explanation's predicted response to declared interventions
-// against the native model's.
-/// Signed composition accounting on an observed execution: a replaced site's output error split
-/// into what it omits on the clean input and its changed response to error arriving from upstream.
-pub mod composition;
+// The native decoder under declared interventions, and a replacement's scores against it.
 pub mod counterfactual;
-
-// The evaluation side on a device: the decoder resident, every compared program run there in batches.
-pub mod eval_device;
-
-#[cfg(test)]
-mod eval_device_tests;
 
 #[cfg(test)]
 mod counterfactual_tests;
-
-// Known-mechanism toys: counterfactual questions and mechanism checks for an explanation.
-pub mod toys;
-
-#[cfg(test)]
-mod toys_tests;
-
-#[cfg(test)]
-mod site_fit_tests;
 
 #[cfg(test)]
 mod gates_tests;

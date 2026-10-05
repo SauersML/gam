@@ -477,7 +477,7 @@ mod tests {
     }
     #[test]
     fn four_layer_terminal_readout_materializes_after_logit_exception_before_readout_edit() {
-        let dir = crate::explanation_tests::tiny_export("artifact_device_readout", 4);
+        let dir = crate::test_support::tiny_export("artifact_device_readout", 4);
         let imported = crate::import::import_language_model(&dir, 2, 12).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         let program = imported.program;
@@ -531,7 +531,7 @@ mod tests {
     }
     #[test]
     fn edited_intermediates_skip_real_native_head_but_preserve_residual_edits() {
-        let dir = crate::explanation_tests::tiny_export("device_intermediate_head", 2);
+        let dir = crate::test_support::tiny_export("device_intermediate_head", 2);
         let imported = crate::import::import_language_model(&dir, 1, 12).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         let p = imported.program;
@@ -577,7 +577,7 @@ mod tests {
     }
     #[test]
     fn overlapping_exceptions_round_in_order_before_intermediate_edit() {
-        let dir = crate::explanation_tests::tiny_export("ordered_device_exceptions", 2);
+        let dir = crate::test_support::tiny_export("ordered_device_exceptions", 2);
         let imported = crate::import::import_language_model(&dir, 1, 12).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         let mut artifact = Artifact::native(&imported.program).unwrap();
@@ -631,7 +631,7 @@ mod tests {
     }
     #[test]
     fn value_mode_materializes_genuine_language_readout_without_synthetic_head() {
-        let dir = crate::explanation_tests::tiny_export("resident_value_readout", 2);
+        let dir = crate::test_support::tiny_export("resident_value_readout", 2);
         let imported = crate::import::import_language_model(&dir, 1, 6).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         let device = Device::host();
@@ -696,7 +696,7 @@ mod tests {
 
     #[test]
     fn shared_resident_keeps_independent_root_edits_and_decoded_values() {
-        let dir = crate::explanation_tests::tiny_export("shared_device_resident", 2);
+        let dir = crate::test_support::tiny_export("shared_device_resident", 2);
         let imported = crate::import::import_language_model(&dir, 1, 12).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         let mut artifact = Artifact::native(&imported.program).unwrap();

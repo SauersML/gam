@@ -10,7 +10,7 @@
 //! amplitudes (given the norm scales and gates the forward computes). Its switching function is a
 //! logit over a few features `f`: its own `a_j` first, then amplitudes `a_k` of upstream
 //! subcomponents at this position (lag 0) or at the previous position (lag 1). Only what the native
-//! forward has computed when `j` runs is allowed ([`upstream`]): a site's amplitudes at this position
+//! forward has computed when `j` runs is allowed: a site's amplitudes at this position
 //! when the site precedes `j`'s read, and at the previous position only through an attention step
 //! between them. Nothing downstream or in the future is read, so the switching functions are a
 //! causal circuit, not an analyser:
@@ -81,8 +81,6 @@
 
 use super::codec::{prefix_integer_len_bits, signed_prefix_integer_len_bits};
 use super::device::{product_atb, proposing};
-use super::masked::Site;
-use super::operator_program::{Node, OperatorProgram};
 use ndarray::{Array1, Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -686,37 +684,6 @@ pub fn screen(candidates: &Array2<f64>, residuals: &Array2<f64>, weights: &Array
     let mut gains = score;
     gains.zip_mut_with(&info, |s, i| *s = if *i > 0.0 { *s * *s / (2.0 * std::f64::consts::LN_2 * i) } else { 0.0 });
     Ok(gains)
-}
-
-/// The sites whose amplitudes a site's switching functions may read (module note).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Upstream {
-    /// At the same position: every written node precedes the site's first read node.
-    pub here: Vec<usize>,
-    /// At the previous position: an attention step lies after every written node and at or before
-    /// the site's first read node, so the previous position reaches it only through attention.
-    pub before: Vec<usize>,
-}
-
-/// Per site, its [`Upstream`] sites in `program` (nodes in topological order).
-pub fn upstream(program: &OperatorProgram, sites: &[Site]) -> Vec<Upstream> {
-    let mixing: Vec<usize> =
-        program.nodes.iter().enumerate().filter(|(_, n)| matches!(n, Node::Attend { .. } | Node::Mix { .. })).map(|(i, _)| i).collect();
-    sites
-        .iter()
-        .map(|b| {
-            let first_read = b.reads.iter().min().copied().unwrap_or(0);
-            let last_write = |a: &Site| a.writes.iter().max().copied().unwrap_or(usize::MAX);
-            let here = sites.iter().enumerate().filter(|(_, a)| last_write(a) < first_read).map(|(i, _)| i).collect();
-            let before = sites
-                .iter()
-                .enumerate()
-                .filter(|(_, a)| mixing.iter().any(|m| last_write(a) < *m && *m <= first_read))
-                .map(|(i, _)| i)
-                .collect();
-            Upstream { here, before }
-        })
-        .collect()
 }
 
 /// A switch's decisions over feature rows, as a column of 0/1.

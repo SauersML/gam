@@ -3,7 +3,7 @@ use crate::acceptance::Change;
 
 #[test]
 fn hidden_teacher_prefix_and_tiled_head_preserve_native_values_and_edits() {
-    let dir=crate::explanation_tests::tiny_export("streamed_family_hidden",2);
+    let dir=crate::test_support::tiny_export("streamed_family_hidden",2);
     let imported=crate::import::import_language_model(&dir,1,12).unwrap();
     std::fs::remove_dir_all(dir).unwrap();
     let head=Head::of(&imported.program).unwrap();
@@ -50,7 +50,7 @@ fn numeric_budgets_count_hidden_teachers_and_all_four_logits_tiles() {
 
 #[test]
 fn native_plan_rejects_non_dense_or_multi_term_terminal_head() {
-    let dir=crate::explanation_tests::tiny_export("streamed_family_head_guard",1);
+    let dir=crate::test_support::tiny_export("streamed_family_head_guard",1);
     let imported=crate::import::import_language_model(&dir,1,4).unwrap();
     std::fs::remove_dir_all(dir).unwrap();
     let mut program=imported.program;
@@ -66,7 +66,7 @@ fn native_plan_rejects_non_dense_or_multi_term_terminal_head() {
 
 #[test]
 fn values_prefix_preserves_ordered_partial_native_edits_and_source() {
-    let dir=crate::explanation_tests::tiny_export("streamed_native_values",2);
+    let dir=crate::test_support::tiny_export("streamed_native_values",2);
     let imported=crate::import::import_language_model(&dir,1,6).unwrap();
     std::fs::remove_dir_all(dir).unwrap();
     let head=Head::of(&imported.program).unwrap();

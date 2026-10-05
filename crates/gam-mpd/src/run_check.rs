@@ -12,8 +12,8 @@
 //! # The episodes
 //!
 //! The native side is `counterfactual`'s own: its binary64 [`Decoder`] runs each episode's actions
-//! through its [`Program`] with the native donor states, exactly as `counterfactual::evaluate` runs
-//! the native model. The explanation's side is the decoded [`Artifact`] executed as an operator
+//! through its [`Program`] with the native donor states. The explanation's side is the decoded
+//! [`Artifact`] executed as an operator
 //! program, each action applied at the places it holds:
 //!
 //! * a head's or a neuron's input scale ([`InputChange::Scale`] at an `o` or `down_proj` site) scales
@@ -46,7 +46,7 @@
 
 use super::acceptance::{EpisodeScore, RunCheck, kl_logits};
 use super::artifact::Artifact;
-use super::counterfactual::{Action, Decoder, Donor, Forward, InputChange, KINDS, Maps, OutputChange, Program, Rows, Spec, top1_rows};
+use super::counterfactual::{Action, Decoder, Donor, Forward, InputChange, KINDS, OutputChange, Program, Rows, Spec, top1_rows};
 use super::operator_program::{FamilyInputs, Node, Operator, OperatorBody, OperatorProgram, SequenceLayout, SlotValues, remap_node};
 use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
 use ndarray::{Array1, Array2, Axis, s};
@@ -946,7 +946,7 @@ impl<'a> LanguageRun<'a> {
                                 .collect::<std::collections::BTreeSet<_>>()
                                 .into_iter()
                                 .collect();
-                            let mut native = Program::new(Maps::Native(decoder), &[], None);
+                            let mut native = Program::new(decoder, &[], None);
                             native.record = keys.iter().map(|k| (*k, None)).collect();
                             let forward_timer = RunTimer::start(&self.timers.teacher_donor_forward);
                             decoder.forward(&self.passages[d], &mut native, &[]);
@@ -967,7 +967,7 @@ impl<'a> LanguageRun<'a> {
                         .collect::<std::collections::BTreeSet<_>>()
                         .into_par_iter()
                         .map(|p| {
-                            let mut native = Program::new(Maps::Native(decoder), &[], None);
+                            let mut native = Program::new(decoder, &[], None);
                             let forward_timer = RunTimer::start(&self.timers.teacher_clean_forward);
                             let forward = decoder.forward(&self.passages[p], &mut native, &all_rows);
                             drop(forward_timer);
@@ -981,7 +981,7 @@ impl<'a> LanguageRun<'a> {
                         .par_iter()
                         .map(|episode| {
                             let native_donor = episode.donor.and_then(|d| native_donors.get(&d)).unwrap_or(&none);
-                            let mut native = Program::new(Maps::Native(decoder), &episode.actions, Some(native_donor));
+                            let mut native = Program::new(decoder, &episode.actions, Some(native_donor));
                             let forward_timer = RunTimer::start(&self.timers.teacher_episode_forward);
                             let reference = decoder.forward(&self.passages[episode.passage], &mut native, &episode.interface_rows);
                             drop(forward_timer);

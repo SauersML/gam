@@ -1,27 +1,19 @@
-//! Counterfactual response (#2951): how well does an explanation predict the native model's
-//! response to declared native interventions?
-//!
-//! An explanation of a decoder is a library of rank-one units per decomposed site (`u_c v_cᵀ`)
-//! and a selection rule naming, for every input, the units it runs. Its program replaces each
-//! site's map `x ↦ W x` by `x_r ↦ Σ_{c ∈ S_r} m_{rc} u_c (v_cᵀ x_r)` over row `r`'s selected
-//! units (masks `m`), and runs everything else of the decoder unchanged. The rule runs inside the
-//! program ([`Selector`]): it sees only the program's own states, never the native model's.
+//! Counterfactual response (#2951): the native model's response to declared native interventions.
 //!
 //! Interventions are native and decomposition-free ([`Action`]): they act on the decoder's
 //! physical quantities, a site's input or output rows (a neuron is a coordinate of the MLP
 //! down-projection's input; a head is a block of the attention output projection's input), or
-//! add a weight edit's map to a site's output. The same actions act on the explanation's program
-//! at the same places, so every explanation predicts the same physical change. An action at one
-//! row is activation-level; one at every row (a scaled neuron's or head's weights, a compiled
-//! edit) is weight-level. Mixing toward a donor passage takes the donor's state from the same
-//! program on the donor ([`Donor`]): the native donor state natively, the explanation's own
-//! donor state in its program.
+//! add a weight edit's map to a site's output. An action at one row is activation-level; one at
+//! every row (a scaled neuron's or head's weights, a compiled edit) is weight-level. Mixing toward
+//! a donor passage takes the donor's state from the same program on the donor ([`Donor`]).
 //!
-//! The score is the disagreement `KL(native ‖ explanation)` of the next-token distributions on
-//! the rows the actions can reach, beside the native effect `KL(native ‖ native clean)` there
-//! (how much there was to predict), and at the declared internal interfaces, the residual
-//! stream after every layer at the episode's interface rows, the same disagreement read through
-//! the final norm and unembedding (the unembedding's metric on the residual).
+//! [`Program`] runs the native maps under an episode's actions; `run_check` applies the same
+//! actions to a decoded artifact at the places it holds and scores both forwards with [`score`]:
+//! the disagreement `KL(native ‖ replacement)` of the next-token distributions on the rows the
+//! actions can reach, beside the native effect `KL(native ‖ native clean)` there (how much there
+//! was to predict), and at the declared internal interfaces, the residual stream after every
+//! layer at the episode's interface rows, the same disagreement read through the final norm and
+//! unembedding (the unembedding's metric on the residual).
 //!
 //! The decoder is the LlamaSimpleMLP of VPD's 4-layer Pile target as exported by
 //! `gam_mpd::import`'s language-model exports: pre-RMS-norm blocks, rotate-half rotary causal
@@ -35,8 +27,6 @@ use std::sync::Arc;
 use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 
-use super::codec::{prefix_integer_len_bits, signed_delta_len_bits};
-use super::explanation::Fitted;
 use super::llama_simple_mlp::gelu_tanh;
 
 /// The decomposed maps of one block, in site order.
@@ -46,11 +36,6 @@ const STORAGE: [&str; 6] = ["attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o
 /// Site `kind` of block `layer`.
 pub fn site_index(layer: usize, kind: usize) -> usize {
     layer * KINDS.len() + kind
-}
-
-/// The site's name in language-model libraries (`blocks.{layer}.{kind}`).
-pub fn site_name(site: usize) -> String {
-    format!("blocks.{}.{}", site / KINDS.len(), KINDS[site % KINDS.len()])
 }
 
 struct Block {
@@ -97,12 +82,6 @@ fn rms_norm(x: &Array2<f64>, gain: &Array1<f64>, eps: f64) -> Array2<f64> {
         row.iter_mut().zip(gain.iter()).for_each(|(v, g)| *v *= scale * g);
     }
     out
-}
-
-/// What computes each decomposed map in one forward: `apply(site, input)` is the site's output
-/// rows for its input rows.
-pub trait SiteMaps {
-    fn apply(&mut self, site: usize, input: &Array2<f64>) -> Array2<f64>;
 }
 
 /// One forward: the residual rows after the last block, and after every block at the asked rows.
@@ -214,23 +193,23 @@ impl Decoder {
         out
     }
 
-    /// One forward of `tokens`, every decomposed map computed by `maps`, keeping the residual
+    /// One forward of `tokens`, every decomposed map computed by `program`, keeping the residual
     /// after every block at `layer_rows`.
-    pub fn forward(&self, tokens: &[u32], maps: &mut dyn SiteMaps, layer_rows: &[usize]) -> Forward {
+    pub fn forward(&self, tokens: &[u32], program: &mut Program<'_>, layer_rows: &[usize]) -> Forward {
         let mut x = self.wte.select(Axis(0), &tokens.iter().map(|t| *t as usize).collect::<Vec<_>>());
         let mut layers = Vec::new();
         for (l, block) in self.blocks.iter().enumerate() {
             let n = rms_norm(&x, &block.rms1, self.eps);
-            let mut q = maps.apply(site_index(l, 0), &n);
-            let mut k = maps.apply(site_index(l, 1), &n);
-            let v = maps.apply(site_index(l, 2), &n);
+            let mut q = program.apply(site_index(l, 0), &n);
+            let mut k = program.apply(site_index(l, 1), &n);
+            let v = program.apply(site_index(l, 2), &n);
             self.rotate(&mut q);
             self.rotate(&mut k);
             let attended = self.attend(&q, &k, &v);
-            x += &maps.apply(site_index(l, 3), &attended);
+            x += &program.apply(site_index(l, 3), &attended);
             let n = rms_norm(&x, &block.rms2, self.eps);
-            let hidden = maps.apply(site_index(l, 4), &n).mapv(gelu_tanh);
-            x += &maps.apply(site_index(l, 5), &hidden);
+            let hidden = program.apply(site_index(l, 4), &n).mapv(gelu_tanh);
+            x += &program.apply(site_index(l, 5), &hidden);
             layers.push(x.select(Axis(0), layer_rows));
         }
         Forward { residual: x, layers }
@@ -330,220 +309,18 @@ pub struct Donor {
     pub states: BTreeMap<(usize, usize, bool), Array1<f64>>,
 }
 
-/// An explanation's selection rule, run inside its program on the program's own states.
-pub trait Selector {
-    /// Per row of the site's input, the units it runs and their masks.
-    fn select(&mut self, site: usize, input: &Array2<f64>) -> Vec<Vec<(u32, f64)>>;
-}
-
-/// A selection given in full (to test the evaluator, or for a rule run elsewhere on the
-/// program's own states): per row, the (site, unit) pairs on.
-#[derive(Clone, Debug, Default)]
-pub struct Selection {
-    pub rows: Vec<Vec<(u32, u32)>>,
-}
-
-impl Selection {
-    /// From global unit numbers (sites in order, each site's units numbered from `offsets[site]`).
-    pub fn from_global(rows: Vec<Vec<u32>>, offsets: &[usize]) -> Self {
-        let rows = rows
-            .into_iter()
-            .map(|units| {
-                units
-                    .into_iter()
-                    .map(|g| {
-                        let site = offsets.partition_point(|o| *o <= g as usize) - 1;
-                        (site as u32, g - offsets[site] as u32)
-                    })
-                    .collect()
-            })
-            .collect();
-        Self { rows }
-    }
-}
-
-impl Selector for Selection {
-    fn select(&mut self, site: usize, input: &Array2<f64>) -> Vec<Vec<(u32, f64)>> {
-        (0..input.nrows()).map(|r| self.rows[r].iter().filter(|(k, _)| *k as usize == site).map(|(_, c)| (*c, 1.0)).collect()).collect()
-    }
-}
-
-/// One site's library: `v` (units × d_in) and `u` (units × d_out).
-pub struct Library {
-    pub v: Array2<f64>,
-    pub u: Array2<f64>,
-}
-
-/// Every site's library from `DIR/{site name}.v.f64` and `.u.f64`; a site without files has none
-/// and runs its native map.
-pub fn load_libraries(dir: &Path, decoder: &Decoder) -> Result<Vec<Option<Library>>, String> {
-    (0..decoder.sites())
-        .map(|site| {
-            let (d_out, d_in) = decoder.native(site).dim();
-            let name = site_name(site);
-            let v_path = dir.join(format!("{name}.v.f64"));
-            if !v_path.exists() {
-                return Ok(None);
-            }
-            let v = read_f64_matrix(&v_path, d_in)?;
-            let u = read_f64_matrix(&dir.join(format!("{name}.u.f64")), d_out)?;
-            if u.nrows() != v.nrows() {
-                return Err(format!("{name}: {} read and {} write vectors", v.nrows(), u.nrows()));
-            }
-            Ok(Some(Library { v, u }))
-        })
-        .collect()
-}
-
-/// A fitted explanation's sites by decoder site (`gam_mpd::explanation`'s names are
-/// [`site_name`]'s); a decoder site none of them replaces runs native.
-pub fn fitted_sites<'a>(decoder: &Decoder, fitted: &'a [Fitted]) -> Result<Vec<Option<&'a Fitted>>, String> {
-    let mut by_site = vec![None; decoder.sites()];
-    for f in fitted {
-        let site = (0..decoder.sites()).find(|k| site_name(*k) == f.site.name).ok_or_else(|| format!("{}: not a site of the decoder", f.site.name))?;
-        let native = decoder.native(site);
-        if f.w != *native {
-            let gap = if f.w.dim() == native.dim() { (&f.w - native).iter().fold(0.0_f64, |m, d| m.max(d.abs())) } else { f64::NAN };
-            let differ = if f.w.dim() == native.dim() { f.w.iter().zip(native.iter()).filter(|(a, b)| a != b).count() } else { 0 };
-            return Err(format!(
-                "{}: fitted on another map than the decoder's ({:?} against {:?}, {differ} entries differ, largest by {gap:.3e}; reads {:?}, writes {:?})",
-                f.site.name,
-                f.w.dim(),
-                native.dim(),
-                f.site.reads,
-                f.site.writes
-            ));
-        }
-        by_site[site] = Some(f);
-    }
-    Ok(by_site)
-}
-
-/// The fitted sites' libraries, every block's columns as units.
-pub fn fitted_libraries(sites: &[Option<&Fitted>]) -> Vec<Option<Library>> {
-    sites.iter().map(|f| f.map(|f| Library { v: f.library.v.clone(), u: f.library.u.clone() })).collect()
-}
-
-/// A fitted explanation's own rule ([`Fitted::select`]) run inside the program: a site's blocks
-/// chosen from the program's own read of it, every column of a chosen block on.
-pub struct FittedRule<'a> {
-    pub sites: &'a [Option<&'a Fitted>],
-}
-
-impl Selector for FittedRule<'_> {
-    fn select(&mut self, site: usize, input: &Array2<f64>) -> Vec<Vec<(u32, f64)>> {
-        let Some(fitted) = self.sites.get(site).copied().flatten() else {
-            return vec![Vec::new(); input.nrows()];
-        };
-        let starts: Vec<usize> = fitted
-            .ranks
-            .iter()
-            .scan(0, |at, r| {
-                *at += r;
-                Some(*at - r)
-            })
-            .collect();
-        fitted
-            .select(input)
-            .outer_iter()
-            .map(|on| on.iter().enumerate().filter(|(_, m)| **m == 1.0).flat_map(|(b, _)| (starts[b]..starts[b] + fitted.ranks[b]).map(|c| (c as u32, 1.0))).collect())
-            .collect()
-    }
-}
-
-/// What a selection rule costs beyond its library.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct RulePrice {
-    /// Every parameter sent as `round(w 2^p)`.
-    pub precision: i32,
-    pub reals: usize,
-    pub bits: f64,
-    /// The site whose selections changed one bit coarser (none when `p = 0`).
-    pub binding: Option<String>,
-    /// The reads the selections were compared on, per site.
-    pub reads: usize,
-}
-
-/// A fitted rule's own parameters beyond its library, each site's map `W`, its mean written
-/// Fisher (the upper triangle) and its blocks' prices, from which [`super::site_fit::Selector`]
-/// forms its selection, sent at the lowest uniform lattice precision `2^-p` (`p ∈ [0, 40]`) under
-/// which every site's selection of `reads[k]` (the site's reads on the test passages, rows ×
-/// d_in) is unchanged in every entry; each lattice integer in the signed Elias δ code and `p + 1`
-/// once in the prefix integer code. The pricing `bench/vpd_2951/vpd_rule_precision.py` gives VPD's
-/// causal-importance network. Keeping the selections is not monotone in `p` (a coarser lattice
-/// can round a borderline read back), so `p` rises from 0 until every site keeps them, each `p`
-/// first trying the site that last failed.
-pub fn rule_price(sites: &[&Fitted], reads: &[Array2<f64>], observations: f64) -> Result<RulePrice, String> {
-    use rayon::prelude::*;
-    const HIGHEST: i32 = 40;
-    if sites.len() != reads.len() {
-        return Err(format!("{} sites, {} read tables", sites.len(), reads.len()));
-    }
-    let on_lattice = |w: f64, p: i32| (w * 2f64.powi(p)).round() / 2f64.powi(p);
-    let keeps = |k: usize, reference: &Array2<f64>, p: i32| -> Result<bool, String> {
-        let f = sites[k];
-        let bits: Vec<f64> = f.bits.iter().map(|b| on_lattice(*b, p)).collect();
-        let rule = super::site_fit::Selector::new(&f.w.mapv(|w| on_lattice(w, p)), &f.fisher.mapv(|w| on_lattice(w, p)), &f.library, &f.ranks, &bits, observations)?;
-        Ok(rule.select(&reads[k]) == *reference)
-    };
-    let references: Vec<Array2<f64>> = sites.par_iter().zip(reads).map(|(f, x)| f.select(x)).collect();
-    let mut order: Vec<usize> = (0..sites.len()).collect();
-    let (mut precision, mut binding) = (0, None);
-    'coarsest: loop {
-        for at in 0..order.len() {
-            let k = order[at];
-            if !keeps(k, &references[k], precision)? {
-                if precision == HIGHEST {
-                    return Err(format!("{}: the selections differ even at p = {HIGHEST}", sites[k].site.name));
-                }
-                order[..=at].rotate_right(1);
-                binding = Some(sites[k].site.name.clone());
-                precision += 1;
-                continue 'coarsest;
-            }
-        }
-        break;
-    }
-    let scale = 2f64.powi(precision);
-    let length = |w: f64| -> Result<f64, String> { Ok(signed_delta_len_bits((w * scale).round() as i64).map_err(|e| e.to_string())? as f64) };
-    let (mut bits, mut reals) = (prefix_integer_len_bits(precision as u64 + 1).map_err(|e| e.to_string())? as f64, 0);
-    for f in sites {
-        for w in f.w.iter().chain(f.bits.iter()) {
-            bits += length(*w)?;
-        }
-        for i in 0..f.fisher.nrows() {
-            for w in f.fisher.row(i).iter().skip(i) {
-                bits += length(*w)?;
-            }
-        }
-        let d = f.fisher.nrows();
-        reals += f.w.len() + f.bits.len() + d * (d + 1) / 2;
-    }
-    Ok(RulePrice { precision, reals, bits, binding, reads: reads.first().map_or(0, |x| x.nrows()) })
-}
-
-/// What a program runs at its sites.
-pub enum Maps<'a> {
-    /// The native maps.
-    Native(&'a Decoder),
-    /// An explanation's units, chosen by its own rule, at the sites it has a library for; its
-    /// other sites run their native maps.
-    Units { decoder: &'a Decoder, libraries: &'a [Option<Library>], selector: &'a mut dyn Selector },
-}
-
-/// A program under an intervention: its maps, the actions, its own donor states, and the site
-/// states to record (`(site, row, output?)`). `selected` counts the units its rule ran.
+/// The native decoder under an intervention: the actions, the donor states, and the site states
+/// to record (`(site, row, output?)`).
 pub struct Program<'a> {
-    pub maps: Maps<'a>,
+    pub decoder: &'a Decoder,
     pub actions: &'a [Action],
     pub donor: Option<&'a Donor>,
     pub record: Vec<((usize, usize, bool), Option<Array1<f64>>)>,
-    pub selected: usize,
 }
 
 impl<'a> Program<'a> {
-    pub fn new(maps: Maps<'a>, actions: &'a [Action], donor: Option<&'a Donor>) -> Self {
-        Self { maps, actions, donor, record: Vec::new(), selected: 0 }
+    pub fn new(decoder: &'a Decoder, actions: &'a [Action], donor: Option<&'a Donor>) -> Self {
+        Self { decoder, actions, donor, record: Vec::new() }
     }
 
     fn donor_row(&self, key: (usize, usize, bool)) -> Option<&Array1<f64>> {
@@ -566,7 +343,8 @@ impl<'a> Program<'a> {
     }
 }
 
-impl SiteMaps for Program<'_> {
+impl Program<'_> {
+    /// Site `site`'s output rows for its input rows, the actions applied.
     fn apply(&mut self, site: usize, input: &Array2<f64>) -> Array2<f64> {
         let actions = self.actions;
         let mut x = input.clone();
@@ -587,24 +365,7 @@ impl SiteMaps for Program<'_> {
             }
         }
         self.keep(site, &x, false);
-        let (mut y, ran) = match &mut self.maps {
-            Maps::Native(decoder) => (fast_abt(&x, decoder.native(site)), 0),
-            Maps::Units { decoder, libraries, selector } => match &libraries[site] {
-                None => (fast_abt(&x, decoder.native(site)), 0),
-                Some(library) => {
-                    let chosen = selector.select(site, &x);
-                    let mut y = Array2::<f64>::zeros((x.nrows(), library.u.ncols()));
-                    for ((mut out, xr), units) in y.outer_iter_mut().zip(x.outer_iter()).zip(&chosen) {
-                        for &(c, mask) in units {
-                            let c = c as usize;
-                            out.scaled_add(mask * library.v.row(c).dot(&xr), &library.u.row(c));
-                        }
-                    }
-                    (y, chosen.iter().map(Vec::len).sum::<usize>())
-                }
-            },
-        };
-        self.selected += ran;
+        let mut y = fast_abt(&x, self.decoder.native(site));
         let outputs = actions.iter().filter_map(|a| match a {
             Action::Output { site: k, change } if *k == site => Some(change),
             Action::Input { .. } | Action::Output { .. } => None,
@@ -621,7 +382,7 @@ impl SiteMaps for Program<'_> {
 }
 
 /// Per row, `KL(p ‖ q)` of two log-probability tiles.
-pub fn kl_rows(p: &Array2<f64>, q: &Array2<f64>) -> Vec<f64> {
+fn kl_rows(p: &Array2<f64>, q: &Array2<f64>) -> Vec<f64> {
     p.outer_iter().zip(q.outer_iter()).map(|(a, b)| a.iter().zip(b.iter()).map(|(x, y)| x.exp() * (x - y)).sum()).collect()
 }
 
@@ -634,29 +395,29 @@ pub fn top1_rows(p: &Array2<f64>, q: &Array2<f64>) -> Vec<bool> {
 /// One episode's scores.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Scores {
-    /// Mean `KL(native ‖ explanation)` over the output rows from the first changed row on.
+    /// Mean `KL(native ‖ replacement)` over the output rows from the first changed row on.
     pub kl: f64,
     /// Mean `KL(native ‖ native clean)` over the same rows.
     pub native_effect: f64,
     /// Share of those rows whose top token agrees.
     pub top1_agree: f64,
-    /// Per layer, mean `KL(native ‖ explanation)` of the residual after it, read through the
+    /// Per layer, mean `KL(native ‖ replacement)` of the residual after it, read through the
     /// final norm and unembedding, at the interface rows.
     pub interface_kl: Vec<f64>,
     /// Per layer, the native effect read the same way.
     pub interface_effect: Vec<f64>,
 }
 
-/// Scores of a native and an explanation forward of one episode (rows from `from` on, `tile` at
+/// Scores of a native and a replacement forward of one episode (rows from `from` on, `tile` at
 /// a time) against the native clean forward, whose layers are kept at every row.
-pub fn score(decoder: &Decoder, native: &Forward, explained: &Forward, clean: &Forward, interface_rows: &[usize], from: usize, tile: usize) -> Scores {
+pub fn score(decoder: &Decoder, native: &Forward, replacement: &Forward, clean: &Forward, interface_rows: &[usize], from: usize, tile: usize) -> Scores {
     let rows = native.residual.nrows();
     let (mut kl, mut effect, mut agree) = (0.0, 0.0, 0.0);
     let mut start = from;
     while start < rows {
         let end = (start + tile).min(rows);
         let p = decoder.log_probs(&native.residual.slice(s![start..end, ..]).to_owned());
-        let q = decoder.log_probs(&explained.residual.slice(s![start..end, ..]).to_owned());
+        let q = decoder.log_probs(&replacement.residual.slice(s![start..end, ..]).to_owned());
         let c = decoder.log_probs(&clean.residual.slice(s![start..end, ..]).to_owned());
         kl += kl_rows(&p, &q).iter().sum::<f64>();
         effect += kl_rows(&p, &c).iter().sum::<f64>();
@@ -668,7 +429,7 @@ pub fn score(decoder: &Decoder, native: &Forward, explained: &Forward, clean: &F
     let (mut interface_kl, mut interface_effect) = (Vec::new(), Vec::new());
     for l in 0..native.layers.len() {
         let p = decoder.log_probs(&native.layers[l]);
-        let q = decoder.log_probs(&explained.layers[l]);
+        let q = decoder.log_probs(&replacement.layers[l]);
         let c = decoder.log_probs(&clean.layers[l].select(Axis(0), interface_rows));
         interface_kl.push(mean(kl_rows(&p, &q)));
         interface_effect.push(mean(kl_rows(&p, &c)));
@@ -751,139 +512,6 @@ impl Spec {
         }
         Ok(Self { rows: field(&spec, "rows")?, episodes })
     }
-}
-
-/// An explanation under evaluation: its libraries (a site without one runs native) and, per
-/// episode id, a fresh instance of its selection rule. A donor passage runs the rule of the
-/// passage's clean episode, `clean/{passage}`.
-pub struct Explanation<'a> {
-    pub libraries: &'a [Option<Library>],
-    pub selector: Box<dyn Fn(&str) -> Result<Box<dyn Selector + 'a>, String> + Sync + 'a>,
-}
-
-/// One episode's scores, with the units per row the explanation's rule ran.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct Scored {
-    pub id: String,
-    pub group: String,
-    pub passage: usize,
-    pub from_row: usize,
-    pub selected_per_row: f64,
-    #[serde(flatten)]
-    pub scores: Scores,
-}
-
-/// Every episode of `spec` on `passages` (token rows), the explanation's program against the
-/// native model's (`None` scores the native model as its own explanation, a check of the
-/// evaluator), `tile` output rows at a time; episodes run in parallel. A donor passage runs once
-/// per program, recording every state any episode mixing toward it reads.
-pub fn evaluate(decoder: &Decoder, spec: &Spec, passages: &[Vec<u32>], explanation: Option<&Explanation<'_>>, tile: usize) -> Result<Vec<Scored>, String> {
-    use rayon::prelude::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let started = std::time::Instant::now();
-    let all_rows: Vec<usize> = (0..spec.rows).collect();
-    let named: std::collections::BTreeSet<usize> = spec.episodes.iter().map(|e| e.passage).collect();
-    let clean: BTreeMap<usize, Forward> = named
-        .par_iter()
-        .map(|&p| {
-            let mut native = Program::new(Maps::Native(decoder), &[], None);
-            (p, decoder.forward(&passages[p], &mut native, &all_rows))
-        })
-        .collect();
-    let mut wanted: BTreeMap<usize, Vec<(usize, usize, bool)>> = BTreeMap::new();
-    for e in &spec.episodes {
-        let keys: Vec<(usize, usize, bool)> = e.actions.iter().filter_map(Action::donor_state).collect();
-        if keys.is_empty() {
-            continue;
-        }
-        let read = wanted.entry(e.donor.ok_or_else(|| format!("{}: a mix without a donor", e.id))?).or_default();
-        read.extend(keys.into_iter().filter(|k| !read.contains(k)).collect::<Vec<_>>());
-    }
-    let record = |maps: Maps<'_>, d: usize, keys: &[(usize, usize, bool)]| -> Result<Donor, String> {
-        let mut program = Program::new(maps, &[], None);
-        program.record = keys.iter().map(|k| (*k, None)).collect();
-        decoder.forward(&passages[d], &mut program, &[]);
-        Ok(Donor { states: program.record.into_iter().map(|(k, v)| v.map(|v| (k, v)).ok_or("donor state not reached")).collect::<Result<_, _>>()? })
-    };
-    let native_donors: BTreeMap<usize, Donor> = wanted.par_iter().map(|(d, keys)| Ok((*d, record(Maps::Native(decoder), *d, keys)?))).collect::<Result<_, String>>()?;
-    let own_donors: BTreeMap<usize, Donor> = match explanation {
-        Some(x) => wanted
-            .par_iter()
-            .map(|(d, keys)| {
-                let mut rule = (x.selector)(&format!("clean/{d}"))?;
-                Ok((*d, record(Maps::Units { decoder, libraries: x.libraries, selector: rule.as_mut() }, *d, keys)?))
-            })
-            .collect::<Result<_, String>>()?,
-        None => BTreeMap::new(),
-    };
-    let none = Donor::default();
-    let done = AtomicUsize::new(0);
-    spec.episodes
-        .par_iter()
-        .map(|e| -> Result<Scored, String> {
-            let native_donor = e.donor.and_then(|d| native_donors.get(&d)).unwrap_or(&none);
-            let own_donor = e.donor.and_then(|d| own_donors.get(&d)).unwrap_or(&none);
-            let mut native = Program::new(Maps::Native(decoder), &e.actions, Some(native_donor));
-            let native_forward = decoder.forward(&passages[e.passage], &mut native, &e.interface_rows);
-            let (explained, selected) = match explanation {
-                Some(x) => {
-                    let mut rule = (x.selector)(&e.id)?;
-                    let mut program = Program::new(Maps::Units { decoder, libraries: x.libraries, selector: rule.as_mut() }, &e.actions, Some(own_donor));
-                    let forward = decoder.forward(&passages[e.passage], &mut program, &e.interface_rows);
-                    (forward, program.selected as f64 / spec.rows as f64)
-                }
-                None => {
-                    let mut program = Program::new(Maps::Native(decoder), &e.actions, Some(native_donor));
-                    (decoder.forward(&passages[e.passage], &mut program, &e.interface_rows), f64::NAN)
-                }
-            };
-            let from = e.actions.iter().map(Action::first_row).min().unwrap_or(0);
-            let scores = score(decoder, &native_forward, &explained, &clean[&e.passage], &e.interface_rows, from, tile);
-            let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if finished % 100 == 0 {
-                log::info!("{finished}/{} episodes, {:.0}s", spec.episodes.len(), started.elapsed().as_secs_f64());
-            }
-            Ok(Scored { id: e.id.clone(), group: e.group.clone(), passage: e.passage, from_row: from, selected_per_row: selected, scores })
-        })
-        .collect()
-}
-
-/// Means per group.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct GroupSummary {
-    pub episodes: usize,
-    pub kl: f64,
-    pub native_effect: f64,
-    pub top1_agree: f64,
-    pub selected_per_row: f64,
-    pub interface_kl: Vec<f64>,
-    pub interface_effect: Vec<f64>,
-}
-
-pub fn summarize(scored: &[Scored]) -> BTreeMap<String, GroupSummary> {
-    let mut groups: BTreeMap<String, Vec<&Scored>> = BTreeMap::new();
-    for s in scored {
-        groups.entry(s.group.clone()).or_default().push(s);
-    }
-    groups
-        .into_iter()
-        .map(|(g, ss)| {
-            let n = ss.len() as f64;
-            let mean = |f: &dyn Fn(&Scored) -> f64| ss.iter().map(|s| f(s)).sum::<f64>() / n;
-            let layers = ss.first().map_or(0, |s| s.scores.interface_kl.len());
-            let per_layer = |f: &dyn Fn(&Scored) -> &Vec<f64>| (0..layers).map(|l| ss.iter().map(|s| f(s)[l]).sum::<f64>() / n).collect();
-            let summary = GroupSummary {
-                episodes: ss.len(),
-                kl: mean(&|s| s.scores.kl),
-                native_effect: mean(&|s| s.scores.native_effect),
-                top1_agree: mean(&|s| s.scores.top1_agree),
-                selected_per_row: mean(&|s| s.selected_per_row),
-                interface_kl: per_layer(&|s| &s.scores.interface_kl),
-                interface_effect: per_layer(&|s| &s.scores.interface_effect),
-            };
-            (g, summary)
-        })
-        .collect()
 }
 
 /// The token rows of an export's passages, the first `rows` columns of each.
