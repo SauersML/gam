@@ -3,201 +3,581 @@
 [![PyPI](https://img.shields.io/pypi/v/gamfit.svg)](https://pypi.org/project/gamfit/)
 [![Python](https://img.shields.io/pypi/pyversions/gamfit.svg)](https://pypi.org/project/gamfit/)
 [![Docs](https://img.shields.io/readthedocs/gamfit.svg)](https://gamfit.readthedocs.io/)
+[![Rust CI](https://github.com/SauersML/gam/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/gam/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](https://github.com/SauersML/gam/blob/main/LICENSE)
 
 gamfit fits generalized additive models from a formula, chooses every
 smoothing parameter by REML/LAML in one converged optimization, and returns
-posterior-mean predictions with credible bands and observation intervals,
-from a Rust engine.
+posterior-mean predictions with credible bands and observation intervals.
+One Rust engine serves both the Python package (`gamfit`) and the CLI (`gam`).
 
-```bash
-uv add gamfit   # or: pip install gamfit
-```
+![A single 3-D weather loop with all 3,653 daily Central Park observations from 2015–2024. Angle is calendar date, distance from the center is the measured daily high–low temperature range, and height and color are mean temperature, in Celsius. Translucent observations occupy the full 3-D volume. The periodic fitted loop combines seasonal mean temperature and seasonal mean range; its vertical ribbon is the temperature fit's 95% credible band. Perspective preserves depth, and the fitted loop wraps smoothly.](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/readme_temperature.png)
 
-Wheels are published for Linux (x86_64, aarch64), macOS (x86_64, Apple
-silicon), and Windows. No Rust toolchain is required.
-
-## Example
-
-```python
-import pandas as pd
-import gamfit
-
-# 133 rows: head acceleration of a crash-test dummy, milliseconds after impact.
-mcycle = pd.read_csv("https://vincentarelbundock.github.io/Rdatasets/csv/MASS/mcycle.csv")
-
-# The mean and the noise level are both smooth functions of time.
-model = gamfit.fit(mcycle, "accel ~ s(times)", noise_formula="s(times)")
-
-bands = model.predict(mcycle, interval=0.95, observation_interval=True)
-print(bands[["posterior_mean", "posterior_mean_lower", "posterior_mean_upper",
-             "observation_lower", "observation_upper"]].head())
-```
-
-![mcycle location-scale fit: posterior mean, credible band and observation interval](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/mcycle_location_scale.png)
-
-## Coming from pyGAM
-
-- **Smoothness is estimated, not searched.** REML/LAML picks every
-  smoothing parameter, so there is no `gridsearch()` and no GCV. Against
-  pyGAM's defaults gamfit wins 8, ties 28 and loses 13 of 49 held-out
-  comparisons; the [benchmarks](https://gamfit.readthedocs.io/en/latest/benchmarks/) list every loss.
-- **Predictions carry their uncertainty.** One `predict` call returns the
-  posterior mean, a credible band for it and an observation interval
-  ([predictions](https://gamfit.readthedocs.io/en/latest/predictions/)).
-- **The noise can be modelled too.** `noise_formula=` fits a
-  location-scale model like the one above, which pyGAM cannot express; on
-  `mcycle` its 95% observation interval covers 97% of the data
-  ([tour](https://gamfit.readthedocs.io/en/latest/tour/#heteroscedastic-noise-mcycle)).
-
-Docs: <https://gamfit.readthedocs.io/>.
+Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
+Contributions of every kind are welcome.
 
 ## Scope
 
-`gamfit` fits Gaussian, binomial (including Bernoulli marginal-slope),
-Poisson, negative-binomial, Gamma, Beta, Tweedie, and multinomial GLMs
-with smooth terms, random effects,
-bounded/constrained coefficients, location-scale extensions, survival
-likelihoods, and flexible/learnable links. Posterior sampling uses NUTS
-where supported, and a Gaussian Laplace approximation otherwise.
+Supported response families: Gaussian, binomial / Bernoulli (including a
+marginal-slope variant for calibrated risk scores, and a latent-cloglog
+form), Poisson, negative-binomial, Gamma, Beta, Tweedie, multinomial-logit,
+conditional transformation-normal, Royston-Parmar, and parametric /
+semi-parametric survival in six likelihood modes (transformation, Weibull,
+location-scale, marginal-slope, and latent-Gaussian frailty in `latent`
+and `latent-binary` forms). Firth /
+Jeffreys bias reduction handles separation in binomial fits.
 
-Manifold smooths handle predictor spaces that wrap or close: circles,
-cylinders, tori, and the sphere (intrinsic Wahba and spherical-harmonic
-kernels), plus periodic tensor products and boundary-conditioned
-B-splines. The Möbius example in the gallery is a 4π-periodic
-double-cover parameterization, not a twisted Möbius-strip basis.
+Supported term types in formulas: parametric terms, univariate smooths
+(`s`), tensor-product smooths (`te`, `ti`, `t2`), radial smooths in arbitrary
+dimension (`matern`, `duchon`, `thinplate`), intrinsic manifold smooths
+(`sphere`, periodic / cyclic, torus, cylinder via `te(..., periodic=...)`),
+measure-jet (`mjs`) and constant-curvature (`curv`) smooths, PCA-subspace
+smooths (`pca`), random effects and factor smooths (`group`, `fs`, `sz`,
+`by=`), shape-constrained smooths (monotone / convex / concave),
+interval-bounded and sign-constrained coefficients (`bounded`,
+`nonnegative`, `nonpositive`), and learnable links
+(`link(type=flexible(...))`, `link(type=blended(...))`, `sas`,
+`beta-logistic`, `linkwiggle`).
 
-![rotating recovery of a trefoil knot, latent-free loop, wobbly cylinder, lumpy sphere, bumpy torus, and Möbius double-cover from noisy 3-D point clouds](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/geometric_shapes_demo.gif)
+Smoothing parameters are selected by REML or LAML. The outer search is
+adaptive regularization with cubics (ARC) on the criterion's exact analytic
+Hessian; a model without an analytic Hessian uses EFS or BFGS instead, never
+a finite-difference Hessian. Every fit returns a convergence certificate; a
+search that ends without one raises `FitConvergenceError`. Posterior
+sampling uses NUTS over the coefficient posterior conditional on the fitted
+smoothing parameters where the family supports it, and a Gaussian Laplace
+approximation otherwise.
 
-## Features
+The engine also provides, past fitting and point prediction (see
+[Examples](#examples) and the [docs](https://gamfit.readthedocs.io/)):
 
-- Polyharmonic / Duchon smooths combine magnitude, gradient, and
-  curvature penalty operators on the same basis. P-spline and
-  thin-plate smooths use their standard derivative penalties. Each
-  penalized block has its own smoothing parameter.
-- Flexible link functions: `flexible(base)` adds a spline offset on a
-  base link; `blended(...)` learns a mixture weight; `sas` and
-  `beta-logistic` learn shape parameters.
-- Surface smooths in arbitrary dimension: thin-plate, Duchon (scale-free
-  by default, hybrid with `length_scale=...`), and Matérn, with
-  automatic knot placement.
-- Tensor-product and manifold smooths: `te(...)` / `ti(...)` B-spline
-  tensors, periodic 1-D, cylinder / torus tensor products,
-  intrinsic sphere (Wahba kernel or spherical harmonics), and
-  boundary-conditioned B-splines.
-- Dispersion GAMLSS for Gamma, Beta, negative-binomial, and Tweedie via
-  `noise_formula=`.
-- Per-axis anisotropy inside a single joint smooth.
-- Shape-constrained smooths: `s(x, shape=monotone_increasing)`,
-  `convex`, `concave`.
-- Difference smooths: `by=` factor smooths plus covariance-aware
-  `model.difference_smooth(...)` contrasts with optional simultaneous
-  bands.
-- Marginal-slope models that separate baseline risk from a calibrated
-  score's effect, for Bernoulli and survival outcomes.
-- Survival in several likelihood modes (transformation, Weibull,
-  location-scale, marginal-slope, latent-Gaussian frailty) plus
-  competing-risks cumulative-incidence functions.
-- Response geometry for spherical and compositional outcomes via
-  Fréchet-mean tangent-space GAMs.
-- Posterior sampling via NUTS where supported, Gaussian Laplace
-  otherwise, behind one API; conformal prediction intervals via
-  `interval="conformal"`.
+- **Prediction intervals** — Wald and delta-method bands, conformal
+  intervals (split, jackknife+, and full conformal), and posterior draws
+  via NUTS or a Laplace approximation, with posterior-predictive checks.
+- **Model comparison** — per-term Wald and likelihood-ratio tests, and
+  ranking on the smoothing-corrected AIC via `compare_models`.
+- **Difference smooths** — covariance-aware contrasts between by-group
+  smooths, with optional simultaneous bands.
+- **Diagnostics and reports** — `summary` (coefficient table, effective
+  degrees of freedom), `diagnose` (residuals and fit metrics), residual and
+  partial-effect `plot`, schema `check`, and a self-contained HTML `report`.
+- **Manifold-valued responses** — responses on the sphere, simplex,
+  SPD-matrix cone, Grassmann, Stiefel, or hyperbolic ball, fit in the
+  tangent space at the Fréchet mean; a constant-curvature family estimates
+  the curvature.
+- **Sparse manifold dictionaries** — decompose a matrix into K sparse
+  atoms, each a low-dimensional curve or surface (line, circle, sphere,
+  torus) with a per-row coordinate, with a differentiable `gamfit.torch`
+  version, steering, crosscoders, and cross-layer transport.
+- **Integration and scale** — scikit-learn estimators, differentiable
+  `gamfit.torch` REML and basis primitives, pandas / polars / pyarrow /
+  numpy and CSV / Parquet inputs, O(n) / O(n log n) solver paths for large
+  univariate and 2-3D spatial smooths, streamed prediction, and optional
+  CUDA.
 
-## API examples
+## Install
+
+Python wheels are published for Linux (x86_64, aarch64), macOS (Intel
+and Apple silicon), and Windows. A Rust toolchain is not required.
+
+```bash
+uv add gamfit
+# or
+pip install gamfit
+```
+
+Optional extras: `gamfit[pandas]`, `gamfit[plot]`, `gamfit[sklearn]`,
+`gamfit[cuda]`, `gamfit[all]`. PyTorch is optional but is installed as
+the `torch` package itself; there is no `gamfit[torch]` package extra.
+
+For the Rust CLI:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SauersML/gam/main/install.sh | bash
+```
+
+Or `cargo build --release`. The binary is `./target/release/gam`.
+
+## Usage
+
+Python:
+
+```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x, site = rng.uniform(0, 10, 300), rng.choice(["A", "B", "C"], 300)
+train = {"x": x, "site": site, "y": np.sin(x) + (site == "B") + rng.normal(0, 0.3, 300)}
+test = {"x": np.array([2.5, 7.5]), "site": np.array(["A", "C"])}
+
+model = gamfit.fit(train, "y ~ s(x) + group(site)")
+preds = model.predict(test, interval=0.95)
+```
+
+CLI:
+
+```bash
+gam fit data.csv 'y ~ smooth(x) + group(site)' --out model.json
+gam predict model.json new_data.csv --out predictions.csv --uncertainty
+gam report model.json data.csv
+```
+
+CLI subcommands: `fit`, `predict`, `report`, `diagnose`, `sample`,
+`generate`, `compare`. Run `gam <command> --help` for options.
+
+## Examples
+
+Surface smooths in arbitrary dimension, with optional per-axis length
+scales:
 
 ```python
 import numpy as np
 import pandas as pd
 import gamfit
-from gamfit.sklearn import GAMRegressor, GAMClassifier
 
 rng = np.random.default_rng(0)
-train = pd.DataFrame({"x": rng.uniform(0, 10, 300), "site": rng.choice(["A", "B", "C"], 300)})
-train["y"] = np.sin(train.x) + (train.site == "B") + rng.normal(0, 0.3, 300)
-test = train.drop(columns="y").head(5)
-X, y = train[["x"]], train["y"].to_numpy()
+df = pd.DataFrame(rng.uniform(-1, 1, (300, 6)), columns=["x1", "x2", "x3", "x4", "space", "time"])
+df["y"] = np.sin(3 * df.x1) + df.x2 * df.x3 + np.cos(3 * df.space * df.time) + rng.normal(0, 0.2, 300)
+df[["pc1", "pc2", "pc3", "pc4"]] = df[["x1", "x2", "x3", "x4"]].to_numpy() * [1, 2, 5, 10]
+df["z"] = np.exp(-(df.x1**2 + df.x2**2 + df.x3**2 + df.x4**2)) + rng.normal(0, 0.1, 300)
 
-# Validate before you fit
-gamfit.validate_formula(train, "y ~ s(x) + group(site)")
-model = gamfit.fit(train, "y ~ s(x) + group(site)")
+gamfit.fit(df, "y ~ matern(x1, x2, x3, nu=5/2)")
+gamfit.fit(df, "y ~ duchon(x1, x2, x3, x4, centers=80)")
+gamfit.fit(df, "y ~ te(space, time, k=10)")
+gamfit.fit(df, "z ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
+```
 
-# Posterior sampling and mean bands
-posterior = model.sample(train, seed=42)
-bands = posterior.predict(test, level=0.95)
+![3D Matérn fit on a noisy 2-D landscape](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/surface_3d_wireframe.png)
 
-# Survival
+Smooths on manifolds. The basis and penalty encode the wrap topology,
+so a fit on `theta ∈ [0, 2π)` has no seam at 0 / 2π, and an `S²` fit
+has no pole artefacts.
+
+```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame(rng.uniform(0, 2 * np.pi, (400, 3)), columns=["theta", "u", "v"])
+df["h"], df["x"] = rng.uniform(0, 1, 400), rng.uniform(0, 1, 400)
+df["lat"], df["lon"] = rng.uniform(-1.4, 1.4, 400), rng.uniform(-np.pi, np.pi, 400)
+df["y"] = np.sin(df.theta) + np.cos(df.v) + np.sin(df.lat) * np.cos(df.lon) + df.x ** 2 + rng.normal(0, 0.2, 400)
+
+gamfit.fit(df, "y ~ s(theta, periodic=true, period=2*pi)")
+gamfit.fit(df, "y ~ te(theta, h, periodic=[0], period=[2*pi, None])")
+gamfit.fit(df, "y ~ te(u, v, periodic=[0,1], period=[2*pi, 2*pi])")
+gamfit.fit(df, "y ~ sphere(lat, lon, radians=true)")
+gamfit.fit(df, "y ~ s(x, bc=clamped)")
+```
+
+![rotating recovery of six geometric examples (trefoil knot, latent-free loop, wobbly cylinder, lumpy sphere, bumpy torus, Möbius double-cover) from noisy 3-D point clouds](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/geometric_shapes_demo.gif)
+
+Each pair shows the noisy input (left) and the recovered smooth
+(right). The full gallery and reproduction script:
+[docs/manifold-smooths.md](https://github.com/SauersML/gam/blob/main/docs/manifold-smooths.md).
+
+Manifold SAE dictionary. `sae_manifold_fit` decomposes an activation /
+embedding matrix into `K` sparse atoms, each a low-dimensional typed shape
+(line, open curve, circle, sphere, torus, graph, or Euclidean patch) with a
+per-token coordinate — a standard SAE direction is the degenerate special
+case. Each atom's topology is *adjudicated, not imposed*: by default the fit
+seeds a mixed portfolio and lets the support competition, the REML-selected
+smoothness, and the per-axis ARD prior decide which shapes survive, collapse
+to points, or die (a homogeneous cyclic topology by shorthand is rejected on
+overcomplete dictionaries — most features are not cyclic). Two lanes share
+one front door, chosen by admission: the dense small-`K` certification lane
+(`K ≤ p`, posterior shape bands, evidence-raced topologies) and the
+overcomplete hard-TopK support lane (`K > p`, per-token active set solved
+against the frozen dictionary, memory `O(N·top_k)` — the LLM-scale path).
+Fits mint only from a converged, certificate-checked optimization.
+
+```python no-exec
+fit = gamfit.sae.sae_manifold_fit(X=acts, K=32_000, d_atom=1,
+                                  assignment="topk", top_k=8)   # K >> p, topology=auto
+census = Counter(fit.atom_topologies)     # which shapes the evidence kept
+codes = fit.encode(acts_new)              # sparse support + amplitude + coordinate
+curve = fit.atom_curve(k, ts)             # the atom's decoded manifold, sampled
+plan = fit.steer(k, amplitude, t_from, t_to)   # on-manifold steering delta
+```
+
+The dictionary supports four gating families (`assignment="ordered_beta_bernoulli"`,
+`"softmax"`, `"threshold_gate"`, or `"topk"`) and a frozen
+`gamfit.torch.ManifoldSAE` tensor adapter over the same converged native fit.
+Around it: `select_topology`
+to choose an atom's shape by evidence; `sae_checkpoint_dynamics` to track
+atoms across training checkpoints; `sae_crosscoder_fit` and
+`layer_transport_fit` / `layer_transport_ladder` for cross-layer
+dictionaries; and `gamfit.identifiability` factor-recovery diagnostics.
+
+Details: [docs/manifold-sae.md](https://github.com/SauersML/gam/blob/main/docs/manifold-sae.md).
+
+Learnable link functions. A `flexible(base)` link adds a spline offset
+on top of a base link. `blended(l1, l2)` learns a mixture weight. `sas`
+and `beta-logistic` learn shape parameters. The beta-logistic link is the
+CDF of `logit(U)`, `U ~ Beta(a, b)`, standardized to logit's location and
+scale, so its `(epsilon, log_delta)` move only skew and tails.
+
+```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+age = rng.uniform(20, 80, 600)
+df = {"age": age, "case": (rng.uniform(size=600) < 1 / (1 + np.exp(-(age - 50) / 8))).astype(float)}
+
+gamfit.fit(df, "case ~ s(age) + link(type=flexible(probit))"
+                 " + linkwiggle(internal_knots=6)")
+```
+
+Marginal-slope models for binary or survival outcomes with a calibrated
+risk score. The baseline and the score effect are fit in separate
+formulas; the score effect is a smooth function of covariate space.
+Supply a `transformation_normal_stage1=` recipe to condition the score on
+covariates and cross-fit it inside the one call (a Neyman-orthogonal chain
+whose slope surface is insensitive to Stage-1 calibration error); no
+`z_column` is materialised by hand.
+
+```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame(rng.normal(size=(600, 3)), columns=["pc1", "pc2", "pc3"]).assign(family_id=np.arange(600) // 2)
+df["pgs"] = 0.5 * df.pc1 + rng.normal(size=600)
+df["case"] = (rng.normal(size=600) < -0.3 + 0.8 * (df.pgs - 0.5 * df.pc1) + 0.3 * df.pc2).astype(int)
+
+gamfit.fit(
+    df,
+    "case ~ matern(pc1, pc2, pc3)",
+    family="bernoulli-marginal-slope",
+    slope_formula="matern(pc1, pc2, pc3)",
+    transformation_normal_stage1=gamfit.CtnStage1(
+        response="pgs",
+        covariates="matern(pc1, pc2, pc3)",
+        group_column="family_id", folds=2,
+    ),
+)
+```
+
+![two predicted-probability surfaces over a (pc1, pc2) plane, at z = 0 and z = +2](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/marginal_slope_3d.png)
+
+Survival models. `Surv(entry, exit, event)` is supported in several
+likelihood modes: transformation, Weibull, location-scale,
+marginal-slope, and latent-Gaussian frailty (`latent`,
+`latent-binary`). `model.predict(...)` returns a `SurvivalPrediction`
+with on-demand `S(t)`, `h(t)`, `H(t)` on any time grid:
+
+```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
 age, bmi = rng.uniform(30, 80, 400), rng.normal(25, 4, 400)
 t = 15 * rng.weibull(1.5, 400) * np.exp(-(age - 55) / 20 - (bmi - 25) / 10)
 df = pd.DataFrame({"entry": 0.0, "exit": np.minimum(t, 25), "event": (t < 25) * 1.0, "age": age, "bmi": bmi})
+train_df, test_df = df.iloc[:300], df.iloc[300:]
+
+model = gamfit.fit(train_df, "Surv(entry, exit, event) ~ s(age) + bmi")
+pred = model.predict(test_df)
+S = pred.survival_at([1, 5, 10, 20])
+H = pred.cumulative_hazard_at([10])
+pred.write_survival_at_csv("surv.csv", times=[1, 5, 10])  # streamed
+```
+
+Event histories. `gam_models::event_history` fits marked counting
+processes: smooth covariate and time effects per mark, plus a per-subject
+latent state of unit-variance Ornstein–Uhlenbeck atoms whose number,
+directions, rates and loading priors are all chosen by the evidence — an
+atom enters when the empirical-Bayes prior of its loadings places their
+posterior mode off zero — and whose covariance across marks is the reported
+object, with its eigenmodes' uncertainty and every subject's smoothed
+latent state. Marks are recurrent, once-only or terminal, so
+competing risks, first occurrences and recurrent events are one likelihood
+with per-mark risk sets. The latent term is the individual's deviation from
+a population rate — `exp(η⁰)` is the intensity averaged over the latent
+state — and an observed risk score enters as a penalised slope surface
+`s(time, by=score)` whose bend with time and whose very existence the
+evidence selects. The latent chain is marginalised by adaptive
+Gauss-Hermite–Lagrange filtering, and the fit refines the quadrature order
+and the time mesh until its coefficients are stationary under refinement.
+Forecasts integrate the killed process chronologically along the latent
+path, so every survival and cumulative incidence is a probability; the
+predictive PIT is the Rosenblatt transform of the event times.
+
+Posterior sampling. `model.sample(...)` draws from the coefficient
+posterior conditional on the fitted smoothing parameters. Predictive
+bands are computed in row chunks.
+
+```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train, test = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}, {"x": np.linspace(0, 10, 5)}
+model = gamfit.fit(train, "y ~ s(x)")
+
+posterior = model.sample(train, seed=42)
+bands = posterior.predict(test, level=0.95)
+```
+
+Interval-bounded coefficients with an optional Beta prior:
+
+```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+age, prop = rng.uniform(20, 70, 300), rng.uniform(0, 1, 300)
+df = {"age": age, "prop": prop, "y": 0.02 * age + 0.6 * prop + rng.normal(0, 0.2, 300)}
+
 gamfit.fit(df,
-    "Surv(entry, exit, event) ~ s(age) + bmi + timewiggle(internal_knots=6)",
-    survival_likelihood="transformation",
-    baseline_target="weibull",
-)
-
-# scikit-learn
-est = GAMRegressor(formula="y ~ s(x)")
-est.fit(X, y)
-
-# Diagnose, plot, report
-model.diagnose(train).metrics
-model.plot_terms()                        # each term's partial effect with bands
-model.partial_dependence("s(x)").simultaneous_upper
-model.report("report.html")
+    "y ~ age + bounded(prop, min=0, max=1, target=0.5, strength=3)")
 ```
 
-## Public API
+Shape-constrained smooths. A smooth can be required to be monotone or
+convex/concave:
 
-| Symbol | Purpose |
+```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+dose, x = rng.uniform(0, 1, 300), rng.uniform(-1, 1, 300)
+df = {"dose": dose, "x": x, "y": np.sqrt(dose) + x ** 2 + rng.normal(0, 0.1, 300)}
+
+gamfit.fit(df, "y ~ s(dose, shape=monotone_increasing)")
+gamfit.fit(df, "y ~ s(x, shape=convex)")
+```
+
+Difference smooths. `by=` factor smooths fit one curve per group, and
+`model.difference_smooth(...)` returns the covariance-aware contrast
+between two groups (with an optional simultaneous band):
+
+```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame({"x": rng.uniform(0, 10, 400), "group": rng.choice(["control", "treated"], 400)})
+df["y"] = np.sin(df.x) + 0.5 * (df.group == "treated") * np.cos(df.x) + rng.normal(0, 0.3, 400)
+
+model = gamfit.fit(df, "y ~ s(x, by=group)")
+diff = model.difference_smooth(data=df, group="group", view="x",
+                               simultaneous=True)
+```
+
+Dispersion (location-scale) GAMLSS. A second formula models the scale /
+variance for Gamma, Beta, negative-binomial, and Tweedie:
+
+```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 1, 400)
+shape = np.exp(1 + 2 * x)                     # the noise shrinks as x grows
+df = {"x": x, "y": rng.gamma(shape, np.exp(np.sin(3 * x)) / shape)}
+
+gamfit.fit(df, "y ~ s(x)", family="gamma", noise_formula="s(x)")
+```
+
+Conformal prediction intervals. `interval="conformal"` with the labeled
+`training_data` gives the exact full-conformal set (Gaussian-identity) at the
+frozen smoothing parameters; with a held-out `calibration` table it gives the
+split-conformal band for any standard family, like
+`gam predict --conformal --training-data` / `--calibration`. The saved model
+holds no per-row training data, so full conformal takes the rows again:
+
+```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+data = pd.DataFrame({"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)})
+df, held_out, test = data.iloc[:200], data.iloc[200:], pd.DataFrame({"x": [2.0, 5.0, 8.0]})
+model = gamfit.fit(df, "y ~ s(x)")
+
+model.predict(test, interval="conformal", training_data=df, conformal_level=0.9)
+model.predict(test, interval="conformal", calibration=held_out, conformal_level=0.9)
+```
+
+Competing-risks survival. `competing_risks_cif(...)` and
+`CompetingRisksPrediction` evaluate cause-specific cumulative-incidence
+functions.
+
+Manifold-valued responses. `ResponseGeometryModel` fits GAMs for
+responses that live on a manifold, mapped to a tangent space at the
+Fréchet mean: the sphere, the simplex (`clr` / `alr`), the cone of SPD
+matrices, the Grassmann and Stiefel manifolds, and the hyperbolic
+(Poincaré) ball. A constant-curvature family estimates the curvature from
+the responses:
+
+```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 4, 300)
+sand = 0.2 + 0.08 * np.sin(x) + rng.normal(0, 0.01, 300)
+silt = 0.3 + 0.08 * np.cos(x) + rng.normal(0, 0.01, 300)
+normal = np.column_stack([np.sin(x), np.cos(x), 0.4 + rng.normal(0, 0.05, 300)])
+normal /= np.linalg.norm(normal, axis=1, keepdims=True)  # unit vectors on the sphere
+df = pd.DataFrame({"x": x, "sand": sand, "silt": silt, "clay": 1 - sand - silt})
+df[["nx", "ny", "nz"]] = normal
+
+gamfit.fit(df, "y ~ s(x)", response_geometry="poincare", response_columns=["sand", "silt", "clay"])
+gamfit.fit(df, "y ~ s(x)", response_geometry="constant_curvature", response_columns=["nx", "ny", "nz"])
+```
+
+Model comparison. `compare_models` ranks fits on the Wood-Pya-Saefken AIC,
+corrected for smoothing-parameter selection (`gam compare` prints the same
+document from saved models).
+
+```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model_a, model_b = gamfit.fit(df, "y ~ x"), gamfit.fit(df, "y ~ s(x)")
+
+gamfit.compare_models([model_a, model_b])
+```
+
+Diagnostics and reports. `model.summary()` gives the parametric and
+smooth-term tables, deviance explained, AIC and the convergence certificate
+(`gam summary MODEL` prints the same text); `model.diagnose(data)` returns
+residuals and fit metrics; `model.plot_terms()` draws each term's partial
+effect with pointwise intervals and a simultaneous band, from the numbers
+`model.partial_dependence(term)` returns (see
+[docs/partial-effects.md](https://github.com/SauersML/gam/blob/main/docs/partial-effects.md)); `model.plot(data, kind=...)`
+draws residual and observed-vs-predicted panels; `model.report("out.html")`
+writes a self-contained HTML report.
+
+PyTorch bridge. Differentiable REML primitives, smooth-basis layers, and
+frozen fitted-model modules are available under `gamfit.torch` and
+`gamfit.kernels` when `torch` is installed.
+
+scikit-learn wrappers:
+
+```python
+import numpy as np
+import pandas as pd
+from gamfit.sklearn import GAMRegressor
+
+rng = np.random.default_rng(0)
+X = pd.DataFrame({"x": rng.uniform(0, 10, 300)})
+y = np.sin(X["x"].to_numpy()) + rng.normal(0, 0.3, 300)
+
+est = GAMRegressor(formula="y ~ s(x)").fit(X, y)
+```
+
+## Penalties
+
+A smooth term contributes one or more penalized coefficient blocks,
+each with its own smoothing parameter selected by REML/LAML. For
+polyharmonic and Duchon radial bases, three penalty operators act on
+the same coefficient block: mass (L²), tension (gradient), and
+stiffness (Laplacian/curvature). P-spline, thin-plate, and tensor-product
+smooths use their standard derivative-based penalties.
+
+## GPU
+
+The Rust engine includes optional CUDA support (cuBLAS, cuSOLVER,
+cuSPARSE). It loads lazily and falls back to the CPU path when no
+working CUDA stack is found. The same wheel runs on CPU-only and GPU
+hosts.
+
+Per-op dispatch thresholds are measured at probe time from GPU FP64
+throughput, CPU FP64 throughput, and PCIe bandwidth. Below the
+crossover where transfer cost dominates, kernels stay on the CPU. To
+print the calibrated thresholds:
+
+```python
+import gamfit
+print(gamfit.cuda.format_cuda_diagnostics())
+```
+
+The wheel is compiled against the CUDA 12 driver/userspace ABI. If PyTorch has
+already mapped a complete CUDA stack, gamfit continues that exact stack; it
+does not preload a second system toolkit into the process. Otherwise it loads
+one complete system or packaged NVIDIA stack. A process whose mapped CUDA
+libraries do not belong to one complete stack is refused by the GPU probe
+instead of mixing context or handle ownership across implementations.
+
+## Repository layout
+
+| Path | Contents |
 | --- | --- |
-| `gamfit.fit(data, formula, **kwargs)` | Fit a model. |
-| `gamfit.load(path)` / `gamfit.loads(bytes)` | Reload a saved model. |
-| `gamfit.validate_formula(data, formula, ...)` | Type-check a formula without fitting. |
-| `gamfit.build_info()` | Native extension build metadata. |
-| `gamfit.cuda.cuda_diagnostics()` / `gamfit.cuda.format_cuda_diagnostics()` | CUDA probe results. |
-| `gamfit.explain_error(exc)` | Human-readable hint for a gamfit exception. |
-| `gamfit.Model` | Fitted model: `predict`, `summary`, `check`, `diagnose`, `plot`, `report`, `sample`, `save`. |
-| `gamfit.results.SurvivalPrediction` | Per-row hazard / survival surface. |
-| `gamfit.results.CompetingRisksPrediction`, `competing_risks_cif` | Competing-risks CIF evaluation. |
-| `gamfit.MultinomialModel` | Multinomial-logit / softmax model. |
-| `gamfit.results.SamplingConfig`, `PosteriorSamples`, `PosteriorPredictive` | Posterior interface. |
-| `gamfit.ResponseGeometryModel`, `sphere_frechet_mean`, `simplex_frechet_mean`, `alr`, `clr`, `closure` | Response-geometry utilities. |
-| `gamfit.smooth.Duchon`, `Matern`, `BSpline`, `TensorBSpline`, `MeasureJet`, `Sphere` | Smooth descriptors for `smooths=` and torch. |
-| `gamfit.sklearn.GAMRegressor` / `GAMClassifier` | scikit-learn estimators. |
+| `crates/gam-*/` | Rust engine, split across focused workspace crates: fitting/solve (`gam-solve`), inference (`gam-inference`), families/models (`gam-models`, `gam-model-api`), smooth construction (`gam-terms`, `gam-geometry`), manifold SAE (`gam-sae`), prediction (`gam-predict`), GPU (`gam-gpu`), reports (`gam-report`), CLI (`gam-cli`), and more. |
+| `crates/gam-pyffi/` | PyO3 bindings (`gamfit._rust`). |
+| `src/` | Thin workspace-root shell (`lib.rs`, shared types, macros) over the crates. |
+| `gamfit/` | Python public API on top of the bindings. |
+| `docs/` | MkDocs/Material documentation sources. |
+| `tests/` | Rust and Python integration tests. |
+| `bench/` | Benchmark harness, configs, datasets, plots. |
+| `examples/` | Python and Rust demos, including SAE and topology examples. |
+| `scripts/` | Documentation figure, gallery, and diagnostic scripts. |
 
-Full reference: <https://gamfit.readthedocs.io/en/latest/api-reference/>.
+## Documentation
 
-## Optional extras
+- Full Python documentation: <https://gamfit.readthedocs.io/>.
+- Real-data tour: [docs/tour.md](https://github.com/SauersML/gam/blob/main/docs/tour.md).
+- Benchmarks against pyGAM: [docs/benchmarks.md](https://github.com/SauersML/gam/blob/main/docs/benchmarks.md).
+- Cookbook: [docs/cookbook.md](https://github.com/SauersML/gam/blob/main/docs/cookbook.md).
+- Manifold smooths gallery: [docs/manifold-smooths.md](https://github.com/SauersML/gam/blob/main/docs/manifold-smooths.md).
+- Manifold SAE dictionary: [docs/manifold-sae.md](https://github.com/SauersML/gam/blob/main/docs/manifold-sae.md).
 
-```bash
-uv add "gamfit[pandas]"     # pandas + pyarrow input/output
-uv add "gamfit[plot]"       # matplotlib-based plotting
-uv add "gamfit[sklearn]"    # scikit-learn integration
-uv add "gamfit[cuda]"       # NVIDIA CUDA 12 wheel libraries on Linux x86_64
-uv add "gamfit[all]"        # pandas + plot + sklearn extras
-uv add torch                # PyTorch bridge dependency
-```
+## Contributing
 
-## GPU acceleration
+This is meant to be one of the easiest projects anywhere to contribute
+to — on purpose, not by neglect.
 
-CUDA support (cuBLAS / cuSOLVER / cuSPARSE) is built into the same
-wheel; there is no separate `gamfit-gpu` package. Install
-`gamfit[cuda]` on Linux x86_64 when you want PyPI's NVIDIA CUDA 12
-runtime libraries instead of a system CUDA toolkit. Per-op dispatch
-thresholds are derived at probe time from measured GPU FP64 throughput,
-CPU FP64 throughput, and PCIe bandwidth, so small kernels stay on the
-CPU. Inspect the calibrated thresholds with
-`gamfit.build_info()["cuda_diagnostics"]` or
-`gamfit.cuda.format_cuda_diagnostics()`.
+The correctness bar is high: smooths are checked against analytic oracles
+and finite-difference jets, and CI is strict. But that bar is on the
+merged result, and keeping it there is the maintainer's job — not a toll
+you pay to take part. So the bar to *contribute* is zero:
 
-The wheel uses the CUDA 12 ABI. If PyTorch has already mapped a complete CUDA
-stack, gamfit continues that same stack rather than preloading a second system
-toolkit. Without an existing stack it loads one complete system or packaged
-NVIDIA stack. The GPU probe refuses a partial or mixed mapped stack because
-CUDA context and library-handle ownership cannot be safely split across
-implementations.
+- **Broken PRs are welcome.** Fails CI, half-finished, you're not sure
+  it's right — open it anyway. A broken PR with a good idea in it beats a
+  good idea that never got sent.
+- **Beginners welcome.** You don't need REML, Rust, or PyO3 to help. A
+  confusing error message, a typo, a docs gap, or "why does it do this?"
+  is a real contribution.
+- **AI is allowed.** Wrote it with Claude, Codex, or a some other agent? Great.
+- **Any feature request, however far-fetched.** "Can it do X?" is useful
+  even when the answer is no — it shows how people want to use this.
+- **No template, no checklist, no CLA, no guidelines.** Have fun.
+
+The point is engagement. Ideas, bug reports, "here's how I'm using
+this," a PR that's mostly wrong but sparks the right fix — all of it
+helps. The only real failure is a good thought that never gets sent
+because the friction felt too high.
+
+Great PRs will often consider SPEC.md. Open a [pull request](https://github.com/SauersML/gam/pulls) or an
+[issue](https://github.com/SauersML/gam/issues) — bugs, features,
+questions, wild ideas. That's the whole process.
+
+Note, this README was written mostly by Claude, with some feedback from the human.
 
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](https://github.com/SauersML/gam/blob/main/LICENSE).
+
+## Live codebase city
+
+[![Latest GAM Codebase City: files become buildings, failures become fires, and repository relationships become roads](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/codebase-city-latest.png)](https://gam-codebase-city.sauerslabs.chatgpt.site)
+
+The city is rebuilt from the repository's files, crates, issues, commits,
+tests, failures, Actions runs, and measurement history. The preview is checked
+and refreshed every two hours. [Explore the live 3D city.](https://gam-codebase-city.sauerslabs.chatgpt.site)
