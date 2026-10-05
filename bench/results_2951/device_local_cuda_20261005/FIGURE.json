@@ -1,0 +1,14 @@
+{
+  "job": 16419,
+  "source": "edfb9aa49b5d4630445a1d54b79d24351d33c487",
+  "speedup_by_case": {
+    "Clean model": 21.214745866353663,
+    "Attention output weights \u00d7 1.5": 21.156573694227642,
+    "Attention output weights \u00d7 \u22120.5": 21.274434960082516
+  },
+  "max_absolute_error": 9.292011604600248e-13,
+  "parity_passed": true,
+  "scope": "Native same-input local supervision capture only; complete contexts, final input/target downloads included. No vocabulary head, fitting, acceptance, or mechanism-discovery result.",
+  "setup_excluded": true,
+  "repetitions_after_warmup": 5
+}

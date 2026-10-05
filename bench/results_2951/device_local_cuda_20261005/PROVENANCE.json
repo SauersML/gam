@@ -1,0 +1,31 @@
+{
+  "source": {
+    "previous": "a21ff63db690da4c5a73f93ad4267901c54e61b4",
+    "commit": "edfb9aa49b5d4630445a1d54b79d24351d33c487",
+    "base": "bd0503eb328cd19134cd0625c9940467c7749540"
+  },
+  "source_note": "Job launcher logs name its launch checkout. The executable was built independently from capture-build/SOURCE.json; use that manifest for code provenance.",
+  "job": 16419,
+  "status": "COMPLETED 0:0",
+  "retrieved_at_utc": "2026-10-05T21:47:57.811590+00:00",
+  "cpu_threads": 8,
+  "device": "NVIDIA L40",
+  "scope": "Native same-input local supervision capture only; complete contexts, final input/target downloads included. No vocabulary head, fitting, acceptance, or mechanism-discovery result.",
+  "setup_excluded": [
+    "model import",
+    "device setup",
+    "compilation",
+    "warmup"
+  ],
+  "included": "Final input and target downloads",
+  "parity_criterion": "Every element: abs(actual-reference) <= atol + rtol*abs(reference)",
+  "absolute_tolerance": 1e-09,
+  "relative_tolerance": 1e-08,
+  "checkpoint_sha256": "155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552",
+  "binary_record": "3ec6e5b2ee1b5ba498f7dc09f69a3c1be06d9a4327a6be3008b0a18e7a57ba4d  /mnt/nw/home/s.sauers/mpd-data/cluster/codex-device-local-core-tests/results/capture-bench",
+  "files": {
+    "capture/results/local_capture_bench.json": "6901719c4126a64634aa808fe7a787d1f40d1bd2bf0b3865ad130e0b59e3ae88",
+    "capture-build/after-verification.log": "9eebfd2932b413f91afeaaca9ab748a1889d5a5f2939b70b8e7116870d76bb3f",
+    "capture/slurm-16419.log": "fe6c3e0d199d74891af499a2ba7618672c8df26ceee0dbefa1c8f2dd4a5ac08c"
+  }
+}
