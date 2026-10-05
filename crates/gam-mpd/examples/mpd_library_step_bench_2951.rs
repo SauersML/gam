@@ -307,8 +307,17 @@ fn main() -> Result<(), String> {
     let mut p_program = DeviceProgram::compile_values_bounded(&device, &interchange::prefix(&p_flat)?, usize::MAX)?;
     p_program.set_arithmetic(gam_gpu::tensor::Arithmetic::F32);
     p_program.prepare_dense_parameters(&trainable)?;
-    let head = FixedHead::new(&device, &m_flat, &p_flat, 4096)?;
-    let m = Model::new(&m_program, &m_flat, m_streams, m_reads, &[])?;
+    // Where the experiments cannot be scored (a head the compact targets do not take), the posterior
+    // parts are timed alone, from a zero gradient on the device.
+    let scoring = match FixedHead::new(&device, &m_flat, &p_flat, 4096) {
+        Ok(head) => Some((head, Model::new(&m_program, &m_flat, m_streams, m_reads, &[])?)),
+        Err(reason) => {
+            log::info!("the experiments are not scored ({reason}); the posterior parts are timed from a zero gradient");
+            None
+        }
+    };
+    let zeros: BTreeMap<usize, gam_gpu::tensor::Tensor> =
+        trainable.iter().zip(&start.mean).map(|(op, m)| Ok((*op, device.zeros(m.nrows(), m.ncols()).map_err(error)?))).collect::<Result<_, String>>()?;
     let experiments = interchange::sample(&mut StdRng::seed_from_u64(1), sequences, layer_count, variables.len());
     let adam = Adam { mean_rate: 5e-5, log_sd_rate: 1e-2, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 };
     let scale = tokens as f64 / (experiments.len() * context) as f64 * std::f64::consts::LN_2;
@@ -330,16 +339,24 @@ fn main() -> Result<(), String> {
         for step in 0..=reps {
             let s = &mut host_seconds;
             timed(&device, s, "means_loaded", || load(&mut p_program, &trainable, &host.mean))?;
-            let design = timed(&device, s, "design", || interchange::design(&p_model(&p_program, sites)?, &variables, &experiments))?;
+            let design = match &scoring {
+                Some(_) => Some(timed(&device, s, "design", || interchange::design(&p_model(&p_program, sites)?, &variables, &experiments))?),
+                None => None,
+            };
             let (theta, noise) = timed(&device, s, "sample", || Ok(host_sample(&host.mean, &host.log_sd, step as u64)))?;
             timed(&device, s, "sample_loaded", || load(&mut p_program, &trainable, &theta))?;
-            let teacher = timed(&device, s, "teacher", || Teacher::new(&m, &head, &batch, &variables, &experiments))?;
-            let evaluation = timed(&device, s, "evaluate", || interchange::evaluate(&m, &p_model(&p_program, sites)?, &head, &batch, &teacher, &experiments, &design, true))?;
+            let evaluation = match (&scoring, &design) {
+                (Some((head, m)), Some(design)) => {
+                    let teacher = timed(&device, s, "teacher", || Teacher::new(m, head, &batch, &variables, &experiments))?;
+                    timed(&device, s, "evaluate", || interchange::evaluate(m, &p_model(&p_program, sites)?, head, &batch, &teacher, &experiments, design, true))?.gradient
+                }
+                _ => zeros.iter().map(|(op, z)| Ok((*op, device.copy(z).map_err(error)?))).collect::<Result<BTreeMap<_, _>, String>>()?,
+            };
             let gradients = timed(&device, s, "gradient_downloaded", || {
                 trainable
                     .iter()
                     .zip(&host.mean)
-                    .map(|(op, values)| match evaluation.gradient.get(op) {
+                    .map(|(op, values)| match evaluation.get(op) {
                         Some(g) => Ok(device.download(g).map_err(error)? * scale),
                         None => Ok(Array2::zeros(values.dim())),
                     })
@@ -356,17 +373,26 @@ fn main() -> Result<(), String> {
         for step in 0..=reps {
             let s = &mut device_seconds;
             timed(&device, s, "means_loaded", || posterior.mean_into(&mut p_program))?;
-            let design = timed(&device, s, "design", || interchange::design(&p_model(&p_program, sites)?, &variables, &experiments))?;
+            let design = match &scoring {
+                Some(_) => Some(timed(&device, s, "design", || interchange::design(&p_model(&p_program, sites)?, &variables, &experiments))?),
+                None => None,
+            };
             timed(&device, s, "sample_loaded", || posterior.sample_into(&mut p_program, step as u64))?;
-            let teacher = timed(&device, s, "teacher", || Teacher::new(&m, &head, &batch, &variables, &experiments))?;
-            let evaluation = timed(&device, s, "evaluate", || interchange::evaluate(&m, &p_model(&p_program, sites)?, &head, &batch, &teacher, &experiments, &design, true))?;
+            let gradient = match (&scoring, &design) {
+                (Some((head, m)), Some(design)) => {
+                    let teacher = timed(&device, s, "teacher", || Teacher::new(m, head, &batch, &variables, &experiments))?;
+                    timed(&device, s, "evaluate", || interchange::evaluate(m, &p_model(&p_program, sites)?, head, &batch, &teacher, &experiments, design, true))?.gradient
+                }
+                _ => zeros.iter().map(|(op, z)| Ok((*op, device.copy(z).map_err(error)?))).collect::<Result<BTreeMap<_, _>, String>>()?,
+            };
             timed(&device, s, "description", || Ok(posterior.divergences()?.iter().sum::<f64>()))?;
-            timed(&device, s, "posterior_step", || posterior.step(&evaluation.gradient, scale, &adam, step as u64))?;
+            timed(&device, s, "posterior_step", || posterior.step(&gradient, scale, &adam, step as u64))?;
         }
     }
     let report = json!({
         "model": model.display().to_string(),
         "explanation": kind,
+        "scored": scoring.is_some(),
         "device": device.name(),
         "sequences": sequences,
         "context": context,
