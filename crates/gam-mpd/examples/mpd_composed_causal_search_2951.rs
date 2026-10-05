@@ -12,7 +12,7 @@ use gam_mpd::{
     import::import_language_model,
     intervention_program::{self, Control, ControlValue},
     operator_program::{remap_node, FamilyInputs, Node, OperatorBody, OperatorProgram},
-    parameter_response_program,
+    parameter_response_program, program_learned_dag,
     program_structure_search::{
         self, EvaluatedArtifact, Evaluation as StructureEvaluation, Metric, Mutation,
     },
@@ -121,6 +121,8 @@ struct Settings {
     down_edit_family: Option<DownSettings>,
     #[serde(default)]
     structural_search: Option<StructuralSettings>,
+    #[serde(default)]
+    joint_response_search: Option<program_learned_dag::Settings>,
     controls: Vec<NativeControl>,
     cases: Vec<Case>,
     fit: FitSettings,
@@ -535,6 +537,42 @@ fn save(path: &Path, value: &Value) -> Result<(), String> {
         serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
+}
+
+// Preserve state fidelity as an independent selection axis for joint programs.
+// This is a maximum of sampled episode/observable means, not a per-token bound.
+fn maximum_response_error(m: &resident_causal_fit::Measurement) -> Result<f64, String> {
+    let mut largest = 0.0_f64;
+    if m.episodes.is_empty() || m.episodes.iter().any(|e| e.responses.is_empty()) {
+        return Err("response selection requires measured native observables".into());
+    }
+    for response in m.episodes.iter().flat_map(|e| &e.responses) {
+        let error = response.mean_normalized_squared_error;
+        if !error.is_finite() || error < 0. || response.scored_rows == 0 {
+            return Err("invalid measured native response error".into());
+        }
+        largest = largest.max(error);
+    }
+    Ok(largest)
+}
+
+fn training_dominates(b: &Value, a: &Value, joint: bool) -> bool {
+    let (Some(ac), Some(bc), Some(ae), Some(be)) = (
+        a["c32"].as_u64(), b["c32"].as_u64(),
+        a["training_kl"].as_f64(), b["training_kl"].as_f64(),
+    ) else { return false; };
+    if joint {
+        let (Some(ar), Some(br)) = (
+            a["maximum_episode_response_error"].as_f64(),
+            b["maximum_episode_response_error"].as_f64(),
+        ) else {
+            // Missing measurements are unknown, never an assumed zero.
+            return false;
+        };
+        bc <= ac && be <= ae && br <= ar && (bc < ac || be < ae || br < ar)
+    } else {
+        bc <= ac && be <= ae && (bc < ac || be < ae)
+    }
 }
 fn controls(
     artifact: &Artifact,
@@ -1162,10 +1200,15 @@ fn down_response_targets(
     weight: f64,
     limit: usize,
 ) -> Result<(resident_causal_fit::NativeResponses, Value), String> {
-    if observed_nodes.len() != down.response_nodes.len() {
+    if observed_nodes.len() != down.response_nodes.len()
+        && observed_nodes.len() != down.response_nodes.len() + 1
+    {
         return Err("response observation count differs".into());
     }
-    let paths: Vec<_> = down.response_nodes.iter().map(|n| vec![*n]).collect();
+    let mut paths: Vec<_> = down.response_nodes.iter().map(|n| vec![*n]).collect();
+    if observed_nodes.len() == down.response_nodes.len() + 1 {
+        paths.insert(0, vec![down.clean_output]);
+    }
     let teacher = intervention_program::compile_observed(&down.program, native_controls, &paths)?;
     if !logits.is_empty() && logits.len() != cases.len() {
         return Err("response label count differs".into());
@@ -1199,7 +1242,9 @@ fn down_response_targets(
         weight,
         limit,
     )?;
-    provenance["scope"]=json!("Direct unscaled scalar native down-edit coefficient targets under each case's upstream controls, before enclosing MLP-output masks. Candidate-owned coefficient functions; independent native teacher inputs. Not a rank-identification certificate or Local acceptance.");
+    provenance["includes_clean_output"] =
+        json!(observed_nodes.len() == down.response_nodes.len() + 1);
+    provenance["scope"]=json!("Direct native clean-output (when requested) and unscaled scalar native down-edit coefficient targets under each case's upstream controls, before enclosing MLP-output masks. Candidate-owned coefficient functions; independent native teacher inputs. Not a rank-identification certificate or Local acceptance.");
     Ok((targets, provenance))
 }
 
@@ -1220,6 +1265,16 @@ fn freeze_evaluation_ids(
             if multiple_uses {
                 ids.push(untied);
             }
+        }
+    }
+    ids
+}
+fn freeze_joint_evaluation_ids(frontier: &[Value], candidates: &[usize]) -> Vec<String> {
+    let mut ids = vec!["native".into()];
+    for candidate in candidates {
+        let id = format!("joint{candidate}-learned");
+        if frontier.iter().any(|v| v.as_str() == Some(&id)) {
+            ids.push(id);
         }
     }
     ids
@@ -1463,6 +1518,63 @@ fn graft_parameters_except(
         }
     }
     Ok((trainable, body_map))
+}
+/// Follow affine occurrences in the unchanged compiled-node prefix. This maps
+/// parameter owners across interface specialization without numerical/name matching.
+fn joint_graft_parameters(
+    candidate: &Artifact,
+    write: usize,
+    compiled: &program_learned_dag::Compiled,
+) -> Result<Vec<usize>, String> {
+    let place = candidate.place(write).ok_or("joint graft write absent")?;
+    let Node::Call { rule, .. } = candidate.program.nodes[place] else {
+        return Err("joint graft wrapper absent".into());
+    };
+    let nodes = &candidate.program.rules[rule].nodes;
+    let owners: BTreeSet<_> = compiled.trainable_operator_ids.iter().copied().collect();
+    let mut mapping = BTreeMap::new();
+    for (index, source) in compiled.program.nodes.iter().enumerate() {
+        if let Node::Affine { terms, bias } = source {
+            let Some(Node::Affine {
+                terms: actual,
+                bias: actual_bias,
+            }) = nodes.get(index)
+            else {
+                return Err("joint affine occurrence absent".into());
+            };
+            if terms.len() != actual.len() || bias.is_some() != actual_bias.is_some() {
+                return Err("joint affine occurrence changed".into());
+            }
+            for (source, target) in terms
+                .iter()
+                .map(|(_, op)| *op)
+                .chain(bias.iter().copied())
+                .zip(
+                    actual
+                        .iter()
+                        .map(|(_, op)| *op)
+                        .chain(actual_bias.iter().copied()),
+                )
+            {
+                if owners.contains(&source) {
+                    if mapping
+                        .insert(source, target)
+                        .is_some_and(|held| held != target)
+                    {
+                        return Err("joint parameter owner split by boundary specialization".into());
+                    }
+                }
+            }
+        }
+    }
+    if mapping.len() != owners.len() {
+        return Err("joint graft lost parameter owner".into());
+    }
+    let ids: Vec<_> = mapping.values().copied().collect();
+    if ids.iter().copied().collect::<BTreeSet<_>>().len() != ids.len() {
+        return Err("joint graft merged parameter owners".into());
+    }
+    Ok(ids)
 }
 fn copy_body(source: &OperatorProgram, target: &mut OperatorProgram) -> Result<(), String> {
     if source.rules.len() != 1 {
@@ -2042,6 +2154,29 @@ fn structural_run(
     )
 }
 
+fn validate_joint_configuration(settings: &Settings) -> Result<(), String> {
+    if settings.joint_response_search.is_some()
+        && (settings.width != 0
+            || !settings.expression_ids.is_empty()
+            || settings.require_interior_learned)
+    {
+        return Err("joint_response_search supplies its own bounded inventory and widths; legacy width, expression IDs and require_interior_learned must be absent".into());
+    }
+    if settings.joint_response_search.is_some() {
+        let config = settings
+            .down_edit_family
+            .as_ref()
+            .ok_or("joint response search requires down_edit_family")?;
+        if settings.uses != vec![config.layer]
+            || settings.structural_search.is_some()
+            || settings.native_initialization
+            || settings.frozen_shared_body.is_some()
+        {
+            return Err("joint response search supports exactly the declared down layer, without structural search, native initialization or body transfer".into());
+        }
+    }
+    Ok(())
+}
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() != 4 && args.len() != 5 {
@@ -2052,6 +2187,7 @@ fn run() -> Result<(), String> {
     let out = Path::new(&args[2]);
     let config_bytes = std::fs::read(config_path).map_err(|e| e.to_string())?;
     let settings: Settings = serde_json::from_slice(&config_bytes).map_err(|e| e.to_string())?;
+    validate_joint_configuration(&settings)?;
     if settings.evaluation.is_some() != (args.len() == 5) {
         return Err(
             "HELDOUT_EXPORT argument required exactly when evaluation config is present".into(),
@@ -2072,7 +2208,8 @@ fn run() -> Result<(), String> {
     }
     if settings.layers == 0
         || (settings.structural_search.is_none()
-            && (settings.uses.is_empty() || settings.width == 0))
+            && (settings.uses.is_empty()
+                || (settings.joint_response_search.is_none() && settings.width == 0)))
         || settings.context == 0
         || settings.sequences == 0
         || settings.uses.iter().copied().collect::<BTreeSet<_>>().len() != settings.uses.len()
@@ -2144,15 +2281,16 @@ fn run() -> Result<(), String> {
         return Err("native initialization and frozen shared body are mutually exclusive".into());
     }
     let inventory = composed_rule_search::enumerate(&settings.grammar)?;
-    let sharing = if settings.structural_search.is_some() {
-        composed_rule_search::interior_learned_selection(&inventory)
-    } else {
-        selection(
-            &inventory,
-            &settings.expression_ids,
-            settings.require_interior_learned,
-        )?
-    };
+    let sharing =
+        if settings.structural_search.is_some() || settings.joint_response_search.is_some() {
+            composed_rule_search::interior_learned_selection(&inventory)
+        } else {
+            selection(
+                &inventory,
+                &settings.expression_ids,
+                settings.require_interior_learned,
+            )?
+        };
     if settings.frozen_shared_body.is_some() && settings.expression_ids.len() != 1 {
         return Err("transfer config requires one frozen expression ID".into());
     }
@@ -2330,12 +2468,13 @@ fn run() -> Result<(), String> {
         "settings_sha256":sha256(config_path)?,"binary_sha256":sha256(&std::env::current_exe().map_err(|e|e.to_string())?)?,
         "rows_per_episode":family.rows,"controls":settings.controls,"cases":settings.cases,
         "scope":"training proposal search with optional frozen heldout measurement; no acceptance claim; declared boundary masks, retained shared-weight gains, and optional finite native down-weight edit family",
-        "fitting_objective":if down.is_some() || settings.structural_search.as_ref().is_some_and(|s|s.native_response_weight.is_some()){"maximum named-group mean of episode KL plus weighted direct coefficient response loss"}else{"maximum named-group mean of episode mean teacher-to-candidate KL"},"ranking_objective":"pure saved-f32 teacher-to-candidate KL; response loss reported separately; all causal sequence rows scored",
+        "fitting_objective":if down.is_some() || settings.structural_search.as_ref().is_some_and(|s|s.native_response_weight.is_some()){"maximum named-group mean of episode KL plus weighted direct native response loss"}else{"maximum named-group mean of episode mean teacher-to-candidate KL"},"ranking_objective":if settings.joint_response_search.is_some(){"Pareto in saved-f32 pure KL, C32 and maximum sampled episode/observable mean normalized squared response error; all causal sequence rows scored"}else{"pure saved-f32 teacher-to-candidate KL; response loss reported separately; all causal sequence rows scored"},
         "native_supervision":if settings.structural_search.as_ref().is_some_and(|s|s.native_response_weight.is_some()) {"native logits plus controlled native observable responses"}else if down.is_some(){"native logits plus direct scalar down-edit response coefficients; candidate runs its own complete states"}else{"native logits only; candidate runs its complete autonomous states"},
         "teacher_planned_numeric_bytes":if settings.fixed_head_targets.is_some(){Value::Null}else{json!(teacher_plan)},"fixed_head_targets":settings.fixed_head_targets,"teacher_plan_scope":"compact target/cache metadata in TEACHER_TARGETS.json; no full-logit target intermediate in compact mode",
         "native_codec_bytes":settings.native_codec_bytes,"native_codec_initialization_seconds":native_codec_initialization_seconds,"native_codec_preflight":native_codec.as_ref().map(|c|c.preflight()),"native_codec_stats":native_codec.as_ref().map(|c|c.stats()),
         "native_codec_budget_scope":"packed native codewords plus cached decoded numeric buffers only; excludes caller-owned source arrays, per-operator construction/lattice temporaries, full messages, label/execution buffers, metadata and allocator/library overhead; construction excluded from warm timings",
         "literal_down_arithmetic":"binary64 stored D updates in declared order D += a*u*v; original graph executes updated matrix; no float32 checkpoint-store or augmented-branch bitwise equivalence claim",
+        "joint_response_search":settings.joint_response_search,"joint_search_scope":"bounded enumerated learned multi-output DAG; exactly one declared down layer; shared computations are actual nodes; no body transfer; inventory truncation disclosed in JOINT_INVENTORY.json",
         "down_edit_family":settings.down_edit_family,"down_family_scope":"restricted declared native down-weight directions; teachers run literal edited matrices, predictor runs own response functions; fixed directions serialized and excluded from fitting; no arbitrary native-edit mapping; body export/transfer disabled in this mode",
         "control_scope":"activation boundary scaling is not a global weight edit; retained_operator gain affects all its invocations; no mapping claimed for removed internal coordinates",
         "weight_gain_arithmetic":"gain applied to every computed contribution, algebraically equivalent to scaling the shared operator; not a bit-exact claim about rounding edited checkpoint literals before GEMM",
@@ -2422,18 +2561,60 @@ fn run() -> Result<(), String> {
     let mut rows = vec![
         json!({"id":"native","c32":native_cost,"training_kl":native_measure.objective,"status":"training_measured","artifact_sha256":sha256(&out.join("native.artifact"))?,"control_map_sha256":sha256(&out.join("NATIVE_CONTROL_MAP.json"))?}),
     ];
-    for &id in &settings.expression_ids {
+    let joint_inventory = if let Some(search) = &settings.joint_response_search {
+        let layer = settings.down_edit_family.as_ref().unwrap().layer;
+        let inputs = vec![gam_mpd::operator_program::Interface::native(
+            native
+                .node_interface(layers[layer].normed)
+                .map_err(|e| e.to_string())?
+                .width(),
+        )
+        .map_err(|e| e.to_string())?];
+        let mut outputs = vec![gam_mpd::operator_program::Interface::native(
+            native
+                .node_interface(layers[layer].mlp)
+                .map_err(|e| e.to_string())?
+                .width(),
+        )
+        .map_err(|e| e.to_string())?];
+        outputs.extend(
+            (0..direction_count).map(|_| gam_mpd::operator_program::Interface::native(1).unwrap()),
+        );
+        let inventory = program_learned_dag::enumerate_interfaces(&inputs, &outputs, search)?;
+        save(
+            &out.join("JOINT_INVENTORY.json"),
+            &serde_json::to_value(&inventory).map_err(|e| e.to_string())?,
+        )?;
+        Some((inputs, outputs, inventory))
+    } else {
+        None
+    };
+    let candidate_ids: Vec<_> = joint_inventory.as_ref().map_or_else(
+        || settings.expression_ids.clone(),
+        |(_, _, i)| (0..i.proposals.len()).collect(),
+    );
+    for &id in &candidate_ids {
         for shared in [true, false] {
-            if !shared && use_specs.len() == 1 {
+            if !shared && (use_specs.len() == 1 || joint_inventory.is_some()) {
                 continue;
             }
-            let arm = if shared { "shared" } else { "untied" };
-            let name = format!("expression{id}-{arm}");
+            let arm = if joint_inventory.is_some() {
+                "learned"
+            } else if shared {
+                "shared"
+            } else {
+                "untied"
+            };
+            let name = if joint_inventory.is_some() {
+                format!("joint{id}-{arm}")
+            } else {
+                format!("expression{id}-{arm}")
+            };
             let root = out.join(&name);
             std::fs::create_dir(&root).map_err(|e| e.to_string())?;
             save(
                 &root.join("DECLARATION.json"),
-                &json!({"expression_id":id,"expression":inventory.expressions[id],"sharing_analysis":sharing.analyses[id],"arm":arm,"uses":settings.uses,"response_uses":direction_count,"body_export_supported":down.is_none(),"transfer":frozen_body.is_some(),"freeze_policy":if frozen_body.is_some() && shared {"body frozen; new maps only"}else if frozen_body.is_some(){"same initial body; independent per-use body adaptation"}else{"all proposal coefficients trainable"}}),
+                &json!({"expression_id":id,"expression":if let Some((_,_,j))=&joint_inventory {serde_json::to_value(&j.proposals[id]).map_err(|e|e.to_string())?}else{serde_json::to_value(&inventory.expressions[id]).map_err(|e|e.to_string())?},"sharing_analysis":if joint_inventory.is_some(){Value::Null}else{serde_json::to_value(&sharing.analyses[id]).map_err(|e|e.to_string())?},"arm":arm,"uses":settings.uses,"response_uses":direction_count,"body_export_supported":down.is_none(),"transfer":frozen_body.is_some(),"freeze_policy":if frozen_body.is_some() && shared {"body frozen; new maps only"}else if frozen_body.is_some(){"same initial body; independent per-use body adaptation"}else{"all proposal coefficients trainable"}}),
             )?;
             let attempt = (|| -> Result<Value, String> {
                 let compile = if shared {
@@ -2441,39 +2622,73 @@ fn run() -> Result<(), String> {
                 } else {
                     composed_rule_search::compile_untied
                 };
-                let mut proposal = compile(
-                    &inventory.expressions[id],
-                    settings.width,
-                    &use_specs,
-                    settings.seed,
-                )?;
-                if settings.native_initialization {
-                    proposal = gam_mpd::native_mlp_initialization::initialize(
-                        &proposal,
+                let joint = joint_inventory
+                    .as_ref()
+                    .map(|(inputs, outputs, inventory)| {
+                        program_learned_dag::compile_program(
+                            inputs,
+                            outputs,
+                            &inventory.proposals[id].expressions,
+                            settings.joint_response_search.as_ref().unwrap(),
+                        )
+                    })
+                    .transpose()?;
+                let proposal = if joint.is_none() {
+                    let mut proposal = compile(
                         &inventory.expressions[id],
-                        &native,
-                        &native_uses(&native, &layers, &settings.uses)?,
+                        settings.width,
+                        &use_specs,
+                        settings.seed,
                     )?;
-                }
-                if let Some((source, _)) = &frozen_body {
-                    copy_body(&source.program, &mut proposal.program)?;
-                }
+                    if settings.native_initialization {
+                        proposal = gam_mpd::native_mlp_initialization::initialize(
+                            &proposal,
+                            &inventory.expressions[id],
+                            &native,
+                            &native_uses(&native, &layers, &settings.uses)?,
+                        )?;
+                    }
+                    if let Some((source, _)) = &frozen_body {
+                        copy_body(&source.program, &mut proposal.program)?;
+                    }
+                    Some(proposal)
+                } else {
+                    None
+                };
+                let proposal_program = joint
+                    .as_ref()
+                    .map(|j| &j.program)
+                    .unwrap_or_else(|| &proposal.as_ref().unwrap().program);
                 let graft_started = Instant::now();
                 let mut candidate = base.clone();
                 let mut response_nodes = Vec::new();
                 for (slot, &layer) in settings.uses.iter().enumerate() {
-                    let clean = composed_rule_search::function(&proposal, slot)?;
+                    let clean = if joint.is_none() {
+                        Some(composed_rule_search::function(
+                            proposal.as_ref().unwrap(),
+                            slot,
+                        )?)
+                    } else {
+                        None
+                    };
                     if settings
                         .down_edit_family
                         .as_ref()
                         .is_some_and(|config| config.layer == layer)
                     {
                         let down = down.as_ref().ok_or("declared down family absent")?;
-                        let responses = (0..direction_count)
-                            .map(|j| {
-                                composed_rule_search::function(&proposal, settings.uses.len() + j)
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
+                        let responses = if joint.is_some() {
+                            Vec::new()
+                        } else {
+                            (0..direction_count)
+                                .map(|j| {
+                                    composed_rule_search::function(
+                                        proposal.as_ref().unwrap(),
+                                        settings.uses.len() + j,
+                                    )
+                                })
+                                .collect::<Result<Vec<_>, _>>()?
+                        };
                         let u = down
                             .direction_operators
                             .iter()
@@ -2482,11 +2697,26 @@ fn run() -> Result<(), String> {
                         let target = native
                             .node_interface(layers[layer].mlp)
                             .map_err(|e| e.to_string())?;
-                        let composed =
+                        let composed = if let Some(joint) = &joint {
+                            parameter_response_program::compose_joint_with_outputs(
+                                &joint.program,
+                                joint.output_nodes[0],
+                                &joint.output_nodes[1..],
+                                &u,
+                                &target,
+                            )?
+                        } else {
                             parameter_response_program::compose_with_outputs_on_interface(
-                                &clean, &responses, &u, &target,
-                            )?;
-                        response_nodes = composed.response_nodes;
+                                clean.as_ref().unwrap(),
+                                &responses,
+                                &u,
+                                &target,
+                            )?
+                        };
+                        if joint.is_some() {
+                            response_nodes.push(composed.clean_output.node);
+                        }
+                        response_nodes.extend(composed.response_nodes);
                         let function = composed.program;
                         let mut reads = vec![layers[layer].normed];
                         reads.extend(&down.control_nodes);
@@ -2499,7 +2729,7 @@ fn run() -> Result<(), String> {
                     } else {
                         candidate = candidate.replace_function(
                             &format!("composed-mlp-{layer}"),
-                            &clean,
+                            clean.as_ref().unwrap(),
                             layers[layer].normed,
                             layers[layer].mlp,
                         )?;
@@ -2510,8 +2740,16 @@ fn run() -> Result<(), String> {
                     .map(|d| fixed_response_writers(&candidate, d))
                     .transpose()?
                     .unwrap_or_default();
-                let (mut trainable, body_map) =
-                    graft_parameters_except(&candidate, &native, &proposal, &fixed)?;
+                let (mut trainable, body_map) = if let Some(proposal) = &proposal {
+                    graft_parameters_except(&candidate, &native, proposal, &fixed)?
+                } else {
+                    let joint = joint.as_ref().unwrap();
+                    let down = down.as_ref().unwrap();
+                    (
+                        joint_graft_parameters(&candidate, down.native_write, joint)?,
+                        BTreeMap::new(),
+                    )
+                };
                 let direction_ids = down
                     .as_ref()
                     .map(|d| {
@@ -2525,7 +2763,7 @@ fn run() -> Result<(), String> {
                 if frozen_body.is_some() && shared {
                     let frozen: BTreeSet<_> = body_map.values().copied().collect();
                     trainable.retain(|index| !frozen.contains(index));
-                    verify_body(&proposal.program, &candidate.program, &body_map)?;
+                    verify_body(proposal_program, &candidate.program, &body_map)?;
                 }
                 if trainable.is_empty() {
                     return Err("graft lost all trainable boundary maps".into());
@@ -2546,7 +2784,7 @@ fn run() -> Result<(), String> {
                     .collect();
                 save(
                     &root.join("CONTROL_MAP.json"),
-                    &json!({"native_controls":settings.controls,"candidate_controls":mapping,"down_edit_family":settings.down_edit_family,"fixed_direction_operator_ids":direction_ids,"response_nodes":response_nodes}),
+                    &json!({"native_controls":settings.controls,"candidate_controls":mapping,"down_edit_family":settings.down_edit_family,"fixed_direction_operator_ids":direction_ids,"response_nodes":response_nodes,"observation_order":if joint.is_some(){"clean output, then scalar response coefficients"}else{"scalar response coefficients"}}),
                 )?;
                 let graft_seconds = graft_started.elapsed().as_secs_f64();
                 let canonical_started = Instant::now();
@@ -2623,13 +2861,13 @@ fn run() -> Result<(), String> {
                 let canonical_after_seconds = canonical_started.elapsed().as_secs_f64();
                 std::fs::write(root.join("program.artifact"), &bytes).map_err(|e| e.to_string())?;
                 if frozen_body.is_some() && shared {
-                    verify_body(&proposal.program, &saved.program, &body_map)?;
+                    verify_body(proposal_program, &saved.program, &body_map)?;
                 }
                 if let Some(down) = &down {
                     verify_fixed_directions(&saved, down, &direction_ids)?;
                 }
                 if shared && down.is_none() {
-                    let mut body_source = proposal.program.clone();
+                    let mut body_source = proposal_program.clone();
                     for (&pool, &graft) in &body_map {
                         Arc::make_mut(&mut body_source.operators[pool]).body =
                             saved.program.operators[graft].body.clone();
@@ -2686,6 +2924,7 @@ fn run() -> Result<(), String> {
                     &root.join("TRAIN.json"),
                     &serde_json::to_value(&measured).map_err(|e| e.to_string())?,
                 )?;
+                let mut response_error = None;
                 if let Some((mut responses, provenance)) = retained_response_targets {
                     if lowered.observed_nodes.len() != saved_lowered.observed_nodes.len() {
                         return Err("saved response observation count changed".into());
@@ -2709,6 +2948,7 @@ fn run() -> Result<(), String> {
                         Some(&responses),
                         settings.fit.numeric_bytes,
                     )?;
+                    response_error = Some(maximum_response_error(&supervised)?);
                     save(
                         &root.join("TRAIN_RESPONSES.json"),
                         &json!({"measurement":supervised,"targets":provenance,"pure_kl_report":"TRAIN.json","native_labels_reused":true}),
@@ -2718,8 +2958,8 @@ fn run() -> Result<(), String> {
                 let c32 = structural_cost(&saved, &mut costs)?.total();
                 let structural_cost_seconds = cost_started.elapsed().as_secs_f64();
                 Ok(
-                    json!({"id":name,"expression_id":id,"arm":arm,"c32":c32,"training_kl":measured.objective,
-                    "artifact_sha256":sha256(&root.join("program.artifact"))?,"control_map_sha256":sha256(&root.join("CONTROL_MAP.json"))?,"trainable":trainable,"sharing_analysis":sharing.analyses[id],"transfer":frozen_body.is_some(),"body_frozen":frozen_body.is_some() && shared,"body_graft_operator_map":body_map,"native_initialization":settings.native_initialization,"native_initialization_scope":"primitive native-width capacity control, not discovery","stage_seconds":{"graft":graft_seconds,"canonical_before_fit":canonical_before_seconds,"canonical_after_fit":canonical_after_seconds,"canonical_before_phases":canonical_before_phases,"canonical_after_phases":canonical_after_phases,"fit":fit_seconds,"structural_cost":structural_cost_seconds},"status":"training_measured"}),
+                    json!({"id":name,"expression_id":id,"arm":arm,"c32":c32,"training_kl":measured.objective,"maximum_episode_response_error":response_error,
+                    "artifact_sha256":sha256(&root.join("program.artifact"))?,"control_map_sha256":sha256(&root.join("CONTROL_MAP.json"))?,"trainable":trainable,"sharing_analysis":if joint_inventory.is_some(){Value::Null}else{serde_json::to_value(&sharing.analyses[id]).map_err(|e|e.to_string())?},"transfer":frozen_body.is_some(),"body_frozen":frozen_body.is_some() && shared,"body_graft_operator_map":body_map,"native_initialization":settings.native_initialization,"native_initialization_scope":"primitive native-width capacity control, not discovery","stage_seconds":{"graft":graft_seconds,"canonical_before_fit":canonical_before_seconds,"canonical_after_fit":canonical_after_seconds,"canonical_before_phases":canonical_before_phases,"canonical_after_phases":canonical_after_phases,"fit":fit_seconds,"structural_cost":structural_cost_seconds},"status":"training_measured"}),
                 )
             })();
             let result = match attempt {
@@ -2738,26 +2978,19 @@ fn run() -> Result<(), String> {
         .iter()
         .filter(|a| a["training_kl"].is_number())
         .filter(|a| {
-            !rows.iter().any(|b| {
-                let (Some(ac), Some(bc), Some(ae), Some(be)) = (
-                    a["c32"].as_u64(),
-                    b["c32"].as_u64(),
-                    a["training_kl"].as_f64(),
-                    b["training_kl"].as_f64(),
-                ) else {
-                    return false;
-                };
-                bc <= ac && be <= ae && (bc < ac || be < ae)
-            })
+            !rows.iter().any(|b| training_dominates(b, a, joint_inventory.is_some()))
         })
         .map(|v| v["id"].clone())
         .collect();
     save(
         &out.join("TRAINING_PARETO.json"),
-        &json!({"ids":frontier,"scope":"training cost/KL candidates for later independent Local/Run assessment; no holdout consulted"}),
+        &json!({"ids":frontier,"native_response_axis":joint_inventory.is_some(),"scope":"Training C32/pure-KL Pareto; joint mode additionally requires no worse maximum sampled episode/observable mean normalized squared response error. Missing response measurements remain unknown. No holdout consulted, no universal fidelity guarantee."}),
     )?;
-    let mut frozen =
-        freeze_evaluation_ids(&frontier, &settings.expression_ids, use_specs.len() > 1);
+    let mut frozen = if joint_inventory.is_some() {
+        freeze_joint_evaluation_ids(&frontier, &candidate_ids)
+    } else {
+        freeze_evaluation_ids(&frontier, &settings.expression_ids, use_specs.len() > 1)
+    };
     add_native_capacity_controls(
         &mut frozen,
         &settings.expression_ids,
@@ -2766,7 +2999,7 @@ fn run() -> Result<(), String> {
     );
     save(
         &out.join("FROZEN_EVALUATION_IDS.json"),
-        &json!({"ids":frozen,"training_pareto_ids":frontier,"policy":"native always; both matched shared/untied controls of every training-Pareto expression, including failed counterparts; native-initialized capacity controls additionally mandatory, independent of cost dominance","native_capacity_controls_mandatory":settings.native_initialization,"frozen_before_heldout_export_access":true}),
+        &json!({"ids":frozen,"training_pareto_ids":frontier,"joint_response_inventory":joint_inventory.is_some(),"policy":if joint_inventory.is_some(){"native always plus learned joint candidates on training pure-KL/C32/native-response Pareto; no legacy expression counterparts"}else{"native always; both matched shared/untied controls of every training-Pareto expression, including failed counterparts; native-initialized capacity controls additionally mandatory, independent of cost dominance"},"native_capacity_controls_mandatory":settings.native_initialization,"frozen_before_heldout_export_access":true}),
     )?;
     let mut heldout_rows = Vec::new();
     let mut heldout_provenance = Value::Null;
@@ -3019,6 +3252,19 @@ mod tests {
         composed_rule_search::{Expr, Unary},
         operator_program::{Node, SlotValues},
     };
+    #[test]
+    fn joint_selection_preserves_native_state_fidelity_and_unknown_measurements() {
+        let accurate = json!({"c32":100,"training_kl":0.02,"maximum_episode_response_error":0.001});
+        let wrong_state = json!({"c32":90,"training_kl":0.01,"maximum_episode_response_error":1.0});
+        assert!(training_dominates(&wrong_state, &accurate, false));
+        assert!(!training_dominates(&wrong_state, &accurate, true));
+        assert!(!training_dominates(&accurate, &wrong_state, true));
+        let better = json!({"c32":90,"training_kl":0.01,"maximum_episode_response_error":0.0001});
+        assert!(training_dominates(&better, &accurate, true));
+        let unmeasured = json!({"c32":1,"training_kl":0.0});
+        assert!(!training_dominates(&unmeasured, &accurate, true));
+        assert!(!training_dominates(&accurate, &unmeasured, true));
+    }
     #[test]
     fn operational_kl_axes_disclose_tiny_negative_and_refuse_invalid_scores() {
         assert_eq!(operational_kl_axis(-8.2e-14).expect("roundoff scale"), 0.);
@@ -3651,6 +3897,35 @@ mod tests {
         assert!(validate_cases(&[clean], 0, 2, true).is_err());
     }
     #[test]
+    fn joint_configuration_rejects_legacy_fields_and_extra_sites_before_import() {
+        let mut config = json!({"export_sha256":"", "layers":1,"uses":[0],"sequences":1,"context":1,"teacher_numeric_bytes":1000,"controls":[],"cases":[],"fit":{"iterations":1,"learning_rate":0.01,"beta1":0.9,"beta2":0.999,"epsilon":1e-8,"numeric_bytes":1000},"seed":1,
+            "down_edit_family":{"layer":0,"directions":[{"output":[1.],"hidden":[1.]}]},
+            "joint_response_search":{"latent_widths":[1],"unary":[],"binary":[],"affine_bias":false,"require_shared":false,"max_operations":2,"max_affine_parameters":2,"max_parameter_elements":10,"max_expression_states":20,"max_tuple_checks":20,"max_tuples":10,"max_body_nodes":10,"seed":1}});
+        let check = |v: Value| {
+            validate_joint_configuration(&serde_json::from_value::<Settings>(v).expect("settings"))
+        };
+        assert!(check(config.clone()).is_ok());
+        config["width"] = json!(2);
+        assert!(check(config.clone()).is_err());
+        config["width"] = json!(0);
+        config["expression_ids"] = json!([0]);
+        assert!(check(config.clone()).is_err());
+        config["expression_ids"] = json!([]);
+        config["uses"] = json!([0, 1]);
+        assert!(check(config.clone()).is_err());
+        config["uses"] = json!([0]);
+        config["down_edit_family"] = Value::Null;
+        assert!(check(config).is_err());
+    }
+    #[test]
+    fn joint_inventory_ids_freeze_without_legacy_expression_indices() {
+        assert_eq!(
+            freeze_joint_evaluation_ids(&[json!("joint14-learned"), json!("native")], &[0, 14, 99]),
+            vec!["native", "joint14-learned"]
+        );
+        assert_eq!(freeze_joint_evaluation_ids(&[], &[14]), vec!["native"]);
+    }
+    #[test]
     fn removed_down_family_runs_literal_teachers_shared_response_fit_and_saved_replay() {
         use gam_mpd::operator_program::{
             exact_precision, Declarations, Interface, Law, Operator, Slot, SlotValues,
@@ -3809,38 +4084,157 @@ mod tests {
             Unary::Relu,
             Box::new(Expr::Affine(Box::new(Expr::Argument(0)))),
         );
-        for shared in [true, false] {
+        for arm in 0..4 {
+            let shared = arm != 1;
             let compiler = if shared {
                 composed_rule_search::compile
             } else {
                 composed_rule_search::compile_untied
             };
-            let proposal = compiler(
-                &expression,
-                2,
-                &[
-                    UseSpec {
-                        input_width: 2,
-                        output_width: 2,
-                    },
-                    UseSpec {
-                        input_width: 2,
-                        output_width: 1,
-                    },
-                ],
-                7,
-            )
-            .expect("joint clean and response pool");
-            let composed = parameter_response_program::compose_with_outputs_on_interface(
-                &composed_rule_search::function(&proposal, 0).expect("clean"),
-                &[composed_rule_search::function(&proposal, 1).expect("response")],
-                &[down.program.operators[down.direction_operators[0].0].clone()],
-                &down
-                    .program
-                    .node_interface(down.native_write)
-                    .expect("native output groups"),
-            )
-            .expect("compose");
+            let proposal = if arm < 2 {
+                Some(
+                    compiler(
+                        &expression,
+                        2,
+                        &[
+                            UseSpec {
+                                input_width: 2,
+                                output_width: 2,
+                            },
+                            UseSpec {
+                                input_width: 2,
+                                output_width: 1,
+                            },
+                        ],
+                        7,
+                    )
+                    .expect("joint clean and response pool"),
+                )
+            } else {
+                None
+            };
+            let joint = if arm >= 2 {
+                use program_learned_dag::{Expr as J, TypeRef};
+                let search = program_learned_dag::Settings {
+                    latent_widths: vec![2],
+                    unary: vec![Unary::Relu],
+                    binary: vec![],
+                    affine_bias: false,
+                    require_shared: true,
+                    max_operations: 3,
+                    max_affine_parameters: 3,
+                    max_parameter_elements: 40,
+                    max_expression_states: 1000,
+                    max_tuple_checks: 100000,
+                    max_tuples: 1000,
+                    max_body_nodes: 20,
+                    seed: 7,
+                };
+                let shared = J::Unary(
+                    Unary::Relu,
+                    Box::new(J::Affine {
+                        parameter: 0,
+                        output: TypeRef::Input(0),
+                        input: Box::new(J::Argument(0)),
+                        bias: false,
+                    }),
+                );
+                let clean = if arm == 3 {
+                    shared.clone()
+                } else {
+                    J::Affine {
+                        parameter: 1,
+                        output: TypeRef::Exit(0),
+                        input: Box::new(shared.clone()),
+                        bias: false,
+                    }
+                };
+                let response = J::Affine {
+                    parameter: 2,
+                    output: TypeRef::Exit(1),
+                    input: Box::new(shared),
+                    bias: false,
+                };
+                let expressions = if arm == 2 {
+                    let inventory = program_learned_dag::enumerate_interfaces(
+                        &[Interface::native(2).unwrap()],
+                        &[Interface::native(2).unwrap(), Interface::native(1).unwrap()],
+                        &search,
+                    )
+                    .expect("bounded reachable inventory");
+                    assert!(inventory.checked_tuples > 0);
+                    // Select a syntactic integration fixture, not a numerical winner.
+                    inventory
+                        .proposals
+                        .iter()
+                        .find(|p| {
+                            fn nonlinear(e: &J, found: &mut BTreeSet<J>) {
+                                match e {
+                                    J::Unary(_, x) => {
+                                        found.insert(e.clone());
+                                        nonlinear(x, found);
+                                    }
+                                    J::Affine { input, .. } => nonlinear(input, found),
+                                    J::Binary(_, a, b) => {
+                                        nonlinear(a, found);
+                                        nonlinear(b, found);
+                                    }
+                                    J::Argument(_) => {}
+                                }
+                            }
+                            let mut a = BTreeSet::new();
+                            let mut b = BTreeSet::new();
+                            nonlinear(&p.expressions[0], &mut a);
+                            nonlinear(&p.expressions[1], &mut b);
+                            a.intersection(&b).next().is_some()
+                        })
+                        .expect("enumerated shared nonlinear fixture")
+                        .expressions
+                        .clone()
+                } else {
+                    vec![clean, response]
+                };
+                Some(
+                    program_learned_dag::compile_program(
+                        &[Interface::native(2).unwrap()],
+                        &[Interface::native(2).unwrap(), Interface::native(1).unwrap()],
+                        &expressions,
+                        &search,
+                    )
+                    .expect("distinct joint expressions sharing real ReLU"),
+                )
+            } else {
+                None
+            };
+            let mut composed = if let Some(joint) = &joint {
+                parameter_response_program::compose_joint_with_outputs(
+                    &joint.program,
+                    joint.output_nodes[0],
+                    &joint.output_nodes[1..],
+                    &[down.program.operators[down.direction_operators[0].0].clone()],
+                    &down.program.node_interface(down.native_write).unwrap(),
+                )
+                .expect("joint compose")
+            } else {
+                parameter_response_program::compose_with_outputs_on_interface(
+                    &composed_rule_search::function(proposal.as_ref().unwrap(), 0).expect("clean"),
+                    &[
+                        composed_rule_search::function(proposal.as_ref().unwrap(), 1)
+                            .expect("response"),
+                    ],
+                    &[down.program.operators[down.direction_operators[0].0].clone()],
+                    &down
+                        .program
+                        .node_interface(down.native_write)
+                        .expect("native output groups"),
+                )
+                .expect("compose")
+            };
+            if joint.is_some() {
+                composed
+                    .response_nodes
+                    .insert(0, composed.clean_output.node);
+            }
             let mut candidate = Artifact::native(&down.program)
                 .expect("native")
                 .replace_function_inputs(
@@ -3853,11 +4247,43 @@ mod tests {
             assert!(candidate.place(down.node_mapping[1]).is_none());
             assert!(candidate.place(down.node_mapping[2]).is_none());
             let fixed = fixed_response_writers(&candidate, &down).expect("fixed writer roles");
-            let (trainable, _) =
-                graft_parameters_except(&candidate, &down.program, &proposal, &fixed)
-                    .expect("real joint parameters");
-            assert_eq!(trainable.len(), proposal.trainable.len());
+            let trainable = if let Some(joint) = &joint {
+                let ids = joint_graft_parameters(&candidate, down.native_write, joint)
+                    .expect("mapped joint parameter owners");
+                assert_eq!(ids.len(), joint.trainable_operator_ids.len());
+                ids
+            } else {
+                graft_parameters_except(
+                    &candidate,
+                    &down.program,
+                    proposal.as_ref().unwrap(),
+                    &fixed,
+                )
+                .expect("real pool parameters")
+                .0
+            };
             assert!(trainable.iter().all(|id| !fixed.contains(id)));
+            if arm == 3 {
+                let joint = joint.as_ref().unwrap();
+                let identity = &composed.program.operators[joint.program.operators.len()];
+                let ids: Vec<_> = candidate
+                    .program
+                    .operators
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(id, op)| Arc::ptr_eq(op, identity).then_some(id))
+                    .collect();
+                assert_eq!(
+                    ids.len(),
+                    1,
+                    "fixed grouped clean identity has an explicit owner"
+                );
+                assert!(
+                    !trainable.contains(&ids[0]),
+                    "fallback identity must never be fitted"
+                );
+            }
+
             let ids = down
                 .retain_directions_excluding(&mut candidate, &trainable.iter().copied().collect())
                 .expect("paid immutable directions");
@@ -3891,8 +4317,11 @@ mod tests {
                 1.,
                 1_000_000,
             )
-            .expect("independent scalar labels");
-            assert_eq!(responses["clean"].len(), 1);
+            .expect("native clean and scalar labels");
+            assert_eq!(
+                responses["clean"].len(),
+                if joint.is_some() { 2 } else { 1 }
+            );
             assert!(provenance["native_rms_and_fixed_scale"].is_object());
             let compact_panels = CausalEpisodes::rebind(
                 Some(&compact_teachers),
@@ -4351,6 +4780,7 @@ mod tests {
             require_interior_learned: false,
             frozen_shared_body: None,
             native_initialization: false,
+            joint_response_search: None,
             down_edit_family: None,
             structural_search: None,
             controls: specs,
@@ -4915,6 +5345,7 @@ mod tests {
             require_interior_learned: false,
             frozen_shared_body: None,
             native_initialization: false,
+            joint_response_search: None,
             down_edit_family: None,
             structural_search: None,
             controls: specs,
