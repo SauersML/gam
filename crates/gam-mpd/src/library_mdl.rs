@@ -1983,20 +1983,22 @@ fn probe_key(seed: u64) -> u64 {
     gam_linalg::utils::splitmix64_hash(seed)
 }
 
-/// The noise seed of batch `batch` in stream `epoch`: stream 1 is the training steps'
-/// (`training_key`), stream 0 the removal comparisons', the epochs' snapshots'
+/// The noise seed of batch `batch` in stream `epoch`: streams `1, 2, …` are the training steps' of
+/// epochs `0, 1, …` (`training_key`), stream 0 the removal comparisons', the epochs' snapshots'
 /// (`snapshot_estimates`) and the held-out evaluation's.
 fn noise_seed(seed: u64, epoch: usize, batch: usize) -> u64 {
     seed.wrapping_add((epoch as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)).wrapping_add((batch as u64).wrapping_mul(0x8CB9_2BA7_2F3D_8DD7))
 }
 
-/// The weight noise of training batch `b` in every epoch: keyed by the batch alone, so the fit
-/// minimizes one sample average of `F` (the batches' experiments are fixed too), and two epochs'
-/// steps on a batch are at identical draws (common random numbers). Stream 1 is apart
-/// from the removal comparisons', the snapshots' and the held-out evaluation's (`noise_seed` with
-/// epoch 0).
-fn training_key(seed: u64, batch: usize) -> u64 {
-    noise_seed(seed, 1, batch)
+/// The weight noise of training batch `batch` in epoch `epoch`, drawn afresh every epoch (stream
+/// `1 + epoch`): the steps estimate the gradient of `F`, the expectation over the posterior, and
+/// not of one fixed Monte Carlo sample of it, whose minimizer fits that sample's noise. Common
+/// random numbers are kept where a paired comparison needs them: the epochs' snapshots, the
+/// removal comparisons and the held-out evaluation share stream 0 (`noise_seed` with epoch 0),
+/// and two fits compared arm against arm draw the same keys at the same epoch and batch. A resumed
+/// fit draws the keys its epoch and batch give, as the uninterrupted fit did.
+fn training_key(seed: u64, epoch: usize, batch: usize) -> u64 {
+    noise_seed(seed, 1 + epoch, batch)
 }
 
 /// A training step's scoring with antithetic weight noise inside the step: the batch's bases split
@@ -2020,8 +2022,8 @@ fn training_key(seed: u64, batch: usize) -> u64 {
 /// ([`factor_half`]). The batches are fixed runs of the training sequences, so a fixed half would
 /// leave the same sequences out of the curvature at every step; with the half drawn, every
 /// training sequence contributes with probability ½ and the curvature average stays unbiased for
-/// the whole collection's. The key, and so the half, is the batch's in every epoch, as its weight
-/// noise is (`training_key`). Each entry of a draw `u` is a sum of independent zero-mean terms,
+/// the whole collection's. The key, and so the half, is drawn afresh every epoch with the weight
+/// noise (`training_key`). Each entry of a draw `u` is a sum of independent zero-mean terms,
 /// one per token, close to normal, so `u_i²` has a relative standard deviation near √2 however
 /// many tokens it sums: half the tokens estimate the curvature about as precisely, for half the
 /// factor pass. Its A/B (fitperf-halffactor-ab2: vpd4l, N = 2^20, RTX 4090, 3 epochs, seeds 1-2)
@@ -3266,7 +3268,7 @@ pub fn fit_from(
             let step_started = Instant::now();
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
-            let key = training_key(settings.seed, b);
+            let key = training_key(settings.seed, epoch, b);
             let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key)?;
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
@@ -4570,9 +4572,10 @@ mod tests {
     }
 
     #[test]
-    fn two_epochs_at_one_posterior_improve_by_exactly_zero() {
-        // The training noise is keyed by the batch alone: two epochs' steps scored at the same
-        // posterior give identical per-batch estimates, so their paired improvement is zero.
+    fn the_training_noise_is_drawn_afresh_each_epoch() {
+        // The training noise is drawn afresh every epoch: two epochs' steps scored at the same
+        // posterior differ batch by batch, while an epoch's steps scored twice agree exactly (the
+        // snapshots' common draws: `a_snapshot_is_f_on_the_removal_draws_and_leaves_the_posterior_as_it_was`).
         let (native, layers, _, sequences) = tiny("library_common_noise", "gelu_tanh");
         let explanation = explanation(&native, &layers).unwrap();
         let (device, settings) = (Device::host(), settings());
@@ -4581,20 +4584,21 @@ mod tests {
         let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, tokens as f64, None, 0).unwrap();
         let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
-        assert!(draws.len() > 1 && training_key(settings.seed, 0) != training_key(settings.seed, 1), "one key for every batch");
-        let mut epoch = || -> Vec<f64> {
+        assert!(draws.len() > 1 && training_key(settings.seed, 0, 0) != training_key(settings.seed, 0, 1), "one key for every batch");
+        assert!((0..draws.len()).all(|b| training_key(settings.seed, 0, b) != training_key(settings.seed, 1, b)), "one key for every epoch");
+        let mut epoch = |at: usize| -> Vec<f64> {
             let mut estimates = Vec::new();
             for (b, draw) in draws.iter().enumerate() {
                 let batch = draw.batch(&sequences).unwrap();
                 let experiments = scorer.experiments(draw, &sequences).unwrap();
-                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, training_key(settings.seed, b)).unwrap();
+                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, training_key(settings.seed, at, b)).unwrap();
                 estimates.push(bits.iter().flatten().sum::<f64>());
             }
             estimates
         };
-        let (first, second) = (epoch(), epoch());
-        let differences: Vec<f64> = first.iter().zip(&second).map(|(a, b)| a - b).collect();
-        assert!(differences.iter().all(|d| *d == 0.0), "paired differences at one posterior: {differences:?}");
+        let (first, again, second) = (epoch(0), epoch(0), epoch(1));
+        assert_eq!(first, again, "one epoch's draws scored twice");
+        assert!(first.iter().zip(&second).all(|(a, b)| a != b), "two epochs' draws at one posterior: {first:?} and {second:?}");
     }
 
     /// A snapshot (`snapshot_estimates`) is the removal comparisons' `F` of the posterior batch by
@@ -4673,7 +4677,7 @@ mod tests {
     #[test]
     fn the_curvature_half_is_drawn_from_the_batch_key() {
         let keys = 4096;
-        let first = (0..keys).filter(|b| factor_half(training_key(7, *b))).count() as f64;
+        let first = (0..keys).filter(|b| factor_half(training_key(7, 0, *b))).count() as f64;
         assert!((first - 0.5 * keys as f64).abs() <= 4.0 * (0.25 * keys as f64).sqrt(), "the first half drawn {first} times of {keys}");
         let (native, layers, _, sequences) = tiny("library_factor_half", "gelu_tanh");
         let explanation = explanation(&native, &layers).unwrap();
@@ -4687,7 +4691,7 @@ mod tests {
         let half = batch.base.len() / 2;
         assert!(half > 0, "a batch of two halves");
         for wanted in [true, false] {
-            let key = (0..).map(|b| training_key(settings.seed, b)).find(|k| factor_half(*k) == wanted).unwrap();
+            let key = (0..).map(|b| training_key(settings.seed, 0, b)).find(|k| factor_half(*k) == wanted).unwrap();
             let (_, _, _, factor) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments.clone(), key).unwrap();
             let part: Vec<Experiment> = experiments.iter().filter(|e| (e.base < half) == wanted).cloned().collect();
             let targets = scorer.experiments.targets(&batch, &part).unwrap();
