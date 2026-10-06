@@ -1843,7 +1843,8 @@ impl Device {
         if blocks == 0 || rows % blocks != 0 || start.checked_add(heads.saturating_mul(width)).is_none_or(|end| end > x.cols) {
             return Err(shape(format!("{heads} heads of {width} from column {start} of {:?} in {blocks} blocks", x.dim())));
         }
-        let mut out = self.zeros(rows * heads, width)?;
+        // The permutation writes every entry of its output: no zeroing first.
+        let mut out = self.empty(rows * heads, width)?;
         self.heads(x, &mut out, (start, heads, width, rows / blocks), turn, inverse, false)?;
         Ok(out)
     }
