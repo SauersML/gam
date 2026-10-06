@@ -2319,8 +2319,7 @@ fn laplace_start(
     for (b, draw) in draws.iter().enumerate() {
         let batch = draw.batch(sequences)?;
         let experiments = scorer.experiments(draw, sequences)?;
-        scorer.prefetch(&draws[(b + 1) % draws.len()], sequences)?;
-        let (_, _, factor) = scorer.score_device(device_posterior, &batch, &experiments, Some(noise_seed(settings.seed, 0, b)), &format!("train_{b}"), true)?;
+        let (_, _, factor) = scorer.score_device(device_posterior, &batch, &experiments, Some(noise_seed(settings.seed, 0, b)), true)?;
         let device = scorer.experiments.models().1.program.device();
         for (op, u) in &factor.ok_or("no Gauss–Newton factor")?.gradient {
             let u = device.download(u).map_err(error)?;
