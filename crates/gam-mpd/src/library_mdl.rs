@@ -1701,6 +1701,9 @@ struct Scorer {
     scope: Option<Vec<bool>>,
     /// The families of each base's patched experiment (`Settings::families`; empty is `read`).
     families: Vec<interchange::Family>,
+    /// Each batch's drawn edits (by its seed and bases), drawn once: a draw runs `M` on the batch
+    /// to find the parts firing there, and a fit asks for a batch's experiments many times.
+    edits: std::cell::RefCell<BTreeMap<(u64, Vec<usize>), Vec<(usize, Patch, usize)>>>,
 }
 
 impl Scorer {
@@ -1725,7 +1728,7 @@ impl Scorer {
         if settings.families.iter().any(|f| *f != interchange::Family::Read) {
             experiments.set_parts(interchange::parts_of(&explanation.artifact.program, sites.len())?)?;
         }
-        Ok(Self { experiments, mlps, position, scope, families: settings.families.clone() })
+        Ok(Self { experiments, mlps, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()) })
     }
 
     fn layers(&self) -> usize {
@@ -1743,11 +1746,21 @@ impl Scorer {
     fn experiments(&self, draw: &Draw, sequences: &[Vec<u32>]) -> Result<Vec<Experiment>, String> {
         let mut experiments = draw.experiments(sequences, self.experiments.variables(), 2 * self.layers())?;
         if self.families.iter().any(|f| *f != interchange::Family::Read) {
-            let mut rng = StdRng::seed_from_u64(gam_linalg::utils::splitmix64_hash(draw.seed ^ 0xED17));
-            let slots: Vec<(usize, interchange::Family)> =
-                (0..draw.bases.len()).map(|n| (n, self.families[rng.random_range(0..self.families.len())])).filter(|(_, f)| *f != interchange::Family::Read).collect();
-            let edits = self.experiments.draw_edits(&mut rng, &draw.batch(sequences)?, &slots)?;
-            for ((n, _), (patch, position)) in slots.into_iter().zip(edits) {
+            let key = (draw.seed, draw.bases.clone());
+            let cached = self.edits.borrow().get(&key).cloned();
+            let drawn = match cached {
+                Some(drawn) => drawn,
+                None => {
+                    let mut rng = StdRng::seed_from_u64(gam_linalg::utils::splitmix64_hash(draw.seed ^ 0xED17));
+                    let slots: Vec<(usize, interchange::Family)> =
+                        (0..draw.bases.len()).map(|n| (n, self.families[rng.random_range(0..self.families.len())])).filter(|(_, f)| *f != interchange::Family::Read).collect();
+                    let edits = self.experiments.draw_edits(&mut rng, &draw.batch(sequences)?, &slots)?;
+                    let drawn: Vec<(usize, Patch, usize)> = slots.into_iter().zip(edits).map(|((n, _), (patch, position))| (n, patch, position)).collect();
+                    self.edits.borrow_mut().insert(key, drawn.clone());
+                    drawn
+                }
+            };
+            for (n, patch, position) in drawn {
                 let clean = experiments.iter().position(|e| e.base == n && e.patch.is_none()).ok_or("a base without its clean experiment")?;
                 let edit = Experiment { base: n, source: n, explained: experiments[clean].explained.clone(), patch: Some(patch), position };
                 match experiments.iter().position(|e| e.base == n && e.patch.is_some()) {
