@@ -104,6 +104,12 @@ pub struct Compensation {
     device: Device,
 }
 
+/// The int8 slices of the split Gram (`Device::gram_split`) and the batch rows it takes: with 9
+/// slices its error stays below the float64 product's bound for up to 2^14 rows, and its int32
+/// sums hold 2^13 rows.
+const GRAM_SLICES: usize = 9;
+const MAX_SPLIT_ROWS: usize = 1 << 13;
+
 /// The operator of `program` named `name`.
 fn operator(program: &OperatorProgram, name: &str) -> Result<usize, String> {
     program.operators.iter().position(|o| o.name == name).ok_or_else(|| error(format!("no operator {name}")))
@@ -200,8 +206,14 @@ impl Compensation {
                 }
                 match (&wide, sum) {
                     (Some(wide), Some(sum)) => {
-                        let h = wide.convert(h).map_err(error)?;
-                        wide.gram_lower(sum, &h, 1.0).map_err(error)?;
+                        // On CUDA the f32 activations' Gram on the integer tensor cores
+                        // (`Device::gram_split`, 9 slices: within γ_rows √(G_ii G_jj) per entry, the
+                        // form of the float64 product's own bound that the floor below uses), else
+                        // the float64 product.
+                        if h.rows() > MAX_SPLIT_ROWS || !wide.gram_split(sum, h, GRAM_SLICES).map_err(error)? {
+                            let h = wide.convert(h).map_err(error)?;
+                            wide.gram_lower(sum, &h, 1.0).map_err(error)?;
+                        }
                     }
                     _ => mlp.gram += &fast_ata(&device.download(h).map_err(error)?),
                 }
