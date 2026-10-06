@@ -206,6 +206,10 @@ pub struct DeviceProgram {
     /// Per operator, how many times its device copy was replaced ([`Frozen`] values stay valid while
     /// no operator they read changes).
     revisions: BTreeMap<usize, u64>,
+    /// The f32 operators the reverse passes since the last forward pass read in bfloat16, each
+    /// rounded once (keyed by where the operator is held; [`DeviceProgram::rounded_operator`]).
+    /// Emptied by every forward pass and every write of an operator.
+    rounded: Mutex<BTreeMap<usize, Arc<Tensor>>>,
 }
 
 /// A group of sibling heads and its stacked operators.
@@ -676,7 +680,7 @@ impl DeviceProgram {
             };
             fused.push(Fused { heads, stacked, sources, live: true, changed: BTreeSet::new(), disabled: false, source_matches: true });
         }
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new() })
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()) })
     }
 
     /// Operator `op`'s device copy changed: every group reading it runs node by node until
@@ -724,6 +728,7 @@ impl DeviceProgram {
     /// weight sample is written (`device_posterior::DevicePosterior::sample_into`); an operator it
     /// does not write is copied from its resident copy. Biases and norm gains are always copied.
     pub fn refresh_fused_with(&mut self, write: &mut dyn FnMut(usize, &mut Tensor, (usize, usize)) -> Result<bool, String>) -> Result<(), String> {
+        self.rounded.get_mut().map_err(|_| "device: poisoned rounding cache".to_string())?.clear();
         let mut fused = std::mem::take(&mut self.fused);
         let restacked = fused.iter_mut().try_for_each(|group| self.restack(group, &mut *write));
         self.fused = fused;
@@ -846,6 +851,7 @@ impl DeviceProgram {
     /// A dense operator's device copy to change in place (a trained library); the program's
     /// host operator no longer describes it until [`Self::refresh`] from a program holding it.
     pub fn dense_mut(&mut self, op: usize) -> Result<&mut Tensor, String> {
+        self.rounded.get_mut().map_err(|_| "device: poisoned rounding cache".to_string())?.clear();
         if self.operators.contains_key(&(op, Role::Column)) {
             return Err(format!("device: operator {op} also has column uses; use replace_dense_parameter"));
         }
@@ -911,6 +917,7 @@ impl DeviceProgram {
     /// The host program remains unchanged; export the final canonical values before
     /// encoding or pricing a fitted candidate. No floating-point rounding occurs here.
     pub fn replace_dense_parameter(&mut self, op: usize, value: Tensor) -> Result<(), String> {
+        self.rounded.get_mut().map_err(|_| "device: poisoned rounding cache".to_string())?.clear();
         let source = self.trainable_dense_source(op)?;
         if value.dim() != (source.rows.width(), source.cols.width()) {
             return Err("device: replacement parameter shape mismatch".into());
@@ -1342,6 +1349,7 @@ impl DeviceProgram {
         reuse: Reuse<'_>,
         span: Span,
     ) -> Result<DeviceTrace, String> {
+        self.rounded.lock().map_err(|_| "device: poisoned rounding cache".to_string())?.clear();
         let d = &self.device;
         for &(amplitude, mask) in gated {
             if mask >= amplitude
@@ -2040,6 +2048,26 @@ impl DeviceProgram {
         half.as_ref().ok_or_else(|| "device: a rounded cotangent".to_string())
     }
 
+    /// Operator array `a` as an operand of a reverse product in `arithmetic`: in bfloat16 an f32
+    /// array rounded once after each forward pass and kept (`rounded`), so the reverse passes of
+    /// one forward pass (the data term's and the Gauss–Newton factor's) and every product in them
+    /// read one copy (each would otherwise round it again, to the same values); otherwise `None`.
+    /// Only an array this program holds (an operator or a stacked group's), whose place is fixed
+    /// until a write, which empties the copies.
+    fn rounded_operator(&self, a: &Tensor, arithmetic: Arithmetic) -> Result<Option<Arc<Tensor>>, String> {
+        if arithmetic != Arithmetic::Bf16 || a.storage() != Storage::F32 {
+            return Ok(None);
+        }
+        let key = std::ptr::from_ref(a) as usize;
+        let mut rounded = self.rounded.lock().map_err(|_| "device: poisoned rounding cache".to_string())?;
+        if let Some(copy) = rounded.get(&key) {
+            return Ok(Some(Arc::clone(copy)));
+        }
+        let copy = Arc::new(self.device.bf16_copy(a).map_err(error)?);
+        rounded.insert(key, Arc::clone(&copy));
+        Ok(Some(copy))
+    }
+
     /// `g[argument] ← g[argument] + cot · ∂(x op(A)ᵀ)/∂x` for the affine term `(argument, operator)`
     /// (nothing for a one-hot feature).
     fn pull_term(&self, (g, needed): (&mut [Option<Tensor>], &[bool]), rows: usize, (cot, half): (&Tensor, &mut Option<Tensor>), argument: usize, operator: usize, arithmetic: Arithmetic) -> Result<(), String> {
@@ -2054,12 +2082,16 @@ impl DeviceProgram {
         match self.held(operator, Role::Product)? {
             Held::Identity => d.axpy(target, 1.0, cot).map_err(error),
             Held::Diagonal(diag) => d.scale_columns(target, cot, diag, true).map_err(error),
-            Held::Dense(a) => d.gemm(target, 1.0, self.operand(cot, half, arithmetic)?, Op::N, a, Op::N, 1.0, arithmetic).map_err(error),
+            Held::Dense(a) => {
+                let rounded = self.rounded_operator(a, arithmetic)?;
+                d.gemm(target, 1.0, self.operand(cot, half, arithmetic)?, Op::N, rounded.as_deref().unwrap_or(a), Op::N, 1.0, arithmetic).map_err(error)
+            }
             Held::LowRank(left, right) => {
                 // g (L R) = (g L) R.
+                let (rounded_left, rounded_right) = (self.rounded_operator(left, arithmetic)?, self.rounded_operator(right, arithmetic)?);
                 let mut middle = d.empty(cot.rows(), left.cols()).map_err(error)?;
-                d.gemm(&mut middle, 1.0, self.operand(cot, half, arithmetic)?, Op::N, left, Op::N, 0.0, arithmetic).map_err(error)?;
-                d.gemm(target, 1.0, &middle, Op::N, right, Op::N, 1.0, arithmetic).map_err(error)
+                d.gemm(&mut middle, 1.0, self.operand(cot, half, arithmetic)?, Op::N, rounded_left.as_deref().unwrap_or(left), Op::N, 0.0, arithmetic).map_err(error)?;
+                d.gemm(target, 1.0, &middle, Op::N, rounded_right.as_deref().unwrap_or(right), Op::N, 1.0, arithmetic).map_err(error)
             }
             Held::Table(_) | Held::Column(_) => Err("device: an operator held in the wrong role".to_string()),
         }
@@ -2090,7 +2122,8 @@ impl DeviceProgram {
             return Ok(());
         }
         let mut g_a = d.empty(trace.rows, heads.heads * heads.width).map_err(error)?;
-        d.gemm(&mut g_a, 1.0, self.operand(cot, half, arithmetic)?, Op::N, &group.stacked.reads, Op::N, 0.0, arithmetic).map_err(error)?;
+        let reads = self.rounded_operator(&group.stacked.reads, arithmetic)?;
+        d.gemm(&mut g_a, 1.0, self.operand(cot, half, arithmetic)?, Op::N, reads.as_deref().unwrap_or(&group.stacked.reads), Op::N, 0.0, arithmetic).map_err(error)?;
         let turn = turn(&trace.rotations, heads.rotary)?;
         let gained = buffers.normed.map(|(_, gained)| &trace.buffers[gained]);
         let g_p = device_heads::backward(d, (heads, &group.stacked), (&trace.buffers[buffers.projections], gained), &g_a, trace.blocks, turn, (self.arithmetic, arithmetic)).map_err(error)?;
@@ -2111,8 +2144,9 @@ impl DeviceProgram {
         if grads[heads.input].is_none() {
             grads[heads.input] = Some(d.zeros(trace.rows, self.widths[heads.input]).map_err(error)?);
         }
+        let weights = self.rounded_operator(&group.stacked.weights, arithmetic)?;
         let target = grads[heads.input].as_mut().ok_or("device: cotangent slot")?;
-        d.gemm(target, 1.0, self.operand(&g_p, &mut half_p, arithmetic)?, Op::N, &group.stacked.weights, Op::N, 1.0, arithmetic).map_err(error)
+        d.gemm(target, 1.0, self.operand(&g_p, &mut half_p, arithmetic)?, Op::N, weights.as_deref().unwrap_or(&group.stacked.weights), Op::N, 1.0, arithmetic).map_err(error)
     }
 
     /// Resident cotangents for explicitly trainable dense operators, including
