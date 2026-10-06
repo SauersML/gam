@@ -4132,7 +4132,6 @@ __device__ __forceinline__ void COPY4(float* dst, const float* src) {
 }
 #define COPY_COMMIT() asm volatile("cp.async.commit_group;" ::: "memory")
 #define COPY_WAIT() asm volatile("cp.async.wait_group 0;" ::: "memory")
-#define COPY_WAIT_ONE() asm volatile("cp.async.wait_group 1;" ::: "memory")
 "#;
 
     /// Attention's kernels on CUDA: blockIdx.x + blockIdx.z gridDim.x is the (sequence, head) pair,
@@ -4162,8 +4161,10 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
     /// sixteen fused multiply-adds; 88 KB of shared memory, one block per multiprocessor.
     const ATTENTION_FORWARD: (usize, usize, usize, usize, usize) = (64, 128, 128, 8, 16);
 
-    /// The keys' reverse's block: key rows, query rows at a time, threads, keys per thread.
-    const ATTENTION_KEYS: (usize, usize, usize, usize) = (32, 32, 256, 2);
+    /// The keys' reverse's block: key rows, query rows at a time, threads, keys per thread and chunk
+    /// (each thread 8 keys × 4 rows of Sᵀ and dPᵀ, and 8 keys × 4 columns of dK and of dV; 88 KB of
+    /// shared memory).
+    const ATTENTION_KEYS: (usize, usize, usize, usize, usize) = (32, 128, 128, 8, 16);
 
     /// The queries' reverse's block, blocked as the forward's: query rows, keys at a time, threads,
     /// rows per thread and chunk (each thread 8 rows × 4 keys of the scores and of dP, and 8 rows × 4
@@ -5067,14 +5068,13 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
         /// compiled on first use per device and width, allowed `shared` bytes of dynamic shared memory.
         fn attention_kernel(&self, width: usize, name: &'static str, shared: usize) -> Result<CudaFunction, GpuError> {
             static MODULES: std::sync::OnceLock<crate::device_cache::KeyedPtxModuleCache<usize>> = std::sync::OnceLock::new();
-            let tuple = |(a, b, c, d): (usize, usize, usize, usize)| format!("{a}, {b}, {c}, {d}");
             let (r, k, n, tr, dc) = ATTENTION_FORWARD;
             let source = |_| {
                 format!(
                     "#define HEAD_W {width}\n#define HEAD_D {}\n#define FORWARD {}\n#define KEYS {}\n#define QUERIES {}\n#define MAX_SEQUENCES {ATTENTION_SEQUENCES}\n{ATTENTION}{}{ATTENTION_KERNELS}",
                     attention_width(width).unwrap_or(128),
                     format!("{r}, {k}, {n}, {tr}, {dc}"),
-                    tuple(ATTENTION_KEYS),
+                    format!("{}, {}, {}, {}, {}", ATTENTION_KEYS.0, ATTENTION_KEYS.1, ATTENTION_KEYS.2, ATTENTION_KEYS.3, ATTENTION_KEYS.4),
                     format!("{}, {}, {}, {}, {}", ATTENTION_QUERIES.0, ATTENTION_QUERIES.1, ATTENTION_QUERIES.2, ATTENTION_QUERIES.3, ATTENTION_QUERIES.4),
                     include_str!("attention_f32.inc")
                 )
@@ -5146,8 +5146,8 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
             // SAFETY: rows × hq·w outputs and cotangents, rows × hq sums; one warp per (row, head).
             unsafe { self.stream.launch_builder(&sums).arg(&n).arg(&hq).arg(&width).arg(slice32(out)?).arg(slice32(ga)?).arg(slice32_mut(&mut dsum)?).launch(cfg_elements((rows * layout.queries) as u64 * 32)) }
                 .gpu_ctx("attention backward sums")?;
-            let ((key_rows, key_queries, key_threads, _), (query_rows, query_keys, query_threads, _, query_chunk)) = (ATTENTION_KEYS, ATTENTION_QUERIES);
-            let keys_shared = ((2 * key_rows + 3 * key_queries) * (padded + 4) + 2 * key_rows * (key_queries + 4) + 2 * key_queries) * 4;
+            let ((key_rows, key_queries, key_threads, _, key_chunk), (query_rows, query_keys, query_threads, _, query_chunk)) = (ATTENTION_KEYS, ATTENTION_QUERIES);
+            let keys_shared = (2 * key_rows * (padded + 4) + 2 * (key_queries * (key_chunk + 4)).max(key_chunk * (padded + 4)) + 2 * key_rows * (key_queries + 4)) * 4;
             let queries_shared = (2 * query_rows * (padded + 4) + 2 * (query_keys * (query_chunk + 4)).max(query_chunk * (padded + 4)) + query_rows * (query_keys + 4)) * 4;
             let (keys_kernel, queries_kernel) = (self.attention_kernel(w, "attention_backward_keys", keys_shared)?, self.attention_kernel(w, "attention_backward_queries", queries_shared)?);
             // The two passes write every row of the sequences.
@@ -7023,7 +7023,6 @@ typedef float4 f4;
 #define COPY4(dst, src) (*((threadgroup float4*)(dst)) = *((device const float4*)(src)))
 #define COPY_COMMIT()
 #define COPY_WAIT()
-#define COPY_WAIT_ONE()
 typedef uint u32;
 typedef ulong u64;
 #define MAX_SEQUENCES 480
@@ -7033,7 +7032,8 @@ typedef ulong u64;
     /// groups`, ...; item `i` is (sequence, head) pair `i mod pairs` and tile `i / pairs` (the longest
     /// sweeps first). Tiles fit the 32 KB of threadgroup memory: the forward's blocks hold 16 query
     /// rows and take 64 keys at a time (64 threads of 4 rows × 4 keys); the reverse's 16 key rows and
-    /// 8 query rows at a time, or 16 query rows and 32 keys (64 threads of 4 rows × 2 keys).
+    /// 32 query rows at a time (64 threads of 4 keys × 2 rows), or 16 query rows and 32 keys (64
+    /// threads of 4 rows × 2 keys).
     const ATTENTION_KERNELS: &str = r#"
 struct AttentionParams { uint hq; uint hk; uint w; float scale; uint pairs; uint items; uint rows; uint unused; Sequences sequences; };
 
@@ -7050,9 +7050,9 @@ kernel void t_attention_forward_##D(device const float* y [[buffer(0)]], device 
 kernel void t_attention_keys_##D(device const float* y [[buffer(0)]], device const float* lse [[buffer(1)]], device const float* ga [[buffer(2)]], \
     device const float* dsum [[buffer(3)]], device float* gy [[buffer(4)]], constant AttentionParams& p [[buffer(5)]], \
     uint group [[threadgroup_position_in_grid]], uint groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]]) { \
-    threadgroup float smem[(2 * 16 + 3 * 8) * TILE_STRIDE(D) + 2 * 16 * (8 + 4) + 2 * 8]; \
+    threadgroup float smem[KEYS_FLOATS(D, 16, 32, 8)]; \
     for (uint item = group; item < p.items; item += groups) { \
-        keys_body<D, 16, 8, 128, 1>(p.sequences, p.hq, p.hk, p.w, p.scale, y, lse, ga, dsum, gy, item % p.pairs, item / p.pairs, t, 256u, smem); \
+        keys_body<D, 16, 32, 64, 4, 8>(p.sequences, p.hq, p.hk, p.w, p.scale, y, lse, ga, dsum, gy, item % p.pairs, item / p.pairs, t, 256u, smem); \
         threadgroup_barrier(mem_flags::mem_threadgroup); \
     } \
 } \
