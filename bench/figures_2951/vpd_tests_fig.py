@@ -4,9 +4,9 @@ Left: resample, from another text, the input directions that VPD's active subcom
 (the causal-abstraction complement test), one attention or MLP block at a time and at all eight blocks
 at once; VPD predicts no change. KL(M || E) per token in nats, held-out rows 1024-1055, mean over 64
 source texts with the worst source marked. Right: faithfulness of circuits on the four subject-verb
-agreement tasks (Marks et al. 2025), mean over tasks, nodes ranked by RelP attribution and the rest
-mean-ablated, for the model's own MLP neurons, VPD's MLP subcomponents (attention left whole, matched
-coverage) and VPD's subcomponents at all 24 sites.
+agreement tasks (Marks et al. 2025), mean over tasks, nodes ranked by their measured patching effects
+(NodeBasis::patch_effects) and the rest mean-ablated, for the model's own MLP neurons, VPD's MLP
+subcomponents (attention left whole, matched coverage) and VPD's subcomponents at all 24 sites.
 
     python bench/figures_2951/vpd_tests_fig.py BATTERY.json CIRCUITS.json OUT.png
 
