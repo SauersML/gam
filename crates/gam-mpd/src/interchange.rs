@@ -1141,13 +1141,24 @@ fn factor_arithmetic(d: &Device, arithmetic: Arithmetic) -> Arithmetic {
     if d.storage() == Storage::F32 && d.with_storage(Storage::Bf16).is_ok() { Arithmetic::Bf16 } else { arithmetic }
 }
 
-/// The reverse of [`run`] from the stream buffer's cotangent `cotangent` (rows of the paths'
-/// outputs): block by block backwards, each call's reverse with the patches' transposed edits
-/// (each source's part added into the source's row of the same call), then each fork's rows added
-/// into its parent's. Adds `P`'s parameter gradient into `gradient`; the calls' tapes stay. The
-/// blocks' products run in `arithmetic`.
-fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::Tape>], mut cotangent: Tensor, gradient: &mut BTreeMap<usize, Tensor>, arithmetic: Arithmetic) -> Result<(), String> {
+/// One reverse pass of [`run_reverse`]: the stream buffer's cotangent (rows of the paths'
+/// outputs), the parameter gradient it adds into, and its products' arithmetic.
+struct Pass<'a> {
+    cotangent: Tensor,
+    gradient: &'a mut BTreeMap<usize, Tensor>,
+    arithmetic: Arithmetic,
+}
+
+/// The reverses of [`run`] from the cotangents of `passes` together: block by block backwards,
+/// each call's tape had once (recomputed from its entering rows when it kept those) and reversed
+/// for every pass in turn with the patches' transposed edits (each source's part added into the
+/// source's row of the same call), then each fork's rows added into its parent's in every pass.
+/// Each pass adds `P`'s parameter gradient into its own map, by the same operations in the same
+/// order as a reverse of its own, so each result is that pass's alone bit for bit, with one
+/// recomputation of a call's tape for all of them; the calls' tapes stay.
+fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::Tape>], passes: &mut [Pass<'_>]) -> Result<(), String> {
     let d = engines[0].device();
+    let width = passes.first().map(|p| p.cotangent.cols()).ok_or_else(|| error("a reverse pass of no cotangent"))?;
     for (index, call) in calls.iter().enumerate().rev() {
         let b = call.block;
         let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.lanes[*l].rows.clone()).collect();
@@ -1165,7 +1176,7 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
                 }
                 let mut rows = match entering {
                     Some(rows) => d.copy(rows).map_err(error)?,
-                    None if b == 0 => d.zeros(at, cotangent.cols()).map_err(error)?,
+                    None if b == 0 => d.zeros(at, width).map_err(error)?,
                     None => return Err(error("a call past the first block without its entering rows")),
                 };
                 let tokens: Vec<&[u32]> = call.lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
@@ -1173,16 +1184,20 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
                 &recomputed
             }
         };
-        engines[call.side].reverse(b, tape, &mut cotangent, &ranges, call.edits.as_ref(), (&mut *gradient, arithmetic))?;
+        for pass in passes.iter_mut() {
+            engines[call.side].reverse(b, tape, &mut pass.cotangent, &ranges, call.edits.as_ref(), (&mut *pass.gradient, pass.arithmetic))?;
+        }
         // Once both sides of the block are reversed, the forks made there return their rows, the
         // later lanes first (a lane forked from a lane forked at the same block returns through it).
         if index == 0 || calls[index - 1].block != b {
-            for lane in plan.lanes.iter().rev().filter(|l| l.start == b) {
-                if let Some(parent) = lane.parent {
-                    let rows = plan.lanes[parent].rows.clone();
-                    let mut total = d.rows_of(&cotangent, rows.start, rows.len()).map_err(error)?;
-                    d.axpy(&mut total, 1.0, &d.rows_of(&cotangent, lane.rows.start, lane.rows.len()).map_err(error)?).map_err(error)?;
-                    d.set_rows(&mut cotangent, rows.start, &total).map_err(error)?;
+            for pass in passes.iter_mut() {
+                for lane in plan.lanes.iter().rev().filter(|l| l.start == b) {
+                    if let Some(parent) = lane.parent {
+                        let rows = plan.lanes[parent].rows.clone();
+                        let mut total = d.rows_of(&pass.cotangent, rows.start, rows.len()).map_err(error)?;
+                        d.axpy(&mut total, 1.0, &d.rows_of(&pass.cotangent, lane.rows.start, lane.rows.len()).map_err(error)?).map_err(error)?;
+                        d.set_rows(&mut pass.cotangent, rows.start, &total).map_err(error)?;
+                    }
                 }
             }
         }
@@ -1665,7 +1680,7 @@ pub fn evaluate_labelled<E: BlockEngine>(
     let spread = |seed: &Tensor, weight: f64| spread(d, stream.rows(), &rows, seed, weight);
     let mut bits = Vec::new();
     let mut total = BTreeMap::new();
-    let mut drawn = None;
+    let (mut drawn, mut data_seed) = (None, None);
     if let Some(targets) = targets {
         let mut mu = d.zeros(hidden.rows(), width).map_err(error)?;
         let mut entropy = Vec::with_capacity(hidden.rows());
@@ -1686,24 +1701,37 @@ pub fn evaluate_labelled<E: BlockEngine>(
         }
         if gradient {
             let seed = seed.ok_or_else(|| error("the head returned no cotangent"))?;
-            run_reverse([p, m], &plan, &calls, spread(&seed, 1.0 / std::f64::consts::LN_2)?, &mut total, factor_arithmetic(d, arithmetic))?;
+            data_seed = Some(spread(&seed, 1.0 / std::f64::consts::LN_2)?);
         }
     }
-    let factor = match labels {
-        Some(uniforms) => {
-            // The pass (and a label draw of its own: its logits and its seed) in the factor's
-            // arithmetic.
-            let factor = factor_arithmetic(d, arithmetic);
-            let seed = match drawn {
+    // The divergence's gradient and the factor's draw (with a label draw of its own, its logits
+    // and its seed, in the factor's arithmetic, when the divergence's sweep drew none) reverse
+    // together, each call's tape had once for both.
+    let factor = factor_arithmetic(d, arithmetic);
+    let factor_seed = match labels {
+        Some(uniforms) => Some(spread(
+            &match drawn {
                 Some(seed) => seed,
                 None => sampled_label_seed(d, &hidden, &head.resident.embedding, head.resident.tile_rows.max(1), uniforms, factor)?,
-            };
-            let mut u = BTreeMap::new();
-            run_reverse([p, m], &plan, &calls, spread(&seed, 1.0)?, &mut u, factor)?;
-            Some(Factor { gradient: u, tokens: hidden.rows() })
-        }
+            },
+            1.0,
+        )?),
         None => None,
     };
+    let mut u = BTreeMap::new();
+    let mut passes = Vec::with_capacity(2);
+    if let Some(cotangent) = data_seed {
+        passes.push(Pass { cotangent, gradient: &mut total, arithmetic: factor });
+    }
+    let factored = factor_seed.is_some();
+    if let Some(cotangent) = factor_seed {
+        passes.push(Pass { cotangent, gradient: &mut u, arithmetic: factor });
+    }
+    if !passes.is_empty() {
+        run_reverse([p, m], &plan, &calls, &mut passes)?;
+    }
+    drop(passes);
+    let factor = factored.then(|| Factor { gradient: u, tokens: hidden.rows() });
     Ok(Evaluation { bits, gradient: total, factor })
 }
 
@@ -1916,6 +1944,58 @@ mod tests {
     };
     use rand::{SeedableRng, rngs::StdRng};
 
+    /// Two cotangents reversed together give each the gradient a reverse of its own gives, bit for
+    /// bit, on the host and on an accelerator.
+    #[test]
+    fn reverses_run_together_are_each_one_alone() {
+        let dir = tiny_export("interchange_fused_reverse", 2);
+        let imported = import_language_model(&dir, 6, 12).expect("the tiny export imports");
+        std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+        let native = split_sites(&imported.program).expect("the native sites");
+        let layers = layer_nodes(&native, 2).expect("the layers");
+        let explanation = library_mdl::explanation(&native, &layers).expect("the library");
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let blocks: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let mut devices = vec![Device::host()];
+        devices.extend(Device::accelerator(gam_gpu::GpuPolicy::Auto).expect("a device probe"));
+        for device in devices {
+            let variables = reads(&native, &blocks).expect("the reads");
+            let ic = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
+            let batch = Batch::new(sequences[..3].to_vec(), sequences[3..].to_vec()).expect("the batch");
+            let experiments = sample(&mut StdRng::seed_from_u64(5), 3, ic.variables(), 4, 12).expect("the draw");
+            let (m, p) = ic.models();
+            let (paths, bases) = paths(&batch, &experiments, p.values(), None, 4).expect("the paths");
+            let plan = Plan::new(paths, 12);
+            let (stream, calls) = run([&p, &m], &plan, true).expect("the forward pass");
+            let rows = outputs(&plan, &bases, &experiments);
+            let scored: usize = rows.iter().map(ExactSizeIterator::len).sum();
+            let seed = |k: u64| {
+                let mut rng = StdRng::seed_from_u64(k);
+                let values = ndarray::Array2::from_shape_fn((scored, stream.cols()), |_| rng.random::<f64>() - 0.5);
+                spread(&device, stream.rows(), &rows, &device.upload(values.view()).expect("upload"), 1.0).expect("the seed")
+            };
+            let bits = |gradient: &BTreeMap<usize, Tensor>| -> Vec<(usize, Vec<u64>)> {
+                gradient.iter().map(|(op, g)| (*op, device.download(g).expect("download").iter().map(|v| v.to_bits()).collect())).collect()
+            };
+            let arithmetic = factor_arithmetic(&device, p.arithmetic());
+            let (mut first, mut second) = (BTreeMap::new(), BTreeMap::new());
+            run_reverse([&p, &m], &plan, &calls, &mut [Pass { cotangent: seed(1), gradient: &mut first, arithmetic }]).expect("the first pass");
+            run_reverse([&p, &m], &plan, &calls, &mut [Pass { cotangent: seed(2), gradient: &mut second, arithmetic }]).expect("the second pass");
+            let (mut first_together, mut second_together) = (BTreeMap::new(), BTreeMap::new());
+            run_reverse(
+                [&p, &m],
+                &plan,
+                &calls,
+                &mut [Pass { cotangent: seed(1), gradient: &mut first_together, arithmetic }, Pass { cotangent: seed(2), gradient: &mut second_together, arithmetic }],
+            )
+            .expect("the passes together");
+            assert!(!first.is_empty(), "the passes reach P's operators");
+            assert_eq!(bits(&first_together), bits(&first), "the first pass");
+            assert_eq!(bits(&second_together), bits(&second), "the second pass");
+        }
+    }
+
     /// Batched edits against one patch at a time, with a patched row repeated (2), a source
     /// repeated (4) and a source that is also a patched row (2), on the host: equal bit for bit.
     #[test]
@@ -2053,7 +2133,7 @@ mod tests {
                 seed.row_mut(r).assign(&residual.dot(&embedding));
                 let cotangent = spread(&device, stream.rows(), &rows, &device.upload(seed.view()).expect("upload"), 1.0).expect("the seed");
                 let mut gradient = BTreeMap::new();
-                run_reverse([&p, &m], &plan, &calls, cotangent, &mut gradient, p.arithmetic()).expect("the reverse pass");
+                run_reverse([&p, &m], &plan, &calls, &mut [Pass { cotangent, gradient: &mut gradient, arithmetic: p.arithmetic() }]).expect("the reverse pass");
                 for (op, g) in gradient {
                     let g = device.download(&g).expect("download");
                     let term = g.mapv(|v| prediction[c] * v * v);
