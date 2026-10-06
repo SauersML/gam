@@ -158,11 +158,6 @@ extern "C" __global__ void copy_within(u64 n, u64 from, u64 at, float* t) {
     GRID_STRIDE(i, n) t[at + i] = t[from + i];
 }
 
-extern "C" __global__ void axpy_from(u64 n, double alpha, const float* y, const float* x, float* out) {
-    float a = (float)alpha;
-    GRID_STRIDE(i, n) out[i] = y[i] + a * x[i];
-}
-
 extern "C" __global__ void move_toward(u64 n, double weight, const float* x, float* y) {
     float w = (float)weight;
     GRID_STRIDE(i, n) {

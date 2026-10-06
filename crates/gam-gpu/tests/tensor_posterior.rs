@@ -142,7 +142,12 @@ fn run(fit: &Device, wide: &Device, c: &Case) -> (Array2<f64>, Array2<f64>, Arra
     assert!(wide.download(&sums).unwrap().iter().all(|v| *v == 0.0), "the sums are zeroed");
     let (gradient, factor) = (up(fit, &c.gradient), up(fit, &c.factor));
     let [momentum, curvature, power] = &mut moments[..] else { unreachable!() };
-    fit.posterior_ivon((&mut mean, &mut log_sd), [momentum, curvature, power], (&gradient, &factor), (&groups, &variance), &mut sums, &c.step).unwrap();
+    let (mut direction, mut terms) = (fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap(), wide.zeros(c.count, 3).unwrap());
+    fit.posterior_ivon((&mean, &mut log_sd), [momentum, curvature, power], (&gradient, &factor), (&groups, &variance), (&mut direction, &mut terms), &c.step).unwrap();
+    // The full step, and an average from zero with weight 1 (the stepped mean itself), whose
+    // moments are the sums after the step.
+    let mut average = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
+    fit.posterior_finish((&mut mean, &direction, 1.0), (&mut average, 1.0), &log_sd, &groups, &mut sums).unwrap();
     let down = |t: &Tensor| fit.download(t).unwrap();
     let down_wide = |t: &Tensor| wide.download(t).unwrap();
     (fit.download(&theta).unwrap(), down(&mean), down(&log_sd), moments.iter().map(down).collect(), before, down_wide(&sums), down_wide(&divergence))
@@ -337,10 +342,9 @@ fn settled(fit: &Device, wide: &Device, steps: u64) -> (f64, Vec<f64>) {
             h * (theta - a) + s * f64::from(posterior_normal(12, t, i as u64))
         });
         let step = PosteriorStep { gradient_scale: 1.0, factor_scale: 1.0, tokens, beta1: 0.9, beta2: 1.0 - 1.0 / 64.0, weights: PosteriorStep::constant_weights(0.9, t) };
-        let mut sums = wide.zeros(1, 3).unwrap();
-        fit.posterior_ivon((&mut mean, &mut log_sd), [&mut momentum, &mut curvature, &mut power], (&up(gradient), &factor), (&groups, &variance), &mut sums, &step).unwrap();
-        let full = fit.download(&mean).unwrap();
-        mean = up(&mu + &((&full - &mu) * 0.1));
+        let (mut direction, mut sums) = (fit.zeros(1, R).unwrap(), wide.zeros(1, 3).unwrap());
+        fit.posterior_ivon((&mean, &mut log_sd), [&mut momentum, &mut curvature, &mut power], (&up(gradient), &factor), (&groups, &variance), (&mut direction, &mut sums), &step).unwrap();
+        mean = up(&mu - &(fit.download(&direction).unwrap() * 0.1));
     }
     (target, averages)
 }
@@ -447,7 +451,10 @@ fn bfloat16_momentum(fit: &Device, half: &Device, wide: &Device, mut c: Case) {
         let (mut variance, mut divergence) = (wide.zeros(c.count, 1).expect("variance"), wide.zeros(c.count, 1).expect("divergence"));
         wide.group_divergence(&mut sums, &mut variance, &mut divergence).expect("group divergence");
         let (gradient, factor) = (up(gradient_storage, &c.gradient), up(gradient_storage, &c.factor));
-        fit.posterior_ivon((&mut m, &mut s), [&mut momentum, &mut curvature, &mut power], (&gradient, &factor), (&groups, &variance), &mut sums, &c.step).expect("bfloat16 step");
+        let (mut direction, mut terms) = (fit.zeros(c.mean.nrows(), c.mean.ncols()).expect("direction"), wide.zeros(c.count, 3).expect("terms"));
+        fit.posterior_ivon((&m, &mut s), [&mut momentum, &mut curvature, &mut power], (&gradient, &factor), (&groups, &variance), (&mut direction, &mut terms), &c.step).expect("bfloat16 step");
+        let mut average = fit.zeros(c.mean.nrows(), c.mean.ncols()).expect("average");
+        fit.posterior_finish((&mut m, &direction, 1.0), (&mut average, 1.0), &s, &groups, &mut sums).expect("finish");
         close("bfloat16 sample", &down(&sample), &theta.mapv(bf16), 2f64.powi(-8));
         close("mean", &down(&m), &mean, CHAIN);
         close("log sd", &down(&s), &log_sd, CHAIN);
@@ -502,30 +509,27 @@ fn removal_sums_against_host(fit: &Device, wide: &Device) {
     assert!((lengths[(1, 1)] - expected_lengths[(1, 1)]).abs() <= bound, "code length {} against {}", lengths[(1, 1)], expected_lengths[(1, 1)]);
 }
 
-/// `group_line_terms` against the five `group_curvature`s it replaces on the same device, for each
-/// axis's case, the gradient and the draw in `draws`'s storage: the direction `d = before − mean`
-/// equal, and each term bit for bit its group curvature's column 1 (the CUDA kernel takes the
-/// entries in the same order).
-fn line_terms_match_the_curvatures(fit: &Device, draws: &Device, wide: &Device) {
+/// A step's terms (`posterior_ivon`'s sums) against the group curvatures of its direction on the
+/// same device, for each axis's case, the momentum in `momenta`'s storage and the gradient and the
+/// factor in `gradients`': `d · d`, `u · d` and `Σ h' d²` each bit for bit its group curvature's
+/// column 1 (the same entries in the same order).
+fn step_terms_match_the_curvatures(fit: &Device, (momenta, gradients): (&Device, &Device), wide: &Device) {
     for axis in AXES {
         let c = case(axis);
-        let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
+        let up = |d: &Device, a: &Array2<f64>| d.upload(a.view()).unwrap();
         let groups = fit.group_map(&c.groups, c.mean.dim()).unwrap();
-        let shifted = &c.mean - &matrix(c.mean.nrows(), c.mean.ncols(), 9, 0.05, 0.0);
-        let (gradient, draw) = (draws.upload(c.gradient.view()).unwrap(), draws.upload(c.factor.view()).unwrap());
-        let (curvature, before, mean, log_sd) = (up(&c.moments[1]), up(&c.mean), up(&shifted), up(&c.log_sd));
-        let mut direction = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
-        let mut sums = wide.zeros(c.count, 5).unwrap();
-        fit.group_line_terms((&gradient, &draw, &curvature), (&before, &mean, &log_sd), &groups, (&mut direction, &mut sums)).unwrap();
-        let mut d = fit.copy(&before).unwrap();
-        fit.axpy(&mut d, -1.0, &mean).unwrap();
-        assert_eq!(fit.download(&direction).unwrap(), fit.download(&d).unwrap(), "{} {axis:?}: the direction", fit.name());
+        let (mean, mut log_sd) = (up(fit, &c.mean), up(fit, &c.log_sd));
+        let (mut momentum, mut curvature, mut power) = (up(momenta, &c.moments[0]), up(fit, &c.moments[1]), up(fit, &c.moments[2]));
+        let (gradient, factor) = (up(gradients, &c.gradient), up(gradients, &c.factor));
+        let variance = wide.upload_vec(c.count, 1, (0..c.count).map(|g| 0.01 * (g + 1) as f64).collect()).unwrap();
+        let (mut direction, mut sums) = (fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap(), wide.zeros(c.count, 3).unwrap());
+        fit.posterior_ivon((&mean, &mut log_sd), [&mut momentum, &mut curvature, &mut power], (&gradient, &factor), (&groups, &variance), (&mut direction, &mut sums), &c.step).unwrap();
         let mut weighted = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
-        fit.hadamard(&mut weighted, &curvature, &d, false).unwrap();
+        fit.hadamard(&mut weighted, &curvature, &direction, false).unwrap();
         let terms = wide.download(&sums).unwrap();
-        for (k, x) in [&gradient, &d, &before, &draw, &weighted].into_iter().enumerate() {
+        for (k, x) in [&direction, &factor, &weighted].into_iter().enumerate() {
             let mut part = wide.zeros(c.count, 3).unwrap();
-            fit.group_curvature((x, &d, &log_sd), &groups, &mut part).unwrap();
+            fit.group_curvature((x, &direction, &log_sd), &groups, &mut part).unwrap();
             let part = wide.download(&part).unwrap();
             for g in 0..c.count {
                 assert_eq!(terms[(g, k)], part[(g, 1)], "{} {axis:?}: term {k} of group {g}", fit.name());
@@ -534,34 +538,54 @@ fn line_terms_match_the_curvatures(fit: &Device, draws: &Device, wide: &Device) 
     }
 }
 
+/// `posterior_finish` against the `axpy`, `move_toward` and `group_moments` it replaces on the same
+/// device, bit for bit, for each axis's case.
+fn finish_matches_its_parts(fit: &Device, wide: &Device) {
+    for axis in AXES {
+        let c = case(axis);
+        let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
+        let groups = fit.group_map(&c.groups, c.mean.dim()).unwrap();
+        let (direction, log_sd) = (up(&matrix(c.mean.nrows(), c.mean.ncols(), 9, 0.05, 0.0)), up(&c.log_sd));
+        let ((mut mean, mut average), mut sums) = ((up(&c.mean), up(&c.moments[0])), wide.zeros(c.count, 3).unwrap());
+        fit.posterior_finish((&mut mean, &direction, 0.375), (&mut average, 0.0625), &log_sd, &groups, &mut sums).unwrap();
+        let ((mut m, mut a), mut s) = ((up(&c.mean), up(&c.moments[0])), wide.zeros(c.count, 3).unwrap());
+        fit.axpy(&mut m, -0.375, &direction).unwrap();
+        fit.move_toward(&mut a, 0.0625, &m).unwrap();
+        fit.group_moments((&a, &log_sd), &groups, &mut s).unwrap();
+        assert_eq!(fit.download(&mean).unwrap(), fit.download(&m).unwrap(), "{} {axis:?}: the mean", fit.name());
+        assert_eq!(fit.download(&average).unwrap(), fit.download(&a).unwrap(), "{} {axis:?}: the average", fit.name());
+        assert_eq!(wide.download(&sums).unwrap(), wide.download(&s).unwrap(), "{} {axis:?}: the moments", fit.name());
+    }
+}
+
 #[test]
-fn line_terms_are_the_group_curvatures_they_replace() {
+fn a_steps_terms_and_finish_are_the_operations_they_replace() {
     let host = Device::host();
-    line_terms_match_the_curvatures(&host, &host, &host);
+    step_terms_match_the_curvatures(&host, (&host, &host), &host);
+    finish_matches_its_parts(&host, &host);
     if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
         let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
         let half = wide.with_storage(Storage::Bf16).expect("CUDA holds bfloat16");
-        line_terms_match_the_curvatures(&narrow, &narrow, &wide);
-        line_terms_match_the_curvatures(&narrow, &half, &wide);
-        line_terms_match_the_curvatures(&wide, &wide, &wide);
+        step_terms_match_the_curvatures(&narrow, (&narrow, &narrow), &wide);
+        step_terms_match_the_curvatures(&narrow, (&half, &narrow), &wide);
+        step_terms_match_the_curvatures(&narrow, (&half, &half), &wide);
+        step_terms_match_the_curvatures(&wide, (&wide, &wide), &wide);
+        finish_matches_its_parts(&narrow, &wide);
+        finish_matches_its_parts(&wide, &wide);
     }
     // On Linux the single-precision device is CUDA's f32 storage, whose sums are no float64 tensor.
     if cfg!(target_os = "macos")
         && let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault")
     {
-        line_terms_match_the_curvatures(&metal, &metal, &metal);
+        step_terms_match_the_curvatures(&metal, (&metal, &metal), &metal);
+        finish_matches_its_parts(&metal, &metal);
     }
 }
 
-/// `axpy_from` and `move_toward` against the copies and `axpy`s they replace, bit for bit.
+/// `move_toward` against the copy and `axpy`s it replaces, bit for bit.
 fn moves_match_their_compositions(d: &Device) {
     let (x, y) = (d.upload(matrix(7, 33, 11, 2.0, 0.5).view()).unwrap(), d.upload(matrix(7, 33, 12, 1.5, -0.25).view()).unwrap());
-    for alpha in [-1.0, -0.375, 0.1, 3.0] {
-        let mut out = d.zeros(7, 33).unwrap();
-        d.axpy_from(&mut out, &y, alpha, &x).unwrap();
-        let mut expected = d.copy(&y).unwrap();
-        d.axpy(&mut expected, alpha, &x).unwrap();
-        assert_eq!(d.download(&out).unwrap(), d.download(&expected).unwrap(), "{} axpy_from {alpha}", d.name());
+    for alpha in [-1.0_f64, -0.375, 0.1, 3.0] {
         let mut moved = d.copy(&y).unwrap();
         d.move_toward(&mut moved, alpha.abs() / 4.0, &x).unwrap();
         let mut difference = d.copy(&x).unwrap();
@@ -573,13 +597,15 @@ fn moves_match_their_compositions(d: &Device) {
 }
 
 #[test]
-fn moves_are_the_copies_and_axpys_they_replace() {
+fn a_move_toward_is_the_copy_and_axpys_it_replaces() {
     moves_match_their_compositions(&Device::host());
     if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
         moves_match_their_compositions(&wide.with_storage(Storage::F32).expect("CUDA holds f32"));
         moves_match_their_compositions(&wide);
     }
-    if let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault") {
+    if cfg!(target_os = "macos")
+        && let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault")
+    {
         moves_match_their_compositions(&metal);
     }
 }
@@ -603,7 +629,7 @@ fn single_columns_match_their_transposes(fit: &Device, momenta: &Device, wide: &
         log_sd[(i / cols, i % cols)] = f64::NEG_INFINITY;
     }
     let (momentum, curvature, power) = (matrix(rows, cols, 3, 0.1, 0.0), matrix(rows, cols, 4, 0.5, 1.0), matrix(rows, cols, 5, 0.01, 0.02));
-    let (gradient, factor, before) = (matrix(rows, cols, 7, 3.0, 0.0), matrix(rows, cols, 8, 2.0, 0.0), &mean + &matrix(rows, cols, 9, 0.05, 0.0));
+    let (gradient, factor) = (matrix(rows, cols, 7, 3.0, 0.0), matrix(rows, cols, 8, 2.0, 0.0));
     let both = |d: &Device, a: &Array2<f64>| (d.upload(a.view()).unwrap(), d.upload(a.t().as_standard_layout().view()).unwrap());
     let back = |t: &Tensor| fit.download(t).unwrap().t().as_standard_layout().to_owned();
     let pair = |what: &str, (a, b): (&Tensor, &Tensor), d: &Device| assert_eq!(d.download(a).unwrap(), d.download(b).unwrap(), "{} {what}", fit.name());
@@ -617,23 +643,26 @@ fn single_columns_match_their_transposes(fit: &Device, momenta: &Device, wide: &
     fit.group_curvature((&u, &m, &s), &map, &mut x).unwrap();
     fit.group_curvature((&ut, &mt, &st), &map_t, &mut y).unwrap();
     pair("curvature", (&x, &y), wide);
-    let ((g, gt), (h, ht), (b, bt)) = (both(fit, &gradient), both(fit, &curvature), both(fit, &before));
-    let (mut d, mut dt) = (fit.zeros(rows, cols).unwrap(), fit.zeros(cols, rows).unwrap());
-    let (mut x, mut y) = sums(5);
-    fit.group_line_terms((&g, &u, &h), (&b, &m, &s), &map, (&mut d, &mut x)).unwrap();
-    fit.group_line_terms((&gt, &ut, &ht), (&bt, &mt, &st), &map_t, (&mut dt, &mut y)).unwrap();
-    pair("line terms", (&x, &y), wide);
-    assert_eq!(fit.download(&d).unwrap(), back(&dt), "{} directions", fit.name());
+    let (g, gt) = both(fit, &gradient);
     let variance = wide.upload_vec(count, 1, (0..count).map(|g| 0.01 * (g + 1) as f64).collect()).unwrap();
     let step = case(GroupAxis::Rows).step;
-    let ((mut m, mut mt), (mut s, mut st)) = (both(fit, &mean), both(fit, &log_sd));
+    let (mut s, mut st) = both(fit, &log_sd);
     let ((mut p, mut pt), (mut c, mut ct), (mut q, mut qt)) = (both(momenta, &momentum), both(fit, &curvature), both(fit, &power));
+    let (mut d, mut dt) = (fit.zeros(rows, cols).unwrap(), fit.zeros(cols, rows).unwrap());
     let (mut x, mut y) = sums(3);
-    fit.posterior_ivon((&mut m, &mut s), [&mut p, &mut c, &mut q], (&g, &u), (&map, &variance), &mut x, &step).unwrap();
-    fit.posterior_ivon((&mut mt, &mut st), [&mut pt, &mut ct, &mut qt], (&gt, &ut), (&map_t, &variance), &mut y, &step).unwrap();
-    pair("step sums", (&x, &y), wide);
-    for (what, a, b) in [("mean", &m, &mt), ("log sd", &s, &st), ("momentum", &p, &pt), ("curvature", &c, &ct), ("power", &q, &qt)] {
+    fit.posterior_ivon((&m, &mut s), [&mut p, &mut c, &mut q], (&g, &u), (&map, &variance), (&mut d, &mut x), &step).unwrap();
+    fit.posterior_ivon((&mt, &mut st), [&mut pt, &mut ct, &mut qt], (&gt, &ut), (&map_t, &variance), (&mut dt, &mut y), &step).unwrap();
+    pair("step terms", (&x, &y), wide);
+    for (what, a, b) in [("direction", &d, &dt), ("log sd", &s, &st), ("momentum", &p, &pt), ("curvature", &c, &ct), ("power", &q, &qt)] {
         assert_eq!(fit.download(a).unwrap(), back(b), "{} stepped {what}", fit.name());
+    }
+    let ((mut m, mut mt), (mut a, mut at)) = (both(fit, &mean), both(fit, &momentum));
+    let (mut x, mut y) = sums(3);
+    fit.posterior_finish((&mut m, &d, 0.375), (&mut a, 0.0625), &s, &map, &mut x).unwrap();
+    fit.posterior_finish((&mut mt, &dt, 0.375), (&mut at, 0.0625), &st, &map_t, &mut y).unwrap();
+    pair("finish sums", (&x, &y), wide);
+    for (what, a, b) in [("finished mean", &m, &mt), ("average", &a, &at)] {
+        assert_eq!(fit.download(a).unwrap(), back(b), "{} {what}", fit.name());
     }
 }
 

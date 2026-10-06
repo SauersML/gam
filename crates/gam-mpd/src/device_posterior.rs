@@ -313,30 +313,6 @@ impl DevicePosterior {
         (self.last_eta, self.rho, self.rho_steps)
     }
 
-    /// Operator `i`'s direction `d = before − μ` after the kernel's full step, with its terms added
-    /// into `sums` (groups × 5, per group: `g · d`, `Σ d²`, `μ · d` at the step's start, `u · d`,
-    /// `Σ h d²`), in one pass over the operator.
-    fn line_terms(&self, i: usize, before: &Tensor, (gradient, draw): (&Tensor, &Tensor), sums: &mut Tensor) -> Result<Tensor, String> {
-        let mut d = self.fitting.empty(before.rows(), before.cols()).map_err(error)?;
-        self.fitting
-            .group_line_terms((gradient, draw, &self.moments[i][1]), (before, &self.mean[i], &self.log_sd[i]), &self.groups[i], (&mut d, sums))
-            .map_err(error)?;
-        Ok(d)
-    }
-
-    /// The posterior's mean, the iterate's Polyak average (uniform over the steps since the
-    /// posterior was set, then over about one epoch; module note), and the groups' variances and
-    /// divergences at it.
-    fn average_and_refresh(&mut self, beta2: f64) -> Result<(), String> {
-        self.averaged += 1;
-        let weight = (1.0 / self.averaged as f64).max(1.0 - beta2);
-        for (average, mean) in self.average.iter_mut().zip(&self.mean) {
-            self.fitting.move_toward(average, weight, mean).map_err(error)?;
-        }
-        self.sums = self.wide.zeros(self.sums.rows(), 3).map_err(error)?;
-        self.refresh()
-    }
-
     /// The steps taken.
     #[must_use]
     pub fn steps(&self) -> u64 {
@@ -464,10 +440,9 @@ impl DevicePosterior {
         self.uploaded.clear();
         self.steps += 1;
         self.momentum_weights = PosteriorStep::weights_after(self.momentum_weights, ivon.beta1);
-        // The kernel takes IVON's full direction from the iterate kept here.
-        let before: Vec<Tensor> = self.mean.iter().map(|m| self.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
-        let mut sums = self.wide.zeros(self.group_count(), 5).map_err(error)?;
-        let mut directions = Vec::with_capacity(before.len());
+        // The kernel leaves the iterate and writes IVON's full step from it as the direction.
+        let mut sums = self.wide.zeros(self.group_count(), 3).map_err(error)?;
+        let mut directions = Vec::with_capacity(self.mean.len());
         for (i, &op) in self.operators.iter().enumerate() {
             let zero = |given: Option<&Tensor>| -> Result<Option<Tensor>, String> {
                 match given {
@@ -480,10 +455,11 @@ impl DevicePosterior {
             let draw = factor.0.get(&op).or(missing_factor.as_ref()).ok_or_else(|| error("no Gauss–Newton factor"))?;
             let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, beta1: ivon.beta1, beta2: ivon.beta2, weights: self.momentum_weights };
             let [momentum, curvature, power] = &mut self.moments[i];
+            let mut direction = self.fitting.empty(self.mean[i].rows(), self.mean[i].cols()).map_err(error)?;
             self.fitting
-                .posterior_ivon((&mut self.mean[i], &mut self.log_sd[i]), [momentum, curvature, power], (gradient, draw), (&self.groups[i], &self.variance), &mut self.sums, &step)
+                .posterior_ivon((&self.mean[i], &mut self.log_sd[i]), [momentum, curvature, power], (gradient, draw), (&self.groups[i], &self.variance), (&mut direction, &mut sums), &step)
                 .map_err(error)?;
-            directions.push(self.line_terms(i, &before[i], (gradient, draw), &mut sums)?);
+            directions.push(direction);
         }
         {
             // The step's length along `d`: the minimum along `d` of `F`'s Gauss–Newton model,
@@ -504,10 +480,10 @@ impl DevicePosterior {
             let column = |k: usize| terms.column(k).to_vec();
             let precision = |g: usize| if variances[g] > 0.0 { 1.0 / (self.tokens * variances[g]) } else { 0.0 };
             let weighted = |values: Vec<f64>| -> f64 { values.iter().enumerate().map(|(g, x)| precision(g) * x).sum() };
-            let along_u: f64 = column(3).iter().sum();
+            let along_u: f64 = column(1).iter().sum();
             let draw_curvature = factor.1 * along_u * along_u;
-            let diagonal: f64 = column(4).iter().sum();
-            let prior_curvature = weighted(column(1));
+            let diagonal: f64 = column(2).iter().sum();
+            let prior_curvature = weighted(column(0));
             if diagonal > 0.0 {
                 self.rho_steps += 1;
                 let w = (1.0 / self.rho_steps as f64).max(1.0 - ivon.beta2);
@@ -516,11 +492,19 @@ impl DevicePosterior {
             let (slope, curvature) = (diagonal + prior_curvature, self.rho * diagonal + prior_curvature);
             let eta = if self.hold || self.rho_steps < RATIO_DRAWS || !(curvature > 0.0 && slope.is_finite()) { 0.0 } else { slope / curvature };
             self.last_eta = eta;
-            for ((mean, start), d) in self.mean.iter_mut().zip(&before).zip(&directions) {
-                self.fitting.axpy_from(mean, start, -eta, d).map_err(error)?;
+            // The mean moved by `η d`, its Polyak average (uniform over the steps since the posterior
+            // was set, then over about one epoch; module note) moved toward it, and the groups'
+            // variances and divergences at the average, one pass per operator.
+            self.averaged += 1;
+            let weight = (1.0 / self.averaged as f64).max(1.0 - ivon.beta2);
+            self.sums = self.wide.zeros(self.sums.rows(), 3).map_err(error)?;
+            for (i, d) in directions.iter().enumerate() {
+                self.fitting
+                    .posterior_finish((&mut self.mean[i], d, eta), (&mut self.average[i], weight), &self.log_sd[i], &self.groups[i], &mut self.sums)
+                    .map_err(error)?;
             }
         }
-        self.average_and_refresh(ivon.beta2)
+        self.wide.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
     }
 
     /// The number of prior groups.
