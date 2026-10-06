@@ -136,7 +136,8 @@
 //! once, in a fixed order. The continuous fit stops descending by a statistical criterion, not a
 //! proof of stationarity: when an epoch's mean improvement of the per-batch estimate of `F` over
 //! the previous epoch, paired by batch (the same batches, experiments and noise seeds' structure),
-//! is within its standard error. The criterion is on `F` itself rather than on the natural
+//! is within its standard error in either direction (an epoch that raises `F` by more is still
+//! moving). The criterion is on `F` itself rather than on the natural
 //! gradient in `μ`: under IVON the means settle long before the curvature `h`, and so `σ`, has
 //! finished its epoch-scale decay, which only `F` sees.
 //!
@@ -2899,7 +2900,9 @@ pub fn fit_from(
         progress.epochs.push(record);
         progress.previous = Some(estimates);
         progress.epoch += 1;
-        let converged = matches!((improvement, standard_error), (Some(i), Some(se)) if i <= se);
+        // Converged when the improvement is within its standard error either way: an epoch that
+        // raised `F` by more than its standard error is a move, not a fixed point.
+        let converged = matches!((improvement, standard_error), (Some(i), Some(se)) if i.abs() <= se);
         if converged {
             let log = checkpoint.map(|path| path.with_extension("removals.jsonl"));
             let evidence = Evidence { draws: &draws, sequences, settings };
