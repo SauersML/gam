@@ -14,7 +14,8 @@
 # card thunder:CARD[:MODE] (thunder:a6000, thunder:a100xl:prototyping) or a Nebius platform
 # nebius:PLATFORM (nebius:gpu-h100-sxm, preemptible); a list gives the types in order of preference;
 # auto ranks every offer (RunPod's community and secure, Thunder's, Nebius's) of the cards the
-# benchmark table (gpu_bench.tsv) has measured by $ per scored token, keeping those with
+# benchmark table (gpu_bench.tsv) has measured by expected $ per scored token, with each offer's
+# measured failures (attempts.tsv, rank_auto), keeping those with
 # RP_MIN_VRAM_GB of memory, and prints the choice; another provider's card enters it once a
 # benchmark run of it (gpu_bench.sh with GPU thunder:CARD:MODE or nebius:PLATFORM) is in the table. Work that does not use a GPU (builds, float64 references, CPU fits) goes to
 # GitHub Actions (gha-run), never to a RunPod pod. A run takes community cloud for every listed type before secure
@@ -178,6 +179,18 @@ TABLE=$MAC_DATA/runpod/gpu_bench.tsv
 REGISTRY=$MAC_DATA/runpod/created.tsv
 # Hosts (RunPod machine ids) whose pods did not come up or could not start CUDA.
 BAD_HOSTS=$MAC_DATA/runpod/bad_hosts
+# Data centers (RunPod's dataCenterId) where a pod never answered SSH: later pods there are deleted
+# at once, as on a failing host (two hosts behind one address, 80.15.7.37, each failed this way).
+BAD_DCS=$MAC_DATA/runpod/bad_dcs
+# One row per pod this runner created, written when the pod's attempt ends (attempt_end): date, run,
+# pod, GPU id, cloud (COMMUNITY, SECURE, THUNDER, NEBIUS), host, data center, $/h, seconds from
+# creation to the end, outcome and detail. Outcomes: worked (the command ran on it), setup failed
+# (no SSH, a host or data center that failed before, no own cap), broken driver (CUDA or NVRTC does
+# not start, the GPU busy or power-capped), dead network (inputs too slow), lost (gone during setup
+# or the command), ended (the runner stopped before the command for reasons of its own: refused
+# inputs, STOP, a pod deleted elsewhere; not counted against the offer). GPU_TYPE auto ranks offers
+# by these records (rank_auto).
+ATTEMPTS=$MAC_DATA/runpod/attempts.tsv
 # The runner's own files in the outputs directory: never synced from or restored to a pod.
 OWN=(run.log rp-run.log console.log pod.json pod.txt build.log data.log watch.log cost.txt ssh rsh host STOP EXTEND)
 # Never synced either: a file still being written (library_mdl writes NAME.partial, then renames it),
@@ -1009,6 +1022,61 @@ OUT=$RP/$NAME
 # pod holds (pod-wide: /workspace/gpu-util.log and the Python packages).
 WS=/workspace/runs/$NAME
 
+# How long a new pod may take to answer SSH (reach waits that long): the slowest time to SSH
+# measured (SSH_UP, at least ten pods) plus the median, the wait a replacement pod typically costs;
+# 300 s until ten are measured. 107 pods answered in 8-56 s (median 26 s); the six that took longer
+# never answered, and each held a paid GPU for 300 s.
+SSH_UP=$RP/ssh_up.tsv BAD_IPS=$RP/bad_ips
+ssh_wait() {
+    cut -f3 "$SSH_UP" 2> /dev/null | sort -n | awk '{ a[NR] = $1 } END { print (NR >= 10 ? a[NR] + a[int((NR + 1) / 2)] : 300) }'
+}
+# GPU_TYPE auto: OFFERS ("KIND|PRICE|GPU id"), every offer (card and cloud) of the measured cards
+# with the memory the run asks (RP_MIN_VRAM_GB), by expected dollars per useful scored token, and
+# their listing on stdout. Scored tokens per second R come from the benchmark table: Qwen3-0.6B's
+# step when the run needs more than 24 GB, else vpd4l's bf16 step at 32 sequences. An offer at P $/h
+# costs P / (3600 R) per token once a pod works. An attempt on it fails with probability f, and a
+# failure costs W seconds of the pod (creation until the failure shows) before the next attempt, so
+# the expected number of failures before a working pod is f / (1 - f), and the run's L = HOURS
+# seconds of tokens cost P / (3600 R) * (1 + f / (1 - f) * W / L) per token. f and W come from
+# ATTEMPTS (outcomes other than "ended"): for the offer's card and cloud, n attempts with m failures
+# losing w seconds in all, f = (m + 2 F) / (n + 2) and W = (w + V) / (m + 1), drawn toward its
+# cloud's F = (M + 1) / (N + 2) and V = (U + W0) / (M + 1) over all cards (N attempts, M failures,
+# U seconds), where W0 is the longest a pod waits for SSH (ssh_wait). With no records every offer
+# has f = 1/2 and W = W0, and the cheaper cloud leads. Cards the table has not measured are offered
+# only when no measured card has the memory, cheapest per hour first. Thunder's and Nebius's offers
+# are ranked by their own measured rows (card thunder:CARD:MODE, nebius:PLATFORM).
+AUTO=0
+rank_auto() {
+    local stats
+    stats=$(awk -F'\t' 'NR > 1 && $10 != "ended" && $10 != "" {
+                o = $4 "|" $5; c = $5; n[o]++; nc[c]++
+                if ($10 != "worked") { m[o]++; w[o] += $9; mc[c]++; wc[c] += $9 }
+            }
+            END { for (o in n) print "o\t" o "\t" n[o] "\t" m[o] + 0 "\t" w[o] + 0; for (c in nc) print "c\t" c "\t" nc[c] "\t" mc[c] + 0 "\t" wc[c] + 0 }' "$ATTEMPTS" 2> /dev/null |
+        jq -Rsc 'split("\n") | map(select(length > 0) | split("\t")) | {o: (map(select(.[0] == "o") | {key: .[1], value: {n: (.[2] | tonumber), m: (.[3] | tonumber), w: (.[4] | tonumber)}}) | from_entries),
+                                                                   c: (map(select(.[0] == "c") | {key: .[1], value: {n: (.[2] | tonumber), m: (.[3] | tonumber), w: (.[4] | tonumber)}}) | from_entries)}') || true
+    [ -n "$stats" ] || stats='{"o": {}, "c": {}}'
+    OFFERS=$(awk -F'\t' -v m="$metric" 'NR == 1 { for (i = 1; i <= NF; i++) { if ($i == "card") c = i; if ($i == m) t = i }; next }
+             t && $t != "-" && $t + 0 > 0 { print $c "\t" $t }' "$TABLE" |
+        jq -Rrs --argjson types "$(jq -c '.data.gpuTypes' <<< "$prices")" --argjson need "${RP_MIN_VRAM_GB:-0}" --argjson others "$others" \
+            --argjson stats "$stats" --argjson w0 "$(ssh_wait)" --argjson L "$CAP_SECONDS" '
+            (split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: (.[1] | tonumber)}) | from_entries) as $rate
+            | def offers($t): [{k: "COMMUNITY", c: 0, p: $t.communityPrice}, {k: "SECURE:cheapest-per-token", c: 1, p: $t.securePrice}] | map(select((.p // 0) > 0));
+              def risk: (.k | split(":")[0]) as $cl | ($stats.c[$cl] // {n: 0, m: 0, w: 0}) as $C | ($stats.o[.g + "|" + $cl] // {n: 0, m: 0, w: 0}) as $O
+                | (($C.m + 1) / ($C.n + 2)) as $F | (($C.w + $w0) / ($C.m + 1)) as $V
+                | (($O.m + 2 * $F) / ($O.n + 2)) as $f | (($O.w + $V) / ($O.m + 1)) as $W
+                | . + {f: $f, W: $W, n: $O.n, x: (1 + $f / (1 - $f) * $W / $L)};
+              ([$types[] | . as $t | offers($t)[] | . + {g: $t.id, mem: ($t.memoryInGb // 0)}] + $others | map(select(.mem >= $need))) as $all
+            | [$all[] | select($rate[.g] != null) | . + {per: (.p / ($rate[.g] * 3600 / 1e6))} | risk | . + {exp: (.per * .x)}]
+            | if length > 0 then sort_by([.exp, .c])
+              else [$all[] | select((.g | test("^(thunder|nebius):")) or (.g | test("A40|A6000|L40|A100|H100|H200"))) | . + {per: null}] | sort_by([.c, .p]) end
+            | .[] | "\(.k)|\(.p)|\(.g)|\(.per // "-")|\(.exp // "-")|\(.f // "-")|\(.W // "-")|\(.n // "-")"')
+    echo "rp-run: auto, by expected dollars per scored token on the $metric workload (rates from $TABLE, failures from $ATTEMPTS):"
+    awk -F'|' '{ if ($4 == "-") printf "rp-run:   %s %s $%s/h, not measured\n", $3, $1, $2
+                 else printf "rp-run:   %s %s $%s/h, $%.4f per million scored tokens, $%.4f expected (an attempt fails with p = %.2f, %d attempts recorded, %d s lost per failure)\n", $3, $1, $2, $4, $5, $6, $8, $7 }' <<< "$OFFERS"
+    OFFERS=$(cut -d'|' -f1-3 <<< "$OFFERS")
+}
+
 # The offers, one per line "KIND|PRICE|GPU id": a run takes community (or another provider's
 # offer) for every type before secure; a dev pod takes the types in order, community before secure
 # for each. A type thunder:CARD[:MODE] is Thunder's (both modes, cheaper first, when MODE is not given).
@@ -1019,32 +1087,13 @@ if :; then
     [ "$(status_of "$r")" = 200 ] || { echo "rp-run: price query failed: $(body_of "$r" | head -c 300)" >&2; exit 1; }
     prices=$(body_of "$r")
     if [ "$GPU" = auto ]; then
-        # Every offer (card and cloud) of the measured cards with the memory the run asks
-        # (RP_MIN_VRAM_GB), cheapest per scored token first, community before secure at equal cost:
-        # on the Qwen3-0.6B step when the run needs more than 24 GB, else vpd4l's bf16 step at 32
-        # sequences. A secure offer comes before a community one only when it costs less per token
-        # (a secure RTX 4090 before a community L40S). Cards the table has not measured are offered
-        # only when no measured card has the memory, cheapest per hour first.
-        # Thunder's and Nebius's offers are ranked by their own measured rows (card thunder:CARD:MODE,
-        # nebius:PLATFORM).
         [ -f "$TABLE" ] || { echo "rp-run: GPU_TYPE auto needs the benchmark table $TABLE" >&2; exit 2; }
         metric="vpd4l bf16 s32 tok/s"
         (( ${RP_MIN_VRAM_GB:-0} > 24 )) && metric="qwen3 bf16 s8 tok/s"
         others=$(provider_offers | jq -Rsc 'split("\n") | map(select(length > 0) | split("|") | {k: .[0], c: 0, p: (.[1] | tonumber), g: .[2], mem: (.[3] | tonumber)})')
-        OFFERS=$(awk -F'\t' -v m="$metric" 'NR == 1 { for (i = 1; i <= NF; i++) { if ($i == "card") c = i; if ($i == m) t = i }; next }
-                 t && $t != "-" && $t + 0 > 0 { print $c "\t" $t }' "$TABLE" |
-            jq -Rrs --argjson types "$(jq -c '.data.gpuTypes' <<< "$prices")" --argjson need "${RP_MIN_VRAM_GB:-0}" --argjson others "$others" '
-                (split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: (.[1] | tonumber)}) | from_entries) as $rate
-                | def offers($t): [{k: "COMMUNITY", c: 0, p: $t.communityPrice}, {k: "SECURE:cheapest-per-token", c: 1, p: $t.securePrice}] | map(select((.p // 0) > 0));
-                  ([$types[] | . as $t | offers($t)[] | . + {g: $t.id, mem: ($t.memoryInGb // 0)}] + $others | map(select(.mem >= $need))) as $all
-                | [$all[] | select($rate[.g] != null) | . + {per: (.p / ($rate[.g] * 3600 / 1e6))}]
-                | if length > 0 then sort_by([.per, .c])
-                  else [$all[] | select((.g | test("^(thunder|nebius):")) or (.g | test("A40|A6000|L40|A100|H100|H200"))) | . + {per: null}] | sort_by([.c, .p]) end
-                | .[] | "\(.k)|\(.p)|\(.g)|\(.per // "-")"')
+        AUTO=1
+        rank_auto >&2
         [ -n "$OFFERS" ] || { echo "rp-run: no card has ${RP_MIN_VRAM_GB:-0} GB" >&2; exit 2; }
-        echo "rp-run: auto, cheapest per scored token on the $metric workload (from $TABLE):" >&2
-        awk -F'|' '{ printf "rp-run:   %s %s $%s/h, %s\n", $3, $1, $2, ($4 == "-" ? "not measured" : sprintf("$%.4f per million scored tokens", $4)) }' <<< "$OFFERS" >&2
-        OFFERS=$(cut -d'|' -f1-3 <<< "$OFFERS")
         GPU=$(cut -d'|' -f3 <<< "$OFFERS" | awk '!seen[$0]++' | paste -sd, -)
     else
     rows=()
@@ -1556,6 +1605,7 @@ ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$TMP/key"
 chmod 600 "$TMP/key"
 KEYS="$( [ -f "$TMP/key.pub" ] && cat "$TMP/key.pub")"$'\n'"$(cat ~/.ssh/runpod_ed25519.pub)"
 POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0 GUEST=0 EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" EARLY_BINS="" PROBE_A="" MED_RATE="" POD_HOST=""
+POD_DC="" ATTEMPT_GPU="" ATTEMPT_KIND="" ATTEMPT_DONE=1 RUN_STARTED=0 REACH_WHY="" REACH_DC=""
 SSH=(ssh -F none -i "$TMP/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ForwardX11=no
      -o UserKnownHostsFile="$TMP/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20
      -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o LogLevel=ERROR)
@@ -1572,6 +1622,7 @@ finish() {
     [ -n "$SYNC" ] && kill $SYNC 2> /dev/null
     # The log stream, the idle check and other helpers end with the run.
     kill $(jobs -p) 2> /dev/null
+    if (( RUN_STARTED )); then attempt_end worked "command ran"; else attempt_end ended "runner ended before the command (status $rc)"; fi
     if [ -n "$POD" ] && [ ! -f "$ACTIVE/.$POD.end" ] && (( ! GUEST )); then
         if [ -f "$OUT/STOP" ]; then echo stopped; elif [ -n "${RC:-}" ]; then echo "exit $RC"; else echo "exit $rc"; fi > "$ACTIVE/.$POD.end"
     fi
@@ -1649,6 +1700,20 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
+# The end of POD's attempt, once (ATTEMPTS): OUTCOME, DETAIL, and "dc" when the data center's network
+# is the likely cause (it joins BAD_DCS). A run sharing another run's pod writes none.
+attempt_end() {  # OUTCOME DETAIL [dc]
+    [ -n "$POD" ] && [ -z "$ATTEMPT_DONE" ] && (( ! GUEST )) || return 0
+    ATTEMPT_DONE=1
+    [ -f "$ATTEMPTS" ] || printf 'date\trun\tpod\tgpu\tcloud\thost\tdatacenter\tprice\tseconds\toutcome\tdetail\n' > "$ATTEMPTS"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$NAME" "$POD" "$ATTEMPT_GPU" "${ATTEMPT_KIND%%:*}" \
+        "${POD_HOST:--}" "${POD_DC:--}" "${PRICE:--}" "$(( $(date +%s) - ${CREATED:-$(date +%s)} ))" "$1" "${2:-}" >> "$ATTEMPTS"
+    if [ "${3:-}" = dc ] && [ -n "$POD_DC" ] && ! grep -qxF "$POD_DC" "$BAD_DCS" 2> /dev/null; then
+        echo "$POD_DC" >> "$BAD_DCS"
+        say "data center $POD_DC recorded as failing ($2)"
+    fi
+}
+
 # Records POD in active/ (name gpu cloud price created owner estimate mode) and starts its watcher.
 record() {  # GPU_ID KIND
     printf '%s\t%s\t%s\n' "$POD" "$NAME" "$(date '+%F %T')" >> "$REGISTRY"
@@ -1663,19 +1728,12 @@ record() {  # GPU_ID KIND
 # by its host (exited by RunPod, or running but unreachable).
 deleted() { [ "$(pod_state "$1")" = GONE ]; }
 
-# Waits for SSH to POD (sets IP PORT VCPU) as long as a new pod may take: the slowest time to SSH
-# measured (SSH_UP, at least ten pods) plus the median, the wait a replacement pod typically costs;
-# 300 s until ten are measured. 107 pods answered in 8-56 s (median 26 s); the six that took longer
-# never answered, and each held a paid GPU for 300 s.
-SSH_UP=$RP/ssh_up.tsv BAD_IPS=$RP/bad_ips
-ssh_wait() {
-    cut -f3 "$SSH_UP" 2> /dev/null | sort -n | awk '{ a[NR] = $1 } END { print (NR >= 10 ? a[NR] + a[int((NR + 1) / 2)] : 300) }'
-}
+# Waits for SSH to POD (sets IP PORT VCPU) as long as a new pod may take (ssh_wait).
 reach() {
     local r b st limit
     limit=$(ssh_wait)
     until [ -n "$IP" ]; do
-        (( $(date +%s) - CREATED < limit )) || { say "no public SSH address after $limit s (the slowest pod measured plus the median)"; return 1; }
+        (( $(date +%s) - CREATED < limit )) || { say "no public SSH address after $limit s (the slowest pod measured plus the median)"; REACH_WHY="no public SSH address" REACH_DC=dc; return 1; }
         if [ "$(provider_of "$POD")" = thunder ]; then
             r=$(tapi GET /instances/list)
             if [ "$(status_of "$r")" = 200 ]; then
@@ -1709,7 +1767,8 @@ reach() {
         if [ "$(status_of "$r")" = 200 ]; then
             b=$(body_of "$r")
             st=$(jq -r .desiredStatus <<< "$b")
-            [ "$st" = RUNNING ] || { say "pod is $st ($(jq -r '.lastStatusChange // ""' <<< "$b"))"; return 1; }
+            [ "$st" = RUNNING ] || { say "pod is $st ($(jq -r '.lastStatusChange // ""' <<< "$b"))"; REACH_WHY="pod $st" REACH_DC=""; return 1; }
+            [ -n "$POD_DC" ] || POD_DC=$(jq -r '.machine.dataCenterId // empty' <<< "$b")
             IP=$(jq -r '.publicIp // empty' <<< "$b")
             PORT=$(jq -r '.portMappings["22"] // empty' <<< "$b")
             VCPU=$(jq -r '.vcpuCount // empty' <<< "$b")
@@ -1723,12 +1782,14 @@ reach() {
     # 300 s) is left at once.
     if grep -qxF "$IP" "$BAD_IPS" 2> /dev/null; then
         say "SSH address $IP never answered before"
+        REACH_WHY="SSH address failed before" REACH_DC=""
         return 1
     fi
     until on_pod true < /dev/null 2> /dev/null; do
         if (( $(date +%s) - CREATED >= limit )); then
             echo "$IP" >> "$BAD_IPS"
             say "SSH to $IP:$PORT not answering after $limit s (the slowest pod measured plus the median); $IP recorded"
+            REACH_WHY="SSH not answering" REACH_DC=dc
             return 1
         fi
         sleep 2
@@ -1898,6 +1959,7 @@ launch() {
     # A listed run relaunches only while still listed; a small run's approval covers its whole cap.
     [ "$APPROVAL" = auto ] || approved "$NAME" || { say "approval for $NAME withdrawn; not launching a pod"; exit 3; }
     POD="" IP="" PORT="" EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" EARLY_BINS="" PROBE_A=""
+    POD_DC="" REACH_WHY="" REACH_DC="" RUN_STARTED=0
     rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
     host=$(find_host)
     if [ -n "$host" ] && attach "$host"; then
@@ -1951,6 +2013,7 @@ launch() {
                 PRICE=$(jq -r '.costPerHr // .adjustedCostPerHr // empty' <<< "$(body_of "$r")")
                 PRICE=${PRICE:-$price}
                 host=$(jq -r '.machineId // empty' <<< "$(body_of "$r")")
+                POD_DC=$(jq -r '.machine.dataCenterId // empty' <<< "$(body_of "$r")")
                 record "$gpu" "$kind"
             fi
         fi
@@ -1963,33 +2026,47 @@ launch() {
             say "no $gpu on ${kind%%:*} ($code): $(body_of "$r" | head -c 200)"
             continue
         fi
-        say "pod $POD: ${gpu#thunder:}, $kind at \$$PRICE/h, host ${host:-?}"
+        say "pod $POD: ${gpu#thunder:}, $kind at \$$PRICE/h, host ${host:-?}${POD_DC:+, data center $POD_DC}"
+        ATTEMPT_GPU=$gpu ATTEMPT_KIND=$kind ATTEMPT_DONE="" RUN_STARTED=0
         SSH_USER=root
         [ "$(provider_of "$POD")" = runpod ] || SSH_USER=ubuntu
         POD_HOST=$host
+        why=()
         if [ -n "$host" ] && grep -qx "$host" "$BAD_HOSTS" 2> /dev/null; then
             say "host $host failed before; deleting pod $POD"
+            why=("setup failed" "host failed before")
+        elif [ -n "$POD_DC" ] && grep -qxF "$POD_DC" "$BAD_DCS" 2> /dev/null; then
+            say "data center $POD_DC failed before; deleting pod $POD"
+            why=("setup failed" "data center failed before")
         elif slow_host "$host"; then
+            why=("dead network" "host slow before")
             say "host $host was slow before (download $(awk -F'\t' -v h="$host" '$2 == h { r = $3 } END { print r }' "$RP/host_rates.tsv" 2> /dev/null) MB/s, Python install $(awk -F'\t' -v h="$host" '$2 == h { r = $3 } END { print r }' "$RP/host_installs.tsv" 2> /dev/null) s): another pod costs less; deleting pod $POD"
         elif ! reach; then
             [ -z "$host" ] || echo "$host" >> "$BAD_HOSTS"
             say "host $host recorded as failing; deleting pod $POD"
+            why=("setup failed" "${REACH_WHY:-no SSH}" $REACH_DC)
         elif ! own_timer; then
             say "the pod's own cap is not armed; deleting pod $POD"
+            why=("setup failed" "own cap not armed")
         elif ! on_pod 'python3 -c "import ctypes; c = ctypes.CDLL(\"libcuda.so.1\"); n = ctypes.c_int(); assert c.cuInit(0) == 0 and c.cuDeviceGetCount(ctypes.byref(n)) == 0 and n.value > 0"' < /dev/null > /dev/null 2>&1; then
             [ -z "$host" ] || echo "$host" >> "$BAD_HOSTS"
             say "CUDA does not initialize on host ${host:-?} ($(on_pod 'nvidia-smi --query-gpu=driver_version --format=csv,noheader' < /dev/null 2> /dev/null)); recorded as failing; deleting pod $POD"
+            why=("broken driver" "CUDA does not initialize")
         elif ! on_pod 'ls /usr/local/cuda/lib64/libnvrtc.so* > /dev/null 2>&1 || ldconfig -p | grep -q libnvrtc' < /dev/null; then
             # The device code compiles through NVRTC at run time: an image without it cannot run it.
             say "the machine has no NVRTC (libnvrtc); deleting pod $POD"
+            why=("broken driver" "no NVRTC")
         elif busy=$(gpu_in_use); [ -n "$busy" ]; then
             [ -z "$host" ] || echo "$host" >> "$BAD_HOSTS"
             say "the GPU on host ${host:-?} is not free before the run ($busy); recorded as failing; deleting pod $POD"
+            why=("broken driver" "GPU not free: $busy")
         elif fetch_too_slow; then
             say "deleting pod $POD"
+            why=("dead network" "inputs too slow")
         else
             break
         fi
+        attempt_end "${why[@]}"
         [ -z "$IP" ] || on_pod -O exit > /dev/null 2>&1 || true
         [ -z "$EARLY_FETCH" ] || { kill "$EARLY_FETCH" 2> /dev/null || true; wait "$EARLY_FETCH" 2> /dev/null || true; EARLY_FETCH=""; }
         [ -z "$EARLY_PYENV" ] || { kill "$EARLY_PYENV" 2> /dev/null || true; wait "$EARLY_PYENV" 2> /dev/null || true; EARLY_PYENV=""; }
@@ -2001,7 +2078,17 @@ launch() {
         POD="" IP="" PORT=""
         DISCARDED=$(( ${DISCARDED:-0} + 1 ))
         (( DISCARDED <= DISCARDS )) || { say "$DISCARDS pods discarded on failing hosts; giving up"; exit 1; }
+        # The failed host (or data center) is now skipped: the offers are ranked again with this
+        # attempt's record and tried from the best, so a community card that failed on one host is
+        # tried on another while it stays cheaper in expectation than a secure one.
+        RESTART=1
+        break
     done 3<<< "$OFFERS"
+    if [ -n "${RESTART:-}" ]; then
+        RESTART=""
+        (( ! AUTO )) || rank_auto > /dev/null
+        continue
+    fi
     if [ -z "$POD" ]; then
         # The first pod: offers RunPod refused with an error rather than a stock answer are asked
         # again, at most three times, 10 s apart (frontier-gn-n128-ab2-trust-s1 ended on one while
@@ -2798,6 +2885,7 @@ run_command() {
         setsid nohup bash -c 'echo \$\$ > $WS/run.pid; bash $WS/run.sh > $WS/run.log 2>&1; echo \$? > $WS/run.exit' > /dev/null 2>&1 < /dev/null &
         until [ -s $WS/run.pid ]; do sleep 0.1; done" || return 1
     say "running: $cmd"
+    RUN_STARTED=1
     FIRST_START=${FIRST_START:-$(date +%s)}
     sync_loop rest &
     SYNC=$!
@@ -2909,6 +2997,7 @@ case $MODE in
             # A pod deleted by anyone but this runner (an API delete, rp-run stop, its own cap) ends
             # the run; only a pod its host lost (exited by RunPod, or unreachable) is replaced.
             if [ -n "$POD" ] && deleted "$POD"; then
+                attempt_end ended "deleted outside the runner"
                 [ -f "$ACTIVE/.$POD.end" ] || (( GUEST )) || echo deleted-elsewhere > "$ACTIVE/.$POD.end"
                 say "pod $POD was deleted outside this runner; the run ends"
                 exit 1
@@ -2919,6 +3008,7 @@ case $MODE in
                 rm -f "$ACTIVE/.$POD.guests/$NAME"
                 reap "$POD" || exit 1
             elif [ -n "$POD" ]; then
+                if (( RUN_STARTED )); then attempt_end lost "during the command"; else attempt_end lost "during setup"; fi
                 echo lost > "$ACTIVE/.$POD.end"
                 reap "$POD" || exit 1
             fi
