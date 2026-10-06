@@ -135,15 +135,28 @@ impl Compensation {
             }
             let out = operator(&flat, &format!("library.l{l}.mlp.out"))?;
             // The activations are the node the output map reads (a term of the MLP's output, beside
-            // the terms of its read–write ties).
-            let node = flat
+            // the terms of its read–write ties, and a fixed bias in a transcoder block, which the
+            // compensation never moves).
+            let (applied, node) = flat
                 .nodes
                 .iter()
-                .find_map(|n| match n {
-                    Node::Affine { terms, bias: None } => terms.iter().find(|(_, op)| *op == out).map(|(input, _)| *input),
+                .enumerate()
+                .find_map(|(a, n)| match n {
+                    Node::Affine { terms, .. } => terms.iter().find(|(_, op)| *op == out).map(|(input, _)| (a, *input)),
                     _ => None,
                 })
-                .ok_or_else(|| error(format!("layer {l}: no bias-free map applies the MLP's output")))?;
+                .ok_or_else(|| error(format!("layer {l}: no map applies the MLP's output")))?;
+            // A position select that writes another node at some positions in place of the output
+            // (a transcoder block runs `M`'s MLP at the first token): the functions' activations
+            // there reach nothing, so the Gram matrix leaves those rows out.
+            let mut elsewhere = Vec::new();
+            for n in &flat.nodes {
+                match n {
+                    Node::Select { inside, .. } if *inside == applied => return Err(error(format!("layer {l}: the MLP's output is selected at given positions only"))),
+                    Node::Select { outside, positions, .. } if *outside == applied => elsewhere.clone_from(positions),
+                    _ => {}
+                }
+            }
             let height = flat.operators[out].rows.width();
             let trainable = |op: usize| position.get(&op).copied().ok_or_else(|| error(format!("{}: not trainable", flat.operators[op].name)));
             let outputs = layer
@@ -177,7 +190,7 @@ impl Compensation {
                 .collect::<Result<Vec<_>, _>>()?;
             let output = trainable(out)?;
             mlps.push(Mlp { functions: layer.functions.clone(), output, outputs, gram: Array2::zeros((layer.functions.len(), layer.functions.len())) });
-            nodes.push(node);
+            nodes.push((node, elsewhere));
         }
         experiments.load(&posterior.mean)?;
         let program = experiments.models().1.program;
@@ -199,11 +212,28 @@ impl Compensation {
         for chunk in sequences.chunks(batch) {
             let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
             let trace = program.forward(&family)?;
-            for ((mlp, node), sum) in mlps.iter_mut().zip(&nodes).zip(&mut sums) {
+            let positions = family.layout.as_ref().map(|layout| layout.position.as_slice()).unwrap_or_default();
+            for ((mlp, (node, elsewhere)), sum) in mlps.iter_mut().zip(&nodes).zip(&mut sums) {
                 let h = trace.value(*node)?;
                 if h.cols() != mlp.gram.ncols() {
                     return Err(error("activations of another width than the MLP's functions"));
                 }
+                // The rows the select takes from elsewhere, zeroed in a copy.
+                let zeroed;
+                let h = if elsewhere.is_empty() {
+                    h
+                } else {
+                    if positions.len() != h.rows() {
+                        return Err(error("a position select on a batch without its positions"));
+                    }
+                    let mut copy = device.copy(h).map_err(error)?;
+                    let zero = device.zeros(1, h.cols()).map_err(error)?;
+                    for (row, _) in positions.iter().enumerate().filter(|(_, p)| elsewhere.contains(p)) {
+                        device.set_rows(&mut copy, row, &zero).map_err(error)?;
+                    }
+                    zeroed = copy;
+                    &zeroed
+                };
                 match (&wide, sum) {
                     (Some(wide), Some(sum)) => {
                         // On CUDA the f32 activations' Gram on the integer tensor cores
@@ -748,5 +778,59 @@ mod tests {
         assert!(shares.iter().all(|(_, s)| (0.0..=1.0).contains(s)));
         let of = |f: usize| shares.iter().find(|(groups, _)| *groups == explanation.layers[0].functions[f]).map(|(_, s)| *s).expect("a share");
         assert!(of(1) < of(2), "the near copy keeps {} of its rise, an unrelated function {}", of(1), of(2));
+    }
+
+    /// A transcoder block (fixed output bias, `M`'s MLP selected at the first token) on the tiny
+    /// Qwen3 decoder: its Gram matrix sums the features' activations over the tokens after the
+    /// first only, and deleting a copy of a surviving feature leaves the explanation unchanged.
+    #[test]
+    fn a_transcoder_blocks_compensation_leaves_out_the_first_token_and_moves_a_copy() {
+        use crate::library_transcoder::{Transcoder, firing};
+        let dir = std::env::temp_dir().join(format!("library_compensation_transcoder_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let export = crate::test_support::tiny_qwen3_export("library_compensation_transcoder", 2);
+        let imported = import_language_model(&export, 6, 12).unwrap();
+        std::fs::remove_dir_all(&export).unwrap();
+        let native = split_sites(&imported.program).unwrap();
+        let layers = layer_nodes(&native, 2).unwrap();
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let path = dir.join("layer_1.safetensors");
+        crate::test_support::transcoder_file(&path, 64, 8, 3);
+        let transcoders = BTreeMap::from([(1, Transcoder::open(&path).unwrap())]);
+        let counts = firing(&Device::host(), &native, &layers, &transcoders, &sequences, 2).unwrap();
+        let kept: Vec<usize> = (0..64).filter(|&f| counts[&1][f] > 0).collect();
+        let kept_path = dir.join("kept_1.safetensors");
+        transcoders[&1].write_kept(&kept, &kept_path).unwrap();
+        let explanation = library_mdl::explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
+        let mut posterior = Posterior::new(&explanation, CONCENTRATED).expect("the posterior");
+        // The features' activations at M's input (layer 0 is M's at the start), first tokens left out.
+        let family = library_mdl::sequence_family(&sequences.iter().map(Vec::as_slice).collect::<Vec<_>>()).unwrap();
+        let x = native.execute(&family, false).unwrap().values[layers[1].normed].clone();
+        let program = &explanation.artifact.program;
+        let matrix = |name: &str| program.operators[program.operators.iter().position(|op| op.name == name).unwrap()].matrix();
+        let mut h = (x.dot(&matrix("library.l1.mlp.gate").t()) + &matrix("library.l1.mlp.gate_bias").column(0)).mapv(|v| v.max(0.0));
+        for (mut row, p) in h.rows_mut().into_iter().zip(&family.layout.as_ref().unwrap().position) {
+            if *p == 0 {
+                row.fill(0.0);
+            }
+        }
+        let expected = h.t().dot(&h);
+        let device = Device::host();
+        let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let reads = interchange::reads(&native, &sites).expect("the reads");
+        let mut ic = Interchange::new(&device, &native, &sites, &explanation.artifact, &explanation.trainable, reads, 1 << 30, 64).expect("the experiments");
+        let compensation = Compensation::new(&mut ic, &explanation, &posterior, &sequences, 2).expect("the compensation");
+        let gram = &compensation.mlps[1].gram;
+        let scale = expected.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let difference = gram.iter().zip(&expected).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        assert!(scale > 0.0 && difference <= 1e-12 * scale, "the Gram differs from the first-token-free one by {difference:e} (scale {scale:e})");
+        // Feature 1 made a copy of feature 0 (gate row and bias), then deleted with compensation.
+        copy_reads(&explanation, &mut posterior, 1, 0, 1);
+        let output = *explanation.layers[1].functions[1].last().expect("an output group");
+        let (compensated, plain, largest) = changes(&explanation, &native, &posterior, &sequences, output);
+        assert!(compensated <= 1e-9 * largest, "the compensated removal moved the stream by {compensated:e} (largest value {largest:e})");
+        assert!(plain > 1e3 * compensated.max(f64::EPSILON * largest), "the plain removal moved the stream by only {plain:e}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
