@@ -55,6 +55,12 @@
 //! proposal order and nothing more: every unit is ranked by it, most negative first, and only the
 //! exact evaluation below decides.
 //!
+//! A proposal's logged prediction takes the description's change exactly from its trial: the
+//! deleted groups' costs, the subset code, and what moving the compensated survivors' means does
+//! to their own costs, which a unit's ranking leaves out (compensation is a step of the means that
+//! the posterior's description charges, and away from a stationary posterior it changes the
+//! description at first order).
+//!
 //! # The search
 //!
 //! The ranked units are taken in segments, each on top of the removals accepted so far. A segment
@@ -1004,15 +1010,19 @@ pub fn round(
                 return Err(error("a nonfinite removal objective"));
             }
             let removed_now = active - base.active.iter().filter(|a| **a).count();
-            let description = -groups.iter().map(|g| costs[*g]).sum::<f64>() + subset_change(removed_now + groups.len())? - subset_change(removed_now)?;
+            // The description's change exactly, with the compensated survivors' moved means, and
+            // the part the deleted groups' costs and the subset code make.
+            let description = proposed.description() - base.description();
+            let deleted = -groups.iter().map(|g| costs[*g]).sum::<f64>() + subset_change(removed_now + groups.len())? - subset_change(removed_now)?;
             let predicted = rest[..k].iter().map(|u| u.data).sum::<f64>() + description;
             // With the Gauss–Newton cross terms between the units, without compensation.
             let roots: Vec<(usize, f64)> = rest[..k].iter().flat_map(|u| u.roots.iter().map(|r| (*r, 1.0 / u.roots.len() as f64))).collect();
-            let joint = curvature.joint(&roots) + description;
+            let joint = curvature.joint(&roots) + deleted;
             let accepted = evaluation.complete && change <= 0.0;
             journal.write(json!({
                 "event": "proposal", "kind": kind, "units": k, "groups": groups, "layers": names(&groups),
                 "predicted_bits": predicted / LN_2, "joint_plain_bits": joint / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
+                "description_bits": description / LN_2, "description_deleted_bits": deleted / LN_2,
                 "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(), "trial_seconds": trial_seconds,
             }))?;
             evaluations.push((groups.len(), change / LN_2));
