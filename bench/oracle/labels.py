@@ -18,7 +18,8 @@ as the floor below which changes are rounding. Float32 throughout, TF32 off.
 Records, per layer (shard_LL.safetensors and shard_LL.json):
   activation   [N, C, T] float16   the neuron's activation at every position
   positions    [N, C, K] int16     the K positions of largest activation in each context
-  per edit e:  kl_e [N, C, K] f32       KL(edited || clean) of the next-token distribution there, nats
+  per edit e:  kl_e [N, C, K] f32       KL(clean || edited) of the next-token distribution there, nats
+                                        (the reference first, as oracle.rs and the interchange scores)
                next_e [N, C, K] f32     change of log p(actual next token) (NaN at the last position)
                up_ids_e                 [N, C, K, 10] the 10 tokens whose probability rises most
                up_dp_e, up_dlogp_e      [N, C, K, 10] their change of probability, and of log-probability
@@ -140,6 +141,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    torch.set_grad_enabled(False)
     dev = device()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -187,7 +189,7 @@ def main():
                 lp_c = runner.log_probs(final[cs][at, pos])
                 delta = lp_e - lp_c
                 dp = lp_e.exp() - lp_c.exp()
-                k = (lp_e.exp() * delta).sum(-1)
+                k = (lp_c.exp() * -delta).sum(-1)
                 upi = dp.topk(TOP, dim=-1).indices
                 dni = (-dp).topk(TOP, dim=-1).indices
                 nt = torch.where(pos + 1 < T, tokens[cs][torch.arange(len(chunk), device=dev)[:, None], (pos + 1).clamp(max=T - 1)], torch.zeros_like(pos))

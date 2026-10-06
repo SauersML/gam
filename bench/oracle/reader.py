@@ -165,6 +165,7 @@ class TransformersBackend:
         self.seed = seed
         self.batch_tokens = batch_tokens
         tokenizer = AutoTokenizer.from_pretrained(model)
+        self.tokenizer = tokenizer
         self.encode = ChatEncoder(tokenizer)
         self.pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -202,6 +203,38 @@ class TransformersBackend:
         return out
 
 
+def _transformers_token_log_probs(self, prompts: list[list[int]], at: list[list[int]]) -> list[np.ndarray]:
+    """log p(prompt[j] | prompt[:j]) for each j in at[i], per prompt; the output layer runs only at the
+    positions read, so no prompts x length x vocabulary logits are formed."""
+    torch = self.torch
+    order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
+    out: list[np.ndarray | None] = [None] * len(prompts)
+    start = 0
+    while start < len(order):
+        stop = start + 1
+        while stop < len(order) and (stop + 1 - start) * len(prompts[order[stop]]) <= self.batch_tokens:
+            stop += 1
+        chunk = order[start:stop]
+        width = len(prompts[chunk[-1]])
+        ids = torch.full((len(chunk), width), self.pad, dtype=torch.long)
+        mask = torch.zeros((len(chunk), width), dtype=torch.long)
+        for row, i in enumerate(chunk):
+            ids[row, : len(prompts[i])] = torch.tensor(prompts[i])
+            mask[row, : len(prompts[i])] = 1
+        with torch.no_grad():
+            hidden = self.model.model(input_ids=ids.to(self.device), attention_mask=mask.to(self.device)).last_hidden_state
+            for row, i in enumerate(chunk):
+                js = torch.tensor(at[i], dtype=torch.long, device=self.device)
+                logits = self.model.lm_head(hidden[row, js - 1]).float()
+                lp = torch.log_softmax(logits, -1).gather(-1, ids[row, js.cpu()].to(self.device)[:, None])[:, 0]
+                out[i] = lp.double().cpu().numpy()
+        start = stop
+    return out
+
+
+TransformersBackend.token_log_probs = _transformers_token_log_probs
+
+
 class VllmBackend:
     """A frozen open-weights instruct model served by vllm.LLM on the GPUs of this machine."""
 
@@ -217,7 +250,15 @@ class VllmBackend:
         if max_model_len is not None:
             kwargs["max_model_len"] = max_model_len
         self.llm = LLM(**kwargs)
-        self.encode = ChatEncoder(self.llm.get_tokenizer())
+        self.tokenizer = self.llm.get_tokenizer()
+        self.encode = ChatEncoder(self.tokenizer)
+
+    def token_log_probs(self, prompts: list[list[int]], at: list[list[int]]) -> list[np.ndarray]:
+        """log p(prompt[j] | prompt[:j]) for each j in at[i] (vLLM's prompt log-probabilities, which
+        every release returns; prompts sharing a prefix share it in the cache)."""
+        params = self.SamplingParams(max_tokens=1, temperature=0.0, seed=self.seed, prompt_logprobs=0)
+        outputs = self.llm.generate([{"prompt_token_ids": p} for p in prompts], params, use_tqdm=False)
+        return [np.array([o.prompt_logprobs[j][p[j]].logprob for j in js]) for o, p, js in zip(outputs, prompts, at)]
 
     def distributions(self, users: list[str], k: int) -> list[np.ndarray]:
         # Each label's log-probability after the prompt, read as the last prompt token's log-probability
