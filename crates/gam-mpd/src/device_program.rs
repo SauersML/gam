@@ -2222,17 +2222,31 @@ impl DeviceProgram {
                 retained.push(node);
             }
         }
-        // A fused group's reverse adds to the projections among this call's trainable operators
-        // alone. The gradient sums are shared by every block a pass reverses, and a block run by
-        // another program (`M`'s, in a hybrid) numbers its operators its own way: its head
-        // projections must not meet the slots of `P`'s operators of the same indices.
+        // The reverse adds to this call's trainable operators alone, fused heads' projections and
+        // every other product. The gradient sums are shared by every block a pass reverses, and a
+        // block run by another program (`M`'s, in a hybrid) numbers its operators its own way: its
+        // products must not meet the slots of `P`'s operators of the same indices.
         let mut own: BTreeMap<usize, Tensor> = requested.iter().filter_map(|op| gradients.remove(op).map(|t| (*op, t))).collect();
-        let reversed = self.reverse_seeds(trace, seeds, &retained, arithmetic, edited, hook, &mut own);
+        let summed = self.reverse_into(trace, seeds, (keep, &retained), arithmetic, (edited, hook), &mut own);
         gradients.extend(own);
-        let (mut nodes, mut rounded) = reversed?;
+        summed
+    }
+
+    /// [`Self::vjp_values_dense_edited`]'s reverse and products, adding into `gradients`, which
+    /// holds the call's trainable operators alone.
+    fn reverse_into(
+        &self,
+        trace: &DeviceTrace,
+        seeds: BTreeMap<usize, Tensor>,
+        (keep, retained): (&[usize], &[usize]),
+        arithmetic: Arithmetic,
+        (edited, hook): (&BTreeSet<usize>, &mut dyn FnMut(usize, &mut Tensor) -> Result<(), String>),
+        gradients: &mut BTreeMap<usize, Tensor>,
+    ) -> Result<BTreeMap<usize, Tensor>, String> {
+        let (mut nodes, mut rounded) = self.reverse_seeds(trace, seeds, retained, arithmetic, edited, hook, gradients)?;
         // One scalar constant is uploaded; all reductions and gradient arrays stay
         // on the device. Reuse the same broadcast across every column occurrence.
-        let has_columns = requested.iter().any(|op| self.operators.contains_key(&(*op, Role::Column)));
+        let has_columns = gradients.keys().any(|op| self.operators.contains_key(&(*op, Role::Column)));
         let ones = if has_columns {
             let one = self.device.upload_vec(1, 1, vec![1.0]).map_err(error)?;
             Some(self.device.broadcast_rows(&one, trace.rows).map_err(error)?)
