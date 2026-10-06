@@ -117,7 +117,7 @@
 # Status: every pod running on the team account, one line each: pod, run NAME, who started it
 # (RP_OWNER=AGENT when the run was launched), GPU and cloud, $/h, the GPU's mean utilization over the
 # last 10 minutes, hours up, $ so far, hours left to its cap, flags (IDLE: GPU under 20%; FLAT: a
-# run's log unchanged for 15 minutes) and the last line of its run's log; then the account's spend,
+# run's log and synced outputs unchanged for 15 minutes) and the last line of its run's log; then the account's spend,
 # its rate, the rate paid for GPUs under 20%, and the hours until the $150 cap at that rate.
 #
 # Binaries: the examples and test binaries (RP_TESTS="PACKAGE:TEST ...", run as $MPD_BIN/test-TEST) a
@@ -803,8 +803,11 @@ case ${1:-} in
                     last=$(grep -v '^[[:space:]]*$' "$f" 2> /dev/null | tail -n 1 | cut -c1-90 || true)
                     [ -n "$last" ] && break
                 done
-                # A run whose log has not grown for 15 minutes (a dev pod's has no command).
-                if [ "${mode:-run}" = run ] && [ -f "$RP/$name/run.log" ] && (( now - $(stat -f %m "$RP/$name/run.log") > 900 )); then flag+="FLAT "; fi
+                # A run whose log has not grown for 15 minutes and none of whose synced outputs
+                # changed in that time (a dev pod's has no command; the oracle's runs write their
+                # own logs among their outputs).
+                if [ "${mode:-run}" = run ] && [ -f "$RP/$name/run.log" ] && (( now - $(stat -f %m "$RP/$name/run.log") > 900 )) &&
+                   [ -z "$(find "$RP/$name" -type f -mmin -15 $(printf '! -name %s ' "${OWN[@]}" live.tsv LOWGPU) -print -quit 2> /dev/null)" ]; then flag+="FLAT "; fi
                 # Under LOW_GPU % for two minutes in a row now (live_profile).
                 if [ -f "$RP/$name/LOWGPU" ]; then flag+="LOW "; fi
             fi
