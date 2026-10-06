@@ -127,15 +127,16 @@ fn transcoder_files(device: &Device, native: &OperatorProgram, layers: &[LayerNo
         .map(|&l| Ok((l, library_transcoder::Transcoder::open(&settings.dir.join(format!("layer_{l}.safetensors")))?)))
         .collect::<Result<BTreeMap<_, _>, String>>()?;
     let train = &train[..settings.count_sequences.map_or(train.len(), |n| n.min(train.len()))];
-    let counts = library_transcoder::firing(device, native, layers, &transcoders, train, batch)?;
+    let fired = library_transcoder::firing(device, native, layers, &transcoders, train, batch)?;
     // Tokens after each sequence's first, where the transcoders run (the first runs M's MLP).
     let tokens: usize = train.iter().map(|s| s.len() - 1).sum();
     let mut record = Vec::new();
     for (l, transcoder) in &transcoders {
         let least = settings.min_frequency.map_or(1.0, |f| (f * tokens as f64).max(1.0));
-        let kept: Vec<usize> = (0..transcoder.features).filter(|&f| counts[l][f] as f64 >= least).collect();
-        transcoder.write_kept(&kept, &files[l])?;
-        let fired: u64 = counts[l].iter().sum();
+        let counts = &fired[l].counts;
+        let kept: Vec<usize> = (0..transcoder.features).filter(|&f| counts[f] as f64 >= least).collect();
+        transcoder.write_kept(&kept, &fired[l].sink, &files[l])?;
+        let fired_tokens: u64 = counts.iter().sum();
         let kept_fired: u64 = kept.iter().map(|&f| counts[l][f]).sum();
         record.push(json!({
             "layer": l,
@@ -244,6 +245,7 @@ fn edit_faithfulness(
         Some(interchange::Patch::Parts { .. }) => "remove_parts",
         Some(interchange::Patch::Swap { .. }) => "swap_part",
         Some(interchange::Patch::PartFrom { .. }) => "remove_part_from",
+        Some(interchange::Patch::HeadFrom { .. }) => "remove_head_from",
         Some(_) => "read",
     };
     // Per family: every scored token's bits, the edited tokens' bits, and the experiments.
@@ -299,7 +301,7 @@ fn edit_faithfulness(
         let ((effect_mean, effect_p99), (effect_edited_mean, effect_edited_p99)) = (summary(&mut effect_all), summary(&mut effect_edited));
         // Experiments on M's own objects (clean text, heads) ask every explanation the same
         // question; edits of parts ask each explanation about its own parts.
-        let objects = if matches!(family, "clean" | "remove_head" | "read") { "native" } else { "own_parts" };
+        let objects = if matches!(family, "clean" | "remove_head" | "remove_head_from" | "read") { "native" } else { "own_parts" };
         let bins: Vec<Value> = (0..=BINS.len())
             .filter_map(|bin| {
                 let (all, at, effect) = binned.get(&(family, bin))?;

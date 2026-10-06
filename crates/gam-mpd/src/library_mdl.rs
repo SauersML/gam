@@ -148,9 +148,11 @@
 //! program, the gradient stays where the reverse pass left it, and the IVON step and the groups'
 //! divergences run there; the host holds it between epochs, for the
 //! held-out evaluation, the checkpoint and the removal step. An epoch visits every training batch
-//! once, in a fixed order. Each step's estimate of `F` is taken at the posterior before its step,
-//! so an epoch's mean of them is `F` at no one posterior. At each epoch's end the fit therefore
-//! scores the end-of-epoch posterior on the whole training collection, its snapshot
+//! once, in a fixed order. A step's data term is measured at weight samples around the iterate,
+//! the optimizer's state, not the reported posterior, and a different one at every step, so the
+//! fit records it as the descent's log (`Epoch::data_bits`) and never adds a description to it. At
+//! each epoch's end the fit scores the end-of-epoch posterior, its data term and description at
+//! the same `q`, on the whole training collection, its snapshot
 //! (`snapshot_estimates`): forward passes only, each batch at its weight sample on the removal
 //! comparisons' noise stream, the same draws at every snapshot, give per batch an estimate of `F`
 //! at that posterior. The continuous fit stops descending at the first epoch whose snapshot's mean
@@ -1962,7 +1964,7 @@ fn noise_seed(seed: u64, epoch: usize, batch: usize) -> u64 {
 
 /// The weight noise of training batch `b` in every epoch: keyed by the batch alone, so the fit
 /// minimizes one sample average of `F` (the batches' experiments are fixed too), and two epochs'
-/// per-step estimates of a batch are at identical draws (common random numbers). Stream 1 is apart
+/// steps on a batch are at identical draws (common random numbers). Stream 1 is apart
 /// from the removal comparisons', the snapshots' and the held-out evaluation's (`noise_seed` with
 /// epoch 0).
 fn training_key(seed: u64, batch: usize) -> u64 {
@@ -2165,7 +2167,7 @@ fn held_out_on(
                     match patch {
                         Patch::Read { .. } => read.add(bits),
                         Patch::Reads { .. } => joint.add(bits),
-                        Patch::Part { .. } | Patch::Head { .. } | Patch::Cut { .. } | Patch::Parts { .. } | Patch::Swap { .. } | Patch::PartFrom { .. } => {}
+                        Patch::Part { .. } | Patch::Head { .. } | Patch::Cut { .. } | Patch::Parts { .. } | Patch::Swap { .. } | Patch::PartFrom { .. } | Patch::HeadFrom { .. } => {}
                     }
                 }
             }
@@ -5237,7 +5239,7 @@ mod tests {
         let (full, kept_path) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
         let features = 64;
         crate::test_support::transcoder_file(&full, features, 8, 3);
-        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..features).collect::<Vec<_>>(), &kept_path).unwrap();
+        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..features).collect::<Vec<_>>(), &[0.0; 8], &kept_path).unwrap();
         let explanation = explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         // The host's count: layer 1 reads `M`'s input (layer 0 is `M`'s functions).
@@ -5277,7 +5279,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (full, kept_path) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
         crate::test_support::transcoder_file(&full, 64, 8, 3);
-        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..64).collect::<Vec<_>>(), &kept_path).unwrap();
+        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..64).collect::<Vec<_>>(), &[0.0; 8], &kept_path).unwrap();
         let explanation = explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         use interchange::Family;
@@ -5375,7 +5377,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (full, kept_path) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
         crate::test_support::transcoder_file(&full, 64, 8, 3);
-        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..64).collect::<Vec<_>>(), &kept_path).unwrap();
+        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..64).collect::<Vec<_>>(), &[0.0; 8], &kept_path).unwrap();
         let explanation = explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
         use interchange::Family;
         let settings = Settings { epochs: Some(8), families: vec![Family::Read, Family::RemovePart, Family::AmplifyPart], ..settings() };

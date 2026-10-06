@@ -268,7 +268,7 @@ fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<ReadVar
 /// `a` the part's activation read on the model's own stream on the source `x′` and on the base `x`
 /// there (the transcoder features' read patch, which `M`'s read variables do not hold). An edit of
 /// a part from the position on (`PartFrom`): the part's edit at every row from the experiment's
-/// position to the sequence's end.
+/// position to the sequence's end; a head's removal from the position on (`HeadFrom`) likewise.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Patch {
     Read { variable: usize },
@@ -279,6 +279,7 @@ pub enum Patch {
     Parts { parts: Vec<usize>, factor: usize },
     Swap { part: usize },
     PartFrom { part: usize, factor: usize },
+    HeadFrom { head: usize },
 }
 
 impl Patch {
@@ -287,7 +288,7 @@ impl Patch {
         match self {
             Self::Read { variable } => std::slice::from_ref(variable),
             Self::Reads { variables } => variables,
-            Self::Part { .. } | Self::Head { .. } | Self::Cut { .. } | Self::Parts { .. } | Self::Swap { .. } | Self::PartFrom { .. } => &[],
+            Self::Part { .. } | Self::Head { .. } | Self::Cut { .. } | Self::Parts { .. } | Self::Swap { .. } | Self::PartFrom { .. } | Self::HeadFrom { .. } => &[],
         }
     }
 }
@@ -349,7 +350,7 @@ pub fn parts_of(program: &OperatorProgram, layers: usize) -> Result<Vec<Part>, S
 /// subset of the parts firing at a row of one block at once (as [`subset`] draws a joint read
 /// patch's: a single part's removal moves `M` little); removing a head; and cutting a connection
 /// between two parts; swapping a part's activation for its value on the source sequence; removing
-/// a part at every row from the position on ([`Interchange::draw_edits`]; scored, not trained: it has
+/// a part, or a head, at every row from the position on ([`Interchange::draw_edits`]; scored, not trained: it has
 /// no reverse pass).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -362,6 +363,7 @@ pub enum Family {
     RemoveParts,
     SwapPart,
     RemovePartFrom,
+    RemoveHeadFrom,
 }
 
 /// Where a model applies edits of parts: per block, for an MLP block, the node its parts read
@@ -468,7 +470,7 @@ impl Experiment {
             }
             return Ok(Some(b.block));
         }
-        if let Patch::Head { head } = patch {
+        if let Patch::Head { head } | Patch::HeadFrom { head } = patch {
             return heads.get(*head).map(|b| Some(*b)).ok_or_else(|| error("a removal of an unknown head"));
         }
         if let Patch::Swap { part } = patch {
@@ -577,7 +579,7 @@ pub fn subset(rng: &mut impl RngExt, candidates: &[usize]) -> Vec<usize> {
 /// The realized count of each family among `experiments`: clean with `P` alone, clean under a
 /// hybrid, single read patches of attention and of MLP variables, and joint read patches.
 pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMap<&'static str, usize> {
-    let mut counts: BTreeMap<&'static str, usize> = ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint", "remove_part", "amplify_part", "remove_head", "cut_connection", "remove_parts", "swap_part", "remove_part_from"].into_iter().map(|k| (k, 0)).collect();
+    let mut counts: BTreeMap<&'static str, usize> = ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint", "remove_part", "amplify_part", "remove_head", "cut_connection", "remove_parts", "swap_part", "remove_part_from", "remove_head_from"].into_iter().map(|k| (k, 0)).collect();
     for e in experiments {
         let family = match &e.patch {
             None if e.explained.iter().all(|x| *x) => "clean_alone",
@@ -592,6 +594,7 @@ pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMa
             Some(Patch::Parts { .. }) => "remove_parts",
             Some(Patch::Swap { .. }) => "swap_part",
             Some(Patch::PartFrom { .. }) => "remove_part_from",
+            Some(Patch::HeadFrom { .. }) => "remove_head_from",
         };
         *counts.entry(family).or_default() += 1;
     }
@@ -1008,7 +1011,7 @@ impl Edits {
                     cuts.get_mut(&out).ok_or_else(|| error("a cut's block"))?.cuts.push((*row, *cut, *from, *to));
                     continue;
                 }
-                Edit::Head { head } => {
+                Edit::Head { head } | Edit::HeadAt { head, .. } => {
                     let (node, width) = sites.heads.get(*head).copied().flatten().ok_or_else(|| error(format!("head {head}: not held by the model")))?;
                     zeroed.push((*row, node, width));
                     continue;
@@ -1451,6 +1454,8 @@ pub(crate) enum Edit {
     SwapAt { part: usize, from: usize },
     /// An edit of part `part` by `FACTORS[factor]` at row `at` of its path's sequence.
     PartAt { part: usize, factor: usize, at: usize },
+    /// A head's removal at row `at` of its path's sequence.
+    HeadAt { head: usize, at: usize },
 }
 
 impl<'t> Path<'t> {
@@ -1560,7 +1565,7 @@ impl<'t> Plan<'t> {
             let path = &self.paths[self.lanes[l].path];
             for (_, edit) in path.edits.iter().filter(|(b, _)| *b == block) {
                 let at = match edit {
-                    Edit::Probe { at, .. } | Edit::PartAt { at, .. } => *at,
+                    Edit::Probe { at, .. } | Edit::PartAt { at, .. } | Edit::HeadAt { at, .. } => *at,
                     _ => path.position,
                 };
                 let edit = match edit {
@@ -1764,6 +1769,7 @@ fn paths<'t>(batch: &'t Batch, experiments: &'t [Experiment], values: &[Value], 
         let (patch, edits) = match (&e.patch, e.block(values, parts, heads)?) {
             (Some(Patch::Part { part, factor }), Some(block)) => (None, vec![(block, Edit::Part { part: *part, factor: *factor })]),
             (Some(Patch::Head { head }), Some(block)) => (None, vec![(block, Edit::Head { head: *head })]),
+            (Some(Patch::HeadFrom { head }), Some(block)) => (None, (e.position..batch.length).map(|at| (block, Edit::HeadAt { head: *head, at })).collect()),
             (Some(Patch::PartFrom { part, factor }), Some(block)) => (None, (e.position..batch.length).map(|at| (block, Edit::PartAt { part: *part, factor: *factor, at })).collect()),
             (Some(Patch::Swap { part }), Some(block)) => {
                 paths.push(Path { tokens: &batch.source[e.source], explained, end: block + 1, position: 0, patch: None, edits: Vec::new() });
@@ -2475,6 +2481,7 @@ impl Interchange {
         // activity queries they need.
         enum Drawn {
             Head(usize, usize),
+            HeadFrom(usize, usize),
             Part(usize, usize, usize),
             Parts(usize, usize),
             Swap(usize, usize),
@@ -2489,11 +2496,12 @@ impl Interchange {
         for (n, family) in slots {
             let position = rng.random_range(1..length);
             match family {
-                Family::RemoveHead => {
+                Family::RemoveHead | Family::RemoveHeadFrom => {
                     if heads.is_empty() {
                         return Err(error("a head's removal, but no head both models hold"));
                     }
-                    drawn.push(Drawn::Head(heads[rng.random_range(0..heads.len())], position));
+                    let head = heads[rng.random_range(0..heads.len())];
+                    drawn.push(if *family == Family::RemoveHead { Drawn::Head(head, position) } else { Drawn::HeadFrom(head, position) });
                 }
                 Family::RemovePart | Family::AmplifyPart | Family::RemovePartFrom => {
                     if held.is_empty() {
@@ -2549,6 +2557,7 @@ impl Interchange {
             };
             out.push(match d {
                 Drawn::Head(head, position) => (Patch::Head { head }, position),
+                Drawn::HeadFrom(head, position) => (Patch::HeadFrom { head }, position),
                 Drawn::Part(position, usize::MAX, silent) => (Patch::PartFrom { part: choose(rng, silent, next()?), factor: 0 }, position),
                 Drawn::Part(position, factor, silent) => (Patch::Part { part: choose(rng, silent, next()?), factor }, position),
                 Drawn::Swap(position, silent) => (Patch::Swap { part: choose(rng, silent, next()?) }, position),

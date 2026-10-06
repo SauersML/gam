@@ -848,7 +848,7 @@ fn edits_of_a_transcoder_block_are_the_hand_computation() {
     std::fs::create_dir_all(&dir).expect("a directory");
     let (full, kept) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
     crate::test_support::transcoder_file(&full, 64, 8, 3);
-    crate::library_transcoder::Transcoder::open(&full).expect("the file").write_kept(&(0..64).collect::<Vec<_>>(), &kept).expect("kept");
+    crate::library_transcoder::Transcoder::open(&full).expect("the file").write_kept(&(0..64).collect::<Vec<_>>(), &[0.0; 8], &kept).expect("kept");
     let explanation = crate::library_mdl::explanation_with(&native, &layers, &std::collections::BTreeMap::from([(1, kept)])).expect("the library");
     std::fs::remove_dir_all(&dir).expect("the directory is removed");
     let program = &explanation.artifact.program;
@@ -963,9 +963,18 @@ fn a_head_removal_zeroes_its_output_in_both_models() {
         None => true,
         _ => false,
     }));
+    // From the position on: zero against M as well, with and without the reverse pass.
+    let from: Vec<Experiment> = (0..heads.len()).map(|head| Experiment { patch: Some(Patch::HeadFrom { head }), ..experiments[head].clone() }).collect();
+    assert_eq!(census(&from, x.variables())["remove_head_from"], heads.len());
+    for gradient in [false, true] {
+        let bits = x.evaluate(&batch, &from, gradient).expect("evaluate").bits;
+        assert!(bits.iter().flatten().all(|b| b.abs() <= 1e-9), "{bits:?}");
+    }
     x.unedited_explanation();
     let effects = x.evaluate(&batch, &experiments, false).expect("evaluate").bits;
     assert!(effects.iter().all(|bits| bits.iter().sum::<f64>() > 1e-9), "{effects:?}");
+    let longer = x.evaluate(&batch, &from, false).expect("evaluate").bits;
+    assert!(longer.iter().zip(&effects).all(|(a, b)| a.iter().sum::<f64>() > 1e-9 && a.iter().sum::<f64>() >= b[..1].iter().sum::<f64>()), "{longer:?}");
 }
 
 /// A cut connection (`Patch::Cut`) on the starting library of the tiny Qwen3 export, an exact copy
@@ -1036,7 +1045,7 @@ fn a_joint_removal_of_parts_is_each_removal_at_once() {
     std::fs::create_dir_all(&dir).expect("a directory");
     let (full, kept) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
     crate::test_support::transcoder_file(&full, 64, 8, 3);
-    crate::library_transcoder::Transcoder::open(&full).expect("the file").write_kept(&(0..64).collect::<Vec<_>>(), &kept).expect("kept");
+    crate::library_transcoder::Transcoder::open(&full).expect("the file").write_kept(&(0..64).collect::<Vec<_>>(), &[0.0; 8], &kept).expect("kept");
     let explanation = crate::library_mdl::explanation_with(&native, &layers, &std::collections::BTreeMap::from([(1, kept)])).expect("the library");
     std::fs::remove_dir_all(&dir).expect("the directory is removed");
     let d = Device::host();
