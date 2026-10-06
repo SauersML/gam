@@ -16,7 +16,8 @@
 # auto ranks every offer (RunPod's community and secure, Thunder's, Nebius's) of the cards the
 # benchmark table (gpu_bench.tsv) has measured by expected $ per scored token, with each offer's
 # measured failures (attempts.tsv, rank_auto), keeping those with
-# RP_MIN_VRAM_GB of memory, and prints the choice; another provider's card enters it once a
+# RP_MIN_VRAM_GB of memory, and prints the choice; RP_MAX_PRICE ($/h) drops every offer above it,
+# in auto and in a list of types (cap_offers); another provider's card enters it once a
 # benchmark run of it (gpu_bench.sh with GPU thunder:CARD:MODE or nebius:PLATFORM) is in the table. Work that does not use a GPU (builds, float64 references, CPU fits) goes to
 # GitHub Actions (gha-run), never to a RunPod pod. A run takes community cloud for every listed type before secure
 # cloud, which it takes only when no community pod is in stock (RunPod no longer offers spot pods:
@@ -1081,9 +1082,22 @@ rank_auto() {
               else [$all[] | select((.g | test("^(thunder|nebius):")) or (.g | test("A40|A6000|L40|A100|H100|H200"))) | . + {per: null}] | sort_by([.c, .p]) end
             | .[] | "\(.k)|\(.p)|\(.g)|\(.per // "-")|\(.exp // "-")|\(.f // "-")|\(.W // "-")|\(.n // "-")"')
     echo "rp-run: auto, by expected dollars per scored token on the $metric workload (rates from $TABLE, failures from $ATTEMPTS):"
-    awk -F'|' '{ if ($4 == "-") printf "rp-run:   %s %s $%s/h, not measured\n", $3, $1, $2
-                 else printf "rp-run:   %s %s $%s/h, $%.4f per million scored tokens, $%.4f expected (an attempt fails with p = %.2f, %d attempts recorded, %d s lost per failure)\n", $3, $1, $2, $4, $5, $6, $8, $7 }' <<< "$OFFERS"
+    awk -F'|' -v cap="${RP_MAX_PRICE:-}" '{ over = (cap != "" && $2 + 0 > cap + 0) ? sprintf("; dropped: over RP_MAX_PRICE $%s/h", cap) : ""
+                 if ($4 == "-") printf "rp-run:   %s %s $%s/h, not measured%s\n", $3, $1, $2, over
+                 else printf "rp-run:   %s %s $%s/h, $%.4f per million scored tokens, $%.4f expected (an attempt fails with p = %.2f, %d attempts recorded, %d s lost per failure)%s\n", $3, $1, $2, $4, $5, $6, $8, $7, over }' <<< "$OFFERS"
     OFFERS=$(cut -d'|' -f1-3 <<< "$OFFERS")
+    cap_offers > /dev/null
+}
+
+# RP_MAX_PRICE ($/h): a run that states it never takes an offer above it, in auto and in a list
+# of types. The ranking is per token on the benchmark workload, which is not every run's workload
+# (oracle-train-dir1 took an H100 SECURE at $3.49/h when every 48 GB offer below it failed). Drops
+# those offers from OFFERS and prints each dropped one.
+cap_offers() {
+    [ -n "${RP_MAX_PRICE:-}" ] || return 0
+    awk -v c="$RP_MAX_PRICE" 'BEGIN { exit !(c + 0 > 0) }' || { echo "rp-run: RP_MAX_PRICE takes dollars per hour above 0, not '$RP_MAX_PRICE'" >&2; exit 2; }
+    awk -F'|' -v c="$RP_MAX_PRICE" '$2 + 0 > c + 0 { printf "rp-run: dropped %s %s $%s/h: over RP_MAX_PRICE $%s/h\n", $3, $1, $2, c }' <<< "$OFFERS"
+    OFFERS=$(awk -F'|' -v c="$RP_MAX_PRICE" '$2 + 0 <= c + 0' <<< "$OFFERS")
 }
 
 # The offers, one per line "KIND|PRICE|GPU id": a run takes community (or another provider's
@@ -1102,7 +1116,7 @@ if :; then
         others=$(provider_offers | jq -Rsc 'split("\n") | map(select(length > 0) | split("|") | {k: .[0], c: 0, p: (.[1] | tonumber), g: .[2], mem: (.[3] | tonumber)})')
         AUTO=1
         rank_auto >&2
-        [ -n "$OFFERS" ] || { echo "rp-run: no card has ${RP_MIN_VRAM_GB:-0} GB" >&2; exit 2; }
+        [ -n "$OFFERS" ] || { echo "rp-run: no card has ${RP_MIN_VRAM_GB:-0} GB${RP_MAX_PRICE:+ at or under RP_MAX_PRICE \$$RP_MAX_PRICE/h}" >&2; exit 2; }
         GPU=$(cut -d'|' -f3 <<< "$OFFERS" | awk '!seen[$0]++' | paste -sd, -)
     else
     rows=()
@@ -1127,7 +1141,8 @@ if :; then
         [to_entries[] | .key as $i | .value[] | select((.p // 0) > 0) | . + {i: $i}]
         | (if $mode == "dev" then sort_by([.i, .c, .p]) else sort_by([.c, .i, .p]) end)
         | .[] | "\(.k)|\(.p)|\(.g)"')
-    [ -n "$OFFERS" ] || { echo "rp-run: no provider offers any of $GPU" >&2; exit 2; }
+    cap_offers >&2
+    [ -n "$OFFERS" ] || { echo "rp-run: no provider offers any of $GPU${RP_MAX_PRICE:+ at or under RP_MAX_PRICE \$$RP_MAX_PRICE/h}" >&2; exit 2; }
     fi
 fi
 
