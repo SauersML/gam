@@ -251,7 +251,7 @@ fn main() -> Result<(), String> {
         report["cancellation"] = battery::vpd_cancellation(&vpd, bases, settings.batch_sequences, settings.seed)?;
         save(&report)?;
         if s_first < s_end {
-            report["interchange_one_position"] = battery::vpd_interchange_atomic(&vpd, export, bases, sources, settings.batch_sequences, settings.seed, &settings.worst_of)?;
+            report["interchange_one_position"] = battery::vpd_interchange_atomic(&vpd, bases, sources, settings.batch_sequences, settings.seed, &settings.worst_of)?;
             save(&report)?;
             report["interchange"] = battery::vpd_interchange(&vpd, bases, sources, settings.batch_sequences, settings.seed, &settings.worst_of)?;
         }
