@@ -32,6 +32,14 @@
 # runs COMMAND again, so a command that resumes from its own checkpoint under the outputs continues.
 # Outputs are synced to the Mac (rsync) every minute while COMMAND runs, except files still being
 # written (*.partial) and library_mdl's rebuildable target caches (*.targets).
+# The outputs synced so far go up from the Mac at its upload rate, about 1.6 MB/s (1.15 GB of a
+# vpd4l 2^24 fit's checkpoint and best checkpoint took 12 min of setup, the GPU idle and paid,
+# frontier-gn-n32768-line6, 2026-10-06), and the fit then rebuilds its target caches. To resume a
+# large checkpoint in a new run, copy it outside runpod/ (run outputs are never published, e.g.
+# mpd-data/checkpoints/NAME/), publish it once (rp-run publish PATH) and start the command from that
+# copy (a driver's start:PATH, library_mdl::checkpoint_start): pods download published inputs at
+# about 145 MB/s. A checkpoint resumes only at a commit whose fit identity matches the one that
+# wrote it ("a checkpoint of another fit" otherwise).
 #
 # Source: `git archive` of origin/main, or of RP_REF=<commit> when it is published: the Rust
 # workspace (crates/, the manifests, the toolchain pin), bench/runpod/ and every /Users/user/gam/...
