@@ -126,20 +126,24 @@
 //! posterior (`σ² = v_G / N`) draws every batch's factor, `h = Σ_b u_b ⊙ u_b / N`, and
 //! `σ² = 1 / (N h + 1 / v_G)`. From the unit-information curvature `1 / v_G` instead, `h` fell by
 //! one e-fold per epoch toward the measured curvature, and `F` by a fixed 1.87e7 bits per epoch
-//! for 10 epochs (vpd4l, `N = 2^16`; 17 epochs at `2^24`). Under the approximation `h ≥ 0`, and
-//! the approximated
-//! objective is stationary in `σ` at `σ = 1 / √(N (h + δ))`, `δ = 1 / (N v_G)` the group prior's
-//! precision per token, so `σ² ≤ v_G`. That stationary point is implicit (`h` is an expectation
-//! under `q`, and `v_G` depends on `σ`); setting `σ` from the running `h` and the current `v_G` at
-//! every step is an online approximation to it, so `σ` has no step size; the mean moves along
-//! IVON's direction `ĝ / (h + δ)` by the Gauss–Newton minimum along it with the epoch-averaged
-//! curvature ratio (`DevicePosterior::step`), `ĝ` the full gradient (the data term's momentum plus the prior's `δ μ`)
-//! filtered by the momentum's measured noise (`Device::posterior_ivon`), so the step's fixed point
-//! is `F`'s stationary point: a sampled gradient is mostly the other weights' noise carried
-//! through the Hessian's off-diagonal terms, and with the momentum unfiltered the mean's steps
-//! walked it away from `M` and raised `F` (vpd4l, `N = 2^16`: from the Laplace posterior at `M`,
-//! `F` rose from 147 to 356 bits per scored token over the first epoch with the curvature held
-//! fixed, and fell to 54 with the means held fixed). The posterior stays on the
+//! for 10 epochs (vpd4l, `N = 2^16`; 17 epochs at `2^24`). Under the approximation the data's
+//! `h ≥ 0`; a prior term's curvature (below) may take `h` below zero, and the step reads
+//! `h⁺ = max(h, 0)`. The approximated objective is stationary in `σ` at `σ = 1 / √(N (h⁺ + δ))`,
+//! `δ = 1 / (N v_G)` the group prior's precision per token, so `σ² ≤ v_G` (where the expected
+//! curvature is negative the Gaussian family has no stationary `σ`, and `σ² = v_G` is the
+//! prior's). That stationary point is implicit (`h` is an expectation under `q`, and `v_G` depends
+//! on `σ`); setting `σ` from the running `h` and the current `v_G` at every step is an online
+//! approximation to it, so `σ` has no step size. The mean moves along IVON's direction
+//! `d = G / (h⁺ + δ)`, `G = m / W + δ μ` the full gradient's estimate (the bias-corrected momentum
+//! `m / W` of the data term's gradients plus the prior's exact `δ μ`; `Device::posterior_ivon`),
+//! by the minimum along `d` of `F`'s Gauss–Newton model (`DevicePosterior::step`): the slope
+//! `G · d` times the epoch's ratio of an unbiased slope along the previous direction to that
+//! direction's own gradient's slope (`G · d` counts the momentum's noise as descent), over the
+//! curvature along `d` with the epoch-averaged ratio of the Gauss–Newton factor's curvature along
+//! `d` to the diagonal's. A prior term (`PriorTerm`) is evaluated at both of the step's antithetic
+//! samples: its mean gradient joins the data term's in the momentum, and the antithetic Stein
+//! estimate of its diagonal curvature (`DevicePosterior::stein_curvature`) joins `ĥ`. The
+//! posterior stays on the
 //! device through an epoch (`device_posterior`): the sample is written into the explanation's
 //! program, the gradient stays where the reverse pass left it, and the IVON step and the groups'
 //! divergences run there; the host holds it between epochs, for the
@@ -338,8 +342,9 @@ pub fn mean_squares(program: &OperatorProgram, groups: &[Group]) -> Vec<f64> {
 }
 
 /// A prior term beyond the groups' own Gaussian priors (`library_mixture`): its value at a weight
-/// sample enters `F` beside the groups' divergences, and its gradient in the sample joins the data
-/// term's.
+/// sample enters `F` beside the groups' divergences, its gradient in the sample joins the data
+/// term's, and a training step takes its diagonal curvature from its gradients at the step's two
+/// antithetic samples (`DevicePosterior::stein_curvature`).
 pub trait PriorTerm {
     /// The trainable operators it reads (indices into `Explanation::trainable`).
     fn operators(&self) -> Vec<usize>;
@@ -348,10 +353,11 @@ pub trait PriorTerm {
     /// Its value in nats at the weight sample `theta` (its operators', by trainable index) of
     /// `posterior`, its gradient in `theta`, and with `learn` one step of its own parameters.
     fn sample(&mut self, posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String>;
-    /// [`PriorTerm::sample`] at the weight sample of `key` of `device_posterior` (the draws of
-    /// [`DevicePosterior::sample_into`]), its gradient by trainable index on `device`. `posterior`
-    /// holds the groups' activity and the operators' shapes; a term without a form on the device
-    /// moves its operators' values into it ([`host_term`]).
+    /// [`PriorTerm::sample`] at the weight sample of `key` of `device_posterior` as a training step
+    /// draws it (around IVON's iterate: the draws of [`DevicePosterior::iterate_into`]), its
+    /// gradient by trainable index on `device`. `posterior` holds the groups' activity and the
+    /// operators' shapes; a term without a form on the device moves its operators' posterior means
+    /// and deviations into it ([`host_term`]).
     fn sample_device(&mut self, device: &Device, device_posterior: &DevicePosterior, posterior: &mut Posterior, key: u64, learn: bool) -> Result<(f64, BTreeMap<usize, Tensor>), String> {
         host_term(self, device, device_posterior, posterior, key, learn)
     }
@@ -375,17 +381,36 @@ pub(crate) fn host_sample(posterior: &Posterior, operators: &[usize], key: u64) 
         .collect()
 }
 
-/// [`PriorTerm::sample`] of `prior` at the weight sample of `key` of `device_posterior`, on the
-/// host: its operators' means and deviations come off the device into `posterior`, the sample is
-/// drawn there (`host_sample`), and the gradient goes back up.
-pub fn host_term<P: PriorTerm + ?Sized>(prior: &mut P, device: &Device, device_posterior: &DevicePosterior, posterior: &mut Posterior, key: u64, learn: bool) -> Result<(f64, BTreeMap<usize, Tensor>), String> {
-    let operators = prior.operators();
-    for &i in &operators {
+/// The weight sample of `key` a training step draws (`DevicePosterior::iterate_into`: `μ + σ ⊙ ε`
+/// around IVON's iterate `μ`) of `device_posterior`'s trainable operators `operators`, on the host;
+/// `posterior` takes their posterior means `μ̄` and log standard deviations, at which a prior term
+/// reads its groups' variances.
+pub(crate) fn step_sample(device_posterior: &DevicePosterior, posterior: &mut Posterior, operators: &[usize], key: u64) -> Result<BTreeMap<usize, Array2<f64>>, String> {
+    let mut iterates = Vec::with_capacity(operators.len());
+    for &i in operators {
         let (mean, log_sd) = device_posterior.values(i)?;
         posterior.mean[i] = mean.into();
         posterior.log_sd[i] = log_sd.into();
+        iterates.push((i, device_posterior.iterate(i)?));
     }
-    let theta = host_sample(posterior, &operators, key);
+    let posterior = &*posterior;
+    Ok(iterates
+        .into_par_iter()
+        .map(|(i, iterate)| {
+            let cols = iterate.ncols();
+            let epsilon = Array2::from_shape_fn(iterate.dim(), |(r, c)| f64::from(gam_gpu::tensor::posterior_normal(key, i as u64, (r * cols + c) as u64)));
+            (i, iterate + &posterior.noise(i, &epsilon))
+        })
+        .collect())
+}
+
+/// [`PriorTerm::sample`] of `prior` at the weight sample of `key` of `device_posterior` as a
+/// training step draws it, on the host: its operators' means and deviations come off the device
+/// into `posterior`, the sample is drawn around the iterate (`step_sample`), and the gradient goes
+/// back up.
+pub fn host_term<P: PriorTerm + ?Sized>(prior: &mut P, device: &Device, device_posterior: &DevicePosterior, posterior: &mut Posterior, key: u64, learn: bool) -> Result<(f64, BTreeMap<usize, Tensor>), String> {
+    let operators = prior.operators();
+    let theta = step_sample(device_posterior, posterior, &operators, key)?;
     let (value, gradient) = prior.sample(posterior, &theta, learn)?;
     let gradient = gradient.into_iter().map(|(i, g)| Ok((i, device.upload(g.view()).map_err(error)?))).collect::<Result<_, String>>()?;
     Ok((value, gradient))
@@ -1915,7 +1940,7 @@ fn training_key(seed: u64, batch: usize) -> u64 {
 /// both. Each half's sample is one of the posterior, so the step's estimate of `F` and of its
 /// gradient keep their expectations; the gradient's term linear in the noise is
 /// `(H_A − H_B) σ ε` over the halves `A` and `B` rather than `(H_A + H_B) σ ε`, which cancels
-/// within the step, where IVON's noise filter measures what remains. The products are one
+/// within the step, and the momentum averages what remains. The products are one
 /// scoring's of the whole batch. A batch of one base is scored at the sample of `key` alone.
 ///
 /// The Gauss–Newton factor is the first half's alone, its curvature estimate per token of the
@@ -2275,11 +2300,20 @@ struct Progress {
     /// ([`DevicePosterior::line_ratio`]).
     #[serde(default = "unit_ratio")]
     ratio: (f64, u64),
-    /// The momentum's weights `(W, W2)` ([`DevicePosterior::momentum_weights`]): its bias
-    /// correction and effective number of gradients, which the step's direction reads. None in a
-    /// checkpoint written before they were saved, which resumes with those of `β₁ = 0.9` over its
-    /// steps, the decay those fits used.
+    /// The line step's averages of the fresh gradient's slope along the previous direction and of
+    /// that direction's own gradient's slope, and the draws they average
+    /// ([`DevicePosterior::line_slope`]); no draws in a checkpoint written before they were kept.
     #[serde(default)]
+    slope: (f64, f64, u64),
+    /// Per trainable operator, its momentum's bias correction `W`
+    /// ([`DevicePosterior::momentum_weights`]), which the step's direction reads.
+    #[serde(default)]
+    weights: Option<Vec<f64>>,
+    /// A checkpoint written before the corrections were kept per operator holds one pair
+    /// `(W, W2)` (`W2` the sum of the weights' squares, which the step no longer reads): `W` for
+    /// every operator. A checkpoint with neither resumes with `β₁ = 0.9`'s `W` over its steps, the
+    /// decay those fits used ([`saved_weights`]). Read, never written.
+    #[serde(default, skip_serializing)]
     momentum_weights: Option<(f64, f64)>,
     /// The best epoch since the objective last changed: its snapshot's estimate of `F` in nats and
     /// the epoch, whose posterior is the checkpoint beside the fit's with extension `best.bin` (the
@@ -2309,11 +2343,11 @@ struct Progress {
     /// The prior term's state, when the fit has one.
     #[serde(default)]
     prior: Option<serde_json::Value>,
-    /// The precision of the payload's `μ`, `ln σ`, momentum, curvature and gradient second-moment
-    /// arrays: the storage the
-    /// device posterior holds each in; none for a checkpoint written in float64 throughout.
+    /// The precision of each of the payload's arrays per operator ([`CHECKPOINT_ARRAYS`] of them,
+    /// or [`LEGACY_ARRAYS`]): the storage the device posterior holds each in; none for a checkpoint
+    /// written in float64 throughout, in the legacy layout.
     #[serde(default)]
-    precision: Option<[Precision; CHECKPOINT_ARRAYS]>,
+    precision: Option<Vec<Precision>>,
 }
 
 /// What a checkpoint belongs to: a fit resumes from it only when every field agrees, so a
@@ -2481,9 +2515,13 @@ fn check_checkpoint_identity(path: &Path, found: &Identity, identity: &Identity)
 }
 
 /// The arrays a checkpoint holds per trainable operator: the posterior's mean `μ̄`, `ln σ`, IVON's
-/// state (the gradient's momentum, the curvature estimate and the gradient's second moment) and
-/// IVON's iterate `μ` whose Polyak average `μ̄` is, each little-endian in its [`Precision`].
-const CHECKPOINT_ARRAYS: usize = 6;
+/// state (the gradient's momentum and the curvature estimate) and IVON's iterate `μ` whose Polyak
+/// average `μ̄` is, each little-endian in its [`Precision`].
+const CHECKPOINT_ARRAYS: usize = 5;
+
+/// The arrays per operator of a checkpoint written before the gradient's second moment was dropped
+/// from IVON's state: the second moment after the curvature, read and discarded.
+const LEGACY_ARRAYS: usize = 6;
 
 /// The precision a checkpoint array is written in: the storage the device holds it in, so that
 /// writing and reading it is exact.
@@ -2512,19 +2550,55 @@ impl Precision {
         }
     }
 
-    /// Each array kind's precision, float64 for a checkpoint that names none.
-    fn of_payload(precision: Option<[Self; CHECKPOINT_ARRAYS]>) -> [Self; CHECKPOINT_ARRAYS] {
-        precision.unwrap_or([Self::F64; CHECKPOINT_ARRAYS])
+    /// Each of a payload's arrays per operator in its precision: those `precision` names
+    /// ([`CHECKPOINT_ARRAYS`], or [`LEGACY_ARRAYS`]), or float64 in the legacy layout for a
+    /// checkpoint that names none.
+    fn of_payload(precision: Option<&[Self]>) -> Result<Vec<Self>, String> {
+        match precision {
+            None => Ok(vec![Self::F64; LEGACY_ARRAYS]),
+            Some(arrays) if arrays.len() == CHECKPOINT_ARRAYS || arrays.len() == LEGACY_ARRAYS => Ok(arrays.to_vec()),
+            Some(arrays) => Err(format!("a checkpoint of {} arrays per operator", arrays.len())),
+        }
     }
 }
 
 /// The payload bytes of a checkpoint of operators of `shapes` with arrays in `precision`.
-fn checkpoint_payload_bytes(shapes: &[(usize, usize)], precision: [Precision; CHECKPOINT_ARRAYS]) -> Option<u64> {
+fn checkpoint_payload_bytes(shapes: &[(usize, usize)], precision: &[Precision]) -> Option<u64> {
     let per_cell = precision.iter().map(|p| p.bytes() as u64).sum::<u64>();
     shapes.iter().try_fold(0_u64, |total, &(rows, cols)| {
         let cells = u64::try_from(rows).ok()?.checked_mul(u64::try_from(cols).ok()?)?;
         total.checked_add(cells.checked_mul(per_cell)?)
     })
+}
+
+/// One operator's arrays of a checkpoint payload in `precision` ([`Precision::of_payload`]) from
+/// `reader`: `mean` and `log_sd` in place, then IVON's momentum and curvature, and its iterate (a
+/// legacy payload's gradient second moment read and dropped).
+fn read_checkpoint_operator(reader: &mut impl Read, (mean, log_sd): (&mut Array2<f64>, &mut Array2<f64>), precision: &[Precision]) -> Result<([Array2<f64>; 2], Array2<f64>), String> {
+    let dim = mean.dim();
+    read_checkpoint_array(reader, mean, precision[0])?;
+    read_checkpoint_array(reader, log_sd, precision[1])?;
+    let mut moments: [Array2<f64>; 2] = std::array::from_fn(|_| Array2::zeros(dim));
+    for (array, precision) in moments.iter_mut().zip(&precision[2..4]) {
+        read_checkpoint_array(reader, array, *precision)?;
+    }
+    if precision.len() == LEGACY_ARRAYS {
+        read_checkpoint_array(reader, &mut Array2::zeros(dim), precision[4])?;
+    }
+    let mut iterate = Array2::zeros(dim);
+    read_checkpoint_array(reader, &mut iterate, precision[precision.len() - 1])?;
+    Ok((moments, iterate))
+}
+
+/// Per trainable operator of `operators`, its momentum's bias correction as a checkpoint holds it:
+/// its `weights`, else its legacy pair's `W` for every operator, else `β₁ = 0.9`'s after its
+/// `steps` steps, the decay the fits that saved neither used.
+fn saved_weights(weights: Option<Vec<f64>>, legacy: Option<(f64, f64)>, steps: u64, operators: usize) -> Vec<f64> {
+    match (weights, legacy) {
+        (Some(weights), _) => weights,
+        (None, Some((w, _))) => vec![w; operators],
+        (None, None) => vec![gam_gpu::tensor::PosteriorStep::constant_weight(0.9, steps); operators],
+    }
 }
 
 /// Decode in fixed-size byte tiles directly into the destination, including nonstandard array
@@ -2584,11 +2658,13 @@ impl Snapshot {
     /// precision. The write starts once the one before it has ended.
     fn save(progress: &mut Progress, posterior: &DevicePosterior, path: &Path, writer: &mut Writer) -> Result<(), String> {
         let precision = posterior.storages().map(Precision::of);
-        progress.precision = Some(precision);
+        progress.precision = Some(precision.to_vec());
         progress.averaged = posterior.averaged();
         progress.ratio = posterior.line_ratio();
-        progress.momentum_weights = Some(posterior.momentum_weights());
-        let bytes = checkpoint_payload_bytes(&progress.shapes, precision).ok_or("a checkpoint too large to address")?;
+        progress.slope = posterior.line_slope();
+        progress.weights = Some(posterior.momentum_weights().to_vec());
+        progress.momentum_weights = None;
+        let bytes = checkpoint_payload_bytes(&progress.shapes, &precision).ok_or("a checkpoint too large to address")?;
         let (header, json) = (serde_json::to_vec(progress).map_err(error)?, serde_json::to_vec_pretty(progress).map_err(error)?);
         // One operator's arrays wait while the writer writes the one before.
         let (send, receive) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
@@ -2598,9 +2674,9 @@ impl Snapshot {
         let stream = move |chunk: Vec<u8>| -> Result<(), String> { send.send(chunk).map_err(|_| STOPPED.to_string()) };
         let taken = (|| -> Result<(), String> {
             for i in 0..progress.shapes.len() {
-                let (mean, log_sd, [momentum, curvature, power]) = posterior.operator(i)?;
+                let (mean, log_sd, [momentum, curvature]) = posterior.operator(i)?;
                 let mut chunk = Vec::new();
-                for (array, precision) in [&mean, &log_sd, &momentum, &curvature, &power, &posterior.iterate(i)?].into_iter().zip(precision) {
+                for (array, precision) in [&mean, &log_sd, &momentum, &curvature, &posterior.iterate(i)?].into_iter().zip(precision) {
                     write_checkpoint_array(&mut chunk, array, precision)?;
                 }
                 stream(chunk)?;
@@ -2676,9 +2752,9 @@ impl Drop for Writer {
     }
 }
 
-/// Restore a checkpoint of this fit into `posterior`, with IVON's state per operator, or refuse one
-/// of another fit.
-fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) -> Result<(Progress, Vec<[Array2<f64>; 3]>, Vec<Array2<f64>>, Vec<Array2<f64>>), String> {
+/// Restore a checkpoint of this fit into `posterior`, with IVON's state per operator (the momentum
+/// and the curvature) and its iterate, or refuse one of another fit.
+fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) -> Result<(Progress, Vec<[Array2<f64>; 2]>, Vec<Array2<f64>>, Vec<Array2<f64>>), String> {
     let (progress, mut reader, payload_bytes): (Progress, _, _) = checkpoint_header(path)?;
     check_checkpoint_identity(path, &progress.identity, &expected.identity)?;
     if progress.collection != expected.collection {
@@ -2698,8 +2774,8 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) 
     {
         return Err(format!("{}: a checkpoint of another fit", path.display()));
     }
-    let precision = Precision::of_payload(progress.precision);
-    if checkpoint_payload_bytes(&progress.shapes, precision) != Some(payload_bytes)
+    let precision = Precision::of_payload(progress.precision.as_deref()).map_err(|e| format!("{}: {e}", path.display()))?;
+    if checkpoint_payload_bytes(&progress.shapes, &precision) != Some(payload_bytes)
         || posterior.mean.len() != progress.shapes.len()
         || posterior.log_sd.len() != progress.shapes.len()
         || posterior.mean.iter().zip(&progress.shapes).any(|(array, shape)| array.dim() != *shape)
@@ -2709,16 +2785,8 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) 
     }
     let (mut moments, mut iterates) = (Vec::with_capacity(posterior.mean.len()), Vec::with_capacity(posterior.mean.len()));
     for i in 0..posterior.mean.len() {
-        let dim = posterior.mean[i].dim();
-        read_checkpoint_array(&mut reader, &mut posterior.mean[i], precision[0])?;
-        read_checkpoint_array(&mut reader, &mut posterior.log_sd[i], precision[1])?;
-        let mut next = std::array::from_fn(|_| Array2::zeros(dim));
-        for (array, precision) in next.iter_mut().zip(&precision[2..5]) {
-            read_checkpoint_array(&mut reader, array, *precision)?;
-        }
-        moments.push(next);
-        let mut iterate = Array2::zeros(dim);
-        read_checkpoint_array(&mut reader, &mut iterate, precision[5])?;
+        let (state, iterate) = read_checkpoint_operator(&mut reader, (&mut *posterior.mean[i], &mut *posterior.log_sd[i]), &precision)?;
+        moments.push(state);
         iterates.push(iterate);
     }
     if reader.read(&mut [0_u8; 1]).map_err(error)? != 0 {
@@ -2740,11 +2808,21 @@ fn read_checkpoint(explanation: &Explanation, path: &Path) -> Result<(Posterior,
         shapes: Vec<(usize, usize)>,
         active: Vec<bool>,
         #[serde(default)]
-        precision: Option<[Precision; CHECKPOINT_ARRAYS]>,
+        precision: Option<Vec<Precision>>,
         step: i32,
         epoch: usize,
         #[serde(default)]
         averaged: u64,
+        #[serde(default = "unit_ratio")]
+        ratio: (f64, u64),
+        #[serde(default)]
+        slope: (f64, f64, u64),
+        #[serde(default)]
+        weights: Option<Vec<f64>>,
+        #[serde(default)]
+        momentum_weights: Option<(f64, f64)>,
+        #[serde(default)]
+        prior: Option<serde_json::Value>,
     }
     let (header, mut reader, payload_bytes): (Header, _, _) = checkpoint_header(path)?;
     // The checkpoint must be a fit of this explanation: the same groups, shared parameters,
@@ -2758,36 +2836,29 @@ fn read_checkpoint(explanation: &Explanation, path: &Path) -> Result<(Posterior,
     if !differing.is_empty() {
         return Err(format!("{}: a checkpoint of another explanation (its {} differ)", path.display(), differing.join(", ")));
     }
-    let precision = Precision::of_payload(header.precision);
+    let precision = Precision::of_payload(header.precision.as_deref()).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut posterior = Posterior::new(explanation, header.tokens)?;
     if header.shapes != posterior.mean.iter().map(|m| m.dim()).collect::<Vec<_>>() || header.active.len() != posterior.active.len() {
         return Err(format!("{}: a checkpoint of another explanation", path.display()));
     }
-    if checkpoint_payload_bytes(&header.shapes, precision) != Some(payload_bytes) {
+    if checkpoint_payload_bytes(&header.shapes, &precision) != Some(payload_bytes) {
         return Err(format!("{}: a checkpoint of the wrong size", path.display()));
     }
-    let (mut state, mut iterates) = (Vec::with_capacity(header.shapes.len()), Vec::with_capacity(header.shapes.len()));
-    for (i, shape) in header.shapes.iter().enumerate() {
-        read_checkpoint_array(&mut reader, &mut posterior.mean[i], precision[0])?;
-        read_checkpoint_array(&mut reader, &mut posterior.log_sd[i], precision[1])?;
-        let mut moments: [Array2<f64>; 3] = std::array::from_fn(|_| Array2::zeros(*shape));
-        for (array, precision) in moments.iter_mut().zip(&precision[2..5]) {
-            read_checkpoint_array(&mut reader, array, *precision)?;
-        }
-        state.push(moments);
-        let mut iterate = Array2::zeros(*shape);
-        read_checkpoint_array(&mut reader, &mut iterate, precision[5])?;
-        iterates.push(iterate);
+    let (mut moments, mut iterate) = (Vec::with_capacity(header.shapes.len()), Vec::with_capacity(header.shapes.len()));
+    for i in 0..header.shapes.len() {
+        let (state, values) = read_checkpoint_operator(&mut reader, (&mut *posterior.mean[i], &mut *posterior.log_sd[i]), &precision)?;
+        moments.push(state);
+        iterate.push(values);
     }
     let held = posterior.mean.clone();
     posterior.active = header.active;
+    let steps = u64::try_from(header.step).map_err(error)?;
+    let weights = saved_weights(header.weights, header.momentum_weights, steps, header.shapes.len());
     let start = Start {
         mean: held.into_iter().map(Shared::into_array).collect(),
         log_sd: posterior.log_sd.iter().map(|s| (**s).clone()).collect(),
         active: posterior.active.clone(),
-        state: Some(state),
-        iterate: Some((iterates, header.averaged)),
-        steps: u64::try_from(header.step).map_err(error)?,
+        state: Some(Optimizer { moments, iterate, averaged: header.averaged, steps, weights, ratio: header.ratio, slope: header.slope, prior: header.prior }),
         epoch: header.epoch,
     };
     Ok((posterior, start))
@@ -2806,28 +2877,44 @@ pub fn checkpoint_artifact(explanation: &Explanation, path: &Path, literals: Lit
     literals.apply(posterior_mean(explanation, &checkpoint_posterior(explanation, path)?)?)
 }
 
+/// IVON's state a [`Start`] continues (a checkpoint's): per trainable operator (in
+/// `Explanation::trainable` order) the gradient's momentum and the curvature estimate; IVON's
+/// iterate `μ` (as the device holds it) whose Polyak average the start's means are, and the steps
+/// `averaged` that average spans; the steps taken; per operator the momentum's bias correction `W`
+/// (`gam_gpu::tensor::PosteriorStep::weight`); the line step's curvature ratio `ratio`
+/// ([`DevicePosterior::line_ratio`]) and slope averages `slope` ([`DevicePosterior::line_slope`]),
+/// each with its draws; and the prior term's state ([`PriorTerm::save`]), when the fit had one.
+#[derive(Debug, PartialEq)]
+pub struct Optimizer {
+    pub moments: Vec<[Array2<f64>; 2]>,
+    pub iterate: Vec<Array2<f64>>,
+    pub averaged: u64,
+    pub steps: u64,
+    pub weights: Vec<f64>,
+    pub ratio: (f64, u64),
+    pub slope: (f64, f64, u64),
+    pub prior: Option<serde_json::Value>,
+}
+
 /// Where [`fit_from`] starts in place of `M`: per trainable operator (in `Explanation::trainable`
 /// order) the posterior means and log standard deviations, which prior groups are in the
 /// explanation (a removed group's entries are zeroed), and, to continue an optimizer, IVON's state
-/// per operator as a checkpoint holds it (the gradient's momentum, the curvature estimate and the
-/// gradient's second moment) after `steps` steps. Without a
-/// state, the fit makes the Laplace start (`laplace_start`) from the start's means: its standard
-/// deviations and IVON's curvature come from one pass at a sample of the given posterior. `epoch`
-/// is the next epoch, whose batches' weight noise the fit draws.
+/// with the steps taken ([`Optimizer`]). Without a state the fit's step count starts at zero, and
+/// it makes the Laplace start (`laplace_start`) from the start's means: its standard deviations
+/// and IVON's curvature come from one pass at a sample of the given posterior. `epoch` is the next
+/// epoch, whose batches' weight noise the fit draws.
 pub struct Start {
     pub mean: Vec<Array2<f64>>,
     pub log_sd: Vec<Array2<f64>>,
     pub active: Vec<bool>,
-    pub state: Option<Vec<[Array2<f64>; 3]>>,
-    /// IVON's iterate `μ` (as the device holds it) whose Polyak average the means are, and the
-    /// steps that average spans; none for a start whose means are the iterate.
-    pub iterate: Option<(Vec<Array2<f64>>, u64)>,
-    pub steps: u64,
+    pub state: Option<Optimizer>,
     pub epoch: usize,
 }
 
-/// The start a fit checkpoint of `explanation` holds: its posterior, IVON's state, the steps taken
-/// and the next epoch. [`fit_from`] continues from it exactly as resuming the checkpoint would.
+/// The start a fit checkpoint of `explanation` holds: its posterior, IVON's state with the steps
+/// taken, the line step's averages, the prior term's state and the next epoch. [`fit_from`]
+/// continues from it exactly as resuming the checkpoint would, with the convergence test begun
+/// afresh.
 pub fn checkpoint_start(explanation: &Explanation, path: &Path) -> Result<Start, String> {
     read_checkpoint(explanation, path).map(|(_, start)| start)
 }
@@ -2899,6 +2986,8 @@ pub fn fit_from(
         step: 0,
         averaged: 0,
         ratio: unit_ratio(),
+        slope: (0.0, 0.0, 0),
+        weights: None,
         momentum_weights: None,
         best: None,
         epochs: Vec::new(),
@@ -2918,59 +3007,62 @@ pub fn fit_from(
     // needs), with `M`'s targets for its experiments made once for every evaluation of it.
     let subset = &held[..settings.batch_sequences.clamp(2, held.len())];
     let subset_batches = held_batches(&scorer, subset, settings)?;
-    let (mut resumed, mut held_means) = (None, None);
-    // IVON's iterate and the steps its average spans, where the means are that average.
-    let mut held_iterate: Option<(Vec<Array2<f64>>, u64)> = None;
+    // IVON's state the fit continues, a start's or a checkpoint's, and the posterior's means the
+    // device holds with it (the Polyak average of the state's iterate).
+    let (mut resumed, mut held_means): (Option<Optimizer>, Option<Vec<Array2<f64>>>) = (None, None);
     if let Some(start) = start {
         let shapes: Vec<(usize, usize)> = posterior.mean.iter().map(|m| m.dim()).collect();
         let fits = |arrays: &[Array2<f64>]| arrays.iter().map(Array2::dim).eq(shapes.iter().copied());
-        let state_fits = start.state.as_ref().is_none_or(|state| state.len() == shapes.len() && state.iter().zip(&shapes).all(|(m, d)| m.iter().all(|a| a.dim() == *d)));
-        let iterate_fits = start.iterate.as_ref().is_none_or(|(iterate, _)| fits(iterate));
-        if !fits(&start.mean) || !fits(&start.log_sd) || start.active.len() != posterior.active.len() || !state_fits || !iterate_fits {
+        let state_fits = start.state.as_ref().is_none_or(|state| {
+            state.moments.len() == shapes.len() && state.moments.iter().zip(&shapes).all(|(m, d)| m.iter().all(|a| a.dim() == *d)) && fits(&state.iterate) && state.weights.len() == shapes.len()
+        });
+        if !fits(&start.mean) || !fits(&start.log_sd) || start.active.len() != posterior.active.len() || !state_fits {
             return Err("a start of another explanation".into());
         }
-        if start.iterate.is_some() {
+        // One clock: the steps a state was taken over, or none without one.
+        if let Some(state) = &start.state {
             held_means = Some(start.mean.clone());
+            progress.step = i32::try_from(state.steps).map_err(error)?;
+            progress.prior = state.prior.clone();
         }
-        held_iterate = start.iterate;
         posterior.mean = start.mean.into_iter().map(Shared::from).collect();
         posterior.log_sd = start.log_sd.into_iter().map(Shared::from).collect();
         posterior.remove(&(0..start.active.len()).filter(|g| !start.active[*g]).collect::<Vec<_>>());
         progress.active = posterior.active.clone();
         progress.epoch = start.epoch;
-        progress.step = i32::try_from(start.steps).map_err(error)?;
         resumed = start.state;
     }
     if let Some(path) = checkpoint.filter(|p| p.exists()) {
         let (loaded, moments, held, iterate) = load_checkpoint(path, &progress, &mut posterior)?;
         held_means = Some(held);
-        held_iterate = Some((iterate, loaded.averaged));
         progress = loaded;
         match (prior.as_deref_mut(), &progress.prior) {
             (Some(prior), Some(state)) => prior.load(state)?,
             (None, None) => {}
             _ => return Err(format!("{}: a checkpoint of a fit with another prior term", path.display())),
         }
-        resumed = Some(moments);
+        let steps = u64::try_from(progress.step).map_err(error)?;
+        let weights = saved_weights(progress.weights.clone(), progress.momentum_weights, steps, progress.shapes.len());
+        resumed = Some(Optimizer { moments, iterate, averaged: progress.averaged, steps, weights, ratio: progress.ratio, slope: progress.slope, prior: progress.prior.clone() });
         log::info!("library fit resumed at epoch {} from {}", progress.epoch, path.display());
+    } else if let Some(state) = resumed.as_ref().and_then(|resumed| resumed.prior.as_ref()) {
+        // A start's prior state: the fit's prior term continues from it, as from its checkpoint.
+        match prior.as_deref_mut() {
+            Some(prior) => prior.load(state)?,
+            None => return Err("a start of a fit with a prior term, continued without one".into()),
+        }
     }
     let resumed_seconds = progress.seconds;
     let fresh = resumed.is_none();
-    let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, resumed.as_deref().map(State::Saved), u64::try_from(progress.step).map_err(error)?)?;
-    drop(resumed);
-    if let (false, Some(weights)) = (fresh, progress.momentum_weights) {
-        device_posterior.set_momentum_weights(weights);
-    }
-    // A resumed fit holds exactly the device's means of the checkpoint, and the iterate they
-    // average with the steps they span: it goes on as the fit that was not stopped.
-    if let Some(held) = held_means.take() {
-        match held_iterate.take() {
-            Some((iterate, averaged)) => {
-                device_posterior.restore(&held, &iterate, averaged)?;
-                device_posterior.set_line_ratio(progress.ratio);
-            }
-            None => device_posterior.restore_means(&held)?,
-        }
+    let state = resumed.as_ref().map(|resumed| State::Saved { moments: &resumed.moments, weights: &resumed.weights });
+    let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, state, u64::try_from(progress.step).map_err(error)?)?;
+    // A resumed fit holds exactly the device's means of the checkpoint, the iterate they average
+    // with the steps they span, and the line step's averages: it goes on as the fit that was not
+    // stopped.
+    if let (Some(resumed), Some(held)) = (resumed.take(), held_means.take()) {
+        device_posterior.restore(&held, &resumed.iterate, resumed.averaged)?;
+        device_posterior.set_line_ratio(resumed.ratio);
+        device_posterior.set_line_slope(resumed.slope);
     }
     if fresh {
         let timed = Instant::now();
@@ -3070,27 +3162,39 @@ pub fn fit_from(
             // `Σ_G KL_G` and the active groups' variances' scales at the posterior the sample was drawn
             // from.
             device_posterior.code_length_into(&mut code, b)?;
-            // The prior term at the same weight sample; its gradient joins the data term's, which
-            // the step weighs by `scale` in nats.
-            // The prior's term at the sample on the device (`PriorTerm::sample_device`), and its
-            // seconds.
+            // The prior term at the step's two antithetic samples, around the iterate as the data
+            // step's (`PriorTerm::sample_device`), and its seconds: its value and gradient averaged
+            // over the pair, the gradient joining the data term's (which the step weighs by `scale`
+            // in nats), and the antithetic Stein estimate of its diagonal curvature per token
+            // (`DevicePosterior::stein_curvature`) joining the step's curvature estimate. The twin
+            // is evaluated first and without learning, so both see the prior's parameters before
+            // the step's one step of them.
             let mut prior_seconds = 0.0;
+            let mut prior_curvature = BTreeMap::new();
             let prior_nats = match prior.as_deref_mut() {
                 Some(prior) => {
                     let timed = Instant::now();
-                    let (nats, extra) = prior.sample_device(device, &device_posterior, &mut posterior, key, true)?;
-                    for (i, g) in extra {
+                    let (twin_nats, twin) = prior.sample_device(device, &device_posterior, &mut posterior, key ^ gam_gpu::tensor::ANTITHETIC, false)?;
+                    let (own_nats, own) = prior.sample_device(device, &device_posterior, &mut posterior, key, true)?;
+                    let mut reached: Vec<usize> = own.keys().chain(twin.keys()).copied().collect();
+                    reached.sort_unstable();
+                    reached.dedup();
+                    for i in reached {
                         let op = explanation.trainable[i];
-                        match gradients.get_mut(&op) {
-                            Some(total) => device.axpy(total, 1.0 / (scale * LN_2), &g).map_err(error)?,
-                            None => {
-                                let mut scaled = device.zeros(g.rows(), g.cols()).map_err(error)?;
-                                device.axpy(&mut scaled, 1.0 / (scale * LN_2), &g).map_err(error)?;
-                                gradients.insert(op, scaled);
+                        let (plus, minus) = (own.get(&i), twin.get(&i));
+                        prior_curvature.insert(op, device_posterior.stein_curvature(i, (plus, minus), key)?);
+                        for g in [plus, minus].into_iter().flatten() {
+                            match gradients.get_mut(&op) {
+                                Some(total) => device.axpy(total, 0.5 / (scale * LN_2), g).map_err(error)?,
+                                None => {
+                                    let mut scaled = device.zeros(g.rows(), g.cols()).map_err(error)?;
+                                    device.axpy(&mut scaled, 0.5 / (scale * LN_2), g).map_err(error)?;
+                                    gradients.insert(op, scaled);
+                                }
                             }
                         }
                     }
-                    let nats = nats + prior.cost(&posterior)?;
+                    let nats = 0.5 * (own_nats + twin_nats) + prior.cost(&posterior)?;
                     prior_seconds = timed.elapsed().as_secs_f64();
                     nats
                 }
@@ -3104,10 +3208,10 @@ pub fn fit_from(
             // `antithetic_step`).
             let factor_weight = weight * scored as f64 / factor.tokens as f64;
             let posterior_started = Instant::now();
-            device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &ivon)?;
+            device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &prior_curvature, &ivon)?;
             let posterior_seconds = posterior_started.elapsed().as_secs_f64();
-            let (eta, rho, draws_averaged) = device_posterior.step_state();
-            log::info!("library line step {epoch}.{b}: η {eta:.4e}, ρ̄ {rho:.4e} over {draws_averaged} draws; posterior step {posterior_seconds:.3} s");
+            let (eta, rho, draws_averaged, ratio) = device_posterior.step_state();
+            log::info!("library line step {epoch}.{b}: η {eta:.4e}, ρ̄ {rho:.4e} over {draws_averaged} draws, r̄ {ratio:.4e}; posterior step {posterior_seconds:.3} s");
             let prior_note = if prior.is_some() { format!(" (prior: {prior_seconds:.3} s)") } else { String::new() };
             log::info!("library step {epoch}.{b}: {:.6} bits per scored token, {:.2} s{prior_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
         }
@@ -4531,13 +4635,14 @@ mod tests {
         let factors: Vec<Array2<f64>> = posterior.mean.iter().map(|m| m.mapv(|_| rng.random::<f64>() - 0.5)).collect();
         let up = |values: &[Array2<f64>]| -> BTreeMap<usize, Tensor> { explanation.trainable.iter().zip(values).map(|(op, g)| (*op, device.upload(g.view()).unwrap())).collect() };
         let ivon = Ivon { beta1: 0.9, beta2: 0.75 };
-        device_posterior.step(&up(&gradients), scale, (&up(&factors), square), &ivon).unwrap();
+        device_posterior.step(&up(&gradients), scale, (&up(&factors), square), &BTreeMap::new(), &ivon).unwrap();
         let mut stepped = posterior.clone();
-        device_posterior.download(&mut stepped).unwrap();
+        let moments = device_posterior.download(&mut stepped).unwrap();
         // The host reference: IVON's first step from momentum zero and the curvature at which the
         // posterior's standard deviations are IVON's.
         let variance = posterior.variances();
         let mut reference = posterior.clone();
+        let close = |what: &str, x: f64, y: f64| assert!((x - y).abs() <= 1e-12 * (1.0 + y.abs()), "the device step's {what} {x} against the host step's {y}");
         for i in 0..reference.mean.len() {
             for ((r, c), _) in posterior.mean[i].indexed_iter() {
                 let delta = 1.0 / (tokens * variance[posterior.membership[i][[r, c]] as usize]);
@@ -4545,9 +4650,11 @@ mod tests {
                 let h0 = (1.0 / (tokens * sd * sd) - delta).max(0.0);
                 let d = square * factors[i][[r, c]] * factors[i][[r, c]] - h0;
                 let h = h0 + (1.0 - ivon.beta2) * d;
-                // A first step's momentum is one gradient, which gives no spread: the gradient's
-                // noise is unknown, the filtered gradient is zero and the mean stays.
+                // The iterate holds until `RATIO_DRAWS` draws of the line step's ratios: the mean
+                // stays, and the momentum holds the one gradient.
                 reference.log_sd[i][[r, c]] = -0.5 * (tokens * (h + delta)).ln();
+                close("momentum", moments[i][0][[r, c]], (1.0 - ivon.beta1) * scale * gradients[i][[r, c]]);
+                close("curvature", moments[i][1][[r, c]], h);
             }
         }
         for (field, (device_values, host_values)) in [("μ", (&stepped.mean, &reference.mean)), ("ln σ", (&stepped.log_sd, &reference.log_sd))] {
@@ -4752,7 +4859,13 @@ mod tests {
         assert!(write_checkpoint_array(&mut Vec::new(), &Array2::from_elem((1, 1), f64::from(1.0_f32 + f32::EPSILON)), Precision::Bf16).is_err());
     }
 
-    fn checkpoint_fixture() -> (Progress, Posterior, Vec<u8>) {
+    /// A checkpoint of three operators (one empty) whose payload holds `precision`'s arrays per
+    /// operator (none: the legacy layout, six float64 arrays), array `field` of operator `i`
+    /// holding `100 i + 10 field + cell` (integers below 256, which every precision holds exactly).
+    /// A legacy layout's header carries the momentum's one `(W, W2)` pair, as checkpoints written
+    /// before the corrections were per operator did; the current layout's carries per operator
+    /// corrections and the line step's slope averages.
+    fn checkpoint_fixture(precision: Option<Vec<Precision>>) -> (Progress, Posterior, Vec<u8>) {
         let shapes = vec![(2, 3), (0, 2), (3, 1)];
         let posterior = Posterior {
             mean: shapes.iter().map(|&dim| Array2::from_elem(dim, -7.0).into()).collect(),
@@ -4762,6 +4875,7 @@ mod tests {
             spans: Vec::new(),
             initial: Vec::new(),
         };
+        let legacy = precision.as_ref().is_none_or(|p| p.len() == LEGACY_ARRAYS);
         let progress = Progress {
             identity: Identity {
                 export: "export".into(),
@@ -4779,7 +4893,9 @@ mod tests {
             step: 17,
             averaged: 3,
             ratio: (1.5, 2),
-            momentum_weights: Some((0.25, 0.0625)),
+            slope: if legacy { (0.0, 0.0, 0) } else { (0.75, 1.25, 4) },
+            weights: (!legacy).then(|| vec![0.5, 0.0, 0.875]),
+            momentum_weights: legacy.then_some((0.25, 0.0625)),
             best: Some((7.0, 3)),
             epochs: Vec::new(),
             removals: Vec::new(),
@@ -4792,46 +4908,76 @@ mod tests {
             evaluation_seconds: 2.0,
             full_seconds: 1.0,
             prior: None,
-            precision: None,
+            precision: precision.clone(),
         };
-        // The wire format: length-prefixed JSON, then `CHECKPOINT_ARRAYS` row-major f64 arrays per
-        // operator. This fixture is independent of the streaming decoder and requires no GPU.
-        let header = serde_json::to_vec(&progress).unwrap();
+        // The wire format: length-prefixed JSON, then each operator's arrays row-major in their
+        // precisions. This fixture is independent of the streaming decoder and requires no GPU.
+        let mut header = serde_json::to_value(&progress).unwrap();
+        if let Some((w, w2)) = progress.momentum_weights {
+            header["momentum_weights"] = serde_json::json!([w, w2]);
+        }
+        let header = serde_json::to_vec(&header).unwrap();
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
         bytes.extend(header);
+        let layout = Precision::of_payload(precision.as_deref()).unwrap();
         for (i, &(rows, cols)) in progress.shapes.iter().enumerate() {
-            for field in 0..CHECKPOINT_ARRAYS {
-                for cell in 0..rows * cols {
-                    bytes.extend(((100 * i + 10 * field + cell) as f64 + 0.25).to_le_bytes());
-                }
+            for (field, &p) in layout.iter().enumerate() {
+                let values = Array2::from_shape_fn((rows, cols), |(r, c)| (100 * i + 10 * field + r * cols + c) as f64);
+                write_checkpoint_array(&mut bytes, &values, p).unwrap();
             }
         }
         (progress, posterior, bytes)
     }
 
-    #[test]
-    fn checkpoint_streaming_restores_the_legacy_payload_without_replacing_posterior_arrays() {
-        let (expected, mut posterior, bytes) = checkpoint_fixture();
-        let path = std::env::temp_dir().join(format!("library_checkpoint_stream_{}.bin", std::process::id()));
+    /// `load_checkpoint` of `checkpoint_fixture(precision)`: every restored array is the fixture's
+    /// (the posterior's own arrays written in place), the iterate the payload's last array, and a
+    /// legacy payload's gradient second moment dropped. Returns the loaded progress.
+    fn restores_its_arrays(precision: Option<Vec<Precision>>, name: &str) -> Progress {
+        let (expected, mut posterior, bytes) = checkpoint_fixture(precision.clone());
+        let path = std::env::temp_dir().join(format!("library_checkpoint_{name}_{}.bin", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
         let pointers: Vec<_> = posterior.mean.iter().chain(&posterior.log_sd).map(|array| array.as_ptr()).collect();
         let (progress, moments, _, iterates) = load_checkpoint(&path, &expected, &mut posterior).unwrap();
+        std::fs::remove_file(path).unwrap();
         assert_eq!(serde_json::to_value(&progress).unwrap(), serde_json::to_value(&expected).unwrap());
         assert_eq!(posterior.active, expected.active);
         assert_eq!(pointers, posterior.mean.iter().chain(&posterior.log_sd).map(|array| array.as_ptr()).collect::<Vec<_>>());
+        let last = Precision::of_payload(precision.as_deref()).unwrap().len() - 1;
         for i in 0..progress.shapes.len() {
-            for (field, array) in [&*posterior.mean[i], &*posterior.log_sd[i]].into_iter().chain(&moments[i]).chain([&iterates[i]]).enumerate() {
+            let arrays = [(0, &*posterior.mean[i]), (1, &*posterior.log_sd[i]), (2, &moments[i][0]), (3, &moments[i][1]), (last, &iterates[i])];
+            for (field, array) in arrays {
                 for (cell, value) in array.iter().enumerate() {
-                    assert_eq!(*value, (100 * i + 10 * field + cell) as f64 + 0.25);
+                    assert_eq!(*value, (100 * i + 10 * field + cell) as f64, "{name}: operator {i}, array {field}");
                 }
             }
         }
-        std::fs::remove_file(path).unwrap();
+        progress
+    }
+
+    #[test]
+    fn checkpoint_streaming_restores_the_legacy_payload_without_replacing_posterior_arrays() {
+        // Six float64 arrays per operator, the gradient's second moment fifth, and the momentum's
+        // one bias correction for every operator.
+        let progress = restores_its_arrays(None, "legacy");
+        assert_eq!(progress.momentum_weights, Some((0.25, 0.0625)));
+        assert_eq!(saved_weights(progress.weights, progress.momentum_weights, 17, 3), vec![0.25; 3]);
+        assert_eq!(saved_weights(None, None, 2, 2), vec![0.9 * (1.0 - 0.9) + (1.0 - 0.9); 2], "a checkpoint with neither: β₁ = 0.9's over its steps");
+    }
+
+    #[test]
+    fn checkpoints_of_five_arrays_and_of_the_six_before_them_restore_in_their_precisions() {
+        // The current layout in the f32 storage, and the one before it with its bfloat16 momentum.
+        let current = restores_its_arrays(Some(vec![Precision::F32; CHECKPOINT_ARRAYS]), "current");
+        assert_eq!(saved_weights(current.weights, current.momentum_weights, 17, 3), vec![0.5, 0.0, 0.875]);
+        assert_eq!(current.slope, (0.75, 1.25, 4));
+        let old = restores_its_arrays(Some(vec![Precision::F32, Precision::F32, Precision::Bf16, Precision::F32, Precision::F32, Precision::F32]), "bf16");
+        assert_eq!(saved_weights(old.weights, old.momentum_weights, 17, 3), vec![0.25; 3]);
+        assert!(Precision::of_payload(Some(&[Precision::F64; 4])).is_err(), "a payload of another layout");
     }
 
     #[test]
     fn checkpoint_streaming_refuses_truncation_trailing_bytes_and_overflow_before_mutating() {
-        let (expected, posterior, bytes) = checkpoint_fixture();
+        let (expected, posterior, bytes) = checkpoint_fixture(None);
         let path = std::env::temp_dir().join(format!("library_checkpoint_bad_{}.bin", std::process::id()));
         let mut trailing = bytes.clone();
         trailing.push(1);
@@ -4870,16 +5016,19 @@ mod tests {
         std::fs::write(&path, [&(header.len() as u64).to_le_bytes()[..], &header, &bytes[8 + header_len..]].concat()).unwrap();
         let message = load_checkpoint(&path, &expected, &mut posterior.clone()).unwrap_err();
         assert!(message.contains("experiment collection 0"), "{message}");
-        let (wide, device) = ([Precision::F64; CHECKPOINT_ARRAYS], [Precision::F32, Precision::F32, Precision::Bf16, Precision::F32, Precision::F32, Precision::F32]);
-        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], wide), Some(9 * 48));
-        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], device), Some(9 * 22));
-        assert_eq!(checkpoint_payload_bytes(&[(usize::MAX, usize::MAX)], wide), None);
+        let shapes = [(2, 3), (0, 2), (3, 1)];
+        let (wide, device) = ([Precision::F64; CHECKPOINT_ARRAYS], [Precision::F32; CHECKPOINT_ARRAYS]);
+        let legacy = [Precision::F32, Precision::F32, Precision::Bf16, Precision::F32, Precision::F32, Precision::F32];
+        assert_eq!(checkpoint_payload_bytes(&shapes, &wide), Some(9 * 40));
+        assert_eq!(checkpoint_payload_bytes(&shapes, &device), Some(9 * 20));
+        assert_eq!(checkpoint_payload_bytes(&shapes, &legacy), Some(9 * 22));
+        assert_eq!(checkpoint_payload_bytes(&[(usize::MAX, usize::MAX)], &wide), None);
         std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn checkpoint_identity_reads_a_bounded_prefix_without_loading_the_payload() {
-        let (expected, _, bytes) = checkpoint_fixture();
+        let (expected, _, bytes) = checkpoint_fixture(None);
         let path = std::env::temp_dir().join(format!("library_checkpoint_identity_{}.bin", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
         // A sparse payload makes the bytes read observable independently of posterior size.
@@ -4933,7 +5082,7 @@ mod tests {
         assert_eq!(started.posterior.log_sd, resumed.posterior.log_sd);
         assert_eq!(started.posterior.active, resumed.posterior.active);
         // A start of another explanation is refused.
-        let other = Start { mean: Vec::new(), log_sd: Vec::new(), active: vec![true], state: None, iterate: None, steps: 0, epoch: 0 };
+        let other = Start { mean: Vec::new(), log_sd: Vec::new(), active: vec![true], state: None, epoch: 0 };
         assert!(fit_from(&device, &native, &explanation, train, held, &settings, "tiny", None, None, Some(other)).is_err());
     }
 
@@ -5088,10 +5237,10 @@ mod tests {
         // lost it (the momentum's weights, 4d64ef9bd5's, were not saved).
         let state = |file: &std::path::PathBuf| -> serde_json::Value {
             let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(file.with_extension("json")).unwrap()).unwrap();
-            serde_json::json!([saved["step"], saved["averaged"], saved["ratio"], saved["momentum_weights"]])
+            serde_json::json!([saved["step"], saved["averaged"], saved["ratio"], saved["weights"], saved["slope"]])
         };
         let (resumed_state, uninterrupted_state) = (state(&stopped), state(&whole));
-        assert!(uninterrupted_state[3].is_array(), "the checkpoint holds the momentum's weights");
+        assert!(uninterrupted_state[3].is_array(), "the checkpoint holds the momentum's bias corrections");
         assert_eq!(resumed_state, uninterrupted_state, "the resumed fit's optimizer state");
         for file in [&whole, &stopped] {
             for extension in ["bin", "json", "removals.jsonl"] {
@@ -5156,16 +5305,16 @@ mod tests {
             let resumed = fit(device, &native, &explanation, train, held, &settings, "tiny", Some(&stopped), Some(&mut Stop { groups, steps: 0, stop: None })).unwrap();
             let start = checkpoint_start(&explanation, &whole.with_extension("start.bin")).unwrap();
             let (a, b) = (checkpoint_start(&explanation, &stopped).unwrap(), checkpoint_start(&explanation, &whole).unwrap());
-            let iterate = |s: &Start| s.iterate.as_ref().expect("a checkpoint holds the iterate").0.clone();
+            let iterate = |s: &Start| s.state.as_ref().expect("a checkpoint holds IVON's state").iterate.clone();
             assert_ne!(iterate(&middle), start.mean, "device {d}: the iterate moved before the stop");
             assert_ne!(iterate(&b), iterate(&middle), "device {d}: the iterate moved after the resume");
             assert_ne!(b.mean, middle.mean, "device {d}: the means moved after the resume");
-            assert_eq!((a.steps, a.epoch), (b.steps, b.epoch), "device {d}");
+            let steps = |s: &Start| s.state.as_ref().map(|state| state.steps);
+            assert_eq!((steps(&a), a.epoch), (steps(&b), b.epoch), "device {d}");
             assert_eq!(a.mean, b.mean, "device {d}: the means");
             assert_eq!(a.log_sd, b.log_sd, "device {d}: the deviations");
             assert_eq!(a.active, b.active, "device {d}");
-            assert_eq!(a.state, b.state, "device {d}: IVON's state");
-            assert_eq!(a.iterate, b.iterate, "device {d}: the iterate and the steps its average spans");
+            assert_eq!(a.state, b.state, "device {d}: IVON's state, the iterate and the steps its average spans");
             assert_eq!(resumed.report.epochs.len(), uninterrupted.report.epochs.len());
             for (x, y) in resumed.report.epochs.iter().zip(&uninterrupted.report.epochs) {
                 assert_eq!(x.objective_bits.to_bits(), y.objective_bits.to_bits(), "device {d}: epoch {}", x.epoch);

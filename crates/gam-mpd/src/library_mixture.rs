@@ -1548,12 +1548,12 @@ impl Mixture {
             let op = self.trainable[i];
             if column {
                 let mut sample = device.zeros(d, count).map_err(error)?;
-                device_posterior.sample_block(op, &mut sample, (0, 0), key)?;
+                device_posterior.iterate_block(op, &mut sample, (0, 0), key)?;
                 let mut turned = device.zeros(count, d).map_err(error)?;
                 device.gemm(&mut turned, 1.0, &sample, Op::T, &layout.eye, Op::N, 0.0, arithmetic).map_err(error)?;
                 device.set_rows(&mut table, start, &turned).map_err(error)?;
             } else {
-                device_posterior.sample_block(op, &mut table, (start, 0), key)?;
+                device_posterior.iterate_block(op, &mut table, (start, 0), key)?;
             }
         }
         if let Some(tokens) = &layout.tokens {
@@ -1673,14 +1673,10 @@ impl PriorTerm for Mixture {
         let (mut value, mut gradient) = (0.0, BTreeMap::new());
         let timed = std::time::Instant::now();
         if !heads.is_empty() {
-            // The key-value groups' terms on the host, at their operators' sample.
+            // The key-value groups' terms on the host, at their operators' sample as a training
+            // step draws it (around the iterate).
             let operators = self.operators_of(&heads);
-            for &i in &operators {
-                let (mean, log_sd) = device_posterior.values(i)?;
-                posterior.mean[i] = mean.into();
-                posterior.log_sd[i] = log_sd.into();
-            }
-            let theta = crate::library_mdl::host_sample(posterior, &operators, key);
+            let theta = crate::library_mdl::step_sample(device_posterior, posterior, &operators, key)?;
             let (nats, host) = self.host_terms(&heads, posterior, &theta, &mut learned)?;
             value += nats;
             for (i, g) in host {

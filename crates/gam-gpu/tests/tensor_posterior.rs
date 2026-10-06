@@ -30,14 +30,17 @@ fn matrix(rows: usize, cols: usize, seed: u64, scale: f64, shift: f64) -> Array2
 /// A test posterior in 8 groups laid out by `axis`: 6 × 40 entries by row (rows 0–5), 130 × 16 by
 /// column pairs (more rows than one column thread sums, `GroupMap`), or 6 × 40 by entry (rows 0–2 by
 /// row, the rest by blocks of 8 columns); group 4 removed (`s = −∞`, `μ = 0`). With the `(key,
-/// stream)` of its sample, its gradient and Gauss–Newton factor, and its step.
+/// stream)` of its sample, IVON's state (the momentum and a positive curvature), its gradient,
+/// Gauss–Newton factor and prior curvature of either sign, and its step (the seventh of a constant
+/// `β₁`).
 struct Case {
     mean: Array2<f64>,
     log_sd: Array2<f64>,
-    moments: [Array2<f64>; 3],
+    moments: [Array2<f64>; 2],
     sample: (u64, u64),
     gradient: Array2<f64>,
     factor: Array2<f64>,
+    prior: Array2<f64>,
     groups: Vec<u32>,
     count: usize,
     step: PosteriorStep,
@@ -62,37 +65,50 @@ fn case(axis: GroupAxis) -> Case {
             log_sd[(i / cols, i % cols)] = f64::NEG_INFINITY;
         }
     }
-    // The gradient's momentum, a positive curvature estimate and the gradient's second moment.
-    let moments = [matrix(rows, cols, 3, 0.1, 0.0), matrix(rows, cols, 4, 0.5, 1.0), matrix(rows, cols, 5, 0.01, 0.02)];
-    let step = PosteriorStep { gradient_scale: 1.5, factor_scale: 0.25, tokens: 50.0, beta1: 0.9, beta2: 0.999, weights: PosteriorStep::constant_weights(0.9, 7) };
-    let (gradient, factor) = (matrix(rows, cols, 7, 3.0, 0.0), matrix(rows, cols, 8, 2.0, 0.0));
-    Case { mean, log_sd, moments, sample: (0x1234_5678_9abc_def0, 42), gradient, factor, groups, count: 8, step }
+    let moments = [matrix(rows, cols, 3, 0.1, 0.0), matrix(rows, cols, 4, 0.5, 1.0)];
+    let step = PosteriorStep { gradient_scale: 1.5, factor_scale: 0.25, tokens: 50.0, beta1: 0.9, beta2: 0.999, weight: PosteriorStep::constant_weight(0.9, 6) };
+    let (gradient, factor, prior) = (matrix(rows, cols, 7, 3.0, 0.0), matrix(rows, cols, 8, 2.0, 0.0), matrix(rows, cols, 5, 0.5, 0.0));
+    Case { mean, log_sd, moments, sample: (0x1234_5678_9abc_def0, 42), gradient, factor, prior, groups, count: 8, step }
 }
 
-/// The formulas, entry by entry: the sample, the stepped posterior and moments, and the group sums
-/// `(n, Σ μ² + σ², Σ 2s)` before and after the step, from the sums before.
-fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 3], Vec<[f64; 3]>, Vec<[f64; 3]>) {
-    let mut before = vec![[0.0; 3]; c.count];
+/// A step's results: the sample, the posterior moved by the step's full direction and IVON's state
+/// (the momentum, the curvature), the group sums `(n, Σ μ² + σ², Σ 2s)` before and after the step,
+/// the divergences from the sums before, and the step's terms (groups × 5,
+/// `Device::posterior_ivon`).
+#[derive(Clone, PartialEq)]
+struct Stepped {
+    theta: Array2<f64>,
+    mean: Array2<f64>,
+    log_sd: Array2<f64>,
+    moments: Vec<Array2<f64>>,
+    before: Array2<f64>,
+    after: Array2<f64>,
+    divergence: Array2<f64>,
+    terms: Array2<f64>,
+}
+
+/// The formulas, entry by entry, from the sums before the step: with `d₀` the direction before the
+/// step and `d` the step's, the terms `d · d`, `u · d`, `Σ h⁺ d²`, `(g + δ μ) · d₀` and
+/// `Σ (h₀⁺ + δ) d₀²` per group.
+fn reference(c: &Case) -> Stepped {
+    let mut before = Array2::zeros((c.count, 3));
     for (i, g) in c.groups.iter().enumerate() {
         let (mu, s) = (c.mean.as_slice().unwrap()[i], c.log_sd.as_slice().unwrap()[i]);
         if s > f64::NEG_INFINITY {
-            let b = &mut before[*g as usize];
-            b[0] += 1.0;
-            b[1] += mu * mu + (2.0 * s).exp();
-            b[2] += 2.0 * s;
+            let g = *g as usize;
+            before[(g, 0)] += 1.0;
+            before[(g, 1)] += mu * mu + (2.0 * s).exp();
+            before[(g, 2)] += 2.0 * s;
         }
     }
-    let variance: Vec<f64> = before.iter().map(|b| if b[0] > 0.0 { b[1] / b[0] } else { 0.0 }).collect();
+    let variance: Vec<f64> = (0..c.count).map(|g| if before[(g, 0)] > 0.0 { before[(g, 1)] / before[(g, 0)] } else { 0.0 }).collect();
+    let divergence = Array2::from_shape_fn((c.count, 1), |(g, _)| if before[(g, 0)] > 0.0 { 0.5 * (before[(g, 0)] * variance[g].ln() - before[(g, 2)]) } else { 0.0 });
     let (b1, b2, n) = (c.step.beta1, c.step.beta2, c.step.tokens);
-    let t = 7;
-    let c1 = 1.0 - b1.powi(t);
-    // The momentum's effective number of gradients, and the factor from the moments' spread to its
-    // variance.
-    let effective = (1.0 + b1) * c1 * c1 / ((1.0 - b1) * (1.0 - b1.powi(2 * t)));
-    let spread = 1.0 / (effective - 1.0);
+    // The momentum's bias correction before the step and after it.
+    let (w0, w1) = (c.step.weight, b1 * c.step.weight + (1.0 - b1));
     let mut theta = c.mean.clone();
     let (mut mean, mut log_sd, mut moments) = (c.mean.clone(), c.log_sd.clone(), c.moments.clone());
-    let mut after = vec![[0.0; 3]; c.count];
+    let (mut after, mut terms) = (Array2::zeros((c.count, 3)), Array2::zeros((c.count, 5)));
     for (i, g) in c.groups.iter().enumerate() {
         let at = (i / c.mean.ncols(), i % c.mean.ncols());
         let e = f64::from(posterior_normal(c.sample.0, c.sample.1, i as u64));
@@ -101,36 +117,40 @@ fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 
         if s == f64::NEG_INFINITY {
             continue;
         }
-        let gr = c.step.gradient_scale * c.gradient[at];
-        let delta = 1.0 / (n * variance[*g as usize]);
-        let momentum = b1 * moments[0][at] + (1.0 - b1) * gr;
-        let power = b1 * moments[2][at] + (1.0 - b1) * gr * gr;
-        let (m, noise) = (momentum / c1, (power / c1 - (momentum / c1).powi(2)).max(0.0) * spread);
-        let full = m + delta * mu;
-        let signal = if full * full > noise { full - noise / full } else { 0.0 };
-        let estimate = c.step.factor_scale * c.factor[at] * c.factor[at];
-        let (h, d) = (moments[1][at], estimate - moments[1][at]);
-        let curvature = h + (1.0 - b2) * d;
+        let g = *g as usize;
+        let delta = 1.0 / (n * variance[g]);
+        let (m0, h0) = (moments[0][at], moments[1][at]);
+        let held = h0.max(0.0) + delta;
+        let previous = (m0 / w0 + delta * mu) / held;
+        let (gr, u) = (c.step.gradient_scale * c.gradient[at], c.factor[at]);
+        let estimate = c.step.factor_scale * u * u + c.prior[at];
+        let momentum = b1 * m0 + (1.0 - b1) * gr;
+        let curvature = h0 + (1.0 - b2) * (estimate - h0);
+        let positive = curvature.max(0.0);
+        let d = (momentum / w1 + delta * mu) / (positive + delta);
         moments[0][at] = momentum;
         moments[1][at] = curvature;
-        moments[2][at] = power;
-        mean[at] = mu - signal / (curvature + delta);
-        log_sd[at] = -0.5 * (n * (curvature + delta)).ln();
-        let a = &mut after[*g as usize];
-        a[0] += 1.0;
-        a[1] += mean[at] * mean[at] + (2.0 * log_sd[at]).exp();
-        a[2] += 2.0 * log_sd[at];
+        mean[at] = mu - d;
+        log_sd[at] = -0.5 * (n * (positive + delta)).ln();
+        after[(g, 0)] += 1.0;
+        after[(g, 1)] += mean[at] * mean[at] + (2.0 * log_sd[at]).exp();
+        after[(g, 2)] += 2.0 * log_sd[at];
+        terms[(g, 0)] += d * d;
+        terms[(g, 1)] += u * d;
+        terms[(g, 2)] += (positive * d) * d;
+        terms[(g, 3)] += (gr + delta * mu) * previous;
+        terms[(g, 4)] += (held * previous) * previous;
     }
-    (theta, mean, log_sd, moments, before, after)
+    Stepped { theta, mean, log_sd, moments: moments.to_vec(), before, after, divergence, terms }
 }
 
-/// The device's results on `c`: the sample, the stepped posterior and moments, the group sums
-/// before and after the step, and the divergences from the sums before. `fit` holds the posterior,
-/// its sample and gradient, `wide` the group sums.
-fn run(fit: &Device, wide: &Device, c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, Vec<Array2<f64>>, Array2<f64>, Array2<f64>, Array2<f64>) {
+/// The device's results on `c`: the sample, the step and its full move of the mean (an average
+/// from zero with weight 1, the stepped mean itself, whose moments are the sums after the step).
+/// `fit` holds the posterior, its sample and gradient, `wide` the group sums.
+fn run(fit: &Device, wide: &Device, c: &Case) -> Stepped {
     let up = |d: &Device, m: &Array2<f64>| d.upload(m.view()).unwrap();
     let (mut mean, mut log_sd) = (up(fit, &c.mean), up(fit, &c.log_sd));
-    let mut moments: Vec<Tensor> = c.moments.iter().map(|m| up(fit, m)).collect();
+    let (mut momentum, mut curvature) = (up(fit, &c.moments[0]), up(fit, &c.moments[1]));
     let groups = fit.group_map(&c.groups, c.mean.dim()).unwrap();
     let mut theta = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
     fit.reparameterize(&mut theta, (&mean, &log_sd), c.sample).unwrap();
@@ -140,21 +160,23 @@ fn run(fit: &Device, wide: &Device, c: &Case) -> (Array2<f64>, Array2<f64>, Arra
     let (mut variance, mut divergence) = (wide.zeros(c.count, 1).unwrap(), wide.zeros(c.count, 2).unwrap());
     wide.group_divergence(&mut sums, None, &mut variance, &mut divergence).unwrap();
     assert!(wide.download(&sums).unwrap().iter().all(|v| *v == 0.0), "the sums are zeroed");
-    let (gradient, factor) = (up(fit, &c.gradient), up(fit, &c.factor));
-    let [momentum, curvature, power] = &mut moments[..] else { unreachable!() };
-    let (mut direction, mut terms) = (fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap(), wide.zeros(c.count, 3).unwrap());
-    fit.posterior_ivon((&mean, &mut log_sd), [momentum, curvature, power], (&gradient, &factor), (&groups, &variance), (&mut direction, &mut terms), &c.step).unwrap();
-    // The full step, and an average from zero with weight 1 (the stepped mean itself), whose
-    // moments are the sums after the step.
+    let (gradient, factor, prior) = (up(fit, &c.gradient), up(fit, &c.factor), up(fit, &c.prior));
+    let (mut direction, mut terms) = (fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap(), wide.zeros(c.count, 5).unwrap());
+    fit.posterior_ivon((&mean, &mut log_sd), [&mut momentum, &mut curvature], (Some(&gradient), Some(&factor), Some(&prior)), (&groups, &variance), (&mut direction, &mut terms), &c.step).unwrap();
     let mut average = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
     fit.posterior_finish((&mut mean, &direction, 1.0), (&mut average, 1.0), &log_sd, &groups, &mut sums).unwrap();
     let down = |t: &Tensor| fit.download(t).unwrap();
     let down_wide = |t: &Tensor| wide.download(t).unwrap();
-    (fit.download(&theta).unwrap(), down(&mean), down(&log_sd), moments.iter().map(down).collect(), before, down_wide(&sums), down_wide(&divergence))
-}
-
-fn sums_of(rows: &[[f64; 3]]) -> Array2<f64> {
-    Array2::from_shape_fn((rows.len(), 3), |(g, k)| rows[g][k])
+    Stepped {
+        theta: down(&theta),
+        mean: down(&mean),
+        log_sd: down(&log_sd),
+        moments: vec![down(&momentum), down(&curvature)],
+        before,
+        after: down_wide(&sums),
+        divergence: down_wide(&divergence),
+        terms: down_wide(&terms),
+    }
 }
 
 /// `a` within `relative` of `b`'s largest magnitude (an entry `−∞` in both counts as equal).
@@ -222,25 +244,32 @@ fn the_host_steps_the_posterior_by_its_formulas() {
     }
 }
 
+/// The host's step against the formulas, the fresh and own slope sums among its terms.
 fn host_formulas(c: &Case) {
     let host = Device::host();
-    let (theta, mean, log_sd, moments, before, after, divergence) = run(&host, &host, c);
-    let (t, m, s, mo, b, a) = reference(c);
+    let found = run(&host, &host, c);
+    let expected = reference(c);
     let exact = 1e-15;
-    close("sample", &theta, &t, exact);
-    close("mean", &mean, &m, exact);
-    close("log sd", &log_sd, &s, exact);
-    for (k, (x, y)) in moments.iter().zip(&mo).enumerate() {
-        close(&format!("moment {k}"), x, y, exact);
+    let pairs = [
+        ("sample", &found.theta, &expected.theta),
+        ("mean", &found.mean, &expected.mean),
+        ("log sd", &found.log_sd, &expected.log_sd),
+        ("momentum", &found.moments[0], &expected.moments[0]),
+        ("curvature", &found.moments[1], &expected.moments[1]),
+        ("sums before", &found.before, &expected.before),
+        ("sums after", &found.after, &expected.after),
+        ("step terms", &found.terms, &expected.terms),
+    ];
+    for (what, x, y) in pairs {
+        close(what, x, y, exact);
     }
-    close("sums before", &before, &sums_of(&b), exact);
-    close("sums after", &after, &sums_of(&a), exact);
-    for (g, row) in b.iter().enumerate() {
-        let expected = if row[0] > 0.0 { 0.5 * (row[0] * (row[1] / row[0]).ln() - row[2]) } else { 0.0 };
-        assert!((divergence[(g, 0)] - expected).abs() <= 1e-12 * expected.abs().max(1.0), "divergence {g}");
+    for g in 0..c.count {
+        let (x, y) = (found.divergence[(g, 0)], expected.divergence[(g, 0)]);
+        assert!((x - y).abs() <= 1e-12 * y.abs().max(1.0), "divergence {g}: {x} against {y}");
     }
-    assert_eq!(b[4][0], 0.0, "the removed group is empty");
-    assert!(theta.iter().zip(&c.groups).all(|(v, g)| *g != 4 || *v == 0.0), "a removed entry samples zero");
+    assert_eq!(expected.before[(4, 0)], 0.0, "the removed group is empty");
+    assert!(expected.terms.row(4).iter().all(|t| *t == 0.0), "the removed group has no terms");
+    assert!(found.theta.iter().zip(&c.groups).all(|(v, g)| *g != 4 || *v == 0.0), "a removed entry samples zero");
 }
 
 fn against_host(fit: &Device, wide: &Device) {
@@ -251,27 +280,30 @@ fn against_host(fit: &Device, wide: &Device) {
 
 fn against_host_on(fit: &Device, wide: &Device, c: &Case) {
     let host = Device::host();
-    let (theta, mean, log_sd, moments, before, after, divergence) = run(fit, wide, c);
-    let (t, m, s, mo, b, a, d) = run(&host, &host, c);
+    let found = run(fit, wide, c);
+    let expected = run(&host, &host, c);
     // No device sum is atomic (`GroupMap`): a second run is the first bit for bit.
-    let first = (theta.clone(), mean.clone(), log_sd.clone(), moments.clone(), before.clone(), after.clone(), divergence.clone());
-    assert!(run(fit, wide, c) == first, "the device's results repeat bit for bit");
-    // A group sums at most `n` entries; the step reads its variance (such a sum over its count),
-    // and a second moment squares a gradient that carries the variance's error.
+    assert!(run(fit, wide, c) == found, "the device's results repeat bit for bit");
+    // A group sums at most `n` entries; the step reads its variance (such a sum over its count).
     let n = (0..c.count as u32).map(|g| c.groups.iter().filter(|h| **h == g).count()).max().unwrap() as f64;
     let sum_band = CHAIN + n * U / (1.0 - n * U);
-    close("sample", &theta, &t, CHAIN);
-    close("mean", &mean, &m, 2.0 * sum_band);
-    close("log sd", &log_sd, &s, 2.0 * sum_band);
-    for (k, (x, y)) in moments.iter().zip(&mo).enumerate() {
+    close("sample", &found.theta, &expected.theta, CHAIN);
+    close("mean", &found.mean, &expected.mean, 2.0 * sum_band);
+    close("log sd", &found.log_sd, &expected.log_sd, 2.0 * sum_band);
+    for (k, (x, y)) in found.moments.iter().zip(&expected.moments).enumerate() {
         close(&format!("moment {k}"), x, y, 2.0 * sum_band);
     }
-    close("sums before", &before, &b, sum_band);
-    close("sums after", &after, &a, sum_band);
+    close("sums before", &found.before, &expected.before, sum_band);
+    close("sums after", &found.after, &expected.after, sum_band);
+    // A term sums at most `n` products of signed factors, each within `2 sum_band` of the largest
+    // product, so it is within `2 n sum_band` of the largest term.
+    close("step terms", &found.terms, &expected.terms, 2.0 * n * sum_band);
     // ½ (n ln v − Σ 2s) cancels terms as large as `n |ln v|` and `|Σ 2s|`.
+    let b = &expected.before;
     let cancelled = b.rows().into_iter().map(|r| r[0] * (r[1] / r[0].max(1.0)).ln().abs() + r[2].abs()).fold(0.0_f64, f64::max);
     for g in 0..c.count {
-        assert!((divergence[(g, 0)] - d[(g, 0)]).abs() <= sum_band * cancelled, "divergence {g}: {} against {}", divergence[(g, 0)], d[(g, 0)]);
+        let (x, y) = (found.divergence[(g, 0)], expected.divergence[(g, 0)]);
+        assert!((x - y).abs() <= sum_band * cancelled, "divergence {g}: {x} against {y}");
     }
 }
 
@@ -325,7 +357,7 @@ fn settled(fit: &Device, wide: &Device, steps: u64) -> (f64, Vec<f64>) {
     let target = h * a / (h + delta);
     let up = |m: Array2<f64>| fit.upload(m.view()).unwrap();
     let (mut mean, mut log_sd) = (up(Array2::from_elem((1, R), a)), up(Array2::from_elem((1, R), -0.5 * (tokens * (h + delta)).ln())));
-    let (mut momentum, mut curvature, mut power) = (up(Array2::zeros((1, R))), up(Array2::from_elem((1, R), h)), up(Array2::zeros((1, R))));
+    let (mut momentum, mut curvature) = (up(Array2::zeros((1, R))), up(Array2::from_elem((1, R), h)));
     let groups = fit.group_map(&[0; R], (1, R)).unwrap();
     let variance = wide.upload(Array2::from_elem((1, 1), v).view()).unwrap();
     let factor = up(Array2::from_elem((1, R), h.sqrt()));
@@ -341,18 +373,20 @@ fn settled(fit: &Device, wide: &Device, steps: u64) -> (f64, Vec<f64>) {
             let theta = mu[(0, i)] + sd[(0, i)] * f64::from(posterior_normal(11, t, i as u64));
             h * (theta - a) + s * f64::from(posterior_normal(12, t, i as u64))
         });
-        let step = PosteriorStep { gradient_scale: 1.0, factor_scale: 1.0, tokens, beta1: 0.9, beta2: 1.0 - 1.0 / 64.0, weights: PosteriorStep::constant_weights(0.9, t) };
-        let (mut direction, mut sums) = (fit.zeros(1, R).unwrap(), wide.zeros(1, 3).unwrap());
-        fit.posterior_ivon((&mean, &mut log_sd), [&mut momentum, &mut curvature, &mut power], (&up(gradient), &factor), (&groups, &variance), (&mut direction, &mut sums), &step).unwrap();
+        let step = PosteriorStep { gradient_scale: 1.0, factor_scale: 1.0, tokens, beta1: 0.9, beta2: 1.0 - 1.0 / 64.0, weight: PosteriorStep::constant_weight(0.9, t - 1) };
+        let (mut direction, mut sums) = (fit.zeros(1, R).unwrap(), wide.zeros(1, 5).unwrap());
+        let gradient = up(gradient);
+        fit.posterior_ivon((&mean, &mut log_sd), [&mut momentum, &mut curvature], (Some(&gradient), Some(&factor), None), (&groups, &variance), (&mut direction, &mut sums), &step).unwrap();
         mean = up(&mu - &(fit.download(&direction).unwrap() * 0.1));
     }
     (target, averages)
 }
 
-/// The filtered step's fixed point is `F`'s stationary point: averaged over the last 2000 of 4000
-/// steps and over 64 coordinates, `μ` is within six standard errors (of that average over the
-/// coordinates) of `μ* = −6.6`, and the standard error is small enough to tell `μ*` from the
-/// `−4.1` at which filtering the data momentum alone and adding `δ μ` exactly settled.
+/// IVON's step's fixed point is `F`'s stationary point: its direction is linear in the bias-corrected
+/// momentum, whose expectation at `μ*` is zero. Averaged over the last 2000 of 4000 steps and over
+/// 64 coordinates, `μ` is within six standard errors (of that average over the coordinates) of
+/// `μ* = −6.6`, and the standard error is small enough to tell `μ*` from the `−4.1` at which
+/// shrinking the data momentum alone by its measured noise, with `δ μ` added exactly, settled.
 fn settles_at_the_stationary_point(fit: &Device, wide: &Device) {
     let (target, averages) = settled(fit, wide, 4000);
     let n = averages.len() as f64;
@@ -411,59 +445,134 @@ fn a_sample_written_into_a_block_is_the_whole_sample() {
     }
 }
 
-/// The bfloat16 nearest `x` (ties to even), as a float64.
-fn bf16(x: f64) -> f64 {
-    let bits = (x as f32).to_bits();
-    f64::from(f32::from_bits(((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) << 16))
+/// IVON's direction from a constant gradient without noise is its full step with the unfiltered
+/// full gradient: from a zero momentum (`W = 0`) each step's bias-corrected momentum `m / W'` is the
+/// gradient `g`, so `d = (g + δ μ) / (h + δ)` and `s = −½ ln(N (h + δ))` from the first step on,
+/// `h = β₂ᵗ h₀` without a curvature estimate. (A filter of the gradient by its measured spread
+/// made no step before a spread was measured, and shrank every step after.)
+fn constant_gradient_steps_fully(fit: &Device, wide: &Device) {
+    let (rows, cols, tokens, v) = (2, 5, 64.0, 0.5);
+    let delta = 1.0 / (tokens * v);
+    let (mean, gradient, start) = (matrix(rows, cols, 21, 0.5, 0.0), matrix(rows, cols, 22, 2.0, 0.0), matrix(rows, cols, 23, 0.25, 0.5));
+    let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
+    let (mu, mut log_sd) = (up(&mean), up(&Array2::from_elem((rows, cols), -1.0)));
+    let (mut momentum, mut curvature, g) = (fit.zeros(rows, cols).unwrap(), up(&start), up(&gradient));
+    let groups = fit.group_map(&vec![0; rows * cols], (rows, cols)).unwrap();
+    let variance = wide.upload(Array2::from_elem((1, 1), v).view()).unwrap();
+    let (beta1, beta2) = (0.9, 0.75);
+    let mut weight = 0.0;
+    for t in 1..=4 {
+        let step = PosteriorStep { gradient_scale: 1.0, factor_scale: 1.0, tokens, beta1, beta2, weight };
+        let (mut direction, mut sums) = (fit.zeros(rows, cols).unwrap(), wide.zeros(1, 5).unwrap());
+        fit.posterior_ivon((&mu, &mut log_sd), [&mut momentum, &mut curvature], (Some(&g), None, None), (&groups, &variance), (&mut direction, &mut sums), &step).unwrap();
+        weight = step.correction();
+        let h = start.mapv(|h0| beta2.powi(t) * h0);
+        let expected = Array2::from_shape_fn((rows, cols), |at| (gradient[at] + delta * mean[at]) / (h[at] + delta));
+        close(&format!("{} step {t}'s direction", fit.name()), &fit.download(&direction).unwrap(), &expected, CHAIN);
+        close(&format!("{} step {t}'s log sd", fit.name()), &fit.download(&log_sd).unwrap(), &h.mapv(|h| -0.5 * (tokens * (h + delta)).ln()), CHAIN);
+    }
 }
 
-/// On CUDA, f32 masters with a bfloat16 momentum (and a bfloat16 gradient, and a bfloat16 sample):
-/// the stored momentum is the f32 step's value rounded once, and the masters, the f32 curvature and
-/// the group sums are the f32 step's.
 #[test]
-fn cuda_bfloat16_momentum_is_the_f32_step_rounded() {
-    let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
-    let fit = wide.with_storage(Storage::F32).expect("CUDA holds f32");
-    let half = wide.with_storage(Storage::Bf16).expect("CUDA holds bfloat16");
-    for axis in AXES {
-        bfloat16_momentum(&fit, &half, &wide, case(axis));
+fn a_constant_gradient_moves_the_mean_by_ivon_s_full_step() {
+    let host = Device::host();
+    constant_gradient_steps_fully(&host, &host);
+    if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
+        constant_gradient_steps_fully(&wide.with_storage(Storage::F32).expect("CUDA holds f32"), &wide);
+        constant_gradient_steps_fully(&wide, &wide);
+    }
+    if cfg!(target_os = "macos")
+        && let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault")
+    {
+        constant_gradient_steps_fully(&metal, &metal);
     }
 }
 
-fn bfloat16_momentum(fit: &Device, half: &Device, wide: &Device, mut c: Case) {
-    // Inputs a bfloat16 holds exactly, so both steps start from the same values.
-    for m in &mut c.moments {
-        m.mapv_inplace(bf16);
+/// A prior curvature input joins the curvature's average, of either sign, and the deviations and
+/// the direction take its positive part `h⁺`: a curvature pushed below zero keeps the signed
+/// average, and there `σ² = 1 / (N δ) = v`, the prior's.
+fn prior_curvature_takes_its_positive_part(fit: &Device, wide: &Device) {
+    let (rows, cols, tokens, v) = (3, 4, 64.0, 0.5);
+    let delta = 1.0 / (tokens * v);
+    let (mean, gradient, factor) = (matrix(rows, cols, 31, 0.5, 0.0), matrix(rows, cols, 32, 1.0, 0.0), matrix(rows, cols, 33, 1.0, 0.0));
+    let (prior, start) = (matrix(rows, cols, 34, 4.0, 0.0), matrix(rows, cols, 35, 0.25, 0.5));
+    let (beta2, square) = (0.5, 0.5);
+    let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
+    let (mu, mut log_sd) = (up(&mean), up(&Array2::from_elem((rows, cols), -1.0)));
+    let (mut momentum, mut curvature) = (fit.zeros(rows, cols).unwrap(), up(&start));
+    let groups = fit.group_map(&vec![0; rows * cols], (rows, cols)).unwrap();
+    let variance = wide.upload(Array2::from_elem((1, 1), v).view()).unwrap();
+    let step = PosteriorStep { gradient_scale: 1.0, factor_scale: square, tokens, beta1: 0.9, beta2, weight: 0.0 };
+    let (mut direction, mut sums) = (fit.zeros(rows, cols).unwrap(), wide.zeros(1, 5).unwrap());
+    let (g, u, r) = (up(&gradient), up(&factor), up(&prior));
+    fit.posterior_ivon((&mu, &mut log_sd), [&mut momentum, &mut curvature], (Some(&g), Some(&u), Some(&r)), (&groups, &variance), (&mut direction, &mut sums), &step).unwrap();
+    let h = Array2::from_shape_fn((rows, cols), |at| start[at] + (1.0 - beta2) * (square * factor[at] * factor[at] + prior[at] - start[at]));
+    assert!(h.iter().any(|x| *x < -0.1) && h.iter().any(|x| *x > 0.1), "curvatures of both signs");
+    let positive = h.mapv(|x| x.max(0.0));
+    let name = fit.name();
+    close(&format!("{name} signed curvature"), &fit.download(&curvature).unwrap(), &h, CHAIN);
+    close(&format!("{name} log sd"), &fit.download(&log_sd).unwrap(), &positive.mapv(|x| -0.5 * (tokens * (x + delta)).ln()), CHAIN);
+    let expected = Array2::from_shape_fn((rows, cols), |at| (gradient[at] + delta * mean[at]) / (positive[at] + delta));
+    close(&format!("{name} direction"), &fit.download(&direction).unwrap(), &expected, CHAIN);
+    for (x, s) in h.iter().zip(fit.download(&log_sd).unwrap().iter()) {
+        if *x < 0.0 {
+            assert!(((2.0 * s).exp() - v).abs() <= 1e-5 * v, "{name}: σ² {} at a negative curvature, against v = {v}", (2.0 * s).exp());
+        }
     }
-    c.gradient.mapv_inplace(bf16);
-    c.factor.mapv_inplace(bf16);
-    let (theta, mean, log_sd, moments, _, after, _) = run(fit, wide, &c);
-    let up = |d: &Device, m: &Array2<f64>| d.upload(m.view()).expect("upload");
-    let down = |t: &Tensor| fit.download(t).expect("download");
-    for gradient_storage in [fit, half] {
-        let (mut m, mut s) = (up(fit, &c.mean), up(fit, &c.log_sd));
-        let (mut momentum, mut curvature, mut power) = (up(half, &c.moments[0]), up(fit, &c.moments[1]), up(fit, &c.moments[2]));
-        let groups = fit.group_map(&c.groups, c.mean.dim()).expect("groups");
-        let mut sample = half.zeros(c.mean.nrows(), c.mean.ncols()).expect("sample");
-        fit.reparameterize(&mut sample, (&m, &s), c.sample).expect("bfloat16 sample");
-        let mut sums = wide.zeros(c.count, 3).expect("sums");
-        fit.group_moments((&m, &s), &groups, &mut sums).expect("group moments");
-        let (mut variance, mut divergence) = (wide.zeros(c.count, 1).expect("variance"), wide.zeros(c.count, 2).expect("divergence"));
-        wide.group_divergence(&mut sums, None, &mut variance, &mut divergence).expect("group divergence");
-        let (gradient, factor) = (up(gradient_storage, &c.gradient), up(gradient_storage, &c.factor));
-        let (mut direction, mut terms) = (fit.zeros(c.mean.nrows(), c.mean.ncols()).expect("direction"), wide.zeros(c.count, 3).expect("terms"));
-        fit.posterior_ivon((&m, &mut s), [&mut momentum, &mut curvature, &mut power], (&gradient, &factor), (&groups, &variance), (&mut direction, &mut terms), &c.step).expect("bfloat16 step");
-        let mut average = fit.zeros(c.mean.nrows(), c.mean.ncols()).expect("average");
-        fit.posterior_finish((&mut m, &direction, 1.0), (&mut average, 1.0), &s, &groups, &mut sums).expect("finish");
-        close("bfloat16 sample", &down(&sample), &theta.mapv(bf16), 2f64.powi(-8));
-        close("mean", &down(&m), &mean, CHAIN);
-        close("log sd", &down(&s), &log_sd, CHAIN);
-        close("bfloat16 momentum", &down(&momentum), &moments[0].mapv(bf16), 2f64.powi(-8));
-        close("curvature", &down(&curvature), &moments[1], CHAIN);
-        close("gradient second moment", &down(&power), &moments[2], CHAIN);
-        close("sums after", &wide.download(&sums).expect("sums"), &after, CHAIN);
-        // A bfloat16 copy widens back to the values it holds.
-        assert_eq!(down(&fit.convert(&momentum).expect("widen")), down(&momentum));
+}
+
+#[test]
+fn a_prior_curvature_joins_the_average_and_sigma_takes_its_positive_part() {
+    let host = Device::host();
+    prior_curvature_takes_its_positive_part(&host, &host);
+    if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
+        prior_curvature_takes_its_positive_part(&wide.with_storage(Storage::F32).expect("CUDA holds f32"), &wide);
+        prior_curvature_takes_its_positive_part(&wide, &wide);
+    }
+    if cfg!(target_os = "macos")
+        && let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault")
+    {
+        prior_curvature_takes_its_positive_part(&metal, &metal);
+    }
+}
+
+/// An absent gradient, factor or prior curvature steps as a zero one, bit for bit: the momentum
+/// still decays and the curvature still averages toward the estimates present.
+fn absent_inputs_are_zero(fit: &Device, wide: &Device) {
+    let c = case(GroupAxis::Entries);
+    let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
+    let step_with = |inputs: [Option<&Array2<f64>>; 3]| -> Vec<Array2<f64>> {
+        let groups = fit.group_map(&c.groups, c.mean.dim()).unwrap();
+        let (mean, mut log_sd) = (up(&c.mean), up(&c.log_sd));
+        let (mut momentum, mut curvature) = (up(&c.moments[0]), up(&c.moments[1]));
+        let variance = wide.upload_vec(c.count, 1, (0..c.count).map(|g| 0.01 * (g + 1) as f64).collect()).unwrap();
+        let [gradient, factor, prior] = inputs.map(|a| a.map(up));
+        let (mut direction, mut terms) = (fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap(), wide.zeros(c.count, 5).unwrap());
+        fit.posterior_ivon((&mean, &mut log_sd), [&mut momentum, &mut curvature], (gradient.as_ref(), factor.as_ref(), prior.as_ref()), (&groups, &variance), (&mut direction, &mut terms), &c.step).unwrap();
+        vec![fit.download(&direction).unwrap(), fit.download(&log_sd).unwrap(), fit.download(&momentum).unwrap(), fit.download(&curvature).unwrap(), wide.download(&terms).unwrap()]
+    };
+    let zero = Array2::zeros(c.mean.dim());
+    let given = [&c.gradient, &c.factor, &c.prior];
+    for absent in 0..3 {
+        let with_zero: [Option<&Array2<f64>>; 3] = std::array::from_fn(|k| Some(if k == absent { &zero } else { given[k] }));
+        let without: [Option<&Array2<f64>>; 3] = std::array::from_fn(|k| (k != absent).then_some(given[k]));
+        assert!(step_with(with_zero) == step_with(without), "{}: input {absent} absent", fit.name());
+    }
+    assert!(step_with([Some(&zero); 3]) == step_with([None; 3]), "{}: every input absent", fit.name());
+}
+
+#[test]
+fn an_absent_input_is_a_zero_input() {
+    let host = Device::host();
+    absent_inputs_are_zero(&host, &host);
+    if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
+        absent_inputs_are_zero(&wide.with_storage(Storage::F32).expect("CUDA holds f32"), &wide);
+        absent_inputs_are_zero(&wide, &wide);
+    }
+    if cfg!(target_os = "macos")
+        && let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault")
+    {
+        absent_inputs_are_zero(&metal, &metal);
     }
 }
 
@@ -520,20 +629,20 @@ fn removal_sums_against_host(fit: &Device, wide: &Device) {
 }
 
 /// A step's terms (`posterior_ivon`'s sums) against the group curvatures of its direction on the
-/// same device, for each axis's case, the momentum in `momenta`'s storage and the gradient and the
-/// factor in `gradients`': `d · d`, `u · d` and `Σ h' d²` each bit for bit its group curvature's
-/// column 1 (the same entries in the same order).
-fn step_terms_match_the_curvatures(fit: &Device, (momenta, gradients): (&Device, &Device), wide: &Device) {
+/// same device, for each axis's case: `d · d`, `u · d` and `Σ h⁺ d²` each bit for bit its group
+/// curvature's column 1 (the same entries in the same order; the case's curvature stays positive).
+fn step_terms_match_the_curvatures(fit: &Device, wide: &Device) {
     for axis in AXES {
         let c = case(axis);
-        let up = |d: &Device, a: &Array2<f64>| d.upload(a.view()).unwrap();
+        let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
         let groups = fit.group_map(&c.groups, c.mean.dim()).unwrap();
-        let (mean, mut log_sd) = (up(fit, &c.mean), up(fit, &c.log_sd));
-        let (mut momentum, mut curvature, mut power) = (up(momenta, &c.moments[0]), up(fit, &c.moments[1]), up(fit, &c.moments[2]));
-        let (gradient, factor) = (up(gradients, &c.gradient), up(gradients, &c.factor));
+        let (mean, mut log_sd) = (up(&c.mean), up(&c.log_sd));
+        let (mut momentum, mut curvature) = (up(&c.moments[0]), up(&c.moments[1]));
+        let (gradient, factor, prior) = (up(&c.gradient), up(&c.factor), up(&c.prior));
         let variance = wide.upload_vec(c.count, 1, (0..c.count).map(|g| 0.01 * (g + 1) as f64).collect()).unwrap();
-        let (mut direction, mut sums) = (fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap(), wide.zeros(c.count, 3).unwrap());
-        fit.posterior_ivon((&mean, &mut log_sd), [&mut momentum, &mut curvature, &mut power], (&gradient, &factor), (&groups, &variance), (&mut direction, &mut sums), &c.step).unwrap();
+        let (mut direction, mut sums) = (fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap(), wide.zeros(c.count, 5).unwrap());
+        fit.posterior_ivon((&mean, &mut log_sd), [&mut momentum, &mut curvature], (Some(&gradient), Some(&factor), Some(&prior)), (&groups, &variance), (&mut direction, &mut sums), &c.step).unwrap();
+        assert!(fit.download(&curvature).unwrap().iter().all(|h| *h > 0.0), "{} {axis:?}: a positive curvature", fit.name());
         let mut weighted = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
         fit.hadamard(&mut weighted, &curvature, &direction, false).unwrap();
         let terms = wide.download(&sums).unwrap();
@@ -568,26 +677,40 @@ fn finish_matches_its_parts(fit: &Device, wide: &Device) {
     }
 }
 
+/// On CUDA every entry of a step is in the masters' storage: an f32 posterior's step refuses a
+/// gradient in `other`'s storage (bfloat16).
+fn refuses_another_storage(fit: &Device, other: &Device, wide: &Device) {
+    let c = case(GroupAxis::Rows);
+    let up = |d: &Device, a: &Array2<f64>| d.upload(a.view()).unwrap();
+    let groups = fit.group_map(&c.groups, c.mean.dim()).unwrap();
+    let (mean, mut log_sd) = (up(fit, &c.mean), up(fit, &c.log_sd));
+    let (mut momentum, mut curvature) = (up(fit, &c.moments[0]), up(fit, &c.moments[1]));
+    let variance = wide.upload_vec(c.count, 1, vec![0.5; c.count]).unwrap();
+    let (mut direction, mut sums) = (fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap(), wide.zeros(c.count, 5).unwrap());
+    let gradient = up(other, &c.gradient);
+    let step = fit.posterior_ivon((&mean, &mut log_sd), [&mut momentum, &mut curvature], (Some(&gradient), None, None), (&groups, &variance), (&mut direction, &mut sums), &c.step);
+    assert!(step.is_err(), "a {:?} gradient beside {:?} masters", other.storage(), fit.storage());
+}
+
 #[test]
 fn a_steps_terms_and_finish_are_the_operations_they_replace() {
     let host = Device::host();
-    step_terms_match_the_curvatures(&host, (&host, &host), &host);
+    step_terms_match_the_curvatures(&host, &host);
     finish_matches_its_parts(&host, &host);
     if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
         let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
         let half = wide.with_storage(Storage::Bf16).expect("CUDA holds bfloat16");
-        step_terms_match_the_curvatures(&narrow, (&narrow, &narrow), &wide);
-        step_terms_match_the_curvatures(&narrow, (&half, &narrow), &wide);
-        step_terms_match_the_curvatures(&narrow, (&half, &half), &wide);
-        step_terms_match_the_curvatures(&wide, (&wide, &wide), &wide);
+        step_terms_match_the_curvatures(&narrow, &wide);
+        step_terms_match_the_curvatures(&wide, &wide);
         finish_matches_its_parts(&narrow, &wide);
         finish_matches_its_parts(&wide, &wide);
+        refuses_another_storage(&narrow, &half, &wide);
     }
     // On Linux the single-precision device is CUDA's f32 storage, whose sums are no float64 tensor.
     if cfg!(target_os = "macos")
         && let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault")
     {
-        step_terms_match_the_curvatures(&metal, (&metal, &metal), &metal);
+        step_terms_match_the_curvatures(&metal, &metal);
         finish_matches_its_parts(&metal, &metal);
     }
 }
@@ -637,8 +760,8 @@ fn a_move_toward_is_the_copy_and_axpys_it_replaces() {
 /// order: every group sum, and every entry the kernels write, bit for bit. 600 rows (two full
 /// passes of a block and part of a third) and 22 columns in a shuffled group order (full tiles of
 /// columns not adjacent in group order, and part of one), groups 18 to 21 beyond the count, and
-/// removed entries; the momentum in `momenta`'s storage.
-fn single_columns_match_their_transposes(fit: &Device, momenta: &Device, wide: &Device) {
+/// removed entries.
+fn single_columns_match_their_transposes(fit: &Device, wide: &Device) {
     let (rows, cols, count) = (600, 22, 18);
     let group = |c: usize| ((c * 7) % cols) as u32;
     let ids: Vec<u32> = (0..rows * cols).map(|i| group(i % cols)).collect();
@@ -650,12 +773,12 @@ fn single_columns_match_their_transposes(fit: &Device, momenta: &Device, wide: &
         mean[(i / cols, i % cols)] = 0.0;
         log_sd[(i / cols, i % cols)] = f64::NEG_INFINITY;
     }
-    let (momentum, curvature, power) = (matrix(rows, cols, 3, 0.1, 0.0), matrix(rows, cols, 4, 0.5, 1.0), matrix(rows, cols, 5, 0.01, 0.02));
-    let (gradient, factor) = (matrix(rows, cols, 7, 3.0, 0.0), matrix(rows, cols, 8, 2.0, 0.0));
-    let both = |d: &Device, a: &Array2<f64>| (d.upload(a.view()).unwrap(), d.upload(a.t().as_standard_layout().view()).unwrap());
+    let (momentum, curvature) = (matrix(rows, cols, 3, 0.1, 0.0), matrix(rows, cols, 4, 0.5, 1.0));
+    let (gradient, factor, prior) = (matrix(rows, cols, 7, 3.0, 0.0), matrix(rows, cols, 8, 2.0, 0.0), matrix(rows, cols, 5, 0.5, 0.0));
+    let both = |a: &Array2<f64>| (fit.upload(a.view()).unwrap(), fit.upload(a.t().as_standard_layout().view()).unwrap());
     let back = |t: &Tensor| fit.download(t).unwrap().t().as_standard_layout().to_owned();
     let pair = |what: &str, (a, b): (&Tensor, &Tensor), d: &Device| assert_eq!(d.download(a).unwrap(), d.download(b).unwrap(), "{} {what}", fit.name());
-    let ((m, mt), (s, st), (u, ut)) = (both(fit, &mean), both(fit, &log_sd), both(fit, &factor));
+    let ((m, mt), (s, st), (u, ut)) = (both(&mean), both(&log_sd), both(&factor));
     let sums = |columns: usize| (wide.zeros(count, columns).unwrap(), wide.zeros(count, columns).unwrap());
     let (mut x, mut y) = sums(3);
     fit.group_moments((&m, &s), &map, &mut x).unwrap();
@@ -665,20 +788,20 @@ fn single_columns_match_their_transposes(fit: &Device, momenta: &Device, wide: &
     fit.group_curvature((&u, &m, &s), &map, &mut x).unwrap();
     fit.group_curvature((&ut, &mt, &st), &map_t, &mut y).unwrap();
     pair("curvature", (&x, &y), wide);
-    let (g, gt) = both(fit, &gradient);
+    let ((g, gt), (r, rt)) = (both(&gradient), both(&prior));
     let variance = wide.upload_vec(count, 1, (0..count).map(|g| 0.01 * (g + 1) as f64).collect()).unwrap();
     let step = case(GroupAxis::Rows).step;
-    let (mut s, mut st) = both(fit, &log_sd);
-    let ((mut p, mut pt), (mut c, mut ct), (mut q, mut qt)) = (both(momenta, &momentum), both(fit, &curvature), both(fit, &power));
+    let (mut s, mut st) = both(&log_sd);
+    let ((mut p, mut pt), (mut c, mut ct)) = (both(&momentum), both(&curvature));
     let (mut d, mut dt) = (fit.zeros(rows, cols).unwrap(), fit.zeros(cols, rows).unwrap());
-    let (mut x, mut y) = sums(3);
-    fit.posterior_ivon((&m, &mut s), [&mut p, &mut c, &mut q], (&g, &u), (&map, &variance), (&mut d, &mut x), &step).unwrap();
-    fit.posterior_ivon((&mt, &mut st), [&mut pt, &mut ct, &mut qt], (&gt, &ut), (&map_t, &variance), (&mut dt, &mut y), &step).unwrap();
+    let (mut x, mut y) = sums(5);
+    fit.posterior_ivon((&m, &mut s), [&mut p, &mut c], (Some(&g), Some(&u), Some(&r)), (&map, &variance), (&mut d, &mut x), &step).unwrap();
+    fit.posterior_ivon((&mt, &mut st), [&mut pt, &mut ct], (Some(&gt), Some(&ut), Some(&rt)), (&map_t, &variance), (&mut dt, &mut y), &step).unwrap();
     pair("step terms", (&x, &y), wide);
-    for (what, a, b) in [("direction", &d, &dt), ("log sd", &s, &st), ("momentum", &p, &pt), ("curvature", &c, &ct), ("power", &q, &qt)] {
+    for (what, a, b) in [("direction", &d, &dt), ("log sd", &s, &st), ("momentum", &p, &pt), ("curvature", &c, &ct)] {
         assert_eq!(fit.download(a).unwrap(), back(b), "{} stepped {what}", fit.name());
     }
-    let ((mut m, mut mt), (mut a, mut at)) = (both(fit, &mean), both(fit, &momentum));
+    let ((mut m, mut mt), (mut a, mut at)) = (both(&mean), both(&momentum));
     let (mut x, mut y) = sums(3);
     fit.posterior_finish((&mut m, &d, 0.375), (&mut a, 0.0625), &s, &map, &mut x).unwrap();
     fit.posterior_finish((&mut mt, &dt, 0.375), (&mut at, 0.0625), &st, &map_t, &mut y).unwrap();
@@ -692,10 +815,8 @@ fn single_columns_match_their_transposes(fit: &Device, momenta: &Device, wide: &
 fn cuda_single_column_groups_reduce_as_their_transposes() {
     let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
     let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
-    let half = wide.with_storage(Storage::Bf16).expect("CUDA holds bfloat16");
-    single_columns_match_their_transposes(&narrow, &narrow, &wide);
-    single_columns_match_their_transposes(&narrow, &half, &wide);
-    single_columns_match_their_transposes(&wide, &wide, &wide);
+    single_columns_match_their_transposes(&narrow, &wide);
+    single_columns_match_their_transposes(&wide, &wide);
 }
 
 /// Samples gathered and run together ([`Device::run_samples`]) against each written by its own

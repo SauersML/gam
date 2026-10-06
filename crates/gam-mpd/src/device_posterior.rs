@@ -1,6 +1,5 @@
 //! The library fit's posterior resident on the device (#2951): the means `μ`, log standard
-//! deviations `s`, the gradient's momentum, the curvature estimate and the gradient's second
-//! moment (which measures the momentum's noise, [`Device::posterior_ivon`]) of every trainable operator
+//! deviations `s`, the gradient's momentum and the curvature estimate of every trainable operator
 //! stay on the device from step to step, so a step moves no parameter between host and device.
 //!
 //! A step writes the weight sample `θ = μ + exp(s) ε` into the explanation's program
@@ -10,10 +9,11 @@
 //! pass left on the device and a draw of the Gauss–Newton factor (`interchange::Factor`, a second
 //! reverse pass from the Fisher probe at the explanation's own predictions), which also sums each
 //! prior group's new moments; the groups' variances and divergences follow from those sums
-//! ([`Device::group_divergence`]). The posterior, the curvature and the gradient's second moment are held in the fitting storage
-//! (f32 on CUDA and the Apple GPU, float64 on the host); the momentum in bfloat16 where the masters
-//! are f32 on CUDA (rounded once as it is stored, its update computed in f32), else in the fitting
-//! storage; the group sums in float64 where the backend holds it (CUDA, the host). The objective is
+//! ([`Device::group_divergence`]). The posterior, the momentum and the curvature are held in the
+//! fitting storage (f32 on CUDA and the Apple GPU, float64 on the host). A step moves the momentum
+//! by `(1 − β₁)(g − m)`, about 1% of its scale at `β₁ = 0.99`, where bfloat16's spacing is 2⁻⁸ (0.4%)
+//! of a value: a bfloat16 momentum's rounding would be the size of its update. The group sums are in
+//! float64 where the backend holds it (CUDA, the host). The objective is
 //! `library_mdl`'s (module note there): `KL(q_G ‖ p_G)` at the group's prior variance `v_G`, the
 //! minimizer of the divergence plus the code of its scale against the group's reference variance
 //! ([`Device::group_divergence`]), whose prior precision per token `1 / (N v_G)` is IVON's weight
@@ -42,10 +42,11 @@ use std::{borrow::Borrow, collections::BTreeMap};
 /// ([`DevicePosterior::add_removal`]): about 45 MB of sums on vpd4l's 29,184 groups.
 pub const REMOVAL_READS: usize = 64;
 
-/// Draws of the step's curvature ratio averaged before its first move: the relative
-/// standard error of a mean of `K` single-draw ratios is `√(2 / K)`, one half at `K = 8` (and the
-/// chance that the mean is below a tenth of its expectation 0.08%, from 25% at one draw). At
-/// `N = 2^24` (4096 batches per epoch) the eight steps are 0.2% of the first epoch.
+/// Draws of each of the step's ratios (the curvature ratio `ρ̄` and the slopes of `r̄`,
+/// [`DevicePosterior::step`]) averaged before its first move: the relative standard error of a
+/// mean of `K` single-draw ratios is `√(2 / K)`, one half at `K = 8` (and the chance that the mean
+/// is below a tenth of its expectation 0.08%, from 25% at one draw). At `N = 2^24` (4096 batches
+/// per epoch) the eight steps are 0.2% of the first epoch.
 const RATIO_DRAWS: u64 = 8;
 
 fn error(e: impl std::fmt::Display) -> String {
@@ -62,26 +63,16 @@ pub struct Ivon {
     pub beta2: f64,
 }
 
-/// IVON's state a device posterior starts from ([`DevicePosterior::new`]); none: the momentum and
-/// second moment zero and the curvature at which IVON's standard deviations are the posterior's.
+/// IVON's state a device posterior starts from ([`DevicePosterior::new`]); none: the momentum zero
+/// and the curvature at which IVON's standard deviations are the posterior's.
 pub enum State<'a> {
-    /// Per operator the gradient's momentum, the curvature estimate and the gradient's second
-    /// moment (a checkpoint's).
-    Saved(&'a [[Array2<f64>; 3]]),
-    /// The momentum, the curvature and the second moment zero, made on the device: a start whose
-    /// deviations and curvature are then set one operator at a time ([`DevicePosterior::set_start`],
-    /// the Laplace start).
+    /// Per operator the gradient's momentum and the curvature estimate, and the momentum's bias
+    /// correction `W` (`PosteriorStep::weight`; a checkpoint's).
+    Saved { moments: &'a [[Array2<f64>; 2]], weights: &'a [f64] },
+    /// The momentum and the curvature zero, made on the device: a start whose deviations and
+    /// curvature are then set one operator at a time ([`DevicePosterior::set_start`], the Laplace
+    /// start).
     Zero,
-}
-
-impl State<'_> {
-    /// The operators it holds a state for, when it holds one per operator.
-    fn len(&self) -> Option<usize> {
-        match self {
-            Self::Saved(moments) => Some(moments.len()),
-            Self::Zero => None,
-        }
-    }
 }
 
 /// A posterior's host arrays ([`DevicePosterior::from_parts`]), and per group the reference
@@ -112,13 +103,15 @@ pub struct DevicePosterior {
     wide: Device,
     fitting: Device,
     /// Per trainable operator (`Explanation::trainable` order): its id, `μ`, `s`, IVON's state
-    /// (the gradient's momentum, the curvature estimate, the gradient's second moment) and its
-    /// entries' groups (one id per
-    /// row or column where the groups are rows or columns).
+    /// (the gradient's momentum and the curvature estimate), the momentum's bias correction `W`
+    /// (`PosteriorStep::weight`, kept whatever `β₁` each step used; zero for a momentum that holds
+    /// no gradient) and its entries' groups (one id per row or column where the groups are rows or
+    /// columns).
     operators: Vec<usize>,
     mean: Vec<Tensor>,
     log_sd: Vec<Tensor>,
-    moments: Vec<[Tensor; 3]>,
+    moments: Vec<[Tensor; 2]>,
+    weights: Vec<f64>,
     groups: Vec<GroupMap>,
     /// Per operator the posterior's mean `μ̄`, the Polyak average of the iterate `mean` over the
     /// `averaged` steps since the posterior was last set, up to one epoch (module note).
@@ -126,10 +119,14 @@ pub struct DevicePosterior {
     averaged: u64,
     /// The step's length along IVON's direction ([`DevicePosterior::step`]): the epoch's average
     /// `rho` of one Gauss–Newton draw's curvature along `d` over the diagonal model's, over
-    /// `rho_steps` draws; the last step's `η`; and whether the means are held (a pass that sets
-    /// the deviations only, [`DevicePosterior::hold_means`]).
+    /// `rho_steps` draws; the epoch's averages `slope` of the fresh gradient's slope along the
+    /// previous direction and of that direction's own gradient's slope, over `slope_steps` draws;
+    /// the last step's `η`; and whether the means are held (a pass that sets the deviations only,
+    /// [`DevicePosterior::hold_means`]).
     rho: f64,
     rho_steps: u64,
+    slope: (f64, f64),
+    slope_steps: u64,
     last_eta: f64,
     hold: bool,
     /// Per group `(n, Σ μ² + σ², Σ 2s)` being summed, its variance, its divergence in nats with
@@ -142,9 +139,6 @@ pub struct DevicePosterior {
     /// The training tokens `N` (the data term's weight) and the steps taken.
     tokens: f64,
     steps: u64,
-    /// The momentum's weights `(W, W2)` (`PosteriorStep::weights`), kept whatever `β₁` each step
-    /// used.
-    momentum_weights: (f64, f64),
     /// Per operator, the host `μ` and `s` its device values were last set from
     /// ([`DevicePosterior::set_values`]) while no step or restore has changed them since, held as
     /// the posterior's own shared arrays (no copy): a later `set_values` sends only the operators
@@ -167,6 +161,9 @@ fn membership(explanation: &Explanation, shapes: &[(usize, usize)]) -> Result<Ve
                     if row >= rows || col >= cols {
                         return Err(error(format!("{}: entry ({row}, {col}) outside its operator", group.name)));
                     }
+                    if out[i][row * cols + col] != u32::MAX {
+                        return Err(error(format!("{}: entry ({row}, {col}) of operator {} is in two groups", group.name, cell.operator)));
+                    }
                     out[i][row * cols + col] = g;
                 }
             }
@@ -181,8 +178,8 @@ fn membership(explanation: &Explanation, shapes: &[(usize, usize)]) -> Result<Ve
 impl DevicePosterior {
     /// `posterior` of `explanation` for `tokens` training tokens on `fitting` (the device whose
     /// storage the explanation's program runs in), with IVON's state per operator (`moments`: the
-    /// gradient's momentum, the curvature estimate and the gradient's second moment; when `None`,
-    /// the moments zero and the curvature at which the posterior's standard deviations are IVON's)
+    /// gradient's momentum, the curvature estimate and the momentum's bias correction; when `None`,
+    /// the momentum zero and the curvature at which the posterior's standard deviations are IVON's)
     /// after `steps` steps.
     pub fn new(fitting: &Device, explanation: &Explanation, posterior: &Posterior, tokens: f64, moments: Option<State<'_>>, steps: u64) -> Result<Self, String> {
         let shapes: Vec<(usize, usize)> = posterior.mean.iter().map(|m| m.dim()).collect();
@@ -204,6 +201,8 @@ impl DevicePosterior {
     /// The posterior of the trainable operators `parts.operators` of a program, each entry in group
     /// `parts.groups[i][entry]` (row-major) of `parts.count`, for `tokens` training tokens on
     /// `fitting`, with IVON's state `moments` (see [`DevicePosterior::new`]) after `steps` steps.
+    /// Every mean is finite, every log standard deviation finite or `−∞` (a removed entry), and a
+    /// saved momentum and curvature finite with a finite nonnegative bias correction.
     pub fn from_parts<A: Borrow<Array2<f64>>>(fitting: &Device, parts: &Parts<'_, A>, tokens: f64, moments: Option<State<'_>>, steps: u64) -> Result<Self, String> {
         let wide = match fitting.with_storage(Storage::F64) {
             Ok(wide) => wide,
@@ -211,19 +210,13 @@ impl DevicePosterior {
             Err(e) => return Err(error(e)),
         };
         let master = fitting.clone();
-        // The momentum: bfloat16 beside f32 masters where the backend stores it (CUDA).
-        let narrow = if fitting.storage() == Storage::F32 {
-            match fitting.with_storage(Storage::Bf16) {
-                Ok(narrow) => narrow,
-                Err(GpuError::NoDeviceKernel { .. }) => fitting.clone(),
-                Err(e) => return Err(error(e)),
-            }
-        } else {
-            fitting.clone()
-        };
         let shapes: Vec<(usize, usize)> = parts.mean.iter().map(|m| m.borrow().dim()).collect();
         let sizes_agree = parts.log_sd.iter().map(|s| s.borrow().dim()).eq(shapes.iter().copied()) && parts.groups.iter().map(Vec::len).eq(shapes.iter().map(|(r, c)| r * c));
-        if shapes.len() != parts.operators.len() || !sizes_agree || moments.as_ref().and_then(State::len).is_some_and(|n| n != shapes.len()) {
+        let saved_agree = match &moments {
+            Some(State::Saved { moments: saved, weights }) => saved.len() == shapes.len() && weights.len() == shapes.len() && saved.iter().zip(&shapes).all(|(m, shape)| m.iter().all(|a| a.dim() == *shape)),
+            _ => true,
+        };
+        if shapes.len() != parts.operators.len() || !sizes_agree || !saved_agree {
             return Err(error("one posterior array and group list per trainable operator required"));
         }
         if parts.groups.iter().flatten().any(|g| *g as usize >= parts.count) {
@@ -234,6 +227,20 @@ impl DevicePosterior {
         }
         if !(tokens.is_finite() && tokens > 0.0) {
             return Err(error("positive training tokens required"));
+        }
+        if parts.mean.iter().any(|m| m.borrow().iter().any(|v| !v.is_finite())) {
+            return Err(error("a nonfinite mean"));
+        }
+        if parts.log_sd.iter().any(|s| s.borrow().iter().any(|v| !(v.is_finite() || *v == f64::NEG_INFINITY))) {
+            return Err(error("a log standard deviation neither finite nor −∞ (removed)"));
+        }
+        if let Some(State::Saved { moments: saved, weights }) = &moments {
+            if saved.iter().flatten().any(|a| a.iter().any(|v| !v.is_finite())) {
+                return Err(error("a nonfinite saved momentum or curvature"));
+            }
+            if weights.iter().any(|w| !(w.is_finite() && *w >= 0.0)) {
+                return Err(error("a saved momentum bias correction neither finite nor nonnegative"));
+            }
         }
         // Without a state, the curvature `h = 1 / (N σ²) − δ` at which IVON's standard deviation
         // `1 / √(N (h + δ))` is the posterior's, `δ = 1 / (N v_G)` at each group's variance
@@ -260,15 +267,18 @@ impl DevicePosterior {
             })
         };
         let up = |m: &Array2<f64>| master.upload(m.view()).map_err(error);
-        let moment = |m: &Array2<f64>| narrow.upload(m.view()).map_err(error);
-        let state = |i: usize| -> Result<[Tensor; 3], String> {
+        let state = |i: usize| -> Result<[Tensor; 2], String> {
             let (rows, cols) = shapes[i];
-            let zero = |d: &Device| d.zeros(rows, cols).map_err(error);
+            let zero = || master.zeros(rows, cols).map_err(error);
             Ok(match &moments {
-                Some(State::Saved(m)) => [moment(&m[i][0])?, up(&m[i][1])?, up(&m[i][2])?],
-                Some(State::Zero) => [zero(&narrow)?, zero(&master)?, zero(&master)?],
-                None => [zero(&narrow)?, up(&start(parts.log_sd[i].borrow(), &parts.groups[i]))?, zero(&master)?],
+                Some(State::Saved { moments: saved, .. }) => [up(&saved[i][0])?, up(&saved[i][1])?],
+                Some(State::Zero) => [zero()?, zero()?],
+                None => [zero()?, up(&start(parts.log_sd[i].borrow(), &parts.groups[i]))?],
             })
+        };
+        let weights = match &moments {
+            Some(State::Saved { weights, .. }) => weights.to_vec(),
+            _ => vec![0.0; shapes.len()],
         };
         let mut out = Self {
             sums: wide.zeros(parts.count, 3).map_err(error)?,
@@ -278,11 +288,14 @@ impl DevicePosterior {
             mean: parts.mean.iter().map(|m| up(m.borrow())).collect::<Result<_, _>>()?,
             log_sd: parts.log_sd.iter().map(|s| up(s.borrow())).collect::<Result<_, _>>()?,
             moments: (0..shapes.len()).map(state).collect::<Result<_, String>>()?,
+            weights,
             groups: parts.groups.iter().zip(&shapes).map(|(ids, shape)| master.group_map(ids, *shape).map_err(error)).collect::<Result<_, _>>()?,
             average: Vec::new(),
             averaged: 0,
             rho: 1.0,
             rho_steps: 0,
+            slope: (0.0, 0.0),
+            slope_steps: 0,
             last_eta: 0.0,
             hold: false,
             operators: parts.operators.to_vec(),
@@ -290,9 +303,6 @@ impl DevicePosterior {
             wide,
             tokens,
             steps,
-            // A posterior resumed after `steps` steps of the fixed `β₁ = 0.9` fits used before the
-            // rule (`library_mdl::momentum_decay`).
-            momentum_weights: PosteriorStep::constant_weights(0.9, steps),
             uploaded: Vec::new(),
         };
         out.average = out.mean.iter().map(|m| out.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
@@ -327,10 +337,16 @@ impl DevicePosterior {
         self.hold = hold;
     }
 
-    /// The last step's `η` and the curvature ratio's average `ρ̄` with its draws.
+    /// The last step's `η`, the curvature ratio's average `ρ̄` with its draws, and the slope ratio
+    /// `r̄` ([`DevicePosterior::step`]).
     #[must_use]
-    pub fn step_state(&self) -> (f64, f64, u64) {
-        (self.last_eta, self.rho, self.rho_steps)
+    pub fn step_state(&self) -> (f64, f64, u64, f64) {
+        (self.last_eta, self.rho, self.rho_steps, self.slope_ratio())
+    }
+
+    /// The ratio `r̄` of the averaged fresh slope to the averaged own slope (zero before a draw).
+    fn slope_ratio(&self) -> f64 {
+        if self.slope.1 > 0.0 { self.slope.0 / self.slope.1 } else { 0.0 }
     }
 
     /// The steps taken.
@@ -339,16 +355,10 @@ impl DevicePosterior {
         self.steps
     }
 
-    /// The momentum's weights `(W, W2)`: its bias correction `W` and effective number of
-    /// gradients `W² / W2`.
+    /// Per trainable operator its momentum's bias correction `W` (`PosteriorStep::weight`).
     #[must_use]
-    pub fn momentum_weights(&self) -> (f64, f64) {
-        self.momentum_weights
-    }
-
-    /// The momentum's weights `(W, W2)`, restored from a checkpoint with IVON's state.
-    pub fn set_momentum_weights(&mut self, weights: (f64, f64)) {
-        self.momentum_weights = weights;
+    pub fn momentum_weights(&self) -> &[f64] {
+        &self.weights
     }
 
     /// Writes the posterior means into `program`'s trainable operators (rounded to its storage).
@@ -358,17 +368,13 @@ impl DevicePosterior {
         Ok((i, &self.average[i], &self.log_sd[i]))
     }
 
-    /// Trainable operator `op`'s weight sample of `key` (the draws [`DevicePosterior::sample_into`]
-    /// writes) into the block of `out` at `(row, col)`, a stacked operand such as a fused group's:
-    /// written in place, no copy of the operator ([`Device::reparameterize_block`]).
-    pub fn sample_block(&self, op: usize, out: &mut Tensor, at: (usize, usize), key: u64) -> Result<(), String> {
-        self.block_of(op, out, at, key, &self.average)
-    }
-
-    /// [`DevicePosterior::sample_block`] around `means` (the posterior's `μ̄` or the iterate).
-    fn block_of(&self, op: usize, out: &mut Tensor, at: (usize, usize), key: u64, means: &[Tensor]) -> Result<(), String> {
+    /// Trainable operator `op`'s weight sample of `key` as a training step draws it (around the
+    /// iterate: the draws [`DevicePosterior::iterate_into`] writes) into the block of `out` at
+    /// `(row, col)`, a stacked operand such as a fused group's: written in place, no copy of the
+    /// operator ([`Device::reparameterize_block`]).
+    pub fn iterate_block(&self, op: usize, out: &mut Tensor, at: (usize, usize), key: u64) -> Result<(), String> {
         let (i, _, log_sd) = self.entries(op)?;
-        self.fitting.reparameterize_block(out, at, (&means[i], log_sd), (key, i as u64)).map_err(error)
+        self.fitting.reparameterize_block(out, at, (&self.mean[i], log_sd), (key, i as u64)).map_err(error)
     }
 
     /// Writes the posterior means into `program`'s trainable operators and their stacks.
@@ -450,51 +456,58 @@ impl DevicePosterior {
     }
 
     /// One IVON step: `gradients` holds per trainable operator (by id) the gradient of the batch's
-    /// data term at the sample, which `scale` turns into an unbiased estimate of the collection's
-    /// gradient per token in nats (`B / N` for one of `B` batches of a collection of `N` scored
-    /// tokens, times the conversion from bits); `factor` holds per operator a draw of the
-    /// Gauss–Newton factor and the factor (`B / N`) turning its square into the curvature estimate
-    /// per token. An operator the batch does not reach has neither, and its step takes the
-    /// prior's alone.
-    pub fn step(&mut self, gradients: &BTreeMap<usize, Tensor>, scale: f64, factor: (&BTreeMap<usize, Tensor>, f64), ivon: &Ivon) -> Result<(), String> {
+    /// data term at the sample (with a prior term's, `library_mdl::PriorTerm`), which `scale` turns
+    /// into an unbiased estimate of the collection's gradient per token in nats (`B / N` for one of
+    /// `B` batches of a collection of `N` scored tokens, times the conversion from bits); `factor`
+    /// holds per operator a draw of the Gauss–Newton factor and the factor (`B / N`) turning its
+    /// square into the curvature estimate per token; `prior` holds per operator an estimate of a
+    /// prior term's diagonal curvature per token, of either sign
+    /// ([`DevicePosterior::stein_curvature`]). An operator absent from a map has none of it (zero,
+    /// nothing allocated): an operator the batch does not reach takes the prior's step alone.
+    ///
+    /// The step's length along IVON's direction `d = G / (h⁺ + δ)` ([`Device::posterior_ivon`]) is
+    /// the minimum along `d` of `F`'s Gauss–Newton model, the slope along `d` over the curvature
+    /// along it: `η = r̄ Σ (h⁺ + δ) d² / (ρ̄ Σ h⁺ d² + Σ δ d²)`. The data curvature along `d` is
+    /// `ρ̄ Σ h⁺ d²`: `ρ̄` the average over the steps (uniform, then over about one epoch,
+    /// `w = max(1/t, 1 − β₂)`) of one draw's `c (u · d)² / Σ h⁺ d²` (`u` the step's Gauss–Newton
+    /// factor, `c` the factor turning its square into curvature per token: `E[c (u · d)²] = dᵀ G d`,
+    /// with the entries' joint terms the diagonal `h` omits). The step's own slope
+    /// `G · d = Σ (h⁺ + δ) d²` is its gradient along the direction made from it: `G` carries the
+    /// momentum's noise, and that projection counts the noise's energy as descent. `r̄` makes the
+    /// slope unbiased. With `d₀` the direction before the step (from the momentum and the curvature
+    /// before their updates, at the current mean and prior), the batch's gradient `g + δ μ` is
+    /// drawn after `d₀` is fixed, so `(g + δ μ) · d₀` is an unbiased estimate of `F`'s slope along
+    /// `d₀`, while `Σ (h₀⁺ + δ) d₀²` is the slope the gradient `d₀` was made from gives; `r̄` is the
+    /// ratio of their averages over the steps (weights `w` as `ρ̄`'s), and `r̄ G · d` estimates the
+    /// slope along `d`. `r̄` is not clamped: a negative `r̄` puts the model's minimum along `d`
+    /// behind the iterate. The independence of `g` from `d₀` holds up to the batch's own gradient
+    /// of the previous epoch (each epoch repeats a batch's experiments and weight noise), which
+    /// `d₀`'s momentum holds with weight `β₁^B` over an epoch of `B` batches: negligible once
+    /// `B ≫ 1 / (1 − β₁)`. One draw of either ratio is a single χ²₁-like sample whatever the
+    /// batch's tokens; the epoch's averages are what the step uses, and the iterate stays until
+    /// `RATIO_DRAWS` draws of each are averaged. Measured before `r̄`, with the gradient filtered
+    /// by its measured noise, at 2^24 a step measured on the next batch instead (one batch's noisy
+    /// measurement, three forward passes) reached held-out F 2.230, 2.154, 2.100 after epochs 1–3
+    /// against the `ρ̄` rule's 2.202, 2.096, 2.015 at two thirds of the time; on the one-block case
+    /// at equal tokens it ended at 2.633 against 2.866 bits per token but took 2.6 times the time.
+    pub fn step(&mut self, gradients: &BTreeMap<usize, Tensor>, scale: f64, factor: (&BTreeMap<usize, Tensor>, f64), prior: &BTreeMap<usize, Tensor>, ivon: &Ivon) -> Result<(), String> {
         self.uploaded.clear();
         self.steps += 1;
-        self.momentum_weights = PosteriorStep::weights_after(self.momentum_weights, ivon.beta1);
         // The kernel leaves the iterate and writes IVON's full step from it as the direction.
-        let mut sums = self.wide.zeros(self.group_count(), 3).map_err(error)?;
+        let mut sums = self.wide.zeros(self.group_count(), 5).map_err(error)?;
         let mut directions = Vec::with_capacity(self.mean.len());
         for (i, &op) in self.operators.iter().enumerate() {
-            let zero = |given: Option<&Tensor>| -> Result<Option<Tensor>, String> {
-                match given {
-                    Some(_) => Ok(None),
-                    None => self.fitting.zeros(self.mean[i].rows(), self.mean[i].cols()).map(Some).map_err(error),
-                }
-            };
-            let (missing_gradient, missing_factor) = (zero(gradients.get(&op))?, zero(factor.0.get(&op))?);
-            let gradient = gradients.get(&op).or(missing_gradient.as_ref()).ok_or_else(|| error("no gradient"))?;
-            let draw = factor.0.get(&op).or(missing_factor.as_ref()).ok_or_else(|| error("no Gauss–Newton factor"))?;
-            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, beta1: ivon.beta1, beta2: ivon.beta2, weights: self.momentum_weights };
-            let [momentum, curvature, power] = &mut self.moments[i];
+            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, beta1: ivon.beta1, beta2: ivon.beta2, weight: self.weights[i] };
+            let [momentum, curvature] = &mut self.moments[i];
             let mut direction = self.fitting.empty(self.mean[i].rows(), self.mean[i].cols()).map_err(error)?;
+            let inputs = (gradients.get(&op), factor.0.get(&op), prior.get(&op));
             self.fitting
-                .posterior_ivon((&self.mean[i], &mut self.log_sd[i]), [momentum, curvature, power], (gradient, draw), (&self.groups[i], &self.variance), (&mut direction, &mut sums), &step)
+                .posterior_ivon((&self.mean[i], &mut self.log_sd[i]), [momentum, curvature], inputs, (&self.groups[i], &self.variance), (&mut direction, &mut sums), &step)
                 .map_err(error)?;
+            self.weights[i] = step.correction();
             directions.push(direction);
         }
         {
-            // The step's length along `d`: the minimum along `d` of `F`'s Gauss–Newton model,
-            // `η = (Σ h d² + Σ δ d²) / (ρ̄ Σ h d² + Σ δ d²)` (the filtered gradient's slope
-            // `ĝ · d = Σ (h + δ) d²` over the curvature along `d`), with the data curvature
-            // `ρ̄ Σ h d²`: `ρ̄` the average over the steps (uniform, then over about one epoch,
-            // `w = max(1/t, 1 − β₂)`) of one draw's `c (u · d)² / Σ h d²` (`u` the step's
-            // sampled-label factor, `c` the factor turning its square into curvature per token:
-            // `E[c (u · d)²] = dᵀ G d`, with the entries' joint terms the diagonal `h` omits). One
-            // draw is a single χ²₁-like sample whatever the batch's tokens; the epoch's average is
-            // what the step uses, and the iterate stays until `RATIO_DRAWS` draws are averaged. At
-            // 2^24 a step measured on the next batch instead (one batch's noisy measurement, three
-            // forward passes) reached held-out F 2.230, 2.154, 2.100 after epochs 1–3 against this
-            // rule's 2.202, 2.096, 2.015 at two thirds of the time; on the one-block case at equal
-            // tokens it ended at 2.633 against 2.866 bits per token but took 2.6 times the time.
             let variances = self.variances()?;
             let terms = self.wide.download(&sums).map_err(error)?;
             let column = |k: usize| terms.column(k).to_vec();
@@ -504,13 +517,21 @@ impl DevicePosterior {
             let draw_curvature = factor.1 * along_u * along_u;
             let diagonal: f64 = column(2).iter().sum();
             let prior_curvature = weighted(column(0));
+            let (fresh, own): (f64, f64) = (column(3).iter().sum(), column(4).iter().sum());
             if diagonal > 0.0 {
                 self.rho_steps += 1;
                 let w = (1.0 / self.rho_steps as f64).max(1.0 - ivon.beta2);
                 self.rho += w * (draw_curvature / diagonal - self.rho);
             }
-            let (slope, curvature) = (diagonal + prior_curvature, self.rho * diagonal + prior_curvature);
-            let eta = if self.hold || self.rho_steps < RATIO_DRAWS || !(curvature > 0.0 && slope.is_finite()) { 0.0 } else { slope / curvature };
+            if own > 0.0 && own.is_finite() && fresh.is_finite() {
+                self.slope_steps += 1;
+                let w = (1.0 / self.slope_steps as f64).max(1.0 - ivon.beta2);
+                self.slope.0 += w * (fresh - self.slope.0);
+                self.slope.1 += w * (own - self.slope.1);
+            }
+            let (slope, curvature) = (self.slope_ratio() * (diagonal + prior_curvature), self.rho * diagonal + prior_curvature);
+            let held = self.hold || self.rho_steps < RATIO_DRAWS || self.slope_steps < RATIO_DRAWS;
+            let eta = if held || !(curvature > 0.0 && slope.is_finite()) { 0.0 } else { slope / curvature };
             self.last_eta = eta;
             // The mean moved by `η d`, its Polyak average (uniform over the steps since the posterior
             // was set, then over about one epoch; module note) moved toward it, and the groups'
@@ -613,10 +634,10 @@ impl DevicePosterior {
 
     /// The posterior's means and log standard deviations into `posterior`, and IVON's state per
     /// operator.
-    pub fn download(&self, posterior: &mut Posterior) -> Result<Vec<[Array2<f64>; 3]>, String> {
+    pub fn download(&self, posterior: &mut Posterior) -> Result<Vec<[Array2<f64>; 2]>, String> {
         self.values_into(posterior)?;
         let down = |t: &Tensor| self.fitting.download(t).map_err(error);
-        self.moments.iter().map(|m| Ok([down(&m[0])?, down(&m[1])?, down(&m[2])?])).collect()
+        self.moments.iter().map(|m| Ok([down(&m[0])?, down(&m[1])?])).collect()
     }
 
     /// The posterior's means and log standard deviations into `posterior`; IVON's state stays on
@@ -629,10 +650,12 @@ impl DevicePosterior {
         Ok(())
     }
 
-    /// `posterior`'s means and log standard deviations onto the device, IVON's state kept, and
-    /// the groups' variances and divergences with them (after a removal on the host, whose removed
-    /// entries, `μ = 0` and `s = −∞`, every later step leaves alone). An operator whose values
-    /// are bit for bit those it was last set from, with no step since, is not sent again.
+    /// `posterior`'s means and log standard deviations onto the device, and the groups' variances
+    /// and divergences with them (after a removal on the host, whose removed entries, `μ = 0` and
+    /// `s = −∞`, every later step leaves alone). An operator whose values are bit for bit those it
+    /// was last set from, with no step since, is not sent again and keeps IVON's state. An operator
+    /// sent keeps its curvature, and its momentum and the momentum's bias correction are zeroed:
+    /// the momentum's gradients were taken at another point.
     pub fn set_values(&mut self, posterior: &Posterior) -> Result<(), String> {
         if posterior.mean.len() != self.mean.len() {
             return Err(error("one posterior array per trainable operator required"));
@@ -642,8 +665,11 @@ impl DevicePosterior {
             if self.uploaded[i].as_ref().is_some_and(|(m, s)| m.same(&posterior.mean[i]) && s.same(&posterior.log_sd[i])) {
                 continue;
             }
+            let (rows, cols) = posterior.mean[i].dim();
             self.mean[i] = self.fitting.upload(posterior.mean[i].view()).map_err(error)?;
             self.log_sd[i] = self.fitting.upload(posterior.log_sd[i].view()).map_err(error)?;
+            self.moments[i][0] = self.fitting.zeros(rows, cols).map_err(error)?;
+            self.weights[i] = 0.0;
             self.uploaded[i] = Some((posterior.mean[i].clone(), posterior.log_sd[i].clone()));
         }
         self.restart()
@@ -655,13 +681,13 @@ impl DevicePosterior {
     }
 
     /// The storage of the means, the log standard deviations, the gradient's momentum, the
-    /// curvature estimate and the gradient's second moment (every operator's alike), in which a
-    /// checkpoint keeps them.
+    /// curvature estimate and the iterate (every operator's alike), in which a checkpoint keeps
+    /// them.
     #[must_use]
-    pub fn storages(&self) -> [Storage; 6] {
+    pub fn storages(&self) -> [Storage; 5] {
         match (self.mean.first(), self.log_sd.first(), self.moments.first()) {
-            (Some(mean), Some(log_sd), Some([momentum, curvature, power])) => [mean.storage(), log_sd.storage(), momentum.storage(), curvature.storage(), power.storage(), mean.storage()],
-            _ => [self.fitting.storage(); 6],
+            (Some(mean), Some(log_sd), Some([momentum, curvature])) => [mean.storage(), log_sd.storage(), momentum.storage(), curvature.storage(), mean.storage()],
+            _ => [self.fitting.storage(); 5],
         }
     }
 
@@ -688,26 +714,53 @@ impl DevicePosterior {
         (self.rho, self.rho_steps) = (rho, steps);
     }
 
+    /// The step's slope averages ([`DevicePosterior::step`]: of the fresh gradient's slope along
+    /// the previous direction and of that direction's own gradient's slope) and the draws they
+    /// average.
+    #[must_use]
+    pub fn line_slope(&self) -> (f64, f64, u64) {
+        (self.slope.0, self.slope.1, self.slope_steps)
+    }
+
+    /// The step's slope averages and their draws, restored from a checkpoint.
+    pub fn set_line_slope(&mut self, (fresh, own, steps): (f64, f64, u64)) {
+        (self.slope, self.slope_steps) = ((fresh, own), steps);
+    }
+
     /// Trainable operator `i`'s state on the host as the device holds it, one operator at a time
     /// (a checkpoint streams them rather than holding every operator's state at once): `μ`, `s`
     /// and IVON's state.
-    pub fn operator(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>, [Array2<f64>; 3]), String> {
+    pub fn operator(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>, [Array2<f64>; 2]), String> {
         let down = |t: &Tensor| self.fitting.download(t).map_err(error);
         let m = self.moments.get(i).ok_or_else(|| error("no such trainable operator"))?;
-        Ok((down(&self.average[i])?, down(&self.log_sd[i])?, [down(&m[0])?, down(&m[1])?, down(&m[2])?]))
+        Ok((down(&self.average[i])?, down(&self.log_sd[i])?, [down(&m[0])?, down(&m[1])?]))
     }
 
-    /// The means as the device holds them, restored exactly from a checkpoint
-    /// ([`DevicePosterior::operator`]).
-    pub fn restore_means(&mut self, held: &[Array2<f64>]) -> Result<(), String> {
-        if held.len() != self.mean.len() || held.iter().zip(&self.mean).any(|(h, m)| h.dim() != (m.rows(), m.cols())) {
-            return Err(error("one mean per trainable operator, of its shape, required"));
+    /// The antithetic Stein estimate of a term's diagonal curvature per token in trainable operator
+    /// `i`, from its gradients `plus` and `minus` (absent: zero) at the weight samples of `key` and
+    /// `key ^ gam_gpu::tensor::ANTITHETIC` as a training step draws them
+    /// ([`DevicePosterior::iterate_into`]: `μ + σ ε` and `μ − σ ε`): `(g⁺ − g⁻) ⊙ ε / (2 σ N)`.
+    /// Gaussian integration by parts gives `E[∂_j R(μ + σ ε) ε_j] = σ_j E[∂²_jj R]` for each of
+    /// the pair, so it is unbiased for `E_q[∂²_jj R] / N`. `ε / σ` is [`Device::reparameterize`] at
+    /// mean zero and log standard deviations `−s` under the same key and stream; at a removed entry
+    /// (`σ = 0`) the estimate is not finite, and [`Device::posterior_ivon`] does not read it.
+    pub fn stein_curvature(&self, i: usize, (plus, minus): (Option<&Tensor>, Option<&Tensor>), key: u64) -> Result<Tensor, String> {
+        let log_sd = self.log_sd.get(i).ok_or_else(|| error("no such trainable operator"))?;
+        let (rows, cols) = (log_sd.rows(), log_sd.cols());
+        let mut negated = self.fitting.zeros(rows, cols).map_err(error)?;
+        self.fitting.axpy(&mut negated, -1.0, log_sd).map_err(error)?;
+        let mut scaled = self.fitting.zeros(rows, cols).map_err(error)?;
+        self.fitting.reparameterize(&mut scaled, (&self.fitting.zeros(rows, cols).map_err(error)?, &negated), (key, i as u64)).map_err(error)?;
+        let half = 0.5 / self.tokens;
+        let mut difference = self.fitting.zeros(rows, cols).map_err(error)?;
+        for (gradient, sign) in [(plus, half), (minus, -half)] {
+            if let Some(gradient) = gradient {
+                self.fitting.axpy(&mut difference, sign, gradient).map_err(error)?;
+            }
         }
-        self.uploaded.clear();
-        for (mean, values) in self.mean.iter_mut().zip(held) {
-            *mean = self.fitting.upload(values.view()).map_err(error)?;
-        }
-        self.restart()
+        let mut out = self.fitting.zeros(rows, cols).map_err(error)?;
+        self.fitting.hadamard(&mut out, &difference, &scaled, false).map_err(error)?;
+        Ok(out)
     }
 
     /// Operator `i`'s deviations `log_sd` (along its rotated axes) and IVON's curvature
@@ -788,7 +841,7 @@ mod tests {
             });
             let gradients = BTreeMap::from([(0, device.upload(gradient.view()).unwrap())]);
             let factors = BTreeMap::from([(0, device.copy(&factor).unwrap())]);
-            posterior.step(&gradients, 1.0, (&factors, 1.0), &ivon).unwrap();
+            posterior.step(&gradients, 1.0, (&factors, 1.0), &BTreeMap::new(), &ivon).unwrap();
             largest = largest.max(posterior.variances().unwrap()[0]);
         }
         let (mean, log_sd) = posterior.values(0).unwrap();
@@ -800,5 +853,102 @@ mod tests {
         assert!(largest <= 1.1 * start, "v_G rose from {start} to {largest}");
         let spread = ((0..R / 2).map(|i| mean[(0, i)] * mean[(0, i)]).sum::<f64>() / (R / 2) as f64).sqrt();
         assert!(spread <= 0.1 * v.sqrt(), "curvature-free μ̄ at rms {spread} against √v_G {}", v.sqrt());
+    }
+
+    /// Two operators in three groups at `N = 1000`, as `Posterior::from_parts` starts them, with
+    /// their entries' groups row-major.
+    fn two_operators() -> (Posterior, Vec<Vec<u32>>) {
+        let mean = vec![Array2::from_shape_fn((2, 3), |(r, c)| 0.1 * (r + 2 * c + 1) as f64), Array2::from_shape_fn((3, 2), |(r, c)| -0.2 * (2 * r + c + 1) as f64)];
+        let membership = vec![Array2::from_elem((2, 3), 0u32), Array2::from_shape_fn((3, 2), |(r, _)| 1 + (r % 2) as u32)];
+        let groups = membership.iter().map(|m| m.iter().copied().collect()).collect();
+        (Posterior::from_parts(mean, membership, vec![1.0; 3], 1000).unwrap(), groups)
+    }
+
+    /// `two_operators` on `device` with IVON's state `state`.
+    fn resident(device: &Device, groups: &[Vec<u32>], (mean, log_sd): (&[Array2<f64>], &[Array2<f64>]), state: Option<State<'_>>) -> Result<DevicePosterior, String> {
+        DevicePosterior::from_parts(device, &Parts { operators: &[4, 9], mean, log_sd, groups, count: 3, reference: None }, 1000.0, state, 0)
+    }
+
+    /// `set_values` sends only the operators whose arrays changed (`Shared::same`) and zeroes
+    /// exactly their momentum and its bias correction, keeping their curvature and every other
+    /// operator's state.
+    #[test]
+    fn setting_one_operator_s_values_zeroes_its_momentum_alone() {
+        let device = Device::host();
+        let (posterior, groups) = two_operators();
+        let arrays = |values: &[Shared]| values.iter().map(|a| (**a).clone()).collect::<Vec<Array2<f64>>>();
+        let mut held = resident(&device, &groups, (&arrays(&posterior.mean), &arrays(&posterior.log_sd)), None).unwrap();
+        held.set_values(&posterior).unwrap();
+        // A momentum in each operator, as steps leave it.
+        for (i, moments) in held.moments.iter_mut().enumerate() {
+            let (rows, cols) = (moments[0].rows(), moments[0].cols());
+            moments[0] = device.upload(Array2::from_elem((rows, cols), 0.5 + i as f64).view()).unwrap();
+        }
+        held.weights = vec![0.25, 0.75];
+        let curvatures: Vec<Array2<f64>> = held.moments.iter().map(|m| device.download(&m[1]).unwrap()).collect();
+        let mut trial = posterior.clone();
+        trial.mean[1][[0, 0]] = 0.3;
+        held.set_values(&trial).unwrap();
+        let momentum = |i: usize| device.download(&held.moments[i][0]).unwrap();
+        assert!(momentum(0).iter().all(|m| *m == 0.5), "operator 0's momentum kept");
+        assert!(momentum(1).iter().all(|m| *m == 0.0), "operator 1's momentum zeroed");
+        assert_eq!(held.momentum_weights(), [0.25, 0.0]);
+        for (i, curvature) in curvatures.iter().enumerate() {
+            assert_eq!(device.download(&held.moments[i][1]).unwrap(), *curvature, "operator {i}'s curvature kept");
+        }
+        assert_eq!(held.iterate(1).unwrap()[[0, 0]], 0.3, "operator 1 sent");
+    }
+
+    /// A nonfinite mean, a log standard deviation of `+∞` or NaN, a nonfinite saved momentum and a
+    /// saved bias correction that is negative or not one per operator are refused; a log standard
+    /// deviation of `−∞` (a removed entry) is not.
+    #[test]
+    fn nonfinite_values_are_refused() {
+        let device = Device::host();
+        let (posterior, groups) = two_operators();
+        let arrays = |values: &[Shared]| values.iter().map(|a| (**a).clone()).collect::<Vec<Array2<f64>>>();
+        let (mean, log_sd) = (arrays(&posterior.mean), arrays(&posterior.log_sd));
+        let with = |arrays: &[Array2<f64>], value: f64| -> Vec<Array2<f64>> {
+            let mut out = arrays.to_vec();
+            out[1][[1, 0]] = value;
+            out
+        };
+        assert!(resident(&device, &groups, (&mean, &with(&log_sd, f64::NEG_INFINITY)), None).is_ok(), "a removed entry");
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(resident(&device, &groups, (&with(&mean, bad), &log_sd), None).is_err(), "a mean {bad}");
+        }
+        for bad in [f64::NAN, f64::INFINITY] {
+            assert!(resident(&device, &groups, (&mean, &with(&log_sd, bad)), None).is_err(), "a log standard deviation {bad}");
+        }
+        let saved: Vec<[Array2<f64>; 2]> = mean.iter().map(|m| [Array2::zeros(m.dim()), Array2::ones(m.dim())]).collect();
+        assert!(resident(&device, &groups, (&mean, &log_sd), Some(State::Saved { moments: &saved, weights: &[0.5, 0.5] })).is_ok());
+        let mut nonfinite = saved.clone();
+        nonfinite[0][0][[0, 0]] = f64::NAN;
+        assert!(resident(&device, &groups, (&mean, &log_sd), Some(State::Saved { moments: &nonfinite, weights: &[0.5, 0.5] })).is_err(), "a nonfinite momentum");
+        assert!(resident(&device, &groups, (&mean, &log_sd), Some(State::Saved { moments: &saved, weights: &[0.5, -1.0] })).is_err(), "a negative bias correction");
+        assert!(resident(&device, &groups, (&mean, &log_sd), Some(State::Saved { moments: &saved, weights: &[0.5] })).is_err(), "one bias correction per operator");
+    }
+
+    /// The antithetic Stein estimate is `(g⁺ − g⁻) ⊙ ε / (2 σ N)` with the draws `ε` of the step's
+    /// key and the operator's stream, an absent gradient zero.
+    #[test]
+    fn the_stein_curvature_is_its_formula() {
+        let device = Device::host();
+        let (posterior, groups) = two_operators();
+        let arrays = |values: &[Shared]| values.iter().map(|a| (**a).clone()).collect::<Vec<Array2<f64>>>();
+        let held = resident(&device, &groups, (&arrays(&posterior.mean), &arrays(&posterior.log_sd)), None).unwrap();
+        let plus = Array2::from_shape_fn((3, 2), |(r, c)| 0.3 * r as f64 - 0.2 * c as f64 + 0.1);
+        let minus = Array2::from_shape_fn((3, 2), |(r, c)| 0.05 * (r * c) as f64 - 0.4);
+        let key = 0x0123_4567_89ab_cdef;
+        let up = |a: &Array2<f64>| device.upload(a.view()).unwrap();
+        let (g_plus, g_minus) = (up(&plus), up(&minus));
+        let both = device.download(&held.stein_curvature(1, (Some(&g_plus), Some(&g_minus)), key).unwrap()).unwrap();
+        let alone = device.download(&held.stein_curvature(1, (Some(&g_plus), None), key).unwrap()).unwrap();
+        for ((r, c), value) in both.indexed_iter() {
+            let scale = f64::from(posterior_normal(key, 1, (2 * r + c) as u64)) / (2.0 * posterior.log_sd[1][[r, c]].exp() * 1000.0);
+            let (expected, bound) = ((plus[[r, c]] - minus[[r, c]]) * scale, 1e-12 * (plus[[r, c]].abs() + minus[[r, c]].abs()) * scale.abs());
+            assert!((value - expected).abs() <= bound, "({r}, {c}): {value} against {expected}");
+            assert!((alone[[r, c]] - plus[[r, c]] * scale).abs() <= 1e-12 * (plus[[r, c]] * scale).abs(), "({r}, {c}) without a twin");
+        }
     }
 }

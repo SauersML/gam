@@ -323,7 +323,7 @@ fn fit(target: &dyn Target, native: &[Array2<f64>], account: &Account, batches: 
             description_sum += description;
             let gradient: BTreeMap<usize, _> = operators.iter().map(|i| Ok((*i, upload(&gradient[*i])?))).collect::<Result<_, String>>()?;
             let factor: BTreeMap<usize, _> = operators.iter().map(|i| Ok((*i, upload(&factor[*i])?))).collect::<Result<_, String>>()?;
-            device.step(&gradient, 1.0 / BATCH as f64, (&factor, 1.0 / BATCH as f64), &ivon)?;
+            device.step(&gradient, 1.0 / BATCH as f64, (&factor, 1.0 / BATCH as f64), &BTreeMap::new(), &ivon)?;
         }
         let converged = previous.as_ref().is_some_and(|before| {
             let differences: Vec<f64> = before.iter().zip(&estimates).map(|(a, b)| a - b).collect();

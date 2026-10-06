@@ -268,7 +268,7 @@ fn main() -> Result<(), String> {
                 }
             };
             timed(&device, s, "description", || Ok(posterior.divergences()?.iter().sum::<f64>()))?;
-            timed(&device, s, "posterior_step", || posterior.step(&gradient, scale, (&factor, 1.0 / factor_tokens as f64), &ivon))?;
+            timed(&device, s, "posterior_step", || posterior.step(&gradient, scale, (&factor, 1.0 / factor_tokens as f64), &BTreeMap::new(), &ivon))?;
             // The step's direction without its measured length (`library_mdl`'s line step).
         }
     }

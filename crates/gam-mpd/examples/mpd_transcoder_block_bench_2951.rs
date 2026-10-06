@@ -206,7 +206,7 @@ fn main() -> Result<(), String> {
             let (_, gradient) = timed(&device, s, "reverse_gradient", || program.vjp_values_dense(&trace, BTreeMap::from([(4, seed(0)?)]), &[], &trainable, reverse))?;
             let (_, factor) = timed(&device, s, "reverse_factor", || program.vjp_values_dense(&trace, BTreeMap::from([(4, seed(5)?)]), &[], &trainable, reverse))?;
             drop(trace);
-            timed(&device, s, "posterior_step", || posterior.step(&gradient, 1.0 / n as f64, (&factor, 1.0 / n as f64), &ivon))?;
+            timed(&device, s, "posterior_step", || posterior.step(&gradient, 1.0 / n as f64, (&factor, 1.0 / n as f64), &BTreeMap::new(), &ivon))?;
         }
         stop.store(true, Ordering::Relaxed);
         sampler.join().map_err(|_| "the memory sampler panicked")?;

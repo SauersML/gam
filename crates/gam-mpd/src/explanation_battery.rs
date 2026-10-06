@@ -1988,7 +1988,7 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
                 let probed = crate::interchange::fisher_probe_seed(&device, trace.value(hidden_node)?, &head, length, probe, arithmetic)?;
                 let (_, factor) = program.vjp_values_dense(&trace, BTreeMap::from([(hidden_node, probed)]), &[], &trainable, arithmetic)?;
                 let per_token = 1.0 / family.rows as f64;
-                posterior.step(&gradients, per_token, (&factor, per_token), &ivon)?;
+                posterior.step(&gradients, per_token, (&factor, per_token), &BTreeMap::new(), &ivon)?;
             }
             out.push((kl, family.rows));
         }
@@ -2060,7 +2060,7 @@ pub fn write_pricing_posterior(path: &Path, posterior: &crate::device_posterior:
     let partial = PathBuf::from(format!("{}.partial", path.display()));
     let mut file = std::io::BufWriter::new(std::fs::File::create(&partial).map_err(error)?);
     for i in 0..operators {
-        let (_, log_sd, [_, curvature, _]) = posterior.operator(i)?;
+        let (_, log_sd, [_, curvature]) = posterior.operator(i)?;
         for array in [&log_sd, &curvature] {
             let bytes: Vec<u8> = array.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect();
             file.write_all(&bytes).map_err(error)?;

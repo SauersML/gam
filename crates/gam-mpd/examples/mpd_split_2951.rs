@@ -165,7 +165,7 @@ fn split_start(base: &Explanation, split: &Explanation, start: &Start, units: &[
             return Err(format!("{}: {:?} against {dim:?}", name(split, i), m.dim()));
         }
     }
-    Ok(Start { mean, log_sd, active, state: None, iterate: None, steps: 0, epoch: start.epoch })
+    Ok(Start { mean, log_sd, active, state: None, epoch: start.epoch })
 }
 
 fn main() -> Result<(), String> {
@@ -246,7 +246,7 @@ fn main() -> Result<(), String> {
     split_explanation.artifact.validate_coverage(&split)?;
     let start = library_mdl::checkpoint_start(&base_explanation, checkpoint)?;
     let split_from = split_start(&base_explanation, &split_explanation, &start, &units, &copies)?;
-    let base_from = Start { state: None, steps: 0, ..start };
+    let base_from = Start { state: None, ..start };
     let mut results = Vec::new();
     for (name, program, explanation, from) in [("base", &native, &base_explanation, base_from), ("split", &split, &split_explanation, split_from)] {
         let dir = out.join(name);
