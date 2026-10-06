@@ -67,19 +67,6 @@ struct Settings {
     /// export's rows outside the held-out ones (as `mpd_library_mdl_2951` takes them).
     #[serde(default)]
     training_sequences: Option<usize>,
-    /// For the count of causally important units per token: the fractions `τ` of `|m(t)|` and the
-    /// target tokens per held-out sequence.
-    #[serde(default)]
-    importance: Option<Importance>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Importance {
-    thresholds: Vec<f64>,
-    targets: usize,
-    /// The faithfulness a per-token circuit must reach; the source rows give the units' means.
-    faithful_level: f64,
 }
 
 #[derive(Deserialize)]
@@ -202,7 +189,7 @@ fn circuits(device: &Device, export: &Path, native: &gam_mpd::operator_program::
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price DECOMPOSITION | importance DECOMPOSITION [ARTIFACT]";
+    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price DECOMPOSITION";
     let (export, settings_path, out, mode, kind, extra, more) = match &args[..] {
         [e, s, o, m, k] => (e, s, o, m, k.as_str(), None, None),
         [e, s, o, m, k, a] => (e, s, o, m, k.as_str(), Some(Path::new(a)), None),
@@ -284,53 +271,6 @@ fn main() -> Result<(), String> {
             progress["pricing"] = state.clone();
             save(&progress)
         })?;
-        report["seconds"] = json!(started.elapsed().as_secs_f64());
-        save(&report)?;
-        log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
-        return Ok(());
-    }
-    if kind == "importance" {
-        let importance = settings.importance.as_ref().ok_or("importance settings required")?;
-        let vpd = Vpd::new(&device, export, Decomposition::load(extra.ok_or(usage)?)?, settings.numeric_bytes)?;
-        let start = library_mdl::explanation(&native, &layers)?.artifact;
-        let library = gam_mpd::library_readout::Library::new(&device, &device, &native, &layers, &start, settings.numeric_bytes, settings.head_tile_rows)?;
-        // The per-token circuits' bases: M's heads and neurons in the library's order, and VPD's
-        // subcomponents, their means over the source rows.
-        let (model, unembedding) = battery::model(export, None)?;
-        let m = Side::of_model(&device, &model, &unembedding, settings.numeric_bytes)?;
-        let none = |_: usize| -> Result<BTreeMap<usize, gam_gpu::tensor::Tensor>, String> { Ok(BTreeMap::new()) };
-        let ones = |rows: usize| -> Result<BTreeMap<usize, gam_gpu::tensor::Tensor>, String> {
-            let mut out = BTreeMap::new();
-            for l in 0..vpd.layers() {
-                out.extend(vpd.given(&device, l, None, rows)?);
-            }
-            Ok(out)
-        };
-        let mut groups = Vec::new();
-        for l in 0..layer_count {
-            for f in library.functions().iter().filter(|f| f.layer == l && matches!(f.kind, gam_mpd::library_readout::Kind::Head)) {
-                let h: usize = f.name.rsplit('H').next().and_then(|h| h.parse().ok()).ok_or("a head name")?;
-                let node = model.layout.head_reads[l][h];
-                groups.push((node, m.program.widths()[node]));
-            }
-            groups.push((model.layout.inputs[battery::KINDS.len() * l + 5], 1));
-        }
-        let model_basis = battery::UnitBasis { side: &m, groups, given: &none, unembedding: &unembedding };
-        let vpd_basis = battery::UnitBasis { side: &vpd.e, groups: vpd.layout.activations.iter().map(|n| (*n, 1)).collect(), given: &ones, unembedding: &unembedding };
-        let (model_means, vpd_means) = (model_basis.means(sources)?, vpd_basis.means(sources)?);
-        let faithful = battery::Faithful { model: (model_basis, model_means), vpd: Some((vpd_basis, vpd_means)), level: importance.faithful_level };
-        report["importance"] = json!({"model_and_vpd": battery::importance_counts(&library, Some(&vpd), bases, importance.targets, &importance.thresholds, settings.seed, Some(&faithful))?});
-        save(&report)?;
-        if let Some(path) = more {
-            let explanation = library_mdl::explanation(&native, &layers)?;
-            let artifact = if path.file_name().is_some_and(|n| n == "checkpoint.bin") {
-                checkpoint_mean(path, &explanation)?.0
-            } else {
-                Artifact::from_bytes(&std::fs::read(path).map_err(error)?, &native.declarations)?
-            };
-            let library = gam_mpd::library_readout::Library::new(&device, &device, &native, &layers, &artifact, settings.numeric_bytes, settings.head_tile_rows)?;
-            report["importance"]["library"] = battery::importance_counts(&library, None, bases, importance.targets, &importance.thresholds, settings.seed, None)?;
-        }
         report["seconds"] = json!(started.elapsed().as_secs_f64());
         save(&report)?;
         log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
