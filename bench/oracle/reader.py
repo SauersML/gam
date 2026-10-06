@@ -20,9 +20,9 @@ the K rotations' distributions mapped back to the options. A reader of a test th
 the documents come first in the prompt, so vLLM's prefix cache shares them across a report's tests.
 
 Backends (one Backend.distributions interface):
-  vllm          a frozen open-weights instruct model on GPUs, offline vllm.LLM, one generated token at
-                temperature 0 with SamplingParams.logprob_token_ids = the K label tokens (exact
-                log-probabilities of those tokens, not a top-n list); thousands of tests per call.
+  vllm          a frozen open-weights instruct model on GPUs, offline vllm.LLM: each label's exact
+                log-probability as the prompt log-probability of the prompt extended by that label (the
+                K extensions share their prefix in vLLM's cache); thousands of tests per call.
   transformers  Hugging Face transformers: on CUDA in bfloat16 when a GPU is present, else on the CPU in
                 float32 (tests on the Mac); last-position logits.
   claude        `claude -p` (headless Claude Code, no tools, no CLAUDE.md or plugins, structured JSON
@@ -220,14 +220,17 @@ class VllmBackend:
         self.encode = ChatEncoder(self.llm.get_tokenizer())
 
     def distributions(self, users: list[str], k: int) -> list[np.ndarray]:
+        # Each label's log-probability after the prompt, read as the last prompt token's log-probability
+        # of the prompt extended by that label (prompt_logprobs, before any sampling processor): exact
+        # on every vLLM release, and the K extensions share their prefix in the cache.
         labels = self.encode.labels(k)
-        params = self.SamplingParams(max_tokens=1, temperature=0.0, seed=self.seed, logprob_token_ids=labels)
-        prompts = [{"prompt_token_ids": self.encode(u)} for u in users]
+        params = self.SamplingParams(max_tokens=1, temperature=0.0, seed=self.seed, prompt_logprobs=0)
+        prompts = [{"prompt_token_ids": self.encode(u) + [t]} for u in users for t in labels]
         outputs = self.llm.generate(prompts, params, use_tqdm=False)
         result = []
-        for o in outputs:
-            first = o.outputs[0].logprobs[0]
-            result.append(_normalize([first[t].logprob for t in labels]))
+        for i in range(len(users)):
+            rows = outputs[i * k : (i + 1) * k]
+            result.append(_normalize([o.prompt_logprobs[-1][t].logprob for o, t in zip(rows, labels)]))
         return result
 
 
