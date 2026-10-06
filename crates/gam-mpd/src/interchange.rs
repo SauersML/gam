@@ -320,11 +320,13 @@ pub fn parts_of(program: &OperatorProgram, layers: usize) -> Result<Vec<Part>, S
     Ok(out)
 }
 
-/// The experiment families of edits ([`Interchange::sample_edits`]): removing a part
-/// (`FACTORS[0]`), and scaling its write by one of the other factors.
+/// The families of patched experiments: a read patch, single or joint ([`sample`]); removing a
+/// part (`FACTORS[0]`); and scaling a part's write by one of the other factors
+/// ([`Interchange::draw_edits`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Family {
+    Read,
     RemovePart,
     AmplifyPart,
 }
@@ -2147,58 +2149,74 @@ impl Interchange {
         Ok(out)
     }
 
-    /// Per base sequence of `batch`, its clean experiment and `per_base` edits of parts, each of a
-    /// family drawn uniformly from `families`, all with `P` alone (or, with `hybrids`, under one
-    /// hybrid per base drawn as [`sample`] draws it): its block uniform over the MLP blocks holding
-    /// parts, its position uniform over the rows after the first (the first is the attention sink,
-    /// where a transcoder block runs `M`'s own MLP), its factor 0 for a removal and uniform over
-    /// the other factors for an amplification, and its part uniform over the parts firing on `M`'s
-    /// read there with one part of the block drawn uniformly added (mostly a silent one: its edit
-    /// tests that the part is silent in `P` where it is in `M`).
-    pub fn sample_edits(&self, rng: &mut impl RngExt, batch: &Batch, families: &[Family], per_base: usize, hybrids: bool) -> Result<Vec<Experiment>, String> {
-        let (blocks, length) = (self.m_sites.entries.len(), batch.length());
+    /// Per slot `(base, family)` of `slots` (a base sequence of `batch`, an edit family), an edit of a
+    /// part and its position: its block uniform over the MLP blocks holding parts, its position
+    /// uniform over the rows after the first (the first is the attention sink, where a transcoder
+    /// block runs `M`'s own MLP), its factor 0 for a removal and uniform over the other factors for
+    /// an amplification, and its part uniform over the parts firing on `M`'s read there with one
+    /// part of the block drawn uniformly added (mostly a silent one: its edit tests that the part
+    /// is silent in `P` where it is in `M`).
+    pub fn draw_edits(&self, rng: &mut impl RngExt, batch: &Batch, slots: &[(usize, Family)]) -> Result<Vec<(Patch, usize)>, String> {
+        let length = batch.length();
         let mut by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (i, p) in self.parts().iter().enumerate() {
             by_block.entry(p.block).or_default().push(i);
         }
         let held: Vec<usize> = by_block.keys().copied().collect();
-        if families.is_empty() || held.is_empty() || length < 2 {
-            return Err(error("edits need families, parts and sequences of two tokens or more"));
+        if held.is_empty() || length < 2 {
+            return Err(error("edits need parts and sequences of two tokens or more"));
         }
-        let mut drawn = Vec::new();
-        let mut wanted = Vec::new();
+        let mut drawn = Vec::with_capacity(slots.len());
+        let mut wanted = Vec::with_capacity(slots.len());
+        for (n, family) in slots {
+            let block = held[rng.random_range(0..held.len())];
+            let position = rng.random_range(1..length);
+            let factor = match family {
+                Family::RemovePart => 0,
+                Family::AmplifyPart => rng.random_range(1..FACTORS.len()),
+                Family::Read => return Err(error("a read patch is not an edit of a part")),
+            };
+            let candidates = &by_block[&block];
+            drawn.push((position, factor, candidates[rng.random_range(0..candidates.len())]));
+            wanted.push((*n, block, position));
+        }
+        let active = self.active_parts(batch, &wanted)?;
+        Ok(drawn
+            .into_iter()
+            .zip(active)
+            .map(|((position, factor, silent), mut candidates)| {
+                if !candidates.contains(&silent) {
+                    candidates.push(silent);
+                }
+                (Patch::Part { part: candidates[rng.random_range(0..candidates.len())], factor }, position)
+            })
+            .collect())
+    }
+
+    /// Per base sequence of `batch`, its clean experiment and `per_base` edits of parts
+    /// ([`Interchange::draw_edits`]), each of a family drawn uniformly from `families`, all with
+    /// `P` alone (or, with `hybrids`, under one hybrid per base drawn as [`sample`] draws it).
+    pub fn sample_edits(&self, rng: &mut impl RngExt, batch: &Batch, families: &[Family], per_base: usize, hybrids: bool) -> Result<Vec<Experiment>, String> {
+        let blocks = self.m_sites.entries.len();
+        if families.is_empty() {
+            return Err(error("edits need families"));
+        }
+        let mut slots = Vec::new();
+        let mut hybrid_of_base = Vec::new();
         for n in 0..batch.base.len() {
-            let explained = if !hybrids || rng.random_range(0..2) == 0 { vec![true; blocks] } else { hybrid(rng, blocks) };
+            hybrid_of_base.push(if !hybrids || rng.random_range(0..2) == 0 { vec![true; blocks] } else { hybrid(rng, blocks) });
             for _ in 0..per_base {
-                let family = families[rng.random_range(0..families.len())];
-                let block = held[rng.random_range(0..held.len())];
-                let position = rng.random_range(1..length);
-                let factor = match family {
-                    Family::RemovePart => 0,
-                    Family::AmplifyPart => rng.random_range(1..FACTORS.len()),
-                };
-                let candidates = &by_block[&block];
-                let silent = candidates[rng.random_range(0..candidates.len())];
-                drawn.push((n, explained.clone(), position, factor, silent));
-                wanted.push((n, block, position));
+                slots.push((n, families[rng.random_range(0..families.len())]));
             }
-            drawn.push((n, explained, 0, usize::MAX, 0));
-            wanted.push((n, 0, 0));
         }
-        let queried: Vec<(usize, usize, usize)> = wanted.iter().zip(&drawn).filter(|(_, d)| d.3 != usize::MAX).map(|(w, _)| *w).collect();
-        let mut active = self.active_parts(batch, &queried)?.into_iter();
-        let mut out = Vec::with_capacity(drawn.len());
-        for (n, explained, position, factor, silent) in drawn {
-            if factor == usize::MAX {
-                out.push(Experiment { base: n, source: n, explained, patch: None, position: 0 });
-                continue;
+        let mut edits = self.draw_edits(rng, batch, &slots)?.into_iter();
+        let mut out = Vec::with_capacity(slots.len() + batch.base.len());
+        for (n, explained) in hybrid_of_base.into_iter().enumerate() {
+            for _ in 0..per_base {
+                let (patch, position) = edits.next().ok_or_else(|| error("an edit not drawn"))?;
+                out.push(Experiment { base: n, source: n, explained: explained.clone(), patch: Some(patch), position });
             }
-            let mut candidates = active.next().ok_or_else(|| error("an edit without its activity"))?;
-            if !candidates.contains(&silent) {
-                candidates.push(silent);
-            }
-            let part = candidates[rng.random_range(0..candidates.len())];
-            out.push(Experiment { base: n, source: n, explained, patch: Some(Patch::Part { part, factor }), position });
+            out.push(Experiment { base: n, source: n, explained, patch: None, position: 0 });
         }
         Ok(out)
     }
