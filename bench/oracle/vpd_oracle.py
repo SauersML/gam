@@ -205,8 +205,12 @@ class Table:
         return int(name.split(".")[1]), name.split(".")[-1], gid - self.offsets[name]
 
     def vectors(self, layer: int, kind: str, c: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Subcomponent c of the table's site: a strided table (vpd_labels.py --edit row) holds every
+        stride-th subcomponent, its numbers in `subcomponents`."""
         name = site_name(layer, kind)
-        return self.uv[f"{name}.V"][:, c], self.uv[f"{name}.U"][c]
+        d = self.sites[(layer, kind)][1] if (layer, kind) in self.sites else {}
+        n = int(d["subcomponents"][c]) if "subcomponents" in d else c
+        return self.uv[f"{name}.V"][:, n], self.uv[f"{name}.U"][n]
 
     def neighbours(self, layer: int, kind: str, c: int) -> list[tuple[int, str, int, float, str]]:
         """Up to 4 upstream and 4 downstream measured neighbours: (layer, kind, index, mean relative
