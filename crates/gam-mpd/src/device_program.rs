@@ -1025,20 +1025,20 @@ impl DeviceProgram {
         self.arithmetic
     }
 
-    /// Run the forward pass's and the head's products in `arithmetic` from now on.
-    /// Every product reads its argument whole, also an exactly-zero one ([`Active`]): the dense
+    /// Every product reads its argument whole, also an exactly-zero one (`Active`): the dense
     /// reference the sparse reads are tested and timed against.
     pub fn read_densely(&mut self) {
         self.exact_zeros.iter_mut().for_each(|z| *z = false);
     }
 
     /// How many columns of `argument` affine node `node` read in the pass that made `trace`
-    /// ([`Active`]); `None` when it read them all.
+    /// (`Active`); `None` when it read them all.
     #[must_use]
     pub fn columns_read(&self, trace: &DeviceTrace, node: usize, argument: usize) -> Option<usize> {
         trace.active.get(&(node, argument)).cloned().flatten().map(|ids| ids.len())
     }
 
+    /// Run the forward pass's and the head's products in `arithmetic` from now on.
     pub fn set_arithmetic(&mut self, arithmetic: Arithmetic) {
         self.arithmetic = arithmetic;
     }
