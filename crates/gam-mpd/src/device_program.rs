@@ -317,6 +317,9 @@ pub struct DeviceTrace {
     positions: Arc<Vec<u32>>,
     /// Per affine node and argument it read sparsely, the argument's columns it read ([`Active`]).
     active: BTreeMap<(usize, usize), Active>,
+    /// Bfloat16 copies of node values the reverse passes' products read ([`DeviceTrace::rounded_value`]),
+    /// kept until [`DeviceTrace::release_rounded`].
+    rounded: Mutex<BTreeMap<usize, Arc<Tensor>>>,
 }
 
 /// The rows of `trace` whose position is one of `positions` (`Step::Select`).
@@ -341,6 +344,32 @@ fn select_rows(d: &Device, rows: &[usize], inside: Option<&Tensor>, outside: &Te
 }
 
 impl DeviceTrace {
+    /// Node `n`'s value as an operand of a reverse product in `arithmetic`: in bfloat16 an f32
+    /// value's copy, rounded on first use and kept until [`DeviceTrace::release_rounded`], so the
+    /// reverse passes of one call (the data term's and the Gauss–Newton factor's) round it once
+    /// (each would otherwise round it again, to the same values); otherwise `None` (the value).
+    fn rounded_value(&self, n: usize, arithmetic: Arithmetic) -> Result<Option<Arc<Tensor>>, String> {
+        let value = self.value(n)?;
+        if arithmetic != Arithmetic::Bf16 || value.storage() != Storage::F32 {
+            return Ok(None);
+        }
+        let mut rounded = self.rounded.lock().map_err(|_| "device: poisoned rounding cache".to_string())?;
+        if let Some(copy) = rounded.get(&n) {
+            return Ok(Some(Arc::clone(copy)));
+        }
+        let copy = Arc::new(self.device.bf16_copy(value).map_err(error)?);
+        rounded.insert(n, Arc::clone(&copy));
+        Ok(Some(copy))
+    }
+
+    /// Drop the bfloat16 copies [`DeviceTrace::rounded_value`] made (their memory is the reverse's
+    /// for one call only).
+    pub fn release_rounded(&self) {
+        if let Ok(mut rounded) = self.rounded.lock() {
+            rounded.clear();
+        }
+    }
+
     /// Node `n`'s value.
     pub fn value(&self, n: usize) -> Result<&Tensor, String> {
         match self.slots.get(n) {
@@ -1558,6 +1587,7 @@ impl DeviceProgram {
             rotations: Arc::clone(&batch.rotations),
             positions: Arc::clone(&batch.positions),
             active: BTreeMap::new(),
+            rounded: Mutex::new(BTreeMap::new()),
         };
         for (index, step) in self.steps.iter().enumerate() {
             if Some(index) == entry {
@@ -2396,7 +2426,8 @@ impl DeviceProgram {
         let g_p = device_heads::backward(d, (heads, &group.stacked), (&trace.buffers[buffers.projections], gained), &g_a, trace.blocks, turn, (self.arithmetic, arithmetic)).map_err(error)?;
         let mut half_p = None;
         if !wanted.is_empty() {
-            let x = trace.value(heads.input)?;
+            let rounded = trace.rounded_value(heads.input, arithmetic)?;
+            let x = rounded.as_deref().map_or(trace.value(heads.input), Ok)?;
             let mut stacked = d.empty(heads.columns(), x.cols()).map_err(error)?;
             d.gemm(&mut stacked, 1.0, self.operand(&g_p, &mut half_p, arithmetic)?, Op::T, x, Op::N, 0.0, arithmetic).map_err(error)?;
             for (i, op) in wanted {
@@ -2572,7 +2603,8 @@ impl DeviceProgram {
                                     let c = d.gather_columns(cot, ids).map_err(error)?;
                                     let c = if arithmetic == Arithmetic::Bf16 && c.storage() == Storage::F32 { d.bf16_copy(&c).map_err(error)? } else { c };
                                     let mut part = d.empty(ids.len(), gradient.cols()).map_err(error)?;
-                                    d.gemm(&mut part, 1.0, &c, Op::T, trace.value(*input)?, Op::N, 0.0, arithmetic).map_err(error)?;
+                                    let x = trace.rounded_value(*input, arithmetic)?;
+                                    d.gemm(&mut part, 1.0, &c, Op::T, x.as_deref().map_or(trace.value(*input), Ok)?, Op::N, 0.0, arithmetic).map_err(error)?;
                                     d.scatter_rows(gradient, ids, &part, true).map_err(error)?;
                                 }
                             }
@@ -2586,13 +2618,19 @@ impl DeviceProgram {
                                     self.device.scatter_columns(gradient, &ids, &part, true).map_err(error)?;
                                 }
                             }
-                            _ => self.device.gemm(gradient, 1.0, self.operand(cot, &mut half, arithmetic)?, Op::T, trace.value(*input)?, Op::N, 1.0, arithmetic).map_err(error)?,
+                            _ => {
+                                let x = trace.rounded_value(*input, arithmetic)?;
+                                self.device
+                                    .gemm(gradient, 1.0, self.operand(cot, &mut half, arithmetic)?, Op::T, x.as_deref().map_or(trace.value(*input), Ok)?, Op::N, 1.0, arithmetic)
+                                    .map_err(error)?;
+                            }
                         }
                     }
                 }
             } else if let Step::Transposed { input, operator } = step {
                 if let Some(gradient) = gradients.get_mut(operator) {
-                    self.device.gemm(gradient, 1.0, trace.value(*input)?, Op::T, self.operand(cot, &mut half, arithmetic)?, Op::N, 1.0, arithmetic).map_err(error)?;
+                    let x = trace.rounded_value(*input, arithmetic)?;
+                    self.device.gemm(gradient, 1.0, x.as_deref().map_or(trace.value(*input), Ok)?, Op::T, self.operand(cot, &mut half, arithmetic)?, Op::N, 1.0, arithmetic).map_err(error)?;
                 }
             }
             let column = match step {

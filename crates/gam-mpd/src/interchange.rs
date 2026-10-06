@@ -1271,6 +1271,10 @@ pub trait BlockEngine {
     /// The bytes a tape holds.
     fn tape_bytes(tape: &Self::Tape) -> usize;
 
+    /// Drop what the reverse passes of a call kept on its tape for one another (the bfloat16 copies
+    /// of its values, [`DeviceTrace::release_rounded`]), once they all ran; nothing by default.
+    fn release(_tape: &Self::Tape) {}
+
     /// The bytes of one gradient of every trainable operator (a reverse pass's sums).
     fn gradient_bytes(&self) -> Result<usize, String>;
 
@@ -1407,6 +1411,10 @@ impl BlockEngine for Model<'_> {
 
     fn tape_bytes(tape: &DeviceTrace) -> usize {
         tape.bytes()
+    }
+
+    fn release(tape: &DeviceTrace) {
+        tape.release_rounded();
     }
 
     fn gradient_bytes(&self) -> Result<usize, String> {
@@ -1709,6 +1717,7 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
         for pass in passes.iter_mut() {
             engines[call.side].reverse(b, tape, &mut pass.cotangent, &ranges, call.edits.as_ref(), (&mut *pass.gradient, pass.arithmetic))?;
         }
+        E::release(tape);
         // Once both sides of the block are reversed, the forks made there return their rows, the
         // later lanes first (a lane forked from a lane forked at the same block returns through it).
         if index == 0 || calls[index - 1].block != b {
