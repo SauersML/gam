@@ -2548,15 +2548,18 @@ mod tests {
         first.choose(&explanation, &posterior).unwrap();
         let mut second = Mixture::new(&explanation, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
         second.choose(&explanation, &posterior).unwrap();
-        // Two terms over one explanation: the second keeps only its value-map targets.
-        for target in &mut second.targets {
-            if !matches!(target.kind, Kind::Value { .. }) {
-                target.components.clear();
+        // Two terms over one explanation: the second keeps only its value-map targets (a target
+        // cleared keeps the moment of its zero logit alone, as a target without components has).
+        for t in 0..second.targets.len() {
+            if !matches!(second.targets[t].kind, Kind::Value { .. }) {
+                second.targets[t].components.clear();
+                second.moments[t].truncate(1);
             }
         }
-        for target in &mut first.targets {
-            if matches!(target.kind, Kind::Value { .. }) {
-                target.components.clear();
+        for t in 0..first.targets.len() {
+            if matches!(first.targets[t].kind, Kind::Value { .. }) {
+                first.targets[t].components.clear();
+                first.moments[t].truncate(1);
             }
         }
         let mut joint = Priors(vec![Box::new(first.clone()), Box::new(second.clone())]);
@@ -2637,7 +2640,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
         let native = split_sites(&imported.program).expect("split");
         let start = explanation(&native, &layer_nodes(&native, 2).expect("layers")).expect("explanation");
-        let settings = Settings { batch_sequences: 2, seed: 3, numeric_bytes: 1 << 26, head_tile_rows: 64, epochs: Some(1), families: Vec::new(), full_antithetic: false, seed_bf16: false, train_bf16: false };
+        let settings = Settings { batch_sequences: 2, seed: 3, numeric_bytes: 1 << 26, head_tile_rows: 64, epochs: Some(1), families: Vec::new(), full_antithetic: false, seed_bf16: false, train_bf16: false, cross_fit: false };
         let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
         let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
         let (train, held) = sequences.split_at(4);
@@ -2698,7 +2701,7 @@ mod tests {
             let values = program.operators[from].matrix();
             replace(program, to, values);
         }
-        let settings = Settings { batch_sequences: 2, seed: 3, numeric_bytes: 1 << 26, head_tile_rows: 64, epochs: None, families: Vec::new(), full_antithetic: false, seed_bf16: false, train_bf16: false };
+        let settings = Settings { batch_sequences: 2, seed: 3, numeric_bytes: 1 << 26, head_tile_rows: 64, epochs: None, families: Vec::new(), full_antithetic: false, seed_bf16: false, train_bf16: false, cross_fit: false };
         let mut mixture = Mixture::new(&start, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
         let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
         let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();

@@ -2838,6 +2838,100 @@ impl Device {
         }
     }
 
+    /// [`Device::posterior_ivon`] with the mean's gradient cross-fitted, an A/B arm
+    /// (`gam_mpd::library_mdl::Settings::cross_fit`): two momenta, `first` (`a`) of the gradients
+    /// of half `0`'s steps and `second` (`b`) of half `1`'s (`step.half` the half this step's
+    /// gradient joins), and the gradients' second moment `power` (`p`, every step's). Each half's
+    /// gradient is weighted by the other half's ratio of signal to noise
+    /// (`ĝ = ½ (k(G_b, V_b) G_a + k(G_a, V_a) G_b)`, [`crossed_gradient`]): a weight made from the
+    /// other half's gradients, which are independent of this half's noise given the trajectory,
+    /// so `E[k_b G_a] = E[k_b] E[G_a]` and the step's expectation vanishes exactly where the full
+    /// gradient's does, whatever the noise's shape, where a weight from a gradient's own momentum
+    /// (`G (1 − V / G²)₊`) moves the fixed point under skewed noise. The direction
+    /// `d = ĝ / (h₀⁺ + δ)`, the deviations, the curvature and the five sums are
+    /// [`Device::posterior_ivon`]'s (the previous direction's ĝ from the state before the step).
+    /// The host and CUDA; the Apple GPU has no kernel for the arm.
+    pub fn posterior_ivon_crossed(
+        &self,
+        (mean, log_sd): (&Tensor, &mut Tensor),
+        [first, second, power, curvature]: [&mut Tensor; 4],
+        (gradient, factor, prior): (Option<&Tensor>, Option<&Tensor>, Option<&Tensor>),
+        (groups, variance): (&GroupMap, &Tensor),
+        (direction, sums): (&mut Tensor, &mut Tensor),
+        step: &CrossStep,
+    ) -> Result<(), GpuError> {
+        groups.check(mean, "posterior")?;
+        same(mean, direction, "posterior direction")?;
+        same(mean, log_sd, "posterior log standard deviation")?;
+        for (state, what) in [(&*first, "posterior first momentum"), (&*second, "posterior second momentum"), (&*power, "posterior second moment"), (&*curvature, "posterior curvature")] {
+            same(mean, state, what)?;
+        }
+        for (input, what) in [(gradient, "posterior gradient"), (factor, "posterior Gauss–Newton factor"), (prior, "posterior prior curvature")] {
+            if let Some(input) = input {
+                same(mean, input, what)?;
+            }
+        }
+        if variance.cols != 1 || sums.dim() != (variance.rows, 5) {
+            return Err(shape(format!("a {:?} variance and {:?} sums for {} entries", variance.dim(), sums.dim(), mean.len())));
+        }
+        if !(step.tokens.is_finite() && step.tokens > 0.0) || step.half > 1 {
+            return Err(shape(format!("{} tokens, half {}", step.tokens, step.half)));
+        }
+        if !((0.0..1.0).contains(&step.beta1) && (0.0..1.0).contains(&step.beta2)) {
+            return Err(shape(format!("decays β₁ = {} and β₂ = {} outside [0, 1)", step.beta1, step.beta2)));
+        }
+        let (halves, after) = (step.halves, step.halves_after());
+        let (power_before, power_after) = (step.power, step.power_after());
+        match &*self.backend {
+            Backend::Host => {
+                let (aa, bb, pp, hs) = (host_mut(first)?, host_mut(second)?, host_mut(power)?, host_mut(curvature)?);
+                let (gv, uv, rv) = (gradient.map(host).transpose()?, factor.map(host).transpose()?, prior.map(host).transpose()?);
+                let (ids, var, means) = (host_indices(&groups.ids)?, host(variance)?, host(mean)?);
+                let (log_sds, moves, totals) = (host_mut(log_sd)?, host_mut(direction)?, host_mut(sums)?);
+                if let Some(id) = ids.iter().find(|id| **id as usize >= var.len()) {
+                    return Err(shape(format!("group {id} of {}", var.len())));
+                }
+                let (b1, b2, half_decay) = (step.beta1, step.beta2, step.beta1 * step.beta1);
+                for i in 0..means.len() {
+                    let mu = means[i];
+                    if log_sds[i] == f64::NEG_INFINITY {
+                        moves[i] = mu - mu;
+                        continue;
+                    }
+                    let g = groups.group(ids, i) as usize;
+                    let delta = 1.0 / (step.tokens * var[g]);
+                    let (a, b, p, h) = (aa[i], bb[i], pp[i], hs[i]);
+                    let (bounded, held) = (h.max(0.0), h.max(0.0) + delta);
+                    let previous = crossed_gradient(a, b, p, delta * mu, halves, power_before) / held;
+                    let data = gv.map_or(0.0, |v| step.gradient_scale * v[i]);
+                    let u = uv.map_or(0.0, |v| v[i]);
+                    let estimate = step.factor_scale * u * u + rv.map_or(0.0, |v| v[i]);
+                    if step.half == 0 {
+                        aa[i] = half_decay * a + (1.0 - half_decay) * data;
+                    } else {
+                        bb[i] = half_decay * b + (1.0 - half_decay) * data;
+                    }
+                    pp[i] = b1 * p + (1.0 - b1) * data * data;
+                    hs[i] = h + (1.0 - b2) * (estimate - h);
+                    let positive = hs[i].max(0.0);
+                    let change = crossed_gradient(aa[i], bb[i], pp[i], delta * mu, after, power_after) / held;
+                    log_sds[i] = -0.5 * (step.tokens * (positive + delta)).ln();
+                    moves[i] = change;
+                    totals[5 * g] += change * change;
+                    totals[5 * g + 1] += u * change;
+                    totals[5 * g + 2] += (bounded * change) * change;
+                    totals[5 * g + 3] += (data + delta * mu) * previous;
+                    totals[5 * g + 4] += (held * previous) * previous;
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.posterior_ivon_crossed((mean, log_sd), [first, second, power, curvature], (gradient, factor, prior), (groups, variance), (direction, sums), step),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the cross-fitted posterior step (an A/B arm) has no Apple GPU kernel".into() }),
+        }
+    }
+
     /// The end of a step ([`Device::posterior_ivon`]): the mean moved along the step's direction,
     /// `μ ← μ − η d` (each entry as [`Device::axpy`] makes it), the average moved toward it,
     /// `μ̄ ← μ̄ + w (μ − μ̄)` (as [`Device::move_toward`]), and each live entry's
@@ -3254,6 +3348,63 @@ impl PosteriorStep {
     pub fn correction(&self) -> f64 {
         Self::weight_after(self.weight, self.beta1)
     }
+}
+
+/// One step of [`Device::posterior_ivon_crossed`]: [`PosteriorStep`]'s scales, tokens and decays;
+/// the half `half` (0 or 1) whose momentum takes this step's gradient; each half's weights
+/// `(W, W2)` before the step, the sum and the sum of squares of the weights its gradients carry (a
+/// half takes every other step's gradient with the decay `β₁²`, so each spans the momentum's
+/// `1 / (1 − β₁)` steps); and the gradient second moment's bias correction `W_p` before the step
+/// (decay `β₁`, every step's gradient).
+#[derive(Clone, Copy, Debug)]
+pub struct CrossStep {
+    pub gradient_scale: f64,
+    pub factor_scale: f64,
+    pub tokens: f64,
+    pub beta1: f64,
+    pub beta2: f64,
+    pub half: usize,
+    pub halves: [(f64, f64); 2],
+    pub power: f64,
+}
+
+impl CrossStep {
+    /// Each half's weights after the step: the half `half` takes one update of decay `β₁²`.
+    #[must_use]
+    pub fn halves_after(&self) -> [(f64, f64); 2] {
+        let b = self.beta1 * self.beta1;
+        let mut out = self.halves;
+        let (w, w2) = out[self.half];
+        out[self.half] = (b * w + (1.0 - b), b * b * w2 + (1.0 - b) * (1.0 - b));
+        out
+    }
+
+    /// The gradient second moment's bias correction after the step.
+    #[must_use]
+    pub fn power_after(&self) -> f64 {
+        self.beta1 * self.power + (1.0 - self.beta1)
+    }
+}
+
+/// One entry's cross-fitted gradient ([`Device::posterior_ivon_crossed`]) from the halves'
+/// momenta `a` and `b`, the gradient's second moment `p`, the prior's exact pull `prior = δ μ`, the
+/// halves' weights `(W, W2)` and the second moment's bias correction `W_p`: with a half's mean
+/// `x̄ = x / W` (none for an empty half), `G = x̄ + δ μ`, the gradients' spread
+/// `(p / W_p − x̄²)₊` and the half mean's variance `V = (p / W_p − x̄²)₊ W2 / W²`,
+/// `ĝ = ½ (k(G_b, V_b) G_a + k(G_a, V_a) G_b)`, `k(G, V) = (1 − V / G²)₊`.
+fn crossed_gradient(a: f64, b: f64, p: f64, prior: f64, halves: [(f64, f64); 2], power: f64) -> f64 {
+    let spread_of = if power > 0.0 { p * (1.0 / power) } else { 0.0 };
+    let part = |x: f64, (w, w2): (f64, f64)| -> (f64, f64) {
+        if w > 0.0 {
+            let mean = x * (1.0 / w);
+            (mean + prior, (spread_of - mean * mean).max(0.0) * (w2 / (w * w)))
+        } else {
+            (prior, 0.0)
+        }
+    };
+    let keep = |g: f64, v: f64| if g * g > v { 1.0 - v / (g * g) } else { 0.0 };
+    let ((ga, va), (gb, vb)) = (part(a, halves[0]), part(b, halves[1]));
+    0.5 * (keep(gb, vb) * ga + keep(ga, va) * gb)
 }
 
 /// Philox4x32-10 (Salmon et al., SC 2011) of the counter `(index, stream)` under `key`.
@@ -4458,6 +4609,75 @@ extern "C" __global__ void posterior_ivon_f32(u64 n, u64 cols, unsigned int axis
     unsigned int inputs, const float* gradient, const float* factor, const float* prior, const unsigned int* groups, const double* variance, const float* mean, float* log_sd,
     float* momentum, float* curvature, float* direction, double* sums) {
     posterior_ivon_body<float>(n, cols, axis, chunks, count, scale, fscale, tokens, beta1, beta2, c0, c1, inputs, gradient, factor, prior, groups, variance, mean, log_sd, momentum, curvature, direction, sums);
+}
+
+// One entry's cross-fitted gradient (`crossed_gradient` on the host): the halves' means
+// `x · (1 / W)`, each `G = x̄ + δ μ` (`pull`), each half mean's variance `(p / W_p − x̄²)₊ W2 / W²`,
+// and `½ (k(G_b, V_b) G_a + k(G_a, V_a) G_b)`, `k(G, V) = (1 − V / G²)₊`.
+template <typename T>
+__device__ T crossed_gradient(T a, T b, T p, T pull, double wa, double w2a, double wb, double w2b, double wp) {
+    const T zero = (T)0, one = (T)1;
+    T spread = wp > 0.0 ? p * (T)(1.0 / wp) : zero;
+    T ga = pull, va = zero, gb = pull, vb = zero;
+    if (wa > 0.0) { T mean = a * (T)(1.0 / wa); T s = spread - mean * mean; ga = mean + pull; va = (s > zero ? s : zero) * (T)(w2a / (wa * wa)); }
+    if (wb > 0.0) { T mean = b * (T)(1.0 / wb); T s = spread - mean * mean; gb = mean + pull; vb = (s > zero ? s : zero) * (T)(w2b / (wb * wb)); }
+    T ka = ga * ga > va ? one - va / (ga * ga) : zero;
+    T kb = gb * gb > vb ? one - vb / (gb * gb) : zero;
+    return (T)0.5 * (kb * ga + ka * gb);
+}
+
+// `Device::posterior_ivon_crossed`: `posterior_ivon_body` with two momenta of alternate steps' gradients
+// (`half` the one this step's joins, at the decay β₁²) and the gradients' second moment, each half
+// weighted by the other's ratio of signal to noise; the weights (W, W2) of each half and the second
+// moment's correction before (…0) and after (…1) the step.
+template <typename T>
+__device__ void posterior_ivon_crossed_body(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double beta1, double beta2,
+    unsigned int half, double wa0, double w2a0, double wb0, double w2b0, double wp0, double wa1, double w2a1, double wb1, double w2b1, double wp1, unsigned int inputs,
+    const T* gradient, const T* factor, const T* prior, const unsigned int* groups, const double* variance, const T* mean, T* log_sd, T* first, T* second, T* power, T* curvature,
+    T* direction, double* sums) {
+    const T b1 = (T)beta1, o1 = (T)(1.0 - beta1), hb = (T)(beta1 * beta1), ho = (T)(1.0 - beta1 * beta1), o2 = (T)(1.0 - beta2), weight = (T)scale, square = (T)fscale, zero = (T)0;
+    const bool given = (inputs & 1u) != 0u, drawn = (inputs & 2u) != 0u, priced = (inputs & 4u) != 0u;
+    segments_reduce<5>(n, cols, axis, chunks, groups, count, true, false, sums, [&](u64 i, unsigned int g, double* e) -> bool {
+        T mu = mean[i];
+        if (g >= count || log_sd[i] == (T)NEG_INF) {
+            direction[i] = mu - mu;
+            return false;
+        }
+        T delta = prior_precision((T)0, tokens, variance[g]);
+        T a = first[i], b = second[i], p = power[i], h = curvature[i];
+        T bounded = h > zero ? h : zero, held = bounded + delta;
+        T previous = crossed_gradient(a, b, p, delta * mu, wa0, w2a0, wb0, w2b0, wp0) / held;
+        T gi = given ? weight * gradient[i] : zero, ui = drawn ? factor[i] : zero;
+        T estimate = square * ui * ui + (priced ? prior[i] : zero);
+        if (half == 0u) a = hb * a + ho * gi; else b = hb * b + ho * gi;
+        T p1 = b1 * p + o1 * gi * gi;
+        T h1 = h + o2 * (estimate - h);
+        T positive = h1 > zero ? h1 : zero;
+        T move = crossed_gradient(a, b, p1, delta * mu, wa1, w2a1, wb1, w2b1, wp1) / held;
+        T s = log_deviation(positive + delta, tokens);
+        first[i] = a; second[i] = b; power[i] = p1; curvature[i] = h1; log_sd[i] = s;
+        direction[i] = move;
+        double dd = (double)move, dp = (double)previous;
+        e[0] = dd * dd; e[1] = (double)ui * dd; e[2] = (double)(bounded * move) * dd;
+        e[3] = (double)(gi + delta * mu) * dp; e[4] = (double)(held * previous) * dp;
+        return true;
+    });
+}
+
+extern "C" __global__ void posterior_ivon_crossed_f64(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double beta1, double beta2,
+    unsigned int half, double wa0, double w2a0, double wb0, double w2b0, double wp0, double wa1, double w2a1, double wb1, double w2b1, double wp1, unsigned int inputs,
+    const double* gradient, const double* factor, const double* prior, const unsigned int* groups, const double* variance, const double* mean, double* log_sd, double* first, double* second,
+    double* power, double* curvature, double* direction, double* sums) {
+    posterior_ivon_crossed_body<double>(n, cols, axis, chunks, count, scale, fscale, tokens, beta1, beta2, half, wa0, w2a0, wb0, w2b0, wp0, wa1, w2a1, wb1, w2b1, wp1, inputs,
+        gradient, factor, prior, groups, variance, mean, log_sd, first, second, power, curvature, direction, sums);
+}
+
+extern "C" __global__ void posterior_ivon_crossed_f32(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double beta1, double beta2,
+    unsigned int half, double wa0, double w2a0, double wb0, double w2b0, double wp0, double wa1, double w2a1, double wb1, double w2b1, double wp1, unsigned int inputs,
+    const float* gradient, const float* factor, const float* prior, const unsigned int* groups, const double* variance, const float* mean, float* log_sd, float* first, float* second,
+    float* power, float* curvature, float* direction, double* sums) {
+    posterior_ivon_crossed_body<float>(n, cols, axis, chunks, count, scale, fscale, tokens, beta1, beta2, half, wa0, w2a0, wb0, w2b0, wp0, wa1, w2a1, wb1, w2b1, wp1, inputs,
+        gradient, factor, prior, groups, variance, mean, log_sd, first, second, power, curvature, direction, sums);
 }
 
 // `Device::posterior_finish`: μ ← μ + (−η) d (as `axpy` makes it), μ̄ ← μ̄ + w (μ − μ̄) (as
@@ -6439,6 +6659,45 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             // an input `inputs` marks absent, float64 group buffers of `count` rows (the sums five
             // columns), ids per the map's axis; ids at or beyond `count` are not stepped.
             unsafe { builder.launch(cfg_elements(groups.blocks() as u64)) }.gpu_ctx("tensor posterior_ivon").map(|_| ())
+        }
+
+        pub(super) fn posterior_ivon_crossed(
+            &self,
+            (mean, log_sd): (&Tensor, &mut Tensor),
+            [first, second, power, curvature]: [&mut Tensor; 4],
+            (gradient, factor, prior): (Option<&Tensor>, Option<&Tensor>, Option<&Tensor>),
+            (groups, variance): (&super::GroupMap, &Tensor),
+            (direction, sums): (&mut Tensor, &mut Tensor),
+            step: &super::CrossStep,
+        ) -> Result<(), GpuError> {
+            let (n, storage) = (mean.len() as u64, mean.storage());
+            let f = self.posterior_kernel("posterior_ivon_crossed", storage)?;
+            let inputs = u32::from(gradient.is_some()) | (u32::from(factor.is_some()) << 1) | (u32::from(prior.is_some()) << 2);
+            let count = variance.len() as u64;
+            let (cols, axis, chunks) = (groups.cols as u64, groups.reduce_code(), groups.chunks() as u64);
+            let (half, absent) = (step.half as u32, 0u64);
+            let ([(wa0, w2a0), (wb0, w2b0)], wp0) = (step.halves, step.power);
+            let ([(wa1, w2a1), (wb1, w2b1)], wp1) = (step.halves_after(), step.power_after());
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).arg(&step.gradient_scale).arg(&step.factor_scale).arg(&step.tokens).arg(&step.beta1).arg(&step.beta2).arg(&half);
+            builder.arg(&wa0).arg(&w2a0).arg(&wb0).arg(&w2b0).arg(&wp0).arg(&wa1).arg(&w2a1).arg(&wb1).arg(&w2b1).arg(&wp1).arg(&inputs);
+            for input in [gradient, factor, prior] {
+                match input {
+                    Some(t) => {
+                        builder.input(t, storage)?;
+                    }
+                    None => {
+                        builder.arg(&absent);
+                    }
+                }
+            }
+            builder.arg(index_slice(&groups.layout)?).arg(slice(variance)?);
+            builder.input(mean, storage)?.output(log_sd, storage)?.output(first, storage)?.output(second, storage)?.output(power, storage)?.output(curvature, storage)?;
+            builder.output(direction, storage)?.arg(slice_mut(sums)?);
+            // SAFETY: as `posterior_ivon`'s: equal-length entry buffers in the masters' storage, a
+            // null pointer only for an input `inputs` marks absent, float64 group buffers of
+            // `count` rows (the sums five columns).
+            unsafe { builder.launch(cfg_elements(groups.blocks() as u64)) }.gpu_ctx("tensor posterior_ivon_crossed").map(|_| ())
         }
 
         pub(super) fn posterior_finish(

@@ -1391,6 +1391,12 @@ pub struct Settings {
     /// `objective_bits`) are the steps' own, so in bfloat16. Off by default; its A/B decides.
     #[serde(default)]
     pub train_bf16: bool,
+    /// A/B arm, to be deleted with the losing arm after its paired test: when set, the mean's
+    /// gradient is cross-fitted, two momenta of alternate steps each weighted by the other's ratio
+    /// of signal to noise (`DevicePosterior::cross_fit`, `gam_gpu::tensor::Device::posterior_ivon_crossed`).
+    /// The arm's state is not checkpointed: a fit with it does not resume.
+    #[serde(default)]
+    pub cross_fit: bool,
 }
 
 /// [`Settings`] as configs and checkpoints hold them, unknown keys refused, and the keys of steps
@@ -1424,6 +1430,8 @@ struct SettingsRecord {
     seed_bf16: bool,
     #[serde(default)]
     train_bf16: bool,
+    #[serde(default)]
+    cross_fit: bool,
     #[serde(default)]
     rate: Option<serde::de::IgnoredAny>,
     #[serde(default)]
@@ -1462,6 +1470,7 @@ impl From<SettingsRecord> for Settings {
             full_antithetic: r.full_antithetic,
             seed_bf16: r.seed_bf16,
             train_bf16: r.train_bf16,
+            cross_fit: r.cross_fit,
         }
     }
 }
@@ -3135,6 +3144,12 @@ pub fn fit_from(
         device_posterior.settle()?;
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
+    if settings.cross_fit {
+        if !fresh {
+            return Err("the cross-fit arm (Settings::cross_fit) keeps no checkpoint of its state, so it does not resume".into());
+        }
+        device_posterior.cross_fit()?;
+    }
     // The curvature estimate `h` estimates the Gauss–Newton diagonal per token of the whole
     // training collection, the mean of its `B` batches' diagonals. `β₂ = 1 − 1/B` makes its running
     // average span about one pass, so each batch weighs about once whatever the batch size. One
@@ -4285,6 +4300,7 @@ mod tests {
             full_antithetic: false,
             seed_bf16: false,
             train_bf16: false,
+            cross_fit: false,
         }
     }
 

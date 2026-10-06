@@ -10,7 +10,7 @@
 //! A group sum of `n` such terms adds `γ_n` of the summed magnitudes.
 
 use gam_gpu::GpuPolicy;
-use gam_gpu::tensor::{ANTITHETIC, Device, GroupAxis, PosteriorStep, Storage, Tensor, posterior_normal};
+use gam_gpu::tensor::{ANTITHETIC, CrossStep, Device, GroupAxis, PosteriorStep, Storage, Tensor, posterior_normal};
 use ndarray::Array2;
 
 const U: f64 = 1.0 / 16_777_216.0;
@@ -563,6 +563,44 @@ fn constant_gradient_steps_fully(fit: &Device, wide: &Device) {
         let expected = Array2::from_shape_fn((rows, cols), |at| (gradient[at] + delta * mean[at]) / (held[at] + delta));
         close(&format!("{} step {t}'s direction", fit.name()), &fit.download(&direction).unwrap(), &expected, CHAIN);
         close(&format!("{} step {t}'s log sd", fit.name()), &fit.download(&log_sd).unwrap(), &h.mapv(|h| -0.5 * (tokens * (h + delta)).ln()), CHAIN);
+    }
+}
+
+/// The cross-fitted step (`Device::posterior_ivon_crossed`) under a constant gradient `g`: the first
+/// step's half takes `g` and the other half is empty (`G_b = δ μ`, no spread), so `ĝ = ½ g + δ μ`;
+/// from the second step both halves hold `g` with no spread, so `ĝ = g + δ μ`, IVON's full step;
+/// the deviations are `posterior_ivon`'s.
+fn crossed_constant_gradient_steps_fully(fit: &Device, wide: &Device) {
+    let (rows, cols, tokens, v) = (2, 5, 64.0, 0.5);
+    let delta = 1.0 / (tokens * v);
+    let (mean, gradient, start) = (matrix(rows, cols, 21, 0.5, 0.0), matrix(rows, cols, 22, 2.0, 0.0), matrix(rows, cols, 23, 0.25, 0.5));
+    let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
+    let (mu, mut log_sd) = (up(&mean), up(&Array2::from_elem((rows, cols), -1.0)));
+    let (mut first, mut second, mut power, mut curvature, g) = (fit.zeros(rows, cols).unwrap(), fit.zeros(rows, cols).unwrap(), fit.zeros(rows, cols).unwrap(), up(&start), up(&gradient));
+    let groups = fit.group_map(&vec![0; rows * cols], (rows, cols)).unwrap();
+    let variance = wide.upload(Array2::from_elem((1, 1), v).view()).unwrap();
+    let (beta1, beta2) = (0.9, 0.75);
+    let (mut halves, mut weight) = ([(0.0, 0.0); 2], 0.0);
+    for t in 1..=4 {
+        let step = CrossStep { gradient_scale: 1.0, factor_scale: 1.0, tokens, beta1, beta2, half: (t + 1) % 2, halves, power: weight };
+        let (mut direction, mut sums) = (fit.zeros(rows, cols).unwrap(), wide.zeros(1, 5).unwrap());
+        fit.posterior_ivon_crossed((&mu, &mut log_sd), [&mut first, &mut second, &mut power, &mut curvature], (Some(&g), None, None), (&groups, &variance), (&mut direction, &mut sums), &step).unwrap();
+        (halves, weight) = (step.halves_after(), step.power_after());
+        let (held, h) = (start.mapv(|h0| beta2.powi(t as i32 - 1) * h0), start.mapv(|h0| beta2.powi(t as i32) * h0));
+        let share = if t == 1 { 0.5 } else { 1.0 };
+        let expected = Array2::from_shape_fn((rows, cols), |at| (share * gradient[at] + delta * mean[at]) / (held[at] + delta));
+        close(&format!("{} crossed step {t}'s direction", fit.name()), &fit.download(&direction).unwrap(), &expected, CHAIN);
+        close(&format!("{} crossed step {t}'s log sd", fit.name()), &fit.download(&log_sd).unwrap(), &h.mapv(|h| -0.5 * (tokens * (h + delta)).ln()), CHAIN);
+    }
+}
+
+#[test]
+fn a_constant_gradient_moves_the_crossed_mean_by_ivon_s_full_step() {
+    let host = Device::host();
+    crossed_constant_gradient_steps_fully(&host, &host);
+    if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
+        crossed_constant_gradient_steps_fully(&wide.with_storage(Storage::F32).expect("CUDA holds f32"), &wide);
+        crossed_constant_gradient_steps_fully(&wide, &wide);
     }
 }
 
