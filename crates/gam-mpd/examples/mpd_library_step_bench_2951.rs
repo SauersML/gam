@@ -243,6 +243,7 @@ fn main() -> Result<(), String> {
     {
         let parts = Parts { operators: &trainable, mean: &start.mean, log_sd: &start.log_sd, groups: &start.groups, count: start.count };
         let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens as f64, None, 0)?;
+        posterior.hold_means(true);
         for step in 0..=reps {
             let s = &mut device_seconds;
             timed(&device, s, "sample_loaded", || posterior.sample_into(&mut p_program, step as u64))?;
@@ -269,7 +270,6 @@ fn main() -> Result<(), String> {
             timed(&device, s, "description", || Ok(posterior.divergences()?.iter().sum::<f64>()))?;
             timed(&device, s, "posterior_step", || posterior.step(&gradient, scale, (&factor, 1.0 / labelled as f64), &ivon))?;
             // The step's direction without its measured length (`library_mdl`'s line step).
-            posterior.settle_line(0.0, ivon.beta2)?;
         }
     }
     let report = json!({

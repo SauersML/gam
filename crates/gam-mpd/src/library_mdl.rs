@@ -119,8 +119,8 @@
 //! precision per token, so `σ² ≤ v_G`. That stationary point is implicit (`h` is an expectation
 //! under `q`, and `v_G` depends on `σ`); setting `σ` from the running `h` and the current `v_G` at
 //! every step is an online approximation to it, so `σ` has no step size; the mean moves along
-//! IVON's direction `ĝ / (h + δ)` by a length measured on the next batch
-//! (`DevicePosterior::finish_line`), `ĝ` the full gradient (the data term's momentum plus the prior's `δ μ`)
+//! IVON's direction `ĝ / (h + δ)` by the Gauss–Newton minimum along it with the epoch-averaged
+//! curvature ratio (`DevicePosterior::step`), `ĝ` the full gradient (the data term's momentum plus the prior's `δ μ`)
 //! filtered by the momentum's measured noise (`Device::posterior_ivon`), so the step's fixed point
 //! is `F`'s stationary point: a sampled gradient is mostly the other weights' noise carried
 //! through the Hessian's off-diagonal terms, and with the momentum unfiltered the mean's steps
@@ -1275,11 +1275,6 @@ pub struct Settings {
     pub numeric_bytes: usize,
     /// Rows of vocabulary logits formed at once.
     pub head_tile_rows: usize,
-    /// The epoch-ratio arm (`DevicePosterior::set_epoch_ratio`): the step's length from the
-    /// epoch-averaged Gauss–Newton curvature ratio along its direction, with no measurement pass.
-    /// The A/B's outcome deletes this field or the measured line step.
-    #[serde(default)]
-    pub epoch_ratio: bool,
     /// When set, the fit ends once its epoch count (counted from `M`, a start's epochs included)
     /// reaches this, with no removal round: a comparison of arms at one budget of steps.
     #[serde(default)]
@@ -1288,7 +1283,7 @@ pub struct Settings {
 
 /// [`Settings`] as configs and checkpoints hold them, unknown keys refused, and the keys of steps
 /// the fit no longer has accepted and dropped: `rate` (IVON's fixed fraction of the Newton step,
-/// replaced by the measured line step), `trust_rate`, `line_search`, `split_filter`,
+/// replaced by the line step), `trust_rate`, `line_search`, `split_filter`,
 /// `deterministic` (the 2^16 and 2^24 A/B arms), `decoder`, `half_factor` (now the step's),
 /// `one_sample` and `rotated` (the rotated posterior of f80fd69565, which its A/B in 1a8361c2c8
 /// retired), so that configs and checkpoints written before still read.
@@ -1302,7 +1297,7 @@ struct SettingsRecord {
     numeric_bytes: usize,
     head_tile_rows: usize,
     #[serde(default)]
-    epoch_ratio: bool,
+    epoch_ratio: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     preconditioned: Option<serde::de::IgnoredAny>,
     #[serde(default)]
@@ -1329,7 +1324,7 @@ struct SettingsRecord {
 
 impl From<SettingsRecord> for Settings {
     fn from(r: SettingsRecord) -> Self {
-        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some()), ("preconditioned", r.preconditioned.is_some()), ("half_factor", r.half_factor.is_some()), ("one_sample", r.one_sample.is_some()), ("rotated", r.rotated.is_some()), ("beta1", r.beta1.is_some())];
+        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some()), ("preconditioned", r.preconditioned.is_some()), ("half_factor", r.half_factor.is_some()), ("one_sample", r.one_sample.is_some()), ("rotated", r.rotated.is_some()), ("beta1", r.beta1.is_some()), ("epoch_ratio", r.epoch_ratio.is_some())];
         for (key, present) in retired {
             if present {
                 log::info!("library settings: the retired key `{key}` is ignored");
@@ -1340,7 +1335,6 @@ impl From<SettingsRecord> for Settings {
             seed: r.seed,
             numeric_bytes: r.numeric_bytes,
             head_tile_rows: r.head_tile_rows,
-            epoch_ratio: r.epoch_ratio,
             epochs: r.epochs,
         }
     }
@@ -1792,8 +1786,6 @@ fn training_key(seed: u64, batch: usize) -> u64 {
 /// Its A/B (fitperf-halffactor-ab2: vpd4l, N = 2^20, RTX 4090, 3 epochs, seeds 1-2) measured F
 /// after epoch 2 at 25.45e6 and 24.09e6 bits against 25.73e6 and 24.81e6 with both halves'
 /// factors, and 7% less wall time per step.
-/// `made` holds `M`'s targets of the halves when they were made already (the previous step's
-/// [`line_measurement`] of this batch makes the same ones); otherwise they are made here.
 /// Returns the experiments in the order of their bits.
 fn antithetic_step(
     scorer: &mut Scorer,
@@ -1801,17 +1793,10 @@ fn antithetic_step(
     batch: &Batch,
     experiments: Vec<Experiment>,
     key: u64,
-    made: Option<Vec<Targets>>,
 ) -> Result<(Vec<Experiment>, Vec<Vec<f64>>, BTreeMap<usize, Tensor>, interchange::Factor), String> {
     let half = batch.base.len() / 2;
     let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.into_iter().partition(|e| e.base < half);
-    let mut given = made.unwrap_or_default().into_iter();
-    let mut targets_of = |scorer: &mut Scorer, part: &[Experiment]| -> Result<Targets, String> {
-        match given.next() {
-            Some(targets) => Ok(targets),
-            None => scorer.experiments.targets(batch, part),
-        }
-    };
+    let targets_of = |scorer: &mut Scorer, part: &[Experiment]| scorer.experiments.targets(batch, part);
     if first.is_empty() || second.is_empty() {
         let all: Vec<Experiment> = first.into_iter().chain(second).collect();
         let targets = targets_of(scorer, &all)?;
@@ -1834,44 +1819,6 @@ fn antithetic_step(
     }
     bits.extend(other_bits);
     Ok((first.into_iter().chain(second).collect(), bits, gradients, factor))
-}
-
-/// A line step's measurement: the bits of `experiments` on `batch` at the iterate's weight samples
-/// of `key`, as [`antithetic_step`] draws them (the first half of the bases at `key`, the second
-/// at its negation), with no gradient, at `η = 0, η₀, 2η₀`
-/// along the pending step's direction (`DevicePosterior::place_line`, `finish_line`). `M`'s
-/// targets are made once per half for the three and returned, in [`antithetic_step`]'s order of
-/// the halves, for the step that scores this batch next; with the seconds of the targets and of
-/// each point (each ends in reading its bits on the host).
-fn line_measurement(
-    scorer: &mut Scorer,
-    posterior: &mut DevicePosterior,
-    (batch, experiments): (&Batch, &[Experiment]),
-    key: u64,
-    trial: f64,
-) -> Result<([f64; 3], Vec<Targets>, [f64; 4]), String> {
-    let half = batch.base.len() / 2;
-    let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.iter().cloned().partition(|e| e.base < half);
-    let halves = if first.is_empty() || second.is_empty() { vec![(experiments.to_vec(), key)] } else { vec![(first, key), (second, key ^ gam_gpu::tensor::ANTITHETIC)] };
-    let mut clock = Instant::now();
-    let mut seconds = [0.0; 4];
-    let targets = halves.iter().map(|(part, _)| scorer.experiments.targets(batch, part)).collect::<Result<Vec<_>, _>>()?;
-    seconds[0] = clock.elapsed().as_secs_f64();
-    let mut values = [0.0; 3];
-    for (k, value) in values.iter_mut().enumerate() {
-        clock = Instant::now();
-        posterior.place_line(trial * k as f64)?;
-        for ((part, seed), targets) in halves.iter().zip(&targets) {
-            posterior.iterate_into(scorer.experiments.explanation_mut(), *seed)?;
-            let evaluation = scorer.experiments.evaluate_labelled(batch, part, Some(targets), false, None)?;
-            if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
-                return Err("nonfinite explanation divergence".into());
-            }
-            *value += evaluation.bits.iter().flatten().sum::<f64>();
-        }
-        seconds[k + 1] = clock.elapsed().as_secs_f64();
-    }
-    Ok((values, targets, seconds))
 }
 
 /// The gradient-noise scale `B = tr(P Σ) / ‖∇F‖²_P` in batches, from IVON's state as it stands
@@ -2860,7 +2807,6 @@ pub fn fit_from(
         device_posterior.settle()?;
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
-    device_posterior.set_epoch_ratio(settings.epoch_ratio);
     // The curvature estimate averages over one epoch's batches: each batch weighs about once. The
     // momentum's decay is set each step (`momentum_decay`): a running mean until an epoch has
     // measured the gradient-noise scale, then the rule's.
@@ -2930,17 +2876,12 @@ pub fn fit_from(
         let mut estimates = Vec::with_capacity(draws.len());
         let (mut data_sum, mut description_sum) = (0.0, 0.0);
         let (mut clean, mut patched) = (Mean::default(), Mean::default());
-        // `M`'s targets of the next batch's halves, made by this step's line measurement and
-        // scored against again by the next step (the same experiments; within an epoch).
-        let mut measured: Option<(usize, Vec<Experiment>, Vec<Targets>)> = None;
         for (b, draw) in draws.iter().enumerate() {
             let step_started = Instant::now();
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
             let key = training_key(settings.seed, b);
-            let made = measured.take().filter(|(at, made_for, _)| *at == b && *made_for == experiments).map(|(_, _, targets)| targets);
-            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key, made)?;
-            let scoring_seconds = step_started.elapsed().as_secs_f64();
+            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key)?;
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
@@ -2986,26 +2927,8 @@ pub fn fit_from(
             ivon.beta1 = measured_decay.unwrap_or(1.0 - 1.0 / (b + 1) as f64);
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &ivon)?;
             let posterior_seconds = posterior_started.elapsed().as_secs_f64();
-            if settings.epoch_ratio {
-                let (eta, rho, draws_averaged) = device_posterior.epoch_ratio_state();
-                log::info!("library ratio step {epoch}.{b}: η {eta:.4e}, ρ̄ {rho:.4e} over {draws_averaged} draws; posterior step {posterior_seconds:.3} s");
-            }
-            if let Some(trial) = device_posterior.line_trial() {
-                // The line step's measurement on the next batch, at its own draws, at η = 0, η₀ and
-                // 2η₀ (`DevicePosterior::finish_line`).
-                let other = (b + 1) % draws.len();
-                let (other_batch, other_experiments) = (draws[other].batch(sequences)?, scorer.experiments(&draws[other], sequences)?);
-                let (bits, targets, seconds) = line_measurement(&mut scorer, &mut device_posterior, (&other_batch, &other_experiments), training_key(settings.seed, other), trial)?;
-                if other > b {
-                    measured = Some((other, other_experiments, targets));
-                }
-                let finish_started = Instant::now();
-                let line = device_posterior.finish_line(bits.map(|b| weight * LN_2 * b), ivon.beta2)?;
-                log::info!(
-                    "library line step {epoch}.{b}: η {:.4e} (trial {trial:.4e}); data slope down d per token: measured {:.4e}, the step's own gradient {:.4e}; data curvature along d: measured {:.4e}, one Gauss–Newton draw {:.4e}, diagonal Σ h d² {:.4e}; seconds: scoring {scoring_seconds:.3}, posterior step {posterior_seconds:.3}, measurement targets {:.3}, points {:.3} {:.3} {:.3}, finish {:.3}",
-                    line.eta, line.slope, line.own_slope, line.measured, line.draw, line.diagonal, seconds[0], seconds[1], seconds[2], seconds[3], finish_started.elapsed().as_secs_f64()
-                );
-            }
+            let (eta, rho, draws_averaged) = device_posterior.step_state();
+            log::info!("library line step {epoch}.{b}: η {eta:.4e}, ρ̄ {rho:.4e} over {draws_averaged} draws, β₁ {:.6}; posterior step {posterior_seconds:.3} s", ivon.beta1);
             let prior_note = if prior.is_some() { format!(" (prior: {prior_seconds:.3} s)") } else { String::new() };
             log::info!("library step {epoch}.{b}: {:.6} bits per scored token, {:.2} s{prior_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
         }
@@ -3997,7 +3920,6 @@ mod tests {
             seed: 3,
             numeric_bytes: 1 << 26,
             head_tile_rows: 64,
-            epoch_ratio: false,
             epochs: None,
         }
     }
@@ -4161,7 +4083,7 @@ mod tests {
             for (b, draw) in draws.iter().enumerate() {
                 let batch = draw.batch(&sequences).unwrap();
                 let experiments = scorer.experiments(draw, &sequences).unwrap();
-                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, training_key(settings.seed, b), None).unwrap();
+                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, training_key(settings.seed, b)).unwrap();
                 estimates.push(bits.iter().flatten().sum::<f64>());
             }
             estimates

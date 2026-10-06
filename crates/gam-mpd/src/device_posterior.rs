@@ -37,39 +37,11 @@ use gam_gpu::{
 use ndarray::Array2;
 use std::{borrow::Borrow, collections::BTreeMap};
 
-/// A line step measured on its batch ([`DevicePosterior::finish_line`]): the step's direction
-/// `d` per operator and the iterate `before` it starts from, and along `d` the data term's slope
-/// `Σ g d` (per token, nats), the prior's slope `Σ δ μ d` and curvature `Σ δ d²`, and for the
-/// record one Gauss–Newton draw's `c (u · d)²` and the diagonal's `Σ h d²`.
-struct LineState {
-    before: Vec<Tensor>,
-    directions: Vec<Tensor>,
-    slope_data: f64,
-    slope_prior: f64,
-    prior_curvature: f64,
-    draw_curvature: f64,
-    diagonal: f64,
-}
-
-/// What a measured line step found: its step `η`, the trial it measured, and the data term's
-/// curvature along `d` measured from the trial, one Gauss–Newton draw's, and the diagonal's.
-#[derive(Clone, Copy, Debug)]
-pub struct LineReport {
-    pub eta: f64,
-    pub trial: f64,
-    pub measured: f64,
-    pub draw: f64,
-    pub diagonal: f64,
-    /// The data term's slope down `d` from the step's own gradient, and as measured.
-    pub own_slope: f64,
-    pub slope: f64,
-}
-
 /// The batches whose removal sums wait on the device before they are read
 /// ([`DevicePosterior::add_removal`]): about 45 MB of sums on vpd4l's 29,184 groups.
 pub const REMOVAL_READS: usize = 64;
 
-/// Draws of the epoch-ratio arm's curvature ratio averaged before its first move: the relative
+/// Draws of the step's curvature ratio averaged before its first move: the relative
 /// standard error of a mean of `K` single-draw ratios is `√(2 / K)`, one half at `K = 8` (and the
 /// chance that the mean is below a tenth of its expectation 0.08%, from 25% at one draw). At
 /// `N = 2^24` (4096 batches per epoch) the eight steps are 0.2% of the first epoch.
@@ -81,7 +53,8 @@ fn error(e: impl std::fmt::Display) -> String {
 
 /// IVON's settings of a step ([`DevicePosterior::step`], [`Device::posterior_ivon`]): the gradient
 /// momentum's decay `β₁` and the curvature estimate's decay `β₂`. The step's length along IVON's
-/// direction is measured ([`DevicePosterior::finish_line`]).
+/// direction is the Gauss–Newton minimum with the epoch-averaged curvature ratio
+/// ([`DevicePosterior::step`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Ivon {
     pub beta1: f64,
@@ -147,20 +120,14 @@ pub struct DevicePosterior {
     /// `averaged` steps since the posterior was last set, up to one epoch (module note).
     average: Vec<Tensor>,
     averaged: u64,
-    /// The line step: the iterate moves to the minimum along IVON's full direction of `F`, measured
-    /// at trial steps (`DevicePosterior::finish_line`); `ratio` is the next trial step and
-    /// `ratio_steps` the line steps taken, `line_state` the step awaiting its measurement.
-    ratio: f64,
-    /// The epoch-ratio arm (`DevicePosterior::set_epoch_ratio`): the step's length from the
-    /// epoch's average `rho` of one Gauss–Newton draw's curvature along `d` over the diagonal
-    /// model's, over `rho_steps` draws, in place of the measured line step; and the last step's
-    /// `η`.
-    epoch_ratio: bool,
+    /// The step's length along IVON's direction ([`DevicePosterior::step`]): the epoch's average
+    /// `rho` of one Gauss–Newton draw's curvature along `d` over the diagonal model's, over
+    /// `rho_steps` draws; the last step's `η`; and whether the means are held (a pass that sets
+    /// the deviations only, [`DevicePosterior::hold_means`]).
     rho: f64,
     rho_steps: u64,
     last_eta: f64,
-    ratio_steps: u64,
-    line_state: Option<LineState>,
+    hold: bool,
     /// Per group `(n, Σ μ² + σ², Σ 2s)` being summed, its variance and its divergence in nats.
     sums: Tensor,
     variance: Tensor,
@@ -294,13 +261,10 @@ impl DevicePosterior {
             groups: parts.groups.iter().zip(&shapes).map(|(ids, shape)| master.group_map(ids, *shape).map_err(error)).collect::<Result<_, _>>()?,
             average: Vec::new(),
             averaged: 0,
-            ratio: 1.0,
-            epoch_ratio: false,
             rho: 1.0,
             rho_steps: 0,
             last_eta: 0.0,
-            ratio_steps: 0,
-            line_state: None,
+            hold: false,
             operators: parts.operators.to_vec(),
             fitting: fitting.clone(),
             wide,
@@ -316,14 +280,6 @@ impl DevicePosterior {
         Ok(out)
     }
 
-    /// Trainable operator `i`'s iterate and its log standard deviations, on the host: where a
-    /// step's gradient is taken (`DevicePosterior::iterate_into`), for a caller that measures a
-    /// line step on the host.
-    pub fn iterate_values(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>), String> {
-        let mean = self.fitting.download(&self.mean[i]).map_err(error)?;
-        Ok((mean, self.fitting.download(&self.log_sd[i]).map_err(error)?))
-    }
-
     /// The groups' variances and divergences from the posterior as it stands, at its mean `μ̄`.
     fn refresh(&mut self) -> Result<(), String> {
         for ((mean, log_sd), groups) in self.average.iter().zip(&self.log_sd).zip(&self.groups) {
@@ -337,7 +293,6 @@ impl DevicePosterior {
     fn restart(&mut self) -> Result<(), String> {
         self.average = self.mean.iter().map(|m| self.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
         self.averaged = 0;
-        self.line_state = None;
         self.refresh()
     }
 
@@ -346,91 +301,16 @@ impl DevicePosterior {
         self.fitting.download(&self.average[i]).map_err(error)
     }
 
-    /// The trial step at which the iterate sits while a line step awaits its measurement.
-    #[must_use]
-    pub fn line_trial(&self) -> Option<f64> {
-        self.line_trial_pending()
+    /// Holds the means (`η = 0` every step) while `hold`: a pass that sets the deviations and the
+    /// curvature only, such as a pricing pass.
+    pub fn hold_means(&mut self, hold: bool) {
+        self.hold = hold;
     }
 
-    /// Sets the epoch-ratio arm: each step's length along IVON's full direction `d` from the
-    /// Gauss–Newton model of `F` along `d`, `η = (Σ h d² + Σ δ d²) / (ρ̄ Σ h d² + Σ δ d²)` (the
-    /// filtered gradient's slope `ĝ · d = Σ (h + δ) d²` over the curvature along `d`), with the data
-    /// curvature `ρ̄ Σ h d²`: `ρ̄` the average over the steps (uniform, then over about one epoch,
-    /// `w = max(1/t, 1 − β₂)`) of one draw's `c (u · d)² / Σ h d²` (`u` the step's sampled-label
-    /// factor, `c` the factor turning its square into curvature per token; `E[c (u · d)²] = dᵀ G d`
-    /// with the entries' joint terms the diagonal `h` omits). One draw is a single χ²₁-like sample
-    /// whatever the batch's tokens, and its epoch average is what the step uses; the iterate stays
-    /// until `RATIO_DRAWS` draws are averaged. No measurement pass: a step costs the plain step.
-    /// The A/B's outcome deletes this or the measured line step (`finish_line`).
-    pub fn set_epoch_ratio(&mut self, on: bool) {
-        self.epoch_ratio = on;
-    }
-
-    /// The last epoch-ratio step's `η` and the ratio average `ρ̄` with its draws.
+    /// The last step's `η` and the curvature ratio's average `ρ̄` with its draws.
     #[must_use]
-    pub fn epoch_ratio_state(&self) -> (f64, f64, u64) {
+    pub fn step_state(&self) -> (f64, f64, u64) {
         (self.last_eta, self.rho, self.rho_steps)
-    }
-
-    fn line_trial_pending(&self) -> Option<f64> {
-        self.line_state.as_ref().map(|_| self.ratio)
-    }
-
-    /// Puts a pending line step's iterate at `before − η d` (`η = 0`: where the step started), for
-    /// its measurement at the step's draws and the deviations the step set.
-    pub fn place_line(&mut self, eta: f64) -> Result<(), String> {
-        let state = self.line_state.as_ref().ok_or_else(|| error("no line step awaits a measurement"))?;
-        for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
-            self.fitting.axpy_from(mean, start, -eta, d).map_err(error)?;
-        }
-        Ok(())
-    }
-
-    /// Ends a line step from the data term per token in nats of a batch other than the step's
-    /// (its own draws) at the iterate `before − η d` for `η = 0, η₀, 2η₀`, all at the deviations
-    /// the step set (`DevicePosterior::place_line`). The step's direction came from its own batch,
-    /// whose noise it follows, so its own batch measures a descent that the others do not have
-    /// (vpd4l, one MLP block at 0.78M tokens, measured on the step's batch: the training data term
-    /// rose 2.35 → 3.28 → 12.5 → 15.6 bits per token over steps 0–3); another batch measures `F`
-    /// along `d` without that bias. The data term along `d` is the parabola through the three
-    /// values, and with the prior's exact slope `Σ δ μ d` and curvature `Σ δ d²` the measured `F` is
-    /// least at `η = (−D′(0) + Σ δ μ d) / (D″ + Σ δ d²)`, trusted up to twice the measured range;
-    /// where the measured curvature is not positive the step is the measured point of least `F`.
-    /// The next trial is this step (half the trial after none). No rate: the step's length is
-    /// measured on the objective, including the entries' joint moves that the diagonal curvature
-    /// `h` omits.
-    pub fn finish_line(&mut self, [zero, one, two]: [f64; 3], beta2: f64) -> Result<LineReport, String> {
-        let state = self.line_state.take().ok_or_else(|| error("no line step awaits a measurement"))?;
-        let trial = self.ratio;
-        let c = (zero - 2.0 * one + two) / (2.0 * trial * trial);
-        let descent = (3.0 * zero - 4.0 * one + two) / (2.0 * trial);
-        let (slope, curvature) = (descent + state.slope_prior, 2.0 * c + state.prior_curvature);
-        let objective = |eta: f64, data: f64| data - eta * state.slope_prior + 0.5 * eta * eta * state.prior_curvature;
-        let eta = if !(slope.is_finite() && curvature.is_finite()) {
-            0.0
-        } else if curvature > 0.0 {
-            (slope / curvature).clamp(0.0, 4.0 * trial)
-        } else {
-            [(0.0, zero), (trial, one), (2.0 * trial, two)].into_iter().map(|(eta, data)| (eta, objective(eta, data))).fold((0.0, f64::INFINITY), |best, x| if x.1 < best.1 { x } else { best }).0
-        };
-        for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
-            self.fitting.axpy_from(mean, start, -eta, d).map_err(error)?;
-        }
-        self.ratio = if eta > 0.0 { eta } else { 0.5 * trial };
-        self.ratio_steps += 1;
-        self.average_and_refresh(beta2)?;
-        Ok(LineReport { eta, trial, measured: 2.0 * c, draw: state.draw_curvature, diagonal: state.diagonal, own_slope: state.slope_data, slope: descent })
-    }
-
-    /// Ends a pending line step at `η` along its direction without a measurement: `η = 0` for a
-    /// caller that moves no mean (a pass that only sets the deviations), or a fraction a test
-    /// fixes. A fit measures its steps ([`DevicePosterior::finish_line`]).
-    pub fn settle_line(&mut self, eta: f64, beta2: f64) -> Result<(), String> {
-        let state = self.line_state.take().ok_or_else(|| error("no line step awaits a measurement"))?;
-        for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
-            self.fitting.axpy_from(mean, start, -eta, d).map_err(error)?;
-        }
-        self.average_and_refresh(beta2)
     }
 
     /// Operator `i`'s direction `d = before − μ` after the kernel's full step, with its terms added
@@ -576,9 +456,6 @@ impl DevicePosterior {
     /// per token. An operator the batch does not reach has neither, and its step takes the
     /// prior's alone.
     pub fn step(&mut self, gradients: &BTreeMap<usize, Tensor>, scale: f64, factor: (&BTreeMap<usize, Tensor>, f64), ivon: &Ivon) -> Result<(), String> {
-        if self.line_state.is_some() {
-            return Err(error("a line step awaits its measurement"));
-        }
         self.uploaded.clear();
         self.steps += 1;
         self.momentum_weights = PosteriorStep::weights_after(self.momentum_weights, ivon.beta1);
@@ -604,44 +481,41 @@ impl DevicePosterior {
             directions.push(self.line_terms(i, &before[i], (gradient, draw), &mut sums)?);
         }
         {
-            // The step's terms along `d`; the iterate waits at the trial step for its measurement
-            // (`DevicePosterior::finish_line`), which also averages and refreshes.
+            // The step's length along `d`: the minimum along `d` of `F`'s Gauss–Newton model,
+            // `η = (Σ h d² + Σ δ d²) / (ρ̄ Σ h d² + Σ δ d²)` (the filtered gradient's slope
+            // `ĝ · d = Σ (h + δ) d²` over the curvature along `d`), with the data curvature
+            // `ρ̄ Σ h d²`: `ρ̄` the average over the steps (uniform, then over about one epoch,
+            // `w = max(1/t, 1 − β₂)`) of one draw's `c (u · d)² / Σ h d²` (`u` the step's
+            // sampled-label factor, `c` the factor turning its square into curvature per token:
+            // `E[c (u · d)²] = dᵀ G d`, with the entries' joint terms the diagonal `h` omits). One
+            // draw is a single χ²₁-like sample whatever the batch's tokens; the epoch's average is
+            // what the step uses, and the iterate stays until `RATIO_DRAWS` draws are averaged. At
+            // 2^24 a step measured on the next batch instead (one batch's noisy measurement, three
+            // forward passes) reached held-out F 2.230, 2.154, 2.100 after epochs 1–3 against this
+            // rule's 2.202, 2.096, 2.015 at two thirds of the time; on the one-block case at equal
+            // tokens it ended at 2.633 against 2.866 bits per token but took 2.6 times the time.
             let variances = self.variances()?;
             let terms = self.wide.download(&sums).map_err(error)?;
             let column = |k: usize| terms.column(k).to_vec();
             let precision = |g: usize| if variances[g] > 0.0 { 1.0 / (self.tokens * variances[g]) } else { 0.0 };
             let weighted = |values: Vec<f64>| -> f64 { values.iter().enumerate().map(|(g, x)| precision(g) * x).sum() };
             let along_u: f64 = column(3).iter().sum();
-            let state = LineState {
-                slope_data: scale * column(0).iter().sum::<f64>(),
-                prior_curvature: weighted(column(1)),
-                slope_prior: weighted(column(2)),
-                draw_curvature: factor.1 * along_u * along_u,
-                diagonal: column(4).iter().sum(),
-                before,
-                directions,
-            };
-            if self.epoch_ratio {
-                if state.diagonal > 0.0 {
-                    self.rho_steps += 1;
-                    let w = (1.0 / self.rho_steps as f64).max(1.0 - ivon.beta2);
-                    self.rho += w * (state.draw_curvature / state.diagonal - self.rho);
-                }
-                let (slope, curvature) = (state.diagonal + state.prior_curvature, self.rho * state.diagonal + state.prior_curvature);
-                let eta = if self.rho_steps < RATIO_DRAWS || !(curvature > 0.0 && slope.is_finite()) { 0.0 } else { slope / curvature };
-                self.last_eta = eta;
-                for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
-                    self.fitting.axpy_from(mean, start, -eta, d).map_err(error)?;
-                }
-                return self.average_and_refresh(ivon.beta2);
+            let draw_curvature = factor.1 * along_u * along_u;
+            let diagonal: f64 = column(4).iter().sum();
+            let prior_curvature = weighted(column(1));
+            if diagonal > 0.0 {
+                self.rho_steps += 1;
+                let w = (1.0 / self.rho_steps as f64).max(1.0 - ivon.beta2);
+                self.rho += w * (draw_curvature / diagonal - self.rho);
             }
-            for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
-                *mean = self.fitting.copy(start).map_err(error)?;
-                self.fitting.axpy(mean, -self.ratio, d).map_err(error)?;
+            let (slope, curvature) = (diagonal + prior_curvature, self.rho * diagonal + prior_curvature);
+            let eta = if self.hold || self.rho_steps < RATIO_DRAWS || !(curvature > 0.0 && slope.is_finite()) { 0.0 } else { slope / curvature };
+            self.last_eta = eta;
+            for ((mean, start), d) in self.mean.iter_mut().zip(&before).zip(&directions) {
+                self.fitting.axpy_from(mean, start, -eta, d).map_err(error)?;
             }
-            self.line_state = Some(state);
         }
-        Ok(())
+        self.average_and_refresh(ivon.beta2)
     }
 
     /// The number of prior groups.
@@ -794,15 +668,15 @@ impl DevicePosterior {
         self.averaged
     }
 
-    /// The line arm's next trial step and the line steps taken.
+    /// The step's curvature-ratio average `ρ̄` and the draws it averages.
     #[must_use]
     pub fn line_ratio(&self) -> (f64, u64) {
-        (self.ratio, self.ratio_steps)
+        (self.rho, self.rho_steps)
     }
 
-    /// The line arm's next trial step and its steps, restored from a checkpoint.
-    pub fn set_line_ratio(&mut self, (ratio, steps): (f64, u64)) {
-        (self.ratio, self.ratio_steps) = (ratio, steps);
+    /// The step's curvature-ratio average and its draws, restored from a checkpoint.
+    pub fn set_line_ratio(&mut self, (rho, steps): (f64, u64)) {
+        (self.rho, self.rho_steps) = (rho, steps);
     }
 
     /// Trainable operator `i`'s state on the host as the device holds it, one operator at a time
@@ -879,57 +753,6 @@ mod tests {
     /// variance is the empirical-Bayes value at the posterior mean `μ̄` (not at the iterate),
     /// stays within 10% of its start (the iterate-charged variance grew 35% per epoch on vpd4l), and the curvature-free entries' `μ̄` go to zero against the prior
     /// scale `√v_G`.
-    /// A line step on a quadratic data term `D(μ) = ½ a Σ (μ − t)²` (gradient `a (μ − t)` per
-    /// token, measured exactly at the iterate) lands on the minimum along its direction of
-    /// `D + Σ δ μ² / 2`: the parabola through the two measurements is exact.
-    #[test]
-    fn a_line_step_on_a_quadratic_lands_on_the_minimum_along_its_direction() {
-        const R: usize = 16;
-        let device = Device::host();
-        let tokens = 1000.0;
-        let a = 3.0;
-        let target = Array2::from_shape_fn((1, R), |(_, i)| 0.2 + 0.05 * i as f64);
-        let mean = Array2::from_elem((1, R), 0.1);
-        let log_sd = Array2::from_elem((1, R), -4.0);
-        let groups = vec![vec![0u32; R]];
-        let parts = Parts { operators: &[0], mean: std::slice::from_ref(&mean), log_sd: std::slice::from_ref(&log_sd), groups: &groups, count: 1 };
-        let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens, None, 0).unwrap();
-        let ivon = Ivon { beta1: 0.9, beta2: 0.75 };
-        let data = |mu: &Array2<f64>| 0.5 * a * mu.iter().zip(&target).map(|(m, t)| (m - t) * (m - t)).sum::<f64>();
-        let factor = device.upload(Array2::from_elem((1, R), a.sqrt()).view()).unwrap();
-        for step in 0..2 {
-            let mu = device.download(&posterior.mean[0]).unwrap();
-            let gradient = Array2::from_shape_fn((1, R), |(_, i)| a * (mu[(0, i)] - target[(0, i)]));
-            let gradients = BTreeMap::from([(0, device.upload(gradient.view()).unwrap())]);
-            let factors = BTreeMap::from([(0, device.copy(&factor).unwrap())]);
-            posterior.step(&gradients, 1.0, (&factors, 1.0), &ivon).unwrap();
-            let trial = posterior.line_trial().expect("a pending line step");
-            let delta = 1.0 / (tokens * posterior.variances().unwrap()[0]);
-            let state = posterior.line_state.as_ref().unwrap();
-            let (start, d) = (device.download(&state.before[0]).unwrap(), device.download(&state.directions[0]).unwrap());
-            let mut values = [0.0; 3];
-            for (k, value) in values.iter_mut().enumerate() {
-                posterior.place_line(trial * k as f64).unwrap();
-                *value = data(&device.download(&posterior.mean[0]).unwrap());
-            }
-            let report = posterior.finish_line(values, ivon.beta2).unwrap();
-            let slope: f64 = start.iter().zip(&d).zip(&target).map(|((m, x), t)| (a * (m - t) + delta * m) * x).sum();
-            let curvature: f64 = d.iter().map(|x| (a + delta) * x * x).sum();
-            if step == 0 {
-                // The first step has one gradient, no measured spread, no direction.
-                assert_eq!(report.eta, 0.0);
-                continue;
-            }
-            let exact = (slope / curvature).clamp(0.0, 4.0 * trial);
-            assert!(curvature > 0.0 && exact > 0.0, "no descent along d: slope {slope}, curvature {curvature}");
-            assert!((report.eta - exact).abs() <= 1e-9 * exact, "η {} against the minimum {exact}", report.eta);
-            let landed = device.download(&posterior.mean[0]).unwrap();
-            for ((x, m), dx) in landed.iter().zip(&start).zip(&d) {
-                assert!((x - (m - exact * dx)).abs() <= 1e-12, "the iterate is not at the step");
-            }
-        }
-    }
-
     #[test]
     fn the_variance_is_charged_at_the_averaged_mean_and_stays_bounded() {
         const R: usize = 64;
@@ -957,8 +780,6 @@ mod tests {
             let gradients = BTreeMap::from([(0, device.upload(gradient.view()).unwrap())]);
             let factors = BTreeMap::from([(0, device.copy(&factor).unwrap())]);
             posterior.step(&gradients, 1.0, (&factors, 1.0), &ivon).unwrap();
-            // A tenth of IVON's direction, as a line step whose measurement the test does not model.
-            posterior.settle_line(0.1, ivon.beta2).unwrap();
             largest = largest.max(posterior.variances().unwrap()[0]);
         }
         let (mean, log_sd) = posterior.values(0).unwrap();

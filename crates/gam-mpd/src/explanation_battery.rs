@@ -1950,6 +1950,8 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
     let parts = crate::device_posterior::Parts { operators: &trainable, mean: &means, log_sd: &log_sd, groups: &groups, count: base };
     let state = started.as_ref().map(|_| crate::device_posterior::State::Zero);
     let mut posterior = crate::device_posterior::DevicePosterior::from_parts(&device, &parts, tokens, state, 0)?;
+    // The pass sets the deviations and the curvature only: the means stay where they are.
+    posterior.hold_means(true);
     if let Some(arrays) = started {
         for (i, (log_sd, curvature)) in arrays.iter().enumerate() {
             posterior.set_start(i, log_sd, curvature)?;
@@ -1987,8 +1989,6 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
                 let (_, factor) = program.vjp_values_dense(&trace, BTreeMap::from([(hidden_node, labels)]), &[], &trainable, arithmetic)?;
                 let per_token = 1.0 / family.rows as f64;
                 posterior.step(&gradients, per_token, (&factor, per_token), &ivon)?;
-                // The pass sets the deviations only: the means stay where they are.
-                posterior.settle_line(0.0, ivon.beta2)?;
             }
             out.push((kl, family.rows));
         }
