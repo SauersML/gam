@@ -489,6 +489,21 @@ pub fn values(native: &OperatorProgram, artifact: &Artifact, layers: &[LayerNode
     let (flat, entries, reads) = sites(artifact, layers)?;
     let program = &artifact.program;
     let named: BTreeMap<&str, usize> = program.operators.iter().enumerate().map(|(i, op)| (op.name.as_str(), i)).collect();
+    // The flat program's nodes by the operator their first term applies, and the read-map owners by
+    // the native operator they replace (in the ownership map's order): each variable looks up its
+    // own instead of scanning every node or owner.
+    let mut applying: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (n, node) in flat.nodes.iter().enumerate() {
+        if let Node::Affine { terms, .. } = node
+            && let Some(first) = terms.first()
+        {
+            applying.entry(first.1).or_default().push(n);
+        }
+    }
+    let mut owners: HashMap<&str, Vec<&crate::artifact::Owner>> = HashMap::new();
+    for owner in artifact.owners.iter().filter(|o| READS.contains(&o.role.as_str())) {
+        owners.entry(owner.native.as_str()).or_default().push(owner);
+    }
     // Per variable, per site: the observation path or the node, and the columns.
     let mut found: Vec<Vec<(Result<Vec<usize>, usize>, Range<usize>)>> = Vec::with_capacity(variables.len());
     for v in variables {
@@ -497,15 +512,14 @@ pub fn values(native: &OperatorProgram, artifact: &Artifact, layers: &[LayerNode
             let name = native.operators.get(*op).map(|o| o.name.as_str()).ok_or_else(|| error("a read variable of an unknown native operator"))?;
             if artifact.owners.is_empty() {
                 let at = *named.get(name).ok_or_else(|| error(format!("{name}: not an operator of the model")))?;
-                let mut applying = flat.nodes.iter().enumerate().filter(|(_, n)| matches!(n, Node::Affine { terms, .. } if terms.first().is_some_and(|t| t.1 == at)));
-                let node = match (applying.next(), applying.next()) {
-                    (Some((n, _)), None) => n,
+                let node = match applying.get(&at).map(Vec::as_slice) {
+                    Some(&[n]) => n,
                     _ => return Err(error(format!("{name}: not applied by exactly one node"))),
                 };
                 out.push((Err(node), rows.clone()));
                 continue;
             }
-            for owner in artifact.owners.iter().filter(|o| o.native == name && READS.contains(&o.role.as_str())) {
+            for owner in owners.get(name).into_iter().flatten() {
                 let (from, to) = (rows.start.max(owner.native_rows.start), rows.end.min(owner.native_rows.end));
                 if from >= to {
                     continue;
