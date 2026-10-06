@@ -3847,10 +3847,32 @@ pub fn start_posterior(device: &Device, native: &OperatorProgram, explanation: &
     for draw in &draws {
         tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
     }
+    // Seconds of the start's parts: the posterior made on the host, sent to the device, the
+    // curvature pass over the training batches, and the deviations made on the host.
+    let mut seconds = [0.0_f64; 4];
+    let mut timed = Instant::now();
+    let mut lap = |part: usize, timed: &mut Instant| {
+        seconds[part] = timed.elapsed().as_secs_f64();
+        *timed = Instant::now();
+    };
     let mut posterior = Posterior::new(explanation, tokens)?;
+    lap(0, &mut timed);
     let device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, None, 0)?;
+    device.synchronize().map_err(error)?;
+    lap(1, &mut timed);
     let sums = laplace_sums(&mut scorer, &device_posterior, &draws, sequences, settings)?;
+    device.synchronize().map_err(error)?;
+    lap(2, &mut timed);
     laplace_start(&scorer, &mut posterior, sums, tokens, |_, _, _| Ok(()))?;
+    lap(3, &mut timed);
+    log::info!(
+        "library start parts: posterior on the host {:.1} s, to the device {:.1} s, curvature pass {:.1} s, deviations on the host {:.1} s ({} parameters)",
+        seconds[0],
+        seconds[1],
+        seconds[2],
+        seconds[3],
+        posterior.mean.iter().map(|m| m.len()).sum::<usize>()
+    );
     Ok(posterior)
 }
 
