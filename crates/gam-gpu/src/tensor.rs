@@ -1033,6 +1033,22 @@ impl Device {
         }
     }
 
+    /// The eigendecomposition of the symmetric float64 matrix `a` (its lower triangle read) by
+    /// cuSOLVER's divide and conquer (`cusolverDnDsyevd`) on CUDA: the eigenvalues in increasing
+    /// order and the eigenvectors as columns, within the backward error of a stable symmetric
+    /// eigensolver that `gam_linalg::roundoff::symmetric_spectrum_rounding_band` bounds. `None` on
+    /// the host and the Apple GPU (no float64 there), whose callers decompose on the host.
+    pub fn symmetric_eigh(&self, a: ArrayView2<'_, f64>) -> Result<Option<(ndarray::Array1<f64>, Array2<f64>)>, GpuError> {
+        if a.nrows() != a.ncols() {
+            return Err(shape(format!("a {:?} matrix for a symmetric eigendecomposition", a.dim())));
+        }
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if a.nrows() > 0 => engine.symmetric_eigh(a).map(Some),
+            _ => Ok(None),
+        }
+    }
+
     /// `y ← y + α x`.
     pub fn axpy(&self, y: &mut Tensor, alpha: f64, x: &Tensor) -> Result<(), GpuError> {
         same(x, y, "axpy")?;
@@ -4646,6 +4662,52 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             .result();
             drop((record_a, record_c, serial));
             update.gpu_ctx("tensor DSYRK")
+        }
+
+        /// [`super::Device::symmetric_eigh`] on a stream of its own (the MLPs of a removal trial
+        /// decompose concurrently): the row-major lower triangle is the column-major upper one,
+        /// which `cusolverDnDsyevd` reads, and the buffer it leaves holds the eigenvectors as
+        /// column-major columns.
+        pub(super) fn symmetric_eigh(&self, a: ndarray::ArrayView2<'_, f64>) -> Result<(ndarray::Array1<f64>, ndarray::Array2<f64>), GpuError> {
+            use cudarc::cusolver::sys as solver;
+            let n = a.nrows();
+            let order = i32_of(n)?;
+            let failed = |what: &str, e: cudarc::cusolver::result::CusolverError| GpuError::DriverCallFailed { reason: format!("cuSOLVER symmetric eigendecomposition, {what}: {e:?}") };
+            let stream = self.ctx.new_stream().gpu_ctx("eigendecomposition stream")?;
+            let handle = cudarc::cusolver::DnHandle::new(stream.clone()).map_err(|e| failed("handle", e))?;
+            let entries: Vec<f64> = a.iter().copied().collect();
+            let mut matrix = stream.clone_htod(&entries).gpu_ctx("eigendecomposition upload")?;
+            let mut values = stream.alloc_zeros::<f64>(n).gpu_ctx("eigendecomposition values")?;
+            let mut info = stream.alloc_zeros::<i32>(1).gpu_ctx("eigendecomposition info")?;
+            let (jobz, uplo) = (solver::cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR, solver::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER);
+            let mut lwork = 0_i32;
+            {
+                let (pa, record_a) = matrix.device_ptr(&stream);
+                let (pw, record_w) = values.device_ptr(&stream);
+                // SAFETY: `matrix` holds n × n and `values` n float64 values; the pointers outlive
+                // the call.
+                let sized = unsafe { solver::cusolverDnDsyevd_bufferSize(handle.cu(), jobz, uplo, order, pa as *const f64, order, pw as *const f64, &mut lwork) }.result();
+                drop((record_a, record_w));
+                sized.map_err(|e| failed("workspace size", e))?;
+            }
+            let mut work = stream.alloc_zeros::<f64>(usize::try_from(lwork.max(1)).unwrap_or(1)).gpu_ctx("eigendecomposition workspace")?;
+            {
+                let (pa, record_a) = matrix.device_ptr_mut(&stream);
+                let (pw, record_w) = values.device_ptr_mut(&stream);
+                let (pk, record_k) = work.device_ptr_mut(&stream);
+                let (pi, record_i) = info.device_ptr_mut(&stream);
+                // SAFETY: as above, with `work` of `lwork` float64 values and `info` one integer.
+                let solved = unsafe { solver::cusolverDnDsyevd(handle.cu(), jobz, uplo, order, pa as *mut f64, order, pw as *mut f64, pk as *mut f64, lwork, pi as *mut i32) }.result();
+                drop((record_a, record_w, record_k, record_i));
+                solved.map_err(|e| failed("solve", e))?;
+            }
+            let status = stream.clone_dtoh(&info).gpu_ctx("eigendecomposition info")?;
+            if status.first().copied() != Some(0) {
+                return Err(GpuError::DriverCallFailed { reason: format!("cusolverDnDsyevd: info {status:?} (a positive value: off-diagonal entries that did not converge)") });
+            }
+            let values = stream.clone_dtoh(&values).gpu_ctx("eigendecomposition values")?;
+            let columns = stream.clone_dtoh(&matrix).gpu_ctx("eigendecomposition vectors")?;
+            Ok((ndarray::Array1::from(values), ndarray::Array2::from_shape_fn((n, n), |(i, j)| columns[j * n + i])))
         }
 
         /// One `cublasGemmEx` (strided-batched when `batch` exceeds one), serialized on the handle

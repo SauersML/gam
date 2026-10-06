@@ -408,3 +408,32 @@ fn proposal_gemm_workspace_handles_shape_changes_accumulation_and_overwrite() {
         }
     }
 }
+
+#[test]
+fn the_device_eigendecomposition_agrees_with_the_host() {
+    use gam_linalg::{decompose::eigh, roundoff::{SymmetricAssembly, symmetric_spectrum_rounding_band}};
+    let Some(device) = accelerator() else { return };
+    // A Gram matrix of rank 40 in 96 dimensions (eigenvalues at zero, as a removal's scaled Gram
+    // has) and a full-rank one with a spread spectrum.
+    for (rows, n, seed) in [(40, 96, 3), (400, 200, 5)] {
+        let b = matrix(rows, n, seed, 1.0);
+        let a = b.t().dot(&b);
+        let Some((values, vectors)) = device.symmetric_eigh(a.view()).expect("the device decomposes") else { return };
+        let host = eigh(a.view(), SymmetricAssembly::Mirrored, None).expect("the host decomposes");
+        let band = symmetric_spectrum_rounding_band(values.as_slice().expect("contiguous"));
+        assert!(values.windows(2).into_iter().all(|w| w[0] <= w[1]), "increasing eigenvalues");
+        for (d, h) in values.iter().zip(&host.values) {
+            assert!((d - h).abs() <= band + host.band, "eigenvalue {d} on the device, {h} on the host, bands {band} and {}", host.band);
+        }
+        // Orthonormal columns, and the matrix rebuilt from them, within the band.
+        let gram = vectors.t().dot(&vectors);
+        let unit = n as f64 * f64::EPSILON;
+        for ((i, j), v) in gram.indexed_iter() {
+            assert!((v - if i == j { 1.0 } else { 0.0 }).abs() <= unit, "column products ({i}, {j}) = {v}");
+        }
+        let rebuilt = vectors.dot(&ndarray::Array2::from_diag(&values)).dot(&vectors.t());
+        for ((i, j), v) in rebuilt.indexed_iter() {
+            assert!((v - a[[i, j]]).abs() <= band, "entry ({i}, {j}): {v} rebuilt, {} given", a[[i, j]]);
+        }
+    }
+}

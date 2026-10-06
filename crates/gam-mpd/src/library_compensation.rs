@@ -47,11 +47,14 @@ use crate::{
     operator_program::{Node, OperatorProgram},
     run_check::LayerNodes,
 };
-use gam_gpu::{gpu_error::GpuError, tensor::Storage};
+use gam_gpu::{
+    gpu_error::GpuError,
+    tensor::{Device, Storage},
+};
 use gam_linalg::{
     decompose::{Eigh, eigh},
     faer_ndarray::{fast_ab, fast_ata, fast_atb},
-    roundoff::SymmetricAssembly,
+    roundoff::{SymmetricAssembly, symmetric_spectrum_rounding_band},
 };
 use ndarray::{Array1, Array2, Axis};
 use rayon::prelude::*;
@@ -97,6 +100,8 @@ pub struct Compensation {
     mlps: Vec<Mlp>,
     /// The rows (tokens) the Gram matrices sum over.
     rows: usize,
+    /// `P`'s device, which decomposes the scaled Gram matrices where it holds float64 (CUDA).
+    device: Device,
 }
 
 /// The operator of `program` named `name`.
@@ -210,7 +215,7 @@ impl Compensation {
                 mlp.gram = Array2::from_shape_fn(gram.dim(), |(i, j)| if i >= j { gram[[i, j]] } else { gram[[j, i]] });
             }
         }
-        Ok(Self { mlps, rows })
+        Ok(Self { mlps, rows, device: device.clone() })
     }
 
     /// `γ_T`, the relative bound on a `T`-term float64 dot product's rounding over the Gram's rows.
@@ -264,7 +269,11 @@ impl Compensation {
         for ((a, b), value) in scaled.indexed_iter_mut() {
             *value *= root[a] * root[b];
         }
-        let decomposition = eigh(scaled.view(), SymmetricAssembly::Mirrored, None).map_err(error)?;
+        // On CUDA by cuSOLVER (`Device::symmetric_eigh`, the same backward-error band), else on the host.
+        let decomposition = match self.device.symmetric_eigh(scaled.view()).map_err(error)? {
+            Some((values, vectors)) => Eigh { band: symmetric_spectrum_rounding_band(values.as_slice().ok_or_else(|| error("eigenvalues not contiguous"))?), values, vectors },
+            None => eigh(scaled.view(), SymmetricAssembly::Mirrored, None).map_err(error)?,
+        };
         let floor = decomposition.band + self.gamma()? * scaled.diag().sum();
         Ok((root, decomposition, floor))
     }
