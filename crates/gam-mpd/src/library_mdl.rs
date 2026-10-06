@@ -3047,17 +3047,19 @@ pub fn fit_from(
             let factor_weight = weight * scored as f64 / factor.tokens as f64;
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &ivon)?;
             if let Some(trial) = device_posterior.line_trial() {
-                // The line step's measurement: the batch's data term at the step's draws around the
-                // iterate where the step started and moved by the trial step, both at the
-                // deviations the step set (`DevicePosterior::finish_line`).
-                device_posterior.place_line(0.0)?;
-                let zero_bits = line_trial_bits(&mut scorer, &device_posterior, &batch, &experiments, (key, settings.one_sample))?;
-                device_posterior.place_line(trial)?;
-                let trial_bits = line_trial_bits(&mut scorer, &device_posterior, &batch, &experiments, (key, settings.one_sample))?;
-                let line = device_posterior.finish_line(weight * LN_2 * zero_bits, weight * LN_2 * trial_bits, ivon.beta2)?;
+                // The line step's measurement on the next batch, at its own draws, at η = 0, η₀ and
+                // 2η₀ (`DevicePosterior::finish_line`).
+                let other = (b + 1) % draws.len();
+                let (other_batch, other_experiments) = (draws[other].batch(sequences)?, scorer.experiments(&draws[other], sequences)?);
+                let mut values = [0.0; 3];
+                for (k, value) in values.iter_mut().enumerate() {
+                    device_posterior.place_line(trial * k as f64)?;
+                    *value = weight * LN_2 * line_trial_bits(&mut scorer, &device_posterior, &other_batch, &other_experiments, (training_key(settings.seed, other), settings.one_sample))?;
+                }
+                let line = device_posterior.finish_line(values, ivon.beta2)?;
                 log::info!(
-                    "library line step {epoch}.{b}: η {:.4e} (trial {trial:.4e}); data curvature along d per token: measured {:.4e}, one Gauss–Newton draw {:.4e}, diagonal Σ h d² {:.4e}",
-                    line.eta, line.measured, line.draw, line.diagonal
+                    "library line step {epoch}.{b}: η {:.4e} (trial {trial:.4e}); data slope down d per token: measured {:.4e}, the step's own gradient {:.4e}; data curvature along d: measured {:.4e}, one Gauss–Newton draw {:.4e}, diagonal Σ h d² {:.4e}",
+                    line.eta, line.slope, line.own_slope, line.measured, line.draw, line.diagonal
                 );
             }
             let prior_note = if prior.is_some() { format!(" (prior: {prior_seconds:.3} s)") } else { String::new() };

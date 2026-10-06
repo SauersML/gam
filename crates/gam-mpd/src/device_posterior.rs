@@ -60,6 +60,9 @@ pub struct LineReport {
     pub measured: f64,
     pub draw: f64,
     pub diagonal: f64,
+    /// The data term's slope down `d` from the step's own gradient, and as measured.
+    pub own_slope: f64,
+    pub slope: f64,
 }
 
 fn error(e: impl std::fmt::Display) -> String {
@@ -379,33 +382,32 @@ impl DevicePosterior {
         Ok(())
     }
 
-    /// Ends a line step from the batch's data term per token in nats at `η = 0` (`data_zero`) and
-    /// at the trial step `η₀` (`data_trial`), both at the step's draws around the iterate
-    /// `before − η d` with the deviations the step set (`DevicePosterior::place_line`): the
-    /// step's own estimate was made at the deviations before it, and their change would enter the
-    /// measured curvature. With the slope `S = Σ g d + Σ δ μ d` known from the gradient, the
-    /// data term along `d` is the parabola through both values, `D(η) = D₀ − (Σ g d) η + c η²`,
-    /// `c = (D(η₀) − D₀ + η₀ Σ g d) / η₀²`, and with the prior's exact `½ η² Σ δ d²` the batch's `F`
-    /// is least at `η = S / (2 c + Σ δ d²)`. That minimum is trusted up to twice the measured
-    /// range; where the measured curvature is not positive the step is the trial if it lowered
-    /// `F`, else none. The next trial is this step (half the trial after none). No rate: the
-    /// step's length is measured on the objective, including the entries' joint moves that the
-    /// diagonal curvature `h` omits.
-    pub fn finish_line(&mut self, data_zero: f64, data_trial: f64, beta2: f64) -> Result<LineReport, String> {
+    /// Ends a line step from the data term per token in nats of a batch other than the step's
+    /// (its own draws) at the iterate `before − η d` for `η = 0, η₀, 2η₀`, all at the deviations
+    /// the step set (`DevicePosterior::place_line`). The step's direction came from its own batch,
+    /// whose noise it follows, so its own batch measures a descent that the others do not have
+    /// (vpd4l, one MLP block at 0.78M tokens, measured on the step's batch: the training data term
+    /// rose 2.35 → 3.28 → 12.5 → 15.6 bits per token over steps 0–3); another batch measures `F`
+    /// along `d` without that bias. The data term along `d` is the parabola through the three
+    /// values, and with the prior's exact slope `Σ δ μ d` and curvature `Σ δ d²` the measured `F` is
+    /// least at `η = (−D′(0) + Σ δ μ d) / (D″ + Σ δ d²)`, trusted up to twice the measured range;
+    /// where the measured curvature is not positive the step is the measured point of least `F`.
+    /// The next trial is this step (half the trial after none). No rate: the step's length is
+    /// measured on the objective, including the entries' joint moves that the diagonal curvature
+    /// `h` omits.
+    pub fn finish_line(&mut self, [zero, one, two]: [f64; 3], beta2: f64) -> Result<LineReport, String> {
         let state = self.line_state.take().ok_or_else(|| error("no line step awaits a measurement"))?;
         let trial = self.ratio;
-        let slope = state.slope_data + state.slope_prior;
-        let c = (data_trial - data_zero + trial * state.slope_data) / (trial * trial);
-        let curvature = 2.0 * c + state.prior_curvature;
-        let lowered = data_trial - trial * state.slope_prior + 0.5 * trial * trial * state.prior_curvature < data_zero;
-        let eta = if !(slope.is_finite() && c.is_finite()) {
+        let c = (zero - 2.0 * one + two) / (2.0 * trial * trial);
+        let descent = (3.0 * zero - 4.0 * one + two) / (2.0 * trial);
+        let (slope, curvature) = (descent + state.slope_prior, 2.0 * c + state.prior_curvature);
+        let objective = |eta: f64, data: f64| data - eta * state.slope_prior + 0.5 * eta * eta * state.prior_curvature;
+        let eta = if !(slope.is_finite() && curvature.is_finite()) {
             0.0
         } else if curvature > 0.0 {
-            (slope / curvature).clamp(0.0, 2.0 * trial)
-        } else if lowered {
-            trial
+            (slope / curvature).clamp(0.0, 4.0 * trial)
         } else {
-            0.0
+            [(0.0, zero), (trial, one), (2.0 * trial, two)].into_iter().map(|(eta, data)| (eta, objective(eta, data))).fold((0.0, f64::INFINITY), |best, x| if x.1 < best.1 { x } else { best }).0
         };
         for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
             *mean = self.fitting.copy(start).map_err(error)?;
@@ -414,7 +416,7 @@ impl DevicePosterior {
         self.ratio = if eta > 0.0 { eta } else { 0.5 * trial };
         self.ratio_steps += 1;
         self.average_and_refresh(beta2)?;
-        Ok(LineReport { eta, trial, measured: 2.0 * c, draw: state.draw_curvature, diagonal: state.diagonal })
+        Ok(LineReport { eta, trial, measured: 2.0 * c, draw: state.draw_curvature, diagonal: state.diagonal, own_slope: state.slope_data, slope: descent })
     }
 
     /// Operator `i`'s direction `d = before − μ` after the kernel's full step, with its terms added
@@ -886,11 +888,12 @@ mod tests {
             let delta = 1.0 / (tokens * posterior.variances().unwrap()[0]);
             let state = posterior.line_state.as_ref().unwrap();
             let (start, d) = (device.download(&state.before[0]).unwrap(), device.download(&state.directions[0]).unwrap());
-            posterior.place_line(0.0).unwrap();
-            let zero = data(&device.download(&posterior.mean[0]).unwrap());
-            posterior.place_line(trial).unwrap();
-            let moved = data(&device.download(&posterior.mean[0]).unwrap());
-            let report = posterior.finish_line(zero, moved, ivon.beta2).unwrap();
+            let mut values = [0.0; 3];
+            for (k, value) in values.iter_mut().enumerate() {
+                posterior.place_line(trial * k as f64).unwrap();
+                *value = data(&device.download(&posterior.mean[0]).unwrap());
+            }
+            let report = posterior.finish_line(values, ivon.beta2).unwrap();
             let slope: f64 = start.iter().zip(&d).zip(&target).map(|((m, x), t)| (a * (m - t) + delta * m) * x).sum();
             let curvature: f64 = d.iter().map(|x| (a + delta) * x * x).sum();
             if step == 0 {
@@ -898,7 +901,7 @@ mod tests {
                 assert_eq!(report.eta, 0.0);
                 continue;
             }
-            let exact = (slope / curvature).clamp(0.0, 2.0 * trial);
+            let exact = (slope / curvature).clamp(0.0, 4.0 * trial);
             assert!(curvature > 0.0 && exact > 0.0, "no descent along d: slope {slope}, curvature {curvature}");
             assert!((report.eta - exact).abs() <= 1e-9 * exact, "η {} against the minimum {exact}", report.eta);
             let landed = device.download(&posterior.mean[0]).unwrap();
