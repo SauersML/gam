@@ -534,6 +534,10 @@ pub struct Library<'a> {
     unembedding_table: Tensor,
     /// The same on the model's device (the edited runs' vocabulary-wide products).
     unembedding_model: Tensor,
+    /// Each head's output map transposed (head width × width) on the model's device, and a column
+    /// of ones (width × 1): heads' output norms on the device.
+    head_outputs: Vec<Tensor>,
+    ones_column: Tensor,
     /// The input embedding (vocabulary × width), and the head (the unembedding after the final
     /// norm) on the model's device, which scores the explanation's distributions against `M`'s.
     embedding: Array2<f64>,
@@ -625,6 +629,8 @@ impl<'a> Library<'a> {
         let unembedding_mean = unembedding.mean_axis(Axis(0)).ok_or("an empty vocabulary")?;
         let unembedding_table = wide.upload(unembedding.view()).map_err(error)?;
         let unembedding_model = model.upload(unembedding.view()).map_err(error)?;
+        let head_outputs = heads.iter().map(|b: &HeadBlock| model.upload(b.output.t().to_owned().view()).map_err(error)).collect::<Result<Vec<_>, String>>()?;
+        let ones_column = model.upload(Array2::<f64>::ones((unembedding.ncols(), 1)).view()).map_err(error)?;
         let feature = native.nodes.iter().position(|n| matches!(n, Node::Feature { .. })).ok_or("no token feature")?;
         let embedding = native
             .nodes
@@ -671,6 +677,8 @@ impl<'a> Library<'a> {
             unembedding_mean,
             unembedding_table,
             unembedding_model,
+            head_outputs,
+            ones_column,
             embedding,
             resident,
             program: compiled,
@@ -1245,21 +1253,31 @@ impl<'a> Library<'a> {
         let gather = |node: usize| -> Result<Array2<f64>, String> { self.model.download(&gather_device(node)?).map_err(error) };
         let last_device = gather_device(self.observed[self.sites.len()])?;
         let last = self.model.download(&last_device).map_err(error)?;
-        let head_reads: Option<Vec<Array2<f64>>> = if heads || matches!(activity, Activity::All) {
+        let head_reads: Option<Vec<Array2<f64>>> = if heads {
             Some((0..self.heads.len()).map(|h| gather(self.observed[self.head_paths + 6 * h + 2])).collect::<Result<_, String>>()?)
         } else {
             None
+        };
+        // A head's output norm ‖W_O,h z_h‖ per read row, on the device.
+        let head_norm = |h: usize| -> Result<Array1<f64>, String> {
+            let z = gather_device(self.observed[self.head_paths + 6 * h + 2])?;
+            let width = self.heads[h].output.nrows();
+            let mut written = self.model.zeros(z.rows(), width).map_err(error)?;
+            self.model.gemm(&mut written, 1.0, &z, Op::N, &self.head_outputs[h], Op::N, 0.0, arithmetic(self.model)).map_err(error)?;
+            let mut squares = self.model.zeros(z.rows(), width).map_err(error)?;
+            self.model.hadamard(&mut squares, &written, &written, false).map_err(error)?;
+            let mut sums = self.model.zeros(z.rows(), 1).map_err(error)?;
+            self.model.gemm(&mut sums, 1.0, &squares, Op::N, &self.ones_column, Op::N, 0.0, arithmetic(self.model)).map_err(error)?;
+            Ok(self.model.download(&sums).map_err(error)?.column(0).mapv(|v| v.max(0.0).sqrt()))
         };
         let (head_columns, mlp_columns) = self.columns();
         let activity = match activity {
             Activity::None => None,
             Activity::All => {
                 let mut out = Array2::<f64>::zeros((read.len(), self.functions().len()));
-                let reads = head_reads.as_ref().ok_or("head reads")?;
                 for (l, members) in self.layer_heads.iter().enumerate() {
                     for (c, &h) in members.iter().enumerate() {
-                        let written = self.write(h, &reads[h]);
-                        out.column_mut(head_columns[l] + c).assign(&written.map_axis(Axis(1), |row| row.dot(&row).sqrt()));
+                        out.column_mut(head_columns[l] + c).assign(&head_norm(h)?);
                     }
                 }
                 for (b, block) in self.mlps.iter().enumerate() {
@@ -1311,7 +1329,7 @@ impl<'a> Library<'a> {
         } else {
             None
         };
-        Ok(Edited { last, last_device, activity, heads: if heads { head_reads } else { None }, inverses })
+        Ok(Edited { last, last_device, activity, heads: head_reads, inverses })
     }
 
     /// Per row of `edited` (rows × width, final streams before the final norm on the model's
@@ -2210,6 +2228,11 @@ mod tests {
                 assert!(largest(&scaled.last, &base.last) > 1e-8, "head {h}: the edit changed nothing");
             }
             let activity = clean.activity.expect("activity");
+            for (h, (layer, head)) in library.heads().into_iter().enumerate() {
+                let f = functions.iter().position(|g| g.name == format!("L{layer}.H{head}")).expect("a head's column");
+                let norms = library.write(h, &base.reads[h]).map_axis(ndarray::Axis(1), |row| row.dot(&row).sqrt());
+                assert!(norms.iter().zip(activity.column(f).iter()).all(|(a, b)| (a - b).abs() < 1e-9 * (1.0 + a)), "head {h}: output norms");
+            }
             for (b, f) in [(0, 3), (1, 5)] {
                 let (first, _) = functions.iter().enumerate().find(|(_, g)| g.layer == b && matches!(g.kind, super::Kind::Mlp)).expect("an MLP function");
                 let count = functions.iter().filter(|g| g.layer == b && matches!(g.kind, super::Kind::Mlp)).count();

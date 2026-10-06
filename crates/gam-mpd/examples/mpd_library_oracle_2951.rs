@@ -351,10 +351,8 @@ fn main() -> Result<(), String> {
         let e = library.edited(&pool, &edits, &Activity::All, false, false)?;
         let a = e.activity.ok_or("activity")?;
         for (k, edit) in edits.iter().enumerate() {
-            let rows = a.slice(ndarray::s![k * t..(k + 1) * t, ..]);
-            for f in 0..total {
-                peaks[[f, edit.sequence]] = rows.column(f).iter().fold(0.0_f64, |m, v| m.max(v.abs())) as f32;
-            }
+            let largest = a.slice(ndarray::s![k * t..(k + 1) * t, ..]).fold_axis(Axis(0), 0.0_f64, |m, v| m.max(v.abs()));
+            peaks.column_mut(edit.sequence).assign(&largest.mapv(|v| v as f32));
         }
         lasts.push(e.last.mapv(|v| v as f32));
     }
