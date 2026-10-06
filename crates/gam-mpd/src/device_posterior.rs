@@ -69,6 +69,12 @@ pub struct LineReport {
 /// ([`DevicePosterior::add_removal`]): about 45 MB of sums on vpd4l's 29,184 groups.
 pub const REMOVAL_READS: usize = 64;
 
+/// Draws of the epoch-ratio arm's curvature ratio averaged before its first move: the relative
+/// standard error of a mean of `K` single-draw ratios is `√(2 / K)`, one half at `K = 8` (and the
+/// chance that the mean is below a tenth of its expectation 0.08%, from 25% at one draw). At
+/// `N = 2^24` (4096 batches per epoch) the eight steps are 0.2% of the first epoch.
+const RATIO_DRAWS: u64 = 8;
+
 fn error(e: impl std::fmt::Display) -> String {
     format!("device posterior: {e}")
 }
@@ -145,6 +151,14 @@ pub struct DevicePosterior {
     /// at trial steps (`DevicePosterior::finish_line`); `ratio` is the next trial step and
     /// `ratio_steps` the line steps taken, `line_state` the step awaiting its measurement.
     ratio: f64,
+    /// The epoch-ratio arm (`DevicePosterior::set_epoch_ratio`): the step's length from the
+    /// epoch's average `rho` of one Gauss–Newton draw's curvature along `d` over the diagonal
+    /// model's, over `rho_steps` draws, in place of the measured line step; and the last step's
+    /// `η`.
+    epoch_ratio: bool,
+    rho: f64,
+    rho_steps: u64,
+    last_eta: f64,
     ratio_steps: u64,
     line_state: Option<LineState>,
     /// Per group `(n, Σ μ² + σ², Σ 2s)` being summed, its variance and its divergence in nats.
@@ -282,6 +296,10 @@ impl DevicePosterior {
             average: Vec::new(),
             averaged: 0,
             ratio: 1.0,
+            epoch_ratio: false,
+            rho: 1.0,
+            rho_steps: 0,
+            last_eta: 0.0,
             ratio_steps: 0,
             line_state: None,
             operators: parts.operators.to_vec(),
@@ -329,6 +347,30 @@ impl DevicePosterior {
     /// The trial step at which the iterate sits while a line step awaits its measurement.
     #[must_use]
     pub fn line_trial(&self) -> Option<f64> {
+        self.line_trial_pending()
+    }
+
+    /// Sets the epoch-ratio arm: each step's length along IVON's full direction `d` from the
+    /// Gauss–Newton model of `F` along `d`, `η = (Σ h d² + Σ δ d²) / (ρ̄ Σ h d² + Σ δ d²)` (the
+    /// filtered gradient's slope `ĝ · d = Σ (h + δ) d²` over the curvature along `d`), with the data
+    /// curvature `ρ̄ Σ h d²`: `ρ̄` the average over the steps (uniform, then over about one epoch,
+    /// `w = max(1/t, 1 − β₂)`) of one draw's `c (u · d)² / Σ h d²` (`u` the step's sampled-label
+    /// factor, `c` the factor turning its square into curvature per token; `E[c (u · d)²] = dᵀ G d`
+    /// with the entries' joint terms the diagonal `h` omits). One draw is a single χ²₁-like sample
+    /// whatever the batch's tokens, and its epoch average is what the step uses; the iterate stays
+    /// until `RATIO_DRAWS` draws are averaged. No measurement pass: a step costs the plain step.
+    /// The A/B's outcome deletes this or the measured line step (`finish_line`).
+    pub fn set_epoch_ratio(&mut self, on: bool) {
+        self.epoch_ratio = on;
+    }
+
+    /// The last epoch-ratio step's `η` and the ratio average `ρ̄` with its draws.
+    #[must_use]
+    pub fn epoch_ratio_state(&self) -> (f64, f64, u64) {
+        (self.last_eta, self.rho, self.rho_steps)
+    }
+
+    fn line_trial_pending(&self) -> Option<f64> {
         self.line_state.as_ref().map(|_| self.ratio)
     }
 
@@ -569,6 +611,21 @@ impl DevicePosterior {
                 before,
                 directions,
             };
+            if self.epoch_ratio {
+                if state.diagonal > 0.0 {
+                    self.rho_steps += 1;
+                    let w = (1.0 / self.rho_steps as f64).max(1.0 - ivon.beta2);
+                    self.rho += w * (state.draw_curvature / state.diagonal - self.rho);
+                }
+                let (slope, curvature) = (state.diagonal + state.prior_curvature, self.rho * state.diagonal + state.prior_curvature);
+                let eta = if self.rho_steps < RATIO_DRAWS || !(curvature > 0.0 && slope.is_finite()) { 0.0 } else { slope / curvature };
+                self.last_eta = eta;
+                for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
+                    *mean = self.fitting.copy(start).map_err(error)?;
+                    self.fitting.axpy(mean, -eta, d).map_err(error)?;
+                }
+                return self.average_and_refresh(ivon.beta2);
+            }
             for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
                 *mean = self.fitting.copy(start).map_err(error)?;
                 self.fitting.axpy(mean, -self.ratio, d).map_err(error)?;

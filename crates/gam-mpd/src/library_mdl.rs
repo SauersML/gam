@@ -1209,6 +1209,11 @@ pub struct Settings {
     pub numeric_bytes: usize,
     /// Rows of vocabulary logits formed at once.
     pub head_tile_rows: usize,
+    /// The epoch-ratio arm (`DevicePosterior::set_epoch_ratio`): the step's length from the
+    /// epoch-averaged Gauss–Newton curvature ratio along its direction, with no measurement pass.
+    /// The A/B's outcome deletes this field or the measured line step.
+    #[serde(default)]
+    pub epoch_ratio: bool,
     /// When set, the fit ends once its epoch count (counted from `M`, a start's epochs included)
     /// reaches this, with no removal round: a comparison of arms at one budget of steps.
     #[serde(default)]
@@ -1229,6 +1234,8 @@ struct SettingsRecord {
     seed: u64,
     numeric_bytes: usize,
     head_tile_rows: usize,
+    #[serde(default)]
+    epoch_ratio: bool,
     #[serde(default)]
     preconditioned: Option<serde::de::IgnoredAny>,
     #[serde(default)]
@@ -1267,6 +1274,7 @@ impl From<SettingsRecord> for Settings {
             seed: r.seed,
             numeric_bytes: r.numeric_bytes,
             head_tile_rows: r.head_tile_rows,
+            epoch_ratio: r.epoch_ratio,
             epochs: r.epochs,
         }
     }
@@ -2705,6 +2713,7 @@ pub fn fit_from(
         device_posterior.settle()?;
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
+    device_posterior.set_epoch_ratio(settings.epoch_ratio);
     // The curvature estimate averages over one epoch's batches: each batch weighs about once.
     let ivon = Ivon { beta1: settings.beta1, beta2: 1.0 - 1.0 / draws.len() as f64 };
     // Each group's size, whose `½ ln |G|` an active group's variance costs.
@@ -2826,6 +2835,10 @@ pub fn fit_from(
             let posterior_started = Instant::now();
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &ivon)?;
             let posterior_seconds = posterior_started.elapsed().as_secs_f64();
+            if settings.epoch_ratio {
+                let (eta, rho, draws_averaged) = device_posterior.epoch_ratio_state();
+                log::info!("library ratio step {epoch}.{b}: η {eta:.4e}, ρ̄ {rho:.4e} over {draws_averaged} draws; posterior step {posterior_seconds:.3} s");
+            }
             if let Some(trial) = device_posterior.line_trial() {
                 // The line step's measurement on the next batch, at its own draws, at η = 0, η₀ and
                 // 2η₀ (`DevicePosterior::finish_line`).
@@ -3792,6 +3805,7 @@ mod tests {
             seed: 3,
             numeric_bytes: 1 << 26,
             head_tile_rows: 64,
+            epoch_ratio: false,
             epochs: None,
         }
     }
