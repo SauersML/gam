@@ -613,11 +613,11 @@ fn a_move_toward_is_the_copy_and_axpys_it_replaces() {
 /// CUDA's reduction over groups of one column each (eight adjacent columns per block) against the
 /// same entries transposed and grouped by rows, which the per-segment reduction takes in the same
 /// order: every group sum, and every entry the kernels write, bit for bit. 600 rows (two full
-/// passes of a block and part of a third) and 20 columns in a shuffled group order (two full tiles
-/// of columns not adjacent in group order, and part of a third), groups 18 and 19 beyond the count,
-/// and removed entries; the momentum in `momenta`'s storage.
+/// passes of a block and part of a third) and 22 columns in a shuffled group order (full tiles of
+/// columns not adjacent in group order, and part of one), groups 18 to 21 beyond the count, and
+/// removed entries; the momentum in `momenta`'s storage.
 fn single_columns_match_their_transposes(fit: &Device, momenta: &Device, wide: &Device) {
-    let (rows, cols, count) = (600, 20, 18);
+    let (rows, cols, count) = (600, 22, 18);
     let group = |c: usize| ((c * 7) % cols) as u32;
     let ids: Vec<u32> = (0..rows * cols).map(|i| group(i % cols)).collect();
     let by_rows: Vec<u32> = (0..cols * rows).map(|i| group(i / rows)).collect();

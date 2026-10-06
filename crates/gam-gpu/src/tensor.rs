@@ -425,10 +425,11 @@ impl GroupMap {
     }
 
     /// The threads a CUDA reduction over the map runs: one block of 256 (the kernels' `BLOCK`) per
-    /// segment (`group_reduce`), or per 8 segments of one column each (`columns_reduce`).
+    /// segment (`segments_reduce`), or per 4 segments of one column each (`columns_reduce`'s
+    /// `COLUMNS`).
     #[cfg(target_os = "linux")]
     fn blocks(&self) -> usize {
-        if self.single_columns() { 256 * self.segments.div_ceil(8) } else { 256 * self.segments }
+        if self.single_columns() { 256 * self.segments.div_ceil(4) } else { 256 * self.segments }
     }
 
     /// Whether every segment is one column: column groups of one column each (an MLP's output
@@ -4020,20 +4021,23 @@ __device__ unsigned int group_of(const unsigned int* ids, unsigned int axis, u64
 }
 
 // A map whose segments are one column each (axis code 3, `GroupMap::reduce_code`), COLUMNS segments
-// per block side by side: thread (r, l) = (threadIdx.x / COLUMNS, threadIdx.x % COLUMNS) takes, for
-// m = 0 .. BLOCK / 32 − 1 in turn, rows r + 32 m + BLOCK j (j = 0, 1, ..., in order) of segment l's
-// column: the entries thread r + 32 m of the segment's own block takes in `group_reduce`, summed in
-// the same order. Those 32 sums of one m go through the shuffles that block's warp m takes, and lane
+// per block side by side: thread (r, l) = (threadIdx.x / COLUMNS, threadIdx.x % COLUMNS), r below
+// R = BLOCK / COLUMNS, takes for m = 0 .. COLUMNS − 1 in turn rows r + R m + BLOCK j (j = 0, 1, ...,
+// in order) of segment l's column: the entries thread r + R m of the segment's own block takes in
+// `segments_reduce`, summed in the same order. The R sums of one m are R / 32 of that block's warps;
+// each goes through the shuffles its warp takes (real warp w those of column w / (R / 32)), and lane
 // 0 of warp l adds the warps' sums in warp order: every group's sums are the ones its own block adds,
-// while a warp reads and writes whole sectors (COLUMNS adjacent columns of 4 rows) instead of one
-// entry of each of 32 rows. `body(i, g, v)` puts entry i's N terms in v and says whether to add them;
+// while a warp reads and writes runs of COLUMNS adjacent columns instead of one entry of each of 32
+// rows. Four columns a block keep six blocks on a multiprocessor (eight left three, and the tiles ran
+// at half the row-grouped operators' rate). `body(i, g, v)` puts entry i's N terms in v and says whether to add them;
 // with `every` it also runs on the entries of a group at or beyond `count` (whose sums are not
 // added); with `counted` a group's sums are added only when the first is positive. Every block runs
 // the same rows and synchronizations.
-#define COLUMNS 8
+#define COLUMNS 4
 template <int N, typename F>
 __device__ void columns_reduce(u64 n, u64 cols, u64 segments, const unsigned int* layout, u64 count, bool every, bool counted, double* sums, F body) {
-    __shared__ double lanes[N][COLUMNS][32];
+    const unsigned int R = BLOCK / COLUMNS, VW = R / 32;
+    __shared__ double lanes[N][COLUMNS][BLOCK / COLUMNS];
     __shared__ double warps[N][COLUMNS][BLOCK / 32];
     const u64 rows = cols > 0 ? n / cols : 0;
     const unsigned int l = threadIdx.x % COLUMNS, r = threadIdx.x / COLUMNS;
@@ -4043,11 +4047,11 @@ __device__ void columns_reduce(u64 n, u64 cols, u64 segments, const unsigned int
         unsigned int g = s < segments ? layout[segments + 1 + s] : 0u;
         bool runs = s < segments && (every || g < count);
         u64 column = runs ? (u64)layout[2 * segments + 1 + layout[s]] : 0;
-        for (unsigned int m = 0; m < BLOCK / 32; m++) {
+        for (unsigned int m = 0; m < COLUMNS; m++) {
             double v[N];
             for (int t = 0; t < N; t++) v[t] = 0.0;
             if (runs)
-                for (u64 row = r + 32 * m; row < rows; row += BLOCK) {
+                for (u64 row = r + R * m; row < rows; row += BLOCK) {
                     double e[N];
                     for (int t = 0; t < N; t++) e[t] = 0.0;
                     if (body(row * cols + column, g, e))
@@ -4055,12 +4059,14 @@ __device__ void columns_reduce(u64 n, u64 cols, u64 segments, const unsigned int
                 }
             for (int t = 0; t < N; t++) lanes[t][l][r] = v[t];
             __syncthreads();
-            if (warp < COLUMNS) {
-                for (int t = 0; t < N; t++) v[t] = lanes[t][warp][lane];
+            {
+                // Warp w reduces column w / VW's virtual warp VW m + w % VW.
+                const unsigned int c = warp / VW, h = warp % VW;
+                for (int t = 0; t < N; t++) v[t] = lanes[t][c][32 * h + lane];
                 for (int o = 16; o > 0; o >>= 1)
                     for (int t = 0; t < N; t++) v[t] += __shfl_down_sync(0xffffffffu, v[t], o);
                 if (lane == 0)
-                    for (int t = 0; t < N; t++) warps[t][warp][m] = v[t];
+                    for (int t = 0; t < N; t++) warps[t][c][VW * m + h] = v[t];
             }
             __syncthreads();
         }
