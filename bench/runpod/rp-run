@@ -2089,6 +2089,11 @@ launch() {
     # running), so this launch does not ask for it again, and such a discard, which costs seconds,
     # does not count against DISCARDS.
     local -A spent=()
+    # Hosts whose pod failed in this launch: RunPod often hands the same machine again for an offer
+    # (a 3090 host held at 330 W of 420 W came back six times running, parity-ql-afb24f1e41), and a
+    # host's power limit, driver or CUDA does not change between two pods minutes apart. A pod on one
+    # moves the launch to the next offer; later launches weigh the host by its record (unit_risk).
+    local -A failed_here=()
     # A listed run relaunches only while still listed; a small run's approval covers its whole cap.
     [ "$APPROVAL" = auto ] || approved "$NAME" || { say "approval for $NAME withdrawn; not launching a pod"; exit 3; }
     POD="" IP="" PORT="" EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" EARLY_BINS="" PROBE_A=""
@@ -2166,7 +2171,10 @@ launch() {
         [ "$(provider_of "$POD")" = runpod ] || SSH_USER=ubuntu
         POD_HOST=$host
         why=()
-        if risk=$(unit_risk "$host" "$POD_DC" "$kind" "$price" "$gpu") && [ -n "$risk" ]; then
+        if [ -n "$host" ] && [ -n "${failed_here[$host]:-}" ]; then
+            say "host $host failed earlier in this launch; deleting pod $POD and trying the next offer"
+            why=("discarded" "host failed earlier in this launch")
+        elif risk=$(unit_risk "$host" "$POD_DC" "$kind" "$price" "$gpu") && [ -n "$risk" ]; then
             say "host ${host:-?}${POD_DC:+ in $POD_DC}: $risk; deleting pod $POD"
             why=("discarded" "riskier than the next offer: $risk")
         elif slow_host "$host"; then
@@ -2197,6 +2205,7 @@ launch() {
             break
         fi
         attempt_end "${why[@]}"
+        [ "${why[0]}" = discarded ] || [ -z "$host" ] || failed_here[$host]=1
         [ -z "$IP" ] || on_pod -O exit > /dev/null 2>&1 || true
         [ -z "$EARLY_FETCH" ] || { kill "$EARLY_FETCH" 2> /dev/null || true; wait "$EARLY_FETCH" 2> /dev/null || true; EARLY_FETCH=""; }
         [ -z "$EARLY_PYENV" ] || { kill "$EARLY_PYENV" 2> /dev/null || true; wait "$EARLY_PYENV" 2> /dev/null || true; EARLY_PYENV=""; }
@@ -2207,7 +2216,7 @@ launch() {
         reap "$POD" || exit 1
         POD="" IP="" PORT=""
         case ${why[1]} in
-            "riskier than the next offer"*|"host slow before") spent[$kind|$gpu]=1 ;;
+            "riskier than the next offer"*|"host slow before"|"host failed earlier in this launch") spent[$kind|$gpu]=1 ;;
             *)  DISCARDED=$(( ${DISCARDED:-0} + 1 ))
                 (( DISCARDED <= DISCARDS )) || { say "$DISCARDS pods discarded on failing hosts; giving up"; exit 1; } ;;
         esac
