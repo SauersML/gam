@@ -77,7 +77,15 @@ case ${1:-} in
         run=$(dispatch "bins-$key" "$sha" "$key" "${examples[*]}" "${tests[*]}" "")
         echo "gha-run: building ${names[*]} at ${sha:0:12} in run $run (https://github.com/$REPO/actions/runs/$run)" >&2
         while :; do
-            state=$("${API[@]}" "repos/$REPO/actions/runs/$run" --jq '.status + " " + (.conclusion // "")')
+            # A poll GitHub does not answer (a run just made can read 404 for a moment) is asked again
+            # 30 s later, up to 20 in a row: under set -e one failed poll ended the wait
+            # (parity-ql-691db2e129's run built its binaries after its runner had given up 40 s in).
+            if state=$("${API[@]}" "repos/$REPO/actions/runs/$run" --jq '.status + " " + (.conclusion // "")' 2> /dev/null); then
+                unanswered=0
+            else
+                state="" unanswered=$(( ${unanswered:-0} + 1 ))
+                (( unanswered < 20 )) || { echo "gha-run: run $run unanswered for 10 minutes" >&2; exit 1; }
+            fi
             case $state in completed*) break ;; esac
             sleep 30
         done
