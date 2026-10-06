@@ -473,6 +473,79 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A transcoder block's thresholds are one prior group of the layer, apart from the gate rows
+    /// (`library_mdl::explanation_with`): on the tiny Qwen3 decoder with layer 1's MLP a
+    /// transcoder's features, each function's gate group is its gate row alone, one group holds
+    /// every kept threshold, and at the start with the thresholds 40 times their file values (the
+    /// scale of Qwen3's thresholds against their gate weights) the description is below the one
+    /// each threshold would cost in its gate row's group, by at least the log-sum gap
+    /// `½ Σ_i [(d + 1) ln(S_i⁺ / (d + 1)) − d ln(S_i / d)] − ½ k ln(S_c / k)` less the new group's
+    /// own precision and scale bits.
+    #[test]
+    fn a_transcoder_blocks_thresholds_are_one_group_with_their_own_variance() {
+        let dir = std::env::temp_dir().join(format!("library_transcoder_thresholds_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let export = crate::test_support::tiny_qwen3_export("library_transcoder_thresholds", 2);
+        let imported = import_language_model(&export, 6, 12).unwrap();
+        std::fs::remove_dir_all(&export).unwrap();
+        let native = split_sites(&imported.program).unwrap();
+        let layers = layer_nodes(&native, 2).unwrap();
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let path = dir.join("layer_1.safetensors");
+        crate::test_support::transcoder_file(&path, 64, 8, 3);
+        let transcoders = BTreeMap::from([(1, Transcoder::open(&path).unwrap())]);
+        let fired = firing(&Device::host(), &native, &layers, &transcoders, &sequences, 2).unwrap();
+        let kept: Vec<usize> = (0..64).filter(|&f| fired[&1].counts[f] > 0).collect();
+        let kept_path = dir.join("kept_1.safetensors");
+        transcoders[&1].write_kept(&kept, &fired[&1].sink, &kept_path).unwrap();
+        let explanation = library_mdl::explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
+        let program = &explanation.artifact.program;
+        let index = |name: &str| program.operators.iter().position(|op| op.name == name).unwrap();
+        let (gate, bias) = (index("library.l1.mlp.gate"), index("library.l1.mlp.gate_bias"));
+        let k = kept.len();
+        let thresholds = explanation.groups.iter().position(|g| g.name == "library.l1.mlp.gate_bias").expect("the thresholds' group");
+        let cells = &explanation.groups[thresholds].cells;
+        assert!(cells.len() == 1 && cells[0].operator == bias && cells[0].rows == (0..k).collect::<Vec<_>>() && cells[0].cols == (0..1));
+        for (i, function) in explanation.layers[1].functions.iter().enumerate() {
+            let cells = &explanation.groups[function[0]].cells;
+            assert!(cells.len() == 1 && cells[0].operator == gate && cells[0].rows == [i], "function {i}'s gate group is its gate row alone");
+        }
+        // M's own MLP at layer 0 keeps its grouping, and has no thresholds' group.
+        assert!(!explanation.groups.iter().any(|g| g.name == "library.l0.mlp.gate_bias"));
+        let at = |op: usize| explanation.trainable.iter().position(|t| *t == op).unwrap();
+        let mut posterior = library_mdl::Posterior::new(&explanation, 1 << 20).unwrap();
+        posterior.mean[at(bias)].mapv_inplace(|c| 40.0 * c);
+        let costs = posterior.costs();
+        // The cost each function's gate group would have with its threshold in it, from the same
+        // moments (reference: the merged group's starting mean square).
+        let (means, log_sd) = (&posterior.mean[at(gate)], &posterior.log_sd[at(gate)]);
+        let (c, c_log_sd) = (&posterior.mean[at(bias)], &posterior.log_sd[at(bias)]);
+        let start = |op: usize| program.operators[op].matrix();
+        let (gate_start, bias_start) = (start(gate), start(bias));
+        let d = means.ncols() as f64;
+        let mut merged = 0.0;
+        let mut gap = 0.0;
+        let mut thresholds_second = 0.0;
+        for i in 0..k {
+            let row_second: f64 = means.row(i).iter().zip(log_sd.row(i)).map(|(m, s)| m * m + (2.0 * s).exp()).sum();
+            let c_second = c[[i, 0]] * c[[i, 0]] + (2.0 * c_log_sd[[i, 0]]).exp();
+            let log_variance: f64 = log_sd.row(i).iter().map(|s| 2.0 * s).sum::<f64>() + 2.0 * c_log_sd[[i, 0]];
+            let reference = (gate_start.row(i).iter().map(|v| v * v).sum::<f64>() + bias_start[[i, 0]] * bias_start[[i, 0]]) / (d + 1.0);
+            let (_, divergence, bits) = gam_gpu::tensor::group_prior(d + 1.0, row_second + c_second, log_variance, Some(reference));
+            merged += divergence + 0.5 * (d + 1.0).ln() + bits * std::f64::consts::LN_2;
+            merged -= costs[explanation.layers[1].functions[i][0]];
+            gap += 0.5 * ((d + 1.0) * ((row_second + c_second) / (d + 1.0)).ln() - d * (row_second / d).ln());
+            thresholds_second += c_second;
+        }
+        merged -= costs[thresholds];
+        gap -= 0.5 * k as f64 * (thresholds_second / k as f64).ln();
+        let overhead = costs[thresholds] - (0.5 * k as f64 * (thresholds_second / k as f64).ln() - 0.5 * c_log_sd.iter().map(|s| 2.0 * s).sum::<f64>());
+        assert!(merged > 0.0, "the thresholds' own group costs {merged} nats more than in their rows");
+        assert!(merged >= gap - overhead.abs() - 1e-6 * gap.abs(), "the description falls by {merged} nats, the log-sum gap is {gap} less {overhead}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A removal step on the tiny Qwen3 decoder with layer 1's MLP as a transcoder block (fixed
     /// output bias, the sink vector at the first token), from the Laplace start: it runs through
     /// the compensation and the search, and never raises `F` on the training collection.
