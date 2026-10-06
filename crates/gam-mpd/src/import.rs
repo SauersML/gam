@@ -482,19 +482,24 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
     for l in blocks {
         let prefix = format!("blocks.{l}.");
         let h = norm(&mut b, x, &format!("{prefix}rms1"))?;
-        let (wq, wk, wv, wo) = (
-            tensors.get(&format!("{prefix}attn.q_proj"))?,
-            tensors.get(&format!("{prefix}attn.k_proj"))?,
-            tensors.get(&format!("{prefix}attn.v_proj"))?,
-            tensors.get(&format!("{prefix}attn.o_proj"))?,
-        );
+        // The query, key and value maps' heads are row blocks: where a checkpoint stores the map,
+        // each head reads its rows there; an export's map is read. The output map's heads are
+        // column blocks, read.
+        let (q_name, k_name, v_name) = (format!("{prefix}attn.q_proj"), format!("{prefix}attn.k_proj"), format!("{prefix}attn.v_proj"));
+        let (sq, sk, sv) = (tensors.stored(&q_name)?, tensors.stored(&k_name)?, tensors.stored(&v_name)?);
+        let read = |name: &str, stored: &Option<crate::safetensors::Stored>| if stored.is_some() { Ok(None) } else { tensors.get(name).map(Some) };
+        let (wq, wk, wv, wo) = (read(&q_name, &sq)?, read(&k_name, &sk)?, read(&v_name, &sv)?, tensors.get(&format!("{prefix}attn.o_proj"))?);
+        let rows_of = |b: &mut Builder, label: &str, stored: &Option<crate::safetensors::Stored>, read: &Option<Array2<f64>>, (from, to): (usize, usize)| match (stored, read) {
+            (Some(stored), _) => b.stored(label, &head, &model, stored.rows(from..to).ok_or_else(|| format!("{label}: rows {from}..{to} of {:?}", stored.dim()))?),
+            (None, Some(values)) => b.operator(label, &head, &model, values.slice(s![from..to, ..]).to_owned()),
+            (None, None) => Err(format!("{label}: a map neither stored nor read")),
+        };
         let group = heads / kv_heads.max(1);
         let mut keys = Vec::new();
         for g in 0..kv_heads {
             let range = (g * hd, (g + 1) * hd);
-            let rows = s![range.0..range.1, ..];
-            let k_op = b.operator(&format!("{prefix}k{g}"), &head, &model, wk.slice(rows).to_owned())?;
-            let v_op = b.operator(&format!("{prefix}v{g}"), &head, &model, wv.slice(rows).to_owned())?;
+            let k_op = rows_of(&mut b, &format!("{prefix}k{g}"), &sk, &wk, range)?;
+            let v_op = rows_of(&mut b, &format!("{prefix}v{g}"), &sv, &wv, range)?;
             let k_bias = bias(&mut b, &format!("{prefix}attn.k_proj.bias"), &head, Some(range))?;
             let v_bias = bias(&mut b, &format!("{prefix}attn.v_proj.bias"), &head, Some(range))?;
             let mut k = b.node(Node::Affine { terms: vec![(h, k_op)], bias: k_bias });
@@ -507,7 +512,7 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
         let mut terms = vec![(x, identity)];
         for hh in 0..heads {
             let range = (hh * hd, (hh + 1) * hd);
-            let q_op = b.operator(&format!("{prefix}q{hh}"), &head, &model, wq.slice(s![range.0..range.1, ..]).to_owned())?;
+            let q_op = rows_of(&mut b, &format!("{prefix}q{hh}"), &sq, &wq, range)?;
             let o_op = b.operator(&format!("{prefix}o{hh}"), &model, &head, wo.slice(s![.., range.0..range.1]).to_owned())?;
             let q_bias = bias(&mut b, &format!("{prefix}attn.q_proj.bias"), &head, Some(range))?;
             let mut q = b.node(Node::Affine { terms: vec![(h, q_op)], bias: q_bias });
@@ -691,7 +696,7 @@ mod tests {
         // single-precision device.
         use crate::operator_program::{Operator, OperatorBody};
         let stored: Vec<&str> = a.operators.iter().filter(|op| matches!(&op.body, OperatorBody::Dense { values, .. } if values.stored().is_some())).map(|op| op.name.as_str()).collect();
-        assert_eq!(stored, ["blocks.0.c_fc", "blocks.0.down_proj", "blocks.0.gate_proj", "lm_head"]);
+        assert_eq!(stored, ["blocks.0.k0", "blocks.0.v0", "blocks.0.q0", "blocks.0.q1", "blocks.0.c_fc", "blocks.0.down_proj", "blocks.0.gate_proj", "lm_head"]);
         let mut held = a.clone();
         for op in &mut held.operators {
             if matches!(&op.body, OperatorBody::Dense { values, .. } if values.stored().is_some()) {
