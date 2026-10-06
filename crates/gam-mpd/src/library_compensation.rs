@@ -77,7 +77,7 @@
 use crate::{
     interchange::{self, Interchange},
     library_mdl::{Explanation, Posterior, sequence_family},
-    operator_program::{FamilyInputs, Node, OperatorProgram},
+    operator_program::{Node, OperatorProgram},
     run_check::LayerNodes,
 };
 use faer::Side;
@@ -196,28 +196,6 @@ fn operator(program: &OperatorProgram, name: &str) -> Result<usize, String> {
     program.operators.iter().position(|o| o.name == name).ok_or_else(|| error(format!("no operator {name}")))
 }
 
-/// The activations `h` of an MLP of `order` functions on the batch `family`, with the rows at the
-/// positions `elsewhere` (where a position select applies `M`'s MLP instead of the functions)
-/// zeroed in a copy; none when there are no such positions.
-fn elsewhere_zeroed(device: &Device, h: &Tensor, family: &FamilyInputs, elsewhere: &[u32], order: usize) -> Result<Option<Tensor>, String> {
-    if h.cols() != order {
-        return Err(error("activations of another width than the MLP's functions"));
-    }
-    if elsewhere.is_empty() {
-        return Ok(None);
-    }
-    let positions = family.layout.as_ref().map(|layout| layout.position.as_slice()).unwrap_or_default();
-    if positions.len() != h.rows() {
-        return Err(error("a position select on a batch without its positions"));
-    }
-    let mut copy = device.copy(h).map_err(error)?;
-    let zero = device.zeros(1, h.cols()).map_err(error)?;
-    for (row, _) in positions.iter().enumerate().filter(|(_, p)| elsewhere.contains(p)) {
-        device.set_rows(&mut copy, row, &zero).map_err(error)?;
-    }
-    Ok(Some(copy))
-}
-
 impl Compensation {
     /// The Gram matrices of every MLP's activations on `sequences` run by `P` alone at
     /// `posterior`'s mean, `batch` sequences at a time, on a float64 device as many MLPs per pass
@@ -237,30 +215,27 @@ impl Compensation {
             if layer.functions.is_empty() {
                 continue;
             }
-            let out = operator(&flat, &format!("library.l{l}.mlp.out"))?;
+            // A transcoder block's features (`library_transcoder`) are removed plainly. They are a
+            // sparse basis: a feature fires on few tokens (2–16 of tens of thousands per token), so
+            // the survivors' activations hardly overlap a deleted one's (`G_RK` near zero) and the
+            // move would be small, while the Gram matrix of a block of `k` features costs `8k²`
+            // bytes and every proposal an eigendecomposition of order `k` (`k` up to 32k at a firing
+            // frequency of 1e-4). The search's acceptance is exact either way.
+            let out_name = format!("library.l{l}.mlp.out");
+            if explanation.artifact.owners.iter().any(|o| o.operator == out_name && o.native.starts_with("transcoder.")) {
+                continue;
+            }
+            let out = operator(&flat, &out_name)?;
             // The activations are the node the output map reads (a term of the MLP's output, beside
-            // the terms of its read–write ties, and a fixed bias in a transcoder block, which the
-            // compensation never moves).
-            let (applied, node) = flat
+            // the terms of its read–write ties).
+            let node = flat
                 .nodes
                 .iter()
-                .enumerate()
-                .find_map(|(a, n)| match n {
-                    Node::Affine { terms, .. } => terms.iter().find(|(_, op)| *op == out).map(|(input, _)| (a, *input)),
+                .find_map(|n| match n {
+                    Node::Affine { terms, bias: None } => terms.iter().find(|(_, op)| *op == out).map(|(input, _)| *input),
                     _ => None,
                 })
-                .ok_or_else(|| error(format!("layer {l}: no map applies the MLP's output")))?;
-            // A position select that writes another node at some positions in place of the output
-            // (a transcoder block runs `M`'s MLP at the first token): the functions' activations
-            // there reach nothing, so the Gram matrix leaves those rows out.
-            let mut elsewhere = Vec::new();
-            for n in &flat.nodes {
-                match n {
-                    Node::Select { inside, .. } if *inside == applied => return Err(error(format!("layer {l}: the MLP's output is selected at given positions only"))),
-                    Node::Select { outside, positions, .. } if *outside == applied => elsewhere.clone_from(positions),
-                    _ => {}
-                }
-            }
+                .ok_or_else(|| error(format!("layer {l}: no bias-free map applies the MLP's output")))?;
             let height = flat.operators[out].rows.width();
             let trainable = |op: usize| position.get(&op).copied().ok_or_else(|| error(format!("{}: not trainable", flat.operators[op].name)));
             let outputs = layer
@@ -294,7 +269,7 @@ impl Compensation {
                 .collect::<Result<Vec<_>, _>>()?;
             let output = trainable(out)?;
             mlps.push(Mlp { functions: layer.functions.clone(), output, outputs, gram: Packed::zeros(layer.functions.len()) });
-            nodes.push((node, elsewhere));
+            nodes.push(node);
         }
         experiments.load(&posterior.mean)?;
         let program = experiments.models().1.program;
@@ -338,12 +313,10 @@ impl Compensation {
                             sums = mlps[group.clone()].iter().map(|mlp| wide.zeros(mlp.gram.order, mlp.gram.order).map_err(error)).collect::<Result<_, _>>()?;
                         }
                         for (k, sum) in group.clone().zip(&mut sums) {
-                            let (node, elsewhere) = &nodes[k];
-                            let zeroed = elsewhere_zeroed(device, trace.value(*node)?, &family, elsewhere, mlps[k].gram.order)?;
-                            let h = match &zeroed {
-                                Some(copy) => copy,
-                                None => trace.value(*node)?,
-                            };
+                            let h = trace.value(nodes[k])?;
+                            if h.cols() != mlps[k].gram.order {
+                                return Err(error("activations of another width than the MLP's functions"));
+                            }
                             // On CUDA the f32 activations' Gram on the integer tensor cores
                             // (`Device::gram_split`, 9 slices: within γ_rows √(G_ii G_jj) per entry,
                             // the form of the float64 product's own bound that the floor below uses),
@@ -367,12 +340,11 @@ impl Compensation {
                 for family in families() {
                     let family = family?;
                     let trace = program.forward(&family)?;
-                    for (mlp, (node, elsewhere)) in mlps.iter_mut().zip(&nodes) {
-                        let zeroed = elsewhere_zeroed(device, trace.value(*node)?, &family, elsewhere, mlp.gram.order)?;
-                        let h = match &zeroed {
-                            Some(copy) => copy,
-                            None => trace.value(*node)?,
-                        };
+                    for (mlp, node) in mlps.iter_mut().zip(&nodes) {
+                        let h = trace.value(*node)?;
+                        if h.cols() != mlp.gram.order {
+                            return Err(error("activations of another width than the MLP's functions"));
+                        }
                         mlp.gram.add_lower(&fast_ata(&device.download(h).map_err(error)?))?;
                     }
                 }
@@ -953,11 +925,11 @@ mod tests {
         assert!(of(1) < of(2), "the near copy keeps {} of its rise, an unrelated function {}", of(1), of(2));
     }
 
-    /// A transcoder block (fixed output bias, `M`'s MLP selected at the first token) on the tiny
-    /// Qwen3 decoder: its Gram matrix sums the features' activations over the tokens after the
-    /// first only, and deleting a copy of a surviving feature leaves the explanation unchanged.
+    /// A transcoder block on the tiny Qwen3 decoder (layer 1's MLP a transcoder's features) is
+    /// removed plainly: the compensation holds only layer 0's MLP, and a proposal deleting a
+    /// feature is the plain removal, bit for bit.
     #[test]
-    fn a_transcoder_blocks_compensation_leaves_out_the_first_token_and_moves_a_copy() {
+    fn a_transcoder_block_is_removed_plainly() {
         use crate::library_transcoder::{Transcoder, firing};
         let dir = std::env::temp_dir().join(format!("library_compensation_transcoder_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -977,33 +949,20 @@ mod tests {
         transcoders[&1].write_kept(&kept, &kept_path).unwrap();
         let explanation = library_mdl::explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
         let mut posterior = Posterior::new(&explanation, CONCENTRATED).expect("the posterior");
-        // The features' activations at M's input (layer 0 is M's at the start), first tokens left out.
-        let family = library_mdl::sequence_family(&sequences.iter().map(Vec::as_slice).collect::<Vec<_>>()).unwrap();
-        let x = native.execute(&family, false).unwrap().values[layers[1].normed].clone();
-        let program = &explanation.artifact.program;
-        let matrix = |name: &str| program.operators[program.operators.iter().position(|op| op.name == name).unwrap()].matrix();
-        let mut h = (x.dot(&matrix("library.l1.mlp.gate").t()) + &matrix("library.l1.mlp.gate_bias").column(0)).mapv(|v| v.max(0.0));
-        for (mut row, p) in h.rows_mut().into_iter().zip(&family.layout.as_ref().unwrap().position) {
-            if *p == 0 {
-                row.fill(0.0);
-            }
-        }
-        let expected = h.t().dot(&h);
+        copy_reads(&explanation, &mut posterior, 1, 0, 1);
         let device = Device::host();
         let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
         let reads = interchange::reads(&native, &sites).expect("the reads");
         let mut ic = Interchange::new(&device, &native, &sites, &explanation.artifact, &explanation.trainable, reads, 1 << 30, 64).expect("the experiments");
         let compensation = Compensation::new(&mut ic, &explanation, &posterior, &sequences, 2).expect("the compensation");
-        let gram = &compensation.mlps[1].gram;
-        let scale = expected.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-        let difference = expected.indexed_iter().fold(0.0_f64, |m, ((i, j), b)| m.max((gram.at(i, j) - b).abs()));
-        assert!(scale > 0.0 && difference <= 1e-12 * scale, "the Gram differs from the first-token-free one by {difference:e} (scale {scale:e})");
-        // Feature 1 made a copy of feature 0 (gate row and bias), then deleted with compensation.
-        copy_reads(&explanation, &mut posterior, 1, 0, 1);
+        assert_eq!(compensation.mlps.len(), 1, "only layer 0's MLP is compensated");
+        assert_eq!(compensation.mlps[0].functions, explanation.layers[0].functions);
         let output = *explanation.layers[1].functions[1].last().expect("an output group");
-        let (compensated, plain, largest) = changes(&explanation, &native, &posterior, &sequences, output);
-        assert!(compensated <= 1e-9 * largest, "the compensated removal moved the stream by {compensated:e} (largest value {largest:e})");
-        assert!(plain > 1e3 * compensated.max(f64::EPSILON * largest), "the plain removal moved the stream by only {plain:e}");
+        let trial = compensation.proposal(&posterior, &[output]).expect("the proposal");
+        let mut plain = posterior.clone();
+        plain.remove(&[output]);
+        assert!(trial.mean.iter().zip(&plain.mean).all(|(a, b)| a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())), "the proposal moved a mean");
+        assert_eq!(trial.active, plain.active);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
