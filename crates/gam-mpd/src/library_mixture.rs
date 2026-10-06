@@ -20,14 +20,16 @@
 //! columns of `wte`), and a gate's also earlier functions' output vectors (a read of what they
 //! write); an output's are earlier output vectors. A key-value group's are the query–key maps of groups
 //! in earlier layers with keys of their own, as many query heads and the same planes, each
-//! brought to the target's gauge plane by plane (`library_sharing::gauge`, a rotation and a scale
-//! that leave every one of its heads' scores unchanged) with each target query head facing one of
+//! brought to the target's gauge plane by plane (`library_sharing::gauge`, a rotation and, for heads
+//! without query and key norms, a scale, leaving every one of its heads' scores unchanged:
+//! `library_sharing::Symmetry`) with each target query head facing one of
 //! the candidate's (the optimal assignment of their misfits), gauge and assignment fixed for the
 //! epoch. A value map's are the value maps `V_s` of earlier groups with as many query heads, each
 //! moved by the transport `T` that `M`'s output projections fix (`library_sharing::transports`):
 //! `M` keeps the projections `O`, so a group's value–output maps `O_i V` are those of the
-//! candidate when `V = T V_s`, the exact symmetry `V → R V`, `O → O R⁻¹` read through the
-//! projections; `T` is sent with `M` and costs nothing. The scales `c_j`, the
+//! candidate when `V = T V_s`: the symmetry `V → R V`, `O → O R⁻¹` read through the projections
+//! where the transport's residual is zero, an approximation otherwise; `T` is sent with `M` and
+//! costs nothing. The scales `c_j`, the
 //! weights `π = softmax(z)` of the logits `z` and the variance `s²` are learned. As the groups' own
 //! Gaussian times `r(g) = π_0 + Σ_j π_j N(g; c_j u_j, s² I) / N(g; 0, diag v)`, the divergence is
 //! `KL(q ‖ N(0, diag v)) − E_q[ln r(g)]`. `library_mdl` keeps the first term's closed form; this
@@ -257,6 +259,8 @@ struct GroupMaps {
     planes: Vec<Vec<usize>>,
     /// Per plane, its prior group.
     groups: Vec<usize>,
+    /// The gauges that leave its heads' scores unchanged.
+    symmetry: library_sharing::Symmetry,
 }
 
 /// A key-value group's value operator (trainable index), its number of query heads and its value
@@ -369,7 +373,8 @@ impl Mixture {
                 return Err(format!("key-value group {l}.{g}: one prior group per plane required"));
             }
             let queries = found.queries().into_iter().map(position).collect::<Result<Vec<_>, _>>()?;
-            key_values.push(((l, g), GroupMaps { queries, key: position(found.key)?, planes, groups }));
+            let symmetry = library_sharing::symmetry(program, &[found], &planes)?;
+            key_values.push(((l, g), GroupMaps { queries, key: position(found.key)?, planes, groups, symmetry }));
         }
         for &((l, g), ref maps) in &key_values {
             let choices = key_values.iter().filter(|((other, _), other_maps)| *other < l && Self::compatible(maps, other_maps)).count();
@@ -462,19 +467,19 @@ impl Mixture {
     /// gauge, and per target query head the source query head it faces (the optimal assignment
     /// of their misfits under the gauge, `library_bodies::hungarian`), alternated twice from the
     /// keys' gauge.
-    fn align(target: (&[&Array2<f64>], &Array2<f64>), source: (&[&Array2<f64>], &Array2<f64>), planes: &[Vec<usize>]) -> Result<(Vec<usize>, Vec<(Array2<f64>, f64)>), String> {
+    fn align(target: (&[&Array2<f64>], &Array2<f64>), source: (&[&Array2<f64>], &Array2<f64>), planes: &[Vec<usize>], symmetry: &library_sharing::Symmetry) -> Result<(Vec<usize>, Vec<(Array2<f64>, f64)>), String> {
         let ((qt, kt), (qs, ks)) = (target, source);
         let mut assignment: Vec<usize> = (0..qt.len()).collect();
-        let mut gauge = library_sharing::gauge(&[], kt, &[], ks, planes);
+        let mut gauge = library_sharing::gauge(&[], kt, &[], ks, planes, symmetry);
         if qt.len() == 1 {
-            return Ok((assignment, library_sharing::gauge(qt, kt, qs, ks, planes)));
+            return Ok((assignment, library_sharing::gauge(qt, kt, qs, ks, planes, symmetry)));
         }
         for _ in 0..2 {
             let turned: Vec<Array2<f64>> = qs.iter().map(|q| library_sharing::turn(q, planes, &gauge, true, false)).collect();
             let cost = Array2::from_shape_fn((qt.len(), qs.len()), |(i, j)| (qt[i] - &turned[j]).iter().map(|v| v * v).sum::<f64>());
             assignment = crate::library_bodies::hungarian(&cost)?;
             let facing: Vec<&Array2<f64>> = assignment.iter().map(|&j| qs[j]).collect();
-            gauge = library_sharing::gauge(qt, kt, &facing, ks, planes);
+            gauge = library_sharing::gauge(qt, kt, &facing, ks, planes, symmetry);
         }
         Ok((assignment, gauge))
     }
@@ -649,7 +654,7 @@ impl Mixture {
                     continue;
                 }
                 let (q, k) = means(other);
-                let (assignment, gauge) = Self::align((&q1, k1), (&q, k), &maps.planes)?;
+                let (assignment, gauge) = Self::align((&q1, k1), (&q, k), &maps.planes, &maps.symmetry.and(&other.symmetry))?;
                 let turned: Vec<Array2<f64>> = assignment.iter().map(|&j| library_sharing::turn(q[j], &maps.planes, &gauge, true, false)).collect();
                 let u = Self::group_vector(maps, &live, &turned.iter().collect::<Vec<_>>(), &library_sharing::turn(k, &maps.planes, &gauge, false, false));
                 let (cross, norm) = ((&mu * &precision).dot(&u), (&u * &u * &precision).sum());

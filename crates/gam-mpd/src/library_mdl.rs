@@ -1110,6 +1110,10 @@ pub struct Report {
     /// The reported artifact: the posterior mean, or the mean rounded to its posterior precision,
     /// whichever has the lower held-out data term at the end ([`HeldOut::mean_bits_per_token`]).
     pub representative: Representative,
+    /// The literals every evaluation ran with: f32 where the device held f32 (every operator
+    /// rounded to f32 as it was uploaded), float64 on the host. The saved artifacts hold the same
+    /// ([`Fit::artifact`]), so the reported fidelity is the saved artifact's.
+    pub literals: Literals,
     pub epochs: Vec<Epoch>,
     pub removals: Vec<Removal>,
     pub active_groups: usize,
@@ -1121,6 +1125,29 @@ pub struct Report {
 pub struct Fit {
     pub posterior: Posterior,
     pub report: Report,
+}
+
+/// The literals a fit's evaluations ran with, and its saved artifacts hold (`Report::literals`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Literals {
+    F32,
+    F64,
+}
+
+impl Literals {
+    /// The literals of a fit on `device`.
+    #[must_use]
+    pub fn of(device: &Device) -> Self {
+        if device.float64() { Self::F64 } else { Self::F32 }
+    }
+
+    /// `artifact` with these literals: rounded to f32, or as it is.
+    pub fn apply(self, artifact: Artifact) -> Result<Artifact, String> {
+        match self {
+            Self::F32 => artifact.f32_literals(),
+            Self::F64 => Ok(artifact),
+        }
+    }
 }
 
 /// Which point of the posterior the reported artifact holds (`Report::representative`).
@@ -1138,6 +1165,13 @@ impl Fit {
             Representative::Mean => self.posterior.clone(),
             Representative::Rounded => self.posterior.rounded(),
         }
+    }
+
+    /// The reported artifact of `explanation`: the representative's means with the literals the
+    /// fit's evaluations ran with (`Report::literals`), so it is the artifact the held-out
+    /// evaluation scored.
+    pub fn artifact(&self, explanation: &Explanation) -> Result<Artifact, String> {
+        self.report.literals.apply(posterior_mean(explanation, &self.representative())?)
     }
 }
 
@@ -2129,11 +2163,11 @@ pub fn fit(
         let snapshot = Snapshot::take(progress, device_posterior)?;
         let (artifact, trainable) = (explanation.artifact.clone(), explanation.trainable.clone());
         let (means, membership, active) = (posterior.means(), posterior.membership.clone(), posterior.active.clone());
-        let path = path.to_path_buf();
+        let (path, literals) = (path.to_path_buf(), Literals::of(device));
         writer.start(move || {
             snapshot.write(&path)?;
             let partial = path.with_extension("artifact.partial");
-            std::fs::write(&partial, mean_artifact(artifact, &trainable, means, &membership, &active)?.f32_literals()?.to_bytes()?).map_err(error)?;
+            std::fs::write(&partial, literals.apply(mean_artifact(artifact, &trainable, means, &membership, &active)?)?.to_bytes()?).map_err(error)?;
             std::fs::rename(&partial, path.with_extension("artifact.bin")).map_err(error)
         })
     };
@@ -2309,6 +2343,7 @@ pub fn fit(
             start: progress.start.ok_or("no starting evaluation")?,
             end,
             representative,
+            literals: Literals::of(device),
             active_groups: posterior.active.iter().filter(|a| **a).count(),
             objective_bits,
             seconds: resumed_seconds + started.elapsed().as_secs_f64(),

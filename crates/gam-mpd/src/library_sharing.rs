@@ -17,8 +17,15 @@
 //!
 //! A head's scores are `qᵀ R k` with `R` the rotary turn between the two positions; a rotation and
 //! a scaling of a plane, `(s R q, R k / s)`, leave them unchanged, for every query head of a key
-//! at once. The groups to share, and the assignment of their query heads, are found by the learned
-//! mixture prior over the groups' query–key maps (`library_mixture`).
+//! at once. Where the heads norm their queries and keys (Qwen3), the scores are
+//! `(γ_q ⊙ N(Q x))ᵀ R (γ_k ⊙ N(K y))` with `N` the RMS norm of the whole head and `γ` its gains: a
+//! plane's scaling changes `N` (with `q = k = (1, 0, 1, 0)`, doubling the first plane's query and
+//! halving its key keeps `q·k = 2` and moves the normed score from 4 to 3.2), and a rotation of a
+//! plane keeps the scores only when it commutes with the gains there. The gauges of normed heads
+//! are therefore rotations alone: any rotation of a plane whose two coordinates have equal gains
+//! in every head involved, else the plane's identity or its half turn (`Symmetry`). The groups to
+//! share, and the assignment of their query heads, are found by the learned mixture prior over the
+//! groups' query–key maps (`library_mixture`).
 //!
 //! # The start
 //!
@@ -33,9 +40,11 @@
 //!
 //! `M` keeps each head's output projection `O_h`, so a group's value–output maps are `O_i V` over
 //! its query heads `i`. Another group's are the same maps when `V = T V_s` with
-//! `T = argmin Σ_i ‖O_{t,i} T − O_{s,π(i)}‖²` and `π` the assignment of query heads
-//! (`transports`): the exact symmetry `V → R V`, `O → O R⁻¹` with `O` fixed by `M`. A shared value
-//! map stores `V_s` once and the target's heads read `c T V_s`, `T` fixed and `c` one scalar
+//! `(π, T) = argmin Σ_i ‖O_{t,i} T − O_{s,π(i)}‖²` over the assignments `π` of query heads and the
+//! transports `T` jointly (`transports`). Where the residual is zero this is the symmetry
+//! `V → R V`, `O → O R⁻¹` with `O` fixed by `M`; otherwise the shared map is an approximation,
+//! which the code length `F` of the re-converged fit accepts or rejects. A shared value map stores
+//! `V_s` once and the target's heads read `c T V_s`, `T` fixed and `c` one scalar
 //! ([`share_value`]).
 //!
 //! # Read–write ties
@@ -151,13 +160,64 @@ fn norm(x: &Array2<f64>) -> f64 {
     x.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
 
+/// The gauges that leave the scores of the heads of some key-value groups unchanged (module note):
+/// whether a plane may be scaled (heads without query and key norms), and per plane whether any of
+/// its rotations may be taken (else the identity or the half turn, which commute with every gain).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Symmetry {
+    pub(crate) scale: bool,
+    pub(crate) turn: Vec<bool>,
+}
+
+impl Symmetry {
+    /// The gauges both `self` and `other` allow.
+    #[must_use]
+    pub(crate) fn and(&self, other: &Self) -> Self {
+        Self { scale: self.scale && other.scale, turn: self.turn.iter().zip(&other.turn).map(|(a, b)| *a && *b).collect() }
+    }
+}
+
+/// The gain operator of a head's normed query or key at node `n` of `rule` (through the scale a
+/// shared function's member multiplies its query by), or none where it is not normed.
+fn head_gain(rule: &crate::operator_program::Rule, n: usize) -> Option<usize> {
+    match rule.nodes.get(n)? {
+        Node::Hadamard { left, .. } => head_gain(rule, *left),
+        Node::Affine { terms, bias: None } if terms.len() == 1 && matches!(rule.nodes.get(terms[0].0), Some(Node::RmsNorm { .. })) => Some(terms[0].1),
+        _ => None,
+    }
+}
+
+/// The gauges of the heads of `groups` with planes `planes` ([`Symmetry`]).
+pub(crate) fn symmetry(program: &OperatorProgram, groups: &[&KeyValue], planes: &[Vec<usize>]) -> Result<Symmetry, String> {
+    let mut gains = Vec::new();
+    let mut normed = false;
+    for group in groups {
+        for (_, head) in &group.heads {
+            let rule = &program.rules[head.rule];
+            let Some(Node::Attend { query, key, .. }) = rule.nodes.get(rule.output) else {
+                return Err(format!("{}: the output is not an attention node", rule.name));
+            };
+            for gain in [head_gain(rule, *query), head_gain(rule, *key)] {
+                if let Some(op) = gain {
+                    normed = true;
+                    gains.push(program.operators[op].diagonal().ok_or_else(|| format!("{}: a head norm's gain is not diagonal", program.operators[op].name))?);
+                }
+            }
+        }
+    }
+    let turn = planes.iter().map(|rows| rows.len() != 2 || gains.iter().all(|g| g[rows[0]] == g[rows[1]])).collect();
+    Ok(Symmetry { scale: !normed, turn })
+}
+
 /// Per plane of `planes`, the rotation (on one coordinate, the sign) and the scale that bring a
 /// group's maps `(q, k)`, its query maps in turn and its key map, to the gauge of `(q1, k1)`
-/// (module note).
-pub(crate) fn gauge(q1: &[&Array2<f64>], k1: &Array2<f64>, q: &[&Array2<f64>], k: &Array2<f64>, planes: &[Vec<usize>]) -> Vec<(Array2<f64>, f64)> {
+/// (module note), among the gauges `symmetry` allows: a plane whose rotations are not all allowed
+/// takes the identity or the half turn, and the scale is 1 where scaling is not allowed.
+pub(crate) fn gauge(q1: &[&Array2<f64>], k1: &Array2<f64>, q: &[&Array2<f64>], k: &Array2<f64>, planes: &[Vec<usize>], symmetry: &Symmetry) -> Vec<(Array2<f64>, f64)> {
     planes
         .iter()
-        .map(|rows| {
+        .zip(&symmetry.turn)
+        .map(|(rows, &turning)| {
             let pick = |m: &Array2<f64>| m.select(ndarray::Axis(0), rows);
             let (a_q, b_q): (Vec<Array2<f64>>, Vec<Array2<f64>>) = (q1.iter().map(|m| pick(m)).collect(), q.iter().map(|m| pick(m)).collect());
             let (a_k, b_k) = (pick(k1), pick(k));
@@ -166,10 +226,14 @@ pub(crate) fn gauge(q1: &[&Array2<f64>], k1: &Array2<f64>, q: &[&Array2<f64>], k
             for (a, b) in a_q.iter().zip(&b_q) {
                 m += &a.dot(&b.t());
             }
-            let rotation = if rows.len() == 2 {
+            let rotation = if rows.len() == 2 && turning {
                 let angle = (m[[1, 0]] - m[[0, 1]]).atan2(m[[0, 0]] + m[[1, 1]]);
                 let (sine, cosine) = angle.sin_cos();
                 ndarray::array![[cosine, -sine], [sine, cosine]]
+            } else if rows.len() == 2 {
+                // The identity or the half turn, whichever brings the maps closer.
+                let sign = if m[[0, 0]] + m[[1, 1]] < 0.0 { -1.0 } else { 1.0 };
+                ndarray::array![[sign, 0.0], [0.0, sign]]
             } else {
                 ndarray::array![[if m[[0, 0]] < 0.0 { -1.0 } else { 1.0 }]]
             };
@@ -177,7 +241,7 @@ pub(crate) fn gauge(q1: &[&Array2<f64>], k1: &Array2<f64>, q: &[&Array2<f64>], k
             // first member's ratio.
             let joint = |ms: &[Array2<f64>]| ms.iter().map(|m| m.iter().map(|v| v * v).sum::<f64>()).sum::<f64>().sqrt();
             let (nq, nk, n1q, n1k) = (joint(&b_q), norm(&b_k), joint(&a_q), norm(&a_k));
-            let scale = if nq > 0.0 && nk > 0.0 && n1q > 0.0 && n1k > 0.0 { (n1q * nk / (nq * n1k)).sqrt() } else { 1.0 };
+            let scale = if symmetry.scale && nq > 0.0 && nk > 0.0 && n1q > 0.0 && n1k > 0.0 { (n1q * nk / (nq * n1k)).sqrt() } else { 1.0 };
             (rotation, scale)
         })
         .collect()
@@ -272,7 +336,8 @@ pub fn share_query_key(explanation: &Explanation, members: &[Member]) -> Result<
         }
         // Member head `i` faces the owner's head `queries[i]`.
         let facing: Vec<&Array2<f64>> = m.queries.iter().map(|&j| &q1[j]).collect();
-        let gauge = gauge(&facing, &k1, &q.iter().collect::<Vec<_>>(), &k, &planes);
+        let allowed = symmetry(program, &[owner, *group], &planes)?;
+        let gauge = gauge(&facing, &k1, &q.iter().collect::<Vec<_>>(), &k, &planes, &allowed);
         for (i, &j) in m.queries.iter().enumerate() {
             q_sum[j] += &turn(&q[i], &planes, &gauge, true, false);
         }
@@ -350,12 +415,68 @@ pub fn share_query_key(explanation: &Explanation, members: &[Member]) -> Result<
     Ok(Explanation { artifact, trainable, groups, layers, removed, fixed_nats: explanation.fixed_nats, reference })
 }
 
-/// The value transport from one key-value group to another (module note): `T` and the source
-/// query head each target query head faces.
+/// The value transport from one key-value group to another (module note): `T`, the source query
+/// head each target query head faces, and the share of the source projections' squared norm the
+/// transport leaves, `Σ_i ‖O_{t,i} T − O_{s,π(i)}‖² / Σ_j ‖O_{s,j}‖²`: zero for a symmetry, else
+/// the transport is an approximation.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Transport {
     pub(crate) matrix: Array2<f64>,
     pub(crate) assignment: Vec<usize>,
+    pub(crate) residual: f64,
+}
+
+/// The assignment `π` maximizing `‖Σ_i M[i][π(i)]‖²`, by depth-first branch and bound from the
+/// assignment `start`: a partial assignment with sum `S` is dropped when
+/// `(‖S‖ + Σ_{i unassigned} max_{j free} ‖M[i][j]‖)²`, which bounds every completion by the
+/// triangle inequality, does not exceed the best found. Exact for every size.
+fn best_assignment(m: &[Vec<Array2<f64>>], start: Vec<usize>) -> Vec<usize> {
+    let h = m.len();
+    let value = |assignment: &[usize]| -> f64 {
+        let mut sum = m[0][assignment[0]].clone();
+        for (i, &j) in assignment.iter().enumerate().skip(1) {
+            sum += &m[i][j];
+        }
+        sum.iter().map(|v| v * v).sum()
+    };
+    let norms: Vec<Vec<f64>> = m.iter().map(|row| row.iter().map(norm).collect()).collect();
+    let mut best = (value(&start), start);
+    let mut partial = Vec::with_capacity(h);
+    let mut used = vec![false; h];
+    fn search(m: &[Vec<Array2<f64>>], norms: &[Vec<f64>], sum: Option<&Array2<f64>>, partial: &mut Vec<usize>, used: &mut [bool], best: &mut (f64, Vec<usize>)) {
+        let (h, i) = (m.len(), partial.len());
+        let current = sum.map_or(0.0, norm);
+        if i == h {
+            if current * current > best.0 {
+                *best = (current * current, partial.clone());
+            }
+            return;
+        }
+        let bound = current + (i..h).map(|r| (0..h).filter(|j| !used[*j]).map(|j| norms[r][j]).fold(0.0, f64::max)).sum::<f64>();
+        if bound * bound <= best.0 {
+            return;
+        }
+        let mut order: Vec<(f64, usize, Array2<f64>)> = (0..h)
+            .filter(|j| !used[*j])
+            .map(|j| {
+                let next = match sum {
+                    Some(s) => s + &m[i][j],
+                    None => m[i][j].clone(),
+                };
+                (norm(&next), j, next)
+            })
+            .collect();
+        order.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (_, j, next) in order {
+            used[j] = true;
+            partial.push(j);
+            search(m, norms, Some(&next), partial, used, best);
+            partial.pop();
+            used[j] = false;
+        }
+    }
+    search(m, &norms, None, &mut partial, &mut used, &mut best);
+    best.1
 }
 
 /// Each query head's native output projection `O_h` (`blocks.{layer}.o{h}`, `d × width`), which the
@@ -367,10 +488,13 @@ fn output_projections(explanation: &Explanation, groups: &BTreeMap<(usize, usize
 }
 
 /// The value transports of key-value group `target` from each group of `sources` (module note):
-/// the assignment `π` of the target's query heads to a source's minimizes the residuals
-/// `‖(I − P_i) O_{s,j}‖²` of each source projection outside each target projection's column
-/// space (`P_i` its projector), and `T = A⁺ B` is the least-squares solution of
-/// `Σ_i ‖O_{t,i} T − O_{s,π(i)}‖²`, `A` and `B` the stacked projections.
+/// `(π, T)` minimize `Σ_i ‖O_{t,i} T − O_{s,π(i)}‖²` jointly. For an assignment `π` the least-squares
+/// transport is `T = A⁺ B_π`, `A` and `B_π` the stacked projections, and its residual is
+/// `‖B_π‖² − ‖Q_Aᵀ B_π‖²` with `Q_A` an orthonormal basis of `A`'s columns; `‖B_π‖²` does not depend on
+/// `π`, so the best assignment maximizes `‖Σ_i Q_{A,i}ᵀ O_{s,π(i)}‖²` (`Q_{A,i}` the rows of `Q_A`
+/// for target head `i`), found exactly by branch and bound ([`best_assignment`]) from the
+/// assignment that minimizes each source projection's residual outside each target projection's
+/// column space.
 pub(crate) fn transports(explanation: &Explanation, target: (usize, usize), sources: &[(usize, usize)]) -> Result<Vec<Transport>, String> {
     use rayon::prelude::*;
     let groups = key_values(explanation)?;
@@ -378,6 +502,14 @@ pub(crate) fn transports(explanation: &Explanation, target: (usize, usize), sour
     let stacked = |ms: &[&Array2<f64>]| ndarray::concatenate(ndarray::Axis(0), &ms.iter().map(|m| m.view()).collect::<Vec<_>>()).map_err(error);
     let a = stacked(&own.iter().collect::<Vec<_>>())?;
     let inverse = gam_linalg::decompose::pseudo_inverse(a.view()).map_err(error)?;
+    // An orthonormal basis of `A`'s columns, split into the target heads' row blocks.
+    let basis = {
+        let d = gam_linalg::decompose::svd(a.view(), false).map_err(error)?;
+        let resolved: Vec<usize> = (0..d.singular_values.len()).filter(|&i| d.singular_values[i] > d.band).collect();
+        d.u.select(ndarray::Axis(1), &resolved)
+    };
+    let height = own.first().map_or(0, Array2::nrows);
+    let blocks: Vec<Array2<f64>> = (0..own.len()).map(|i| basis.slice(ndarray::s![i * height..(i + 1) * height, ..]).to_owned()).collect();
     // Each target projection's column space, orthonormal.
     let bases = own
         .iter()
@@ -401,10 +533,15 @@ pub(crate) fn transports(explanation: &Explanation, target: (usize, usize), sour
                     let inside = bases[i].t().dot(&theirs[j]);
                     theirs[j].iter().map(|v| v * v).sum::<f64>() - inside.iter().map(|v| v * v).sum::<f64>()
                 });
-                crate::library_bodies::hungarian(&cost)?
+                let start = crate::library_bodies::hungarian(&cost)?;
+                let projected: Vec<Vec<Array2<f64>>> = blocks.iter().map(|q| theirs.iter().map(|o| q.t().dot(o)).collect()).collect();
+                best_assignment(&projected, start)
             };
             let b = stacked(&assignment.iter().map(|&j| &theirs[j]).collect::<Vec<_>>())?;
-            Ok(Transport { matrix: inverse.dot(&b), assignment })
+            let matrix = inverse.dot(&b);
+            let total: f64 = b.iter().map(|v| v * v).sum();
+            let left: f64 = (a.dot(&matrix) - &b).iter().map(|v| v * v).sum();
+            Ok(Transport { matrix, assignment, residual: if total > 0.0 { left / total } else { 0.0 } })
         })
         .collect()
 }
@@ -1202,6 +1339,114 @@ mod tests {
         assert!(owners.iter().any(|o| o.operator == "library.l0.mlp.out" && o.cols == (4..5)));
     }
 
+    /// `(γ_q ⊙ N(q))ᵀ R (γ_k ⊙ N(k))`, `N` the RMS norm (ε = 0) and `R` turning each plane of
+    /// `planes` by `angle`.
+    fn normed_score(q: &[f64], k: &[f64], (gq, gk): (&[f64], &[f64]), planes: &[Vec<usize>], angle: f64) -> f64 {
+        let normed = |x: &[f64], g: &[f64]| -> Vec<f64> {
+            let rms = (x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64).sqrt();
+            x.iter().zip(g).map(|(v, g)| g * v / rms).collect()
+        };
+        let (q, mut k) = (normed(q, gq), normed(k, gk));
+        let (sine, cosine) = angle.sin_cos();
+        for rows in planes.iter().filter(|r| r.len() == 2) {
+            let (a, b) = (k[rows[0]], k[rows[1]]);
+            (k[rows[0]], k[rows[1]]) = (cosine * a - sine * b, sine * a + cosine * b);
+        }
+        q.iter().zip(&k).map(|(a, b)| a * b).sum()
+    }
+
+    #[test]
+    fn the_gauges_of_normed_heads_keep_their_normed_scores() {
+        let planes = [vec![0, 1], vec![2, 3]];
+        let ones = [1.0; 4];
+        // A plane's reciprocal scaling keeps the raw score and moves the normed one (4 to 3.2).
+        let (q, k) = ([1.0, 0.0, 1.0, 0.0], [1.0, 0.0, 1.0, 0.0]);
+        let (qs, ks) = ([2.0, 0.0, 1.0, 0.0], [0.5, 0.0, 1.0, 0.0]);
+        let raw = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+        assert_eq!(raw(&q, &k), raw(&qs, &ks));
+        assert!((normed_score(&q, &k, (&ones, &ones), &planes, 0.0) - 4.0).abs() < 1e-12);
+        assert!((normed_score(&qs, &ks, (&ones, &ones), &planes, 0.0) - 3.2).abs() < 1e-12);
+        // Gains unequal on plane 0, equal on plane 1: plane 0 takes the identity or the half turn,
+        // plane 1 any rotation, and no plane a scale.
+        let (gq, gk) = ([0.7, 1.3, 0.9, 0.9], [1.1, 0.6, 1.2, 1.2]);
+        let symmetry = Symmetry { scale: false, turn: vec![false, true] };
+        let q1 = Array2::from_shape_fn((4, 3), |(i, j)| ((i * 3 + j) as f64 * 0.37).sin() + 0.2);
+        let k1 = Array2::from_shape_fn((4, 3), |(i, j)| ((i + 2 * j) as f64 * 0.53).cos() - 0.1);
+        let (sine, cosine) = 0.9_f64.sin_cos();
+        let mut g = Array2::<f64>::zeros((4, 4));
+        g[[0, 0]] = -1.0;
+        g[[1, 1]] = -1.0;
+        g.slice_mut(ndarray::s![2..4, 2..4]).assign(&ndarray::array![[cosine, -sine], [sine, cosine]]);
+        let (q, k) = (g.dot(&q1), g.dot(&k1));
+        let gauge = gauge(&[&q1], &k1, &[&q], &k, &planes, &symmetry);
+        assert!(gauge.iter().all(|(_, s)| *s == 1.0), "normed heads take no scale");
+        let (qa, ka) = (turn(&q, &planes, &gauge, true, false), turn(&k, &planes, &gauge, false, false));
+        assert!((&qa - &q1).iter().chain((&ka - &k1).iter()).all(|d| d.abs() < 1e-12), "the gauge brings the maps back");
+        // Every gauge it can take keeps the normed scores of the maps it moves, at any rotary turn.
+        let x = [0.3, -1.2, 0.8];
+        let y = [-0.4, 0.9, 1.1];
+        let apply = |m: &Array2<f64>, v: &[f64]| m.dot(&ndarray::Array1::from(v.to_vec())).to_vec();
+        for angle in [0.0, 0.4, 2.1] {
+            let before = normed_score(&apply(&q, &x), &apply(&k, &y), (&gq, &gk), &planes, angle);
+            let after = normed_score(&apply(&qa, &x), &apply(&ka, &y), (&gq, &gk), &planes, angle);
+            assert!((before - after).abs() < 1e-12, "the gauge keeps the normed score: {before} against {after}");
+        }
+    }
+
+    #[test]
+    fn the_gauges_of_a_qwen3_library_take_no_scale() {
+        let dir = crate::test_support::tiny_qwen3_export("library_sharing_symmetry", 2);
+        let imported = import_language_model(&dir, 6, 12).expect("import");
+        std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+        let native = split_sites(&imported.program).expect("split");
+        let start = explanation(&native, &layer_nodes(&native, 2).expect("layers")).expect("explanation");
+        let groups = key_values(&start).expect("groups");
+        let group = &groups[&(0, 0)];
+        let planes = planes(start.artifact.program.operators[group.key].rows.width(), group.rotary);
+        let found = symmetry(&start.artifact.program, &[group], &planes).expect("symmetry");
+        assert!(!found.scale, "heads with query and key norms take no scale");
+        assert_eq!(found.turn.len(), planes.len());
+    }
+
+    #[test]
+    fn the_best_assignment_is_found_jointly_with_the_transport() {
+        // Scalar projections (1, 2) of the target heads and (2, 1) of the source's: each pair alone
+        // fits exactly, the identity's common transport leaves a residual (0.8 with 1.8 left) and
+        // the swap none.
+        let m = |v: f64| Array2::from_elem((1, 1), v);
+        let norm = (1.0_f64 + 4.0).sqrt();
+        let projected = vec![vec![m(2.0 / norm), m(1.0 / norm)], vec![m(4.0 / norm), m(2.0 / norm)]];
+        assert_eq!(best_assignment(&projected, vec![0, 1]), vec![1, 0]);
+        // A permutation of five heads, found from the identity.
+        let blocks: Vec<Array2<f64>> = (0..5).map(|i| Array2::from_shape_fn((3, 2), |(r, c)| ((i * 7 + r * 3 + c) as f64 * 0.61).sin())).collect();
+        let truth = [3, 0, 4, 1, 2];
+        let projected: Vec<Vec<Array2<f64>>> = (0..5).map(|i| (0..5).map(|j| if truth[i] == j { blocks[i].clone() } else { -&blocks[i] * 0.3 + 0.05 * (i * 5 + j) as f64 }).collect()).collect();
+        let found = best_assignment(&projected, (0..5).collect());
+        let value = |a: &[usize]| {
+            let mut sum = projected[0][a[0]].clone();
+            for (i, &j) in a.iter().enumerate().skip(1) {
+                sum += &projected[i][j];
+            }
+            sum.iter().map(|v| v * v).sum::<f64>()
+        };
+        // Exhaustively: no permutation scores higher.
+        let mut best = 0.0_f64;
+        let mut order: Vec<usize> = (0..5).collect();
+        fn each(k: usize, order: &mut Vec<usize>, visit: &mut dyn FnMut(&[usize])) {
+            if k == order.len() {
+                visit(order);
+                return;
+            }
+            for i in k..order.len() {
+                order.swap(k, i);
+                each(k + 1, order, visit);
+                order.swap(k, i);
+            }
+        }
+        each(0, &mut order, &mut |a| best = best.max(value(a)));
+        assert!((value(&found) - best).abs() <= 1e-12 * best, "branch and bound finds the best assignment");
+    }
+
     #[test]
     fn alignment_undoes_a_plane_rotation_and_scale() {
         let q1 = Array2::from_shape_fn((2, 3), |(i, j)| (i * 3 + j) as f64 + 1.0);
@@ -1212,7 +1457,7 @@ mod tests {
         // Two query heads of one key: one rotation and one scale of the plane for the whole group.
         let q2 = Array2::from_shape_fn((2, 3), |(i, j)| ((3 * i + j) as f64).cos() - 0.5);
         let planes = [vec![0, 1]];
-        let gauge = gauge(&[&q1, &q2], &k1, &[&(r.dot(&q1) * 3.0), &(r.dot(&q2) * 3.0)], &k, &planes);
+        let gauge = gauge(&[&q1, &q2], &k1, &[&(r.dot(&q1) * 3.0), &(r.dot(&q2) * 3.0)], &k, &planes, &Symmetry { scale: true, turn: vec![true] });
         let (qa, q2a, ka) = (turn(&q, &planes, &gauge, true, false), turn(&(r.dot(&q2) * 3.0), &planes, &gauge, true, false), turn(&k, &planes, &gauge, false, false));
         assert!((&qa - &q1).iter().chain((&q2a - &q2).iter()).chain((&ka - &k1).iter()).all(|d| d.abs() < 1e-12));
         // The transpose takes a cotangent back: <turn(x), y> = <x, turn^T(y)>.

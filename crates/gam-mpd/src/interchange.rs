@@ -60,7 +60,7 @@
 
 use crate::{
     artifact::Artifact,
-    decoder::Decoder,
+    decoder::{self, Decoder},
     artifact_device::mapped_inlined,
     device_program::{DeviceProgram, DeviceTrace},
     operator_program::{FamilyInputs, Node, OperatorProgram, SequenceLayout, SlotValues},
@@ -1203,9 +1203,121 @@ fn check(e: &Experiment, batch: &Batch, blocks: usize) -> Result<(), String> {
 
 /// `M`'s compact statistics for a batch's experiments, per experiment from its position on: the
 /// targets every score of `P` on them is measured against ([`targets`]). They do not depend on `P`;
-/// a fit makes them on the device whenever it scores a batch.
+/// a fit makes them on the device whenever it scores a batch. [`Interchange::targets`] records how
+/// `M` ran ([`Execution`]), and [`Interchange::evaluate_labelled`] refuses targets made another way.
 pub struct Targets {
     rows: Vec<Target>,
+    teacher: Option<Execution>,
+}
+
+/// How one model's blocks run in the experiments: its program block by block, or its fused decoder
+/// ([`Decoder`]), and the arithmetic of the products outside the blocks (the head, the patches).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Execution {
+    Program(Arithmetic),
+    Fused(Arithmetic),
+}
+
+/// One model's engine in the experiments: its program block by block, or its fused decoder. Each
+/// model of an [`Interchange`] takes its own, so `M`'s blocks and targets run the same way whatever
+/// explanation they are compared with.
+pub enum Engine<'a> {
+    Program(Model<'a>),
+    Fused(&'a Decoder),
+}
+
+/// A tape of an [`Engine`].
+pub enum EngineTape {
+    Program(DeviceTrace),
+    Fused(decoder::Tape),
+}
+
+impl Engine<'_> {
+    /// How it runs.
+    #[must_use]
+    pub fn execution(&self) -> Execution {
+        match self {
+            Self::Program(m) => Execution::Program(BlockEngine::arithmetic(m)),
+            Self::Fused(d) => Execution::Fused(BlockEngine::arithmetic(*d)),
+        }
+    }
+}
+
+impl BlockEngine for Engine<'_> {
+    type Tape = EngineTape;
+
+    fn device(&self) -> &Device {
+        match self {
+            Self::Program(m) => BlockEngine::device(m),
+            Self::Fused(d) => BlockEngine::device(*d),
+        }
+    }
+
+    fn width(&self) -> usize {
+        match self {
+            Self::Program(m) => BlockEngine::width(m),
+            Self::Fused(d) => BlockEngine::width(*d),
+        }
+    }
+
+    fn blocks(&self) -> usize {
+        match self {
+            Self::Program(m) => BlockEngine::blocks(m),
+            Self::Fused(d) => BlockEngine::blocks(*d),
+        }
+    }
+
+    fn arithmetic(&self) -> Arithmetic {
+        match self {
+            Self::Program(m) => BlockEngine::arithmetic(m),
+            Self::Fused(d) => BlockEngine::arithmetic(*d),
+        }
+    }
+
+    fn forward(
+        &self,
+        block: usize,
+        stream: &mut Tensor,
+        ranges: &[Range<usize>],
+        tokens: &[&[u32]],
+        read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
+        keep: bool,
+    ) -> Result<Option<EngineTape>, String> {
+        Ok(match self {
+            Self::Program(m) => BlockEngine::forward(m, block, stream, ranges, tokens, read, keep)?.map(EngineTape::Program),
+            Self::Fused(d) => BlockEngine::forward(*d, block, stream, ranges, tokens, read, keep)?.map(EngineTape::Fused),
+        })
+    }
+
+    fn reverse(
+        &self,
+        block: usize,
+        tape: &EngineTape,
+        cotangent: &mut Tensor,
+        ranges: &[Range<usize>],
+        read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
+        gradient: &mut BTreeMap<usize, Tensor>,
+    ) -> Result<(), String> {
+        match (self, tape) {
+            (Self::Program(m), EngineTape::Program(t)) => BlockEngine::reverse(m, block, t, cotangent, ranges, read, gradient),
+            (Self::Fused(d), EngineTape::Fused(t)) => BlockEngine::reverse(*d, block, t, cotangent, ranges, read, gradient),
+            _ => Err(error("a tape of another engine")),
+        }
+    }
+
+    fn tape_bytes(tape: &EngineTape) -> usize {
+        match tape {
+            EngineTape::Program(t) => <Model<'_> as BlockEngine>::tape_bytes(t),
+            EngineTape::Fused(t) => <Decoder as BlockEngine>::tape_bytes(t),
+        }
+    }
+
+    fn gradient_bytes(&self) -> Result<usize, String> {
+        match self {
+            Self::Program(m) => BlockEngine::gradient_bytes(m),
+            Self::Fused(d) => BlockEngine::gradient_bytes(*d),
+        }
+    }
 }
 
 /// The paths of `experiments` on `batch` with the directions of `design`, every block run by `M`
@@ -1255,7 +1367,7 @@ pub fn targets<E: BlockEngine>(m: &E, head: &FixedHead, batch: &Batch, experimen
         out.push(Target { mu: Arc::new(mu), entropy: all.entropy[at..at + r.len()].to_vec(), head: Arc::clone(&head.head), scored: None });
         at += r.len();
     }
-    Ok(Targets { rows: out })
+    Ok(Targets { rows: out, teacher: None })
 }
 
 impl Targets {
@@ -1438,10 +1550,13 @@ pub struct Interchange {
     trainable: Vec<usize>,
     /// `M`'s and `P`'s programs through their hidden nodes, which [`Interchange::fuse`] compiles.
     prefixes: (OperatorProgram, OperatorProgram),
-    /// The fused engines of `M` and `P` ([`Decoder`]) once [`Interchange::fuse`] made them, else
-    /// none (the reference engine runs); `P`'s is refreshed from `P`'s program before an evaluation
-    /// that follows a write to it (`stale`).
-    engines: Option<(Decoder, RefCell<Decoder>)>,
+    /// Once [`Interchange::fuse`] asked for fused engines, `M`'s when `M` is of the decoder family
+    /// and `P`'s when `P` is, each decided by its own program alone; a model without one runs its
+    /// program. `P`'s is refreshed from `P`'s program before an evaluation that follows a write to
+    /// it (`stale`).
+    teacher: Option<Decoder>,
+    candidate: Option<RefCell<Decoder>>,
+    fuse_asked: bool,
     stale: Cell<bool>,
 }
 
@@ -1480,39 +1595,53 @@ impl Interchange {
         if variables.iter().any(|v| v.block >= 2 * layers.len() || v.parts.is_empty() || v.parts.iter().any(|(op, _)| !trainable.contains(op))) {
             return Err(error("a read variable outside the blocks or the trainable operators"));
         }
-        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), prefixes: (m_prefix, p_prefix), engines: None, stale: Cell::new(false) })
+        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), prefixes: (m_prefix, p_prefix), teacher: None, candidate: None, fuse_asked: false, stale: Cell::new(false) })
     }
 
-    /// Run the experiments on the fused engines from now on, when the device holds f32 and both
-    /// programs are of the decoder family; returns whether they run. Not the default: the decoder's
-    /// bfloat16 products differ from the program engine by as much as the divergence itself
-    /// (`mpd_engine_parity_2951`, vpd4l on an RTX 4090: up to 0.045 bits per token against means of
-    /// 0.02 to 0.05, gradients 6 to 8% off).
+    /// Run each model on its fused engine from now on where the device holds f32 and the model is
+    /// of the decoder family, each decided by its own program: `M`'s execution does not depend on
+    /// the explanation it is compared with. Returns whether `P` runs fused. Not the default: the
+    /// decoder's bfloat16 products differ from the program engine by as much as the divergence
+    /// itself (`mpd_engine_parity_2951`, vpd4l on an RTX 4090: up to 0.045 bits per token against
+    /// means of 0.02 to 0.05, gradients 6 to 8% off).
     pub fn fuse(&mut self) -> Result<bool, String> {
-        if self.engines.is_some() || self.p.device().float64() {
-            return Ok(self.engines.is_some());
+        if self.fuse_asked || self.p.device().float64() {
+            return Ok(self.candidate.is_some());
         }
+        self.fuse_asked = true;
         let device = self.p.device();
-        let m_engine = Decoder::new(device, &self.prefixes.0, (&self.m_sites.entries, &self.m_sites.reads, self.m.hidden()), &[]);
-        let p_engine = Decoder::new(device, &self.prefixes.1, (&self.p_sites.entries, &self.p_sites.reads, self.p.hidden()), &self.trainable);
-        match (m_engine, p_engine) {
-            (Ok(m_engine), Ok(mut p_engine)) => {
-                p_engine.refresh(&self.p)?;
-                self.engines = Some((m_engine, RefCell::new(p_engine)));
+        match Decoder::new(device, &self.prefixes.0, (&self.m_sites.entries, &self.m_sites.reads, self.m.hidden()), &[]) {
+            Ok(engine) => self.teacher = Some(engine),
+            Err(reason) => log::info!("interchange: M runs its program ({reason})"),
+        }
+        match Decoder::new(device, &self.prefixes.1, (&self.p_sites.entries, &self.p_sites.reads, self.p.hidden()), &self.trainable) {
+            Ok(mut engine) => {
+                engine.refresh(&self.p)?;
+                self.candidate = Some(RefCell::new(engine));
                 self.stale.set(false);
-                Ok(true)
             }
-            (m_engine, p_engine) => {
-                let reason = m_engine.err().or(p_engine.err()).unwrap_or_default();
-                log::info!("interchange: the reference engine runs ({reason})");
-                Ok(false)
-            }
+            Err(reason) => log::info!("interchange: P runs its program ({reason})"),
+        }
+        Ok(self.candidate.is_some())
+    }
+
+    /// Whether `P` runs on its fused engine.
+    pub fn fused(&self) -> bool {
+        self.candidate.is_some()
+    }
+
+    /// `M`'s engine.
+    fn teacher(&self) -> Engine<'_> {
+        match &self.teacher {
+            Some(engine) => Engine::Fused(engine),
+            None => Engine::Program(self.models().0),
         }
     }
 
-    /// Whether the fused engines run the experiments.
-    pub fn fused(&self) -> bool {
-        self.engines.is_some()
+    /// How `M` runs: the execution every target of this interchange is made with.
+    #[must_use]
+    pub fn teacher_execution(&self) -> Execution {
+        self.teacher().execution()
     }
 
     /// `M` and `P` as the free functions of this module take them.
@@ -1557,12 +1686,12 @@ impl Interchange {
         Ok(all.slice(s![rows.clone(), ..]).to_owned())
     }
 
-    /// `M`'s targets for `experiments` on `batch` under `design` ([`targets`]).
+    /// `M`'s targets for `experiments` on `batch` under `design` ([`targets`]), on `M`'s engine.
     pub fn targets(&self, batch: &Batch, experiments: &[Experiment], design: &Design) -> Result<Targets, String> {
-        match &self.engines {
-            Some((m, _)) => targets(m, &self.head, batch, experiments, design),
-            None => targets(&self.models().0, &self.head, batch, experiments, design),
-        }
+        let teacher = self.teacher();
+        let mut made = targets(&teacher, &self.head, batch, experiments, design)?;
+        made.teacher = Some(teacher.execution());
+        Ok(made)
     }
 
     /// `P`'s program, so that a fit writes each weight sample into its resident parameters.
@@ -1579,19 +1708,24 @@ impl Interchange {
 
     /// [`evaluate_labelled`] of `P` as it is held, the gradients left on the device.
     pub fn evaluate_labelled(&self, batch: &Batch, experiments: &[Experiment], design: &Design, targets: Option<&Targets>, gradient: bool, labels: Option<&[f64]>) -> Result<Evaluation, String> {
-        match &self.engines {
-            Some((m, p)) => {
-                if self.stale.replace(false) {
-                    p.try_borrow_mut().map_err(error)?.refresh(&self.p)?;
-                }
-                let p = p.try_borrow().map_err(error)?;
-                evaluate_labelled((m, &*p), &self.head, (batch, experiments, design), targets, gradient, labels)
-            }
-            None => {
-                let (m, p) = self.models();
-                evaluate_labelled((&m, &p), &self.head, (batch, experiments, design), targets, gradient, labels)
-            }
+        let teacher = self.teacher();
+        if let Some(made) = targets.and_then(|t| t.teacher)
+            && made != teacher.execution()
+        {
+            return Err(error(format!("targets made with M run as {made:?}, compared with M run as {:?}", teacher.execution())));
         }
+        let held;
+        let p = match &self.candidate {
+            Some(engine) => {
+                if self.stale.replace(false) {
+                    engine.try_borrow_mut().map_err(error)?.refresh(&self.p)?;
+                }
+                held = engine.try_borrow().map_err(error)?;
+                Engine::Fused(&*held)
+            }
+            None => Engine::Program(self.models().1),
+        };
+        evaluate_labelled((&teacher, &p), &self.head, (batch, experiments, design), targets, gradient, labels)
     }
 
     /// [`sampled_label`] at `P`'s loaded parameters, the gradient left on the device per trainable
