@@ -39,9 +39,10 @@ for s in ("top", "right"):
     ax.spines[s].set_visible(False)
 last = x[-1]
 ax.set_xlim(x[0], last + 0.22 * (last - x[0] + 1))
+ax.set_xticks([t for t in ax.get_xticks() if x[0] <= t <= last])
 pad = 0.012 * (last - x[0] + 1)
 ax.annotate(f"F  {total[-1]:.2f}", (last, total[-1]), xytext=(last + pad, total[-1] * 1.15), color=INK, va="bottom", fontsize=16)
-ax.annotate(f"description  {description[-1]:.2f}", (last, description[-1]), xytext=(last + pad, description[-1]), color=BLUE, va="center", fontsize=16)
-ax.annotate(f"data  {data[-1]:.2f}", (last, data[-1]), xytext=(last + pad, data[-1]), color=ORANGE, va="center", fontsize=16)
+ax.annotate(f"description  {description[-1]:.2f}", (last, description[-1]), xytext=(last + pad, description[-1] * 1.12), color=BLUE, va="center", fontsize=16)
+ax.annotate(f"data  {data[-1]:.2f}", (last, data[-1]), xytext=(last + pad, data[-1] * 0.86), color=ORANGE, va="center", fontsize=16)
 fig.savefig(out, dpi=170, facecolor="white", bbox_inches="tight")
 print(out)
