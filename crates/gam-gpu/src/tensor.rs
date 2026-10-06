@@ -3870,13 +3870,17 @@ extern "C" __global__ void group_curvature_f32_bf16(u64 n, u64 cols, unsigned in
     group_curvature_body<float, unsigned short>(n, cols, axis, chunks, count, factor, mean, log_sd, groups, sums);
 }
 
-// `Device::group_code_length`: one entry per group, every one into row `slot`, summed by the first
-// warp alone in a fixed order (lane by lane, then by shuffles), so the sum is the same on every run.
+// `Device::group_code_length`, first stage: block b sums groups b·BLOCK .. (b + 1)·BLOCK, one per
+// thread, by shuffles within each warp in a fixed order and then the warps in order, into
+// `partials[2b]` (live groups) and `partials[2b + 1]` (their code length). The second stage
+// (`group_code_length_total`) adds the blocks' in order, so the sum is the same on every run. Each
+// group's Elias δ exponent takes two double logarithms: one warp doing every group (as before)
+// was bound by one multiprocessor's double units.
 extern "C" __global__ void group_code_length(u64 n, u64 slot, const double* divergence, const double* variance, const double* weight, const double* constant,
-    const double* initial, double* sums) {
-    if (blockIdx.x != 0 || threadIdx.x >= 32) return;
+    const double* initial, double* partials) {
+    __shared__ double warps_a[BLOCK / 32], warps_t[BLOCK / 32];
     double a = 0.0, total = 0.0;
-    for (u64 g = threadIdx.x; g < n; g += 32) {
+    for (u64 g = (u64)blockIdx.x * BLOCK + threadIdx.x; g < n && g < ((u64)blockIdx.x + 1) * BLOCK; g += BLOCK) {
         bool live = weight[g] != 0.0;
         double b = 0.0;
         if (live) {
@@ -3898,7 +3902,23 @@ extern "C" __global__ void group_code_length(u64 n, u64 slot, const double* dive
         a += __shfl_down_sync(0xffffffffu, a, o);
         total += __shfl_down_sync(0xffffffffu, total, o);
     }
-    if (threadIdx.x == 0 && a > 0.0) {
+    if ((threadIdx.x & 31u) == 0) { warps_a[threadIdx.x >> 5] = a; warps_t[threadIdx.x >> 5] = total; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double ba = 0.0, bt = 0.0;
+        for (unsigned int w = 0; w < BLOCK / 32; w++) { ba += warps_a[w]; bt += warps_t[w]; }
+        partials[2 * (u64)blockIdx.x] = ba;
+        partials[2 * (u64)blockIdx.x + 1] = bt;
+    }
+}
+
+// `Device::group_code_length`, second stage: the first stage's `blocks` partials added in block
+// order into row `slot` of `sums`, by thread 0 alone.
+extern "C" __global__ void group_code_length_total(u64 blocks, u64 slot, const double* partials, double* sums) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    double a = 0.0, total = 0.0;
+    for (u64 b = 0; b < blocks; b++) { a += partials[2 * b]; total += partials[2 * b + 1]; }
+    if (a > 0.0) {
         sums[3 * slot] += a;
         sums[3 * slot + 1] += total;
     }
@@ -5536,12 +5556,21 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             slot: usize,
         ) -> Result<(), GpuError> {
             let (n, slot) = (divergence.len() as u64, slot as u64);
+            let blocks = n.div_ceil(u64::from(BLOCK)).max(1);
+            // SAFETY: the first stage writes all `2 · blocks` partials before the second reads them.
+            let mut partials = unsafe { self.stream.alloc::<f64>(2 * blocks as usize) }.gpu_ctx("tensor alloc")?;
             let f = self.function("group_code_length")?;
             let mut builder = self.stream.launch_builder(&f);
-            builder.arg(&n).arg(&slot).arg(slice(divergence)?).arg(slice(variance)?).arg(slice(weight)?).arg(slice(constant)?).arg(slice(initial)?).arg(slice_mut(sums)?);
-            // SAFETY: groups × 1 float64 inputs and a rows × 3 float64 sum, the slot inside it,
-            // checked by the caller.
-            unsafe { builder.launch(cfg_elements(32)) }.gpu_ctx("tensor group_code_length").map(|_| ())
+            builder.arg(&n).arg(&slot).arg(slice(divergence)?).arg(slice(variance)?).arg(slice(weight)?).arg(slice(constant)?).arg(slice(initial)?).arg(&mut partials);
+            // SAFETY: groups × 1 float64 inputs; one block per BLOCK groups, each writing its two
+            // partials.
+            unsafe { builder.launch(LaunchConfig { grid_dim: (blocks as u32, 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 }) }.gpu_ctx("tensor group_code_length")?;
+            let total = self.function("group_code_length_total")?;
+            // SAFETY: `2 · blocks` partials and a rows × 3 float64 sum, the slot inside it, checked
+            // by the caller.
+            unsafe { self.stream.launch_builder(&total).arg(&blocks).arg(&slot).arg(&partials).arg(slice_mut(sums)?).launch(cfg_elements(1)) }
+                .gpu_ctx("tensor group_code_length_total")
+                .map(|_| ())
         }
 
         pub(super) fn resolved_counts(
