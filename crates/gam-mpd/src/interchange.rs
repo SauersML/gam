@@ -292,6 +292,43 @@ pub struct Part {
 /// and 3 amplify it.
 pub const FACTORS: [f64; 4] = [0.0, 0.5, 2.0, 3.0];
 
+/// The parts of a library explanation `program` of `layers` layers (`library_mdl::explanation_with`):
+/// per layer whose MLP is transcoder features (`library_transcoder::mlp`: a ReLU gate with its bias,
+/// no up map), each feature `relu(g·x + c) u` with a nonzero write, in the layer's order; layers
+/// running `M`'s own functions have none.
+pub fn parts_of(program: &OperatorProgram, layers: usize) -> Result<Vec<Part>, String> {
+    let named: BTreeMap<&str, usize> = program.operators.iter().enumerate().map(|(i, op)| (op.name.as_str(), i)).collect();
+    let mut out = Vec::new();
+    for l in 0..layers {
+        let name = format!("library.l{l}.mlp");
+        let at = |part: &str| named.get(format!("{name}.{part}").as_str()).copied();
+        let (Some(gate), Some(bias), Some(write)) = (at("gate"), at("gate_bias"), at("out")) else { continue };
+        if at("up").is_some() || at("m_gate").is_none() {
+            continue;
+        }
+        let (gate, bias, write) = (program.operators[gate].matrix(), program.operators[bias].matrix(), program.operators[write].matrix());
+        if bias.dim() != (gate.nrows(), 1) || write.dim() != (gate.ncols(), gate.nrows()) {
+            return Err(error(format!("layer {l}: a transcoder MLP's gate, bias and write disagree in shape")));
+        }
+        for i in 0..gate.nrows() {
+            let u = write.column(i);
+            if u.iter().any(|v| *v != 0.0) {
+                out.push(Part { block: 2 * l + 1, read: gate.row(i).to_vec(), bias: bias[[i, 0]], write: u.to_vec() });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The experiment families of edits ([`Interchange::sample_edits`]): removing a part
+/// (`FACTORS[0]`), and scaling its write by one of the other factors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Family {
+    RemovePart,
+    AmplifyPart,
+}
+
 /// Where a model applies edits of parts: per block, for an MLP block, the node its parts read
 /// (the block's read) and the node their writes add to (the MLP's output), and the parts.
 #[derive(Clone, Debug, Default)]
@@ -1477,7 +1514,7 @@ fn paths<'t>(batch: &'t Batch, experiments: &'t [Experiment], values: &[Value], 
 }
 
 /// The parts of `engine`'s edits (none without part sites).
-fn parts_of<E: BlockEngine>(engine: &E) -> &[Part] {
+fn engine_parts<E: BlockEngine>(engine: &E) -> &[Part] {
     engine.part_sites().map_or(&[], PartSites::parts)
 }
 
@@ -1492,7 +1529,7 @@ pub fn targets<E: BlockEngine>(m: &E, head: &FixedHead, batch: &Batch, experimen
     let d = m.device();
     let blocks = m.blocks();
     let native = vec![false; blocks];
-    let (paths, bases) = paths(batch, experiments, m.values(), parts_of(m), Some(&native), blocks)?;
+    let (paths, bases) = paths(batch, experiments, m.values(), engine_parts(m), Some(&native), blocks)?;
     let plan = Plan::new(paths, batch.length);
     let (stream, _) = run([m, m], &plan, false)?;
     let rows = outputs(&plan, &bases, experiments);
@@ -1907,7 +1944,7 @@ pub fn evaluate_labelled<E: BlockEngine>(
             return Err(error("a target of other rows than its experiment's"));
         }
     }
-    let (paths, bases) = paths(batch, experiments, p.values(), parts_of(p), None, blocks)?;
+    let (paths, bases) = paths(batch, experiments, p.values(), engine_parts(p), None, blocks)?;
     let plan = Plan::new(paths, length);
     let arithmetic = p.arithmetic();
     let (stream, calls) = run([p, m], &plan, gradient || labels.is_some())?;
@@ -2073,6 +2110,97 @@ impl Interchange {
     /// The parts ([`Interchange::set_parts`]).
     pub fn parts(&self) -> &[Part] {
         &self.m_sites.parts.parts
+    }
+
+    /// Per `(base, block, position)` of `wanted` (a base sequence of `batch`, an MLP block, a row),
+    /// the parts of that block that fire on `M`'s own read there (`g·x + c > 0`, `M` running alone
+    /// on the base).
+    pub fn active_parts(&self, batch: &Batch, wanted: &[(usize, usize, usize)]) -> Result<Vec<Vec<usize>>, String> {
+        let (m, _) = self.models();
+        let (d, length) = (m.device(), batch.length());
+        let bases: Vec<usize> = wanted.iter().map(|w| w.0).collect::<BTreeSet<_>>().into_iter().collect();
+        if wanted.iter().any(|w| w.0 >= batch.base.len() || w.1 >= m.blocks() || w.2 >= length) {
+            return Err(error("an activity query outside the batch or the blocks"));
+        }
+        let mut by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (i, p) in self.parts().iter().enumerate() {
+            by_block.entry(p.block).or_default().push(i);
+        }
+        let ranges: Vec<Range<usize>> = (0..bases.len()).map(|i| i * length..(i + 1) * length).collect();
+        let tokens: Vec<&[u32]> = bases.iter().map(|b| batch.base[*b].as_slice()).collect();
+        let mut stream = d.zeros(bases.len() * length, BlockEngine::width(&m)).map_err(error)?;
+        let mut out = vec![Vec::new(); wanted.len()];
+        let Some(last) = wanted.iter().map(|w| w.1).max() else { return Ok(out) };
+        for b in 0..=last {
+            let needed: Vec<usize> = (0..wanted.len()).filter(|i| wanted[*i].1 == b).collect();
+            let Some(trace) = m.forward(b, &mut stream, &ranges, &tokens, None, !needed.is_empty())? else { continue };
+            let (read, _) = self.m_sites.parts.nodes(b).ok_or_else(|| error(format!("block {b}: no parts")))?;
+            let rows = needed.iter().map(|i| bases.binary_search(&wanted[*i].0).map(|k| k * length + wanted[*i].2).map_err(|_| error("a base outside the run")));
+            let rows: Vec<usize> = rows.collect::<Result<_, _>>()?;
+            let x = d.download(&d.gather_ranges(trace.value(read)?, &single(rows)).map_err(error)?).map_err(error)?;
+            let parts = by_block.get(&b).map(Vec::as_slice).unwrap_or_default();
+            for (k, i) in needed.iter().enumerate() {
+                let row = x.row(k);
+                out[*i] = parts.iter().copied().filter(|j| row.iter().zip(&self.parts()[*j].read).map(|(a, g)| a * g).sum::<f64>() + self.parts()[*j].bias > 0.0).collect();
+            }
+        }
+        Ok(out)
+    }
+
+    /// Per base sequence of `batch`, its clean experiment and `per_base` edits of parts, each of a
+    /// family drawn uniformly from `families`, all with `P` alone (or, with `hybrids`, under one
+    /// hybrid per base drawn as [`sample`] draws it): its block uniform over the MLP blocks holding
+    /// parts, its position uniform over the rows after the first (the first is the attention sink,
+    /// where a transcoder block runs `M`'s own MLP), its factor 0 for a removal and uniform over
+    /// the other factors for an amplification, and its part uniform over the parts firing on `M`'s
+    /// read there with one part of the block drawn uniformly added (mostly a silent one: its edit
+    /// tests that the part is silent in `P` where it is in `M`).
+    pub fn sample_edits(&self, rng: &mut impl RngExt, batch: &Batch, families: &[Family], per_base: usize, hybrids: bool) -> Result<Vec<Experiment>, String> {
+        let (blocks, length) = (self.m_sites.entries.len(), batch.length());
+        let mut by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (i, p) in self.parts().iter().enumerate() {
+            by_block.entry(p.block).or_default().push(i);
+        }
+        let held: Vec<usize> = by_block.keys().copied().collect();
+        if families.is_empty() || held.is_empty() || length < 2 {
+            return Err(error("edits need families, parts and sequences of two tokens or more"));
+        }
+        let mut drawn = Vec::new();
+        let mut wanted = Vec::new();
+        for n in 0..batch.base.len() {
+            let explained = if !hybrids || rng.random_range(0..2) == 0 { vec![true; blocks] } else { hybrid(rng, blocks) };
+            for _ in 0..per_base {
+                let family = families[rng.random_range(0..families.len())];
+                let block = held[rng.random_range(0..held.len())];
+                let position = rng.random_range(1..length);
+                let factor = match family {
+                    Family::RemovePart => 0,
+                    Family::AmplifyPart => rng.random_range(1..FACTORS.len()),
+                };
+                let candidates = &by_block[&block];
+                let silent = candidates[rng.random_range(0..candidates.len())];
+                drawn.push((n, explained.clone(), position, factor, silent));
+                wanted.push((n, block, position));
+            }
+            drawn.push((n, explained, 0, usize::MAX, 0));
+            wanted.push((n, 0, 0));
+        }
+        let queried: Vec<(usize, usize, usize)> = wanted.iter().zip(&drawn).filter(|(_, d)| d.3 != usize::MAX).map(|(w, _)| *w).collect();
+        let mut active = self.active_parts(batch, &queried)?.into_iter();
+        let mut out = Vec::with_capacity(drawn.len());
+        for (n, explained, position, factor, silent) in drawn {
+            if factor == usize::MAX {
+                out.push(Experiment { base: n, source: n, explained, patch: None, position: 0 });
+                continue;
+            }
+            let mut candidates = active.next().ok_or_else(|| error("an edit without its activity"))?;
+            if !candidates.contains(&silent) {
+                candidates.push(silent);
+            }
+            let part = candidates[rng.random_range(0..candidates.len())];
+            out.push(Experiment { base: n, source: n, explained, patch: Some(Patch::Part { part, factor }), position });
+        }
+        Ok(out)
     }
 
     /// `M` and `P` as the free functions of this module take them.

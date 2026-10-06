@@ -815,3 +815,89 @@ fn an_edit_of_a_part_on_m_adds_its_scaled_write() {
         }
     }
 }
+
+/// On the tiny Qwen3 decoder with layer 1's MLP a transcoder's 64 features (every fourth never
+/// fires): the parts are the features with their rows; the active parts at a row are the host's
+/// positive pre-activations of `M`'s read there; an edit of a part on `P`'s transcoder block is the
+/// hand computation `Σ_{j≠i} relu(g_j·x + c_j) u_j + α relu(g_i·x + c_i) u_i + b` at the edited
+/// row (`x` `P`'s read there) and leaves the other rows; and the drawn edits are of firing parts
+/// or the one silent part drawn with them, every one scored finite and nonnegative.
+#[test]
+fn edits_of_a_transcoder_block_are_the_hand_computation() {
+    use super::interchange::{Family, parts_of};
+    let export = crate::test_support::tiny_qwen3_export("interchange_parts_transcoder", 2);
+    let imported = crate::import::import_language_model(&export, 6, 12).expect("the tiny export imports");
+    std::fs::remove_dir_all(&export).expect("the tiny export is removed");
+    let native = split_sites(&imported.program).expect("the native sites");
+    let layers = layer_nodes(&native, 2).expect("the layers");
+    let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+    let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+    let dir = std::env::temp_dir().join(format!("interchange_parts_transcoder_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a directory");
+    let (full, kept) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
+    crate::test_support::transcoder_file(&full, 64, 8, 3);
+    crate::library_transcoder::Transcoder::open(&full).expect("the file").write_kept(&(0..64).collect::<Vec<_>>(), &kept).expect("kept");
+    let explanation = crate::library_mdl::explanation_with(&native, &layers, &std::collections::BTreeMap::from([(1, kept)])).expect("the library");
+    std::fs::remove_dir_all(&dir).expect("the directory is removed");
+    let program = &explanation.artifact.program;
+    let operator = |name: &str| program.operators.iter().find(|op| op.name == name).expect("an operator").matrix();
+    let (gate, bias, write, out_bias) = (operator("library.l1.mlp.gate"), operator("library.l1.mlp.gate_bias"), operator("library.l1.mlp.out"), operator("library.l1.mlp.bias"));
+    let parts = parts_of(program, 2).expect("the parts");
+    assert_eq!(parts.len(), 64);
+    for (i, p) in parts.iter().enumerate() {
+        assert_eq!((p.block, p.bias), (3, bias[[i, 0]]));
+        assert!(p.read.iter().zip(gate.row(i)).all(|(a, b)| a == b) && p.write.iter().zip(write.column(i)).all(|(a, b)| a == b));
+    }
+    let d = Device::host();
+    let mut x = Interchange::new(&d, &native, &layers, &explanation.artifact, &explanation.trainable, explanation.reads.clone(), 1 << 30, 64).expect("the experiments");
+    x.set_parts(parts.clone()).expect("the parts");
+    let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
+    // Activity against the host's pre-activations of M's read.
+    let family = crate::library_mdl::sequence_family(&batch.base.iter().map(Vec::as_slice).collect::<Vec<_>>()).expect("the family");
+    let read = native.execute(&family, false).expect("M on the host").values[layers[1].normed].clone();
+    let pre = read.dot(&gate.t()) + &bias.column(0);
+    let wanted: Vec<(usize, usize, usize)> = (0..3).flat_map(|n| (1..12).map(move |t| (n, 3, t))).collect();
+    let active = x.active_parts(&batch, &wanted).expect("the activity");
+    for ((n, _, t), found) in wanted.iter().zip(&active) {
+        let host: Vec<usize> = (0..64).filter(|j| pre[[n * 12 + t, *j]] > 0.0).collect();
+        assert_eq!(found, &host, "base {n} row {t}");
+    }
+    // An edit on P's transcoder block against the hand computation.
+    let (_, p) = x.models();
+    let sites = p.part_sites().expect("P's part sites");
+    let (read_node, out_node) = sites.nodes(3).expect("layer 1's MLP holds parts");
+    let (ranges, tok) = (vec![0..12], vec![batch.base[0].as_slice()]);
+    let mut entering = d.zeros(12, 8).expect("zeros");
+    for b in 0..3 {
+        p.forward(b, &mut entering, &ranges, &tok, None, false).expect("a block");
+    }
+    let plain = p.forward(3, &mut d.copy(&entering).expect("copy"), &ranges, &tok, None, true).expect("the MLP").expect("a tape");
+    let (xp, plain_out) = (d.download(plain.value(read_node).expect("the read")).expect("download"), d.download(plain.value(out_node).expect("the output")).expect("download"));
+    let row = 5;
+    let i = (0..64).find(|j| (xp.row(row).dot(&gate.row(*j)) + bias[[*j, 0]]) > 0.0).expect("a firing feature");
+    for (factor, alpha) in FACTORS.iter().enumerate() {
+        let edits = Edits::with_parts(&d, &[], p.values(), &[(row, i, factor)], Some(sites)).expect("the edits");
+        let edited = p.forward(3, &mut d.copy(&entering).expect("copy"), &ranges, &tok, Some(&edits), true).expect("the edited MLP").expect("a tape");
+        let edited = d.download(edited.value(out_node).expect("the output")).expect("download");
+        let mut hand = out_bias.column(0).to_owned();
+        for j in 0..64 {
+            let a = (xp.row(row).dot(&gate.row(j)) + bias[[j, 0]]).max(0.0) * if j == i { *alpha } else { 1.0 };
+            hand.scaled_add(a, &write.column(j));
+        }
+        let scale = hand.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+        for r in 0..12 {
+            for c in 0..8 {
+                let want = if r == row { hand[c] } else { plain_out[[r, c]] };
+                assert!((edited[[r, c]] - want).abs() <= 1e-12 * scale, "factor {alpha}, row {r}, column {c}: {} against {want}", edited[[r, c]]);
+            }
+        }
+    }
+    // Drawn edits: of firing parts, or the silent part drawn with them; scored finite.
+    let experiments = x.sample_edits(&mut rand::rngs::StdRng::seed_from_u64(2), &batch, &[Family::RemovePart, Family::AmplifyPart], 6, false).expect("the draw");
+    let counts = census(&experiments, x.variables());
+    assert_eq!((counts["clean_alone"], counts["remove_part"] + counts["amplify_part"]), (3, 18), "{counts:?}");
+    let silent = experiments.iter().filter(|e| matches!(e.patch, Some(Patch::Part { part, .. }) if pre[[e.base * 12 + e.position, part]] <= 0.0)).count();
+    assert!(silent <= 6, "{silent} edits of silent parts");
+    let bits = x.evaluate(&batch, &experiments, false).expect("evaluate").bits;
+    assert!(bits.iter().flatten().all(|b| b.is_finite() && *b >= -1e-12), "{bits:?}");
+}

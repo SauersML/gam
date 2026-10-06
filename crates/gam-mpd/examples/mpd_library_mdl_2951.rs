@@ -2,7 +2,7 @@
 //! description length on interchange experiments (`gam_mpd::library_mdl`, #2951), on an export's
 //! token rows, and scored on held-out rows after every epoch.
 //!
-//! MODEL SETTINGS.json OUT host|gpu [artifact]
+//! MODEL SETTINGS.json OUT host|gpu [artifact | edits EDITS.json]
 //!
 //! `MODEL` is an engine export (`export.json` and its token rows), or a Hugging Face checkpoint
 //! directory (`config.json` and its safetensors, one file or sharded) whose token rows come from
@@ -20,6 +20,15 @@
 //! fitted: the explanation the checkpoint holds, at its posterior mean with the device's literals,
 //! is written to `OUT/checkpoint.artifact.bin` (a running fit's explanation, read where it is wanted).
 //!
+//! With `edits EDITS.json`, nothing is fitted: edit faithfulness. The explanation (the posterior mean
+//! of the checkpoint `OUT/{checkpoint}`, or with no checkpoint the library as built, the transcoder
+//! features as they are) is scored on held-out sequences `sequences` (a range of the held-out rows)
+//! under edits of its parts (`interchange::Interchange::sample_edits`: per sequence its clean
+//! experiment and `edits_per_sequence` edits, each of a family in `families`, `remove_part` or
+//! `amplify_part`, applied identically to `M` and to `P`). `OUT/EDITS_{name}.json` holds per family
+//! `KL(M_e ‖ P_e)` in bits per token: the mean and 99th percentile over every scored token (from the
+//! edited token on) and over the edited tokens alone, with the clean experiments' as `clean`.
+//!
 //! With `blocks` (block `2l` layer `l`'s attention, `2l + 1` its MLP), the explanation is of those
 //! blocks alone and `M` everywhere else (`library_mdl::scoped`): the fast loop for comparing method
 //! changes, F against N for one block before a whole-model run.
@@ -36,11 +45,12 @@ use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     engine::{log_to_stderr, sha256},
     import::{hugging_face_language_model, hugging_face_language_model_prefix, import_language_model},
-    library_mdl, library_transcoder,
+    interchange, library_mdl, library_transcoder,
     operator_program::{OperatorProgram, SlotValues},
     run_check::{LayerNodes, layer_nodes, split_sites},
 };
 use gam_runtime::warm_start::Fingerprinter;
+use rand::SeedableRng;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -170,6 +180,100 @@ fn checkpoint_digest(dir: &Path) -> Result<String, String> {
     Ok(fingerprint.finalize().to_hex())
 }
 
+/// The settings of an edit-faithfulness run (module note).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditSettings {
+    /// The fit checkpoint in `OUT` whose posterior mean is scored; none scores the library as built.
+    checkpoint: Option<String>,
+    sequences: [usize; 2],
+    families: Vec<interchange::Family>,
+    edits_per_sequence: usize,
+    batch_sequences: usize,
+    seed: u64,
+    /// The most bytes of operator values each program holds on the device.
+    numeric_bytes: usize,
+    name: String,
+}
+
+/// Edit faithfulness (module note): per family the bits per token of `KL(M_e ‖ P_e)`.
+fn edit_faithfulness(
+    device: &Device,
+    (native, layers): (&OperatorProgram, &[LayerNodes]),
+    explanation: &library_mdl::Explanation,
+    identity: &library_mdl::Identity,
+    held_out: &[Vec<u32>],
+    settings: &EditSettings,
+    out: &Path,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let [first, end] = settings.sequences;
+    if first >= end || end > held_out.len() || settings.batch_sequences == 0 {
+        return Err("edits: a nonempty range of the held-out sequences and a batch size are required".into());
+    }
+    let artifact = match &settings.checkpoint {
+        Some(file) => {
+            let path = out.join(file);
+            library_mdl::check_checkpoint(&path, identity)?;
+            library_mdl::checkpoint_artifact(explanation, &path, library_mdl::Literals::of(device))?
+        }
+        None => explanation.artifact.clone(),
+    };
+    let mut experiments = interchange::Interchange::new(device, native, layers, &artifact, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
+    let parts = interchange::parts_of(&artifact.program, layers.len())?;
+    let count = parts.len();
+    experiments.set_parts(parts)?;
+    log::info!("edits: {count} parts, {} held-out sequences, {:.0} s to compile", end - first, started.elapsed().as_secs_f64());
+    let mut rng = rand::rngs::StdRng::seed_from_u64(settings.seed);
+    // Per family: every scored token's bits, the edited tokens' bits, and the experiments.
+    let mut scores: BTreeMap<&str, (Vec<f64>, Vec<f64>, usize)> = BTreeMap::new();
+    for (b, chunk) in held_out[first..end].chunks(settings.batch_sequences).enumerate() {
+        let batch = interchange::Batch::new(chunk.to_vec(), chunk.to_vec())?;
+        let drawn = experiments.sample_edits(&mut rng, &batch, &settings.families, settings.edits_per_sequence, false)?;
+        let scored = experiments.evaluate(&batch, &drawn, false)?;
+        for (e, bits) in drawn.iter().zip(&scored.bits) {
+            let family = match &e.patch {
+                None => "clean",
+                Some(interchange::Patch::Part { factor: 0, .. }) => "remove_part",
+                Some(interchange::Patch::Part { .. }) => "amplify_part",
+                Some(_) => "read",
+            };
+            let entry = scores.entry(family).or_default();
+            entry.0.extend_from_slice(bits);
+            entry.1.extend(bits.first());
+            entry.2 += 1;
+        }
+        log::info!("edits: batch {b} scored ({:.0} s)", started.elapsed().as_secs_f64());
+    }
+    let summary = |values: &mut Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        let mean = values.iter().sum::<f64>() / values.len().max(1) as f64;
+        let p99 = values.get(((values.len() as f64 * 0.99).ceil() as usize).saturating_sub(1)).copied().unwrap_or(f64::NAN);
+        (mean, p99)
+    };
+    let mut families = serde_json::Map::new();
+    for (family, (mut all, mut edited, count)) in scores {
+        let (tokens, (mean, p99), (edited_mean, edited_p99)) = (all.len(), summary(&mut all), summary(&mut edited));
+        families.insert(
+            family.into(),
+            json!({"experiments": count, "tokens": tokens, "mean_bits_per_token": mean, "p99_bits_per_token": p99, "edited_token_mean_bits": edited_mean, "edited_token_p99_bits": edited_p99}),
+        );
+    }
+    let report = json!({
+        "checkpoint": settings.checkpoint,
+        "parts": count,
+        "sequences": settings.sequences,
+        "edits_per_sequence": settings.edits_per_sequence,
+        "seed": settings.seed,
+        "device": device.name(),
+        "source_revision": option_env!("GAM_BUILD_GIT_SHA"),
+        "families": families,
+        "seconds": started.elapsed().as_secs_f64(),
+    });
+    log::info!("edits: {report}");
+    save(&out.join(format!("EDITS_{}.json", settings.name)), &report)
+}
+
 fn save(path: &Path, value: &Value) -> Result<(), String> {
     std::fs::write(path, serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
@@ -177,10 +281,11 @@ fn save(path: &Path, value: &Value) -> Result<(), String> {
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (export, settings_path, out, mode, read_artifact) = match &args[..] {
-        [export, settings, out, mode] => (export, settings, out, mode, false),
-        [export, settings, out, mode, artifact] if artifact == "artifact" => (export, settings, out, mode, true),
-        _ => return Err("EXPORT SETTINGS.json OUT host|gpu [artifact]".into()),
+    let (export, settings_path, out, mode, read_artifact, edits) = match &args[..] {
+        [export, settings, out, mode] => (export, settings, out, mode, false, None),
+        [export, settings, out, mode, artifact] if artifact == "artifact" => (export, settings, out, mode, true, None),
+        [export, settings, out, mode, edits, file] if edits == "edits" => (export, settings, out, mode, false, Some(Path::new(file))),
+        _ => return Err("EXPORT SETTINGS.json OUT host|gpu [artifact | edits EDITS.json]".into()),
     };
     let (export, settings_path, out) = (Path::new(export), Path::new(settings_path), Path::new(out));
     let settings: Settings = serde_json::from_slice(&std::fs::read(settings_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -194,7 +299,7 @@ fn main() -> Result<(), String> {
         return Err("held-out sequences must be a nonempty range, and training sequences nonempty".into());
     }
     let checkpoint = out.join("checkpoint.bin");
-    if (out.exists() || read_artifact) && !checkpoint.exists() {
+    if (out.exists() || read_artifact) && edits.is_none() && !checkpoint.exists() {
         return Err("a fresh output directory, or one holding this fit's checkpoint, required".into());
     }
     let device = match mode.as_str() {
@@ -253,6 +358,10 @@ fn main() -> Result<(), String> {
     // parameters) before anything is written.
     let identity = library_mdl::identity(&settings.export_sha256, &native, &explanation, &train, held_out);
     library_mdl::check_checkpoint(&checkpoint, &identity)?;
+    if let Some(file) = edits {
+        let settings: EditSettings = serde_json::from_slice(&std::fs::read(file).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        return edit_faithfulness(&device, (&native, &layers), &explanation, &identity, held_out, &settings, out);
+    }
     if read_artifact {
         let artifact = library_mdl::checkpoint_artifact(&explanation, &checkpoint, library_mdl::Literals::of(&device))?;
         artifact.validate_coverage(&native)?;
