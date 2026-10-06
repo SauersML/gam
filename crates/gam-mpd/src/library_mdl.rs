@@ -1766,6 +1766,12 @@ pub struct Identity {
     /// The shared-parameter map: per trainable operator, every node of every rule and of the
     /// program that applies it.
     pub sharing: String,
+    /// What else defines the explanation: the values of its fixed operators that are not `M`'s
+    /// tensors (a tie's selection and scatter, a transport, a merged body's unit scales), the
+    /// ownership map with its factors, the layers' groups and sites, the trainable operators, and
+    /// each group's scale reference. A checkpoint that names none is of another identity.
+    #[serde(default)]
+    pub definition: String,
 }
 
 fn program_structure(hasher: &mut Fingerprinter, tag: &[u8], program: &OperatorProgram) {
@@ -1821,12 +1827,27 @@ pub fn identity(export: &str, native: &OperatorProgram, explanation: &Explanatio
     for (op, list) in &uses {
         sharing.absorb_str(b"uses", &format!("{op}|{}", list.join(",")));
     }
+    let mut definition = Fingerprinter::new();
+    let trainable: std::collections::BTreeSet<usize> = explanation.trainable.iter().copied().collect();
+    for (i, op) in explained.operators.iter().enumerate() {
+        if !trainable.contains(&i) && !op.provenance.derivation.is_empty() {
+            definition.absorb_str(b"fixed", &op.name);
+            let values: Vec<u8> = op.matrix().iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            definition.absorb_bytes(b"values", &values);
+        }
+    }
+    definition.absorb_str(b"owners", &format!("{:?}", explanation.artifact.owners));
+    definition.absorb_str(b"layers", &format!("{:?}", explanation.layers));
+    definition.absorb_str(b"trainable", &format!("{:?}", explanation.trainable));
+    let reference: Vec<u8> = explanation.reference.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+    definition.absorb_bytes(b"reference", &reference);
     Identity {
         export: export.to_string(),
         tokens: tokens.finalize().to_hex(),
         program: program.finalize().to_hex(),
         groups: groups.finalize().to_hex(),
         sharing: sharing.finalize().to_hex(),
+        definition: definition.finalize().to_hex(),
     }
 }
 
@@ -1876,6 +1897,7 @@ fn check_checkpoint_identity(path: &Path, found: &Identity, identity: &Identity)
         ("program", found.program == identity.program),
         ("groups", found.groups == identity.groups),
         ("sharing", found.sharing == identity.sharing),
+        ("definition", found.definition == identity.definition),
     ]
     .into_iter()
     .filter(|(_, same)| !same)
@@ -3689,6 +3711,24 @@ mod tests {
         ] {
             let refusal = check_checkpoint(&checkpoint, &other).unwrap_err();
             assert!(refusal.contains(field), "{refusal}");
+        }
+        // The ownership map, the scale references and a tie's fixed operators define the
+        // explanation as well: each alone changes only the definition.
+        let mut owned = explanation.clone();
+        owned.artifact.owners.pop();
+        let mut referenced = explanation.clone();
+        referenced.reference[0] *= 2.0;
+        let column = crate::library_sharing::tie_column(&explanation, (1, 3), (0, 5), 0.7).unwrap();
+        let mut scattered = column.clone();
+        let at = scattered.artifact.program.operators.iter().position(|o| o.name.ends_with(".scatter")).unwrap();
+        if let OperatorBody::Dense { values, .. } = &mut Arc::make_mut(&mut scattered.artifact.program.operators[at]).body {
+            values.mapv_inplace(|v| 2.0 * v);
+        }
+        for (a, b) in [(&explanation, &owned), (&explanation, &referenced), (&column, &scattered)] {
+            let (a, b) = (identity("tiny", &native, a, train, held), identity("tiny", &native, b, train, held));
+            assert_eq!((&a.export, &a.tokens, &a.program, &a.groups, &a.sharing), (&b.export, &b.tokens, &b.program, &b.groups, &b.sharing));
+            let refusal = check_checkpoint_identity(&checkpoint, &a, &b).unwrap_err();
+            assert!(refusal.contains("definition"), "{refusal}");
         }
         assert!(super::fit(&device, &native, &explanation, train, held, &settings, "another", Some(&checkpoint), None).is_err());
         std::fs::remove_file(&checkpoint).unwrap();
