@@ -345,8 +345,18 @@ fn edit_faithfulness(
     experiments.set_fixed_parts(slices.clone())?;
     log::info!("edits: {count} parts, {} held-out sequences, {:.0} s to compile", end - first, started.elapsed().as_secs_f64());
     let mut rng = rand::rngs::StdRng::seed_from_u64(settings.seed);
+    // Operations on shared sites push seeded directions at each site's typical norm, measured on
+    // M's own runs of the first held-out batch: the same for every explanation.
+    let typical_batch: Vec<Vec<u32>> = held_out[first..end].iter().take(settings.batch_sequences).cloned().collect();
+    let typical_batch = interchange::Batch::new(typical_batch.clone(), typical_batch)?;
+    experiments.set_directions(DIRECTIONS, settings.seed);
+    experiments.measure_typical(&typical_batch)?;
     let family = |e: &interchange::Experiment| match &e.patch {
         None => "clean",
+        Some(interchange::Patch::Ops { family: interchange::Family::Swap, .. }) => "swap",
+        Some(interchange::Patch::Ops { family: interchange::Family::Zero, .. }) => "zero",
+        Some(interchange::Patch::Ops { family: interchange::Family::Scale, .. }) => "scale",
+        Some(interchange::Patch::Ops { family: interchange::Family::Push, .. }) => "push",
         Some(interchange::Patch::Part { factor: 0, .. }) => "remove_part",
         Some(interchange::Patch::Part { .. }) => "amplify_part",
         Some(interchange::Patch::Head { .. }) => "remove_head",
@@ -364,7 +374,9 @@ fn edit_faithfulness(
     let mut batches = Vec::new();
     for (b, chunk) in held_out[first..end].chunks(settings.batch_sequences).enumerate() {
         let batch = interchange::Batch::new(chunk.to_vec(), chunk.to_vec())?;
-        let mut drawn = experiments.sample_edits(&mut rng, &batch, &settings.families, settings.edits_per_sequence, false)?;
+        // Each base's donor is the next held-out sequence of its batch.
+        let donors: Vec<usize> = (0..chunk.len()).map(|n| (n + 1) % chunk.len()).collect();
+        let mut drawn = experiments.sample_ops(&mut rng, &batch, &settings.families, settings.edits_per_sequence, &donors, false)?;
         if let (Some(vpd), Some(v)) = (&vpd, &settings.vpd) {
             drawn.extend(vpd_edits(&mut rng, &batch, (vpd, &slice_of), v.per_sequence, 2 * layers.len())?);
         }
@@ -384,6 +396,8 @@ fn edit_faithfulness(
     let mut reference = interchange::Interchange::new(device, native, layers, &gam_mpd::artifact::Artifact::native(native)?, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     reference.set_parts(parts.clone())?;
     reference.set_fixed_parts(slices.clone())?;
+    reference.set_directions(DIRECTIONS, settings.seed);
+    reference.measure_typical(&typical_batch)?;
     reference.unedited_explanation();
     // An edit's evidence grows with how much it moves M: per family, the gaps of the edits whose
     // effect at the edited token KL(M_e ‖ M) falls in each bin (bits).
@@ -411,8 +425,12 @@ fn edit_faithfulness(
                 Some(interchange::Patch::FixedPart { part, .. }) => slices.get(*part).map(|s| json!([s.part.layer, if s.part.map == vpd_parts::Map::Down { "mlp.down_proj" } else { "mlp.c_fc" }, s.part.index])),
                 _ => None,
             };
+            let ops: Vec<Value> = match &e.patch {
+                Some(interchange::Patch::Ops { ops, .. }) => ops.iter().map(|o| json!({"site": o.site, "operation": format!("{:?}", o.operation), "onward": o.onward})).collect(),
+                _ => Vec::new(),
+            };
             records.push_str(&json!({
-                "sequence": first + b * settings.batch_sequences + e.base, "position": e.position, "family": family(e),
+                "sequence": first + b * settings.batch_sequences + e.base, "position": e.position, "family": family(e), "ops": ops,
                 "parts": chosen.iter().filter_map(part_of).collect::<Vec<_>>(), "subcomponent": subcomponent, "factor": factor.and_then(|f| interchange::FACTORS.get(f).copied()),
                 "effect_bits_at_edited_token": bits.first(), "gap_bits_at_edited_token": gap.first(),
             }).to_string());
@@ -473,6 +491,9 @@ fn edit_faithfulness(
     log::info!("edits: {report}");
     save(&out.join(format!("EDITS_{}.json", settings.name)), &report)
 }
+
+/// The seeded unit directions a push draws from (`Interchange::set_directions`).
+const DIRECTIONS: usize = 64;
 
 fn save(path: &Path, value: &Value) -> Result<(), String> {
     std::fs::write(path, serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
