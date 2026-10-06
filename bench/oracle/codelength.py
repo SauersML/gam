@@ -198,8 +198,8 @@ class _Handler(socketserver.StreamRequestHandler):
             self.wfile.flush()
 
 
-def backend(kind: str, model: str, args):
-    ns = argparse.Namespace(**{**vars(args), "backend": kind, "model": model, "concurrency": 1})
+def backend(kind: str, model: str, args, share: float):
+    ns = argparse.Namespace(**{**vars(args), "backend": kind, "model": model, "gpu_memory_utilization": share})
     return R.make_backend(ns)
 
 
@@ -220,10 +220,11 @@ def main():
     ap.add_argument("--batch-tokens", type=int, default=8192)
     ap.add_argument("--tensor-parallel-size", type=int, default=1)
     ap.add_argument("--max-model-len", type=int)
-    ap.add_argument("--gpu-memory-utilization", type=float, default=0.4)
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.4, help="vllm: the reader's share of the GPU's memory")
+    ap.add_argument("--prior-gpu-memory-utilization", type=float, default=0.15, help="vllm: the prior's share, when it is another model")
     args = ap.parse_args()
-    reader = backend(args.reader_backend, args.reader, args)
-    prior = reader if (args.prior, args.prior_backend) == (args.reader, args.reader_backend) else backend(args.prior_backend, args.prior, args)
+    reader = backend(args.reader_backend, args.reader, args, args.gpu_memory_utilization)
+    prior = reader if (args.prior, args.prior_backend) == (args.reader, args.reader_backend) else backend(args.prior_backend, args.prior, args, args.prior_gpu_memory_utilization)
     labels = Labels(Path(args.labels), args.top, args.others)
     if args.command == "serve":
         host, sep, port = args.listen.rpartition(":")

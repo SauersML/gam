@@ -9,10 +9,8 @@ logarithmic scoring rule: proper, so q = p maximizes its expectation; no thresho
 
 Prompt. Every backend sees the same system text and the same body (documents, context between <<< and
 >>>, intervention, the candidates as JSON strings labelled A, B, C, ...). The last line asks for the
-backend's output channel: the open-weights readers answer with one letter and q is their probability of
-each letter's token at the first answer position, renormalized over the K letters; the Claude reader
-cannot return log-probabilities, so it is asked for a probability per letter as JSON, normalized to sum
-to one.
+backend's output channel: the reader answers with one letter and q is its probability of each letter's
+token at the first answer position, renormalized over the K letters.
 
 Position bias. Each test is read under all K cyclic rotations of the option order (rotation r shows
 option (j + r) mod K at label j), so every option sits at every label exactly once, and q is the mean of
@@ -25,11 +23,8 @@ Backends (one Backend.distributions interface):
                 K extensions share their prefix in vLLM's cache); thousands of tests per call.
   transformers  Hugging Face transformers: on CUDA in bfloat16 when a GPU is present, else on the CPU in
                 float32 (tests on the Mac); last-position logits.
-  claude        `claude -p` (headless Claude Code, no tools, no CLAUDE.md or plugins, structured JSON
-                output); used only to calibrate the open-weights reader on a sample (calibrate.py).
 Chat templates are applied with thinking disabled (enable_thinking=False, read by Qwen3's template).
-The open-weights readers are deterministic: logits do not depend on sampling, and the seed is recorded.
-The Claude CLI exposes no temperature; its model id and per-call cost are recorded.
+The readers are deterministic: logits do not depend on sampling, and the seed is recorded.
 
 Service. `reader.py serve` loads one backend and answers JSON lines on a Unix socket or TCP port with
 the experiment server's protocol: {"op": "read", "tests": [...]} -> {"ok": {"q": [...], ...}}, so the RL
@@ -49,14 +44,11 @@ intervention means the model as it is. OUT.jsonl lines: {"id", "q", "q_rotations
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import json
 import math
 import os
 import socketserver
-import subprocess
 import sys
-import tempfile
 import time
 
 import numpy as np
@@ -70,10 +62,6 @@ SYSTEM = (
 )
 
 ANSWER_LETTER = "Answer with the letter of one candidate and nothing else."
-ANSWER_PROBABILITIES = (
-    "Give your probability for each candidate as a JSON object mapping each letter to a number greater "
-    "than zero; the numbers sum to 1."
-)
 
 
 def body(documents: list[str], context: str, intervention: str, options: list[str], kind: str = "next_token") -> str:
@@ -275,70 +263,11 @@ class VllmBackend:
         return result
 
 
-_EMPTY_DIR = None
-
-
-def claude_json(prompt: str, schema: dict, model: str, system: str) -> tuple[dict, dict]:
-    """One headless Claude Code call (`claude -p`) with no tools, no CLAUDE.md, plugins or MCP servers,
-    run from an empty directory, whose reply must match the JSON schema; returns (reply object,
-    {model, cost_usd, session})."""
-    global _EMPTY_DIR
-    if _EMPTY_DIR is None:
-        _EMPTY_DIR = tempfile.mkdtemp(prefix="oracle-claude-")
-    command = [
-        "claude", "-p", "--model", model, "--system-prompt", system, "--tools", "", "--safe-mode",
-        "--strict-mcp-config", "--no-session-persistence", "--output-format", "json",
-        "--json-schema", json.dumps(schema), prompt,
-    ]
-    r = subprocess.run(command, cwd=_EMPTY_DIR, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"claude -p exit {r.returncode}: {r.stderr[-2000:] or r.stdout[-2000:]}")
-    reply = json.loads(r.stdout)
-    values = reply.get("structured_output")
-    if not isinstance(values, dict):
-        raise RuntimeError(f"claude -p gave no structured output: {r.stdout[-2000:]}")
-    return values, {"model": list(reply.get("modelUsage", {}).keys()), "cost_usd": reply.get("total_cost_usd"), "session": reply.get("session_id")}
-
-
-class ClaudeBackend:
-    """Headless Claude Code through claude_json, with one positive number per label; `concurrency` calls
-    at a time."""
-
-    name = "claude"
-
-    def __init__(self, model: str, seed: int, concurrency: int):
-        self.model_id = model
-        self.seed = seed  # recorded only: the CLI takes no seed
-        self.concurrency = concurrency
-        self.calls: list[dict] = []
-
-    def _one(self, user: str, k: int) -> tuple[np.ndarray, dict]:
-        schema = {
-            "type": "object",
-            "properties": {label: {"type": "number", "exclusiveMinimum": 0} for label in LABELS[:k]},
-            "required": list(LABELS[:k]),
-            "additionalProperties": False,
-        }
-        values, meta = claude_json(user + "\n\n" + ANSWER_PROBABILITIES, schema, self.model_id, SYSTEM)
-        w = np.array([float(values[label]) for label in LABELS[:k]])
-        if not np.all(np.isfinite(w)) or np.any(w <= 0):
-            raise RuntimeError(f"claude -p probabilities not all positive: {values}")
-        return w / w.sum(), meta
-
-    def distributions(self, users: list[str], k: int) -> list[np.ndarray]:
-        with concurrent.futures.ThreadPoolExecutor(self.concurrency) as pool:
-            results = list(pool.map(lambda u: self._one(u, k), users))
-        self.calls += [meta for _, meta in results]
-        return [q for q, _ in results]
-
-
-def make_backend(args) -> TransformersBackend | VllmBackend | ClaudeBackend:
+def make_backend(args) -> TransformersBackend | VllmBackend:
     if args.backend == "transformers":
         return TransformersBackend(args.model, args.seed, args.batch_tokens)
     if args.backend == "vllm":
         return VllmBackend(args.model, args.seed, args.tensor_parallel_size, args.max_model_len, args.gpu_memory_utilization)
-    if args.backend == "claude":
-        return ClaudeBackend(args.model, args.seed, args.concurrency)
     raise ValueError(args.backend)
 
 
@@ -411,8 +340,8 @@ def serve(backend, address: str):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["score", "serve"])
-    ap.add_argument("--backend", required=True, choices=["vllm", "transformers", "claude"])
-    ap.add_argument("--model", required=True, help="a Hugging Face model id or directory; for claude, a model name or alias")
+    ap.add_argument("--backend", required=True, choices=["vllm", "transformers"])
+    ap.add_argument("--model", required=True, help="a Hugging Face model id or directory")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tests")
     ap.add_argument("--out")
@@ -421,7 +350,6 @@ def main():
     ap.add_argument("--tensor-parallel-size", type=int, default=1)
     ap.add_argument("--max-model-len", type=int)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    ap.add_argument("--concurrency", type=int, default=4, help="claude: calls in flight")
     args = ap.parse_args()
     backend = make_backend(args)
     if args.command == "serve":
@@ -446,9 +374,6 @@ def main():
     summary = {"tests": len(tests), "seconds": time.time() - start, **reader}
     if scored:
         summary["mean_log_score_nats"] = float(np.mean(scored))
-    if isinstance(backend, ClaudeBackend):
-        summary["cost_usd"] = sum(c["cost_usd"] or 0.0 for c in backend.calls)
-        summary["claude_models"] = sorted({m for c in backend.calls for m in c["model"]})
     print(json.dumps(summary))
 
 

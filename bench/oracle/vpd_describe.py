@@ -22,7 +22,7 @@ GRPOTrainer is not used: the policy reads vectors injected into its residual str
 placeholders, which neither TRL's generation nor vLLM's can carry, so the objective is written out here.
 
   vpd_describe.py train --answer RUN --labels TRAIN_LABELS --uv UV --relations REL --reward HOST:PORT
-                        --steps N --out DIR [--components 4] [--group 8] [--turns 4] [--tokens 768] [--lr 1e-5]
+                        --steps N --out DIR [--components 4] [--group 8] [--turns 4] [--tokens 768] [--lr 1e-5] [--hours H]
   vpd_describe.py evaluate --policy DIR --labels HELDOUT_LABELS --uv UV --relations REL --reward HOST:PORT
                         [--count 256]   (one description per held-out-layer subcomponent, scored)
 """
@@ -96,7 +96,6 @@ class Target:
         t = self.model.t
         clean = VM.rms(self.run(ids, []), t.ln_f, t.eps)
         edited = VM.rms(self.run(ids, edits), t.ln_f, t.eps)
-        at = torch.arange(len(js), device=self.dev)
         lines = []
         for r in range(len(js)):
             lc, le = self.model.log_probs(clean[r, pos[r]]), self.model.log_probs(edited[r, pos[r]])
@@ -323,6 +322,8 @@ def train(args):
     log = open(out / "train.jsonl", "a")
     started = time.time()
     for step in range(args.steps):
+        if args.hours and time.time() - started > 3600 * args.hours:
+            break  # the run's time budget: stop and save the policy as it is
         comps = [c for c in components(table, {0, 1, 2, 3} - held, args.components, rng) for _ in range(args.group)]
         oracle.model.eval()
         oracle.model.base_model.model.gradient_checkpointing_disable()  # sampling keeps its cache
@@ -390,6 +391,7 @@ def main():
     t.add_argument("--components", type=int, default=4)
     t.add_argument("--group", type=int, default=8)
     t.add_argument("--lr", type=float, default=1e-5)
+    t.add_argument("--hours", type=float, help="stop after this many hours of training and save (the pod's cap leaves room for evaluation)")
     e = sub.choices["evaluate"]
     e.add_argument("--policy", required=True)
     e.add_argument("--count", type=int, default=256)

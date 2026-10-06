@@ -1,16 +1,19 @@
-"""Figure of the vpd4l oracle's held-out comparison (#2951): per question, the log-score gain over the
-`nothing` condition (nats per question, paired on the same questions, with +-1 standard error) of
-reading the subcomponent's weights with its graph neighbourhood, its weights alone, and its activity on
-other texts, on subcomponents of layers never trained on, on held-out texts (vpd_oracle.py compare's
-summary).
+"""Figure of the vpd4l oracle's held-out comparison (#2951), from each condition's evaluation file: the
+log-score gain over the `nothing` condition (nats per question, paired on the same questions, +-1
+standard error) of reading a subcomponent's weights with its measured neighbourhood, its weights alone,
+and its activity on other texts. Rows: subcomponents of the layer never trained on, and of trained
+layers, both on held-out texts. Left: each question kind on the natural distribution. Right: the effect
+questions (token direction and most raised token, pooled) by effect stratum, the decade of the removal KL.
 
-  vpd_figure.py --summary SUMMARY.json --out FIGURE.png [--split heldout_layers]
+  vpd_figure.py --runs DIR... --eval eval_labels_heldout.jsonl --out FIGURE.png
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
+from pathlib import Path
 
 import matplotlib
 
@@ -19,36 +22,61 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 QUESTIONS = {"activity": "activity\nlevel", "direction": "token up\nor down", "top": "most raised\ntoken", "continuation": "amplified\ncontinuation",
-             "edge": "cut edge:\nactivity change", "attribution": "which raises\nthe prediction"}
-ARMS = (("graph", "weights + graph", "#1f5fa8"), ("weights", "weights", "#6aa0d8"), ("activity", "activity on other texts", "#c0504d"))
+             "edge": "cut edge", "attribution": "which raises\nthe prediction"}
+STRATA = ("<1e-5", "1e-5", "1e-4", "1e-3", "1e-2", ">1e-1")
+ARMS = (("graph", "weights + neighbours", "#1f5fa8"), ("weights", "weights", "#6aa0d8"), ("activity", "activity on other texts", "#c0504d"))
+SPLITS = (("heldout_layers", "layer never trained on"), ("trained_layers", "trained layers"))
+
+
+def gain(rows, base, keep) -> tuple[float, float]:
+    d = np.array([r["log_score"] - b["log_score"] for r, b in zip(rows, base) if keep(r)])
+    if len(d) < 2:
+        return float("nan"), 0.0
+    return float(d.mean()), float(d.std(ddof=1) / math.sqrt(len(d)))
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--summary", required=True)
+    ap.add_argument("--runs", nargs="+", required=True)
+    ap.add_argument("--eval", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--split", default="heldout_layers")
     args = ap.parse_args()
-    table = json.load(open(args.summary))
-    questions = [q for q in QUESTIONS if any(f"{a}/{args.split}/{q}" in table for a, _, _ in ARMS)]
-    fig, ax = plt.subplots(figsize=(2.4 * len(questions) + 2, 6))
-    width = 0.8 / len(ARMS)
-    x = np.arange(len(questions))
-    for i, (arm, label, color) in enumerate(ARMS):
-        rows = [table.get(f"{arm}/{args.split}/{q}") for q in questions]
-        means = [r["gain_over_nothing_nats"] if r else np.nan for r in rows]
-        errs = [r["standard_error_nats"] or 0 if r else 0 for r in rows]
-        ax.bar(x + (i - (len(ARMS) - 1) / 2) * width, means, width, yerr=errs, color=color, capsize=4, label=label)
-    ax.axhline(0, color="black", linewidth=1)
-    ax.set_xticks(x, [QUESTIONS[q] for q in questions], fontsize=15)
-    ax.set_ylabel("log-score gain over no input\n(nats per question)", fontsize=16)
-    ax.tick_params(axis="y", labelsize=14)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    ax.legend(fontsize=14, frameon=False)
+    runs = {}
+    for d in args.runs:
+        config = json.loads((Path(d) / "config.json").read_text())
+        runs[config["condition"]] = [json.loads(line) for line in open(Path(d) / args.eval)]
+    base = runs["nothing"]
+    arms = [a for a in ARMS if a[0] in runs]
+    questions = [q for q in QUESTIONS if any(r["question"] == q for r in base)]
+    fig, axes = plt.subplots(2, 2, figsize=(20, 11), gridspec_kw={"width_ratios": [len(questions), len(STRATA)]})
+    width = 0.8 / len(arms)
+    for row, (split, split_label) in enumerate(SPLITS):
+        for col in range(2):
+            ax = axes[row, col]
+            groups = questions if col == 0 else list(range(len(STRATA)))
+            x = np.arange(len(groups))
+            for i, (arm, label, color) in enumerate(arms):
+                stats = []
+                for g in groups:
+                    if col == 0:
+                        keep = lambda r, g=g: r["split"] == split and r["question"] == g and r["distribution"] == "natural"  # noqa: E731
+                    else:
+                        keep = lambda r, g=g: r["split"] == split and r["question"] in ("direction", "top") and r["distribution"] == "stratified" and r["stratum"] == g  # noqa: E731
+                    stats.append(gain(runs[arm], base, keep))
+                ax.bar(x + (i - (len(arms) - 1) / 2) * width, [m for m, _ in stats], width, yerr=[e for _, e in stats], color=color, capsize=3, label=label)
+            ax.axhline(0, color="black", linewidth=1)
+            ax.set_xticks(x, [QUESTIONS[q] for q in groups] if col == 0 else [f"KL {s}" for s in STRATA], fontsize=13)
+            ax.tick_params(axis="y", labelsize=13)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+            if col == 0:
+                ax.set_ylabel(f"{split_label}\ngain over no input (nats per question)", fontsize=14)
+            else:
+                ax.set_xlabel("token questions, by the removal's KL at the peak (nats)", fontsize=14)
+    axes[0, 0].legend(fontsize=13, frameon=False)
     fig.set_facecolor("white")
     fig.tight_layout()
-    fig.savefig(args.out, dpi=150, facecolor="white")
+    fig.savefig(args.out, dpi=130, facecolor="white")
     print(args.out)
 
 
