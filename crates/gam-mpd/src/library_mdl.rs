@@ -1275,6 +1275,11 @@ pub struct Settings {
     pub numeric_bytes: usize,
     /// Rows of vocabulary logits formed at once.
     pub head_tile_rows: usize,
+    /// The momentum-rule arm: the momentum's decay set each epoch from the gradient-noise scale
+    /// (`momentum_decay`) in place of the fixed `MOMENTUM_DECAY`. The A/B's outcome deletes this
+    /// field or the constant.
+    #[serde(default)]
+    pub momentum_rule: bool,
     /// When set, the fit ends once its epoch count (counted from `M`, a start's epochs included)
     /// reaches this, with no removal round: a comparison of arms at one budget of steps.
     #[serde(default)]
@@ -1296,6 +1301,8 @@ struct SettingsRecord {
     seed: u64,
     numeric_bytes: usize,
     head_tile_rows: usize,
+    #[serde(default)]
+    momentum_rule: bool,
     #[serde(default)]
     epoch_ratio: Option<serde::de::IgnoredAny>,
     #[serde(default)]
@@ -1335,6 +1342,7 @@ impl From<SettingsRecord> for Settings {
             seed: r.seed,
             numeric_bytes: r.numeric_bytes,
             head_tile_rows: r.head_tile_rows,
+            momentum_rule: r.momentum_rule,
             epochs: r.epochs,
         }
     }
@@ -1820,6 +1828,13 @@ fn antithetic_step(
     bits.extend(other_bits);
     Ok((first.into_iter().chain(second).collect(), bits, gradients, factor))
 }
+
+/// The momentum's decay: an average over about 199 gradients (`n_eff = (1 + β₁) / (1 − β₁)`). On
+/// vpd4l's one-block case at equal tokens (batch 8, 3 epochs) it ended at held-out F 2.595 bits per
+/// token against 2.730 at 0.9 (frontier-gn-b3-noise-*), and at 2^24 one epoch reached 2.158 against
+/// 2.230 (frontier-gn-n32768-m99 against -line4). The noise-scale rule (`momentum_decay`, the
+/// momentum-rule arm) awaits its paired test.
+const MOMENTUM_DECAY: f64 = 0.99;
 
 /// The gradient-noise scale `B = tr(P Σ) / ‖∇F‖²_P` in batches, from IVON's state as it stands
 /// (McCandlish et al. 2018's simple noise scale, with IVON's preconditioner `P = 1 / (h + δ)`). Per
@@ -2808,9 +2823,10 @@ pub fn fit_from(
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
     // The curvature estimate averages over one epoch's batches: each batch weighs about once. The
-    // momentum's decay is set each step (`momentum_decay`): a running mean until an epoch has
-    // measured the gradient-noise scale, then the rule's.
-    let mut ivon = Ivon { beta1: 0.0, beta2: 1.0 - 1.0 / draws.len() as f64 };
+    // momentum's decay is `MOMENTUM_DECAY`, or with the momentum-rule arm set each step
+    // (`momentum_decay`): a running mean until an epoch has measured the gradient-noise scale,
+    // then the rule's.
+    let mut ivon = Ivon { beta1: MOMENTUM_DECAY, beta2: 1.0 - 1.0 / draws.len() as f64 };
     let mut measured_decay: Option<f64> = None;
     // Each group's size, whose `½ ln |G|` an active group's variance costs.
     let sizes: Vec<f64> = explanation.groups.iter().map(|g| g.cells.iter().map(|c| (c.rows.len() * c.cols.len()) as f64).sum()).collect();
@@ -2924,7 +2940,7 @@ pub fn fit_from(
             // sums (the first antithetic half's, `antithetic_step`).
             let factor_weight = weight * scored as f64 / factor.tokens as f64;
             let posterior_started = Instant::now();
-            ivon.beta1 = measured_decay.unwrap_or(1.0 - 1.0 / (b + 1) as f64);
+            ivon.beta1 = if settings.momentum_rule { measured_decay.unwrap_or(1.0 - 1.0 / (b + 1) as f64) } else { MOMENTUM_DECAY };
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &ivon)?;
             let posterior_seconds = posterior_started.elapsed().as_secs_f64();
             let (eta, rho, draws_averaged) = device_posterior.step_state();
@@ -2933,13 +2949,18 @@ pub fn fit_from(
             log::info!("library step {epoch}.{b}: {:.6} bits per scored token, {:.2} s{prior_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
         }
         // The next epoch's momentum decay from the noise scale this epoch's state measures.
-        match gradient_noise_scale(&device_posterior, &posterior, tokens as f64)? {
-            Some(scale) => {
-                let decay = momentum_decay(scale, draws.len());
-                log::info!("library momentum after epoch {epoch}: gradient-noise scale {scale:.4e} batches, β₁ {decay:.6} (was {:.6})", ivon.beta1);
-                measured_decay = Some(decay);
+        if settings.momentum_rule {
+            match gradient_noise_scale(&device_posterior, &posterior, tokens as f64)? {
+                Some(scale) => {
+                    let decay = momentum_decay(scale, draws.len());
+                    log::info!("library momentum after epoch {epoch}: gradient-noise scale {scale:.4e} batches, β₁ {decay:.6} (was {:.6})", ivon.beta1);
+                    measured_decay = Some(decay);
+                }
+                None => match measured_decay {
+                    Some(decay) => log::info!("library momentum after epoch {epoch}: no signal measured above the noise; β₁ stays {decay:.6}"),
+                    None => log::info!("library momentum after epoch {epoch}: no signal measured above the noise; β₁ stays the epoch's running mean"),
+                },
             }
-            None => log::info!("library momentum after epoch {epoch}: no noise scale measured, β₁ stays a running mean"),
         }
         for ((code_length, data), prior_nats) in device_posterior.code_lengths(&code)?.into_iter().zip(datas).zip(priors) {
             let description = code_length + subset_code + explanation.fixed_nats + prior_nats;
@@ -3920,6 +3941,7 @@ mod tests {
             seed: 3,
             numeric_bytes: 1 << 26,
             head_tile_rows: 64,
+            momentum_rule: false,
             epochs: None,
         }
     }

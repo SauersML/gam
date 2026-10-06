@@ -537,6 +537,7 @@ fn main() -> Result<(), String> {
                 seed: 1,
                 numeric_bytes: 1 << 28,
                 head_tile_rows: 64,
+                momentum_rule: false,
                 epochs: None,
             };
             let base = library_mdl::explanation(&native, &layers)?;
