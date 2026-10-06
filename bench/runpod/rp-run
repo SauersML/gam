@@ -805,6 +805,8 @@ case ${1:-} in
                 done
                 # A run whose log has not grown for 15 minutes (a dev pod's has no command).
                 if [ "${mode:-run}" = run ] && [ -f "$RP/$name/run.log" ] && (( now - $(stat -f %m "$RP/$name/run.log") > 900 )); then flag+="FLAT "; fi
+                # Under LOW_GPU % for two minutes in a row now (live_profile).
+                if [ -f "$RP/$name/LOWGPU" ]; then flag+="LOW "; fi
             fi
             if [ -n "$util" ] && (( ${util%\*} < 20 )); then
                 flag+="IDLE "
@@ -2488,6 +2490,53 @@ idle_check() {
     done
 }
 
+# The run's live profile while its command runs: each minute a row of OUT/live.tsv with the GPU's
+# mean and lowest utilization over the minute (the pod's 10 s samples, /workspace/gpu-util.log), the
+# GPU's and the host's memory, and what the command logged in the minute: its library_mdl steps
+# ("library step E.B: ..., T s"), their mean seconds and their share of the minute, and its last
+# other line. Two minutes in a row under LOW_GPU % alert the run's owner: a LOW GPU line in
+# rp-run.log, a row of runpod/alerts.tsv (time, run, owner, utilization, last line) and OUT/LOWGPU,
+# which status shows as LOW until the GPU is back over the line.
+LOW_GPU=70
+live_profile() {
+    local tsv=$OUT/live.tsv offset size gpu chunk steps under=0 alerted=0 i u
+    offset=$(wc -c < "$LOG" | tr -d ' ')
+    [ -s "$tsv" ] || printf 'time\tgpu_util\tgpu_util_min\tgpu_mem_used_mib\tgpu_mem_total_mib\thost_mem_used_mib\thost_mem_total_mib\tsteps\tstep_s_mean\tstep_share\tlast_line\n' > "$tsv"
+    while :; do
+        for (( i = 0; i < 12; i++ )); do
+            [ ! -f "$TMP/stop-sync" ] && kill -0 $$ 2> /dev/null || return 0
+            sleep 5
+        done
+        gpu=$(on_pod "awk -v t=\$(( \$(date +%s) - 60 )) '\$1 >= t && NF == 2 { s += \$2; n++; if (n == 1 || \$2 < m) m = \$2 } END { if (n) printf \"%d %d\\n\", s / n, m; else print \"- -\" }' /workspace/gpu-util.log
+            nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits | head -n 1 | tr -d ,
+            free -m | awk '/^Mem:/ { print \$3, \$2 }'" < /dev/null 2> /dev/null | paste -sd ' ' -) || gpu=""
+        read -r -a gpu <<< "${gpu:-- - - - - -}"
+        size=$(wc -c < "$LOG" | tr -d ' ')
+        (( size >= offset )) || offset=0
+        chunk=""
+        (( size <= offset )) || chunk=$(tail -c +$(( offset + 1 )) "$LOG" | head -c $(( size - offset )) || true)
+        offset=$size
+        steps=$(awk '/^library step [0-9]+\.[0-9]+:/ { n++; s += $(NF - 1); next } NF { last = substr($0, 1, 120) }
+            END { gsub(/\t/, " ", last); if (n) printf "%d\t%.3f\t%.2f\t%s", n, s / n, s / 60, last; else printf "0\t-\t0\t%s", last }' <<< "$chunk")
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "${gpu[0]:--}" "${gpu[1]:--}" "${gpu[2]:--}" "${gpu[3]:--}" "${gpu[4]:--}" "${gpu[5]:--}" "$steps" >> "$tsv"
+        u=${gpu[0]:--}
+        [[ $u =~ ^[0-9]+$ ]] || continue
+        if (( u < LOW_GPU )); then
+            under=$(( under + 1 ))
+            if (( under >= 2 && !alerted )); then
+                alerted=1
+                touch "$OUT/LOWGPU"
+                say "LOW GPU: $u% over the last minute, under $LOW_GPU% for $under minutes (owner ${RP_OWNER:--}); live profile $tsv"
+                printf '%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$NAME" "${RP_OWNER:--}" "$u" "$(tail -n 1 "$tsv" | cut -f11)" >> "$RP/alerts.tsv"
+            fi
+        else
+            (( alerted )) && say "GPU back to $u% (over $LOW_GPU%)"
+            under=0 alerted=0
+            rm -f "$OUT/LOWGPU"
+        fi
+    done
+}
+
 # Starts COMMAND detached on the pod (a dropped connection does not end it) and streams its log.
 # Sets RC to its exit status; returns 1 when the pod is lost first.
 run_command() {
@@ -2512,6 +2561,9 @@ run_command() {
     sync_loop checkpoints &
     SYNC="$SYNC $!"
     idle_check &
+    SYNC="$SYNC $!"
+    rm -f "$OUT/LOWGPU"
+    live_profile &
     SYNC="$SYNC $!"
     local base misses=0 state r
     base=$(wc -c < "$LOG" | tr -d ' ')
