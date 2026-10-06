@@ -4598,6 +4598,47 @@ mod tests {
         }
     }
 
+    /// The per-token activity counts leave out the positions where a layer's block runs `M`'s MLP
+    /// instead of its functions (its `Node::Select`, a transcoder layer's first token,
+    /// 0e9b9c6213): on the tiny Qwen3 decoder with layer 1's MLP a transcoder's features, layer 1's
+    /// nonzero functions per token are those of the host's pre-activations `x Wᵀ + c` over the
+    /// tokens after each sequence's first, which differ from those over every token.
+    #[test]
+    fn activity_counts_leave_out_the_positions_a_block_runs_m_at() {
+        let export = crate::test_support::tiny_qwen3_export("library_activity_select", 2);
+        let imported = import_language_model(&export, 6, 12).unwrap();
+        std::fs::remove_dir_all(&export).unwrap();
+        let native = split_sites(&imported.program).unwrap();
+        let layers = layer_nodes(&native, 2).unwrap();
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let dir = std::env::temp_dir().join(format!("library_activity_select_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (full, kept_path) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
+        let features = 64;
+        crate::test_support::transcoder_file(&full, features, 8, 3);
+        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..features).collect::<Vec<_>>(), &kept_path).unwrap();
+        let explanation = explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        // The host's count: layer 1 reads `M`'s input (layer 0 is `M`'s functions).
+        let family = sequence_family(&sequences.iter().map(Vec::as_slice).collect::<Vec<_>>()).unwrap();
+        let x = native.execute(&family, false).unwrap().values[layers[1].normed].clone();
+        let program = &explanation.artifact.program;
+        let operator = |name: &str| program.operators.iter().find(|op| op.name == name).unwrap().matrix();
+        let pre = x.dot(&operator("library.l1.mlp.gate").t()) + &operator("library.l1.mlp.gate_bias").column(0);
+        let positions = &family.layout.as_ref().unwrap().position;
+        let firing = |rows: Vec<usize>| -> f64 { rows.iter().map(|&r| pre.row(r).iter().filter(|v| **v > 0.0).count()).sum::<usize>() as f64 / rows.len() as f64 };
+        let later = firing((0..pre.nrows()).filter(|&r| positions[r] != 0).collect());
+        assert_ne!(later, firing((0..pre.nrows()).collect()), "the first tokens fire differently");
+        let settings = settings();
+        let device = Device::host();
+        let posterior = Posterior::new(&explanation, 1000).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 1000.0, None, 0).unwrap();
+        let counts = activity(&mut scorer, &explanation, (&posterior, &device_posterior), &sequences, &settings).unwrap();
+        assert!((counts[1].nonzero_per_token - later).abs() <= 1e-12 * later, "layer 1 counts {} functions per token, the tokens after the first {later}", counts[1].nonzero_per_token);
+    }
+
     #[test]
     fn a_fit_stopped_in_the_middle_of_an_epoch_and_resumed_is_the_uninterrupted_fit() {
         let (native, layers, _, sequences) = tiny("library_fit_stopped", "gelu_tanh");

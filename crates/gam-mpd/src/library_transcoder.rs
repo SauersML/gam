@@ -382,29 +382,6 @@ mod tests {
     };
     use rand::{RngExt, SeedableRng, rngs::StdRng};
 
-    /// A bfloat16 transcoder file of `features` random features on `d` coordinates.
-    fn transcoder_file(path: &Path, features: usize, d: usize, seed: u64) {
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut bf16 = |n: usize, scale: f64| -> Vec<u8> { (0..n).flat_map(|_| ((((rng.random::<f64>() - 0.5) * scale) as f32).to_bits() >> 16).to_le_bytes()[..2].to_vec()).collect() };
-        // Every fourth feature's bias is -64, far below any pre-activation: it never fires.
-        let dead = |mut bias: Vec<u8>| {
-            bias.chunks_exact_mut(2).step_by(4).for_each(|b| b.copy_from_slice(&((-64.0f32).to_bits() >> 16).to_le_bytes()[..2]));
-            bias
-        };
-        let parts = [("W_dec", vec![features, d], bf16(features * d, 1.0)), ("W_enc", vec![features, d], bf16(features * d, 2.0)), ("b_dec", vec![d], bf16(d, 0.2)), ("b_enc", vec![features], dead(bf16(features, 1.0)))];
-        let mut header = serde_json::Map::new();
-        let mut offset = 0;
-        for (name, shape, data) in &parts {
-            header.insert((*name).into(), serde_json::json!({"dtype": "BF16", "shape": shape, "data_offsets": [offset, offset + data.len()]}));
-            offset += data.len();
-        }
-        let text = serde_json::Value::Object(header).to_string();
-        let mut bytes = (text.len() as u64).to_le_bytes().to_vec();
-        bytes.extend_from_slice(text.as_bytes());
-        parts.iter().for_each(|(_, _, data)| bytes.extend_from_slice(data));
-        std::fs::write(path, bytes).unwrap();
-    }
-
     /// On the tiny Qwen3 decoder with layer 1's MLP replaced by a transcoder's firing features: the
     /// library's MLP output is `M`'s own MLP output at each sequence's first token and the
     /// transcoder's reconstruction at every other (to float64 rounding), every dropped feature is
@@ -424,7 +401,7 @@ mod tests {
         let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
         let (features, d) = (64, 8);
         let path = dir.join("layer_1.safetensors");
-        transcoder_file(&path, features, d, 3);
+        crate::test_support::transcoder_file(&path, features, d, 3);
         let transcoder = Transcoder::open(&path).unwrap();
         // The host's count of each feature's firing tokens at M's MLP input.
         let family = library_mdl::sequence_family(&sequences.iter().map(Vec::as_slice).collect::<Vec<_>>()).unwrap();
