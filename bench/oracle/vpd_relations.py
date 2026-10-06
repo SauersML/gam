@@ -426,7 +426,7 @@ def attribution(model: Model, g: Graph, uv, tokens, out: Path, args):
                 m = torch.from_numpy(g.site_of[cand.cpu().numpy()] == site).to(dev)
                 idx = torch.arange(P, device=dev)[m]
                 edited = g.inputs(ids.repeat(len(idx), 1), removal(g, cand[idx]))["final"][:, p]
-                delta[idx] = model.log_probs(edited)[:, X] - lc[X]
+                delta[idx] = (model.log_probs(edited)[:, X] - lc[X]).to(delta.dtype)  # log_probs normalizes in float64 on CUDA
             rows["context"].append(c)
             rows["position"].append(p)
             rows["token"].append(X)
