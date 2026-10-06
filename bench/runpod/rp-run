@@ -92,9 +92,16 @@
 # ~/mpd-data/runpod/LEDGER.tsv, dollars = the pod's price per hour x hours from creation to
 # deletion; cloud is COMMUNITY, SECURE:cheapest-per-token, SECURE:no-community-stock or SECURE:dev; then the seconds
 # the pod spent uploading inputs, building data, and from its creation to the command's start (the
-# first two overlap each other and the Rust build, so the third is the paid waiting). One run at a time
-# unless RP_PARALLEL=1 (held pods do not count). After deleting its pod the runner checks through
-# the API that the pod is gone and lists any other pod it created that remains.
+# first two overlap each other and the Rust build, so the third is the paid waiting), how its run
+# ended, its owner (RP_OWNER) and its approval. A run beside another live run needs RP_PARALLEL=1
+# unless it is small (below; held pods do not count). After deleting its pod the runner checks
+# through the API that the pod is gone and lists any other pod it created that remains.
+#
+# Approval: a run starts when ~/mpd-data/runpod/APPROVED.txt (the lead's) lists a prefix of its
+# NAME, or when it is small: its estimate at most $3, its owner's spend over the last 24 h plus the
+# estimate at most $8 (RP_OWNER=AGENT names the owner), and the account's spend rate now plus the
+# run's price at most $4/h. Each automatic approval is logged in ~/mpd-data/runpod/approvals.tsv
+# (with its owner and the three amounts), and the ledger marks the pod's approval listed or auto.
 #
 # Batch: SPEC holds one run per line, written as rp-run's arguments would be (NAME GPU_TYPE HOURS --
 # COMMAND..., shell quoting; leading VAR=VALUE words set that run's environment; # starts a comment).
@@ -512,16 +519,21 @@ reap() {  # POD [cap]
         head -n 1 "$LEDGER" | grep -q wait_s || sed -i '' '1s/$/\tupload_s\tdata_s\twait_s/' "$LEDGER"
         # How the pod's run ended: exit N (its command's status), lost, stopped (rp-run stop),
         # idle-stopped (under 20% GPU for 15 minutes), cap (its HOURS), or deleted (no run on it).
-        head -n 1 "$LEDGER" | grep -q $'\tend$' || sed -i '' '1s/$/\tend/' "$LEDGER"
-        local hours dollars total line
+        head -n 1 "$LEDGER" | grep -q $'\tend' || sed -i '' '1s/$/\tend/' "$LEDGER"
+        # Who launched the run (RP_OWNER) and what approved it: listed (APPROVED.txt) or auto (the
+        # small-run rule).
+        head -n 1 "$LEDGER" | grep -q $'\towner\tapproval$' || sed -i '' '1s/$/\towner\tapproval/' "$LEDGER"
+        local hours dollars total line owner approval
+        owner=$(cat "$ACTIVE/.$pod.owner" 2> /dev/null || echo -)
+        approval=$(cat "$ACTIVE/.$pod.approval" 2> /dev/null || echo -)
         hours=$(awk -v a="$created" -v b="$ended" 'BEGIN { printf "%.4f", (b - a) / 3600 }')
         dollars=$(awk -v h="$hours" -v p="$price" 'BEGIN { printf "%.4f", h * p }')
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$name" "$gpu" "$cloud" "$hours" "$dollars" "$pod" "${upload_s:--}" "${data_s:--}" "${wait_s:--}" "$end" >> "$LEDGER"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$name" "$gpu" "$cloud" "$hours" "$dollars" "$pod" "${upload_s:--}" "${data_s:--}" "${wait_s:--}" "$end" "${owner:--}" "${approval:--}" >> "$LEDGER"
         total=$(awk -F'\t' 'NR > 1 { s += $6 } END { printf "%.2f", s }' "$LEDGER")
         line="pod $pod deleted (confirmed). $gpu ($cloud) at \$$price/h x $hours h = \$$dollars; ledger total \$$total"
         echo "rp-run: $line" >&2
         [ -d "$RP/$name" ] && echo "$(date '+%F %T') $line" >> "$RP/$name/cost.txt"
-        rm -f "$rec" "$ACTIVE/.$pod.deadline" "$ACTIVE/.$pod.owner" "$ACTIVE/.$pod.ssh" "$ACTIVE/.$pod.end"
+        rm -f "$rec" "$ACTIVE/.$pod.deadline" "$ACTIVE/.$pod.owner" "$ACTIVE/.$pod.approval" "$ACTIVE/.$pod.ssh" "$ACTIVE/.$pod.end"
         rm -rf "$ACTIVE/.$pod.guests"
     fi
     rmdir "$RP/.ledger.lock"
@@ -629,8 +641,9 @@ held() {
     return 1
 }
 
-# Launch approval (lead only): a run starts, or a lost pod is replaced, only while ~/mpd-data/runpod/APPROVED.txt
-# lists a prefix of its NAME. Paid GPUs serve goal-producing runs only; the lead grants and withdraws approval.
+# Launch approval: a run starts while ~/mpd-data/runpod/APPROVED.txt (lead only) lists a prefix of its
+# NAME, a lost pod is replaced only while it still does, or the run is small enough to be approved
+# automatically (small_run below). Paid GPUs serve goal-producing runs only.
 approved() {
     local f="$RP/APPROVED.txt" p
     [ -f "$f" ] || return 1
@@ -852,7 +865,9 @@ for line in open(sys.argv[1]):
         shift 4 ;;
 esac
 name_ok "$NAME"
-approved "$NAME" || { echo "rp-run: $NAME is not approved (~/mpd-data/runpod/APPROVED.txt is lead-only; ask the lead)" >&2; exit 3; }
+# Listed in APPROVED.txt, or approved automatically as a small run once its estimate is known.
+APPROVAL=auto
+! approved "$NAME" || APPROVAL=listed
 hours_ok "$HOURS"
 CAP_SECONDS=$(awk -v h="$HOURS" 'BEGIN { printf "%d", h * 3600 }')
 OUT=$RP/$NAME
@@ -928,6 +943,75 @@ PRICE_MAX=$(awk -F'|' '$2 > m { m = $2 } END { print m }' <<< "$OFFERS")
 
 ESTIMATE=$(awk -v p="$PRICE_MAX" -v h="$HOURS" 'BEGIN { printf "%.2f", p * h }')
 
+# The small-run rule (the lead's, 2026-10-05), which approves a run APPROVED.txt does not list and
+# lets any run start beside others without RP_PARALLEL=1: the run's estimate (its dearest offer
+# times HOURS) at most AUTO_RUN; its owner's (RP_OWNER) spend over the last 24 h, plus that
+# estimate, at most AUTO_OWNER_DAY; and the account's spend rate now (every running pod, ours and
+# others', and our other providers' pods) plus the run's price at most AUTO_RATE $/h. The owner's
+# spend counts the ledger's pods of that owner deleted in the last 24 h, the whole cap of each of
+# the owner's pods still running, and the estimates of the owner's runs approved in the last 24 h
+# that have no pod yet (APPROVALS, under a lock, so runs started together see each other). Prints
+# the reason when the rule fails.
+AUTO_RUN=3 AUTO_OWNER_DAY=8 AUTO_RATE=4
+APPROVALS=$MAC_DATA/runpod/approvals.tsv
+small_run() {
+    local owner=${RP_OWNER:-} day rate now rec pod o
+    now=$(date +%s)
+    [ -n "$owner" ] && [ "$owner" != - ] || { echo "no owner (RP_OWNER=AGENT names whose spend it is)"; return 1; }
+    awk -v e="$ESTIMATE" -v c="$AUTO_RUN" 'BEGIN { exit !(e <= c) }' || { echo "its estimate \$$ESTIMATE is over \$$AUTO_RUN"; return 1; }
+    day=$(awk -F'\t' -v o="$owner" -v t="$(date -r $(( now - 86400 )) '+%F %T')" '
+        NR == 1 { for (i = 1; i <= NF; i++) { if ($i == "owner") oc = i; if ($i == "dollars") dc = i }; next }
+        oc && $oc == o && $1 >= t { s += $dc } END { printf "%.4f", s }' "$LEDGER" 2> /dev/null || echo 0)
+    for rec in "$ACTIVE"/*; do
+        [ -f "$rec" ] || continue
+        pod=${rec##*/}
+        [ "$(cat "$ACTIVE/.$pod.owner" 2> /dev/null)" = "$owner" ] || continue
+        read -r _ _ _ p c _ < "$rec"
+        day=$(awk -v d="$day" -v p="$p" -v a="$c" -v b="$(cat "$ACTIVE/.$pod.deadline" 2> /dev/null || echo "$now")" 'BEGIN { printf "%.4f", d + p * (b - a) / 3600 }')
+    done
+    # Approved, still running, and no pod yet: its runner's pid lives and holds no record.
+    day=$(cat "$APPROVALS" 2> /dev/null | awk -F'\t' -v o="$owner" -v t=$(( now - 86400 )) -v d="$day" 'NR > 1 && $4 == o && $2 + 0 >= t { print $6, $5 } END { print "end", d }' |
+        while read -r pid est; do
+            if [ "$pid" = end ]; then echo "$est"; break; fi
+            kill -0 "$pid" 2> /dev/null && ! grep -lqs "^[^ ]* [^ ]* [^ ]* [^ ]* [^ ]* $pid " "$ACTIVE"/* && echo "+$est"
+        done | awk '{ s += $1 } END { printf "%.4f", s }')
+    awk -v d="$day" -v e="$ESTIMATE" -v c="$AUTO_OWNER_DAY" 'BEGIN { exit !(d + e <= c) }' ||
+        { echo "$owner's spend over the last 24 h, \$$day, plus its estimate \$$ESTIMATE is over \$$AUTO_OWNER_DAY"; return 1; }
+    rate=$(gql 'query { myself { currentSpendPerHr } }' | sed '$d' | jq -r '.data.myself.currentSpendPerHr // empty' 2> /dev/null)
+    [ -n "$rate" ] || { echo "the account's spend rate could not be read"; return 1; }
+    for rec in "$ACTIVE"/thunder-* "$ACTIVE"/nebius-*; do
+        [ -f "$rec" ] || continue
+        read -r _ _ _ p _ < "$rec"
+        rate=$(awk -v a="$rate" -v p="$p" 'BEGIN { print a + p }')
+    done
+    awk -v r="$rate" -v p="$PRICE_MAX" -v c="$AUTO_RATE" 'BEGIN { exit !(r + p <= c) }' ||
+        { echo "the account's \$$rate/h now plus its \$$PRICE_MAX/h is over \$$AUTO_RATE/h"; return 1; }
+    echo "estimate \$$ESTIMATE, $owner's 24 h \$$day, account \$$rate/h + \$$PRICE_MAX/h"
+}
+SMALL="" SMALL_WHY=""
+if SMALL_WHY=$(small_run); then SMALL=1; fi
+if [ "$APPROVAL" = auto ] && [ -z "$SMALL" ]; then
+    echo "rp-run: $NAME is not approved: APPROVED.txt (lead-only) does not list it, and it is not a small run: $SMALL_WHY" >&2
+    exit 3
+fi
+if [ "$APPROVAL" = auto ] && [ -z "${RP_ESTIMATE_ONLY:-}" ] && [ -z "${RP_DRY:-}" ]; then
+    # Logged under a lock, so a run started at the same time counts this one.
+    until mkdir "$RP/.approvals.lock" 2> /dev/null; do
+        (( $(date +%s) - $(stat -f %m "$RP/.approvals.lock" 2> /dev/null || date +%s) > 120 )) && rmdir "$RP/.approvals.lock" 2> /dev/null
+        sleep 1
+    done
+    if SMALL_WHY=$(small_run); then
+        [ -f "$APPROVALS" ] || printf 'date\tepoch\tname\towner\testimate\tpid\twhy\n' > "$APPROVALS"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$(date +%s)" "$NAME" "$RP_OWNER" "$ESTIMATE" "$$" "$SMALL_WHY" >> "$APPROVALS"
+        rmdir "$RP/.approvals.lock"
+    else
+        rmdir "$RP/.approvals.lock"
+        echo "rp-run: $NAME is not approved: APPROVED.txt (lead-only) does not list it, and it is not a small run: $SMALL_WHY" >&2
+        exit 3
+    fi
+    echo "rp-run: $NAME approved automatically as a small run ($SMALL_WHY)" >&2
+fi
+
 # Runs left by a process that is gone (its watcher killed too) are reaped; live runs counted.
 live=()
 for rec in "$ACTIVE"/*; do
@@ -940,8 +1024,8 @@ for rec in "$ACTIVE"/*; do
         reap "${rec##*/}" || exit 1
     fi
 done
-if [ "$MODE" = run ] && [ ${#live[@]} -gt 0 ] && [ -z "${RP_PARALLEL:-}" ]; then
-    echo "rp-run: pod ${live[*]} is running for another rp-run; RP_PARALLEL=1 to run beside it" >&2
+if [ "$MODE" = run ] && [ ${#live[@]} -gt 0 ] && [ -z "${RP_PARALLEL:-}" ] && [ -z "$SMALL" ]; then
+    echo "rp-run: pod ${live[*]} is running for another rp-run, and this run is not small ($SMALL_WHY); RP_PARALLEL=1 to run beside it" >&2
     exit 2
 fi
 
@@ -1170,6 +1254,7 @@ if [ -n "${RP_DRY:-}" ]; then
     echo "built:    ${built:-none}"
     echo "source:   crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md ${srcpaths[*]:-}"
     echo "binaries: $(unbuilt | tr '\n' ' ' | sed 's/^$/all built/; s/^\(.\)/to build on GitHub Actions: \1/') (examples ${examples[*]:-none}, tests ${tests[*]:-none}, key $KEY)"
+    echo "approval: $APPROVAL${SMALL:+ (a small run: $SMALL_WHY)}"
     echo "command:  ${cmd:-none}"
     echo "request:  $(IFS='|' read -r k p g <<< "$(head -n 1 <<< "$OFFERS")"; if [[ $g == thunder:* ]]; then thunder_body "$g" '<run key>'; elif [[ $g == nebius:* ]]; then nebius_request "${g#nebius:}" '<preset>' '<project>' '<subnet>' '<pricing policy>' '<run key>' "mpd2951-$NAME"; else create_body "$k" "$g" "$CAP_SECONDS" '<run key> <~/.ssh/runpod_ed25519.pub>'; fi)"
     exit 0
@@ -1283,6 +1368,7 @@ record() {  # GPU_ID KIND
     printf '%s\t%s\t%s\n' "$POD" "$NAME" "$(date '+%F %T')" >> "$REGISTRY"
     printf '%s %s %s %s %s %s %s %s\n' "$NAME" "${1// /_}" "$2" "$PRICE" "$CREATED" "$$" "$ESTIMATE" "$MODE" > "$ACTIVE/$POD"
     echo "${RP_OWNER:--}" > "$ACTIVE/.$POD.owner"
+    echo "$APPROVAL" > "$ACTIVE/.$POD.approval"
     echo "$DEADLINE" > "$ACTIVE/.$POD.deadline"
     nohup "$SELF" --watch "$POD" "$$" "$DEADLINE" >> "$OUT/watch.log" 2>&1 &
 }
@@ -1416,6 +1502,22 @@ nebius_settled() {  # OPERATION
 # RP_MIN_VRAM_GB of GPU memory and the run's disk free, and has the run's HOURS left before its cap.
 # Of those, the least busy GPU. RP_PACK=0 always takes a pod of its own. Prints the pod, or nothing.
 PACK_GPU=20 PACK_WINDOW=300
+
+# Whether a new pod's GPU is in use by something else or held below its power: over 5 one-second
+# samples before anything of ours runs on it, mean utilization at or above the idle line (PACK_GPU),
+# a power limit below the card's default (a host found at 153 W of 450 W ran 5x slower), or less
+# free memory than the run states (RP_MIN_VRAM_GB). Prints the reason, or nothing.
+gpu_in_use() {
+    on_pod 'for i in 1 2 3 4 5; do nvidia-smi --query-gpu=utilization.gpu,memory.free,power.limit,power.default_limit --format=csv,noheader,nounits | head -n 1; sleep 1; done' < /dev/null 2> /dev/null |
+        awk -F', *' -v idle="$PACK_GPU" -v need="${RP_MIN_VRAM_GB:-0}" '
+            { u += $1; n++; free = $2; lim = $3; def = $4 }
+            END {
+                if (!n) exit
+                if (u / n >= idle) printf "utilization %d%% with no run of ours; ", u / n
+                if (lim ~ /^[0-9.]+$/ && def ~ /^[0-9.]+$/ && lim + 0 < def + 0) printf "power limit %s W of its default %s W; ", lim, def
+                if (need > 0 && free + 0 < need * 1024) printf "%d MiB free of the %d GiB the run needs; ", free, need
+            }' | sed 's/; $//'
+}
 find_host() {
     local rec pod g dl ip port tmp user util free disk best="" bestu="" now
     [ "$MODE" = run ] && [ -n "${RP_MIN_VRAM_GB:-}" ] && [ "${RP_PACK:-1}" != 0 ] || return 0
@@ -1468,7 +1570,8 @@ attach() {  # POD
 # Signals wait while a pod is created, so none can end the run between its creation and its record.
 launch() {
     local kind price gpu r code left host
-    approved "$NAME" || { say "approval for $NAME withdrawn; not launching a pod"; exit 3; }
+    # A listed run relaunches only while still listed; a small run's approval covers its whole cap.
+    [ "$APPROVAL" = auto ] || approved "$NAME" || { say "approval for $NAME withdrawn; not launching a pod"; exit 3; }
     POD="" IP="" PORT=""
     host=$(find_host)
     if [ -n "$host" ] && attach "$host"; then
@@ -1547,6 +1650,9 @@ launch() {
         elif ! on_pod 'ls /usr/local/cuda/lib64/libnvrtc.so* > /dev/null 2>&1 || ldconfig -p | grep -q libnvrtc' < /dev/null; then
             # The device code compiles through NVRTC at run time: an image without it cannot run it.
             say "the machine has no NVRTC (libnvrtc); deleting pod $POD"
+        elif busy=$(gpu_in_use); [ -n "$busy" ]; then
+            [ -z "$host" ] || echo "$host" >> "$BAD_HOSTS"
+            say "the GPU on host ${host:-?} is not free before the run ($busy); recorded as failing; deleting pod $POD"
         else
             break
         fi
