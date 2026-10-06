@@ -106,14 +106,15 @@ fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 
         let momentum = b1 * moments[0][at] + (1.0 - b1) * gr;
         let power = b1 * moments[2][at] + (1.0 - b1) * gr * gr;
         let (m, noise) = (momentum / c1, (power / c1 - (momentum / c1).powi(2)).max(0.0) * spread);
-        let signal = if m * m > noise { m - noise / m } else { 0.0 };
+        let full = m + delta * mu;
+        let signal = if full * full > noise { full - noise / full } else { 0.0 };
         let estimate = c.step.factor_scale * c.factor[at] * c.factor[at];
         let (h, d) = (moments[1][at], estimate - moments[1][at]);
         let curvature = h + (1.0 - b2) * d + 0.5 * (1.0 - b2) * (1.0 - b2) * d * d / (h + delta);
         moments[0][at] = momentum;
         moments[1][at] = curvature;
         moments[2][at] = power;
-        mean[at] = mu - (c.step.rate * (signal + delta * mu) / (curvature + delta)).clamp(-sd, sd);
+        mean[at] = mu - (c.step.rate * signal / (curvature + delta)).clamp(-sd, sd);
         log_sd[at] = -0.5 * (n * (curvature + delta)).ln();
         let a = &mut after[*g as usize];
         a[0] += 1.0;
@@ -294,6 +295,75 @@ fn a_bfloat16_sample_is_the_f32_sample_rounded() {
     // `bf16_copy` rounds to nearest, ties to even, as the bfloat16 sample does.
     let expected = fit.download(&fit.bf16_copy(&single).unwrap()).unwrap();
     assert_eq!(fit.download(&half).unwrap(), expected);
+}
+
+/// `R` coordinates in one group whose data term per token is `½ h (θ − a)²` (`a` the coordinate's
+/// value in `M`, its start) with gradient noise of standard deviation `s` per step, the group's
+/// prior variance `v` held fixed, at `N = 2^16` tokens: `F / N = E_q[ℓ] + KL(q ‖ p) / N` is
+/// stationary in `μ` at `μ* = h a / (h + δ)`, `δ = 1 / (N v)`. With `h = δ / 4` and `a = −33`,
+/// `μ* = −6.6`, and the gradient's noise equals the full gradient's size at the start
+/// (`s = δ |a|`), so the data term's pull near `μ*` is within the momentum's noise. Each step
+/// draws `θ = μ + σ ε` and `g = h (θ − a) + s z` (`ε`, `z` standard normal), and the Gauss–Newton
+/// factor `√h`, so the curvature stays `h`. Returns each coordinate's average `μ` over the last half
+/// of `steps` steps. `fit` holds the posterior, `wide` the group's variance and sums.
+fn settled(fit: &Device, wide: &Device, steps: u64) -> (f64, Vec<f64>) {
+    const R: usize = 64;
+    let (tokens, v) = (65_536.0, 1.0);
+    let delta = 1.0 / (tokens * v);
+    let (h, a) = (0.25 * delta, -33.0);
+    let s = delta * 33.0;
+    let target = h * a / (h + delta);
+    let up = |m: Array2<f64>| fit.upload(m.view()).unwrap();
+    let (mut mean, mut log_sd) = (up(Array2::from_elem((1, R), a)), up(Array2::from_elem((1, R), -0.5 * (tokens * (h + delta)).ln())));
+    let (mut momentum, mut curvature, mut power) = (up(Array2::zeros((1, R))), up(Array2::from_elem((1, R), h)), up(Array2::zeros((1, R))));
+    let groups = fit.group_map(&[0; R], (1, R)).unwrap();
+    let variance = wide.upload(Array2::from_elem((1, 1), v).view()).unwrap();
+    let factor = up(Array2::from_elem((1, R), h.sqrt()));
+    let mut averages = vec![0.0; R];
+    for t in 1..=steps {
+        let (mu, sd) = (fit.download(&mean).unwrap(), fit.download(&log_sd).unwrap().mapv(f64::exp));
+        if t > steps / 2 {
+            for (total, m) in averages.iter_mut().zip(&mu) {
+                *total += m / (steps - steps / 2) as f64;
+            }
+        }
+        let gradient = Array2::from_shape_fn((1, R), |(_, i)| {
+            let theta = mu[(0, i)] + sd[(0, i)] * f64::from(posterior_normal(11, t, i as u64));
+            h * (theta - a) + s * f64::from(posterior_normal(12, t, i as u64))
+        });
+        let step = PosteriorStep { gradient_scale: 1.0, factor_scale: 1.0, tokens, rate: 0.1, beta1: 0.9, beta2: 1.0 - 1.0 / 64.0, step: t };
+        let mut sums = wide.zeros(1, 3).unwrap();
+        fit.posterior_ivon((&mut mean, &mut log_sd), [&mut momentum, &mut curvature, &mut power], (&up(gradient), &factor), (&groups, &variance), &mut sums, &step).unwrap();
+    }
+    (target, averages)
+}
+
+/// The filtered step's fixed point is `F`'s stationary point: averaged over the last 2000 of 4000
+/// steps and over 64 coordinates, `μ` is within six standard errors (of that average over the
+/// coordinates) of `μ* = −6.6`, and the standard error is small enough to tell `μ*` from the
+/// `−4.1` at which filtering the data momentum alone and adding `δ μ` exactly settled.
+fn settles_at_the_stationary_point(fit: &Device, wide: &Device) {
+    let (target, averages) = settled(fit, wide, 4000);
+    let n = averages.len() as f64;
+    let mean = averages.iter().sum::<f64>() / n;
+    let error = (averages.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0) / n).sqrt();
+    assert!((target + 6.6).abs() < 1e-12, "μ* {target}");
+    assert!(error < 0.2, "standard error {error}");
+    assert!((mean - target).abs() < 6.0 * error, "μ settled at {mean} ± {error}, against μ* = {target}");
+}
+
+#[test]
+fn a_coordinate_within_its_gradient_noise_settles_at_the_stationary_point() {
+    let host = Device::host();
+    settles_at_the_stationary_point(&host, &host);
+    #[cfg(target_os = "macos")]
+    if let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault") {
+        settles_at_the_stationary_point(&metal, &metal);
+    }
+    if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
+        settles_at_the_stationary_point(&wide.with_storage(Storage::F32).expect("CUDA holds f32"), &wide);
+        settles_at_the_stationary_point(&wide, &wide);
+    }
 }
 
 /// `c`'s sample written by `fit` into a block at (2, 4) of a larger tensor on `out` (`out`'s

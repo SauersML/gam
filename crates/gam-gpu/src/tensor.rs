@@ -2198,17 +2198,24 @@ impl Device {
     /// total precision `λ ← λ (1 + x + ½ x²)` with `x = (1 − β₂)(ĥ + δ − λ) / λ`, which keeps `λ`
     /// positive for any estimate, written in `h` as
     /// `h ← β₂ h + (1 − β₂) ĥ + ½ (1 − β₂)² (h − ĥ)² / (h + δ)`;
-    /// `μ ← μ − α (ĝ + δ μ) / (h + δ)`, the move held within one posterior standard deviation `σ`
-    /// (a trust region), and `s = −½ ln(N (h + δ))`. `ĝ` is the momentum's estimate of the mean
-    /// gradient filtered by its own noise: with `p ← β₁ p + (1 − β₁) g²`, the bias-corrected
+    /// `μ ← μ − α ĝ / (h + δ)`, the move held within one posterior standard deviation `σ` (a
+    /// trust region), and `s = −½ ln(N (h + δ))`. `ĝ` is the estimate of the full gradient
+    /// `ḡ + δ μ` per token (the data term's mean gradient `ḡ` plus the prior's exact pull) filtered
+    /// by its measured noise: with `p ← β₁ p + (1 − β₁) g²`, the bias-corrected
     /// `m̄ = m / (1 − β₁ᵗ)` and `p̄ = p / (1 − β₁ᵗ)`, and `n` the momentum's effective number of
     /// gradients (the inverse of its weights' sum of squares), `V = (p̄ − m̄²) / (n − 1)` is an
-    /// unbiased estimate of `m̄`'s variance for gradients of a common mean, and
-    /// `ĝ = m̄ (1 − V / m̄²)` where `m̄² > V`, else 0: the empirical-Bayes (Wiener) estimate of the
-    /// mean from `m̄`. Most of a sampled gradient is the other weights' noise carried through the
+    /// unbiased estimate of `m̄`'s variance for gradients of a common mean, which is also the
+    /// variance of `G = m̄ + δ μ` (the prior's term carries no noise), and `ĝ = G (1 − V / G²)`
+    /// where `G² > V`, else 0: the empirical-Bayes (Wiener) estimate of the full gradient from `G`.
+    /// The filter is odd and nondecreasing in `G`, so its expectation over `G`'s noise is zero
+    /// exactly where the full gradient's mean is: the step's fixed point is `F`'s stationary point.
+    /// Filtering the data momentum alone and adding `δ μ` exactly moved the fixed point toward
+    /// `μ = 0` wherever the data's pull is within its noise (one coordinate at `N = 2^16` whose
+    /// stationary point is `μ* = −6.6` settled at `−4.1`), a removal bias the objective does not
+    /// contain. Most of a sampled gradient is the other weights' noise carried through the
     /// Hessian's off-diagonal terms; the unfiltered momentum walked the means away from `M` and
-    /// raised `F`. Before the gradients give a spread (`n ≤ 1`: the first step, or `β₁ = 0`),
-    /// `ĝ = 0`. Under the approximation `ĥ ≥ 0`, so an `h ≥ 0` stays nonnegative
+    /// raised `F`. Before the gradients give a spread (`n ≤ 1`: the first step, or `β₁ = 0`), `V`
+    /// is unknown and `ĝ = 0`: the mean stays. Under the approximation `ĥ ≥ 0`, so an `h ≥ 0` stays nonnegative
     /// (`β₂ h + (1 − β₂) ĥ ≥ 0` and the last term is nonnegative; rounding keeps it, since
     /// `|fl(ĥ − h)| ≤ h` when `ĥ < h`), and `σ² = 1 / (N (h + δ)) ≤ v`: the standard deviation at
     /// which the approximated `N E_q[ℓ] + KL(q ‖ p)` is stationary for the curvature `h` and the
@@ -2262,10 +2269,11 @@ impl Device {
                     ps[i] = b1 * ps[i] + (1.0 - b1) * data * data;
                     let (m, p) = (ms[i] / correction, ps[i] / correction);
                     let noise = (p - m * m).max(0.0) * noise_scale;
-                    let signal = if noise_scale >= 0.0 && m * m > noise { m - noise / m } else { 0.0 };
+                    let full = m + delta * mu;
+                    let signal = if noise_scale >= 0.0 && full * full > noise { full - noise / full } else { 0.0 };
                     let (h, d) = (hs[i], curvature - hs[i]);
                     hs[i] = h + (1.0 - b2) * d + 0.5 * (1.0 - b2) * (1.0 - b2) * d * d / (h + delta);
-                    means[i] = mu - (step.rate * (signal + delta * mu) / (hs[i] + delta)).clamp(-sd, sd);
+                    means[i] = mu - (step.rate * signal / (hs[i] + delta)).clamp(-sd, sd);
                     log_sds[i] = -0.5 * (step.tokens * (hs[i] + delta)).ln();
                     totals[3 * g] += 1.0;
                     totals[3 * g + 1] += means[i] * means[i] + (2.0 * log_sds[i]).exp();
@@ -3972,6 +3980,7 @@ __device__ void group_reduce(u64 n, u64 cols, unsigned int axis, u64 chunks, con
 
 // Entries (the posterior, the momentum, the curvature, the gradient's second moment, the gradient)
 // in T; group sums in double. `spread` is `PosteriorStep::noise_scale` (negative: no estimate yet).
+// The filter acts on the full gradient `m + δ μ` (`Device::posterior_ivon`).
 template <typename T>
 __device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1, double spread,
     const T* gradient, const T* factor, const unsigned int* groups, const double* variance, T* mean, T* log_sd, T* momentum, T* curvature, T* power, double* sums) {
@@ -3983,11 +3992,11 @@ __device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chun
         T gi = weight * gradient[i], ui = factor[i];
         T m1 = b1 * momentum[i] + o1 * gi, p1 = b1 * power[i] + o1 * gi * gi;
         T m = m1 * k1, q = p1 * k1 - m * m;
-        T noise = (q > (T)0 ? q : (T)0) * v1;
-        T signal = known && m * m > noise ? m - noise / m : (T)0;
+        T noise = (q > (T)0 ? q : (T)0) * v1, full = m + delta * mu;
+        T signal = known && full * full > noise ? full - noise / full : (T)0;
         T h = curvature[i], d = square * ui * ui - h;
         T h1 = h + o2 * d + (T)0.5 * o2 * o2 * d * d / (h + delta);
-        T move = alpha * (signal + delta * mu) / (h1 + delta);
+        T move = alpha * signal / (h1 + delta);
         mu -= move > sd ? sd : (move < -sd ? -sd : move);
         T s = (T)(-0.5 * log(tokens * ((double)h1 + (double)delta)));
         momentum[i] = m1; power[i] = p1; curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
@@ -4033,11 +4042,11 @@ __device__ void posterior_ivon_mixed(u64 n, u64 cols, unsigned int axis, u64 chu
         float delta = (float)(1.0 / (tokens * variance[g])), mu = mean[i], sd = expf(log_sd[i]);
         float gi = weight * entry_load(gradient[i]), ui = entry_load(factor[i]);
         float m1 = b1 * entry_load(momentum[i]) + o1 * gi, p1 = b1 * power[i] + o1 * gi * gi;
-        float m = m1 * k1, noise = fmaxf(p1 * k1 - m * m, 0.0f) * v1;
-        float signal = known && m * m > noise ? m - noise / m : 0.0f;
+        float m = m1 * k1, noise = fmaxf(p1 * k1 - m * m, 0.0f) * v1, full = m + delta * mu;
+        float signal = known && full * full > noise ? full - noise / full : 0.0f;
         float h = curvature[i], d = square * ui * ui - h;
         float h1 = h + o2 * d + 0.5f * o2 * o2 * d * d / (h + delta);
-        mu -= fminf(fmaxf(alpha * (signal + delta * mu) / (h1 + delta), -sd), sd);
+        mu -= fminf(fmaxf(alpha * signal / (h1 + delta), -sd), sd);
         float s = (float)(-0.5 * log(tokens * ((double)h1 + (double)delta)));
         entry_store(momentum + i, m1); power[i] = p1; curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
         a = 1.0; b = (double)mu * (double)mu + exp(2.0 * (double)s); c = 2.0 * (double)s;
@@ -6932,12 +6941,13 @@ inline void ivon_entry(uint i, uint g, device const float* gradient, device cons
     float delta = 1.0f / (p.tokens * variance[g]), mu = mean[i], sd = exp(log_sd[i]);
     float gi = p.scale * gradient[i], ui = factor[i];
     float m1 = p.beta1 * momentum[i] + (1.0f - p.beta1) * gi, p1 = p.beta1 * power[i] + (1.0f - p.beta1) * gi * gi;
-    // The momentum filtered by its own noise (`Device::posterior_ivon`; `p.noise < 0`: none known yet).
-    float m = m1 / p.c1, noise = max(p1 / p.c1 - m * m, 0.0f) * p.noise;
-    float signal = p.noise >= 0.0f && m * m > noise ? m - noise / m : 0.0f;
+    // The full gradient m + δ μ filtered by the momentum's noise (`Device::posterior_ivon`;
+    // `p.noise < 0`: none known yet).
+    float m = m1 / p.c1, noise = max(p1 / p.c1 - m * m, 0.0f) * p.noise, full = m + delta * mu;
+    float signal = p.noise >= 0.0f && full * full > noise ? full - noise / full : 0.0f;
     float o2 = 1.0f - p.beta2, h = curvature[i], d = p.fscale * ui * ui - h;
     float h1 = h + o2 * d + 0.5f * o2 * o2 * d * d / (h + delta);
-    mu -= clamp(p.rate * (signal + delta * mu) / (h1 + delta), -sd, sd);
+    mu -= clamp(p.rate * signal / (h1 + delta), -sd, sd);
     float s = -0.5f * log(p.tokens * (h1 + delta));
     momentum[i] = m1; power[i] = p1; curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
     a = 1.0f; b = mu * mu + exp(2.0f * s); c = 2.0f * s;

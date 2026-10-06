@@ -122,8 +122,9 @@
 //! under `q`, and `v_G` depends on `σ`); setting `σ` from the running `h` and the current `v_G` at
 //! every step is an online approximation to it, so `σ` has no step size; the mean takes the
 //! preconditioned
-//! step `α (ĝ + δ μ) / (h + δ)`, `ĝ` the gradient's momentum filtered by its own measured noise
-//! (`Device::posterior_ivon`): a sampled gradient is mostly the other weights' noise carried
+//! step `α ĝ / (h + δ)`, `ĝ` the full gradient (the data term's momentum plus the prior's `δ μ`)
+//! filtered by the momentum's measured noise (`Device::posterior_ivon`), so the step's fixed point
+//! is `F`'s stationary point: a sampled gradient is mostly the other weights' noise carried
 //! through the Hessian's off-diagonal terms, and with the momentum unfiltered the mean's steps
 //! walked it away from `M` and raised `F` (vpd4l, `N = 2^16`: from the Laplace posterior at `M`,
 //! `F` rose from 147 to 356 bits per scored token over the first epoch with the curvature held
@@ -3806,15 +3807,14 @@ mod tests {
         let variance: Vec<f64> = posterior.moments().iter().map(|m| m.second / m.count).collect();
         let mut reference = posterior.clone();
         for i in 0..reference.mean.len() {
-            for ((r, c), mu) in reference.mean[i].indexed_iter_mut() {
+            for ((r, c), _) in posterior.mean[i].indexed_iter() {
                 let delta = 1.0 / (tokens * variance[posterior.membership[i][[r, c]] as usize]);
                 let sd = posterior.log_sd[i][[r, c]].exp();
                 let h0 = (1.0 / (tokens * sd * sd) - delta).max(0.0);
                 let d = square * factors[i][[r, c]] * factors[i][[r, c]] - h0;
                 let h = h0 + (1.0 - ivon.beta2) * d + 0.5 * (1.0 - ivon.beta2).powi(2) * d * d / (h0 + delta);
-                // A first step's momentum is one gradient, which gives no spread: the filtered
-                // gradient is zero and the mean moves by the prior's pull alone.
-                *mu -= (ivon.rate * (delta * *mu) / (h + delta)).clamp(-sd, sd);
+                // A first step's momentum is one gradient, which gives no spread: the gradient's
+                // noise is unknown, the filtered gradient is zero and the mean stays.
                 reference.log_sd[i][[r, c]] = -0.5 * (tokens * (h + delta)).ln();
             }
         }
@@ -3935,16 +3935,15 @@ mod tests {
         let mut reference = posterior.clone();
         for i in 0..reference.mean.len() {
             let along = |x: &Array2<f64>| posterior.rotations[i].as_ref().map_or_else(|| x.clone(), |r| r.undo(x));
-            let (mut mean, factor) = (along(&posterior.mean[i]), along(&factors[i]));
-            for ((r, c), mu) in mean.indexed_iter_mut() {
+            let (mean, factor) = (along(&posterior.mean[i]), along(&factors[i]));
+            for ((r, c), _) in mean.indexed_iter() {
                 let delta = 1.0 / (tokens * variance[posterior.membership[i][[r, c]] as usize]);
                 let sd = posterior.log_sd[i][[r, c]].exp();
                 let h0 = (1.0 / (tokens * sd * sd) - delta).max(0.0);
                 let d = square * factor[[r, c]] * factor[[r, c]] - h0;
                 let h = h0 + (1.0 - ivon.beta2) * d + 0.5 * (1.0 - ivon.beta2).powi(2) * d * d / (h0 + delta);
-                // A first step's momentum is one gradient, which gives no spread: the filtered
-                // gradient is zero and the mean moves by the prior's pull alone.
-                *mu -= (ivon.rate * (delta * *mu) / (h + delta)).clamp(-sd, sd);
+                // A first step's momentum is one gradient, which gives no spread: the gradient's
+                // noise is unknown, the filtered gradient is zero and the mean stays.
                 reference.log_sd[i][[r, c]] = -0.5 * (tokens * (h + delta)).ln();
             }
             reference.mean[i] = posterior.rotations[i].as_ref().map_or(mean.clone(), |r| r.apply(&mean));
