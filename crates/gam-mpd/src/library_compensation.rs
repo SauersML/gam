@@ -54,6 +54,7 @@ use gam_linalg::{
     roundoff::SymmetricAssembly,
 };
 use ndarray::{Array1, Array2, Axis};
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 fn error(e: impl std::fmt::Display) -> String {
@@ -80,6 +81,15 @@ struct Mlp {
     outputs: Vec<Output>,
     /// `Hᵀ H` over the functions' activations on every row it was formed from.
     gram: Array2<f64>,
+}
+
+/// One MLP's compensation in a proposal: per surviving function its output column (none for a
+/// tied output), the scale `√v_j` and the row of its move, which adds `v_j^½ · row` to the column.
+struct Change {
+    output: usize,
+    columns: Vec<Option<usize>>,
+    scales: Vec<f64>,
+    rows: Array2<f64>,
 }
 
 /// The compensation of every MLP of a library explanation for one removal round.
@@ -261,64 +271,75 @@ impl Compensation {
 
     /// `posterior` with the groups `removed` removed and, in every MLP that loses functions it had,
     /// its surviving functions' outputs moved to the posterior mode of the compensation (module
-    /// note).
+    /// note). Each MLP's compensation reads `posterior` alone and moves only its own output
+    /// columns, so the MLPs are solved in parallel and their moves added after, in MLP order.
     pub fn proposal(&self, posterior: &Posterior, removed: &[usize]) -> Result<Posterior, String> {
         let gone: BTreeSet<usize> = removed.iter().copied().collect();
+        let changes: Vec<Option<Change>> = self.mlps.par_iter().map(|mlp| self.change(mlp, posterior, &gone)).collect::<Result<_, String>>()?;
         let mut trial = posterior.clone();
-        for mlp in &self.mlps {
-            // A tied output also depends on the gate row it reads.
-            let groups = |i: usize| mlp.functions[i].iter().copied().chain(match mlp.outputs[i] {
-                Output::Tied { group, .. } => Some(group),
-                Output::Column(_) => None,
-            });
-            let alive = |i: &usize| groups(*i).all(|g| posterior.active[g]);
-            let hit = |i: &usize| groups(*i).any(|g| gone.contains(&g));
-            let (deleted, kept): (Vec<usize>, Vec<usize>) = (0..mlp.functions.len()).filter(alive).partition(hit);
-            let surviving: Vec<usize> = kept.into_iter().filter(|i| matches!(mlp.outputs[*i], Output::Column(_))).collect();
-            if deleted.is_empty() || surviving.is_empty() {
-                continue;
-            }
-            let (prior, curvature) = Self::scales(mlp, posterior, &Self::columns(mlp, posterior));
-            // A survivor without prior variance (all its values and deviations zero) stays put.
-            let surviving: Vec<usize> = surviving.into_iter().filter(|i| prior[*i] > 0.0).collect();
-            if surviving.is_empty() || curvature.iter().all(|c| *c == 0.0) {
-                continue;
-            }
-            let outputs = &posterior.mean[mlp.output];
-            // `U_K`: the deleted functions' outputs as rows.
-            let mut deleted_outputs = Array2::zeros((deleted.len(), outputs.nrows()));
-            for (mut row, i) in deleted_outputs.rows_mut().into_iter().zip(&deleted) {
-                match mlp.outputs[*i] {
-                    Output::Column(column) => row.assign(&outputs.column(column)),
-                    Output::Tied { scale, gate, row: read, .. } => row.assign(&(&posterior.mean[gate].row(read) * posterior.mean[scale][[0, 0]])),
-                }
-            }
-            let (root, decomposition, floor) = self.scaled(mlp, &surviving, &prior)?;
-            // `V_R^½ G_RK U_K` along `S`'s eigenvectors, each coordinate's column weighed by
-            // `c_r / (1 + c_r e_k)`, and back.
-            let mut right = fast_ab(&mlp.gram.select(Axis(0), &surviving).select(Axis(1), &deleted), &deleted_outputs);
-            for (mut row, r) in right.rows_mut().into_iter().zip(&root) {
-                row *= *r;
-            }
-            let mut projected = fast_atb(&decomposition.vectors, &right);
-            for (mut row, e) in projected.rows_mut().into_iter().zip(&decomposition.values) {
-                if *e > floor {
-                    row.zip_mut_with(&curvature, |x, c| *x *= c / (1.0 + c * e));
-                } else {
-                    row.fill(0.0);
-                }
-            }
-            let change = fast_ab(&decomposition.vectors, &projected);
-            let target = &mut trial.mean[mlp.output];
-            for ((row, i), r) in change.rows().into_iter().zip(&surviving).zip(&root) {
-                if let Output::Column(column) = mlp.outputs[*i] {
-                    let mut column = target.column_mut(column);
-                    column.scaled_add(*r, &row);
+        for change in changes.into_iter().flatten() {
+            let target = &mut trial.mean[change.output];
+            for ((row, column), r) in change.rows.rows().into_iter().zip(&change.columns).zip(&change.scales) {
+                if let Some(column) = column {
+                    target.column_mut(*column).scaled_add(*r, &row);
                 }
             }
         }
         trial.remove(removed);
         Ok(trial)
+    }
+
+    /// The move of `mlp`'s surviving output columns when the groups `gone` are removed from
+    /// `posterior` ([`Compensation::proposal`]), or `None` when it loses no function it had.
+    fn change(&self, mlp: &Mlp, posterior: &Posterior, gone: &BTreeSet<usize>) -> Result<Option<Change>, String> {
+        // A tied output also depends on the gate row it reads.
+        let groups = |i: usize| mlp.functions[i].iter().copied().chain(match mlp.outputs[i] {
+            Output::Tied { group, .. } => Some(group),
+            Output::Column(_) => None,
+        });
+        let alive = |i: &usize| groups(*i).all(|g| posterior.active[g]);
+        let hit = |i: &usize| groups(*i).any(|g| gone.contains(&g));
+        let (deleted, kept): (Vec<usize>, Vec<usize>) = (0..mlp.functions.len()).filter(alive).partition(hit);
+        let surviving: Vec<usize> = kept.into_iter().filter(|i| matches!(mlp.outputs[*i], Output::Column(_))).collect();
+        if deleted.is_empty() || surviving.is_empty() {
+            return Ok(None);
+        }
+        let (prior, curvature) = Self::scales(mlp, posterior, &Self::columns(mlp, posterior));
+        // A survivor without prior variance (all its values and deviations zero) stays put.
+        let surviving: Vec<usize> = surviving.into_iter().filter(|i| prior[*i] > 0.0).collect();
+        if surviving.is_empty() || curvature.iter().all(|c| *c == 0.0) {
+            return Ok(None);
+        }
+        let outputs = &posterior.mean[mlp.output];
+        // `U_K`: the deleted functions' outputs as rows.
+        let mut deleted_outputs = Array2::zeros((deleted.len(), outputs.nrows()));
+        for (mut row, i) in deleted_outputs.rows_mut().into_iter().zip(&deleted) {
+            match mlp.outputs[*i] {
+                Output::Column(column) => row.assign(&outputs.column(column)),
+                Output::Tied { scale, gate, row: read, .. } => row.assign(&(&posterior.mean[gate].row(read) * posterior.mean[scale][[0, 0]])),
+            }
+        }
+        let (root, decomposition, floor) = self.scaled(mlp, &surviving, &prior)?;
+        // `V_R^½ G_RK U_K` along `S`'s eigenvectors, each coordinate's column weighed by
+        // `c_r / (1 + c_r e_k)`, and back.
+        let mut right = fast_ab(&mlp.gram.select(Axis(0), &surviving).select(Axis(1), &deleted), &deleted_outputs);
+        for (mut row, r) in right.rows_mut().into_iter().zip(&root) {
+            row *= *r;
+        }
+        let mut projected = fast_atb(&decomposition.vectors, &right);
+        for (mut row, e) in projected.rows_mut().into_iter().zip(&decomposition.values) {
+            if *e > floor {
+                row.zip_mut_with(&curvature, |x, c| *x *= c / (1.0 + c * e));
+            } else {
+                row.fill(0.0);
+            }
+        }
+        let change = fast_ab(&decomposition.vectors, &projected);
+        let columns = surviving.iter().map(|i| match mlp.outputs[*i] {
+            Output::Column(column) => Some(column),
+            Output::Tied { .. } => None,
+        });
+        Ok(Some(Change { output: mlp.output, columns: columns.collect(), scales: root, rows: change }))
     }
 
     /// Per function alive at `posterior` with its own output column, its groups and the share of

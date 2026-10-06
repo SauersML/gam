@@ -926,6 +926,9 @@ pub fn round(
             Ok(groups)
         };
         let mut changes: BTreeMap<usize, f64> = BTreeMap::new();
+        // The last accepted proposal's trial: the searches return the length they last accepted,
+        // so it is the next posterior and is not solved again.
+        let mut kept: Option<(usize, Posterior)> = None;
         let mut test = |k: usize, kind: &str| -> Result<bool, String> {
             let timed = Instant::now();
             let groups = proposal(k)?;
@@ -945,11 +948,17 @@ pub fn round(
             }))?;
             evaluations.push((groups.len(), change / LN_2));
             changes.insert(k, change);
+            if change <= 0.0 {
+                kept = Some((k, proposed));
+            }
             Ok(change <= 0.0)
         };
         let accepted = if tail { gallop(rest.len(), true, &mut test)? } else { gallop_down(safe, &mut test)? };
         if accepted > 0 {
-            let next = trial(base, &proposal(accepted)?)?;
+            let next = match kept.take() {
+                Some((k, proposed)) if k == accepted => proposed,
+                _ => trial(base, &proposal(accepted)?)?,
+            };
             *posterior = next;
             current += changes[&accepted];
         }
