@@ -2097,9 +2097,9 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
 /// mask 1 (every subcomponent, the remainder dropped); VPD's causal-importance network made causal
 /// on that run's inputs to the sites; then `E` again with the network's masks (`own_causal_1` of
 /// [`vpd_mask_sources`]). It reads neither `M` nor later positions. Every parameter is described
-/// and fitted with its mean free (IVON, `β₁ = 0.99`, [`DevicePosterior::step`]'s length): the
+/// and fitted with its mean free (IVON, `β₁ = 0.99`, `DevicePosterior::step`'s length): the
 /// subcomponents' `U` and `V` with [`vpd_pricing`]'s groups (their deviations from `start`, a
-/// pricing posterior), and the network's weights with [`Charged`]'s groups (deviations from its
+/// pricing posterior), and the network's weights with `Charged`'s groups (deviations from its
 /// Laplace pass). The data term is `Σ_t KL(M ‖ P)` over the `train` sequences, and the gradient
 /// runs back through both passes: the masks' cotangents through the network to its replaced
 /// inputs and on into the all-on run. After the first epoch, every subcomponent whose masks were
