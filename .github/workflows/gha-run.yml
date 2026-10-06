@@ -38,7 +38,7 @@ on:
         description: "Examples to build, as PACKAGE:EXAMPLE words"
         default: ""
       tests:
-        description: "Test binaries to build, as PACKAGE:TEST words (installed as test-TEST)"
+        description: "Test binaries to build, as PACKAGE:TEST words (installed as test-TEST; TEST lib is the package's library unit tests)"
         default: ""
       command:
         description: "Shell command run at the commit after the build (empty: none)"
@@ -129,8 +129,10 @@ jobs:
           for w in $EXAMPLES; do cp "target/release/examples/${w#*:}" bin/; done
           for w in $TESTS; do
             pkg=${w%%:*} name=${w#*:}
-            exe=$(cargo test -p "$pkg" --test "$name" --no-run --message-format=json |
-              jq -r --arg n "$name" 'select(.reason == "compiler-artifact" and .executable != null and .target.name == $n) | .executable' | tail -n 1)
+            # TEST lib is the package's library unit tests (cargo's target name: the package's, - as _).
+            if [ "$name" = lib ]; then sel=(--lib) target=${pkg//-/_}; else sel=(--test "$name") target=$name; fi
+            exe=$(cargo test -p "$pkg" "${sel[@]}" --no-run --message-format=json |
+              jq -r --arg n "$target" 'select(.reason == "compiler-artifact" and .executable != null and .target.name == $n) | .executable' | tail -n 1)
             [ -n "$exe" ] || { echo "no test executable for $w"; exit 1; }
             cp "$exe" "bin/test-$name"
           done

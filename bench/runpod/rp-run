@@ -129,7 +129,8 @@
 # run's log and synced outputs unchanged for 15 minutes) and the last line of its run's log; then the account's spend,
 # its rate, the rate paid for GPUs under 20%, and the hours until the $150 cap at that rate.
 #
-# Binaries: the examples and test binaries (RP_TESTS="PACKAGE:TEST ...", run as $MPD_BIN/test-TEST) a
+# Binaries: the examples and test binaries (RP_TESTS="PACKAGE:TEST ...", run as $MPD_BIN/test-TEST;
+# TEST lib is the package's library unit tests, so one package's per run) a
 # run needs come from the prerelease rp-run-bin (assets KEY.NAME, KEY the hash of the commit's Rust
 # sources), which the pod downloads itself; what it lacks is built first on GitHub Actions
 # (gha-run bins, before any pod exists). Only when that fails does the run's first GPU pod build
@@ -2523,9 +2524,12 @@ compile_on_pod() {
     for x in "${ts[@]}"; do
         pkg=${x%%:*} name=${x#*:}
         say "building test $name (-p $pkg) at ${C:0:12}"
-        # The test executable cargo reports for the target, copied as test-NAME.
-        on_pod "source ~/.cargo/env && cd $WS/src && cargo test -q -p $pkg --test $name --no-run --message-format=json ${VCPU:+-j $VCPU} 2>> $WS/build.log |
-            python3 -c 'import json, sys; [print(m[\"executable\"]) for m in map(json.loads, sys.stdin) if m.get(\"reason\") == \"compiler-artifact\" and m.get(\"executable\") and m[\"target\"][\"name\"] == sys.argv[1]]' $name |
+        # The test executable cargo reports for the target, copied as test-NAME (NAME lib: the
+        # package's library unit tests, whose target is the package's name with - as _).
+        sel="--test $name" target=$name
+        [ "$name" != lib ] || { sel=--lib target=${pkg//-/_}; }
+        on_pod "source ~/.cargo/env && cd $WS/src && cargo test -q -p $pkg $sel --no-run --message-format=json ${VCPU:+-j $VCPU} 2>> $WS/build.log |
+            python3 -c 'import json, sys; [print(m[\"executable\"]) for m in map(json.loads, sys.stdin) if m.get(\"reason\") == \"compiler-artifact\" and m.get(\"executable\") and m[\"target\"][\"name\"] == sys.argv[1]]' $target |
             tail -n 1 | xargs -r -I{} cp {} $WS/bin/test-$name && [ -x $WS/bin/test-$name ]"
         case $? in
             0) made+=("test-$name") ;;
