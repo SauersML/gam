@@ -3377,6 +3377,25 @@ pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Exp
     Ok((removal, before, after))
 }
 
+/// The posterior a fresh fit starts from on `sequences` under `settings` ([`fit`]): the
+/// unit-information posterior at `M`'s values, its operators' rotations, and the Laplace start's
+/// deviations from one sampled-label pass (`laplace_start`).
+pub fn start_posterior(device: &Device, native: &OperatorProgram, explanation: &Explanation, sequences: &[Vec<u32>], settings: &Settings) -> Result<Posterior, String> {
+    settings.validate()?;
+    let length = sequences.first().map_or(0, Vec::len);
+    let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?;
+    let mut tokens = 0;
+    for draw in &draws {
+        tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
+    }
+    let mut posterior = Posterior::new(explanation, tokens)?;
+    posterior.rotations = rotations(&mut scorer, explanation, &posterior, sequences, settings)?;
+    let device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, None, 0)?;
+    laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens)?;
+    Ok(posterior)
+}
+
 /// Per group set of `sets`, removed from `posterior` alone, the changes of the data term and of
 /// the description in nats on the removal step's training collection at its weight samples,
 /// without compensation and with it (`library_compensation`): what a unit's prediction estimates.

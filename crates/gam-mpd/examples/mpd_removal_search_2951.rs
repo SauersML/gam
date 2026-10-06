@@ -6,7 +6,8 @@
 //! EXPORT SETTINGS.json CHECKPOINT OUT host|gpu
 //!
 //! `EXPORT` and `SETTINGS.json` are the fit's (`mpd_library_mdl_2951`, an engine export);
-//! `CHECKPOINT` is its `checkpoint.bin` (or a copy). `OUT` receives `REPORT.json`, the search's
+//! `CHECKPOINT` is its `checkpoint.bin` (or a copy), or `start` for the posterior a fresh fit starts
+//! from (`library_mdl::start_posterior`). `OUT` receives `REPORT.json`, the search's
 //! log (`ranked.removals.jsonl`) and `M`'s targets (`targets/`). With a sixth argument, group sets
 //! (`;` between sets, `,` between groups), each set is removed alone without and with compensation
 //! and the changes of the data term and the description go to `OUT/CHANGES.json` instead.
@@ -76,8 +77,13 @@ fn main() -> Result<(), String> {
     let native = split_sites(&imported.program)?;
     let layers = layer_nodes(&native, layer_count)?;
     let explanation = library_mdl::explanation(&native, &layers)?;
-    library_mdl::check_checkpoint(checkpoint, &library_mdl::identity(&settings.export_sha256, &native, &explanation, &train, held))?;
-    let start = library_mdl::checkpoint_posterior(&explanation, checkpoint)?;
+    // `start`: the posterior a fresh fit starts from, built here.
+    let start = if checkpoint == Path::new("start") {
+        library_mdl::start_posterior(&device, &native, &explanation, &train, &settings.fit)?
+    } else {
+        library_mdl::check_checkpoint(checkpoint, &library_mdl::identity(&settings.export_sha256, &native, &explanation, &train, held))?;
+        library_mdl::checkpoint_posterior(&explanation, checkpoint)?
+    };
     std::fs::create_dir_all(out).map_err(error)?;
     if let Some(sets) = sets {
         // Each listed group set removed alone, without and with compensation.
@@ -124,7 +130,7 @@ fn main() -> Result<(), String> {
         "export_sha256": settings.export_sha256,
         "settings_sha256": sha256(settings_path)?,
         "checkpoint": checkpoint.display().to_string(),
-        "checkpoint_sha256": sha256(checkpoint)?,
+        "checkpoint_sha256": if checkpoint.exists() { sha256(checkpoint)? } else { "start".into() },
         "device": device.name(),
         "source_revision": option_env!("GAM_BUILD_GIT_SHA"),
         "runs": runs,
