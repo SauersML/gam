@@ -1857,6 +1857,9 @@ impl Scorer {
         let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
         // Edits act on the starting library's parts, fixed through the fit: `M`'s targets for an
         // edit depend on them, and the experiments stay one fixed collection.
+        if settings.families.contains(&interchange::Family::CutConnection) {
+            return Err("library fit: cut_connection scores explanations and has no reverse pass to train them".into());
+        }
         if settings.families.iter().any(|f| *f != interchange::Family::Read) {
             experiments.set_parts(interchange::parts_of(&explanation.artifact.program, sites.len())?)?;
         }
