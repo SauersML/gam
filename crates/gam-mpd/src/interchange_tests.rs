@@ -590,9 +590,9 @@ impl BlockEngine for Counting<'_> {
         cotangent: &mut gam_gpu::tensor::Tensor,
         ranges: &[std::ops::Range<usize>],
         edits: Option<&Edits>,
-        gradient: &mut std::collections::BTreeMap<usize, gam_gpu::tensor::Tensor>,
+        sums: (&mut std::collections::BTreeMap<usize, gam_gpu::tensor::Tensor>, gam_gpu::tensor::Arithmetic),
     ) -> Result<(), String> {
-        self.model.reverse(block, tape, cotangent, ranges, edits, gradient)
+        self.model.reverse(block, tape, cotangent, ranges, edits, sums)
     }
 
     fn tape_bytes(tape: &DeviceTrace) -> usize {

@@ -708,6 +708,9 @@ pub trait BlockEngine {
         keep: bool,
     ) -> Result<Option<Self::Tape>, String>;
 
+    /// The reverse of block `block` from its tape, its products in `arithmetic` (a pass may run in
+    /// another precision than the forward pass that made the tape), adding `P`'s parameter
+    /// gradient into `gradient`.
     fn reverse(
         &self,
         block: usize,
@@ -715,7 +718,7 @@ pub trait BlockEngine {
         cotangent: &mut Tensor,
         ranges: &[Range<usize>],
         edits: Option<&Edits>,
-        gradient: &mut BTreeMap<usize, Tensor>,
+        sums: (&mut BTreeMap<usize, Tensor>, Arithmetic),
     ) -> Result<(), String>;
 
     /// The bytes a tape holds.
@@ -837,7 +840,7 @@ impl BlockEngine for Model<'_> {
         cotangent: &mut Tensor,
         ranges: &[Range<usize>],
         edits: Option<&Edits>,
-        gradient: &mut BTreeMap<usize, Tensor>,
+        (gradient, arithmetic): (&mut BTreeMap<usize, Tensor>, Arithmetic),
     ) -> Result<(), String> {
         let d = self.program.device();
         let seeds = BTreeMap::from([(self.end(block), gather(d, cotangent, ranges)?)]);
@@ -852,7 +855,6 @@ impl BlockEngine for Model<'_> {
                 None => Ok(()),
             }
         };
-        let arithmetic = self.program.arithmetic();
         let (nodes, gradients) = self.program.vjp_values_dense_edited(tape, seeds, &keep, &self.sites.trainable[block], arithmetic, &edited, &mut hook)?;
         for (op, g) in gradients {
             match gradient.get_mut(&op) {
@@ -1065,11 +1067,22 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
     Ok((stream, calls))
 }
 
+/// The products' precision of the sampled-label factor's reverse pass: bfloat16 on CUDA in f32
+/// storage (whose bfloat16 tensor cores run at least twice its f32 rate), else the forward's
+/// `arithmetic`. The factor is one label draw, whose square estimates the Gauss–Newton
+/// diagonal with a relative standard deviation near one per entry; bfloat16 operands move each
+/// entry by a few percent (`Interchange::fuse`), which adds about a percent to that variance. The
+/// data term's gradient, which IVON's mean follows, keeps the forward's arithmetic.
+fn factor_arithmetic(d: &Device, arithmetic: Arithmetic) -> Arithmetic {
+    if d.storage() == Storage::F32 && d.with_storage(Storage::Bf16).is_ok() { Arithmetic::Bf16 } else { arithmetic }
+}
+
 /// The reverse of [`run`] from the stream buffer's cotangent `cotangent` (rows of the paths'
 /// outputs): block by block backwards, each call's reverse with the patches' transposed edits
 /// (each source's part added into the source's row of the same call), then each fork's rows added
-/// into its parent's. Adds `P`'s parameter gradient into `gradient`; the calls' tapes stay.
-fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::Tape>], mut cotangent: Tensor, gradient: &mut BTreeMap<usize, Tensor>) -> Result<(), String> {
+/// into its parent's. Adds `P`'s parameter gradient into `gradient`; the calls' tapes stay. The
+/// blocks' products run in `arithmetic`.
+fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::Tape>], mut cotangent: Tensor, gradient: &mut BTreeMap<usize, Tensor>, arithmetic: Arithmetic) -> Result<(), String> {
     let d = engines[0].device();
     for (index, call) in calls.iter().enumerate().rev() {
         let b = call.block;
@@ -1096,7 +1109,7 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
                 &recomputed
             }
         };
-        engines[call.side].reverse(b, tape, &mut cotangent, &ranges, call.edits.as_ref(), gradient)?;
+        engines[call.side].reverse(b, tape, &mut cotangent, &ranges, call.edits.as_ref(), (&mut *gradient, arithmetic))?;
         // Once both sides of the block are reversed, the forks made there return their rows, the
         // later lanes first (a lane forked from a lane forked at the same block returns through it).
         if index == 0 || calls[index - 1].block != b {
@@ -1223,11 +1236,11 @@ impl BlockEngine for Engine<'_> {
         cotangent: &mut Tensor,
         ranges: &[Range<usize>],
         edits: Option<&Edits>,
-        gradient: &mut BTreeMap<usize, Tensor>,
+        sums: (&mut BTreeMap<usize, Tensor>, Arithmetic),
     ) -> Result<(), String> {
         match (self, tape) {
-            (Self::Program(m), EngineTape::Program(t)) => BlockEngine::reverse(m, block, t, cotangent, ranges, edits, gradient),
-            (Self::Fused(d), EngineTape::Fused(t)) => BlockEngine::reverse(*d, block, t, cotangent, ranges, edits, gradient),
+            (Self::Program(m), EngineTape::Program(t)) => BlockEngine::reverse(m, block, t, cotangent, ranges, edits, sums),
+            (Self::Fused(d), EngineTape::Fused(t)) => BlockEngine::reverse(*d, block, t, cotangent, ranges, edits, sums),
             _ => Err(error("a tape of another engine")),
         }
     }
@@ -1428,14 +1441,16 @@ pub fn evaluate_labelled<E: BlockEngine>(
         }
         if gradient {
             let seed = seed.ok_or_else(|| error("the head returned no cotangent"))?;
-            run_reverse([p, m], &plan, &calls, spread(&seed, 1.0 / std::f64::consts::LN_2)?, &mut total)?;
+            run_reverse([p, m], &plan, &calls, spread(&seed, 1.0 / std::f64::consts::LN_2)?, &mut total, arithmetic)?;
         }
     }
     let factor = match labels {
         Some(uniforms) => {
-            let seed = sampled_label_seed(d, &hidden, &head.resident.embedding, head.resident.tile_rows.max(1), uniforms, arithmetic)?;
+            // The label draw's logits, its seed and the pass in the factor's arithmetic.
+            let factor = factor_arithmetic(d, arithmetic);
+            let seed = sampled_label_seed(d, &hidden, &head.resident.embedding, head.resident.tile_rows.max(1), uniforms, factor)?;
             let mut u = BTreeMap::new();
-            run_reverse([p, m], &plan, &calls, spread(&seed, 1.0)?, &mut u)?;
+            run_reverse([p, m], &plan, &calls, spread(&seed, 1.0)?, &mut u, factor)?;
             Some(Factor { gradient: u, tokens: hidden.rows() })
         }
         None => None,
@@ -1734,7 +1749,7 @@ mod tests {
                 seed.row_mut(r).assign(&residual.dot(&embedding));
                 let cotangent = spread(&device, stream.rows(), &rows, &device.upload(seed.view()).expect("upload"), 1.0).expect("the seed");
                 let mut gradient = BTreeMap::new();
-                run_reverse([&p, &m], &plan, &calls, cotangent, &mut gradient).expect("the reverse pass");
+                run_reverse([&p, &m], &plan, &calls, cotangent, &mut gradient, p.arithmetic()).expect("the reverse pass");
                 for (op, g) in gradient {
                     let g = device.download(&g).expect("download");
                     let term = g.mapv(|v| prediction[c] * v * v);

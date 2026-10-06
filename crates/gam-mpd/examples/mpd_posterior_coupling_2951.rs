@@ -227,7 +227,7 @@ fn main() -> Result<(), String> {
                 at_outputs.insert(b / 2, d.download(&cotangent).map_err(error)?);
             }
             let tape = tapes.pop().ok_or("a block without its tape")?;
-            p.reverse(b, &tape, &mut cotangent, &ranges, None, &mut gradient)?;
+            p.reverse(b, &tape, &mut cotangent, &ranges, None, (&mut gradient, p.arithmetic()))?;
         }
         for (l, (m, s)) in mlps.iter().zip(&mut sums).enumerate() {
             let delta = &at_outputs[&l];

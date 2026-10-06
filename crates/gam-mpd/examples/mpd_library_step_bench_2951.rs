@@ -397,7 +397,7 @@ fn main() -> Result<(), String> {
                 let mut cotangent = device.copy(&stream).map_err(error)?;
                 timed(&device, s, "blocks_reverse", || {
                     for (b, tape) in tapes.iter().enumerate().rev() {
-                        p.reverse(b, tape, &mut cotangent, &ranges, None, &mut gradient)?;
+                        p.reverse(b, tape, &mut cotangent, &ranges, None, (&mut gradient, p.arithmetic()))?;
                     }
                     Ok(())
                 })?;

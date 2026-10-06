@@ -767,7 +767,7 @@ impl BlockEngine for Decoder {
         cotangent: &mut Tensor,
         ranges: &[Range<usize>],
         edits: Option<&Edits>,
-        gradient: &mut BTreeMap<usize, Tensor>,
+        (gradient, arithmetic): (&mut BTreeMap<usize, Tensor>, Arithmetic),
     ) -> Result<(), String> {
         self.edited(edits)?;
         let d = &self.device;
@@ -775,7 +775,7 @@ impl BlockEngine for Decoder {
         let mut g = self.gather(cotangent, ranges)?;
         let rows = g.rows();
         let mut g_read = d.empty(rows, self.width).map_err(error)?;
-        let (arithmetic, half) = (self.arithmetic, self.arithmetic == Arithmetic::Bf16);
+        let half = arithmetic == Arithmetic::Bf16;
         // A cotangent that feeds two products, rounded once in bfloat16.
         let operand = |t: Tensor| if half { d.bf16_copy(&t).map_err(error) } else { Ok(t) };
         match (&self.blocks[block], &tape.inner) {
@@ -914,7 +914,7 @@ mod tests {
             }
             let mut g = host.copy(&cotangent).unwrap();
             for (b, tape) in tapes.iter().enumerate().rev() {
-                reference.reverse(b, tape, &mut g, &ranges, None, &mut reference_gradient).unwrap();
+                reference.reverse(b, tape, &mut g, &ranges, None, (&mut reference_gradient, BlockEngine::arithmetic(&reference))).unwrap();
             }
         }
         {
@@ -925,7 +925,7 @@ mod tests {
             }
             let mut g = host.copy(&cotangent).unwrap();
             for (b, tape) in tapes.iter().enumerate().rev() {
-                decoder.reverse(b, tape, &mut g, &ranges, None, &mut decoder_gradient).unwrap();
+                decoder.reverse(b, tape, &mut g, &ranges, None, (&mut decoder_gradient, BlockEngine::arithmetic(&decoder))).unwrap();
             }
         }
         assert_eq!(reference_gradient.keys().collect::<Vec<_>>(), decoder_gradient.keys().collect::<Vec<_>>(), "the same operators receive gradients");
