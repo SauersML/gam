@@ -127,11 +127,11 @@
 //! `σ² = 1 / (N h + 1 / v_G)`. From the unit-information curvature `1 / v_G` instead, `h` fell by
 //! one e-fold per epoch toward the measured curvature, and `F` by a fixed 1.87e7 bits per epoch
 //! for 10 epochs (vpd4l, `N = 2^16`; 17 epochs at `2^24`). Under the approximation the data's
-//! `h ≥ 0`; a prior term's curvature (below) may take `h` below zero, and the step reads
-//! `h⁺ = max(h, 0)`. The approximated objective is stationary in `σ` at `σ = 1 / √(N (h⁺ + δ))`,
-//! `δ = 1 / (N v_G)` the group prior's precision per token, so `σ² ≤ v_G` (where the expected
-//! curvature is negative the Gaussian family has no stationary `σ`, and `σ² = v_G` is the
-//! prior's). That stationary point is implicit (`h` is an expectation under `q`, and `v_G` depends
+//! `h ≥ 0`; a prior term's curvature (below) may take `h` below zero. The approximated objective is
+//! stationary in `σ` at `σ² = 1 / (N h + 1 / v_G)` wherever that total precision is positive
+//! (`δ = 1 / (N v_G)` the group prior's precision per token: `σ² < v_G` for `h > 0`, `σ² > v_G`
+//! for `−δ < h < 0`); where it is not positive the Gaussian family has no stationary `σ`, and the
+//! step takes `σ² = v_G`, the prior's (the step reads `h⁺ = h` where `h + δ > 0`, else 0). That stationary point is implicit (`h` is an expectation under `q`, and `v_G` depends
 //! on `σ`); setting `σ` from the running `h` and the current `v_G` at every step is an online
 //! approximation to it, so `σ` has no step size. The mean moves along IVON's direction
 //! `d = G / (h₀⁺ + δ)`, `h₀` the curvature before the step's own Gauss–Newton draw enters it and
