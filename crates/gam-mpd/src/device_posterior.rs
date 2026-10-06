@@ -32,7 +32,7 @@ use crate::{
 };
 use gam_gpu::{
     gpu_error::GpuError,
-    tensor::{Arithmetic, Device, GroupMap, Op, PosteriorStep, Storage, Tensor},
+    tensor::{Device, GroupMap, PosteriorStep, Storage, Tensor},
 };
 use ndarray::Array2;
 use std::collections::BTreeMap;
@@ -158,44 +158,6 @@ pub struct DevicePosterior {
     /// `set_values` sends only the operators whose values differ in some bit (a removal trial
     /// changes a few operators of many).
     uploaded: Vec<Option<(Array2<f64>, Array2<f64>)>>,
-    /// Per operator its prior groups (sorted, once each), and the step's preconditioner along its
-    /// input axis where it has one ([`DevicePosterior::set_directions`]).
-    members: Vec<Vec<u32>>,
-    directions: Vec<Option<Direction>>,
-}
-
-/// The step's preconditioner along one operator's input axis (EKFAC's input side): `U` the
-/// eigenvectors of the input's second moment `Σ x xᵀ` (`library_mdl::input_factors`), and
-/// IVON's state along those axes (momentum, curvature, gradient second moment) for a second pass
-/// of the step's kernel there. The diagonal curvature `h` along the operator's own axes cannot see
-/// entries that move together: an MLP's output map, whose input is the functions' activations,
-/// shifts every function's output column by nearly one residual vector along the
-/// mean-activation direction, which the diagonal underprices about 1500× (toygate, one MLP
-/// block); the input's second moment has that direction as an eigenvector, so the curvature per
-/// entry along `U` prices it. The pass uses one prior precision for the whole operator, the mean
-/// `δ̄` of its groups' `1 / (N v_G)` (the groups' precisions are not diagonal along `U`): the
-/// step's length along the resulting direction is measured on the exact `F`
-/// ([`DevicePosterior::finish_line`]), so the preconditioner need only be positive definite.
-struct Direction {
-    /// `U_A` (columns × columns) and, where the output factor is known, `U_G` (rows × rows).
-    input: Tensor,
-    output: Option<Tensor>,
-    moments: [Tensor; 3],
-    groups: GroupMap,
-    variance: Tensor,
-    sums: Tensor,
-    /// 1 at the operator's live entries and 0 at removed ones (`s = −∞`): the direction mixes the
-    /// operator's axes, and a removed entry must stay at zero.
-    live: Tensor,
-    /// The step's buffers (rows × columns), allocated once: the turned gradient, draw and iterate,
-    /// the iterate before the pass, the deviations the pass writes, and two products' scratch.
-    gradient: Tensor,
-    draw: Tensor,
-    iterate: Tensor,
-    start: Tensor,
-    deviations: Tensor,
-    scratch: Tensor,
-    moved: Tensor,
 }
 
 /// Whether two host arrays hold the same values bit for bit (`-0.0` differs from `0.0`).
@@ -327,17 +289,6 @@ impl DevicePosterior {
             tokens,
             steps,
             uploaded: Vec::new(),
-            members: parts
-                .groups
-                .iter()
-                .map(|ids| {
-                    let mut unique = ids.clone();
-                    unique.sort_unstable();
-                    unique.dedup();
-                    unique
-                })
-                .collect(),
-            directions: Vec::new(),
         };
         out.average = out.mean.iter().map(|m| out.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
         out.refresh()?;
@@ -366,115 +317,7 @@ impl DevicePosterior {
         self.average = self.mean.iter().map(|m| self.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
         self.averaged = 0;
         self.line_state = None;
-        self.refresh_live()?;
         self.refresh()
-    }
-
-    /// The products' arithmetic in the fitting storage.
-    fn arithmetic(&self) -> Arithmetic {
-        if self.fitting.storage() == Storage::F64 { Arithmetic::F64 } else { Arithmetic::F32 }
-    }
-
-    /// Sets the step's preconditioner from `inputs` (per operator the eigenvectors `U_A` of its
-    /// input's second moment `A`, its columns' axis, and their eigenvalues `λ_A` per token) and
-    /// `outputs` (per operator the eigenvectors `U_G` and eigenvalues `λ_G` of its output-side
-    /// Gauss–Newton factor `G`, its rows' axis, where known): see [`Direction`]. The curvature in
-    /// the product basis starts at the Kronecker model's diagonal there, `h̃_rk = c λ_G,r λ_A,k`
-    /// (`λ_G = 1` and `U_G = I` without an output factor), with `c` matching the diagonal
-    /// curvature's total, `Σ h̃ = Σ h` (the diagonal `h_rj ≈ G_rr A_jj` sums to `tr G tr A`). The
-    /// momentum and the gradient's second moment start at zero. A resumed fit sets them afresh.
-    pub fn set_directions(&mut self, inputs: &[Option<std::sync::Arc<crate::library_mdl::InputFactor>>], outputs: &[Option<std::sync::Arc<crate::library_mdl::InputFactor>>]) -> Result<(), String> {
-        if inputs.len() != self.mean.len() || outputs.len() != self.mean.len() {
-            return Err(error("one input and one output factor per trainable operator required"));
-        }
-        self.directions = Vec::with_capacity(inputs.len());
-        for (i, (input, output)) in inputs.iter().zip(outputs).enumerate() {
-            let (rows, cols) = (self.mean[i].rows(), self.mean[i].cols());
-            let Some(input) = input.as_ref().filter(|f| f.vectors.dim() == (cols, cols) && f.values.len() == cols && f.values.iter().sum::<f64>() > 0.0) else {
-                self.directions.push(None);
-                continue;
-            };
-            let output = output.as_ref().filter(|f| f.vectors.dim() == (rows, rows) && f.values.len() == rows && f.values.iter().sum::<f64>() > 0.0);
-            let output_values: Vec<f64> = output.map_or_else(|| vec![1.0; rows], |f| f.values.clone());
-            let total: f64 = self.fitting.download(&self.moments[i][1]).map_err(error)?.sum();
-            let scale = total / (output_values.iter().sum::<f64>() * input.values.iter().sum::<f64>());
-            let curvature = self.fitting.upload(Array2::from_shape_fn((rows, cols), |(r, k)| scale * output_values[r] * input.values[k]).view()).map_err(error)?;
-            let zeros = || self.fitting.zeros(rows, cols).map_err(error);
-            self.directions.push(Some(Direction {
-                input: self.fitting.upload(input.vectors.view()).map_err(error)?,
-                output: output.map(|f| self.fitting.upload(f.vectors.view()).map_err(error)).transpose()?,
-                moments: [zeros()?, curvature, zeros()?],
-                groups: self.fitting.group_map(&vec![0; rows * cols], (rows, cols)).map_err(error)?,
-                variance: self.wide.zeros(1, 1).map_err(error)?,
-                sums: self.wide.zeros(1, 3).map_err(error)?,
-                live: zeros()?,
-                gradient: zeros()?,
-                draw: zeros()?,
-                iterate: zeros()?,
-                start: zeros()?,
-                deviations: zeros()?,
-                scratch: zeros()?,
-                moved: zeros()?,
-            }));
-        }
-        self.refresh_live()
-    }
-
-    /// Each preconditioned operator's live-entry mask from its log standard deviations.
-    fn refresh_live(&mut self) -> Result<(), String> {
-        for (i, direction) in self.directions.iter_mut().enumerate() {
-            let Some(direction) = direction else { continue };
-            let s = self.fitting.download(&self.log_sd[i]).map_err(error)?;
-            direction.live = self.fitting.upload(s.mapv(|x| if x == f64::NEG_INFINITY { 0.0 } else { 1.0 }).view()).map_err(error)?;
-        }
-        Ok(())
-    }
-
-    /// Operator `i`'s step direction preconditioned in the product basis of its factors, written
-    /// as the iterate `before − d` the line step reads its direction from: the step's kernel run a
-    /// second time on the turned gradient, Gauss–Newton draw and iterate (`U_Gᵀ x U_A`) with
-    /// IVON's state there and the operator's mean prior precision `δ̄`, its move `d̃` turned back
-    /// (`d = U_G d̃ U_Aᵀ`) and zero at removed entries ([`Direction`]). The buffers are the
-    /// direction's own: a step allocates nothing here.
-    fn precondition(&mut self, i: usize, before: &Tensor, (gradient, draw): (&Tensor, &Tensor), step: &PosteriorStep, variances: &[f64]) -> Result<(), String> {
-        let arithmetic = self.arithmetic();
-        let Some(direction) = self.directions.get_mut(i).and_then(Option::as_mut) else { return Ok(()) };
-        let precision: Vec<f64> = self.members[i].iter().map(|&g| variances[g as usize]).filter(|v| *v > 0.0).map(|v| 1.0 / (self.tokens * v)).collect();
-        if precision.is_empty() {
-            return Ok(());
-        }
-        let mean_precision = precision.iter().sum::<f64>() / precision.len() as f64;
-        direction.variance = self.wide.upload(Array2::from_elem((1, 1), 1.0 / (self.tokens * mean_precision)).view()).map_err(error)?;
-        let d = &self.fitting;
-        let Direction { input, output, moments, groups, variance, sums, live, gradient: along_gradient, draw: along_draw, iterate, start, deviations, scratch, moved } = direction;
-        // `out ← U_Gᵀ x U_A` (or `x U_A`).
-        let turn = |out: &mut Tensor, x: &Tensor, scratch: &mut Tensor| -> Result<(), String> {
-            match output.as_ref() {
-                Some(g) => {
-                    d.gemm(scratch, 1.0, x, Op::N, input, Op::N, 0.0, arithmetic).map_err(error)?;
-                    d.gemm(out, 1.0, g, Op::T, scratch, Op::N, 0.0, arithmetic).map_err(error)
-                }
-                None => d.gemm(out, 1.0, x, Op::N, input, Op::N, 0.0, arithmetic).map_err(error),
-            }
-        };
-        turn(along_gradient, gradient, scratch)?;
-        turn(along_draw, draw, scratch)?;
-        turn(iterate, before, scratch)?;
-        d.set_rows(start, 0, iterate).map_err(error)?;
-        let [momentum, curvature, power] = moments;
-        d.posterior_ivon((&mut *iterate, &mut *deviations), [momentum, curvature, power], (&*along_gradient, &*along_draw), (&*groups, &*variance), &mut *sums, step).map_err(error)?;
-        // `d̃ = start − iterate`, then `d = U_G d̃ U_Aᵀ` (or `d̃ U_Aᵀ`), masked.
-        d.axpy(start, -1.0, iterate).map_err(error)?;
-        match output.as_ref() {
-            Some(g) => {
-                d.gemm(scratch, 1.0, start, Op::N, input, Op::T, 0.0, arithmetic).map_err(error)?;
-                d.gemm(moved, 1.0, g, Op::N, scratch, Op::N, 0.0, arithmetic).map_err(error)?;
-            }
-            None => d.gemm(moved, 1.0, start, Op::N, input, Op::T, 0.0, arithmetic).map_err(error)?,
-        }
-        d.hadamard(scratch, moved, live, false).map_err(error)?;
-        d.set_rows(&mut self.mean[i], 0, before).map_err(error)?;
-        d.axpy(&mut self.mean[i], -1.0, scratch).map_err(error)
     }
 
     /// Operator `i`'s posterior means `μ̄` on the host.
@@ -691,10 +534,7 @@ impl DevicePosterior {
         let before: Vec<Tensor> = self.mean.iter().map(|m| self.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
         let mut sums: Vec<Tensor> = (0..5).map(|_| self.wide.zeros(self.group_count(), 3).map_err(error)).collect::<Result<_, _>>()?;
         let mut directions = Vec::with_capacity(before.len());
-        // The groups' prior precisions as the step's kernel reads them, for the preconditioner.
-        let variances = if self.directions.iter().any(Option::is_some) { self.variances()? } else { Vec::new() };
-        let operators = self.operators.clone();
-        for (i, &op) in operators.iter().enumerate() {
+        for (i, &op) in self.operators.iter().enumerate() {
             let zero = |given: Option<&Tensor>| -> Result<Option<Tensor>, String> {
                 match given {
                     Some(_) => Ok(None),
@@ -709,9 +549,6 @@ impl DevicePosterior {
             self.fitting
                 .posterior_ivon((&mut self.mean[i], &mut self.log_sd[i]), [momentum, curvature, power], (gradient, draw), (&self.groups[i], &self.variance), &mut self.sums, &step)
                 .map_err(error)?;
-            // Along the operator's input factor, where it has one, the direction is the
-            // preconditioned move; σ and h stay as the kernel set them along the own axes.
-            self.precondition(i, &before[i], (gradient, draw), &step, &variances)?;
             directions.push(self.line_terms(i, &before[i], (gradient, draw), &mut sums)?);
         }
         {
@@ -954,57 +791,6 @@ mod tests {
     /// variance is the empirical-Bayes value at the posterior mean `μ̄` (not at the iterate),
     /// stays within 10% of its start (the iterate-charged variance grew 35% per epoch on vpd4l), and the curvature-free entries' `μ̄` go to zero against the prior
     /// scale `√v_G`.
-    /// With the identity as an operator's input factor, the preconditioned direction is IVON's
-    /// own: the kernel's second pass along `U = I`, with the one group's precision and the same
-    /// starting state, repeats the first. With a rotation it differs.
-    #[test]
-    fn an_identity_input_factor_leaves_the_step_direction() {
-        const R: usize = 4;
-        const C: usize = 6;
-        let device = Device::host();
-        let mean = Array2::from_shape_fn((R, C), |(r, c)| 0.1 * (r as f64 - c as f64));
-        let log_sd = Array2::from_elem((R, C), -3.0);
-        let groups = vec![vec![0u32; R * C]];
-        let parts = Parts { operators: &[0], mean: std::slice::from_ref(&mean), log_sd: std::slice::from_ref(&log_sd), groups: &groups, count: 1 };
-        let ivon = Ivon { beta1: 0.9, beta2: 0.75 };
-        let turned = {
-            let (c, s) = (0.6_f64, 0.8_f64);
-            let mut u = Array2::<f64>::eye(C);
-            u[[0, 0]] = c;
-            u[[0, 1]] = -s;
-            u[[1, 0]] = s;
-            u[[1, 1]] = c;
-            u
-        };
-        let run = |factor: Option<Array2<f64>>| -> Vec<Array2<f64>> {
-            let mut posterior = DevicePosterior::from_parts(&device, &parts, 500.0, None, 0).unwrap();
-            if let Some(u) = factor {
-                // Eigenvalues whose Kronecker start equals the diagonal's: every entry of the
-                // starting curvature is the same, so `g_r λ_k = h_rk` along any `U`.
-                let values = vec![1.0; C];
-                posterior.set_directions(&[Some(std::sync::Arc::new(crate::library_mdl::InputFactor { vectors: u, values }))], &[None]).unwrap();
-            }
-            let mut iterates = Vec::new();
-            for t in 0..3u64 {
-                let gradient = Array2::from_shape_fn((R, C), |(r, c)| f64::from(posterior_normal(21, t, (r * C + c) as u64)));
-                let draw = Array2::from_shape_fn((R, C), |(r, c)| f64::from(posterior_normal(22, t, (r * C + c) as u64)));
-                let gradients = BTreeMap::from([(0, device.upload(gradient.view()).unwrap())]);
-                let draws = BTreeMap::from([(0, device.upload(draw.view()).unwrap())]);
-                posterior.step(&gradients, 0.01, (&draws, 0.01), &ivon).unwrap();
-                iterates.push(device.download(&posterior.mean[0]).unwrap());
-                posterior.settle_line(0.5, ivon.beta2).unwrap();
-            }
-            iterates
-        };
-        let (own, identity, rotated) = (run(None), run(Some(Array2::eye(C))), run(Some(turned)));
-        for (t, (a, b)) in own.iter().zip(&identity).enumerate() {
-            let gap = a.iter().zip(b).fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()));
-            assert!(gap <= 1e-12, "step {t}: the identity factor moved the direction by {gap}");
-        }
-        let moved = own.iter().zip(&rotated).skip(1).any(|(a, b)| a.iter().zip(b).any(|(x, y)| (x - y).abs() > 1e-9));
-        assert!(moved, "a rotated input factor left the direction unchanged");
-    }
-
     /// A line step on a quadratic data term `D(μ) = ½ a Σ (μ − t)²` (gradient `a (μ − t)` per
     /// token, measured exactly at the iterate) lands on the minimum along its direction of
     /// `D + Σ δ μ² / 2`: the parabola through the two measurements is exact.
