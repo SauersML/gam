@@ -17,6 +17,14 @@
 //! `library_mdl`'s (module note there): `KL(q_G ‖ p_G) = ½ (|G| ln v_G − Σ 2s)` at the
 //! empirical-Bayes variance `v_G`, whose prior precision per token `1 / (N v_G)` is IVON's weight
 //! decay.
+//!
+//! The posterior's mean is the Polyak average `μ̄` of IVON's iterate `μ` over about one epoch
+//! (`μ̄ ← μ̄ + w (μ − μ̄)`, `w = max(1/t, 1 − β₂)`, `t` the steps since the posterior was last set,
+//! `1 / (1 − β₂)` the epoch's batches): the steps move the iterate, sampled at `μ + σ ε`, while
+//! `v_G`, `KL(q_G ‖ p_G)`, the reported and checkpointed posterior and every evaluation take `μ̄`.
+//! The iterate's optimizer noise is not part of `q`: where the data's curvature is small,
+//! `σ² ≈ v_G`, and charging the iterate's random walk within `±σ` to `v_G = mean(μ² + σ²)` grew
+//! `v_G` without bound (vpd4l at `N = 2^16`: `Σ v_G` 356 → 1.4e4 over 12 epochs).
 
 use crate::{
     decoder::Decoder,
@@ -80,6 +88,15 @@ pub struct DevicePosterior {
     log_sd: Vec<Tensor>,
     moments: Vec<[Tensor; 3]>,
     groups: Vec<GroupMap>,
+    /// Per operator the posterior's mean `μ̄`, the Polyak average of the iterate `mean` over the
+    /// `averaged` steps since the posterior was last set, up to one epoch (module note).
+    average: Vec<Tensor>,
+    averaged: u64,
+    /// The A/B arms of the 2^16 comparison (`PosteriorStep::trust`, `PosteriorStep::split`, and
+    /// steps taken at the iterate itself, no weight noise); the A/B's outcome deletes them.
+    trust: f64,
+    split: bool,
+    deterministic: bool,
     /// Per group `(n, Σ μ² + σ², Σ 2s)` being summed, its variance and its divergence in nats.
     sums: Tensor,
     variance: Tensor,
@@ -203,6 +220,11 @@ impl DevicePosterior {
             log_sd: parts.log_sd.iter().map(up).collect::<Result<_, _>>()?,
             moments: moments.ok_or_else(|| error("no posterior state"))?.iter().map(|m| Ok([moment(&m[0])?, up(&m[1])?, up(&m[2])?])).collect::<Result<_, String>>()?,
             groups: parts.groups.iter().zip(&shapes).map(|(ids, shape)| master.group_map(ids, *shape).map_err(error)).collect::<Result<_, _>>()?,
+            average: Vec::new(),
+            averaged: 0,
+            trust: 1.0,
+            split: false,
+            deterministic: false,
             operators: parts.operators.to_vec(),
             fitting: fitting.clone(),
             wide,
@@ -215,16 +237,31 @@ impl DevicePosterior {
         let (placed, matrices) = crate::library_mdl::rotation_layout(parts.rotations);
         out.matrices = matrices.iter().map(|m| up(m)).collect::<Result<_, _>>()?;
         out.placed = placed;
+        out.average = out.mean.iter().map(|m| out.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
         out.refresh()?;
         Ok(out)
     }
 
-    /// The groups' variances and divergences from the posterior as it stands.
+    /// Sets the A/B arm: the mean's move clamped to `±trust σ`, the data momentum filtered alone
+    /// (`split`), and steps at the iterate without weight noise (`deterministic`).
+    pub fn set_arm(&mut self, trust: f64, split: bool, deterministic: bool) {
+        (self.trust, self.split, self.deterministic) = (trust, split, deterministic);
+    }
+
+    /// The groups' variances and divergences from the posterior as it stands, at its mean `μ̄`.
     fn refresh(&mut self) -> Result<(), String> {
-        for ((mean, log_sd), groups) in self.mean.iter().zip(&self.log_sd).zip(&self.groups) {
+        for ((mean, log_sd), groups) in self.average.iter().zip(&self.log_sd).zip(&self.groups) {
             self.fitting.group_moments((mean, log_sd), groups, &mut self.sums).map_err(error)?;
         }
         self.wide.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
+    }
+
+    /// The iterate set to the posterior's mean, the average restarted there, and the groups'
+    /// variances and divergences from it.
+    fn restart(&mut self) -> Result<(), String> {
+        self.average = self.mean.iter().map(|m| self.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
+        self.averaged = 0;
+        self.refresh()
     }
 
     /// The products' arithmetic in the fitting storage.
@@ -260,9 +297,9 @@ impl DevicePosterior {
         Ok(Some(out))
     }
 
-    /// Operator `i`'s means along its own axes, on the host.
+    /// Operator `i`'s posterior means `μ̄` along its own axes, on the host.
     fn host_mean(&self, i: usize) -> Result<Array2<f64>, String> {
-        let mean = self.fitting.download(&self.mean[i]).map_err(error)?;
+        let mean = self.fitting.download(&self.average[i]).map_err(error)?;
         Ok(match &self.rotations[i] {
             Some(r) => r.apply(&mean),
             None => mean,
@@ -292,7 +329,7 @@ impl DevicePosterior {
     /// Trainable operator `op`'s position, and its means and log standard deviations.
     fn entries(&self, op: usize) -> Result<(usize, &Tensor, &Tensor), String> {
         let i = self.operators.iter().position(|o| *o == op).ok_or_else(|| error(format!("operator {op} is not trainable")))?;
-        Ok((i, &self.mean[i], &self.log_sd[i]))
+        Ok((i, &self.average[i], &self.log_sd[i]))
     }
 
     /// Trainable operator `op`'s weight sample of `key` (the draws [`DevicePosterior::sample_into`]
@@ -301,7 +338,13 @@ impl DevicePosterior {
     /// An operator with a rotation is sampled along its rotated axes, turned to its own, and written
     /// whole.
     pub fn sample_block(&self, op: usize, out: &mut Tensor, at: (usize, usize), key: u64) -> Result<(), String> {
-        let (i, mean, log_sd) = self.entries(op)?;
+        self.block_of(op, out, at, key, &self.average)
+    }
+
+    /// [`DevicePosterior::sample_block`] around `means` (the posterior's `μ̄` or the iterate).
+    fn block_of(&self, op: usize, out: &mut Tensor, at: (usize, usize), key: u64, means: &[Tensor]) -> Result<(), String> {
+        let (i, _, log_sd) = self.entries(op)?;
+        let mean = &means[i];
         if self.placed[i].is_none() {
             return self.fitting.reparameterize_block(out, at, (mean, log_sd), (key, i as u64)).map_err(error);
         }
@@ -341,11 +384,17 @@ impl DevicePosterior {
 
     /// Writes the posterior means into `program`'s trainable operators and their stacks.
     pub fn mean_into(&self, program: &mut DeviceProgram) -> Result<(), String> {
+        self.means_into(program, &self.average)
+    }
+
+    /// Writes `means` (the posterior's `μ̄` or the iterate) into `program`'s trainable operators
+    /// and their stacks.
+    fn means_into(&self, program: &mut DeviceProgram, means: &[Tensor]) -> Result<(), String> {
         for (i, &op) in self.operators.iter().enumerate() {
             // A program holding the operator in bfloat16 (`DeviceProgram::hold_bf16`) gets it so.
             let bf16 = program.dense(op).is_ok_and(|held| held.storage() == Storage::Bf16);
-            let rotated = self.applied(i, &self.mean[i])?;
-            let mean = rotated.as_ref().unwrap_or(&self.mean[i]);
+            let rotated = self.applied(i, &means[i])?;
+            let mean = rotated.as_ref().unwrap_or(&means[i]);
             let value = if bf16 { self.fitting.bf16_copy(mean) } else { self.fitting.copy(mean) };
             program.replace_dense_parameter(op, value.map_err(error)?)?;
         }
@@ -358,15 +407,15 @@ impl DevicePosterior {
     /// deviation's grid: the decoder reads the operator's own values.
     pub fn rounded_into(&self, program: &mut DeviceProgram) -> Result<(), String> {
         for (i, &op) in self.operators.iter().enumerate() {
-            let mut rounded = self.fitting.empty(self.mean[i].rows(), self.mean[i].cols()).map_err(error)?;
+            let mut rounded = self.fitting.empty(self.average[i].rows(), self.average[i].cols()).map_err(error)?;
             match &self.rotations[i] {
                 Some(rotation) => {
-                    let mean = self.applied(i, &self.mean[i])?.ok_or_else(|| error("a rotation lost"))?;
+                    let mean = self.applied(i, &self.average[i])?.ok_or_else(|| error("a rotation lost"))?;
                     let variances = rotation.marginal(&self.fitting.download(&self.log_sd[i]).map_err(error)?.mapv(|s| (2.0 * s).exp()));
                     let log_sd = self.fitting.upload(variances.mapv(|v| 0.5 * v.ln()).view()).map_err(error)?;
                     self.fitting.round_to_deviation(&mut rounded, (&mean, &log_sd)).map_err(error)?;
                 }
-                None => self.fitting.round_to_deviation(&mut rounded, (&self.mean[i], &self.log_sd[i])).map_err(error)?,
+                None => self.fitting.round_to_deviation(&mut rounded, (&self.average[i], &self.log_sd[i])).map_err(error)?,
             }
             let bf16 = program.dense(op).is_ok_and(|held| held.storage() == Storage::Bf16);
             let value = if bf16 { self.fitting.bf16_copy(&rounded).map_err(error)? } else { rounded };
@@ -381,11 +430,23 @@ impl DevicePosterior {
     /// stack gets the same draws written straight into its blocks
     /// (`DeviceProgram::refresh_fused_with`), not restacked from the operators.
     pub fn sample_into(&self, program: &mut DeviceProgram, key: u64) -> Result<(), String> {
+        self.sample_of(program, key, &self.average)
+    }
+
+    /// The point a step's gradient is taken at, into `program`: the iterate's weight sample of
+    /// `key` (`μ + σ ε`, the draws of [`DevicePosterior::sample_into`] around the iterate rather
+    /// than `μ̄`), or the iterate itself in the deterministic arm.
+    pub fn iterate_into(&self, program: &mut DeviceProgram, key: u64) -> Result<(), String> {
+        if self.deterministic { self.means_into(program, &self.mean) } else { self.sample_of(program, key, &self.mean) }
+    }
+
+    /// [`DevicePosterior::sample_into`] around `means`.
+    fn sample_of(&self, program: &mut DeviceProgram, key: u64, means: &[Tensor]) -> Result<(), String> {
         for (i, &op) in self.operators.iter().enumerate() {
-            let parts = (&self.mean[i], &self.log_sd[i]);
+            let parts = (&means[i], &self.log_sd[i]);
             if self.placed[i].is_some() {
                 // The sample along the rotated axes, then along the operator's own.
-                let mut rotated = self.fitting.zeros(self.mean[i].rows(), self.mean[i].cols()).map_err(error)?;
+                let mut rotated = self.fitting.zeros(means[i].rows(), means[i].cols()).map_err(error)?;
                 self.fitting.reparameterize(&mut rotated, parts, (key, i as u64)).map_err(error)?;
                 let theta = self.applied(i, &rotated)?.ok_or_else(|| error("a rotation lost"))?;
                 match program.dense_mut(op) {
@@ -395,7 +456,7 @@ impl DevicePosterior {
             } else if let Ok(theta) = program.dense_mut(op) {
                 self.fitting.reparameterize(theta, parts, (key, i as u64)).map_err(error)?;
             } else {
-                let (rows, cols) = (self.mean[i].rows(), self.mean[i].cols());
+                let (rows, cols) = (means[i].rows(), means[i].cols());
                 let mut theta = self.fitting.zeros(rows, cols).map_err(error)?;
                 self.fitting.reparameterize(&mut theta, parts, (key, i as u64)).map_err(error)?;
                 program.replace_dense_parameter(op, theta)?;
@@ -405,7 +466,7 @@ impl DevicePosterior {
             if !self.operators.contains(&op) {
                 return Ok(false);
             }
-            self.sample_block(op, stack, at, key)?;
+            self.block_of(op, stack, at, key, means)?;
             Ok(true)
         })
     }
@@ -444,13 +505,24 @@ impl DevicePosterior {
             // Along the rotated axes, where the posterior is held.
             let (rotated_gradient, rotated_draw) = (self.undone(i, gradient)?, self.undone(i, draw)?);
             let (gradient, draw) = (rotated_gradient.as_ref().unwrap_or(gradient), rotated_draw.as_ref().unwrap_or(draw));
-            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, rate: ivon.rate, beta1: ivon.beta1, beta2: ivon.beta2, step: self.steps };
+            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, rate: ivon.rate, beta1: ivon.beta1, beta2: ivon.beta2, step: self.steps, trust: self.trust, split: self.split };
             let [momentum, curvature, power] = &mut self.moments[i];
             self.fitting
                 .posterior_ivon((&mut self.mean[i], &mut self.log_sd[i]), [momentum, curvature, power], (gradient, draw), (&self.groups[i], &self.variance), &mut self.sums, &step)
                 .map_err(error)?;
         }
-        self.wide.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
+        // The posterior's mean: the iterate's Polyak average, uniform over the steps since the
+        // posterior was set and then over about one epoch (module note).
+        self.averaged += 1;
+        let weight = (1.0 / self.averaged as f64).max(1.0 - ivon.beta2);
+        for (average, mean) in self.average.iter_mut().zip(&self.mean) {
+            let mut difference = self.fitting.copy(mean).map_err(error)?;
+            self.fitting.axpy(&mut difference, -1.0, average).map_err(error)?;
+            self.fitting.axpy(average, weight, &difference).map_err(error)?;
+        }
+        // The groups' variances and divergences at `μ̄`, not at the iterate the step summed.
+        self.sums = self.wide.zeros(self.sums.rows(), 3).map_err(error)?;
+        self.refresh()
     }
 
     /// The number of prior groups.
@@ -474,7 +546,7 @@ impl DevicePosterior {
             // The draw along the operator's rotated axes, where its means and deviations live
             // (`u · μ` is the same along either; `Σ u² σ²` is a sum along the rotated axes).
             let rotated = self.undone(i, draw)?;
-            self.fitting.group_curvature((rotated.as_ref().unwrap_or(draw), &self.mean[i], &self.log_sd[i]), &self.groups[i], &mut sums).map_err(error)?;
+            self.fitting.group_curvature((rotated.as_ref().unwrap_or(draw), &self.average[i], &self.log_sd[i]), &self.groups[i], &mut sums).map_err(error)?;
         }
         for (g, row) in self.wide.download(&sums).map_err(error)?.rows().into_iter().enumerate() {
             curvature.quadratic[g] += weight * row[1] * row[1];
@@ -496,7 +568,7 @@ impl DevicePosterior {
             let Some(gradient) = g.get(op) else { continue };
             // Along the rotated axes, where the means live (`g · μ` is the same along either).
             let rotated = self.undone(i, gradient)?;
-            self.fitting.group_curvature((rotated.as_ref().unwrap_or(gradient), &self.mean[i], &self.log_sd[i]), &self.groups[i], &mut sums).map_err(error)?;
+            self.fitting.group_curvature((rotated.as_ref().unwrap_or(gradient), &self.average[i], &self.log_sd[i]), &self.groups[i], &mut sums).map_err(error)?;
         }
         for (at, row) in self.wide.download(&sums).map_err(error)?.rows().into_iter().enumerate() {
             curvature.slope[at] += weight * row[1];
@@ -570,10 +642,10 @@ impl DevicePosterior {
             self.mean[i] = self.fitting.upload(mean.view()).map_err(error)?;
             self.log_sd[i] = self.fitting.upload(posterior.log_sd[i].view()).map_err(error)?;
         }
-        self.refresh()
+        self.restart()
     }
 
-    /// Trainable operator `i`'s `μ` and `s` on the host.
+    /// Trainable operator `i`'s `μ̄` and `s` on the host.
     pub fn values(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>), String> {
         Ok((self.host_mean(i)?, self.fitting.download(&self.log_sd[i]).map_err(error)?))
     }
@@ -595,7 +667,7 @@ impl DevicePosterior {
     pub fn operator(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>, [Array2<f64>; 3]), String> {
         let down = |t: &Tensor| self.fitting.download(t).map_err(error);
         let m = self.moments.get(i).ok_or_else(|| error("no such trainable operator"))?;
-        Ok((down(&self.mean[i])?, down(&self.log_sd[i])?, [down(&m[0])?, down(&m[1])?, down(&m[2])?]))
+        Ok((down(&self.average[i])?, down(&self.log_sd[i])?, [down(&m[0])?, down(&m[1])?, down(&m[2])?]))
     }
 
     /// The means as the device holds them (along each operator's rotated axes), restored exactly
@@ -607,7 +679,59 @@ impl DevicePosterior {
         for (mean, values) in self.mean.iter_mut().zip(held) {
             *mean = self.fitting.upload(values.view()).map_err(error)?;
         }
-        self.refresh()
+        self.restart()
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gam_gpu::tensor::posterior_normal;
+
+    /// One prior group of 64 entries at `N = 2^16`: 32 without data curvature whose gradient is
+    /// pure noise of standard deviation `s` per step, starting at `μ = 0.05`, and 32 with
+    /// curvature `h` and data term `½ h (θ − a)²`. Over 3000 steps (`β₂ = 1 − 1/64`) the group's
+    /// variance is the empirical-Bayes value at the posterior mean `μ̄` (not at the iterate),
+    /// stays below its start, and the curvature-free entries' `μ̄` go to zero against the prior
+    /// scale `√v_G`.
+    #[test]
+    fn the_variance_is_charged_at_the_averaged_mean_and_stays_bounded() {
+        const R: usize = 64;
+        let device = Device::host();
+        let tokens = 65_536.0;
+        let free = |i: usize| i < R / 2;
+        let a = Array2::from_shape_fn((1, R), |(_, i)| if free(i) { 0.05 } else { 0.1 * f64::from(posterior_normal(5, 0, i as u64)) });
+        let v0 = a.iter().map(|x| x * x).sum::<f64>() / R as f64;
+        let h = 1.0 / (tokens * v0);
+        let log_sd = Array2::from_shape_fn((1, R), |(_, i)| if free(i) { 0.5 * v0.ln() } else { -0.5 * (tokens * (h + 1.0 / (tokens * v0))).ln() });
+        let groups = vec![vec![0u32; R]];
+        let parts = Parts { operators: &[0], mean: std::slice::from_ref(&a), log_sd: std::slice::from_ref(&log_sd), groups: &groups, count: 1, rotations: &[None] };
+        let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens, None, 0).unwrap();
+        let start = posterior.variances().unwrap()[0];
+        let ivon = Ivon { rate: 0.1, beta1: 0.9, beta2: 1.0 - 1.0 / 64.0 };
+        let s = 1e-4;
+        let factor = device.upload(Array2::from_shape_fn((1, R), |(_, i)| if free(i) { 0.0 } else { h.sqrt() }).view()).unwrap();
+        let mut largest: f64 = 0.0;
+        for t in 1..=3000u64 {
+            let (mean, log_sd) = posterior.values(0).unwrap();
+            let gradient = Array2::from_shape_fn((1, R), |(_, i)| {
+                let noise = s * f64::from(posterior_normal(12, t, i as u64));
+                if free(i) { noise } else { h * (mean[(0, i)] + log_sd[(0, i)].exp() * f64::from(posterior_normal(11, t, i as u64)) - a[(0, i)]) + noise }
+            });
+            let gradients = BTreeMap::from([(0, device.upload(gradient.view()).unwrap())]);
+            let factors = BTreeMap::from([(0, device.copy(&factor).unwrap())]);
+            posterior.step(&gradients, 1.0, (&factors, 1.0), &ivon).unwrap();
+            largest = largest.max(posterior.variances().unwrap()[0]);
+        }
+        let (mean, log_sd) = posterior.values(0).unwrap();
+        let v = posterior.variances().unwrap()[0];
+        let charged = mean.iter().zip(&log_sd).map(|(m, s)| m * m + (2.0 * s).exp()).sum::<f64>() / R as f64;
+        assert!((v - charged).abs() <= 1e-9 * v, "v_G {v} against mean(μ̄² + σ²) {charged}");
+        let iterate = device.download(&posterior.mean[0]).unwrap();
+        assert!(iterate.iter().zip(&mean).any(|(x, y)| x != y), "the iterate is its own average");
+        assert!(largest <= start, "v_G rose from {start} to {largest}");
+        let spread = ((0..R / 2).map(|i| mean[(0, i)] * mean[(0, i)]).sum::<f64>() / (R / 2) as f64).sqrt();
+        assert!(spread <= 0.1 * v.sqrt(), "curvature-free μ̄ at rms {spread} against √v_G {}", v.sqrt());
+    }
 }

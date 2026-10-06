@@ -1307,6 +1307,17 @@ pub struct Settings {
     /// the same fit. The gate's outcome deletes one of the two engines and this field.
     #[serde(default)]
     pub decoder: bool,
+    /// The A/B arms at `N = 2^16` (`DevicePosterior::set_arm`): the mean's move clamped to `±α σ`
+    /// in place of `±σ`; the data momentum filtered alone with `δ μ` added exactly (98386f5d88's
+    /// step); and every step's gradient taken at the iterate itself, with no weight noise, `σ` from
+    /// the Gauss–Newton curvature as before and `F` measured at the posterior's samples. The A/B's
+    /// outcome deletes these fields.
+    #[serde(default)]
+    pub trust_rate: bool,
+    #[serde(default)]
+    pub split_filter: bool,
+    #[serde(default)]
+    pub deterministic: bool,
 }
 
 impl Settings {
@@ -1713,9 +1724,12 @@ impl Scorer {
         targets: &Targets,
         gradient: bool,
     ) -> Result<(Vec<Vec<f64>>, BTreeMap<usize, Tensor>, Option<interchange::Factor>), String> {
-        match sample {
-            Some(seed) => posterior.sample_into(self.experiments.explanation_mut(), seed)?,
-            None => posterior.mean_into(self.experiments.explanation_mut())?,
+        // A step's gradient is taken around the iterate; every evaluation around the posterior's
+        // mean `μ̄` (`DevicePosterior`'s module note).
+        match (sample, gradient) {
+            (Some(seed), true) => posterior.iterate_into(self.experiments.explanation_mut(), seed)?,
+            (Some(seed), false) => posterior.sample_into(self.experiments.explanation_mut(), seed)?,
+            (None, _) => posterior.mean_into(self.experiments.explanation_mut())?,
         }
         let labels = match (gradient, sample) {
             (true, Some(seed)) => Some(uniforms(seed, batch, experiments)),
@@ -2776,6 +2790,8 @@ pub fn fit_from(
     let resumed_seconds = progress.seconds;
     let fresh = resumed.is_none();
     let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, resumed.as_deref(), u64::try_from(progress.step).map_err(error)?)?;
+    let arm = (if settings.trust_rate { settings.rate } else { 1.0 }, settings.split_filter, settings.deterministic);
+    device_posterior.set_arm(arm.0, arm.1, arm.2);
     drop(resumed);
     // A resumed fit holds exactly the device's means of the checkpoint.
     if let Some(held) = held_means.take() {
@@ -2785,6 +2801,7 @@ pub fn fit_from(
         let timed = Instant::now();
         let moments = laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens)?;
         device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, Some(&moments), 0)?;
+        device_posterior.set_arm(arm.0, arm.1, arm.2);
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
     // The curvature estimate averages over one epoch's batches: each batch weighs about once.
@@ -2963,23 +2980,18 @@ pub fn fit_from(
         progress.epochs.push(record);
         progress.previous = Some(estimates);
         progress.epoch += 1;
-        // Converged when the improvement is within its standard error either way: an epoch that
-        // raised `F` by more than its standard error is a move, not a fixed point.
-        let converged = matches!((improvement, standard_error), (Some(i), Some(se)) if i.abs() <= se);
-        // An epoch that raised `F` by more than its standard error ends the descent at the best
-        // epoch: the posterior goes back to it and the removal round starts from there.
-        let worse = matches!((improvement, standard_error), (Some(i), Some(se)) if i < -se);
-        if worse {
+        // The descent stops at the first epoch whose mean improvement over the last, paired batch
+        // by batch, is not positive, and the removal round starts from the best epoch's
+        // posterior (the lowest mean per-batch estimate since the objective last changed).
+        if best.as_ref().is_none_or(|(b, _)| mean_estimate < *b) {
+            best = Some((mean_estimate, posterior.clone()));
+        }
+        if improvement.is_some_and(|i| i <= 0.0) {
             if let Some((bits, kept)) = best.take() {
-                log::info!("library fit epoch {epoch} raised F: back to the best epoch's posterior ({:.6e} bits)", bits / LN_2);
+                log::info!("library fit stops after epoch {epoch}: back to the best epoch's posterior ({:.6e} bits)", bits / LN_2);
                 posterior = kept;
                 device_posterior.set_values(&posterior)?;
             }
-        } else if best.as_ref().is_none_or(|(b, _)| mean_estimate < *b) {
-            best = Some((mean_estimate, posterior.clone()));
-        }
-        if converged || worse {
-            best = None;
             let log = checkpoint.map(|path| path.with_extension("removals.jsonl"));
             let evidence = Evidence { draws: &draws, sequences, settings };
             let removal = remove(&mut scorer, &mut device_posterior, &mut posterior, &evidence, explanation, prior.as_deref_mut(), log.as_deref())?;
@@ -3677,6 +3689,9 @@ mod tests {
             numeric_bytes: 1 << 26,
             head_tile_rows: 64,
             decoder: false,
+            trust_rate: false,
+            split_filter: false,
+            deterministic: false,
         }
     }
 
