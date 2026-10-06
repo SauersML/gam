@@ -1311,8 +1311,8 @@ pub struct Settings {
     /// in place of `±σ`; the A/B's outcome deletes it or `line_search`.
     #[serde(default)]
     pub trust_rate: bool,
-    /// The line arm: each step moves to the Gauss–Newton line minimum along IVON's direction, in
-    /// place of the step `α` (`DevicePosterior::line_step`).
+    /// The line arm: each step moves to the minimum along IVON's full direction of the batch's `F`,
+    /// measured at a trial step, in place of the step `α` (`DevicePosterior::finish_line`).
     #[serde(default)]
     pub line_search: bool,
     /// The half-factor arm: a training step draws the Gauss–Newton factor from its first
@@ -1827,6 +1827,26 @@ fn antithetic_step(
     }
     bits.extend(other_bits);
     Ok((first.into_iter().chain(second).collect(), bits, gradients, factor))
+}
+
+/// The bits of `experiments` on `batch` at the iterate's weight samples of the step `key`, as
+/// [`antithetic_step`] draws them (the first half of the bases at `key`, the second at its
+/// negation), with no gradient: a line step's trial (`DevicePosterior::finish_line`).
+fn line_trial_bits(scorer: &mut Scorer, posterior: &DevicePosterior, batch: &Batch, experiments: &[Experiment], (key, one_sample): (u64, bool)) -> Result<f64, String> {
+    let half = batch.base.len() / 2;
+    let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.iter().cloned().partition(|e| e.base < half);
+    let halves = if one_sample || first.is_empty() || second.is_empty() { vec![(experiments.to_vec(), key)] } else { vec![(first, key), (second, key ^ gam_gpu::tensor::ANTITHETIC)] };
+    let mut total = 0.0;
+    for (part, seed) in halves {
+        let targets = scorer.experiments.targets(batch, &part)?;
+        posterior.iterate_into(scorer.experiments.explanation_mut(), seed)?;
+        let evaluation = scorer.experiments.evaluate_labelled(batch, &part, Some(&targets), false, None)?;
+        if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
+            return Err("nonfinite explanation divergence".into());
+        }
+        total += evaluation.bits.iter().flatten().sum::<f64>();
+    }
+    Ok(total)
 }
 
 /// A running mean of bits over scored tokens.
@@ -3012,6 +3032,17 @@ pub fn fit_from(
             priors.push(prior_nats);
             progress.step += 1;
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, weight), &ivon)?;
+            if let Some(trial) = device_posterior.line_trial() {
+                // The line step's trial: the batch's data term at the same draws around the iterate
+                // moved by the trial step (`DevicePosterior::finish_line`).
+                let trial_bits = line_trial_bits(&mut scorer, &device_posterior, &batch, &experiments, (key, settings.one_sample))?;
+                let zero_bits: f64 = bits.iter().flatten().sum();
+                let line = device_posterior.finish_line(weight * LN_2 * zero_bits, weight * LN_2 * trial_bits, ivon.beta2)?;
+                log::info!(
+                    "library line step {epoch}.{b}: η {:.4e} (trial {trial:.4e}); data curvature along d per token: measured {:.4e}, one Gauss–Newton draw {:.4e}, diagonal Σ h d² {:.4e}",
+                    line.eta, line.measured, line.draw, line.diagonal
+                );
+            }
             let prior_note = if prior.is_some() { format!(" (prior: {prior_seconds:.3} s)") } else { String::new() };
             log::info!("library step {epoch}.{b}: {:.6} bits per scored token, {:.2} s{prior_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
         }
@@ -4044,7 +4075,7 @@ mod tests {
             for (b, draw) in draws.iter().enumerate() {
                 let batch = draw.batch(&sequences).unwrap();
                 let experiments = scorer.experiments(draw, &sequences).unwrap();
-                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, (training_key(settings.seed, b), settings.half_factor)).unwrap();
+                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, (training_key(settings.seed, b), settings.half_factor, settings.one_sample)).unwrap();
                 estimates.push(bits.iter().flatten().sum::<f64>());
             }
             estimates
