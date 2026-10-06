@@ -721,7 +721,7 @@ fn operations_on_shared_sites_are_the_same_on_both_models() {
     let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
     x.set_directions(8, 1);
     x.measure_typical(&batch).expect("the typical norms");
-    let families = [Family::Swap, Family::Zero, Family::Scale, Family::Push];
+    let families = [Family::Swap, Family::Zero, Family::Scale, Family::Push, Family::Cut];
     let experiments = x.sample_ops(&mut rand::rngs::StdRng::seed_from_u64(3), &batch, &families, 12, &[1, 2, 0], false).expect("the draw");
     let counts = census(&experiments, x.variables());
     assert!(families.iter().all(|f| counts[format!("{f:?}").to_lowercase().as_str()] > 0), "{counts:?}");

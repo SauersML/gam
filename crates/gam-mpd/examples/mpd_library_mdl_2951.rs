@@ -383,6 +383,7 @@ fn edit_faithfulness(
         Some(interchange::Patch::Ops { family: interchange::Family::Zero, .. }) => "zero",
         Some(interchange::Patch::Ops { family: interchange::Family::Scale, .. }) => "scale",
         Some(interchange::Patch::Ops { family: interchange::Family::Push, .. }) => "push",
+        Some(interchange::Patch::Ops { family: interchange::Family::Cut, .. }) => "cut",
         Some(interchange::Patch::FixedPart { factor: 0, .. }) => "remove_subcomponent",
         Some(interchange::Patch::FixedPart { .. }) => "amplify_subcomponent",
         Some(_) => "read",
