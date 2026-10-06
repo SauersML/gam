@@ -23,17 +23,18 @@
 //!    expects to save (`library_bodies::regions`, which lists every candidate; the others are
 //!    recorded and not proposed). That search evaluates on the order of `n⁴` unions of an MLP's `n`
 //!    functions, so at a model's width only the regions through a head are proposed;
-//! 3. every region is rewritten as a call of its own body from the same start
-//!    (`library_bodies::rewrite`), a region through a head reading through it
-//!    (`library_crossing::read_through`), and fitted (OUT/rewritten);
-//! 4. reuse by gradient: the library is fitted with the mixture prior over bodies
-//!    (`library_bodies::BodyMixture`; OUT/soft{n}), each dominant component is compiled by a merge
-//!    (`library_bodies::merge`), and the merged library is fitted (OUT/merged{n}) and kept when its
-//!    `F` is below the extraction's so far; repeated while a merge is kept;
-//! 5. the extraction with its reuse is accepted when its final `F` is below the base's. An
-//!    extraction that pays only through the reuse it enables is one proposal with that reuse, so a
-//!    costlier intermediate step does not end the search. A rejection means this search found no
-//!    better description, not that none exists.
+//! 3. extract-and-reuse, one transaction per proposal (OUT/t{n}): the child is the accepted
+//!    explanation with the proposal made, fitted, and accepted when its `F` is below the accepted
+//!    one's; a rejection does not end the search. Proposals in order: two regions whose bodies
+//!    align with evidence (each extracted alone, `library_bodies::align`, by their fit statistic),
+//!    extracted together as one body called at both sites (`library_bodies::rewrite`, a region
+//!    through a head reading through it, `library_crossing::read_through`, then
+//!    `library_bodies::merge`); then each region left as a call of an accepted body it aligns to;
+//!    then each region left as its own body. An extraction that pays only through the reuse it
+//!    enables is proposed with that reuse, so a costlier intermediate never ends the search;
+//! 4. reuse by gradient among the accepted bodies: the fit with the mixture prior over bodies
+//!    (`library_bodies::BodyMixture`; OUT/soft{n}), its dominant components merged
+//!    (`library_bodies::BodyMixture::harden`), each hardening one transaction.
 //!
 //! OUT/SUMMARY.json: per stage `F` and the held-out evaluation (KL per token by experiment family),
 //! the regions, the bodies with their calls and the native functions each replaced, the alignments
@@ -256,6 +257,29 @@ fn warm(explanation: &Explanation, fit: &Fit) -> Result<Explanation, String> {
     Ok(out)
 }
 
+/// A region the method may extract: its layer, its functions, and the head it reads through (with
+/// the number of heads its MLP may read).
+#[derive(Clone, serde::Serialize)]
+struct Region {
+    layer: usize,
+    functions: Vec<usize>,
+    #[serde(serialize_with = "head")]
+    through: Option<(library_crossing::Writer, usize)>,
+}
+
+fn head<S: serde::Serializer>(through: &Option<(library_crossing::Writer, usize)>, serializer: S) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&through.as_ref().map(|(w, _)| [w.layer, w.head]), serializer)
+}
+
+/// `explanation` with `region` rewritten as a call of its own body, read through its head.
+fn extract(explanation: &Explanation, region: &Region) -> Result<(Explanation, Call), String> {
+    let (next, call) = library_bodies::rewrite(explanation, region.layer, &region.functions)?;
+    Ok(match &region.through {
+        Some((writer, choices)) => (library_crossing::read_through(&next, &call, writer, *choices)?, call),
+        None => (next, call),
+    })
+}
+
 /// The method (module note) from `base` with its posterior `posterior` (a checkpoint's; none for
 /// `M`, whose posterior is the library's start); with `planted`, the gate's planted units per layer.
 fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior>, planted: Option<&[Vec<usize>; 2]>) -> Result<(), String> {
@@ -299,66 +323,133 @@ fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior
         summary["planted"] = json!(planted);
     }
     save(&run.out.join("SUMMARY.json"), &summary)?;
-    if regions.is_empty() && through.is_empty() {
+    let mut pending: Vec<Region> = through
+        .iter()
+        .map(|(layer, writer, choices, functions)| Region { layer: *layer, functions: functions.clone(), through: Some((writer.clone(), *choices)) })
+        .chain(regions.iter().map(|(layer, functions)| Region { layer: *layer, functions: functions.clone(), through: None }))
+        .collect();
+    // Extract-and-reuse, one transaction per proposal (module note, step 3): every child is the
+    // accepted explanation with the proposal made, fitted, and accepted when its `F` is below the
+    // accepted one's; a rejected proposal does not end the search.
+    let (mut explanation, mut current) = (base, fitted);
+    let mut calls: Vec<Call> = Vec::new();
+    let mut transaction = 0;
+    let mut decide = |summary: &mut Value, kind: &str, detail: Value, child: Explanation, child_calls: Vec<Call>, explanation: &mut Explanation, current: &mut Fit, calls: &mut Vec<Call>| -> Result<bool, String> {
+        child.artifact.validate_coverage(&run.native)?;
+        let name = format!("t{transaction}");
+        transaction += 1;
+        let fit = run.fit(&name, &child)?;
+        record(summary, "stages", stage(&name, &fit))?;
+        let accepted = fit.report.objective_bits < current.report.objective_bits;
+        record(summary, "decisions", json!({"move": kind, "stage": name, "detail": detail, "before_bits": current.report.objective_bits, "after_bits": fit.report.objective_bits, "accepted": accepted}))?;
+        if accepted {
+            (*explanation, *current, *calls) = (child, fit, child_calls);
+        }
+        Ok(accepted)
+    };
+    // Reuse first: the pairs of proposals whose bodies align with evidence (each extracted alone
+    // from the accepted explanation, aligned at the start's resolution), in order of their fit
+    // statistic; then the proposals left onto the bodies accepted so far; then each proposal
+    // alone.
+    loop {
+        let start = warm(&explanation, &current)?;
+        let tokens = current.report.scored_tokens;
+        let shadows = pending.iter().map(|r| extract(&start, r)).collect::<Result<Vec<_>, _>>()?;
+        let values = shadows
+            .iter()
+            .map(|(e, call)| library_bodies::body_values(e, &library_mdl::Posterior::new(e, tokens)?, &call.body))
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+        for i in 0..pending.len() {
+            for j in i + 1..pending.len() {
+                if let Ok(alignment) = library_bodies::align(&values[j], &values[i])
+                    && alignment.constrains()
+                {
+                    pairs.push((alignment.misfit / (alignment.entries - alignment.gauge) as f64, i, j));
+                }
+            }
+        }
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut accepted = None;
+        for &(statistic, i, j) in &pairs {
+            let (one, first) = extract(&start, &pending[i])?;
+            let (two, second) = extract(&one, &pending[j])?;
+            let posterior = library_mdl::Posterior::new(&two, tokens)?;
+            let alignment = library_bodies::align(&library_bodies::body_values(&two, &posterior, &second.body)?, &library_bodies::body_values(&two, &posterior, &first.body)?)?;
+            let mut child_calls = calls.clone();
+            child_calls.extend([first.clone(), second.clone()]);
+            let (child, child_calls) = library_bodies::merge(&two, &child_calls, &second.body, &first.body, &alignment)?;
+            let detail = json!({"regions": [&pending[i], &pending[j]], "statistic": statistic, "alignment": alignment});
+            if decide(&mut summary, "extract two regions as one body", detail, child, child_calls, &mut explanation, &mut current, &mut calls)? {
+                accepted = Some((i, j));
+                break;
+            }
+        }
+        match accepted {
+            Some((i, j)) => {
+                pending.remove(j);
+                pending.remove(i);
+            }
+            None => break,
+        }
+    }
+    // The proposals left onto an accepted body, then alone.
+    let mut index = 0;
+    while index < pending.len() {
+        let start = warm(&explanation, &current)?;
+        let tokens = current.report.scored_tokens;
+        let (child, call) = extract(&start, &pending[index])?;
+        let posterior = library_mdl::Posterior::new(&child, tokens)?;
+        let fresh = library_bodies::body_values(&child, &posterior, &call.body)?;
+        let mut bodies: Vec<&String> = calls.iter().map(|c| &c.body).collect();
+        bodies.sort();
+        bodies.dedup();
+        let mut onto: Vec<(f64, String, library_bodies::Alignment)> = Vec::new();
+        for body in bodies {
+            if let Ok(alignment) = library_bodies::align(&fresh, &library_bodies::body_values(&child, &posterior, body)?)
+                && alignment.constrains()
+            {
+                onto.push((alignment.misfit / (alignment.entries - alignment.gauge) as f64, body.clone(), alignment));
+            }
+        }
+        onto.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut done = false;
+        for (statistic, body, alignment) in onto {
+            let mut child_calls = calls.clone();
+            child_calls.push(call.clone());
+            let (merged, merged_calls) = library_bodies::merge(&child, &child_calls, &call.body, &body, &alignment)?;
+            let detail = json!({"region": &pending[index], "onto": body, "statistic": statistic});
+            if decide(&mut summary, "extract a region as a call of an accepted body", detail, merged, merged_calls, &mut explanation, &mut current, &mut calls)? {
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            let mut child_calls = calls.clone();
+            child_calls.push(call);
+            done = decide(&mut summary, "extract a region as its own body", json!({"region": &pending[index]}), child, child_calls, &mut explanation, &mut current, &mut calls)?;
+        }
+        if done {
+            pending.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    if calls.is_empty() {
         return Ok(());
     }
-    // Every region rewritten as a call of its own body, from the same start; a region through a
-    // head reads through it.
-    let mut rewritten = base;
-    let mut calls: Vec<Call> = Vec::new();
-    for (layer, region) in &regions {
-        let (next, call) = library_bodies::rewrite(&rewritten, *layer, region)?;
-        rewritten = next;
-        calls.push(call);
-    }
-    for (layer, writer, choices, region) in &through {
-        let (next, call) = library_bodies::rewrite(&rewritten, *layer, region)?;
-        rewritten = library_crossing::read_through(&next, &call, writer, *choices)?;
-        calls.push(call);
-    }
-    rewritten.artifact.validate_coverage(&run.native)?;
-    let mut current = run.fit("rewritten", &rewritten)?;
-    record(&mut summary, "stages", stage("rewritten", &current))?;
-    // The extraction is judged with its reuse (module note, step 5).
-    let mut explanation = rewritten;
-    // Reuse by gradient: the fit with the mixture prior over bodies (each body's components the
-    // earlier bodies it aligns to, OUT/soft{n}); every dominant component made exact by a merge, the
-    // merged library fitted (OUT/merged{n}) from the soft fit's means and accepted when its `F` is
-    // below the library's; repeated while a merge is accepted.
+    // Reuse by gradient among the accepted bodies: the fit with the mixture prior over bodies
+    // (OUT/soft{n}); its dominant components made exact by merges, each hardening one transaction.
     let steps = library_mixture::Steps { rate: 0.05, beta1: run.fit.beta1, beta2: 0.999, epsilon: 1e-8 };
     for round in 0.. {
         let mut mixture = library_bodies::BodyMixture::new(&explanation, steps)?;
         let soft = run.fit_with(&format!("soft{round}"), &warm(&explanation, &current)?, Some(&mut mixture))?;
         let weights: Vec<Value> = mixture.targets.iter().map(|t| json!({"body": t.body, "components": t.components.iter().map(|c| &c.body).collect::<Vec<_>>(), "weights": t.weights().unwrap_or_default()})).collect();
-        let soft_start = warm(&explanation, &soft)?;
-        let (merged, merged_calls, pairs) = mixture.harden(&soft_start, &calls, &soft.posterior)?;
         record(&mut summary, "stages", json!({"stage": format!("soft{round}"), "objective_bits": soft.report.objective_bits, "prior_bits": soft.report.end.prior_bits, "mixture": weights}))?;
-        if pairs.is_empty() {
+        let (merged, merged_calls, pairs) = mixture.harden(&warm(&explanation, &soft)?, &calls, &soft.posterior)?;
+        if pairs.is_empty() || !decide(&mut summary, "merge bodies the mixture prior found", json!({"merged": pairs}), merged, merged_calls, &mut explanation, &mut current, &mut calls)? {
             break;
         }
-        merged.artifact.validate_coverage(&run.native)?;
-        let name = format!("merged{round}");
-        let fit = run.fit(&name, &merged)?;
-        record(&mut summary, "stages", stage(&name, &fit))?;
-        let kept = fit.report.objective_bits < current.report.objective_bits;
-        record(
-            &mut summary,
-            "decisions",
-            json!({"move": "merge", "merged": pairs, "calls": merged_calls, "before_bits": current.report.objective_bits, "after_bits": fit.report.objective_bits, "kept": kept}),
-        )?;
-        if !kept {
-            break;
-        }
-        (explanation, current, calls) = (merged, fit, merged_calls);
-    }
-    let accepted = current.report.objective_bits < fitted.report.objective_bits;
-    record(
-        &mut summary,
-        "decisions",
-        json!({"move": "extraction with reuse", "calls": calls, "before_bits": fitted.report.objective_bits, "after_bits": current.report.objective_bits, "accepted": accepted}),
-    )?;
-    if !accepted {
-        return Ok(());
     }
     summary["calls"] = json!(calls);
     // The evidence for each call: the share of its reads that each head's writes take in (the
