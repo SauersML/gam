@@ -3333,21 +3333,34 @@ const RANKING_STREAM: usize = usize::MAX;
 fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings, stream: usize, moved: &[usize]) -> Result<Curvature, String> {
     let mut rng = StdRng::seed_from_u64(noise_seed(settings.seed, stream, draws.len()));
     let mut curvature = Curvature::new(posterior.group_count());
+    // Seconds in each part of the pass: the sample, the batch's experiments, M's targets, the
+    // scoring with its two reverse passes, and the per-group sums.
+    let (mut seconds, started) = ([0.0_f64; 5], Instant::now());
     let device = scorer.experiments.models().1.program.device().clone();
     let mut sums: BTreeMap<usize, Tensor> = BTreeMap::new();
     for (b, draw) in draws.iter().enumerate() {
         let key = noise_seed(settings.seed, stream, b);
+        let mut timed = Instant::now();
+        let mut lap = |part: usize, timed: &mut Instant| {
+            seconds[part] += timed.elapsed().as_secs_f64();
+            *timed = Instant::now();
+        };
         posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
+        lap(0, &mut timed);
         let batch = draw.batch(sequences)?;
         let experiments = scorer.experiments(draw, sequences)?;
+        lap(1, &mut timed);
         let targets = scorer.experiments.targets(&batch, &experiments)?;
+        lap(2, &mut timed);
         let rows: usize = experiments.iter().map(|e| batch.length() - e.position).sum();
         let uniforms: Vec<f64> = (0..rows).map(|_| rng.random::<f64>()).collect();
         // One forward pass at the batch's sample, reversed twice: the divergence's gradient (in
         // bits) and a draw of the Gauss–Newton factor.
         let evaluation = scorer.experiments.evaluate_labelled(&batch, &experiments, Some(&targets), true, Some(&uniforms))?;
         let factor = evaluation.factor.ok_or("no Gauss–Newton factor")?;
+        lap(3, &mut timed);
         posterior.add_removal((&evaluation.gradient, LN_2), &factor.gradient, key, &mut curvature)?;
+        lap(4, &mut timed);
         for op in moved {
             let Some(g) = evaluation.gradient.get(op) else { continue };
             match sums.get_mut(op) {
@@ -3361,6 +3374,16 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
     for (op, sum) in &sums {
         curvature.gradient.insert(scorer.at(*op)?, device.download(sum).map_err(error)? * LN_2);
     }
+    log::info!(
+        "library removal curvature: {} batches {:.1} s: sample {:.1} s, experiments {:.1} s, targets {:.1} s, scoring and reverses {:.1} s, group sums {:.1} s",
+        draws.len(),
+        started.elapsed().as_secs_f64(),
+        seconds[0],
+        seconds[1],
+        seconds[2],
+        seconds[3],
+        seconds[4]
+    );
     Ok(curvature)
 }
 
