@@ -209,6 +209,9 @@ struct Fused {
     sources: Vec<usize>,
     /// False while a training update has made the stacked copy stale.
     live: bool,
+    /// The operators changed since the stacked copy was written from them (`DeviceProgram::dissolve`):
+    /// the ones a refresh writes again.
+    changed: BTreeSet<usize>,
     /// Explicit `unfuse` is permanent, unlike invalidation by a parameter update.
     disabled: bool,
     /// Resident restacking must not license sharing by the original host identities.
@@ -662,7 +665,7 @@ impl DeviceProgram {
                 Some(shared) => Arc::clone(&shared.stacked),
                 None => Arc::new(Stacked::upload(device, program, &heads).map_err(error)?),
             };
-            fused.push(Fused { heads, stacked, sources, live: true, disabled: false, source_matches: true });
+            fused.push(Fused { heads, stacked, sources, live: true, changed: BTreeSet::new(), disabled: false, source_matches: true });
         }
         Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new() })
     }
@@ -675,6 +678,7 @@ impl DeviceProgram {
             if group.heads.operators().contains(&op) {
                 group.live = false;
                 group.source_matches = false;
+                group.changed.insert(op);
             }
         }
     }
@@ -695,56 +699,79 @@ impl DeviceProgram {
     }
 
     /// Refresh attention stacks from current resident operators after a batch of parameter
-    /// updates. Copies stay on the device and preserve its storage precision. Shared programs
-    /// retain their old stacks. Explicitly unfused groups, or groups whose norm gains are no
-    /// longer diagonal, remain unfused; the ordinary hook/span guards still apply per pass.
-    /// This restores forward packing, not packed gradients for trainable operators.
+    /// updates: the operators changed since a stack was written are copied into it, in its
+    /// storage, on the device. A stack another program shares (it was made from the same host
+    /// operators) is copied once first, so shared programs retain their old stacks. Explicitly
+    /// unfused groups, or groups whose norm gains are no longer diagonal, remain unfused; the
+    /// ordinary hook/span guards still apply per pass. This restores forward packing, not packed
+    /// gradients for trainable operators.
     pub fn refresh_fused(&mut self) -> Result<(), String> {
-        for index in 0..self.fused.len() {
-            let group = &self.fused[index];
-            if group.live || group.disabled {
-                continue;
-            }
-            let heads = &group.heads;
-            // A changed execution role can invalidate the matched pattern. In particular,
-            // a trainable dense norm gain may have acquired off-diagonal entries.
-            let mut products = heads.projection_operators.iter().map(|(op, _)| *op)
-                .chain(heads.attends.iter().map(|(_, op)| *op));
-            if products.any(|op| !matches!(self.held(op, Role::Product), Ok(Held::Dense(_))))
-                || heads.norms.iter().flat_map(|n| &n.nodes)
-                    .any(|(_, _, op)| !matches!(self.held(*op, Role::Product), Ok(Held::Diagonal(_))))
-            {
-                continue;
-            }
-            // Build privately, publishing only once every copy succeeds. Never modify an
-            // Arc-shared stack, nor reconstruct from the now-stale host OperatorProgram.
-            let d = &self.device;
-            let mut weights = d.copy(&group.stacked.weights).map_err(error)?;
-            let mut biases = group.stacked.biases.as_ref().map(|b| d.copy(b).map_err(error)).transpose()?;
-            for (i, &(op, bias)) in heads.projection_operators.iter().enumerate() {
-                d.set_rows(&mut weights, i * heads.width, self.dense(op)?).map_err(error)?;
-                if let Some(op) = bias {
-                    d.set_columns(biases.as_mut().ok_or("device: missing stacked biases")?, i * heads.width, self.column(op)?).map_err(error)?;
-                }
-            }
-            let mut reads = d.copy(&group.stacked.reads).map_err(error)?;
-            for (i, &(_, op)) in heads.attends.iter().enumerate() {
-                d.set_columns(&mut reads, i * heads.width, self.dense(op)?).map_err(error)?;
-            }
-            let mut gains = group.stacked.gains.as_ref().map(|g| d.copy(g).map_err(error)).transpose()?;
-            if let Some(norms) = &heads.norms {
-                for (i, &(_, _, op)) in norms.nodes.iter().enumerate() {
-                    let Held::Diagonal(gain) = self.held(op, Role::Product)? else {
-                        return Err("device: incompatible stacked gain".into());
-                    };
-                    d.set_columns(gains.as_mut().ok_or("device: missing stacked gains")?, i * heads.width, gain).map_err(error)?;
-                }
-            }
-            let group = &mut self.fused[index];
-            group.stacked = Arc::new(Stacked { weights, biases, gains, reads });
-            group.source_matches = false;
-            group.live = true;
+        self.refresh_fused_with(&mut |_, _, _| Ok(false))
+    }
+
+    /// [`Self::refresh_fused`] where `write(op, stack, (row, col))` may write a changed
+    /// operator's new value straight into its block of a stacked operand (a projection's rows of
+    /// the stacked weights, an output read's columns of the stacked reads) and return true, as a
+    /// weight sample is written (`device_posterior::DevicePosterior::sample_into`); an operator it
+    /// does not write is copied from its resident copy. Biases and norm gains are always copied.
+    pub fn refresh_fused_with(&mut self, write: &mut dyn FnMut(usize, &mut Tensor, (usize, usize)) -> Result<bool, String>) -> Result<(), String> {
+        let mut fused = std::mem::take(&mut self.fused);
+        let restacked = fused.iter_mut().try_for_each(|group| self.restack(group, &mut *write));
+        self.fused = fused;
+        restacked
+    }
+
+    /// Writes `group`'s changed operators into its stack and runs it fused again, unless it
+    /// cannot run fused ([`Self::refresh_fused`]).
+    fn restack(&self, group: &mut Fused, write: &mut dyn FnMut(usize, &mut Tensor, (usize, usize)) -> Result<bool, String>) -> Result<(), String> {
+        if group.live || group.disabled {
+            return Ok(());
         }
+        let heads = &group.heads;
+        // A changed execution role can invalidate the matched pattern. In particular,
+        // a trainable dense norm gain may have acquired off-diagonal entries.
+        let mut products = heads.projection_operators.iter().map(|(op, _)| *op)
+            .chain(heads.attends.iter().map(|(_, op)| *op));
+        if products.any(|op| !matches!(self.held(op, Role::Product), Ok(Held::Dense(_))))
+            || heads.norms.iter().flat_map(|n| &n.nodes)
+                .any(|(_, _, op)| !matches!(self.held(*op, Role::Product), Ok(Held::Diagonal(_))))
+        {
+            return Ok(());
+        }
+        let d = &self.device;
+        if Arc::get_mut(&mut group.stacked).is_none() {
+            let s = &group.stacked;
+            let copy = |t: &Option<Tensor>| t.as_ref().map(|t| d.copy(t).map_err(error)).transpose();
+            group.stacked = Arc::new(Stacked { weights: d.copy(&s.weights).map_err(error)?, biases: copy(&s.biases)?, gains: copy(&s.gains)?, reads: d.copy(&s.reads).map_err(error)? });
+        }
+        let stacked = Arc::get_mut(&mut group.stacked).ok_or("device: a shared stack")?;
+        let (heads, changed) = (&group.heads, &group.changed);
+        // A failure leaves the group stale with its changed operators, which the next refresh
+        // writes again.
+        for (i, &(op, bias)) in heads.projection_operators.iter().enumerate() {
+            if changed.contains(&op) && !write(op, &mut stacked.weights, (i * heads.width, 0))? {
+                d.set_rows(&mut stacked.weights, i * heads.width, self.dense(op)?).map_err(error)?;
+            }
+            if let Some(op) = bias.filter(|b| changed.contains(b)) {
+                d.set_columns(stacked.biases.as_mut().ok_or("device: missing stacked biases")?, i * heads.width, self.column(op)?).map_err(error)?;
+            }
+        }
+        for (i, &(_, op)) in heads.attends.iter().enumerate() {
+            if changed.contains(&op) && !write(op, &mut stacked.reads, (0, i * heads.width))? {
+                d.set_columns(&mut stacked.reads, i * heads.width, self.dense(op)?).map_err(error)?;
+            }
+        }
+        if let Some(norms) = &heads.norms {
+            for (i, &(_, _, op)) in norms.nodes.iter().enumerate().filter(|(_, (_, _, op))| changed.contains(op)) {
+                let Held::Diagonal(gain) = self.held(op, Role::Product)? else {
+                    return Err("device: incompatible stacked gain".into());
+                };
+                d.set_columns(stacked.gains.as_mut().ok_or("device: missing stacked gains")?, i * heads.width, gain).map_err(error)?;
+            }
+        }
+        group.changed.clear();
+        group.source_matches = false;
+        group.live = true;
         Ok(())
     }
 

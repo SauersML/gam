@@ -371,14 +371,22 @@ impl Decoder {
     }
 
     /// The trainable operators' current values from `program` (the explanation's resident program,
-    /// after its weight sample is written): each stack's row blocks copied into place (widened to
-    /// f32 where the program holds bfloat16, `DeviceProgram::hold_bf16`).
+    /// after its weight sample is written), each copied into its place ([`Decoder::write_trainable`];
+    /// widened to f32 where the program holds bfloat16, `DeviceProgram::hold_bf16`).
     pub fn refresh(&mut self, program: &DeviceProgram) -> Result<(), String> {
         let d = self.device.clone();
-        let value = |op: usize| -> Result<Tensor, String> {
+        self.write_trainable(&mut |op, operand, (row, _)| {
             let value = program.dense(op)?;
-            if value.storage() == Storage::Bf16 { d.convert(value) } else { d.copy(value) }.map_err(error)
-        };
+            let widened = if value.storage() == Storage::Bf16 { Some(d.convert(value).map_err(error)?) } else { None };
+            d.set_rows(operand, row, widened.as_ref().unwrap_or(value)).map_err(error)
+        })
+    }
+
+    /// Hands each trainable operator's place among the decoder's operands to `write(op, operand,
+    /// (row, 0))`, which writes the operator's value there: its rows `row..` of a block's stacked
+    /// input product, or the whole of a block's output product (row 0). A weight sample written
+    /// so (`device_posterior::DevicePosterior::sample_into_decoder`) needs no program and no copy.
+    pub fn write_trainable(&mut self, write: &mut dyn FnMut(usize, &mut Tensor, (usize, usize)) -> Result<(), String>) -> Result<(), String> {
         for (block, weights) in self.blocks.iter().zip(&mut self.weights) {
             let (stack, output) = match block {
                 Block::Attention(a) => (&a.projections, None),
@@ -386,11 +394,11 @@ impl Decoder {
             };
             for &(op, at, _) in &stack.parts {
                 if self.trainable.contains(&op) {
-                    d.set_rows(&mut weights.input, at, &value(op)?).map_err(error)?;
+                    write(op, &mut weights.input, (at, 0))?;
                 }
             }
             if let Some(op) = output.filter(|op| self.trainable.contains(op)) {
-                weights.output = value(op)?;
+                write(op, &mut weights.output, (0, 0))?;
             }
         }
         Ok(())

@@ -1,4 +1,4 @@
-//! The factorized Gaussian posterior's device operations (`Device::reparameterize`,
+//! The factorized Gaussian posterior's device operations (`Device::reparameterize`, its block form,
 //! `posterior_ivon`, `group_moments`, `group_divergence`): the host against the formulas entry by
 //! entry, and every accelerator that resolves (CUDA in f32 storage with float64 group sums, the
 //! Apple GPU in f32) against the host on the same inputs, with the groups held per row, per column
@@ -271,6 +271,40 @@ fn a_bfloat16_sample_is_the_f32_sample_rounded() {
     // `bf16_copy` rounds to nearest, ties to even, as the bfloat16 sample does.
     let expected = fit.download(&fit.bf16_copy(&single).unwrap()).unwrap();
     assert_eq!(fit.download(&half).unwrap(), expected);
+}
+
+/// `c`'s sample written by `fit` into a block at (2, 4) of a larger tensor on `out` (`out`'s
+/// storage) holds the whole sample entry for entry and leaves the rest as it was.
+fn sample_in_a_block(fit: &Device, out: &Device) {
+    let c = case(GroupAxis::Entries);
+    let (mean, log_sd) = (fit.upload(c.mean.view()).unwrap(), fit.upload(c.log_sd.view()).unwrap());
+    let (rows, cols) = c.mean.dim();
+    let mut whole = out.zeros(rows, cols).unwrap();
+    fit.reparameterize(&mut whole, (&mean, &log_sd), c.sample).unwrap();
+    let mut stack = out.upload(Array2::from_elem((rows + 3, cols + 5), 0.5).view()).unwrap();
+    fit.reparameterize_block(&mut stack, (2, 4), (&mean, &log_sd), c.sample).unwrap();
+    let (whole, stack) = (out.download(&whole).unwrap(), out.download(&stack).unwrap());
+    for ((r, k), v) in stack.indexed_iter() {
+        let inside = (2..2 + rows).contains(&r) && (4..4 + cols).contains(&k);
+        assert_eq!(*v, if inside { whole[(r - 2, k - 4)] } else { 0.5 }, "({r}, {k})");
+    }
+    assert!(fit.reparameterize_block(&mut out.zeros(rows, cols).unwrap(), (1, 0), (&mean, &log_sd), c.sample).is_err(), "a block past the tensor");
+}
+
+#[test]
+fn a_sample_written_into_a_block_is_the_whole_sample() {
+    let host = Device::host();
+    sample_in_a_block(&host, &host);
+    #[cfg(target_os = "macos")]
+    if let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault") {
+        sample_in_a_block(&metal, &metal);
+    }
+    if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
+        let fit = wide.with_storage(Storage::F32).expect("CUDA holds f32");
+        sample_in_a_block(&fit, &fit);
+        sample_in_a_block(&fit, &wide.with_storage(Storage::Bf16).expect("CUDA holds bfloat16"));
+        sample_in_a_block(&wide, &wide);
+    }
 }
 
 /// The bfloat16 nearest `x` (ties to even), as a float64.

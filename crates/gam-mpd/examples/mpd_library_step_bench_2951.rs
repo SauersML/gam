@@ -13,7 +13,8 @@
 //! clean and one patched experiment per base (`interchange::sample`, seed 1). The programs run on
 //! the single-precision device (CUDA in f32 storage, else the Apple GPU), with f32 products.
 //!
-//! A step, as the fit takes it: the weight sample written into `P`, `M`'s clean runs
+//! A step, as the fit takes it: the weight sample written into `P` (into the decoder's operands
+//! on the decoder engine, into the program's operators and fused stacks otherwise), `M`'s clean runs
 //! (`interchange::targets`), the experiments with the gradient (`interchange::evaluate`), the
 //! description `Σ_G KL_G`, and the IVON step (`Device::posterior_ivon`); none of the parameters
 //! leave the device. The step runs `REPS` times after one warm-up, each part timed to a device
@@ -340,9 +341,11 @@ fn main() -> Result<(), String> {
         let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens as f64, None, 0)?;
         for step in 0..=reps {
             let s = &mut device_seconds;
-            timed(&device, s, "sample_loaded", || {
-                posterior.sample_into(&mut p_program, step as u64)?;
-                decoders.as_mut().map_or(Ok(()), |(_, p)| p.refresh(&p_program))
+            // The decoder engine takes the sample straight into its operands; the program engine into
+            // its operators and fused stacks.
+            timed(&device, s, "sample_loaded", || match decoders.as_mut() {
+                Some((_, p)) => posterior.sample_into_decoder(p, step as u64),
+                None => posterior.sample_into(&mut p_program, step as u64),
             })?;
             // The step's evaluation: the gradient and a draw of the Gauss–Newton factor (a second
             // reverse pass through the same forward pass), with its scored tokens.

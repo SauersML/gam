@@ -19,6 +19,7 @@
 //! decay.
 
 use crate::{
+    decoder::Decoder,
     device_program::DeviceProgram,
     library_mdl::{Curvature, Explanation, Posterior},
 };
@@ -225,20 +226,22 @@ impl DevicePosterior {
     }
 
     /// Trainable operator `op`'s weight sample of `key` (the draws [`DevicePosterior::sample_into`]
-    /// writes) into rows `at..` of `out`, a stacked operand such as a decoder's: written in place,
-    /// no copy of the operator ([`Device::reparameterize_rows`]).
-    pub fn sample_rows(&self, op: usize, out: &mut Tensor, at: usize, key: u64) -> Result<(), String> {
+    /// writes) into the block of `out` at `(row, col)`, a stacked operand such as a fused group's
+    /// or a decoder's: written in place, no copy of the operator ([`Device::reparameterize_block`]).
+    pub fn sample_block(&self, op: usize, out: &mut Tensor, at: (usize, usize), key: u64) -> Result<(), String> {
         let (i, mean, log_sd) = self.entries(op)?;
-        self.fitting.reparameterize_rows(out, at, (mean, log_sd), (key, i as u64)).map_err(error)
+        self.fitting.reparameterize_block(out, at, (mean, log_sd), (key, i as u64)).map_err(error)
     }
 
-    /// Trainable operator `op`'s posterior means into rows `at..` of `out` (in `out`'s storage).
-    pub fn mean_rows(&self, op: usize, out: &mut Tensor, at: usize) -> Result<(), String> {
+    /// Trainable operator `op`'s posterior means into rows `row..` of `out` (in `out`'s storage),
+    /// whose columns are the operator's.
+    pub fn mean_rows(&self, op: usize, out: &mut Tensor, row: usize) -> Result<(), String> {
         let (_, mean, _) = self.entries(op)?;
         let value = if out.storage() == Storage::Bf16 { self.fitting.bf16_copy(mean) } else { self.fitting.copy(mean) }.map_err(error)?;
-        self.fitting.set_rows(out, at, &value).map_err(error)
+        self.fitting.set_rows(out, row, &value).map_err(error)
     }
 
+    /// Writes the posterior means into `program`'s trainable operators and their stacks.
     pub fn mean_into(&self, program: &mut DeviceProgram) -> Result<(), String> {
         for (i, &op) in self.operators.iter().enumerate() {
             // A program holding the operator in bfloat16 (`DeviceProgram::hold_bf16`) gets it so.
@@ -264,7 +267,9 @@ impl DevicePosterior {
 
     /// Writes the weight sample of `key` into `program`'s trainable operators (operator `i` in
     /// `Explanation::trainable` order draws stream `i`); in place where the program holds the
-    /// operator in one role, replaced where it also holds a column copy (a bias).
+    /// operator in one role, replaced where it also holds a column copy (a bias). A fused group's
+    /// stack gets the same draws written straight into its blocks
+    /// (`DeviceProgram::refresh_fused_with`), not restacked from the operators.
     pub fn sample_into(&self, program: &mut DeviceProgram, key: u64) -> Result<(), String> {
         for (i, &op) in self.operators.iter().enumerate() {
             let parts = (&self.mean[i], &self.log_sd[i]);
@@ -277,7 +282,25 @@ impl DevicePosterior {
                 program.replace_dense_parameter(op, theta)?;
             }
         }
-        program.refresh_fused()
+        program.refresh_fused_with(&mut |op, stack, at| {
+            if !self.operators.contains(&op) {
+                return Ok(false);
+            }
+            self.sample_block(op, stack, at, key)?;
+            Ok(true)
+        })
+    }
+
+    /// Writes the weight sample of `key` (the draws of [`DevicePosterior::sample_into`]) straight
+    /// into `decoder`'s operands ([`Decoder::write_trainable`]): no program holds it, and nothing is
+    /// copied.
+    pub fn sample_into_decoder(&self, decoder: &mut Decoder, key: u64) -> Result<(), String> {
+        decoder.write_trainable(&mut |op, operand, at| self.sample_block(op, operand, at, key))
+    }
+
+    /// Writes the posterior means into `decoder`'s operands.
+    pub fn mean_into_decoder(&self, decoder: &mut Decoder) -> Result<(), String> {
+        decoder.write_trainable(&mut |op, operand, (row, _)| self.mean_rows(op, operand, row))
     }
 
     /// One IVON step: `gradients` holds per trainable operator (by id) the gradient of the batch's

@@ -676,6 +676,57 @@ mod tests {
         }
     }
 
+    /// A weight sample written straight into a fused group's stacks
+    /// (`DevicePosterior::sample_into`) computes what the same sample run node by node computes,
+    /// sample after sample, and the program the stacks were shared with keeps its own.
+    #[test]
+    fn a_sample_written_into_the_stacks_runs_as_its_operators_do() {
+        use crate::device_posterior::{DevicePosterior, Parts};
+        let mut backends = devices();
+        let single: Vec<_> = backends.iter().filter_map(|d| d.with_storage(gam_gpu::tensor::Storage::F32).ok()).collect();
+        backends.extend(single);
+        if let Some(device) = Device::single_precision(gam_gpu::GpuPolicy::Auto).expect("single-precision device") {
+            if !backends.iter().any(|d| d.name() == device.name() && d.storage() == device.storage()) {
+                backends.push(device);
+            }
+        }
+        for device in backends {
+            let (program, family) = layer_normed(4, 2, Some(Rotary { base: 500, dims: 2, half_split: false }), true, false);
+            let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
+            let tolerance = if device.float64() { 1e-11 } else { 2e-5 };
+            let trainable: Vec<_> = program.operators.iter().enumerate()
+                .filter(|(_, op)| matches!(op.name.as_str(), "q" | "k" | "v" | "qb" | "kb" | "o" | "ob"))
+                .map(|(id, _)| id).collect();
+            let mut original = DeviceProgram::compile_values(&device, &program).expect("original");
+            original.set_arithmetic(arithmetic);
+            let before = device.download(original.forward(&family).unwrap().value(program.output).unwrap()).unwrap();
+            let mut fused = DeviceProgram::compile_values_sharing(&original, &program).expect("fused");
+            let mut plain = DeviceProgram::compile_values_sharing(&original, &program).expect("plain");
+            fused.set_arithmetic(arithmetic);
+            plain.set_arithmetic(arithmetic);
+            plain.unfuse();
+            fused.prepare_dense_parameters(&trainable).expect("prepare fused");
+            plain.prepare_dense_parameters(&trainable).expect("prepare plain");
+            let mean: Vec<Array2<f64>> = trainable.iter().map(|&op| program.operators[op].matrix().mapv(|x| 1.2 * x + 0.01)).collect();
+            let log_sd: Vec<Array2<f64>> = mean.iter().map(|m| m.mapv(|_| 0.05_f64.ln())).collect();
+            let groups: Vec<Vec<u32>> = mean.iter().map(|m| vec![0; m.len()]).collect();
+            let parts = Parts { operators: &trainable, mean: &mean, log_sd: &log_sd, groups: &groups, count: 1 };
+            let posterior = DevicePosterior::from_parts(&device, &parts, 100.0, None, 0).expect("posterior");
+            for key in [3, 4] {
+                posterior.sample_into(&mut fused, key).expect("fused sample");
+                posterior.sample_into(&mut plain, key).expect("plain sample");
+                assert_eq!((fused.fused_groups(), plain.fused_groups()), (1, 0));
+                let (a, b) = (fused.forward(&family).unwrap(), plain.forward(&family).unwrap());
+                for node in 0..program.nodes.len() {
+                    let (x, y) = (device.download(a.value(node).unwrap()).unwrap(), device.download(b.value(node).unwrap()).unwrap());
+                    assert!(worst(&x, &y) < tolerance, "{} key {key} node {node}: {}", device.name(), worst(&x, &y));
+                }
+                assert!(worst(&device.download(a.value(program.output).unwrap()).unwrap(), &before) > 1e-3, "the sample moved the output");
+                assert_eq!(device.download(original.forward(&family).unwrap().value(program.output).unwrap()).unwrap(), before, "the shared program keeps its stacks");
+            }
+        }
+    }
+
     #[test]
     fn resident_attention_repacking_respects_changed_norm_gain_roles() {
         let device = Device::host();
