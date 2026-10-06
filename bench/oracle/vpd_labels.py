@@ -31,8 +31,18 @@ log-probabilities normalized in float64 where the device has it. The model is th
 Output under OUT: site_<layer>_<kind>.safetensors and .json per site, contexts.safetensors (the pool's
 row ids and tokens).
 
+Row edits (`--edit row`, meta "edit": "row"): the same weight edit W + (alpha - 1) u v^T applied to M at
+chosen rows only, alpha in (0, 2) (interchange's FACTORS' removal and doubling), every `--stride`-th
+subcomponent of each site. At p, the next-token distribution under the edit at row p alone (the same as
+from row p on: later rows do not reach p): kl (KL(M || M_e), nats), effect (KL(M_e || M), bits), next,
+the 10 most raised and lowered tokens, as above, and the activity at every position. Per subcomponent and
+its first `--continue` top contexts, greedy continuations of S tokens after p: clean (cont_clean), with
+the edit at row p only (cont_row_<alpha>) and with it at every row from p on, the generated ones
+included (cont_from_<alpha>). Effects of either size, zero included, are kept: predicting no change is
+part of the task.
+
   vpd_labels.py --out DIR [--offset 0] [--pool 2048] [--top 16] [--random 16] [--sites h.0.mlp.c_fc,...]
-                [--limit N] [--rows 256] [--seed 0]
+                [--limit N] [--rows 256] [--seed 0] [--edit all|row] [--stride 1] [--continue 1]
 """
 
 from __future__ import annotations
@@ -55,6 +65,7 @@ import vpd_model as VM  # noqa: E402
 
 ALPHAS = (("ablate", 0.0), ("amplify", 1.5))
 AMPLIFY = 1.5
+ROW_ALPHAS = (("ablate", 0.0), ("amplify", 2.0))
 T, S, TOP = 128, 12, 10
 
 
@@ -99,8 +110,9 @@ class Model:
         self.wide = torch.float32 if dev.type == "mps" else torch.float64
 
     def layer(self, i: int, x: torch.Tensor, edit=None):
-        """Layer i on the stream x; edit = (site name, v [R, d_in], u [R, d_out], coef [R]). Returns the
-        stream after the layer and, with an edit, the edited site's input."""
+        """Layer i on the stream x; edit = (site name, v [R, d_in], u [R, d_out], coef [R][, start [R][, stop
+        [R]]]): the edit at every row, or at rows start_r <= t (< stop_r) only. Returns the stream after
+        the layer and, with an edit, the edited site's input."""
         t = self.t
         B, L, _ = x.shape
         seen = None
@@ -110,9 +122,13 @@ class Model:
             name = f"h.{i}.{'mlp' if kind in ('c_fc', 'down_proj') else 'attn'}.{kind}"
             out = t.site(name)(h)
             if edit is not None and edit[0] == name:
-                _, v, u, coef = edit
+                _, v, u, coef = edit[:4]
                 seen = h
-                out = out + (coef[:, None] * torch.einsum("rtd,rd->rt", h, v))[..., None] * u[:, None, :]
+                g = coef[:, None] * torch.einsum("rtd,rd->rt", h, v)
+                if len(edit) > 4:  # rows from start_r on (before stop_r)
+                    t_ = torch.arange(h.shape[1], device=h.device)[None]
+                    g = g * ((t_ >= edit[4][:, None]) & ((t_ < edit[5][:, None]) if len(edit) > 5 else True))
+                out = out + g[..., None] * u[:, None, :]
             return out
 
         h = VM.rms(x, t.norms[2 * i], t.eps)
@@ -169,7 +185,8 @@ def site_inputs(model: Model, ids: torch.Tensor, chunk: int):
 @torch.no_grad()
 def greedy(model: Model, prefixes: list[torch.Tensor], edit, steps: int) -> torch.Tensor:
     """Greedy continuations of right-padded prefixes (causal attention: padding after a row's tokens
-    never reaches them), every step a full forward with the rows' edit (a weight edit acts everywhere)."""
+    never reaches them), every step a full forward with the rows' edit (a weight edit acts everywhere,
+    or at the rows its start and stop give)."""
     R = len(prefixes)
     lengths = torch.tensor([len(p) for p in prefixes], device=model.dev)
     width = int(lengths.max()) + steps
@@ -194,6 +211,90 @@ def greedy(model: Model, prefixes: list[torch.Tensor], edit, steps: int) -> torc
 UV: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
+@torch.no_grad()
+def row_labels(args, model: Model, ids: torch.Tensor, entering, final, peaks, names, out: Path, rng):
+    """The row-edit table (module note, `--edit row`)."""
+    dev, T = model.dev, ids.shape[1]
+    K = args.top + args.random
+    for name in names:
+        tag = name.replace("h.", "").replace(".attn.", "_").replace(".mlp.", "_")
+        if (out / f"site_{tag}.json").exists():
+            continue
+        started = time.time()
+        U, V = UV[name]
+        layer = int(name.split(".")[1])
+        chosen = torch.arange(0, U.shape[0] if not args.limit else min(args.limit, U.shape[0]), args.stride)
+        C = len(chosen)
+        order = peaks[name][:, chosen].T.argsort(dim=-1, descending=True).cpu().numpy()
+        ctx = np.empty((C, K), dtype=np.int64)
+        for c in range(C):
+            ctx[c] = np.concatenate([order[c, : args.top], rng.choice(order[c, args.top :], size=args.random, replace=False)])
+        ctx_t = torch.from_numpy(ctx).to(dev)
+        activity = torch.empty(C, K, T, device=dev)
+        position = torch.empty(C, K, dtype=torch.int64, device=dev)
+        fields = {a: {} for a, _ in ROW_ALPHAS}
+        pairs = torch.cartesian_prod(torch.arange(C, device=dev), torch.arange(K, device=dev))
+        for s in range(0, len(pairs), args.rows):
+            cs, ks = pairs[s : s + args.rows, 0], pairs[s : s + args.rows, 1]
+            R = len(cs)
+            at = torch.arange(R, device=dev)
+            rows_ctx = ctx_t[cs, ks]
+            sub = chosen.to(dev)[cs]
+            v, u = V[:, sub].T, U[sub]
+            _, seen = model.from_layer(layer, entering[layer][rows_ctx], (name, v, u, torch.zeros(R, device=dev)))
+            act = torch.einsum("rtd,rd->rt", seen, v)
+            pos = act[:, 1:].abs().argmax(-1) + 1  # after the first token
+            activity[cs, ks], position[cs, ks] = act, pos
+            lp_c = model.log_probs(final[rows_ctx, pos])
+            for alpha_name, alpha in ROW_ALPHAS:
+                h, _ = model.from_layer(layer, entering[layer][rows_ctx], (name, v, u, torch.full((R,), alpha - 1.0, device=dev), pos, pos + 1))
+                lp_e = model.log_probs(h[at, pos])
+                delta, dp = lp_e - lp_c, lp_e.exp() - lp_c.exp()
+                upi, dni = dp.topk(TOP, dim=-1).indices, (-dp).topk(TOP, dim=-1).indices
+                nt = ids[rows_ctx, (pos + 1).clamp(max=T - 1)]
+                nd = delta.gather(-1, nt[:, None])[:, 0]
+                vals = {"kl": (lp_c.exp() * -delta).sum(-1), "effect": (lp_e.exp() * delta).sum(-1) / math.log(2),
+                        "next": torch.where(pos + 1 < T, nd, torch.full_like(nd, float("nan"))),
+                        "up_ids": upi, "up_dp": dp.gather(-1, upi), "up_dlogp": delta.gather(-1, upi),
+                        "down_ids": dni, "down_dp": dp.gather(-1, dni), "down_dlogp": delta.gather(-1, dni)}
+                for key, val in vals.items():
+                    fields[alpha_name].setdefault(key, []).append(val.cpu())
+        rec = {}
+        for alpha_name, _ in ROW_ALPHAS:
+            for key, parts in fields[alpha_name].items():
+                val = torch.cat(parts).reshape(C, K, *parts[0].shape[1:])
+                rec[f"{key}_{alpha_name}"] = val.to(torch.int32) if key.endswith("_ids") else val.to(torch.float32)
+        # Continuations after p in each subcomponent's first `--continue` top contexts.
+        J = args.cont
+        conts = {"cont_clean": torch.empty(C, J, S, dtype=torch.int32)}
+        for alpha_name, _ in ROW_ALPHAS:
+            conts[f"cont_row_{alpha_name}"] = torch.empty(C, J, S, dtype=torch.int32)
+            conts[f"cont_from_{alpha_name}"] = torch.empty(C, J, S, dtype=torch.int32)
+        cj = torch.cartesian_prod(torch.arange(C), torch.arange(J))
+        step = max(1, args.rows // 4)
+        for s in range(0, len(cj), step):
+            cs, js = cj[s : s + step, 0], cj[s : s + step, 1]
+            pos = position[cs.to(dev), js.to(dev)]
+            prefixes = [ids[int(ctx[c, j]), : int(pos[r]) + 1] for r, (c, j) in enumerate(zip(cs.tolist(), js.tolist()))]
+            sub = chosen.to(dev)[cs.to(dev)]
+            v, u = V[:, sub].T, U[sub]
+            conts["cont_clean"][cs, js] = greedy(model, prefixes, None, S).to(torch.int32).cpu()
+            for alpha_name, alpha in ROW_ALPHAS:
+                coef = torch.full((len(cs),), alpha - 1.0, device=dev)
+                conts[f"cont_row_{alpha_name}"][cs, js] = greedy(model, prefixes, (name, v, u, coef, pos, pos + 1), S).to(torch.int32).cpu()
+                conts[f"cont_from_{alpha_name}"][cs, js] = greedy(model, prefixes, (name, v, u, coef, pos), S).to(torch.int32).cpu()
+        rec.update(conts)
+        rec.update({"subcomponents": chosen.to(torch.int32), "contexts": torch.from_numpy(ctx).to(torch.int32), "activity": activity.to(torch.float16).cpu(),
+                    "position": position.to(torch.int16).cpu()})
+        save_file({k: val.contiguous() for k, val in rec.items()}, str(out / f"site_{tag}.safetensors"))
+        meta = {"site": name, "layer": layer, "subcomponents": C, "stride": args.stride, "top": args.top, "random": args.random, "pool_offset": args.offset, "pool": args.pool,
+                "alphas": dict(ROW_ALPHAS), "amplify": dict(ROW_ALPHAS)["amplify"], "edit": "row", "continuation_steps": S, "continue": J,
+                "seconds": time.time() - started, "seed": args.seed, "decomposition": str(VM.VPD_PTH), "target": str(VM.TARGET_DIR)}
+        (out / f"site_{tag}.json").write_text(json.dumps(meta))
+        print(json.dumps({"site": name, "subcomponents": C, "seconds": round(meta["seconds"], 1), "median_effect_bits_ablate": float(rec["effect_ablate"].median()),
+                          "share_above_0.1_bits": float((rec["effect_ablate"] > 0.1).float().mean())}), flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
@@ -209,6 +310,9 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="only the first N subcomponents of each site (a smoke test)")
     ap.add_argument("--rows", type=int, default=256)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--edit", default="all", choices=("all", "row"), help="row: the row-edit table (module note)")
+    ap.add_argument("--stride", type=int, default=1, help="row edits: every stride-th subcomponent of each site")
+    ap.add_argument("--continue", dest="cont", type=int, default=1, help="row edits: continuations in each subcomponent's first N top contexts")
     args = ap.parse_args()
     torch.set_grad_enabled(False)
     out = Path(args.out)
@@ -231,6 +335,8 @@ def main():
     print(json.dumps({"pool": args.pool, "clean_seconds": round(time.time() - t0, 1)}), flush=True)
     rng = np.random.default_rng(args.seed)
     names = [s for s in args.sites.split(",") if s] or VM.site_names(model.t.n_layer)
+    if args.edit == "row":
+        return row_labels(args, model, ids, entering, final, peaks, names, out, rng)
     K = args.top + args.random
     for name in names:
         tag = name.replace("h.", "").replace(".attn.", "_").replace(".mlp.", "_")
