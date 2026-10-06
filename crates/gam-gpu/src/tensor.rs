@@ -361,14 +361,20 @@ pub enum GroupAxis {
 }
 
 /// An operator's prior groups on the device ([`Device::group_map`]): its ids and the axis they
-/// index. A row or column layout holds one id per row or column instead of four bytes per entry,
-/// and a column layout's group sums are reduced down each column (a column's entries are a row
-/// apart, so a SIMD group's lanes hold different groups).
+/// index. A row or column layout holds one id per row or column instead of four bytes per entry.
+/// The device's group sums run over the map's segments (`layout`): each group of the operator is
+/// one segment, the coordinates (rows, columns or entries) the axis indexes in its group, and one
+/// warp (SIMD group) sums each segment's entries in a fixed order and adds them to its group's row
+/// once. No sum is atomic, so the sums are the same on every run.
 pub struct GroupMap {
     ids: Indices,
     axis: GroupAxis,
     rows: usize,
     cols: usize,
+    /// The segments' `S + 1` offsets into the members, the `S` segments' groups, then the members
+    /// (the axis's coordinates, by group and within one in ascending order).
+    layout: Indices,
+    segments: usize,
 }
 
 impl GroupMap {
@@ -403,17 +409,16 @@ impl GroupMap {
         }
     }
 
-    /// Row chunks of a column reduction: each thread sums a column over about 64 rows (one
-    /// atomic per column per chunk); one chunk otherwise.
+    /// The segments of the map's layout, the kernels' `chunks`.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn chunks(&self) -> usize {
-        if self.axis == GroupAxis::Columns { self.rows.div_ceil(64).max(1) } else { 1 }
+        self.segments
     }
 
-    /// The threads a reduction over the map runs: one per column and chunk, or one per entry.
+    /// The threads a reduction over the map runs: one warp (SIMD group) of 32 per segment.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn threads(&self) -> usize {
-        if self.axis == GroupAxis::Columns { self.cols * self.chunks() } else { self.rows * self.cols }
+        32 * self.segments
     }
 
     /// `t`'s shape is the map's.
@@ -803,7 +808,22 @@ impl Device {
         } else {
             (GroupAxis::Entries, ids.to_vec())
         };
-        Ok(GroupMap { ids: self.upload_indices(&compact)?, axis, rows, cols })
+        // The segments: the coordinates by group id, each group's in ascending order.
+        let index = |k: usize| u32::try_from(k).map_err(|_| shape(format!("a group map of {k} coordinates")));
+        let mut members = (0..compact.len()).map(index).collect::<Result<Vec<u32>, _>>()?;
+        members.sort_by_key(|&k| compact[k as usize]);
+        let (mut offsets, mut groups) = (Vec::new(), Vec::new());
+        for (k, &m) in members.iter().enumerate() {
+            let g = compact[m as usize];
+            if groups.last() != Some(&g) {
+                offsets.push(index(k)?);
+                groups.push(g);
+            }
+        }
+        offsets.push(index(members.len())?);
+        let segments = groups.len();
+        let layout: Vec<u32> = offsets.into_iter().chain(groups).chain(members).collect();
+        Ok(GroupMap { ids: self.upload_indices(&compact)?, axis, rows, cols, layout: self.upload_indices(&layout)?, segments })
     }
 
     pub fn upload_indices(&self, values: &[u32]) -> Result<Indices, GpuError> {
@@ -3564,36 +3584,36 @@ __device__ unsigned int group_of(const unsigned int* ids, unsigned int axis, u64
 
 // Runs `body(i, g, a, b, c)` on every entry i of an `n`-entry operator of `cols` columns whose group
 // g is below `count`, and adds each entry it returns true for, (a, b, c), into its group's row of
-// `sums`. Row and entry maps: entries in row-major order (WARP_STRIDE), a warp's run of one group
-// added in one atomic (`group_add`). Column maps: thread t sums column t % cols over the rows
-// t / cols, t / cols + chunks, ... in registers and adds once (a column's entries are a row apart,
-// so a warp's lanes hold different groups and adding per entry would take three atomics each).
+// `sums`. The entries go by the map's segments (`GroupMap`'s `layout`: `segments + 1` offsets, the
+// segments' groups, then their members): one warp per segment, each lane summing every 32nd of its
+// entries in order, the lanes' sums added by shuffles in a fixed order, and lane 0 adding the
+// totals to the group's row. A group is one segment of the map and launches on a stream run in
+// order, so nothing is atomic and the sums are the same on every run.
 template <typename F>
-__device__ void group_reduce(u64 n, u64 cols, unsigned int axis, u64 chunks, const unsigned int* ids, u64 count, double* sums, F body) {
-    if (axis == 1u) {
-        u64 rows = n / cols;
-        GRID_STRIDE(t, cols * chunks) {
-            u64 c = t % cols;
-            unsigned int g = ids[c];
-            if (g >= count) continue;
-            double a = 0.0, b = 0.0, d = 0.0;
-            for (u64 r = t / cols; r < rows; r += chunks) {
-                double ea = 0.0, eb = 0.0, ed = 0.0;
-                if (body(r * cols + c, g, ea, eb, ed)) { a += ea; b += eb; d += ed; }
-            }
-            if (a > 0.0) {
-                atomicAdd(sums + 3 * (u64)g, a);
-                atomicAdd(sums + 3 * (u64)g + 1, b);
-                atomicAdd(sums + 3 * (u64)g + 2, d);
-            }
-        }
-        return;
-    }
-    WARP_STRIDE(i, n) {
-        unsigned int g = i < n ? group_of(ids, axis, cols, i) : 0u;
+__device__ void group_reduce(u64 n, u64 cols, unsigned int axis, u64 segments, const unsigned int* layout, u64 count, double* sums, F body) {
+    const u64 warps = ((u64)gridDim.x * blockDim.x) >> 5, lane = threadIdx.x & 31u, rows = cols > 0 ? n / cols : 0;
+    for (u64 s = ((u64)blockIdx.x * blockDim.x + threadIdx.x) >> 5; s < segments; s += warps) {
+        unsigned int g = layout[segments + 1 + s];
+        if (g >= count) continue;
+        u64 off = layout[s], size = (u64)layout[s + 1] - off;
+        u64 length = axis == 0u ? size * cols : (axis == 1u ? size * rows : size);
+        const unsigned int* members = layout + 2 * segments + 1 + off;
         double a = 0.0, b = 0.0, d = 0.0;
-        bool live = i < n && g < count && body(i, g, a, b, d);
-        group_add(sums, g, live, a, b, d);
+        for (u64 k = lane; k < length; k += 32) {
+            u64 i = axis == 0u ? (u64)members[k / cols] * cols + k % cols : (axis == 1u ? (k / size) * cols + members[k % size] : (u64)members[k]);
+            double ea = 0.0, eb = 0.0, ed = 0.0;
+            if (body(i, g, ea, eb, ed)) { a += ea; b += eb; d += ed; }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            a += __shfl_down_sync(0xffffffffu, a, o);
+            b += __shfl_down_sync(0xffffffffu, b, o);
+            d += __shfl_down_sync(0xffffffffu, d, o);
+        }
+        if (lane == 0 && a > 0.0) {
+            sums[3 * (u64)g] += a;
+            sums[3 * (u64)g + 1] += b;
+            sums[3 * (u64)g + 2] += d;
+        }
     }
 }
 
@@ -3727,11 +3747,14 @@ extern "C" __global__ void group_curvature_f32_bf16(u64 n, u64 cols, unsigned in
     group_curvature_body<float, unsigned short>(n, cols, axis, chunks, count, factor, mean, log_sd, groups, sums);
 }
 
-// `Device::group_code_length`: one entry per group, every one into row `slot`.
+// `Device::group_code_length`: one entry per group, every one into row `slot`, summed by the first
+// warp alone in a fixed order (lane by lane, then by shuffles), so the sum is the same on every run.
 extern "C" __global__ void group_code_length(u64 n, u64 slot, const double* divergence, const double* variance, const double* weight, const double* constant,
     const double* initial, double* sums) {
-    WARP_STRIDE(g, n) {
-        bool live = g < n && weight[g] != 0.0;
+    if (blockIdx.x != 0 || threadIdx.x >= 32) return;
+    double a = 0.0, total = 0.0;
+    for (u64 g = threadIdx.x; g < n; g += 32) {
+        bool live = weight[g] != 0.0;
         double b = 0.0;
         if (live) {
             double exponent = round(log2(variance[g]) - log2(initial[g]));
@@ -3745,7 +3768,16 @@ extern "C" __global__ void group_code_length(u64 n, u64 slot, const double* dive
             }
             b = weight[g] * (divergence[g] + constant[g] + 0.6931471805599453 * bits);
         }
-        group_add(sums, (unsigned int)slot, live, live ? 1.0 : 0.0, b, 0.0);
+        a += live ? 1.0 : 0.0;
+        total += b;
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        a += __shfl_down_sync(0xffffffffu, a, o);
+        total += __shfl_down_sync(0xffffffffu, total, o);
+    }
+    if (threadIdx.x == 0 && a > 0.0) {
+        sums[3 * slot] += a;
+        sums[3 * slot + 1] += total;
     }
 }
 
@@ -5195,7 +5227,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).arg(&step.gradient_scale).arg(&step.factor_scale).arg(&step.tokens).arg(&step.rate).arg(&step.beta1).arg(&step.beta2).arg(&c1).arg(&noise);
             let split = u32::from(step.split);
             builder.arg(&step.trust).arg(&split);
-            builder.input(gradient, gradients)?.input(factor, gradients)?.arg(index_slice(&groups.ids)?).arg(slice(variance)?);
+            builder.input(gradient, gradients)?.input(factor, gradients)?.arg(index_slice(&groups.layout)?).arg(slice(variance)?);
             builder.output(mean, storage)?.output(log_sd, storage)?.output(momentum, moments)?.output(curvature, storage)?.output(power, storage)?.arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers in their storages, float64 group buffers of
             // `count` rows, ids per the map's axis; ids at or beyond `count` are skipped.
@@ -5207,7 +5239,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             let (f, count) = (self.posterior_kernel("group_moments", storage)?, sums.rows as u64);
             let (cols, axis, chunks) = (groups.cols as u64, groups.code(), groups.chunks() as u64);
             let mut builder = self.stream.launch_builder(&f);
-            builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(&groups.ids)?).arg(slice_mut(sums)?);
+            builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(&groups.layout)?).arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers, checked by the caller; float64 sums of `count` rows.
             unsafe { builder.launch(cfg_elements(groups.threads() as u64)) }.gpu_ctx("tensor group_moments").map(|_| ())
         }
@@ -5222,7 +5254,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             let count = sums.rows as u64;
             let (cols, axis, chunks) = (groups.cols as u64, groups.code(), groups.chunks() as u64);
             let mut builder = self.stream.launch_builder(&f);
-            builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).input(factor, factors)?.input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(&groups.ids)?).arg(slice_mut(sums)?);
+            builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).input(factor, factors)?.input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(&groups.layout)?).arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers, checked by the caller; float64 sums of `count` rows.
             unsafe { builder.launch(cfg_elements(groups.threads() as u64)) }.gpu_ctx("tensor group_curvature").map(|_| ())
         }
@@ -5240,7 +5272,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             builder.arg(&n).arg(&slot).arg(slice(divergence)?).arg(slice(variance)?).arg(slice(weight)?).arg(slice(constant)?).arg(slice(initial)?).arg(slice_mut(sums)?);
             // SAFETY: groups × 1 float64 inputs and a rows × 3 float64 sum, the slot inside it,
             // checked by the caller.
-            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor group_code_length").map(|_| ())
+            unsafe { builder.launch(cfg_elements(32)) }.gpu_ctx("tensor group_code_length").map(|_| ())
         }
 
         pub(super) fn resolved_counts(
@@ -6147,13 +6179,25 @@ inline uint group_of(device const uint* ids, constant Posterior& p, uint i) {
     return p.axis == 0u ? ids[i / p.cols] : (p.axis == 1u ? ids[i % p.cols] : ids[i]);
 }
 
-// A column map's thread t: column t % cols summed over rows t / cols, t / cols + chunks, ... (a
-// column's entries are a row apart, so a SIMD group's lanes hold different groups), added once.
-inline void column_add(device float* sums, uint g, float a, float b, float c) {
-    if (a > 0.0f) {
-        atomic_fetch_add_explicit((device atomic_float*)(sums + 3 * g), a, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)(sums + 3 * g + 1), b, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)(sums + 3 * g + 2), c, memory_order_relaxed);
+// Segment s of an operator's group map (`GroupMap`'s layout: `p.chunks + 1` offsets, the
+// segments' groups, then their members), one per SIMD group: its group, the start `off` and count
+// `size` of its members, and its entries' count; entry k of the segment is `segment_entry`.
+inline uint segment_length(constant Posterior& p, uint size) {
+    return p.axis == 0u ? size * p.cols : (p.axis == 1u ? size * (p.n / p.cols) : size);
+}
+
+inline uint segment_entry(device const uint* layout, constant Posterior& p, uint off, uint size, uint k) {
+    device const uint* members = layout + 2u * p.chunks + 1u + off;
+    return p.axis == 0u ? members[k / p.cols] * p.cols + k % p.cols : (p.axis == 1u ? (k / size) * p.cols + members[k % size] : members[k]);
+}
+
+// A segment's lanes' sums added across its SIMD group, and the totals added to its group's row by
+// the first lane: a group is one segment and dispatches run in order, so nothing is atomic and the
+// sums are the same on every run.
+inline void segment_add(device float* sums, uint g, uint lane, float a, float b, float c) {
+    a = simd_sum(a); b = simd_sum(b); c = simd_sum(c);
+    if (lane == 0u && a > 0.0f) {
+        sums[3 * g] += a; sums[3 * g + 1] += b; sums[3 * g + 2] += c;
     }
 }
 
@@ -6213,88 +6257,69 @@ inline void ivon_entry(uint i, uint g, device const float* gradient, device cons
     a = 1.0f; b = mu * mu + exp(2.0f * s); c = 2.0f * s;
 }
 
-// One thread per entry (every lane reaches `group_add`), or per column and row chunk for a column
-// map (`column_add`).
-kernel void t_posterior_ivon(device const float* gradient [[buffer(0)]], device const uint* groups [[buffer(1)]], device const float* variance [[buffer(2)]],
+// One SIMD group per segment of the group map, each lane stepping every 32nd of its entries.
+kernel void t_posterior_ivon(device const float* gradient [[buffer(0)]], device const uint* layout [[buffer(1)]], device const float* variance [[buffer(2)]],
                              device float* mean [[buffer(3)]], device float* log_sd [[buffer(4)]], device float* momentum [[buffer(5)]], device float* curvature [[buffer(6)]],
                              device float* sums [[buffer(7)]], device const float* factor [[buffer(8)]], device float* power [[buffer(9)]],
                              constant Posterior& p [[buffer(10)]], uint i [[thread_position_in_grid]]) {
-    if (p.axis == 1u) {
-        uint rows = p.n / p.cols, col = i % p.cols;
-        if (i >= p.cols * p.chunks || groups[col] >= p.count) return;
-        uint g = groups[col];
-        float a = 0.0f, b = 0.0f, c = 0.0f;
-        for (uint r = i / p.cols; r < rows; r += p.chunks) {
-            uint e = r * p.cols + col;
-            if (log_sd[e] == -INFINITY) continue;
-            float ea, eb, ec;
-            ivon_entry(e, g, gradient, factor, variance, mean, log_sd, momentum, curvature, power, p, ea, eb, ec);
-            a += ea; b += eb; c += ec;
-        }
-        column_add(sums, g, a, b, c);
-        return;
-    }
-    uint g = i < p.n ? group_of(groups, p, i) : 0u;
-    bool live = i < p.n && g < p.count && log_sd[i] != -INFINITY;
+    uint s = i / 32u, lane = i % 32u;
+    if (s >= p.chunks) return;
+    uint g = layout[p.chunks + 1u + s];
+    if (g >= p.count) return;
+    uint off = layout[s], size = layout[s + 1u] - off, length = segment_length(p, size);
     float a = 0.0f, b = 0.0f, c = 0.0f;
-    if (live) {
-        ivon_entry(i, g, gradient, factor, variance, mean, log_sd, momentum, curvature, power, p, a, b, c);
+    for (uint k = lane; k < length; k += 32u) {
+        uint e = segment_entry(layout, p, off, size, k);
+        if (log_sd[e] == -INFINITY) continue;
+        float ea, eb, ec;
+        ivon_entry(e, g, gradient, factor, variance, mean, log_sd, momentum, curvature, power, p, ea, eb, ec);
+        a += ea; b += eb; c += ec;
     }
-    group_add(sums, g, live, a, b, c);
+    segment_add(sums, g, lane, a, b, c);
 }
 
-kernel void t_group_moments(device const float* mean [[buffer(0)]], device const float* log_sd [[buffer(1)]], device const uint* groups [[buffer(2)]],
+kernel void t_group_moments(device const float* mean [[buffer(0)]], device const float* log_sd [[buffer(1)]], device const uint* layout [[buffer(2)]],
                             device float* sums [[buffer(3)]], constant Posterior& p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
-    if (p.axis == 1u) {
-        uint rows = p.n / p.cols, col = i % p.cols;
-        if (i >= p.cols * p.chunks || groups[col] >= p.count) return;
-        float a = 0.0f, b = 0.0f, c = 0.0f;
-        for (uint r = i / p.cols; r < rows; r += p.chunks) {
-            uint e = r * p.cols + col;
-            if (log_sd[e] == -INFINITY) continue;
-            a += 1.0f; b += mean[e] * mean[e] + exp(2.0f * log_sd[e]); c += 2.0f * log_sd[e];
-        }
-        column_add(sums, groups[col], a, b, c);
-        return;
+    uint s = i / 32u, lane = i % 32u;
+    if (s >= p.chunks) return;
+    uint g = layout[p.chunks + 1u + s];
+    if (g >= p.count) return;
+    uint off = layout[s], size = layout[s + 1u] - off, length = segment_length(p, size);
+    float a = 0.0f, b = 0.0f, c = 0.0f;
+    for (uint k = lane; k < length; k += 32u) {
+        uint e = segment_entry(layout, p, off, size, k);
+        if (log_sd[e] == -INFINITY) continue;
+        a += 1.0f; b += mean[e] * mean[e] + exp(2.0f * log_sd[e]); c += 2.0f * log_sd[e];
     }
-    uint g = i < p.n ? group_of(groups, p, i) : 0u;
-    bool live = i < p.n && g < p.count && log_sd[i] != -INFINITY;
-    float a = live ? 1.0f : 0.0f;
-    float b = live ? mean[i] * mean[i] + exp(2.0f * log_sd[i]) : 0.0f;
-    float c = live ? 2.0f * log_sd[i] : 0.0f;
-    group_add(sums, g, live, a, b, c);
+    segment_add(sums, g, lane, a, b, c);
 }
 
 kernel void t_group_curvature(device const float* factor [[buffer(0)]], device const float* mean [[buffer(1)]], device const float* log_sd [[buffer(2)]],
-                              device const uint* groups [[buffer(3)]], device float* sums [[buffer(4)]], constant Posterior& p [[buffer(5)]], uint i [[thread_position_in_grid]]) {
-    if (p.axis == 1u) {
-        uint rows = p.n / p.cols, col = i % p.cols;
-        if (i >= p.cols * p.chunks || groups[col] >= p.count) return;
-        float a = 0.0f, b = 0.0f, c = 0.0f;
-        for (uint r = i / p.cols; r < rows; r += p.chunks) {
-            uint e = r * p.cols + col;
-            if (log_sd[e] == -INFINITY) continue;
-            a += 1.0f; b += factor[e] * mean[e]; c += factor[e] * factor[e] * exp(2.0f * log_sd[e]);
-        }
-        column_add(sums, groups[col], a, b, c);
-        return;
+                              device const uint* layout [[buffer(3)]], device float* sums [[buffer(4)]], constant Posterior& p [[buffer(5)]], uint i [[thread_position_in_grid]]) {
+    uint s = i / 32u, lane = i % 32u;
+    if (s >= p.chunks) return;
+    uint g = layout[p.chunks + 1u + s];
+    if (g >= p.count) return;
+    uint off = layout[s], size = layout[s + 1u] - off, length = segment_length(p, size);
+    float a = 0.0f, b = 0.0f, c = 0.0f;
+    for (uint k = lane; k < length; k += 32u) {
+        uint e = segment_entry(layout, p, off, size, k);
+        if (log_sd[e] == -INFINITY) continue;
+        a += 1.0f; b += factor[e] * mean[e]; c += factor[e] * factor[e] * exp(2.0f * log_sd[e]);
     }
-    uint g = i < p.n ? group_of(groups, p, i) : 0u;
-    bool live = i < p.n && g < p.count && log_sd[i] != -INFINITY;
-    float a = live ? 1.0f : 0.0f;
-    float b = live ? factor[i] * mean[i] : 0.0f;
-    float c = live ? factor[i] * factor[i] * exp(2.0f * log_sd[i]) : 0.0f;
-    group_add(sums, g, live, a, b, c);
+    segment_add(sums, g, lane, a, b, c);
 }
 
-// `Device::group_code_length`, one thread per group, every one into row `p.count`.
+// `Device::group_code_length`, every group into row `p.count`, summed by the first SIMD group alone
+// in a fixed order (lane by lane, then across the lanes), so the sum is the same on every run.
 kernel void t_group_code_length(device const float* divergence [[buffer(0)]], device const float* variance [[buffer(1)]], device const float* weight [[buffer(2)]],
                                 device const float* constants [[buffer(3)]], device const float* initial [[buffer(4)]], device float* sums [[buffer(5)]],
                                 constant Posterior& p [[buffer(6)]], uint i [[thread_position_in_grid]]) {
-    bool live = i < p.n && weight[i] != 0.0f;
-    float b = 0.0f;
-    if (live) {
-        float exponent = round(log2(variance[i]) - log2(initial[i]));
+    if (i >= 32u) return;
+    float a = 0.0f, total = 0.0f;
+    for (uint g = i; g < p.n; g += 32u) {
+        if (weight[g] == 0.0f) continue;
+        float exponent = round(log2(variance[g]) - log2(initial[g]));
         float bits = INFINITY;
         if (isfinite(exponent)) {
             int x = int(exponent);
@@ -6303,9 +6328,13 @@ kernel void t_group_code_length(device const float* divergence [[buffer(0)]], de
             uint prefix = 31u - clz(low + 1u);
             bits = float(low + 2u * prefix + 1u);
         }
-        b = weight[i] * (divergence[i] + constants[i] + 0.6931471805599453f * bits);
+        a += 1.0f;
+        total += weight[g] * (divergence[g] + constants[g] + 0.6931471805599453f * bits);
     }
-    group_add(sums, p.count, live, live ? 1.0f : 0.0f, b, 0.0f);
+    a = simd_sum(a); total = simd_sum(total);
+    if (i == 0u && a > 0.0f) {
+        sums[3 * p.count] += a; sums[3 * p.count + 1] += total;
+    }
 }
 
 // `Device::resolved_counts` in f32, one thread per entry; `p.count` columns, `p.key.x` nonzero
@@ -6772,7 +6801,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
             };
             let buffers = [
                 whole(buffer(gradient)?),
-                whole(index_buffer(&groups.ids)?),
+                whole(index_buffer(&groups.layout)?),
                 whole(buffer(variance)?),
                 whole(buffer(mean)?),
                 whole(buffer(log_sd)?),
@@ -6787,12 +6816,12 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
 
         pub(super) fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &super::GroupMap, sums: &mut Tensor) -> Result<(), GpuError> {
             let p = Posterior { count: u32_of(sums.rows)?, ..Posterior::default() };
-            self.grouped("t_group_moments", &[whole(buffer(mean)?), whole(buffer(log_sd)?), whole(index_buffer(&groups.ids)?), whole(buffer(sums)?)], groups, p)
+            self.grouped("t_group_moments", &[whole(buffer(mean)?), whole(buffer(log_sd)?), whole(index_buffer(&groups.layout)?), whole(buffer(sums)?)], groups, p)
         }
 
         pub(super) fn group_curvature(&self, (factor, mean, log_sd): (&Tensor, &Tensor, &Tensor), groups: &super::GroupMap, sums: &mut Tensor) -> Result<(), GpuError> {
             let p = Posterior { count: u32_of(sums.rows)?, ..Posterior::default() };
-            let buffers = [whole(buffer(factor)?), whole(buffer(mean)?), whole(buffer(log_sd)?), whole(index_buffer(&groups.ids)?), whole(buffer(sums)?)];
+            let buffers = [whole(buffer(factor)?), whole(buffer(mean)?), whole(buffer(log_sd)?), whole(index_buffer(&groups.layout)?), whole(buffer(sums)?)];
             self.grouped("t_group_curvature", &buffers, groups, p)
         }
 

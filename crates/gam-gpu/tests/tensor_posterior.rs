@@ -248,6 +248,9 @@ fn against_host_on(fit: &Device, wide: &Device, c: &Case) {
     let host = Device::host();
     let (theta, mean, log_sd, moments, before, after, divergence) = run(fit, wide, c);
     let (t, m, s, mo, b, a, d) = run(&host, &host, c);
+    // No device sum is atomic (`GroupMap`): a second run is the first bit for bit.
+    let first = (theta.clone(), mean.clone(), log_sd.clone(), moments.clone(), before.clone(), after.clone(), divergence.clone());
+    assert!(run(fit, wide, c) == first, "the device's results repeat bit for bit");
     // A group sums at most `n` entries; the step reads its variance (such a sum over its count),
     // and a second moment squares a gradient that carries the variance's error.
     let n = (0..c.count as u32).map(|g| c.groups.iter().filter(|h| **h == g).count()).max().unwrap() as f64;
