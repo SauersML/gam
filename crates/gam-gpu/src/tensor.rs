@@ -418,8 +418,8 @@ impl GroupMap {
         self.segments
     }
 
-    /// The threads a reduction over the map runs: one warp (SIMD group) of 32 per segment.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// The threads an Apple GPU reduction over the map runs: one SIMD group of 32 per segment.
+    #[cfg(target_os = "macos")]
     fn threads(&self) -> usize {
         32 * self.segments
     }
