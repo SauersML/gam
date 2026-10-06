@@ -2452,7 +2452,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.rms_gain(x, gain, epsilon, bf16),
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+            Backend::Metal(engine) => engine.rms_gain(x, gain, epsilon, bf16),
         }
     }
 
@@ -2481,7 +2481,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.rms_gain_backward((x, gain, rstd), gy, gx),
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+            Backend::Metal(engine) => engine.rms_gain_backward((x, gain, rstd), gy, gx),
         }
     }
 
@@ -2501,7 +2501,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.heads_rope(p, layout, norm, rotation),
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+            Backend::Metal(engine) => engine.heads_rope(p, layout, norm, rotation),
         }
     }
 
@@ -2519,7 +2519,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.heads_rope_backward(p, layout, norm, rotation, gy),
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+            Backend::Metal(engine) => engine.heads_rope_backward(p, layout, norm, rotation, gy),
         }
     }
 
@@ -2587,7 +2587,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.swiglu(h, bf16),
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+            Backend::Metal(engine) => engine.swiglu(h, bf16),
         }
     }
 
@@ -2613,7 +2613,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.swiglu_backward(h, ga),
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+            Backend::Metal(engine) => engine.swiglu_backward(h, ga),
         }
     }
 
@@ -2635,7 +2635,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.gelu_tanh(h, bias, bf16),
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+            Backend::Metal(engine) => engine.gelu_tanh(h, bias, bf16),
         }
     }
 
@@ -2654,7 +2654,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.gelu_tanh_backward(h, bias, ga),
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
+            Backend::Metal(engine) => engine.gelu_tanh_backward(h, bias, ga),
         }
     }
 
@@ -7065,6 +7065,179 @@ kernel void t_attention_sums(device const float* out [[buffer(0)]], device const
 }
 "#;
 
+    /// The decoder layer's fused operations on the Apple GPU, in f32 (`decoder.cu`'s twins): the
+    /// RMS norm with its gain, the heads' norms and rotation, and the MLP activations, each forward
+    /// and backward. A value asked for in bfloat16 is rounded to it (to nearest, ties to even) and
+    /// kept in f32 storage, as the host does.
+    const DECODER: &str = r#"
+// x rounded to bfloat16, as an f32.
+inline float bf16_round(float x) {
+    uint b = as_type<uint>(x);
+    if (x != x) return x;
+    b = (b + 0x7fffu + ((b >> 16) & 1u)) & 0xffff0000u;
+    return as_type<float>(b);
+}
+
+// Row r of x (rows × cols): k = 1/√(mean x² + ε) (p.alpha = ε), y = x k g, rounded to bfloat16 when
+// p.a; k into rstd.
+kernel void t_rms_gain(device const float* x [[buffer(0)]], device const float* g [[buffer(1)]], device float* y [[buffer(2)]], device float* rstd [[buffer(3)]],
+                       constant P& p [[buffer(4)]], uint group [[threadgroup_position_in_grid]], uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float shared[GROUP];
+    ROWS {
+        device const float* xr = x + (ulong)r * p.cols;
+        float squares = 0.0f;
+        for (uint c = t; c < p.cols; c += GROUP) squares = fma(xr[c], xr[c], squares);
+        float k = 1.0f / sqrt(group_sum(squares, shared, t) / (float)p.cols + p.alpha);
+        if (t == 0) rstd[r] = k;
+        for (uint c = t; c < p.cols; c += GROUP) {
+            float v = xr[c] * k * g[c];
+            y[(ulong)r * p.cols + c] = p.a != 0 ? bf16_round(v) : v;
+        }
+    }
+}
+
+// The input cotangent of t_rms_gain added into gx: k gy g − (k³/d) x Σ gy g x.
+kernel void t_rms_gain_backward(device const float* x [[buffer(0)]], device const float* g [[buffer(1)]], device const float* rstd [[buffer(2)]], device const float* gy [[buffer(3)]],
+                                device float* gx [[buffer(4)]], constant P& p [[buffer(5)]], uint group [[threadgroup_position_in_grid]], uint groups [[threadgroups_per_grid]],
+                                uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float shared[GROUP];
+    ROWS {
+        ulong base = (ulong)r * p.cols;
+        float dot = 0.0f;
+        for (uint c = t; c < p.cols; c += GROUP) dot = fma(gy[base + c] * g[c], x[base + c], dot);
+        dot = group_sum(dot, shared, t);
+        float k = rstd[r];
+        float coefficient = k * k * k * dot / (float)p.cols;
+        for (uint c = t; c < p.cols; c += GROUP) gx[base + c] = gx[base + c] + (k * gy[base + c] * g[c] - coefficient * x[base + c]);
+    }
+}
+
+// The pair of coordinates of rotary plane `plane` (rotate-half when `split`, else interleaved).
+inline uint2 plane_pair(uint plane, uint planes, bool split) {
+    return split ? uint2(plane, plane + planes) : uint2(2u * plane, 2u * plane + 1u);
+}
+
+// Projections pr (rows × heads of width p.cols: p.a query heads, then p.b key heads, then p.b value
+// heads) into y, each query and key head RMS-normed with its gain row when p.d & 2 (ε = p.alpha;
+// rstd, rows × (q + kv), its scales) and turned by its row's angles (cos, sin: rows × p.c planes,
+// rotate-half when p.d & 1); values copied. One simdgroup per (row, head).
+kernel void t_heads_rope(device const float* pr [[buffer(0)]], device const float* gains [[buffer(1)]], device const float* cosines [[buffer(2)]], device const float* sines [[buffer(3)]],
+                         device float* y [[buffer(4)]], device float* rstd [[buffer(5)]], constant P& p [[buffer(6)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    uint q = p.a, kv = p.b, w = p.cols, planes = p.c, heads = q + 2u * kv;
+    bool split = (p.d & 1u) != 0, normed = (p.d & 2u) != 0;
+    for (ulong item = gid / 32u; item < (ulong)p.rows * heads; item += grid / 32u) {
+        uint r = (uint)(item / heads), h = (uint)(item % heads);
+        ulong base = ((ulong)r * heads + h) * w;
+        device const float* x = pr + base;
+        if (h >= q + kv) {
+            for (uint i = lane; i < w; i += 32u) y[base + i] = x[i];
+            continue;
+        }
+        float k = 1.0f;
+        if (normed) {
+            float s = 0.0f;
+            for (uint i = lane; i < w; i += 32u) s = fma(x[i], x[i], s);
+            k = 1.0f / sqrt(simd_sum(s) / (float)w + p.alpha);
+            if (lane == 0) rstd[(ulong)r * (q + kv) + h] = k;
+        }
+        device const float* gh = gains + (ulong)h * w;
+        for (uint plane = lane; plane < planes; plane += 32u) {
+            uint2 ab = plane_pair(plane, planes, split);
+            float za = normed ? x[ab.x] * k * gh[ab.x] : x[ab.x], zb = normed ? x[ab.y] * k * gh[ab.y] : x[ab.y];
+            float c = cosines[(ulong)r * planes + plane], sn = sines[(ulong)r * planes + plane];
+            y[base + ab.x] = c * za - sn * zb;
+            y[base + ab.y] = sn * za + c * zb;
+        }
+        for (uint i = 2u * planes + lane; i < w; i += 32u) y[base + i] = normed ? x[i] * k * gh[i] : x[i];
+    }
+}
+
+// The input cotangent of t_heads_rope from its output's gy: the rotation's transpose, then the
+// norm's k gz γ − (k³/w) x Σ gz γ x.
+kernel void t_heads_rope_backward(device const float* pr [[buffer(0)]], device const float* gains [[buffer(1)]], device const float* cosines [[buffer(2)]], device const float* sines [[buffer(3)]],
+                                  device const float* rstd [[buffer(4)]], device const float* gy [[buffer(5)]], device float* gp [[buffer(6)]], constant P& p [[buffer(7)]],
+                                  uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint q = p.a, kv = p.b, w = p.cols, planes = p.c, heads = q + 2u * kv;
+    bool split = (p.d & 1u) != 0, normed = (p.d & 2u) != 0;
+    for (ulong item = gid / 32u; item < (ulong)p.rows * heads; item += grid / 32u) {
+        uint r = (uint)(item / heads), h = (uint)(item % heads);
+        ulong base = ((ulong)r * heads + h) * w;
+        device const float* x = pr + base;
+        device const float* g = gy + base;
+        device float* out = gp + base;
+        if (h >= q + kv) {
+            for (uint i = lane; i < w; i += 32u) out[i] = g[i];
+            continue;
+        }
+        for (uint plane = lane; plane < planes; plane += 32u) {
+            uint2 ab = plane_pair(plane, planes, split);
+            float c = cosines[(ulong)r * planes + plane], sn = sines[(ulong)r * planes + plane];
+            float ga = g[ab.x], gb = g[ab.y];
+            out[ab.x] = c * ga + sn * gb;
+            out[ab.y] = -sn * ga + c * gb;
+        }
+        for (uint i = 2u * planes + lane; i < w; i += 32u) out[i] = g[i];
+        if (!normed) continue;
+        simdgroup_barrier(mem_flags::mem_device);
+        device const float* gamma = gains + (ulong)h * w;
+        float k = rstd[(ulong)r * (q + kv) + h];
+        float dot = 0.0f;
+        for (uint i = lane; i < w; i += 32u) dot = fma(out[i] * gamma[i], x[i], dot);
+        dot = simd_sum(dot);
+        float coefficient = k * k * k * dot / (float)w;
+        simdgroup_barrier(mem_flags::mem_device);
+        for (uint i = lane; i < w; i += 32u) out[i] = k * out[i] * gamma[i] - coefficient * x[i];
+    }
+}
+
+inline float sigmoid(float x) { return 1.0f / (1.0f + exp(-x)); }
+
+// The gated MLP's activations from h (rows × 2m: gates, then inputs; p.cols = m): silu(gate) · input,
+// rounded to bfloat16 when p.a.
+kernel void t_swiglu(device const float* h [[buffer(0)]], device float* a [[buffer(1)]], constant P& p [[buffer(2)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        ulong r = i / p.cols, j = i % p.cols;
+        float g = h[r * 2 * p.cols + j], u = h[r * 2 * p.cols + p.cols + j];
+        float v = g * sigmoid(g) * u;
+        a[i] = p.a != 0 ? bf16_round(v) : v;
+    }
+}
+
+kernel void t_swiglu_backward(device const float* h [[buffer(0)]], device const float* ga [[buffer(1)]], device float* gh [[buffer(2)]], constant P& p [[buffer(3)]],
+                              uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        ulong r = i / p.cols, j = i % p.cols;
+        float g = h[r * 2 * p.cols + j], u = h[r * 2 * p.cols + p.cols + j], s = sigmoid(g), d = ga[i];
+        gh[r * 2 * p.cols + j] = d * u * s * (1.0f + g * (1.0f - s));
+        gh[r * 2 * p.cols + p.cols + j] = d * g * s;
+    }
+}
+
+// GELU in its tanh form of h plus the bias row (when p.b; p.cols = m), rounded to bfloat16 when p.a.
+kernel void t_gelu_tanh(device const float* h [[buffer(0)]], device const float* bias [[buffer(1)]], device float* a [[buffer(2)]], constant P& p [[buffer(3)]],
+                        uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    const float c = 0.7978845608028654f, k = 0.044715f;
+    ELEMENTS {
+        float x = h[i] + (p.b != 0 ? bias[i % p.cols] : 0.0f);
+        float v = 0.5f * x * (1.0f + tanh(c * (x + k * x * x * x)));
+        a[i] = p.a != 0 ? bf16_round(v) : v;
+    }
+}
+
+kernel void t_gelu_tanh_backward(device const float* h [[buffer(0)]], device const float* bias [[buffer(1)]], device const float* ga [[buffer(2)]], device float* gh [[buffer(3)]],
+                                 constant P& p [[buffer(4)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    const float c = 0.7978845608028654f, k = 0.044715f;
+    ELEMENTS {
+        float x = h[i] + (p.b != 0 ? bias[i % p.cols] : 0.0f);
+        float t = tanh(c * (x + k * x * x * x));
+        gh[i] = ga[i] * (0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * c * (1.0f + 3.0f * k * x * x));
+    }
+}
+"#;
+
+    const DECODER_NAMES: &[&str] = &["t_rms_gain", "t_rms_gain_backward", "t_heads_rope", "t_heads_rope_backward", "t_swiglu", "t_swiglu_backward", "t_gelu_tanh", "t_gelu_tanh_backward"];
+
     const ATTENTION_NAMES: &[&str] = &[
         "t_attention_forward_64",
         "t_attention_keys_64",
@@ -7203,8 +7376,8 @@ kernel void t_attention_sums(device const float* out [[buffer(0)]], device const
             static ENGINE: std::sync::OnceLock<Result<std::sync::Arc<super::Backend>, GpuError>> = std::sync::OnceLock::new();
             ENGINE
                 .get_or_init(|| {
-                    let source = [KERNELS, ATTENTION, include_str!("attention_f32.inc"), ATTENTION_KERNELS].concat();
-                    let names: Vec<&'static str> = NAMES.iter().chain(ATTENTION_NAMES).copied().collect();
+                    let source = [KERNELS, DECODER, ATTENTION, include_str!("attention_f32.inc"), ATTENTION_KERNELS].concat();
+                    let names: Vec<&'static str> = NAMES.iter().chain(DECODER_NAMES).chain(ATTENTION_NAMES).copied().collect();
                     let stream = Stream::new(&runtime.context, &source, &names)?;
                     let every_row = stream.alloc(1)?;
                     let name = format!("{} (Metal, f32)", stream.device_name());
@@ -7227,6 +7400,86 @@ kernel void t_attention_sums(device const float* out [[buffer(0)]], device const
             p.rows = u32_of(rows)?;
             p.cols = u32_of(cols)?;
             self.stream.dispatch(kernel, buffers, &p, rows)
+        }
+
+        /// [`super::Device::rms_gain`]: `y` and the scales `k`.
+        pub(super) fn rms_gain(&self, x: &Tensor, gain: &Tensor, epsilon: f64, bf16: bool) -> Result<(Tensor, Tensor), GpuError> {
+            let (y, k) = (self.tensor(x.rows, x.cols)?, self.tensor(x.rows, 1)?);
+            let p = P { alpha: epsilon as f32, a: u32::from(bf16), ..P::default() };
+            self.rows("t_rms_gain", &[whole(buffer(x)?), whole(buffer(gain)?), whole(buffer(&y)?), whole(buffer(&k)?)], x.rows, x.cols, p)?;
+            Ok((y, k))
+        }
+
+        /// [`super::Device::rms_gain_backward`]: the input cotangent added into `gx`.
+        pub(super) fn rms_gain_backward(&self, (x, gain, rstd): (&Tensor, &Tensor, &Tensor), gy: &Tensor, gx: &mut Tensor) -> Result<(), GpuError> {
+            self.rows("t_rms_gain_backward", &[whole(buffer(x)?), whole(buffer(gain)?), whole(buffer(rstd)?), whole(buffer(gy)?), whole(buffer(gx)?)], x.rows, x.cols, P::default())
+        }
+
+        /// The parameters of `t_heads_rope` and its reverse, and the buffers of the gains and the
+        /// angles (the projections themselves where one is absent: never read then).
+        fn heads_params<'a>(p: &'a Tensor, layout: super::HeadLayout, gains: Option<&'a Tensor>, epsilon: f64, rotation: Option<(&'a Tensor, &'a Tensor, bool)>) -> Result<(P, [&'a Buffer; 3]), GpuError> {
+            let planes = rotation.map_or(0, |(c, _, _)| c.cols);
+            let flags = u32::from(rotation.is_some_and(|r| r.2)) | (u32::from(gains.is_some()) << 1);
+            let params = P { rows: u32_of(p.rows)?, cols: u32_of(layout.width)?, a: u32_of(layout.queries)?, b: u32_of(layout.keys)?, c: u32_of(planes)?, d: flags, alpha: epsilon as f32, ..P::default() };
+            let fallback = buffer(p)?;
+            let (cos, sin) = match rotation {
+                Some((c, s, _)) => (buffer(c)?, buffer(s)?),
+                None => (fallback, fallback),
+            };
+            Ok((params, [gains.map(buffer).transpose()?.unwrap_or(fallback), cos, sin]))
+        }
+
+        /// [`super::Device::heads_rope`]: the heads in f32, and the norms' scales.
+        pub(super) fn heads_rope(&self, p: &Tensor, layout: super::HeadLayout, norm: Option<(&Tensor, f64)>, rotation: Option<(&Tensor, &Tensor, bool)>) -> Result<(Tensor, Option<Tensor>), GpuError> {
+            let y = self.tensor(p.rows, p.cols)?;
+            let scales = norm.map(|_| self.tensor(p.rows, layout.queries + layout.keys)).transpose()?;
+            let (params, [gains, cos, sin]) = Self::heads_params(p, layout, norm.map(|n| n.0), norm.map_or(0.0, |n| n.1), rotation)?;
+            let rstd = scales.as_ref().map(buffer).transpose()?.unwrap_or(buffer(&y)?);
+            let items = p.rows * (layout.queries + 2 * layout.keys);
+            self.stream.dispatch("t_heads_rope", &[whole(buffer(p)?), whole(gains), whole(cos), whole(sin), whole(buffer(&y)?), whole(rstd)], &params, spread(items * 32))?;
+            Ok((y, scales))
+        }
+
+        /// [`super::Device::heads_rope_backward`]: the projections' cotangent.
+        pub(super) fn heads_rope_backward(&self, p: &Tensor, layout: super::HeadLayout, norm: Option<(&Tensor, &Tensor)>, rotation: Option<(&Tensor, &Tensor, bool)>, gy: &Tensor) -> Result<Tensor, GpuError> {
+            let gp = self.tensor(p.rows, p.cols)?;
+            let (params, [gains, cos, sin]) = Self::heads_params(p, layout, norm.map(|n| n.0), 0.0, rotation)?;
+            let rstd = norm.map(|n| buffer(n.1)).transpose()?.unwrap_or(buffer(p)?);
+            let items = p.rows * (layout.queries + 2 * layout.keys);
+            self.stream.dispatch("t_heads_rope_backward", &[whole(buffer(p)?), whole(gains), whole(cos), whole(sin), whole(rstd), whole(buffer(gy)?), whole(buffer(&gp)?)], &params, spread(items * 32))?;
+            Ok(gp)
+        }
+
+        /// [`super::Device::swiglu`].
+        pub(super) fn swiglu(&self, h: &Tensor, bf16: bool) -> Result<Tensor, GpuError> {
+            let m = h.cols / 2;
+            let a = self.tensor(h.rows, m)?;
+            self.elements("t_swiglu", &[whole(buffer(h)?), whole(buffer(&a)?)], h.rows * m, P { cols: u32_of(m)?, a: u32::from(bf16), ..P::default() })?;
+            Ok(a)
+        }
+
+        /// [`super::Device::swiglu_backward`].
+        pub(super) fn swiglu_backward(&self, h: &Tensor, ga: &Tensor) -> Result<Tensor, GpuError> {
+            let m = h.cols / 2;
+            let gh = self.tensor(h.rows, h.cols)?;
+            self.elements("t_swiglu_backward", &[whole(buffer(h)?), whole(buffer(ga)?), whole(buffer(&gh)?)], h.rows * m, P { cols: u32_of(m)?, ..P::default() })?;
+            Ok(gh)
+        }
+
+        /// [`super::Device::gelu_tanh`].
+        pub(super) fn gelu_tanh(&self, h: &Tensor, bias: Option<&Tensor>, bf16: bool) -> Result<Tensor, GpuError> {
+            let a = self.tensor(h.rows, h.cols)?;
+            let p = P { cols: u32_of(h.cols)?, a: u32::from(bf16), b: u32::from(bias.is_some()), ..P::default() };
+            self.elements("t_gelu_tanh", &[whole(buffer(h)?), whole(bias.map(buffer).transpose()?.unwrap_or(buffer(h)?)), whole(buffer(&a)?)], h.len(), p)?;
+            Ok(a)
+        }
+
+        /// [`super::Device::gelu_tanh_backward`].
+        pub(super) fn gelu_tanh_backward(&self, h: &Tensor, bias: Option<&Tensor>, ga: &Tensor) -> Result<Tensor, GpuError> {
+            let gh = self.tensor(h.rows, h.cols)?;
+            let p = P { cols: u32_of(h.cols)?, b: u32::from(bias.is_some()), ..P::default() };
+            self.elements("t_gelu_tanh_backward", &[whole(buffer(h)?), whole(bias.map(buffer).transpose()?.unwrap_or(buffer(h)?)), whole(buffer(ga)?), whole(buffer(&gh)?)], h.len(), p)?;
+            Ok(gh)
         }
 
         /// [`super::Device::causal_attention`] in f32 (`attention_f32.inc`); rows outside every
