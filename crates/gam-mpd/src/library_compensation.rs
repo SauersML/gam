@@ -554,6 +554,30 @@ mod tests {
     }
 
     #[test]
+    fn the_moved_terms_cancel_a_deleted_copys_own_term() {
+        // Deleting a copy of a surviving function, the compensation reproduces its output exactly,
+        // so under the model the data term does not change: the move's terms equal minus the
+        // deleted output's own, −½ Σ_r c_r u_r² G_kk.
+        let (native, explanation, sequences) = tiny("library_compensation_moved");
+        let mut posterior = Posterior::new(&explanation, CONCENTRATED).expect("the posterior");
+        copy_reads(&explanation, &mut posterior, 0, 0, 1);
+        let output = *explanation.layers[0].functions[1].last().expect("an output group");
+        let device = Device::host();
+        let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let reads = interchange::reads(&native, &sites).expect("the reads");
+        let mut ic = Interchange::new(&device, &native, &sites, &explanation.artifact, &explanation.trainable, reads, 1 << 30, 64).expect("the experiments");
+        let compensation = Compensation::new(&mut ic, &explanation, &posterior, &sequences, 2).expect("the compensation");
+        let trial = compensation.proposal(&posterior, &[output]).expect("the proposal");
+        assert_eq!(compensation.moved_quadratic(&posterior, &posterior, &[output]).unwrap(), 0.0, "no move, no terms");
+        let mlp = &compensation.mlps[0];
+        let (_, curvature) = Compensation::scales(mlp, &posterior, &Compensation::columns(mlp, &posterior));
+        let super::Output::Column(column) = mlp.outputs[1] else { panic!("an own column") };
+        let own: f64 = curvature.iter().zip(posterior.mean[mlp.output].column(column)).map(|(c, u)| c * u * u).sum::<f64>() * mlp.gram[[1, 1]];
+        let moved = compensation.moved_quadratic(&posterior, &trial, &[output]).unwrap();
+        assert!(own > 0.0 && (moved + 0.5 * own).abs() <= 1e-6 * own, "moved {moved:e}, own {own:e}");
+    }
+
+    #[test]
     fn deleting_a_tied_function_moves_a_free_copy_of_it_and_leaves_the_explanation_unchanged() {
         use crate::library_sharing::{Tie, tie};
         let (native, start, sequences) = tiny("library_compensation_tie");
