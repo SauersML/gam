@@ -3148,8 +3148,14 @@ fn expected_divergence(
     prior: Option<&mut (dyn PriorTerm + 'static)>,
 ) -> Result<f64, String> {
     let timed = Instant::now();
-    let mut trial = posterior.clone();
-    trial.remove(removed);
+    // The removal objective's trial arrives with its groups removed: no copy of it.
+    let trial = if removed.is_empty() {
+        std::borrow::Cow::Borrowed(posterior)
+    } else {
+        let mut trial = posterior.clone();
+        trial.remove(removed);
+        std::borrow::Cow::Owned(trial)
+    };
     let cloned = timed.elapsed().as_secs_f64();
     // The trial goes to the device once; each batch's weight sample is drawn there.
     device_posterior.set_values(&trial)?;

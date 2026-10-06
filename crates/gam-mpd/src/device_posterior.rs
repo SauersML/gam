@@ -110,6 +110,16 @@ pub struct DevicePosterior {
     rotations: Vec<Option<Rotation>>,
     matrices: Vec<Tensor>,
     placed: Vec<Option<(Side, usize)>>,
+    /// Per operator, the host `μ` and `s` its device values were last set from
+    /// ([`DevicePosterior::set_values`]) while no step or restore has changed them since: a later
+    /// `set_values` sends only the operators whose values differ in some bit (a removal trial
+    /// changes a few operators of many).
+    uploaded: Vec<Option<(Array2<f64>, Array2<f64>)>>,
+}
+
+/// Whether two host arrays hold the same values bit for bit (`-0.0` differs from `0.0`).
+fn same_bits(a: &Array2<f64>, b: &Array2<f64>) -> bool {
+    a.dim() == b.dim() && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 /// Each trainable operator's entries' groups, row-major.
@@ -233,6 +243,7 @@ impl DevicePosterior {
             rotations: parts.rotations.to_vec(),
             matrices: Vec::new(),
             placed: Vec::new(),
+            uploaded: Vec::new(),
         };
         let (placed, matrices) = crate::library_mdl::rotation_layout(parts.rotations);
         out.matrices = matrices.iter().map(|m| up(m)).collect::<Result<_, _>>()?;
@@ -491,6 +502,7 @@ impl DevicePosterior {
     /// per token. An operator the batch does not reach has neither, and its step takes the
     /// prior's alone.
     pub fn step(&mut self, gradients: &BTreeMap<usize, Tensor>, scale: f64, factor: (&BTreeMap<usize, Tensor>, f64), ivon: &Ivon) -> Result<(), String> {
+        self.uploaded.clear();
         self.steps += 1;
         for (i, &op) in self.operators.iter().enumerate() {
             let zero = |given: Option<&Tensor>| -> Result<Option<Tensor>, String> {
@@ -632,15 +644,21 @@ impl DevicePosterior {
 
     /// `posterior`'s means and log standard deviations onto the device, IVON's state kept, and
     /// the groups' variances and divergences with them (after a removal on the host, whose removed
-    /// entries, `μ = 0` and `s = −∞`, every later step leaves alone).
+    /// entries, `μ = 0` and `s = −∞`, every later step leaves alone). An operator whose values
+    /// are bit for bit those it was last set from, with no step since, is not sent again.
     pub fn set_values(&mut self, posterior: &Posterior) -> Result<(), String> {
         if posterior.mean.len() != self.mean.len() {
             return Err(error("one posterior array per trainable operator required"));
         }
+        self.uploaded.resize_with(self.mean.len(), || None);
         for i in 0..self.mean.len() {
+            if self.uploaded[i].as_ref().is_some_and(|(m, s)| same_bits(m, &posterior.mean[i]) && same_bits(s, &posterior.log_sd[i])) {
+                continue;
+            }
             let mean = self.rotations[i].as_ref().map_or_else(|| posterior.mean[i].clone(), |r| r.undo(&posterior.mean[i]));
             self.mean[i] = self.fitting.upload(mean.view()).map_err(error)?;
             self.log_sd[i] = self.fitting.upload(posterior.log_sd[i].view()).map_err(error)?;
+            self.uploaded[i] = Some((posterior.mean[i].clone(), posterior.log_sd[i].clone()));
         }
         self.restart()
     }
@@ -676,6 +694,7 @@ impl DevicePosterior {
         if held.len() != self.mean.len() || held.iter().zip(&self.mean).any(|(h, m)| h.dim() != (m.rows(), m.cols())) {
             return Err(error("one mean per trainable operator, of its shape, required"));
         }
+        self.uploaded.clear();
         for (mean, values) in self.mean.iter_mut().zip(held) {
             *mean = self.fitting.upload(values.view()).map_err(error)?;
         }
