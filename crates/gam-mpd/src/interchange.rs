@@ -328,7 +328,7 @@ pub fn parts_of(program: &OperatorProgram, layers: usize) -> Result<Vec<Part>, S
         let name = format!("library.l{l}.mlp");
         let at = |part: &str| named.get(format!("{name}.{part}").as_str()).copied();
         let (Some(gate), Some(bias), Some(write)) = (at("gate"), at("gate_bias"), at("out")) else { continue };
-        if at("up").is_some() || at("m_gate").is_none() {
+        if at("up").is_some() || at("sink").is_none() {
             continue;
         }
         let (gate, bias, write) = (program.operators[gate].matrix(), program.operators[bias].matrix(), program.operators[write].matrix());
