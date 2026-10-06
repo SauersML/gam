@@ -2706,13 +2706,20 @@ impl Device {
     /// that term's mean `½ (1 − β₂) Var(ĥ) / (h + δ)` raised `h` without bound under one batch's
     /// heavy-tailed `ĥ = u² / n` (vpd4l, `N = 2^16`: one batch's outlying estimate multiplied `h`
     /// and the description rose from 25 to 152 bits per scored token in one epoch). The step is
-    /// `d = G / (h⁺ + δ)` with `G = m / W' + δ μ` (the bias-corrected momentum plus the prior's
-    /// exact pull) and `h⁺ = max(h, 0)`: IVON's full step from the mean, written to `direction`
-    /// with the mean left as it is (a caller moves it by `η d`, [`Device::posterior_finish`]); and
-    /// `s = −½ ln(N (h⁺ + δ))`, so `σ² ≤ v`: the standard deviation at which the approximated
-    /// `N E_q[ℓ] + KL(q ‖ p)` is stationary for a curvature `h ≥ 0` and the variance `v`. A
-    /// Gauss–Newton estimate is never negative, so without `prior` an `h ≥ 0` stays nonnegative
-    /// (`β₂ h + (1 − β₂) ĥ ≥ 0`; rounding keeps it, since `|fl(ĥ − h)| ≤ h` when `ĥ < h`). Where
+    /// `d = G / (h₀⁺ + δ)` with `G = m / W' + δ μ` (the bias-corrected momentum plus the prior's
+    /// exact pull), `h₀` the curvature before this step's update and `x⁺ = max(x, 0)`: IVON's full
+    /// step from the mean, written to `direction` with the mean left as it is (a caller moves it
+    /// by `η d`, [`Device::posterior_finish`]). The direction is formed before this step's factor
+    /// `u` enters the curvature, so given the batch and the weight sample it does not depend on the
+    /// probe that draws `u`, and `E[c (u · d)²] = dᵀ G_n d` exactly, `G_n` the Gauss–Newton matrix
+    /// per token of the tokens `u` sums and `c = step.factor_scale`: the curvature along `d` that
+    /// the caller's step length reads from `u · d`. From the updated `h` an entry with a large
+    /// `u_i²` would take a short `d_i`, and `(u · d)²` would be biased low. The deviation is
+    /// `s = −½ ln(N (h⁺ + δ))` with the updated `h`, so `σ² ≤ v`: the standard deviation at which
+    /// the approximated `N E_q[ℓ] + KL(q ‖ p)` is stationary for a curvature `h ≥ 0` and the
+    /// variance `v`. A Gauss–Newton estimate is never negative, so without `prior` an `h ≥ 0`
+    /// stays nonnegative (`β₂ h + (1 − β₂) ĥ ≥ 0`; rounding keeps it, since `|fl(ĥ − h)| ≤ h`
+    /// when `ĥ < h`). Where
     /// the expected curvature is negative the Gaussian family has no stationary `σ` at that `δ`:
     /// `h` keeps the signed average, and `σ² = v` is the prior's. Both `h` and `v` depend on the
     /// posterior (`h` is an expectation under `q`, `v` is the empirical-Bayes variance), so the
@@ -2721,7 +2728,7 @@ impl Device {
     ///
     /// Per group into `sums` (groups × 5; float64 on CUDA and the host, f32 on the Apple GPU, as
     /// are `variance` and [`Device::group_divergence`]'s outputs) the terms of the step over its
-    /// live entries: along `d`, `d · d`, `u · d` and `Σ h⁺ d²`; along the direction before the
+    /// live entries: along `d`, `d · d`, `u · d` and `Σ h₀⁺ d²`; along the direction before the
     /// step, `d₀ = (m₀ / W + δ μ) / (h₀⁺ + δ)` from the momentum `m₀` and the curvature `h₀` before
     /// their updates (`m₀ / W = 0` while `W = 0`), the slope `(g + δ μ) · d₀` of this step's
     /// gradient and the slope `Σ (h₀⁺ + δ) d₀²` of the gradient `d₀` was made from (the line
@@ -2781,20 +2788,22 @@ impl Device {
                     let delta = 1.0 / (step.tokens * var[g]);
                     // The direction before the step, from the momentum and the curvature it holds.
                     let (m, h) = (ms[i], hs[i]);
-                    let held = h.max(0.0) + delta;
+                    let (bounded, held) = (h.max(0.0), h.max(0.0) + delta);
                     let previous = (if before > 0.0 { m / before } else { 0.0 } + delta * mu) / held;
                     let data = gv.map_or(0.0, |v| step.gradient_scale * v[i]);
                     let u = uv.map_or(0.0, |v| v[i]);
                     let estimate = step.factor_scale * u * u + rv.map_or(0.0, |v| v[i]);
                     ms[i] = b1 * m + (1.0 - b1) * data;
                     hs[i] = h + (1.0 - b2) * (estimate - h);
+                    // The step's direction from the curvature before this step's draw, its deviation
+                    // from the curvature after it.
                     let positive = hs[i].max(0.0);
-                    let change = (ms[i] / after + delta * mu) / (positive + delta);
+                    let change = (ms[i] / after + delta * mu) / held;
                     log_sds[i] = -0.5 * (step.tokens * (positive + delta)).ln();
                     moves[i] = change;
                     totals[5 * g] += change * change;
                     totals[5 * g + 1] += u * change;
-                    totals[5 * g + 2] += (positive * change) * change;
+                    totals[5 * g + 2] += (bounded * change) * change;
                     totals[5 * g + 3] += (data + delta * mu) * previous;
                     totals[5 * g + 4] += (held * previous) * previous;
                 }
@@ -4379,10 +4388,11 @@ __device__ void group_reduce(u64 n, u64 cols, unsigned int axis, u64 segments, c
 // prior curvature) in T; group sums in double. `inputs` holds 1 with a gradient, 2 with a factor and
 // 4 with a prior curvature; an absent one (a null pointer, never read) is zero. `c0` and `c1` are the
 // momentum's bias corrections before and after the step (`PosteriorStep`). The mean stays; its full
-// step d = G / (h⁺ + δ) goes to `direction`, and each live entry's (d d, u d, (h⁺ d) d,
-// (g + δ μ) d₀, ((h₀⁺ + δ) d₀) d₀) into its group's row of `sums` (groups × 5), d₀ the direction
-// before the step (`Device::posterior_ivon`). An entry the step leaves (removed, or of a group at or
-// beyond `count`) has d = μ − μ.
+// step d = G / (h₀⁺ + δ), h₀ the curvature before this step's draw, goes to `direction`, and each
+// live entry's (d d, u d, (h₀⁺ d) d, (g + δ μ) d₀, ((h₀⁺ + δ) d₀) d₀) into its group's row of `sums`
+// (groups × 5), d₀ the direction before the step (`Device::posterior_ivon`); the deviation takes the
+// stepped curvature h⁺. An entry the step leaves (removed, or of a group at or beyond `count`) has
+// d = μ − μ.
 template <typename T>
 __device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double beta1, double beta2, double c0, double c1,
     unsigned int inputs, const T* gradient, const T* factor, const T* prior, const unsigned int* groups, const double* variance, const T* mean, T* log_sd, T* momentum, T* curvature,
@@ -4398,19 +4408,19 @@ __device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chun
         T delta = prior_precision((T)0, tokens, variance[g]);
         // The direction before the step, from the momentum and the curvature it holds.
         T m = momentum[i], h = curvature[i];
-        T held = (h > zero ? h : zero) + delta;
+        T bounded = h > zero ? h : zero, held = bounded + delta;
         T previous = (m * k0 + delta * mu) / held;
         T gi = given ? weight * gradient[i] : zero, ui = drawn ? factor[i] : zero;
         T estimate = square * ui * ui + (priced ? prior[i] : zero);
         T m1 = b1 * m + o1 * gi;
         T h1 = h + o2 * (estimate - h);
         T positive = h1 > zero ? h1 : zero;
-        T move = (m1 * k1 + delta * mu) / (positive + delta);
+        T move = (m1 * k1 + delta * mu) / held;
         T s = log_deviation(positive + delta, tokens);
         momentum[i] = m1; curvature[i] = h1; log_sd[i] = s;
         direction[i] = move;
         double dd = (double)move, dp = (double)previous;
-        e[0] = dd * dd; e[1] = (double)ui * dd; e[2] = (double)(positive * move) * dd;
+        e[0] = dd * dd; e[1] = (double)ui * dd; e[2] = (double)(bounded * move) * dd;
         e[3] = (double)(gi + delta * mu) * dp; e[4] = (double)(held * previous) * dp;
         return true;
     });
@@ -7471,9 +7481,10 @@ inline void group_add(device float* sums, uint g, bool live, float a, float b, f
 }
 
 // IVON's step (`Device::posterior_ivon`), one SIMD group per segment of the group map, each lane
-// stepping every 32nd of its entries: the mean stays, its full step d = G / (h⁺ + δ) goes to
-// `direction`, and each live entry's (d d, u d, (h⁺ d) d, (g + δ μ) d₀, ((h₀⁺ + δ) d₀) d₀) into its
-// group's row of `sums` (groups × 5) by the segment's first lane, d₀ the direction before the step.
+// stepping every 32nd of its entries: the mean stays, its full step d = G / (h₀⁺ + δ) (h₀ the
+// curvature before this step's draw) goes to `direction`, and each live entry's (d d, u d,
+// (h₀⁺ d) d, (g + δ μ) d₀, ((h₀⁺ + δ) d₀) d₀) into its group's row of `sums` (groups × 5) by the
+// segment's first lane, d₀ the direction before the step.
 // `p.inputs` holds 1 with a gradient, 2 with a factor and 4 with a prior curvature; an absent one
 // is zero (its slot bound to another buffer, not read). `p.c0` and `p.c1` are the momentum's bias
 // corrections before and after the step. An entry the step leaves (removed, or of a group at or
@@ -7499,17 +7510,17 @@ kernel void t_posterior_ivon(device const float* gradient [[buffer(0)]], device 
         }
         // The direction before the step, from the momentum and the curvature it holds.
         float m = momentum[e], h = curvature[e];
-        float held = max(h, 0.0f) + delta;
+        float bounded = max(h, 0.0f), held = bounded + delta;
         float previous = ((p.c0 > 0.0f ? m / p.c0 : 0.0f) + delta * mu) / held;
         float gi = given ? p.scale * gradient[e] : 0.0f, ui = drawn ? factor[e] : 0.0f;
         float estimate = p.fscale * ui * ui + (priced ? prior[e] : 0.0f);
         float m1 = p.beta1 * m + (1.0f - p.beta1) * gi;
         float h1 = h + (1.0f - p.beta2) * (estimate - h);
         float positive = max(h1, 0.0f);
-        float d = (m1 / p.c1 + delta * mu) / (positive + delta);
+        float d = (m1 / p.c1 + delta * mu) / held;
         float sd = -0.5f * log(p.tokens * (positive + delta));
         momentum[e] = m1; curvature[e] = h1; log_sd[e] = sd; direction[e] = d;
-        float weighted = positive * d, fresh = gi + delta * mu, own = held * previous;
+        float weighted = bounded * d, fresh = gi + delta * mu, own = held * previous;
         t0 += d * d; t1 += ui * d; t2 += weighted * d; t3 += fresh * previous; t4 += own * previous;
     }
     t0 = simd_sum(t0); t1 = simd_sum(t1); t2 = simd_sum(t2); t3 = simd_sum(t3); t4 = simd_sum(t4);

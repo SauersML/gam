@@ -465,14 +465,19 @@ impl DevicePosterior {
     /// ([`DevicePosterior::stein_curvature`]). An operator absent from a map has none of it (zero,
     /// nothing allocated): an operator the batch does not reach takes the prior's step alone.
     ///
-    /// The step's length along IVON's direction `d = G / (h⁺ + δ)` ([`Device::posterior_ivon`]) is
-    /// the minimum along `d` of `F`'s Gauss–Newton model, the slope along `d` over the curvature
-    /// along it: `η = r̄ Σ (h⁺ + δ) d² / (ρ̄ Σ h⁺ d² + Σ δ d²)`. The data curvature along `d` is
-    /// `ρ̄ Σ h⁺ d²`: `ρ̄` the average over the steps (uniform, then over about one epoch,
-    /// `w = max(1/t, 1 − β₂)`) of one draw's `c (u · d)² / Σ h⁺ d²` (`u` the step's Gauss–Newton
-    /// factor, `c` the factor turning its square into curvature per token: `E[c (u · d)²] = dᵀ G d`,
-    /// with the entries' joint terms the diagonal `h` omits). The step's own slope
-    /// `G · d = Σ (h⁺ + δ) d²` is its gradient along the direction made from it: `G` carries the
+    /// The step's length along IVON's direction `d = G / (h₀⁺ + δ)` ([`Device::posterior_ivon`],
+    /// `h₀` the curvature before this step's draw) is the minimum along `d` of `F`'s local
+    /// Gauss–Newton quadratic model, not of `F` along the line: the slope along `d` over the
+    /// model's curvature along it, `η = r̄ Σ (h₀⁺ + δ) d² / (ρ̄ Σ h₀⁺ d² + Σ δ d²)`. The data
+    /// curvature along `d` is `ρ̄ Σ h₀⁺ d²`: `ρ̄` the average over the steps (uniform, then over
+    /// about one epoch, `w = max(1/t, 1 − β₂)`) of one draw's `c (u · d)² / Σ h₀⁺ d²` (`u` the
+    /// step's Gauss–Newton factor, `c` the factor turning its square into curvature per token).
+    /// `d` is formed before `u` enters the curvature, so given the batch and the sample
+    /// `E[c (u · d)²] = dᵀ G_n d` exactly, `G_n` the Gauss–Newton matrix per token of the tokens
+    /// `u` sums, with the entries' joint terms the diagonal `h` omits. `ρ̄` averages ratios over
+    /// directions that change from step to step: it stabilizes the step's length and is not the
+    /// current direction's ratio. The step's own slope `G · d = Σ (h₀⁺ + δ) d²` is its gradient
+    /// along the direction made from it: `G` carries the
     /// momentum's noise, and that projection counts the noise's energy as descent. `r̄` makes the
     /// slope unbiased. With `d₀` the direction before the step (from the momentum and the curvature
     /// before their updates, at the current mean and prior), the batch's gradient `g + δ μ` is

@@ -127,7 +127,7 @@ fn reference(c: &Case) -> Stepped {
         let momentum = b1 * m0 + (1.0 - b1) * gr;
         let curvature = h0 + (1.0 - b2) * (estimate - h0);
         let positive = curvature.max(0.0);
-        let d = (momentum / w1 + delta * mu) / (positive + delta);
+        let d = (momentum / w1 + delta * mu) / held;
         moments[0][at] = momentum;
         moments[1][at] = curvature;
         mean[at] = mu - d;
@@ -137,7 +137,7 @@ fn reference(c: &Case) -> Stepped {
         after[(g, 2)] += 2.0 * log_sd[at];
         terms[(g, 0)] += d * d;
         terms[(g, 1)] += u * d;
-        terms[(g, 2)] += (positive * d) * d;
+        terms[(g, 2)] += (h0.max(0.0) * d) * d;
         terms[(g, 3)] += (gr + delta * mu) * previous;
         terms[(g, 4)] += (held * previous) * previous;
     }
@@ -411,6 +411,99 @@ fn a_coordinate_within_its_gradient_noise_settles_at_the_stationary_point() {
     }
 }
 
+/// A softmax regression's step on `fit` (sums on `wide`): logits `z_t = W x_t` over `K` classes at
+/// `n` fixed inputs, and per draw the Gauss–Newton factor `u = Σ_t (e_{y_t} − p_t) x_tᵀ`, each label
+/// `y_t` drawn from `p_t = softmax(z_t)`, so `E[u uᵀ] = G = Σ_t J_tᵀ F_t J_t` (`F_t` the softmax's
+/// Fisher matrix `diag(p_t) − p_t p_tᵀ`). The step's direction `d` is the same for every draw
+/// (with `β₂ = ½` the draw carries half the stepped curvature, so a direction formed from it would
+/// differ draw by draw). Returns over `draws` draws the mean of `c (u · d)²` (`c` the factor
+/// scale, `u · d` the step's terms), its standard error, and the exact `c dᵀ G d`.
+fn direction_is_independent_of_the_probe(fit: &Device, wide: &Device, draws: usize) -> (f64, f64, f64) {
+    let (k, dim, n) = (5, 4, 12);
+    let w = matrix(k, dim, 21, 0.8, 0.0);
+    let x = matrix(n, dim, 22, 1.0, 0.0);
+    let p: Vec<Vec<f64>> = (0..n)
+        .map(|t| {
+            let z: Vec<f64> = (0..k).map(|c| (0..dim).map(|j| w[(c, j)] * x[(t, j)]).sum()).collect();
+            let top = z.iter().copied().fold(f64::MIN, f64::max);
+            let e: Vec<f64> = z.iter().map(|v| (v - top).exp()).collect();
+            let total: f64 = e.iter().sum();
+            e.iter().map(|v| v / total).collect()
+        })
+        .collect();
+    let ids: Vec<u32> = (0..k * dim).map(|i| (i / dim) as u32).collect();
+    let groups = fit.group_map(&ids, (k, dim)).unwrap();
+    let variance = wide.upload_vec(k, 1, (0..k).map(|g| 0.01 * (g + 1) as f64).collect()).unwrap();
+    let step = PosteriorStep { gradient_scale: 1.5, factor_scale: 1.0 / n as f64, tokens: 50.0, beta1: 0.9, beta2: 0.5, weight: 0.5 };
+    let (log_sd, momentum, curvature, gradient) = (matrix(k, dim, 2, 0.5, -3.0), matrix(k, dim, 3, 0.1, 0.0), matrix(k, dim, 4, 0.5, 1.0), matrix(k, dim, 7, 3.0, 0.0));
+    let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
+    let (mean, gradient) = (up(&w), up(&gradient));
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut uniform = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let (mut first, mut total, mut squares) = (None::<Array2<f64>>, 0.0, 0.0);
+    for _ in 0..draws {
+        let mut u = Array2::<f64>::zeros((k, dim));
+        for (t, pt) in p.iter().enumerate() {
+            let r = uniform();
+            let y = (0..k).find(|c| r < pt[..=*c].iter().sum::<f64>()).unwrap_or(k - 1);
+            for (c, pc) in pt.iter().enumerate() {
+                let seed = f64::from(u8::from(c == y)) - pc;
+                for j in 0..dim {
+                    u[(c, j)] += seed * x[(t, j)];
+                }
+            }
+        }
+        let (mut s, mut m, mut h) = (up(&log_sd), up(&momentum), up(&curvature));
+        let (mut direction, mut sums) = (fit.zeros(k, dim).unwrap(), wide.zeros(k, 5).unwrap());
+        fit.posterior_ivon((&mean, &mut s), [&mut m, &mut h], (Some(&gradient), Some(&up(&u)), None), (&groups, &variance), (&mut direction, &mut sums), &step).unwrap();
+        let d = fit.download(&direction).unwrap();
+        match &first {
+            None => first = Some(d),
+            Some(f) => assert_eq!(&d, f, "{}: the direction moved with the probe", fit.name()),
+        }
+        let along: f64 = wide.download(&sums).unwrap().column(1).sum();
+        let x = step.factor_scale * along * along;
+        total += x;
+        squares += x * x;
+    }
+    let d = first.unwrap();
+    // `dᵀ G d = Σ_t a_tᵀ F_t a_t`, `a_t = d x_t` the logits' move along `d`.
+    let exact: f64 = p
+        .iter()
+        .enumerate()
+        .map(|(t, pt)| {
+            let a: Vec<f64> = (0..k).map(|c| (0..dim).map(|j| d[(c, j)] * x[(t, j)]).sum()).collect();
+            let first: f64 = pt.iter().zip(&a).map(|(pc, ac)| pc * ac).sum();
+            pt.iter().zip(&a).map(|(pc, ac)| pc * ac * ac).sum::<f64>() - first * first
+        })
+        .sum::<f64>()
+        * step.factor_scale;
+    let m = total / draws as f64;
+    (m, ((squares / draws as f64 - m * m) / (draws as f64 - 1.0)).sqrt(), exact)
+}
+
+/// On the host over 40,000 label draws the mean of `c (u · d)²` is within five standard errors of
+/// `c dᵀ G d`, the standard error under 2% of it: the curvature along the step's direction that
+/// the step length reads is unbiased. Every accelerator keeps the direction fixed across draws.
+#[test]
+fn a_steps_direction_does_not_depend_on_its_curvature_probe() {
+    let host = Device::host();
+    let (mean, error, exact) = direction_is_independent_of_the_probe(&host, &host, 40_000);
+    assert!((mean - exact).abs() <= 5.0 * error && error < 0.02 * exact, "c (u · d)² averages {mean} against c dᵀ G d = {exact} (standard error {error})");
+    #[cfg(target_os = "macos")]
+    if let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault") {
+        direction_is_independent_of_the_probe(&metal, &metal, 4);
+    }
+    if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
+        direction_is_independent_of_the_probe(&wide.with_storage(Storage::F32).expect("CUDA holds f32"), &wide, 4);
+    }
+}
+
 /// `c`'s sample written by `fit` into a block at (2, 4) of a larger tensor on `out` (`out`'s
 /// storage) holds the whole sample entry for entry and leaves the rest as it was.
 fn sample_in_a_block(fit: &Device, out: &Device) {
@@ -447,8 +540,8 @@ fn a_sample_written_into_a_block_is_the_whole_sample() {
 
 /// IVON's direction from a constant gradient without noise is its full step with the unfiltered
 /// full gradient: from a zero momentum (`W = 0`) each step's bias-corrected momentum `m / W'` is the
-/// gradient `g`, so `d = (g + δ μ) / (h + δ)` and `s = −½ ln(N (h + δ))` from the first step on,
-/// `h = β₂ᵗ h₀` without a curvature estimate. (A filter of the gradient by its measured spread
+/// gradient `g`, so `d = (g + δ μ) / (h_{t−1} + δ)` and `s = −½ ln(N (h_t + δ))` from the first step
+/// on, `h_t = β₂ᵗ h₀` without a curvature estimate. (A filter of the gradient by its measured spread
 /// made no step before a spread was measured, and shrank every step after.)
 fn constant_gradient_steps_fully(fit: &Device, wide: &Device) {
     let (rows, cols, tokens, v) = (2, 5, 64.0, 0.5);
@@ -466,8 +559,8 @@ fn constant_gradient_steps_fully(fit: &Device, wide: &Device) {
         let (mut direction, mut sums) = (fit.zeros(rows, cols).unwrap(), wide.zeros(1, 5).unwrap());
         fit.posterior_ivon((&mu, &mut log_sd), [&mut momentum, &mut curvature], (Some(&g), None, None), (&groups, &variance), (&mut direction, &mut sums), &step).unwrap();
         weight = step.correction();
-        let h = start.mapv(|h0| beta2.powi(t) * h0);
-        let expected = Array2::from_shape_fn((rows, cols), |at| (gradient[at] + delta * mean[at]) / (h[at] + delta));
+        let (held, h) = (start.mapv(|h0| beta2.powi(t - 1) * h0), start.mapv(|h0| beta2.powi(t) * h0));
+        let expected = Array2::from_shape_fn((rows, cols), |at| (gradient[at] + delta * mean[at]) / (held[at] + delta));
         close(&format!("{} step {t}'s direction", fit.name()), &fit.download(&direction).unwrap(), &expected, CHAIN);
         close(&format!("{} step {t}'s log sd", fit.name()), &fit.download(&log_sd).unwrap(), &h.mapv(|h| -0.5 * (tokens * (h + delta)).ln()), CHAIN);
     }
@@ -488,9 +581,9 @@ fn a_constant_gradient_moves_the_mean_by_ivon_s_full_step() {
     }
 }
 
-/// A prior curvature input joins the curvature's average, of either sign, and the deviations and
-/// the direction take its positive part `h⁺`: a curvature pushed below zero keeps the signed
-/// average, and there `σ² = 1 / (N δ) = v`, the prior's.
+/// A prior curvature input joins the curvature's average, of either sign, and the deviations take
+/// its positive part `h⁺` (the direction the curvature before the step): a curvature pushed below
+/// zero keeps the signed average, and there `σ² = 1 / (N δ) = v`, the prior's.
 fn prior_curvature_takes_its_positive_part(fit: &Device, wide: &Device) {
     let (rows, cols, tokens, v) = (3, 4, 64.0, 0.5);
     let delta = 1.0 / (tokens * v);
@@ -512,7 +605,7 @@ fn prior_curvature_takes_its_positive_part(fit: &Device, wide: &Device) {
     let name = fit.name();
     close(&format!("{name} signed curvature"), &fit.download(&curvature).unwrap(), &h, CHAIN);
     close(&format!("{name} log sd"), &fit.download(&log_sd).unwrap(), &positive.mapv(|x| -0.5 * (tokens * (x + delta)).ln()), CHAIN);
-    let expected = Array2::from_shape_fn((rows, cols), |at| (gradient[at] + delta * mean[at]) / (positive[at] + delta));
+    let expected = Array2::from_shape_fn((rows, cols), |at| (gradient[at] + delta * mean[at]) / (start[at].max(0.0) + delta));
     close(&format!("{name} direction"), &fit.download(&direction).unwrap(), &expected, CHAIN);
     for (x, s) in h.iter().zip(fit.download(&log_sd).unwrap().iter()) {
         if *x < 0.0 {
@@ -629,22 +722,24 @@ fn removal_sums_against_host(fit: &Device, wide: &Device) {
 }
 
 /// A step's terms (`posterior_ivon`'s sums) against the group curvatures of its direction on the
-/// same device, for each axis's case: `d · d`, `u · d` and `Σ h⁺ d²` each bit for bit its group
-/// curvature's column 1 (the same entries in the same order; the case's curvature stays positive).
+/// same device, for each axis's case: `d · d`, `u · d` and `Σ h₀⁺ d²` (`h₀` the curvature before
+/// the step) each bit for bit its group curvature's column 1 (the same entries in the same order;
+/// the case's curvature stays positive).
 fn step_terms_match_the_curvatures(fit: &Device, wide: &Device) {
     for axis in AXES {
         let c = case(axis);
         let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
         let groups = fit.group_map(&c.groups, c.mean.dim()).unwrap();
         let (mean, mut log_sd) = (up(&c.mean), up(&c.log_sd));
-        let (mut momentum, mut curvature) = (up(&c.moments[0]), up(&c.moments[1]));
+        let (mut momentum, mut curvature, before) = (up(&c.moments[0]), up(&c.moments[1]), up(&c.moments[1]));
+        assert!(c.moments[1].iter().all(|h| *h > 0.0), "a positive curvature before the step");
         let (gradient, factor, prior) = (up(&c.gradient), up(&c.factor), up(&c.prior));
         let variance = wide.upload_vec(c.count, 1, (0..c.count).map(|g| 0.01 * (g + 1) as f64).collect()).unwrap();
         let (mut direction, mut sums) = (fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap(), wide.zeros(c.count, 5).unwrap());
         fit.posterior_ivon((&mean, &mut log_sd), [&mut momentum, &mut curvature], (Some(&gradient), Some(&factor), Some(&prior)), (&groups, &variance), (&mut direction, &mut sums), &c.step).unwrap();
         assert!(fit.download(&curvature).unwrap().iter().all(|h| *h > 0.0), "{} {axis:?}: a positive curvature", fit.name());
         let mut weighted = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
-        fit.hadamard(&mut weighted, &curvature, &direction, false).unwrap();
+        fit.hadamard(&mut weighted, &before, &direction, false).unwrap();
         let terms = wide.download(&sums).unwrap();
         for (k, x) in [&direction, &factor, &weighted].into_iter().enumerate() {
             let mut part = wide.zeros(c.count, 3).unwrap();
