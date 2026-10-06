@@ -86,9 +86,13 @@ fn main() -> Result<(), String> {
         // A sharing fit's checkpoint (`mpd_library_sharing_2951`) holds its mixture's state: with no
         // candidates its prior is the groups' Gaussian, this explanation's; with candidates it is
         // another prior, which this step does not charge.
-        let progress: serde_json::Value = serde_json::from_slice(&std::fs::read(checkpoint.with_extension("json")).map_err(error)?).map_err(error)?;
-        if progress["prior"]["width"].as_u64().is_some_and(|width| width > 0) {
-            return Err("a checkpoint of a sharing fit with candidates: its prior is not the groups' Gaussian".into());
+        // The JSON is read when it is beside the checkpoint (a pod receives only the paths a run
+        // names).
+        if let Ok(bytes) = std::fs::read(checkpoint.with_extension("json")) {
+            let progress: serde_json::Value = serde_json::from_slice(&bytes).map_err(error)?;
+            if progress["prior"]["width"].as_u64().is_some_and(|width| width > 0) {
+                return Err("a checkpoint of a sharing fit with candidates: its prior is not the groups' Gaussian".into());
+            }
         }
         library_mdl::checkpoint_posterior(&explanation, checkpoint)?
     };
