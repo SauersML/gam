@@ -56,6 +56,7 @@ pub mod library_bodies;
 pub mod library_crossing;
 // A removal's least-squares compensation: an MLP's surviving functions take over deleted ones' output.
 pub mod library_compensation;
+pub mod library_complexity;
 // The removal search: groups without effect first, then units ranked by their predicted change of F.
 pub mod library_removal;
 // Transcoder features as the library's MLP functions: relu(g·x + c) u per feature that fires.
