@@ -28,7 +28,9 @@
 //!    align with evidence (each extracted alone, `library_bodies::align`, by their fit statistic),
 //!    extracted together as one body called at both sites (`library_bodies::rewrite`, a region
 //!    through a head reading through it, `library_crossing::read_through`, then
-//!    `library_bodies::merge`); then each region left as a call of an accepted body it aligns to;
+//!    `library_bodies::merge`), and where each reads through one head, with the two heads made one
+//!    head function as well (`library_crossing::share_writers`: a head and the functions it feeds,
+//!    one unit at both sites); then each region left as a call of an accepted body it aligns to;
 //!    then each region left as its own body. An extraction that pays only through the reuse it
 //!    enables is proposed with that reuse, so a costlier intermediate never ends the search;
 //! 4. reuse by gradient among the accepted bodies: the fit with the mixture prior over bodies
@@ -377,8 +379,25 @@ fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>) -> Re
             let mut child_calls = calls.clone();
             child_calls.extend([first.clone(), second.clone()]);
             let (child, child_calls) = library_bodies::merge(&two, &child_calls, &second.body, &first.body, &alignment)?;
+            // When each region reads through one head of its own layer, the heads can be one head
+            // function too: the head and the functions it feeds one unit at both sites.
+            let heads = match (&pending[i].through, &pending[j].through) {
+                (Some((a, _)), Some((b, _))) if a.len() == 1 && b.len() == 1 && a[0].layer != b[0].layer => Some((a[0].clone(), b[0].clone())),
+                _ => None,
+            };
             let detail = json!({"regions": [&pending[i], &pending[j]], "statistic": statistic, "alignment": alignment});
-            if decide(&mut summary, "extract two regions as one body", detail, child, child_calls, &mut explanation, &mut current, &mut calls)? {
+            let with_heads = |e: &Explanation| heads.as_ref().map(|(a, b)| library_crossing::share_writers(e, a, b)).transpose();
+            let composite = with_heads(&child)?;
+            if decide(&mut summary, "extract two regions as one body", detail.clone(), child, child_calls.clone(), &mut explanation, &mut current, &mut calls)? {
+                if let Some(shared) = with_heads(&warm(&explanation, &current)?)? {
+                    decide(&mut summary, "make the heads the body reads one head function", detail, shared, calls.clone(), &mut explanation, &mut current, &mut calls)?;
+                }
+                accepted = Some((i, j));
+                break;
+            }
+            if let Some(composite) = composite
+                && decide(&mut summary, "extract two regions and the heads they read as one unit", detail, composite, child_calls, &mut explanation, &mut current, &mut calls)?
+            {
                 accepted = Some((i, j));
                 break;
             }
