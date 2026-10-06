@@ -2027,6 +2027,32 @@ fn training_key(seed: u64, batch: usize) -> u64 {
 /// gradient, the Gauss–Newton factor the first scoring's: for a quadratic objective with Hessian
 /// `H` the gradient's terms linear in the noise, `H σ ε` and `−H σ ε`, cancel exactly, where the
 /// split halves leave `(H_A − H_B) σ ε`; the batch is scored twice.
+/// The parts a training step scores a batch's experiments in ([`antithetic_step`]): with `whole`
+/// all of them as given; otherwise the experiments of the first and of the second half of the
+/// batch's bases (the antithetic pair), or all of them together when a half has none. `M`'s
+/// targets are kept per part (`Interchange::targets`), so every scoring of a training batch asks
+/// for them by these parts ([`part_targets`]).
+fn step_parts(batch: &Batch, experiments: Vec<Experiment>, whole: bool) -> Vec<Vec<Experiment>> {
+    if whole {
+        return vec![experiments];
+    }
+    let half = batch.base.len() / 2;
+    let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.into_iter().partition(|e| e.base < half);
+    if first.is_empty() || second.is_empty() {
+        vec![first.into_iter().chain(second).collect()]
+    } else {
+        vec![first, second]
+    }
+}
+
+/// A training batch's experiments in the order of its [`step_parts`], and `M`'s targets for them,
+/// asked for part by part.
+fn part_targets(scorer: &Scorer, batch: &Batch, experiments: Vec<Experiment>, whole: bool) -> Result<(Vec<Experiment>, Targets), String> {
+    let parts = step_parts(batch, experiments, whole);
+    let targets = Targets::joined(parts.iter().map(|part| scorer.experiments.targets(batch, part)).collect::<Result<Vec<_>, String>>()?);
+    Ok((parts.into_iter().flatten().collect(), targets))
+}
+
 /// Returns the experiments in the order of their bits.
 fn antithetic_step(
     scorer: &mut Scorer,
@@ -2056,14 +2082,14 @@ fn antithetic_step(
         }
         return Ok((experiments, bits, gradients, factor));
     }
-    let half = batch.base.len() / 2;
-    let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.into_iter().partition(|e| e.base < half);
-    if first.is_empty() || second.is_empty() {
-        let all: Vec<Experiment> = first.into_iter().chain(second).collect();
+    let mut parts = step_parts(batch, experiments, false);
+    if parts.len() == 1 {
+        let all = parts.pop().ok_or("a batch's experiments")?;
         let targets = targets_of(scorer, &all)?;
         let (bits, gradients, factor) = scorer.evaluate_device(device_posterior, (batch, &all), Some(key), &targets, (true, true))?;
         return Ok((all, bits, gradients, factor.ok_or("no Gauss–Newton factor")?));
     }
+    let (second, first) = (parts.pop().ok_or("a batch's second half")?, parts.pop().ok_or("a batch's first half")?);
     let probed_first = factor_half(key);
     let targets = targets_of(scorer, &first)?;
     let (mut bits, mut gradients, factor) = scorer.evaluate_device(device_posterior, (batch, &first), Some(key), &targets, (true, probed_first))?;
@@ -3555,7 +3581,7 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
         let batch = draw.batch(sequences)?;
         let experiments = scorer.experiments(draw, sequences)?;
         lap(1, &mut timed);
-        let targets = scorer.experiments.targets(&batch, &experiments)?;
+        let (experiments, targets) = part_targets(scorer, &batch, experiments, settings.full_antithetic)?;
         lap(2, &mut timed);
         // One forward pass at the batch's sample, reversed twice: the divergence's gradient (in
         // bits) and a draw of the Gauss–Newton factor.
@@ -3667,7 +3693,7 @@ fn collection_divergence(
         let batch = draw.batch(sequences)?;
         preparing += started.elapsed().as_secs_f64();
         let started = Instant::now();
-        let targets = scorer.experiments.targets(&batch, &experiments)?;
+        let (experiments, targets) = part_targets(scorer, &batch, experiments, settings.full_antithetic)?;
         targeting += started.elapsed().as_secs_f64();
         let started = Instant::now();
         let scored = scorer.evaluate_device(device_posterior, (&batch, &experiments), Some(key), &targets, (false, false))?.0;

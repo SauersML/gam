@@ -2420,6 +2420,11 @@ struct TargetStore {
 }
 
 impl Targets {
+    /// The targets of several lists of experiments, in order: those of the lists' concatenation.
+    pub fn joined(parts: impl IntoIterator<Item = Targets>) -> Targets {
+        Targets { rows: parts.into_iter().flat_map(|t| t.rows).collect() }
+    }
+
     /// Per experiment its rows' `μ` and `Σ p log p`, on the host.
     pub fn host(&self, d: &Device) -> Result<Vec<(ndarray::Array2<f64>, Vec<f64>)>, String> {
         self.rows.iter().map(|t| Ok((d.download(&t.mu).map_err(error)?, t.entropy.clone()))).collect()
