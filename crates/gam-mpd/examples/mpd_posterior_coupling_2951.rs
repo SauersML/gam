@@ -138,7 +138,7 @@ fn main() -> Result<(), String> {
         _ => return Err(USAGE.into()),
     };
     let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
-    let reads = interchange::library_reads(&explanation.artifact.program, sites.len())?;
+    let reads = interchange::reads(&native, &sites)?;
     let mut ic = Interchange::new(&device, &native, &sites, &explanation.artifact, &explanation.trainable, reads, settings.fit.numeric_bytes, settings.fit.head_tile_rows)?;
     let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
     let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();

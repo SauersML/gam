@@ -238,7 +238,7 @@ fn main() -> Result<(), String> {
         _ => return Err(USAGE.into()),
     };
     let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
-    let reads = interchange::library_reads(&explanation.artifact.program, sites.len())?;
+    let reads = interchange::reads(&native, &sites)?;
     let trainable = explanation.trainable.clone();
     let mut ic = Interchange::new(&device, &native, &sites, &explanation.artifact, &trainable, reads, settings.fit.numeric_bytes, settings.fit.head_tile_rows)?;
     let variables = ic.variables().to_vec();
@@ -247,7 +247,7 @@ fn main() -> Result<(), String> {
         let (_, p) = ic.models();
         BlockEngine::device(&p).upload(head_matrix(&flat, BlockEngine::width(&p))?.view()).map_err(error)?
     };
-    // The experiments' fixed directions are M's reads, the library's start.
+    // The trainable operators' shapes, at the library's start.
     let starting: Vec<Array2<f64>> = trainable.iter().map(|op| explanation.artifact.program.operators[*op].matrix()).collect();
     let shapes: Vec<(usize, usize)> = starting.iter().map(Array2::dim).collect();
     let sd: Vec<Array2<f64>> = posterior.log_sd.iter().map(|s| s.mapv(f64::exp)).collect();
@@ -271,8 +271,7 @@ fn main() -> Result<(), String> {
         let pick = |indices: &[usize]| indices.iter().map(|i| train[*i].clone()).collect::<Vec<_>>();
         let batch = Batch::new(pick(&bases), pick(&sources))?;
         let experiments = interchange::sample(&mut rng, bases.len(), &variables, 2 * layer_count, settings.context)?;
-        let design = ic.design_at(&variables, &experiments, &starting)?;
-        let targets = ic.targets(&batch, &experiments, &design)?;
+        let targets = ic.targets(&batch, &experiments)?;
         let noise: Vec<Array2<f64>> = shapes.iter().map(|dim| standard_normal(&mut rng, *dim)).collect();
         let sample = |sign: f64| -> Vec<Array2<f64>> {
             posterior.mean.iter().zip(&sd).zip(&noise).map(|((mu, s), e)| Zip::from(mu).and(s).and(e).map_collect(|m, s, e| m + sign * s * e)).collect()
@@ -280,7 +279,7 @@ fn main() -> Result<(), String> {
         let d = ic.models().1.program.device().clone();
         ic.load(&sample(1.0))?;
         let clock = Instant::now();
-        let plus = downloaded(&d, &trainable, &shapes, &ic.evaluate_resident(&batch, &experiments, &design, &targets, true)?.gradient)?;
+        let plus = downloaded(&d, &trainable, &shapes, &ic.evaluate_resident(&batch, &experiments, &targets, true)?.gradient)?;
         full_seconds += clock.elapsed().as_secs_f64();
         let base_tokens: Vec<&[u32]> = batch.base.iter().map(Vec::as_slice).collect();
         let mut local = Vec::with_capacity(2);
@@ -291,7 +290,7 @@ fn main() -> Result<(), String> {
         }
         let factor = downloaded(&d, &trainable, &shapes, &sampled_label_gradient(&ic, &head, &base_tokens, &mut rng)?)?;
         ic.load(&sample(-1.0))?;
-        let minus = downloaded(&d, &trainable, &shapes, &ic.evaluate_resident(&batch, &experiments, &design, &targets, true)?.gradient)?;
+        let minus = downloaded(&d, &trainable, &shapes, &ic.evaluate_resident(&batch, &experiments, &targets, true)?.gradient)?;
         for (i, total) in totals.iter_mut().enumerate() {
             total.full += dot(&plus[i], &plus[i]);
             for (kind, c) in local.iter().enumerate() {

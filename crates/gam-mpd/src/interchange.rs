@@ -11,27 +11,22 @@
 //!   uniformly among the sets of that size, so the autonomous `P` (`k = 2L`) and each single
 //!   replacement keep probability `1/(2L)` and every combination of blocks is tested, not only
 //!   prefixes (exact abstraction under the identity alignment requires every hybrid to match `M`);
-//! * and patches at one position `t₀` of distinct blocks (none, one read patch, a joint read
-//!   patch of several variables of one block, or the complements at a set of blocks), applied by
-//!   both models; at a block `B`, on the read's row `t₀` only (the variables are a direction at a
-//!   position):
-//!   - a read patch of one of the read variables at `B` (an MLP function's gate direction `g_i`,
-//!     or an attention function's query, key or value read map, a subspace), with orthonormal
-//!     basis `Q`: the read becomes `h + (s − h) Q Qᵀ`, the source's coordinates in the variable;
-//!     a joint read patch of several variables takes `Q` a basis of their span, all of them at
-//!     once;
-//!   - a complement patch at `B`, with `Q` an orthonormal basis of the span of all of `P`'s read
-//!     directions at `B`: the read becomes `s + (h − s) Q Qᵀ`, the source's coordinates outside
-//!     every read of `P`. `P` predicts no effect, so `M` must show none.
+//! * and at most one patch, at one position `t₀` of one block `B`, applied by both models: a read
+//!   patch of one of `M`'s functions at `B` (the variables: an MLP function's gate pre-activation
+//!   `a_i·x̂ + c_i`, with its up pre-activation `b_i·x̂ + e_i` for a gated law; a head's query, key
+//!   or value vector, a key or value map its group's query heads share being one variable), or a
+//!   joint read patch of several of them at once. A patch replaces each variable's value at row
+//!   `t₀` by its value on `x′`, and nothing else: the other functions keep reading the base's
+//!   stream, so the experiment intervenes on the explanation's variables alone, the interchange
+//!   intervention of causal abstraction.
 //!
-//! `h` is the model's read value at `B` and `t₀` on `x` and `s` its own read value at `B` and `t₀`
-//! on `x′`: `M`'s for `M_e`, the same hybrid's for `P_e`. Only the block's projections read the read
-//! node, so the patch is path-specific: the residual passthrough keeps the base's stream. `Q` is
-//! data, computed from `P`'s current reads ([`design`]): the right singular vectors whose singular
-//! values are resolved from zero by their rounding band. No gradient passes through it. The
-//! gradient does pass through `s`: a read cotangent `ḡ` splits into the base's `ḡ − ḡ Q Qᵀ` and
-//! the source's `ḡ Q Qᵀ` (the complement's the other way round), and the source's part flows back
-//! through the hybrid's run on `x′`.
+//! Each model patches its own variables: `M` its native functions, `P` the call sites that replaced
+//! them (`Artifact::owners`: a head's or an MLP's rule, or the unit of a body at a call). A
+//! function `P` no longer computes has no value to patch in `P`, so only `M_e` changes, and the
+//! experiment tests that the function does not matter. The source's value is the same model's own
+//! on `x′`: `M`'s for `M_e`, the same hybrid's for `P_e`. The gradient passes through it: the
+//! cotangent of a patched entry flows to the source's run on `x′`, the base's own entry there
+//! receives none.
 //!
 //! The data term is `Σ_e Σ_{t ≥ t₀} KL(M_e ‖ P_e)` over the tokens `t` of each base from the
 //! experiment's position on (an unpatched experiment's position is 0), in bits ([`evaluate`]),
@@ -45,10 +40,10 @@
 //! A run of one sequence through a range of blocks is a lane. Block by block, the lanes that run
 //! `P` at that block run as one batch through `P`'s block, and the others through `M`'s
 //! ([`DeviceProgram::forward_span`]): no block runs twice and every product spans all experiments
-//! at once. An evaluation makes three passes: `M` under each patch, from the patched block on and
-//! entering at `M`'s clean stream; the hybrids on the sources, up to the patched block; the
-//! hybrids on the bases. `M`'s clean runs are made once per batch ([`Teacher`]). The reverse pass
-//! runs the bases' blocks backwards, then the sources' from their patched reads.
+//! at once. A patched experiment's base forks from its unpatched run at the patched block, and its
+//! source runs up to that block in the same calls, so a patch takes the source's values from rows
+//! of the call it edits ([`Edits`]). The reverse pass runs the blocks backwards, the cotangents of
+//! the patched entries moving to the sources' rows.
 //!
 //! A block's reverse needs its forward's tape (the block's intermediate values), which holds many
 //! times the rows of the stream entering it. A call keeps its tape while the tapes kept so far,
@@ -61,23 +56,14 @@
 use crate::{
     artifact::Artifact,
     decoder::{self, Decoder},
-    artifact_device::mapped_inlined,
+    artifact_device::{mapped_inlined, mapped_inlined_observed},
     device_program::{DeviceProgram, DeviceTrace},
     operator_program::{FamilyInputs, Node, OperatorProgram, SequenceLayout, SlotValues},
     resident_causal_fit::fixed_head_target::{Head, ResidentHead, Target},
     run_check::LayerNodes,
 };
 use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, Storage, Tensor};
-use faer::Side;
-use gam_linalg::{
-    decompose::svd,
-    faer_ndarray::{FaerCholesky, FaerQr, fast_ata},
-    roundoff::{accumulation_growth, factor_singular_band, weighted_gram_assembly_band},
-};
-use gam_math::roundoff::inflated;
-use ndarray::{ArrayView2, Axis, s};
 use rand::RngExt;
-use rayon::prelude::*;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
@@ -90,15 +76,17 @@ fn error(e: impl std::fmt::Display) -> String {
 }
 
 /// One model's sites, checked against its program: the stream entering each block, each block's
-/// read, and the dense operators that receive gradients, per block.
+/// read, the dense operators that receive gradients, per block, and where it holds each read
+/// variable's value.
 struct Sites {
     entries: Vec<usize>,
     reads: Vec<usize>,
     trainable: Vec<Vec<usize>>,
+    values: Vec<Value>,
 }
 
 impl Sites {
-    fn new(program: &DeviceProgram, flat: &OperatorProgram, entries: Vec<usize>, reads: Vec<usize>, trainable: &[usize]) -> Result<Self, String> {
+    fn new(program: &DeviceProgram, flat: &OperatorProgram, entries: Vec<usize>, reads: Vec<usize>, trainable: &[usize], values: Vec<Value>) -> Result<Self, String> {
         let blocks = entries.len();
         let hidden = program.hidden();
         let widths = program.widths();
@@ -128,7 +116,10 @@ impl Sites {
             }
             per_block.push(used.into_iter().collect());
         }
-        Ok(Self { entries, reads, trainable: per_block })
+        if values.iter().any(|v| v.block >= blocks) || values.iter().flat_map(|v| &v.sites).any(|s| s.node >= hidden || widths[s.node] != s.width || s.columns.is_empty() || s.columns.end > s.width) {
+            return Err(error("a read variable's value outside the program or its node"));
+        }
+        Ok(Self { entries, reads, trainable: per_block, values })
     }
 }
 
@@ -145,9 +136,9 @@ impl<'a> Model<'a> {
     /// the stream entering it and `reads` the node its projections read. `trainable` lists the
     /// dense operators that receive gradients (none for `M`). Each block's nodes must read nothing
     /// before the stream entering it except token features, so that one block runs from that
-    /// stream alone.
-    pub fn new(program: &'a DeviceProgram, flat: &OperatorProgram, entries: Vec<usize>, reads: Vec<usize>, trainable: &[usize]) -> Result<Self, String> {
-        Ok(Self { program, sites: Arc::new(Sites::new(program, flat, entries, reads, trainable)?) })
+    /// stream alone. `values` says where the model holds each read variable's value ([`values`]).
+    pub fn new(program: &'a DeviceProgram, flat: &OperatorProgram, entries: Vec<usize>, reads: Vec<usize>, trainable: &[usize], values: Vec<Value>) -> Result<Self, String> {
+        Ok(Self { program, sites: Arc::new(Sites::new(program, flat, entries, reads, trainable, values)?) })
     }
 
     fn blocks(&self) -> usize {
@@ -160,10 +151,6 @@ impl<'a> Model<'a> {
 
     fn entry(&self, b: usize) -> usize {
         self.sites.entries[b]
-    }
-
-    fn read(&self, block: usize) -> usize {
-        self.sites.reads[block]
     }
 
     /// The last node block `b` runs: the stream entering the next block, or the hidden node.
@@ -190,19 +177,20 @@ pub fn prefix(flat: &OperatorProgram) -> Result<OperatorProgram, String> {
     Ok(Head::of(flat)?.prefix(flat))
 }
 
-/// One of `P`'s read variables at block `block`'s input: the span of the rows `rows` of each of its
-/// dense operators `operator` reading that input (`parts`). A gated MLP function reads through two
-/// operators, its gate's and its input's rows.
+/// One read variable at block `block`: rows `rows` of each operator `operator` applied to the
+/// block's read (`parts`), whose value is those rows of the operator's output. [`reads`] gives
+/// `M`'s, as native operators; a library's own ([`library_reads`]) are its operators. A gated MLP
+/// function reads through two operators, its gate's and its up map's rows.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReadVariable {
     pub block: usize,
     pub parts: Vec<(usize, Range<usize>)>,
 }
 
-/// The read variables of a library explanation of `layers` layers (`library_mdl::explanation`):
-/// per head its query, key and value read maps, per MLP function its gate direction (with its up
-/// direction for a gated law).
-pub fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<ReadVariable>, String> {
+/// The read variables of a library explanation of `layers` layers (`library_mdl::explanation`), as
+/// its own operators: per head its query, key and value read maps, per MLP function its gate row
+/// (with its up row for a gated law).
+fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<ReadVariable>, String> {
     let named: BTreeMap<&str, usize> = program.operators.iter().enumerate().map(|(i, op)| (op.name.as_str(), i)).collect();
     let mut out = Vec::new();
     for l in 0..layers {
@@ -234,17 +222,23 @@ pub fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<Rea
     Ok(out)
 }
 
-/// A patch: one read variable (an index into the variables); the distinct read variables
-/// `variables` (ascending, all at one block) jointly; or at each of the distinct blocks `blocks`
-/// (ascending) the complement of every read there. The complements at different blocks are
-/// distinct variables, so patching several at once is one joint intervention whose order does not
-/// matter; cancellation between blocks shows only under such joint patches. A joint read patch
-/// shows what single ones miss: many reads that matter little one at a time and much together.
+/// A patch: one read variable (an index into the variables), or the distinct read variables
+/// `variables` (ascending, all at one block) jointly. A joint read patch shows what single ones
+/// miss: many reads that matter little one at a time and much together.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Patch {
     Read { variable: usize },
     Reads { variables: Vec<usize> },
-    Complement { blocks: Vec<usize> },
+}
+
+impl Patch {
+    /// The patched variables.
+    pub fn variables(&self) -> &[usize] {
+        match self {
+            Self::Read { variable } => std::slice::from_ref(variable),
+            Self::Reads { variables } => variables,
+        }
+    }
 }
 
 /// One experiment: base and source sequences (indices into the batch's), the hybrid (per block
@@ -260,28 +254,18 @@ pub struct Experiment {
 }
 
 impl Experiment {
-    /// The patched blocks, ascending (none for an unpatched experiment).
-    fn blocks(&self, variables: &[ReadVariable]) -> Result<Vec<usize>, String> {
-        Ok(match &self.patch {
-            None => Vec::new(),
-            Some(Patch::Read { variable }) => vec![variables.get(*variable).ok_or_else(|| error("a patch of an unknown variable"))?.block],
-            Some(Patch::Reads { variables: chosen }) => {
-                let block = |i: &usize| variables.get(*i).map(|v| v.block).ok_or_else(|| error("a patch of an unknown variable"));
-                let first = block(chosen.first().ok_or_else(|| error("a joint read patch of no variable"))?)?;
-                for (i, w) in chosen.iter().zip(chosen.iter().skip(1)) {
-                    if i >= w || block(w)? != first {
-                        return Err(error("a joint read patch needs distinct ascending variables of one block"));
-                    }
-                }
-                vec![first]
+    /// The patched block of the variables `values` (none for an unpatched experiment).
+    fn block(&self, values: &[Value]) -> Result<Option<usize>, String> {
+        let Some(patch) = &self.patch else { return Ok(None) };
+        let chosen = patch.variables();
+        let block = |i: &usize| values.get(*i).map(|v| v.block).ok_or_else(|| error("a patch of an unknown variable"));
+        let first = block(chosen.first().ok_or_else(|| error("a joint read patch of no variable"))?)?;
+        for (i, w) in chosen.iter().zip(chosen.iter().skip(1)) {
+            if i >= w || block(w)? != first {
+                return Err(error("a joint read patch needs distinct ascending variables of one block"));
             }
-            Some(Patch::Complement { blocks }) => {
-                if blocks.is_empty() || blocks.windows(2).any(|w| w[0] >= w[1]) {
-                    return Err(error("a complement patch needs distinct ascending blocks"));
-                }
-                blocks.clone()
-            }
-        })
+        }
+        Ok(Some(first))
     }
 }
 
@@ -353,11 +337,9 @@ pub fn subset(rng: &mut impl RngExt, candidates: &[usize]) -> Vec<usize> {
 }
 
 /// The realized count of each family among `experiments`: clean with `P` alone, clean under a
-/// hybrid, single read patches of attention and of MLP variables, joint read patches, and
-/// complement patches.
+/// hybrid, single read patches of attention and of MLP variables, and joint read patches.
 pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMap<&'static str, usize> {
-    let mut counts: BTreeMap<&'static str, usize> =
-        ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint", "complement"].into_iter().map(|k| (k, 0)).collect();
+    let mut counts: BTreeMap<&'static str, usize> = ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint"].into_iter().map(|k| (k, 0)).collect();
     for e in experiments {
         let family = match &e.patch {
             None if e.explained.iter().all(|x| *x) => "clean_alone",
@@ -365,7 +347,6 @@ pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMa
             Some(Patch::Read { variable }) if variables.get(*variable).is_some_and(|v| v.block % 2 == 0) => "read_attention",
             Some(Patch::Read { .. }) => "read_mlp",
             Some(Patch::Reads { .. }) => "read_joint",
-            Some(Patch::Complement { .. }) => "complement",
         };
         *counts.entry(family).or_default() += 1;
     }
@@ -431,329 +412,277 @@ impl FixedHead {
     }
 }
 
-/// The span of a patch's directions in the `d`-dimensional stream: no direction, every direction,
-/// or a proper subspace with an orthonormal basis `Q` (`d × r`, `0 < r < d`).
-enum Span<T> {
-    Empty,
-    Whole,
-    Part(T),
-}
-
-/// A patch's directions: the block, the kind, and their span.
-struct Basis {
-    block: usize,
-    complement: bool,
-    span: Span<Tensor>,
-}
-
-impl Basis {
-    /// Whether the patch takes the source's rows whole (`Some(true)`: a read of every direction,
-    /// a complement of none) or keeps the base's (`Some(false)`: a read of none, a complement of
-    /// every direction); `None` when it mixes them through `Q`.
-    fn extreme(&self) -> Option<bool> {
-        match self.span {
-            Span::Empty => Some(self.complement),
-            Span::Whole => Some(!self.complement),
-            Span::Part(_) => None,
-        }
-    }
-}
-
-/// The patch directions of each experiment at `P`'s reads when it was made, per patched block in
-/// ascending order: the experiment design, which is data and carries no gradient.
-pub struct Design {
-    bases: Vec<Vec<Arc<Basis>>>,
-}
-
-impl Design {
-    /// A fingerprint of the directions: per experiment and patched block, the block, the kind and
-    /// the basis's values bit for bit.
-    pub fn fingerprint(&self, d: &Device) -> Result<u64, String> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for bases in &self.bases {
-            bases.len().hash(&mut hasher);
-            for basis in bases {
-                (basis.block, basis.complement).hash(&mut hasher);
-                match &basis.span {
-                    Span::Empty => 0u8.hash(&mut hasher),
-                    Span::Whole => 1u8.hash(&mut hasher),
-                    Span::Part(q) => d.download(q).map_err(error)?.iter().for_each(|v| v.to_bits().hash(&mut hasher)),
-                }
-            }
-        }
-        Ok(hasher.finish())
-    }
-}
-
-/// The fixed questions every explanation of one model is asked: `M`'s read variables (those of the
-/// library started at `M`, in [`library_reads`] order) and their rows, which are `M`'s, from the
-/// native program alone. However an explanation was started (at `M`, warm from a fit) or rewritten
-/// (tied, shared, new bodies), its experiments use these variables and these directions, so two
-/// explanations of the model are scored on the same interventions against the same targets.
-pub struct Protocol {
-    variables: Vec<ReadVariable>,
-    operators: BTreeMap<usize, ndarray::Array2<f64>>,
-    blocks: usize,
-}
-
-impl Protocol {
-    /// The protocol of the split native program `native` with its `layers`.
-    pub fn new(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Self, String> {
-        let start = crate::library_mdl::explanation(native, layers)?;
-        let program = &start.artifact.program;
-        let variables = library_reads(program, layers.len())?;
-        let read: BTreeSet<usize> = variables.iter().flat_map(|v| v.parts.iter().map(|(op, _)| *op)).collect();
-        let operators: BTreeMap<usize, ndarray::Array2<f64>> = read.into_iter().map(|op| (op, program.operators[op].matrix())).collect();
-        Ok(Self { variables, operators, blocks: 2 * layers.len() })
-    }
-
-    pub fn variables(&self) -> &[ReadVariable] {
-        &self.variables
-    }
-
-    /// The directions of `experiments` (over this protocol's variables) on device `d`: `M`'s.
-    pub fn design(&self, d: &Device, experiments: &[Experiment]) -> Result<Design, String> {
-        self.host_design(experiments)?.upload(d)
-    }
-
-    /// [`Protocol::design`] on the host, before upload: host arithmetic alone, so a fit can make
-    /// the next batch's on another thread while the device runs the current one.
-    pub fn host_design(&self, experiments: &[Experiment]) -> Result<HostDesign, String> {
-        let rows_of = |op: usize, rows: &Range<usize>| -> Result<ndarray::Array2<f64>, String> {
-            let all = self.operators.get(&op).ok_or_else(|| error("a read variable outside the protocol's operators"))?;
-            if rows.end > all.nrows() || rows.is_empty() {
-                return Err(error("a read variable outside its operator"));
-            }
-            Ok(all.slice(s![rows.clone(), ..]).to_owned())
-        };
-        host_design(self.blocks, &self.variables, experiments, rows_of)
-    }
-}
-
-/// The span of the rows of `rows` (`n × d`): the right singular vectors whose singular values
-/// exceed the decomposition's rounding band `max(n, d)·ε·σ₁` (`factor_singular_band`), as an
-/// orthonormal basis `d × r` unless none or all `d` are resolved from zero. When the Gram of the
-/// shorter side certifies all `min(n, d)` resolved ([`resolved_gram`]), the span is every direction
-/// (`n ≥ d`) or the rows' own, whose basis a Householder QR of the rows gives, and no singular
-/// value decomposition is needed; otherwise one decides.
-fn span(rows: ArrayView2<'_, f64>) -> Result<Span<ndarray::Array2<f64>>, String> {
-    let (n, d) = rows.dim();
-    let gram = if n >= d { fast_ata(&rows) } else { fast_ata(&rows.t()) };
-    let squares = inflated(gram.diag().sum(), n.max(d));
-    let band = factor_singular_band(n, d, squares.sqrt());
-    if resolved_gram(&gram, n.max(d), squares, band * band) {
-        if n >= d {
-            return Ok(Span::Whole);
-        }
-        return Ok(Span::Part(rows.t().qr().map_err(error)?.0));
-    }
-    let decomposition = svd(rows, false).map_err(error)?;
-    let rank = decomposition.singular_values.iter().filter(|s| **s > decomposition.band).count();
-    Ok(match rank {
-        0 => Span::Empty,
-        r if r == rows.ncols() => Span::Whole,
-        r => Span::Part(decomposition.vt.slice(s![..r, ..]).t().to_owned()),
-    })
-}
-
-/// Whether every eigenvalue of the exact Gram `G = XᵀX` of a factor `X` exceeds `floor`, from its
-/// computed `gram` (`k × k`), the length `inner` of its inner products and a bound `squares` on
-/// `‖X‖_F²`. The computed Gram is within `e = γ_inner·‖X‖_F²` of `G` in the 2-norm
-/// (`weighted_gram_assembly_band`). A Cholesky factorization of `gram − sI` that completes in
-/// floating point is the exact one of `gram − sI + Δ`, with `|Δ| ≤ γ_{k+1}|L||Lᵀ|` (Higham, ASNA
-/// 2nd ed., Thm 10.3) plus the shift's rounding; the majorant is positive semidefinite, so its trace
-/// bounds its norm, and `‖Δ‖₂ ≤ c = γ_{k+2}/(1 − γ_{k+2})·tr(gram)`. Then `gram ≻ (s − c)I` and
-/// `G ≻ (s − c − e)I`, so completion at `s = floor + c + e` certifies the claim.
-fn resolved_gram(gram: &ndarray::Array2<f64>, inner: usize, squares: f64, floor: f64) -> bool {
-    let k = gram.nrows();
-    let growth = accumulation_growth(k + 2);
-    let factorization = growth / (1.0 - growth) * gram.diag().sum();
-    let shift = floor + factorization + weighted_gram_assembly_band(inner, 1, squares);
-    if !(shift.is_finite() && growth < 1.0) {
-        return false;
-    }
-    let mut shifted = gram.clone();
-    shifted.diag_mut().mapv_inplace(|v| v - shift);
-    shifted.cholesky(Side::Lower).is_ok()
-}
-
-/// The patch directions of `experiments` at `P`'s current values of its read `variables`.
-pub fn design(p: &Model, variables: &[ReadVariable], experiments: &[Experiment]) -> Result<Design, String> {
-    let d = p.program.device();
-    // Each operator a patch reads, downloaded once.
-    let operators: RefCell<BTreeMap<usize, ndarray::Array2<f64>>> = RefCell::new(BTreeMap::new());
-    let rows_of = |op: usize, rows: &Range<usize>| -> Result<ndarray::Array2<f64>, String> {
-        let mut operators = operators.borrow_mut();
-        if !operators.contains_key(&op) {
-            let all = p.program.dense(op)?;
-            if all.cols() != p.width() {
-                return Err(error("a read variable outside its operator"));
-            }
-            operators.insert(op, d.download(all).map_err(error)?);
-        }
-        let all = &operators[&op];
-        if rows.end > all.nrows() || rows.is_empty() {
-            return Err(error("a read variable outside its operator"));
-        }
-        Ok(all.slice(s![rows.clone(), ..]).to_owned())
-    };
-    design_with(d, p.blocks(), variables, experiments, rows_of)
-}
-
-/// The patch directions of a batch of experiments on the host, before upload: each distinct set of
-/// directions once (a variable's, a joint subset's, a block's complement) with its block, kind and
-/// span, and per experiment the sets of its patched blocks in ascending order.
-pub struct HostDesign {
-    sets: Vec<(usize, bool, Span<ndarray::Array2<f64>>)>,
-    plan: Vec<Vec<usize>>,
-}
-
-impl HostDesign {
-    /// The design on device `d`, each set's basis uploaded once.
-    pub fn upload(&self, d: &Device) -> Result<Design, String> {
-        let bases = self
-            .sets
-            .iter()
-            .map(|(block, complement, span)| {
-                let span = match span {
-                    Span::Empty => Span::Empty,
-                    Span::Whole => Span::Whole,
-                    Span::Part(q) => Span::Part(d.upload(q.view()).map_err(error)?),
-                };
-                Ok(Arc::new(Basis { block: *block, complement: *complement, span }))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(Design { bases: self.plan.iter().map(|sets| sets.iter().map(|at| Arc::clone(&bases[*at])).collect()).collect() })
-    }
-}
-
-/// The patch directions of `experiments` over `blocks` blocks on device `d`, with
-/// `rows_of(operator, rows)` giving those rows of one of `P`'s operators.
-fn design_with(
-    d: &Device,
-    blocks: usize,
-    variables: &[ReadVariable],
-    experiments: &[Experiment],
-    rows_of: impl Fn(usize, &Range<usize>) -> Result<ndarray::Array2<f64>, String>,
-) -> Result<Design, String> {
-    host_design(blocks, variables, experiments, rows_of)?.upload(d)
-}
-
-/// [`design_with`] on the host, before upload.
-fn host_design(
-    blocks: usize,
-    variables: &[ReadVariable],
-    experiments: &[Experiment],
-    rows_of: impl Fn(usize, &Range<usize>) -> Result<ndarray::Array2<f64>, String>,
-) -> Result<HostDesign, String> {
-    let rows_of = |v: &ReadVariable| -> Result<ndarray::Array2<f64>, String> {
-        let parts = v.parts.iter().map(|(op, rows)| rows_of(*op, rows)).collect::<Result<Vec<_>, String>>()?;
-        let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
-        ndarray::concatenate(Axis(0), &views).map_err(error)
-    };
-    // Each distinct set of directions once, its rows gathered here and their spans decomposed in
-    // parallel.
-    let mut sets: BTreeMap<(bool, Vec<usize>), usize> = BTreeMap::new();
-    let mut rows: Vec<(usize, bool, ndarray::Array2<f64>)> = Vec::new();
-    let mut plan: Vec<Vec<usize>> = Vec::with_capacity(experiments.len());
-    for e in experiments {
-        let mut wanted: Vec<(usize, bool, Vec<usize>)> = Vec::new();
-        match &e.patch {
-            None => {}
-            Some(Patch::Read { variable }) => {
-                let v = variables.get(*variable).ok_or_else(|| error("a patch of an unknown variable"))?;
-                wanted.push((v.block, false, vec![*variable]));
-            }
-            Some(Patch::Reads { variables: chosen }) => {
-                let block = e.blocks(variables)?[0];
-                wanted.push((block, false, chosen.clone()));
-            }
-            Some(Patch::Complement { .. }) => {
-                for block in e.blocks(variables)? {
-                    if block >= blocks {
-                        return Err(error("a complement patch of an unknown block"));
+/// The read variables every explanation of the split native program `native` with its `layers` is
+/// asked about: `M`'s functions, in the order of the library started at `M`
+/// (`library_mdl::explanation`, [`library_reads`]), each part an operator of `native` and its rows.
+/// The library's ownership map (`Artifact::owners`) names the native operator and rows each of its
+/// read rows replaces.
+pub fn reads(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Vec<ReadVariable>, String> {
+    let start = crate::library_mdl::explanation(native, layers)?;
+    let program = &start.artifact.program;
+    let named: BTreeMap<&str, usize> = native.operators.iter().enumerate().map(|(i, op)| (op.name.as_str(), i)).collect();
+    library_reads(program, layers.len())?
+        .into_iter()
+        .map(|v| {
+            let mut parts: Vec<(usize, Range<usize>)> = Vec::new();
+            for (op, rows) in &v.parts {
+                let name = &program.operators[*op].name;
+                for owner in start.artifact.owners.iter().filter(|o| &o.operator == name && READS.contains(&o.role.as_str())) {
+                    let (from, to) = (rows.start.max(owner.rows.start), rows.end.min(owner.rows.end));
+                    if from >= to {
+                        continue;
                     }
-                    wanted.push((block, true, variables.iter().enumerate().filter(|(_, v)| v.block == block).map(|(i, _)| i).collect()));
+                    let at = *named.get(owner.native.as_str()).ok_or_else(|| error(format!("{}: no native operator {}", name, owner.native)))?;
+                    let shift = owner.native_rows.start;
+                    let part = (at, shift + from - owner.rows.start..shift + to - owner.rows.start);
+                    if !parts.contains(&part) {
+                        parts.push(part);
+                    }
+                }
+            }
+            if parts.is_empty() {
+                return Err(error(format!("block {}: a read variable no native operator owns", v.block)));
+            }
+            Ok(ReadVariable { block: v.block, parts })
+        })
+        .collect()
+}
+
+/// The roles of the owners (`Artifact::owners`) whose blocks are read maps: a head's query, key
+/// and value maps, an MLP's gate and up maps.
+const READS: [&str; 5] = ["q", "k", "v", "gate", "up"];
+
+/// Where a model holds part of a read variable's value: the node of its flat program, the node's
+/// width, and the columns of the node's value the part is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Site {
+    pub node: usize,
+    pub width: usize,
+    pub columns: Range<usize>,
+}
+
+/// Where a model holds one read variable's value: the variable's block and the sites of its parts
+/// (none for a function the model no longer computes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Value {
+    pub block: usize,
+    pub sites: Vec<Site>,
+}
+
+/// Where `artifact`, an explanation of the split native program `native` (or `Artifact::native`
+/// itself) with its `layers`, holds each of the read `variables` ([`reads`]): per variable the
+/// nodes of its flat program ([`sites`]) and their columns. With an ownership map, each native
+/// part's sites are those of its owners: the node applying the owner's operator in the owner's
+/// rule body, at the owner's call site, the columns its rows; a part no owner replaces has no site,
+/// the function being gone from `artifact`. Without one, the artifact's operators are the native
+/// ones, each applied by one node. Every site lies in its variable's block, after the block's read.
+pub fn values(native: &OperatorProgram, artifact: &Artifact, layers: &[LayerNodes], variables: &[ReadVariable]) -> Result<Vec<Value>, String> {
+    let (flat, entries, reads) = sites(artifact, layers)?;
+    let program = &artifact.program;
+    let named: BTreeMap<&str, usize> = program.operators.iter().enumerate().map(|(i, op)| (op.name.as_str(), i)).collect();
+    // Per variable, per site: the observation path or the node, and the columns.
+    let mut found: Vec<Vec<(Result<Vec<usize>, usize>, Range<usize>)>> = Vec::with_capacity(variables.len());
+    for v in variables {
+        let mut out = Vec::new();
+        for (op, rows) in &v.parts {
+            let name = native.operators.get(*op).map(|o| o.name.as_str()).ok_or_else(|| error("a read variable of an unknown native operator"))?;
+            if artifact.owners.is_empty() {
+                let at = *named.get(name).ok_or_else(|| error(format!("{name}: not an operator of the model")))?;
+                let mut applying = flat.nodes.iter().enumerate().filter(|(_, n)| matches!(n, Node::Affine { terms, .. } if terms.first().is_some_and(|t| t.1 == at)));
+                let node = match (applying.next(), applying.next()) {
+                    (Some((n, _)), None) => n,
+                    _ => return Err(error(format!("{name}: not applied by exactly one node"))),
+                };
+                out.push((Err(node), rows.clone()));
+                continue;
+            }
+            for owner in artifact.owners.iter().filter(|o| o.native == name && READS.contains(&o.role.as_str())) {
+                let (from, to) = (rows.start.max(owner.native_rows.start), rows.end.min(owner.native_rows.end));
+                if from >= to {
+                    continue;
+                }
+                let at = *named.get(owner.operator.as_str()).ok_or_else(|| error(format!("{}: no operator {}", owner.site, owner.operator)))?;
+                let mut path = invocation(program, &owner.body, &owner.site)?;
+                let body = path.last().and_then(|n| call_rule(program, &path[..path.len() - 1], *n)).ok_or_else(|| error(format!("{}: no rule {}", owner.site, owner.body)))?;
+                let node = program.rules[body]
+                    .nodes
+                    .iter()
+                    .position(|n| matches!(n, Node::Affine { terms, .. } if terms.first().is_some_and(|t| t.1 == at)))
+                    .ok_or_else(|| error(format!("{}: no node of {} applies {}", owner.site, owner.body, owner.operator)))?;
+                path.push(node);
+                let shift = owner.rows.start;
+                out.push((Ok(path), shift + from - owner.native_rows.start..shift + to - owner.native_rows.start));
+            }
+        }
+        found.push(out);
+    }
+    let paths: Vec<Vec<usize>> = found.iter().flatten().filter_map(|(path, _)| path.as_ref().ok().cloned()).collect();
+    let observed = if paths.is_empty() {
+        Vec::new()
+    } else {
+        let (observing, _, observed) = mapped_inlined_observed(program, &paths)?;
+        if observing.nodes.len() != flat.nodes.len() {
+            return Err(error("the observed program differs from the flat program"));
+        }
+        observed
+    };
+    let mut next = observed.into_iter();
+    let interfaces = flat.interfaces().map_err(error)?;
+    let blocks = entries.len();
+    let end = |b: usize| if b + 1 < blocks { entries[b + 1] } else { flat.nodes.len() };
+    variables
+        .iter()
+        .zip(found)
+        .map(|(v, parts)| {
+            let sites = parts
+                .into_iter()
+                .map(|(path, columns)| {
+                    let node = match path {
+                        Ok(_) => next.next().ok_or_else(|| error("an unobserved site"))?,
+                        Err(node) => node,
+                    };
+                    let width = interfaces.get(node).ok_or_else(|| error("a site outside the program"))?.width();
+                    if v.block >= blocks || node <= reads[v.block] || node >= end(v.block) || columns.end > width {
+                        return Err(error(format!("block {}: a read variable's value outside the block", v.block)));
+                    }
+                    Ok(Site { node, width, columns })
+                })
+                .collect::<Result<_, String>>()?;
+            Ok(Value { block: v.block, sites })
+        })
+        .collect()
+}
+
+/// The path of call nodes from a root node of `program` to the call of the rule named `body` at
+/// call site `site` (outermost first, `mapped_inlined_observed`'s form). A rule called at one site
+/// has that site's name; a body called at several sites is told apart by its call's read binding,
+/// the operator `{site}.read` applied to the call's argument.
+fn invocation(program: &OperatorProgram, body: &str, site: &str) -> Result<Vec<usize>, String> {
+    fn walk(program: &OperatorProgram, nodes: &[Node], body: &str, site: &str, path: &mut Vec<usize>, found: &mut Vec<Vec<usize>>) {
+        for (n, node) in nodes.iter().enumerate() {
+            let Node::Call { rule, arguments } = node else { continue };
+            let Some(called) = program.rules.get(*rule) else { continue };
+            path.push(n);
+            if called.name == body {
+                let read = arguments.first().and_then(|a| match nodes.get(*a) {
+                    Some(Node::Affine { terms, .. }) => terms.first().and_then(|t| program.operators.get(t.1)).map(|op| op.name.as_str()),
+                    _ => None,
+                });
+                if site == body || read == Some(format!("{site}.read").as_str()) {
+                    found.push(path.clone());
+                }
+            } else {
+                walk(program, &called.nodes, body, site, path, found);
+            }
+            path.pop();
+        }
+    }
+    let mut found = Vec::new();
+    walk(program, &program.nodes, body, site, &mut Vec::new(), &mut found);
+    match (found.pop(), found.is_empty()) {
+        (Some(path), true) => Ok(path),
+        (None, _) => Err(error(format!("{site}: no call of {body}"))),
+        (Some(_), false) => Err(error(format!("{site}: several calls of {body}"))),
+    }
+}
+
+/// The rule called by node `node` of the body that the call path `outer` leads into (the root
+/// program's nodes when it is empty).
+fn call_rule(program: &OperatorProgram, outer: &[usize], node: usize) -> Option<usize> {
+    let mut nodes = &program.nodes;
+    for n in outer {
+        let Node::Call { rule, .. } = nodes.get(*n)? else { return None };
+        nodes = &program.rules.get(*rule)?.nodes;
+    }
+    match nodes.get(node)? {
+        Node::Call { rule, .. } => Some(*rule),
+        _ => None,
+    }
+}
+
+/// The patches of one engine call (module note): per node of the model's flat program, the rows
+/// whose patched entries take the source row's (both rows of the call), with the 0/1 masks of the
+/// node's columns that keep the base's entries and that take the source's.
+pub struct Edits {
+    nodes: BTreeMap<usize, Vec<(usize, usize, Tensor, Tensor)>>,
+}
+
+impl Edits {
+    /// The patches of a call at block rows `patches` (the patched row, the source's row, and the
+    /// variables), at the sites `values` of the model that runs the call.
+    fn new(d: &Device, patches: &[(usize, usize, &[usize])], values: &[Value]) -> Result<Self, String> {
+        let mut masks: BTreeMap<(usize, usize, usize), Vec<f64>> = BTreeMap::new();
+        for (row, source, variables) in patches {
+            for v in *variables {
+                for site in &values.get(*v).ok_or_else(|| error("a patch of an unknown variable"))?.sites {
+                    let mask = masks.entry((site.node, *row, *source)).or_insert_with(|| vec![0.0; site.width]);
+                    mask[site.columns.clone()].iter_mut().for_each(|m| *m = 1.0);
                 }
             }
         }
-        let mut row = Vec::with_capacity(wanted.len());
-        for (block, complement, chosen) in wanted {
-            let key = (complement, chosen);
-            let at = match sets.get(&key) {
-                Some(at) => *at,
-                None => {
-                    let parts = key.1.iter().map(|i| rows_of(&variables[*i])).collect::<Result<Vec<_>, _>>()?;
-                    let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
-                    // No rows: an empty span (a complement of a block that reads nothing).
-                    let gathered = if views.is_empty() { ndarray::Array2::zeros((0, 0)) } else { ndarray::concatenate(Axis(0), &views).map_err(error)? };
-                    rows.push((block, key.0, gathered));
-                    sets.insert(key, rows.len() - 1);
-                    rows.len() - 1
-                }
-            };
-            row.push(at);
+        let mut nodes: BTreeMap<usize, Vec<(usize, usize, Tensor, Tensor)>> = BTreeMap::new();
+        for ((node, row, source), take) in masks {
+            let keep = take.iter().map(|m| 1.0 - m).collect();
+            let (keep, take) = (d.upload_vec(1, take.len(), keep).map_err(error)?, d.upload_vec(1, take.len(), take).map_err(error)?);
+            nodes.entry(node).or_default().push((row, source, keep, take));
         }
-        plan.push(row);
+        Ok(Self { nodes })
     }
-    let spans = rows
-        .into_par_iter()
-        .map(|(block, complement, r)| Ok((block, complement, if r.nrows() == 0 { Span::Empty } else { span(r.view())? })))
-        .collect::<Result<_, String>>()?;
-    Ok(HostDesign { sets: spans, plan })
-}
 
-/// Rows `at..at + s.rows()` of the read `value` patched with the source's `s`: `h + (s − h) Q Qᵀ`
-/// (read) or `s + (h − s) Q Qᵀ` (complement).
-fn exchange(d: &Device, value: &mut Tensor, at: usize, s: &Tensor, basis: &Basis, arithmetic: Arithmetic) -> Result<(), String> {
-    let rows = s.rows();
-    let Span::Part(q) = &basis.span else {
-        return if basis.extreme() == Some(true) { d.set_rows(value, at, s).map_err(error) } else { Ok(()) };
-    };
-    let h = d.rows_of(value, at, rows).map_err(error)?;
-    let mut difference = d.copy(s).map_err(error)?;
-    d.axpy(&mut difference, -1.0, &h).map_err(error)?;
-    let mut coordinates = d.zeros(rows, q.cols()).map_err(error)?;
-    d.gemm(&mut coordinates, 1.0, &difference, Op::N, q, Op::N, 0.0, arithmetic).map_err(error)?;
-    let (mut out, sign) = if basis.complement { (d.copy(s).map_err(error)?, -1.0) } else { (h, 1.0) };
-    d.gemm(&mut out, sign, &coordinates, Op::N, q, Op::T, 1.0, arithmetic).map_err(error)?;
-    d.set_rows(value, at, &out).map_err(error)
-}
+    /// The nodes the call edits.
+    pub fn nodes(&self) -> BTreeSet<usize> {
+        self.nodes.keys().copied().collect()
+    }
 
-/// The transpose of [`exchange`] on rows `at..at + rows` of the read cotangent `g`: the base's
-/// part stays in `g`, the source's is returned (none when it is zero).
-fn exchange_cotangent(d: &Device, g: &mut Tensor, at: usize, rows: usize, basis: &Basis, arithmetic: Arithmetic) -> Result<Option<Tensor>, String> {
-    let Span::Part(q) = &basis.span else {
-        if basis.extreme() != Some(true) {
-            return Ok(None);
+    /// Node `node`'s value `value` (the call's rows in order) with each patched row's patched
+    /// entries replaced by its source row's: `h ⊙ (1 − m) + s ⊙ m`, both products exact, every
+    /// source row read before any row is written.
+    pub fn apply(&self, d: &Device, node: usize, value: &mut Tensor) -> Result<(), String> {
+        let Some(patches) = self.nodes.get(&node) else { return Ok(()) };
+        let sources = patches.iter().map(|(_, s, _, _)| d.rows_of(value, *s, 1).map_err(error)).collect::<Result<Vec<_>, _>>()?;
+        for ((row, _, keep, take), s) in patches.iter().zip(&sources) {
+            let h = d.rows_of(value, *row, 1).map_err(error)?;
+            let mut out = d.zeros(1, value.cols()).map_err(error)?;
+            d.scale_columns(&mut out, &h, keep, false).map_err(error)?;
+            d.scale_columns(&mut out, s, take, true).map_err(error)?;
+            d.set_rows(value, *row, &out).map_err(error)?;
         }
-        let source = d.rows_of(g, at, rows).map_err(error)?;
-        d.set_rows(g, at, &d.zeros(rows, g.cols()).map_err(error)?).map_err(error)?;
-        return Ok(Some(source));
-    };
-    let gr = d.rows_of(g, at, rows).map_err(error)?;
-    let mut coordinates = d.zeros(rows, q.cols()).map_err(error)?;
-    d.gemm(&mut coordinates, 1.0, &gr, Op::N, q, Op::N, 0.0, arithmetic).map_err(error)?;
-    let mut inside = d.zeros(rows, g.cols()).map_err(error)?;
-    d.gemm(&mut inside, 1.0, &coordinates, Op::N, q, Op::T, 0.0, arithmetic).map_err(error)?;
-    let mut outside = gr;
-    d.axpy(&mut outside, -1.0, &inside).map_err(error)?;
-    let (base, source) = if basis.complement { (inside, outside) } else { (outside, inside) };
-    d.set_rows(g, at, &base).map_err(error)?;
-    Ok(Some(source))
+        Ok(())
+    }
+
+    /// The transpose of [`Edits::apply`] on node `node`'s cotangent `g`: each patched row keeps
+    /// `ḡ ⊙ (1 − m)` and its source row receives `ḡ ⊙ m`.
+    pub fn transpose(&self, d: &Device, node: usize, g: &mut Tensor) -> Result<(), String> {
+        let Some(patches) = self.nodes.get(&node) else { return Ok(()) };
+        let rows = patches.iter().map(|(r, _, _, _)| d.rows_of(g, *r, 1).map_err(error)).collect::<Result<Vec<_>, _>>()?;
+        let mut parts = Vec::with_capacity(patches.len());
+        for ((row, source, keep, take), gr) in patches.iter().zip(&rows) {
+            let mut base = d.zeros(1, g.cols()).map_err(error)?;
+            d.scale_columns(&mut base, gr, keep, false).map_err(error)?;
+            d.set_rows(g, *row, &base).map_err(error)?;
+            let mut part = d.zeros(1, g.cols()).map_err(error)?;
+            d.scale_columns(&mut part, gr, take, false).map_err(error)?;
+            parts.push((*source, part));
+        }
+        for (source, part) in parts {
+            let mut total = d.rows_of(g, source, 1).map_err(error)?;
+            d.axpy(&mut total, 1.0, &part).map_err(error)?;
+            d.set_rows(g, source, &total).map_err(error)?;
+        }
+        Ok(())
+    }
 }
 
 /// A block engine: one model's blocks (block `2l` is layer `l`'s attention, `2l + 1` its MLP) run
 /// on rows of one stream buffer in place. A call names its rows as ranges of the buffer, each one
 /// sequence's positions `0..T` (`tokens` holds each range's sequence); attention is causal within
 /// each range. The forward pass replaces each range's rows by the stream after the block (after
-/// the last block, the final normed stream); block 0 reads the tokens. `read`, when given, edits
-/// the block's read (the normed stream its projections read; the call's rows in range order)
-/// before the projections. The reverse pass replaces the rows' cotangent by the cotangent of the
-/// stream entering the block, calls `read` on the read's cotangent (the transposed edit), and adds
-/// the gradient of the trainable operators the block uses into `gradient`; it leaves the tape as it
-/// was, so one forward pass serves several reverse passes.
+/// the last block, the final normed stream); block 0 reads the tokens. `edits`, when given, patch
+/// the values of the nodes they name (of the model's flat program; the call's rows in range order)
+/// as soon as each is computed ([`Edits::apply`]). The reverse pass replaces the rows' cotangent by
+/// the cotangent of the stream entering the block, transposes the edits on those nodes' cotangents
+/// ([`Edits::transpose`]), and adds the gradient of the trainable operators the block uses into
+/// `gradient`; it leaves the tape as it was, so one forward pass serves several reverse passes.
 pub trait BlockEngine {
     type Tape;
 
@@ -763,8 +692,11 @@ pub trait BlockEngine {
     fn width(&self) -> usize;
     fn blocks(&self) -> usize;
 
-    /// The precision of the products, which the patches use too.
+    /// The precision of the products.
     fn arithmetic(&self) -> Arithmetic;
+
+    /// Where the model holds each read variable's value ([`values`]): the nodes its edits name.
+    fn values(&self) -> &[Value];
 
     fn forward(
         &self,
@@ -772,7 +704,7 @@ pub trait BlockEngine {
         stream: &mut Tensor,
         ranges: &[Range<usize>],
         tokens: &[&[u32]],
-        read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
+        edits: Option<&Edits>,
         keep: bool,
     ) -> Result<Option<Self::Tape>, String>;
 
@@ -782,7 +714,7 @@ pub trait BlockEngine {
         tape: &Self::Tape,
         cotangent: &mut Tensor,
         ranges: &[Range<usize>],
-        read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
+        edits: Option<&Edits>,
         gradient: &mut BTreeMap<usize, Tensor>,
     ) -> Result<(), String>;
 
@@ -866,23 +798,27 @@ impl BlockEngine for Model<'_> {
         self.program.arithmetic()
     }
 
+    fn values(&self) -> &[Value] {
+        &self.sites.values
+    }
+
     fn forward(
         &self,
         block: usize,
         stream: &mut Tensor,
         ranges: &[Range<usize>],
         tokens: &[&[u32]],
-        mut read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
+        edits: Option<&Edits>,
         keep: bool,
     ) -> Result<Option<DeviceTrace>, String> {
         let d = self.program.device();
         let entry = if block == 0 { None } else { Some((self.entry(block), gather(d, stream, ranges)?)) };
-        let node = self.read(block);
+        let edited = edits.map(Edits::nodes).unwrap_or_default();
         let edit = |n: usize, trace: &DeviceTrace| -> Result<Option<Tensor>, String> {
-            match read.as_mut() {
-                Some(read) if n == node => {
+            match edits {
+                Some(edits) if edited.contains(&n) => {
                     let mut value = d.copy(trace.value(n)?).map_err(error)?;
-                    read(&mut value)?;
+                    edits.apply(d, n, &mut value)?;
                     Ok(Some(value))
                 }
                 _ => Ok(None),
@@ -900,21 +836,20 @@ impl BlockEngine for Model<'_> {
         tape: &DeviceTrace,
         cotangent: &mut Tensor,
         ranges: &[Range<usize>],
-        mut read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
+        edits: Option<&Edits>,
         gradient: &mut BTreeMap<usize, Tensor>,
     ) -> Result<(), String> {
         let d = self.program.device();
-        let node = self.read(block);
         let seeds = BTreeMap::from([(self.end(block), gather(d, cotangent, ranges)?)]);
-        let edited: BTreeSet<usize> = read.as_ref().map(|_| node).into_iter().collect();
+        let edited = edits.map(Edits::nodes).unwrap_or_default();
         let mut keep: Vec<usize> = edited.iter().copied().collect();
         if block > 0 {
             keep.push(self.entry(block));
         }
         let mut hook = |n: usize, g: &mut Tensor| -> Result<(), String> {
-            match read.as_mut() {
-                Some(read) if n == node => read(g),
-                _ => Ok(()),
+            match edits {
+                Some(edits) => edits.transpose(d, n, g),
+                None => Ok(()),
             }
         };
         let arithmetic = self.program.arithmetic();
@@ -946,19 +881,19 @@ impl BlockEngine for Model<'_> {
 }
 
 /// One sequence's way through the blocks: run by the hybrid `explained` (per block whether `P`
-/// runs it) up to block `end`, with patches at row `position` of distinct blocks, each with its
-/// directions and the path whose read at that block is the source.
+/// runs it) up to block `end`, with at most one patch at row `position`: its block, its variables,
+/// and the path whose values at that block are the source.
 struct Path<'t> {
     tokens: &'t [u32],
     explained: &'t [bool],
     end: usize,
     position: usize,
-    patches: Vec<(Arc<Basis>, usize)>,
+    patch: Option<(usize, &'t [usize], usize)>,
 }
 
-impl Path<'_> {
-    fn patched(&self, block: usize) -> Option<&(Arc<Basis>, usize)> {
-        self.patches.iter().find(|(basis, _)| basis.block == block)
+impl<'t> Path<'t> {
+    fn patched(&self, block: usize) -> Option<(&'t [usize], usize)> {
+        self.patch.filter(|(b, _, _)| *b == block).map(|(_, variables, source)| (variables, source))
     }
 }
 
@@ -1034,16 +969,16 @@ impl<'t> Plan<'t> {
     }
 
     /// The patches applied at `block`, as rows of a call over `lanes` (in order): the patched row,
-    /// the source's row, and the directions.
-    fn patches(&self, block: usize, lanes: &[usize]) -> Result<Vec<(usize, usize, Arc<Basis>)>, String> {
+    /// the source's row, and the variables.
+    fn patches(&self, block: usize, lanes: &[usize]) -> Result<Vec<(usize, usize, &'t [usize])>, String> {
         let at = |l: usize| lanes.iter().position(|x| *x == l).map(|i| i * self.length);
         let mut out = Vec::new();
         for &l in lanes {
             let path = &self.paths[self.lanes[l].path];
-            if let Some((basis, source)) = path.patched(block) {
+            if let Some((variables, source)) = path.patched(block) {
                 let row = at(l).ok_or_else(|| error("a patched lane outside its call"))? + path.position;
-                let source = at(self.lane(*source, block)).ok_or_else(|| error("a patch's source outside its call"))? + path.position;
-                out.push((row, source, Arc::clone(basis)));
+                let source = at(self.lane(source, block)).ok_or_else(|| error("a patch's source outside its call"))? + path.position;
+                out.push((row, source, variables));
             }
         }
         Ok(out)
@@ -1057,33 +992,34 @@ enum Kept<T> {
     Entering(Option<Tensor>),
 }
 
-/// One engine call of a forward pass: its block, side (0 for `P`, 1 for `M`), lanes, and what it
-/// keeps for the reverse passes (nothing when none follows).
+/// One engine call of a forward pass: its block, side (0 for `P`, 1 for `M`), lanes, edits, and
+/// what it keeps for the reverse passes (nothing when none follows).
 struct Call<T> {
     block: usize,
     side: usize,
     lanes: Vec<usize>,
+    edits: Option<Edits>,
     kept: Option<Kept<T>>,
 }
 
-/// The patches `patches` (rows of one call's read, [`Plan::patches`]) applied to its read `read`,
-/// every source row read before any patch writes.
-fn patch(d: &Device, read: &mut Tensor, patches: &[(usize, usize, Arc<Basis>)], arithmetic: Arithmetic) -> Result<(), String> {
-    let sources = patches.iter().map(|(_, s, _)| d.rows_of(read, *s, 1).map_err(error)).collect::<Result<Vec<_>, _>>()?;
-    for ((row, _, basis), s) in patches.iter().zip(&sources) {
-        exchange(d, read, *row, s, basis, arithmetic)?;
+/// The edits of the call at block `block` over `lanes` run by `engine` ([`Plan::patches`] at its
+/// sites), none when nothing there is patched.
+fn edits<E: BlockEngine>(engine: &E, plan: &Plan, block: usize, lanes: &[usize]) -> Result<Option<Edits>, String> {
+    let patches = plan.patches(block, lanes)?;
+    if patches.is_empty() {
+        return Ok(None);
     }
-    Ok(())
+    Ok(Some(Edits::new(engine.device(), &patches, engine.values())?))
 }
 
 /// Run `plan` on the engines `[P, M]` (module note): block by block, the lanes forking there copy
 /// their parent's rows, then per side one call over the lanes running that side, the patches
-/// applied in the read hook from the source rows of the same call. Returns the stream buffer and
+/// applied as its edits from the source rows of the same call. Returns the stream buffer and
 /// the calls. With `keep`, each call keeps its tape while the kept bytes, this call's tape and one
 /// block run again with its reverse (each estimated by the largest tape so far) stay below `P`'s
 /// [`BlockEngine::tape_budget`], and the rows entering it otherwise.
 fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Tensor, Vec<Call<E::Tape>>), String> {
-    let (d, width, blocks, arithmetic) = (engines[0].device(), engines[0].width(), engines[0].blocks(), engines[0].arithmetic());
+    let (d, width, blocks) = (engines[0].device(), engines[0].width(), engines[0].blocks());
     let mut stream = d.zeros(plan.lanes.len() * plan.length, width).map_err(error)?;
     let mut calls = Vec::new();
     let budget = if keep { Some(engines[0].tape_budget(stream.rows())?) } else { None };
@@ -1103,16 +1039,14 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
             }
             let ranges: Vec<Range<usize>> = lanes.iter().map(|l| plan.lanes[*l].rows.clone()).collect();
             let tokens: Vec<&[u32]> = lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
-            let patches = plan.patches(b, &lanes)?;
-            let mut edit = |read: &mut Tensor| patch(d, read, &patches, arithmetic);
-            let read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>> = if patches.is_empty() { None } else { Some(&mut edit) };
+            let edits = edits(engines[side], plan, b, &lanes)?;
             let kept_here = match budget {
                 None => {
-                    engines[side].forward(b, &mut stream, &ranges, &tokens, read, false)?;
+                    engines[side].forward(b, &mut stream, &ranges, &tokens, edits.as_ref(), false)?;
                     None
                 }
                 Some(budget) if kept.saturating_add(largest.saturating_mul(3)) < budget => {
-                    let tape = engines[side].forward(b, &mut stream, &ranges, &tokens, read, true)?.ok_or_else(|| error("a call kept no tape"))?;
+                    let tape = engines[side].forward(b, &mut stream, &ranges, &tokens, edits.as_ref(), true)?.ok_or_else(|| error("a call kept no tape"))?;
                     let bytes = E::tape_bytes(&tape);
                     kept = kept.saturating_add(bytes);
                     largest = largest.max(bytes);
@@ -1121,11 +1055,11 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
                 Some(_) => {
                     let entering = if b == 0 { None } else { Some(gather(d, &stream, &ranges)?) };
                     kept = kept.saturating_add(entering.as_ref().map_or(0, Tensor::bytes));
-                    engines[side].forward(b, &mut stream, &ranges, &tokens, read, false)?;
+                    engines[side].forward(b, &mut stream, &ranges, &tokens, edits.as_ref(), false)?;
                     Some(Kept::Entering(entering))
                 }
             };
-            calls.push(Call { block: b, side, lanes, kept: kept_here });
+            calls.push(Call { block: b, side, lanes, edits, kept: kept_here });
         }
     }
     Ok((stream, calls))
@@ -1136,22 +1070,10 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
 /// (each source's part added into the source's row of the same call), then each fork's rows added
 /// into its parent's. Adds `P`'s parameter gradient into `gradient`; the calls' tapes stay.
 fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::Tape>], mut cotangent: Tensor, gradient: &mut BTreeMap<usize, Tensor>) -> Result<(), String> {
-    let (d, arithmetic) = (engines[0].device(), engines[0].arithmetic());
+    let d = engines[0].device();
     for (index, call) in calls.iter().enumerate().rev() {
         let b = call.block;
         let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.lanes[*l].rows.clone()).collect();
-        let patches = plan.patches(b, &call.lanes)?;
-        let mut transpose = |g: &mut Tensor| -> Result<(), String> {
-            for (row, source, basis) in &patches {
-                if let Some(part) = exchange_cotangent(d, g, *row, 1, basis, arithmetic)? {
-                    let mut total = d.rows_of(g, *source, 1).map_err(error)?;
-                    d.axpy(&mut total, 1.0, &part).map_err(error)?;
-                    d.set_rows(g, *source, &total).map_err(error)?;
-                }
-            }
-            Ok(())
-        };
-        let read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>> = if patches.is_empty() { None } else { Some(&mut transpose) };
         let recomputed;
         let tape = match call.kept.as_ref().ok_or_else(|| error("a call kept nothing for the reverse pass"))? {
             Kept::Tape(tape) => tape,
@@ -1170,13 +1092,11 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
                     None => return Err(error("a call past the first block without its entering rows")),
                 };
                 let tokens: Vec<&[u32]> = call.lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
-                let mut edit = |read: &mut Tensor| patch(d, read, &patches, arithmetic);
-                let edit: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>> = if patches.is_empty() { None } else { Some(&mut edit) };
-                recomputed = engines[call.side].forward(b, &mut rows, &local, &tokens, edit, true)?.ok_or_else(|| error("a call kept no tape"))?;
+                recomputed = engines[call.side].forward(b, &mut rows, &local, &tokens, call.edits.as_ref(), true)?.ok_or_else(|| error("a call kept no tape"))?;
                 &recomputed
             }
         };
-        engines[call.side].reverse(b, tape, &mut cotangent, &ranges, read, gradient)?;
+        engines[call.side].reverse(b, tape, &mut cotangent, &ranges, call.edits.as_ref(), gradient)?;
         // Once both sides of the block are reversed, the forks made there return their rows, the
         // later lanes first (a lane forked from a lane forked at the same block returns through it).
         if index == 0 || calls[index - 1].block != b {
@@ -1274,18 +1194,25 @@ impl BlockEngine for Engine<'_> {
         }
     }
 
+    fn values(&self) -> &[Value] {
+        match self {
+            Self::Program(m) => BlockEngine::values(m),
+            Self::Fused(d) => BlockEngine::values(*d),
+        }
+    }
+
     fn forward(
         &self,
         block: usize,
         stream: &mut Tensor,
         ranges: &[Range<usize>],
         tokens: &[&[u32]],
-        read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
+        edits: Option<&Edits>,
         keep: bool,
     ) -> Result<Option<EngineTape>, String> {
         Ok(match self {
-            Self::Program(m) => BlockEngine::forward(m, block, stream, ranges, tokens, read, keep)?.map(EngineTape::Program),
-            Self::Fused(d) => BlockEngine::forward(*d, block, stream, ranges, tokens, read, keep)?.map(EngineTape::Fused),
+            Self::Program(m) => BlockEngine::forward(m, block, stream, ranges, tokens, edits, keep)?.map(EngineTape::Program),
+            Self::Fused(d) => BlockEngine::forward(*d, block, stream, ranges, tokens, edits, keep)?.map(EngineTape::Fused),
         })
     }
 
@@ -1295,12 +1222,12 @@ impl BlockEngine for Engine<'_> {
         tape: &EngineTape,
         cotangent: &mut Tensor,
         ranges: &[Range<usize>],
-        read: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
+        edits: Option<&Edits>,
         gradient: &mut BTreeMap<usize, Tensor>,
     ) -> Result<(), String> {
         match (self, tape) {
-            (Self::Program(m), EngineTape::Program(t)) => BlockEngine::reverse(m, block, t, cotangent, ranges, read, gradient),
-            (Self::Fused(d), EngineTape::Fused(t)) => BlockEngine::reverse(*d, block, t, cotangent, ranges, read, gradient),
+            (Self::Program(m), EngineTape::Program(t)) => BlockEngine::reverse(m, block, t, cotangent, ranges, edits, gradient),
+            (Self::Fused(d), EngineTape::Fused(t)) => BlockEngine::reverse(*d, block, t, cotangent, ranges, edits, gradient),
             _ => Err(error("a tape of another engine")),
         }
     }
@@ -1320,24 +1247,24 @@ impl BlockEngine for Engine<'_> {
     }
 }
 
-/// The paths of `experiments` on `batch` with the directions of `design`, every block run by `M`
-/// when `native`, else by each experiment's hybrid: per patched experiment its source's path (to
-/// its last patched block) and its base's path; per experiment the index of its base's path.
-fn paths<'t>(batch: &'t Batch, experiments: &'t [Experiment], design: &Design, native: Option<&'t [bool]>, blocks: usize) -> Result<(Vec<Path<'t>>, Vec<usize>), String> {
-    if design.bases.len() != experiments.len() {
-        return Err(error("the design does not match the experiments"));
-    }
+/// The paths of `experiments` on `batch` over the read variables of `values` (their blocks), every
+/// block run by `M` when `native`, else by each experiment's hybrid: per patched experiment its
+/// source's path (to its patched block) and its base's path; per experiment the index of its base's
+/// path.
+fn paths<'t>(batch: &'t Batch, experiments: &'t [Experiment], values: &[Value], native: Option<&'t [bool]>, blocks: usize) -> Result<(Vec<Path<'t>>, Vec<usize>), String> {
     let (mut paths, mut bases) = (Vec::with_capacity(2 * experiments.len()), Vec::with_capacity(experiments.len()));
-    for (e, directions) in experiments.iter().zip(&design.bases) {
+    for e in experiments {
         check(e, batch, blocks)?;
         let explained = native.unwrap_or(&e.explained);
-        let mut patches = Vec::with_capacity(directions.len());
-        if let Some(last) = directions.last() {
-            paths.push(Path { tokens: &batch.source[e.source], explained, end: last.block + 1, position: 0, patches: Vec::new() });
-            patches.extend(directions.iter().map(|basis| (Arc::clone(basis), paths.len() - 1)));
-        }
+        let patch = match (&e.patch, e.block(values)?) {
+            (Some(patch), Some(block)) => {
+                paths.push(Path { tokens: &batch.source[e.source], explained, end: block + 1, position: 0, patch: None });
+                Some((block, patch.variables(), paths.len() - 1))
+            }
+            _ => None,
+        };
         bases.push(paths.len());
-        paths.push(Path { tokens: &batch.base[e.base], explained, end: blocks, position: e.position, patches });
+        paths.push(Path { tokens: &batch.base[e.base], explained, end: blocks, position: e.position, patch });
     }
     Ok((paths, bases))
 }
@@ -1347,14 +1274,13 @@ fn outputs(plan: &Plan, bases: &[usize], experiments: &[Experiment]) -> Vec<Rang
     bases.iter().zip(experiments).map(|(p, e)| plan.lanes[plan.holder[*p]].rows.start + e.position..plan.lanes[plan.holder[*p]].rows.end).collect()
 }
 
-/// `M`'s targets for `experiments` on `batch` under the patch directions of `design`: `M` on every
-/// base and source, the patched runs forking from their base's clean run at the first patched
-/// block ([`Plan`]).
-pub fn targets<E: BlockEngine>(m: &E, head: &FixedHead, batch: &Batch, experiments: &[Experiment], design: &Design) -> Result<Targets, String> {
+/// `M`'s targets for `experiments` on `batch`: `M` on every base and source, the patched runs
+/// forking from their base's clean run at the patched block ([`Plan`]).
+pub fn targets<E: BlockEngine>(m: &E, head: &FixedHead, batch: &Batch, experiments: &[Experiment]) -> Result<Targets, String> {
     let d = m.device();
     let blocks = m.blocks();
     let native = vec![false; blocks];
-    let (paths, bases) = paths(batch, experiments, design, Some(&native), blocks)?;
+    let (paths, bases) = paths(batch, experiments, m.values(), Some(&native), blocks)?;
     let plan = Plan::new(paths, batch.length);
     let (stream, _) = run([m, m], &plan, false)?;
     let rows = outputs(&plan, &bases, experiments);
@@ -1440,29 +1366,29 @@ pub fn sampled_label_seed(d: &Device, hidden: &Tensor, embedding: &Tensor, tile:
 }
 
 /// `KL(M_e ‖ P_e)` per token for each of `experiments` on `batch` from its position on (module
-/// note), at `P`'s current parameters and the patch directions of `design`, against `M`'s
-/// `targets` for them, and with `gradient` its sum's gradient in `P`'s trainable operators. `M`
-/// runs here only as the hybrids' blocks it keeps.
-pub fn evaluate<E: BlockEngine>(m: &E, p: &E, head: &FixedHead, batch: &Batch, targets: &Targets, experiments: &[Experiment], design: &Design, gradient: bool) -> Result<Evaluation, String> {
-    evaluate_labelled((m, p), head, (batch, experiments, design), Some(targets), gradient, None)
+/// note), at `P`'s current parameters, against `M`'s `targets` for them, and with `gradient` its
+/// sum's gradient in `P`'s trainable operators. `M` runs here only as the hybrids' blocks it keeps.
+pub fn evaluate<E: BlockEngine>(m: &E, p: &E, head: &FixedHead, batch: &Batch, targets: &Targets, experiments: &[Experiment], gradient: bool) -> Result<Evaluation, String> {
+    evaluate_labelled((m, p), head, (batch, experiments), Some(targets), gradient, None)
 }
 
-/// [`evaluate`] of `experiments` on `batch` under `design`, with the scores only when `targets` are
+/// [`evaluate`] of `experiments` on `batch`, with the scores only when `targets` are
 /// given, and with `labels` also a draw of the Gauss–Newton factor ([`Factor`]), each scored row's
 /// label drawn with its entry of `labels` (rows in experiment order): a second reverse pass through
 /// the same forward pass, seeded at every scored token by [`sampled_label_seed`].
 pub fn evaluate_labelled<E: BlockEngine>(
     (m, p): (&E, &E),
     head: &FixedHead,
-    (batch, experiments, design): (&Batch, &[Experiment], &Design),
+    (batch, experiments): (&Batch, &[Experiment]),
     targets: Option<&Targets>,
     gradient: bool,
     labels: Option<&[f64]>,
 ) -> Result<Evaluation, String> {
     let d = p.device();
     let (blocks, length, width) = (p.blocks(), batch.length, p.width());
-    if m.blocks() != blocks || m.width() != width || design.bases.len() != experiments.len() || targets.is_some_and(|t| t.rows.len() != experiments.len()) {
-        return Err(error("models, design or targets do not match"));
+    let blocks_of = |values: &[Value]| values.iter().map(|v| v.block).collect::<Vec<_>>();
+    if m.blocks() != blocks || m.width() != width || blocks_of(m.values()) != blocks_of(p.values()) || targets.is_some_and(|t| t.rows.len() != experiments.len()) {
+        return Err(error("models, read variables or targets do not match"));
     }
     if gradient && targets.is_none() {
         return Err(error("the divergence's gradient needs targets"));
@@ -1473,7 +1399,7 @@ pub fn evaluate_labelled<E: BlockEngine>(
             return Err(error("a target of other rows than its experiment's"));
         }
     }
-    let (paths, bases) = paths(batch, experiments, design, None, blocks)?;
+    let (paths, bases) = paths(batch, experiments, p.values(), None, blocks)?;
     let plan = Plan::new(paths, length);
     let arithmetic = p.arithmetic();
     let (stream, calls) = run([p, m], &plan, gradient || labels.is_some())?;
@@ -1524,8 +1450,8 @@ pub fn evaluate_labelled<E: BlockEngine>(
 /// estimate of the Gauss–Newton matrix of the experiments' divergence `Σ KL(M_e ‖ P_e)` in nats,
 /// `Σ_t J_tᵀ F_t J_t` with `F_t` the Fisher matrix of `P_e`'s softmax at `t`: the matrix that is the
 /// divergence's Hessian where `P_e`'s predictions equal `M_e`'s.
-pub fn sampled_label<E: BlockEngine>(m: &E, p: &E, head: &FixedHead, batch: &Batch, experiments: &[Experiment], design: &Design, uniforms: &[f64]) -> Result<BTreeMap<usize, Tensor>, String> {
-    let evaluation = evaluate_labelled((m, p), head, (batch, experiments, design), None, false, Some(uniforms))?;
+pub fn sampled_label<E: BlockEngine>(m: &E, p: &E, head: &FixedHead, batch: &Batch, experiments: &[Experiment], uniforms: &[f64]) -> Result<BTreeMap<usize, Tensor>, String> {
+    let evaluation = evaluate_labelled((m, p), head, (batch, experiments), None, false, Some(uniforms))?;
     Ok(evaluation.factor.ok_or_else(|| error("no Gauss–Newton factor"))?.gradient)
 }
 
@@ -1563,10 +1489,10 @@ pub struct Interchange {
 impl Interchange {
     /// `M` is the split native program `native` (`run_check::split_sites`) with its `layers`
     /// (`run_check::layer_nodes`); `P` is `explanation`, built from it with the same sites, whose
-    /// operators `trainable` receive gradients and whose read variables are `variables` (for a
-    /// library explanation, [`library_reads`]). Each program holds at most `numeric_bytes` of
-    /// operator values on the device; `tile_rows` rows of vocabulary logits are formed at once.
-    /// Products run in the device's storage precision.
+    /// operators `trainable` receive gradients. The experiments patch the read variables
+    /// `variables` ([`reads`]), each model at its own sites ([`values`]). Each program holds at
+    /// most `numeric_bytes` of operator values on the device; `tile_rows` rows of vocabulary
+    /// logits are formed at once. Products run in the device's storage precision.
     pub fn new(
         device: &Device,
         native: &OperatorProgram,
@@ -1590,11 +1516,10 @@ impl Interchange {
         p.set_arithmetic(arithmetic);
         p.prepare_dense_parameters(trainable)?;
         let head = FixedHead::new(device, &m_flat, &p_flat, tile_rows)?;
-        let m_sites = Arc::new(Sites::new(&m, &m_flat, m_streams, m_reads, &[])?);
-        let p_sites = Arc::new(Sites::new(&p, &p_flat, p_streams, p_reads, trainable)?);
-        if variables.iter().any(|v| v.block >= 2 * layers.len() || v.parts.is_empty() || v.parts.iter().any(|(op, _)| !trainable.contains(op))) {
-            return Err(error("a read variable outside the blocks or the trainable operators"));
-        }
+        let m_values = values(native, &Artifact::native(native)?, layers, &variables)?;
+        let p_values = values(native, explanation, layers, &variables)?;
+        let m_sites = Arc::new(Sites::new(&m, &m_flat, m_streams, m_reads, &[], m_values)?);
+        let p_sites = Arc::new(Sites::new(&p, &p_flat, p_streams, p_reads, trainable, p_values)?);
         Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), prefixes: (m_prefix, p_prefix), teacher: None, candidate: None, fuse_asked: false, stale: Cell::new(false) })
     }
 
@@ -1612,10 +1537,10 @@ impl Interchange {
         self.fuse_asked = true;
         let device = self.p.device();
         match Decoder::new(device, &self.prefixes.0, (&self.m_sites.entries, &self.m_sites.reads, self.m.hidden()), &[]) {
-            Ok(engine) => self.teacher = Some(engine.with_arithmetic(arithmetic)),
+            Ok(engine) => self.teacher = Some(engine.with_arithmetic(arithmetic).with_values(self.m_sites.values.clone())),
             Err(reason) => log::info!("interchange: M runs its program ({reason})"),
         }
-        match Decoder::new(device, &self.prefixes.1, (&self.p_sites.entries, &self.p_sites.reads, self.p.hidden()), &self.trainable).map(|d| d.with_arithmetic(arithmetic)) {
+        match Decoder::new(device, &self.prefixes.1, (&self.p_sites.entries, &self.p_sites.reads, self.p.hidden()), &self.trainable).map(|d| d.with_arithmetic(arithmetic).with_values(self.p_sites.values.clone())) {
             Ok(mut engine) => {
                 engine.refresh(&self.p)?;
                 self.candidate = Some(RefCell::new(engine));
@@ -1661,36 +1586,15 @@ impl Interchange {
         &self.head
     }
 
-    /// `P`'s read variables.
+    /// The read variables the experiments patch.
     pub fn variables(&self) -> &[ReadVariable] {
         &self.variables
     }
 
-    /// The patch directions of `experiments` over `variables` at `P`'s trainable operators'
-    /// values `values` (in the order given to [`Interchange::new`]), read on the host: no load.
-    pub fn design_at(&self, variables: &[ReadVariable], experiments: &[Experiment], values: &[ndarray::Array2<f64>]) -> Result<Design, String> {
-        if values.len() != self.trainable.len() {
-            return Err(error("one value per trainable operator required"));
-        }
-        design_with(self.p.device(), self.m_sites.entries.len(), variables, experiments, |op, rows| self.host_rows(values, op, rows))
-    }
-
-    /// Rows `rows` of trainable operator `op` in `values` (in the order given to
-    /// [`Interchange::new`]).
-    fn host_rows(&self, values: &[ndarray::Array2<f64>], op: usize, rows: &Range<usize>) -> Result<ndarray::Array2<f64>, String> {
-        let width = self.p.widths()[self.p.hidden()];
-        let at = self.trainable.iter().position(|t| *t == op).ok_or_else(|| error("a read variable outside the trainable operators"))?;
-        let all = &values[at];
-        if rows.end > all.nrows() || rows.is_empty() || all.ncols() != width {
-            return Err(error("a read variable outside its operator"));
-        }
-        Ok(all.slice(s![rows.clone(), ..]).to_owned())
-    }
-
-    /// `M`'s targets for `experiments` on `batch` under `design` ([`targets`]), on `M`'s engine.
-    pub fn targets(&self, batch: &Batch, experiments: &[Experiment], design: &Design) -> Result<Targets, String> {
+    /// `M`'s targets for `experiments` on `batch` ([`targets`]), on `M`'s engine.
+    pub fn targets(&self, batch: &Batch, experiments: &[Experiment]) -> Result<Targets, String> {
         let teacher = self.teacher();
-        let mut made = targets(&teacher, &self.head, batch, experiments, design)?;
+        let mut made = targets(&teacher, &self.head, batch, experiments)?;
         made.teacher = Some(teacher.execution());
         Ok(made)
     }
@@ -1703,12 +1607,12 @@ impl Interchange {
 
     /// `P`'s score on `experiments` against `targets` ([`evaluate`]), the gradient left on the
     /// device per trainable operator.
-    pub fn evaluate_resident(&self, batch: &Batch, experiments: &[Experiment], design: &Design, targets: &Targets, gradient: bool) -> Result<Evaluation, String> {
-        self.evaluate_labelled(batch, experiments, design, Some(targets), gradient, None)
+    pub fn evaluate_resident(&self, batch: &Batch, experiments: &[Experiment], targets: &Targets, gradient: bool) -> Result<Evaluation, String> {
+        self.evaluate_labelled(batch, experiments, Some(targets), gradient, None)
     }
 
     /// [`evaluate_labelled`] of `P` as it is held, the gradients left on the device.
-    pub fn evaluate_labelled(&self, batch: &Batch, experiments: &[Experiment], design: &Design, targets: Option<&Targets>, gradient: bool, labels: Option<&[f64]>) -> Result<Evaluation, String> {
+    pub fn evaluate_labelled(&self, batch: &Batch, experiments: &[Experiment], targets: Option<&Targets>, gradient: bool, labels: Option<&[f64]>) -> Result<Evaluation, String> {
         let teacher = self.teacher();
         if let Some(made) = targets.and_then(|t| t.teacher)
             && made != teacher.execution()
@@ -1726,13 +1630,13 @@ impl Interchange {
             }
             None => Engine::Program(self.models().1),
         };
-        evaluate_labelled((&teacher, &p), &self.head, (batch, experiments, design), targets, gradient, labels)
+        evaluate_labelled((&teacher, &p), &self.head, (batch, experiments), targets, gradient, labels)
     }
 
     /// [`sampled_label`] at `P`'s loaded parameters, the gradient left on the device per trainable
     /// operator.
-    pub fn sampled_label_resident(&self, batch: &Batch, experiments: &[Experiment], design: &Design, uniforms: &[f64]) -> Result<BTreeMap<usize, Tensor>, String> {
-        let evaluation = self.evaluate_labelled(batch, experiments, design, None, false, Some(uniforms))?;
+    pub fn sampled_label_resident(&self, batch: &Batch, experiments: &[Experiment], uniforms: &[f64]) -> Result<BTreeMap<usize, Tensor>, String> {
+        let evaluation = self.evaluate_labelled(batch, experiments, None, false, Some(uniforms))?;
         Ok(evaluation.factor.ok_or_else(|| error("no Gauss–Newton factor"))?.gradient)
     }
 
@@ -1750,11 +1654,11 @@ impl Interchange {
     }
 
     /// `KL(M_e ‖ P_e)` per token for each of `experiments` on `batch` from its position on, at
-    /// `P`'s loaded parameters and the directions of `design`, with `M`'s targets made here, and
+    /// `P`'s loaded parameters, with `M`'s targets made here, and
     /// with `gradient` its sum's gradient downloaded per trainable operator.
-    pub fn evaluate(&self, batch: &Batch, experiments: &[Experiment], design: &Design, gradient: bool) -> Result<Scored, String> {
-        let targets = self.targets(batch, experiments, design)?;
-        let evaluation = self.evaluate_resident(batch, experiments, design, &targets, gradient)?;
+    pub fn evaluate(&self, batch: &Batch, experiments: &[Experiment], gradient: bool) -> Result<Scored, String> {
+        let targets = self.targets(batch, experiments)?;
+        let evaluation = self.evaluate_resident(batch, experiments, &targets, gradient)?;
         if !gradient {
             return Ok(Scored { bits: evaluation.bits, gradient: Vec::new() });
         }
@@ -1805,15 +1709,13 @@ mod tests {
         let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
         let device = Device::host();
         let blocks: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
-        let reads = library_reads(&explanation.artifact.program, blocks.len()).expect("the reads");
-        let ic = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, reads, 1 << 30, 64).expect("the experiments");
+        let variables = reads(&native, &blocks).expect("the reads");
+        let ic = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
         let batch = Batch::new(sequences[..3].to_vec(), sequences[3..].to_vec()).expect("the batch");
         let experiments = sample(&mut StdRng::seed_from_u64(3), 3, ic.variables(), 4, 12).expect("the draw");
-        let starting: Vec<ndarray::Array2<f64>> = explanation.trainable.iter().map(|op| explanation.artifact.program.operators[*op].matrix()).collect();
-        let design = ic.design_at(ic.variables(), &experiments, &starting).expect("the design");
         // The exact diagonal.
         let (m, p) = ic.models();
-        let (paths, bases) = paths(&batch, &experiments, &design, None, 4).expect("the paths");
+        let (paths, bases) = paths(&batch, &experiments, p.values(), None, 4).expect("the paths");
         let plan = Plan::new(paths, 12);
         let (stream, calls) = run([&p, &m], &plan, true).expect("the forward pass");
         let rows = outputs(&plan, &bases, &experiments);
@@ -1851,7 +1753,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         for _ in 0..draws {
             let uniforms: Vec<f64> = (0..hidden.nrows()).map(|_| rng.random::<f64>()).collect();
-            let evaluation = ic.evaluate_labelled(&batch, &experiments, &design, None, false, Some(&uniforms)).expect("a draw");
+            let evaluation = ic.evaluate_labelled(&batch, &experiments, None, false, Some(&uniforms)).expect("a draw");
             let factor = evaluation.factor.expect("the factor");
             assert_eq!(factor.tokens, hidden.nrows());
             for (op, u) in factor.gradient {

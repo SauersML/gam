@@ -308,7 +308,7 @@ mod tests {
     fn changes(explanation: &library_mdl::Explanation, native: &crate::operator_program::OperatorProgram, posterior: &Posterior, sequences: &[Vec<u32>], removed: usize) -> (f64, f64, f64) {
         let device = Device::host();
         let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
-        let reads = interchange::library_reads(&explanation.artifact.program, sites.len()).expect("the reads");
+        let reads = interchange::reads(native, &sites).expect("the reads");
         let mut ic = Interchange::new(&device, native, &sites, &explanation.artifact, &explanation.trainable, reads, 1 << 30, 64).expect("the experiments");
         let compensation = Compensation::new(&mut ic, explanation, posterior, sequences, 2).expect("the compensation");
         let trial = compensation.proposal(posterior, &[removed]).expect("the proposal");

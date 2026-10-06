@@ -16,9 +16,7 @@
 //! A step, as the fit takes it: the weight sample written into `P`, `M`'s clean runs
 //! (`interchange::targets`), the experiments with the gradient (`interchange::evaluate`), the
 //! description `Σ_G KL_G`, and the IVON step (`Device::posterior_ivon`); none of the parameters
-//! leave the device. The patch directions (`interchange::design`, at the means written into `P`)
-//! are formed once before the steps, as the fit keeps a batch's design, and timed alone
-//! (`design_seconds`). The step runs `REPS` times after one warm-up, each part timed to a device
+//! leave the device. The step runs `REPS` times after one warm-up, each part timed to a device
 //! synchronization. One JSON object goes to `OUT/library_step_bench.json` and stdout: per part the
 //! median seconds.
 
@@ -258,7 +256,7 @@ fn main() -> Result<(), String> {
     let tokens = 2 * sequences * context;
     let (artifact, trainable, variables, start, kind) = match library_mdl::explanation(&native, &layers) {
         Ok(explanation) => {
-            let variables = interchange::library_reads(&explanation.artifact.program, layer_count)?;
+            let variables = interchange::reads(&native, &layers)?;
             let posterior = library_mdl::Posterior::new(&explanation, tokens)?;
             let shapes: Vec<usize> = posterior.mean.iter().map(Array2::len).collect();
             let mut groups: Vec<Vec<u32>> = shapes.iter().map(|n| vec![0; *n]).collect();
@@ -288,6 +286,8 @@ fn main() -> Result<(), String> {
     log::info!("{kind} P: {} trainable operators, {parameters} parameters, {} groups", trainable.len(), start.count);
     let (m_flat, m_streams, m_reads) = interchange::sites(&Artifact::native(&native)?, &layers)?;
     let (p_flat, p_streams, p_reads) = interchange::sites(&artifact, &layers)?;
+    let m_values = interchange::values(&native, &Artifact::native(&native)?, &layers, &variables)?;
+    let p_values = interchange::values(&native, &artifact, &layers, &variables)?;
     let mut m_program = DeviceProgram::compile_values_bounded(&device, &interchange::prefix(&m_flat)?, usize::MAX)?;
     m_program.set_arithmetic(products);
     let mut p_program = DeviceProgram::compile_values_bounded(&device, &interchange::prefix(&p_flat)?, usize::MAX)?;
@@ -304,7 +304,7 @@ fn main() -> Result<(), String> {
     // Where the experiments cannot be scored (a head the compact targets do not take), the posterior
     // parts are timed alone, from a zero gradient on the device.
     let scoring = match FixedHead::new(&device, &m_flat, &p_flat, 4096) {
-        Ok(head) => Some((head, Model::new(&m_program, &m_flat, m_streams.clone(), m_reads.clone(), &[])?)),
+        Ok(head) => Some((head, Model::new(&m_program, &m_flat, m_streams.clone(), m_reads.clone(), &[], m_values.clone())?)),
         Err(reason) => {
             log::info!("the experiments are not scored ({reason}); the posterior parts are timed from a zero gradient");
             None
@@ -316,15 +316,15 @@ fn main() -> Result<(), String> {
     let ivon = Ivon { rate: 0.1, beta1: 0.9, beta2: 0.999 };
     // The gradient of the data term per scored token, in nats.
     let scale = std::f64::consts::LN_2 / (experiments.len() * context) as f64;
-    fn p_model<'a>(program: &'a DeviceProgram, (flat, streams, reads, trainable): (&OperatorProgram, &[usize], &[usize], &[usize])) -> Result<Model<'a>, String> {
-        Model::new(program, flat, streams.to_vec(), reads.to_vec(), trainable)
+    fn p_model<'a>(program: &'a DeviceProgram, (flat, streams, reads, trainable, values): (&OperatorProgram, &[usize], &[usize], &[usize], &[interchange::Value])) -> Result<Model<'a>, String> {
+        Model::new(program, flat, streams.to_vec(), reads.to_vec(), trainable, values.to_vec())
     }
-    let sites = (&p_flat, &p_streams[..], &p_reads[..], &trainable[..]);
+    let sites = (&p_flat, &p_streams[..], &p_reads[..], &trainable[..], &p_values[..]);
     let decoders = if fixed {
         let (m_prefix, p_prefix) = (interchange::prefix(&m_flat)?, interchange::prefix(&p_flat)?);
         let m_ends = (&m_streams[..], &m_reads[..], m_program.hidden());
-        let m = Decoder::new(&device, &m_prefix, m_ends, &[])?.with_arithmetic(products);
-        Some((m, Decoder::new(&device, &p_prefix, (&p_streams[..], &p_reads[..], p_program.hidden()), &trainable)?.with_arithmetic(products)))
+        let m = Decoder::new(&device, &m_prefix, m_ends, &[])?.with_arithmetic(products).with_values(m_values.clone());
+        Some((m, Decoder::new(&device, &p_prefix, (&p_streams[..], &p_reads[..], p_program.hidden()), &trainable)?.with_arithmetic(products).with_values(p_values.clone())))
     } else {
         None
     };
@@ -335,23 +335,9 @@ fn main() -> Result<(), String> {
     // The last step's mean KL(M_e ‖ P_e) per scored token, in bits (a check that the products'
     // arithmetic did not change what is computed).
     let mut mean_bits = None;
-    // The design at P's means, once: the fit draws the experiments once and keeps each batch's
-    // design, so neither the means' load nor the design is part of a step.
-    let mut design_seconds = None;
     {
         let parts = Parts { operators: &trainable, mean: &start.mean, log_sd: &start.log_sd, groups: &start.groups, count: start.count };
         let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens as f64, None, 0)?;
-        posterior.mean_into(&mut p_program)?;
-        let design = match &scoring {
-            Some(_) => {
-                let started = Instant::now();
-                let design = interchange::design(&p_model(&p_program, sites)?, &variables, &experiments)?;
-                device.synchronize().map_err(error)?;
-                design_seconds = Some(started.elapsed().as_secs_f64());
-                Some(design)
-            }
-            None => None,
-        };
         for step in 0..=reps {
             let s = &mut device_seconds;
             timed(&device, s, "sample_loaded", || {
@@ -362,17 +348,17 @@ fn main() -> Result<(), String> {
             // reverse pass through the same forward pass), with its scored tokens.
             let mut draws = StdRng::seed_from_u64(step as u64);
             let uniforms: Vec<f64> = (0..experiments.iter().map(|e| context - e.position).sum::<usize>()).map(|_| draws.random::<f64>()).collect();
-            let (gradient, factor, labelled) = match (&scoring, &design) {
-                (Some((head, m)), Some(design)) => {
+            let (gradient, factor, labelled) = match &scoring {
+                Some((head, m)) => {
                     let evaluation = match &decoders {
                         Some((m, p)) => {
-                            let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments, design))?;
-                            timed(&device, s, "evaluate", || interchange::evaluate_labelled((m, p), head, (&batch, &experiments, design), Some(&targets), true, Some(&uniforms)))?
+                            let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments))?;
+                            timed(&device, s, "evaluate", || interchange::evaluate_labelled((m, p), head, (&batch, &experiments), Some(&targets), true, Some(&uniforms)))?
                         }
                         None => {
-                            let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments, design))?;
+                            let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments))?;
                             let p = p_model(&p_program, sites)?;
-                            timed(&device, s, "evaluate", || interchange::evaluate_labelled((m, &p), head, (&batch, &experiments, design), Some(&targets), true, Some(&uniforms)))?
+                            timed(&device, s, "evaluate", || interchange::evaluate_labelled((m, &p), head, (&batch, &experiments), Some(&targets), true, Some(&uniforms)))?
                         }
                     };
                     let tokens = evaluation.bits.iter().map(Vec::len).sum::<usize>();
@@ -380,7 +366,7 @@ fn main() -> Result<(), String> {
                     let factor = evaluation.factor.ok_or("no Gauss–Newton factor")?;
                     (evaluation.gradient, factor.gradient, factor.tokens)
                 }
-                _ => {
+                None => {
                     let zero = || zeros.iter().map(|(op, z)| Ok((*op, device.copy(z).map_err(error)?))).collect::<Result<BTreeMap<_, _>, String>>();
                     (zero()?, zero()?, 1)
                 }
@@ -446,7 +432,6 @@ fn main() -> Result<(), String> {
         "groups": start.count,
         "reps": reps,
         "device_posterior_seconds": medians(&device_seconds),
-        "design_seconds": design_seconds,
     });
     println!("{report}");
     std::fs::create_dir_all(out).map_err(error)?;

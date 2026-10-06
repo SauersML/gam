@@ -7,8 +7,8 @@
 //! SETTINGS.json is the library fit's (`mpd_library_mdl_2951`). Both runs order the checkpoint's
 //! active groups by increasing divergence and search prefix lengths by the fit's bisection,
 //! accepting the longest evaluated prefix that does not increase `F`. Every evaluation scores the
-//! same experiments (per training batch of the fit's size, one draw of `interchange::sample` with
-//! `M`'s fixed directions) at the same weight noise per batch (`ε` of `gam_gpu`'s Philox normals,
+//! same experiments (per training batch of the fit's size, one draw of `interchange::sample` over
+//! `M`'s functions) at the same weight noise per batch (`ε` of `gam_gpu`'s Philox normals,
 //! zero where a group is removed): `F` is the summed divergence over every training experiment's
 //! scored tokens plus the posterior's description and the explanation's fixed choices, in bits.
 use gam_gpu::{
@@ -18,7 +18,7 @@ use gam_gpu::{
 use gam_mpd::{
     engine::{log_to_stderr, sha256},
     import::import_language_model,
-    interchange::{self, Batch, Design, Experiment, Interchange, Targets},
+    interchange::{self, Batch, Experiment, Interchange, Targets},
     library_compensation::Compensation,
     library_mdl::{self, Posterior},
     operator_program::SlotValues,
@@ -46,11 +46,10 @@ fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-/// One training batch's experiments, their directions and `M`'s targets for them.
+/// One training batch's experiments and `M`'s targets for them.
 struct Evidence {
     batch: Batch,
     experiments: Vec<Experiment>,
-    design: Design,
     targets: Targets,
 }
 
@@ -72,7 +71,7 @@ fn objective(ic: &mut Interchange, evidence: &[Evidence], posterior: &Posterior,
             })
             .collect();
         ic.load(&theta)?;
-        let evaluation = ic.evaluate_resident(&e.batch, &e.experiments, &e.design, &e.targets, false)?;
+        let evaluation = ic.evaluate_resident(&e.batch, &e.experiments, &e.targets, false)?;
         bits += evaluation.bits.iter().flatten().sum::<f64>();
     }
     Ok(bits + (posterior.description() + fixed) / LN_2)
@@ -150,10 +149,9 @@ fn main() -> Result<(), String> {
     let explanation = library_mdl::explanation(&native, &layers)?;
     let posterior = library_mdl::checkpoint_posterior(&explanation, Path::new(checkpoint))?;
     let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
-    let reads = interchange::library_reads(&explanation.artifact.program, sites.len())?;
+    let reads = interchange::reads(&native, &sites)?;
     let mut ic = Interchange::new(&device, &native, &sites, &explanation.artifact, &explanation.trainable, reads, settings.fit.numeric_bytes, settings.fit.head_tile_rows)?;
     let variables = ic.variables().to_vec();
-    let starting: Vec<Array2<f64>> = explanation.trainable.iter().map(|op| explanation.artifact.program.operators[*op].matrix()).collect();
     // The fixed collection: the training sequences in order, in batches, each base's source drawn
     // among the other training sequences.
     let mut rng = StdRng::seed_from_u64(settings.fit.seed);
@@ -170,9 +168,8 @@ fn main() -> Result<(), String> {
         let pick = |chosen: &[usize]| chosen.iter().map(|i| train[*i].clone()).collect::<Vec<_>>();
         let batch = Batch::new(pick(bases), pick(&sources))?;
         let experiments = interchange::sample(&mut rng, bases.len(), &variables, 2 * layer_count, settings.context)?;
-        let design = ic.design_at(&variables, &experiments, &starting)?;
-        let targets = ic.targets(&batch, &experiments, &design)?;
-        evidence.push(Evidence { batch, experiments, design, targets });
+        let targets = ic.targets(&batch, &experiments)?;
+        evidence.push(Evidence { batch, experiments, targets });
     }
     let divergences = posterior.divergences();
     let mut order: Vec<usize> = (0..divergences.len()).filter(|g| posterior.active[*g]).collect();

@@ -16,9 +16,8 @@
 //! reference).
 //!
 //! The families, `SEQUENCES` bases each (the first rows; the next rows are the sources): clean
-//! with `P` alone; clean under a random block-subset hybrid; a read patch of one of `M`'s read
-//! variables; a joint read patch; both with `M`'s directions (the library's start); and a read
-//! patch with `P`'s own directions (adaptive). Per family: the largest per-token difference of
+//! with `P` alone; clean under a random block-subset hybrid; a read patch of one of `M`'s functions
+//! (`interchange::reads`); a joint read patch. Per family: the largest per-token difference of
 //! `KL(M_e ‖ P_e)` in bits and the reference's mean, and the gradient's relative difference
 //! `|g − g_ref| / |g_ref|` over all trainable operators, per candidate (a fused family that fails
 //! records its error). One JSON object goes to `OUT/engine_parity.json` and stdout.
@@ -69,20 +68,18 @@ fn family(name: &str, rng: &mut StdRng, sequences: usize, blocks: usize, length:
 }
 
 /// `KL` per experiment and token, and the gradient per trainable operator (host), of `experiments`
-/// on `x` with directions at `values`.
-fn scored(x: &Interchange, batch: &Batch, experiments: &[Experiment], values: &[Array2<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Array2<f64>>), String> {
-    let design = x.design_at(x.variables(), experiments, values)?;
-    let scored = x.evaluate(batch, experiments, &design, true)?;
+/// on `x`.
+fn scored(x: &Interchange, batch: &Batch, experiments: &[Experiment]) -> Result<(Vec<Vec<f64>>, Vec<Array2<f64>>), String> {
+    let scored = x.evaluate(batch, experiments, true)?;
     Ok((scored.bits, scored.gradient))
 }
 
 /// [`scored`] on the reference engine of `x`'s device (its programs), whether or not `x` runs
 /// the fused engine; the gradient in `trainable` order.
-fn scored_by_programs(x: &Interchange, trainable: &[usize], batch: &Batch, experiments: &[Experiment], values: &[Array2<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Array2<f64>>), String> {
-    let design = x.design_at(x.variables(), experiments, values)?;
+fn scored_by_programs(x: &Interchange, trainable: &[usize], batch: &Batch, experiments: &[Experiment]) -> Result<(Vec<Vec<f64>>, Vec<Array2<f64>>), String> {
     let (m, p) = x.models();
-    let targets = interchange::targets(&m, x.head(), batch, experiments, &design)?;
-    let evaluation = interchange::evaluate(&m, &p, x.head(), batch, &targets, experiments, &design, true)?;
+    let targets = interchange::targets(&m, x.head(), batch, experiments)?;
+    let evaluation = interchange::evaluate(&m, &p, x.head(), batch, &targets, experiments, true)?;
     let d = p.program.device();
     let gradient = trainable
         .iter()
@@ -154,7 +151,7 @@ fn main() -> Result<(), String> {
     let layers = layer_nodes(&native, layer_count)?;
     let batch = Batch::new(rows[..sequences].to_vec(), rows[sequences..2 * sequences].to_vec())?;
     let explanation = library_mdl::explanation(&native, &layers)?;
-    let variables = interchange::library_reads(&explanation.artifact.program, layer_count)?;
+    let variables = interchange::reads(&native, &layers)?;
     let trainable = &explanation.trainable;
     let start: Vec<Array2<f64>> = trainable.iter().map(|op| explanation.artifact.program.operators[*op].matrix()).collect();
     // P: every trainable value moved by a relative 10%, deterministically.
@@ -169,24 +166,23 @@ fn main() -> Result<(), String> {
     let blocks = 2 * layer_count;
     // The families' experiments, and the reference's scores of them.
     let mut families = Vec::new();
-    for name in ["clean_alone", "clean_hybrid", "read", "read_joint", "adaptive"] {
+    for name in ["clean_alone", "clean_hybrid", "read", "read_joint"] {
         let experiments = family(name, &mut rng, sequences, blocks, context, &variables);
-        let directions = if name == "adaptive" { &moved } else { &start };
-        let expected = scored(&reference, &batch, &experiments, directions)?;
-        families.push((name, experiments, directions, expected));
+        let expected = scored(&reference, &batch, &experiments)?;
+        families.push((name, experiments, expected));
     }
     // The accelerator's program engine first, then the fused engine when it runs: a fault in the
     // second leaves the first's numbers.
     let mut programs = serde_json::Map::new();
-    for (name, experiments, directions, expected) in families.iter().filter(|_| !on_host) {
-        let row = compare(expected, &scored_by_programs(&candidate, trainable, &batch, experiments, directions)?);
+    for (name, experiments, expected) in families.iter().filter(|_| !on_host) {
+        let row = compare(expected, &scored_by_programs(&candidate, trainable, &batch, experiments)?);
         log::info!("parity {name}, programs: {row}");
         programs.insert((*name).into(), row);
     }
     let mut fused = serde_json::Map::new();
     if candidate.fuse(arithmetic)? {
-        for (name, experiments, directions, expected) in &families {
-            let row = match scored(&candidate, &batch, experiments, directions) {
+        for (name, experiments, expected) in &families {
+            let row = match scored(&candidate, &batch, experiments) {
                 Ok(found) => compare(expected, &found),
                 Err(e) => json!({"error": e}),
             };

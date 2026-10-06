@@ -28,7 +28,7 @@
 
 use crate::{
     device_program::DeviceProgram,
-    interchange::BlockEngine,
+    interchange::{BlockEngine, Edits, Value},
     operator_program::{Law, Node, Operator, OperatorBody, OperatorProgram, Rotary},
 };
 use gam_gpu::tensor::{Arithmetic, Device, HeadLayout, Indices, Op, Storage, Tensor};
@@ -136,6 +136,9 @@ pub struct Decoder {
     /// Per rotary configuration, the angles of positions `0..span` (span × planes), grown to the
     /// longest sequence seen.
     angles: Mutex<Vec<(Rotary, usize, Arc<(Tensor, Tensor)>)>>,
+    /// Where the program holds each read variable's value (`interchange::values`); the decoder
+    /// does not yet apply edits there, so a patched experiment is refused.
+    values: Vec<Value>,
 }
 
 /// A layer's shape ([`Decoder::layer_shape`]).
@@ -263,7 +266,7 @@ impl Decoder {
         let width = embedding.cols();
         let value = if device.storage() == Storage::F32 { 4 } else { 8 };
         let gradient_bytes = trainable.iter().map(|op| program.operators[*op].rows.width() * program.operators[*op].cols.width() * value).sum();
-        let mut out = Self { device: device.clone(), blocks, weights: Vec::new(), embedding, width, trainable: trainable.to_vec(), gradient_bytes, arithmetic: Arithmetic::F32, angles: Mutex::new(Vec::new()) };
+        let mut out = Self { device: device.clone(), blocks, weights: Vec::new(), embedding, width, trainable: trainable.to_vec(), gradient_bytes, arithmetic: Arithmetic::F32, angles: Mutex::new(Vec::new()), values: Vec::new() };
         out.weights = out.blocks.iter().map(|b| out.upload(program, b)).collect::<Result<_, _>>()?;
         Ok(out)
     }
@@ -347,6 +350,13 @@ impl Decoder {
     #[must_use]
     pub fn with_arithmetic(mut self, arithmetic: Arithmetic) -> Self {
         self.arithmetic = arithmetic;
+        self
+    }
+
+    /// Where the program holds each read variable's value (`interchange::values`).
+    #[must_use]
+    pub fn with_values(mut self, values: Vec<Value>) -> Self {
+        self.values = values;
         self
     }
 
@@ -606,15 +616,22 @@ impl BlockEngine for Decoder {
         self.arithmetic
     }
 
+    fn values(&self) -> &[Value] {
+        &self.values
+    }
+
     fn forward(
         &self,
         block: usize,
         stream: &mut Tensor,
         ranges: &[Range<usize>],
         tokens: &[&[u32]],
-        read_edit: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
+        edits: Option<&Edits>,
         keep: bool,
     ) -> Result<Option<Tape>, String> {
+        if edits.is_some() {
+            return Err(error("the decoder does not patch read variables"));
+        }
         let d = &self.device;
         let x = if block == 0 {
             let ids: Vec<u32> = tokens.iter().flat_map(|t| t.iter().copied()).collect();
@@ -627,10 +644,7 @@ impl BlockEngine for Decoder {
             Block::Attention(a) => (a.epsilon, a.rotary),
             Block::Mlp(m) => (m.epsilon, None),
         };
-        let (mut read, scale) = d.rms_gain(&x, &w.gain, epsilon, false).map_err(error)?;
-        if let Some(edit) = read_edit {
-            edit(&mut read)?;
-        }
+        let (read, scale) = d.rms_gain(&x, &w.gain, epsilon, false).map_err(error)?;
         // In bfloat16 each operand is rounded once where it is made, not per product reading it.
         let (arithmetic, half) = (self.arithmetic, self.arithmetic == Arithmetic::Bf16);
         let read = if half { d.bf16_copy(&read).map_err(error)? } else { read };
@@ -675,9 +689,12 @@ impl BlockEngine for Decoder {
         tape: &Tape,
         cotangent: &mut Tensor,
         ranges: &[Range<usize>],
-        read_edit: Option<&mut dyn FnMut(&mut Tensor) -> Result<(), String>>,
+        edits: Option<&Edits>,
         gradient: &mut BTreeMap<usize, Tensor>,
     ) -> Result<(), String> {
+        if edits.is_some() {
+            return Err(error("the decoder does not patch read variables"));
+        }
         let d = &self.device;
         let w = &self.weights[block];
         let mut g = self.gather(cotangent, ranges)?;
@@ -731,9 +748,6 @@ impl BlockEngine for Decoder {
             }
             _ => return Err(error("a tape of another block")),
         }
-        if let Some(edit) = read_edit {
-            edit(&mut g_read)?;
-        }
         // The stream's cotangent: the residual's own plus the read's through the norm.
         d.rms_gain_backward((&tape.x, &w.gain, &tape.scale), &g_read, &mut g).map_err(error)?;
         if block == 0 {
@@ -773,9 +787,9 @@ mod tests {
         test_support::{tiny_export, tiny_qwen3_export},
     };
 
-    /// Both engines in `arithmetic`, every block forward and then backward on two sequences, with a
-    /// read edit at block 1 (half the read) and its transpose: the final streams, every trainable
-    /// operator's gradient and the embedding's cotangent agree within the rounding both share. The
+    /// Both engines in `arithmetic`, every block forward and then backward on two sequences: the
+    /// final streams, every trainable operator's gradient and the embedding's cotangent agree
+    /// within the rounding both share. The
     /// reference rounds its products' operands as the decoder does; only the order of summation and
     /// an operand rounded across a tie differ: values within 4 rounding steps of the magnitude
     /// they sum, gradients within 8 (a step the arithmetic's unit roundoff, and at least `2⁻²⁰` for
@@ -792,32 +806,20 @@ mod tests {
         let mut program = DeviceProgram::compile_values_bounded(&host, &prefix, usize::MAX).unwrap();
         program.set_arithmetic(arithmetic);
         program.prepare_dense_parameters(&explanation.trainable).unwrap();
-        let reference = Model::new(&program, &flat, entries.clone(), reads.clone(), &explanation.trainable).unwrap();
+        let reference = Model::new(&program, &flat, entries.clone(), reads.clone(), &explanation.trainable, Vec::new()).unwrap();
         let decoder = Decoder::new(&host, &prefix, (&entries, &reads, program.hidden()), &explanation.trainable).unwrap().with_arithmetic(arithmetic);
         let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
         let sequences: Vec<&[u32]> = tokens.chunks(12).collect();
         let ranges = [0..12, 12..24];
-        let run = |engine: &dyn Fn(usize, &mut Tensor, bool) -> Result<(), String>| {
+        let run = |engine: &dyn Fn(usize, &mut Tensor) -> Result<(), String>| {
             let mut stream = host.zeros(24, 8).unwrap();
             for b in 0..4 {
-                engine(b, &mut stream, b == 1).unwrap();
+                engine(b, &mut stream).unwrap();
             }
             stream
         };
-        let half = |t: &mut Tensor| -> Result<(), String> {
-            let mut out = host.zeros(t.rows(), t.cols()).map_err(|e| e.to_string())?;
-            host.axpy(&mut out, 0.5, t).map_err(|e| e.to_string())?;
-            *t = out;
-            Ok(())
-        };
-        let reference_stream = run(&|b, s, edit| {
-            let mut e = half;
-            reference.forward(b, s, &ranges, &sequences, if edit { Some(&mut e) } else { None }, false).map(|_| ())
-        });
-        let decoder_stream = run(&|b, s, edit| {
-            let mut e = half;
-            decoder.forward(b, s, &ranges, &sequences, if edit { Some(&mut e) } else { None }, false).map(|_| ())
-        });
+        let reference_stream = run(&|b, s| reference.forward(b, s, &ranges, &sequences, None, false).map(|_| ()));
+        let decoder_stream = run(&|b, s| decoder.forward(b, s, &ranges, &sequences, None, false).map(|_| ()));
         let (a, b) = (host.download(&reference_stream).unwrap(), host.download(&decoder_stream).unwrap());
         let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         let difference = a.iter().zip(&b).fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()));
@@ -831,26 +833,22 @@ mod tests {
             let mut stream = host.zeros(24, 8).unwrap();
             let mut tapes = Vec::new();
             for b in 0..4 {
-                let mut e = half;
-                tapes.push(reference.forward(b, &mut stream, &ranges, &sequences, if b == 1 { Some(&mut e) } else { None }, true).unwrap().unwrap());
+                tapes.push(reference.forward(b, &mut stream, &ranges, &sequences, None, true).unwrap().unwrap());
             }
             let mut g = host.copy(&cotangent).unwrap();
             for (b, tape) in tapes.iter().enumerate().rev() {
-                let mut e = half;
-                reference.reverse(b, tape, &mut g, &ranges, if b == 1 { Some(&mut e) } else { None }, &mut reference_gradient).unwrap();
+                reference.reverse(b, tape, &mut g, &ranges, None, &mut reference_gradient).unwrap();
             }
         }
         {
             let mut stream = host.zeros(24, 8).unwrap();
             let mut tapes = Vec::new();
             for b in 0..4 {
-                let mut e = half;
-                tapes.push(decoder.forward(b, &mut stream, &ranges, &sequences, if b == 1 { Some(&mut e) } else { None }, true).unwrap().unwrap());
+                tapes.push(decoder.forward(b, &mut stream, &ranges, &sequences, None, true).unwrap().unwrap());
             }
             let mut g = host.copy(&cotangent).unwrap();
             for (b, tape) in tapes.iter().enumerate().rev() {
-                let mut e = half;
-                decoder.reverse(b, tape, &mut g, &ranges, if b == 1 { Some(&mut e) } else { None }, &mut decoder_gradient).unwrap();
+                decoder.reverse(b, tape, &mut g, &ranges, None, &mut decoder_gradient).unwrap();
             }
         }
         assert_eq!(reference_gradient.keys().collect::<Vec<_>>(), decoder_gradient.keys().collect::<Vec<_>>(), "the same operators receive gradients");

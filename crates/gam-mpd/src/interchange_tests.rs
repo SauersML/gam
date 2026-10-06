@@ -6,9 +6,9 @@
 //!
 //! The host reference runs each model's program with `OperatorProgram::execute_edited`: a hybrid
 //! runs block by block, each block's model entering at the stream the previous block left; a patch
-//! replaces the read node's value, its projector formed from a QR decomposition of the read rows
-//! (not the device's singular value decomposition); and the divergence is formed from full softmax
-//! distributions (not the compact head statistics). Both sides evaluate the same expressions in float64 in different orders; each
+//! writes the source run's entries of the patched variables' nodes into the base run's row (not
+//! the device's masked rows); and the divergence is formed from full softmax distributions (not
+//! the compact head statistics). Both sides evaluate the same expressions in float64 in different orders; each
 //! value then differs by a few units of rounding of its widest sum (at most `d + V` terms here,
 //! `V` classes), far below the `1e-9` bits the comparison allows and far below any effect of a
 //! patch.
@@ -16,8 +16,8 @@
 use super::artifact::Artifact;
 use super::device_program::DeviceProgram;
 use super::device_program_tests::{devices, fixture_sized, noise};
-use super::interchange::{Batch, Design, Experiment, FixedHead, Interchange, Model, Patch, ReadVariable, census, design, evaluate, sample, sites, targets};
-use super::interchange::BlockEngine;
+use super::interchange::{Batch, Experiment, FixedHead, Interchange, Model, Patch, ReadVariable, Site, Value, census, evaluate, reads, sample, sites, targets, values};
+use super::interchange::{BlockEngine, Edits};
 use super::device_program::DeviceTrace;
 use super::operator_program::{FamilyInputs, Operator, OperatorProgram, SequenceLayout, SlotValues, exact_precision};
 use super::resident_causal_fit::fixed_head_target::Head;
@@ -25,7 +25,7 @@ use super::run_check::{layer_nodes, split_sites};
 use gam_gpu::tensor::Device;
 use gam_math::categorical::categorical_kl_from_logits;
 use gam_linalg::decompose::{QrMode, qr};
-use ndarray::{Array2, Axis, s};
+use ndarray::Array2;
 use rand::SeedableRng;
 use std::sync::Arc;
 
@@ -42,12 +42,14 @@ struct Host {
     reads: Vec<usize>,
 }
 
-/// The native model `M`, its explanation `P` (perturbed maps), `P`'s read variables and trainable
-/// operators, and the shared head.
+/// The native model `M`, its explanation `P` (perturbed maps), the read variables, where both
+/// models hold their values (the same nodes: `P` is `M`'s program with other values), `P`'s
+/// trainable operators, and the shared head.
 struct Fixture {
     m: Host,
     p: Host,
     variables: Vec<ReadVariable>,
+    values: Vec<Value>,
     trainable: Vec<usize>,
     head: Head,
     batch: Batch,
@@ -89,15 +91,15 @@ fn fixture_at(width: usize) -> Fixture {
             variables.extend((0..op.rows.width()).map(|i| ReadVariable { block, parts: vec![(index, i..i + 1)] }));
         }
     }
-    // A variable read through two operator parts, as a gated MLP function's is (at a block no
-    // complement patch below spans, since its rows repeat other variables').
+    // A variable read through two operator parts, as a gated MLP function's is.
     let up = flat.operators.iter().position(|op| op.name == "blocks.0.c_fc").expect("layer 0 MLP input");
     variables.push(ReadVariable { block: 1, parts: vec![(up, 1..2), (up, 4..6)] });
     let p = Host { prefix: head.prefix(&p_flat), flat: p_flat, entries, reads };
+    let held = values(&native, &Artifact::native(&native).expect("native artifact"), &layers, &variables).expect("the variables' values");
     let SlotValues::Tokens(tokens) = &family.slots[0] else { panic!("tokens") };
     let base: Vec<Vec<u32>> = tokens.chunks(LENGTH).map(<[u32]>::to_vec).collect();
     let source: Vec<Vec<u32>> = base.iter().map(|s| s.iter().map(|t| (t + 5) % VOCAB as u32).rev().collect()).collect();
-    Fixture { m, p, variables, trainable, head, batch: Batch::new(base, source).expect("batch") }
+    Fixture { m, p, variables, values: held, trainable, head, batch: Batch::new(base, source).expect("batch") }
 }
 
 fn one(tokens: &[u32]) -> FamilyInputs {
@@ -108,33 +110,19 @@ fn one(tokens: &[u32]) -> FamilyInputs {
     }
 }
 
-/// The projector onto the span of `rows` (`complement` false) as the reference forms it: `Q Qᵀ`
-/// from a QR decomposition of the rows' transpose, which here have full rank or span everything.
-fn projector(rows: &Array2<f64>) -> Array2<f64> {
-    let q = qr(rows.t(), QrMode::Economic).expect("qr").q.expect("q");
-    q.dot(&q.t())
-}
-
-/// A patch as the reference applies it: block, projector, complement, the source's read, and the
-/// one row it replaces.
-type HostPatch<'a> = (usize, &'a Array2<f64>, bool, &'a Array2<f64>, usize);
-
-fn patched(h: &Array2<f64>, (_, pi, complement, s, at): HostPatch<'_>) -> Array2<f64> {
-    let (hr, sr) = (h.row(at).to_owned(), s.row(at).to_owned());
-    let row = if complement { &sr + &(&hr - &sr).dot(pi) } else { &hr + &(&sr - &hr).dot(pi) };
-    let mut out = h.clone();
-    out.row_mut(at).assign(&row);
-    out
-}
+/// A patch as the reference applies it: its block, the sites of its variables, the source run's
+/// values of that block (every node), and the row it replaces.
+type HostPatch<'a> = (usize, &'a [Site], &'a [Array2<f64>], usize);
 
 /// The hybrid running `P`'s version of the blocks `explained` marks and `M`'s of the others, on
-/// `tokens`, under `patches`: its hidden rows and its read at every block. Each block is one run of
-/// its model's whole program with the stream entering the block replaced by the previous block's
-/// output, of which only the block's own nodes are kept.
-fn hybrid(f: &Fixture, tokens: &[u32], explained: &[bool], patches: &[HostPatch<'_>]) -> (Array2<f64>, Vec<Array2<f64>>) {
+/// `tokens`, under `patch`: its hidden rows and every node's value of each block's run. Each block
+/// is one run of its model's whole program with the stream entering the block replaced by the
+/// previous block's output, of which only the block's own nodes are kept; a patched node's entries
+/// at the patched row take the source run's.
+fn hybrid(f: &Fixture, tokens: &[u32], explained: &[bool], patch: Option<HostPatch<'_>>) -> (Array2<f64>, Vec<Vec<Array2<f64>>>) {
     let family = one(tokens);
     let blocks = 2 * LAYERS;
-    let (mut state, mut reads) = (None::<Array2<f64>>, Vec::with_capacity(blocks));
+    let (mut state, mut runs) = (None::<Array2<f64>>, Vec::with_capacity(blocks));
     for b in 0..blocks {
         let host = if explained[b] { &f.p } else { &f.m };
         let end = if b + 1 < blocks { host.entries[b + 1] } else { host.prefix.output };
@@ -146,23 +134,27 @@ fn hybrid(f: &Fixture, tokens: &[u32], explained: &[bool], patches: &[HostPatch<
                 {
                     *value = entering.clone();
                 }
-                if let Some(patch) = patches.iter().find(|p| p.0 == b)
-                    && node == host.reads[b]
+                if let Some((block, sites, source, at)) = patch
+                    && block == b
                 {
-                    *value = patched(value, *patch);
+                    for site in sites.iter().filter(|s| s.node == node) {
+                        for c in site.columns.clone() {
+                            value[[at, c]] = source[node][[at, c]];
+                        }
+                    }
                 }
                 Ok(())
             })
             .expect("block");
-        reads.push(run.values[host.reads[b]].clone());
         state = Some(run.values[end].clone());
+        runs.push(run.values);
     }
-    (state.expect("a block ran"), reads)
+    (state.expect("a block ran"), runs)
 }
 
 /// `M` alone (the hybrid with no block of `P`).
-fn native(f: &Fixture, tokens: &[u32], patches: &[HostPatch<'_>]) -> (Array2<f64>, Vec<Array2<f64>>) {
-    hybrid(f, tokens, &[false; 2 * LAYERS], patches)
+fn native(f: &Fixture, tokens: &[u32], patch: Option<HostPatch<'_>>) -> (Array2<f64>, Vec<Vec<Array2<f64>>>) {
+    hybrid(f, tokens, &[false; 2 * LAYERS], patch)
 }
 
 /// Per row `KL(softmax(E a) ‖ softmax(E b))` in bits.
@@ -178,28 +170,14 @@ fn kl_bits(head: &Head, a: &Array2<f64>, b: &Array2<f64>) -> Vec<f64> {
 fn reference(f: &Fixture, e: &Experiment) -> Vec<f64> {
     let (base, source) = (&f.batch.base[e.base], &f.batch.source[e.source]);
     let Some(patch) = &e.patch else {
-        return kl_bits(&f.head, &native(f, base, &[]).0, &hybrid(f, base, &e.explained, &[]).0)[e.position..].to_vec();
+        return kl_bits(&f.head, &native(f, base, None).0, &hybrid(f, base, &e.explained, None).0)[e.position..].to_vec();
     };
-    let rows_of = |v: &ReadVariable| -> Vec<Array2<f64>> { v.parts.iter().map(|(op, rows)| f.p.flat.operators[*op].matrix().slice(s![rows.clone(), ..]).to_owned()).collect() };
-    // Per patched block: its rows, and whether the patch takes their complement.
-    let sites: Vec<(usize, Vec<Array2<f64>>, bool)> = match patch {
-        Patch::Read { variable } => vec![(f.variables[*variable].block, rows_of(&f.variables[*variable]), false)],
-        Patch::Reads { variables } => vec![(f.variables[variables[0]].block, variables.iter().flat_map(|v| rows_of(&f.variables[*v])).collect(), false)],
-        Patch::Complement { blocks } => blocks.iter().map(|&b| (b, f.variables.iter().filter(|v| v.block == b).flat_map(rows_of).collect(), true)).collect(),
-    };
-    let projectors: Vec<Array2<f64>> = sites
-        .iter()
-        .map(|(_, parts, _)| {
-            let views: Vec<_> = parts.iter().map(|m| m.view()).collect();
-            let rows = ndarray::concatenate(Axis(0), &views).expect("rows");
-            // More rows than coordinates span everything: the projector is the identity.
-            if rows.nrows() >= rows.ncols() { Array2::eye(rows.ncols()) } else { projector(&rows) }
-        })
-        .collect();
-    let (m_reads, p_reads) = (native(f, source, &[]).1, hybrid(f, source, &e.explained, &[]).1);
-    let m_patches: Vec<HostPatch<'_>> = sites.iter().zip(&projectors).map(|((b, _, c), pi)| (*b, pi, *c, &m_reads[*b], e.position)).collect();
-    let p_patches: Vec<HostPatch<'_>> = sites.iter().zip(&projectors).map(|((b, _, c), pi)| (*b, pi, *c, &p_reads[*b], e.position)).collect();
-    kl_bits(&f.head, &native(f, base, &m_patches).0, &hybrid(f, base, &e.explained, &p_patches).0)[e.position..].to_vec()
+    let block = f.variables[patch.variables()[0]].block;
+    let sites: Vec<Site> = patch.variables().iter().flat_map(|v| f.values[*v].sites.clone()).collect();
+    let (m_source, p_source) = (native(f, source, None).1, hybrid(f, source, &e.explained, None).1);
+    let m = native(f, base, Some((block, &sites, &m_source[block], e.position))).0;
+    let p = hybrid(f, base, &e.explained, Some((block, &sites, &p_source[block], e.position))).0;
+    kl_bits(&f.head, &m, &p)[e.position..].to_vec()
 }
 
 /// Experiments covering every kind of patch on both sides of the hybrids' switches, under prefix
@@ -219,17 +197,11 @@ fn experiments(f: &Fixture) -> Vec<Experiment> {
         e(5, 4, [t, n, t, t], Some(Patch::Read { variable: read(1, 3) }), 1),
         e(1, 2, [n, t, n, t], Some(Patch::Read { variable: read(2, 1) }), 2),
         e(3, 0, [t, t, n, n], Some(Patch::Read { variable: f.variables.len() - 1 }), 4),
-        e(0, 2, [t, t, n, n], Some(Patch::Complement { blocks: vec![0] }), 0),
-        e(1, 3, [t, t, t, t], Some(Patch::Complement { blocks: vec![2] }), 2),
-        e(2, 0, [t, t, n, n], Some(Patch::Complement { blocks: vec![3] }), 5),
-        e(5, 1, [n, t, t, n], Some(Patch::Complement { blocks: vec![0] }), 3),
-        // Joint complements at several blocks, on both sides of the switches.
-        e(4, 0, [t, n, t, n], Some(Patch::Complement { blocks: vec![0, 3] }), 1),
-        e(3, 5, [n, t, t, t], Some(Patch::Complement { blocks: vec![0, 2, 3] }), 0),
-        e(0, 4, [t, t, t, t], Some(Patch::Complement { blocks: vec![2, 3] }), 4),
         // Joint read patches of several variables of one block.
         e(2, 4, [t, t, n, n], Some(Patch::Reads { variables: vec![read(3, 0), read(3, 2), read(3, 7)] }), 2),
         e(5, 3, [n, t, t, n], Some(Patch::Reads { variables: vec![read(2, 0), read(2, 2)] }), 1),
+        e(0, 4, [t, t, t, t], Some(Patch::Reads { variables: vec![read(1, 0), read(1, 1), read(1, 6)] }), 0),
+        e(1, 5, [n, n, t, t], Some(Patch::Reads { variables: vec![read(0, 1), read(0, 3)] }), 3),
     ]
 }
 
@@ -249,8 +221,8 @@ fn programs(device: &Device, f: &Fixture) -> Programs {
 
 fn models<'a>(f: &Fixture, programs: &'a Programs) -> (Model<'a>, Model<'a>) {
     (
-        Model::new(&programs.m, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &[]).expect("M model"),
-        Model::new(&programs.p, &f.p.flat, f.p.entries.clone(), f.p.reads.clone(), &f.trainable).expect("P model"),
+        Model::new(&programs.m, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &[], f.values.clone()).expect("M model"),
+        Model::new(&programs.p, &f.p.flat, f.p.entries.clone(), f.p.reads.clone(), &f.trainable, f.values.clone()).expect("P model"),
     )
 }
 
@@ -261,9 +233,8 @@ fn every_experiment_matches_the_host_reference() {
     for device in devices() {
         let programs = programs(&device, &f);
         let (m, p) = models(&f, &programs);
-        let design = design(&p, &f.variables, &experiments).expect("design");
-        let targets = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
-        let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, &design, false).expect("evaluate");
+        let targets = targets(&m, &programs.head, &f.batch, &experiments).expect("targets");
+        let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, false).expect("evaluate");
         for (e, bits) in experiments.iter().zip(&evaluation.bits) {
             let expected = reference(&f, e);
             assert_eq!(bits.len(), LENGTH - e.position);
@@ -286,24 +257,23 @@ fn the_model_explains_itself_exactly() {
     p.prepare_dense_parameters(&f.trainable).expect("parameters");
     let m = DeviceProgram::compile_values(&device, &f.m.prefix).expect("M");
     let head = FixedHead::new(&device, &f.m.flat, &f.m.flat, 4).expect("head");
-    let mm = Model::new(&m, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &[]).expect("M model");
-    let pm = Model::new(&p, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &f.trainable).expect("P model");
+    let mm = Model::new(&m, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &[], f.values.clone()).expect("M model");
+    let pm = Model::new(&p, &f.m.flat, f.m.entries.clone(), f.m.reads.clone(), &f.trainable, f.values.clone()).expect("P model");
     let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(5), f.batch.base.len(), &f.variables, 2 * LAYERS, LENGTH).expect("sample");
-    let design = design(&pm, &f.variables, &experiments).expect("design");
-    let targets = targets(&mm, &head, &f.batch, &experiments, &design).expect("targets");
-    let evaluation = evaluate(&mm, &pm, &head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
+    let targets = targets(&mm, &head, &f.batch, &experiments).expect("targets");
+    let evaluation = evaluate(&mm, &pm, &head, &f.batch, &targets, &experiments, true).expect("evaluate");
     assert!(evaluation.bits.iter().flatten().all(|b| b.abs() <= 1e-12), "{:?}", evaluation.bits);
     for g in evaluation.gradient.values() {
         assert!(device.download(g).expect("gradient").iter().all(|v| v.abs() <= 1e-9));
     }
 }
 
-/// The total bits at `P`'s operator `op` moved to `value`, the design held fixed.
-fn total_at(device: &Device, f: &Fixture, programs: &mut Programs, op: usize, value: &Array2<f64>, experiments: &[Experiment], design: &Design) -> f64 {
+/// The total bits at `P`'s operator `op` moved to `value`.
+fn total_at(device: &Device, f: &Fixture, programs: &mut Programs, op: usize, value: &Array2<f64>, experiments: &[Experiment]) -> f64 {
     programs.p.replace_dense_parameter(op, device.upload(value.view()).expect("upload")).expect("replace");
     let (m, p) = models(f, programs);
-    let targets = targets(&m, &programs.head, &f.batch, experiments, design).expect("targets");
-    let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &targets, experiments, design, false).expect("evaluate");
+    let targets = targets(&m, &programs.head, &f.batch, experiments).expect("targets");
+    let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &targets, experiments, false).expect("evaluate");
     evaluation.bits.iter().flatten().sum()
 }
 
@@ -316,12 +286,10 @@ fn the_gradient_matches_central_differences() {
     let device = Device::host();
     let experiments = experiments(&f);
     let mut programs = programs(&device, &f);
-    let (design, gradient) = {
+    let gradient = {
         let (m, p) = models(&f, &programs);
-        let design = design(&p, &f.variables, &experiments).expect("design");
-        let targets = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
-        let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
-        (design, evaluation.gradient)
+        let targets = targets(&m, &programs.head, &f.batch, &experiments).expect("targets");
+        evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, true).expect("evaluate").gradient
     };
     let delta = 1e-5;
     for (k, &op) in f.trainable.iter().enumerate() {
@@ -333,8 +301,8 @@ fn the_gradient_matches_central_differences() {
         up[[i, j]] += delta;
         let mut down = start.clone();
         down[[i, j]] -= delta;
-        let numeric = (total_at(&device, &f, &mut programs, op, &up, &experiments, &design) - total_at(&device, &f, &mut programs, op, &down, &experiments, &design)) / (2.0 * delta);
-        total_at(&device, &f, &mut programs, op, &start, &experiments, &design);
+        let numeric = (total_at(&device, &f, &mut programs, op, &up, &experiments) - total_at(&device, &f, &mut programs, op, &down, &experiments)) / (2.0 * delta);
+        total_at(&device, &f, &mut programs, op, &start, &experiments);
         let scale = analytic.abs().max(numeric.abs()).max(1.0);
         assert!((analytic - numeric).abs() <= 1e-6 * scale, "operator {} entry ({i}, {j}): analytic {analytic}, numeric {numeric}", f.p.flat.operators[op].name);
     }
@@ -374,7 +342,6 @@ fn sampling_draws_each_family_with_its_stated_weight() {
     within(counts["read_attention"] as f64, n as f64, 0.25);
     within(counts["read_mlp"] as f64, n as f64, 0.25);
     within(counts["read_joint"] as f64, n as f64, 0.5);
-    assert_eq!(counts["complement"], 0);
     // A joint subset of three: each size 1, 2, 3 with probability 1/3.
     let joints = counts["read_joint"] as f64;
     assert_eq!(joint_sizes[0], 0);
@@ -392,77 +359,24 @@ fn sampling_draws_each_family_with_its_stated_weight() {
 }
 
 #[test]
-fn joint_patches_spanning_the_stream_match_the_host_reference() {
-    // At width 8 a block's 16 MLP reads span the whole stream: a joint patch of them takes the
-    // source's read whole, and their complement keeps the base's.
-    let f = fixture_at(8);
-    let at_block = |b: usize| -> Vec<usize> { f.variables.iter().enumerate().filter(|(_, v)| v.block == b).map(|(i, _)| i).collect() };
-    let mlp = at_block(3);
-    assert!(mlp.len() >= 8);
-    let e = |patch: Patch, position: usize| Experiment { base: 1, source: 2, explained: vec![true, false, true, true], patch: Some(patch), position };
-    let experiments = vec![
-        e(Patch::Reads { variables: mlp.clone() }, 2),
-        e(Patch::Reads { variables: mlp[..9].to_vec() }, 4),
-        e(Patch::Reads { variables: mlp[..3].to_vec() }, 1),
-        e(Patch::Read { variable: mlp[5] }, 3),
-        e(Patch::Complement { blocks: vec![3] }, 0),
-    ];
-    for device in devices() {
-        let programs = programs(&device, &f);
-        let (m, p) = models(&f, &programs);
-        let design = design(&p, &f.variables, &experiments).expect("design");
-        let targets = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
-        let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, &design, false).expect("evaluate");
-        for (e, bits) in experiments.iter().zip(&evaluation.bits) {
-            for (a, b) in bits.iter().zip(reference(&f, e)) {
-                assert!((a - b).abs() <= 1e-9, "{e:?}: device {a} bits, host {b} bits");
-            }
-        }
-    }
-}
-
-#[test]
-fn rows_that_repeat_patch_the_span_they_resolve() {
-    // At width 8, three copies of four MLP rows are twelve rows of rank four: more rows than
-    // coordinates, yet not every direction. Their joint patch is the patch of the four rows alone.
-    let mut f = fixture_at(8);
-    let up = f.p.flat.operators.iter().position(|op| op.name == "blocks.1.c_fc").expect("layer 1 MLP input");
-    let first = f.variables.len();
-    f.variables.extend((0..3).map(|_| ReadVariable { block: 3, parts: vec![(up, 0..4)] }));
-    let e = |patch: Patch| Experiment { base: 1, source: 2, explained: vec![true, false, true, true], patch: Some(patch), position: 2 };
-    let experiments = vec![e(Patch::Reads { variables: (first..first + 3).collect() }), e(Patch::Read { variable: first })];
-    for device in devices() {
-        let programs = programs(&device, &f);
-        let (m, p) = models(&f, &programs);
-        let design = design(&p, &f.variables, &experiments).expect("design");
-        let targets = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
-        let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, &design, false).expect("evaluate");
-        for ((joint, alone), host) in evaluation.bits[0].iter().zip(&evaluation.bits[1]).zip(reference(&f, &experiments[1])) {
-            assert!((joint - alone).abs() <= 1e-9 && (alone - host).abs() <= 1e-9, "repeated rows {joint} bits, the four alone {alone} bits, host {host} bits");
-        }
-    }
-}
-
-#[test]
 fn many_dropped_reads_that_matter_little_alone_matter_jointly() {
-    // M's last MLP gets n functions whose gate rows g_k put every base read at -L and the source's
-    // read at the patched position at +L (GELU leaves them off on the base, on at the source), and
-    // whose outputs are a small common ε u (u the stream's first coordinate). P drops them. The rows are g_k = g₀ + η_k: g₀ the
-    // least-norm solution of those constraints, η_k orthogonal and λ = 30 |g₀| long in their null
-    // space, so a patch of one g_k moves another's input by 2L/(1 + 30²) only. A single patch
-    // turns one function on (output change ε L u), the joint patch all n (n ε L u): to second
-    // order the joint divergence is n² times a single one, while the base never sees them.
+    // M's last MLP gets n functions whose gate rows are one row g₀ putting every base read at -L
+    // and the source's read at the patched position at +L (GELU leaves them off on the base, on at
+    // the source), and whose outputs are a small common ε u (u the stream's first coordinate). P
+    // drops them, so only M's values change under their patches. A single patch turns one function
+    // on (output change ε L u), the joint patch all n (n ε L u): to second order the joint
+    // divergence is n² times a single one, while the base never sees them.
     let f = fixture();
     let (n, epsilon, at, big) = (8, 1e-4, 3, 10.0);
     let host = Device::host();
     let base = f.batch.base[0].clone();
     let source = f.batch.source[1].clone();
-    let reads = native(&f, &base, &[]).1[3].clone();
-    let source_read = native(&f, &source, &[]).1[3].row(at).to_owned();
+    let reads = native(&f, &base, None).1[3][f.m.reads[3]].clone();
+    let source_read = native(&f, &source, None).1[3][f.m.reads[3]].row(at).to_owned();
     let mut rows = reads.clone();
     rows.push_row(source_read.view()).expect("rows");
     let rhs: Vec<f64> = (0..rows.nrows()).map(|r| if r + 1 == rows.nrows() { big } else { -big }).collect();
-    // A = rowsᵀ = Q R: the least-norm g₀ = Q₁ R₁⁻ᵀ rhs, the null space Q's remaining columns.
+    // A = rowsᵀ = Q R: the least-norm g₀ = Q₁ R₁⁻ᵀ rhs.
     let decomposition = qr(rows.t(), QrMode::Full).expect("qr");
     let (q, r) = (decomposition.q.expect("q"), decomposition.r);
     let k = rows.nrows();
@@ -471,13 +385,12 @@ fn many_dropped_reads_that_matter_little_alone_matter_jointly() {
         y[i] = (rhs[i] - (0..i).map(|j| r[[j, i]] * y[j]).sum::<f64>()) / r[[i, i]];
     }
     let g0 = (0..k).fold(ndarray::Array1::<f64>::zeros(D), |acc, i| acc + &(q.column(i).to_owned() * y[i]));
-    let lambda = 30.0 * g0.dot(&g0).sqrt();
     let up = f.m.flat.operators.iter().position(|op| op.name == "blocks.1.c_fc").expect("layer 1 MLP input");
     let down = f.m.flat.operators.iter().position(|op| op.name == "blocks.1.down_proj").expect("layer 1 MLP output");
     let mut gates = f.m.flat.operators[up].matrix();
     let mut outputs = f.m.flat.operators[down].matrix();
     for unit in 0..n {
-        gates.row_mut(unit).assign(&(&g0 + &(q.column(k + unit).to_owned() * lambda)));
+        gates.row_mut(unit).assign(&g0);
         outputs.column_mut(unit).fill(0.0);
         outputs[[0, unit]] = epsilon;
     }
@@ -496,22 +409,18 @@ fn many_dropped_reads_that_matter_little_alone_matter_jointly() {
     let m_program = DeviceProgram::compile_values(&host, &head.prefix(&m_flat)).expect("M");
     let mut p_program = DeviceProgram::compile_values(&host, &head.prefix(&p_flat)).expect("P");
     p_program.prepare_dense_parameters(&[up]).expect("parameters");
-    // M's directions, read from a copy of M holding its gate rows as a parameter.
-    let mut directions = DeviceProgram::compile_values(&host, &head.prefix(&m_flat)).expect("M's directions");
-    directions.prepare_dense_parameters(&[up]).expect("parameters");
     let fixed_head = FixedHead::new(&host, &m_flat, &p_flat, 5).expect("head");
-    let m = Model::new(&m_program, &m_flat, f.m.entries.clone(), f.m.reads.clone(), &[]).expect("M model");
-    let p = Model::new(&p_program, &p_flat, f.m.entries.clone(), f.m.reads.clone(), &[up]).expect("P model");
-    let native_reads = Model::new(&directions, &m_flat, f.m.entries.clone(), f.m.reads.clone(), &[up]).expect("M's reads");
-    let variables: Vec<ReadVariable> = (0..n).map(|unit| ReadVariable { block: 3, parts: vec![(up, unit..unit + 1)] }).collect();
+    // The functions' values are where the fixture's units of the same rows are.
+    let units: Vec<Value> = (0..n).map(|unit| f.values[f.variables.iter().position(|v| v.block == 3 && v.parts == [(up, unit..unit + 1)]).expect("a unit")].clone()).collect();
+    let m = Model::new(&m_program, &m_flat, f.m.entries.clone(), f.m.reads.clone(), &[], units.clone()).expect("M model");
+    let p = Model::new(&p_program, &p_flat, f.m.entries.clone(), f.m.reads.clone(), &[up], units).expect("P model");
     let batch = Batch::new(vec![base], vec![source]).expect("batch");
     let e = |patch: Option<Patch>| Experiment { base: 0, source: 0, explained: vec![true; 2 * LAYERS], patch, position: at };
     let mut experiments: Vec<Experiment> = (0..n).map(|v| e(Some(Patch::Read { variable: v }))).collect();
     experiments.push(e(Some(Patch::Reads { variables: (0..n).collect() })));
     experiments.push(e(None));
-    let design = design(&native_reads, &variables, &experiments).expect("design");
-    let targets = targets(&m, &fixed_head, &batch, &experiments, &design).expect("targets");
-    let bits: Vec<f64> = evaluate(&m, &p, &fixed_head, &batch, &targets, &experiments, &design, false).expect("evaluate").bits.iter().map(|b| b.iter().sum()).collect();
+    let targets = targets(&m, &fixed_head, &batch, &experiments).expect("targets");
+    let bits: Vec<f64> = evaluate(&m, &p, &fixed_head, &batch, &targets, &experiments, false).expect("evaluate").bits.iter().map(|b| b.iter().sum()).collect();
     let (single, joint, clean) = (bits[..n].iter().copied().fold(0.0, f64::max), bits[n], bits[n + 1]);
     assert!(clean.abs() <= 1e-12, "the dropped functions are off on the base: {clean} bits");
     assert!(single <= 1e-3, "one dropped read alone: {single} bits");
@@ -526,16 +435,16 @@ fn a_device_model_refuses_a_layer_reading_before_its_stream() {
     let m = DeviceProgram::compile_values(&device, &f.m.prefix).expect("M");
     let mut reads = f.m.reads.clone();
     reads.swap(0, 2);
-    assert!(Model::new(&m, &f.m.flat, f.m.entries.clone(), reads, &[]).is_err());
+    assert!(Model::new(&m, &f.m.flat, f.m.entries.clone(), reads, &[], Vec::new()).is_err());
     let mut entries = f.m.entries.clone();
     entries[2] = f.m.reads[3];
-    assert!(Model::new(&m, &f.m.flat, entries, f.m.reads.clone(), &[]).is_err());
+    assert!(Model::new(&m, &f.m.flat, entries, f.m.reads.clone(), &[], Vec::new()).is_err());
 }
 
 #[test]
-fn directions_from_host_values_are_those_of_the_loaded_explanation() {
-    // The owner starts at M and loads P's maps; directions read from the host values it was given
-    // must be the device's own after the load, and score as the host reference does.
+fn an_interchange_loaded_with_p_scores_as_the_host_reference() {
+    // The owner starts at M (the native artifact, its values at M's nodes) and loads P's maps: it
+    // scores every experiment as the host reference does.
     let f = fixture();
     let device = Device::host();
     let (program, _) = fixture_sized(D, VOCAB, LENGTH, 6);
@@ -543,22 +452,54 @@ fn directions_from_host_values_are_those_of_the_loaded_explanation() {
     let layers = layer_nodes(&native, LAYERS).expect("layers");
     let explanation = Artifact::native(&native).expect("native artifact");
     let mut x = Interchange::new(&device, &native, &layers, &explanation, &f.trainable, f.variables.clone(), usize::MAX, 5).expect("interchange");
-    let values: Vec<Array2<f64>> = f.trainable.iter().map(|op| f.p.flat.operators[*op].matrix()).collect();
+    let loaded: Vec<Array2<f64>> = f.trainable.iter().map(|op| f.p.flat.operators[*op].matrix()).collect();
+    x.load(&loaded).expect("load");
     let experiments = experiments(&f);
-    let at_values = x.design_at(&f.variables, &experiments, &values).expect("design at values");
-    x.load(&values).expect("load");
-    let (m, p) = x.models();
-    let loaded = design(&p, &f.variables, &experiments).expect("design");
-    let at_targets = targets(&m, x.head(), &f.batch, &experiments, &at_values).expect("targets");
-    let loaded_targets = targets(&m, x.head(), &f.batch, &experiments, &loaded).expect("targets");
-    let from_values = evaluate(&m, &p, x.head(), &f.batch, &at_targets, &experiments, &at_values, false).expect("evaluate").bits;
-    let from_device = evaluate(&m, &p, x.head(), &f.batch, &loaded_targets, &experiments, &loaded, false).expect("evaluate").bits;
-    assert_eq!(from_values, from_device);
-    for (e, bits) in experiments.iter().zip(&from_values) {
+    let scored = x.evaluate(&f.batch, &experiments, false).expect("evaluate").bits;
+    for (e, bits) in experiments.iter().zip(&scored) {
         for (a, b) in bits.iter().zip(reference(&f, e)) {
             assert!((a - b).abs() <= 1e-9, "{e:?}: device {a} bits, host {b} bits");
         }
     }
+}
+
+/// The starting library of the tiny export `dir` (`library_mdl::explanation`) under the native
+/// questions: its values sit at its rules' nodes (`Artifact::owners`), not at `M`'s, yet every
+/// patched experiment scores zero, since the library computes what `M` computes, while each patch
+/// changes `M`'s own prediction.
+fn the_starting_library_explains_m_under_every_patch(dir: std::path::PathBuf) {
+    let imported = crate::import::import_language_model(&dir, 6, 12).expect("the tiny export imports");
+    std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+    let native = split_sites(&imported.program).expect("the native sites");
+    let layers = layer_nodes(&native, 2).expect("the layers");
+    let explanation = crate::library_mdl::explanation(&native, &layers).expect("the library");
+    let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+    let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+    let device = Device::host();
+    let variables = reads(&native, &layers).expect("the reads");
+    let held = values(&native, &explanation.artifact, &layers, &variables).expect("the library's values");
+    assert!(held.iter().all(|v| !v.sites.is_empty()), "the library computes every function of M");
+    let x = Interchange::new(&device, &native, &layers, &explanation.artifact, &explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
+    let batch = Batch::new(sequences[..3].to_vec(), sequences[3..].to_vec()).expect("the batch");
+    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(9), 3, x.variables(), 4, 12).expect("the draw");
+    let bits = x.evaluate(&batch, &experiments, false).expect("evaluate").bits;
+    assert!(bits.iter().flatten().all(|b| b.abs() <= 1e-9), "{bits:?}");
+    let made = x.targets(&batch, &experiments).expect("targets").host(&device).expect("host");
+    for (i, pair) in experiments.chunks(2).enumerate() {
+        let (clean, patched) = (&made[2 * i].1, &made[2 * i + 1].1);
+        let at = pair[1].position;
+        assert!(clean[at..].iter().zip(patched).any(|(a, b)| (a - b).abs() > 1e-9), "{:?}: the patch changes nothing in M", pair[1]);
+    }
+}
+
+#[test]
+fn the_starting_gelu_library_explains_m_under_every_patch() {
+    the_starting_library_explains_m_under_every_patch(crate::test_support::tiny_export("interchange_library_gelu", 2));
+}
+
+#[test]
+fn the_starting_qwen3_library_explains_m_under_every_patch() {
+    the_starting_library_explains_m_under_every_patch(crate::test_support::tiny_qwen3_export("interchange_library_qwen3", 2));
 }
 
 /// An engine counting the rows each forward call runs, around the reference.
@@ -588,17 +529,21 @@ impl BlockEngine for Counting<'_> {
         BlockEngine::arithmetic(&self.model)
     }
 
+    fn values(&self) -> &[Value] {
+        BlockEngine::values(&self.model)
+    }
+
     fn forward(
         &self,
         block: usize,
         stream: &mut gam_gpu::tensor::Tensor,
         ranges: &[std::ops::Range<usize>],
         tokens: &[&[u32]],
-        read: Option<&mut dyn FnMut(&mut gam_gpu::tensor::Tensor) -> Result<(), String>>,
+        edits: Option<&Edits>,
         keep: bool,
     ) -> Result<Option<DeviceTrace>, String> {
         self.rows.set(self.rows.get() + ranges.iter().map(ExactSizeIterator::len).sum::<usize>());
-        self.model.forward(block, stream, ranges, tokens, read, keep)
+        self.model.forward(block, stream, ranges, tokens, edits, keep)
     }
 
     fn reverse(
@@ -607,10 +552,10 @@ impl BlockEngine for Counting<'_> {
         tape: &DeviceTrace,
         cotangent: &mut gam_gpu::tensor::Tensor,
         ranges: &[std::ops::Range<usize>],
-        read: Option<&mut dyn FnMut(&mut gam_gpu::tensor::Tensor) -> Result<(), String>>,
+        edits: Option<&Edits>,
         gradient: &mut std::collections::BTreeMap<usize, gam_gpu::tensor::Tensor>,
     ) -> Result<(), String> {
-        self.model.reverse(block, tape, cotangent, ranges, read, gradient)
+        self.model.reverse(block, tape, cotangent, ranges, edits, gradient)
     }
 
     fn tape_bytes(tape: &DeviceTrace) -> usize {
@@ -640,12 +585,11 @@ fn a_patched_experiment_reuses_its_base_below_the_patched_block() {
     let device = Device::host();
     let programs = programs(&device, &f);
     let (m, p) = models(&f, &programs);
-    let design = design(&p, &f.variables, &experiments).expect("design");
-    let targets = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
-    let reference = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
+    let targets = targets(&m, &programs.head, &f.batch, &experiments).expect("targets");
+    let reference = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, true).expect("evaluate");
     let (cm, cp) = models(&f, &programs);
     let (cm, cp) = (Counting { model: cm, rows: std::cell::Cell::new(0), budget: usize::MAX }, Counting { model: cp, rows: std::cell::Cell::new(0), budget: usize::MAX });
-    let counted = evaluate(&cm, &cp, &programs.head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
+    let counted = evaluate(&cm, &cp, &programs.head, &f.batch, &targets, &experiments, true).expect("evaluate");
     assert_eq!(cm.rows.get() + cp.rows.get(), 13 * LENGTH);
     assert_eq!(counted.bits, reference.bits);
     for (op, g) in &reference.gradient {
@@ -667,12 +611,11 @@ fn blocks_run_again_in_the_reverse_pass_give_the_kept_tapes_gradient() {
     let device = Device::host();
     let programs = programs(&device, &f);
     let (m, p) = models(&f, &programs);
-    let design = design(&p, &f.variables, &experiments).expect("design");
-    let targets = targets(&m, &programs.head, &f.batch, &experiments, &design).expect("targets");
-    let kept = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
+    let targets = targets(&m, &programs.head, &f.batch, &experiments).expect("targets");
+    let kept = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, true).expect("evaluate");
     let (cm, cp) = models(&f, &programs);
     let (cm, cp) = (Counting { model: cm, rows: std::cell::Cell::new(0), budget: 0 }, Counting { model: cp, rows: std::cell::Cell::new(0), budget: 0 });
-    let again = evaluate(&cm, &cp, &programs.head, &f.batch, &targets, &experiments, &design, true).expect("evaluate");
+    let again = evaluate(&cm, &cp, &programs.head, &f.batch, &targets, &experiments, true).expect("evaluate");
     assert_eq!(cm.rows.get() + cp.rows.get(), 2 * 13 * LENGTH);
     assert_eq!(again.bits, kept.bits);
     assert_eq!(again.gradient.len(), kept.gradient.len());

@@ -2405,20 +2405,19 @@ mod tests {
         let posterior = Posterior::new(&two, 72).unwrap();
         let alignment = align(&body_values(&two, &posterior, &second.body).unwrap(), &body_values(&two, &posterior, &first.body).unwrap()).unwrap();
         let (merged, _) = merge(&two, &[first.clone(), second], "library.body1", &first.body, &alignment).unwrap();
-        let reads = interchange::library_reads(&merged.artifact.program, layers.len()).unwrap();
+        let reads = interchange::reads(&native, &layers).unwrap();
         let device = Device::host();
         let mut x = Interchange::new(&device, &native, &layers, &merged.artifact, &merged.trainable, reads.clone(), usize::MAX, 16).unwrap();
         let batch = Batch::new(sequences[..2].to_vec(), sequences[2..4].to_vec()).unwrap();
         let experiments = interchange::sample(&mut StdRng::seed_from_u64(5), 2, &reads, 4, 12).unwrap();
         let values: Vec<Array2<f64>> = merged.trainable.iter().map(|op| merged.artifact.program.operators[*op].matrix()).collect();
-        let design = x.design_at(&reads, &experiments, &values).unwrap();
         x.load(&values).unwrap();
-        let scored = x.evaluate(&batch, &experiments, &design, true).unwrap();
+        let scored = x.evaluate(&batch, &experiments, true).unwrap();
         let program = &merged.artifact.program;
         let at = |name: &str| merged.trainable.iter().position(|op| program.operators[*op].name == name).unwrap();
         let mut bits = |values: &[Array2<f64>]| -> f64 {
             x.load(values).unwrap();
-            x.evaluate(&batch, &experiments, &design, false).unwrap().bits.iter().flatten().sum()
+            x.evaluate(&batch, &experiments, false).unwrap().bits.iter().flatten().sum()
         };
         for (i, entry) in [(at(&format!("{}.gate", first.body)), (2, 1)), (at(&format!("{}.out", first.body)), (1, 3)), (at("library.l1.call1.read"), (0, 5))] {
             let h = 1e-5;

@@ -16,17 +16,14 @@
 //! * Behaviour and VPD's protocols (`explanation_battery::protocols`), from the logits: every
 //!   nonempty layer subset run as the explanation's (all layers is error-propagating, one layer
 //!   single-layer, a prefix a cut), and clean-input.
-//! * Interchange (`interchange`) with `P` alone: per base one read patch of one of `M`'s read
-//!   variables drawn uniformly, with `M`'s own directions (the library's start, the fit's fixed
-//!   questions: `read`) and with `P`'s current reads of the same rows (adaptive questions:
-//!   `read_adaptive`); a joint read patch, with `M`'s directions, of a random subset of the variables
-//!   at that variable's block, its size uniform (`read_joint`); the complement patch of every block and the joint complement patch at a
-//!   uniformly drawn set of at least two blocks (its size uniform in `2..=2L`, where cancellation
-//!   between blocks shows), both of `P`'s current reads, since `M`'s reads span every block's whole
-//!   stream and leave no complement. Each with the source a sequence shared across the whole batch
-//!   of bases. Each base's patches replace one position drawn uniformly and are scored from that
-//!   position on (earlier tokens are the unpatched run's). Every source row is scored; the worst
-//!   source of the first `K` (by the mean over all bases) is reported for each `K`.
+//! * Interchange (`interchange`) with `P` alone: per base one read patch of one of `M`'s functions
+//!   drawn uniformly (`read`), and a joint read patch of a random subset of the functions at that
+//!   function's block, its size uniform (`read_joint`): each model's values of the patched functions
+//!   replaced by its own on the source (`P`'s at the call sites that replaced them), a function `P`
+//!   no longer computes patched in `M` alone. Each with the source a sequence shared across the
+//!   whole batch of bases. Each base's patches replace one position drawn uniformly and are scored
+//!   from that position on (earlier tokens are the unpatched run's). Every source row is scored;
+//!   the worst source of the first `K` (by the mean over all bases) is reported for each `K`.
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     artifact::Artifact,
@@ -389,10 +386,8 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
 
-    // Interchange with P alone, sources shared across the batch, over M's read variables: their
-    // directions at the library's start (M's reads) and at the scored explanation (P's).
-    let variables = interchange::library_reads(&explanation.artifact.program, layer_count)?;
-    let start: Vec<Array2<f64>> = explanation.trainable.iter().map(|op| explanation.artifact.program.operators[*op].matrix()).collect();
+    // Interchange with P alone, sources shared across the batch, over M's functions.
+    let variables = interchange::reads(&native, &layers)?;
     let blocks = 2 * layer_count;
     let interchange = Interchange::new(&device, &native, &layers, &artifact, &explanation.trainable, variables.clone(), settings.numeric_bytes, settings.head_tile_rows)?;
     let read_of: Vec<usize> = (0..bases.len()).map(|_| rng.random_range(0..variables.len())).collect();
@@ -404,85 +399,57 @@ fn main() -> Result<(), String> {
             interchange::subset(&mut rng, &at)
         })
         .collect();
-    let joint_of: Vec<Vec<usize>> = (0..bases.len())
-        .map(|_| {
-            let k = rng.random_range(2..=blocks);
-            interchange::hybrid_of(&mut rng, blocks, k).iter().enumerate().filter(|(_, x)| **x).map(|(b, _)| b).collect()
-        })
-        .collect();
-    // Per family (the read patch at M's directions, at P's, each block's complement, the joint
-    // complement, then the joint read patch) per source: bits and tokens over every base, and
-    // every token's bits.
-    let families = 4 + blocks;
+    // Per family (the read patch, then the joint read patch) per source: bits and tokens over
+    // every base, and every token's bits.
+    let families = 2;
     let mut per_source = vec![vec![(0.0f64, 0usize); sources.len()]; families];
     let mut all: Vec<Tokens> = (0..families).map(|_| Tokens::default()).collect();
     let mut clean = Tokens::default();
     for (s, source) in sources.iter().enumerate() {
         for (c, chunk) in bases.chunks(settings.batch_sequences).enumerate() {
             let batch = Batch::new(chunk.to_vec(), vec![source.clone()])?;
-            // M's directions: the read patches and (once) the clean experiments; P's: the read
-            // patches again and the complements.
-            let (mut fixed, mut adaptive) = (Vec::new(), Vec::new());
+            let mut experiments = Vec::new();
             for b in 0..chunk.len() {
                 let position = position_of[c * settings.batch_sequences + b];
                 let at = |patch: Option<Patch>| {
                     let position = if patch.is_some() { position } else { 0 };
                     Experiment { base: b, source: 0, explained: vec![true; blocks], patch, position }
                 };
-                let read = at(Some(Patch::Read { variable: read_of[c * settings.batch_sequences + b] }));
-                fixed.push(read.clone());
-                fixed.push(at(Some(Patch::Reads { variables: subset_of[c * settings.batch_sequences + b].clone() })));
-                adaptive.push(read);
-                adaptive.extend((0..blocks).map(|block| at(Some(Patch::Complement { blocks: vec![block] }))));
-                adaptive.push(at(Some(Patch::Complement { blocks: joint_of[c * settings.batch_sequences + b].clone() })));
+                experiments.push(at(Some(Patch::Read { variable: read_of[c * settings.batch_sequences + b] })));
+                experiments.push(at(Some(Patch::Reads { variables: subset_of[c * settings.batch_sequences + b].clone() })));
                 if s == 0 {
-                    fixed.push(at(None));
+                    experiments.push(at(None));
                 }
             }
-            let fixed_design = interchange.design_at(&variables, &fixed, &start)?;
-            let adaptive_design = interchange::design(&interchange.models().1, &variables, &adaptive)?;
-            let scored = [(&fixed, interchange.evaluate(&batch, &fixed, &fixed_design, false)?, 0), (&adaptive, interchange.evaluate(&batch, &adaptive, &adaptive_design, false)?, 1)];
-            for (experiments, scored, read_family) in &scored {
-                for (e, bits) in experiments.iter().zip(&scored.bits) {
-                    let family = match &e.patch {
-                        None => {
-                            clean.0.extend_from_slice(bits);
-                            continue;
-                        }
-                        Some(Patch::Read { .. }) => *read_family,
-                        Some(Patch::Reads { .. }) => 3 + blocks,
-                        Some(Patch::Complement { blocks: one }) if one.len() == 1 => 2 + one[0],
-                        Some(Patch::Complement { .. }) => 2 + blocks,
-                    };
-                    per_source[family][s].0 += bits.iter().sum::<f64>();
-                    per_source[family][s].1 += bits.len();
-                    all[family].0.extend_from_slice(bits);
-                }
+            let scored = interchange.evaluate(&batch, &experiments, false)?;
+            for (e, bits) in experiments.iter().zip(&scored.bits) {
+                let family = match &e.patch {
+                    None => {
+                        clean.0.extend_from_slice(bits);
+                        continue;
+                    }
+                    Some(Patch::Read { .. }) => 0,
+                    Some(Patch::Reads { .. }) => 1,
+                };
+                per_source[family][s].0 += bits.iter().sum::<f64>();
+                per_source[family][s].1 += bits.len();
+                all[family].0.extend_from_slice(bits);
             }
         }
         log::info!("battery: interchange source {}/{} ({:.0} s)", s + 1, sources.len(), started.elapsed().as_secs_f64());
     }
-    let name = |f: usize| match f {
-        0 => "read".to_string(),
-        1 => "read_adaptive".to_string(),
-        f if f < 2 + blocks => format!("complement_block_{}", f - 2),
-        f if f == 2 + blocks => "complement_joint".to_string(),
-        _ => "read_joint".to_string(),
-    };
+    let name = |f: usize| if f == 0 { "read" } else { "read_joint" };
     let mut patches = serde_json::Map::new();
     for f in 0..families {
         let means: Vec<f64> = per_source[f].iter().map(|(bits, n)| bits / *n as f64).collect();
         let worst: serde_json::Map<String, Value> =
             settings.worst_of.iter().map(|&k| (format!("worst_of_{k}"), json!(means[..k].iter().copied().fold(f64::NEG_INFINITY, f64::max)))).collect();
-        patches.insert(name(f), json!({"all_sources": all[f].summary(), "shared_source": worst}));
+        patches.insert(name(f).to_string(), json!({"all_sources": all[f].summary(), "shared_source": worst}));
     }
-    let mut complement = Tokens::default();
-    (2..2 + blocks).for_each(|f| complement.0.extend_from_slice(&all[f].0));
     report["interchange"] = json!({
         "read_variables": variables.len(),
         "clean": clean.summary(),
         "patches": patches,
-        "complement_all_blocks": complement.summary(),
     });
     report["seconds"] = json!(started.elapsed().as_secs_f64());
     std::fs::write(out, serde_json::to_vec_pretty(&report).map_err(error)?).map_err(error)?;

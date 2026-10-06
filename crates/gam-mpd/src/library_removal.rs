@@ -1081,7 +1081,7 @@ mod tests {
     use super::*;
     use crate::{
         import::import_language_model,
-        interchange::{Batch, Design, Experiment, Interchange, Targets},
+        interchange::{Batch, Experiment, Interchange, Targets},
         library_mdl,
         operator_program::SlotValues,
         run_check::{layer_nodes, split_sites},
@@ -1152,7 +1152,7 @@ mod tests {
         for e in evidence {
             let rows: usize = e.experiments.iter().map(|x| e.batch.length() - x.position).sum();
             let uniforms: Vec<f64> = (0..rows).map(|_| rng.random::<f64>()).collect();
-            let evaluation = ic.evaluate_labelled(&e.batch, &e.experiments, &e.design, Some(&e.targets), true, Some(&uniforms)).expect("the labelled evaluation");
+            let evaluation = ic.evaluate_labelled(&e.batch, &e.experiments, Some(&e.targets), true, Some(&uniforms)).expect("the labelled evaluation");
             let factor = evaluation.factor.expect("the Gauss–Newton factor");
             let d = ic.models().1.program.device();
             let host = |gradient: &BTreeMap<usize, gam_gpu::tensor::Tensor>| -> Vec<Array2<f64>> {
@@ -1170,7 +1170,7 @@ mod tests {
     }
 
     fn interchange(native: &OperatorProgram, layers: &[LayerNodes], explanation: &Explanation, device: &Device) -> Interchange {
-        let reads = interchange::library_reads(&explanation.artifact.program, layers.len()).expect("the reads");
+        let reads = interchange::reads(native, layers).expect("the reads");
         Interchange::new(device, native, layers, &explanation.artifact, &explanation.trainable, reads, 1 << 30, 64).expect("the experiments")
     }
 
@@ -1321,11 +1321,10 @@ mod tests {
         assert!(lines.iter().any(|l| l["event"] == "round") && lines.last().unwrap()["event"] == "end");
     }
 
-    /// One batch of the fixed collection: its sequences, experiments, `M`'s directions and targets.
+    /// One batch of the fixed collection: its sequences, experiments and `M`'s targets.
     struct Evidence {
         batch: Batch,
         experiments: Vec<Experiment>,
-        design: Design,
         targets: Targets,
     }
 
@@ -1336,16 +1335,14 @@ mod tests {
         let device = Device::host();
         let mut ic = interchange(&native, &layers, &explanation, &device);
         let variables = ic.variables().to_vec();
-        let starting: Vec<Array2<f64>> = explanation.trainable.iter().map(|op| explanation.artifact.program.operators[*op].matrix()).collect();
         let mut rng = StdRng::seed_from_u64(5);
         let evidence: Vec<Evidence> = (0..sequences.len() / 2)
             .map(|b| {
                 let pick = |offset: usize| (0..2).map(|i| sequences[(2 * b + i + offset) % sequences.len()].clone()).collect();
                 let batch = Batch::new(pick(0), pick(2)).unwrap();
                 let experiments = interchange::sample(&mut rng, 2, &variables, 2 * layers.len(), 12).unwrap();
-                let design = ic.design_at(&variables, &experiments, &starting).unwrap();
-                let targets = ic.targets(&batch, &experiments, &design).unwrap();
-                Evidence { batch, experiments, design, targets }
+                let targets = ic.targets(&batch, &experiments).unwrap();
+                Evidence { batch, experiments, targets }
             })
             .collect();
         // The collection stands for N tokens of M's behaviour: the data term weighs its scored tokens
@@ -1370,7 +1367,7 @@ mod tests {
                     })
                     .collect();
                 ic.load(&theta)?;
-                bits += ic.evaluate_resident(&e.batch, &e.experiments, &e.design, &e.targets, false)?.bits.iter().flatten().sum::<f64>();
+                bits += ic.evaluate_resident(&e.batch, &e.experiments, &e.targets, false)?.bits.iter().flatten().sum::<f64>();
             }
             Ok(weight * bits * LN_2 + posterior.description())
         };
@@ -1428,7 +1425,7 @@ mod tests {
                     })
                     .collect();
                 ic.load(&theta).unwrap();
-                bits += ic.evaluate_resident(&e.batch, &e.experiments, &e.design, &e.targets, false).unwrap().bits.iter().flatten().sum::<f64>();
+                bits += ic.evaluate_resident(&e.batch, &e.experiments, &e.targets, false).unwrap().bits.iter().flatten().sum::<f64>();
             }
             weight * bits * LN_2 + p.description()
         };
