@@ -1307,6 +1307,9 @@ fn the_curvature_innovations_follow_their_formulas_on_every_backend() {
         if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
             devices.push((wide.with_storage(Storage::F32).expect("CUDA holds f32"), wide));
         }
+        // The Apple GPU sums in its own f32 buffers; elsewhere single_precision is CUDA's f32
+        // device, whose sums are float64 on the wide device (the pair above).
+        #[cfg(target_os = "macos")]
         if let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault") {
             devices.push((metal.clone(), metal));
         }
