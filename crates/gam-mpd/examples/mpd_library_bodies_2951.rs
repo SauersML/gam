@@ -17,7 +17,7 @@
 //! 1. the library is fitted (OUT/base);
 //! 2. among each MLP's functions in the explanation where it starts (`M`'s, or a checkpoint's
 //!    survivors), the regions are those reading only one head's writes
-//!    (`library_crossing::regions_through`: a head and the functions it feeds, across the
+//!    (`library_crossing::regions_through`: heads and the functions they feed, across the
 //!    attention/MLP boundary; linear in the MLP's width) and, of the functions left, in the gate
 //!    only, the groups a count of the parameters a rewrite saves at the posterior's resolution
 //!    expects to save (`library_bodies::regions`, which lists every candidate; the others are
@@ -257,25 +257,25 @@ fn warm(explanation: &Explanation, fit: &Fit) -> Result<Explanation, String> {
     Ok(out)
 }
 
-/// A region the method may extract: its layer, its functions, and the head it reads through (with
-/// the number of heads its MLP may read).
+/// A region the method may extract: its layer, its functions, and the heads it reads through (with
+/// the number of heads its MLP may read; none for a region reading the stream).
 #[derive(Clone, serde::Serialize)]
 struct Region {
     layer: usize,
     functions: Vec<usize>,
-    #[serde(serialize_with = "head")]
-    through: Option<(library_crossing::Writer, usize)>,
+    #[serde(serialize_with = "heads")]
+    through: Option<(Vec<library_crossing::Writer>, usize)>,
 }
 
-fn head<S: serde::Serializer>(through: &Option<(library_crossing::Writer, usize)>, serializer: S) -> Result<S::Ok, S::Error> {
-    serde::Serialize::serialize(&through.as_ref().map(|(w, _)| [w.layer, w.head]), serializer)
+fn heads<S: serde::Serializer>(through: &Option<(Vec<library_crossing::Writer>, usize)>, serializer: S) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&through.as_ref().map(|(ws, _)| ws.iter().map(|w| [w.layer, w.head]).collect::<Vec<_>>()), serializer)
 }
 
-/// `explanation` with `region` rewritten as a call of its own body, read through its head.
+/// `explanation` with `region` rewritten as a call of its own body, read through its heads.
 fn extract(explanation: &Explanation, region: &Region) -> Result<(Explanation, Call), String> {
     let (next, call) = library_bodies::rewrite(explanation, region.layer, &region.functions)?;
     Ok(match &region.through {
-        Some((writer, choices)) => (library_crossing::read_through(&next, &call, writer, *choices)?, call),
+        Some((writers, choices)) => (library_crossing::read_through(&next, &call, &writers.iter().collect::<Vec<_>>(), *choices)?, call),
         None => (next, call),
     })
 }
@@ -301,9 +301,9 @@ fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior
         let pool: Vec<usize> = (0..base.layers[l].functions.len()).filter(|i| base.layers[l].functions[*i].iter().all(|g| posterior.active[*g])).collect();
         let writers = library_crossing::writers(&run.native, &run.layers, l)?;
         let mut taken = Vec::new();
-        for (w, region) in library_crossing::regions_through(&base, &posterior, &writers, l, &pool)? {
+        for (set, region) in library_crossing::regions_through(&base, &posterior, &writers, l, &pool)? {
             taken.extend(region.iter().copied());
-            through.push((l, writers[w].clone(), writers.len(), region));
+            through.push((l, set.iter().map(|w| writers[*w].clone()).collect::<Vec<_>>(), writers.len(), region));
         }
         if run.grown {
             let rest: Vec<usize> = pool.into_iter().filter(|i| !taken.contains(i)).collect();
@@ -316,8 +316,8 @@ fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior
         }
     }
     summary["candidates"] = json!(candidates);
-    summary["through"] = json!(through.iter().map(|(l, w, _, r)| json!({"layer": l, "head": [w.layer, w.head], "functions": r})).collect::<Vec<_>>());
-    log::info!("bodies: {} regions and {} regions through a head", regions.len(), through.len());
+    summary["through"] = json!(through.iter().map(|(l, ws, _, r)| json!({"layer": l, "heads": ws.iter().map(|w| [w.layer, w.head]).collect::<Vec<_>>(), "functions": r})).collect::<Vec<_>>());
+    log::info!("bodies: {} regions and {} regions through heads", regions.len(), through.len());
     summary["regions"] = json!(regions);
     if let Some(planted) = planted {
         summary["planted"] = json!(planted);
@@ -325,7 +325,7 @@ fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior
     save(&run.out.join("SUMMARY.json"), &summary)?;
     let mut pending: Vec<Region> = through
         .iter()
-        .map(|(layer, writer, choices, functions)| Region { layer: *layer, functions: functions.clone(), through: Some((writer.clone(), *choices)) })
+        .map(|(layer, writers, choices, functions)| Region { layer: *layer, functions: functions.clone(), through: Some((writers.clone(), *choices)) })
         .chain(regions.iter().map(|(layer, functions)| Region { layer: *layer, functions: functions.clone(), through: None }))
         .collect();
     // Extract-and-reuse, one transaction per proposal (module note, step 3): every child is the
@@ -462,7 +462,7 @@ fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior
         let read = named(format!("{}.read", call.name))?;
         let mut shares: Vec<(String, f64)> = Vec::new();
         match through.iter().find(|(l, _, _, region)| *l == call.layer && call.replaced.iter().map(|(f, _)| *f).eq(region.iter().copied())) {
-            Some((_, w, _, _)) => shares.push((format!("L{}.H{}", w.layer, w.head), 1.0)),
+            Some((_, ws, _, _)) => shares.extend(ws.iter().map(|w| (format!("L{}.H{}", w.layer, w.head), 1.0 / ws.len() as f64))),
             None => {
                 let total = read.iter().map(|v| v * v).sum::<f64>();
                 for w in library_crossing::writers(&run.native, &run.layers, call.layer)? {

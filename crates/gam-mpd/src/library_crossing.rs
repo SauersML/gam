@@ -14,12 +14,14 @@
 //! # Regions through a head
 //!
 //! [`regions_through`] takes, among an MLP's functions in the explanation, those whose reads lie in
-//! a head's write directions up to the posterior's resolution. The reads are whitened in the
-//! separable row-times-column form that keeps rank (`library_bodies`), the head's directions with
-//! the same column scales; a function's rows lie in them when the largest singular value of what
-//! is left is within that of same-shaped unit noise in the complement, `√rows + √(d − rank)`. A
-//! function lying in several heads' directions goes to the head capturing the largest share of
-//! its whitened reads. [`read_through`] then makes an existing call read through the head:
+//! the write directions of a set of heads up to the posterior's resolution (a body of several
+//! inputs). The reads are whitened in the separable row-times-column form that keeps rank
+//! (`library_bodies`), the heads' directions with the same column scales; a function's rows lie in
+//! them when the largest singular value of what is left is within that of same-shaped unit noise in
+//! the complement, `√rows + √(d − rank)`. A function's set grows one head at a time, the head
+//! taking the most of what is left joining, until what is left is within noise; a set as wide as
+//! the stream would read everything and save nothing, so it is not formed. Functions with one set
+//! form one region. [`read_through`] then makes an existing call read through the head:
 //! `P = R H (Hᵀ H)⁺`, the least-squares factor, exact when `R`'s rows lie in `H`'s columns. Both are
 //! proposals; a rewrite is accepted only if the code length `F` falls on the fixed experiments.
 
@@ -93,10 +95,10 @@ fn basis(m: &Array2<f64>) -> Result<Array2<f64>, String> {
     Ok(decomposition.u.slice(s![.., ..rank]).to_owned())
 }
 
-/// The regions of layer `layer`'s MLP that read through a head (module note), among its functions
-/// in `pool` whose groups are in the explanation at `posterior`: per writer (an index into
-/// `writers`) the functions it takes, wherever there are at least two.
-pub fn regions_through(explanation: &Explanation, posterior: &Posterior, writers: &[Writer], layer: usize, pool: &[usize]) -> Result<Vec<(usize, Vec<usize>)>, String> {
+/// The regions of layer `layer`'s MLP that read through heads (module note), among its functions
+/// in `pool` whose groups are in the explanation at `posterior`: per set of writers (indices into
+/// `writers`) the functions reading exactly through it, wherever there are at least two.
+pub fn regions_through(explanation: &Explanation, posterior: &Posterior, writers: &[Writer], layer: usize, pool: &[usize]) -> Result<Vec<(Vec<usize>, Vec<usize>)>, String> {
     let program = &explanation.artifact.program;
     let mlp = format!("library.l{layer}.mlp");
     let maps: Vec<usize> = ["gate", "up"].iter().filter_map(|part| program.operators.iter().position(|op| op.name == format!("{mlp}.{part}"))).collect();
@@ -118,36 +120,56 @@ pub fn regions_through(explanation: &Explanation, posterior: &Posterior, writers
     let columns = (&log_sd - &row_scales.view().insert_axis(Axis(1))).mean_axis(Axis(0)).ok_or("no reads")?;
     let whitened = Array2::from_shape_fn((rows, d), |(r, c)| reads[[r, c]] * (-row_scales[r] - columns[c]).exp());
     let column_scale = columns.mapv(|c| (-c).exp());
-    // Per writer its whitened directions; per function the writer capturing most of its reads
-    // among those it lies within.
-    let bases = writers.iter().map(|w| basis(&(&w.writes * &column_scale.view().insert_axis(Axis(1))))).collect::<Result<Vec<_>, _>>()?;
-    let mut taken: Vec<Vec<usize>> = vec![Vec::new(); writers.len()];
+    // Per writer its whitened directions. Per function, the heads it reads: the head capturing the
+    // most of what is left of its whitened reads joins, one at a time, until what is left is within
+    // noise; a set as wide as the stream reads everything and saves nothing, so a function needing
+    // one is taken by no set.
+    let scaled: Vec<Array2<f64>> = writers.iter().map(|w| &w.writes * &column_scale.view().insert_axis(Axis(1))).collect();
+    let mut taken: std::collections::BTreeMap<Vec<usize>, Vec<usize>> = std::collections::BTreeMap::new();
     for (f, &i) in live.iter().enumerate() {
         let block = whitened.slice(s![f * parts..(f + 1) * parts, ..]).to_owned();
-        let total = block.iter().map(|v| v * v).sum::<f64>();
-        let mut best: Option<(f64, usize)> = None;
-        for (w, b) in bases.iter().enumerate() {
-            let inside = block.dot(b);
-            let residual = &block - &inside.dot(&b.t());
-            let edge = (parts as f64).sqrt() + ((d - b.ncols()) as f64).sqrt();
+        let mut set: Vec<usize> = Vec::new();
+        loop {
+            let span = if set.is_empty() {
+                Array2::zeros((d, 0))
+            } else {
+                let views: Vec<_> = set.iter().map(|w| scaled[*w].view()).collect();
+                basis(&ndarray::concatenate(Axis(1), &views).map_err(error)?)?
+            };
+            let residual = &block - &block.dot(&span).dot(&span.t());
             let largest = svd(residual.view(), false).map_err(error)?.singular_values.first().copied().unwrap_or(0.0);
-            let share = if total > 0.0 { inside.iter().map(|v| v * v).sum::<f64>() / total } else { 0.0 };
-            if largest <= edge && best.is_none_or(|(s, _)| share > s) {
-                best = Some((share, w));
+            if largest <= (parts as f64).sqrt() + ((d - span.ncols()) as f64).sqrt() {
+                if !set.is_empty() {
+                    set.sort_unstable();
+                    taken.entry(set).or_default().push(i);
+                }
+                break;
+            }
+            let next = (0..writers.len())
+                .filter(|w| !set.contains(w))
+                .map(|w| {
+                    let inside = residual.dot(&basis(&scaled[w])?);
+                    Ok((inside.iter().map(|v| v * v).sum::<f64>(), w))
+                })
+                .collect::<Result<Vec<(f64, usize)>, String>>()?
+                .into_iter()
+                .max_by(|a, b| a.0.total_cmp(&b.0));
+            let Some((_, w)) = next else { break };
+            set.push(w);
+            if set.iter().map(|w| writers[*w].writes.ncols()).sum::<usize>() >= d {
+                break;
             }
         }
-        if let Some((_, w)) = best {
-            taken[w].push(i);
-        }
     }
-    Ok(taken.into_iter().enumerate().filter(|(_, f)| f.len() > 1).collect())
+    Ok(taken.into_iter().filter(|(_, f)| f.len() > 1).collect())
 }
 
-/// `explanation` with `call`'s read binding made to read through `writer` (module note): `R = P Hᵀ`,
-/// `P = R H (Hᵀ H)⁺` its own trainable binding and `Hᵀ` a constant of the call; the binding's
-/// groups now span `P`'s rows, the owners of the call's reads gain `Hᵀ` as a factor after `P`, and
-/// the choice of the head among the `choices` the MLP may read costs `ln choices` nats.
-pub fn read_through(explanation: &Explanation, call: &Call, writer: &Writer, choices: usize) -> Result<Explanation, String> {
+/// `explanation` with `call`'s read binding made to read through `writers` (module note): `R = P Hᵀ`
+/// with `H` their writes side by side, `P = R H (Hᵀ H)⁺` its own trainable binding and `Hᵀ` a
+/// constant of the call; the binding's groups now span `P`'s rows, the owners of the call's reads
+/// gain `Hᵀ` as a factor after `P`, and the choice of the heads among the `choices` the MLP may read
+/// costs their enumerative subset code.
+pub fn read_through(explanation: &Explanation, call: &Call, writers: &[&Writer], choices: usize) -> Result<Explanation, String> {
     let mut out = explanation.clone();
     let program = &mut out.artifact.program;
     let read = operator_index(program, &format!("{}.read", call.name))?;
@@ -159,14 +181,16 @@ pub fn read_through(explanation: &Explanation, call: &Call, writer: &Writer, cho
         .position(|n| matches!(n, Node::Affine { terms, .. } if terms.len() == 1 && terms[0].1 == read))
         .ok_or_else(|| format!("{}: no node applies its read binding", call.name))?;
     let source = Arc::clone(&program.operators[read]);
-    let h = &writer.writes;
+    let views: Vec<_> = writers.iter().map(|w| w.writes.view()).collect();
+    let h = &ndarray::concatenate(Axis(1), &views).map_err(error)?;
+    let names: Vec<&str> = writers.iter().map(|w| w.operator.as_str()).collect();
     if source.cols.width() != h.nrows() {
         return Err(format!("{}: reads {} coordinates, the head writes {}", call.name, source.cols.width(), h.nrows()));
     }
     let p = source.matrix().dot(h).dot(&pseudo_inverse(h.t().dot(h).view()).map_err(error)?);
     let width = h.ncols();
     let head = Interface::uniform(width, 1, LabelKind::Unit, 0).map_err(error)?;
-    let provenance = Provenance::derived(&[&source.provenance], format!("{} read through {}", call.name, writer.operator));
+    let provenance = Provenance::derived(&[&source.provenance], format!("{} read through {}", call.name, names.join(", ")));
     let through = format!("{}.through", call.name);
     program.operators[read] = Arc::new(dense(source.name.clone(), source.rows.clone(), head.clone(), p, provenance.clone())?);
     program.operators.push(Arc::new(dense(through.clone(), head, source.cols.clone(), h.t().to_owned(), provenance)?));
@@ -205,7 +229,8 @@ pub fn read_through(explanation: &Explanation, call: &Call, writer: &Writer, cho
             owner.right.insert(at + 1, through.clone());
         }
     }
-    out.fixed_nats += (choices as f64).ln();
+    // Which heads, among the `choices` the MLP may read (the enumerative subset code).
+    out.fixed_nats += crate::codec::subset_code_len_bits(choices, writers.len()).map_err(error)? as f64 * std::f64::consts::LN_2;
     Ok(out)
 }
 
@@ -250,10 +275,10 @@ mod tests {
         program.operators[gate] = Arc::new(dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values, source.provenance.clone()).unwrap());
         let posterior = Posterior::new(&start, 1_000_000).unwrap();
         let found = regions_through(&start, &posterior, &all, 1, &(0..16).collect::<Vec<_>>()).unwrap();
-        assert_eq!(found, vec![(w, vec![2, 5, 9])]);
+        assert_eq!(found, vec![(vec![w], vec![2, 5, 9])]);
         // Rewritten and read through the head, the explanation computes what it computed.
         let (rewritten, call) = rewrite(&start, 1, &[2, 5, 9]).unwrap();
-        let through = read_through(&rewritten, &call, &all[w], all.len()).unwrap();
+        let through = read_through(&rewritten, &call, &[&all[w]], all.len()).unwrap();
         let outputs = |e: &Explanation| e.artifact.execute(&family).unwrap().values[e.artifact.program.output].clone();
         let (a, b) = (outputs(&start), outputs(&through));
         let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
@@ -267,6 +292,7 @@ mod tests {
         for (x, y) in natives(&rewritten).iter().zip(natives(&through)) {
             assert!(x.iter().zip(&y).all(|(p, q)| (p - q).abs() <= 1e-9 * (1.0 + p.abs())), "each native gate row is stated exactly");
         }
-        assert!((through.fixed_nats - rewritten.fixed_nats - (all.len() as f64).ln()).abs() < 1e-12);
+        let subset = crate::codec::subset_code_len_bits(all.len(), 1).unwrap() as f64 * std::f64::consts::LN_2;
+        assert!((through.fixed_nats - rewritten.fixed_nats - subset).abs() < 1e-12);
     }
 }
