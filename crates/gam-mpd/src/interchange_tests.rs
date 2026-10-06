@@ -660,3 +660,46 @@ fn blocks_run_again_in_the_reverse_pass_give_the_kept_tapes_gradient() {
         assert_eq!(device.download(g).expect("gradient"), device.download(&again.gradient[op]).expect("gradient"));
     }
 }
+
+#[test]
+fn m_runs_the_same_whatever_explanation_it_is_compared_with() {
+    // M's targets do not depend on the explanation P they are compared with (review item 7). The
+    // same M is compared with its starting library and with a body rewrite of it (layer 1's
+    // functions 1, 4, 6 and 9 called through a new body), each with the fused engines asked for
+    // (`Interchange::fuse`): M runs the same way in both and its targets agree bit for bit. Targets
+    // made before M's engine changed are refused rather than scored against.
+    let dir = crate::test_support::tiny_export("interchange_teacher", 2);
+    let imported = crate::import::import_language_model(&dir, 6, 12).expect("the tiny export imports");
+    std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+    let native = split_sites(&imported.program).expect("the native sites");
+    let layers = layer_nodes(&native, 2).expect("the layers");
+    let start = crate::library_mdl::explanation(&native, &layers).expect("the library");
+    let (rewritten, _) = crate::library_bodies::rewrite(&start, 1, &[1, 4, 6, 9]).expect("the rewrite");
+    let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+    let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+    let device = Device::host();
+    let variables = reads(&native, &layers).expect("the reads");
+    let batch = Batch::new(sequences[..3].to_vec(), sequences[3..].to_vec()).expect("the batch");
+    let experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(9), 3, &variables, 4, 12).expect("the draw");
+    let mut made = Vec::new();
+    let mut executions = Vec::new();
+    for explanation in [&start, &rewritten] {
+        let mut x = Interchange::new(&device, &native, &layers, &explanation.artifact, &explanation.trainable, variables.clone(), 1 << 30, 64).expect("the experiments");
+        let (was, before) = (x.teacher_execution(), x.targets(&batch, &experiments).expect("the targets"));
+        x.fuse(gam_gpu::tensor::Arithmetic::F32).expect("the fused engines");
+        let refused = x.evaluate_resident(&batch, &experiments, &before, false);
+        if x.teacher_execution() == was {
+            refused.expect("targets of M's own execution are scored");
+        } else {
+            let reason = refused.err().expect("targets of M's earlier execution are refused");
+            assert!(reason.contains("targets made with M run as"), "{reason}");
+        }
+        executions.push(x.teacher_execution());
+        made.push(x.targets(&batch, &experiments).expect("the targets").host(&device).expect("on the host"));
+    }
+    assert_eq!(executions[0], executions[1], "M's execution depends on the explanation");
+    assert_eq!(made[0].len(), made[1].len());
+    for (a, b) in made[0].iter().zip(&made[1]) {
+        assert!(a.0 == b.0 && a.1 == b.1, "M's targets depend on the explanation");
+    }
+}
