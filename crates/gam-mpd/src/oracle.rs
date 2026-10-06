@@ -19,7 +19,12 @@
 //!   components `P_c`: a whole operator, its rows or columns, a head's output map (its write, so
 //!   `α` scales the head's contribution exactly), an MLP neuron's down column (its write), the
 //!   difference from another model's operator (`P = W − W_ref`, or chosen singular components of
-//!   it), or the part of an operator that reads (`W v vᵀ`) or writes (`u uᵀ W`) one direction.
+//!   it), the part of an operator that reads (`W v vᵀ`) or writes (`u uᵀ W`) one direction, or a
+//!   registered component (`Request::Register`, `Request::RegisterVpd`): an id naming the
+//!   component's uses, each a low-rank part `P = L R` of one stored operator. A component the
+//!   program holds at several operators (a VPD subcomponent of a projection the program splits per
+//!   head, one function called at several sites) has one use per operator, and its edit applies
+//!   `(α − 1) P` at every use together.
 //!   `α = 1` is the model itself, exactly.
 //! * Crossed interventions. For inputs `x₀, x₁` and interventions `a₀, a₁`,
 //!   `Γ = [y(x₁, a₁) − y(x₀, a₁)] − [y(x₁, a₀) − y(x₀, a₀)]`: how much an intervention changes the
@@ -127,6 +132,26 @@ pub enum Component {
     /// The part of `name` reading the unit direction `direction` (`side = input`: `W d dᵀ`) or
     /// writing it (`side = output`: `d dᵀ W`).
     Direction { name: String, side: Side, direction: Vec<f64> },
+    /// A component registered with the session under `id` (module note): `P` at each of its uses.
+    Registered { id: String },
+}
+
+/// One use of a registered component: `P = L R` added to the stored operator `operator`, with
+/// `left` (`L`, the operator's rows × `r`) and `right` (`R`, `r` × its columns) as lists of rows.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentUse {
+    pub operator: String,
+    pub left: Vec<Vec<f64>>,
+    pub right: Vec<Vec<f64>>,
+}
+
+/// A registered use, resolved: the operator's index and the factors.
+#[derive(Clone, Debug)]
+struct Use {
+    operator: usize,
+    left: Array2<f64>,
+    right: Array2<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -393,6 +418,14 @@ pub enum Request {
         #[serde(default = "default_top")]
         top: usize,
     },
+    /// Registers components of `model` (module note), each id with its uses; an id registered
+    /// again is replaced.
+    Register { model: String, components: BTreeMap<String, Vec<ComponentUse>> },
+    /// Registers every subcomponent of VPD's exported decomposition at `decomposition`
+    /// (`explanation_battery::load_factors`) as id `{site}:{c}` (`h.0.attn.q_proj:17`), `P_c` the
+    /// outer product of row `c` of the site's `U` (its output) and column `c` of its `V` (its
+    /// input), with one use per operator of `model` that holds part of the site's projection.
+    RegisterVpd { model: String, decomposition: String },
 }
 
 fn default_components() -> usize {
@@ -637,11 +670,103 @@ pub struct Session {
     pub work_bytes: usize,
     /// Thin singular value decompositions of operator differences, by (model, reference, operator).
     differences: HashMap<(String, String, String), Arc<gam_linalg::decompose::Svd>>,
+    /// Registered components' uses, by (model, id).
+    registered: HashMap<(String, String), Vec<Use>>,
 }
 
 impl Session {
     pub fn new(models: BTreeMap<String, Native>, work_bytes: usize) -> Self {
-        Self { models, work_bytes, differences: HashMap::new() }
+        Self { models, work_bytes, differences: HashMap::new(), registered: HashMap::new() }
+    }
+
+    /// Registers the component `id` of `model` with its `uses` (module note), each checked against
+    /// its operator's shape; returns the number of uses.
+    pub fn register(&mut self, model: &str, id: &str, uses: &[ComponentUse]) -> Result<usize, String> {
+        let native = self.model(model)?;
+        let matrix = |rows: &[Vec<f64>], what: &str| -> Result<Array2<f64>, String> {
+            let width = rows.first().map_or(0, Vec::len);
+            if rows.is_empty() || width == 0 || rows.iter().any(|r| r.len() != width) || rows.iter().flatten().any(|v| !v.is_finite()) {
+                return Err(format!("{id}: {what} must be a nonempty finite matrix given as rows of one length"));
+            }
+            Array2::from_shape_vec((rows.len(), width), rows.concat()).map_err(|e| e.to_string())
+        };
+        let mut resolved = Vec::with_capacity(uses.len());
+        for u in uses {
+            let (left, right) = (matrix(&u.left, "left")?, matrix(&u.right, "right")?);
+            resolved.push(Self::use_of(native, id, &u.operator, left, right)?);
+        }
+        if resolved.is_empty() {
+            return Err(format!("{id}: a component needs a use"));
+        }
+        let count = resolved.len();
+        self.registered.insert((model.to_string(), id.to_string()), resolved);
+        Ok(count)
+    }
+
+    /// A use `L R` of the stored dense operator `name`, its shape checked.
+    fn use_of(native: &Native, id: &str, name: &str, left: Array2<f64>, right: Array2<f64>) -> Result<Use, String> {
+        let operator = native.operator(name)?;
+        let OperatorBody::Dense { values, .. } = &native.program.operators[operator].body else {
+            return Err(format!("{id}: {name} is not a stored dense matrix"));
+        };
+        if left.ncols() != right.nrows() || (left.nrows(), right.ncols()) != values.dim() {
+            return Err(format!("{id}: factors {:?} and {:?} on {name} of {:?}", left.dim(), right.dim(), values.dim()));
+        }
+        Ok(Use { operator, left, right })
+    }
+
+    /// Registers every subcomponent of VPD's decomposition at `decomposition` (`Request::RegisterVpd`):
+    /// a site's projection is the operator `blocks.{l}.{kind}` when the program holds it whole, or
+    /// the program's per-head (per key-value group) operators `blocks.{l}.{q,k,v,o}{h}` in order,
+    /// which split a query, key or value map by rows and the output map by columns; each holds the
+    /// matching slice of `u_c v_cᵀ`. Returns the number of subcomponents.
+    pub fn register_vpd(&mut self, model: &str, decomposition: &Path) -> Result<usize, String> {
+        let factors = crate::explanation_battery::load_factors(decomposition)?;
+        let native = self.model(model)?;
+        let mut registered = Vec::new();
+        for f in &factors {
+            let kind = f.name.rsplit('.').next().ok_or_else(|| format!("site {}", f.name))?;
+            let whole = format!("blocks.{}.{kind}", f.layer);
+            // The operators holding the site's projection and the slice each holds (rows of the
+            // output for a split query, key or value map, columns of the input for a split output map).
+            let parts: Vec<(String, std::ops::Range<usize>, bool)> = if native.operators.contains_key(&whole) {
+                vec![(whole, 0..0, false)]
+            } else {
+                let letter = kind.chars().next().filter(|_| kind.ends_with("_proj") && kind != "down_proj").ok_or_else(|| format!("no operator for site {}", f.name))?;
+                let by_rows = letter != 'o';
+                let mut parts = Vec::new();
+                let mut offset = 0;
+                while let Some(&op) = native.operators.get(&format!("blocks.{}.{letter}{}", f.layer, parts.len())) {
+                    let (rows, cols) = native.program.operators[op].matrix_cow().dim();
+                    let width = if by_rows { rows } else { cols };
+                    parts.push((format!("blocks.{}.{letter}{}", f.layer, parts.len()), offset..offset + width, by_rows));
+                    offset += width;
+                }
+                let total = if by_rows { f.u.ncols() } else { f.v.nrows() };
+                if parts.is_empty() || offset != total {
+                    return Err(format!("site {}: the program's operators hold {offset} of its {total} coordinates", f.name));
+                }
+                parts
+            };
+            for c in 0..f.subcomponents() {
+                let (u, v) = (f.u.row(c), f.v.column(c));
+                let mut uses = Vec::with_capacity(parts.len());
+                for (name, range, by_rows) in &parts {
+                    let (u, v) = match (range.is_empty(), by_rows) {
+                        (true, _) => (u.to_owned(), v.to_owned()),
+                        (false, true) => (u.slice(ndarray::s![range.clone()]).to_owned(), v.to_owned()),
+                        (false, false) => (u.to_owned(), v.slice(ndarray::s![range.clone()]).to_owned()),
+                    };
+                    uses.push(Self::use_of(native, &f.name, name, u.insert_axis(Axis(1)), v.insert_axis(Axis(0)))?);
+                }
+                registered.push((format!("{}:{c}", f.name), uses));
+            }
+        }
+        let count = registered.len();
+        for (id, uses) in registered {
+            self.registered.insert((model.to_string(), id), uses);
+        }
+        Ok(count)
     }
 
     fn model(&self, name: &str) -> Result<&Native, String> {
@@ -669,8 +794,17 @@ impl Session {
         Ok(wa.as_ref() - wb.as_ref())
     }
 
-    /// The component's operator and its matrix `P_c` (module note).
-    fn component(&mut self, model: &str, component: &Component) -> Result<(usize, Array2<f64>), String> {
+    /// The component's operators and its matrix `P_c` at each (module note).
+    fn component(&mut self, model: &str, component: &Component) -> Result<Vec<(usize, Array2<f64>)>, String> {
+        if let Component::Registered { id } = component {
+            let uses = self.registered.get(&(model.to_string(), id.clone())).ok_or_else(|| format!("no registered component {id} of {model}"))?;
+            return Ok(uses.iter().map(|u| (u.operator, u.left.dot(&u.right))).collect());
+        }
+        self.single(model, component).map(|p| vec![p])
+    }
+
+    /// A component of one operator: its index and `P_c`.
+    fn single(&mut self, model: &str, component: &Component) -> Result<(usize, Array2<f64>), String> {
         let native = self.model(model)?;
         let matrix = |name: &str| -> Result<(usize, Array2<f64>), String> {
             let op = native.operator(name)?;
@@ -743,6 +877,7 @@ impl Session {
                 };
                 Ok((op, p))
             }
+            Component::Registered { id } => Err(format!("{id}: a registered component is resolved by its uses")),
         }
     }
 
@@ -753,9 +888,10 @@ impl Session {
             if !edit.alpha.is_finite() {
                 return Err("a nonfinite amplitude".into());
             }
-            let (op, p) = self.component(model, &edit.component)?;
-            let entry = deltas.entry(op).or_insert_with(|| Array2::zeros(p.dim()));
-            entry.scaled_add(edit.alpha - 1.0, &p);
+            for (op, p) in self.component(model, &edit.component)? {
+                let entry = deltas.entry(op).or_insert_with(|| Array2::zeros(p.dim()));
+                entry.scaled_add(edit.alpha - 1.0, &p);
+            }
         }
         let mut program = self.model(model)?.program.clone();
         for (op, delta) in deltas {
@@ -893,6 +1029,14 @@ impl Session {
             Request::Scan { model, reference, sequences, top } => self.scan(model, reference, sequences, *top),
             Request::ContextScan { model, sequences, keep, top } => self.context_scan(model, sequences, *keep, *top),
             Request::Activations { model, site, sequences, coordinate, direction, top } => self.activations(model, site, sequences, *coordinate, direction.as_deref(), *top),
+            Request::Register { model, components } => {
+                let mut uses = 0;
+                for (id, list) in components {
+                    uses += self.register(model, id, list)?;
+                }
+                Ok(json!({"components": components.len(), "uses": uses}))
+            }
+            Request::RegisterVpd { model, decomposition } => Ok(json!({"components": self.register_vpd(model, Path::new(decomposition))?})),
         }
     }
 

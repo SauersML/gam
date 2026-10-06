@@ -184,3 +184,120 @@ fn option_log_probabilities_sum_the_continuation() {
     assert!((a[0][1] - b[0][1]).abs() < 1e-12);
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
+
+/// `rows` as the request's list of rows.
+fn rows_of(m: &Array2<f64>) -> Vec<Vec<f64>> {
+    m.outer_iter().map(|r| r.to_vec()).collect()
+}
+
+/// `native`'s program with `W + scale · P` on each listed operator: the literal edit.
+fn literally_edited(native: &Native, edits: &[(&str, Array2<f64>)], scale: f64) -> Native {
+    let mut program = native.program.clone();
+    for (name, p) in edits {
+        let op = native.operator(name).expect("operator");
+        let mut operator = (*program.operators[op]).clone();
+        let OperatorBody::Dense { values, present, .. } = &operator.body else { panic!("dense") };
+        let values = values + &(p * scale);
+        let precision = exact_precision(values.iter().copied()).expect("precision");
+        operator.body = OperatorBody::Dense { values, present: present.clone(), precision };
+        program.operators[op] = Arc::new(operator);
+    }
+    Native::new(program, native.layers.len()).expect("edited model")
+}
+
+/// A registered component is a literal edit of the stored matrices: at alpha = 1 the model
+/// exactly; at other alphas, with uses on two operators of different layers (one shared
+/// component), the runs of a model whose operators hold W + (alpha - 1) L R; and a component
+/// registered as one neuron's down column runs as the native neuron component.
+#[test]
+fn registered_components_are_literal_edits() {
+    for dir in [tiny_export("oracle_registered", 2), tiny_qwen3_export("oracle_registered_q", 2)] {
+        let native = Native::load(&dir).expect("load");
+        let factor = |rows: usize, cols: usize, seed: f64| Array2::from_shape_fn((rows, cols), |(r, c)| ((r * 7 + c * 3) as f64 * 0.37 + seed).sin() * 0.2);
+        let shape = |name: &str| native.program.operators[native.operator(name).expect("operator")].matrix_cow().dim();
+        let ((fc_rows, fc_cols), (o_rows, o_cols)) = (shape("blocks.1.c_fc"), shape("blocks.0.o1"));
+        let uses = [("blocks.1.c_fc", factor(fc_rows, 2, 0.1), factor(2, fc_cols, 0.7)), ("blocks.0.o1", factor(o_rows, 1, 1.3), factor(1, o_cols, 2.9))];
+        let mut s = session(&dir, 1 << 30);
+        let components = serde_json::json!({"shared": uses.iter().map(|(n, l, r)| serde_json::json!({"operator": n, "left": rows_of(l), "right": rows_of(r)})).collect::<Vec<_>>()});
+        let reply = s.handle(&serde_json::from_value(serde_json::json!({"op": "register", "model": "m", "components": components})).expect("request")).expect("register");
+        assert_eq!(reply["uses"].as_u64(), Some(2));
+        let clean = run(&mut s, "m", serde_json::json!({}));
+        let edit = |alpha: f64| serde_json::json!({"edits": [{"component": {"kind": "registered", "id": "shared"}, "alpha": alpha}]});
+        assert_eq!(largest_difference(&clean, &run(&mut s, "m", edit(1.0))), 0.0);
+        let products: Vec<(&str, Array2<f64>)> = uses.iter().map(|(n, l, r)| (*n, l.dot(r))).collect();
+        for alpha in [0.0, 2.5, -1.0] {
+            s.models.insert("literal".into(), literally_edited(&native, &products, alpha - 1.0));
+            let (registered, literal) = (run(&mut s, "m", edit(alpha)), run(&mut s, "literal", serde_json::json!({})));
+            assert!(largest_difference(&registered, &literal) < 1e-12, "alpha {alpha}: {}", largest_difference(&registered, &literal));
+            assert!(largest_difference(&clean, &registered) > 1e-9, "alpha {alpha} changes nothing");
+        }
+        // A neuron's write registered as its down column times the unit row selecting it.
+        let down = native.program.operators[native.operator("blocks.1.down_proj").expect("down")].matrix_cow().into_owned();
+        let mut select = Array2::zeros((1, down.ncols()));
+        select[[0, 3]] = 1.0;
+        let column = down.column(3).to_owned().insert_axis(ndarray::Axis(1));
+        s.register("m", "neuron", &[crate::oracle::ComponentUse { operator: "blocks.1.down_proj".into(), left: rows_of(&column), right: rows_of(&select) }]).expect("register neuron");
+        let registered = run(&mut s, "m", serde_json::json!({"edits": [{"component": {"kind": "registered", "id": "neuron"}, "alpha": 0.0}]}));
+        let neuron = run(&mut s, "m", serde_json::json!({"edits": [{"component": {"kind": "neuron", "layer": 1, "index": 3}, "alpha": 0.0}]}));
+        assert!(largest_difference(&registered, &neuron) < 1e-12);
+        // Factors that do not fit their operator are refused.
+        assert!(s.register("m", "bad", &[crate::oracle::ComponentUse { operator: "blocks.1.c_fc".into(), left: rows_of(&factor(fc_rows + 1, 1, 0.0)), right: rows_of(&factor(1, fc_cols, 0.0)) }]).is_err());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+}
+
+/// VPD's subcomponents registered from an exported decomposition: a query subcomponent is held by
+/// every head's query operator (its output rows split by head) and an output-map subcomponent by
+/// every head's output operator (its input columns split by head), and each edit runs as the
+/// literal edit of those slices of `u_c v_cᵀ`; at alpha = 1 the model exactly.
+#[test]
+fn vpd_subcomponents_register_on_every_split_operator() {
+    let dir = tiny_export("oracle_vpd_register", 2);
+    let native = Native::load(&dir).expect("load");
+    let decomposition = std::env::temp_dir().join(format!("gam_mpd_oracle_vpd_decomposition_{}", std::process::id()));
+    std::fs::create_dir_all(&decomposition).expect("decomposition dir");
+    let (d, hd, heads, kv) = (native.width, native.head_width, native.heads, native.kv_heads);
+    let mlp = native.mlp_width;
+    let count = 3;
+    let mut sites = Vec::new();
+    let mut files = serde_json::Map::new();
+    for l in 0..2 {
+        for (kind, (d_in, d_out)) in [("attn.q_proj", (d, heads * hd)), ("attn.k_proj", (d, kv * hd)), ("attn.v_proj", (d, kv * hd)), ("attn.o_proj", (heads * hd, d)), ("mlp.c_fc", (d, mlp)), ("mlp.down_proj", (mlp, d))] {
+            let name = format!("h.{l}.{kind}");
+            for (part, (rows, cols)) in [("U", (count, d_out)), ("V", (d_in, count))] {
+                let values: Vec<u8> = (0..rows * cols).flat_map(|i| (((i * 13 + l * 5) as f64 * 0.31).cos() * 0.3).to_le_bytes()).collect();
+                std::fs::write(decomposition.join(format!("{name}.{part}.f64")), values).expect("write factor");
+                files.insert(format!("{name}.{part}"), serde_json::json!({"shape": [rows, cols]}));
+            }
+            sites.push(name);
+        }
+    }
+    std::fs::write(decomposition.join("export.json"), serde_json::to_vec(&serde_json::json!({"config": {"sites": sites}, "files": files})).expect("json")).expect("write export");
+    let mut s = session(&dir, 1 << 30);
+    let reply = s.handle(&serde_json::from_value(serde_json::json!({"op": "register_vpd", "model": "m", "decomposition": decomposition.display().to_string()})).expect("request")).expect("register");
+    assert_eq!(reply["components"].as_u64(), Some((2 * 6 * count) as u64));
+    let factors = crate::explanation_battery::load_factors(&decomposition).expect("factors");
+    let clean = run(&mut s, "m", serde_json::json!({}));
+    for (site, c, letter, by_rows) in [(0usize, 1usize, 'q', true), (6 + 3, 2, 'o', false), (6 + 1, 0, 'k', true)] {
+        let f = &factors[site];
+        let p = f.u.row(c).to_owned().insert_axis(ndarray::Axis(1)).dot(&f.v.column(c).to_owned().insert_axis(ndarray::Axis(0)));
+        let parts = if letter == 'q' || letter == 'o' { heads } else { kv };
+        let slices: Vec<(String, Array2<f64>)> = (0..parts)
+            .map(|h| {
+                let range = h * hd..(h + 1) * hd;
+                let slice = if by_rows { p.slice(ndarray::s![range, ..]).to_owned() } else { p.slice(ndarray::s![.., range]).to_owned() };
+                (format!("blocks.{}.{letter}{h}", f.layer), slice)
+            })
+            .collect();
+        let named: Vec<(&str, Array2<f64>)> = slices.iter().map(|(n, m)| (n.as_str(), m.clone())).collect();
+        let id = format!("{}:{c}", f.name);
+        assert_eq!(largest_difference(&clean, &run(&mut s, "m", serde_json::json!({"edits": [{"component": {"kind": "registered", "id": id}, "alpha": 1.0}]}))), 0.0);
+        s.models.insert("literal".into(), literally_edited(&native, &named, 2.0));
+        let registered = run(&mut s, "m", serde_json::json!({"edits": [{"component": {"kind": "registered", "id": id}, "alpha": 3.0}]}));
+        let literal = run(&mut s, "literal", serde_json::json!({}));
+        assert!(largest_difference(&registered, &literal) < 1e-12, "{id}: {}", largest_difference(&registered, &literal));
+        assert!(largest_difference(&clean, &registered) > 1e-9, "{id} changes nothing");
+    }
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+    std::fs::remove_dir_all(&decomposition).expect("cleanup");
+}
