@@ -134,7 +134,8 @@ def labels(args):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     save_file({"rows": torch.arange(args.offset, args.offset + args.pool, dtype=torch.int64), "tokens": ids.to(torch.int32).cpu()}, str(out / "contexts.safetensors"))
-    parts = {l: parts_of(fn, l, args.read, dev, torch.float32, args.limit) for l in layers}
+    # Every part of each layer (the parts family removes all those active at p); the first `--limit` are asked about.
+    parts = {l: parts_of(fn, l, args.read, dev, torch.float32) for l in layers}
 
     # The clean pass: every part's activity on every pool row; its peak after the first token (the attention sink).
     peaks = {l: torch.empty(args.pool, parts[l][0].shape[0], device=dev) for l in layers}
@@ -155,8 +156,8 @@ def labels(args):
             continue
         started = time.time()
         U, V, b = parts[l]
-        C = U.shape[0]
-        order = peaks[l].T.argsort(dim=-1, descending=True).cpu().numpy()
+        C = U.shape[0] if not args.limit else min(args.limit, U.shape[0])
+        order = peaks[l][:, :C].T.argsort(dim=-1, descending=True).cpu().numpy()
         ctx = np.empty((C, K), dtype=np.int64)
         for c in range(C):
             ctx[c] = np.concatenate([order[c, : args.top], rng.choice(order[c, args.top :], size=args.random, replace=False)])
