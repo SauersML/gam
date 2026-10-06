@@ -32,7 +32,9 @@
 //! `KL(M_e ‖ P_e)` in bits per token: the mean and 99th percentile over every scored token (from the
 //! edited token on) and over the edited tokens alone, with the clean experiments' as `clean`; and
 //! next to it, over the same tokens, the edit's effect on the model `KL(M_e ‖ M)` (`effect_*`), the
-//! size of the change the explanation is asked to predict. Each family states its `objects`:
+//! size of the change the explanation is asked to predict, and the gaps again in bins of the
+//! effect at the edited token (`by_effect`: below 0.01, 0.01–0.1, 0.1–1 and above 1 bits), so a
+//! comparison can rest on the edits that change `M`. Each family states its `objects`:
 //! `native` for experiments on `M`'s own objects (clean text, head removals), the same for every
 //! explanation and the primary comparison between explanations, and `own_parts` for edits of the
 //! explanation's own parts.
@@ -256,7 +258,7 @@ fn edit_faithfulness(
             entry.1.extend(bits.first());
             entry.2 += 1;
         }
-        batches.push((batch, drawn));
+        batches.push((batch, drawn, scored.bits));
         log::info!("edits: batch {b} scored ({:.0} s)", started.elapsed().as_secs_f64());
     }
     // The edits' effect on M, KL(M_e ‖ M), over the same tokens: the same experiments with P = M
@@ -265,12 +267,22 @@ fn edit_faithfulness(
     let mut reference = interchange::Interchange::new(device, native, layers, &gam_mpd::artifact::Artifact::native(native)?, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     reference.set_parts(parts)?;
     reference.unedited_explanation();
+    // An edit's evidence grows with how much it moves M: per family, the gaps of the edits whose
+    // effect at the edited token KL(M_e ‖ M) falls in each bin (bits).
+    const BINS: [f64; 3] = [0.01, 0.1, 1.0];
     let mut effects: BTreeMap<&str, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
-    for (batch, drawn) in &batches {
-        for (e, bits) in drawn.iter().zip(&reference.evaluate(batch, drawn, false)?.bits) {
+    let mut binned: BTreeMap<(&str, usize), (Vec<f64>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for (batch, drawn, gaps) in &batches {
+        for ((e, bits), gap) in drawn.iter().zip(&reference.evaluate(batch, drawn, false)?.bits).zip(gaps) {
             let entry = effects.entry(family(e)).or_default();
             entry.0.extend_from_slice(bits);
             entry.1.extend(bits.first());
+            let at = bits.first().copied().unwrap_or(0.0);
+            let bin = BINS.iter().filter(|b| at >= **b).count();
+            let entry = binned.entry((family(e), bin)).or_default();
+            entry.0.extend_from_slice(gap);
+            entry.1.extend(gap.first());
+            entry.2.push(at);
         }
     }
     let summary = |values: &mut Vec<f64>| {
@@ -287,10 +299,20 @@ fn edit_faithfulness(
         // Experiments on M's own objects (clean text, heads) ask every explanation the same
         // question; edits of parts ask each explanation about its own parts.
         let objects = if matches!(family, "clean" | "remove_head" | "read") { "native" } else { "own_parts" };
+        let bins: Vec<Value> = (0..=BINS.len())
+            .filter_map(|bin| {
+                let (all, at, effect) = binned.get(&(family, bin))?;
+                let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+                let low = if bin == 0 { 0.0 } else { BINS[bin - 1] };
+                let high = BINS.get(bin).copied().unwrap_or(f64::INFINITY);
+                Some(json!({"effect_bits_at_edited_token": [low, if high.is_finite() { json!(high) } else { json!("inf") }], "experiments": effect.len(), "mean_bits_per_token": mean(all), "edited_token_mean_bits": mean(at), "effect_edited_token_mean_bits": mean(effect)}))
+            })
+            .collect();
         families.insert(
             family.into(),
             json!({
                 "objects": objects,
+                "by_effect": bins,
                 "experiments": count, "tokens": tokens,
                 "mean_bits_per_token": mean, "p99_bits_per_token": p99, "edited_token_mean_bits": edited_mean, "edited_token_p99_bits": edited_p99,
                 "effect_mean_bits_per_token": effect_mean, "effect_p99_bits_per_token": effect_p99, "effect_edited_token_mean_bits": effect_edited_mean, "effect_edited_token_p99_bits": effect_edited_p99,
