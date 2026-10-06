@@ -1598,23 +1598,24 @@ impl Interchange {
         Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), prefixes: (m_prefix, p_prefix), teacher: None, candidate: None, fuse_asked: false, stale: Cell::new(false) })
     }
 
-    /// Run each model on its fused engine from now on where the device holds f32 and the model is
-    /// of the decoder family, each decided by its own program: `M`'s execution does not depend on
-    /// the explanation it is compared with. Returns whether `P` runs fused. Not the default: the
-    /// decoder's bfloat16 products differ from the program engine by as much as the divergence
-    /// itself (`mpd_engine_parity_2951`, vpd4l on an RTX 4090: up to 0.045 bits per token against
-    /// means of 0.02 to 0.05, gradients 6 to 8% off).
-    pub fn fuse(&mut self) -> Result<bool, String> {
-        if self.fuse_asked || self.p.device().float64() {
+    /// Run each model on its fused engine from now on, its products in `arithmetic`
+    /// (`Decoder::with_arithmetic`), where the device holds f32 or is the host (whose decoder rounds
+    /// as `arithmetic` says) and the model is of the decoder family, each decided by its own
+    /// program: `M`'s execution does not depend on the explanation it is compared with. Returns
+    /// whether `P` runs fused. Not the default: in bfloat16 the decoder's products differ from the
+    /// program engine by as much as the divergence itself (`mpd_engine_parity_2951`, vpd4l on an
+    /// RTX 4090: up to 0.045 bits per token against means of 0.02 to 0.05, gradients 6 to 8% off).
+    pub fn fuse(&mut self, arithmetic: Arithmetic) -> Result<bool, String> {
+        if self.fuse_asked || (self.p.device().float64() && !self.p.device().is_host()) {
             return Ok(self.candidate.is_some());
         }
         self.fuse_asked = true;
         let device = self.p.device();
         match Decoder::new(device, &self.prefixes.0, (&self.m_sites.entries, &self.m_sites.reads, self.m.hidden()), &[]) {
-            Ok(engine) => self.teacher = Some(engine),
+            Ok(engine) => self.teacher = Some(engine.with_arithmetic(arithmetic)),
             Err(reason) => log::info!("interchange: M runs its program ({reason})"),
         }
-        match Decoder::new(device, &self.prefixes.1, (&self.p_sites.entries, &self.p_sites.reads, self.p.hidden()), &self.trainable) {
+        match Decoder::new(device, &self.prefixes.1, (&self.p_sites.entries, &self.p_sites.reads, self.p.hidden()), &self.trainable).map(|d| d.with_arithmetic(arithmetic)) {
             Ok(mut engine) => {
                 engine.refresh(&self.p)?;
                 self.candidate = Some(RefCell::new(engine));

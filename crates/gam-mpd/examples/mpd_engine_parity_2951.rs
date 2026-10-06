@@ -2,7 +2,8 @@
 //! by a candidate block engine (`interchange::BlockEngine`) and by the reference (`Model`, the
 //! resident-value program in float64 on the host), values and gradients, on a language model.
 //!
-//! `mpd_engine_parity_2951 MODEL SEQUENCES CONTEXT OUT [WINDOWS]`
+//! `mpd_engine_parity_2951 MODEL SEQUENCES CONTEXT OUT [WINDOWS] [device=host]
+//! [arithmetic=f32|tf32x3|bf16x3|bf16]`
 //!
 //! `MODEL` is an engine export (`export.json`; its token rows) or a Hugging Face checkpoint
 //! directory (`config.json`; token rows from `WINDOWS`, rows of `CONTEXT` little-endian u32). `P` is
@@ -10,7 +11,9 @@
 //! by a deterministic relative perturbation, so that divergences and gradients are not zero. The
 //! candidates on the accelerator in f32 storage are its program engine (`Model`) and, where the
 //! programs are of the decoder family, the fused decoder (`decoder::Decoder`) the experiments run
-//! on there.
+//! on there, its products in `arithmetic` (f32 by default). With `device=host` the decoder runs on
+//! the host, rounding as its arithmetic says, and the program engine is not a candidate (it is the
+//! reference).
 //!
 //! The families, `SEQUENCES` bases each (the first rows; the next rows are the sources): clean
 //! with `P` alone; clean under a random block-subset hybrid; a read patch of one of `M`'s read
@@ -20,7 +23,10 @@
 //! `|g − g_ref| / |g_ref|` over all trainable operators, per candidate (a fused family that fails
 //! records its error). One JSON object goes to `OUT/engine_parity.json` and stdout.
 
-use gam_gpu::{GpuPolicy, tensor::Device};
+use gam_gpu::{
+    GpuPolicy,
+    tensor::{Arithmetic, Device},
+};
 use gam_mpd::{
     engine::log_to_stderr,
     import::{hugging_face_language_model, import_language_model},
@@ -104,8 +110,19 @@ fn compare((bits, gradient): &(Vec<Vec<f64>>, Vec<Array2<f64>>), (candidate_bits
 
 fn main() -> Result<(), String> {
     log_to_stderr();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "MODEL SEQUENCES CONTEXT OUT [WINDOWS]";
+    let (settings, args): (Vec<String>, Vec<String>) = std::env::args().skip(1).partition(|a| a.contains('='));
+    let (mut on_host, mut arithmetic) = (false, Arithmetic::F32);
+    for setting in &settings {
+        match setting.as_str() {
+            "device=host" => on_host = true,
+            "arithmetic=f32" => arithmetic = Arithmetic::F32,
+            "arithmetic=tf32x3" => arithmetic = Arithmetic::Tf32x3,
+            "arithmetic=bf16x3" => arithmetic = Arithmetic::Bf16x3,
+            "arithmetic=bf16" => arithmetic = Arithmetic::Bf16,
+            other => return Err(format!("unknown setting {other}")),
+        }
+    }
+    let usage = "MODEL SEQUENCES CONTEXT OUT [WINDOWS] [device=host] [arithmetic=f32|tf32x3|bf16x3|bf16]";
     let [model, sequences, context, out, windows @ ..] = &args[..] else {
         return Err(usage.into());
     };
@@ -144,7 +161,7 @@ fn main() -> Result<(), String> {
     let mut rng = StdRng::seed_from_u64(1);
     let moved: Vec<Array2<f64>> = start.iter().map(|m| m.mapv(|v| v * (1.0 + 0.1 * (2.0 * rng.random::<f64>() - 1.0)))).collect();
     let host = Device::host();
-    let accelerator = Device::single_precision(GpuPolicy::Required).map_err(error)?.ok_or("no accelerator")?;
+    let accelerator = if on_host { Device::host() } else { Device::single_precision(GpuPolicy::Required).map_err(error)?.ok_or("no accelerator")? };
     let mut reference = Interchange::new(&host, &native, &layers, &explanation.artifact, trainable, variables.clone(), usize::MAX, 4096)?;
     let mut candidate = Interchange::new(&accelerator, &native, &layers, &explanation.artifact, trainable, variables.clone(), usize::MAX, 4096)?;
     reference.load(&moved)?;
@@ -161,13 +178,13 @@ fn main() -> Result<(), String> {
     // The accelerator's program engine first, then the fused engine when it runs: a fault in the
     // second leaves the first's numbers.
     let mut programs = serde_json::Map::new();
-    for (name, experiments, directions, expected) in &families {
+    for (name, experiments, directions, expected) in families.iter().filter(|_| !on_host) {
         let row = compare(expected, &scored_by_programs(&candidate, trainable, &batch, experiments, directions)?);
         log::info!("parity {name}, programs: {row}");
         programs.insert((*name).into(), row);
     }
     let mut fused = serde_json::Map::new();
-    if candidate.fuse()? {
+    if candidate.fuse(arithmetic)? {
         for (name, experiments, directions, expected) in &families {
             let row = match scored(&candidate, &batch, experiments, directions) {
                 Ok(found) => compare(expected, &found),
@@ -181,6 +198,7 @@ fn main() -> Result<(), String> {
         "model": model.display().to_string(),
         "reference": host.name(),
         "candidate": accelerator.name(),
+        "arithmetic": format!("{arithmetic:?}"),
         "sequences": sequences,
         "context": context,
         "programs": programs,
