@@ -2935,20 +2935,25 @@ impl Interchange {
             _ => (0, true),
         };
         let mut ops = Vec::with_capacity(k);
+        let every = family == Family::Cut && rng.random_range(0..2) == 0;
         for (site, _) in sites.iter().zip(&chosen).filter(|(_, c)| **c) {
             let operation = match family {
                 Family::Swap => Operation::Swap,
                 Family::Zero => Operation::Scale(0),
                 Family::Scale => Operation::Scale(rng.random_range(1..SCALES.len())),
                 Family::Push => Operation::Push { direction: rng.random_range(0..directions), size: rng.random_range(0..SIZES.len()) },
-                // A cut's later block uniform after its site's, one cut into each block's read.
+                // A cut into one later block uniform after its site's, or (half of the experiments)
+                // into every later block's read, so the whole rest of the model sees the site's
+                // donor value; one cut into each block's read.
                 Family::Cut => {
                     let from = site.block(&self.m_sites.parts.head_blocks).ok_or_else(|| error("a cut at an unknown site"))?;
-                    let to = rng.random_range(from + 1..blocks);
-                    if ops.iter().any(|o: &SiteOp| o.operation == Operation::Cut { to }) {
-                        continue;
+                    let targets: Vec<usize> = if every { (from + 1..blocks).collect() } else { vec![rng.random_range(from + 1..blocks)] };
+                    for to in targets {
+                        if !ops.iter().any(|o: &SiteOp| o.operation == Operation::Cut { to }) {
+                            ops.push(SiteOp { site: *site, operation: Operation::Cut { to }, onward });
+                        }
                     }
-                    Operation::Cut { to }
+                    continue;
                 }
                 Family::Read | Family::Neuron | Family::RankOne => return Err(error("not an operation on a site")),
             };
