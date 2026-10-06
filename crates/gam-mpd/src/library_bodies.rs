@@ -2280,7 +2280,7 @@ pub fn carried(parent: &Explanation, posterior: &Posterior, child: &Explanation,
             }
         });
     }
-    Ok(crate::library_mdl::Start { mean: fresh.mean, log_sd, active: fresh.active, state: None, iterate: None, steps: 0, epoch: 0, rotations: Vec::new() })
+    Ok(crate::library_mdl::Start { mean: fresh.mean, log_sd, active: fresh.active, state: None, iterate: None, steps: 0, epoch: 0 })
 }
 
 #[cfg(test)]

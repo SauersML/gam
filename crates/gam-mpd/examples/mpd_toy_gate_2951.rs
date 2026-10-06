@@ -255,7 +255,7 @@ fn fit(target: &dyn Target, native: &[Array2<f64>], account: &Account, batches: 
     let mut posterior = Posterior::from_parts(account.start.clone(), account.membership.clone(), account.groups, tokens)?;
     let operators: Vec<usize> = (0..account.start.len()).collect();
     let groups: Vec<Vec<u32>> = account.membership.iter().map(|m| m.iter().copied().collect()).collect();
-    let parts = Parts { operators: &operators, mean: &posterior.mean, log_sd: &posterior.log_sd, groups: &groups, count: account.groups, rotations: &posterior.rotations };
+    let parts = Parts { operators: &operators, mean: &posterior.mean, log_sd: &posterior.log_sd, groups: &groups, count: account.groups };
     let mut device = DevicePosterior::from_parts(&host, &parts, tokens as f64, None, 0)?;
     let count = batches.len() as f64;
     let ivon = Ivon { beta1: 0.9, beta2: 1.0 - 1.0 / count };

@@ -148,7 +148,7 @@ fn main() -> Result<(), String> {
     }
     let explanation = library_mdl::explanation(&native, &layers)?;
     // Entry by entry along the operators' own axes, as the objective below samples it.
-    let posterior = library_mdl::checkpoint_posterior(&explanation, Path::new(checkpoint))?.factorized();
+    let posterior = library_mdl::checkpoint_posterior(&explanation, Path::new(checkpoint))?;
     let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
     let reads = interchange::reads(&native, &sites)?;
     let mut ic = Interchange::new(&device, &native, &sites, &explanation.artifact, &explanation.trainable, reads, settings.fit.numeric_bytes, settings.fit.head_tile_rows)?;

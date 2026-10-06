@@ -522,7 +522,6 @@ fn main() -> Result<(), String> {
                 seed: 1,
                 numeric_bytes: 1 << 28,
                 head_tile_rows: 64,
-                rotated: false,
                 epochs: None,
             };
             let base = library_mdl::explanation(&native, &layers)?;
@@ -577,7 +576,7 @@ fn main() -> Result<(), String> {
                 None if from == "native" => start,
                 Some(("checkpoint", path)) => {
                     // Entry by entry along the operators' own axes, as the bodies read it.
-                    let posterior = library_mdl::checkpoint_posterior(&start, Path::new(path))?.factorized();
+                    let posterior = library_mdl::checkpoint_posterior(&start, Path::new(path))?;
                     let mut base = library_sharing::warm(&start, &library_mdl::posterior_mean(&start, &posterior)?)?;
                     base.removed = (0..posterior.active.len()).filter(|g| !posterior.active[*g]).collect();
                     base

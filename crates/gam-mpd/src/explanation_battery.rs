@@ -1936,8 +1936,7 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
     let hidden_node = built.layout.hidden;
     drop(built);
     program.prepare_dense_parameters(&trainable)?;
-    let unrotated = vec![None; trainable.len()];
-    let parts = crate::device_posterior::Parts { operators: &trainable, mean: &means, log_sd: &log_sd, groups: &groups, count: base, rotations: &unrotated };
+    let parts = crate::device_posterior::Parts { operators: &trainable, mean: &means, log_sd: &log_sd, groups: &groups, count: base };
     let mut posterior = crate::device_posterior::DevicePosterior::from_parts(&device, &parts, tokens, None, 0)?;
     drop((means, log_sd));
     let variance_nats: f64 = sizes.iter().map(|n| 0.5 * n.ln()).sum();

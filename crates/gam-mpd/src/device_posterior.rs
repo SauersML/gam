@@ -28,11 +28,11 @@
 
 use crate::{
     device_program::DeviceProgram,
-    library_mdl::{Curvature, Explanation, Posterior, Rotation, Side},
+    library_mdl::{Curvature, Explanation, Posterior},
 };
 use gam_gpu::{
     gpu_error::GpuError,
-    tensor::{Arithmetic, Device, GroupMap, Op, PosteriorStep, Storage, Tensor},
+    tensor::{Device, GroupMap, PosteriorStep, Storage, Tensor},
 };
 use ndarray::Array2;
 use std::collections::BTreeMap;
@@ -106,9 +106,6 @@ pub struct Parts<'a> {
     pub log_sd: &'a [Array2<f64>],
     pub groups: &'a [Vec<u32>],
     pub count: usize,
-    /// Per operator the rotation of its noise, if any (`library_mdl::Rotation`): its posterior
-    /// lives along the rotated axes on the device.
-    pub rotations: &'a [Option<Rotation>],
 }
 
 /// The per-group constants of a posterior's code length and one row per step for its values
@@ -152,12 +149,6 @@ pub struct DevicePosterior {
     /// The training tokens `N` (the data term's weight) and the steps taken.
     tokens: f64,
     steps: u64,
-    /// Per operator its rotation (on the host), and on the device each distinct rotation matrix and
-    /// per operator its side and matrix: the operator's `μ`, gradient and IVON state are held along
-    /// the rotated axes, so IVON's step stays entrywise there.
-    rotations: Vec<Option<Rotation>>,
-    matrices: Vec<Tensor>,
-    placed: Vec<Option<(Side, usize)>>,
     /// Per operator, the host `μ` and `s` its device values were last set from
     /// ([`DevicePosterior::set_values`]) while no step or restore has changed them since: a later
     /// `set_values` sends only the operators whose values differ in some bit (a removal trial
@@ -207,7 +198,7 @@ impl DevicePosterior {
             return Err(error("one posterior array per trainable operator required"));
         }
         let groups = membership(explanation, &shapes)?;
-        let parts = Parts { operators: &explanation.trainable, mean: &posterior.mean, log_sd: &posterior.log_sd, groups: &groups, count: explanation.groups.len(), rotations: &posterior.rotations };
+        let parts = Parts { operators: &explanation.trainable, mean: &posterior.mean, log_sd: &posterior.log_sd, groups: &groups, count: explanation.groups.len() };
         Self::from_parts(fitting, &parts, tokens, moments, steps)
     }
 
@@ -233,8 +224,8 @@ impl DevicePosterior {
         };
         let shapes: Vec<(usize, usize)> = parts.mean.iter().map(Array2::dim).collect();
         let sizes_agree = parts.log_sd.iter().map(Array2::dim).eq(shapes.iter().copied()) && parts.groups.iter().map(Vec::len).eq(shapes.iter().map(|(r, c)| r * c));
-        if shapes.len() != parts.operators.len() || !sizes_agree || moments.as_ref().is_some_and(|m| m.len() != shapes.len()) || parts.rotations.len() != shapes.len() {
-            return Err(error("one posterior array, group list and rotation per trainable operator required"));
+        if shapes.len() != parts.operators.len() || !sizes_agree || moments.as_ref().is_some_and(|m| m.len() != shapes.len()) {
+            return Err(error("one posterior array and group list per trainable operator required"));
         }
         if parts.groups.iter().flatten().any(|g| *g as usize >= parts.count) {
             return Err(error("a group id beyond the groups"));
@@ -279,7 +270,7 @@ impl DevicePosterior {
             sums: wide.zeros(parts.count, 3).map_err(error)?,
             variance: wide.zeros(parts.count, 1).map_err(error)?,
             divergence: wide.zeros(parts.count, 1).map_err(error)?,
-            mean: parts.mean.iter().zip(parts.rotations).map(|(m, r)| match r { Some(r) => up(&r.undo(m)), None => up(m) }).collect::<Result<_, _>>()?,
+            mean: parts.mean.iter().map(up).collect::<Result<_, _>>()?,
             log_sd: parts.log_sd.iter().map(up).collect::<Result<_, _>>()?,
             moments: (0..shapes.len()).map(state).collect::<Result<_, String>>()?,
             groups: parts.groups.iter().zip(&shapes).map(|(ids, shape)| master.group_map(ids, *shape).map_err(error)).collect::<Result<_, _>>()?,
@@ -293,28 +284,18 @@ impl DevicePosterior {
             wide,
             tokens,
             steps,
-            rotations: parts.rotations.to_vec(),
-            matrices: Vec::new(),
-            placed: Vec::new(),
             uploaded: Vec::new(),
         };
-        let (placed, matrices) = crate::library_mdl::rotation_layout(parts.rotations);
-        out.matrices = matrices.iter().map(|m| up(m)).collect::<Result<_, _>>()?;
-        out.placed = placed;
         out.average = out.mean.iter().map(|m| out.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
         out.refresh()?;
         Ok(out)
     }
 
-    /// Trainable operator `i`'s iterate along its own axes and its log standard deviations, on the
-    /// host: where a step's gradient is taken (`DevicePosterior::iterate_into`), for a caller
-    /// that measures a line step on the host.
+    /// Trainable operator `i`'s iterate and its log standard deviations, on the host: where a
+    /// step's gradient is taken (`DevicePosterior::iterate_into`), for a caller that measures a
+    /// line step on the host.
     pub fn iterate_values(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>), String> {
         let mean = self.fitting.download(&self.mean[i]).map_err(error)?;
-        let mean = match &self.rotations[i] {
-            Some(r) => r.apply(&mean),
-            None => mean,
-        };
         Ok((mean, self.fitting.download(&self.log_sd[i]).map_err(error)?))
     }
 
@@ -335,59 +316,9 @@ impl DevicePosterior {
         self.refresh()
     }
 
-    /// The products' arithmetic in the fitting storage.
-    fn arithmetic(&self) -> Arithmetic {
-        if self.fitting.storage() == Storage::F64 { Arithmetic::F64 } else { Arithmetic::F32 }
-    }
-
-    /// Operator `i`'s array `x` along its rotated axes, along its own axes (`None` without a
-    /// rotation).
-    fn applied(&self, i: usize, x: &Tensor) -> Result<Option<Tensor>, String> {
-        let Some((side, at)) = self.placed[i] else { return Ok(None) };
-        let r = &self.matrices[at];
-        let mut out = self.fitting.zeros(x.rows(), x.cols()).map_err(error)?;
-        match side {
-            Side::Columns => self.fitting.gemm(&mut out, 1.0, x, Op::N, r, Op::T, 0.0, self.arithmetic()),
-            Side::Rows => self.fitting.gemm(&mut out, 1.0, r, Op::N, x, Op::N, 0.0, self.arithmetic()),
-        }
-        .map_err(error)?;
-        Ok(Some(out))
-    }
-
-    /// Operator `i`'s array `x` along its own axes (a gradient), along its rotated axes (`None`
-    /// without a rotation).
-    fn undone(&self, i: usize, x: &Tensor) -> Result<Option<Tensor>, String> {
-        let Some((side, at)) = self.placed[i] else { return Ok(None) };
-        let r = &self.matrices[at];
-        let mut out = self.fitting.zeros(x.rows(), x.cols()).map_err(error)?;
-        match side {
-            Side::Columns => self.fitting.gemm(&mut out, 1.0, x, Op::N, r, Op::N, 0.0, self.arithmetic()),
-            Side::Rows => self.fitting.gemm(&mut out, 1.0, r, Op::T, x, Op::N, 0.0, self.arithmetic()),
-        }
-        .map_err(error)?;
-        Ok(Some(out))
-    }
-
-    /// Operator `i`'s posterior means `μ̄` along its own axes, on the host.
+    /// Operator `i`'s posterior means `μ̄` on the host.
     fn host_mean(&self, i: usize) -> Result<Array2<f64>, String> {
-        let mean = self.fitting.download(&self.average[i]).map_err(error)?;
-        Ok(match &self.rotations[i] {
-            Some(r) => r.apply(&mean),
-            None => mean,
-        })
-    }
-
-    /// Per operator, the rotation of its noise.
-    #[must_use]
-    pub fn rotations(&self) -> &[Option<Rotation>] {
-        &self.rotations
-    }
-
-    /// Trainable operator `op`'s array `x` along its own axes (a gradient or a Gauss–Newton
-    /// factor), along its rotated axes; `None` without a rotation.
-    pub fn along_rotated_axes(&self, op: usize, x: &Tensor) -> Result<Option<Tensor>, String> {
-        let (i, _, _) = self.entries(op)?;
-        self.undone(i, x)
+        self.fitting.download(&self.average[i]).map_err(error)
     }
 
     /// The trial step at which the iterate sits while a line step awaits its measurement.
@@ -504,8 +435,6 @@ impl DevicePosterior {
     /// Trainable operator `op`'s weight sample of `key` (the draws [`DevicePosterior::sample_into`]
     /// writes) into the block of `out` at `(row, col)`, a stacked operand such as a fused group's:
     /// written in place, no copy of the operator ([`Device::reparameterize_block`]).
-    /// An operator with a rotation is sampled along its rotated axes, turned to its own, and written
-    /// whole.
     pub fn sample_block(&self, op: usize, out: &mut Tensor, at: (usize, usize), key: u64) -> Result<(), String> {
         self.block_of(op, out, at, key, &self.average)
     }
@@ -513,32 +442,7 @@ impl DevicePosterior {
     /// [`DevicePosterior::sample_block`] around `means` (the posterior's `μ̄` or the iterate).
     fn block_of(&self, op: usize, out: &mut Tensor, at: (usize, usize), key: u64, means: &[Tensor]) -> Result<(), String> {
         let (i, _, log_sd) = self.entries(op)?;
-        let mean = &means[i];
-        if self.placed[i].is_none() {
-            return self.fitting.reparameterize_block(out, at, (mean, log_sd), (key, i as u64)).map_err(error);
-        }
-        let mut rotated = self.fitting.empty(mean.rows(), mean.cols()).map_err(error)?;
-        self.fitting.reparameterize(&mut rotated, (mean, log_sd), (key, i as u64)).map_err(error)?;
-        let theta = self.applied(i, &rotated)?.ok_or_else(|| error("a rotation lost"))?;
-        self.write_block(out, at, theta)
-    }
-
-    /// `value` (in the fitting storage) written into the block of `out` at `(row, col)`, in `out`'s
-    /// storage.
-    fn write_block(&self, out: &mut Tensor, (row, col): (usize, usize), value: Tensor) -> Result<(), String> {
-        let narrow = |value: Tensor| if out.storage() == Storage::Bf16 { self.fitting.bf16_copy(&value).map_err(error) } else { Ok(value) };
-        if col == 0 && value.cols() == out.cols() {
-            let value = narrow(value)?;
-            self.fitting.set_rows(out, row, &value).map_err(error)
-        } else if row == 0 && value.rows() == out.rows() {
-            let value = narrow(value)?;
-            self.fitting.set_columns(out, col, &value).map_err(error)
-        } else {
-            // A block of deviation zero is its mean (`exp(−∞) = 0`).
-            let row_of = self.fitting.upload_vec(1, value.cols(), vec![f64::NEG_INFINITY; value.cols()]).map_err(error)?;
-            let fixed = self.fitting.broadcast_rows(&row_of, value.rows()).map_err(error)?;
-            self.fitting.reparameterize_block(out, (row, col), (&value, &fixed), (0, 0)).map_err(error)
-        }
+        self.fitting.reparameterize_block(out, at, (&means[i], log_sd), (key, i as u64)).map_err(error)
     }
 
     /// Writes the posterior means into `program`'s trainable operators and their stacks.
@@ -552,30 +456,18 @@ impl DevicePosterior {
         for (i, &op) in self.operators.iter().enumerate() {
             // A program holding the operator in bfloat16 (`DeviceProgram::hold_bf16`) gets it so.
             let bf16 = program.dense(op).is_ok_and(|held| held.storage() == Storage::Bf16);
-            let rotated = self.applied(i, &means[i])?;
-            let mean = rotated.as_ref().unwrap_or(&means[i]);
-            let value = if bf16 { self.fitting.bf16_copy(mean) } else { self.fitting.copy(mean) };
+            let value = if bf16 { self.fitting.bf16_copy(&means[i]) } else { self.fitting.copy(&means[i]) };
             program.replace_dense_parameter(op, value.map_err(error)?)?;
         }
         program.refresh_fused()
     }
 
     /// Writes the rounded posterior means (each `μ` to the nearest multiple of `2^⌊log2 σ⌋`,
-    /// `Posterior::rounded`) into `program`'s trainable operators (rounded to its storage). An
-    /// operator with a rotation is rounded along its own axes, each mean to its marginal
-    /// deviation's grid: the decoder reads the operator's own values.
+    /// `Posterior::rounded`) into `program`'s trainable operators (rounded to its storage).
     pub fn rounded_into(&self, program: &mut DeviceProgram) -> Result<(), String> {
         for (i, &op) in self.operators.iter().enumerate() {
             let mut rounded = self.fitting.empty(self.average[i].rows(), self.average[i].cols()).map_err(error)?;
-            match &self.rotations[i] {
-                Some(rotation) => {
-                    let mean = self.applied(i, &self.average[i])?.ok_or_else(|| error("a rotation lost"))?;
-                    let variances = rotation.marginal(&self.fitting.download(&self.log_sd[i]).map_err(error)?.mapv(|s| (2.0 * s).exp()));
-                    let log_sd = self.fitting.upload(variances.mapv(|v| 0.5 * v.ln()).view()).map_err(error)?;
-                    self.fitting.round_to_deviation(&mut rounded, (&mean, &log_sd)).map_err(error)?;
-                }
-                None => self.fitting.round_to_deviation(&mut rounded, (&self.average[i], &self.log_sd[i])).map_err(error)?,
-            }
+            self.fitting.round_to_deviation(&mut rounded, (&self.average[i], &self.log_sd[i])).map_err(error)?;
             let bf16 = program.dense(op).is_ok_and(|held| held.storage() == Storage::Bf16);
             let value = if bf16 { self.fitting.bf16_copy(&rounded).map_err(error)? } else { rounded };
             program.replace_dense_parameter(op, value)?;
@@ -603,16 +495,7 @@ impl DevicePosterior {
     fn sample_of(&self, program: &mut DeviceProgram, key: u64, means: &[Tensor]) -> Result<(), String> {
         for (i, &op) in self.operators.iter().enumerate() {
             let parts = (&means[i], &self.log_sd[i]);
-            if self.placed[i].is_some() {
-                // The sample along the rotated axes, then along the operator's own.
-                let mut rotated = self.fitting.zeros(means[i].rows(), means[i].cols()).map_err(error)?;
-                self.fitting.reparameterize(&mut rotated, parts, (key, i as u64)).map_err(error)?;
-                let theta = self.applied(i, &rotated)?.ok_or_else(|| error("a rotation lost"))?;
-                match program.dense_mut(op) {
-                    Ok(held) => *held = theta,
-                    Err(_) => program.replace_dense_parameter(op, theta)?,
-                }
-            } else if let Ok(theta) = program.dense_mut(op) {
+            if let Ok(theta) = program.dense_mut(op) {
                 self.fitting.reparameterize(theta, parts, (key, i as u64)).map_err(error)?;
             } else {
                 let (rows, cols) = (means[i].rows(), means[i].cols());
@@ -657,9 +540,6 @@ impl DevicePosterior {
             let (missing_gradient, missing_factor) = (zero(gradients.get(&op))?, zero(factor.0.get(&op))?);
             let gradient = gradients.get(&op).or(missing_gradient.as_ref()).ok_or_else(|| error("no gradient"))?;
             let draw = factor.0.get(&op).or(missing_factor.as_ref()).ok_or_else(|| error("no Gauss–Newton factor"))?;
-            // Along the rotated axes, where the posterior is held.
-            let (rotated_gradient, rotated_draw) = (self.undone(i, gradient)?, self.undone(i, draw)?);
-            let (gradient, draw) = (rotated_gradient.as_ref().unwrap_or(gradient), rotated_draw.as_ref().unwrap_or(draw));
             let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, beta1: ivon.beta1, beta2: ivon.beta2, step: self.steps };
             let [momentum, curvature, power] = &mut self.moments[i];
             self.fitting
@@ -713,14 +593,12 @@ impl DevicePosterior {
             if gradient.is_none() && draw.is_none() {
                 continue;
             }
-            // The sample along the rotated axes, where the means and deviations are, as
-            // `sample_into` draws it; `x · θ` is the same along either axes.
+            // The sample as `sample_into` draws it.
             let mut theta = self.fitting.zeros(self.mean[i].rows(), self.mean[i].cols()).map_err(error)?;
             self.fitting.reparameterize(&mut theta, (&self.average[i], &self.log_sd[i]), (key, i as u64)).map_err(error)?;
             for (x, sums) in [(gradient, &mut slopes), (draw, &mut forms)] {
                 let Some(x) = x else { continue };
-                let rotated = self.undone(i, x)?;
-                self.fitting.group_curvature((rotated.as_ref().unwrap_or(x), &theta, &self.log_sd[i]), &self.groups[i], sums).map_err(error)?;
+                self.fitting.group_curvature((x, &theta, &self.log_sd[i]), &self.groups[i], sums).map_err(error)?;
             }
         }
         let slope: Vec<f64> = self.wide.download(&slopes).map_err(error)?.column(1).iter().map(|s| nats * s).collect();
@@ -795,8 +673,7 @@ impl DevicePosterior {
             if self.uploaded[i].as_ref().is_some_and(|(m, s)| same_bits(m, &posterior.mean[i]) && same_bits(s, &posterior.log_sd[i])) {
                 continue;
             }
-            let mean = self.rotations[i].as_ref().map_or_else(|| posterior.mean[i].clone(), |r| r.undo(&posterior.mean[i]));
-            self.mean[i] = self.fitting.upload(mean.view()).map_err(error)?;
+            self.mean[i] = self.fitting.upload(posterior.mean[i].view()).map_err(error)?;
             self.log_sd[i] = self.fitting.upload(posterior.log_sd[i].view()).map_err(error)?;
             self.uploaded[i] = Some((posterior.mean[i].clone(), posterior.log_sd[i].clone()));
         }
@@ -819,8 +696,8 @@ impl DevicePosterior {
         }
     }
 
-    /// Trainable operator `i`'s iterate `μ` on the host as the device holds it (along its rotated
-    /// axes), whose Polyak average is the posterior's mean.
+    /// Trainable operator `i`'s iterate `μ` on the host, whose Polyak average is the posterior's
+    /// mean.
     pub fn iterate(&self, i: usize) -> Result<Array2<f64>, String> {
         self.fitting.download(self.mean.get(i).ok_or_else(|| error("no such trainable operator"))?).map_err(error)
     }
@@ -844,15 +721,15 @@ impl DevicePosterior {
 
     /// Trainable operator `i`'s state on the host as the device holds it, one operator at a time
     /// (a checkpoint streams them rather than holding every operator's state at once): `μ`, `s`
-    /// and IVON's state, all along the operator's rotated axes where it has a rotation.
+    /// and IVON's state.
     pub fn operator(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>, [Array2<f64>; 3]), String> {
         let down = |t: &Tensor| self.fitting.download(t).map_err(error);
         let m = self.moments.get(i).ok_or_else(|| error("no such trainable operator"))?;
         Ok((down(&self.average[i])?, down(&self.log_sd[i])?, [down(&m[0])?, down(&m[1])?, down(&m[2])?]))
     }
 
-    /// The means as the device holds them (along each operator's rotated axes), restored exactly
-    /// from a checkpoint ([`DevicePosterior::operator`]).
+    /// The means as the device holds them, restored exactly from a checkpoint
+    /// ([`DevicePosterior::operator`]).
     pub fn restore_means(&mut self, held: &[Array2<f64>]) -> Result<(), String> {
         if held.len() != self.mean.len() || held.iter().zip(&self.mean).any(|(h, m)| h.dim() != (m.rows(), m.cols())) {
             return Err(error("one mean per trainable operator, of its shape, required"));
@@ -908,7 +785,7 @@ mod tests {
         let mean = Array2::from_elem((1, R), 0.1);
         let log_sd = Array2::from_elem((1, R), -4.0);
         let groups = vec![vec![0u32; R]];
-        let parts = Parts { operators: &[0], mean: std::slice::from_ref(&mean), log_sd: std::slice::from_ref(&log_sd), groups: &groups, count: 1, rotations: &[None] };
+        let parts = Parts { operators: &[0], mean: std::slice::from_ref(&mean), log_sd: std::slice::from_ref(&log_sd), groups: &groups, count: 1 };
         let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens, None, 0).unwrap();
         let ivon = Ivon { beta1: 0.9, beta2: 0.75 };
         let data = |mu: &Array2<f64>| 0.5 * a * mu.iter().zip(&target).map(|(m, t)| (m - t) * (m - t)).sum::<f64>();
@@ -957,7 +834,7 @@ mod tests {
         let h = 1.0 / (tokens * v0);
         let log_sd = Array2::from_shape_fn((1, R), |(_, i)| if free(i) { 0.5 * v0.ln() } else { -0.5 * (tokens * (h + 1.0 / (tokens * v0))).ln() });
         let groups = vec![vec![0u32; R]];
-        let parts = Parts { operators: &[0], mean: std::slice::from_ref(&a), log_sd: std::slice::from_ref(&log_sd), groups: &groups, count: 1, rotations: &[None] };
+        let parts = Parts { operators: &[0], mean: std::slice::from_ref(&a), log_sd: std::slice::from_ref(&log_sd), groups: &groups, count: 1 };
         let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens, None, 0).unwrap();
         let start = posterior.variances().unwrap()[0];
         let ivon = Ivon { beta1: 0.9, beta2: 1.0 - 1.0 / 64.0 };
