@@ -3912,6 +3912,7 @@ dependencies = [
  "gam-runtime",
  "gam-solve",
  "gam-workspace-hack",
+ "libc",
  "log",
  "memmap2",
  "ndarray 0.17.2",
