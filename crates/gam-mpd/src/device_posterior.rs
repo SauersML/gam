@@ -350,6 +350,11 @@ impl DevicePosterior {
         self.momentum_weights
     }
 
+    /// The momentum's weights `(W, W2)`, restored from a checkpoint with IVON's state.
+    pub fn set_momentum_weights(&mut self, weights: (f64, f64)) {
+        self.momentum_weights = weights;
+    }
+
     /// Writes the posterior means into `program`'s trainable operators (rounded to its storage).
     /// Trainable operator `op`'s position, and its means and log standard deviations.
     fn entries(&self, op: usize) -> Result<(usize, &Tensor, &Tensor), String> {

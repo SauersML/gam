@@ -2140,6 +2140,12 @@ struct Progress {
     /// ([`DevicePosterior::line_ratio`]).
     #[serde(default = "unit_ratio")]
     ratio: (f64, u64),
+    /// The momentum's weights `(W, W2)` ([`DevicePosterior::momentum_weights`]): its bias
+    /// correction and effective number of gradients, which the step's direction reads. None in a
+    /// checkpoint written before they were saved, which resumes with those of `β₁ = 0.9` over its
+    /// steps, the decay those fits used.
+    #[serde(default)]
+    momentum_weights: Option<(f64, f64)>,
     /// The best epoch since the objective last changed: its mean per-batch estimate and the epoch,
     /// whose posterior is the checkpoint beside the fit's with extension `best.bin` (the removal
     /// round starts from it).
@@ -2441,6 +2447,7 @@ impl Snapshot {
         progress.precision = Some(precision);
         progress.averaged = posterior.averaged();
         progress.ratio = posterior.line_ratio();
+        progress.momentum_weights = Some(posterior.momentum_weights());
         let bytes = checkpoint_payload_bytes(&progress.shapes, precision).ok_or("a checkpoint too large to address")?;
         let (header, json) = (serde_json::to_vec(progress).map_err(error)?, serde_json::to_vec_pretty(progress).map_err(error)?);
         // One operator's arrays wait while the writer writes the one before.
@@ -2744,6 +2751,7 @@ pub fn fit_from(
         step: 0,
         averaged: 0,
         ratio: unit_ratio(),
+        momentum_weights: None,
         best: None,
         epochs: Vec::new(),
         removals: Vec::new(),
@@ -2800,6 +2808,9 @@ pub fn fit_from(
     let fresh = resumed.is_none();
     let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, resumed.as_deref().map(State::Saved), u64::try_from(progress.step).map_err(error)?)?;
     drop(resumed);
+    if let (false, Some(weights)) = (fresh, progress.momentum_weights) {
+        device_posterior.set_momentum_weights(weights);
+    }
     // A resumed fit holds exactly the device's means of the checkpoint, and the iterate they
     // average with the steps they span: it goes on as the fit that was not stopped.
     if let Some(held) = held_means.take() {
@@ -4398,6 +4409,7 @@ mod tests {
             step: 17,
             averaged: 3,
             ratio: (1.5, 2),
+            momentum_weights: Some((0.25, 0.0625)),
             best: Some((7.0, 3)),
             epochs: Vec::new(),
             removals: Vec::new(),
@@ -4605,6 +4617,16 @@ mod tests {
         };
         assert!(message.contains("stopped"), "{message}");
         let resumed = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&stopped), Some(&mut Stop { groups, steps: 0, stop: None })).unwrap();
+        // The optimizer's state the step's direction and length read: in this tiny fit the iterate
+        // never moves (fewer than RATIO_DRAWS draws), so the means alone cannot show a resume that
+        // lost it (the momentum's weights, 4d64ef9bd5's, were not saved).
+        let state = |file: &std::path::PathBuf| -> serde_json::Value {
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(file.with_extension("json")).unwrap()).unwrap();
+            serde_json::json!([saved["step"], saved["averaged"], saved["ratio"], saved["momentum_weights"]])
+        };
+        let (resumed_state, uninterrupted_state) = (state(&stopped), state(&whole));
+        assert!(uninterrupted_state[3].is_array(), "the checkpoint holds the momentum's weights");
+        assert_eq!(resumed_state, uninterrupted_state, "the resumed fit's optimizer state");
         for file in [&whole, &stopped] {
             for extension in ["bin", "json", "removals.jsonl"] {
                 let written = file.with_extension(extension);
