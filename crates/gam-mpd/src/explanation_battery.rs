@@ -2301,3 +2301,222 @@ impl UnitBasis<'_> {
         Ok(high)
     }
 }
+
+// ------------------------------------------------------------------------------ VPD, one position
+
+/// `M`'s read variables (the library's starting reads, `interchange::library_reads`): per layer
+/// each head's query, key and value read maps at its attention block, then each MLP neuron's input
+/// direction at its MLP block; each as its block and an orthonormal basis of its rows.
+fn model_reads(export: &Path) -> Result<Vec<(usize, Array2<f64>)>, String> {
+    let export = Export::open(export)?;
+    let config = Config::of(&export)?;
+    let hd = config.head_dim;
+    let mut out = Vec::new();
+    for l in 0..config.layers {
+        let [wq, wk, wv] = [Kind::Query, Kind::Key, Kind::Value].map(|k| export.tensor(&format!("blocks.{l}.{}", k.export_name())));
+        let (wq, wk, wv) = (wq?, wk?, wv?);
+        for h in 0..config.heads {
+            for w in [&wq, &wk, &wv] {
+                out.push((2 * l, w.slice(s![h * hd..(h + 1) * hd, ..]).to_owned()));
+            }
+        }
+        let wc = export.tensor(&format!("blocks.{l}.{}", Kind::Up.export_name()))?;
+        out.extend(wc.outer_iter().map(|row| (2 * l + 1, row.insert_axis(Axis(0)).to_owned())));
+    }
+    Ok(out)
+}
+
+/// An orthonormal basis (`d × r`) of the span of the rows of `rows`, or none.
+fn row_span(rows: &Array2<f64>) -> Result<Option<Array2<f32>>, String> {
+    let decomposition = gam_linalg::decompose::svd(rows.view(), false).map_err(error)?;
+    let rank = decomposition.singular_values.iter().filter(|s| **s > decomposition.band).count();
+    Ok((rank > 0).then(|| decomposition.vt.slice(s![..rank, ..]).t().mapv(|x| x as f32)))
+}
+
+/// Row `row` of a read `h` patched with the source's row `s` in the span `q`: the read patch
+/// `h + (s − h) Q Qᵀ`, or (`complement`) `s + (h − s) Q Qᵀ`; with no span the read patch changes
+/// nothing and the complement takes the source whole.
+fn patch_row(h: &mut Array2<f64>, row: usize, s: ndarray::ArrayView1<f64>, q: Option<&Array2<f32>>, complement: bool) {
+    let base = h.row(row).to_owned();
+    let (start, other) = if complement { (s.to_owned(), &base) } else { (base.clone(), &s.to_owned()) };
+    let mut out = start.clone();
+    if let Some(q) = q {
+        let difference = (other - &start).mapv(|x| x as f32);
+        let along = q.dot(&difference.dot(q));
+        out.zip_mut_with(&along, |o, a| *o += f64::from(*a));
+    }
+    h.row_mut(row).assign(&out);
+}
+
+/// VPD's interchange experiments as the battery asks them of a library explanation
+/// (`interchange`, module note there): each patch at one position `t₀` per base (uniform), scored
+/// from `t₀` on, the source a sequence shared across all bases, each model taking the source's read
+/// from its own run on it (VPD under the source's own CI masks); VPD alone, under the base's CI
+/// masks, the remainder dropped. Families: `read`, one of `M`'s read variables drawn uniformly per
+/// base (the same questions asked of every explanation); `read_joint`, a subset of the variables at
+/// that variable's block (its size uniform, `interchange::subset`); `complement_block_b`, at block
+/// `b` the component outside the span of the reads of VPD's subcomponents active at `t₀`; and
+/// `complement_joint`, the complements at a set of blocks of size uniform in `2..=2L`
+/// (`interchange::hybrid_of`). VPD reads only its active coordinates, which a complement keeps, so
+/// its prediction there is its unpatched output.
+pub fn vpd_interchange_atomic(vpd: &Vpd, export: &Path, bases: &[Vec<u32>], sources: &[Vec<u32>], batch: usize, seed: u64, worst_of: &[usize]) -> Result<Value, String> {
+    let d = vpd.m.program.device().clone();
+    let (layers, blocks) = (vpd.layers(), 2 * vpd.layers());
+    let length = bases.first().map_or(0, Vec::len);
+    let variables = model_reads(export)?;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let position: Vec<usize> = (0..bases.len()).map(|_| rng.random_range(0..length)).collect();
+    let read_of: Vec<usize> = (0..bases.len()).map(|_| rng.random_range(0..variables.len())).collect();
+    let joint_of: Vec<Vec<usize>> = read_of
+        .iter()
+        .map(|&v| crate::interchange::subset(&mut rng, &(0..variables.len()).filter(|i| variables[*i].0 == variables[v].0).collect::<Vec<_>>()))
+        .collect();
+    let blocks_of: Vec<Vec<usize>> = (0..bases.len())
+        .map(|_| {
+            let k = rng.random_range(2..=blocks);
+            crate::interchange::hybrid_of(&mut rng, blocks, k).iter().enumerate().filter(|(_, x)| **x).map(|(b, _)| b).collect()
+        })
+        .collect();
+    // Per base the span of its read and joint read patches.
+    let span_of = |chosen: &[usize]| -> Result<Option<Array2<f32>>, String> {
+        let rows: Vec<_> = chosen.iter().map(|v| variables[*v].1.view()).collect();
+        row_span(&ndarray::concatenate(Axis(0), &rows).map_err(error)?)
+    };
+    let read_spans: Vec<Option<Array2<f32>>> = read_of.iter().map(|v| span_of(&[*v])).collect::<Result<_, _>>()?;
+    let joint_spans: Vec<Option<Array2<f32>>> = joint_of.iter().map(|vs| span_of(vs)).collect::<Result<_, _>>()?;
+    // Each source's reads at every block: M's, and VPD's under the source's own CI masks.
+    let mut source_reads: Vec<(Vec<Array2<f64>>, Vec<Array2<f64>>)> = Vec::with_capacity(sources.len());
+    for source in sources {
+        let family = sequence_family(&[source.as_slice()])?;
+        let masks = Strategy::Ci.masks(&vpd.importances(&family)?, &mut rng);
+        let capture = |side: &Side, reads: &[usize], masks: Option<&Masks>| -> Result<Vec<Array2<f64>>, String> {
+            let mut out = vec![Array2::zeros((0, 0)); blocks];
+            let mut x: Option<Tensor> = None;
+            for l in 0..layers {
+                let given = match masks {
+                    Some(m) => vpd.given(&d, l, Some(m), family.rows)?,
+                    None => BTreeMap::new(),
+                };
+                let trace = side.layer_trace(&family, l, x.as_ref(), given, |_, _| Ok(None))?;
+                for b in [2 * l, 2 * l + 1] {
+                    out[b] = d.download(trace.value(reads[b])?).map_err(error)?;
+                }
+                x = Some(d.copy(trace.value(side.leaving(l))?).map_err(error)?);
+            }
+            Ok(out)
+        };
+        source_reads.push((capture(&vpd.m, &vpd.m_layout.reads, None)?, capture(&vpd.e, &vpd.layout.reads, Some(&masks))?));
+    }
+    let mut names = vec!["read".to_string(), "read_joint".to_string()];
+    names.extend((0..blocks).map(|b| format!("complement_block_{b}")));
+    names.push("complement_joint".into());
+    let mut families = Families { per_source: vec![vec![(0.0, 0); sources.len()]; names.len()], all: vec![Tokens::default(); names.len()], names };
+    for (c, chunk) in bases.chunks(batch).enumerate() {
+        let views: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
+        let family = sequence_family(&views)?;
+        let g = vpd.importances(&family)?;
+        let masks = Strategy::Ci.masks(&g, &mut rng);
+        let index = |r: usize| c * batch + r;
+        // The spans of VPD's active reads at each base's position, per block.
+        let active: Vec<Vec<Option<Array2<f32>>>> = (0..blocks)
+            .map(|b| -> Result<Vec<Option<Array2<f32>>>, String> {
+                let sites = reading_sites(b);
+                let v = ndarray::concatenate(Axis(1), &sites.iter().map(|s| vpd.factors[*s].v.view()).collect::<Vec<_>>()).map_err(error)?;
+                (0..chunk.len())
+                    .map(|r| {
+                        let t = r * length + position[index(r)];
+                        let mut cols = Vec::new();
+                        let mut offset = 0;
+                        for &s in &sites {
+                            cols.extend(g[s].row(t).iter().enumerate().filter(|(_, x)| **x > 0.0).map(|(k, _)| offset + k));
+                            offset += g[s].ncols();
+                        }
+                        column_span(&v, &cols)
+                    })
+                    .collect()
+            })
+            .collect::<Result<_, _>>()?;
+        // VPD's unpatched output.
+        let mut x: Option<Tensor> = None;
+        for l in 0..layers {
+            x = Some(vpd.e.layer(&family, l, x.as_ref(), vpd.given(&d, l, Some(&masks), family.rows)?)?);
+        }
+        let e_logits = vpd.m.logits(&family, x.as_ref().ok_or_else(|| error("no layers"))?, length)?;
+        for (s, (m_source, e_source)) in source_reads.iter().enumerate() {
+            // KL(M_e ‖ E_e) per base from its position on.
+            let score = |families: &mut Families, f: usize, m_final: &Tensor, e_logits: &[Array2<f64>]| -> Result<(), String> {
+                let reference = Reference::of(vpd.m.logits(&family, m_final, length)?)?;
+                let mut behaviour = Behaviour::default();
+                behaviour.add(&reference, e_logits, &views)?;
+                let bits: Vec<f64> = (0..chunk.len()).flat_map(|r| behaviour.kl.0[r * length + position[index(r)]..(r + 1) * length].to_vec()).collect();
+                families.add(f, s, &bits);
+                Ok(())
+            };
+            // A forward through `side` whose reads at `t₀` are patched by `patch(block, h)`.
+            let run = |side: &Side, reads: &[usize], masks: Option<&Masks>, patch: &dyn Fn(usize, &mut Array2<f64>) -> bool| -> Result<Tensor, String> {
+                let mut x: Option<Tensor> = None;
+                for l in 0..layers {
+                    let given = match masks {
+                        Some(m) => vpd.given(&d, l, Some(m), family.rows)?,
+                        None => BTreeMap::new(),
+                    };
+                    let trace = side.layer_trace(&family, l, x.as_ref(), given, |node, trace| {
+                        let Some(b) = [2 * l, 2 * l + 1].into_iter().find(|b| reads[*b] == node) else { return Ok(None) };
+                        let mut h = d.download(trace.value(node)?).map_err(error)?;
+                        if !patch(b, &mut h) {
+                            return Ok(None);
+                        }
+                        d.upload(h.view()).map(Some).map_err(error)
+                    })?;
+                    x = Some(d.copy(trace.value(side.leaving(l))?).map_err(error)?);
+                }
+                x.ok_or_else(|| error("no layers"))
+            };
+            for (f, spans) in [(0usize, &read_spans), (1, &joint_spans)] {
+                // Each base's variable (or its joint set) sits at that variable's block.
+                let patch_with = |source: &[Array2<f64>], b: usize, h: &mut Array2<f64>| -> bool {
+                    let mut any = false;
+                    for r in 0..chunk.len() {
+                        if variables[read_of[index(r)]].0 == b {
+                            let t = position[index(r)];
+                            patch_row(h, r * length + t, source[b].row(t), spans[index(r)].as_ref(), false);
+                            any = true;
+                        }
+                    }
+                    any
+                };
+                let m_final = run(&vpd.m, &vpd.m_layout.reads, None, &|b, h| patch_with(m_source, b, h))?;
+                let e_final = run(&vpd.e, &vpd.layout.reads, Some(&masks), &|b, h| patch_with(e_source, b, h))?;
+                let e_patched = vpd.m.logits(&family, &e_final, length)?;
+                score(&mut families, f, &m_final, &e_patched)?;
+            }
+            for b in 0..blocks {
+                let m_final = run(&vpd.m, &vpd.m_layout.reads, None, &|at, h| {
+                    if at != b {
+                        return false;
+                    }
+                    for r in 0..chunk.len() {
+                        let t = position[index(r)];
+                        patch_row(h, r * length + t, m_source[b].row(t), active[b][r].as_ref(), true);
+                    }
+                    true
+                })?;
+                score(&mut families, 2 + b, &m_final, &e_logits)?;
+            }
+            let m_final = run(&vpd.m, &vpd.m_layout.reads, None, &|at, h| {
+                let mut any = false;
+                for r in 0..chunk.len() {
+                    if blocks_of[index(r)].contains(&at) {
+                        let t = position[index(r)];
+                        patch_row(h, r * length + t, m_source[at].row(t), active[at][r].as_ref(), true);
+                        any = true;
+                    }
+                }
+                any
+            })?;
+            score(&mut families, 2 + blocks, &m_final, &e_logits)?;
+        }
+        log::info!("battery: VPD one-position interchange on {} bases", chunk.len());
+    }
+    Ok(json!({"patches": families.summary(worst_of)}))
+}

@@ -8,7 +8,9 @@
 //! posterior mean is scored (with its `KL(q ‖ p)` and description reported). Without it `P` is the
 //! library's starting point, which computes `M` exactly: every divergence must vanish to rounding.
 //! `DECOMPOSITION` is VPD's exported decomposition (`bench/vpd_2951/vpd_export.py`), scored by
-//! `explanation_battery::{vpd_protocols, vpd_cancellation, vpd_interchange}`. An empty source range
+//! `explanation_battery::{vpd_protocols, vpd_cancellation, vpd_interchange_atomic, vpd_interchange}`
+//! (the interchange families at one position as asked of a library explanation, then at every
+//! position). An empty source range
 //! skips the interchange experiments.
 //!
 //! * Behaviour and VPD's protocols (`explanation_battery::protocols`), from the logits: every
@@ -265,6 +267,8 @@ fn main() -> Result<(), String> {
         report["cancellation"] = battery::vpd_cancellation(&vpd, bases, settings.batch_sequences, settings.seed)?;
         save(&report)?;
         if s_first < s_end {
+            report["interchange_one_position"] = battery::vpd_interchange_atomic(&vpd, export, bases, sources, settings.batch_sequences, settings.seed, &settings.worst_of)?;
+            save(&report)?;
             report["interchange"] = battery::vpd_interchange(&vpd, bases, sources, settings.batch_sequences, settings.seed, &settings.worst_of)?;
         }
         report["seconds"] = json!(started.elapsed().as_secs_f64());
