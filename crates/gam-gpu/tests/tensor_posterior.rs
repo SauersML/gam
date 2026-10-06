@@ -1,7 +1,8 @@
 //! The factorized Gaussian posterior's device operations (`Device::reparameterize`,
 //! `posterior_ivon`, `group_moments`, `group_divergence`): the host against the formulas entry by
 //! entry, and every accelerator that resolves (CUDA in f32 storage with float64 group sums, the
-//! Apple GPU in f32) against the host on the same inputs.
+//! Apple GPU in f32) against the host on the same inputs, with the groups held per row, per column
+//! and per entry (`GroupMap`).
 //!
 //! An accelerator's value is a chain of at most 24 roundings, each within 4 ulps of f32 (`exp`,
 //! `log`, `sqrt`, `cos` in the safe math modes; the rest exact to half an ulp), of terms no larger
@@ -9,7 +10,7 @@
 //! A group sum of `n` such terms adds `γ_n` of the summed magnitudes.
 
 use gam_gpu::GpuPolicy;
-use gam_gpu::tensor::{BF16_TERM_RESOLUTION, Device, Indices, PosteriorStep, Storage, Tensor, TermLayout, posterior_normal};
+use gam_gpu::tensor::{Device, GroupAxis, PosteriorStep, Storage, Tensor, posterior_normal};
 use ndarray::Array2;
 
 const U: f64 = 1.0 / 16_777_216.0;
@@ -26,9 +27,10 @@ fn matrix(rows: usize, cols: usize, seed: u64, scale: f64, shift: f64) -> Array2
     })
 }
 
-/// The test posterior: 6 × 40 entries in 9 groups (rows 0–2 by row, the rest by column pairs),
-/// one group removed (`s = −∞`, `μ = 0`), the `(key, stream)` of its sample, its gradient and
-/// Gauss–Newton factor, and its step.
+/// A test posterior in 8 groups laid out by `axis`: 6 × 40 entries by row (rows 0–5), 130 × 16 by
+/// column pairs (more rows than one column thread sums, `GroupMap`), or 6 × 40 by entry (rows 0–2 by
+/// row, the rest by blocks of 8 columns); group 4 removed (`s = −∞`, `μ = 0`). With the `(key,
+/// stream)` of its sample, its gradient and Gauss–Newton factor, and its step.
 struct Case {
     mean: Array2<f64>,
     log_sd: Array2<f64>,
@@ -41,9 +43,17 @@ struct Case {
     step: PosteriorStep,
 }
 
-fn case() -> Case {
-    let (rows, cols) = (6, 40);
-    let groups: Vec<u32> = (0..rows * cols).map(|i| if i / cols < 3 { (i / cols) as u32 } else { 3 + ((i % cols) / 8) as u32 }).collect();
+const AXES: [GroupAxis; 3] = [GroupAxis::Rows, GroupAxis::Columns, GroupAxis::Entries];
+
+fn case(axis: GroupAxis) -> Case {
+    let (rows, cols) = if axis == GroupAxis::Columns { (130, 16) } else { (6, 40) };
+    let group = |r: usize, c: usize| match axis {
+        GroupAxis::Rows => r,
+        GroupAxis::Columns => c / 2,
+        GroupAxis::Entries if r < 3 => r,
+        GroupAxis::Entries => 3 + c / 8,
+    };
+    let groups: Vec<u32> = (0..rows * cols).map(|i| group(i / cols, i % cols) as u32).collect();
     let mut mean = matrix(rows, cols, 1, 0.5, 0.0);
     let mut log_sd = matrix(rows, cols, 2, 0.5, -3.0);
     for (i, g) in groups.iter().enumerate() {
@@ -111,7 +121,7 @@ fn run(fit: &Device, wide: &Device, c: &Case) -> (Array2<f64>, Array2<f64>, Arra
     let up = |d: &Device, m: &Array2<f64>| d.upload(m.view()).unwrap();
     let (mut mean, mut log_sd) = (up(fit, &c.mean), up(fit, &c.log_sd));
     let mut moments: Vec<Tensor> = c.moments.iter().map(|m| up(fit, m)).collect();
-    let groups: Indices = fit.upload_indices(&c.groups).unwrap();
+    let groups = fit.group_map(&c.groups, c.mean.dim()).unwrap();
     let mut theta = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
     fit.reparameterize(&mut theta, (&mean, &log_sd), c.sample).unwrap();
     let mut sums = wide.zeros(c.count, 3).unwrap();
@@ -158,11 +168,26 @@ fn draws_are_standard_normal() {
 }
 
 #[test]
-fn the_host_steps_the_posterior_by_its_formulas() {
-    let c = case();
+fn group_ids_are_held_per_row_per_column_or_per_entry() {
     let host = Device::host();
-    let (theta, mean, log_sd, moments, before, after, divergence) = run(&host, &host, &c);
-    let (t, m, s, mo, b, a) = reference(&c);
+    for axis in AXES {
+        let c = case(axis);
+        assert_eq!(host.group_map(&c.groups, c.mean.dim()).unwrap().axis(), axis);
+    }
+    assert!(host.group_map(&[0, 1, 2], (2, 2)).is_err(), "ids for every entry");
+}
+
+#[test]
+fn the_host_steps_the_posterior_by_its_formulas() {
+    for axis in AXES {
+        host_formulas(&case(axis));
+    }
+}
+
+fn host_formulas(c: &Case) {
+    let host = Device::host();
+    let (theta, mean, log_sd, moments, before, after, divergence) = run(&host, &host, c);
+    let (t, m, s, mo, b, a) = reference(c);
     let exact = 1e-15;
     close("sample", &theta, &t, exact);
     close("mean", &mean, &m, exact);
@@ -177,17 +202,23 @@ fn the_host_steps_the_posterior_by_its_formulas() {
         assert!((divergence[(g, 0)] - expected).abs() <= 1e-12 * expected.abs().max(1.0), "divergence {g}");
     }
     assert_eq!(b[4][0], 0.0, "the removed group is empty");
-    assert!(theta.indexed_iter().all(|((r, col), v)| c.groups[r * 40 + col] != 4 || *v == 0.0), "a removed entry samples zero");
+    assert!(theta.iter().zip(&c.groups).all(|(v, g)| *g != 4 || *v == 0.0), "a removed entry samples zero");
 }
 
 fn against_host(fit: &Device, wide: &Device) {
-    let c = case();
+    for axis in AXES {
+        against_host_on(fit, wide, &case(axis));
+    }
+}
+
+fn against_host_on(fit: &Device, wide: &Device, c: &Case) {
     let host = Device::host();
-    let (theta, mean, log_sd, moments, before, after, divergence) = run(fit, wide, &c);
-    let (t, m, s, mo, b, a, d) = run(&host, &host, &c);
-    // A group sums at most 40 entries; the step reads its variance (such a sum over its count),
+    let (theta, mean, log_sd, moments, before, after, divergence) = run(fit, wide, c);
+    let (t, m, s, mo, b, a, d) = run(&host, &host, c);
+    // A group sums at most `n` entries; the step reads its variance (such a sum over its count),
     // and a second moment squares a gradient that carries the variance's error.
-    let sum_band = CHAIN + 40.0 * U / (1.0 - 40.0 * U);
+    let n = (0..c.count as u32).map(|g| c.groups.iter().filter(|h| **h == g).count()).max().unwrap() as f64;
+    let sum_band = CHAIN + n * U / (1.0 - n * U);
     close("sample", &theta, &t, CHAIN);
     close("mean", &mean, &m, 2.0 * sum_band);
     close("log sd", &log_sd, &s, 2.0 * sum_band);
@@ -222,7 +253,7 @@ fn cuda_matches_the_host() {
 fn a_bfloat16_sample_is_the_f32_sample_rounded() {
     let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
     let fit = wide.with_storage(Storage::F32).expect("CUDA holds f32");
-    let c = case();
+    let c = case(GroupAxis::Entries);
     let (mean, log_sd) = (fit.upload(c.mean.view()).unwrap(), fit.upload(c.log_sd.view()).unwrap());
     let mut single = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
     fit.reparameterize(&mut single, (&mean, &log_sd), c.sample).unwrap();
@@ -247,20 +278,25 @@ fn cuda_bfloat16_momentum_is_the_f32_step_rounded() {
     let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
     let fit = wide.with_storage(Storage::F32).expect("CUDA holds f32");
     let half = wide.with_storage(Storage::Bf16).expect("CUDA holds bfloat16");
-    let mut c = case();
+    for axis in AXES {
+        bfloat16_momentum(&fit, &half, &wide, case(axis));
+    }
+}
+
+fn bfloat16_momentum(fit: &Device, half: &Device, wide: &Device, mut c: Case) {
     // Inputs a bfloat16 holds exactly, so both steps start from the same values.
     for m in &mut c.moments {
         m.mapv_inplace(bf16);
     }
     c.gradient.mapv_inplace(bf16);
     c.factor.mapv_inplace(bf16);
-    let (theta, mean, log_sd, moments, _, after, _) = run(&fit, &wide, &c);
+    let (theta, mean, log_sd, moments, _, after, _) = run(fit, wide, &c);
     let up = |d: &Device, m: &Array2<f64>| d.upload(m.view()).expect("upload");
     let down = |t: &Tensor| fit.download(t).expect("download");
-    for gradient_storage in [&fit, &half] {
-        let (mut m, mut s) = (up(&fit, &c.mean), up(&fit, &c.log_sd));
-        let (mut momentum, mut curvature) = (up(&half, &c.moments[0]), up(&fit, &c.moments[1]));
-        let groups = fit.upload_indices(&c.groups).expect("groups");
+    for gradient_storage in [fit, half] {
+        let (mut m, mut s) = (up(fit, &c.mean), up(fit, &c.log_sd));
+        let (mut momentum, mut curvature) = (up(half, &c.moments[0]), up(fit, &c.moments[1]));
+        let groups = fit.group_map(&c.groups, c.mean.dim()).expect("groups");
         let mut sample = half.zeros(c.mean.nrows(), c.mean.ncols()).expect("sample");
         fit.reparameterize(&mut sample, (&m, &s), c.sample).expect("bfloat16 sample");
         let mut sums = wide.zeros(c.count, 3).expect("sums");
@@ -280,92 +316,15 @@ fn cuda_bfloat16_momentum_is_the_f32_step_rounded() {
     }
 }
 
-/// A posterior whose rows need 1, 2 and 3 bfloat16 terms (row r has `σ = 2^-(8r+2) |μ|`, so
-/// `u_{r+1} |μ| ≤ σ < u_r |μ|` with `u = 2^-8, 2^-16, 2^-24`), and a removed row (`μ = 0`,
-/// `s = −∞`). The means are bfloat16 values.
-fn term_case() -> (Array2<f64>, Array2<f64>) {
-    let mean = matrix(4, 24, 11, 1.0, 0.0).mapv(|m| bf16(if m.abs() < 0.05 { 0.5 } else { m }));
-    let mut log_sd = Array2::zeros(mean.dim());
-    for ((r, c), s) in log_sd.indexed_iter_mut() {
-        *s = if r == 3 { f64::NEG_INFINITY } else { (mean[(r, c)].abs() * 2f64.powi(-(8 * r as i32 + 2))).ln() };
-    }
-    let mean = Array2::from_shape_fn(mean.dim(), |(r, c)| if r == 3 { 0.0 } else { mean[(r, c)] });
-    (mean, log_sd)
-}
-
-/// The sum of a sample's terms, per entry, from `Separate` tensors.
-fn term_sum(d: &Device, terms: &[Tensor]) -> Array2<f64> {
-    terms.iter().map(|t| d.download(t).unwrap()).fold(None, |acc: Option<Array2<f64>>, t| Some(acc.map_or(t.clone(), |a| a + t))).unwrap()
-}
-
-/// Checks a device's terms: their count, each term a bfloat16 value, the stacked layout the
-/// separate one side by side, and the sum within `u_K |θ|` of the f32 sample `theta`.
-fn check_terms(d: &Device, (m, s): (&Array2<f64>, &Array2<f64>), theta: &Array2<f64>, rows_need: &[usize]) {
-    for (r, need) in rows_need.iter().enumerate() {
-        let row = |a: &Array2<f64>| d.upload(a.slice(ndarray::s![r..r + 1, ..])).unwrap();
-        assert_eq!(d.term_count((&row(m), &row(s))).unwrap(), *need, "row {r}");
-    }
-    let (mean, log_sd) = (&d.upload(m.view()).unwrap(), &d.upload(s.view()).unwrap());
-    assert_eq!(d.term_count((mean, log_sd)).unwrap(), 3);
-    for count in 1..=3 {
-        let separate = d.sample_terms((mean, log_sd), (7, 3), count, TermLayout::Separate).unwrap();
-        let stacked = d.sample_terms((mean, log_sd), (7, 3), count, TermLayout::Stacked).unwrap();
-        assert_eq!((separate.len(), stacked.len()), (count, 1));
-        let side = d.download(&stacked[0]).unwrap();
-        let cols = theta.ncols();
-        for (k, term) in separate.iter().enumerate() {
-            let values = d.download(term).unwrap();
-            assert!(values.iter().all(|v| bf16(*v) == *v), "term {k} holds bfloat16 values");
-            assert_eq!(side.slice(ndarray::s![.., k * cols..(k + 1) * cols]), values, "stacked term {k}");
-        }
-        let sum = term_sum(d, &separate);
-        let u = BF16_TERM_RESOLUTION[count - 1];
-        for ((at, a), b) in sum.indexed_iter().zip(theta.iter()) {
-            assert!((a - b).abs() <= u * b.abs(), "{count} terms at {at:?}: {a} against {b}");
-        }
-    }
-}
-
-#[test]
-fn the_host_writes_a_sample_as_bfloat16_terms_that_keep_its_noise() {
-    let host = Device::host();
-    let (m, s) = term_case();
-    let theta = Array2::from_shape_fn(m.dim(), |(r, c)| {
-        let i = (r * m.ncols() + c) as u64;
-        f64::from((m[(r, c)] + s[(r, c)].exp() * f64::from(posterior_normal(7, 3, i))) as f32)
-    });
-    check_terms(&host, (&m, &s), &theta, &[1, 2, 3, 1]);
-    // One bfloat16 loses the noise of a row that needs three: noise below half a bfloat16 step of
-    // a bfloat16 mean rounds back to the mean, while three terms keep it.
-    let (mean, log_sd) = (host.upload(m.view()).unwrap(), host.upload(s.view()).unwrap());
-    let one = host.download(&host.sample_terms((&mean, &log_sd), (7, 3), 1, TermLayout::Separate).unwrap()[0]).unwrap();
-    assert!(one.row(2).iter().zip(m.row(2)).all(|(t, mu)| t == mu), "the noise vanishes in one bfloat16");
-    let three = term_sum(&host, &host.sample_terms((&mean, &log_sd), (7, 3), 3, TermLayout::Separate).unwrap());
-    // (An f32 sample keeps noise above half an f32 step, 2^-24 |μ|: all but a draw |ε| < 2^-6.)
-    let kept = three.row(2).iter().zip(m.row(2)).filter(|(t, mu)| t != mu).count();
-    assert!(kept >= 20, "three terms keep the noise of {kept} of 24 entries");
-}
-
-#[test]
-fn cuda_bfloat16_terms_match_its_f32_sample() {
-    let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
-    let fit = wide.with_storage(Storage::F32).expect("CUDA holds f32");
-    let (m, s) = term_case();
-    let (mean, log_sd) = (fit.upload(m.view()).unwrap(), fit.upload(s.view()).unwrap());
-    let mut single = fit.zeros(m.nrows(), m.ncols()).unwrap();
-    fit.reparameterize(&mut single, (&mean, &log_sd), (7, 3)).unwrap();
-    check_terms(&fit, (&m, &s), &fit.download(&single).unwrap(), &[1, 2, 3, 1]);
-}
-
 /// `group_curvature` and `group_code_length` of the case on `fit` (sums on `wide`): the curvature
 /// rows of the case's factor at its posterior, and in row 1 of 2 the code length of its groups
 /// (groups 4, removed, and 6 out of the explanation; each group's starting variance `2^-k` times
 /// its variance on the host, so that the scale's exponent is the integer `k` and not near a
 /// rounding boundary).
 fn removal_sums(fit: &Device, wide: &Device, initial: &[f64]) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
-    let c = case();
+    let c = case(GroupAxis::Entries);
     let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
-    let groups = fit.upload_indices(&c.groups).unwrap();
+    let groups = fit.group_map(&c.groups, c.mean.dim()).unwrap();
     let mut curvature = wide.zeros(c.count, 3).unwrap();
     fit.group_curvature((&up(&c.factor), &up(&c.mean), &up(&c.log_sd)), &groups, &mut curvature).unwrap();
     let mut moments = wide.zeros(c.count, 3).unwrap();
@@ -382,7 +341,7 @@ fn removal_sums(fit: &Device, wide: &Device, initial: &[f64]) -> (Array2<f64>, A
 
 fn removal_sums_against_host(fit: &Device, wide: &Device) {
     let host = Device::host();
-    let count = case().count;
+    let count = case(GroupAxis::Entries).count;
     let (_, _, variance) = removal_sums(&host, &host, &vec![1.0; count]);
     let initial: Vec<f64> = (0..count).map(|g| if variance[(g, 0)] > 0.0 { variance[(g, 0)] * 2f64.powi(-(g as i32 % 5) + 2) } else { 1.0 }).collect();
     let (curvature, lengths, _) = removal_sums(fit, wide, &initial);
@@ -402,7 +361,7 @@ fn removal_sums_against_host(fit: &Device, wide: &Device) {
 #[test]
 fn removal_sums_on_the_host_match_their_formulas() {
     let host = Device::host();
-    let c = case();
+    let c = case(GroupAxis::Entries);
     let (_, _, variance) = removal_sums(&host, &host, &vec![1.0; c.count]);
     let initial: Vec<f64> = (0..c.count).map(|g| if variance[(g, 0)] > 0.0 { variance[(g, 0)] * 2f64.powi(3) } else { 1.0 }).collect();
     let (curvature, lengths, _) = removal_sums(&host, &host, &initial);
@@ -418,7 +377,7 @@ fn removal_sums_on_the_host_match_their_formulas() {
     // Every scale is 2^-3 of its start: the exponent -3, zigzag 5, plus one 6, an Elias delta
     // codeword of 2 + 2 x 1 + 1 = 5 bits.
     let mut moments = host.zeros(c.count, 3).unwrap();
-    host.group_moments((&host.upload(c.mean.view()).unwrap(), &host.upload(c.log_sd.view()).unwrap()), &host.upload_indices(&c.groups).unwrap(), &mut moments).unwrap();
+    host.group_moments((&host.upload(c.mean.view()).unwrap(), &host.upload(c.log_sd.view()).unwrap()), &host.group_map(&c.groups, c.mean.dim()).unwrap(), &mut moments).unwrap();
     let (mut v, mut d) = (host.zeros(c.count, 1).unwrap(), host.zeros(c.count, 1).unwrap());
     host.group_divergence(&mut moments, &mut v, &mut d).unwrap();
     let d = host.download(&d).unwrap();

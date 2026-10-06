@@ -345,6 +345,79 @@ pub struct Indices {
     data: IndexData,
 }
 
+/// Which of an operator's coordinates its prior-group ids index ([`GroupMap`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupAxis {
+    /// One id per row: every entry of a row is in its row's group.
+    Rows,
+    /// One id per column.
+    Columns,
+    /// One id per entry, row-major.
+    Entries,
+}
+
+/// An operator's prior groups on the device ([`Device::group_map`]): its ids and the axis they
+/// index. A row or column layout holds one id per row or column instead of four bytes per entry,
+/// and a column layout's group sums are reduced down each column (a column's entries are a row
+/// apart, so a SIMD group's lanes hold different groups).
+pub struct GroupMap {
+    ids: Indices,
+    axis: GroupAxis,
+    rows: usize,
+    cols: usize,
+}
+
+impl GroupMap {
+    /// The axis the ids index.
+    #[must_use]
+    pub fn axis(&self) -> GroupAxis {
+        self.axis
+    }
+
+    /// The operator's shape.
+    #[must_use]
+    pub fn dim(&self) -> (usize, usize) {
+        (self.rows, self.cols)
+    }
+
+    /// Entry `i`'s (row-major) group in `ids`, the map's ids on the host.
+    fn group(&self, ids: &[u32], i: usize) -> u32 {
+        match self.axis {
+            GroupAxis::Rows => ids[i / self.cols],
+            GroupAxis::Columns => ids[i % self.cols],
+            GroupAxis::Entries => ids[i],
+        }
+    }
+
+    /// The axis as the kernels' code: 0 rows, 1 columns, 2 entries.
+    fn code(&self) -> u32 {
+        match self.axis {
+            GroupAxis::Rows => 0,
+            GroupAxis::Columns => 1,
+            GroupAxis::Entries => 2,
+        }
+    }
+
+    /// Row chunks of a column reduction: each thread sums a column over about 64 rows (one
+    /// atomic per column per chunk); one chunk otherwise.
+    fn chunks(&self) -> usize {
+        if self.axis == GroupAxis::Columns { self.rows.div_ceil(64).max(1) } else { 1 }
+    }
+
+    /// The threads a reduction over the map runs: one per column and chunk, or one per entry.
+    fn threads(&self) -> usize {
+        if self.axis == GroupAxis::Columns { self.cols * self.chunks() } else { self.rows * self.cols }
+    }
+
+    /// `t`'s shape is the map's.
+    fn check(&self, t: &Tensor, what: &str) -> Result<(), GpuError> {
+        if t.dim() != (self.rows, self.cols) {
+            return Err(shape(format!("{what}: a {:?} tensor with a {:?} group map", t.dim(), (self.rows, self.cols))));
+        }
+        Ok(())
+    }
+}
+
 enum IndexData {
     Host(Vec<u32>),
     #[cfg(target_os = "linux")]
@@ -709,6 +782,25 @@ impl Device {
             Backend::Metal(engine) => Data::Metal(engine.stream.upload(&values.iter().map(|v| *v as f32).collect::<Vec<f32>>())?),
         };
         Ok(Tensor { rows, cols, data })
+    }
+
+    /// An operator's prior-group ids `ids` (one per entry, row-major, of a `rows × cols` operator)
+    /// held compactly ([`GroupMap`]): one id per row where every row is one group, else one per
+    /// column where every column is one group, else one per entry.
+    pub fn group_map(&self, ids: &[u32], (rows, cols): (usize, usize)) -> Result<GroupMap, GpuError> {
+        if ids.len() != rows * cols {
+            return Err(shape(format!("{} group ids for a {rows}x{cols} operator", ids.len())));
+        }
+        let by_rows = cols > 0 && ids.chunks(cols).all(|row| row.iter().all(|g| *g == row[0]));
+        let by_columns = cols > 0 && rows > 0 && ids.chunks(cols).all(|row| row == &ids[..cols]);
+        let (axis, compact): (GroupAxis, Vec<u32>) = if by_rows {
+            (GroupAxis::Rows, ids.chunks(cols).map(|row| row[0]).collect())
+        } else if by_columns {
+            (GroupAxis::Columns, ids[..cols].to_vec())
+        } else {
+            (GroupAxis::Entries, ids.to_vec())
+        };
+        Ok(GroupMap { ids: self.upload_indices(&compact)?, axis, rows, cols })
     }
 
     pub fn upload_indices(&self, values: &[u32]) -> Result<Indices, GpuError> {
@@ -2019,69 +2111,6 @@ impl Device {
         }
     }
 
-    /// How many bfloat16 terms resolve the posterior's noise: the least `K` in `1..=3` with
-    /// `u_K |μ_j| ≤ σ_j` for every entry `j` (`u_K` = [`BF16_TERM_RESOLUTION`]`[K − 1]`, the
-    /// relative error of a sum of `K` successive bfloat16 roundings), so that the sample `θ = μ +
-    /// σ ε` written as `K` terms ([`Device::sample_terms`]) keeps every entry's noise; 3 terms
-    /// resolve an f32 sample. A removed entry (`μ = 0`, `s = −∞`) needs one.
-    pub fn term_count(&self, (mean, log_sd): (&Tensor, &Tensor)) -> Result<usize, GpuError> {
-        same(mean, log_sd, "term count")?;
-        match &*self.backend {
-            Backend::Host => Ok(host(mean)?.iter().zip(host(log_sd)?).map(|(m, s)| terms_needed(*m, *s)).fold(1, usize::max)),
-            #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.term_count((mean, log_sd)),
-            #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the Apple GPU holds no bfloat16 terms".to_string() }),
-        }
-    }
-
-    /// The weight sample `θ = μ + exp(s) ε` (`ε` = [`posterior_normal`]`(key, stream, i)`, as
-    /// [`Device::reparameterize`] draws it), formed in f32 and written as `count` bfloat16 terms
-    /// `T_1, …, T_count`, each the nearest bfloat16 of what the earlier ones leave of `θ`, so
-    /// `|θ − Σ T_k| ≤ u_count |θ|` ([`BF16_TERM_RESOLUTION`]): a product of `x` with the operator
-    /// reads every term (`Σ_k x T_kᵀ`) and the sample keeps the noise one bfloat16 would round
-    /// away. `layout` places them: [`TermLayout::Stacked`] one `rows × (count · cols)` tensor
-    /// `[T_1 | … | T_count]` (the terms side by side along the reduction axis, for one product
-    /// against `[x | … | x]`), [`TermLayout::Separate`] `count` tensors of `rows × cols`. CUDA
-    /// writes bfloat16 tensors from f32 masters; the host writes float64 tensors holding the same
-    /// bfloat16 values (its reference). `count` is in `1..=3`.
-    pub fn sample_terms(&self, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64), count: usize, layout: TermLayout) -> Result<Vec<Tensor>, GpuError> {
-        same(mean, log_sd, "sampled terms")?;
-        if !(1..=3).contains(&count) {
-            return Err(shape(format!("{count} bfloat16 terms, not 1 to 3")));
-        }
-        let (rows, cols) = mean.dim();
-        match &*self.backend {
-            Backend::Host => {
-                let (mv, sv) = (host(mean)?, host(log_sd)?);
-                let mut terms = vec![vec![0.0; rows * cols]; count];
-                for i in 0..rows * cols {
-                    let theta = (mv[i] + sv[i].exp() * f64::from(posterior_normal(key, stream, i as u64))) as f32;
-                    for (k, value) in bf16_terms(theta, count).into_iter().enumerate() {
-                        terms[k][i] = value;
-                    }
-                }
-                Ok(match layout {
-                    TermLayout::Separate => terms.into_iter().map(|values| Tensor { rows, cols, data: Data::Host(values) }).collect(),
-                    TermLayout::Stacked => {
-                        let mut stacked = vec![0.0; rows * cols * count];
-                        for r in 0..rows {
-                            for (k, values) in terms.iter().enumerate() {
-                                let at = r * cols * count + k * cols;
-                                stacked[at..at + cols].copy_from_slice(&values[r * cols..(r + 1) * cols]);
-                            }
-                        }
-                        vec![Tensor { rows, cols: cols * count, data: Data::Host(stacked) }]
-                    }
-                })
-            }
-            #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.sample_terms((mean, log_sd), (key, stream), count, layout),
-            #[cfg(target_os = "macos")]
-            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the Apple GPU holds no bfloat16 terms".to_string() }),
-        }
-    }
-
     /// One step of the improved variational online Newton method (IVON; Shen et al., ICML 2024,
     /// arXiv 2402.17641, Algorithm 1) on the factorized Gaussian posterior `N(μ, exp(s)²)`, with the
     /// data term's curvature taken in the Gauss–Newton approximation, and each entry's new
@@ -2120,17 +2149,18 @@ impl Device {
         (mean, log_sd): (&mut Tensor, &mut Tensor),
         [momentum, hessian]: [&mut Tensor; 2],
         (gradient, factor): (&Tensor, &Tensor),
-        (groups, variance): (&Indices, &Tensor),
+        (groups, variance): (&GroupMap, &Tensor),
         sums: &mut Tensor,
         step: &PosteriorStep,
     ) -> Result<(), GpuError> {
+        groups.check(mean, "posterior")?;
         same(mean, gradient, "posterior gradient")?;
         same(mean, factor, "posterior Gauss–Newton factor")?;
         same(mean, log_sd, "posterior log standard deviation")?;
         same(mean, momentum, "posterior momentum")?;
         same(mean, hessian, "posterior curvature")?;
-        if groups.len != mean.len() || variance.cols != 1 || sums.dim() != (variance.rows, 3) {
-            return Err(shape(format!("{} group ids, a {:?} variance and {:?} sums for {} entries", groups.len, variance.dim(), sums.dim(), mean.len())));
+        if variance.cols != 1 || sums.dim() != (variance.rows, 3) {
+            return Err(shape(format!("a {:?} variance and {:?} sums for {} entries", variance.dim(), sums.dim(), mean.len())));
         }
         if !(step.tokens.is_finite() && step.tokens > 0.0) {
             return Err(shape(format!("{} tokens", step.tokens)));
@@ -2139,7 +2169,7 @@ impl Device {
         match &*self.backend {
             Backend::Host => {
                 let (ms, hs) = (host_mut(momentum)?, host_mut(hessian)?);
-                let (gv, uv, ids, var) = (host(gradient)?, host(factor)?, host_indices(groups)?, host(variance)?);
+                let (gv, uv, ids, var) = (host(gradient)?, host(factor)?, host_indices(&groups.ids)?, host(variance)?);
                 let (means, log_sds, totals) = (host_mut(mean)?, host_mut(log_sd)?, host_mut(sums)?);
                 if let Some(id) = ids.iter().find(|id| **id as usize >= var.len()) {
                     return Err(shape(format!("group {id} of {}", var.len())));
@@ -2149,7 +2179,7 @@ impl Device {
                     if log_sds[i] == f64::NEG_INFINITY {
                         continue;
                     }
-                    let g = ids[i] as usize;
+                    let g = groups.group(ids, i) as usize;
                     let delta = 1.0 / (step.tokens * var[g]);
                     let (mu, sd, data) = (means[i], log_sds[i].exp(), step.gradient_scale * gv[i]);
                     let curvature = step.factor_scale * uv[i] * uv[i];
@@ -2173,17 +2203,18 @@ impl Device {
 
     /// Each entry's `(1, μ² + exp(2s), 2s)` added into its group's row of `sums` (groups × 3), as
     /// [`Device::posterior_ivon`] adds them after a step; a removed entry (`s = −∞`) adds nothing.
-    pub fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
+    pub fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &GroupMap, sums: &mut Tensor) -> Result<(), GpuError> {
+        groups.check(mean, "group moments")?;
         same(mean, log_sd, "group moments")?;
-        if groups.len != mean.len() || sums.cols != 3 {
-            return Err(shape(format!("{} group ids and {:?} sums for {} entries", groups.len, sums.dim(), mean.len())));
+        if sums.cols != 3 {
+            return Err(shape(format!("{:?} sums for {} entries", sums.dim(), mean.len())));
         }
         match &*self.backend {
             Backend::Host => {
-                let (means, log_sds, ids) = (host(mean)?, host(log_sd)?, host_indices(groups)?);
+                let (means, log_sds, ids) = (host(mean)?, host(log_sd)?, host_indices(&groups.ids)?);
                 let totals = host_mut(sums)?;
                 for i in 0..means.len() {
-                    let g = ids[i] as usize;
+                    let g = groups.group(ids, i) as usize;
                     if g * 3 >= totals.len() {
                         return Err(shape(format!("group {g} of {}", totals.len() / 3)));
                     }
@@ -2207,18 +2238,19 @@ impl Device {
     /// group `u_G · μ_G` and `Σ u_j² σ_j²` of one draw `u` of the Gauss–Newton factor at the
     /// posterior `N(μ, exp(s)²)`, the terms of a removal's curvature; a removed entry (`s = −∞`)
     /// adds nothing. `factor` is in the posterior's storage, or bfloat16 with f32 masters on CUDA.
-    pub fn group_curvature(&self, (factor, mean, log_sd): (&Tensor, &Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
+    pub fn group_curvature(&self, (factor, mean, log_sd): (&Tensor, &Tensor, &Tensor), groups: &GroupMap, sums: &mut Tensor) -> Result<(), GpuError> {
+        groups.check(mean, "group curvature")?;
         same(mean, log_sd, "group curvature")?;
         same(mean, factor, "group curvature factor")?;
-        if groups.len != mean.len() || sums.cols != 3 {
-            return Err(shape(format!("{} group ids and {:?} sums for {} entries", groups.len, sums.dim(), mean.len())));
+        if sums.cols != 3 {
+            return Err(shape(format!("{:?} sums for {} entries", sums.dim(), mean.len())));
         }
         match &*self.backend {
             Backend::Host => {
-                let (us, means, log_sds, ids) = (host(factor)?, host(mean)?, host(log_sd)?, host_indices(groups)?);
+                let (us, means, log_sds, ids) = (host(factor)?, host(mean)?, host(log_sd)?, host_indices(&groups.ids)?);
                 let totals = host_mut(sums)?;
                 for i in 0..means.len() {
-                    let g = ids[i] as usize;
+                    let g = groups.group(ids, i) as usize;
                     if g * 3 >= totals.len() {
                         return Err(shape(format!("group {g} of {}", totals.len() / 3)));
                     }
@@ -2943,39 +2975,6 @@ fn philox(key: u64, stream: u64, index: u64) -> [u32; 4] {
         c = [((p1 >> 32) as u32) ^ c[1] ^ k[0], p1 as u32, ((p0 >> 32) as u32) ^ c[3] ^ k[1], p0 as u32];
     }
     c
-}
-
-/// Where [`Device::sample_terms`] places a sample's bfloat16 terms.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TermLayout {
-    /// One `rows × (count · cols)` tensor, the terms side by side along the reduction axis.
-    Stacked,
-    /// One `rows × cols` tensor per term.
-    Separate,
-}
-
-/// The relative error `u_K` of a value written as `K` successive bfloat16 roundings (each the
-/// nearest bfloat16 of what the earlier ones leave): bfloat16's unit roundoff `2^-8` per term,
-/// `2^-8`, `2^-16`, `2^-24` (the last f32's own).
-pub const BF16_TERM_RESOLUTION: [f64; 3] = [1.0 / 256.0, 1.0 / 65_536.0, 1.0 / 16_777_216.0];
-
-/// The least number of bfloat16 terms with `u_K |μ| ≤ σ` (`σ = exp(s)`), 3 at most.
-fn terms_needed(mean: f64, log_sd: f64) -> usize {
-    let sd = log_sd.exp();
-    BF16_TERM_RESOLUTION.iter().position(|u| u * mean.abs() <= sd).map_or(3, |k| k + 1)
-}
-
-/// `x` as `count` bfloat16 terms, each the nearest bfloat16 (ties to even) of what the earlier
-/// ones leave, in f32, as float64 values.
-fn bf16_terms(x: f32, count: usize) -> Vec<f64> {
-    let mut rest = x;
-    (0..count)
-        .map(|_| {
-            let term = f32::from_bits(bf16_bits(rest) << 16);
-            rest -= term;
-            f64::from(term)
-        })
-        .collect()
 }
 
 /// The standard normal draw `index` of `(key, stream)`: Box–Muller in f32 on the first two words of
@@ -3732,34 +3731,6 @@ extern "C" __global__ void reparameterize_bf16(u64 n, u64 key, u64 stream, const
     GRID_STRIDE(i, n) theta[i] = bf16_round(mean[i] + expf(log_sd[i]) * posterior_normal(key, stream, i));
 }
 
-// The f32 sample as `count` bfloat16 terms, each the nearest bfloat16 of what the earlier ones
-// leave (`Device::sample_terms`). Term k of entry i (row r, column c) goes to
-// `out_k[r * row + k * along + c]`: one stacked tensor (`row = count * cols`, `along = cols`, every
-// `out_k` the same buffer) or `count` separate ones (`row = cols`, `along = 0`).
-extern "C" __global__ void sample_terms(u64 n, u64 key, u64 stream, unsigned int count, u64 cols, u64 row, u64 along,
-    const float* mean, const float* log_sd, unsigned short* out0, unsigned short* out1, unsigned short* out2) {
-    GRID_STRIDE(i, n) {
-        float rest = mean[i] + expf(log_sd[i]) * posterior_normal(key, stream, i);
-        u64 at = (i / cols) * row + (i % cols);
-        unsigned short* outs[3] = {out0, out1, out2};
-        for (unsigned int k = 0; k < count; ++k) {
-            unsigned short t = bf16_round(rest);
-            rest -= __uint_as_float(((unsigned int)t) << 16);
-            outs[k][at + k * along] = t;
-        }
-    }
-}
-
-// The bfloat16 terms the noise needs (`Device::term_count`): over the entries, the largest least
-// K with u_K |mu| <= sigma (u_K = 2^-8, 2^-16; 3 otherwise), into `needed`.
-extern "C" __global__ void term_count(u64 n, const float* mean, const float* log_sd, unsigned int* needed) {
-    GRID_STRIDE(i, n) {
-        float m = fabsf(mean[i]), sd = expf(log_sd[i]);
-        unsigned int k = sd >= ldexpf(m, -8) ? 1u : (sd >= ldexpf(m, -16) ? 2u : 3u);
-        atomicMax(needed, k);
-    }
-}
-
 // Adds a live entry's (1, μ² + σ², 2s) to its group's row of `sums`: once per warp when every live
 // lane's group is lane 0's (a row-major run of one group), else per lane. Every lane of the warp
 // calls it.
@@ -3787,39 +3758,76 @@ __device__ void group_add(double* sums, unsigned int g, bool live, double a, dou
 // they are made). Blocks stride whole, so every lane of a warp runs every iteration (`group_add`).
 #define WARP_STRIDE(i, n) for (u64 base_ = (u64)blockIdx.x * blockDim.x, i = base_ + threadIdx.x; base_ < (n); base_ += (u64)gridDim.x * blockDim.x, i = base_ + threadIdx.x)
 
-// Entries (the posterior, the momentum, the curvature, the gradient) in T; group sums in double.
-template <typename T>
-__device__ void posterior_ivon_body(u64 n, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1,
-    const T* gradient, const T* factor, const unsigned int* groups, const double* variance, T* mean, T* log_sd, T* momentum, T* curvature, double* sums) {
-    const T b1 = (T)beta1, o1 = (T)(1.0 - beta1), o2 = (T)(1.0 - beta2), k1 = (T)(1.0 / c1), weight = (T)scale, alpha = (T)rate, square = (T)fscale;
-    WARP_STRIDE(i, n) {
-        unsigned int g = i < n ? groups[i] : 0u;
-        bool live = i < n && g < count && log_sd[i] != (T)NEG_INF;
-        double a = 0.0, b = 0.0, c = 0.0;
-        if (live) {
-            T delta = (T)(1.0 / (tokens * variance[g])), mu = mean[i], sd = entry_exp(log_sd[i]);
-            T gi = weight * gradient[i], ui = factor[i];
-            T m1 = b1 * momentum[i] + o1 * gi;
-            T h = curvature[i], d = square * ui * ui - h;
-            T h1 = h + o2 * d + (T)0.5 * o2 * o2 * d * d / (h + delta);
-            T move = alpha * (m1 * k1 + delta * mu) / (h1 + delta);
-            mu -= move > sd ? sd : (move < -sd ? -sd : move);
-            T s = (T)(-0.5 * log(tokens * ((double)h1 + (double)delta)));
-            momentum[i] = m1; curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
-            a = 1.0; b = (double)mu * (double)mu + exp(2.0 * (double)s); c = 2.0 * (double)s;
+// Entry i's group under an operator's group map (`GroupMap`): its row's id (axis 0), its column's
+// (axis 1) or its own (axis 2).
+__device__ unsigned int group_of(const unsigned int* ids, unsigned int axis, u64 cols, u64 i) {
+    return axis == 0u ? ids[i / cols] : (axis == 1u ? ids[i % cols] : ids[i]);
+}
+
+// Runs `body(i, g, a, b, c)` on every entry i of an `n`-entry operator of `cols` columns whose group
+// g is below `count`, and adds each entry it returns true for, (a, b, c), into its group's row of
+// `sums`. Row and entry maps: entries in row-major order (WARP_STRIDE), a warp's run of one group
+// added in one atomic (`group_add`). Column maps: thread t sums column t % cols over the rows
+// t / cols, t / cols + chunks, ... in registers and adds once (a column's entries are a row apart,
+// so a warp's lanes hold different groups and adding per entry would take three atomics each).
+template <typename F>
+__device__ void group_reduce(u64 n, u64 cols, unsigned int axis, u64 chunks, const unsigned int* ids, u64 count, double* sums, F body) {
+    if (axis == 1u) {
+        u64 rows = n / cols;
+        GRID_STRIDE(t, cols * chunks) {
+            u64 c = t % cols;
+            unsigned int g = ids[c];
+            if (g >= count) continue;
+            double a = 0.0, b = 0.0, d = 0.0;
+            for (u64 r = t / cols; r < rows; r += chunks) {
+                double ea = 0.0, eb = 0.0, ed = 0.0;
+                if (body(r * cols + c, g, ea, eb, ed)) { a += ea; b += eb; d += ed; }
+            }
+            if (a > 0.0) {
+                atomicAdd(sums + 3 * (u64)g, a);
+                atomicAdd(sums + 3 * (u64)g + 1, b);
+                atomicAdd(sums + 3 * (u64)g + 2, d);
+            }
         }
-        group_add(sums, g, live, a, b, c);
+        return;
+    }
+    WARP_STRIDE(i, n) {
+        unsigned int g = i < n ? group_of(ids, axis, cols, i) : 0u;
+        double a = 0.0, b = 0.0, d = 0.0;
+        bool live = i < n && g < count && body(i, g, a, b, d);
+        group_add(sums, g, live, a, b, d);
     }
 }
 
-extern "C" __global__ void posterior_ivon_f64(u64 n, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1,
-    const double* gradient, const double* factor, const unsigned int* groups, const double* variance, double* mean, double* log_sd, double* momentum, double* curvature, double* sums) {
-    posterior_ivon_body<double>(n, count, scale, fscale, tokens, rate, beta1, beta2, c1, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, sums);
+// Entries (the posterior, the momentum, the curvature, the gradient) in T; group sums in double.
+template <typename T>
+__device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1,
+    const T* gradient, const T* factor, const unsigned int* groups, const double* variance, T* mean, T* log_sd, T* momentum, T* curvature, double* sums) {
+    const T b1 = (T)beta1, o1 = (T)(1.0 - beta1), o2 = (T)(1.0 - beta2), k1 = (T)(1.0 / c1), weight = (T)scale, alpha = (T)rate, square = (T)fscale;
+    group_reduce(n, cols, axis, chunks, groups, count, sums, [&](u64 i, unsigned int g, double& a, double& b, double& c) -> bool {
+        if (log_sd[i] == (T)NEG_INF) return false;
+        T delta = (T)(1.0 / (tokens * variance[g])), mu = mean[i], sd = entry_exp(log_sd[i]);
+        T gi = weight * gradient[i], ui = factor[i];
+        T m1 = b1 * momentum[i] + o1 * gi;
+        T h = curvature[i], d = square * ui * ui - h;
+        T h1 = h + o2 * d + (T)0.5 * o2 * o2 * d * d / (h + delta);
+        T move = alpha * (m1 * k1 + delta * mu) / (h1 + delta);
+        mu -= move > sd ? sd : (move < -sd ? -sd : move);
+        T s = (T)(-0.5 * log(tokens * ((double)h1 + (double)delta)));
+        momentum[i] = m1; curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
+        a = 1.0; b = (double)mu * (double)mu + exp(2.0 * (double)s); c = 2.0 * (double)s;
+        return true;
+    });
 }
 
-extern "C" __global__ void posterior_ivon_f32(u64 n, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1,
+extern "C" __global__ void posterior_ivon_f64(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1,
+    const double* gradient, const double* factor, const unsigned int* groups, const double* variance, double* mean, double* log_sd, double* momentum, double* curvature, double* sums) {
+    posterior_ivon_body<double>(n, cols, axis, chunks, count, scale, fscale, tokens, rate, beta1, beta2, c1, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, sums);
+}
+
+extern "C" __global__ void posterior_ivon_f32(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1,
     const float* gradient, const float* factor, const unsigned int* groups, const double* variance, float* mean, float* log_sd, float* momentum, float* curvature, double* sums) {
-    posterior_ivon_body<float>(n, count, scale, fscale, tokens, rate, beta1, beta2, c1, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, sums);
+    posterior_ivon_body<float>(n, cols, axis, chunks, count, scale, fscale, tokens, rate, beta1, beta2, c1, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, sums);
 }
 
 // A bfloat16's value (`bf16_round` is its inverse to nearest).
@@ -3839,86 +3847,74 @@ extern "C" __global__ void widen_bf16(u64 n, const unsigned short* x, float* y) 
 // and the momentum rounded once as it is stored. The curvature stays f32: its step `(1 − β₂)(ĥ − h)` is below bfloat16's
 // resolution of `h` for an average over more than a few hundred batches.
 template <typename G, typename M>
-__device__ void posterior_ivon_mixed(u64 n, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1,
+__device__ void posterior_ivon_mixed(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1,
     const G* gradient, const G* factor, const unsigned int* groups, const double* variance, float* mean, float* log_sd, M* momentum, float* curvature, double* sums) {
     const float b1 = (float)beta1, o1 = (float)(1.0 - beta1), o2 = (float)(1.0 - beta2), k1 = (float)(1.0 / c1), weight = (float)scale, alpha = (float)rate, square = (float)fscale;
-    WARP_STRIDE(i, n) {
-        unsigned int g = i < n ? groups[i] : 0u;
-        bool live = i < n && g < count && log_sd[i] != (float)NEG_INF;
-        double a = 0.0, b = 0.0, c = 0.0;
-        if (live) {
-            float delta = (float)(1.0 / (tokens * variance[g])), mu = mean[i], sd = expf(log_sd[i]);
-            float gi = weight * entry_load(gradient[i]), ui = entry_load(factor[i]);
-            float m1 = b1 * entry_load(momentum[i]) + o1 * gi;
-            float h = curvature[i], d = square * ui * ui - h;
-            float h1 = h + o2 * d + 0.5f * o2 * o2 * d * d / (h + delta);
-            mu -= fminf(fmaxf(alpha * (m1 * k1 + delta * mu) / (h1 + delta), -sd), sd);
-            float s = (float)(-0.5 * log(tokens * ((double)h1 + (double)delta)));
-            entry_store(momentum + i, m1); curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
-            a = 1.0; b = (double)mu * (double)mu + exp(2.0 * (double)s); c = 2.0 * (double)s;
-        }
-        group_add(sums, g, live, a, b, c);
-    }
+    group_reduce(n, cols, axis, chunks, groups, count, sums, [&](u64 i, unsigned int g, double& a, double& b, double& c) -> bool {
+        if (log_sd[i] == (float)NEG_INF) return false;
+        float delta = (float)(1.0 / (tokens * variance[g])), mu = mean[i], sd = expf(log_sd[i]);
+        float gi = weight * entry_load(gradient[i]), ui = entry_load(factor[i]);
+        float m1 = b1 * entry_load(momentum[i]) + o1 * gi;
+        float h = curvature[i], d = square * ui * ui - h;
+        float h1 = h + o2 * d + 0.5f * o2 * o2 * d * d / (h + delta);
+        mu -= fminf(fmaxf(alpha * (m1 * k1 + delta * mu) / (h1 + delta), -sd), sd);
+        float s = (float)(-0.5 * log(tokens * ((double)h1 + (double)delta)));
+        entry_store(momentum + i, m1); curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
+        a = 1.0; b = (double)mu * (double)mu + exp(2.0 * (double)s); c = 2.0 * (double)s;
+        return true;
+    });
 }
 
-extern "C" __global__ void posterior_ivon_f32_bf16(u64 n, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1,
+extern "C" __global__ void posterior_ivon_f32_bf16(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1,
     const float* gradient, const float* factor, const unsigned int* groups, const double* variance, float* mean, float* log_sd, unsigned short* momentum, float* curvature, double* sums) {
-    posterior_ivon_mixed<float, unsigned short>(n, count, scale, fscale, tokens, rate, beta1, beta2, c1, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, sums);
+    posterior_ivon_mixed<float, unsigned short>(n, cols, axis, chunks, count, scale, fscale, tokens, rate, beta1, beta2, c1, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, sums);
 }
 
-extern "C" __global__ void posterior_ivon_bf16_bf16(u64 n, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1,
+extern "C" __global__ void posterior_ivon_bf16_bf16(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1,
     const unsigned short* gradient, const unsigned short* factor, const unsigned int* groups, const double* variance, float* mean, float* log_sd, unsigned short* momentum, float* curvature, double* sums) {
-    posterior_ivon_mixed<unsigned short, unsigned short>(n, count, scale, fscale, tokens, rate, beta1, beta2, c1, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, sums);
+    posterior_ivon_mixed<unsigned short, unsigned short>(n, cols, axis, chunks, count, scale, fscale, tokens, rate, beta1, beta2, c1, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, sums);
 }
 
 template <typename T>
-__device__ void group_moments_body(u64 n, u64 count, const T* mean, const T* log_sd, const unsigned int* groups, double* sums) {
-    WARP_STRIDE(i, n) {
-        unsigned int g = i < n ? groups[i] : 0u;
-        bool live = i < n && g < count && log_sd[i] != (T)NEG_INF;
-        double a = 0.0, b = 0.0, c = 0.0;
-        if (live) {
-            double mu = (double)mean[i], s = (double)log_sd[i];
-            a = 1.0; b = mu * mu + exp(2.0 * s); c = 2.0 * s;
-        }
-        group_add(sums, g, live, a, b, c);
-    }
+__device__ void group_moments_body(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, const T* mean, const T* log_sd, const unsigned int* groups, double* sums) {
+    group_reduce(n, cols, axis, chunks, groups, count, sums, [&](u64 i, unsigned int, double& a, double& b, double& c) -> bool {
+        if (log_sd[i] == (T)NEG_INF) return false;
+        double mu = (double)mean[i], s = (double)log_sd[i];
+        a = 1.0; b = mu * mu + exp(2.0 * s); c = 2.0 * s;
+        return true;
+    });
 }
 
-extern "C" __global__ void group_moments_f64(u64 n, u64 count, const double* mean, const double* log_sd, const unsigned int* groups, double* sums) {
-    group_moments_body<double>(n, count, mean, log_sd, groups, sums);
+extern "C" __global__ void group_moments_f64(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, const double* mean, const double* log_sd, const unsigned int* groups, double* sums) {
+    group_moments_body<double>(n, cols, axis, chunks, count, mean, log_sd, groups, sums);
 }
 
-extern "C" __global__ void group_moments_f32(u64 n, u64 count, const float* mean, const float* log_sd, const unsigned int* groups, double* sums) {
-    group_moments_body<float>(n, count, mean, log_sd, groups, sums);
+extern "C" __global__ void group_moments_f32(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, const float* mean, const float* log_sd, const unsigned int* groups, double* sums) {
+    group_moments_body<float>(n, cols, axis, chunks, count, mean, log_sd, groups, sums);
 }
 
 // Each live entry's (1, u μ, u² exp(2s)) into its group's row (`Device::group_curvature`), the
 // factor `u` in U (the masters' storage, or bfloat16 with f32 masters).
 template <typename T, typename U>
-__device__ void group_curvature_body(u64 n, u64 count, const U* factor, const T* mean, const T* log_sd, const unsigned int* groups, double* sums) {
-    WARP_STRIDE(i, n) {
-        unsigned int g = i < n ? groups[i] : 0u;
-        bool live = i < n && g < count && log_sd[i] != (T)NEG_INF;
-        double a = 0.0, b = 0.0, c = 0.0;
-        if (live) {
-            double u = (double)entry_load(factor[i]), s = (double)log_sd[i];
-            a = 1.0; b = u * (double)mean[i]; c = u * u * exp(2.0 * s);
-        }
-        group_add(sums, g, live, a, b, c);
-    }
+__device__ void group_curvature_body(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, const U* factor, const T* mean, const T* log_sd, const unsigned int* groups, double* sums) {
+    group_reduce(n, cols, axis, chunks, groups, count, sums, [&](u64 i, unsigned int, double& a, double& b, double& c) -> bool {
+        if (log_sd[i] == (T)NEG_INF) return false;
+        double u = (double)entry_load(factor[i]), s = (double)log_sd[i];
+        a = 1.0; b = u * (double)mean[i]; c = u * u * exp(2.0 * s);
+        return true;
+    });
 }
 
-extern "C" __global__ void group_curvature_f64(u64 n, u64 count, const double* factor, const double* mean, const double* log_sd, const unsigned int* groups, double* sums) {
-    group_curvature_body<double, double>(n, count, factor, mean, log_sd, groups, sums);
+extern "C" __global__ void group_curvature_f64(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, const double* factor, const double* mean, const double* log_sd, const unsigned int* groups, double* sums) {
+    group_curvature_body<double, double>(n, cols, axis, chunks, count, factor, mean, log_sd, groups, sums);
 }
 
-extern "C" __global__ void group_curvature_f32(u64 n, u64 count, const float* factor, const float* mean, const float* log_sd, const unsigned int* groups, double* sums) {
-    group_curvature_body<float, float>(n, count, factor, mean, log_sd, groups, sums);
+extern "C" __global__ void group_curvature_f32(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, const float* factor, const float* mean, const float* log_sd, const unsigned int* groups, double* sums) {
+    group_curvature_body<float, float>(n, cols, axis, chunks, count, factor, mean, log_sd, groups, sums);
 }
 
-extern "C" __global__ void group_curvature_f32_bf16(u64 n, u64 count, const unsigned short* factor, const float* mean, const float* log_sd, const unsigned int* groups, double* sums) {
-    group_curvature_body<float, unsigned short>(n, count, factor, mean, log_sd, groups, sums);
+extern "C" __global__ void group_curvature_f32_bf16(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, const unsigned short* factor, const float* mean, const float* log_sd, const unsigned int* groups, double* sums) {
+    group_curvature_body<float, unsigned short>(n, cols, axis, chunks, count, factor, mean, log_sd, groups, sums);
 }
 
 // `Device::group_code_length`: one entry per group, every one into row `slot`.
@@ -5700,53 +5696,12 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
             }
         }
 
-        pub(super) fn sample_terms(&self, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64), count: usize, layout: super::TermLayout) -> Result<Vec<Tensor>, GpuError> {
-            let ((rows, cols), n) = (mean.dim(), mean.len() as u64);
-            let (count32, cols64) = (count as u32, cols as u64);
-            let (mut outs, row, along): (Vec<CudaSlice<u16>>, u64, u64) = match layout {
-                super::TermLayout::Stacked => (vec![self.zeros16(rows * cols * count)?], cols64 * count as u64, cols64),
-                super::TermLayout::Separate => ((0..count).map(|_| self.zeros16(rows * cols)).collect::<Result<_, _>>()?, cols64, 0),
-            };
-            if n > 0 {
-                let f = self.function("sample_terms")?;
-                let mut builder = self.stream.launch_builder(&f);
-                builder.arg(&n).arg(&key).arg(&stream).arg(&count32).arg(&cols64).arg(&row).arg(&along).input(mean, Storage::F32)?.input(log_sd, Storage::F32)?;
-                // The three output pointers: the stacked buffer three times, or each term's (an
-                // unused one repeats the first; the kernel writes only `count` of them).
-                match &mut outs[..] {
-                    [first] => builder.arg(&*first).arg(&*first).arg(&*first),
-                    [first, second] => builder.arg(&*first).arg(&*second).arg(&*first),
-                    [first, second, third] => builder.arg(&*first).arg(&*second).arg(&*third),
-                    _ => return Err(shape("1 to 3 bfloat16 term buffers".to_string())),
-                };
-                // SAFETY: f32 means and log sds of n entries; each output holds every entry its
-                // strides reach (rows × count·cols stacked, rows × cols separate).
-                unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor sample_terms")?;
-            }
-            Ok(match layout {
-                super::TermLayout::Stacked => outs.into_iter().map(|s| Tensor { rows, cols: cols * count, data: Data::CudaBf16(s) }).collect(),
-                super::TermLayout::Separate => outs.into_iter().map(|s| Tensor { rows, cols, data: Data::CudaBf16(s) }).collect(),
-            })
-        }
-
-        pub(super) fn term_count(&self, (mean, log_sd): (&Tensor, &Tensor)) -> Result<usize, GpuError> {
-            let n = mean.len() as u64;
-            let mut needed = self.stream.alloc_zeros::<u32>(1).gpu_ctx("tensor term count")?;
-            if n > 0 {
-                let f = self.function("term_count")?;
-                // SAFETY: f32 means and log sds of n entries; one u32 maximum.
-                unsafe { self.stream.launch_builder(&f).arg(&n).input(mean, Storage::F32)?.input(log_sd, Storage::F32)?.arg(&mut needed).launch(cfg_elements(n)) }.gpu_ctx("tensor term_count")?;
-            }
-            let found = self.stream.clone_dtoh(&needed).gpu_ctx("tensor term count read")?;
-            Ok(found.first().map_or(1, |k| (*k as usize).max(1)))
-        }
-
         pub(super) fn posterior_ivon(
             &self,
             (mean, log_sd): (&mut Tensor, &mut Tensor),
             [momentum, curvature]: [&mut Tensor; 2],
             (gradient, factor): (&Tensor, &Tensor),
-            (groups, variance): (&Indices, &Tensor),
+            (groups, variance): (&super::GroupMap, &Tensor),
             sums: &mut Tensor,
             step: &super::PosteriorStep,
         ) -> Result<(), GpuError> {
@@ -5765,25 +5720,27 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
                 (masters, m, g) => return Err(shape(format!("{masters:?} masters with a {m:?} momentum and a {g:?} gradient"))),
             };
             let count = variance.len() as u64;
+            let (cols, axis, chunks) = (groups.cols as u64, groups.code(), groups.chunks() as u64);
             let mut builder = self.stream.launch_builder(&f);
-            builder.arg(&n).arg(&count).arg(&step.gradient_scale).arg(&step.factor_scale).arg(&step.tokens).arg(&step.rate).arg(&step.beta1).arg(&step.beta2).arg(&c1);
-            builder.input(gradient, gradients)?.input(factor, gradients)?.arg(index_slice(groups)?).arg(slice(variance)?);
+            builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).arg(&step.gradient_scale).arg(&step.factor_scale).arg(&step.tokens).arg(&step.rate).arg(&step.beta1).arg(&step.beta2).arg(&c1);
+            builder.input(gradient, gradients)?.input(factor, gradients)?.arg(index_slice(&groups.ids)?).arg(slice(variance)?);
             builder.output(mean, storage)?.output(log_sd, storage)?.output(momentum, moments)?.output(curvature, storage)?.arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers in their storages, float64 group buffers of
-            // `count` rows; ids at or beyond `count` are skipped by the kernel.
-            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor posterior_ivon").map(|_| ())
+            // `count` rows, ids per the map's axis; ids at or beyond `count` are skipped.
+            unsafe { builder.launch(cfg_elements(groups.threads() as u64)) }.gpu_ctx("tensor posterior_ivon").map(|_| ())
         }
 
-        pub(super) fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
+        pub(super) fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &super::GroupMap, sums: &mut Tensor) -> Result<(), GpuError> {
             let (n, storage) = (mean.len() as u64, mean.storage());
             let (f, count) = (self.posterior_kernel("group_moments", storage)?, sums.rows as u64);
+            let (cols, axis, chunks) = (groups.cols as u64, groups.code(), groups.chunks() as u64);
             let mut builder = self.stream.launch_builder(&f);
-            builder.arg(&n).arg(&count).input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(groups)?).arg(slice_mut(sums)?);
+            builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(&groups.ids)?).arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers, checked by the caller; float64 sums of `count` rows.
-            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor group_moments").map(|_| ())
+            unsafe { builder.launch(cfg_elements(groups.threads() as u64)) }.gpu_ctx("tensor group_moments").map(|_| ())
         }
 
-        pub(super) fn group_curvature(&self, (factor, mean, log_sd): (&Tensor, &Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
+        pub(super) fn group_curvature(&self, (factor, mean, log_sd): (&Tensor, &Tensor, &Tensor), groups: &super::GroupMap, sums: &mut Tensor) -> Result<(), GpuError> {
             let (n, storage, factors) = (mean.len() as u64, mean.storage(), factor.storage());
             let f = match (storage, factors) {
                 (Storage::F32, Storage::Bf16) => self.function("group_curvature_f32_bf16")?,
@@ -5791,10 +5748,11 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
                 (masters, u) => return Err(shape(format!("{masters:?} masters with a {u:?} Gauss–Newton factor"))),
             };
             let count = sums.rows as u64;
+            let (cols, axis, chunks) = (groups.cols as u64, groups.code(), groups.chunks() as u64);
             let mut builder = self.stream.launch_builder(&f);
-            builder.arg(&n).arg(&count).input(factor, factors)?.input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(groups)?).arg(slice_mut(sums)?);
+            builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).input(factor, factors)?.input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(&groups.ids)?).arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers, checked by the caller; float64 sums of `count` rows.
-            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor group_curvature").map(|_| ())
+            unsafe { builder.launch(cfg_elements(groups.threads() as u64)) }.gpu_ctx("tensor group_curvature").map(|_| ())
         }
 
         pub(super) fn group_code_length(
@@ -6654,7 +6612,22 @@ inline float posterior_normal(uint2 key, uint2 stream, uint index) {
 }
 
 // The parameters of the posterior kernels (Rust `Posterior`).
-struct Posterior { uint n; uint count; uint2 key; uint2 stream; float scale; float tokens; float rate; float beta1; float beta2; float c1; float fscale; };
+struct Posterior { uint n; uint count; uint2 key; uint2 stream; float scale; float tokens; float rate; float beta1; float beta2; float c1; float fscale; uint axis; uint cols; uint chunks; };
+
+// Entry i's group under an operator's group map: its row's id (axis 0), its column's (1), its own (2).
+inline uint group_of(device const uint* ids, constant Posterior& p, uint i) {
+    return p.axis == 0u ? ids[i / p.cols] : (p.axis == 1u ? ids[i % p.cols] : ids[i]);
+}
+
+// A column map's thread t: column t % cols summed over rows t / cols, t / cols + chunks, ... (a
+// column's entries are a row apart, so a SIMD group's lanes hold different groups), added once.
+inline void column_add(device float* sums, uint g, float a, float b, float c) {
+    if (a > 0.0f) {
+        atomic_fetch_add_explicit((device atomic_float*)(sums + 3 * g), a, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)(sums + 3 * g + 1), b, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)(sums + 3 * g + 2), c, memory_order_relaxed);
+    }
+}
 
 kernel void t_reparameterize(device const float* mean [[buffer(0)]], device const float* log_sd [[buffer(1)]], device float* theta [[buffer(2)]],
                              constant Posterior& p [[buffer(3)]], uint i [[thread_position_in_grid]]) {
@@ -6679,30 +6652,64 @@ inline void group_add(device float* sums, uint g, bool live, float a, float b, f
     }
 }
 
-// One thread per entry (the dispatch covers every entry once), so every lane reaches `group_add`.
+// IVON's step of a live entry i of group g, and its (1, μ² + σ², 2s) into a, b, c.
+inline void ivon_entry(uint i, uint g, device const float* gradient, device const float* factor, device const float* variance, device float* mean, device float* log_sd,
+                       device float* momentum, device float* curvature, constant Posterior& p, thread float& a, thread float& b, thread float& c) {
+    float delta = 1.0f / (p.tokens * variance[g]), mu = mean[i], sd = exp(log_sd[i]);
+    float gi = p.scale * gradient[i], ui = factor[i];
+    float m1 = p.beta1 * momentum[i] + (1.0f - p.beta1) * gi;
+    float o2 = 1.0f - p.beta2, h = curvature[i], d = p.fscale * ui * ui - h;
+    float h1 = h + o2 * d + 0.5f * o2 * o2 * d * d / (h + delta);
+    mu -= clamp(p.rate * (m1 / p.c1 + delta * mu) / (h1 + delta), -sd, sd);
+    float s = -0.5f * log(p.tokens * (h1 + delta));
+    momentum[i] = m1; curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
+    a = 1.0f; b = mu * mu + exp(2.0f * s); c = 2.0f * s;
+}
+
+// One thread per entry (every lane reaches `group_add`), or per column and row chunk for a column
+// map (`column_add`).
 kernel void t_posterior_ivon(device const float* gradient [[buffer(0)]], device const uint* groups [[buffer(1)]], device const float* variance [[buffer(2)]],
                              device float* mean [[buffer(3)]], device float* log_sd [[buffer(4)]], device float* momentum [[buffer(5)]], device float* curvature [[buffer(6)]],
                              device float* sums [[buffer(7)]], device const float* factor [[buffer(8)]], constant Posterior& p [[buffer(9)]], uint i [[thread_position_in_grid]]) {
-    uint g = i < p.n ? groups[i] : 0u;
+    if (p.axis == 1u) {
+        uint rows = p.n / p.cols, col = i % p.cols;
+        if (i >= p.cols * p.chunks || groups[col] >= p.count) return;
+        uint g = groups[col];
+        float a = 0.0f, b = 0.0f, c = 0.0f;
+        for (uint r = i / p.cols; r < rows; r += p.chunks) {
+            uint e = r * p.cols + col;
+            if (log_sd[e] == -INFINITY) continue;
+            float ea, eb, ec;
+            ivon_entry(e, g, gradient, factor, variance, mean, log_sd, momentum, curvature, p, ea, eb, ec);
+            a += ea; b += eb; c += ec;
+        }
+        column_add(sums, g, a, b, c);
+        return;
+    }
+    uint g = i < p.n ? group_of(groups, p, i) : 0u;
     bool live = i < p.n && g < p.count && log_sd[i] != -INFINITY;
     float a = 0.0f, b = 0.0f, c = 0.0f;
     if (live) {
-        float delta = 1.0f / (p.tokens * variance[g]), mu = mean[i], sd = exp(log_sd[i]);
-        float gi = p.scale * gradient[i], ui = factor[i];
-        float m1 = p.beta1 * momentum[i] + (1.0f - p.beta1) * gi;
-        float o2 = 1.0f - p.beta2, h = curvature[i], d = p.fscale * ui * ui - h;
-        float h1 = h + o2 * d + 0.5f * o2 * o2 * d * d / (h + delta);
-        mu -= clamp(p.rate * (m1 / p.c1 + delta * mu) / (h1 + delta), -sd, sd);
-        float s = -0.5f * log(p.tokens * (h1 + delta));
-        momentum[i] = m1; curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
-        a = 1.0f; b = mu * mu + exp(2.0f * s); c = 2.0f * s;
+        ivon_entry(i, g, gradient, factor, variance, mean, log_sd, momentum, curvature, p, a, b, c);
     }
     group_add(sums, g, live, a, b, c);
 }
 
 kernel void t_group_moments(device const float* mean [[buffer(0)]], device const float* log_sd [[buffer(1)]], device const uint* groups [[buffer(2)]],
                             device float* sums [[buffer(3)]], constant Posterior& p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
-    uint g = i < p.n ? groups[i] : 0u;
+    if (p.axis == 1u) {
+        uint rows = p.n / p.cols, col = i % p.cols;
+        if (i >= p.cols * p.chunks || groups[col] >= p.count) return;
+        float a = 0.0f, b = 0.0f, c = 0.0f;
+        for (uint r = i / p.cols; r < rows; r += p.chunks) {
+            uint e = r * p.cols + col;
+            if (log_sd[e] == -INFINITY) continue;
+            a += 1.0f; b += mean[e] * mean[e] + exp(2.0f * log_sd[e]); c += 2.0f * log_sd[e];
+        }
+        column_add(sums, groups[col], a, b, c);
+        return;
+    }
+    uint g = i < p.n ? group_of(groups, p, i) : 0u;
     bool live = i < p.n && g < p.count && log_sd[i] != -INFINITY;
     float a = live ? 1.0f : 0.0f;
     float b = live ? mean[i] * mean[i] + exp(2.0f * log_sd[i]) : 0.0f;
@@ -6712,7 +6719,19 @@ kernel void t_group_moments(device const float* mean [[buffer(0)]], device const
 
 kernel void t_group_curvature(device const float* factor [[buffer(0)]], device const float* mean [[buffer(1)]], device const float* log_sd [[buffer(2)]],
                               device const uint* groups [[buffer(3)]], device float* sums [[buffer(4)]], constant Posterior& p [[buffer(5)]], uint i [[thread_position_in_grid]]) {
-    uint g = i < p.n ? groups[i] : 0u;
+    if (p.axis == 1u) {
+        uint rows = p.n / p.cols, col = i % p.cols;
+        if (i >= p.cols * p.chunks || groups[col] >= p.count) return;
+        float a = 0.0f, b = 0.0f, c = 0.0f;
+        for (uint r = i / p.cols; r < rows; r += p.chunks) {
+            uint e = r * p.cols + col;
+            if (log_sd[e] == -INFINITY) continue;
+            a += 1.0f; b += factor[e] * mean[e]; c += factor[e] * factor[e] * exp(2.0f * log_sd[e]);
+        }
+        column_add(sums, groups[col], a, b, c);
+        return;
+    }
+    uint g = i < p.n ? group_of(groups, p, i) : 0u;
     bool live = i < p.n && g < p.count && log_sd[i] != -INFINITY;
     float a = live ? 1.0f : 0.0f;
     float b = live ? factor[i] * mean[i] : 0.0f;
@@ -6948,6 +6967,10 @@ kernel void t_attention_sums(device const float* out [[buffer(0)]], device const
         beta2: f32,
         c1: f32,
         fscale: f32,
+        /// The group map's axis code, columns and row chunks (`GroupMap`).
+        axis: u32,
+        cols: u32,
+        chunks: u32,
     }
 
     /// A 64-bit counter word as MSL's `uint2` (low half first).
@@ -7301,6 +7324,14 @@ kernel void t_attention_sums(device const float* out [[buffer(0)]], device const
             self.stream.dispatch(kernel, buffers, &p, spread(n))
         }
 
+        /// A posterior kernel over an operator's entries reduced into their groups (`map`): one
+        /// thread per entry, or per column and row chunk for a column map.
+        fn grouped(&self, kernel: &'static str, buffers: &[(&Buffer, usize)], map: &super::GroupMap, mut p: Posterior) -> Result<(), GpuError> {
+            p.n = u32_of(map.rows * map.cols)?;
+            (p.axis, p.cols, p.chunks) = (map.code(), u32_of(map.cols.max(1))?, u32_of(map.chunks())?);
+            self.stream.dispatch(kernel, buffers, &p, spread(map.threads()))
+        }
+
         pub(super) fn reparameterize(&self, theta: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {
             let p = Posterior { key: halves(key), stream: halves(stream), ..Posterior::default() };
             self.posterior("t_reparameterize", &[whole(buffer(mean)?), whole(buffer(log_sd)?), whole(buffer(theta)?)], theta.len(), p)
@@ -7311,7 +7342,7 @@ kernel void t_attention_sums(device const float* out [[buffer(0)]], device const
             (mean, log_sd): (&mut Tensor, &mut Tensor),
             [momentum, curvature]: [&mut Tensor; 2],
             (gradient, factor): (&Tensor, &Tensor),
-            (groups, variance): (&Indices, &Tensor),
+            (groups, variance): (&super::GroupMap, &Tensor),
             sums: &mut Tensor,
             step: &super::PosteriorStep,
         ) -> Result<(), GpuError> {
@@ -7328,7 +7359,7 @@ kernel void t_attention_sums(device const float* out [[buffer(0)]], device const
             };
             let buffers = [
                 whole(buffer(gradient)?),
-                whole(index_buffer(groups)?),
+                whole(index_buffer(&groups.ids)?),
                 whole(buffer(variance)?),
                 whole(buffer(mean)?),
                 whole(buffer(log_sd)?),
@@ -7337,18 +7368,18 @@ kernel void t_attention_sums(device const float* out [[buffer(0)]], device const
                 whole(buffer(sums)?),
                 whole(buffer(factor)?),
             ];
-            self.posterior("t_posterior_ivon", &buffers, mean.len(), p)
+            self.grouped("t_posterior_ivon", &buffers, groups, p)
         }
 
-        pub(super) fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
+        pub(super) fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &super::GroupMap, sums: &mut Tensor) -> Result<(), GpuError> {
             let p = Posterior { count: u32_of(sums.rows)?, ..Posterior::default() };
-            self.posterior("t_group_moments", &[whole(buffer(mean)?), whole(buffer(log_sd)?), whole(index_buffer(groups)?), whole(buffer(sums)?)], mean.len(), p)
+            self.grouped("t_group_moments", &[whole(buffer(mean)?), whole(buffer(log_sd)?), whole(index_buffer(&groups.ids)?), whole(buffer(sums)?)], groups, p)
         }
 
-        pub(super) fn group_curvature(&self, (factor, mean, log_sd): (&Tensor, &Tensor, &Tensor), groups: &Indices, sums: &mut Tensor) -> Result<(), GpuError> {
+        pub(super) fn group_curvature(&self, (factor, mean, log_sd): (&Tensor, &Tensor, &Tensor), groups: &super::GroupMap, sums: &mut Tensor) -> Result<(), GpuError> {
             let p = Posterior { count: u32_of(sums.rows)?, ..Posterior::default() };
-            let buffers = [whole(buffer(factor)?), whole(buffer(mean)?), whole(buffer(log_sd)?), whole(index_buffer(groups)?), whole(buffer(sums)?)];
-            self.posterior("t_group_curvature", &buffers, mean.len(), p)
+            let buffers = [whole(buffer(factor)?), whole(buffer(mean)?), whole(buffer(log_sd)?), whole(index_buffer(&groups.ids)?), whole(buffer(sums)?)];
+            self.grouped("t_group_curvature", &buffers, groups, p)
         }
 
         pub(super) fn group_code_length(

@@ -13,11 +13,12 @@
 //! clean and one patched experiment per base (`interchange::sample`, seed 1). The programs run on
 //! the single-precision device (CUDA in f32 storage, else the Apple GPU), with f32 products.
 //!
-//! A step, as the fit takes it: the patch directions at the posterior mean (the means written into
-//! `P`, `interchange::design`), the weight sample written into `P`, `M`'s clean runs
+//! A step, as the fit takes it: the weight sample written into `P`, `M`'s clean runs
 //! (`interchange::targets`), the experiments with the gradient (`interchange::evaluate`), the
 //! description `Σ_G KL_G`, and the IVON step (`Device::posterior_ivon`); none of the parameters
-//! leave the device. The step runs `REPS` times after one warm-up, each part timed to a device
+//! leave the device. The patch directions (`interchange::design`, at the means written into `P`)
+//! are formed once before the steps, as the fit keeps a batch's design, and timed alone
+//! (`design_seconds`). The step runs `REPS` times after one warm-up, each part timed to a device
 //! synchronization. One JSON object goes to `OUT/library_step_bench.json` and stdout: per part the
 //! median seconds.
 
@@ -334,16 +335,25 @@ fn main() -> Result<(), String> {
     // The last step's mean KL(M_e ‖ P_e) per scored token, in bits (a check that the products'
     // arithmetic did not change what is computed).
     let mut mean_bits = None;
+    // The design at P's means, once: the fit draws the experiments once and keeps each batch's
+    // design, so neither the means' load nor the design is part of a step.
+    let mut design_seconds = None;
     {
         let parts = Parts { operators: &trainable, mean: &start.mean, log_sd: &start.log_sd, groups: &start.groups, count: start.count };
         let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens as f64, None, 0)?;
+        posterior.mean_into(&mut p_program)?;
+        let design = match &scoring {
+            Some(_) => {
+                let started = Instant::now();
+                let design = interchange::design(&p_model(&p_program, sites)?, &variables, &experiments)?;
+                device.synchronize().map_err(error)?;
+                design_seconds = Some(started.elapsed().as_secs_f64());
+                Some(design)
+            }
+            None => None,
+        };
         for step in 0..=reps {
             let s = &mut device_seconds;
-            timed(&device, s, "means_loaded", || posterior.mean_into(&mut p_program))?;
-            let design = match &scoring {
-                Some(_) => Some(timed(&device, s, "design", || interchange::design(&p_model(&p_program, sites)?, &variables, &experiments))?),
-                None => None,
-            };
             timed(&device, s, "sample_loaded", || {
                 posterior.sample_into(&mut p_program, step as u64)?;
                 decoders.as_mut().map_or(Ok(()), |(_, p)| p.refresh(&p_program))
@@ -436,6 +446,7 @@ fn main() -> Result<(), String> {
         "groups": start.count,
         "reps": reps,
         "device_posterior_seconds": medians(&device_seconds),
+        "design_seconds": design_seconds,
     });
     println!("{report}");
     std::fs::create_dir_all(out).map_err(error)?;

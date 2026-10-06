@@ -23,7 +23,7 @@ use crate::{
 };
 use gam_gpu::{
     gpu_error::GpuError,
-    tensor::{Device, Indices, PosteriorStep, Storage, Tensor},
+    tensor::{Device, GroupMap, PosteriorStep, Storage, Tensor},
 };
 use ndarray::Array2;
 use std::collections::BTreeMap;
@@ -67,12 +67,13 @@ pub struct DevicePosterior {
     wide: Device,
     fitting: Device,
     /// Per trainable operator (`Explanation::trainable` order): its id, `μ`, `s`, IVON's state
-    /// (the gradient's momentum, then the curvature estimate) and each entry's group.
+    /// (the gradient's momentum, then the curvature estimate) and its entries' groups (one id per
+    /// row or column where the groups are rows or columns).
     operators: Vec<usize>,
     mean: Vec<Tensor>,
     log_sd: Vec<Tensor>,
     moments: Vec<[Tensor; 2]>,
-    groups: Vec<Indices>,
+    groups: Vec<GroupMap>,
     /// Per group `(n, Σ μ² + σ², Σ 2s)` being summed, its variance and its divergence in nats.
     sums: Tensor,
     variance: Tensor,
@@ -188,7 +189,7 @@ impl DevicePosterior {
             mean: parts.mean.iter().map(up).collect::<Result<_, _>>()?,
             log_sd: parts.log_sd.iter().map(up).collect::<Result<_, _>>()?,
             moments: moments.ok_or_else(|| error("no posterior state"))?.iter().map(|m| Ok([moment(&m[0])?, up(&m[1])?])).collect::<Result<_, String>>()?,
-            groups: parts.groups.iter().map(|ids| master.upload_indices(ids).map_err(error)).collect::<Result<_, _>>()?,
+            groups: parts.groups.iter().zip(&shapes).map(|(ids, shape)| master.group_map(ids, *shape).map_err(error)).collect::<Result<_, _>>()?,
             operators: parts.operators.to_vec(),
             fitting: fitting.clone(),
             wide,
