@@ -1194,6 +1194,12 @@ for x in "${tests[@]}"; do [[ $x =~ ^[A-Za-z0-9_-]+:[A-Za-z0-9_]+$ ]] || { echo 
 
 uploads=() hf=() srcpaths=() examples=() words=() fineweb=() pile=()
 DATA_HAVE=$(published_data)
+# Whether each of the files NAME... that mpd-data/DIR holds is published (a missing one is not needed).
+all_published_any() {  # DIR NAME...
+    local d=$1 x
+    shift
+    for x; do [ ! -e "$MAC_DATA/$d/$x" ] || all_published "$d/$x" || return 1; done
+}
 # Whether every file under mpd-data/REL is published.
 all_published() {  # REL
     local f
@@ -1226,7 +1232,15 @@ for a in "$@"; do
         # Data with a public source is built on the pod: a FineWeb release shard (or its Mac copy
         # train, heldout), and a vpd4l export extended with Pile training rows (its base export,
         # which holds the target's weights, goes up instead).
-        if [[ $rel =~ ^qwen3_fineweb/([^/]+)(/([^/]+))?$ ]] && [ -f "$CONTENTS" ] && jq -e --arg d "${BASH_REMATCH[1]}" 'has($d)' "$CONTENTS" > /dev/null; then
+        # A FineWeb shard the Mac holds and has published is downloaded with the files beside it
+        # (meta.json, documents.u32, offsets.u64) instead of tokenized on the pod.
+        if [[ $rel =~ ^qwen3_fineweb/([^/]+)(/([^/]+))?$ ]] && [ -e "$p" ] && all_published "$rel" &&
+           all_published_any "qwen3_fineweb/${BASH_REMATCH[1]}" meta.json documents.u32 offsets.u64; then
+            uploads+=("$rel")
+            for x in meta.json documents.u32 offsets.u64; do
+                [ -e "$MAC_DATA/qwen3_fineweb/${BASH_REMATCH[1]}/$x" ] && uploads+=("qwen3_fineweb/${BASH_REMATCH[1]}/$x")
+            done
+        elif [[ $rel =~ ^qwen3_fineweb/([^/]+)(/([^/]+))?$ ]] && [ -f "$CONTENTS" ] && jq -e --arg d "${BASH_REMATCH[1]}" 'has($d)' "$CONTENTS" > /dev/null; then
             fineweb+=("${BASH_REMATCH[1]} ${BASH_REMATCH[3]:-}")
         elif [[ $rel =~ ^engine/([^/]+) ]] && jq -e '.source.extends.export' "$MAC_DATA/engine/${BASH_REMATCH[1]}/export.json" > /dev/null 2>&1 &&
              ! all_published "engine/${BASH_REMATCH[1]}"; then
