@@ -425,10 +425,24 @@ impl GroupMap {
     }
 
     /// The threads a CUDA reduction over the map runs: one block of 256 (the kernels' `BLOCK`) per
-    /// segment (`group_reduce`).
+    /// segment (`group_reduce`), or per 8 segments of one column each (`columns_reduce`).
     #[cfg(target_os = "linux")]
     fn blocks(&self) -> usize {
-        256 * self.segments
+        if self.single_columns() { 256 * self.segments.div_ceil(8) } else { 256 * self.segments }
+    }
+
+    /// Whether every segment is one column: column groups of one column each (an MLP's output
+    /// columns, a unit each), which CUDA reduces eight adjacent columns at a time.
+    #[cfg(target_os = "linux")]
+    fn single_columns(&self) -> bool {
+        self.axis == GroupAxis::Columns && self.segments == self.cols
+    }
+
+    /// The axis as CUDA's group reductions take it: [`GroupMap::code`], or 3 for a map of one-column
+    /// segments (`columns_reduce`).
+    #[cfg(target_os = "linux")]
+    fn reduce_code(&self) -> u32 {
+        if self.single_columns() { 3 } else { self.code() }
     }
 
     /// `t`'s shape is the map's.
@@ -3833,6 +3847,68 @@ __device__ unsigned int group_of(const unsigned int* ids, unsigned int axis, u64
     return axis == 0u ? ids[i / cols] : (axis == 1u ? ids[i % cols] : ids[i]);
 }
 
+// A map whose segments are one column each (axis code 3, `GroupMap::reduce_code`), COLUMNS segments
+// per block side by side: thread (r, l) = (threadIdx.x / COLUMNS, threadIdx.x % COLUMNS) takes, for
+// m = 0 .. BLOCK / 32 − 1 in turn, rows r + 32 m + BLOCK j (j = 0, 1, ..., in order) of segment l's
+// column: the entries thread r + 32 m of the segment's own block takes in `group_reduce`, summed in
+// the same order. Those 32 sums of one m go through the shuffles that block's warp m takes, and lane
+// 0 of warp l adds the warps' sums in warp order: every group's sums are the ones its own block adds,
+// while a warp reads and writes whole sectors (COLUMNS adjacent columns of 4 rows) instead of one
+// entry of each of 32 rows. `body(i, g, v)` puts entry i's N terms in v and says whether to add them;
+// with `every` it also runs on the entries of a group at or beyond `count` (whose sums are not
+// added); with `counted` a group's sums are added only when the first is positive. Every block runs
+// the same rows and synchronizations.
+#define COLUMNS 8
+template <int N, typename F>
+__device__ void columns_reduce(u64 n, u64 cols, u64 segments, const unsigned int* layout, u64 count, bool every, bool counted, double* sums, F body) {
+    __shared__ double lanes[N][COLUMNS][32];
+    __shared__ double warps[N][COLUMNS][BLOCK / 32];
+    const u64 rows = cols > 0 ? n / cols : 0;
+    const unsigned int l = threadIdx.x % COLUMNS, r = threadIdx.x / COLUMNS;
+    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    for (u64 first = (u64)blockIdx.x * COLUMNS; first < segments; first += (u64)gridDim.x * COLUMNS) {
+        u64 s = first + l;
+        unsigned int g = s < segments ? layout[segments + 1 + s] : 0u;
+        bool runs = s < segments && (every || g < count);
+        u64 column = runs ? (u64)layout[2 * segments + 1 + layout[s]] : 0;
+        for (unsigned int m = 0; m < BLOCK / 32; m++) {
+            double v[N];
+            for (int t = 0; t < N; t++) v[t] = 0.0;
+            if (runs)
+                for (u64 row = r + 32 * m; row < rows; row += BLOCK) {
+                    double e[N];
+                    for (int t = 0; t < N; t++) e[t] = 0.0;
+                    if (body(row * cols + column, g, e))
+                        for (int t = 0; t < N; t++) v[t] += e[t];
+                }
+            for (int t = 0; t < N; t++) lanes[t][l][r] = v[t];
+            __syncthreads();
+            if (warp < COLUMNS) {
+                for (int t = 0; t < N; t++) v[t] = lanes[t][warp][lane];
+                for (int o = 16; o > 0; o >>= 1)
+                    for (int t = 0; t < N; t++) v[t] += __shfl_down_sync(0xffffffffu, v[t], o);
+                if (lane == 0)
+                    for (int t = 0; t < N; t++) warps[t][warp][m] = v[t];
+            }
+            __syncthreads();
+        }
+        u64 own = first + warp;
+        if (lane == 0 && warp < COLUMNS && own < segments) {
+            unsigned int h = layout[segments + 1 + own];
+            if (h < count) {
+                double total[N];
+                for (int t = 0; t < N; t++) {
+                    total[t] = 0.0;
+                    for (unsigned int w = 0; w < BLOCK / 32; w++) total[t] += warps[t][warp][w];
+                }
+                if (!counted || total[0] > 0.0)
+                    for (int t = 0; t < N; t++) sums[N * (u64)h + t] += total[t];
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // Runs `body(i, g, a, b, c)` on every entry i of an `n`-entry operator of `cols` columns whose group
 // g is below `count`, and adds each entry it returns true for, (a, b, c), into its group's row of
 // `sums`. The entries go by the map's segments (`GroupMap`'s `layout`: `segments + 1` offsets, the
@@ -3844,6 +3920,10 @@ __device__ unsigned int group_of(const unsigned int* ids, unsigned int axis, u64
 // segment's entries to 32 threads: the posterior kernels ran at a fifth of their memory rate.)
 template <typename F>
 __device__ void group_reduce(u64 n, u64 cols, unsigned int axis, u64 segments, const unsigned int* layout, u64 count, double* sums, F body) {
+    if (axis == 3u) {
+        columns_reduce<3>(n, cols, segments, layout, count, false, true, sums, [&](u64 i, unsigned int g, double* e) { return body(i, g, e[0], e[1], e[2]); });
+        return;
+    }
     __shared__ double partial[3][BLOCK / 32];
     const u64 rows = cols > 0 ? n / cols : 0;
     const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
@@ -4015,6 +4095,21 @@ extern "C" __global__ void group_curvature_f32_bf16(u64 n, u64 cols, unsigned in
 template <typename T, typename G>
 __device__ void group_line_terms_body(u64 n, u64 cols, unsigned int axis, u64 segments, const unsigned int* layout, u64 count,
     const G* gradient, const G* draw, const T* curvature, const T* before, const T* mean, const T* log_sd, T* direction, double* sums) {
+    if (axis == 3u) {
+        columns_reduce<5>(n, cols, segments, layout, count, true, false, sums, [&](u64 i, unsigned int, double* e) -> bool {
+            T d = before[i] - mean[i];
+            direction[i] = d;
+            if (log_sd[i] == (T)NEG_INF) return false;
+            double dd = (double)d;
+            e[0] = (double)entry_load(gradient[i]) * dd;
+            e[1] = dd * dd;
+            e[2] = (double)before[i] * dd;
+            e[3] = (double)entry_load(draw[i]) * dd;
+            e[4] = (double)(curvature[i] * d) * dd;
+            return true;
+        });
+        return;
+    }
     __shared__ double partial[5][BLOCK / 32];
     const u64 rows = cols > 0 ? n / cols : 0;
     const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
@@ -5730,7 +5825,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 (masters, m, g) => return Err(shape(format!("{masters:?} masters with a {m:?} momentum and a {g:?} gradient"))),
             };
             let count = variance.len() as u64;
-            let (cols, axis, chunks) = (groups.cols as u64, groups.code(), groups.chunks() as u64);
+            let (cols, axis, chunks) = (groups.cols as u64, groups.reduce_code(), groups.chunks() as u64);
             let mut builder = self.stream.launch_builder(&f);
             builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).arg(&step.gradient_scale).arg(&step.factor_scale).arg(&step.tokens).arg(&step.beta1).arg(&step.beta2).arg(&c1).arg(&noise);
             builder.input(gradient, gradients)?.input(factor, gradients)?.arg(index_slice(&groups.layout)?).arg(slice(variance)?);
@@ -5743,7 +5838,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
         pub(super) fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &super::GroupMap, sums: &mut Tensor) -> Result<(), GpuError> {
             let (n, storage) = (mean.len() as u64, mean.storage());
             let (f, count) = (self.posterior_kernel("group_moments", storage)?, sums.rows as u64);
-            let (cols, axis, chunks) = (groups.cols as u64, groups.code(), groups.chunks() as u64);
+            let (cols, axis, chunks) = (groups.cols as u64, groups.reduce_code(), groups.chunks() as u64);
             let mut builder = self.stream.launch_builder(&f);
             builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(&groups.layout)?).arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers, checked by the caller; float64 sums of `count` rows.
@@ -5758,7 +5853,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 (masters, u) => return Err(shape(format!("{masters:?} masters with a {u:?} Gauss–Newton factor"))),
             };
             let count = sums.rows as u64;
-            let (cols, axis, chunks) = (groups.cols as u64, groups.code(), groups.chunks() as u64);
+            let (cols, axis, chunks) = (groups.cols as u64, groups.reduce_code(), groups.chunks() as u64);
             let mut builder = self.stream.launch_builder(&f);
             builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).input(factor, factors)?.input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(&groups.layout)?).arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers, checked by the caller; float64 sums of `count` rows.
@@ -5782,7 +5877,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 (masters, g) => return Err(shape(format!("{masters:?} masters with a {g:?} gradient"))),
             };
             let count = sums.rows as u64;
-            let (cols, axis, chunks) = (groups.cols as u64, groups.code(), groups.chunks() as u64);
+            let (cols, axis, chunks) = (groups.cols as u64, groups.reduce_code(), groups.chunks() as u64);
             let mut builder = self.stream.launch_builder(&f);
             builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).input(gradient, draws)?.input(draw, draws)?;
             for t in [curvature, before, mean, log_sd] {

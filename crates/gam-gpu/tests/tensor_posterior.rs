@@ -584,6 +584,69 @@ fn moves_are_the_copies_and_axpys_they_replace() {
     }
 }
 
+/// CUDA's reduction over groups of one column each (eight adjacent columns per block) against the
+/// same entries transposed and grouped by rows, which the per-segment reduction takes in the same
+/// order: every group sum, and every entry the kernels write, bit for bit. 600 rows (two full
+/// passes of a block and part of a third) and 20 columns in a shuffled group order (two full tiles
+/// of columns not adjacent in group order, and part of a third), groups 18 and 19 beyond the count,
+/// and removed entries; the momentum in `momenta`'s storage.
+fn single_columns_match_their_transposes(fit: &Device, momenta: &Device, wide: &Device) {
+    let (rows, cols, count) = (600, 20, 18);
+    let group = |c: usize| ((c * 7) % cols) as u32;
+    let ids: Vec<u32> = (0..rows * cols).map(|i| group(i % cols)).collect();
+    let by_rows: Vec<u32> = (0..cols * rows).map(|i| group(i / rows)).collect();
+    let (map, map_t) = (fit.group_map(&ids, (rows, cols)).unwrap(), fit.group_map(&by_rows, (cols, rows)).unwrap());
+    assert_eq!((map.axis(), map_t.axis()), (GroupAxis::Columns, GroupAxis::Rows));
+    let (mut mean, mut log_sd) = (matrix(rows, cols, 1, 0.5, 0.0), matrix(rows, cols, 2, 0.5, -3.0));
+    for i in (0..rows * cols).filter(|i| i % 37 == 0) {
+        mean[(i / cols, i % cols)] = 0.0;
+        log_sd[(i / cols, i % cols)] = f64::NEG_INFINITY;
+    }
+    let (momentum, curvature, power) = (matrix(rows, cols, 3, 0.1, 0.0), matrix(rows, cols, 4, 0.5, 1.0), matrix(rows, cols, 5, 0.01, 0.02));
+    let (gradient, factor, before) = (matrix(rows, cols, 7, 3.0, 0.0), matrix(rows, cols, 8, 2.0, 0.0), &mean + &matrix(rows, cols, 9, 0.05, 0.0));
+    let both = |d: &Device, a: &Array2<f64>| (d.upload(a.view()).unwrap(), d.upload(a.t().as_standard_layout().view()).unwrap());
+    let back = |t: &Tensor| fit.download(t).unwrap().t().as_standard_layout().to_owned();
+    let pair = |what: &str, (a, b): (&Tensor, &Tensor), d: &Device| assert_eq!(d.download(a).unwrap(), d.download(b).unwrap(), "{} {what}", fit.name());
+    let ((m, mt), (s, st), (u, ut)) = (both(fit, &mean), both(fit, &log_sd), both(fit, &factor));
+    let sums = |columns: usize| (wide.zeros(count, columns).unwrap(), wide.zeros(count, columns).unwrap());
+    let (mut x, mut y) = sums(3);
+    fit.group_moments((&m, &s), &map, &mut x).unwrap();
+    fit.group_moments((&mt, &st), &map_t, &mut y).unwrap();
+    pair("moments", (&x, &y), wide);
+    let (mut x, mut y) = sums(3);
+    fit.group_curvature((&u, &m, &s), &map, &mut x).unwrap();
+    fit.group_curvature((&ut, &mt, &st), &map_t, &mut y).unwrap();
+    pair("curvature", (&x, &y), wide);
+    let ((g, gt), (h, ht), (b, bt)) = (both(fit, &gradient), both(fit, &curvature), both(fit, &before));
+    let (mut d, mut dt) = (fit.zeros(rows, cols).unwrap(), fit.zeros(cols, rows).unwrap());
+    let (mut x, mut y) = sums(5);
+    fit.group_line_terms((&g, &u, &h), (&b, &m, &s), &map, (&mut d, &mut x)).unwrap();
+    fit.group_line_terms((&gt, &ut, &ht), (&bt, &mt, &st), &map_t, (&mut dt, &mut y)).unwrap();
+    pair("line terms", (&x, &y), wide);
+    assert_eq!(fit.download(&d).unwrap(), back(&dt), "{} directions", fit.name());
+    let variance = wide.upload_vec(count, 1, (0..count).map(|g| 0.01 * (g + 1) as f64).collect()).unwrap();
+    let step = case(GroupAxis::Rows).step;
+    let ((mut m, mut mt), (mut s, mut st)) = (both(fit, &mean), both(fit, &log_sd));
+    let ((mut p, mut pt), (mut c, mut ct), (mut q, mut qt)) = (both(momenta, &momentum), both(fit, &curvature), both(fit, &power));
+    let (mut x, mut y) = sums(3);
+    fit.posterior_ivon((&mut m, &mut s), [&mut p, &mut c, &mut q], (&g, &u), (&map, &variance), &mut x, &step).unwrap();
+    fit.posterior_ivon((&mut mt, &mut st), [&mut pt, &mut ct, &mut qt], (&gt, &ut), (&map_t, &variance), &mut y, &step).unwrap();
+    pair("step sums", (&x, &y), wide);
+    for (what, a, b) in [("mean", &m, &mt), ("log sd", &s, &st), ("momentum", &p, &pt), ("curvature", &c, &ct), ("power", &q, &qt)] {
+        assert_eq!(fit.download(a).unwrap(), back(b), "{} stepped {what}", fit.name());
+    }
+}
+
+#[test]
+fn cuda_single_column_groups_reduce_as_their_transposes() {
+    let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
+    let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
+    let half = wide.with_storage(Storage::Bf16).expect("CUDA holds bfloat16");
+    single_columns_match_their_transposes(&narrow, &narrow, &wide);
+    single_columns_match_their_transposes(&narrow, &half, &wide);
+    single_columns_match_their_transposes(&wide, &wide, &wide);
+}
+
 #[test]
 fn removal_sums_on_the_host_match_their_formulas() {
     let host = Device::host();
