@@ -554,6 +554,9 @@ impl ResidentHead {
         } else {
             None
         };
+        // `μ · h` per row, queued ahead of the sweep, so the sweep's download (which waits for the
+        // device) finds it made and the scoring waits on the device once.
+        let dots = d.block_products(hidden, &target.mu, &self.width).map_err(error)?;
         let mut draws = None;
         let partitions = match (draw, seed.as_mut()) {
             (Some(uniforms), Some(seed)) => {
@@ -583,12 +586,7 @@ impl ResidentHead {
                 )
                 .map_err(error)?,
         };
-        let dots = d
-            .download(
-                &d.block_products(hidden, &target.mu, &self.width)
-                    .map_err(error)?,
-            )
-            .map_err(error)?;
+        let dots = d.download(&dots).map_err(error)?;
         let losses = (0..hidden.rows())
             .map(|r| {
                 let loss = if target.scored.as_ref().is_some_and(|s| !s[r]) {
