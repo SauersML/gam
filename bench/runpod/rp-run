@@ -827,8 +827,13 @@ case ${1:-} in
         done
         [ ${#todo[@]} -gt 0 ] || { echo "rp-run: all already published" >&2; exit 0; }
         echo "rp-run: publishing ${#todo[@]} files, $(du -chL "${todo[@]}" | tail -n 1 | cut -f1)" >&2
-        printf '%s\n' "${todo[@]}" | xargs -P 4 -I{} gh release upload rp-run-data -R SauersML/gam {} --clobber
+        # The listing decides: gh can report an error for an upload that completed.
+        printf '%s\n' "${todo[@]}" | xargs -P 4 -I{} gh release upload rp-run-data -R SauersML/gam {} || true
+        have=$(published_data)
+        missing=0
+        for f in "${todo[@]}"; do grep -qx "${f##*/}" <<< "$have" || { echo "rp-run: ${f##*/} did not upload" >&2; missing=1; }; done
         rm -f "${todo[@]}"
+        (( ! missing )) || { echo "rp-run: some files did not publish; run rp-run publish again" >&2; exit 1; }
         echo "rp-run: published; runs naming these files download them on the pod" >&2
         exit 0 ;;
     batch)
