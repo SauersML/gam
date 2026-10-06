@@ -1857,9 +1857,6 @@ impl Scorer {
         let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
         // Edits act on the starting library's parts, fixed through the fit: `M`'s targets for an
         // edit depend on them, and the experiments stay one fixed collection.
-        if settings.families.contains(&interchange::Family::CutConnection) {
-            return Err("library fit: cut_connection scores explanations and has no reverse pass to train them".into());
-        }
         if settings.families.iter().any(|f| *f != interchange::Family::Read) {
             experiments.set_parts(interchange::parts_of(&explanation.artifact.program, sites.len())?)?;
         }
@@ -3340,8 +3337,24 @@ pub fn fit_from(
             if let Some((bits, at)) = progress.best.take() {
                 log::info!("library fit stops after epoch {epoch}: back to the best epoch's posterior ({:.6e} bits)", bits / LN_2);
                 if at != epoch {
+                    // Back to every state the best snapshot's `F` was scored at: the posterior's
+                    // means and deviations, its active groups and the prior term's state (its
+                    // parameters and structure), so the restored state scores the recorded best.
+                    // The optimizer continues from there rather than from the best epoch's own
+                    // state: IVON's iterate is the restored mean, the momentum and its bias
+                    // correction of every operator whose values changed are zeroed (its gradients
+                    // were taken along the abandoned path, `DevicePosterior::set_values`), and the
+                    // curvature `h`, the step-length averages `ρ̄` and `r̄` and the step count carry
+                    // on: averages of measurements of `F` near the posterior over the last epoch,
+                    // which the removal round below changes and the next epoch re-estimates.
                     writer.wait()?;
-                    posterior = checkpoint_posterior(explanation, &best_path)?;
+                    let (restored, start) = read_checkpoint(explanation, &best_path)?;
+                    posterior = restored;
+                    match (prior.as_deref_mut(), start.state.and_then(|state| state.prior)) {
+                        (Some(prior), Some(state)) => prior.load(&state)?,
+                        (None, None) => {}
+                        _ => return Err("the best epoch's snapshot holds another prior term's state".into()),
+                    }
                     device_posterior.set_values(&posterior)?;
                 }
             }
@@ -3357,9 +3370,11 @@ pub fn fit_from(
             // The objective changed discretely: convergence is judged afresh.
             progress.previous = None;
         } else if is_best {
-            // The best posterior so far, kept on disk rather than as a copy on the host.
+            // The best posterior so far, kept on disk rather than as a copy on the host, with the
+            // prior term's state its snapshot was scored at.
             let mut kept = progress.clone();
             kept.active = posterior.active.clone();
+            kept.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
             Snapshot::save(&mut kept, &device_posterior, &best_path, &mut writer)?;
         }
         progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
@@ -5201,6 +5216,56 @@ mod tests {
             self.steps = value["steps"].as_u64().ok_or("a saved step count")?;
             Ok(())
         }
+    }
+
+    /// A prior term whose cost rises by `rise` nats at every epoch after the first (its structure
+    /// chosen afresh, `PriorTerm::epoch`), so each epoch's snapshot of `F` is above the one before:
+    /// the fit stops after its second epoch and goes back to the first.
+    struct Rising {
+        epochs: u64,
+        rise: f64,
+    }
+
+    impl PriorTerm for Rising {
+        fn operators(&self) -> Vec<usize> {
+            Vec::new()
+        }
+        fn epoch(&mut self, _: &Explanation, _: &Posterior) -> Result<(), String> {
+            self.epochs += 1;
+            Ok(())
+        }
+        fn sample(&mut self, posterior: &Posterior, _: &BTreeMap<usize, Array2<f64>>, _: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String> {
+            Ok((self.cost(posterior)?, BTreeMap::new()))
+        }
+        fn cost(&self, _: &Posterior) -> Result<f64, String> {
+            Ok(self.rise * self.epochs as f64)
+        }
+        fn save(&self) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({ "epochs": self.epochs }))
+        }
+        fn load(&mut self, value: &serde_json::Value) -> Result<(), String> {
+            self.epochs = value["epochs"].as_u64().ok_or("a saved epoch count")?;
+            Ok(())
+        }
+    }
+
+    /// Going back to the best epoch restores every state its snapshot was scored at, the prior
+    /// term's with the posterior: with a prior whose cost rises at each epoch, the fit stops after
+    /// its second epoch, and the removal round's `F` before any removal, scored at the restored
+    /// state, is the first epoch's snapshot (the recorded best), not the second's.
+    #[test]
+    fn going_back_to_the_best_epoch_restores_the_prior_terms_state() {
+        let (native, layers, _, sequences) = tiny("library_best_prior", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let (train, held) = sequences.split_at(4);
+        let mut prior = Rising { epochs: 0, rise: 1e6 };
+        let fitted = fit(&Device::host(), &native, &explanation, train, held, &settings(), "tiny", None, Some(&mut prior)).unwrap();
+        let (epochs, removals) = (&fitted.report.epochs, &fitted.report.removals);
+        assert!(epochs.len() >= 2 && !removals.is_empty(), "{} epochs, {} removal rounds", epochs.len(), removals.len());
+        let rise = epochs[1].snapshot_bits - epochs[0].snapshot_bits;
+        assert!(epochs[1].improvement_bits.is_some_and(|i| i < 0.0) && rise > 0.5e6 / LN_2, "the second epoch's snapshot rises by {rise} bits");
+        let (best, restored) = (epochs[0].snapshot_bits, removals[0].before_bits);
+        assert!((restored - best).abs() <= 1e-9 * best.abs(), "F at the restored state {restored} against the best epoch's {best} (the second's {})", epochs[1].snapshot_bits);
     }
 
     /// The per-token activity counts leave out the positions where a layer's block runs `M`'s MLP
