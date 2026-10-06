@@ -4781,21 +4781,26 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             let stride = rows.div_ceil(4) * 4;
             let x = slice32(a)?;
             let (rows_u, cols_u, stride_u, slices_u) = (u32_of(rows)?, u32_of(cols)?, u32_of(stride)?, u32_of(slices)?);
-            let mut exponents = self.stream.alloc_zeros::<i32>(cols).gpu_ctx("split exponents")?;
+            // Every buffer below is written whole before it is read (each column's exponent, every
+            // slice entry with the padding rows, each product with β = 0 first), so none is zeroed.
+            // SAFETY: `split_exponents` writes all cols entries.
+            let mut exponents = unsafe { self.stream.alloc::<i32>(cols) }.gpu_ctx("split exponents")?;
             let f = self.kernel("split_exponents", Storage::F32)?;
-            let cfg = LaunchConfig { grid_dim: (cols.div_ceil(BLOCK as usize) as u32, 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
+            let tiles = u32_of(cols.div_ceil(32))?;
+            let cfg = LaunchConfig { grid_dim: (tiles, 1, 1), block_dim: (32, 32, 1), shared_mem_bytes: 0 };
             // SAFETY: `x` holds rows × cols floats and `exponents` cols integers.
             unsafe { self.stream.launch_builder(&f).arg(&rows_u).arg(&cols_u).arg(x).arg(&mut exponents).launch(cfg) }.gpu_ctx("split_exponents")?;
-            let mut parts = self.stream.alloc_zeros::<i8>(slices * cols * stride).gpu_ctx("split slices")?;
+            // SAFETY: `split_slices` writes every one of the slices × cols × stride bytes.
+            let mut parts = unsafe { self.stream.alloc::<i8>(slices * cols * stride) }.gpu_ctx("split slices")?;
             let f = self.kernel("split_slices", Storage::F32)?;
+            let cfg = LaunchConfig { grid_dim: (tiles, u32_of(stride.div_ceil(32))?, 1), block_dim: (32, 8, 1), shared_mem_bytes: 0 };
             // SAFETY: `parts` holds slices × cols × stride bytes.
-            unsafe { self.stream.launch_builder(&f).arg(&rows_u).arg(&cols_u).arg(&stride_u).arg(&slices_u).arg(x).arg(&exponents).arg(&mut parts).launch(cfg_elements((stride * cols) as u64)) }
-                .gpu_ctx("split_slices")?;
-            let mut product = self.stream.alloc_zeros::<i32>(cols * cols).gpu_ctx("split product")?;
+            unsafe { self.stream.launch_builder(&f).arg(&rows_u).arg(&cols_u).arg(&stride_u).arg(&slices_u).arg(x).arg(&exponents).arg(&mut parts).launch(cfg) }.gpu_ctx("split_slices")?;
+            // SAFETY: each shift's first product writes all cols × cols entries (β = 0).
+            let mut product = unsafe { self.stream.alloc::<i32>(cols * cols) }.gpu_ctx("split product")?;
             let combine = self.kernel("split_combine", Storage::F32)?;
             let g = slice_mut(c)?;
             let (n, k) = (i32_of(cols)?, i32_of(stride)?);
-            let tiles = u32_of(cols.div_ceil(32))?;
             for shift in 0..slices {
                 for s in 0..=shift / 2 {
                     let t = shift - s;

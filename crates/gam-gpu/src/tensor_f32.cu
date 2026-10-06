@@ -806,28 +806,45 @@ extern "C" __global__ void head_finish(unsigned int rows, unsigned int width, co
 }
 
 // The Ozaki split of a Gram matrix's operand (Device::gram_split). Per column j of the rows × cols
-// row-major x, the exponent e_j with every |x_kj| < 2^e_j (0 for a zero column).
+// row-major x, the exponent e_j with every |x_kj| < 2^e_j (0 for a zero column): 32 columns per
+// block, its 32 rows of threads striding down them, the maxima reduced through shared memory.
 extern "C" __global__ void split_exponents(unsigned int rows, unsigned int cols, const float* x, int* e) {
-    unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= cols) return;
+    __shared__ float part[32][33];
+    unsigned int j = blockIdx.x * 32 + threadIdx.x;
     float m = 0.0f;
-    for (unsigned int k = 0; k < rows; ++k) m = fmaxf(m, fabsf(x[(u64)k * cols + j]));
-    int p = 0;
-    if (m > 0.0f) frexpf(m, &p);
-    e[j] = p;
+    if (j < cols)
+        for (unsigned int k = threadIdx.y; k < rows; k += 32) m = fmaxf(m, fabsf(x[(u64)k * cols + j]));
+    part[threadIdx.y][threadIdx.x] = m;
+    __syncthreads();
+    if (threadIdx.y == 0 && j < cols) {
+        for (unsigned int y = 1; y < 32; ++y) m = fmaxf(m, part[y][threadIdx.x]);
+        int p = 0;
+        if (m > 0.0f) frexpf(m, &p);
+        e[j] = p;
+    }
 }
 
 // The int8 slices a_s of x: x_kj = 2^(e_j - 7) Σ_{s < slices} a_s,kj 2^(-7 s) + r_kj with
 // |r_kj| < 2^(e_j - 7 slices), each |a| ≤ 127 (truncation of a scaled value below 128 in magnitude;
 // every step exact in float). Slice s is column-major (rows padded with zeros to `stride`) at
-// out + s · cols · stride.
+// out + s · cols · stride. 32 × 32 tiles through shared memory, read along x's rows and written
+// along the slices' columns.
 extern "C" __global__ void split_slices(unsigned int rows, unsigned int cols, unsigned int stride, unsigned int slices, const float* x, const int* e, signed char* out) {
-    GRID_STRIDE(i, (u64)stride * cols) {
-        unsigned int j = (unsigned int)(i / stride), k = (unsigned int)(i % stride);
-        float v = k < rows ? ldexpf(x[(u64)k * cols + j], 7 - e[j]) : 0.0f;
+    __shared__ float tile[32][33];
+    unsigned int j0 = blockIdx.x * 32, k0 = blockIdx.y * 32;
+    for (unsigned int y = threadIdx.y; y < 32; y += blockDim.y) {
+        unsigned int k = k0 + y, j = j0 + threadIdx.x;
+        tile[y][threadIdx.x] = (k < rows && j < cols) ? x[(u64)k * cols + j] : 0.0f;
+    }
+    __syncthreads();
+    for (unsigned int y = threadIdx.y; y < 32; y += blockDim.y) {
+        unsigned int j = j0 + y, k = k0 + threadIdx.x;
+        if (j >= cols || k >= stride) continue;
+        float v = k < rows ? ldexpf(tile[threadIdx.x][y], 7 - e[j]) : 0.0f;
+        u64 at = (u64)j * stride + k;
         for (unsigned int s = 0; s < slices; ++s) {
             float a = truncf(v);
-            out[(u64)s * cols * stride + i] = (signed char)a;
+            out[(u64)s * cols * stride + at] = (signed char)a;
             v = (v - a) * 128.0f;
         }
     }
