@@ -3121,23 +3121,41 @@ fn expected_divergence(
     settings: &Settings,
     prior: Option<&mut (dyn PriorTerm + 'static)>,
 ) -> Result<f64, String> {
+    let timed = Instant::now();
     let mut trial = posterior.clone();
     trial.remove(removed);
+    let cloned = timed.elapsed().as_secs_f64();
     // The trial goes to the device once; each batch's weight sample is drawn there.
     device_posterior.set_values(&trial)?;
+    let uploaded = timed.elapsed().as_secs_f64();
     let mut prior = prior;
     let (mut bits, mut prior_nats) = (0.0, 0.0);
+    let (mut preparing, mut targeting) = (0.0, 0.0);
     for (b, draw) in draws.iter().enumerate() {
         // Removal zeroes entries, so the remaining entries see the same noise as the full posterior.
         let key = noise_seed(settings.seed, 0, b);
+        let started = Instant::now();
         let experiments = scorer.experiments(draw, sequences)?;
-        let scored = scorer.score_device(device_posterior, &draw.batch(sequences)?, &experiments, Some(key), false)?.0;
+        let batch = draw.batch(sequences)?;
+        preparing += started.elapsed().as_secs_f64();
+        let started = Instant::now();
+        let targets = scorer.experiments.targets(&batch, &experiments)?;
+        targeting += started.elapsed().as_secs_f64();
+        let scored = scorer.evaluate_device(device_posterior, (&batch, &experiments), Some(key), &targets, false)?.0;
         bits += scored.iter().flatten().sum::<f64>();
         if let Some(prior) = prior.as_deref_mut() {
             prior_nats += prior.sample(&trial, &host_sample(&trial, &prior.operators(), key), false)?.0;
         }
     }
     let cost = prior.as_deref().map_or(Ok(0.0), |p| p.cost(&trial))?;
+    let total = timed.elapsed().as_secs_f64();
+    log::info!(
+        "library removal evaluation: {total:.2} s: trial clone {cloned:.2} s, set_values {:.2} s, {} batches {:.2} s (experiments {preparing:.2} s, targets {targeting:.2} s, scoring {:.2} s)",
+        uploaded - cloned,
+        draws.len(),
+        total - uploaded,
+        total - uploaded - preparing - targeting
+    );
     Ok(bits * LN_2 + prior_nats / draws.len() as f64 + cost)
 }
 
@@ -3163,8 +3181,11 @@ fn remove(
 ) -> Result<Removal, String> {
     let mut prior = prior;
     let (fixed, Evidence { draws, sequences, settings }) = (explanation.fixed_nats, evidence);
+    let timed = Instant::now();
     let compensation = Compensation::new(&mut scorer.experiments, explanation, posterior, sequences, settings.batch_sequences)?;
+    let compensated = timed.elapsed().as_secs_f64();
     let curvature = removal_curvature(scorer, device_posterior, draws, sequences, settings)?;
+    log::info!("library removal setup: compensation Gram {compensated:.1} s, curvature {:.1} s", timed.elapsed().as_secs_f64() - compensated);
     let mut objective = |trial: &Posterior| -> Result<f64, String> {
         Ok(expected_divergence(scorer, device_posterior, trial, draws, sequences, &[], settings, prior.as_deref_mut())? + trial.description() + fixed)
     };

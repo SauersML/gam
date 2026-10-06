@@ -929,7 +929,9 @@ pub fn round(
         let mut test = |k: usize, kind: &str| -> Result<bool, String> {
             let timed = Instant::now();
             let groups = proposal(k)?;
-            let change = objective(&trial(base, &groups)?)? - current;
+            let proposed = trial(base, &groups)?;
+            let trial_seconds = timed.elapsed().as_secs_f64();
+            let change = objective(&proposed)? - current;
             if !change.is_finite() {
                 return Err(error("a nonfinite removal objective"));
             }
@@ -939,7 +941,7 @@ pub fn round(
             journal.write(json!({
                 "event": "proposal", "kind": kind, "units": k, "groups": groups, "layers": names(&groups),
                 "predicted_bits": predicted / LN_2, "measured_bits": change / LN_2,
-                "accepted": change <= 0.0, "seconds": timed.elapsed().as_secs_f64(),
+                "accepted": change <= 0.0, "seconds": timed.elapsed().as_secs_f64(), "trial_seconds": trial_seconds,
             }))?;
             evaluations.push((groups.len(), change / LN_2));
             changes.insert(k, change);
