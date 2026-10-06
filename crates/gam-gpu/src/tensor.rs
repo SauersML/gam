@@ -3982,6 +3982,9 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
         /// The row flags of a call that scores every row (never read).
         every_row: CudaSlice<u32>,
         gemm_workspace: std::sync::Mutex<F32Workspace>,
+        /// [`Engine::gram_split`]'s exponents, slices and int32 product, kept from call to call: a
+        /// fresh stream-ordered allocation of them maps new pages (up to 8.6 ms each on a 4090).
+        split_workspace: std::sync::Mutex<SplitWorkspace>,
         /// Whether the stream is being captured into a graph.
         capturing: AtomicBool,
         /// cuBLAS's workspace inside captures (a recorded product may not allocate), kept for the
@@ -3991,6 +3994,24 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
 
     /// The cuBLAS workspace captured products use.
     const CAPTURE_WORKSPACE: usize = 32 << 20;
+
+    #[derive(Default)]
+    struct SplitWorkspace {
+        exponents: Option<CudaSlice<i32>>,
+        parts: Option<CudaSlice<i8>>,
+        product: Option<CudaSlice<i32>>,
+    }
+
+    /// `held` grown to at least `n` values (its old values dropped, never read: every user writes
+    /// what it reads first).
+    fn at_least<T: DeviceRepr>(stream: &Arc<CudaStream>, held: &mut Option<CudaSlice<T>>, n: usize) -> Result<(), GpuError> {
+        if held.as_ref().is_none_or(|h| h.len() < n) {
+            *held = None;
+            // SAFETY: the buffer's values are written before they are read (`Engine::gram_split`).
+            *held = Some(unsafe { stream.alloc::<T>(n.max(1)) }.gpu_ctx("split workspace")?);
+        }
+        Ok(())
+    }
 
     #[derive(Default)]
     struct F32Workspace {
@@ -4190,6 +4211,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 checked_interval_module: crate::device_cache::PtxModuleCache::new(),
                 every_row,
                 gemm_workspace: std::sync::Mutex::new(F32Workspace::default()),
+                split_workspace: std::sync::Mutex::new(SplitWorkspace::default()),
                 capturing: AtomicBool::new(false),
                 capture_workspace: std::sync::Mutex::new(None),
             })
@@ -4782,22 +4804,26 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             let x = slice32(a)?;
             let (rows_u, cols_u, stride_u, slices_u) = (u32_of(rows)?, u32_of(cols)?, u32_of(stride)?, u32_of(slices)?);
             // Every buffer below is written whole before it is read (each column's exponent, every
-            // slice entry with the padding rows, each product with β = 0 first), so none is zeroed.
-            // SAFETY: `split_exponents` writes all cols entries.
-            let mut exponents = unsafe { self.stream.alloc::<i32>(cols) }.gpu_ctx("split exponents")?;
+            // slice entry with the padding rows, each product with β = 0 first), so none is zeroed,
+            // and they are kept for the next call (held for this one, which orders their reuse on
+            // the stream).
+            let mut workspace = self.split_workspace.lock().map_err(|_| shape("poisoned split workspace".to_string()))?;
+            let SplitWorkspace { exponents, parts, product } = &mut *workspace;
+            at_least(&self.stream, exponents, cols)?;
+            at_least(&self.stream, parts, slices * cols * stride)?;
+            at_least(&self.stream, product, cols * cols)?;
+            let (Some(exponents), Some(parts), Some(product)) = (exponents.as_mut(), parts.as_mut(), product.as_mut()) else {
+                return Err(shape("split workspace missing".to_string()));
+            };
             let f = self.kernel("split_exponents", Storage::F32)?;
             let tiles = u32_of(cols.div_ceil(32))?;
             let cfg = LaunchConfig { grid_dim: (tiles, 1, 1), block_dim: (32, 32, 1), shared_mem_bytes: 0 };
             // SAFETY: `x` holds rows × cols floats and `exponents` cols integers.
-            unsafe { self.stream.launch_builder(&f).arg(&rows_u).arg(&cols_u).arg(x).arg(&mut exponents).launch(cfg) }.gpu_ctx("split_exponents")?;
-            // SAFETY: `split_slices` writes every one of the slices × cols × stride bytes.
-            let mut parts = unsafe { self.stream.alloc::<i8>(slices * cols * stride) }.gpu_ctx("split slices")?;
+            unsafe { self.stream.launch_builder(&f).arg(&rows_u).arg(&cols_u).arg(x).arg(&mut *exponents).launch(cfg) }.gpu_ctx("split_exponents")?;
             let f = self.kernel("split_slices", Storage::F32)?;
             let cfg = LaunchConfig { grid_dim: (tiles, u32_of(stride.div_ceil(32))?, 1), block_dim: (32, 8, 1), shared_mem_bytes: 0 };
             // SAFETY: `parts` holds slices × cols × stride bytes.
-            unsafe { self.stream.launch_builder(&f).arg(&rows_u).arg(&cols_u).arg(&stride_u).arg(&slices_u).arg(x).arg(&exponents).arg(&mut parts).launch(cfg) }.gpu_ctx("split_slices")?;
-            // SAFETY: each shift's first product writes all cols × cols entries (β = 0).
-            let mut product = unsafe { self.stream.alloc::<i32>(cols * cols) }.gpu_ctx("split product")?;
+            unsafe { self.stream.launch_builder(&f).arg(&rows_u).arg(&cols_u).arg(&stride_u).arg(&slices_u).arg(x).arg(&*exponents).arg(&mut *parts).launch(cfg) }.gpu_ctx("split_slices")?;
             let combine = self.kernel("split_combine", Storage::F32)?;
             let g = slice_mut(c)?;
             let (n, k) = (i32_of(cols)?, i32_of(stride)?);
@@ -4842,7 +4868,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 let shift = i32::try_from(shift).map_err(|_| shape("slices".to_string()))?;
                 let cfg = LaunchConfig { grid_dim: (tiles, tiles, 1), block_dim: (32, 8, 1), shared_mem_bytes: 0 };
                 // SAFETY: `product` holds cols × cols integers, `exponents` cols, `g` cols × cols doubles.
-                unsafe { self.stream.launch_builder(&combine).arg(&cols_u).arg(&shift).arg(&product).arg(&exponents).arg(&mut *g).launch(cfg) }.gpu_ctx("split_combine")?;
+                unsafe { self.stream.launch_builder(&combine).arg(&cols_u).arg(&shift).arg(&*product).arg(&*exponents).arg(&mut *g).launch(cfg) }.gpu_ctx("split_combine")?;
             }
             Ok(())
         }
