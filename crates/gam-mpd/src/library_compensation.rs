@@ -943,10 +943,10 @@ mod tests {
         let path = dir.join("layer_1.safetensors");
         crate::test_support::transcoder_file(&path, 64, 8, 3);
         let transcoders = BTreeMap::from([(1, Transcoder::open(&path).unwrap())]);
-        let counts = firing(&Device::host(), &native, &layers, &transcoders, &sequences, 2).unwrap();
-        let kept: Vec<usize> = (0..64).filter(|&f| counts[&1][f] > 0).collect();
+        let fired = firing(&Device::host(), &native, &layers, &transcoders, &sequences, 2).unwrap();
+        let kept: Vec<usize> = (0..64).filter(|&f| fired[&1].counts[f] > 0).collect();
         let kept_path = dir.join("kept_1.safetensors");
-        transcoders[&1].write_kept(&kept, &kept_path).unwrap();
+        transcoders[&1].write_kept(&kept, &fired[&1].sink, &kept_path).unwrap();
         let explanation = library_mdl::explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
         let mut posterior = Posterior::new(&explanation, CONCENTRATED).expect("the posterior");
         copy_reads(&explanation, &mut posterior, 1, 0, 1);

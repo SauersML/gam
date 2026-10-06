@@ -7,8 +7,8 @@
 //! The features that fire on those tokens at `M`'s MLP input are kept (`OUT/kept.safetensors`);
 //! the library explanation with that layer's MLP replaced by them is run, and `OUT/CHECK.json`
 //! holds the largest difference between the library block's output and the full transcoder's own
-//! reconstruction `Σ_i relu(g_i·x + c_i) u_i + b` at the block's input (`M`'s own MLP output at
-//! each sequence's first token, where the block runs `M`'s MLP), against the reconstruction's
+//! reconstruction `Σ_i relu(g_i·x + c_i) u_i + b` at the block's input (the block's sink vector at
+//! each sequence's first token, `M`'s MLP output there averaged over the rows), against the reconstruction's
 //! largest entry, and the count of kept functions that are off (exactly zero) per token after the
 //! first.
 use gam_gpu::tensor::Device;
@@ -44,11 +44,11 @@ fn main() -> Result<(), String> {
     let layers = layer_nodes(&native, layer + 1)?;
     let mut transcoders = BTreeMap::new();
     transcoders.insert(layer, library_transcoder::Transcoder::open(Path::new(transcoder))?);
-    let counts = library_transcoder::firing(&Device::host(), &native, &layers, &transcoders, &sequences, 1)?;
+    let fired = library_transcoder::firing(&Device::host(), &native, &layers, &transcoders, &sequences, 1)?;
     let full = &transcoders[&layer];
-    let kept: Vec<usize> = (0..full.features).filter(|&f| counts[&layer][f] > 0).collect();
+    let kept: Vec<usize> = (0..full.features).filter(|&f| fired[&layer].counts[f] > 0).collect();
     let kept_path = out.join("kept.safetensors");
-    full.write_kept(&kept, &kept_path)?;
+    full.write_kept(&kept, &fired[&layer].sink, &kept_path)?;
     let explanation = library_mdl::explanation_with(&native, &layers, &BTreeMap::from([(layer, kept_path)]))?;
     explanation.artifact.validate_coverage(&native)?;
     let family = library_mdl::sequence_family(&sequences.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
@@ -59,9 +59,11 @@ fn main() -> Result<(), String> {
     let mut reference = full.reconstruction(x)?;
     let native_trace = native.execute(&family, false).map_err(|e| e.to_string())?;
     let first: Vec<bool> = family.layout.as_ref().ok_or("a layout")?.position.iter().map(|&p| p == 0).collect();
+    // The block's sink vector at first tokens, as stored (float32).
+    let sink: Vec<f64> = fired[&layer].sink.iter().map(|&v| f64::from(v as f32)).collect();
     for (row, &first) in first.iter().enumerate() {
         if first {
-            reference.row_mut(row).assign(&native_trace.values[layers[layer].mlp].row(row));
+            reference.row_mut(row).assign(&ndarray::ArrayView1::from(&sink[..]));
         }
     }
     let scale = reference.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
@@ -70,14 +72,14 @@ fn main() -> Result<(), String> {
     let native_x = native_trace.values[layers[layer].normed].clone();
     let input_difference = native_x.iter().zip(x).fold(0.0_f64, |a, (p, q)| a.max((p - q).abs()));
     let tokens = sequences.len() * (context - 1);
-    let fired: u64 = counts[&layer].iter().sum();
+    let fired_tokens: u64 = fired[&layer].counts.iter().sum();
     let record = json!({
         "layer": layer,
         "tokens": tokens,
         "features": full.features,
         "kept": kept.len(),
-        "active_per_token": fired as f64 / tokens as f64,
-        "off_per_token": kept.len() as f64 - fired as f64 / tokens as f64,
+        "active_per_token": fired_tokens as f64 / tokens as f64,
+        "off_per_token": kept.len() as f64 - fired_tokens as f64 / tokens as f64,
         "max_abs_difference": difference,
         "reconstruction_max_abs": scale,
         "relative_difference": difference / scale,

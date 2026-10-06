@@ -113,7 +113,7 @@ fn main() -> Result<(), String> {
     let kept: Vec<usize> = (0..features.min(transcoder.features)).collect();
     let k = kept.len();
     let file = Path::new(out).join(format!("kept_{layer}_{k}.safetensors"));
-    transcoder.write_kept(&kept, &file)?;
+    transcoder.write_kept(&kept, &vec![0.0; transcoder.width], &file)?;
     let stored = SafetensorsFile::open(&file).map_err(error)?;
     let units = Interface::uniform(k, 1, LabelKind::Unit, 0).map_err(error)?;
     let input = Interface::native(d).map_err(error)?;

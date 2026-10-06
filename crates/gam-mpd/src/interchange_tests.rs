@@ -848,7 +848,7 @@ fn edits_of_a_transcoder_block_are_the_hand_computation() {
     std::fs::create_dir_all(&dir).expect("a directory");
     let (full, kept) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
     crate::test_support::transcoder_file(&full, 64, 8, 3);
-    crate::library_transcoder::Transcoder::open(&full).expect("the file").write_kept(&(0..64).collect::<Vec<_>>(), &kept).expect("kept");
+    crate::library_transcoder::Transcoder::open(&full).expect("the file").write_kept(&(0..64).collect::<Vec<_>>(), &[0.0; 8], &kept).expect("kept");
     let explanation = crate::library_mdl::explanation_with(&native, &layers, &std::collections::BTreeMap::from([(1, kept)])).expect("the library");
     std::fs::remove_dir_all(&dir).expect("the directory is removed");
     let program = &explanation.artifact.program;
@@ -1045,7 +1045,7 @@ fn a_joint_removal_of_parts_is_each_removal_at_once() {
     std::fs::create_dir_all(&dir).expect("a directory");
     let (full, kept) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
     crate::test_support::transcoder_file(&full, 64, 8, 3);
-    crate::library_transcoder::Transcoder::open(&full).expect("the file").write_kept(&(0..64).collect::<Vec<_>>(), &kept).expect("kept");
+    crate::library_transcoder::Transcoder::open(&full).expect("the file").write_kept(&(0..64).collect::<Vec<_>>(), &[0.0; 8], &kept).expect("kept");
     let explanation = crate::library_mdl::explanation_with(&native, &layers, &std::collections::BTreeMap::from([(1, kept)])).expect("the library");
     std::fs::remove_dir_all(&dir).expect("the directory is removed");
     let d = Device::host();

@@ -12,18 +12,24 @@
 //! the sparsity is the functions' own, not a penalty.
 //!
 //! The first token of a sequence is outside a transcoder's domain: Qwen3's attention sink, where
-//! the MLP's input is small (norm 2.4 at layer 14, against 33 elsewhere), M's MLP output is tiny
-//! (norm 0.25) and the transcoder fires about 54,000 features with a relative error of about 3,000.
-//! So the block runs `M`'s own MLP at position 0 (its operators, fixed and not described) and the
-//! transcoder's features at every other position ([`Node::Select`]).
+//! the MLP's input is small (norm 2.4 at layer 14, against 33 elsewhere) and the transcoder fires
+//! about 54,000 features with a relative error of about 3,000. `M`'s MLP output there is nearly one
+//! vector per layer whatever the token: replacing it at every layer by its mean over the training
+//! sequences' first tokens raises KL(M ‖ M') by 0.0084 bits per token after the first (Qwen3-0.6B,
+//! 32 held-out windows of 512, the mean over 1,024 training windows), although its norm is 0.1–0.4
+//! at layers 3–15 and 295–6,694 at layers 2, 26 and 27. So the block's output at position 0 is one
+//! described vector, `library.l{l}.mlp.sink` (`d × 1`, its own prior group), started at that mean
+//! ([`firing`]), and the transcoder's features give it at every other position ([`Node::Select`]).
+//! `M`'s MLP is not run.
 //!
 //! Only features that fire on the training sample at positions after the first are kept
 //! ([`firing`]): a feature whose pre-activation is not positive on any such token adds exactly zero
 //! to the block's output on every clean training input at the starting point, so dropping it
 //! leaves the start unchanged there. The kept features are written once in the library's layout ([`Transcoder::write_kept`]): `gate`
 //! `k × d`, `gate_bias` `k × 1`, `out` `d × k` (`W_dec`'s kept rows transposed) and `bias` `d × 1`
-//! in the transcoder's own storage type (bfloat16 reals copied bit for bit), and `features` (the
-//! kept features' indices in the transcoder, as float32, exact below 2^24). The library's operators
+//! in the transcoder's own storage type (bfloat16 reals copied bit for bit), `features` (the
+//! kept features' indices in the transcoder, as float32, exact below 2^24) and `sink` (`d × 1`,
+//! float32: the start of the block's output at position 0). The library's operators
 //! read them where that file stores them ([`Operator::stored`]), with no float64 copy on the host.
 //!
 //! A transcoder's gate rows are not maps of `M`, so they carry no read patch: the experiments of a
@@ -107,11 +113,15 @@ impl Transcoder {
         Ok(active.dot(&decoder) + &b)
     }
 
-    /// Writes features `kept` (indices into the transcoder, increasing) in the library's layout
-    /// (module note) to `path`.
-    pub fn write_kept(&self, kept: &[usize], path: &Path) -> Result<(), String> {
+    /// Writes features `kept` (indices into the transcoder, increasing) and the block's output at
+    /// position 0, `sink` (`d` reals, stored as float32), in the library's layout (module note) to
+    /// `path`.
+    pub fn write_kept(&self, kept: &[usize], sink: &[f64], path: &Path) -> Result<(), String> {
         if kept.windows(2).any(|w| w[0] >= w[1]) || kept.last().is_some_and(|&f| f >= self.features) {
             return Err(format!("kept features must increase within {}", self.features));
+        }
+        if sink.len() != self.width {
+            return Err(format!("a sink of {} reals for width {}", sink.len(), self.width));
         }
         let (k, d, bytes) = (kept.len(), self.width, if self.float == StoredFloat::F32 { 4 } else { 2 });
         let (encoder, decoder) = (self.matrix("W_enc")?, self.matrix("W_dec")?);
@@ -143,9 +153,16 @@ impl Transcoder {
         self.vector("b_dec", d)?.iter().for_each(|&v| encode(v, &mut bias));
         let mut features = Vec::with_capacity(4 * k);
         kept.iter().for_each(|&f| features.extend_from_slice(&(f as f32).to_le_bytes()));
+        let sink: Vec<u8> = sink.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect();
         let dtype = if self.float == StoredFloat::F32 { "F32" } else { "BF16" };
-        let parts: [(&str, &str, Vec<usize>, &[u8]); 5] =
-            [("gate", dtype, vec![k, d], &gate), ("gate_bias", dtype, vec![k, 1], &gate_bias), ("out", dtype, vec![d, k], &out), ("bias", dtype, vec![d, 1], &bias), ("features", "F32", vec![k], &features)];
+        let parts: [(&str, &str, Vec<usize>, &[u8]); 6] = [
+            ("gate", dtype, vec![k, d], &gate),
+            ("gate_bias", dtype, vec![k, 1], &gate_bias),
+            ("out", dtype, vec![d, k], &out),
+            ("bias", dtype, vec![d, 1], &bias),
+            ("features", "F32", vec![k], &features),
+            ("sink", "F32", vec![d, 1], &sink),
+        ];
         let mut header = serde_json::Map::new();
         header.insert("__metadata__".into(), serde_json::json!({"transcoder": self.path.display().to_string(), "features": self.features.to_string()}));
         let mut offset = 0usize;
@@ -176,12 +193,22 @@ pub fn kept_features(path: &Path) -> Result<Vec<usize>, String> {
     Ok(file.vector("features", k).map_err(error)?.iter().map(|&f| f as usize).collect())
 }
 
+/// What [`firing`] counts per transcoder layer.
+pub struct Fired {
+    /// Per feature, the tokens it fires on.
+    pub counts: Vec<u64>,
+    /// `M`'s MLP output at the sequences' first tokens, averaged: the start of the block's output
+    /// there (module note).
+    pub sink: Vec<f64>,
+}
+
 /// Per transcoder layer, on how many tokens of `sequences` after each one's first (where the block
-/// runs `M`'s own MLP, module note) each feature fires (its pre-activation `g_i·x + c_i` is
-/// positive) at `M`'s own MLP input `x`, from `M` run on `device`, `batch` sequences at a time.
-/// The counts are float32 sums of zeros and ones, exact below 2^24 tokens. The encoders are held
-/// on the device [`ENCODER_BYTES`] at a time, `M` run once per such group of layers.
-pub fn firing(device: &Device, native: &OperatorProgram, layers: &[LayerNodes], transcoders: &BTreeMap<usize, Transcoder>, sequences: &[Vec<u32>], batch: usize) -> Result<BTreeMap<usize, Vec<u64>>, String> {
+/// gives its described vector, module note) each feature fires (its pre-activation `g_i·x + c_i`
+/// is positive) at `M`'s own MLP input `x`, and the mean of `M`'s MLP output over the first tokens,
+/// from `M` run on `device`, `batch` sequences at a time. The counts are float32 sums of zeros and
+/// ones, exact below 2^24 tokens. The encoders are held on the device [`ENCODER_BYTES`] at a time,
+/// `M` run once per such group of layers.
+pub fn firing(device: &Device, native: &OperatorProgram, layers: &[LayerNodes], transcoders: &BTreeMap<usize, Transcoder>, sequences: &[Vec<u32>], batch: usize) -> Result<BTreeMap<usize, Fired>, String> {
     let mut program = DeviceProgram::compile(device, native)?;
     program.set_arithmetic(if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 });
     let mut groups: Vec<BTreeMap<usize, &Transcoder>> = vec![BTreeMap::new()];
@@ -206,23 +233,29 @@ pub fn firing(device: &Device, native: &OperatorProgram, layers: &[LayerNodes], 
 /// of the 163,840-feature Qwen3-0.6B transcoders (671 MB each in f32), leaving a 24 GB card room for `M`.
 pub const ENCODER_BYTES: usize = 4 << 30;
 
-fn firing_group(program: &DeviceProgram, layers: &[LayerNodes], transcoders: &BTreeMap<usize, &Transcoder>, sequences: &[Vec<u32>], batch: usize) -> Result<BTreeMap<usize, Vec<u64>>, String> {
+fn firing_group(program: &DeviceProgram, layers: &[LayerNodes], transcoders: &BTreeMap<usize, &Transcoder>, sequences: &[Vec<u32>], batch: usize) -> Result<BTreeMap<usize, Fired>, String> {
     let d = program.device();
     let code = law_of(Law::Relu).code();
-    // Per layer its encoder (`F × d`, the device's storage), bias row and counts.
-    let mut per_layer: Vec<(usize, Tensor, Tensor, Tensor, usize)> = Vec::new();
+    // Per layer its encoder (`F × d`, the device's storage), bias row, counts, MLP input and output
+    // nodes, and the sum of its MLP outputs at first tokens.
+    let mut per_layer: Vec<(usize, Tensor, Tensor, Tensor, (usize, usize), Tensor)> = Vec::new();
     for (&l, transcoder) in transcoders {
         let layer = layers.get(l).ok_or_else(|| format!("transcoder layer {l} of {} layers", layers.len()))?;
         let encoder = transcoder.matrix("W_enc")?.f32_values().ok_or("W_enc in f32")?;
         let encoder = d.upload_f32(transcoder.features, transcoder.width, &encoder).map_err(error)?;
         let bias = d.upload_vec(1, transcoder.features, transcoder.vector("b_enc", transcoder.features)?).map_err(error)?;
-        per_layer.push((l, encoder, bias, d.zeros(1, transcoder.features).map_err(error)?, layer.normed));
+        per_layer.push((l, encoder, bias, d.zeros(1, transcoder.features).map_err(error)?, (layer.normed, layer.mlp), d.zeros(1, transcoder.width).map_err(error)?));
     }
-    let end = per_layer.iter().map(|p| p.4).max().ok_or("no transcoder layers")? + 1;
+    let end = per_layer.iter().map(|p| p.4.0.max(p.4.1)).max().ok_or("no transcoder layers")? + 1;
+    let mut firsts = 0usize;
     for chunk in sequences.chunks(batch.max(1)) {
         let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
         let trace = program.forward_span(&family, None, end, |_, _| Ok(None))?;
-        for (_, encoder, bias, counts, normed) in &mut per_layer {
+        let positions = &family.layout.as_ref().ok_or("a sequence layout")?.position;
+        let first = d.upload_vec(1, positions.len(), positions.iter().map(|&p| if p == 0 { 1.0 } else { 0.0 }).collect()).map_err(error)?;
+        firsts += positions.iter().filter(|&&p| p == 0).count();
+        for (_, encoder, bias, counts, (normed, mlp), sink) in &mut per_layer {
+            d.gemm(sink, 1.0, &first, Op::N, trace.value(*mlp)?, Op::N, 1.0, program.arithmetic()).map_err(error)?;
             let x = trace.value(*normed)?;
             let mut z = d.empty(x.rows(), encoder.rows()).map_err(error)?;
             d.gemm(&mut z, 1.0, x, Op::N, encoder, Op::T, 0.0, program.arithmetic()).map_err(error)?;
@@ -232,50 +265,21 @@ fn firing_group(program: &DeviceProgram, layers: &[LayerNodes], transcoders: &BT
             // ReLU's slope: one where the pre-activation is positive, zero elsewhere.
             let fired = d.law_slopes(&ones, &z, &codes, gelu_tanh_constant()).map_err(error)?;
             drop((z, ones));
-            let positions = &family.layout.as_ref().ok_or("a sequence layout")?.position;
             let tokens = d.upload_vec(1, fired.rows(), positions.iter().map(|&p| if p == 0 { 0.0 } else { 1.0 }).collect()).map_err(error)?;
             d.gemm(counts, 1.0, &tokens, Op::N, &fired, Op::N, 1.0, program.arithmetic()).map_err(error)?;
         }
     }
+    if firsts == 0 {
+        return Err("no sequences: the first tokens' MLP output has no mean".into());
+    }
     per_layer
         .into_iter()
-        .map(|(l, _, _, counts, _)| Ok((l, d.download(&counts).map_err(error)?.iter().map(|&c| c.round() as u64).collect())))
+        .map(|(l, _, _, counts, _, sink)| {
+            let counts = d.download(&counts).map_err(error)?.iter().map(|&c| c.round() as u64).collect();
+            let sink = d.download(&sink).map_err(error)?.iter().map(|&s| s / firsts as f64).collect();
+            Ok((l, Fired { counts, sink }))
+        })
         .collect()
-}
-
-/// `M`'s MLP at a layer: its gate map (and bias), its law per unit group, its up map (and bias)
-/// when gated, and its down map.
-struct NativeMlp {
-    gate: Operator,
-    gate_bias: Option<Operator>,
-    laws: Vec<Law>,
-    up: Option<(Operator, Option<Operator>)>,
-    down: Operator,
-}
-
-fn native_mlp(native: &OperatorProgram, layer: &LayerNodes, l: usize) -> Result<NativeMlp, String> {
-    let affine = |node: usize| -> Result<(Operator, Option<Operator>), String> {
-        match &native.nodes[node] {
-            Node::Affine { terms, bias } if terms.len() == 1 && terms[0].0 == layer.normed => {
-                Ok((native.operators[terms[0].1].as_ref().clone(), bias.map(|b| native.operators[b].as_ref().clone())))
-            }
-            other => Err(format!("layer {l}: an MLP map is {other:?}")),
-        }
-    };
-    let (pointwise, up) = match &native.nodes[layer.active] {
-        Node::Hadamard { left, right } => (*left, Some(affine(*right)?)),
-        Node::Pointwise { .. } => (layer.active, None),
-        other => return Err(format!("layer {l}: the MLP's activation is {other:?}")),
-    };
-    let Node::Pointwise { input, laws } = &native.nodes[pointwise] else {
-        return Err(format!("layer {l}: the MLP's law is not one pointwise node"));
-    };
-    let (gate, gate_bias) = affine(*input)?;
-    let down = match &native.nodes[layer.mlp] {
-        Node::Affine { terms, bias: None } if terms.len() == 1 && terms[0].0 == layer.active => native.operators[terms[0].1].as_ref().clone(),
-        other => return Err(format!("layer {l}: the MLP's output map is {other:?}")),
-    };
-    Ok(NativeMlp { gate, gate_bias, laws: laws.clone(), up, down })
 }
 
 /// The native operator applied to `input` by the first affine node reading it.
@@ -292,9 +296,10 @@ fn reader(native: &OperatorProgram, input: usize) -> Result<&Operator, String> {
 
 /// `artifact` with layer `l`'s MLP (`layer.normed` to `layer.mlp`) replaced by the library block of
 /// the transcoder features a kept file holds ([`Transcoder::write_kept`]), its operators named as a
-/// plain MLP's (`library.l{l}.mlp.gate`, `.gate_bias`, `.out`, and the fixed output `.bias`), and
-/// per function the owners of its gate row, gate bias and output column: the transcoder's
-/// tensors (`transcoder.l{l}.W_enc` and so on) at the feature's row, not operators of `M`.
+/// plain MLP's (`library.l{l}.mlp.gate`, `.gate_bias`, `.out`, and the fixed output `.bias`) and
+/// its output at each sequence's first token `library.l{l}.mlp.sink` (module note), and per
+/// function the owners of its gate row, gate bias and output column: the transcoder's tensors
+/// (`transcoder.l{l}.W_enc` and so on) at the feature's row, not operators of `M`.
 pub fn mlp(native: &OperatorProgram, artifact: Artifact, layer: &LayerNodes, l: usize, kept: &Path) -> Result<(Artifact, Vec<Owner>), String> {
     let file = SafetensorsFile::open(kept).map_err(error)?;
     let features = kept_features(kept)?;
@@ -310,45 +315,25 @@ pub fn mlp(native: &OperatorProgram, artifact: Artifact, layer: &LayerNodes, l: 
     }
     let units = Interface::uniform(k, 1, LabelKind::Unit, 0).map_err(error)?;
     let name = format!("library.l{l}.mlp");
-    let sink = native_mlp(native, layer, l)?;
     let source = format!("transcoder.l{l}");
     let provenance = || Provenance::derived(&[&Provenance::native(&source)], "transcoder import".into());
     let stored = |part: &str, rows: usize, cols: usize| file.stored(part, rows, cols).map_err(error);
     let base = artifact.program.operators.len();
-    let mut operators = vec![
+    let operators = vec![
         Operator::stored(format!("{name}.gate"), units.clone(), input.clone(), stored("gate", k, d)?, provenance()).map_err(error)?,
         Operator::stored(format!("{name}.gate_bias"), units.clone(), Interface::constant(), stored("gate_bias", k, 1)?, provenance()).map_err(error)?,
         Operator::stored(format!("{name}.out"), output.clone(), units, stored("out", d, k)?, provenance()).map_err(error)?,
-        Operator::stored(format!("{name}.bias"), output, Interface::constant(), stored("bias", d, 1)?, provenance()).map_err(error)?,
+        Operator::stored(format!("{name}.bias"), output.clone(), Interface::constant(), stored("bias", d, 1)?, provenance()).map_err(error)?,
+        Operator::stored(format!("{name}.sink"), output, Interface::constant(), stored("sink", d, 1)?, Provenance::derived(&[&Provenance::native(&format!("{source}.sink"))], "M's MLP output at first tokens, averaged".into())).map_err(error)?,
     ];
-    let mut nodes = vec![
+    let nodes = vec![
         Node::Param { index: 0 },
         Node::Affine { terms: vec![(0, base)], bias: Some(base + 1) },
         Node::Pointwise { input: 1, laws: vec![Law::Relu; k] },
         Node::Affine { terms: vec![(2, base + 2)], bias: Some(base + 3) },
+        Node::Constant { operator: base + 4 },
+        Node::Select { inside: 4, outside: 3, positions: vec![0] },
     ];
-    // M's own MLP, for position 0: its operators copied under `m_` names (no prior group reads
-    // them, so they stay fixed), its laws as M has them.
-    let mut copy = |op: &Operator, part: &str| -> usize {
-        let mut op = op.clone();
-        op.name = format!("{name}.m_{part}");
-        operators.push(op);
-        base + operators.len() - 1
-    };
-    let gate = copy(&sink.gate, "gate");
-    let gate_bias = sink.gate_bias.as_ref().map(|b| copy(b, "gate_bias"));
-    nodes.push(Node::Affine { terms: vec![(0, gate)], bias: gate_bias });
-    nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: sink.laws.clone() });
-    let mut active = nodes.len() - 1;
-    if let Some((up, up_bias)) = &sink.up {
-        let (up, up_bias) = (copy(up, "up"), up_bias.as_ref().map(|b| copy(b, "up_bias")));
-        nodes.push(Node::Affine { terms: vec![(0, up)], bias: up_bias });
-        nodes.push(Node::Hadamard { left: active, right: nodes.len() - 1 });
-        active = nodes.len() - 1;
-    }
-    let down = copy(&sink.down, "down");
-    nodes.push(Node::Affine { terms: vec![(active, down)], bias: None });
-    nodes.push(Node::Select { inside: nodes.len() - 1, outside: 3, positions: vec![0] });
     let rule = Rule { name: name.clone(), inputs: vec![input], output: nodes.len() - 1, nodes };
     let mut owners = Vec::with_capacity(3 * k);
     for (i, &f) in features.iter().enumerate() {
@@ -383,7 +368,8 @@ mod tests {
     use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     /// On the tiny Qwen3 decoder with layer 1's MLP replaced by a transcoder's firing features: the
-    /// library's MLP output is `M`'s own MLP output at each sequence's first token and the
+    /// library's MLP output is the sink (`M`'s MLP output at the first tokens, averaged, as the
+    /// device's firing pass makes it) at each sequence's first token and the
     /// transcoder's reconstruction at every other (to float64 rounding), every dropped feature is
     /// off on every token after the first, and every kept feature's gate, gate bias and output are
     /// the file's reals; the device's firing counts (first tokens left out) are the host's, and the
@@ -413,12 +399,18 @@ mod tests {
         let expected: Vec<u64> = (0..features).map(|f| pre.column(f).iter().zip(&first).filter(|(t, first)| **t > 0.0 && !**first).count() as u64).collect();
         let mut transcoders = BTreeMap::new();
         transcoders.insert(1, transcoder);
-        let counts = firing(&Device::host(), &native, &layers, &transcoders, &sequences, 2).unwrap();
-        assert_eq!(counts[&1], expected, "the device counts each feature's firing tokens");
+        let fired = firing(&Device::host(), &native, &layers, &transcoders, &sequences, 2).unwrap();
+        assert_eq!(fired[&1].counts, expected, "the device counts each feature's firing tokens");
+        // The sink's start: M's MLP output at the first tokens, averaged.
+        let native_mlp = native.execute(&family, false).unwrap().values[layers[1].mlp].clone();
+        let firsts: Vec<usize> = (0..first.len()).filter(|&r| first[r]).collect();
+        let mean: Vec<f64> = (0..d).map(|j| firsts.iter().map(|&r| native_mlp[[r, j]]).sum::<f64>() / firsts.len() as f64).collect();
+        let size = mean.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+        assert!(fired[&1].sink.iter().zip(&mean).all(|(a, b)| (a - b).abs() <= 1e-12 * size), "the device averages M's MLP output at first tokens");
         let kept: Vec<usize> = (0..features).filter(|&f| expected[f] > 0).collect();
         assert!(kept.len() < features && !kept.is_empty(), "some features fire and some do not ({} of {features})", kept.len());
         let kept_path = dir.join("kept_1.safetensors");
-        transcoders[&1].write_kept(&kept, &kept_path).unwrap();
+        transcoders[&1].write_kept(&kept, &fired[&1].sink, &kept_path).unwrap();
         assert_eq!(kept_features(&kept_path).unwrap(), kept);
         let mut files = BTreeMap::new();
         files.insert(1, kept_path.clone());
@@ -441,15 +433,16 @@ mod tests {
         let input = trace.values[place(layers[1].normed)].clone();
         assert_eq!(input, x, "layer 0 is M's, so the transcoder reads M's input");
         let mut reference = transcoders[&1].reconstruction(&x).unwrap();
-        let native_mlp = native.execute(&family, false).unwrap().values[layers[1].mlp].clone();
+        // The sink as stored (float32).
+        let sink: Vec<f64> = mean.iter().map(|&v| f64::from(v as f32)).collect();
         for (row, &first) in first.iter().enumerate() {
             if first {
-                reference.row_mut(row).assign(&native_mlp.row(row));
+                reference.row_mut(row).assign(&ndarray::ArrayView1::from(&sink[..]));
             }
         }
         let scale = reference.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
         let difference = reference.iter().zip(&mlp).fold(0.0_f64, |a, (r, m)| a.max((r - m).abs()));
-        assert!(difference <= 1e-12 * scale, "the library's MLP differs from M's at first tokens and the transcoder elsewhere by {difference} (scale {scale})");
+        assert!(difference <= 1e-12 * scale, "the library's MLP differs from the sink at first tokens and the transcoder elsewhere by {difference} (scale {scale})");
         // The select node survives the artifact's code.
         let decoded = crate::artifact::Artifact::from_bytes(&explanation.artifact.to_bytes().unwrap(), &explanation.artifact.program.declarations).unwrap();
         assert!(decoded.program.nodes == explanation.artifact.program.nodes && decoded.program.rules.iter().zip(&explanation.artifact.program.rules).all(|(a, b)| a.nodes == b.nodes));
@@ -481,7 +474,7 @@ mod tests {
     }
 
     /// A removal step on the tiny Qwen3 decoder with layer 1's MLP as a transcoder block (fixed
-    /// output bias, `M`'s MLP selected at the first token), from the Laplace start: it runs through
+    /// output bias, the sink vector at the first token), from the Laplace start: it runs through
     /// the compensation and the search, and never raises `F` on the training collection.
     #[test]
     fn a_removal_step_runs_on_a_transcoder_block() {
@@ -498,10 +491,10 @@ mod tests {
         let path = dir.join("layer_1.safetensors");
         crate::test_support::transcoder_file(&path, 64, 8, 3);
         let transcoders = BTreeMap::from([(1, Transcoder::open(&path).unwrap())]);
-        let counts = firing(&Device::host(), &native, &layers, &transcoders, train, 2).unwrap();
-        let kept: Vec<usize> = (0..64).filter(|&f| counts[&1][f] > 0).collect();
+        let fired = firing(&Device::host(), &native, &layers, &transcoders, train, 2).unwrap();
+        let kept: Vec<usize> = (0..64).filter(|&f| fired[&1].counts[f] > 0).collect();
         let kept_path = dir.join("kept_1.safetensors");
-        transcoders[&1].write_kept(&kept, &kept_path).unwrap();
+        transcoders[&1].write_kept(&kept, &fired[&1].sink, &kept_path).unwrap();
         let explanation = library_mdl::explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
         let settings: library_mdl::Settings = serde_json::from_value(serde_json::json!({"batch_sequences": 2, "seed": 3, "numeric_bytes": 1 << 26, "head_tile_rows": 64})).unwrap();
         let device = Device::host();

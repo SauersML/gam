@@ -45,7 +45,8 @@
 //!
 //! With `transcoders` (`{"dir": D, "layers": [l, ...]}`, `D/layer_{l}.safetensors` circuit-tracer
 //! transcoder files), those layers' MLPs are the transcoders' features (`library_transcoder`, with
-//! `M`'s own MLP at each sequence's first token): the features that fire on the training
+//! one described vector at each sequence's first token, started at `M`'s MLP output there averaged
+//! over the counted training sequences; kept files written before it are refused): the features that fire on the training
 //! sequences' later tokens at `M`'s MLP inputs are written to
 //! `OUT/transcoder_l{l}.safetensors` (kept from an earlier run of the same command), with their
 //! counts in `OUT/TRANSCODERS.json`; every other layer keeps `M`'s own MLP functions. With
@@ -127,26 +128,27 @@ fn transcoder_files(device: &Device, native: &OperatorProgram, layers: &[LayerNo
         .map(|&l| Ok((l, library_transcoder::Transcoder::open(&settings.dir.join(format!("layer_{l}.safetensors")))?)))
         .collect::<Result<BTreeMap<_, _>, String>>()?;
     let train = &train[..settings.count_sequences.map_or(train.len(), |n| n.min(train.len()))];
-    let counts = library_transcoder::firing(device, native, layers, &transcoders, train, batch)?;
-    // Tokens after each sequence's first, where the transcoders run (the first runs M's MLP).
+    let fired = library_transcoder::firing(device, native, layers, &transcoders, train, batch)?;
+    // Tokens after each sequence's first, where the transcoders run (the first takes the block's sink vector).
     let tokens: usize = train.iter().map(|s| s.len() - 1).sum();
     let mut record = Vec::new();
     for (l, transcoder) in &transcoders {
         let least = settings.min_frequency.map_or(1.0, |f| (f * tokens as f64).max(1.0));
-        let kept: Vec<usize> = (0..transcoder.features).filter(|&f| counts[l][f] as f64 >= least).collect();
-        transcoder.write_kept(&kept, &files[l])?;
-        let fired: u64 = counts[l].iter().sum();
-        let kept_fired: u64 = kept.iter().map(|&f| counts[l][f]).sum();
+        let counts = &fired[l].counts;
+        let kept: Vec<usize> = (0..transcoder.features).filter(|&f| counts[f] as f64 >= least).collect();
+        transcoder.write_kept(&kept, &fired[l].sink, &files[l])?;
+        let fired_tokens: u64 = counts.iter().sum();
+        let kept_fired: u64 = kept.iter().map(|&f| counts[f]).sum();
         record.push(json!({
             "layer": l,
             "features": transcoder.features,
             "kept": kept.len(),
-            "active_per_token": fired as f64 / tokens as f64,
+            "active_per_token": fired_tokens as f64 / tokens as f64,
             "kept_active_per_token": kept_fired as f64 / tokens as f64,
-            "ever_fired": counts[l].iter().filter(|&&c| c > 0).count(),
+            "ever_fired": counts.iter().filter(|&&c| c > 0).count(),
             "tokens": tokens,
         }));
-        log::info!("transcoder layer {l}: {} of {} features fire on {tokens} training tokens after the first, {:.2} per token", kept.len(), transcoder.features, fired as f64 / tokens as f64);
+        log::info!("transcoder layer {l}: {} of {} features fire on {tokens} training tokens after the first, {:.2} per token", kept.len(), transcoder.features, fired_tokens as f64 / tokens as f64);
     }
     save(&out.join("TRANSCODERS.json"), &json!({"layers": record, "seconds": started.elapsed().as_secs_f64()}))?;
     Ok(files)

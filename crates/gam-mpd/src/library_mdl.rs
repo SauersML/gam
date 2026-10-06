@@ -5222,7 +5222,7 @@ mod tests {
         let (full, kept_path) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
         let features = 64;
         crate::test_support::transcoder_file(&full, features, 8, 3);
-        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..features).collect::<Vec<_>>(), &kept_path).unwrap();
+        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..features).collect::<Vec<_>>(), &[0.0; 8], &kept_path).unwrap();
         let explanation = explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         // The host's count: layer 1 reads `M`'s input (layer 0 is `M`'s functions).
@@ -5262,7 +5262,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (full, kept_path) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
         crate::test_support::transcoder_file(&full, 64, 8, 3);
-        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..64).collect::<Vec<_>>(), &kept_path).unwrap();
+        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..64).collect::<Vec<_>>(), &[0.0; 8], &kept_path).unwrap();
         let explanation = explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         use interchange::Family;
@@ -5360,7 +5360,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (full, kept_path) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
         crate::test_support::transcoder_file(&full, 64, 8, 3);
-        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..64).collect::<Vec<_>>(), &kept_path).unwrap();
+        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..64).collect::<Vec<_>>(), &[0.0; 8], &kept_path).unwrap();
         let explanation = explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
         use interchange::Family;
         let settings = Settings { epochs: Some(8), families: vec![Family::Read, Family::RemovePart, Family::AmplifyPart], ..settings() };
