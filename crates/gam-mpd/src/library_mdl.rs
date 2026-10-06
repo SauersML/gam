@@ -2352,7 +2352,11 @@ struct Progress {
 
 /// What a checkpoint belongs to: a fit resumes from it only when every field agrees, so a
 /// checkpoint of another model, dataset or library can neither resume nor skip training. Each
-/// field is a SHA-256 in hexadecimal.
+/// field is a SHA-256 in hexadecimal. The arithmetic a fit runs in (the device and its storage) is
+/// not part of it: a checkpoint resumes on another device, continuing the same objective from the
+/// values it holds (each array restored exactly in its saved precision), in that device's rounding
+/// from there on, so a resume on another arithmetic is the uninterrupted fit to that rounding, not
+/// bit for bit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
     /// The export the native model was imported from (`export.json`'s digest).

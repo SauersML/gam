@@ -1,6 +1,6 @@
 //! The removal step of a library fit (`gam_mpd::library_mdl`, #2951) run on one checkpoint: the
 //! search of `library_removal` (groups without effect first, then units ranked by their predicted
-//! change of `F`, in segments) scores the fit's own training collection at the fit's weight noise,
+//! change of `F`, in ranges of the ranked list split until each unit is removed or rejected alone) scores the fit's own training collection at the fit's weight noise,
 //! with compensation, and is evaluated on the held-out sequences before and after.
 //!
 //! EXPORT SETTINGS.json CHECKPOINT OUT host|gpu

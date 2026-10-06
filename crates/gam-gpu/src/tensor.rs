@@ -2753,6 +2753,10 @@ impl Device {
         if !(step.tokens.is_finite() && step.tokens > 0.0) {
             return Err(shape(format!("{} tokens", step.tokens)));
         }
+        // Decays in [0, 1): a running average of what it is given, and a momentum that moves.
+        if !((0.0..1.0).contains(&step.beta1) && (0.0..1.0).contains(&step.beta2)) {
+            return Err(shape(format!("decays β₁ = {} and β₂ = {} outside [0, 1)", step.beta1, step.beta2)));
+        }
         let (before, after) = (step.weight, step.correction());
         if !(before >= 0.0 && after > 0.0 && after.is_finite()) {
             return Err(shape(format!("a momentum bias correction {before} before the step and {after} after it")));
