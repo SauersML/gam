@@ -1954,7 +1954,8 @@ nebius_settled() {  # OPERATION
 # Packing: a run that states the GPU memory it needs (RP_MIN_VRAM_GB) runs on a pod of ours that is
 # already up, instead of a new one, when that pod's GPU is one the run takes (its listed types; under
 # auto, any card the ranking offers), averaged under 20% over the last 5 minutes (the idle line), has
-# RP_MIN_VRAM_GB of GPU memory and the run's disk free, and has the run's HOURS left before its cap.
+# RP_MIN_VRAM_GB of GPU memory (at most the card's, less 1 GiB the driver holds) and the run's disk
+# free, and has the run's HOURS left before its cap.
 # Of those, the least busy GPU. RP_PACK=0 always takes a pod of its own. Prints the pod, or nothing.
 PACK_GPU=20 PACK_WINDOW=300
 
@@ -1978,7 +1979,7 @@ gpu_in_use() {
             }' | sed 's/; $//'
 }
 find_host() {
-    local rec pod g dl ip port tmp user util free disk best="" bestu="" now
+    local rec pod g dl ip port tmp user util free total disk best="" bestu="" now
     [ "$MODE" = run ] && [ -n "${RP_MIN_VRAM_GB:-}" ] && [ "${RP_PACK:-1}" != 0 ] || return 0
     now=$(date +%s)
     for rec in "$ACTIVE"/*; do
@@ -1991,13 +1992,16 @@ find_host() {
         (( dl - now >= CAP_SECONDS )) || continue
         read -r ip port tmp user < "$ACTIVE/.$pod.ssh"
         [ -f "$tmp/key" ] || continue
-        read -r util free disk < <(ssh -F none -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$tmp/known_hosts" \
+        read -r util free total disk < <(ssh -F none -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$tmp/known_hosts" \
             -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -o LogLevel=ERROR -p "$port" "${user:-root}@$ip" \
             "awk -v t=\$(( \$(date +%s) - $PACK_WINDOW )) '\$1 >= t && NF == 2 { s += \$2; n++ } END { printf \"%d \", (n ? s / n : 100) }' /workspace/gpu-util.log;
-             nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -n 1 | tr '\n' ' ';
+             nvidia-smi --query-gpu=memory.free,memory.total --format=csv,noheader,nounits | head -n 1 | tr ',\n' '  ';
              df -BG --output=avail /workspace | tail -n 1 | tr -dc 0-9" < /dev/null 2> /dev/null) || continue
         [ -n "$disk" ] || continue
-        (( util < PACK_GPU && free >= RP_MIN_VRAM_GB * 1024 && disk >= DISK )) || continue
+        # The run's memory is RP_MIN_VRAM_GB, at most the card's whole memory, less the 1 GiB an
+        # idle card's driver may hold (gpu_in_use): free >= RP_MIN_VRAM_GB x 1024 never held on a
+        # card of the run's own size (an idle 24 GB 4090 has 24080 MiB free, a 48 GB A40 45458).
+        (( util < PACK_GPU && free + 1024 >= (RP_MIN_VRAM_GB * 1024 < total ? RP_MIN_VRAM_GB * 1024 : total) && disk >= DISK )) || continue
         if [ -z "$bestu" ] || (( util < bestu )); then best=$pod bestu=$util; fi
     done
     echo "$best"
