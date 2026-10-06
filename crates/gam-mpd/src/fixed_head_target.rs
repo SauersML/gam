@@ -159,7 +159,12 @@ impl Teacher {
                 _ => continue,
             }
         }
-        let prefix = DeviceProgram::compile_values_bounded(device, &prefix_source, numeric_bytes)?;
+        let mut prefix =
+            DeviceProgram::compile_values_bounded(device, &prefix_source, numeric_bytes)?;
+        // f32 storage (the Apple GPU) has no float64 product: the prefix runs in f32 there.
+        if device.storage() == Storage::F32 {
+            prefix.set_arithmetic(Arithmetic::F32);
+        }
         if head
             .embedding
             .len()
