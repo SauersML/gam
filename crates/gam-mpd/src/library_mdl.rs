@@ -1282,6 +1282,11 @@ pub struct Settings {
     pub numeric_bytes: usize,
     /// Rows of vocabulary logits formed at once.
     pub head_tile_rows: usize,
+    /// `M` and `P` run on the fused decoder engines with f32 products (`Interchange::fuse`) in
+    /// place of the operator programs: the decoder's gate, its throughput against the programs' in
+    /// the same fit. The gate's outcome deletes one of the two engines and this field.
+    #[serde(default)]
+    pub decoder: bool,
 }
 
 impl Settings {
@@ -1628,10 +1633,7 @@ impl Scorer {
         let reads = interchange::reads(native, &sites)?;
         let mut experiments =
             Interchange::new(device, native, &sites, &explanation.artifact, &explanation.trainable, reads, settings.numeric_bytes, settings.head_tile_rows)?;
-        // `MPD_ENGINE=decoder` runs `M` and `P` on the fused decoder engines with f32 products
-        // (`Interchange::fuse`): the decoder's gate, its throughput against the programs' in the
-        // same fit. The gate's outcome deletes one of the two.
-        if std::env::var("MPD_ENGINE").as_deref() == Ok("decoder") {
+        if settings.decoder {
             let fused = experiments.fuse(gam_gpu::tensor::Arithmetic::F32)?;
             log::info!("library engine: decoder (P fused: {fused})");
         }
@@ -3581,6 +3583,7 @@ mod tests {
             seed: 3,
             numeric_bytes: 1 << 26,
             head_tile_rows: 64,
+            decoder: false,
         }
     }
 
