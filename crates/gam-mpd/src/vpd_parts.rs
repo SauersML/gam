@@ -20,7 +20,7 @@
 
 use crate::{explanation_battery::load_factors, explanation_battery::Kind, operator_program::Law};
 use ndarray::{Array1, Array2, ArrayView1};
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 fn error(e: impl std::fmt::Display) -> String {
     format!("vpd parts: {e}")
@@ -88,6 +88,34 @@ impl VpdPart {
             }
         }
     }
+}
+
+/// A part with `M`'s MLP of its layer, what an edit of it reads (`interchange::Patch::Slice`).
+#[derive(Clone, Debug)]
+pub struct Slice {
+    pub part: VpdPart,
+    pub mlp: Arc<Mlp>,
+}
+
+impl Slice {
+    /// [`VpdPart::edit`] with the part's own layer's MLP.
+    #[must_use]
+    pub fn edit(&self, x: ArrayView1<f64>, alpha: f64) -> Array1<f64> {
+        self.part.edit(&self.mlp, x, alpha)
+    }
+
+    /// The MLP block whose read it reads and whose output it adds to.
+    #[must_use]
+    pub fn block(&self) -> usize {
+        self.part.block
+    }
+}
+
+/// [`load`]'s parts, each with its layer's MLP.
+pub fn slices(export: &Path, decomposition: &Path) -> Result<Vec<Slice>, String> {
+    let (mlps, parts) = load(export, decomposition)?;
+    let mlps: Vec<Arc<Mlp>> = mlps.into_iter().map(Arc::new).collect();
+    Ok(parts.into_iter().map(|part| Slice { mlp: Arc::clone(&mlps[part.layer]), part }).collect())
 }
 
 /// A tensor of an engine export (`export.json` and its float64 files), as the battery reads it.
