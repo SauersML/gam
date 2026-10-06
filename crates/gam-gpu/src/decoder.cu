@@ -1,7 +1,9 @@
 // The decoder layer's fused kernels (`tensor::cuda::decoder`): an RMS norm with its gain, the
 // queries' and keys' per-head norms and rotation, and the MLP's activations, each forward and
-// backward (attention itself is `attention.cu`). Inputs and cotangents are f32; a product's operand
-// is written as bfloat16 (rounded to nearest, ties to even) where the next product reads it.
+// backward (attention itself is `attention_f32.inc`), and the operand terms of the split products
+// (`Arithmetic::Tf32x3`, `Arithmetic::Bf16x3`). Inputs and cotangents are f32; a product's operand
+// is written in f32, or as bfloat16 (rounded to nearest, ties to even) where the next product
+// reads bfloat16.
 #define BLOCK 256
 typedef unsigned long long u64;
 
@@ -18,6 +20,11 @@ __device__ __forceinline__ float from_bf16(unsigned short h) {
 __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
+}
+
+// Writes v at i of the f32 output where it is given, else of the bfloat16 one.
+__device__ __forceinline__ void put(float* y32, unsigned short* y16, u64 i, float v) {
+    if (y32) y32[i] = v; else y16[i] = to_bf16(v);
 }
 
 // The sum of every thread's `v` in a block of BLOCK threads.
@@ -158,13 +165,13 @@ extern "C" __global__ void heads_rope_backward(unsigned int rows, unsigned int q
 __device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 // The gated MLP's activations from its two input products h (rows × 2m: the gates' m columns,
-// then the inputs'): a = silu(gate) · input, as bfloat16 (rows × m).
-extern "C" __global__ void swiglu(u64 rows, unsigned int m, const float* h, unsigned short* a) {
+// then the inputs'): a = silu(gate) · input (rows × m), in a32 (f32) when given, else a16.
+extern "C" __global__ void swiglu(u64 rows, unsigned int m, const float* h, float* a32, unsigned short* a16) {
     u64 n = rows * m;
     for (u64 i = (u64)blockIdx.x * BLOCK + threadIdx.x; i < n; i += (u64)gridDim.x * BLOCK) {
         u64 r = i / m, j = i % m;
         float g = h[r * 2 * m + j], u = h[r * 2 * m + m + j];
-        a[i] = to_bf16(g * sigmoid(g) * u);
+        put(a32, a16, i, g * sigmoid(g) * u);
     }
 }
 
@@ -179,13 +186,14 @@ extern "C" __global__ void swiglu_backward(u64 rows, unsigned int m, const float
     }
 }
 
-// GELU in its tanh form of h plus a bias row (none when null), as bfloat16 (rows × m).
-extern "C" __global__ void gelu_tanh(u64 rows, unsigned int m, const float* h, const float* bias, unsigned short* a) {
+// GELU in its tanh form of h plus a bias row (none when null) (rows × m), in a32 (f32) when
+// given, else a16.
+extern "C" __global__ void gelu_tanh(u64 rows, unsigned int m, const float* h, const float* bias, float* a32, unsigned short* a16) {
     const float c = 0.7978845608028654f, k = 0.044715f;
     u64 n = rows * m;
     for (u64 i = (u64)blockIdx.x * BLOCK + threadIdx.x; i < n; i += (u64)gridDim.x * BLOCK) {
         float x = h[i] + (bias ? bias[i % m] : 0.0f);
-        a[i] = to_bf16(0.5f * x * (1.0f + tanhf(c * (x + k * x * x * x))));
+        put(a32, a16, i, 0.5f * x * (1.0f + tanhf(c * (x + k * x * x * x))));
     }
 }
 
@@ -196,5 +204,27 @@ extern "C" __global__ void gelu_tanh_backward(u64 rows, unsigned int m, const fl
         float x = h[i] + (bias ? bias[i % m] : 0.0f);
         float t = tanhf(c * (x + k * x * x * x));
         gh[i] = ga[i] * (0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * c * (1.0f + 3.0f * k * x * x));
+    }
+}
+
+// An f32 operand of `Arithmetic::Bf16x3` as two bfloat16 terms, hi = bf16(x) and lo = bf16(x − hi).
+extern "C" __global__ void bf16_split(u64 n, const float* x, unsigned short* hi, unsigned short* lo) {
+    for (u64 i = (u64)blockIdx.x * BLOCK + threadIdx.x; i < n; i += (u64)gridDim.x * BLOCK) {
+        unsigned short h = to_bf16(x[i]);
+        hi[i] = h;
+        lo[i] = to_bf16(x[i] - from_bf16(h));
+    }
+}
+
+// An f32 operand of `Arithmetic::Tf32x3` as two f32 terms: big, x rounded to TF32 (10 stored
+// significand bits, to nearest, ties to even), exact in TF32 however the tensor cores read it; and
+// small = x − big, exact in f32, which the tensor cores read to within 2⁻¹⁰ of itself.
+extern "C" __global__ void tf32_split(u64 n, const float* x, float* big, float* small) {
+    for (u64 i = (u64)blockIdx.x * BLOCK + threadIdx.x; i < n; i += (u64)gridDim.x * BLOCK) {
+        float v = x[i];
+        unsigned int bits = __float_as_uint(v);
+        float b = (v != v || isinf(v)) ? v : __uint_as_float((bits + 0x0fffu + ((bits >> 13) & 1u)) & 0xffffe000u);
+        big[i] = b;
+        small[i] = (v != v || isinf(v)) ? 0.0f : v - b;
     }
 }

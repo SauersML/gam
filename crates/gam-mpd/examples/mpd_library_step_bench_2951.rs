@@ -191,7 +191,7 @@ fn classes(device: &Device, decoder: &Decoder, sequences: usize, length: usize, 
         "products": Value::Object(products),
         "attention": {"forward": {"seconds": forward, "tflops": flops / forward / 1e12}, "reverse": {"seconds": reverse, "tflops": 2.5 * flops / reverse / 1e12}},
         "rms_gain": bandwidth(norm, rows * d * (4 + 2)),
-        "heads_rope": bandwidth(rope, rows * layout.columns() * (4 + 2)),
+        "heads_rope": bandwidth(rope, rows * layout.columns() * (4 + 4)),
         "activation": bandwidth(activation, rows * (shape.mlp_inputs * 4 + m * 2)),
     }))
 }

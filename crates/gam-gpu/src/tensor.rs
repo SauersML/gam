@@ -36,7 +36,7 @@
 
 use crate::gpu_error::GpuError;
 use crate::GpuPolicy;
-use ndarray::{Array2, ArrayView2, ArrayViewMut2, Axis, linalg::general_mat_mul};
+use ndarray::{Array2, ArrayView2, ArrayViewMut2, Axis, Slice, linalg::general_mat_mul};
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -64,6 +64,17 @@ pub enum Arithmetic {
     /// its operands alike, while CUDA float64 storage and the Apple GPU run it as `F32`, more
     /// precise than asked.
     Bf16,
+    /// Each operand as two TF32 terms, its nearest TF32 value `big` and the remainder `small`, and
+    /// the three products `big·big + big·small + small·big` summed with f32 accumulation (the
+    /// remainders' product, below `2⁻²²` of each term, is left out): within about `2⁻²⁰` of the
+    /// exact product per term, at a third of the tensor cores' TF32 rate. A bfloat16 copy is
+    /// exact in TF32 and has no remainder. The host rounds alike; CUDA float64 storage and the
+    /// Apple GPU run it as `F32`.
+    Tf32x3,
+    /// As [`Arithmetic::Tf32x3`] with bfloat16 terms (`hi`, and `lo` the remainder rounded to
+    /// bfloat16): within about `2⁻¹⁵` of the exact product per term, at a third of the bfloat16
+    /// rate.
+    Bf16x3,
 }
 
 /// How a tensor holds its values.
@@ -82,7 +93,10 @@ pub enum Storage {
 }
 
 impl Arithmetic {
-    /// The unit roundoff of the operands' rounding.
+    /// The unit roundoff of the operands' rounding; for a split arithmetic, half its bound on a
+    /// term's error relative to the term's magnitude (the remainders' product left out, each
+    /// remainder's own rounding, which the tensor cores may truncate in TF32, and the operands'
+    /// rounding to f32).
     #[must_use]
     pub fn unit_roundoff(self) -> f64 {
         match self {
@@ -90,6 +104,18 @@ impl Arithmetic {
             Self::F32 => f64::from(f32::EPSILON) / 2.0,
             Self::Tf32 => 2f64.powi(-11),
             Self::Bf16 => 2f64.powi(-8),
+            Self::Tf32x3 => 2f64.powi(-20),
+            Self::Bf16x3 => 2f64.powi(-15),
+        }
+    }
+
+    /// The arithmetic of each of a split arithmetic's three products, and `None` for any other.
+    #[must_use]
+    pub fn split(self) -> Option<Self> {
+        match self {
+            Self::Tf32x3 => Some(Self::Tf32),
+            Self::Bf16x3 => Some(Self::Bf16),
+            _ => None,
         }
     }
 }
@@ -440,11 +466,12 @@ fn bf16_bits(x: f32) -> u32 {
     if x.is_nan() { (bits >> 16) | 0x40 } else { (bits + 0x7fff + ((bits >> 16) & 1)) >> 16 }
 }
 
-/// Rounds `x` to `arithmetic`'s operand precision.
+/// Rounds `x` to `arithmetic`'s operand precision (a split arithmetic's operands are f32; its
+/// terms are rounded by its part's arithmetic, [`Arithmetic::split`]).
 fn round_operand(x: f64, arithmetic: Arithmetic) -> f64 {
     match arithmetic {
         Arithmetic::F64 => x,
-        Arithmetic::F32 => f64::from(x as f32),
+        Arithmetic::F32 | Arithmetic::Tf32x3 | Arithmetic::Bf16x3 => f64::from(x as f32),
         Arithmetic::Tf32 => {
             // Round the f32 value's 23-bit mantissa to 10 bits, to nearest even.
             let bits = (x as f32).to_bits();
@@ -2434,8 +2461,8 @@ impl Device {
     }
 
     /// A gated MLP's activations from its two input products `h` (rows × 2m: the gates' m columns,
-    /// then the inputs'): `silu(gate) · input`, rows × m in bfloat16.
-    pub fn swiglu(&self, h: &Tensor) -> Result<Tensor, GpuError> {
+    /// then the inputs'): `silu(gate) · input`, rows × m, in bfloat16 when `bf16` and f32 otherwise.
+    pub fn swiglu(&self, h: &Tensor, bf16: bool) -> Result<Tensor, GpuError> {
         if h.cols % 2 != 0 {
             return Err(shape(format!("{:?} gated inputs", h.dim())));
         }
@@ -2446,12 +2473,13 @@ impl Device {
                 let a = (0..h.rows * m).map(|i| {
                     let (r, j) = (i / m, i % m);
                     let (g, u) = (hv[r * 2 * m + j], hv[r * 2 * m + m + j]);
-                    round_operand(g / (1.0 + (-g).exp()) * u, Arithmetic::Bf16)
+                    let a = g / (1.0 + (-g).exp()) * u;
+                    if bf16 { round_operand(a, Arithmetic::Bf16) } else { a }
                 });
                 Ok(Tensor { rows: h.rows, cols: m, data: Data::Host(a.collect()) })
             }
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.swiglu(h),
+            Backend::Cuda(engine) => engine.swiglu(h, bf16),
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
         }
@@ -2483,20 +2511,23 @@ impl Device {
         }
     }
 
-    /// GELU in its tanh form ([`PointwiseLaw::GeluTanh`]) of `h` plus the bias row `bias`, rows × m
-    /// in bfloat16.
-    pub fn gelu_tanh(&self, h: &Tensor, bias: Option<&Tensor>) -> Result<Tensor, GpuError> {
+    /// GELU in its tanh form ([`PointwiseLaw::GeluTanh`]) of `h` plus the bias row `bias`, rows × m,
+    /// in bfloat16 when `bf16` and f32 otherwise.
+    pub fn gelu_tanh(&self, h: &Tensor, bias: Option<&Tensor>, bf16: bool) -> Result<Tensor, GpuError> {
         if bias.is_some_and(|b| b.dim() != (1, h.cols)) {
             return Err(shape(format!("a bias for {:?} inputs", h.dim())));
         }
         match &*self.backend {
             Backend::Host => {
                 let (hv, b) = (host(h)?, bias.map(host).transpose()?);
-                let a = (0..h.len()).map(|i| round_operand(host_gelu_tanh(hv[i] + b.map_or(0.0, |b| b[i % h.cols])).0, Arithmetic::Bf16));
+                let a = (0..h.len()).map(|i| {
+                    let a = host_gelu_tanh(hv[i] + b.map_or(0.0, |b| b[i % h.cols])).0;
+                    if bf16 { round_operand(a, Arithmetic::Bf16) } else { a }
+                });
                 Ok(Tensor { rows: h.rows, cols: h.cols, data: Data::Host(a.collect()) })
             }
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.gelu_tanh(h, bias),
+            Backend::Cuda(engine) => engine.gelu_tanh(h, bias, bf16),
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
         }
@@ -2970,6 +3001,12 @@ fn host_softmax_stats(z: &[f64]) -> (f64, f64) {
     (m, z.iter().map(|v| (v - m).exp()).sum())
 }
 
+/// Block `i` of `v`'s equal blocks of `dims`, as `op` reads it.
+fn block_view(v: &[f64], i: usize, dims: (usize, usize), op: Op) -> Result<ArrayView2<'_, f64>, GpuError> {
+    let v = ArrayView2::from_shape(dims, &v[i * dims.0 * dims.1..(i + 1) * dims.0 * dims.1]).map_err(|e| shape(e.to_string()))?;
+    Ok(if op == Op::T { v.reversed_axes() } else { v })
+}
+
 fn host_gemm(
     batch: usize,
     ab: (usize, usize),
@@ -2981,14 +3018,22 @@ fn host_gemm(
     c: &mut [f64],
     arithmetic: Arithmetic,
 ) -> Result<(), GpuError> {
-    let lowered = |v: &[f64]| -> Vec<f64> { v.iter().map(|x| round_operand(*x, arithmetic)).collect() };
-    let (a_low, b_low);
-    let (a, b) = if arithmetic == Arithmetic::F64 {
-        (a, b)
-    } else {
-        a_low = lowered(a);
-        b_low = lowered(b);
-        (&a_low[..], &b_low[..])
+    let lowered = |v: &[f64], unit: Arithmetic| -> Vec<f64> { v.iter().map(|x| round_operand(*x, unit)).collect() };
+    // The products summed into c, each a pair of operands as rounded: one, or a split
+    // arithmetic's three (the remainders' product first, as CUDA sums them).
+    let pairs: Vec<(Vec<f64>, Vec<f64>)> = match arithmetic.split() {
+        Some(unit) => {
+            let terms = |v: &[f64]| -> (Vec<f64>, Vec<f64>) {
+                let whole = lowered(v, Arithmetic::F32);
+                let first = lowered(&whole, unit);
+                let rest = whole.iter().zip(&first).map(|(x, h)| round_operand(x - h, unit)).collect();
+                (first, rest)
+            };
+            let ((a1, a2), (b1, b2)) = (terms(a), terms(b));
+            vec![(a2, b1.clone()), (a1.clone(), b2), (a1, b1)]
+        }
+        None if arithmetic == Arithmetic::F64 => vec![(a.to_vec(), b.to_vec())],
+        None => vec![(lowered(a, arithmetic), lowered(b, arithmetic))],
     };
     let size = cb.0 * cb.1;
     if size == 0 {
@@ -2997,14 +3042,15 @@ fn host_gemm(
     // The products of a batch, and row blocks of each product, run on the rayon pool: the gemm
     // library's own threading stops at four threads. Each entry's sum is the same either way.
     c.par_chunks_mut(size).take(batch).enumerate().try_for_each(|(i, c)| -> Result<(), GpuError> {
-        let av = ArrayView2::from_shape(ab, &a[i * ab.0 * ab.1..(i + 1) * ab.0 * ab.1]).map_err(|e| shape(e.to_string()))?;
-        let bv = ArrayView2::from_shape(bb, &b[i * bb.0 * bb.1..(i + 1) * bb.0 * bb.1]).map_err(|e| shape(e.to_string()))?;
+        let products = pairs.iter().map(|(a, b)| Ok((block_view(a, i, ab, ta)?, block_view(b, i, bb, tb)?))).collect::<Result<Vec<_>, GpuError>>()?;
         let mut cv = ArrayViewMut2::from_shape(cb, c).map_err(|e| shape(e.to_string()))?;
-        let av = if ta == Op::T { av.reversed_axes() } else { av };
-        let bv = if tb == Op::T { bv.reversed_axes() } else { bv };
         let rows = cb.0.div_ceil(rayon::current_num_threads()).max(1);
-        cv.axis_chunks_iter_mut(Axis(0), rows).into_par_iter().zip(av.axis_chunks_iter(Axis(0), rows)).for_each(|(mut cv, av)| {
-            general_mat_mul(alpha, &av, &bv, beta, &mut cv);
+        cv.axis_chunks_iter_mut(Axis(0), rows).into_par_iter().enumerate().for_each(|(chunk, mut cv)| {
+            let at = chunk * rows;
+            for (t, (av, bv)) in products.iter().enumerate() {
+                let av = av.slice_axis(Axis(0), Slice::from(at..at + cv.nrows()));
+                general_mat_mul(alpha, &av, bv, if t == 0 { beta } else { 1.0 }, &mut cv);
+            }
             if arithmetic != Arithmetic::F64 {
                 cv.mapv_inplace(|x| f64::from(x as f32));
             }
@@ -4192,6 +4238,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
             Arithmetic::F32 => Ok((cublasComputeType_t::CUBLAS_COMPUTE_32F, false)),
             Arithmetic::Tf32 => Ok((cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32, false)),
             Arithmetic::Bf16 => Ok((cublasComputeType_t::CUBLAS_COMPUTE_32F, true)),
+            Arithmetic::Tf32x3 | Arithmetic::Bf16x3 => Err(shape(format!("{arithmetic:?} runs as three products of its terms"))),
         }
     }
 
@@ -4617,6 +4664,9 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
             if m == 0 || n == 0 {
                 return Ok(());
             }
+            if let Some(unit) = arithmetic.split() {
+                return self.gemm_split(batch, (m, n, k), (alpha, beta), (a, ta), (b, tb), c, unit);
+            }
             let (compute, half) = compute_of(arithmetic, &self.name)?;
             let valid = |t: &Tensor| match &t.data {
                 Data::Cuda32(_) => Ok(()),
@@ -4669,6 +4719,60 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
         /// `t` (f32) as a bfloat16 tensor.
         pub(super) fn bf16_copy(&self, t: &Tensor) -> Result<Tensor, GpuError> {
             Ok(Tensor { rows: t.rows, cols: t.cols, data: Data::CudaBf16(self.round_half(slice32(t)?, 0, t.len())?) })
+        }
+
+        /// A split arithmetic's product (`Arithmetic::split` gives `unit`, its parts' arithmetic):
+        /// each f32 operand as its two terms, the three products summed into `c`, the remainders'
+        /// first. A bfloat16 operand is exact in either unit and has no remainder.
+        fn gemm_split(
+            &self,
+            batch: usize,
+            dims: (usize, usize, usize),
+            (alpha, beta): (f64, f64),
+            (a, ta): (&Tensor, Op),
+            (b, tb): (&Tensor, Op),
+            c: &mut Tensor,
+            unit: Arithmetic,
+        ) -> Result<(), GpuError> {
+            let ((a_first, a_rest), (b_first, b_rest)) = (self.terms(a, unit)?, self.terms(b, unit)?);
+            let (a1, b1) = (a_first.as_ref().unwrap_or(a), b_first.as_ref().unwrap_or(b));
+            let mut scale = beta;
+            if let Some(a2) = &a_rest {
+                self.gemm32(batch, dims, (alpha, scale), (a2, ta), (b1, tb), c, unit)?;
+                scale = 1.0;
+            }
+            if let Some(b2) = &b_rest {
+                self.gemm32(batch, dims, (alpha, scale), (a1, ta), (b2, tb), c, unit)?;
+                scale = 1.0;
+            }
+            self.gemm32(batch, dims, (alpha, scale), (a1, ta), (b1, tb), c, unit)
+        }
+
+        /// An operand's two terms in `unit` (`bf16_split` or `tf32_split`, `decoder.cu`): the first
+        /// (`None` where it is the operand itself) and the remainder (`None` where there is none).
+        /// A bfloat16 operand is its own first term in bfloat16, and widened to f32 in TF32.
+        fn terms(&self, t: &Tensor, unit: Arithmetic) -> Result<(Option<Tensor>, Option<Tensor>), GpuError> {
+            let half = unit == Arithmetic::Bf16;
+            if matches!(t.data, Data::CudaBf16(_)) {
+                return Ok((if half { None } else { Some(self.convert_to(t, Storage::F32)?) }, None));
+            }
+            let n = t.len() as u64;
+            let (mut first, mut rest) = if half {
+                (self.unset16(t.rows, t.cols)?, self.unset16(t.rows, t.cols)?)
+            } else {
+                (self.unset32(t.rows, t.cols)?, self.unset32(t.rows, t.cols)?)
+            };
+            let f = self.decoder(if half { "bf16_split" } else { "tf32_split" })?;
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&n).arg(slice32(t)?);
+            match (&mut first.data, &mut rest.data) {
+                (Data::CudaBf16(h), Data::CudaBf16(l)) => builder.arg(h).arg(l),
+                (Data::Cuda32(h), Data::Cuda32(l)) => builder.arg(h).arg(l),
+                (other, _) => return Err(mismatch(other)),
+            };
+            // SAFETY: three buffers of `n` values.
+            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("decoder operand terms")?;
+            Ok((Some(first), Some(rest)))
         }
 
         /// Decoder kernel `name` (`decoder.cu`), its module compiled on first use.
@@ -4932,15 +5036,20 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
             Ok(gy)
         }
 
-        pub(super) fn swiglu(&self, h: &Tensor) -> Result<Tensor, GpuError> {
+        pub(super) fn swiglu(&self, h: &Tensor, bf16: bool) -> Result<Tensor, GpuError> {
             let m = h.cols / 2;
-            let mut a = self.unset16(h.rows, m)?;
-            let (rows, width) = (h.rows as u64, u32_of(m)?);
+            let mut a = if bf16 { self.unset16(h.rows, m)? } else { self.unset32(h.rows, m)? };
+            let (rows, width, null) = (h.rows as u64, u32_of(m)?, 0u64);
             let f = self.decoder("swiglu")?;
-            let Data::CudaBf16(out) = &mut a.data else { return Err(mismatch(&a.data)) };
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&rows).arg(&width).arg(slice32(h)?);
+            match &mut a.data {
+                Data::CudaBf16(out) => builder.arg(&null).arg(out),
+                Data::Cuda32(out) => builder.arg(out).arg(&null),
+                other => return Err(mismatch(other)),
+            };
             // SAFETY: rows × 2m inputs, rows × m outputs.
-            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(slice32(h)?).arg(out).launch(cfg_elements(rows * m as u64)) }
-                .gpu_ctx("decoder swiglu")?;
+            unsafe { builder.launch(cfg_elements(rows * m as u64)) }.gpu_ctx("decoder swiglu")?;
             Ok(a)
         }
 
@@ -4957,8 +5066,8 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
             Ok(gh)
         }
 
-        pub(super) fn gelu_tanh(&self, h: &Tensor, bias: Option<&Tensor>) -> Result<Tensor, GpuError> {
-            let mut a = self.unset16(h.rows, h.cols)?;
+        pub(super) fn gelu_tanh(&self, h: &Tensor, bias: Option<&Tensor>, bf16: bool) -> Result<Tensor, GpuError> {
+            let mut a = if bf16 { self.unset16(h.rows, h.cols)? } else { self.unset32(h.rows, h.cols)? };
             let (rows, width, null) = (h.rows as u64, u32_of(h.cols)?, 0u64);
             let f = self.decoder("gelu_tanh")?;
             let mut builder = self.stream.launch_builder(&f);
@@ -4967,8 +5076,11 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
                 Some(b) => builder.arg(slice32(b)?),
                 None => builder.arg(&null),
             };
-            let Data::CudaBf16(out) = &mut a.data else { return Err(mismatch(&a.data)) };
-            builder.arg(out);
+            match &mut a.data {
+                Data::CudaBf16(out) => builder.arg(&null).arg(out),
+                Data::Cuda32(out) => builder.arg(out).arg(&null),
+                other => return Err(mismatch(other)),
+            };
             // SAFETY: rows × m inputs and outputs, m biases.
             unsafe { builder.launch(cfg_elements(h.len() as u64)) }.gpu_ctx("decoder gelu_tanh")?;
             Ok(a)

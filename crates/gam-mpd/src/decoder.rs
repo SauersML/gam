@@ -19,9 +19,9 @@
 //! default): in [`Arithmetic::Bf16`] each product's operands are rounded to bfloat16, which
 //! changes a model's divergence per token by as much as the divergences an experiment measures;
 //! in any other, the operands stay f32 and the product rounds them as its arithmetic says
-//! ([`Arithmetic::Tf32x3`] keeps f32's accuracy on the tensor cores). Attention reads its heads
-//! in bfloat16 in every arithmetic until its kernel takes f32. A program the recognition does not
-//! take runs on the reference engine (`interchange::Model`).
+//! ([`Arithmetic::Tf32x3`] keeps f32's accuracy on the tensor cores). Attention runs in f32 in
+//! every arithmetic. A program the recognition does not take runs on the reference engine
+//! (`interchange::Model`).
 //!
 //! The trainable operators' values are read from the program they live in ([`Decoder::refresh`]),
 //! their gradients returned per operator.
@@ -646,8 +646,7 @@ impl BlockEngine for Decoder {
                 // Each range is one sequence; the gathered rows hold them in order.
                 let sequences: Vec<Range<usize>> = ranges.iter().scan(0, |at, r| { *at += r.len(); Some(*at - r.len()..*at) }).collect();
                 let attended = d.causal_attention(&heads, a.layout, &sequences, a.scale).map_err(error)?;
-                let wide = if half { None } else { Some(d.convert(&attended.0).map_err(error)?) };
-                d.gemm(&mut out, 1.0, wide.as_ref().unwrap_or(&attended.0), Op::N, &w.output, Op::T, 1.0, arithmetic).map_err(error)?;
+                d.gemm(&mut out, 1.0, &attended.0, Op::N, &w.output, Op::T, 1.0, arithmetic).map_err(error)?;
                 Inner::Attention { head_scales, heads, angles, attended, sequences }
             }
             Block::Mlp(m) => {
@@ -777,10 +776,10 @@ mod tests {
     /// Both engines in `arithmetic`, every block forward and then backward on two sequences, with a
     /// read edit at block 1 (half the read) and its transpose: the final streams, every trainable
     /// operator's gradient and the embedding's cotangent agree within the rounding both share. The
-    /// reference rounds its products' operands as the decoder does; only the order of summation,
-    /// an operand rounded across a tie, and the decoder's attention, which reads bfloat16 heads in
-    /// every arithmetic, differ (a few bfloat16 rounding steps, `2⁻⁸` relative, of the magnitude
-    /// the value sums).
+    /// reference rounds its products' operands as the decoder does; only the order of summation and
+    /// an operand rounded across a tie differ: values within 4 rounding steps of the magnitude
+    /// they sum, gradients within 8 (a step the arithmetic's unit roundoff, and at least `2⁻²⁰` for
+    /// the f32 sums that differ in order).
     fn parity(dir: std::path::PathBuf, arithmetic: Arithmetic) {
         let imported = import_language_model(&dir, 2, 12).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
@@ -822,7 +821,8 @@ mod tests {
         let (a, b) = (host.download(&reference_stream).unwrap(), host.download(&decoder_stream).unwrap());
         let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         let difference = a.iter().zip(&b).fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()));
-        assert!(difference <= 4.0 / 256.0 * scale, "final streams differ by {difference} of {scale}");
+        let unit = arithmetic.unit_roundoff().max(2f64.powi(-20));
+        assert!(difference <= 4.0 * unit * scale, "final streams differ by {difference} of {scale}");
         // The reverse: forward with tapes, then every block backward from one cotangent.
         let cotangent = host.upload(Array2::from_shape_fn((24, 8), |(r, c)| ((r * 8 + c) as f64 * 0.37).sin()).view()).unwrap();
         let mut reference_gradient = BTreeMap::new();
@@ -858,7 +858,7 @@ mod tests {
             let (r, d) = (host.download(r).unwrap(), host.download(&decoder_gradient[op]).unwrap());
             let scale = r.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
             let difference = r.iter().zip(&d).fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()));
-            assert!(difference <= 8.0 / 256.0 * scale, "operator {} gradient differs by {difference} of {scale}", explanation.artifact.program.operators[*op].name);
+            assert!(difference <= 8.0 * unit * scale, "operator {} gradient differs by {difference} of {scale}", explanation.artifact.program.operators[*op].name);
         }
     }
 

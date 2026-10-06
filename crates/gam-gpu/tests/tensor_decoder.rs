@@ -1,16 +1,18 @@
 //! The decoder layer's fused operations (`Device::rms_gain`, `heads_rope`, `causal_attention`,
-//! `swiglu`, `gelu_tanh` and their reverses) on CUDA against their host twins on the same inputs.
+//! `swiglu`, `gelu_tanh` and their reverses) on CUDA against their host twins on the same inputs,
+//! and the split products it runs in (`Arithmetic::Tf32x3`, `Arithmetic::Bf16x3`).
 //!
-//! The device computes in f32 and rounds what a product reads to bfloat16; the host computes in
-//! float64 and rounds the same values to bfloat16. A bfloat16 output is within one bfloat16 rounding
+//! The device computes in f32 and rounds what a product reads to bfloat16 where asked; the host
+//! computes in float64 and rounds the same values alike. A bfloat16 output is within one bfloat16 rounding
 //! (`2⁻⁸` relative) of the host's plus the f32 error before it; an f32 output within `2⁻¹⁶` of the
 //! largest magnitude entering it (a chain of f32 operations and sums of at most a few thousand
 //! terms). Attention computes in f32 (`attention_f32.inc`) against the host's float64; its bands
 //! are those of `tests/attention_metal.rs`, which runs the same kernel bodies on the Apple GPU.
-//! Each test runs when a CUDA device resolves and has nothing to run otherwise.
+//! Each test runs when a CUDA device resolves and has nothing to run otherwise, except the split
+//! products' host test.
 
 use gam_gpu::GpuPolicy;
-use gam_gpu::tensor::{Device, HeadLayout, Storage, Tensor};
+use gam_gpu::tensor::{Arithmetic, Device, HeadLayout, Op, Storage, Tensor};
 use ndarray::Array2;
 
 fn cuda() -> Option<Device> {
@@ -97,7 +99,7 @@ fn heads_rope_and_its_reverse_match_the_host() {
             };
             let ((y, gp), (hy, hgp)) = (run(&d), run(&host));
             let what = format!("heads (normed {normed}, rotate-half {half_split})");
-            close(&what, &y, &hy, |i, j| HALF * hy[[i, j]].abs() + 4.0 * SINGLE * largest(&hy));
+            close(&what, &y, &hy, |_, _| 4.0 * SINGLE * largest(&hy));
             close(&format!("{what} reverse"), &gp, &hgp, |_, _| 16.0 * SINGLE * largest(&hgp));
         }
     }
@@ -166,16 +168,73 @@ fn the_mlp_activations_and_their_reverses_match_the_host() {
     let (h, ga, gh) = (matrix(19, 64, 10, 4.0), matrix(19, 32, 11, 1.0), matrix(19, 64, 12, 1.0));
     let bias = matrix(1, 64, 13, 0.5);
     let up = |dev: &Device, m: &Array2<f64>| -> Tensor { dev.upload(m.view()).unwrap() };
-    let a = d.download(&d.swiglu(&up(&d, &h)).unwrap()).unwrap();
-    let ha = host.download(&host.swiglu(&up(&host, &h)).unwrap()).unwrap();
-    close("swiglu", &a, &ha, |i, j| HALF * ha[[i, j]].abs() + SINGLE * largest(&ha));
+    for bf16 in [true, false] {
+        let a = d.download(&d.swiglu(&up(&d, &h), bf16).unwrap()).unwrap();
+        let ha = host.download(&host.swiglu(&up(&host, &h), bf16).unwrap()).unwrap();
+        let band = if bf16 { HALF } else { SINGLE };
+        close("swiglu", &a, &ha, |i, j| band * ha[[i, j]].abs() + SINGLE * largest(&ha));
+        let a = d.download(&d.gelu_tanh(&up(&d, &h), Some(&up(&d, &bias)), bf16).unwrap()).unwrap();
+        let ha = host.download(&host.gelu_tanh(&up(&host, &h), Some(&up(&host, &bias)), bf16).unwrap()).unwrap();
+        close("gelu", &a, &ha, |i, j| band * ha[[i, j]].abs() + SINGLE * largest(&ha));
+    }
     let g = d.download(&d.swiglu_backward(&up(&d, &h), &up(&d, &ga)).unwrap()).unwrap();
     let hg = host.download(&host.swiglu_backward(&up(&host, &h), &up(&host, &ga)).unwrap()).unwrap();
     close("swiglu reverse", &g, &hg, |_, _| 4.0 * SINGLE * largest(&hg));
-    let a = d.download(&d.gelu_tanh(&up(&d, &h), Some(&up(&d, &bias))).unwrap()).unwrap();
-    let ha = host.download(&host.gelu_tanh(&up(&host, &h), Some(&up(&host, &bias))).unwrap()).unwrap();
-    close("gelu", &a, &ha, |i, j| HALF * ha[[i, j]].abs() + SINGLE * largest(&ha));
     let g = d.download(&d.gelu_tanh_backward(&up(&d, &h), Some(&up(&d, &bias)), &up(&d, &gh)).unwrap()).unwrap();
     let hg = host.download(&host.gelu_tanh_backward(&up(&host, &h), Some(&up(&host, &bias)), &up(&host, &gh)).unwrap()).unwrap();
     close("gelu reverse", &g, &hg, |_, _| 4.0 * SINGLE * largest(&hg));
+}
+
+/// `op(a) op(b)` in `arithmetic` on `device` (f32 operands, and `b` also as a bfloat16 copy where
+/// `frozen`), and the float64 product's magnitude `Σ |a| |b|` per entry.
+fn split_case(device: &Device, arithmetic: Arithmetic, frozen: bool) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
+    let host = Device::host();
+    let (rows, cols, inner) = (40, 56, 700);
+    let (a, b) = (matrix(rows, inner, 31, 1.0), matrix(cols, inner, 37, 1.0));
+    let b = if frozen { host.download(&host.bf16_copy(&host.upload(b.view()).unwrap()).unwrap()).unwrap() } else { b };
+    let (da, db) = (device.upload(a.view()).unwrap(), device.upload(b.view()).unwrap());
+    let db = if frozen && !device.is_host() { device.bf16_copy(&db).unwrap() } else { db };
+    let mut c = device.zeros(rows, cols).unwrap();
+    device.gemm(&mut c, 1.0, &da, Op::N, &db, Op::T, 0.0, arithmetic).unwrap();
+    (device.download(&c).unwrap(), a.dot(&b.t()), a.mapv(f64::abs).dot(&b.mapv(f64::abs).t()))
+}
+
+/// The largest difference of `c` from `exact` relative to the magnitude summed.
+fn worst(c: &Array2<f64>, exact: &Array2<f64>, magnitude: &Array2<f64>) -> f64 {
+    c.iter().zip(exact).zip(magnitude).fold(0.0_f64, |m, ((x, e), g)| m.max((x - e).abs() / g))
+}
+
+/// A split product is within `2 u` of each term's magnitude plus f32's sums (`(k + 2) 2⁻²⁴`) of the
+/// exact product, `u` its unit roundoff; one product of its parts' arithmetic is 64 times further
+/// off at least.
+#[test]
+fn split_products_keep_f32_accuracy_on_the_host() {
+    let host = Device::host();
+    for arithmetic in [Arithmetic::Tf32x3, Arithmetic::Bf16x3] {
+        let mut split = 0.0_f64;
+        for frozen in [false, true] {
+            let (c, exact, magnitude) = split_case(&host, arithmetic, frozen);
+            let bound = 2.0 * arithmetic.unit_roundoff() + 702.0 * f64::from(f32::EPSILON) / 2.0;
+            close(&format!("{arithmetic:?} (frozen {frozen})"), &c, &exact, |i, j| bound * magnitude[[i, j]]);
+            split = split.max(worst(&c, &exact, &magnitude));
+        }
+        let single = arithmetic.split().unwrap();
+        let (c, exact, magnitude) = split_case(&host, single, false);
+        let alone = worst(&c, &exact, &magnitude);
+        assert!(alone > 64.0 * split, "{single:?} alone is within {alone:e} of the magnitude, {arithmetic:?} within {split:e}");
+    }
+}
+
+/// The CUDA split products against the host's, which round alike: within the bound of the exact
+/// product either keeps.
+#[test]
+fn split_products_match_the_host_on_cuda() {
+    let Some(d) = cuda() else { return };
+    for arithmetic in [Arithmetic::Tf32x3, Arithmetic::Bf16x3] {
+        for frozen in [false, true] {
+            let (c, exact, magnitude) = split_case(&d, arithmetic, frozen);
+            let bound = 2.0 * arithmetic.unit_roundoff() + 702.0 * f64::from(f32::EPSILON) / 2.0;
+            close(&format!("CUDA {arithmetic:?} (frozen {frozen})"), &c, &exact, |i, j| bound * magnitude[[i, j]]);
+        }
+    }
 }
