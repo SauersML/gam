@@ -15,8 +15,7 @@
 //!
 //! The method, each fit to convergence on the same fixed native experiments:
 //! 1. the library is fitted (OUT/base);
-//! 2. among each MLP's functions in the explanation where it starts (`M`'s, or a checkpoint's
-//!    survivors), the regions are those reading only one head's writes
+//! 2. among each MLP's functions in the fitted library, at its posterior, the regions are those reading only one head's writes
 //!    (`library_crossing::regions_through`: heads and the functions they feed, across the
 //!    attention/MLP boundary; linear in the MLP's width) and, of the functions left, in the gate
 //!    only, the groups a count of the parameters a rewrite saves at the posterior's resolution
@@ -280,9 +279,8 @@ fn extract(explanation: &Explanation, region: &Region) -> Result<(Explanation, C
     })
 }
 
-/// The method (module note) from `base` with its posterior `posterior` (a checkpoint's; none for
-/// `M`, whose posterior is the library's start); with `planted`, the gate's planted units per layer.
-fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior>, planted: Option<&[Vec<usize>; 2]>) -> Result<(), String> {
+/// The method (module note) from `base`; with `planted`, the gate's planted units per layer.
+fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>) -> Result<(), String> {
     let mut summary = json!({"stages": [], "decisions": []});
     let record = |summary: &mut Value, key: &str, value: Value| -> Result<(), String> {
         summary[key].as_array_mut().ok_or("a summary list")?.push(value);
@@ -290,24 +288,21 @@ fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior
     };
     let fitted = run.fit("base", &base)?;
     record(&mut summary, "stages", stage("base", &fitted))?;
-    // Among each MLP's functions in the explanation where it starts, the regions at the start's
-    // posterior; of the functions left, those reading through one head.
-    let posterior = match posterior {
-        Some(posterior) => posterior,
-        None => library_mdl::Posterior::new(&base, fitted.report.scored_tokens)?,
-    };
+    // Among each MLP's functions in the fitted explanation, the regions at its posterior (the one
+    // that resolves what the data determine; the extraction starts from its means).
+    let posterior = &fitted.posterior.clone();
     let (mut regions, mut candidates, mut through) = (Vec::new(), Vec::new(), Vec::new());
     for l in 0..run.layers.len() {
         let pool: Vec<usize> = (0..base.layers[l].functions.len()).filter(|i| base.layers[l].functions[*i].iter().all(|g| posterior.active[*g])).collect();
         let writers = library_crossing::writers(&run.native, &run.layers, l)?;
         let mut taken = Vec::new();
-        for (set, region) in library_crossing::regions_through(&base, &posterior, &writers, l, &pool)? {
+        for (set, region) in library_crossing::regions_through(&base, posterior, &writers, l, &pool)? {
             taken.extend(region.iter().copied());
             through.push((l, set.iter().map(|w| writers[*w].clone()).collect::<Vec<_>>(), writers.len(), region));
         }
         if run.grown {
             let rest: Vec<usize> = pool.into_iter().filter(|i| !taken.contains(i)).collect();
-            for (region, saving) in library_bodies::regions(&base, &posterior, l, &rest)? {
+            for (region, saving) in library_bodies::regions(&base, posterior, l, &rest)? {
                 candidates.push(json!({"layer": l, "functions": region, "saving": saving}));
                 if saving > 0.0 {
                     regions.push((l, region));
@@ -519,7 +514,7 @@ fn main() -> Result<(), String> {
                 fit,
                 out: out.to_path_buf(),
             };
-            method(&run, base, None, Some(&planted))
+            method(&run, base, Some(&planted))
         }
         Some("model") => {
             let (export, settings_path, from, out, mode, scoreboard) = match &args[..] {
@@ -553,21 +548,20 @@ fn main() -> Result<(), String> {
                 return Err("the export holds fewer training sequences than asked for".into());
             }
             let start = library_mdl::explanation(&native, &layers)?;
-            let (base, posterior) = match from.split_once(':') {
-                None if from == "native" => (start, None),
+            let base = match from.split_once(':') {
+                None if from == "native" => start,
                 Some(("checkpoint", path)) => {
-                    // Entry by entry along the operators' own axes, as the bodies read it.
                     let posterior = library_mdl::checkpoint_posterior(&start, Path::new(path))?;
                     let mut base = library_sharing::warm(&start, &library_mdl::posterior_mean(&start, &posterior)?)?;
                     base.removed = (0..posterior.active.len()).filter(|g| !posterior.active[*g]).collect();
-                    (base, Some(posterior))
+                    base
                 }
                 _ => return Err("FROM is native or checkpoint:PATH".into()),
             };
             std::fs::create_dir_all(out).map_err(error)?;
             let model = export.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let run = Run { model, grown: false, scoreboard, device, native, layers, held: sequences[first..end].to_vec(), train, fit: settings.fit, digest: settings.export_sha256, out: out.to_path_buf() };
-            method(&run, base, posterior, None)
+            method(&run, base, None)
         }
         _ => Err("gate OUT [SCOREBOARD.tsv] | model EXPORT SETTINGS.json FROM OUT host|gpu [SCOREBOARD.tsv]".into()),
     }
