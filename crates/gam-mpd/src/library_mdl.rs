@@ -3057,7 +3057,8 @@ pub fn fit(
 
 /// [`fit`] from `start` in place of `M` when one is given (a checkpoint's [`checkpoint_start`], a
 /// posterior whose groups no checkpoint has, or a start set from the curvature). A checkpoint of
-/// this fit, when one exists, is resumed and `start` is not used.
+/// this fit, when one exists, is resumed and `start` is not used; one of this fit's problem from an
+/// older experiment collection is the start instead.
 pub fn fit_from(
     device: &Device,
     native: &OperatorProgram,
@@ -3125,6 +3126,33 @@ pub fn fit_from(
     // needs), with `M`'s targets for its experiments made once for every evaluation of it.
     let subset = &held[..settings.batch_sequences.clamp(2, held.len())];
     let subset_batches = held_batches(&scorer, subset, settings)?;
+    // A checkpoint at `checkpoint` of this fit's problem (its identity) drawn from an older
+    // experiment collection ([`COLLECTION`]) was trained on other experiments, so it is not
+    // resumed: its posterior and IVON's state start this fit as its [`checkpoint_start`] would, in
+    // place of `start`. The file stays beside it as `<name>.collection<c>.bin`, a hard link the
+    // fit's first save leaves (a save replaces `checkpoint`'s directory entry), and a fit stopped
+    // before that save starts from it again.
+    let mut start = start;
+    let mut warm = false;
+    if let Some(path) = checkpoint.filter(|p| p.exists()) {
+        #[derive(Deserialize)]
+        struct Header {
+            identity: Identity,
+            #[serde(default)]
+            collection: u32,
+        }
+        let (header, _, _): (Header, _, _) = checkpoint_header(path)?;
+        if header.collection != COLLECTION {
+            check_checkpoint_identity(path, &header.identity, &progress.identity)?;
+            let aside = path.with_extension(format!("collection{}.bin", header.collection));
+            if !aside.exists() {
+                std::fs::hard_link(path, &aside).or_else(|_| std::fs::copy(path, &aside).map(|_| ())).map_err(error)?;
+            }
+            start = Some(read_checkpoint(explanation, path)?.1);
+            warm = true;
+            log::info!("library fit started from {} (experiment collection {}, kept as {})", path.display(), header.collection, aside.display());
+        }
+    }
     // IVON's state the fit continues, a start's or a checkpoint's, and the posterior's means the
     // device holds with it (the Polyak average of the state's iterate).
     let (mut resumed, mut held_means): (Option<Optimizer>, Option<Vec<Array2<f64>>>) = (None, None);
@@ -3150,7 +3178,7 @@ pub fn fit_from(
         progress.epoch = start.epoch;
         resumed = start.state;
     }
-    if let Some(path) = checkpoint.filter(|p| p.exists()) {
+    if let Some(path) = checkpoint.filter(|p| p.exists() && !warm) {
         let (loaded, moments, held, iterate) = load_checkpoint(path, &progress, &mut posterior)?;
         held_means = Some(held);
         progress = loaded;
@@ -5236,6 +5264,33 @@ mod tests {
         assert_eq!(started.posterior.mean, resumed.posterior.mean);
         assert_eq!(started.posterior.log_sd, resumed.posterior.log_sd);
         assert_eq!(started.posterior.active, resumed.posterior.active);
+        // The same checkpoint marked as one of an older experiment collection, at the fit's own
+        // path: it is the fit's start, not resumed, and stays beside as `.collection0.bin`.
+        let mut older: serde_json::Value = serde_json::from_slice(&bytes[8..8 + length]).unwrap();
+        older["done"] = serde_json::Value::Bool(false);
+        older["previous"] = serde_json::Value::Null;
+        older.as_object_mut().unwrap().remove("collection").unwrap();
+        let older = serde_json::to_vec(&older).unwrap();
+        let older = [&(older.len() as u64).to_le_bytes()[..], &older, &bytes[8 + length..]].concat();
+        let path = std::env::temp_dir().join(format!("library_fit_from_older_{}.bin", std::process::id()));
+        std::fs::write(&path, &older).unwrap();
+        let warmed = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&path), None).unwrap();
+        let aside = path.with_extension("collection0.bin");
+        assert_eq!(std::fs::read(&aside).unwrap(), older, "the older checkpoint stays beside");
+        for file in [&path, &aside] {
+            for extension in ["bin", "json", "removals.jsonl", "collection0.bin"] {
+                let written = file.with_extension(extension);
+                if written.exists() {
+                    std::fs::remove_file(written).unwrap();
+                }
+            }
+        }
+        assert_eq!(warmed.report.epochs.len(), started.report.epochs.len());
+        for (a, b) in warmed.report.epochs.iter().zip(&started.report.epochs) {
+            assert_eq!(a.epoch, b.epoch);
+            assert_eq!((a.data_bits.to_bits(), a.snapshot_bits.to_bits()), (b.data_bits.to_bits(), b.snapshot_bits.to_bits()), "epoch {}", a.epoch);
+        }
+        assert_eq!(warmed.posterior.mean, started.posterior.mean);
         // A start of another explanation is refused.
         let other = Start { mean: Vec::new(), log_sd: Vec::new(), active: vec![true], state: None, epoch: 0 };
         assert!(fit_from(&device, &native, &explanation, train, held, &settings, "tiny", None, None, Some(other)).is_err());
