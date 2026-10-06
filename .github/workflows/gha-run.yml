@@ -58,6 +58,9 @@ on:
       cache:
         description: "Build cache kind: empty for release builds (binaries); check, clippy or test for fastcheck's overflow"
         default: ""
+      os:
+        description: "Runner: ubuntu-22.04 (default) or macos-15 (Apple silicon: fastcheck's release builds for the Mac)"
+        default: ""
 
 run-name: gha-run ${{ inputs.name }}
 
@@ -68,7 +71,7 @@ permissions:
 
 jobs:
   run:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ inputs.os != '' && inputs.os || 'ubuntu-22.04' }}
     timeout-minutes: 355
     env:
       NAME: ${{ inputs.name }}
@@ -90,6 +93,11 @@ jobs:
           # The command gets no credentials: the token stays with the publish step.
           persist-credentials: false
 
+      # On macOS (fastcheck's release builds) sccache keeps every unchanged crate's objects across
+      # commits, so a build recompiles only what the commit changed; the command sets RUSTC_WRAPPER.
+      - uses: mozilla-actions/sccache-action@v0.0.9
+        if: runner.os == 'macOS'
+
       - name: Toolchain (rust-toolchain.toml's)
         run: rustup toolchain install "$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)" --profile minimal
 
@@ -107,7 +115,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}${{ inputs.cache != '' && format('-{0}', inputs.cache) || '' }}
+          key: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}${{ inputs.cache != '' && format('-{0}', inputs.cache) || '' }}${{ runner.os == 'macOS' && '-macos' || '' }}
 
       - name: Build
         run: |
@@ -159,9 +167,14 @@ jobs:
           export DEADLINE=$(( JOB_START + LINK_MINUTES * 60 ))
           left=$(( DEADLINE - $(date +%s) ))
           (( left > 0 )) || { echo "no time left in this link (LINK_MINUTES $LINK_MINUTES)"; exit 1; }
-          echo "# link $LINK of at most $LINKS; the command stops at $(date -u -d "@$DEADLINE")" | tee -a out/command.log
+          echo "# link $LINK of at most $LINKS; the command stops at $(date -u -r "$DEADLINE" 2> /dev/null || date -u -d "@$DEADLINE")" | tee -a out/command.log
           set +e
-          timeout --signal=TERM --kill-after=60 "$left" bash -c "$COMMAND" 2>&1 | tee -a out/command.log
+          # macOS has no GNU timeout; there the job's own limit stops the command.
+          if command -v timeout > /dev/null; then
+            timeout --signal=TERM --kill-after=60 "$left" bash -c "$COMMAND" 2>&1 | tee -a out/command.log
+          else
+            bash -c "$COMMAND" 2>&1 | tee -a out/command.log
+          fi
           rc=${PIPESTATUS[0]}
           set -e
           # 75: unfinished, its state under $OUT; 124: the link's time ran out.
@@ -178,7 +191,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}${{ inputs.cache != '' && format('-{0}', inputs.cache) || '' }}
+          key: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}${{ inputs.cache != '' && format('-{0}', inputs.cache) || '' }}${{ runner.os == 'macOS' && '-macos' || '' }}
 
       - uses: actions/upload-artifact@v4
         if: always() && inputs.command != ''
