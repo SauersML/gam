@@ -1679,7 +1679,9 @@ reach() {
     printf '%s\t%s\t%s\n' "$(date '+%F %T')" "${POD_HOST:-}" "$(( $(date +%s) - CREATED ))" >> "$SSH_UP"
     say "ssh $SSH_USER@$IP -p $PORT up after $(( $(date +%s) - CREATED )) s"
     # The published inputs start downloading now, while the pod's checks run (setup waits for them;
-    # a pod the checks discard takes its partial download with it).
+    # a pod the checks discard takes its partial download with it). A Thunder or Nebius machine's
+    # login is not root: /workspace is made for it first.
+    [ "$(provider_of "$POD")" = runpod ] || on_pod 'sudo mkdir -p /workspace && sudo chown "$(id -u):$(id -g)" /workspace' < /dev/null > /dev/null 2>&1
     if [ ${#fetched[@]} -gt 0 ] && [ -z "$EARLY_FETCH" ]; then
         fetch_published & EARLY_FETCH=$!
     fi
