@@ -1141,3 +1141,116 @@ fn a_part_removed_from_a_position_on_is_the_same_on_both_models() {
     let (from, at): (f64, f64) = (effects[0].iter().sum(), effects[1].iter().sum());
     assert!(from > 1e-9 && from >= at, "removed from the position on {from}, at the position {at}");
 }
+
+/// The reverse pass of every edit of parts is the transpose of its forward tangent: on the tiny
+/// Qwen3 export's part sites, with random reads, streams, tangents and cotangents (host, float64),
+/// `⟨tangent, ḡ⟩` equals `⟨direction, reverse(ḡ)⟩` to 1e-12 relative for an amplification, a swap
+/// (read at another row), a removal at several rows, a head's removal at two rows, and a cut
+/// connection (probes at layer 0's MLP on a base and a source row, the cut at layer 1's: the
+/// tangent through the recomputed norm `N`, the reverse through its transpose, the entering
+/// stream's share and the record carried between the blocks). The tangents are written from the
+/// edits' definitions, apart from the edits' code.
+#[test]
+fn the_reverse_of_every_edit_is_the_transpose_of_its_tangent() {
+    use ndarray::Array2 as A;
+    use rand::RngExt;
+    let dir = crate::test_support::tiny_qwen3_export("interchange_adjoint", 2);
+    let imported = crate::import::import_language_model(&dir, 6, 12).expect("the tiny export imports");
+    std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+    let native = split_sites(&imported.program).expect("the native sites");
+    let layers = layer_nodes(&native, 2).expect("the layers");
+    let d = Device::host();
+    let variables = reads(&native, &layers).expect("the reads");
+    let mut x = Interchange::new(&d, &native, &layers, &Artifact::native(&native).expect("native"), &[], variables, 1 << 30, 64).expect("the experiments");
+    let width = BlockEngine::width(&x.models().0);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+    let mut random = |rows: usize, cols: usize, scale: f64| A::from_shape_fn((rows, cols), |_| scale * (rng.random::<f64>() - 0.5));
+    // Parts that fire on the random reads (bias 1, small reads) and a large write for the cut's source.
+    let parts: Vec<Part> = [1usize, 1, 3].iter().map(|b| Part { block: *b, read: random(1, width, 0.2).row(0).to_vec(), bias: 1.0, write: random(1, width, 2.0).row(0).to_vec() }).collect();
+    x.set_parts(parts.clone()).expect("the parts");
+    let (m, _) = x.models();
+    let sites = m.part_sites().expect("M's edit sites");
+    let dot = |a: &A<f64>, b: &A<f64>| -> f64 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+    let close = |a: f64, b: f64, what: &str| assert!((a - b).abs() <= 1e-12 * a.abs().max(b.abs()).max(1e-12), "{what}: ⟨tangent, ḡ⟩ {a}, ⟨direction, reverse⟩ {b}");
+    let rows = 6;
+    // Writes: an amplification by 3 at row 1, a swap at row 2 read at row 4, a removal at rows 3 and 5.
+    {
+        let (read, out) = sites.nodes(1).expect("layer 0's MLP");
+        let edits = [(1, Edit::Part { part: 0, factor: 3 }), (2, Edit::SwapAt { part: 1, from: 4 }), (3, Edit::PartAt { part: 0, factor: 0, at: 3 }), (5, Edit::PartAt { part: 0, factor: 0, at: 5 })];
+        let e = Edits::with_parts(&d, &[], m.values(), &edits, Some(sites), None).expect("the edits");
+        let (xs, dx, g) = (random(rows, width, 2.0), random(rows, width, 1.0), random(rows, width, 1.0));
+        let xt = d.upload(xs.view()).expect("upload");
+        let mut value = d.zeros(rows, width).expect("zeros");
+        e.write(&d, out, &mut value, |n| if n == read { Ok(&xt) } else { Err("another node".into()) }).expect("the forward");
+        // The tangent of the added rows: Σ s 1[g·x + c > 0] (g·dx[from]) u at each edited row.
+        let mut tangent = A::zeros((rows, width));
+        let pre = |p: &Part, r: usize| xs.row(r).iter().zip(&p.read).map(|(a, b)| a * b).sum::<f64>() + p.bias;
+        let mut add = |row: usize, from: usize, p: &Part, s: f64| {
+            if pre(p, from) > 0.0 {
+                let c = s * dx.row(from).iter().zip(&p.read).map(|(a, b)| a * b).sum::<f64>();
+                tangent.row_mut(row).iter_mut().zip(&p.write).for_each(|(t, u)| *t += c * u);
+            }
+        };
+        add(1, 1, &parts[0], FACTORS[3] - 1.0);
+        add(2, 4, &parts[1], 1.0);
+        add(2, 2, &parts[1], -1.0);
+        add(3, 3, &parts[0], -1.0);
+        add(5, 5, &parts[0], -1.0);
+        let mut gout = d.upload(g.view()).expect("upload");
+        e.transpose(&d, out, &mut gout).expect("the output's transpose");
+        assert_eq!(d.download(&gout).expect("download"), g, "the output's own cotangent passes");
+        let mut gread = d.zeros(rows, width).expect("zeros");
+        e.transpose(&d, read, &mut gread).expect("the read's transpose");
+        close(dot(&tangent, &g), dot(&dx, &d.download(&gread).expect("download")), "writes");
+    }
+    // A head's removal at rows 1 and 4: the masks' transpose.
+    {
+        let head = x.heads().iter().position(|(_, held)| *held).expect("a head");
+        let e = Edits::with_parts(&d, &[], m.values(), &[(1, Edit::HeadAt { head, at: 1 }), (4, Edit::HeadAt { head, at: 4 })], Some(sites), None).expect("the edits");
+        let (node, w) = sites.head(head).expect("the head's node");
+        let (dv, g) = (random(rows, w, 1.0), random(rows, w, 1.0));
+        let mut t = d.upload(dv.view()).expect("upload");
+        e.apply(&d, node, &mut t).expect("the masks");
+        let mut gt = d.upload(g.view()).expect("upload");
+        e.transpose(&d, node, &mut gt).expect("the masks' transpose");
+        close(dot(&d.download(&t).expect("download"), &g), dot(&dv, &d.download(&gt).expect("download")), "head removal");
+    }
+    // A cut from part 0 (layer 0's MLP; base row 1, source row 4 there) to part 2 (layer 1's MLP, row 2).
+    {
+        let records: super::interchange::Records = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+        let ((read_a, out_a), (_, out_b)) = (sites.nodes(1).expect("layer 0's MLP"), sites.nodes(3).expect("layer 1's MLP"));
+        let norm = sites.norm(3).expect("layer 1's input norm");
+        let probes = [(1, Edit::Probe { cut: 0, part: 0, role: 0, at: 1 }), (4, Edit::Probe { cut: 0, part: 0, role: 1, at: 4 })];
+        let ea = Edits::with_parts(&d, &[], m.values(), &probes, Some(sites), Some(std::rc::Rc::clone(&records))).expect("the probes");
+        let eb = Edits::with_parts(&d, &[], m.values(), &[(2, Edit::Cut { cut: 0, from: 0, to: 2 })], Some(sites), Some(std::rc::Rc::clone(&records))).expect("the cut");
+        let (xa, dxa, s, ds, g) = (random(rows, width, 2.0), random(rows, width, 1.0), random(rows, width, 4.0), random(rows, width, 1.0), random(rows, width, 1.0));
+        let (xat, st) = (d.upload(xa.view()).expect("upload"), d.upload(s.view()).expect("upload"));
+        let mut value = d.zeros(rows, width).expect("zeros");
+        ea.write(&d, out_a, &mut value, |n| if n == read_a { Ok(&xat) } else { Err("another node".into()) }).expect("the probes' forward");
+        let mut value = d.zeros(rows, width).expect("zeros");
+        eb.write(&d, out_b, &mut value, |n| if n == norm.entry() { Ok(&st) } else { Err("another node".into()) }).expect("the cut's forward");
+        // The tangent from the definition: y = s + (a′ − a) u_A, out += (relu(g_B·N(y) + c) − relu(g_B·N(s) + c)) u_B.
+        let (pa, pb) = (&parts[0], &parts[2]);
+        let lin = |v: &[f64], w: &[f64]| v.iter().zip(w).map(|(a, b)| a * b).sum::<f64>();
+        let act = |r: usize| lin(xa.row(r).as_slice().unwrap(), &pa.read) + pa.bias;
+        let dact = |r: usize| if act(r) > 0.0 { lin(dxa.row(r).as_slice().unwrap(), &pa.read) } else { 0.0 };
+        let (a, a2) = (act(1).max(0.0), act(4).max(0.0));
+        let srow = s.row(2).to_vec();
+        let y: Vec<f64> = srow.iter().zip(&pa.write).map(|(v, u)| v + (a2 - a) * u).collect();
+        let dy: Vec<f64> = ds.row(2).iter().zip(&pa.write).map(|(v, u)| v + (dact(4) - dact(1)) * u).collect();
+        let on = |z: &[f64]| lin(&norm.apply(z), &pb.read) + pb.bias > 0.0;
+        let dchange = if on(&y) { lin(&norm.tangent(&y, &dy), &pb.read) } else { 0.0 } - if on(&srow) { lin(&norm.tangent(&srow, ds.row(2).as_slice().unwrap()), &pb.read) } else { 0.0 };
+        let mut tangent = A::zeros((rows, width));
+        tangent.row_mut(2).iter_mut().zip(&pb.write).for_each(|(t, u)| *t = dchange * u);
+        let mut gout = d.upload(g.view()).expect("upload");
+        eb.transpose(&d, out_b, &mut gout).expect("the cut's transpose");
+        let mut gs = d.zeros(rows, width).expect("zeros");
+        eb.add_entering(&d, &mut gs).expect("the entering stream's share");
+        let mut ga = d.zeros(rows, width).expect("zeros");
+        ea.transpose(&d, read_a, &mut ga).expect("the probes' transpose");
+        let back = dot(&ds, &d.download(&gs).expect("download")) + dot(&dxa, &d.download(&ga).expect("download"));
+        assert!(dchange != 0.0, "the cut's tangent is not zero");
+        close(dot(&tangent, &g), back, "cut connection");
+    }
+}
+

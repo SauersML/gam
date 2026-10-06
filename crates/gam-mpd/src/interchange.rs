@@ -386,7 +386,7 @@ pub struct PartSites {
 /// A block's input norm `N(s) = γ ⊙ s · (mean(s²) + ε)^{-1/2} + β` of the stream `s` entering it
 /// (node `entry`), as the model applies it.
 #[derive(Clone, Debug)]
-struct Norm {
+pub(crate) struct Norm {
     entry: usize,
     epsilon: f64,
     gain: Vec<f64>,
@@ -417,7 +417,19 @@ impl Norm {
         1.0 / (s.iter().map(|v| v * v).sum::<f64>() / s.len() as f64 + self.epsilon).sqrt()
     }
 
-    fn apply(&self, s: &[f64]) -> Vec<f64> {
+    /// The stream node the norm reads.
+    pub(crate) fn entry(&self) -> usize {
+        self.entry
+    }
+
+    /// The tangent of `N(s)` along `ds`: `γ ⊙ (r ds + s dr)`, `dr = −r³ (s·ds)/d`.
+    pub(crate) fn tangent(&self, s: &[f64], ds: &[f64]) -> Vec<f64> {
+        let r = self.scale(s);
+        let dr = -r * r * r * s.iter().zip(ds).map(|(a, b)| a * b).sum::<f64>() / s.len() as f64;
+        s.iter().zip(ds).zip(&self.gain).map(|((v, dv), g)| g * (r * dv + v * dr)).collect()
+    }
+
+    pub(crate) fn apply(&self, s: &[f64]) -> Vec<f64> {
         let r = self.scale(s);
         s.iter().enumerate().map(|(k, v)| self.gain[k] * v * r + self.bias.as_ref().map_or(0.0, |b| b[k])).collect()
     }
@@ -481,6 +493,16 @@ impl PartSites {
     }
 
     /// Block `block`'s node its parts read and the node their writes add to, if it has parts.
+    /// Head `h`'s attention output node and its width, when the model holds it.
+    pub(crate) fn head(&self, h: usize) -> Option<(usize, usize)> {
+        self.heads.get(h).copied().flatten()
+    }
+
+    /// Block `block`'s input norm, when a cut connection can recompute it.
+    pub(crate) fn norm(&self, block: usize) -> Option<&Norm> {
+        self.norms.get(block).and_then(Option::as_ref)
+    }
+
     pub fn nodes(&self, block: usize) -> Option<(usize, usize)> {
         self.nodes.get(block).copied().flatten()
     }
