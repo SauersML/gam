@@ -7,7 +7,9 @@
 //!
 //! `EXPORT` and `SETTINGS.json` are the fit's (`mpd_library_mdl_2951`, an engine export);
 //! `CHECKPOINT` is its `checkpoint.bin` (or a copy). `OUT` receives `REPORT.json`, the search's
-//! log (`ranked.removals.jsonl`) and `M`'s targets (`targets/`).
+//! log (`ranked.removals.jsonl`) and `M`'s targets (`targets/`). With a sixth argument, group sets
+//! (`;` between sets, `,` between groups), each set is removed alone without and with compensation
+//! and the changes of the data term and the description go to `OUT/CHANGES.json` instead.
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     engine::{log_to_stderr, sha256},
@@ -20,7 +22,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::{path::Path, time::Instant};
 
-const USAGE: &str = "EXPORT SETTINGS.json CHECKPOINT OUT host|gpu";
+const USAGE: &str = "EXPORT SETTINGS.json CHECKPOINT OUT host|gpu [G,G;G,…]";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,7 +41,11 @@ fn error(e: impl std::fmt::Display) -> String {
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [export, settings_path, checkpoint, out, mode] = &args[..] else { return Err(USAGE.into()) };
+    let (export, settings_path, checkpoint, out, mode, sets) = match &args[..] {
+        [export, settings, checkpoint, out, mode] => (export, settings, checkpoint, out, mode, None),
+        [export, settings, checkpoint, out, mode, sets] => (export, settings, checkpoint, out, mode, Some(sets)),
+        _ => return Err(USAGE.into()),
+    };
     let (export, settings_path, checkpoint, out) = (Path::new(export), Path::new(settings_path), Path::new(checkpoint), Path::new(out));
     let settings: Settings = serde_json::from_slice(&std::fs::read(settings_path).map_err(error)?).map_err(error)?;
     if sha256(&export.join("export.json"))? != settings.export_sha256 {
@@ -73,6 +79,24 @@ fn main() -> Result<(), String> {
     library_mdl::check_checkpoint(checkpoint, &library_mdl::identity(&settings.export_sha256, &native, &explanation, &train, held))?;
     let start = library_mdl::checkpoint_posterior(&explanation, checkpoint)?;
     std::fs::create_dir_all(out).map_err(error)?;
+    if let Some(sets) = sets {
+        // Each listed group set removed alone, without and with compensation.
+        let sets: Vec<Vec<usize>> = sets.split(';').map(|set| set.split(',').map(|g| g.trim().parse::<usize>().map_err(error)).collect()).collect::<Result<_, _>>()?;
+        let step = Step { sequences: &train, held, settings: &settings.fit, log: None };
+        let changes = library_mdl::removal_changes(&device, &native, &explanation, &start, step, &sets)?;
+        let bits = |(data, description): (f64, f64)| json!({"data_bits": data / std::f64::consts::LN_2, "description_bits": description / std::f64::consts::LN_2, "f_bits": (data + description) / std::f64::consts::LN_2});
+        let rows: Vec<_> = sets
+            .iter()
+            .zip(&changes)
+            .map(|(set, [plain, compensated])| {
+                json!({"groups": set, "names": set.iter().map(|g| explanation.groups[*g].name.clone()).collect::<Vec<_>>(), "plain": bits(*plain), "compensated": bits(*compensated)})
+            })
+            .collect();
+        let report = json!({"checkpoint": checkpoint.display().to_string(), "device": device.name(), "changes": rows});
+        std::fs::write(out.join("CHANGES.json"), serde_json::to_vec_pretty(&report).map_err(error)?).map_err(error)?;
+        println!("{}", serde_json::to_string_pretty(&report).map_err(error)?);
+        return Ok(());
+    }
     let mut runs = serde_json::Map::new();
     let name = "ranked";
     {

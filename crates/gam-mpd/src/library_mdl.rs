@@ -3282,6 +3282,37 @@ pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Exp
     Ok((removal, before, after))
 }
 
+/// Per group set of `sets`, removed from `posterior` alone, the changes of the data term and of
+/// the description in nats on the removal step's training collection at its weight samples,
+/// without compensation and with it (`library_compensation`): what a unit's prediction estimates.
+pub fn removal_changes(device: &Device, native: &OperatorProgram, explanation: &Explanation, posterior: &Posterior, step: Step, sets: &[Vec<usize>]) -> Result<Vec<[(f64, f64); 2]>, String> {
+    let Step { sequences, settings, .. } = step;
+    settings.validate()?;
+    let length = sequences.first().map_or(0, Vec::len);
+    let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?;
+    let mut tokens = 0;
+    for draw in &draws {
+        tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
+    }
+    let mut device_posterior = DevicePosterior::new(device, explanation, posterior, tokens as f64, None, 0)?;
+    let compensation = Compensation::new(&mut scorer.experiments, explanation, posterior, sequences, settings.batch_sequences)?;
+    let base = expected_divergence(&mut scorer, &mut device_posterior, posterior, &draws, sequences, &[], settings, None, None)?.total();
+    let mut changes = Vec::with_capacity(sets.len());
+    for set in sets {
+        let mut plain = posterior.clone();
+        plain.remove(set);
+        let compensated = compensation.proposal(posterior, set)?;
+        let mut pair = [(0.0, 0.0); 2];
+        for (change, trial) in pair.iter_mut().zip([&plain, &compensated]) {
+            let data = expected_divergence(&mut scorer, &mut device_posterior, trial, &draws, sequences, &[], settings, None, None)?.total();
+            *change = (data - base, trial.description() - posterior.description());
+        }
+        changes.push(pair);
+    }
+    Ok(changes)
+}
+
 // ----------------------------------------------------------------------------- the reported artifact
 
 /// The explanation at the posterior mean: each library operator holds `μ`, and the blocks only
