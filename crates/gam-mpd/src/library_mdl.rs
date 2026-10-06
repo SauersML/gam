@@ -2771,9 +2771,10 @@ pub fn fit_from(
             None => device_posterior.restore_means(&held)?,
         }
     }
+    let mut output_products: BTreeMap<usize, Tensor> = BTreeMap::new();
     if fresh {
         let timed = Instant::now();
-        let curvature = laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens)?;
+        let curvature = laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens, settings.preconditioned.then_some(&mut output_products))?;
         // The unit-information start's state goes before the Laplace start's is made.
         drop(device_posterior);
         device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, Some(State::Curvature(&curvature)), 0)?;
@@ -2783,8 +2784,17 @@ pub fn fit_from(
     if settings.preconditioned {
         let timed = Instant::now();
         let factors = input_factors(&mut scorer, explanation, &posterior, sequences, settings)?;
-        device_posterior.set_directions(&factors)?;
-        log::info!("library input factors: {} operators, {:.1} s", factors.iter().flatten().count(), timed.elapsed().as_secs_f64());
+        // The output factors from the Laplace start's products (none for a resumed fit).
+        let mut outputs: Vec<Option<Arc<InputFactor>>> = vec![None; factors.len()];
+        let device = scorer.experiments.models().1.program.device().clone();
+        for (op, product) in &output_products {
+            let product = device.download(product).map_err(error)?;
+            let eigen = gam_linalg::decompose::eigh(product.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(error)?;
+            outputs[scorer.at(*op)?] = Some(Arc::new(InputFactor { vectors: eigen.vectors, values: eigen.values.iter().map(|v| v.max(0.0)).collect() }));
+        }
+        drop(output_products);
+        device_posterior.set_directions(&factors, &outputs)?;
+        log::info!("library input factors: {} operators, output factors: {}, {:.1} s", factors.iter().flatten().count(), outputs.iter().flatten().count(), timed.elapsed().as_secs_f64());
     }
     // The curvature estimate averages over one epoch's batches: each batch weighs about once.
     let ivon = Ivon { beta1: settings.beta1, beta2: 1.0 - 1.0 / draws.len() as f64 };
@@ -3061,6 +3071,9 @@ pub fn fit_from(
 /// minimum in `σ` of the data term's Gauss–Newton model `½ N h σ²` plus `KL(q ‖ p)`, instead of the
 /// epochs IVON's curvature average needs to fall from the start's `1 / v_G` to `h`. Returns IVON's
 /// curvature `h` per operator (its momentum and second moment start at zero, `State::Curvature`).
+/// With `outputs`, the same pass also sums each operator's output-side products `Σ_b u_b u_bᵀ`
+/// (rows × rows, in the fitting storage): under the Kronecker model `E[u uᵀ] ∝ G`, the output
+/// factor of the step's preconditioner (`DevicePosterior::set_directions`).
 fn laplace_start(
     scorer: &mut Scorer,
     posterior: &mut Posterior,
@@ -3069,6 +3082,7 @@ fn laplace_start(
     sequences: &[Vec<u32>],
     settings: &Settings,
     tokens: usize,
+    mut outputs: Option<&mut BTreeMap<usize, Tensor>>,
 ) -> Result<Vec<Array2<f64>>, String> {
     let device = scorer.experiments.models().1.program.device().clone();
     // `Σ_b u_b ⊙ u_b` summed on the device, in float64 where it holds float64, and read once.
@@ -3086,6 +3100,14 @@ fn laplace_start(
         device_posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
         let factor = scorer.experiments.sampled_label_resident(&batch, &experiments, &uniforms(key, &batch, &experiments))?;
         for (op, u) in &factor {
+            if let Some(outputs) = outputs.as_deref_mut() {
+                let product = match outputs.entry(*op) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => entry.insert(device.zeros(u.rows(), u.rows()).map_err(error)?),
+                };
+                let u = device.convert(u).map_err(error)?;
+                device.gemm(product, 1.0, &u, Op::N, &u, Op::T, 1.0, scorer.experiments.models().1.program.arithmetic()).map_err(error)?;
+            }
             let u = wide.convert(u).map_err(error)?;
             match sums.get_mut(op) {
                 Some(sum) => wide.hadamard(sum, &u, &u, true).map_err(error)?,
@@ -3342,7 +3364,7 @@ pub fn start_posterior(device: &Device, native: &OperatorProgram, explanation: &
     }
     let mut posterior = Posterior::new(explanation, tokens)?;
     let device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, None, 0)?;
-    laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens)?;
+    laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens, None)?;
     Ok(posterior)
 }
 

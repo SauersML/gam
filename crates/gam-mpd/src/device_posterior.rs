@@ -177,14 +177,25 @@ pub struct DevicePosterior {
 /// step's length along the resulting direction is measured on the exact `F`
 /// ([`DevicePosterior::finish_line`]), so the preconditioner need only be positive definite.
 struct Direction {
-    matrix: Tensor,
+    /// `U_A` (columns × columns) and, where the output factor is known, `U_G` (rows × rows).
+    input: Tensor,
+    output: Option<Tensor>,
     moments: [Tensor; 3],
     groups: GroupMap,
     variance: Tensor,
     sums: Tensor,
     /// 1 at the operator's live entries and 0 at removed ones (`s = −∞`): the direction mixes the
-    /// input axis, and a removed entry must stay at zero.
+    /// operator's axes, and a removed entry must stay at zero.
     live: Tensor,
+    /// The step's buffers (rows × columns), allocated once: the turned gradient, draw and iterate,
+    /// the iterate before the pass, the deviations the pass writes, and two products' scratch.
+    gradient: Tensor,
+    draw: Tensor,
+    iterate: Tensor,
+    start: Tensor,
+    deviations: Tensor,
+    scratch: Tensor,
+    moved: Tensor,
 }
 
 /// Whether two host arrays hold the same values bit for bit (`-0.0` differs from `0.0`).
@@ -364,44 +375,46 @@ impl DevicePosterior {
         if self.fitting.storage() == Storage::F64 { Arithmetic::F64 } else { Arithmetic::F32 }
     }
 
-    /// Sets the step's preconditioner along each operator's input axis from `factors` (per
-    /// operator the eigenvectors `U` of its input's second moment `A`, its columns' axis, and their
-    /// eigenvalues `λ` per token, or none): see `Direction`. The curvature along `U` starts at
-    /// the Kronecker model's diagonal there, `h̃_rk = g_r λ_k`, with each row's output factor
-    /// `g_r = Σ_j h_rj / Σ_k λ_k` from the diagonal curvature `h_rj ≈ g_r A_jj` (`Σ_j A_jj = Σ_k λ_k`):
-    /// the diagonal's own value along `U`, `h (U ∘ U)`, keeps its underpricing of the
-    /// directions entries share (the mean activation's eigenvalue is about `n mean(a)²` against the
-    /// diagonal's `mean(a²)`), which an average of a few draws per step would correct only over
-    /// an epoch. The momentum and the gradient's second moment start at zero. A resumed fit sets
-    /// them afresh.
-    pub fn set_directions(&mut self, factors: &[Option<std::sync::Arc<crate::library_mdl::InputFactor>>]) -> Result<(), String> {
-        if factors.len() != self.mean.len() {
-            return Err(error("one input factor per trainable operator required"));
+    /// Sets the step's preconditioner from `inputs` (per operator the eigenvectors `U_A` of its
+    /// input's second moment `A`, its columns' axis, and their eigenvalues `λ_A` per token) and
+    /// `outputs` (per operator the eigenvectors `U_G` and eigenvalues `λ_G` of its output-side
+    /// Gauss–Newton factor `G`, its rows' axis, where known): see [`Direction`]. The curvature in
+    /// the product basis starts at the Kronecker model's diagonal there, `h̃_rk = c λ_G,r λ_A,k`
+    /// (`λ_G = 1` and `U_G = I` without an output factor), with `c` matching the diagonal
+    /// curvature's total, `Σ h̃ = Σ h` (the diagonal `h_rj ≈ G_rr A_jj` sums to `tr G tr A`). The
+    /// momentum and the gradient's second moment start at zero. A resumed fit sets them afresh.
+    pub fn set_directions(&mut self, inputs: &[Option<std::sync::Arc<crate::library_mdl::InputFactor>>], outputs: &[Option<std::sync::Arc<crate::library_mdl::InputFactor>>]) -> Result<(), String> {
+        if inputs.len() != self.mean.len() || outputs.len() != self.mean.len() {
+            return Err(error("one input and one output factor per trainable operator required"));
         }
-        self.directions = Vec::with_capacity(factors.len());
-        for (i, factor) in factors.iter().enumerate() {
+        self.directions = Vec::with_capacity(inputs.len());
+        for (i, (input, output)) in inputs.iter().zip(outputs).enumerate() {
             let (rows, cols) = (self.mean[i].rows(), self.mean[i].cols());
-            let Some(factor) = factor.as_ref().filter(|f| f.vectors.dim() == (cols, cols) && f.values.len() == cols) else {
+            let Some(input) = input.as_ref().filter(|f| f.vectors.dim() == (cols, cols) && f.values.len() == cols && f.values.iter().sum::<f64>() > 0.0) else {
                 self.directions.push(None);
                 continue;
             };
-            let matrix = self.fitting.upload(factor.vectors.view()).map_err(error)?;
-            let trace: f64 = factor.values.iter().sum();
-            if !(trace > 0.0) {
-                self.directions.push(None);
-                continue;
-            }
-            let diagonal = self.fitting.download(&self.moments[i][1]).map_err(error)?;
-            let output: Vec<f64> = diagonal.rows().into_iter().map(|row| row.sum() / trace).collect();
-            let curvature = self.fitting.upload(Array2::from_shape_fn((rows, cols), |(r, k)| output[r] * factor.values[k]).view()).map_err(error)?;
-            let moments = [self.fitting.zeros(rows, cols).map_err(error)?, curvature, self.fitting.zeros(rows, cols).map_err(error)?];
+            let output = output.as_ref().filter(|f| f.vectors.dim() == (rows, rows) && f.values.len() == rows && f.values.iter().sum::<f64>() > 0.0);
+            let output_values: Vec<f64> = output.map_or_else(|| vec![1.0; rows], |f| f.values.clone());
+            let total: f64 = self.fitting.download(&self.moments[i][1]).map_err(error)?.sum();
+            let scale = total / (output_values.iter().sum::<f64>() * input.values.iter().sum::<f64>());
+            let curvature = self.fitting.upload(Array2::from_shape_fn((rows, cols), |(r, k)| scale * output_values[r] * input.values[k]).view()).map_err(error)?;
+            let zeros = || self.fitting.zeros(rows, cols).map_err(error);
             self.directions.push(Some(Direction {
-                matrix,
-                moments,
+                input: self.fitting.upload(input.vectors.view()).map_err(error)?,
+                output: output.map(|f| self.fitting.upload(f.vectors.view()).map_err(error)).transpose()?,
+                moments: [zeros()?, curvature, zeros()?],
                 groups: self.fitting.group_map(&vec![0; rows * cols], (rows, cols)).map_err(error)?,
                 variance: self.wide.zeros(1, 1).map_err(error)?,
                 sums: self.wide.zeros(1, 3).map_err(error)?,
-                live: self.fitting.zeros(rows, cols).map_err(error)?,
+                live: zeros()?,
+                gradient: zeros()?,
+                draw: zeros()?,
+                iterate: zeros()?,
+                start: zeros()?,
+                deviations: zeros()?,
+                scratch: zeros()?,
+                moved: zeros()?,
             }));
         }
         self.refresh_live()
@@ -417,11 +430,12 @@ impl DevicePosterior {
         Ok(())
     }
 
-    /// Operator `i`'s step direction preconditioned along its input axis, written as the iterate
-    /// `before − d` the line step reads its direction from: the step's kernel run a second time
-    /// along `U` on the turned gradient, Gauss–Newton draw and iterate (`g U`, `u U`, `μ U`) with
+    /// Operator `i`'s step direction preconditioned in the product basis of its factors, written
+    /// as the iterate `before − d` the line step reads its direction from: the step's kernel run a
+    /// second time on the turned gradient, Gauss–Newton draw and iterate (`U_Gᵀ x U_A`) with
     /// IVON's state there and the operator's mean prior precision `δ̄`, its move `d̃` turned back
-    /// (`d = d̃ Uᵀ`) and zero at removed entries ([`Direction`]).
+    /// (`d = U_G d̃ U_Aᵀ`) and zero at removed entries ([`Direction`]). The buffers are the
+    /// direction's own: a step allocates nothing here.
     fn precondition(&mut self, i: usize, before: &Tensor, (gradient, draw): (&Tensor, &Tensor), step: &PosteriorStep, variances: &[f64]) -> Result<(), String> {
         let arithmetic = self.arithmetic();
         let Some(direction) = self.directions.get_mut(i).and_then(Option::as_mut) else { return Ok(()) };
@@ -431,30 +445,36 @@ impl DevicePosterior {
         }
         let mean_precision = precision.iter().sum::<f64>() / precision.len() as f64;
         direction.variance = self.wide.upload(Array2::from_elem((1, 1), 1.0 / (self.tokens * mean_precision)).view()).map_err(error)?;
-        let (rows, cols) = (before.rows(), before.cols());
-        let turn = |x: &Tensor| -> Result<Tensor, String> {
-            let mut out = self.fitting.zeros(rows, cols).map_err(error)?;
-            self.fitting.gemm(&mut out, 1.0, x, Op::N, &direction.matrix, Op::N, 0.0, arithmetic).map_err(error)?;
-            Ok(out)
+        let d = &self.fitting;
+        let Direction { input, output, moments, groups, variance, sums, live, gradient: along_gradient, draw: along_draw, iterate, start, deviations, scratch, moved } = direction;
+        // `out ← U_Gᵀ x U_A` (or `x U_A`).
+        let turn = |out: &mut Tensor, x: &Tensor, scratch: &mut Tensor| -> Result<(), String> {
+            match output.as_ref() {
+                Some(g) => {
+                    d.gemm(scratch, 1.0, x, Op::N, input, Op::N, 0.0, arithmetic).map_err(error)?;
+                    d.gemm(out, 1.0, g, Op::T, scratch, Op::N, 0.0, arithmetic).map_err(error)
+                }
+                None => d.gemm(out, 1.0, x, Op::N, input, Op::N, 0.0, arithmetic).map_err(error),
+            }
         };
-        let (along_gradient, along_draw, mut along_mean) = (turn(gradient)?, turn(draw)?, turn(before)?);
-        let start = self.fitting.copy(&along_mean).map_err(error)?;
-        let mut deviations = self.fitting.zeros(rows, cols).map_err(error)?;
-        direction.sums = self.wide.zeros(1, 3).map_err(error)?;
-        let [momentum, curvature, power] = &mut direction.moments;
-        self.fitting
-            .posterior_ivon((&mut along_mean, &mut deviations), [momentum, curvature, power], (&along_gradient, &along_draw), (&direction.groups, &direction.variance), &mut direction.sums, step)
-            .map_err(error)?;
-        let mut moved = start;
-        self.fitting.axpy(&mut moved, -1.0, &along_mean).map_err(error)?;
-        let mut d = self.fitting.zeros(rows, cols).map_err(error)?;
-        self.fitting.gemm(&mut d, 1.0, &moved, Op::N, &direction.matrix, Op::T, 0.0, arithmetic).map_err(error)?;
-        let mut masked = self.fitting.zeros(rows, cols).map_err(error)?;
-        self.fitting.hadamard(&mut masked, &d, &direction.live, false).map_err(error)?;
-        let mut iterate = self.fitting.copy(before).map_err(error)?;
-        self.fitting.axpy(&mut iterate, -1.0, &masked).map_err(error)?;
-        self.mean[i] = iterate;
-        Ok(())
+        turn(along_gradient, gradient, scratch)?;
+        turn(along_draw, draw, scratch)?;
+        turn(iterate, before, scratch)?;
+        d.set_rows(start, 0, iterate).map_err(error)?;
+        let [momentum, curvature, power] = moments;
+        d.posterior_ivon((&mut *iterate, &mut *deviations), [momentum, curvature, power], (&*along_gradient, &*along_draw), (&*groups, &*variance), &mut *sums, step).map_err(error)?;
+        // `d̃ = start − iterate`, then `d = U_G d̃ U_Aᵀ` (or `d̃ U_Aᵀ`), masked.
+        d.axpy(start, -1.0, iterate).map_err(error)?;
+        match output.as_ref() {
+            Some(g) => {
+                d.gemm(scratch, 1.0, start, Op::N, input, Op::T, 0.0, arithmetic).map_err(error)?;
+                d.gemm(moved, 1.0, g, Op::N, scratch, Op::N, 0.0, arithmetic).map_err(error)?;
+            }
+            None => d.gemm(moved, 1.0, start, Op::N, input, Op::T, 0.0, arithmetic).map_err(error)?,
+        }
+        d.hadamard(scratch, moved, live, false).map_err(error)?;
+        d.set_rows(&mut self.mean[i], 0, before).map_err(error)?;
+        d.axpy(&mut self.mean[i], -1.0, scratch).map_err(error)
     }
 
     /// Operator `i`'s posterior means `μ̄` on the host.
@@ -962,7 +982,7 @@ mod tests {
                 // Eigenvalues whose Kronecker start equals the diagonal's: every entry of the
                 // starting curvature is the same, so `g_r λ_k = h_rk` along any `U`.
                 let values = vec![1.0; C];
-                posterior.set_directions(&[Some(std::sync::Arc::new(crate::library_mdl::InputFactor { vectors: u, values }))]).unwrap();
+                posterior.set_directions(&[Some(std::sync::Arc::new(crate::library_mdl::InputFactor { vectors: u, values }))], &[None]).unwrap();
             }
             let mut iterates = Vec::new();
             for t in 0..3u64 {
