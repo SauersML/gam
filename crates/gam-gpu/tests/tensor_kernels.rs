@@ -690,7 +690,7 @@ fn the_split_gram_is_timed_by_its_slices() {
     }
 }
 
-/// `nonzero_columns`, `gather_columns` and `scatter_columns` on the host and the accelerator: the
+/// `nonzero_columns`, `gather_columns`, `scatter_columns` and `scatter_rows` on the host and the accelerator: the
 /// columns nonzero on the rows asked for (a NaN counts, a column nonzero only on a row left out does
 /// not), the gathered columns in order, and the columns written or added back (integers, so every
 /// sum is exact in float32 too).
@@ -730,6 +730,17 @@ fn column_reads_and_writes_agree_with_the_host() {
                 }
             }
             assert_eq!(down(&device, &t), expected, "{}: scatter (accumulate {accumulate})", device.name());
+            let row_ids: Vec<u32> = vec![8, 2, 5];
+            let row_values = Array2::from_shape_fn((row_ids.len(), cols), |(i, c)| (i * 5 + c) as f64 - 6.0);
+            let mut t = up(&device, &target);
+            device.scatter_rows(&mut t, &device.upload_indices(&row_ids).expect("ids"), &up(&device, &row_values), accumulate).expect("scatter rows");
+            let mut expected = target.clone();
+            for (i, &r) in row_ids.iter().enumerate() {
+                for c in 0..cols {
+                    expected[[r as usize, c]] = if accumulate { target[[r as usize, c]] + row_values[[i, c]] } else { row_values[[i, c]] };
+                }
+            }
+            assert_eq!(down(&device, &t), expected, "{}: scatter rows (accumulate {accumulate})", device.name());
         }
     }
 }

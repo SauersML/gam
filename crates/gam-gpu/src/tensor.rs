@@ -1457,6 +1457,34 @@ impl Device {
         }
     }
 
+    /// `t[ids[i], c] = values[i, c]` (added to it when `accumulate`): [`Device::gather_rows`]'s
+    /// inverse; `ids` distinct.
+    pub fn scatter_rows(&self, t: &mut Tensor, ids: &Indices, values: &Tensor, accumulate: bool) -> Result<(), GpuError> {
+        if values.dim() != (ids.len, t.cols) {
+            return Err(shape(format!("{:?} values for {} rows of {:?}", values.dim(), ids.len, t.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (cols, rows, ids, v) = (t.cols, t.rows, host_indices(ids)?.to_vec(), host(values)?.to_vec());
+                if let Some(id) = ids.iter().find(|id| **id as usize >= rows) {
+                    return Err(shape(format!("row {id} of a {rows}-row tensor")));
+                }
+                let target = host_mut(t)?;
+                for (i, &r) in ids.iter().enumerate() {
+                    for c in 0..cols {
+                        let at = r as usize * cols + c;
+                        target[at] = if accumulate { target[at] + v[i * cols + c] } else { v[i * cols + c] };
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.scatter_rows(t, ids, values, accumulate),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.scatter_rows(t, ids, values, accumulate),
+        }
+    }
+
     /// `rows` copies of the `1 × cols` tensor `row`.
     pub fn broadcast_rows(&self, row: &Tensor, rows: usize) -> Result<Tensor, GpuError> {
         let mut out = self.zeros(rows, row.cols)?;
@@ -3502,6 +3530,14 @@ extern "C" __global__ void gather_columns(u64 n, unsigned int m, unsigned int co
 extern "C" __global__ void scatter_columns(u64 n, unsigned int m, unsigned int cols, double* t, const unsigned int* ids, const double* values, int accumulate) {
     GRID_STRIDE(i, n) {
         u64 at = (i / m) * cols + ids[i % m];
+        t[at] = accumulate ? t[at] + values[i] : values[i];
+    }
+}
+
+// `t[ids[i], c] = values[i, c]` (added when `accumulate`), ids distinct.
+extern "C" __global__ void scatter_rows(u64 n, unsigned int cols, double* t, const unsigned int* ids, const double* values, int accumulate) {
+    GRID_STRIDE(i, n) {
+        u64 at = (u64)ids[i / cols] * cols + i % cols;
         t[at] = accumulate ? t[at] + values[i] : values[i];
     }
 }
@@ -5795,6 +5831,20 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 .map(|_| ())
         }
 
+        pub(super) fn scatter_rows(&self, t: &mut Tensor, ids: &Indices, values: &Tensor, accumulate: bool) -> Result<(), GpuError> {
+            let storage = t.storage();
+            if values.storage() != storage || storage == Storage::Bf16 {
+                return Err(shape("scatter_rows: values stored unlike the target, or in bfloat16".to_string()));
+            }
+            let n = values.len() as u64;
+            let (cols, acc) = (t.cols as u32, i32::from(accumulate));
+            let f = self.kernel("scatter_rows", storage)?;
+            // SAFETY: ids are distinct rows of `t`; `values` is ids × cols.
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&cols).output(t, storage)?.arg(index_slice(ids)?).input(values, storage)?.arg(&acc).launch(cfg_elements(n)) }
+                .gpu_ctx("tensor scatter_rows")
+                .map(|_| ())
+        }
+
         pub(super) fn laws(&self, x: &Tensor, g: Option<&Tensor>, codes: &Indices, c: f64) -> Result<Tensor, GpuError> {
             let storage = x.storage();
             let mut out = self.output(storage, x.rows, x.cols)?;
@@ -6832,6 +6882,15 @@ kernel void t_gather_columns(device const float* t [[buffer(0)]], device const u
     ELEMENTS out[i] = t[(i / p.extra) * p.cols + ids[i % p.extra]];
 }
 
+// t[ids[i], c] = values[i, c] (added when p.a), ids distinct; p.cols = t's columns.
+kernel void t_scatter_rows(device float* t [[buffer(0)]], device const uint* ids [[buffer(1)]], device const float* values [[buffer(2)]],
+                           constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        uint at = ids[i / p.cols] * p.cols + i % p.cols;
+        t[at] = p.a ? t[at] + values[i] : values[i];
+    }
+}
+
 // t[r, ids[j]] = values[r, j] (added when p.a), ids distinct.
 kernel void t_scatter_columns(device float* t [[buffer(0)]], device const uint* ids [[buffer(1)]], device const float* values [[buffer(2)]],
                               constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
@@ -7514,6 +7573,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
         "t_nonzero_columns",
         "t_gather_columns",
         "t_scatter_columns",
+        "t_scatter_rows",
         "t_laws",
         "t_rms",
         "t_rotate",
@@ -7763,6 +7823,16 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
             u32_of(t.len())?;
             let p = P { cols: u32_of(t.cols)?, extra: u32_of(ids.len.max(1))?, a: u32::from(accumulate), ..P::default() };
             self.elements("t_scatter_columns", &[whole(buffer(t)?), whole(index_buffer(ids)?), whole(buffer(values)?)], values.len(), p)
+        }
+
+        pub(super) fn scatter_rows(&self, t: &mut Tensor, ids: &Indices, values: &Tensor, accumulate: bool) -> Result<(), GpuError> {
+            let IndexData::Metal(_, ids_host) = &ids.data else { return Err(foreign()) };
+            if let Some(id) = ids_host.iter().find(|id| **id as usize >= t.rows) {
+                return Err(shape(format!("row {id} of a {}-row tensor", t.rows)));
+            }
+            u32_of(t.len())?;
+            let p = P { cols: u32_of(t.cols)?, a: u32::from(accumulate), ..P::default() };
+            self.elements("t_scatter_rows", &[whole(buffer(t)?), whole(index_buffer(ids)?), whole(buffer(values)?)], values.len(), p)
         }
 
         pub(super) fn laws(&self, x: &Tensor, g: Option<&Tensor>, codes: &Indices, c: f64) -> Result<Tensor, GpuError> {

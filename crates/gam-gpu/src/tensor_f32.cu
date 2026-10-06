@@ -204,6 +204,14 @@ extern "C" __global__ void scatter_columns(u64 n, unsigned int m, unsigned int c
     }
 }
 
+// `t[ids[i], c] = values[i, c]` (added when `accumulate`), ids distinct.
+extern "C" __global__ void scatter_rows(u64 n, unsigned int cols, float* t, const unsigned int* ids, const float* values, int accumulate) {
+    GRID_STRIDE(i, n) {
+        u64 at = (u64)ids[i / cols] * cols + i % cols;
+        t[at] = accumulate ? t[at] + values[i] : values[i];
+    }
+}
+
 extern "C" __global__ void fill(u64 n, double value, float* x) {
     float v = (float)value;
     GRID_STRIDE(i, n) x[i] = v;
