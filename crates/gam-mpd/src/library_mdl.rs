@@ -3523,6 +3523,7 @@ mod tests {
                 program: "program".into(),
                 groups: "groups".into(),
                 sharing: "sharing".into(),
+                definition: "definition".into(),
             },
             settings: settings(),
             tokens: 23,
