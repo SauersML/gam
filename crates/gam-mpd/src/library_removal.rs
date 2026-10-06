@@ -74,7 +74,7 @@
 //! estimated not to lower `F` is not split on rejection: its units are counted as tested only
 //! jointly (`Removal::untested`). Each proposal also removes the groups it leaves without effect.
 //! With `m` units that block their ranges, about `2 m log2(n/m)` proposals settle `n` units; a
-//! rejection is usually settled after a few batches (below), so the cost is mostly the accepted
+//! rejection stops once it is certain (below), so the cost is mostly the accepted
 //! ranges' full evaluations. The estimates only order the units and mark where splitting stops: a
 //! set's second-order estimate grows with its size where the data term saturates (on vpd4l at the
 //! Laplace start, N = 2^16, sets of 1,000 or more units were estimated at +0.5M to +13M bits and
@@ -91,14 +91,18 @@
 //! the realized `F`; it does not show that none exists.
 //!
 //! A proposal is scored batch by batch against the accepted posterior on the same samples: with
-//! `d_b` the paired difference of batch `b`'s data term and `r` the fall of the rest of `F` (the
-//! description), the proposal lowers `F` when `Σ_b d_b ≤ r`. After `k` of `n` batches, if even the
-//! smallest difference seen so far on each of the `n − k` remaining batches would leave
-//! `Σ_{b≤k} d_b + (n − k) min_{b≤k} d_b > r`, the evaluation stops and the proposal is rejected
-//! ([`settled`]); the range needs two differences, so at least two batches are scored. This
-//! extrapolates the observed range and does not bound the remaining batches: an early rejection can
-//! be wrong, and its change in the log is the observed mean difference extrapolated to the `n`
-//! batches. Acceptance always scores every batch.
+//! `d_b` the paired difference of batch `b`'s data term, `a_b` the accepted posterior's, and `r`
+//! the fall of the rest of `F` (the description), the proposal lowers `F` when `Σ_b d_b ≤ r`. A
+//! batch's data term is a divergence, never below zero, so `d_b ≥ −a_b` on every batch not yet
+//! scored, and after scoring the batches `S` the evaluation stops once
+//! `Σ_{b∈S} d_b − Σ_{b∉S} a_b > r` ([`settled`]): the proposal raises `F` whatever the rest hold.
+//! The rejection is certain, with no assumption on the unscored batches. The batches are scored in
+//! decreasing `a_b` ([`order`]), known before scoring, so the slack `Σ_{b∉S} a_b` falls fastest; a
+//! stopped evaluation's logged change is that least change. Acceptance always scores every batch.
+//! A prior term's per-batch value has no floor, so an objective with one scores every batch. The
+//! rule this replaces stopped after two batches once their sum plus the smaller of them on every
+//! remaining batch exceeded `r`; on vpd4l at N = 2^24 two of the six rejections it made against the
+//! Laplace start would have lowered `F` (by 260k and 129k bits) when scored on all 4096 batches.
 //!
 //! Every proposal and its outcome are written as one JSON line to the round's log, with every
 //! active group's posterior summaries and every unit's prediction at the start of the round.
@@ -830,9 +834,9 @@ impl Journal {
     }
 }
 
-/// An evaluation of `F` in nats on the fixed collection: per training batch its data term, and the
-/// rest of `F`; `complete` when every batch was scored, otherwise the batches scored before the
-/// evaluation was settled (module note, [`settled`]).
+/// An evaluation of `F` in nats on the fixed collection: per training batch its data term (NaN for
+/// a batch not scored), and the rest of `F`; `complete` when every batch was scored, otherwise the
+/// evaluation stopped once its rejection was certain (module note, [`settled`]).
 #[derive(Clone, Debug)]
 pub struct Evaluation {
     pub batches: Vec<f64>,
@@ -847,30 +851,43 @@ impl Evaluation {
         self.batches.iter().sum::<f64>() + self.rest
     }
 
+    /// The batches scored.
+    #[must_use]
+    pub fn scored(&self) -> usize {
+        self.batches.iter().filter(|b| !b.is_nan()).count()
+    }
+
     /// The change of `F` from the complete evaluation `from` on the same batches: exact when this
-    /// one is complete, otherwise the paired differences' mean over the scored batches times the
-    /// number of batches, plus the change of the rest.
+    /// one is complete, otherwise the least change its scored batches allow, every unscored batch's
+    /// data term at its floor zero: `Σ_scored (t_b − a_b) − Σ_unscored a_b` plus the change of the
+    /// rest.
     #[must_use]
     pub fn change(&self, from: &Self) -> f64 {
         if self.complete {
             return self.total() - from.total();
         }
-        let paired: f64 = self.batches.iter().zip(&from.batches).map(|(t, a)| t - a).sum();
-        paired * from.batches.len() as f64 / self.batches.len().max(1) as f64 + self.rest - from.rest
+        let data: f64 = self.batches.iter().zip(&from.batches).map(|(t, a)| if t.is_nan() { -a } else { t - a }).sum();
+        data + self.rest - from.rest
     }
 }
 
-/// Whether the paired per-batch `differences` scored so far of `n` batches settle a rejection
-/// against `budget`, the fall of the rest of `F` (module note): at least two differences, and their
-/// sum plus the smallest of them on each remaining batch above `budget`.
+/// The order in which to score batches against an accepted evaluation's per-batch data terms
+/// `accepted`: decreasing, so the slack of the floor ([`settled`]) falls fastest.
 #[must_use]
-pub fn settled(differences: &[f64], n: usize, budget: f64) -> bool {
-    let k = differences.len();
-    if k < 2 || k >= n {
-        return false;
-    }
-    let low = differences.iter().copied().fold(f64::INFINITY, f64::min);
-    differences.iter().sum::<f64>() + (n - k) as f64 * low > budget
+pub fn order(accepted: &[f64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..accepted.len()).collect();
+    order.sort_by(|a, b| accepted[*b].total_cmp(&accepted[*a]));
+    order
+}
+
+/// Whether a trial must raise `F`: its scored batches' data terms exceed the accepted posterior's
+/// on them by `scored` in total, `slack` is the accepted posterior's data term on the batches not
+/// yet scored, and `budget` the fall of the rest of `F`. A batch's data term is a divergence, never
+/// below zero, so the trial's data term changes by at least `scored − slack`; above `budget`, `F`
+/// rises whatever the unscored batches hold.
+#[must_use]
+pub fn settled(scored: f64, slack: f64, budget: f64) -> bool {
+    scored - slack > budget
 }
 
 /// One removal round on `posterior` (module note) with `objective` the exact `F` in nats of a
@@ -923,7 +940,7 @@ pub fn round(
         let accepted = evaluation.complete && change <= 0.0;
         journal.write(json!({
             "event": "proposal", "kind": "dead", "groups": dead, "layers": names(&dead),
-            "predicted_bits": predicted / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
+            "predicted_bits": predicted / LN_2, "measured_bits": change / LN_2, "batches": evaluation.scored(), "complete": evaluation.complete,
             "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(),
         }))?;
         evaluations.push((dead.len(), change / LN_2));
@@ -1039,7 +1056,7 @@ pub fn round(
         let kind = if high - low == units.len() { "whole" } else if high - low == 1 { "single" } else { "split" };
         journal.write(json!({
             "event": "proposal", "kind": kind, "units": high - low, "first_unit": low, "groups": groups, "layers": names(&groups),
-            "predicted_bits": predicted / LN_2, "predicted_share_bits": shared / LN_2, "move_quadratic_bits": quadratic / LN_2, "joint_plain_bits": joint / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
+            "predicted_bits": predicted / LN_2, "predicted_share_bits": shared / LN_2, "move_quadratic_bits": quadratic / LN_2, "joint_plain_bits": joint / LN_2, "measured_bits": change / LN_2, "batches": evaluation.scored(), "complete": evaluation.complete,
             "description_bits": description / LN_2, "description_deleted_bits": deleted / LN_2, "compensation_slope_bits": moved / LN_2,
             "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(), "trial_seconds": trial_seconds,
         }))?;
@@ -1378,18 +1395,22 @@ mod tests {
         // Scored batch by batch against an accepted evaluation, stopping as the fit's does.
         let objective = |ic: &mut Interchange, posterior: &Posterior, against: Option<&Evaluation>| -> Result<Evaluation, String> {
             let rest = posterior.description();
-            let mut batches = Vec::new();
-            for (b, e) in evidence.iter().enumerate() {
+            let mut batches = vec![f64::NAN; evidence.len()];
+            let sequence: Vec<usize> = against.map_or_else(|| (0..evidence.len()).collect(), |a| order(&a.batches));
+            let (mut scored, mut slack) = (0.0, against.map_or(0.0, |a| a.batches.iter().sum::<f64>()));
+            for (k, b) in sequence.into_iter().enumerate() {
+                let e = &evidence[b];
                 ic.load(&sample(posterior, b as u64))?;
-                batches.push(weight * ic.evaluate_resident(&e.batch, &e.experiments, &e.targets, false)?.bits.iter().flatten().sum::<f64>() * LN_2);
+                batches[b] = weight * ic.evaluate_resident(&e.batch, &e.experiments, &e.targets, false)?.bits.iter().flatten().sum::<f64>() * LN_2;
                 if let Some(a) = against {
-                    let differences: Vec<f64> = batches.iter().zip(&a.batches).map(|(t, x)| t - x).collect();
-                    if settled(&differences, evidence.len(), a.rest - rest) {
+                    scored += batches[b] - a.batches[b];
+                    slack -= a.batches[b];
+                    if k + 1 < evidence.len() && settled(scored, slack, a.rest - rest) {
                         break;
                     }
                 }
             }
-            let complete = batches.len() == evidence.len();
+            let complete = batches.iter().all(|b| !b.is_nan());
             Ok(Evaluation { batches, rest, complete })
         };
         let mut posterior = Posterior::new(&explanation, tokens as usize).expect("the posterior");
@@ -1442,19 +1463,18 @@ mod tests {
     }
 
     #[test]
-    fn an_evaluation_stops_once_the_observed_range_cannot_lower_f() {
-        // Ten batches against a fall of 5 in the rest of F: differences 2 and 4 leave at least
-        // 6 + 8 × 2 = 22 > 5.
-        assert!(settled(&[2.0, 4.0], 10, 5.0));
-        // One difference has no range; a negative one keeps the total open (1 + 8 × (−1) ≤ 5);
-        // with every batch scored there is nothing to settle.
-        assert!(!settled(&[100.0], 10, 5.0));
-        assert!(!settled(&[2.0, -1.0], 10, 5.0));
-        assert!(!settled(&[2.0, 4.0], 2, 0.0));
-        // The change of a stopped evaluation extrapolates its paired differences' mean: (1 + 2) / 2
-        // per batch over 4 batches, and the rest's change −1.
+    fn an_evaluation_stops_once_the_floor_cannot_lower_f() {
+        // Scored batches 3 above the accepted posterior's, 5 of its data term left unscored, a fall
+        // of 1 in the rest: the data term changes by at least 3 − 5 = −2, not enough to settle; with
+        // 1 left, by at least 2 > 1.
+        assert!(!settled(3.0, 5.0, 1.0));
+        assert!(settled(3.0, 1.0, 1.0));
+        // Batches in decreasing data term.
+        assert_eq!(order(&[1.0, 4.0, 2.0, 3.0]), vec![1, 3, 2, 0]);
+        // A stopped evaluation's change is its least: scored batches 0 and 1 rise by 1 and 2, the
+        // unscored 2 and 3 fall at most to zero (−1 each), the rest falls by 1.
         let from = Evaluation { batches: vec![1.0; 4], rest: 10.0, complete: true };
-        assert_eq!(Evaluation { batches: vec![2.0, 3.0], rest: 9.0, complete: false }.change(&from), 5.0);
+        assert_eq!(Evaluation { batches: vec![2.0, 3.0, f64::NAN, f64::NAN], rest: 9.0, complete: false }.change(&from), 0.0);
         assert_eq!(Evaluation { batches: vec![2.0, 3.0, 1.0, 1.0], rest: 9.0, complete: true }.change(&from), 2.0);
     }
 }

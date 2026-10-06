@@ -3120,9 +3120,10 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
 /// `prior`, plus its value at each batch's sample, averaged, and the parameters it sends. Returned
 /// per batch (each with its share of the prior's value), the prior's cost as the rest. With
 /// `against`, an accepted posterior's per-batch values and the decrease of the rest of `F` other
-/// than the prior's cost from it, the batches stop once their paired differences settle the
-/// comparison against a rise of `F` (`library_removal::settled`), and the evaluation is
-/// incomplete.
+/// than the prior's cost from it, the batches are scored in decreasing accepted value
+/// (`library_removal::order`) and stop once a rise of `F` is certain (`library_removal::settled`),
+/// the evaluation then incomplete (unscored batches NaN); without a prior term only, whose
+/// per-batch value has no floor.
 fn expected_divergence(
     scorer: &mut Scorer,
     device_posterior: &mut DevicePosterior,
@@ -3149,9 +3150,14 @@ fn expected_divergence(
     let uploaded = timed.elapsed().as_secs_f64();
     let mut prior = prior;
     let cost = prior.as_deref().map_or(Ok(0.0), |p| p.cost(&trial))?;
-    let mut batches = Vec::with_capacity(draws.len());
+    let n = draws.len();
+    let against = against.filter(|_| prior.is_none());
+    let sequence: Vec<usize> = against.map_or_else(|| (0..n).collect(), |(accepted, _)| library_removal::order(accepted));
+    let mut batches = vec![f64::NAN; n];
+    let (mut rise, mut slack) = (0.0, against.map_or(0.0, |(accepted, _)| accepted.iter().sum::<f64>()));
     let (mut preparing, mut targeting) = (0.0, 0.0);
-    for (b, draw) in draws.iter().enumerate() {
+    for (k, b) in sequence.into_iter().enumerate() {
+        let draw = &draws[b];
         // Removal zeroes entries, so the remaining entries see the same noise as the full posterior.
         let key = noise_seed(settings.seed, 0, b);
         let started = Instant::now();
@@ -3166,24 +3172,26 @@ fn expected_divergence(
         if let Some(prior) = prior.as_deref_mut() {
             nats += prior.sample(&trial, &host_sample(&trial, &prior.operators(), key), false)?.0 / draws.len() as f64;
         }
-        batches.push(nats);
+        batches[b] = nats;
         if let Some((accepted, budget)) = against {
-            let differences: Vec<f64> = batches.iter().zip(accepted).map(|(t, a)| t - a).collect();
-            if library_removal::settled(&differences, draws.len(), budget - cost) {
+            rise += nats - accepted[b];
+            slack -= accepted[b];
+            if k + 1 < n && library_removal::settled(rise, slack, budget - cost) {
                 break;
             }
         }
     }
+    let count = batches.iter().filter(|b| !b.is_nan()).count();
     let total = timed.elapsed().as_secs_f64();
     log::info!(
         "library removal evaluation: {total:.2} s: trial clone {cloned:.2} s, set_values {:.2} s, {} of {} batches {:.2} s (experiments {preparing:.2} s, targets {targeting:.2} s, scoring {:.2} s)",
         uploaded - cloned,
-        batches.len(),
-        draws.len(),
+        count,
+        n,
         total - uploaded,
         total - uploaded - preparing - targeting
     );
-    let complete = batches.len() == draws.len();
+    let complete = count == n;
     Ok(Evaluation { batches, rest: cost, complete })
 }
 
