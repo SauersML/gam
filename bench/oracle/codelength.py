@@ -59,13 +59,13 @@ PRIOR_PROMPT = "Describe what this component of a language model responds to and
 class Labels:
     """A vpd_labels.py run, by subcomponent, with the target's tokens as strings."""
 
-    def __init__(self, root: Path, top: int, others: int):
+    def __init__(self, root: Path, top: int, others: int, tokenizer: Path = TOKENIZER):
         import tokenizers
 
         self.root = root
         self.top, self.others = top, others
         self.tokens = load_file(str(root / "contexts.safetensors"))["tokens"]
-        self.tok = tokenizers.Tokenizer.from_file(str(TOKENIZER))
+        self.tok = tokenizers.Tokenizer.from_file(str(tokenizer))
         self.meta = {}
         for path in root.glob("site_*.json"):
             m = json.loads(path.read_text())
@@ -207,6 +207,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["score", "serve"])
     ap.add_argument("--labels", required=True)
+    ap.add_argument("--tokenizer", default=str(TOKENIZER), help="the target's tokenizer.json")
     ap.add_argument("--reader-backend", required=True, choices=["vllm", "transformers"])
     ap.add_argument("--reader", required=True)
     ap.add_argument("--prior-backend", required=True, choices=["vllm", "transformers"])
@@ -225,7 +226,7 @@ def main():
     args = ap.parse_args()
     reader = backend(args.reader_backend, args.reader, args, args.gpu_memory_utilization)
     prior = reader if (args.prior, args.prior_backend) == (args.reader, args.reader_backend) else backend(args.prior_backend, args.prior, args, args.prior_gpu_memory_utilization)
-    labels = Labels(Path(args.labels), args.top, args.others)
+    labels = Labels(Path(args.labels), args.top, args.others, Path(args.tokenizer))
     if args.command == "serve":
         host, sep, port = args.listen.rpartition(":")
         server = socketserver.TCPServer((host, int(port)), _Handler) if sep and port.isdigit() else socketserver.UnixStreamServer(args.listen, _Handler)
