@@ -527,6 +527,7 @@ fn main() -> Result<(), String> {
                 trust_rate: false,
                 split_filter: false,
                 deterministic: false,
+                line_search: false,
             };
             let base = library_mdl::explanation(&native, &layers)?;
             let run = Run {

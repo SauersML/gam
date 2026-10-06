@@ -1295,6 +1295,10 @@ pub struct Settings {
     pub split_filter: bool,
     #[serde(default)]
     pub deterministic: bool,
+    /// The line arm: each step moves to the Gauss–Newton line minimum along IVON's direction, in
+    /// place of the step `α` (`DevicePosterior::line_step`).
+    #[serde(default)]
+    pub line_search: bool,
 }
 
 impl Settings {
@@ -2768,7 +2772,7 @@ pub fn fit_from(
     let fresh = resumed.is_none();
     let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, resumed.as_deref(), u64::try_from(progress.step).map_err(error)?)?;
     let arm = (if settings.trust_rate { settings.rate } else { 1.0 }, settings.split_filter, settings.deterministic);
-    device_posterior.set_arm(arm.0, arm.1, arm.2);
+    device_posterior.set_arm(arm.0, arm.1, arm.2, settings.line_search);
     drop(resumed);
     // A resumed fit holds exactly the device's means of the checkpoint.
     if let Some(held) = held_means.take() {
@@ -2778,7 +2782,7 @@ pub fn fit_from(
         let timed = Instant::now();
         let moments = laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens)?;
         device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, Some(&moments), 0)?;
-        device_posterior.set_arm(arm.0, arm.1, arm.2);
+        device_posterior.set_arm(arm.0, arm.1, arm.2, settings.line_search);
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
     // The curvature estimate averages over one epoch's batches: each batch weighs about once.
@@ -3685,6 +3689,7 @@ mod tests {
             trust_rate: false,
             split_filter: false,
             deterministic: false,
+            line_search: false,
         }
     }
 
