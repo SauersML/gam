@@ -403,7 +403,7 @@ fn removal_sums_on_cuda_match_the_host() {
 /// `resolved_counts` of a gated and an ungated layer on `fit` (sums on `wide`): values, slopes and
 /// noises from the case's arrays, a dead column, and exact zeros in the values.
 fn resolved_counts_on(fit: &Device, wide: &Device) -> [Array2<f64>; 2] {
-    let c = case();
+    let c = case(GroupAxis::Entries);
     let mut value = c.mean.clone();
     value.row_mut(1).fill(0.0);
     let (slope, phi, noise_z, noise_y) = (c.gradient.clone(), c.factor.clone(), c.log_sd.mapv(|s| if s.is_finite() { (2.0 * s).exp() } else { 0.0 }), c.moments[0].clone());
@@ -431,7 +431,7 @@ fn resolved_counts_against_host(fit: &Device, wide: &Device) {
 fn resolved_counts_on_the_host_count_their_entries() {
     let host = Device::host();
     let [gated, plain] = resolved_counts_on(&host, &host);
-    let c = case();
+    let c = case(GroupAxis::Entries);
     let alive = (0..c.mean.ncols()).filter(|j| j % 7 != 3).count() * c.mean.nrows();
     assert_eq!(gated[(0, 0)], alive as f64);
     assert_eq!(plain[(0, 0)], alive as f64);
