@@ -400,15 +400,19 @@ DEVICE void keys_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, floa
 }
 
 // The queries' cotangents: a block of BR query rows (of one query head of one sequence) sweeps the
-// key tiles up to its last row, as the forward's block does: thread (g, c) holds rows g + RG i, their
-// scores and dP = dO Vᵀ at keys c + CG j, and dQ at columns 4c + 4 CG m..; dS goes through shared
-// memory to the threads that contract it with K. Key tiles are double-buffered (the next loads
-// while this one's products run), the value tile loads while the scores form. Shared memory:
-// (2 BR + 3 BC) (D + 4) + BR (BC + 4) floats.
-template <int D, int BR, int BC, int NT, int TR>
+// key tiles of BC rows up to its last row, its threads blocked as the forward's: thread (g, c) holds
+// rows g + RG i (i < TR), their scores and dP = dO Vᵀ at keys c + CG j (j < BC / CG), and dQ at
+// columns 4c + 4 CG m.. (m < D / (4 CG)). The queries and their cotangents stay in shared memory;
+// each key tile streams through two buffers as the keys' columns in chunks of DC (the scores), the
+// values' columns (dP), then the keys' rows in chunks of DC (dQ += dS K, dS through shared memory).
+// Shared memory: 2 BR (D + 4) + 2 max(BC (DC + 4), DC (D + 4)) + BR (BC + 4) floats.
+#define QUERIES_FLOATS(D, BR, BC, DC) (2 * (BR) * ((D) + 4) + 2 * FORWARD_CHUNK(D, BC, DC) + (BR) * ((BC) + 4))
+
+template <int D, int BR, int BC, int NT, int TR, int DC>
 DEVICE void queries_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, float scale, GLOBAL const float* y, GLOBAL const float* lse, GLOBAL const float* ga,
                          GLOBAL const float* dsum, GLOBAL float* gy, u32 pair, u32 tile, u32 t, u32 threads, SHARED float* smem) {
-    constexpr u32 RG = BR / TR, CG = NT / RG, KP = BC / CG, DP = D / CG;
+    constexpr u32 RG = BR / TR, CG = NT / RG, KP = BC / CG, DP = D / CG, NK = D / DC, NR = BC / DC;
+    constexpr u32 CHUNK = FORWARD_CHUNK(D, BC, DC);
     if (pair >= sequences.count * hq) return;
     const u32 head = pair % hq, sequence = pair / hq;
     const u32 start = sequences.start[sequence], length = sequences.length[sequence];
@@ -421,21 +425,20 @@ DEVICE void queries_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, f
     GLOBAL const float* yv = y + (u64)start * stride + (hq + hk + kv) * w;
     SHARED float* sq = smem;
     SHARED float* sdo = sq + BR * TILE_STRIDE(D);
-    SHARED float* sk = sdo + BR * TILE_STRIDE(D);
-    SHARED float* sv = sk + 2u * BC * TILE_STRIDE(D);
-    SHARED float* sds = sv + BC * TILE_STRIDE(D);
+    SHARED float* sbuf = sdo + BR * TILE_STRIDE(D);
+    SHARED float* sds = sbuf + 2u * CHUNK;
     const u32 keys = min(q0 + BR, length), key_tiles = (keys + BC - 1u) / BC;
     const u32 valid = min((u32)BR, length - q0);
     const bool computes = t < NT;
     const u32 g = t / CG, c = t % CG;
 
+    // Chunk u of key tile kt: u < NK the keys' columns [u DC, ...), u < 2 NK the values' columns
+    // [(u − NK) DC, ...), else the keys' rows [(u − 2 NK) DC, ...); buffer (its number) mod 2.
     load_tile<D>(sq, y + (u64)(start + q0) * stride + head * w, stride, BR, valid, w, t, threads);
     load_tile<D>(sdo, ga + (u64)(start + q0) * reads + head * w, reads, BR, valid, w, t, threads);
-    load_tile<D>(sk, yk, stride, BC, min((u32)BC, keys), w, t, threads);
+    load_block<DC>(sbuf, DC + 4u, yk, stride, BC, min((u32)BC, keys), w, t, threads);
     COPY_COMMIT();
-    load_tile<D>(sv, yv, stride, BC, min((u32)BC, keys), w, t, threads);
-    COPY_COMMIT();
-    float lse2[TR], dr[TR], dq[TR][DP];
+    float lse2[TR], dr[TR], dq[TR][DP], s[TR][KP], dp[TR][KP];
     UNROLL for (u32 i = 0; i < TR; ++i) {
         const u32 row = q0 + g + RG * i;
         const bool inside = computes && row < length;
@@ -443,73 +446,73 @@ DEVICE void queries_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, f
         dr[i] = inside ? dsum[(u64)(start + row) * hq + head] : 0.0f;
         UNROLL for (u32 d = 0; d < DP; ++d) dq[i][d] = 0.0f;
     }
+    u32 chunk = 0;
     for (u32 kt = 0; kt < key_tiles; ++kt) {
-        const u32 k0 = kt * BC;
-        const bool more = kt + 1u < key_tiles;
-        SHARED float* sks = sk + (kt & 1u) * BC * TILE_STRIDE(D);
-        // This tile's keys have landed (its values, the newest copies, may not have); the previous
-        // tile's products are done with the buffers about to be replaced.
-        COPY_WAIT_ONE();
-        BARRIER();
-        if (more) {
-            load_tile<D>(sk + ((kt + 1u) & 1u) * BC * TILE_STRIDE(D), yk + (u64)(k0 + BC) * stride, stride, BC, min((u32)BC, keys - k0 - BC), w, t, threads);
-            COPY_COMMIT();
-        }
-        float s[TR][KP], dp[TR][KP];
-        if (computes) {
-            UNROLL for (u32 i = 0; i < TR; ++i)
-                UNROLL for (u32 j = 0; j < KP; ++j) s[i][j] = dp[i][j] = 0.0f;
-            for (u32 d = 0; d < D; d += 4u) {
-                f4 qr[TR], kr[KP];
-                UNROLL for (u32 i = 0; i < TR; ++i) qr[i] = LOAD4(sq + (g + RG * i) * TILE_STRIDE(D) + d);
-                UNROLL for (u32 j = 0; j < KP; ++j) kr[j] = LOAD4(sks + (c + CG * j) * TILE_STRIDE(D) + d);
-                UNROLL for (u32 i = 0; i < TR; ++i)
-                    UNROLL for (u32 j = 0; j < KP; ++j) s[i][j] = FMA(qr[i].w, kr[j].w, FMA(qr[i].z, kr[j].z, FMA(qr[i].y, kr[j].y, FMA(qr[i].x, kr[j].x, s[i][j]))));
-            }
-        }
-        // This tile's values (the next tile's keys, if issued, are the newest copies).
-        if (more) {
-            COPY_WAIT_ONE();
-        } else {
+        const u32 k0 = kt * BC, valid_keys = min((u32)BC, keys - k0);
+        UNROLL for (u32 i = 0; i < TR; ++i)
+            UNROLL for (u32 j = 0; j < KP; ++j) s[i][j] = dp[i][j] = 0.0f;
+        for (u32 u = 0; u < 2u * NK + NR; ++u, ++chunk) {
             COPY_WAIT();
-        }
-        BARRIER();
-        if (computes) {
-            for (u32 d = 0; d < D; d += 4u) {
-                f4 dor[TR], vr[KP];
-                UNROLL for (u32 i = 0; i < TR; ++i) dor[i] = LOAD4(sdo + (g + RG * i) * TILE_STRIDE(D) + d);
-                UNROLL for (u32 j = 0; j < KP; ++j) vr[j] = LOAD4(sv + (c + CG * j) * TILE_STRIDE(D) + d);
-                UNROLL for (u32 i = 0; i < TR; ++i)
-                    UNROLL for (u32 j = 0; j < KP; ++j) dp[i][j] = FMA(dor[i].w, vr[j].w, FMA(dor[i].z, vr[j].z, FMA(dor[i].y, vr[j].y, FMA(dor[i].x, vr[j].x, dp[i][j]))));
+            BARRIER();
+            SHARED float* next = sbuf + ((chunk + 1u) & 1u) * CHUNK;
+            const u32 v = u + 1u;
+            if (v < NK) {
+                load_block<DC>(next, DC + 4u, yk + (u64)k0 * stride + v * DC, stride, BC, valid_keys, w > v * DC ? w - v * DC : 0u, t, threads);
+            } else if (v < 2u * NK) {
+                const u32 d0 = (v - NK) * DC;
+                load_block<DC>(next, DC + 4u, yv + (u64)k0 * stride + d0, stride, BC, valid_keys, w > d0 ? w - d0 : 0u, t, threads);
+            } else if (v < 2u * NK + NR) {
+                const u32 r0 = (v - 2u * NK) * DC;
+                load_block<D>(next, D + 4u, yk + (u64)(k0 + r0) * stride, stride, DC, valid_keys > r0 ? min((u32)DC, valid_keys - r0) : 0u, w, t, threads);
+            } else if (kt + 1u < key_tiles) {
+                load_block<DC>(next, DC + 4u, yk + (u64)(k0 + BC) * stride, stride, BC, min((u32)BC, keys - k0 - BC), w, t, threads);
             }
-            // dS = P ∘ (dP − D); a key after a row weighs nothing for it.
-            UNROLL for (u32 i = 0; i < TR; ++i)
-                UNROLL for (u32 j = 0; j < KP; ++j) {
-                    const u32 key = k0 + c + CG * j, row = q0 + g + RG * i;
-                    const float p = key > row ? 0.0f : EXP2(FMA(s[i][j], scale_log2, -lse2[i]));
-                    sds[(g + RG * i) * (BC + 4u) + c + CG * j] = p * (dp[i][j] - dr[i]);
-                }
-        }
-        // Every thread is done with this tile's values: the next tile's load into their buffer.
-        BARRIER();
-        if (more) {
-            load_tile<D>(sv, yv + (u64)(k0 + BC) * stride, stride, BC, min((u32)BC, keys - k0 - BC), w, t, threads);
             COPY_COMMIT();
-        }
-        if (computes) {
-            // dQ += dS K, the tile's keys contracted.
-            for (u32 k = 0; k < BC; k += 4u) {
-                f4 sr[TR];
-                UNROLL for (u32 i = 0; i < TR; ++i) sr[i] = LOAD4(sds + (g + RG * i) * (BC + 4u) + k);
-                UNROLL for (u32 kk = 0; kk < 4u; ++kk) {
-                    UNROLL for (u32 n = 0; n < DP / 4u; ++n) {
-                        const f4 kv4 = LOAD4(sks + (k + kk) * TILE_STRIDE(D) + 4u * c + 4u * CG * n);
-                        UNROLL for (u32 i = 0; i < TR; ++i) {
-                            const float s = kk == 0u ? sr[i].x : kk == 1u ? sr[i].y : kk == 2u ? sr[i].z : sr[i].w;
-                            dq[i][4u * n] = FMA(s, kv4.x, dq[i][4u * n]);
-                            dq[i][4u * n + 1u] = FMA(s, kv4.y, dq[i][4u * n + 1u]);
-                            dq[i][4u * n + 2u] = FMA(s, kv4.z, dq[i][4u * n + 2u]);
-                            dq[i][4u * n + 3u] = FMA(s, kv4.w, dq[i][4u * n + 3u]);
+            SHARED float* cur = sbuf + (chunk & 1u) * CHUNK;
+            if (u < 2u * NK) {
+                if (computes) {
+                    // The scores (u < NK) or dP (else) over this chunk's columns.
+                    const bool scores = u < NK;
+                    SHARED float* rows_tile = scores ? sq : sdo;
+                    const u32 d0 = (scores ? u : u - NK) * DC;
+                    for (u32 d = 0; d < DC; d += 4u) {
+                        f4 a[TR], b[KP];
+                        UNROLL for (u32 i = 0; i < TR; ++i) a[i] = LOAD4(rows_tile + (g + RG * i) * TILE_STRIDE(D) + d0 + d);
+                        UNROLL for (u32 j = 0; j < KP; ++j) b[j] = LOAD4(cur + (c + CG * j) * (DC + 4u) + d);
+                        if (scores) {
+                            UNROLL for (u32 i = 0; i < TR; ++i)
+                                UNROLL for (u32 j = 0; j < KP; ++j) s[i][j] = FMA(a[i].w, b[j].w, FMA(a[i].z, b[j].z, FMA(a[i].y, b[j].y, FMA(a[i].x, b[j].x, s[i][j]))));
+                        } else {
+                            UNROLL for (u32 i = 0; i < TR; ++i)
+                                UNROLL for (u32 j = 0; j < KP; ++j) dp[i][j] = FMA(a[i].w, b[j].w, FMA(a[i].z, b[j].z, FMA(a[i].y, b[j].y, FMA(a[i].x, b[j].x, dp[i][j]))));
+                        }
+                    }
+                    if (u + 1u == 2u * NK) {
+                        // dS = P ∘ (dP − D); a key after a row weighs nothing for it.
+                        UNROLL for (u32 i = 0; i < TR; ++i)
+                            UNROLL for (u32 j = 0; j < KP; ++j) {
+                                const u32 key = k0 + c + CG * j, row = q0 + g + RG * i;
+                                const float p = key > row ? 0.0f : EXP2(FMA(s[i][j], scale_log2, -lse2[i]));
+                                sds[(g + RG * i) * (BC + 4u) + c + CG * j] = p * (dp[i][j] - dr[i]);
+                            }
+                    }
+                }
+            } else if (computes && (u - 2u * NK) * DC < valid_keys) {
+                // dQ += dS K over this chunk's keys.
+                const u32 r0 = (u - 2u * NK) * DC;
+                for (u32 k = 0; k < DC; k += 4u) {
+                    f4 sr[TR];
+                    UNROLL for (u32 i = 0; i < TR; ++i) sr[i] = LOAD4(sds + (g + RG * i) * (BC + 4u) + r0 + k);
+                    UNROLL for (u32 kk = 0; kk < 4u; ++kk) {
+                        UNROLL for (u32 n = 0; n < DP / 4u; ++n) {
+                            const f4 kv4 = LOAD4(cur + (k + kk) * TILE_STRIDE(D) + 4u * c + 4u * CG * n);
+                            UNROLL for (u32 i = 0; i < TR; ++i) {
+                                const float x = kk == 0u ? sr[i].x : kk == 1u ? sr[i].y : kk == 2u ? sr[i].z : sr[i].w;
+                                dq[i][4u * n] = FMA(x, kv4.x, dq[i][4u * n]);
+                                dq[i][4u * n + 1u] = FMA(x, kv4.y, dq[i][4u * n + 1u]);
+                                dq[i][4u * n + 2u] = FMA(x, kv4.z, dq[i][4u * n + 2u]);
+                                dq[i][4u * n + 3u] = FMA(x, kv4.w, dq[i][4u * n + 3u]);
+                            }
                         }
                     }
                 }

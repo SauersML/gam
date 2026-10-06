@@ -4165,8 +4165,10 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
     /// The keys' reverse's block: key rows, query rows at a time, threads, keys per thread.
     const ATTENTION_KEYS: (usize, usize, usize, usize) = (32, 32, 256, 2);
 
-    /// The queries' reverse's block: query rows, keys at a time, threads, rows per thread.
-    const ATTENTION_QUERIES: (usize, usize, usize, usize) = (32, 32, 256, 1);
+    /// The queries' reverse's block, blocked as the forward's: query rows, keys at a time, threads,
+    /// rows per thread and chunk (each thread 8 rows × 4 keys of the scores and of dP, and 8 rows × 4
+    /// columns of dQ; 71 KB of shared memory).
+    const ATTENTION_QUERIES: (usize, usize, usize, usize, usize) = (32, 128, 128, 8, 16);
 
     /// The sequences one attention launch takes (they are passed by value: a kernel's parameters
     /// hold 4 KB).
@@ -5073,7 +5075,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
                     attention_width(width).unwrap_or(128),
                     format!("{r}, {k}, {n}, {tr}, {dc}"),
                     tuple(ATTENTION_KEYS),
-                    tuple(ATTENTION_QUERIES),
+                    format!("{}, {}, {}, {}, {}", ATTENTION_QUERIES.0, ATTENTION_QUERIES.1, ATTENTION_QUERIES.2, ATTENTION_QUERIES.3, ATTENTION_QUERIES.4),
                     include_str!("attention_f32.inc")
                 )
             };
@@ -5144,9 +5146,9 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
             // SAFETY: rows × hq·w outputs and cotangents, rows × hq sums; one warp per (row, head).
             unsafe { self.stream.launch_builder(&sums).arg(&n).arg(&hq).arg(&width).arg(slice32(out)?).arg(slice32(ga)?).arg(slice32_mut(&mut dsum)?).launch(cfg_elements((rows * layout.queries) as u64 * 32)) }
                 .gpu_ctx("attention backward sums")?;
-            let ((key_rows, key_queries, key_threads, _), (query_rows, query_keys, query_threads, _)) = (ATTENTION_KEYS, ATTENTION_QUERIES);
+            let ((key_rows, key_queries, key_threads, _), (query_rows, query_keys, query_threads, _, query_chunk)) = (ATTENTION_KEYS, ATTENTION_QUERIES);
             let keys_shared = ((2 * key_rows + 3 * key_queries) * (padded + 4) + 2 * key_rows * (key_queries + 4) + 2 * key_queries) * 4;
-            let queries_shared = ((2 * query_rows + 3 * query_keys) * (padded + 4) + query_rows * (query_keys + 4)) * 4;
+            let queries_shared = (2 * query_rows * (padded + 4) + 2 * (query_keys * (query_chunk + 4)).max(query_chunk * (padded + 4)) + query_rows * (query_keys + 4)) * 4;
             let (keys_kernel, queries_kernel) = (self.attention_kernel(w, "attention_backward_keys", keys_shared)?, self.attention_kernel(w, "attention_backward_queries", queries_shared)?);
             // The two passes write every row of the sequences.
             let mut gy = self.attention_output((rows, columns), sequences)?;
@@ -7031,7 +7033,7 @@ typedef ulong u64;
     /// groups`, ...; item `i` is (sequence, head) pair `i mod pairs` and tile `i / pairs` (the longest
     /// sweeps first). Tiles fit the 32 KB of threadgroup memory: the forward's blocks hold 16 query
     /// rows and take 64 keys at a time (64 threads of 4 rows × 4 keys); the reverse's 16 key rows and
-    /// 8 query rows at a time, or 16 query rows and 8 keys.
+    /// 8 query rows at a time, or 16 query rows and 32 keys (64 threads of 4 rows × 2 keys).
     const ATTENTION_KERNELS: &str = r#"
 struct AttentionParams { uint hq; uint hk; uint w; float scale; uint pairs; uint items; uint rows; uint unused; Sequences sequences; };
 
@@ -7057,9 +7059,9 @@ kernel void t_attention_keys_##D(device const float* y [[buffer(0)]], device con
 kernel void t_attention_queries_##D(device const float* y [[buffer(0)]], device const float* lse [[buffer(1)]], device const float* ga [[buffer(2)]], \
     device const float* dsum [[buffer(3)]], device float* gy [[buffer(4)]], constant AttentionParams& p [[buffer(5)]], \
     uint group [[threadgroup_position_in_grid]], uint groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]]) { \
-    threadgroup float smem[(2 * 16 + 3 * 8) * TILE_STRIDE(D) + 16 * (8 + 4)]; \
+    threadgroup float smem[QUERIES_FLOATS(D, 16, 32, 8)]; \
     for (uint item = group; item < p.items; item += groups) { \
-        queries_body<D, 16, 8, 128, 1>(p.sequences, p.hq, p.hk, p.w, p.scale, y, lse, ga, dsum, gy, item % p.pairs, item / p.pairs, t, 256u, smem); \
+        queries_body<D, 16, 32, 64, 4, 8>(p.sequences, p.hq, p.hk, p.w, p.scale, y, lse, ga, dsum, gy, item % p.pairs, item / p.pairs, t, 256u, smem); \
         threadgroup_barrier(mem_flags::mem_threadgroup); \
     } \
 }
