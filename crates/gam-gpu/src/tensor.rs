@@ -2745,8 +2745,7 @@ impl Device {
     /// heavy-tailed `ĥ = u² / n` (vpd4l, `N = 2^16`: one batch's outlying estimate multiplied `h`
     /// and the description rose from 25 to 152 bits per scored token in one epoch). The step is
     /// `d = G / (h₀⁺ + δ)` with `G = m / W' + δ μ` (the bias-corrected momentum plus the prior's
-    /// exact pull), `h₀` the curvature before this step's update and `h⁺` the curvature where the
-    /// total precision is positive, `h⁺ = h` where `h + δ > 0` and `0` elsewhere: IVON's full
+    /// exact pull), `h₀` the curvature before this step's update and `x⁺ = max(x, 0)`: IVON's full
     /// step from the mean, written to `direction` with the mean left as it is (a caller moves it
     /// by `η d`, [`Device::posterior_finish`]). The direction is formed before this step's factor
     /// `u` enters the curvature, so given the batch and the weight sample it does not depend on the
@@ -2754,14 +2753,16 @@ impl Device {
     /// per token of the tokens `u` sums and `c = step.factor_scale`: the curvature along `d` that
     /// the caller's step length reads from `u · d`. From the updated `h` an entry with a large
     /// `u_i²` would take a short `d_i`, and `(u · d)²` would be biased low. The deviation is
-    /// `s = −½ ln(N (h⁺ + δ))` with the updated `h`: the standard deviation at which the
-    /// approximated `N E_q[ℓ] + KL(q ‖ p)` is stationary for the curvature `h` and the variance `v`,
-    /// `σ² = 1 / (N h + 1 / v)`, wherever that total precision is positive: below `v` where
-    /// `h > 0` and above it where `−1 / (N v) < h < 0`. A Gauss–Newton estimate is never negative,
-    /// so without `prior` an `h ≥ 0` stays nonnegative (`β₂ h + (1 − β₂) ĥ ≥ 0`; rounding keeps it,
-    /// since `|fl(ĥ − h)| ≤ h` when `ĥ < h`); a prior term's curvature can make `h` negative. Where
-    /// the total precision `N h + 1 / v` is not positive the approximated objective has no
-    /// stationary `σ`: `h` keeps the signed average, and `σ² = v` is the prior's. Both `h` and `v` depend on the
+    /// `s = −½ ln(N (h⁺ + δ))` with the updated `h`, so `σ² ≤ v`: the standard deviation at which
+    /// the approximated `N E_q[ℓ] + KL(q ‖ p)` is stationary for a curvature `h ≥ 0` and the
+    /// variance `v`. A Gauss–Newton estimate is never negative, so without `prior` an `h ≥ 0`
+    /// stays nonnegative (`β₂ h + (1 − β₂) ĥ ≥ 0`; rounding keeps it, since `|fl(ĥ − h)| ≤ h`
+    /// when `ĥ < h`). Where the expected curvature is negative (a prior term's curvature, `prior`,
+    /// can make it so), `h` keeps the signed average and `σ² = v` is the prior's: at a fixed `v`
+    /// an `h` in `(−1 / (N v), 0)` would be stationary at `σ² = 1 / (N h + 1 / v) > v`, but `v` is
+    /// fitted to `μ² + σ²`, and jointly in `σ` and `v` there is no stationary point (along
+    /// `σ² = v → ∞` the term `N h σ² / 2` falls without bound). The step's sums read `h₀⁺ ≥ 0`
+    /// alike, so the line step's curvature `ρ̄ Σ h₀⁺ d² + Σ δ d²` is positive. Both `h` and `v` depend on the
     /// posterior (`h` is an expectation under `q`, `v` is the empirical-Bayes variance), so the
     /// exact stationary point solves implicit equations; this step, from the running `h` and the
     /// current `v`, is an online approximation to it.
@@ -2828,9 +2829,7 @@ impl Device {
                     let delta = 1.0 / (step.tokens * var[g]);
                     // The direction before the step, from the momentum and the curvature it holds.
                     let (m, h) = (ms[i], hs[i]);
-                    // The curvature where the total precision `h + δ` is positive, else none (σ² = v).
-                    let usable = |h: f64| if h + delta > 0.0 { h } else { 0.0 };
-                    let (bounded, held) = (usable(h), usable(h) + delta);
+                    let (bounded, held) = (h.max(0.0), h.max(0.0) + delta);
                     let previous = (if before > 0.0 { m / before } else { 0.0 } + delta * mu) / held;
                     let data = gv.map_or(0.0, |v| step.gradient_scale * v[i]);
                     let u = uv.map_or(0.0, |v| v[i]);
@@ -2839,7 +2838,7 @@ impl Device {
                     hs[i] = h + (1.0 - b2) * (estimate - h);
                     // The step's direction from the curvature before this step's draw, its deviation
                     // from the curvature after it.
-                    let positive = usable(hs[i]);
+                    let positive = hs[i].max(0.0);
                     let change = (ms[i] / after + delta * mu) / held;
                     log_sds[i] = -0.5 * (step.tokens * (positive + delta)).ln();
                     moves[i] = change;
@@ -4583,7 +4582,7 @@ __device__ void group_reduce(u64 n, u64 cols, unsigned int axis, u64 segments, c
 // step d = G / (h₀⁺ + δ), h₀ the curvature before this step's draw, goes to `direction`, and each
 // live entry's (d d, u d, (h₀⁺ d) d, (g + δ μ) d₀, ((h₀⁺ + δ) d₀) d₀) into its group's row of `sums`
 // (groups × 5), d₀ the direction before the step (`Device::posterior_ivon`); the deviation takes the
-// stepped curvature h⁺ (h⁺ = h where the total precision h + δ is positive, else 0). An entry the step leaves (removed, or of a group at or beyond `count`) has
+// stepped curvature h⁺. An entry the step leaves (removed, or of a group at or beyond `count`) has
 // d = μ − μ.
 template <typename T>
 __device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double beta1, double beta2, double c0, double c1,
@@ -4600,13 +4599,13 @@ __device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chun
         T delta = prior_precision((T)0, tokens, variance[g]);
         // The direction before the step, from the momentum and the curvature it holds.
         T m = momentum[i], h = curvature[i];
-        T bounded = h + delta > zero ? h : zero, held = bounded + delta;
+        T bounded = h > zero ? h : zero, held = bounded + delta;
         T previous = (m * k0 + delta * mu) / held;
         T gi = given ? weight * gradient[i] : zero, ui = drawn ? factor[i] : zero;
         T estimate = square * ui * ui + (priced ? prior[i] : zero);
         T m1 = b1 * m + o1 * gi;
         T h1 = h + o2 * (estimate - h);
-        T positive = h1 + delta > zero ? h1 : zero;
+        T positive = h1 > zero ? h1 : zero;
         T move = (m1 * k1 + delta * mu) / held;
         T s = log_deviation(positive + delta, tokens);
         momentum[i] = m1; curvature[i] = h1; log_sd[i] = s;
@@ -7828,13 +7827,13 @@ kernel void t_posterior_ivon(device const float* gradient [[buffer(0)]], device 
         }
         // The direction before the step, from the momentum and the curvature it holds.
         float m = momentum[e], h = curvature[e];
-        float bounded = h + delta > 0.0f ? h : 0.0f, held = bounded + delta;
+        float bounded = max(h, 0.0f), held = bounded + delta;
         float previous = ((p.c0 > 0.0f ? m / p.c0 : 0.0f) + delta * mu) / held;
         float gi = given ? p.scale * gradient[e] : 0.0f, ui = drawn ? factor[e] : 0.0f;
         float estimate = p.fscale * ui * ui + (priced ? prior[e] : 0.0f);
         float m1 = p.beta1 * m + (1.0f - p.beta1) * gi;
         float h1 = h + (1.0f - p.beta2) * (estimate - h);
-        float positive = h1 + delta > 0.0f ? h1 : 0.0f;
+        float positive = max(h1, 0.0f);
         float d = (m1 / p.c1 + delta * mu) / held;
         float sd = -0.5f * log(p.tokens * (positive + delta));
         momentum[e] = m1; curvature[e] = h1; log_sd[e] = sd; direction[e] = d;

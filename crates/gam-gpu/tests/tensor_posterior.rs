@@ -88,7 +88,7 @@ struct Stepped {
 }
 
 /// The formulas, entry by entry, from the sums before the step: with `d₀` the direction before the
-/// step and `d` the step's, the terms `d · d`, `u · d`, `Σ h⁺ d²` (`h⁺` the curvature where `h + δ > 0`, else 0), `(g + δ μ) · d₀` and
+/// step and `d` the step's, the terms `d · d`, `u · d`, `Σ h⁺ d²`, `(g + δ μ) · d₀` and
 /// `Σ (h₀⁺ + δ) d₀²` per group.
 fn reference(c: &Case) -> Stepped {
     let mut before = Array2::zeros((c.count, 3));
@@ -120,15 +120,13 @@ fn reference(c: &Case) -> Stepped {
         let g = *g as usize;
         let delta = 1.0 / (n * variance[g]);
         let (m0, h0) = (moments[0][at], moments[1][at]);
-        // The curvature where the total precision `h + δ` is positive, else none.
-        let usable = |h: f64| if h + delta > 0.0 { h } else { 0.0 };
-        let held = usable(h0) + delta;
+        let held = h0.max(0.0) + delta;
         let previous = (m0 / w0 + delta * mu) / held;
         let (gr, u) = (c.step.gradient_scale * c.gradient[at], c.factor[at]);
         let estimate = c.step.factor_scale * u * u + c.prior[at];
         let momentum = b1 * m0 + (1.0 - b1) * gr;
         let curvature = h0 + (1.0 - b2) * (estimate - h0);
-        let positive = usable(curvature);
+        let positive = curvature.max(0.0);
         let d = (momentum / w1 + delta * mu) / held;
         moments[0][at] = momentum;
         moments[1][at] = curvature;
@@ -139,7 +137,7 @@ fn reference(c: &Case) -> Stepped {
         after[(g, 2)] += 2.0 * log_sd[at];
         terms[(g, 0)] += d * d;
         terms[(g, 1)] += u * d;
-        terms[(g, 2)] += (usable(h0) * d) * d;
+        terms[(g, 2)] += (h0.max(0.0) * d) * d;
         terms[(g, 3)] += (gr + delta * mu) * previous;
         terms[(g, 4)] += (held * previous) * previous;
     }
@@ -583,22 +581,15 @@ fn a_constant_gradient_moves_the_mean_by_ivon_s_full_step() {
     }
 }
 
-/// A prior curvature input joins the curvature's average, of either sign, and the deviations are
-/// the stationary ones of the total precision `N h + 1 / v` wherever it is positive (the direction
-/// the curvature before the step): `σ² = 1 / (N (h + δ))`, below `v` for `h > 0` and above it for
-/// `−δ < h < 0`; where `h + δ ≤ 0` the curvature keeps the signed average and `σ² = 1 / (N δ) = v`,
-/// the prior's. The prior input is chosen to put the stepped curvature at each of the three.
-fn prior_curvature_enters_the_total_precision(fit: &Device, wide: &Device) {
+/// A prior curvature input joins the curvature's average, of either sign, and the deviations take
+/// its positive part `h⁺` (the direction the curvature before the step): a curvature pushed below
+/// zero keeps the signed average, and there `σ² = 1 / (N δ) = v`, the prior's.
+fn prior_curvature_takes_its_positive_part(fit: &Device, wide: &Device) {
     let (rows, cols, tokens, v) = (3, 4, 64.0, 0.5);
     let delta = 1.0 / (tokens * v);
     let (mean, gradient, factor) = (matrix(rows, cols, 31, 0.5, 0.0), matrix(rows, cols, 32, 1.0, 0.0), matrix(rows, cols, 33, 1.0, 0.0));
-    let start = matrix(rows, cols, 35, 0.25, 0.5);
+    let (prior, start) = (matrix(rows, cols, 34, 4.0, 0.0), matrix(rows, cols, 35, 0.25, 0.5));
     let (beta2, square) = (0.5, 0.5);
-    // Stepped curvatures above zero, between −δ and zero, and below −δ, and the prior inputs that
-    // give them: `h = start + (1 − β₂)(c u² + r − start)`.
-    let targets = [0.3, -0.5 * delta, -0.5, 0.1 * delta];
-    let wanted = Array2::from_shape_fn((rows, cols), |(r, c)| targets[(r + c) % targets.len()]);
-    let prior = Array2::from_shape_fn((rows, cols), |at| (wanted[at] - beta2 * start[at]) / (1.0 - beta2) - square * factor[at] * factor[at]);
     let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
     let (mu, mut log_sd) = (up(&mean), up(&Array2::from_elem((rows, cols), -1.0)));
     let (mut momentum, mut curvature) = (fit.zeros(rows, cols).unwrap(), up(&start));
@@ -609,36 +600,32 @@ fn prior_curvature_enters_the_total_precision(fit: &Device, wide: &Device) {
     let (g, u, r) = (up(&gradient), up(&factor), up(&prior));
     fit.posterior_ivon((&mu, &mut log_sd), [&mut momentum, &mut curvature], (Some(&g), Some(&u), Some(&r)), (&groups, &variance), (&mut direction, &mut sums), &step).unwrap();
     let h = Array2::from_shape_fn((rows, cols), |at| start[at] + (1.0 - beta2) * (square * factor[at] * factor[at] + prior[at] - start[at]));
-    assert!(h.iter().any(|x| *x < -delta) && h.iter().any(|x| *x > -delta && *x < 0.0) && h.iter().any(|x| *x > 0.0), "curvatures in all three ranges");
-    let usable = |x: f64| if x + delta > 0.0 { x } else { 0.0 };
-    let positive = h.mapv(usable);
+    assert!(h.iter().any(|x| *x < -0.1) && h.iter().any(|x| *x > 0.1), "curvatures of both signs");
+    let positive = h.mapv(|x| x.max(0.0));
     let name = fit.name();
     close(&format!("{name} signed curvature"), &fit.download(&curvature).unwrap(), &h, CHAIN);
     close(&format!("{name} log sd"), &fit.download(&log_sd).unwrap(), &positive.mapv(|x| -0.5 * (tokens * (x + delta)).ln()), CHAIN);
-    let expected = Array2::from_shape_fn((rows, cols), |at| (gradient[at] + delta * mean[at]) / (usable(start[at]) + delta));
+    let expected = Array2::from_shape_fn((rows, cols), |at| (gradient[at] + delta * mean[at]) / (start[at].max(0.0) + delta));
     close(&format!("{name} direction"), &fit.download(&direction).unwrap(), &expected, CHAIN);
     for (x, s) in h.iter().zip(fit.download(&log_sd).unwrap().iter()) {
-        let variance = (2.0 * s).exp();
-        if *x + delta <= 0.0 {
-            assert!((variance - v).abs() <= 1e-5 * v, "{name}: σ² {variance} at a total precision below zero, against v = {v}");
-        } else if *x < 0.0 {
-            assert!(variance > v, "{name}: σ² {variance} at a negative curvature of positive total precision, not above v = {v}");
+        if *x < 0.0 {
+            assert!(((2.0 * s).exp() - v).abs() <= 1e-5 * v, "{name}: σ² {} at a negative curvature, against v = {v}", (2.0 * s).exp());
         }
     }
 }
 
 #[test]
-fn a_prior_curvature_joins_the_average_and_sigma_follows_the_total_precision() {
+fn a_prior_curvature_joins_the_average_and_sigma_takes_its_positive_part() {
     let host = Device::host();
-    prior_curvature_enters_the_total_precision(&host, &host);
+    prior_curvature_takes_its_positive_part(&host, &host);
     if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
-        prior_curvature_enters_the_total_precision(&wide.with_storage(Storage::F32).expect("CUDA holds f32"), &wide);
-        prior_curvature_enters_the_total_precision(&wide, &wide);
+        prior_curvature_takes_its_positive_part(&wide.with_storage(Storage::F32).expect("CUDA holds f32"), &wide);
+        prior_curvature_takes_its_positive_part(&wide, &wide);
     }
     if cfg!(target_os = "macos")
         && let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault")
     {
-        prior_curvature_enters_the_total_precision(&metal, &metal);
+        prior_curvature_takes_its_positive_part(&metal, &metal);
     }
 }
 
