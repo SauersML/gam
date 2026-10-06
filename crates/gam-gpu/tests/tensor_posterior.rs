@@ -502,6 +502,54 @@ fn removal_sums_against_host(fit: &Device, wide: &Device) {
     assert!((lengths[(1, 1)] - expected_lengths[(1, 1)]).abs() <= bound, "code length {} against {}", lengths[(1, 1)], expected_lengths[(1, 1)]);
 }
 
+/// `group_line_terms` against the five `group_curvature`s it replaces on the same device, for each
+/// axis's case, the gradient and the draw in `draws`'s storage: the direction `d = before − mean`
+/// equal, and each term bit for bit its group curvature's column 1 (the CUDA kernel takes the
+/// entries in the same order).
+fn line_terms_match_the_curvatures(fit: &Device, draws: &Device, wide: &Device) {
+    for axis in AXES {
+        let c = case(axis);
+        let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
+        let groups = fit.group_map(&c.groups, c.mean.dim()).unwrap();
+        let shifted = &c.mean - &matrix(c.mean.nrows(), c.mean.ncols(), 9, 0.05, 0.0);
+        let (gradient, draw) = (draws.upload(c.gradient.view()).unwrap(), draws.upload(c.factor.view()).unwrap());
+        let (curvature, before, mean, log_sd) = (up(&c.moments[1]), up(&c.mean), up(&shifted), up(&c.log_sd));
+        let mut direction = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
+        let mut sums = wide.zeros(c.count, 5).unwrap();
+        fit.group_line_terms((&gradient, &draw, &curvature), (&before, &mean, &log_sd), &groups, (&mut direction, &mut sums)).unwrap();
+        let mut d = fit.copy(&before).unwrap();
+        fit.axpy(&mut d, -1.0, &mean).unwrap();
+        assert_eq!(fit.download(&direction).unwrap(), fit.download(&d).unwrap(), "{} {axis:?}: the direction", fit.name());
+        let mut weighted = fit.zeros(c.mean.nrows(), c.mean.ncols()).unwrap();
+        fit.hadamard(&mut weighted, &curvature, &d, false).unwrap();
+        let terms = wide.download(&sums).unwrap();
+        for (k, x) in [&gradient, &d, &before, &draw, &weighted].into_iter().enumerate() {
+            let mut part = wide.zeros(c.count, 3).unwrap();
+            fit.group_curvature((x, &d, &log_sd), &groups, &mut part).unwrap();
+            let part = wide.download(&part).unwrap();
+            for g in 0..c.count {
+                assert_eq!(terms[(g, k)], part[(g, 1)], "{} {axis:?}: term {k} of group {g}", fit.name());
+            }
+        }
+    }
+}
+
+#[test]
+fn line_terms_are_the_group_curvatures_they_replace() {
+    let host = Device::host();
+    line_terms_match_the_curvatures(&host, &host, &host);
+    if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
+        let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
+        let half = wide.with_storage(Storage::Bf16).expect("CUDA holds bfloat16");
+        line_terms_match_the_curvatures(&narrow, &narrow, &wide);
+        line_terms_match_the_curvatures(&narrow, &half, &wide);
+        line_terms_match_the_curvatures(&wide, &wide, &wide);
+    }
+    if let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault") {
+        line_terms_match_the_curvatures(&metal, &metal, &metal);
+    }
+}
+
 #[test]
 fn removal_sums_on_the_host_match_their_formulas() {
     let host = Device::host();

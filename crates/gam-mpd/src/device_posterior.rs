@@ -431,19 +431,13 @@ impl DevicePosterior {
     }
 
     /// Operator `i`'s direction `d = before − μ` after the kernel's full step, with its terms added
-    /// into `sums` (column 1 per group: `g · d`, `Σ d²`, `μ · d`, `u · d`, `Σ h d²`).
-    fn line_terms(&self, i: usize, before: &Tensor, (gradient, draw): (&Tensor, &Tensor), sums: &mut [Tensor]) -> Result<Tensor, String> {
-        let mut d = self.fitting.copy(before).map_err(error)?;
-        self.fitting.axpy(&mut d, -1.0, &self.mean[i]).map_err(error)?;
-        let mut weighted = self.fitting.empty(d.rows(), d.cols()).map_err(error)?;
-        self.fitting.hadamard(&mut weighted, &self.moments[i][1], &d, false).map_err(error)?;
-        let [along_g, square_sums, along_mean, along_u, diagonal] = sums else { return Err(error("five sums")) };
-        let s = &self.log_sd[i];
-        self.fitting.group_curvature((gradient, &d, s), &self.groups[i], along_g).map_err(error)?;
-        self.fitting.group_curvature((&d, &d, s), &self.groups[i], square_sums).map_err(error)?;
-        self.fitting.group_curvature((before, &d, s), &self.groups[i], along_mean).map_err(error)?;
-        self.fitting.group_curvature((draw, &d, s), &self.groups[i], along_u).map_err(error)?;
-        self.fitting.group_curvature((&weighted, &d, s), &self.groups[i], diagonal).map_err(error)?;
+    /// into `sums` (groups × 5, per group: `g · d`, `Σ d²`, `μ · d` at the step's start, `u · d`,
+    /// `Σ h d²`), in one pass over the operator.
+    fn line_terms(&self, i: usize, before: &Tensor, (gradient, draw): (&Tensor, &Tensor), sums: &mut Tensor) -> Result<Tensor, String> {
+        let mut d = self.fitting.empty(before.rows(), before.cols()).map_err(error)?;
+        self.fitting
+            .group_line_terms((gradient, draw, &self.moments[i][1]), (before, &self.mean[i], &self.log_sd[i]), &self.groups[i], (&mut d, sums))
+            .map_err(error)?;
         Ok(d)
     }
 
@@ -571,7 +565,7 @@ impl DevicePosterior {
         self.steps += 1;
         // The kernel takes IVON's full direction from the iterate kept here.
         let before: Vec<Tensor> = self.mean.iter().map(|m| self.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
-        let mut sums: Vec<Tensor> = (0..5).map(|_| self.wide.zeros(self.group_count(), 3).map_err(error)).collect::<Result<_, _>>()?;
+        let mut sums = self.wide.zeros(self.group_count(), 5).map_err(error)?;
         let mut directions = Vec::with_capacity(before.len());
         for (i, &op) in self.operators.iter().enumerate() {
             let zero = |given: Option<&Tensor>| -> Result<Option<Tensor>, String> {
@@ -594,16 +588,17 @@ impl DevicePosterior {
             // The step's terms along `d`; the iterate waits at the trial step for its measurement
             // (`DevicePosterior::finish_line`), which also averages and refreshes.
             let variances = self.variances()?;
-            let column = |t: &Tensor| -> Result<Vec<f64>, String> { Ok(self.wide.download(t).map_err(error)?.column(1).to_vec()) };
+            let terms = self.wide.download(&sums).map_err(error)?;
+            let column = |k: usize| terms.column(k).to_vec();
             let precision = |g: usize| if variances[g] > 0.0 { 1.0 / (self.tokens * variances[g]) } else { 0.0 };
             let weighted = |values: Vec<f64>| -> f64 { values.iter().enumerate().map(|(g, x)| precision(g) * x).sum() };
-            let along_u: f64 = column(&sums[3])?.iter().sum();
+            let along_u: f64 = column(3).iter().sum();
             let state = LineState {
-                slope_data: scale * column(&sums[0])?.iter().sum::<f64>(),
-                prior_curvature: weighted(column(&sums[1])?),
-                slope_prior: weighted(column(&sums[2])?),
+                slope_data: scale * column(0).iter().sum::<f64>(),
+                prior_curvature: weighted(column(1)),
+                slope_prior: weighted(column(2)),
                 draw_curvature: factor.1 * along_u * along_u,
-                diagonal: column(&sums[4])?.iter().sum(),
+                diagonal: column(4).iter().sum(),
                 before,
                 directions,
             };

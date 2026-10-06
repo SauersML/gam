@@ -2525,6 +2525,74 @@ impl Device {
         }
     }
 
+    /// A line step's direction `d = before − mean` into `direction`, and per group into its row of
+    /// `sums` (groups × 5) the five terms of `d` over the group's live entries (`s ≠ −∞`): `g · d`,
+    /// `d · d`, `before · d`, `u · d` and `Σ h d²`, for the gradient `g`, a draw `u` of the
+    /// Gauss–Newton factor and the curvature `h`; every entry is in the posterior's storage (the
+    /// gradient and the draw may be bfloat16 with f32 masters on CUDA), the sums in float64. One
+    /// pass on CUDA, whose terms are bit for bit [`Device::group_curvature`]'s column 1 of each (the
+    /// same entries in the same order); the Apple GPU makes them so.
+    pub fn group_line_terms(
+        &self,
+        (gradient, draw, curvature): (&Tensor, &Tensor, &Tensor),
+        (before, mean, log_sd): (&Tensor, &Tensor, &Tensor),
+        groups: &GroupMap,
+        (direction, sums): (&mut Tensor, &mut Tensor),
+    ) -> Result<(), GpuError> {
+        groups.check(mean, "group line terms")?;
+        for (t, what) in [(gradient, "gradient"), (draw, "draw"), (curvature, "curvature"), (before, "before"), (log_sd, "log sd")] {
+            same(mean, t, &format!("group line terms {what}"))?;
+        }
+        same(mean, direction, "group line terms direction")?;
+        if sums.cols != 5 {
+            return Err(shape(format!("{:?} sums of five line terms", sums.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (gs, us, hs, bs, ms, ss, ids) = (host(gradient)?, host(draw)?, host(curvature)?, host(before)?, host(mean)?, host(log_sd)?, host_indices(&groups.ids)?);
+                let ds: Vec<f64> = bs.iter().zip(ms).map(|(b, m)| b - m).collect();
+                let totals = host_mut(sums)?;
+                for i in 0..ds.len() {
+                    let g = groups.group(ids, i) as usize;
+                    if g * 5 >= totals.len() {
+                        return Err(shape(format!("group {g} of {}", totals.len() / 5)));
+                    }
+                    if ss[i] == f64::NEG_INFINITY {
+                        continue;
+                    }
+                    let d = ds[i];
+                    totals[5 * g] += gs[i] * d;
+                    totals[5 * g + 1] += d * d;
+                    totals[5 * g + 2] += bs[i] * d;
+                    totals[5 * g + 3] += us[i] * d;
+                    totals[5 * g + 4] += (hs[i] * d) * d;
+                }
+                host_mut(direction)?.copy_from_slice(&ds);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.group_line_terms((gradient, draw, curvature), (before, mean, log_sd), groups, (direction, sums)),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => {
+                // The five group curvatures the line step summed one at a time, each column 1 added
+                // into its column of the sums.
+                *direction = self.copy(before)?;
+                self.axpy(direction, -1.0, mean)?;
+                let d: &Tensor = direction;
+                let mut weighted = self.empty(mean.rows, mean.cols)?;
+                self.hadamard(&mut weighted, curvature, d, false)?;
+                for (k, x) in [gradient, d, before, draw, &weighted].into_iter().enumerate() {
+                    let mut part = self.zeros(sums.rows, 3)?;
+                    self.group_curvature((x, d, log_sd), groups, &mut part)?;
+                    let mut column = self.columns_of(sums, k..k + 1)?;
+                    self.axpy(&mut column, 1.0, &self.columns_of(&part, 1..2)?)?;
+                    self.set_columns(sums, k, &column)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// The code length in nats of the groups' posteriors, added into row `slot` of `sums` (rows × 3,
     /// as [`Device::group_moments`] lays its rows out): `(n, Σ_g w_g (d_g + c_g + ln 2 · δ_g), 0)`
     /// over the groups `g` with weight `w_g ≠ 0` (`n` their count), `d_g` the divergence
@@ -3868,6 +3936,67 @@ extern "C" __global__ void group_curvature_f32(u64 n, u64 cols, unsigned int axi
 
 extern "C" __global__ void group_curvature_f32_bf16(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, const unsigned short* factor, const float* mean, const float* log_sd, const unsigned int* groups, double* sums) {
     group_curvature_body<float, unsigned short>(n, cols, axis, chunks, count, factor, mean, log_sd, groups, sums);
+}
+
+// `Device::group_line_terms`: each entry's direction d = before − mean into `direction`, and each
+// live entry's (g d, d d, before d, u d, (h d) d) into its group's row of `sums` (groups × 5). The
+// segments go as `group_reduce` takes them (a block per segment, each thread every BLOCK-th entry
+// in order, shuffles in a fixed order, the warps in order), so each term is bit for bit the
+// `group_curvature` column 1 it replaces; a segment of a group at or beyond `count` writes its
+// directions and adds nothing.
+template <typename T, typename G>
+__device__ void group_line_terms_body(u64 n, u64 cols, unsigned int axis, u64 segments, const unsigned int* layout, u64 count,
+    const G* gradient, const G* draw, const T* curvature, const T* before, const T* mean, const T* log_sd, T* direction, double* sums) {
+    __shared__ double partial[5][BLOCK / 32];
+    const u64 rows = cols > 0 ? n / cols : 0;
+    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    for (u64 s = blockIdx.x; s < segments; s += gridDim.x) {
+        unsigned int g = layout[segments + 1 + s];
+        u64 off = layout[s], size = (u64)layout[s + 1] - off;
+        u64 length = axis == 0u ? size * cols : (axis == 1u ? size * rows : size);
+        const unsigned int* members = layout + 2 * segments + 1 + off;
+        double v[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+        for (u64 k = threadIdx.x; k < length; k += blockDim.x) {
+            u64 i = axis == 0u ? (u64)members[k / cols] * cols + k % cols : (axis == 1u ? (k / size) * cols + members[k % size] : (u64)members[k]);
+            T d = before[i] - mean[i];
+            direction[i] = d;
+            if (log_sd[i] == (T)NEG_INF) continue;
+            double dd = (double)d;
+            v[0] += (double)entry_load(gradient[i]) * dd;
+            v[1] += dd * dd;
+            v[2] += (double)before[i] * dd;
+            v[3] += (double)entry_load(draw[i]) * dd;
+            v[4] += (double)(curvature[i] * d) * dd;
+        }
+        if (g >= count) continue;
+        for (int o = 16; o > 0; o >>= 1)
+            for (int t = 0; t < 5; t++) v[t] += __shfl_down_sync(0xffffffffu, v[t], o);
+        if (lane == 0)
+            for (int t = 0; t < 5; t++) partial[t][warp] = v[t];
+        __syncthreads();
+        if (threadIdx.x == 0)
+            for (int t = 0; t < 5; t++) {
+                double total = 0.0;
+                for (unsigned int w = 0; w < blockDim.x / 32u; w++) total += partial[t][w];
+                sums[5 * (u64)g + t] += total;
+            }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void group_line_terms_f64(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, const double* gradient, const double* draw, const double* curvature,
+    const double* before, const double* mean, const double* log_sd, const unsigned int* groups, double* direction, double* sums) {
+    group_line_terms_body<double, double>(n, cols, axis, chunks, groups, count, gradient, draw, curvature, before, mean, log_sd, direction, sums);
+}
+
+extern "C" __global__ void group_line_terms_f32(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, const float* gradient, const float* draw, const float* curvature,
+    const float* before, const float* mean, const float* log_sd, const unsigned int* groups, float* direction, double* sums) {
+    group_line_terms_body<float, float>(n, cols, axis, chunks, groups, count, gradient, draw, curvature, before, mean, log_sd, direction, sums);
+}
+
+extern "C" __global__ void group_line_terms_f32_bf16(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, const unsigned short* gradient, const unsigned short* draw, const float* curvature,
+    const float* before, const float* mean, const float* log_sd, const unsigned int* groups, float* direction, double* sums) {
+    group_line_terms_body<float, unsigned short>(n, cols, axis, chunks, groups, count, gradient, draw, curvature, before, mean, log_sd, direction, sums);
 }
 
 // `Device::group_code_length`, first stage: block b sums groups b·BLOCK .. (b + 1)·BLOCK, one per
@@ -5546,6 +5675,35 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).input(factor, factors)?.input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(&groups.layout)?).arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers, checked by the caller; float64 sums of `count` rows.
             unsafe { builder.launch(cfg_elements(groups.blocks() as u64)) }.gpu_ctx("tensor group_curvature").map(|_| ())
+        }
+
+        pub(super) fn group_line_terms(
+            &self,
+            (gradient, draw, curvature): (&Tensor, &Tensor, &Tensor),
+            (before, mean, log_sd): (&Tensor, &Tensor, &Tensor),
+            groups: &super::GroupMap,
+            (direction, sums): (&mut Tensor, &mut Tensor),
+        ) -> Result<(), GpuError> {
+            let (n, storage, draws) = (mean.len() as u64, mean.storage(), gradient.storage());
+            if draw.storage() != draws {
+                return Err(shape(format!("a {draws:?} gradient with a {:?} Gauss–Newton factor", draw.storage())));
+            }
+            let f = match (storage, draws) {
+                (Storage::F32, Storage::Bf16) => self.function("group_line_terms_f32_bf16")?,
+                (masters, g) if masters == g => self.posterior_kernel("group_line_terms", storage)?,
+                (masters, g) => return Err(shape(format!("{masters:?} masters with a {g:?} gradient"))),
+            };
+            let count = sums.rows as u64;
+            let (cols, axis, chunks) = (groups.cols as u64, groups.code(), groups.chunks() as u64);
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).input(gradient, draws)?.input(draw, draws)?;
+            for t in [curvature, before, mean, log_sd] {
+                builder.input(t, storage)?;
+            }
+            builder.arg(index_slice(&groups.layout)?).output(direction, storage)?.arg(slice_mut(sums)?);
+            // SAFETY: equal-length entry buffers in their storages, checked by the caller and
+            // `input`; float64 sums of `count` rows of five.
+            unsafe { builder.launch(cfg_elements(groups.blocks() as u64)) }.gpu_ctx("tensor group_line_terms").map(|_| ())
         }
 
         pub(super) fn group_code_length(
