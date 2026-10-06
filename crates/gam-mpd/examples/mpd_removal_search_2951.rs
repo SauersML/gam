@@ -6,7 +6,8 @@
 //! EXPORT SETTINGS.json CHECKPOINT OUT host|gpu
 //!
 //! `EXPORT` and `SETTINGS.json` are the fit's (`mpd_library_mdl_2951`, an engine export);
-//! `CHECKPOINT` is its `checkpoint.bin` (or a copy), or `start` for the posterior a fresh fit starts
+//! `CHECKPOINT` is its `checkpoint.bin` (or a copy, beside its `.json`; a sharing fit's with no
+//! candidates is this explanation's), or `start` for the posterior a fresh fit starts
 //! from (`library_mdl::start_posterior`). `OUT` receives `REPORT.json`, the search's
 //! log (`ranked.removals.jsonl`) and `M`'s targets (`targets/`). With a sixth argument, group sets
 //! (`;` between sets, `,` between groups), each set is removed alone without and with compensation
@@ -82,6 +83,13 @@ fn main() -> Result<(), String> {
         library_mdl::start_posterior(&device, &native, &explanation, &train, &settings.fit)?
     } else {
         library_mdl::check_checkpoint(checkpoint, &library_mdl::identity(&settings.export_sha256, &native, &explanation, &train, held))?;
+        // A sharing fit's checkpoint (`mpd_library_sharing_2951`) holds its mixture's state: with no
+        // candidates its prior is the groups' Gaussian, this explanation's; with candidates it is
+        // another prior, which this step does not charge.
+        let progress: serde_json::Value = serde_json::from_slice(&std::fs::read(checkpoint.with_extension("json")).map_err(error)?).map_err(error)?;
+        if progress["prior"]["width"].as_u64().is_some_and(|width| width > 0) {
+            return Err("a checkpoint of a sharing fit with candidates: its prior is not the groups' Gaussian".into());
+        }
         library_mdl::checkpoint_posterior(&explanation, checkpoint)?
     };
     std::fs::create_dir_all(out).map_err(error)?;

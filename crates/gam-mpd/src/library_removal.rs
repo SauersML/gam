@@ -64,17 +64,20 @@
 //! # The search
 //!
 //! The ranked units are taken in segments, each on top of the removals accepted so far. A segment
-//! starts with the predicted-safe set, every remaining unit predicted to lower `F`, proposed whole;
-//! on rejection the proposal halves (the first `n/2`, `n/4`, … units) until one is accepted, then
-//! bisection between the longest accepted and the shortest rejected prefix. The longest accepted
-//! prefix is removed; the unit after it is the one the segment ended on, its own effect being the
-//! difference of the two prefixes (a single-unit test), and it is kept; the next segment starts
-//! after it, again with the whole remaining safe set. A segment over `n` safe units costs at most
-//! `log2 n + 3` evaluations, one when the whole set is accepted. Each proposal also removes the
-//! groups it leaves without effect. Once no unit predicted to lower `F` remains, the rest are
-//! proposed whole and then by prefixes of length 1, 3, 7, … until one is rejected (with bisection
-//! as above); when neither the whole nor the first alone is accepted the round ends, and the units
-//! after the first are counted as tested only jointly (`Removal::untested`).
+//! proposes every remaining unit whole; on rejection the proposal halves (the first `n/2`, `n/4`,
+//! … units) until one is accepted, then bisects between the longest accepted and the shortest
+//! rejected prefix. The longest accepted prefix is removed; the unit after it is the one the
+//! segment ended on, its own effect being the difference of the two prefixes (a single-unit test),
+//! and it is kept; the next segment starts after it. A segment over `n` units costs at most
+//! `log2 n + 3` evaluations, and a rejection of a large set is settled after a few batches (below).
+//! Each proposal also removes the groups it leaves without effect. When the whole, every half and
+//! the first unit alone are rejected and no remaining unit is estimated to lower `F`, the round
+//! ends, and the units after the first are counted as tested only jointly (`Removal::untested`).
+//! Beyond that end of the ranking, the units' estimates decide no proposal: a set's second-order
+//! estimate grows with its size where the data term saturates
+//! (on vpd4l at the Laplace start, N = 2^16, sets of 1,000 or more units were estimated at +0.5M to
+//! +13M bits and measured at −0.5M to −0.9M), so how far a segment reaches rests on the measured
+//! paired sums alone.
 //!
 //! Every evaluation is `F` on the fixed collection at one common weight sample per batch, with the
 //! MLPs that lose functions compensated by least squares when compensation is on
@@ -974,10 +977,6 @@ pub fn round(
     units.sort_by(|a, b| a.predicted.total_cmp(&b.predicted));
     let mut rest: &[Unit] = &units;
     while !rest.is_empty() {
-        // The predicted-safe set: the leading units predicted to lower `F`. Without one, the
-        // units predicted not to lower `F` are proposed whole, then from the first alone.
-        let safe = rest.iter().take_while(|u| u.predicted < 0.0).count();
-        let tail = safe == 0;
         let base: &Posterior = posterior;
         // The groups of the first `k` units still active, with those their removal leaves
         // without effect.
@@ -1032,7 +1031,8 @@ pub fn round(
             }
             Ok(accepted)
         };
-        let accepted = if tail { gallop(rest.len(), true, &mut test)? } else { gallop_down(safe, &mut test)? };
+        // Every remaining unit, then halves, then bisection: the measured paired sums decide.
+        let accepted = gallop_down(rest.len(), &mut test)?;
         // The change of `F` from the accepted prefix (complete) to the next length, on the batches
         // both scored, exact when the next length's evaluation is complete (before the accepted
         // prefix's evaluation is taken).
@@ -1053,13 +1053,11 @@ pub fn round(
         if accepted == rest.len() {
             break;
         }
-        if !tail && accepted == safe {
-            rest = &rest[safe..];
-            continue;
-        }
         // The unit the segment ended on: its own effect on top of the accepted prefix.
         let (marginal, complete) = blocked.ok_or_else(|| error("a segment ended on an untested unit"))?;
         let blocked = &rest[accepted];
+        // Nothing accepted, and the ranking holds no unit estimated to lower `F` from here on.
+        let exhausted = accepted == 0 && blocked.predicted >= 0.0;
         singles.push((blocked.groups[0], marginal / LN_2));
         journal.write(json!({
             "event": "proposal", "kind": "blocked", "units": 1, "groups": blocked.groups, "layers": names(&blocked.groups),
@@ -1069,9 +1067,9 @@ pub fn round(
         while rest.first().is_some_and(|u| u.groups.iter().all(|g| !posterior.active[*g])) {
             rest = &rest[1..];
         }
-        if tail && accepted == 0 {
+        if exhausted {
             untested = rest.len();
-            journal.write(json!({"event": "end", "untested_units": untested, "reason": "the units predicted not to lower F were rejected whole and the first of them alone"}))?;
+            journal.write(json!({"event": "end", "untested_units": untested, "reason": "the remaining units, none estimated to lower F, were rejected whole, in halves and the first alone"}))?;
             break;
         }
     }
@@ -1081,46 +1079,6 @@ pub fn round(
         "before_bits": before / LN_2, "after_bits": current / LN_2, "evaluations": evaluations.len(), "seconds": started.elapsed().as_secs_f64(),
     }))?;
     Ok(Removal { candidates, removed, dead: dead_removed, before_bits: before / LN_2, after_bits: current / LN_2, evaluations, singles, untested })
-}
-
-/// The longest accepted prefix of `n` units found by testing the whole (when `whole`), then lengths
-/// 1, 3, 7, … until one is rejected, then bisection between the longest accepted and the shortest
-/// rejected length; `test(k, kind)` evaluates the prefix of length `k`.
-fn gallop(n: usize, whole: bool, test: &mut impl FnMut(usize, &str) -> Result<bool, String>) -> Result<usize, String> {
-    if n == 0 {
-        return Ok(0);
-    }
-    if whole && test(n, "whole")? {
-        return Ok(n);
-    }
-    // `low` is accepted (or empty) and `high` rejected, or untested when it is `n` without `whole`.
-    let (mut low, mut high, mut step) = (0, n, 1);
-    let rejected = whole;
-    loop {
-        let next = (low + step).min(high);
-        if next == high && rejected {
-            break;
-        }
-        if test(next, "gallop")? {
-            low = next;
-            step *= 2;
-            if low == high {
-                return Ok(low);
-            }
-        } else {
-            high = next;
-            break;
-        }
-    }
-    while high - low > 1 {
-        let middle = low + (high - low) / 2;
-        if test(middle, "bisect")? {
-            low = middle;
-        } else {
-            high = middle;
-        }
-    }
-    Ok(low)
 }
 
 /// The longest accepted prefix of `n` units found by testing the whole, then halving the length
@@ -1544,17 +1502,6 @@ mod tests {
     fn the_searches_find_a_monotone_boundary_in_logarithmically_many_evaluations() {
         for n in [1, 2, 7, 1000] {
             for boundary in [0, 1, n / 2, n - 1, n] {
-                for whole in [true, false] {
-                    let mut tested = 0;
-                    let found = gallop(n, whole, &mut |k, _| {
-                        tested += 1;
-                        Ok(k <= boundary)
-                    })
-                    .unwrap();
-                    assert_eq!(found, boundary, "n {n}, whole {whole}");
-                    let bound = 2 * (usize::BITS - boundary.max(1).leading_zeros()) as usize + 2;
-                    assert!(tested <= bound, "{tested} evaluations for the boundary {boundary} of {n}");
-                }
                 let mut tested = 0;
                 let found = gallop_down(n, &mut |k, _| {
                     tested += 1;
@@ -1566,7 +1513,6 @@ mod tests {
                 assert!(boundary < n || tested == 1, "the whole set took {tested} evaluations");
             }
         }
-        assert!(gallop(1, true, &mut |_, _| Err("nonfinite".into())).is_err());
         assert!(gallop_down(1, &mut |_, _| Err("nonfinite".into())).is_err());
     }
 }
