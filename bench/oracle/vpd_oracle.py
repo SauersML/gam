@@ -57,6 +57,9 @@ trained layers on held-out texts.
                       [--heldout-layers 2] [--examples 65536] [--batch 16] [--lr 1e-4] [--lora-rank 64]
   vpd_oracle.py evaluate --run DIR --labels HELDOUT --relations HELDOUT_REL --uv UV [--examples 4096]
   vpd_oracle.py compare --runs DIR... --eval eval_<labels>.jsonl --out SUMMARY.json
+  vpd_oracle.py check --base MODEL --labels TRAIN --uv UV [--lens LENS] [--condition weights_lens] [--steps 40]
+      the training pipeline's check: every layer's adapter gets a gradient, and 16 fixed questions are
+      fitted to a mean loss below 0.01 nats (on vpd4l with Qwen3-0.6B: 0.0001 by step 26, the Mac)
 """
 
 from __future__ import annotations
@@ -631,6 +634,36 @@ def train(args):
     print(json.dumps({"condition": args.condition, "steps": args.steps, "seconds": time.time() - started, "last_loss": float(loss.detach())}))
 
 
+def check(args):
+    """The training pipeline's check (see the module's usage): a reader that cannot fit 16 questions it
+    sees every step, or whose adapter misses a layer's gradient, has a bug (prompt, scored position,
+    answer tokens, injection or optimizer), whatever the questions ask."""
+    dev = device()
+    torch.manual_seed(args.seed)
+    table = table_of(args)
+    batch = examples(table, set(table.layers), 16, args.seed, per_component=4, only=("direction",))
+    oracle = Oracle(args.base, 64, 1, dev, table.dims, table.depth)
+    oracle.model.base_model.model.gradient_checkpointing_enable()
+    oracle.model.base_model.model.config.use_cache = False
+    oracle.model.train()
+    optimizer = torch.optim.AdamW(oracle.trainable(), lr=1e-4, weight_decay=0.0)
+    losses = []
+    for step in range(args.steps):
+        log_q, valid = oracle.log_q(table, batch, args.condition)
+        loss = -log_scores(log_q, valid, batch).mean()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        oracle.hook.set(None)
+        if step == 0:
+            missing = sorted({n.split("layers.")[1].split(".")[0] for n, p_ in oracle.model.named_parameters() if p_.requires_grad and "lora_B" in n and (p_.grad is None or float(p_.grad.norm()) == 0.0)})
+            assert not missing, f"layers whose adapter gets no gradient: {missing}"
+        torch.nn.utils.clip_grad_norm_(oracle.trainable(), 1.0)
+        optimizer.step()
+        losses.append(float(loss.detach()))
+    print(json.dumps({"losses": [round(x, 4) for x in losses]}))
+    assert min(losses[-5:]) < 0.01, f"16 fixed questions not fitted: last losses {losses[-5:]}"
+
+
 @torch.no_grad()
 def evaluate(args):
     dev = device()
@@ -725,12 +758,21 @@ def main():
     e = sub.choices["evaluate"]
     e.add_argument("--run", required=True)
     e.add_argument("--examples", type=int, default=4096)
+    k = sub.add_parser("check")
+    for a in ("--base", "--labels", "--uv"):
+        k.add_argument(a, required=True)
+    for a in ("--relations", "--lens", "--feature-examples", "--transcoders"):
+        k.add_argument(a)
+    k.add_argument("--tokenizer", default=str(TOKENIZER))
+    k.add_argument("--condition", default="weights_lens", choices=CONDITIONS)
+    k.add_argument("--steps", type=int, default=40)
+    k.add_argument("--seed", type=int, default=0)
     c = sub.add_parser("compare")
     c.add_argument("--runs", nargs="+", required=True)
     c.add_argument("--eval", required=True, help="the evaluation file name inside each run, eval_<labels dir name>.jsonl")
     c.add_argument("--out", required=True)
     args = ap.parse_args()
-    {"train": train, "evaluate": evaluate, "compare": compare}[args.command](args)
+    {"train": train, "evaluate": evaluate, "compare": compare, "check": check}[args.command](args)
 
 
 if __name__ == "__main__":
