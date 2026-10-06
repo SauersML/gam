@@ -2395,7 +2395,7 @@ struct Charged {
 }
 
 impl Charged {
-    /// With `causal` the network's attention is causal ([`importance_model`]); its Laplace pass
+    /// With `causal` the network's attention is causal (`importance_model`); its Laplace pass
     /// still reads `M`'s activations.
     fn new(vpd: &Vpd, export: &Path, decomposition: &Path, (program, hidden_node): (&mut DeviceProgram, usize), batches: &[&[Vec<u32>]], head: &Tensor, (tokens, seed, causal): (f64, u64, bool)) -> Result<Self, String> {
         let device = program.device().clone();
@@ -2661,7 +2661,7 @@ pub fn vpd_mask_sources(vpd: &Vpd, export: &Path, decomposition: &Path, held_out
 /// records: the subcomponents whose mask is on (above zero) at `t` in either run and the number
 /// that flip; `KL(M ‖ VPD)` at `t` in bits under each run's masks; and `log₂ p_VPD` of the true
 /// next token at `t` under each. The same is measured with the network's attention causal
-/// ([`importance_model`]), the control, where both runs' masks at `t` must agree exactly.
+/// (`importance_model`), the control, where both runs' masks at `t` must agree exactly.
 pub fn vpd_lookahead(vpd: &Vpd, export: &Path, decomposition: &Path, held_out: &[Vec<u32>], (batch, cuts, seeds, seed): (usize, usize, usize, u64), numeric_bytes: usize) -> Result<Value, String> {
     let d = vpd.e.program.device().clone();
     let (causal, causal_outputs) = {

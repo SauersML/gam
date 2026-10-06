@@ -53,7 +53,7 @@
 //! through which they reach the parameters as the copied rows' own computation would. At an
 //! attention block the call runs as segments (`device_attention::Segment`,
 //! `DeviceProgram::forward_span_segments`): a suffix lane's queries read the keys and values of its
-//! positions before `t₀` from its twin's rows in the same call ([`Plan::before`]), and their
+//! positions before `t₀` from its twin's rows in the same call (`Plan::before`), and their
 //! cotangents go to those rows.
 //!
 //! A block's reverse needs its forward's tape (the block's intermediate values), which holds many

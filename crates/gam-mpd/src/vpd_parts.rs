@@ -128,7 +128,7 @@ impl VpdPart {
     }
 
     /// The derivative of [`VpdPart::edit`] in the read along `dx`, `J(x) dx`, with `h'` the hidden
-    /// activations' tangent ([`Mlp::hidden_tangent`], the product rule for a gated MLP): for a
+    /// activations' tangent (`Mlp::hidden_tangent`, the product rule for a gated MLP): for a
     /// slice of `W_down`, `(α − 1)(v·h'(z; W_fc dx)) u`; for a slice of `W_fc`,
     /// `W_down[h'(z'; W_fc dx + (α − 1)(v·dx) u) − h'(z; W_fc dx)]` (`z`, `z'` as in
     /// [`VpdPart::pullback`]).
@@ -146,7 +146,7 @@ impl VpdPart {
     }
 
     /// The pullback of [`VpdPart::edit`] in the read: `J(x)ᵀ ḡ` for the output's cotangent `ḡ`,
-    /// the transpose of [`VpdPart::tangent`] ([`Mlp::hidden_pullback`]): for a slice of `W_down`,
+    /// the transpose of [`VpdPart::tangent`] (`Mlp::hidden_pullback`): for a slice of `W_down`,
     /// the hidden activations' cotangent is `(α − 1)(u·ḡ) v`; for a slice of `W_fc`, with
     /// `z' = z + (α − 1)(v·x) u` and `r = W_downᵀ ḡ`, the pullback of `r` at `z'` less that at `z`,
     /// plus `(α − 1)(u·ρ) v` with `ρ` the pre-activations' cotangent at `z'`.
