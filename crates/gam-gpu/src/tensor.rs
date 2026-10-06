@@ -6609,7 +6609,7 @@ kernel void t_group_curvature(device const float* factor [[buffer(0)]], device c
 
 // `Device::group_code_length`, one thread per group, every one into row `p.count`.
 kernel void t_group_code_length(device const float* divergence [[buffer(0)]], device const float* variance [[buffer(1)]], device const float* weight [[buffer(2)]],
-                                device const float* constant [[buffer(3)]], device const float* initial [[buffer(4)]], device float* sums [[buffer(5)]],
+                                device const float* constants [[buffer(3)]], device const float* initial [[buffer(4)]], device float* sums [[buffer(5)]],
                                 constant Posterior& p [[buffer(6)]], uint i [[thread_position_in_grid]]) {
     bool live = i < p.n && weight[i] != 0.0f;
     float b = 0.0f;
@@ -6623,7 +6623,7 @@ kernel void t_group_code_length(device const float* divergence [[buffer(0)]], de
             uint prefix = 31u - clz(low + 1u);
             bits = float(low + 2u * prefix + 1u);
         }
-        b = weight[i] * (divergence[i] + constant[i] + 0.6931471805599453f * bits);
+        b = weight[i] * (divergence[i] + constants[i] + 0.6931471805599453f * bits);
     }
     group_add(sums, p.count, live, live ? 1.0f : 0.0f, b, 0.0f);
 }
