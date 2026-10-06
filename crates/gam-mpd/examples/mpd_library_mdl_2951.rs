@@ -206,6 +206,45 @@ struct EditSettings {
     /// The most bytes of operator values each program holds on the device.
     numeric_bytes: usize,
     name: String,
+    /// When set, nothing is scored: the explanation's parts (its transcoder features at the
+    /// scored posterior mean) are written to `OUT/{functions}` in the oracle's names
+    /// (`bench/oracle`): per layer `l` with parts, `h.{l}.mlp.function.U` [C, d] (the writes),
+    /// `.V` [d, C] (the reads), `.bias` [C] and `.index` [C] (each part's row in the layer's
+    /// operators, its transcoder feature through the kept file), in float32.
+    #[serde(default)]
+    functions: Option<String>,
+}
+
+/// The parts in the oracle's names (`EditSettings::functions`), a safetensors file.
+fn write_functions(parts: &[interchange::Part], path: &Path) -> Result<(), String> {
+    let mut by_layer: BTreeMap<usize, Vec<&interchange::Part>> = BTreeMap::new();
+    for part in parts {
+        by_layer.entry((part.block - 1) / 2).or_default().push(part);
+    }
+    let floats = |values: &mut dyn Iterator<Item = f64>| -> Vec<u8> { values.flat_map(|v| (v as f32).to_le_bytes()).collect() };
+    let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+    for (l, chosen) in &by_layer {
+        let (c, d) = (chosen.len(), chosen[0].write.len());
+        let name = format!("h.{l}.mlp.function");
+        tensors.push((format!("{name}.U"), vec![c, d], floats(&mut chosen.iter().flat_map(|p| p.write.iter().copied()))));
+        tensors.push((format!("{name}.V"), vec![d, c], floats(&mut (0..d).flat_map(|j| chosen.iter().map(move |p| p.read[j])))));
+        tensors.push((format!("{name}.bias"), vec![c], floats(&mut chosen.iter().map(|p| p.bias))));
+        tensors.push((format!("{name}.index"), vec![c], floats(&mut chosen.iter().map(|p| p.index as f64))));
+    }
+    let mut header = serde_json::Map::new();
+    let mut offset = 0usize;
+    for (name, shape, data) in &tensors {
+        header.insert(name.clone(), json!({"dtype": "F32", "shape": shape, "data_offsets": [offset, offset + data.len()]}));
+        offset += data.len();
+    }
+    let mut text = Value::Object(header).to_string().into_bytes();
+    while text.len() % 8 != 0 {
+        text.push(b' ');
+    }
+    let mut bytes = (text.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(&text);
+    tensors.iter().for_each(|(_, _, data)| bytes.extend_from_slice(data));
+    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Edit faithfulness (module note): per family the bits per token of `KL(M_e ‖ P_e)`.
@@ -231,8 +270,12 @@ fn edit_faithfulness(
         }
         None => explanation.artifact.clone(),
     };
-    let mut experiments = interchange::Interchange::new(device, native, layers, &artifact, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     let parts = interchange::parts_of(&artifact.program, layers.len())?;
+    if let Some(file) = &settings.functions {
+        log::info!("edits: {} parts written to {file}", parts.len());
+        return write_functions(&parts, &out.join(file));
+    }
+    let mut experiments = interchange::Interchange::new(device, native, layers, &artifact, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     let count = parts.len();
     experiments.set_parts(parts.clone())?;
     log::info!("edits: {count} parts, {} held-out sequences, {:.0} s to compile", end - first, started.elapsed().as_secs_f64());
@@ -262,22 +305,41 @@ fn edit_faithfulness(
             entry.1.extend(bits.first());
             entry.2 += 1;
         }
-        batches.push((batch, drawn, scored.bits));
+        batches.push((b, batch, drawn, scored.bits));
         log::info!("edits: batch {b} scored ({:.0} s)", started.elapsed().as_secs_f64());
     }
     // The edits' effect on M, KL(M_e ‖ M), over the same tokens: the same experiments with P = M
     // applying no edit.
     drop(experiments);
     let mut reference = interchange::Interchange::new(device, native, layers, &gam_mpd::artifact::Artifact::native(native)?, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
-    reference.set_parts(parts)?;
+    reference.set_parts(parts.clone())?;
     reference.unedited_explanation();
     // An edit's evidence grows with how much it moves M: per family, the gaps of the edits whose
     // effect at the edited token KL(M_e ‖ M) falls in each bin (bits).
     const BINS: [f64; 3] = [0.01, 0.1, 1.0];
     let mut effects: BTreeMap<&str, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
     let mut binned: BTreeMap<(&str, usize), (Vec<f64>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
-    for (batch, drawn, gaps) in &batches {
+    // Per experiment (one JSON line each): its held-out sequence, edited position, family, parts
+    // as (layer, row in the layer), factor, effect at the edited token and gap there, so another
+    // implementation of the same edit (bench/oracle/qwen_labels.py) can be checked against it.
+    let part_of = |i: &usize| parts.get(*i).map(|p| json!([(p.block - 1) / 2, p.index]));
+    let mut records = String::new();
+    for (b, batch, drawn, gaps) in &batches {
         for ((e, bits), gap) in drawn.iter().zip(&reference.evaluate(batch, drawn, false)?.bits).zip(gaps) {
+            let (chosen, factor): (Vec<usize>, Option<usize>) = match &e.patch {
+                Some(interchange::Patch::Part { part, factor }) => (vec![*part], Some(*factor)),
+                Some(interchange::Patch::PartFrom { part, factor }) => (vec![*part], Some(*factor)),
+                Some(interchange::Patch::Parts { parts: chosen, factor }) => (chosen.clone(), Some(*factor)),
+                Some(interchange::Patch::Swap { part }) => (vec![*part], None),
+                Some(interchange::Patch::Cut { from, to }) => (vec![*from, *to], None),
+                _ => (Vec::new(), None),
+            };
+            records.push_str(&json!({
+                "sequence": first + b * settings.batch_sequences + e.base, "position": e.position, "family": family(e),
+                "parts": chosen.iter().filter_map(part_of).collect::<Vec<_>>(), "factor": factor.and_then(|f| interchange::FACTORS.get(f).copied()),
+                "effect_bits_at_edited_token": bits.first(), "gap_bits_at_edited_token": gap.first(),
+            }).to_string());
+            records.push('\n');
             let entry = effects.entry(family(e)).or_default();
             entry.0.extend_from_slice(bits);
             entry.1.extend(bits.first());
@@ -289,6 +351,7 @@ fn edit_faithfulness(
             entry.2.push(at);
         }
     }
+    std::fs::write(out.join(format!("EDITS_{}.experiments.jsonl", settings.name)), records).map_err(|e| e.to_string())?;
     let summary = |values: &mut Vec<f64>| {
         values.sort_by(f64::total_cmp);
         let mean = values.iter().sum::<f64>() / values.len().max(1) as f64;

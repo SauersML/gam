@@ -703,8 +703,8 @@ fn random_parts(width: usize, seed: u64) -> Vec<Part> {
     let mut vector = |scale: f64| (0..width).map(|_| scale * (rng.random::<f64>() - 0.5)).collect::<Vec<f64>>();
     let mut out = Vec::new();
     for block in [1, 3] {
-        for bias in [1.0, -100.0] {
-            out.push(Part { block, read: vector(0.2), bias, write: vector(2.0) });
+        for (index, bias) in [1.0, -100.0].into_iter().enumerate() {
+            out.push(Part { block, index, read: vector(0.2), bias, write: vector(2.0) });
         }
     }
     out
@@ -1166,7 +1166,7 @@ fn the_reverse_of_every_edit_is_the_transpose_of_its_tangent() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(11);
     let mut random = |rows: usize, cols: usize, scale: f64| A::from_shape_fn((rows, cols), |_| scale * (rng.random::<f64>() - 0.5));
     // Parts that fire on the random reads (bias 1, small reads) and a large write for the cut's source.
-    let parts: Vec<Part> = [1usize, 1, 3].iter().map(|b| Part { block: *b, read: random(1, width, 0.2).row(0).to_vec(), bias: 1.0, write: random(1, width, 2.0).row(0).to_vec() }).collect();
+    let parts: Vec<Part> = [1usize, 1, 3].iter().enumerate().map(|(index, b)| Part { block: *b, index, read: random(1, width, 0.2).row(0).to_vec(), bias: 1.0, write: random(1, width, 2.0).row(0).to_vec() }).collect();
     x.set_parts(parts.clone()).expect("the parts");
     let (m, _) = x.models();
     let sites = m.part_sites().expect("M's edit sites");

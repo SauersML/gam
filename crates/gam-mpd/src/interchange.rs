@@ -308,6 +308,8 @@ impl Patch {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Part {
     pub block: usize,
+    /// Its row in its block's feature operators (the library's function index in the layer).
+    pub index: usize,
     pub read: Vec<f64>,
     pub bias: f64,
     pub write: Vec<f64>,
@@ -338,7 +340,7 @@ pub fn parts_of(program: &OperatorProgram, layers: usize) -> Result<Vec<Part>, S
         for i in 0..gate.nrows() {
             let u = write.column(i);
             if u.iter().any(|v| *v != 0.0) {
-                out.push(Part { block: 2 * l + 1, read: gate.row(i).to_vec(), bias: bias[[i, 0]], write: u.to_vec() });
+                out.push(Part { block: 2 * l + 1, index: i, read: gate.row(i).to_vec(), bias: bias[[i, 0]], write: u.to_vec() });
             }
         }
     }
