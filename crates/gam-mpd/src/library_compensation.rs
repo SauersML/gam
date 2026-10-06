@@ -31,10 +31,7 @@ use crate::{
     operator_program::{Node, OperatorProgram},
     run_check::LayerNodes,
 };
-use gam_gpu::{
-    gpu_error::GpuError,
-    tensor::{Arithmetic, Op, Storage},
-};
+use gam_gpu::{gpu_error::GpuError, tensor::Storage};
 use gam_linalg::{decompose::eigh, faer_ndarray::fast_ata, roundoff::SymmetricAssembly};
 use ndarray::{Array2, Axis};
 use std::collections::{BTreeMap, BTreeSet};
@@ -165,7 +162,7 @@ impl Compensation {
                 match (&wide, sum) {
                     (Some(wide), Some(sum)) => {
                         let h = wide.convert(h).map_err(error)?;
-                        wide.gemm(sum, 1.0, &h, Op::T, &h, Op::N, 1.0, Arithmetic::F64).map_err(error)?;
+                        wide.gram_lower(sum, &h, 1.0).map_err(error)?;
                     }
                     _ => mlp.gram += &fast_ata(&device.download(h).map_err(error)?),
                 }
@@ -175,7 +172,7 @@ impl Compensation {
         if let Some(wide) = &wide {
             for (mlp, sum) in mlps.iter_mut().zip(&sums) {
                 let gram = wide.download(sum.as_ref().ok_or_else(|| error("a Gram sum missing"))?).map_err(error)?;
-                // The product's two triangles are separate sums; mirror the lower one.
+                // The update sums the lower triangle; mirror it.
                 mlp.gram = Array2::from_shape_fn(gram.dim(), |(i, j)| if i >= j { gram[[i, j]] } else { gram[[j, i]] });
             }
         }

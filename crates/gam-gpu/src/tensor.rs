@@ -866,6 +866,32 @@ impl Device {
         }
     }
 
+    /// The lower triangle (row-major, `i ≥ j`) of `c ← aᵀ a + β c` in float64, `a` rows × n and `c`
+    /// n × n: a symmetric rank-k update, half a product's work; `c`'s strict upper triangle is
+    /// left as it was. Float64 storage only (CUDA, the host).
+    pub fn gram_lower(&self, c: &mut Tensor, a: &Tensor, beta: f64) -> Result<(), GpuError> {
+        if c.dim() != (a.cols, a.cols) {
+            return Err(shape(format!("a {:?} Gram of a {:?} product", c.dim(), a.dim())));
+        }
+        float64_only("a symmetric rank-k update", &[a, c])?;
+        match &*self.backend {
+            Backend::Host => {
+                let (n, values, out) = (a.cols, host(a)?, host_mut(c)?);
+                for i in 0..n {
+                    for j in 0..=i {
+                        let dot: f64 = values.chunks_exact(n).map(|row| row[i] * row[j]).sum();
+                        out[i * n + j] = dot + beta * out[i * n + j];
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.gram_lower(c, a, beta),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "a symmetric rank-k update runs in float64 only".to_string() }),
+        }
+    }
+
     /// `y ← y + α x`.
     pub fn axpy(&self, y: &mut Tensor, alpha: f64, x: &Tensor) -> Result<(), GpuError> {
         same(x, y, "axpy")?;
@@ -4964,6 +4990,40 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
             Ok(gh)
         }
 
+        /// [`super::Device::gram_lower`]: the row-major `aᵀ a` is the column-major `A Aᵀ` of the same
+        /// buffer read as n × rows, and its row-major lower triangle that product's upper one.
+        pub(super) fn gram_lower(&self, c: &mut Tensor, a: &Tensor, beta: f64) -> Result<(), GpuError> {
+            if a.cols == 0 {
+                return Ok(());
+            }
+            let serial = self.gemm_workspace.lock().map_err(|_| shape("poisoned GEMM workspace".to_string()))?;
+            let (n, k) = (i32_of(a.cols)?, i32_of(a.rows)?);
+            let alpha = 1.0_f64;
+            let (Data::Cuda(sa), Data::Cuda(sc)) = (&a.data, &mut c.data) else { return Err(mismatch(&a.data)) };
+            let (pa, record_a) = sa.device_ptr(&self.stream);
+            let (pc, record_c) = sc.device_ptr_mut(&self.stream);
+            // SAFETY: `a` holds rows × n and `c` n × n float64 values (checked by the caller); the
+            // pointers outlive the call (their records drop after it).
+            let update = unsafe {
+                cudarc::cublas::sys::cublasDsyrk_v2(
+                    *self.blas.handle(),
+                    cudarc::cublas::sys::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER,
+                    cublasOperation_t::CUBLAS_OP_N,
+                    n,
+                    k,
+                    &alpha,
+                    pa as *const f64,
+                    n,
+                    &beta,
+                    pc as *mut f64,
+                    n,
+                )
+            }
+            .result();
+            drop((record_a, record_c, serial));
+            update.gpu_ctx("tensor DSYRK")
+        }
+
         /// One `cublasGemmEx` (strided-batched when `batch` exceeds one), serialized on the handle
         /// with the float64 path's math-mode switches.
         fn gemm_ex(&self, g: Gemm32<'_>, batch: usize, (stride_a, stride_b, stride_c): (usize, usize, usize)) -> Result<(), GpuError> {
@@ -7230,6 +7290,28 @@ kernel void t_attention_sums(device const float* out [[buffer(0)]], device const
             self.rows("t_box_charge", &buffers, z.rows, z.cols, P::default())?;
             Ok(self.stream.read::<f32>(&norms)?.into_iter().take(z.rows).map(|n| 0.5 * f64::from(n) * f64::from(n)).collect())
         }
+    }
+}
+
+#[cfg(test)]
+mod gram_tests {
+    use super::*;
+
+    #[test]
+    fn the_symmetric_update_sums_the_lower_triangle_and_keeps_the_upper() {
+        let device = Device::host();
+        let values: Vec<f64> = (0..15).map(|i| (i as f64 - 7.0) / 3.0).collect();
+        let a = device.upload_vec(5, 3, values.clone()).unwrap();
+        let mut c = device.upload_vec(3, 3, vec![7.0; 9]).unwrap();
+        device.gram_lower(&mut c, &a, 0.5).unwrap();
+        let c = device.download(&c).unwrap();
+        for i in 0..3 {
+            for j in 0..3 {
+                let expected = if i >= j { (0..5).map(|r| values[3 * r + i] * values[3 * r + j]).sum::<f64>() + 3.5 } else { 7.0 };
+                assert_eq!(c[[i, j]], expected, "entry ({i}, {j})");
+            }
+        }
+        assert!(device.gram_lower(&mut device.zeros(2, 2).unwrap(), &a, 0.0).is_err());
     }
 }
 
