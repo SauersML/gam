@@ -2115,7 +2115,7 @@ fn held_out_on(
                     match patch {
                         Patch::Read { .. } => read.add(bits),
                         Patch::Reads { .. } => joint.add(bits),
-                        Patch::Part { .. } | Patch::Head { .. } | Patch::Cut { .. } => {}
+                        Patch::Part { .. } | Patch::Head { .. } | Patch::Cut { .. } | Patch::Parts { .. } => {}
                     }
                 }
             }

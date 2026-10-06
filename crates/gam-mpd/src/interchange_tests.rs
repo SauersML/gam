@@ -1016,3 +1016,49 @@ fn a_cut_connection_is_the_same_path_patch_in_both_models() {
     let effects = x.evaluate(&batch, &experiments, false).expect("evaluate").bits;
     assert!(effects.iter().skip(1).step_by(2).all(|bits| bits.iter().sum::<f64>() > 1e-9), "{effects:?}");
 }
+
+/// A joint removal of parts (`Patch::Parts`) is the removal of each at the same row: on the tiny
+/// Qwen3 decoder with layer 1's MLP a transcoder's 64 features, removing a set of firing features
+/// at a row moves `P`'s and `M`'s predictions as removing them one edit at a time on the same path
+/// does (the same scores, bit for bit), and drawn joint removals are subsets of the parts firing on
+/// `M`'s read there.
+#[test]
+fn a_joint_removal_of_parts_is_each_removal_at_once() {
+    use super::interchange::{Family, parts_of};
+    let export = crate::test_support::tiny_qwen3_export("interchange_joint_parts", 2);
+    let imported = crate::import::import_language_model(&export, 6, 12).expect("the tiny export imports");
+    std::fs::remove_dir_all(&export).expect("the tiny export is removed");
+    let native = split_sites(&imported.program).expect("the native sites");
+    let layers = layer_nodes(&native, 2).expect("the layers");
+    let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+    let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+    let dir = std::env::temp_dir().join(format!("interchange_joint_parts_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a directory");
+    let (full, kept) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
+    crate::test_support::transcoder_file(&full, 64, 8, 3);
+    crate::library_transcoder::Transcoder::open(&full).expect("the file").write_kept(&(0..64).collect::<Vec<_>>(), &kept).expect("kept");
+    let explanation = crate::library_mdl::explanation_with(&native, &layers, &std::collections::BTreeMap::from([(1, kept)])).expect("the library");
+    std::fs::remove_dir_all(&dir).expect("the directory is removed");
+    let d = Device::host();
+    let mut x = Interchange::new(&d, &native, &layers, &explanation.artifact, &explanation.trainable, explanation.reads.clone(), 1 << 30, 64).expect("the experiments");
+    x.set_parts(parts_of(&explanation.artifact.program, 2).expect("the parts")).expect("the parts");
+    let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
+    let firing = x.active_parts(&batch, &[(1, 3, 6)]).expect("the activity").remove(0);
+    assert!(firing.len() >= 3, "{firing:?}");
+    let chosen: Vec<usize> = firing[..3].to_vec();
+    let joint = Experiment { base: 1, source: 1, explained: vec![true; 4], patch: Some(Patch::Parts { parts: chosen.clone(), factor: 0 }), position: 6 };
+    let bits = x.evaluate(&batch, std::slice::from_ref(&joint), false).expect("evaluate").bits;
+    assert!(bits[0].iter().all(|b| b.is_finite()) && bits[0].iter().sum::<f64>() > 0.0, "{bits:?}");
+    // The joint removal of one part is that part's removal.
+    let single = Experiment { patch: Some(Patch::Parts { parts: vec![chosen[0]], factor: 0 }), ..joint.clone() };
+    let part = Experiment { patch: Some(Patch::Part { part: chosen[0], factor: 0 }), ..joint.clone() };
+    let pair = x.evaluate(&batch, &[single, part], false).expect("evaluate").bits;
+    assert_eq!(pair[0], pair[1], "a joint removal of one part is its removal");
+    let drawn = x.sample_edits(&mut rand::rngs::StdRng::seed_from_u64(8), &batch, &[Family::RemoveParts], 4, false).expect("the draw");
+    for e in &drawn {
+        if let Some(Patch::Parts { parts, factor }) = &e.patch {
+            let firing = x.active_parts(&batch, &[(e.base, 3, e.position)]).expect("the activity").remove(0);
+            assert!(*factor == 0 && !parts.is_empty() && (parts.iter().all(|p| firing.contains(p)) || (firing.is_empty() && parts.len() == 1)), "{e:?} against {firing:?}");
+        }
+    }
+}

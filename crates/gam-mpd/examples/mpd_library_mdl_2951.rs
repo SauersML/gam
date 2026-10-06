@@ -25,12 +25,16 @@
 //! features as they are) is scored on held-out sequences `sequences` (a range of the held-out rows)
 //! under edits of its parts (`interchange::Interchange::sample_edits`: per sequence its clean
 //! experiment and `edits_per_sequence` edits, each of a family in `families`, `remove_part`,
-//! `amplify_part`, `remove_head` or `cut_connection` (its source the next held-out sequence),
+//! `amplify_part`, `remove_parts` (a random subset of the parts firing at a row of one block),
+//! `remove_head` or `cut_connection` (its source the next held-out sequence),
 //! applied identically to `M` and to `P`). `OUT/EDITS_{name}.json` holds per family
 //! `KL(M_e ‖ P_e)` in bits per token: the mean and 99th percentile over every scored token (from the
 //! edited token on) and over the edited tokens alone, with the clean experiments' as `clean`; and
 //! next to it, over the same tokens, the edit's effect on the model `KL(M_e ‖ M)` (`effect_*`), the
-//! size of the change the explanation is asked to predict.
+//! size of the change the explanation is asked to predict. Each family states its `objects`:
+//! `native` for experiments on `M`'s own objects (clean text, head removals), the same for every
+//! explanation and the primary comparison between explanations, and `own_parts` for edits of the
+//! explanation's own parts.
 //!
 //! With `blocks` (block `2l` layer `l`'s attention, `2l + 1` its MLP), the explanation is of those
 //! blocks alone and `M` everywhere else (`library_mdl::scoped`): the fast loop for comparing method
@@ -234,6 +238,7 @@ fn edit_faithfulness(
         Some(interchange::Patch::Part { .. }) => "amplify_part",
         Some(interchange::Patch::Head { .. }) => "remove_head",
         Some(interchange::Patch::Cut { .. }) => "cut_connection",
+        Some(interchange::Patch::Parts { .. }) => "remove_parts",
         Some(_) => "read",
     };
     // Per family: every scored token's bits, the edited tokens' bits, and the experiments.
@@ -277,9 +282,13 @@ fn edit_faithfulness(
         let (tokens, (mean, p99), (edited_mean, edited_p99)) = (all.len(), summary(&mut all), summary(&mut edited));
         let (mut effect_all, mut effect_edited) = effects.remove(family).unwrap_or_default();
         let ((effect_mean, effect_p99), (effect_edited_mean, effect_edited_p99)) = (summary(&mut effect_all), summary(&mut effect_edited));
+        // Experiments on M's own objects (clean text, heads) ask every explanation the same
+        // question; edits of parts ask each explanation about its own parts.
+        let objects = if matches!(family, "clean" | "remove_head" | "read") { "native" } else { "own_parts" };
         families.insert(
             family.into(),
             json!({
+                "objects": objects,
                 "experiments": count, "tokens": tokens,
                 "mean_bits_per_token": mean, "p99_bits_per_token": p99, "edited_token_mean_bits": edited_mean, "edited_token_p99_bits": edited_p99,
                 "effect_mean_bits_per_token": effect_mean, "effect_p99_bits_per_token": effect_p99, "effect_edited_token_mean_bits": effect_edited_mean, "effect_edited_token_p99_bits": effect_edited_p99,
