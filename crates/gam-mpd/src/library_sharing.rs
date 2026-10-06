@@ -941,7 +941,7 @@ pub fn tie_column(explanation: &Explanation, target: (usize, usize), source: (us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{gated, grouped, same_native_blocks};
+    use crate::test_support::{grouped, same_native_blocks};
     use crate::{
         import::import_language_model,
         library_mdl::{Posterior, explanation},
