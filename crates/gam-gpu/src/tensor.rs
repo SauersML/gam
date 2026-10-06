@@ -366,6 +366,12 @@ pub enum GroupAxis {
 /// one segment, the coordinates (rows, columns or entries) the axis indexes in its group, and one
 /// warp (SIMD group) sums each segment's entries in a fixed order and adds them to its group's row
 /// once. No sum is atomic, so the sums are the same on every run.
+/// One-column segments from which CUDA reduces eight a block (`GroupMap::reduce_code`): 512
+/// blocks, about four a multiprocessor on a 128-multiprocessor card. Fewer keep four a block, so a
+/// small operator still fills the card (f97524b178: eight columns left 384 blocks on 3072).
+#[cfg(target_os = "linux")]
+const WIDE_SEGMENTS: usize = 512 * 8;
+
 pub struct GroupMap {
     ids: Indices,
     axis: GroupAxis,
@@ -425,11 +431,22 @@ impl GroupMap {
     }
 
     /// The threads a CUDA reduction over the map runs: one block of 256 (the kernels' `BLOCK`) per
-    /// segment (`segments_reduce`), or per 4 segments of one column each (`columns_reduce`'s
-    /// `COLUMNS`).
+    /// segment (`segments_reduce`), per 4 or 8 segments of one column each (`columns_reduce`), or
+    /// one thread per segment of a single entry (`entries_reduce`).
     #[cfg(target_os = "linux")]
     fn blocks(&self) -> usize {
-        if self.single_columns() { 256 * self.segments.div_ceil(4) } else { 256 * self.segments }
+        match self.reduce_code() {
+            3 => 256 * self.segments.div_ceil(4),
+            4 => self.segments,
+            5 => 256 * self.segments.div_ceil(8),
+            _ => 256 * self.segments,
+        }
+    }
+
+    /// Whether every segment holds one entry (a bias's groups: one row of one column each).
+    #[cfg(target_os = "linux")]
+    fn single_entries(&self) -> bool {
+        self.segments == self.rows * self.cols
     }
 
     /// Whether every segment is one column: column groups of one column each (an MLP's output
@@ -439,11 +456,21 @@ impl GroupMap {
         self.axis == GroupAxis::Columns && self.segments == self.cols
     }
 
-    /// The axis as CUDA's group reductions take it: [`GroupMap::code`], or 3 for a map of one-column
-    /// segments (`columns_reduce`).
+    /// The axis as CUDA's group reductions take it: [`GroupMap::code`]; for a map of one-column
+    /// segments 3 (`columns_reduce`, four columns a block), or 5 from [`WIDE_SEGMENTS`] of them
+    /// (eight columns a block: a warp reads whole 32-byte sectors of four rows where four columns
+    /// read half of each of eight); 4 for a map of one-entry segments (one thread each, where a
+    /// block of 256 took each). Every code adds each group's sums in the same order, so the sums do
+    /// not depend on it.
     #[cfg(target_os = "linux")]
     fn reduce_code(&self) -> u32 {
-        if self.single_columns() { 3 } else { self.code() }
+        if self.single_entries() {
+            4
+        } else if self.single_columns() {
+            if self.segments >= WIDE_SEGMENTS { 5 } else { 3 }
+        } else {
+            self.code()
+        }
     }
 
     /// `t`'s shape is the map's.
@@ -4440,12 +4467,14 @@ __device__ unsigned int group_of(const unsigned int* ids, unsigned int axis, u64
 // with `every` it also runs on the entries of a group at or beyond `count` (whose sums are not
 // added); with `counted` a group's sums are added only when the first is positive. Every block runs
 // the same rows and synchronizations.
-#define COLUMNS 4
-template <int N, typename F>
-__device__ void columns_reduce(u64 n, u64 cols, u64 segments, const unsigned int* layout, u64 count, bool every, bool counted, double* sums, F body) {
+// COLUMNS is 4 (axis code 3) or 8 (code 5, wide maps: a warp then reads whole 32-byte sectors);
+// both take their shared arrays from `pool` (N · BLOCK + N · 8 · BLOCK / 32 doubles), which
+// `segments_reduce` declares once for every path.
+template <int N, unsigned int COLUMNS, typename F>
+__device__ void columns_reduce(u64 n, u64 cols, u64 segments, const unsigned int* layout, u64 count, bool every, bool counted, double* sums, double* pool, F body) {
     const unsigned int R = BLOCK / COLUMNS, VW = R / 32;
-    __shared__ double lanes[N][COLUMNS][BLOCK / COLUMNS];
-    __shared__ double warps[N][COLUMNS][BLOCK / 32];
+    double (*lanes)[COLUMNS][BLOCK / COLUMNS] = reinterpret_cast<double (*)[COLUMNS][BLOCK / COLUMNS]>(pool);
+    double (*warps)[COLUMNS][BLOCK / 32] = reinterpret_cast<double (*)[COLUMNS][BLOCK / 32]>(pool + N * BLOCK);
     const u64 rows = cols > 0 ? n / cols : 0;
     const unsigned int l = threadIdx.x % COLUMNS, r = threadIdx.x / COLUMNS;
     const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
@@ -4506,13 +4535,43 @@ __device__ void columns_reduce(u64 n, u64 cols, u64 segments, const unsigned int
 // of the map and launches on a stream run in order, so nothing is atomic and the sums are the same
 // on every run. (One warp per segment left a segment's entries to 32 threads: the posterior kernels
 // ran at a fifth of their memory rate.)
+// Segments of one entry each (axis code 4), one thread each: the entry's terms v (zero when `body`
+// does not add them) are what a block of `segments_reduce` adds for it, 0 + v through its shuffles
+// and warps (which turns a −0 into +0, as `+ 0.0` does here), so the sums are the same.
+template <int N, typename F>
+__device__ void entries_reduce(u64 segments, const unsigned int* layout, u64 count, bool every, bool counted, double* sums, F body) {
+    for (u64 s = (u64)blockIdx.x * blockDim.x + threadIdx.x; s < segments; s += (u64)gridDim.x * blockDim.x) {
+        unsigned int g = layout[segments + 1 + s];
+        if (!every && g >= count) continue;
+        u64 i = layout[2 * segments + 1 + layout[s]];
+        double e[N], v[N];
+        for (int t = 0; t < N; t++) { e[t] = 0.0; v[t] = 0.0; }
+        if (body(i, g, e))
+            for (int t = 0; t < N; t++) v[t] += e[t];
+        if (g >= count) continue;
+        double total[N];
+        for (int t = 0; t < N; t++) total[t] = 0.0 + (v[t] + 0.0);
+        if (!counted || total[0] > 0.0)
+            for (int t = 0; t < N; t++) sums[N * (u64)g + t] += total[t];
+    }
+}
+
 template <int N, typename F>
 __device__ void segments_reduce(u64 n, u64 cols, unsigned int axis, u64 segments, const unsigned int* layout, u64 count, bool every, bool counted, double* sums, F body) {
+    __shared__ double pool[N * BLOCK + N * 8 * (BLOCK / 32)];
     if (axis == 3u) {
-        columns_reduce<N>(n, cols, segments, layout, count, every, counted, sums, body);
+        columns_reduce<N, 4>(n, cols, segments, layout, count, every, counted, sums, pool, body);
         return;
     }
-    __shared__ double partial[N][BLOCK / 32];
+    if (axis == 5u) {
+        columns_reduce<N, 8>(n, cols, segments, layout, count, every, counted, sums, pool, body);
+        return;
+    }
+    if (axis == 4u) {
+        entries_reduce<N>(segments, layout, count, every, counted, sums, body);
+        return;
+    }
+    double (*partial)[BLOCK / 32] = reinterpret_cast<double (*)[BLOCK / 32]>(pool);
     const u64 rows = cols > 0 ? n / cols : 0;
     const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     for (u64 s = blockIdx.x; s < segments; s += gridDim.x) {

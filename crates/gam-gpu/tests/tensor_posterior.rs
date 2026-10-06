@@ -888,14 +888,14 @@ fn a_move_toward_is_the_copy_and_axpys_it_replaces() {
     }
 }
 
-/// CUDA's reduction over groups of one column each (eight adjacent columns per block) against the
-/// same entries transposed and grouped by rows, which the per-segment reduction takes in the same
-/// order: every group sum, and every entry the kernels write, bit for bit. 600 rows (two full
-/// passes of a block and part of a third) and 22 columns in a shuffled group order (full tiles of
-/// columns not adjacent in group order, and part of one), groups 18 to 21 beyond the count, and
-/// removed entries.
-fn single_columns_match_their_transposes(fit: &Device, wide: &Device) {
-    let (rows, cols, count) = (600, 22, 18);
+/// CUDA's reduction over groups of one column each (four adjacent columns per block, or eight from
+/// 4096 such groups) against the same entries transposed and grouped by rows, which the
+/// per-segment reduction takes in the same order: every group sum, and every entry the kernels
+/// write, bit for bit. 600 rows (two full passes of a block and part of a third) and `cols` columns
+/// in a shuffled group order (full tiles of columns not adjacent in group order, and part of one),
+/// the last four groups beyond the count, and removed entries.
+fn single_columns_match_their_transposes(fit: &Device, wide: &Device, cols: usize) {
+    let (rows, count) = (600, cols - 4);
     let group = |c: usize| ((c * 7) % cols) as u32;
     let ids: Vec<u32> = (0..rows * cols).map(|i| group(i % cols)).collect();
     let by_rows: Vec<u32> = (0..cols * rows).map(|i| group(i / rows)).collect();
@@ -948,8 +948,70 @@ fn single_columns_match_their_transposes(fit: &Device, wide: &Device) {
 fn cuda_single_column_groups_reduce_as_their_transposes() {
     let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
     let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
-    single_columns_match_their_transposes(&narrow, &wide);
-    single_columns_match_their_transposes(&wide, &wide);
+    for cols in [22, 4102] {
+        single_columns_match_their_transposes(&narrow, &wide, cols);
+        single_columns_match_their_transposes(&wide, &wide, cols);
+    }
+}
+
+/// CUDA's reduction over groups of one entry each (one thread a group) against the same entries as
+/// column 0 of an operator whose groups are its rows and whose column 1 is removed, which the
+/// per-segment reduction takes a block a group: every group sum, and every entry of column 0 the
+/// kernels write, bit for bit, for the posterior step, its finish, the moments and the curvature.
+/// 3000 rows in a shuffled group order, the last ten beyond the count, and removed entries.
+fn single_entries_match_their_rows(fit: &Device, wide: &Device) {
+    let (rows, count) = (3000, 2990);
+    let group = |r: usize| ((r * 7) % rows) as u32;
+    let (map, map_2) = (fit.group_map(&(0..rows).map(group).collect::<Vec<_>>(), (rows, 1)).unwrap(), fit.group_map(&(0..2 * rows).map(|i| group(i / 2)).collect::<Vec<_>>(), (rows, 2)).unwrap());
+    let widen = |a: &Array2<f64>, other: f64| Array2::from_shape_fn((rows, 2), |(r, c)| if c == 0 { a[(r, 0)] } else { other });
+    let (mut mean, mut log_sd) = (matrix(rows, 1, 1, 0.5, 0.0), matrix(rows, 1, 2, 0.5, -3.0));
+    for r in (0..rows).filter(|r| r % 37 == 0) {
+        mean[(r, 0)] = 0.0;
+        log_sd[(r, 0)] = f64::NEG_INFINITY;
+    }
+    let (momentum, curvature) = (matrix(rows, 1, 3, 0.1, 0.0), matrix(rows, 1, 4, 0.5, 1.0));
+    let (gradient, factor, prior) = (matrix(rows, 1, 7, 3.0, 0.0), matrix(rows, 1, 8, 2.0, 0.0), matrix(rows, 1, 5, 0.5, 0.0));
+    let both = |a: &Array2<f64>, other: f64| (fit.upload(a.view()).unwrap(), fit.upload(widen(a, other).view()).unwrap());
+    let first = |t: &Tensor| fit.download(t).unwrap().column(0).to_owned().insert_axis(ndarray::Axis(1));
+    let pair = |what: &str, (a, b): (&Tensor, &Tensor), d: &Device| assert_eq!(d.download(a).unwrap(), d.download(b).unwrap(), "{} {what}", fit.name());
+    let ((m, m2), (s, s2), (u, u2)) = (both(&mean, 0.0), both(&log_sd, f64::NEG_INFINITY), both(&factor, 1.0));
+    let sums = |columns: usize| (wide.zeros(count, columns).unwrap(), wide.zeros(count, columns).unwrap());
+    let (mut x, mut y) = sums(3);
+    fit.group_moments((&m, &s), &map, &mut x).unwrap();
+    fit.group_moments((&m2, &s2), &map_2, &mut y).unwrap();
+    pair("moments", (&x, &y), wide);
+    let (mut x, mut y) = sums(3);
+    fit.group_curvature((&u, &m, &s), &map, &mut x).unwrap();
+    fit.group_curvature((&u2, &m2, &s2), &map_2, &mut y).unwrap();
+    pair("curvature", (&x, &y), wide);
+    let ((g, g2), (r, r2)) = (both(&gradient, 1.0), both(&prior, 1.0));
+    let variance = wide.upload_vec(count, 1, (0..count).map(|g| 0.01 * (g + 1) as f64).collect()).unwrap();
+    let step = case(GroupAxis::Rows).step;
+    let ((mut s, mut s2), (mut p, mut p2), (mut c, mut c2)) = (both(&log_sd, f64::NEG_INFINITY), both(&momentum, 0.0), both(&curvature, 0.0));
+    let (mut d, mut d2) = (fit.zeros(rows, 1).unwrap(), fit.zeros(rows, 2).unwrap());
+    let (mut x, mut y) = sums(5);
+    fit.posterior_ivon((&m, &mut s), [&mut p, &mut c], (Some(&g), Some(&u), Some(&r)), (&map, &variance), (&mut d, &mut x), &step).unwrap();
+    fit.posterior_ivon((&m2, &mut s2), [&mut p2, &mut c2], (Some(&g2), Some(&u2), Some(&r2)), (&map_2, &variance), (&mut d2, &mut y), &step).unwrap();
+    pair("step terms", (&x, &y), wide);
+    for (what, a, b) in [("direction", &d, &d2), ("log sd", &s, &s2), ("momentum", &p, &p2), ("curvature", &c, &c2)] {
+        assert_eq!(fit.download(a).unwrap(), first(b), "{} stepped {what}", fit.name());
+    }
+    let ((mut m, mut m2), (mut a, mut a2)) = (both(&mean, 0.0), both(&momentum, 0.0));
+    let (mut x, mut y) = sums(3);
+    fit.posterior_finish((&mut m, &d, 0.375), (&mut a, 0.0625), &s, &map, &mut x).unwrap();
+    fit.posterior_finish((&mut m2, &d2, 0.375), (&mut a2, 0.0625), &s2, &map_2, &mut y).unwrap();
+    pair("finish sums", (&x, &y), wide);
+    for (what, a, b) in [("finished mean", &m, &m2), ("average", &a, &a2)] {
+        assert_eq!(fit.download(a).unwrap(), first(b), "{} {what}", fit.name());
+    }
+}
+
+#[test]
+fn cuda_single_entry_groups_reduce_as_their_rows() {
+    let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
+    let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
+    single_entries_match_their_rows(&narrow, &wide);
+    single_entries_match_their_rows(&wide, &wide);
 }
 
 /// Samples gathered and run together ([`Device::run_samples`]) against each written by its own
