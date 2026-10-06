@@ -2782,8 +2782,9 @@ struct Snapshot;
 
 impl Snapshot {
     /// Save `progress` and `posterior` as they are now to `path`; `progress` records the payload's
-    /// precision. The write starts once the one before it has ended.
-    fn save(progress: &mut Progress, posterior: &DevicePosterior, path: &Path, writer: &mut Writer) -> Result<(), String> {
+    /// precision. The write starts once the one before it has ended. With `link`, the written files
+    /// are also linked there (`Snapshot::write`).
+    fn save(progress: &mut Progress, posterior: &DevicePosterior, (path, link): (&Path, Option<&Path>), writer: &mut Writer) -> Result<(), String> {
         let precision = posterior.storages().map(Precision::of);
         progress.precision = Some(precision.to_vec());
         progress.averaged = posterior.averaged();
@@ -2795,8 +2796,8 @@ impl Snapshot {
         let (header, json) = (serde_json::to_vec(progress).map_err(error)?, serde_json::to_vec_pretty(progress).map_err(error)?);
         // One operator's arrays wait while the writer writes the one before.
         let (send, receive) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
-        let path = path.to_path_buf();
-        writer.start(move || Self::write(&path, &header, &json, receive, bytes))?;
+        let (path, link) = (path.to_path_buf(), link.map(Path::to_path_buf));
+        writer.start(move || Self::write(&path, &header, &json, receive, bytes, link.as_deref()))?;
         const STOPPED: &str = "the checkpoint writer stopped";
         let stream = move |chunk: Vec<u8>| -> Result<(), String> { send.send(chunk).map_err(|_| STOPPED.to_string()) };
         let taken = (|| -> Result<(), String> {
@@ -2822,8 +2823,10 @@ impl Snapshot {
 
     /// Write the checkpoint atomically: the progress `header` as JSON after its length, then the
     /// payload's `bytes` as they arrive. The progress alone also goes to the path with extension
-    /// `json`, readable while the fit runs.
-    fn write(path: &Path, header: &[u8], json: &[u8], payload: std::sync::mpsc::Receiver<Vec<u8>>, bytes: u64) -> Result<(), String> {
+    /// `json`, readable while the fit runs. With `link`, both files are then linked there (copied
+    /// where the file system refuses a link), each replacing the one before atomically; a later
+    /// checkpoint replaces `path`'s directory entry, never the linked file.
+    fn write(path: &Path, header: &[u8], json: &[u8], payload: std::sync::mpsc::Receiver<Vec<u8>>, bytes: u64, link: Option<&Path>) -> Result<(), String> {
         let partial = path.with_extension("partial");
         let mut file = std::io::BufWriter::new(std::fs::File::create(&partial).map_err(error)?);
         file.write_all(&(header.len() as u64).to_le_bytes()).map_err(error)?;
@@ -2842,7 +2845,20 @@ impl Snapshot {
         std::fs::rename(&partial, path).map_err(error)?;
         let partial = path.with_extension("json.partial");
         std::fs::write(&partial, json).map_err(error)?;
-        std::fs::rename(&partial, path.with_extension("json")).map_err(error)
+        std::fs::rename(&partial, path.with_extension("json")).map_err(error)?;
+        if let Some(link) = link {
+            for (from, to) in [(path.to_path_buf(), link.to_path_buf()), (path.with_extension("json"), link.with_extension("json"))] {
+                let linking = to.with_extension("linking");
+                if linking.exists() {
+                    std::fs::remove_file(&linking).map_err(error)?;
+                }
+                if std::fs::hard_link(&from, &linking).is_err() {
+                    std::fs::copy(&from, &linking).map_err(error)?;
+                }
+                std::fs::rename(&linking, &to).map_err(error)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3222,11 +3238,11 @@ pub fn fit_from(
     // at every save held the means, their group map and the encoded artifact on the host beside
     // the checkpoint, about 28 bytes per trainable parameter that the fit never reads back.
     let mut writer = Writer::default();
-    let save = |progress: &mut Progress, posterior: &Posterior, device_posterior: &DevicePosterior, writer: &mut Writer| -> Result<(), String> {
+    let save = |progress: &mut Progress, posterior: &Posterior, (device_posterior, link): (&DevicePosterior, Option<&Path>), writer: &mut Writer| -> Result<(), String> {
         progress.active = posterior.active.clone();
         progress.seconds = resumed_seconds + started.elapsed().as_secs_f64();
         let Some(path) = checkpoint else { return Ok(()) };
-        Snapshot::save(progress, device_posterior, path, writer)
+        Snapshot::save(progress, device_posterior, (path, link), writer)
     };
     if let Some(prior) = prior.as_deref_mut()
         && progress.prior.is_none()
@@ -3245,12 +3261,11 @@ pub fn fit_from(
         progress.start = Some(start);
         device_posterior.values_into(&mut posterior)?;
         progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
-        save(&mut progress, &posterior, &device_posterior, &mut writer)?;
         // The start's own checkpoint beside the fit's (extension `start.bin`), kept whatever the
-        // descent does next: a valid posterior to begin other fits or a removal round from.
-        if let Some(path) = checkpoint {
-            Snapshot::save(&mut progress, &device_posterior, &path.with_extension("start.bin"), &mut writer)?;
-        }
+        // descent does next: a valid posterior to begin other fits or a removal round from. It is
+        // the fit's first checkpoint, linked there.
+        let start = checkpoint.map(|path| path.with_extension("start.bin"));
+        save(&mut progress, &posterior, (&device_posterior, start.as_deref()), &mut writer)?;
     }
     // The posterior at the end of the epoch with the lowest snapshot estimate of `F` since the
     // objective last changed (a start or a removal), with that estimate.
@@ -3392,6 +3407,7 @@ pub fn fit_from(
         if is_best {
             progress.best = Some((snapshot_mean, epoch));
         }
+        let mut keep_best = false;
         if budget {
             progress.done = true;
         } else if settings.epochs.is_none() && improvement.is_some_and(|i| i <= 0.0) {
@@ -3432,14 +3448,18 @@ pub fn fit_from(
             progress.previous = None;
         } else if is_best {
             // The best posterior so far, kept on disk rather than as a copy on the host, with the
-            // prior term's state its snapshot was scored at.
-            let mut kept = progress.clone();
-            kept.active = posterior.active.clone();
-            kept.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
-            Snapshot::save(&mut kept, &device_posterior, &best_path, &mut writer)?;
+            // prior term's state its snapshot was scored at: the epoch's checkpoint below, linked
+            // at `best_path`, or for a fit without one a file of its own.
+            keep_best = true;
+            if checkpoint.is_none() {
+                let mut kept = progress.clone();
+                kept.active = posterior.active.clone();
+                kept.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
+                Snapshot::save(&mut kept, &device_posterior, (&best_path, None), &mut writer)?;
+            }
         }
         progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
-        save(&mut progress, &posterior, &device_posterior, &mut writer)?;
+        save(&mut progress, &posterior, (&device_posterior, keep_best.then_some(best_path.as_path())), &mut writer)?;
     }
     writer.wait()?;
     for written in [best_path.clone(), best_path.with_extension("json")] {
