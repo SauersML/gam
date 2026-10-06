@@ -1294,6 +1294,14 @@ pub struct Settings {
     /// place of the step `α` (`DevicePosterior::line_step`).
     #[serde(default)]
     pub line_search: bool,
+    /// The half-factor arm: a training step draws the Gauss–Newton factor from its first
+    /// antithetic half's experiments alone (`antithetic_step`), with the curvature estimate per
+    /// token of those tokens. A draw's squared factor `u ⊙ u` has a relative standard deviation
+    /// near √2 per entry however many tokens `u` sums (each entry of `u` is a sum of independent
+    /// zero-mean terms, close to normal), so half the tokens give an estimate of about the same
+    /// precision, for half the factor pass. The A/B's outcome deletes this field.
+    #[serde(default)]
+    pub half_factor: bool,
     /// When set, the fit ends once its epoch count (counted from `M`, a start's epochs included)
     /// reaches this, with no removal round: a comparison of arms at one budget of steps.
     #[serde(default)]
@@ -1676,19 +1684,19 @@ impl Scorer {
 
     /// The explanation on `experiments` (on `batch`) with the posterior on the device: at its
     /// weight sample of `sample` ([`DevicePosterior::sample_into`]), or at its mean when none, and
-    /// with `gradient` the gradient of the sum per trainable operator and a draw of the
-    /// Gauss–Newton factor (`interchange::Factor`, its labels drawn from the seed `sample`), left
-    /// on the device; `M`'s targets made here.
+    /// with `gradient` the gradient of the sum per trainable operator and, with `factor` too, a draw
+    /// of the Gauss–Newton factor (`interchange::Factor`, its labels drawn from the seed `sample`),
+    /// left on the device; `M`'s targets made here.
     fn score_device(
         &mut self,
         posterior: &DevicePosterior,
         batch: &Batch,
         experiments: &[Experiment],
         sample: Option<u64>,
-        gradient: bool,
+        (gradient, factor): (bool, bool),
     ) -> Result<(Vec<Vec<f64>>, BTreeMap<usize, Tensor>, Option<interchange::Factor>), String> {
         let targets = self.experiments.targets(batch, experiments)?;
-        self.evaluate_device(posterior, (batch, experiments), sample, &targets, gradient)
+        self.evaluate_device(posterior, (batch, experiments), sample, &targets, (gradient, factor))
     }
 
     /// [`Scorer::score_device`] against `M`'s `targets` already made for these experiments.
@@ -1698,7 +1706,7 @@ impl Scorer {
         (batch, experiments): (&Batch, &[Experiment]),
         sample: Option<u64>,
         targets: &Targets,
-        gradient: bool,
+        (gradient, factor): (bool, bool),
     ) -> Result<(Vec<Vec<f64>>, BTreeMap<usize, Tensor>, Option<interchange::Factor>), String> {
         // A step's gradient is taken around the iterate; every evaluation around the posterior's
         // mean `μ̄` (`DevicePosterior`'s module note).
@@ -1707,7 +1715,7 @@ impl Scorer {
             (Some(seed), false) => posterior.sample_into(self.experiments.explanation_mut(), seed)?,
             (None, _) => posterior.mean_into(self.experiments.explanation_mut())?,
         }
-        let labels = match (gradient, sample) {
+        let labels = match (gradient && factor, sample) {
             (true, Some(seed)) => Some(uniforms(seed, batch, experiments)),
             _ => None,
         };
@@ -1740,26 +1748,27 @@ fn noise_seed(seed: u64, epoch: usize, batch: usize) -> u64 {
 /// estimate of `F` and of its gradient keep their expectations; the gradient's term linear in the
 /// noise is `(H_A − H_B) σ ε` over the halves `A` and `B` rather than `(H_A + H_B) σ ε`, which
 /// cancels within the step, where IVON's noise filter measures what remains. The products are one
-/// scoring's of the whole batch. A batch of one base is scored at the sample of `key` alone.
+/// scoring's of the whole batch. A batch of one base is scored at the sample of `key` alone. With
+/// `half_factor` (`Settings::half_factor`) the factor is the first half's alone.
 /// Returns the experiments in the order of their bits.
 fn antithetic_step(
     scorer: &mut Scorer,
     (device, device_posterior): (&Device, &DevicePosterior),
     batch: &Batch,
     experiments: Vec<Experiment>,
-    key: u64,
+    (key, half_factor): (u64, bool),
 ) -> Result<(Vec<Experiment>, Vec<Vec<f64>>, BTreeMap<usize, Tensor>, interchange::Factor), String> {
     let half = batch.base.len() / 2;
     let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.into_iter().partition(|e| e.base < half);
     if first.is_empty() || second.is_empty() {
         let all: Vec<Experiment> = first.into_iter().chain(second).collect();
-        let (bits, gradients, factor) = scorer.score_device(device_posterior, batch, &all, Some(key), true)?;
+        let (bits, gradients, factor) = scorer.score_device(device_posterior, batch, &all, Some(key), (true, true))?;
         return Ok((all, bits, gradients, factor.ok_or("no Gauss–Newton factor")?));
     }
-    let (mut bits, mut gradients, factor) = scorer.score_device(device_posterior, batch, &first, Some(key), true)?;
+    let (mut bits, mut gradients, factor) = scorer.score_device(device_posterior, batch, &first, Some(key), (true, true))?;
     let mut factor = factor.ok_or("no Gauss–Newton factor")?;
-    let (other_bits, other_gradients, other_factor) = scorer.score_device(device_posterior, batch, &second, Some(key ^ gam_gpu::tensor::ANTITHETIC), true)?;
-    let other_factor = other_factor.ok_or("no Gauss–Newton factor")?;
+    // With `Settings::half_factor` the second half draws no factor.
+    let (other_bits, other_gradients, other_factor) = scorer.score_device(device_posterior, batch, &second, Some(key ^ gam_gpu::tensor::ANTITHETIC), (true, !half_factor))?;
     let add = |total: &mut BTreeMap<usize, Tensor>, more: BTreeMap<usize, Tensor>| -> Result<(), String> {
         for (op, g) in more {
             match total.get_mut(&op) {
@@ -1772,8 +1781,10 @@ fn antithetic_step(
         Ok(())
     };
     add(&mut gradients, other_gradients)?;
-    add(&mut factor.gradient, other_factor.gradient)?;
-    factor.tokens += other_factor.tokens;
+    if let Some(other) = other_factor {
+        add(&mut factor.gradient, other.gradient)?;
+        factor.tokens += other.tokens;
+    }
     bits.extend(other_bits);
     Ok((first.into_iter().chain(second).collect(), bits, gradients, factor))
 }
@@ -1833,7 +1844,7 @@ fn held_out(
     for (b, (draw, experiments)) in held_out_experiments(scorer, sequences, settings)?.into_iter().enumerate() {
         let batch = draw.batch(sequences)?;
         let targets = scorer.experiments.targets(&batch, &experiments)?;
-        let (bits, _, _) = scorer.evaluate_device(device_posterior, (&batch, &experiments), None, &targets, false)?;
+        let (bits, _, _) = scorer.evaluate_device(device_posterior, (&batch, &experiments), None, &targets, (false, false))?;
         bits.iter().for_each(|b| at_mean.add(b));
         for (e, bits) in experiments.iter().zip(&bits) {
             match &e.patch {
@@ -1847,7 +1858,7 @@ fn held_out(
                 }
             }
         }
-        let (bits, _, _) = scorer.evaluate_device(device_posterior, (&batch, &experiments), Some(noise_seed(settings.seed, 0, b)), &targets, false)?;
+        let (bits, _, _) = scorer.evaluate_device(device_posterior, (&batch, &experiments), Some(noise_seed(settings.seed, 0, b)), &targets, (false, false))?;
         bits.iter().for_each(|b| sampled.add(b));
         made.push((batch, experiments, targets));
     }
@@ -2895,7 +2906,7 @@ pub fn fit_from(
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
             let key = noise_seed(settings.seed, epoch + 1, b);
-            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key)?;
+            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, (key, settings.half_factor))?;
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
@@ -3185,7 +3196,7 @@ fn expected_divergence(
         let started = Instant::now();
         let targets = scorer.experiments.targets(&batch, &experiments)?;
         targeting += started.elapsed().as_secs_f64();
-        let scored = scorer.evaluate_device(device_posterior, (&batch, &experiments), Some(key), &targets, false)?.0;
+        let scored = scorer.evaluate_device(device_posterior, (&batch, &experiments), Some(key), &targets, (false, false))?.0;
         let mut nats = scored.iter().flatten().sum::<f64>() * LN_2;
         if let Some(prior) = prior.as_deref_mut() {
             nats += prior.sample(&trial, &host_sample(&trial, &prior.operators(), key), false)?.0 / draws.len() as f64;
@@ -3766,6 +3777,7 @@ mod tests {
             split_filter: false,
             deterministic: false,
             line_search: false,
+            half_factor: false,
             epochs: None,
         }
     }
