@@ -368,9 +368,22 @@ impl DevicePosterior {
         self.line_state.as_ref().map(|_| self.ratio)
     }
 
-    /// Ends a line step from the batch's data term per token in nats at the step's sample
-    /// (`data_zero`, `η = 0`) and at the trial step `η₀` (`data_trial`, the same draws around the
-    /// iterate `before − η₀ d`). With the slope `S = Σ g d + Σ δ μ d` known from the gradient, the
+    /// Puts a pending line step's iterate at `before − η d` (`η = 0`: where the step started), for
+    /// its measurement at the step's draws and the deviations the step set.
+    pub fn place_line(&mut self, eta: f64) -> Result<(), String> {
+        let state = self.line_state.as_ref().ok_or_else(|| error("no line step awaits a measurement"))?;
+        for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
+            *mean = self.fitting.copy(start).map_err(error)?;
+            self.fitting.axpy(mean, -eta, d).map_err(error)?;
+        }
+        Ok(())
+    }
+
+    /// Ends a line step from the batch's data term per token in nats at `η = 0` (`data_zero`) and
+    /// at the trial step `η₀` (`data_trial`), both at the step's draws around the iterate
+    /// `before − η d` with the deviations the step set (`DevicePosterior::place_line`): the
+    /// step's own estimate was made at the deviations before it, and their change would enter the
+    /// measured curvature. With the slope `S = Σ g d + Σ δ μ d` known from the gradient, the
     /// data term along `d` is the parabola through both values, `D(η) = D₀ − (Σ g d) η + c η²`,
     /// `c = (D(η₀) − D₀ + η₀ Σ g d) / η₀²`, and with the prior's exact `½ η² Σ δ d²` the batch's `F`
     /// is least at `η = S / (2 c + Σ δ d²)`. That minimum is trusted up to twice the measured

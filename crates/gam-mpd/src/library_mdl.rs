@@ -3038,10 +3038,13 @@ pub fn fit_from(
             progress.step += 1;
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, weight), &ivon)?;
             if let Some(trial) = device_posterior.line_trial() {
-                // The line step's trial: the batch's data term at the same draws around the iterate
-                // moved by the trial step (`DevicePosterior::finish_line`).
+                // The line step's measurement: the batch's data term at the step's draws around the
+                // iterate where the step started and moved by the trial step, both at the
+                // deviations the step set (`DevicePosterior::finish_line`).
+                device_posterior.place_line(0.0)?;
+                let zero_bits = line_trial_bits(&mut scorer, &device_posterior, &batch, &experiments, (key, settings.one_sample))?;
+                device_posterior.place_line(trial)?;
                 let trial_bits = line_trial_bits(&mut scorer, &device_posterior, &batch, &experiments, (key, settings.one_sample))?;
-                let zero_bits: f64 = bits.iter().flatten().sum();
                 let line = device_posterior.finish_line(weight * LN_2 * zero_bits, weight * LN_2 * trial_bits, ivon.beta2)?;
                 log::info!(
                     "library line step {epoch}.{b}: η {:.4e} (trial {trial:.4e}); data curvature along d per token: measured {:.4e}, one Gauss–Newton draw {:.4e}, diagonal Σ h d² {:.4e}",
