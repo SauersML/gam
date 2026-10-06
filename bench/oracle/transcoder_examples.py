@@ -13,7 +13,11 @@ Feature order. A library made by library_transcoder.rs keeps a layer's features 
 transcoder_l{l}.safetensors, so function c of layer l is transcoder feature kept[l][c] while the library
 has not removed any.
 
+A subset (`extract`): the records of the features a label table asks about, as one gzip'd JSON
+{layer: {feature: record}}, which Features also reads (pods need not download the 36 GB directory).
+
   transcoder_examples.py show --features DIR --layer L --feature F [--n 3]
+  transcoder_examples.py extract --features DIR --transcoders OUT --labels TABLE... --out SUBSET.json.gz
 """
 
 from __future__ import annotations
@@ -30,10 +34,13 @@ LEVELS = 10
 class Features:
     def __init__(self, root: Path):
         self.root = Path(root)
-        self.index = json.loads(gzip.decompress((self.root / "index.json.gz").read_bytes()))
+        self.subset = json.loads(gzip.decompress(self.root.read_bytes())) if self.root.is_file() else None
+        self.index = None if self.subset is not None else json.loads(gzip.decompress((self.root / "index.json.gz").read_bytes()))
         self.files: dict[int, object] = {}
 
     def record(self, layer: int, feature: int) -> dict:
+        if self.subset is not None:
+            return self.subset[str(layer)][str(feature)]
         entry = self.index[str(layer)]
         if layer not in self.files:
             self.files[layer] = open(self.root / entry["filename"], "rb")
@@ -79,6 +86,22 @@ def kept(out: Path) -> dict[int, list[int]]:
     return result
 
 
+def extract(args):
+    """The records of every part the label tables hold (site_{l}_function.json's subcomponents: functions
+    0..C-1 of layer l, transcoder features kept[l][0..C-1])."""
+    features, k = Features(Path(args.features)), kept(Path(args.transcoders))
+    out: dict[str, dict] = {}
+    for table in args.labels:
+        for meta_path in sorted(Path(table).glob("site_*_function.json")):
+            meta = json.loads(meta_path.read_text())
+            layer = meta["layer"]
+            for c in range(meta["subcomponents"]):
+                f = k[layer][c]
+                out.setdefault(str(layer), {})[str(f)] = features.record(layer, f)
+    Path(args.out).write_bytes(gzip.compress(json.dumps(out).encode()))
+    print(json.dumps({"layers": len(out), "features": sum(len(v) for v in out.values()), "bytes": Path(args.out).stat().st_size}))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)
@@ -87,8 +110,16 @@ def main():
     s.add_argument("--layer", type=int, required=True)
     s.add_argument("--feature", type=int, required=True)
     s.add_argument("--n", type=int, default=3)
+    e = sub.add_parser("extract")
+    e.add_argument("--features", required=True)
+    e.add_argument("--transcoders", required=True)
+    e.add_argument("--labels", nargs="+", required=True)
+    e.add_argument("--out", required=True)
     args = ap.parse_args()
-    print(Features(Path(args.features)).text(args.layer, args.feature, args.n))
+    if args.command == "extract":
+        extract(args)
+    else:
+        print(Features(Path(args.features)).text(args.layer, args.feature, args.n))
 
 
 if __name__ == "__main__":

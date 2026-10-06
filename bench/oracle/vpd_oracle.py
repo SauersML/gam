@@ -258,7 +258,7 @@ def effect_index(table: Table, keys: list) -> list[np.ndarray]:
 
 
 def examples(table: Table, layers: set[int], count: int, seed: int, stratified: bool = True, per_component: int = 1,
-             only: tuple[str, ...] = (), rule: bool = False) -> list[dict]:
+             only: tuple[str, ...] = (), rule: int = 0) -> list[dict]:
     """`count` questions, the kinds in turn (those the table's relations support, or `only` those). With
     per_component K > 1, each subcomponent an effect question draws is asked about at K of its strongest
     contexts (the drawn one and K - 1 others, in the following questions of that kind).
@@ -266,8 +266,9 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
     rule (a sanity check of the reader, not a measurement): direction questions about a token from the
     subcomponent's lens text (its 8 raised or 8 lowered tokens), answered by the rule the text states:
     the probability goes up iff (edit sign) * (stated activity sign) * (+1 raised, -1 lowered) > 0, the
-    edit sign -1 for removal and +1 for amplification. A reader that cannot learn this from those
-    inputs has a bug."""
+    edit sign -1 for removal and +1 for amplification (rule 3: a parity of three facts the text states);
+    rule 1: amplification of a positive activity only, so the answer is whether the token is listed as
+    raised (one fact). A reader that cannot learn rule 1 from those inputs has a bug."""
     rng = random.Random(seed)
     pending: dict[str, list] = {"direction": [], "top": []}
     keys = [k for k in table.sites if k[0] in layers]
@@ -314,7 +315,8 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
         here = ""
         if q in ("direction", "top"):  # an effect question states the activity there (an input-side measurement, not its answer)
             a_here = float(act[j, int(d["position"][c, j])])
-            here = f"At the marked token its activity is {int(math.copysign(level(a_here, peak), a_here)):+d} (9 is its largest |activity| over its texts). "
+            signed = int(math.copysign(level(a_here, peak), a_here))
+            here = f"At the marked token its activity is {signed:+d} (9 is its largest |activity| over its texts). "
         if q == "activity":
             p = int(d["position"][c, j]) if rng.random() < 0.5 else rng.randrange(act.shape[1])
             ex.update(context=int(contexts[j]), position=p, options=[str(b) for b in range(BINS)], answer=level(float(act[j, p]), peak),
@@ -322,17 +324,19 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
         elif q == "direction":
             p = int(d["position"][c, j])
             edit, side, r = rng.choice(["ablate", "amplify"]), rng.choice(["up", "down"]), rng.randrange(10)
+            if rule == 1:
+                edit = "amplify"
             verb = "removed" if edit == "ablate" else f"made {meta.get('amplify', 1.5):g} times stronger"
             token, answer = int(d[f"{side}_ids_{edit}"][c, j, r]), 0 if float(d[f"{side}_dp_{edit}"][c, j, r]) > 0 else 1
             if rule:
                 a_sign = int(math.copysign(1, a_here)) if level(a_here, peak) > 0 else 0
-                if a_sign == 0:
+                if a_sign == 0 or (rule == 1 and a_sign < 0):
                     continue
                 listed = table.lens[f"{site_name(layer, kind)}.{side}"][c]
                 token = int(listed[rng.randrange(int((listed >= 0).sum()))])
                 answer = 0 if (-1 if edit == "ablate" else 1) * a_sign * (1 if side == "up" else -1) > 0 else 1
             ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=["up", "down"],
-                      answer=answer, edit=edit, option_ids=[token],
+                      answer=answer, edit=edit, option_ids=[token], change=(-1.0 if edit == "ablate" else meta.get("amplify", 1.5) - 1.0) * signed / (BINS - 1),
                       question=here + f"If the component is {verb}, does the probability that the next token after the marked token is {table.piece(token)} go up or go down?")
         elif q == "top":
             p = int(d["position"][c, j])
@@ -346,7 +350,7 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             order = list(range(4))
             rng.shuffle(order)
             ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=[table.piece(options[i]) for i in order],
-                      answer=order.index(0), edit="ablate", option_ids=[int(options[i]) for i in order], question=here + "If the component is removed, which of these next tokens after the marked token gains the most probability?")
+                      answer=order.index(0), edit="ablate", option_ids=[int(options[i]) for i in order], change=-signed / (BINS - 1), question=here + "If the component is removed, which of these next tokens after the marked token gains the most probability?")
         elif q == "continuation":
             cont = table.rel["continuations"]
             g = table.gid(layer, kind, c)
@@ -474,6 +478,10 @@ def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
             if values and values[0] is not None:
                 info += "\nIts write's lens value (standard deviations over tokens; positive activity raises tokens with positive values) for " + ", ".join(
                     f"{table.piece(t)}: {v:+.1f}" for t, v in zip(ex["option_ids"], values)) + "."
+                # The edit's direct effect through the unembedding: the change of its activity (the stated level
+                # times the edit's factor minus one, over 9) times the lens value; weights and the stated activity only.
+                info += "\nThe edit's direct effect on the logit through the unembedding (change of its activity, in units of its largest, times the lens value): " + ", ".join(
+                    f"{table.piece(t)}: {ex['change'] * v:+.2f}" for t, v in zip(ex["option_ids"], values)) + "."
         else:
             info += "\n".join(lens_text(table, l, k, c, f"C{i + 1}", reads=False) for i, (l, k, c, _, _) in enumerate(ex["candidates"]))
     text = table.text(ex["context"], ex["position"], ex["position"])
@@ -636,7 +644,7 @@ def evaluate(args):
     for split, layers in (("heldout_layers", held), ("trained_layers", set(table.layers) - held)):
         for distribution in ("natural", "stratified"):
             data = examples(table, layers, args.examples, args.seed + 1, stratified=distribution == "stratified",
-                            only=tuple(config["questions"].split(",")) if config.get("questions") else (), rule=config.get("rule", False))
+                            only=tuple(config["questions"].split(",")) if config.get("questions") else (), rule=3 if config.get("rule") is True else int(config.get("rule", 0)))
             for s in range(0, len(data), config["batch"]):
                 batch = data[s : s + config["batch"]]
                 lq, valid = oracle.log_q(table, batch, config["condition"])
@@ -709,7 +717,7 @@ def main():
     t.add_argument("--init", help="an earlier run to start from (its adapter and maps)")
     t.add_argument("--per-component", type=int, default=1, help="effect questions per drawn subcomponent, at its strongest contexts")
     t.add_argument("--questions", default="", help="only these question kinds, comma-separated (default: all the relations support)")
-    t.add_argument("--rule", action="store_true", help="the reader sanity check: direction questions answered by the lens rule (see examples)")
+    t.add_argument("--rule", type=int, default=0, choices=(0, 1, 3), help="the reader sanity check: direction questions answered by the lens rule (see examples)")
     t.add_argument("--batch", type=int, default=16)
     t.add_argument("--lr", type=float, default=1e-4)
     t.add_argument("--lora-rank", type=int, default=64)
