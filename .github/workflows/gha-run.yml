@@ -97,7 +97,11 @@ jobs:
       # clippy and test builds): the dependencies, which cost the build most, come from it; the
       # workspace's own crates rebuild from the commit. An entry per commit would evict the other
       # workflows' caches from the repository's 10 GB.
-      - uses: actions/cache@v4
+      # Saved (below) only when missing, and for check, clippy and test only by a run named
+      # cache-KIND that builds the whole workspace's dependencies, so a narrow check never stores a
+      # partial cache that every later check would then rebuild around.
+      - uses: actions/cache/restore@v4
+        id: cache
         with:
           path: |
             ~/.cargo/registry
@@ -166,6 +170,15 @@ jobs:
             exit 0
           fi
           exit "$rc"
+
+      - uses: actions/cache/save@v4
+        if: always() && steps.cache.outputs.cache-hit != 'true' && (inputs.cache == '' || startsWith(inputs.name, 'cache-'))
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}${{ inputs.cache != '' && format('-{0}', inputs.cache) || '' }}
 
       - uses: actions/upload-artifact@v4
         if: always() && inputs.command != ''
