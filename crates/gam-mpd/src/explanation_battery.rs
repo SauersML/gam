@@ -1643,8 +1643,8 @@ pub struct Pair {
 }
 
 /// A node basis of a model for circuits (Arora, Wu et al. 2026; Marks et al. 2025): node groups,
-/// each the columns of one node of a model program on the device, the raw slots that program
-/// takes, and per pair each node's RelP attribution summed over positions.
+/// each the columns of one node of a model program on the device, and the raw slots that program
+/// takes.
 pub struct NodeBasis<'a> {
     pub side: &'a Side,
     pub groups: Vec<usize>,
@@ -1737,7 +1737,8 @@ impl NodeBasis<'_> {
     }
 }
 
-/// Faithfulness and completeness of the circuits of the `k` nodes of largest `|attribution|`
+/// Faithfulness and completeness of the circuits of the `k` nodes of largest measured effect
+/// `|attribution|` ([`NodeBasis::patch_effects`])
 /// (per group, per column) on `test`, for `k` the powers of two up to the node count and the count
 /// itself: `(m(C_k) − m(∅)) / (m(M) − m(∅))` with every node outside the circuit at its mean
 /// (faithfulness) and with the circuit itself at its mean (completeness), `∅` every node at its
@@ -1768,87 +1769,64 @@ pub fn circuit_curve(basis: &NodeBasis, attribution: &[Array1<f64>], train: &[Pa
     Ok(json!({"nodes": total, "m_model": full, "m_empty": empty, "k": ks, "faithfulness": faithfulness, "completeness": completeness}))
 }
 
-/// Per layer, each MLP neuron's RelP attribution (`library_readout::Library` on the library's
-/// starting artifact, whose MLP functions are `M`'s neurons) to the logit difference `target −
-/// foil` at the last position, the counterfactual as the baseline, summed over positions and
-/// averaged over `pairs`.
-pub fn neuron_attributions(library: &crate::library_readout::Library<'_>, pairs: &[Pair], layers: usize) -> Result<Vec<Array1<f64>>, String> {
-    let functions = library.functions();
-    let columns: Vec<Vec<usize>> = (0..layers)
-        .map(|l| functions.iter().enumerate().filter(|(_, f)| f.layer == l && matches!(f.kind, crate::library_readout::Kind::Mlp)).map(|(i, _)| i).collect())
-        .collect();
-    let mut out: Vec<Array1<f64>> = columns.iter().map(|c| Array1::zeros(c.len())).collect();
-    for p in pairs {
-        let prompt = crate::library_readout::Prompt {
-            tokens: p.clean.clone(),
-            baseline: Some(p.counterfactual.clone()),
-            metric: crate::library_readout::Metric::Difference { position: p.clean.len() - 1, target: p.target, foil: p.foil },
-            gradients: false,
-        };
-        let attribution = library.attributions(&prompt)?.attributions.sum_axis(Axis(0));
-        for (acc, cols) in out.iter_mut().zip(&columns) {
-            for (a, c) in acc.iter_mut().zip(cols) {
-                *a += attribution[*c] / pairs.len() as f64;
+impl NodeBasis<'_> {
+    /// Per group and column, the node's measured effect on the logit difference: the mean over
+    /// `pairs` of the change of `target − foil` at the last position when that one column is
+    /// replaced at every position by its value on the counterfactual, every later node rerun
+    /// (activation patching). Columns are patched in copies of the prompts, one column per copy,
+    /// as many copies per pass as fit in `rows` rows.
+    pub fn patch_effects(&self, pairs: &[Pair], rows: usize) -> Result<Vec<Array1<f64>>, String> {
+        let d = self.side.program.device();
+        let mut effects: Vec<Array1<f64>> = Vec::new();
+        for (length, group) in by_length(pairs) {
+            let clean: Vec<&[u32]> = group.iter().map(|p| p.clean.as_slice()).collect();
+            let counterfactual: Vec<&[u32]> = group.iter().map(|p| p.counterfactual.as_slice()).collect();
+            let (_, trace) = self.run(&counterfactual, &|_, _| None)?;
+            let source: Vec<Array2<f64>> = self.groups.iter().map(|n| d.download(trace.value(*n)?).map_err(error)).collect::<Result<_, _>>()?;
+            if effects.is_empty() {
+                effects = source.iter().map(|v| Array1::zeros(v.ncols())).collect();
+            }
+            // Per sequence of a pass (copies of `group`'s prompts), its logit difference.
+            let differences = |count: usize, trace: &DeviceTrace| -> Result<Vec<f64>, String> {
+                let hidden = d.download(trace.value(self.side.hidden)?).map_err(error)?;
+                Ok((0..count)
+                    .map(|i| {
+                        let p = group[i % group.len()];
+                        let h = hidden.row((i + 1) * length - 1);
+                        h.dot(&self.unembedding.row(p.target as usize)) - h.dot(&self.unembedding.row(p.foil as usize))
+                    })
+                    .collect())
+            };
+            let (_, trace) = self.run(&clean, &|_, _| None)?;
+            let base = differences(clean.len(), &trace)?;
+            let per_copy = group.len() * length;
+            let copies = (rows / per_copy).max(1);
+            for (g, value) in source.iter().enumerate() {
+                let columns: Vec<usize> = (0..value.ncols()).collect();
+                for chunk in columns.chunks(copies) {
+                    let sequences: Vec<&[u32]> = chunk.iter().flat_map(|_| clean.iter().copied()).collect();
+                    let replace = |at: usize, current: &Array2<f64>| -> Option<Array2<f64>> {
+                        if at != g {
+                            return None;
+                        }
+                        let mut out = current.clone();
+                        for (j, &c) in chunk.iter().enumerate() {
+                            for r in 0..per_copy {
+                                out[[j * per_copy + r, c]] = value[[r, c]];
+                            }
+                        }
+                        Some(out)
+                    };
+                    let (_, trace) = self.run(&sequences, &replace)?;
+                    let patched = differences(sequences.len(), &trace)?;
+                    for (j, &c) in chunk.iter().enumerate() {
+                        effects[g][c] += (0..group.len()).map(|i| patched[j * group.len() + i] - base[i]).sum::<f64>() / pairs.len() as f64;
+                    }
+                }
             }
         }
+        Ok(effects)
     }
-    Ok(out)
-}
-
-/// Per site, each of VPD's subcomponents' RelP attribution to the logit difference `target − foil`
-/// at the last position, the counterfactual as the baseline, summed over positions and averaged over
-/// `pairs`: `(a_c − a′_c) · (U_c · ∂m/∂y)` with `a_c = x·V_c` the subcomponent's activation (from
-/// `basis`, VPD's program with every mask and remainder at one, which is `M`), `y` its site's
-/// output and the gradient that of `library` (`library_readout`'s RelP on the library's starting
-/// artifact, `M` itself). The attention pattern is frozen, so queries and keys have no path: their
-/// subcomponents' attributions are zero.
-pub fn subcomponent_attributions(library: &crate::library_readout::Library<'_>, basis: &NodeBasis, factors: &[Factors], pairs: &[Pair]) -> Result<Vec<Array1<f64>>, String> {
-    let functions = library.functions();
-    // Per layer, the head index of each of the library's heads in its order.
-    let heads: Vec<Vec<usize>> = (0..factors.len() / KINDS.len())
-        .map(|l| {
-            functions
-                .iter()
-                .filter(|f| f.layer == l && matches!(f.kind, crate::library_readout::Kind::Head))
-                .map(|f| f.name.rsplit('H').next().and_then(|h| h.parse::<usize>().ok()).ok_or_else(|| error(format!("head name {}", f.name))))
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .collect::<Result<_, _>>()?;
-    let d = basis.side.program.device();
-    let mut out: Vec<Array1<f64>> = factors.iter().map(|f| Array1::zeros(f.subcomponents())).collect();
-    for p in pairs {
-        let length = p.clean.len();
-        let prompt = crate::library_readout::Prompt {
-            tokens: p.clean.clone(),
-            baseline: Some(p.counterfactual.clone()),
-            metric: crate::library_readout::Metric::Difference { position: length - 1, target: p.target, foil: p.foil },
-            gradients: true,
-        };
-        let gradients = library.attributions(&prompt)?.gradients.ok_or_else(|| error("RelP returned no gradients"))?;
-        let (_, trace) = basis.run(&[p.clean.as_slice(), p.counterfactual.as_slice()], &|_, _| None)?;
-        for (s, f) in factors.iter().enumerate() {
-            let layer = &gradients[f.layer];
-            let gradient: Array2<f64> = match f.kind {
-                Kind::Query | Kind::Key => continue,
-                Kind::Value => {
-                    let width = layer.values.first().map_or(0, Array2::ncols);
-                    let mut g = Array2::zeros((length, width * heads[f.layer].len()));
-                    for (value, &h) in layer.values.iter().zip(&heads[f.layer]) {
-                        g.slice_mut(s![.., h * width..(h + 1) * width]).assign(value);
-                    }
-                    g
-                }
-                Kind::Output => layer.attention_output.clone(),
-                Kind::Up => layer.gate.clone(),
-                Kind::Down => layer.mlp_output.clone(),
-            };
-            let a = d.download(trace.value(basis.groups[s])?).map_err(error)?;
-            let difference = &a.slice(s![..length, ..]) - &a.slice(s![length.., ..]);
-            let along = gradient.dot(&f.u.t());
-            out[s] += &((&difference * &along).sum_axis(Axis(0)) / pairs.len() as f64);
-        }
-    }
-    Ok(out)
 }
 
 // ------------------------------------------------------------------------------ VPD's code length

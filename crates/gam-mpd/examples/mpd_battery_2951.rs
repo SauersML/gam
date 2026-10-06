@@ -105,7 +105,7 @@ fn checkpoint_mean(path: &Path, explanation: &library_mdl::Explanation) -> Resul
 /// The circuit curves (`explanation_battery::circuit_curve`) on each task of `pairs`
 /// (`bench/vpd_2951/sva_export.py`) of `M`'s MLP neurons and, with `decomposition`, of VPD's
 /// subcomponents (all sites, and the MLP sites alone), and their means over the tasks.
-fn circuits(device: &Device, export: &Path, native: &gam_mpd::operator_program::OperatorProgram, layers: &[gam_mpd::run_check::LayerNodes], pairs: &Path, decomposition: Option<&Path>, settings: &Settings) -> Result<Value, String> {
+fn circuits(device: &Device, export: &Path, layers: &[gam_mpd::run_check::LayerNodes], pairs: &Path, decomposition: Option<&Path>, settings: &Settings) -> Result<Value, String> {
     #[derive(Deserialize)]
     struct Task {
         train: Vec<battery::Pair>,
@@ -119,8 +119,6 @@ fn circuits(device: &Device, export: &Path, native: &gam_mpd::operator_program::
     let count = layers.len();
     let down = |l: usize| model.layout.inputs[battery::KINDS.len() * l + 5];
     let neurons = battery::NodeBasis { side: &m, groups: (0..count).map(down).collect(), given: &none, unembedding: &unembedding };
-    let start = library_mdl::explanation(native, layers)?.artifact;
-    let library = gam_mpd::library_readout::Library::new(device, device, native, layers, &start, settings.numeric_bytes, settings.head_tile_rows)?;
     // VPD's subcomponents, as nodes of its program with every mask and remainder at one (`M`):
     // at all 24 sites, and at the MLP sites alone (the coverage of `M`'s neurons).
     let vpd = decomposition
@@ -156,11 +154,13 @@ fn circuits(device: &Device, export: &Path, native: &gam_mpd::operator_program::
     let mut curves: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
     for (name, task) in &tasks {
         let mut entry = json!({"train": task.train.len(), "test": task.test.len()});
-        let attribution = battery::neuron_attributions(&library, &task.train, count)?;
+        // Nodes ranked by their measured patching effects on the training pairs, as many prompt
+        // copies per pass as fit in the head's tile rows.
+        let attribution = neurons.patch_effects(&task.train, settings.head_tile_rows)?;
         entry["neurons"] = battery::circuit_curve(&neurons, &attribution, &task.train, &task.test)?;
-        if let Some((factors, layout, side, _)) = &vpd {
+        if let Some((_, layout, side, _)) = &vpd {
             let all = battery::NodeBasis { side, groups: layout.activations.clone(), given: &ones, unembedding: &unembedding };
-            let attribution = battery::subcomponent_attributions(&library, &all, factors, &task.train)?;
+            let attribution = all.patch_effects(&task.train, settings.head_tile_rows)?;
             entry["vpd"] = battery::circuit_curve(&all, &attribution, &task.train, &task.test)?;
             let mlp = battery::NodeBasis { side, groups: mlp_sites.iter().map(|s| layout.activations[*s]).collect(), given: &ones, unembedding: &unembedding };
             let mlp_attribution: Vec<_> = mlp_sites.iter().map(|s| attribution[*s].clone()).collect();
@@ -277,7 +277,7 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
     if kind == "circuits" {
-        report["circuits"] = circuits(&device, export, &native, &layers, extra.ok_or(usage)?, more, &settings)?;
+        report["circuits"] = circuits(&device, export, &layers, extra.ok_or(usage)?, more, &settings)?;
         report["seconds"] = json!(started.elapsed().as_secs_f64());
         save(&report)?;
         log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
