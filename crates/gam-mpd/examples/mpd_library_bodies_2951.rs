@@ -541,6 +541,7 @@ fn main() -> Result<(), String> {
                 families: Vec::new(),
                 full_antithetic: false,
                 seed_bf16: false,
+                train_bf16: false,
             };
             let base = library_mdl::explanation(&native, &layers)?;
             let run = Run {

@@ -228,7 +228,7 @@ use crate::{
     },
     run_check::{LayerNodes, head_projection},
 };
-use gam_gpu::tensor::{Device, Op, Storage, Tensor};
+use gam_gpu::tensor::{Arithmetic, Device, Op, Storage, Tensor};
 use gam_runtime::warm_start::Fingerprinter;
 use ndarray::Array2;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -1373,6 +1373,13 @@ pub struct Settings {
     /// its A/B decides.
     #[serde(default)]
     pub seed_bf16: bool,
+    /// The arm whose training steps evaluate `P` (its forward and its head's logits) in bfloat16
+    /// (CUDA), the gradient's reverse passes in bfloat16 as always. Every evaluation without a
+    /// gradient stays in f32: the snapshot estimates the stop and the best epoch are decided on,
+    /// held-out scoring and removal comparisons. An epoch's running estimates (`Epoch::estimates`,
+    /// `objective_bits`) are the steps' own, so in bfloat16. Off by default; its A/B decides.
+    #[serde(default)]
+    pub train_bf16: bool,
 }
 
 /// [`Settings`] as configs and checkpoints hold them, unknown keys refused, and the keys of steps
@@ -1404,6 +1411,8 @@ struct SettingsRecord {
     full_antithetic: bool,
     #[serde(default)]
     seed_bf16: bool,
+    #[serde(default)]
+    train_bf16: bool,
     #[serde(default)]
     rate: Option<serde::de::IgnoredAny>,
     #[serde(default)]
@@ -1441,6 +1450,7 @@ impl From<SettingsRecord> for Settings {
             families: r.families,
             full_antithetic: r.full_antithetic,
             seed_bf16: r.seed_bf16,
+            train_bf16: r.train_bf16,
         }
     }
 }
@@ -1806,6 +1816,8 @@ struct Scorer {
     /// Each batch's drawn edits (by its seed and bases), drawn once: a draw runs `M` on the batch
     /// to find the parts firing there, and a fit asks for a batch's experiments many times.
     edits: std::cell::RefCell<BTreeMap<(u64, Vec<usize>), Vec<(usize, Patch, usize)>>>,
+    /// A training step's evaluation runs `P` in bfloat16 (`Settings::train_bf16`).
+    train_bf16: bool,
 }
 
 impl Scorer {
@@ -1836,7 +1848,7 @@ impl Scorer {
         if settings.families.iter().any(|f| *f != interchange::Family::Read) {
             experiments.set_parts(interchange::parts_of(&explanation.artifact.program, sites.len())?)?;
         }
-        Ok(Self { experiments, mlps, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()) })
+        Ok(Self { experiments, mlps, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), train_bf16: settings.train_bf16 })
     }
 
     fn layers(&self) -> usize {
@@ -1915,7 +1927,18 @@ impl Scorer {
             (true, Some(seed)) => Some(probe_key(seed)),
             _ => None,
         };
-        let evaluation = self.experiments.evaluate_probed(batch, experiments, Some(targets), gradient, probe)?;
+        // With `train_bf16` a step (a gradient) runs `P` in bfloat16, then `P` returns to its own
+        // arithmetic, error or not.
+        let own = self.experiments.program_mut().arithmetic();
+        let bf16 = gradient && self.train_bf16;
+        if bf16 {
+            self.experiments.program_mut().set_arithmetic(Arithmetic::Bf16);
+        }
+        let evaluation = self.experiments.evaluate_probed(batch, experiments, Some(targets), gradient, probe);
+        if bf16 {
+            self.experiments.program_mut().set_arithmetic(own);
+        }
+        let evaluation = evaluation?;
         if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
             return Err("nonfinite explanation divergence".into());
         }
@@ -4284,6 +4307,7 @@ mod tests {
             families: Vec::new(),
             full_antithetic: false,
             seed_bf16: false,
+            train_bf16: false,
         }
     }
 
