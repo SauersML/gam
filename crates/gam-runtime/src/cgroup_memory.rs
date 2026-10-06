@@ -271,6 +271,17 @@ mod linux {
             return inspect_visible_v1_hierarchy(&leaf, &mount.mount_point);
         }
         if let Some(unified) = membership.unified {
+            // A hybrid layout that mounts only cgroup-v1 hierarchies here, none of them the memory
+            // controller (seen on RunPod's A100-SXM4 hosts: `0::/docker/<id>` beside v1 lines and
+            // v1 mounts, no `cgroup2` mount): the unified entry is the named systemd hierarchy, and no
+            // memory controller is visible to bound this process, as when no line names one.
+            let unified_mounted = mountinfo_text
+                .lines()
+                .filter_map(|line| line.split_once(" - "))
+                .any(|(_, after)| after.split_whitespace().next() == Some("cgroup2"));
+            if !unified_mounted {
+                return Ok(CgroupMemoryObservation::NotPresent);
+            }
             let mount = select_controller_mount(
                 &mountinfo_text,
                 &unified,
@@ -845,6 +856,30 @@ mod linux {
                 detect_from_proc_files(&self.cgroup_file, &self.mountinfo_file)
                     .unwrap_or_else(CgroupMemoryObservation::ProbeFailed)
             }
+        }
+
+        /// RunPod's A100-SXM4 layout (pod `scale-hostpeak-cgroup`, 2026-10-06): v1 hierarchies
+        /// without the memory controller and a unified entry no `cgroup2` mount serves. No memory
+        /// controller is visible, so the probe reports none instead of failing closed (which
+        /// admitted 0 bytes on a host with 835 GB available); a `cgroup2` mount that does not
+        /// cover the membership still fails closed.
+        #[test]
+        fn a_hybrid_layout_without_a_visible_memory_controller_has_no_cgroup_limit() {
+            let temp = TempDir::new().expect("fixture tempdir");
+            let (cgroup_file, mountinfo_file) = (temp.path().join("self.cgroup"), temp.path().join("self.mountinfo"));
+            let id = "/docker/a6c75e08e81e87869298d6a6f45a2277042f2ae003ef48534e676311734ceb91";
+            fs::write(&cgroup_file, format!("12:perf_event:{id}\n8:pids:{id}\n6:cpu,cpuacct:{id}\n3:dmem:/\n1:name=systemd:{id}\n0::{id}\n")).expect("membership");
+            let mut mountinfo = String::from("2558 2219 0:219 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,mode=755,uid=100000,gid=100000,inode64\n");
+            for (n, controller) in [(2559, "systemd"), (2564, "cpu,cpuacct"), (2566, "pids"), (2570, "perf_event")] {
+                let option = if controller == "systemd" { "xattr,name=systemd".to_string() } else { controller.to_string() };
+                mountinfo.push_str(&format!("{n} 2558 0:33 {id} /sys/fs/cgroup/{controller} rw,nosuid,nodev,noexec,relatime master:12 - cgroup cgroup rw,{option}\n"));
+            }
+            fs::write(&mountinfo_file, &mountinfo).expect("mountinfo");
+            assert!(matches!(detect_from_proc_files(&cgroup_file, &mountinfo_file), Ok(CgroupMemoryObservation::NotPresent)));
+            mountinfo.push_str("29 23 0:26 /elsewhere /sys/fs/cgroup/unified rw - cgroup2 cgroup2 rw\n");
+            fs::write(&mountinfo_file, &mountinfo).expect("mountinfo");
+            let failure = detect_from_proc_files(&cgroup_file, &mountinfo_file).expect_err("an uncovering cgroup2 mount");
+            assert_eq!(failure.kind(), CgroupMemoryProbeFailureKind::MissingUnifiedMount);
         }
 
         #[test]
