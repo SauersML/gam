@@ -82,8 +82,12 @@ from reporter import Injection, Magnitude  # noqa: E402
 
 KINDS = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj", "head", "function")  # VPD's sites, then the library's
 LABELS = "ABCDEFGHIJ"
-CONDITIONS = ("graph", "weights", "activity", "nothing", "graph_lens", "weights_lens", "weights_examples", "examples")
-QUESTIONS = ("activity", "direction", "top", "continuation", "edge", "attribution")
+CONDITIONS = ("graph", "weights", "activity", "nothing", "graph_lens", "weights_lens", "weights_examples", "examples", "weights_activity")
+QUESTIONS = ("activity", "direction", "top", "continuation", "edge", "attribution", "effect")
+# The edit's effect on M at the edited token, KL(M_e || M) in bits: the edits driver's bins (also the
+# effect question's answers; "barely" includes no change at all).
+EFFECT_BINS = (0.01, 0.1, 1.0)
+EFFECT_LEVELS = ("barely (under 0.01 bits)", "slightly (0.01 to 0.1 bits)", "clearly (0.1 to 1 bit)", "strongly (over 1 bit)")
 BINS = 10
 NEIGHBOURS = 4  # per direction
 SLOTS = 1 + 2 * NEIGHBOURS  # subcomponents per example: itself, then neighbours or candidates
@@ -260,8 +264,12 @@ def effect_index(table: Table, keys: list) -> list[np.ndarray]:
     return [np.concatenate(p) for p in per]
 
 
+def effect_bin(bits: float) -> int:
+    return sum(bits >= b for b in EFFECT_BINS)
+
+
 def examples(table: Table, layers: set[int], count: int, seed: int, stratified: bool = True, per_component: int = 1,
-             only: tuple[str, ...] = (), rule: int = 0) -> list[dict]:
+             only: tuple[str, ...] = (), rule: int = 0, held: int = 0, side: str = "trained") -> list[dict]:
     """`count` questions, the kinds in turn (those the table's relations support, or `only` those). With
     per_component K > 1, each subcomponent an effect question draws is asked about at K of its strongest
     contexts (the drawn one and K - 1 others, in the following questions of that kind).
@@ -271,12 +279,23 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
     the probability goes up iff (edit sign) * (stated activity sign) * (+1 raised, -1 lowered) > 0, the
     edit sign -1 for removal and +1 for amplification (rule 3: a parity of three facts the text states);
     rule 1: amplification of a positive activity only, so the answer is whether the token is listed as
-    raised (one fact). A reader that cannot learn rule 1 from those inputs has a bug."""
+    raised (one fact). A reader that cannot learn rule 1 from those inputs has a bug.
+
+    held > 0: subcomponents split by their index in the table, c % held == 0 held out (side "heldout")
+    and the others trained on (side "trained"), in every layer.
+
+    A row-edit table (vpd_labels.py --edit row) adds the effect question (how much the next-token
+    distribution changes, in the effect bins, no change included) and asks continuations from its own
+    clean and edited continuations; its edits act at the marked token only, or from it on."""
     rng = random.Random(seed)
-    pending: dict[str, list] = {"direction": [], "top": []}
+    ok = (lambda c: True) if not held else ((lambda c: c % held == 0) if side == "heldout" else (lambda c: c % held != 0))
+    pending: dict[str, list] = {"direction": [], "top": [], "effect": []}
     keys = [k for k in table.sites if k[0] in layers]
     kinds = ["activity", "direction", "top"]
-    if "continuations" in table.rel:
+    row = all(m.get("edit") == "row" for m, _ in table.sites.values())
+    if row:
+        kinds.append("effect")
+    if "continuations" in table.rel or (row and all("cont_clean" in d for _, d in table.sites.values())):
         kinds.append("continuation")
     if "edges" in table.rel:
         kinds.append("edge")
@@ -291,6 +310,8 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
         assert kinds == ["direction"] and table.lens is not None, "the rule check asks direction questions with a lens"
         keys = [k for k in keys if int(table.lens[f"{site_name(*k)}.up"][0, 0]) >= 0]  # sites with a write lens
     index = effect_index(table, keys) if stratified else None
+    if index is not None and held:
+        index = [x[[ok(int(c)) for c in x[:, 1]]] if len(x) else x for x in index]
     out = []
     while len(out) < count:
         q = kinds[len(out) % len(kinds)]
@@ -298,7 +319,7 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
         meta, d = table.sites[(layer, kind)]
         c = rng.randrange(meta["subcomponents"])
         j = rng.randrange(meta["top"] + meta["random"])
-        if q in ("direction", "top") and index is not None:
+        if q in ("direction", "top", "effect") and index is not None:
             pool = index[(len(out) // len(kinds)) % len(index)]
             if pending[q]:
                 k, c, j = pending[q].pop()
@@ -310,13 +331,17 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
                 meta, d = table.sites[(layer, kind)]
                 if per_component > 1:
                     others = [x for x in range(meta["top"]) if x != j]
+                    pending.setdefault(q, [])
                     pending[q] = [(k, c, x) for x in rng.sample(others, min(per_component - 1, len(others)))]
+        if not ok(c):
+            continue
         ex = {"layer": layer, "kind": kind, "c": c, "kind_q": q, "j": j, "stratum": -1, "candidates": []}
         contexts = d["contexts"][c].long()
         act = d["activity"][c].float()
         peak = float(act.abs().max())
         here = ""
-        if q in ("direction", "top"):  # an effect question states the activity there (an input-side measurement, not its answer)
+        where = " at the marked token only" if row else ""
+        if q in ("direction", "top", "effect"):  # an effect question states the activity there (an input-side measurement, not its answer)
             a_here = float(act[j, int(d["position"][c, j])])
             signed = int(math.copysign(level(a_here, peak), a_here))
             here = f"At the marked token its activity is {signed:+d} (9 is its largest |activity| over its texts). "
@@ -329,7 +354,7 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             edit, side, r = rng.choice(["ablate", "amplify"]), rng.choice(["up", "down"]), rng.randrange(10)
             if rule == 1:
                 edit = "amplify"
-            verb = "removed" if edit == "ablate" else f"made {meta.get('amplify', 1.5):g} times stronger"
+            verb = ("removed" if edit == "ablate" else f"made {meta.get('amplify', 1.5):g} times stronger") + where
             token, answer = int(d[f"{side}_ids_{edit}"][c, j, r]), 0 if float(d[f"{side}_dp_{edit}"][c, j, r]) > 0 else 1
             if rule:
                 a_sign = int(math.copysign(1, a_here)) if level(a_here, peak) > 0 else 0
@@ -353,7 +378,34 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             order = list(range(4))
             rng.shuffle(order)
             ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=[table.piece(options[i]) for i in order],
-                      answer=order.index(0), edit="ablate", option_ids=[int(options[i]) for i in order], change=-signed / (BINS - 1), question=here + "If the component is removed, which of these next tokens after the marked token gains the most probability?")
+                      answer=order.index(0), edit="ablate", option_ids=[int(options[i]) for i in order], change=-signed / (BINS - 1), question=here + f"If the component is removed{where}, which of these next tokens after the marked token gains the most probability?")
+        elif q == "effect":
+            p = int(d["position"][c, j])
+            edit = rng.choice(["ablate", "amplify"])
+            verb = ("removed" if edit == "ablate" else f"made {meta.get('amplify', 1.5):g} times stronger") + where
+            ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=list(EFFECT_LEVELS), edit=edit,
+                      answer=effect_bin(float(d[f"effect_{edit}"][c, j])),
+                      question=here + f"If the component is {verb}, how much does the model's distribution of the next token after the marked token change?")
+        elif q == "continuation" and row:
+            J = meta.get("continue", 1)
+            j = rng.randrange(J)
+            edit, family = rng.choice(["ablate", "amplify"]), rng.choice(["row", "from"])
+            edited, clean = d[f"cont_{family}_{edit}"][c, j].tolist(), d["cont_clean"][c, j].tolist()
+            other = clean
+            for _ in range(20):
+                other = d["cont_clean"][rng.randrange(d["cont_clean"].shape[0]), 0].tolist()
+                if other not in (edited, clean):
+                    break
+            text = lambda ids: json.dumps(table.tok.decode([i for i in ids if i >= 0]))  # noqa: E731
+            options = [f"changed to {text(edited)}"] if edited != clean else []
+            options = [o for o in options] + [f"unchanged: {text(clean)}", f"changed to {text(other)}"]
+            answer_text = options[0]
+            rng.shuffle(options)
+            p = int(d["position"][c, j])
+            verb = "removed" if edit == "ablate" else f"made {meta.get('amplify', 1.5):g} times stronger"
+            span = "at the marked token only" if family == "row" else "from the marked token on (every later token too)"
+            ex.update(context=int(contexts[j]), position=p, j=j, options=options, answer=options.index(answer_text), edit=edit, family=family,
+                      question=f"If the component is {verb} {span}, how does the model continue the text after the marked token (greedy decoding, {len(clean)} tokens)?")
         elif q == "continuation":
             cont = table.rel["continuations"]
             g = table.gid(layer, kind, c)
@@ -397,6 +449,8 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             ex.update(layer=-1, kind="", c=-1, j=-1, context=ctx, position=p, options=[f"C{i + 1} (layer {l}, {k})" for i, (l, k, _) in enumerate(cands)],
                       candidates=[(l, k, cc, 1.0, "up") for l, k, cc in cands], answer=order.index(0),
                       question=f"At the marked token the model predicts {table.piece(att['token'][r])} next. Which of the listed components raises that prediction most?")
+        if row and ex.get("edit") and ex["c"] >= 0:
+            ex["effect"] = float(d[f"effect_{ex['edit']}"][ex["c"], ex["j"]])  # KL(M_e || M) at the edited token, bits
         out.append(ex)
     return out
 
@@ -416,8 +470,9 @@ def exemplars(table: Table, ex: dict, n: int = 3) -> str:
 
 
 def base(condition: str) -> str:
-    """The condition's vector input (a *_lens or *_examples condition adds text to graph's or weights')."""
-    return condition.removesuffix("_lens").removesuffix("_examples")
+    """The condition's vector input (a *_lens, *_examples or *_activity condition adds text to graph's or
+    weights')."""
+    return condition.removesuffix("_lens").removesuffix("_examples").removesuffix("_activity")
 
 
 def slots(table: Table, ex: dict, condition: str) -> list[tuple]:
@@ -458,13 +513,14 @@ def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
     """The user turn around the placeholders: (before, after)."""
     lens = condition.endswith("_lens")
     public = condition.endswith("examples")
+    shown = condition == "activity" or condition.endswith("_activity")  # its top-activating texts from the label table
     condition = base(condition)
     n = table.depth
     if ex["c"] >= 0:
         before = f"A component of a {n}-layer language model: layer {ex['layer']}, {ex['kind']}. Its vectors, then those of related components:"
     else:
         before = f"Components of a {n}-layer language model. Their vectors:"
-    info = "\n" + exemplars(table, ex) if condition == "activity" and ex["c"] >= 0 else ""
+    info = "\n" + exemplars(table, ex) if shown and ex["c"] >= 0 else ""
     if condition == "graph" and ex["c"] >= 0 and ex["kind_q"] not in ("edge", "attribution"):
         lines = [f"N{i + 1}: layer {l}, {k}, {'upstream: its removal changes this component by' if d == 'up' else 'downstream: depends on this component by'} {s:.2g} of its peak"
                  for i, (l, k, _, s, d) in enumerate(table.neighbours(ex["layer"], ex["kind"], ex["c"]))]
@@ -603,9 +659,10 @@ def table_of(args) -> Table:
 def train(args):
     dev = device()
     torch.manual_seed(args.seed)
-    held = {int(x) for x in args.heldout_layers.split(",") if x}
+    held = {int(x) for x in args.heldout_layers.split(",") if x} if not args.heldout_every else set()
     table = table_of(args)
-    data = examples(table, set(table.layers) - held, args.examples, args.seed, per_component=args.per_component, only=tuple(args.questions.split(",")) if args.questions else (), rule=args.rule)
+    data = examples(table, set(table.layers) - held, args.examples, args.seed, per_component=args.per_component, only=tuple(args.questions.split(",")) if args.questions else (), rule=args.rule,
+                    held=args.heldout_every, side="trained")
     oracle = Oracle(args.base, args.lora_rank, args.inject, dev, table.dims, table.depth)
     if args.init:  # warm start: an earlier run's adapter and maps (same base model); new kinds' maps start fresh
         oracle.load(Path(args.init))
@@ -672,12 +729,16 @@ def evaluate(args):
     oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev, table.dims, table.depth)
     oracle.load(Path(args.run))
     oracle.model.eval()
-    held = {int(x) for x in config["heldout_layers"].split(",") if x}
+    every = config.get("heldout_every", 0)
+    held = {int(x) for x in config["heldout_layers"].split(",") if x} if not every else set()
+    splits = (("heldout_layers", held, "trained"), ("trained_layers", set(table.layers) - held, "trained")) if not every else \
+        (("heldout_subcomponents", set(table.layers), "heldout"), ("trained_subcomponents", set(table.layers), "trained"))
     rows = []
-    for split, layers in (("heldout_layers", held), ("trained_layers", set(table.layers) - held)):
+    for split, layers, side in splits:
         for distribution in ("natural", "stratified"):
             data = examples(table, layers, args.examples, args.seed + 1, stratified=distribution == "stratified",
-                            only=tuple(config["questions"].split(",")) if config.get("questions") else (), rule=3 if config.get("rule") is True else int(config.get("rule", 0)))
+                            only=tuple(config["questions"].split(",")) if config.get("questions") else (), rule=3 if config.get("rule") is True else int(config.get("rule", 0)),
+                            held=every, side=side)
             for s in range(0, len(data), config["batch"]):
                 batch = data[s : s + config["batch"]]
                 lq, valid = oracle.log_q(table, batch, config["condition"])
@@ -685,10 +746,11 @@ def evaluate(args):
                 best = lq.argmax(-1).tolist()
                 for ex, score, guess in zip(batch, log_scores(lq, valid, batch).tolist(), best):
                     rows.append({"split": split, "distribution": distribution, "question": ex["kind_q"], "stratum": ex["stratum"], "layer": ex["layer"], "kind": ex["kind"],
-                                 "c": ex["c"], "context": ex["context"], "log_score": score, "options": len(ex["options"]), "correct": int(guess == ex["answer"])})
+                                 "c": ex["c"], "context": ex["context"], "log_score": score, "options": len(ex["options"]), "correct": int(guess == ex["answer"]),
+                                 "effect": ex.get("effect")})
     (Path(args.run) / f"eval_{Path(args.labels).name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     summary = {}
-    for split in ("heldout_layers", "trained_layers"):
+    for split in [s_ for s_, _, _ in splits]:
         for q in QUESTIONS:
             v = [r for r in rows if r["split"] == split and r["question"] == q and r["distribution"] == "natural"]
             if v:
@@ -700,7 +762,9 @@ def evaluate(args):
 def compare(args):
     """Per split and question: each condition's mean log score and its paired gain over `nothing`
     (the same examples in every run: evaluate draws them from the same seed), with standard errors;
-    effect questions also per stratum, edge questions per strong and near-zero edges."""
+    effect questions also per stratum, edge questions per strong and near-zero edges, and questions about
+    an edit (row-edit tables) per bin of its effect on M at the edited token, KL(M_e || M) in bits, over
+    both distributions ("/effect_bits_<low>-<high>")."""
     runs = {}
     for d in args.runs:
         config = json.loads((Path(d) / "config.json").read_text())
@@ -708,9 +772,19 @@ def compare(args):
     base = runs["nothing"]
     table = {}
     groups = [("natural", None), ("stratified", None)] + [("stratified", k) for k in range(len(STRATA) - 1)]
+    splits = list(dict.fromkeys(r["split"] for r in base))
     for condition, rows in runs.items():
-        for split in ("heldout_layers", "trained_layers"):
+        for split in splits:
             for q in QUESTIONS:
+                for b in range(len(EFFECT_BINS) + 1):
+                    sel = [(r, n) for r, n in zip(rows, base) if r["split"] == split and r["question"] == q and r.get("effect") is not None and effect_bin(r["effect"]) == b]
+                    if not sel:
+                        continue
+                    d = np.array([r["log_score"] - n["log_score"] for r, n in sel])
+                    edges = (0.0, *EFFECT_BINS, float("inf"))
+                    table[f"{condition}/{split}/{q}/effect_bits_{edges[b]:g}-{edges[b + 1]:g}"] = {
+                        "examples": len(d), "log_score_nats": float(np.mean([r["log_score"] for r, _ in sel])), "gain_over_nothing_nats": float(d.mean()),
+                        "standard_error_nats": float(d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else None, "accuracy": float(np.mean([r["correct"] for r, _ in sel]))}
                 for distribution, k in groups:
                     pairs = [(r["log_score"], b["log_score"]) for r, b in zip(rows, base)
                              if r["split"] == split and r["question"] == q and r["distribution"] == distribution and (k is None or r["stratum"] == k)]
@@ -746,6 +820,7 @@ def main():
     t.add_argument("--steps", type=int, required=True)
     t.add_argument("--out", required=True)
     t.add_argument("--heldout-layers", default="2")
+    t.add_argument("--heldout-every", type=int, default=0, help="hold out the subcomponents whose table index is a multiple of N (every layer) instead of layers")
     t.add_argument("--examples", type=int, default=65536)
     t.add_argument("--init", help="an earlier run to start from (its adapter and maps)")
     t.add_argument("--per-component", type=int, default=1, help="effect questions per drawn subcomponent, at its strongest contexts")
