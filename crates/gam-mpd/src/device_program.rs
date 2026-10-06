@@ -369,7 +369,7 @@ impl DeviceTrace {
         Ok(Some(copy))
     }
 
-    /// Drop the bfloat16 copies [`DeviceTrace::rounded_value`] made (their memory is the reverse's
+    /// Drop the bfloat16 copies `DeviceTrace::rounded_value` made (their memory is the reverse's
     /// for one call only).
     pub fn release_rounded(&self) {
         if let Ok(mut rounded) = self.rounded.lock() {

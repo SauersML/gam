@@ -1892,7 +1892,7 @@ fn importance_given(vpd: &Vpd, family: &FamilyInputs) -> Result<BTreeMap<usize, 
 /// 30 epochs, at any `N`).
 ///
 /// With `charge` (VPD's decomposition directory) the causal-importance network is charged too
-/// ([`Charged`]): its weights are a posterior of their own, one prior group per operator row,
+/// (`Charged`): its weights are a posterior of their own, one prior group per operator row,
 /// sampled with the subcomponents', and `F` adds its description; the masks still read `M`'s
 /// clean activations. Its posterior is written beside `save` (extension `network.f32`).
 pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec<u32>], batch: usize, seed: u64, (start, charge): (Option<&Path>, Option<&Path>), save: &Path, mut report: impl FnMut(&Value) -> Result<(), String>) -> Result<Value, String> {
