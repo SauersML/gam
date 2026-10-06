@@ -1126,12 +1126,16 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
     Ok((stream, calls))
 }
 
-/// The products' precision of the sampled-label factor's reverse pass: bfloat16 on CUDA in f32
-/// storage (whose bfloat16 tensor cores run at least twice its f32 rate), else the forward's
-/// `arithmetic`. The factor is one label draw, whose square estimates the Gauss–Newton diagonal
-/// with a relative standard deviation near one per entry; bfloat16 operands move each entry by a
-/// few percent, which adds about a percent to that variance. The data term's gradient, which
-/// IVON's mean follows, keeps the forward's arithmetic.
+/// The products' precision of the reverse passes (the data term's gradient and the sampled-label
+/// factor): bfloat16 on CUDA in f32 storage (whose bfloat16 tensor cores run at least twice its
+/// f32 rate), else the forward's `arithmetic`. The forward passes and the scores, the objective and
+/// the line step's measurements, keep the forward's arithmetic. Each reverse pass's result is one
+/// Monte Carlo draw (the gradient at one weight sample, and the factor whose square estimates the
+/// Gauss–Newton diagonal); bfloat16 operands move their entries by about 0.55% (vpd4l, against the
+/// float64 reference). Fit A/B speed-revab (vpd4l, N = 2^20, RTX 4090, seeds 1-2): F after epochs
+/// 0/1/2 at 44.10/29.00/24.15 and 44.78/29.78/23.21 M bits with the data term's reverse in
+/// bfloat16, against 45.04/30.75/24.99 and 43.37/29.51/25.03 in f32, and 0.1231 s per step against
+/// 0.1315.
 fn factor_arithmetic(d: &Device, arithmetic: Arithmetic) -> Arithmetic {
     if d.storage() == Storage::F32 && d.with_storage(Storage::Bf16).is_ok() { Arithmetic::Bf16 } else { arithmetic }
 }
@@ -1478,7 +1482,7 @@ pub fn evaluate_labelled<E: BlockEngine>(
         }
         if gradient {
             let seed = seed.ok_or_else(|| error("the head returned no cotangent"))?;
-            run_reverse([p, m], &plan, &calls, spread(&seed, 1.0 / std::f64::consts::LN_2)?, &mut total, arithmetic)?;
+            run_reverse([p, m], &plan, &calls, spread(&seed, 1.0 / std::f64::consts::LN_2)?, &mut total, factor_arithmetic(d, arithmetic))?;
         }
     }
     let factor = match labels {
