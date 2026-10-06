@@ -1942,7 +1942,7 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
     drop((means, log_sd));
     let variance_nats: f64 = sizes.iter().map(|n| 0.5 * n.ln()).sum();
     let batches: Vec<&[Vec<u32>]> = train.chunks(batch).collect();
-    let ivon = crate::device_posterior::Ivon { rate: 0.0, beta1: 0.0, beta2: 1.0 - 1.0 / batches.len() as f64 };
+    let ivon = crate::device_posterior::Ivon { beta1: 0.0, beta2: 1.0 - 1.0 / batches.len() as f64 };
     let head = d_copy(&device, &vpd.e.head)?;
     let arithmetic = program.arithmetic();
     // One pass over `sequences` at a sample per batch (with `step`, IVON's step after each): the
@@ -1970,6 +1970,8 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
                 let (_, factor) = program.vjp_values_dense(&trace, BTreeMap::from([(hidden_node, labels)]), &[], &trainable, arithmetic)?;
                 let per_token = 1.0 / family.rows as f64;
                 posterior.step(&gradients, per_token, (&factor, per_token), &ivon)?;
+                // The pass sets the deviations only: the means stay where they are.
+                posterior.settle_line(0.0, ivon.beta2)?;
             }
             out.push((kl, family.rows));
         }

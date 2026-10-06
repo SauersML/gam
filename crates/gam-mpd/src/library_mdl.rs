@@ -1295,16 +1295,15 @@ impl Posterior {
 
 // ------------------------------------------------------------------------------------- the fit
 
-/// The optimizer's step sizes and the run's resources (none of them is part of the objective).
+/// The optimizer's settings and the run's resources (none of them is part of the objective). Read
+/// through [`SettingsRecord`], which also accepts and drops the keys of retired steps.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "SettingsRecord")]
 pub struct Settings {
     /// Base sequences per step.
     pub batch_sequences: usize,
-    /// IVON's step in `μ` as a fraction of the Newton step `(m + δ μ) / (h + δ)`, and the decay of
-    /// the gradient's momentum `m`. The curvature estimate averages over one epoch's batches and
-    /// sets `σ` (module note).
-    pub rate: f64,
+    /// The decay of the gradient's momentum `m`. The curvature estimate averages over one epoch's
+    /// batches and sets `σ`; each step's length along IVON's direction is measured (module note).
     pub beta1: f64,
     /// The seed of the weight noise and of the experiments' draws.
     pub seed: u64,
@@ -1312,14 +1311,6 @@ pub struct Settings {
     pub numeric_bytes: usize,
     /// Rows of vocabulary logits formed at once.
     pub head_tile_rows: usize,
-    /// The A/B arm at `N = 2^24` (`DevicePosterior::set_arm`) clamping the mean's move to `±α σ`
-    /// in place of `±σ`; the A/B's outcome deletes it or `line_search`.
-    #[serde(default)]
-    pub trust_rate: bool,
-    /// The line arm: each step moves to the minimum along IVON's full direction of the batch's `F`,
-    /// measured at a trial step, in place of the step `α` (`DevicePosterior::finish_line`).
-    #[serde(default)]
-    pub line_search: bool,
     /// The half-factor arm: a training step draws the Gauss–Newton factor from its first
     /// antithetic half's experiments alone (`antithetic_step`), with the curvature estimate per
     /// token of those tokens. A draw's squared factor `u ⊙ u` has a relative standard deviation
@@ -1349,11 +1340,66 @@ pub struct Settings {
     pub epochs: Option<usize>,
 }
 
+/// [`Settings`] as configs and checkpoints hold them, unknown keys refused, and the keys of steps
+/// the fit no longer has accepted and dropped: `rate` (IVON's fixed fraction of the Newton step,
+/// replaced by the measured line step), `trust_rate`, `line_search`, `split_filter`,
+/// `deterministic` (the 2^16 and 2^24 A/B arms) and `decoder`, so that configs and checkpoints
+/// written before still read.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsRecord {
+    batch_sequences: usize,
+    beta1: f64,
+    seed: u64,
+    numeric_bytes: usize,
+    head_tile_rows: usize,
+    #[serde(default)]
+    half_factor: bool,
+    #[serde(default)]
+    one_sample: bool,
+    #[serde(default)]
+    rotated: bool,
+    #[serde(default)]
+    epochs: Option<usize>,
+    #[serde(default)]
+    rate: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    trust_rate: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    line_search: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    split_filter: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    deterministic: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    decoder: Option<serde::de::IgnoredAny>,
+}
+
+impl From<SettingsRecord> for Settings {
+    fn from(r: SettingsRecord) -> Self {
+        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some())];
+        for (key, present) in retired {
+            if present {
+                log::info!("library settings: the retired key `{key}` is ignored");
+            }
+        }
+        Settings {
+            batch_sequences: r.batch_sequences,
+            beta1: r.beta1,
+            seed: r.seed,
+            numeric_bytes: r.numeric_bytes,
+            head_tile_rows: r.head_tile_rows,
+            half_factor: r.half_factor,
+            one_sample: r.one_sample,
+            rotated: r.rotated,
+            epochs: r.epochs,
+        }
+    }
+}
+
 impl Settings {
     fn validate(&self) -> Result<(), String> {
-        let positive = |x: f64| x.is_finite() && x > 0.0;
         if self.batch_sequences == 0
-            || !positive(self.rate)
             || !(0.0..1.0).contains(&self.beta1)
             || self.numeric_bytes == 0
             || self.head_tile_rows == 0
@@ -2920,8 +2966,6 @@ pub fn fit_from(
     let resumed_seconds = progress.seconds;
     let fresh = resumed.is_none();
     let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, resumed.as_deref().map(State::Saved), u64::try_from(progress.step).map_err(error)?)?;
-    let trust = if settings.trust_rate { settings.rate } else { 1.0 };
-    device_posterior.set_arm(trust, settings.line_search);
     drop(resumed);
     // A resumed fit holds exactly the device's means of the checkpoint, and the iterate they
     // average with the steps they span: it goes on as the fit that was not stopped.
@@ -2940,11 +2984,10 @@ pub fn fit_from(
         // The unit-information start's state goes before the Laplace start's is made.
         drop(device_posterior);
         device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, Some(State::Curvature(&curvature)), 0)?;
-        device_posterior.set_arm(trust, settings.line_search);
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
     // The curvature estimate averages over one epoch's batches: each batch weighs about once.
-    let ivon = Ivon { rate: settings.rate, beta1: settings.beta1, beta2: 1.0 - 1.0 / draws.len() as f64 };
+    let ivon = Ivon { beta1: settings.beta1, beta2: 1.0 - 1.0 / draws.len() as f64 };
     // Each group's size, whose `½ ln |G|` an active group's variance costs.
     let sizes: Vec<f64> = explanation.groups.iter().map(|g| g.cells.iter().map(|c| (c.rows.len() * c.cols.len()) as f64).sum()).collect();
     // The fit's thread streams the checkpoint off the device to the writer thread, which finishes
@@ -3935,13 +3978,10 @@ mod tests {
     fn settings() -> Settings {
         Settings {
             batch_sequences: 2,
-            rate: 0.1,
             beta1: 0.9,
             seed: 3,
             numeric_bytes: 1 << 26,
             head_tile_rows: 64,
-            trust_rate: false,
-            line_search: false,
             half_factor: false,
             one_sample: false,
             rotated: false,
@@ -4196,7 +4236,7 @@ mod tests {
         let gradients: Vec<Array2<f64>> = posterior.mean.iter().map(|m| m.mapv(|_| rng.random::<f64>() - 0.5)).collect();
         let factors: Vec<Array2<f64>> = posterior.mean.iter().map(|m| m.mapv(|_| rng.random::<f64>() - 0.5)).collect();
         let up = |values: &[Array2<f64>]| -> BTreeMap<usize, Tensor> { explanation.trainable.iter().zip(values).map(|(op, g)| (*op, device.upload(g.view()).unwrap())).collect() };
-        let ivon = Ivon { rate: settings.rate, beta1: settings.beta1, beta2: 0.75 };
+        let ivon = Ivon { beta1: settings.beta1, beta2: 0.75 };
         device_posterior.step(&up(&gradients), scale, (&up(&factors), square), &ivon).unwrap();
         let mut stepped = posterior.clone();
         device_posterior.download(&mut stepped).unwrap();
@@ -4325,7 +4365,7 @@ mod tests {
         let gradients: Vec<Array2<f64>> = posterior.mean.iter().map(|m| m.mapv(|_| rng.random::<f64>() - 0.5)).collect();
         let factors: Vec<Array2<f64>> = posterior.mean.iter().map(|m| m.mapv(|_| rng.random::<f64>() - 0.5)).collect();
         let up = |values: &[Array2<f64>]| -> BTreeMap<usize, Tensor> { explanation.trainable.iter().zip(values).map(|(op, g)| (*op, device.upload(g.view()).unwrap())).collect() };
-        let ivon = Ivon { rate: settings.rate, beta1: settings.beta1, beta2: 0.75 };
+        let ivon = Ivon { beta1: settings.beta1, beta2: 0.75 };
         device_posterior.step(&up(&gradients), scale, (&up(&factors), square), &ivon).unwrap();
         let mut stepped = posterior.clone();
         device_posterior.download(&mut stepped).unwrap();

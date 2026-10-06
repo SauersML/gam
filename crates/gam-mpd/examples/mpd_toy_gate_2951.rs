@@ -258,7 +258,7 @@ fn fit(target: &dyn Target, native: &[Array2<f64>], account: &Account, batches: 
     let parts = Parts { operators: &operators, mean: &posterior.mean, log_sd: &posterior.log_sd, groups: &groups, count: account.groups, rotations: &posterior.rotations };
     let mut device = DevicePosterior::from_parts(&host, &parts, tokens as f64, None, 0)?;
     let count = batches.len() as f64;
-    let ivon = Ivon { rate: 0.1, beta1: 0.9, beta2: 1.0 - 1.0 / count };
+    let ivon = Ivon { beta1: 0.9, beta2: 1.0 - 1.0 / count };
     let upload = |a: &Array2<f64>| host.upload(a.view()).map_err(|e| e.to_string());
     let mut previous: Option<Vec<f64>> = None;
     let mut epoch = 0;
@@ -292,6 +292,26 @@ fn fit(target: &dyn Target, native: &[Array2<f64>], account: &Account, batches: 
             let gradient: BTreeMap<usize, _> = operators.iter().map(|i| Ok((*i, upload(&gradient[*i])?))).collect::<Result<_, String>>()?;
             let factor: BTreeMap<usize, _> = operators.iter().map(|i| Ok((*i, upload(&factor[*i])?))).collect::<Result<_, String>>()?;
             device.step(&gradient, 1.0 / BATCH as f64, (&factor, 1.0 / BATCH as f64), &ivon)?;
+            // The step's length along IVON's direction, measured on the next batch at its own
+            // draws at η = 0, η₀ and 2η₀ (`DevicePosterior::finish_line`), the data term per token.
+            let trial = device.line_trial().ok_or("no line step awaits a measurement")?;
+            let other = (b + 1) % batches.len();
+            let (other_x, other_y) = (&batches[other], &outputs[other]);
+            let other_key = crate::key(seed, epoch, other);
+            let mut values = [0.0; 3];
+            for (k, value) in values.iter_mut().enumerate() {
+                device.place_line(trial * k as f64)?;
+                let mut theta = Vec::with_capacity(operators.len());
+                for i in &operators {
+                    let (iterate, log_sd) = device.iterate_values(*i)?;
+                    let mut sample = host.zeros(iterate.nrows(), iterate.ncols()).map_err(|e| e.to_string())?;
+                    host.reparameterize(&mut sample, (&upload(&iterate)?, &upload(&log_sd)?), (other_key, *i as u64)).map_err(|e| e.to_string())?;
+                    theta.push(host.download(&sample).map_err(|e| e.to_string())?);
+                }
+                let (out, _) = target.forward(&account.assemble(&theta), other_x);
+                *value = (out - other_y).iter().map(|r| r * r).sum::<f64>() / (2.0 * s2) / BATCH as f64;
+            }
+            device.finish_line(values, ivon.beta2)?;
         }
         let converged = previous.as_ref().is_some_and(|before| {
             let differences: Vec<f64> = before.iter().zip(&estimates).map(|(a, b)| a - b).collect();

@@ -64,7 +64,7 @@ fn case(axis: GroupAxis) -> Case {
     }
     // The gradient's momentum, a positive curvature estimate and the gradient's second moment.
     let moments = [matrix(rows, cols, 3, 0.1, 0.0), matrix(rows, cols, 4, 0.5, 1.0), matrix(rows, cols, 5, 0.01, 0.02)];
-    let step = PosteriorStep { gradient_scale: 1.5, factor_scale: 0.25, tokens: 50.0, rate: 0.1, beta1: 0.9, beta2: 0.999, step: 7, trust: 1.0 };
+    let step = PosteriorStep { gradient_scale: 1.5, factor_scale: 0.25, tokens: 50.0, beta1: 0.9, beta2: 0.999, step: 7 };
     let (gradient, factor) = (matrix(rows, cols, 7, 3.0, 0.0), matrix(rows, cols, 8, 2.0, 0.0));
     Case { mean, log_sd, moments, sample: (0x1234_5678_9abc_def0, 42), gradient, factor, groups, count: 8, step }
 }
@@ -101,7 +101,7 @@ fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 
         if s == f64::NEG_INFINITY {
             continue;
         }
-        let (sd, gr) = (s.exp(), c.step.gradient_scale * c.gradient[at]);
+        let gr = c.step.gradient_scale * c.gradient[at];
         let delta = 1.0 / (n * variance[*g as usize]);
         let momentum = b1 * moments[0][at] + (1.0 - b1) * gr;
         let power = b1 * moments[2][at] + (1.0 - b1) * gr * gr;
@@ -114,7 +114,7 @@ fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 
         moments[0][at] = momentum;
         moments[1][at] = curvature;
         moments[2][at] = power;
-        mean[at] = mu - (c.step.rate * signal / (curvature + delta)).clamp(-sd, sd);
+        mean[at] = mu - signal / (curvature + delta);
         log_sd[at] = -0.5 * (n * (curvature + delta)).ln();
         let a = &mut after[*g as usize];
         a[0] += 1.0;
@@ -307,8 +307,10 @@ fn a_bfloat16_sample_is_the_f32_sample_rounded() {
 /// `μ* = −6.6`, and the gradient's noise equals the full gradient's size at the start
 /// (`s = δ |a|`), so the data term's pull near `μ*` is within the momentum's noise. Each step
 /// draws `θ = μ + σ ε` and `g = h (θ − a) + s z` (`ε`, `z` standard normal), and the Gauss–Newton
-/// factor `√h`, so the curvature stays `h`. Returns each coordinate's average `μ` over the last half
-/// of `steps` steps. `fit` holds the posterior, `wide` the group's variance and sums.
+/// factor `√h`, so the curvature stays `h`. The kernel takes IVON's full direction; each step
+/// moves a tenth of it, as a line step whose measurement the test does not model would. Returns
+/// each coordinate's average `μ` over the last half of `steps` steps. `fit` holds the posterior,
+/// `wide` the group's variance and sums.
 fn settled(fit: &Device, wide: &Device, steps: u64) -> (f64, Vec<f64>) {
     const R: usize = 64;
     let (tokens, v) = (65_536.0, 1.0);
@@ -334,9 +336,11 @@ fn settled(fit: &Device, wide: &Device, steps: u64) -> (f64, Vec<f64>) {
             let theta = mu[(0, i)] + sd[(0, i)] * f64::from(posterior_normal(11, t, i as u64));
             h * (theta - a) + s * f64::from(posterior_normal(12, t, i as u64))
         });
-        let step = PosteriorStep { gradient_scale: 1.0, factor_scale: 1.0, tokens, rate: 0.1, beta1: 0.9, beta2: 1.0 - 1.0 / 64.0, step: t, trust: 1.0 };
+        let step = PosteriorStep { gradient_scale: 1.0, factor_scale: 1.0, tokens, beta1: 0.9, beta2: 1.0 - 1.0 / 64.0, step: t };
         let mut sums = wide.zeros(1, 3).unwrap();
         fit.posterior_ivon((&mut mean, &mut log_sd), [&mut momentum, &mut curvature, &mut power], (&up(gradient), &factor), (&groups, &variance), &mut sums, &step).unwrap();
+        let full = fit.download(&mean).unwrap();
+        mean = up(&mu + &((&full - &mu) * 0.1));
     }
     (target, averages)
 }

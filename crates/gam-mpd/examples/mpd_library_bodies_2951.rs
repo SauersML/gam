@@ -518,13 +518,10 @@ fn main() -> Result<(), String> {
             let sequences: Vec<Vec<u32>> = tokens.chunks(CONTEXT).map(<[u32]>::to_vec).collect();
             let fit = library_mdl::Settings {
                 batch_sequences: 32,
-                rate: 0.1,
                 beta1: 0.9,
                 seed: 1,
                 numeric_bytes: 1 << 28,
                 head_tile_rows: 64,
-                trust_rate: false,
-                line_search: false,
                 half_factor: false,
                 one_sample: false,
                 rotated: false,

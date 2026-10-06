@@ -227,7 +227,7 @@ fn main() -> Result<(), String> {
     let zeros: BTreeMap<usize, gam_gpu::tensor::Tensor> =
         trainable.iter().zip(&start.mean).map(|(op, m)| Ok((*op, device.zeros(m.nrows(), m.ncols()).map_err(error)?))).collect::<Result<_, String>>()?;
     let experiments = interchange::sample(&mut StdRng::seed_from_u64(1), sequences, &variables, 2 * layer_count, context)?;
-    let ivon = Ivon { rate: 0.1, beta1: 0.9, beta2: 0.999 };
+    let ivon = Ivon { beta1: 0.9, beta2: 0.999 };
     // The gradient of the data term per scored token, in nats.
     let scale = std::f64::consts::LN_2 / (experiments.len() * context) as f64;
     fn p_model<'a>(program: &'a DeviceProgram, (flat, streams, reads, trainable, values): (&OperatorProgram, &[usize], &[usize], &[usize], &[interchange::Value])) -> Result<Model<'a>, String> {
@@ -269,6 +269,8 @@ fn main() -> Result<(), String> {
             };
             timed(&device, s, "description", || Ok(posterior.divergences()?.iter().sum::<f64>()))?;
             timed(&device, s, "posterior_step", || posterior.step(&gradient, scale, (&factor, 1.0 / labelled as f64), &ivon))?;
+            // The step's direction without its measured length (`library_mdl`'s line step).
+            posterior.settle_line(0.0, ivon.beta2)?;
         }
     }
     let report = json!({

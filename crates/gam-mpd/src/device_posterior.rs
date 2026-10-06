@@ -69,12 +69,11 @@ fn error(e: impl std::fmt::Display) -> String {
     format!("device posterior: {e}")
 }
 
-/// IVON's settings of a step ([`DevicePosterior::step`], [`Device::posterior_ivon`]): the mean's
-/// step `α` as a fraction of the Newton step, the gradient momentum's decay `β₁` and the curvature
-/// estimate's decay `β₂`.
+/// IVON's settings of a step ([`DevicePosterior::step`], [`Device::posterior_ivon`]): the gradient
+/// momentum's decay `β₁` and the curvature estimate's decay `β₂`. The step's length along IVON's
+/// direction is measured ([`DevicePosterior::finish_line`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Ivon {
-    pub rate: f64,
     pub beta1: f64,
     pub beta2: f64,
 }
@@ -140,13 +139,9 @@ pub struct DevicePosterior {
     /// `averaged` steps since the posterior was last set, up to one epoch (module note).
     average: Vec<Tensor>,
     averaged: u64,
-    /// The clamp arm of the 2^24 comparison (`PosteriorStep::trust`); the A/B's outcome deletes it
-    /// or the line arm.
-    trust: f64,
-    /// The line arm: the iterate moves to the minimum along IVON's full direction of the batch's
-    /// `F`, measured at a trial step (`DevicePosterior::finish_line`); `ratio` is the next trial
-    /// step and `ratio_steps` the line steps taken, `line_state` the step awaiting its measurement.
-    line: bool,
+    /// The line step: the iterate moves to the minimum along IVON's full direction of `F`, measured
+    /// at trial steps (`DevicePosterior::finish_line`); `ratio` is the next trial step and
+    /// `ratio_steps` the line steps taken, `line_state` the step awaiting its measurement.
     ratio: f64,
     ratio_steps: u64,
     line_state: Option<LineState>,
@@ -290,8 +285,6 @@ impl DevicePosterior {
             groups: parts.groups.iter().zip(&shapes).map(|(ids, shape)| master.group_map(ids, *shape).map_err(error)).collect::<Result<_, _>>()?,
             average: Vec::new(),
             averaged: 0,
-            trust: 1.0,
-            line: false,
             ratio: 1.0,
             ratio_steps: 0,
             line_state: None,
@@ -313,10 +306,16 @@ impl DevicePosterior {
         Ok(out)
     }
 
-    /// Sets the A/B arm: the mean's move clamped to `±trust σ`, or the line arm
-    /// (`DevicePosterior::finish_line`).
-    pub fn set_arm(&mut self, trust: f64, line: bool) {
-        (self.trust, self.line) = (trust, line);
+    /// Trainable operator `i`'s iterate along its own axes and its log standard deviations, on the
+    /// host: where a step's gradient is taken (`DevicePosterior::iterate_into`), for a caller
+    /// that measures a line step on the host.
+    pub fn iterate_values(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>), String> {
+        let mean = self.fitting.download(&self.mean[i]).map_err(error)?;
+        let mean = match &self.rotations[i] {
+            Some(r) => r.apply(&mean),
+            None => mean,
+        };
+        Ok((mean, self.fitting.download(&self.log_sd[i]).map_err(error)?))
     }
 
     /// The groups' variances and divergences from the posterior as it stands, at its mean `μ̄`.
@@ -443,6 +442,18 @@ impl DevicePosterior {
         self.ratio_steps += 1;
         self.average_and_refresh(beta2)?;
         Ok(LineReport { eta, trial, measured: 2.0 * c, draw: state.draw_curvature, diagonal: state.diagonal, own_slope: state.slope_data, slope: descent })
+    }
+
+    /// Ends a pending line step at `η` along its direction without a measurement: `η = 0` for a
+    /// caller that moves no mean (a pass that only sets the deviations), or a fraction a test
+    /// fixes. A fit measures its steps ([`DevicePosterior::finish_line`]).
+    pub fn settle_line(&mut self, eta: f64, beta2: f64) -> Result<(), String> {
+        let state = self.line_state.take().ok_or_else(|| error("no line step awaits a measurement"))?;
+        for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
+            *mean = self.fitting.copy(start).map_err(error)?;
+            self.fitting.axpy(mean, -eta, d).map_err(error)?;
+        }
+        self.average_and_refresh(beta2)
     }
 
     /// Operator `i`'s direction `d = before − μ` after the kernel's full step, with its terms added
@@ -627,12 +638,15 @@ impl DevicePosterior {
     /// per token. An operator the batch does not reach has neither, and its step takes the
     /// prior's alone.
     pub fn step(&mut self, gradients: &BTreeMap<usize, Tensor>, scale: f64, factor: (&BTreeMap<usize, Tensor>, f64), ivon: &Ivon) -> Result<(), String> {
+        if self.line_state.is_some() {
+            return Err(error("a line step awaits its measurement"));
+        }
         self.uploaded.clear();
         self.steps += 1;
-        // The line arm takes IVON's full direction (rate 1, no clamp) from the iterate kept here.
-        let before = if self.line { Some(self.mean.iter().map(|m| self.fitting.copy(m).map_err(error)).collect::<Result<Vec<_>, _>>()?) } else { None };
-        let (rate, trust) = if self.line { (1.0, f64::INFINITY) } else { (ivon.rate, self.trust) };
-        let mut line = if self.line { Some(((0..5).map(|_| self.wide.zeros(self.group_count(), 3).map_err(error)).collect::<Result<Vec<_>, _>>()?, Vec::new())) } else { None };
+        // The kernel takes IVON's full direction from the iterate kept here.
+        let before: Vec<Tensor> = self.mean.iter().map(|m| self.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
+        let mut sums: Vec<Tensor> = (0..5).map(|_| self.wide.zeros(self.group_count(), 3).map_err(error)).collect::<Result<_, _>>()?;
+        let mut directions = Vec::with_capacity(before.len());
         for (i, &op) in self.operators.iter().enumerate() {
             let zero = |given: Option<&Tensor>| -> Result<Option<Tensor>, String> {
                 match given {
@@ -646,16 +660,14 @@ impl DevicePosterior {
             // Along the rotated axes, where the posterior is held.
             let (rotated_gradient, rotated_draw) = (self.undone(i, gradient)?, self.undone(i, draw)?);
             let (gradient, draw) = (rotated_gradient.as_ref().unwrap_or(gradient), rotated_draw.as_ref().unwrap_or(draw));
-            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, rate, beta1: ivon.beta1, beta2: ivon.beta2, step: self.steps, trust };
+            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, beta1: ivon.beta1, beta2: ivon.beta2, step: self.steps };
             let [momentum, curvature, power] = &mut self.moments[i];
             self.fitting
                 .posterior_ivon((&mut self.mean[i], &mut self.log_sd[i]), [momentum, curvature, power], (gradient, draw), (&self.groups[i], &self.variance), &mut self.sums, &step)
                 .map_err(error)?;
-            if let (Some(before), Some((sums, directions))) = (before.as_ref(), line.as_mut()) {
-                directions.push(self.line_terms(i, &before[i], (gradient, draw), sums)?);
-            }
+            directions.push(self.line_terms(i, &before[i], (gradient, draw), &mut sums)?);
         }
-        if let (Some(before), Some((sums, directions))) = (before, line) {
+        {
             // The step's terms along `d`; the iterate waits at the trial step for its measurement
             // (`DevicePosterior::finish_line`), which also averages and refreshes.
             let variances = self.variances()?;
@@ -677,10 +689,8 @@ impl DevicePosterior {
                 self.fitting.axpy(mean, -self.ratio, d).map_err(error)?;
             }
             self.line_state = Some(state);
-            return Ok(());
         }
-        // The groups' variances and divergences at `μ̄`, not at the iterate the step summed.
-        self.average_and_refresh(ivon.beta2)
+        Ok(())
     }
 
     /// The number of prior groups.
@@ -900,8 +910,7 @@ mod tests {
         let groups = vec![vec![0u32; R]];
         let parts = Parts { operators: &[0], mean: std::slice::from_ref(&mean), log_sd: std::slice::from_ref(&log_sd), groups: &groups, count: 1, rotations: &[None] };
         let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens, None, 0).unwrap();
-        posterior.set_arm(1.0, true);
-        let ivon = Ivon { rate: 0.1, beta1: 0.9, beta2: 0.75 };
+        let ivon = Ivon { beta1: 0.9, beta2: 0.75 };
         let data = |mu: &Array2<f64>| 0.5 * a * mu.iter().zip(&target).map(|(m, t)| (m - t) * (m - t)).sum::<f64>();
         let factor = device.upload(Array2::from_elem((1, R), a.sqrt()).view()).unwrap();
         for step in 0..2 {
@@ -951,7 +960,7 @@ mod tests {
         let parts = Parts { operators: &[0], mean: std::slice::from_ref(&a), log_sd: std::slice::from_ref(&log_sd), groups: &groups, count: 1, rotations: &[None] };
         let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens, None, 0).unwrap();
         let start = posterior.variances().unwrap()[0];
-        let ivon = Ivon { rate: 0.1, beta1: 0.9, beta2: 1.0 - 1.0 / 64.0 };
+        let ivon = Ivon { beta1: 0.9, beta2: 1.0 - 1.0 / 64.0 };
         let s = 1e-4;
         let factor = device.upload(Array2::from_shape_fn((1, R), |(_, i)| if free(i) { 0.0 } else { h.sqrt() }).view()).unwrap();
         let mut largest: f64 = 0.0;
@@ -964,6 +973,8 @@ mod tests {
             let gradients = BTreeMap::from([(0, device.upload(gradient.view()).unwrap())]);
             let factors = BTreeMap::from([(0, device.copy(&factor).unwrap())]);
             posterior.step(&gradients, 1.0, (&factors, 1.0), &ivon).unwrap();
+            // A tenth of IVON's direction, as a line step whose measurement the test does not model.
+            posterior.settle_line(0.1, ivon.beta2).unwrap();
             largest = largest.max(posterior.variances().unwrap()[0]);
         }
         let (mean, log_sd) = posterior.values(0).unwrap();
