@@ -502,6 +502,43 @@ fn the_starting_qwen3_library_explains_m_under_every_patch() {
     the_starting_library_explains_m_under_every_patch(crate::test_support::tiny_qwen3_export("interchange_library_qwen3", 2));
 }
 
+#[test]
+fn a_body_rewrite_explains_m_under_every_patch() {
+    // Four of layer 1's MLP functions rewritten as a call of a new body (`library_bodies::rewrite`,
+    // exact: every singular value of their rows is kept). Their values now sit at the body's units
+    // at the call, the other functions' at the MLP's rule, and every patch, of the region's
+    // functions alone, with others, or elsewhere, still scores zero against M.
+    let dir = crate::test_support::tiny_export("interchange_body_rewrite", 2);
+    let imported = crate::import::import_language_model(&dir, 6, 12).expect("the tiny export imports");
+    std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+    let native = split_sites(&imported.program).expect("the native sites");
+    let layers = layer_nodes(&native, 2).expect("the layers");
+    let start = crate::library_mdl::explanation(&native, &layers).expect("the library");
+    let region = [1, 4, 6, 9];
+    let (rewritten, call) = crate::library_bodies::rewrite(&start, 1, &region).expect("the rewrite");
+    assert_eq!(call.discarded, [0.0, 0.0], "the rewrite keeps every direction");
+    let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+    let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+    let variables = reads(&native, &layers).expect("the reads");
+    let unit = |u: usize| variables.iter().enumerate().filter(|(_, v)| v.block == 3).nth(u).map(|(i, _)| i).expect("a unit of layer 1");
+    let (before, after) = (values(&native, &start.artifact, &layers, &variables).expect("the start's values"), values(&native, &rewritten.artifact, &layers, &variables).expect("the rewrite's values"));
+    for u in 0..16 {
+        let (was, is) = (&before[unit(u)].sites, &after[unit(u)].sites);
+        assert_eq!(is.len(), was.len(), "unit {u}: one site per part");
+        assert_eq!(region.contains(&u), is.iter().zip(was).all(|(a, b)| a.node != b.node), "unit {u}: the region's functions move to the body");
+    }
+    let device = Device::host();
+    let x = Interchange::new(&device, &native, &layers, &rewritten.artifact, &rewritten.trainable, variables.clone(), 1 << 30, 64).expect("the experiments");
+    let batch = Batch::new(sequences[..3].to_vec(), sequences[3..].to_vec()).expect("the batch");
+    let mut experiments = sample(&mut rand::rngs::StdRng::seed_from_u64(9), 3, x.variables(), 4, 12).expect("the draw");
+    let e = |base: usize, patch: Patch, position: usize| Experiment { base, source: base, explained: vec![true, false, true, true], patch: Some(patch), position };
+    experiments.push(e(0, Patch::Read { variable: unit(4) }, 3));
+    experiments.push(e(1, Patch::Reads { variables: vec![unit(1), unit(2), unit(9)] }, 5));
+    experiments.push(e(2, Patch::Reads { variables: region.iter().map(|u| unit(*u)).collect() }, 0));
+    let bits = x.evaluate(&batch, &experiments, false).expect("evaluate").bits;
+    assert!(bits.iter().flatten().all(|b| b.abs() <= 1e-9), "{bits:?}");
+}
+
 /// An engine counting the rows each forward call runs, around the reference.
 struct Counting<'a> {
     model: Model<'a>,
