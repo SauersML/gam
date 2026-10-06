@@ -2488,7 +2488,7 @@ fn explanation_identity(explanation: &Explanation) -> (String, String, String) {
         }
     }
     definition.absorb_str(b"owners", &format!("{:?}", explanation.artifact.owners));
-    definition.absorb_str(b"layers", &format!("{:?}", explanation.layers));
+    definition.absorb_str(b"layers", &layers_definition(&explanation.layers));
     definition.absorb_str(b"trainable", &format!("{:?}", explanation.trainable));
     let reference: Vec<u8> = explanation.reference.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
     definition.absorb_bytes(b"reference", &reference);
@@ -2525,6 +2525,23 @@ pub fn identity(export: &str, native: &OperatorProgram, explanation: &Explanatio
     program_structure(&mut program, b"explanation", &explanation.artifact.program);
     let (groups, sharing, definition) = explanation_identity(explanation);
     Identity { export: export.to_string(), tokens: tokens.finalize().to_hex(), program: program.finalize().to_hex(), groups, sharing, definition }
+}
+
+/// The layers as an explanation's definition hashes them: [`Layer`]'s debug form without the sink
+/// field, which is appended only to a layer that holds a sink group. Hashing the derived debug form
+/// made every field added to `Layer` a change of every explanation's identity: the sink field
+/// (`None` for every library on main) made each checkpoint written before it "a checkpoint of
+/// another fit", though no explanation changed. A layer without a sink hashes as before the field
+/// existed, so those checkpoints resume and are scored again.
+fn layers_definition(layers: &[Layer]) -> String {
+    let each: Vec<String> = layers
+        .iter()
+        .map(|layer| {
+            let sink = layer.sink.map_or(String::new(), |group| format!(", sink: Some({group})"));
+            format!("Layer {{ sites: {:?}, heads: {:?}, functions: {:?}{sink} }}", layer.sites, layer.heads, layer.functions)
+        })
+        .collect();
+    format!("[{}]", each.join(", "))
 }
 
 /// Read only the length-delimited JSON header. Neither identity checks nor restoration need a
@@ -3876,6 +3893,35 @@ fn mean_artifact(mut artifact: Artifact, trainable: &[usize], means: Vec<Array2<
 
 #[cfg(test)]
 mod tests {
+    /// The definition hashes a layer without a sink exactly as `Layer`'s debug form did before the
+    /// sink field existed (so earlier checkpoints keep their identity), and a sink when there is one.
+    #[test]
+    fn a_layer_without_a_sink_is_defined_as_before_the_sink_field() {
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Layer {
+            sites: crate::run_check::LayerNodes,
+            heads: Vec<(Vec<usize>, Vec<usize>)>,
+            functions: Vec<Vec<usize>>,
+        }
+        let export = crate::test_support::tiny_qwen3_export("layers_definition", 2);
+        let imported = crate::import::import_language_model(&export, 2, 6).unwrap();
+        std::fs::remove_dir_all(&export).unwrap();
+        let native = crate::run_check::split_sites(&imported.program).unwrap();
+        let sites = crate::run_check::layer_nodes(&native, 2).unwrap();
+        let layers: Vec<super::Layer> = sites
+            .iter()
+            .enumerate()
+            .map(|(l, sites)| super::Layer { sites: sites.clone(), heads: vec![(vec![l, 1], vec![2])], functions: vec![vec![3, 4], vec![l]], sink: None })
+            .collect();
+        let before: Vec<Layer> = layers.iter().map(|l| Layer { sites: l.sites.clone(), heads: l.heads.clone(), functions: l.functions.clone() }).collect();
+        assert_eq!(super::layers_definition(&layers), format!("{before:?}"));
+        let mut sunk = layers.clone();
+        sunk[1].sink = Some(7);
+        assert_eq!(super::layers_definition(&sunk), format!("{sunk:?}").replace(", sink: None", ""));
+        assert_ne!(super::layers_definition(&sunk), super::layers_definition(&layers));
+    }
+
     use super::*;
     use crate::{
         import::import_language_model,
