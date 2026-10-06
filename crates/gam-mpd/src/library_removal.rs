@@ -993,33 +993,67 @@ pub fn round(
         // The last accepted proposal's trial: the searches return the length they last accepted,
         // so it is the next posterior and is not solved again.
         let mut kept: Option<(usize, Posterior)> = None;
-        let mut test = |k: usize, kind: &str| -> Result<bool, String> {
-            let timed = Instant::now();
-            let groups = proposal(k)?;
-            let proposed = trial(base, &groups)?;
-            let trial_seconds = timed.elapsed().as_secs_f64();
-            let evaluation = objective(&proposed, Some(from))?;
-            let change = evaluation.change(from);
-            if !change.is_finite() {
-                return Err(error("a nonfinite removal objective"));
-            }
-            let removed_now = active - base.active.iter().filter(|a| **a).count();
-            let predicted = rest[..k].iter().map(|u| u.data).sum::<f64>() - groups.iter().map(|g| costs[*g]).sum::<f64>() + subset_change(removed_now + groups.len())?
-                - subset_change(removed_now)?;
-            let accepted = evaluation.complete && change <= 0.0;
-            journal.write(json!({
-                "event": "proposal", "kind": kind, "units": k, "groups": groups, "layers": names(&groups),
-                "predicted_bits": predicted / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
-                "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(), "trial_seconds": trial_seconds,
-            }))?;
-            evaluations.push((groups.len(), change / LN_2));
-            changes.insert(k, (change, evaluation));
-            if accepted {
-                kept = Some((k, proposed));
-            }
-            Ok(accepted)
-        };
-        let accepted = if tail { gallop(rest.len(), true, &mut test)? } else { gallop_down(safe, &mut test)? };
+        // A trial (the compensation's solve, on the host) is a function of the base and the
+        // proposal alone, so while the device evaluates proposal `k` the descending search's two
+        // possible next proposals are solved on other threads: `low + (k − low) / 2` if `k` is
+        // rejected and `k + (high − k) / 2` if it is accepted, with `low` the longest accepted
+        // and `high` the shortest rejected length so far (`gallop_down`'s halving and bisection
+        // alike). A proposal asked for is taken from them when one was solved, else solved then;
+        // solves no later proposal can ask for are let go.
+        let (proposal, trial) = (&proposal, &trial);
+        let accepted = std::thread::scope(|scope| -> Result<usize, String> {
+            type Solved = Result<(Vec<usize>, Posterior), String>;
+            let mut ahead: BTreeMap<usize, std::thread::ScopedJoinHandle<'_, Solved>> = BTreeMap::new();
+            let (mut low, mut high) = (0, safe + 1);
+            let mut test = |k: usize, kind: &str| -> Result<bool, String> {
+                let timed = Instant::now();
+                let (groups, proposed) = match ahead.remove(&k) {
+                    Some(solving) => solving.join().map_err(|_| error("a trial's thread panicked"))??,
+                    None => {
+                        let groups = proposal(k)?;
+                        let proposed = trial(base, &groups)?;
+                        (groups, proposed)
+                    }
+                };
+                let trial_seconds = timed.elapsed().as_secs_f64();
+                if !tail {
+                    for n in [low + (k - low) / 2, k + (high - k) / 2] {
+                        if n > low && n < high && n != k && !ahead.contains_key(&n) {
+                            ahead.insert(n, scope.spawn(move || -> Solved {
+                                let groups = proposal(n)?;
+                                let proposed = trial(base, &groups)?;
+                                Ok((groups, proposed))
+                            }));
+                        }
+                    }
+                }
+                let evaluation = objective(&proposed, Some(from))?;
+                let change = evaluation.change(from);
+                if !change.is_finite() {
+                    return Err(error("a nonfinite removal objective"));
+                }
+                let removed_now = active - base.active.iter().filter(|a| **a).count();
+                let predicted = rest[..k].iter().map(|u| u.data).sum::<f64>() - groups.iter().map(|g| costs[*g]).sum::<f64>() + subset_change(removed_now + groups.len())?
+                    - subset_change(removed_now)?;
+                let accepted = evaluation.complete && change <= 0.0;
+                journal.write(json!({
+                    "event": "proposal", "kind": kind, "units": k, "groups": groups, "layers": names(&groups),
+                    "predicted_bits": predicted / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
+                    "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(), "trial_seconds": trial_seconds,
+                }))?;
+                evaluations.push((groups.len(), change / LN_2));
+                changes.insert(k, (change, evaluation));
+                if accepted {
+                    low = low.max(k);
+                    kept = Some((k, proposed));
+                } else {
+                    high = high.min(k);
+                }
+                ahead.retain(|n, _| *n > low && *n < high);
+                Ok(accepted)
+            };
+            if tail { gallop(rest.len(), true, &mut test) } else { gallop_down(safe, &mut test) }
+        })?;
         // The change of `F` from the accepted prefix to the next length, exact when both
         // evaluations are complete (before the accepted prefix's evaluation is taken).
         let blocked = changes.get(&(accepted + 1)).map(|(after, evaluation)| {
