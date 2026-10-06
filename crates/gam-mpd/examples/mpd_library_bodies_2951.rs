@@ -539,6 +539,7 @@ fn main() -> Result<(), String> {
                 head_tile_rows: 64,
                 epochs: None,
                 families: Vec::new(),
+                full_antithetic: false,
             };
             let base = library_mdl::explanation(&native, &layers)?;
             let run = Run {

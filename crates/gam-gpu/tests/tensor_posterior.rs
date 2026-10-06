@@ -137,8 +137,8 @@ fn run(fit: &Device, wide: &Device, c: &Case) -> (Array2<f64>, Array2<f64>, Arra
     let mut sums = wide.zeros(c.count, 3).unwrap();
     fit.group_moments((&mean, &log_sd), &groups, &mut sums).unwrap();
     let before = wide.download(&sums).unwrap();
-    let (mut variance, mut divergence) = (wide.zeros(c.count, 1).unwrap(), wide.zeros(c.count, 1).unwrap());
-    wide.group_divergence(&mut sums, &mut variance, &mut divergence).unwrap();
+    let (mut variance, mut divergence) = (wide.zeros(c.count, 1).unwrap(), wide.zeros(c.count, 2).unwrap());
+    wide.group_divergence(&mut sums, None, &mut variance, &mut divergence).unwrap();
     assert!(wide.download(&sums).unwrap().iter().all(|v| *v == 0.0), "the sums are zeroed");
     let (gradient, factor) = (up(fit, &c.gradient), up(fit, &c.factor));
     let [momentum, curvature, power] = &mut moments[..] else { unreachable!() };
@@ -448,8 +448,8 @@ fn bfloat16_momentum(fit: &Device, half: &Device, wide: &Device, mut c: Case) {
         fit.reparameterize(&mut sample, (&m, &s), c.sample).expect("bfloat16 sample");
         let mut sums = wide.zeros(c.count, 3).expect("sums");
         fit.group_moments((&m, &s), &groups, &mut sums).expect("group moments");
-        let (mut variance, mut divergence) = (wide.zeros(c.count, 1).expect("variance"), wide.zeros(c.count, 1).expect("divergence"));
-        wide.group_divergence(&mut sums, &mut variance, &mut divergence).expect("group divergence");
+        let (mut variance, mut divergence) = (wide.zeros(c.count, 1).expect("variance"), wide.zeros(c.count, 2).expect("divergence"));
+        wide.group_divergence(&mut sums, None, &mut variance, &mut divergence).expect("group divergence");
         let (gradient, factor) = (up(gradient_storage, &c.gradient), up(gradient_storage, &c.factor));
         let (mut direction, mut terms) = (fit.zeros(c.mean.nrows(), c.mean.ncols()).expect("direction"), wide.zeros(c.count, 3).expect("terms"));
         fit.posterior_ivon((&m, &mut s), [&mut momentum, &mut curvature, &mut power], (&gradient, &factor), (&groups, &variance), (&mut direction, &mut terms), &c.step).expect("bfloat16 step");
@@ -467,12 +467,11 @@ fn bfloat16_momentum(fit: &Device, half: &Device, wide: &Device, mut c: Case) {
     }
 }
 
-/// `group_curvature` and `group_code_length` of the case on `fit` (sums on `wide`): the curvature
-/// rows of the case's factor at its posterior, and in row 1 of 2 the code length of its groups
-/// (groups 4, removed, and 6 out of the explanation; each group's starting variance `2^-k` times
-/// its variance on the host, so that the scale's exponent is the integer `k` and not near a
-/// rounding boundary).
-fn removal_sums(fit: &Device, wide: &Device, initial: &[f64]) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
+/// `group_curvature`, `group_divergence` and `group_code_length` of the case on `fit` (sums on
+/// `wide`): the curvature rows of the case's factor at its posterior, in row 1 of 2 the code length
+/// of its groups (groups 4, removed, and 6 out of the explanation), their scales sent against
+/// `reference` when one is given, and the groups' variances.
+fn removal_sums(fit: &Device, wide: &Device, reference: Option<&[f64]>) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
     let c = case(GroupAxis::Entries);
     let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
     let groups = fit.group_map(&c.groups, c.mean.dim()).unwrap();
@@ -480,23 +479,34 @@ fn removal_sums(fit: &Device, wide: &Device, initial: &[f64]) -> (Array2<f64>, A
     fit.group_curvature((&up(&c.factor), &up(&c.mean), &up(&c.log_sd)), &groups, &mut curvature).unwrap();
     let mut moments = wide.zeros(c.count, 3).unwrap();
     fit.group_moments((&up(&c.mean), &up(&c.log_sd)), &groups, &mut moments).unwrap();
-    let (mut variance, mut divergence) = (wide.zeros(c.count, 1).unwrap(), wide.zeros(c.count, 1).unwrap());
-    wide.group_divergence(&mut moments, &mut variance, &mut divergence).unwrap();
     let column = |v: Vec<f64>| wide.upload_vec(v.len(), 1, v).unwrap();
+    let reference = reference.map(|r| column(r.to_vec()));
+    let (mut variance, mut divergence) = (wide.zeros(c.count, 1).unwrap(), wide.zeros(c.count, 2).unwrap());
+    wide.group_divergence(&mut moments, reference.as_ref(), &mut variance, &mut divergence).unwrap();
     let weight = column((0..c.count).map(|g| if g == 4 || g == 6 { 0.0 } else { 1.0 }).collect());
     let constant = column((0..c.count).map(|g| 0.5 * (g as f64 + 2.0).ln()).collect());
     let mut lengths = wide.zeros(2, 3).unwrap();
-    wide.group_code_length((&divergence, &variance), (&weight, &constant, &column(initial.to_vec())), &mut lengths, 1).unwrap();
+    wide.group_code_length(&divergence, (&weight, &constant), &mut lengths, 1).unwrap();
     (wide.download(&curvature).unwrap(), wide.download(&lengths).unwrap(), wide.download(&variance).unwrap())
 }
 
+/// The code lengths with each group's reference `2^(2 − k)` times its variance on the host
+/// (`k = g mod 5`), so that `log2(S / n)` sits at the integer `k − 2` against its reference: groups
+/// 1, 3 and 6 take the edge of exponent 0's bin and group 5 that of exponent −1's (a saved bit
+/// worth 0.05 nats more than the divergence's rise there), the rest stay at `S / n`, every choice
+/// far from a tie in f32.
 fn removal_sums_against_host(fit: &Device, wide: &Device) {
     let host = Device::host();
     let count = case(GroupAxis::Entries).count;
-    let (_, _, variance) = removal_sums(&host, &host, &vec![1.0; count]);
+    let (_, _, variance) = removal_sums(&host, &host, None);
     let initial: Vec<f64> = (0..count).map(|g| if variance[(g, 0)] > 0.0 { variance[(g, 0)] * 2f64.powi(-(g as i32 % 5) + 2) } else { 1.0 }).collect();
-    let (curvature, lengths, _) = removal_sums(fit, wide, &initial);
-    let (expected_curvature, expected_lengths, _) = removal_sums(&host, &host, &initial);
+    let (curvature, lengths, chosen) = removal_sums(fit, wide, Some(&initial));
+    let (expected_curvature, expected_lengths, expected_chosen) = removal_sums(&host, &host, Some(&initial));
+    for (g, (v, w)) in chosen.iter().zip(&expected_chosen).enumerate() {
+        assert!((v - w).abs() <= 4.0 * CHAIN * w.abs(), "group {g}: v {v} against {w}");
+    }
+    let moved: Vec<usize> = (0..count).filter(|g| expected_chosen[(*g, 0)] != variance[(*g, 0)]).collect();
+    assert_eq!(moved, [1, 3, 5, 6], "the groups whose variance takes a cheaper bin's edge");
     let sum_band = CHAIN + 40.0 * U / (1.0 - 40.0 * U);
     // A dot product u_G . mu_G cancels terms as large as its summed magnitudes, at most 40 entries
     // of the largest magnitude.
@@ -738,9 +748,10 @@ fn gathered_samples_are_the_ones_each_writes_alone() {
 fn removal_sums_on_the_host_match_their_formulas() {
     let host = Device::host();
     let c = case(GroupAxis::Entries);
-    let (_, _, variance) = removal_sums(&host, &host, &vec![1.0; c.count]);
+    let (_, _, variance) = removal_sums(&host, &host, None);
     let initial: Vec<f64> = (0..c.count).map(|g| if variance[(g, 0)] > 0.0 { variance[(g, 0)] * 2f64.powi(3) } else { 1.0 }).collect();
-    let (curvature, lengths, _) = removal_sums(&host, &host, &initial);
+    let (curvature, lengths, chosen) = removal_sums(&host, &host, Some(&initial));
+    assert_eq!(chosen, variance, "every variance stays at S / n");
     for g in 0..c.count {
         let entries: Vec<usize> = (0..c.groups.len()).filter(|i| c.groups[*i] as usize == g).collect();
         let at = |a: &Array2<f64>, i: usize| a[(i / a.ncols(), i % a.ncols())];
@@ -751,11 +762,13 @@ fn removal_sums_on_the_host_match_their_formulas() {
         assert!((curvature[(g, 1)] - dot).abs() <= 1e-12 * dot.abs().max(1.0) && (curvature[(g, 2)] - noise).abs() <= 1e-12 * noise, "group {g}");
     }
     // Every scale is 2^-3 of its start: the exponent -3, zigzag 5, plus one 6, an Elias delta
-    // codeword of 2 + 2 x 1 + 1 = 5 bits.
+    // codeword of 2 + 2 x 1 + 1 = 5 bits. Exponent -2's bin codes in as many bits, and the edge of
+    // exponent -1's (4 bits) lies 1.5 ln 2 from S / n, where the divergence of a group of at least
+    // 24 entries has risen by 4.7 nats, more than the bit it saves: every variance stays at S / n.
     let mut moments = host.zeros(c.count, 3).unwrap();
     host.group_moments((&host.upload(c.mean.view()).unwrap(), &host.upload(c.log_sd.view()).unwrap()), &host.group_map(&c.groups, c.mean.dim()).unwrap(), &mut moments).unwrap();
-    let (mut v, mut d) = (host.zeros(c.count, 1).unwrap(), host.zeros(c.count, 1).unwrap());
-    host.group_divergence(&mut moments, &mut v, &mut d).unwrap();
+    let (mut v, mut d) = (host.zeros(c.count, 1).unwrap(), host.zeros(c.count, 2).unwrap());
+    host.group_divergence(&mut moments, None, &mut v, &mut d).unwrap();
     let d = host.download(&d).unwrap();
     let expected: f64 = (0..c.count).filter(|g| *g != 4 && *g != 6).map(|g| d[(g, 0)] + 0.5 * (g as f64 + 2.0).ln() + 5.0 * std::f64::consts::LN_2).sum();
     assert!((lengths[(1, 1)] - expected).abs() <= 1e-12 * expected.abs(), "{} against {expected}", lengths[(1, 1)]);
@@ -827,4 +840,134 @@ fn resolved_counts_on_cuda_match_the_host() {
     let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
     resolved_counts_against_host(&narrow, &wide);
     resolved_counts_against_host(&wide, &wide);
+}
+
+/// The bits of the Elias δ codeword of the signed index of `k` (`2k + 1` for `k ≥ 0`, `2|k|` for
+/// `k < 0`) from `⌊log2⌋` of the index and of its length: the test's own form of
+/// `scale_code_bits`.
+fn elias_delta(k: i64) -> f64 {
+    let x = if k >= 0 { 2 * k.unsigned_abs() + 1 } else { 2 * k.unsigned_abs() };
+    let low = x.ilog2();
+    f64::from(low + 2 * (low + 1).ilog2() + 1)
+}
+
+/// `group_prior` against every bin of exponent −40 to 40, each charged `KL + ln 2 · bits` at
+/// `S / n` clamped to it: its charge is the least of theirs, for groups of 1 to 500 entries with
+/// `S / n` from `2^-12` to `2^12` of the reference (every entry `μ² = σ² = S / 2n`), and its
+/// divergence is `KL(q ‖ N(0, v I))` at its variance `v`, which is `S / n` or a bin's edge.
+#[test]
+fn the_prior_variance_is_the_least_charge_over_the_bins() {
+    let ln2 = std::f64::consts::LN_2;
+    for k in -2100_i64..=2100 {
+        assert_eq!(gam_gpu::tensor::scale_code_bits(k), elias_delta(k), "exponent {k}");
+    }
+    let reference = 0.37;
+    for n in [1.0, 3.0, 24.0, 40.0, 500.0] {
+        for step in -240..=240 {
+            let t = f64::from(step) / 20.0 + 0.013;
+            let centre = reference * t.exp2();
+            let log_variance = n * (0.5 * centre).ln();
+            let divergence = |v: f64| 0.5 * (n * centre / v + n * v.ln() - n - log_variance);
+            let (v, kl, bits) = gam_gpu::tensor::group_prior(n, n * centre, log_variance, Some(reference));
+            let least = (-40_i64..=40)
+                .map(|k| divergence(reference * t.clamp(k as f64 - 0.5, k as f64 + 0.5).exp2()) + ln2 * elias_delta(k))
+                .fold(f64::INFINITY, f64::min);
+            let charge = kl + ln2 * bits;
+            assert!((charge - least).abs() <= 1e-9 * least.abs().max(1.0), "n {n}, t {t}: {charge} against the least {least}");
+            assert!((kl - divergence(v)).abs() <= 1e-9 * kl.abs().max(1.0), "n {n}, t {t}: KL {kl} at v {v}");
+            // The distance of `log2(v / v⁰)` from the nearest bin edge, a half-integer.
+            let shifted = (v / reference).log2() - 0.5;
+            let edge = (shifted - shifted.round()).abs();
+            // `S / n` as `group_prior` forms it from the sums, `(n c) / n`, which need not be `c` itself.
+            assert!(v == n * centre / n || edge <= 1e-12, "n {n}, t {t}: v {v} is neither S / n nor an edge");
+        }
+    }
+}
+
+/// Groups' sums `(n, S, Σ 2s)` (every entry `μ² = σ² = S / 2n`) with `log2(S / n)` at the given
+/// power of two of their references, and an empty group last; returned with the references.
+fn prior_case() -> (Array2<f64>, Vec<f64>) {
+    // (n, log2 of S / n against the reference, the reference)
+    let groups = [(40.0, 0.52, 1.0), (40.0, 1.0, 0.25), (8.0, 4.6, 3.0), (24.0, -0.53, 0.5), (24.0, -2.0, 1.5), (500.0, 0.52, 2.0), (1.0, 7.3, 0.125), (24.0, 0.0, 1.0)];
+    let mut sums = Array2::zeros((groups.len() + 1, 3));
+    let mut references = vec![1.0; groups.len() + 1];
+    for (g, &(n, t, r)) in groups.iter().enumerate() {
+        let centre: f64 = r * f64::exp2(t);
+        sums[(g, 0)] = n;
+        sums[(g, 1)] = n * centre;
+        sums[(g, 2)] = n * (0.5 * centre).ln();
+        references[g] = r;
+    }
+    (sums, references)
+}
+
+/// `group_divergence` of [`prior_case`] on `d`: the variances and the divergences with their bits.
+fn priors_on(d: &Device) -> (Array2<f64>, Array2<f64>) {
+    let (sums, references) = prior_case();
+    let rows = sums.nrows();
+    let mut s = d.upload(sums.view()).unwrap();
+    let r = d.upload_vec(rows, 1, references).unwrap();
+    let (mut v, mut divergence) = (d.zeros(rows, 1).unwrap(), d.zeros(rows, 2).unwrap());
+    d.group_divergence(&mut s, Some(&r), &mut v, &mut divergence).unwrap();
+    assert!(d.download(&s).unwrap().iter().all(|x| *x == 0.0), "{}: the sums are zeroed", d.name());
+    (d.download(&v).unwrap(), d.download(&divergence).unwrap())
+}
+
+/// On the host, [`prior_case`]'s groups take the bins `group_prior` reasons out (its doc): a centre
+/// just inside an expensive bin next to a cheaper one (groups 0, 3 and 5: 2^0.52 and 2^-0.53 of
+/// their references, in bins of 4 bits) moves to the cheaper bin's edge and lowers the charge;
+/// group 1's, at the middle of exponent 1's bin, still gains by the move to exponent 0's edge;
+/// group 2's passes exponent 4's bin (a code as long as exponent 5's) for exponent 3's edge; group
+/// 4's moves one bin; group 6's (one entry, seven bins out) stays, as does group 7's at its
+/// reference; the empty group is zero.
+#[test]
+fn prior_variances_on_the_host_take_the_cheaper_bins() {
+    let ln2 = std::f64::consts::LN_2;
+    let (sums, references) = prior_case();
+    let (v, divergence) = priors_on(&Device::host());
+    // Per group, `log2(v / v⁰)` and the bits of its scale.
+    let expected = [(0.5, 1.0), (0.5, 1.0), (3.5, 5.0), (-0.5, 1.0), (-1.5, 4.0), (0.5, 1.0), (7.3, 8.0), (0.0, 1.0)];
+    for (g, &(at, bits)) in expected.iter().enumerate() {
+        let (n, centre) = (sums[(g, 0)], sums[(g, 1)] / sums[(g, 0)]);
+        assert!((v[(g, 0)] - references[g] * f64::exp2(at)).abs() <= 1e-12 * v[(g, 0)], "group {g}: v {}", v[(g, 0)]);
+        assert_eq!(divergence[(g, 1)], bits, "group {g}: bits");
+        let stays = g >= 6;
+        assert_eq!(v[(g, 0)] == centre, stays, "group {g}: v {} against S / n {centre}", v[(g, 0)]);
+        let at_centre = gam_gpu::tensor::group_prior(n, n * centre, sums[(g, 2)], None).1;
+        let unmoved = at_centre + ln2 * gam_gpu::tensor::scale_code_bits((centre / references[g]).log2().round() as i64);
+        let charge = divergence[(g, 0)] + ln2 * bits;
+        if stays {
+            assert!((charge - unmoved).abs() <= 1e-12 * unmoved.abs(), "group {g} stays");
+        } else {
+            assert!(charge < unmoved, "group {g}: the cheaper bin lowers the charge, {charge} against {unmoved}");
+        }
+    }
+    assert_eq!((v[(8, 0)], divergence[(8, 0)], divergence[(8, 1)]), (0.0, 0.0, 0.0));
+}
+
+/// `group_divergence` with references on `d` against the host: the same bits, and the variances and
+/// divergences within f32 rounding of the terms they cancel.
+fn priors_against_host(d: &Device) {
+    let (sums, _) = prior_case();
+    let (v, divergence) = priors_on(d);
+    let (hv, hdivergence) = priors_on(&Device::host());
+    for g in 0..sums.nrows() {
+        assert_eq!(divergence[(g, 1)], hdivergence[(g, 1)], "{} group {g}: bits", d.name());
+        assert!((v[(g, 0)] - hv[(g, 0)]).abs() <= 4.0 * CHAIN * hv[(g, 0)], "{} group {g}: v {} against {}", d.name(), v[(g, 0)], hv[(g, 0)]);
+        let (n, second) = (sums[(g, 0)], sums[(g, 1)]);
+        let cancelled = if n > 0.0 { n * (second / n).ln().abs() + sums[(g, 2)].abs() + n } else { 0.0 };
+        assert!((divergence[(g, 0)] - hdivergence[(g, 0)]).abs() <= 4.0 * CHAIN * cancelled, "{} group {g}: KL {} against {}", d.name(), divergence[(g, 0)], hdivergence[(g, 0)]);
+    }
+}
+
+#[test]
+fn prior_variances_on_every_accelerator_match_the_host() {
+    if cfg!(target_os = "macos")
+        && let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault")
+    {
+        priors_against_host(&metal);
+    }
+    if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
+        priors_against_host(&wide);
+    }
 }

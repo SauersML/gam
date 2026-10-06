@@ -14,8 +14,9 @@
 //! (f32 on CUDA and the Apple GPU, float64 on the host); the momentum in bfloat16 where the masters
 //! are f32 on CUDA (rounded once as it is stored, its update computed in f32), else in the fitting
 //! storage; the group sums in float64 where the backend holds it (CUDA, the host). The objective is
-//! `library_mdl`'s (module note there): `KL(q_G ‖ p_G) = ½ (|G| ln v_G − Σ 2s)` at the
-//! empirical-Bayes variance `v_G`, whose prior precision per token `1 / (N v_G)` is IVON's weight
+//! `library_mdl`'s (module note there): `KL(q_G ‖ p_G)` at the group's prior variance `v_G`, the
+//! minimizer of the divergence plus the code of its scale against the group's reference variance
+//! ([`Device::group_divergence`]), whose prior precision per token `1 / (N v_G)` is IVON's weight
 //! decay.
 //!
 //! The posterior's mean is the Polyak average `μ̄` of IVON's iterate `μ` over about one epoch
@@ -83,13 +84,17 @@ impl State<'_> {
     }
 }
 
-/// A posterior's host arrays ([`DevicePosterior::from_parts`]).
+/// A posterior's host arrays ([`DevicePosterior::from_parts`]), and per group the reference
+/// variance its variance's scale is sent against (`library_mdl::Explanation::reference`), or none
+/// for a posterior whose code has no scale (each variance then `Σ (μ² + σ²) / n`,
+/// [`Device::group_divergence`]).
 pub struct Parts<'a, A: Borrow<Array2<f64>> = Array2<f64>> {
     pub operators: &'a [usize],
     pub mean: &'a [A],
     pub log_sd: &'a [A],
     pub groups: &'a [Vec<u32>],
     pub count: usize,
+    pub reference: Option<&'a [f64]>,
 }
 
 /// The per-group constants of a posterior's code length and one row per step for its values
@@ -97,7 +102,6 @@ pub struct Parts<'a, A: Borrow<Array2<f64>> = Array2<f64>> {
 pub struct CodeLength {
     weight: Tensor,
     constant: Tensor,
-    initial: Tensor,
     rows: Tensor,
 }
 
@@ -128,10 +132,13 @@ pub struct DevicePosterior {
     rho_steps: u64,
     last_eta: f64,
     hold: bool,
-    /// Per group `(n, Σ μ² + σ², Σ 2s)` being summed, its variance and its divergence in nats.
+    /// Per group `(n, Σ μ² + σ², Σ 2s)` being summed, its variance, its divergence in nats with
+    /// its variance's scale bits (groups × 2), and its reference variance when its code has a scale
+    /// ([`Device::group_divergence`]).
     sums: Tensor,
     variance: Tensor,
     divergence: Tensor,
+    reference: Option<Tensor>,
     /// The training tokens `N` (the data term's weight) and the steps taken.
     tokens: f64,
     steps: u64,
@@ -183,7 +190,14 @@ impl DevicePosterior {
             return Err(error("one posterior array per trainable operator required"));
         }
         let groups = membership(explanation, &shapes)?;
-        let parts = Parts { operators: &explanation.trainable, mean: &posterior.mean, log_sd: &posterior.log_sd, groups: &groups, count: explanation.groups.len() };
+        let parts = Parts {
+            operators: &explanation.trainable,
+            mean: &posterior.mean,
+            log_sd: &posterior.log_sd,
+            groups: &groups,
+            count: explanation.groups.len(),
+            reference: Some(posterior.references()),
+        };
         Self::from_parts(fitting, &parts, tokens, moments, steps)
     }
 
@@ -215,13 +229,17 @@ impl DevicePosterior {
         if parts.groups.iter().flatten().any(|g| *g as usize >= parts.count) {
             return Err(error("a group id beyond the groups"));
         }
+        if parts.reference.is_some_and(|r| r.len() != parts.count) {
+            return Err(error("one reference variance per group required"));
+        }
         if !(tokens.is_finite() && tokens > 0.0) {
             return Err(error("positive training tokens required"));
         }
         // Without a state, the curvature `h = 1 / (N σ²) − δ` at which IVON's standard deviation
-        // `1 / √(N (h + δ))` is the posterior's, `δ = 1 / (N v_G)` at each group's variance (zero
-        // where the posterior is wider than the prior: `h` is nonnegative, `Device::posterior_ivon`).
-        // Each operator's state is made and sent one operator at a time, its zeros on the device.
+        // `1 / √(N (h + δ))` is the posterior's, `δ = 1 / (N v_G)` at each group's variance
+        // (`gam_gpu::tensor::group_prior`, as the device forms it; zero where the posterior is wider
+        // than the prior: `h` is nonnegative, `Device::posterior_ivon`). Each operator's state is
+        // made and sent one operator at a time, its zeros on the device.
         let mut sums = vec![(0.0, 0.0); parts.count];
         if moments.is_none() {
             for ((mean, log_sd), groups) in parts.mean.iter().zip(parts.log_sd).zip(parts.groups) {
@@ -233,11 +251,12 @@ impl DevicePosterior {
                 }
             }
         }
+        let variances: Vec<f64> = sums.iter().enumerate().map(|(g, (n, second))| gam_gpu::tensor::group_prior(*n, *second, 0.0, parts.reference.map(|r| r[g])).0).collect();
         let start = |log_sd: &Array2<f64>, groups: &[u32]| -> Array2<f64> {
             let (rows, cols) = log_sd.dim();
             Array2::from_shape_fn((rows, cols), |(r, c)| {
-                let (s, (n, second)) = (log_sd[[r, c]], sums[groups[r * cols + c] as usize]);
-                if s == f64::NEG_INFINITY { 0.0 } else { (1.0 / (tokens * (2.0 * s).exp()) - n / (tokens * second)).max(0.0) }
+                let (s, v) = (log_sd[[r, c]], variances[groups[r * cols + c] as usize]);
+                if s == f64::NEG_INFINITY { 0.0 } else { (1.0 / (tokens * (2.0 * s).exp()) - 1.0 / (tokens * v)).max(0.0) }
             })
         };
         let up = |m: &Array2<f64>| master.upload(m.view()).map_err(error);
@@ -254,7 +273,8 @@ impl DevicePosterior {
         let mut out = Self {
             sums: wide.zeros(parts.count, 3).map_err(error)?,
             variance: wide.zeros(parts.count, 1).map_err(error)?,
-            divergence: wide.zeros(parts.count, 1).map_err(error)?,
+            divergence: wide.zeros(parts.count, 2).map_err(error)?,
+            reference: parts.reference.map(|r| wide.upload_vec(r.len(), 1, r.to_vec())).transpose().map_err(error)?,
             mean: parts.mean.iter().map(|m| up(m.borrow())).collect::<Result<_, _>>()?,
             log_sd: parts.log_sd.iter().map(|s| up(s.borrow())).collect::<Result<_, _>>()?,
             moments: (0..shapes.len()).map(state).collect::<Result<_, String>>()?,
@@ -285,7 +305,7 @@ impl DevicePosterior {
         for ((mean, log_sd), groups) in self.average.iter().zip(&self.log_sd).zip(&self.groups) {
             self.fitting.group_moments((mean, log_sd), groups, &mut self.sums).map_err(error)?;
         }
-        self.wide.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
+        self.wide.group_divergence(&mut self.sums, self.reference.as_ref(), &mut self.variance, &mut self.divergence).map_err(error)
     }
 
     /// The iterate set to the posterior's mean, the average restarted there, and the groups'
@@ -504,7 +524,7 @@ impl DevicePosterior {
                     .map_err(error)?;
             }
         }
-        self.wide.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
+        self.wide.group_divergence(&mut self.sums, self.reference.as_ref(), &mut self.variance, &mut self.divergence).map_err(error)
     }
 
     /// The number of prior groups.
@@ -556,24 +576,23 @@ impl DevicePosterior {
     }
 
     /// Rows for `steps` steps' code lengths ([`DevicePosterior::code_length_into`]) of a posterior
-    /// whose groups are `active`, of `sizes` entries, their variances' scales sent against the
-    /// starting variances `initial`.
-    pub fn code_length(&self, active: &[bool], sizes: &[f64], initial: &[f64], steps: usize) -> Result<CodeLength, String> {
+    /// whose groups are `active`, of `sizes` entries.
+    pub fn code_length(&self, active: &[bool], sizes: &[f64], steps: usize) -> Result<CodeLength, String> {
         let column = |values: Vec<f64>| self.wide.upload_vec(values.len(), 1, values).map_err(error);
         Ok(CodeLength {
             weight: column(active.iter().map(|a| f64::from(u8::from(*a))).collect())?,
             constant: column(sizes.iter().map(|n| 0.5 * n.ln()).collect())?,
-            initial: column(initial.to_vec())?,
             rows: self.wide.zeros(steps, 3).map_err(error)?,
         })
     }
 
     /// Adds the code length in nats of the groups' posteriors as they stand into row `step` of
     /// `code`: over the active groups `G`, `KL(q_G ‖ p_G) + ½ ln |G|` and `ln 2` times the bits of
-    /// `v_G`'s scale against `v⁰_G` (`library_mdl`'s description without its subset code), summed
-    /// on the device ([`Device::group_code_length`]).
+    /// `v_G`'s scale against `v⁰_G` (`library_mdl`'s description without its subset code; no bits
+    /// for a posterior without references, [`Parts`]), summed on the device
+    /// ([`Device::group_code_length`]).
     pub fn code_length_into(&self, code: &mut CodeLength, step: usize) -> Result<(), String> {
-        self.wide.group_code_length((&self.divergence, &self.variance), (&code.weight, &code.constant, &code.initial), &mut code.rows, step).map_err(error)
+        self.wide.group_code_length(&self.divergence, (&code.weight, &code.constant), &mut code.rows, step).map_err(error)
     }
 
     /// Each step's code length in nats, read at once.
@@ -581,14 +600,15 @@ impl DevicePosterior {
         Ok(self.wide.download(&code.rows).map_err(error)?.column(1).to_vec())
     }
 
-    /// Per group, its empirical-Bayes variance `v_G` at the posterior as it stands.
+    /// Per group, its prior variance `v_G` at the posterior as it stands
+    /// ([`Device::group_divergence`]).
     pub fn variances(&self) -> Result<Vec<f64>, String> {
         Ok(self.wide.download(&self.variance).map_err(error)?.into_iter().collect())
     }
 
     /// Per group, `KL(q_G ‖ p_G)` in nats at the posterior as it stands (zero for a removed group).
     pub fn divergences(&self) -> Result<Vec<f64>, String> {
-        Ok(self.wide.download(&self.divergence).map_err(error)?.into_iter().collect())
+        Ok(self.wide.download(&self.divergence).map_err(error)?.column(0).to_vec())
     }
 
     /// The posterior's means and log standard deviations into `posterior`, and IVON's state per
@@ -753,7 +773,7 @@ mod tests {
         let h = 1.0 / (tokens * v0);
         let log_sd = Array2::from_shape_fn((1, R), |(_, i)| if free(i) { 0.5 * v0.ln() } else { -0.5 * (tokens * (h + 1.0 / (tokens * v0))).ln() });
         let groups = vec![vec![0u32; R]];
-        let parts = Parts { operators: &[0], mean: std::slice::from_ref(&a), log_sd: std::slice::from_ref(&log_sd), groups: &groups, count: 1 };
+        let parts = Parts { operators: &[0], mean: std::slice::from_ref(&a), log_sd: std::slice::from_ref(&log_sd), groups: &groups, count: 1, reference: None };
         let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens, None, 0).unwrap();
         let start = posterior.variances().unwrap()[0];
         let ivon = Ivon { beta1: 0.9, beta2: 1.0 - 1.0 / 64.0 };

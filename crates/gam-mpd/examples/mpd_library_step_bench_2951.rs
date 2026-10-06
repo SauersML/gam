@@ -241,7 +241,7 @@ fn main() -> Result<(), String> {
     // arithmetic did not change what is computed).
     let mut mean_bits = None;
     {
-        let parts = Parts { operators: &trainable, mean: &start.mean, log_sd: &start.log_sd, groups: &start.groups, count: start.count };
+        let parts = Parts { operators: &trainable, mean: &start.mean, log_sd: &start.log_sd, groups: &start.groups, count: start.count, reference: None };
         let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens as f64, None, 0)?;
         posterior.hold_means(true);
         for step in 0..=reps {

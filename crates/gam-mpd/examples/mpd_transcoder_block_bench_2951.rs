@@ -190,7 +190,7 @@ fn main() -> Result<(), String> {
         if dense {
             program.read_densely();
         }
-        let parts = Parts { operators: &trainable, mean: &mean, log_sd: &log_sd, groups: &groups, count: 2 * k };
+        let parts = Parts { operators: &trainable, mean: &mean, log_sd: &log_sd, groups: &groups, count: 2 * k, reference: None };
         let mut posterior = DevicePosterior::from_parts(&device, &parts, n as f64, None, 0)?;
         posterior.hold_means(true);
         device.synchronize().map_err(error)?;

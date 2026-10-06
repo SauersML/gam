@@ -1947,7 +1947,7 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
     let hidden_node = built.layout.hidden;
     drop(built);
     program.prepare_dense_parameters(&trainable)?;
-    let parts = crate::device_posterior::Parts { operators: &trainable, mean: &means, log_sd: &log_sd, groups: &groups, count: base };
+    let parts = crate::device_posterior::Parts { operators: &trainable, mean: &means, log_sd: &log_sd, groups: &groups, count: base, reference: None };
     let state = started.as_ref().map(|_| crate::device_posterior::State::Zero);
     let mut posterior = crate::device_posterior::DevicePosterior::from_parts(&device, &parts, tokens, state, 0)?;
     // The pass sets the deviations and the curvature only: the means stay where they are.

@@ -38,25 +38,30 @@
 //! sums `KL(M_e ‖ P_e)` of the next-token distributions over every token of every training
 //! experiment `e` (below), so the data term's weight is the number of scored tokens `N` and no
 //! tradeoff weight exists. `N` is the amount of `M`'s behaviour the explanation is asked to
-//! explain; it is the one choice left, and results are reported along it. The fit's steps use each
-//! prior variance's Gaussian-only empirical-Bayes value `v_G = (1/|G|) Σ_{j∈G} (μ_j² + σ_j²)`, the
-//! minimizer of `KL(q_G ‖ p_G)` alone, at which `KL(q_G ‖ p_G) = ½ (|G| ln v_G − ln det Σ_G)` (`Σ_G`
-//! the group's posterior covariance) with derivatives `μ_j / v_G` in `μ_j` and `σ_j² / v_G − 1` in
-//! `ln σ_j`. The code length charges each group at `v_G` itself: a variance in the bin of a cheaper
-//! scale exponent could shorten `KL(q_G ‖ p_G) + L_scale`, so `v_G` is not that sum's minimizer, and
-//! `F` is the code length at `v_G`. With a mixture prior
-//! (`library_mixture`) the variance minimizing the mixture's divergence weights each sample by the
-//! Gaussian component's responsibility; the fit keeps the Gaussian-only value as an adaptively
-//! updated hyperparameter, so the reported `F` is the code length at that variance, not its minimum
-//! over the variance. An active group sends its variance at the precision of a parameter estimated
-//! from `|G|` values, `½ log2 |G|` bits (the two-part code's asymptotic cost of a parameter's
-//! precision, a regular model's approximation rather than an exact code for an arbitrary real),
-//! after its scale: the integer exponent `round(log2(v_G / v⁰_G))` relative to the group's
-//! reference variance `v⁰_G` (`Explanation::reference`: the mean square of `M`'s values over its
-//! cells, which every decoder has from `M` and the explanation's structure; [`mean_squares`]), in
-//! the Elias δ code of its signed index
+//! explain; it is the one choice left, and results are reported along it. An active group sends
+//! its variance at the precision of a parameter estimated from `|G|` values, `½ log2 |G|` bits (the
+//! two-part code's asymptotic cost of a parameter's precision, a regular model's approximation
+//! rather than an exact code for an arbitrary real), after its scale: the integer exponent `z` of
+//! the bin `v_G / v⁰_G ∈ [2^(z − ½), 2^(z + ½)]` holding it, relative to the group's reference
+//! variance `v⁰_G` (`Explanation::reference`: the mean square of `M`'s values over its cells, which
+//! every decoder has from `M` and the explanation's structure; [`mean_squares`]), in the Elias δ
+//! code of its signed index
 //! (`L_scale`; the precision prices the fraction, the scale the exponent, since `(μ, σ) → (a μ, a
-//! σ)` leaves `KL` unchanged). Which groups are in the explanation is sent once in the enumerative
+//! σ)` leaves `KL` unchanged). Each prior variance `v_G` is the empirical-Bayes value minimizing the
+//! group's charge `KL(q_G ‖ p_G) + ln 2 · L_scale(v_G)` (the precision's `½ ln |G|` does not depend
+//! on it; `gam_gpu::tensor::group_prior`). With `S_G = Σ_{j∈G} (μ_j² + σ_j²)` and `Σ_G` the group's
+//! posterior covariance, `KL(q_G ‖ N(0, v I)) = ½ (S_G / v + |G| ln v − |G| − ln det Σ_G)` is least
+//! at `S_G / |G|` and rises with the distance from it in `ln v`, while `L_scale` is constant within
+//! a bin, so within a bin the charge is least at `S_G / |G|` clamped to the bin. The bin holding
+//! `S_G / |G|` is compared with the bins toward exponent 0, whose one bit is the shortest code, each
+//! at its edge nearest `S_G / |G|`, until the divergence there plus the shortest code is no less
+//! than the best charge so far, which no bin further on can undercut. At `v_G` the divergence's
+//! derivatives are `μ_j / v_G` in `μ_j` and `σ_j² / v_G − 1` in `ln σ_j`: `v_G` is either
+//! `S_G / |G|`, where the divergence is stationary in `v`, or a bin's fixed edge. With a mixture
+//! prior (`library_mixture`) the variance minimizing the mixture's divergence weights each sample
+//! by the Gaussian component's responsibility; the fit keeps the group's own value as an adaptively
+//! updated hyperparameter, so the reported `F` is the code length at that variance, not its minimum
+//! over the variance. Which groups are in the explanation is sent once in the enumerative
 //! subset code, `L_subset = L_int(k + 1) + ⌈log2 C(n, k)⌉` bits for `k` of `n` groups. A group the data does not inform
 //! sits at its prior with zero divergence and posterior mean zero, so the null is recovered;
 //! removing it from the explanation is a discrete step of the same `F`.
@@ -83,7 +88,10 @@
 //! (`interchange::values`). The variables are `M`'s functions (`interchange::reads`), those `P`
 //! removes included, one at a time and jointly: a function `P` no longer computes is patched in
 //! `M` alone, which asks whether it matters. A base's source is another training sequence, drawn
-//! uniformly. The questions do not move as `P` learns or loses functions, so `F`, the convergence
+//! uniformly. Each base's source and experiments come from a stream of draws of its own, seeded by
+//! the seed and the base's index (`base_draws`), so the collection, and with it `N`, does not
+//! depend on how the bases are packed into batches. The questions do not move as `P` learns or
+//! loses functions, so `F`, the convergence
 //! test and every removal comparison score the same experiments, and `M`'s targets for them are
 //! made on the device whenever a batch is scored (`interchange::targets`).
 //!
@@ -136,13 +144,18 @@
 //! program, the gradient stays where the reverse pass left it, and the IVON step and the groups'
 //! divergences run there; the host holds it between epochs, for the
 //! held-out evaluation, the checkpoint and the removal step. An epoch visits every training batch
-//! once, in a fixed order. The continuous fit stops descending by a statistical criterion, not a
-//! proof of stationarity: when an epoch's mean improvement of the per-batch estimate of `F` over
-//! the previous epoch, paired by batch (the same batches, experiments and noise seeds' structure),
-//! is within its standard error in either direction (an epoch that raises `F` by more is still
-//! moving). The criterion is on `F` itself rather than on the natural
-//! gradient in `μ`: under IVON the means settle long before the curvature `h`, and so `σ`, has
-//! finished its epoch-scale decay, which only `F` sees.
+//! once, in a fixed order. Each step's estimate of `F` is taken at the posterior before its step,
+//! so an epoch's mean of them is `F` at no one posterior. At each epoch's end the fit therefore
+//! scores the end-of-epoch posterior on the whole training collection, its snapshot
+//! (`snapshot_estimates`): forward passes only, each batch at its weight sample on the removal
+//! comparisons' noise stream, the same draws at every snapshot, give per batch an estimate of `F`
+//! at that posterior. The continuous fit stops descending at the first epoch whose snapshot's mean
+//! improvement over the previous epoch's, paired by batch (the same experiments and draws: common
+//! random numbers), is not positive, and goes back to the epoch whose snapshot estimate is the
+//! lowest since the objective last changed: a decision on one realization of the sampled `F`, not a
+//! proof of stationarity. The rule is on `F` itself rather than on the natural gradient in `μ`:
+//! under IVON the means settle long before the curvature `h`, and so `σ`, has finished its
+//! epoch-scale decay, which only `F` sees.
 //!
 //! Once the stopping criterion holds, the fit removes groups (`library_removal`): first every group without effect on
 //! any experiment (a rotary plane of a head with no value coordinate left, the gate of a function
@@ -183,12 +196,13 @@
 //! # Evaluation
 //!
 //! At the start and after every epoch a fixed subset of the held-out sequences (the first batch of
-//! them) is scored ([`HeldOut`]), and all of them only while the evaluations so far, with the last
+//! them) is scored ([`HeldOut`]), its experiments and `M`'s targets for them made once per fit, and
+//! all of them only while the evaluations so far, with the last
 //! full evaluation's time (estimated from the subset's until one is made), stay within
 //! [`EVALUATION_SHARE`] of the training time so far; the fit ends with a full evaluation. The
 //! held-out experiments are a fixed sample from the training distribution (`interchange::sample`,
-//! from each held-out batch's seed): per base one clean and one patched experiment, sources among
-//! the held-out sequences. `F` per token is the
+//! each base's from its own draws under a seed of their own): per base one clean and one patched
+//! experiment, sources among the held-out sequences. `F` per token is the
 //! held-out data term at one weight sample per batch plus the description spread over the training
 //! experiments' scored tokens; the divergences per experiment kind are taken at the posterior mean.
 //! Per layer it counts the surviving heads and MLP functions and, per token, the functions whose
@@ -959,22 +973,6 @@ impl std::ops::DerefMut for Shared {
     }
 }
 
-/// The bits of a group's variance scale (module note): the integer exponent
-/// `round(log2(v_G / v⁰_G))` in the Elias δ code of its signed index.
-fn scale_bits(variance: f64, initial: f64) -> f64 {
-    // In the log domain: a ratio of finite positive variances can overflow where its logarithm
-    // does not.
-    let exponent = (variance.log2() - initial.log2()).round();
-    if !(variance > 0.0 && initial > 0.0) || !exponent.is_finite() {
-        return f64::INFINITY;
-    }
-    // Finite positive variances have |exponent| ≤ 2098, well inside i64.
-    match crate::codec::signed_codeword_argument(exponent as i64).and_then(crate::codec::elias_delta_len_bits) {
-        Ok(bits) => bits as f64,
-        Err(_) => f64::INFINITY,
-    }
-}
-
 /// Per group: its size, `Σ (μ² + σ²)` and `Σ ln σ²`.
 #[derive(Clone, Copy, Debug, Default)]
 struct Moments {
@@ -983,10 +981,21 @@ struct Moments {
     log_variance: f64,
 }
 
+/// A group's prior variance `v_G`, `KL(q_G ‖ p_G)` there in nats, and the bits of `v_G`'s scale
+/// (module note).
+#[derive(Clone, Copy, Debug)]
+struct Prior {
+    variance: f64,
+    divergence: f64,
+    bits: f64,
+}
+
 impl Moments {
-    /// `KL(q_G ‖ p_G)` at the empirical-Bayes variance, in nats.
-    fn divergence(&self) -> f64 {
-        0.5 * (self.count * (self.second / self.count).ln() - self.log_variance)
+    /// The group's prior at its reference variance `reference` (`gam_gpu::tensor::group_prior`,
+    /// the device's arithmetic): zero for a group with no live entry.
+    fn prior(&self, reference: f64) -> Prior {
+        let (variance, divergence, bits) = gam_gpu::tensor::group_prior(self.count, self.second, self.log_variance, Some(reference));
+        Prior { variance, divergence, bits }
     }
 }
 
@@ -1155,6 +1164,25 @@ impl Posterior {
         out
     }
 
+    /// Per group, its prior variance, divergence and scale bits (module note; zero for a removed
+    /// group).
+    fn priors(&self) -> Vec<Prior> {
+        self.moments().iter().zip(&self.initial).map(|(m, reference)| m.prior(*reference)).collect()
+    }
+
+    /// Per group, the reference variance `v⁰_G` its variance's scale is sent against
+    /// (`Explanation::reference`).
+    #[must_use]
+    pub fn references(&self) -> &[f64] {
+        &self.initial
+    }
+
+    /// Per group, its prior variance `v_G` (module note; zero for a removed group): the minimizer
+    /// of `KL(q_G ‖ N(0, v I)) + ln 2 · L_scale(v)`, which the device's steps also use.
+    pub fn variances(&self) -> Vec<f64> {
+        self.priors().iter().map(|p| p.variance).collect()
+    }
+
     /// Per group, its second-order data change on removal summed over the batches,
     /// `Σ_b δ_bG` (module note, [`Curvature`]), and zero for a removed group: a proposal score,
     /// not a bound on the finite change.
@@ -1162,9 +1190,9 @@ impl Posterior {
         (0..self.active.len()).map(|g| if self.active[g] { curvature.rise[g] } else { 0.0 }).collect()
     }
 
-    /// Over the active groups' entries, the mean `ln σ` and the mean `|μ|`,
-    /// and over the active groups, the sum of the empirical-Bayes variances `v_G`: what moves
-    /// `Σ_G KL(q_G ‖ p_G) = ½ Σ_G (|G| ln v_G − Σ_{j∈G} ln σ_j²)` between epochs.
+    /// Over the active groups' entries, the mean `ln σ` and the mean `|μ|`, and over the active
+    /// groups, the sum of the prior variances `v_G`: what moves
+    /// `Σ_G KL(q_G ‖ p_G) = ½ Σ_G (S_G / v_G + |G| ln v_G − |G| − Σ_{j∈G} ln σ_j²)` between epochs.
     pub fn spread(&self) -> (f64, f64, f64) {
         let (mut entries, mut log_sd, mut magnitude) = (0.0, 0.0, 0.0);
         for i in 0..self.mean.len() {
@@ -1176,23 +1204,29 @@ impl Posterior {
                 }
             }
         }
-        let variances = self.moments().iter().zip(&self.active).filter(|(_, a)| **a).map(|(m, _)| m.second / m.count).sum();
+        let variances = self.priors().iter().zip(&self.active).filter(|(_, a)| **a).map(|(p, _)| p.variance).sum();
         (log_sd / entries, magnitude / entries, variances)
     }
 
-    /// Per group, `KL(q_G ‖ p_G)` in nats (zero for a removed group).
+    /// Per group, `KL(q_G ‖ p_G)` in nats at its prior variance (zero for a removed group).
     pub fn divergences(&self) -> Vec<f64> {
-        self.moments().iter().zip(&self.active).map(|(m, active)| if *active { m.divergence() } else { 0.0 }).collect()
+        self.priors().iter().zip(&self.active).map(|(p, active)| if *active { p.divergence } else { 0.0 }).collect()
     }
 
-    /// Per group, `KL(q_G ‖ p_G)` plus its variance's `½ ln |G|`, in nats (zero for a removed
-    /// group).
+    /// Per group, `KL(q_G ‖ p_G)` plus its variance's precision `½ ln |G|` and its scale's
+    /// `ln 2 · L_scale(v_G)`, in nats (zero for a removed group).
     pub fn costs(&self) -> Vec<f64> {
         self.moments()
             .iter()
             .zip(&self.active)
             .zip(&self.initial)
-            .map(|((m, active), initial)| if *active { m.divergence() + 0.5 * m.count.ln() + scale_bits(m.second / m.count, *initial) * LN_2 } else { 0.0 })
+            .map(|((m, active), reference)| {
+                if !*active {
+                    return 0.0;
+                }
+                let prior = m.prior(*reference);
+                prior.divergence + 0.5 * m.count.ln() + prior.bits * LN_2
+            })
             .collect()
     }
 
@@ -1303,6 +1337,11 @@ pub struct Settings {
     /// Empty (the default) is `read` alone.
     #[serde(default)]
     pub families: Vec<interchange::Family>,
+    /// A/B arm, to be deleted with the losing arm after its paired test: when set, each step
+    /// scores the whole batch at its weight sample and again at the antithetic twin, averaging the
+    /// two, instead of splitting the bases between them (`antithetic_step`).
+    #[serde(default)]
+    pub full_antithetic: bool,
 }
 
 /// [`Settings`] as configs and checkpoints hold them, unknown keys refused, and the keys of steps
@@ -1330,6 +1369,8 @@ struct SettingsRecord {
     epochs: Option<usize>,
     #[serde(default)]
     families: Vec<interchange::Family>,
+    #[serde(default)]
+    full_antithetic: bool,
     #[serde(default)]
     rate: Option<serde::de::IgnoredAny>,
     #[serde(default)]
@@ -1365,6 +1406,7 @@ impl From<SettingsRecord> for Settings {
             head_tile_rows: r.head_tile_rows,
             epochs: r.epochs,
             families: r.families,
+            full_antithetic: r.full_antithetic,
         }
     }
 }
@@ -1443,11 +1485,20 @@ pub const EVALUATION_SHARE: f64 = 0.1;
 pub struct Epoch {
     pub epoch: usize,
     /// Mean over the epoch's steps of the objective estimate, and of its data and description
-    /// parts, in bits.
+    /// parts, in bits: each step's at the posterior before its step, so the mean is no estimate of
+    /// `F` at one posterior (the log's record of the descent).
     pub objective_bits: f64,
     pub data_bits: f64,
     pub description_bits: f64,
-    /// Mean paired improvement over the previous epoch and its standard error, in bits.
+    /// The snapshot's estimate of `F` at the end-of-epoch posterior, the mean of its per-batch
+    /// estimates on the whole training collection at fixed draws, and the snapshot's seconds
+    /// (module note): what the stop and the best epoch are decided on.
+    #[serde(default)]
+    pub snapshot_bits: f64,
+    #[serde(default)]
+    pub snapshot_seconds: f64,
+    /// The snapshot's mean improvement over the previous epoch's, paired by batch, and its
+    /// standard error, in bits.
     pub improvement_bits: Option<f64>,
     pub standard_error_bits: Option<f64>,
     pub active_groups: usize,
@@ -1455,7 +1506,7 @@ pub struct Epoch {
     /// training experiments, in bits.
     pub clean_bits_per_token: f64,
     pub patched_bits_per_token: f64,
-    /// The epoch's training seconds.
+    /// The epoch's training seconds: its steps and its snapshot.
     pub seconds: f64,
     /// The held-out evaluation after the epoch's steps on the fixed subset, and on every held-out
     /// sequence when the schedule ran it (module note).
@@ -1586,7 +1637,7 @@ pub fn sequence_family(sequences: &[&[u32]]) -> Result<FamilyInputs, String> {
 }
 
 /// A batch of experiments: its base sequences, each base's source (indices into the sequences),
-/// and the seed of its experiments' draws.
+/// and the seed every base's draws derive from ([`base_draws`]).
 #[derive(Clone, Debug)]
 struct Draw {
     bases: Vec<usize>,
@@ -1601,15 +1652,40 @@ impl Draw {
     }
 
     /// Per base one clean and one patched experiment over `variables` in `blocks` blocks
-    /// (`interchange::sample`), from the batch's seed.
+    /// (`interchange::sample` of the one base), each base's from its own draws after its source
+    /// ([`base_draws`]), so a base's experiments do not depend on the batch it is in.
     fn experiments(&self, sequences: &[Vec<u32>], variables: &[ReadVariable], blocks: usize) -> Result<Vec<Experiment>, String> {
         let length = self.bases.first().map_or(0, |b| sequences[*b].len());
-        interchange::sample(&mut StdRng::seed_from_u64(self.seed), self.bases.len(), variables, blocks, length)
+        let mut out = Vec::with_capacity(2 * self.bases.len());
+        for (k, &base) in self.bases.iter().enumerate() {
+            let (_, mut rng) = base_draws(self.seed, sequences.len(), base);
+            for mut e in interchange::sample(&mut rng, 1, variables, blocks, length)? {
+                (e.base, e.source) = (k, k);
+                out.push(e);
+            }
+        }
+        Ok(out)
     }
 }
 
-/// The `count` sequences in order, in batches of `size` bases, each base's source drawn uniformly
-/// among the other sequences, all from `seed`.
+/// The version of the experiment collection's draws a checkpoint records ([`Progress::collection`]):
+/// 1 draws every base's source and experiments from its own stream ([`base_draws`]). Before it
+/// (0, a checkpoint naming none), each batch drew its bases' experiments from a seed of its own,
+/// which the batch size changed.
+const COLLECTION: u32 = 1;
+
+/// Base `base`'s draws among `count` sequences under `seed`: its source, uniform among the other
+/// sequences, and the generator positioned after it, from which its experiments are drawn
+/// ([`Draw::experiments`]). The generator is seeded by `seed` and the base's index alone (the
+/// SplitMix64 hash of `seed` mixed with the index's, `gam_linalg::utils::splitmix64_hash`), so the
+/// collection does not depend on how the bases are packed into batches.
+fn base_draws(seed: u64, count: usize, base: usize) -> (usize, StdRng) {
+    use gam_linalg::utils::splitmix64_hash;
+    let mut rng = StdRng::seed_from_u64(splitmix64_hash(seed ^ splitmix64_hash(base as u64)));
+    let j = rng.random_range(0..count - 1);
+    (if j >= base { j + 1 } else { j }, rng)
+}
+
 /// One of `batches` batches drawn uniformly from a collection of `tokens` scored tokens: the factor
 /// turning the batch's data term into an unbiased estimate of the collection's (`B`), and the one
 /// turning its gradient and squared Gauss–Newton factor into the collection's per token (`B / N`),
@@ -1620,24 +1696,16 @@ fn batch_weights(batches: usize, tokens: usize) -> (f64, f64) {
     (b, b / tokens as f64)
 }
 
+/// The `count` sequences in order, in batches of `size` bases, each base's source drawn uniformly
+/// among the other sequences from its own draws under `seed` ([`base_draws`]).
 fn draws(count: usize, size: usize, seed: u64) -> Result<Vec<Draw>, String> {
     if count < 2 || size == 0 {
         return Err("a source needs another sequence, and batches must be nonempty".into());
     }
-    let mut rng = StdRng::seed_from_u64(seed);
     let all: Vec<usize> = (0..count).collect();
     Ok(all
         .chunks(size)
-        .map(|bases| {
-            let sources = bases
-                .iter()
-                .map(|&i| {
-                    let j = rng.random_range(0..count - 1);
-                    if j >= i { j + 1 } else { j }
-                })
-                .collect();
-            Draw { bases: bases.to_vec(), sources, seed: rng.random() }
-        })
+        .map(|bases| Draw { bases: bases.to_vec(), sources: bases.iter().map(|&i| base_draws(seed, count, i).0).collect(), seed })
         .collect())
 }
 
@@ -1741,9 +1809,11 @@ impl Scorer {
 
     /// The batch's experiments from `draw`: the fixed collection's for that batch.
     /// With edit families (`Settings::families`), each base's patched experiment takes a family
-    /// drawn uniformly from them (from the batch's seed): an edit replaces its read patch (or
-    /// joins a base without one) under the same hybrid.
+    /// drawn uniformly from them, from draws of the base's own keyed by its index as its source's
+    /// and experiments' are ([`base_draws`]), so packing changes neither: an edit replaces its
+    /// read patch (or joins a base without one) under the same hybrid.
     fn experiments(&self, draw: &Draw, sequences: &[Vec<u32>]) -> Result<Vec<Experiment>, String> {
+        use gam_linalg::utils::splitmix64_hash;
         let mut experiments = draw.experiments(sequences, self.experiments.variables(), 2 * self.layers())?;
         if self.families.iter().any(|f| *f != interchange::Family::Read) {
             let key = (draw.seed, draw.bases.clone());
@@ -1751,11 +1821,15 @@ impl Scorer {
             let drawn = match cached {
                 Some(drawn) => drawn,
                 None => {
-                    let mut rng = StdRng::seed_from_u64(gam_linalg::utils::splitmix64_hash(draw.seed ^ 0xED17));
-                    let slots: Vec<(usize, interchange::Family)> =
-                        (0..draw.bases.len()).map(|n| (n, self.families[rng.random_range(0..self.families.len())])).filter(|(_, f)| *f != interchange::Family::Read).collect();
-                    let edits = self.experiments.draw_edits(&mut rng, &draw.batch(sequences)?, &slots)?;
-                    let drawn: Vec<(usize, Patch, usize)> = slots.into_iter().zip(edits).map(|((n, _), (patch, position))| (n, patch, position)).collect();
+                    let batch = draw.batch(sequences)?;
+                    let mut drawn: Vec<(usize, Patch, usize)> = Vec::new();
+                    for (n, &base) in draw.bases.iter().enumerate() {
+                        let mut rng = StdRng::seed_from_u64(splitmix64_hash(splitmix64_hash(draw.seed ^ 0xED17) ^ splitmix64_hash(base as u64)));
+                        let family = self.families[rng.random_range(0..self.families.len())];
+                        if family != interchange::Family::Read {
+                            drawn.extend(self.experiments.draw_edits(&mut rng, &batch, &[(n, family)])?.into_iter().map(|(patch, position)| (n, patch, position)));
+                        }
+                    }
                     self.edits.borrow_mut().insert(key, drawn.clone());
                     drawn
                 }
@@ -1817,15 +1891,16 @@ fn probe_key(seed: u64) -> u64 {
 }
 
 /// The noise seed of batch `batch` in stream `epoch`: stream 1 is the training steps'
-/// (`training_key`), stream 0 the removal comparisons' and the held-out evaluation's.
+/// (`training_key`), stream 0 the removal comparisons', the epochs' snapshots'
+/// (`snapshot_estimates`) and the held-out evaluation's.
 fn noise_seed(seed: u64, epoch: usize, batch: usize) -> u64 {
     seed.wrapping_add((epoch as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)).wrapping_add((batch as u64).wrapping_mul(0x8CB9_2BA7_2F3D_8DD7))
 }
 
 /// The weight noise of training batch `b` in every epoch: keyed by the batch alone, so the fit
-/// minimizes one sample average of `F` (the batches' experiments are fixed too), and an epoch's
-/// paired per-batch improvement compares estimates at identical draws (common random numbers).
-/// Stream 1 is apart from the removal comparisons' and the held-out evaluation's (`noise_seed` with
+/// minimizes one sample average of `F` (the batches' experiments are fixed too), and two epochs'
+/// per-step estimates of a batch are at identical draws (common random numbers). Stream 1 is apart
+/// from the removal comparisons', the snapshots' and the held-out evaluation's (`noise_seed` with
 /// epoch 0).
 fn training_key(seed: u64, batch: usize) -> u64 {
     noise_seed(seed, 1, batch)
@@ -1847,6 +1922,12 @@ fn training_key(seed: u64, batch: usize) -> u64 {
 /// Its A/B (fitperf-halffactor-ab2: vpd4l, N = 2^20, RTX 4090, 3 epochs, seeds 1-2) measured F
 /// after epoch 2 at 25.45e6 and 24.09e6 bits against 25.73e6 and 24.81e6 with both halves'
 /// factors, and 7% less wall time per step.
+///
+/// With `whole` (the A/B arm [`Settings::full_antithetic`]) the whole batch is scored at the sample
+/// of `key` and again at its negation, and the step takes the two scorings' mean bits and mean
+/// gradient, the Gauss–Newton factor the first scoring's: for a quadratic objective with Hessian
+/// `H` the gradient's terms linear in the noise, `H σ ε` and `−H σ ε`, cancel exactly, where the
+/// split halves leave `(H_A − H_B) σ ε`; the batch is scored twice.
 /// Returns the experiments in the order of their bits.
 fn antithetic_step(
     scorer: &mut Scorer,
@@ -1854,10 +1935,30 @@ fn antithetic_step(
     batch: &Batch,
     experiments: Vec<Experiment>,
     key: u64,
+    whole: bool,
 ) -> Result<(Vec<Experiment>, Vec<Vec<f64>>, BTreeMap<usize, Tensor>, interchange::Factor), String> {
+    let targets_of = |scorer: &mut Scorer, part: &[Experiment]| scorer.experiments.targets(batch, part);
+    if whole {
+        let targets = targets_of(scorer, &experiments)?;
+        let (mut bits, mut gradients, factor) = scorer.evaluate_device(device_posterior, (batch, &experiments), Some(key), &targets, (true, true))?;
+        let factor = factor.ok_or("no Gauss–Newton factor")?;
+        let (other_bits, other_gradients, _) = scorer.evaluate_device(device_posterior, (batch, &experiments), Some(key ^ gam_gpu::tensor::ANTITHETIC), &targets, (true, false))?;
+        if !other_gradients.keys().eq(gradients.keys()) {
+            return Err("the antithetic pair's scorings reached different operators".into());
+        }
+        for (op, g) in other_gradients {
+            let sum = gradients.get_mut(&op).ok_or("the antithetic pair's scorings reached different operators")?;
+            device.move_toward(sum, 0.5, &g).map_err(error)?;
+        }
+        for (mine, other) in bits.iter_mut().zip(&other_bits) {
+            for (a, b) in mine.iter_mut().zip(other) {
+                *a = 0.5 * (*a + b);
+            }
+        }
+        return Ok((experiments, bits, gradients, factor));
+    }
     let half = batch.base.len() / 2;
     let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.into_iter().partition(|e| e.base < half);
-    let targets_of = |scorer: &mut Scorer, part: &[Experiment]| scorer.experiments.targets(batch, part);
     if first.is_empty() || second.is_empty() {
         let all: Vec<Experiment> = first.into_iter().chain(second).collect();
         let targets = targets_of(scorer, &all)?;
@@ -1910,10 +2011,11 @@ impl Mean {
 }
 
 /// The held-out batches of `sequences` and their experiments: a fixed sample from the training
-/// distribution, one clean and one patched experiment per base. They are drawn from their own seed,
-/// the SplitMix64 output after the fit's (`gam_linalg::utils::splitmix64_hash`): drawn from the
-/// fit's seed itself, held-out batch `b` repeated training batch `b`'s interventions exactly, so
-/// held-out scores tested unseen bases under seen interventions only.
+/// distribution, one clean and one patched experiment per base, each base's from its own draws
+/// ([`base_draws`]). They are drawn from their own seed, the SplitMix64 output after the fit's
+/// (`gam_linalg::utils::splitmix64_hash`): drawn from the fit's seed itself, held-out base `b`
+/// would repeat training base `b`'s interventions exactly, so held-out scores would test unseen
+/// bases under seen interventions only.
 fn held_out_experiments(scorer: &Scorer, sequences: &[Vec<u32>], settings: &Settings) -> Result<Vec<(Draw, Vec<Experiment>)>, String> {
     draws(sequences.len(), settings.batch_sequences, gam_linalg::utils::splitmix64_hash(settings.seed))?
         .into_iter()
@@ -1924,13 +2026,45 @@ fn held_out_experiments(scorer: &Scorer, sequences: &[Vec<u32>], settings: &Sett
         .collect()
 }
 
+/// A held-out batch ([`held_batches`]): its bases and sources, its experiments and `M`'s targets
+/// for them.
+type HeldBatch = (Batch, Vec<Experiment>, Targets);
+
+/// The held-out batches of `sequences` ([`held_out_experiments`]) with `M`'s targets for each.
+fn held_batches(scorer: &Scorer, sequences: &[Vec<u32>], settings: &Settings) -> Result<Vec<HeldBatch>, String> {
+    held_out_experiments(scorer, sequences, settings)?
+        .into_iter()
+        .map(|(draw, experiments)| {
+            let batch = draw.batch(sequences)?;
+            let targets = scorer.experiments.targets(&batch, &experiments)?;
+            Ok((batch, experiments, targets))
+        })
+        .collect()
+}
+
 /// The held-out evaluation of `posterior` (held on the host, and as `device_posterior` on the
-/// device) on `sequences` (module note); `tokens` is `N`.
+/// device) on `sequences` (module note), its batches and `M`'s targets made here; `tokens` is `N`.
 fn held_out(
     scorer: &mut Scorer,
     explanation: &Explanation,
-    (posterior, device_posterior): (&Posterior, &DevicePosterior),
+    posteriors: (&Posterior, &DevicePosterior),
     sequences: &[Vec<u32>],
+    settings: &Settings,
+    tokens: usize,
+    prior: Option<&mut (dyn PriorTerm + 'static)>,
+) -> Result<HeldOut, String> {
+    let batches = held_batches(scorer, sequences, settings)?;
+    held_out_on(scorer, explanation, posteriors, (sequences, &batches), settings, tokens, prior)
+}
+
+/// [`held_out`] on `batches`, the held-out batches of `sequences` made beforehand
+/// ([`held_batches`]): the fit's fixed subset, whose experiments and targets depend on `M`, the
+/// batch and its experiments alone, has them made once per fit and scored after every epoch.
+fn held_out_on(
+    scorer: &mut Scorer,
+    explanation: &Explanation,
+    (posterior, device_posterior): (&Posterior, &DevicePosterior),
+    (sequences, batches): (&[Vec<u32>], &[HeldBatch]),
     settings: &Settings,
     tokens: usize,
     prior: Option<&mut (dyn PriorTerm + 'static)>,
@@ -1940,13 +2074,10 @@ fn held_out(
     let (mut read, mut joint, mut sampled) = (Mean::default(), Mean::default(), Mean::default());
     let (mut at_mean, mut at_rounded) = (Mean::default(), Mean::default());
     let size = |e: &Experiment| e.explained.iter().filter(|x| **x).count();
-    // Each batch's targets from `M` are made once; the mean, the sample and the rounded posterior
-    // (rounded on the device) are scored against them.
-    let mut made = Vec::new();
-    for (b, (draw, experiments)) in held_out_experiments(scorer, sequences, settings)?.into_iter().enumerate() {
-        let batch = draw.batch(sequences)?;
-        let targets = scorer.experiments.targets(&batch, &experiments)?;
-        let (bits, _, _) = scorer.evaluate_device(device_posterior, (&batch, &experiments), None, &targets, (false, false))?;
+    // The mean, the sample and the rounded posterior (rounded on the device) are scored against
+    // each batch's targets from `M`.
+    for (b, (batch, experiments, targets)) in batches.iter().enumerate() {
+        let (bits, _, _) = scorer.evaluate_device(device_posterior, (batch, experiments), None, targets, (false, false))?;
         bits.iter().for_each(|b| at_mean.add(b));
         for (e, bits) in experiments.iter().zip(&bits) {
             match &e.patch {
@@ -1961,12 +2092,11 @@ fn held_out(
                 }
             }
         }
-        let (bits, _, _) = scorer.evaluate_device(device_posterior, (&batch, &experiments), Some(noise_seed(settings.seed, 0, b)), &targets, (false, false))?;
+        let (bits, _, _) = scorer.evaluate_device(device_posterior, (batch, experiments), Some(noise_seed(settings.seed, 0, b)), targets, (false, false))?;
         bits.iter().for_each(|b| sampled.add(b));
-        made.push((batch, experiments, targets));
     }
     device_posterior.rounded_into(scorer.experiments.explanation_mut())?;
-    for (batch, experiments, targets) in &made {
+    for (batch, experiments, targets) in batches {
         let evaluation = scorer.experiments.evaluate_resident(batch, experiments, targets, false)?;
         if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
             return Err("nonfinite explanation divergence".into());
@@ -2148,15 +2278,20 @@ struct Progress {
     /// steps, the decay those fits used.
     #[serde(default)]
     momentum_weights: Option<(f64, f64)>,
-    /// The best epoch since the objective last changed: its mean per-batch estimate and the epoch,
-    /// whose posterior is the checkpoint beside the fit's with extension `best.bin` (the removal
-    /// round starts from it).
+    /// The best epoch since the objective last changed: its snapshot's estimate of `F` in nats and
+    /// the epoch, whose posterior is the checkpoint beside the fit's with extension `best.bin` (the
+    /// removal round starts from it).
     #[serde(default)]
     best: Option<(f64, usize)>,
     epochs: Vec<Epoch>,
     removals: Vec<Removal>,
-    /// The last epoch's per-batch objective estimates, when convergence is being judged.
+    /// The last epoch's snapshot, its per-batch estimates of `F` in nats, when convergence is being
+    /// judged.
     previous: Option<Vec<f64>>,
+    /// The version of the experiment collection's draws ([`COLLECTION`]; 0 in a checkpoint written
+    /// before it was recorded), which a resumed fit must share.
+    #[serde(default)]
+    collection: u32,
     active: Vec<bool>,
     done: bool,
     seconds: f64,
@@ -2543,6 +2678,14 @@ impl Drop for Writer {
 fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) -> Result<(Progress, Vec<[Array2<f64>; 3]>, Vec<Array2<f64>>, Vec<Array2<f64>>), String> {
     let (progress, mut reader, payload_bytes): (Progress, _, _) = checkpoint_header(path)?;
     check_checkpoint_identity(path, &progress.identity, &expected.identity)?;
+    if progress.collection != expected.collection {
+        return Err(format!(
+            "{}: a checkpoint of experiment collection {}, where this fit draws collection {} (every base's source and experiments from its own draws, which the batch size does not change): it was trained on other experiments",
+            path.display(),
+            progress.collection,
+            expected.collection
+        ));
+    }
     let same_settings =
         serde_json::to_value(&progress.settings).map_err(error)? == serde_json::to_value(&expected.settings).map_err(error)?;
     if !same_settings
@@ -2758,6 +2901,7 @@ pub fn fit_from(
         epochs: Vec::new(),
         removals: Vec::new(),
         previous: None,
+        collection: COLLECTION,
         active: posterior.active.clone(),
         done: false,
         seconds: 0.0,
@@ -2768,8 +2912,9 @@ pub fn fit_from(
         precision: None,
     };
     // The fixed held-out subset: the first batch of held-out bases (at least the two a source
-    // needs).
+    // needs), with `M`'s targets for its experiments made once for every evaluation of it.
     let subset = &held[..settings.batch_sequences.clamp(2, held.len())];
+    let subset_batches = held_batches(&scorer, subset, settings)?;
     let (mut resumed, mut held_means) = (None, None);
     // IVON's iterate and the steps its average spans, where the means are that average.
     let mut held_iterate: Option<(Vec<Array2<f64>>, u64)> = None;
@@ -2835,7 +2980,13 @@ pub fn fit_from(
         device_posterior.settle()?;
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
-    // The curvature estimate averages over one epoch's batches: each batch weighs about once.
+    // The curvature estimate `h` estimates the Gauss–Newton diagonal per token of the whole
+    // training collection, the mean of its `B` batches' diagonals. `β₂ = 1 − 1/B` makes its running
+    // average span about one pass, so each batch weighs about once whatever the batch size. One
+    // factor draw per batch estimates its entry of the batch's diagonal with relative variance at
+    // most 2 under a random-sign probe, so the pass's average of `B` independent draws has relative
+    // variance about `2 / B` per entry: the batch size sets how many draws the average holds, not
+    // what it estimates.
     let ivon = Ivon { beta1: MOMENTUM_DECAY, beta2: 1.0 - 1.0 / draws.len() as f64 };
     // Each group's size, whose `½ ln |G|` an active group's variance costs.
     let sizes: Vec<f64> = explanation.groups.iter().map(|g| g.cells.iter().map(|c| (c.rows.len() * c.cols.len()) as f64).sum()).collect();
@@ -2860,7 +3011,7 @@ pub fn fit_from(
         // The start obeys the budget too: the subset now; the full set's time, until a full
         // evaluation is made, estimated from the subset's in proportion to the sequences.
         let timed = Instant::now();
-        let start = held_out(&mut scorer, explanation, (&posterior, &device_posterior), subset, settings, tokens, prior.as_deref_mut())?;
+        let start = held_out_on(&mut scorer, explanation, (&posterior, &device_posterior), (subset, &subset_batches), settings, tokens, prior.as_deref_mut())?;
         let seconds = timed.elapsed().as_secs_f64();
         progress.evaluation_seconds += seconds;
         progress.full_seconds = seconds * held.len() as f64 / subset.len() as f64;
@@ -2875,8 +3026,8 @@ pub fn fit_from(
             Snapshot::save(&mut progress, &device_posterior, &path.with_extension("start.bin"), &mut writer)?;
         }
     }
-    // The posterior at the end of the epoch with the lowest mean per-batch estimate of `F` since
-    // the objective last changed (a start or a removal), with that mean.
+    // The posterior at the end of the epoch with the lowest snapshot estimate of `F` since the
+    // objective last changed (a start or a removal), with that estimate.
     // The best epoch's posterior, written whole where the removal round can read it back: beside
     // the fit's checkpoint, or for a fit without one a file of its own, removed at the end.
     static FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2896,7 +3047,7 @@ pub fn fit_from(
         let subset_code = posterior.subset_nats();
         // Each step's code length of the groups' posteriors, summed on the device and read once
         // the epoch's steps are done.
-        let mut code = device_posterior.code_length(&posterior.active, &sizes, &posterior.initial, draws.len())?;
+        let mut code = device_posterior.code_length(&posterior.active, &sizes, draws.len())?;
         let (mut datas, mut priors) = (Vec::with_capacity(draws.len()), Vec::with_capacity(draws.len()));
         let mut estimates = Vec::with_capacity(draws.len());
         let (mut data_sum, mut description_sum) = (0.0, 0.0);
@@ -2906,7 +3057,7 @@ pub fn fit_from(
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
             let key = training_key(settings.seed, b);
-            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key)?;
+            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key, settings.full_antithetic)?;
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
@@ -2946,7 +3097,8 @@ pub fn fit_from(
             priors.push(prior_nats);
             progress.step += 1;
             // The factor's scale: its square estimates the curvature per token of the tokens it
-            // sums (the first antithetic half's, `antithetic_step`).
+            // sums (the first antithetic half's, or the whole batch's under the full arm,
+            // `antithetic_step`).
             let factor_weight = weight * scored as f64 / factor.tokens as f64;
             let posterior_started = Instant::now();
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &ivon)?;
@@ -2966,10 +3118,15 @@ pub fn fit_from(
             description_sum += description;
         }
         let count = draws.len() as f64;
-        let mean_estimate = estimates.iter().sum::<f64>() / count;
+        // The end-of-epoch posterior scored on the whole collection at the draws every snapshot
+        // shares: the estimates the stop and the best epoch are decided on (module note).
+        let snapshot_started = Instant::now();
+        let snapshot = snapshot_estimates(&mut scorer, &device_posterior, &mut posterior, explanation, &Evidence { draws: &draws, sequences, settings }, prior.as_deref_mut())?;
+        let snapshot_seconds = snapshot_started.elapsed().as_secs_f64();
+        let snapshot_mean = snapshot.iter().sum::<f64>() / count;
         let (improvement, standard_error) = match &progress.previous {
             Some(before) => {
-                let differences: Vec<f64> = before.iter().zip(&estimates).map(|(a, b)| a - b).collect();
+                let differences: Vec<f64> = before.iter().zip(&snapshot).map(|(a, b)| a - b).collect();
                 let mean = differences.iter().sum::<f64>() / count;
                 let variance = differences.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (count - 1.0);
                 (Some(mean), Some((variance / count).sqrt()))
@@ -2983,6 +3140,8 @@ pub fn fit_from(
             objective_bits: to_bits(estimates.iter().sum::<f64>() / count),
             data_bits: to_bits(data_sum / count),
             description_bits: to_bits(description_sum / count),
+            snapshot_bits: to_bits(snapshot_mean),
+            snapshot_seconds,
             improvement_bits: improvement.map(to_bits),
             standard_error_bits: standard_error.map(to_bits),
             active_groups: posterior.active.iter().filter(|a| **a).count(),
@@ -2991,9 +3150,8 @@ pub fn fit_from(
             seconds: epoch_started.elapsed().as_secs_f64(),
             held_out: {
                 progress.training_seconds += epoch_started.elapsed().as_secs_f64();
-                device_posterior.values_into(&mut posterior)?;
                 let timed = Instant::now();
-                let evaluation = held_out(&mut scorer, explanation, (&posterior, &device_posterior), subset, settings, tokens, prior.as_deref_mut())?;
+                let evaluation = held_out_on(&mut scorer, explanation, (&posterior, &device_posterior), (subset, &subset_batches), settings, tokens, prior.as_deref_mut())?;
                 progress.evaluation_seconds += timed.elapsed().as_secs_f64();
                 evaluation
             },
@@ -3011,19 +3169,21 @@ pub fn fit_from(
         let (log_sd, magnitude, variances) = posterior.spread();
         log::info!("library posterior after epoch {epoch}: mean ln σ {log_sd:.5}, mean |μ| {magnitude:.6e}, Σ v_G {variances:.6e}");
         progress.epochs.push(record);
-        progress.previous = Some(estimates);
+        progress.previous = Some(snapshot);
         progress.epoch += 1;
         let budget = settings.epochs.is_some_and(|last| progress.epoch >= last);
-        // The descent stops at the first epoch whose mean improvement over the last, paired batch
-        // by batch, is not positive, and the removal round starts from the best epoch's
-        // posterior (the lowest mean per-batch estimate since the objective last changed).
-        let is_best = progress.best.is_none_or(|(b, _)| mean_estimate < b);
+        // The descent stops at the first epoch whose snapshot's mean improvement over the last
+        // one's, paired batch by batch, is not positive, and the removal round starts from the
+        // best epoch's posterior (the lowest snapshot estimate since the objective last changed).
+        // A fit with a budget of epochs (`Settings::epochs`) runs exactly that many and removes
+        // nothing: arms compared at one budget take the same steps.
+        let is_best = progress.best.is_none_or(|(b, _)| snapshot_mean < b);
         if is_best {
-            progress.best = Some((mean_estimate, epoch));
+            progress.best = Some((snapshot_mean, epoch));
         }
         if budget {
             progress.done = true;
-        } else if improvement.is_some_and(|i| i <= 0.0) {
+        } else if settings.epochs.is_none() && improvement.is_some_and(|i| i <= 0.0) {
             if let Some((bits, at)) = progress.best.take() {
                 log::info!("library fit stops after epoch {epoch}: back to the best epoch's posterior ({:.6e} bits)", bits / LN_2);
                 if at != epoch {
@@ -3058,8 +3218,9 @@ pub fn fit_from(
             std::fs::remove_file(&written).map_err(error)?;
         }
     }
-    // A fit ended by its budget of epochs has no removal round: its last epoch's estimate.
-    let objective_bits = progress.removals.last().map(|r| r.after_bits).or_else(|| settings.epochs.and(progress.epochs.last()).map(|e| e.objective_bits)).unwrap_or(f64::NAN);
+    // A fit ended by its budget of epochs has no removal round: its last epoch's snapshot, the
+    // estimate of `F` at the posterior it ends with.
+    let objective_bits = progress.removals.last().map(|r| r.after_bits).or_else(|| settings.epochs.and(progress.epochs.last()).map(|e| e.snapshot_bits)).unwrap_or(f64::NAN);
     let end = held_out(&mut scorer, explanation, (&posterior, &device_posterior), held, settings, tokens, prior.as_deref_mut())?;
     log::info!("library end: {end:?}");
     writer.wait()?;
@@ -3142,7 +3303,7 @@ fn laplace_start(
     for (op, sum) in sums {
         at.insert(scorer.at(op)?, sum);
     }
-    let variance: Vec<f64> = posterior.moments().iter().map(|m| if m.count > 0.0 { m.second / m.count } else { 0.0 }).collect();
+    let variance = posterior.variances();
     let n = tokens as f64;
     for i in 0..posterior.mean.len() {
         let mut h = match at.remove(&i) {
@@ -3260,14 +3421,40 @@ fn expected_divergence(
     // The trial goes to the device once; each batch's weight sample is drawn there.
     device_posterior.set_values(&trial)?;
     let uploaded = timed.elapsed().as_secs_f64();
+    let (evaluation, (preparing, targeting, scoring)) = collection_divergence(scorer, device_posterior, &trial, (draws, sequences, settings), prior, against)?;
+    log::info!(
+        "library removal evaluation: {:.2} s: trial clone {cloned:.2} s, set_values {:.2} s, {} of {} batches {:.2} s (experiments {preparing:.2} s, targets {targeting:.2} s, scoring {:.2} s)",
+        timed.elapsed().as_secs_f64(),
+        uploaded - cloned,
+        evaluation.scored(),
+        draws.len(),
+        preparing + targeting + scoring,
+        scoring
+    );
+    Ok(evaluation)
+}
+
+/// [`expected_divergence`] of the posterior `device_posterior` holds, `trial` on the host, which
+/// the prior term's samples are drawn from: the device posterior's state is only read, each
+/// batch's weight sample drawn around its mean `μ̄` on the removal comparisons' noise stream
+/// (`noise_seed(seed, 0, b)`). Returns the evaluation and the seconds spent making the batches'
+/// experiments, their targets, and scoring them.
+fn collection_divergence(
+    scorer: &mut Scorer,
+    device_posterior: &DevicePosterior,
+    trial: &Posterior,
+    (draws, sequences, settings): (&[Draw], &[Vec<u32>], &Settings),
+    prior: Option<&mut (dyn PriorTerm + 'static)>,
+    against: Option<(&[f64], f64)>,
+) -> Result<(Evaluation, (f64, f64, f64)), String> {
     let mut prior = prior;
-    let cost = prior.as_deref().map_or(Ok(0.0), |p| p.cost(&trial))?;
+    let cost = prior.as_deref().map_or(Ok(0.0), |p| p.cost(trial))?;
     let n = draws.len();
     let against = against.filter(|_| prior.is_none());
     let sequence: Vec<usize> = against.map_or_else(|| (0..n).collect(), |(accepted, _)| library_removal::order(accepted));
     let mut batches = vec![f64::NAN; n];
     let (mut rise, mut slack) = (0.0, against.map_or(0.0, |(accepted, _)| accepted.iter().sum::<f64>()));
-    let (mut preparing, mut targeting) = (0.0, 0.0);
+    let (mut preparing, mut targeting, mut scoring) = (0.0, 0.0, 0.0);
     for (k, b) in sequence.into_iter().enumerate() {
         let draw = &draws[b];
         // Removal zeroes entries, so the remaining entries see the same noise as the full posterior.
@@ -3279,11 +3466,13 @@ fn expected_divergence(
         let started = Instant::now();
         let targets = scorer.experiments.targets(&batch, &experiments)?;
         targeting += started.elapsed().as_secs_f64();
+        let started = Instant::now();
         let scored = scorer.evaluate_device(device_posterior, (&batch, &experiments), Some(key), &targets, (false, false))?.0;
         let mut nats = scored.iter().flatten().sum::<f64>() * LN_2;
         if let Some(prior) = prior.as_deref_mut() {
-            nats += prior.sample(&trial, &host_sample(&trial, &prior.operators(), key), false)?.0 / draws.len() as f64;
+            nats += prior.sample(trial, &host_sample(trial, &prior.operators(), key), false)?.0 / draws.len() as f64;
         }
+        scoring += started.elapsed().as_secs_f64();
         batches[b] = nats;
         if let Some((accepted, budget)) = against {
             rise += nats - accepted[b];
@@ -3293,18 +3482,37 @@ fn expected_divergence(
             }
         }
     }
-    let count = batches.iter().filter(|b| !b.is_nan()).count();
-    let total = timed.elapsed().as_secs_f64();
-    log::info!(
-        "library removal evaluation: {total:.2} s: trial clone {cloned:.2} s, set_values {:.2} s, {} of {} batches {:.2} s (experiments {preparing:.2} s, targets {targeting:.2} s, scoring {:.2} s)",
-        uploaded - cloned,
-        count,
-        n,
-        total - uploaded,
-        total - uploaded - preparing - targeting
-    );
-    let complete = count == n;
-    Ok(Evaluation { batches, rest: cost, complete })
+    let complete = batches.iter().all(|b| !b.is_nan());
+    Ok((Evaluation { batches, rest: cost, complete }, (preparing, targeting, scoring)))
+}
+
+/// The snapshot of the posterior `device_posterior` holds at an epoch's end (module note): per
+/// training batch `b` of `evidence`, the estimate `B D_b + R` of `F` in nats, `B` the batches,
+/// `D_b` the batch's data term at its weight sample on the removal comparisons' noise stream
+/// (`noise_seed(seed, 0, b)`, the same draws at every snapshot) with its share of the prior term's
+/// value there ([`collection_divergence`]), and `R` the rest of `F` at the posterior: the groups'
+/// description, the explanation's discrete choices and the prior term's parameters. The mean over
+/// the batches is the removal comparisons' `F` of the posterior. Forward passes only: the device
+/// posterior's state (its iterate, its average and IVON's state) is left as it is; `posterior` is
+/// set to the device's values.
+fn snapshot_estimates(
+    scorer: &mut Scorer,
+    device_posterior: &DevicePosterior,
+    posterior: &mut Posterior,
+    explanation: &Explanation,
+    evidence: &Evidence,
+    prior: Option<&mut (dyn PriorTerm + 'static)>,
+) -> Result<Vec<f64>, String> {
+    let &Evidence { draws, sequences, settings } = evidence;
+    device_posterior.values_into(posterior)?;
+    let (evaluation, (preparing, targeting, scoring)) = collection_divergence(scorer, device_posterior, posterior, (draws, sequences, settings), prior, None)?;
+    log::info!("library snapshot: {} batches, experiments {preparing:.2} s, targets {targeting:.2} s, scoring {scoring:.2} s", draws.len());
+    let rest = evaluation.rest + posterior.description() + explanation.fixed_nats;
+    if !rest.is_finite() {
+        return Err("a nonfinite posterior divergence".into());
+    }
+    let count = draws.len() as f64;
+    Ok(evaluation.batches.iter().map(|data| count * data + rest).collect())
 }
 
 /// A removal round's fixed evidence: the training batches of the sequences under the fit's
@@ -3561,7 +3769,7 @@ mod tests {
     /// `data`'s gradient at the sample `θ = μ + σ ⊙ noise` (zero in removed groups); the host
     /// reference of the device step.
     fn derivatives(posterior: &Posterior, data: &[Array2<f64>], noise: &[Array2<f64>]) -> Vec<(Array2<f64>, Array2<f64>)> {
-        let variance: Vec<f64> = posterior.moments().iter().map(|m| if m.count > 0.0 { m.second / m.count } else { 0.0 }).collect();
+        let variance = posterior.variances();
         (0..data.len())
             .into_par_iter()
             .map(|i| {
@@ -3936,6 +4144,7 @@ mod tests {
             head_tile_rows: 64,
             epochs: None,
             families: Vec::new(),
+            full_antithetic: false,
         }
     }
 
@@ -4098,7 +4307,7 @@ mod tests {
             for (b, draw) in draws.iter().enumerate() {
                 let batch = draw.batch(&sequences).unwrap();
                 let experiments = scorer.experiments(draw, &sequences).unwrap();
-                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, training_key(settings.seed, b)).unwrap();
+                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, training_key(settings.seed, b), false).unwrap();
                 estimates.push(bits.iter().flatten().sum::<f64>());
             }
             estimates
@@ -4106,6 +4315,138 @@ mod tests {
         let (first, second) = (epoch(), epoch());
         let differences: Vec<f64> = first.iter().zip(&second).map(|(a, b)| a - b).collect();
         assert!(differences.iter().all(|d| *d == 0.0), "paired differences at one posterior: {differences:?}");
+    }
+
+    /// A snapshot (`snapshot_estimates`) is the removal comparisons' `F` of the posterior batch by
+    /// batch, `B D_b` plus the rest of `F`, at the same draws every time: two snapshots of one
+    /// posterior improve on each other by exactly zero. It only reads the device posterior: an
+    /// iterate apart from its average, and the steps the average spans, are left as they were.
+    #[test]
+    fn a_snapshot_is_f_on_the_removal_draws_and_leaves_the_posterior_as_it_was() {
+        let (native, layers, _, sequences) = tiny("library_snapshot", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let (device, settings) = (Device::host(), settings());
+        let tokens = 2 * sequences.len() * 12;
+        let mut posterior = Posterior::new(&explanation, tokens).unwrap();
+        let mut device_posterior = DevicePosterior::new(&device, &explanation, &posterior, tokens as f64, None, 0).unwrap();
+        // An iterate away from its average, which spans five steps.
+        let means: Vec<Array2<f64>> = posterior.mean.iter().map(|m| (**m).clone()).collect();
+        let iterate: Vec<Array2<f64>> = means.iter().map(|m| m * 1.1).collect();
+        device_posterior.restore(&means, &iterate, 5).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let evidence = Evidence { draws: &draws, sequences: &sequences, settings: &settings };
+        let first = snapshot_estimates(&mut scorer, &device_posterior, &mut posterior, &explanation, &evidence, None).unwrap();
+        let second = snapshot_estimates(&mut scorer, &device_posterior, &mut posterior, &explanation, &evidence, None).unwrap();
+        assert_eq!(first, second, "two snapshots of one posterior");
+        assert_eq!(device_posterior.averaged(), 5);
+        for (i, expected) in iterate.iter().enumerate() {
+            assert_eq!(device_posterior.iterate(i).unwrap(), *expected, "operator {i}'s iterate");
+        }
+        // The removal comparisons' evaluation of the same posterior, which sets the device's values.
+        let evaluation = expected_divergence(&mut scorer, &mut device_posterior, &posterior, &draws, &sequences, &[], &settings, None, None).unwrap();
+        let rest = posterior.description() + explanation.fixed_nats;
+        let count = draws.len() as f64;
+        for (b, (snapshot, data)) in first.iter().zip(&evaluation.batches).enumerate() {
+            let expected = count * data + rest;
+            assert!((snapshot - expected).abs() <= 1e-12 * expected.abs(), "batch {b}: {snapshot} against {expected}");
+        }
+        let total = evaluation.total() + rest;
+        assert!((first.iter().sum::<f64>() / count - total).abs() <= 1e-12 * total.abs());
+    }
+
+    /// Each base's source and experiments come from its own draws: the training collection, base by
+    /// base, is the same in batches of one, two, four and seven bases.
+    #[test]
+    fn the_collection_does_not_depend_on_the_batch_size() {
+        let (native, layers, _, sequences) = tiny("library_collection_packing", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let settings = settings();
+        let scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
+        let many: Vec<Vec<u32>> = sequences.iter().cycle().take(20).cloned().collect();
+        // Per base its source and its two experiments, their indices into the batch made the
+        // sequences'.
+        let collection = |size: usize| -> Vec<(usize, usize, Vec<Experiment>)> {
+            let mut out = Vec::new();
+            for draw in draws(many.len(), size, settings.seed).unwrap() {
+                let experiments = scorer.experiments(&draw, &many).unwrap();
+                for (k, (&base, &source)) in draw.bases.iter().zip(&draw.sources).enumerate() {
+                    let own: Vec<Experiment> = experiments.iter().filter(|e| e.base == k).cloned().collect();
+                    assert!(own.len() == 2 && own.iter().all(|e| e.source == k), "base {base}: {own:?}");
+                    out.push((base, source, own.into_iter().map(|e| Experiment { base, source, ..e }).collect()));
+                }
+            }
+            out
+        };
+        let one = collection(1);
+        assert_eq!(one.len(), many.len());
+        assert!(one.iter().all(|(base, source, _)| base != source) && one.iter().any(|(_, _, own)| own[1].patch.is_some()));
+        for size in [2, 4, 7] {
+            assert_eq!(collection(size), one, "batches of {size}");
+        }
+    }
+
+    /// The whole-batch antithetic arm (`Settings::full_antithetic`): the step's bits and gradient
+    /// are the means of the batch scored at the sample and at its antithetic twin, its factor the
+    /// first scoring's, over the batch's experiments in their order.
+    #[test]
+    fn the_whole_batch_antithetic_arm_averages_the_pair() {
+        let (native, layers, _, sequences) = tiny("library_full_antithetic", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let (device, settings) = (Device::host(), settings());
+        let tokens = 2 * sequences.len() * 12;
+        let posterior = Posterior::new(&explanation, tokens).unwrap();
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, tokens as f64, None, 0).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let (batch, experiments) = (draws[0].batch(&sequences).unwrap(), scorer.experiments(&draws[0], &sequences).unwrap());
+        let key = training_key(settings.seed, 0);
+        let (order, bits, gradients, factor) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments.clone(), key, true).unwrap();
+        assert_eq!(order, experiments);
+        let targets = scorer.experiments.targets(&batch, &experiments).unwrap();
+        let (plus_bits, plus, plus_factor) = scorer.evaluate_device(&device_posterior, (&batch, &experiments), Some(key), &targets, (true, true)).unwrap();
+        let (minus_bits, minus, _) = scorer.evaluate_device(&device_posterior, (&batch, &experiments), Some(key ^ gam_gpu::tensor::ANTITHETIC), &targets, (true, false)).unwrap();
+        assert!(plus_bits != minus_bits, "the twin is another sample");
+        for ((mean, a), b) in bits.iter().flatten().zip(plus_bits.iter().flatten()).zip(minus_bits.iter().flatten()) {
+            assert_eq!(*mean, 0.5 * (a + b));
+        }
+        assert_eq!(bits.iter().map(Vec::len).sum::<usize>(), plus_bits.iter().map(Vec::len).sum::<usize>());
+        assert!(!gradients.is_empty() && gradients.keys().eq(plus.keys()));
+        for (op, g) in &gradients {
+            let (g, a, b) = (device.download(g).unwrap(), device.download(&plus[op]).unwrap(), device.download(&minus[op]).unwrap());
+            let gap = g.iter().zip(a.iter().zip(&b)).fold(0.0_f64, |m, (x, (p, q))| m.max((x - 0.5 * (p + q)).abs() / (1.0 + x.abs())));
+            assert!(gap <= 1e-14, "operator {op}: {gap}");
+        }
+        assert_eq!(factor.tokens, plus_factor.unwrap().tokens);
+    }
+
+    /// The arm is read from configs: absent it is off.
+    #[test]
+    fn the_whole_batch_antithetic_arm_reads_from_configs() {
+        let base = serde_json::json!({"batch_sequences": 2, "seed": 3, "numeric_bytes": 1024, "head_tile_rows": 64});
+        assert!(!serde_json::from_value::<Settings>(base.clone()).unwrap().full_antithetic);
+        let mut on = base;
+        on["full_antithetic"] = true.into();
+        assert!(serde_json::from_value::<Settings>(on).unwrap().full_antithetic);
+    }
+
+    /// The fit's held-out subset scored on its batches made once (`held_out_on`) is the evaluation
+    /// that makes them afresh (`held_out`), bit for bit, however often it is scored.
+    #[test]
+    fn the_held_out_subset_with_targets_made_once_is_the_evaluation_made_afresh() {
+        let (native, layers, _, sequences) = tiny("library_held_once", "relu");
+        let explanation = explanation(&native, &layers).unwrap();
+        let (device, settings) = (Device::host(), settings());
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let subset = &sequences[..settings.batch_sequences.clamp(2, sequences.len())];
+        let batches = held_batches(&scorer, subset, &settings).unwrap();
+        let afresh = serde_json::to_value(held_out(&mut scorer, &explanation, (&posterior, &device_posterior), subset, &settings, 72, None).unwrap()).unwrap();
+        for _ in 0..2 {
+            let once = held_out_on(&mut scorer, &explanation, (&posterior, &device_posterior), (subset, &batches), &settings, 72, None).unwrap();
+            assert_eq!(serde_json::to_value(once).unwrap(), afresh);
+        }
     }
 
     #[test]
@@ -4192,7 +4533,7 @@ mod tests {
         device_posterior.download(&mut stepped).unwrap();
         // The host reference: IVON's first step from momentum zero and the curvature at which the
         // posterior's standard deviations are IVON's.
-        let variance: Vec<f64> = posterior.moments().iter().map(|m| m.second / m.count).collect();
+        let variance = posterior.variances();
         let mut reference = posterior.clone();
         for i in 0..reference.mean.len() {
             for ((r, c), _) in posterior.mean[i].indexed_iter() {
@@ -4216,9 +4557,56 @@ mod tests {
 
     #[test]
     fn a_variance_scale_far_from_its_reference_has_a_finite_code() {
-        // Finite variances whose ratio overflows still have a finite scale code.
-        assert!(scale_bits(1e300, 1e-300).is_finite());
-        assert_eq!(scale_bits(1.0, 1.0), scale_bits(1.2, 1.0));
+        // Finite variances whose ratio overflows still have a finite scale code, and the variance
+        // stays where the divergence is least when the scale's code cannot shorten.
+        let (variance, divergence, bits) = gam_gpu::tensor::group_prior(4.0, 4e300, 0.0, Some(1e-300));
+        assert!(bits.is_finite() && divergence.is_finite() && variance == 1e300, "{variance} {divergence} {bits}");
+        let at = |centre: f64| gam_gpu::tensor::group_prior(4.0, 4.0 * centre, 0.0, Some(1.0)).2;
+        assert_eq!(at(1.0), at(1.2));
+        assert_eq!(at(1.0), 1.0, "exponent 0 costs one bit");
+    }
+
+    /// The scale's closed-form code length is `codec`'s Elias δ length of the exponent's signed
+    /// index, for every exponent a finite variance ratio can take.
+    #[test]
+    fn the_scale_code_is_the_codec_s_elias_delta_length() {
+        for k in -2100_i64..=2100 {
+            let codec = crate::codec::signed_codeword_argument(k).and_then(crate::codec::elias_delta_len_bits).unwrap();
+            assert_eq!(gam_gpu::tensor::scale_code_bits(k), codec as f64, "exponent {k}");
+        }
+    }
+
+    /// `v_G` minimizes the group's charge `KL(q_G ‖ N(0, v I)) + ln 2 · L_scale(v)`: a group of 40
+    /// entries at `μ = 1`, reference `v⁰ = 1` (their mean square), with `σ² = 2^0.52 − 1`, so that
+    /// `S / |G| = 2^0.52` sits just inside the bin of exponent 1 (4 bits) next to exponent 0's (1
+    /// bit). The divergence rises by `½ |G| (e^(−w) − 1 + w) ≈ 2e-3` nats (`w = −0.02 ln 2`) at the
+    /// bins' shared edge `2^0.5`, three bits less than the code saves: `v_G` is that edge, its code
+    /// one bit, and the group's charge is that much below its charge at `S / |G|`.
+    #[test]
+    fn a_variance_just_inside_an_expensive_bin_takes_the_cheaper_neighbour() {
+        let (n, tokens) = (40, 1000);
+        let mut posterior = Posterior::from_parts(vec![Array2::from_elem((1, n), 1.0)], vec![Array2::zeros((1, n))], vec![1.0], tokens).unwrap();
+        assert_eq!(posterior.references(), &[1.0]);
+        let size = n as f64;
+        // `KL(q_G ‖ N(0, v I))` of the group at `μ = 1` with every `σ² = sigma2`.
+        let kl = |sigma2: f64, v: f64| 0.5 * (size * (1.0 + sigma2) / v + size * v.ln() - size - size * sigma2.ln());
+        let precision = 0.5 * size.ln();
+        let sigma2 = 2f64.powf(0.52) - 1.0;
+        posterior.log_sd[0].fill(0.5 * sigma2.ln());
+        let variance = posterior.variances()[0];
+        assert!((variance - 2f64.sqrt()).abs() <= 1e-15, "v_G {variance} against the edge √2");
+        let divergence = posterior.divergences()[0];
+        assert!((divergence - kl(sigma2, variance)).abs() <= 1e-12, "the divergence is KL at v_G: {divergence} against {}", kl(sigma2, variance));
+        let chosen = posterior.costs()[0];
+        assert!((chosen - (kl(sigma2, variance) + precision + LN_2)).abs() <= 1e-12, "one bit of scale: {chosen}");
+        let unclamped = kl(sigma2, 1.0 + sigma2) + precision + 4.0 * LN_2;
+        assert!(unclamped - chosen > 2.0 * LN_2, "the cheaper bin saves nearly three bits: {chosen} against {unclamped}");
+        // At the centre of exponent 2's bin (5 bits) the edge of exponent 1's (4 bits) costs
+        // `½ |G| (e^(ln 2 / 2) − 1 − ln 2 / 2) ≈ 1.4` nats, more than the bit it saves: the variance
+        // stays at `S / |G| = 4`.
+        posterior.log_sd[0].fill(0.5 * 3f64.ln());
+        assert!((posterior.variances()[0] - 4.0).abs() <= 1e-14, "{}", posterior.variances()[0]);
+        assert!((posterior.costs()[0] - (kl(3.0, 4.0) + precision + 5.0 * LN_2)).abs() <= 1e-12);
     }
 
 
@@ -4282,18 +4670,14 @@ mod tests {
         posterior.remove(&[1]);
         let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 72.0, None, 0).unwrap();
         let sizes: Vec<f64> = explanation.groups.iter().map(|g| g.cells.iter().map(|c| (c.rows.len() * c.cols.len()) as f64).sum()).collect();
-        let mut code = device_posterior.code_length(&posterior.active, &sizes, &posterior.initial, 2).unwrap();
+        let mut code = device_posterior.code_length(&posterior.active, &sizes, 2).unwrap();
         device_posterior.code_length_into(&mut code, 1).unwrap();
-        let variances = device_posterior.variances().unwrap();
-        let expected: f64 = device_posterior
-            .divergences()
-            .unwrap()
-            .iter()
-            .zip(&sizes)
-            .zip(&posterior.active)
-            .zip(variances.iter().zip(&posterior.initial))
-            .map(|(((d, n), active), (v, initial))| if *active { d + 0.5 * n.ln() + scale_bits(*v, *initial) * LN_2 } else { 0.0 })
-            .sum();
+        // The device's variances are the host's (`Posterior::variances`), and its code length the
+        // host's description without the subset code.
+        for (g, (device, host)) in device_posterior.variances().unwrap().iter().zip(posterior.variances()).enumerate() {
+            assert!((device - host).abs() <= 1e-12 * host.abs(), "group {g}: v_G {device} on the device against {host}");
+        }
+        let expected: f64 = posterior.costs().iter().sum();
         let lengths = device_posterior.code_lengths(&code).unwrap();
         assert_eq!(lengths[0], 0.0, "an untouched step's row stays zero");
         assert!(expected.is_finite() && (lengths[1] - expected).abs() <= 1e-12 * expected.abs(), "{} against {expected}", lengths[1]);
@@ -4306,12 +4690,14 @@ mod tests {
         let mut posterior = Posterior::new(&explanation, 72).unwrap();
         let group = &explanation.groups[0];
         let position = |op: usize| explanation.trainable.iter().position(|t| *t == op).unwrap();
+        // The group at its prior at its reference variance, whose scale is exponent 0's one bit.
+        let log_sd = 0.5 * posterior.references()[0].ln();
         for cell in &group.cells {
             let i = position(cell.operator);
             for &row in &cell.rows {
                 for col in cell.cols.clone() {
                     posterior.mean[i][[row, col]] = 0.0;
-                    posterior.log_sd[i][[row, col]] = -1.5;
+                    posterior.log_sd[i][[row, col]] = log_sd;
                 }
             }
         }
@@ -4319,9 +4705,8 @@ mod tests {
         assert!(divergences[0].abs() < 1e-12, "an uninformed group at its prior costs {}", divergences[0]);
         assert!(divergences[1] > 0.0);
         let size: usize = group.cells.iter().map(|c| c.rows.len() * c.cols.len()).sum();
-        let variance = (-3.0_f64).exp();
-        let expected = 0.5 * (size as f64).ln() + scale_bits(variance, posterior.initial[0]) * LN_2;
-        assert!((posterior.costs()[0] - expected).abs() < 1e-12, "its variance costs ½ ln |G| and its scale");
+        let expected = 0.5 * (size as f64).ln() + LN_2;
+        assert!((posterior.costs()[0] - expected).abs() < 1e-12, "its variance costs ½ ln |G| and its scale's one bit");
     }
 
     #[test]
@@ -4396,6 +4781,7 @@ mod tests {
             epochs: Vec::new(),
             removals: Vec::new(),
             previous: Some(vec![1.0, 2.0]),
+            collection: COLLECTION,
             active: vec![false, true],
             done: false,
             seconds: 5.0,
@@ -4473,6 +4859,14 @@ mod tests {
         other = expected.clone();
         other.settings.seed += 1;
         assert!(load_checkpoint(&path, &other, &mut posterior.clone()).unwrap_err().contains("another fit"));
+        // A checkpoint written before the collection's version was recorded drew other experiments:
+        // refused, naming the collection.
+        let mut header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len]).unwrap();
+        header.as_object_mut().unwrap().remove("collection").unwrap();
+        let header = serde_json::to_vec(&header).unwrap();
+        std::fs::write(&path, [&(header.len() as u64).to_le_bytes()[..], &header, &bytes[8 + header_len..]].concat()).unwrap();
+        let message = load_checkpoint(&path, &expected, &mut posterior.clone()).unwrap_err();
+        assert!(message.contains("experiment collection 0"), "{message}");
         let (wide, device) = ([Precision::F64; CHECKPOINT_ARRAYS], [Precision::F32, Precision::F32, Precision::Bf16, Precision::F32, Precision::F32, Precision::F32]);
         assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], wide), Some(9 * 48));
         assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], device), Some(9 * 22));
@@ -4903,8 +5297,11 @@ mod tests {
     #[test]
     fn the_scale_reference_survives_a_warm_start() {
         // A warm start from values three times M's keeps every group's reference at M's mean
-        // square, so each active group's scale sends the exponent round(log2 9) = 3 and the
+        // square, so each active group's scale sends the exponent round(log2 9.009) = 3 and the
         // description grows by the difference of their Elias δ lengths; the start at M sends 0.
+        // Exponent 2's bin codes in as many bits as 3's, and the edge of exponent 1's (one bit
+        // shorter) lies `1.67 ln 2` below `log 9.009`, where the divergence of a group of at least
+        // 8 entries has risen by more than 4 nats.
         let (native, layers, _, _) = tiny("library_scale_reference", "gelu_tanh");
         let start = explanation(&native, &layers).unwrap();
         let mut moved = start.artifact.clone();
@@ -4918,10 +5315,10 @@ mod tests {
         assert_eq!(warm.reference, start.reference);
         let (cold, hot) = (Posterior::new(&start, 1000).unwrap(), Posterior::new(&warm, 1000).unwrap());
         assert_eq!(hot.initial, cold.initial);
-        let zero = scale_bits(1.0, 1.0);
-        for (g, (c, h)) in cold.moments().iter().zip(hot.moments()).enumerate() {
-            assert_eq!(scale_bits(c.second / c.count, cold.initial[g]), zero, "{}", start.groups[g].name);
-            assert_eq!(scale_bits(h.second / h.count, hot.initial[g]), scale_bits(9.0, 1.0), "{}", start.groups[g].name);
+        let bits = gam_gpu::tensor::scale_code_bits;
+        for (g, (c, h)) in cold.priors().iter().zip(hot.priors()).enumerate() {
+            assert_eq!(c.bits, bits(0), "{}", start.groups[g].name);
+            assert_eq!(h.bits, bits(3), "{}", start.groups[g].name);
         }
     }
 
