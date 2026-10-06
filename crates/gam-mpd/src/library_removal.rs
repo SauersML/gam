@@ -1054,11 +1054,12 @@ pub fn round(
             };
             if tail { gallop(rest.len(), true, &mut test) } else { gallop_down(safe, &mut test) }
         })?;
-        // The change of `F` from the accepted prefix to the next length, exact when both
-        // evaluations are complete (before the accepted prefix's evaluation is taken).
-        let blocked = changes.get(&(accepted + 1)).map(|(after, evaluation)| {
-            let (before, complete) = changes.get(&accepted).map_or((0.0, true), |(c, e)| (*c, e.complete));
-            (after - before, complete && evaluation.complete)
+        // The change of `F` from the accepted prefix (complete) to the next length, on the batches
+        // both scored, exact when the next length's evaluation is complete (before the accepted
+        // prefix's evaluation is taken).
+        let blocked = changes.get(&(accepted + 1)).map(|(after, evaluation)| match changes.get(&accepted) {
+            Some((_, prefix)) => (evaluation.change(prefix), evaluation.complete),
+            None => (*after, evaluation.complete),
         });
         if accepted > 0 {
             let next = match kept.take() {
