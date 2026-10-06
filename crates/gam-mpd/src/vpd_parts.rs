@@ -217,6 +217,112 @@ pub fn load(export: &Path, decomposition: &Path) -> Result<(Vec<Mlp>, Vec<VpdPar
 mod tests {
     use super::*;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use crate::interchange::{Batch, BlockEngine, Edit, Edits, Experiment, FACTORS, Interchange, Patch, reads};
+    use crate::operator_program::SlotValues;
+    use crate::run_check::{layer_nodes, split_sites};
+    use gam_gpu::tensor::Device;
+
+    /// Fixed parts of the stream's `width` in MLP blocks 1 and 3 (layers 0 and 1): per block an MLP
+    /// of 6 hidden units under the tanh GELU, and one slice of its up map and one of its down map.
+    fn random_slices(width: usize, seed: u64) -> Vec<Slice> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut normal = |rows: usize, cols: usize, scale: f64| Array2::from_shape_fn((rows, cols), |_| scale * (rng.random::<f64>() - 0.5));
+        let mut out = Vec::new();
+        for layer in [0, 1] {
+            let mlp = Arc::new(Mlp { read: normal(6, width, 1.0), write: normal(width, 6, 1.0), law: Law::GeluTanh });
+            let (up, down) = ((normal(1, 6, 2.0), normal(1, width, 2.0)), (normal(1, width, 2.0), normal(1, 6, 2.0)));
+            for (map, (u, v)) in [(Map::Up, up), (Map::Down, down)] {
+                let part = VpdPart { block: 2 * layer + 1, layer, map, index: 0, u: u.row(0).to_owned(), v: v.row(0).to_owned() };
+                out.push(Slice { part, mlp: Arc::clone(&mlp) });
+            }
+        }
+        out
+    }
+
+    /// The tiny Qwen3 export's model and its starting library (an exact copy of `M`), with its
+    /// sequences of 12 tokens.
+    fn tiny(name: &str) -> (crate::operator_program::OperatorProgram, Vec<crate::run_check::LayerNodes>, crate::library_mdl::Explanation, Vec<Vec<u32>>) {
+        let dir = crate::test_support::tiny_qwen3_export(name, 2);
+        let imported = crate::import::import_language_model(&dir, 6, 12).expect("the tiny export imports");
+        std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+        let native = split_sites(&imported.program).expect("the native sites");
+        let layers = layer_nodes(&native, 2).expect("the layers");
+        let explanation = crate::library_mdl::explanation(&native, &layers).expect("the library");
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+        let sequences = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        (native, layers, explanation, sequences)
+    }
+
+    /// An edit of a fixed part on `M` through the engine: after layer 0's MLP block of the tiny
+    /// Qwen3 export, the stream moves by exactly `Slice::edit` of `M`'s own read at the edited row
+    /// and nowhere else (1e-12 of the stream's scale), for both maps' slices and every factor.
+    #[test]
+    fn an_edit_of_a_fixed_part_on_m_adds_its_function_of_the_read() {
+        let (native, layers, explanation, sequences) = tiny("vpd_parts_hand");
+        let d = Device::host();
+        let mut x = Interchange::new(&d, &native, &layers, &explanation.artifact, &explanation.trainable, reads(&native, &layers).expect("the reads"), 1 << 30, 64).expect("the experiments");
+        let width = BlockEngine::width(&x.models().0);
+        x.set_fixed_parts(random_slices(width, 5)).expect("the fixed parts");
+        let (m, _) = x.models();
+        let sites = m.part_sites().expect("M's part sites");
+        let (read, _) = sites.nodes(1).expect("layer 0's MLP holds parts");
+        let (ranges, tok) = (vec![0..12], vec![sequences[0].as_slice()]);
+        let mut entering = d.zeros(12, width).expect("zeros");
+        m.forward(0, &mut entering, &ranges, &tok, None, false).expect("attention");
+        let mut plain = d.copy(&entering).expect("copy");
+        let trace = m.forward(1, &mut plain, &ranges, &tok, None, true).expect("the MLP").expect("a tape");
+        let normed = d.download(trace.value(read).expect("the read")).expect("download");
+        let plain = d.download(&plain).expect("download");
+        for part in 0..2 {
+            for (factor, alpha) in FACTORS.iter().enumerate() {
+                let row = 3 + factor;
+                let edits = Edits::with_parts(&d, &[], m.values(), &[(row, Edit::Fixed { part, factor })], Some(sites), None).expect("the edits");
+                let mut edited = d.copy(&entering).expect("copy");
+                m.forward(1, &mut edited, &ranges, &tok, Some(&edits), false).expect("the edited MLP");
+                let moved = d.download(&edited).expect("download") - &plain;
+                let want = x.fixed_parts()[part].edit(normed.row(row), *alpha);
+                assert!(want.iter().any(|v| v.abs() > 1e-6), "part {part} at α {alpha} moves the stream");
+                let scale = moved.iter().chain(plain.iter()).fold(0.0f64, |m, v| m.max(v.abs()));
+                for r in 0..12 {
+                    for c in 0..width {
+                        let expected = if r == row { want[c] } else { 0.0 };
+                        assert!((moved[[r, c]] - expected).abs() <= 1e-12 * scale, "part {part}, α {alpha}, row {r}, column {c}: moved {} against {expected}", moved[[r, c]]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The starting library is an exact copy of `M`, so every edit of a fixed part at every factor
+    /// scores zero bits, with and without the reverse pass; with `P` applying no edit, an edit
+    /// scores `KL(M_e ‖ M)`, positive for α ≠ 1.
+    #[test]
+    fn an_exact_copy_scores_every_fixed_part_edit_zero() {
+        let (native, layers, explanation, sequences) = tiny("vpd_parts_copy");
+        let d = Device::host();
+        let mut x = Interchange::new(&d, &native, &layers, &explanation.artifact, &explanation.trainable, reads(&native, &layers).expect("the reads"), 1 << 30, 64).expect("the experiments");
+        let width = BlockEngine::width(&x.models().0);
+        x.set_fixed_parts(random_slices(width, 7)).expect("the fixed parts");
+        let batch = Batch::new(sequences[..3].to_vec(), sequences[3..].to_vec()).expect("the batch");
+        let mut experiments = Vec::new();
+        for part in 0..x.fixed_parts().len() {
+            let block = x.fixed_parts()[part].block();
+            for factor in 0..FACTORS.len() {
+                let base = (part + factor) % 3;
+                experiments.push(Experiment { base, source: base, explained: vec![true; 4], patch: Some(Patch::FixedPart { part, factor, block }), position: 1 + (part + 3 * factor) % 11 });
+            }
+        }
+        for gradient in [false, true] {
+            let bits = x.evaluate(&batch, &experiments, gradient).expect("evaluate").bits;
+            assert!(bits.iter().flatten().all(|b| b.abs() <= 1e-9), "{bits:?}");
+        }
+        x.unedited_explanation();
+        let effects = x.evaluate(&batch, &experiments, false).expect("evaluate").bits;
+        for (e, bits) in experiments.iter().zip(&effects) {
+            let sum: f64 = bits.iter().sum();
+            assert!(sum > 1e-9, "{e:?}: KL(M_e ‖ M) {sum}");
+        }
+    }
 
     /// On `M`, a part's edit is the weight edit `W + (α − 1) u_i vᵢᵀ` of its map: for an MLP whose
     /// maps are sums of four slices each, every slice of either map at every factor of
