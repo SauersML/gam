@@ -366,7 +366,7 @@ impl DevicePosterior {
 
     /// Sets the step's preconditioner along each operator's input axis from `factors` (per
     /// operator the eigenvectors `U` of its input's second moment `A`, its columns' axis, and their
-    /// eigenvalues `λ` per token, or none): see [`Direction`]. The curvature along `U` starts at
+    /// eigenvalues `λ` per token, or none): see `Direction`. The curvature along `U` starts at
     /// the Kronecker model's diagonal there, `h̃_rk = g_r λ_k`, with each row's output factor
     /// `g_r = Σ_j h_rj / Σ_k λ_k` from the diagonal curvature `h_rj ≈ g_r A_jj` (`Σ_j A_jj = Σ_k λ_k`):
     /// the diagonal's own value along `U`, `h (U ∘ U)`, keeps its underpricing of the

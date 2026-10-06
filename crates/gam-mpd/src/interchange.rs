@@ -1802,7 +1802,7 @@ impl Interchange {
     /// `M`'s targets for `experiments` on `batch` ([`targets`]), on `M`'s engine. Once
     /// [`Interchange::keep_targets`] asked for it, targets made for a batch are kept on the host
     /// while the process's memory budget admits them, on local disk while it has room
-    /// ([`DiskTargets`]), and the same experiments on the same tokens are given those back (bit for
+    /// (`DiskTargets`), and the same experiments on the same tokens are given those back (bit for
     /// bit) instead of running `M` again.
     pub fn targets(&self, batch: &Batch, experiments: &[Experiment]) -> Result<Targets, String> {
         let teacher = self.models().0;

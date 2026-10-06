@@ -1194,7 +1194,7 @@ impl Posterior {
 // ------------------------------------------------------------------------------------- the fit
 
 /// The optimizer's settings and the run's resources (none of them is part of the objective). Read
-/// through [`SettingsRecord`], which also accepts and drops the keys of retired steps.
+/// through `SettingsRecord`, which also accepts and drops the keys of retired steps.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(from = "SettingsRecord")]
 pub struct Settings {
@@ -1355,7 +1355,7 @@ fn input_factors(scorer: &mut Scorer, explanation: &Explanation, posterior: &Pos
     Ok(read.iter().map(|node| node.map(|n| Arc::clone(&matrices[&n]))).collect())
 }
 
-/// An operator's input factor ([`input_factors`]): the eigenvectors of its input's second moment
+/// An operator's input factor (`input_factors`): the eigenvectors of its input's second moment
 /// (columns) and its eigenvalues per token.
 pub struct InputFactor {
     pub vectors: Array2<f64>,
