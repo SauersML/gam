@@ -183,7 +183,7 @@ fn classes(device: &Device, decoder: &Decoder, sequences: usize, length: usize, 
     let p = device.zeros(rows, layout.columns()).map_err(error)?;
     let rope = median(device, reps, || device.heads_rope(&p, layout, None, None).map(|_| ()).map_err(error))?;
     let h = device.zeros(rows, shape.mlp_inputs).map_err(error)?;
-    let activation = median(device, reps, || if shape.gated { device.swiglu(&h) } else { device.gelu_tanh(&h, None) }.map(|_| ()).map_err(error))?;
+    let activation = median(device, reps, || if shape.gated { device.swiglu(&h, true) } else { device.gelu_tanh(&h, None, true) }.map(|_| ()).map_err(error))?;
     let bandwidth = |t: f64, bytes: usize| json!({"seconds": t, "gb_per_s": bytes as f64 / t / 1e9});
     Ok(json!({
         "rows": rows,

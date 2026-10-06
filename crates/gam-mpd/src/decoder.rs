@@ -652,7 +652,7 @@ impl BlockEngine for Decoder {
             Block::Mlp(m) => {
                 let mut pre = d.empty(x.rows(), m.input.rows).map_err(error)?;
                 d.gemm(&mut pre, 1.0, &read, Op::N, &w.input, Op::T, 0.0, arithmetic).map_err(error)?;
-                let active = if m.gated { d.swiglu(&pre) } else { d.gelu_tanh(&pre, w.bias.as_ref()) }.map_err(error)?;
+                let active = if m.gated { d.swiglu(&pre, half) } else { d.gelu_tanh(&pre, w.bias.as_ref(), half) }.map_err(error)?;
                 d.gemm(&mut out, 1.0, &active, Op::N, &w.output, Op::T, 1.0, arithmetic).map_err(error)?;
                 let last = match (&w.last, m.last) {
                     (Some(g), Some((_, e))) => {
@@ -706,7 +706,7 @@ impl BlockEngine for Decoder {
             (Block::Mlp(m), Inner::Mlp { out }) => {
                 let mut pre = d.empty(rows, m.input.rows).map_err(error)?;
                 d.gemm(&mut pre, 1.0, &tape.read, Op::N, &w.input, Op::T, 0.0, arithmetic).map_err(error)?;
-                let active = if m.gated { d.swiglu(&pre) } else { d.gelu_tanh(&pre, w.bias.as_ref()) }.map_err(error)?;
+                let active = if m.gated { d.swiglu(&pre, half) } else { d.gelu_tanh(&pre, w.bias.as_ref(), half) }.map_err(error)?;
                 if let (Some((residual, k)), Some(gain)) = (out, &w.last) {
                     let mut g_residual = d.zeros(rows, self.width).map_err(error)?;
                     d.rms_gain_backward((residual, gain, k), &g, &mut g_residual).map_err(error)?;
