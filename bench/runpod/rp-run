@@ -1482,7 +1482,8 @@ if [ -n "${RP_DRY:-}" ]; then
         echo "source:   ${srcpaths[*]:-none} (from the Mac; the whole commit from GitHub only if the pod must compile)"
     fi
     need=$(unbuilt | tr '\n' ' ')
-    echo "binaries: ${need:+to build on GitHub Actions: $need}${need:-all built} (examples ${examples[*]:-none}, tests ${tests[*]:-none}, key $KEY)"
+    [ -n "$need" ] && need="to build on GitHub Actions: $need" || need="all built"
+    echo "binaries: $need (examples ${examples[*]:-none}, tests ${tests[*]:-none}, key $KEY)"
     echo "approval: $APPROVAL${SMALL:+ (a small run: $SMALL_WHY)}"
     echo "command:  ${cmd:-none}"
     echo "request:  $(IFS='|' read -r k p g <<< "$(head -n 1 <<< "$OFFERS")"; if [[ $g == thunder:* ]]; then thunder_body "$g" '<run key>'; elif [[ $g == nebius:* ]]; then nebius_request "${g#nebius:}" '<preset>' '<project>' '<subnet>' '<pricing policy>' '<run key>' "mpd2951-$NAME"; else create_body "$k" "$g" "$CAP_SECONDS" '<run key> <~/.ssh/runpod_ed25519.pub>'; fi)"
