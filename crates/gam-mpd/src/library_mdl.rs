@@ -2544,16 +2544,36 @@ fn laplace_start(
     settings: &Settings,
     tokens: usize,
 ) -> Result<Vec<[Array2<f64>; 3]>, String> {
-    let mut curvature: Vec<Array2<f64>> = posterior.mean.iter().map(|m| Array2::zeros(m.dim())).collect();
+    let device = scorer.experiments.models().1.program.device().clone();
+    // `Σ_b u_b ⊙ u_b` summed on the device, in float64 where it holds float64, and read once.
+    let wide = match device.with_storage(Storage::F64) {
+        Ok(wide) => wide,
+        Err(_) => device.clone(),
+    };
+    let mut sums: BTreeMap<usize, Tensor> = BTreeMap::new();
     for (b, draw) in draws.iter().enumerate() {
         let batch = draw.batch(sequences)?;
         let experiments = scorer.experiments(draw, sequences)?;
-        let (_, _, factor) = scorer.score_device(device_posterior, &batch, &experiments, Some(noise_seed(settings.seed, 0, b)), true)?;
-        let device = scorer.experiments.models().1.program.device();
-        for (op, u) in &factor.ok_or("no Gauss–Newton factor")?.gradient {
-            let u = device.download(u).map_err(error)?;
-            curvature[scorer.at(*op)?].zip_mut_with(&u, |h, u| *h += u * u);
+        // The factor alone, at the batch's weight sample with its labels drawn from the same seed:
+        // `P`'s own sampled labels need neither `M`'s targets nor the divergence's gradient.
+        let key = noise_seed(settings.seed, 0, b);
+        device_posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
+        let factor = scorer.experiments.sampled_label_resident(&batch, &experiments, &uniforms(key, &batch, &experiments))?;
+        for (op, u) in &factor {
+            let u = wide.convert(u).map_err(error)?;
+            match sums.get_mut(op) {
+                Some(sum) => wide.hadamard(sum, &u, &u, true).map_err(error)?,
+                None => {
+                    let mut sum = wide.zeros(u.rows(), u.cols()).map_err(error)?;
+                    wide.hadamard(&mut sum, &u, &u, false).map_err(error)?;
+                    sums.insert(*op, sum);
+                }
+            }
         }
+    }
+    let mut curvature: Vec<Array2<f64>> = posterior.mean.iter().map(|m| Array2::zeros(m.dim())).collect();
+    for (op, sum) in &sums {
+        curvature[scorer.at(*op)?] = wide.download(sum).map_err(error)?;
     }
     let variance: Vec<f64> = posterior.moments().iter().map(|m| if m.count > 0.0 { m.second / m.count } else { 0.0 }).collect();
     let n = tokens as f64;
