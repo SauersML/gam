@@ -1469,6 +1469,12 @@ fn disk_space(dir: &std::path::Path) -> Option<(u64, u64)> {
 struct DiskTargets {
     dir: PathBuf,
     files: HashMap<Identity, PathBuf>,
+    /// Each batch asked for after another (the scorings of a fit repeat their batches in order),
+    /// the last asked for, and the read of the batch expected next, started on its own thread
+    /// when the one before it was read, so a pass reads one batch while the device scores another.
+    next: HashMap<Identity, Identity>,
+    last: Option<Identity>,
+    ahead: Option<(Identity, std::thread::JoinHandle<std::io::Result<Vec<u8>>>)>,
 }
 
 impl DiskTargets {
@@ -1477,7 +1483,31 @@ impl DiskTargets {
         let n = STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("mpd-targets-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).ok()?;
-        Some(Self { dir, files: HashMap::new() })
+        Some(Self { dir, files: HashMap::new(), next: HashMap::new(), last: None, ahead: None })
+    }
+
+    /// Records that `identity` is asked for now, after the last one.
+    fn asked(&mut self, identity: &Identity) {
+        if let Some(last) = self.last.replace(identity.clone()) {
+            self.next.insert(last, identity.clone());
+        }
+    }
+
+    /// The bytes kept for `identity`, from the read started ahead when it was the batch expected,
+    /// and the read of the batch expected after it started.
+    fn read(&mut self, identity: &Identity) -> Result<Option<Vec<u8>>, String> {
+        let Some(path) = self.files.get(identity) else { return Ok(None) };
+        let bytes = match self.ahead.take() {
+            Some((expected, reading)) if &expected == identity => reading.join().map_err(|_| error("a kept targets read panicked"))?.map_err(error)?,
+            _ => std::fs::read(path).map_err(error)?,
+        };
+        if let Some(following) = self.next.get(identity)
+            && let Some(path) = self.files.get(following)
+        {
+            let path = path.clone();
+            self.ahead = Some((following.clone(), std::thread::spawn(move || std::fs::read(path))));
+        }
+        Ok(Some(bytes))
     }
 
     /// `kept` written for `identity` when the disk has room for its `bytes`.
@@ -1498,6 +1528,12 @@ impl DiskTargets {
 
 impl Drop for DiskTargets {
     fn drop(&mut self) {
+        // A read still running finishes before its file goes.
+        if let Some((_, reading)) = self.ahead.take()
+            && reading.join().is_err()
+        {
+            log::warn!("interchange: a kept targets read panicked");
+        }
         if let Err(e) = std::fs::remove_dir_all(&self.dir) {
             log::warn!("interchange: kept targets at {} not removed: {e}", self.dir.display());
         }
@@ -1772,12 +1808,15 @@ impl Interchange {
         let teacher = self.models().0;
         let mut store = self.kept.try_borrow_mut().map_err(error)?;
         let identity = store.as_ref().map(|_| Identity { base: batch.base.clone(), source: batch.source.clone(), experiments: experiments.to_vec() });
-        if let (Some(store), Some(identity)) = (store.as_ref(), identity.as_ref()) {
+        if let (Some(store), Some(identity)) = (store.as_mut(), identity.as_ref()) {
+            if let Some(disk) = store.disk.as_mut() {
+                disk.asked(identity);
+            }
             if let Some(kept) = store.batches.get(identity) {
                 return kept.restore(self.m.device());
             }
-            if let Some(path) = store.disk.as_ref().and_then(|disk| disk.files.get(identity)) {
-                return HostTargets::decode(&std::fs::read(path).map_err(error)?, &self.head.head)?.restore(self.m.device());
+            if let Some(bytes) = store.disk.as_mut().map(|disk| disk.read(identity)).transpose()?.flatten() {
+                return HostTargets::decode(&bytes, &self.head.head)?.restore(self.m.device());
             }
         }
         let made = targets(&teacher, &self.head, batch, experiments)?;
