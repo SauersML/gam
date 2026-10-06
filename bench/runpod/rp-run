@@ -480,11 +480,11 @@ asset_for() {  # SHA [LISTING]
     return 0
 }
 published_assets() { gh api "repos/SauersML/gam/releases/tags/rp-run-bin" --jq '.assets[].name' 2> /dev/null || true; }
-unbuilt() {
-    local have x
-    have=$(published_assets)
-    for x in "${examples[@]}"; do [ -x "$CACHE/$x" ] || grep -qx "$KEY.$x" <<< "$have" || echo "$x"; done
-    for x in "${tests[@]}"; do [ -x "$CACHE/test-${x#*:}" ] || grep -qx "$KEY.test-${x#*:}" <<< "$have" || echo "test:$x"; done
+unbuilt() { unbuilt_in "$(published_assets)"; }
+unbuilt_in() {  # LISTING
+    local x
+    for x in "${examples[@]}"; do [ -x "$CACHE/$x" ] || grep -qx "$KEY.$x" <<< "$1" || echo "$x"; done
+    for x in "${tests[@]}"; do [ -x "$CACHE/test-${x#*:}" ] || grep -qx "$KEY.test-${x#*:}" <<< "$1" || echo "test:$x"; done
 }
 
 
@@ -2403,8 +2403,15 @@ setup() {
     if [ -n "$EARLY_FETCH" ]; then jobs+=("$EARLY_FETCH"); else fetch_published & jobs+=($!); fi
     # The pod downloads published binaries itself (in the background: vpd-pricing-n2048's waited
     # 6 minutes behind a source download on a slow host); the Mac sends only what it alone holds.
-    local have="" assets=()
-    [ ${#examples[@]} -eq 0 ] && [ ${#tests[@]} -eq 0 ] || have=$(published_assets)
+    local have="" assets=() try
+    # build_binaries saw every binary published or cached before the pod existed: a listing that
+    # lacks one now is GitHub's API failing for the moment (published_assets prints nothing then),
+    # asked again before the run is refused.
+    for try in 1 2 3 4 5; do
+        [ ${#examples[@]} -eq 0 ] && [ ${#tests[@]} -eq 0 ] || have=$(published_assets)
+        [ -z "$(unbuilt_in "$have")" ] && break
+        sleep $(( 2 * try ))
+    done
     for x in "${examples[@]}"; do
         if grep -qx "$KEY.$x" <<< "$have"; then assets+=("$x"); elif [ -x "$CACHE/$x" ]; then cached+=("$x"); else build+=("$x"); fi
     done
