@@ -444,6 +444,41 @@ sha_of() {  # REL
     fi
     echo "$sha"
 }
+# A float64 file goes up in the smallest form that widens back to the same bytes: u16 when every
+# value is a whole number in [0, 65535] (token ids: vpd4l_pile2p27's 2.0 GB tokens.f64 is 0.5 GB),
+# f32 when every value is a float32 (an export's weights), else as it is. ENCODINGS caches each
+# sha256's form.
+ENCODINGS=$MAC_DATA/runpod/encodings.tsv
+ENCODE_CHECK='import os, sys
+import numpy as np
+# In chunks of 16M values, so a 2 GB file needs about 0.3 GB of memory.
+n = os.path.getsize(sys.argv[1]) // 8
+x = np.memmap(sys.argv[1], dtype="<f8", mode="r") if n else None
+u16 = f32 = n > 0
+for i in range(0, n, 1 << 24):
+    c = np.asarray(x[i:i + (1 << 24)])
+    u16 = u16 and bool(np.all(c == np.floor(c)) and c.min() >= 0 and c.max() <= 65535)
+    f32 = f32 and bool(np.array_equal(c.astype("<f4").astype("<f8"), c))
+    if not (u16 or f32):
+        break
+print("u16" if u16 else "f32" if f32 else "raw")'
+encoding_of() {  # REL SHA
+    local enc
+    case $1 in *.f64) ;; *) echo raw; return ;; esac
+    (( $(stat -L -f %z "$MAC_DATA/$1") % 8 == 0 )) || { echo raw; return; }
+    enc=$(awk -F'\t' -v h="$2" '$1 == h { e = $2 } END { print e }' "$ENCODINGS" 2> /dev/null)
+    if [ -z "$enc" ]; then
+        enc=$("$MAC_DATA/venv/bin/python" -c "$ENCODE_CHECK" "$MAC_DATA/$1" 2> /dev/null || echo raw)
+        printf '%s\t%s\n' "$2" "$enc" >> "$ENCODINGS"
+    fi
+    echo "$enc"
+}
+# The published asset of SHA, smallest form first, or nothing.
+asset_for() {  # SHA [LISTING]
+    local have=${2:-$DATA_HAVE} a
+    for a in "$1.u16" "$1.f32" "$1"; do grep -qx "$a" <<< "$have" && { echo "$a"; return; }; done
+    return 0
+}
 published_assets() { gh api "repos/SauersML/gam/releases/tags/rp-run-bin" --jq '.assets[].name' 2> /dev/null || true; }
 unbuilt() {
     local have x
@@ -819,10 +854,21 @@ case ${1:-} in
                 rel=${f#"$MAC_DATA"/}
                 (( $(stat -L -f %z "$f") < 2147483648 )) || { echo "rp-run: $rel is 2 GiB or more, over GitHub's asset limit" >&2; exit 2; }
                 sha=$(sha_of "$rel")
-                if grep -qx "$sha" <<< "$have"; then continue; fi
-                ln -f "$(realpath "$f")" "$stage/$sha" 2> /dev/null || cp "$f" "$stage/$sha"
-                todo+=("$stage/$sha")
-                have+=$'\n'"$sha"
+                enc=$(encoding_of "$rel" "$sha")
+                name=$sha
+                [ "$enc" = raw ] || name=$sha.$enc
+                if grep -qx "$name" <<< "$have"; then continue; fi
+                case $enc in
+                    raw) ln -f "$(realpath "$f")" "$stage/$name" 2> /dev/null || cp "$f" "$stage/$name" ;;
+                    *) "$MAC_DATA/venv/bin/python" -c 'import sys
+import numpy as np
+x = np.memmap(sys.argv[1], dtype="<f8", mode="r")
+with open(sys.argv[2], "wb") as out:
+    for i in range(0, len(x), 1 << 24):
+        out.write(np.asarray(x[i:i + (1 << 24)]).astype(sys.argv[3]).tobytes())' "$f" "$stage/$name" "$( [ "$enc" = u16 ] && echo '<u2' || echo '<f4')" ;;
+                esac
+                todo+=("$stage/$name")
+                have+=$'\n'"$name"
             done < <(find -L "$p" -type f ! -name '.*' | sort)
         done
         [ ${#todo[@]} -gt 0 ] || { echo "rp-run: all already published" >&2; exit 0; }
@@ -1023,8 +1069,22 @@ ESTIMATE=$(awk -v p="$PRICE_MAX" -v h="$HOURS" 'BEGIN { printf "%.2f", p * h }')
 # the reason when the rule fails.
 AUTO_RUN=3 AUTO_OWNER_DAY=8 AUTO_RATE=4
 APPROVALS=$MAC_DATA/runpod/approvals.tsv
+# Launches logged in APPROVALS whose pod does not exist yet: "PID OWNER ESTIMATE PRICE" for each whose
+# runner still lives and holds neither a pod record nor a place on another run's pod.
+pending_launches() {
+    local now
+    now=$(date +%s)
+    cat "$APPROVALS" 2> /dev/null | awk -F'\t' -v t=$(( now - 86400 )) 'NR > 1 && $2 + 0 >= t { print $6, $4, $5, ($8 == "" ? 0 : $8) }' |
+        while read -r pid o est price; do
+            kill -0 "$pid" 2> /dev/null || continue
+            grep -lqs "^[^ ]* [^ ]* [^ ]* [^ ]* [^ ]* $pid " "$ACTIVE"/* && continue
+            grep -qsx "$pid" "$ACTIVE"/.*.guests/* && continue
+            echo "$pid $o $est $price"
+        done
+}
+
 small_run() {
-    local owner=${RP_OWNER:-} day rate now rec pod o
+    local owner=${RP_OWNER:-} day rate now rec pod o pending
     now=$(date +%s)
     [ -n "$owner" ] && [ "$owner" != - ] || { echo "no owner (RP_OWNER=AGENT names whose spend it is)"; return 1; }
     awk -v e="$ESTIMATE" -v c="$AUTO_RUN" 'BEGIN { exit !(e <= c) }' || { echo "its estimate \$$ESTIMATE is over \$$AUTO_RUN"; return 1; }
@@ -1038,12 +1098,9 @@ small_run() {
         read -r _ _ _ p c _ < "$rec"
         day=$(awk -v d="$day" -v p="$p" -v a="$c" -v b="$(cat "$ACTIVE/.$pod.deadline" 2> /dev/null || echo "$now")" 'BEGIN { printf "%.4f", d + p * (b - a) / 3600 }')
     done
-    # Approved, still running, and no pod yet: its runner's pid lives and holds no record.
-    day=$(cat "$APPROVALS" 2> /dev/null | awk -F'\t' -v o="$owner" -v t=$(( now - 86400 )) -v d="$day" 'NR > 1 && $4 == o && $2 + 0 >= t { print $6, $5 } END { print "end", d }' |
-        while read -r pid est; do
-            if [ "$pid" = end ]; then echo "$est"; break; fi
-            kill -0 "$pid" 2> /dev/null && ! grep -lqs "^[^ ]* [^ ]* [^ ]* [^ ]* [^ ]* $pid " "$ACTIVE"/* && echo "+$est"
-        done | awk '{ s += $1 } END { printf "%.4f", s }')
+    # Launched (logged in APPROVALS), still running, and no pod yet: its estimate, and its price below.
+    pending=$(pending_launches)
+    day=$(awk -v o="$owner" -v d="$day" '$2 == o { d += $3 } END { printf "%.4f", d }' <<< "$pending")
     awk -v d="$day" -v e="$ESTIMATE" -v c="$AUTO_OWNER_DAY" 'BEGIN { exit !(d + e <= c) }' ||
         { echo "$owner's spend over the last 24 h, \$$day, plus its estimate \$$ESTIMATE is over \$$AUTO_OWNER_DAY"; return 1; }
     rate=$(gql 'query { myself { currentSpendPerHr } }' | sed '$d' | jq -r '.data.myself.currentSpendPerHr // empty' 2> /dev/null)
@@ -1053,6 +1110,8 @@ small_run() {
         read -r _ _ _ p _ < "$rec"
         rate=$(awk -v a="$rate" -v p="$p" 'BEGIN { print a + p }')
     done
+    # Pods launched together see each other: each launch not yet a pod counts at its price.
+    rate=$(awk -v r="$rate" '{ r += $4 } END { printf "%.3f", r }' <<< "$pending")
     awk -v r="$rate" -v p="$PRICE_MAX" -v c="$AUTO_RATE" 'BEGIN { exit !(r + p <= c) }' ||
         { echo "the account's \$$rate/h now plus its \$$PRICE_MAX/h is over \$$AUTO_RATE/h"; return 1; }
     echo "estimate \$$ESTIMATE, $owner's 24 h \$$day, account \$$rate/h + \$$PRICE_MAX/h"
@@ -1063,22 +1122,25 @@ if [ "$APPROVAL" = auto ] && [ -z "$SMALL" ]; then
     echo "rp-run: $NAME is not approved: APPROVED.txt (lead-only) does not list it, and it is not a small run: $SMALL_WHY" >&2
     exit 3
 fi
-if [ "$APPROVAL" = auto ] && [ -z "${RP_ESTIMATE_ONLY:-}" ] && [ -z "${RP_DRY:-}" ]; then
-    # Logged under a lock, so a run started at the same time counts this one.
+if [ -z "${RP_ESTIMATE_ONLY:-}" ] && [ -z "${RP_DRY:-}" ]; then
+    # Every launch, listed or automatic, is logged under a lock with its estimate and price, so a run
+    # started at the same time counts this one (pending_launches) until its pod exists.
     until mkdir "$RP/.approvals.lock" 2> /dev/null; do
         (( $(date +%s) - $(stat -f %m "$RP/.approvals.lock" 2> /dev/null || date +%s) > 120 )) && rmdir "$RP/.approvals.lock" 2> /dev/null
         sleep 1
     done
-    if SMALL_WHY=$(small_run); then
-        [ -f "$APPROVALS" ] || printf 'date\tepoch\tname\towner\testimate\tpid\twhy\n' > "$APPROVALS"
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$(date +%s)" "$NAME" "$RP_OWNER" "$ESTIMATE" "$$" "$SMALL_WHY" >> "$APPROVALS"
-        rmdir "$RP/.approvals.lock"
-    else
+    SMALL=""
+    if SMALL_WHY=$(small_run); then SMALL=1; fi
+    if [ "$APPROVAL" = auto ] && [ -z "$SMALL" ]; then
         rmdir "$RP/.approvals.lock"
         echo "rp-run: $NAME is not approved: APPROVED.txt (lead-only) does not list it, and it is not a small run: $SMALL_WHY" >&2
         exit 3
     fi
-    echo "rp-run: $NAME approved automatically as a small run ($SMALL_WHY)" >&2
+    [ -f "$APPROVALS" ] || printf 'date\tepoch\tname\towner\testimate\tpid\twhy\tprice\tapproval\n' > "$APPROVALS"
+    head -n 1 "$APPROVALS" | grep -q $'\tprice' || sed -i '' '1s/$/\tprice\tapproval/' "$APPROVALS"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$(date +%s)" "$NAME" "${RP_OWNER:--}" "$ESTIMATE" "$$" "$SMALL_WHY" "$PRICE_MAX" "$APPROVAL" >> "$APPROVALS"
+    rmdir "$RP/.approvals.lock"
+    [ "$APPROVAL" = listed ] || echo "rp-run: $NAME approved automatically as a small run ($SMALL_WHY)" >&2
 fi
 
 # Runs left by a process that is gone (its watcher killed too) are reaped; live runs counted.
@@ -1136,7 +1198,7 @@ DATA_HAVE=$(published_data)
 all_published() {  # REL
     local f
     while IFS= read -r f; do
-        grep -qx "$(sha_of "${f#"$MAC_DATA"/}")" <<< "$DATA_HAVE" || return 1
+        [ -n "$(asset_for "$(sha_of "${f#"$MAC_DATA"/}")")" ] || return 1
     done < <(find -L "$MAC_DATA/$1" -type f ! -name '.*')
 }
 [ -z "$C" ] || ! git -C "$MAC_GAM" cat-file -e "$C:bench/runpod" 2> /dev/null || srcpaths+=(bench/runpod)
@@ -1176,6 +1238,12 @@ for a in "$@"; do
     while read -r p; do
         [ -n "$p" ] && hf+=("$p")
     done < <(grep -oE "$HF_HUB/models--[^/ ]+--[^/ ]+/snapshots/[0-9a-f]+" <<< "$a" || true)
+    # A binary the command names anywhere, as an argument too (a script's argument), is fetched like
+    # the command's own: every target/*/examples/X it names becomes an example the run needs.
+    while read -r x; do
+        [ -n "$x" ] && examples+=("${x##*/}")
+    done < <(grep -oE "(^|[ =:,\"'])(\./)?($MAC_GAM/)?target/[a-z-]+/examples/[A-Za-z0-9_-]+" <<< " $a" | sed -E 's/^[ =:,"'"'"']//' || true)
+    a=$(sed -E "s#(^|[ =:,])(\./)?target/[a-z-]+/examples/#\1$WS/bin/#g" <<< "$a")
     while read -r p; do
         [ -n "$p" ] || continue
         rel=${p#"$MAC_GAM"/}
@@ -1278,6 +1346,12 @@ if [ ${#uploads[@]} -gt 0 ]; then
     while IFS= read -r f; do files+=("$f"); done < <(cd "$MAC_DATA" && find -L "${uploads[@]}" -type f ! -name '*.pem' ! -name '*.key' ! -name .env ! -name .DS_Store | sort -u)
     upload_kb=$(cd "$MAC_DATA" && du -skL "${uploads[@]}" | awk '{ s += $1 } END { print s }')
 fi
+# A Mac binary among the inputs cannot run on the pod: refused before any pod exists.
+for f in "${files[@]}"; do
+    case $(file -b "$MAC_DATA/$f") in
+        Mach-O*) echo "rp-run: $MAC_DATA/$f is a Mac binary, which cannot run on a Linux pod; name the example as target/release/examples/${f##*/} (built on GitHub Actions)" >&2; exit 2 ;;
+    esac
+done
 # Published inputs ("SHA256 REL") are downloaded by the pod; the rest go up from the Mac, at most
 # UPLOAD_MAX_MB of them.
 fetched=() unpublished_kb=0 FETCH_BYTES=0
@@ -1285,15 +1359,17 @@ if [ ${#files[@]} -gt 0 ]; then
     kept=()
     for f in "${files[@]}"; do
         sha=$(sha_of "$f")
-        if grep -qx "$sha" <<< "$DATA_HAVE"; then
-            fetched+=("$sha $f")
+        asset=$(asset_for "$sha")
+        if [ -n "$asset" ]; then
+            fetched+=("$asset $f $sha")
         else
             kept+=("$f")
             unpublished_kb=$(( unpublished_kb + $(stat -L -f %z "$MAC_DATA/$f") / 1024 ))
         fi
     done
     files=("${kept[@]}")
-    FETCH_BYTES=$(for e in "${fetched[@]}"; do stat -L -f %z "$MAC_DATA/${e#* }"; done | awk '{ s += $1 } END { print s + 0 }')
+    # What the pod downloads: a u16 asset is a quarter of its float64 file, an f32 one half.
+    FETCH_BYTES=$(for e in "${fetched[@]}"; do read -r a f _ <<< "$e"; z=$(stat -L -f %z "$MAC_DATA/$f"); case $a in *.u16) echo $(( z / 4 )) ;; *.f32) echo $(( z / 2 )) ;; *) echo "$z" ;; esac; done | awk '{ s += $1 } END { print s + 0 }')
     if (( unpublished_kb > UPLOAD_MAX_MB * 1024 )); then
         # A Pile export is published whole (the pod then downloads it instead of building it).
         echo "rp-run: $(( unpublished_kb / 1024 )) MB of inputs would go up from the Mac (at most $UPLOAD_MAX_MB MB); publish them once (public inputs only), then launch: rp-run publish $(printf "$MAC_DATA/%s " "${uploads[@]}" $(printf 'engine/%s\n' "${pile[@]}" | sort -u))" >&2
@@ -1943,20 +2019,33 @@ upload_inputs() {
 FETCH_PIECE=$(( 128 << 20 ))
 fetch_published() {
     [ ${#fetched[@]} -gt 0 ] || return 0
-    local started=$(date +%s) sums sha f size k jobs="" total=0
-    sums=$(printf '%s\n' "${fetched[@]}" | awk '{ sha = $1; $1 = ""; sub(/^ /, ""); print sha "  " $0 }')
+    local started=$(date +%s) sums asset sha f to size k jobs="" total=0 widen=""
+    sums=$(printf '%s\n' "${fetched[@]}" | awk '{ print $3 "  " $2 }')
     for e in "${fetched[@]}"; do
-        read -r sha f <<< "$e"
-        size=$(stat -L -f %z "$MAC_DATA/$f")
+        read -r asset f sha <<< "$e"
+        size=$(stat -L -f %z "$MAC_DATA/$f") to=$f
+        # An encoded asset lands beside its file and is widened into it.
+        case $asset in
+            *.u16) size=$(( size / 4 )) to=$f.u16 widen+="$f.u16 $f <u2"$'\n' ;;
+            *.f32) size=$(( size / 2 )) to=$f.f32 widen+="$f.f32 $f <f4"$'\n' ;;
+        esac
         total=$(( total + size ))
         if (( size > FETCH_PIECE )); then
-            for (( k = 0; k * FETCH_PIECE < size; k++ )); do jobs+="$sha $f $(( k * FETCH_PIECE )) $(( (k + 1) * FETCH_PIECE - 1 )) $size"$'\n'; done
+            for (( k = 0; k * FETCH_PIECE < size; k++ )); do jobs+="$asset $to $(( k * FETCH_PIECE )) $(( (k + 1) * FETCH_PIECE - 1 )) $size"$'\n'; done
         else
-            jobs+="$sha $f - - $size"$'\n'
+            jobs+="$asset $to - - $size"$'\n'
         fi
     done
     printf '%s' "$jobs" | on_pod "mkdir -p $WS/mpd-data && cd $WS/mpd-data && tee .fetch.jobs | while read -r sha rel a b size; do mkdir -p \"\$(dirname \"\$rel\")\"; [ \"\$a\" = - ] || truncate -s \$size \"\$rel\"; done &&
         xargs -P 16 -L 1 sh -c 'if [ \"\$2\" = - ]; then curl -fsSL --retry 3 -o \"\$1\" $DATA_ASSETS/\$0; else curl -fsSL --retry 3 -r \$2-\$3 $DATA_ASSETS/\$0 | dd of=\"\$1\" bs=4M iflag=fullblock oflag=seek_bytes seek=\$2 conv=notrunc status=none; fi' < .fetch.jobs && rm -f .fetch.jobs" || return 1
+    if [ -n "$widen" ]; then
+        printf '%s' "$widen" | on_pod "cd $WS/mpd-data && python3 -c $(printf %q 'import os, sys
+import numpy as np
+for line in sys.stdin:
+    src, dst, dtype = line.split()
+    np.fromfile(src, dtype=dtype).astype("<f8").tofile(dst)
+    os.remove(src)')" || { say "widening the downloaded inputs failed; refusing to run"; touch "$TMP/refused"; return 1; }
+    fi
     on_pod "cd $WS/mpd-data && sha256sum -c --quiet" <<< "$sums" || { say "a downloaded input differs from its sha256; refusing to run"; touch "$TMP/refused"; return 1; }
     echo $(( $(date +%s) - started )) >> "$TMP/upload_s"
     say "downloaded ${#fetched[@]} published inputs, $(( total >> 20 )) MB, in $(( $(date +%s) - started )) s"
