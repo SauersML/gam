@@ -45,6 +45,9 @@ fn error(e: impl std::fmt::Display) -> String {
     format!("decoder: {e}")
 }
 
+/// The call shapes whose rotary angles a decoder keeps ([`Decoder::angles`]).
+const CALL_ANGLES: usize = 16;
+
 /// A stacked operator: its row blocks, each an operator of the program and its first row; and
 /// per node of the program applying one of them, the columns of the stacked product that are its
 /// value (several nodes applying one operator share them).
@@ -147,6 +150,9 @@ pub struct Decoder {
     /// Per rotary configuration, the angles of positions `0..span` (span × planes), grown to the
     /// longest sequence seen.
     angles: Mutex<Vec<(Rotary, usize, Arc<(Tensor, Tensor)>)>>,
+    /// The angles of a call's rows by its sequences' lengths, the latest [`CALL_ANGLES`] kept: a
+    /// fit's calls repeat a few shapes, and each new one costs a host transfer of positions.
+    call_angles: Mutex<Vec<(Rotary, Vec<usize>, Arc<(Tensor, Tensor)>)>>,
     /// Where the program holds each read variable's value (`interchange::values`).
     values: Vec<Value>,
 }
@@ -176,7 +182,7 @@ pub struct Tape {
 /// six times the stream's width per row in Qwen3), and keeping them would bound the rows a step can
 /// take by memory.
 enum Inner {
-    Attention { head_scales: Option<Tensor>, heads: Tensor, angles: Option<(Tensor, Tensor)>, attended: (Tensor, Tensor), sequences: Vec<Range<usize>> },
+    Attention { head_scales: Option<Tensor>, heads: Tensor, angles: Option<Arc<(Tensor, Tensor)>>, attended: (Tensor, Tensor), sequences: Vec<Range<usize>> },
     Mlp { out: Option<(Tensor, Tensor)> },
 }
 
@@ -276,7 +282,7 @@ impl Decoder {
         let width = embedding.cols();
         let value = if device.storage() == Storage::F32 { 4 } else { 8 };
         let gradient_bytes = trainable.iter().map(|op| program.operators[*op].rows.width() * program.operators[*op].cols.width() * value).sum();
-        let mut out = Self { device: device.clone(), blocks, weights: Vec::new(), embedding, width, trainable: trainable.to_vec(), gradient_bytes, arithmetic: Arithmetic::F32, angles: Mutex::new(Vec::new()), values: Vec::new() };
+        let mut out = Self { device: device.clone(), blocks, weights: Vec::new(), embedding, width, trainable: trainable.to_vec(), gradient_bytes, arithmetic: Arithmetic::F32, angles: Mutex::new(Vec::new()), call_angles: Mutex::new(Vec::new()), values: Vec::new() };
         out.weights = out.blocks.iter().map(|b| out.upload(program, b)).collect::<Result<_, _>>()?;
         Ok(out)
     }
@@ -435,8 +441,15 @@ impl Decoder {
 
     /// The rotary angles of the call's rows (each range a sequence from position 0), from a table
     /// of each position's angles computed once.
-    fn angles(&self, rotary: Rotary, ranges: &[Range<usize>]) -> Result<(Tensor, Tensor), String> {
-        let span = ranges.iter().map(ExactSizeIterator::len).max().unwrap_or(0);
+    fn angles(&self, rotary: Rotary, ranges: &[Range<usize>]) -> Result<Arc<(Tensor, Tensor)>, String> {
+        let lengths: Vec<usize> = ranges.iter().map(ExactSizeIterator::len).collect();
+        {
+            let cached = self.call_angles.lock().map_err(|_| error("poisoned angle tables"))?;
+            if let Some((_, _, t)) = cached.iter().find(|(r, l, _)| *r == rotary && *l == lengths) {
+                return Ok(Arc::clone(t));
+            }
+        }
+        let span = lengths.iter().copied().max().unwrap_or(0);
         let table = {
             let mut cached = self.angles.lock().map_err(|_| error("poisoned angle tables"))?;
             match cached.iter().find(|(r, covered, _)| *r == rotary && *covered >= span) {
@@ -460,7 +473,13 @@ impl Decoder {
         };
         let positions: Vec<u32> = ranges.iter().flat_map(|r| 0..r.len() as u32).collect();
         let ids: Indices = self.device.upload_indices(&positions).map_err(error)?;
-        Ok((self.device.gather_rows(&table.0, &ids).map_err(error)?, self.device.gather_rows(&table.1, &ids).map_err(error)?))
+        let rows = Arc::new((self.device.gather_rows(&table.0, &ids).map_err(error)?, self.device.gather_rows(&table.1, &ids).map_err(error)?));
+        let mut cached = self.call_angles.lock().map_err(|_| error("poisoned angle tables"))?;
+        if cached.len() == CALL_ANGLES {
+            cached.remove(0);
+        }
+        cached.push((rotary, lengths, Arc::clone(&rows)));
+        Ok(rows)
     }
 
     /// `edits` applied to the values of `stack`'s nodes they name, which are column blocks of the
@@ -722,7 +741,7 @@ impl BlockEngine for Decoder {
                 d.gemm(&mut p, 1.0, &read, Op::N, &w.input, Op::T, 0.0, arithmetic).map_err(error)?;
                 self.edit(edits, &a.projections, &mut p, false)?;
                 let angles = rotary.map(|r| self.angles(r, ranges)).transpose()?;
-                let rotation = angles.as_ref().zip(rotary).map(|((c, s), r)| (c, s, r.half_split));
+                let rotation = angles.as_ref().zip(rotary).map(|(t, r)| (&t.0, &t.1, r.half_split));
                 let norm = w.norms.as_ref().zip(a.norms.as_ref()).map(|(g, (_, e))| (g, *e));
                 let (heads, head_scales) = d.heads_rope(&p, a.layout, norm, rotation).map_err(error)?;
                 // Each range is one sequence; the gathered rows hold them in order.
@@ -778,7 +797,7 @@ impl BlockEngine for Decoder {
                 let mut g_attended = d.empty(rows, a.layout.queries * a.layout.width).map_err(error)?;
                 d.gemm(&mut g_attended, 1.0, &g, Op::N, &w.output, Op::N, 0.0, arithmetic).map_err(error)?;
                 let g_heads = d.causal_attention_backward(heads, a.layout, sequences, a.scale, (&attended.0, &attended.1), &g_attended).map_err(error)?;
-                let rotation = angles.as_ref().zip(a.rotary).map(|((c, s), r)| (c, s, r.half_split));
+                let rotation = angles.as_ref().zip(a.rotary).map(|(t, r)| (&t.0, &t.1, r.half_split));
                 let norm = w.norms.as_ref().zip(head_scales.as_ref());
                 let mut g_p = d.heads_rope_backward(&projections, a.layout, norm, rotation, &g_heads).map_err(error)?;
                 self.edit(edits, &a.projections, &mut g_p, true)?;
@@ -831,13 +850,8 @@ impl BlockEngine for Decoder {
 
     fn tape_bytes(tape: &Tape) -> usize {
         let inner = match &tape.inner {
-            Inner::Attention { head_scales, heads, angles, attended, .. } => {
-                head_scales.as_ref().map_or(0, Tensor::bytes)
-                    + heads.bytes()
-                    + angles.as_ref().map_or(0, |(c, s)| c.bytes() + s.bytes())
-                    + attended.0.bytes()
-                    + attended.1.bytes()
-            }
+            // The angles are the decoder's cached table, not the tape's own.
+            Inner::Attention { head_scales, heads, attended, .. } => head_scales.as_ref().map_or(0, Tensor::bytes) + heads.bytes() + attended.0.bytes() + attended.1.bytes(),
             Inner::Mlp { out } => out.as_ref().map_or(0, |(r, k)| r.bytes() + k.bytes()),
         };
         tape.x.bytes() + tape.scale.bytes() + tape.read.bytes() + inner
