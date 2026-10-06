@@ -770,14 +770,20 @@ impl Side {
         self.program.device().copy(trace.value(self.leaving(l))?).map_err(error)
     }
 
+    /// The final normed stream on `family` from the final residual `x`.
+    pub fn hidden_of(&self, family: &FamilyInputs, x: &Tensor) -> Result<Tensor, String> {
+        let d = self.program.device();
+        let trace = self.program.forward_span(family, Some((self.residual, d.copy(x).map_err(error)?)), self.hidden, |_, _| Ok(None))?;
+        d.copy(trace.value(self.hidden)?).map_err(error)
+    }
+
     /// Per sequence of `family` (each `length` rows), the logits of the final residual `x`.
     pub fn logits(&self, family: &FamilyInputs, x: &Tensor, length: usize) -> Result<Vec<Array2<f64>>, String> {
         let d = self.program.device();
-        let trace = self.program.forward_span(family, Some((self.residual, d.copy(x).map_err(error)?)), self.hidden, |_, _| Ok(None))?;
-        let hidden = trace.value(self.hidden)?;
+        let hidden = self.hidden_of(family, x)?;
         (0..family.rows / length)
             .map(|s| {
-                let rows = d.rows_of(hidden, s * length, length).map_err(error)?;
+                let rows = d.rows_of(&hidden, s * length, length).map_err(error)?;
                 let mut logits = d.zeros(length, self.head.rows()).map_err(error)?;
                 d.gemm(&mut logits, 1.0, &rows, Op::N, &self.head, Op::T, 0.0, self.program.arithmetic()).map_err(error)?;
                 d.download(&logits).map_err(error)
@@ -1847,39 +1853,27 @@ pub fn subcomponent_attributions(library: &crate::library_readout::Library<'_>, 
 
 // ------------------------------------------------------------------------------ VPD's code length
 
-/// The sum over a batch's tokens of `KL(M ‖ E)` in nats, from `E`'s final normed stream `hidden`
-/// (the batch's sequences of `length` rows each) and `M`'s `reference`, and with `seed` the
-/// gradient of that sum in the final normed stream: `(p_E − p_M)` through the unembedding `head`.
-fn divergence_and_seed(d: &Device, hidden: &Tensor, head: &Tensor, reference: &Reference, length: usize, seed: bool, arithmetic: Arithmetic) -> Result<(f64, Option<Tensor>), String> {
-    let sequences = hidden.rows() / length;
+/// The sum over a batch's tokens of `KL(M ‖ E)` in nats, from the final normed streams `m` of
+/// `M` and `e` of `E` (the batch's sequences of `length` rows each) through the unembedding
+/// `head`, on the device; with `seed` the gradient of that sum in `E`'s final normed stream,
+/// `(p_E − p_M)` through `head`.
+fn divergence_and_seed(d: &Device, m: &Tensor, e: &Tensor, head: &Tensor, length: usize, seed: bool, arithmetic: Arithmetic) -> Result<(f64, Option<Tensor>), String> {
+    let sequences = e.rows() / length;
     let mut total = 0.0;
-    let mut out = if seed { Some(d.zeros(hidden.rows(), hidden.cols()).map_err(error)?) } else { None };
+    let mut out = if seed { Some(d.zeros(e.rows(), e.cols()).map_err(error)?) } else { None };
     for s in 0..sequences {
-        let h = d.rows_of(hidden, s * length, length).map_err(error)?;
-        let mut logits = d.zeros(length, head.rows()).map_err(error)?;
-        d.gemm(&mut logits, 1.0, &h, Op::N, head, Op::T, 0.0, arithmetic).map_err(error)?;
-        let logits = d.download(&logits).map_err(error)?;
-        let lp = &reference.log_probabilities[s];
-        let mut cotangent = Array2::<f64>::zeros(logits.dim());
-        let kl: Vec<f64> = cotangent
-            .axis_iter_mut(Axis(0))
-            .into_par_iter()
-            .enumerate()
-            .map(|(t, mut row)| -> Result<f64, String> {
-                let lq = log_softmax(logits.row(t).as_slice().ok_or_else(|| error("noncontiguous logits"))?).map_err(error)?;
-                let mut kl = 0.0;
-                for ((out, p), q) in row.iter_mut().zip(lp.row(t)).zip(&lq) {
-                    kl += p.exp() * (p - q);
-                    *out = q.exp() - p.exp();
-                }
-                Ok(kl)
-            })
-            .collect::<Result<_, _>>()?;
-        total += kl.iter().sum::<f64>();
+        let logits_of = |x: &Tensor| -> Result<Tensor, String> {
+            let rows = d.rows_of(x, s * length, length).map_err(error)?;
+            let mut logits = d.zeros(length, head.rows()).map_err(error)?;
+            d.gemm(&mut logits, 1.0, &rows, Op::N, head, Op::T, 0.0, arithmetic).map_err(error)?;
+            Ok(logits)
+        };
+        let (target, mut logits) = (logits_of(m)?, logits_of(e)?);
+        // The KL per row, and the cotangent `q − p` in place of `E`'s logits.
+        total += d.kl_rows(&target, &mut logits, None).map_err(error)?.iter().sum::<f64>();
         if let Some(out) = out.as_mut() {
-            let upstream = d.upload(cotangent.view()).map_err(error)?;
-            let mut part = d.zeros(length, hidden.cols()).map_err(error)?;
-            d.gemm(&mut part, 1.0, &upstream, Op::N, head, Op::N, 0.0, arithmetic).map_err(error)?;
+            let mut part = d.zeros(length, e.cols()).map_err(error)?;
+            d.gemm(&mut part, 1.0, &logits, Op::N, head, Op::N, 0.0, arithmetic).map_err(error)?;
             d.set_rows(out, s * length, &part).map_err(error)?;
         }
     }
@@ -1887,13 +1881,15 @@ fn divergence_and_seed(d: &Device, hidden: &Tensor, head: &Tensor, reference: &R
 }
 
 /// The causal-importance masks of every site on `family`, as the raw slots of the whole program
-/// (the remainder dropped: VPD's intended setting).
-fn importance_given(vpd: &Vpd, family: &FamilyInputs, rng: &mut StdRng) -> Result<BTreeMap<usize, Tensor>, String> {
+/// (the remainder dropped: VPD's intended setting), on the device: each mask the importance
+/// network's output itself (`Strategy::Ci`) and every `δ` zero.
+fn importance_given(vpd: &Vpd, family: &FamilyInputs) -> Result<BTreeMap<usize, Tensor>, String> {
     let d = vpd.e.program.device();
-    let masks = Strategy::Ci.masks(&vpd.importances(family)?, rng);
+    let trace = vpd.importance.forward(family)?;
     let mut given = BTreeMap::new();
-    for l in 0..vpd.layers() {
-        given.extend(vpd.given(d, l, Some(&masks), family.rows)?);
+    for (s, &(_, _, width)) in vpd.sites.iter().enumerate() {
+        given.insert(vpd.layout.masks[s], d.copy(trace.value(vpd.outputs[s])?).map_err(error)?);
+        given.insert(vpd.layout.deltas[s], d.zeros(family.rows, width).map_err(error)?);
     }
     Ok(given)
 }
@@ -1969,12 +1965,11 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
     let variance_nats: f64 = sizes.iter().map(|n| 0.5 * n.ln()).sum();
     let batches: Vec<&[Vec<u32>]> = train.chunks(batch).collect();
     let ivon = crate::device_posterior::Ivon { rate: 0.0, beta1: 0.0, beta2: 1.0 - 1.0 / batches.len() as f64 };
-    let mut rng = StdRng::seed_from_u64(seed);
     let head = d_copy(&device, &vpd.e.head)?;
     let arithmetic = program.arithmetic();
     // One pass over `sequences` at a sample per batch (with `step`, IVON's step after each): the
     // per-batch data term in nats per token.
-    let mut pass = |sequences: &[&[Vec<u32>]], epoch: u64, step: bool, posterior: &mut crate::device_posterior::DevicePosterior, program: &mut DeviceProgram, at_mean: bool| -> Result<Vec<(f64, usize)>, String> {
+    let pass = |sequences: &[&[Vec<u32>]], epoch: u64, step: bool, posterior: &mut crate::device_posterior::DevicePosterior, program: &mut DeviceProgram, at_mean: bool| -> Result<Vec<(f64, usize)>, String> {
         let mut out = Vec::with_capacity(sequences.len());
         for (b, chunk) in sequences.iter().enumerate() {
             let key = seed ^ (epoch << 32) ^ b as u64;
@@ -1982,11 +1977,11 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
             let views: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
             let family = sequence_family(&views)?;
             let length = views[0].len();
-            let given = importance_given(vpd, &family, &mut rng)?;
+            let given = importance_given(vpd, &family)?;
             let trace = program.forward_given(&family, given)?;
             let (_, m_streams) = streams(&vpd.m, &family, |_| BTreeMap::new())?;
-            let reference = Reference::of(vpd.m.logits(&family, &m_streams[vpd.layers()], length)?)?;
-            let (kl, cotangent) = divergence_and_seed(&device, trace.value(hidden_node)?, &head, &reference, length, step, arithmetic)?;
+            let m_hidden = vpd.m.hidden_of(&family, &m_streams[vpd.layers()])?;
+            let (kl, cotangent) = divergence_and_seed(&device, &m_hidden, trace.value(hidden_node)?, &head, length, step, arithmetic)?;
             if let Some(cotangent) = cotangent {
                 let (_, gradients) = program.vjp_values_dense(&trace, BTreeMap::from([(hidden_node, cotangent)]), &[], &trainable, arithmetic)?;
                 // A draw of the Gauss–Newton factor through the same forward pass: labels drawn
