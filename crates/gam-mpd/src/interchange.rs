@@ -2823,8 +2823,8 @@ impl Interchange {
             let chosen = hybrid_of(&mut rng, all.len(), per_layer);
             neurons.extend(all.into_iter().zip(chosen).filter(|(_, c)| *c).map(|(s, _)| s));
             let half = per_layer / 2;
-            slices.extend(random_slices_of(&mlp, layer, Map::Up, half, splitmix(seed, 2 * layer as u64)));
-            slices.extend(random_slices_of(&mlp, layer, Map::Down, per_layer - half, splitmix(seed, 2 * layer as u64 + 1)));
+            slices.extend(random_slices_of(&mlp, layer, Map::Up, half, splitmix(seed, 2 * layer as u64))?);
+            slices.extend(random_slices_of(&mlp, layer, Map::Down, per_layer - half, splitmix(seed, 2 * layer as u64 + 1))?);
         }
         self.add_weight_edits(Family::Neuron, neurons)?;
         self.add_weight_edits(Family::RankOne, slices)

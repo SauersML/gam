@@ -222,44 +222,28 @@ pub fn neuron_slices(mlp: &Arc<Mlp>, layer: usize) -> Vec<Slice> {
 
 /// `count` random rank-one slices of layer `layer`'s MLP map `map`, drawn from `seed`: unit `u`
 /// and `v` uniform on their spheres (normalized standard normal draws,
-/// `gam_gpu::tensor::posterior_normal` under `seed`, streams `2i` and `2i + 1` for slice `i`), scaled by the map's top
-/// singular value `s` (the Rayleigh quotient of power iteration on `WᵀW` from a fixed start, until
-/// it changes by at most 1e-12 relative, at most 1000 steps), so the edit is `W + (α − 1) s u vᵀ`: a weight
-/// edit of `M` at the size of the map's largest direction, independent of any explanation.
-#[must_use]
-pub fn random_slices_of(mlp: &Arc<Mlp>, layer: usize, map: Map, count: usize, seed: u64) -> Vec<Slice> {
+/// `gam_gpu::tensor::posterior_normal` under `seed`, streams `2i` and `2i + 1` for slice `i`),
+/// scaled by the map's top singular value `s` (`gam_linalg::decompose::svd`), so the edit is
+/// `W + (α − 1) s u vᵀ`: a weight edit of `M` at the size of the map's largest direction,
+/// independent of any explanation.
+pub fn random_slices_of(mlp: &Arc<Mlp>, layer: usize, map: Map, count: usize, seed: u64) -> Result<Vec<Slice>, String> {
     let w = match map {
         Map::Up => &mlp.read,
         Map::Down => &mlp.write,
     };
-    let mut x = Array1::from_elem(w.ncols(), 1.0 / (w.ncols() as f64).sqrt());
-    let mut top = 0.0;
-    for _ in 0..1000 {
-        // The Rayleigh quotient `xᵀ WᵀW x` of the unit `x`, whose error is quadratic in `x`'s.
-        let y = w.t().dot(&w.dot(&x));
-        let (estimate, norm) = (x.dot(&y).max(0.0).sqrt(), y.dot(&y).sqrt());
-        if norm == 0.0 {
-            break;
-        }
-        x = y / norm;
-        let settled = (estimate - top).abs() <= 1e-12 * estimate;
-        top = estimate;
-        if settled {
-            break;
-        }
-    }
+    let top = gam_linalg::decompose::svd(w.view(), false).map_err(error)?.singular_values.first().copied().unwrap_or(0.0);
     // Standard normal draws keyed by `seed`, one stream per slice and side (`posterior_normal`).
     let unit = |n: usize, stream: u64| {
         let a = Array1::from_shape_fn(n, |i| f64::from(gam_gpu::tensor::posterior_normal(seed, stream, i as u64)));
         let norm = a.dot(&a).sqrt();
         a / norm
     };
-    (0..count)
+    Ok((0..count)
         .map(|index| {
             let (u, v) = (unit(w.nrows(), 2 * index as u64) * top, unit(w.ncols(), 2 * index as u64 + 1));
             Slice { part: VpdPart { block: 2 * layer + 1, layer, map, index, u, v }, mlp: Arc::clone(mlp) }
         })
-        .collect()
+        .collect())
 }
 
 /// `M`'s MLP of every layer from its split native program `native` with its `layers`
@@ -417,8 +401,8 @@ mod tests {
         let (x, dx, g) = (normal(1, 5).row(0).to_owned(), normal(1, 5).row(0).to_owned(), normal(1, 5).row(0).to_owned());
         let output = |m: &Mlp| m.output(x.view());
         let mut slices = neuron_slices(&mlp, 0);
-        slices.extend(random_slices_of(&mlp, 0, Map::Up, 3, 4));
-        slices.extend(random_slices_of(&mlp, 0, Map::Down, 3, 5));
+        slices.extend(random_slices_of(&mlp, 0, Map::Up, 3, 4).unwrap());
+        slices.extend(random_slices_of(&mlp, 0, Map::Down, 3, 5).unwrap());
         for slice in &slices {
             let piece = slice.part.u.clone().insert_axis(ndarray::Axis(1)).dot(&slice.part.v.clone().insert_axis(ndarray::Axis(0)));
             for alpha in [0.0, 0.5, 3.0] {
@@ -448,16 +432,13 @@ mod tests {
         for (a, b) in total.iter().zip(&output) {
             assert!((a + b).abs() <= 1e-12 * output.iter().fold(1.0_f64, |m, v| m.max(v.abs())), "{a} against −{b}");
         }
-        let slices = random_slices_of(&mlp, 0, Map::Down, 3, 9);
+        let slices = random_slices_of(&mlp, 0, Map::Down, 3, 9).unwrap();
         let top = {
-            let svd_like = mlp.write.t().dot(&mlp.write);
-            // The largest eigenvalue of WᵀW by many power steps from a different start.
-            let mut y = Array1::from_shape_fn(7, |i| 1.0 + i as f64);
-            for _ in 0..5000 {
-                let z = svd_like.dot(&y);
-                y = &z / z.dot(&z).sqrt();
-            }
-            svd_like.dot(&y).dot(&y).sqrt()
+            // The square root of WᵀW's largest eigenvalue (a symmetric eigensolver, not the SVD).
+            let gram = mlp.write.t().dot(&mlp.write);
+            let gram = (&gram + &gram.t()) * 0.5;
+            let eigen = gam_linalg::decompose::eigh(gram.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).unwrap();
+            eigen.values[eigen.values.len() - 1].sqrt()
         };
         for s in &slices {
             let scale = s.part.u.dot(&s.part.u).sqrt() * s.part.v.dot(&s.part.v).sqrt();
