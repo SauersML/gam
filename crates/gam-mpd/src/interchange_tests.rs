@@ -17,7 +17,7 @@ use super::artifact::Artifact;
 use super::device_program::DeviceProgram;
 use super::device_program_tests::{devices, fixture_sized, noise};
 use super::interchange::{Batch, Experiment, FixedHead, Interchange, Model, Patch, ReadVariable, Site, Value, census, evaluate, reads, sample, sites, targets, values};
-use super::interchange::{BlockEngine, Edits, FACTORS, Part};
+use super::interchange::{BlockEngine, Edit, Edits, FACTORS, Part};
 use super::device_program::DeviceTrace;
 use super::operator_program::{FamilyInputs, Operator, OperatorProgram, SequenceLayout, SlotValues, exact_precision};
 use super::resident_causal_fit::fixed_head_target::Head;
@@ -812,7 +812,7 @@ fn an_edit_of_a_part_on_m_adds_its_scaled_write() {
     let plain = d.download(&plain).expect("download");
     for (factor, alpha) in FACTORS.iter().enumerate() {
         let row = 3 + factor;
-        let edits = Edits::with_parts(&d, &[], m.values(), &[(row, 0, factor)], Some(sites)).expect("the edits");
+        let edits = Edits::with_parts(&d, &[], m.values(), &[(row, Edit::Part { part: 0, factor })], Some(sites)).expect("the edits");
         let mut edited = d.copy(&entering).expect("copy");
         m.forward(1, &mut edited, &ranges, &tok, Some(&edits), false).expect("the edited MLP");
         let moved = d.download(&edited).expect("download") - &plain;
@@ -888,7 +888,7 @@ fn edits_of_a_transcoder_block_are_the_hand_computation() {
     let row = 5;
     let i = (0..64).find(|j| (xp.row(row).dot(&gate.row(*j)) + bias[[*j, 0]]) > 0.0).expect("a firing feature");
     for (factor, alpha) in FACTORS.iter().enumerate() {
-        let edits = Edits::with_parts(&d, &[], p.values(), &[(row, i, factor)], Some(sites)).expect("the edits");
+        let edits = Edits::with_parts(&d, &[], p.values(), &[(row, Edit::Part { part: i, factor })], Some(sites)).expect("the edits");
         let edited = p.forward(3, &mut d.copy(&entering).expect("copy"), &ranges, &tok, Some(&edits), true).expect("the edited MLP").expect("a tape");
         let edited = d.download(edited.value(out_node).expect("the output")).expect("download");
         let mut hand = out_bias.column(0).to_owned();
@@ -912,4 +912,58 @@ fn edits_of_a_transcoder_block_are_the_hand_computation() {
     assert!(silent <= 6, "{silent} edits of silent parts");
     let bits = x.evaluate(&batch, &experiments, false).expect("evaluate").bits;
     assert!(bits.iter().flatten().all(|b| b.is_finite() && *b >= -1e-12), "{bits:?}");
+}
+
+/// A head's removal (`Patch::Head`) zeroes the head's attention output at the edited row, in both
+/// models alike: with `P` = `M` (`Artifact::native`, every head held by both) on the tiny Qwen3
+/// export, every head's removal under `P` alone scores zero and changes `M`'s prediction; the
+/// edited forward of layer 0's attention holds zeros at the head's row and the plain values
+/// elsewhere; drawn removals name held heads after the first token; and with `P` applying no
+/// edit, each removal scores `KL(M_e ‖ M)` above zero.
+#[test]
+fn a_head_removal_zeroes_its_output_in_both_models() {
+    use super::interchange::Family;
+    let dir = crate::test_support::tiny_qwen3_export("interchange_heads", 2);
+    let imported = crate::import::import_language_model(&dir, 6, 12).expect("the tiny export imports");
+    std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+    let native = split_sites(&imported.program).expect("the native sites");
+    let layers = layer_nodes(&native, 2).expect("the layers");
+    let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+    let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+    let d = Device::host();
+    let variables = reads(&native, &layers).expect("the reads");
+    let mut x = Interchange::new(&d, &native, &layers, &Artifact::native(&native).expect("native"), &[], variables, 1 << 30, 64).expect("the experiments");
+    let heads = x.heads();
+    assert!(!heads.is_empty() && heads.iter().all(|(b, held)| *held && b % 2 == 0), "{heads:?}");
+    let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
+    let experiments: Vec<Experiment> = (0..heads.len()).map(|head| Experiment { base: head % 3, source: head % 3, explained: vec![true; 4], patch: Some(Patch::Head { head }), position: 1 + head % 11 }).collect();
+    assert_eq!(census(&experiments, x.variables())["remove_head"], heads.len());
+    let bits = x.evaluate(&batch, &experiments, false).expect("evaluate").bits;
+    assert!(bits.iter().flatten().all(|b| b.abs() <= 1e-9), "{bits:?}");
+    // The edited forward of layer 0's attention: the head's node is zero at the row.
+    let (m, _) = x.models();
+    let sites = m.part_sites().expect("M's edit sites");
+    let (ranges, tok) = (vec![0..12], vec![sequences[0].as_slice()]);
+    let width = BlockEngine::width(&m);
+    let plain = m.forward(0, &mut d.zeros(12, width).expect("zeros"), &ranges, &tok, None, true).expect("attention").expect("a tape");
+    let edits = Edits::with_parts(&d, &[], m.values(), &[(4, Edit::Head { head: 0 })], Some(sites)).expect("the edits");
+    let edited = m.forward(0, &mut d.zeros(12, width).expect("zeros"), &ranges, &tok, Some(&edits), true).expect("attention").expect("a tape");
+    let node = *edits.nodes().iter().next().expect("one edited node");
+    let (plain, edited) = (d.download(plain.value(node).expect("plain")).expect("download"), d.download(edited.value(node).expect("edited")).expect("download"));
+    for r in 0..12 {
+        for c in 0..plain.ncols() {
+            let want = if r == 4 { 0.0 } else { plain[[r, c]] };
+            assert_eq!(edited[[r, c]], want, "row {r}, column {c}");
+        }
+    }
+    assert!(plain.row(4).iter().any(|v| *v != 0.0), "the head writes at the row");
+    let drawn = x.sample_edits(&mut rand::rngs::StdRng::seed_from_u64(4), &batch, &[Family::RemoveHead], 4, false).expect("the draw");
+    assert!(drawn.iter().all(|e| match e.patch {
+        Some(Patch::Head { head }) => heads[head].1 && e.position >= 1,
+        None => true,
+        _ => false,
+    }));
+    x.unedited_explanation();
+    let effects = x.evaluate(&batch, &experiments, false).expect("evaluate").bits;
+    assert!(effects.iter().all(|bits| bits.iter().sum::<f64>() > 1e-9), "{effects:?}");
 }

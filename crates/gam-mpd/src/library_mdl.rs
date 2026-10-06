@@ -1938,7 +1938,7 @@ fn held_out(
                     match patch {
                         Patch::Read { .. } => read.add(bits),
                         Patch::Reads { .. } => joint.add(bits),
-                        Patch::Part { .. } => {}
+                        Patch::Part { .. } | Patch::Head { .. } => {}
                     }
                 }
             }

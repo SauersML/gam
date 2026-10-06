@@ -24,8 +24,8 @@
 //! of the checkpoint `OUT/{checkpoint}`, or with no checkpoint the library as built, the transcoder
 //! features as they are) is scored on held-out sequences `sequences` (a range of the held-out rows)
 //! under edits of its parts (`interchange::Interchange::sample_edits`: per sequence its clean
-//! experiment and `edits_per_sequence` edits, each of a family in `families`, `remove_part` or
-//! `amplify_part`, applied identically to `M` and to `P`). `OUT/EDITS_{name}.json` holds per family
+//! experiment and `edits_per_sequence` edits, each of a family in `families`, `remove_part`,
+//! `amplify_part` or `remove_head`, applied identically to `M` and to `P`). `OUT/EDITS_{name}.json` holds per family
 //! `KL(M_e ‖ P_e)` in bits per token: the mean and 99th percentile over every scored token (from the
 //! edited token on) and over the edited tokens alone, with the clean experiments' as `clean`; and
 //! next to it, over the same tokens, the edit's effect on the model `KL(M_e ‖ M)` (`effect_*`), the
@@ -231,6 +231,7 @@ fn edit_faithfulness(
         None => "clean",
         Some(interchange::Patch::Part { factor: 0, .. }) => "remove_part",
         Some(interchange::Patch::Part { .. }) => "amplify_part",
+        Some(interchange::Patch::Head { .. }) => "remove_head",
         Some(_) => "read",
     };
     // Per family: every scored token's bits, the edited tokens' bits, and the experiments.
