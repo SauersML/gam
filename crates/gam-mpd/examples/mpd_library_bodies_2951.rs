@@ -539,7 +539,6 @@ fn main() -> Result<(), String> {
                 head_tile_rows: 64,
                 epochs: None,
                 families: Vec::new(),
-                full_antithetic: false,
                 seed_bf16: false,
                 train_bf16: false,
             };

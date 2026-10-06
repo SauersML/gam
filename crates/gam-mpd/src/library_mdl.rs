@@ -1393,11 +1393,6 @@ pub struct Settings {
     /// `interchange::Interchange::draw_ops`). Empty (the default) is `read` alone.
     #[serde(default)]
     pub families: Vec<interchange::Family>,
-    /// A/B arm, to be deleted with the losing arm after its paired test: when set, each step
-    /// scores the whole batch at its weight sample and again at the antithetic twin, averaging the
-    /// two, instead of splitting the bases between them (`antithetic_step`).
-    #[serde(default)]
-    pub full_antithetic: bool,
     /// The arm whose head sweep forms the reverse passes' seeds (`Σ π e` and the Fisher probe's
     /// pull-back) in bfloat16 against a bfloat16 copy of the head, as the reverse passes run
     /// (`interchange::factor_arithmetic`); the log partitions, and so `F`, stay f32. Off by default;
@@ -1418,8 +1413,9 @@ pub struct Settings {
 /// replaced by the line step), `trust_rate`, `line_search`, `split_filter`,
 /// `deterministic` (the 2^16 and 2^24 A/B arms), `decoder`, `half_factor` (now the step's),
 /// `one_sample`, `rotated` (the rotated posterior of f80fd69565, which its A/B in 1a8361c2c8
-/// retired) and `cross_fit` (4948bbc723's cross-fitted mean step, which its paired A/B retired), so
-/// that configs and checkpoints written before still read.
+/// retired), and `cross_fit` and `full_antithetic` (4948bbc723's cross-fitted mean step and
+/// 5759e6a350's scoring of the whole batch at both antithetic samples, which their paired A/Bs
+/// retired), so that configs and checkpoints written before still read.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettingsRecord {
@@ -1440,7 +1436,7 @@ struct SettingsRecord {
     #[serde(default)]
     families: Vec<interchange::Family>,
     #[serde(default)]
-    full_antithetic: bool,
+    full_antithetic: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     seed_bf16: bool,
     #[serde(default)]
@@ -1469,7 +1465,7 @@ struct SettingsRecord {
 
 impl From<SettingsRecord> for Settings {
     fn from(r: SettingsRecord) -> Self {
-        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some()), ("preconditioned", r.preconditioned.is_some()), ("half_factor", r.half_factor.is_some()), ("one_sample", r.one_sample.is_some()), ("rotated", r.rotated.is_some()), ("beta1", r.beta1.is_some()), ("epoch_ratio", r.epoch_ratio.is_some()), ("momentum_rule", r.momentum_rule.is_some()), ("cross_fit", r.cross_fit.is_some())];
+        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some()), ("preconditioned", r.preconditioned.is_some()), ("half_factor", r.half_factor.is_some()), ("one_sample", r.one_sample.is_some()), ("rotated", r.rotated.is_some()), ("beta1", r.beta1.is_some()), ("epoch_ratio", r.epoch_ratio.is_some()), ("momentum_rule", r.momentum_rule.is_some()), ("cross_fit", r.cross_fit.is_some()), ("full_antithetic", r.full_antithetic.is_some())];
         for (key, present) in retired {
             if present {
                 log::info!("library settings: the retired key `{key}` is ignored");
@@ -1482,7 +1478,6 @@ impl From<SettingsRecord> for Settings {
             head_tile_rows: r.head_tile_rows,
             epochs: r.epochs,
             families: r.families,
-            full_antithetic: r.full_antithetic,
             seed_bf16: r.seed_bf16,
             train_bf16: r.train_bf16,
         }
@@ -2014,6 +2009,12 @@ fn training_key(seed: u64, batch: usize) -> u64 {
 /// averages what remains. The products are one scoring's of the whole batch. A batch of one base is
 /// scored at the sample of `key` alone.
 ///
+/// Scoring the whole batch at both samples and averaging cancels `H σ ε` exactly, and it lowers
+/// `F` more per epoch: on vpd4l's one-block fit (block 3, 1024 sequences, L40, MATS audit-new-*)
+/// held-out F after 3 epochs was 2.555 and 2.783 bits per token (seeds 1 and 2) against the split's
+/// 2.980 and 3.055. It costs 1.5× the time per epoch, and at equal time it lost (audit-z-*): 2.578
+/// and 2.859 after 3 epochs in 169 s against the split's 2.399 and 2.596 after 5 in 175 s.
+///
 /// The Gauss–Newton factor is one half's alone, its curvature estimate per token of the tokens it
 /// sums; which half supplies it is drawn from the batch's key, each with probability ½
 /// ([`factor_half`]). The batches are fixed runs of the training sequences, so a fixed half would
@@ -2026,21 +2027,11 @@ fn training_key(seed: u64, batch: usize) -> u64 {
 /// factor pass. Its A/B (fitperf-halffactor-ab2: vpd4l, N = 2^20, RTX 4090, 3 epochs, seeds 1-2)
 /// measured F after epoch 2 at 25.45e6 and 24.09e6 bits against 25.73e6 and 24.81e6 with both
 /// halves' factors, and 7% less wall time per step.
-///
-/// With `whole` (the A/B arm [`Settings::full_antithetic`]) the whole batch is scored at the sample
-/// of `key` and again at its negation, and the step takes the two scorings' mean bits and mean
-/// gradient, the Gauss–Newton factor the first scoring's: for a quadratic objective with Hessian
-/// `H` the gradient's terms linear in the noise, `H σ ε` and `−H σ ε`, cancel exactly, where the
-/// split halves leave `(H_A − H_B) σ ε`; the batch is scored twice.
-/// The parts a training step scores a batch's experiments in ([`antithetic_step`]): with `whole`
-/// all of them as given; otherwise the experiments of the first and of the second half of the
+/// The parts a training step scores a batch's experiments in ([`antithetic_step`]): the experiments of the first and of the second half of the
 /// batch's bases (the antithetic pair), or all of them together when a half has none. `M`'s
 /// targets are kept per part (`Interchange::targets`), so every scoring of a training batch asks
 /// for them by these parts ([`part_targets`]).
-fn step_parts(batch: &Batch, experiments: Vec<Experiment>, whole: bool) -> Vec<Vec<Experiment>> {
-    if whole {
-        return vec![experiments];
-    }
+fn step_parts(batch: &Batch, experiments: Vec<Experiment>) -> Vec<Vec<Experiment>> {
     let half = batch.base.len() / 2;
     let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.into_iter().partition(|e| e.base < half);
     if first.is_empty() || second.is_empty() {
@@ -2052,8 +2043,8 @@ fn step_parts(batch: &Batch, experiments: Vec<Experiment>, whole: bool) -> Vec<V
 
 /// A training batch's experiments in the order of its [`step_parts`], and `M`'s targets for them,
 /// asked for part by part.
-fn part_targets(scorer: &Scorer, batch: &Batch, experiments: Vec<Experiment>, whole: bool) -> Result<(Vec<Experiment>, Targets), String> {
-    let parts = step_parts(batch, experiments, whole);
+fn part_targets(scorer: &Scorer, batch: &Batch, experiments: Vec<Experiment>) -> Result<(Vec<Experiment>, Targets), String> {
+    let parts = step_parts(batch, experiments);
     let targets = Targets::joined(parts.iter().map(|part| scorer.experiments.targets(batch, part)).collect::<Result<Vec<_>, String>>()?);
     Ok((parts.into_iter().flatten().collect(), targets))
 }
@@ -2065,29 +2056,9 @@ fn antithetic_step(
     batch: &Batch,
     experiments: Vec<Experiment>,
     key: u64,
-    whole: bool,
 ) -> Result<(Vec<Experiment>, Vec<Vec<f64>>, BTreeMap<usize, Tensor>, interchange::Factor), String> {
     let targets_of = |scorer: &mut Scorer, part: &[Experiment]| scorer.experiments.targets(batch, part);
-    if whole {
-        let targets = targets_of(scorer, &experiments)?;
-        let (mut bits, mut gradients, factor) = scorer.evaluate_device(device_posterior, (batch, &experiments), Some(key), &targets, (true, true))?;
-        let factor = factor.ok_or("no Gauss–Newton factor")?;
-        let (other_bits, other_gradients, _) = scorer.evaluate_device(device_posterior, (batch, &experiments), Some(key ^ gam_gpu::tensor::ANTITHETIC), &targets, (true, false))?;
-        if !other_gradients.keys().eq(gradients.keys()) {
-            return Err("the antithetic pair's scorings reached different operators".into());
-        }
-        for (op, g) in other_gradients {
-            let sum = gradients.get_mut(&op).ok_or("the antithetic pair's scorings reached different operators")?;
-            device.move_toward(sum, 0.5, &g).map_err(error)?;
-        }
-        for (mine, other) in bits.iter_mut().zip(&other_bits) {
-            for (a, b) in mine.iter_mut().zip(other) {
-                *a = 0.5 * (*a + b);
-            }
-        }
-        return Ok((experiments, bits, gradients, factor));
-    }
-    let mut parts = step_parts(batch, experiments, false);
+    let mut parts = step_parts(batch, experiments);
     if parts.len() == 1 {
         let all = parts.pop().ok_or("a batch's experiments")?;
         let targets = targets_of(scorer, &all)?;
@@ -3296,7 +3267,7 @@ pub fn fit_from(
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
             let key = training_key(settings.seed, b);
-            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key, settings.full_antithetic)?;
+            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key)?;
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
@@ -3338,8 +3309,7 @@ pub fn fit_from(
             }
             progress.step += 1;
             // The factor's scale: its square estimates the curvature per token of the tokens it
-            // sums (one antithetic half's, or the whole batch's under the full arm,
-            // `antithetic_step`).
+            // sums (one antithetic half's, `antithetic_step`).
             let factor_weight = weight * scored as f64 / factor.tokens as f64;
             let posterior_started = Instant::now();
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &prior_curvature, &ivon)?;
@@ -3605,7 +3575,7 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
         let batch = draw.batch(sequences)?;
         let experiments = scorer.experiments(draw, sequences)?;
         lap(1, &mut timed);
-        let (experiments, targets) = part_targets(scorer, &batch, experiments, settings.full_antithetic)?;
+        let (experiments, targets) = part_targets(scorer, &batch, experiments)?;
         lap(2, &mut timed);
         // One forward pass at the batch's sample, reversed twice: the divergence's gradient (in
         // bits) and a draw of the Gauss–Newton factor.
@@ -3717,7 +3687,7 @@ fn collection_divergence(
         let batch = draw.batch(sequences)?;
         preparing += started.elapsed().as_secs_f64();
         let started = Instant::now();
-        let (experiments, targets) = part_targets(scorer, &batch, experiments, settings.full_antithetic)?;
+        let (experiments, targets) = part_targets(scorer, &batch, experiments)?;
         targeting += started.elapsed().as_secs_f64();
         let started = Instant::now();
         let scored = scorer.evaluate_device(device_posterior, (&batch, &experiments), Some(key), &targets, (false, false))?.0;
@@ -4453,7 +4423,6 @@ mod tests {
             head_tile_rows: 64,
             epochs: None,
             families: Vec::new(),
-            full_antithetic: false,
             seed_bf16: false,
             train_bf16: false,
         }
@@ -4618,7 +4587,7 @@ mod tests {
             for (b, draw) in draws.iter().enumerate() {
                 let batch = draw.batch(&sequences).unwrap();
                 let experiments = scorer.experiments(draw, &sequences).unwrap();
-                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, training_key(settings.seed, b), false).unwrap();
+                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, training_key(settings.seed, b)).unwrap();
                 estimates.push(bits.iter().flatten().sum::<f64>());
             }
             estimates
@@ -4697,40 +4666,6 @@ mod tests {
         }
     }
 
-    /// The whole-batch antithetic arm (`Settings::full_antithetic`): the step's bits and gradient
-    /// are the means of the batch scored at the sample and at its antithetic twin, its factor the
-    /// first scoring's, over the batch's experiments in their order.
-    #[test]
-    fn the_whole_batch_antithetic_arm_averages_the_pair() {
-        let (native, layers, _, sequences) = tiny("library_full_antithetic", "gelu_tanh");
-        let explanation = explanation(&native, &layers).unwrap();
-        let (device, settings) = (Device::host(), settings());
-        let tokens = 2 * sequences.len() * 12;
-        let posterior = Posterior::new(&explanation, tokens).unwrap();
-        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, tokens as f64, None, 0).unwrap();
-        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
-        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
-        let (batch, experiments) = (draws[0].batch(&sequences).unwrap(), scorer.experiments(&draws[0], &sequences).unwrap());
-        let key = training_key(settings.seed, 0);
-        let (order, bits, gradients, factor) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments.clone(), key, true).unwrap();
-        assert_eq!(order, experiments);
-        let targets = scorer.experiments.targets(&batch, &experiments).unwrap();
-        let (plus_bits, plus, plus_factor) = scorer.evaluate_device(&device_posterior, (&batch, &experiments), Some(key), &targets, (true, true)).unwrap();
-        let (minus_bits, minus, _) = scorer.evaluate_device(&device_posterior, (&batch, &experiments), Some(key ^ gam_gpu::tensor::ANTITHETIC), &targets, (true, false)).unwrap();
-        assert!(plus_bits != minus_bits, "the twin is another sample");
-        for ((mean, a), b) in bits.iter().flatten().zip(plus_bits.iter().flatten()).zip(minus_bits.iter().flatten()) {
-            assert_eq!(*mean, 0.5 * (a + b));
-        }
-        assert_eq!(bits.iter().map(Vec::len).sum::<usize>(), plus_bits.iter().map(Vec::len).sum::<usize>());
-        assert!(!gradients.is_empty() && gradients.keys().eq(plus.keys()));
-        for (op, g) in &gradients {
-            let (g, a, b) = (device.download(g).unwrap(), device.download(&plus[op]).unwrap(), device.download(&minus[op]).unwrap());
-            let gap = g.iter().zip(a.iter().zip(&b)).fold(0.0_f64, |m, (x, (p, q))| m.max((x - 0.5 * (p + q)).abs() / (1.0 + x.abs())));
-            assert!(gap <= 1e-14, "operator {op}: {gap}");
-        }
-        assert_eq!(factor.tokens, plus_factor.unwrap().tokens);
-    }
-
     /// The half of a batch whose Gauss–Newton factor the step takes is drawn from the batch's key:
     /// over 4096 training keys the first half is drawn within four standard errors of half the
     /// time, and a step's factor is the drawn half's, bit for bit, scored at that half's own sample
@@ -4753,7 +4688,7 @@ mod tests {
         assert!(half > 0, "a batch of two halves");
         for wanted in [true, false] {
             let key = (0..).map(|b| training_key(settings.seed, b)).find(|k| factor_half(*k) == wanted).unwrap();
-            let (_, _, _, factor) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments.clone(), key, false).unwrap();
+            let (_, _, _, factor) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments.clone(), key).unwrap();
             let part: Vec<Experiment> = experiments.iter().filter(|e| (e.base < half) == wanted).cloned().collect();
             let targets = scorer.experiments.targets(&batch, &part).unwrap();
             let own = if wanted { key } else { key ^ gam_gpu::tensor::ANTITHETIC };
@@ -4765,16 +4700,6 @@ mod tests {
                 assert_eq!(device.download(u).unwrap(), device.download(&expected.gradient[op]).unwrap(), "operator {op}, the first half drawn: {wanted}");
             }
         }
-    }
-
-    /// The arm is read from configs: absent it is off.
-    #[test]
-    fn the_whole_batch_antithetic_arm_reads_from_configs() {
-        let base = serde_json::json!({"batch_sequences": 2, "seed": 3, "numeric_bytes": 1024, "head_tile_rows": 64});
-        assert!(!serde_json::from_value::<Settings>(base.clone()).unwrap().full_antithetic);
-        let mut on = base;
-        on["full_antithetic"] = true.into();
-        assert!(serde_json::from_value::<Settings>(on).unwrap().full_antithetic);
     }
 
     /// The fit's held-out subset scored on its batches made once (`held_out_on`) is the evaluation
