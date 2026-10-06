@@ -356,3 +356,87 @@ fn cuda_bfloat16_terms_match_its_f32_sample() {
     fit.reparameterize(&mut single, (&mean, &log_sd), (7, 3)).unwrap();
     check_terms(&fit, (&m, &s), &fit.download(&single).unwrap(), &[1, 2, 3, 1]);
 }
+
+/// `group_curvature` and `group_code_length` of the case on `fit` (sums on `wide`): the curvature
+/// rows of the case's factor at its posterior, and in row 1 of 2 the code length of its groups
+/// (groups 4, removed, and 6 out of the explanation; each group's starting variance `2^-k` times
+/// its variance on the host, so that the scale's exponent is the integer `k` and not near a
+/// rounding boundary).
+fn removal_sums(fit: &Device, wide: &Device, initial: &[f64]) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
+    let c = case();
+    let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
+    let groups = fit.upload_indices(&c.groups).unwrap();
+    let mut curvature = wide.zeros(c.count, 3).unwrap();
+    fit.group_curvature((&up(&c.factor), &up(&c.mean), &up(&c.log_sd)), &groups, &mut curvature).unwrap();
+    let mut moments = wide.zeros(c.count, 3).unwrap();
+    fit.group_moments((&up(&c.mean), &up(&c.log_sd)), &groups, &mut moments).unwrap();
+    let (mut variance, mut divergence) = (wide.zeros(c.count, 1).unwrap(), wide.zeros(c.count, 1).unwrap());
+    wide.group_divergence(&mut moments, &mut variance, &mut divergence).unwrap();
+    let column = |v: Vec<f64>| wide.upload_vec(v.len(), 1, v).unwrap();
+    let weight = column((0..c.count).map(|g| if g == 4 || g == 6 { 0.0 } else { 1.0 }).collect());
+    let constant = column((0..c.count).map(|g| 0.5 * (g as f64 + 2.0).ln()).collect());
+    let mut lengths = wide.zeros(2, 3).unwrap();
+    wide.group_code_length((&divergence, &variance), (&weight, &constant, &column(initial.to_vec())), &mut lengths, 1).unwrap();
+    (wide.download(&curvature).unwrap(), wide.download(&lengths).unwrap(), wide.download(&variance).unwrap())
+}
+
+fn removal_sums_against_host(fit: &Device, wide: &Device) {
+    let host = Device::host();
+    let count = case().count;
+    let (_, _, variance) = removal_sums(&host, &host, &vec![1.0; count]);
+    let initial: Vec<f64> = (0..count).map(|g| if variance[(g, 0)] > 0.0 { variance[(g, 0)] * 2f64.powi(-(g as i32 % 5) + 2) } else { 1.0 }).collect();
+    let (curvature, lengths, _) = removal_sums(fit, wide, &initial);
+    let (expected_curvature, expected_lengths, _) = removal_sums(&host, &host, &initial);
+    let sum_band = CHAIN + 40.0 * U / (1.0 - 40.0 * U);
+    // A dot product u_G . mu_G cancels terms as large as its summed magnitudes, at most 40 entries
+    // of the largest magnitude.
+    close("curvature sums", &curvature, &expected_curvature, 40.0 * sum_band);
+    assert_eq!(expected_lengths[(0, 0)], 0.0, "row 0 untouched");
+    assert_eq!(expected_lengths[(1, 0)], 6.0, "six groups in the explanation");
+    // The divergences' cancellation (`n |ln v| + |Σ 2s|`, below 40 x 10 per group) bounds the code
+    // length's difference; the scales' bits are integers and equal.
+    let bound = sum_band * 40.0 * 10.0 * count as f64;
+    assert!((lengths[(1, 1)] - expected_lengths[(1, 1)]).abs() <= bound, "code length {} against {}", lengths[(1, 1)], expected_lengths[(1, 1)]);
+}
+
+#[test]
+fn removal_sums_on_the_host_match_their_formulas() {
+    let host = Device::host();
+    let c = case();
+    let (_, _, variance) = removal_sums(&host, &host, &vec![1.0; c.count]);
+    let initial: Vec<f64> = (0..c.count).map(|g| if variance[(g, 0)] > 0.0 { variance[(g, 0)] * 2f64.powi(3) } else { 1.0 }).collect();
+    let (curvature, lengths, _) = removal_sums(&host, &host, &initial);
+    for g in 0..c.count {
+        let entries: Vec<usize> = (0..c.groups.len()).filter(|i| c.groups[*i] as usize == g).collect();
+        let at = |a: &Array2<f64>, i: usize| a[(i / a.ncols(), i % a.ncols())];
+        let live: Vec<usize> = entries.iter().copied().filter(|i| at(&c.log_sd, *i) != f64::NEG_INFINITY).collect();
+        let dot: f64 = live.iter().map(|i| at(&c.factor, *i) * at(&c.mean, *i)).sum();
+        let noise: f64 = live.iter().map(|i| at(&c.factor, *i).powi(2) * (2.0 * at(&c.log_sd, *i)).exp()).sum();
+        assert_eq!(curvature[(g, 0)], live.len() as f64);
+        assert!((curvature[(g, 1)] - dot).abs() <= 1e-12 * dot.abs().max(1.0) && (curvature[(g, 2)] - noise).abs() <= 1e-12 * noise, "group {g}");
+    }
+    // Every scale is 2^-3 of its start: the exponent -3, zigzag 5, plus one 6, an Elias delta
+    // codeword of 2 + 2 x 1 + 1 = 5 bits.
+    let mut moments = host.zeros(c.count, 3).unwrap();
+    host.group_moments((&host.upload(c.mean.view()).unwrap(), &host.upload(c.log_sd.view()).unwrap()), &host.upload_indices(&c.groups).unwrap(), &mut moments).unwrap();
+    let (mut v, mut d) = (host.zeros(c.count, 1).unwrap(), host.zeros(c.count, 1).unwrap());
+    host.group_divergence(&mut moments, &mut v, &mut d).unwrap();
+    let d = host.download(&d).unwrap();
+    let expected: f64 = (0..c.count).filter(|g| *g != 4 && *g != 6).map(|g| d[(g, 0)] + 0.5 * (g as f64 + 2.0).ln() + 5.0 * std::f64::consts::LN_2).sum();
+    assert!((lengths[(1, 1)] - expected).abs() <= 1e-12 * expected.abs(), "{} against {expected}", lengths[(1, 1)]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn removal_sums_on_the_apple_gpu_match_the_host() {
+    let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
+    removal_sums_against_host(&metal, &metal);
+}
+
+#[test]
+fn removal_sums_on_cuda_match_the_host() {
+    let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
+    let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
+    removal_sums_against_host(&narrow, &wide);
+    removal_sums_against_host(&wide, &wide);
+}
