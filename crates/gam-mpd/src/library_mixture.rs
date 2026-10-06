@@ -335,9 +335,10 @@ struct Layout {
     /// The sources' count (targets, then pairs, then parameter pairs) and the destination rows'.
     sources: usize,
     destinations: usize,
-    /// Per slot `m`, the `m`-th source of each destination with more than `m` (destinations in
-    /// decreasing count, so the slot's destinations are the first).
-    slots: Vec<Indices>,
+    /// The sums of each destination's sources as products: per run of destinations, its first and
+    /// the 0/1 matrix (destinations by sources) whose row holds a 1 at each of its sources, built
+    /// once per layout; a run holds at most `SUM_ENTRIES` entries.
+    sums: Vec<(usize, Tensor)>,
     /// Per segment with a destination, the place of each of its rows among the destinations
     /// (`destinations` for none).
     scatter: Vec<(usize, Indices)>,
@@ -345,6 +346,9 @@ struct Layout {
     ones_row: Tensor,
     ones_column: Tensor,
 }
+
+/// The most entries of one 0/1 summing matrix of a [`Layout`] (a bound on device memory).
+const SUM_ENTRIES: usize = 1 << 25;
 
 /// [`Layout`] held by a [`Mixture`]: not saved, and rebuilt by a copy.
 #[derive(Default)]
@@ -1482,8 +1486,21 @@ impl Mixture {
         }
         let mut order: Vec<(usize, Vec<usize>)> = incoming.into_iter().collect();
         order.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
-        let most = order.first().map_or(0, |o| o.1.len());
-        let slots = (0..most).map(|m| indices(&order.iter().take_while(|o| o.1.len() > m).map(|o| o.1[m]).collect::<Vec<_>>())).collect::<Result<Vec<_>, _>>()?;
+        let source_count = first_rows.len() + pairs + parameter_pairs.len();
+        let run = (SUM_ENTRIES / source_count.max(1)).max(1);
+        let sums = order
+            .chunks(run)
+            .enumerate()
+            .map(|(c, part)| {
+                let mut ones = Array2::zeros((part.len(), source_count));
+                for (k, (_, sources)) in part.iter().enumerate() {
+                    for &j in sources {
+                        ones[[k, j]] = 1.0;
+                    }
+                }
+                Ok((c * run, upload(&ones)?))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let place: BTreeMap<usize, usize> = order.iter().enumerate().map(|(k, o)| (o.0, k)).collect();
         let destinations = order.len();
         let mut scatter = Vec::new();
@@ -1509,7 +1526,7 @@ impl Mixture {
             parameter_place,
             sources: first_rows.len() + pairs + parameter_pairs.len(),
             destinations,
-            slots,
+            sums,
             scatter,
             eye: upload(&Array2::eye(d))?,
             ones_row: upload(&Array2::ones((1, d)))?,
@@ -1606,10 +1623,10 @@ impl Mixture {
         device.hadamard(&mut weighted, &spread(&device.upload_vec(layout.sources, 1, coefficients).map_err(error)?, layout.sources)?, &sources, false).map_err(error)?;
         drop(sources);
         let mut rows = device.zeros(layout.destinations + 1, d).map_err(error)?;
-        for slot in &layout.slots {
-            let mut prefix = device.rows_of(&rows, 0, slot.len()).map_err(error)?;
-            device.axpy(&mut prefix, 1.0, &device.gather_rows(&weighted, slot).map_err(error)?).map_err(error)?;
-            device.set_rows(&mut rows, 0, &prefix).map_err(error)?;
+        for (first, ones) in &layout.sums {
+            let mut summed = device.zeros(ones.rows(), d).map_err(error)?;
+            device.gemm(&mut summed, 1.0, ones, Op::N, &weighted, Op::N, 0.0, arithmetic).map_err(error)?;
+            device.set_rows(&mut rows, *first, &summed).map_err(error)?;
         }
         let mut gradient = BTreeMap::new();
         for (s, at) in &layout.scatter {
@@ -1677,7 +1694,7 @@ impl PriorTerm for Mixture {
             }
             let (nats, on_device) = self.blocks_on_device(device, device_posterior, key, &mut learned)?;
             if let Some(layout) = &self.plan.0 {
-                log::debug!("mixture term: {} key-value targets on the host in {host_seconds:.4} s; {} block targets, {} pairs, {} table rows, {} slots on the device in {:.4} s", heads.len(), blocks.len(), layout.pairs, layout.rows, layout.slots.len(), timed.elapsed().as_secs_f64() - host_seconds);
+                log::debug!("mixture term: {} key-value targets on the host in {host_seconds:.4} s; {} block targets, {} pairs, {} table rows, {} summing products on the device in {:.4} s", heads.len(), blocks.len(), layout.pairs, layout.rows, layout.sums.len(), timed.elapsed().as_secs_f64() - host_seconds);
             }
             value += nats;
             for (i, g) in on_device {
