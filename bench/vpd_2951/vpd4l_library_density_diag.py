@@ -195,3 +195,60 @@ for l in range(L):
 res['kl_mean_all_A_recheck'] = kl_bits(lambda: PA)
 print('recheck mean A', res['kl_mean_all_A_recheck'], flush=True)
 json.dump(res, open(out_path, 'w'), indent=1)
+
+# Counterfactual: B with its extra firing removed. Per feature, a threshold theta_i on B's own inputs so
+# that it fires as often as under A on A's own inputs; activations keep their values above theta_i
+# (a mask, not a shift), so only the firing count changes. KL at the mean and at weight samples.
+def masked_params(ops, l, theta, rng=None):
+    g, c, u, b = params(ops, l, rng)
+    return (g, c, u, b, theta)
+
+
+@torch.no_grad()
+def run_masked(ids, lp):
+    Bn, Tn = ids.shape
+    x = T.wte[ids]
+    for i in range(L):
+        h = rms(x, T.norms[2 * i], eps)
+        q = T._rope((h @ W(i, 'q_proj').T).view(Bn, Tn, H, hd).transpose(1, 2), Tn)
+        k = T._rope((h @ W(i, 'k_proj').T).view(Bn, Tn, H, hd).transpose(1, 2), Tn)
+        v = (h @ W(i, 'v_proj').T).view(Bn, Tn, H, hd).transpose(1, 2)
+        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+        x = x + y.transpose(1, 2).reshape(Bn, Tn, -1) @ W(i, 'o_proj').T
+        hn = rms(x, T.norms[2 * i + 1], eps)
+        m = gelu_tanh(hn @ W(i, 'c_fc').T) @ W(i, 'down_proj').T
+        g, c, ud, b, theta = lp[i]
+        z = hn @ g.T + c
+        a = torch.where(z > theta, torch.relu(z), torch.zeros_like(z))
+        t = a @ ud + b
+        x = x + torch.cat([m[:, :1], t[:, 1:]], 1)
+    return rms(x, T.ln_f, eps) @ T.wte.T
+
+
+def kl_masked(lp_fn):
+    tot, n = 0.0, 0
+    for b in range(0, 32, 8):
+        ids = rows[b:b + 8]
+        lm, _ = run(ids, [None] * L)
+        lp = run_masked(ids, lp_fn())
+        pm = lm.softmax(-1)
+        tot += float((pm * (lm.log_softmax(-1) - lp.log_softmax(-1))).sum() / LN2); n += lm.shape[0] * lm.shape[1]
+    return tot / n
+
+
+thetas = []
+for l in range(L):
+    gA, cA, _, _ = PA[l]
+    gB, cB, _, _ = PB[l]
+    fA = freq(XA[l], gA, cA)
+    zB = (XB[l] @ gB.T + cB).cpu()
+    zs = zB.sort(0).values
+    idx = ((1 - fA.cpu()) * (zs.shape[0] - 1)).round().long().clamp(0, zs.shape[0] - 1)
+    th = zs.gather(0, idx[None]).squeeze(0)
+    th = torch.where(fA.cpu() > 0, th.clamp(min=0), zs[-1] + 1.0)
+    thetas.append(th.to(dev))
+res['sparse_B_kl_mean'] = kl_masked(lambda: [PB[l] + (thetas[l],) for l in range(L)])
+res['sparse_B_kl_sample'] = float(np.mean([kl_masked(lambda: [params(B, l, rng) + (thetas[l],) for l in range(L)]) for _ in range(2)]))
+res['dense_B_kl_mean_check'] = kl_masked(lambda: [PB[l] + (torch.zeros(PB[l][0].shape[0], device=dev),) for l in range(L)])
+print('B with A firing counts: KL mean', res['sparse_B_kl_mean'], 'sample', res['sparse_B_kl_sample'], '| B as is (check)', res['dense_B_kl_mean_check'], flush=True)
+json.dump(res, open(out_path, 'w'), indent=1)
