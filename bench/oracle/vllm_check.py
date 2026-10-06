@@ -31,8 +31,9 @@ def main():
     from vllm import LLM, SamplingParams
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    prompts = [tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=False, tokenize=True) for p in PROMPTS]
-    prompts = [p["input_ids"] if isinstance(p, dict) else list(p) for p in prompts]
+    # The template as text, then token ids (transformers 5 returns a BatchEncoding from tokenize=True).
+    texts = [tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=False, tokenize=False) for p in PROMPTS]
+    prompts = [tok.encode(t, add_special_tokens=False) for t in texts]
     llm = LLM(model=args.model, dtype="bfloat16", gpu_memory_utilization=0.45, enable_prefix_caching=True, seed=0)
     outs = llm.generate([{"prompt_token_ids": p} for p in prompts], SamplingParams(max_tokens=args.tokens, temperature=0.0, prompt_logprobs=0), use_tqdm=False)
     v_tokens = [list(o.outputs[0].token_ids) for o in outs]
