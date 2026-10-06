@@ -1222,6 +1222,10 @@ if [ -n "${RP_PYENV:-}" ]; then
     gb=$(sed -nE '1s/^# installed size: ([0-9]+) GB.*/\1/p' <<< "$PYENV_REQS")
     [ -n "$gb" ] || { echo "rp-run: bench/runpod/pyenv/$RP_PYENV.txt must state its installed size on its first line (# installed size: N GB)" >&2; exit 2; }
     pyenv_kb=$(( gb * 1048576 ))
+    # A set whose torch is built for a newer CUDA than the image's takes only hosts whose driver
+    # supports that CUDA ("# cuda: X.Y" in its first lines).
+    need=$(sed -nE '1,5s/^# cuda: ([0-9]+[.][0-9]+).*/\1/p' <<< "$PYENV_REQS")
+    [ -z "$need" ] || CUDA_OK=$(jq -c --arg t "$need" 'map(select((split(".") | map(tonumber)) >= ($t | split(".") | map(tonumber))))' <<< "$CUDA_OK")
     # One environment per pinned set, shared by the runs on a pod.
     PYENV_DIR=/workspace/pyenv/$(shasum <<< "$PYENV_REQS" | cut -c1-12)
 fi
