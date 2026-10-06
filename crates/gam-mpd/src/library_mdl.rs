@@ -1893,24 +1893,35 @@ fn antithetic_step(
     Ok((first.into_iter().chain(second).collect(), bits, gradients, factor))
 }
 
-/// The bits of `experiments` on `batch` at the iterate's weight samples of the step `key`, as
-/// [`antithetic_step`] draws them (the first half of the bases at `key`, the second at its
-/// negation), with no gradient: a line step's trial (`DevicePosterior::finish_line`).
-fn line_trial_bits(scorer: &mut Scorer, posterior: &DevicePosterior, batch: &Batch, experiments: &[Experiment], (key, one_sample): (u64, bool)) -> Result<f64, String> {
+/// A line step's measurement: the bits of `experiments` on `batch` at the iterate's weight samples
+/// of `key`, as [`antithetic_step`] draws them (the first half of the bases at `key`, the second
+/// at its negation, or all at `key` with `one_sample`), with no gradient, at `η = 0, η₀, 2η₀`
+/// along the pending step's direction (`DevicePosterior::place_line`, `finish_line`). `M`'s
+/// targets are made once per half for the three.
+fn line_measurement(
+    scorer: &mut Scorer,
+    posterior: &mut DevicePosterior,
+    (batch, experiments): (&Batch, &[Experiment]),
+    (key, one_sample): (u64, bool),
+    trial: f64,
+) -> Result<[f64; 3], String> {
     let half = batch.base.len() / 2;
     let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.iter().cloned().partition(|e| e.base < half);
     let halves = if one_sample || first.is_empty() || second.is_empty() { vec![(experiments.to_vec(), key)] } else { vec![(first, key), (second, key ^ gam_gpu::tensor::ANTITHETIC)] };
-    let mut total = 0.0;
-    for (part, seed) in halves {
-        let targets = scorer.experiments.targets(batch, &part)?;
-        posterior.iterate_into(scorer.experiments.explanation_mut(), seed)?;
-        let evaluation = scorer.experiments.evaluate_labelled(batch, &part, Some(&targets), false, None)?;
-        if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
-            return Err("nonfinite explanation divergence".into());
+    let targets = halves.iter().map(|(part, _)| scorer.experiments.targets(batch, part)).collect::<Result<Vec<_>, _>>()?;
+    let mut values = [0.0; 3];
+    for (k, value) in values.iter_mut().enumerate() {
+        posterior.place_line(trial * k as f64)?;
+        for ((part, seed), targets) in halves.iter().zip(&targets) {
+            posterior.iterate_into(scorer.experiments.explanation_mut(), *seed)?;
+            let evaluation = scorer.experiments.evaluate_labelled(batch, part, Some(targets), false, None)?;
+            if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
+                return Err("nonfinite explanation divergence".into());
+            }
+            *value += evaluation.bits.iter().flatten().sum::<f64>();
         }
-        total += evaluation.bits.iter().flatten().sum::<f64>();
     }
-    Ok(total)
+    Ok(values)
 }
 
 /// A running mean of bits over scored tokens.
@@ -3108,12 +3119,8 @@ pub fn fit_from(
                 // 2η₀ (`DevicePosterior::finish_line`).
                 let other = (b + 1) % draws.len();
                 let (other_batch, other_experiments) = (draws[other].batch(sequences)?, scorer.experiments(&draws[other], sequences)?);
-                let mut values = [0.0; 3];
-                for (k, value) in values.iter_mut().enumerate() {
-                    device_posterior.place_line(trial * k as f64)?;
-                    *value = weight * LN_2 * line_trial_bits(&mut scorer, &device_posterior, &other_batch, &other_experiments, (training_key(settings.seed, other), settings.one_sample))?;
-                }
-                let line = device_posterior.finish_line(values, ivon.beta2)?;
+                let bits = line_measurement(&mut scorer, &mut device_posterior, (&other_batch, &other_experiments), (training_key(settings.seed, other), settings.one_sample), trial)?;
+                let line = device_posterior.finish_line(bits.map(|b| weight * LN_2 * b), ivon.beta2)?;
                 log::info!(
                     "library line step {epoch}.{b}: η {:.4e} (trial {trial:.4e}); data slope down d per token: measured {:.4e}, the step's own gradient {:.4e}; data curvature along d: measured {:.4e}, one Gauss–Newton draw {:.4e}, diagonal Σ h d² {:.4e}",
                     line.eta, line.slope, line.own_slope, line.measured, line.draw, line.diagonal
