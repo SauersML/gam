@@ -2184,7 +2184,7 @@ impl Device {
 
     /// [`Device::reparameterize`] written into the block of `out` at `(row, col)`: entry `(r, c)`
     /// of the operator's sample goes to `out[(row + r, col + c)]`, so an operator's sample lands
-    /// straight in a stacked operand (a fused group's rows or columns, a decoder's rows) with no
+    /// straight in a stacked operand (a fused group's rows or columns) with no
     /// copy. The draws are the operator's own (`ε` of its entry `i = r · cols + c`), the same
     /// whether it is written whole or into a block. `out` in f32, or bfloat16 beside f32 masters,
     /// on CUDA; in f32 on the Apple GPU; in float64 on the host.
@@ -2483,8 +2483,8 @@ impl Device {
         }
     }
 
-    /// Rows `ranges` of `t` (f32 on CUDA), stacked in order: a decoder call's rows of its stream
-    /// buffer, on CUDA in one launch per [`ROW_RANGES`] ranges with the ranges passed by value.
+    /// Rows `ranges` of `t` (f32 on CUDA), stacked in order: an interchange block call's rows of its
+    /// stream buffer, on CUDA in one launch per [`ROW_RANGES`] ranges with the ranges passed by value.
     pub fn gather_ranges(&self, t: &Tensor, ranges: &[std::ops::Range<usize>]) -> Result<Tensor, GpuError> {
         if ranges.iter().any(|r| r.end > t.rows) {
             return Err(shape(format!("rows {ranges:?} of {} rows", t.rows)));
@@ -3819,7 +3819,8 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
         /// The f32 twins, compiled on first use, and the functions loaded from them.
         module32: std::sync::OnceLock<Arc<CudaModule>>,
         functions32: std::sync::Mutex<HashMap<&'static str, CudaFunction>>,
-        /// The decoder kernels, compiled on first use, and the functions loaded from them.
+        /// `decoder.cu`'s kernels (the split products' operand terms, the row moves), compiled on first
+        /// use, and the functions loaded from them.
         module_decoder: std::sync::OnceLock<Arc<CudaModule>>,
         functions_decoder: std::sync::Mutex<HashMap<&'static str, CudaFunction>>,
         checked_interval_module: crate::device_cache::PtxModuleCache,
@@ -4529,7 +4530,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             Ok((Some(first), Some(rest)))
         }
 
-        /// Decoder kernel `name` (`decoder.cu`), its module compiled on first use.
+        /// Kernel `name` of `decoder.cu`, its module compiled on first use.
         fn decoder(&self, name: &'static str) -> Result<CudaFunction, GpuError> {
             let mut loaded = self.functions_decoder.lock().map_err(|_| shape("poisoned decoder kernel table".to_string()))?;
             if let Some(f) = loaded.get(name) {
