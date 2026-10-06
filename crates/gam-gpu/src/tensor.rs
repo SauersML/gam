@@ -372,8 +372,11 @@ pub struct GroupMap {
     rows: usize,
     cols: usize,
     /// The segments' `S + 1` offsets into the members, the `S` segments' groups, then the members
-    /// (the axis's coordinates, by group and within one in ascending order).
+    /// (the axis's coordinates, by group and within one in ascending order). Only the CUDA and
+    /// Metal kernels read the segments, so they exist only for Linux and macOS.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     layout: Indices,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     segments: usize,
 }
 
@@ -809,21 +812,34 @@ impl Device {
             (GroupAxis::Entries, ids.to_vec())
         };
         // The segments: the coordinates by group id, each group's in ascending order.
-        let index = |k: usize| u32::try_from(k).map_err(|_| shape(format!("a group map of {k} coordinates")));
-        let mut members = (0..compact.len()).map(index).collect::<Result<Vec<u32>, _>>()?;
-        members.sort_by_key(|&k| compact[k as usize]);
-        let (mut offsets, mut groups) = (Vec::new(), Vec::new());
-        for (k, &m) in members.iter().enumerate() {
-            let g = compact[m as usize];
-            if groups.last() != Some(&g) {
-                offsets.push(index(k)?);
-                groups.push(g);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let (layout, segments) = {
+            let index = |k: usize| u32::try_from(k).map_err(|_| shape(format!("a group map of {k} coordinates")));
+            let mut members = (0..compact.len()).map(index).collect::<Result<Vec<u32>, _>>()?;
+            members.sort_by_key(|&k| compact[k as usize]);
+            let (mut offsets, mut groups) = (Vec::new(), Vec::new());
+            for (k, &m) in members.iter().enumerate() {
+                let g = compact[m as usize];
+                if groups.last() != Some(&g) {
+                    offsets.push(index(k)?);
+                    groups.push(g);
+                }
             }
-        }
-        offsets.push(index(members.len())?);
-        let segments = groups.len();
-        let layout: Vec<u32> = offsets.into_iter().chain(groups).chain(members).collect();
-        Ok(GroupMap { ids: self.upload_indices(&compact)?, axis, rows, cols, layout: self.upload_indices(&layout)?, segments })
+            offsets.push(index(members.len())?);
+            let segments = groups.len();
+            let layout: Vec<u32> = offsets.into_iter().chain(groups).chain(members).collect();
+            (self.upload_indices(&layout)?, segments)
+        };
+        Ok(GroupMap {
+            ids: self.upload_indices(&compact)?,
+            axis,
+            rows,
+            cols,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            layout,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            segments,
+        })
     }
 
     pub fn upload_indices(&self, values: &[u32]) -> Result<Indices, GpuError> {
