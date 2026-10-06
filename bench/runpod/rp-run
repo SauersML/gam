@@ -2186,7 +2186,7 @@ PROBE_S=3
 # environment installing at the same time shares) and its clock (s).
 probe_bytes() {
     on_pod "date +%s.%N; cat /proc/net/dev" < /dev/null |
-        awk 'NR == 1 { t = $1; next } /:/ { sub(/^ +/, ""); split($0, a, /: */); split(a[2], f, / +/); if (a[1] != "lo") s += f[1] } END { print s + 0, t + 0 }'
+        awk 'NR == 1 { t = $1; next } /:/ { sub(/^ +/, ""); split($0, a, /: */); split(a[2], f, / +/); if (a[1] != "lo") s += f[1] } END { printf "%.0f %.3f\n", s, t }'
 }
 # Exit 0 when samples A and B (probe_bytes lines) show the inputs left would take longer than a new
 # pod; prints the rate (MB/s) and the MB still to come.
