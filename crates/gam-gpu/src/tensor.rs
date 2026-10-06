@@ -4458,7 +4458,8 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
 
         /// `count` values of `source` from `offset`, rounded to bfloat16 (`to_bf16`).
         fn round_half(&self, source: &CudaSlice<f32>, offset: usize, count: usize) -> Result<CudaSlice<u16>, GpuError> {
-            let mut out = self.stream.alloc_zeros::<u16>(count.max(1)).gpu_ctx("tensor bf16 alloc")?;
+            // SAFETY: `to_bf16` writes all `count` values before any is read (none when it is 0).
+            let mut out = unsafe { self.stream.alloc::<u16>(count.max(1)) }.gpu_ctx("tensor bf16 alloc")?;
             if count > 0 {
                 let n = count as u64;
                 let f = self.kernel("to_bf16", Storage::F32)?;
@@ -5434,14 +5435,18 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 None => &no_uniforms,
             };
             let (drawn, chunks32) = (i32::from(draw.is_some()), chunks as u32);
-            let mut logits = self.zeros32(rows * chunk)?;
-            let mut largest = self.zeros32(rows)?;
+            // SAFETY: each chunk's product writes its logits whole (β = 0) before `head_chunk` reads
+            // them, and `fill` writes every row's largest before any is read.
+            let mut logits = unsafe { self.stream.alloc::<f32>((rows * chunk).max(1)) }.gpu_ctx("tensor alloc")?;
+            // SAFETY: as `logits`.
+            let mut largest = unsafe { self.stream.alloc::<f32>(rows.max(1)) }.gpu_ctx("tensor alloc")?;
             let (n_rows, lowest) = (rows as u64, f64::NEG_INFINITY);
             let fill = self.kernel("fill", Storage::F32)?;
             // SAFETY: `fill(n, v, x)` writes n floats.
             unsafe { self.stream.launch_builder(&fill).arg(&n_rows).arg(&lowest).arg(&mut largest).launch(cfg_elements(n_rows)) }.gpu_ctx("tensor fill")?;
             let mut sums = self.zeros(rows)?;
-            let mut factor = self.zeros32(rows)?;
+            // SAFETY: each chunk's `head_chunk` writes every row's factor before `scale_rows` reads it.
+            let mut factor = unsafe { self.stream.alloc::<f32>(rows.max(1)) }.gpu_ctx("tensor alloc")?;
             let (rows32, width32) = (u32::try_from(rows).map_err(|_| shape("head rows exceed u32".to_string()))?, width as u32);
             let want = i32::from(expected.is_some());
             let (t, n_op) = (cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N);
