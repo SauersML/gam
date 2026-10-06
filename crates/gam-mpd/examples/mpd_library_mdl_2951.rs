@@ -2,7 +2,7 @@
 //! description length on interchange experiments (`gam_mpd::library_mdl`, #2951), on an export's
 //! token rows, and scored on held-out rows after every epoch.
 //!
-//! MODEL SETTINGS.json OUT host|gpu
+//! MODEL SETTINGS.json OUT host|gpu [artifact]
 //!
 //! `MODEL` is an engine export (`export.json` and its token rows), or a Hugging Face checkpoint
 //! directory (`config.json` and its safetensors, one file or sharded) whose token rows come from
@@ -16,7 +16,9 @@
 //! first `training_sequences` of the others, in order. On a checkpoint, `held_out` is a range of
 //! the held-out file's rows and the training sequences are the training file's first rows. `gpu` is the single-precision device (CUDA in f32 storage, or the Apple GPU). The
 //! fit is checkpointed in `OUT/checkpoint.bin` after every epoch, with its trajectory readable in
-//! `OUT/checkpoint.json`; rerunning the same command resumes it.
+//! `OUT/checkpoint.json`; rerunning the same command resumes it. With `artifact`, nothing is
+//! fitted: the explanation the checkpoint holds, at its posterior mean with the device's literals,
+//! is written to `OUT/checkpoint.artifact.bin` (a running fit's explanation, read where it is wanted).
 //!
 //! With `blocks` (block `2l` layer `l`'s attention, `2l + 1` its MLP), the explanation is of those
 //! blocks alone and `M` everywhere else (`library_mdl::scoped`): the fast loop for comparing method
@@ -24,7 +26,7 @@
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     engine::{log_to_stderr, sha256},
-    import::{hugging_face_language_model, import_language_model},
+    import::{hugging_face_language_model, hugging_face_language_model_prefix, import_language_model},
     library_mdl,
     operator_program::{OperatorProgram, SlotValues},
     run_check::{layer_nodes, split_sites},
@@ -50,6 +52,11 @@ struct Settings {
     /// A Hugging Face checkpoint's token rows (absent for an engine export, which holds its own).
     #[serde(default)]
     windows: Option<Windows>,
+    /// A Hugging Face checkpoint cut to its first `layers` blocks, then its final norm and head
+    /// (`import::hugging_face_language_model_prefix`): the same fit on a smaller model of the same
+    /// tokens, for measuring per-layer costs. All blocks when absent.
+    #[serde(default)]
+    layers: Option<usize>,
     fit: library_mdl::Settings,
 }
 
@@ -98,8 +105,10 @@ fn save(path: &Path, value: &Value) -> Result<(), String> {
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [export, settings_path, out, mode] = &args[..] else {
-        return Err("EXPORT SETTINGS.json OUT host|gpu".into());
+    let (export, settings_path, out, mode, read_artifact) = match &args[..] {
+        [export, settings, out, mode] => (export, settings, out, mode, false),
+        [export, settings, out, mode, artifact] if artifact == "artifact" => (export, settings, out, mode, true),
+        _ => return Err("EXPORT SETTINGS.json OUT host|gpu [artifact]".into()),
     };
     let (export, settings_path, out) = (Path::new(export), Path::new(settings_path), Path::new(out));
     let settings: Settings = serde_json::from_slice(&std::fs::read(settings_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -113,7 +122,7 @@ fn main() -> Result<(), String> {
         return Err("held-out sequences must be a nonempty range, and training sequences nonempty".into());
     }
     let checkpoint = out.join("checkpoint.bin");
-    if out.exists() && !checkpoint.exists() {
+    if (out.exists() || read_artifact) && !checkpoint.exists() {
         return Err("a fresh output directory, or one holding this fit's checkpoint, required".into());
     }
     let device = match mode.as_str() {
@@ -126,13 +135,16 @@ fn main() -> Result<(), String> {
     let (program, layer_count, train, held_out): (OperatorProgram, usize, Vec<Vec<u32>>, Vec<Vec<u32>>) = if checkpoint_model {
         let windows = settings.windows.as_ref().ok_or("a Hugging Face checkpoint needs the settings' windows")?;
         let text = std::fs::read_to_string(export.join("config.json")).map_err(|e| e.to_string())?;
-        let layers = serde_json::from_str::<Value>(&text).map_err(|e| e.to_string())?["num_hidden_layers"].as_u64().ok_or("num_hidden_layers")? as usize;
-        let (program, _) = hugging_face_language_model(export, 0..layers)?;
+        let all = serde_json::from_str::<Value>(&text).map_err(|e| e.to_string())?["num_hidden_layers"].as_u64().ok_or("num_hidden_layers")? as usize;
+        let (program, layers) = match settings.layers {
+            Some(k) => (hugging_face_language_model_prefix(export, k)?.0, k),
+            None => (hugging_face_language_model(export, 0..all)?.0, all),
+        };
         let held_out = rows(&windows.held_out, end, settings.context)?[first..].to_vec();
         (program, layers, rows(&windows.training, settings.training_sequences, settings.context)?, held_out)
     } else {
-        if settings.windows.is_some() {
-            return Err("an engine export holds its own token rows; windows are for a Hugging Face checkpoint".into());
+        if settings.windows.is_some() || settings.layers.is_some() {
+            return Err("an engine export holds its own token rows and blocks; windows and layers are for a Hugging Face checkpoint".into());
         }
         // The rows to import: the held-out range and the training sequences around it.
         let count = end.max(settings.training_sequences + if settings.training_sequences > first { end - first } else { 0 });
@@ -150,6 +162,8 @@ fn main() -> Result<(), String> {
     }
     let held_out = &held_out[..];
     let native = split_sites(&program)?;
+    // The imported program's operators the split replaced are not read again.
+    drop(program);
     let layers = layer_nodes(&native, layer_count)?;
     let explanation = library_mdl::explanation(&native, &layers)?;
     let explanation = match &settings.blocks {
@@ -161,6 +175,11 @@ fn main() -> Result<(), String> {
     // parameters) before anything is written.
     let identity = library_mdl::identity(&settings.export_sha256, &native, &explanation, &train, held_out);
     library_mdl::check_checkpoint(&checkpoint, &identity)?;
+    if read_artifact {
+        let artifact = library_mdl::checkpoint_artifact(&explanation, &checkpoint, library_mdl::Literals::of(&device))?;
+        artifact.validate_coverage(&native)?;
+        return std::fs::write(out.join("checkpoint.artifact.bin"), artifact.to_bytes()?).map_err(|e| e.to_string());
+    }
     let provenance = json!({
         "export": export.display().to_string(),
         "export_sha256": settings.export_sha256,
@@ -173,6 +192,7 @@ fn main() -> Result<(), String> {
         "context": settings.context,
         "groups": explanation.groups.len(),
         "blocks": settings.blocks,
+        "layers": settings.layers,
         "identity": identity,
     });
     log::info!("library run: {provenance}");

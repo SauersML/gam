@@ -694,11 +694,23 @@ impl DevicePosterior {
     /// curvature estimate and the gradient's second moment (every operator's alike), in which a
     /// checkpoint keeps them.
     #[must_use]
-    pub fn storages(&self) -> [Storage; 5] {
+    pub fn storages(&self) -> [Storage; 6] {
         match (self.mean.first(), self.log_sd.first(), self.moments.first()) {
-            (Some(mean), Some(log_sd), Some([momentum, curvature, power])) => [mean.storage(), log_sd.storage(), momentum.storage(), curvature.storage(), power.storage()],
-            _ => [self.fitting.storage(); 5],
+            (Some(mean), Some(log_sd), Some([momentum, curvature, power])) => [mean.storage(), log_sd.storage(), momentum.storage(), curvature.storage(), power.storage(), mean.storage()],
+            _ => [self.fitting.storage(); 6],
         }
+    }
+
+    /// Trainable operator `i`'s iterate `μ` on the host as the device holds it (along its rotated
+    /// axes), whose Polyak average is the posterior's mean.
+    pub fn iterate(&self, i: usize) -> Result<Array2<f64>, String> {
+        self.fitting.download(self.mean.get(i).ok_or_else(|| error("no such trainable operator"))?).map_err(error)
+    }
+
+    /// The steps the posterior's mean averages the iterate over.
+    #[must_use]
+    pub fn averaged(&self) -> u64 {
+        self.averaged
     }
 
     /// Trainable operator `i`'s state on the host as the device holds it, one operator at a time
@@ -721,6 +733,24 @@ impl DevicePosterior {
             *mean = self.fitting.upload(values.view()).map_err(error)?;
         }
         self.restart()
+    }
+
+    /// The posterior's mean `held`, the iterate `iterate` it averages and the steps `averaged` it
+    /// averages over, restored exactly from a checkpoint ([`DevicePosterior::operator`],
+    /// [`DevicePosterior::iterate`]): the fit goes on as if it had not stopped.
+    pub fn restore(&mut self, held: &[Array2<f64>], iterate: &[Array2<f64>], averaged: u64) -> Result<(), String> {
+        let fits = |arrays: &[Array2<f64>]| arrays.len() == self.mean.len() && arrays.iter().zip(&self.mean).all(|(a, m)| a.dim() == (m.rows(), m.cols()));
+        if !fits(held) || !fits(iterate) {
+            return Err(error("one mean and one iterate per trainable operator, of its shape, required"));
+        }
+        for ((mean, average), (values, iterate)) in self.mean.iter_mut().zip(self.average.iter_mut()).zip(held.iter().zip(iterate)) {
+            *mean = self.fitting.upload(iterate.view()).map_err(error)?;
+            *average = self.fitting.upload(values.view()).map_err(error)?;
+        }
+        self.averaged = averaged;
+        // The groups' variances and divergences at `μ̄`, as the last step left them.
+        self.sums = self.wide.zeros(self.sums.rows(), 3).map_err(error)?;
+        self.refresh()
     }
 
 }

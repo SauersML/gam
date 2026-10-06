@@ -2069,6 +2069,9 @@ struct Progress {
     /// The next epoch, and the optimizer steps taken.
     epoch: usize,
     step: i32,
+    /// The steps the posterior's mean averages IVON's iterate over ([`DevicePosterior::averaged`]).
+    #[serde(default)]
+    averaged: u64,
     epochs: Vec<Epoch>,
     removals: Vec<Removal>,
     /// The last epoch's per-batch objective estimates, when convergence is being judged.
@@ -2265,10 +2268,10 @@ fn check_checkpoint_identity(path: &Path, found: &Identity, identity: &Identity)
     }
 }
 
-/// The arrays a checkpoint holds per trainable operator: `μ`, `ln σ` and IVON's state (the
-/// gradient's momentum, the curvature estimate and the gradient's second moment), each
-/// little-endian in its [`Precision`].
-const CHECKPOINT_ARRAYS: usize = 5;
+/// The arrays a checkpoint holds per trainable operator: the posterior's mean `μ̄`, `ln σ`, IVON's
+/// state (the gradient's momentum, the curvature estimate and the gradient's second moment) and
+/// IVON's iterate `μ` whose Polyak average `μ̄` is, each little-endian in its [`Precision`].
+const CHECKPOINT_ARRAYS: usize = 6;
 
 /// The precision a checkpoint array is written in: the storage the device holds it in, so that
 /// writing and reading it is exact.
@@ -2401,52 +2404,75 @@ fn write_checkpoint_array(out: &mut Vec<u8>, array: &Array2<f64>, precision: Pre
     Ok(())
 }
 
-/// A checkpoint on the host ([`Snapshot::take`]), which a writer thread writes ([`Writer`]) while
-/// the fit goes on.
-struct Snapshot {
-    /// The progress, as the payload's header and as the readable copy.
-    header: Vec<u8>,
-    json: Vec<u8>,
-    /// Per trainable operator `μ`, `ln σ` and IVON's state (the gradient's momentum, the curvature
-    /// estimate and the gradient's second moment), each in the storage the device holds it in
-    /// (`Progress::precision`).
-    payload: Vec<u8>,
-}
+/// A checkpoint streamed from the device to disk: the fit's thread takes one operator's arrays off
+/// the device at a time and hands them to the writer thread ([`Writer`]), which writes them while
+/// the next is taken and finishes the file while the fit goes on. At most two operators' arrays
+/// are on the host, never the whole payload.
+struct Snapshot;
 
 impl Snapshot {
-    /// The checkpoint of `progress` and `posterior` as they are now; `progress` records the
-    /// payload's precision. One operator's arrays are on the host as float64 at a time.
-    fn take(progress: &mut Progress, posterior: &DevicePosterior) -> Result<Self, String> {
+    /// Save `progress` and `posterior` as they are now to `path`; `progress` records the payload's
+    /// precision. The write starts once the one before it has ended.
+    fn save(progress: &mut Progress, posterior: &DevicePosterior, path: &Path, writer: &mut Writer) -> Result<(), String> {
         let precision = posterior.storages().map(Precision::of);
         progress.precision = Some(precision);
+        progress.averaged = posterior.averaged();
         let bytes = checkpoint_payload_bytes(&progress.shapes, precision, &progress.rotation_orders).ok_or("a checkpoint too large to address")?;
-        let mut payload = Vec::with_capacity(usize::try_from(bytes).map_err(error)?);
-        for i in 0..progress.shapes.len() {
-            let (mean, log_sd, [momentum, curvature, power]) = posterior.operator(i)?;
-            for (array, precision) in [&mean, &log_sd, &momentum, &curvature, &power].into_iter().zip(precision) {
-                write_checkpoint_array(&mut payload, array, precision)?;
+        let (header, json) = (serde_json::to_vec(progress).map_err(error)?, serde_json::to_vec_pretty(progress).map_err(error)?);
+        // One operator's arrays wait while the writer writes the one before.
+        let (send, receive) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let path = path.to_path_buf();
+        writer.start(move || Self::write(&path, &header, &json, receive, bytes))?;
+        const STOPPED: &str = "the checkpoint writer stopped";
+        let stream = move |chunk: Vec<u8>| -> Result<(), String> { send.send(chunk).map_err(|_| STOPPED.to_string()) };
+        let taken = (|| -> Result<(), String> {
+            for i in 0..progress.shapes.len() {
+                let (mean, log_sd, [momentum, curvature, power]) = posterior.operator(i)?;
+                let mut chunk = Vec::new();
+                for (array, precision) in [&mean, &log_sd, &momentum, &curvature, &power, &posterior.iterate(i)?].into_iter().zip(precision) {
+                    write_checkpoint_array(&mut chunk, array, precision)?;
+                }
+                stream(chunk)?;
             }
+            // The rotations' distinct matrices, as the header's layout lists them.
+            let mut chunk = Vec::new();
+            for matrix in rotation_layout(posterior.rotations()).1 {
+                write_checkpoint_array(&mut chunk, &matrix, Precision::F64)?;
+            }
+            stream(chunk)
+        })();
+        // The payload ends here: the writer finishes the file, or refuses a payload that ends short
+        // and leaves the last whole checkpoint in place. A writer that stopped first reports its
+        // own failure.
+        drop(stream);
+        match taken {
+            Ok(()) => Ok(()),
+            Err(e) => Err(writer.wait().err().filter(|_| e == STOPPED).unwrap_or(e)),
         }
-        // The rotations' distinct matrices, as the header's layout lists them.
-        for matrix in rotation_layout(posterior.rotations()).1 {
-            write_checkpoint_array(&mut payload, &matrix, Precision::F64)?;
-        }
-        Ok(Self { header: serde_json::to_vec(progress).map_err(error)?, json: serde_json::to_vec_pretty(progress).map_err(error)?, payload })
     }
 
-    /// Write the checkpoint atomically: the progress as JSON after its length, then the payload.
-    /// The progress alone also goes to the path with extension `json`, readable while the fit
-    /// runs.
-    fn write(&self, path: &Path) -> Result<(), String> {
+    /// Write the checkpoint atomically: the progress `header` as JSON after its length, then the
+    /// payload's `bytes` as they arrive. The progress alone also goes to the path with extension
+    /// `json`, readable while the fit runs.
+    fn write(path: &Path, header: &[u8], json: &[u8], payload: std::sync::mpsc::Receiver<Vec<u8>>, bytes: u64) -> Result<(), String> {
         let partial = path.with_extension("partial");
         let mut file = std::io::BufWriter::new(std::fs::File::create(&partial).map_err(error)?);
-        file.write_all(&(self.header.len() as u64).to_le_bytes()).map_err(error)?;
-        file.write_all(&self.header).map_err(error)?;
-        file.write_all(&self.payload).map_err(error)?;
+        file.write_all(&(header.len() as u64).to_le_bytes()).map_err(error)?;
+        file.write_all(header).map_err(error)?;
+        let mut written = 0u64;
+        for chunk in payload {
+            file.write_all(&chunk).map_err(error)?;
+            written += chunk.len() as u64;
+        }
+        if written != bytes {
+            drop(file);
+            std::fs::remove_file(&partial).map_err(error)?;
+            return Err(format!("a checkpoint payload of {written} bytes where {bytes} were due"));
+        }
         file.into_inner().map_err(error)?.sync_all().map_err(error)?;
         std::fs::rename(&partial, path).map_err(error)?;
         let partial = path.with_extension("json.partial");
-        std::fs::write(&partial, &self.json).map_err(error)?;
+        std::fs::write(&partial, json).map_err(error)?;
         std::fs::rename(&partial, path.with_extension("json")).map_err(error)
     }
 }
@@ -2486,7 +2512,7 @@ impl Drop for Writer {
 
 /// Restore a checkpoint of this fit into `posterior`, with IVON's state per operator, or refuse one
 /// of another fit.
-fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) -> Result<(Progress, Vec<[Array2<f64>; 3]>, Vec<Array2<f64>>), String> {
+fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) -> Result<(Progress, Vec<[Array2<f64>; 3]>, Vec<Array2<f64>>, Vec<Array2<f64>>), String> {
     let (progress, mut reader, payload_bytes): (Progress, _, _) = checkpoint_header(path)?;
     check_checkpoint_identity(path, &progress.identity, &expected.identity)?;
     let same_settings =
@@ -2507,16 +2533,19 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) 
     {
         return Err(format!("{}: a checkpoint of the wrong size", path.display()));
     }
-    let mut moments = Vec::with_capacity(posterior.mean.len());
+    let (mut moments, mut iterates) = (Vec::with_capacity(posterior.mean.len()), Vec::with_capacity(posterior.mean.len()));
     for i in 0..posterior.mean.len() {
         let dim = posterior.mean[i].dim();
         read_checkpoint_array(&mut reader, &mut posterior.mean[i], precision[0])?;
         read_checkpoint_array(&mut reader, &mut posterior.log_sd[i], precision[1])?;
         let mut next = std::array::from_fn(|_| Array2::zeros(dim));
-        for (array, precision) in next.iter_mut().zip(&precision[2..]) {
+        for (array, precision) in next.iter_mut().zip(&precision[2..5]) {
             read_checkpoint_array(&mut reader, array, *precision)?;
         }
         moments.push(next);
+        let mut iterate = Array2::zeros(dim);
+        read_checkpoint_array(&mut reader, &mut iterate, precision[5])?;
+        iterates.push(iterate);
     }
     posterior.rotations = read_rotations(&mut reader, &progress.rotations, &progress.rotation_orders, &progress.shapes)?;
     if reader.read(&mut [0_u8; 1]).map_err(error)? != 0 {
@@ -2526,7 +2555,7 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) 
     let held = posterior.mean.clone();
     along_own_axes(posterior);
     posterior.active = progress.active.clone();
-    Ok((progress, moments, held))
+    Ok((progress, moments, held, iterates))
 }
 
 /// A checkpoint of `explanation` read whole: the posterior (means along the operators' own axes,
@@ -2547,6 +2576,8 @@ fn read_checkpoint(explanation: &Explanation, path: &Path) -> Result<(Posterior,
         rotation_orders: Vec<usize>,
         step: i32,
         epoch: usize,
+        #[serde(default)]
+        averaged: u64,
     }
     let (header, mut reader, payload_bytes): (Header, _, _) = checkpoint_header(path)?;
     // The checkpoint must be a fit of this explanation: the same groups, shared parameters,
@@ -2568,15 +2599,18 @@ fn read_checkpoint(explanation: &Explanation, path: &Path) -> Result<(Posterior,
     if checkpoint_payload_bytes(&header.shapes, precision, &header.rotation_orders) != Some(payload_bytes) {
         return Err(format!("{}: a checkpoint of the wrong size", path.display()));
     }
-    let mut state = Vec::with_capacity(header.shapes.len());
+    let (mut state, mut iterates) = (Vec::with_capacity(header.shapes.len()), Vec::with_capacity(header.shapes.len()));
     for (i, shape) in header.shapes.iter().enumerate() {
         read_checkpoint_array(&mut reader, &mut posterior.mean[i], precision[0])?;
         read_checkpoint_array(&mut reader, &mut posterior.log_sd[i], precision[1])?;
         let mut moments: [Array2<f64>; 3] = std::array::from_fn(|_| Array2::zeros(*shape));
-        for (array, precision) in moments.iter_mut().zip(&precision[2..]) {
+        for (array, precision) in moments.iter_mut().zip(&precision[2..5]) {
             read_checkpoint_array(&mut reader, array, *precision)?;
         }
         state.push(moments);
+        let mut iterate = Array2::zeros(*shape);
+        read_checkpoint_array(&mut reader, &mut iterate, precision[5])?;
+        iterates.push(iterate);
     }
     posterior.rotations = read_rotations(&mut reader, &header.rotations, &header.rotation_orders, &header.shapes)?;
     // The start keeps the means as the device held them; the posterior reads them along the
@@ -2589,6 +2623,7 @@ fn read_checkpoint(explanation: &Explanation, path: &Path) -> Result<(Posterior,
         log_sd: posterior.log_sd.clone(),
         active: posterior.active.clone(),
         state: Some(state),
+        iterate: Some((iterates, header.averaged)),
         steps: u64::try_from(header.step).map_err(error)?,
         epoch: header.epoch,
         rotations: posterior.rotations.clone(),
@@ -2600,6 +2635,13 @@ fn read_checkpoint(explanation: &Explanation, path: &Path) -> Result<(Posterior,
 /// log standard deviations, rotations and active groups, for reading a fit that is still running.
 pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Posterior, String> {
     read_checkpoint(explanation, path).map(|(posterior, _)| posterior)
+}
+
+/// The posterior-mean artifact ([`posterior_mean`]) of a fit checkpoint of `explanation` at
+/// `path`, with `literals` (those of the fit's device, [`Literals::of`]): the explanation a
+/// running fit holds, read from its last save.
+pub fn checkpoint_artifact(explanation: &Explanation, path: &Path, literals: Literals) -> Result<Artifact, String> {
+    literals.apply(posterior_mean(explanation, &checkpoint_posterior(explanation, path)?)?)
 }
 
 /// Where [`fit_from`] starts in place of `M`: per trainable operator (in `Explanation::trainable`
@@ -2618,6 +2660,9 @@ pub struct Start {
     pub log_sd: Vec<Array2<f64>>,
     pub active: Vec<bool>,
     pub state: Option<Vec<[Array2<f64>; 3]>>,
+    /// IVON's iterate `μ` (as the device holds it) whose Polyak average the means are, and the
+    /// steps that average spans; none for a start whose means are the iterate.
+    pub iterate: Option<(Vec<Array2<f64>>, u64)>,
     pub steps: u64,
     pub epoch: usize,
     pub rotations: Vec<Option<Rotation>>,
@@ -2694,6 +2739,7 @@ pub fn fit_from(
         start: None,
         epoch: 0,
         step: 0,
+        averaged: 0,
         epochs: Vec::new(),
         removals: Vec::new(),
         previous: None,
@@ -2712,19 +2758,23 @@ pub fn fit_from(
     // needs).
     let subset = &held[..settings.batch_sequences.clamp(2, held.len())];
     let (mut resumed, mut held_means, mut from_start) = (None, None, false);
+    // IVON's iterate and the steps its average spans, where the means are that average.
+    let mut held_iterate: Option<(Vec<Array2<f64>>, u64)> = None;
     if let Some(start) = start {
         let shapes: Vec<(usize, usize)> = posterior.mean.iter().map(Array2::dim).collect();
         let fits = |arrays: &[Array2<f64>]| arrays.iter().map(Array2::dim).eq(shapes.iter().copied());
         let state_fits = start.state.as_ref().is_none_or(|state| state.len() == shapes.len() && state.iter().zip(&shapes).all(|(m, d)| m.iter().all(|a| a.dim() == *d)));
         let rotations_fit = start.rotations.is_empty() || start.rotations.len() == shapes.len();
-        if !fits(&start.mean) || !fits(&start.log_sd) || start.active.len() != posterior.active.len() || !state_fits || !rotations_fit {
+        let iterate_fits = start.iterate.as_ref().is_none_or(|(iterate, _)| fits(iterate));
+        if !fits(&start.mean) || !fits(&start.log_sd) || start.active.len() != posterior.active.len() || !state_fits || !rotations_fit || !iterate_fits {
             return Err("a start of another explanation".into());
         }
         // The start's own rotations, along which its deviations and state are and its means held.
         posterior.rotations = if start.rotations.is_empty() { vec![None; shapes.len()] } else { start.rotations };
-        if posterior.rotations.iter().any(Option::is_some) {
+        if posterior.rotations.iter().any(Option::is_some) || start.iterate.is_some() {
             held_means = Some(start.mean.clone());
         }
+        held_iterate = start.iterate;
         posterior.mean = start.mean;
         along_own_axes(&mut posterior);
         posterior.log_sd = start.log_sd;
@@ -2739,8 +2789,9 @@ pub fn fit_from(
         from_start = true;
     }
     if let Some(path) = checkpoint.filter(|p| p.exists()) {
-        let (loaded, moments, held) = load_checkpoint(path, &progress, &mut posterior)?;
+        let (loaded, moments, held, iterate) = load_checkpoint(path, &progress, &mut posterior)?;
         held_means = Some(held);
+        held_iterate = Some((iterate, loaded.averaged));
         progress = loaded;
         match (prior.as_deref_mut(), &progress.prior) {
             (Some(prior), Some(state)) => prior.load(state)?,
@@ -2765,9 +2816,13 @@ pub fn fit_from(
     let arm = (if settings.trust_rate { settings.rate } else { 1.0 }, settings.split_filter, settings.deterministic);
     device_posterior.set_arm(arm.0, arm.1, arm.2, settings.line_search);
     drop(resumed);
-    // A resumed fit holds exactly the device's means of the checkpoint.
+    // A resumed fit holds exactly the device's means of the checkpoint, and the iterate they
+    // average with the steps they span: it goes on as the fit that was not stopped.
     if let Some(held) = held_means.take() {
-        device_posterior.restore_means(&held)?;
+        match held_iterate.take() {
+            Some((iterate, averaged)) => device_posterior.restore(&held, &iterate, averaged)?,
+            None => device_posterior.restore_means(&held)?,
+        }
     }
     if fresh {
         let timed = Instant::now();
@@ -2780,25 +2835,17 @@ pub fn fit_from(
     let ivon = Ivon { rate: settings.rate, beta1: settings.beta1, beta2: 1.0 - 1.0 / draws.len() as f64 };
     // Each group's size, whose `½ ln |G|` an active group's variance costs.
     let sizes: Vec<f64> = explanation.groups.iter().map(|g| g.cells.iter().map(|c| (c.rows.len() * c.cols.len()) as f64).sum()).collect();
-    // After every save, the posterior-mean artifact goes next to the checkpoint (extension
-    // `artifact.bin`), so the current explanation can be read and scored while the fit runs. The
-    // fit's thread takes the checkpoint and the means off the device; the writer thread encodes
-    // and writes them while the device trains on.
+    // The fit's thread streams the checkpoint off the device to the writer thread, which finishes
+    // writing it while the device trains on ([`Snapshot`]). The current explanation is read from
+    // the checkpoint where it is wanted ([`checkpoint_artifact`]): a posterior-mean artifact made
+    // at every save held the means, their group map and the encoded artifact on the host beside
+    // the checkpoint, about 28 bytes per trainable parameter that the fit never reads back.
     let mut writer = Writer::default();
     let save = |progress: &mut Progress, posterior: &Posterior, device_posterior: &DevicePosterior, writer: &mut Writer| -> Result<(), String> {
         progress.active = posterior.active.clone();
         progress.seconds = resumed_seconds + started.elapsed().as_secs_f64();
         let Some(path) = checkpoint else { return Ok(()) };
-        let snapshot = Snapshot::take(progress, device_posterior)?;
-        let (artifact, trainable) = (explanation.artifact.clone(), explanation.trainable.clone());
-        let (means, membership, active) = (posterior.means(), posterior.membership.clone(), posterior.active.clone());
-        let (path, literals) = (path.to_path_buf(), Literals::of(device));
-        writer.start(move || {
-            snapshot.write(&path)?;
-            let partial = path.with_extension("artifact.partial");
-            std::fs::write(&partial, literals.apply(mean_artifact(artifact, &trainable, means, &membership, &active)?)?.to_bytes()?).map_err(error)?;
-            std::fs::rename(&partial, path.with_extension("artifact.bin")).map_err(error)
-        })
+        Snapshot::save(progress, device_posterior, path, writer)
     };
     if let Some(prior) = prior.as_deref_mut()
         && progress.prior.is_none()
@@ -4228,6 +4275,7 @@ mod tests {
             start: None,
             epoch: 4,
             step: 17,
+            averaged: 3,
             epochs: Vec::new(),
             removals: Vec::new(),
             previous: Some(vec![1.0, 2.0]),
@@ -4263,12 +4311,12 @@ mod tests {
         let path = std::env::temp_dir().join(format!("library_checkpoint_stream_{}.bin", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
         let pointers: Vec<_> = posterior.mean.iter().chain(&posterior.log_sd).map(|array| array.as_ptr()).collect();
-        let (progress, moments, _) = load_checkpoint(&path, &expected, &mut posterior).unwrap();
+        let (progress, moments, _, iterates) = load_checkpoint(&path, &expected, &mut posterior).unwrap();
         assert_eq!(serde_json::to_value(&progress).unwrap(), serde_json::to_value(&expected).unwrap());
         assert_eq!(posterior.active, expected.active);
         assert_eq!(pointers, posterior.mean.iter().chain(&posterior.log_sd).map(|array| array.as_ptr()).collect::<Vec<_>>());
         for i in 0..progress.shapes.len() {
-            for (field, array) in [&posterior.mean[i], &posterior.log_sd[i]].into_iter().chain(&moments[i]).enumerate() {
+            for (field, array) in [&posterior.mean[i], &posterior.log_sd[i]].into_iter().chain(&moments[i]).chain([&iterates[i]]).enumerate() {
                 for (cell, value) in array.iter().enumerate() {
                     assert_eq!(*value, (100 * i + 10 * field + cell) as f64 + 0.25);
                 }
@@ -4310,10 +4358,10 @@ mod tests {
         other = expected.clone();
         other.settings.seed += 1;
         assert!(load_checkpoint(&path, &other, &mut posterior.clone()).unwrap_err().contains("another fit"));
-        let (wide, device) = ([Precision::F64; CHECKPOINT_ARRAYS], [Precision::F32, Precision::F32, Precision::Bf16, Precision::F32, Precision::F32]);
-        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], wide, &[]), Some(9 * 40));
-        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], device, &[]), Some(9 * 18));
-        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], device, &[2]), Some(9 * 18 + 4 * 8));
+        let (wide, device) = ([Precision::F64; CHECKPOINT_ARRAYS], [Precision::F32, Precision::F32, Precision::Bf16, Precision::F32, Precision::F32, Precision::F32]);
+        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], wide, &[]), Some(9 * 48));
+        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], device, &[]), Some(9 * 22));
+        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], device, &[2]), Some(9 * 22 + 4 * 8));
         assert_eq!(checkpoint_payload_bytes(&[(usize::MAX, usize::MAX)], wide, &[]), None);
         std::fs::remove_file(path).unwrap();
     }
@@ -4356,7 +4404,7 @@ mod tests {
         let resumed = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&path), None).unwrap();
         let started = fit_from(&device, &native, &explanation, train, held, &settings, "tiny", None, None, Some(start)).unwrap();
         for file in [&finished_path, &path] {
-            for extension in ["bin", "json", "artifact.bin", "removals.jsonl"] {
+            for extension in ["bin", "json", "removals.jsonl"] {
                 let written = file.with_extension(extension);
                 if written.exists() {
                     std::fs::remove_file(written).unwrap();
@@ -4374,8 +4422,85 @@ mod tests {
         assert_eq!(started.posterior.log_sd, resumed.posterior.log_sd);
         assert_eq!(started.posterior.active, resumed.posterior.active);
         // A start of another explanation is refused.
-        let other = Start { mean: Vec::new(), log_sd: Vec::new(), active: vec![true], state: None, steps: 0, epoch: 0, rotations: Vec::new() };
+        let other = Start { mean: Vec::new(), log_sd: Vec::new(), active: vec![true], state: None, iterate: None, steps: 0, epoch: 0, rotations: Vec::new() };
         assert!(fit_from(&device, &native, &explanation, train, held, &settings, "tiny", None, None, Some(other)).is_err());
+    }
+
+    /// A prior term that adds nothing to `F` over an explanation of `groups` groups and stops the
+    /// fit at its `stop`-th training step, as a process killed there; its steps go into the
+    /// checkpoint.
+    struct Stop {
+        groups: usize,
+        steps: u64,
+        stop: Option<u64>,
+    }
+
+    impl PriorTerm for Stop {
+        fn operators(&self) -> Vec<usize> {
+            Vec::new()
+        }
+        fn epoch(&mut self, explanation: &Explanation, posterior: &Posterior) -> Result<(), String> {
+            let groups = (explanation.groups.len(), posterior.active.len());
+            if groups == (self.groups, self.groups) { Ok(()) } else { Err(format!("{groups:?} groups where {} were set", self.groups)) }
+        }
+        fn sample(&mut self, posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String> {
+            if !theta.is_empty() {
+                return Err("a sample of operators it does not read".into());
+            }
+            let nats = self.cost(posterior)?;
+            self.steps += u64::from(learn);
+            if learn && Some(self.steps) == self.stop {
+                return Err("stopped".into());
+            }
+            Ok((nats, BTreeMap::new()))
+        }
+        fn cost(&self, posterior: &Posterior) -> Result<f64, String> {
+            if posterior.active.len() == self.groups { Ok(0.0) } else { Err("a posterior of another explanation".into()) }
+        }
+        fn save(&self) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({ "steps": self.steps }))
+        }
+        fn load(&mut self, value: &serde_json::Value) -> Result<(), String> {
+            self.steps = value["steps"].as_u64().ok_or("a saved step count")?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_fit_stopped_in_the_middle_of_an_epoch_and_resumed_is_the_uninterrupted_fit() {
+        let (native, layers, _, sequences) = tiny("library_fit_stopped", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let settings = settings();
+        let device = Device::host();
+        let (train, held) = sequences.split_at(4);
+        let path = |name: &str| std::env::temp_dir().join(format!("library_fit_{name}_{}.bin", std::process::id()));
+        let (whole, stopped) = (path("whole"), path("stopped"));
+        let groups = explanation.groups.len();
+        let uninterrupted = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&whole), Some(&mut Stop { groups, steps: 0, stop: None })).unwrap();
+        // The second epoch's second step, after its first: the checkpoint is the first epoch's.
+        let batches = (train.len() / settings.batch_sequences) as u64;
+        assert!(uninterrupted.report.epochs.len() >= 2, "the fit trains a second epoch");
+        let Err(message) = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&stopped), Some(&mut Stop { groups, steps: 0, stop: Some(batches + 2) })) else {
+            panic!("the fit ran past its stop");
+        };
+        assert!(message.contains("stopped"), "{message}");
+        let resumed = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&stopped), Some(&mut Stop { groups, steps: 0, stop: None })).unwrap();
+        for file in [&whole, &stopped] {
+            for extension in ["bin", "json", "removals.jsonl"] {
+                let written = file.with_extension(extension);
+                if written.exists() {
+                    std::fs::remove_file(written).unwrap();
+                }
+            }
+        }
+        assert_eq!(resumed.report.epochs.len(), uninterrupted.report.epochs.len());
+        for (a, b) in resumed.report.epochs.iter().zip(&uninterrupted.report.epochs) {
+            assert_eq!(a.objective_bits.to_bits(), b.objective_bits.to_bits(), "epoch {}", a.epoch);
+        }
+        assert_eq!(resumed.report.removals.len(), uninterrupted.report.removals.len());
+        assert_eq!(resumed.posterior.mean, uninterrupted.posterior.mean);
+        assert_eq!(resumed.posterior.log_sd, uninterrupted.posterior.log_sd);
+        assert_eq!(resumed.posterior.active, uninterrupted.posterior.active);
     }
 
     #[test]
@@ -4442,9 +4567,12 @@ mod tests {
         // The reader refuses a checkpoint of another explanation too, and reads its own exactly.
         assert!(checkpoint_posterior(&warmed, &checkpoint).unwrap_err().contains("definition"));
         assert_eq!(checkpoint_posterior(&explanation, &checkpoint).unwrap().means(), fit.posterior.means());
+        // The running fit's explanation read from its checkpoint is the fit's posterior mean.
+        assert!(!checkpoint.with_extension("artifact.bin").exists(), "a save writes the checkpoint alone");
+        let literals = Literals::of(&device);
+        assert_eq!(checkpoint_artifact(&explanation, &checkpoint, literals).unwrap(), literals.apply(posterior_mean(&explanation, &fit.posterior).unwrap()).unwrap());
         std::fs::remove_file(&checkpoint).unwrap();
         std::fs::remove_file(checkpoint.with_extension("json")).unwrap();
-        std::fs::remove_file(checkpoint.with_extension("artifact.bin")).unwrap();
         assert_eq!(resumed.posterior.active, fit.posterior.active);
         assert_eq!(resumed.posterior.means(), fit.posterior.means());
         assert_eq!(resumed.report.epochs.len(), fit.report.epochs.len());
