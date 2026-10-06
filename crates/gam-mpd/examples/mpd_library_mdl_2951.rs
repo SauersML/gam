@@ -127,16 +127,15 @@ fn transcoder_files(device: &Device, native: &OperatorProgram, layers: &[LayerNo
         .map(|&l| Ok((l, library_transcoder::Transcoder::open(&settings.dir.join(format!("layer_{l}.safetensors")))?)))
         .collect::<Result<BTreeMap<_, _>, String>>()?;
     let train = &train[..settings.count_sequences.map_or(train.len(), |n| n.min(train.len()))];
-    let fired = library_transcoder::firing(device, native, layers, &transcoders, train, batch)?;
+    let counts = library_transcoder::firing(device, native, layers, &transcoders, train, batch)?;
     // Tokens after each sequence's first, where the transcoders run (the first runs M's MLP).
     let tokens: usize = train.iter().map(|s| s.len() - 1).sum();
     let mut record = Vec::new();
     for (l, transcoder) in &transcoders {
         let least = settings.min_frequency.map_or(1.0, |f| (f * tokens as f64).max(1.0));
-        let counts = &fired[l].counts;
-        let kept: Vec<usize> = (0..transcoder.features).filter(|&f| counts[f] as f64 >= least).collect();
-        transcoder.write_kept(&kept, &fired[l].sink, &files[l])?;
-        let fired_tokens: u64 = counts.iter().sum();
+        let kept: Vec<usize> = (0..transcoder.features).filter(|&f| counts[l][f] as f64 >= least).collect();
+        transcoder.write_kept(&kept, &files[l])?;
+        let fired: u64 = counts[l].iter().sum();
         let kept_fired: u64 = kept.iter().map(|&f| counts[l][f]).sum();
         record.push(json!({
             "layer": l,
