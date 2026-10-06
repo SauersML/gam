@@ -8,6 +8,7 @@
 #   rp-run stop NAME                                              end a run or a held pod now
 #   rp-run batch SPEC                                             launch every run SPEC lists, at once
 #   rp-run status                                                 one line per running pod
+#   rp-run publish PATH...                                        publish public inputs for pods to download
 #
 # GPU_TYPE is a RunPod GPU id ("NVIDIA RTX A5000") or its display name ("RTX A5000"), a Thunder
 # card thunder:CARD[:MODE] (thunder:a6000, thunder:a100xl:prototyping) or a Nebius platform
@@ -420,6 +421,29 @@ provider_offers() { thunder_offers "$@"; nebius_offers "$@"; }
 # The binaries a run needs ("NAME" for an example, "test:PACKAGE:NAME" for a test) that neither the
 # prerelease rp-run-bin (assets KEY.NAME, built on GitHub Actions) nor the Mac's cache _bin/KEY holds.
 ASSETS=https://github.com/SauersML/gam/releases/download/rp-run-bin
+# Inputs published once (rp-run publish PATH...) as assets of the prerelease rp-run-data, named by
+# their sha256, which pods download at datacenter speed instead of the Mac's 2-3 MB/s uplink.
+# published.tsv caches each file's sha256 by path, size and modification time.
+DATA_ASSETS=https://github.com/SauersML/gam/releases/download/rp-run-data
+PUBLISHED=$MAC_DATA/runpod/published.tsv
+# The most a run may upload from the Mac (unpublished inputs): 50 MB, under half a minute at the
+# Mac's measured uplink.
+UPLOAD_MAX_MB=50
+# Seconds of setup (pod creation to command start, the GPU idle and paid) past which a run's setup
+# is a failure to fix.
+SETUP_FAIL=600
+published_data() { gh api --paginate "repos/SauersML/gam/releases/tags/rp-run-data" --jq '.assets[].name' 2> /dev/null || true; }
+# The sha256 of mpd-data/REL, from the cache when its size and modification time are unchanged.
+sha_of() {  # REL
+    local f=$MAC_DATA/$1 size mtime sha
+    size=$(stat -L -f %z "$f") mtime=$(stat -L -f %m "$f")
+    sha=$(awk -F'\t' -v p="$1" -v s="$size" -v m="$mtime" '$4 == p && $2 == s && $3 == m { h = $1 } END { print h }' "$PUBLISHED" 2> /dev/null)
+    if [ -z "$sha" ]; then
+        sha=$(shasum -a 256 < "$f" | cut -d' ' -f1)
+        printf '%s\t%s\t%s\t%s\n' "$sha" "$size" "$mtime" "$1" >> "$PUBLISHED"
+    fi
+    echo "$sha"
+}
 published_assets() { gh api "repos/SauersML/gam/releases/tags/rp-run-bin" --jq '.assets[].name' 2> /dev/null || true; }
 unbuilt() {
     local have x
@@ -728,14 +752,16 @@ case ${1:-} in
             fi
         done <<< "$pods"
         wait
-        printf '%-15s %-22s %-9s %-22s %6s %5s %5s %7s %6s %-9s %s\n' POD NAME OWNER GPU '$/h' 'GPU%' 'UP h' '$ SO FAR' 'LEFT h' FLAG 'LAST LOG LINE'
+        printf '%-15s %-22s %-9s %-22s %6s %5s %5s %7s %6s %6s %-9s %s\n' POD NAME OWNER GPU '$/h' 'GPU%' 'UP h' '$ SO FAR' 'LEFT h' 'SETUP' FLAG 'LAST LOG LINE'
         idle_rate=0
         while IFS=$'\t' read -r id pname price gpu created _; do
             [ -n "$id" ] || continue
-            rec=$ACTIVE/$id name=${pname#mpd2951-} owner="not ours" kind="" mode="" left=- last="" flag="" util=$(cat "$utils/$id" 2> /dev/null || true)
+            rec=$ACTIVE/$id name=${pname#mpd2951-} owner="not ours" kind="" mode="" left=- last="" flag="" setup=- util=$(cat "$utils/$id" 2> /dev/null || true)
             [[ $pname == mpd2951-* ]] && registered "$id" && owner="ours, unheld"
             if [ -f "$rec" ]; then
-                read -r name _ kind _ c _ _ mode _ < "$rec"
+                read -r name _ kind _ c _ _ mode _ _ wait_s _ < "$rec"
+                # Seconds from the pod's creation to its command (counting, + , while it sets up).
+                if [ -n "${wait_s:-}" ]; then setup=${wait_s}s; else setup="$(( now - c ))s+"; (( now - c > SETUP_FAIL )) && flag+="SETUP "; fi
                 owner=$(cat "$ACTIVE/.$id.owner" 2> /dev/null || echo -)
                 [ -f "$ACTIVE/.$id.deadline" ] && left=$(awk -v d="$(cat "$ACTIVE/.$id.deadline")" -v n="$now" 'BEGIN { printf "%.1f", (d - n) / 3600 }')
                 for f in "$RP/$name/run.log" "$RP/$name/rp-run.log"; do
@@ -752,14 +778,14 @@ case ${1:-} in
             # The pod's own creation time, which the account bills from.
             start=$(date -j -u -f '%Y-%m-%d %H:%M:%S' "${created:0:19}" +%s 2> /dev/null || echo "$now")
             up=$(awk -v a="$start" -v n="$now" 'BEGIN { printf "%.2f", (n - a) / 3600 }')
-            printf '%-15s %-22s %-9s %-22s %6s %5s %5s %7s %6s %-9s %s\n' "$id" "${name:0:22}" "${owner:0:9}" "$(cut -c1-22 <<< "${gpu#NVIDIA } ${kind%%:*}")" "$price" "${util:--}" "$up" \
-                "$(awk -v p="$price" -v u="$up" 'BEGIN { printf "%.2f", p * u }')" "$left" "${flag:--}" "$last"
+            printf '%-15s %-22s %-9s %-22s %6s %5s %5s %7s %6s %6s %-9s %s\n' "$id" "${name:0:22}" "${owner:0:9}" "$(cut -c1-22 <<< "${gpu#NVIDIA } ${kind%%:*}")" "$price" "${util:--}" "$up" \
+                "$(awk -v p="$price" -v u="$up" 'BEGIN { printf "%.2f", p * u }')" "$left" "$setup" "${flag:--}" "$last"
             # Runs packed onto this pod.
             for g in "$ACTIVE/.$id.guests"/*; do
                 [ -f "$g" ] && kill -0 "$(cat "$g")" 2> /dev/null || continue
                 gname=${g##*/}
                 last=$(grep -v '^[[:space:]]*$' "$RP/$gname/run.log" 2> /dev/null | tail -n 1 | cut -c1-90 || true)
-                printf '%-15s %-22s %-9s %-22s %6s %5s %5s %7s %6s %-9s %s\n' "  + packed" "${gname:0:22}" "-" "" "" "" "" "" "" "-" "$last"
+                printf '%-15s %-22s %-9s %-22s %6s %5s %5s %7s %6s %6s %-9s %s\n' "  + packed" "${gname:0:22}" "-" "" "" "" "" "" "" "" "-" "$last"
             done
         done <<< "$pods"
         rm -rf "$utils"
@@ -770,6 +796,40 @@ case ${1:-} in
         jq -r --arg s "$START_BALANCE" --arg c "$CAP_DOLLARS" --arg idle "$idle_rate" --argjson ts "$tspent" --argjson tr "$trate" '.data.myself
             | (($s | tonumber) - .clientBalance + $ts) as $spent | (.currentSpendPerHr + $tr) as $rate
             | "spend (the RunPod team account, shared with other MATS users, and our Thunder and Nebius pods; the $\($c) check counts all of it): $\($spent * 100 | round / 100) since $\($s) of RunPod credit (Thunder and Nebius $\($ts)), $\($rate * 100 | round / 100)/h now ($\($idle | tonumber * 100 | round / 100)/h on GPUs under 20%); at this rate the $\($c) cap is \(if $rate > 0 then ((($c | tonumber) - $spent) / $rate * 10 | round / 10 | tostring) + " h" else "never" end) away"' <<< "$(body_of "$r")"
+        exit 0 ;;
+    publish)
+        # PATH... under mpd-data (files or directories): every file not yet published goes up once,
+        # named by its sha256, four at a time. The release is public: inputs from public sources
+        # (VPD's weights, our exports derived from them, public datasets) only; never blind or
+        # sealed material.
+        [ $# -ge 2 ] || usage
+        shift
+        have=$(published_data)
+        gh release view rp-run-data -R SauersML/gam > /dev/null 2>&1 ||
+            gh release create rp-run-data -R SauersML/gam --prerelease --title "rp-run data" \
+                --notes "Public inputs of #2951's GPU runs (VPD's public weights, exports derived from them, public datasets), one asset per file named by its sha256, for pods to download." > /dev/null
+        stage=$RP/.publish
+        mkdir -p "$stage"
+        todo=()
+        for p in "$@"; do
+            p=$(cd "$(dirname "$p")" && pwd)/$(basename "$p")
+            [[ $p == "$MAC_DATA"/* ]] || { echo "rp-run: $p is not under $MAC_DATA" >&2; exit 2; }
+            case $p in */blind/*|*sealed*|*organism*|"$MAC_DATA"/runpod/*) echo "rp-run: $p may not be published (blind, sealed, organism or run outputs)" >&2; exit 2 ;; esac
+            while IFS= read -r f; do
+                rel=${f#"$MAC_DATA"/}
+                (( $(stat -L -f %z "$f") < 2147483648 )) || { echo "rp-run: $rel is 2 GiB or more, over GitHub's asset limit" >&2; exit 2; }
+                sha=$(sha_of "$rel")
+                if grep -qx "$sha" <<< "$have"; then continue; fi
+                ln -f "$(realpath "$f")" "$stage/$sha" 2> /dev/null || cp "$f" "$stage/$sha"
+                todo+=("$stage/$sha")
+                have+=$'\n'"$sha"
+            done < <(find -L "$p" -type f ! -name '.*' | sort)
+        done
+        [ ${#todo[@]} -gt 0 ] || { echo "rp-run: all already published" >&2; exit 0; }
+        echo "rp-run: publishing ${#todo[@]} files, $(du -chL "${todo[@]}" | tail -n 1 | cut -f1)" >&2
+        printf '%s\n' "${todo[@]}" | xargs -P 4 -I{} gh release upload rp-run-data -R SauersML/gam {} --clobber
+        rm -f "${todo[@]}"
+        echo "rp-run: published; runs naming these files download them on the pod" >&2
         exit 0 ;;
     batch)
         [ $# -eq 2 ] && [ -f "$2" ] || usage
@@ -1066,6 +1126,14 @@ read -r -a tests <<< "${RP_TESTS:-}"
 for x in "${tests[@]}"; do [[ $x =~ ^[A-Za-z0-9_-]+:[A-Za-z0-9_]+$ ]] || { echo "rp-run: RP_TESTS takes PACKAGE:TEST words, not $x" >&2; exit 2; }; done
 
 uploads=() hf=() srcpaths=() examples=() words=() fineweb=() pile=()
+DATA_HAVE=$(published_data)
+# Whether every file under mpd-data/REL is published.
+all_published() {  # REL
+    local f
+    while IFS= read -r f; do
+        grep -qx "$(sha_of "${f#"$MAC_DATA"/}")" <<< "$DATA_HAVE" || return 1
+    done < <(find -L "$MAC_DATA/$1" -type f ! -name '.*')
+}
 [ -z "$C" ] || ! git -C "$MAC_GAM" cat-file -e "$C:bench/runpod" 2> /dev/null || srcpaths+=(bench/runpod)
 # The FineWeb release's contents (per shard: source file and every file's sha256), remade when the
 # release changes.
@@ -1093,7 +1161,8 @@ for a in "$@"; do
         # which holds the target's weights, goes up instead).
         if [[ $rel =~ ^qwen3_fineweb/([^/]+)(/([^/]+))?$ ]] && [ -f "$CONTENTS" ] && jq -e --arg d "${BASH_REMATCH[1]}" 'has($d)' "$CONTENTS" > /dev/null; then
             fineweb+=("${BASH_REMATCH[1]} ${BASH_REMATCH[3]:-}")
-        elif [[ $rel =~ ^engine/([^/]+) ]] && jq -e '.source.extends.export' "$MAC_DATA/engine/${BASH_REMATCH[1]}/export.json" > /dev/null 2>&1; then
+        elif [[ $rel =~ ^engine/([^/]+) ]] && jq -e '.source.extends.export' "$MAC_DATA/engine/${BASH_REMATCH[1]}/export.json" > /dev/null 2>&1 &&
+             ! all_published "engine/${BASH_REMATCH[1]}"; then
             pile+=("${BASH_REMATCH[1]}")
         elif [ -e "$p" ]; then
             uploads+=("$rel")
@@ -1204,6 +1273,27 @@ if [ ${#uploads[@]} -gt 0 ]; then
     while IFS= read -r f; do files+=("$f"); done < <(cd "$MAC_DATA" && find -L "${uploads[@]}" -type f ! -name '*.pem' ! -name '*.key' ! -name .env ! -name .DS_Store | sort -u)
     upload_kb=$(cd "$MAC_DATA" && du -skL "${uploads[@]}" | awk '{ s += $1 } END { print s }')
 fi
+# Published inputs ("SHA256 REL") are downloaded by the pod; the rest go up from the Mac, at most
+# UPLOAD_MAX_MB of them.
+fetched=() unpublished_kb=0
+if [ ${#files[@]} -gt 0 ]; then
+    kept=()
+    for f in "${files[@]}"; do
+        sha=$(sha_of "$f")
+        if grep -qx "$sha" <<< "$DATA_HAVE"; then
+            fetched+=("$sha $f")
+        else
+            kept+=("$f")
+            unpublished_kb=$(( unpublished_kb + $(stat -L -f %z "$MAC_DATA/$f") / 1024 ))
+        fi
+    done
+    files=("${kept[@]}")
+    if (( unpublished_kb > UPLOAD_MAX_MB * 1024 )); then
+        # A Pile export is published whole (the pod then downloads it instead of building it).
+        echo "rp-run: $(( unpublished_kb / 1024 )) MB of inputs would go up from the Mac (at most $UPLOAD_MAX_MB MB); publish them once (public inputs only), then launch: rp-run publish $(printf "$MAC_DATA/%s " "${uploads[@]}" $(printf 'engine/%s\n' "${pile[@]}" | sort -u))" >&2
+        exit 2
+    fi
+fi
 hf_kb=0
 for p in "${hf[@]}"; do
     [ -e "$p" ] || { echo "rp-run: $p is not on this Mac (the pod fetches the files the Mac's snapshot holds)" >&2; exit 2; }
@@ -1275,7 +1365,7 @@ fi
 echo "rp-run: $MODE $NAME; offers $(awk -F'|' '{ printf "%s%s %s $%s/h", (NR > 1 ? ", " : ""), $3, $1, $2 }' <<< "$OFFERS"); estimate \$$ESTIMATE for $HOURS h" >&2
 if [ -n "${RP_DRY:-}" ]; then
     echo "commit:   ${C:-none}"
-    echo "uploads:  ${uploads[*]:-none} (${#files[@]} files, $(( upload_kb / 1024 )) MB)"
+    echo "uploads:  ${uploads[*]:-none}: ${#fetched[@]} files published (the pod downloads them), ${#files[@]} files ($(( unpublished_kb / 1024 )) MB) from the Mac"
     echo "hf:       ${hf[*]:-none}"
     built=$( for e in "${fw_plan[@]}"; do IFS='|' read -r d k n ts _ <<< "$e"; printf 'qwen3_fineweb/%s (FineWeb file %s, %s documents, contexts %s) ' "$d" "$k" "$n" "$ts"; done
              for e in "${pile_plan[@]}"; do read -r x b m <<< "$e"; printf 'engine/%s (from %s and %s Pile train rows) ' "$x" "$b" "$m"; done )
@@ -1829,6 +1919,19 @@ upload_inputs() {
 }
 
 # The Hugging Face snapshots COMMAND names, downloaded by the pod at their revisions.
+# The published inputs, from rp-run-data on GitHub, eight at a time, checked against their sha256.
+fetch_published() {
+    [ ${#fetched[@]} -gt 0 ] || return 0
+    local started=$(date +%s) sums
+    sums=$(printf '%s\n' "${fetched[@]}" | awk '{ sha = $1; $1 = ""; sub(/^ /, ""); print sha "  " $0 }')
+    printf '%s\n' "${fetched[@]}" | on_pod "cd $WS/mpd-data 2> /dev/null || mkdir -p $WS/mpd-data && cd $WS/mpd-data
+        while read -r sha rel; do mkdir -p \"\$(dirname \"\$rel\")\"; printf '%s %s\\n' \"\$sha\" \"\$rel\"; done |
+            xargs -P 8 -L 1 sh -c 'curl -fsSL --retry 3 -o \"\$1\" $DATA_ASSETS/\$0'" || return 1
+    on_pod "cd $WS/mpd-data && sha256sum -c --quiet" <<< "$sums" || { say "a downloaded input differs from its sha256; refusing to run"; touch "$TMP/refused"; return 1; }
+    echo $(( $(date +%s) - started )) >> "$TMP/upload_s"
+    say "downloaded ${#fetched[@]} published inputs, $(( $(printf '%s\n' "${fetched[@]}" | while read -r _ f; do stat -L -f %z "$MAC_DATA/$f"; done | awk '{ s += $1 } END { print int(s / 1048576) }') )) MB, in $(( $(date +%s) - started )) s"
+}
+
 fetch_models() {
     local p repo rev list
     for p in "${hf[@]}"; do
@@ -1989,9 +2092,8 @@ compile_on_pod() {
 
 # Before any pod exists, what the run needs and nobody has built is built on GitHub Actions
 # (gha-run bins: a free runner, published as rp-run-bin assets). One build per set of sources at a
-# time: a run that finds another building them waits for it. When Actions fails, the run's first GPU
-# pod builds them (FALLBACK_BUILD) and the Mac caches them; the lock stays held until then, so no
-# other run builds the same sources.
+# time: a run that finds another building them waits for it, before renting anything. When Actions
+# fails, the run ends before any pod exists.
 build_binaries() {
     local need x holder ex=() ts=()
     need=$(unbuilt)
@@ -2018,8 +2120,12 @@ build_binaries() {
         say "built on GitHub Actions"
         rm -rf "$CACHE.lock"
     else
-        say "GitHub Actions did not build them: the first GPU pod builds them once and the Mac caches them"
-        FALLBACK_BUILD=1
+        # No pod is rented to build: a commit Actions cannot build would not build on the pod either
+        # (frontier-gn-n32768's pod idled through such a build of a commit that did not compile).
+        rm -rf "$CACHE.lock"
+        say "GitHub Actions did not build $(echo $need) at ${C:0:12} (its errors: gha-run status, then gh run view RUN --log-failed); no pod is rented"
+        grep -o 'https://github.com/[^ )]*/actions/runs/[0-9]*' "$OUT/rp-run.log" | tail -n 1 | sed 's/^/rp-run: /' >&2
+        exit 1
     fi
 }
 
@@ -2029,11 +2135,20 @@ setup() {
     # Every step checks its own status: `set -e` does not act inside the condition this runs in. A
     # step that fails on the connection (ssh's 255) loses the pod; any other failure ends the run.
     # The source first: the data builds run its scripts.
+    # From GitHub at datacenter speed (the commit is published); the Mac's archive if that fails.
+    local members
+    members=$(printf "gam-$C/%s " crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md "${srcpaths[@]}")
+    if on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && curl -fsSL --retry 3 https://codeload.github.com/SauersML/gam/tar.gz/$C |
+            tar -xz --strip-components=1 -C $WS/src $members" < /dev/null 2> /dev/null; then
+        say "source ${C:0:12} from GitHub"
+    else
     git -C "$MAC_GAM" archive "$C" crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md "${srcpaths[@]}" |
         gzip -1 | on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && gzip -dc | tar -x -C $WS/src" || return 1
+    fi
     # Inputs, data, models and rsync (for syncing outputs) arrive while the toolchain and builds do.
     rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
     { upload_inputs && build_pile; } & jobs+=($!)
+    fetch_published & jobs+=($!)
     build_fineweb & jobs+=($!)
     fetch_models & jobs+=($!)
     python_env & jobs+=($!)
@@ -2105,6 +2220,12 @@ setup() {
     fi
     note_times
     say "set up in $(( $(date +%s) - started )) s (pod waited $(( $(date +%s) - CREATED )) s since its creation)"
+    # The GPU idles, paid, from the pod's creation to the command's start: over SETUP_FAIL seconds is
+    # a failure to fix (logged in setup_failures.tsv; the run goes on).
+    if (( $(date +%s) - CREATED > SETUP_FAIL )); then
+        say "SETUP FAILURE: $(( $(date +%s) - CREATED )) s from the pod's creation to the command (over $SETUP_FAIL s); see rp-run.log for the slow steps"
+        printf '%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$NAME" "$(( $(date +%s) - CREATED ))" "$POD" >> "$RP/setup_failures.tsv"
+    fi
 }
 
 # The outputs, copied to the Mac while the command runs, in two loops (sync_loop): checkpoints
@@ -2183,7 +2304,8 @@ sync_loop() {  # checkpoints | rest
 # minutes (the pod's own samples, every 10 s) ends the run as idle-stopped: it pays for a GPU it does
 # not use (CPU-only work goes to GitHub Actions: gha-run).
 idle_check() {
-    local started=$(date +%s) mean i
+    # From the pod's creation (or this run's packing onto it): setup is idle GPU too.
+    local started=${CREATED:-$(date +%s)} mean i
     while :; do
         for (( i = 0; i < 12; i++ )); do
             [ ! -f "$TMP/stop-sync" ] && kill -0 $$ 2> /dev/null || return 0
