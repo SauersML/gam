@@ -45,11 +45,6 @@
 //! The model runs on its device in that device's arithmetic; the vocabulary-wide searches (top
 //! tokens, OV entries) run on the products device; every reported token score is recomputed in
 //! float64 on the host from the selected tokens.
-//!
-//! [`Library::attributions`] (RelP: the reverse pass of the network linearized with every norm's
-//! denominator, every law's gate factor `φ(x)/x` and every attention pattern frozen, and half of
-//! the gradient through each factor of a product) remains for the explanation battery's circuits
-//! until it measures them by patching; the read-out does not use it.
 use crate::{
     artifact::Artifact,
     artifact_device::mapped_inlined_observed,
@@ -61,7 +56,7 @@ use crate::{
     tiled_attention::{probabilities, rotate},
 };
 use gam_gpu::tensor::{Arithmetic, Device, Op, Storage, Tensor};
-use ndarray::{Array1, Array2, ArrayBase, ArrayView1, ArrayView2, Axis, CowArray, Data, Ix1, Ix2, s};
+use ndarray::{Array1, Array2, ArrayBase, ArrayView1, Axis, CowArray, Data, Ix1, Ix2, s};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -457,7 +452,7 @@ fn dot(a: ArrayView1<f64>, b: ArrayView1<f64>) -> f64 {
 
 // ------------------------------------------------------------------------------ the library
 
-/// A library explanation prepared for forward passes and RelP attribution: its blocks, the native
+/// A library explanation prepared for forward passes: its blocks, the native
 /// reads and readout they act through, and its program compiled with every read, activation and
 /// attention input observed.
 pub struct Library<'a> {
@@ -505,28 +500,6 @@ struct Pass<'a> {
     weights: Vec<Vec<Values<'a>>>,
 }
 
-/// A cut of the reverse pass: one MLP's functions (an index into the MLPs) or one layer's heads
-/// (indices into the heads).
-enum Cut {
-    Mlp(usize),
-    Heads(usize),
-}
-
-/// What a cut's functions read, as the gradient of `m` in the linearized network with respect to
-/// each read's value per row: an MLP's gate pre-activations and up values (rows × functions); per
-/// head of the cut its value, and (when routes are asked for) its query and key projections (rows
-/// × head width).
-enum Reads<'r> {
-    Mlp { gate: &'r Array2<f64>, up: Option<&'r Array2<f64>> },
-    Heads(&'r HeadReads),
-}
-
-struct HeadReads {
-    value: Vec<Array2<f64>>,
-    query: Vec<Array2<f64>>,
-    key: Vec<Array2<f64>>,
-}
-
 /// One run of the explanation ([`Library::run`]).
 #[derive(Clone, Debug)]
 pub struct Run {
@@ -539,85 +512,6 @@ pub struct Run {
     pub weights: Vec<Vec<Array2<f64>>>,
     /// The final stream, before the final norm.
     pub last: Array2<f64>,
-}
-
-/// What the reverse pass hands its visitor at a cut: the cut, its attributions (rows × its
-/// functions), its reads, and `∂m/∂x` for the residual stream `x` right after the cut.
-struct Visit<'v> {
-    cut: Cut,
-    attribution: Array2<f64>,
-    reads: Reads<'v>,
-    after: &'v Array2<f64>,
-}
-
-/// One cut's completeness: the sum of its functions' attributions, the attribution `Σ ∂m/∂x · x`
-/// of the residual stream entering it along the skip connection, and the attribution of the
-/// biases of the functions after it; in the linearized network the three sum to `m`.
-#[derive(Clone, Debug, Serialize)]
-pub struct CutCheck {
-    pub name: String,
-    pub functions: f64,
-    pub stream: f64,
-    pub biases: f64,
-    pub metric: f64,
-}
-
-impl CutCheck {
-    /// `|functions + stream + biases − m| / |m|`.
-    #[must_use]
-    pub fn gap(&self) -> f64 {
-        ((self.functions + self.stream + self.biases - self.metric) / self.metric.abs()).abs()
-    }
-}
-
-/// A layer's gradients of the metric in the linearized network (`Prompt::gradients`): with
-/// respect to the residual stream after its attention and after its MLP (the attention and MLP
-/// outputs), each head's value, and its MLP's gate pre-activations (and up values when gated).
-#[derive(Clone, Debug)]
-pub struct LayerGradients {
-    pub attention_output: Array2<f64>,
-    pub mlp_output: Array2<f64>,
-    pub values: Vec<Array2<f64>>,
-    pub gate: Array2<f64>,
-    pub up: Option<Array2<f64>>,
-}
-
-/// A prompt to attribute: its tokens, an optional baseline of the same length (attributions are
-/// then of the difference of each function's value from its value on the baseline), and the
-/// metric.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Prompt {
-    pub tokens: Vec<u32>,
-    #[serde(default)]
-    pub baseline: Option<Vec<u32>>,
-    pub metric: Metric,
-    /// Whether to return each layer's gradients ([`LayerGradients`]).
-    #[serde(default)]
-    pub gradients: bool,
-}
-
-/// What is attributed: the sum over positions of the centred logit of the model's predicted token
-/// (a function's attribution at a position then includes its effect on later positions'
-/// predictions), or at one position the logit of `target` minus the logit of `foil`.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum Metric {
-    Predicted,
-    Difference { position: usize, target: u32, foil: u32 },
-}
-
-/// A prompt's attributions: per position the metric `m` (zero where it is not taken) and the
-/// predicted token, and per position and function (columns in [`Library::functions`]'s order)
-/// `A_i(t)` and the function's output norm (`|h_i| ‖u_i‖`, a head's `‖W_O,h z_h‖`); per layer its
-/// gradients when the prompt asks for them.
-#[derive(Clone, Debug)]
-pub struct PromptAttribution {
-    pub metric: Vec<f64>,
-    pub predicted: Vec<u32>,
-    pub attributions: Array2<f64>,
-    pub outputs: Array2<f64>,
-    pub gradients: Option<Vec<LayerGradients>>,
 }
 
 /// A function's identity: its name, layer and kind.
@@ -1266,102 +1160,7 @@ impl<'a> Library<'a> {
         Ok((predicted, seed, metric))
     }
 
-    /// RelP (module note): the reverse pass from `seed`, the metric's gradient in the final stream,
-    /// with every norm's denominator, every law's gate factor `φ(x)/x` and every attention pattern
-    /// frozen and half of the gradient through each factor of a product; each cut's attributions
-    /// (rows × its functions) and reads go to `visit`, deepest first. With `baseline`, a function's
-    /// value is taken less its value on the baseline. With `routes`, each head's reads also carry
-    /// the gradient through its scores: `c q·k` split half to each factor, through the softmax's
-    /// derivative and the head norms (denominators frozen); the reverse pass itself keeps the
-    /// patterns frozen.
-    /// Returns `∂m/∂x` for the embedding stream `x` entering the first layer.
-    fn relp(&self, pass: &Pass<'_>, seed: Array2<f64>, baseline: Option<&Pass<'_>>, routes: bool, visit: &mut dyn FnMut(Visit<'_>)) -> Array2<f64> {
-        let length = pass.rows / pass.weights.first().map_or(1, |w| w.len().max(1));
-        let positions: Vec<u32> = (0..length as u32).collect();
-        let mut g = seed;
-        for l in (0..self.layer_heads.len()).rev() {
-            for (b, block) in self.mlps.iter().enumerate().filter(|(_, b)| b.layer == l) {
-                let (activations, pre, up) = &pass.mlp[b];
-                let d = g.dot(&block.out);
-                let value = match baseline {
-                    Some(base) => activations - &base.mlp[b].0,
-                    None => activations.to_owned(),
-                };
-                let through = |factor: ArrayView2<'_, f64>, share: f64| {
-                    let mut out = &d * activations;
-                    ndarray::Zip::from(&mut out).and(factor).for_each(|o, f| *o = if *f == 0.0 { 0.0 } else { share * *o / f });
-                    out
-                };
-                let (gate, up_gradient) = match (up, &block.up) {
-                    (Some(up_values), Some(_)) => (through(pre.view(), 0.5), Some(through(up_values.view(), 0.5))),
-                    _ => (through(pre.view(), 1.0), None),
-                };
-                let mut read = gate.dot(&block.gate);
-                if let (Some(up_gradient), Some((_, up_map))) = (&up_gradient, &block.up) {
-                    read = read + up_gradient.dot(up_map);
-                }
-                visit(Visit { cut: Cut::Mlp(b), attribution: value * &d, reads: Reads::Mlp { gate: &gate, up: up_gradient.as_ref() }, after: &g });
-                let (gain, inv) = (&self.sites[2 * l + 1].gain, &pass.inverse[2 * l + 1]);
-                g = g + read * &gain.view().insert_axis(Axis(0)) * &inv.view().insert_axis(Axis(1));
-            }
-            let members = &self.layer_heads[l];
-            if members.is_empty() {
-                continue;
-            }
-            let mut attribution = Array2::<f64>::zeros((pass.rows, members.len()));
-            let mut delta = Array2::<f64>::zeros(g.dim());
-            let mut reads = HeadReads { value: Vec::new(), query: Vec::new(), key: Vec::new() };
-            for (c, &h) in members.iter().enumerate() {
-                let block = &self.heads[h];
-                let [q, k, z, v, query_projection, key_projection] = &pass.head[h];
-                let gz = g.dot(&block.output);
-                let value = match baseline {
-                    Some(base) => z - &base.head[h][2],
-                    None => z.to_owned(),
-                };
-                attribution.column_mut(c).assign(&(value * &gz).sum_axis(Axis(1)));
-                let mut gv = Array2::<f64>::zeros(gz.dim());
-                let (mut gq, mut gk) = (Array2::<f64>::zeros(q.dim()), Array2::<f64>::zeros(k.dim()));
-                for (s, weights) in pass.weights[h].iter().enumerate() {
-                    let span = s * length..(s + 1) * length;
-                    let gzs = gz.slice(s![span.clone(), ..]);
-                    gv.slice_mut(s![span.clone(), ..]).assign(&weights.t().dot(&gzs));
-                    if !routes {
-                        continue;
-                    }
-                    // ∂m/∂S_τσ = A_τσ (∂m/∂z_τ · (v_σ − z_τ)), then half of `c q·k` to each factor.
-                    let own = (&gzs * &z.slice(s![span.clone(), ..])).sum_axis(Axis(1));
-                    let mut scores = gzs.dot(&v.slice(s![span.clone(), ..]).t());
-                    ndarray::Zip::indexed(&mut scores).and(weights).for_each(|(t, _), d, w| *d = w * (*d - own[t]));
-                    let (qs, ks) = (q.slice(s![span.clone(), ..]).to_owned(), k.slice(s![span.clone(), ..]).to_owned());
-                    let (qs, ks) = (rotate(&qs, block.rotary, &positions, false), rotate(&ks, block.rotary, &positions, false));
-                    let half = 0.5 * block.scale;
-                    let (dq, dk) = (scores.dot(&*ks) * half, scores.t().dot(&*qs) * half);
-                    let (dq, dk) = (rotate(&dq, block.rotary, &positions, true).into_owned(), rotate(&dk, block.rotary, &positions, true).into_owned());
-                    let unnormed = |grad: Array2<f64>, read: &Read, projection: ndarray::ArrayView2<f64>| match &read.norm {
-                        Some((gain, epsilon)) => {
-                            let mut out = grad * &gain.view().insert_axis(Axis(0));
-                            out.outer_iter_mut().zip(projection.outer_iter()).for_each(|(mut row, p)| row *= rms_scale(p, *epsilon));
-                            out
-                        }
-                        None => grad,
-                    };
-                    gq.slice_mut(s![span.clone(), ..]).assign(&unnormed(dq, &block.query, query_projection.slice(s![span.clone(), ..])));
-                    gk.slice_mut(s![span.clone(), ..]).assign(&unnormed(dk, &block.key, key_projection.slice(s![span, ..])));
-                }
-                delta = delta + gv.dot(&block.value);
-                reads.value.push(gv);
-                reads.query.push(gq);
-                reads.key.push(gk);
-            }
-            visit(Visit { cut: Cut::Heads(l), attribution, reads: Reads::Heads(&reads), after: &g });
-            let (gain, inv) = (&self.sites[2 * l].gain, &pass.inverse[2 * l]);
-            g = g + delta * &gain.view().insert_axis(Axis(0)) * &inv.view().insert_axis(Axis(1));
-        }
-        g
-    }
-
-    /// The first column of each cut's functions in [`Library::functions`]'s order.
+    /// The first column of each layer's heads and of each MLP's functions in [`Library::functions`]'s order.
     fn columns(&self) -> (Vec<usize>, Vec<usize>) {
         let (mut heads, mut mlps) = (vec![0; self.layer_heads.len()], vec![0; self.mlps.len()]);
         let mut next = 0;
@@ -1374,112 +1173,6 @@ impl<'a> Library<'a> {
             }
         }
         (heads, mlps)
-    }
-
-    /// RelP attributions of `prompt`'s metric to every function at every position.
-    pub fn attributions(&self, prompt: &Prompt) -> Result<PromptAttribution, String> {
-        let rows = prompt.tokens.len();
-        if rows == 0 || prompt.baseline.as_ref().is_some_and(|b| b.len() != rows) {
-            return Err("a prompt must be nonempty and its baseline of the same length".into());
-        }
-        let pass = self.pass(&[&prompt.tokens])?;
-        let baseline = prompt.baseline.as_ref().map(|b| self.pass(&[b])).transpose()?;
-        let (predicted, seed, metric) = match &prompt.metric {
-            Metric::Predicted => self.predicted(&pass)?,
-            Metric::Difference { position, target, foil } => {
-                let (t, f, p) = (*target as usize, *foil as usize, *position);
-                if p >= rows || t >= self.unembedding.nrows() || f >= self.unembedding.nrows() {
-                    return Err("a difference metric outside the prompt or the vocabulary".into());
-                }
-                let mut seed = Array2::<f64>::zeros(pass.last.dim());
-                let row = (&self.unembedding.row(t) - &self.unembedding.row(f)) * pass.inverse_final[p];
-                let mut metric = vec![0.0; rows];
-                metric[p] = row.dot(&pass.last.row(p));
-                seed.row_mut(p).assign(&row);
-                (self.predicted(&pass)?.0, seed, metric)
-            }
-        };
-        let (head_columns, mlp_columns) = self.columns();
-        let mut attributions = Array2::<f64>::zeros((rows, self.functions().len()));
-        let empty = || Array2::<f64>::zeros((0, 0));
-        let mut gradients: Vec<LayerGradients> = (0..self.layer_heads.len())
-            .map(|_| LayerGradients { attention_output: empty(), mlp_output: empty(), values: Vec::new(), gate: empty(), up: None })
-            .collect();
-        self.relp(&pass, seed, baseline.as_ref(), false, &mut |visit| {
-            let start = match visit.cut {
-                Cut::Mlp(b) => mlp_columns[b],
-                Cut::Heads(l) => head_columns[l],
-            };
-            attributions.slice_mut(s![.., start..start + visit.attribution.ncols()]).assign(&visit.attribution);
-            if !prompt.gradients {
-                return;
-            }
-            if let (Cut::Mlp(b), Reads::Mlp { gate, up }) = (&visit.cut, &visit.reads) {
-                let layer = &mut gradients[self.mlps[*b].layer];
-                layer.mlp_output = visit.after.clone();
-                layer.gate = (*gate).clone();
-                layer.up = up.cloned();
-            }
-            if let (Cut::Heads(l), Reads::Heads(reads)) = (&visit.cut, &visit.reads) {
-                gradients[*l].attention_output = visit.after.clone();
-                gradients[*l].values = reads.value.clone();
-            }
-        });
-        let mut outputs = Array2::<f64>::zeros(attributions.dim());
-        for (b, block) in self.mlps.iter().enumerate() {
-            let norms = block.out.map_axis(Axis(0), |u| u.dot(&u).sqrt());
-            let start = mlp_columns[b];
-            outputs.slice_mut(s![.., start..start + norms.len()]).assign(&(pass.mlp[b].0.mapv(f64::abs) * &norms.view().insert_axis(Axis(0))));
-        }
-        for (l, members) in self.layer_heads.iter().enumerate() {
-            for (c, &h) in members.iter().enumerate() {
-                let z = &pass.head[h][2];
-                let gram = self.heads[h].output.t().dot(&self.heads[h].output);
-                outputs.column_mut(head_columns[l] + c).assign(&(z.dot(&gram) * z).sum_axis(Axis(1)).mapv(|v| v.max(0.0).sqrt()));
-            }
-        }
-        let gradients = prompt.gradients.then_some(gradients);
-        Ok(PromptAttribution { metric, predicted: predicted.into_iter().map(|t| t as u32).collect(), attributions, outputs, gradients })
-    }
-
-    /// RelP's completeness on `prompt` (no baseline): at every cut, its functions' attributions,
-    /// the skip connection's `Σ ∂m/∂x · x` and the biases after it against `m` (summed over
-    /// positions), and finally the embedding stream's, named `embedding`. In the linearized network
-    /// each total equals `m` up to rounding.
-    pub fn completeness(&self, prompt: &Prompt) -> Result<Vec<CutCheck>, String> {
-        let pass = self.pass(&[&prompt.tokens])?;
-        let (seed, metric) = match &prompt.metric {
-            Metric::Predicted => {
-                let (_, seed, metric) = self.predicted(&pass)?;
-                (seed, metric.iter().sum::<f64>())
-            }
-            Metric::Difference { position, target, foil } => {
-                let (t, f, p) = (*target as usize, *foil as usize, *position);
-                if p >= pass.rows || t >= self.unembedding.nrows() || f >= self.unembedding.nrows() {
-                    return Err("a difference metric outside the prompt or the vocabulary".into());
-                }
-                let mut seed = Array2::<f64>::zeros(pass.last.dim());
-                seed.row_mut(p).assign(&((&self.unembedding.row(t) - &self.unembedding.row(f)) * pass.inverse_final[p]));
-                let m = seed.row(p).dot(&pass.last.row(p));
-                (seed, m)
-            }
-        };
-        let (mut checks, mut biases) = (Vec::new(), 0.0);
-        let embedding = self.relp(&pass, seed, None, false, &mut |visit| {
-            let (name, site) = match visit.cut {
-                Cut::Mlp(b) => (format!("L{}.mlp", self.mlps[b].layer), 2 * self.mlps[b].layer + 1),
-                Cut::Heads(l) => (format!("L{l}.heads"), 2 * l),
-            };
-            checks.push(CutCheck { name, functions: visit.attribution.sum(), stream: (visit.after * &pass.streams[site]).sum(), biases, metric });
-            // A function's pre-activation bias c enters h through the frozen factor as the
-            // gradient with respect to the pre-activation times c.
-            if let (Cut::Mlp(b), Reads::Mlp { gate, up }) = (&visit.cut, &visit.reads) {
-                let block = &self.mlps[*b];
-                biases += gate.dot(&block.bias).sum() + up.map_or(0.0, |u| u.dot(&block.up_bias).sum());
-            }
-        });
-        checks.push(CutCheck { name: "embedding".into(), functions: 0.0, stream: (&embedding * &pass.streams[0]).sum(), biases, metric });
-        Ok(checks)
     }
 }
 
@@ -1943,7 +1636,7 @@ pub fn function_costs(explanation: &Explanation, posterior: &Posterior) -> Vec<F
 
 #[cfg(test)]
 mod tests {
-    use super::{Library, Metric, Prompt};
+    use super::Library;
     use crate::{
         import::import_language_model,
         library_mdl,
@@ -1952,31 +1645,6 @@ mod tests {
         test_support::{tiny_export, tiny_qwen3_export},
     };
     use gam_gpu::tensor::Device;
-    use std::path::PathBuf;
-
-    /// The largest relative gap `|Σ_i A_i + Σ ∂m/∂x · x − m| / |m|` over every cut (and the
-    /// embedding stream) of the tiny decoder exported to `dir`, on its six sequences, for the
-    /// predicted tokens' logits and for a logit difference at one position.
-    fn largest_gap(dir: PathBuf) -> f64 {
-        let imported = import_language_model(&dir, 6, 12).expect("tiny export");
-        std::fs::remove_dir_all(dir).expect("remove the tiny export");
-        let native = split_sites(&imported.program).expect("split sites");
-        let layers = layer_nodes(&native, 2).expect("layer nodes");
-        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
-        let artifact = library_mdl::explanation(&native, &layers).expect("library").artifact;
-        let host = Device::host();
-        let library = Library::new(&host, &host, &native, &layers, &artifact, 1 << 30, 64).expect("library on the host");
-        let mut largest: f64 = 0.0;
-        for (i, sequence) in tokens.chunks(12).enumerate() {
-            for metric in [Metric::Predicted, Metric::Difference { position: 4 + i, target: 1, foil: 2 }] {
-                let prompt = Prompt { tokens: sequence.to_vec(), baseline: None, metric, gradients: false };
-                for check in library.completeness(&prompt).expect("completeness") {
-                    largest = largest.max(check.gap());
-                }
-            }
-        }
-        largest
-    }
 
     /// A head recomputed on the run's own streams gives its read, a run whose head reads are
     /// replaced by their own values reproduces the run, and a replaced read changes what follows.
@@ -2043,21 +1711,4 @@ mod tests {
         }
     }
 
-    /// RelP's attributions with the skip connection account for the metric at every cut of a GELU
-    /// decoder (frozen norm denominators, frozen gate factors, frozen attention patterns).
-    #[test]
-    fn relp_is_complete_at_every_cut_of_a_gelu_decoder() {
-        let gap = largest_gap(tiny_export("readout_complete_gelu", 2));
-        eprintln!("readout_complete_gelu: largest relative gap {gap:e}");
-        assert!(gap < 1e-10, "largest relative gap {gap}");
-    }
-
-    /// ... and of a SiLU-gated decoder with head norms and a shared key and value: half of the
-    /// gradient through each factor of gate × up.
-    #[test]
-    fn relp_is_complete_at_every_cut_of_a_gated_decoder() {
-        let gap = largest_gap(tiny_qwen3_export("readout_complete_gated", 2));
-        eprintln!("readout_complete_gated: largest relative gap {gap:e}");
-        assert!(gap < 1e-10, "largest relative gap {gap}");
-    }
 }

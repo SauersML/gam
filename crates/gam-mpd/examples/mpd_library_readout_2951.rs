@@ -1,11 +1,9 @@
 //! The read-out of a library explanation (`gam_mpd::library_readout`, #2951) on an export's
-//! held-out token rows: per surviving function its RelP importance, contexts, written and read tokens,
+//! held-out token rows: per surviving function its contexts, written and read tokens,
 //! attention summary and inputs, with every context decoded to text.
 //!
 //! EXPORT TOKENIZER SETTINGS.json OUT.json [ARTIFACT]
-//! relp EXPORT PROMPTS.json OUT_DIR [ARTIFACT]
 //! costs EXPORT CHECKPOINT OUT.json [READOUT.json]
-//! complete EXPORT PROMPTS.json OUT.json [ARTIFACT]
 //! removals EXPORT REMOVALS.json OUT.json [ARTIFACT]
 //!
 //! The `removals` mode measures every function's removal (`Library::removal_effects`) on held-out
@@ -13,18 +11,6 @@
 //! tokens, and per token the effective number of functions its prediction rests on,
 //! `(Σ_i |ΔKL_i|)² / Σ_i ΔKL_i²`, with its quantiles. `REMOVALS.json` is `{export_sha256, context,
 //! held_out: [start, end), batch, numeric_bytes, tile_rows}`.
-//!
-//! The `complete` mode checks RelP's completeness on each prompt (`Library::completeness`): at
-//! every cut, its functions' attributions plus the skip connection's against the metric, in
-//! float64 (CUDA, else the host); it writes every check and the largest relative gap.
-//!
-//! The `relp` mode attributes each prompt's metric to every function at every position
-//! (`Library::attributions`). `PROMPTS.json` is `{export_sha256, numeric_bytes, tile_rows,
-//! prompts: [{tokens, baseline?, metric: "predicted" | {difference: {position, target, foil}}}]}`;
-//! `OUT_DIR` (fresh) receives `functions.json` (the attribution columns: name, layer, kind),
-//! `attributions.json` (per prompt its metric and predicted token per position and its file) and
-//! per prompt `prompt{i}.f64` and `prompt{i}.outputs.f64`, its positions × functions attributions
-//! and output norms as little-endian float64.
 //!
 //! Without `ARTIFACT` (a `library_mdl` posterior-mean `artifact.bin`), the read-out is of the
 //! library's starting point, where every function is a native head or neuron. The model runs on
@@ -45,15 +31,6 @@ use gam_mpd::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, time::Instant};
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Prompts {
-    export_sha256: String,
-    numeric_bytes: usize,
-    tile_rows: usize,
-    prompts: Vec<library_readout::Prompt>,
-}
 
 /// The model's device (CUDA in float64, else the Apple GPU, else the host) and the device of
 /// vocabulary-wide products (the single-precision device, else the model's).
@@ -85,49 +62,6 @@ fn load(export: &Path, sequences: usize, context: usize, artifact: Option<&Path>
     };
     artifact.validate_coverage(&native)?;
     Ok((native, layers, tokens, artifact))
-}
-
-fn relp(args: &[String]) -> Result<(), String> {
-    let (export, prompts_path, out, artifact_path) = match args {
-        [e, p, o] => (e, p, o, None),
-        [e, p, o, a] => (e, p, o, Some(Path::new(a))),
-        _ => return Err("relp EXPORT PROMPTS.json OUT_DIR [ARTIFACT]".into()),
-    };
-    let (export, out) = (Path::new(export), Path::new(out));
-    let prompts: Prompts = serde_json::from_slice(&std::fs::read(prompts_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    if sha256(&export.join("export.json"))? != prompts.export_sha256 {
-        return Err("export hash mismatch".into());
-    }
-    if out.exists() {
-        return Err("a fresh output directory required".into());
-    }
-    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
-    let started = Instant::now();
-    let (model, wide) = devices()?;
-    let (native, layers, _, artifact) = load(export, 1, 1, artifact_path)?;
-    let library = Library::new(&model, &wide, &native, &layers, &artifact, prompts.numeric_bytes, prompts.tile_rows)?;
-    std::fs::write(out.join("functions.json"), serde_json::to_vec(&library.functions()).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    let mut index = Vec::new();
-    for (i, prompt) in prompts.prompts.iter().enumerate() {
-        let a = library.attributions(prompt)?;
-        let file = format!("prompt{i}.f64");
-        let bytes: Vec<u8> = a.attributions.iter().flat_map(|v| v.to_le_bytes()).collect();
-        std::fs::write(out.join(&file), bytes).map_err(|e| e.to_string())?;
-        let bytes: Vec<u8> = a.outputs.iter().flat_map(|v| v.to_le_bytes()).collect();
-        std::fs::write(out.join(format!("prompt{i}.outputs.f64")), bytes).map_err(|e| e.to_string())?;
-        index.push(json!({"file": file, "rows": a.attributions.nrows(), "functions": a.attributions.ncols(), "metric": a.metric, "predicted": a.predicted}));
-    }
-    let report = json!({
-        "export": export.display().to_string(),
-        "prompts_sha256": sha256(Path::new(prompts_path))?,
-        "artifact": artifact_path.map(|p| p.display().to_string()),
-        "artifact_sha256": artifact_path.map(sha256).transpose()?,
-        "source_revision": option_env!("GAM_BUILD_GIT_SHA"),
-        "model_device": model.name(),
-        "prompts": index,
-        "seconds": started.elapsed().as_secs_f64(),
-    });
-    std::fs::write(out.join("attributions.json"), serde_json::to_vec(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
 /// Where a fit checkpoint's code length goes: per function its bits, summed per layer and kind,
@@ -183,40 +117,6 @@ fn costs(args: &[String]) -> Result<(), String> {
         "most_expensive": expensive,
         "functions": costs,
     });
-    std::fs::write(out, serde_json::to_vec(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
-}
-
-fn complete(args: &[String]) -> Result<(), String> {
-    let (export, prompts_path, out, artifact_path) = match args {
-        [e, p, o] => (e, p, o, None),
-        [e, p, o, a] => (e, p, o, Some(Path::new(a))),
-        _ => return Err("complete EXPORT PROMPTS.json OUT.json [ARTIFACT]".into()),
-    };
-    let export = Path::new(export);
-    let prompts: Prompts = serde_json::from_slice(&std::fs::read(prompts_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    if sha256(&export.join("export.json"))? != prompts.export_sha256 {
-        return Err("export hash mismatch".into());
-    }
-    let device = Device::accelerator(GpuPolicy::Auto).map_err(|e| e.to_string())?.unwrap_or_else(Device::host);
-    let (native, layers, _, artifact) = load(export, 1, 1, artifact_path)?;
-    let library = Library::new(&device, &device, &native, &layers, &artifact, prompts.numeric_bytes, prompts.tile_rows)?;
-    let mut largest: f64 = 0.0;
-    let mut checks = Vec::new();
-    for prompt in &prompts.prompts {
-        let cut = library.completeness(prompt)?;
-        largest = cut.iter().fold(largest, |m, c| m.max(c.gap()));
-        checks.push(cut);
-    }
-    let report = json!({
-        "export": export.display().to_string(),
-        "prompts_sha256": sha256(Path::new(prompts_path))?,
-        "artifact": artifact_path.map(|p| p.display().to_string()),
-        "source_revision": option_env!("GAM_BUILD_GIT_SHA"),
-        "device": device.name(),
-        "largest_relative_gap": largest,
-        "checks": checks,
-    });
-    log::info!("largest relative completeness gap {largest:e} over {} prompts", prompts.prompts.len());
     std::fs::write(out, serde_json::to_vec(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
@@ -311,14 +211,8 @@ struct Settings {
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|a| a == "relp") {
-        return relp(&args[1..]);
-    }
     if args.first().is_some_and(|a| a == "costs") {
         return costs(&args[1..]);
-    }
-    if args.first().is_some_and(|a| a == "complete") {
-        return complete(&args[1..]);
     }
     if args.first().is_some_and(|a| a == "removals") {
         return removals(&args[1..]);
