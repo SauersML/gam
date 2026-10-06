@@ -4609,6 +4609,63 @@ mod tests {
         assert_eq!(resumed.posterior.active, uninterrupted.posterior.active);
     }
 
+    /// A resumed fit is the uninterrupted one bit for bit also where the step has moved IVON's
+    /// iterate (the tiny fit above stops before it moves: fewer than `RATIO_DRAWS` draws) and on a
+    /// transcoder block (ReLU features with fixed biases, `M`'s MLP at each sequence's first
+    /// token through its `Node::Select`): eight epochs of the tiny Qwen3 decoder with layer 1's
+    /// MLP 64 transcoder features, stopped in the sixth epoch's second step after the iterate has
+    /// moved, resume to the uninterrupted fit's final checkpoint (means, deviations, IVON's
+    /// state, the iterate and the steps its average spans) and its epochs' objectives; the
+    /// iterate moves both before the stop and after the resume.
+    #[test]
+    fn a_transcoder_fit_stopped_after_its_iterate_moved_resumes_bit_exactly() {
+        let export = crate::test_support::tiny_qwen3_export("library_fit_moved", 2);
+        let imported = import_language_model(&export, 6, 12).unwrap();
+        std::fs::remove_dir_all(&export).unwrap();
+        let native = split_sites(&imported.program).unwrap();
+        let layers = layer_nodes(&native, 2).unwrap();
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let dir = std::env::temp_dir().join(format!("library_fit_moved_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (full, kept_path) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
+        crate::test_support::transcoder_file(&full, 64, 8, 3);
+        crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..64).collect::<Vec<_>>(), &kept_path).unwrap();
+        let explanation = explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
+        let settings = Settings { epochs: Some(8), ..settings() };
+        let device = Device::host();
+        let (train, held) = sequences.split_at(4);
+        let batches = (train.len() / settings.batch_sequences) as u64;
+        let (whole, stopped) = (dir.join("whole.bin"), dir.join("stopped.bin"));
+        let groups = explanation.groups.len();
+        let uninterrupted = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&whole), Some(&mut Stop { groups, steps: 0, stop: None })).unwrap();
+        let Err(message) = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&stopped), Some(&mut Stop { groups, steps: 0, stop: Some(5 * batches + 2) })) else {
+            panic!("the fit ran past its stop");
+        };
+        assert!(message.contains("stopped"), "{message}");
+        // The checkpoint the resume reads: five epochs, ten steps.
+        let middle = checkpoint_start(&explanation, &stopped).unwrap();
+        assert_eq!(middle.epoch, 5);
+        let resumed = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&stopped), Some(&mut Stop { groups, steps: 0, stop: None })).unwrap();
+        let start = checkpoint_start(&explanation, &whole.with_extension("start.bin")).unwrap();
+        let (a, b) = (checkpoint_start(&explanation, &stopped).unwrap(), checkpoint_start(&explanation, &whole).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+        let iterate = |s: &Start| s.iterate.as_ref().expect("a checkpoint holds the iterate").0.clone();
+        assert_ne!(iterate(&middle), start.mean, "the iterate moved before the stop");
+        assert_ne!(iterate(&b), iterate(&middle), "the iterate moved after the resume");
+        assert_ne!(b.mean, middle.mean, "the means moved after the resume");
+        assert_eq!((a.steps, a.epoch), (b.steps, b.epoch));
+        assert_eq!(a.mean, b.mean, "the means");
+        assert_eq!(a.log_sd, b.log_sd, "the deviations");
+        assert_eq!(a.active, b.active);
+        assert_eq!(a.state, b.state, "IVON's state");
+        assert_eq!(a.iterate, b.iterate, "the iterate and the steps its average spans");
+        assert_eq!(resumed.report.epochs.len(), uninterrupted.report.epochs.len());
+        for (x, y) in resumed.report.epochs.iter().zip(&uninterrupted.report.epochs) {
+            assert_eq!(x.objective_bits.to_bits(), y.objective_bits.to_bits(), "epoch {}", x.epoch);
+        }
+    }
+
     /// A removal trial (a copy of the posterior with groups removed) shares every operator the
     /// removed groups do not touch with its source, and copies only those they do; the device's
     /// upload of the trial sends only those, and its values equal a full upload's bit for bit.
