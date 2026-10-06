@@ -65,21 +65,20 @@
 //!
 //! # The search
 //!
-//! The ranked units are taken in segments, each on top of the removals accepted so far. A segment
-//! proposes every remaining unit whole; on rejection the proposal halves (the first `n/2`, `n/4`,
-//! … units) until one is accepted, then bisects between the longest accepted and the shortest
-//! rejected prefix. The longest accepted prefix is removed; the unit after it is the one the
-//! segment ended on, its own effect being the difference of the two prefixes (a single-unit test),
-//! and it is kept; the next segment starts after it. A segment over `n` units costs at most
-//! `log2 n + 3` evaluations, and a rejection of a large set is settled after a few batches (below).
-//! Each proposal also removes the groups it leaves without effect. When the whole, every half and
-//! the first unit alone are rejected and no remaining unit is estimated to lower `F`, the round
-//! ends, and the units after the first are counted as tested only jointly (`Removal::untested`).
-//! Beyond that end of the ranking, the units' estimates decide no proposal: a set's second-order
-//! estimate grows with its size where the data term saturates
-//! (on vpd4l at the Laplace start, N = 2^16, sets of 1,000 or more units were estimated at +0.5M to
-//! +13M bits and measured at −0.5M to −0.9M), so how far a segment reaches rests on the measured
-//! paired sums alone.
+//! The search proposes ranges of the ranked units, each on top of the removals accepted so far:
+//! first all of them; a rejected range splits into its first and second halves, proposed in that
+//! order, down to single units, each rejected alone being kept. A range whose units are all
+//! estimated not to lower `F` is not split on rejection: its units are counted as tested only
+//! jointly (`Removal::untested`). Each proposal also removes the groups it leaves without effect.
+//! With `m` units that block their ranges, about `2 m log2(n/m)` proposals settle `n` units; a
+//! rejection is usually settled after a few batches (below), so the cost is mostly the accepted
+//! ranges' full evaluations. The estimates only order the units and mark where splitting stops: a
+//! set's second-order estimate grows with its size where the data term saturates (on vpd4l at the
+//! Laplace start, N = 2^16, sets of 1,000 or more units were estimated at +0.5M to +13M bits and
+//! measured at −0.5M to −0.9M), so which ranges are removed rests on the measured paired sums.
+//! Searching prefixes instead (the longest accepted prefix, then again from the unit after the one
+//! that blocked it) took one segment of `log2 n` proposals per blocking unit and at N = 2^24 removed
+//! 77 groups in its first hour.
 //!
 //! Every evaluation is `F` on the fixed collection at one common weight sample per batch, with the
 //! MLPs that lose functions compensated by least squares when compensation is on
@@ -977,117 +976,77 @@ pub fn round(
         "units": units.iter().map(|u| json!({"groups": u.groups, "roots": u.roots, "predicted_bits": u.predicted / LN_2})).collect::<Vec<Value>>(),
     }))?;
     units.sort_by(|a, b| a.predicted.total_cmp(&b.predicted));
-    let mut rest: &[Unit] = &units;
-    while !rest.is_empty() {
-        let base: &Posterior = posterior;
-        // The groups of the first `k` units still active, with those their removal leaves
-        // without effect.
-        let proposal = |k: usize| -> Result<Vec<usize>, String> {
-            let mut groups: Vec<usize> = rest[..k].iter().flat_map(|u| u.groups.iter().copied()).filter(|g| base.active[*g]).collect();
-            groups.sort_unstable();
-            groups.dedup();
-            let mut active = base.active.clone();
-            for g in &groups {
-                active[*g] = false;
-            }
-            groups.extend(structure.dead(&active)?);
-            groups.sort_unstable();
-            Ok(groups)
-        };
-        // Per tested prefix length, its change of `F` and its evaluation.
-        let mut changes: BTreeMap<usize, (f64, Evaluation)> = BTreeMap::new();
-        let from = &accepted_evaluation;
-        // The last accepted proposal's trial: the searches return the length they last accepted,
-        // so it is the next posterior and is not solved again.
-        let mut kept: Option<(usize, Posterior)> = None;
-        let mut test = |k: usize, kind: &str| -> Result<bool, String> {
-            let timed = Instant::now();
-            let groups = proposal(k)?;
-            let proposed = trial(base, &groups)?;
-            let trial_seconds = timed.elapsed().as_secs_f64();
-            let evaluation = objective(&proposed, Some(from))?;
-            let change = evaluation.change(from);
-            if !change.is_finite() {
-                return Err(error("a nonfinite removal objective"));
-            }
-            let removed_now = active - base.active.iter().filter(|a| **a).count();
-            // The description's change exactly, with the compensated survivors' moved means, and
-            // the part the deleted groups' costs and the subset code make.
-            let description = proposed.description() - base.description();
-            let deleted = -groups.iter().map(|g| costs[*g]).sum::<f64>() + subset_change(removed_now + groups.len())? - subset_change(removed_now)?;
-            // The data term's first-order change from the compensation's move of the surviving
-            // means, `Σ_b g_b · Δ` over the entries both posteriors keep.
-            let moved: f64 = curvature
-                .gradient
-                .iter()
-                .map(|(i, g)| {
-                    let mut dot = 0.0;
-                    ndarray::Zip::from(g).and(&proposed.mean[*i]).and(&base.mean[*i]).and(&proposed.log_sd[*i]).for_each(|g, after, before, s| {
-                        if *s != f64::NEG_INFINITY {
-                            dot += g * (after - before);
-                        }
-                    });
-                    dot
-                })
-                .sum();
-            let predicted = rest[..k].iter().map(|u| u.data).sum::<f64>() + moved + description;
-            // With the Gauss–Newton cross terms between the units, without compensation.
-            let roots: Vec<(usize, f64)> = rest[..k].iter().flat_map(|u| u.roots.iter().map(|r| (*r, 1.0 / u.roots.len() as f64))).collect();
-            let joint = curvature.joint(&roots) + deleted;
-            let accepted = evaluation.complete && change <= 0.0;
-            journal.write(json!({
-                "event": "proposal", "kind": kind, "units": k, "groups": groups, "layers": names(&groups),
-                "predicted_bits": predicted / LN_2, "joint_plain_bits": joint / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
-                "description_bits": description / LN_2, "description_deleted_bits": deleted / LN_2, "compensation_slope_bits": moved / LN_2,
-                "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(), "trial_seconds": trial_seconds,
-            }))?;
-            evaluations.push((groups.len(), change / LN_2));
-            changes.insert(k, (change, evaluation));
-            if accepted {
-                kept = Some((k, proposed));
-            }
-            Ok(accepted)
-        };
-        // Every remaining unit, then halves, then bisection: the measured paired sums decide.
-        let accepted = gallop_down(rest.len(), &mut test)?;
-        // The change of `F` from the accepted prefix (complete) to the next length, on the batches
-        // both scored, exact when the next length's evaluation is complete (before the accepted
-        // prefix's evaluation is taken).
-        let blocked = changes.get(&(accepted + 1)).map(|(after, evaluation)| match changes.get(&accepted) {
-            Some((_, prefix)) => (evaluation.change(prefix), evaluation.complete),
-            None => (*after, evaluation.complete),
-        });
-        if accepted > 0 {
-            let next = match kept.take() {
-                Some((k, proposed)) if k == accepted => proposed,
-                _ => trial(base, &proposal(accepted)?)?,
-            };
-            *posterior = next;
-            let (change, evaluation) = changes.remove(&accepted).ok_or_else(|| error("an accepted prefix without its evaluation"))?;
+    // Ranges of the ranked units still to propose, the next on top.
+    let mut ranges: Vec<(usize, usize)> = vec![(0, units.len())];
+    while let Some((low, high)) = ranges.pop() {
+        let span = &units[low..high];
+        // The range's groups still active, with those their removal leaves without effect.
+        let mut groups: Vec<usize> = span.iter().flat_map(|u| u.groups.iter().copied()).filter(|g| posterior.active[*g]).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        if groups.is_empty() {
+            continue;
+        }
+        let mut left = posterior.active.clone();
+        for g in &groups {
+            left[*g] = false;
+        }
+        groups.extend(structure.dead(&left)?);
+        groups.sort_unstable();
+        let timed = Instant::now();
+        let proposed = trial(posterior, &groups)?;
+        let trial_seconds = timed.elapsed().as_secs_f64();
+        let evaluation = objective(&proposed, Some(&accepted_evaluation))?;
+        let change = evaluation.change(&accepted_evaluation);
+        if !change.is_finite() {
+            return Err(error("a nonfinite removal objective"));
+        }
+        let removed_now = active - posterior.active.iter().filter(|a| **a).count();
+        // The description's change exactly, with the compensated survivors' moved means, and
+        // the part the deleted groups' costs and the subset code make.
+        let description = proposed.description() - posterior.description();
+        let deleted = -groups.iter().map(|g| costs[*g]).sum::<f64>() + subset_change(removed_now + groups.len())? - subset_change(removed_now)?;
+        // The data term's first-order change from the compensation's move of the surviving
+        // means, `Σ_b g_b · Δ` over the entries both posteriors keep.
+        let moved: f64 = curvature
+            .gradient
+            .iter()
+            .map(|(i, g)| {
+                let mut dot = 0.0;
+                ndarray::Zip::from(g).and(&proposed.mean[*i]).and(&posterior.mean[*i]).and(&proposed.log_sd[*i]).for_each(|g, after, before, s| {
+                    if *s != f64::NEG_INFINITY {
+                        dot += g * (after - before);
+                    }
+                });
+                dot
+            })
+            .sum();
+        let predicted = span.iter().map(|u| u.data).sum::<f64>() + moved + description;
+        // With the Gauss–Newton cross terms between the units, without compensation.
+        let roots: Vec<(usize, f64)> = span.iter().flat_map(|u| u.roots.iter().map(|r| (*r, 1.0 / u.roots.len() as f64))).collect();
+        let joint = curvature.joint(&roots) + deleted;
+        let accepted = evaluation.complete && change <= 0.0;
+        let kind = if high - low == units.len() { "whole" } else if high - low == 1 { "single" } else { "split" };
+        journal.write(json!({
+            "event": "proposal", "kind": kind, "units": high - low, "first_unit": low, "groups": groups, "layers": names(&groups),
+            "predicted_bits": predicted / LN_2, "joint_plain_bits": joint / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
+            "description_bits": description / LN_2, "description_deleted_bits": deleted / LN_2, "compensation_slope_bits": moved / LN_2,
+            "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(), "trial_seconds": trial_seconds,
+        }))?;
+        evaluations.push((groups.len(), change / LN_2));
+        if accepted {
+            *posterior = proposed;
             current += change;
             accepted_evaluation = evaluation;
-        }
-        if accepted == rest.len() {
-            break;
-        }
-        // The unit the segment ended on: its own effect on top of the accepted prefix.
-        let (marginal, complete) = blocked.ok_or_else(|| error("a segment ended on an untested unit"))?;
-        let blocked = &rest[accepted];
-        // Nothing accepted, and the ranking holds no unit estimated to lower `F` from here on.
-        let exhausted = accepted == 0 && blocked.predicted >= 0.0;
-        singles.push((blocked.groups[0], marginal / LN_2));
-        journal.write(json!({
-            "event": "proposal", "kind": "blocked", "units": 1, "groups": blocked.groups, "layers": names(&blocked.groups),
-            "predicted_bits": blocked.predicted / LN_2, "measured_bits": marginal / LN_2, "complete": complete, "accepted": false, "seconds": 0.0,
-        }))?;
-        rest = &rest[accepted + 1..];
-        while rest.first().is_some_and(|u| u.groups.iter().all(|g| !posterior.active[*g])) {
-            rest = &rest[1..];
-        }
-        if exhausted {
-            untested = rest.len();
-            journal.write(json!({"event": "end", "untested_units": untested, "reason": "the remaining units, none estimated to lower F, were rejected whole, in halves and the first alone"}))?;
-            break;
+        } else if high - low == 1 {
+            singles.push((span[0].groups[0], change / LN_2));
+        } else if span[0].predicted >= 0.0 {
+            // No unit of the range is estimated to lower `F`: tested only jointly.
+            untested += high - low;
+        } else {
+            let middle = low + (high - low) / 2;
+            ranges.push((middle, high));
+            ranges.push((low, middle));
         }
     }
     let removed = candidates - posterior.active.iter().filter(|a| **a).count();
@@ -1096,33 +1055,6 @@ pub fn round(
         "before_bits": before / LN_2, "after_bits": current / LN_2, "evaluations": evaluations.len(), "seconds": started.elapsed().as_secs_f64(),
     }))?;
     Ok(Removal { candidates, removed, dead: dead_removed, before_bits: before / LN_2, after_bits: current / LN_2, evaluations, singles, untested })
-}
-
-/// The longest accepted prefix of `n` units found by testing the whole, then halving the length
-/// until one is accepted, then bisection between the longest accepted and the shortest rejected
-/// length; `test(k, kind)` evaluates the prefix of length `k`.
-fn gallop_down(n: usize, test: &mut impl FnMut(usize, &str) -> Result<bool, String>) -> Result<usize, String> {
-    if n == 0 || test(n, "whole")? {
-        return Ok(n);
-    }
-    let (mut low, mut high, mut next) = (0, n, n / 2);
-    while next > 0 {
-        if test(next, "halve")? {
-            low = next;
-            break;
-        }
-        high = next;
-        next /= 2;
-    }
-    while high - low > 1 {
-        let middle = low + (high - low) / 2;
-        if test(middle, "bisect")? {
-            low = middle;
-        } else {
-            high = middle;
-        }
-    }
-    Ok(low)
 }
 
 #[cfg(test)]
@@ -1399,7 +1331,8 @@ mod tests {
         std::fs::remove_file(&log).unwrap();
         let kinds: Vec<&str> = lines.iter().filter_map(|l| l["kind"].as_str()).collect();
         assert_eq!(kinds.first(), Some(&"dead"));
-        assert!(kinds.contains(&"blocked"));
+        // The needed group was rejected alone.
+        assert!(lines.iter().any(|l| l["kind"] == "single" && l["groups"] == json!([needed]) && l["accepted"].as_bool() == Some(false)));
         assert!(lines.iter().any(|l| l["event"] == "round") && lines.last().unwrap()["event"] == "end");
     }
 
@@ -1513,23 +1446,5 @@ mod tests {
         let from = Evaluation { batches: vec![1.0; 4], rest: 10.0, complete: true };
         assert_eq!(Evaluation { batches: vec![2.0, 3.0], rest: 9.0, complete: false }.change(&from), 5.0);
         assert_eq!(Evaluation { batches: vec![2.0, 3.0, 1.0, 1.0], rest: 9.0, complete: true }.change(&from), 2.0);
-    }
-
-    #[test]
-    fn the_searches_find_a_monotone_boundary_in_logarithmically_many_evaluations() {
-        for n in [1, 2, 7, 1000] {
-            for boundary in [0, 1, n / 2, n - 1, n] {
-                let mut tested = 0;
-                let found = gallop_down(n, &mut |k, _| {
-                    tested += 1;
-                    Ok(k <= boundary)
-                })
-                .unwrap();
-                assert_eq!(found, boundary, "n {n}, halving");
-                assert!(tested <= 3 + (usize::BITS - n.leading_zeros()) as usize, "{tested} evaluations halving to the boundary {boundary} of {n}");
-                assert!(boundary < n || tested == 1, "the whole set took {tested} evaluations");
-            }
-        }
-        assert!(gallop_down(1, &mut |_, _| Err("nonfinite".into())).is_err());
     }
 }
