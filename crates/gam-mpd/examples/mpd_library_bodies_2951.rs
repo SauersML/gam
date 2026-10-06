@@ -524,8 +524,6 @@ fn main() -> Result<(), String> {
                 numeric_bytes: 1 << 28,
                 head_tile_rows: 64,
                 trust_rate: false,
-                split_filter: false,
-                deterministic: false,
                 line_search: false,
                 half_factor: false,
                 one_sample: false,

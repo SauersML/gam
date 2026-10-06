@@ -37,6 +37,12 @@ use gam_gpu::{
 use ndarray::Array2;
 use std::collections::BTreeMap;
 
+/// Draws of the line arm's curvature ratio averaged before its first move: the relative standard
+/// error of a mean of `K` single-draw ratios is `√(2 / K)`, which falls to one half at `K = 8`
+/// (and the chance that the mean is below a tenth of its expectation to 0.08%, from 25% at one
+/// draw). At `N = 2^24` (4096 batches per epoch) the eight steps are 0.2% of the first epoch.
+const RATIO_DRAWS: u64 = 8;
+
 fn error(e: impl std::fmt::Display) -> String {
     format!("device posterior: {e}")
 }
@@ -91,11 +97,9 @@ pub struct DevicePosterior {
     /// `averaged` steps since the posterior was last set, up to one epoch (module note).
     average: Vec<Tensor>,
     averaged: u64,
-    /// The A/B arms of the 2^16 comparison (`PosteriorStep::trust`, `PosteriorStep::split`, and
-    /// steps taken at the iterate itself, no weight noise); the A/B's outcome deletes them.
+    /// The clamp arm of the 2^24 comparison (`PosteriorStep::trust`); the A/B's outcome deletes it
+    /// or the line arm.
     trust: f64,
-    split: bool,
-    deterministic: bool,
     /// The line arm: the iterate moves to the Gauss–Newton minimum of `F` along IVON's full
     /// direction (`DevicePosterior::line_step`), with the joint curvature's ratio to the diagonal
     /// one averaged over `ratio_steps` steps (up to one epoch).
@@ -238,8 +242,6 @@ impl DevicePosterior {
             average: Vec::new(),
             averaged: 0,
             trust: 1.0,
-            split: false,
-            deterministic: false,
             line: false,
             ratio: 1.0,
             ratio_steps: 0,
@@ -261,10 +263,10 @@ impl DevicePosterior {
         Ok(out)
     }
 
-    /// Sets the A/B arm: the mean's move clamped to `±trust σ`, the data momentum filtered alone
-    /// (`split`), and steps at the iterate without weight noise (`deterministic`).
-    pub fn set_arm(&mut self, trust: f64, split: bool, deterministic: bool, line: bool) {
-        (self.trust, self.split, self.deterministic, self.line) = (trust, split, deterministic, line);
+    /// Sets the A/B arm: the mean's move clamped to `±trust σ`, or the line arm
+    /// (`DevicePosterior::line_step`).
+    pub fn set_arm(&mut self, trust: f64, line: bool) {
+        (self.trust, self.line) = (trust, line);
     }
 
     /// The groups' variances and divergences from the posterior as it stands, at its mean `μ̄`.
@@ -357,7 +359,10 @@ impl DevicePosterior {
             self.ratio += w * (square * along * along / diagonal - self.ratio);
         }
         let (slope, curvature) = (diagonal + prior, self.ratio * diagonal + prior);
-        let eta = if curvature > 0.0 && slope.is_finite() { slope / curvature } else { 0.0 };
+        // Until `RATIO_DRAWS` draws are averaged the iterate stays: a mean of one draw's ratio (a
+        // scaled χ²₁ where `u · d` is Gaussian) is below a tenth of its expectation a quarter of
+        // the time, and the step it sets is then ten times the line minimum's.
+        let eta = if self.ratio_steps < RATIO_DRAWS || !(curvature > 0.0 && slope.is_finite()) { 0.0 } else { slope / curvature };
         log::debug!("line step {}: η {eta:.4e}, ρ {:.4e}", self.steps, self.ratio);
         for ((mean, start), d) in self.mean.iter_mut().zip(before).zip(directions) {
             *mean = self.fitting.copy(start).map_err(error)?;
@@ -486,9 +491,9 @@ impl DevicePosterior {
 
     /// The point a step's gradient is taken at, into `program`: the iterate's weight sample of
     /// `key` (`μ + σ ε`, the draws of [`DevicePosterior::sample_into`] around the iterate rather
-    /// than `μ̄`), or the iterate itself in the deterministic arm.
+    /// than `μ̄`).
     pub fn iterate_into(&self, program: &mut DeviceProgram, key: u64) -> Result<(), String> {
-        if self.deterministic { self.means_into(program, &self.mean) } else { self.sample_of(program, key, &self.mean) }
+        self.sample_of(program, key, &self.mean)
     }
 
     /// [`DevicePosterior::sample_into`] around `means`.
@@ -549,7 +554,7 @@ impl DevicePosterior {
             // Along the rotated axes, where the posterior is held.
             let (rotated_gradient, rotated_draw) = (self.undone(i, gradient)?, self.undone(i, draw)?);
             let (gradient, draw) = (rotated_gradient.as_ref().unwrap_or(gradient), rotated_draw.as_ref().unwrap_or(draw));
-            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, rate, beta1: ivon.beta1, beta2: ivon.beta2, step: self.steps, trust, split: self.split };
+            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, rate, beta1: ivon.beta1, beta2: ivon.beta2, step: self.steps, trust };
             let [momentum, curvature, power] = &mut self.moments[i];
             self.fitting
                 .posterior_ivon((&mut self.mean[i], &mut self.log_sd[i]), [momentum, curvature, power], (gradient, draw), (&self.groups[i], &self.variance), &mut self.sums, &step)

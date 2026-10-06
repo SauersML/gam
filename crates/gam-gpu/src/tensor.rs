@@ -2344,8 +2344,8 @@ impl Device {
                     ps[i] = b1 * ps[i] + (1.0 - b1) * data * data;
                     let (m, p) = (ms[i] / correction, ps[i] / correction);
                     let noise = (p - m * m).max(0.0) * noise_scale;
-                    let filtered = |x: f64| if noise_scale >= 0.0 && x * x > noise { x - noise / x } else { 0.0 };
-                    let signal = if step.split { filtered(m) + delta * mu } else { filtered(m + delta * mu) };
+                    let full = m + delta * mu;
+                    let signal = if noise_scale >= 0.0 && full * full > noise { full - noise / full } else { 0.0 };
                     let (h, d) = (hs[i], curvature - hs[i]);
                     hs[i] = h + (1.0 - b2) * d;
                     let bound = step.trust * sd;
@@ -2738,11 +2738,10 @@ pub struct PosteriorStep {
     pub beta1: f64,
     pub beta2: f64,
     pub step: u64,
-    /// The mean's move is clamped to `±trust σ`, and `split` filters the data momentum alone and
-    /// adds `δ μ` exactly: two arms of the 2^16 A/B (`trust = 1`, `split = false` is the step
-    /// above); the A/B's outcome deletes both fields.
+    /// The mean's move is clamped to `±trust σ`: an arm of the 2^24 A/B (`trust = 1` is the step
+    /// above, `trust = α` the clamp at `±α σ`, and the line arm takes no clamp); the A/B's outcome
+    /// deletes the field or the step's rate.
     pub trust: f64,
-    pub split: bool,
 }
 
 impl PosteriorStep {
@@ -3637,7 +3636,7 @@ __device__ void group_reduce(u64 n, u64 cols, unsigned int axis, u64 segments, c
 // in T; group sums in double. `spread` is `PosteriorStep::noise_scale` (negative: no estimate yet).
 // The filter acts on the full gradient `m + δ μ` (`Device::posterior_ivon`).
 template <typename T>
-__device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1, double spread, double trust, unsigned int split,
+__device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1, double spread, double trust,
     const T* gradient, const T* factor, const unsigned int* groups, const double* variance, T* mean, T* log_sd, T* momentum, T* curvature, T* power, double* sums) {
     const T b1 = (T)beta1, o1 = (T)(1.0 - beta1), o2 = (T)(1.0 - beta2), k1 = (T)(1.0 / c1), weight = (T)scale, alpha = (T)rate, square = (T)fscale, v1 = (T)spread;
     const bool known = spread >= 0.0;
@@ -3647,9 +3646,8 @@ __device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chun
         T gi = weight * gradient[i], ui = factor[i];
         T m1 = b1 * momentum[i] + o1 * gi, p1 = b1 * power[i] + o1 * gi * gi;
         T m = m1 * k1, q = p1 * k1 - m * m;
-        T noise = (q > (T)0 ? q : (T)0) * v1, full = split ? m : m + delta * mu;
+        T noise = (q > (T)0 ? q : (T)0) * v1, full = m + delta * mu;
         T signal = known && full * full > noise ? full - noise / full : (T)0;
-        if (split) signal += delta * mu;
         T h = curvature[i], d = square * ui * ui - h;
         T h1 = h + o2 * d;
         T move = alpha * signal / (h1 + delta), bound = (T)trust * sd;
@@ -3661,14 +3659,14 @@ __device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chun
     });
 }
 
-extern "C" __global__ void posterior_ivon_f64(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1, double spread, double trust, unsigned int split,
+extern "C" __global__ void posterior_ivon_f64(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1, double spread, double trust,
     const double* gradient, const double* factor, const unsigned int* groups, const double* variance, double* mean, double* log_sd, double* momentum, double* curvature, double* power, double* sums) {
-    posterior_ivon_body<double>(n, cols, axis, chunks, count, scale, fscale, tokens, rate, beta1, beta2, c1, spread, trust, split, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, power, sums);
+    posterior_ivon_body<double>(n, cols, axis, chunks, count, scale, fscale, tokens, rate, beta1, beta2, c1, spread, trust, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, power, sums);
 }
 
-extern "C" __global__ void posterior_ivon_f32(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1, double spread, double trust, unsigned int split,
+extern "C" __global__ void posterior_ivon_f32(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1, double spread, double trust,
     const float* gradient, const float* factor, const unsigned int* groups, const double* variance, float* mean, float* log_sd, float* momentum, float* curvature, float* power, double* sums) {
-    posterior_ivon_body<float>(n, cols, axis, chunks, count, scale, fscale, tokens, rate, beta1, beta2, c1, spread, trust, split, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, power, sums);
+    posterior_ivon_body<float>(n, cols, axis, chunks, count, scale, fscale, tokens, rate, beta1, beta2, c1, spread, trust, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, power, sums);
 }
 
 // A bfloat16's value (`bf16_round` is its inverse to nearest).
@@ -3689,7 +3687,7 @@ extern "C" __global__ void widen_bf16(u64 n, const unsigned short* x, float* y) 
 // resolution of `h` for an average over more than a few hundred batches. So does the gradient's second moment, whose
 // difference from the momentum's square measures the gradient's noise.
 template <typename G, typename M>
-__device__ void posterior_ivon_mixed(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1, double spread, double trust, unsigned int split,
+__device__ void posterior_ivon_mixed(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1, double spread, double trust,
     const G* gradient, const G* factor, const unsigned int* groups, const double* variance, float* mean, float* log_sd, M* momentum, float* curvature, float* power, double* sums) {
     const float b1 = (float)beta1, o1 = (float)(1.0 - beta1), o2 = (float)(1.0 - beta2), k1 = (float)(1.0 / c1), weight = (float)scale, alpha = (float)rate, square = (float)fscale, v1 = (float)spread;
     const bool known = spread >= 0.0;
@@ -3698,9 +3696,8 @@ __device__ void posterior_ivon_mixed(u64 n, u64 cols, unsigned int axis, u64 chu
         float delta = (float)(1.0 / (tokens * variance[g])), mu = mean[i], sd = expf(log_sd[i]);
         float gi = weight * entry_load(gradient[i]), ui = entry_load(factor[i]);
         float m1 = b1 * entry_load(momentum[i]) + o1 * gi, p1 = b1 * power[i] + o1 * gi * gi;
-        float m = m1 * k1, noise = fmaxf(p1 * k1 - m * m, 0.0f) * v1, full = split ? m : m + delta * mu;
+        float m = m1 * k1, noise = fmaxf(p1 * k1 - m * m, 0.0f) * v1, full = m + delta * mu;
         float signal = known && full * full > noise ? full - noise / full : 0.0f;
-        if (split) signal += delta * mu;
         float h = curvature[i], d = square * ui * ui - h;
         float h1 = h + o2 * d, bound = (float)trust * sd;
         mu -= fminf(fmaxf(alpha * signal / (h1 + delta), -bound), bound);
@@ -3711,14 +3708,14 @@ __device__ void posterior_ivon_mixed(u64 n, u64 cols, unsigned int axis, u64 chu
     });
 }
 
-extern "C" __global__ void posterior_ivon_f32_bf16(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1, double spread, double trust, unsigned int split,
+extern "C" __global__ void posterior_ivon_f32_bf16(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1, double spread, double trust,
     const float* gradient, const float* factor, const unsigned int* groups, const double* variance, float* mean, float* log_sd, unsigned short* momentum, float* curvature, float* power, double* sums) {
-    posterior_ivon_mixed<float, unsigned short>(n, cols, axis, chunks, count, scale, fscale, tokens, rate, beta1, beta2, c1, spread, trust, split, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, power, sums);
+    posterior_ivon_mixed<float, unsigned short>(n, cols, axis, chunks, count, scale, fscale, tokens, rate, beta1, beta2, c1, spread, trust, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, power, sums);
 }
 
-extern "C" __global__ void posterior_ivon_bf16_bf16(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1, double spread, double trust, unsigned int split,
+extern "C" __global__ void posterior_ivon_bf16_bf16(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double scale, double fscale, double tokens, double rate, double beta1, double beta2, double c1, double spread, double trust,
     const unsigned short* gradient, const unsigned short* factor, const unsigned int* groups, const double* variance, float* mean, float* log_sd, unsigned short* momentum, float* curvature, float* power, double* sums) {
-    posterior_ivon_mixed<unsigned short, unsigned short>(n, cols, axis, chunks, count, scale, fscale, tokens, rate, beta1, beta2, c1, spread, trust, split, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, power, sums);
+    posterior_ivon_mixed<unsigned short, unsigned short>(n, cols, axis, chunks, count, scale, fscale, tokens, rate, beta1, beta2, c1, spread, trust, gradient, factor, groups, variance, mean, log_sd, momentum, curvature, power, sums);
 }
 
 template <typename T>
@@ -5287,8 +5284,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             let (cols, axis, chunks) = (groups.cols as u64, groups.code(), groups.chunks() as u64);
             let mut builder = self.stream.launch_builder(&f);
             builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).arg(&step.gradient_scale).arg(&step.factor_scale).arg(&step.tokens).arg(&step.rate).arg(&step.beta1).arg(&step.beta2).arg(&c1).arg(&noise);
-            let split = u32::from(step.split);
-            builder.arg(&step.trust).arg(&split);
+            builder.arg(&step.trust);
             builder.input(gradient, gradients)?.input(factor, gradients)?.arg(index_slice(&groups.layout)?).arg(slice(variance)?);
             builder.output(mean, storage)?.output(log_sd, storage)?.output(momentum, moments)?.output(curvature, storage)?.output(power, storage)?.arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers in their storages, float64 group buffers of
@@ -6234,7 +6230,7 @@ inline float posterior_normal(uint2 key, uint2 stream, uint index) {
 }
 
 // The parameters of the posterior kernels (Rust `Posterior`).
-struct Posterior { uint n; uint count; uint2 key; uint2 stream; float scale; float tokens; float rate; float beta1; float beta2; float c1; float fscale; uint axis; uint cols; uint chunks; float noise; uint stride; uint at; float trust; uint split; };
+struct Posterior { uint n; uint count; uint2 key; uint2 stream; float scale; float tokens; float rate; float beta1; float beta2; float c1; float fscale; uint axis; uint cols; uint chunks; float noise; uint stride; uint at; float trust; };
 
 // Entry i's group under an operator's group map: its row's id (axis 0), its column's (1), its own (2).
 inline uint group_of(device const uint* ids, constant Posterior& p, uint i) {
@@ -6308,9 +6304,8 @@ inline void ivon_entry(uint i, uint g, device const float* gradient, device cons
     float m1 = p.beta1 * momentum[i] + (1.0f - p.beta1) * gi, p1 = p.beta1 * power[i] + (1.0f - p.beta1) * gi * gi;
     // The full gradient m + δ μ filtered by the momentum's noise (`Device::posterior_ivon`;
     // `p.noise < 0`: none known yet).
-    float m = m1 / p.c1, noise = max(p1 / p.c1 - m * m, 0.0f) * p.noise, full = p.split != 0u ? m : m + delta * mu;
+    float m = m1 / p.c1, noise = max(p1 / p.c1 - m * m, 0.0f) * p.noise, full = m + delta * mu;
     float signal = p.noise >= 0.0f && full * full > noise ? full - noise / full : 0.0f;
-    if (p.split != 0u) signal += delta * mu;
     float o2 = 1.0f - p.beta2, h = curvature[i], d = p.fscale * ui * ui - h;
     float h1 = h + o2 * d, bound = p.trust * sd;
     mu -= clamp(p.rate * signal / (h1 + delta), -bound, bound);
@@ -6504,9 +6499,8 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
         /// `cols`).
         stride: u32,
         at: u32,
-        /// `PosteriorStep::trust` and `PosteriorStep::split` (`t_posterior_ivon`).
+        /// `PosteriorStep::trust` (`t_posterior_ivon`).
         trust: f32,
-        split: u32,
     }
 
     /// A 64-bit counter word as MSL's `uint2` (low half first).
@@ -6858,7 +6852,6 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
                 c1: step.correction() as f32,
                 noise: step.noise_scale() as f32,
                 trust: step.trust as f32,
-                split: u32::from(step.split),
                 ..Posterior::default()
             };
             let buffers = [

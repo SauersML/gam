@@ -2375,7 +2375,7 @@ mod tests {
             let values = program.operators[from].matrix();
             replace(program, to, values);
         }
-        let settings = Settings { batch_sequences: 2, rate: 0.1, beta1: 0.9, seed: 3, numeric_bytes: 1 << 26, head_tile_rows: 64, trust_rate: false, split_filter: false, deterministic: false, line_search: false, half_factor: false, one_sample: false, factorized: false, epochs: None };
+        let settings = Settings { batch_sequences: 2, rate: 0.1, beta1: 0.9, seed: 3, numeric_bytes: 1 << 26, head_tile_rows: 64, trust_rate: false, line_search: false, half_factor: false, one_sample: false, factorized: false, epochs: None };
         let mut mixture = Mixture::new(&start, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
         let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
         let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();

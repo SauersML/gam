@@ -1307,17 +1307,10 @@ pub struct Settings {
     pub numeric_bytes: usize,
     /// Rows of vocabulary logits formed at once.
     pub head_tile_rows: usize,
-    /// The A/B arms at `N = 2^16` (`DevicePosterior::set_arm`): the mean's move clamped to `±α σ`
-    /// in place of `±σ`; the data momentum filtered alone with `δ μ` added exactly (98386f5d88's
-    /// step); and every step's gradient taken at the iterate itself, with no weight noise, `σ` from
-    /// the Gauss–Newton curvature as before and `F` measured at the posterior's samples. The A/B's
-    /// outcome deletes these fields.
+    /// The A/B arm at `N = 2^24` (`DevicePosterior::set_arm`) clamping the mean's move to `±α σ`
+    /// in place of `±σ`; the A/B's outcome deletes it or `line_search`.
     #[serde(default)]
     pub trust_rate: bool,
-    #[serde(default)]
-    pub split_filter: bool,
-    #[serde(default)]
-    pub deterministic: bool,
     /// The line arm: each step moves to the Gauss–Newton line minimum along IVON's direction, in
     /// place of the step `α` (`DevicePosterior::line_step`).
     #[serde(default)]
@@ -1772,10 +1765,19 @@ fn uniforms(seed: u64, batch: &Batch, experiments: &[Experiment]) -> Vec<f64> {
     (0..rows).map(|_| rng.random::<f64>()).collect()
 }
 
-/// The noise seed of step `(epoch, batch)`, or of the removal comparisons' and the held-out
-/// evaluation's batch (epoch 0).
+/// The noise seed of batch `batch` in stream `epoch`: stream 1 is the training steps'
+/// (`training_key`), stream 0 the removal comparisons' and the held-out evaluation's.
 fn noise_seed(seed: u64, epoch: usize, batch: usize) -> u64 {
     seed.wrapping_add((epoch as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)).wrapping_add((batch as u64).wrapping_mul(0x8CB9_2BA7_2F3D_8DD7))
+}
+
+/// The weight noise of training batch `b` in every epoch: keyed by the batch alone, so the fit
+/// minimizes one sample average of `F` (the batches' experiments are fixed too), and an epoch's
+/// paired per-batch improvement compares estimates at identical draws (common random numbers).
+/// Stream 1 is apart from the removal comparisons' and the held-out evaluation's (`noise_seed` with
+/// epoch 0).
+fn training_key(seed: u64, batch: usize) -> u64 {
+    noise_seed(seed, 1, batch)
 }
 
 /// A training step's scoring with antithetic weight noise inside the step: the batch's bases split
@@ -2883,8 +2885,8 @@ pub fn fit_from(
     let resumed_seconds = progress.seconds;
     let fresh = resumed.is_none();
     let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, resumed.as_deref(), u64::try_from(progress.step).map_err(error)?)?;
-    let arm = (if settings.trust_rate { settings.rate } else { 1.0 }, settings.split_filter, settings.deterministic);
-    device_posterior.set_arm(arm.0, arm.1, arm.2, settings.line_search);
+    let trust = if settings.trust_rate { settings.rate } else { 1.0 };
+    device_posterior.set_arm(trust, settings.line_search);
     drop(resumed);
     // A resumed fit holds exactly the device's means of the checkpoint, and the iterate they
     // average with the steps they span: it goes on as the fit that was not stopped.
@@ -2901,7 +2903,7 @@ pub fn fit_from(
         let timed = Instant::now();
         let moments = laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens)?;
         device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, Some(&moments), 0)?;
-        device_posterior.set_arm(arm.0, arm.1, arm.2, settings.line_search);
+        device_posterior.set_arm(trust, settings.line_search);
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
     // The curvature estimate averages over one epoch's batches: each batch weighs about once.
@@ -2969,7 +2971,7 @@ pub fn fit_from(
             let step_started = Instant::now();
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
-            let key = noise_seed(settings.seed, epoch + 1, b);
+            let key = training_key(settings.seed, b);
             let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, (key, settings.half_factor, settings.one_sample))?;
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
@@ -3856,8 +3858,6 @@ mod tests {
             numeric_bytes: 1 << 26,
             head_tile_rows: 64,
             trust_rate: false,
-            split_filter: false,
-            deterministic: false,
             line_search: false,
             half_factor: false,
             one_sample: false,
@@ -4005,6 +4005,34 @@ mod tests {
         }
         assert!((curvature.joint(&[(groups[0], 1.0)]) - rise[groups[0]]).abs() <= 1e-6 * rise[groups[0]].abs());
         assert!(curvature.spread()[groups[0]].is_finite());
+    }
+
+    #[test]
+    fn two_epochs_at_one_posterior_improve_by_exactly_zero() {
+        // The training noise is keyed by the batch alone: two epochs' steps scored at the same
+        // posterior give identical per-batch estimates, so their paired improvement is zero.
+        let (native, layers, _, sequences) = tiny("library_common_noise", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let (device, settings) = (Device::host(), settings());
+        let tokens = 2 * sequences.len() * 12;
+        let posterior = Posterior::new(&explanation, tokens).unwrap();
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, tokens as f64, None, 0).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        assert!(draws.len() > 1 && training_key(settings.seed, 0) != training_key(settings.seed, 1), "one key for every batch");
+        let mut epoch = || -> Vec<f64> {
+            let mut estimates = Vec::new();
+            for (b, draw) in draws.iter().enumerate() {
+                let batch = draw.batch(&sequences).unwrap();
+                let experiments = scorer.experiments(draw, &sequences).unwrap();
+                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, (training_key(settings.seed, b), settings.half_factor)).unwrap();
+                estimates.push(bits.iter().flatten().sum::<f64>());
+            }
+            estimates
+        };
+        let (first, second) = (epoch(), epoch());
+        let differences: Vec<f64> = first.iter().zip(&second).map(|(a, b)| a - b).collect();
+        assert!(differences.iter().all(|d| *d == 0.0), "paired differences at one posterior: {differences:?}");
     }
 
     #[test]
