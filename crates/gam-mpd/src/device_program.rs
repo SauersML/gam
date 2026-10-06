@@ -1827,6 +1827,20 @@ impl DeviceProgram {
         Self::tiled(trace.rows, trace.blocks)
     }
 
+    /// [`DeviceProgram::attention`] and, with `half`, the weights' bfloat16 copy written by their
+    /// softmax ([`Device::softmax_rows_bf16`]).
+    fn attention_and_half(&self, trace: &DeviceTrace, (q, k): (&Tensor, &Tensor), scale: f64, causal: bool, half: bool) -> Result<(Tensor, Option<Tensor>), String> {
+        if !half {
+            return Ok((self.attention(trace, q, k, scale, causal)?, None));
+        }
+        let d = &self.device;
+        let length = trace.rows / trace.blocks;
+        let mut scores = d.empty(trace.rows, length).map_err(error)?;
+        d.gemm_batched(trace.blocks, &mut scores, scale, q, Op::N, k, Op::T, 0.0, self.arithmetic).map_err(error)?;
+        let copy = d.softmax_rows_bf16(&mut scores, causal).map_err(error)?;
+        Ok((scores, Some(copy)))
+    }
+
     fn attention(&self, trace: &DeviceTrace, q: &Tensor, k: &Tensor, scale: f64, causal: bool) -> Result<Tensor, String> {
         let d = &self.device;
         let length = trace.rows / trace.blocks;
@@ -2199,7 +2213,7 @@ impl DeviceProgram {
                     let (gq, gk, gv) = self.attend_cotangent(
                         trace,
                         (*query, *key, *value),
-                        &cot,
+                        (&cot, &mut half),
                         *scale,
                         *rotary,
                         *causal,
@@ -2600,7 +2614,7 @@ impl DeviceProgram {
         &self,
         trace: &DeviceTrace,
         (query, key, value): (usize, usize, usize),
-        cot: &Tensor,
+        (cot, half): (&Tensor, &mut Option<Tensor>),
         scale: f64,
         rotary: Option<Rotary>,
         causal: bool,
@@ -2620,15 +2634,19 @@ impl DeviceProgram {
                 }
             };
         }
-        let alpha = self.attention(trace, &q, &k, scale, causal)?;
+        // The products read the cotangent rounded once (`operand`), the weights' bfloat16 copy made
+        // with them and ds written in bfloat16, when they run in bfloat16 on f32 values.
+        let bf16 = arithmetic == Arithmetic::Bf16 && cot.storage() == Storage::F32;
+        let (alpha, alpha_half) = self.attention_and_half(trace, (&q, &k), scale, causal, bf16)?;
         let v = trace.value(value)?;
         let length = trace.rows / blocks;
+        let operand = self.operand(cot, half, arithmetic)?;
         let mut dalpha = d.empty(trace.rows, length).map_err(error)?;
-        d.gemm_batched(blocks, &mut dalpha, 1.0, cot, Op::N, v, Op::T, 0.0, arithmetic).map_err(error)?;
+        d.gemm_batched(blocks, &mut dalpha, 1.0, operand, Op::N, v, Op::T, 0.0, arithmetic).map_err(error)?;
         let mut gv = d.empty(trace.rows, v.cols()).map_err(error)?;
-        d.gemm_batched(blocks, &mut gv, 1.0, &alpha, Op::T, cot, Op::N, 0.0, arithmetic).map_err(error)?;
-        let ds = d.softmax_backward(&alpha, &dalpha).map_err(error)?;
-        drop((alpha, dalpha));
+        d.gemm_batched(blocks, &mut gv, 1.0, alpha_half.as_ref().unwrap_or(&alpha), Op::T, operand, Op::N, 0.0, arithmetic).map_err(error)?;
+        let ds = if bf16 { d.softmax_backward_bf16(&alpha, &dalpha) } else { d.softmax_backward(&alpha, &dalpha) }.map_err(error)?;
+        drop((alpha, alpha_half, dalpha));
         let mut gq = d.empty(trace.rows, q.cols()).map_err(error)?;
         d.gemm_batched(blocks, &mut gq, scale, &ds, Op::N, &k, Op::N, 0.0, arithmetic).map_err(error)?;
         let mut gk = d.empty(trace.rows, k.cols()).map_err(error)?;
