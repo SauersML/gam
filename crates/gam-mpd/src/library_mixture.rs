@@ -2350,7 +2350,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
         let native = split_sites(&imported.program).expect("split");
         let start = explanation(&native, &layer_nodes(&native, 2).expect("layers")).expect("explanation");
-        let settings = Settings { batch_sequences: 2, beta1: 0.9, seed: 3, numeric_bytes: 1 << 26, head_tile_rows: 64, epochs: Some(1) };
+        let settings = Settings { batch_sequences: 2, beta1: 0.9, seed: 3, numeric_bytes: 1 << 26, head_tile_rows: 64, epochs: Some(1), preconditioned: false };
         let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
         let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
         let (train, held) = sequences.split_at(4);
