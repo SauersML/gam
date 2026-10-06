@@ -158,6 +158,11 @@ extern "C" __global__ void copy_within(u64 n, u64 from, u64 at, float* t) {
     GRID_STRIDE(i, n) t[at + i] = t[from + i];
 }
 
+extern "C" __global__ void scaled(u64 n, double zero, double alpha, const float* x, float* out) {
+    float a = (float)alpha, z = (float)zero;
+    GRID_STRIDE(i, n) out[i] = z + a * x[i];
+}
+
 extern "C" __global__ void move_toward(u64 n, double weight, const float* x, float* y) {
     float w = (float)weight;
     GRID_STRIDE(i, n) {

@@ -1190,6 +1190,23 @@ impl Device {
         }
     }
 
+    /// `0 + α x` per entry, a new tensor: each entry the one [`Device::axpy`] makes adding `α x` into
+    /// zeros (a negative zero comes out positive, as there), in one pass with no zeroing first. f32
+    /// or float64 storage.
+    pub fn scaled(&self, alpha: f64, x: &Tensor) -> Result<Tensor, GpuError> {
+        match &*self.backend {
+            Backend::Host => Ok(Tensor { rows: x.rows, cols: x.cols, data: Data::Host(host(x)?.iter().map(|v| 0.0 + alpha * v).collect()) }),
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.scaled(alpha, x),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => {
+                let mut out = self.zeros(x.rows, x.cols)?;
+                engine.axpy(&mut out, alpha, x)?;
+                Ok(out)
+            }
+        }
+    }
+
     /// `y ← y + w (x − y)`, the difference rounded to the storage first: each entry the one
     /// [`Device::axpy`] makes adding `w` times a copy of `x` less `y` (by `axpy` with −1).
     pub fn move_toward(&self, y: &mut Tensor, weight: f64, x: &Tensor) -> Result<(), GpuError> {
@@ -3293,6 +3310,11 @@ extern "C" __global__ void axpy_within(u64 n, double alpha, u64 from, u64 at, do
 
 extern "C" __global__ void copy_within(u64 n, u64 from, u64 at, double* t) {
     GRID_STRIDE(i, n) t[at + i] = t[from + i];
+}
+
+// `Device::scaled`: `zero + α x` (`zero` 0, an argument so that the sum stays: it turns −0 to +0).
+extern "C" __global__ void scaled(u64 n, double zero, double alpha, const double* x, double* out) {
+    GRID_STRIDE(i, n) out[i] = zero + alpha * x[i];
 }
 
 extern "C" __global__ void move_toward(u64 n, double weight, const double* x, double* y) {
@@ -5510,6 +5532,19 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 }
             };
             launched.gpu_ctx("tensor rows_within").map(|_| ())
+        }
+
+        pub(super) fn scaled(&self, alpha: f64, x: &Tensor) -> Result<Tensor, GpuError> {
+            let (n, storage) = (x.len() as u64, x.storage());
+            if storage == Storage::Bf16 {
+                return Err(shape("a bfloat16 tensor scaled".to_string()));
+            }
+            let mut out = self.output(storage, x.rows, x.cols)?;
+            let (f, zero) = (self.kernel("scaled", storage)?, 0.0_f64);
+            // SAFETY: `out` holds as many values as `x`, in its storage (`input`).
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&zero).arg(&alpha).input(x, storage)?.output(&mut out, storage)?.launch(cfg_elements(n)) }
+                .gpu_ctx("tensor scaled")?;
+            Ok(out)
         }
 
         pub(super) fn move_toward(&self, y: &mut Tensor, weight: f64, x: &Tensor) -> Result<(), GpuError> {

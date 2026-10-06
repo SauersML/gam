@@ -1205,12 +1205,33 @@ impl DeviceProgram {
                 d.scale_columns(&mut out, x, diag, false).map_err(error)?;
                 out
             }
+            Held::Identity => d.scaled(1.0, x).map_err(error)?,
             _ => {
                 let mut out = d.zeros(rows, width).map_err(error)?;
                 self.add_product(&mut out, x, op, transposed, arithmetic)?;
                 out
             }
         })
+    }
+
+    /// The affine term `(argument, operator)` as a new `rows × width` tensor, the values zeros plus
+    /// [`DeviceProgram::add_term`] make: in one pass ([`Device::scaled`]) where the term is added by
+    /// an axpy (a one-hot feature's gathered rows, an identity operator), else added into zeros.
+    fn term(&self, trace: &DeviceTrace, (argument, operator): (usize, usize), (rows, width): (usize, usize)) -> Result<Tensor, String> {
+        let d = &self.device;
+        if let Step::Feature { slot } = &self.steps[argument] {
+            let Held::Table(table) = self.held(operator, Role::Table)? else {
+                return Err("device: an operator held in the wrong role".to_string());
+            };
+            let ids = trace.ids.get(slot).ok_or("device: feature ids missing")?;
+            return d.scaled(1.0, &d.gather_rows(table, ids).map_err(error)?).map_err(error);
+        }
+        if matches!(self.held(operator, Role::Product)?, Held::Identity) {
+            return d.scaled(1.0, trace.value(argument)?).map_err(error);
+        }
+        let mut out = d.zeros(rows, width).map_err(error)?;
+        self.add_term(&mut out, trace, argument, operator)?;
+        Ok(out)
     }
 
     fn column(&self, op: usize) -> Result<&Tensor, String> {
@@ -1500,7 +1521,8 @@ impl DeviceProgram {
                         Some(((argument, operator), rest)) if !matches!(self.steps[*argument], Step::Feature { .. }) => {
                             (self.product(trace.value(*argument)?, *operator, false, (rows, width), self.arithmetic)?, rest)
                         }
-                        _ => (d.zeros(rows, width).map_err(error)?, &terms[..]),
+                        Some(((argument, operator), rest)) => (self.term(&trace, (*argument, *operator), (rows, width))?, rest),
+                        None => (d.zeros(rows, width).map_err(error)?, &terms[..]),
                     };
                     for (argument, operator) in rest {
                         self.add_term(&mut out, &trace, *argument, *operator)?;
@@ -1511,11 +1533,7 @@ impl DeviceProgram {
                     value(out)
                 }
                 Step::Pointwise { input, codes } => value(d.law_values(trace.value(*input)?, codes, gelu_tanh_constant()).map_err(error)?),
-                Step::Gain { input, factor } => {
-                    let mut out = d.zeros(rows, width).map_err(error)?;
-                    d.axpy(&mut out, *factor, trace.value(*input)?).map_err(error)?;
-                    value(out)
-                }
+                Step::Gain { input, factor } => value(d.scaled(*factor, trace.value(*input)?).map_err(error)?),
                 Step::Hadamard { left, right } => {
                     let mut out = d.empty(rows, width).map_err(error)?;
                     d.hadamard(&mut out, trace.value(*left)?, trace.value(*right)?, false).map_err(error)?;
@@ -1657,8 +1675,13 @@ impl DeviceProgram {
         let group = &self.fused[g];
         let heads = &group.heads;
         let buffers = trace.fused[g].ok_or("device: a fused output before its heads")?;
-        let mut out = d.zeros(trace.rows, self.widths[heads.output]).map_err(error)?;
-        for (argument, operator) in &heads.rest {
+        let shape = (trace.rows, self.widths[heads.output]);
+        let mut rest = heads.rest.iter();
+        let mut out = match rest.next() {
+            Some(&(argument, operator)) => self.term(trace, (argument, operator), shape)?,
+            None => d.zeros(shape.0, shape.1).map_err(error)?,
+        };
+        for (argument, operator) in rest {
             self.add_term(&mut out, trace, *argument, *operator)?;
         }
         d.gemm(&mut out, 1.0, &trace.buffers[buffers.reads], Op::N, &group.stacked.reads, Op::T, 1.0, self.arithmetic).map_err(error)?;
@@ -1998,11 +2021,7 @@ impl DeviceProgram {
                     continue;
                 }
                 Step::Readout { input } => add(&mut g, *input, d.copy(&cot).map_err(error)?)?,
-                Step::Gain { input, factor } => {
-                    let mut term = d.zeros(cot.rows(), cot.cols()).map_err(error)?;
-                    d.axpy(&mut term, *factor, &cot).map_err(error)?;
-                    add(&mut g, *input, term)?;
-                }
+                Step::Gain { input, factor } => add(&mut g, *input, d.scaled(*factor, &cot).map_err(error)?)?,
                 Step::Head | Step::Feature { .. } | Step::Raw { .. } | Step::Constant { .. } => {}
                 Step::Affine { terms, .. } => {
                     for (argument, operator) in terms {
@@ -2124,11 +2143,17 @@ impl DeviceProgram {
         if matches!(self.steps[argument], Step::Feature { .. }) || !needed[argument] {
             return Ok(());
         }
+        let held = self.held(operator, Role::Product)?;
         if g[argument].is_none() {
+            if matches!(held, Held::Identity) {
+                // Zeros plus the cotangent, in one pass.
+                g[argument] = Some(d.scaled(1.0, cot).map_err(error)?);
+                return Ok(());
+            }
             g[argument] = Some(d.zeros(rows, self.widths[argument]).map_err(error)?);
         }
         let target = g[argument].as_mut().ok_or("device: cotangent slot")?;
-        match self.held(operator, Role::Product)? {
+        match held {
             Held::Identity => d.axpy(target, 1.0, cot).map_err(error),
             Held::Diagonal(diag) => d.scale_columns(target, cot, diag, true).map_err(error),
             Held::Dense(a) => {
@@ -2477,9 +2502,7 @@ impl DeviceProgram {
                 },
                 Step::Gain { input, factor } => match dv[*input].as_ref() {
                     Some(dx) => {
-                        let mut out = d.zeros(rows, width).map_err(error)?;
-                        d.axpy(&mut out, *factor, dx).map_err(error)?;
-                        Some(out)
+                        Some(d.scaled(*factor, dx).map_err(error)?)
                     }
                     None => None,
                 },

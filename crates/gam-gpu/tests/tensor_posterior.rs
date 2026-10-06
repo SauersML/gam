@@ -582,9 +582,21 @@ fn a_steps_terms_and_finish_are_the_operations_they_replace() {
     }
 }
 
-/// `move_toward` against the copy and `axpy`s it replaces, bit for bit.
+/// `move_toward` and `scaled` against the copies, zeros and `axpy`s they replace, bit for bit (zeros
+/// among `x`, of either sign, for `scaled`).
 fn moves_match_their_compositions(d: &Device) {
     let (x, y) = (d.upload(matrix(7, 33, 11, 2.0, 0.5).view()).unwrap(), d.upload(matrix(7, 33, 12, 1.5, -0.25).view()).unwrap());
+    let mut signed = matrix(7, 33, 13, 1.0, 0.0);
+    for (k, v) in signed.iter_mut().enumerate().filter(|(k, _)| k % 5 == 0) {
+        *v = if k % 2 == 0 { -0.0 } else { 0.0 };
+    }
+    let signed = d.upload(signed.view()).unwrap();
+    for alpha in [-1.0_f64, -0.375, 0.0, 1.0, 3.0] {
+        let mut expected = d.zeros(7, 33).unwrap();
+        d.axpy(&mut expected, alpha, &signed).unwrap();
+        let bits = |t: &Tensor| d.download(t).unwrap().mapv(f64::to_bits);
+        assert_eq!(bits(&d.scaled(alpha, &signed).unwrap()), bits(&expected), "{} scaled {alpha}", d.name());
+    }
     for alpha in [-1.0_f64, -0.375, 0.1, 3.0] {
         let mut moved = d.copy(&y).unwrap();
         d.move_toward(&mut moved, alpha.abs() / 4.0, &x).unwrap();
