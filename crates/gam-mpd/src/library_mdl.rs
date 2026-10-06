@@ -143,8 +143,8 @@
 //! any experiment (a rotary plane of a head with no value coordinate left, the gate of a function
 //! whose output is removed), found exactly from the program's structure; then units of groups (a
 //! group with those its removal silences) ranked by their second-order removal effect (below),
-//! tested in segments of the ranked list by galloping and bisection, each segment ending on a unit
-//! the objective rejects and the next starting after it.
+//! tested in ranges of the ranked list, a rejected range split until each of its units is removed
+//! with an accepted range or rejected alone.
 //! Where a proposal deletes functions of an MLP, the MLP's surviving functions' outputs move by the
 //! least-squares solution that takes over the deleted functions' output on `P`'s own states
 //! (`library_compensation`), and the comparison scores the removal with those outputs. The
@@ -1066,18 +1066,25 @@ impl Posterior {
     }
 
     /// The posterior over parameter arrays `mean` whose entries' prior groups are `membership`
-    /// (one id array per mean array, ids below `groups`, every group holding an entry), every group
-    /// in the explanation, at [`Posterior::new`]'s start: each group's `v⁰_G` the mean square of its
-    /// starting means, and its standard deviations `√(v⁰_G / N)` for `tokens` training tokens `N`.
-    /// A parameterization that is not a library explanation (the toy accounts of
-    /// `mpd_toy_gate_2951`) is priced by this posterior's code length.
-    pub fn from_parts(mean: Vec<Array2<f64>>, membership: Vec<Array2<u32>>, groups: usize, tokens: usize) -> Result<Self, String> {
+    /// (one id array per mean array, ids below the group count, every group holding an entry),
+    /// every group in the explanation, at [`Posterior::new`]'s start: `reference` holds each
+    /// group's reference variance `v⁰_G` (one per group, positive, as `Explanation::reference`
+    /// gives [`Posterior::new`]), and a group's standard deviations start at `√(v_G / N)` for
+    /// `tokens` training tokens `N`, `v_G` the mean square of its starting means, or `v⁰_G` where
+    /// those are all zero (a Gaussian of mean zero and positive variance). A parameterization that
+    /// is not a library explanation (the toy accounts of `mpd_toy_gate_2951`) is priced by this
+    /// posterior's code length.
+    pub fn from_parts(mean: Vec<Array2<f64>>, membership: Vec<Array2<u32>>, reference: Vec<f64>, tokens: usize) -> Result<Self, String> {
         if membership.len() != mean.len() || membership.iter().zip(&mean).any(|(ids, m)| ids.dim() != m.dim()) {
             return Err("one group array per mean array, of its shape, required".into());
         }
         if tokens == 0 {
             return Err("no training tokens".into());
         }
+        if let Some(g) = reference.iter().position(|v| !(*v > 0.0 && v.is_finite())) {
+            return Err(format!("group {g}: a reference variance that is not positive and finite"));
+        }
+        let groups = reference.len();
         let mut squares = vec![(0.0, 0.0); groups];
         let mut spans: Vec<Range<usize>> = vec![usize::MAX..0; mean.len()];
         for ((values, ids), span) in mean.iter().zip(&membership).zip(&mut spans) {
@@ -1089,8 +1096,14 @@ impl Posterior {
                 *span = span.start.min(g)..span.end.max(g + 1);
             }
         }
-        if let Some(g) = squares.iter().position(|(count, sum)| !(*count > 0.0 && *sum > 0.0 && sum.is_finite())) {
-            return Err(format!("group {g} holds no entry or starts at zero, and has no scale"));
+        if let Some(g) = squares.iter().position(|(count, sum)| !(*count > 0.0 && sum.is_finite())) {
+            return Err(format!("group {g} holds no entry or starts at a nonfinite value"));
+        }
+        // A group starting at zero starts from its reference variance (`Posterior::new`).
+        for ((count, sum), v0) in squares.iter_mut().zip(&reference) {
+            if *sum == 0.0 {
+                *sum = *count * *v0;
+            }
         }
         let log_sd = membership
             .iter()
@@ -1102,9 +1115,8 @@ impl Posterior {
             })
             .map(Shared::from)
             .collect();
-        let initial = squares.iter().map(|(count, sum)| sum / count).collect();
         let mean = mean.into_iter().map(Shared::from).collect();
-        Ok(Self { mean, log_sd, active: vec![true; groups], membership: Arc::new(membership), spans, initial })
+        Ok(Self { mean, log_sd, active: vec![true; groups], membership: Arc::new(membership), spans, initial: reference })
     }
 
     fn moments(&self) -> Vec<Moments> {
@@ -1452,15 +1464,11 @@ pub struct Removal {
     pub before_bits: f64,
     pub after_bits: f64,
     /// Every evaluated proposal `(groups, F − F_before)` in bits, `F_before` the state it was
-    /// proposed on, and each unit a segment of the search ended on `(its first group, its own
-    /// change of F)`.
+    /// proposed on, and each unit the search rejected alone `(its first group, its change of F)`:
+    /// every other unit was removed (`library_removal`'s module note).
     pub evaluations: Vec<(usize, f64)>,
     #[serde(default)]
     pub singles: Vec<(usize, f64)>,
-    /// The units the round ended without testing alone: those predicted not to lower `F` after the
-    /// first of them, tested only jointly (`library_removal`'s module note).
-    #[serde(default)]
-    pub untested: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]

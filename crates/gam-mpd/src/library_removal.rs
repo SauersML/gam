@@ -72,15 +72,16 @@
 //! # The search
 //!
 //! The search proposes ranges of the ranked units, each on top of the removals accepted so far:
-//! first all of them; a rejected range splits after its prefix of least estimated total (the units
-//! after it are estimated to raise `F` together), or in halves when that prefix is the whole range
-//! just rejected, the two parts proposed in that order, down to single units, each rejected alone
-//! being kept. The estimates place the split; the measured sums decide each part. A range whose units are all
-//! estimated not to lower `F` is not split on rejection: its units are counted as tested only
-//! jointly (`Removal::untested`). Each proposal also removes the groups it leaves without effect.
-//! With `m` units that block their ranges, about `2 m log2(n/m)` proposals settle `n` units; a
-//! rejection stops once it is certain (below), so the cost is mostly the accepted
-//! ranges' full evaluations. The estimates only order the units and mark where splitting stops: a
+//! first all of them; a rejected range splits after its prefix of least estimated total when that
+//! total is negative and the prefix is not the whole range (the units after it are estimated to
+//! raise `F` together), and in halves otherwise (the whole range was just rejected, or no prefix of
+//! it is estimated to lower `F`, so the estimates do not place a removable unit), the two parts
+//! proposed in that order, down to single units, each rejected alone being kept. Every ranked unit
+//! thus ends the round decided by an exact evaluation, removed with an accepted range or rejected
+//! alone, however its estimate ranked it. The estimates place the split; the measured sums decide
+//! each part. Each proposal also removes the groups it leaves without effect. With `m` units that
+//! block their ranges, about `2 m log2(n/m)` proposals settle `n` units; a rejection stops once it
+//! is certain (below). The estimates only order the units and place the splits: a
 //! set's second-order estimate grows with its size where the data term saturates (on vpd4l at the
 //! Laplace start, N = 2^16, sets of 1,000 or more units were estimated at +0.5M to +13M bits and
 //! measured at −0.5M to −0.9M), so which ranges are removed rests on the measured paired sums.
@@ -927,9 +928,9 @@ pub fn round(
     let before = accepted_evaluation.total();
     let mut current = before;
     let mut evaluations: Vec<(usize, f64)> = Vec::new();
-    // The groups removed as without effect, and each rejected unit's first group with its own
-    // effect in bits.
-    let (mut dead_removed, mut singles, mut untested) = (0, Vec::new(), 0);
+    // The groups removed as without effect, and each unit rejected alone: its first group and its
+    // change of `F` in bits.
+    let (mut dead_removed, mut singles) = (0, Vec::new());
     let trial = |posterior: &Posterior, groups: &[usize]| -> Result<Posterior, String> {
         match compensation {
             Some(c) => c.proposal(posterior, groups),
@@ -1079,11 +1080,8 @@ pub fn round(
             accepted_evaluation = evaluation;
         } else if high - low == 1 {
             singles.push((span[0].groups[0], change / LN_2));
-        } else if span[0].predicted >= 0.0 {
-            // No unit of the range is estimated to lower `F`: tested only jointly.
-            untested += high - low;
         } else {
-            let middle = split(&units[low..high].iter().map(|u| u.predicted).collect::<Vec<_>>()) + low;
+            let middle = split(&span.iter().map(|u| u.predicted).collect::<Vec<_>>()) + low;
             ranges.push((middle, high));
             ranges.push((low, middle));
         }
@@ -1093,22 +1091,25 @@ pub fn round(
         "event": "end", "candidates": candidates, "removed": removed,
         "before_bits": before / LN_2, "after_bits": current / LN_2, "evaluations": evaluations.len(), "seconds": started.elapsed().as_secs_f64(),
     }))?;
-    Ok(Removal { candidates, removed, dead: dead_removed, before_bits: before / LN_2, after_bits: current / LN_2, evaluations, singles, untested })
+    Ok(Removal { candidates, removed, dead: dead_removed, before_bits: before / LN_2, after_bits: current / LN_2, evaluations, singles })
 }
 
-/// Where a rejected range of units, estimated to change `F` by `predicted` each, splits: after the
-/// prefix of least estimated total (the units after it estimated to raise `F` together), or in
-/// halves when that prefix is the whole range, which was just measured; always strictly inside.
+/// Where a rejected range of at least two units, estimated to change `F` by `predicted` each,
+/// splits: after its prefix of least estimated total when that total is negative and the prefix
+/// is not the whole range (the units after it estimated to raise `F` together); in halves when the
+/// least prefix is the whole range, which was just measured, or when no prefix is estimated to
+/// lower `F`, where the estimates do not place a removable unit (halving settles `m` blocking
+/// units of `n` in about `2 m log2(n/m)` proposals). Always strictly inside.
 fn split(predicted: &[f64]) -> usize {
     let n = predicted.len();
-    let (mut sum, mut best, mut at) = (0.0, f64::INFINITY, n);
+    let (mut sum, mut best, mut at) = (0.0, 0.0, n);
     for (k, p) in predicted.iter().enumerate() {
         sum += p;
         if sum < best {
             (best, at) = (sum, k + 1);
         }
     }
-    if at >= n || at == 0 { n / 2 } else { at }
+    if at >= n { n / 2 } else { at }
 }
 
 #[cfg(test)]
@@ -1388,6 +1389,16 @@ mod tests {
         // The needed group was rejected alone.
         assert!(lines.iter().any(|l| l["kind"] == "single" && l["groups"] == json!([needed]) && l["accepted"].as_bool() == Some(false)));
         assert!(lines.iter().any(|l| l["event"] == "round") && lines.last().unwrap()["event"] == "end");
+        // Every ranked unit was decided by an exact evaluation, those estimated to raise F
+        // included: removed with an accepted range, or rejected alone.
+        let units = lines.iter().find(|l| l["event"] == "round").expect("the round's record")["units"].as_array().expect("the ranked units").clone();
+        assert!(units.len() > free.len());
+        for unit in &units {
+            let groups: Vec<usize> = unit["groups"].as_array().expect("a unit's groups").iter().map(|g| g.as_u64().expect("a group id") as usize).collect();
+            let gone = groups.iter().all(|g| !posterior.active[*g]);
+            let alone = ranked.singles.iter().any(|(first, _)| *first == groups[0]);
+            assert!(gone || alone, "unit {groups:?} ended the round without its own evaluation");
+        }
     }
 
     /// One batch of the fixed collection: its sequences, experiments and `M`'s targets.
@@ -1490,15 +1501,17 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_range_splits_after_its_prefix_of_least_estimated_total() {
+    fn a_rejected_range_splits_after_its_prefix_of_least_negative_estimated_total_or_in_halves() {
         // Estimated −3, −2, +4, −1: the least prefix total is −5 after two units.
         assert_eq!(split(&[-3.0, -2.0, 4.0, -1.0]), 2);
         // The least total over the whole range, which was rejected: halves.
         assert_eq!(split(&[-3.0, -2.0, -1.0, -1.0]), 2);
         assert_eq!(split(&[-1.0, -1.0, -1.0]), 1);
-        // Every prefix estimated to raise F: after the first unit, the least.
-        assert_eq!(split(&[1.0, 2.0, 3.0]), 1);
         assert_eq!(split(&[5.0, -9.0]), 1);
+        // No prefix estimated to lower F: halves, so the range's units are still tested.
+        assert_eq!(split(&[1.0, 2.0, 3.0, 4.0]), 2);
+        assert_eq!(split(&[0.0, 0.0, 5.0]), 1);
+        assert_eq!(split(&[2.0, 3.0]), 1);
     }
 
     #[test]

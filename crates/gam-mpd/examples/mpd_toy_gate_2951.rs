@@ -231,6 +231,37 @@ fn rows(dim: (usize, usize), g: u32) -> Array2<u32> {
     Array2::from_shape_fn(dim, |(r, _)| g + r as u32)
 }
 
+/// Per group of `groups`, the reference variance its scale is sent against, by
+/// `library_mdl::mean_squares`'s rule on the account's start `start` (made from `M`, so `M` fixes
+/// it): the mean square of its starting values; for a group starting at zero, the mean square of
+/// its blocks' entries in the groups that do not, and `1` where those are all zero too.
+fn references(start: &[Array2<f64>], membership: &[Array2<u32>], groups: usize) -> Vec<f64> {
+    let mut own = vec![(0.0, 0.0); groups];
+    for (values, ids) in start.iter().zip(membership) {
+        for (value, g) in values.iter().zip(ids) {
+            let entry = &mut own[*g as usize];
+            entry.0 += 1.0;
+            entry.1 += value * value;
+        }
+    }
+    // Per block, the count and sum of squares of its entries in groups not all zero.
+    let blocks: Vec<(f64, f64)> = start
+        .iter()
+        .zip(membership)
+        .map(|(values, ids)| values.iter().zip(ids).filter(|(_, g)| own[**g as usize].1 > 0.0).fold((0.0, 0.0), |(count, sum), (value, _)| (count + 1.0, sum + value * value)))
+        .collect();
+    (0..groups)
+        .map(|g| {
+            let (count, sum) = own[g];
+            if sum > 0.0 {
+                return sum / count;
+            }
+            let (count, sum) = membership.iter().zip(&blocks).filter(|(ids, _)| ids.iter().any(|h| *h as usize == g)).fold((0.0, 0.0), |(n, total), (_, (c, s))| (n + *c, total + *s));
+            if sum > 0.0 { sum / count } else { 1.0 }
+        })
+        .collect()
+}
+
 // ------------------------------------------------------------------------------------- the fit
 
 /// A converged fit: `F` and its parts in bits, and the epochs taken.
@@ -252,7 +283,8 @@ fn fit(target: &dyn Target, native: &[Array2<f64>], account: &Account, batches: 
     let host = Device::host();
     let tokens = batches.len() * BATCH;
     let outputs: Vec<Array2<f64>> = batches.iter().map(|x| target.forward(native, x).0).collect();
-    let mut posterior = Posterior::from_parts(account.start.clone(), account.membership.clone(), account.groups, tokens)?;
+    let reference = references(&account.start, &account.membership, account.groups);
+    let mut posterior = Posterior::from_parts(account.start.clone(), account.membership.clone(), reference, tokens)?;
     let operators: Vec<usize> = (0..account.start.len()).collect();
     let groups: Vec<Vec<u32>> = account.membership.iter().map(|m| m.iter().copied().collect()).collect();
     let parts = Parts { operators: &operators, mean: &posterior.mean, log_sd: &posterior.log_sd, groups: &groups, count: account.groups };

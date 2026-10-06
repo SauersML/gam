@@ -5448,9 +5448,9 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             Ok(())
         }
 
-        /// [`super::Device::symmetric_eigh`] on a stream of its own (the MLPs of a removal trial
-        /// decompose concurrently): the row-major lower triangle is the column-major upper one,
-        /// which `cusolverDnDsyevd` reads, and the buffer it leaves holds the eigenvectors as
+        /// [`super::Device::symmetric_eigh`] on a stream of its own, so concurrent callers do not
+        /// share one: the row-major lower triangle is the column-major upper one, which
+        /// `cusolverDnDsyevd` reads, and the buffer it leaves holds the eigenvectors as
         /// column-major columns.
         pub(super) fn symmetric_eigh(&self, a: ndarray::ArrayView2<'_, f64>) -> Result<(ndarray::Array1<f64>, ndarray::Array2<f64>), GpuError> {
             use cudarc::cusolver::sys as solver;

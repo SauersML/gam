@@ -26,7 +26,23 @@
 //! with `N h_rj` the data term's curvature in it, which under `G ⊗ C` is `c_r G_jj`. Over the alive
 //! functions `A` with own output columns, `c_r = max(0, Σ_{j∈A} (1/σ_rj² − 1/v_j)) / Σ_{j∈A} G_jj`,
 //! the ratio that matches the curvatures' sum. `v_j = (1/|G|) Σ (μ² + σ²)` over the column, the
-//! group's empirical-Bayes variance.
+//! group's empirical-Bayes variance. `c_r G` is thus in the units of `N h`, the curvature of the
+//! data term over all `N` scored tokens (`G` sums over the rows it was formed from, `c_r` per unit
+//! of that sum), and so are the precisions below: no conversion enters between them and the fit's
+//! `σ² = 1/(N (h + δ))`, `δ = 1/(N v)`.
+//!
+//! The compensated posterior is this model's conditional one. With the deleted outputs at zero,
+//! the surviving output entries of coordinate `r` are Gaussian with precision
+//! `c_r G_RR + V_R⁻¹ = c_r (G_RR + Λ_r)` and mean the posterior mode above. Its mean-field
+//! approximation (the diagonal Gaussian nearest it in `KL(q ‖ ·)`) has that mode for its means and
+//! the reciprocals of the precision's diagonal, `1/(c_r G_jj + 1/v_j)`, for its variances (not the
+//! covariance's diagonal). That diagonal does not involve the deleted functions: a deletion moves
+//! the conditional mean and leaves each survivor's mean-field variance where it was before it. The
+//! posterior holds a measurement of that variance per entry, `σ_rj² = 1/(N h_rj + 1/v_j)`, of
+//! which `1/(c_r G_jj + 1/v_j)` is the Kronecker model's fit, so a proposal moves the survivors'
+//! means and keeps their `σ`. Writing the model's value instead would move each entry's `σ` off its
+//! stationary point in `F` (`σ² = 1/(N (h + δ))`) by the model's error, raising `F` by
+//! `½ (ρ − 1 − ln ρ) ≥ 0` per entry, `ρ` the ratio of the two variances.
 //!
 //! A function's output is its own column of the MLP's output map, or, under a read–write tie
 //! (`library_sharing::tie`), `c` times a later layer's gate row. A tied output is fixed by the tie:
@@ -36,27 +52,45 @@
 //! the composed explanation on the fixed collection (`library_mdl`'s removal step).
 //!
 //! Each MLP's Gram matrix `G` is formed once per removal round, in float64 from the activations the
-//! device computes. An eigenvalue `e_k` of `S` within the bound on its rounding (the summation bound
-//! `γ_T trace(S)` of its `T`-term dot products plus the eigendecomposition's own band) is not
-//! resolved from zero: a proposal leaves the outputs unchanged along it, and the share below takes
-//! it as zero.
+//! device computes, and held through the round as its lower triangle. An eigenvalue `e_k` of `S`
+//! within the bound on its rounding (the summation bound `γ_T trace(S)` of its `T`-term dot
+//! products plus the eigendecomposition's own band) is not resolved from zero: a proposal leaves
+//! the outputs unchanged along it, and the share below takes it as zero.
+//!
+//! Memory, for an MLP of `n` functions of which `m` are decomposed, `d` output coordinates and
+//! float64 values: the packed Grams take `4 n (n + 1)` bytes per MLP through the round. While they
+//! are formed, a float64 device (CUDA) sums each MLP's Gram in an `n × n` matrix (`8 n²` bytes on
+//! the device, and on the host while it is read and packed), as many MLPs' in one pass over the
+//! sequences as the device's free memory holds beside one batch's trace; the Apple GPU's activations are summed on the host, one batch's activations and
+//! their `8 n²`-byte product at a time. The ranking and each proposal decompose one MLP's scaled
+//! Gram `S` (`8 m²` bytes) at a time, which the decomposition consumes: on the host faer copies its
+//! lower triangle and adds its divide-and-conquer workspace and the eigenvectors, `40 m²` bytes, of
+//! which the eigenvectors' `8 m²` stay; on CUDA the host holds `S`, the copy staged for the upload
+//! and the eigenvectors as downloaded and as returned (`32 m²` bytes), and the device the matrix
+//! and cuSOLVER's workspace. A move multiplies by the block of `G` between the survivors and the
+//! deleted functions, `8 m (n − m)` bytes, and holds `O(n d)` more. No use is an exact solve from
+//! products with `G`: each coordinate's move solves with its own shift `1/c_r`, which one
+//! eigendecomposition serves exactly for every coordinate (its unresolved directions dropped) where
+//! an iterative solve from products would stop at a tolerance, and the rankings read diagonals of
+//! spectral functions of `S`.
 
 use crate::{
     interchange::{self, Interchange},
     library_mdl::{Explanation, Posterior, sequence_family},
-    operator_program::{Node, OperatorProgram},
+    operator_program::{FamilyInputs, Node, OperatorProgram},
     run_check::LayerNodes,
 };
+use faer::Side;
 use gam_gpu::{
     gpu_error::GpuError,
-    tensor::{Device, Storage},
+    tensor::{Device, Storage, Tensor},
 };
 use gam_linalg::{
-    decompose::{Eigh, eigh},
-    faer_ndarray::{fast_ab, fast_ata, fast_atb},
-    roundoff::{SymmetricAssembly, symmetric_spectrum_rounding_band},
+    decompose::Eigh,
+    faer_ndarray::{FaerArrayView, fast_ab, fast_ata, fast_atb, self_adjoint_evd},
+    roundoff::symmetric_spectrum_rounding_band,
 };
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array1, Array2, ShapeBuilder};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,6 +108,53 @@ enum Output {
     Tied { scale: usize, gate: usize, row: usize, group: usize },
 }
 
+/// A symmetric matrix of order `order` held as its lower triangle row by row: entry `(i, j)`,
+/// `i ≥ j`, at `i (i + 1) / 2 + j`, `order (order + 1) / 2` values.
+struct Packed {
+    order: usize,
+    values: Vec<f64>,
+}
+
+impl Packed {
+    fn zeros(order: usize) -> Self {
+        Self { order, values: vec![0.0; order * (order + 1) / 2] }
+    }
+
+    /// Entry `(i, j)`.
+    fn at(&self, i: usize, j: usize) -> f64 {
+        let (i, j) = if i >= j { (i, j) } else { (j, i) };
+        self.values[i * (i + 1) / 2 + j]
+    }
+
+    /// Adds the lower triangle of the `order × order` matrix `full`.
+    fn add_lower(&mut self, full: &Array2<f64>) -> Result<(), String> {
+        if full.dim() != (self.order, self.order) {
+            return Err(error(format!("a {:?} matrix added to a Gram of order {}", full.dim(), self.order)));
+        }
+        let mut start = 0;
+        for (i, row) in full.rows().into_iter().enumerate() {
+            for (value, add) in self.values[start..=start + i].iter_mut().zip(row) {
+                *value += add;
+            }
+            start += i + 1;
+        }
+        Ok(())
+    }
+
+    /// Rows `rows` and columns `cols` as a dense matrix, entry `(a, b)` times `weight(a, b)`.
+    fn block(&self, rows: &[usize], cols: &[usize], weight: impl Fn(usize, usize) -> f64 + Sync) -> Result<Array2<f64>, String> {
+        let mut values = vec![0.0; rows.len() * cols.len()];
+        if !cols.is_empty() {
+            values.par_chunks_mut(cols.len()).enumerate().for_each(|(a, line)| {
+                for (b, value) in line.iter_mut().enumerate() {
+                    *value = self.at(rows[a], cols[b]) * weight(a, b);
+                }
+            });
+        }
+        Array2::from_shape_vec((rows.len(), cols.len()), values).map_err(error)
+    }
+}
+
 /// One MLP's functions, where their outputs are held, and their activations' Gram matrix.
 struct Mlp {
     /// Per function, its prior groups (its gate's, its up direction's when gated, and its output's
@@ -83,7 +164,7 @@ struct Mlp {
     output: usize,
     outputs: Vec<Output>,
     /// `Hᵀ H` over the functions' activations on every row it was formed from.
-    gram: Array2<f64>,
+    gram: Packed,
 }
 
 /// One MLP's compensation in a proposal: per surviving function its output column (none for a
@@ -115,10 +196,33 @@ fn operator(program: &OperatorProgram, name: &str) -> Result<usize, String> {
     program.operators.iter().position(|o| o.name == name).ok_or_else(|| error(format!("no operator {name}")))
 }
 
+/// The activations `h` of an MLP of `order` functions on the batch `family`, with the rows at the
+/// positions `elsewhere` (where a position select applies `M`'s MLP instead of the functions)
+/// zeroed in a copy; none when there are no such positions.
+fn elsewhere_zeroed(device: &Device, h: &Tensor, family: &FamilyInputs, elsewhere: &[u32], order: usize) -> Result<Option<Tensor>, String> {
+    if h.cols() != order {
+        return Err(error("activations of another width than the MLP's functions"));
+    }
+    if elsewhere.is_empty() {
+        return Ok(None);
+    }
+    let positions = family.layout.as_ref().map(|layout| layout.position.as_slice()).unwrap_or_default();
+    if positions.len() != h.rows() {
+        return Err(error("a position select on a batch without its positions"));
+    }
+    let mut copy = device.copy(h).map_err(error)?;
+    let zero = device.zeros(1, h.cols()).map_err(error)?;
+    for (row, _) in positions.iter().enumerate().filter(|(_, p)| elsewhere.contains(p)) {
+        device.set_rows(&mut copy, row, &zero).map_err(error)?;
+    }
+    Ok(Some(copy))
+}
+
 impl Compensation {
     /// The Gram matrices of every MLP's activations on `sequences` run by `P` alone at
-    /// `posterior`'s mean, `batch` sequences at a time; `experiments` holds `P` compiled for the
-    /// fit, and its trainable operators hold the posterior mean afterwards.
+    /// `posterior`'s mean, `batch` sequences at a time, on a float64 device as many MLPs per pass
+    /// over the sequences as its free memory holds (module note); `experiments` holds `P` compiled
+    /// for the fit, and its trainable operators hold the posterior mean afterwards.
     pub fn new(experiments: &mut Interchange, explanation: &Explanation, posterior: &Posterior, sequences: &[Vec<u32>], batch: usize) -> Result<Self, String> {
         if batch == 0 {
             return Err(error("positive batch required"));
@@ -189,7 +293,7 @@ impl Compensation {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let output = trainable(out)?;
-            mlps.push(Mlp { functions: layer.functions.clone(), output, outputs, gram: Array2::zeros((layer.functions.len(), layer.functions.len())) });
+            mlps.push(Mlp { functions: layer.functions.clone(), output, outputs, gram: Packed::zeros(layer.functions.len()) });
             nodes.push((node, elsewhere));
         }
         experiments.load(&posterior.mean)?;
@@ -202,61 +306,79 @@ impl Compensation {
             Err(GpuError::NoDeviceKernel { .. }) => None,
             Err(e) => return Err(error(e)),
         };
-        // With a float64 device, each MLP's Gram matrix is summed there over every batch (one product
-        // accumulating into it per batch) and read once.
-        let mut sums = match &wide {
-            Some(wide) => mlps.iter().map(|mlp| wide.zeros(mlp.gram.nrows(), mlp.gram.ncols()).map(Some).map_err(error)).collect::<Result<Vec<_>, _>>()?,
-            None => (0..mlps.len()).map(|_| None).collect(),
-        };
-        let mut rows = 0;
-        for chunk in sequences.chunks(batch) {
-            let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
-            let trace = program.forward(&family)?;
-            let positions = family.layout.as_ref().map(|layout| layout.position.as_slice()).unwrap_or_default();
-            for ((mlp, (node, elsewhere)), sum) in mlps.iter_mut().zip(&nodes).zip(&mut sums) {
-                let h = trace.value(*node)?;
-                if h.cols() != mlp.gram.ncols() {
-                    return Err(error("activations of another width than the MLP's functions"));
-                }
-                // The rows the select takes from elsewhere, zeroed in a copy.
-                let zeroed;
-                let h = if elsewhere.is_empty() {
-                    h
-                } else {
-                    if positions.len() != h.rows() {
-                        return Err(error("a position select on a batch without its positions"));
-                    }
-                    let mut copy = device.copy(h).map_err(error)?;
-                    let zero = device.zeros(1, h.cols()).map_err(error)?;
-                    for (row, _) in positions.iter().enumerate().filter(|(_, p)| elsewhere.contains(p)) {
-                        device.set_rows(&mut copy, row, &zero).map_err(error)?;
-                    }
-                    zeroed = copy;
-                    &zeroed
-                };
-                match (&wide, sum) {
-                    (Some(wide), Some(sum)) => {
-                        // On CUDA the f32 activations' Gram on the integer tensor cores
-                        // (`Device::gram_split`, 9 slices: within γ_rows √(G_ii G_jj) per entry, the
-                        // form of the float64 product's own bound that the floor below uses), else
-                        // the float64 product.
-                        if h.rows() > MAX_SPLIT_ROWS || !wide.gram_split(sum, h, GRAM_SLICES).map_err(error)? {
-                            let h = wide.convert(h).map_err(error)?;
-                            wide.gram_lower(sum, &h, 1.0).map_err(error)?;
+        let families = || sequences.chunks(batch).map(|chunk| sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>()));
+        match &wide {
+            // Each MLP's Gram summed on the device over every batch (one product accumulating into
+            // it per batch), read once, its lower triangle packed, and its device sum freed. A pass
+            // over the sequences sums as many MLPs' Grams as the device's free memory holds while
+            // one batch's trace is held (`8 n²` bytes each), measured on the first batch: one pass
+            // when every MLP's fits, as on Qwen3-0.6B's 28 MLPs of 3072 functions (2.1 GB).
+            Some(wide) => {
+                let mut start = 0;
+                while start < mlps.len() {
+                    let mut group = start..start;
+                    let mut sums: Vec<Tensor> = Vec::new();
+                    for (index, family) in families().enumerate() {
+                        let family = family?;
+                        let trace = program.forward(&family)?;
+                        if index == 0 {
+                            // The group: the MLPs whose sums fit the free memory beside the trace.
+                            let free = wide.memory().map_err(error)?.map(|(free, _)| free);
+                            let mut used = 0usize;
+                            let mut end = start;
+                            while end < mlps.len() {
+                                let bytes = 8 * mlps[end].gram.order * mlps[end].gram.order;
+                                if end > start && free.is_some_and(|free| used + bytes > free) {
+                                    break;
+                                }
+                                used += bytes;
+                                end += 1;
+                            }
+                            group = start..end;
+                            sums = mlps[group.clone()].iter().map(|mlp| wide.zeros(mlp.gram.order, mlp.gram.order).map_err(error)).collect::<Result<_, _>>()?;
+                        }
+                        for (k, sum) in group.clone().zip(&mut sums) {
+                            let (node, elsewhere) = &nodes[k];
+                            let zeroed = elsewhere_zeroed(device, trace.value(*node)?, &family, elsewhere, mlps[k].gram.order)?;
+                            let h = match &zeroed {
+                                Some(copy) => copy,
+                                None => trace.value(*node)?,
+                            };
+                            // On CUDA the f32 activations' Gram on the integer tensor cores
+                            // (`Device::gram_split`, 9 slices: within γ_rows √(G_ii G_jj) per entry,
+                            // the form of the float64 product's own bound that the floor below uses),
+                            // else the float64 product; either sums the lower triangle.
+                            if h.rows() > MAX_SPLIT_ROWS || !wide.gram_split(sum, h, GRAM_SLICES).map_err(error)? {
+                                let h = wide.convert(h).map_err(error)?;
+                                wide.gram_lower(sum, &h, 1.0).map_err(error)?;
+                            }
                         }
                     }
-                    _ => mlp.gram += &fast_ata(&device.download(h).map_err(error)?),
+                    if group.is_empty() {
+                        return Err(error("no sequences to form the Gram matrices from"));
+                    }
+                    for (k, sum) in group.clone().zip(sums) {
+                        mlps[k].gram.add_lower(&wide.download(&sum).map_err(error)?)?;
+                    }
+                    start = group.end;
                 }
             }
-            rows += family.rows;
-        }
-        if let Some(wide) = &wide {
-            for (mlp, sum) in mlps.iter_mut().zip(&sums) {
-                let gram = wide.download(sum.as_ref().ok_or_else(|| error("a Gram sum missing"))?).map_err(error)?;
-                // The update sums the lower triangle; mirror it.
-                mlp.gram = Array2::from_shape_fn(gram.dim(), |(i, j)| if i >= j { gram[[i, j]] } else { gram[[j, i]] });
+            None => {
+                for family in families() {
+                    let family = family?;
+                    let trace = program.forward(&family)?;
+                    for (mlp, (node, elsewhere)) in mlps.iter_mut().zip(&nodes) {
+                        let zeroed = elsewhere_zeroed(device, trace.value(*node)?, &family, elsewhere, mlp.gram.order)?;
+                        let h = match &zeroed {
+                            Some(copy) => copy,
+                            None => trace.value(*node)?,
+                        };
+                        mlp.gram.add_lower(&fast_ata(&device.download(h).map_err(error)?))?;
+                    }
+                }
             }
         }
+        let rows: usize = sequences.iter().map(Vec::len).sum();
         Ok(Self { mlps, rows, device: device.clone() })
     }
 
@@ -297,7 +419,7 @@ impl Compensation {
                     *p += 1.0 / s - 1.0 / v;
                 }
             });
-            energy += mlp.gram[[*i, *i]];
+            energy += mlp.gram.at(*i, *i);
         }
         let curvature = precision.mapv(|p| if energy > 0.0 && p > 0.0 { p / energy } else { 0.0 });
         (prior, curvature)
@@ -307,17 +429,48 @@ impl Compensation {
     /// eigendecomposition and the floor below which an eigenvalue is not resolved from zero.
     fn scaled(&self, mlp: &Mlp, set: &[usize], prior: &[f64]) -> Result<(Vec<f64>, Eigh, f64), String> {
         let root: Vec<f64> = set.iter().map(|i| prior[*i].sqrt()).collect();
-        let mut scaled = mlp.gram.select(Axis(0), set).select(Axis(1), set);
-        for ((a, b), value) in scaled.indexed_iter_mut() {
-            *value *= root[a] * root[b];
-        }
-        // On CUDA by cuSOLVER (`Device::symmetric_eigh`, the same backward-error band), else on the host.
-        let decomposition = match self.device.symmetric_eigh(scaled.view()).map_err(error)? {
-            Some((values, vectors)) => Eigh { band: symmetric_spectrum_rounding_band(values.as_slice().ok_or_else(|| error("eigenvalues not contiguous"))?), values, vectors },
-            None => eigh(scaled.view(), SymmetricAssembly::Mirrored, None).map_err(error)?,
-        };
-        let floor = decomposition.band + self.gamma()? * scaled.diag().sum();
+        let scaled = mlp.gram.block(set, set, |a, b| root[a] * root[b])?;
+        let trace = scaled.diag().sum();
+        let decomposition = self.decompose(scaled)?;
+        let floor = decomposition.band + self.gamma()? * trace;
         Ok((root, decomposition, floor))
+    }
+
+    /// The eigendecomposition of the symmetric `s` (its lower triangle read), which it consumes
+    /// and frees once decomposed: on CUDA by cuSOLVER (`Device::symmetric_eigh`), else on the host
+    /// by faer (`self_adjoint_evd`, the decomposition `gam_linalg::decompose::eigh` makes, without
+    /// its copies of the input and the eigenvectors), within the backward-error band
+    /// `symmetric_spectrum_rounding_band` states. Its uses are spectral functions, which neither
+    /// the eigenpairs' order nor the eigenvectors' signs change.
+    fn decompose(&self, s: Array2<f64>) -> Result<Eigh, String> {
+        if s.iter().any(|v| !v.is_finite()) {
+            return Err(error("a scaled Gram with a nonfinite entry"));
+        }
+        let on_device = self.device.symmetric_eigh(s.view()).map_err(error)?;
+        let (values, vectors) = match on_device {
+            Some(pair) => {
+                drop(s);
+                pair
+            }
+            None => {
+                let (values, vectors) = self_adjoint_evd(FaerArrayView::new(&s).as_ref(), Side::Lower).map_err(|e| error(format!("eigendecomposition: {e:?}")))?;
+                drop(s);
+                let order = vectors.nrows();
+                let values = Array1::from_shape_fn(order, |k| values.as_ref().column_vector()[k]);
+                // faer's columns, contiguous, become the columns of a column-major array.
+                let q = vectors.as_ref();
+                let mut columns = Vec::with_capacity(order * order);
+                for j in 0..order {
+                    for i in 0..order {
+                        columns.push(q[(i, j)]);
+                    }
+                }
+                drop(vectors);
+                (values, Array2::from_shape_vec((order, order).f(), columns).map_err(error)?)
+            }
+        };
+        let band = symmetric_spectrum_rounding_band(values.as_slice().ok_or_else(|| error("eigenvalues not contiguous"))?);
+        Ok(Eigh { values, vectors, band })
     }
 
     /// The data term's change from `trial`'s move `Δ` of the surviving output columns of
@@ -360,8 +513,8 @@ impl Compensation {
                     Output::Tied { scale, gate, row: read, .. } => row.assign(&(&posterior.mean[gate].row(read) * posterior.mean[scale][[0, 0]])),
                 }
             }
-            let own = fast_ab(&mlp.gram.select(Axis(0), &surviving).select(Axis(1), &surviving), &moves);
-            let cross = fast_ab(&mlp.gram.select(Axis(0), &surviving).select(Axis(1), &deleted), &deleted_outputs);
+            let own = fast_ab(&mlp.gram.block(&surviving, &surviving, |_, _| 1.0)?, &moves);
+            let cross = fast_ab(&mlp.gram.block(&surviving, &deleted, |_, _| 1.0)?, &deleted_outputs);
             for (r, c) in curvature.iter().enumerate() {
                 let (mut quadratic, mut coupling) = (0.0, 0.0);
                 for j in 0..surviving.len() {
@@ -382,14 +535,16 @@ impl Compensation {
     }
 
     /// `posterior` with the groups `removed` removed and, in every MLP that loses functions it had,
-    /// its surviving functions' outputs moved to the posterior mode of the compensation (module
+    /// the compensation's conditional posterior of its surviving functions' outputs: their means
+    /// moved to its mode, their standard deviations kept, which are its mean-field ones (module
     /// note). Each MLP's compensation reads `posterior` alone and moves only its own output
-    /// columns, so the MLPs are solved in parallel and their moves added after, in MLP order.
+    /// columns; the MLPs are solved one at a time, in order, each move added before the next MLP is
+    /// decomposed, so one decomposition is held at a time.
     pub fn proposal(&self, posterior: &Posterior, removed: &[usize]) -> Result<Posterior, String> {
         let gone: BTreeSet<usize> = removed.iter().copied().collect();
-        let changes: Vec<Option<Change>> = self.mlps.par_iter().map(|mlp| self.change(mlp, posterior, &gone)).collect::<Result<_, String>>()?;
         let mut trial = posterior.clone();
-        for change in changes.into_iter().flatten() {
+        for mlp in &self.mlps {
+            let Some(change) = self.change(mlp, posterior, &gone)? else { continue };
             let target = &mut trial.mean[change.output];
             for ((row, column), r) in change.rows.rows().into_iter().zip(&change.columns).zip(&change.scales) {
                 if let Some(column) = column {
@@ -434,7 +589,7 @@ impl Compensation {
         let (root, decomposition, floor) = self.scaled(mlp, &surviving, &prior)?;
         // `V_R^½ G_RK U_K` along `S`'s eigenvectors, each coordinate's column weighed by
         // `c_r / (1 + c_r e_k)`, and back.
-        let mut right = fast_ab(&mlp.gram.select(Axis(0), &surviving).select(Axis(1), &deleted), &deleted_outputs);
+        let mut right = fast_ab(&mlp.gram.block(&surviving, &deleted, |_, _| 1.0)?, &deleted_outputs);
         for (mut row, r) in right.rows_mut().into_iter().zip(&root) {
             row *= *r;
         }
@@ -477,7 +632,7 @@ impl Compensation {
             }
             let (root, decomposition, floor) = self.scaled(mlp, &alive, &prior)?;
             let values = decomposition.values.mapv(|e| if e > floor { e } else { 0.0 });
-            let q = &decomposition.vectors;
+            let mut q = decomposition.vectors;
             let (n, d) = (alive.len(), curvature.len());
             let means = &posterior.mean[mlp.output];
             let column = |i: usize| match mlp.outputs[i] {
@@ -490,15 +645,16 @@ impl Compensation {
             let g_map = gradient.get(&mlp.output).unwrap_or(&zero);
             let g = Array2::from_shape_fn((n, d), |(a, r)| g_map[[r, column(alive[a])]]);
             let dk = Array2::from_shape_fn((n, d), |(k, r)| curvature[r] / (1.0 + curvature[r] * values[k]));
-            let squares = q.mapv(|x| x * x);
-            let t0 = fast_ab(&squares, &dk);
-            let t2 = fast_ab(&squares, &dk.mapv(|x| x * x));
             let scaled_g = Array2::from_shape_fn((n, d), |(a, r)| root[a] * g[[a, r]]);
             let scaled_mu = Array2::from_shape_fn((n, d), |(a, r)| mu[[a, r]] / root[a]);
-            let t1 = fast_ab(q, &(&fast_atb(q, &scaled_g) * &dk));
-            let t3 = fast_ab(q, &(&fast_atb(q, &scaled_mu) * &dk));
+            let t1 = fast_ab(&q, &(&fast_atb(&q, &scaled_g) * &dk));
+            let t3 = fast_ab(&q, &(&fast_atb(&q, &scaled_mu) * &dk));
+            // `Q ⊙ Q` in `Q`'s place.
+            q.mapv_inplace(|x| x * x);
+            let t0 = fast_ab(&q, &dk);
+            let t2 = fast_ab(&q, &dk.mapv(|x| x * x));
             for (a, i) in alive.iter().enumerate() {
-                let (v, gii) = (prior[*i], mlp.gram[[*i, *i]]);
+                let (v, gii) = (prior[*i], mlp.gram.at(*i, *i));
                 let mut extra = 0.0;
                 for (r, c) in curvature.iter().enumerate() {
                     let (u, t) = (mu[[a, r]], t0[[a, r]]);
@@ -518,14 +674,25 @@ impl Compensation {
 
     /// Per function alive at `posterior` with its own output column, its groups and the share of
     /// its removal's data rise that remains after compensation, the others of its MLP surviving.
-    /// Deleting function `i` alone, the compensation of coordinate `r` leaves
-    /// `ρ_ir = G_ii − G_iR (G_RR + Λ_r)⁻¹ G_Ri` of its activations' energy `G_ii` (the Schur
-    /// complement of the regularized Gram; module note), which along the eigenvectors of
-    /// `S = V^½ G_AA V^½` over all those functions `A` is
-    /// `ρ_ir / G_ii = Σ_k Q_ik² e_k / (1 + c_r e_k) / (S_ii Σ_k Q_ik² / (1 + c_r e_k))`.
-    /// The uncompensated rise of coordinate `r` is `½ c_r u_ri² G_ii`, so the share is
-    /// `Σ_r c_r u_ri² ρ_ir / (G_ii Σ_r c_r u_ri²)`: from 1 where the data does not support moving
-    /// the outputs (`c_r → 0`) to the least-squares `1 / (G_ii (G_AA⁻¹)_ii)` (`c_r → ∞`).
+    /// Deleting function `i` alone, with survivors `R` and `h_i` its activations, the compensation
+    /// of coordinate `r` minimizes `c_r ‖H_R Δ_r − h_i u_ri‖² + Σ_{j∈R} Δ_rj² / v_j` (twice the
+    /// change of `F` it makes; module note), whose minimum is `c_r u_ri² ρ_ir`,
+    /// `ρ_ir = G_ii − G_iR (G_RR + Λ_r)⁻¹ G_Ri`, the Schur complement of the regularized Gram
+    /// `M_r = G_AA + Λ_r` over all those functions `A` less `Λ_r`'s own entry:
+    /// `ρ_ir = 1 / (M_r⁻¹)_ii − 1 / (c_r v_i)`. Along the eigenvectors of
+    /// `S = V^½ G_AA V^½ = Q diag(e) Qᵀ`, `(M_r⁻¹)_ii = c_r v_i Σ_k Q_ik² / (1 + c_r e_k)` and
+    /// `Σ_k Q_ik² = 1`, so
+    /// `ρ_ir / G_ii = Σ_k Q_ik² e_k / (1 + c_r e_k) / (S_ii Σ_k Q_ik² / (1 + c_r e_k))`, which
+    /// inverts no Gram and holds for a singular one (its eigenvalues below the rounding floor taken
+    /// as zero). The uncompensated rise of coordinate `r` is `½ c_r u_ri² G_ii`, so the share is
+    /// `Σ_r c_r u_ri² ρ_ir / (G_ii Σ_r c_r u_ri²)`. It is 1 where the data does not support moving
+    /// the outputs (`c_r → 0`), and at every `c_r` for a function whose activations are orthogonal
+    /// to its survivors' (`G_iR = 0`). As `c_r → ∞` it tends to the least-squares share
+    /// `‖(I − P_R) h_i‖² / G_ii`, `P_R` the orthogonal projector onto the survivors' activations:
+    /// `1 / (G_ii (G_AA⁺)_ii)` when `e_i` lies in the range of `G_AA`, and zero when it does not,
+    /// which is when the survivors reproduce the function's activations exactly. Two functions
+    /// with the same activations `h`, orthogonal to the others', each keep
+    /// `1 / (1 + c_r v_j ‖h‖²)` of their rise, `v_j` the other's prior variance.
     pub fn unexplained(&self, posterior: &Posterior) -> Result<Vec<(Vec<usize>, f64)>, String> {
         let mut out = Vec::new();
         for mlp in &self.mlps {
@@ -537,14 +704,16 @@ impl Compensation {
             }
             let (_, decomposition, floor) = self.scaled(mlp, &alive, &prior)?;
             let values = decomposition.values.mapv(|e| if e > floor { e } else { 0.0 });
-            let squares = decomposition.vectors.mapv(|q| q * q);
+            // `Q ⊙ Q` in `Q`'s place.
+            let mut squares = decomposition.vectors;
+            squares.mapv_inplace(|q| q * q);
             let weights = |f: &dyn Fn(f64, f64) -> f64| Array2::from_shape_fn((values.len(), curvature.len()), |(k, r)| f(values[k], curvature[r]));
             let numerator = fast_ab(&squares, &weights(&|e, c| e / (1.0 + c * e)));
             let denominator = fast_ab(&squares, &weights(&|e, c| 1.0 / (1.0 + c * e)));
             let means = &*posterior.mean[mlp.output];
             for (a, i) in alive.iter().enumerate() {
                 let Output::Column(column) = mlp.outputs[*i] else { continue };
-                let diagonal = prior[*i] * mlp.gram[[*i, *i]];
+                let diagonal = prior[*i] * mlp.gram.at(*i, *i);
                 let (mut remaining, mut total) = (0.0, 0.0);
                 for (r, c) in curvature.iter().enumerate() {
                     let rise = c * means[[r, column]].powi(2);
@@ -664,7 +833,7 @@ mod tests {
         let mlp = &compensation.mlps[0];
         let (_, curvature) = Compensation::scales(mlp, &posterior, &Compensation::columns(mlp, &posterior));
         let super::Output::Column(column) = mlp.outputs[1] else { panic!("an own column") };
-        let own: f64 = curvature.iter().zip(posterior.mean[mlp.output].column(column)).map(|(c, u)| c * u * u).sum::<f64>() * mlp.gram[[1, 1]];
+        let own: f64 = curvature.iter().zip(posterior.mean[mlp.output].column(column)).map(|(c, u)| c * u * u).sum::<f64>() * mlp.gram.at(1, 1);
         let moved = compensation.moved_quadratic(&posterior, &trial, &[output]).unwrap();
         assert!(own > 0.0 && (moved + 0.5 * own).abs() <= 1e-6 * own, "moved {moved:e}, own {own:e}");
     }
@@ -723,7 +892,6 @@ mod tests {
 
     #[test]
     fn the_compensation_is_the_posterior_mode_and_moves_a_near_copy_less_than_least_squares() {
-        use ndarray::Axis;
         let (native, explanation, sequences) = tiny("library_compensation_mode");
         let mut posterior = Posterior::new(&explanation, 1000).expect("the posterior");
         // Function 1 reads what function 0 reads, its gate's first entry moved by one part in 10^6:
@@ -752,8 +920,8 @@ mod tests {
         let moved = &*trial.mean[mlp.output] - means;
         let delta = Array2::from_shape_fn((surviving.len(), means.nrows()), |(a, r)| moved[[r, column(surviving[a])]]);
         let deleted = means.column(column(1)).to_owned();
-        let g_rr = mlp.gram.select(Axis(0), &surviving).select(Axis(1), &surviving);
-        let g_rk = mlp.gram.select(Axis(0), &surviving).column(1).to_owned();
+        let g_rr = mlp.gram.block(&surviving, &surviving, |_, _| 1.0).expect("the survivors' Gram");
+        let g_rk = mlp.gram.block(&surviving, &[1], |_, _| 1.0).expect("the survivors' Gram with function 1").column(0).to_owned();
         // Stationarity of `Σ_r ½ c_r ‖H_R Δ_r − H_K u_r‖² + Σ_j ‖Δ_j‖² / (2 v_j)` per coordinate.
         let mut worst: f64 = 0.0;
         for r in 0..means.nrows() {
@@ -764,6 +932,11 @@ mod tests {
             worst = worst.max(gradient.iter().fold(0.0_f64, |m, v| m.max(v.abs())) / scale);
         }
         assert!(worst <= 1e-6, "the proposal is not the posterior mode: relative gradient {worst:e}");
+        // The survivors' deviations are kept: the deletion leaves the conditional posterior's
+        // mean-field variances where they were (module note).
+        for j in &surviving {
+            assert_eq!(trial.log_sd[mlp.output].column(column(*j)), posterior.log_sd[mlp.output].column(column(*j)), "survivor {j}'s deviations");
+        }
         // The least-squares move of the same deletion (the limit of a concentrated posterior).
         let mut sharp = posterior.clone();
         let tokens = 1e12_f64;
@@ -823,7 +996,7 @@ mod tests {
         let compensation = Compensation::new(&mut ic, &explanation, &posterior, &sequences, 2).expect("the compensation");
         let gram = &compensation.mlps[1].gram;
         let scale = expected.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-        let difference = gram.iter().zip(&expected).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        let difference = expected.indexed_iter().fold(0.0_f64, |m, ((i, j), b)| m.max((gram.at(i, j) - b).abs()));
         assert!(scale > 0.0 && difference <= 1e-12 * scale, "the Gram differs from the first-token-free one by {difference:e} (scale {scale:e})");
         // Feature 1 made a copy of feature 0 (gate row and bias), then deleted with compensation.
         copy_reads(&explanation, &mut posterior, 1, 0, 1);
@@ -832,5 +1005,37 @@ mod tests {
         assert!(compensated <= 1e-9 * largest, "the compensated removal moved the stream by {compensated:e} (largest value {largest:e})");
         assert!(plain > 1e3 * compensated.max(f64::EPSILON * largest), "the plain removal moved the stream by only {plain:e}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_duplicate_keeps_its_regularized_share_and_an_orthogonal_function_all_of_its_rise() {
+        // Three functions writing one output coordinate: 0 and 1 with the same activations `h`
+        // (a singular Gram), 2 orthogonal to both, `G = [[1, 1, 0], [1, 1, 0], [0, 0, 1]]`. Every
+        // output entry has mean 1 and variance `s`, so `v = 1 + s` for each function and
+        // `c = Σ_j (1/s − 1/v) / Σ_j G_jj = 1/(s (1 + s))`. Deleting 0, its survivor 1 reproduces
+        // its activations, and the regularization leaves `ρ = G_00 − G_01² / (G_11 + 1/(c v)) =
+        // 1/(1 + c v)` of `G_00 = 1`, which is `s/(1 + s)`: a half at `s = 1`, 9.1e-13 at
+        // `s = 2^-40`, and zero, the least-squares share of a reproduced function, as `s → 0`; the
+        // pseudoinverse's `1/(G_00 (G⁺)_00) = 4` is not that limit. No survivor reaches function
+        // 2's activations: it keeps all of its rise at every `s`.
+        let gram = [[1.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let mut packed = super::Packed::zeros(3);
+        packed.add_lower(&Array2::from_shape_fn((3, 3), |(i, j)| gram[i][j])).expect("the Gram");
+        let mlp = super::Mlp { functions: vec![vec![0], vec![1], vec![2]], output: 0, outputs: (0..3).map(super::Output::Column).collect(), gram: packed };
+        let compensation = Compensation { mlps: vec![mlp], rows: 1, device: Device::host() };
+        for s in [1.0, 2f64.powi(-40)] {
+            let membership = Array2::from_shape_fn((1, 3), |(_, j)| j as u32);
+            let mut posterior = Posterior::from_parts(vec![Array2::ones((1, 3))], vec![membership], vec![1.0; 3], 1).expect("the posterior");
+            posterior.log_sd[0] = Array2::from_elem((1, 3), 0.5 * s.ln()).into();
+            let shares = compensation.unexplained(&posterior).expect("the shares");
+            let of = |f: usize| shares.iter().find(|(groups, _)| *groups == [f]).map(|(_, share)| *share).expect("a share");
+            let v = 1.0 + s;
+            let c = 1.0 / s - 1.0 / v;
+            let duplicate = 1.0 / (1.0 + c * v);
+            for f in [0, 1] {
+                assert!((of(f) - duplicate).abs() <= 1e-9 * duplicate, "s = {s:e}: function {f} keeps {:e} of its rise, the regularized share is {duplicate:e}", of(f));
+            }
+            assert!((of(2) - 1.0).abs() <= 1e-12, "s = {s:e}: the orthogonal function keeps {} of its rise", of(2));
+        }
     }
 }
