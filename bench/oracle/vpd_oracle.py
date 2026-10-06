@@ -272,6 +272,54 @@ class Oracle(torch.nn.Module):
         b = self.tokenizer.encode(tail, add_special_tokens=False)
         return a + [self.placeholder] * slots + b, list(range(len(a), len(a) + slots))
 
+    def injection(self, table: Table, components: list[tuple[int, str, int]], condition: str, places: list[list[int]]):
+        """The hook's batch for rows each reading one subcomponent (layer, kind, index) at its
+        placeholder positions `places[row]`: its read and write vectors, then its neighbours', each
+        through its own map; the condition decides which are shown (module note)."""
+        rows, cols, vecs, roles, mags, keeps, layers = [], [], [], [], [], [], []
+        for b, ((layer0, kind0, c0), slots) in enumerate(zip(components, places)):
+            near = table.neighbours(layer0, kind0, c0)
+            items = [(layer0, kind0, c0, None, "")] + [(l, k, c, s, "neighbour_") for l, k, c, s in near]
+            filled = 0
+            for layer, kind, c, strength, who in items:
+                v, u = table.vectors(layer, kind, c)
+                scale = math.log(float(u.norm() * v.norm())) if strength is None else math.log(max(strength, 1e-30))
+                shown = condition in ("graph", "weights") if strength is None else condition == "graph"
+                for side, vec in (("read", v), ("write", u)):
+                    rows.append(b)
+                    cols.append(slots[filled])
+                    filled += 1
+                    vecs.append(self.maps[f"{kind}_{side}"](vec.to(self.dev)))
+                    roles.append(ROLE[who + side])
+                    mags.append(scale)
+                    keeps.append(1.0 if shown else 0.0)
+                    layers.append(layer)
+            for _ in range(filled, len(slots)):  # a subcomponent with fewer neighbours: empty slots
+                rows.append(b)
+                cols.append(slots[filled])
+                filled += 1
+                vecs.append(torch.zeros(self.maps["q_proj_read"].out_features, device=self.dev))
+                roles.append(ROLE["neighbour_read"])
+                mags.append(0.0)
+                keeps.append(0.0)
+                layers.append(layer0)
+        keep = torch.tensor(keeps, device=self.dev)
+        unit = torch.nn.functional.normalize(torch.stack(vecs), dim=-1) * keep[:, None]
+        logn = torch.tensor(mags, device=self.dev) * keep
+        extra = self.magnitude(torch.tensor(roles, device=self.dev), torch.tensor(layers, device=self.dev), logn, 1.0 - keep)
+        at = torch.full((len(rows),), self.inject, device=self.dev)
+        return (torch.tensor(rows, device=self.dev), torch.tensor(cols, device=self.dev), unit, extra, keep, at)
+
+    def load(self, run: Path):
+        """An answer-mode run's adapter, maps and magnitude term (trainable)."""
+        from peft import PeftModel
+
+        inner = self.model.get_base_model()
+        self.model = PeftModel.from_pretrained(inner, str(run / "adapter"), is_trainable=True)
+        state = torch.load(run / "maps.pt")
+        self.maps.load_state_dict(state["maps"])
+        self.magnitude.load_state_dict(state["magnitude"])
+
     def log_q(self, table: Table, batch: list[dict], condition: str):
         slots = 2 + 2 * table.k
         enc = [self.encode(*prompt(table, ex, condition), slots) for ex in batch]
@@ -281,40 +329,7 @@ class Oracle(torch.nn.Module):
         for b, (t, _) in enumerate(enc):
             ids[b, : len(t)] = torch.tensor(t)
             mask[b, : len(t)] = 1
-        rows, cols, vecs, roles, mags, keeps, layers = [], [], [], [], [], [], []
-        for b, (ex, (_, places)) in enumerate(zip(batch, enc)):
-            near = table.neighbours(ex["layer"], ex["kind"], ex["c"])
-            items = [(ex["layer"], ex["kind"], ex["c"], None, "")] + [(l, k, c, s, "neighbour_") for l, k, c, s in near]
-            filled = 0
-            for layer, kind, c, strength, who in items:
-                v, u = table.vectors(layer, kind, c)
-                scale = math.log(float(u.norm() * v.norm())) if strength is None else math.log(max(strength, 1e-30))
-                shown = condition in ("graph", "weights") if strength is None else condition == "graph"
-                for side, vec in (("read", v), ("write", u)):
-                    rows.append(b)
-                    cols.append(places[filled])
-                    filled += 1
-                    vecs.append(self.maps[f"{kind}_{side}"](vec.to(self.dev)))
-                    roles.append(ROLE[who + side])
-                    mags.append(scale)
-                    keeps.append(1.0 if shown else 0.0)
-                    layers.append(layer)
-            for _ in range(filled, len(places)):  # a subcomponent with fewer neighbours: empty slots
-                rows.append(b)
-                cols.append(places[filled])
-                filled += 1
-                vecs.append(torch.zeros(self.maps["q_proj_read"].out_features, device=self.dev))
-                roles.append(ROLE["neighbour_read"])
-                mags.append(0.0)
-                keeps.append(0.0)
-                layers.append(ex["layer"])
-        keep = torch.tensor(keeps, device=self.dev)
-        unit = torch.nn.functional.normalize(torch.stack(vecs), dim=-1) * keep[:, None]
-        layer = torch.tensor(layers, device=self.dev)
-        logn = torch.tensor(mags, device=self.dev) * keep
-        extra = self.magnitude(torch.tensor(roles, device=self.dev), layer, logn, 1.0 - keep)
-        at = torch.full((len(rows),), self.inject, device=self.dev)
-        self.hook.set((torch.tensor(rows, device=self.dev), torch.tensor(cols, device=self.dev), unit, extra, keep, at))
+        self.hook.set(self.injection(table, [(ex["layer"], ex["kind"], ex["c"]) for ex in batch], condition, [places for _, places in enc]))
         inner = self.model.get_base_model()
         try:
             hidden = inner.model(input_ids=ids.to(self.dev), attention_mask=mask.to(self.dev)).last_hidden_state
@@ -362,16 +377,10 @@ def train(args):
 
 @torch.no_grad()
 def evaluate(args):
-    from peft import PeftModel
-
     dev = device()
     config = json.loads((Path(args.run) / "config.json").read_text())
     oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev)
-    inner = oracle.model.get_base_model()
-    oracle.model = PeftModel.from_pretrained(inner, str(Path(args.run) / "adapter"))
-    state = torch.load(Path(args.run) / "maps.pt")
-    oracle.maps.load_state_dict(state["maps"])
-    oracle.magnitude.load_state_dict(state["magnitude"])
+    oracle.load(Path(args.run))
     table = Table(Path(args.labels), Path(args.uv), Path(args.graph) if args.graph else None)
     held = {int(x) for x in config["heldout_layers"].split(",") if x}
     rows = []
