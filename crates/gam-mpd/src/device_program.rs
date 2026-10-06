@@ -29,7 +29,7 @@ use super::device_heads::{self, Buffer, Heads, Stacked};
 use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorBody, OperatorProgram, Rotary, SlotValues};
 use gam_gpu::tensor::{Arithmetic, Device, Indices, Op, PointwiseLaw, Storage, Tensor};
 use ndarray::{Array1, Array2};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// The largest logits tile the head forms at once, in bytes.
@@ -197,7 +197,8 @@ pub struct DeviceProgram {
     head: Head,
     edited_head_nodes: BTreeMap<usize, Option<usize>>,
     operators: BTreeMap<(usize, Role), HeldOperator>,
-    batch: Mutex<Option<Arc<PreparedBatch>>>,
+    /// The last [`BATCHES`] families' prepared batches, the most recently used first.
+    batch: Mutex<VecDeque<Arc<PreparedBatch>>>,
     /// Per rotary, its cosines and sines at positions `0..span` (span × planes), computed once and
     /// grown when a longer sequence comes; a batch gathers its rows by position.
     rotary_tables: Mutex<Vec<(Rotary, usize, Arc<(Tensor, Tensor)>)>>,
@@ -248,6 +249,14 @@ fn sources(program: &OperatorProgram, heads: &Heads) -> Vec<usize> {
         .chain(heads.norms.iter().flat_map(|norms| norms.nodes.iter().map(|(_, _, op)| id(*op))))
         .collect()
 }
+
+/// The prepared batches a program keeps ([`DeviceProgram::prepared_batch`]). A fit's step runs one
+/// block call per side and block, each on its own lanes, for its own batch's halves and three times
+/// for the next batch's (its line step's measurement, then the next step's own evaluation): the
+/// calls of two batches, about 32 families on vpd4l. Kept: each one's ids, positions and rotation
+/// rows (about 1 MB at 4096 rows), which a call otherwise uploads and gathers again (an RTX 4090
+/// trace of a vpd4l step at 4d64ef9bd5 ran 365 uploads per step, the device idle 6 ms after them).
+const BATCHES: usize = 32;
 
 struct PreparedBatch {
     rows: usize,
@@ -712,7 +721,7 @@ impl DeviceProgram {
             };
             fused.push(Fused { heads, stacked, sources, live: true, changed: BTreeSet::new(), disabled: false, source_matches: true });
         }
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()) })
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(VecDeque::new()), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()) })
     }
 
     /// Operator `op`'s device copy changed: every group reading it runs node by node until
@@ -1059,18 +1068,19 @@ impl DeviceProgram {
     /// length, positions strictly increasing within it.
     fn prepared_batch(&self, family: &FamilyInputs) -> Result<Arc<PreparedBatch>, String> {
         let mut cached = self.batch.lock().map_err(|_| "device: poisoned batch cache".to_string())?;
-        if let Some(saved) = cached.as_ref() {
+        let same = |saved: &PreparedBatch| {
             let same_layout = match (&saved.layout, &family.layout) {
                 (None, None) => true,
                 (Some(a), Some(b)) => a.sequence == b.sequence && a.position == b.position,
                 _ => false,
             };
-            if saved.rows == family.rows
+            saved.rows == family.rows
                 && same_layout
                 && saved.tokens.iter().all(|(slot, tokens)| matches!(family.slots.get(*slot), Some(SlotValues::Tokens(current)) if current == tokens))
-            {
-                return Ok(Arc::clone(saved));
-            }
+        };
+        if let Some(saved) = cached.iter().position(|saved| same(saved)).and_then(|k| cached.remove(k)) {
+            cached.push_front(Arc::clone(&saved));
+            return Ok(saved);
         }
         let (blocks, rotations) = self.layout(family)?;
         let mut tokens = BTreeMap::new();
@@ -1091,7 +1101,8 @@ impl DeviceProgram {
         }
         let positions = Arc::new(family.layout.as_ref().map(|l| l.position.clone()).unwrap_or_default());
         let saved = Arc::new(PreparedBatch { rows: family.rows, layout: family.layout.clone(), tokens, ids, blocks, rotations: Arc::new(rotations), positions });
-        *cached = Some(Arc::clone(&saved));
+        cached.push_front(Arc::clone(&saved));
+        cached.truncate(BATCHES);
         Ok(saved)
     }
 
