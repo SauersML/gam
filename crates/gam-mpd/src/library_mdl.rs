@@ -2078,11 +2078,28 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_p
         let alive = d.upload_indices(&surviving).map_err(error)?;
         gates.push(Some((alive, codes, variances(&mlp.gate)?, mlp.up.as_ref().map(variances).transpose()?)));
     }
-    let mut rows = 0usize;
+    // Per layer the positions where its block runs `M`'s MLP instead of its functions (a transcoder
+    // layer's first token, `library_transcoder`): its functions are computed there but not used,
+    // so those tokens are not counted.
+    let fixed: Vec<Vec<u32>> = (0..explanation.layers.len())
+        .map(|l| {
+            let rule = explanation.artifact.program.rules.iter().find(|r| r.name == format!("library.l{l}.mlp"));
+            rule.and_then(|r| r.nodes.iter().find_map(|n| match n {
+                Node::Select { positions, .. } => Some(positions.clone()),
+                _ => None,
+            }))
+            .unwrap_or_default()
+        })
+        .collect();
+    let mut rows = vec![0usize; out.len()];
     for chunk in sequences.chunks(settings.batch_sequences) {
         let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
         let trace = program.forward(&family)?;
-        for ((count, mlp), (alive, codes, gate, up)) in out.iter_mut().zip(&scorer.mlps).zip(&gates).filter_map(|(pair, gates)| gates.as_ref().map(|g| (pair, g))) {
+        let positions = &family.layout.as_ref().ok_or("a sequence layout")?.position;
+        for (l, ((count, mlp), gates)) in out.iter_mut().zip(&scorer.mlps).zip(&gates).enumerate() {
+            let skipped: Vec<usize> = positions.iter().enumerate().filter(|(_, p)| fixed[l].binary_search(p).is_ok()).map(|(r, _)| r).collect();
+            rows[l] += family.rows - skipped.len();
+            let Some((alive, codes, gate, up)) = gates else { continue };
             let x = trace.value(mlp.input)?;
             let mut squares = d.empty(x.rows(), x.cols()).map_err(error)?;
             d.hadamard(&mut squares, x, x, false).map_err(error)?;
@@ -2094,6 +2111,18 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_p
                 Ok(s2)
             };
             let (z, a) = (trace.value(mlp.gate.node)?, trace.value(mlp.activation)?);
+            // The activations with the skipped tokens' rows zero: nothing counts there.
+            let masked = if skipped.is_empty() {
+                None
+            } else {
+                let mut masked = d.copy(a).map_err(error)?;
+                let zero = d.zeros(1, a.cols()).map_err(error)?;
+                for &r in &skipped {
+                    d.set_rows(&mut masked, r, &zero).map_err(error)?;
+                }
+                Some(masked)
+            };
+            let a = masked.as_ref().unwrap_or(a);
             let sz2 = noise(gate)?;
             let mut sums = wide.zeros(1, 3).map_err(error)?;
             match (&mlp.up, up) {
@@ -2116,9 +2145,8 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_p
             count.nonzero_per_token += sums[[0, 1]];
             count.resolved_per_token += sums[[0, 2]];
         }
-        rows += family.rows;
     }
-    for count in &mut out {
+    for (count, rows) in out.iter_mut().zip(rows) {
         count.nonzero_per_token /= rows as f64;
         count.resolved_per_token /= rows as f64;
     }
