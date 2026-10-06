@@ -1837,7 +1837,7 @@ reach() {
         python_env & EARLY_PYENV=$!
     fi
     on_pod 'S=$(command -v sudo || true); command -v rsync > /dev/null || { $S apt-get update -qq && $S apt-get install -y -qq rsync; } > /dev/null 2>&1' < /dev/null & EARLY_RSYNC=$!
-    on_pod "mkdir -p $WS && for i in 1 2 3 4 5; do nvidia-smi --query-gpu=utilization.gpu,memory.free,power.limit,power.default_limit --format=csv,noheader,nounits | head -n 1; sleep 1; done > $WS/.gpu-probe.part; mv $WS/.gpu-probe.part $WS/.gpu-probe" < /dev/null > /dev/null 2>&1 &
+    on_pod "mkdir -p $WS && for i in 1 2 3 4 5; do nvidia-smi --query-gpu=utilization.gpu,memory.free,power.limit,power.default_limit,memory.total --format=csv,noheader,nounits | head -n 1; sleep 1; done > $WS/.gpu-probe.part; mv $WS/.gpu-probe.part $WS/.gpu-probe" < /dev/null > /dev/null 2>&1 &
     # The first sample of the host's receive rate (fetch_too_slow takes the next after the checks).
     PROBE_A=""
     [ -z "$EARLY_FETCH" ] || PROBE_A=$(probe_bytes) || PROBE_A=""
@@ -1915,17 +1915,21 @@ PACK_GPU=20 PACK_WINDOW=300
 
 # Whether a new pod's GPU is in use by something else or held below its power: over 5 one-second
 # samples before anything of ours runs on it, mean utilization at or above the idle line (PACK_GPU),
-# a power limit below the card's default (a host found at 153 W of 450 W ran 5x slower), or less
-# free memory than the run states (RP_MIN_VRAM_GB). Prints the reason, or nothing.
+# a power limit below the card's default (a host found at 153 W of 450 W ran 5x slower), or more
+# than 1 GiB of its memory in use (total less free; an idle card's driver holds 0.5-0.6 GiB: 484 MiB
+# of a 4090's 24564, 610 of an A40's 46068). The card's size is the offers' (RP_MIN_VRAM_GB against
+# its nominal memoryInGb): comparing free MiB with RP_MIN_VRAM_GB x 1024 failed every idle 24 GB
+# 4090 (24080 MiB free) and 48 GB L40S or A40 (45458) and recorded its host as failing. Prints the
+# reason, or nothing.
 gpu_in_use() {
     on_pod "timeout 30 sh -c 'until [ -f $WS/.gpu-probe ]; do sleep 0.2; done' && cat $WS/.gpu-probe" < /dev/null 2> /dev/null |
         awk -F', *' -v idle="$PACK_GPU" -v need="${RP_MIN_VRAM_GB:-0}" '
-            { u += $1; n++; free = $2; lim = $3; def = $4 }
+            { u += $1; n++; free = $2; lim = $3; def = $4; total = $5 }
             END {
                 if (!n) exit
                 if (u / n >= idle) printf "utilization %d%% with no run of ours; ", u / n
                 if (lim ~ /^[0-9.]+$/ && def ~ /^[0-9.]+$/ && lim + 0 < def + 0) printf "power limit %s W of its default %s W; ", lim, def
-                if (need > 0 && free + 0 < need * 1024) printf "%d MiB free of the %d GiB the run needs; ", free, need
+                if (total ~ /^[0-9.]+$/ && free ~ /^[0-9.]+$/ && total - free > 1024) printf "%d MiB of its %d MiB in use with no run of ours; ", total - free, total
             }' | sed 's/; $//'
 }
 find_host() {
