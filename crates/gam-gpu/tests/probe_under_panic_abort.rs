@@ -1,9 +1,12 @@
 //! A consumer built with `panic = "abort"` gets typed CUDA absence from the probe, not an abort.
 //!
 //! No in-tree test binary can observe the abort: libtest ignores a profile's `panic` setting, and
-//! gam's own profiles unwind. This test compiles the gam-gpu example
-//! `cudarc_probe_under_panic_abort` with `-C panic=abort` through `cargo rustc`, in a private
-//! target directory so the nested cargo never waits on the outer build's lock, and runs it. The
+//! gam's own profiles unwind. This test builds the gam-gpu example
+//! `cudarc_probe_under_panic_abort` as a `panic = "abort"` consumer builds it, every crate of its
+//! graph with abort (`CARGO_PROFILE_DEV_PANIC=abort`), in a private target directory so the nested
+//! cargo never waits on the outer build's lock, and runs it. Aborting the example crate alone
+//! (`cargo rustc -- -C panic=abort`) does not link on macOS, where the Metal dependencies (`objc2`
+//! and the crates around it) require the crates that use them to unwind as they do. The
 //! nested resolve is `--locked` to the workspace lockfile but may fetch: a test shard that runs
 //! from a nextest archive has the registry cache but no checkout of the workspace's git
 //! dependencies, and `--offline` refused the resolve there. On a host where cudarc's loader opens
@@ -23,23 +26,21 @@ fn build_example_with_panic_abort() -> PathBuf {
             "CARGO_TARGET_DIR",
             concat!(env!("CARGO_TARGET_TMPDIR"), "/probe_under_panic_abort"),
         )
+        .env("CARGO_PROFILE_DEV_PANIC", "abort")
         .args([
-            "rustc",
+            "build",
             "--locked",
             "--package",
             "gam-gpu",
             "--example",
             EXAMPLE,
-            "--message-format=json",
-            "--",
-            "-C",
-            "panic=abort",
+            "--message-format=json-render-diagnostics",
         ])
         .output()
-        .expect("run cargo rustc for the panic=abort probe example");
+        .expect("run cargo build for the panic=abort probe example");
     assert!(
         output.status.success(),
-        "cargo rustc failed for the panic=abort probe example: {}",
+        "cargo build failed for the panic=abort probe example: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout)
