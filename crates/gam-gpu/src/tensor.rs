@@ -6966,7 +6966,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             // A probe's key, a chunk's signed roots per row and class, and per row their running sum
             // `a` (from zero) and its rescaling.
             let (key, probing) = (probe.as_ref().map_or(0, |(key, _)| *key), i32::from(probe.is_some()));
-            let cells = if probe.is_some() { rows * chunk } else { 1 };
+            let cells = if probe.is_some() && !seed_half { rows * chunk } else { 1 };
             // SAFETY: with a probe, each chunk's `head_chunk` writes the roots of its rows × count
             // classes before the product reads them; without one, no kernel touches them.
             let mut roots = unsafe { self.stream.alloc::<f32>(cells.max(1)) }.gpu_ctx("tensor alloc")?;
@@ -6989,6 +6989,16 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             let (rows32, width32) = (u32::try_from(rows).map_err(|_| shape("head rows exceed u32".to_string()))?, width as u32);
             let want = i32::from(expected.is_some());
             let (t, n_op) = (cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N);
+            // With the seeds' products in bfloat16, `head_chunk` writes each chunk's exponentials
+            // and roots rounded into these (rows × count) in place of the f32 ones.
+            let half32 = i32::from(seed_half);
+            let half_cells = |on: bool| if seed_half && on { rows * chunk } else { 1 };
+            // SAFETY: with `seed_half`, each chunk's `head_chunk` writes the rows × count
+            // exponentials (with `expected`) and roots (with a probe) before a product reads them;
+            // otherwise no kernel touches them.
+            let mut half_e = unsafe { self.stream.alloc::<u16>(half_cells(expected.is_some())) }.gpu_ctx("tensor bf16 alloc")?;
+            // SAFETY: as `half_e`.
+            let mut half_roots = unsafe { self.stream.alloc::<u16>(half_cells(probe.is_some())) }.gpu_ctx("tensor bf16 alloc")?;
             let chunk_kernel = self.kernel("head_chunk", Storage::F32)?;
             let rescale = self.kernel("scale_rows", Storage::F32)?;
             for (index, start) in (0..classes).step_by(chunk).enumerate() {
@@ -7016,7 +7026,8 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                 unsafe {
                     self.stream.launch_builder(&chunk_kernel).arg(&rows32).arg(&count32).arg(&mut logits).arg(&mut largest)
                         .arg(&mut sums).arg(&mut factor).arg(&want).arg(&key).arg(&start32).arg(&probing)
-                        .arg(&mut roots).arg(&mut root_sums).arg(&mut root_factor).launch(cfg_rows(rows))
+                        .arg(&mut roots).arg(&mut root_sums).arg(&mut root_factor).arg(&half32).arg(&mut half_e).arg(&mut half_roots)
+                        .launch(cfg_rows(rows))
                 }
                 .gpu_ctx("tensor head_chunk")?;
                 if let Some(out) = expected.as_deref_mut() {
@@ -7028,11 +7039,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                     }
                     // Column-major outᵀ (width × rows) += E_chunkᵀ (width × count) · Pᵀ (count × rows).
                     let (head_op, head_ld) = if transposed { (t, classes) } else { (n_op, width) };
-                    let rounded = if seed_half { Some(self.round_half(&logits, 0, rows * count)?) } else { None };
-                    let weights = match &rounded {
-                        Some(r) => Factor::Half(r),
-                        None => Factor::Single(&logits),
-                    };
+                    let weights = if seed_half { Factor::Half(&half_e) } else { Factor::Single(&logits) };
                     self.gemm_ex(
                         Gemm32 {
                             ops: (head_op, n_op),
@@ -7058,11 +7065,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                     // Column-major probedᵀ (width × rows) += E_chunkᵀ (width × count) · Wᵀ (count ×
                     // rows), W the chunk's signed roots (rounded to bfloat16 as the exponentials are).
                     let (head_op, head_ld) = if transposed { (t, classes) } else { (n_op, width) };
-                    let rounded = if seed_half { Some(self.round_half(&roots, 0, rows * count)?) } else { None };
-                    let weights = match &rounded {
-                        Some(r) => Factor::Half(r),
-                        None => Factor::Single(&roots),
-                    };
+                    let weights = if seed_half { Factor::Half(&half_roots) } else { Factor::Single(&roots) };
                     self.gemm_ex(
                         Gemm32 {
                             ops: (head_op, n_op),

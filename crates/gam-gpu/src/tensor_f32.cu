@@ -743,9 +743,12 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
 // cols) gets exp((logit − new largest) / 2) ξ, ξ the signs of row r under `key` (`fisher_sign`),
 // ready to weight the chunk's head rows into the probe's accumulator; `root_factor[r]` gets
 // exp((old largest − new) / 2), that accumulator's rescaling, and `a[r]` becomes
-// `a[r] root_factor + Σ roots` (in double).
+// `a[r] root_factor + Σ roots` (in double). With `half` (products in bfloat16) the exponentials and
+// the roots are written rounded (`bf16_of`) to `half_e` and `half_roots` (rows × cols) in place of
+// `logits` and `roots`; the sums are of the unrounded values either way.
 extern "C" __global__ void head_chunk(unsigned int rows, unsigned int cols, float* logits, float* m, double* s, float* factor, int expected,
-    u64 key, unsigned int start, int probe, float* roots, double* a, float* root_factor) {
+    u64 key, unsigned int start, int probe, float* roots, double* a, float* root_factor, int half, unsigned short* half_e,
+    unsigned short* half_roots) {
     __shared__ float shared[WARPS];
     __shared__ double sd[WARPS];
     unsigned int r = blockIdx.x;
@@ -763,9 +766,13 @@ extern "C" __global__ void head_chunk(unsigned int rows, unsigned int cols, floa
         if (probe) {
             float root = next == NEG_INF ? 0.0f : expf(0.5f * (z[c] - next)) * fisher_sign(key, r, start + c);
             signed_part += (double)root;
-            roots[(u64)r * cols + c] = root;
+            if (half) half_roots[(u64)r * cols + c] = bf16_of(root);
+            else roots[(u64)r * cols + c] = root;
         }
-        if (expected) z[c] = e;
+        if (expected) {
+            if (half) half_e[(u64)r * cols + c] = bf16_of(e);
+            else z[c] = e;
+        }
     }
     part = block_sum_d(part, sd);
     if (probe) signed_part = block_sum_d(signed_part, sd);
