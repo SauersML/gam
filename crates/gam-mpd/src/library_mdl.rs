@@ -1394,8 +1394,7 @@ pub struct Settings {
     pub epochs: Option<usize>,
     /// The families of each base's patched experiment, one drawn uniformly per base
     /// (`interchange::Family`): `read` (a read patch, `interchange::sample`), `swap`, `zero`,
-    /// `scale`, `push`, `cut`, `neuron` and `rank_one` (operations on sites every explanation shares
-    /// with `M`, and weight edits of `M`'s MLPs,
+    /// `scale`, `push` and `cut` (operations on sites every explanation shares with `M`,
     /// `interchange::Interchange::draw_ops`). Empty (the default) is `read` alone.
     #[serde(default)]
     pub families: Vec<interchange::Family>,
@@ -1903,10 +1902,6 @@ impl Scorer {
         let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
-        // Weight edits of M's MLPs (neurons, seeded rank-one slices), drawn from M and the seed.
-        if settings.families.iter().any(|f| matches!(f, interchange::Family::Neuron | interchange::Family::RankOne)) {
-            experiments.set_weight_edits(crate::vpd_parts::mlps_of(native, &sites)?, interchange::WEIGHT_EDITS, settings.seed)?;
-        }
         Ok(Self { experiments, mlps, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()) })
     }
 
@@ -2300,7 +2295,7 @@ fn held_out_on(
                     match patch {
                         Patch::Read { .. } => read.add(bits),
                         Patch::Reads { .. } => joint.add(bits),
-                        Patch::FixedPart { .. } | Patch::Ops { .. } => {}
+                        Patch::Ops { .. } => {}
                     }
                 }
             }

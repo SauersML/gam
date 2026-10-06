@@ -55,7 +55,6 @@ use gam_mpd::{
     import::{hugging_face_language_model, hugging_face_language_model_prefix, import_language_model},
     interchange, library_mdl, library_transcoder,
     operator_program::{OperatorProgram, SlotValues},
-    vpd_parts,
     run_check::{LayerNodes, layer_nodes, split_sites},
 };
 use gam_runtime::warm_start::Fingerprinter;
@@ -211,48 +210,6 @@ struct EditSettings {
     /// operators, its transcoder feature through the kept file), in float32.
     #[serde(default)]
     functions: Option<String>,
-    /// VPD's MLP subcomponents as one more source of the `rank_one` family's weight edits, when set.
-    #[serde(default)]
-    vpd: Option<VpdEdits>,
-}
-
-/// VPD's MLP subcomponents as rank-one weight edits (`EditSettings::vpd`): `export` is `M`'s
-/// engine export (its MLPs) and `decomposition` VPD's exported decomposition. Each is a slice of
-/// `M`'s weight, a real weight edit of `M` applied as the same function of each model's own MLP
-/// read; the `rank_one` family draws them uniformly with the seeded random slices, chosen without
-/// looking at VPD's (or any explanation's) activity.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VpdEdits {
-    export: PathBuf,
-    decomposition: PathBuf,
-    /// Edits scored besides the drawn ones, each `[sequence, layer, site, subcomponent, position,
-    /// α]` (`sequence` a held-out index in `EditSettings::sequences`, as the experiments' lines
-    /// name it, `site` `"mlp.c_fc"` or `"mlp.down_proj"`,
-    /// `α` one of `interchange::FACTORS`), so another implementation of the same edit is checked
-    /// against this one experiment by experiment.
-    #[serde(default)]
-    listed: Vec<(usize, usize, String, usize, usize, f64)>,
-}
-
-/// The listed edits ([`VpdEdits::listed`]) of the batch's `count` held-out sequences from held-out
-/// index `first`.
-fn listed_edits(listed: &[(usize, usize, String, usize, usize, f64)], (first, count): (usize, usize), slices: &BTreeMap<(usize, bool, usize), usize>, blocks: usize) -> Result<Vec<interchange::Experiment>, String> {
-    let mut out = Vec::new();
-    for (sequence, layer, site, index, position, alpha) in listed {
-        if !(first..first + count).contains(sequence) {
-            continue;
-        }
-        let down = match site.as_str() {
-            "mlp.down_proj" => true,
-            "mlp.c_fc" => false,
-            other => return Err(format!("edits: a listed edit of site {other}")),
-        };
-        let part = *slices.get(&(*layer, down, *index)).ok_or_else(|| format!("edits: no subcomponent {index} of layer {layer}'s {site}"))?;
-        let factor = interchange::FACTORS.iter().position(|f| f == alpha).ok_or_else(|| format!("edits: α {alpha} is not one of the factors"))?;
-        out.push(interchange::Experiment { base: sequence - first, source: sequence - first, explained: vec![true; blocks], patch: Some(interchange::Patch::FixedPart { part, factor, block: 2 * layer + 1 }), position: *position });
-    }
-    Ok(out)
 }
 
 /// The parts in the oracle's names (`EditSettings::functions`), a safetensors file.
@@ -317,27 +274,6 @@ fn edit_faithfulness(
     }
     let mut experiments = interchange::Interchange::new(device, native, layers, &artifact, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     let count = parts.len();
-    // VPD's subcomponents as fixed parts (the listed edits name them) and as rank-one weight edits.
-    let slices = match &settings.vpd {
-        Some(v) => {
-            let slices = vpd_parts::slices(&v.export, &v.decomposition)?;
-            log::info!("edits: {} VPD MLP subcomponents", slices.len());
-            slices
-        }
-        None => Vec::new(),
-    };
-    let slice_of: BTreeMap<(usize, bool, usize), usize> = slices.iter().enumerate().map(|(i, s)| ((s.part.layer, s.part.map == vpd_parts::Map::Down, s.part.index), i)).collect();
-    experiments.set_fixed_parts(slices.clone())?;
-    // Weight edits of M's MLPs, the same for every explanation: seeded neurons and rank-one slices,
-    // and VPD's subcomponents (when given) as one more source of rank-one slices.
-    let weights = |x: &mut interchange::Interchange| -> Result<(), String> {
-        if settings.families.iter().any(|f| matches!(f, interchange::Family::Neuron | interchange::Family::RankOne)) {
-            x.set_weight_edits(vpd_parts::mlps_of(native, layers)?, interchange::WEIGHT_EDITS, settings.seed)?;
-            x.add_weight_edits(interchange::Family::RankOne, slices.clone())?;
-        }
-        Ok(())
-    };
-    weights(&mut experiments)?;
     log::info!("edits: {count} parts, {} held-out sequences, {:.0} s to compile", end - first, started.elapsed().as_secs_f64());
     let mut rng = rand::rngs::StdRng::seed_from_u64(settings.seed);
     // Operations on shared sites push seeded directions at each site's typical norm, measured on
@@ -353,9 +289,6 @@ fn edit_faithfulness(
         Some(interchange::Patch::Ops { family: interchange::Family::Scale, .. }) => "scale",
         Some(interchange::Patch::Ops { family: interchange::Family::Push, .. }) => "push",
         Some(interchange::Patch::Ops { family: interchange::Family::Cut, .. }) => "cut",
-        Some(interchange::Patch::FixedPart { .. }) => "rank_one",
-        Some(interchange::Patch::Ops { family: interchange::Family::Neuron, .. }) => "neuron",
-        Some(interchange::Patch::Ops { family: interchange::Family::RankOne, .. }) => "rank_one",
         Some(_) => "read",
     };
     // Per family: every scored token's bits, the edited tokens' bits, and the experiments.
@@ -365,10 +298,7 @@ fn edit_faithfulness(
         let batch = interchange::Batch::new(chunk.to_vec(), chunk.to_vec())?;
         // Each base's donor is the next held-out sequence of its batch.
         let donors: Vec<usize> = (0..chunk.len()).map(|n| (n + 1) % chunk.len()).collect();
-        let mut drawn = experiments.sample_ops(&mut rng, &batch, &settings.families, settings.edits_per_sequence, &donors, false)?;
-        if let Some(v) = &settings.vpd {
-            drawn.extend(listed_edits(&v.listed, (first + b * settings.batch_sequences, chunk.len()), &slice_of, 2 * layers.len())?);
-        }
+        let drawn = experiments.sample_ops(&mut rng, &batch, &settings.families, settings.edits_per_sequence, &donors, false)?;
         let scored = experiments.evaluate(&batch, &drawn, false)?;
         for (e, bits) in drawn.iter().zip(&scored.bits) {
             let entry = scores.entry(family(e)).or_default();
@@ -383,8 +313,6 @@ fn edit_faithfulness(
     // applying no edit.
     drop(experiments);
     let mut reference = interchange::Interchange::new(device, native, layers, &gam_mpd::artifact::Artifact::native(native)?, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
-    reference.set_fixed_parts(slices.clone())?;
-    weights(&mut reference)?;
     reference.set_directions(interchange::DIRECTIONS, settings.seed);
     reference.measure_typical(&typical_batch)?;
     reference.unedited_explanation();
@@ -393,28 +321,17 @@ fn edit_faithfulness(
     const BINS: [f64; 3] = [0.01, 0.1, 1.0];
     let mut effects: BTreeMap<&str, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
     let mut binned: BTreeMap<(&str, usize), (Vec<f64>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
-    // Per experiment (one JSON line each): its held-out sequence, edited position, family, parts
-    // as (layer, row in the layer), factor, effect at the edited token and gap there, so another
-    // implementation of the same edit (bench/oracle/qwen_labels.py) can be checked against it.
+    // Per experiment (one JSON line each): its held-out sequence, edited position, family,
+    // operations, effect at the edited token and gap there.
     let mut records = String::new();
     for (b, batch, drawn, gaps) in &batches {
         for ((e, bits), gap) in drawn.iter().zip(&reference.evaluate(batch, drawn, false)?.bits).zip(gaps) {
-            let factor = match &e.patch {
-                Some(interchange::Patch::FixedPart { factor, .. }) => Some(*factor),
-                _ => None,
-            };
-            // A subcomponent as (layer, VPD's site, its index there).
-            let subcomponent = match &e.patch {
-                Some(interchange::Patch::FixedPart { part, .. }) => slices.get(*part).map(|s| json!([s.part.layer, if s.part.map == vpd_parts::Map::Down { "mlp.down_proj" } else { "mlp.c_fc" }, s.part.index])),
-                _ => None,
-            };
             let ops: Vec<Value> = match &e.patch {
                 Some(interchange::Patch::Ops { ops, .. }) => ops.iter().map(|o| json!({"site": o.site, "operation": format!("{:?}", o.operation), "onward": o.onward})).collect(),
                 _ => Vec::new(),
             };
             records.push_str(&json!({
                 "sequence": first + b * settings.batch_sequences + e.base, "position": e.position, "family": family(e), "ops": ops,
-                "subcomponent": subcomponent, "factor": factor.and_then(|f| interchange::FACTORS.get(f).copied()),
                 "effect_bits_at_edited_token": bits.first(), "gap_bits_at_edited_token": gap.first(),
             }).to_string());
             records.push('\n');
