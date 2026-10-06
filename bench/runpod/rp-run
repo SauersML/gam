@@ -1427,7 +1427,8 @@ done
 # Each shard the pod tokenizes is tokenized once more, whole (every window length), on a free GitHub
 # Actions runner at the same commit, checked against the release's sha256s and published to
 # rp-run-data by gha-run.yml's data step, so later runs download it. One dispatch per shard in 6 h
-# ($RP/fineweb_publish/SHARD's time); the dispatch runs in the background.
+# ($RP/fineweb_publish/SHARD's time); the dispatch runs in the background. The runner's pip (22.0 on
+# ubuntu-22.04) fails to resolve the set, so a current pip is installed first.
 if [ ${#fw_publish[@]} -gt 0 ] && [ -z "${RP_DRY:-}" ] && [ -z "${RP_ESTIMATE_ONLY:-}" ]; then
     mkdir -p "$RP/fineweb_publish"
     for e in "${fw_publish[@]}"; do
@@ -1436,7 +1437,7 @@ if [ ${#fw_publish[@]} -gt 0 ] && [ -z "${RP_DRY:-}" ] && [ -z "${RP_ESTIMATE_ON
         [ -f "$m" ] && (( $(date +%s) - $(stat -f %m "$m") < 21600 )) && continue
         touch "$m"
         lines=$(tr ';' '\n' <<< "$sums" | sed '/^$/d' | sed "s/.*/'&'/" | tr '\n' ' ')
-        cmd="python3 -m pip install -q 'numpy>=2' pyarrow huggingface_hub tokenizers && python3 bench/mpd_qwen3_fineweb_2951.py --file $k --documents $n --context ${ts//,/ } --out \$OUT/shard --workers 4 && cd \$OUT/shard && printf '%s\\n' $lines| sha256sum -c --quiet && mkdir -p \$OUT/rp-run-data && for f in *; do mv \"\$f\" \"\$OUT/rp-run-data/\$(sha256sum \"\$f\" | cut -c1-64)\"; done"
+        cmd="python3 -m pip install -q --user --upgrade pip && python3 -m pip install -q --user 'numpy>=2' pyarrow huggingface_hub tokenizers && python3 bench/mpd_qwen3_fineweb_2951.py --file $k --documents $n --context ${ts//,/ } --out \$OUT/shard --workers 4 && cd \$OUT/shard && printf '%s\\n' $lines| sha256sum -c --quiet && mkdir -p \$OUT/rp-run-data && for f in *; do mv \"\$f\" \"\$OUT/rp-run-data/\$(sha256sum \"\$f\" | cut -c1-64)\"; done"
         ( GHA_REF=$C "${SELF%/*}/gha-run" "fineweb-publish-$d" -- "$cmd" >> "$RP/fineweb_publish/dispatch.log" 2>&1 & )
     done
 fi
