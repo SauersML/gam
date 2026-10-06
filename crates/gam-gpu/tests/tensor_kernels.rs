@@ -437,3 +437,70 @@ fn the_device_eigendecomposition_agrees_with_the_host() {
         }
     }
 }
+
+#[test]
+fn the_split_gram_lies_within_its_bound_and_is_timed_against_the_float64_product() {
+    use gam_gpu::tensor::Storage;
+    let Some(device) = accelerator() else { return };
+    let Ok(narrow) = device.with_storage(Storage::F32) else { return };
+    let wide = device.with_storage(Storage::F64).expect("float64 storage beside f32");
+    let slices = 9;
+    // Entries spread over 2^-30 .. 2^5, exact zeros, and a zero column, rounded to f32 as the
+    // device holds them.
+    let (rows, cols) = (1000, 96);
+    let spread = matrix(rows, cols, 11, 1.0);
+    let a = Array2::from_shape_fn((rows, cols), |(k, j)| {
+        let scale = 2f64.powi(5 - ((k * 7 + j * 13) % 36) as i32);
+        if j == 5 || (k + j) % 17 == 0 { 0.0 } else { f64::from((spread[[k, j]] * scale) as f32) }
+    });
+    let mut c = wide.zeros(cols, cols).expect("sum");
+    if !wide.gram_split(&mut c, &narrow.upload(a.view()).expect("upload"), slices).expect("split Gram") {
+        return;
+    }
+    let c = wide.download(&c).expect("download");
+    let exponent = |j: usize| {
+        let m = a.column(j).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        if m == 0.0 { 0 } else { m.log2().floor() as i32 + 1 }
+    };
+    for i in 0..cols {
+        for j in 0..cols {
+            let exact = exact_dot(a.column(i), a.column(j));
+            let bound = (slices + 4) as f64 * rows as f64 * 2f64.powi(exponent(i) + exponent(j) - 7 * slices as i32);
+            assert!((c[[i, j]] - exact).abs() <= bound, "entry ({i}, {j}): {} against {exact}, bound {bound}", c[[i, j]]);
+        }
+    }
+    // One vpd4l MLP's batch, 4096 rows of 3072 functions: the split Gram against the float64
+    // rank-k update of the same values.
+    let (rows, cols) = (4096, 3072);
+    let a = matrix(rows, cols, 17, 1.0).mapv(|v| f64::from(v as f32));
+    let (narrow_a, wide_a) = (narrow.upload(a.view()).expect("upload"), wide.upload(a.view()).expect("upload"));
+    let mut split = wide.zeros(cols, cols).expect("sum");
+    let mut full = wide.zeros(cols, cols).expect("sum");
+    wide.gram_split(&mut split, &narrow_a, slices).expect("warm");
+    wide.gram_lower(&mut full, &wide_a, 1.0).expect("warm");
+    assert_eq!(wide.download(&full).expect("sync").dim(), (cols, cols));
+    let repeats = 5;
+    let started = std::time::Instant::now();
+    for _ in 0..repeats {
+        wide.gram_split(&mut split, &narrow_a, slices).expect("split Gram");
+    }
+    assert_eq!(wide.download(&split).expect("sync").dim(), (cols, cols));
+    let split_seconds = started.elapsed().as_secs_f64() / repeats as f64;
+    let started = std::time::Instant::now();
+    for _ in 0..repeats {
+        let wide_now = wide.convert(&narrow_a).expect("widen");
+        wide.gram_lower(&mut full, &wide_now, 1.0).expect("float64 Gram");
+    }
+    assert_eq!(wide.download(&full).expect("sync").dim(), (cols, cols));
+    let full_seconds = started.elapsed().as_secs_f64() / repeats as f64;
+    println!("split Gram {rows} x {cols} in {slices} slices: {:.2} ms; float64 rank-k update with the widening: {:.2} ms", split_seconds * 1e3, full_seconds * 1e3);
+    // Both sums hold 1 + repeats products: their lower triangles agree within the two bounds.
+    let (split, full) = (wide.download(&split).expect("split"), wide.download(&full).expect("full"));
+    let norms: Vec<f64> = (0..cols).map(|j| a.column(j).dot(&a.column(j))).collect();
+    for i in (0..cols).step_by(97) {
+        for j in (0..=i).step_by(89) {
+            let tolerance = (1 + repeats) as f64 * 2.0 * gamma(rows) * (norms[i] * norms[j]).sqrt();
+            assert!((split[[i, j]] - full[[i, j]]).abs() <= tolerance, "entry ({i}, {j}): {} split, {} float64", split[[i, j]], full[[i, j]]);
+        }
+    }
+}

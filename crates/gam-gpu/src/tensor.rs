@@ -1064,6 +1064,29 @@ impl Device {
         }
     }
 
+    /// `c ← c + aᵀ a` (the whole float64 `c`) for the f32 rows × n activations `a`, by the Ozaki
+    /// scheme on CUDA's integer tensor cores: each column j of `a` scaled by its exponent `e_j`
+    /// (every |a_kj| < 2^e_j) and split into `slices` int8 slices, `a_kj = 2^(e_j − 7) Σ_s a_s,kj
+    /// 2^(−7s) + r_kj` with `|r_kj| < 2^(e_j − 7 slices)`; the slice products with `s + t <
+    /// slices` are exact in int32 (rows · 127² < 2^31) and added in float64. Per entry the
+    /// result is within `(slices + 4) · rows · 2^(e_i + e_j − 7 slices)` of the exact sum (the
+    /// truncation `2 · 2^(e_i + e_j − 7 slices)` per row, the products left out at most
+    /// `1.01 (slices + 1)` of it, the float64 additions below one more), and `2^(e_i + e_j) < 4
+    /// max_k |a_ki| max_k |a_kj| ≤ 4 √(G_ii G_jj)`: with 9 slices and up to 2^14 rows this is below
+    /// `γ_rows √(G_ii G_jj)`, the bound of a float64 product's own rounding. `Ok(false)` where
+    /// there is no such path (the host, the Apple GPU, or `a` not f32), for the caller's float64
+    /// product. Rows above 2^17 are refused (the int32 sums could overflow).
+    pub fn gram_split(&self, c: &mut Tensor, a: &Tensor, slices: usize) -> Result<bool, GpuError> {
+        if c.dim() != (a.cols, a.cols) || slices == 0 || a.rows > 1 << 17 {
+            return Err(shape(format!("a {:?} Gram of {:?} activations in {slices} slices", c.dim(), a.dim())));
+        }
+        match (&*self.backend, &a.data) {
+            #[cfg(target_os = "linux")]
+            (Backend::Cuda(engine), Data::Cuda32(_)) if a.rows > 0 && a.cols > 0 => engine.gram_split(c, a, slices).map(|()| true),
+            _ => Ok(false),
+        }
+    }
+
     /// The eigendecomposition of the symmetric float64 matrix `a` (its lower triangle read) by
     /// cuSOLVER's divide and conquer (`cusolverDnDsyevd`) on CUDA: the eigenvalues in increasing
     /// order and the eigenvectors as columns, within the backward error of a stable symmetric
@@ -4684,6 +4707,75 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             .result();
             drop((record_a, record_c, serial));
             update.gpu_ctx("tensor DSYRK")
+        }
+
+        /// [`super::Device::gram_split`]: the exponents, the slices (column-major, rows padded to a
+        /// multiple of 4 for the integer kernels), one int32 product `a_sᵀ a_t` per pair `s ≤ t`
+        /// with `s + t < slices`, each added (with its transpose when `s < t`) into `c`.
+        pub(super) fn gram_split(&self, c: &mut Tensor, a: &Tensor, slices: usize) -> Result<(), GpuError> {
+            use cudarc::cublas::sys::{cublasComputeType_t, cublasGemmAlgo_t};
+            let (rows, cols) = (a.rows, a.cols);
+            let stride = rows.div_ceil(4) * 4;
+            let x = slice32(a)?;
+            let (rows_u, cols_u, stride_u, slices_u) = (u32_of(rows)?, u32_of(cols)?, u32_of(stride)?, u32_of(slices)?);
+            let mut exponents = self.stream.alloc_zeros::<i32>(cols).gpu_ctx("split exponents")?;
+            let f = self.kernel("split_exponents", Storage::F32)?;
+            let cfg = LaunchConfig { grid_dim: (cols.div_ceil(BLOCK as usize) as u32, 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
+            // SAFETY: `x` holds rows × cols floats and `exponents` cols integers.
+            unsafe { self.stream.launch_builder(&f).arg(&rows_u).arg(&cols_u).arg(x).arg(&mut exponents).launch(cfg) }.gpu_ctx("split_exponents")?;
+            let mut parts = self.stream.alloc_zeros::<i8>(slices * cols * stride).gpu_ctx("split slices")?;
+            let f = self.kernel("split_slices", Storage::F32)?;
+            // SAFETY: `parts` holds slices × cols × stride bytes.
+            unsafe { self.stream.launch_builder(&f).arg(&rows_u).arg(&cols_u).arg(&stride_u).arg(&slices_u).arg(x).arg(&exponents).arg(&mut parts).launch(cfg_elements((stride * cols) as u64)) }
+                .gpu_ctx("split_slices")?;
+            let mut product = self.stream.alloc_zeros::<i32>(cols * cols).gpu_ctx("split product")?;
+            let combine = self.kernel("split_combine", Storage::F32)?;
+            let g = slice_mut(c)?;
+            let (n, k) = (i32_of(cols)?, i32_of(stride)?);
+            let (one, zero) = (1_i32, 0_i32);
+            for s in 0..slices {
+                for t in s..slices - s {
+                    {
+                        let serial = self.gemm_workspace.lock().map_err(|_| shape("poisoned GEMM workspace".to_string()))?;
+                        let (base, record_a) = parts.device_ptr(&self.stream);
+                        let (pc, record_c) = product.device_ptr_mut(&self.stream);
+                        let (left, right) = (base + (s * cols * stride) as u64, base + (t * cols * stride) as u64);
+                        // SAFETY: each slice holds cols × stride bytes (column-major, leading
+                        // dimension stride, a multiple of 4) and `product` cols × cols integers.
+                        let status = unsafe {
+                            cudarc::cublas::sys::cublasGemmEx(
+                                *self.blas.handle(),
+                                cublasOperation_t::CUBLAS_OP_T,
+                                cublasOperation_t::CUBLAS_OP_N,
+                                n,
+                                n,
+                                k,
+                                (&raw const one).cast(),
+                                left as *const std::ffi::c_void,
+                                cudaDataType_t::CUDA_R_8I,
+                                k,
+                                right as *const std::ffi::c_void,
+                                cudaDataType_t::CUDA_R_8I,
+                                k,
+                                (&raw const zero).cast(),
+                                pc as *mut std::ffi::c_void,
+                                cudaDataType_t::CUDA_R_32I,
+                                n,
+                                cublasComputeType_t::CUBLAS_COMPUTE_32I,
+                                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                            )
+                        }
+                        .result();
+                        drop((record_a, record_c, serial));
+                        status.gpu_ctx("split int8 product")?;
+                    }
+                    let (shift, both) = (i32::try_from(s + t).map_err(|_| shape("slices".to_string()))?, u32::from(s != t));
+                    // SAFETY: `product` holds cols × cols integers, `exponents` cols, `g` cols × cols doubles.
+                    unsafe { self.stream.launch_builder(&combine).arg(&cols_u).arg(&shift).arg(&both).arg(&product).arg(&exponents).arg(&mut *g).launch(cfg_elements((cols * cols) as u64)) }
+                        .gpu_ctx("split_combine")?;
+                }
+            }
+            Ok(())
         }
 
         /// [`super::Device::symmetric_eigh`] on a stream of its own (the MLPs of a removal trial

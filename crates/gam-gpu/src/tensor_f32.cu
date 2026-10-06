@@ -804,3 +804,42 @@ extern "C" __global__ void head_finish(unsigned int rows, unsigned int width, co
         mean[i] = on ? mean[i] * inverse : 0.0f;
     }
 }
+
+// The Ozaki split of a Gram matrix's operand (Device::gram_split). Per column j of the rows × cols
+// row-major x, the exponent e_j with every |x_kj| < 2^e_j (0 for a zero column).
+extern "C" __global__ void split_exponents(unsigned int rows, unsigned int cols, const float* x, int* e) {
+    unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= cols) return;
+    float m = 0.0f;
+    for (unsigned int k = 0; k < rows; ++k) m = fmaxf(m, fabsf(x[(u64)k * cols + j]));
+    int p = 0;
+    if (m > 0.0f) frexpf(m, &p);
+    e[j] = p;
+}
+
+// The int8 slices a_s of x: x_kj = 2^(e_j - 7) Σ_{s < slices} a_s,kj 2^(-7 s) + r_kj with
+// |r_kj| < 2^(e_j - 7 slices), each |a| ≤ 127 (truncation of a scaled value below 128 in magnitude;
+// every step exact in float). Slice s is column-major (rows padded with zeros to `stride`) at
+// out + s · cols · stride.
+extern "C" __global__ void split_slices(unsigned int rows, unsigned int cols, unsigned int stride, unsigned int slices, const float* x, const int* e, signed char* out) {
+    GRID_STRIDE(i, (u64)stride * cols) {
+        unsigned int j = (unsigned int)(i / stride), k = (unsigned int)(i % stride);
+        float v = k < rows ? ldexpf(x[(u64)k * cols + j], 7 - e[j]) : 0.0f;
+        for (unsigned int s = 0; s < slices; ++s) {
+            float a = truncf(v);
+            out[(u64)s * cols * stride + i] = (signed char)a;
+            v = (v - a) * 128.0f;
+        }
+    }
+}
+
+// g (n × n row-major float64) += 2^(e_i + e_j - 14 - 7 shift) (c_ij, plus c_ji when `both`), c the
+// column-major n × n exact int32 product a_sᵀ a_t of two slices (shift = s + t).
+extern "C" __global__ void split_combine(unsigned int n, int shift, unsigned int both, const int* c, const int* e, double* g) {
+    GRID_STRIDE(i, (u64)n * n) {
+        unsigned int r = (unsigned int)(i / n), col = (unsigned int)(i % n);
+        double v = (double)c[r + (u64)col * n];
+        if (both) v += (double)c[col + (u64)r * n];
+        g[i] += ldexp(v, e[r] + e[col] - 14 - 7 * shift);
+    }
+}
