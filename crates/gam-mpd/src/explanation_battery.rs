@@ -2652,6 +2652,135 @@ pub fn vpd_mask_sources(vpd: &Vpd, export: &Path, decomposition: &Path, held_out
     ))
 }
 
+/// Whether VPD's masks read the future (the look-ahead test), at VPD's own weights (the remainder
+/// dropped) on the held-out sequences. For each sequence and each of `cuts` positions `t` (spread
+/// evenly), the masks are computed twice. Once on the true sequence. Once on a counterfactual
+/// whose tokens after `t` are those of another held-out sequence at the same positions, chosen
+/// under each of `seeds` keys. `M` and `E` are causal, so `M`'s output at `t` is the same in both,
+/// and only the masks can carry the future into `E`'s output at `t`. Per (sequence, `t`, key) it
+/// records: the subcomponents whose mask is on (above zero) at `t` in either run and the number
+/// that flip; `KL(M ‖ VPD)` at `t` in bits under each run's masks; and `log₂ p_VPD` of the true
+/// next token at `t` under each. The same is measured with the network's attention causal
+/// ([`importance_model`]), the control, where both runs' masks at `t` must agree exactly.
+pub fn vpd_lookahead(vpd: &Vpd, export: &Path, decomposition: &Path, held_out: &[Vec<u32>], (batch, cuts, seeds, seed): (usize, usize, usize, u64), numeric_bytes: usize) -> Result<Value, String> {
+    let d = vpd.e.program.device().clone();
+    let (causal, causal_outputs) = {
+        let Decomposition { sites, ci } = Decomposition::load(decomposition)?;
+        let (built, outputs) = importance_model(export, &sites, ci, true)?;
+        (Side::compile(&d, &built.program, numeric_bytes)?, outputs)
+    };
+    let head = d.download(&vpd.e.head).map_err(error)?;
+    let length = held_out.first().map(Vec::len).ok_or_else(|| error("no held-out rows"))?;
+    if held_out.len() < 2 || held_out.iter().any(|r| r.len() != length) || cuts == 0 || cuts >= length {
+        return Err(error("the look-ahead test needs two or more held-out rows of one length and fewer cuts than positions"));
+    }
+    let cut_at: Vec<usize> = (0..cuts).map(|k| ((2 * k + 1) * (length - 1)) / (2 * cuts)).collect();
+    // Log-probabilities (base 2) of the classes from a final normed row.
+    let log2_probs = |h: &Array1<f64>| -> Vec<f64> {
+        let logits = head.dot(h);
+        let top = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let total: f64 = logits.iter().map(|z| (z - top).exp()).sum();
+        let log_z = top + total.ln();
+        logits.iter().map(|z| (z - log_z) / LN_2).collect()
+    };
+    // On `sequences` (one batch), with the masks of `network`: per sequence, per row asked of it,
+    // the masks' on/off at that row (every site in order) and `log₂ p_VPD` there.
+    let run = |sequences: &[Vec<u32>], rows: &[Vec<usize>], network: &DeviceProgram, outputs: &[usize]| -> Result<Vec<Vec<(Vec<bool>, Vec<f64>)>>, String> {
+        let views: Vec<&[u32]> = sequences.iter().map(Vec::as_slice).collect();
+        let family = sequence_family(&views)?;
+        let ci = network.forward(&family)?;
+        let mut on: Vec<Vec<Vec<bool>>> = rows.iter().map(|r| vec![Vec::new(); r.len()]).collect();
+        let mut given = BTreeMap::new();
+        for (s, &(_, _, width)) in vpd.sites.iter().enumerate() {
+            let mask = d.copy(ci.value(outputs[s])?).map_err(error)?;
+            for (i, asked) in rows.iter().enumerate() {
+                for (k, &t) in asked.iter().enumerate() {
+                    let row = d.download(&d.rows_of(&mask, i * length + t, 1).map_err(error)?).map_err(error)?;
+                    on[i][k].extend(row.iter().map(|v| *v > 0.0));
+                }
+            }
+            given.insert(vpd.layout.masks[s], mask);
+            given.insert(vpd.layout.deltas[s], d.zeros(family.rows, width).map_err(error)?);
+        }
+        drop(ci);
+        let trace = vpd.e.program.forward_given(&family, given)?;
+        let hidden = trace.value(vpd.e.hidden)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (i, asked) in rows.iter().enumerate() {
+            let mut per = Vec::with_capacity(asked.len());
+            for (k, &t) in asked.iter().enumerate() {
+                let h = d.download(&d.rows_of(hidden, i * length + t, 1).map_err(error)?).map_err(error)?;
+                per.push((std::mem::take(&mut on[i][k]), log2_probs(&h.row(0).to_owned())));
+            }
+            out.push(per);
+        }
+        Ok(out)
+    };
+    // `M`'s log-probabilities at each sequence's cuts.
+    let mut m_at: Vec<Vec<Vec<f64>>> = Vec::with_capacity(held_out.len());
+    for chunk in held_out.chunks(batch) {
+        let views: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
+        let family = sequence_family(&views)?;
+        let (_, m_streams) = streams(&vpd.m, &family, |_| BTreeMap::new())?;
+        let m_hidden = vpd.m.hidden_of(&family, &m_streams[vpd.layers()])?;
+        for i in 0..chunk.len() {
+            m_at.push(
+                cut_at
+                    .iter()
+                    .map(|&t| Ok(log2_probs(&d.download(&d.rows_of(&m_hidden, i * length + t, 1).map_err(error)?).map_err(error)?.row(0).to_owned())))
+                    .collect::<Result<_, String>>()?,
+            );
+        }
+    }
+    let kl_bits = |m: &[f64], p: &[f64]| -> f64 { m.iter().zip(p).map(|(a, b)| a.exp2() * (a - b)).sum() };
+    let mut networks = serde_json::Map::new();
+    for (name, network, outputs) in [("bidirectional", &vpd.importance, &vpd.outputs), ("causal", &causal, &causal_outputs)] {
+        // The true sequences: every cut of each.
+        let mut truth: Vec<Vec<(Vec<bool>, Vec<f64>)>> = Vec::with_capacity(held_out.len());
+        for chunk in held_out.chunks(batch) {
+            let rows: Vec<Vec<usize>> = chunk.iter().map(|_| cut_at.clone()).collect();
+            truth.extend(run(chunk, &rows, network, outputs)?);
+        }
+        let mut records: Vec<Value> = Vec::new();
+        for (j, sequence) in held_out.iter().enumerate() {
+            for r in 0..seeds {
+                let mut rng = StdRng::seed_from_u64(seed ^ ((j as u64) << 16) ^ ((r as u64) << 40));
+                let other = (j + 1 + rng.random_range(0..held_out.len() - 1)) % held_out.len();
+                let variants: Vec<Vec<u32>> = cut_at.iter().map(|&t| sequence[..=t].iter().chain(&held_out[other][t + 1..]).copied().collect()).collect();
+                for (c0, chunk) in variants.chunks(batch).enumerate() {
+                    let rows: Vec<Vec<usize>> = (0..chunk.len()).map(|i| vec![cut_at[c0 * batch + i]]).collect();
+                    for (i, per) in run(chunk, &rows, network, outputs)?.into_iter().enumerate() {
+                        let k = c0 * batch + i;
+                        let t = cut_at[k];
+                        let (on_cf, logp_cf) = &per[0];
+                        let (on_true, logp_true) = &truth[j][k];
+                        let next = sequence[t + 1] as usize;
+                        let flips = on_true.iter().zip(on_cf).filter(|(a, b)| a != b).count();
+                        records.push(json!([
+                            j,
+                            t,
+                            other,
+                            kl_bits(&m_at[j][k], logp_true),
+                            kl_bits(&m_at[j][k], logp_cf),
+                            logp_true[next],
+                            logp_cf[next],
+                            flips,
+                            on_true.iter().filter(|v| **v).count(),
+                            on_cf.iter().filter(|v| **v).count(),
+                        ]));
+                    }
+                }
+            }
+            log::info!("look-ahead {name}: sequence {} of {}", j + 1, held_out.len());
+        }
+        networks.insert(name.to_string(), json!({
+            "columns": ["sequence", "t", "replacement_sequence", "kl_bits_true_future", "kl_bits_counterfactual_future", "log2p_next_true_future", "log2p_next_counterfactual_future", "mask_flips", "on_true_future", "on_counterfactual_future"],
+            "records": records,
+        }));
+    }
+    Ok(json!({"cut_positions": cut_at, "seeds": seeds, "networks": networks}))
+}
+
 fn d_copy(d: &Device, t: &Tensor) -> Result<Tensor, String> {
     d.copy(t).map_err(error)
 }

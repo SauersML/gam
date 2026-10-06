@@ -6,6 +6,7 @@
 //! EXPORT SETTINGS.json OUT.json host|gpu price DECOMPOSITION [START]
 //! EXPORT SETTINGS.json OUT.json host|gpu price_charged DECOMPOSITION [START]
 //! EXPORT SETTINGS.json OUT.json host|gpu masks DECOMPOSITION
+//! EXPORT SETTINGS.json OUT.json host|gpu lookahead DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu fit DECOMPOSITION START
 //!
 //! `price_charged` prices VPD's causal-importance network beside its subcomponents
@@ -13,6 +14,9 @@
 //!
 //! `fit` is our fit started from VPD's decomposition, autonomous and causal
 //! (`explanation_battery::vpd_fit`), every mean free; START is a `price` posterior.
+//!
+//! `lookahead` tests whether VPD's masks read the future (`explanation_battery::vpd_lookahead`):
+//! 16 cuts per held-out row, 3 counterfactual futures each, VPD's network and a causal control.
 //!
 //! `masks` measures where VPD's masks come from (`explanation_battery::vpd_mask_sources`): held-out
 //! KL with masks from `M`'s activations, from them through a causal network, with every mask 1,
@@ -208,7 +212,7 @@ fn circuits(device: &Device, export: &Path, layers: &[gam_mpd::run_check::LayerN
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price|price_charged DECOMPOSITION [START] | masks DECOMPOSITION | fit DECOMPOSITION START";
+    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price|price_charged DECOMPOSITION [START] | masks DECOMPOSITION | lookahead DECOMPOSITION | fit DECOMPOSITION START";
     let (export, settings_path, out, mode, kind, extra, more) = match &args[..] {
         [e, s, o, m, k] => (e, s, o, m, k.as_str(), None, None),
         [e, s, o, m, k, a] => (e, s, o, m, k.as_str(), Some(Path::new(a)), None),
@@ -295,6 +299,15 @@ fn main() -> Result<(), String> {
             progress["fit"] = state.clone();
             save(&progress)
         })?;
+        report["seconds"] = json!(started.elapsed().as_secs_f64());
+        save(&report)?;
+        log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
+        return Ok(());
+    }
+    if kind == "lookahead" {
+        let decomposition = extra.ok_or(usage)?;
+        let vpd = Vpd::new(&device, export, Decomposition::load(decomposition)?, settings.numeric_bytes)?;
+        report["lookahead"] = battery::vpd_lookahead(&vpd, export, decomposition, bases, (settings.batch_sequences, 16, 3, settings.seed), settings.numeric_bytes)?;
         report["seconds"] = json!(started.elapsed().as_secs_f64());
         save(&report)?;
         log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
