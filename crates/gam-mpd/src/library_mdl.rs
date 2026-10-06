@@ -2115,13 +2115,13 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_p
     Ok(out)
 }
 
-/// Where a fit stands at the end of an epoch: with the posterior and the optimizer's moments, all a
-/// fit needs to continue exactly as if it had not stopped.
 /// The line arm's ratio before any step ([`Progress::ratio`]).
 fn unit_ratio() -> (f64, u64) {
     (1.0, 0)
 }
 
+/// Where a fit stands at the end of an epoch: with the posterior and the optimizer's moments, all a
+/// fit needs to continue exactly as if it had not stopped.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Progress {
     identity: Identity,
