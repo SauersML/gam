@@ -1334,10 +1334,15 @@ pub struct Settings {
     /// deletes this field.
     #[serde(default)]
     pub one_sample: bool,
-    /// The factorized arm: the posterior's noise along each operator's own axes, with no rotation
-    /// (`rotations`, f80fd69565). The A/B's outcome deletes this field.
+    /// The rotated arm, off by default: the posterior's noise along the eigenvectors of each
+    /// operator's input second moment (`rotations`, f80fd69565) in place of its own axes. Its A/B
+    /// (fitperf-arms-ab: vpd4l, N = 2^20, RTX 4090, 3 epochs) measured F after epoch 2 at 24.99e6
+    /// and 25.03e6 bits rotated against 17.29e6 and 16.43e6 along the own axes (seeds 1, 2),
+    /// nearly all of it description: along the rotated axes the directions the inputs hardly span
+    /// keep `σ̃² ≈ v_G`, which raises each group's prior variance, so every mean in the group is
+    /// shrunk less (mean |μ| twice the factorized posterior's). The rotation machinery goes next.
     #[serde(default)]
-    pub factorized: bool,
+    pub rotated: bool,
     /// When set, the fit ends once its epoch count (counted from `M`, a start's epochs included)
     /// reaches this, with no removal round: a comparison of arms at one budget of steps.
     #[serde(default)]
@@ -2902,7 +2907,7 @@ pub fn fit_from(
         let timed = Instant::now();
         // A prior term prices entries one by one along their own axes, and re-chooses the operators
         // it reads every epoch (`PriorTerm::epoch`): a fit with one keeps the factorized posterior.
-        posterior.rotations = if prior.is_some() || settings.factorized { vec![None; posterior.mean.len()] } else { rotations(&mut scorer, explanation, &posterior, sequences, settings)? };
+        posterior.rotations = if prior.is_some() || !settings.rotated { vec![None; posterior.mean.len()] } else { rotations(&mut scorer, explanation, &posterior, sequences, settings)? };
         let (layout, matrices) = rotation_layout(&posterior.rotations);
         progress.rotations = layout;
         progress.rotation_orders = matrices.iter().map(|m| m.nrows()).collect();
@@ -3930,7 +3935,7 @@ mod tests {
             line_search: false,
             half_factor: false,
             one_sample: false,
-            factorized: false,
+            rotated: false,
             epochs: None,
         }
     }

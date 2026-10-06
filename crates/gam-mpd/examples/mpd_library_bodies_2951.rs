@@ -527,7 +527,7 @@ fn main() -> Result<(), String> {
                 line_search: false,
                 half_factor: false,
                 one_sample: false,
-                factorized: false,
+                rotated: false,
                 epochs: None,
             };
             let base = library_mdl::explanation(&native, &layers)?;
