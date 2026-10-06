@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Tests of the oracle's measured interventions (#2951) on tiny decoders.
 
 use crate::operator_program::{FamilyInputs, OperatorBody, SequenceLayout, SlotValues, exact_precision};
