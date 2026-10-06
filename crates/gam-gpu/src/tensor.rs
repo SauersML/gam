@@ -424,6 +424,13 @@ impl GroupMap {
         32 * self.segments
     }
 
+    /// The threads a CUDA reduction over the map runs: one block of 256 (the kernels' `BLOCK`) per
+    /// segment (`group_reduce`).
+    #[cfg(target_os = "linux")]
+    fn blocks(&self) -> usize {
+        256 * self.segments
+    }
+
     /// `t`'s shape is the map's.
     fn check(&self, t: &Tensor, what: &str) -> Result<(), GpuError> {
         if t.dim() != (self.rows, self.cols) {
@@ -3693,21 +3700,25 @@ __device__ unsigned int group_of(const unsigned int* ids, unsigned int axis, u64
 // Runs `body(i, g, a, b, c)` on every entry i of an `n`-entry operator of `cols` columns whose group
 // g is below `count`, and adds each entry it returns true for, (a, b, c), into its group's row of
 // `sums`. The entries go by the map's segments (`GroupMap`'s `layout`: `segments + 1` offsets, the
-// segments' groups, then their members): one warp per segment, each lane summing every 32nd of its
-// entries in order, the lanes' sums added by shuffles in a fixed order, and lane 0 adding the
-// totals to the group's row. A group is one segment of the map and launches on a stream run in
-// order, so nothing is atomic and the sums are the same on every run.
+// segments' groups, then their members): one block per segment (`GroupMap::blocks`), each thread
+// summing every BLOCK-th of its entries in order, each warp's sums added by shuffles in a fixed
+// order, the warps' added by thread 0 in warp order, and thread 0 adding the totals to the
+// group's row. A group is one segment of the map and launches on a stream run in order, so
+// nothing is atomic and the sums are the same on every run. (One warp per segment left a
+// segment's entries to 32 threads: the posterior kernels ran at a fifth of their memory rate.)
 template <typename F>
 __device__ void group_reduce(u64 n, u64 cols, unsigned int axis, u64 segments, const unsigned int* layout, u64 count, double* sums, F body) {
-    const u64 warps = ((u64)gridDim.x * blockDim.x) >> 5, lane = threadIdx.x & 31u, rows = cols > 0 ? n / cols : 0;
-    for (u64 s = ((u64)blockIdx.x * blockDim.x + threadIdx.x) >> 5; s < segments; s += warps) {
+    __shared__ double partial[3][BLOCK / 32];
+    const u64 rows = cols > 0 ? n / cols : 0;
+    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    for (u64 s = blockIdx.x; s < segments; s += gridDim.x) {
         unsigned int g = layout[segments + 1 + s];
         if (g >= count) continue;
         u64 off = layout[s], size = (u64)layout[s + 1] - off;
         u64 length = axis == 0u ? size * cols : (axis == 1u ? size * rows : size);
         const unsigned int* members = layout + 2 * segments + 1 + off;
         double a = 0.0, b = 0.0, d = 0.0;
-        for (u64 k = lane; k < length; k += 32) {
+        for (u64 k = threadIdx.x; k < length; k += blockDim.x) {
             u64 i = axis == 0u ? (u64)members[k / cols] * cols + k % cols : (axis == 1u ? (k / size) * cols + members[k % size] : (u64)members[k]);
             double ea = 0.0, eb = 0.0, ed = 0.0;
             if (body(i, g, ea, eb, ed)) { a += ea; b += eb; d += ed; }
@@ -3717,11 +3728,18 @@ __device__ void group_reduce(u64 n, u64 cols, unsigned int axis, u64 segments, c
             b += __shfl_down_sync(0xffffffffu, b, o);
             d += __shfl_down_sync(0xffffffffu, d, o);
         }
-        if (lane == 0 && a > 0.0) {
-            sums[3 * (u64)g] += a;
-            sums[3 * (u64)g + 1] += b;
-            sums[3 * (u64)g + 2] += d;
+        if (lane == 0) { partial[0][warp] = a; partial[1][warp] = b; partial[2][warp] = d; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            double ta = 0.0, tb = 0.0, td = 0.0;
+            for (unsigned int w = 0; w < blockDim.x / 32u; w++) { ta += partial[0][w]; tb += partial[1][w]; td += partial[2][w]; }
+            if (ta > 0.0) {
+                sums[3 * (u64)g] += ta;
+                sums[3 * (u64)g + 1] += tb;
+                sums[3 * (u64)g + 2] += td;
+            }
         }
+        __syncthreads();
     }
 }
 
@@ -5451,7 +5469,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             builder.output(mean, storage)?.output(log_sd, storage)?.output(momentum, moments)?.output(curvature, storage)?.output(power, storage)?.arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers in their storages, float64 group buffers of
             // `count` rows, ids per the map's axis; ids at or beyond `count` are skipped.
-            unsafe { builder.launch(cfg_elements(groups.threads() as u64)) }.gpu_ctx("tensor posterior_ivon").map(|_| ())
+            unsafe { builder.launch(cfg_elements(groups.blocks() as u64)) }.gpu_ctx("tensor posterior_ivon").map(|_| ())
         }
 
         pub(super) fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &super::GroupMap, sums: &mut Tensor) -> Result<(), GpuError> {
@@ -5461,7 +5479,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             let mut builder = self.stream.launch_builder(&f);
             builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(&groups.layout)?).arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers, checked by the caller; float64 sums of `count` rows.
-            unsafe { builder.launch(cfg_elements(groups.threads() as u64)) }.gpu_ctx("tensor group_moments").map(|_| ())
+            unsafe { builder.launch(cfg_elements(groups.blocks() as u64)) }.gpu_ctx("tensor group_moments").map(|_| ())
         }
 
         pub(super) fn group_curvature(&self, (factor, mean, log_sd): (&Tensor, &Tensor, &Tensor), groups: &super::GroupMap, sums: &mut Tensor) -> Result<(), GpuError> {
@@ -5476,7 +5494,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             let mut builder = self.stream.launch_builder(&f);
             builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).input(factor, factors)?.input(mean, storage)?.input(log_sd, storage)?.arg(index_slice(&groups.layout)?).arg(slice_mut(sums)?);
             // SAFETY: equal-length entry buffers, checked by the caller; float64 sums of `count` rows.
-            unsafe { builder.launch(cfg_elements(groups.threads() as u64)) }.gpu_ctx("tensor group_curvature").map(|_| ())
+            unsafe { builder.launch(cfg_elements(groups.blocks() as u64)) }.gpu_ctx("tensor group_curvature").map(|_| ())
         }
 
         pub(super) fn group_code_length(
