@@ -199,6 +199,31 @@ extern "C" __global__ void gather_rows(u64 n, unsigned int cols, const float* ta
     GRID_STRIDE(i, n) out[i] = table[(u64)ids[i / cols] * cols + i % cols];
 }
 
+// Per column of an n-column x, 1 when one of its rows `rows` (nr of them) holds a value other
+// than zero (a NaN counts).
+extern "C" __global__ void nonzero_columns(u64 n, unsigned int nr, const float* x, const unsigned int* rows, float* out) {
+    GRID_STRIDE(c, n) {
+        float any = 0.0f;
+        for (unsigned int t = 0; t < nr; ++t) {
+            if (x[(u64)rows[t] * n + c] != 0.0f) { any = 1.0f; break; }
+        }
+        out[c] = any;
+    }
+}
+
+// `out[r, j] = t[r, ids[j]]` over the n = rows × m entries of out.
+extern "C" __global__ void gather_columns(u64 n, unsigned int m, unsigned int cols, const float* t, const unsigned int* ids, float* out) {
+    GRID_STRIDE(i, n) out[i] = t[(i / m) * cols + ids[i % m]];
+}
+
+// `t[r, ids[j]] = values[r, j]` (added when `accumulate`), ids distinct.
+extern "C" __global__ void scatter_columns(u64 n, unsigned int m, unsigned int cols, float* t, const unsigned int* ids, const float* values, int accumulate) {
+    GRID_STRIDE(i, n) {
+        u64 at = (i / m) * cols + ids[i % m];
+        t[at] = accumulate ? t[at] + values[i] : values[i];
+    }
+}
+
 extern "C" __global__ void fill(u64 n, double value, float* x) {
     float v = (float)value;
     GRID_STRIDE(i, n) x[i] = v;

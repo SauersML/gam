@@ -93,6 +93,20 @@ fn f32_storage_moves_values_exactly_and_refuses_mixed_and_float64_work() {
     for (r, id) in ids.iter().enumerate() {
         assert_eq!(gathered.row(r), x.row(*id as usize));
     }
+    // Columns: read, gathered and written back in f32 storage as the host does.
+    let column_ids = d.upload_indices(&[4, 1]).expect("ids");
+    let columns = d.gather_columns(&t, &column_ids).expect("gather columns");
+    assert_eq!(columns.storage(), Storage::F32);
+    assert_eq!(down(&d, &columns), ndarray::stack![ndarray::Axis(1), x.column(4), x.column(1)]);
+    let mut moved = d.zeros(7, 5).expect("zeros");
+    d.scatter_columns(&mut moved, &column_ids, &columns, false).expect("scatter columns");
+    d.scatter_columns(&mut moved, &column_ids, &columns, true).expect("scatter columns");
+    let host_columns: Vec<u32> = (0..5u32).filter(|&c| (2..7).any(|r| x[[r, c as usize]] != 0.0)).collect();
+    assert_eq!(d.nonzero_columns(&t, &[2, 3, 4, 5, 6]).expect("nonzero columns"), host_columns);
+    let moved = down(&d, &moved);
+    for c in [4, 1] {
+        assert_eq!(moved.column(c), x.column(c).mapv(|v| f64::from(2.0 * v as f32)));
+    }
     let mut filled = d.copy(&t).expect("copy");
     d.fill_entries(&mut filled, &d.upload_indices(&[0, 7, 34]).expect("positions"), 2.5).expect("fill");
     let filled = down(&d, &filled);

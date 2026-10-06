@@ -1380,6 +1380,83 @@ impl Device {
         }
     }
 
+    /// The columns of `x` holding a value other than zero (a NaN counts) in one of rows `rows`
+    /// (increasing), increasing: on those rows the only columns a product `x Aᵀ` reads, every
+    /// other column's terms being zeros. The flags are made on the device and read back.
+    pub fn nonzero_columns(&self, x: &Tensor, rows: &[u32]) -> Result<Vec<u32>, GpuError> {
+        if rows.iter().any(|&r| r as usize >= x.rows) {
+            return Err(shape(format!("rows {rows:?} of {} rows", x.rows)));
+        }
+        let flags: Vec<f64> = match &*self.backend {
+            Backend::Host => {
+                let (v, cols) = (host(x)?, x.cols);
+                let mut any = vec![0.0; cols];
+                for &r in rows {
+                    for (a, &t) in any.iter_mut().zip(&v[r as usize * cols..(r as usize + 1) * cols]) {
+                        if t != 0.0 {
+                            *a = 1.0;
+                        }
+                    }
+                }
+                any
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => self.download(&engine.nonzero_columns(x, &self.upload_indices(rows)?)?)?.iter().copied().collect(),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => self.download(&engine.nonzero_columns(x, &self.upload_indices(rows)?)?)?.iter().copied().collect(),
+        };
+        Ok(flags.iter().enumerate().filter(|(_, f)| **f != 0.0).map(|(c, _)| c as u32).collect())
+    }
+
+    /// `out[r, j] = t[r, ids[j]]`: columns `ids` of `t`, in order.
+    pub fn gather_columns(&self, t: &Tensor, ids: &Indices) -> Result<Tensor, GpuError> {
+        match &*self.backend {
+            Backend::Host => {
+                let (v, cols, ids) = (host(t)?, t.cols, host_indices(ids)?);
+                if let Some(id) = ids.iter().find(|id| **id as usize >= cols) {
+                    return Err(shape(format!("column {id} of a {cols}-column tensor")));
+                }
+                let mut out = Vec::with_capacity(t.rows * ids.len());
+                for row in v.chunks(cols.max(1)).take(t.rows) {
+                    out.extend(ids.iter().map(|&c| row[c as usize]));
+                }
+                Ok(Tensor { rows: t.rows, cols: ids.len(), data: Data::Host(out) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.gather_columns(t, ids),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.gather_columns(t, ids),
+        }
+    }
+
+    /// `t[r, ids[j]] = values[r, j]` (added to it when `accumulate`): [`Device::gather_columns`]'s
+    /// inverse; `ids` distinct.
+    pub fn scatter_columns(&self, t: &mut Tensor, ids: &Indices, values: &Tensor, accumulate: bool) -> Result<(), GpuError> {
+        if values.dim() != (t.rows, ids.len) {
+            return Err(shape(format!("{:?} values for {} columns of {:?}", values.dim(), ids.len, t.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (cols, ids, v) = (t.cols, host_indices(ids)?.to_vec(), host(values)?.to_vec());
+                if let Some(id) = ids.iter().find(|id| **id as usize >= cols) {
+                    return Err(shape(format!("column {id} of a {cols}-column tensor")));
+                }
+                let m = ids.len();
+                for (r, row) in host_mut(t)?.chunks_mut(cols.max(1)).enumerate() {
+                    for (j, &c) in ids.iter().enumerate() {
+                        let value = v[r * m + j];
+                        row[c as usize] = if accumulate { row[c as usize] + value } else { value };
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.scatter_columns(t, ids, values, accumulate),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.scatter_columns(t, ids, values, accumulate),
+        }
+    }
+
     /// `rows` copies of the `1 × cols` tensor `row`.
     pub fn broadcast_rows(&self, row: &Tensor, rows: usize) -> Result<Tensor, GpuError> {
         let mut out = self.zeros(rows, row.cols)?;
@@ -3429,6 +3506,31 @@ extern "C" __global__ void scale_columns(u64 n, unsigned int cols, const double*
 
 extern "C" __global__ void gather_rows(u64 n, unsigned int cols, const double* table, const unsigned int* ids, double* out) {
     GRID_STRIDE(i, n) out[i] = table[(u64)ids[i / cols] * cols + i % cols];
+}
+
+// Per column of an n-column x, 1 when one of its rows `rows` (nr of them) holds a value other
+// than zero (a NaN counts).
+extern "C" __global__ void nonzero_columns(u64 n, unsigned int nr, const double* x, const unsigned int* rows, double* out) {
+    GRID_STRIDE(c, n) {
+        double any = 0.0;
+        for (unsigned int t = 0; t < nr; ++t) {
+            if (x[(u64)rows[t] * n + c] != 0.0) { any = 1.0; break; }
+        }
+        out[c] = any;
+    }
+}
+
+// `out[r, j] = t[r, ids[j]]` over the n = rows × m entries of out.
+extern "C" __global__ void gather_columns(u64 n, unsigned int m, unsigned int cols, const double* t, const unsigned int* ids, double* out) {
+    GRID_STRIDE(i, n) out[i] = t[(i / m) * cols + ids[i % m]];
+}
+
+// `t[r, ids[j]] = values[r, j]` (added when `accumulate`), ids distinct.
+extern "C" __global__ void scatter_columns(u64 n, unsigned int m, unsigned int cols, double* t, const unsigned int* ids, const double* values, int accumulate) {
+    GRID_STRIDE(i, n) {
+        u64 at = (i / m) * cols + ids[i % m];
+        t[at] = accumulate ? t[at] + values[i] : values[i];
+    }
 }
 
 extern "C" __global__ void to_f32(u64 n, const double* x, float* y) {
@@ -5697,6 +5799,50 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             Ok(out)
         }
 
+        pub(super) fn nonzero_columns(&self, x: &Tensor, rows: &Indices) -> Result<Tensor, GpuError> {
+            let storage = x.storage();
+            if storage == Storage::Bf16 {
+                return Err(shape("nonzero_columns of a bfloat16 tensor".to_string()));
+            }
+            let mut out = self.output(storage, 1, x.cols)?;
+            let n = x.cols as u64;
+            let nr = rows.len as u32;
+            let f = self.kernel("nonzero_columns", storage)?;
+            // SAFETY: `rows` index rows of `x` (checked by the caller); `out` holds n values.
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&nr).input(x, storage)?.arg(index_slice(rows)?).output(&mut out, storage)?.launch(cfg_elements(n)) }
+                .gpu_ctx("tensor nonzero_columns")?;
+            Ok(out)
+        }
+
+        pub(super) fn gather_columns(&self, t: &Tensor, ids: &Indices) -> Result<Tensor, GpuError> {
+            let storage = t.storage();
+            if storage == Storage::Bf16 {
+                return Err(shape("gather_columns of a bfloat16 tensor".to_string()));
+            }
+            let mut out = self.output(storage, t.rows, ids.len)?;
+            let n = out.len() as u64;
+            let (m, cols) = (ids.len as u32, t.cols as u32);
+            let f = self.kernel("gather_columns", storage)?;
+            // SAFETY: ids index columns of `t` (the caller's nonzero columns of it).
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&m).arg(&cols).input(t, storage)?.arg(index_slice(ids)?).output(&mut out, storage)?.launch(cfg_elements(n)) }
+                .gpu_ctx("tensor gather_columns")?;
+            Ok(out)
+        }
+
+        pub(super) fn scatter_columns(&self, t: &mut Tensor, ids: &Indices, values: &Tensor, accumulate: bool) -> Result<(), GpuError> {
+            let storage = t.storage();
+            if values.storage() != storage || storage == Storage::Bf16 {
+                return Err(shape("scatter_columns: values stored unlike the target, or in bfloat16".to_string()));
+            }
+            let n = values.len() as u64;
+            let (m, cols, acc) = (ids.len as u32, t.cols as u32, i32::from(accumulate));
+            let f = self.kernel("scatter_columns", storage)?;
+            // SAFETY: ids are distinct columns of `t`; `values` is rows × m.
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&m).arg(&cols).output(t, storage)?.arg(index_slice(ids)?).input(values, storage)?.arg(&acc).launch(cfg_elements(n)) }
+                .gpu_ctx("tensor scatter_columns")
+                .map(|_| ())
+        }
+
         pub(super) fn laws(&self, x: &Tensor, g: Option<&Tensor>, codes: &Indices, c: f64) -> Result<Tensor, GpuError> {
             let storage = x.storage();
             let mut out = self.output(storage, x.rows, x.cols)?;
@@ -6710,6 +6856,34 @@ kernel void t_gather_rows(device const float* table [[buffer(0)]], device const 
     ELEMENTS out[i] = table[ids[i / p.cols] * p.cols + i % p.cols];
 }
 
+// Per column (n = cols) of x, 1 when one of its rows `rows` (p.rows of them) holds a value other
+// than zero (a NaN counts).
+kernel void t_nonzero_columns(device const float* x [[buffer(0)]], device const uint* rows [[buffer(1)]], device float* out [[buffer(2)]],
+                              constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        float any = 0.0f;
+        for (uint t = 0; t < p.rows; ++t) {
+            if (x[rows[t] * p.n + i] != 0.0f) { any = 1.0f; break; }
+        }
+        out[i] = any;
+    }
+}
+
+// out[r, j] = t[r, ids[j]] over the n = rows × m (p.extra) entries; p.cols = t's columns.
+kernel void t_gather_columns(device const float* t [[buffer(0)]], device const uint* ids [[buffer(1)]], device float* out [[buffer(2)]],
+                             constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS out[i] = t[(i / p.extra) * p.cols + ids[i % p.extra]];
+}
+
+// t[r, ids[j]] = values[r, j] (added when p.a), ids distinct.
+kernel void t_scatter_columns(device float* t [[buffer(0)]], device const uint* ids [[buffer(1)]], device const float* values [[buffer(2)]],
+                              constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        uint at = (i / p.extra) * p.cols + ids[i % p.extra];
+        t[at] = p.a ? t[at] + values[i] : values[i];
+    }
+}
+
 // erfc to a relative error below 1.2e-7 (Numerical Recipes' erfcc, a Chebyshev fit).
 inline float gam_erfc(float x) {
     float z = fabs(x);
@@ -7418,6 +7592,9 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
         "t_add_row",
         "t_scale_columns",
         "t_gather_rows",
+        "t_nonzero_columns",
+        "t_gather_columns",
+        "t_scatter_columns",
         "t_laws",
         "t_rms",
         "t_rotate",
@@ -7639,6 +7816,35 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
             let p = P { cols: u32_of(table.cols)?, ..P::default() };
             self.elements("t_gather_rows", &[whole(buffer(table)?), whole(index_buffer(ids)?), whole(buffer(&out)?)], out.len(), p)?;
             Ok(out)
+        }
+
+        pub(super) fn nonzero_columns(&self, x: &Tensor, rows: &Indices) -> Result<Tensor, GpuError> {
+            let out = self.tensor(1, x.cols)?;
+            u32_of(x.len())?;
+            let p = P { rows: u32_of(rows.len)?, ..P::default() };
+            self.elements("t_nonzero_columns", &[whole(buffer(x)?), whole(index_buffer(rows)?), whole(buffer(&out)?)], x.cols, p)?;
+            Ok(out)
+        }
+
+        pub(super) fn gather_columns(&self, t: &Tensor, ids: &Indices) -> Result<Tensor, GpuError> {
+            let IndexData::Metal(_, values) = &ids.data else { return Err(foreign()) };
+            if let Some(id) = values.iter().find(|id| **id as usize >= t.cols) {
+                return Err(shape(format!("column {id} of a {}-column tensor", t.cols)));
+            }
+            let out = self.tensor(t.rows, ids.len)?;
+            let p = P { cols: u32_of(t.cols)?, extra: u32_of(ids.len.max(1))?, ..P::default() };
+            self.elements("t_gather_columns", &[whole(buffer(t)?), whole(index_buffer(ids)?), whole(buffer(&out)?)], out.len(), p)?;
+            Ok(out)
+        }
+
+        pub(super) fn scatter_columns(&self, t: &mut Tensor, ids: &Indices, values: &Tensor, accumulate: bool) -> Result<(), GpuError> {
+            let IndexData::Metal(_, ids_host) = &ids.data else { return Err(foreign()) };
+            if let Some(id) = ids_host.iter().find(|id| **id as usize >= t.cols) {
+                return Err(shape(format!("column {id} of a {}-column tensor", t.cols)));
+            }
+            u32_of(t.len())?;
+            let p = P { cols: u32_of(t.cols)?, extra: u32_of(ids.len.max(1))?, a: u32::from(accumulate), ..P::default() };
+            self.elements("t_scatter_columns", &[whole(buffer(t)?), whole(index_buffer(ids)?), whole(buffer(values)?)], values.len(), p)
         }
 
         pub(super) fn laws(&self, x: &Tensor, g: Option<&Tensor>, codes: &Indices, c: f64) -> Result<Tensor, GpuError> {

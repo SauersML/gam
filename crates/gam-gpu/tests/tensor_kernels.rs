@@ -610,3 +610,47 @@ fn the_split_gram_is_timed_by_its_slices() {
         println!("split Gram {rows} x {cols}, {slices} slices ({products} int8 products, {slices} combines): {:.2} ms", started.elapsed().as_secs_f64() / 5.0 * 1e3);
     }
 }
+
+/// `nonzero_columns`, `gather_columns` and `scatter_columns` on the host and the accelerator: the
+/// columns nonzero on the rows asked for (a NaN counts, a column nonzero only on a row left out does
+/// not), the gathered columns in order, and the columns written or added back (integers, so every
+/// sum is exact in float32 too).
+#[test]
+fn column_reads_and_writes_agree_with_the_host() {
+    let mut devices = vec![Device::host()];
+    devices.extend(accelerator());
+    devices.extend(Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault"));
+    let (rows, cols) = (9, 13);
+    let mut x = Array2::from_shape_fn((rows, cols), |(r, c)| if c % 3 == 0 { 0.0 } else { ((r * c) % 7) as f64 - 3.0 });
+    x.column_mut(4).fill(0.0);
+    x[[0, 4]] = 2.0;
+    x[[5, 6]] = f64::NAN;
+    x.column_mut(6).iter_mut().enumerate().for_each(|(r, v)| if r != 5 { *v = 0.0 });
+    let every: Vec<u32> = (0..rows as u32).collect();
+    let later: Vec<u32> = (1..rows as u32).collect();
+    let nonzero = |rows: &[u32]| -> Vec<u32> { (0..cols as u32).filter(|&c| rows.iter().any(|&r| x[[r as usize, c as usize]] != 0.0)).collect() };
+    assert!(nonzero(&every).contains(&4) && !nonzero(&later).contains(&4) && nonzero(&later).contains(&6));
+    let ids: Vec<u32> = vec![5, 0, 12, 7];
+    let values = Array2::from_shape_fn((rows, ids.len()), |(r, j)| (r + 2 * j) as f64 - 4.0);
+    let target = Array2::from_shape_fn((rows, cols), |(r, c)| (r * 3 + c) as f64 % 5.0);
+    for device in devices {
+        assert_eq!(device.nonzero_columns(&up(&device, &x), &every).expect("nonzero"), nonzero(&every), "{}", device.name());
+        assert_eq!(device.nonzero_columns(&up(&device, &x), &later).expect("nonzero"), nonzero(&later), "{}", device.name());
+        let finite = x.mapv(|v| if v.is_nan() { 1.0 } else { v });
+        let gathered = down(&device, &device.gather_columns(&up(&device, &finite), &device.upload_indices(&ids).expect("ids")).expect("gather"));
+        for (j, &c) in ids.iter().enumerate() {
+            assert_eq!(gathered.column(j), finite.column(c as usize), "{}: gathered column {j}", device.name());
+        }
+        for accumulate in [false, true] {
+            let mut t = up(&device, &target);
+            device.scatter_columns(&mut t, &device.upload_indices(&ids).expect("ids"), &up(&device, &values), accumulate).expect("scatter");
+            let mut expected = target.clone();
+            for (j, &c) in ids.iter().enumerate() {
+                for r in 0..rows {
+                    expected[[r, c as usize]] = if accumulate { target[[r, c as usize]] + values[[r, j]] } else { values[[r, j]] };
+                }
+            }
+            assert_eq!(down(&device, &t), expected, "{}: scatter (accumulate {accumulate})", device.name());
+        }
+    }
+}

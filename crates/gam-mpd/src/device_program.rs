@@ -217,7 +217,20 @@ pub struct DeviceProgram {
     /// rounded once (keyed by where the operator is held; [`DeviceProgram::rounded_operator`]).
     /// Emptied by every forward pass and every write of an operator.
     rounded: Mutex<BTreeMap<usize, Arc<Tensor>>>,
+    /// Per node, whether its value is exactly zero wherever its law is off (a pointwise node of
+    /// ReLUs): a dense product reading it reads only its nonzero columns ([`Active`]).
+    exact_zeros: Vec<bool>,
+    /// Per node, the positions whose rows of it no reader uses: every reader is a select taking
+    /// another node's rows there (a transcoder block's output at the attention sink).
+    dead: Vec<Vec<u32>>,
 }
+
+/// The columns of an exactly-zero node (`DeviceProgram::exact_zeros`) a product reads: those
+/// nonzero on some row the product's node is used at (`DeviceProgram::dead`); `None` when that is
+/// every column. Every other column of the node is zero on those rows, so the product of the
+/// gathered columns with the operator's gathered columns is the dense product there; the dead rows
+/// (a few) take the dense product, and their cotangent is zero.
+type Active = Option<Arc<Indices>>;
 
 /// A group of sibling heads and its stacked operators.
 struct Fused {
@@ -300,6 +313,8 @@ pub struct DeviceTrace {
     rotations: Arc<Vec<(Rotary, Tensor, Tensor)>>,
     /// Per row its position in its sequence (empty without a layout).
     positions: Arc<Vec<u32>>,
+    /// Per affine node and argument it read sparsely, the argument's columns it read ([`Active`]).
+    active: BTreeMap<(usize, usize), Active>,
 }
 
 /// The rows of `trace` whose position is one of `positions` (`Step::Select`).
@@ -712,7 +727,22 @@ impl DeviceProgram {
             };
             fused.push(Fused { heads, stacked, sources, live: true, changed: BTreeSet::new(), disabled: false, source_matches: true });
         }
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()) })
+        let exact_zeros = program.nodes.iter().map(|n| matches!(n, Node::Pointwise { laws, .. } if !laws.is_empty() && laws.iter().all(|l| matches!(l, Law::Relu)))).collect();
+        let dead = (0..program.nodes.len())
+            .map(|n| {
+                let mut dead: Option<Vec<u32>> = None;
+                for &r in &readers[n] {
+                    match &program.nodes[r] {
+                        Node::Select { inside, outside, positions } if *outside == n && *inside != n => {
+                            dead = Some(dead.map_or_else(|| positions.clone(), |d| d.into_iter().filter(|p| positions.contains(p)).collect()));
+                        }
+                        _ => return Vec::new(),
+                    }
+                }
+                if n == program.output { Vec::new() } else { dead.unwrap_or_default() }
+            })
+            .collect();
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead })
     }
 
     /// Operator `op`'s device copy changed: every group reading it runs node by node until
@@ -996,6 +1026,19 @@ impl DeviceProgram {
     }
 
     /// Run the forward pass's and the head's products in `arithmetic` from now on.
+    /// Every product reads its argument whole, also an exactly-zero one ([`Active`]): the dense
+    /// reference the sparse reads are tested and timed against.
+    pub fn read_densely(&mut self) {
+        self.exact_zeros.iter_mut().for_each(|z| *z = false);
+    }
+
+    /// How many columns of `argument` affine node `node` read in the pass that made `trace`
+    /// ([`Active`]); `None` when it read them all.
+    #[must_use]
+    pub fn columns_read(&self, trace: &DeviceTrace, node: usize, argument: usize) -> Option<usize> {
+        trace.active.get(&(node, argument)).cloned().flatten().map(|ids| ids.len())
+    }
+
     pub fn set_arithmetic(&mut self, arithmetic: Arithmetic) {
         self.arithmetic = arithmetic;
     }
@@ -1212,6 +1255,62 @@ impl DeviceProgram {
                 out
             }
         })
+    }
+
+    /// The columns of `argument` the product of affine node `node`'s term `(argument, operator)`
+    /// reads ([`Active`]) and the rows they leave out (`node`'s dead rows), when it reads it
+    /// sparsely: `argument` exactly zero where off and its value the law's (`hooked` false),
+    /// `operator` held dense in f32 or f64. `None` for the dense product.
+    fn active(&self, trace: &DeviceTrace, (node, argument, operator): (usize, usize, usize), hooked: bool) -> Result<Option<(Active, Vec<u32>)>, String> {
+        if !self.exact_zeros[argument] || hooked {
+            return Ok(None);
+        }
+        let Held::Dense(a) = self.held(operator, Role::Product)? else { return Ok(None) };
+        let x = trace.value(argument)?;
+        if a.storage() == Storage::Bf16 || x.storage() == Storage::Bf16 {
+            return Ok(None);
+        }
+        let dead = &self.dead[node];
+        let (rows, dead): (Vec<u32>, Vec<u32>) = if dead.is_empty() || trace.positions.len() != trace.rows {
+            ((0..trace.rows as u32).collect(), Vec::new())
+        } else {
+            (0..trace.rows as u32).partition(|&r| !dead.contains(&trace.positions[r as usize]))
+        };
+        let d = &self.device;
+        let columns = d.nonzero_columns(x, &rows).map_err(error)?;
+        Ok(Some((if columns.len() == x.cols() { None } else { Some(Arc::new(d.upload_indices(&columns).map_err(error)?)) }, dead)))
+    }
+
+    /// `x Aᵀ` (`A` held dense) from the columns `ids` of `x` and of `A`, the dense product on every
+    /// row where `x`'s other columns are zero, and on rows `dead` from all of them ([`Active`]).
+    fn sparse_product(&self, x: &Tensor, (ids, dead): (&Indices, &[u32]), op: usize, (rows, width): (usize, usize)) -> Result<Tensor, String> {
+        let d = &self.device;
+        let Held::Dense(a) = self.held(op, Role::Product)? else { return Err("device: a sparse product of an operator not held dense".into()) };
+        let mut out = if ids.is_empty() {
+            d.zeros(rows, width).map_err(error)?
+        } else {
+            let (xs, a_s) = (d.gather_columns(x, ids).map_err(error)?, d.gather_columns(a, ids).map_err(error)?);
+            let mut out = d.empty(rows, width).map_err(error)?;
+            d.gemm(&mut out, 1.0, &xs, Op::N, &a_s, Op::T, 0.0, self.arithmetic).map_err(error)?;
+            out
+        };
+        if !dead.is_empty() {
+            let xd = d.gather_rows(x, &d.upload_indices(dead).map_err(error)?).map_err(error)?;
+            let mut part = d.empty(dead.len(), width).map_err(error)?;
+            d.gemm(&mut part, 1.0, &xd, Op::N, a, Op::T, 0.0, self.arithmetic).map_err(error)?;
+            let ranges: Vec<std::ops::Range<usize>> = dead.iter().map(|&r| r as usize..r as usize + 1).collect();
+            d.scatter_ranges(&mut out, &ranges, &part).map_err(error)?;
+        }
+        Ok(out)
+    }
+
+    /// `A`'s columns `ids` (held dense) as a reverse product's operand in `arithmetic`: rounded to
+    /// bfloat16 after the gather, the values gathering the rounded operator gives.
+    fn gathered_operand(&self, op: usize, ids: &Indices, arithmetic: Arithmetic) -> Result<Tensor, String> {
+        let d = &self.device;
+        let Held::Dense(a) = self.held(op, Role::Product)? else { return Err("device: a sparse product of an operator not held dense".into()) };
+        let gathered = d.gather_columns(a, ids).map_err(error)?;
+        if arithmetic == Arithmetic::Bf16 && gathered.storage() == Storage::F32 { d.bf16_copy(&gathered).map_err(error) } else { Ok(gathered) }
     }
 
     /// The affine term `(argument, operator)` as a new `rows × width` tensor, the values zeros plus
@@ -1455,6 +1554,7 @@ impl DeviceProgram {
             blocks: batch.blocks,
             rotations: Arc::clone(&batch.rotations),
             positions: Arc::clone(&batch.positions),
+            active: BTreeMap::new(),
         };
         for (index, step) in self.steps.iter().enumerate() {
             if Some(index) == entry {
@@ -1519,7 +1619,16 @@ impl DeviceProgram {
                     // The first term's product is the output, written whole (`product`).
                     let (mut out, rest) = match terms.split_first() {
                         Some(((argument, operator), rest)) if !matches!(self.steps[*argument], Step::Feature { .. }) => {
-                            (self.product(trace.value(*argument)?, *operator, false, (rows, width), self.arithmetic)?, rest)
+                            let active = self.active(&trace, (index, *argument, *operator), hooks.before(*argument))?;
+                            let out = match &active {
+                                Some((Some(ids), dead)) => self.sparse_product(trace.value(*argument)?, (ids, dead), *operator, (rows, width))?,
+                                _ => self.product(trace.value(*argument)?, *operator, false, (rows, width), self.arithmetic)?,
+                            };
+                            let active = active.map(|(ids, _)| ids);
+                            if let Some(active) = active {
+                                trace.active.insert((index, *argument), active);
+                            }
+                            (out, rest)
                         }
                         Some(((argument, operator), rest)) => (self.term(&trace, (*argument, *operator), (rows, width))?, rest),
                         None => (d.zeros(rows, width).map_err(error)?, &terms[..]),
@@ -1959,6 +2068,7 @@ impl DeviceProgram {
             .map(|(i, f)| f.live && trace.fused.get(i).is_some_and(Option::is_some) && f.heads.members().all(|m| !keep.contains(&m) && !seeds.contains_key(&m) && !edited.contains(&m)))
             .collect();
         let mut g: Vec<Option<Tensor>> = (0..self.steps.len()).map(|_| None).collect();
+        let seeded: BTreeSet<usize> = seeds.keys().copied().collect();
         for (node, term) in seeds {
             g[node] = Some(term);
         }
@@ -2025,7 +2135,12 @@ impl DeviceProgram {
                 Step::Head | Step::Feature { .. } | Step::Raw { .. } | Step::Constant { .. } => {}
                 Step::Affine { terms, .. } => {
                     for (argument, operator) in terms {
-                        self.pull_term((&mut g, &needed), trace.rows, (&cot, &mut half), *argument, *operator, arithmetic)?;
+                        // A cotangent of the argument kept or edited is the dense one.
+                        let observed = keep.contains(argument) || edited.contains(argument);
+                        match self.reverse_active(trace, (index, *argument), (edited, &seeded)) {
+                            Some(ids) if needed[*argument] && !observed => self.pull_sparse(&mut g, trace.rows, (&cot, &mut half), (*argument, *operator), &ids, arithmetic)?,
+                            _ => self.pull_term((&mut g, &needed), trace.rows, (&cot, &mut half), *argument, *operator, arithmetic)?,
+                        }
                     }
                 }
                 Step::Transposed { input, operator } => {
@@ -2138,6 +2253,34 @@ impl DeviceProgram {
 
     /// `g[argument] ← g[argument] + cot · ∂(x op(A)ᵀ)/∂x` for the affine term `(argument, operator)`
     /// (nothing for a one-hot feature).
+    /// The columns affine node `node` read of `argument` sparsely in the forward pass ([`Active`]),
+    /// when its reverse may use them: its cotangent is zero on the rows the columns were not taken
+    /// on (`node` neither seeded nor edited).
+    fn reverse_active(&self, trace: &DeviceTrace, (node, argument): (usize, usize), (edited, seeded): (&BTreeSet<usize>, &BTreeSet<usize>)) -> Option<Arc<Indices>> {
+        if edited.contains(&node) || seeded.contains(&node) {
+            return None;
+        }
+        trace.active.get(&(node, argument)).cloned().flatten()
+    }
+
+    /// [`DeviceProgram::pull_term`] for a term read sparsely ([`Active`]): `cot A` on columns `ids`
+    /// only. The other columns' terms are left out; the argument's law has slope zero there on every
+    /// row the cotangent is not zero, so its input's cotangent is the dense pass's.
+    fn pull_sparse(&self, g: &mut [Option<Tensor>], rows: usize, (cot, half): (&Tensor, &mut Option<Tensor>), (argument, operator): (usize, usize), ids: &Indices, arithmetic: Arithmetic) -> Result<(), String> {
+        let d = &self.device;
+        if g[argument].is_none() {
+            g[argument] = Some(d.zeros(rows, self.widths[argument]).map_err(error)?);
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let a = self.gathered_operand(operator, ids, arithmetic)?;
+        let mut part = d.empty(rows, ids.len()).map_err(error)?;
+        d.gemm(&mut part, 1.0, self.operand(cot, half, arithmetic)?, Op::N, &a, Op::N, 0.0, arithmetic).map_err(error)?;
+        let target = g[argument].as_mut().ok_or("device: cotangent slot")?;
+        d.scatter_columns(target, ids, &part, true).map_err(error)
+    }
+
     fn pull_term(&self, (g, needed): (&mut [Option<Tensor>], &[bool]), rows: usize, (cot, half): (&Tensor, &mut Option<Tensor>), argument: usize, operator: usize, arithmetic: Arithmetic) -> Result<(), String> {
         let d = &self.device;
         if matches!(self.steps[argument], Step::Feature { .. }) || !needed[argument] {
@@ -2351,6 +2494,7 @@ impl DeviceProgram {
         (edited, hook): (&BTreeSet<usize>, &mut dyn FnMut(usize, &mut Tensor) -> Result<(), String>),
         gradients: &mut BTreeMap<usize, Tensor>,
     ) -> Result<BTreeMap<usize, Tensor>, String> {
+        let seeded: BTreeSet<usize> = seeds.keys().copied().collect();
         let (mut nodes, mut rounded) = self.reverse_seeds(trace, seeds, retained, arithmetic, edited, hook, gradients)?;
         // One scalar constant is uploaded; all reductions and gradient arrays stay
         // on the device. Reuse the same broadcast across every column occurrence.
@@ -2366,8 +2510,21 @@ impl DeviceProgram {
             let mut half = rounded.remove(&node);
             if let Step::Affine { terms, .. } = step {
                 for (input, op) in terms {
+                    let active = self.reverse_active(trace, (node, *input), (edited, &seeded));
                     if let Some(gradient) = gradients.get_mut(op) {
-                        self.device.gemm(gradient, 1.0, self.operand(cot, &mut half, arithmetic)?, Op::T, trace.value(*input)?, Op::N, 1.0, arithmetic).map_err(error)?;
+                        match active {
+                            // Only the columns read have a nonzero gradient (`cotᵀ x`, x zero elsewhere
+                            // on the rows the cotangent is not zero).
+                            Some(ids) if gradient.storage() != Storage::Bf16 => {
+                                if !ids.is_empty() {
+                                    let x = self.device.gather_columns(trace.value(*input)?, &ids).map_err(error)?;
+                                    let mut part = self.device.empty(gradient.rows(), ids.len()).map_err(error)?;
+                                    self.device.gemm(&mut part, 1.0, self.operand(cot, &mut half, arithmetic)?, Op::T, &x, Op::N, 0.0, arithmetic).map_err(error)?;
+                                    self.device.scatter_columns(gradient, &ids, &part, true).map_err(error)?;
+                                }
+                            }
+                            _ => self.device.gemm(gradient, 1.0, self.operand(cot, &mut half, arithmetic)?, Op::T, trace.value(*input)?, Op::N, 1.0, arithmetic).map_err(error)?,
+                        }
                     }
                 }
             } else if let Step::Transposed { input, operator } = step {
@@ -2951,5 +3108,124 @@ mod values_vjp_tests {
         // Refuse unsupported trainable storage before any reverse pass.
         let trace = lowered.forward(&family).unwrap();
         assert!(lowered.vjp_values_dense(&trace, BTreeMap::new(), &[0], &[0], Arithmetic::F64).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sparse_read_tests {
+    use super::*;
+    use crate::operator_program::{Declarations, FamilyInputs, Interface, LabelKind, SequenceLayout, Slot, SlotValues, exact_precision};
+    use ndarray::Array2;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+    /// A ReLU layer read by a dense product (`x ↦ relu(x Gᵀ + c) Wᵀ`, a transcoder block's shape)
+    /// with its output replaced at position 0 by another map (`Select`, the attention sink): the
+    /// product reads only the features nonzero on some position after the first, and the output,
+    /// the input's cotangent and the gradients of `G`, `c` and `W` are the dense layer's (float64
+    /// rounding on the host, float32 on an accelerator). One feature fires only at position 0 and
+    /// half never fire, so the sparse read leaves both out.
+    #[test]
+    fn a_relu_layer_read_sparsely_is_the_dense_layer() {
+        let (d, k, length, sequences) = (8, 64, 6, 4);
+        let rows = length * sequences;
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut normal = |r: usize, c: usize, s: f64| Array2::from_shape_fn((r, c), |_| s * (rng.random::<f64>() - 0.5));
+        let mut x = normal(rows, d, 2.0);
+        let mut gate = normal(k, d, 2.0);
+        let mut bias = Array2::from_elem((k, 1), -0.3);
+        let (out, sink) = (normal(d, k, 1.0), normal(d, d, 1.0));
+        let seed = normal(rows, d, 1.0);
+        for f in 0..k / 2 {
+            bias[[f, 0]] = -100.0;
+        }
+        // Feature k - 1 reads coordinate 0, which is large only at position 0.
+        gate.row_mut(k - 1).fill(0.0);
+        gate[[k - 1, 0]] = 1.0;
+        bias[[k - 1, 0]] = -5.0;
+        for r in 0..rows {
+            x[[r, 0]] = if r % length == 0 { 10.0 } else { x[[r, 0]].clamp(-1.0, 1.0) };
+        }
+        let units = Interface::uniform(k, 1, LabelKind::Unit, 0).unwrap();
+        let native = Interface::native(d).unwrap();
+        let dense = |name: &str, rows: Interface, cols: Interface, v: &Array2<f64>| {
+            Arc::new(Operator::dense(name, rows, cols, v.clone(), exact_precision(v.iter().copied()).unwrap(), Default::default()).unwrap())
+        };
+        let program = OperatorProgram {
+            declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: d }], parameters: 0 },
+            operators: vec![
+                dense("gate", units.clone(), native.clone(), &gate),
+                dense("gate_bias", units.clone(), Interface::constant(), &bias),
+                dense("out", native.clone(), units, &out),
+                dense("sink", native.clone(), native, &sink),
+            ],
+            bases: vec![],
+            rules: vec![],
+            nodes: vec![
+                Node::Raw { slot: 0 },
+                Node::Affine { terms: vec![(0, 0)], bias: Some(1) },
+                Node::Pointwise { input: 1, laws: vec![Law::Relu; k] },
+                Node::Affine { terms: vec![(2, 2)], bias: None },
+                Node::Affine { terms: vec![(0, 3)], bias: None },
+                Node::Select { inside: 4, outside: 3, positions: vec![0] },
+            ],
+            output: 5,
+        };
+        let layout = SequenceLayout { sequence: (0..rows as u32).map(|r| r / length as u32).collect(), position: (0..rows as u32).map(|r| r % length as u32).collect() };
+        let family = FamilyInputs { rows, slots: vec![SlotValues::Raw(x.clone())], layout: Some(layout) };
+        // The dense layer in float64.
+        let z = x.dot(&gate.t()) + &bias.column(0);
+        let a = z.mapv(|t| t.max(0.0));
+        let first = |r: usize| r % length == 0;
+        let mut y = a.dot(&out.t());
+        let y_sink = x.dot(&sink.t());
+        let (mut cot_out, mut cot_sink) = (seed.clone(), Array2::zeros((rows, d)));
+        for r in (0..rows).filter(|&r| first(r)) {
+            y.row_mut(r).assign(&y_sink.row(r));
+            cot_out.row_mut(r).fill(0.0);
+            cot_sink.row_mut(r).assign(&seed.row(r));
+        }
+        let g_out = cot_out.t().dot(&a);
+        let dz = cot_out.dot(&out) * z.mapv(|t| if t > 0.0 { 1.0 } else { 0.0 });
+        let g_gate = dz.t().dot(&x);
+        let g_bias = dz.sum_axis(ndarray::Axis(0)).insert_axis(ndarray::Axis(1));
+        let dx = dz.dot(&gate) + cot_sink.dot(&sink);
+        let live: Vec<usize> = (0..k).filter(|&f| (0..rows).any(|r| !first(r) && a[[r, f]] != 0.0)).collect();
+        assert!(live.len() < k / 2 && !live.contains(&(k - 1)) && (0..rows).any(|r| a[[r, k - 1]] > 0.0));
+        let close = |name: &str, device: &Device, got: &Tensor, want: &Array2<f64>| {
+            let got = device.download(got).unwrap();
+            let scale = want.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+            let tolerance = if device.float64() { 1e-12 } else { 1e-4 };
+            let difference = got.iter().zip(want).fold(0.0_f64, |m, (p, q)| m.max((p - q).abs()));
+            assert!(difference <= tolerance * scale, "{}: {name} differs by {difference} (scale {scale})", device.name());
+        };
+        let mut devices = crate::device_program_tests::devices();
+        devices.extend(Device::single_precision(gam_gpu::GpuPolicy::Auto).unwrap());
+        for device in devices {
+            let mut lowered = DeviceProgram::compile_values(&device, &program).unwrap();
+            let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
+            lowered.set_arithmetic(arithmetic);
+            let trace = lowered.forward(&family).unwrap();
+            let Some(Some(ids)) = trace.active.get(&(3, 2)) else { panic!("{}: the ReLU layer is read densely", device.name()) };
+            assert_eq!(ids.len(), live.len(), "{}: the columns read are the features live after position 0", device.name());
+            close("the output", &device, trace.value(5).unwrap(), &y);
+            close("the layer's output at every row", &device, trace.value(3).unwrap(), &a.dot(&out.t()));
+            let seeds = BTreeMap::from([(5, device.upload(seed.view()).unwrap())]);
+            let (nodes, gradients) = lowered.vjp_values_dense(&trace, seeds, &[0], &[0, 1, 2], arithmetic).unwrap();
+            close("the input's cotangent", &device, &nodes[&0], &dx);
+            close("W's gradient", &device, &gradients[&2], &g_out);
+            close("G's gradient", &device, &gradients[&0], &g_gate);
+            close("c's gradient", &device, &gradients[&1], &g_bias);
+            // The same on the device's dense read.
+            lowered.read_densely();
+            let dense = lowered.forward(&family).unwrap();
+            assert!(dense.active.is_empty());
+            let seeds = BTreeMap::from([(5, device.upload(seed.view()).unwrap())]);
+            let (dense_nodes, dense_gradients) = lowered.vjp_values_dense(&dense, seeds, &[0], &[0, 1, 2], arithmetic).unwrap();
+            close("the dense read's output", &device, dense.value(5).unwrap(), &device.download(trace.value(5).unwrap()).unwrap());
+            close("the dense read's cotangent", &device, &dense_nodes[&0], &device.download(&nodes[&0]).unwrap());
+            for op in 0..3 {
+                close("the dense read's gradient", &device, &dense_gradients[&op], &device.download(&gradients[&op]).unwrap());
+            }
+        }
     }
 }
