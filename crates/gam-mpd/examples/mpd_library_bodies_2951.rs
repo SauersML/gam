@@ -11,7 +11,11 @@
 //! layer 1, layer 1's copy reads a head of layer 0), the other units random and weaker.
 //! It is built in OUT/toy and fitted on the host. `model` runs the method on an engine export with
 //! the library fit's settings (`mpd_library_mdl_2951`'s SETTINGS.json); FROM is `native` (the
-//! library's start at `M`) or `checkpoint:PATH` (a library fit's checkpoint of this export).
+//! library's start at `M`), `checkpoint:PATH` (a library fit's checkpoint of this export, its means
+//! and removed groups, from which the base fit makes its own Laplace start) or `start:PATH` (the
+//! base fit continues that checkpoint exactly: its posterior, optimizer state, removals and epoch,
+//! so the regions are read at the checkpoint's resolution; with the settings' budget of epochs,
+//! `fit.epochs`, every fit of the method stops there).
 //!
 //! The method, each fit to convergence on the same fixed native experiments:
 //! 1. the library is fitted (OUT/base);
@@ -233,11 +237,6 @@ fn scoreboard(run: &Run, model: &str, name: &str, fit: &Fit) -> Result<(), Strin
 }
 
 impl Run {
-    /// `explanation` fitted to convergence in OUT/`name` (resumed from its checkpoint there).
-    fn fit(&self, name: &str, explanation: &Explanation) -> Result<Fit, String> {
-        self.fit_with(name, explanation, None, None)
-    }
-
     /// `explanation` fitted to convergence in OUT/`name` with the prior term `prior`, from `start`
     /// (a move's start carrying its parent's fit) when given.
     fn fit_with(&self, name: &str, explanation: &Explanation, prior: Option<&mut (dyn library_mdl::PriorTerm + 'static)>, start: Option<library_mdl::Start>) -> Result<Fit, String> {
@@ -283,13 +282,13 @@ fn extract(explanation: &Explanation, region: &Region) -> Result<(Explanation, C
 }
 
 /// The method (module note) from `base`; with `planted`, the gate's planted units per layer.
-fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>) -> Result<(), String> {
+fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>, begin: Option<library_mdl::Start>) -> Result<(), String> {
     let mut summary = json!({"stages": [], "decisions": []});
     let record = |summary: &mut Value, key: &str, value: Value| -> Result<(), String> {
         summary[key].as_array_mut().ok_or("a summary list")?.push(value);
         save(&run.out.join("SUMMARY.json"), summary)
     };
-    let fitted = run.fit("base", &base)?;
+    let fitted = run.fit_with("base", &base, None, begin)?;
     record(&mut summary, "stages", stage("base", &fitted))?;
     // Among each MLP's functions in the fitted explanation, the regions at its posterior (the one
     // that resolves what the data determine; the extraction starts from its means).
@@ -538,13 +537,13 @@ fn main() -> Result<(), String> {
                 fit,
                 out: out.to_path_buf(),
             };
-            method(&run, base, Some(&planted))
+            method(&run, base, Some(&planted), None)
         }
         Some("model") => {
             let (export, settings_path, from, out, mode, scoreboard) = match &args[..] {
                 [_, export, settings, from, out, mode] => (export, settings, from, out, mode, None),
                 [_, export, settings, from, out, mode, board] => (export, settings, from, out, mode, Some(PathBuf::from(board))),
-                _ => return Err("model EXPORT SETTINGS.json native|checkpoint:PATH OUT host|gpu [SCOREBOARD.tsv]".into()),
+                _ => return Err("model EXPORT SETTINGS.json native|checkpoint:PATH|start:PATH OUT host|gpu [SCOREBOARD.tsv]".into()),
             };
             let (export, out) = (Path::new(export), Path::new(out));
             let settings: Settings = serde_json::from_slice(&std::fs::read(settings_path).map_err(error)?).map_err(error)?;
@@ -572,8 +571,13 @@ fn main() -> Result<(), String> {
                 return Err("the export holds fewer training sequences than asked for".into());
             }
             let start = library_mdl::explanation(&native, &layers)?;
+            let mut begin = None;
             let base = match from.split_once(':') {
                 None if from == "native" => start,
+                Some(("start", path)) => {
+                    begin = Some(library_mdl::checkpoint_start(&start, Path::new(path))?);
+                    start
+                }
                 Some(("checkpoint", path)) => {
                     // Entry by entry along the operators' own axes, as the bodies read it.
                     let posterior = library_mdl::checkpoint_posterior(&start, Path::new(path))?;
@@ -581,12 +585,12 @@ fn main() -> Result<(), String> {
                     base.removed = (0..posterior.active.len()).filter(|g| !posterior.active[*g]).collect();
                     base
                 }
-                _ => return Err("FROM is native or checkpoint:PATH".into()),
+                _ => return Err("FROM is native, checkpoint:PATH or start:PATH".into()),
             };
             std::fs::create_dir_all(out).map_err(error)?;
             let model = export.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let run = Run { model, grown: false, scoreboard, device, native, layers, held: sequences[first..end].to_vec(), train, fit: settings.fit, digest: settings.export_sha256, out: out.to_path_buf() };
-            method(&run, base, None)
+            method(&run, base, None, begin)
         }
         _ => Err("gate OUT [SCOREBOARD.tsv] | model EXPORT SETTINGS.json FROM OUT host|gpu [SCOREBOARD.tsv]".into()),
     }
