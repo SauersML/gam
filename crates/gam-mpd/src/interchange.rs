@@ -418,11 +418,13 @@ impl Norm {
     }
 
     /// The stream node the norm reads.
+    #[cfg(test)]
     pub(crate) fn entry(&self) -> usize {
         self.entry
     }
 
     /// The tangent of `N(s)` along `ds`: `γ ⊙ (r ds + s dr)`, `dr = −r³ (s·ds)/d`.
+    #[cfg(test)]
     pub(crate) fn tangent(&self, s: &[f64], ds: &[f64]) -> Vec<f64> {
         let r = self.scale(s);
         let dr = -r * r * r * s.iter().zip(ds).map(|(a, b)| a * b).sum::<f64>() / s.len() as f64;
@@ -494,11 +496,13 @@ impl PartSites {
 
     /// Block `block`'s node its parts read and the node their writes add to, if it has parts.
     /// Head `h`'s attention output node and its width, when the model holds it.
+    #[cfg(test)]
     pub(crate) fn head(&self, h: usize) -> Option<(usize, usize)> {
         self.heads.get(h).copied().flatten()
     }
 
     /// Block `block`'s input norm, when a cut connection can recompute it.
+    #[cfg(test)]
     pub(crate) fn norm(&self, block: usize) -> Option<&Norm> {
         self.norms.get(block).and_then(Option::as_ref)
     }
