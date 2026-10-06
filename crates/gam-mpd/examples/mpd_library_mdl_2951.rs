@@ -76,6 +76,12 @@ struct Settings {
 struct Transcoders {
     dir: PathBuf,
     layers: Vec<usize>,
+    /// Keep only features firing on at least this fraction of the training tokens after the
+    /// first (every feature that fires, when absent): F's keep rule `N f Δ > |G| / (2 ln 2)` for a
+    /// feature of `|G|` parameters saving `Δ` bits per firing at `N` tokens, with `Δ` at most a
+    /// few bits, rules out features below about 1e-3 at N = 2^22 (toygate, 10-06).
+    #[serde(default)]
+    min_frequency: Option<f64>,
 }
 
 /// Per transcoder layer its kept file in `out`: the features that fire on `train` at `M`'s MLP
@@ -97,14 +103,18 @@ fn transcoder_files(device: &Device, native: &OperatorProgram, layers: &[LayerNo
     let tokens: usize = train.iter().map(|s| s.len() - 1).sum();
     let mut record = Vec::new();
     for (l, transcoder) in &transcoders {
-        let kept: Vec<usize> = (0..transcoder.features).filter(|&f| counts[l][f] > 0).collect();
+        let least = settings.min_frequency.map_or(1.0, |f| (f * tokens as f64).max(1.0));
+        let kept: Vec<usize> = (0..transcoder.features).filter(|&f| counts[l][f] as f64 >= least).collect();
         transcoder.write_kept(&kept, &files[l])?;
         let fired: u64 = counts[l].iter().sum();
+        let kept_fired: u64 = kept.iter().map(|&f| counts[l][f]).sum();
         record.push(json!({
             "layer": l,
             "features": transcoder.features,
             "kept": kept.len(),
             "active_per_token": fired as f64 / tokens as f64,
+            "kept_active_per_token": kept_fired as f64 / tokens as f64,
+            "ever_fired": counts[l].iter().filter(|&&c| c > 0).count(),
             "tokens": tokens,
         }));
         log::info!("transcoder layer {l}: {} of {} features fire on {tokens} training tokens after the first, {:.2} per token", kept.len(), transcoder.features, fired as f64 / tokens as f64);

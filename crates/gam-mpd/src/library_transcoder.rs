@@ -179,10 +179,34 @@ pub fn kept_features(path: &Path) -> Result<Vec<usize>, String> {
 /// Per transcoder layer, on how many tokens of `sequences` after each one's first (where the block
 /// runs `M`'s own MLP, module note) each feature fires (its pre-activation `g_i·x + c_i` is
 /// positive) at `M`'s own MLP input `x`, from `M` run on `device`, `batch` sequences at a time.
-/// The counts are float32 sums of zeros and ones, exact below 2^24 tokens.
+/// The counts are float32 sums of zeros and ones, exact below 2^24 tokens. The encoders are held
+/// on the device [`ENCODER_BYTES`] at a time, `M` run once per such group of layers.
 pub fn firing(device: &Device, native: &OperatorProgram, layers: &[LayerNodes], transcoders: &BTreeMap<usize, Transcoder>, sequences: &[Vec<u32>], batch: usize) -> Result<BTreeMap<usize, Vec<u64>>, String> {
     let mut program = DeviceProgram::compile(device, native)?;
     program.set_arithmetic(if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 });
+    let mut groups: Vec<BTreeMap<usize, &Transcoder>> = vec![BTreeMap::new()];
+    let mut bytes = 0usize;
+    for (&l, transcoder) in transcoders {
+        let size = 4 * transcoder.features * transcoder.width;
+        if bytes > 0 && bytes + size > ENCODER_BYTES {
+            groups.push(BTreeMap::new());
+            bytes = 0;
+        }
+        bytes += size;
+        groups.last_mut().expect("a group").insert(l, transcoder);
+    }
+    let mut out = BTreeMap::new();
+    for group in groups {
+        out.extend(firing_group(&program, layers, &group, sequences, batch)?);
+    }
+    Ok(out)
+}
+
+/// The encoders' bytes [`firing`] holds on the device at once (each layer's `F × d` in f32): six
+/// of the 163,840-feature Qwen3-0.6B transcoders (671 MB each in f32), leaving a 24 GB card room for `M`.
+pub const ENCODER_BYTES: usize = 4 << 30;
+
+fn firing_group(program: &DeviceProgram, layers: &[LayerNodes], transcoders: &BTreeMap<usize, &Transcoder>, sequences: &[Vec<u32>], batch: usize) -> Result<BTreeMap<usize, Vec<u64>>, String> {
     let d = program.device();
     let code = law_of(Law::Relu).code();
     // Per layer its encoder (`F × d`, the device's storage), bias row and counts.
