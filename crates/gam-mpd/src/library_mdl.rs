@@ -3271,6 +3271,9 @@ pub fn fit_from(
     // The best epoch's posterior, written whole where the removal round can read it back: beside
     // the fit's checkpoint, or for a fit without one a file of its own, removed at the end.
     static FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // The best epoch's snapshot evaluation, the removal round's start (not checkpointed: a resumed
+    // fit scores it again).
+    let mut best_evaluation: Option<Evaluation> = None;
     let best_path = checkpoint.map_or_else(
         || std::env::temp_dir().join(format!("library_best_{}_{}.bin", std::process::id(), FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed))),
         |path| path.with_extension("best.bin"),
@@ -3349,7 +3352,7 @@ pub fn fit_from(
         // The end-of-epoch posterior scored on the whole collection at the draws every snapshot
         // shares: the estimates the stop and the best epoch are decided on (module note).
         let snapshot_started = Instant::now();
-        let snapshot = snapshot_estimates(&mut scorer, &device_posterior, &mut posterior, explanation, &Evidence { draws: &draws, sequences, settings }, prior.as_deref_mut())?;
+        let (snapshot, evaluated) = snapshot_estimates(&mut scorer, &device_posterior, &mut posterior, explanation, &Evidence { draws: &draws, sequences, settings }, prior.as_deref_mut())?;
         let snapshot_seconds = snapshot_started.elapsed().as_secs_f64();
         let snapshot_mean = snapshot.iter().sum::<f64>() / count;
         let (improvement, standard_error) = match &progress.previous {
@@ -3405,6 +3408,7 @@ pub fn fit_from(
         let is_best = progress.best.is_none_or(|(b, _)| snapshot_mean < b);
         if is_best {
             progress.best = Some((snapshot_mean, epoch));
+            best_evaluation = Some(evaluated);
         }
         let mut keep_best = false;
         if budget {
@@ -3436,7 +3440,7 @@ pub fn fit_from(
             }
             let log = checkpoint.map(|path| path.with_extension("removals.jsonl"));
             let evidence = Evidence { draws: &draws, sequences, settings };
-            let removal = remove(&mut scorer, &mut device_posterior, &mut posterior, &evidence, explanation, prior.as_deref_mut(), log.as_deref())?;
+            let removal = remove(&mut scorer, &mut device_posterior, &mut posterior, (&evidence, best_evaluation.take()), explanation, prior.as_deref_mut(), log.as_deref())?;
             log::info!("library removal after epoch {epoch}: {} of {} candidates, {} without effect", removal.removed, removal.candidates, removal.dead);
             // The removed groups' entries are exactly zero with `ln σ = −∞`, which the device step
             // leaves alone; the objective left its last trial on the device.
@@ -3742,7 +3746,8 @@ fn collection_divergence(
 /// description, the explanation's discrete choices and the prior term's parameters. The mean over
 /// the batches is the removal comparisons' `F` of the posterior. Forward passes only: the device
 /// posterior's state (its iterate, its average and IVON's state) is left as it is; `posterior` is
-/// set to the device's values.
+/// set to the device's values. Also the evaluation itself, its rest the whole `R`: what a removal
+/// round's objective returns for this posterior ([`remove`]).
 fn snapshot_estimates(
     scorer: &mut Scorer,
     device_posterior: &DevicePosterior,
@@ -3750,17 +3755,19 @@ fn snapshot_estimates(
     explanation: &Explanation,
     evidence: &Evidence,
     prior: Option<&mut (dyn PriorTerm + 'static)>,
-) -> Result<Vec<f64>, String> {
+) -> Result<(Vec<f64>, Evaluation), String> {
     let &Evidence { draws, sequences, settings } = evidence;
     device_posterior.values_into(posterior)?;
-    let (evaluation, (preparing, targeting, scoring)) = collection_divergence(scorer, device_posterior, posterior, (draws, sequences, settings), prior, None)?;
+    let (mut evaluation, (preparing, targeting, scoring)) = collection_divergence(scorer, device_posterior, posterior, (draws, sequences, settings), prior, None)?;
     log::info!("library snapshot: {} batches, experiments {preparing:.2} s, targets {targeting:.2} s, scoring {scoring:.2} s", draws.len());
     let rest = evaluation.rest + posterior.description() + explanation.fixed_nats;
     if !rest.is_finite() {
         return Err("a nonfinite posterior divergence".into());
     }
     let count = draws.len() as f64;
-    Ok(evaluation.batches.iter().map(|data| count * data + rest).collect())
+    let estimates = evaluation.batches.iter().map(|data| count * data + rest).collect();
+    evaluation.rest = rest;
+    Ok((estimates, evaluation))
 }
 
 /// A removal round's fixed evidence: the training batches of the sequences under the fit's
@@ -3773,12 +3780,14 @@ struct Evidence<'a> {
 
 /// The removal step (`library_removal`) on `posterior`, scored by `F` on the round's
 /// fixed `evidence`, compensated in the MLPs it deletes functions of (`library_compensation`),
-/// logged to `log`.
+/// logged to `log`. `start`, when given, is `posterior`'s own evaluation (the best epoch's
+/// snapshot, [`snapshot_estimates`]: the same posterior on the same draws and noise stream), which
+/// the round's first scoring returns in place of scoring it again.
 fn remove(
     scorer: &mut Scorer,
     device_posterior: &mut DevicePosterior,
     posterior: &mut Posterior,
-    evidence: &Evidence,
+    (evidence, start): (&Evidence, Option<Evaluation>),
     explanation: &Explanation,
     prior: Option<&mut (dyn PriorTerm + 'static)>,
     log: Option<&Path>,
@@ -3791,7 +3800,13 @@ fn remove(
     let moved: Vec<usize> = compensation.outputs().iter().map(|i| explanation.trainable[*i]).collect();
     let curvature = removal_curvature(scorer, device_posterior, draws, sequences, settings, RANKING_STREAM, &moved)?;
     log::info!("library removal setup: compensation Gram {compensated:.1} s, curvature {:.1} s", timed.elapsed().as_secs_f64() - compensated);
+    let mut start = start;
     let mut objective = |trial: &Posterior, accepted: Option<&Evaluation>| -> Result<Evaluation, String> {
+        if accepted.is_none()
+            && let Some(evaluation) = start.take()
+        {
+            return Ok(evaluation);
+        }
         let rest = trial.description() + fixed;
         let against = accepted.map(|a| (a.batches.as_slice(), a.rest - rest));
         let mut evaluation = expected_divergence(scorer, device_posterior, trial, draws, sequences, &[], settings, prior.as_deref_mut(), against)?;
@@ -3830,7 +3845,7 @@ pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Exp
     let before = evaluate(&mut scorer, posterior)?;
     let evidence = Evidence { draws: &draws, sequences, settings };
     let mut device_posterior = DevicePosterior::new(device, explanation, posterior, tokens as f64, None, 0)?;
-    let removal = remove(&mut scorer, &mut device_posterior, posterior, &evidence, explanation, None, log)?;
+    let removal = remove(&mut scorer, &mut device_posterior, posterior, (&evidence, None), explanation, None, log)?;
     let after = evaluate(&mut scorer, posterior)?;
     Ok((removal, before, after))
 }
@@ -4632,8 +4647,8 @@ mod tests {
         let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let evidence = Evidence { draws: &draws, sequences: &sequences, settings: &settings };
-        let first = snapshot_estimates(&mut scorer, &device_posterior, &mut posterior, &explanation, &evidence, None).unwrap();
-        let second = snapshot_estimates(&mut scorer, &device_posterior, &mut posterior, &explanation, &evidence, None).unwrap();
+        let (first, _) = snapshot_estimates(&mut scorer, &device_posterior, &mut posterior, &explanation, &evidence, None).unwrap();
+        let (second, _) = snapshot_estimates(&mut scorer, &device_posterior, &mut posterior, &explanation, &evidence, None).unwrap();
         assert_eq!(first, second, "two snapshots of one posterior");
         assert_eq!(device_posterior.averaged(), 5);
         for (i, expected) in iterate.iter().enumerate() {
