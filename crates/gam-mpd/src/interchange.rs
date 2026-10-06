@@ -171,26 +171,33 @@ impl<'a> Model<'a> {
     fn end(&self, b: usize) -> usize {
         if b + 1 < self.blocks() { self.entry(b + 1) } else { self.program.hidden() }
     }
+}
 
-    /// The forward tangent of block `block` on rows `ranges` of the stream's tangent
-    /// `stream` (replaced by the tangent of the stream after the block), from its forward's
-    /// `tape`, with each operator in `tangents` moving along its entry and `edits`' tangents
-    /// ([`Edits::tangent`]); the exact directional derivative the reverse pass is the transpose of.
-    #[cfg(test)]
-    pub(crate) fn tangent(&self, block: usize, tape: &DeviceTrace, stream: &mut Tensor, ranges: &[Range<usize>], edits: Option<&Edits>, tangents: &BTreeMap<usize, ndarray::Array2<f64>>) -> Result<(), String> {
-        let d = self.program.device();
-        let rows: usize = ranges.iter().map(ExactSizeIterator::len).sum();
-        let entry = if block == 0 { None } else { Some((self.entry(block), gather(d, stream, ranges)?)) };
-        let widths = self.program.widths();
-        let out = self.program.jvp_span(tape, entry, self.end(block), tangents, self.program.arithmetic(), |n, t, dv| match edits {
-            Some(edits) => edits.tangent(d, n, t, dv, (rows, widths[n])),
-            None => Ok(()),
-        })?;
-        let out = match out {
-            Some(t) => t,
-            None => d.zeros(rows, stream.cols()).map_err(error)?,
-        };
-        scatter(d, stream, ranges, &out)
+/// The model's forward tangent, for the tests of the reverse pass against it.
+#[cfg(test)]
+mod model_tangent_tests {
+    use super::*;
+
+    impl Model<'_> {
+        /// The forward tangent of block `block` on rows `ranges` of the stream's tangent
+        /// `stream` (replaced by the tangent of the stream after the block), from its forward's
+        /// `tape`, with each operator in `tangents` moving along its entry and `edits`' tangents
+        /// ([`Edits::tangent`]); the exact directional derivative the reverse pass is the transpose of.
+        pub(crate) fn tangent(&self, block: usize, tape: &DeviceTrace, stream: &mut Tensor, ranges: &[Range<usize>], edits: Option<&Edits>, tangents: &BTreeMap<usize, ndarray::Array2<f64>>) -> Result<(), String> {
+            let d = self.program.device();
+            let rows: usize = ranges.iter().map(ExactSizeIterator::len).sum();
+            let entry = if block == 0 { None } else { Some((self.entry(block), gather(d, stream, ranges)?)) };
+            let widths = self.program.widths();
+            let out = self.program.jvp_span(tape, entry, self.end(block), tangents, self.program.arithmetic(), |n, t, dv| match edits {
+                Some(edits) => edits.tangent(d, n, t, dv, (rows, widths[n])),
+                None => Ok(()),
+            })?;
+            let out = match out {
+                Some(t) => t,
+                None => d.zeros(rows, stream.cols()).map_err(error)?,
+            };
+            scatter(d, stream, ranges, &out)
+        }
     }
 }
 
@@ -203,11 +210,14 @@ pub fn sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorProg
     Ok((flat, entries, reads))
 }
 
+/// [`flat_sites`]' result: the flat program, per block its entering stream and its read, its
+/// parts' sites (read and output), its heads' node and the shared sites' nodes.
+type FlatSites = (OperatorProgram, Vec<usize>, Vec<usize>, Vec<Option<(usize, usize)>>, Vec<Option<usize>>, BTreeMap<SharedSite, usize>);
+
 /// [`sites`] with, per block, where `artifact` applies edits of parts ([`PartSites`]): for layer
 /// `l`'s MLP (block `2l + 1`) its read and the MLP's output (the native `mlp` node or the node
 /// that replaced it), none for an attention block or an MLP output the artifact does not hold.
-#[allow(clippy::type_complexity)]
-fn flat_sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorProgram, Vec<usize>, Vec<usize>, Vec<Option<(usize, usize)>>, Vec<Option<usize>>, BTreeMap<SharedSite, usize>), String> {
+fn flat_sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<FlatSites, String> {
     let (flat, roots) = mapped_inlined(&artifact.program)?;
     let at = |native: usize| artifact.place(native).map(|n| roots[n]).ok_or_else(|| error(format!("native node {native} is not held")));
     let entries: Vec<usize> = layers.iter().flat_map(|l| [l.stream, l.attended]).map(at).collect::<Result<_, _>>()?;
@@ -1462,20 +1472,18 @@ pub trait BlockEngine {
         edits: Option<&Edits>,
         keep: bool,
     ) -> Result<Option<Self::Tape>, String> {
-        self.forward_before(block, stream, ranges, &vec![Vec::new(); ranges.len()], tokens, edits, keep)
+        self.forward_before(block, stream, (ranges, &vec![Vec::new(); ranges.len()]), tokens, edits, keep)
     }
 
     /// [`BlockEngine::forward`] where a range may hold its sequence's rows from a position on (a
     /// suffix lane, `Plan::range`): `before`, per range, the call's rows (laid out one range after
     /// another) holding the keys of its positions before its first row (`Plan::before`), empty
     /// for a whole sequence.
-    #[allow(clippy::too_many_arguments)]
     fn forward_before(
         &self,
         block: usize,
         stream: &mut Tensor,
-        ranges: &[Range<usize>],
-        before: &[Vec<Range<usize>>],
+        call: (&[Range<usize>], &[Vec<Range<usize>>]),
         tokens: &[&[u32]],
         edits: Option<&Edits>,
         keep: bool,
@@ -1604,8 +1612,7 @@ impl BlockEngine for Model<'_> {
         &self,
         block: usize,
         stream: &mut Tensor,
-        ranges: &[Range<usize>],
-        before: &[Vec<Range<usize>>],
+        (ranges, before): (&[Range<usize>], &[Vec<Range<usize>>]),
         tokens: &[&[u32]],
         edits: Option<&Edits>,
         keep: bool,
@@ -1820,7 +1827,7 @@ impl<'t> Plan<'t> {
 
     /// Lane `l`'s rows a call at `block` takes: from its position on for a suffix lane (module
     /// note), else all.
-    fn range(&self, l: usize, _block: usize) -> Range<usize> {
+    fn range(&self, l: usize) -> Range<usize> {
         let lane = &self.lanes[l];
         match lane.prefix {
             Some((_, t0)) => lane.rows.start + t0..lane.rows.end,
@@ -1832,13 +1839,13 @@ impl<'t> Plan<'t> {
     /// sequence, in position order: a suffix lane's before its position from its twin's lane (in
     /// the same call: it runs the block alike), its own after.
     fn keys(&self, block: usize, lanes: &[usize], l: usize, upto: usize) -> Result<Vec<Range<usize>>, String> {
-        let first = self.range(l, block).start - self.lanes[l].rows.start;
+        let first = self.range(l).start - self.lanes[l].rows.start;
         let mut out = match self.lanes[l].prefix {
             Some((twin, _)) if first > 0 && upto > 0 => self.keys(block, lanes, self.lane(twin, block), first.min(upto))?,
             _ => Vec::new(),
         };
         if upto > first {
-            let at = self.row_of(block, lanes, l, first)?;
+            let at = self.row_of(lanes, l, first)?;
             out.push(at..at + upto - first);
         }
         Ok(out)
@@ -1858,10 +1865,10 @@ impl<'t> Plan<'t> {
 
     /// The row of a call at `block` over `lanes` (each taking [`Plan::range`]) holding row `row` of
     /// lane `l`'s sequence.
-    fn row_of(&self, block: usize, lanes: &[usize], l: usize, row: usize) -> Result<usize, String> {
+    fn row_of(&self, lanes: &[usize], l: usize, row: usize) -> Result<usize, String> {
         let mut offset = 0;
         for &x in lanes {
-            let range = self.range(x, block);
+            let range = self.range(x);
             if x == l {
                 let first = range.start - self.lanes[x].rows.start;
                 if row < first || row >= self.length {
@@ -1917,8 +1924,8 @@ impl<'t> Plan<'t> {
         for &l in lanes {
             let path = &self.paths[self.lanes[l].path];
             if let Some((variables, source)) = path.patched(block) {
-                let row = self.row_of(block, lanes, l, path.position)?;
-                let source = self.row_of(block, lanes, self.lane(source, block), path.position)?;
+                let row = self.row_of(lanes, l, path.position)?;
+                let source = self.row_of(lanes, self.lane(source, block), path.position)?;
                 out.push((row, source, variables));
             }
         }
@@ -1939,14 +1946,14 @@ impl<'t> Plan<'t> {
                 let edit = match edit {
                     Edit::Op { site, operation, at, source } => {
                         let from = match operation {
-                            Operation::Swap => self.row_of(block, lanes, self.lane(*source, block), *at)?,
-                            _ => self.row_of(block, lanes, l, *at)?,
+                            Operation::Swap => self.row_of(lanes, self.lane(*source, block), *at)?,
+                            _ => self.row_of(lanes, l, *at)?,
                         };
                         Edit::OpAt { site: *site, operation: *operation, from }
                     }
                     other => *other,
                 };
-                out.push((self.row_of(block, lanes, l, at)?, edit));
+                out.push((self.row_of(lanes, l, at)?, edit));
             }
         }
         Ok(out)
@@ -2006,17 +2013,17 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
             if lanes.is_empty() {
                 continue;
             }
-            let ranges: Vec<Range<usize>> = lanes.iter().map(|l| plan.range(*l, b)).collect();
+            let ranges: Vec<Range<usize>> = lanes.iter().map(|l| plan.range(*l)).collect();
             let before = plan.before(b, &lanes)?;
             let tokens: Vec<&[u32]> = lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
             let edits = edits(engines[side], plan, b, &lanes)?;
             let kept_here = match budget {
                 None => {
-                    engines[side].forward_before(b, &mut stream, &ranges, &before, &tokens, edits.as_ref(), false)?;
+                    engines[side].forward_before(b, &mut stream, (&ranges, &before), &tokens, edits.as_ref(), false)?;
                     None
                 }
                 Some(budget) if kept.saturating_add(largest.saturating_mul(3)) < budget => {
-                    let tape = engines[side].forward_before(b, &mut stream, &ranges, &before, &tokens, edits.as_ref(), true)?.ok_or_else(|| error("a call kept no tape"))?;
+                    let tape = engines[side].forward_before(b, &mut stream, (&ranges, &before), &tokens, edits.as_ref(), true)?.ok_or_else(|| error("a call kept no tape"))?;
                     let bytes = E::tape_bytes(&tape);
                     kept = kept.saturating_add(bytes);
                     largest = largest.max(bytes);
@@ -2025,7 +2032,7 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
                 Some(_) => {
                     let entering = if b == 0 { None } else { Some(gather(d, &stream, &ranges)?) };
                     kept = kept.saturating_add(entering.as_ref().map_or(0, Tensor::bytes));
-                    engines[side].forward_before(b, &mut stream, &ranges, &before, &tokens, edits.as_ref(), false)?;
+                    engines[side].forward_before(b, &mut stream, (&ranges, &before), &tokens, edits.as_ref(), false)?;
                     Some(Kept::Entering(entering))
                 }
             };
@@ -2070,7 +2077,7 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
     let width = passes.first().map(|p| p.cotangent.cols()).ok_or_else(|| error("a reverse pass of no cotangent"))?;
     for (index, call) in calls.iter().enumerate().rev() {
         let b = call.block;
-        let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.range(*l, b)).collect();
+        let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.range(*l)).collect();
         let recomputed;
         let tape = match call.kept.as_ref().ok_or_else(|| error("a call kept nothing for the reverse pass"))? {
             Kept::Tape(tape) => tape,
@@ -2089,7 +2096,7 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
                     None => return Err(error("a call past the first block without its entering rows")),
                 };
                 let tokens: Vec<&[u32]> = call.lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
-                recomputed = engines[call.side].forward_before(b, &mut rows, &local, &plan.before(b, &call.lanes)?, &tokens, call.edits.as_ref(), true)?.ok_or_else(|| error("a call kept no tape"))?;
+                recomputed = engines[call.side].forward_before(b, &mut rows, (&local, &plan.before(b, &call.lanes)?), &tokens, call.edits.as_ref(), true)?.ok_or_else(|| error("a call kept no tape"))?;
                 &recomputed
             }
         };
@@ -3495,7 +3502,7 @@ mod tests {
                 }
             }
             for call in calls.iter().filter(|c| c.block == b) {
-                let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.range(*l, b)).collect();
+                let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.range(*l)).collect();
                 let Some(Kept::Tape(tape)) = &call.kept else { panic!("a call kept no tape") };
                 let model = if call.side == 0 { &p } else { &m };
                 model.tangent(b, tape, &mut t, &ranges, call.edits.as_ref(), if call.side == 0 { &tangents } else { &none }).expect("the tangent");

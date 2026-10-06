@@ -579,14 +579,13 @@ impl BlockEngine for Counting<'_> {
         &self,
         block: usize,
         stream: &mut gam_gpu::tensor::Tensor,
-        ranges: &[std::ops::Range<usize>],
-        before: &[Vec<std::ops::Range<usize>>],
+        (ranges, before): (&[std::ops::Range<usize>], &[Vec<std::ops::Range<usize>>]),
         tokens: &[&[u32]],
         edits: Option<&Edits>,
         keep: bool,
     ) -> Result<Option<DeviceTrace>, String> {
         self.rows.set(self.rows.get() + ranges.iter().map(ExactSizeIterator::len).sum::<usize>());
-        self.model.forward_before(block, stream, ranges, before, tokens, edits, keep)
+        self.model.forward_before(block, stream, (ranges, before), tokens, edits, keep)
     }
 
     fn reverse(

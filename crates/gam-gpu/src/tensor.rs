@@ -4941,10 +4941,13 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
     const STAGE_BYTES: usize = 4 << 20;
 
     impl Drop for Staging {
-        /// A buffer is freed only after its last copy finished.
+        /// A buffer is freed only after its last copy finished (a failed wait is logged: a drop
+        /// returns nothing).
         fn drop(&mut self) {
             for event in self.buffers.iter().filter_map(|(_, e)| e.as_ref()) {
-                let _ = event.synchronize();
+                if let Err(e) = event.synchronize() {
+                    log::error!("tensor upload staging: waiting for a copy before freeing its buffer: {e:?}");
+                }
             }
         }
     }
