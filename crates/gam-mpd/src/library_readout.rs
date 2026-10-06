@@ -204,32 +204,6 @@ pub struct Readout {
     pub participation: [f64; 4],
 }
 
-/// One token's account of its prediction ([`Library::accounts`]).
-#[derive(Clone, Debug, Serialize)]
-pub struct Account {
-    /// The token's row in the sequences.
-    pub row: usize,
-    /// The functions whose removal raises `KL(M ‖ P)` at the token most, descending.
-    pub functions: Vec<Share>,
-}
-
-/// One function's part in a token's prediction.
-#[derive(Clone, Debug, Serialize)]
-pub struct Share {
-    pub name: String,
-    /// The measured removal effect at the token: the change in `KL(M ‖ P)` in bits.
-    pub removal_bits: f64,
-    /// A head: the positions of the token's sequence it attends to most from the token, with
-    /// their weights.
-    pub attention: Vec<(usize, f64)>,
-    /// An MLP function: its activation `h_i` at the token.
-    pub activation: Option<f64>,
-    /// Its write at the token through the final norm (at the token's RMS) and the unembedding,
-    /// centred over the vocabulary: the tokens it raises most and lowers most (a direct path only).
-    pub promoted: Vec<TokenScore>,
-    pub suppressed: Vec<TokenScore>,
-}
-
 // ------------------------------------------------------------------------------ the explanation
 
 /// A read of the residual stream: its native norm's input node, gain and epsilon.
@@ -1012,59 +986,6 @@ impl<'a> Library<'a> {
             start = end;
         }
         Ok(())
-    }
-
-    /// Per row of `targets` (rows of `sequences`, of one length), an account of its prediction:
-    /// the `top` functions whose measured removal ([`Library::removal_effects`], `batch` at a
-    /// time) raises `KL(M ‖ P)` there most, each with where it attends (a head's `tokens` largest
-    /// weights) or its activation (an MLP function), and the `tokens` tokens its write there
-    /// raises and lowers most.
-    pub fn accounts(&self, teacher: &Teacher, sequences: &[Vec<u32>], targets: &[usize], top: usize, tokens: usize, batch: usize) -> Result<Vec<Account>, String> {
-        let effects = self.removal_effects(teacher, sequences, Some(targets), batch)?;
-        let length = sequences[0].len();
-        let pass = self.pass(&sequences.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
-        let names = self.functions();
-        let top = top.min(names.len());
-        let mut writes = Array2::<f64>::zeros((targets.len() * top, self.unembedding.ncols()));
-        let mut accounts = Vec::with_capacity(targets.len());
-        for (c, &row) in targets.iter().enumerate() {
-            let mut ranked: Vec<usize> = (0..names.len()).collect();
-            ranked.sort_by(|a, b| effects[[*b, c]].total_cmp(&effects[[*a, c]]));
-            let (sequence, position) = (row / length, row % length);
-            let mut shares = Vec::with_capacity(top);
-            for (k, &f) in ranked.iter().take(top).enumerate() {
-                let mut write = writes.row_mut(c * top + k);
-                let (attention, activation) = match self.place(f)?.1 {
-                    Ok(h) => {
-                        write.assign(&self.heads[h].output.dot(&pass.head[h][2].row(row)));
-                        let weights = pass.weights[h][sequence].row(position);
-                        let mut order: Vec<usize> = (0..=position).collect();
-                        order.sort_by(|a, b| weights[*b].total_cmp(&weights[*a]));
-                        (order.into_iter().take(tokens).map(|u| (u, weights[u])).collect(), None)
-                    }
-                    Err((b, i)) => {
-                        let a = pass.mlp[b].0[[row, i]];
-                        write.assign(&(&self.mlps[b].out.column(i) * a));
-                        (Vec::new(), Some(a))
-                    }
-                };
-                shares.push(Share { name: names[f].name.clone(), removal_bits: effects[[f, c]], attention, activation, promoted: Vec::new(), suppressed: Vec::new() });
-            }
-            accounts.push(Account { row, functions: shares });
-        }
-        let promoted = extreme_columns(self.wide, &self.unembedding_table, &writes, tokens, 1.0, self.tile_rows)?;
-        let suppressed = extreme_columns(self.wide, &self.unembedding_table, &writes, tokens, -1.0, self.tile_rows)?;
-        for (c, account) in accounts.iter_mut().enumerate() {
-            let inverse = pass.inverse_final[account.row];
-            for (k, share) in account.functions.iter_mut().enumerate() {
-                let write = writes.row(c * top + k);
-                let centre = dot(self.unembedding_mean.view(), write);
-                let logit = |t: usize| (dot(self.unembedding.row(t), write) - centre) * inverse;
-                share.promoted = scored(&promoted[c * top + k], logit);
-                share.suppressed = scored(&suppressed[c * top + k], logit);
-            }
-        }
-        Ok(accounts)
     }
 
     /// Every function in the order of attribution columns: per layer its heads, then its MLP
