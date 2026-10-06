@@ -1973,7 +1973,7 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
     let mut charged = match charge {
         Some(dir) => {
             posterior.mean_into(&mut program)?;
-            Some(Charged::new(vpd, export, dir, (&mut program, hidden_node), &batches, &head, tokens, seed)?)
+            Some(Charged::new(vpd, export, dir, (&mut program, hidden_node), &batches, &head, (tokens, seed, false))?)
         }
         None => None,
     };
@@ -2093,6 +2093,281 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
     }))
 }
 
+/// Our fit started from VPD's decomposition. `P` runs autonomously and causally: `E` with every
+/// mask 1 (every subcomponent, the remainder dropped); VPD's causal-importance network made causal
+/// on that run's inputs to the sites; then `E` again with the network's masks (`own_causal_1` of
+/// [`vpd_mask_sources`]). It reads neither `M` nor later positions. Every parameter is described
+/// and fitted with its mean free (IVON, `β₁ = 0.99`, [`DevicePosterior::step`]'s length): the
+/// subcomponents' `U` and `V` with [`vpd_pricing`]'s groups (their deviations from `start`, a
+/// pricing posterior), and the network's weights with [`Charged`]'s groups (deviations from its
+/// Laplace pass). The data term is `Σ_t KL(M ‖ P)` over the `train` sequences, and the gradient
+/// runs back through both passes: the masks' cotangents through the network to its replaced
+/// inputs and on into the all-on run. After the first epoch, every subcomponent whose masks were
+/// zero on every training token is removed with its gate's row. Its data term is zero, so `F`
+/// falls by its description. A removal sets weights of `M`'s own decomposition to zero, so it is
+/// a weight edit of `M`. Epochs run until the mean paired improvement is below its standard
+/// error, or `epochs` of them. Each epoch reports `F`, its parts, the held-out KL at the mean and
+/// at samples, and the subcomponents kept and active per token per layer.
+pub fn vpd_fit(vpd: &Vpd, export: &Path, decomposition: &Path, (train, held_out): (&[Vec<u32>], &[Vec<u32>]), (batch, seed, epochs): (usize, u64, u64), (start, save): (&Path, &Path), mut report: impl FnMut(&Value) -> Result<(), String>) -> Result<Value, String> {
+    use crate::device_posterior::{DevicePosterior, Ivon, Parts, State};
+    let device = vpd.e.program.device().clone();
+    let d = &device;
+    let (built, _) = model(export, Some(&vpd.factors))?;
+    // Per site its subcomponents' operators: (trainable index, holds V (rows the subcomponents)).
+    let mut site_ops: Vec<Vec<(usize, bool)>> = vec![Vec::new(); vpd.factors.len()];
+    let (mut trainable, mut groups, mut means, mut sizes) = (Vec::new(), Vec::<Vec<u32>>::new(), Vec::<Array2<f64>>::new(), Vec::<f64>::new());
+    let mut base = 0usize;
+    for (site, f) in vpd.factors.iter().enumerate() {
+        let c = f.subcomponents();
+        sizes.extend(std::iter::repeat_n(f.v.nrows() as f64, c));
+        sizes.extend(std::iter::repeat_n(f.u.ncols() as f64, c));
+        for (op, operator) in built.program.operators.iter().enumerate() {
+            let Some(part) = operator.name.strip_prefix(&format!("{}.", f.name)) else { continue };
+            let values = operator.matrix();
+            let (rows, cols) = values.dim();
+            let is_v = part.starts_with('V');
+            let ids: Vec<u32> = if is_v {
+                (0..rows * cols).map(|e| (base + e / cols) as u32).collect()
+            } else if part.starts_with('U') {
+                (0..rows * cols).map(|e| (base + c + e % cols) as u32).collect()
+            } else {
+                continue;
+            };
+            site_ops[site].push((trainable.len(), is_v));
+            trainable.push(op);
+            groups.push(ids);
+            means.push(values);
+        }
+        base += 2 * c;
+    }
+    let tokens = train.iter().map(Vec::len).sum::<usize>() as f64;
+    let started = read_pricing_posterior(start, &means)?;
+    let mut program = Side::compile(&device, &built.program, usize::MAX)?;
+    let hidden_node = built.layout.hidden;
+    drop(built);
+    program.prepare_dense_parameters(&trainable)?;
+    let log_sd: Vec<Array2<f64>> = started.iter().map(|(s, _)| s.clone()).collect();
+    let parts = Parts { operators: &trainable, mean: &means, log_sd: &log_sd, groups: &groups, count: base, reference: None };
+    let mut uv = DevicePosterior::from_parts(&device, &parts, tokens, Some(State::Zero), 0)?;
+    for (i, (s, h)) in started.iter().enumerate() {
+        uv.set_start(i, s, h)?;
+    }
+    uv.settle()?;
+    drop((means, log_sd, started, groups));
+    let batches: Vec<&[Vec<u32>]> = train.chunks(batch).collect();
+    let head = d_copy(&device, &vpd.e.head)?;
+    let arithmetic = program.arithmetic();
+    uv.mean_into(&mut program)?;
+    let mut net = Charged::new(vpd, export, decomposition, (&mut program, hidden_node), &batches, &head, (tokens, seed, true))?;
+    uv.hold_means(false);
+    net.posterior.hold_means(false);
+    let ivon = Ivon { beta1: 0.99, beta2: 1.0 - 1.0 / batches.len() as f64 };
+    let mut variance_nats: f64 = sizes.iter().map(|n| 0.5 * n.ln()).sum::<f64>() + net.variance_nats;
+    let mut removed: Vec<Vec<bool>> = vpd.sites.iter().map(|&(_, c, _)| vec![false; c]).collect();
+    // Per site the sum over the first epoch's training tokens of each subcomponent's mask (1 × C).
+    let mut mass: Vec<Tensor> = vpd.sites.iter().map(|&(_, c, _)| d.zeros(1, c).map_err(error)).collect::<Result<_, _>>()?;
+    let ones_given = |rows: usize| -> Result<BTreeMap<usize, Tensor>, String> {
+        let mut given = BTreeMap::new();
+        for (s, &(_, c, width)) in vpd.sites.iter().enumerate() {
+            given.insert(vpd.layout.masks[s], d.upload(Array2::<f64>::ones((rows, c)).view()).map_err(error)?);
+            given.insert(vpd.layout.deltas[s], d.zeros(rows, width).map_err(error)?);
+        }
+        Ok(given)
+    };
+    let replaced: std::collections::BTreeSet<usize> = vpd.m_layout.inputs.iter().copied().collect();
+    let no_edits = std::collections::BTreeSet::new();
+    // One pass over `sequences`, at the means or at a sample per batch (with `step`, the steps):
+    // per batch the data term in nats and its tokens, and (`count`) per layer the subcomponents
+    // kept and active summed over the tokens.
+    let mut pass = |sequences: &[&[Vec<u32>]], epoch: u64, step: bool, at_mean: bool, count: bool, uv: &mut DevicePosterior, net: &mut Charged, program: &mut DeviceProgram, mass: Option<&mut Vec<Tensor>>, removed: &[Vec<bool>]| -> Result<(Vec<(f64, usize)>, Vec<f64>), String> {
+        let mut mass = mass;
+        let mut out = Vec::with_capacity(sequences.len());
+        let mut active = vec![0.0; vpd.layers()];
+        for (b, chunk) in sequences.iter().enumerate() {
+            let key = seed ^ (epoch << 32) ^ b as u64;
+            if at_mean {
+                uv.mean_into(program)?;
+                net.posterior.mean_into(&mut net.program)?;
+            } else {
+                uv.sample_into(program, key)?;
+                net.posterior.sample_into(&mut net.program, gam_linalg::utils::splitmix64_hash(key ^ NETWORK_KEY))?;
+            }
+            let views: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
+            let family = sequence_family(&views)?;
+            let length = views[0].len();
+            let all_on = program.forward_given(&family, ones_given(family.rows)?)?;
+            // The network on the all-on run's inputs to the sites, in place of `M`'s.
+            let inputs: BTreeMap<usize, Tensor> =
+                vpd.layout.inputs.iter().zip(&vpd.m_layout.inputs).map(|(own, m)| Ok((*m, d.copy(all_on.value(*own)?).map_err(error)?))).collect::<Result<_, String>>()?;
+            let ci = net.program.forward_edited(
+                &family,
+                BTreeMap::new(),
+                &replaced,
+                |node, value| {
+                    if let Some(v) = inputs.get(&node) {
+                        *value = d.copy(v).map_err(error)?;
+                    }
+                    Ok(())
+                },
+                |_, _| Ok(None),
+            )?;
+            drop(inputs);
+            if let Some(mass) = mass.as_deref_mut() {
+                let ones = d.upload(Array2::<f64>::ones((1, family.rows)).view()).map_err(error)?;
+                for (s, acc) in mass.iter_mut().enumerate() {
+                    d.gemm(acc, 1.0, &ones, Op::N, ci.value(net.outputs[s])?, Op::N, 1.0, arithmetic).map_err(error)?;
+                }
+            }
+            if count {
+                let g: Vec<Array2<f64>> = net
+                    .outputs
+                    .iter()
+                    .zip(removed)
+                    .map(|(n, gone)| {
+                        let mut m = d.download(ci.value(*n)?).map_err(error)?;
+                        for (j, g) in gone.iter().enumerate() {
+                            if *g {
+                                m.column_mut(j).fill(0.0);
+                            }
+                        }
+                        Ok(m)
+                    })
+                    .collect::<Result<_, String>>()?;
+                let (_, per_layer) = active_counts(&g, &vpd.sites, vpd.layers());
+                for (acc, counts) in active.iter_mut().zip(per_layer) {
+                    *acc += counts.iter().sum::<f64>();
+                }
+            }
+            let masked = program.forward_given(&family, network_given(vpd, &family, &ci, &net.outputs)?)?;
+            let (_, m_streams) = streams(&vpd.m, &family, |_| BTreeMap::new())?;
+            let m_hidden = vpd.m.hidden_of(&family, &m_streams[vpd.layers()])?;
+            let (kl, cotangent) = divergence_and_seed(d, &m_hidden, masked.value(hidden_node)?, &head, length, step, arithmetic)?;
+            if let Some(cotangent) = cotangent {
+                let probe = gam_linalg::utils::splitmix64_hash(key);
+                let probed = crate::interchange::fisher_probe_seed(d, masked.value(hidden_node)?, &head, length, probe, arithmetic)?;
+                let (mut g_uv, mut u_uv, mut g_net, mut u_net) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+                for (seed_at_hidden, uv_sums, net_sums) in [(cotangent, &mut g_uv, &mut g_net), (probed, &mut u_uv, &mut u_net)] {
+                    let nodes = program.vjp_values_dense_edited(&masked, BTreeMap::from([(hidden_node, seed_at_hidden)]), &vpd.layout.mask_nodes, &trainable, arithmetic, (&no_edits, &mut |_, _| Ok(())), uv_sums)?;
+                    // The masks' cotangents through the network; its replaced inputs' cotangents kept.
+                    let mut captured: BTreeMap<usize, Tensor> = BTreeMap::new();
+                    let mut keep_input = |node: usize, cotangent: &mut Tensor| -> Result<(), String> {
+                        captured.insert(node, d.copy(cotangent).map_err(error)?);
+                        *cotangent = d.zeros(cotangent.rows(), cotangent.cols()).map_err(error)?;
+                        Ok(())
+                    };
+                    net.program.vjp_values_dense_edited(&ci, mask_seeds(vpd, nodes, &net.outputs), &[], &net.trainable, arithmetic, (&replaced, &mut keep_input), net_sums)?;
+                    let seeds: BTreeMap<usize, Tensor> = vpd.layout.inputs.iter().zip(&vpd.m_layout.inputs).filter_map(|(own, m)| captured.remove(m).map(|t| (*own, t))).collect();
+                    program.vjp_values_dense_edited(&all_on, seeds, &[], &trainable, arithmetic, (&no_edits, &mut |_, _| Ok(())), uv_sums)?;
+                }
+                let per_token = 1.0 / family.rows as f64;
+                uv.step(&g_uv, per_token, (&u_uv, per_token), &BTreeMap::new(), &ivon)?;
+                net.posterior.step(&g_net, per_token, (&u_net, per_token), &BTreeMap::new(), &ivon)?;
+            }
+            out.push((kl, family.rows));
+        }
+        Ok((out, active))
+    };
+    let held: Vec<&[Vec<u32>]> = held_out.chunks(batch).collect();
+    let held_tokens = held_out.iter().map(Vec::len).sum::<usize>() as f64;
+    let mut epochs_out: Vec<Value> = Vec::new();
+    let mut previous: Option<Vec<f64>> = None;
+    // The held-out scores of the posterior as it stands: KL at the mean, at samples, and the
+    // subcomponents kept and active per token per layer.
+    let held_out_scores = |uv: &mut DevicePosterior, net: &mut Charged, program: &mut DeviceProgram, removed: &[Vec<bool>], pass: &mut dyn FnMut(&[&[Vec<u32>]], u64, bool, bool, bool, &mut DevicePosterior, &mut Charged, &mut DeviceProgram, Option<&mut Vec<Tensor>>, &[Vec<bool>]) -> Result<(Vec<(f64, usize)>, Vec<f64>), String>| -> Result<Value, String> {
+        let (at_mean, active) = pass(&held, 0, false, true, true, uv, net, program, None, removed)?;
+        let (sampled, _) = pass(&held, 0, false, false, false, uv, net, program, None, removed)?;
+        let bits = |data: &[(f64, usize)]| data.iter().map(|(kl, _)| kl).sum::<f64>() / held_tokens / LN_2;
+        Ok(json!({
+            "kl_bits_per_token_at_mean": bits(&at_mean),
+            "kl_bits_per_token_sampled": bits(&sampled),
+            "active_per_token_per_layer": active.iter().map(|a| a / held_tokens).collect::<Vec<f64>>(),
+            "kept": removed.iter().map(|r| r.iter().filter(|g| !**g).count()).sum::<usize>(),
+        }))
+    };
+    let start_scores = held_out_scores(&mut uv, &mut net, &mut program, &removed, &mut pass)?;
+    log::info!("vpd fit start (held out): {start_scores}");
+    report(&json!({"start": start_scores}))?;
+    for epoch in 1..=epochs {
+        let (data, _) = pass(&batches, epoch, true, false, false, &mut uv, &mut net, &mut program, (epoch == 1).then_some(&mut mass), &removed)?;
+        if epoch == 1 {
+            // Every subcomponent no training token's mask reached, removed with its gate's row.
+            for (site, acc) in mass.iter().enumerate() {
+                let sums = d.download(acc).map_err(error)?;
+                let dead: Vec<usize> = (0..sums.ncols()).filter(|j| sums[[0, *j]] == 0.0).collect();
+                let c = removed[site].len();
+                for &(i, is_v) in &site_ops[site] {
+                    let shape = uv.values(i)?.0.dim();
+                    let at: Vec<u32> = if is_v {
+                        dead.iter().flat_map(|j| (j * shape.1..(j + 1) * shape.1).map(|e| e as u32)).collect()
+                    } else {
+                        dead.iter().flat_map(|j| (0..shape.0).map(move |r| (r * c + j) as u32)).collect()
+                    };
+                    uv.remove_entries(i, &at)?;
+                }
+                let name = &vpd.factors[site].name;
+                for (k, op_name) in net.names.iter().enumerate() {
+                    let gate = op_name == &format!("ci.head.{site}");
+                    let gate_bias = op_name == &format!("ci.head.b.{site}");
+                    if !(gate || gate_bias) {
+                        continue;
+                    }
+                    let shape = net.posterior.values(k)?.0.dim();
+                    let at: Vec<u32> = dead.iter().flat_map(|j| (j * shape.1..(j + 1) * shape.1).map(|e| e as u32)).collect();
+                    net.posterior.remove_entries(k, &at)?;
+                    if gate {
+                        variance_nats -= dead.len() as f64 * 0.5 * (shape.1 as f64).ln();
+                    }
+                }
+                for j in &dead {
+                    removed[site][*j] = true;
+                    variance_nats -= 0.5 * (vpd.factors[site].v.nrows() as f64).ln() + 0.5 * (vpd.factors[site].u.ncols() as f64).ln();
+                }
+                log::info!("vpd fit: {name}: {} of {c} subcomponents removed (zero mask on every training token)", dead.len());
+            }
+            uv.settle()?;
+            net.posterior.settle()?;
+        }
+        let uv_divergence: f64 = uv.divergences()?.iter().sum();
+        let net_divergence: f64 = net.posterior.divergences()?.iter().sum();
+        let description = uv_divergence + net_divergence + variance_nats;
+        let estimates: Vec<f64> = data.iter().map(|(kl, n)| (tokens * kl / *n as f64 + description) / LN_2).collect();
+        let data_bits = data.iter().map(|(kl, _)| kl).sum::<f64>() / tokens / LN_2;
+        let (improvement, standard_error) = match &previous {
+            Some(before) => {
+                let diff: Vec<f64> = before.iter().zip(&estimates).map(|(a, b)| a - b).collect();
+                let mean = diff.iter().sum::<f64>() / diff.len() as f64;
+                let var = diff.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (diff.len() as f64 - 1.0).max(1.0);
+                (Some(mean), Some((var / diff.len() as f64).sqrt()))
+            }
+            None => (None, None),
+        };
+        let scores = held_out_scores(&mut uv, &mut net, &mut program, &removed, &mut pass)?;
+        epochs_out.push(json!({
+            "epoch": epoch,
+            "data_bits_per_token": data_bits,
+            "subcomponent_divergence_bits": uv_divergence / LN_2,
+            "network_divergence_bits": net_divergence / LN_2,
+            "variance_bits": variance_nats / LN_2,
+            "objective_bits": tokens * data_bits + description / LN_2,
+            "improvement_bits": improvement,
+            "standard_error_bits": standard_error,
+            "held_out": scores,
+        }));
+        log::info!("vpd fit epoch {epoch}: {}", epochs_out[epochs_out.len() - 1]);
+        report(&json!({"start": start_scores, "epochs": epochs_out}))?;
+        write_pricing_posterior(save, &uv, trainable.len())?;
+        write_pricing_posterior(&save.with_extension("network.f32"), &net.posterior, net.trainable.len())?;
+        write_means(&save.with_extension("means.f32"), &uv, trainable.len())?;
+        write_means(&save.with_extension("network_means.f32"), &net.posterior, net.trainable.len())?;
+        let converged = matches!((improvement, standard_error), (Some(i), Some(s)) if i < s);
+        previous = Some(estimates);
+        if converged {
+            break;
+        }
+    }
+    Ok(json!({"start": start_scores, "epochs": epochs_out, "training_tokens": tokens, "network_parameters": net.parameters}))
+}
+
 /// The key a charged network's weight draw is made apart from the subcomponents' under.
 const NETWORK_KEY: u64 = 0x6369_6e65_7477_6f72;
 
@@ -2111,6 +2386,8 @@ struct Charged {
     program: DeviceProgram,
     outputs: Vec<usize>,
     trainable: Vec<usize>,
+    /// The trainable operators' names, in `trainable`'s order.
+    names: Vec<String>,
     posterior: crate::device_posterior::DevicePosterior,
     parameters: usize,
     groups: usize,
@@ -2118,12 +2395,13 @@ struct Charged {
 }
 
 impl Charged {
-    #[allow(clippy::too_many_arguments)]
-    fn new(vpd: &Vpd, export: &Path, decomposition: &Path, (program, hidden_node): (&mut DeviceProgram, usize), batches: &[&[Vec<u32>]], head: &Tensor, tokens: f64, seed: u64) -> Result<Self, String> {
+    /// With `causal` the network's attention is causal ([`importance_model`]); its Laplace pass
+    /// still reads `M`'s activations.
+    fn new(vpd: &Vpd, export: &Path, decomposition: &Path, (program, hidden_node): (&mut DeviceProgram, usize), batches: &[&[Vec<u32>]], head: &Tensor, (tokens, seed, causal): (f64, u64, bool)) -> Result<Self, String> {
         let device = program.device().clone();
         let arithmetic = program.arithmetic();
         let Decomposition { sites, ci } = Decomposition::load(decomposition)?;
-        let (built, outputs) = importance_model(export, &sites, ci, false)?;
+        let (built, outputs) = importance_model(export, &sites, ci, causal)?;
         drop(sites);
         let fixed = |name: &str| name == "ci I" || ["ci.one.", "ci.I.", "ci.minus."].iter().any(|p| name.starts_with(p));
         let (mut trainable, mut groups, mut means, mut sizes): (Vec<usize>, Vec<Vec<u32>>, Vec<Array2<f64>>, Vec<usize>) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -2144,6 +2422,7 @@ impl Charged {
             trainable.push(op);
             means.push(values);
         }
+        let names: Vec<String> = trainable.iter().map(|op| built.program.operators[*op].name.clone()).collect();
         let mut network = Side::compile(&device, &built.program, usize::MAX)?;
         drop(built);
         network.prepare_dense_parameters(&trainable)?;
@@ -2211,7 +2490,7 @@ impl Charged {
         let variance_nats = sizes.iter().map(|n| 0.5 * (*n as f64).ln()).sum();
         let divergence: f64 = posterior.divergences()?.iter().sum();
         log::info!("charged network: Laplace start, divergence {:.0} bits, variance {:.0} bits", divergence / LN_2, variance_nats / LN_2);
-        Ok(Self { program: network, outputs, trainable, posterior, parameters, groups: sizes.len(), variance_nats })
+        Ok(Self { program: network, outputs, trainable, names, posterior, parameters, groups: sizes.len(), variance_nats })
     }
 }
 
@@ -2247,6 +2526,22 @@ pub fn write_pricing_posterior(path: &Path, posterior: &crate::device_posterior:
             let bytes: Vec<u8> = array.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect();
             file.write_all(&bytes).map_err(error)?;
         }
+    }
+    file.flush().map_err(error)?;
+    drop(file);
+    std::fs::rename(&partial, path).map_err(error)
+}
+
+/// A posterior's means `μ̄` written to `path`: per trainable operator in order, row-major
+/// little-endian float32, written with `.partial` appended and renamed when whole.
+fn write_means(path: &Path, posterior: &crate::device_posterior::DevicePosterior, operators: usize) -> Result<(), String> {
+    use std::io::Write;
+    let partial = PathBuf::from(format!("{}.partial", path.display()));
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&partial).map_err(error)?);
+    for i in 0..operators {
+        let (mean, _) = posterior.values(i)?;
+        let bytes: Vec<u8> = mean.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect();
+        file.write_all(&bytes).map_err(error)?;
     }
     file.flush().map_err(error)?;
     drop(file);
