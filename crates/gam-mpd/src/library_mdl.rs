@@ -1636,20 +1636,7 @@ impl Scorer {
     /// weight sample of `sample` ([`DevicePosterior::sample_into`]), or at its mean when none, and
     /// with `gradient` the gradient of the sum per trainable operator and, with `factor` too, a draw
     /// of the Gauss–Newton factor (`interchange::Factor`, its labels drawn from the seed `sample`),
-    /// left on the device; `M`'s targets made here.
-    fn score_device(
-        &mut self,
-        posterior: &DevicePosterior,
-        batch: &Batch,
-        experiments: &[Experiment],
-        sample: Option<u64>,
-        (gradient, factor): (bool, bool),
-    ) -> Result<(Vec<Vec<f64>>, BTreeMap<usize, Tensor>, Option<interchange::Factor>), String> {
-        let targets = self.experiments.targets(batch, experiments)?;
-        self.evaluate_device(posterior, (batch, experiments), sample, &targets, (gradient, factor))
-    }
-
-    /// [`Scorer::score_device`] against `M`'s `targets` already made for these experiments.
+    /// left on the device; against `M`'s `targets` made for these experiments.
     fn evaluate_device(
         &mut self,
         posterior: &DevicePosterior,
@@ -1716,6 +1703,8 @@ fn training_key(seed: u64, batch: usize) -> u64 {
 /// Its A/B (fitperf-halffactor-ab2: vpd4l, N = 2^20, RTX 4090, 3 epochs, seeds 1-2) measured F
 /// after epoch 2 at 25.45e6 and 24.09e6 bits against 25.73e6 and 24.81e6 with both halves'
 /// factors, and 7% less wall time per step.
+/// `made` holds `M`'s targets of the halves when they were made already (the previous step's
+/// [`line_measurement`] of this batch makes the same ones); otherwise they are made here.
 /// Returns the experiments in the order of their bits.
 fn antithetic_step(
     scorer: &mut Scorer,
@@ -1723,17 +1712,29 @@ fn antithetic_step(
     batch: &Batch,
     experiments: Vec<Experiment>,
     key: u64,
+    made: Option<Vec<Targets>>,
 ) -> Result<(Vec<Experiment>, Vec<Vec<f64>>, BTreeMap<usize, Tensor>, interchange::Factor), String> {
     let half = batch.base.len() / 2;
     let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.into_iter().partition(|e| e.base < half);
+    let mut given = made.unwrap_or_default().into_iter();
+    let mut targets_of = |scorer: &mut Scorer, part: &[Experiment]| -> Result<Targets, String> {
+        match given.next() {
+            Some(targets) => Ok(targets),
+            None => scorer.experiments.targets(batch, part),
+        }
+    };
     if first.is_empty() || second.is_empty() {
         let all: Vec<Experiment> = first.into_iter().chain(second).collect();
-        let (bits, gradients, factor) = scorer.score_device(device_posterior, batch, &all, Some(key), (true, true))?;
+        let targets = targets_of(scorer, &all)?;
+        let (bits, gradients, factor) = scorer.evaluate_device(device_posterior, (batch, &all), Some(key), &targets, (true, true))?;
         return Ok((all, bits, gradients, factor.ok_or("no Gauss–Newton factor")?));
     }
-    let (mut bits, mut gradients, factor) = scorer.score_device(device_posterior, batch, &first, Some(key), (true, true))?;
+    let targets = targets_of(scorer, &first)?;
+    let (mut bits, mut gradients, factor) = scorer.evaluate_device(device_posterior, (batch, &first), Some(key), &targets, (true, true))?;
+    drop(targets);
     let factor = factor.ok_or("no Gauss–Newton factor")?;
-    let (other_bits, other_gradients, _) = scorer.score_device(device_posterior, batch, &second, Some(key ^ gam_gpu::tensor::ANTITHETIC), (true, false))?;
+    let targets = targets_of(scorer, &second)?;
+    let (other_bits, other_gradients, _) = scorer.evaluate_device(device_posterior, (batch, &second), Some(key ^ gam_gpu::tensor::ANTITHETIC), &targets, (true, false))?;
     for (op, g) in other_gradients {
         match gradients.get_mut(&op) {
             Some(sum) => device.axpy(sum, 1.0, &g).map_err(error)?,
@@ -1750,20 +1751,26 @@ fn antithetic_step(
 /// of `key`, as [`antithetic_step`] draws them (the first half of the bases at `key`, the second
 /// at its negation), with no gradient, at `η = 0, η₀, 2η₀`
 /// along the pending step's direction (`DevicePosterior::place_line`, `finish_line`). `M`'s
-/// targets are made once per half for the three.
+/// targets are made once per half for the three and returned, in [`antithetic_step`]'s order of
+/// the halves, for the step that scores this batch next; with the seconds of the targets and of
+/// each point (each ends in reading its bits on the host).
 fn line_measurement(
     scorer: &mut Scorer,
     posterior: &mut DevicePosterior,
     (batch, experiments): (&Batch, &[Experiment]),
     key: u64,
     trial: f64,
-) -> Result<[f64; 3], String> {
+) -> Result<([f64; 3], Vec<Targets>, [f64; 4]), String> {
     let half = batch.base.len() / 2;
     let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.iter().cloned().partition(|e| e.base < half);
     let halves = if first.is_empty() || second.is_empty() { vec![(experiments.to_vec(), key)] } else { vec![(first, key), (second, key ^ gam_gpu::tensor::ANTITHETIC)] };
+    let mut clock = Instant::now();
+    let mut seconds = [0.0; 4];
     let targets = halves.iter().map(|(part, _)| scorer.experiments.targets(batch, part)).collect::<Result<Vec<_>, _>>()?;
+    seconds[0] = clock.elapsed().as_secs_f64();
     let mut values = [0.0; 3];
     for (k, value) in values.iter_mut().enumerate() {
+        clock = Instant::now();
         posterior.place_line(trial * k as f64)?;
         for ((part, seed), targets) in halves.iter().zip(&targets) {
             posterior.iterate_into(scorer.experiments.explanation_mut(), *seed)?;
@@ -1773,8 +1780,9 @@ fn line_measurement(
             }
             *value += evaluation.bits.iter().flatten().sum::<f64>();
         }
+        seconds[k + 1] = clock.elapsed().as_secs_f64();
     }
-    Ok(values)
+    Ok((values, targets, seconds))
 }
 
 /// A running mean of bits over scored tokens.
@@ -2744,12 +2752,17 @@ pub fn fit_from(
         let mut estimates = Vec::with_capacity(draws.len());
         let (mut data_sum, mut description_sum) = (0.0, 0.0);
         let (mut clean, mut patched) = (Mean::default(), Mean::default());
+        // `M`'s targets of the next batch's halves, made by this step's line measurement and
+        // scored against again by the next step (the same experiments; within an epoch).
+        let mut measured: Option<(usize, Vec<Experiment>, Vec<Targets>)> = None;
         for (b, draw) in draws.iter().enumerate() {
             let step_started = Instant::now();
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
             let key = training_key(settings.seed, b);
-            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key)?;
+            let made = measured.take().filter(|(at, made_for, _)| *at == b && *made_for == experiments).map(|(_, _, targets)| targets);
+            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key, made)?;
+            let scoring_seconds = step_started.elapsed().as_secs_f64();
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
@@ -2791,17 +2804,23 @@ pub fn fit_from(
             // The factor's scale: its square estimates the curvature per token of the tokens it
             // sums (the first antithetic half's, `antithetic_step`).
             let factor_weight = weight * scored as f64 / factor.tokens as f64;
+            let posterior_started = Instant::now();
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &ivon)?;
+            let posterior_seconds = posterior_started.elapsed().as_secs_f64();
             if let Some(trial) = device_posterior.line_trial() {
                 // The line step's measurement on the next batch, at its own draws, at η = 0, η₀ and
                 // 2η₀ (`DevicePosterior::finish_line`).
                 let other = (b + 1) % draws.len();
                 let (other_batch, other_experiments) = (draws[other].batch(sequences)?, scorer.experiments(&draws[other], sequences)?);
-                let bits = line_measurement(&mut scorer, &mut device_posterior, (&other_batch, &other_experiments), training_key(settings.seed, other), trial)?;
+                let (bits, targets, seconds) = line_measurement(&mut scorer, &mut device_posterior, (&other_batch, &other_experiments), training_key(settings.seed, other), trial)?;
+                if other > b {
+                    measured = Some((other, other_experiments, targets));
+                }
+                let finish_started = Instant::now();
                 let line = device_posterior.finish_line(bits.map(|b| weight * LN_2 * b), ivon.beta2)?;
                 log::info!(
-                    "library line step {epoch}.{b}: η {:.4e} (trial {trial:.4e}); data slope down d per token: measured {:.4e}, the step's own gradient {:.4e}; data curvature along d: measured {:.4e}, one Gauss–Newton draw {:.4e}, diagonal Σ h d² {:.4e}",
-                    line.eta, line.slope, line.own_slope, line.measured, line.draw, line.diagonal
+                    "library line step {epoch}.{b}: η {:.4e} (trial {trial:.4e}); data slope down d per token: measured {:.4e}, the step's own gradient {:.4e}; data curvature along d: measured {:.4e}, one Gauss–Newton draw {:.4e}, diagonal Σ h d² {:.4e}; seconds: scoring {scoring_seconds:.3}, posterior step {posterior_seconds:.3}, measurement targets {:.3}, points {:.3} {:.3} {:.3}, finish {:.3}",
+                    line.eta, line.slope, line.own_slope, line.measured, line.draw, line.diagonal, seconds[0], seconds[1], seconds[2], seconds[3], finish_started.elapsed().as_secs_f64()
                 );
             }
             let prior_note = if prior.is_some() { format!(" (prior: {prior_seconds:.3} s)") } else { String::new() };
@@ -3867,7 +3886,7 @@ mod tests {
             for (b, draw) in draws.iter().enumerate() {
                 let batch = draw.batch(&sequences).unwrap();
                 let experiments = scorer.experiments(draw, &sequences).unwrap();
-                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, training_key(settings.seed, b)).unwrap();
+                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, training_key(settings.seed, b), None).unwrap();
                 estimates.push(bits.iter().flatten().sum::<f64>());
             }
             estimates
