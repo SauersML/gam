@@ -1803,14 +1803,16 @@ next_offer() {  # KIND GPU
 # statistics. One failure in a data center with successes no longer bans it (12:19 10-06: one
 # missing SSH address put CA-MTL-1, 4 successes before, on a permanent list and 10 pods were
 # rejected). Prints the reason to discard the pod, or nothing (the last offer is always kept).
-unit_risk() {  # HOST DC KIND PRICE GPU [ADDRESS]
+# With POWER (the card's power limit over its default, below 1), the pod runs at most about that
+# fraction of its card's measured speed, so its cost per token is c / POWER (power_check).
+unit_risk() {  # HOST DC KIND PRICE GPU [ADDRESS [POWER]]
     local next c cn
     next=$(next_offer "$3" "$5")
     [ -n "$next" ] || return 0
     c=$(awk -F'|' -v o="$3|$5" '$1 "|" $2 == o && $3 != "-" { print $3 }' <<< "${OFFER_PER:-}")
     cn=$(awk -F'|' -v o="$(cut -d'|' -f1,3 <<< "$next")" '$1 "|" $2 == o && $3 != "-" { print $3 }' <<< "${OFFER_PER:-}")
     [ -n "$c" ] && [ -n "$cn" ] || { c=$4; cn=$(cut -d'|' -f2 <<< "$next"); }
-    awk -F'\t' -v h="$1" -v d="$2" -v a="${6:-}" -v cl="${3%%:*}" -v c="$c" -v cn="$cn" -v nx="$next" -v w0="$(ssh_wait)" -v L="$CAP_SECONDS" '
+    awk -F'\t' -v h="$1" -v d="$2" -v a="${6:-}" -v pw="${7:-1}" -v cl="${3%%:*}" -v c="$c" -v cn="$cn" -v nx="$next" -v w0="$(ssh_wait)" -v L="$CAP_SECONDS" '
         NR > 1 && $10 != "" && $10 != "ended" && $10 != "discarded" && $11 != "host failed before" && $11 != "data center failed before" && $11 != "SSH address failed before" {
             fail = ($10 != "worked"); N[$5]++; M[$5] += fail; U[$5] += fail * $9
             if (h != "" && $6 == h) { nh++; mh += fail; wh += fail * $9 }
@@ -1827,8 +1829,8 @@ unit_risk() {  # HOST DC KIND PRICE GPU [ADDRESS]
             split(nx, q, "|"); k = q[1]; sub(/:.*/, "", k); on = q[3] "|" k
             Fn = (M[k] + 1) / (N[k] + 2); Vn = (U[k] + w0) / (M[k] + 1)
             fn = (mo[on] + 2 * Fn) / (no[on] + 2); Wn = (wo[on] + Vn) / (mo[on] + 1)
-            this = c * (1 + f / (1 - f) * W / L); other = cn * (1 + fn / (1 - fn) * Wn / L)
-            if (this > other) printf "failure probability %.2f (host %d of %d attempts failed, data center %d of %d, address %d of %d) makes it cost %.4f against %.4f for the next offer, %s %s", f, mh, nh, md, nd, ma, na, this, other, q[3], q[1]
+            this = c / pw * (1 + f / (1 - f) * W / L); other = cn * (1 + fn / (1 - fn) * Wn / L)
+            if (this > other) printf "%sfailure probability %.2f (host %d of %d attempts failed, data center %d of %d, address %d of %d) makes it cost %.4f against %.4f for the next offer, %s %s", (pw < 1 ? sprintf("at %.0f%% of its default power and ", 100 * pw) : ""), f, mh, nh, md, nd, ma, na, this, other, q[3], q[1]
         }' "$ATTEMPTS"
 }
 
@@ -2009,10 +2011,9 @@ nebius_settled() {  # OPERATION
 # Of those, the least busy GPU. RP_PACK=0 always takes a pod of its own. Prints the pod, or nothing.
 PACK_GPU=20 PACK_WINDOW=300
 
-# Whether a new pod's GPU is in use by something else or held below its power: over 5 one-second
-# samples before anything of ours runs on it, mean utilization at or above the idle line (PACK_GPU),
-# a power limit below the card's default (a host found at 153 W of 450 W ran 5x slower), or more
-# than 1 GiB of its memory in use (total less free; an idle card's driver holds 0.5-0.6 GiB: 484 MiB
+# Whether a new pod's GPU is in use by something else: over 5 one-second samples before anything of
+# ours runs on it, mean utilization at or above the idle line (PACK_GPU), or more than 1 GiB of its
+# memory in use (total less free; an idle card's driver holds 0.5-0.6 GiB: 484 MiB
 # of a 4090's 24564, 610 of an A40's 46068). The card's size is the offers' (RP_MIN_VRAM_GB against
 # its nominal memoryInGb): comparing free MiB with RP_MIN_VRAM_GB x 1024 failed every idle 24 GB
 # 4090 (24080 MiB free) and 48 GB L40S or A40 (45458) and recorded its host as failing. Prints the
@@ -2024,9 +2025,17 @@ gpu_in_use() {
             END {
                 if (!n) exit
                 if (u / n >= idle) printf "utilization %d%% with no run of ours; ", u / n
-                if (lim ~ /^[0-9.]+$/ && def ~ /^[0-9.]+$/ && lim + 0 < def + 0) printf "power limit %s W of its default %s W; ", lim, def
                 if (total ~ /^[0-9.]+$/ && free ~ /^[0-9.]+$/ && total - free > 1024) printf "%d MiB of its %d MiB in use with no run of ours; ", total - free, total
             }' | sed 's/; $//'
+}
+# A new pod's power limit over its card's default from the same samples (the last), below 1 when the
+# host caps it, else 1. A card capped at fraction p runs at most about p of its measured speed (a
+# host found at 153 W of 450 W ran 5x slower), so unit_risk prices it at its cost per token over p:
+# the pod is kept while that beats the next offer's expected cost (test_power_cost.sh), not by a
+# fixed threshold (a 3090 at 330 W of 420 W, $0.22/h, was discarded six times by any cap at all).
+gpu_power() {
+    on_pod "cat $WS/.gpu-probe" < /dev/null 2> /dev/null |
+        awk -F', *' '{ lim = $3; def = $4 } END { if (lim ~ /^[0-9.]+$/ && def ~ /^[0-9.]+$/ && def + 0 > 0 && lim + 0 < def + 0) printf "%.4f", lim / def; else print 1 }'
 }
 find_host() {
     local rec pod g dl ip port tmp user util free total disk best="" bestu="" now
@@ -2083,7 +2092,7 @@ attach() {  # POD
 # attempt's end is recorded there. Sets POD IP PORT VCPU PRICE.
 # Signals wait while a pod is created, so none can end the run between its creation and its record.
 launch() {
-    local kind price gpu r code left host
+    local kind price gpu r code left host power
     # Offers whose pod landed on a host, data center or address that failed before: RunPod's stock of
     # that offer is that machine for now (frontier-gn-n32768-line6 got host l5bnouhrol1e three times
     # running), so this launch does not ask for it again, and such a discard, which costs seconds,
@@ -2198,6 +2207,11 @@ launch() {
         elif busy=$(gpu_in_use); [ -n "$busy" ]; then
             say "the GPU on host ${host:-?} is not free before the run ($busy); deleting pod $POD"
             why=("broken driver" "GPU not free: $busy")
+        # After gpu_in_use, which waits for the probe's samples.
+        elif power=$(gpu_power) && [ -n "$power" ] && [ "${power:-1}" != 1 ] && risk=$(unit_risk "$host" "$POD_DC" "$kind" "$price" "$gpu" "${IP:-}" "$power") && [ -n "$risk" ]; then
+            say "host ${host:-?}: $risk; deleting pod $POD"
+            why=("discarded" "riskier than the next offer: $risk")
+            [ -z "$host" ] || failed_here[$host]=1
         elif fetch_too_slow; then
             say "deleting pod $POD"
             why=("dead network" "inputs too slow")
