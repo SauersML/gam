@@ -3,6 +3,12 @@
 //!
 //! EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT]
 //! EXPORT SETTINGS.json OUT.json host|gpu vpd DECOMPOSITION
+//! EXPORT SETTINGS.json OUT.json host|gpu price DECOMPOSITION [START]
+//!
+//! `price` prices VPD's decomposition in the library's code length
+//! (`explanation_battery::vpd_pricing`) on the settings' `training_sequences` and writes the
+//! converged posterior to OUT with the extension `posterior.f32`; `START`, a posterior written so
+//! (at any number of training tokens), starts the fit.
 //!
 //! `ARTIFACT` is a `library_mdl` posterior-mean `artifact.bin`, or a fit's `checkpoint.bin`, whose
 //! posterior mean is scored (with its `KL(q ‖ p)` and description reported). Without it `P` is the
@@ -189,7 +195,7 @@ fn circuits(device: &Device, export: &Path, layers: &[gam_mpd::run_check::LayerN
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price DECOMPOSITION";
+    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price DECOMPOSITION [START]";
     let (export, settings_path, out, mode, kind, extra, more) = match &args[..] {
         [e, s, o, m, k] => (e, s, o, m, k.as_str(), None, None),
         [e, s, o, m, k, a] => (e, s, o, m, k.as_str(), Some(Path::new(a)), None),
@@ -267,7 +273,9 @@ fn main() -> Result<(), String> {
             return Err("pricing needs training_sequences rows outside the held-out ones".into());
         }
         let mut progress = report.clone();
-        report["pricing"] = battery::vpd_pricing(&vpd, export, &train, bases, settings.batch_sequences, settings.seed, |state| {
+        // The converged posterior beside OUT; START, a posterior written so, starts the fit.
+        let posterior = Path::new(out).with_extension("posterior.f32");
+        report["pricing"] = battery::vpd_pricing(&vpd, export, &train, bases, settings.batch_sequences, settings.seed, more, &posterior, |state| {
             progress["pricing"] = state.clone();
             save(&progress)
         })?;

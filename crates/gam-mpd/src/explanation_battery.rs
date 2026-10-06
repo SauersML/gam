@@ -1882,7 +1882,14 @@ fn importance_given(vpd: &Vpd, family: &FamilyInputs) -> Result<BTreeMap<usize, 
 /// mean paired improvement of the per-batch objective is below its standard error. Reports per
 /// epoch and at the end `F = KL(q ‖ p) + Σ_G ½ log2 |G| + N · data` in bits, and the held-out data
 /// term at the posterior mean (VPD itself) and at one sample per batch.
-pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec<u32>], batch: usize, seed: u64, mut report: impl FnMut(&Value) -> Result<(), String>) -> Result<Value, String> {
+///
+/// The converged posterior is written to `save` ([`write_pricing_posterior`]). With `start`, the
+/// fit starts from such a file instead of from each group's mean square: its log standard
+/// deviations and IVON's curvature estimates, which are per-token quantities, so a posterior
+/// converged at one `N` starts the fit at another (the curvature's running average otherwise
+/// starts far above the data's and falls by a factor `e` per epoch: at `N = 2^20` the start took
+/// 30 epochs, at any `N`).
+pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec<u32>], batch: usize, seed: u64, start: Option<&Path>, save: &Path, mut report: impl FnMut(&Value) -> Result<(), String>) -> Result<Value, String> {
     let device = vpd.e.program.device().clone();
     let (built, _) = model(export, Some(&vpd.factors))?;
     // The subcomponents' operators: per site its `V` (rows the subcomponents) and `U` (columns).
@@ -1921,23 +1928,34 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
             squares[*g as usize].1 += v * v;
         }
     }
-    let log_sd: Vec<Array2<f64>> = means
-        .iter()
-        .zip(&groups)
-        .map(|(m, ids)| {
-            let cols = m.ncols();
-            Array2::from_shape_fn(m.dim(), |(r, c)| {
-                let (n, s) = squares[ids[r * cols + c] as usize];
-                0.5 * (s / n / tokens).ln()
+    let started = start.map(|path| read_pricing_posterior(path, &means)).transpose()?;
+    let log_sd: Vec<Array2<f64>> = match &started {
+        Some(arrays) => arrays.iter().map(|(log_sd, _)| log_sd.clone()).collect(),
+        None => means
+            .iter()
+            .zip(&groups)
+            .map(|(m, ids)| {
+                let cols = m.ncols();
+                Array2::from_shape_fn(m.dim(), |(r, c)| {
+                    let (n, s) = squares[ids[r * cols + c] as usize];
+                    0.5 * (s / n / tokens).ln()
+                })
             })
-        })
-        .collect();
+            .collect(),
+    };
     let mut program = Side::compile(&device, &built.program, usize::MAX)?;
     let hidden_node = built.layout.hidden;
     drop(built);
     program.prepare_dense_parameters(&trainable)?;
     let parts = crate::device_posterior::Parts { operators: &trainable, mean: &means, log_sd: &log_sd, groups: &groups, count: base };
-    let mut posterior = crate::device_posterior::DevicePosterior::from_parts(&device, &parts, tokens, None, 0)?;
+    let state = started.as_ref().map(|_| crate::device_posterior::State::Zero);
+    let mut posterior = crate::device_posterior::DevicePosterior::from_parts(&device, &parts, tokens, state, 0)?;
+    if let Some(arrays) = started {
+        for (i, (log_sd, curvature)) in arrays.iter().enumerate() {
+            posterior.set_start(i, log_sd, curvature)?;
+        }
+        posterior.settle()?;
+    }
     drop((means, log_sd));
     let variance_nats: f64 = sizes.iter().map(|n| 0.5 * n.ln()).sum();
     let batches: Vec<&[Vec<u32>]> = train.chunks(batch).collect();
@@ -2014,10 +2032,13 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
     let held: Vec<&[Vec<u32>]> = held_out.chunks(batch).collect();
     let held_tokens: usize = held_out.iter().map(Vec::len).sum();
     let at = |data: Vec<(f64, usize)>| data.iter().map(|(kl, _)| kl).sum::<f64>() / held_tokens as f64 / LN_2;
+    write_pricing_posterior(save, &posterior, trainable.len())?;
     let sampled = at(pass(&held, 0, false, &mut posterior, &mut program, false)?);
     let mean = at(pass(&held, 0, false, &mut posterior, &mut program, true)?);
     let divergence: f64 = posterior.divergences()?.iter().sum();
     Ok(json!({
+        "start": start.map(|p| p.display().to_string()),
+        "posterior": save.display().to_string(),
         "training_tokens": tokens,
         "subcomponents": base / 2,
         "parameters": groups.iter().map(Vec::len).sum::<usize>(),
@@ -2028,6 +2049,40 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
         "held_out_kl_bits_per_token_sampled": sampled,
         "epochs": epochs,
     }))
+}
+
+/// A pricing posterior written to `path` ([`vpd_pricing`]): per trainable operator in order, its
+/// log standard deviations and then IVON's curvature estimates, row-major little-endian float32
+/// (the device holds them in float32 on CUDA). Written to `path` with `.partial` appended and
+/// renamed when whole.
+pub fn write_pricing_posterior(path: &Path, posterior: &crate::device_posterior::DevicePosterior, operators: usize) -> Result<(), String> {
+    use std::io::Write;
+    let partial = PathBuf::from(format!("{}.partial", path.display()));
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&partial).map_err(error)?);
+    for i in 0..operators {
+        let (_, log_sd, [_, curvature, _]) = posterior.operator(i)?;
+        for array in [&log_sd, &curvature] {
+            let bytes: Vec<u8> = array.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect();
+            file.write_all(&bytes).map_err(error)?;
+        }
+    }
+    file.flush().map_err(error)?;
+    drop(file);
+    std::fs::rename(&partial, path).map_err(error)
+}
+
+/// The log standard deviations and curvature estimates of a pricing posterior
+/// ([`write_pricing_posterior`]), one pair per array of `shapes_of`'s shapes; a file of another size
+/// is refused.
+fn read_pricing_posterior(path: &Path, shapes_of: &[Array2<f64>]) -> Result<Vec<(Array2<f64>, Array2<f64>)>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let entries: usize = shapes_of.iter().map(|m| 2 * m.len()).sum();
+    if bytes.len() != 4 * entries {
+        return Err(format!("{}: {} bytes, a posterior of these operators has {}", path.display(), bytes.len(), 4 * entries));
+    }
+    let mut values = bytes.chunks_exact(4).map(|c| f64::from(f32::from_le_bytes(c.try_into().expect("four bytes"))));
+    let mut next = |dim: (usize, usize)| Array2::from_shape_fn(dim, |_| values.next().expect("sized above"));
+    Ok(shapes_of.iter().map(|m| (next(m.dim()), next(m.dim()))).collect())
 }
 
 fn d_copy(d: &Device, t: &Tensor) -> Result<Tensor, String> {
