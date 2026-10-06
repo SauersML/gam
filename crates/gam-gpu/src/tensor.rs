@@ -4265,6 +4265,14 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
     // SAFETY: plain u32s laid out as the kernel's parameter struct.
     unsafe impl DeviceRepr for RowRanges {}
 
+    /// The rows (or keys) per thread of a tile shape given `per` at 128 columns, for heads padded to
+    /// `padded` columns: fewer columns put fewer of them on each of a row group's lanes, and a lane
+    /// must hold at least four (`attention_f32.inc` reads them four at a time), so the row group
+    /// shrinks with them and its lanes take more rows.
+    fn attention_per_thread(per: usize, padded: usize) -> usize {
+        per * padded / 128
+    }
+
     /// The width the attention kernels pad heads of `width` columns to.
     fn attention_width(width: usize) -> Result<usize, GpuError> {
         match width {
@@ -5149,14 +5157,14 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
         /// compiled on first use per device and width, allowed `shared` bytes of dynamic shared memory.
         fn attention_kernel(&self, width: usize, name: &'static str, shared: usize) -> Result<CudaFunction, GpuError> {
             static MODULES: std::sync::OnceLock<crate::device_cache::KeyedPtxModuleCache<usize>> = std::sync::OnceLock::new();
-            let (r, k, n, tr, dc) = ATTENTION_FORWARD;
+            let padded = attention_width(width)?;
+            let tiles = |(a, b, c, d, e): (usize, usize, usize, usize, usize)| format!("{a}, {b}, {c}, {}, {e}", attention_per_thread(d, padded));
             let source = |_| {
                 format!(
-                    "#define HEAD_W {width}\n#define HEAD_D {}\n#define FORWARD {}\n#define KEYS {}\n#define QUERIES {}\n#define MAX_SEQUENCES {ATTENTION_SEQUENCES}\n{ATTENTION}{}{ATTENTION_KERNELS}",
-                    attention_width(width).unwrap_or(128),
-                    format!("{r}, {k}, {n}, {tr}, {dc}"),
-                    format!("{}, {}, {}, {}, {}", ATTENTION_KEYS.0, ATTENTION_KEYS.1, ATTENTION_KEYS.2, ATTENTION_KEYS.3, ATTENTION_KEYS.4),
-                    format!("{}, {}, {}, {}, {}", ATTENTION_QUERIES.0, ATTENTION_QUERIES.1, ATTENTION_QUERIES.2, ATTENTION_QUERIES.3, ATTENTION_QUERIES.4),
+                    "#define HEAD_W {width}\n#define HEAD_D {padded}\n#define FORWARD {}\n#define KEYS {}\n#define QUERIES {}\n#define MAX_SEQUENCES {ATTENTION_SEQUENCES}\n{ATTENTION}{}{ATTENTION_KERNELS}",
+                    tiles(ATTENTION_FORWARD),
+                    tiles(ATTENTION_KEYS),
+                    tiles(ATTENTION_QUERIES),
                     include_str!("attention_f32.inc")
                 )
             };

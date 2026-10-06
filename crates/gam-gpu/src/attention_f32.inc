@@ -82,6 +82,7 @@ DEVICE void forward_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, f
                          u32 pair, u32 tile, u32 t, u32 threads, SHARED float* smem) {
     constexpr u32 RG = BR / TR, CG = NT / RG, KP = BC / CG, DP = D / CG, NK = D / DC, NV = BC / DC;
     constexpr u32 CHUNK = FORWARD_CHUNK(D, BC, DC);
+    static_assert(RG * TR == BR && RG * CG == NT && CG <= 32 && (CG & (CG - 1)) == 0 && KP * CG == BC && DP % 4 == 0 && DP >= 4, "a forward tile its threads cover");
     if (pair >= sequences.count * hq) return;
     const u32 head = pair % hq, sequence = pair / hq;
     const u32 start = sequences.start[sequence], length = sequences.length[sequence];
@@ -233,6 +234,7 @@ DEVICE void keys_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, floa
                       GLOBAL const float* dsum, GLOBAL float* gy, u32 pair, u32 tile, u32 t, u32 threads, SHARED float* smem) {
     constexpr u32 KG = BK / TK, CG = NT / KG, QP = BQ / CG, DP = D / CG, NK = D / DC, NR = BQ / DC;
     constexpr u32 CHUNK = FORWARD_CHUNK(D, BQ, DC);
+    static_assert(KG * TK == BK && KG * CG == NT && QP * CG == BQ && DP % 4 == 0 && DP >= 4, "a keys' tile its threads cover");
     if (pair >= sequences.count * hk) return;
     const u32 kv = pair % hk, sequence = pair / hk;
     const u32 start = sequences.start[sequence], length = sequences.length[sequence];
@@ -393,6 +395,7 @@ DEVICE void queries_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, f
                          GLOBAL const float* dsum, GLOBAL float* gy, u32 pair, u32 tile, u32 t, u32 threads, SHARED float* smem) {
     constexpr u32 RG = BR / TR, CG = NT / RG, KP = BC / CG, DP = D / CG, NK = D / DC, NR = BC / DC;
     constexpr u32 CHUNK = FORWARD_CHUNK(D, BC, DC);
+    static_assert(RG * TR == BR && RG * CG == NT && KP * CG == BC && DP % 4 == 0 && DP >= 4, "a queries' tile its threads cover");
     if (pair >= sequences.count * hq) return;
     const u32 head = pair % hq, sequence = pair / hq;
     const u32 start = sequences.start[sequence], length = sequences.length[sequence];
