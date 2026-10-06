@@ -1449,15 +1449,16 @@ pub fn sampled_label_seed(d: &Device, hidden: &Tensor, embedding: &Tensor, tile:
     if uniforms.len() != rows || tile == 0 {
         return Err(error("one uniform per row and positive tile rows required"));
     }
-    let mut seed = d.zeros(rows, hidden.cols()).map_err(error)?;
+    // Every buffer below is written whole (products with β = 0, the tiles' rows), so none is zeroed.
+    let mut seed = d.empty(rows, hidden.cols()).map_err(error)?;
     for start in (0..rows).step_by(tile) {
         let n = tile.min(rows - start);
         let h = d.rows_of(hidden, start, n).map_err(error)?;
-        let mut logits = d.zeros(n, classes).map_err(error)?;
+        let mut logits = d.empty(n, classes).map_err(error)?;
         d.gemm(&mut logits, 1.0, &h, Op::N, embedding, Op::T, 0.0, arithmetic).map_err(error)?;
         let uniforms = d.upload_vec(n, 1, uniforms[start..start + n].to_vec()).map_err(error)?;
         d.sampled_cotangent(&mut logits, &uniforms, None).map_err(error)?;
-        let mut part = d.zeros(n, hidden.cols()).map_err(error)?;
+        let mut part = d.empty(n, hidden.cols()).map_err(error)?;
         d.gemm(&mut part, 1.0, &logits, Op::N, embedding, Op::N, 0.0, arithmetic).map_err(error)?;
         d.set_rows(&mut seed, start, &part).map_err(error)?;
     }
