@@ -71,6 +71,7 @@ class Runner:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         self.dev = dev
+        self.wide = torch.float32 if dev.type == "mps" else torch.float64
         # SDPA with no mask is causal attention over the full window (no padding in a window).
         self.model = AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32, attn_implementation="sdpa").to(dev).eval()
         self.inner = self.model.model
@@ -122,8 +123,7 @@ class Runner:
         """Log-probabilities from the float32 logits, normalized in float64 where the device has it (not on
         Apple's GPU): in float32 the normalization over 151,936 tokens leaves a KL floor near 1e-7 nats
         (measured against oracle.rs), far above what the forward pass's own rounding contributes."""
-        wide = torch.float32 if self.dev.type == "mps" else torch.float64
-        return torch.log_softmax(self.model.lm_head(h).to(wide), dim=-1)
+        return torch.log_softmax(self.model.lm_head(h).to(self.wide), dim=-1)
 
 
 def parse_layers(text: str, count: int) -> list[int]:
@@ -175,37 +175,35 @@ def main():
         check = runner.edited(l, mids[l][:2], acts[l][:2], idx[:2], torch.ones(2, device=dev))
         floor = float((runner.log_probs(check[:, -1]) - runner.log_probs(final[:2, -1])).abs().max())
         for name, alpha in EDITS:
-            kl = torch.empty(N, C, K)
-            nxt = torch.empty(N, C, K)
-            up_ids = torch.empty(N, C, K, TOP, dtype=torch.int32)
-            up_dp, up_dl = torch.empty(N, C, K, TOP), torch.empty(N, C, K, TOP)
-            down_ids = torch.empty(N, C, K, TOP, dtype=torch.int32)
-            down_dp, down_dl = torch.empty(N, C, K, TOP), torch.empty(N, C, K, TOP)
-            pairs = [(n, c) for n in range(N) for c in range(C)]
+            # Results stay on the device and are copied once per edit.
+            kl = torch.empty(N, C, K, dtype=runner.wide, device=dev)
+            nxt = torch.empty(N, C, K, dtype=runner.wide, device=dev)
+            up_ids = torch.empty(N, C, K, TOP, dtype=torch.int64, device=dev)
+            down_ids = torch.empty(N, C, K, TOP, dtype=torch.int64, device=dev)
+            up_dp, up_dl, down_dp, down_dl = (torch.empty(N, C, K, TOP, dtype=runner.wide, device=dev) for _ in range(4))
+            pairs = torch.cartesian_prod(torch.arange(N, device=dev), torch.arange(C, device=dev))
             for s in range(0, len(pairs), args.rows):
-                chunk = pairs[s : s + args.rows]
-                ns = torch.tensor([n for n, _ in chunk], device=dev)
-                cs = torch.tensor([c for _, c in chunk], device=dev)
-                h = runner.edited(l, mids[l][cs], acts[l][cs], idx[ns], torch.full((len(chunk),), alpha, device=dev))
+                ns, cs = pairs[s : s + args.rows, 0], pairs[s : s + args.rows, 1]
+                R = len(ns)
+                h = runner.edited(l, mids[l][cs], acts[l][cs], idx[ns], torch.full((R,), alpha, device=dev))
                 pos = positions[ns, cs]  # [R, K]
-                at = torch.arange(len(chunk), device=dev)[:, None]
+                at = torch.arange(R, device=dev)[:, None]
                 lp_e = runner.log_probs(h[at, pos])  # [R, K, V]
                 lp_c = runner.log_probs(final[cs][at, pos])
                 delta = lp_e - lp_c
                 dp = lp_e.exp() - lp_c.exp()
-                k = (lp_c.exp() * -delta).sum(-1)
+                kl[ns, cs] = (lp_c.exp() * -delta).sum(-1)
                 upi = dp.topk(TOP, dim=-1).indices
                 dni = (-dp).topk(TOP, dim=-1).indices
-                nt = torch.where(pos + 1 < T, tokens[cs][torch.arange(len(chunk), device=dev)[:, None], (pos + 1).clamp(max=T - 1)], torch.zeros_like(pos))
+                up_ids[ns, cs], down_ids[ns, cs] = upi, dni
+                up_dp[ns, cs], up_dl[ns, cs] = dp.gather(-1, upi), delta.gather(-1, upi)
+                down_dp[ns, cs], down_dl[ns, cs] = dp.gather(-1, dni), delta.gather(-1, dni)
+                nt = tokens[cs][at, (pos + 1).clamp(max=T - 1)]
                 nd = delta.gather(-1, nt[..., None])[..., 0]
-                nd = torch.where(pos + 1 < T, nd, torch.full_like(nd, float("nan")))
-                for r, (n, c) in enumerate(chunk):
-                    kl[n, c], nxt[n, c] = k[r].cpu(), nd[r].cpu()
-                    up_ids[n, c], down_ids[n, c] = upi[r].to(torch.int32).cpu(), dni[r].to(torch.int32).cpu()
-                    up_dp[n, c], up_dl[n, c] = dp[r].gather(-1, upi[r]).cpu(), delta[r].gather(-1, upi[r]).cpu()
-                    down_dp[n, c], down_dl[n, c] = dp[r].gather(-1, dni[r]).cpu(), delta[r].gather(-1, dni[r]).cpu()
-            rec.update({f"kl_{name}": kl, f"next_{name}": nxt, f"up_ids_{name}": up_ids, f"up_dp_{name}": up_dp, f"up_dlogp_{name}": up_dl,
-                        f"down_ids_{name}": down_ids, f"down_dp_{name}": down_dp, f"down_dlogp_{name}": down_dl})
+                nxt[ns, cs] = torch.where(pos + 1 < T, nd, torch.full_like(nd, float("nan")))
+            f32 = lambda t: t.to(torch.float32).cpu()  # noqa: E731
+            rec.update({f"kl_{name}": f32(kl), f"next_{name}": f32(nxt), f"up_ids_{name}": up_ids.to(torch.int32).cpu(), f"up_dp_{name}": f32(up_dp), f"up_dlogp_{name}": f32(up_dl),
+                        f"down_ids_{name}": down_ids.to(torch.int32).cpu(), f"down_dp_{name}": f32(down_dp), f"down_dlogp_{name}": f32(down_dl)})
         # Continuations at each neuron's M largest activations in distinct contexts.
         best_c = activation.amax(-1)  # [N, C]
         where = torch.empty(N, M, 2, dtype=torch.int64)
@@ -213,7 +211,7 @@ def main():
             cs = best_c[n].topk(M).indices
             where[n, :, 0] = cs.cpu()
             where[n, :, 1] = activation[n, cs].argmax(-1).cpu()
-        clean_cont, amp_cont = continuations(runner, tokens, l, idx, where)
+        clean_cont, amp_cont = continuations(runner, tokens, l, idx, where, args.rows)
         rec.update({"where": where.to(torch.int16), "clean": clean_cont, "amplified": amp_cont})
         save_file({k: v.contiguous() for k, v in rec.items()}, str(out / f"shard_{l:02d}.safetensors"))
         meta = {"layer": l, "neurons": [[l, int(i)] for i in neurons_of[l]], "contexts": [int(r) for r in context_rows], "model": args.model,
@@ -226,41 +224,43 @@ def main():
 
 
 @torch.no_grad()
-def continuations(runner: Runner, tokens, l: int, idx, where):
+def continuations(runner: Runner, tokens, l: int, idx, where, rows: int):
     """Greedy S-token continuations after each (context, position) of `where`, without and with the
     neuron's down column multiplied by AMPLIFY, every row its own neuron, the edit applied in that row's
-    down map at every position and step (a weight edit acts everywhere). Rows are batched by prefix
-    length, so no row is padded."""
+    down map at every position and step (a weight edit acts everywhere). Prefixes are left-padded;
+    generate takes positions from the attention mask, so a padded row computes what it would alone."""
     N = where.shape[0]
-    by_length: dict[int, list[tuple[int, int]]] = {}
-    for n in range(N):
-        for m in range(M):
-            by_length.setdefault(int(where[n, m, 1]) + 1, []).append((n, m))
+    jobs = [(n, m) for n in range(N) for m in range(M)]
     outs = {}
     for alpha_name, alpha in (("clean", 1.0), ("amplified", AMPLIFY)):
         result = torch.full((N, M, S), -1, dtype=torch.int32)
-        for length, jobs in by_length.items():
-            for s in range(0, len(jobs), 64):
-                chunk = jobs[s : s + 64]
-                ids = torch.stack([tokens[int(where[n, m, 0]), :length] for n, m in chunk])
-                neuron = idx[torch.tensor([n for n, _ in chunk], device=runner.dev)]
+        for s in range(0, len(jobs), rows):
+            chunk = jobs[s : s + rows]
+            prefixes = [tokens[int(where[n, m, 0]), : int(where[n, m, 1]) + 1] for n, m in chunk]
+            width = max(len(p) for p in prefixes)
+            ids = torch.zeros(len(chunk), width, dtype=torch.long, device=runner.dev)
+            mask = torch.zeros(len(chunk), width, dtype=torch.long, device=runner.dev)
+            for r, p in enumerate(prefixes):
+                ids[r, width - len(p) :] = p
+                mask[r, width - len(p) :] = 1
+            neuron = idx[torch.tensor([n for n, _ in chunk], device=runner.dev)]
 
-                def hook(module, inputs):
-                    (x,) = inputs
-                    x = x.clone()
-                    rows = torch.arange(x.shape[0], device=x.device)
-                    x[rows, :, neuron] = x[rows, :, neuron] * alpha
-                    return (x,)
+            def hook(module, inputs):
+                (x,) = inputs
+                x = x.clone()
+                r = torch.arange(x.shape[0], device=x.device)
+                x[r, :, neuron] = x[r, :, neuron] * alpha
+                return (x,)
 
-                handle = runner.layers[l].mlp.down_proj.register_forward_pre_hook(hook) if alpha != 1.0 else None
-                try:
-                    gen = runner.model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=S, do_sample=False, pad_token_id=0)
-                finally:
-                    if handle is not None:
-                        handle.remove()
-                new = gen[:, length:].to(torch.int32).cpu()
-                for r, (n, m) in enumerate(chunk):
-                    result[n, m, : new.shape[1]] = new[r]
+            handle = runner.layers[l].mlp.down_proj.register_forward_pre_hook(hook) if alpha != 1.0 else None
+            try:
+                gen = runner.model.generate(input_ids=ids, attention_mask=mask, max_new_tokens=S, do_sample=False, pad_token_id=0)
+            finally:
+                if handle is not None:
+                    handle.remove()
+            new = gen[:, width:].to(torch.int32).cpu()
+            for r, (n, m) in enumerate(chunk):
+                result[n, m, : new.shape[1]] = new[r]
         outs[alpha_name] = result
     return outs["clean"], outs["amplified"]
 
