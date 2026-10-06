@@ -233,6 +233,33 @@ struct VpdEdits {
     export: PathBuf,
     decomposition: PathBuf,
     per_sequence: usize,
+    /// Edits scored besides the drawn ones, each `[sequence, layer, site, subcomponent, position,
+    /// α]` (`sequence` a held-out index in `EditSettings::sequences`, as the experiments' lines
+    /// name it, `site` `"mlp.c_fc"` or `"mlp.down_proj"`,
+    /// `α` one of `interchange::FACTORS`), so another implementation of the same edit is checked
+    /// against this one experiment by experiment.
+    #[serde(default)]
+    listed: Vec<(usize, usize, String, usize, usize, f64)>,
+}
+
+/// The listed edits ([`VpdEdits::listed`]) of the batch's `count` held-out sequences from held-out
+/// index `first`.
+fn listed_edits(listed: &[(usize, usize, String, usize, usize, f64)], (first, count): (usize, usize), slices: &BTreeMap<(usize, bool, usize), usize>, blocks: usize) -> Result<Vec<interchange::Experiment>, String> {
+    let mut out = Vec::new();
+    for (sequence, layer, site, index, position, alpha) in listed {
+        if !(first..first + count).contains(sequence) {
+            continue;
+        }
+        let down = match site.as_str() {
+            "mlp.down_proj" => true,
+            "mlp.c_fc" => false,
+            other => return Err(format!("edits: a listed edit of site {other}")),
+        };
+        let part = *slices.get(&(*layer, down, *index)).ok_or_else(|| format!("edits: no subcomponent {index} of layer {layer}'s {site}"))?;
+        let factor = interchange::FACTORS.iter().position(|f| f == alpha).ok_or_else(|| format!("edits: α {alpha} is not one of the factors"))?;
+        out.push(interchange::Experiment { base: sequence - first, source: sequence - first, explained: vec![true; blocks], patch: Some(interchange::Patch::FixedPart { part, factor, block: 2 * layer + 1 }), position: *position });
+    }
+    Ok(out)
 }
 
 /// Per held-out sequence of `batch` its edits of VPD's subcomponents ([`VpdEdits`]): `vpd`'s causal
@@ -379,6 +406,7 @@ fn edit_faithfulness(
         let mut drawn = experiments.sample_ops(&mut rng, &batch, &settings.families, settings.edits_per_sequence, &donors, false)?;
         if let (Some(vpd), Some(v)) = (&vpd, &settings.vpd) {
             drawn.extend(vpd_edits(&mut rng, &batch, (vpd, &slice_of), v.per_sequence, 2 * layers.len())?);
+            drawn.extend(listed_edits(&v.listed, (first + b * settings.batch_sequences, chunk.len()), &slice_of, 2 * layers.len())?);
         }
         let scored = experiments.evaluate(&batch, &drawn, false)?;
         for (e, bits) in drawn.iter().zip(&scored.bits) {
