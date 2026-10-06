@@ -1400,16 +1400,22 @@ fn separable(a: &Array2<f64>, log_sd: &Array2<f64>) -> (Array2<f64>, Array1<f64>
     (whitened, columns)
 }
 
-/// The parameters a rewrite of the functions with posterior-whitened reads `reads` (their gate rows,
-/// and up rows when gated, in the separable whitening of [`separable`]; `parts` rows per function)
-/// and whitened writes `writes` (their output columns, one row each) saves: `|S| (parts d + d′)` native
-/// entries against the body's `k (d + parts |S|) + k′ (d′ + |S|)`, with `k` and `k′` the numbers of
-/// whitened singular values above the largest singular value of a matrix of the same shape of
-/// independent unit-variance noise, `√rows + √cols` (Bai and Yin 1988): the directions the
-/// posterior resolves from its own noise.
+/// The noise-edge heuristic for a `rows × cols` matrix: `√rows + √cols`, the asymptotic largest
+/// singular value of a matrix of independent unit-variance entries (Bai and Yin 1988). It is not a
+/// finite-sample bound, and whitened posterior means are not drawn from that null: it orders
+/// proposals and certifies no rank.
+fn noise_edge(rows: usize, cols: usize) -> f64 {
+    (rows as f64).sqrt() + (cols as f64).sqrt()
+}
+
+/// A heuristic count of the parameters a rewrite of the functions with posterior-whitened reads
+/// `reads` (their gate rows, and up rows when gated, in the separable whitening of [`separable`];
+/// `parts` rows per function) and whitened writes `writes` (their output columns, one row each)
+/// saves: `|S| (parts d + d′)` native entries against the body's `k (d + parts |S|) + k′ (d′ + |S|)`,
+/// with `k` and `k′` the numbers of whitened singular values above the noise edge ([`noise_edge`]).
 fn saving(reads: &Array2<f64>, writes: &Array2<f64>, parts: usize) -> Result<f64, String> {
     let resolved_rank = |m: &Array2<f64>| -> Result<usize, String> {
-        let edge = (m.nrows() as f64).sqrt() + (m.ncols() as f64).sqrt();
+        let edge = noise_edge(m.nrows(), m.ncols());
         Ok(svd(m.view(), false).map_err(error)?.singular_values.iter().filter(|s| **s > edge).count())
     };
     let n = writes.nrows() as f64;
@@ -1419,13 +1425,14 @@ fn saving(reads: &Array2<f64>, writes: &Array2<f64>, parts: usize) -> Result<f64
 }
 
 /// The candidate regions of layer `layer`'s MLP among the native functions `pool` (those carrying
-/// flow) at `posterior` (module note): from each function a group is grown by adding, one at a
-/// time, the function whose union's rewrite saves the most parameters (`saving`), and the best
-/// group along the way is that function's candidate; the candidates that save are taken, the
-/// largest saving first, each disjoint from those before it. Parallel functions of one body read
-/// and write the same few directions, so their union saves what each alone cannot; a function
-/// reading a direction of its own adds a coordinate to each binding and is left out.
-pub fn regions(explanation: &Explanation, posterior: &Posterior, layer: usize, pool: &[usize]) -> Result<Vec<Vec<usize>>, String> {
+/// flow) at `posterior` (module note), each with its heuristic saving (`saving`), largest first:
+/// from each function a group is grown by adding, one at a time, the function whose union's rewrite
+/// saves the most, and the best group along the way is that function's candidate; the candidates
+/// are taken in order of their saving, each disjoint from those before it, and none is left out for
+/// its saving. Parallel
+/// functions of one body read and write the same few directions, so their union saves what each
+/// alone cannot; a function reading a direction of its own adds a coordinate to each binding.
+pub fn regions(explanation: &Explanation, posterior: &Posterior, layer: usize, pool: &[usize]) -> Result<Vec<(Vec<usize>, f64)>, String> {
     let program = &explanation.artifact.program;
     let mlp = format!("library.l{layer}.mlp");
     let maps: Vec<usize> = ["gate", "up"].iter().filter_map(|part| operator_named(program, &format!("{mlp}.{part}"))).collect();
@@ -1464,17 +1471,17 @@ pub fn regions(explanation: &Explanation, posterior: &Posterior, layer: usize, p
     };
     // A group's resolved read and write directions (right singular vectors above the noise edge).
     let resolved_basis = |m: &Array2<f64>| -> Result<Array2<f64>, String> {
-        let edge = (m.nrows() as f64).sqrt() + (m.ncols() as f64).sqrt();
+        let edge = noise_edge(m.nrows(), m.ncols());
         let decomposition = svd(m.view(), false).map_err(error)?;
         let k = decomposition.singular_values.iter().filter(|s| **s > edge).count();
         Ok(decomposition.vt.slice(s![..k, ..]).to_owned())
     };
     // Whether `block`'s rows lie within `basis`'s span up to noise: the largest singular value of
-    // the residual is within that of a same-shaped unit-noise block in the complement.
+    // the residual is within the noise edge of a same-shaped block in the complement.
     let within = |block: &Array2<f64>, basis: &Array2<f64>| -> Result<bool, String> {
         let residual = block - &block.dot(&basis.t()).dot(basis);
         let complement = block.ncols() - basis.nrows();
-        let edge = (block.nrows() as f64).sqrt() + (complement as f64).sqrt();
+        let edge = noise_edge(block.nrows(), complement);
         Ok(svd(residual.view(), false).map_err(error)?.singular_values.first().is_none_or(|s| *s <= edge))
     };
     // A function's block whitened in a group's column scales `c`, with its own row scales.
@@ -1527,16 +1534,16 @@ pub fn regions(explanation: &Explanation, posterior: &Posterior, layer: usize, p
             Ok(best)
         })
         .collect::<Result<_, String>>()?;
-    // The candidates that save, largest saving first, each disjoint from those taken.
+    // The candidates, largest saving first, each disjoint from those taken.
     candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let mut taken = vec![false; n];
     let mut out = Vec::new();
     for (saved, members) in candidates {
-        if saved > 0.0 && members.iter().all(|f| !taken[*f]) {
+        if members.iter().all(|f| !taken[*f]) {
             members.iter().for_each(|f| taken[*f] = true);
             let mut region: Vec<usize> = members.iter().map(|f| functions[*f].0).collect();
             region.sort_unstable();
-            out.push(region);
+            out.push((region, saved));
         }
     }
     Ok(out)
@@ -2723,7 +2730,11 @@ mod tests {
                 for (l, site) in [(0, SITE0), (1, SITE1)] {
                     let mut expected = site.to_vec();
                     expected.sort_unstable();
-                    assert_eq!(regions(&start, &posterior, l, &pool).unwrap(), vec![expected], "layer {l} at {tokens} tokens");
+                    let found = regions(&start, &posterior, l, &pool).unwrap();
+                    // The planted copy first, the only candidate the heuristic expects to save; the
+                    // others are listed too.
+                    assert_eq!(found[0].0, expected, "layer {l} at {tokens} tokens");
+                    assert!(found.len() > 1 && found[0].1 > 0.0 && found[1..].iter().all(|(_, saved)| *saved <= 0.0), "layer {l} at {tokens} tokens: {found:?}");
                 }
             }
         }
