@@ -30,8 +30,10 @@
 
 use super::operator_program::{Node, OperatorBody, OperatorProgram, Rotary};
 use gam_gpu::gpu_error::GpuError;
+use super::device_attention::{Segment, add_rows};
 use gam_gpu::tensor::{Arithmetic, Device, Op, Storage, Tensor};
 use std::collections::BTreeSet;
+use std::ops::Range;
 
 /// The most attention weights a fused group forms at once (sequences × heads × positions²); more
 /// key heads run in turn.
@@ -454,6 +456,118 @@ fn attend_by(d: &Device, heads: &Heads, (qk, p): (&Tensor, &Tensor), blocks: usi
     Ok(a)
 }
 
+/// The rotation tables at the rows `ranges` of a call's.
+fn turn_at(d: &Device, turn: Turn<'_>, ranges: &[Range<usize>]) -> Result<Option<(Tensor, Tensor, bool)>, GpuError> {
+    turn.map(|(cos, sin, half)| Ok((d.gather_ranges(cos, ranges)?, d.gather_ranges(sin, ranges)?, half))).transpose()
+}
+
+/// Key heads at a time for one segment: every one when its weights fit.
+fn segment_step(heads: &Heads, s: &Segment) -> usize {
+    let per_key = heads.group().saturating_mul(s.rows.len()).saturating_mul(s.length()).max(1);
+    (SCORES / per_key).clamp(1, heads.keys)
+}
+
+/// [`attend`] over `segments` (`device_attention::Segment`): each segment's queries against its
+/// keys and values, the earlier positions' from its `before` rows; its reads written to its rows.
+pub(crate) fn attend_segments(d: &Device, heads: &Heads, (qk, p): (&Tensor, &Tensor), segments: &[Segment], turn: Turn<'_>, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
+    let (w, g) = (heads.width, heads.group());
+    let mut a = d.zeros(p.rows(), heads.heads * w)?;
+    for s in segments {
+        let (rows, keys) = (vec![s.rows.clone()], s.keys());
+        let (n_rows, length) = (s.rows.len(), s.length());
+        let (q_rows, k_rows, v_rows) = (d.gather_ranges(qk, &rows)?, d.gather_ranges(qk, &keys)?, d.gather_ranges(p, &keys)?);
+        let (turn_q, turn_k) = (turn_at(d, turn, &rows)?, turn_at(d, turn, &keys)?);
+        let (turn_q, turn_k) = (turn_q.as_ref().map(|(c, s, h)| (c, s, *h)), turn_k.as_ref().map(|(c, s, h)| (c, s, *h)));
+        let mut read = d.zeros(n_rows, heads.heads * w)?;
+        let step = segment_step(heads, s);
+        for first in (0..heads.keys).step_by(step) {
+            let n = step.min(heads.keys - first);
+            let q = d.split_heads(&q_rows, first * g * w, n * g, w, 1, turn_q, false)?;
+            let k = d.split_heads(&k_rows, (heads.heads + first) * w, n, w, 1, turn_k, false)?;
+            let v = split_operand(d, &v_rows, ((heads.heads + heads.keys + first) * w, n, w, 1), arithmetic)?;
+            let mut alpha = d.empty(q.rows(), length)?;
+            d.gemm_batched(n, &mut alpha, heads.scale, &q, Op::N, &k, Op::T, 0.0, arithmetic)?;
+            d.softmax_rows_period(&mut alpha, heads.causal, s.first, n_rows)?;
+            let mut out = d.empty(q.rows(), w)?;
+            d.gemm_batched(n, &mut out, 1.0, &alpha, Op::N, &v, Op::N, 0.0, arithmetic)?;
+            d.merge_heads(&out, &mut read, first * g * w, n * g, 1, None, false)?;
+        }
+        d.scatter_ranges(&mut a, &rows, &read)?;
+    }
+    Ok(a)
+}
+
+/// [`backward`] over `segments`: each segment's queries' cotangents to its rows, its keys' and
+/// values' added into the rows holding them (its own and its `before` rows).
+pub(crate) fn backward_segments(
+    d: &Device,
+    (heads, stacked): (&Heads, &Stacked),
+    (p, gained): (&Tensor, Option<&Tensor>),
+    g_a: &Tensor,
+    segments: &[Segment],
+    turn: Turn<'_>,
+    (forward, arithmetic): (Arithmetic, Arithmetic),
+) -> Result<Tensor, GpuError> {
+    let rows = p.rows();
+    let (w, g) = (heads.width, heads.group());
+    let mut g_p = d.zeros(rows, heads.columns())?;
+    let mut g_g = match (&heads.norms, gained) {
+        (Some(_), Some(_)) => Some(d.zeros(rows, heads.normed_columns())?),
+        (None, None) => None,
+        _ => return Err(GpuError::DriverCallFailed { reason: "normed heads without their gained values".into() }),
+    };
+    let qk = gained.unwrap_or(p);
+    for s in segments {
+        let (own, keys) = (vec![s.rows.clone()], s.keys());
+        let (n_rows, length) = (s.rows.len(), s.length());
+        let (q_rows, k_rows, v_rows, cot_rows) = (d.gather_ranges(qk, &own)?, d.gather_ranges(qk, &keys)?, d.gather_ranges(p, &keys)?, d.gather_ranges(g_a, &own)?);
+        let (turn_q, turn_k) = (turn_at(d, turn, &own)?, turn_at(d, turn, &keys)?);
+        let (turn_q, turn_k) = (turn_q.as_ref().map(|(c, s, h)| (c, s, *h)), turn_k.as_ref().map(|(c, s, h)| (c, s, *h)));
+        // The segment's own rows' cotangent (queries) and its keys' rows' (keys and values), in
+        // the columns of `G` for queries and keys when they are normed, else of `P`.
+        let mut on_queries = d.zeros(n_rows, if g_g.is_some() { heads.normed_columns() } else { heads.columns() })?;
+        let mut on_keys = d.zeros(length, if g_g.is_some() { heads.normed_columns() } else { heads.columns() })?;
+        let mut on_values = d.zeros(length, heads.columns())?;
+        let step = segment_step(heads, s);
+        for first in (0..heads.keys).step_by(step) {
+            let n = step.min(heads.keys - first);
+            let (q, q_half) = halves(d, &q_rows, (first * g * w, n * g, w, 1), turn_q, arithmetic)?;
+            let (k, k_half) = halves(d, &k_rows, ((heads.heads + first) * w, n, w, 1), turn_k, arithmetic)?;
+            let v = split_operand(d, &v_rows, ((heads.heads + heads.keys + first) * w, n, w, 1), arithmetic)?;
+            let cot = split_operand(d, &cot_rows, (first * g * w, n * g, w, 1), arithmetic)?;
+            let mut alpha = d.empty(q.rows(), length)?;
+            d.gemm_batched(n, &mut alpha, heads.scale, &q, Op::N, &k, Op::T, 0.0, forward)?;
+            d.softmax_rows_period(&mut alpha, heads.causal, s.first, n_rows)?;
+            let alpha_half = if arithmetic == Arithmetic::Bf16 && alpha.storage() == Storage::F32 { Some(d.bf16_copy(&alpha)?) } else { None };
+            let mut dalpha = d.empty(alpha.rows(), alpha.cols())?;
+            d.gemm_batched(n, &mut dalpha, 1.0, &cot, Op::N, &v, Op::T, 0.0, arithmetic)?;
+            let mut gv = d.empty(v.rows(), w)?;
+            d.gemm_batched(n, &mut gv, 1.0, alpha_half.as_ref().unwrap_or(&alpha), Op::T, &cot, Op::N, 0.0, arithmetic)?;
+            let ds = if alpha_half.is_some() { d.softmax_backward_bf16(&alpha, &dalpha)? } else { d.softmax_backward(&alpha, &dalpha)? };
+            drop((alpha, alpha_half, dalpha));
+            let mut gq = d.empty(q.rows(), w)?;
+            d.gemm_batched(n, &mut gq, heads.scale, &ds, Op::N, k_half.as_ref().unwrap_or(&k), Op::N, 0.0, arithmetic)?;
+            let mut gk = d.empty(k.rows(), w)?;
+            d.gemm_batched(n, &mut gk, heads.scale, &ds, Op::T, q_half.as_ref().unwrap_or(&q), Op::N, 0.0, arithmetic)?;
+            d.merge_heads(&gq, &mut on_queries, first * g * w, n * g, 1, turn_q, true)?;
+            d.merge_heads(&gk, &mut on_keys, (heads.heads + first) * w, n, 1, turn_k, true)?;
+            d.merge_heads(&gv, &mut on_values, (heads.heads + heads.keys + first) * w, n, 1, None, false)?;
+        }
+        let target = g_g.as_mut().unwrap_or(&mut g_p);
+        add_rows(d, target, &own, &on_queries)?;
+        add_rows(d, target, &keys, &on_keys)?;
+        add_rows(d, &mut g_p, &keys, &on_values)?;
+    }
+    if let (Some(g_g), Some(norms), Some(gains)) = (g_g, &heads.norms, &stacked.gains) {
+        let mut g_n = d.empty(rows, heads.normed_columns())?;
+        d.scale_columns(&mut g_n, &g_g, gains, false)?;
+        let per_head = rows * (heads.heads + heads.keys);
+        let g_qk = d.rms_norm_backward(&queries_and_keys(d, heads, p, true)?, &g_n.reshape(per_head, w)?, norms.epsilon)?;
+        d.set_columns(&mut g_p, 0, &g_qk.reshape(rows, heads.normed_columns())?)?;
+    }
+    Ok(g_p)
+}
+
 /// The cotangent of `P` given `A`'s, `g_a`, from `P` and (normed) `G`; the weights are recomputed
 /// in the forward's arithmetic, `forward`, the products run in `arithmetic`.
 pub(crate) fn backward(
@@ -865,6 +979,71 @@ mod tests {
                         assert!(worst(&x, &cpu.values[program.output]) > 1e-3, "the edits change the output");
                     }
                 }
+            }
+        }
+    }
+
+    /// A layer's heads run fused over segments against the layer over whole sequences: sequence 1
+    /// equals sequence 0 before its third row and runs from there on, its earlier keys sequence
+    /// 0's rows. Its outputs, the cotangents of every operator and of the input (sequence 1's
+    /// earlier rows' added to sequence 0's, the rows the segment reads in their place), and the
+    /// tangent pass along every operator equal the whole-sequence pass's, with and without normed
+    /// queries and keys and a rotation.
+    #[test]
+    fn fused_heads_over_segments_are_the_whole_sequences() {
+        use crate::device_attention::Segment;
+        let first = 2;
+        for (heads, keys, normed, rotary) in [(4, 2, false, None), (4, 2, true, Some(Rotary { base: 10_000, dims: 4, half_split: true })), (3, 3, true, None)] {
+            let (program, mut family) = layer_normed(heads, keys, rotary, true, normed);
+            let SlotValues::Raw(x) = &mut family.slots[0] else { panic!("raw rows") };
+            for r in 0..first {
+                let row = x.row(r).to_owned();
+                x.row_mut(LENGTH + r).assign(&row);
+            }
+            let x = x.clone();
+            let layout = family.layout.clone().expect("a layout");
+            let kept: Vec<usize> = (0..SEQUENCES * LENGTH).filter(|r| r / LENGTH != 1 || r % LENGTH >= first).collect();
+            let call = |a: &Array2<f64>| a.select(ndarray::Axis(0), &kept);
+            let segmented = FamilyInputs {
+                rows: kept.len(),
+                slots: vec![SlotValues::Raw(call(&x))],
+                layout: Some(SequenceLayout { sequence: kept.iter().map(|r| layout.sequence[*r]).collect(), position: kept.iter().map(|r| layout.position[*r]).collect() }),
+            };
+            let segments = Arc::new(vec![
+                Segment { rows: 0..LENGTH, first: 0, before: vec![] },
+                Segment { rows: LENGTH..2 * LENGTH - first, first, before: vec![0..first] },
+                Segment { rows: 2 * LENGTH - first..3 * LENGTH - first, first: 0, before: vec![] },
+            ]);
+            let seed = Array2::from_shape_fn((SEQUENCES * LENGTH, D), |(r, c)| if r / LENGTH == 1 && r % LENGTH < first { 0.0 } else { noise(7000 + r * D + c) });
+            let trainable: Vec<usize> = (0..program.operators.len()).filter(|op| matches!(program.operators[*op].body, OperatorBody::Dense { .. }) && program.operators[*op].diagonal().is_none()).collect();
+            let mut backends = devices();
+            backends.extend(Device::single_precision(gam_gpu::GpuPolicy::Auto).expect("a probe"));
+            for device in backends {
+                let (tolerance, arithmetic) = if device.float64() { (1e-10, Arithmetic::F64) } else { (1e-4, Arithmetic::F32) };
+                let mut lowered = DeviceProgram::compile_values(&device, &program).expect("compile");
+                lowered.set_arithmetic(arithmetic);
+                assert!(lowered.fused_groups() > 0, "the heads run fused");
+                let close = |what: &str, got: &Array2<f64>, want: &Array2<f64>| {
+                    let scale = want.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+                    let error = (got - want).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+                    assert!(error <= tolerance * scale, "{} {heads}/{keys} normed {normed}: {what} differs by {error}", device.name());
+                };
+                let whole = lowered.forward(&family).expect("whole");
+                let parts = lowered.forward_span_segments(&segmented, None, program.output, |_, _| Ok(None), Arc::clone(&segments)).expect("segments");
+                close("output", &device.download(parts.value(program.output).expect("value")).expect("download"), &call(&device.download(whole.value(program.output).expect("value")).expect("download")));
+                let up = |a: &Array2<f64>| device.upload(a.view()).expect("upload");
+                let (whole_nodes, whole_gradients) = lowered.vjp_values_dense(&whole, BTreeMap::from([(program.output, up(&seed))]), &[0], &trainable, arithmetic).expect("whole reverse");
+                let (part_nodes, part_gradients) = lowered.vjp_values_dense(&parts, BTreeMap::from([(program.output, up(&call(&seed)))]), &[0], &trainable, arithmetic).expect("segment reverse");
+                for op in &trainable {
+                    close("an operator's gradient", &device.download(&part_gradients[op]).expect("download"), &device.download(&whole_gradients[op]).expect("download"));
+                }
+                let mut g = device.download(&whole_nodes[&0]).expect("download");
+                for r in 0..first {
+                    let row = g.row(LENGTH + r).to_owned();
+                    let mut target = g.row_mut(r);
+                    target += &row;
+                }
+                close("the input's cotangent", &device.download(&part_nodes[&0]).expect("download"), &call(&g));
             }
         }
     }

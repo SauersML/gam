@@ -1677,6 +1677,17 @@ impl Device {
         }
     }
 
+    /// In place, each row of `scores` to its softmax, the rows taken in runs of `period` (a head's
+    /// queries of one batch of [`Device::gemm_batched`]): when `causal`, row `r` reads only columns
+    /// `j ≤ start + r mod period`, the rest zero. A segment's queries at positions
+    /// `start..start + period` against its keys at positions `0..` (columns).
+    pub fn softmax_rows_period(&self, scores: &mut Tensor, causal: bool, start: usize, period: usize) -> Result<(), GpuError> {
+        if scores.cols == 0 || period == 0 || scores.rows % period != 0 || (causal && start.saturating_add(period) > scores.cols) {
+            return Err(shape(format!("attention scores {:?} in runs of {period} from position {start}", scores.dim())));
+        }
+        self.softmax_rows_impl(scores, causal, start, period)
+    }
+
     /// Softmax of a rectangular query tile against a sequence's keys, preserving its causal
     /// offset. Noncausal rows can have any batch/vocabulary shape.
     pub fn softmax_rows_offset(&self, scores: &mut Tensor, causal: bool, start: usize) -> Result<(), GpuError> {

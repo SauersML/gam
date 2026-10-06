@@ -25,6 +25,7 @@
 //! low-rank operators, pointwise laws, Hadamard products, RMS norms, attention, and the head.
 //! Any other node refuses the whole program with its reason; its caller then runs on the CPU.
 
+use super::device_attention::Segment;
 use super::device_heads::{self, Buffer, Heads, Stacked};
 use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorBody, OperatorProgram, Rotary, SlotValues};
 use gam_gpu::tensor::{Arithmetic, Device, Indices, Op, PointwiseLaw, Storage, Tensor};
@@ -279,6 +280,30 @@ struct PreparedBatch {
     blocks: usize,
     rotations: Arc<Vec<(Rotary, Tensor, Tensor)>>,
     positions: Arc<Vec<u32>>,
+    /// Whether its sequences are runs of positions of any length ([`DeviceProgram::forward_span_segments`]).
+    segmented: bool,
+}
+
+/// `segments` cover rows `0..rows` in order, each run's rows at consecutive positions `p..` and
+/// its `before` rows, `first` of them within the rows, at positions `p − first..p` in order.
+fn check_segments(segments: &[Segment], positions: &[u32], rows: usize) -> Result<(), String> {
+    let mut next = 0;
+    for s in segments {
+        let position = |r: usize| positions.get(r).map(|p| *p as usize);
+        let p = position(s.rows.start).unwrap_or(0);
+        if s.rows.is_empty() || s.rows.start != next || s.rows.end > rows || p < s.first || (s.rows.start..s.rows.end).enumerate().any(|(i, r)| position(r) != Some(p + i)) {
+            return Err("device: segments that are not the rows' runs of their positions in order".into());
+        }
+        let before: Vec<usize> = s.before.iter().flat_map(Clone::clone).collect();
+        if before.len() != s.first || before.iter().enumerate().any(|(i, &r)| r >= rows || position(r) != Some(p - s.first + i)) {
+            return Err("device: a segment's earlier rows are not its positions before its first".into());
+        }
+        next = s.rows.end;
+    }
+    if next != rows {
+        return Err("device: segments that do not cover the rows".into());
+    }
+    Ok(())
 }
 
 /// A fused group's buffers in a trace (`device_heads`): `P`, `N` and `G` when its queries and
@@ -322,6 +347,9 @@ pub struct DeviceTrace {
     rotations: Arc<Vec<(Rotary, Tensor, Tensor)>>,
     /// Per row its position in its sequence (empty without a layout).
     positions: Arc<Vec<u32>>,
+    /// The rows as runs of sequences' positions, when the pass was given them
+    /// ([`DeviceProgram::forward_span_segments`]).
+    segments: Option<Arc<Vec<Segment>>>,
     /// Per affine node and argument it read sparsely, the argument's columns it read ([`Active`]).
     active: BTreeMap<(usize, usize), Active>,
     /// Bfloat16 copies of node values a bfloat16 forward pass's and the reverse passes' products read
@@ -525,12 +553,15 @@ enum Reuse<'a> {
 struct Span {
     entry: Option<(usize, Tensor)>,
     end: usize,
+    /// The rows as runs of sequences' positions whose earlier keys are other rows
+    /// ([`DeviceProgram::forward_span_segments`]).
+    segments: Option<Arc<Vec<Segment>>>,
 }
 
 impl Span {
     /// Every node.
     fn all() -> Self {
-        Self { entry: None, end: usize::MAX }
+        Self { entry: None, end: usize::MAX, segments: None }
     }
 }
 
@@ -1140,7 +1171,7 @@ impl DeviceProgram {
 
     /// The family's blocks and rotation tables: every sequence one contiguous block of equal
     /// length, positions strictly increasing within it.
-    fn prepared_batch(&self, family: &FamilyInputs) -> Result<Arc<PreparedBatch>, String> {
+    fn prepared_batch(&self, family: &FamilyInputs, segmented: bool) -> Result<Arc<PreparedBatch>, String> {
         let mut cached = self.batch.lock().map_err(|_| "device: poisoned batch cache".to_string())?;
         if let Some(saved) = cached.as_ref() {
             let same_layout = match (&saved.layout, &family.layout) {
@@ -1149,13 +1180,14 @@ impl DeviceProgram {
                 _ => false,
             };
             if saved.rows == family.rows
+                && saved.segmented == segmented
                 && same_layout
                 && saved.tokens.iter().all(|(slot, tokens)| matches!(family.slots.get(*slot), Some(SlotValues::Tokens(current)) if current == tokens))
             {
                 return Ok(Arc::clone(saved));
             }
         }
-        let (blocks, rotations) = self.layout(family)?;
+        let (blocks, rotations) = self.layout(family, segmented)?;
         let mut tokens = BTreeMap::new();
         let mut ids = BTreeMap::new();
         for step in &self.steps {
@@ -1173,12 +1205,14 @@ impl DeviceProgram {
             }
         }
         let positions = Arc::new(family.layout.as_ref().map(|l| l.position.clone()).unwrap_or_default());
-        let saved = Arc::new(PreparedBatch { rows: family.rows, layout: family.layout.clone(), tokens, ids, blocks, rotations: Arc::new(rotations), positions });
+        let saved = Arc::new(PreparedBatch { rows: family.rows, layout: family.layout.clone(), tokens, ids, blocks, rotations: Arc::new(rotations), positions, segmented });
         *cached = Some(Arc::clone(&saved));
         Ok(saved)
     }
 
-    fn layout(&self, family: &FamilyInputs) -> Result<(usize, Vec<(Rotary, Tensor, Tensor)>), String> {
+    /// With `segmented` the sequences need not be of one length (each a run of its positions,
+    /// [`Self::forward_span_segments`]), and the batch is one block.
+    fn layout(&self, family: &FamilyInputs, segmented: bool) -> Result<(usize, Vec<(Rotary, Tensor, Tensor)>), String> {
         let rotaries: Vec<Rotary> = {
             let mut list: Vec<Rotary> = Vec::new();
             for step in &self.steps {
@@ -1202,7 +1236,7 @@ impl DeviceProgram {
             return Err("device: layout length does not match batch".to_string());
         }
         let length = (1..=rows).find(|&l| l == rows || layout.sequence[l] != layout.sequence[0]).unwrap_or(rows);
-        if attends {
+        if attends && !segmented {
             if length == 0 || rows % length != 0 {
                 return Err(format!("device: {rows} rows are not equal sequence blocks of {length}"));
             }
@@ -1227,7 +1261,7 @@ impl DeviceProgram {
                 rotations.push((rotary, cos, sin));
             }
         }
-        Ok((if attends { rows / length } else { 1 }, rotations))
+        Ok((if attends && !segmented { rows / length } else { 1 }, rotations))
     }
 
     /// `rotary`'s cosines and sines at positions `0..span` at least (rows by position, columns by
@@ -1467,7 +1501,24 @@ impl DeviceProgram {
         edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
         let hooks = Hooks { before: None, edit: true };
-        self.forward_hooks(Some(family), given, &[], |_, _| Err("no gate".into()), false, hooks, |_, _| Ok(()), edit, Reuse::Nothing, Span { entry, end })
+        self.forward_hooks(Some(family), given, &[], |_, _| Err("no gate".into()), false, hooks, |_, _| Ok(()), edit, Reuse::Nothing, Span { entry, end, segments: None })
+    }
+
+    /// [`Self::forward_span`] on rows that are runs of sequences' positions (`segments`, in row
+    /// order, covering the rows): a run of positions `first..` reads the keys and values of its
+    /// earlier positions from its `before` rows (another sequence's that agree with it there), in
+    /// every attention node, fused or not, forward and reverse. The family's layout gives each run
+    /// its own sequence id and its positions; its sequences need not be of one length.
+    pub fn forward_span_segments(
+        &self,
+        family: &FamilyInputs,
+        entry: Option<(usize, Tensor)>,
+        end: usize,
+        edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
+        segments: Arc<Vec<Segment>>,
+    ) -> Result<DeviceTrace, String> {
+        let hooks = Hooks { before: None, edit: true };
+        self.forward_hooks(Some(family), BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, hooks, |_, _| Ok(()), edit, Reuse::Nothing, Span { entry, end, segments: Some(segments) })
     }
 
     pub fn is_streamed_head(&self, node: usize) -> bool {
@@ -1496,7 +1547,7 @@ impl DeviceProgram {
     pub fn freeze(&self, family: &FamilyInputs, given: BTreeMap<usize, Tensor>, trainable: &[usize], keep: &[usize]) -> Result<Frozen, String> {
         let trainable: BTreeSet<usize> = trainable.iter().copied().collect();
         let frozen = self.frozen_nodes(&trainable);
-        let batch = self.prepared_batch(family)?;
+        let batch = self.prepared_batch(family, false)?;
         let mut trace = self.forward_hooks(Some(family), given, &[], |_, _| Err("no gate".into()), false, Hooks { before: None, edit: false }, |_, _| Ok(()), |_, _| Ok(None), Reuse::Freeze(&frozen), Span::all())?;
         let mut read = vec![false; self.steps.len()];
         for (index, step) in self.steps.iter().enumerate() {
@@ -1555,10 +1606,13 @@ impl DeviceProgram {
         }
         let batch = match (reuse, family) {
             (Reuse::From(frozen), _) => Arc::clone(&frozen.batch),
-            (_, Some(family)) => self.prepared_batch(family)?,
+            (_, Some(family)) => self.prepared_batch(family, span.segments.is_some())?,
             (_, None) => return Err("device: a forward pass without its family".into()),
         };
         let rows = batch.rows;
+        if let Some(segments) = &span.segments {
+            check_segments(segments, &batch.positions, rows)?;
+        }
         let (entry, mut entered) = match span.entry {
             Some((node, value)) => (Some(node), Some(value)),
             None => (None, None),
@@ -1574,7 +1628,7 @@ impl DeviceProgram {
         };
         // A group runs fused unless an in-place hook or a gate may change one of its nodes, its
         // sequences are long enough for the tiled attention, or this pass does not compute its heads.
-        let tiled = Self::tiled(rows, batch.blocks);
+        let tiled = span.segments.is_none() && Self::tiled(rows, batch.blocks);
         let fusing: Vec<bool> = self
             .fused
             .iter()
@@ -1594,6 +1648,7 @@ impl DeviceProgram {
             blocks: batch.blocks,
             rotations: Arc::clone(&batch.rotations),
             positions: Arc::clone(&batch.positions),
+            segments: span.segments.clone(),
             active: BTreeMap::new(),
             rounded: Mutex::new(BTreeMap::new()),
         };
@@ -1700,7 +1755,9 @@ impl DeviceProgram {
                 Step::Attend { query, key, value: v, scale, rotary, causal } => {
                     let (q, k) = self.rotated(&trace, *query, *key, *rotary)?;
                     let v = trace.value(*v)?;
-                    if tiled {
+                    if let Some(segments) = &trace.segments {
+                        value(super::device_attention::forward_segments(d, (&q, &k, v), segments, *scale, *causal, self.arithmetic).map_err(error)?)
+                    } else if tiled {
                         value(super::device_attention::forward(d, (&q, &k, v), trace.blocks, *scale, *causal, self.arithmetic).map_err(error)?)
                     } else {
                         let alpha = self.attention(&trace, &q, &k, *scale, *causal)?;
@@ -1804,7 +1861,11 @@ impl DeviceProgram {
             None => None,
         };
         let qk = &trace.buffers[normed.map_or(projections, |(_, gained)| gained)];
-        let a = device_heads::attend(d, heads, (qk, &trace.buffers[projections]), trace.blocks, turn, self.arithmetic).map_err(error)?;
+        let a = match &trace.segments {
+            Some(segments) => device_heads::attend_segments(d, heads, (qk, &trace.buffers[projections]), segments, turn, self.arithmetic),
+            None => device_heads::attend(d, heads, (qk, &trace.buffers[projections]), trace.blocks, turn, self.arithmetic),
+        }
+        .map_err(error)?;
         let reads = Self::offer_blocks(trace, heads, (Buffer::Reads, a), edit)?;
         trace.fused[g] = Some(Buffers { projections, normed, reads });
         Ok(())
@@ -2518,7 +2579,11 @@ impl DeviceProgram {
         d.gemm(&mut g_a, 1.0, self.operand(cot, half, arithmetic)?, Op::N, reads.as_deref().unwrap_or(&group.stacked.reads), Op::N, 0.0, arithmetic).map_err(error)?;
         let turn = turn(&trace.rotations, heads.rotary)?;
         let gained = buffers.normed.map(|(_, gained)| &trace.buffers[gained]);
-        let g_p = device_heads::backward(d, (heads, &group.stacked), (&trace.buffers[buffers.projections], gained), &g_a, trace.blocks, turn, (self.arithmetic, arithmetic)).map_err(error)?;
+        let g_p = match &trace.segments {
+            Some(segments) => device_heads::backward_segments(d, (heads, &group.stacked), (&trace.buffers[buffers.projections], gained), &g_a, segments, turn, (self.arithmetic, arithmetic)),
+            None => device_heads::backward(d, (heads, &group.stacked), (&trace.buffers[buffers.projections], gained), &g_a, trace.blocks, turn, (self.arithmetic, arithmetic)),
+        }
+        .map_err(error)?;
         let mut half_p = None;
         if !wanted.is_empty() {
             let rounded = trace.rounded_value(heads.input, arithmetic)?;
@@ -2772,9 +2837,12 @@ impl DeviceProgram {
         let d = &self.device;
         let blocks = trace.blocks;
         let (q, k) = self.rotated(trace, query, key, rotary)?;
-        if Self::tile_attention(trace) {
-            let (gq, gk, gv) = super::device_attention::backward(d, (&q, &k, trace.value(value)?), cot, blocks, scale, causal, (self.arithmetic, arithmetic))
-                .map_err(error)?;
+        if trace.segments.is_some() || Self::tile_attention(trace) {
+            let (gq, gk, gv) = match &trace.segments {
+                Some(segments) => super::device_attention::backward_segments(d, (&q, &k, trace.value(value)?), cot, segments, scale, causal, (self.arithmetic, arithmetic)),
+                None => super::device_attention::backward(d, (&q, &k, trace.value(value)?), cot, blocks, scale, causal, (self.arithmetic, arithmetic)),
+            }
+            .map_err(error)?;
             return match rotary {
                 None => Ok((gq, gk, gv)),
                 Some(r) => {
@@ -2964,6 +3032,12 @@ impl DeviceProgram {
                 }
             }
         };
+        if let Some(segments) = &trace.segments {
+            let dq = dv[query].as_ref().map(&turn).transpose()?;
+            let dk = dv[key].as_ref().map(&turn).transpose()?;
+            return super::device_attention::tangent_segments(d, (&q, &k, trace.value(value)?), (dq.as_ref(), dk.as_ref(), dv[value].as_ref()), segments, scale, causal, (self.arithmetic, arithmetic))
+                .map_err(error);
+        }
         if Self::tile_attention(trace) {
             let dq = dv[query].as_ref().map(&turn).transpose()?;
             let dk = dv[key].as_ref().map(&turn).transpose()?;
