@@ -569,25 +569,6 @@ impl Device {
         Self { backend: Arc::new(Backend::Host), storage: Storage::F64 }
     }
 
-    /// Every CUDA device `policy` admits, the selected one first (data-parallel work runs one
-    /// replica per device); empty under `off` or when none exists.
-    pub fn accelerators(policy: GpuPolicy) -> Result<Vec<Self>, GpuError> {
-        #[cfg(target_os = "linux")]
-        {
-            if policy == GpuPolicy::Off {
-                return Ok(Vec::new());
-            }
-            let Some(runtime) = crate::device_runtime::GpuRuntime::resolve(policy)? else { return Ok(Vec::new()) };
-            return runtime
-                .devices
-                .iter()
-                .map(|device| Ok(Self { backend: Arc::new(Backend::Cuda(cuda::Engine::new(device.ordinal, device.name.clone())?)), storage: Storage::F64 }))
-                .collect();
-        }
-        #[cfg(not(target_os = "linux"))]
-        Ok(Self::accelerator(policy)?.into_iter().collect())
-    }
-
     /// The accelerator `policy` selects for device-resident float64 execution: a CUDA device
     /// (`auto` when one resolved, `required` or an error), `None` under `off` or when none exists.
     pub fn accelerator(policy: GpuPolicy) -> Result<Option<Self>, GpuError> {
@@ -1321,16 +1302,6 @@ impl Device {
         }
         let width = scores.cols;
         self.softmax_rows_impl(scores, causal, start, width)
-    }
-
-    /// Causal softmax of `blocks` query tiles stacked (`blocks · block_rows × L`), each the
-    /// positions `start..start + block_rows` of its own sequence's `L` keys: row `r` reads columns
-    /// `j ≤ start + r mod block_rows`, the rest become zero.
-    pub fn softmax_rows_blocks(&self, scores: &mut Tensor, block_rows: usize, start: usize) -> Result<(), GpuError> {
-        if block_rows == 0 || scores.rows % block_rows != 0 || start + block_rows > scores.cols {
-            return Err(shape(format!("causal query blocks of {block_rows} rows from {start} in {:?} scores", scores.dim())));
-        }
-        self.softmax_rows_impl(scores, true, start, block_rows)
     }
 
     fn softmax_rows_impl(&self, scores: &mut Tensor, causal: bool, start: usize, period: usize) -> Result<(), GpuError> {
