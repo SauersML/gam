@@ -33,6 +33,7 @@ use crate::{
 };
 use gam_linalg::decompose::{pseudo_inverse, svd};
 use ndarray::{Array1, Array2, Axis, s};
+use rayon::prelude::*;
 use std::sync::Arc;
 
 fn error(e: impl std::fmt::Display) -> String {
@@ -125,40 +126,50 @@ pub fn regions_through(explanation: &Explanation, posterior: &Posterior, writers
     // noise; a set as wide as the stream reads everything and saves nothing, so a function needing
     // one is taken by no set.
     let scaled: Vec<Array2<f64>> = writers.iter().map(|w| &w.writes * &column_scale.view().insert_axis(Axis(1))).collect();
-    let mut taken: std::collections::BTreeMap<Vec<usize>, Vec<usize>> = std::collections::BTreeMap::new();
-    for (f, &i) in live.iter().enumerate() {
-        let block = whitened.slice(s![f * parts..(f + 1) * parts, ..]).to_owned();
-        let mut set: Vec<usize> = Vec::new();
-        loop {
-            let span = if set.is_empty() {
-                Array2::zeros((d, 0))
-            } else {
-                let views: Vec<_> = set.iter().map(|w| scaled[*w].view()).collect();
-                basis(&ndarray::concatenate(Axis(1), &views).map_err(error)?)?
-            };
-            let residual = &block - &block.dot(&span).dot(&span.t());
-            let largest = svd(residual.view(), false).map_err(error)?.singular_values.first().copied().unwrap_or(0.0);
-            if largest <= (parts as f64).sqrt() + ((d - span.ncols()) as f64).sqrt() {
-                if !set.is_empty() {
+    // Each writer's orthonormal directions, once, and all of them side by side for one product per
+    // step: a writer's share of what is left is the energy of its block of that product.
+    let bases = scaled.iter().map(basis).collect::<Result<Vec<_>, _>>()?;
+    let offsets: Vec<usize> = std::iter::once(0).chain(bases.iter().scan(0, |at, b| {
+        *at += b.ncols();
+        Some(*at)
+    })).collect();
+    let views: Vec<_> = bases.iter().map(|b| b.view()).collect();
+    let all = ndarray::concatenate(Axis(1), &views).map_err(error)?;
+    let sets: Vec<Option<Vec<usize>>> = (0..live.len())
+        .into_par_iter()
+        .map(|f| -> Result<Option<Vec<usize>>, String> {
+            let block = whitened.slice(s![f * parts..(f + 1) * parts, ..]).to_owned();
+            let mut set: Vec<usize> = Vec::new();
+            loop {
+                let span = if set.is_empty() {
+                    Array2::zeros((d, 0))
+                } else {
+                    let views: Vec<_> = set.iter().map(|w| scaled[*w].view()).collect();
+                    basis(&ndarray::concatenate(Axis(1), &views).map_err(error)?)?
+                };
+                let residual = &block - &block.dot(&span).dot(&span.t());
+                let largest = svd(residual.view(), false).map_err(error)?.singular_values.first().copied().unwrap_or(0.0);
+                if largest <= (parts as f64).sqrt() + ((d - span.ncols()) as f64).sqrt() {
                     set.sort_unstable();
-                    taken.entry(set).or_default().push(i);
+                    return Ok((!set.is_empty()).then_some(set));
                 }
-                break;
+                let projected = residual.dot(&all);
+                let next = (0..writers.len())
+                    .filter(|w| !set.contains(w))
+                    .map(|w| (projected.slice(s![.., offsets[w]..offsets[w + 1]]).iter().map(|v| v * v).sum::<f64>(), w))
+                    .max_by(|a, b| a.0.total_cmp(&b.0));
+                let Some((_, w)) = next else { return Ok(None) };
+                set.push(w);
+                if set.iter().map(|w| writers[*w].writes.ncols()).sum::<usize>() >= d {
+                    return Ok(None);
+                }
             }
-            let next = (0..writers.len())
-                .filter(|w| !set.contains(w))
-                .map(|w| {
-                    let inside = residual.dot(&basis(&scaled[w])?);
-                    Ok((inside.iter().map(|v| v * v).sum::<f64>(), w))
-                })
-                .collect::<Result<Vec<(f64, usize)>, String>>()?
-                .into_iter()
-                .max_by(|a, b| a.0.total_cmp(&b.0));
-            let Some((_, w)) = next else { break };
-            set.push(w);
-            if set.iter().map(|w| writers[*w].writes.ncols()).sum::<usize>() >= d {
-                break;
-            }
+        })
+        .collect::<Result<_, String>>()?;
+    let mut taken: std::collections::BTreeMap<Vec<usize>, Vec<usize>> = std::collections::BTreeMap::new();
+    for (set, &i) in sets.into_iter().zip(&live) {
+        if let Some(set) = set {
+            taken.entry(set).or_default().push(i);
         }
     }
     Ok(taken.into_iter().filter(|(_, f)| f.len() > 1).collect())
