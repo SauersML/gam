@@ -187,11 +187,8 @@ TABLE=$MAC_DATA/runpod/gpu_bench.tsv
 # creation, never rewritten; the ids in LEDGER.tsv count too). Any other pod is listed by status as
 # "not ours" and never acted on, even when a record in active/ names it.
 REGISTRY=$MAC_DATA/runpod/created.tsv
-# Hosts (RunPod machine ids) whose pods did not come up or could not start CUDA.
-BAD_HOSTS=$MAC_DATA/runpod/bad_hosts
-# Data centers (RunPod's dataCenterId) where a pod never answered SSH: later pods there are deleted
-# at once, as on a failing host (two hosts behind one address, 80.15.7.37, each failed this way).
-BAD_DCS=$MAC_DATA/runpod/bad_dcs
+# A host (RunPod machine id) or data center is never banned for good: whether a new pod on it is
+# kept is decided from its record in ATTEMPTS (unit_risk), as GPU auto ranks offers.
 # One row per pod this runner created, written when the pod's attempt ends (attempt_end): date, run,
 # pod, GPU id, cloud (COMMUNITY, SECURE, THUNDER, NEBIUS), host, data center, $/h, seconds from
 # creation to the end, outcome and detail. Outcomes: worked (the command ran on it), setup failed
@@ -1058,7 +1055,7 @@ ssh_wait() {
 AUTO=0
 rank_auto() {
     local stats
-    stats=$(awk -F'\t' 'NR > 1 && $10 != "ended" && $10 != "" {
+    stats=$(awk -F'\t' 'NR > 1 && $10 != "ended" && $10 != "" && $10 != "discarded" && $11 != "host failed before" && $11 != "data center failed before" {
                 o = $4 "|" $5; c = $5; n[o]++; nc[c]++
                 if ($10 != "worked") { m[o]++; w[o] += $9; mc[c]++; wc[c] += $9 }
             }
@@ -1085,6 +1082,7 @@ rank_auto() {
     awk -F'|' -v cap="${RP_MAX_PRICE:-}" '{ over = (cap != "" && $2 + 0 > cap + 0) ? sprintf("; dropped: over RP_MAX_PRICE $%s/h", cap) : ""
                  if ($4 == "-") printf "rp-run:   %s %s $%s/h, not measured%s\n", $3, $1, $2, over
                  else printf "rp-run:   %s %s $%s/h, $%.4f per million scored tokens, $%.4f expected (an attempt fails with p = %.2f, %d attempts recorded, %d s lost per failure)%s\n", $3, $1, $2, $4, $5, $6, $8, $7, over }' <<< "$OFFERS"
+    OFFER_PER=$(cut -d'|' -f1,3,4 <<< "$OFFERS")
     OFFERS=$(cut -d'|' -f1-3 <<< "$OFFERS")
     cap_offers > /dev/null
 }
@@ -1724,18 +1722,65 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-# The end of POD's attempt, once (ATTEMPTS): OUTCOME, DETAIL, and "dc" when the data center's network
-# is the likely cause (it joins BAD_DCS). A run sharing another run's pod writes none.
+# The end of POD's attempt, once (ATTEMPTS): OUTCOME, DETAIL (a third argument, "dc" when the data
+# center's network is the likely cause, is read by no one now; the row's data center column is the
+# record unit_risk weighs). A run sharing another run's pod writes none.
 attempt_end() {  # OUTCOME DETAIL [dc]
     [ -n "$POD" ] && [ -z "$ATTEMPT_DONE" ] && (( ! GUEST )) || return 0
     ATTEMPT_DONE=1
     [ -f "$ATTEMPTS" ] || printf 'date\trun\tpod\tgpu\tcloud\thost\tdatacenter\tprice\tseconds\toutcome\tdetail\n' > "$ATTEMPTS"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$NAME" "$POD" "$ATTEMPT_GPU" "${ATTEMPT_KIND%%:*}" \
         "${POD_HOST:--}" "${POD_DC:--}" "${PRICE:--}" "$(( $(date +%s) - ${CREATED:-$(date +%s)} ))" "$1" "${2:-}" >> "$ATTEMPTS"
-    if [ "${3:-}" = dc ] && [ -n "$POD_DC" ] && ! grep -qxF "$POD_DC" "$BAD_DCS" 2> /dev/null; then
-        echo "$POD_DC" >> "$BAD_DCS"
-        say "data center $POD_DC recorded as failing ($2)"
-    fi
+}
+
+# The offer tried after KIND|GPU in OFFERS that this launch has not spent, as KIND|PRICE|GPU, or
+# nothing when it is the last.
+next_offer() {  # KIND GPU
+    local k p g seen=0
+    while IFS='|' read -r k p g; do
+        if (( seen )); then
+            [ -n "${spent[$k|$g]:-}" ] || { echo "$k|$p|$g"; return 0; }
+        elif [ "$k|$g" = "$1|$2" ]; then
+            seen=1
+        fi
+    done <<< "$OFFERS"
+}
+
+# Whether a new pod on HOST in data center DC costs more per token in expectation than the next
+# offer, by the statistics rank_auto ranks offers with: over ATTEMPTS (outcomes other than ended and
+# discarded, and not the old blocklist's own discards), a host with n attempts and m failures losing
+# w seconds fails with probability f = (m + 2 F) / (n + 2) and costs W = (w + V) / (m + 1) seconds a
+# failure, F = (M + 1) / (N + 2) and V = (U + W0) / (M + 1) its cloud's over all cards; a data center
+# alike; the pod takes the larger f of the two with its W. Its expected cost per token is
+# c (1 + f / (1 - f) W / L) (c its offer's dollars per scored token from the ranking, or its price
+# when the run names its cards; L = HOURS in seconds), the next offer's the same with its own offer
+# statistics. One failure in a data center with successes no longer bans it (12:19 10-06: one
+# missing SSH address put CA-MTL-1, 4 successes before, on a permanent list and 10 pods were
+# rejected). Prints the reason to discard the pod, or nothing (the last offer is always kept).
+unit_risk() {  # HOST DC KIND PRICE GPU
+    local next c cn
+    next=$(next_offer "$3" "$5")
+    [ -n "$next" ] || return 0
+    c=$(awk -F'|' -v o="$3|$5" '$1 "|" $2 == o && $3 != "-" { print $3 }' <<< "${OFFER_PER:-}")
+    cn=$(awk -F'|' -v o="$(cut -d'|' -f1,3 <<< "$next")" '$1 "|" $2 == o && $3 != "-" { print $3 }' <<< "${OFFER_PER:-}")
+    [ -n "$c" ] && [ -n "$cn" ] || { c=$4; cn=$(cut -d'|' -f2 <<< "$next"); }
+    awk -F'\t' -v h="$1" -v d="$2" -v cl="${3%%:*}" -v c="$c" -v cn="$cn" -v nx="$next" -v w0="$(ssh_wait)" -v L="$CAP_SECONDS" '
+        NR > 1 && $10 != "" && $10 != "ended" && $10 != "discarded" && $11 != "host failed before" && $11 != "data center failed before" {
+            fail = ($10 != "worked"); N[$5]++; M[$5] += fail; U[$5] += fail * $9
+            if (h != "" && $6 == h) { nh++; mh += fail; wh += fail * $9 }
+            if (d != "" && d != "-" && $7 == d) { nd++; md += fail; wd += fail * $9 }
+            o = $4 "|" $5; no[o]++; mo[o] += fail; wo[o] += fail * $9
+        }
+        END {
+            F = (M[cl] + 1) / (N[cl] + 2); V = (U[cl] + w0) / (M[cl] + 1)
+            fh = (mh + 2 * F) / (nh + 2); fd = (md + 2 * F) / (nd + 2)
+            if (fh >= fd) { f = fh; W = (wh + V) / (mh + 1) } else { f = fd; W = (wd + V) / (md + 1) }
+            split(nx, q, "|"); k = q[1]; sub(/:.*/, "", k); on = q[3] "|" k
+            Fn = (M[k] + 1) / (N[k] + 2); Vn = (U[k] + w0) / (M[k] + 1)
+            fn = (mo[on] + 2 * Fn) / (no[on] + 2); Wn = (wo[on] + Vn) / (mo[on] + 1)
+            this = c * (1 + f / (1 - f) * W / L); other = cn * (1 + fn / (1 - fn) * Wn / L)
+            if (this > other) printf "failure probability %.2f (host %d of %d attempts failed, data center %d of %d) makes it cost %.4f against %.4f for the next offer, %s %s", f, mh, nh, md, nd, this, other, q[3], q[1]
+        }' "$ATTEMPTS"
 }
 
 # Records POD in active/ (name gpu cloud price created owner estimate mode) and starts its watcher.
@@ -1979,8 +2024,9 @@ attach() {  # POD
 
 # A pod in stock on a host that works: reachable by SSH, its own deletion timer armed, and CUDA
 # initializing (a host whose CUDA does not start fails every program; one did, with PyTorch too). A
-# pod on a host that failed before (BAD_HOSTS), or that fails now, is deleted and the next offer
-# tried; such a host is recorded so no later run waits on it. Sets POD IP PORT VCPU PRICE.
+# pod on a host or data center whose record in ATTEMPTS makes it cost more per token in expectation
+# than the next offer (unit_risk), or that fails now, is deleted and the next offer tried; every
+# attempt's end is recorded there. Sets POD IP PORT VCPU PRICE.
 # Signals wait while a pod is created, so none can end the run between its creation and its record.
 launch() {
     local kind price gpu r code left host
@@ -2066,33 +2112,27 @@ launch() {
         [ "$(provider_of "$POD")" = runpod ] || SSH_USER=ubuntu
         POD_HOST=$host
         why=()
-        if [ -n "$host" ] && grep -qx "$host" "$BAD_HOSTS" 2> /dev/null; then
-            say "host $host failed before; deleting pod $POD"
-            why=("setup failed" "host failed before")
-        elif [ -n "$POD_DC" ] && grep -qxF "$POD_DC" "$BAD_DCS" 2> /dev/null; then
-            say "data center $POD_DC failed before; deleting pod $POD"
-            why=("setup failed" "data center failed before")
+        if risk=$(unit_risk "$host" "$POD_DC" "$kind" "$price" "$gpu") && [ -n "$risk" ]; then
+            say "host ${host:-?}${POD_DC:+ in $POD_DC}: $risk; deleting pod $POD"
+            why=("discarded" "riskier than the next offer: $risk")
         elif slow_host "$host"; then
             why=("dead network" "host slow before")
             say "host $host was slow before (download $(awk -F'\t' -v h="$host" '$2 == h { r = $3 } END { print r }' "$RP/host_rates.tsv" 2> /dev/null) MB/s, Python install $(awk -F'\t' -v h="$host" '$2 == h { r = $3 } END { print r }' "$RP/host_installs.tsv" 2> /dev/null) s): another pod costs less; deleting pod $POD"
         elif ! reach; then
-            [ -z "$host" ] || echo "$host" >> "$BAD_HOSTS"
-            say "host $host recorded as failing; deleting pod $POD"
+            say "host $host failed to come up; deleting pod $POD"
             why=("setup failed" "${REACH_WHY:-no SSH}" $REACH_DC)
         elif ! own_timer; then
             say "the pod's own cap is not armed; deleting pod $POD"
             why=("setup failed" "own cap not armed")
         elif ! on_pod 'python3 -c "import ctypes; c = ctypes.CDLL(\"libcuda.so.1\"); n = ctypes.c_int(); assert c.cuInit(0) == 0 and c.cuDeviceGetCount(ctypes.byref(n)) == 0 and n.value > 0"' < /dev/null > /dev/null 2>&1; then
-            [ -z "$host" ] || echo "$host" >> "$BAD_HOSTS"
-            say "CUDA does not initialize on host ${host:-?} ($(on_pod 'nvidia-smi --query-gpu=driver_version --format=csv,noheader' < /dev/null 2> /dev/null)); recorded as failing; deleting pod $POD"
+            say "CUDA does not initialize on host ${host:-?} ($(on_pod 'nvidia-smi --query-gpu=driver_version --format=csv,noheader' < /dev/null 2> /dev/null)); deleting pod $POD"
             why=("broken driver" "CUDA does not initialize")
         elif ! on_pod 'ls /usr/local/cuda/lib64/libnvrtc.so* > /dev/null 2>&1 || ldconfig -p | grep -q libnvrtc' < /dev/null; then
             # The device code compiles through NVRTC at run time: an image without it cannot run it.
             say "the machine has no NVRTC (libnvrtc); deleting pod $POD"
             why=("broken driver" "no NVRTC")
         elif busy=$(gpu_in_use); [ -n "$busy" ]; then
-            [ -z "$host" ] || echo "$host" >> "$BAD_HOSTS"
-            say "the GPU on host ${host:-?} is not free before the run ($busy); recorded as failing; deleting pod $POD"
+            say "the GPU on host ${host:-?} is not free before the run ($busy); deleting pod $POD"
             why=("broken driver" "GPU not free: $busy")
         elif fetch_too_slow; then
             say "deleting pod $POD"
@@ -2111,7 +2151,7 @@ launch() {
         reap "$POD" || exit 1
         POD="" IP="" PORT=""
         case ${why[1]} in
-            "host failed before"|"data center failed before"|"host slow before"|"SSH address failed before") spent[$kind|$gpu]=1 ;;
+            "riskier than the next offer"*|"host slow before"|"SSH address failed before") spent[$kind|$gpu]=1 ;;
             *)  DISCARDED=$(( ${DISCARDED:-0} + 1 ))
                 (( DISCARDED <= DISCARDS )) || { say "$DISCARDS pods discarded on failing hosts; giving up"; exit 1; } ;;
         esac
