@@ -778,14 +778,13 @@ impl Device {
         if values.len() != rows * cols {
             return Err(shape(format!("{} values for {rows}x{cols}", values.len())));
         }
-        let data = match &*self.backend {
+        match &*self.backend {
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) if self.storage == Storage::F32 => Data::Cuda32(engine.upload(values)?),
+            Backend::Cuda(engine) if self.storage == Storage::F32 => Ok(Tensor { rows, cols, data: Data::Cuda32(engine.upload(values)?) }),
             #[cfg(target_os = "macos")]
-            Backend::Metal(engine) => Data::Metal(engine.stream.upload(values)?),
-            _ => return self.upload_vec(rows, cols, values.iter().map(|v| f64::from(*v)).collect()),
-        };
-        Ok(Tensor { rows, cols, data })
+            Backend::Metal(engine) => Ok(Tensor { rows, cols, data: Data::Metal(engine.stream.upload(values)?) }),
+            _ => self.upload_vec(rows, cols, values.iter().map(|v| f64::from(*v)).collect()),
+        }
     }
 
     /// An operator's prior-group ids `ids` (one per entry, row-major, of a `rows × cols` operator)
