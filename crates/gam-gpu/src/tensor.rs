@@ -873,7 +873,9 @@ impl Device {
         if c.dim() != (a.cols, a.cols) {
             return Err(shape(format!("a {:?} Gram of a {:?} product", c.dim(), a.dim())));
         }
-        float64_only("a symmetric rank-k update", &[a, c])?;
+        if a.storage() != Storage::F64 || c.storage() != Storage::F64 {
+            return Err(GpuError::NoDeviceKernel { reason: "a symmetric rank-k update runs in float64 only".to_string() });
+        }
         match &*self.backend {
             Backend::Host => {
                 let (n, values, out) = (a.cols, host(a)?, host_mut(c)?);
