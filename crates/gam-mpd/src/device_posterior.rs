@@ -381,8 +381,7 @@ impl DevicePosterior {
     pub fn place_line(&mut self, eta: f64) -> Result<(), String> {
         let state = self.line_state.as_ref().ok_or_else(|| error("no line step awaits a measurement"))?;
         for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
-            *mean = self.fitting.copy(start).map_err(error)?;
-            self.fitting.axpy(mean, -eta, d).map_err(error)?;
+            self.fitting.axpy_from(mean, start, -eta, d).map_err(error)?;
         }
         Ok(())
     }
@@ -415,8 +414,7 @@ impl DevicePosterior {
             [(0.0, zero), (trial, one), (2.0 * trial, two)].into_iter().map(|(eta, data)| (eta, objective(eta, data))).fold((0.0, f64::INFINITY), |best, x| if x.1 < best.1 { x } else { best }).0
         };
         for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
-            *mean = self.fitting.copy(start).map_err(error)?;
-            self.fitting.axpy(mean, -eta, d).map_err(error)?;
+            self.fitting.axpy_from(mean, start, -eta, d).map_err(error)?;
         }
         self.ratio = if eta > 0.0 { eta } else { 0.5 * trial };
         self.ratio_steps += 1;
@@ -430,8 +428,7 @@ impl DevicePosterior {
     pub fn settle_line(&mut self, eta: f64, beta2: f64) -> Result<(), String> {
         let state = self.line_state.take().ok_or_else(|| error("no line step awaits a measurement"))?;
         for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
-            *mean = self.fitting.copy(start).map_err(error)?;
-            self.fitting.axpy(mean, -eta, d).map_err(error)?;
+            self.fitting.axpy_from(mean, start, -eta, d).map_err(error)?;
         }
         self.average_and_refresh(beta2)
     }
@@ -454,9 +451,7 @@ impl DevicePosterior {
         self.averaged += 1;
         let weight = (1.0 / self.averaged as f64).max(1.0 - beta2);
         for (average, mean) in self.average.iter_mut().zip(&self.mean) {
-            let mut difference = self.fitting.copy(mean).map_err(error)?;
-            self.fitting.axpy(&mut difference, -1.0, average).map_err(error)?;
-            self.fitting.axpy(average, weight, &difference).map_err(error)?;
+            self.fitting.move_toward(average, weight, mean).map_err(error)?;
         }
         self.sums = self.wide.zeros(self.sums.rows(), 3).map_err(error)?;
         self.refresh()
@@ -626,8 +621,7 @@ impl DevicePosterior {
                 let eta = if self.rho_steps < RATIO_DRAWS || !(curvature > 0.0 && slope.is_finite()) { 0.0 } else { slope / curvature };
                 self.last_eta = eta;
                 for ((mean, start), d) in self.mean.iter_mut().zip(&state.before).zip(&state.directions) {
-                    *mean = self.fitting.copy(start).map_err(error)?;
-                    self.fitting.axpy(mean, -eta, d).map_err(error)?;
+                    self.fitting.axpy_from(mean, start, -eta, d).map_err(error)?;
                 }
                 return self.average_and_refresh(ivon.beta2);
             }

@@ -144,6 +144,19 @@ extern "C" __global__ void axpy(u64 n, double alpha, const float* x, float* y) {
     GRID_STRIDE(i, n) y[i] += a * x[i];
 }
 
+extern "C" __global__ void axpy_from(u64 n, double alpha, const float* y, const float* x, float* out) {
+    float a = (float)alpha;
+    GRID_STRIDE(i, n) out[i] = y[i] + a * x[i];
+}
+
+extern "C" __global__ void move_toward(u64 n, double weight, const float* x, float* y) {
+    float w = (float)weight;
+    GRID_STRIDE(i, n) {
+        float d = x[i] - y[i];
+        y[i] += w * d;
+    }
+}
+
 extern "C" __global__ void columns_of(u64 n, u64 source_cols, u64 width, u64 start, const float* source, float* out) {
     GRID_STRIDE(i, n) out[i] = source[(i / width) * source_cols + start + i % width];
 }

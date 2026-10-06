@@ -1158,6 +1158,51 @@ impl Device {
         }
     }
 
+    /// `out ← y + α x`, written into `out` without allocating: each entry the one
+    /// [`Device::axpy`] makes of a copy of `y`.
+    pub fn axpy_from(&self, out: &mut Tensor, y: &Tensor, alpha: f64, x: &Tensor) -> Result<(), GpuError> {
+        same(x, y, "axpy from")?;
+        same(y, out, "axpy from output")?;
+        match &*self.backend {
+            Backend::Host => {
+                for ((o, yv), xv) in host_mut(out)?.iter_mut().zip(host(y)?).zip(host(x)?) {
+                    *o = yv + alpha * xv;
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.axpy_from(out, y, alpha, x),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => {
+                *out = self.copy(y)?;
+                engine.axpy(out, alpha, x)
+            }
+        }
+    }
+
+    /// `y ← y + w (x − y)`, the difference rounded to the storage first: each entry the one
+    /// [`Device::axpy`] makes adding `w` times a copy of `x` less `y` (by `axpy` with −1).
+    pub fn move_toward(&self, y: &mut Tensor, weight: f64, x: &Tensor) -> Result<(), GpuError> {
+        same(x, y, "move toward")?;
+        match &*self.backend {
+            Backend::Host => {
+                for (yv, xv) in host_mut(y)?.iter_mut().zip(host(x)?) {
+                    let d = xv - *yv;
+                    *yv += weight * d;
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.move_toward(y, weight, x),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => {
+                let mut d = self.copy(x)?;
+                engine.axpy(&mut d, -1.0, y)?;
+                engine.axpy(y, weight, &d)
+            }
+        }
+    }
+
     /// `out ← a ⊙ b`, or `out ← out + a ⊙ b` when `accumulate`.
     pub fn hadamard(&self, out: &mut Tensor, a: &Tensor, b: &Tensor, accumulate: bool) -> Result<(), GpuError> {
         same(a, b, "hadamard")?;
@@ -3084,6 +3129,17 @@ __device__ double block_max(double v, double* shared) {
 
 extern "C" __global__ void axpy(u64 n, double alpha, const double* x, double* y) {
     GRID_STRIDE(i, n) y[i] += alpha * x[i];
+}
+
+extern "C" __global__ void axpy_from(u64 n, double alpha, const double* y, const double* x, double* out) {
+    GRID_STRIDE(i, n) out[i] = y[i] + alpha * x[i];
+}
+
+extern "C" __global__ void move_toward(u64 n, double weight, const double* x, double* y) {
+    GRID_STRIDE(i, n) {
+        double d = x[i] - y[i];
+        y[i] += weight * d;
+    }
 }
 
 extern "C" __global__ void scaled_row_l2(u64 rows, u64 cols, u64 begin, u64 end,
@@ -5124,6 +5180,26 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             // SAFETY: equal-length buffers, checked by the caller.
             unsafe { self.stream.launch_builder(&f).arg(&n).arg(&alpha).input(x, storage)?.output(y, storage)?.launch(cfg_elements(n)) }
                 .gpu_ctx("tensor axpy")
+                .map(|_| ())
+        }
+
+        pub(super) fn axpy_from(&self, out: &mut Tensor, y: &Tensor, alpha: f64, x: &Tensor) -> Result<(), GpuError> {
+            let n = out.len() as u64;
+            let storage = out.storage();
+            let f = self.kernel("axpy_from", storage)?;
+            // SAFETY: equal-length buffers, checked by the caller.
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&alpha).input(y, storage)?.input(x, storage)?.output(out, storage)?.launch(cfg_elements(n)) }
+                .gpu_ctx("tensor axpy_from")
+                .map(|_| ())
+        }
+
+        pub(super) fn move_toward(&self, y: &mut Tensor, weight: f64, x: &Tensor) -> Result<(), GpuError> {
+            let n = y.len() as u64;
+            let storage = y.storage();
+            let f = self.kernel("move_toward", storage)?;
+            // SAFETY: equal-length buffers, checked by the caller.
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&weight).input(x, storage)?.output(y, storage)?.launch(cfg_elements(n)) }
+                .gpu_ctx("tensor move_toward")
                 .map(|_| ())
         }
 

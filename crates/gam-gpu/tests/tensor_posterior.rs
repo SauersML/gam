@@ -550,6 +550,37 @@ fn line_terms_are_the_group_curvatures_they_replace() {
     }
 }
 
+/// `axpy_from` and `move_toward` against the copies and `axpy`s they replace, bit for bit.
+fn moves_match_their_compositions(d: &Device) {
+    let (x, y) = (d.upload(matrix(7, 33, 11, 2.0, 0.5).view()).unwrap(), d.upload(matrix(7, 33, 12, 1.5, -0.25).view()).unwrap());
+    for alpha in [-1.0, -0.375, 0.1, 3.0] {
+        let mut out = d.zeros(7, 33).unwrap();
+        d.axpy_from(&mut out, &y, alpha, &x).unwrap();
+        let mut expected = d.copy(&y).unwrap();
+        d.axpy(&mut expected, alpha, &x).unwrap();
+        assert_eq!(d.download(&out).unwrap(), d.download(&expected).unwrap(), "{} axpy_from {alpha}", d.name());
+        let mut moved = d.copy(&y).unwrap();
+        d.move_toward(&mut moved, alpha.abs() / 4.0, &x).unwrap();
+        let mut difference = d.copy(&x).unwrap();
+        d.axpy(&mut difference, -1.0, &y).unwrap();
+        let mut expected = d.copy(&y).unwrap();
+        d.axpy(&mut expected, alpha.abs() / 4.0, &difference).unwrap();
+        assert_eq!(d.download(&moved).unwrap(), d.download(&expected).unwrap(), "{} move_toward {alpha}", d.name());
+    }
+}
+
+#[test]
+fn moves_are_the_copies_and_axpys_they_replace() {
+    moves_match_their_compositions(&Device::host());
+    if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
+        moves_match_their_compositions(&wide.with_storage(Storage::F32).expect("CUDA holds f32"));
+        moves_match_their_compositions(&wide);
+    }
+    if let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault") {
+        moves_match_their_compositions(&metal);
+    }
+}
+
 #[test]
 fn removal_sums_on_the_host_match_their_formulas() {
     let host = Device::host();
