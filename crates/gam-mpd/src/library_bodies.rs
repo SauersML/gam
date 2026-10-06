@@ -337,6 +337,15 @@ pub fn rewrite(explanation: &Explanation, layer: usize, functions: &[usize]) -> 
             }
             retired.push(g);
         }
+        // A block another site also reads (a read-write tie's later gate row, read transposed by the
+        // earlier layer) is not the MLP's alone: zeroing it here would change that site.
+        let operator = |part: &str| format!("{mlp}.{part}");
+        let shared = explanation.artifact.owners.iter().any(|o| {
+            o.site != mlp && parts.iter().any(|part| o.operator == operator(part)) && (if o.operator == operator("out") { o.cols.contains(&i) } else { o.rows.contains(&i) })
+        });
+        if shared {
+            return Err(format!("{mlp} function {i} has a block another site reads"));
+        }
     }
     let gate = operator_index(program, &format!("{mlp}.gate"))?;
     let (gate_bias, up_bias) = (operator_named(program, &format!("{mlp}.gate_bias")), operator_named(program, &format!("{mlp}.up_bias")));
@@ -2932,5 +2941,15 @@ mod tests {
             }
         }
         assert_eq!(carried.active, fresh.active);
+    }
+
+    #[test]
+    fn a_row_another_site_reads_is_not_rewritten() {
+        let (native, layers, _, _) = tiny("bodies_tied_row", "gelu_tanh", false);
+        let start = explanation(&native, &layers).unwrap();
+        // Layer 0's function 3 writes along layer 1's function 5's gate row (a read-write tie).
+        let tied = crate::library_sharing::tie(&start, &[crate::library_sharing::Tie { source: (0, 3), target: (1, 5), scale: 0.5 }]).unwrap();
+        assert!(rewrite(&tied, 1, &[4, 5, 6]).is_err(), "the tied gate row is read by layer 0 too");
+        assert!(rewrite(&tied, 1, &[4, 6, 7]).is_ok());
     }
 }
