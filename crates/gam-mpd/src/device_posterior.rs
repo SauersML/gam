@@ -38,7 +38,7 @@ use crate::{
 };
 use gam_gpu::{
     gpu_error::GpuError,
-    tensor::{CrossStep, Device, GroupMap, PosteriorStep, Storage, Tensor},
+    tensor::{Device, GroupMap, PosteriorStep, Storage, Tensor},
 };
 use ndarray::Array2;
 use std::{borrow::Borrow, collections::BTreeMap};
@@ -142,18 +142,6 @@ pub struct DevicePosterior {
     /// whose arrays are not these ([`Shared::same`]; a removal trial shares the operators it does
     /// not change, and a write to a shared array copies it).
     uploaded: Vec<Option<(Shared, Shared)>>,
-    /// The cross-fitted step's state when the A/B arm is on ([`DevicePosterior::cross_fit`]).
-    crossed: Option<Crossed>,
-}
-
-/// The cross-fitted step's state ([`Device::posterior_ivon_crossed`]): per operator the second
-/// half's momentum (the first half's is IVON's momentum) and the gradients' second moment, each
-/// half's weights `(W, W2)` and the second moment's bias correction.
-struct Crossed {
-    second: Vec<Tensor>,
-    power: Vec<Tensor>,
-    halves: Vec<[(f64, f64); 2]>,
-    power_weights: Vec<f64>,
 }
 
 /// Each trainable operator's entries' groups, row-major.
@@ -313,7 +301,6 @@ impl DevicePosterior {
             tokens,
             steps,
             uploaded: Vec::new(),
-            crossed: None,
         };
         out.average = out.mean.iter().map(|m| out.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
         out.refresh()?;
@@ -357,23 +344,6 @@ impl DevicePosterior {
     /// The ratio `r̄` of the averaged fresh slope to the averaged own slope (zero before a draw).
     fn slope_ratio(&self) -> f64 {
         if self.slope.1 > 0.0 { self.slope.0 / self.slope.1 } else { 0.0 }
-    }
-
-    /// Turns on the cross-fitted step (A/B arm, `library_mdl::Settings::cross_fit`;
-    /// [`Device::posterior_ivon_crossed`]): every operator's two momenta and second moment start at
-    /// zero with no weight, IVON's momentum becoming the first half's. The arm's state is not
-    /// checkpointed, so a fit with it does not resume.
-    pub fn cross_fit(&mut self) -> Result<(), String> {
-        let zeros = |m: &Tensor| self.fitting.zeros(m.rows(), m.cols()).map_err(error);
-        let second = self.mean.iter().map(zeros).collect::<Result<Vec<_>, _>>()?;
-        let power = self.mean.iter().map(zeros).collect::<Result<Vec<_>, _>>()?;
-        for (i, m) in self.mean.iter().enumerate() {
-            self.moments[i][0] = zeros(m)?;
-            self.weights[i] = 0.0;
-        }
-        let count = self.mean.len();
-        self.crossed = Some(Crossed { second, power, halves: vec![[(0.0, 0.0); 2]; count], power_weights: vec![0.0; count] });
-        Ok(())
     }
 
     /// The steps taken.
@@ -528,26 +498,15 @@ impl DevicePosterior {
         // The kernel leaves the iterate and writes IVON's full step from it as the direction.
         let mut sums = self.wide.zeros(self.group_count(), 5).map_err(error)?;
         let mut directions = Vec::with_capacity(self.mean.len());
-        // The half a cross-fitted step's gradient joins: alternate steps alternate halves.
-        let half = usize::from(self.steps % 2 == 0);
         for (i, &op) in self.operators.iter().enumerate() {
             let [momentum, curvature] = &mut self.moments[i];
             let mut direction = self.fitting.empty(self.mean[i].rows(), self.mean[i].cols()).map_err(error)?;
             let inputs = (gradients.get(&op), factor.0.get(&op), prior.get(&op));
-            if let Some(crossed) = self.crossed.as_mut() {
-                let step = CrossStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, beta1: ivon.beta1, beta2: ivon.beta2, half, halves: crossed.halves[i], power: crossed.power_weights[i] };
-                let state = [momentum, &mut crossed.second[i], &mut crossed.power[i], curvature];
-                self.fitting
-                    .posterior_ivon_crossed((&self.mean[i], &mut self.log_sd[i]), state, inputs, (&self.groups[i], &self.variance), (&mut direction, &mut sums), &step)
-                    .map_err(error)?;
-                (crossed.halves[i], crossed.power_weights[i]) = (step.halves_after(), step.power_after());
-            } else {
-                let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, beta1: ivon.beta1, beta2: ivon.beta2, weight: self.weights[i] };
-                self.fitting
-                    .posterior_ivon((&self.mean[i], &mut self.log_sd[i]), [momentum, curvature], inputs, (&self.groups[i], &self.variance), (&mut direction, &mut sums), &step)
-                    .map_err(error)?;
-                self.weights[i] = step.correction();
-            }
+            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, beta1: ivon.beta1, beta2: ivon.beta2, weight: self.weights[i] };
+            self.fitting
+                .posterior_ivon((&self.mean[i], &mut self.log_sd[i]), [momentum, curvature], inputs, (&self.groups[i], &self.variance), (&mut direction, &mut sums), &step)
+                .map_err(error)?;
+            self.weights[i] = step.correction();
             directions.push(direction);
         }
         {
@@ -688,11 +647,6 @@ impl DevicePosterior {
             self.log_sd[i] = self.fitting.upload(posterior.log_sd[i].view()).map_err(error)?;
             self.moments[i][0] = self.fitting.zeros(rows, cols).map_err(error)?;
             self.weights[i] = 0.0;
-            if let Some(crossed) = self.crossed.as_mut() {
-                crossed.second[i] = self.fitting.zeros(rows, cols).map_err(error)?;
-                crossed.power[i] = self.fitting.zeros(rows, cols).map_err(error)?;
-                (crossed.halves[i], crossed.power_weights[i]) = ([(0.0, 0.0); 2], 0.0);
-            }
             self.uploaded[i] = Some((posterior.mean[i].clone(), posterior.log_sd[i].clone()));
         }
         self.restart()

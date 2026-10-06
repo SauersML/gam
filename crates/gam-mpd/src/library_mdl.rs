@@ -1407,20 +1407,15 @@ pub struct Settings {
     /// `objective_bits`) are the steps' own, so in bfloat16. Off by default; its A/B decides.
     #[serde(default)]
     pub train_bf16: bool,
-    /// A/B arm, to be deleted with the losing arm after its paired test: when set, the mean's
-    /// gradient is cross-fitted, two momenta of alternate steps each weighted by the other's ratio
-    /// of signal to noise (`DevicePosterior::cross_fit`, `gam_gpu::tensor::Device::posterior_ivon_crossed`).
-    /// The arm's state is not checkpointed: a fit with it does not resume.
-    #[serde(default)]
-    pub cross_fit: bool,
 }
 
 /// [`Settings`] as configs and checkpoints hold them, unknown keys refused, and the keys of steps
 /// the fit no longer has accepted and dropped: `rate` (IVON's fixed fraction of the Newton step,
 /// replaced by the line step), `trust_rate`, `line_search`, `split_filter`,
 /// `deterministic` (the 2^16 and 2^24 A/B arms), `decoder`, `half_factor` (now the step's),
-/// `one_sample` and `rotated` (the rotated posterior of f80fd69565, which its A/B in 1a8361c2c8
-/// retired), so that configs and checkpoints written before still read.
+/// `one_sample`, `rotated` (the rotated posterior of f80fd69565, which its A/B in 1a8361c2c8
+/// retired) and `cross_fit` (4948bbc723's cross-fitted mean step, which its paired A/B retired), so
+/// that configs and checkpoints written before still read.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettingsRecord {
@@ -1447,7 +1442,7 @@ struct SettingsRecord {
     #[serde(default)]
     train_bf16: bool,
     #[serde(default)]
-    cross_fit: bool,
+    cross_fit: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     rate: Option<serde::de::IgnoredAny>,
     #[serde(default)]
@@ -1470,7 +1465,7 @@ struct SettingsRecord {
 
 impl From<SettingsRecord> for Settings {
     fn from(r: SettingsRecord) -> Self {
-        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some()), ("preconditioned", r.preconditioned.is_some()), ("half_factor", r.half_factor.is_some()), ("one_sample", r.one_sample.is_some()), ("rotated", r.rotated.is_some()), ("beta1", r.beta1.is_some()), ("epoch_ratio", r.epoch_ratio.is_some()), ("momentum_rule", r.momentum_rule.is_some())];
+        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some()), ("preconditioned", r.preconditioned.is_some()), ("half_factor", r.half_factor.is_some()), ("one_sample", r.one_sample.is_some()), ("rotated", r.rotated.is_some()), ("beta1", r.beta1.is_some()), ("epoch_ratio", r.epoch_ratio.is_some()), ("momentum_rule", r.momentum_rule.is_some()), ("cross_fit", r.cross_fit.is_some())];
         for (key, present) in retired {
             if present {
                 log::info!("library settings: the retired key `{key}` is ignored");
@@ -1486,7 +1481,6 @@ impl From<SettingsRecord> for Settings {
             full_antithetic: r.full_antithetic,
             seed_bf16: r.seed_bf16,
             train_bf16: r.train_bf16,
-            cross_fit: r.cross_fit,
         }
     }
 }
@@ -3217,12 +3211,6 @@ pub fn fit_from(
         device_posterior.settle()?;
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
-    if settings.cross_fit {
-        if !fresh {
-            return Err("the cross-fit arm (Settings::cross_fit) keeps no checkpoint of its state, so it does not resume".into());
-        }
-        device_posterior.cross_fit()?;
-    }
     // The curvature estimate `h` estimates the Gauss–Newton diagonal per token of the whole
     // training collection, the mean of its `B` batches' diagonals. `β₂ = 1 − 1/B` makes its running
     // average span about one pass, so each batch weighs about once whatever the batch size. One
@@ -4455,7 +4443,6 @@ mod tests {
             full_antithetic: false,
             seed_bf16: false,
             train_bf16: false,
-            cross_fit: false,
         }
     }
 
