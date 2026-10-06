@@ -47,12 +47,14 @@
 //!
 //! Attention is causal, so a patched or edited path's rows before its position `t₀` equal those of
 //! the path it forked from at every block both run alike (the same hybrid, no edit of the other):
-//! a lane holding such a path is a suffix lane (`Lane::prefix`). At an MLP block (odd), whose rules
-//! act on each row alone, its call takes only its rows from `t₀` on, as one-row sequences at their
-//! positions, and its rows before `t₀` are copied from that path's lane after the block; the
-//! reverse pass adds their cotangents to that lane's rows before the block's reverse, through which
-//! they reach the parameters as the copied rows' own computation would. An attention block takes
-//! the whole lane, its rows before `t₀` serving as keys and values of the later ones.
+//! a lane holding such a path is a suffix lane (`Lane::prefix`). At every block its call takes
+//! only its rows from `t₀` on, and its rows before `t₀` are copied from that path's lane after the
+//! block; the reverse pass adds their cotangents to that lane's rows before the block's reverse,
+//! through which they reach the parameters as the copied rows' own computation would. At an
+//! attention block the call runs as segments (`device_attention::Segment`,
+//! `DeviceProgram::forward_span_segments`): a suffix lane's queries read the keys and values of its
+//! positions before `t₀` from its twin's rows in the same call ([`Plan::before`]), and their
+//! cotangents go to those rows.
 //!
 //! A block's reverse needs its forward's tape (the block's intermediate values), which holds many
 //! times the rows of the stream entering it. A call keeps its tape while the tapes kept so far,
@@ -1459,6 +1461,24 @@ pub trait BlockEngine {
         tokens: &[&[u32]],
         edits: Option<&Edits>,
         keep: bool,
+    ) -> Result<Option<Self::Tape>, String> {
+        self.forward_before(block, stream, ranges, &vec![Vec::new(); ranges.len()], tokens, edits, keep)
+    }
+
+    /// [`BlockEngine::forward`] where a range may hold its sequence's rows from a position on (a
+    /// suffix lane, `Plan::range`): `before`, per range, the call's rows (laid out one range after
+    /// another) holding the keys of its positions before its first row (`Plan::before`), empty
+    /// for a whole sequence.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_before(
+        &self,
+        block: usize,
+        stream: &mut Tensor,
+        ranges: &[Range<usize>],
+        before: &[Vec<Range<usize>>],
+        tokens: &[&[u32]],
+        edits: Option<&Edits>,
+        keep: bool,
     ) -> Result<Option<Self::Tape>, String>;
 
     /// The reverse of block `block` from its tape, its products in `arithmetic` (a pass may run in
@@ -1526,24 +1546,28 @@ fn family(tokens: &[&[u32]]) -> FamilyInputs {
     FamilyInputs { rows: ids.len(), slots: vec![SlotValues::Tokens(ids)], layout: Some(SequenceLayout { sequence, position }) }
 }
 
-/// The family of a call's rows: whole sequences, or where a range holds a sequence's rows from a
-/// position on (a suffix lane at an MLP block, [`Plan::range`]), every row its own sequence at its
-/// position (an MLP block's rules act on each row alone, `Node::Select` reads the position).
-fn ranges_family(block: usize, ranges: &[Range<usize>], tokens: &[&[u32]]) -> Result<FamilyInputs, String> {
-    if ranges.iter().zip(tokens).all(|(r, t)| r.len() == t.len()) {
-        return Ok(family(tokens));
+/// The family and segments of a call's rows where a range holds a sequence's rows from a position
+/// on (a suffix lane, [`Plan::range`]): each range its own sequence at its positions, a segment
+/// whose earlier keys are its `before` rows; `None` when every range is a whole sequence.
+fn segments(ranges: &[Range<usize>], before: &[Vec<Range<usize>>], tokens: &[&[u32]]) -> Result<Option<(FamilyInputs, Vec<crate::device_attention::Segment>)>, String> {
+    if ranges.iter().zip(tokens).all(|(r, t)| r.len() == t.len()) && before.iter().all(Vec::is_empty) {
+        return Ok(None);
     }
-    if block % 2 == 0 {
-        return Err(error("an attention block's call over part of a sequence"));
+    if before.len() != ranges.len() {
+        return Err(error("a call's earlier keys for another number of ranges"));
     }
     let rows: usize = ranges.iter().map(ExactSizeIterator::len).sum();
-    let (mut ids, mut position) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
-    for (r, t) in ranges.iter().zip(tokens) {
-        let start = t.len().checked_sub(r.len()).ok_or_else(|| error("a range longer than its sequence"))?;
-        ids.extend_from_slice(&t[start..]);
-        position.extend(start as u32..t.len() as u32);
+    let (mut ids, mut sequence, mut position, mut out) = (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(ranges.len()));
+    let mut at = 0;
+    for (i, (r, t)) in ranges.iter().zip(tokens).enumerate() {
+        let first = t.len().checked_sub(r.len()).ok_or_else(|| error("a range longer than its sequence"))?;
+        ids.extend_from_slice(&t[first..]);
+        sequence.extend(std::iter::repeat_n(i as u32, r.len()));
+        position.extend(first as u32..t.len() as u32);
+        out.push(crate::device_attention::Segment { rows: at..at + r.len(), first, before: before[i].clone() });
+        at += r.len();
     }
-    Ok(FamilyInputs { rows, slots: vec![SlotValues::Tokens(ids)], layout: Some(SequenceLayout { sequence: (0..rows as u32).collect(), position }) })
+    Ok(Some((FamilyInputs { rows, slots: vec![SlotValues::Tokens(ids)], layout: Some(SequenceLayout { sequence, position }) }, out)))
 }
 
 /// The reference engine: the model's resident-value program, one block a span
@@ -1576,11 +1600,12 @@ impl BlockEngine for Model<'_> {
         Some(&self.sites.parts)
     }
 
-    fn forward(
+    fn forward_before(
         &self,
         block: usize,
         stream: &mut Tensor,
         ranges: &[Range<usize>],
+        before: &[Vec<Range<usize>>],
         tokens: &[&[u32]],
         edits: Option<&Edits>,
         keep: bool,
@@ -1599,7 +1624,10 @@ impl BlockEngine for Model<'_> {
             }
         };
         let end = self.end(block);
-        let trace = self.program.forward_span(&ranges_family(block, ranges, tokens)?, entry, end, edit)?;
+        let trace = match segments(ranges, before, tokens)? {
+            None => self.program.forward_span(&family(tokens), entry, end, edit)?,
+            Some((family, segments)) => self.program.forward_span_segments(&family, entry, end, edit, Arc::new(segments))?,
+        };
         scatter(d, stream, ranges, trace.value(end)?)?;
         Ok(keep.then_some(trace))
     }
@@ -1790,14 +1818,42 @@ impl<'t> Plan<'t> {
         Self { paths, lanes, holder, length, recorded: std::rc::Rc::new(RefCell::new(BTreeMap::new())) }
     }
 
-    /// Lane `l`'s rows a call at `block` takes: from its position on for a suffix lane at an MLP
-    /// block (module note), else all.
-    fn range(&self, l: usize, block: usize) -> Range<usize> {
+    /// Lane `l`'s rows a call at `block` takes: from its position on for a suffix lane (module
+    /// note), else all.
+    fn range(&self, l: usize, _block: usize) -> Range<usize> {
         let lane = &self.lanes[l];
         match lane.prefix {
-            Some((_, t0)) if block % 2 == 1 => lane.rows.start + t0..lane.rows.end,
-            _ => lane.rows.clone(),
+            Some((_, t0)) => lane.rows.start + t0..lane.rows.end,
+            None => lane.rows.clone(),
         }
+    }
+
+    /// The rows of a call at `block` over `lanes` holding positions `0..upto` of lane `l`'s
+    /// sequence, in position order: a suffix lane's before its position from its twin's lane (in
+    /// the same call: it runs the block alike), its own after.
+    fn keys(&self, block: usize, lanes: &[usize], l: usize, upto: usize) -> Result<Vec<Range<usize>>, String> {
+        let first = self.range(l, block).start - self.lanes[l].rows.start;
+        let mut out = match self.lanes[l].prefix {
+            Some((twin, _)) if first > 0 && upto > 0 => self.keys(block, lanes, self.lane(twin, block), first.min(upto))?,
+            _ => Vec::new(),
+        };
+        if upto > first {
+            let at = self.row_of(block, lanes, l, first)?;
+            out.push(at..at + upto - first);
+        }
+        Ok(out)
+    }
+
+    /// Per lane of a call at `block` over `lanes`, the call's rows holding the keys of its positions
+    /// before its first row (none for a whole lane).
+    fn before(&self, block: usize, lanes: &[usize]) -> Result<Vec<Vec<Range<usize>>>, String> {
+        lanes
+            .iter()
+            .map(|&l| match self.lanes[l].prefix {
+                Some((twin, t0)) => self.keys(block, lanes, self.lane(twin, block), t0),
+                None => Ok(Vec::new()),
+            })
+            .collect()
     }
 
     /// The row of a call at `block` over `lanes` (each taking [`Plan::range`]) holding row `row` of
@@ -1818,12 +1874,9 @@ impl<'t> Plan<'t> {
         Err(error("a lane outside its call"))
     }
 
-    /// After block `block` (an MLP block), each suffix lane running it takes its rows before its
-    /// position from its twin path's lane, in lane order (a twin's own rows are complete first).
+    /// After block `block`, each suffix lane running it takes its rows before its position from
+    /// its twin path's lane, in lane order (a twin's own rows are complete first).
     fn copy_prefixes(&self, d: &Device, stream: &mut Tensor, block: usize) -> Result<(), String> {
-        if block % 2 == 0 {
-            return Ok(());
-        }
         for lane in self.lanes.iter().filter(|l| (l.start..l.end).contains(&block)) {
             if let Some((twin, t0)) = lane.prefix {
                 let from = self.lanes[self.lane(twin, block)].rows.start;
@@ -1833,13 +1886,10 @@ impl<'t> Plan<'t> {
         Ok(())
     }
 
-    /// Before the reverse of a call at `block` (an MLP block) over `lanes`, each suffix lane's
-    /// cotangents of its rows before its position move to its twin's lane, the later lanes first
-    /// (a twin passes on what it received).
+    /// Before the reverse of a call at `block` over `lanes`, each suffix lane's cotangents of its
+    /// rows before its position move to its twin's lane, the later lanes first (a twin passes on
+    /// what it received).
     fn return_prefixes(&self, d: &Device, cotangent: &mut Tensor, block: usize, lanes: &[usize]) -> Result<(), String> {
-        if block % 2 == 0 {
-            return Ok(());
-        }
         let mut suffix: Vec<usize> = lanes.iter().copied().filter(|l| self.lanes[*l].prefix.is_some()).collect();
         suffix.sort_unstable();
         for l in suffix.into_iter().rev() {
@@ -1957,15 +2007,16 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
                 continue;
             }
             let ranges: Vec<Range<usize>> = lanes.iter().map(|l| plan.range(*l, b)).collect();
+            let before = plan.before(b, &lanes)?;
             let tokens: Vec<&[u32]> = lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
             let edits = edits(engines[side], plan, b, &lanes)?;
             let kept_here = match budget {
                 None => {
-                    engines[side].forward(b, &mut stream, &ranges, &tokens, edits.as_ref(), false)?;
+                    engines[side].forward_before(b, &mut stream, &ranges, &before, &tokens, edits.as_ref(), false)?;
                     None
                 }
                 Some(budget) if kept.saturating_add(largest.saturating_mul(3)) < budget => {
-                    let tape = engines[side].forward(b, &mut stream, &ranges, &tokens, edits.as_ref(), true)?.ok_or_else(|| error("a call kept no tape"))?;
+                    let tape = engines[side].forward_before(b, &mut stream, &ranges, &before, &tokens, edits.as_ref(), true)?.ok_or_else(|| error("a call kept no tape"))?;
                     let bytes = E::tape_bytes(&tape);
                     kept = kept.saturating_add(bytes);
                     largest = largest.max(bytes);
@@ -1974,7 +2025,7 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
                 Some(_) => {
                     let entering = if b == 0 { None } else { Some(gather(d, &stream, &ranges)?) };
                     kept = kept.saturating_add(entering.as_ref().map_or(0, Tensor::bytes));
-                    engines[side].forward(b, &mut stream, &ranges, &tokens, edits.as_ref(), false)?;
+                    engines[side].forward_before(b, &mut stream, &ranges, &before, &tokens, edits.as_ref(), false)?;
                     Some(Kept::Entering(entering))
                 }
             };
@@ -2038,7 +2089,7 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
                     None => return Err(error("a call past the first block without its entering rows")),
                 };
                 let tokens: Vec<&[u32]> = call.lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
-                recomputed = engines[call.side].forward(b, &mut rows, &local, &tokens, call.edits.as_ref(), true)?.ok_or_else(|| error("a call kept no tape"))?;
+                recomputed = engines[call.side].forward_before(b, &mut rows, &local, &plan.before(b, &call.lanes)?, &tokens, call.edits.as_ref(), true)?.ok_or_else(|| error("a call kept no tape"))?;
                 &recomputed
             }
         };
