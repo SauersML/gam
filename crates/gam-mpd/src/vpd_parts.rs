@@ -237,6 +237,26 @@ pub fn load(export: &Path, decomposition: &Path) -> Result<(Vec<Mlp>, Vec<VpdPar
     Ok((mlps, parts))
 }
 
+/// Test data: fixed parts of the stream's `width` in MLP blocks 1 and 3 (layers 0 and 1): per
+/// block an MLP of 6 hidden units under the tanh GELU, and one slice of its up map and one of its
+/// down map.
+#[cfg(test)]
+pub(crate) fn random_slices(width: usize, seed: u64) -> Vec<Slice> {
+    use rand::{RngExt, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut normal = |rows: usize, cols: usize, scale: f64| Array2::from_shape_fn((rows, cols), |_| scale * (rng.random::<f64>() - 0.5));
+    let mut out = Vec::new();
+    for layer in [0, 1] {
+        let mlp = Arc::new(Mlp { read: normal(6, width, 1.0), write: normal(width, 6, 1.0), law: Law::GeluTanh });
+        let (up, down) = ((normal(1, 6, 2.0), normal(1, width, 2.0)), (normal(1, width, 2.0), normal(1, 6, 2.0)));
+        for (map, (u, v)) in [(Map::Up, up), (Map::Down, down)] {
+            let part = VpdPart { block: 2 * layer + 1, layer, map, index: 0, u: u.row(0).to_owned(), v: v.row(0).to_owned() };
+            out.push(Slice { part, mlp: Arc::clone(&mlp) });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,23 +265,6 @@ mod tests {
     use crate::operator_program::SlotValues;
     use crate::run_check::{layer_nodes, split_sites};
     use gam_gpu::tensor::Device;
-
-    /// Fixed parts of the stream's `width` in MLP blocks 1 and 3 (layers 0 and 1): per block an MLP
-    /// of 6 hidden units under the tanh GELU, and one slice of its up map and one of its down map.
-    fn random_slices(width: usize, seed: u64) -> Vec<Slice> {
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut normal = |rows: usize, cols: usize, scale: f64| Array2::from_shape_fn((rows, cols), |_| scale * (rng.random::<f64>() - 0.5));
-        let mut out = Vec::new();
-        for layer in [0, 1] {
-            let mlp = Arc::new(Mlp { read: normal(6, width, 1.0), write: normal(width, 6, 1.0), law: Law::GeluTanh });
-            let (up, down) = ((normal(1, 6, 2.0), normal(1, width, 2.0)), (normal(1, width, 2.0), normal(1, 6, 2.0)));
-            for (map, (u, v)) in [(Map::Up, up), (Map::Down, down)] {
-                let part = VpdPart { block: 2 * layer + 1, layer, map, index: 0, u: u.row(0).to_owned(), v: v.row(0).to_owned() };
-                out.push(Slice { part, mlp: Arc::clone(&mlp) });
-            }
-        }
-        out
-    }
 
     /// The tiny Qwen3 export's model and its starting library (an exact copy of `M`), with its
     /// sequences of 12 tokens.

@@ -1282,6 +1282,22 @@ impl Edits {
             };
             d.scatter_ranges(value, &single(at.iter().copied()), &d.upload(replaced.view()).map_err(error)?).map_err(error)?;
         }
+        // A fixed part's edit adds `J(x)·dx` at its row, `dx` its read's tangent there
+        // (`vpd_parts::Slice::tangent`, at the read the forward kept).
+        if let Some(f) = self.fixed.get(&node) {
+            let inputs = f.inputs.borrow();
+            let x = inputs.as_ref().ok_or_else(|| error("a fixed part's tangent before its forward"))?;
+            let dx = rows_of(dv.get(f.read).and_then(Option::as_ref), &f.rows)?;
+            let mut added = ndarray::Array2::zeros((f.rows.len(), width));
+            for (i, (slice, alpha)) in f.edits.iter().enumerate() {
+                added.row_mut(i).assign(&slice.tangent(x.row(i), *alpha, dx.row(i)));
+            }
+            let value = match t {
+                Some(value) => value,
+                None => t.insert(d.zeros(rows, width).map_err(error)?),
+            };
+            add_rows(d, value, &f.rows, &added)?;
+        }
         Ok(())
     }
 
@@ -3140,7 +3156,8 @@ mod tests {
 
     /// The forward tangents through blocks and edits ([`Model::tangent`]) of a batch with a swap of
     /// the stream from a donor, a head's zeroing from a position on, an MLP's output scaled at every
-    /// row, a pushed direction and connection cuts (onward and at one row), on the scoped starting library of the tiny Qwen3 export (its MLPs
+    /// row, a pushed direction, connection cuts (onward and at one row) and edits of fixed parts
+    /// (rank-one slices of a random MLP's up and down maps), on the scoped starting library of the tiny Qwen3 export (its MLPs
     /// P's, its attention M's): for random tangents `v` of P's
     /// operators and a random cotangent `ḡ` of the scored rows, `⟨ḡ, J v⟩` from the tangent pass
     /// equals `Σ ⟨∇, v⟩` from the reverse pass to 1e-10 relative (host, float64).
@@ -3159,6 +3176,8 @@ mod tests {
         let blocks: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
         let variables = reads(&native, &blocks).expect("the reads");
         let mut ic = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
+        let width = BlockEngine::width(&ic.models().0);
+        ic.set_fixed_parts(crate::vpd_parts::random_slices(width, 9)).expect("the fixed parts");
         let mut rng = StdRng::seed_from_u64(21);
         let head = ic.shared_sites().into_iter().find(|s| matches!(s, SharedSite::Head(_))).expect("a shared head");
         let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
@@ -3172,6 +3191,10 @@ mod tests {
             e(2, 2, Family::Scale, vec![op(SharedSite::Mlp(1), Operation::Scale(3), true)], 0),
             e(0, 0, Family::Push, vec![op(SharedSite::Stream(1), Operation::Push { direction: 1, size: 2 }, false)], 6),
             e(1, 2, Family::Cut, vec![op(SharedSite::Mlp(0), Operation::Cut { to: 3 }, true), op(SharedSite::Attention(0), Operation::Cut { to: 2 }, false)], 4),
+            // Layer 1's slices, whose read depends on P's layer-0 MLP: the up map's amplified, the
+            // down map's removed.
+            Experiment { base: 2, source: 2, explained: vec![true; 4], patch: Some(Patch::FixedPart { part: 2, factor: 3, block: 3 }), position: 5 },
+            Experiment { base: 0, source: 0, explained: vec![true; 4], patch: Some(Patch::FixedPart { part: 3, factor: 0, block: 3 }), position: 7 },
         ];
         let (m, p) = ic.models();
         let (paths, bases) = paths(&batch, &experiments, p.values(), engine_heads(&p), None, 4).expect("the paths");
