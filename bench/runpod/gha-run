@@ -31,12 +31,24 @@ REPO=SauersML/gam WORKFLOW=gha-run.yml MAC_GAM=/Users/user/gam
 API=(gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10")
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 2; }
 
-# Dispatches the workflow; prints the run id.
+# Dispatches the workflow; prints the run id. A dispatch GitHub answers with an error or no run id
+# is asked again, at most three times, 10 s apart (parity-q-53f7101644's ended on one empty answer,
+# "unexpected end of JSON input", with no run made).
 dispatch() {  # NAME SHA KEY EXAMPLES TESTS COMMAND
-    "${API[@]}" --method POST "repos/$REPO/actions/workflows/$WORKFLOW/dispatches" -f ref=main \
-        -f "inputs[name]=$1" -f "inputs[sha]=$2" -f "inputs[key]=$3" -f "inputs[examples]=$4" \
-        -f "inputs[tests]=$5" -f "inputs[command]=$6" -f "inputs[links]=${GHA_LINKS:-1}" \
-        -f "inputs[link_minutes]=${GHA_LINK_MINUTES:-330}" -F return_run_details=true | jq -er '.workflow_run_id'
+    local answer="" id try
+    for try in 1 2 3; do
+        if answer=$("${API[@]}" --method POST "repos/$REPO/actions/workflows/$WORKFLOW/dispatches" -f ref=main \
+            -f "inputs[name]=$1" -f "inputs[sha]=$2" -f "inputs[key]=$3" -f "inputs[examples]=$4" \
+            -f "inputs[tests]=$5" -f "inputs[command]=$6" -f "inputs[links]=${GHA_LINKS:-1}" \
+            -f "inputs[link_minutes]=${GHA_LINK_MINUTES:-330}" -F return_run_details=true) &&
+            id=$(jq -er '.workflow_run_id' <<< "$answer" 2> /dev/null); then
+            echo "$id"
+            return 0
+        fi
+        echo "gha-run: dispatch of $1 answered without a run id (attempt $try of 3): ${answer:0:200}" >&2
+        [ "$try" = 3 ] || sleep 10
+    done
+    return 1
 }
 
 # The binaries KEY needs that the release lacks.
