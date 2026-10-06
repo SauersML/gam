@@ -99,6 +99,34 @@ impl Tensors<'_> {
         }
     }
 
+    /// A Hugging Face checkpoint's two-axis tensor where the file stores it, its reals not read
+    /// ([`Stored`](crate::safetensors::Stored)); none for an export, whose reals are read.
+    fn stored(&self, name: &str) -> Result<Option<crate::safetensors::Stored>, String> {
+        let Self::HuggingFace { files } = self else { return Ok(None) };
+        let stored = hugging_face_name(name).ok_or_else(|| format!("{name}: no Hugging Face tensor"))?;
+        let file = holding(files, &stored).ok_or_else(|| format!("{stored}: missing"))?;
+        let shape = file.tensors().get(&stored).map(|e| e.shape.clone()).ok_or_else(|| format!("{stored}: missing"))?;
+        let [rows, cols] = shape[..] else { return Err(format!("{stored}: shape {shape:?} is not two axes")) };
+        file.stored(&stored, rows, cols).map(Some).map_err(|e| e.to_string())
+    }
+
+    /// The operator of the two-axis tensor `name` between `rows` and `cols`: where a checkpoint
+    /// stores it, or read from an export.
+    fn operator(&self, b: &mut Builder, label: &str, rows: &Interface, cols: &Interface, name: &str) -> Result<usize, String> {
+        match self.stored(name)? {
+            Some(stored) => b.stored(label, rows, cols, stored),
+            None => b.operator(label, rows, cols, self.get(name)?),
+        }
+    }
+
+    /// The rows of the two-axis tensor `name`, without reading its reals.
+    fn rows_of(&self, name: &str) -> Result<usize, String> {
+        match self.stored(name)? {
+            Some(stored) => Ok(stored.dim().0),
+            None => Ok(self.get(name)?.nrows()),
+        }
+    }
+
     /// A stored row vector as a column.
     fn column(&self, name: &str) -> Result<Array2<f64>, String> {
         Ok(self.get(name)?.t().to_owned())
@@ -120,6 +148,13 @@ impl Builder {
         let precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
         let op = Operator::dense(name, rows.clone(), cols.clone(), values, precision, Provenance::native(name))
             .map_err(|e| e.to_string())?;
+        self.operators.push(Arc::new(op));
+        Ok(self.operators.len() - 1)
+    }
+
+    /// The operator `name` whose reals stay where `stored` holds them.
+    fn stored(&mut self, name: &str, rows: &Interface, cols: &Interface, stored: crate::safetensors::Stored) -> Result<usize, String> {
+        let op = Operator::stored(name, rows.clone(), cols.clone(), stored, Provenance::native(name)).map_err(|e| e.to_string())?;
         self.operators.push(Arc::new(op));
         Ok(self.operators.len() - 1)
     }
@@ -495,16 +530,15 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
         // A parallel block's MLP reads the stream the attention read; a sequential one reads the
         // stream after it.
         let h2 = norm(&mut b, if parallel { x } else { attended }, &format!("{prefix}rms2"))?;
-        let c_fc = tensors.get(&format!("{prefix}mlp.c_fc"))?;
-        let hidden = c_fc.nrows();
+        let hidden = tensors.rows_of(&format!("{prefix}mlp.c_fc"))?;
         let neurons = interface(hidden, 1, LabelKind::Unit)?;
-        let up = b.operator(&format!("{prefix}c_fc"), &neurons, &model, c_fc)?;
+        let up = tensors.operator(&mut b, &format!("{prefix}c_fc"), &neurons, &model, &format!("{prefix}mlp.c_fc"))?;
         let up_bias = bias(&mut b, &format!("{prefix}mlp.c_fc.bias"), &neurons, None)?;
-        let down = b.operator(&format!("{prefix}down_proj"), &model, &neurons, tensors.get(&format!("{prefix}mlp.down_proj"))?)?;
+        let down = tensors.operator(&mut b, &format!("{prefix}down_proj"), &model, &neurons, &format!("{prefix}mlp.down_proj"))?;
         let down_bias = bias(&mut b, &format!("{prefix}mlp.down_proj.bias"), &model, None)?;
         let pre = b.node(Node::Affine { terms: vec![(h2, up)], bias: up_bias });
         let active = if gated {
-            let gate = b.operator(&format!("{prefix}gate_proj"), &neurons, &model, tensors.get(&format!("{prefix}mlp.gate_proj"))?)?;
+            let gate = tensors.operator(&mut b, &format!("{prefix}gate_proj"), &neurons, &model, &format!("{prefix}mlp.gate_proj"))?;
             let gate_bias = bias(&mut b, &format!("{prefix}mlp.gate_proj.bias"), &neurons, None)?;
             let gate_pre = b.node(Node::Affine { terms: vec![(h2, gate)], bias: gate_bias });
             let gate_active = b.node(Node::Pointwise { input: gate_pre, laws: vec![act; hidden] });
@@ -521,7 +555,7 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
         let logits = match embedding {
             Some(embedding) if tied => b.node(Node::Transposed { input: h, operator: embedding }),
             _ => {
-                let head_op = b.operator("lm_head", &tokens_interface, &model, tensors.get("lm_head")?)?;
+                let head_op = tensors.operator(&mut b, "lm_head", &tokens_interface, &model, "lm_head")?;
                 b.node(Node::Affine { terms: vec![(h, head_op)], bias: None })
             }
         };
@@ -652,5 +686,33 @@ mod tests {
             assert!(x.matrix().iter().zip(y.matrix().iter()).all(|(u, v)| u.to_bits() == v.to_bits()), "{} differs", x.name);
         }
         assert_eq!(format!("{:?}", a.nodes), format!("{:?}", b.nodes));
+        // The MLP maps and the head stay where the checkpoint stores them, and a device program
+        // made from them runs exactly as one made from their float64 values, on the host and on a
+        // single-precision device.
+        use crate::operator_program::{Operator, OperatorBody};
+        let stored: Vec<&str> = a.operators.iter().filter(|op| matches!(&op.body, OperatorBody::Dense { values, .. } if values.stored().is_some())).map(|op| op.name.as_str()).collect();
+        assert_eq!(stored, ["blocks.0.c_fc", "blocks.0.down_proj", "blocks.0.gate_proj", "lm_head"]);
+        let mut held = a.clone();
+        for op in &mut held.operators {
+            if matches!(&op.body, OperatorBody::Dense { values, .. } if values.stored().is_some()) {
+                let OperatorBody::Dense { present, precision, .. } = &op.body else { continue };
+                *op = std::sync::Arc::new(Operator::blocks(op.name.clone(), op.rows.clone(), op.cols.clone(), op.matrix(), present.clone(), *precision, op.provenance.clone()).expect("the same reals"));
+            }
+        }
+        assert!(held.operators.iter().all(|op| !matches!(&op.body, OperatorBody::Dense { values, .. } if values.stored().is_some())));
+        let family = crate::library_mdl::sequence_family(&[&[1, 4, 2, 7, 3]]).expect("a family");
+        let devices = [Some(gam_gpu::tensor::Device::host()), gam_gpu::tensor::Device::single_precision(gam_gpu::GpuPolicy::Auto).ok().flatten()];
+        for device in devices.into_iter().flatten() {
+            let run = |program: &crate::operator_program::OperatorProgram| {
+                let mut compiled = crate::device_program::DeviceProgram::compile_values(&device, program).expect("a device program");
+                if device.storage() == gam_gpu::tensor::Storage::F32 {
+                    compiled.set_arithmetic(gam_gpu::tensor::Arithmetic::F32);
+                }
+                let trace = compiled.forward(&family).expect("a forward pass");
+                device.download(trace.value(program.output).expect("the output")).expect("its values")
+            };
+            let (from_file, from_host) = (run(&a), run(&held));
+            assert!(from_file.iter().zip(from_host.iter()).all(|(u, v)| u.to_bits() == v.to_bits()), "{}: stored and held reals run differently", device.name());
+        }
     }
 }

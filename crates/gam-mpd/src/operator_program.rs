@@ -498,7 +498,7 @@ pub enum OperatorBody {
     Identity,
     /// A block matrix: `values` (rows × cols) on the lattice of `precision`, zero off the present
     /// blocks; `present` is (row groups × column groups).
-    Dense { values: Array2<f64>, present: Array2<bool>, precision: DeclaredPrecision },
+    Dense { values: DenseValues, present: Array2<bool>, precision: DeclaredPrecision },
     /// The product `left · right` of a `rows × r` and an `r × cols` factor, both on the lattice of
     /// `precision`. The executed operator is the exact product; its computed product is within
     /// `γ_r |left||right|` of it entrywise.
@@ -506,6 +506,96 @@ pub enum OperatorBody {
     /// `diag(values)` between equal interfaces, `values` on the lattice of `precision`: a norm
     /// gain. A product with it is a column scale.
     Diagonal { values: Array1<f64>, precision: DeclaredPrecision },
+}
+
+/// A dense operator's reals: in float64 on the host, or where a safetensors file stores them
+/// ([`Stored`](crate::safetensors::Stored)). Stored reals are widened to float64 on the host only
+/// when read there: [`Operator::matrix`] widens a copy, a read through `Deref` widens them once and
+/// keeps them; a device takes them in its own storage ([`DenseValues::stored`]) without either.
+#[derive(Clone)]
+pub struct DenseValues {
+    stored: Option<crate::safetensors::Stored>,
+    host: std::sync::OnceLock<Array2<f64>>,
+}
+
+impl DenseValues {
+    /// Reals where a file stores them.
+    #[must_use]
+    pub fn stored_in(stored: crate::safetensors::Stored) -> Self {
+        Self { stored: Some(stored), host: std::sync::OnceLock::new() }
+    }
+
+    /// Where a file stores them, when it does and the host has not edited them.
+    #[must_use]
+    pub fn stored(&self) -> Option<&crate::safetensors::Stored> {
+        self.stored.as_ref()
+    }
+
+    /// Their shape, rows × cols, without reading them.
+    #[must_use]
+    pub fn shape(&self) -> (usize, usize) {
+        match (&self.stored, self.host.get()) {
+            (_, Some(host)) => host.dim(),
+            (Some(stored), None) => stored.dim(),
+            (None, None) => (0, 0),
+        }
+    }
+
+    /// The reals in float64 without keeping them: borrowed when the host holds them, widened from
+    /// their file otherwise.
+    #[must_use]
+    pub fn matrix(&self) -> std::borrow::Cow<'_, Array2<f64>> {
+        match (&self.stored, self.host.get()) {
+            (_, Some(host)) => std::borrow::Cow::Borrowed(host),
+            (Some(stored), None) => std::borrow::Cow::Owned(stored.matrix()),
+            (None, None) => std::borrow::Cow::Owned(Array2::zeros((0, 0))),
+        }
+    }
+}
+
+impl From<Array2<f64>> for DenseValues {
+    fn from(values: Array2<f64>) -> Self {
+        Self { stored: None, host: std::sync::OnceLock::from(values) }
+    }
+}
+
+impl std::ops::Deref for DenseValues {
+    type Target = Array2<f64>;
+    /// The reals in float64, widened from their file once and kept.
+    fn deref(&self) -> &Array2<f64> {
+        self.host.get_or_init(|| self.stored.as_ref().map_or_else(|| Array2::zeros((0, 0)), crate::safetensors::Stored::matrix))
+    }
+}
+
+impl std::ops::DerefMut for DenseValues {
+    /// The reals on the host to edit: an edit leaves the file's values behind.
+    fn deref_mut(&mut self) -> &mut Array2<f64> {
+        let held = std::mem::take(&mut self.host).into_inner();
+        let values = held.unwrap_or_else(|| self.stored.as_ref().map_or_else(|| Array2::zeros((0, 0)), crate::safetensors::Stored::matrix));
+        self.stored = None;
+        self.host = std::sync::OnceLock::from(values);
+        self.host.get_mut().expect("the host values were just set")
+    }
+}
+
+impl PartialEq for DenseValues {
+    /// The same reals, wherever they are held.
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.stored, &other.stored) {
+            (Some(a), Some(b)) if self.host.get().is_none() && other.host.get().is_none() => a == b,
+            _ => *self.matrix() == *other.matrix(),
+        }
+    }
+}
+
+impl fmt::Debug for DenseValues {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.stored, self.host.get()) {
+            (_, Some(host)) => write!(f, "{host:?}"),
+            (Some(stored), None) => write!(f, "{stored:?}"),
+            (None, None) => write!(f, "[]"),
+        }
+    }
 }
 
 /// Identity, dense, low-rank, dense with ordered rows, and diagonal (module note, "The code").
@@ -575,7 +665,24 @@ impl Operator {
                 block.fill(0.0);
             }
         }
-        Ok(Self { name, rows, cols, body: OperatorBody::Dense { values, present, precision }, provenance })
+        Ok(Self { name, rows, cols, body: OperatorBody::Dense { values: values.into(), present, precision }, provenance })
+    }
+
+    /// A dense operator with every block present whose reals stay where `stored` holds them, on
+    /// the lattice of their exact precision (nothing to round).
+    pub fn stored(name: impl Into<String>, rows: Interface, cols: Interface, stored: crate::safetensors::Stored, provenance: Provenance) -> Result<Self, ProgramError> {
+        let name = name.into();
+        if stored.dim() != (rows.width(), cols.width()) {
+            return Err(ProgramError::Shape(format!("operator {name}: stored {:?} against interfaces {}×{}", stored.dim(), rows.width(), cols.width())));
+        }
+        let exact = exact_precision(stored.values())?;
+        let precision = exact.within_range(stored.values().fold(0.0_f64, |acc, v| acc.max(v.abs())));
+        if precision != exact {
+            // Reals whose range coarsens their lattice are rounded on the host, as `blocks` does.
+            return Self::dense(name, rows, cols, stored.matrix(), exact, provenance);
+        }
+        let present = Array2::from_elem((rows.group_count(), cols.group_count()), true);
+        Ok(Self { name, rows, cols, body: OperatorBody::Dense { values: DenseValues::stored_in(stored), present, precision }, provenance })
     }
 
     /// The diagonal operator `diag(values)` on `interface`, its reals rounded to `precision`'s
@@ -674,7 +781,7 @@ impl Operator {
     /// otherwise.
     pub fn matrix_cow(&self) -> std::borrow::Cow<'_, Array2<f64>> {
         match &self.body {
-            OperatorBody::Dense { values, .. } => std::borrow::Cow::Borrowed(values),
+            OperatorBody::Dense { values, .. } => values.matrix(),
             _ => std::borrow::Cow::Owned(self.matrix()),
         }
     }
@@ -699,7 +806,7 @@ impl Operator {
     pub fn matrix(&self) -> Array2<f64> {
         match &self.body {
             OperatorBody::Identity => Array2::eye(self.rows.width()),
-            OperatorBody::Dense { values, .. } => values.clone(),
+            OperatorBody::Dense { values, .. } => values.matrix().into_owned(),
             OperatorBody::LowRank { left, right, .. } => left.dot(right),
             OperatorBody::Diagonal { values, .. } => Array2::from_diag(values),
         }
@@ -3800,7 +3907,7 @@ fn decode_operator_with(reader: &mut BitReader<'_>, index: u64, starts: Option<&
         rows,
         cols,
         body: OperatorBody::Dense {
-            values,
+            values: values.into(),
             present,
             precision,
         },

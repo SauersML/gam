@@ -465,7 +465,7 @@ pub fn f32_operator(op: &Operator) -> Result<Operator, String> {
     Ok(match &op.body {
         OperatorBody::Identity => op.clone(),
         OperatorBody::Dense { values, present, .. } => {
-            let mut values = values.clone();
+            let mut values = values.matrix().into_owned();
             f32_reals(&mut values);
             let precision = exact_precision(values.iter().copied()).map_err(error)?;
             Operator::blocks(op.name.clone(), op.rows.clone(), op.cols.clone(), values, present.clone(), precision, op.provenance.clone())

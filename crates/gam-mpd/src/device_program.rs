@@ -80,7 +80,15 @@ fn hold(device: &Device, op: &Operator, role: Role) -> Result<Held, String> {
             OperatorBody::LowRank { left, right, .. } => Held::LowRank(device.upload(left.view()).map_err(error)?, device.upload(right.view()).map_err(error)?),
             OperatorBody::Dense { values, .. } => match op.diagonal() {
                 Some(d) => Held::Diagonal(device.upload_vec(1, d.len(), d.to_vec()).map_err(error)?),
-                None => Held::Dense(device.upload(values.view()).map_err(error)?),
+                // Stored reals go to an f32 device as the f32 values they are, never widened on
+                // the host; others as their float64 values.
+                None => Held::Dense(
+                    match values.stored().filter(|_| device.storage() == Storage::F32).and_then(crate::safetensors::Stored::f32_values) {
+                        Some(f32s) => device.upload_f32(values.shape().0, values.shape().1, &f32s),
+                        None => device.upload(values.matrix().view()),
+                    }
+                    .map_err(error)?,
+                ),
             },
         },
     })
@@ -2743,7 +2751,7 @@ mod values_vjp_tests {
             let mut reference = program.clone();
             for (op, value) in [(0, changed), (1, changed_constant)] {
                 let OperatorBody::Dense { values, .. } = &mut Arc::make_mut(&mut reference.operators[op]).body else { panic!("dense") };
-                *values = value;
+                *values = value.into();
             }
             let expected = reference.execute(&family, false).unwrap();
             let after = trained.forward(&family).unwrap();

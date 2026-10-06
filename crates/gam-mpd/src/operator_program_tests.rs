@@ -98,6 +98,7 @@ fn a_program_with_an_absent_block_executes_its_zero() {
     let OperatorBody::Dense { values, precision: p, .. } = program.operators[7].body.clone() else {
         panic!("the fixture's W_out is dense")
     };
+    let values = values.matrix().into_owned();
     let mut present = Array2::from_elem((5, 5), true);
     present[[2, 1]] = false;
     program.operators[7] = Arc::new(Operator::blocks(

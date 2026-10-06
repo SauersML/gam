@@ -122,7 +122,7 @@ fn a_difference_at_alpha_zero_is_the_reference() {
     let OperatorBody::Dense { values, present, .. } = &operator.body else { panic!("dense") };
     let values = values.mapv(|v| v * 1.5 + 0.01);
     let precision = exact_precision(values.iter().copied()).expect("precision");
-    operator.body = OperatorBody::Dense { values, present: present.clone(), precision };
+    operator.body = OperatorBody::Dense { values: values.into(), present: present.clone(), precision };
     program.operators[op] = Arc::new(operator);
     let updated = Native::new(program, 2).expect("updated");
     let mut models = BTreeMap::new();
@@ -198,9 +198,9 @@ fn literally_edited(native: &Native, edits: &[(&str, Array2<f64>)], scale: f64) 
         let op = native.operator(name).expect("operator");
         let mut operator = (*program.operators[op]).clone();
         let OperatorBody::Dense { values, present, .. } = &operator.body else { panic!("dense") };
-        let values = values + &(p * scale);
+        let values = &*values.matrix() + &(p * scale);
         let precision = exact_precision(values.iter().copied()).expect("precision");
-        operator.body = OperatorBody::Dense { values, present: present.clone(), precision };
+        operator.body = OperatorBody::Dense { values: values.into(), present: present.clone(), precision };
         program.operators[op] = Arc::new(operator);
     }
     Native::new(program, native.layers.len()).expect("edited model")

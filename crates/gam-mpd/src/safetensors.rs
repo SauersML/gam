@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gam_runtime::resource::{Governed, MemoryGovernor, MemoryReservationError};
 use memmap2::Mmap;
@@ -134,7 +135,7 @@ impl std::error::Error for SafetensorsError {}
 
 /// A memory-mapped `.safetensors` file and its parsed header.
 pub struct SafetensorsFile {
-    mmap: Mmap,
+    mmap: Arc<Mmap>,
     data_start: usize,
     tensors: BTreeMap<String, TensorEntry>,
 }
@@ -199,7 +200,7 @@ impl SafetensorsFile {
             }
             tensors.insert(name.clone(), TensorEntry { dtype, shape, begin, end });
         }
-        Ok(Self { mmap, data_start, tensors })
+        Ok(Self { mmap: Arc::new(mmap), data_start, tensors })
     }
 
     /// Every tensor, by name.
@@ -243,6 +244,20 @@ impl SafetensorsFile {
         Ok(reservation.bind(values))
     }
 
+    /// The two-axis float tensor `name`, which must be `rows × cols`, where the file stores it
+    /// ([`Stored`]): nothing is read or widened until its values are asked for.
+    pub fn stored(&self, name: &str, rows: usize, cols: usize) -> Result<Stored, SafetensorsError> {
+        let entry = self.entry(name)?;
+        if entry.shape != [rows, cols] {
+            return Err(SafetensorsError::Shape { tensor: name.into(), expected: vec![rows, cols], found: entry.shape.clone() });
+        }
+        let float = match &entry.dtype {
+            StoredType::Float(float) => *float,
+            StoredType::Other { name: dtype, .. } => return Err(SafetensorsError::UnsupportedType { tensor: name.to_string(), dtype: dtype.clone() }),
+        };
+        Ok(Stored { map: Arc::clone(&self.mmap), start: self.data_start + entry.begin, float, rows, cols })
+    }
+
     /// The one-axis tensor `name`, which must hold `len` entries, widened exactly to binary64.
     pub fn vector(&self, name: &str, len: usize) -> Result<Array1<f64>, SafetensorsError> {
         let entry = self.entry(name)?;
@@ -250,6 +265,67 @@ impl SafetensorsFile {
             return Err(SafetensorsError::Shape { tensor: name.into(), expected: vec![len], found: entry.shape.clone() });
         }
         Ok(Array1::from_vec(self.widened(name, entry)?))
+    }
+}
+
+/// A matrix's reals where a safetensors file stores them: `rows × cols` row-major elements of
+/// `float` from byte `start` of the file's memory map. Reading widens them exactly to binary64
+/// ([`Stored::matrix`]), or to f32 for the stored types it holds exactly ([`Stored::f32_values`]).
+#[derive(Clone)]
+pub struct Stored {
+    map: Arc<Mmap>,
+    start: usize,
+    float: StoredFloat,
+    rows: usize,
+    cols: usize,
+}
+
+impl Stored {
+    /// Its shape, rows × cols.
+    #[must_use]
+    pub fn dim(&self) -> (usize, usize) {
+        (self.rows, self.cols)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.map[self.start..self.start + self.rows * self.cols * self.float.bytes()]
+    }
+
+    /// Its elements in row-major order, widened exactly to binary64.
+    pub fn values(&self) -> impl Iterator<Item = f64> + '_ {
+        self.bytes().chunks_exact(self.float.bytes()).map(|raw| self.float.widen(raw))
+    }
+
+    /// The matrix, widened exactly to binary64.
+    #[must_use]
+    pub fn matrix(&self) -> Array2<f64> {
+        Array2::from_shape_vec((self.rows, self.cols), self.values().collect()).expect("the stored shape holds the data")
+    }
+
+    /// Its elements in row-major order as f32, when that holds every stored value exactly (stored
+    /// F32, F16 or BF16).
+    #[must_use]
+    pub fn f32_values(&self) -> Option<Vec<f32>> {
+        (self.float != StoredFloat::F64).then(|| self.values().map(|v| v as f32).collect())
+    }
+
+    /// Rows `rows` of it, where the file stores them (a row range is contiguous).
+    #[must_use]
+    pub fn rows(&self, rows: std::ops::Range<usize>) -> Option<Self> {
+        (rows.start <= rows.end && rows.end <= self.rows).then(|| Self { start: self.start + rows.start * self.cols * self.float.bytes(), rows: rows.len(), ..self.clone() })
+    }
+}
+
+impl PartialEq for Stored {
+    /// The same reals stored the same way.
+    fn eq(&self, other: &Self) -> bool {
+        self.dim() == other.dim() && self.float == other.float && self.bytes() == other.bytes()
+    }
+}
+
+impl fmt::Debug for Stored {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Stored({}x{} {:?})", self.rows, self.cols, self.float)
     }
 }
 

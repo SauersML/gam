@@ -809,7 +809,7 @@ impl Session {
         let matrix = |name: &str| -> Result<(usize, Array2<f64>), String> {
             let op = native.operator(name)?;
             match &native.program.operators[op].body {
-                OperatorBody::Dense { values, .. } => Ok((op, values.clone())),
+                OperatorBody::Dense { values, .. } => Ok((op, values.matrix().into_owned())),
                 OperatorBody::Identity | OperatorBody::LowRank { .. } | OperatorBody::Diagonal { .. } => Err(format!("{name} is not a stored dense matrix")),
             }
         };
@@ -899,9 +899,9 @@ impl Session {
             let OperatorBody::Dense { values, present, .. } = &operator.body else {
                 return Err(format!("{}: not dense", operator.name));
             };
-            let values = values + &delta;
+            let values = &*values.matrix() + &delta;
             let precision = exact_precision(values.iter().copied()).map_err(|e| e.to_string())?;
-            operator.body = OperatorBody::Dense { values, present: present.clone(), precision };
+            operator.body = OperatorBody::Dense { values: values.into(), present: present.clone(), precision };
             program.operators[op] = Arc::new(operator);
         }
         Ok(program)
