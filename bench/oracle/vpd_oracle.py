@@ -88,7 +88,7 @@ def site_name(layer: int, kind: str) -> str:
 class Table:
     """A label run's sites (vpd_labels.py output) and the decomposition's vectors."""
 
-    def __init__(self, root: Path, uv_path: Path, graph: Path | None = None):
+    def __init__(self, root: Path, uv_path: Path, graph: Path | None = None, tokenizer: Path = TOKENIZER):
         import tokenizers
 
         self.root = root
@@ -104,7 +104,7 @@ class Table:
             kind = meta["site"].split(".")[-1]
             self.sites[(meta["layer"], kind)] = (meta, load_file(str(meta_path.with_suffix(".safetensors"))))
         self.uv = load_file(str(uv_path))
-        self.tok = tokenizers.Tokenizer.from_file(str(TOKENIZER))
+        self.tok = tokenizers.Tokenizer.from_file(str(tokenizer))
 
     def vectors(self, layer: int, kind: str, c: int) -> tuple[torch.Tensor, torch.Tensor]:
         name = site_name(layer, kind)
@@ -137,15 +137,48 @@ def level(a: float, peak: float) -> int:
     return 0 if peak <= 0 else min(BINS - 1, int(math.floor(BINS * abs(a) / peak)))
 
 
-def examples(table: Table, layers: set[int], count: int, seed: int) -> list[dict]:
-    """`count` questions (a third of each kind), subcomponents drawn uniformly from `layers`' sites."""
+# Effect strata: the decade of KL(clean || removed) at the context's peak (nats). Single subcomponents
+# mostly change little (median 3e-4 at their strongest contexts), so effect questions are drawn equally
+# from each stratum when stratified: a known one-sixth below 1e-5 and as many above 1e-1.
+STRATA = (0.0, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, float("inf"))
+
+
+def stratum(kl: float) -> int:
+    return int(np.searchsorted(STRATA, kl, side="right") - 1)
+
+
+def effect_index(table: Table, keys: list) -> list[np.ndarray]:
+    """Per stratum, the (site, subcomponent, context) triples whose removal KL falls in it."""
+    per = [[] for _ in STRATA[:-1]]
+    for k, key in enumerate(keys):
+        kl = table.sites[key][1]["kl_ablate"].numpy()
+        which = np.clip(np.searchsorted(STRATA, kl, side="right") - 1, 0, len(STRATA) - 2)
+        for s_ in range(len(STRATA) - 1):
+            c, j = np.nonzero(which == s_)
+            per[s_].append(np.stack([np.full(len(c), k), c, j], 1))
+    return [np.concatenate(p) for p in per]
+
+
+def examples(table: Table, layers: set[int], count: int, seed: int, stratified: bool = True) -> list[dict]:
+    """`count` questions, the kinds in turn. Activity questions: subcomponents uniform over `layers`'
+    sites. Effect questions (direction, top): with `stratified`, the (subcomponent, context) drawn
+    equally from each effect stratum; without, uniform over subcomponents and their measured contexts
+    (the natural distribution). Each example records its stratum."""
     rng = random.Random(seed)
     keys = [k for k in table.sites if k[0] in layers]
+    index = effect_index(table, keys) if stratified else None
     out = []
     while len(out) < count:
         layer, kind = keys[rng.randrange(len(keys))]
         meta, d = table.sites[(layer, kind)]
         c = rng.randrange(meta["subcomponents"])
+        effect_j = rng.randrange(meta["top"] + meta["random"])
+        if index is not None and len(out) % 3 in (1, 2):
+            pool = index[(len(out) // 3) % len(index)]
+            if len(pool):
+                k, c, effect_j = (int(x) for x in pool[rng.randrange(len(pool))])
+                layer, kind = keys[k]
+                meta, d = table.sites[(layer, kind)]
         contexts = d["contexts"][c].long()
         act = d["activity"][c].float()  # [K, T]
         peak = float(act.abs().max())
@@ -153,7 +186,7 @@ def examples(table: Table, layers: set[int], count: int, seed: int) -> list[dict
         name = site_name(layer, kind)
         patched = table.graph is not None and f"{name}.patch_activity" in table.graph
         which = len(out) % (5 if patched else 3)
-        base = {"layer": layer, "kind": kind, "c": c}
+        base = {"layer": layer, "kind": kind, "c": c, "stratum": stratum(float(d["kl_ablate"][c, effect_j])) if which in (1, 2) else -1}
         if which == 0:
             j = rng.randrange(len(contexts))
             p = int(d["position"][c, j]) if rng.random() < 0.5 else rng.randrange(act.shape[1])
@@ -162,7 +195,7 @@ def examples(table: Table, layers: set[int], count: int, seed: int) -> list[dict
                         "question": "How active is the component at the marked token, on a scale from 0 (inactive) to 9 (its largest activity)?",
                         "options": [str(b) for b in range(BINS)], "answer": answer})
         elif which == 1:
-            j = rng.randrange(top)
+            j = effect_j
             p = int(d["position"][c, j])
             edit = rng.choice(["ablate", "amplify"])
             side = rng.choice(["up", "down"])
@@ -197,10 +230,11 @@ def examples(table: Table, layers: set[int], count: int, seed: int) -> list[dict
                             "question": f"If the connection from {names[i]} to this component is cut (its write removed from what this component reads), does the probability that the next token after the marked token is {json.dumps(table.tok.decode([token]))} go up or go down?",
                             "options": ["up", "down"], "answer": 0 if dp > 0 else 1})
         else:
-            j = rng.randrange(top)
+            j = effect_j
             p = int(d["position"][c, j])
             truth = int(d["up_ids_ablate"][c, j, 0])
-            pool = [int(x) for x in d["up_ids_ablate"][c, rng.randrange(top, len(contexts))].tolist() if int(x) != truth]
+            other = rng.choice([x for x in range(len(contexts)) if x != j])
+            pool = [int(x) for x in d["up_ids_ablate"][c, other].tolist() if int(x) != truth]
             distractors = rng.sample(pool, 3) if len(pool) >= 3 else pool + [truth + 1] * (3 - len(pool))
             options = [truth] + distractors
             order = list(range(4))
@@ -350,7 +384,7 @@ def train(args):
     dev = device()
     torch.manual_seed(args.seed)
     held = {int(x) for x in args.heldout_layers.split(",") if x}
-    table = Table(Path(args.labels), Path(args.uv), Path(args.graph) if args.graph else None)
+    table = Table(Path(args.labels), Path(args.uv), Path(args.graph) if args.graph else None, Path(args.tokenizer))
     data = examples(table, {0, 1, 2, 3} - held, args.examples, args.seed)
     oracle = Oracle(args.base, args.lora_rank, args.inject, dev)
     oracle.model.base_model.model.gradient_checkpointing_enable()
@@ -383,22 +417,24 @@ def evaluate(args):
     config = json.loads((Path(args.run) / "config.json").read_text())
     oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev)
     oracle.load(Path(args.run))
-    table = Table(Path(args.labels), Path(args.uv), Path(args.graph) if args.graph else None)
+    table = Table(Path(args.labels), Path(args.uv), Path(args.graph) if args.graph else None, Path(args.tokenizer))
     held = {int(x) for x in config["heldout_layers"].split(",") if x}
     rows = []
     for split, layers in (("heldout_layers", held), ("trained_layers", {0, 1, 2, 3} - held)):
-        data = examples(table, layers, args.examples, args.seed + 1)
-        for s in range(0, len(data), config["batch"]):
-            batch = data[s : s + config["batch"]]
-            lq, valid = oracle.log_q(table, batch, config["condition"])
-            oracle.hook.set(None)
-            for ex, score in zip(batch, log_scores(lq, valid, batch).tolist()):
-                rows.append({"split": split, "question": ex["kind_q"], "layer": ex["layer"], "kind": ex["kind"], "c": ex["c"], "context": ex["context"], "log_score": score})
+        for distribution in ("natural", "stratified"):
+            data = examples(table, layers, args.examples, args.seed + 1, stratified=distribution == "stratified")
+            for s in range(0, len(data), config["batch"]):
+                batch = data[s : s + config["batch"]]
+                lq, valid = oracle.log_q(table, batch, config["condition"])
+                oracle.hook.set(None)
+                for ex, score in zip(batch, log_scores(lq, valid, batch).tolist()):
+                    rows.append({"split": split, "distribution": distribution, "question": ex["kind_q"], "stratum": ex["stratum"], "layer": ex["layer"], "kind": ex["kind"],
+                                 "c": ex["c"], "context": ex["context"], "log_score": score})
     (Path(args.run) / f"eval_{Path(args.labels).name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     summary = {}
     for split in ("heldout_layers", "trained_layers"):
         for q in ("activity", "direction", "top", "which_upstream", "edge_cut"):
-            v = [r["log_score"] for r in rows if r["split"] == split and r["question"] == q]
+            v = [r["log_score"] for r in rows if r["split"] == split and r["question"] == q and r["distribution"] == "natural"]
             summary[f"{split}/{q}"] = float(np.mean(v)) if v else None
     print(json.dumps({"condition": config["condition"], **summary}))
 
@@ -413,15 +449,19 @@ def compare(args):
         runs[config["condition"]] = rows
     base = runs["nothing"]
     table = {}
+    groups = [("natural", None), ("stratified", None)] + [("stratified", k) for k in range(len(STRATA) - 1)]
     for condition, rows in runs.items():
         for split in ("heldout_layers", "trained_layers"):
             for q in ("activity", "direction", "top", "which_upstream", "edge_cut"):
-                pairs = [(r["log_score"], b["log_score"]) for r, b in zip(rows, base) if r["split"] == split and r["question"] == q]
-                if not pairs:
-                    continue
-                d = np.array([a - b for a, b in pairs])
-                table[f"{condition}/{split}/{q}"] = {"examples": len(d), "log_score_nats": float(np.mean([a for a, _ in pairs])),
-                                                     "gain_over_nothing_nats": float(d.mean()), "standard_error_nats": float(d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else None}
+                for distribution, k in groups:
+                    pairs = [(r["log_score"], b["log_score"]) for r, b in zip(rows, base)
+                             if r["split"] == split and r["question"] == q and r["distribution"] == distribution and (k is None or r["stratum"] == k)]
+                    if not pairs or (k is not None and q == "activity"):
+                        continue
+                    d = np.array([a - b for a, b in pairs])
+                    name = f"{condition}/{split}/{q}" + ("" if distribution == "natural" else f"/stratified" + ("" if k is None else f"/kl{STRATA[k]:g}-{STRATA[k + 1]:g}"))
+                    table[name] = {"examples": len(d), "log_score_nats": float(np.mean([a for a, _ in pairs])),
+                                   "gain_over_nothing_nats": float(d.mean()), "standard_error_nats": float(d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else None}
     Path(args.out).write_text(json.dumps(table, indent=1))
     print(json.dumps(table, indent=1))
 
@@ -434,6 +474,7 @@ def main():
     t.add_argument("--labels", required=True)
     t.add_argument("--uv", required=True)
     t.add_argument("--graph", help="vpd_graph.py's output for these labels (neighbourhoods and edge labels)")
+    t.add_argument("--tokenizer", default=str(TOKENIZER), help="the target's tokenizer.json")
     t.add_argument("--condition", required=True, choices=CONDITIONS)
     t.add_argument("--steps", type=int, required=True)
     t.add_argument("--out", required=True)
@@ -449,6 +490,7 @@ def main():
     e.add_argument("--labels", required=True)
     e.add_argument("--uv", required=True)
     e.add_argument("--graph", help="vpd_graph.py's output for these labels")
+    e.add_argument("--tokenizer", default=str(TOKENIZER), help="the target's tokenizer.json")
     e.add_argument("--examples", type=int, default=4096)
     e.add_argument("--seed", type=int, default=0)
     c = sub.add_parser("compare")
