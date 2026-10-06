@@ -103,9 +103,14 @@
 //! matrix of `P_e`'s softmax at token `t`, which is positive semidefinite. The Hessian adds the
 //! second derivatives of `P_e`'s logits weighted by `p_P − p_M`, so the two agree where `P_e`'s
 //! predictions equal `M_e`'s. The estimate is the squared Gauss–Newton factor `ĥ = u ⊙ u / n`
-//! (`interchange::Factor`): `u` is the gradient of `Σ_t log P_e(y_t)` over the batch's `n` scored
-//! tokens, each label `y_t` drawn from `P_e`'s own prediction, from a second reverse pass through
-//! the step's forward pass, and `E[ĥ]` is that diagonal. The reparameterization estimate
+//! (`interchange::Factor`): `u = Σ_t J_tᵀ b_t` over the batch's `n` scored tokens, `J_t` the
+//! Jacobian of `P_e`'s logits at `t` and `b_t = √p_t ⊙ ξ_t − p_t (√p_t · ξ_t)` the Fisher probe
+//! there (`p_t` `P_e`'s prediction, `ξ_t` independent random signs over the vocabulary, so
+//! `E[b_t b_tᵀ] = F_t`), from a second reverse pass through the step's forward pass. `E[ĥ]` is that
+//! diagonal, and each entry of `u ⊙ u` estimates its expectation with relative variance at most 2
+//! whatever `P_e` predicts; with a label `y_t` drawn from `p_t` (the seed `p_t − e_{y_t}`) the
+//! relative variance is `(1 − 2p)² / (p (1 − p))` on a class of probability `p`. The
+//! reparameterization estimate
 //! `g ε / σ` of the Hessian's diagonal carries every other weight's noise through the off-diagonal
 //! terms (on vpd4l, eight draws showed no signal). `h` is the estimates' average over the last
 //! epoch's batches (`β₂ = 1 − 1/B` for `B` training batches), starting from the Laplace start
@@ -162,9 +167,10 @@
 //! where `P_e`'s predictions equal `M_e`'s), the batch's change is
 //! `δ_bG = −g_b,G · θ_b,G + ½ θ_b,Gᵀ H_b θ_b,G`, and the estimate is its sum over the batches,
 //! `Σ_b δ_bG` ([`Curvature`]). Both are measured at `θ_b`, one forward pass per training batch
-//! reversed twice (`interchange::evaluate_labelled`): once for `g_b`, and once for a draw `u_b` of
-//! the gradient of `Σ log P_e(y)` with every `y` drawn from `P_e` itself, whose
-//! `E[(u_b,G · θ_b,G)²] = θ_b,Gᵀ H_b θ_b,G`. Over the noise of `θ_b`, `E[δ_bG]` is to second order
+//! reversed twice (`interchange::evaluate_probed`): once for `g_b`, and once for a draw
+//! `u_b = Σ_t J_tᵀ b_t` of the Gauss–Newton factor (the Fisher probe at every token, as in the
+//! fit), whose `E[(u_b,G · θ_b,G)²] = θ_b,Gᵀ H_b θ_b,G`. Over the noise of `θ_b`, `E[δ_bG]` is to
+//! second order
 //! `−g_G · μ_G + ½ μ_Gᵀ H μ_G − ½ Σ_{j∈G} H_jj σ_j²` at the mean, the change of the expected data
 //! term. The samples are drawn on a noise stream of their own: acceptance scores other samples, so
 //! a removal ranked first because its estimate fell low on these draws is not also measured on them.
@@ -809,7 +815,7 @@ pub fn scoped(explanation: &Explanation, blocks: &[usize]) -> Result<Explanation
 
 /// Per prior group, the removal estimates over the batches of the fixed collection: with `θ_b` the
 /// weight sample of batch `b` on the ranking's own noise stream, `g_b` the data term's gradient there
-/// in nats and `u_b` a draw of the sampled-label gradient there (`interchange::sampled_label`),
+/// in nats and `u_b` a draw of the Gauss–Newton factor there (`interchange::fisher_probe`),
 /// `s_bG = g_b,G · θ_b,G` and `d_bG = u_b,G · θ_b,G`, and each batch's second-order change of its
 /// data term when the group's entries of `θ_b` become zero, `δ_bG = −s_bG + ½ d_bG²` (module note):
 /// the sums of `δ_bG`, of its square and of `s_bG` over the batches, and every batch's `d_bG` (in
@@ -1761,8 +1767,8 @@ impl Scorer {
     /// The explanation on `experiments` (on `batch`) with the posterior on the device: at its
     /// weight sample of `sample` ([`DevicePosterior::sample_into`]), or at its mean when none, and
     /// with `gradient` the gradient of the sum per trainable operator and, with `factor` too, a draw
-    /// of the Gauss–Newton factor (`interchange::Factor`, its labels drawn from the seed `sample`),
-    /// left on the device; against `M`'s `targets` made for these experiments.
+    /// of the Gauss–Newton factor (`interchange::Factor`, its probe under [`probe_key`] of the
+    /// seed `sample`), left on the device; against `M`'s `targets` made for these experiments.
     fn evaluate_device(
         &mut self,
         posterior: &DevicePosterior,
@@ -1778,11 +1784,11 @@ impl Scorer {
             (Some(seed), false) => posterior.sample_into(self.experiments.explanation_mut(), seed)?,
             (None, _) => posterior.mean_into(self.experiments.explanation_mut())?,
         }
-        let labels = match (gradient && factor, sample) {
-            (true, Some(seed)) => Some(uniforms(seed, batch, experiments)),
+        let probe = match (gradient && factor, sample) {
+            (true, Some(seed)) => Some(probe_key(seed)),
             _ => None,
         };
-        let evaluation = self.experiments.evaluate_labelled(batch, experiments, Some(targets), gradient, labels.as_deref())?;
+        let evaluation = self.experiments.evaluate_probed(batch, experiments, Some(targets), gradient, probe)?;
         if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
             return Err("nonfinite explanation divergence".into());
         }
@@ -1790,12 +1796,11 @@ impl Scorer {
     }
 }
 
-/// One uniform per scored row of `experiments` on `batch` (rows in experiment order) from `seed`:
-/// the draws of the Gauss–Newton factor's labels (`interchange::evaluate_labelled`).
-fn uniforms(seed: u64, batch: &Batch, experiments: &[Experiment]) -> Vec<f64> {
-    let rows: usize = experiments.iter().map(|e| batch.length() - e.position).sum();
-    let mut rng = StdRng::seed_from_u64(seed);
-    (0..rows).map(|_| rng.random::<f64>()).collect()
+/// The key of the Gauss–Newton factor's Fisher probe (`interchange::evaluate_probed`) at the
+/// weight sample of `seed`: the SplitMix64 output after it (`gam_linalg::utils::splitmix64_hash`),
+/// so the probe's signs and the sample's noise, both Philox draws, are under different keys.
+fn probe_key(seed: u64) -> u64 {
+    gam_linalg::utils::splitmix64_hash(seed)
 }
 
 /// The noise seed of batch `batch` in stream `epoch`: stream 1 is the training steps'
@@ -3069,7 +3074,8 @@ pub fn fit_from(
 }
 
 /// The Laplace start of a fresh fit. One pass over the training collection draws every batch's
-/// sampled-label factor `u_b` at a weight sample of the unit-information start, and
+/// Gauss–Newton factor `u_b` (`interchange::fisher_probe`) at a weight sample of the
+/// unit-information start, and
 /// `h = Σ_b u_b ⊙ u_b / N` (the batches' estimates `B / N · u_b ⊙ u_b`, averaged) estimates the
 /// Gauss–Newton diagonal per token. Each entry's deviation becomes `σ² = 1 / (N h + 1 / v_G)`, the
 /// minimum in `σ` of the data term's Gauss–Newton model `½ N h σ²` plus `KL(q ‖ p)`, instead of the
@@ -3087,11 +3093,12 @@ fn laplace_sums(scorer: &mut Scorer, device_posterior: &DevicePosterior, draws: 
     for (b, draw) in draws.iter().enumerate() {
         let batch = draw.batch(sequences)?;
         let experiments = scorer.experiments(draw, sequences)?;
-        // The factor alone, at the batch's weight sample with its labels drawn from the same seed:
-        // `P`'s own sampled labels need neither `M`'s targets nor the divergence's gradient.
+        // The factor alone, at the batch's weight sample with its probe keyed from the same seed:
+        // the probe at `P`'s own predictions needs neither `M`'s targets nor the divergence's
+        // gradient.
         let key = noise_seed(settings.seed, 0, b);
         device_posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
-        let factor = scorer.experiments.sampled_label_resident(&batch, &experiments, &uniforms(key, &batch, &experiments))?;
+        let factor = scorer.experiments.fisher_probe_resident(&batch, &experiments, probe_key(key))?;
         for (op, u) in &factor {
             let u = wide.convert(u).map_err(error)?;
             match sums.get_mut(op) {
@@ -3148,11 +3155,10 @@ const RANKING_STREAM: usize = usize::MAX;
 
 /// The removal estimates' [`Curvature`]: per training batch of the fixed collection, at the batch's
 /// weight sample on the noise stream `stream` (the fit's: [`RANKING_STREAM`]), the data term's
-/// gradient and one draw of the sampled-label gradient (module note), each batch's group sums made
+/// gradient and one draw of the Gauss–Newton factor (module note), each batch's group sums made
 /// on the device (`DevicePosterior::add_removal`); for the operators `moved` (by id), the data
 /// gradient summed over the batches on the device.
 fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings, stream: usize, moved: &[usize]) -> Result<Curvature, String> {
-    let mut rng = StdRng::seed_from_u64(noise_seed(settings.seed, stream, draws.len()));
     let mut curvature = Curvature::new(posterior.group_count());
     // Seconds in each part of the pass: the sample, the batch's experiments, M's targets, the
     // scoring with its two reverse passes, and the per-group sums.
@@ -3174,11 +3180,9 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
         lap(1, &mut timed);
         let targets = scorer.experiments.targets(&batch, &experiments)?;
         lap(2, &mut timed);
-        let rows: usize = experiments.iter().map(|e| batch.length() - e.position).sum();
-        let uniforms: Vec<f64> = (0..rows).map(|_| rng.random::<f64>()).collect();
         // One forward pass at the batch's sample, reversed twice: the divergence's gradient (in
         // bits) and a draw of the Gauss–Newton factor.
-        let evaluation = scorer.experiments.evaluate_labelled(&batch, &experiments, Some(&targets), true, Some(&uniforms))?;
+        let evaluation = scorer.experiments.evaluate_probed(&batch, &experiments, Some(&targets), true, Some(probe_key(key)))?;
         let factor = evaluation.factor.ok_or("no Gauss–Newton factor")?;
         lap(3, &mut timed);
         posterior.add_removal((&evaluation.gradient, LN_2), &factor.gradient, key, &mut curvature, &mut pending)?;
@@ -3364,7 +3368,7 @@ pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Exp
 
 /// The posterior a fresh fit starts from on `sequences` under `settings` ([`fit`]): the
 /// unit-information posterior at `M`'s values with the Laplace start's deviations from one
-/// sampled-label pass (`laplace_start`).
+/// pass of the Gauss–Newton factor (`laplace_start`).
 pub fn start_posterior(device: &Device, native: &OperatorProgram, explanation: &Explanation, sequences: &[Vec<u32>], settings: &Settings) -> Result<Posterior, String> {
     settings.validate()?;
     let length = sequences.first().map_or(0, Vec::len);

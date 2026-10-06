@@ -265,7 +265,7 @@ fn f32_maps_norms_and_softmaxes_agree_with_the_host() {
     assert_eq!(argmax, host.argmax_rows(&hx).expect("argmax"));
 }
 
-/// The vocabulary reductions: KL rows and their cotangent, softmax statistics, sampled cotangents,
+/// The vocabulary reductions: KL rows and their cotangent, softmax statistics, Fisher probes,
 /// the Fisher quadratic, and the swept head log partition, some rows unscored.
 #[test]
 fn f32_vocabulary_reductions_agree_with_the_host() {
@@ -314,18 +314,16 @@ fn f32_vocabulary_reductions_agree_with_the_host() {
     }
     let probabilities = down(&host, &hs);
     assert_within("softmax probabilities", &down(&d, &ds), &probabilities, |i, j| 16.0 * U * probabilities[[i, j]] + 1e-38);
-    // Sampled cotangents: the same label away from ties at the uniform, q within 16u q.
-    let uniforms = matrix(n, 1, 59, 0.5).mapv(|v| v + 0.5);
-    let (hu, du) = both(&uniforms);
-    let (mut hs, mut ds) = both(&logits);
-    host.sampled_cotangent(&mut hs, &hu, None).expect("host sampled");
-    d.sampled_cotangent(&mut ds, &du, None).expect("device sampled");
-    let (hs, ds) = (down(&host, &hs), down(&d, &ds));
-    for r in 0..n {
-        let label = |m: &Array2<f64>| m.row(r).iter().position(|v| *v < -0.5).expect("a label");
-        assert_eq!(label(&hs), label(&ds), "row {r}'s label");
-    }
-    assert_within("sampled cotangent", &ds, &hs, |i, j| 16.0 * U * (hs[[i, j]].abs() + if hs[[i, j]] < -0.5 { 1.0 } else { 0.0 }) + 1e-38);
+    // Fisher probes of the same f32 probabilities, with the same signs: `√q` within `u` (`sqrtf`
+    // is correctly rounded), `√q · ξ` summed in double of those terms and rounded to float once
+    // (within `2u Σ √q`), and the product and the difference rounded: each entry within
+    // `4u (√q + q Σ √q)`, and within 16u of it here.
+    let q = probabilities.mapv(|v| f64::from(v as f32));
+    let roots: Vec<f64> = q.rows().into_iter().map(|row| row.iter().map(|p| p.sqrt()).sum()).collect();
+    let (mut hp, mut dp) = both(&q);
+    host.fisher_probe_cotangent(&mut hp, (59, 3), Some(&hf)).expect("host probe");
+    d.fisher_probe_cotangent(&mut dp, (59, 3), Some(&df)).expect("device probe");
+    assert_within("fisher probe", &down(&d, &dp), &down(&host, &hp), |i, j| 16.0 * U * (q[[i, j]].sqrt() + q[[i, j]] * roots[i]) + 1e-38);
     let tangent = matrix(n, classes, 61, 1.0);
     let (hl, dl) = both(&logits);
     let (htan, dtan) = both(&tangent);
@@ -484,6 +482,12 @@ fn bf16(x: f64) -> f64 {
 /// the host's products of the same rounded operands: only the f32 accumulation differs, within
 /// `(k + 2)` f32 roundings of `|A||B|`. The swept head log partition on a bfloat16 head: its logits
 /// alike (`δ`), its expected rows also rounding each chunk's weights and head rows (`2⁻⁷ max |e|`).
+/// A probed bfloat16 sweep leaves the partitions and expected rows as they are, and its probe lies
+/// within `(2⁻⁶ + 4δ + (6n + 96 + 4s) u) ‖e‖_∞ Σ √q` of the host's with bfloat16 products (`n` the
+/// classes, `s` the row's logit span, `q` its softmax): the host rounds each `b_c` to bfloat16
+/// (`2⁻⁸` of `|b_c| ≤ √q_c + q_c Σ √q`), the device each signed root (`2⁻⁸` of `√q_c`) and each
+/// exponential of the expected row (`2⁻⁸` of `q_c` times `|√q · ξ| ≤ Σ √q`), and the logits and the
+/// sums round as `tensor_kernels.rs`'s probed sweep test derives.
 #[test]
 fn bfloat16_products_match_the_host_on_rounded_operands() {
     let Some((d, wide)) = cuda() else { return };
@@ -528,4 +532,30 @@ fn bfloat16_products_match_the_host_on_rounded_operands() {
         assert!((hz[r] - dz[r]).abs() <= delta + 8.0 * U, "bfloat16 log partition row {r}: {} against {}", dz[r], hz[r]);
     }
     assert_within("bfloat16 expected head rows", &down(&d, &dm), &down(&host, &hm), |_, _| 2.0 * delta + 2f64.powi(-7) + (classes + 16) as f64 * U);
+    let (classes, key) = (257, 0xB16_u64);
+    let embedding = matrix(classes, width, 25, 1.0);
+    let (mut hm, mut hp) = (host.zeros(rows, width).expect("zeros"), host.zeros(rows, width).expect("zeros"));
+    host.head_log_partition_probed(&up(&host, &hidden), (&up(&host, &embedding), false), None, &mut hm, (key, &mut hp), Arithmetic::Bf16).expect("host");
+    let (dh, head) = (up(&d, &hidden), d.bf16_copy(&up(&d, &embedding)).expect("frozen head"));
+    let mut plain = d.zeros(rows, width).expect("zeros");
+    let pz = d.head_log_partition(&dh, &head, false, None, Some(&mut plain), Arithmetic::Bf16).expect("bfloat16 sweep");
+    let (mut dm, mut dp) = (d.zeros(rows, width).expect("zeros"), d.zeros(rows, width).expect("zeros"));
+    let dz = d.head_log_partition_probed(&dh, (&head, false), None, &mut dm, (key, &mut dp), Arithmetic::Bf16).expect("probed bfloat16 sweep");
+    assert_eq!(dz, pz, "the probe leaves the bfloat16 partitions");
+    assert_eq!(down(&d, &dm), down(&d, &plain), "the probe leaves the bfloat16 expected rows");
+    let (rounded, rounded_head) = (hidden.mapv(bf16), embedding.mapv(bf16));
+    let largest = rounded_head.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    let logits = rounded.dot(&rounded_head.t());
+    let band: Vec<f64> = logits
+        .rows()
+        .into_iter()
+        .map(|z| {
+            let (top, low) = z.iter().fold((f64::NEG_INFINITY, f64::INFINITY), |(t, l), v| (t.max(*v), l.min(*v)));
+            let weights: Vec<f64> = z.iter().map(|v| (v - top).exp()).collect();
+            let total: f64 = weights.iter().sum();
+            let roots: f64 = weights.iter().map(|w| (w / total).sqrt()).sum();
+            (2f64.powi(-6) + 4.0 * delta + (6.0 * classes as f64 + 96.0 + 4.0 * (top - low)) * U) * largest * roots
+        })
+        .collect();
+    assert_within("bfloat16 probe", &down(&d, &dp), &down(&host, &hp), |i, _| band[i]);
 }

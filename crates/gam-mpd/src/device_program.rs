@@ -2,8 +2,8 @@
 //!
 //! [`DeviceProgram`] lowers a program's nodes onto `gam_gpu::tensor`'s operations once, keeps its
 //! operators on the device, and then runs forward passes ([`DeviceProgram::forward`]), the KL of
-//! the logits against a target with its cotangent ([`DeviceProgram::kl`]), sampled-label
-//! cotangents ([`DeviceProgram::sampled`]), reverse passes ([`DeviceProgram::vjp`]) and tangents
+//! the logits against a target with its cotangent ([`DeviceProgram::kl`]), Fisher probes'
+//! cotangents ([`DeviceProgram::fisher_probe`]), reverse passes ([`DeviceProgram::vjp`]) and tangents
 //! in the operators' reals ([`DeviceProgram::jvp`], [`DeviceProgram::quadratic`]) with every node
 //! value staying on the device: only what a caller asks for comes back.
 //!
@@ -1903,9 +1903,10 @@ impl DeviceProgram {
         Ok((Array1::from(kl), g))
     }
 
-    /// The cotangent of `−log q_y` pulled back to the hidden node, `y` drawn per row from the
-    /// logits' softmax by `uniforms[r]` (rows `scored` leaves out stay zero).
-    pub fn sampled(&self, trace: &DeviceTrace, uniforms: &[f64], scored: Option<&[bool]>, arithmetic: Arithmetic) -> Result<Tensor, String> {
+    /// The Fisher probe under `key` pulled back to the hidden node: per row, the probe's cotangent
+    /// at the logits' softmax (`Device::fisher_probe_cotangent`, rows numbered from zero) through
+    /// the head, its products in `arithmetic` (rows `scored` leaves out stay zero).
+    pub fn fisher_probe(&self, trace: &DeviceTrace, key: u64, scored: Option<&[bool]>, arithmetic: Arithmetic) -> Result<Tensor, String> {
         self.linear_operator()?;
         let d = &self.device;
         let hidden = trace.value(self.head.hidden)?;
@@ -1913,44 +1914,39 @@ impl DeviceProgram {
         let tile = self.tile_rows();
         for start in (0..trace.rows).step_by(tile) {
             let n = tile.min(trace.rows - start);
-            let mut logits = self.logits_tile(hidden, start, n, self.arithmetic)?;
-            let u = d.upload_vec(n, 1, uniforms[start..start + n].to_vec()).map_err(error)?;
-            d.sampled_cotangent(&mut logits, &u, self.flags(scored, start, n)?.as_ref()).map_err(error)?;
-            self.pull_tile(&mut g, start, &logits, arithmetic)?;
+            let mut probabilities = self.logits_tile(hidden, start, n, self.arithmetic)?;
+            d.softmax_rows(&mut probabilities, false).map_err(error)?;
+            d.fisher_probe_cotangent(&mut probabilities, (key, start), self.flags(scored, start, n)?.as_ref()).map_err(error)?;
+            self.pull_tile(&mut g, start, &probabilities, arithmetic)?;
         }
         Ok(g)
     }
 
-    /// Sample several hidden cotangents from one forward. Each vocabulary tile is projected,
-    /// normalized, and pulled through the head only once. Seeds use `E_q[o] − o_y` in F64;
-    /// subsequent reverse passes can still use proposal arithmetic. Only hidden-width seeds
+    /// [`Self::fisher_probe`] under each of `keys` from one forward, the products in the
+    /// program's arithmetic. Each vocabulary tile is projected and normalized once and copied for
+    /// each key's probe, which is pulled through the head on its own; only hidden-width seeds
     /// survive each tile, so no full-batch vocabulary distribution is retained.
-    pub fn sampled_many(&self, trace: &DeviceTrace, uniforms: &[Vec<f64>], scored: Option<&[bool]>) -> Result<Vec<Tensor>, String> {
+    pub fn fisher_probes(&self, trace: &DeviceTrace, keys: &[u64], scored: Option<&[bool]>) -> Result<Vec<Tensor>, String> {
         self.linear_operator()?;
-        if uniforms.iter().any(|u| u.len() != trace.rows) || scored.is_some_and(|s| s.len() != trace.rows) {
-            return Err("device: sampled uniforms or flags do not match trace rows".to_string());
+        if scored.is_some_and(|s| s.len() != trace.rows) {
+            return Err("device: probe flags do not match trace rows".to_string());
         }
-        if uniforms.is_empty() {
+        if keys.is_empty() {
             return Ok(Vec::new());
         }
         let d = &self.device;
         let hidden = trace.value(self.head.hidden)?;
-        let Held::Dense(head) = self.held(self.linear_operator()?, Role::Product)? else {
-            return Err("device: the head is not dense".to_string());
-        };
-        let mut seeds = uniforms.iter().map(|_| d.zeros(trace.rows, hidden.cols()).map_err(error)).collect::<Result<Vec<_>, _>>()?;
+        let mut seeds = keys.iter().map(|_| d.zeros(trace.rows, hidden.cols()).map_err(error)).collect::<Result<Vec<_>, _>>()?;
         let tile = self.tile_rows();
         for start in (0..trace.rows).step_by(tile) {
             let n = tile.min(trace.rows - start);
             let mut probabilities = self.logits_tile(hidden, start, n, self.arithmetic)?;
             d.softmax_rows(&mut probabilities, false).map_err(error)?;
-            let mut mean = d.zeros(n, hidden.cols()).map_err(error)?;
-            self.pull_tile(&mut mean, 0, &probabilities, self.arithmetic)?;
             let flags = self.flags(scored, start, n)?;
-            for (uniforms, seed) in uniforms.iter().zip(&mut seeds) {
-                let u = d.upload_vec(n, 1, uniforms[start..start + n].to_vec()).map_err(error)?;
-                let part = d.sampled_head_cotangent(&probabilities, &mean, head, self.head.transposed, &u, flags.as_ref()).map_err(error)?;
-                d.set_rows(seed, start, &part).map_err(error)?;
+            for (key, seed) in keys.iter().zip(&mut seeds) {
+                let mut probe = d.copy(&probabilities).map_err(error)?;
+                d.fisher_probe_cotangent(&mut probe, (*key, start), flags.as_ref()).map_err(error)?;
+                self.pull_tile(seed, start, &probe, self.arithmetic)?;
             }
         }
         Ok(seeds)

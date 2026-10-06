@@ -11,8 +11,9 @@
 //! token in its Kronecker factorization:
 //!
 //! * `H(u_i) ≈ ā_i Ḡ`: `ā_i` the mean over tokens of the function's squared activation, `Ḡ` the mean
-//!   of `δ δᵀ` with `δ` the cotangent of the MLP's output when every next token is drawn from `P`
-//!   itself (its expectation over the draws is `Σ_t J_tᵀ F_t J_t` at that output);
+//!   of `δ δᵀ` with `δ` the cotangent of the MLP's output from the Fisher probe at `P`'s own
+//!   prediction at every token (`Device::fisher_probe_cotangent`; its expectation over the probe's
+//!   signs is `Σ_t J_tᵀ F_t J_t` at that output);
 //! * `H(g_i) ≈ w̄_i A`: `A` the mean of `x xᵀ` over the MLP's inputs `x` (with a constant 1 where the
 //!   gate has a bias), `w̄_i` the mean of `φ'(z_i)² (u_i · δ)²`.
 //!
@@ -197,7 +198,7 @@ fn main() -> Result<(), String> {
         // The values: one forward pass of the whole program.
         let family = library_mdl::sequence_family(&tokens)?;
         let trace = p.program.forward(&family)?;
-        // The cotangents at each MLP's output: P alone block by block, sampled labels at the head.
+        // The cotangents at each MLP's output: P alone block by block, the Fisher probe at the head.
         let length = tokens[0].len();
         let ranges: Vec<Range<usize>> = (0..tokens.len()).map(|i| i * length..(i + 1) * length).collect();
         let total = tokens.len() * length;
@@ -208,13 +209,14 @@ fn main() -> Result<(), String> {
         }
         let mut cotangent = d.zeros(total, width).map_err(error)?;
         let tile = (1 << 28) / (4 * head.rows()).max(1);
+        let key = rng.random::<u64>();
         for start in (0..total).step_by(tile.max(1)) {
             let n = tile.max(1).min(total - start);
             let h = d.rows_of(&stream, start, n).map_err(error)?;
             let mut logits = d.zeros(n, head.rows()).map_err(error)?;
             d.gemm(&mut logits, 1.0, &h, Op::N, &head, Op::T, 0.0, arithmetic).map_err(error)?;
-            let uniforms = d.upload_vec(n, 1, (0..n).map(|_| rng.random::<f64>()).collect()).map_err(error)?;
-            d.sampled_cotangent(&mut logits, &uniforms, None).map_err(error)?;
+            d.softmax_rows(&mut logits, false).map_err(error)?;
+            d.fisher_probe_cotangent(&mut logits, (key, start), None).map_err(error)?;
             let mut seed = d.zeros(n, width).map_err(error)?;
             d.gemm(&mut seed, 1.0, &logits, Op::N, &head, Op::N, 0.0, arithmetic).map_err(error)?;
             d.set_rows(&mut cotangent, start, &seed).map_err(error)?;

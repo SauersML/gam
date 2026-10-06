@@ -11,7 +11,7 @@
 
 use gam_gpu::GpuPolicy;
 use gam_gpu::precision_bounds::{DeviceArithmetic, GemmBand};
-use gam_gpu::tensor::{Arithmetic, Device, Op, PointwiseLaw, Tensor};
+use gam_gpu::tensor::{Arithmetic, Device, Op, PointwiseLaw, Tensor, fisher_sign};
 use ndarray::{Array2, ArrayView1};
 
 const U: f64 = f64::EPSILON / 2.0;
@@ -113,41 +113,99 @@ fn grouped_mask_fisher_squares_sums_with_cross_terms() {
     }
 }
 
-#[test]
-fn sampled_head_lookup_matches_full_pullback_in_both_orientations() {
+/// The host, a CUDA device in float64 when one resolves, and the single-precision device (CUDA in
+/// f32 storage, or the Apple GPU) when one does.
+fn every_device() -> Vec<Device> {
     let mut devices = vec![Device::host()];
     devices.extend(accelerator());
-    let logits = ndarray::array![[0.0, 1.0, -1000.0], [1.0, 0.0, 2.0], [0.0, 0.0, 0.0]];
-    let head = ndarray::array![[2.0, -3.0], [0.5, 7.0], [-1.0, 4.0]];
-    for device in devices {
-        let flags = device.upload_indices(&[1, 0, 1]).expect("flags");
-        for transposed in [false, true] {
-            let weights = up(&device, &if transposed { head.t().to_owned() } else { head.clone() });
-            let op = if transposed { Op::T } else { Op::N };
-            let mut probabilities = up(&device, &logits);
-            device.softmax_rows(&mut probabilities, false).expect("softmax");
-            let mut mean = device.zeros(3, 2).expect("mean");
-            device.gemm(&mut mean, 1.0, &probabilities, Op::N, &weights, op, 0.0, Arithmetic::F64).expect("mean projection");
-            for u in [0.0, 0.2, 0.7, 1.0 - f64::EPSILON] {
-                let uniforms = up(&device, &Array2::from_elem((3, 1), u));
-                let shared = device.sampled_head_cotangent(&probabilities, &mean, &weights, transposed, &uniforms, Some(&flags)).expect("lookup");
-                let mut cotangent = up(&device, &logits);
-                device.sampled_cotangent(&mut cotangent, &uniforms, Some(&flags)).expect("sample");
-                let mut reference = device.zeros(3, 2).expect("reference");
-                device.gemm(&mut reference, 1.0, &cotangent, Op::N, &weights, op, 0.0, Arithmetic::F64).expect("pullback");
-                assert_within("sampled head lookup", &down(&device, &shared), &down(&device, &reference), |_, _| 1e-13);
-                assert!(down(&device, &shared).row(1).iter().all(|g| *g == 0.0));
+    devices.extend(Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault").filter(|d| !d.float64()));
+    devices
+}
+
+/// The Fisher probe's signs are one function of `(key, row, class)` on every device
+/// ([`fisher_sign`]), so a probe is regenerated alike everywhere. On rows of equal probabilities
+/// `2⁻¹²` over 4096 classes every step is exact in f32 (`√π = 2⁻⁶`, the sum of `±2⁻⁶`, and
+/// `b = 2⁻⁶ ξ − 2⁻¹² (√π · ξ)`), so the host and CUDA (float64 and f32) give the probe made from the
+/// counters on the host bit for bit. The Apple GPU's `sqrt` is within 4 ulps (`8u` relative) and
+/// it sums in f32, so there each entry lies within `32u √π + π (n + 8) u Σ √π` of it (`n` the
+/// classes). Everywhere each scored entry has the sign of its `ξ_c`, as
+/// `|b_c − √π ξ_c| = √π |Σ ξ| / n < √π`.
+/// Row `r` carries the signs of row `first + r`, so two calls on the rows split in two are the call
+/// on all of them, and an unscored row is zero.
+#[test]
+fn fisher_probe_signs_are_the_same_on_every_device() {
+    let (rows, classes, first, key) = (5, 4096, 70_000, 0xA5A5_5A5A_DEAD_BEEF_u64);
+    let flags: Vec<u32> = (0..rows as u32).map(|r| u32::from(r != 2)).collect();
+    let (pi, root) = (1.0 / classes as f64, 1.0 / 64.0);
+    let signs: Vec<Vec<f64>> = (0..rows).map(|r| (0..classes).map(|c| fisher_sign(key, (first + r) as u64, c as u64)).collect()).collect();
+    let exact = Array2::from_shape_fn((rows, classes), |(r, c)| root * signs[r][c] - pi * (root * signs[r].iter().sum::<f64>()));
+    let probabilities = Array2::from_elem((rows, classes), pi);
+    let single_unit = f64::from(f32::EPSILON) / 2.0;
+    for device in every_device() {
+        let name = device.name();
+        let band = if cfg!(target_os = "macos") && !device.float64() {
+            32.0 * single_unit * root + pi * (classes + 8) as f64 * single_unit * classes as f64 * root
+        } else {
+            0.0
+        };
+        let check = |what: &str, probe: &Array2<f64>, at: usize, scored: &dyn Fn(usize) -> bool| {
+            for ((i, c), b) in probe.indexed_iter() {
+                let r = at + i;
+                if !scored(r) {
+                    assert_eq!(*b, 0.0, "{name} {what} row {r}: an unscored row");
+                    continue;
+                }
+                assert_eq!(b.signum(), signs[r][c], "{name} {what} ({r},{c}): the sign");
+                assert!((b - exact[[r, c]]).abs() <= band, "{name} {what} ({r},{c}): {b} against {}", exact[[r, c]]);
+            }
+        };
+        let mut whole = up(&device, &probabilities);
+        device.fisher_probe_cotangent(&mut whole, (key, first), Some(&device.upload_indices(&flags).expect("flags"))).expect("the probe");
+        check("whole", &down(&device, &whole), 0, &|r: usize| flags[r] != 0);
+        for (at, n) in [(0, 2), (2, rows - 2)] {
+            let mut part = up(&device, &Array2::from_elem((n, classes), pi));
+            device.fisher_probe_cotangent(&mut part, (key, first + at), None).expect("the probe of a part");
+            check("part", &down(&device, &part), at, &|_: usize| true);
+        }
+    }
+}
+
+/// A probe's outer products average to the softmax's Fisher matrix, on every device: with `π` the
+/// stored probabilities, `L = diag √π − π √πᵀ` and `b = L ξ`, `E[b bᵀ] = L Lᵀ = diag π − (2 − Σ π) π πᵀ`
+/// (`diag π − π πᵀ` when `Σ π = 1`), each of `R` rows of the same `π` with its own signs one draw.
+/// For any `a`, `a · b` is a weighted sum of independent signs, so `E[(a · b)⁴] ≤ 3 E[(a · b)²]²` and
+/// `Var(b_j b_k) ≤ E[b_j⁴]^½ E[b_k⁴]^½ ≤ 3 F_jj F_kk`: the mean over the rows lies within five of its
+/// standard errors `√(3 F_jj F_kk / R)` of `F_jk`, for the rare class's `F_jj` a relative `5 √(3 / R)`,
+/// where a label drawn from `π` would estimate `π_j (1 − π_j)` with relative variance
+/// `(1 − 2π_j)² / (π_j (1 − π_j))` (`10⁴` here). The mean of `b` is zero within five standard errors
+/// `√(F_jj / R)`.
+#[test]
+fn fisher_probes_average_to_the_softmax_fisher() {
+    let rows = 20_000;
+    // f32 values, so every device holds the same ones: one confident class and a rare one.
+    let pi: Vec<f64> = [0.9_f32, 0.06, 0.03, 0.0099, 1e-4].iter().map(|p| f64::from(*p)).collect();
+    let classes = pi.len();
+    let total: f64 = pi.iter().sum();
+    let fisher = Array2::from_shape_fn((classes, classes), |(j, k)| (if j == k { pi[j] } else { 0.0 }) - (2.0 - total) * pi[j] * pi[k]);
+    let probabilities = Array2::from_shape_fn((rows, classes), |(_, c)| pi[c]);
+    let n = rows as f64;
+    for device in every_device() {
+        let name = device.name();
+        let mut t = up(&device, &probabilities);
+        device.fisher_probe_cotangent(&mut t, (0x5EED, 11), None).expect("the probe");
+        let b = down(&device, &t);
+        let second = b.t().dot(&b) / n;
+        for j in 0..classes {
+            let mean = b.column(j).sum() / n;
+            assert!(mean.abs() <= 5.0 * (fisher[[j, j]] / n).sqrt(), "{name}: the mean of class {j}'s entry, {mean:e}");
+            for k in 0..classes {
+                let error = (3.0 * fisher[[j, j]] * fisher[[k, k]] / n).sqrt();
+                assert!((second[[j, k]] - fisher[[j, k]]).abs() <= 5.0 * error, "{name} ({j},{k}): {:e} against {:e} (standard error at most {error:e})", second[[j, k]], fisher[[j, k]]);
             }
         }
     }
 }
 
-/// A drawn head sweep (`Device::head_log_partition_drawn`) on the host, a CUDA device in float64
-/// and in f32 storage, and the Apple GPU: its partitions and expected rows are the undrawn sweep's;
-/// each scored row's draw is its expected row less one class's head row, rounded once (an unscored
-/// row's is zero); and over rows of one hidden vector against classes spanning several of CUDA's
-/// swept chunks (the last narrower than a block), the draws of each of a few sets of classes fall
-/// within five binomial standard errors of the set's softmax probability.
 /// `axpy_rows`, `axpy_rows_within` and `copy_rows_within` against the copies, axpys and writes they
 /// replace, bit for bit.
 fn row_moves_match_their_compositions(d: &Device) {
@@ -226,62 +284,85 @@ fn bfloat16_outputs_are_the_copies_of_the_f32_ones() {
     }
 }
 
+/// A probed head sweep (`Device::head_log_partition_probed`) on the host, a CUDA device in float64
+/// and in f32 storage, and the Apple GPU, the head stored either way, over classes spanning several
+/// of CUDA's swept chunks (the last narrower than a block): its partitions and expected rows are
+/// the plain sweep's, an unscored row's probe is zero, and each scored row's probe
+/// `Σ_c b_c e_c` (`b = √q ⊙ ξ − q D`, `D = √q · ξ`) lies within `ε ‖e‖_∞ Σ_c √q_c` of the probe
+/// made in float64 on the host from the same signs, and within twice that of the device's own
+/// unfused probe (the logits, their softmax, `Device::fisher_probe_cotangent` and the pullback).
+/// `ε = 4δ + (4 s + 6n + 96) u`, `u` the device's unit roundoff, `n` the classes, `δ` the row's
+/// logit error `(w + 2) u max_c Σ_j |h_j e_cj|` (`w` the width) and `s` the span of its logits: a
+/// logit error `δ` moves `√q_c` by `δ √q_c`, `q_c` by `2δ q_c` and `D` by `δ Σ √q`, so
+/// `Σ_c |Δb_c| |e_cj| ≤ 4δ ‖e‖_∞ Σ √q` (`Σ q = 1`, `|D| ≤ Σ √q`); an exponential's argument
+/// rounds by `u s`, another such error; and the sums over the classes (`D`, the partition and the
+/// pullback, `(n + 8) u` each), the exponentials and roots (`8u` each) and the last combination add
+/// at most `(3n + 48) u` of `‖e‖_∞ Σ_c (√q_c + q_c |D|) ≤ 2 ‖e‖_∞ Σ √q`.
 #[test]
-fn a_drawn_head_sweep_draws_each_class_with_its_softmax_probability() {
-    let (rows, classes, width) = (6000, 3940, 8);
-    let mut devices = vec![Device::host()];
-    devices.extend(accelerator());
-    devices.extend(Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault").filter(|d| !d.float64()));
+fn a_probed_head_sweep_is_the_probe_of_its_softmax() {
+    let (rows, classes, width, key) = (6000, 3940, 8, 0x0C0F_FEE5_u64);
     // f32 values, so every device holds the same ones.
     let single = |m: Array2<f64>| m.mapv(|v| f64::from(v as f32));
-    let vector = single(matrix(1, width, 5, 3.0));
-    let hidden = Array2::from_shape_fn((rows, width), |(_, j)| vector[[0, j]]);
+    let hidden = single(matrix(rows, width, 5, 3.0));
     let embedding = single(matrix(classes, width, 9, 0.7));
-    let uniforms = single(matrix(rows, 1, 13, 0.5).mapv(|v| v + 0.5));
     let flags: Vec<u32> = (0..rows as u32).map(|r| u32::from(r % 7 != 3)).collect();
-    let logits = embedding.dot(&vector.row(0));
-    let top = logits.fold(f64::NEG_INFINITY, |a, b| a.max(*b));
-    let weights = logits.mapv(|z| (z - top).exp());
-    let q = &weights / weights.sum();
-    let mut order: Vec<usize> = (0..classes).collect();
-    order.sort_by(|a, b| q[*b].total_cmp(&q[*a]));
-    let set = |name: String, member: &dyn Fn(usize) -> bool| (name, (0..classes).map(member).collect::<Vec<bool>>());
-    let mut sets: Vec<(String, Vec<bool>)> = order[..4].iter().map(|&c| set(format!("class {c}"), &|k| k == c)).collect();
-    sets.extend((0..5).map(|m| set(format!("classes {m} mod 5"), &|k| k % 5 == m)));
-    sets.extend([(0, 1000), (1000, 2560), (2560, 3840), (3840, classes)].map(|(a, b)| set(format!("classes {a}..{b}"), &|k| a <= k && k < b)));
-    for device in &devices {
-        let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
-        let (h, e, u) = (up(device, &hidden), up(device, &embedding), up(device, &uniforms));
-        let f = device.upload_indices(&flags).expect("flags");
-        let mut plain = device.zeros(rows, width).expect("zeros");
-        let partitions = device.head_log_partition(&h, &e, false, Some(&f), Some(&mut plain), arithmetic).expect("the sweep");
-        let (mut mean, mut draws) = (device.zeros(rows, width).expect("zeros"), device.zeros(rows, width).expect("zeros"));
-        let drawn = device.head_log_partition_drawn(&h, (&e, false), Some(&f), &mut mean, (&u, &mut draws), arithmetic).expect("the drawn sweep");
-        let name = device.name();
-        assert_eq!(drawn, partitions, "{name}: the partitions");
-        let (mean, draws) = (down(device, &mean), down(device, &draws));
-        assert_eq!(mean, down(device, &plain), "{name}: the expected rows");
-        let mut counts = vec![0usize; classes];
-        for r in 0..rows {
-            if flags[r] == 0 {
-                assert!(draws.row(r).iter().all(|v| *v == 0.0), "{name} row {r}: an unscored row's draw");
-                continue;
-            }
-            let gap = |c: usize| (0..width).map(|j| (mean[[r, j]] - draws[[r, j]] - embedding[[c, j]]).powi(2)).sum::<f64>();
-            let label = (0..classes).min_by(|a, b| gap(*a).total_cmp(&gap(*b))).expect("a class");
+    let largest = embedding.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    // The probe in float64, and per row `Σ √q`, the logits' span and the largest `Σ_j |h_j e_cj|`.
+    let mut exact = Array2::<f64>::zeros((rows, width));
+    let (mut roots, mut spans, mut sizes) = (vec![0.0; rows], vec![0.0; rows], vec![0.0_f64; rows]);
+    for r in 0..rows {
+        let term = |c: usize, j: usize| hidden[[r, j]] * embedding[[c, j]];
+        let z: Vec<f64> = (0..classes).map(|c| (0..width).map(|j| term(c, j)).sum::<f64>()).collect();
+        let top = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let low = z.iter().copied().fold(f64::INFINITY, f64::min);
+        let weights: Vec<f64> = z.iter().map(|v| (v - top).exp()).collect();
+        let total: f64 = weights.iter().sum();
+        let q: Vec<f64> = weights.iter().map(|w| w / total).collect();
+        let signed: Vec<f64> = (0..classes).map(|c| q[c].sqrt() * fisher_sign(key, r as u64, c as u64)).collect();
+        let dot: f64 = signed.iter().sum();
+        for c in 0..classes {
+            let b = signed[c] - q[c] * dot;
             for j in 0..width {
-                let exact = mean[[r, j]] - embedding[[label, j]];
-                let band = if device.float64() { 0.0 } else { exact.abs() / 16_777_216.0 };
-                assert!((draws[[r, j]] - exact).abs() <= band, "{name} row {r}: draw {} against {exact} less class {label}", draws[[r, j]]);
+                exact[[r, j]] += b * embedding[[c, j]];
             }
-            counts[label] += 1;
+            sizes[r] = sizes[r].max((0..width).map(|j| term(c, j).abs()).sum::<f64>());
         }
-        let scored = flags.iter().filter(|f| **f != 0).count() as f64;
-        for (set, members) in &sets {
-            let p: f64 = (0..classes).filter(|c| members[*c]).map(|c| q[c]).sum();
-            let n = (0..classes).filter(|c| members[*c]).map(|c| counts[c]).sum::<usize>() as f64;
-            let error = (scored * p * (1.0 - p)).sqrt();
-            assert!((n - scored * p).abs() <= 5.0 * error + 1.0, "{name}: {set} drawn {n} times against {} (standard error {error})", scored * p);
+        roots[r] = q.iter().map(|p| p.sqrt()).sum();
+        spans[r] = top - low;
+    }
+    for device in every_device() {
+        let (arithmetic, u) = if device.float64() { (Arithmetic::F64, U) } else { (Arithmetic::F32, f64::from(f32::EPSILON) / 2.0) };
+        let band = |r: usize| (4.0 * (width + 2) as f64 * u * sizes[r] + (4.0 * spans[r] + 6.0 * classes as f64 + 96.0) * u) * largest * roots[r];
+        let (h, f) = (up(&device, &hidden), device.upload_indices(&flags).expect("flags"));
+        for transposed in [false, true] {
+            let name = format!("{} (transposed {transposed})", device.name());
+            let e = up(&device, &if transposed { embedding.t().to_owned() } else { embedding.clone() });
+            let mut plain = device.zeros(rows, width).expect("zeros");
+            let partitions = device.head_log_partition(&h, &e, transposed, Some(&f), Some(&mut plain), arithmetic).expect("the sweep");
+            let (mut mean, mut probed) = (device.zeros(rows, width).expect("zeros"), device.zeros(rows, width).expect("zeros"));
+            let swept = device.head_log_partition_probed(&h, (&e, transposed), Some(&f), &mut mean, (key, &mut probed), arithmetic).expect("the probed sweep");
+            assert_eq!(swept, partitions, "{name}: the partitions");
+            assert_eq!(down(&device, &mean), down(&device, &plain), "{name}: the expected rows");
+            // The same probe unfused on the device.
+            let (into, back) = if transposed { (Op::N, Op::T) } else { (Op::T, Op::N) };
+            let mut logits = device.zeros(rows, classes).expect("zeros");
+            device.gemm(&mut logits, 1.0, &h, Op::N, &e, into, 0.0, arithmetic).expect("the logits");
+            device.softmax_rows(&mut logits, false).expect("the softmax");
+            device.fisher_probe_cotangent(&mut logits, (key, 0), Some(&f)).expect("the probe");
+            let mut unfused = device.zeros(rows, width).expect("zeros");
+            device.gemm(&mut unfused, 1.0, &logits, Op::N, &e, back, 0.0, arithmetic).expect("the pullback");
+            let (probed, unfused) = (down(&device, &probed), down(&device, &unfused));
+            for r in 0..rows {
+                for j in 0..width {
+                    let (swept, alone) = (probed[[r, j]], unfused[[r, j]]);
+                    if flags[r] == 0 {
+                        assert!(swept == 0.0 && alone == 0.0, "{name} row {r}: an unscored row's probe");
+                        continue;
+                    }
+                    assert!((swept - exact[[r, j]]).abs() <= band(r), "{name} ({r},{j}): swept {swept} against {} (band {:e})", exact[[r, j]], band(r));
+                    assert!((swept - alone).abs() <= 2.0 * band(r), "{name} ({r},{j}): swept {swept} against unfused {alone} (band {:e})", 2.0 * band(r));
+                }
+            }
         }
     }
 }
@@ -413,7 +494,7 @@ fn device_operations_agree_with_the_host() {
     host.hadamard(&mut hy, &hx, &hg, true).expect("hadamard");
     device.hadamard(&mut dy, &dx, &dg, true).expect("hadamard");
     assert_eq!(down(&device, &dy), down(&host, &hy), "elementwise maps round alike (no contraction)");
-    // The KL rows, the sampled cotangent and the Fisher quadratic, with some rows unscored.
+    // The KL rows, the Fisher probe and the Fisher quadratic, with some rows unscored.
     let (classes, n) = (1000, 37);
     let logits = matrix(n, classes, 47, 6.0);
     let target = matrix(n, classes, 53, 6.0);
@@ -427,18 +508,16 @@ fn device_operations_agree_with_the_host() {
         assert!((hk[r] - dk[r]).abs() <= gamma(classes + 8) * 40.0, "kl row {r}: {} against {}", dk[r], hk[r]);
     }
     assert_within("kl cotangent", &down(&device, &dl), &down(&host, &hl), |_, _| gamma(classes + 8));
-    let uniforms = matrix(n, 1, 59, 0.5).mapv(|v| v + 0.5);
-    let (hu, du) = both(&uniforms);
-    let (mut hs, mut ds) = both(&logits);
-    host.sampled_cotangent(&mut hs, &hu, None).expect("host sampled");
-    device.sampled_cotangent(&mut ds, &du, None).expect("device sampled");
-    let (hs, ds) = (down(&host, &hs), down(&device, &ds));
-    for r in 0..n {
-        // The label is the one entry below zero; away from a tie at the uniform both pick it.
-        let label = |m: &Array2<f64>| m.row(r).iter().position(|v| *v < -0.5).expect("a label");
-        assert_eq!(label(&hs), label(&ds), "row {r}'s label");
-    }
-    assert_within("sampled cotangent", &ds, &hs, |_, _| gamma(classes + 8));
+    // The probe of the host's softmax rows on both: the same signs, so each entry within the
+    // summation band of `q (√q · ξ)` and the roundings of `√q` and the last two steps.
+    let mut hq = up(&host, &logits);
+    host.softmax_rows(&mut hq, false).expect("host softmax");
+    let q = down(&host, &hq);
+    let roots: Vec<f64> = q.rows().into_iter().map(|row| row.iter().map(|p| p.sqrt()).sum()).collect();
+    let (mut hp, mut dp) = both(&q);
+    host.fisher_probe_cotangent(&mut hp, (59, 3), Some(&hf)).expect("host probe");
+    device.fisher_probe_cotangent(&mut dp, (59, 3), Some(&df)).expect("device probe");
+    assert_within("fisher probe", &down(&device, &dp), &down(&host, &hp), |i, j| gamma(classes + 8) * (q[[i, j]].sqrt() + q[[i, j]] * roots[i]));
     let tangent = matrix(n, classes, 61, 1.0);
     let (hl, dl) = both(&logits);
     let (htan, dtan) = both(&tangent);

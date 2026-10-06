@@ -1200,8 +1200,9 @@ mod tests {
 
     /// The removal estimates of `posterior` on the evidence ([`Curvature`]): per batch `b`, one
     /// forward pass at its sample ([`sample`] with key `b`), reversed for the divergence's
-    /// gradient `g_b` and for a sampled-label draw `u_b`, and per group `g_b,G · θ_b,G` and
-    /// `u_b,G · θ_b,G` over its live entries, the data term weighted by `weight`.
+    /// gradient `g_b` and for a draw `u_b` of the Gauss–Newton factor (its Fisher probe keyed from
+    /// `rng`), and per group `g_b,G · θ_b,G` and `u_b,G · θ_b,G` over its live entries, the data
+    /// term weighted by `weight`.
     fn measured(ic: &mut Interchange, explanation: &Explanation, posterior: &Posterior, evidence: &[Evidence], weight: f64, rng: &mut StdRng) -> Curvature {
         use rand::RngExt;
         let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
@@ -1209,9 +1210,8 @@ mod tests {
         for (b, e) in evidence.iter().enumerate() {
             let theta = sample(posterior, b as u64);
             ic.load(&theta).expect("the sample loads");
-            let rows: usize = e.experiments.iter().map(|x| e.batch.length() - x.position).sum();
-            let uniforms: Vec<f64> = (0..rows).map(|_| rng.random::<f64>()).collect();
-            let evaluation = ic.evaluate_labelled(&e.batch, &e.experiments, Some(&e.targets), true, Some(&uniforms)).expect("the labelled evaluation");
+            let probe = rng.random::<u64>();
+            let evaluation = ic.evaluate_probed(&e.batch, &e.experiments, Some(&e.targets), true, Some(probe)).expect("the probed evaluation");
             let factor = evaluation.factor.expect("the Gauss–Newton factor");
             let d = ic.models().1.program.device();
             let dots = |gradient: &BTreeMap<usize, gam_gpu::tensor::Tensor>| -> Vec<f64> {

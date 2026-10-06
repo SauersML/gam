@@ -1446,7 +1446,7 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
     Ok((stream, calls))
 }
 
-/// The products' precision of the reverse passes (the data term's gradient and the sampled-label
+/// The products' precision of the reverse passes (the data term's gradient and the Gauss–Newton
 /// factor): bfloat16 on CUDA in f32 storage (whose bfloat16 tensor cores run at least twice its
 /// f32 rate), else the forward's `arithmetic`. The forward passes and the scores, the objective and
 /// the line step's measurements, keep the forward's arithmetic. Each reverse pass's result is one
@@ -1910,7 +1910,7 @@ fn spread(d: &Device, buffer: usize, rows: &[Range<usize>], seed: &Tensor, weigh
     Ok(cotangent)
 }
 
-/// One batch's scores and gradients ([`evaluate`], [`evaluate_labelled`]).
+/// One batch's scores and gradients ([`evaluate`], [`evaluate_probed`]).
 pub struct Evaluation {
     /// Per experiment, per base token from its position on, `KL(M_e ‖ P_e)` in bits (empty when no
     /// targets were given).
@@ -1918,30 +1918,37 @@ pub struct Evaluation {
     /// The gradient of the sum of `bits` in each of `P`'s trainable operators, on the device (empty
     /// when not asked for).
     pub gradient: BTreeMap<usize, Tensor>,
-    /// A draw of the Gauss–Newton factor, when asked for ([`evaluate_labelled`]).
+    /// A draw of the Gauss–Newton factor, when asked for ([`evaluate_probed`]).
     pub factor: Option<Factor>,
 }
 
-/// A draw of the Gauss–Newton factor of a batch's experiments: the gradient `u`, in each of `P`'s
-/// trainable operators on the device, of `Σ_t log P_e(y_t)` over every scored token `t` of every
-/// experiment `e`, each label `y_t` drawn from `P_e`'s own prediction there, and the number of
-/// tokens `n`. The labels are independent across tokens with `E[e_y] = p`, so
-/// `E[u uᵀ] = Σ_t J_tᵀ (diag p_t − p_t p_tᵀ) J_t`: `u ⊙ u / n` is an unbiased estimate of the
-/// diagonal of the data term's Gauss–Newton curvature per token (the Hessian of `KL(M_e ‖ P_e)` in
-/// `P`'s logits is `P`'s softmax Fisher matrix whatever `M_e` is).
+/// A draw of the Gauss–Newton factor of a batch's experiments: `u = Σ_t J_tᵀ b_t` in each of `P`'s
+/// trainable operators on the device, over every scored token `t` of every experiment `e`, `J_t`
+/// the Jacobian of `P_e`'s logits at `t` and `b_t` the Fisher probe there
+/// (`Device::fisher_probe_cotangent`): with `p_t` `P_e`'s prediction and `ξ_t` independent random
+/// signs over the vocabulary, `b_t = √p_t ⊙ ξ_t − p_t (√p_t · ξ_t)`; and the number of tokens `n`.
+/// With `L_t = diag √p_t − p_t √p_tᵀ`, `b_t = L_t ξ_t` and `L_t L_tᵀ = diag p_t − p_t p_tᵀ`, and the
+/// tokens' signs are independent, so `E[u uᵀ] = Σ_t J_tᵀ (diag p_t − p_t p_tᵀ) J_t`: `u ⊙ u / n` is
+/// an unbiased estimate of the diagonal of the data term's Gauss–Newton curvature per token (the
+/// Hessian of `KL(M_e ‖ P_e)` in `P`'s logits is `P`'s softmax Fisher matrix whatever `M_e` is).
+/// Each entry is `u_i = a · ξ` over all the batch's signs `ξ`, so `E[u_i⁴] = 3 c² − 2 Σ_j a_j⁴` with
+/// `c = E[u_i²] = ‖a‖²`: `u_i²` estimates `c` with relative variance at most 2 whatever the
+/// predictions are. A label `y_t` drawn from `p_t` (the score `p_t − e_{y_t}` in place of `b_t`) has
+/// the same `E[u uᵀ]`, but its squared score estimates `p (1 − p)` for a class of probability `p`
+/// with relative variance `(1 − 2p)² / (p (1 − p))`, `10⁶` at `p = 10⁻⁶`.
 pub struct Factor {
     pub gradient: BTreeMap<usize, Tensor>,
     pub tokens: usize,
 }
 
-/// The cotangent at the final normed stream `hidden` (rows × width) of `−Σ_r log P(y_r)` for one
-/// label `y_r` per row drawn from `P`'s prediction `softmax(E h_r)` there with that row's entry of
-/// `uniforms` (`embedding` is `E`, classes × width): per row `(p_r − e_{y_r}) E`. The logits are
-/// formed `tile` rows at a time.
-pub fn sampled_label_seed(d: &Device, hidden: &Tensor, embedding: &Tensor, tile: usize, uniforms: &[f64], arithmetic: Arithmetic) -> Result<Tensor, String> {
+/// The Fisher probe under `key` pulled back to the final normed stream `hidden` (rows × width): per
+/// row `r`, `b_r E` with `b_r` the probe's cotangent at `P`'s prediction `softmax(E h_r)` there
+/// (`Device::fisher_probe_cotangent`, rows numbered from zero; `embedding` is `E`, classes ×
+/// width). The logits are formed `tile` rows at a time.
+pub fn fisher_probe_seed(d: &Device, hidden: &Tensor, embedding: &Tensor, tile: usize, key: u64, arithmetic: Arithmetic) -> Result<Tensor, String> {
     let (rows, classes) = (hidden.rows(), embedding.rows());
-    if uniforms.len() != rows || tile == 0 {
-        return Err(error("one uniform per row and positive tile rows required"));
+    if tile == 0 {
+        return Err(error("positive tile rows required"));
     }
     // Every buffer below is written whole (products with β = 0, the tiles' rows), so none is zeroed.
     let mut seed = d.empty(rows, hidden.cols()).map_err(error)?;
@@ -1950,8 +1957,8 @@ pub fn sampled_label_seed(d: &Device, hidden: &Tensor, embedding: &Tensor, tile:
         let h = d.rows_of(hidden, start, n).map_err(error)?;
         let mut logits = d.empty(n, classes).map_err(error)?;
         d.gemm(&mut logits, 1.0, &h, Op::N, embedding, Op::T, 0.0, arithmetic).map_err(error)?;
-        let uniforms = d.upload_vec(n, 1, uniforms[start..start + n].to_vec()).map_err(error)?;
-        d.sampled_cotangent(&mut logits, &uniforms, None).map_err(error)?;
+        d.softmax_rows(&mut logits, false).map_err(error)?;
+        d.fisher_probe_cotangent(&mut logits, (key, start), None).map_err(error)?;
         let mut part = d.empty(n, hidden.cols()).map_err(error)?;
         d.gemm(&mut part, 1.0, &logits, Op::N, embedding, Op::N, 0.0, arithmetic).map_err(error)?;
         d.set_rows(&mut seed, start, &part).map_err(error)?;
@@ -1963,22 +1970,23 @@ pub fn sampled_label_seed(d: &Device, hidden: &Tensor, embedding: &Tensor, tile:
 /// note), at `P`'s current parameters, against `M`'s `targets` for them, and with `gradient` its
 /// sum's gradient in `P`'s trainable operators. `M` runs here only as the hybrids' blocks it keeps.
 pub fn evaluate<E: BlockEngine>(m: &E, p: &E, head: &FixedHead, batch: &Batch, targets: &Targets, experiments: &[Experiment], gradient: bool) -> Result<Evaluation, String> {
-    evaluate_labelled((m, p), head, (batch, experiments), Some(targets), gradient, None)
+    evaluate_probed((m, p), head, (batch, experiments), Some(targets), gradient, None)
 }
 
-/// [`evaluate`] of `experiments` on `batch`, with the scores only when `targets` are
-/// given, and with `labels` also a draw of the Gauss–Newton factor ([`Factor`]), each scored row's
-/// label drawn with its entry of `labels` (rows in experiment order): a second reverse pass through
-/// the same forward pass, seeded at every scored token by `Σ q e − e_y`. With the divergence's
-/// gradient the head's one sweep of the vocabulary makes both seeds, which share `Σ q e`
-/// (`Device::head_log_partition_drawn`); without it, [`sampled_label_seed`] sweeps for the labels.
-pub fn evaluate_labelled<E: BlockEngine>(
+/// [`evaluate`] of `experiments` on `batch`, with the scores only when `targets` are given, and
+/// with the probe key `probe` also a draw of the Gauss–Newton factor ([`Factor`]) under it, the
+/// scored rows numbered from zero in experiment order: a second reverse pass through the same
+/// forward pass, seeded at every scored token by the probe pulled back through the head. With the
+/// divergence's gradient the head's one sweep of the vocabulary makes both seeds
+/// (`Device::head_log_partition_probed`); without it, [`fisher_probe_seed`] sweeps for the probe.
+/// Either way a key gives the same signs: the two seeds of one key differ only by rounding.
+pub fn evaluate_probed<E: BlockEngine>(
     (m, p): (&E, &E),
     head: &FixedHead,
     (batch, experiments): (&Batch, &[Experiment]),
     targets: Option<&Targets>,
     gradient: bool,
-    labels: Option<&[f64]>,
+    probe: Option<u64>,
 ) -> Result<Evaluation, String> {
     let d = p.device();
     let (blocks, length, width) = (p.blocks(), batch.length, p.width());
@@ -1998,14 +2006,14 @@ pub fn evaluate_labelled<E: BlockEngine>(
     let (paths, bases) = paths(batch, experiments, p.values(), engine_parts(p), None, blocks)?;
     let plan = Plan::new(paths, length);
     let arithmetic = p.arithmetic();
-    let (stream, calls) = run([p, m], &plan, gradient || labels.is_some())?;
+    let (stream, calls) = run([p, m], &plan, gradient || probe.is_some())?;
     // Each experiment's scored rows, from its position on.
     let rows = outputs(&plan, &bases, experiments);
     let hidden = gather(d, &stream, &rows)?;
     let spread = |seed: &Tensor, weight: f64| spread(d, stream.rows(), &rows, seed, weight);
     let mut bits = Vec::new();
     let mut total = BTreeMap::new();
-    let (mut drawn, mut data_seed) = (None, None);
+    let (mut probed, mut data_seed) = (None, None);
     if let Some(targets) = targets {
         let mut mu = d.zeros(hidden.rows(), width).map_err(error)?;
         let mut entropy = Vec::with_capacity(hidden.rows());
@@ -2016,8 +2024,8 @@ pub fn evaluate_labelled<E: BlockEngine>(
             at += r.len();
         }
         let target = Target { mu: Arc::new(mu), entropy, head: Arc::clone(&head.head), scored: None };
-        let (nats, seed, draws) = head.resident.score(d, &hidden, &target, gradient, labels.filter(|_| gradient), arithmetic)?;
-        drawn = draws;
+        let (nats, seed, pulled) = head.resident.score(d, &hidden, &target, gradient, probe.filter(|_| gradient), arithmetic)?;
+        probed = pulled;
         bits.reserve(experiments.len());
         let mut at = 0;
         for r in &rows {
@@ -2029,15 +2037,15 @@ pub fn evaluate_labelled<E: BlockEngine>(
             data_seed = Some(spread(&seed, 1.0 / std::f64::consts::LN_2)?);
         }
     }
-    // The divergence's gradient and the factor's draw (with a label draw of its own, its logits
-    // and its seed, in the factor's arithmetic, when the divergence's sweep drew none) reverse
-    // together, each call's tape had once for both.
+    // The divergence's gradient and the factor's draw (with a sweep of its own for the probe, its
+    // logits and its seed, in the factor's arithmetic, when the divergence's sweep made none)
+    // reverse together, each call's tape had once for both.
     let factor = factor_arithmetic(d, arithmetic);
-    let factor_seed = match labels {
-        Some(uniforms) => Some(spread(
-            &match drawn {
+    let factor_seed = match probe {
+        Some(key) => Some(spread(
+            &match probed {
                 Some(seed) => seed,
-                None => sampled_label_seed(d, &hidden, &head.resident.embedding, head.resident.tile_rows.max(1), uniforms, factor)?,
+                None => fisher_probe_seed(d, &hidden, &head.resident.embedding, head.resident.tile_rows.max(1), key, factor)?,
             },
             1.0,
         )?),
@@ -2060,15 +2068,16 @@ pub fn evaluate_labelled<E: BlockEngine>(
     Ok(Evaluation { bits, gradient: total, factor })
 }
 
-/// The gradient in `P`'s trainable operators of `Σ log P_e(y)` over every scored token of
-/// `experiments` on `batch` (each experiment from its position on, as [`evaluate`] scores it), at
-/// `P`'s loaded parameters, each `y` drawn from `P_e`'s own next-token distribution at its row with
-/// that row's entry of `uniforms` (rows in experiment order). Its outer product `u uᵀ` is an unbiased
-/// estimate of the Gauss–Newton matrix of the experiments' divergence `Σ KL(M_e ‖ P_e)` in nats,
-/// `Σ_t J_tᵀ F_t J_t` with `F_t` the Fisher matrix of `P_e`'s softmax at `t`: the matrix that is the
-/// divergence's Hessian where `P_e`'s predictions equal `M_e`'s.
-pub fn sampled_label<E: BlockEngine>(m: &E, p: &E, head: &FixedHead, batch: &Batch, experiments: &[Experiment], uniforms: &[f64]) -> Result<BTreeMap<usize, Tensor>, String> {
-    let evaluation = evaluate_labelled((m, p), head, (batch, experiments), None, false, Some(uniforms))?;
+/// The draw `u = Σ_t J_tᵀ b_t` of the Gauss–Newton factor ([`Factor`]) in `P`'s trainable operators
+/// over every scored token `t` of `experiments` on `batch` (each experiment from its position on, as
+/// [`evaluate`] scores it), at `P`'s loaded parameters, `b_t` the Fisher probe under `key` at
+/// `P_e`'s own next-token distribution there (rows numbered from zero in experiment order). Its
+/// outer product `u uᵀ` is an unbiased estimate of the Gauss–Newton matrix of the experiments'
+/// divergence `Σ KL(M_e ‖ P_e)` in nats, `Σ_t J_tᵀ F_t J_t` with `F_t` the Fisher matrix of `P_e`'s
+/// softmax at `t`: the matrix that is the divergence's Hessian where `P_e`'s predictions equal
+/// `M_e`'s.
+pub fn fisher_probe<E: BlockEngine>(m: &E, p: &E, head: &FixedHead, batch: &Batch, experiments: &[Experiment], key: u64) -> Result<BTreeMap<usize, Tensor>, String> {
+    let evaluation = evaluate_probed((m, p), head, (batch, experiments), None, false, Some(key))?;
     Ok(evaluation.factor.ok_or_else(|| error("no Gauss–Newton factor"))?.gradient)
 }
 
@@ -2377,19 +2386,19 @@ impl Interchange {
     /// `P`'s score on `experiments` against `targets` ([`evaluate`]), the gradient left on the
     /// device per trainable operator.
     pub fn evaluate_resident(&self, batch: &Batch, experiments: &[Experiment], targets: &Targets, gradient: bool) -> Result<Evaluation, String> {
-        self.evaluate_labelled(batch, experiments, Some(targets), gradient, None)
+        self.evaluate_probed(batch, experiments, Some(targets), gradient, None)
     }
 
-    /// [`evaluate_labelled`] of `P` as it is held, the gradients left on the device.
-    pub fn evaluate_labelled(&self, batch: &Batch, experiments: &[Experiment], targets: Option<&Targets>, gradient: bool, labels: Option<&[f64]>) -> Result<Evaluation, String> {
+    /// [`evaluate_probed`] of `P` as it is held, the gradients left on the device.
+    pub fn evaluate_probed(&self, batch: &Batch, experiments: &[Experiment], targets: Option<&Targets>, gradient: bool, probe: Option<u64>) -> Result<Evaluation, String> {
         let (teacher, p) = self.models();
-        evaluate_labelled((&teacher, &p), &self.head, (batch, experiments), targets, gradient, labels)
+        evaluate_probed((&teacher, &p), &self.head, (batch, experiments), targets, gradient, probe)
     }
 
-    /// [`sampled_label`] at `P`'s loaded parameters, the gradient left on the device per trainable
+    /// [`fisher_probe`] at `P`'s loaded parameters, the gradient left on the device per trainable
     /// operator.
-    pub fn sampled_label_resident(&self, batch: &Batch, experiments: &[Experiment], uniforms: &[f64]) -> Result<BTreeMap<usize, Tensor>, String> {
-        let evaluation = self.evaluate_labelled(batch, experiments, None, false, Some(uniforms))?;
+    pub fn fisher_probe_resident(&self, batch: &Batch, experiments: &[Experiment], key: u64) -> Result<BTreeMap<usize, Tensor>, String> {
+        let evaluation = self.evaluate_probed(batch, experiments, None, false, Some(key))?;
         Ok(evaluation.factor.ok_or_else(|| error("no Gauss–Newton factor"))?.gradient)
     }
 
@@ -2594,8 +2603,9 @@ mod tests {
     /// exact diagonal is `Σ_r Σ_c p_rc (J_rᵀ (p_r − e_c))²`: one reverse pass per row and class
     /// through the same forward pass, seeded at that row alone. The draws' mean of `u²` must lie
     /// within five standard errors of it, for each operator's trace and for its largest entry: for
-    /// the labels drawn by their own sweep, and for those drawn in the divergence's sweep with its
-    /// gradient.
+    /// the probe made by its own sweep, and for the one made in the divergence's sweep with its
+    /// gradient. On the host the two make one key's factor bit for bit (the same probabilities,
+    /// signs and products, and reverses run together are each one alone).
     #[test]
     fn the_squared_factor_estimates_the_gauss_newton_diagonal() {
         let dir = tiny_export("interchange_factor", 2);
@@ -2648,16 +2658,24 @@ mod tests {
         }
         // The draws.
         let targets = ic.targets(&batch, &experiments).expect("the targets");
+        let factor_bits = |factor: &Factor| -> Vec<(usize, Vec<u64>)> {
+            factor.gradient.iter().map(|(op, u)| (*op, device.download(u).expect("download").iter().map(|v| v.to_bits()).collect())).collect()
+        };
+        for key in [1, 2, 3] {
+            let fused = ic.evaluate_probed(&batch, &experiments, Some(&targets), true, Some(key)).expect("a draw").factor.expect("the factor");
+            let alone = ic.evaluate_probed(&batch, &experiments, None, false, Some(key)).expect("a draw").factor.expect("the factor");
+            assert_eq!(factor_bits(&fused), factor_bits(&alone), "key {key}: the divergence's sweep and the probe's own");
+        }
         for fused in [false, true] {
             let draws = 400;
             let mut sums: BTreeMap<usize, (ndarray::Array2<f64>, ndarray::Array2<f64>, f64, f64)> = BTreeMap::new();
             let mut rng = StdRng::seed_from_u64(7);
             for _ in 0..draws {
-                let uniforms: Vec<f64> = (0..hidden.nrows()).map(|_| rng.random::<f64>()).collect();
+                let key = rng.random::<u64>();
                 let evaluation = if fused {
-                    ic.evaluate_labelled(&batch, &experiments, Some(&targets), true, Some(&uniforms))
+                    ic.evaluate_probed(&batch, &experiments, Some(&targets), true, Some(key))
                 } else {
-                    ic.evaluate_labelled(&batch, &experiments, None, false, Some(&uniforms))
+                    ic.evaluate_probed(&batch, &experiments, None, false, Some(key))
                 };
                 let factor = evaluation.expect("a draw").factor.expect("the factor");
                 assert_eq!(factor.tokens, hidden.nrows());

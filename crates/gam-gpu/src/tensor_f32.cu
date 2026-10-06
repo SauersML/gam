@@ -105,38 +105,18 @@ __device__ double row_lse(const float* z, unsigned int cols, float* sm, double* 
     return (double)mm + log(total);
 }
 
-// The first class whose cumulative probability passes `pick` (the last if none does): each thread
-// sums a contiguous chunk of the row in double, then one thread walks the chunk sums and the chosen
-// chunk. Every thread returns the label.
-__device__ unsigned int pick_label(const float* q, unsigned int cols, double pick, double* chunks, unsigned int* label) {
-    unsigned int t = threadIdx.x;
-    unsigned int chunk = (cols + BLOCK - 1) / BLOCK;
-    unsigned int lo = min(t * chunk, cols), hi = min(lo + chunk, cols);
-    double part = 0.0;
-    for (unsigned int c = lo; c < hi; c++) part += (double)q[c];
-    chunks[t] = part;
-    __syncthreads();
-    if (t == 0) {
-        unsigned int chosen = cols - 1;
-        double left = pick;
-        for (unsigned int k = 0; k < BLOCK; k++) {
-            if (left < chunks[k]) {
-                unsigned int start = k * chunk, end = min(start + chunk, cols);
-                chosen = end - 1;
-                for (unsigned int c = start; c < end; c++) {
-                    if (left < (double)q[c]) { chosen = c; break; }
-                    left -= (double)q[c];
-                }
-                break;
-            }
-            left -= chunks[k];
-        }
-        *label = chosen;
+// The sign of class `k` in row `r` of the Fisher probe under `key` (`fisher_sign` on the host): the
+// top bit of the first word of Philox4x32-10 of the counter (k, r), +1 when it is clear.
+__device__ float fisher_sign(u64 key, u64 r, u64 k) {
+    unsigned int c0 = (unsigned int)k, c1 = (unsigned int)(k >> 32), c2 = (unsigned int)r, c3 = (unsigned int)(r >> 32);
+    unsigned int k0 = (unsigned int)key, k1 = (unsigned int)(key >> 32);
+    for (int round = 0; round < 10; ++round) {
+        if (round > 0) { k0 += 0x9E3779B9u; k1 += 0xBB67AE85u; }
+        unsigned int hi0 = __umulhi(0xD2511F53u, c0), lo0 = 0xD2511F53u * c0;
+        unsigned int hi1 = __umulhi(0xCD9E8D57u, c2), lo1 = 0xCD9E8D57u * c2;
+        c0 = hi1 ^ c1 ^ k0; c1 = lo1; c2 = hi0 ^ c3 ^ k1; c3 = lo0;
     }
-    __syncthreads();
-    unsigned int chosen = *label;
-    __syncthreads();
-    return chosen;
+    return (c0 >> 31) ? -1.0f : 1.0f;
 }
 
 extern "C" __global__ void axpy(u64 n, double alpha, const float* x, float* y) {
@@ -540,27 +520,23 @@ extern "C" __global__ void kl_rows(unsigned int rows, unsigned int cols, const f
     if (threadIdx.x == 0) kl[r] = total;
 }
 
-extern "C" __global__ void sampled_cotangent(unsigned int rows, unsigned int cols, float* logits, const float* uniforms,
-                                             const unsigned int* scored, int use_scored) {
-    __shared__ float sm[WARPS];
+// In place of row r's probabilities π, the Fisher probe's cotangent b = √π ⊙ ξ − π (√π · ξ)
+// (`Device::fisher_probe_cotangent`), ξ the signs of row `first + r` under `key`, √π · ξ summed in
+// double; a row whose `scored` flag is zero becomes zero.
+extern "C" __global__ void fisher_probe(unsigned int rows, unsigned int cols, float* probabilities, u64 key, u64 first,
+                                        const unsigned int* scored, int use_scored) {
     __shared__ double ss[WARPS];
-    __shared__ double chunks[BLOCK];
-    __shared__ unsigned int label;
     unsigned int r = blockIdx.x;
     if (r >= rows) return;
-    float* z = logits + (u64)r * cols;
+    float* q = probabilities + (u64)r * cols;
     if (use_scored && scored[r] == 0) {
-        for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) z[c] = 0.0f;
+        for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) q[c] = 0.0f;
         return;
     }
-    float m;
-    double sum;
-    row_lse(z, cols, sm, ss, &m, &sum);
-    float inverse = (float)(1.0 / sum);
-    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) z[c] = expf(z[c] - m) * inverse;
-    __syncthreads();
-    unsigned int chosen = pick_label(z, cols, (double)uniforms[r], chunks, &label);
-    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) z[c] -= (c == chosen) ? 1.0f : 0.0f;
+    double partial = 0.0;
+    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) partial += (double)(sqrtf(q[c]) * fisher_sign(key, first + r, c));
+    float dot = (float)block_sum_d(partial, ss);
+    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) q[c] = sqrtf(q[c]) * fisher_sign(key, first + r, c) - q[c] * dot;
 }
 
 extern "C" __global__ void block_products(u64 n, unsigned int cols, unsigned int blocks,
@@ -572,24 +548,6 @@ extern "C" __global__ void block_products(u64 n, unsigned int cols, unsigned int
         for (unsigned int c = offsets[block]; c < offsets[block + 1]; c++)
             sum += left[row * cols + c] * right[row * cols + c];
         out[i] = sum;
-    }
-}
-
-extern "C" __global__ void sampled_head_cotangent(unsigned int rows, unsigned int classes, unsigned int width,
-    const float* probabilities, const float* mean, const float* head, int transposed,
-    const float* uniforms, const unsigned int* scored, int use_scored, float* out) {
-    __shared__ double chunks[BLOCK];
-    __shared__ unsigned int label;
-    unsigned int r = blockIdx.x;
-    if (r >= rows) return;
-    if (use_scored && scored[r] == 0) {
-        for (unsigned int h = threadIdx.x; h < width; h += BLOCK) out[(u64)r * width + h] = 0.0f;
-        return;
-    }
-    unsigned int chosen = pick_label(probabilities + (u64)r * classes, classes, (double)uniforms[r], chunks, &label);
-    for (unsigned int h = threadIdx.x; h < width; h += BLOCK) {
-        u64 index = transposed ? (u64)h * classes + chosen : (u64)chosen * width + h;
-        out[(u64)r * width + h] = mean[(u64)r * width + h] - head[index];
     }
 }
 
@@ -769,32 +727,19 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
     if (threadIdx.x == 0) out[r] = total;
 }
 
-// A uniform on [0, 1) for chunk `k` of row `r` of a drawn sweep whose row uniform is `u`: output
-// k + 1 of SplitMix64 (Steele, Lea and Flood 2014) seeded with the row and the uniform's bits.
-__device__ double chunk_uniform(float u, unsigned int r, unsigned int k) {
-    u64 z = (((u64)r << 32) | (u64)__float_as_uint(u)) + 0x9E3779B97F4A7C15ull * ((u64)k + 1);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    z ^= z >> 31;
-    return (double)(z >> 11) * (1.0 / 9007199254740992.0);
-}
-
 // One chunk of a swept log partition (`Device::head_log_partition`): row r's logits for the chunk's
 // `cols` classes merge into its running largest `m[r]` and sum `s[r]`, `factor[r]` gets exp(old
 // largest − new) (the rescaling of what the row accumulated before), and when `expected` the
 // logits become exp(logit − new largest) in place, ready to weight the chunk's head rows. With
-// `draw` (`Device::head_log_partition_drawn`), chunk `chunk` of `chunks` (its first class `start`)
-// also draws row r's candidate class, each with probability proportional to its exponential: by
-// the inverse distribution function over the classes in the order the threads hold them (thread
-// t's classes t, t + BLOCK, ..., then thread t + 1's), with `chunk_uniform`; the candidate goes to
-// `candidates[r * chunks + chunk]` and the chunk's log mass `next + log Σ e` to `masses` there.
+// `probe` (`Device::head_log_partition_probed`, the chunk's first class `start`), `roots` (rows ×
+// cols) gets exp((logit − new largest) / 2) ξ, ξ the signs of row r under `key` (`fisher_sign`),
+// ready to weight the chunk's head rows into the probe's accumulator; `root_factor[r]` gets
+// exp((old largest − new) / 2), that accumulator's rescaling, and `a[r]` becomes
+// `a[r] root_factor + Σ roots` (in double).
 extern "C" __global__ void head_chunk(unsigned int rows, unsigned int cols, float* logits, float* m, double* s, float* factor, int expected,
-    const float* uniforms, unsigned int start, unsigned int chunk, unsigned int chunks, unsigned int* candidates, double* masses, int draw) {
+    u64 key, unsigned int start, int probe, float* roots, double* a, float* root_factor) {
     __shared__ float shared[WARPS];
     __shared__ double sd[WARPS];
-    __shared__ double parts[BLOCK];
-    __shared__ unsigned int owner;
-    __shared__ double rest;
     unsigned int r = blockIdx.x;
     if (r >= rows) return;
     float* z = logits + (u64)r * cols;
@@ -803,118 +748,47 @@ extern "C" __global__ void head_chunk(unsigned int rows, unsigned int cols, floa
     top = block_max(top, shared);
     float old = m[r];
     float next = fmaxf(old, top);
-    double part = 0.0;
+    double part = 0.0, signed_part = 0.0;
     for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) {
         float e = next == NEG_INF ? 0.0f : expf(z[c] - next);
         part += (double)e;
+        if (probe) {
+            float root = next == NEG_INF ? 0.0f : expf(0.5f * (z[c] - next)) * fisher_sign(key, r, start + c);
+            signed_part += (double)root;
+            roots[(u64)r * cols + c] = root;
+        }
         if (expected) z[c] = e;
     }
-    if (draw) parts[threadIdx.x] = part;
     part = block_sum_d(part, sd);
+    if (probe) signed_part = block_sum_d(signed_part, sd);
     if (threadIdx.x == 0) {
         double f = old == NEG_INF ? 0.0 : exp((double)old - (double)next);
         s[r] = s[r] * f + part;
         m[r] = next;
         factor[r] = (float)f;
-    }
-    if (!draw) return;
-    if (threadIdx.x < 32) {
-        // Warp 0 finds the thread whose classes hold the pick: each lane sums BLOCK / 32 threads'
-        // masses, the lanes' sums are scanned, and the lane holding the pick walks its threads.
-        // Past the end by rounding, the pick goes to the last thread with mass.
-        const unsigned int per = BLOCK / 32;
-        unsigned int lane = threadIdx.x;
-        double own = 0.0;
-        for (unsigned int i = 0; i < per; i++) own += parts[lane * per + i];
-        double scan = own;
-        for (unsigned int o = 1; o < 32; o <<= 1) {
-            double v = __shfl_up_sync(FULL, scan, o);
-            if (lane >= o) scan += v;
+        if (probe) {
+            double g = old == NEG_INF ? 0.0 : exp(0.5 * ((double)old - (double)next));
+            a[r] = a[r] * g + signed_part;
+            root_factor[r] = (float)g;
         }
-        double pick = chunk_uniform(uniforms[r], r, chunk) * part;
-        unsigned int hit = __ballot_sync(FULL, pick < scan), with = __ballot_sync(FULL, own > 0.0);
-        unsigned int at = hit ? __ffs(hit) - 1 : (with ? 31 - __clz(with) : 0);
-        double before = __shfl_sync(FULL, scan - own, at);
-        if (lane == at) {
-            double left = pick - before;
-            unsigned int k = lane * per;
-            for (unsigned int t = lane * per; t < (lane + 1) * per; t++) {
-                if (parts[t] > 0.0) k = t;
-                if (left < parts[t]) { k = t; break; }
-                left -= parts[t];
-            }
-            owner = k;
-            rest = left;
-            masses[(u64)r * chunks + chunk] = part > 0.0 ? (double)next + log(part) : (double)NEG_INF;
-        }
-    }
-    __syncthreads();
-    if (threadIdx.x == owner) {
-        double left = rest;
-        unsigned int chosen = owner < cols ? owner : 0;
-        for (unsigned int c = owner; c < cols; c += BLOCK) {
-            double e = expected ? (double)z[c] : (double)(next == NEG_INF ? 0.0f : expf(z[c] - next));
-            if (e > 0.0) chosen = c;
-            if (left < e) break;
-            left -= e;
-        }
-        candidates[(u64)r * chunks + chunk] = start + chosen;
     }
 }
 
-// A drawn sweep's labels (`Device::head_log_partition_drawn`), after `head_finish`: per row the
-// chunk by the inverse distribution function over the chunks' masses exp(masses − largest) with
-// the row's uniform, its candidate the label y, and out_r = mean_r − head[y] (the expected head
-// row less the label's); an unscored row gets zero.
-extern "C" __global__ void head_draw(unsigned int rows, unsigned int chunks, unsigned int classes, unsigned int width,
-    const float* uniforms, const unsigned int* candidates, const double* masses, const unsigned int* scored, int use_scored,
-    const float* mean, const float* head, int transposed, float* out) {
-    __shared__ unsigned int label;
+// A probed sweep's pullback (`Device::head_log_partition_probed`), after `head_finish`: per row,
+// with A_r = Σ exp((z − m_r) / 2) ξ e the accumulated head rows in `out`, a_r = Σ exp((z − m_r) / 2) ξ
+// and μ_r the expected row (`mean`), out_r ← (A_r − a_r μ_r) / √s_r = Σ_c √q_c ξ_c e_c − (√q · ξ) μ_r
+// (√q_c = exp((z_c − m_r) / 2) / √s_r); an unscored row gets zero.
+extern "C" __global__ void head_probe(unsigned int rows, unsigned int width, const double* s, const double* a,
+    const unsigned int* scored, int use_scored, const float* mean, float* out) {
     unsigned int r = blockIdx.x;
     if (r >= rows) return;
-    float* o = out + (u64)r * width;
-    if (use_scored && scored[r] == 0) {
-        for (unsigned int h = threadIdx.x; h < width; h += BLOCK) o[h] = 0.0f;
-        return;
+    int on = !use_scored || scored[r] != 0;
+    double root = on ? 1.0 / sqrt(s[r]) : 0.0;
+    float scale = (float)root, shift = (float)(a[r] * root);
+    for (unsigned int h = threadIdx.x; h < width; h += BLOCK) {
+        u64 i = (u64)r * width + h;
+        out[i] = on ? out[i] * scale - shift * mean[i] : 0.0f;
     }
-    if (threadIdx.x < 32) {
-        // Warp 0 picks the chunk: each lane holds a run of consecutive chunks, the lanes' sums of
-        // exp(mass − largest) are scanned, and the lane holding the pick walks its run (past the
-        // end by rounding, the last chunk with mass).
-        unsigned int lane = threadIdx.x, per = (chunks + 31) / 32;
-        unsigned int lo = min(lane * per, chunks), hi = min(lo + per, chunks);
-        const double* w = masses + (u64)r * chunks;
-        double top = (double)NEG_INF;
-        for (unsigned int k = lo; k < hi; k++) top = fmax(top, w[k]);
-        for (int o = 16; o > 0; o >>= 1) top = fmax(top, __shfl_xor_sync(FULL, top, o));
-        double own = 0.0;
-        if (top != (double)NEG_INF)
-            for (unsigned int k = lo; k < hi; k++) own += exp(w[k] - top);
-        double scan = own;
-        for (unsigned int o = 1; o < 32; o <<= 1) {
-            double v = __shfl_up_sync(FULL, scan, o);
-            if (lane >= o) scan += v;
-        }
-        double pick = (double)uniforms[r] * __shfl_sync(FULL, scan, 31);
-        unsigned int hit = __ballot_sync(FULL, pick < scan), with = __ballot_sync(FULL, own > 0.0);
-        unsigned int at = hit ? __ffs(hit) - 1 : (with ? 31 - __clz(with) : 0);
-        double before = __shfl_sync(FULL, scan - own, at);
-        if (lane == at) {
-            double left = pick - before;
-            unsigned int chosen = lo < chunks ? lo : 0;
-            for (unsigned int k = lo; k < hi; k++) {
-                double p = exp(w[k] - top);
-                if (p > 0.0) chosen = k;
-                if (left < p) break;
-                left -= p;
-            }
-            label = candidates[(u64)r * chunks + chosen];
-        }
-    }
-    __syncthreads();
-    unsigned int y = label;
-    for (unsigned int h = threadIdx.x; h < width; h += BLOCK)
-        o[h] = mean[(u64)r * width + h] - head[transposed ? (u64)h * classes + y : (u64)y * width + h];
 }
 
 // A swept log partition's results: log Z_r = m_r + log s_r into `out`, and the accumulated expected

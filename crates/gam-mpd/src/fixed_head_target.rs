@@ -417,24 +417,25 @@ impl ResidentHead {
                 .map_err(error)?,
         })
     }
-    /// Per-row compact KL; with `gradient`, the hidden seed; with `draw` as well (one uniform per
-    /// row), the hidden cotangent of `−log q_y` for a label `y` drawn per row from `P`'s softmax `q`
-    /// with its uniform, `Σ_c q_c e_c − e_y`, made from the seed's own products
-    /// ([`Device::head_log_partition_drawn`]). Logit and seed products run in `arithmetic`.
+    /// Per-row compact KL; with `gradient`, the hidden seed; with the probe key `probe` as well,
+    /// each row's Fisher probe under it at `P`'s softmax `q` pulled back to the hidden row,
+    /// `Σ_c b_c e_c` (rows numbered from zero, [`Device::fisher_probe_cotangent`]), made from the
+    /// seed's own sweep ([`Device::head_log_partition_probed`]). Logit and seed products run in
+    /// `arithmetic`.
     pub fn score(
         &self,
         d: &Device,
         hidden: &Tensor,
         target: &Target,
         gradient: bool,
-        draw: Option<&[f64]>,
+        probe: Option<u64>,
         arithmetic: Arithmetic,
     ) -> Result<(Vec<f64>, Option<Tensor>, Option<Tensor>), String> {
-        if draw.is_some_and(|u| !gradient || u.len() != hidden.rows()) {
-            return Err("a drawn label needs the gradient and one uniform per row".into());
+        if probe.is_some() && !gradient {
+            return Err("a probe needs the gradient".into());
         }
         if hidden.storage() == Storage::F32 {
-            return self.swept(d, hidden, target, gradient, draw, arithmetic);
+            return self.swept(d, hidden, target, gradient, probe, arithmetic);
         }
         let mut losses = Vec::with_capacity(hidden.rows());
         let mut seed = if gradient {
@@ -442,7 +443,7 @@ impl ResidentHead {
         } else {
             None
         };
-        let mut draws = match draw {
+        let mut probed = match probe {
             Some(_) => Some(d.empty(hidden.rows(), hidden.cols()).map_err(error)?),
             None => None,
         };
@@ -518,29 +519,41 @@ impl ResidentHead {
                     arithmetic,
                 )
                 .map_err(error)?;
-                if let (Some(draws), Some(uniforms)) = (draws.as_mut(), draw) {
-                    let uniforms = d.upload_vec(n, 1, uniforms[start..start + n].to_vec()).map_err(error)?;
-                    let drawn = d
-                        .sampled_head_cotangent(&q, &projected, &self.embedding, false, &uniforms, flags.as_ref())
-                        .map_err(error)?;
-                    d.set_rows(draws, start, &drawn).map_err(error)?;
+                if let (Some(probed), Some(key)) = (probed.as_mut(), probe) {
+                    // The probabilities become the probe's cotangent (row `start + r` for the
+                    // tile's row `r`), pulled back through the head.
+                    d.fisher_probe_cotangent(&mut q, (key, start), flags.as_ref()).map_err(error)?;
+                    let mut pulled = d.empty(n, h.cols()).map_err(error)?;
+                    d.gemm(
+                        &mut pulled,
+                        1.,
+                        &q,
+                        Op::N,
+                        &self.embedding,
+                        Op::N,
+                        0.,
+                        arithmetic,
+                    )
+                    .map_err(error)?;
+                    d.set_rows(probed, start, &pulled).map_err(error)?;
                 }
                 d.axpy(&mut projected, -1., &mu).map_err(error)?;
                 // Target creation masks BOTH p and q, so unscored projected seeds are zero.
                 d.set_rows(seed, start, &projected).map_err(error)?;
             }
         }
-        Ok((losses, seed, draws))
+        Ok((losses, seed, probed))
     }
     /// [`Self::score`] in f32 storage: the vocabulary is swept without forming the logits
-    /// ([`Device::head_log_partition`]), which also returns the seed's `E^T q`.
+    /// ([`Device::head_log_partition`]), which also returns the seed's `E^T q`, and with a probe
+    /// its pullback ([`Device::head_log_partition_probed`]).
     fn swept(
         &self,
         d: &Device,
         hidden: &Tensor,
         target: &Target,
         gradient: bool,
-        draw: Option<&[f64]>,
+        probe: Option<u64>,
         arithmetic: Arithmetic,
     ) -> Result<(Vec<f64>, Option<Tensor>, Option<Tensor>), String> {
         let flags = target
@@ -557,22 +570,21 @@ impl ResidentHead {
         // `μ · h` per row, queued ahead of the sweep, so the sweep's download (which waits for the
         // device) finds it made and the scoring waits on the device once.
         let dots = d.block_products(hidden, &target.mu, &self.width).map_err(error)?;
-        let mut draws = None;
-        let partitions = match (draw, seed.as_mut()) {
-            (Some(uniforms), Some(seed)) => {
-                let uniforms = d.upload_vec(uniforms.len(), 1, uniforms.to_vec()).map_err(error)?;
+        let mut probed = None;
+        let partitions = match (probe, seed.as_mut()) {
+            (Some(key), Some(seed)) => {
                 let mut out = d.empty(hidden.rows(), hidden.cols()).map_err(error)?;
                 let partitions = d
-                    .head_log_partition_drawn(
+                    .head_log_partition_probed(
                         hidden,
                         (&self.embedding, false),
                         flags.as_ref(),
                         seed,
-                        (&uniforms, &mut out),
+                        (key, &mut out),
                         arithmetic,
                     )
                     .map_err(error)?;
-                draws = Some(out);
+                probed = Some(out);
                 partitions
             }
             (_, seed) => d
@@ -605,7 +617,7 @@ impl ResidentHead {
             // Unscored rows of both E^T q and mu are zero.
             d.axpy(seed, -1., &target.mu).map_err(error)?;
         }
-        Ok((losses, seed, draws))
+        Ok((losses, seed, probed))
     }
 }
 

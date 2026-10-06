@@ -305,30 +305,17 @@ fn metal_row_reductions_lie_inside_their_bands() {
     let (hg, dg) = (down(&host, &hl), down(&d, &dl));
     let pq: Vec<(ndarray::Array1<f64>, ndarray::Array1<f64>)> = (0..n).map(|r| (softmax(target.row(r)), softmax(logits.row(r)))).collect();
     assert_within("kl cotangent", &dg, &hg, |i, j| input * (pq[i].0[j] + pq[i].1[j]));
-    // Sampled cotangents: away from the uniform's ties (each cumulative sum farther than the
-    // softmax band from it) both pick the same label, and `q − e_y` within the band.
-    let uniforms = matrix(n, 1, 67, 0.5).mapv(|v| v + 0.5);
-    let (hu, du) = both(&uniforms);
-    let (mut hs, mut ds) = both(&logits);
-    host.sampled_cotangent(&mut hs, &hu, None).expect("host sampled");
-    d.sampled_cotangent(&mut ds, &du, None).expect("device sampled");
-    let (hs, ds) = (down(&host, &hs), down(&d, &ds));
-    for r in 0..n {
-        let q = &pq[r].1;
-        let mut cumulative = 0.0;
-        let clear = q.iter().all(|p| {
-            cumulative += p;
-            (cumulative - uniforms[[r, 0]]).abs() > 2.0 * input
-        });
-        if !clear {
-            continue;
-        }
-        let label = |m: &Array2<f64>| m.row(r).iter().position(|v| *v < -0.5).expect("a label");
-        assert_eq!(label(&hs), label(&ds), "row {r}'s label");
-        for c in 0..classes {
-            assert!((hs[[r, c]] - ds[[r, c]]).abs() <= input * (q[c] + 1.0) , "sampled cotangent ({r},{c})");
-        }
-    }
+    // Fisher probes of the same f32 probabilities (the host's softmax rows), with the same signs:
+    // `√q` within 4 ulps (`8u`), `√q · ξ` summed in f32 (within `(8u + γ_n) Σ √q`), and the
+    // product and the difference rounded: each entry within `16u (√q + q Σ √q) + γ_{n+8} q Σ √q`.
+    let q = single(&Array2::from_shape_fn((n, classes), |(r, c)| pq[r].1[c]));
+    let roots: Vec<f64> = q.rows().into_iter().map(|row| row.iter().map(|p| p.sqrt()).sum()).collect();
+    let (mut hp, mut dp) = both(&q);
+    host.fisher_probe_cotangent(&mut hp, (67, 3), Some(&host.upload_indices(&flags).expect("flags"))).expect("host probe");
+    d.fisher_probe_cotangent(&mut dp, (67, 3), Some(&d.upload_indices(&flags).expect("flags"))).expect("device probe");
+    assert_within("fisher probe", &down(&d, &dp), &down(&host, &hp), |i, j| {
+        16.0 * U * (q[[i, j]].sqrt() + q[[i, j]] * roots[i]) + gamma(classes + 8) * q[[i, j]] * roots[i]
+    });
     // The Fisher's quadratic per row: two passes of `n` terms of `q (|t| + |mean|)²`.
     let tangent = matrix(n, classes, 71, 1.0);
     let (htan, dtan) = both(&tangent);
@@ -345,7 +332,7 @@ fn metal_row_reductions_lie_inside_their_bands() {
 }
 
 #[test]
-fn metal_grouped_products_and_sampled_head_match_the_host() {
+fn metal_grouped_products_match_the_host() {
     let Some(d) = metal() else { return };
     // Small integers: every product and sum is exact in f32.
     let blocks = d.column_blocks(&[2, 1]).expect("blocks");
@@ -353,29 +340,6 @@ fn metal_grouped_products_and_sampled_head_match_the_host() {
     let right = up(&d, &ndarray::array![[1.0, 1.0, 2.0], [3.0, 4.0, 5.0]]);
     let sums = d.block_products(&left, &right, &blocks).expect("reduce");
     assert_eq!(down(&d, &sums), ndarray::array![[0.0, 6.0], [11.0, -5.0]]);
-    // The sampled head lookup is the full pullback of the sampled cotangent, both on the device:
-    // each within the f32 band of its three-term product.
-    let logits = ndarray::array![[0.0, 1.0, -1000.0], [1.0, 0.0, 2.0], [0.0, 0.0, 0.0]];
-    let head = ndarray::array![[2.0, -3.0], [0.5, 7.0], [-1.0, 4.0]];
-    let flags = d.upload_indices(&[1, 0, 1]).expect("flags");
-    for transposed in [false, true] {
-        let weights = up(&d, &if transposed { head.t().to_owned() } else { head.clone() });
-        let op = if transposed { Op::T } else { Op::N };
-        let mut probabilities = up(&d, &logits);
-        d.softmax_rows(&mut probabilities, false).expect("softmax");
-        let mut mean = d.zeros(3, 2).expect("mean");
-        d.gemm(&mut mean, 1.0, &probabilities, Op::N, &weights, op, 0.0, Arithmetic::F32).expect("mean projection");
-        for u in [0.0, 0.2, 0.7, 1.0 - f64::EPSILON] {
-            let uniforms = up(&d, &Array2::from_elem((3, 1), u));
-            let shared = d.sampled_head_cotangent(&probabilities, &mean, &weights, transposed, &uniforms, Some(&flags)).expect("lookup");
-            let mut cotangent = up(&d, &logits);
-            d.sampled_cotangent(&mut cotangent, &uniforms, Some(&flags)).expect("sample");
-            let mut reference = d.zeros(3, 2).expect("reference");
-            d.gemm(&mut reference, 1.0, &cotangent, Op::N, &weights, op, 0.0, Arithmetic::F32).expect("pullback");
-            assert_within("sampled head lookup", &down(&d, &shared), &down(&d, &reference), |_, _| gamma(24) * 14.0);
-            assert!(down(&d, &shared).row(1).iter().all(|g| *g == 0.0));
-        }
-    }
 }
 
 #[test]

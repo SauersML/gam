@@ -34,7 +34,7 @@ use gam_mpd::{
     run_check::{layer_nodes, split_sites},
 };
 use ndarray::Array2;
-use rand::{RngExt, SeedableRng, rngs::StdRng};
+use rand::{SeedableRng, rngs::StdRng};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, time::Instant};
 
@@ -248,15 +248,15 @@ fn main() -> Result<(), String> {
             let s = &mut device_seconds;
             timed(&device, s, "sample_loaded", || posterior.sample_into(&mut p_program, step as u64))?;
             // The step's evaluation: the gradient and a draw of the Gauss–Newton factor (a second
-            // reverse pass through the same forward pass), with its scored tokens.
-            let mut draws = StdRng::seed_from_u64(step as u64);
-            let uniforms: Vec<f64> = (0..experiments.iter().map(|e| context - e.position).sum::<usize>()).map(|_| draws.random::<f64>()).collect();
-            let (gradient, factor, labelled) = match &scoring {
+            // reverse pass through the same forward pass, its Fisher probe under a key apart from
+            // the sample's), with its scored tokens.
+            let probe = gam_linalg::utils::splitmix64_hash(step as u64);
+            let (gradient, factor, factor_tokens) = match &scoring {
                 Some((head, m)) => {
                     let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments))?;
                     let p = p_model(&p_program, sites)?;
                     let evaluation =
-                        timed(&device, s, "evaluate", || interchange::evaluate_labelled((m, &p), head, (&batch, &experiments), Some(&targets), true, Some(&uniforms)))?;
+                        timed(&device, s, "evaluate", || interchange::evaluate_probed((m, &p), head, (&batch, &experiments), Some(&targets), true, Some(probe)))?;
                     let tokens = evaluation.bits.iter().map(Vec::len).sum::<usize>();
                     mean_bits = Some(evaluation.bits.iter().flatten().sum::<f64>() / tokens as f64);
                     let factor = evaluation.factor.ok_or("no Gauss–Newton factor")?;
@@ -268,7 +268,7 @@ fn main() -> Result<(), String> {
                 }
             };
             timed(&device, s, "description", || Ok(posterior.divergences()?.iter().sum::<f64>()))?;
-            timed(&device, s, "posterior_step", || posterior.step(&gradient, scale, (&factor, 1.0 / labelled as f64), &ivon))?;
+            timed(&device, s, "posterior_step", || posterior.step(&gradient, scale, (&factor, 1.0 / factor_tokens as f64), &ivon))?;
             // The step's direction without its measured length (`library_mdl`'s line step).
         }
     }

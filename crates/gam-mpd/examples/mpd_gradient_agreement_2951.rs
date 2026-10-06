@@ -23,10 +23,11 @@
 //! estimate `g₊ ε / σ` contains the batch's gradient at the mean times `ε`, noise that grows with the
 //! training tokens per batch token; the antithetic estimate `(g₊ − g₋) ε / (2σ)` has the same
 //! expectation without that term. Both also contain `Σ_k H_jk σ_k ε_k ε_j / σ_j`, every other
-//! weight's noise through its Hessian coupling. The third estimate is the square of `u`, the
-//! gradient at `θ₊` of `Σ_t log P(y_t)` over the base sequences run by `P` alone with each `y_t`
-//! drawn from `P` (`sampled_label_gradient`): it estimates the Gauss–Newton diagonal, which equals
-//! the Hessian of `KL(M ‖ P)` where `P`'s predictions equal `M`'s. Per operator the report gives,
+//! weight's noise through its Hessian coupling. The third estimate is the square of
+//! `u = Σ_t J_tᵀ b_t` at `θ₊` over the base sequences run by `P` alone, `J_t` the Jacobian of `P`'s
+//! logits at `t` and `b_t` the Fisher probe at `P`'s prediction there (`fisher_probe_gradient`): it
+//! estimates the Gauss–Newton diagonal, which equals the Hessian of `KL(M ‖ P)` where `P`'s
+//! predictions equal `M`'s. Per operator the report gives,
 //! over its entries, the median ratio of Stein's and the antithetic estimates' variances over draws
 //! and the median `|mean| / sd` over draws of each of the three estimates.
 use gam_gpu::{
@@ -134,11 +135,12 @@ fn head_matrix(flat: &OperatorProgram, width: usize) -> Result<Array2<f64>, Stri
     }
 }
 
-/// The gradient of `Σ_t log P(y_t)` in `P`'s trainable operators on the sequences `tokens` run by
-/// `P` alone, each `y_t` drawn from `P`'s own next-token distribution at position `t`: its square,
-/// entry by entry, is an unbiased estimate of the diagonal of the Gauss–Newton matrix
-/// `Σ_t J_tᵀ F_t J_t` (`F_t` the Fisher matrix of `P`'s softmax at `t`).
-fn sampled_label_gradient(ic: &Interchange, head: &Tensor, tokens: &[&[u32]], rng: &mut StdRng) -> Result<BTreeMap<usize, Tensor>, String> {
+/// `u = Σ_t J_tᵀ b_t` in `P`'s trainable operators on the sequences `tokens` run by `P` alone,
+/// `J_t` the Jacobian of `P`'s logits at position `t` and `b_t` the Fisher probe under `key` at
+/// `P`'s own next-token distribution there (`Device::fisher_probe_cotangent`): its square, entry by
+/// entry, is an unbiased estimate of the diagonal of the Gauss–Newton matrix `Σ_t J_tᵀ F_t J_t`
+/// (`F_t` the Fisher matrix of `P`'s softmax at `t`).
+fn fisher_probe_gradient(ic: &Interchange, head: &Tensor, tokens: &[&[u32]], key: u64) -> Result<BTreeMap<usize, Tensor>, String> {
     let (_, p) = ic.models();
     let (d, width, arithmetic) = (BlockEngine::device(&p), BlockEngine::width(&p), BlockEngine::arithmetic(&p));
     let length = tokens.first().map_or(0, |t| t.len());
@@ -149,8 +151,8 @@ fn sampled_label_gradient(ic: &Interchange, head: &Tensor, tokens: &[&[u32]], rn
     for b in 0..BlockEngine::blocks(&p) {
         tapes.push(p.forward(b, &mut stream, &ranges, tokens, None, true)?.ok_or("the block kept no tape")?);
     }
-    // The cotangent of the final normed stream, a tile of rows at a time: the logits' sampled
-    // cotangent pulled back through the head.
+    // The cotangent of the final normed stream, a tile of rows at a time: the probe's cotangent at
+    // the logits' softmax pulled back through the head.
     let tile = (1 << 28) / (4 * head.rows()).max(1);
     let mut cotangent = d.zeros(rows, width).map_err(error)?;
     for start in (0..rows).step_by(tile.max(1)) {
@@ -158,8 +160,8 @@ fn sampled_label_gradient(ic: &Interchange, head: &Tensor, tokens: &[&[u32]], rn
         let h = d.rows_of(&stream, start, n).map_err(error)?;
         let mut logits = d.zeros(n, head.rows()).map_err(error)?;
         d.gemm(&mut logits, 1.0, &h, Op::N, head, Op::T, 0.0, arithmetic).map_err(error)?;
-        let uniforms = d.upload_vec(n, 1, (0..n).map(|_| rng.random::<f64>()).collect()).map_err(error)?;
-        d.sampled_cotangent(&mut logits, &uniforms, None).map_err(error)?;
+        d.softmax_rows(&mut logits, false).map_err(error)?;
+        d.fisher_probe_cotangent(&mut logits, (key, start), None).map_err(error)?;
         let mut seed = d.zeros(n, width).map_err(error)?;
         d.gemm(&mut seed, 1.0, &logits, Op::N, head, Op::N, 0.0, arithmetic).map_err(error)?;
         d.set_rows(&mut cotangent, start, &seed).map_err(error)?;
@@ -177,7 +179,7 @@ struct Totals {
     full: f64,
     local: [(f64, f64); 2],
     /// Per entry, the sums of each curvature estimate and of its square: Stein's, the antithetic
-    /// one, and the sampled-label Gauss–Newton diagonal.
+    /// one, and the probed Gauss–Newton diagonal.
     sums: [Array2<f64>; 6],
 }
 
@@ -289,7 +291,7 @@ fn main() -> Result<(), String> {
             local.push(downloaded(&d, &trainable, &shapes, &local_gradient(&ic, &base_tokens, own)?)?);
             local_seconds[i] += clock.elapsed().as_secs_f64();
         }
-        let factor = downloaded(&d, &trainable, &shapes, &sampled_label_gradient(&ic, &head, &base_tokens, &mut rng)?)?;
+        let factor = downloaded(&d, &trainable, &shapes, &fisher_probe_gradient(&ic, &head, &base_tokens, rng.random())?)?;
         ic.load(&sample(-1.0))?;
         let minus = downloaded(&d, &trainable, &shapes, &ic.evaluate_resident(&batch, &experiments, &targets, true)?.gradient)?;
         for (i, total) in totals.iter_mut().enumerate() {

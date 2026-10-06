@@ -2,7 +2,7 @@
 //!
 //! A [`Device`] runs dense row-major tensors (`rows × cols`, `f64`) through a small, closed set
 //! of operations: products (BLAS GEMM, also strided-batched over equal row blocks), elementwise
-//! maps, per-row reductions (a norm, a softmax, a KL against a target row, a sampled-label
+//! maps, per-row reductions (a norm, a softmax, a KL against a target row, a Fisher probe's
 //! cotangent) and gathers. It is vendor-neutral: callers see [`Device`], [`Tensor`] and
 //! [`Indices`] only, never a driver type, so another backend (ROCm/HIP, whose kernel dialect the
 //! CUDA source below already is) slots in behind the same calls.
@@ -1906,42 +1906,41 @@ impl Device {
         }
     }
 
-    /// In place of `logits`, the cotangent of `−log q_y` per row, `q − e_y`, with `y` drawn from
-    /// the row's softmax `q` by its uniform `uniforms[r]` (`rows × 1`): the first class whose
-    /// cumulative probability passes it; a row whose `scored` flag is zero becomes zero.
-    pub fn sampled_cotangent(&self, logits: &mut Tensor, uniforms: &Tensor, scored: Option<&Indices>) -> Result<(), GpuError> {
-        if uniforms.rows != logits.rows || uniforms.cols != 1 {
-            return Err(shape(format!("{:?} uniforms for {:?} logits", uniforms.dim(), logits.dim())));
+    /// In place of `probabilities` (each row a softmax `π`), the Fisher probe's cotangent per row,
+    /// `b = √π ⊙ ξ − π (√π · ξ)`, `ξ` the row's signs: row `r`'s are those of row `first + r` under
+    /// `key` ([`fisher_sign`]), so a probe made one row tile at a time is the probe of the whole.
+    /// With `L = diag √π − π √πᵀ`, `b = L ξ` and `L Lᵀ = diag π − π πᵀ` (as `Σ π = 1`), so
+    /// `E[b bᵀ]` is the softmax's Fisher matrix, and for any `a`, `a · b = (Lᵀ a) · ξ` has
+    /// `E[(a · b)⁴] = 3 c² − 2 Σ_k (Lᵀ a)_k⁴` with `c = E[(a · b)²]`: `(a · b)²` estimates `c` with
+    /// relative variance at most 2 whatever `π` is. A row whose `scored` flag is zero becomes zero.
+    pub fn fisher_probe_cotangent(&self, probabilities: &mut Tensor, (key, first): (u64, usize), scored: Option<&Indices>) -> Result<(), GpuError> {
+        if let Some(s) = scored
+            && s.len != probabilities.rows
+        {
+            return Err(shape(format!("{} row flags for {} rows", s.len, probabilities.rows)));
         }
         match &*self.backend {
             Backend::Host => {
-                let (uv, cols) = (host(uniforms)?.to_vec(), logits.cols);
+                let cols = probabilities.cols;
                 let flags = scored.map(host_indices).transpose()?;
-                for (r, row) in host_mut(logits)?.chunks_mut(cols).enumerate() {
+                for (r, row) in host_mut(probabilities)?.chunks_mut(cols.max(1)).enumerate() {
                     if flags.is_some_and(|f| f[r] == 0) {
                         row.fill(0.0);
                         continue;
                     }
-                    let q = host_softmax(row);
-                    let mut pick = uv[r];
-                    let mut label = cols - 1;
-                    for (c, p) in q.iter().enumerate() {
-                        if pick < *p {
-                            label = c;
-                            break;
-                        }
-                        pick -= p;
-                    }
-                    for c in 0..cols {
-                        row[c] = q[c] - if c == label { 1.0 } else { 0.0 };
+                    let at = (first + r) as u64;
+                    let roots: Vec<f64> = row.iter().enumerate().map(|(c, p)| p.sqrt() * fisher_sign(key, at, c as u64)).collect();
+                    let dot: f64 = roots.iter().sum();
+                    for (b, root) in row.iter_mut().zip(&roots) {
+                        *b = root - *b * dot;
                     }
                 }
                 Ok(())
             }
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.sampled_cotangent(logits, uniforms, scored),
+            Backend::Cuda(engine) => engine.fisher_probe_cotangent(probabilities, (key, first), scored),
             #[cfg(target_os = "macos")]
-            Backend::Metal(engine) => engine.sampled_cotangent(logits, uniforms, scored),
+            Backend::Metal(engine) => engine.fisher_probe_cotangent(probabilities, (key, first), scored),
         }
     }
 
@@ -1981,47 +1980,6 @@ impl Device {
         }
     }
 
-    /// Draw a label from each probability row and return `mean − head[label]`, where
-    /// `mean = probabilities * head`. A transposed head stores vocabulary vectors as columns.
-    /// This reuses the distribution and its head mean across sampled-label reverse passes.
-    pub fn sampled_head_cotangent(
-        &self, probabilities: &Tensor, mean: &Tensor, head: &Tensor, transposed: bool,
-        uniforms: &Tensor, scored: Option<&Indices>,
-    ) -> Result<Tensor, GpuError> {
-        let expected_head = if transposed { (mean.cols, probabilities.cols) } else { (probabilities.cols, mean.cols) };
-        if probabilities.cols == 0 || mean.rows != probabilities.rows || head.dim() != expected_head
-            || uniforms.dim() != (mean.rows, 1) || scored.is_some_and(|s| s.len != mean.rows)
-        {
-            return Err(shape("sampled head cotangent shapes".to_string()));
-        }
-        match &*self.backend {
-            Backend::Host => {
-                let (q, mu, weights, u) = (host(probabilities)?, host(mean)?, host(head)?, host(uniforms)?);
-                let flags = scored.map(host_indices).transpose()?;
-                let mut out = vec![0.0; mean.len()];
-                for r in 0..mean.rows {
-                    if flags.is_some_and(|f| f[r] == 0) { continue; }
-                    let mut pick = u[r];
-                    let mut label = probabilities.cols - 1;
-                    for c in 0..probabilities.cols {
-                        let p = q[r * probabilities.cols + c];
-                        if pick < p { label = c; break; }
-                        pick -= p;
-                    }
-                    for h in 0..mean.cols {
-                        let index = if transposed { h * probabilities.cols + label } else { label * mean.cols + h };
-                        out[r * mean.cols + h] = mu[r * mean.cols + h] - weights[index];
-                    }
-                }
-                Ok(Tensor { rows: mean.rows, cols: mean.cols, data: Data::Host(out) })
-            }
-            #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.sampled_head_cotangent(probabilities, mean, head, transposed, uniforms, scored),
-            #[cfg(target_os = "macos")]
-            Backend::Metal(engine) => engine.sampled_head_cotangent(probabilities, mean, head, transposed, uniforms, scored),
-        }
-    }
-
     /// Per row `r` of `hidden` (rows × width), the log partition `log Σ_c exp(hidden_r · e_c)` over
     /// the head's classes `e_c` (`head` classes × width, or width × classes when `transposed`), and
     /// with `expected` (rows × width) also `Σ_c q_rc e_c`, `q_r` the row's softmax: the log
@@ -2046,36 +2004,37 @@ impl Device {
     }
 
     /// [`Device::head_log_partition`] (the head and whether it is transposed as one argument)
-    /// with `expected`, drawing as well one label `y_r` per row from the row's softmax `q_r` with
-    /// its uniform `uniforms[r]` (rows × 1), and writing into `draws` (rows × width)
-    /// `Σ_c q_rc e_c − e_{y_r}`, the gradient of `−log q_{y_r}` in `hidden_r`, from the same
-    /// products (zero on an unscored row). The host and the Apple GPU draw by the inverse
-    /// distribution function in class order ([`Device::sampled_head_cotangent`]). CUDA f32 storage
-    /// never holds a row's whole softmax, so it draws in two stages: in each swept chunk a candidate
-    /// class with probability proportional to its exponential (by a uniform derived from the row's
-    /// and the chunk), and after the sweep one chunk with probability proportional to its share of
-    /// the partition (by the row's uniform), whose candidate is the label; each class is then drawn
-    /// with its softmax probability. The head is f32 or float64, as the hidden rows are.
-    pub fn head_log_partition_drawn(
+    /// with `expected`, and with the probe `(key, probed)` also each row's Fisher probe pulled
+    /// back to `hidden_r`, written into `probed` (rows × width): `Σ_c b_rc e_c`, `b_r` the probe's
+    /// cotangent at the row's softmax `q_r` under `key`, rows numbered from zero
+    /// ([`Device::fisher_probe_cotangent`]), and zero on an unscored row. The host and the Apple
+    /// GPU make it from each row tile's probabilities (`fisher_probe_cotangent`, then one more
+    /// product). CUDA f32 storage never holds a row's whole softmax: alongside the sweep's running
+    /// largest logit `m_r` and sum `s_r = Σ_c exp(z_rc − m_r)` it accumulates
+    /// `A_r = Σ_c exp((z_rc − m_r) / 2) ξ_rc e_c` (one more product per chunk) and
+    /// `a_r = Σ_c exp((z_rc − m_r) / 2) ξ_rc` (in double), both rescaled by `exp((m_old − m_new) / 2)`
+    /// as the largest grows, and ends with `(A_r − a_r μ_r) / √s_r`, `μ_r` the expected row: as
+    /// `√q_rc = exp((z_rc − m_r) / 2) / √s_r`, that is `Σ_c √q_rc ξ_rc e_c − (√q_r · ξ_r) μ_r`.
+    pub fn head_log_partition_probed(
         &self,
         hidden: &Tensor,
         head: (&Tensor, bool),
         scored: Option<&Indices>,
         expected: &mut Tensor,
-        draw: (&Tensor, &mut Tensor),
+        probe: (u64, &mut Tensor),
         arithmetic: Arithmetic,
     ) -> Result<Vec<f64>, GpuError> {
-        self.head_sweep(hidden, head, scored, Some(expected), Some(draw), arithmetic)
+        self.head_sweep(hidden, head, scored, Some(expected), Some(probe), arithmetic)
     }
 
-    /// [`Device::head_log_partition`] and [`Device::head_log_partition_drawn`].
+    /// [`Device::head_log_partition`] and [`Device::head_log_partition_probed`].
     fn head_sweep(
         &self,
         hidden: &Tensor,
         (head, transposed): (&Tensor, bool),
         scored: Option<&Indices>,
         expected: Option<&mut Tensor>,
-        draw: Option<(&Tensor, &mut Tensor)>,
+        probe: Option<(u64, &mut Tensor)>,
         arithmetic: Arithmetic,
     ) -> Result<Vec<f64>, GpuError> {
         let (rows, width) = hidden.dim();
@@ -2084,10 +2043,10 @@ impl Device {
         if head_width != width || classes == 0 || scored.is_some_and(|s| s.len != rows) || expected.as_ref().is_some_and(|e| e.dim() != (rows, width)) {
             return Err(shape(format!("a {:?} head (transposed {transposed}) on {:?} rows", head.dim(), hidden.dim())));
         }
-        if let Some((uniforms, draws)) = &draw {
-            if uniforms.dim() != (rows, 1) || draws.dim() != (rows, width) || expected.is_none() {
-                return Err(shape(format!("{:?} uniforms and {:?} draws for {:?} rows", uniforms.dim(), draws.dim(), hidden.dim())));
-            }
+        if let Some((_, probed)) = &probe
+            && (probed.dim() != (rows, width) || expected.is_none())
+        {
+            return Err(shape(format!("a {:?} probe for {:?} rows, which takes the expected rows too", probed.dim(), hidden.dim())));
         }
         if rows == 0 {
             return Ok(Vec::new());
@@ -2095,12 +2054,12 @@ impl Device {
         match &*self.backend {
             Backend::Host => {
                 let flags = scored.map(host_indices).transpose()?;
-                self.head_log_partition_tiled(hidden, (head, transposed), flags, expected, draw, arithmetic)
+                self.head_log_partition_tiled(hidden, (head, transposed), flags, expected, probe, arithmetic)
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) if hidden.storage() == Storage::F32 => {
                 let chunk = swept_chunk(rows);
-                engine.head_log_partition(hidden, (head, transposed), scored, (expected, draw), (chunk, arithmetic))
+                engine.head_log_partition(hidden, (head, transposed), scored, (expected, probe), (chunk, arithmetic))
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(_) => {
@@ -2110,8 +2069,9 @@ impl Device {
                 let stats = self.softmax_stats_rows(&mut logits, scored)?;
                 if let Some(out) = expected {
                     self.gemm(out, 1.0, &logits, Op::N, head, back, 0.0, arithmetic)?;
-                    if let Some((uniforms, draws)) = draw {
-                        *draws = self.sampled_head_cotangent(&logits, out, head, transposed, uniforms, scored)?;
+                    if let Some((key, probed)) = probe {
+                        self.fisher_probe_cotangent(&mut logits, (key, 0), scored)?;
+                        self.gemm(probed, 1.0, &logits, Op::N, head, back, 0.0, arithmetic)?;
                     }
                 }
                 Ok(stats.iter().map(|s| s[0]).collect())
@@ -2123,13 +2083,13 @@ impl Device {
                     _ => Err(foreign()),
                 });
                 let flags = flags.transpose()?;
-                self.head_log_partition_tiled(hidden, (head, transposed), flags, expected, draw, arithmetic)
+                self.head_log_partition_tiled(hidden, (head, transposed), flags, expected, probe, arithmetic)
             }
         }
     }
 
     /// [`Device::head_sweep`] in row tiles whose logits fill about 32 MB (the size of CUDA's swept
-    /// chunks), through this device's own products, softmax statistics and label draws; `flags`
+    /// chunks), through this device's own products, softmax statistics and Fisher probes; `flags`
     /// are the scored rows' flags.
     fn head_log_partition_tiled(
         &self,
@@ -2137,7 +2097,7 @@ impl Device {
         (head, transposed): (&Tensor, bool),
         flags: Option<&[u32]>,
         mut expected: Option<&mut Tensor>,
-        mut draw: Option<(&Tensor, &mut Tensor)>,
+        mut probe: Option<(u64, &mut Tensor)>,
         arithmetic: Arithmetic,
     ) -> Result<Vec<f64>, GpuError> {
         let (rows, width) = hidden.dim();
@@ -2155,10 +2115,13 @@ impl Device {
             if let Some(out) = expected.as_deref_mut() {
                 let mut mean = self.zeros(n, width)?;
                 self.gemm(&mut mean, 1.0, &logits, Op::N, head, back, 0.0, arithmetic)?;
-                if let Some((uniforms, draws)) = draw.as_mut() {
-                    let uniforms = self.rows_of(uniforms, start, n)?;
-                    let drawn = self.sampled_head_cotangent(&logits, &mean, head, transposed, &uniforms, part.as_ref())?;
-                    self.set_rows(draws, start, &drawn)?;
+                if let Some((key, probed)) = probe.as_mut() {
+                    // The tile's probabilities become its rows' probes (row `start + r` of the
+                    // whole for its row `r`), pulled back through the head.
+                    self.fisher_probe_cotangent(&mut logits, (*key, start), part.as_ref())?;
+                    let mut pulled = self.zeros(n, width)?;
+                    self.gemm(&mut pulled, 1.0, &logits, Op::N, head, back, 0.0, arithmetic)?;
+                    self.set_rows(probed, start, &pulled)?;
                 }
                 self.set_rows(out, start, &mean)?;
             }
@@ -3299,6 +3262,16 @@ pub fn posterior_normal(key: u64, stream: u64, index: u64) -> f32 {
     if key & ANTITHETIC == 0 { z } else { -z }
 }
 
+/// The sign `ξ` of class `class` in row `row` of the Fisher probe under `key`
+/// ([`Device::fisher_probe_cotangent`]): `−1` when the top bit of the first word of `philox` of
+/// the counter `(class, row)` is set, else `+1`, so each sign is `±1` with probability ½ and signs
+/// of distinct counters are independent as far as Philox's words are. Every backend computes it
+/// alike, bit for bit, so a probe's signs are regenerated from their counters, never stored.
+#[must_use]
+pub fn fisher_sign(key: u64, row: u64, class: u64) -> f64 {
+    if philox(key, row, class)[0] >> 31 == 0 { 1.0 } else { -1.0 }
+}
+
 fn host_softmax(z: &[f64]) -> Vec<f64> {
     let m = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let e: Vec<f64> = z.iter().map(|v| (v - m).exp()).collect();
@@ -3806,32 +3779,37 @@ extern "C" __global__ void kl_proposal_rows(unsigned int rows, unsigned int cols
     }
 }
 
-extern "C" __global__ void sampled_cotangent(unsigned int rows, unsigned int cols, double* logits, const double* uniforms,
-                                             const unsigned int* scored, int use_scored) {
+// The sign of class `k` in row `r` of the Fisher probe under `key` (`fisher_sign` on the host): the
+// top bit of the first word of Philox4x32-10 of the counter (k, r), +1 when it is clear.
+__device__ double fisher_sign(u64 key, u64 r, u64 k) {
+    unsigned int c0 = (unsigned int)k, c1 = (unsigned int)(k >> 32), c2 = (unsigned int)r, c3 = (unsigned int)(r >> 32);
+    unsigned int k0 = (unsigned int)key, k1 = (unsigned int)(key >> 32);
+    for (int round = 0; round < 10; ++round) {
+        if (round > 0) { k0 += 0x9E3779B9u; k1 += 0xBB67AE85u; }
+        unsigned int hi0 = __umulhi(0xD2511F53u, c0), lo0 = 0xD2511F53u * c0;
+        unsigned int hi1 = __umulhi(0xCD9E8D57u, c2), lo1 = 0xCD9E8D57u * c2;
+        c0 = hi1 ^ c1 ^ k0; c1 = lo1; c2 = hi0 ^ c3 ^ k1; c3 = lo0;
+    }
+    return (c0 >> 31) ? -1.0 : 1.0;
+}
+
+// In place of row r's probabilities π, the Fisher probe's cotangent b = √π ⊙ ξ − π (√π · ξ)
+// (`Device::fisher_probe_cotangent`), ξ the signs of row `first + r` under `key`; a row whose
+// `scored` flag is zero becomes zero.
+extern "C" __global__ void fisher_probe(unsigned int rows, unsigned int cols, double* probabilities, u64 key, u64 first,
+                                        const unsigned int* scored, int use_scored) {
     __shared__ double shared[BLOCK];
-    __shared__ unsigned int label;
     unsigned int r = blockIdx.x;
     if (r >= rows) return;
-    double* z = logits + (u64)r * cols;
+    double* q = probabilities + (u64)r * cols;
     if (use_scored && scored[r] == 0) {
-        for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) z[c] = 0.0;
+        for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) q[c] = 0.0;
         return;
     }
-    double m, total;
-    softmax_stats(z, cols, shared, &m, &total);
-    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) z[c] = exp(z[c] - m) / total;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        double pick = uniforms[r];
-        unsigned int chosen = cols - 1;
-        for (unsigned int c = 0; c < cols; c++) {
-            if (pick < z[c]) { chosen = c; break; }
-            pick -= z[c];
-        }
-        label = chosen;
-    }
-    __syncthreads();
-    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) z[c] -= (c == label) ? 1.0 : 0.0;
+    double partial = 0.0;
+    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) partial += sqrt(q[c]) * fisher_sign(key, first + r, c);
+    double dot = block_sum(partial, shared);
+    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) q[c] = sqrt(q[c]) * fisher_sign(key, first + r, c) - q[c] * dot;
 }
 
 extern "C" __global__ void block_products(u64 n, unsigned int cols, unsigned int blocks,
@@ -3843,32 +3821,6 @@ extern "C" __global__ void block_products(u64 n, unsigned int cols, unsigned int
         for (unsigned int c = offsets[block]; c < offsets[block + 1]; c++)
             sum += left[row * cols + c] * right[row * cols + c];
         out[i] = sum;
-    }
-}
-
-extern "C" __global__ void sampled_head_cotangent(unsigned int rows, unsigned int classes, unsigned int width,
-    const double* probabilities, const double* mean, const double* head, int transposed,
-    const double* uniforms, const unsigned int* scored, int use_scored, double* out) {
-    __shared__ unsigned int label;
-    unsigned int r = blockIdx.x;
-    if (r >= rows) return;
-    if (use_scored && scored[r] == 0) {
-        for (unsigned int h = threadIdx.x; h < width; h += BLOCK) out[(u64)r * width + h] = 0.0;
-        return;
-    }
-    if (threadIdx.x == 0) {
-        double pick = uniforms[r];
-        label = classes - 1;
-        for (unsigned int c = 0; c < classes; c++) {
-            double p = probabilities[(u64)r * classes + c];
-            if (pick < p) { label = c; break; }
-            pick -= p;
-        }
-    }
-    __syncthreads();
-    for (unsigned int h = threadIdx.x; h < width; h += BLOCK) {
-        u64 index = transposed ? (u64)h * classes + label : (u64)label * width + h;
-        out[(u64)r * width + h] = mean[(u64)r * width + h] - head[index];
     }
 }
 
@@ -6185,25 +6137,26 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
         }
 
 
-        pub(super) fn sampled_cotangent(&self, logits: &mut Tensor, uniforms: &Tensor, scored: Option<&Indices>) -> Result<(), GpuError> {
-            let (rows, cols) = (logits.rows as u32, logits.cols as u32);
+        pub(super) fn fisher_probe_cotangent(&self, probabilities: &mut Tensor, (key, first): (u64, usize), scored: Option<&Indices>) -> Result<(), GpuError> {
+            let (rows, cols) = (probabilities.rows as u32, probabilities.cols as u32);
             let (flags, use_flags) = self.flags(scored)?;
-            let storage = logits.storage();
-            let f = self.kernel("sampled_cotangent", storage)?;
-            let n_rows = logits.rows;
-            // SAFETY: one block per row; one uniform per row.
+            let storage = probabilities.storage();
+            let f = self.kernel("fisher_probe", storage)?;
+            let (n_rows, first) = (probabilities.rows, first as u64);
+            // SAFETY: one block per row of a rows × cols buffer; `flags` has a flag per row when used.
             unsafe {
                 self.stream
                     .launch_builder(&f)
                     .arg(&rows)
                     .arg(&cols)
-                    .output(logits, storage)?
-                    .input(uniforms, storage)?
+                    .output(probabilities, storage)?
+                    .arg(&key)
+                    .arg(&first)
                     .arg(flags)
                     .arg(&use_flags)
                     .launch(cfg_rows(n_rows))
             }
-            .gpu_ctx("tensor sampled_cotangent")
+            .gpu_ctx("tensor fisher_probe")
             .map(|_| ())
         }
 
@@ -6219,28 +6172,6 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                     .input(left, storage)?.input(right, storage)?.arg(index_slice(&blocks.offsets)?)
                     .output(&mut out, storage)?.launch(cfg_elements(n))
             }.gpu_ctx("tensor block_products")?;
-            Ok(out)
-        }
-
-        pub(super) fn sampled_head_cotangent(
-            &self, probabilities: &Tensor, mean: &Tensor, head: &Tensor, transposed: bool,
-            uniforms: &Tensor, scored: Option<&Indices>,
-        ) -> Result<Tensor, GpuError> {
-            let storage = mean.storage();
-            let mut out = self.output(storage, mean.rows, mean.cols)?;
-            let (rows, classes, width) = (mean.rows as u32, probabilities.cols as u32, mean.cols as u32);
-            let transposed = i32::from(transposed);
-            let (flags, use_flags) = self.flags(scored)?;
-            let f = self.kernel("sampled_head_cotangent", storage)?;
-            // SAFETY: the public entry validates each tensor shape and the scored flag count.
-            // One block writes each row; the sampled label is always inside the vocabulary.
-            unsafe {
-                self.stream.launch_builder(&f)
-                    .arg(&rows).arg(&classes).arg(&width)
-                    .input(probabilities, storage)?.input(mean, storage)?.input(head, storage)?.arg(&transposed)
-                    .input(uniforms, storage)?.arg(flags).arg(&use_flags).output(&mut out, storage)?
-                    .launch(cfg_rows(mean.rows))
-            }.gpu_ctx("tensor sampled_head_cotangent")?;
             Ok(out)
         }
 
@@ -6604,7 +6535,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             hidden: &Tensor,
             head: (&Tensor, bool),
             scored: Option<&Indices>,
-            outputs: (Option<&mut Tensor>, Option<(&Tensor, &mut Tensor)>),
+            outputs: (Option<&mut Tensor>, Option<(u64, &mut Tensor)>),
             settings: (usize, Arithmetic),
         ) -> Result<Vec<f64>, GpuError> {
             let mut out = self.zeros(hidden.rows)?;
@@ -6615,15 +6546,17 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
         }
 
         /// The swept log partitions into `out` (one double per row), left on the device: no
-        /// host transfer, so a captured step can record it. With a draw (its uniforms and its
-        /// output), each chunk's launch of `head_chunk` also draws each row's candidate there, and
-        /// `head_draw` picks among them after the sweep (`Device::head_log_partition_drawn`).
+        /// host transfer, so a captured step can record it. With a probe (its key and its output,
+        /// `Device::head_log_partition_probed`), each chunk's launch of `head_chunk` also writes the
+        /// chunk's signed roots `exp((z − m) / 2) ξ`, which weight its head rows into the output
+        /// (one more product, rescaled by `scale_rows` as the largest grows), and `head_probe`
+        /// turns the output into the probe's pullback after the sweep.
         pub(super) fn head_log_partition_into(
             &self,
             hidden: &Tensor,
             (head, transposed): (&Tensor, bool),
             scored: Option<&Indices>,
-            (mut expected, draw): (Option<&mut Tensor>, Option<(&Tensor, &mut Tensor)>),
+            (mut expected, mut probe): (Option<&mut Tensor>, Option<(u64, &mut Tensor)>),
             out: &mut CudaSlice<f64>,
             (chunk, arithmetic): (usize, Arithmetic),
         ) -> Result<(), GpuError> {
@@ -6644,21 +6577,17 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 None => Factor::Single(slice32(hidden)?),
             };
             let chunk = chunk.clamp(1, classes.max(1));
-            let chunks = classes.div_ceil(chunk);
-            // A draw's candidate and log mass per row and chunk.
-            let cells = if draw.is_some() { rows * chunks } else { 1 };
-            // SAFETY: with a draw, each chunk's launch writes its column of both before `head_draw`
-            // reads them; without one, no kernel touches them.
-            let mut candidates = unsafe { self.stream.alloc::<u32>(cells) }.gpu_ctx("tensor alloc")?;
-            // SAFETY: as `candidates`.
-            let mut masses = unsafe { self.stream.alloc::<f64>(cells) }.gpu_ctx("tensor alloc")?;
-            // SAFETY: read only with a draw, which passes its own uniforms instead.
-            let no_uniforms = unsafe { self.stream.alloc::<f32>(1) }.gpu_ctx("tensor alloc")?;
-            let uniforms = match &draw {
-                Some((u, _)) => slice32(*u)?,
-                None => &no_uniforms,
-            };
-            let (drawn, chunks32) = (i32::from(draw.is_some()), chunks as u32);
+            // A probe's key, a chunk's signed roots per row and class, and per row their running sum
+            // `a` (from zero) and its rescaling.
+            let (key, probing) = (probe.as_ref().map_or(0, |(key, _)| *key), i32::from(probe.is_some()));
+            let cells = if probe.is_some() { rows * chunk } else { 1 };
+            // SAFETY: with a probe, each chunk's `head_chunk` writes the roots of its rows × count
+            // classes before the product reads them; without one, no kernel touches them.
+            let mut roots = unsafe { self.stream.alloc::<f32>(cells.max(1)) }.gpu_ctx("tensor alloc")?;
+            let mut root_sums = self.zeros(if probe.is_some() { rows } else { 1 })?;
+            // SAFETY: with a probe, each chunk's `head_chunk` writes every row's before `scale_rows`
+            // reads it; without one, no kernel touches it.
+            let mut root_factor = unsafe { self.stream.alloc::<f32>(rows.max(1)) }.gpu_ctx("tensor alloc")?;
             // SAFETY: each chunk's product writes its logits whole (β = 0) before `head_chunk` reads
             // them, and `fill` writes every row's largest before any is read.
             let mut logits = unsafe { self.stream.alloc::<f32>((rows * chunk).max(1)) }.gpu_ctx("tensor alloc")?;
@@ -6695,13 +6624,13 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                     1,
                     (0, 0, 0),
                 )?;
-                let (count32, start32, index32) = (count as u32, start as u32, index as u32);
+                let (count32, start32) = (count as u32, start as u32);
                 // SAFETY: one block per row of the rows × count logits; per-row state of length rows;
-                // with a draw, rows × chunks candidates and masses and one uniform per row.
+                // with a probe, rows × count roots.
                 unsafe {
                     self.stream.launch_builder(&chunk_kernel).arg(&rows32).arg(&count32).arg(&mut logits).arg(&mut largest)
-                        .arg(&mut sums).arg(&mut factor).arg(&want).arg(uniforms).arg(&start32).arg(&index32).arg(&chunks32)
-                        .arg(&mut candidates).arg(&mut masses).arg(&drawn).launch(cfg_rows(rows))
+                        .arg(&mut sums).arg(&mut factor).arg(&want).arg(&key).arg(&start32).arg(&probing)
+                        .arg(&mut roots).arg(&mut root_sums).arg(&mut root_factor).launch(cfg_rows(rows))
                 }
                 .gpu_ctx("tensor head_chunk")?;
                 if let Some(out) = expected.as_deref_mut() {
@@ -6732,6 +6661,36 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                         (0, 0, 0),
                     )?;
                 }
+                if let Some((_, probed)) = probe.as_mut() {
+                    let probed: &mut Tensor = probed;
+                    let n = probed.len() as u64;
+                    if index > 0 && n > 0 {
+                        // SAFETY: `probed` is rows × width; `root_factor` holds one value per row.
+                        unsafe { self.stream.launch_builder(&rescale).arg(&n).arg(&width32).arg(&root_factor).output(probed, Storage::F32)?.launch(cfg_elements(n)) }
+                            .gpu_ctx("tensor scale_rows")?;
+                    }
+                    // Column-major probedᵀ (width × rows) += E_chunkᵀ (width × count) · Wᵀ (count ×
+                    // rows), W the chunk's signed roots (rounded to bfloat16 as the exponentials are).
+                    let (head_op, head_ld) = if transposed { (t, classes) } else { (n_op, width) };
+                    let rounded = if half { Some(self.round_half(&roots, 0, rows * count)?) } else { None };
+                    let weights = match &rounded {
+                        Some(r) => Factor::Half(r),
+                        None => Factor::Single(&roots),
+                    };
+                    self.gemm_ex(
+                        Gemm32 {
+                            ops: (head_op, n_op),
+                            dims: (width, rows, count),
+                            scale: (1.0, if index == 0 { 0.0 } else { 1.0 }),
+                            a: (head_factor, if transposed { start } else { start * width }, head_ld),
+                            b: (weights, 0, count),
+                            c: (slice32_mut(probed)?, 0, width),
+                            compute,
+                        },
+                        1,
+                        (0, 0, 0),
+                    )?;
+                }
             }
             let (flags, use_flags) = self.flags(scored)?;
             let finish = self.kernel("head_finish", Storage::F32)?;
@@ -6746,17 +6705,15 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                     .arg(&want).arg(&mut *mean).arg(out).launch(cfg_rows(rows))
             }
             .gpu_ctx("tensor head_finish")?;
-            if let Some((_, draws)) = draw {
-                let pick = self.kernel("head_draw", Storage::F32)?;
-                let (classes32, transposed32) = (classes as u32, i32::from(transposed));
-                // SAFETY: rows × chunks candidates and masses, all written by the sweep; `mean` and
-                // `draws` are rows × width, the head classes × width (or transposed), f32.
+            if let Some((_, probed)) = probe {
+                let finish_probe = self.kernel("head_probe", Storage::F32)?;
+                // SAFETY: per-row sums of length rows, written by the sweep; `mean` (rows × width
+                // with a probe, which takes `expected`) and `probed` are rows × width, f32.
                 unsafe {
-                    self.stream.launch_builder(&pick).arg(&rows32).arg(&chunks32).arg(&classes32).arg(&width32).arg(uniforms)
-                        .arg(&candidates).arg(&masses).arg(flags).arg(&use_flags).arg(&*mean).arg(slice32(head)?).arg(&transposed32)
-                        .arg(slice32_mut(draws)?).launch(cfg_rows(rows))
+                    self.stream.launch_builder(&finish_probe).arg(&rows32).arg(&width32).arg(&sums).arg(&root_sums).arg(flags).arg(&use_flags)
+                        .arg(&*mean).arg(slice32_mut(probed)?).launch(cfg_rows(rows))
                 }
-                .gpu_ctx("tensor head_draw")?;
+                .gpu_ctx("tensor head_probe")?;
             }
             Ok(())
         }
@@ -7086,56 +7043,38 @@ kernel void t_kl_rows(device const float* target [[buffer(0)]], device float* lo
     }
 }
 
-// The first class whose cumulative probability passes `pick` (the last if none does): each thread
-// sums a contiguous chunk of the row, then one thread walks the chunk sums and the chosen chunk.
-inline uint pick_label(device const float* q, uint cols, float pick, threadgroup float* shared, threadgroup uint* label, uint t) {
-    uint chunk = (cols + GROUP - 1) / GROUP;
-    uint lo = min(t * chunk, cols), hi = min(lo + chunk, cols);
-    float part = 0.0f;
-    for (uint c = lo; c < hi; c++) part += q[c];
-    shared[t] = part;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (t == 0) {
-        uint chosen = cols - 1;
-        float left = pick;
-        for (uint k = 0; k < GROUP; k++) {
-            if (left < shared[k]) {
-                uint start = k * chunk, end = min(start + chunk, cols);
-                chosen = end - 1;
-                for (uint c = start; c < end; c++) {
-                    if (left < q[c]) { chosen = c; break; }
-                    left -= q[c];
-                }
-                break;
-            }
-            left -= shared[k];
-        }
-        *label = chosen;
+// The sign of class `k` in row `row` of the Fisher probe under `key` (`fisher_sign` on the host;
+// rows and classes fit 32 bits here): the top bit of the first word of Philox4x32-10 of the
+// counter (k, row), +1 when it is clear.
+inline float fisher_sign(uint2 key, uint row, uint k) {
+    uint c0 = k, c1 = 0u, c2 = row, c3 = 0u, k0 = key.x, k1 = key.y;
+    for (int round = 0; round < 10; ++round) {
+        if (round > 0) { k0 += 0x9E3779B9u; k1 += 0xBB67AE85u; }
+        uint hi0 = mulhi(0xD2511F53u, c0), lo0 = 0xD2511F53u * c0;
+        uint hi1 = mulhi(0xCD9E8D57u, c2), lo1 = 0xCD9E8D57u * c2;
+        c0 = hi1 ^ c1 ^ k0; c1 = lo1; c2 = hi0 ^ c3 ^ k1; c3 = lo0;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint chosen = *label;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return chosen;
+    return (c0 >> 31) != 0u ? -1.0f : 1.0f;
 }
 
-// a: rows flagged by `scored`.
-kernel void t_sampled_cotangent(device float* logits [[buffer(0)]], device const float* uniforms [[buffer(1)]], device const uint* scored [[buffer(2)]],
-                                constant P& p [[buffer(3)]], uint group [[threadgroup_position_in_grid]],
-                                uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
+// In place of row r's probabilities π, the Fisher probe's cotangent b = √π ⊙ ξ − π (√π · ξ)
+// (`Device::fisher_probe_cotangent`), ξ the signs of row `extra + r` under the key (c, d) (its low
+// and high words); a: rows flagged by `scored`, a row whose flag is zero becoming zero.
+kernel void t_fisher_probe(device float* probabilities [[buffer(0)]], device const uint* scored [[buffer(1)]],
+                           constant P& p [[buffer(2)]], uint group [[threadgroup_position_in_grid]],
+                           uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
     threadgroup float shared[GROUP];
-    threadgroup uint label;
+    uint2 key = uint2(p.c, p.d);
     ROWS {
-        device float* z = logits + (ulong)r * p.cols;
+        device float* q = probabilities + (ulong)r * p.cols;
         if (p.a != 0 && scored[r] == 0) {
-            for (uint c = t; c < p.cols; c += GROUP) z[c] = 0.0f;
+            for (uint c = t; c < p.cols; c += GROUP) q[c] = 0.0f;
             continue;
         }
-        float2 s = softmax_stats(z, p.cols, shared, t);
-        for (uint c = t; c < p.cols; c += GROUP) z[c] = exp(z[c] - s.x) / s.y;
-        threadgroup_barrier(mem_flags::mem_device);
-        uint chosen = pick_label(z, p.cols, uniforms[r], shared, &label, t);
-        for (uint c = t; c < p.cols; c += GROUP) z[c] = z[c] - ((c == chosen) ? 1.0f : 0.0f);
-        threadgroup_barrier(mem_flags::mem_device);
+        float partial = 0.0f;
+        for (uint c = t; c < p.cols; c += GROUP) partial += sqrt(q[c]) * fisher_sign(key, p.extra + r, c);
+        float dot = group_sum(partial, shared, t);
+        for (uint c = t; c < p.cols; c += GROUP) q[c] = sqrt(q[c]) * fisher_sign(key, p.extra + r, c) - q[c] * dot;
     }
 }
 
@@ -7148,26 +7087,6 @@ kernel void t_block_products(device const float* left [[buffer(0)]], device cons
         float sum = 0.0f;
         for (uint c = offsets[block]; c < offsets[block + 1]; c++) sum += left[row * p.cols + c] * right[row * p.cols + c];
         out[i] = sum;
-    }
-}
-
-// cols: classes; extra: width; a: rows flagged by `scored`; b: the head stored transposed.
-kernel void t_sampled_head(device const float* probabilities [[buffer(0)]], device const float* mean [[buffer(1)]], device const float* head [[buffer(2)]],
-                           device const float* uniforms [[buffer(3)]], device const uint* scored [[buffer(4)]], device float* out [[buffer(5)]],
-                           constant P& p [[buffer(6)]], uint group [[threadgroup_position_in_grid]],
-                           uint groups [[threadgroups_per_grid]], uint t [[thread_position_in_threadgroup]]) {
-    threadgroup float shared[GROUP];
-    threadgroup uint label;
-    ROWS {
-        if (p.a != 0 && scored[r] == 0) {
-            for (uint h = t; h < p.extra; h += GROUP) out[(ulong)r * p.extra + h] = 0.0f;
-            continue;
-        }
-        uint chosen = pick_label(probabilities + (ulong)r * p.cols, p.cols, uniforms[r], shared, &label, t);
-        for (uint h = t; h < p.extra; h += GROUP) {
-            ulong index = p.b ? (ulong)h * p.cols + chosen : (ulong)chosen * p.extra + h;
-            out[(ulong)r * p.extra + h] = mean[(ulong)r * p.extra + h] - head[index];
-        }
     }
 }
 
@@ -7602,9 +7521,8 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
         "t_softmax_rows",
         "t_softmax_backward",
         "t_kl_rows",
-        "t_sampled_cotangent",
+        "t_fisher_probe",
         "t_block_products",
-        "t_sampled_head",
         "t_softmax_quadratic",
         "t_argmax_rows",
         "t_fill_entries",
@@ -7932,10 +7850,13 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
             Ok(stats)
         }
 
-        pub(super) fn sampled_cotangent(&self, logits: &mut Tensor, uniforms: &Tensor, scored: Option<&Indices>) -> Result<(), GpuError> {
+        pub(super) fn fisher_probe_cotangent(&self, probabilities: &mut Tensor, (key, first): (u64, usize), scored: Option<&Indices>) -> Result<(), GpuError> {
             let (flags, use_flags) = self.flags(scored)?;
-            let p = P { a: use_flags, ..P::default() };
-            self.rows("t_sampled_cotangent", &[whole(buffer(logits)?), whole(buffer(uniforms)?), whole(flags)], logits.rows, logits.cols, p)
+            // The signs' rows and classes are 32-bit counters here.
+            u32_of(first.saturating_add(probabilities.rows))?;
+            let [low, high] = halves(key);
+            let p = P { extra: u32_of(first)?, a: use_flags, c: low, d: high, ..P::default() };
+            self.rows("t_fisher_probe", &[whole(buffer(probabilities)?), whole(flags)], probabilities.rows, probabilities.cols, p)
         }
 
         pub(super) fn block_products(&self, left: &Tensor, right: &Tensor, blocks: &ColumnBlocks) -> Result<Tensor, GpuError> {
@@ -7943,25 +7864,6 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
             let p = P { cols: u32_of(left.cols)?, extra: u32_of(blocks.len())?, ..P::default() };
             let buffers = [whole(buffer(left)?), whole(buffer(right)?), whole(index_buffer(&blocks.offsets)?), whole(buffer(&out)?)];
             self.elements("t_block_products", &buffers, out.len(), p)?;
-            Ok(out)
-        }
-
-        pub(super) fn sampled_head_cotangent(
-            &self,
-            probabilities: &Tensor,
-            mean: &Tensor,
-            head: &Tensor,
-            transposed: bool,
-            uniforms: &Tensor,
-            scored: Option<&Indices>,
-        ) -> Result<Tensor, GpuError> {
-            let out = self.tensor(mean.rows, mean.cols)?;
-            let (flags, use_flags) = self.flags(scored)?;
-            let p = P { extra: u32_of(mean.cols)?, a: use_flags, b: u32::from(transposed), ..P::default() };
-            let buffers =
-                [whole(buffer(probabilities)?), whole(buffer(mean)?), whole(buffer(head)?), whole(buffer(uniforms)?), whole(flags), whole(buffer(&out)?)];
-            u32_of(head.len())?;
-            self.rows("t_sampled_head", &buffers, mean.rows, probabilities.cols, p)?;
             Ok(out)
         }
 

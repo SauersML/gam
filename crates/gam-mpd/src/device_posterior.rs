@@ -8,7 +8,7 @@
 //! the improved variational online Newton step (IVON, [`Device::posterior_ivon`]) with the data
 //! term's curvature in the Gauss–Newton approximation, from the gradient the program's reverse
 //! pass left on the device and a draw of the Gauss–Newton factor (`interchange::Factor`, a second
-//! reverse pass from labels drawn from the explanation's own predictions), which also sums each
+//! reverse pass from the Fisher probe at the explanation's own predictions), which also sums each
 //! prior group's new moments; the groups' variances and divergences follow from those sums
 //! ([`Device::group_divergence`]). The posterior, the curvature and the gradient's second moment are held in the fitting storage
 //! (f32 on CUDA and the Apple GPU, float64 on the host); the momentum in bfloat16 where the masters

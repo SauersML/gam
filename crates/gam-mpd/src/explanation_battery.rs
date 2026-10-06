@@ -1981,12 +1981,12 @@ pub fn vpd_pricing(vpd: &Vpd, export: &Path, train: &[Vec<u32>], held_out: &[Vec
             let (kl, cotangent) = divergence_and_seed(&device, &m_hidden, trace.value(hidden_node)?, &head, length, step, arithmetic)?;
             if let Some(cotangent) = cotangent {
                 let (_, gradients) = program.vjp_values_dense(&trace, BTreeMap::from([(hidden_node, cotangent)]), &[], &trainable, arithmetic)?;
-                // A draw of the Gauss–Newton factor through the same forward pass: labels drawn
-                // from VPD's own prediction at every token (`interchange::Factor`).
-                let mut draws = StdRng::seed_from_u64(key);
-                let uniforms: Vec<f64> = (0..family.rows).map(|_| draws.random::<f64>()).collect();
-                let labels = crate::interchange::sampled_label_seed(&device, trace.value(hidden_node)?, &head, length, &uniforms, arithmetic)?;
-                let (_, factor) = program.vjp_values_dense(&trace, BTreeMap::from([(hidden_node, labels)]), &[], &trainable, arithmetic)?;
+                // A draw of the Gauss–Newton factor through the same forward pass: the Fisher
+                // probe at VPD's own prediction at every token (`interchange::Factor`), under a
+                // key apart from the sample's (both are Philox draws).
+                let probe = gam_linalg::utils::splitmix64_hash(key);
+                let probed = crate::interchange::fisher_probe_seed(&device, trace.value(hidden_node)?, &head, length, probe, arithmetic)?;
+                let (_, factor) = program.vjp_values_dense(&trace, BTreeMap::from([(hidden_node, probed)]), &[], &trainable, arithmetic)?;
                 let per_token = 1.0 / family.rows as f64;
                 posterior.step(&gradients, per_token, (&factor, per_token), &ivon)?;
             }
