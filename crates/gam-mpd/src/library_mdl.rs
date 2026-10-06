@@ -3481,6 +3481,10 @@ pub fn fit_from(
                         along += data.iter().zip(mean.iter()).map(|(a, b)| a * b).sum::<f64>() * scale * LN_2;
                     }
                     square += mean.iter().map(|v| v * v).sum::<f64>();
+                    // At λ = 0 the term adds nothing, and the step is the budget-free one bit for bit.
+                    if lambda == 0.0 {
+                        continue;
+                    }
                     let pull = mean.mapv(|v| lambda * v / (scale * LN_2));
                     let pull = device.upload(pull.view()).map_err(error)?;
                     match gradients.get_mut(&op) {
@@ -4616,6 +4620,63 @@ mod tests {
             let central = (bits(&up) - bits(&down)) / (2.0 * h);
             assert!((gradients[i][at] - central).abs() <= 1e-5 * (1.0 + central.abs()), "shared key gradient {} against {central}", gradients[i][at]);
         }
+    }
+
+    /// A budget that never binds (`K = ∞`, or `K` far above any count, where `λ` stays 0) leaves
+    /// the fit bit for bit; a finite one records `K`, `Ê[k]` and `λ` in every epoch.
+    #[test]
+    fn a_budget_that_never_binds_leaves_the_fit_bit_for_bit() {
+        let (native, layers, _, sequences) = tiny("library_budget_free", "relu");
+        let explanation = explanation(&native, &layers).unwrap();
+        let (train, held) = sequences.split_at(4);
+        let run = |budget: Option<f64>| {
+            let mut settings = settings();
+            settings.epochs = Some(2);
+            settings.budget = budget;
+            fit(&Device::host(), &native, &explanation, train, held, &settings, "tiny", None, None).unwrap()
+        };
+        let free = run(None);
+        for budget in [f64::INFINITY, 1e9] {
+            let fitted = run(Some(budget));
+            let same = fitted.posterior.mean.iter().zip(&free.posterior.mean).all(|(a, b)| a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits()));
+            assert!(same, "a budget of {budget} moved the posterior");
+            assert_eq!(fitted.report.objective_bits.to_bits(), free.report.objective_bits.to_bits());
+            if budget.is_finite() {
+                for epoch in &fitted.report.epochs {
+                    assert_eq!(epoch.budget, Some(budget));
+                    assert_eq!(epoch.multiplier, Some(0.0));
+                    assert!(epoch.expected_parts.is_some_and(|k| k > 0.0 && k < budget));
+                }
+            }
+        }
+    }
+
+    /// A budget below the free fit's count pulls the expected parts per token down: on the tiny
+    /// decoder with ReLU functions (gated parts), after the same epochs the fit with `K` at half
+    /// the gated count's share has a positive multiplier and fewer expected parts per token than
+    /// the free fit's.
+    #[test]
+    fn a_binding_budget_lowers_the_expected_parts_per_token() {
+        let (native, layers, _, sequences) = tiny("library_budget_binds", "relu");
+        let explanation = explanation(&native, &layers).unwrap();
+        let (train, held) = sequences.split_at(4);
+        let run = |budget: f64| {
+            let mut settings = settings();
+            settings.epochs = Some(6);
+            settings.budget = Some(budget);
+            fit(&Device::host(), &native, &explanation, train, held, &settings, "tiny", None, None).unwrap()
+        };
+        let free = run(1e9);
+        let free_parts = free.report.epochs.last().and_then(|e| e.expected_parts).unwrap();
+        // The heads count whole; the budget asks for half of the rest.
+        let heads: usize = explanation.layers.iter().map(|l| l.heads.len()).sum();
+        let limit = heads as f64 + 0.5 * (free_parts - heads as f64);
+        let bound = run(limit);
+        let last = bound.report.epochs.last().unwrap();
+        assert!(last.multiplier.is_some_and(|l| l > 0.0), "the multiplier stayed at zero over the budget");
+        let parts = last.expected_parts.unwrap();
+        eprintln!("free {free_parts}, budget {limit}, bound {parts}, λ {:?}", last.multiplier);
+        assert!(parts < free_parts, "the budget left {parts} parts per token against the free fit's {free_parts}");
     }
 
     fn settings() -> Settings {
