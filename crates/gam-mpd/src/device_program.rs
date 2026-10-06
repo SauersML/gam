@@ -1820,7 +1820,7 @@ impl DeviceProgram {
                 }
             }
         }
-        self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut BTreeMap::new())
+        Ok(self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut BTreeMap::new())?.0)
     }
 
     /// Reverse resident-value expressions from explicitly declared node seeds.
@@ -1837,7 +1837,7 @@ impl DeviceProgram {
         if self.head.operator.is_some() {
             return Err("device: values VJP requires resident-value compilation".into());
         }
-        self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut BTreeMap::new())
+        Ok(self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut BTreeMap::new())?.0)
     }
 
     /// The reverse pass from `seeds` down to the lowest node of `keep`; at each node of `edited`,
@@ -1852,7 +1852,7 @@ impl DeviceProgram {
         edited: &BTreeSet<usize>,
         hook: &mut dyn FnMut(usize, &mut Tensor) -> Result<(), String>,
         parameters: &mut BTreeMap<usize, Tensor>,
-    ) -> Result<BTreeMap<usize, Tensor>, String> {
+    ) -> Result<(BTreeMap<usize, Tensor>, BTreeMap<usize, Tensor>), String> {
         if keep
             .iter()
             .chain(seeds.keys())
@@ -1870,7 +1870,7 @@ impl DeviceProgram {
             }
         }
         let Some(first) = keep.iter().copied().min() else {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), BTreeMap::new()));
         };
         let d = &self.device;
         // A group that ran fused reverses fused unless a cotangent is wanted or seeded inside it.
@@ -1886,7 +1886,7 @@ impl DeviceProgram {
         }
         // A frozen node's cotangent is wanted only when it is kept.
         let needed: Vec<bool> = (0..self.steps.len()).map(|n| keep.contains(&n) || trace.frozen.as_ref().is_none_or(|f| !f[n])).collect();
-        let mut kept = BTreeMap::new();
+        let (mut kept, mut rounded) = (BTreeMap::new(), BTreeMap::new());
         // Adds `term` into node `n`'s cotangent.
         let add = |g: &mut Vec<Option<Tensor>>, n: usize, term: Tensor| -> Result<(), String> {
             match g[n].as_mut() {
@@ -1912,10 +1912,13 @@ impl DeviceProgram {
                 kept.insert(index, cot);
                 break;
             }
+            // The cotangent as the products below read it (`operand`).
+            let mut half = None;
             if let Some(group) = self.grouped[index].filter(|f| fused[*f] && self.fused[*f].heads.output == index) {
-                self.heads_reverse(trace, group, &cot, (&mut g, &needed), arithmetic, parameters)?;
+                self.heads_reverse(trace, group, (&cot, &mut half), (&mut g, &needed), arithmetic, parameters)?;
                 if keep.contains(&index) {
                     kept.insert(index, cot);
+                    rounded.extend(half.map(|h| (index, h)));
                 }
                 continue;
             }
@@ -1943,7 +1946,7 @@ impl DeviceProgram {
                 Step::Head | Step::Feature { .. } | Step::Raw { .. } | Step::Constant { .. } => {}
                 Step::Affine { terms, .. } => {
                     for (argument, operator) in terms {
-                        self.pull_term((&mut g, &needed), trace.rows, &cot, *argument, *operator, arithmetic)?;
+                        self.pull_term((&mut g, &needed), trace.rows, (&cot, &mut half), *argument, *operator, arithmetic)?;
                     }
                 }
                 Step::Transposed { input, operator } => {
@@ -2009,14 +2012,28 @@ impl DeviceProgram {
             }
             if keep.contains(&index) {
                 kept.insert(index, cot);
+                rounded.extend(half.map(|h| (index, h)));
             }
         }
-        Ok(kept)
+        Ok((kept, rounded))
+    }
+
+    /// `cot` as an operand of a product in `arithmetic`: in bfloat16 an f32 cotangent rounded once
+    /// into `half`, from which every product reading it takes it (each would otherwise round it
+    /// again, to the same values); otherwise `cot` itself.
+    fn operand<'a>(&self, cot: &'a Tensor, half: &'a mut Option<Tensor>, arithmetic: Arithmetic) -> Result<&'a Tensor, String> {
+        if arithmetic != Arithmetic::Bf16 || cot.storage() != Storage::F32 {
+            return Ok(cot);
+        }
+        if half.is_none() {
+            *half = Some(self.device.bf16_copy(cot).map_err(error)?);
+        }
+        half.as_ref().ok_or_else(|| "device: a rounded cotangent".to_string())
     }
 
     /// `g[argument] ← g[argument] + cot · ∂(x op(A)ᵀ)/∂x` for the affine term `(argument, operator)`
     /// (nothing for a one-hot feature).
-    fn pull_term(&self, (g, needed): (&mut [Option<Tensor>], &[bool]), rows: usize, cot: &Tensor, argument: usize, operator: usize, arithmetic: Arithmetic) -> Result<(), String> {
+    fn pull_term(&self, (g, needed): (&mut [Option<Tensor>], &[bool]), rows: usize, (cot, half): (&Tensor, &mut Option<Tensor>), argument: usize, operator: usize, arithmetic: Arithmetic) -> Result<(), String> {
         let d = &self.device;
         if matches!(self.steps[argument], Step::Feature { .. }) || !needed[argument] {
             return Ok(());
@@ -2028,11 +2045,11 @@ impl DeviceProgram {
         match self.held(operator, Role::Product)? {
             Held::Identity => d.axpy(target, 1.0, cot).map_err(error),
             Held::Diagonal(diag) => d.scale_columns(target, cot, diag, true).map_err(error),
-            Held::Dense(a) => d.gemm(target, 1.0, cot, Op::N, a, Op::N, 1.0, arithmetic).map_err(error),
+            Held::Dense(a) => d.gemm(target, 1.0, self.operand(cot, half, arithmetic)?, Op::N, a, Op::N, 1.0, arithmetic).map_err(error),
             Held::LowRank(left, right) => {
                 // g (L R) = (g L) R.
                 let mut middle = d.empty(cot.rows(), left.cols()).map_err(error)?;
-                d.gemm(&mut middle, 1.0, cot, Op::N, left, Op::N, 0.0, arithmetic).map_err(error)?;
+                d.gemm(&mut middle, 1.0, self.operand(cot, half, arithmetic)?, Op::N, left, Op::N, 0.0, arithmetic).map_err(error)?;
                 d.gemm(target, 1.0, &middle, Op::N, right, Op::N, 1.0, arithmetic).map_err(error)
             }
             Held::Table(_) | Held::Column(_) => Err("device: an operator held in the wrong role".to_string()),
@@ -2047,7 +2064,7 @@ impl DeviceProgram {
         &self,
         trace: &DeviceTrace,
         g: usize,
-        cot: &Tensor,
+        (cot, half): (&Tensor, &mut Option<Tensor>),
         (grads, needed): (&mut [Option<Tensor>], &[bool]),
         arithmetic: Arithmetic,
         parameters: &mut BTreeMap<usize, Tensor>,
@@ -2057,21 +2074,22 @@ impl DeviceProgram {
         let heads = &group.heads;
         let buffers = trace.fused[g].ok_or("device: a fused reverse without its forward")?;
         for (argument, operator) in &heads.rest {
-            self.pull_term((&mut *grads, needed), trace.rows, cot, *argument, *operator, arithmetic)?;
+            self.pull_term((&mut *grads, needed), trace.rows, (cot, &mut *half), *argument, *operator, arithmetic)?;
         }
         let wanted: Vec<(usize, usize)> = heads.projection_operators.iter().enumerate().filter(|(_, (op, _))| parameters.contains_key(op)).map(|(i, (op, _))| (i, *op)).collect();
         if !needed[heads.input] && wanted.is_empty() {
             return Ok(());
         }
         let mut g_a = d.empty(trace.rows, heads.heads * heads.width).map_err(error)?;
-        d.gemm(&mut g_a, 1.0, cot, Op::N, &group.stacked.reads, Op::N, 0.0, arithmetic).map_err(error)?;
+        d.gemm(&mut g_a, 1.0, self.operand(cot, half, arithmetic)?, Op::N, &group.stacked.reads, Op::N, 0.0, arithmetic).map_err(error)?;
         let turn = turn(&trace.rotations, heads.rotary)?;
         let gained = buffers.normed.map(|(_, gained)| &trace.buffers[gained]);
         let g_p = device_heads::backward(d, (heads, &group.stacked), (&trace.buffers[buffers.projections], gained), &g_a, trace.blocks, turn, (self.arithmetic, arithmetic)).map_err(error)?;
+        let mut half_p = None;
         if !wanted.is_empty() {
             let x = trace.value(heads.input)?;
             let mut stacked = d.empty(heads.columns(), x.cols()).map_err(error)?;
-            d.gemm(&mut stacked, 1.0, &g_p, Op::T, x, Op::N, 0.0, arithmetic).map_err(error)?;
+            d.gemm(&mut stacked, 1.0, self.operand(&g_p, &mut half_p, arithmetic)?, Op::T, x, Op::N, 0.0, arithmetic).map_err(error)?;
             for (i, op) in wanted {
                 let rows = d.rows_of(&stacked, i * heads.width, heads.width).map_err(error)?;
                 let gradient = parameters.get_mut(&op).ok_or("device: a projection's gradient slot")?;
@@ -2085,7 +2103,7 @@ impl DeviceProgram {
             grads[heads.input] = Some(d.zeros(trace.rows, self.widths[heads.input]).map_err(error)?);
         }
         let target = grads[heads.input].as_mut().ok_or("device: cotangent slot")?;
-        d.gemm(target, 1.0, &g_p, Op::N, &group.stacked.weights, Op::N, 1.0, arithmetic).map_err(error)
+        d.gemm(target, 1.0, self.operand(&g_p, &mut half_p, arithmetic)?, Op::N, &group.stacked.weights, Op::N, 1.0, arithmetic).map_err(error)
     }
 
     /// Resident cotangents for explicitly trainable dense operators, including
@@ -2185,7 +2203,7 @@ impl DeviceProgram {
                 retained.push(node);
             }
         }
-        let mut nodes = self.reverse_seeds(trace, seeds, &retained, arithmetic, edited, hook, &mut gradients)?;
+        let (mut nodes, mut rounded) = self.reverse_seeds(trace, seeds, &retained, arithmetic, edited, hook, &mut gradients)?;
         // One scalar constant is uploaded; all reductions and gradient arrays stay
         // on the device. Reuse the same broadcast across every column occurrence.
         let has_columns = requested.iter().any(|op| self.operators.contains_key(&(*op, Role::Column)));
@@ -2197,15 +2215,16 @@ impl DeviceProgram {
             let Some(cot) = nodes.get(&node) else {
                 continue;
             };
+            let mut half = rounded.remove(&node);
             if let Step::Affine { terms, .. } = step {
                 for (input, op) in terms {
                     if let Some(gradient) = gradients.get_mut(op) {
-                        self.device.gemm(gradient, 1.0, cot, Op::T, trace.value(*input)?, Op::N, 1.0, arithmetic).map_err(error)?;
+                        self.device.gemm(gradient, 1.0, self.operand(cot, &mut half, arithmetic)?, Op::T, trace.value(*input)?, Op::N, 1.0, arithmetic).map_err(error)?;
                     }
                 }
             } else if let Step::Transposed { input, operator } = step {
                 if let Some(gradient) = gradients.get_mut(operator) {
-                    self.device.gemm(gradient, 1.0, trace.value(*input)?, Op::T, cot, Op::N, 1.0, arithmetic).map_err(error)?;
+                    self.device.gemm(gradient, 1.0, trace.value(*input)?, Op::T, self.operand(cot, &mut half, arithmetic)?, Op::N, 1.0, arithmetic).map_err(error)?;
                 }
             }
             let column = match step {
@@ -2214,7 +2233,7 @@ impl DeviceProgram {
                 _ => None,
             };
             if let Some(gradient) = column.and_then(|op| gradients.get_mut(&op)) {
-                self.device.gemm(gradient, 1.0, cot, Op::T,
+                self.device.gemm(gradient, 1.0, self.operand(cot, &mut half, arithmetic)?, Op::T,
                     ones.as_ref().ok_or("device: missing column reduction workspace")?, Op::N,
                     1.0, arithmetic).map_err(error)?;
             }
