@@ -3299,6 +3299,37 @@ pub fn start_posterior(device: &Device, native: &OperatorProgram, explanation: &
     Ok(posterior)
 }
 
+/// `posterior` with the removals a round accepted applied in order (each `(without effect,
+/// groups)` of `accepted`, from its journal): groups without effect removed plainly, every other
+/// proposal compensated as the round made it (`library_compensation`, its Gram from `posterior`
+/// before the first), with the held-out evaluation before and after.
+pub fn removal_replay(device: &Device, native: &OperatorProgram, explanation: &Explanation, posterior: &mut Posterior, step: Step, accepted: &[(bool, Vec<usize>)]) -> Result<(HeldOut, HeldOut), String> {
+    let Step { sequences, held, settings, .. } = step;
+    settings.validate()?;
+    let length = sequences.first().map_or(0, Vec::len);
+    let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?;
+    let mut tokens = 0;
+    for draw in &draws {
+        tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
+    }
+    let evaluate = |scorer: &mut Scorer, posterior: &Posterior| -> Result<HeldOut, String> {
+        let device_posterior = DevicePosterior::new(device, explanation, posterior, tokens as f64, None, 0)?;
+        held_out(scorer, explanation, (posterior, &device_posterior), held, settings, tokens, None)
+    };
+    let before = evaluate(&mut scorer, posterior)?;
+    let compensation = Compensation::new(&mut scorer.experiments, explanation, posterior, sequences, settings.batch_sequences)?;
+    for (dead, groups) in accepted {
+        if *dead {
+            posterior.remove(groups);
+        } else {
+            *posterior = compensation.proposal(posterior, groups)?;
+        }
+    }
+    let after = evaluate(&mut scorer, posterior)?;
+    Ok((before, after))
+}
+
 /// Per group set of `sets`, removed from `posterior` alone, the changes of the data term and of
 /// the description in nats on the removal step's training collection at its weight samples,
 /// without compensation and with it (`library_compensation`): what a unit's prediction estimates.

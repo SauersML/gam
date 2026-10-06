@@ -11,7 +11,9 @@
 //! from (`library_mdl::start_posterior`). `OUT` receives `REPORT.json`, the search's
 //! log (`ranked.removals.jsonl`) and `M`'s targets (`targets/`). With a sixth argument, group sets
 //! (`;` between sets, `,` between groups), each set is removed alone without and with compensation
-//! and the changes of the data term and the description go to `OUT/CHANGES.json` instead.
+//! and the changes of the data term and the description go to `OUT/CHANGES.json` instead; with
+//! `replay:JOURNAL`, the removals that round journal accepted are applied to the posterior in order
+//! and the held-out evaluation before and after goes to `OUT/REPLAY.json`.
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     engine::{log_to_stderr, sha256},
@@ -24,7 +26,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::{path::Path, time::Instant};
 
-const USAGE: &str = "EXPORT SETTINGS.json CHECKPOINT OUT host|gpu [G,G;G,…]";
+const USAGE: &str = "EXPORT SETTINGS.json CHECKPOINT OUT host|gpu [G,G;G,…|replay:JOURNAL]";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +99,29 @@ fn main() -> Result<(), String> {
         library_mdl::checkpoint_posterior(&explanation, checkpoint)?
     };
     std::fs::create_dir_all(out).map_err(error)?;
+    if let Some(journal) = sets.and_then(|s| s.strip_prefix("replay:")) {
+        // The removals a round's journal accepted, applied to the posterior in order.
+        let mut accepted = Vec::new();
+        for line in std::fs::read_to_string(journal).map_err(error)?.lines() {
+            let record: serde_json::Value = serde_json::from_str(line).map_err(error)?;
+            if record["event"] == "proposal" && record["accepted"].as_bool() == Some(true) && record["kind"] != "blocked" {
+                let groups: Vec<usize> = record["groups"].as_array().ok_or("a proposal without groups")?.iter().map(|g| g.as_u64().map(|g| g as usize).ok_or("a group id")).collect::<Result<_, _>>()?;
+                accepted.push((record["kind"] == "dead", groups));
+            }
+        }
+        let mut posterior = start.clone();
+        let step = Step { sequences: &train, held, settings: &settings.fit, log: None };
+        let (before, after) = library_mdl::removal_replay(&device, &native, &explanation, &mut posterior, step, &accepted)?;
+        let report = json!({
+            "checkpoint": checkpoint.display().to_string(), "journal": journal, "device": device.name(),
+            "accepted_proposals": accepted.len(), "active_groups": posterior.active.iter().filter(|a| **a).count(),
+            "description_bits": posterior.description() / std::f64::consts::LN_2,
+            "held_out_before": before, "held_out_after": after,
+        });
+        std::fs::write(out.join("REPLAY.json"), serde_json::to_vec_pretty(&report).map_err(error)?).map_err(error)?;
+        println!("{}", serde_json::to_string_pretty(&report).map_err(error)?);
+        return Ok(());
+    }
     if let Some(sets) = sets {
         // Each listed group set removed alone, without and with compensation.
         let sets: Vec<Vec<usize>> = sets.split(';').map(|set| set.split(',').map(|g| g.trim().parse::<usize>().map_err(error)).collect()).collect::<Result<_, _>>()?;

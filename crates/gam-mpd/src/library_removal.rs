@@ -72,8 +72,10 @@
 //! # The search
 //!
 //! The search proposes ranges of the ranked units, each on top of the removals accepted so far:
-//! first all of them; a rejected range splits into its first and second halves, proposed in that
-//! order, down to single units, each rejected alone being kept. A range whose units are all
+//! first all of them; a rejected range splits after its prefix of least estimated total (the units
+//! after it are estimated to raise `F` together), or in halves when that prefix is the whole range
+//! just rejected, the two parts proposed in that order, down to single units, each rejected alone
+//! being kept. The estimates place the split; the measured sums decide each part. A range whose units are all
 //! estimated not to lower `F` is not split on rejection: its units are counted as tested only
 //! jointly (`Removal::untested`). Each proposal also removes the groups it leaves without effect.
 //! With `m` units that block their ranges, about `2 m log2(n/m)` proposals settle `n` units; a
@@ -1072,7 +1074,7 @@ pub fn round(
             // No unit of the range is estimated to lower `F`: tested only jointly.
             untested += high - low;
         } else {
-            let middle = low + (high - low) / 2;
+            let middle = split(&units[low..high].iter().map(|u| u.predicted).collect::<Vec<_>>()) + low;
             ranges.push((middle, high));
             ranges.push((low, middle));
         }
@@ -1083,6 +1085,21 @@ pub fn round(
         "before_bits": before / LN_2, "after_bits": current / LN_2, "evaluations": evaluations.len(), "seconds": started.elapsed().as_secs_f64(),
     }))?;
     Ok(Removal { candidates, removed, dead: dead_removed, before_bits: before / LN_2, after_bits: current / LN_2, evaluations, singles, untested })
+}
+
+/// Where a rejected range of units, estimated to change `F` by `predicted` each, splits: after the
+/// prefix of least estimated total (the units after it estimated to raise `F` together), or in
+/// halves when that prefix is the whole range, which was just measured; always strictly inside.
+fn split(predicted: &[f64]) -> usize {
+    let n = predicted.len();
+    let (mut sum, mut best, mut at) = (0.0, f64::INFINITY, n);
+    for (k, p) in predicted.iter().enumerate() {
+        sum += p;
+        if sum < best {
+            (best, at) = (sum, k + 1);
+        }
+    }
+    if at >= n || at == 0 { n / 2 } else { at }
 }
 
 #[cfg(test)]
@@ -1461,6 +1478,18 @@ mod tests {
             let (kept, searched) = (fresh(&dead_only, key), fresh(&posterior, key));
             assert!(searched < kept, "on fresh noise {key} the searched posterior scores {searched} nats against {kept}");
         }
+    }
+
+    #[test]
+    fn a_rejected_range_splits_after_its_prefix_of_least_estimated_total() {
+        // Estimated −3, −2, +4, −1: the least prefix total is −5 after two units.
+        assert_eq!(split(&[-3.0, -2.0, 4.0, -1.0]), 2);
+        // The least total over the whole range, which was rejected: halves.
+        assert_eq!(split(&[-3.0, -2.0, -1.0, -1.0]), 2);
+        assert_eq!(split(&[-1.0, -1.0, -1.0]), 1);
+        // Every prefix estimated to raise F: after the first unit, the least.
+        assert_eq!(split(&[1.0, 2.0, 3.0]), 1);
+        assert_eq!(split(&[5.0, -9.0]), 1);
     }
 
     #[test]
