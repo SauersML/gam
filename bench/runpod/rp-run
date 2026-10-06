@@ -2542,6 +2542,8 @@ build_binaries() {
     until mkdir "$CACHE.lock" 2> /dev/null; do
         holder=$(cat "$CACHE.lock/pid" 2> /dev/null || echo 0)
         if ! kill -0 "$holder" 2> /dev/null; then rm -rf "$CACHE.lock"; continue; fi
+        # Another run's build of other binaries need not hold this run: its own may be published.
+        [ -n "$(unbuilt)" ] || return 0
         say "waiting for run $(cat "$CACHE.lock/name" 2> /dev/null) to finish building $KEY's binaries"
         sleep 30
     done
