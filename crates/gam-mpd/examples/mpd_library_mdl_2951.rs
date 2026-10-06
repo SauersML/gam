@@ -375,7 +375,7 @@ fn edit_faithfulness(
     // M's own runs of the first held-out batch: the same for every explanation.
     let typical_batch: Vec<Vec<u32>> = held_out[first..end].iter().take(settings.batch_sequences).cloned().collect();
     let typical_batch = interchange::Batch::new(typical_batch.clone(), typical_batch)?;
-    experiments.set_directions(DIRECTIONS, settings.seed);
+    experiments.set_directions(interchange::DIRECTIONS, settings.seed);
     experiments.measure_typical(&typical_batch)?;
     let family = |e: &interchange::Experiment| match &e.patch {
         None => "clean",
@@ -415,7 +415,7 @@ fn edit_faithfulness(
     drop(experiments);
     let mut reference = interchange::Interchange::new(device, native, layers, &gam_mpd::artifact::Artifact::native(native)?, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     reference.set_fixed_parts(slices.clone())?;
-    reference.set_directions(DIRECTIONS, settings.seed);
+    reference.set_directions(interchange::DIRECTIONS, settings.seed);
     reference.measure_typical(&typical_batch)?;
     reference.unedited_explanation();
     // An edit's evidence grows with how much it moves M: per family, the gaps of the edits whose
@@ -504,9 +504,6 @@ fn edit_faithfulness(
     log::info!("edits: {report}");
     save(&out.join(format!("EDITS_{}.json", settings.name)), &report)
 }
-
-/// The seeded unit directions a push draws from (`Interchange::set_directions`).
-const DIRECTIONS: usize = 64;
 
 fn save(path: &Path, value: &Value) -> Result<(), String> {
     std::fs::write(path, serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?).map_err(|e| e.to_string())

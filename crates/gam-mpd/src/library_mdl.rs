@@ -1389,9 +1389,8 @@ pub struct Settings {
     pub epochs: Option<usize>,
     /// The families of each base's patched experiment, one drawn uniformly per base
     /// (`interchange::Family`): `read` (a read patch, `interchange::sample`), `swap`, `zero`,
-    /// `scale` and `cut` (operations on sites every explanation shares with `M`,
-    /// `interchange::Interchange::draw_ops`). Empty (the default) is `read` alone. The families left
-    /// out (`push`, and any the edits driver scores) are the held-out operation types.
+    /// `scale`, `push` and `cut` (operations on sites every explanation shares with `M`,
+    /// `interchange::Interchange::draw_ops`). Empty (the default) is `read` alone.
     #[serde(default)]
     pub families: Vec<interchange::Family>,
     /// A/B arm, to be deleted with the losing arm after its paired test: when set, each step
@@ -1870,12 +1869,20 @@ impl Scorer {
         let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
-        // A push's size is its site's typical norm, which the edits driver measures; the fit's
-        // families leave it out.
-        if settings.families.contains(&interchange::Family::Push) {
-            return Err("library fit: push is a held-out operation type (the edits driver scores it)".into());
-        }
         Ok(Self { experiments, mlps, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), train_bf16: settings.train_bf16 })
+    }
+
+    /// With push among the families, the scorer with the pushed directions set from the seed and
+    /// each shared site's typical norm measured on `M`'s runs of the first batch of the training
+    /// `sequences` (the unit of a push's size, the same for every explanation and fit).
+    fn prepared(mut self, sequences: &[Vec<u32>], settings: &Settings) -> Result<Self, String> {
+        if self.families.contains(&interchange::Family::Push) {
+            let n = settings.batch_sequences.min(sequences.len());
+            let batch = Batch::new(sequences[..n].to_vec(), sequences[..n].to_vec())?;
+            self.experiments.set_directions(interchange::DIRECTIONS, settings.seed);
+            self.experiments.measure_typical(&batch)?;
+        }
+        Ok(self)
     }
 
     fn layers(&self) -> usize {
@@ -3105,7 +3112,7 @@ pub fn fit_from(
     if draws.len() < 2 {
         return Err("the convergence test needs at least two training batches".into());
     }
-    let mut scorer = Scorer::new(device, native, explanation, settings)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(sequences, settings)?;
     // The fixed collection: its scored tokens N and its realized families.
     let (mut tokens, mut families) = (0, BTreeMap::new());
     for draw in &draws {
@@ -3827,7 +3834,7 @@ pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Exp
     settings.validate()?;
     let length = sequences.first().map_or(0, Vec::len);
     let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
-    let mut scorer = Scorer::new(device, native, explanation, settings)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(sequences, settings)?;
     let mut tokens = 0;
     for draw in &draws {
         tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
@@ -3851,7 +3858,7 @@ pub fn start_posterior(device: &Device, native: &OperatorProgram, explanation: &
     settings.validate()?;
     let length = sequences.first().map_or(0, Vec::len);
     let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
-    let mut scorer = Scorer::new(device, native, explanation, settings)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(sequences, settings)?;
     let mut tokens = 0;
     for draw in &draws {
         tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
@@ -3894,7 +3901,7 @@ pub fn removal_replay(device: &Device, native: &OperatorProgram, explanation: &E
     settings.validate()?;
     let length = sequences.first().map_or(0, Vec::len);
     let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
-    let mut scorer = Scorer::new(device, native, explanation, settings)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(sequences, settings)?;
     let mut tokens = 0;
     for draw in &draws {
         tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
@@ -3924,7 +3931,7 @@ pub fn removal_changes(device: &Device, native: &OperatorProgram, explanation: &
     settings.validate()?;
     let length = sequences.first().map_or(0, Vec::len);
     let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
-    let mut scorer = Scorer::new(device, native, explanation, settings)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(sequences, settings)?;
     let mut tokens = 0;
     for draw in &draws {
         tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
@@ -5463,10 +5470,10 @@ mod tests {
         let explanation = explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         use interchange::Family;
-        let settings = Settings { families: vec![Family::Read, Family::Swap, Family::Zero, Family::Scale], epochs: Some(2), ..settings() };
+        let settings = Settings { families: vec![Family::Read, Family::Swap, Family::Zero, Family::Scale, Family::Push, Family::Cut], epochs: Some(2), ..settings() };
         let device = Device::host();
-        let scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
         let (train, held) = sequences.split_at(4);
+        let scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap().prepared(train, &settings).unwrap();
         let mut kinds = (0, 0);
         for draw in draws(train.len(), settings.batch_sequences, settings.seed).unwrap() {
             let experiments = scorer.experiments(&draw, train).unwrap();

@@ -364,6 +364,9 @@ pub enum Operation {
 /// The factors a scale operation multiplies its site's value by.
 pub const SCALES: [f64; 4] = [0.0, 0.5, 2.0, 3.0];
 
+/// The seeded unit directions a push draws from ([`Interchange::set_directions`]).
+pub const DIRECTIONS: usize = 64;
+
 /// The sizes of a pushed direction, in units of its site's typical norm.
 pub const SIZES: [f64; 3] = [0.5, 1.0, 2.0];
 
