@@ -544,7 +544,7 @@ pub struct Part {
 
 /// One body's posterior: its law, per unit its gate row (`m × k`), gate bias, up row, up bias, and
 /// its output column (`k′ × m`); which units compute a function that is not identically zero
-/// ([`live`]), and which input and output coordinates some call of the body reads or writes.
+/// (`live`), and which input and output coordinates some call of the body reads or writes.
 #[derive(Clone, Debug)]
 pub struct BodyValues {
     pub law: Law,
@@ -642,7 +642,7 @@ fn artifact_values(program: &OperatorProgram, body: &str) -> Result<BodyValues, 
 /// squared difference over its marginal variance under both posteriors: a heuristic score of the
 /// match, with no established null distribution (the values are correlated, and the gauge and the
 /// matching are fitted to them). `gauge` counts the entries of `A` and `C` fitted, and `live` the
-/// units of `from` and of `onto` that compute a function ([`live`]).
+/// units of `from` and of `onto` that compute a function (`live`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Alignment {
     pub units: Vec<Option<usize>>,
@@ -1420,7 +1420,7 @@ fn saving(reads: &Array2<f64>, writes: &Array2<f64>, parts: usize) -> Result<f64
 
 /// The candidate regions of layer `layer`'s MLP among the native functions `pool` (those carrying
 /// flow) at `posterior` (module note): from each function a group is grown by adding, one at a
-/// time, the function whose union's rewrite saves the most parameters ([`saving`]), and the best
+/// time, the function whose union's rewrite saves the most parameters (`saving`), and the best
 /// group along the way is that function's candidate; the candidates that save are taken, the
 /// largest saving first, each disjoint from those before it. Parallel functions of one body read
 /// and write the same few directions, so their union saves what each alone cannot; a function
