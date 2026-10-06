@@ -772,6 +772,22 @@ impl Device {
         Ok(Tensor { rows, cols, data })
     }
 
+    /// A `rows × cols` tensor from row-major f32 `values` ([`Device::upload_vec`]), sent as they are
+    /// where the device holds f32 (CUDA f32 storage, the Apple GPU): no widening and narrowing pass.
+    pub fn upload_f32(&self, rows: usize, cols: usize, values: &[f32]) -> Result<Tensor, GpuError> {
+        if values.len() != rows * cols {
+            return Err(shape(format!("{} values for {rows}x{cols}", values.len())));
+        }
+        let data = match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if self.storage == Storage::F32 => Data::Cuda32(engine.upload(values)?),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => Data::Metal(engine.stream.upload(values)?),
+            _ => return self.upload_vec(rows, cols, values.iter().map(|v| f64::from(*v)).collect()),
+        };
+        Ok(Tensor { rows, cols, data })
+    }
+
     /// An operator's prior-group ids `ids` (one per entry, row-major, of a `rows × cols` operator)
     /// held compactly ([`GroupMap`]): one id per row where every row is one group, else one per
     /// column where every column is one group, else one per entry.

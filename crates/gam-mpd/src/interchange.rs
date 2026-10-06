@@ -1374,12 +1374,12 @@ impl HostTargets {
             .rows
             .iter()
             .map(|t| {
-                let values = match &t.mu {
-                    KeptValues::Single(v) => v.iter().map(|x| f64::from(*x)).collect(),
-                    KeptValues::Double(v) => v.clone(),
-                };
                 let held = if d.storage() == t.storage { d.clone() } else { d.with_storage(t.storage).map_err(error)? };
-                let mu = held.upload_vec(t.shape.0, t.shape.1, values).map_err(error)?;
+                let mu = match &t.mu {
+                    KeptValues::Single(v) => held.upload_f32(t.shape.0, t.shape.1, v),
+                    KeptValues::Double(v) => held.upload_vec(t.shape.0, t.shape.1, v.clone()),
+                }
+                .map_err(error)?;
                 Ok(Target { mu: Arc::new(mu), entropy: t.entropy.clone(), head: Arc::clone(&t.head), scored: t.scored.clone() })
             })
             .collect::<Result<_, String>>()?;
