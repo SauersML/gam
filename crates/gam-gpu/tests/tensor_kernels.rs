@@ -505,3 +505,30 @@ fn the_split_gram_lies_within_its_bound_and_is_timed_against_the_float64_product
         }
     }
 }
+
+/// The split Gram's time by slice count on one vpd4l MLP batch (4096 rows × 3072 functions), to
+/// separate its int8 products from its float64 combines: `s` slices make `Σ_m (⌊m/2⌋ + 1)`
+/// products over the shifts `m < s` and `s` combines.
+#[test]
+fn the_split_gram_is_timed_by_its_slices() {
+    use gam_gpu::tensor::Storage;
+    let Some(device) = accelerator() else { return };
+    let Ok(narrow) = device.with_storage(Storage::F32) else { return };
+    let wide = device.with_storage(Storage::F64).expect("float64 storage beside f32");
+    let (rows, cols) = (4096, 3072);
+    let a = narrow.upload(matrix(rows, cols, 23, 1.0).view()).expect("upload");
+    let mut sum = wide.zeros(cols, cols).expect("sum");
+    for slices in [1, 2, 3, 5, 9] {
+        if !wide.gram_split(&mut sum, &a, slices).expect("warm") {
+            return;
+        }
+        assert_eq!(wide.download(&sum).expect("sync").dim(), (cols, cols));
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            wide.gram_split(&mut sum, &a, slices).expect("split Gram");
+        }
+        assert_eq!(wide.download(&sum).expect("sync").dim(), (cols, cols));
+        let products: usize = (0..slices).map(|m| m / 2 + 1).sum();
+        println!("split Gram {rows} x {cols}, {slices} slices ({products} int8 products, {slices} combines): {:.2} ms", started.elapsed().as_secs_f64() / 5.0 * 1e3);
+    }
+}
