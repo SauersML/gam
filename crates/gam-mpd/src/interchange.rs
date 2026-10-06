@@ -188,20 +188,21 @@ impl<'a> Model<'a> {
 /// (`run_check::layer_nodes` of the native program `artifact` was made from): the arguments of
 /// [`Model::new`]. `Artifact::native` gives `M`'s.
 pub fn sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorProgram, Vec<usize>, Vec<usize>), String> {
-    let (flat, entries, reads, _, _) = flat_sites(artifact, layers)?;
+    let (flat, entries, reads, _, _, _) = flat_sites(artifact, layers)?;
     Ok((flat, entries, reads))
 }
 
 /// [`sites`] with, per block, where `artifact` applies edits of parts ([`PartSites`]): for layer
 /// `l`'s MLP (block `2l + 1`) its read and the MLP's output (the native `mlp` node or the node
 /// that replaced it), none for an attention block or an MLP output the artifact does not hold.
-fn flat_sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorProgram, Vec<usize>, Vec<usize>, Vec<Option<(usize, usize)>>, Vec<Option<usize>>), String> {
+#[allow(clippy::type_complexity)]
+fn flat_sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorProgram, Vec<usize>, Vec<usize>, Vec<Option<(usize, usize)>>, Vec<Option<usize>>, BTreeMap<SharedSite, usize>), String> {
     let (flat, roots) = mapped_inlined(&artifact.program)?;
     let at = |native: usize| artifact.place(native).map(|n| roots[n]).ok_or_else(|| error(format!("native node {native} is not held")));
     let entries: Vec<usize> = layers.iter().flat_map(|l| [l.stream, l.attended]).map(at).collect::<Result<_, _>>()?;
     let reads: Vec<usize> = layers.iter().flat_map(|l| [l.normed_stream, l.normed]).map(at).collect::<Result<_, _>>()?;
     let blocks = entries.len();
-    let parts = layers
+    let parts: Vec<Option<(usize, usize)>> = layers
         .iter()
         .enumerate()
         .flat_map(|(l, layer)| {
@@ -212,13 +213,37 @@ fn flat_sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorPro
         })
         .collect();
     // Per head (layer-major) the node of its attention output, inside its attention block.
-    let heads = layers
+    let heads: Vec<Option<usize>> = layers
         .iter()
         .enumerate()
         .flat_map(|(l, layer)| layer.reads.iter().map(move |r| (l, *r)))
         .map(|(l, r)| at(r).ok().filter(|n| *n > reads[2 * l] && *n < entries[2 * l + 1]))
         .collect();
-    Ok((flat, entries, reads, parts, heads))
+    // The shared sites the artifact holds, each inside the block that computes it: the stream after
+    // each block (the next block's entering stream; after the last, the last residual), each head's
+    // output, each attention's and each MLP's output.
+    let mut shared = BTreeMap::new();
+    let end_of = |b: usize| if b + 1 < blocks { entries[b + 1] } else { flat.nodes.len() };
+    for b in 0..blocks {
+        let node = if b + 1 < blocks { Some(entries[b + 1]) } else { layers.last().and_then(|l| at(l.residual).ok()) };
+        if let Some(node) = node.filter(|n| *n > reads[b] && *n <= end_of(b)) {
+            shared.insert(SharedSite::Stream(b), node);
+        }
+    }
+    for (h, node) in heads.iter().enumerate() {
+        if let Some(node) = node {
+            shared.insert(SharedSite::Head(h), *node);
+        }
+    }
+    for (l, layer) in layers.iter().enumerate() {
+        if let Some(node) = at(layer.attention).ok().filter(|n| *n > reads[2 * l] && *n < entries[2 * l + 1]) {
+            shared.insert(SharedSite::Attention(l), node);
+        }
+        if let Some((_, out)) = parts[2 * l + 1] {
+            shared.insert(SharedSite::Mlp(l), out);
+        }
+    }
+    Ok((flat, entries, reads, parts, heads, shared))
 }
 
 /// The program of the flat program `flat` through its head's hidden node (the final normed
@@ -306,6 +331,60 @@ pub enum Patch {
     /// MLP block `block`'s read added to its output, the same on every model) by `FACTORS[factor]`
     /// at the experiment's position.
     FixedPart { part: usize, factor: usize, block: usize },
+    /// Operations on sites every explanation shares with `M` ([`SiteOp`]), applied verbatim to both
+    /// models, drawn as `family` draws them; a swap reads the experiment's source sequence.
+    Ops { family: Family, ops: Vec<SiteOp> },
+}
+
+/// A site every explanation shares with `M`, each model holding it at its own node: the stream
+/// after block `b` (block `2l` is layer `l`'s attention, `2l + 1` its MLP), head `h`'s attention
+/// output (heads numbered layer by layer), layer `l`'s attention output (the `o` site's) and its
+/// MLP output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedSite {
+    Stream(usize),
+    Head(usize),
+    Attention(usize),
+    Mlp(usize),
+}
+
+impl SharedSite {
+    /// The block whose run computes the site; `heads` gives each head's block.
+    fn block(&self, heads: &[usize]) -> Option<usize> {
+        match self {
+            SharedSite::Stream(b) => Some(*b),
+            SharedSite::Head(h) => heads.get(*h).copied(),
+            SharedSite::Attention(l) => Some(2 * l),
+            SharedSite::Mlp(l) => Some(2 * l + 1),
+        }
+    }
+}
+
+/// What an operation does at its site's rows: the value on the donor (the experiment's source)
+/// at the same row (`Swap`), the value scaled by `SCALES[i]` (`Scale`, 0 zeroing it), or unit
+/// direction `direction` ([`Interchange::set_directions`]) times `SIZES[size]` times the site's
+/// typical norm ([`Interchange::measure_typical`]) added (`Push`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Operation {
+    Swap,
+    Scale(usize),
+    Push { direction: usize, size: usize },
+}
+
+/// The factors a scale operation multiplies its site's value by.
+pub const SCALES: [f64; 4] = [0.0, 0.5, 2.0, 3.0];
+
+/// The sizes of a pushed direction, in units of its site's typical norm.
+pub const SIZES: [f64; 3] = [0.5, 1.0, 2.0];
+
+/// One operation of an experiment: its site, what it does, and its rows (the experiment's
+/// position alone, or with `onward` every row from it on).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SiteOp {
+    pub site: SharedSite,
+    pub operation: Operation,
+    pub onward: bool,
 }
 
 impl Patch {
@@ -314,7 +393,7 @@ impl Patch {
         match self {
             Self::Read { variable } => std::slice::from_ref(variable),
             Self::Reads { variables } => variables,
-            Self::Part { .. } | Self::Head { .. } | Self::Cut { .. } | Self::Parts { .. } | Self::Swap { .. } | Self::PartFrom { .. } | Self::HeadFrom { .. } | Self::FixedPart { .. } => &[],
+            Self::Part { .. } | Self::Head { .. } | Self::Cut { .. } | Self::Parts { .. } | Self::Swap { .. } | Self::PartFrom { .. } | Self::HeadFrom { .. } | Self::Ops { .. } | Self::FixedPart { .. } => &[],
         }
     }
 }
@@ -383,6 +462,12 @@ pub fn parts_of(program: &OperatorProgram, layers: usize) -> Result<Vec<Part>, S
 #[serde(rename_all = "snake_case")]
 pub enum Family {
     Read,
+    /// Operations on shared sites ([`Interchange::sample_ops`]): swaps from a donor, zeroing a
+    /// head's, an attention's or an MLP's output, scaling a site, pushing a direction.
+    Swap,
+    Zero,
+    Scale,
+    Push,
     RemovePart,
     AmplifyPart,
     RemoveHead,
@@ -411,6 +496,12 @@ pub struct PartSites {
     norms: Vec<Option<Norm>>,
     /// The fixed parts ([`Interchange::set_fixed_parts`]).
     fixed: Arc<Vec<Slice>>,
+    /// Per shared site the node holding it and the node's width.
+    shared: BTreeMap<SharedSite, (usize, usize)>,
+    /// The sites' typical norms ([`Interchange::measure_typical`]) and the unit directions pushed
+    /// ([`Interchange::set_directions`]), the same for every model.
+    typical: Arc<BTreeMap<SharedSite, f64>>,
+    directions: Arc<Vec<Vec<f64>>>,
 }
 
 /// A block's input norm `N(s) = γ ⊙ s · (mean(s²) + ε)^{-1/2} + β` of the stream `s` entering it
@@ -573,6 +664,9 @@ impl Experiment {
             }
             return Ok(Some(b.block));
         }
+        if let Patch::Ops { ops, .. } = patch {
+            return ops.iter().map(|o| o.site.block(heads)).min().flatten().map(Some).ok_or_else(|| error("operations of no site"));
+        }
         if let Patch::Head { head } | Patch::HeadFrom { head } = patch {
             return heads.get(*head).map(|b| Some(*b)).ok_or_else(|| error("a removal of an unknown head"));
         }
@@ -682,7 +776,7 @@ pub fn subset(rng: &mut impl RngExt, candidates: &[usize]) -> Vec<usize> {
 /// The realized count of each family among `experiments`: clean with `P` alone, clean under a
 /// hybrid, single read patches of attention and of MLP variables, and joint read patches.
 pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMap<&'static str, usize> {
-    let mut counts: BTreeMap<&'static str, usize> = ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint", "remove_part", "amplify_part", "remove_head", "cut_connection", "remove_parts", "swap_part", "remove_part_from", "remove_head_from", "remove_subcomponent", "amplify_subcomponent"].into_iter().map(|k| (k, 0)).collect();
+    let mut counts: BTreeMap<&'static str, usize> = ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint", "remove_part", "amplify_part", "remove_head", "cut_connection", "remove_parts", "swap_part", "remove_part_from", "remove_head_from", "remove_subcomponent", "amplify_subcomponent", "swap", "zero", "scale", "push"].into_iter().map(|k| (k, 0)).collect();
     for e in experiments {
         let family = match &e.patch {
             None if e.explained.iter().all(|x| *x) => "clean_alone",
@@ -698,6 +792,11 @@ pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMa
             Some(Patch::Swap { .. }) => "swap_part",
             Some(Patch::PartFrom { .. }) => "remove_part_from",
             Some(Patch::HeadFrom { .. }) => "remove_head_from",
+            Some(Patch::Ops { family: Family::Swap, .. }) => "swap",
+            Some(Patch::Ops { family: Family::Zero, .. }) => "zero",
+            Some(Patch::Ops { family: Family::Scale, .. }) => "scale",
+            Some(Patch::Ops { family: Family::Push, .. }) => "push",
+            Some(Patch::Ops { .. }) => "ops",
             Some(Patch::FixedPart { factor: 0, .. }) => "remove_subcomponent",
             Some(Patch::FixedPart { .. }) => "amplify_subcomponent",
         };
@@ -995,6 +1094,9 @@ pub struct Edits {
     recorded: Option<Records>,
     /// The edits of fixed parts by the node they add to ([`FixedWrites`]).
     fixed: BTreeMap<usize, FixedWrites>,
+    /// Pushed directions by node: the rows and the vectors added there (the forward's alone: a
+    /// constant has no tangent and passes the cotangent as it is).
+    adds: BTreeMap<usize, (Vec<usize>, ndarray::Array2<f64>)>,
 }
 
 /// The edits of fixed parts at one block's output node ([`Edits`]): the node they read, per edit
@@ -1101,6 +1203,7 @@ impl Edits {
     ) -> Result<Self, String> {
         let mut writes: BTreeMap<usize, (usize, Vec<(usize, usize, &Part, f64)>)> = BTreeMap::new();
         let mut zeroed = Vec::new();
+        let mut adds: BTreeMap<usize, (Vec<usize>, Vec<Vec<f64>>)> = BTreeMap::new();
         let mut cuts: BTreeMap<usize, Cuts> = BTreeMap::new();
         let mut fixed: BTreeMap<usize, FixedWrites> = BTreeMap::new();
         for (row, edit) in edits {
@@ -1132,9 +1235,29 @@ impl Edits {
                 }
                 Edit::Head { head } | Edit::HeadAt { head, .. } => {
                     let (node, width) = sites.heads.get(*head).copied().flatten().ok_or_else(|| error(format!("head {head}: not held by the model")))?;
-                    zeroed.push((*row, node, width));
+                    zeroed.push((*row, *row, node, width, 0.0, 0.0));
                     continue;
                 }
+                Edit::OpAt { site, operation, from } => {
+                    let (node, width) = sites.shared.get(site).copied().ok_or_else(|| error(format!("{site:?}: not held by the model")))?;
+                    match operation {
+                        Operation::Swap => zeroed.push((*row, *from, node, width, 0.0, 1.0)),
+                        Operation::Scale(i) => zeroed.push((*row, *row, node, width, *SCALES.get(*i).ok_or_else(|| error("a scale outside SCALES"))?, 0.0)),
+                        Operation::Push { direction, size } => {
+                            let unit = sites.directions.get(*direction).ok_or_else(|| error("a push of an unknown direction"))?;
+                            let norm = sites.typical.get(site).copied().ok_or_else(|| error(format!("{site:?}: no typical norm")))?;
+                            let size = SIZES.get(*size).ok_or_else(|| error("a push outside SIZES"))?;
+                            if unit.len() != width {
+                                return Err(error(format!("{site:?}: a direction of another width")));
+                            }
+                            let entry = adds.entry(node).or_default();
+                            entry.0.push(*row);
+                            entry.1.push(unit.iter().map(|u| size * norm * u).collect());
+                        }
+                    }
+                    continue;
+                }
+                Edit::Op { .. } => return Err(error("an operation without its call's rows")),
                 Edit::Fixed { part, factor } => {
                     let slice = sites.fixed.get(*part).ok_or_else(|| error("an edit of an unknown fixed part"))?;
                     let (read, out) = sites.nodes.get(slice.block()).copied().flatten().ok_or_else(|| error(format!("block {}: no part sites", slice.block())))?;
@@ -1174,6 +1297,7 @@ impl Edits {
             })
             .collect::<Result<_, String>>()?;
         let mut out = Self::patches(d, patches, values, &zeroed)?;
+        out.adds = adds.into_iter().map(|(node, (rows, vectors))| (node, (rows, ndarray::Array2::from_shape_fn((vectors.len(), vectors[0].len()), |(i, c)| vectors[i][c])))).collect();
         out.writes = writes;
         out.fixed = fixed;
         if !cuts.is_empty() {
@@ -1187,7 +1311,7 @@ impl Edits {
     /// The read patches `patches` and the rows `zeroed` (a row, a node and its width) of nodes
     /// whose value is zeroed there (a head's removal: the patch keeping none of the row and taking
     /// none of its source, the row itself).
-    fn patches(d: &Device, patches: &[(usize, usize, &[usize])], values: &[Value], zeroed: &[(usize, usize, usize)]) -> Result<Self, String> {
+    fn patches(d: &Device, patches: &[(usize, usize, &[usize])], values: &[Value], zeroed: &[(usize, usize, usize, usize, f64, f64)]) -> Result<Self, String> {
         let mut masks: BTreeMap<(usize, usize, usize), (Vec<f64>, Vec<f64>)> = BTreeMap::new();
         for (row, source, variables) in patches {
             for v in *variables {
@@ -1198,8 +1322,8 @@ impl Edits {
                 }
             }
         }
-        for (row, node, width) in zeroed {
-            masks.insert((*node, *row, *row), (vec![0.0; *width], vec![0.0; *width]));
+        for (row, source, node, width, keep, take) in zeroed {
+            masks.insert((*node, *row, *source), (vec![*keep; *width], vec![*take; *width]));
         }
         let mut grouped: BTreeMap<usize, (Vec<usize>, Vec<usize>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
         for ((node, row, source), (keep, take)) in masks {
@@ -1215,7 +1339,7 @@ impl Edits {
             let (keep, take) = (d.upload_vec(rows.len(), width, keep).map_err(error)?, d.upload_vec(rows.len(), width, take).map_err(error)?);
             nodes.insert(node, Patches { rows, sources, keep, take });
         }
-        Ok(Self { nodes, writes: BTreeMap::new(), cuts: BTreeMap::new(), parts: Arc::new(Vec::new()), recorded: None, fixed: BTreeMap::new() })
+        Ok(Self { nodes, writes: BTreeMap::new(), cuts: BTreeMap::new(), parts: Arc::new(Vec::new()), recorded: None, fixed: BTreeMap::new(), adds: BTreeMap::new() })
     }
 
     /// The nodes the call edits, with the nodes edited parts and cuts' probes read (whose
@@ -1223,7 +1347,7 @@ impl Edits {
     pub fn nodes(&self) -> BTreeSet<usize> {
         let probed = self.cuts.values().filter(|c| !c.probes.is_empty()).map(|c| c.read);
         let fixed = self.fixed.iter().flat_map(|(out, f)| [*out, f.read]);
-        self.nodes.keys().chain(self.writes.keys()).chain(self.cuts.keys()).copied().chain(self.writes.values().map(|w| w.read)).chain(probed).chain(fixed).collect()
+        self.nodes.keys().chain(self.writes.keys()).chain(self.cuts.keys()).chain(self.adds.keys()).copied().chain(self.writes.values().map(|w| w.read)).chain(probed).chain(fixed).collect()
     }
 
     /// Add the cuts' cotangents of the stream entering the block ([`Edits::transpose`]) to its
@@ -1240,7 +1364,7 @@ impl Edits {
 
     /// Whether the forward pass changes node `node`'s value (a read of parts only is not changed).
     pub fn changes(&self, node: usize) -> bool {
-        self.nodes.contains_key(&node) || self.writes.contains_key(&node) || self.cuts.contains_key(&node) || self.fixed.contains_key(&node)
+        self.nodes.contains_key(&node) || self.writes.contains_key(&node) || self.cuts.contains_key(&node) || self.fixed.contains_key(&node) || self.adds.contains_key(&node)
     }
 
     /// The edits of parts and the cut connections' steps at node `node` on its value `value` (the
@@ -1251,6 +1375,9 @@ impl Edits {
     /// the block there, `N` the block's input norm and `δ = (a′ − a)·u_A` the change of the `from`
     /// part's write from the base's activation `a` to the source's `a′`.
     pub fn write<'v>(&self, d: &Device, node: usize, value: &mut Tensor, value_of: impl Fn(usize) -> Result<&'v Tensor, String>) -> Result<(), String> {
+        if let Some((rows, vectors)) = self.adds.get(&node) {
+            add_rows(d, value, rows, vectors)?;
+        }
         if let Some(c) = self.cuts.get(&node) {
             let rows = |t: &Tensor, at: &[usize]| -> Result<ndarray::Array2<f64>, String> { d.download(&d.gather_ranges(t, &single(at.iter().copied())).map_err(error)?).map_err(error) };
             let recorded = self.recorded.as_ref().ok_or_else(|| error("a cut connection outside a plan"))?;
@@ -1752,6 +1879,10 @@ pub(crate) enum Edit {
     HeadAt { head: usize, at: usize },
     /// An edit of fixed part `part` by `FACTORS[factor]` (`Patch::FixedPart`).
     Fixed { part: usize, factor: usize },
+    /// An operation at a shared site at row `at` of its path's sequence, a swap from the donor's
+    /// path `source`; as a call's edit (`OpAt`), a swap from the call's row `from`.
+    Op { site: SharedSite, operation: Operation, at: usize, source: usize },
+    OpAt { site: SharedSite, operation: Operation, from: usize },
 }
 
 impl<'t> Path<'t> {
@@ -1861,10 +1992,20 @@ impl<'t> Plan<'t> {
             let path = &self.paths[self.lanes[l].path];
             for (_, edit) in path.edits.iter().filter(|(b, _)| *b == block) {
                 let at = match edit {
-                    Edit::Probe { at, .. } | Edit::PartAt { at, .. } | Edit::HeadAt { at, .. } => *at,
+                    Edit::Probe { at, .. } | Edit::PartAt { at, .. } | Edit::HeadAt { at, .. } | Edit::Op { at, .. } => *at,
                     _ => path.position,
                 };
                 let edit = match edit {
+                    Edit::Op { site, operation, at, source } => {
+                        let from = match operation {
+                            Operation::Swap => {
+                                let lane = self.lane(*source, block);
+                                lanes.iter().position(|x| *x == lane).ok_or_else(|| error("a swap's donor outside its call"))? * self.length + at
+                            }
+                            _ => i * self.length + at,
+                        };
+                        Edit::OpAt { site: *site, operation: *operation, from }
+                    }
                     Edit::Swap { part, source } => {
                         let lane = self.lane(*source, block);
                         let k = lanes.iter().position(|x| *x == lane).ok_or_else(|| error("a swap's source outside its call"))?;
@@ -2064,6 +2205,21 @@ fn paths<'t>(batch: &'t Batch, experiments: &'t [Experiment], values: &[Value], 
         let explained = native.unwrap_or(&e.explained);
         let (patch, edits) = match (&e.patch, e.block(values, parts, heads)?) {
             (Some(Patch::Part { part, factor }), Some(block)) => (None, vec![(block, Edit::Part { part: *part, factor: *factor })]),
+            (Some(Patch::Ops { ops, .. }), Some(_)) => {
+                // The donor runs to the last block a swap reads.
+                let swapped = ops.iter().filter(|o| o.operation == Operation::Swap).filter_map(|o| o.site.block(heads)).max();
+                let source = swapped.map(|b| {
+                    paths.push(Path { tokens: &batch.source[e.source], explained, end: b + 1, position: 0, patch: None, edits: Vec::new() });
+                    paths.len() - 1
+                });
+                let mut edits = Vec::new();
+                for o in ops {
+                    let block = o.site.block(heads).ok_or_else(|| error("an operation at an unknown head"))?;
+                    let rows = if o.onward { e.position..batch.length } else { e.position..e.position + 1 };
+                    edits.extend(rows.map(|at| (block, Edit::Op { site: o.site, operation: o.operation, at, source: source.unwrap_or(usize::MAX) })));
+                }
+                (None, edits)
+            }
             (Some(Patch::FixedPart { part, factor, .. }), Some(block)) => (None, vec![(block, Edit::Fixed { part: *part, factor: *factor })]),
             (Some(Patch::Head { head }), Some(block)) => (None, vec![(block, Edit::Head { head: *head })]),
             (Some(Patch::HeadFrom { head }), Some(block)) => (None, (e.position..batch.length).map(|at| (block, Edit::HeadAt { head: *head, at })).collect()),
@@ -2655,8 +2811,8 @@ impl Interchange {
         tile_rows: usize,
     ) -> Result<Self, String> {
         let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
-        let (m_flat, m_streams, m_reads, m_parts, m_heads) = flat_sites(&Artifact::native(native)?, layers)?;
-        let (p_flat, p_streams, p_reads, p_parts, p_heads) = flat_sites(explanation, layers)?;
+        let (m_flat, m_streams, m_reads, m_parts, m_heads, m_shared) = flat_sites(&Artifact::native(native)?, layers)?;
+        let (p_flat, p_streams, p_reads, p_parts, p_heads, p_shared) = flat_sites(explanation, layers)?;
         let (m_prefix, p_prefix) = (prefix(&m_flat)?, prefix(&p_flat)?);
         let mut m = DeviceProgram::compile_values_bounded(device, &m_prefix, numeric_bytes)?;
         m.set_arithmetic(arithmetic);
@@ -2672,7 +2828,8 @@ impl Interchange {
         let mut m_sites = Sites::new(&m, &m_flat, m_streams, m_reads, &[], m_values)?;
         let mut p_sites = Sites::new(&p, &p_flat, p_streams, p_reads, trainable, p_values)?;
         let head_blocks: Vec<usize> = layers.iter().enumerate().flat_map(|(l, layer)| layer.reads.iter().map(move |_| 2 * l)).collect();
-        for (sites, nodes, heads, program, flat) in [(&mut m_sites, m_parts, m_heads, &m, &m_flat), (&mut p_sites, p_parts, p_heads, &p, &p_flat)] {
+        for (sites, nodes, heads, program, flat, shared) in [(&mut m_sites, m_parts, m_heads, &m, &m_flat, m_shared), (&mut p_sites, p_parts, p_heads, &p, &p_flat, p_shared)] {
+            sites.parts.shared = shared.into_iter().map(|(site, n)| (site, (n, program.widths()[n]))).collect();
             sites.parts.norms = nodes.iter().enumerate().map(|(b, n)| n.and_then(|(read, _)| Norm::of(flat, read, sites.entries[b]))).collect();
             sites.parts.nodes = nodes;
             sites.parts.heads = heads.into_iter().map(|n| n.map(|n| (n, program.widths()[n]))).collect();
@@ -2733,6 +2890,131 @@ impl Interchange {
     /// The fixed parts ([`Interchange::set_fixed_parts`]).
     pub fn fixed_parts(&self) -> &[Slice] {
         &self.m_sites.parts.fixed
+    }
+
+    /// The shared sites both models hold ([`SharedSite`]).
+    pub fn shared_sites(&self) -> Vec<SharedSite> {
+        self.m_sites.parts.shared.keys().filter(|s| self.p_sites.parts.shared.contains_key(s)).copied().collect()
+    }
+
+    /// `count` unit directions of the stream's width drawn from `seed` (each coordinate standard
+    /// normal, then normalized): the directions [`Operation::Push`] adds, the same for every model.
+    pub fn set_directions(&mut self, count: usize, seed: u64) {
+        let width = self.m.widths()[self.m_sites.entries[0]];
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed);
+        let mut normal = || -> f64 {
+            let (u, v): (f64, f64) = (rng.random::<f64>().max(f64::MIN_POSITIVE), rng.random());
+            (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+        };
+        let directions: Vec<Vec<f64>> = (0..count)
+            .map(|_| {
+                let v: Vec<f64> = (0..width).map(|_| normal()).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+                v.into_iter().map(|x| x / norm).collect()
+            })
+            .collect();
+        let directions = Arc::new(directions);
+        for sites in [&mut self.m_sites, &mut self.p_sites] {
+            let mut next = (**sites).clone();
+            next.parts.directions = Arc::clone(&directions);
+            *sites = Arc::new(next);
+        }
+    }
+
+    /// Each shared site's typical norm, the root mean square of its rows' norms over `batch`'s base
+    /// sequences after their first token on `M`'s own runs: the unit of [`SIZES`], the same for
+    /// every model.
+    pub fn measure_typical(&mut self, batch: &Batch) -> Result<(), String> {
+        let typical = {
+            let (m, _) = self.models();
+            let (d, length) = (m.device(), batch.length());
+            let n = batch.base.len();
+            let ranges: Vec<Range<usize>> = (0..n).map(|i| i * length..(i + 1) * length).collect();
+            let later: Vec<Range<usize>> = (0..n).map(|i| i * length + 1..(i + 1) * length).collect();
+            let tokens: Vec<&[u32]> = batch.base.iter().map(Vec::as_slice).collect();
+            let heads = self.m_sites.parts.head_blocks.clone();
+            let mut stream = d.zeros(n * length, BlockEngine::width(&m)).map_err(error)?;
+            let mut typical = BTreeMap::new();
+            for b in 0..m.blocks() {
+                let trace = m.forward(b, &mut stream, &ranges, &tokens, None, true)?.ok_or_else(|| error("a block kept no tape"))?;
+                for (site, (node, _)) in self.m_sites.parts.shared.iter().filter(|(s, _)| s.block(&heads) == Some(b)) {
+                    let rows = d.download(&d.gather_ranges(trace.value(*node)?, &later).map_err(error)?).map_err(error)?;
+                    let mean = rows.rows().into_iter().map(|r| r.dot(&r)).sum::<f64>() / rows.nrows().max(1) as f64;
+                    typical.insert(*site, mean.sqrt());
+                }
+            }
+            Arc::new(typical)
+        };
+        for sites in [&mut self.m_sites, &mut self.p_sites] {
+            let mut next = (**sites).clone();
+            next.parts.typical = Arc::clone(&typical);
+            *sites = Arc::new(next);
+        }
+        Ok(())
+    }
+
+    /// Per base sequence of `batch`, its clean experiment and `per_base` experiments of operations
+    /// on shared sites, each of a family drawn uniformly from `families` (none of `M`'s or an
+    /// explanation's parts enter the draw, so every explanation faces the same experiments), the
+    /// donor of base `n` its sequence `donors[n]`, all with `P` alone (with `hybrids`, under one
+    /// hybrid per base drawn as [`sample`] draws it). An experiment's `k` operations, `k = 2^u` with
+    /// `u` uniform in `0..=4` (at most the family's sites), act at distinct sites drawn uniformly
+    /// among the family's (a swap and a scale at every shared site, a zeroing at heads', attentions'
+    /// and MLPs' outputs, a push at the stream's, attentions' and MLPs' outputs), all at one row, at
+    /// every row from it on, or at every row, each a third of the time (the row uniform after the
+    /// attention sink); a scale's factor uniform among the nonzero [`SCALES`], a push's direction and
+    /// size uniform.
+    pub fn sample_ops(&self, rng: &mut impl RngExt, batch: &Batch, families: &[Family], per_base: usize, donors: &[usize], hybrids: bool) -> Result<Vec<Experiment>, String> {
+        let (blocks, length) = (self.m_sites.entries.len(), batch.length());
+        let shared = self.shared_sites();
+        let directions = self.m_sites.parts.directions.len();
+        let eligible = |f: Family| -> Vec<SharedSite> {
+            shared
+                .iter()
+                .copied()
+                .filter(|s| match f {
+                    Family::Swap | Family::Scale => true,
+                    Family::Zero => !matches!(s, SharedSite::Stream(_)),
+                    Family::Push => !matches!(s, SharedSite::Head(_)) && self.m_sites.parts.typical.contains_key(s),
+                    _ => false,
+                })
+                .collect()
+        };
+        if families.is_empty() || length < 2 || donors.len() != batch.base.len() {
+            return Err(error("operations need families, sequences of two tokens or more and a donor per base"));
+        }
+        let mut out = Vec::new();
+        for n in 0..batch.base.len() {
+            let explained = if !hybrids || rng.random_range(0..2) == 0 { vec![true; blocks] } else { hybrid(rng, blocks) };
+            for _ in 0..per_base {
+                let family = families[rng.random_range(0..families.len())];
+                let sites = eligible(family);
+                if sites.is_empty() || (family == Family::Push && directions == 0) {
+                    return Err(error(format!("{family:?}: no site to operate on")));
+                }
+                let k = (1usize << rng.random_range(0..=4)).min(sites.len());
+                let chosen = hybrid_of(rng, sites.len(), k);
+                let (position, onward) = match rng.random_range(0..3) {
+                    0 => (rng.random_range(1..length), false),
+                    1 => (rng.random_range(1..length), true),
+                    _ => (0, true),
+                };
+                let mut ops = Vec::with_capacity(k);
+                for (site, _) in sites.iter().zip(&chosen).filter(|(_, c)| **c) {
+                    let operation = match family {
+                        Family::Swap => Operation::Swap,
+                        Family::Zero => Operation::Scale(0),
+                        Family::Scale => Operation::Scale(rng.random_range(1..SCALES.len())),
+                        Family::Push => Operation::Push { direction: rng.random_range(0..directions), size: rng.random_range(0..SIZES.len()) },
+                        _ => return Err(error(format!("{family:?}: not an operation family"))),
+                    };
+                    ops.push(SiteOp { site: *site, operation, onward });
+                }
+                out.push(Experiment { base: n, source: donors[n], explained: explained.clone(), patch: Some(Patch::Ops { family, ops }), position });
+            }
+            out.push(Experiment { base: n, source: n, explained, patch: None, position: 0 });
+        }
+        Ok(out)
     }
 
     /// `P` applies no edits of parts from now on, `M` still does: with `P` = `M`
@@ -2873,7 +3155,7 @@ impl Interchange {
                     wanted.push((*n, from, position));
                     wanted.push((*n, to, position));
                 }
-                Family::Read => return Err(error("a read patch is not an edit")),
+                Family::Read | Family::Swap | Family::Zero | Family::Scale | Family::Push => return Err(error(format!("{family:?}: not an edit of a part (Interchange::sample_ops)"))),
             }
         }
         let mut active = if wanted.is_empty() { Vec::new() } else { self.active_parts(batch, &wanted)? }.into_iter();
@@ -3144,7 +3426,7 @@ mod tests {
         let take = ndarray::array![[1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let keep = take.mapv(|m: f64| 1.0 - m);
         let patches = Patches { rows: rows.clone(), sources: sources.clone(), keep: d.upload(keep.view()).unwrap(), take: d.upload(take.view()).unwrap() };
-        let edits = Edits { nodes: BTreeMap::from([(7, patches)]), writes: BTreeMap::new(), cuts: BTreeMap::new(), parts: Arc::new(Vec::new()), recorded: None, fixed: BTreeMap::new() };
+        let edits = Edits { nodes: BTreeMap::from([(7, patches)]), writes: BTreeMap::new(), cuts: BTreeMap::new(), parts: Arc::new(Vec::new()), recorded: None, fixed: BTreeMap::new(), adds: BTreeMap::new() };
         let start = ndarray::Array2::from_shape_fn((6, 3), |(r, c)| 1.0 + r as f64 * 0.37 - c as f64 * 1.9);
         // Applied one at a time, every source read first.
         let mut applied = start.clone();

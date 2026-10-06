@@ -1254,3 +1254,45 @@ fn the_reverse_of_every_edit_is_the_transpose_of_its_tangent() {
     }
 }
 
+
+/// Operations on shared sites ([`Patch::Ops`], [`Interchange::sample_ops`]) on the scoped starting
+/// library of the tiny Qwen3 export (its MLPs P's, an exact copy of M's; its attention M's): every
+/// family (swap from a donor, zeroing, scaling, pushing a direction) at one row, onward and at
+/// every row, with one to many operations, scores zero against M with and without the reverse
+/// pass, the draws reach several operations at once, and with P applying no edit most experiments
+/// move M.
+#[test]
+fn operations_on_shared_sites_are_the_same_on_both_models() {
+    use super::interchange::Family;
+    let dir = crate::test_support::tiny_qwen3_export("interchange_ops", 2);
+    let imported = crate::import::import_language_model(&dir, 6, 12).expect("the tiny export imports");
+    std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+    let native = split_sites(&imported.program).expect("the native sites");
+    let layers = layer_nodes(&native, 2).expect("the layers");
+    let explanation = crate::library_mdl::scoped(&crate::library_mdl::explanation(&native, &layers).expect("the library"), &[1, 3]).expect("scoped");
+    let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+    let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+    let d = Device::host();
+    let blocks: Vec<crate::run_check::LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+    let variables = reads(&native, &blocks).expect("the reads");
+    let mut x = Interchange::new(&d, &native, &blocks, &explanation.artifact, &explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
+    let shared = x.shared_sites();
+    assert!(shared.len() >= 4 + 4 + 2, "{shared:?}");
+    let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
+    x.set_directions(8, 1);
+    x.measure_typical(&batch).expect("the typical norms");
+    let families = [Family::Swap, Family::Zero, Family::Scale, Family::Push];
+    let experiments = x.sample_ops(&mut rand::rngs::StdRng::seed_from_u64(3), &batch, &families, 12, &[1, 2, 0], false).expect("the draw");
+    let counts = census(&experiments, x.variables());
+    assert!(families.iter().all(|f| counts[format!("{f:?}").to_lowercase().as_str()] > 0), "{counts:?}");
+    assert!(experiments.iter().any(|e| matches!(&e.patch, Some(Patch::Ops { ops, .. }) if ops.len() > 2)), "several operations at once");
+    for gradient in [false, true] {
+        let bits = x.evaluate(&batch, &experiments, gradient).expect("evaluate").bits;
+        assert!(bits.iter().flatten().all(|b| b.abs() <= 1e-9), "{bits:?}");
+    }
+    x.unedited_explanation();
+    let effects = x.evaluate(&batch, &experiments, false).expect("evaluate").bits;
+    let moved = experiments.iter().zip(&effects).filter(|(e, bits)| e.patch.is_some() && bits.iter().sum::<f64>() > 1e-9).count();
+    let edited = experiments.iter().filter(|e| e.patch.is_some()).count();
+    assert!(moved * 10 >= edited * 8, "{moved} of {edited} operations move M");
+}
