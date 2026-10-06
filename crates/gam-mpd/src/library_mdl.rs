@@ -357,7 +357,7 @@ pub(crate) fn host_sample(posterior: &Posterior, operators: &[usize], key: u64) 
 
 /// [`PriorTerm::sample`] of `prior` at the weight sample of `key` of `device_posterior`, on the
 /// host: its operators' means and deviations come off the device into `posterior`, the sample is
-/// drawn there ([`host_sample`]), and the gradient goes back up.
+/// drawn there (`host_sample`), and the gradient goes back up.
 pub fn host_term<P: PriorTerm + ?Sized>(prior: &mut P, device: &Device, device_posterior: &DevicePosterior, posterior: &mut Posterior, key: u64, learn: bool) -> Result<(f64, BTreeMap<usize, Tensor>), String> {
     let operators = prior.operators();
     for &i in &operators {
