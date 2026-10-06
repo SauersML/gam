@@ -27,6 +27,8 @@ layer, beside the no-input reader's log score on the same questions (and their p
 
   vpd_lens.py values --lens LENS --uv UV --data PILE.npy      add the values to an existing lens file
   vpd_lens.py build --uv UV | --functions LIBRARY/functions.safetensors --data PILE.npy --out LENS.safetensors [--k 8]
+                    [--model HF_SNAPSHOT_DIR]   (a library of a Hugging Face Qwen3 model; --data its tokens, .npy or .u32)
+  vpd_lens.py functions --transcoders OUT --out functions.safetensors   (a transcoder library's start, from its kept files)
   vpd_lens.py baseline --labels HELDOUT --relations HELDOUT_REL --uv UV --data PILE.npy --nothing RUN --out OUT.json
 """
 
@@ -50,6 +52,27 @@ import vpd_model as VM  # noqa: E402
 KINDS = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")
 
 
+def tokens(data: Path) -> np.ndarray:
+    """A token file: .npy, or raw little-endian uint32 (.u32, the Qwen3 data release's documents.u32)."""
+    return np.fromfile(str(data), dtype="<u4") if str(data).endswith(".u32") else np.asarray(np.load(str(data), mmap_mode="r")).reshape(-1)
+
+
+class HFTarget:
+    """A Hugging Face Qwen3 model's weights the lens reads: per layer the attention and MLP norms'
+    gains, the final norm's, the (tied) embedding."""
+
+    def __init__(self, snapshot: Path):
+        from safetensors.torch import load_file as load
+
+        sd = load(str(Path(snapshot) / "model.safetensors"))
+        config = json.loads((Path(snapshot) / "config.json").read_text())
+        assert config.get("tie_word_embeddings", False), "the lens reads the unembedding as the tied embedding"
+        self.n_layer, self.eps = config["num_hidden_layers"], config["rms_norm_eps"]
+        self.wte = sd["model.embed_tokens.weight"].float()
+        self.ln_f = sd["model.norm.weight"].float()
+        self.norms = [sd[f"model.layers.{l}.{n}.weight"].float() for l in range(self.n_layer) for n in ("input_layernorm", "post_attention_layernorm")]
+
+
 def site(layer: int, kind: str) -> str:
     return f"h.{layer}.{'mlp' if kind in ('c_fc', 'down_proj') else 'attn'}.{kind}"
 
@@ -57,8 +80,8 @@ def site(layer: int, kind: str) -> str:
 class Lens:
     """The target's weights and the subcomponents' vectors, with the write and read lenses."""
 
-    def __init__(self, uv_path: Path | None, data: Path):
-        self.t = VM.load_target("cpu")
+    def __init__(self, uv_path: Path | None, data: Path, model: Path | None = None):
+        self.t = VM.load_target("cpu") if model is None else HFTarget(model)
         if uv_path is not None:
             d = load_file(str(uv_path))
             self.uv = {n: (d[f"{n}.U"].float(), d[f"{n}.V"].float()) for n in VM.site_names()}
@@ -66,7 +89,7 @@ class Lens:
         self.E = E
         self.Ef = E * self.t.ln_f.float()  # the unembedding through the final norm's gain
         self.Er = E * torch.rsqrt(E.pow(2).mean(-1, keepdim=True) + self.t.eps)  # rms(e_t)
-        counts = np.bincount(np.asarray(np.load(str(data), mmap_mode="r")).reshape(-1), minlength=E.shape[0])[: E.shape[0]]
+        counts = np.bincount(tokens(data), minlength=E.shape[0])[: E.shape[0]]
         self.seen = torch.from_numpy(counts > 0)
         self.freq = torch.from_numpy(counts / counts.sum()).float()  # the unigram distribution of the data
 
@@ -178,7 +201,7 @@ def build_library(args):
     tokens along the left vector to source tokens along the right; rotary positions left out)."""
     from vpd_oracle import head_vectors, top_pair
 
-    lens = Lens(None, Path(args.data))
+    lens = Lens(None, Path(args.data), Path(args.model) if args.model else None)
     lib = load_file(args.functions)
     head_vectors(lib)  # the functions' U and V also from readout's earlier write and gate names
     vocab = torch.nonzero(lens.seen).reshape(-1)
@@ -208,7 +231,13 @@ def build_library(args):
             for key, val in zip(("up", "down"), written(U[rows])):
                 parts[key].append(val)
         out.update({f"{n}.{key}": torch.cat(v) for key, v in parts.items()})
+        # Values (the module's Values): the asked tokens' write lens in the oracle's effect questions.
+        w = U @ Ef.T
+        out[f"{n}.write"], out[f"{n}.write_centre"], out[f"{n}.write_scale"] = U.half(), w.mean(1), w.std(1)
         n = f"h.{layer}.attn.head"
+        if f"{n}.query" not in lib:
+            print(json.dumps({"layer": layer, "functions": U.shape[0], "heads": 0}), flush=True)
+            continue  # attention is the model's own (a transcoder library replaces the MLPs only)
         Q, K, Vv, O = (lib[f"{n}.{x_}"].float() for x_ in ("query", "key", "value", "output"))
         x = lens.Er[vocab] * lens.t.norms[2 * layer].float()
         ov = [top_pair(O[h] @ Vv[h]) for h in range(Q.shape[0])]
@@ -218,6 +247,24 @@ def build_library(args):
         out[f"{n}.attn_from"], _ = ranked((x @ torch.stack([left for _, left, _ in qk], 1)).T)
         out[f"{n}.attn_to"], _ = ranked((x @ torch.stack([r for _, _, r in qk], 1)).T)
         print(json.dumps({"layer": layer, "functions": U.shape[0], "heads": Q.shape[0]}), flush=True)
+    out["unembed"] = lens.Ef.half()
+    save_file(out, args.out)
+
+
+def transcoder_functions(args):
+    """A transcoder library's functions before any fit, in functions.safetensors' names: per layer l,
+    h.{l}.mlp.function.U (the kept features' decoder rows), .V (their encoder rows, transposed), .bias
+    (the encoder biases) and .features (their transcoder indices), from library_transcoder.rs's kept
+    files transcoder_l{l}.safetensors (gate k x d, gate_bias k x 1, out d x k)."""
+    out = {}
+    for path in sorted(Path(args.transcoders).glob("transcoder_l*.safetensors")):
+        layer = int(path.stem.removeprefix("transcoder_l"))
+        d = load_file(str(path))
+        n = f"h.{layer}.mlp.function"
+        out[f"{n}.U"] = d["out"].float().T.contiguous()
+        out[f"{n}.V"] = d["gate"].float().T.contiguous()
+        out[f"{n}.bias"] = d["gate_bias"].float().reshape(-1)
+        out[f"{n}.features"] = d["features"].reshape(-1)
     save_file(out, args.out)
 
 
@@ -346,6 +393,10 @@ def main():
     b.add_argument("--data", required=True)
     b.add_argument("--out", required=True)
     b.add_argument("--k", type=int, default=8)
+    b.add_argument("--model", help="a Hugging Face Qwen3 snapshot directory (a library of that model; default vpd4l)")
+    f = sub.add_parser("functions")
+    f.add_argument("--transcoders", required=True, help="a transcoder library fit's OUT (transcoder_l*.safetensors)")
+    f.add_argument("--out", required=True)
     s = sub.add_parser("baseline")
     for a in ("--labels", "--relations", "--uv", "--data", "--nothing", "--out"):
         s.add_argument(a, required=True)
@@ -357,6 +408,8 @@ def main():
     torch.set_grad_enabled(False)
     if args.command == "build" and args.functions:
         build_library(args)
+    elif args.command == "functions":
+        transcoder_functions(args)
     else:
         {"build": build, "baseline": baseline, "values": add_values}[args.command](args)
 
