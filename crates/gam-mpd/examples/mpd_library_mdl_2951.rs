@@ -307,7 +307,16 @@ fn edit_faithfulness(
             entry.2 += 1;
         }
         batches.push((b, batch, drawn, scored.bits));
-        log::info!("edits: batch {b} scored ({:.0} s)", started.elapsed().as_secs_f64());
+        let w = scored.work;
+        log::info!(
+            "edits: batch {b} scored ({:.0} s): {} paths in {} lanes ({} suffix lanes), {} block rows run of {} whole",
+            started.elapsed().as_secs_f64(),
+            w.paths,
+            w.lanes,
+            w.suffix_lanes,
+            w.rows,
+            w.whole_rows
+        );
     }
     // The edits' effect on M, KL(M_e ‖ M), over the same tokens: the same experiments with P = M
     // applying no edit.

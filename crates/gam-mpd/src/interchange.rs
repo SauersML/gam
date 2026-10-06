@@ -2477,6 +2477,20 @@ pub struct Evaluation {
     pub gradient: BTreeMap<usize, Tensor>,
     /// A draw of the Gauss–Newton factor, when asked for ([`evaluate_probed`]).
     pub factor: Option<Factor>,
+    /// The forward pass's work ([`Work`]).
+    pub work: Work,
+}
+
+/// What a forward pass over a batch's experiments ran: its paths, lanes and suffix lanes (module
+/// note), and the block rows its calls took against those of every lane whole (lanes × blocks run
+/// × the sequence length).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Work {
+    pub paths: usize,
+    pub lanes: usize,
+    pub suffix_lanes: usize,
+    pub rows: usize,
+    pub whole_rows: usize,
 }
 
 /// A draw of the Gauss–Newton factor of a batch's experiments: `u = Σ_t J_tᵀ b_t` in each of `P`'s
@@ -2564,6 +2578,13 @@ pub fn evaluate_probed<E: BlockEngine>(
     let plan = Plan::new(paths, length);
     let arithmetic = p.arithmetic();
     let (stream, calls) = run([p, m], &plan, gradient || probe.is_some())?;
+    let work = Work {
+        paths: plan.paths.len(),
+        lanes: plan.lanes.len(),
+        suffix_lanes: plan.lanes.iter().filter(|l| l.prefix.is_some()).count(),
+        rows: calls.iter().map(|c| c.lanes.iter().map(|l| plan.range(*l).len()).sum::<usize>()).sum(),
+        whole_rows: calls.iter().map(|c| c.lanes.len() * plan.length).sum(),
+    };
     // Each experiment's scored rows, from its position on.
     let rows = outputs(&plan, &bases, experiments);
     let hidden = gather(d, &stream, &rows)?;
@@ -2622,7 +2643,7 @@ pub fn evaluate_probed<E: BlockEngine>(
     }
     drop(passes);
     let factor = factored.then(|| Factor { gradient: u, tokens: hidden.rows() });
-    Ok(Evaluation { bits, gradient: total, factor })
+    Ok(Evaluation { bits, gradient: total, factor, work })
 }
 
 /// The draw `u = Σ_t J_tᵀ b_t` of the Gauss–Newton factor ([`Factor`]) in `P`'s trainable operators
