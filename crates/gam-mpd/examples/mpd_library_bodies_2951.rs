@@ -233,16 +233,17 @@ fn scoreboard(run: &Run, model: &str, name: &str, fit: &Fit) -> Result<(), Strin
 impl Run {
     /// `explanation` fitted to convergence in OUT/`name` (resumed from its checkpoint there).
     fn fit(&self, name: &str, explanation: &Explanation) -> Result<Fit, String> {
-        self.fit_with(name, explanation, None)
+        self.fit_with(name, explanation, None, None)
     }
 
-    /// `explanation` fitted to convergence in OUT/`name` with the prior term `prior`.
-    fn fit_with(&self, name: &str, explanation: &Explanation, prior: Option<&mut (dyn library_mdl::PriorTerm + 'static)>) -> Result<Fit, String> {
+    /// `explanation` fitted to convergence in OUT/`name` with the prior term `prior`, from `start`
+    /// (a move's start carrying its parent's fit) when given.
+    fn fit_with(&self, name: &str, explanation: &Explanation, prior: Option<&mut (dyn library_mdl::PriorTerm + 'static)>, start: Option<library_mdl::Start>) -> Result<Fit, String> {
         let dir = self.out.join(name);
         std::fs::create_dir_all(&dir).map_err(error)?;
         let checkpoint = dir.join("checkpoint.bin");
         library_mdl::check_checkpoint(&checkpoint, &library_mdl::identity(&self.digest, &self.native, explanation, &self.train, &self.held))?;
-        let fit = library_mdl::fit(&self.device, &self.native, explanation, &self.train, &self.held, &self.fit, &self.digest, Some(&checkpoint), prior)?;
+        let fit = library_mdl::fit_from(&self.device, &self.native, explanation, &self.train, &self.held, &self.fit, &self.digest, Some(&checkpoint), prior, start)?;
         save(&dir.join("REPORT.json"), &serde_json::to_value(&fit.report).map_err(error)?)?;
         scoreboard(self, &self.model, name, &fit)?;
         Ok(fit)
@@ -333,7 +334,9 @@ fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>) -> Re
         child.artifact.validate_coverage(&run.native)?;
         let name = format!("t{transaction}");
         transaction += 1;
-        let fit = run.fit(&name, &child)?;
+        // The child starts from its parent's fit: what the move left alone keeps its posterior.
+        let start = library_bodies::carried(explanation, &current.posterior, &child, current.report.scored_tokens)?;
+        let fit = run.fit_with(&name, &child, None, Some(start))?;
         record(summary, "stages", stage(&name, &fit))?;
         let accepted = fit.report.objective_bits < current.report.objective_bits;
         record(summary, "decisions", json!({"move": kind, "stage": name, "detail": detail, "before_bits": current.report.objective_bits, "after_bits": fit.report.objective_bits, "accepted": accepted}))?;
@@ -438,7 +441,9 @@ fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>) -> Re
     let steps = library_mixture::Steps { rate: 0.05, beta1: run.fit.beta1, beta2: 0.999, epsilon: 1e-8 };
     for round in 0.. {
         let mut mixture = library_bodies::BodyMixture::new(&explanation, steps)?;
-        let soft = run.fit_with(&format!("soft{round}"), &warm(&explanation, &current)?, Some(&mut mixture))?;
+        let warmed = warm(&explanation, &current)?;
+        let start = library_bodies::carried(&explanation, &current.posterior, &warmed, current.report.scored_tokens)?;
+        let soft = run.fit_with(&format!("soft{round}"), &warmed, Some(&mut mixture), Some(start))?;
         let weights: Vec<Value> = mixture.targets.iter().map(|t| json!({"body": t.body, "components": t.components.iter().map(|c| &c.body).collect::<Vec<_>>(), "weights": t.weights().unwrap_or_default()})).collect();
         record(&mut summary, "stages", json!({"stage": format!("soft{round}"), "objective_bits": soft.report.objective_bits, "prior_bits": soft.report.end.prior_bits, "mixture": weights}))?;
         let (merged, merged_calls, pairs) = mixture.harden(&warm(&explanation, &soft)?, &calls, &soft.posterior)?;

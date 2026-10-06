@@ -2247,6 +2247,33 @@ pub fn edit_native(explanation: &Explanation, owner: &crate::artifact::Owner, de
     Ok(out)
 }
 
+// ------------------------------------------------------------------------------- a move's start
+
+/// The start of a fit of `child`, an explanation a move made from `parent` (a rewrite, a merge, a
+/// read through heads), carrying the parent's fit (`posterior`): every trainable operator the two
+/// share by name and shape keeps the parent's posterior deviations where its entries are in the
+/// child, so the parameters the move left alone keep what the fit learned of them; the move's new
+/// operators (and those it reshaped) start as `Posterior::new` starts a library, `tokens` the
+/// training collection's scored tokens. The means are the child's own values (`library_sharing::
+/// warm` gives it the parent's). IVON's state restarts from these deviations.
+pub fn carried(parent: &Explanation, posterior: &Posterior, child: &Explanation, tokens: usize) -> Result<crate::library_mdl::Start, String> {
+    let fresh = Posterior::new(child, tokens)?;
+    let names: BTreeMap<&str, usize> = parent.trainable.iter().enumerate().map(|(j, op)| (parent.artifact.program.operators[*op].name.as_str(), j)).collect();
+    let mut log_sd = fresh.log_sd.clone();
+    for (i, op) in child.trainable.iter().enumerate() {
+        let Some(&j) = names.get(child.artifact.program.operators[*op].name.as_str()) else { continue };
+        if posterior.log_sd[j].dim() != log_sd[i].dim() {
+            continue;
+        }
+        ndarray::Zip::from(&mut log_sd[i]).and(&posterior.log_sd[j]).for_each(|own, inherited| {
+            if own.is_finite() && inherited.is_finite() {
+                *own = *inherited;
+            }
+        });
+    }
+    Ok(crate::library_mdl::Start { mean: fresh.mean, log_sd, active: fresh.active, state: None, steps: 0, epoch: 0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2878,6 +2905,33 @@ mod tests {
                 assert!(outputs(&reference, &family).iter().zip(outputs(&start, &family).iter()).any(|(a, b)| (a - b).abs() > 1e-6), "the edit moves the outputs");
             }
         }
+    }
+
+    #[test]
+    fn a_move_s_start_keeps_the_parent_s_deviations_of_what_it_left_alone() {
+        let (native, layers, _, _) = tiny("bodies_carried", "gelu_tanh", false);
+        let start = explanation(&native, &layers).unwrap();
+        let mut parent = Posterior::new(&start, 72).unwrap();
+        for log_sd in &mut parent.log_sd {
+            log_sd.mapv_inplace(|s| s - 1.25);
+        }
+        let (child, call) = rewrite(&start, 0, &SITE0).unwrap();
+        let carried = carried(&start, &parent, &child, 72).unwrap();
+        let fresh = Posterior::new(&child, 72).unwrap();
+        let program = &child.artifact.program;
+        for (i, op) in child.trainable.iter().enumerate() {
+            let name = &program.operators[*op].name;
+            let (got, own) = (&carried.log_sd[i], &fresh.log_sd[i]);
+            if name.starts_with(&call.body) || name.starts_with(&call.name) {
+                assert_eq!(got, own, "{name} is new and starts fresh");
+            } else {
+                let j = start.trainable.iter().position(|t| start.artifact.program.operators[*t].name == *name).unwrap();
+                for (g, (o, p)) in got.iter().zip(own.iter().zip(parent.log_sd[j].iter())) {
+                    assert_eq!(*g, if o.is_finite() { *p } else { *o }, "{name} keeps the parent's deviations where it is in the child");
+                }
+            }
+        }
+        assert_eq!(carried.active, fresh.active);
     }
 }
 
