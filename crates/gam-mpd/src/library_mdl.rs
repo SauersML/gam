@@ -769,14 +769,26 @@ pub fn explanation_with(native: &OperatorProgram, layers: &[LayerNodes], transco
         let (functions, d) = (program.operators[output].cols.width(), program.operators[output].rows.width());
         layer.functions = vec![Vec::new(); functions];
         // Per function its gate (with its bias), its up direction when gated (likewise), its output.
+        // A transcoder block's gate biases are one group of the layer, apart from the gate rows: a
+        // feature's threshold `c` is 30–60 times its gate weights in size, so under one isotropic
+        // prior with its row the empirical-Bayes variance is set by the weights, `c` costs 300–600
+        // bits per feature and the prior pulls the thresholds toward 0, which makes the features
+        // fire more (compare, vpd4l: 7.2M of 28M description bits). The layer's thresholds share
+        // their own variance instead.
+        let apart = transcoders.contains_key(&l);
         for part in ["gate", "up"] {
             let Some(map) = operator_named(program, &format!("{name}.{part}")) else { continue };
             let bias = operator_named(program, &format!("{name}.{part}_bias"));
             for (i, function) in layer.functions.iter_mut().enumerate() {
                 let mut cells = vec![Cells { operator: map, rows: vec![i], cols: 0..d }];
-                cells.extend(bias.map(|b| Cells { operator: b, rows: vec![i], cols: 0..1 }));
+                if !apart {
+                    cells.extend(bias.map(|b| Cells { operator: b, rows: vec![i], cols: 0..1 }));
+                }
                 function.push(groups.len());
                 groups.push(Group { name: format!("{name}.f{i}.{part}"), cells });
+            }
+            if let (true, Some(b)) = (apart, bias) {
+                groups.push(Group { name: format!("{name}.{part}_bias"), cells: vec![Cells { operator: b, rows: (0..functions).collect(), cols: 0..1 }] });
             }
             trainable.push(map);
             trainable.extend(bias);
