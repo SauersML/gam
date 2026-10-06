@@ -2936,18 +2936,28 @@ sync_loop() {  # checkpoints | rest
 }
 
 # The idle check: once the command has run 15 minutes, a GPU averaging under 20% over the last 15
-# minutes (the pod's own samples, every 10 s) ends the run as idle-stopped: it pays for a GPU it does
-# not use (CPU-only work goes to GitHub Actions: gha-run).
+# minutes of the command (the pod's own samples, every 10 s) ends the run as idle-stopped: it pays
+# for a GPU it does not use (CPU-only work goes to GitHub Actions: gha-run). The window starts at
+# the command's start, not the pod's creation: setup (a checkpoint restored from the Mac, uploads,
+# builds of data) idles the GPU by design and has its own limit (SETUP_FAIL); counted here, it
+# stopped compare-vpd4l-tc4096-n2p24 one minute into its command after an 881 s restore.
+# IDLE_MEAN: the mean of the samples ("epoch utilization") from t on; idle_since STARTED NOW: the
+# window's start, the later of NOW - 900 and the command's start (both run on the pod, on its clock;
+# tested by test_idle_window.sh).
+IDLE_MEAN='$1 >= t && NF == 2 { s += $2; n++ } END { if (n) printf "%d", s / n }'
+idle_since() { local w=$(( $2 - 900 )); echo $(( w > $1 ? w : $1 )); }
 idle_check() {
-    # From the pod's creation (or this run's packing onto it): setup is idle GPU too.
-    local started=${CREATED:-$(date +%s)} mean i
+    local started mean i now
+    started=$(date +%s)
     while :; do
         for (( i = 0; i < 12; i++ )); do
             [ ! -f "$TMP/stop-sync" ] && kill -0 $$ 2> /dev/null || return 0
             sleep 5
         done
-        (( $(date +%s) - started >= 900 )) || continue
-        mean=$(on_pod "awk -v t=\$(( \$(date +%s) - 900 )) '\$1 >= t && NF == 2 { s += \$2; n++ } END { if (n) printf \"%d\", s / n }' /workspace/gpu-util.log" < /dev/null 2> /dev/null || true)
+        now=$(date +%s)
+        (( now - started >= 900 )) || continue
+        # On the pod's clock: the command's start is its run.pid file's time.
+        mean=$(on_pod "$(declare -f idle_since); awk -v t=\$(idle_since \$(stat -c %Y $WS/run.pid) \$(date +%s)) '$IDLE_MEAN' /workspace/gpu-util.log" < /dev/null 2> /dev/null || true)
         if [ -n "$mean" ] && (( mean < 20 )); then
             say "GPU at $mean% over the last 15 minutes: stopping the run as idle"
             (( GUEST )) || echo idle-stopped > "$ACTIVE/.$POD.end"
