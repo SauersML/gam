@@ -1850,7 +1850,8 @@ impl Scorer {
     /// restored after, error or not. Every evaluation of `P` with a gradient or a Gauss–Newton draw
     /// (a training step, the Laplace start's pass, the removal curvature) runs there; every scoring
     /// without one (the snapshot the stop and the best epoch are decided on, held-out scoring,
-    /// removal comparisons) in `P`'s own, so an epoch's running estimates (`Epoch::estimates`) are
+    /// removal comparisons) in `P`'s own, so an epoch's running estimates (`Epoch::data_bits`,
+    /// `clean_bits_per_token`, `patched_bits_per_token`) are
     /// the steps' own. On vpd4l at N = 2^20 (fitperf-seedab, RTX 4090) bfloat16 steps took 66 ms
     /// against 96 and reached a lower snapshot `F` at every epoch of seed 1.
     fn reversed<R>(&mut self, f: impl FnOnce(&mut Interchange) -> R) -> R {
@@ -3792,7 +3793,9 @@ fn snapshot_estimates(
     device_posterior.values_into(posterior)?;
     let (mut evaluation, (preparing, targeting, scoring)) = collection_divergence(scorer, device_posterior, posterior, (draws, sequences, settings), prior, None)?;
     log::info!("library snapshot: {} batches, experiments {preparing:.2} s, targets {targeting:.2} s, scoring {scoring:.2} s", draws.len());
-    let rest = evaluation.rest + posterior.description() + explanation.fixed_nats;
+    // Summed as a removal round's objective sums it (`remove`), so the evaluation it takes over is
+    // the one the round would have made, to the last bit.
+    let rest = evaluation.rest + (posterior.description() + explanation.fixed_nats);
     if !rest.is_finite() {
         return Err("a nonfinite posterior divergence".into());
     }

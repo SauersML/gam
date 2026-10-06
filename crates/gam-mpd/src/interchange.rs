@@ -2673,7 +2673,7 @@ pub fn evaluate_probed<E: BlockEngine>(
         Some(key) => Some(spread(
             &match probed {
                 Some(seed) => seed,
-                None => fisher_probe_seed(d, &hidden, &head.resident.embedding, head.resident.tile_rows.max(1), key, factor)?,
+                None => fisher_probe_seed(d, &hidden, head.resident.embedding_in(d, factor)?, head.resident.tile_rows.max(1), key, factor)?,
             },
             1.0,
         )?),

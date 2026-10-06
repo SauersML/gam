@@ -585,7 +585,8 @@ impl DevicePosterior {
     /// ratio of their averages over the steps (weights `w` as `ρ̄`'s), and `r̄ G · d` estimates the
     /// slope along `d`. `r̄` is not clamped: a negative `r̄` puts the model's minimum along `d`
     /// behind the iterate. The independence of `g` from `d₀` holds up to the batch's own gradient
-    /// of the previous epoch (each epoch repeats a batch's experiments and weight noise), which
+    /// of the previous epoch (each epoch repeats a batch's experiments, its weight noise drawn
+    /// afresh, `library_mdl::training_key`), which
     /// `d₀`'s momentum holds with weight `β₁^B` over an epoch of `B` batches: negligible once
     /// `B ≫ 1 / (1 − β₁)`. One draw of either ratio is a single χ²₁-like sample whatever the
     /// batch's tokens; the epoch's averages are what the step uses, and the iterate stays until

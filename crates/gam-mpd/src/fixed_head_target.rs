@@ -401,8 +401,9 @@ pub(crate) struct ResidentHead {
     pub embedding: Tensor,
     /// The embedding in bfloat16 (CUDA in f32), which a sweep in bfloat16 (a training step's,
     /// `library_mdl::Scorer::evaluate_device`) reads as it is in place of rounding the embedding at
-    /// every call.
-    pub half: Option<Tensor>,
+    /// every call: made at the first such sweep ([`ResidentHead::embedding_in`]), so a head that no
+    /// bfloat16 sweep reads (a read-out's) holds none (0.78 GB at Qwen3-4B's vocabulary).
+    half: std::sync::OnceLock<Tensor>,
     pub ones: Tensor,
     pub tile_rows: usize,
     /// The hidden width as one column block (row dots).
@@ -411,10 +412,9 @@ pub(crate) struct ResidentHead {
 impl ResidentHead {
     pub fn new(d: &Device, head: &Head, tile_rows: usize) -> Result<Self, String> {
         let embedding = d.upload(head.embedding()).map_err(error)?;
-        let half = if d.storage() == Storage::F32 && d.with_storage(Storage::Bf16).is_ok() { Some(d.bf16_copy(&embedding).map_err(error)?) } else { None };
         Ok(Self {
             embedding,
-            half,
+            half: std::sync::OnceLock::new(),
             ones: d
                 .upload(Array2::ones((head.embedding().ncols(), 1)).view())
                 .map_err(error)?,
@@ -423,6 +423,18 @@ impl ResidentHead {
                 .column_blocks(&[head.embedding().ncols()])
                 .map_err(error)?,
         })
+    }
+    /// The embedding a sweep in `arithmetic` reads: in bfloat16 from an f32 embedding, its bfloat16
+    /// copy, made at the first such sweep and kept; otherwise the embedding as it is.
+    pub fn embedding_in(&self, d: &Device, arithmetic: Arithmetic) -> Result<&Tensor, String> {
+        if !matches!(arithmetic, Arithmetic::Bf16) || self.embedding.storage() != Storage::F32 {
+            return Ok(&self.embedding);
+        }
+        if self.half.get().is_none() {
+            let copy = d.bf16_copy(&self.embedding).map_err(error)?;
+            let _ = self.half.set(copy);
+        }
+        self.half.get().ok_or_else(|| "the head's bfloat16 copy".to_string())
     }
     /// Per-row compact KL; with `gradient`, the hidden seed; with the probe key `probe` as well,
     /// each row's Fisher probe under it at `P`'s softmax `q` pulled back to the hidden row,
@@ -580,10 +592,7 @@ impl ResidentHead {
         // device) finds it made and the scoring waits on the device once.
         let dots = d.block_products(hidden, &target.mu, &self.width).map_err(error)?;
         let mut probed = None;
-        let embedding = match (&self.half, arithmetic) {
-            (Some(half), Arithmetic::Bf16) => half,
-            _ => &self.embedding,
-        };
+        let embedding = self.embedding_in(d, arithmetic)?;
         let partitions = match (probe, seed.as_mut()) {
             (Some(key), Some(seed)) => {
                 let mut out = d.empty(hidden.rows(), hidden.cols()).map_err(error)?;
