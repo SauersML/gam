@@ -1938,18 +1938,24 @@ fn training_key(seed: u64, batch: usize) -> u64 {
 /// in two, the first half's experiments scored at the weight sample of `key` and the second half's
 /// at its negation (`gam_gpu::tensor::ANTITHETIC`: `ε` and `−ε`), with the gradients summed over
 /// both. Each half's sample is one of the posterior, so the step's estimate of `F` and of its
-/// gradient keep their expectations; the gradient's term linear in the noise is
-/// `(H_A − H_B) σ ε` over the halves `A` and `B` rather than `(H_A + H_B) σ ε`, which cancels
-/// within the step, and the momentum averages what remains. The products are one
-/// scoring's of the whole batch. A batch of one base is scored at the sample of `key` alone.
+/// gradient keep their expectations. The gradient's term linear in the noise is `(H_A − H_B) σ ε`
+/// over the halves `A` and `B` (each half's Hessian on its own experiments) rather than
+/// `(H_A + H_B) σ ε`: it cancels only as far as the two halves' curvatures agree, and the momentum
+/// averages what remains. The products are one scoring's of the whole batch. A batch of one base is
+/// scored at the sample of `key` alone.
 ///
-/// The Gauss–Newton factor is the first half's alone, its curvature estimate per token of the
-/// tokens it sums. Each entry of a draw `u` is a sum of independent zero-mean terms, one per
-/// token, close to normal, so `u_i²` has a relative standard deviation near √2 however many tokens
-/// it sums: half the tokens estimate the curvature about as precisely, for half the factor pass.
-/// Its A/B (fitperf-halffactor-ab2: vpd4l, N = 2^20, RTX 4090, 3 epochs, seeds 1-2) measured F
-/// after epoch 2 at 25.45e6 and 24.09e6 bits against 25.73e6 and 24.81e6 with both halves'
-/// factors, and 7% less wall time per step.
+/// The Gauss–Newton factor is one half's alone, its curvature estimate per token of the tokens it
+/// sums; which half supplies it is drawn from the batch's key, each with probability ½
+/// ([`factor_half`]). The batches are fixed runs of the training sequences, so a fixed half would
+/// leave the same sequences out of the curvature at every step; with the half drawn, every
+/// training sequence contributes with probability ½ and the curvature average stays unbiased for
+/// the whole collection's. The key, and so the half, is the batch's in every epoch, as its weight
+/// noise is (`training_key`). Each entry of a draw `u` is a sum of independent zero-mean terms,
+/// one per token, close to normal, so `u_i²` has a relative standard deviation near √2 however
+/// many tokens it sums: half the tokens estimate the curvature about as precisely, for half the
+/// factor pass. Its A/B (fitperf-halffactor-ab2: vpd4l, N = 2^20, RTX 4090, 3 epochs, seeds 1-2)
+/// measured F after epoch 2 at 25.45e6 and 24.09e6 bits against 25.73e6 and 24.81e6 with both
+/// halves' factors, and 7% less wall time per step.
 ///
 /// With `whole` (the A/B arm [`Settings::full_antithetic`]) the whole batch is scored at the sample
 /// of `key` and again at its negation, and the step takes the two scorings' mean bits and mean
@@ -1993,12 +1999,13 @@ fn antithetic_step(
         let (bits, gradients, factor) = scorer.evaluate_device(device_posterior, (batch, &all), Some(key), &targets, (true, true))?;
         return Ok((all, bits, gradients, factor.ok_or("no Gauss–Newton factor")?));
     }
+    let probed_first = factor_half(key);
     let targets = targets_of(scorer, &first)?;
-    let (mut bits, mut gradients, factor) = scorer.evaluate_device(device_posterior, (batch, &first), Some(key), &targets, (true, true))?;
+    let (mut bits, mut gradients, factor) = scorer.evaluate_device(device_posterior, (batch, &first), Some(key), &targets, (true, probed_first))?;
     drop(targets);
-    let factor = factor.ok_or("no Gauss–Newton factor")?;
     let targets = targets_of(scorer, &second)?;
-    let (other_bits, other_gradients, _) = scorer.evaluate_device(device_posterior, (batch, &second), Some(key ^ gam_gpu::tensor::ANTITHETIC), &targets, (true, false))?;
+    let (other_bits, other_gradients, other_factor) = scorer.evaluate_device(device_posterior, (batch, &second), Some(key ^ gam_gpu::tensor::ANTITHETIC), &targets, (true, !probed_first))?;
+    let factor = factor.or(other_factor).ok_or("no Gauss–Newton factor")?;
     for (op, g) in other_gradients {
         match gradients.get_mut(&op) {
             Some(sum) => device.axpy(sum, 1.0, &g).map_err(error)?,
@@ -2009,6 +2016,14 @@ fn antithetic_step(
     }
     bits.extend(other_bits);
     Ok((first.into_iter().chain(second).collect(), bits, gradients, factor))
+}
+
+/// Whether the first half of a training batch's bases supplies the step's Gauss–Newton factor
+/// (`antithetic_step`), drawn from the batch's `key`: the top bit of the SplitMix64 output after
+/// the probe's key ([`probe_key`]), so apart from the weight noise's and the probe's draws, each
+/// half with probability ½.
+fn factor_half(key: u64) -> bool {
+    probe_key(probe_key(key)) >> 63 == 0
 }
 
 /// The momentum's decay: an average over about 199 gradients (`n_eff = (1 + β₁) / (1 − β₁)`). On
@@ -3208,7 +3223,7 @@ pub fn fit_from(
             priors.push(prior_nats);
             progress.step += 1;
             // The factor's scale: its square estimates the curvature per token of the tokens it
-            // sums (the first antithetic half's, or the whole batch's under the full arm,
+            // sums (one antithetic half's, or the whole batch's under the full arm,
             // `antithetic_step`).
             let factor_weight = weight * scored as f64 / factor.tokens as f64;
             let posterior_started = Instant::now();
@@ -4529,6 +4544,42 @@ mod tests {
             assert!(gap <= 1e-14, "operator {op}: {gap}");
         }
         assert_eq!(factor.tokens, plus_factor.unwrap().tokens);
+    }
+
+    /// The half of a batch whose Gauss–Newton factor the step takes is drawn from the batch's key:
+    /// over 4096 training keys the first half is drawn within four standard errors of half the
+    /// time, and a step's factor is the drawn half's, bit for bit, scored at that half's own sample
+    /// (the first half at the key, the second at its antithetic twin).
+    #[test]
+    fn the_curvature_half_is_drawn_from_the_batch_key() {
+        let keys = 4096;
+        let first = (0..keys).filter(|b| factor_half(training_key(7, *b))).count() as f64;
+        assert!((first - 0.5 * keys as f64).abs() <= 4.0 * (0.25 * keys as f64).sqrt(), "the first half drawn {first} times of {keys}");
+        let (native, layers, _, sequences) = tiny("library_factor_half", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let (device, settings) = (Device::host(), settings());
+        let tokens = 2 * sequences.len() * 12;
+        let posterior = Posterior::new(&explanation, tokens).unwrap();
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, tokens as f64, None, 0).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let (batch, experiments) = (draws[0].batch(&sequences).unwrap(), scorer.experiments(&draws[0], &sequences).unwrap());
+        let half = batch.base.len() / 2;
+        assert!(half > 0, "a batch of two halves");
+        for wanted in [true, false] {
+            let key = (0..).map(|b| training_key(settings.seed, b)).find(|k| factor_half(*k) == wanted).unwrap();
+            let (_, _, _, factor) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments.clone(), key, false).unwrap();
+            let part: Vec<Experiment> = experiments.iter().filter(|e| (e.base < half) == wanted).cloned().collect();
+            let targets = scorer.experiments.targets(&batch, &part).unwrap();
+            let own = if wanted { key } else { key ^ gam_gpu::tensor::ANTITHETIC };
+            let (_, _, expected) = scorer.evaluate_device(&device_posterior, (&batch, &part), Some(own), &targets, (true, true)).unwrap();
+            let expected = expected.unwrap();
+            assert_eq!(factor.tokens, expected.tokens, "the first half drawn: {wanted}");
+            assert!(!factor.gradient.is_empty() && factor.gradient.keys().eq(expected.gradient.keys()));
+            for (op, u) in &factor.gradient {
+                assert_eq!(device.download(u).unwrap(), device.download(&expected.gradient[op]).unwrap(), "operator {op}, the first half drawn: {wanted}");
+            }
+        }
     }
 
     /// The arm is read from configs: absent it is off.
