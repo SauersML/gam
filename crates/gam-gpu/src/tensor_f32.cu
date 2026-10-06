@@ -345,6 +345,18 @@ extern "C" __global__ void heads_permute_bf16(unsigned int rows, unsigned int co
     }
 }
 
+// `heads_permute`'s split written twice, in f32 and in bfloat16 (`bf16_of`), for an operand read both ways.
+extern "C" __global__ void heads_permute_both(unsigned int rows, unsigned int cols, unsigned int start, unsigned int heads, unsigned int width,
+                                              unsigned int length, unsigned int planes, int half_split, double sign,
+                                              const float* x, const float* cosines, const float* sines, float* out, unsigned short* half) {
+    GRID_STRIDE(i, (u64)rows * heads * width) {
+        u64 to;
+        float v = permuted(i, cols, start, heads, width, length, planes, half_split, sign, 0, x, cosines, sines, &to);
+        out[to] = v;
+        half[to] = bf16_of(v);
+    }
+}
+
 extern "C" __global__ void heads_permute(unsigned int rows, unsigned int cols, unsigned int start, unsigned int heads, unsigned int width,
                                          unsigned int length, unsigned int planes, int half_split, double sign, int merge,
                                          const float* x, const float* cosines, const float* sines, float* out) {
@@ -376,6 +388,35 @@ extern "C" __global__ void softmax_rows(unsigned int rows, unsigned int width, i
     }
     float inverse = 1.0f / block_sum(total, shared);
     for (unsigned int c = threadIdx.x; c < valid; c += BLOCK) row[c] *= inverse;
+}
+
+// `softmax_rows` with each final value also written in bfloat16 (`bf16_of`) into `half`.
+extern "C" __global__ void softmax_rows_bf16(unsigned int rows, unsigned int width, int causal, unsigned int start, unsigned int period, float* s, unsigned short* half) {
+    __shared__ float shared[WARPS];
+    unsigned int r = blockIdx.x;
+    if (r >= rows) return;
+    float* row = s + (u64)r * width;
+    unsigned short* h = half + (u64)r * width;
+    unsigned int valid = causal ? start + r % period + 1 : width;
+    float m = NEG_INF;
+    for (unsigned int c = threadIdx.x; c < valid; c += BLOCK) m = fmaxf(m, row[c]);
+    m = block_max(m, shared);
+    float total = 0.0f;
+    for (unsigned int c = threadIdx.x; c < width; c += BLOCK) {
+        if (c < valid) {
+            float e = expf(row[c] - m);
+            row[c] = e;
+            total += e;
+        } else {
+            row[c] = 0.0f;
+            h[c] = bf16_of(0.0f);
+        }
+    }
+    float inverse = 1.0f / block_sum(total, shared);
+    for (unsigned int c = threadIdx.x; c < valid; c += BLOCK) {
+        row[c] *= inverse;
+        h[c] = bf16_of(row[c]);
+    }
 }
 
 extern "C" __global__ void softmax_backward(unsigned int rows, unsigned int cols, const float* alpha, const float* d, float* out) {

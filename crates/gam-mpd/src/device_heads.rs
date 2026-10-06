@@ -379,6 +379,31 @@ fn weights(d: &Device, heads: &Heads, (q, k): (&Tensor, &Tensor), batch: usize, 
     Ok(scores)
 }
 
+/// [`weights`] in the forward's arithmetic, `forward`, and, when the products of `arithmetic` read
+/// them in bfloat16, their bfloat16 copy written in the same pass ([`Device::softmax_rows_bf16`]).
+fn weights_and_half(d: &Device, heads: &Heads, (q, k): (&Tensor, &Tensor), batch: usize, (forward, arithmetic): (Arithmetic, Arithmetic)) -> Result<(Tensor, Option<Tensor>), GpuError> {
+    let length = k.rows() / batch;
+    let mut scores = d.empty(q.rows(), length)?;
+    d.gemm_batched(batch, &mut scores, heads.scale, q, Op::N, k, Op::T, 0.0, forward)?;
+    if arithmetic == Arithmetic::Bf16 && scores.storage() == Storage::F32 {
+        let half = d.softmax_rows_bf16(&mut scores, heads.causal)?;
+        return Ok((scores, Some(half)));
+    }
+    d.softmax_rows(&mut scores, heads.causal)?;
+    Ok((scores, None))
+}
+
+/// Turned heads of `x` ([`Device::split_heads`]) in f32 for the weights and, when the products of
+/// `arithmetic` read them in bfloat16, written rounded in the same pass
+/// ([`Device::split_heads_both`]).
+fn halves(d: &Device, x: &Tensor, (start, heads, width, blocks): (usize, usize, usize, usize), turn: Turn<'_>, arithmetic: Arithmetic) -> Result<(Tensor, Option<Tensor>), GpuError> {
+    if arithmetic == Arithmetic::Bf16 && x.storage() == Storage::F32 {
+        let (wide, half) = d.split_heads_both(x, start, heads, width, blocks, turn, false)?;
+        return Ok((wide, Some(half)));
+    }
+    Ok((d.split_heads(x, start, heads, width, blocks, turn, false)?, None))
+}
+
 /// `P = x Wᵀ` plus the stacked biases, `x` the input's value (module note).
 pub(crate) fn project(d: &Device, heads: &Heads, stacked: &Stacked, x: &Tensor, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
     let mut p = d.empty(x.rows(), heads.columns())?;
@@ -466,19 +491,23 @@ fn backward_by(
     for first in (0..heads.keys).step_by(step) {
         let n = step.min(heads.keys - first);
         let batch = blocks * n;
-        let (q, k, v) = split(d, heads, (qk, p), (first, n), blocks, turn, arithmetic)?;
+        // The queries, keys and weights in f32 for the weights' recomputation and the softmax's
+        // cotangent, and as the products read them.
+        let (q, q_half) = halves(d, qk, (first * g * w, n * g, w, blocks), turn, arithmetic)?;
+        let (k, k_half) = halves(d, qk, ((heads.heads + first) * w, n, w, blocks), turn, arithmetic)?;
+        let v = split_operand(d, p, ((heads.heads + heads.keys + first) * w, n, w, blocks), arithmetic)?;
         let cot = split_operand(d, g_a, (first * g * w, n * g, w, blocks), arithmetic)?;
-        let alpha = weights(d, heads, (&q, &k), batch, forward)?;
+        let (alpha, alpha_half) = weights_and_half(d, heads, (&q, &k), batch, (forward, arithmetic))?;
         let mut dalpha = d.empty(alpha.rows(), alpha.cols())?;
         d.gemm_batched(batch, &mut dalpha, 1.0, &cot, Op::N, &v, Op::T, 0.0, arithmetic)?;
         let mut gv = d.empty(v.rows(), w)?;
-        d.gemm_batched(batch, &mut gv, 1.0, &alpha, Op::T, &cot, Op::N, 0.0, arithmetic)?;
+        d.gemm_batched(batch, &mut gv, 1.0, alpha_half.as_ref().unwrap_or(&alpha), Op::T, &cot, Op::N, 0.0, arithmetic)?;
         let ds = if arithmetic == Arithmetic::Bf16 && alpha.storage() == Storage::F32 { d.softmax_backward_bf16(&alpha, &dalpha)? } else { d.softmax_backward(&alpha, &dalpha)? };
-        drop((alpha, dalpha));
+        drop((alpha, alpha_half, dalpha));
         let mut gq = d.empty(q.rows(), w)?;
-        d.gemm_batched(batch, &mut gq, heads.scale, &ds, Op::N, &k, Op::N, 0.0, arithmetic)?;
+        d.gemm_batched(batch, &mut gq, heads.scale, &ds, Op::N, k_half.as_ref().unwrap_or(&k), Op::N, 0.0, arithmetic)?;
         let mut gk = d.empty(k.rows(), w)?;
-        d.gemm_batched(batch, &mut gk, heads.scale, &ds, Op::T, &q, Op::N, 0.0, arithmetic)?;
+        d.gemm_batched(batch, &mut gk, heads.scale, &ds, Op::T, q_half.as_ref().unwrap_or(&q), Op::N, 0.0, arithmetic)?;
         let target = g_g.as_mut().unwrap_or(&mut g_p);
         d.merge_heads(&gq, target, first * g * w, n * g, blocks, turn, true)?;
         d.merge_heads(&gk, target, (heads.heads + first) * w, n, blocks, turn, true)?;

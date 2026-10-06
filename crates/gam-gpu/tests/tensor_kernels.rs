@@ -199,12 +199,23 @@ fn bf16_outputs_match_their_copies(d: &Device) {
             let split = d.split_heads_bf16(&x, 4, heads, width, blocks, turn, inverse).unwrap();
             let expected = d.bf16_copy(&d.split_heads(&x, 4, heads, width, blocks, turn, inverse).unwrap()).unwrap();
             assert_eq!(down(d, &split), down(d, &expected), "{} split {what}, inverse {inverse}", d.name());
+            let (wide, half) = d.split_heads_both(&x, 4, heads, width, blocks, turn, inverse).unwrap();
+            assert_eq!(down(d, &wide), down(d, &d.split_heads(&x, 4, heads, width, blocks, turn, inverse).unwrap()), "{} both splits' f32 {what}", d.name());
+            assert_eq!(down(d, &half), down(d, &expected), "{} both splits' bfloat16 {what}", d.name());
         }
     }
     let (alpha, cot) = (up(d, &matrix(7, 19, 34, 1.0)), up(d, &matrix(7, 19, 35, 3.0)));
     let map = d.softmax_backward_bf16(&alpha, &cot).unwrap();
     let expected = d.bf16_copy(&d.softmax_backward(&alpha, &cot).unwrap()).unwrap();
     assert_eq!(down(d, &map), down(d, &expected), "{} softmax backward", d.name());
+    for causal in [false, true] {
+        let mut scores = up(d, &matrix(12, 6, 36, 2.0));
+        let half = d.softmax_rows_bf16(&mut scores, causal).unwrap();
+        let mut expected = up(d, &matrix(12, 6, 36, 2.0));
+        d.softmax_rows(&mut expected, causal).unwrap();
+        assert_eq!(down(d, &scores), down(d, &expected), "{} softmax, causal {causal}", d.name());
+        assert_eq!(down(d, &half), down(d, &d.bf16_copy(&expected).unwrap()), "{} softmax's bfloat16 copy, causal {causal}", d.name());
+    }
 }
 
 #[test]

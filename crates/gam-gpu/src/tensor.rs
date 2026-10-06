@@ -563,6 +563,24 @@ fn float64_only(what: &str, tensors: &[&Tensor]) -> Result<(), GpuError> {
     Ok(())
 }
 
+/// A split of `heads` heads of `width` from column `start` of `x` in `blocks` sequences, turned by
+/// `turn` ([`Device::split_heads`]): its sequences' length and the rotation's planes.
+#[cfg(target_os = "linux")]
+fn split_shape(x: &Tensor, (start, heads, width, blocks): (usize, usize, usize, usize), turn: Option<(&Tensor, &Tensor, bool)>) -> Result<(usize, usize), GpuError> {
+    let rows = x.rows;
+    if blocks == 0 || rows % blocks != 0 || start.checked_add(heads.saturating_mul(width)).is_none_or(|end| end > x.cols) {
+        return Err(shape(format!("{heads} heads of {width} from column {start} of {:?} in {blocks} blocks", x.dim())));
+    }
+    let planes = turn.map_or(0, |(cos, _, _)| cos.cols);
+    if let Some((cos, sin, _)) = turn {
+        same(cos, sin, "rotation tables")?;
+        if cos.rows != rows || 2 * planes > width {
+            return Err(shape(format!("{:?} rotation tables on {rows} rows of {width}-wide heads", cos.dim())));
+        }
+    }
+    Ok((rows / blocks, planes))
+}
+
 /// Rows `at..at + rows` and `from..from + rows` lie in `t` and apart.
 fn apart(t: &Tensor, at: usize, from: usize, rows: usize) -> Result<(), GpuError> {
     if at + rows > t.rows || from + rows > t.rows || (at < from + rows && from < at + rows) {
@@ -1509,6 +1527,24 @@ impl Device {
         self.softmax_rows_impl(scores, causal, 0, width)
     }
 
+    /// [`Device::softmax_rows`] with its bfloat16 copy written in the same pass, each value the one
+    /// [`Device::bf16_copy`] makes of the f32 weights. CUDA f32 storage; elsewhere the softmax and
+    /// its copy.
+    pub fn softmax_rows_bf16(&self, scores: &mut Tensor, causal: bool) -> Result<Tensor, GpuError> {
+        let width = scores.cols;
+        if width == 0 || (causal && scores.rows % width != 0) {
+            return Err(shape(format!("attention scores {:?} are not square blocks", scores.dim())));
+        }
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if scores.storage() == Storage::F32 => engine.softmax_rows_bf16(scores, causal, width),
+            _ => {
+                self.softmax_rows(scores, causal)?;
+                self.bf16_copy(scores)
+            }
+        }
+    }
+
     /// Softmax of a rectangular query tile against a sequence's keys, preserving its causal
     /// offset. Noncausal rows can have any batch/vocabulary shape.
     pub fn softmax_rows_offset(&self, scores: &mut Tensor, causal: bool, start: usize) -> Result<(), GpuError> {
@@ -2343,20 +2379,29 @@ impl Device {
         match &*self.backend {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) if x.storage() == Storage::F32 => {
-                let rows = x.rows;
-                if blocks == 0 || rows % blocks != 0 || start.checked_add(heads.saturating_mul(width)).is_none_or(|end| end > x.cols) {
-                    return Err(shape(format!("{heads} heads of {width} from column {start} of {:?} in {blocks} blocks", x.dim())));
-                }
-                let planes = turn.map_or(0, |(cos, _, _)| cos.cols);
-                if let Some((cos, sin, _)) = turn {
-                    same(cos, sin, "rotation tables")?;
-                    if cos.rows != rows || 2 * planes > width {
-                        return Err(shape(format!("{:?} rotation tables on {rows} rows of {width}-wide heads", cos.dim())));
-                    }
-                }
-                engine.split_heads_bf16(x, (start, heads, width, rows / blocks, planes), turn, inverse)
+                let (length, planes) = split_shape(x, (start, heads, width, blocks), turn)?;
+                Ok(engine.split_halves(x, (start, heads, width, length, planes), turn, inverse, false)?.1)
             }
             _ => self.bf16_copy(&self.split_heads(x, start, heads, width, blocks, turn, inverse)?),
+        }
+    }
+
+    /// [`Device::split_heads`] written twice in one pass, in f32 and in bfloat16 (each bfloat16
+    /// value the one [`Device::bf16_copy`] makes of the f32 split), for an operand read both ways:
+    /// `(f32, bfloat16)`. CUDA f32 storage; elsewhere the split and its copy.
+    pub fn split_heads_both(&self, x: &Tensor, start: usize, heads: usize, width: usize, blocks: usize, turn: Option<(&Tensor, &Tensor, bool)>, inverse: bool) -> Result<(Tensor, Tensor), GpuError> {
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if x.storage() == Storage::F32 => {
+                let (length, planes) = split_shape(x, (start, heads, width, blocks), turn)?;
+                let (wide, half) = engine.split_halves(x, (start, heads, width, length, planes), turn, inverse, true)?;
+                Ok((wide.ok_or_else(|| shape("a split without its f32 values".to_string()))?, half))
+            }
+            _ => {
+                let split = self.split_heads(x, start, heads, width, blocks, turn, inverse)?;
+                let half = self.bf16_copy(&split)?;
+                Ok((split, half))
+            }
         }
     }
 
@@ -5802,12 +5847,14 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             Ok(out)
         }
 
-        /// [`super::Device::split_heads_bf16`]: `heads_permute`'s split written in bfloat16.
-        pub(super) fn split_heads_bf16(&self, x: &Tensor, (start, heads, width, length, planes): (usize, usize, usize, usize, usize), turn: Option<(&Tensor, &Tensor, bool)>, inverse: bool) -> Result<Tensor, GpuError> {
+        /// [`super::Device::split_heads_bf16`] and, `wide`, [`super::Device::split_heads_both`]:
+        /// `heads_permute`'s split written in bfloat16, and in f32 too when `wide`.
+        pub(super) fn split_halves(&self, x: &Tensor, (start, heads, width, length, planes): (usize, usize, usize, usize, usize), turn: Option<(&Tensor, &Tensor, bool)>, inverse: bool, wide: bool) -> Result<(Option<Tensor>, Tensor), GpuError> {
             let rows = x.rows;
             let mut out = self.unset16(rows * heads, width)?;
+            let mut full = if wide { Some(self.output(Storage::F32, rows * heads, width)?) } else { None };
             if rows == 0 || heads == 0 || width == 0 {
-                return Ok(out);
+                return Ok((full, out));
             }
             let n = (rows * heads * width) as u64;
             let half_split = i32::from(turn.is_some_and(|(_, _, h)| h));
@@ -5815,13 +5862,13 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             let sign: f64 = if inverse { -1.0 } else { 1.0 };
             // Without a rotation the tables are never read; `x` stands in for them.
             let (cos, sin) = turn.map_or((x, x), |(c, s, _)| (c, s));
-            let f = self.kernel("heads_permute_bf16", Storage::F32)?;
+            let f = self.kernel(if wide { "heads_permute_both" } else { "heads_permute_bf16" }, Storage::F32)?;
             let Data::CudaBf16(o) = &mut out.data else { return Err(shape("a bfloat16 output".to_string())) };
             // SAFETY: shapes checked by the caller: `x` holds `rows × cols` f32 values, the tables
             // `rows × planes` when `planes > 0`, and the output `rows·heads·width` halves.
             unsafe {
-                self.stream
-                    .launch_builder(&f)
+                let mut builder = self.stream.launch_builder(&f);
+                builder
                     .arg(&rows32)
                     .arg(&cols)
                     .arg(&start)
@@ -5833,12 +5880,26 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                     .arg(&sign)
                     .input(x, Storage::F32)?
                     .input(cos, Storage::F32)?
-                    .input(sin, Storage::F32)?
-                    .arg(o)
-                    .launch(cfg_elements(n))
+                    .input(sin, Storage::F32)?;
+                if let Some(full) = full.as_mut() {
+                    builder.output(full, Storage::F32)?;
+                }
+                builder.arg(o).launch(cfg_elements(n))
             }
             .gpu_ctx("tensor split_heads_bf16")?;
-            Ok(out)
+            Ok((full, out))
+        }
+
+        pub(super) fn softmax_rows_bf16(&self, scores: &mut Tensor, causal: bool, period: usize) -> Result<Tensor, GpuError> {
+            let mut half = self.unset16(scores.rows, scores.cols)?;
+            let (rows, width, causal, start, period) = (scores.rows as u32, scores.cols as u32, i32::from(causal), 0u32, period as u32);
+            let f = self.kernel("softmax_rows_bf16", Storage::F32)?;
+            let launch = cfg_rows(scores.rows);
+            let Data::CudaBf16(h) = &mut half.data else { return Err(shape("a bfloat16 output".to_string())) };
+            // SAFETY: one block per row of a rows × width f32 buffer and a bfloat16 one of its shape.
+            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(&causal).arg(&start).arg(&period).output(scores, Storage::F32)?.arg(h).launch(launch) }
+                .gpu_ctx("tensor softmax_rows_bf16")?;
+            Ok(half)
         }
 
         pub(super) fn softmax_backward(&self, alpha: &Tensor, d: &Tensor) -> Result<Tensor, GpuError> {
