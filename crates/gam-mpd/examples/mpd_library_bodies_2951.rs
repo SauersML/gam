@@ -1,8 +1,8 @@
-//! Reusable rule bodies found from flows and decided by the code length
-//! (`gam_mpd::library_bodies`, #2951).
+//! Reusable rule bodies found from the library's own parameters and decided by the code length
+//! (`gam_mpd::library_bodies`, `gam_mpd::library_crossing`, #2951).
 //!
-//! gate OUT
-//! model EXPORT SETTINGS.json FROM OUT host|gpu
+//! gate OUT [SCOREBOARD.tsv]
+//! model EXPORT SETTINGS.json FROM OUT host|gpu [SCOREBOARD.tsv]
 //!
 //! `gate` is the fast regression gate: a toy decoder (two layers, width 16, 32 GELU units per MLP,
 //! 48 tokens; 4096 training and 32 held-out sequences of 16 random tokens) whose MLPs both
@@ -15,13 +15,15 @@
 //!
 //! The method, each fit to convergence on the same fixed native experiments:
 //! 1. the library is fitted (OUT/base);
-//! 2. among each MLP's functions carrying RelP flow at the library's start on the selection
-//!    sequences (`library_readout`), the regions are the groups whose rewrite saves parameters at
-//!    the posterior's resolution (`library_bodies::regions`). The selection sequences are the first
-//!    training sequences, as many as the held-out ones: the structure is chosen on training data,
-//!    so the held-out sequences only report;
-//! 3. every region is rewritten as a call of its own body from the fitted library
-//!    (`library_bodies::rewrite`) and fitted (OUT/rewritten);
+//! 2. among each MLP's functions in the explanation where it starts (`M`'s, or a checkpoint's
+//!    survivors), the regions are the groups a count of the parameters a rewrite saves at the
+//!    posterior's resolution expects to save (`library_bodies::regions`, which lists every
+//!    candidate; the others are recorded and not proposed), and, of the functions left, those
+//!    reading only one head's writes (`library_crossing::regions_through`: a head and the
+//!    functions it feeds, across the attention/MLP boundary);
+//! 3. every region is rewritten as a call of its own body from the same start
+//!    (`library_bodies::rewrite`), a region through a head reading through it
+//!    (`library_crossing::read_through`), and fitted (OUT/rewritten);
 //! 4. reuse by gradient: the library is fitted with the mixture prior over bodies
 //!    (`library_bodies::BodyMixture`; OUT/soft{n}), each dominant component is compiled by a merge
 //!    (`library_bodies::merge`), and the merged library is fitted (OUT/merged{n}) and kept when its
@@ -33,15 +35,17 @@
 //!
 //! OUT/SUMMARY.json: per stage `F` and the held-out evaluation (KL per token by experiment family),
 //! the regions, the bodies with their calls and the native functions each replaced, the alignments
-//! and every decision; for the gate, where the planted units are.
+//! and every decision; per call the heads whose writes its reads take in and its reads and writes in
+//! token terms; for the gate, where the planted units are. With SCOREBOARD.tsv each fitted stage
+//! appends a row to it (agent "bodies").
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     engine::{log_to_stderr, sha256},
     import::import_language_model,
     library_bodies::{self, Call},
+    library_crossing,
     library_mdl::{self, Explanation, Fit},
-    library_mixture, library_readout,
-    library_sharing,
+    library_mixture, library_sharing,
     operator_program::{OperatorProgram, SlotValues},
     run_check::{LayerNodes, layer_nodes, split_sites},
 };
@@ -49,10 +53,7 @@ use ndarray::Array2;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -168,15 +169,11 @@ fn toy(dir: &Path) -> Result<[Vec<usize>; 2], String> {
     Ok(sites)
 }
 
-/// A function of the explanation in the flows: a head or an MLP function of a layer.
-#[derive(Clone, Copy, Debug, serde::Serialize)]
-enum Function {
-    Head { layer: usize, head: usize },
-    Mlp { layer: usize, function: usize },
-}
-
 /// One run of the method: the native model, its sequences, the fit's settings and the output.
 struct Run {
+    /// The model's name in the scoreboard, and the scoreboard a fitted stage appends its row to.
+    model: String,
+    scoreboard: Option<PathBuf>,
     device: Device,
     native: OperatorProgram,
     layers: Vec<LayerNodes>,
@@ -199,6 +196,36 @@ fn stage(name: &str, fit: &Fit) -> Value {
     })
 }
 
+/// A row of the scoreboard (`SCOREBOARD.tsv`, e.g. ~/mpd-data/scoreboard/accuracy.tsv) for a fitted stage (its columns: time, commit,
+/// agent, model, training tokens, optimizer, epoch, wall hours, held-out F per token, P alone's KL
+/// per token, description bits, surviving groups, decoded KL per token, note).
+fn scoreboard(run: &Run, model: &str, name: &str, fit: &Fit) -> Result<(), String> {
+    let Some(path) = &run.scoreboard else { return Ok(()) };
+    let end = serde_json::to_value(&fit.report.end).map_err(error)?;
+    let number = |key: &str| end[key].as_f64().map_or("".to_string(), |v| format!("{v}"));
+    let alone = end["clean"].as_array().and_then(|c| c.last()).and_then(Value::as_f64).map_or("".to_string(), |v| format!("{v}"));
+    let description = ["divergence_bits", "variance_bits", "choice_bits", "prior_bits"].iter().filter_map(|k| end[*k].as_f64()).sum::<f64>();
+    let time = std::process::Command::new("date").arg("-u").arg("+%Y-%m-%dT%H:%M:%SZ").output().map_err(error)?;
+    let row = [
+        String::from_utf8_lossy(&time.stdout).trim().to_string(),
+        option_env!("GAM_BUILD_GIT_SHA").unwrap_or("").to_string(),
+        "bodies".to_string(),
+        model.to_string(),
+        fit.report.scored_tokens.to_string(),
+        "ivon".to_string(),
+        fit.report.epochs.len().to_string(),
+        format!("{:.3}", fit.report.seconds / 3600.0),
+        number("objective_bits_per_token"),
+        alone,
+        format!("{description}"),
+        fit.report.active_groups.to_string(),
+        number("rounded_bits_per_token"),
+        format!("bodies {name} {}", run.out.display()),
+    ];
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    std::io::Write::write_all(&mut file, format!("{}\n", row.join("\t")).as_bytes()).map_err(error)
+}
+
 impl Run {
     /// `explanation` fitted to convergence in OUT/`name` (resumed from its checkpoint there).
     fn fit(&self, name: &str, explanation: &Explanation) -> Result<Fit, String> {
@@ -213,65 +240,8 @@ impl Run {
         library_mdl::check_checkpoint(&checkpoint, &library_mdl::identity(&self.digest, &self.native, explanation, &self.train, &self.held))?;
         let fit = library_mdl::fit(&self.device, &self.native, explanation, &self.train, &self.held, &self.fit, &self.digest, Some(&checkpoint), prior)?;
         save(&dir.join("REPORT.json"), &serde_json::to_value(&fit.report).map_err(error)?)?;
+        scoreboard(self, &self.model, name, &fit)?;
         Ok(fit)
-    }
-
-    /// The sequences the structure is chosen on (module note): the first training sequences, as
-    /// many as the held-out ones.
-    fn selection(&self) -> &[Vec<u32>] {
-        &self.train[..self.held.len().min(self.train.len())]
-    }
-
-    /// The RelP flows among the functions of `explanation` as it stands (its artifact's values) on
-    /// the selection sequences: `flows[t][s]` from `s` to `t` among the functions with any flow.
-    fn flows(&self, explanation: &Explanation) -> Result<(Array2<f64>, Vec<Function>), String> {
-        let selection = self.selection();
-        let length = selection.first().ok_or("no selection sequences")?.len();
-        let artifact = &explanation.artifact;
-        let all: usize = explanation.layers.iter().map(|l| l.heads.len() + l.functions.len()).sum();
-        let settings = library_readout::Settings {
-            batch_sequences: self.fit.batch_sequences,
-            numeric_bytes: self.fit.numeric_bytes,
-            tile_rows: self.fit.head_tile_rows,
-            contexts: 1,
-            tokens: 1,
-            edges: all,
-            candidates: all,
-            core: 0,
-            thresholds: vec![1.0],
-            targets: length,
-        };
-        let library = library_readout::Library::new(&self.device, &self.device, &self.native, &self.layers, artifact, settings.numeric_bytes, settings.tile_rows)?;
-        let readout = library_readout::read_out(&library, selection, &settings)?;
-        let parse = |name: &str, layer: usize| -> Result<Function, String> {
-            let (_, rest) = name.split_once('.').ok_or_else(|| format!("function name {name}"))?;
-            let index = |s: &str| s.parse::<usize>().map_err(|e| format!("function name {name}: {e}"));
-            match (rest.strip_prefix('H'), rest.strip_prefix('M')) {
-                (Some(h), _) => Ok(Function::Head { layer, head: index(h)? }),
-                (_, Some(m)) => Ok(Function::Mlp { layer, function: index(m)? }),
-                _ => Err(format!("function name {name}")),
-            }
-        };
-        let mut index: BTreeMap<usize, usize> = BTreeMap::new();
-        for (t, f) in readout.functions.iter().enumerate() {
-            for edge in &f.inputs {
-                for v in [t, edge.from] {
-                    let next = index.len();
-                    index.entry(v).or_insert(next);
-                }
-            }
-        }
-        let mut flows = Array2::zeros((index.len(), index.len()));
-        let mut functions = vec![Function::Head { layer: 0, head: 0 }; index.len()];
-        for (&v, &at) in &index {
-            functions[at] = parse(&readout.functions[v].name, readout.functions[v].layer)?;
-        }
-        for (t, f) in readout.functions.iter().enumerate() {
-            for edge in &f.inputs {
-                flows[[index[&t], index[&edge.from]]] += edge.flow;
-            }
-        }
-        Ok((flows, functions))
     }
 }
 
@@ -292,40 +262,52 @@ fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior
     };
     let fitted = run.fit("base", &base)?;
     record(&mut summary, "stages", stage("base", &fitted))?;
-    // The functions carrying flow where the library starts, and among each MLP's the regions at the
-    // start's posterior.
+    // Among each MLP's functions in the explanation where it starts, the regions at the start's
+    // posterior; of the functions left, those reading through one head.
     let posterior = match posterior {
         Some(posterior) => posterior,
         None => library_mdl::Posterior::new(&base, fitted.report.scored_tokens)?,
     };
-    let (flows, functions) = run.flows(&base)?;
-    save(&run.out.join("FLOWS.json"), &json!({"functions": functions, "flows": flows.outer_iter().map(|r| r.to_vec()).collect::<Vec<_>>()}))?;
-    let mut regions = Vec::new();
+    let (mut regions, mut candidates, mut through) = (Vec::new(), Vec::new(), Vec::new());
     for l in 0..run.layers.len() {
-        let pool: Vec<usize> = functions
-            .iter()
-            .filter_map(|f| match f {
-                Function::Mlp { layer, function } if *layer == l => Some(*function),
-                Function::Mlp { .. } | Function::Head { .. } => None,
-            })
-            .collect();
-        regions.extend(library_bodies::regions(&base, &posterior, l, &pool)?.into_iter().map(|r| (l, r)));
+        let pool: Vec<usize> = (0..base.layers[l].functions.len()).filter(|i| base.layers[l].functions[*i].iter().all(|g| posterior.active[*g])).collect();
+        let mut taken = Vec::new();
+        for (region, saving) in library_bodies::regions(&base, &posterior, l, &pool)? {
+            candidates.push(json!({"layer": l, "functions": region, "saving": saving}));
+            if saving > 0.0 {
+                taken.extend(region.iter().copied());
+                regions.push((l, region));
+            }
+        }
+        let rest: Vec<usize> = pool.into_iter().filter(|i| !taken.contains(i)).collect();
+        let writers = library_crossing::writers(&run.native, &run.layers, l)?;
+        for (w, region) in library_crossing::regions_through(&base, &posterior, &writers, l, &rest)? {
+            through.push((l, writers[w].clone(), writers.len(), region));
+        }
     }
-    log::info!("bodies: {} regions among {} functions carrying flow: {regions:?}", regions.len(), functions.len());
+    summary["candidates"] = json!(candidates);
+    summary["through"] = json!(through.iter().map(|(l, w, _, r)| json!({"layer": l, "head": [w.layer, w.head], "functions": r})).collect::<Vec<_>>());
+    log::info!("bodies: {} regions and {} regions through a head", regions.len(), through.len());
     summary["regions"] = json!(regions);
     if let Some(planted) = planted {
         summary["planted"] = json!(planted);
     }
     save(&run.out.join("SUMMARY.json"), &summary)?;
-    if regions.is_empty() {
+    if regions.is_empty() && through.is_empty() {
         return Ok(());
     }
-    // Every region rewritten as a call of its own body, from the same start.
+    // Every region rewritten as a call of its own body, from the same start; a region through a
+    // head reads through it.
     let mut rewritten = base;
     let mut calls: Vec<Call> = Vec::new();
     for (layer, region) in &regions {
         let (next, call) = library_bodies::rewrite(&rewritten, *layer, region)?;
         rewritten = next;
+        calls.push(call);
+    }
+    for (layer, writer, choices, region) in &through {
+        let (next, call) = library_bodies::rewrite(&rewritten, *layer, region)?;
+        rewritten = library_crossing::read_through(&next, &call, writer, *choices)?;
         calls.push(call);
     }
     rewritten.artifact.validate_coverage(&run.native)?;
@@ -373,32 +355,28 @@ fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior
         return Ok(());
     }
     summary["calls"] = json!(calls);
-    // The evidence for each call: the functions whose flows enter and leave its region (RelP flows
-    // at the start), and its reads and writes in token terms at the accepted explanation.
-    let name = |f: &Function| match f {
-        Function::Head { layer, head } => format!("L{layer}.H{head}"),
-        Function::Mlp { layer, function } => format!("L{layer}.M{function}"),
-    };
+    // The evidence for each call: the share of its reads that each head's writes take in (the
+    // read binding's rows projected on the head's columns `H H⁺`; a call through a head reads it
+    // alone), and its reads and writes in token terms at the accepted explanation.
     let mut evidence = Vec::new();
     for call in &calls {
-        let inside: Vec<usize> = (0..functions.len())
-            .filter(|&v| matches!(functions[v], Function::Mlp { layer, function } if layer == call.layer && call.replaced.iter().any(|(f, _)| *f == function)))
-            .collect();
-        let mut into: BTreeMap<String, f64> = BTreeMap::new();
-        let mut out_of: BTreeMap<String, f64> = BTreeMap::new();
-        for &v in &inside {
-            for u in (0..functions.len()).filter(|u| !inside.contains(u)) {
-                *into.entry(name(&functions[u])).or_default() += flows[[v, u]].abs();
-                *out_of.entry(name(&functions[u])).or_default() += flows[[u, v]].abs();
+        let program = &explanation.artifact.program;
+        let named = |name: String| program.operators.iter().find(|op| op.name == name).map(|op| op.matrix()).ok_or(format!("no operator {name}"));
+        let read = named(format!("{}.read", call.name))?;
+        let mut shares: Vec<(String, f64)> = Vec::new();
+        match through.iter().find(|(l, _, _, region)| *l == call.layer && call.replaced.iter().map(|(f, _)| *f).eq(region.iter().copied())) {
+            Some((_, w, _, _)) => shares.push((format!("L{}.H{}", w.layer, w.head), 1.0)),
+            None => {
+                let total = read.iter().map(|v| v * v).sum::<f64>();
+                for w in library_crossing::writers(&run.native, &run.layers, call.layer)? {
+                    let projected = read.dot(&w.writes).dot(&gam_linalg::decompose::pseudo_inverse(w.writes.view()).map_err(error)?);
+                    shares.push((format!("L{}.H{}", w.layer, w.head), projected.iter().map(|v| v * v).sum::<f64>() / total));
+                }
+                shares.sort_by(|a, b| b.1.total_cmp(&a.1));
+                shares.truncate(4);
             }
         }
-        let strongest = |m: BTreeMap<String, f64>| {
-            let mut v: Vec<(String, f64)> = m.into_iter().filter(|(_, f)| *f > 0.0).collect();
-            v.sort_by(|a, b| b.1.total_cmp(&a.1));
-            v.truncate(8);
-            v
-        };
-        evidence.push(json!({"call": call.name, "body": call.body, "layer": call.layer, "flow_in": strongest(into), "flow_out": strongest(out_of)}));
+        evidence.push(json!({"call": call.name, "body": call.body, "layer": call.layer, "heads": shares}));
     }
     summary["evidence"] = json!(evidence);
     summary["readings"] = json!(library_bodies::describe(&run.native, &run.layers, &explanation, &calls, 8)?);
@@ -410,7 +388,11 @@ fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("gate") => {
-            let [_, out] = &args[..] else { return Err("gate OUT".into()) };
+            let (out, scoreboard) = match &args[..] {
+                [_, out] => (out, None),
+                [_, out, board] => (out, Some(PathBuf::from(board))),
+                _ => return Err("gate OUT [SCOREBOARD.tsv]".into()),
+            };
             let out = Path::new(out);
             let planted = toy(&out.join("toy"))?;
             let imported = import_language_model(&out.join("toy"), ROWS, CONTEXT)?;
@@ -428,6 +410,8 @@ fn main() -> Result<(), String> {
             };
             let base = library_mdl::explanation(&native, &layers)?;
             let run = Run {
+                model: "bodies toy".to_string(),
+                scoreboard,
                 device: Device::host(),
                 digest: sha256(&out.join("toy").join("export.json"))?,
                 train: sequences[..ROWS - 32].to_vec(),
@@ -440,8 +424,10 @@ fn main() -> Result<(), String> {
             method(&run, base, None, Some(&planted))
         }
         Some("model") => {
-            let [_, export, settings_path, from, out, mode] = &args[..] else {
-                return Err("model EXPORT SETTINGS.json native|checkpoint:PATH OUT host|gpu".into());
+            let (export, settings_path, from, out, mode, scoreboard) = match &args[..] {
+                [_, export, settings, from, out, mode] => (export, settings, from, out, mode, None),
+                [_, export, settings, from, out, mode, board] => (export, settings, from, out, mode, Some(PathBuf::from(board))),
+                _ => return Err("model EXPORT SETTINGS.json native|checkpoint:PATH OUT host|gpu [SCOREBOARD.tsv]".into()),
             };
             let (export, out) = (Path::new(export), Path::new(out));
             let settings: Settings = serde_json::from_slice(&std::fs::read(settings_path).map_err(error)?).map_err(error)?;
@@ -472,6 +458,7 @@ fn main() -> Result<(), String> {
             let (base, posterior) = match from.split_once(':') {
                 None if from == "native" => (start, None),
                 Some(("checkpoint", path)) => {
+                    // Entry by entry along the operators' own axes, as the bodies read it.
                     let posterior = library_mdl::checkpoint_posterior(&start, Path::new(path))?;
                     let mut base = library_sharing::warm(&start, &library_mdl::posterior_mean(&start, &posterior)?)?;
                     base.removed = (0..posterior.active.len()).filter(|g| !posterior.active[*g]).collect();
@@ -480,9 +467,10 @@ fn main() -> Result<(), String> {
                 _ => return Err("FROM is native or checkpoint:PATH".into()),
             };
             std::fs::create_dir_all(out).map_err(error)?;
-            let run = Run { device, native, layers, held: sequences[first..end].to_vec(), train, fit: settings.fit, digest: settings.export_sha256, out: out.to_path_buf() };
+            let model = export.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let run = Run { model, scoreboard, device, native, layers, held: sequences[first..end].to_vec(), train, fit: settings.fit, digest: settings.export_sha256, out: out.to_path_buf() };
             method(&run, base, posterior, None)
         }
-        _ => Err("gate OUT | model EXPORT SETTINGS.json FROM OUT host|gpu".into()),
+        _ => Err("gate OUT [SCOREBOARD.tsv] | model EXPORT SETTINGS.json FROM OUT host|gpu [SCOREBOARD.tsv]".into()),
     }
 }
