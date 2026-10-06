@@ -420,7 +420,6 @@ fn host_indices(i: &Indices) -> Result<&[u32], GpuError> {
 }
 
 /// Refuses f32 operands where an operation is float64 only (a certificate, an acceptance statistic).
-#[cfg(target_os = "linux")]
 fn float64_only(what: &str, tensors: &[&Tensor]) -> Result<(), GpuError> {
     if tensors.iter().any(|t| t.storage() != Storage::F64) {
         return Err(GpuError::NoDeviceKernel { reason: format!("{what} run in float64 only") });
