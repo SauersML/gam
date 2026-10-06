@@ -167,7 +167,7 @@ fn classes(device: &Device, decoder: &Decoder, sequences: usize, length: usize, 
         products.insert(format!("{arithmetic:?}"), classes);
     }
     let ranges: Vec<std::ops::Range<usize>> = (0..sequences).map(|i| i * length..(i + 1) * length).collect();
-    let (heads, _) = device.heads_rope(&device.zeros(rows, layout.columns()).map_err(error)?, layout, None, None, true).map_err(error)?;
+    let (heads, _) = device.heads_rope(&device.zeros(rows, layout.columns()).map_err(error)?, layout, None, None).map_err(error)?;
     let flops = 2.0 * 2.0 * rows as f64 * (length as f64 / 2.0) * layout.width as f64 * layout.queries as f64;
     let mut kept = None;
     let forward = median(device, reps, || {
@@ -181,9 +181,9 @@ fn classes(device: &Device, decoder: &Decoder, sequences: usize, length: usize, 
     let gain = device.upload_vec(1, d, vec![1.0; d]).map_err(error)?;
     let norm = median(device, reps, || device.rms_gain(&x, &gain, shape.epsilon, true).map(|_| ()).map_err(error))?;
     let p = device.zeros(rows, layout.columns()).map_err(error)?;
-    let rope = median(device, reps, || device.heads_rope(&p, layout, None, None, true).map(|_| ()).map_err(error))?;
+    let rope = median(device, reps, || device.heads_rope(&p, layout, None, None).map(|_| ()).map_err(error))?;
     let h = device.zeros(rows, shape.mlp_inputs).map_err(error)?;
-    let activation = median(device, reps, || if shape.gated { device.swiglu(&h, true) } else { device.gelu_tanh(&h, None, true) }.map(|_| ()).map_err(error))?;
+    let activation = median(device, reps, || if shape.gated { device.swiglu(&h) } else { device.gelu_tanh(&h, None) }.map(|_| ()).map_err(error))?;
     let bandwidth = |t: f64, bytes: usize| json!({"seconds": t, "gb_per_s": bytes as f64 / t / 1e9});
     Ok(json!({
         "rows": rows,

@@ -642,7 +642,7 @@ impl BlockEngine for Decoder {
                 let angles = rotary.map(|r| self.angles(r, ranges)).transpose()?;
                 let rotation = angles.as_ref().zip(rotary).map(|((c, s), r)| (c, s, r.half_split));
                 let norm = w.norms.as_ref().zip(a.norms.as_ref()).map(|(g, (_, e))| (g, *e));
-                let (heads, head_scales) = d.heads_rope(&p, a.layout, norm, rotation, true).map_err(error)?;
+                let (heads, head_scales) = d.heads_rope(&p, a.layout, norm, rotation).map_err(error)?;
                 // Each range is one sequence; the gathered rows hold them in order.
                 let sequences: Vec<Range<usize>> = ranges.iter().scan(0, |at, r| { *at += r.len(); Some(*at - r.len()..*at) }).collect();
                 let attended = d.causal_attention(&heads, a.layout, &sequences, a.scale).map_err(error)?;
@@ -653,7 +653,7 @@ impl BlockEngine for Decoder {
             Block::Mlp(m) => {
                 let mut pre = d.empty(x.rows(), m.input.rows).map_err(error)?;
                 d.gemm(&mut pre, 1.0, &read, Op::N, &w.input, Op::T, 0.0, arithmetic).map_err(error)?;
-                let active = if m.gated { d.swiglu(&pre, half) } else { d.gelu_tanh(&pre, w.bias.as_ref(), half) }.map_err(error)?;
+                let active = if m.gated { d.swiglu(&pre) } else { d.gelu_tanh(&pre, w.bias.as_ref()) }.map_err(error)?;
                 d.gemm(&mut out, 1.0, &active, Op::N, &w.output, Op::T, 1.0, arithmetic).map_err(error)?;
                 let last = match (&w.last, m.last) {
                     (Some(g), Some((_, e))) => {
@@ -707,7 +707,7 @@ impl BlockEngine for Decoder {
             (Block::Mlp(m), Inner::Mlp { out }) => {
                 let mut pre = d.empty(rows, m.input.rows).map_err(error)?;
                 d.gemm(&mut pre, 1.0, &tape.read, Op::N, &w.input, Op::T, 0.0, arithmetic).map_err(error)?;
-                let active = if m.gated { d.swiglu(&pre, half) } else { d.gelu_tanh(&pre, w.bias.as_ref(), half) }.map_err(error)?;
+                let active = if m.gated { d.swiglu(&pre) } else { d.gelu_tanh(&pre, w.bias.as_ref()) }.map_err(error)?;
                 if let (Some((residual, k)), Some(gain)) = (out, &w.last) {
                     let mut g_residual = d.zeros(rows, self.width).map_err(error)?;
                     d.rms_gain_backward((residual, gain, k), &g, &mut g_residual).map_err(error)?;
