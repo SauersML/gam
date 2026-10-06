@@ -1209,6 +1209,10 @@ pub struct Settings {
     pub numeric_bytes: usize,
     /// Rows of vocabulary logits formed at once.
     pub head_tile_rows: usize,
+    /// The preconditioner arm: each step's direction preconditioned along the operators' input
+    /// axes (`DevicePosterior::set_directions`). The A/B's outcome deletes this field.
+    #[serde(default)]
+    pub preconditioned: bool,
     /// When set, the fit ends once its epoch count (counted from `M`, a start's epochs included)
     /// reaches this, with no removal round: a comparison of arms at one budget of steps.
     #[serde(default)]
@@ -1229,6 +1233,8 @@ struct SettingsRecord {
     seed: u64,
     numeric_bytes: usize,
     head_tile_rows: usize,
+    #[serde(default)]
+    preconditioned: bool,
     #[serde(default)]
     epochs: Option<usize>,
     #[serde(default)]
@@ -1265,6 +1271,7 @@ impl From<SettingsRecord> for Settings {
             seed: r.seed,
             numeric_bytes: r.numeric_bytes,
             head_tile_rows: r.head_tile_rows,
+            preconditioned: r.preconditioned,
             epochs: r.epochs,
         }
     }
@@ -1281,6 +1288,68 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+/// Per trainable operator read by one input node as an affine term, with more than one column,
+/// the eigenvectors of that input's second moment `Σ x xᵀ` over `sequences` (`P` at `posterior`'s
+/// mean, accumulated on the device, decomposed in float64 on the host); operators reading one
+/// input share its matrix. The input side of the step's preconditioner
+/// (`DevicePosterior::set_directions`): an MLP's output map is included, its input the
+/// functions' activations.
+fn input_factors(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterior, sequences: &[Vec<u32>], settings: &Settings) -> Result<Vec<Option<Arc<Array2<f64>>>>, String> {
+    let sites: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+    let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
+    let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
+    let columns: Vec<usize> = posterior.mean.iter().map(Array2::ncols).collect();
+    let several: Vec<bool> = columns.iter().map(|c| *c > 1).collect();
+    // Each operator's input as an affine term; one read by different inputs takes none.
+    let mut inputs: Vec<Option<Option<usize>>> = vec![None; columns.len()];
+    for node in &flat.nodes {
+        if let Node::Affine { terms, .. } = node {
+            for (x, op) in terms {
+                if let Some(&i) = position.get(op) {
+                    inputs[i] = match inputs[i] {
+                        None => Some(Some(*x)),
+                        Some(Some(seen)) if seen == *x => Some(Some(seen)),
+                        _ => Some(None),
+                    };
+                }
+            }
+        }
+    }
+    let read: Vec<Option<usize>> = inputs.iter().zip(&several).map(|(input, several)| if *several { input.flatten() } else { None }).collect();
+    let mut nodes: Vec<usize> = read.iter().flatten().copied().collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+    if nodes.is_empty() {
+        return Ok(vec![None; columns.len()]);
+    }
+    scorer.experiments.load(&posterior.mean)?;
+    let program = scorer.experiments.models().1.program;
+    let device = program.device();
+    // `Σ x xᵀ` accumulates on the device in the program's arithmetic: any orthogonal `R` gives a
+    // valid posterior (its eigenvectors are taken in float64 from the downloaded sum), so the
+    // accumulation's rounding moves the axes, not the code length's validity.
+    let mut grams: BTreeMap<usize, Tensor> = BTreeMap::new();
+    for chunk in sequences.chunks(settings.batch_sequences) {
+        let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+        let trace = program.forward(&family)?;
+        for &node in &nodes {
+            let x = trace.value(node)?;
+            let gram = match grams.entry(node) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(device.zeros(x.cols(), x.cols()).map_err(error)?),
+            };
+            device.gemm(gram, 1.0, x, Op::T, x, Op::N, 1.0, program.arithmetic()).map_err(error)?;
+        }
+    }
+    let mut matrices: BTreeMap<usize, Arc<Array2<f64>>> = BTreeMap::new();
+    for (node, gram) in grams {
+        let gram = device.download(&gram).map_err(error)?;
+        let vectors = gam_linalg::decompose::eigh(gram.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(error)?.vectors;
+        matrices.insert(node, Arc::new(vectors));
+    }
+    Ok(read.iter().map(|node| node.map(|n| Arc::clone(&matrices[&n]))).collect())
 }
 
 /// One layer's survivors and activity on the held-out sequences at the posterior mean.
@@ -2700,6 +2769,13 @@ pub fn fit_from(
         device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, Some(State::Curvature(&curvature)), 0)?;
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
+    // The step's preconditioner along each operator's input axis (`DevicePosterior::set_directions`).
+    if settings.preconditioned {
+        let timed = Instant::now();
+        let factors = input_factors(&mut scorer, explanation, &posterior, sequences, settings)?;
+        device_posterior.set_directions(&factors)?;
+        log::info!("library input factors: {} operators, {:.1} s", factors.iter().flatten().count(), timed.elapsed().as_secs_f64());
+    }
     // The curvature estimate averages over one epoch's batches: each batch weighs about once.
     let ivon = Ivon { beta1: settings.beta1, beta2: 1.0 - 1.0 / draws.len() as f64 };
     // Each group's size, whose `½ ln |G|` an active group's variance costs.
@@ -3764,6 +3840,7 @@ mod tests {
             seed: 3,
             numeric_bytes: 1 << 26,
             head_tile_rows: 64,
+            preconditioned: false,
             epochs: None,
         }
     }
