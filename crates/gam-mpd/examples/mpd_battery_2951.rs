@@ -4,7 +4,11 @@
 //! EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT]
 //! EXPORT SETTINGS.json OUT.json host|gpu vpd DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu price DECOMPOSITION [START]
+//! EXPORT SETTINGS.json OUT.json host|gpu price_charged DECOMPOSITION [START]
 //! EXPORT SETTINGS.json OUT.json host|gpu masks DECOMPOSITION
+//!
+//! `price_charged` prices VPD's causal-importance network beside its subcomponents
+//! (`vpd_pricing` with `charge`).
 //!
 //! `masks` measures where VPD's masks come from (`explanation_battery::vpd_mask_sources`): held-out
 //! KL with masks from `M`'s activations, from them through a causal network, with every mask 1,
@@ -200,7 +204,7 @@ fn circuits(device: &Device, export: &Path, layers: &[gam_mpd::run_check::LayerN
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price DECOMPOSITION [START] | masks DECOMPOSITION";
+    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price|price_charged DECOMPOSITION [START] | masks DECOMPOSITION";
     let (export, settings_path, out, mode, kind, extra, more) = match &args[..] {
         [e, s, o, m, k] => (e, s, o, m, k.as_str(), None, None),
         [e, s, o, m, k, a] => (e, s, o, m, k.as_str(), Some(Path::new(a)), None),
@@ -280,7 +284,9 @@ fn main() -> Result<(), String> {
         log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
         return Ok(());
     }
-    if kind == "price" {
+    if kind == "price" || kind == "price_charged" {
+        // `price_charged` charges VPD's causal-importance network too.
+        let charge = (kind == "price_charged").then(|| extra.ok_or(usage)).transpose()?;
         let vpd = Vpd::new(&device, export, Decomposition::load(extra.ok_or(usage)?)?, settings.numeric_bytes)?;
         let train: Vec<Vec<u32>> = all_rows[..first].iter().chain(&all_rows[end..]).take(training).cloned().collect();
         if training == 0 || train.len() != training {
@@ -289,7 +295,7 @@ fn main() -> Result<(), String> {
         let mut progress = report.clone();
         // The converged posterior beside OUT; START, a posterior written so, starts the fit.
         let posterior = Path::new(out).with_extension("posterior.f32");
-        report["pricing"] = battery::vpd_pricing(&vpd, export, &train, bases, settings.batch_sequences, settings.seed, more, &posterior, |state| {
+        report["pricing"] = battery::vpd_pricing(&vpd, export, &train, bases, settings.batch_sequences, settings.seed, (more, charge), &posterior, |state| {
             progress["pricing"] = state.clone();
             save(&progress)
         })?;
@@ -393,7 +399,7 @@ fn main() -> Result<(), String> {
                     Some(Patch::Read { .. }) => 0,
                     Some(Patch::Reads { .. }) => 1,
                     // The battery draws no edits of parts.
-                    Some(Patch::Part { .. } | Patch::Head { .. } | Patch::Cut { .. } | Patch::Parts { .. } | Patch::Swap { .. } | Patch::PartFrom { .. } | Patch::HeadFrom { .. } | Patch::FixedPart { .. }) => continue,
+                    Some(Patch::Part { .. } | Patch::Head { .. } | Patch::Cut { .. } | Patch::Parts { .. } | Patch::Swap { .. } | Patch::PartFrom { .. } | Patch::HeadFrom { .. }) => continue,
                 };
                 per_source[family][s].0 += bits.iter().sum::<f64>();
                 per_source[family][s].1 += bits.len();
