@@ -257,7 +257,7 @@ fn removals(args: &[String]) -> Result<(), String> {
     let sequences: Vec<Vec<u32>> = tokens.chunks(settings.context).skip(first).map(<[u32]>::to_vec).collect();
     let library = Library::new(&model, &wide, &native, &layers, &artifact, settings.numeric_bytes, settings.tile_rows)?;
     let teacher = Teacher::new(&model, &native, settings.tile_rows, settings.numeric_bytes)?;
-    let effects = library.removal_effects(&native, &teacher, &sequences, settings.batch)?;
+    let effects = library.removal_effects(&teacher, &sequences, None, settings.batch)?;
     let functions: Vec<Value> = library
         .functions()
         .iter()
@@ -342,9 +342,10 @@ fn main() -> Result<(), String> {
     let (native, layers, tokens, artifact) = load(export, end, settings.context, artifact_path)?;
     let sequences: Vec<Vec<u32>> = tokens.chunks(settings.context).skip(first).map(<[u32]>::to_vec).collect();
     let library = Library::new(&model, &wide, &native, &layers, &artifact, settings.readout.numeric_bytes, settings.readout.tile_rows)?;
-    // The library holds what the read-out reads; the programs it came from go.
+    let teacher = Teacher::new(&model, &native, settings.readout.tile_rows, settings.readout.numeric_bytes)?;
+    // The library and the teacher hold what the read-out reads; the programs they came from go.
     drop((native, layers, artifact));
-    let readout = library_readout::read_out(&library, &sequences, &settings.readout)?;
+    let readout = library_readout::read_out(&library, &teacher, &sequences, &settings.readout)?;
     let vocabulary = Vocabulary::from_tokenizer(Path::new(tokenizer))?;
     let text = |t: u32| vocabulary.text(&[t]);
     let mut functions = serde_json::to_value(&readout.functions).map_err(|e| e.to_string())?;
@@ -395,12 +396,8 @@ fn main() -> Result<(), String> {
         "wide_device": wide.name(),
         "held_out_sequences": [first, end],
         "held_out_tokens": readout.held_out_tokens,
-        "mean_logit": readout.mean_logit,
-        "targets": readout.targets,
-        "important": readout.important,
+        "measured_tokens": readout.measured_tokens,
         "participation": readout.participation,
-        "cuts": readout.cuts,
-        "background": readout.functions.iter().enumerate().filter(|(_, f)| f.background).map(|(i, _)| i).collect::<Vec<_>>(),
         "surviving": readout.functions.len(),
         "removed": readout.removed,
         "core": readout.core,

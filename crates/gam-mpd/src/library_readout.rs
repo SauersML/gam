@@ -11,39 +11,32 @@
 //! `W_O,h z_h`, `z_h` its attention read and `W_O,h` the native output projection's columns of
 //! the head.
 //!
-//! * RelP attribution. The reverse pass of the network linearized with every norm's denominator,
-//!   every law's gate factor `φ(x)/x` and every attention pattern frozen, and half of the gradient
-//!   through each factor of a product (SwiGLU's gate times up), seeded with the gradient of a metric
-//!   `m` in the final stream (by default the centred logit of the model's predicted token, the
-//!   final norm's denominator frozen). A function's attribution of the prediction at target token
-//!   `t` is `A_i(t) = Σ_{s ≤ t} h_i(s) ∂m(t)/∂h_i(s)` (a head: `z_h · ∂m(t)/∂z_h`), over every
-//!   position it acts at; within a cut (one layer's heads, one MLP) the functions and the residual
-//!   stream entering it account for `m(t)`. Targets are drawn per held-out sequence, and their
-//!   predictions attributed one at a time.
-//! * Importance: the mean of `|A_i(t)|` over held-out tokens, which ranks the functions; per
-//!   threshold `τ`, the fraction of held-out tokens with `|A_i(t)| > τ |m(t)|` (causal activity).
-//!   Background functions are important at the first threshold on every held-out token.
+//! * Removal effect: the change in `KL(M ‖ P)` of a token's next-token distributions, in bits,
+//!   when one function's write alone (`h_i u_i`, a head's `W_O,h z_h`) is taken out of the
+//!   explanation `P` at every position and every later layer rerun ([`Library::removal_effects`]).
+//!   Importance is its mean over the measured held-out tokens; its quantiles give the spread.
+//!   Participation: per token, the effective number of functions its prediction rests on,
+//!   `(Σ_i |ΔKL_i|)² / Σ_i ΔKL_i²`.
 //! * Positive-gate fraction (MLP functions): the fraction of tokens with a positive gate
 //!   pre-activation. It is not activity: GELU and SiLU are nonzero on both sides, and a negative
 //!   gate times a large up value is a large output. It is not comparable with VPD's L0.
 //! * Usage: the mean output norm `|h_i| ‖u_i‖` (heads `‖W_O,h z_h‖`) over held-out tokens.
 //!   Contexts: the held-out tokens with the largest output norm (heads: with the position the
 //!   head attends to most there).
-//! * Supports and opposes: the held-out tokens with the largest positive and negative attributions,
-//!   and the predicted token a majority of each set shares.
+//! * Supports and opposes: the measured tokens where the function's removal raises the divergence
+//!   most and lowers it most, and the predicted token a majority of each set shares.
 //! * Writes: the output direction through the final norm's gain and the unembedding,
 //!   `W_U (γ_f ⊙ u_i)`, centred over the vocabulary; the most promoted and suppressed tokens (a
 //!   direct path only). Reads: the gate direction `γ ⊙ g_i` against each token's embedding at that
 //!   read, `(γ ⊙ g_i)·e_t / √(mean(e_t²) + ε)`.
-//! * Flow edges: RelP's direct effect of a writer on a reader, summed over held-out tokens:
-//!   `flow(s → t) = Σ_τ h_s(τ) ∂h_t/∂h_s(τ) ∂m/∂h_t(τ)` through the residual stream alone (no other
-//!   function between them), in the linearized network with the reader's norm denominator frozen
-//!   and the half rule. An MLP reader reads through its gate and, when gated, its up map; a head
-//!   reader through its value map (frozen pattern) and its query and key maps (the scores
-//!   `c q·k` split half to each factor, through the softmax's derivative and the head's query and
-//!   key norms, their denominators frozen). Flows are computed among the `candidates` most
-//!   important functions; each keeps its strongest inputs, and the most important (`core`) their
-//!   complete wiring.
+//! * Edges: a writer's exact contribution to a reader's reads ([`Library::contributions`], the
+//!   writer's write through the reader's norm at the stream's actual RMS and each read map: an
+//!   MLP reader's gate and up, a head reader's query, key and value) ranks the candidates among
+//!   the `candidates` most important functions; each of the `edges` strongest is measured by path
+//!   patching ([`Library::path_patch`]: the write taken out of that reader's reads alone, the
+//!   reader recomputed and everything after it rerun), as the reader's output change and
+//!   `KL(P ‖ P′)` in bits. The `core` most important functions' wiring among themselves is
+//!   measured whole.
 //! * Attention (heads): the attention mass by query-key offset in binary orders of magnitude, the
 //!   source tokens receiving the most mass, the OV map's largest token-to-token entries over the
 //!   held-out text's tokens (`self_top1`: the fraction of source tokens whose largest output is
@@ -52,6 +45,11 @@
 //! The model runs on its device in that device's arithmetic; the vocabulary-wide searches (top
 //! tokens, OV entries) run on the products device; every reported token score is recomputed in
 //! float64 on the host from the selected tokens.
+//!
+//! [`Library::attributions`] (RelP: the reverse pass of the network linearized with every norm's
+//! denominator, every law's gate factor `φ(x)/x` and every attention pattern frozen, and half of
+//! the gradient through each factor of a product) remains for the explanation battery's circuits
+//! until it measures them by patching; the read-out does not use it.
 use crate::{
     artifact::Artifact,
     artifact_device::mapped_inlined_observed,
@@ -92,20 +90,18 @@ pub struct Settings {
     pub batch_sequences: usize,
     pub numeric_bytes: usize,
     pub tile_rows: usize,
-    /// Per function: contexts, tokens of each token list, and strongest inputs reported.
+    /// Per function: contexts, tokens of each token list, and inputs measured.
     pub contexts: usize,
     pub tokens: usize,
     pub edges: usize,
-    /// The functions of largest RelP importance among which flows are computed, and those (the
-    /// background apart) whose complete wiring among themselves is reported.
+    /// The held-out sequences (the first of them) on which removals and path patches are
+    /// measured, and the functions removed at a time.
+    pub measured_sequences: usize,
+    pub removal_batch: usize,
+    /// The most important functions among which edge candidates are ranked by exact
+    /// contribution, and those whose wiring among themselves is measured whole.
     pub candidates: usize,
     pub core: usize,
-    /// The fractions `τ` of `|m(t)|` above which a function's `|A_i(t)|` counts it as causally
-    /// important at token `t`.
-    pub thresholds: Vec<f64>,
-    /// Target tokens drawn per held-out sequence (uniformly, without replacement) whose
-    /// predictions are attributed one at a time.
-    pub targets: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -130,14 +126,16 @@ pub struct Entry {
     pub score: f64,
 }
 
-/// An input of a function: the writer (an index into `Readout::functions`), its mean flow per
-/// held-out token, and that flow per route of the reader's reads: a head reader's value, query
-/// and key maps; an MLP reader's gate and up maps (and zero).
+/// An input of a function: the writer (an index into `Readout::functions`), its exact
+/// contribution to the reader's reads per route ([`Library::contributions`]), and the measured
+/// effect of path patching it out ([`Library::path_patch`]): the reader's mean output change and
+/// `KL(P ‖ P′)` per token in bits.
 #[derive(Clone, Debug, Serialize)]
 pub struct Edge {
     pub from: usize,
-    pub flow: f64,
-    pub routes: [f64; 3],
+    pub contribution: [f64; 3],
+    pub output: f64,
+    pub prediction_bits: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -172,8 +170,6 @@ pub struct Function {
     /// MLP functions: the fraction of held-out tokens with a positive gate pre-activation (not
     /// activity; module note).
     pub positive_gate_fraction: Option<f64>,
-    /// Per threshold `τ`, the fraction of held-out tokens with `|A_i(t)| > τ |m(t)|`.
-    pub important_fraction: Vec<f64>,
     pub usage: f64,
     pub contexts: Vec<Context>,
     pub promoted: Vec<TokenScore>,
@@ -181,54 +177,62 @@ pub struct Function {
     pub reads: Vec<TokenScore>,
     pub inputs: Vec<Edge>,
     pub attention: Option<Attention>,
-    /// Mean over held-out tokens of `|A_i(t)|` and of `A_i(t)`, `A_i(t)` the function's RelP
-    /// attribution of the model's predicted-token logit (module note).
+    /// The measured removal effect ([`Library::removal_effects`]): the mean change of
+    /// `KL(M ‖ P)` per token in bits, and its quantiles 0.5, 0.9, 0.99 and 1 over the tokens.
     pub importance: f64,
-    pub attribution: f64,
-    /// The held-out tokens with the largest positive and negative attributions, and the predicted
-    /// token a majority of each set shares (none when no token holds a majority).
+    pub effect_quantiles: [f64; 4],
+    /// The tokens where its removal raises the divergence most and where it lowers it most, and
+    /// the predicted token a majority of each set shares (none when no token holds a majority).
     pub supports: Vec<Context>,
     pub opposes: Vec<Context>,
     pub supports_token: Option<u32>,
     pub opposes_token: Option<u32>,
-    /// Important at the first threshold on every held-out token.
-    pub background: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Readout {
     pub held_out_tokens: usize,
+    /// The tokens removals and path patches were measured on.
+    pub measured_tokens: usize,
     pub functions: Vec<Function>,
     pub removed: Vec<String>,
-    /// Indices into `functions` of the most important functions, descending, and `wiring[i][j]` the
-    /// mean flow per held-out token from core function `j` to core function `i` (zero when `j`
-    /// does not precede `i`'s read).
+    /// Indices into `functions` of the most important functions, descending, and `wiring[i][j]`
+    /// the measured `KL(P ‖ P′)` per token in bits of path patching core function `j` out of core
+    /// function `i`'s reads (zero when `j` does not precede `i`'s read).
     pub core: Vec<usize>,
     pub wiring: Vec<Vec<f64>>,
-    /// Per held-out token, the model's predicted token, and the mean centred logit `m` of it.
+    /// Per held-out token, the model's predicted token.
     pub predicted: Vec<u32>,
-    pub mean_logit: f64,
-    /// The target tokens whose predictions were attributed (`Settings::targets` per sequence);
-    /// importance, important fractions, supports and opposes, and the cut summaries are over them.
-    pub targets: usize,
-    /// Per cut of the reverse pass (one layer's heads, one MLP), its causally important functions
-    /// per token.
-    pub cuts: Vec<CutSummary>,
-    /// Summed over cuts: per threshold `τ`, the mean number of functions per token with
-    /// `|A_i(t)| > τ |m(t)|`, and the mean participation number.
-    pub important: Vec<[f64; 2]>,
-    pub participation: f64,
+    /// Per measured token, the effective number of functions its prediction rests on,
+    /// `(Σ_i |ΔKL_i|)² / Σ_i ΔKL_i²` over the measured removals: its quantiles 0.1, 0.5, 0.9 and
+    /// its mean.
+    pub participation: [f64; 4],
 }
 
-/// One cut's mean per token of its participation number `(Σ_i |A_i(t)|)² / Σ_i A_i(t)²` (the
-/// effective number of its functions the prediction rests on) and, per threshold, of its number of
-/// functions with `|A_i(t)| > τ |m(t)|`. Within a cut, the functions and the residual stream
-/// entering it account for `m` (RelP's completeness), so counts are comparable across cuts.
+/// One token's account of its prediction ([`Library::accounts`]).
 #[derive(Clone, Debug, Serialize)]
-pub struct CutSummary {
+pub struct Account {
+    /// The token's row in the sequences.
+    pub row: usize,
+    /// The functions whose removal raises `KL(M ‖ P)` at the token most, descending.
+    pub functions: Vec<Share>,
+}
+
+/// One function's part in a token's prediction.
+#[derive(Clone, Debug, Serialize)]
+pub struct Share {
     pub name: String,
-    pub participation: f64,
-    pub counts: Vec<f64>,
+    /// The measured removal effect at the token: the change in `KL(M ‖ P)` in bits.
+    pub removal_bits: f64,
+    /// A head: the positions of the token's sequence it attends to most from the token, with
+    /// their weights.
+    pub attention: Vec<(usize, f64)>,
+    /// An MLP function: its activation `h_i` at the token.
+    pub activation: Option<f64>,
+    /// Its write at the token through the final norm (at the token's RMS) and the unembedding,
+    /// centred over the vocabulary: the tokens it raises most and lowers most (a direct path only).
+    pub promoted: Vec<TokenScore>,
+    pub suppressed: Vec<TokenScore>,
 }
 
 // ------------------------------------------------------------------------------ the explanation
@@ -387,34 +391,6 @@ struct MlpStat {
     positive: f64,
     abs: f64,
     top: Best,
-    relp: Relp,
-}
-
-/// A function's RelP attributions: `Σ |A|`, `Σ A`, per threshold the tokens with
-/// `|A| > τ |m|`, and the rows of the largest and of the most negative.
-#[derive(Clone, Default)]
-struct Relp {
-    absolute: f64,
-    signed: f64,
-    important: Vec<f64>,
-    supports: Best,
-    opposes: Best,
-}
-
-impl Relp {
-    /// The attribution `a` of the prediction `m` at target row `id`.
-    fn add(&mut self, k: usize, a: f64, m: f64, thresholds: &[f64], id: usize) {
-        self.important.resize(thresholds.len(), 0.0);
-        self.absolute += a.abs();
-        self.signed += a;
-        for (count, tau) in self.important.iter_mut().zip(thresholds) {
-            if a.abs() > tau * m.abs() {
-                *count += 1.0;
-            }
-        }
-        self.supports.offer(k, a, id);
-        self.opposes.offer(k, -a, id);
-    }
 }
 
 struct HeadStat {
@@ -424,7 +400,6 @@ struct HeadStat {
     sources: HashMap<u32, f64>,
     /// Per held-out row, the position attended to most.
     attended: Vec<usize>,
-    relp: Relp,
     /// Summed attention to the induction and the duplicate-token positions.
     induction: f64,
     duplicate: f64,
@@ -501,8 +476,10 @@ pub struct Library<'a> {
     unembedding: Array2<f64>,
     unembedding_mean: Array1<f64>,
     unembedding_table: Tensor,
-    /// The input embedding (vocabulary × width).
+    /// The input embedding (vocabulary × width), and the head (the unembedding after the final
+    /// norm) on the model's device, which scores the explanation's distributions against `M`'s.
     embedding: Array2<f64>,
+    resident: ResidentHead,
     program: DeviceProgram,
     observed: Vec<usize>,
     mlp_paths: Vec<usize>,
@@ -528,29 +505,11 @@ struct Pass<'a> {
     weights: Vec<Vec<Values<'a>>>,
 }
 
-impl<'a> Pass<'a> {
-    /// The first `end` rows of sequence `sequence` (of `length` rows) alone, viewed.
-    fn prefix<'b>(&'b self, sequence: usize, length: usize, end: usize) -> Pass<'b> {
-        let rows = sequence * length..sequence * length + end;
-        let cut = |x: &'b Values<'a>| -> Values<'b> { CowArray::from(x.slice(s![rows.clone(), ..])) };
-        Pass {
-            rows: end,
-            streams: self.streams.iter().map(cut).collect(),
-            inverse: self.inverse.iter().map(|v| CowArray::from(v.slice(s![rows.clone()]))).collect(),
-            last: cut(&self.last),
-            inverse_final: CowArray::from(self.inverse_final.slice(s![rows.clone()])),
-            mlp: self.mlp.iter().map(|(a, p, u)| (cut(a), cut(p), u.as_ref().map(cut))).collect(),
-            head: self.head.iter().map(|values| std::array::from_fn(|j| cut(&values[j]))).collect(),
-            weights: self.weights.iter().map(|w| vec![CowArray::from(w[sequence].slice(s![..end, ..end]))]).collect(),
-        }
-    }
-}
-
 /// A cut of the reverse pass: one MLP's functions (an index into the MLPs) or one layer's heads
 /// (indices into the heads).
-enum Cut<'c> {
+enum Cut {
     Mlp(usize),
-    Heads(usize, &'c [usize]),
+    Heads(usize),
 }
 
 /// What a cut's functions read, as the gradient of `m` in the linearized network with respect to
@@ -585,7 +544,7 @@ pub struct Run {
 /// What the reverse pass hands its visitor at a cut: the cut, its attributions (rows × its
 /// functions), its reads, and `∂m/∂x` for the residual stream `x` right after the cut.
 struct Visit<'v> {
-    cut: Cut<'v>,
+    cut: Cut,
     attribution: Array2<f64>,
     reads: Reads<'v>,
     after: &'v Array2<f64>,
@@ -719,7 +678,9 @@ impl<'a> Library<'a> {
             return Err("the artifact holds no library functions".into());
         }
         let layer_heads = (0..layers.len()).map(|l| (0..heads.len()).filter(|h| heads[*h].layer == l).collect()).collect();
-        let Head { hidden, embedding: mut unembedding, .. } = Head::of(native)?;
+        let head = Head::of(native)?;
+        let resident = ResidentHead::new(model, &head, tile_rows)?;
+        let Head { hidden, embedding: mut unembedding, .. } = head;
         let final_site = site(native, hidden)?;
         unembedding.axis_iter_mut(Axis(0)).for_each(|mut row| row *= &final_site.gain);
         let unembedding_mean = unembedding.mean_axis(Axis(0)).ok_or("an empty vocabulary")?;
@@ -770,6 +731,7 @@ impl<'a> Library<'a> {
             unembedding_mean,
             unembedding_table,
             embedding,
+            resident,
             program: compiled,
             observed,
             mlp_paths,
@@ -1025,25 +987,107 @@ impl<'a> Library<'a> {
     /// explanation (an MLP function's `h_i u_i`, a head's `W_O,h z_h`) and every layer after it
     /// recomputed. `teacher` gives `M`'s distributions; `batch` functions are removed at a time,
     /// each in its own copy of the sequences, entering at the stream after the function's block.
-    pub fn removal_effects(&self, native: &OperatorProgram, teacher: &Teacher, sequences: &[Vec<u32>], batch: usize) -> Result<Array2<f64>, String> {
+    /// With `scored`, only those rows are scored (the columns of the result, in that order).
+    pub fn removal_effects(&self, teacher: &Teacher, sequences: &[Vec<u32>], scored: Option<&[usize]>, batch: usize) -> Result<Array2<f64>, String> {
         if batch == 0 || sequences.is_empty() {
             return Err("a positive batch and held-out sequences required".into());
         }
         let refs: Vec<&[u32]> = sequences.iter().map(Vec::as_slice).collect();
         let family = sequence_family(&refs)?;
         let rows = family.rows;
-        let target = teacher.target(&family, None)?;
-        let head = Head::of(native)?;
-        let resident = ResidentHead::new(self.model, &head, self.tile_rows)?;
+        let all: Vec<usize> = (0..rows).collect();
+        let scored = scored.unwrap_or(&all);
+        if scored.iter().any(|r| *r >= rows) {
+            return Err("a scored row outside the sequences".into());
+        }
+        let resident = &self.resident;
         let arithmetic = arithmetic(self.model);
         let hidden = self.program.hidden();
-        let score = |trace: &DeviceTrace, target: &Target| -> Result<Vec<f64>, String> {
-            Ok(resident.score(self.model, trace.value(hidden)?, target, false, arithmetic)?.0)
+        // The scored rows of `copies` copies of the sequences (copy `k`'s rows at `k · rows`).
+        let selection = |copies: usize| -> Result<_, String> {
+            let indices: Vec<u32> = (0..copies).flat_map(|k| scored.iter().map(move |r| (k * rows + r) as u32)).collect();
+            self.model.upload_indices(&indices).map_err(error)
         };
-        let base = score(&self.program.forward(&family)?, &target)?;
+        let full = teacher.target(&family, None)?;
+        let target = Target {
+            mu: std::sync::Arc::new(self.model.gather_rows(&full.mu, &selection(1)?).map_err(error)?),
+            entropy: scored.iter().map(|r| full.entropy[*r]).collect(),
+            head: std::sync::Arc::clone(&full.head),
+            scored: None,
+        };
+        drop(full);
+        let score = |trace: &DeviceTrace, copies: usize, target: &Target| -> Result<Vec<f64>, String> {
+            let selected = self.model.gather_rows(trace.value(hidden)?, &selection(copies)?).map_err(error)?;
+            Ok(resident.score(self.model, &selected, target, false, arithmetic)?.0)
+        };
+        let base = score(&self.program.forward(&family)?, 1, &target)?;
         let pass = self.pass(&refs)?;
-        let functions = self.functions().len();
-        let mut effects = Array2::<f64>::zeros((functions, rows));
+        let n = scored.len();
+        let mut effects = Array2::<f64>::zeros((self.functions().len(), n));
+        self.sweep(&refs, &pass, None, batch, |columns, trace| {
+            let indices = self.model.upload_indices(&(0..columns.len()).flat_map(|_| 0..n as u32).collect::<Vec<_>>()).map_err(error)?;
+            let copied_target = Target {
+                mu: std::sync::Arc::new(self.model.gather_rows(&target.mu, &indices).map_err(error)?),
+                entropy: (0..columns.len()).flat_map(|_| target.entropy.iter().copied()).collect(),
+                head: std::sync::Arc::clone(&target.head),
+                scored: None,
+            };
+            let kl = score(trace, columns.len(), &copied_target)?;
+            for (k, column) in columns.iter().enumerate() {
+                for r in 0..n {
+                    effects[[*column, r]] = (kl[k * n + r] - base[r]) / std::f64::consts::LN_2;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(effects)
+    }
+
+    /// Activation patching of every function on prompt pairs: per function ([`Library::functions`]'s
+    /// order) and per pair (a clean prompt and a counterfactual of its length) with its tokens
+    /// `(target, foil)`, the change of the logit difference `target − foil` at the last position
+    /// when the function's write on the clean prompt is replaced at every position by its write on
+    /// the counterfactual and every later layer rerun; `batch` functions at a time.
+    pub fn patch_effects(&self, pairs: &[(Vec<u32>, Vec<u32>)], tokens: &[(u32, u32)], batch: usize) -> Result<Array2<f64>, String> {
+        let vocabulary = self.unembedding.nrows() as u32;
+        if batch == 0 || pairs.len() != tokens.len() || tokens.iter().any(|(t, f)| *t >= vocabulary || *f >= vocabulary) {
+            return Err("a positive batch and one target and foil in the vocabulary per pair required".into());
+        }
+        let mut effects = Array2::<f64>::zeros((self.functions().len(), pairs.len()));
+        let last_node = self.observed[self.sites.len()];
+        for (p, ((clean, counterfactual), (target, foil))) in pairs.iter().zip(tokens).enumerate() {
+            let length = clean.len();
+            if length == 0 || counterfactual.len() != length {
+                return Err("a clean prompt and a counterfactual of its length required".into());
+            }
+            let direction = &self.unembedding.row(*target as usize) - &self.unembedding.row(*foil as usize);
+            let difference = |x: ArrayView1<f64>| direction.dot(&x) * rms_scale(x, self.final_site.epsilon);
+            let refs = [clean.as_slice()];
+            let pass = self.pass(&refs)?;
+            let other = self.pass(&[counterfactual.as_slice()])?;
+            let base = difference(pass.last.row(length - 1));
+            self.sweep(&refs, &pass, Some(&other), batch, |columns, trace| {
+                let rows = self.model.upload_indices(&(0..columns.len()).map(|k| (k * length + length - 1) as u32).collect::<Vec<_>>()).map_err(error)?;
+                let last = self.model.download(&self.model.gather_rows(trace.value(last_node)?, &rows).map_err(error)?).map_err(error)?;
+                for (k, column) in columns.iter().enumerate() {
+                    effects[[*column, p]] = difference(last.row(k)) - base;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(effects)
+    }
+
+    /// Every function's write in `pass` (the run of `refs`) taken out at every position, or
+    /// replaced by its write in `replacement` (a run of sequences of the same shape), `batch`
+    /// functions at a time, each in its own copy of the sequences entering at the stream after its
+    /// block and every later layer rerun; `measure` reads each batch's columns
+    /// ([`Library::functions`]'s order, copy `k` at rows `k · rows`) and trace.
+    fn sweep(&self, refs: &[&[u32]], pass: &Pass<'_>, replacement: Option<&Pass<'_>>, batch: usize, mut measure: impl FnMut(&[usize], &DeviceTrace) -> Result<(), String>) -> Result<(), String> {
+        if batch == 0 || replacement.is_some_and(|r| r.rows != pass.rows) {
+            return Err("a positive batch and a replacement run of the same rows required".into());
+        }
+        let rows = pass.rows;
         let (head_columns, mlp_columns) = self.columns();
         // Per layer: the heads' writes enter the stream before its MLP, the MLP functions' the
         // stream after it (the next layer's, or the final one).
@@ -1058,7 +1102,7 @@ impl<'a> Library<'a> {
                 jobs.extend((0..block.gate.nrows()).map(|i| (mlp_columns[b] + i, entry, Err((b, i)))));
             }
         }
-        let write = |job: &Result<usize, (usize, usize)>| -> Array2<f64> {
+        let write = |pass: &Pass<'_>, job: &Result<usize, (usize, usize)>| -> Array2<f64> {
             match job {
                 Ok(h) => self.write(*h, &pass.head[*h][2].to_owned()),
                 Err((b, i)) => {
@@ -1068,9 +1112,10 @@ impl<'a> Library<'a> {
             }
         };
         let stream = |entry: usize| if entry < self.sites.len() { &pass.streams[entry] } else { &pass.last };
+        let hidden = self.program.hidden();
         let mut start = 0;
         while start < jobs.len() {
-            // A batch removes functions entering at one stream.
+            // A batch changes functions entering at one stream.
             let entry = jobs[start].1;
             let end = (start + batch).min(jobs.len());
             let end = start + jobs[start..end].iter().take_while(|j| j.1 == entry).count();
@@ -1078,28 +1123,72 @@ impl<'a> Library<'a> {
             let x = stream(entry);
             let mut values = Array2::<f64>::zeros((chunk.len() * rows, x.ncols()));
             for (k, (_, _, job)) in chunk.iter().enumerate() {
-                values.slice_mut(s![k * rows..(k + 1) * rows, ..]).assign(&(x - &write(job)));
+                let mut edited = x - &write(pass, job);
+                if let Some(other) = replacement {
+                    edited += &write(other, job);
+                }
+                values.slice_mut(s![k * rows..(k + 1) * rows, ..]).assign(&edited);
             }
             let copies: Vec<&[u32]> = (0..chunk.len()).flat_map(|_| refs.iter().copied()).collect();
             let copied = sequence_family(&copies)?;
-            let node = self.observed[entry];
-            let trace = self.program.forward_span(&copied, Some((node, self.model.upload(values.view()).map_err(error)?)), hidden, |_, _| Ok(None))?;
-            let indices = self.model.upload_indices(&(0..chunk.len()).flat_map(|_| 0..rows as u32).collect::<Vec<_>>()).map_err(error)?;
-            let copied_target = Target {
-                mu: std::sync::Arc::new(self.model.gather_rows(&target.mu, &indices).map_err(error)?),
-                entropy: (0..chunk.len()).flat_map(|_| target.entropy.iter().copied()).collect(),
-                head: std::sync::Arc::clone(&target.head),
-                scored: None,
-            };
-            let kl = score(&trace, &copied_target)?;
-            for (k, (column, _, _)) in chunk.iter().enumerate() {
-                for r in 0..rows {
-                    effects[[*column, r]] = (kl[k * rows + r] - base[r]) / std::f64::consts::LN_2;
-                }
-            }
+            let trace = self.program.forward_span(&copied, Some((self.observed[entry], self.model.upload(values.view()).map_err(error)?)), hidden, |_, _| Ok(None))?;
+            measure(&chunk.iter().map(|j| j.0).collect::<Vec<_>>(), &trace)?;
             start = end;
         }
-        Ok(effects)
+        Ok(())
+    }
+
+    /// Per row of `targets` (rows of `sequences`, of one length), an account of its prediction:
+    /// the `top` functions whose measured removal ([`Library::removal_effects`], `batch` at a
+    /// time) raises `KL(M ‖ P)` there most, each with where it attends (a head's `tokens` largest
+    /// weights) or its activation (an MLP function), and the `tokens` tokens its write there
+    /// raises and lowers most.
+    pub fn accounts(&self, teacher: &Teacher, sequences: &[Vec<u32>], targets: &[usize], top: usize, tokens: usize, batch: usize) -> Result<Vec<Account>, String> {
+        let effects = self.removal_effects(teacher, sequences, Some(targets), batch)?;
+        let length = sequences[0].len();
+        let pass = self.pass(&sequences.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+        let names = self.functions();
+        let top = top.min(names.len());
+        let mut writes = Array2::<f64>::zeros((targets.len() * top, self.unembedding.ncols()));
+        let mut accounts = Vec::with_capacity(targets.len());
+        for (c, &row) in targets.iter().enumerate() {
+            let mut ranked: Vec<usize> = (0..names.len()).collect();
+            ranked.sort_by(|a, b| effects[[*b, c]].total_cmp(&effects[[*a, c]]));
+            let (sequence, position) = (row / length, row % length);
+            let mut shares = Vec::with_capacity(top);
+            for (k, &f) in ranked.iter().take(top).enumerate() {
+                let mut write = writes.row_mut(c * top + k);
+                let (attention, activation) = match self.place(f)?.1 {
+                    Ok(h) => {
+                        write.assign(&self.heads[h].output.dot(&pass.head[h][2].row(row)));
+                        let weights = pass.weights[h][sequence].row(position);
+                        let mut order: Vec<usize> = (0..=position).collect();
+                        order.sort_by(|a, b| weights[*b].total_cmp(&weights[*a]));
+                        (order.into_iter().take(tokens).map(|u| (u, weights[u])).collect(), None)
+                    }
+                    Err((b, i)) => {
+                        let a = pass.mlp[b].0[[row, i]];
+                        write.assign(&(&self.mlps[b].out.column(i) * a));
+                        (Vec::new(), Some(a))
+                    }
+                };
+                shares.push(Share { name: names[f].name.clone(), removal_bits: effects[[f, c]], attention, activation, promoted: Vec::new(), suppressed: Vec::new() });
+            }
+            accounts.push(Account { row, functions: shares });
+        }
+        let promoted = extreme_columns(self.wide, &self.unembedding_table, &writes, tokens, 1.0, self.tile_rows)?;
+        let suppressed = extreme_columns(self.wide, &self.unembedding_table, &writes, tokens, -1.0, self.tile_rows)?;
+        for (c, account) in accounts.iter_mut().enumerate() {
+            let inverse = pass.inverse_final[account.row];
+            for (k, share) in account.functions.iter_mut().enumerate() {
+                let write = writes.row(c * top + k);
+                let centre = dot(self.unembedding_mean.view(), write);
+                let logit = |t: usize| (dot(self.unembedding.row(t), write) - centre) * inverse;
+                share.promoted = scored(&promoted[c * top + k], logit);
+                share.suppressed = scored(&suppressed[c * top + k], logit);
+            }
+        }
+        Ok(accounts)
     }
 
     /// Every function in the order of attribution columns: per layer its heads, then its MLP
@@ -1283,7 +1372,7 @@ impl<'a> Library<'a> {
                 reads.query.push(gq);
                 reads.key.push(gk);
             }
-            visit(Visit { cut: Cut::Heads(l, members), attribution, reads: Reads::Heads(&reads), after: &g });
+            visit(Visit { cut: Cut::Heads(l), attribution, reads: Reads::Heads(&reads), after: &g });
             let (gain, inv) = (&self.sites[2 * l].gain, &pass.inverse[2 * l]);
             g = g + delta * &gain.view().insert_axis(Axis(0)) * &inv.view().insert_axis(Axis(1));
         }
@@ -1338,7 +1427,7 @@ impl<'a> Library<'a> {
         self.relp(&pass, seed, baseline.as_ref(), false, &mut |visit| {
             let start = match visit.cut {
                 Cut::Mlp(b) => mlp_columns[b],
-                Cut::Heads(l, _) => head_columns[l],
+                Cut::Heads(l) => head_columns[l],
             };
             attributions.slice_mut(s![.., start..start + visit.attribution.ncols()]).assign(&visit.attribution);
             if !prompt.gradients {
@@ -1350,7 +1439,7 @@ impl<'a> Library<'a> {
                 layer.gate = (*gate).clone();
                 layer.up = up.cloned();
             }
-            if let (Cut::Heads(l, _), Reads::Heads(reads)) = (&visit.cut, &visit.reads) {
+            if let (Cut::Heads(l), Reads::Heads(reads)) = (&visit.cut, &visit.reads) {
                 gradients[*l].attention_output = visit.after.clone();
                 gradients[*l].values = reads.value.clone();
             }
@@ -1402,7 +1491,7 @@ impl<'a> Library<'a> {
         let embedding = self.relp(&pass, seed, None, false, &mut |visit| {
             let (name, site) = match visit.cut {
                 Cut::Mlp(b) => (format!("L{}.mlp", self.mlps[b].layer), 2 * self.mlps[b].layer + 1),
-                Cut::Heads(l, _) => (format!("L{l}.heads"), 2 * l),
+                Cut::Heads(l) => (format!("L{l}.heads"), 2 * l),
             };
             checks.push(CutCheck { name, functions: visit.attribution.sum(), stream: (visit.after * &pass.streams[site]).sum(), biases, metric });
             // A function's pre-activation bias c enters h through the frozen factor as the
@@ -1419,9 +1508,12 @@ impl<'a> Library<'a> {
 
 // ------------------------------------------------------------------------------ the read-out
 
-/// The read-out (module note) of `library` on the held-out `sequences` (of equal length).
-pub fn read_out(library: &Library, sequences: &[Vec<u32>], settings: &Settings) -> Result<Readout, String> {
-    if settings.batch_sequences == 0 || sequences.is_empty() || settings.thresholds.iter().any(|t| !(t.is_finite() && *t > 0.0)) {
+/// The read-out (module note) of `library` on the held-out `sequences` (of equal length), its
+/// measured removals and path patches on the first `Settings::measured_sequences` of them, `M`'s
+/// distributions from `teacher`.
+pub fn read_out(library: &Library, teacher: &Teacher, sequences: &[Vec<u32>], settings: &Settings) -> Result<Readout, String> {
+    let measured = settings.measured_sequences.min(sequences.len());
+    if settings.batch_sequences == 0 || settings.removal_batch == 0 || measured == 0 {
         return Err("invalid read-out settings or no held-out sequences".into());
     }
     let length = sequences[0].len();
@@ -1443,34 +1535,16 @@ pub fn read_out(library: &Library, sequences: &[Vec<u32>], settings: &Settings) 
     }
 
     let k = settings.contexts;
-    let thresholds = &settings.thresholds;
     let mut mlp_stats: Vec<Vec<MlpStat>> = mlps.iter().map(|b| vec![MlpStat::default(); b.gate.nrows()]).collect();
     let mut head_stats: Vec<HeadStat> = heads
         .iter()
-        .map(|_| HeadStat {
-            output: 0.0,
-            top: Best::default(),
-            offsets: Vec::new(),
-            sources: HashMap::new(),
-            attended: Vec::new(),
-            relp: Relp::default(),
-            induction: 0.0,
-            duplicate: 0.0,
-        })
+        .map(|_| HeadStat { output: 0.0, top: Best::default(), offsets: Vec::new(), sources: HashMap::new(), attended: Vec::new(), induction: 0.0, duplicate: 0.0 })
         .collect();
     let grams: Vec<Array2<f64>> = heads.iter().map(|b| b.output.t().dot(&b.output)).collect();
     let out_norms: Vec<Array1<f64>> = mlps.iter().map(|b| b.out.map_axis(Axis(0), |u| u.dot(&u).sqrt())).collect();
     let mut predicted_all: Vec<u32> = Vec::with_capacity(sequences.len() * length);
-    let mut logit_sum = 0.0;
-    let (mut rng, mut samples) = (StdRng::seed_from_u64(0), 0.0);
-    // Per cut, the summed participation number and, per threshold, the summed count of functions
-    // with |A_i(t)| > τ |m(t)|.
-    let cuts = 2 * layers;
-    let mut cut_participation = vec![0.0; cuts];
-    let mut cut_counts = vec![vec![0.0; thresholds.len()]; cuts];
-    let batches: Vec<(usize, &[Vec<u32>])> = sequences.chunks(settings.batch_sequences).enumerate().map(|(c, b)| (c * settings.batch_sequences * length, b)).collect();
-    for (first_row, batch) in &batches {
-        let first_row = *first_row;
+    for (chunk, batch) in sequences.chunks(settings.batch_sequences).enumerate() {
+        let first_row = chunk * settings.batch_sequences * length;
         let pass = library.pass(&batch.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
         let rows = pass.rows;
         for (b, (activations, pre, _)) in pass.mlp.iter().enumerate() {
@@ -1512,61 +1586,7 @@ pub fn read_out(library: &Library, sequences: &[Vec<u32>], settings: &Settings) 
                 stat.top.offer(k, norm, first_row + r);
             }
         });
-        let (predicted, seed, metric) = library.predicted(&pass)?;
-        // Each drawn target's prediction alone: the reverse pass from its row of the seed over the
-        // sequence up to it, each function's attribution summed over the positions it acts at.
-        let mut picks = Vec::new();
-        for s in 0..batch.len() {
-            let mut positions: Vec<usize> = (0..length).collect();
-            for j in 0..settings.targets.min(length) {
-                let pick = rng.random_range(j..length);
-                positions.swap(j, pick);
-            }
-            picks.extend(positions[..settings.targets.min(length)].iter().map(|&t| (s, t)));
-        }
-        // The targets' reverse passes run in parallel; each returns its cuts' attributions summed
-        // over positions (as an MLP's index or a layer's, with its heads).
-        let targets: Vec<(usize, f64, Vec<(bool, usize, Array1<f64>)>)> = picks
-            .par_iter()
-            .map(|&(s, t)| {
-                let row = s * length + t;
-                let prefix = pass.prefix(s, length, t + 1);
-                let mut target_seed = Array2::<f64>::zeros((t + 1, seed.ncols()));
-                target_seed.row_mut(t).assign(&seed.row(row));
-                let mut cuts = Vec::new();
-                library.relp(&prefix, target_seed, None, false, &mut |visit| {
-                    let (mlp, index) = match visit.cut {
-                        Cut::Mlp(b) => (true, b),
-                        Cut::Heads(l, _) => (false, l),
-                    };
-                    cuts.push((mlp, index, visit.attribution.sum_axis(Axis(0))));
-                });
-                (first_row + row, metric[row], cuts)
-            })
-            .collect();
-        for (id, m, cuts) in targets {
-            samples += 1.0;
-            for (mlp, index, totals) in cuts {
-                let cut = if mlp {
-                    mlp_stats[index].iter_mut().zip(&totals).for_each(|(stat, a)| stat.relp.add(k, *a, m, thresholds, id));
-                    2 * mlps[index].layer + 1
-                } else {
-                    for (h, a) in library.layer_heads[index].iter().zip(&totals) {
-                        head_stats[*h].relp.add(k, *a, m, thresholds, id);
-                    }
-                    2 * index
-                };
-                let (absolute, square) = totals.iter().fold((0.0, 0.0), |(a, q), v| (a + v.abs(), q + v * v));
-                if square > 0.0 {
-                    cut_participation[cut] += absolute * absolute / square;
-                }
-                for (count, tau) in cut_counts[cut].iter_mut().zip(thresholds) {
-                    *count += totals.iter().filter(|v| v.abs() > tau * m.abs()).count() as f64;
-                }
-            }
-        }
-        logit_sum += metric.iter().sum::<f64>();
-        predicted_all.extend(predicted.iter().map(|t| *t as u32));
+        predicted_all.extend(library.predicted(&pass)?.0.iter().map(|t| *t as u32));
     }
     // Head diagnostics on sequences of random held-out tokens repeated once.
     let mut present: Vec<usize> = sequences.iter().flatten().map(|t| *t as usize).filter(|t| *t < vocabulary).collect();
@@ -1598,29 +1618,41 @@ pub fn read_out(library: &Library, sequences: &[Vec<u32>], settings: &Settings) 
     let repeats = (sequences.len() * (half.max(1) - 1)) as f64;
     let total = (sequences.len() * length) as f64;
     let context = |value: f64, id: usize, source: Option<usize>| Context { sequence: id / length, position: id % length, value, source };
-    // The predicted token a majority of a function's top attribution rows share.
+
+    // Measured removals on the first sequences: per function (Library::functions' columns) and
+    // measured token, the change of KL(M ‖ P) in bits.
+    let measured_sequences = &sequences[..measured];
+    let effects = library.removal_effects(teacher, measured_sequences, None, settings.removal_batch)?;
+    let column: BTreeMap<String, usize> = library.functions().into_iter().enumerate().map(|(c, f)| (f.name, c)).collect();
+    // The predicted token a majority of rows share.
     let majority = |best: &Best| {
         let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
         best.entries.iter().for_each(|(_, id)| *counts.entry(predicted_all[*id]).or_insert(0) += 1);
         counts.into_iter().find(|(_, c)| 2 * c > best.entries.len()).map(|(t, _)| t)
     };
-    let fill = |f: &mut Function, relp: &Relp| {
-        let rows = |best: &Best, sign: f64| best.entries.iter().map(|(v, id)| context(sign * v, *id, None)).collect::<Vec<_>>();
-        f.importance = relp.absolute / samples;
-        f.attribution = relp.signed / samples;
-        f.important_fraction = relp.important.iter().map(|n| n / samples).collect();
-        f.background = f.important_fraction.first().is_some_and(|x| *x == 1.0);
-        f.supports = rows(&relp.supports, 1.0);
-        f.opposes = rows(&relp.opposes, -1.0);
-        f.supports_token = majority(&relp.supports);
-        f.opposes_token = majority(&relp.opposes);
+    let measure = |f: &mut Function| -> Result<(), String> {
+        let row = effects.row(*column.get(&f.name).ok_or_else(|| format!("{}: not measured", f.name))?);
+        let mut sorted = row.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let quantile = |q: f64| sorted[((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len()) - 1];
+        f.importance = row.mean().unwrap_or(0.0);
+        f.effect_quantiles = [quantile(0.5), quantile(0.9), quantile(0.99), quantile(1.0)];
+        let (mut supports, mut opposes) = (Best::default(), Best::default());
+        for (id, effect) in row.iter().enumerate() {
+            supports.offer(k, *effect, id);
+            opposes.offer(k, -*effect, id);
+        }
+        f.supports = supports.entries.iter().map(|(v, id)| context(*v, *id, None)).collect();
+        f.opposes = opposes.entries.iter().map(|(v, id)| context(-*v, *id, None)).collect();
+        f.supports_token = majority(&supports);
+        f.opposes_token = majority(&opposes);
+        Ok(())
     };
     let blank = |name: String, layer: usize, kind: Kind| Function {
         name,
         layer,
         kind,
         positive_gate_fraction: None,
-        important_fraction: Vec::new(),
         usage: 0.0,
         contexts: Vec::new(),
         promoted: Vec::new(),
@@ -1629,12 +1661,11 @@ pub fn read_out(library: &Library, sequences: &[Vec<u32>], settings: &Settings) 
         inputs: Vec::new(),
         attention: None,
         importance: 0.0,
-        attribution: 0.0,
+        effect_quantiles: [0.0; 4],
         supports: Vec::new(),
         opposes: Vec::new(),
         supports_token: None,
         opposes_token: None,
-        background: false,
     };
 
     // The functions, surviving ones only: per layer its heads, then its MLP functions.
@@ -1656,7 +1687,7 @@ pub fn read_out(library: &Library, sequences: &[Vec<u32>], settings: &Settings) 
             sources.truncate(settings.tokens);
             head_index[h] = Some(functions.len());
             let mut f = blank(name, l, Kind::Head);
-            fill(&mut f, &stat.relp);
+            measure(&mut f)?;
             f.usage = stat.output / total;
             f.contexts = stat.top.entries.iter().map(|(v, id)| context(*v, *id, Some(stat.attended[*id]))).collect();
             f.attention = Some(Attention {
@@ -1681,7 +1712,7 @@ pub fn read_out(library: &Library, sequences: &[Vec<u32>], settings: &Settings) 
                 let stat = &mlp_stats[b][i];
                 mlp_index[b][i] = Some(functions.len());
                 let mut f = blank(name, l, Kind::Mlp);
-                fill(&mut f, &stat.relp);
+                measure(&mut f)?;
                 f.positive_gate_fraction = Some(stat.positive / total);
                 f.usage = stat.abs / total * out_norms[b][i];
                 f.contexts = stat.top.entries.iter().map(|(v, id)| context(*v, *id, None)).collect();
@@ -1748,128 +1779,69 @@ pub fn read_out(library: &Library, sequences: &[Vec<u32>], settings: &Settings) 
         }
     }
 
-    // Flow edges among the most important functions: a second pass over the held-out sequences.
+    // Edges: among the most important functions, each core reader's writers ranked by exact
+    // contribution, the strongest measured by path patching; the core's wiring measured whole.
     let mut ranked: Vec<usize> = (0..functions.len()).collect();
     ranked.sort_by(|a, b| functions[*b].importance.total_cmp(&functions[*a].importance));
-    ranked.truncate(settings.candidates);
-    let mut candidate_of: Vec<Option<usize>> = vec![None; functions.len()];
-    ranked.iter().enumerate().for_each(|(c, f)| candidate_of[*f] = Some(c));
-    // Per MLP its candidate functions and their candidate indices; per head its candidate index.
-    let mlp_candidates: Vec<Vec<(usize, usize)>> =
-        mlp_index.iter().map(|block| block.iter().enumerate().filter_map(|(i, f)| Some((i, candidate_of[(*f)?]?))).collect()).collect();
-    let head_candidate: Vec<Option<usize>> = head_index.iter().map(|f| candidate_of[(*f)?]).collect();
-    // Per route (a head reader's value, query and key maps; an MLP reader's gate and up maps), the
-    // summed flow from each candidate writer (columns) to each candidate reader (rows).
-    let mut flows: [Array2<f64>; 3] = std::array::from_fn(|_| Array2::<f64>::zeros((ranked.len(), ranked.len())));
-    for (_, batch) in &batches {
-        let pass = library.pass(&batch.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
-        let (_, seed, _) = library.predicted(&pass)?;
-        library.relp(&pass, seed, None, true, &mut |visit| {
-            let (cut, reads) = (visit.cut, &visit.reads);
-            // The writers before this read: MLPs of earlier layers, heads of earlier layers (and of
-            // this layer, for an MLP read).
-            let (layer, site_index) = match cut {
-                Cut::Mlp(b) => (mlps[b].layer, 2 * mlps[b].layer + 1),
-                Cut::Heads(l, _) => (l, 2 * l),
-            };
-            let (gain, inverse) = (&sites[site_index].gain, &pass.inverse[site_index]);
-            let mlp_writers: Vec<usize> = (0..mlps.len()).filter(|b| mlps[*b].layer < layer && !mlp_candidates[*b].is_empty()).collect();
-            let head_writers: Vec<usize> =
-                (0..heads.len()).filter(|h| head_candidate[*h].is_some() && (heads[*h].layer < layer || heads[*h].layer == layer && site_index % 2 == 1)).collect();
-            if let (Cut::Mlp(b), Reads::Mlp { gate, up }) = (&cut, reads) {
-                let b = *b;
-                let readers = &mlp_candidates[b];
-                if !readers.is_empty() {
-                    let block = &mlps[b];
-                    let mut parts = vec![(*gate, &block.gate)];
-                    if let (Some(up), Some((_, map))) = (up, &block.up) {
-                        parts.push((*up, map));
-                    }
-                    for (route, (gradient, map)) in parts.into_iter().enumerate() {
-                        let flows = &mut flows[route];
-                        // Per token the reader's gradient through its frozen norm, and its direction.
-                        let weights = Array2::from_shape_fn((pass.rows, readers.len()), |(r, c)| gradient[[r, readers[c].0]] * inverse[r]);
-                        let directions = Array2::from_shape_fn((readers.len(), width), |(c, d)| map[[readers[c].0, d]] * gain[d]);
-                        for &w in &mlp_writers {
-                            let writers = &mlp_candidates[w];
-                            let values = Array2::from_shape_fn((pass.rows, writers.len()), |(r, c)| pass.mlp[w].0[[r, writers[c].0]]);
-                            let outputs = Array2::from_shape_fn((width, writers.len()), |(d, c)| mlps[w].out[[d, writers[c].0]]);
-                            let flow = weights.t().dot(&values) * directions.dot(&outputs);
-                            for (r, reader) in readers.iter().enumerate() {
-                                for (c, writer) in writers.iter().enumerate() {
-                                    flows[[reader.1, writer.1]] += flow[[r, c]];
-                                }
-                            }
-                        }
-                        for &h in &head_writers {
-                            let (z, Some(writer)) = (&pass.head[h][2], head_candidate[h]) else { continue };
-                            let flow = (weights.t().dot(z) * directions.dot(&heads[h].output)).sum_axis(Axis(1));
-                            for (r, reader) in readers.iter().enumerate() {
-                                flows[[reader.1, writer]] += flow[r];
-                            }
-                        }
-                    }
-                }
-            }
-            if let (Cut::Heads(_, members), Reads::Heads(head_reads)) = (&cut, reads) {
-                    for (c, &h) in members.iter().enumerate() {
-                        let Some(reader) = head_candidate[h] else { continue };
-                        let block = &heads[h];
-                        let routes = [(&head_reads.value[c], &block.value), (&head_reads.query[c], &block.query.map), (&head_reads.key[c], &block.key.map)];
-                        for (route, (gradient, map)) in routes.into_iter().enumerate() {
-                            let flows = &mut flows[route];
-                            let weights = gradient * &inverse.view().insert_axis(Axis(1));
-                            let read = map * &gain.view().insert_axis(Axis(0));
-                            for &w in &mlp_writers {
-                                let writers = &mlp_candidates[w];
-                                let values = Array2::from_shape_fn((pass.rows, writers.len()), |(r, c)| pass.mlp[w].0[[r, writers[c].0]]);
-                                let outputs = Array2::from_shape_fn((writers.len(), width), |(c, d)| mlps[w].out[[d, writers[c].0]]);
-                                let flow = (values.t().dot(&weights) * outputs.dot(&read.t())).sum_axis(Axis(1));
-                                for (c, writer) in writers.iter().enumerate() {
-                                    flows[[reader, writer.1]] += flow[c];
-                                }
-                            }
-                            for &s in &head_writers {
-                                let Some(writer) = head_candidate[s] else { continue };
-                                flows[[reader, writer]] += (pass.head[s][2].t().dot(&weights) * heads[s].output.t().dot(&read.t())).sum();
-                            }
-                        }
-                    }
-            }
-        });
-    }
-    let summed = &flows[0] + &flows[1] + &flows[2];
-    for (c, &f) in ranked.iter().enumerate() {
-        let mut best = Best::default();
-        for (w, flow) in summed.row(c).iter().enumerate() {
-            if *flow != 0.0 {
-                best.offer(settings.edges, flow.abs(), w);
+    let core: Vec<usize> = ranked.iter().copied().take(settings.core).collect();
+    ranked.truncate(settings.candidates.max(settings.core));
+    let columns_of = |list: &[usize]| list.iter().map(|f| column[&functions[*f].name]).collect::<Vec<_>>();
+    let contributions = library.contributions(measured_sequences, &columns_of(&ranked), &columns_of(&core))?;
+    let mut measured_edges: BTreeMap<(usize, usize), (f64, f64)> = BTreeMap::new();
+    let mut patch = |writer: usize, reader: usize| -> Result<(f64, f64), String> {
+        if let Some(found) = measured_edges.get(&(writer, reader)) {
+            return Ok(*found);
+        }
+        let [output, bits] = library.path_patch(measured_sequences, column[&functions[writer].name], column[&functions[reader].name], None)?;
+        measured_edges.insert((writer, reader), (output, bits));
+        Ok((output, bits))
+    };
+    let mut wiring = vec![vec![0.0; core.len()]; core.len()];
+    let mut inputs: Vec<(usize, Vec<Edge>)> = Vec::new();
+    for (ri, &reader) in core.iter().enumerate() {
+        let mut candidates: Vec<(usize, [f64; 3])> = ranked
+            .iter()
+            .enumerate()
+            .map(|(wi, &writer)| (writer, [contributions[[ri, wi, 0]], contributions[[ri, wi, 1]], contributions[[ri, wi, 2]]]))
+            .filter(|(_, c)| c.iter().sum::<f64>() > 0.0)
+            .collect();
+        candidates.sort_by(|a, b| b.1.iter().sum::<f64>().total_cmp(&a.1.iter().sum::<f64>()));
+        candidates.truncate(settings.edges);
+        let mut edges = Vec::with_capacity(candidates.len());
+        for (writer, contribution) in candidates {
+            let (output, prediction_bits) = patch(writer, reader)?;
+            edges.push(Edge { from: writer, contribution, output, prediction_bits });
+        }
+        for (wi, &writer) in core.iter().enumerate() {
+            let w = ranked.iter().position(|f| *f == writer).ok_or("a core function outside the candidates")?;
+            if (0..3).any(|route| contributions[[ri, w, route]] > 0.0) {
+                wiring[ri][wi] = patch(writer, reader)?.1;
             }
         }
-        functions[f].inputs =
-            best.entries.iter().map(|(_, w)| Edge { from: ranked[*w], flow: summed[[c, *w]] / total, routes: std::array::from_fn(|r| flows[r][[c, *w]] / total) }).collect();
+        inputs.push((reader, edges));
     }
-    // The core: the most important candidates, the background apart.
-    let core: Vec<usize> = ranked.iter().copied().filter(|f| !functions[*f].background).take(settings.core).collect();
-    let wiring = core.iter().map(|i| core.iter().map(|j| candidate_of[*i].zip(candidate_of[*j]).map_or(0.0, |(a, b)| summed[[a, b]] / total)).collect()).collect();
+    for (reader, edges) in inputs {
+        functions[reader].inputs = edges;
+    }
+    let mut participation: Vec<f64> = effects
+        .columns()
+        .into_iter()
+        .map(|column| {
+            let (absolute, square) = column.iter().fold((0.0, 0.0), |(a, q), v| (a + v.abs(), q + v * v));
+            if square > 0.0 { absolute * absolute / square } else { 0.0 }
+        })
+        .collect();
+    participation.sort_by(f64::total_cmp);
+    let quantile = |q: f64| participation[((q * participation.len() as f64).ceil() as usize).clamp(1, participation.len()) - 1];
     Ok(Readout {
         held_out_tokens: sequences.len() * length,
+        measured_tokens: effects.ncols(),
         functions,
         removed,
         core,
         wiring,
         predicted: predicted_all,
-        mean_logit: logit_sum / total,
-        targets: samples as usize,
-        important: thresholds.iter().enumerate().map(|(j, tau)| [*tau, cut_counts.iter().map(|c| c[j]).sum::<f64>() / samples]).collect(),
-        participation: cut_participation.iter().sum::<f64>() / samples,
-        cuts: (0..cuts)
-            .map(|c| CutSummary {
-                name: format!("L{}.{}", c / 2, if c % 2 == 0 { "heads" } else { "mlp" }),
-                participation: cut_participation[c] / samples,
-                counts: cut_counts[c].iter().map(|n| n / samples).collect(),
-            })
-            .collect(),
+        participation: [quantile(0.1), quantile(0.5), quantile(0.9), participation.iter().sum::<f64>() / participation.len() as f64],
     })
 }
 
@@ -2056,6 +2028,41 @@ mod tests {
             assert!(largest(&library.run(&sequences, &zero).expect("run").last, &base.last) > 1e-6);
             let log_p = library.log_probabilities(&base.last).expect("log probabilities");
             assert!(log_p.outer_iter().all(|row| (row.mapv(f64::exp).sum() - 1.0).abs() < 1e-12));
+        }
+    }
+
+    /// Patching every function with its own write changes nothing, and patching a head's write
+    /// with the counterfactual's equals the run with that head's read replaced by the
+    /// counterfactual's.
+    #[test]
+    fn patching_a_head_matches_replacing_its_read() {
+        for dir in [tiny_export("readout_patch_gelu", 2), tiny_qwen3_export("readout_patch_gated", 2)] {
+            let imported = import_language_model(&dir, 6, 12).expect("tiny export");
+            std::fs::remove_dir_all(dir).expect("remove the tiny export");
+            let native = split_sites(&imported.program).expect("split sites");
+            let layers = layer_nodes(&native, 2).expect("layer nodes");
+            let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+            let (clean, other) = (tokens[..12].to_vec(), tokens[12..24].to_vec());
+            let artifact = library_mdl::explanation(&native, &layers).expect("library").artifact;
+            let host = Device::host();
+            let library = Library::new(&host, &host, &native, &layers, &artifact, 1 << 30, 64).expect("library on the host");
+            let same = library.patch_effects(&[(clean.clone(), clean.clone())], &[(1, 2)], 7).expect("patch");
+            assert!(same.iter().all(|v| v.abs() < 1e-12), "self-patching changed the metric");
+            let effects = library.patch_effects(&[(clean.clone(), other.clone())], &[(1, 2)], 7).expect("patch");
+            let none = std::collections::BTreeMap::new();
+            let (base, counter) = (library.run(&[clean.clone()], &none).expect("run"), library.run(&[other], &none).expect("run"));
+            let difference = |last: &ndarray::Array2<f64>| {
+                let log_p = library.log_probabilities(last).expect("log probabilities");
+                log_p[[11, 1]] - log_p[[11, 2]]
+            };
+            let functions = library.functions();
+            for (h, (layer, head)) in library.heads().into_iter().enumerate() {
+                let column = functions.iter().position(|f| f.name == format!("L{layer}.H{head}")).expect("a head's column");
+                let replaced = library.run(&[clean.clone()], &[(h, counter.reads[h].clone())].into()).expect("run");
+                let expected = difference(&replaced.last) - difference(&base.last);
+                let gap = (effects[[column, 0]] - expected).abs();
+                assert!(gap < 1e-9 * (1.0 + expected.abs()), "head {h}: patched {} against {expected}", effects[[column, 0]]);
+            }
         }
     }
 

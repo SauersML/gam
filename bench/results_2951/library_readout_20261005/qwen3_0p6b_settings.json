@@ -13,13 +13,9 @@
   "contexts": 8,
   "tokens": 8,
   "edges": 8,
-  "core": 12,
-  "thresholds": [
-   0.01,
-   0.03,
-   0.1
-  ],
+  "measured_sequences": 4,
+  "removal_batch": 8,
   "candidates": 2048,
-  "targets": 8
+  "core": 12
  }
 }

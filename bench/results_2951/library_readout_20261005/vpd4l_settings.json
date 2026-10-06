@@ -8,18 +8,14 @@
  "window": 16,
  "readout": {
   "batch_sequences": 2,
-  "numeric_bytes": 4000000000,
+  "numeric_bytes": 8000000000,
   "tile_rows": 1024,
   "contexts": 8,
   "tokens": 8,
   "edges": 8,
-  "core": 12,
-  "thresholds": [
-   0.01,
-   0.03,
-   0.1
-  ],
+  "measured_sequences": 4,
+  "removal_batch": 16,
   "candidates": 2048,
-  "targets": 32
+  "core": 12
  }
 }
