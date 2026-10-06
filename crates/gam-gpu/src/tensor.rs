@@ -390,6 +390,7 @@ impl GroupMap {
     }
 
     /// The axis as the kernels' code: 0 rows, 1 columns, 2 entries.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn code(&self) -> u32 {
         match self.axis {
             GroupAxis::Rows => 0,
@@ -400,11 +401,13 @@ impl GroupMap {
 
     /// Row chunks of a column reduction: each thread sums a column over about 64 rows (one
     /// atomic per column per chunk); one chunk otherwise.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn chunks(&self) -> usize {
         if self.axis == GroupAxis::Columns { self.rows.div_ceil(64).max(1) } else { 1 }
     }
 
     /// The threads a reduction over the map runs: one per column and chunk, or one per entry.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn threads(&self) -> usize {
         if self.axis == GroupAxis::Columns { self.cols * self.chunks() } else { self.rows * self.cols }
     }

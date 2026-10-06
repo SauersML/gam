@@ -1,4 +1,4 @@
-//! Declared-precision real codes and decode-then-evaluate distortion (#2951).
+//! Declared-precision real codes (#2951).
 //!
 //! A mechanism program's code carries no free real-valued coefficient. Every real
 //! an artifact holds is sent as integers under a precision the experiment declares,
@@ -21,33 +21,10 @@
 //! holds with no rounding term. A step that is not a power of two would put a
 //! rounding error into every decoded value.
 //!
-//! # Decode, then evaluate
+//! # Codes
 //!
-//! [`decode_then_evaluate`] decodes an artifact, executes the decoded artifact, and
-//! measures the declared distortion of its outputs against the native reference.
-//! The quantization error of the parameters never stands in for the error of the
-//! outputs: the computation is nonlinear, and a parameter error bounds an output
-//! error only through a derived Lipschitz constant. The measurement covers the inputs
-//! the evaluation executes and certifies nothing beyond them (#2946 fr-census
-//! overclaim audit, comment 5716123817).
-//!
-//! The declared distortion returns an [`EvidenceStatus`]. The status names the family
-//! it evaluated, its witness and its derived rounding bound.
-//! [`DecodedFidelity::verdict`] reports only what that status proves about the
-//! tolerance. A figure within its rounding of the tolerance is unresolved, not a pass.
-//! A statistical estimate never certifies.
-//!
-//! # Messages
-//!
-//! The code is also one self-delimiting message through `codec`'s integer codes, so
-//! a library appends it and a decoder reads it back without a real-valued field:
-//! [`LatticeCode::write`] sends the coordinate count as `count + 1` in the prefix
-//! integer code, then the declared precision `p` and each index `k` in `codec`'s signed
-//! prefix integer code. [`LatticeCode::index_bits`] is the length of the index codewords
-//! alone, without that header.
-//!
-//! A reader refuses a count that the bits remaining in the message cannot hold before
-//! it allocates anything: a lattice index takes at least one bit.
+//! [`LatticeCode`] holds reals as their indices on one declared lattice;
+//! [`DecodableArtifact::decode`] rebuilds them from the indices and the declaration alone.
 
 /// Largest `|p|` for which both `2^p` and `2^-p` are normal `f64` powers of two: the
 /// normal exponents span `[f64::MIN_EXP - 1, f64::MAX_EXP - 1] = [-1022, 1023]`.

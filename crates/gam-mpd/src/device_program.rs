@@ -191,7 +191,7 @@ pub struct DeviceProgram {
     /// The arithmetic of every product in the forward pass and the head (float64 by default; a
     /// training step's proposals may run in TF32, its accepted point is scored again in float64).
     arithmetic: Arithmetic,
-    /// Sibling attention heads run as one computation ([`device_heads`]).
+    /// Sibling attention heads run as one computation (`device_heads`).
     fused: Vec<Fused>,
     /// Per node, the group it is a member or the output of.
     grouped: Vec<Option<usize>>,
@@ -236,7 +236,7 @@ struct PreparedBatch {
     rotations: Arc<Vec<(Rotary, Tensor, Tensor)>>,
 }
 
-/// A fused group's buffers in a trace ([`device_heads`]): `P`, `N` and `G` when its queries and
+/// A fused group's buffers in a trace (`device_heads`): `P`, `N` and `G` when its queries and
 /// keys are normed, and `A`.
 #[derive(Clone, Copy)]
 struct Buffers {
@@ -1155,7 +1155,7 @@ impl DeviceProgram {
     /// Per-node edits on materialized values, preserving exception-before-intervention order:
     /// `before(node, value)` changes the value of each node in `before_at` in place, then
     /// `edit(node, trace)` may replace any node's value. In a group of sibling heads run as one
-    /// computation ([`device_heads`]; one with a node in `before_at` runs node by node) `edit` is
+    /// computation (`device_heads`; one with a node in `before_at` runs node by node) `edit` is
     /// offered the group's projections first, then its heads, each replacement written back before
     /// the attention or the output reads it: there a hook reads only its own node's value. An
     /// unsupported unmaterialized head/feature is not offered to either callback.
@@ -1485,7 +1485,7 @@ impl DeviceProgram {
         }
     }
 
-    /// Group `g`'s heads (module note of [`device_heads`]): `P` into the trace's buffers, each
+    /// Group `g`'s heads (module note of `device_heads`): `P` into the trace's buffers, each
     /// projection offered to `edit` in node order (a replacement written back into `P`), then `N`
     /// and `G` from it the same way when the queries and keys are normed, then `A`; every member's
     /// value a block of one of them.
