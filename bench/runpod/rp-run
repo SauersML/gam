@@ -1267,6 +1267,11 @@ for a in "$@"; do
         case $rel in target/*) continue ;; esac
         git -C "$MAC_GAM" cat-file -e "$C:$rel" 2> /dev/null && srcpaths+=("$rel")
     done < <(grep -oE "$MAC_GAM/[^ :,;=\"']+" <<< "$a" || true)
+    # A path relative to the repository (the command runs in WS/src) that the commit holds.
+    while read -r p; do
+        p=${p#./} p=${p%/}
+        [ -n "$p" ] && [[ $p != target/* ]] && git -C "$MAC_GAM" cat-file -e "$C:$p" 2> /dev/null && srcpaths+=("$p")
+    done < <(grep -oE "(^|[ =:,\"'])(\./)?[A-Za-z0-9_][A-Za-z0-9_.-]*/[^ :,;=\"']*" <<< " $a" | sed -E 's/^[ =:,"'"'"']//' || true)
     a=${a//$MAC_GAM\/target\/release\/examples\//$WS/bin/}
     a=${a//$MAC_GAM\//$WS/src/}
     a=${a//$MAC_DATA\//$WS/mpd-data/}
@@ -1468,7 +1473,11 @@ if [ -n "${RP_DRY:-}" ]; then
     built=$( for e in "${fw_plan[@]}"; do IFS='|' read -r d k n ts _ <<< "$e"; printf 'qwen3_fineweb/%s (FineWeb file %s, %s documents, contexts %s) ' "$d" "$k" "$n" "$ts"; done
              for e in "${pile_plan[@]}"; do read -r x b m <<< "$e"; printf 'engine/%s (from %s and %s Pile train rows) ' "$x" "$b" "$m"; done )
     echo "built:    ${built:-none}"
-    echo "source:   crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md ${srcpaths[*]:-}"
+    if (( NEED_RUST )); then
+        echo "source:   crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md ${srcpaths[*]:-} (from GitHub)"
+    else
+        echo "source:   ${srcpaths[*]:-none} (from the Mac; the whole commit from GitHub only if the pod must compile)"
+    fi
     echo "binaries: $(unbuilt | tr '\n' ' ' | sed 's/^$/all built/; s/^\(.\)/to build on GitHub Actions: \1/') (examples ${examples[*]:-none}, tests ${tests[*]:-none}, key $KEY)"
     echo "approval: $APPROVAL${SMALL:+ (a small run: $SMALL_WHY)}"
     echo "command:  ${cmd:-none}"
@@ -1485,7 +1494,7 @@ TMP=$(mktemp -d /tmp/rp-run.XXXXXX)
 ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$TMP/key"
 chmod 600 "$TMP/key"
 KEYS="$( [ -f "$TMP/key.pub" ] && cat "$TMP/key.pub")"$'\n'"$(cat ~/.ssh/runpod_ed25519.pub)"
-POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0 GUEST=0 EARLY_FETCH="" POD_HOST=""
+POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0 GUEST=0 EARLY_FETCH="" EARLY_PYENV="" POD_HOST=""
 SSH=(ssh -F none -i "$TMP/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ForwardX11=no
      -o UserKnownHostsFile="$TMP/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20
      -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o LogLevel=ERROR)
@@ -1593,13 +1602,19 @@ record() {  # GPU_ID KIND
 # by its host (exited by RunPod, or running but unreachable).
 deleted() { [ "$(pod_state "$1")" = GONE ]; }
 
-# Waits for SSH to POD: 5 minutes. Of the pods so far every one that came up did so within 45 s,
-# and the three that did not had not answered after 10 to 15 minutes (a host pulling the 7 GB image
-# slower than 25 MB/s is also better left for another). Sets IP PORT VCPU.
+# Waits for SSH to POD (sets IP PORT VCPU) as long as a new pod may take: the slowest time to SSH
+# measured (SSH_UP, at least ten pods) plus the median, the wait a replacement pod typically costs;
+# 300 s until ten are measured. 107 pods answered in 8-56 s (median 26 s); the six that took longer
+# never answered, and each held a paid GPU for 300 s.
+SSH_UP=$RP/ssh_up.tsv BAD_IPS=$RP/bad_ips
+ssh_wait() {
+    cut -f3 "$SSH_UP" 2> /dev/null | sort -n | awk '{ a[NR] = $1 } END { print (NR >= 10 ? a[NR] + a[int((NR + 1) / 2)] : 300) }'
+}
 reach() {
-    local r b st
+    local r b st limit
+    limit=$(ssh_wait)
     until [ -n "$IP" ]; do
-        (( $(date +%s) - CREATED < 300 )) || { say "no public SSH address after 5 minutes"; return 1; }
+        (( $(date +%s) - CREATED < limit )) || { say "no public SSH address after $limit s (the slowest pod measured plus the median)"; return 1; }
         if [ "$(provider_of "$POD")" = thunder ]; then
             r=$(tapi GET /instances/list)
             if [ "$(status_of "$r")" = 200 ]; then
@@ -1642,15 +1657,30 @@ reach() {
         fi
         [ -n "$IP" ] || sleep 5
     done
+    # An address whose pods never answered SSH (two hosts behind 80.15.7.37 each held a GPU for
+    # 300 s) is left at once.
+    if grep -qxF "$IP" "$BAD_IPS" 2> /dev/null; then
+        say "SSH address $IP never answered before"
+        return 1
+    fi
     until on_pod true < /dev/null 2> /dev/null; do
-        (( $(date +%s) - CREATED < 300 )) || { say "SSH to $IP:$PORT not answering after 5 minutes"; return 1; }
-        sleep 5
+        if (( $(date +%s) - CREATED >= limit )); then
+            echo "$IP" >> "$BAD_IPS"
+            say "SSH to $IP:$PORT not answering after $limit s (the slowest pod measured plus the median); $IP recorded"
+            return 1
+        fi
+        sleep 2
     done
+    printf '%s\t%s\t%s\n' "$(date '+%F %T')" "${POD_HOST:-}" "$(( $(date +%s) - CREATED ))" >> "$SSH_UP"
     say "ssh $SSH_USER@$IP -p $PORT up after $(( $(date +%s) - CREATED )) s"
     # The published inputs start downloading now, while the pod's checks run (setup waits for them;
     # a pod the checks discard takes its partial download with it).
     if [ ${#fetched[@]} -gt 0 ] && [ -z "$EARLY_FETCH" ]; then
         fetch_published & EARLY_FETCH=$!
+    fi
+    # So do the Python environment and the models (19-106 s), which need nothing from the checks.
+    if { [ -n "$PYENV_DIR" ] || [ -n "${RP_HF_MODELS:-}" ]; } && [ -z "$EARLY_PYENV" ]; then
+        python_env & EARLY_PYENV=$!
     fi
 }
 
@@ -1793,7 +1823,7 @@ launch() {
     local kind price gpu r code left host
     # A listed run relaunches only while still listed; a small run's approval covers its whole cap.
     [ "$APPROVAL" = auto ] || approved "$NAME" || { say "approval for $NAME withdrawn; not launching a pod"; exit 3; }
-    POD="" IP="" PORT="" EARLY_FETCH=""
+    POD="" IP="" PORT="" EARLY_FETCH="" EARLY_PYENV=""
     rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
     host=$(find_host)
     if [ -n "$host" ] && attach "$host"; then
@@ -1878,12 +1908,15 @@ launch() {
         elif busy=$(gpu_in_use); [ -n "$busy" ]; then
             [ -z "$host" ] || echo "$host" >> "$BAD_HOSTS"
             say "the GPU on host ${host:-?} is not free before the run ($busy); recorded as failing; deleting pod $POD"
+        elif fetch_too_slow; then
+            say "deleting pod $POD"
         else
             break
         fi
         [ -z "$IP" ] || on_pod -O exit > /dev/null 2>&1 || true
         [ -z "$EARLY_FETCH" ] || { kill "$EARLY_FETCH" 2> /dev/null || true; wait "$EARLY_FETCH" 2> /dev/null || true; EARLY_FETCH=""; }
-        rm -f "$TMP/upload_s" "$TMP/refused"
+        [ -z "$EARLY_PYENV" ] || { kill "$EARLY_PYENV" 2> /dev/null || true; wait "$EARLY_PYENV" 2> /dev/null || true; EARLY_PYENV=""; }
+        rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
         echo discarded > "$ACTIVE/.$POD.end"
         reap "$POD" || exit 1
         POD="" IP="" PORT=""
@@ -2024,7 +2057,7 @@ upload_inputs() {
     fi
     took=$(( $(date +%s) - started ))
     echo "$took" >> "$TMP/upload_s"
-    say "uploaded ${#files[@]} files, $(( upload_kb / 1024 )) MB ($saved MB fewer: $(grep -c . <<< "$narrow") float64 files as float32, widened on the pod, sha256s equal), in $took s ($(awk -v k="$upload_kb" -v s="$saved" -v t="$took" 'BEGIN { printf "%.1f", (k / 1024 - s) / (t > 0 ? t : 1) }') MB/s sent, $streams streams)"
+    say "uploaded ${#files[@]} files, $(( total >> 20 )) MB ($saved MB fewer: $(grep -c . <<< "$narrow") float64 files as float32, widened on the pod, sha256s equal), in $took s ($(awk -v k="$(( total >> 10 ))" -v s="$saved" -v t="$took" 'BEGIN { printf "%.1f", (k / 1024 - s) / (t > 0 ? t : 1) }') MB/s sent, $streams streams)"
 }
 
 # The Hugging Face snapshots COMMAND names, downloaded by the pod at their revisions.
@@ -2094,6 +2127,34 @@ slow_host() {  # HOST
     awk -v b="$FETCH_BYTES" -v r="$mine" -v m="$med" -v d="$DISCARD_S" 'BEGIN { mb = b / 1048576; exit !(mb / r > d + mb / m) }'
 }
 
+# Whether the inputs still downloading on this new pod would take longer to finish than a new pod
+# takes to boot and fetch them all (slow_host's rule, at the rate measured now): the bytes the pod
+# received over PROBE_S seconds (the download goes on meanwhile, and setup waits for it anyway). vpd-pricing-n2048's host fetched 2.8 GB at 8.4 MB/s (329 s) where the median host
+# took 55 s; its rate showed in the first seconds. The rate is recorded for slow_host.
+PROBE_S=3
+# The pod's bytes in its run's inputs (KB) and its bytes received on every interface but lo: the
+# host's download rate, which a Python environment installing at the same time shares.
+probe_bytes() {
+    on_pod "du -sk $WS/mpd-data 2> /dev/null | cut -f1; cat /proc/net/dev" < /dev/null |
+        awk 'NR == 1 { d = $1; next } /:/ { sub(/^ +/, ""); split($0, a, /: */); split(a[2], f, / +/); if (a[1] != "lo") s += f[1] } END { print d + 0, s + 0 }'
+}
+fetch_too_slow() {
+    local med a b rate
+    [ -n "$EARLY_FETCH" ] && kill -0 "$EARLY_FETCH" 2> /dev/null && (( FETCH_BYTES > FETCH_PIECE )) || return 1
+    med=$(cut -f3 "$RP/host_rates.tsv" 2> /dev/null | sort -n | awk '{ a[NR] = $1 } END { if (NR >= 3) print a[int((NR + 1) / 2)] }')
+    [ -n "$med" ] || return 1
+    a=$(probe_bytes) || return 1
+    sleep "$PROBE_S"
+    kill -0 "$EARLY_FETCH" 2> /dev/null || return 1
+    b=$(probe_bytes) || return 1
+    rate=$(awk -v a="$a" -v b="$b" -v t="$PROBE_S" 'BEGIN { split(a, x, " "); split(b, y, " "); printf "%.1f", (y[2] - x[2]) / 1048576 / t }')
+    awk -v b="$b" -v total="$FETCH_BYTES" -v r="$rate" -v m="$med" -v d="$DISCARD_S" \
+        'BEGIN { split(b, y, " "); mb = total / 1048576; rest = mb - y[1] / 1024; exit !(rest > 0 && r > 0 && rest / r > d + mb / m) }' || return 1
+    [ -z "$POD_HOST" ] || printf '%s\t%s\t%s\n' "$(date '+%F %T')" "$POD_HOST" "$rate" >> "$RP/host_rates.tsv"
+    say "host ${POD_HOST:-?} receives $rate MB/s: the $(( FETCH_BYTES >> 20 )) MB of inputs would take longer than a new pod ($DISCARD_S s) at the median host's $med MB/s; recorded"
+    return 0
+}
+
 fetch_models() {
     local p repo rev list
     for p in "${hf[@]}"; do
@@ -2129,6 +2190,8 @@ python_env() {
     [ -n "$PYENV_DIR" ] || [ -n "${RP_HF_MODELS:-}" ] || return 0
     # Over the shared connection: the uploads hold the separate ones sshd allows.
     local STEP_CONN=on_pod
+    # The pinned set goes up from the Mac: this starts at SSH, before the source is on the pod.
+    on_pod "mkdir -p $WS && cat > $WS/pyenv-reqs.txt" <<< "$PYENV_REQS" || return 1
     data_step "installing uv" 'command -v uv > /dev/null || [ -x ~/.local/bin/uv ] || curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null 2>&1' || return 1
     for m in ${RP_HF_MODELS:-}; do
         repo=${m%@*} rev=main
@@ -2140,7 +2203,7 @@ python_env() {
         local t0=$(date +%s)
         data_step "installing the Python environment $RP_PYENV ($WS/pyenv.log)" "export PATH=\$HOME/.local/bin:\$PATH UV_CACHE_DIR=/workspace/.uv-cache
             mkdir -p /workspace/pyenv && flock /workspace/pyenv/.lock bash -c '[ -f $PYENV_DIR/.complete ] || {
-                rm -rf $PYENV_DIR && uv venv -q --python 3.12 $PYENV_DIR && uv pip install -q --python $PYENV_DIR/bin/python -r $WS/src/bench/runpod/pyenv/$RP_PYENV.txt && touch $PYENV_DIR/.complete $WS/pyenv.fresh; }' > $WS/pyenv.log 2>&1" || failed=1
+                rm -rf $PYENV_DIR && uv venv -q --python 3.12 $PYENV_DIR && uv pip install -q --python $PYENV_DIR/bin/python -r $WS/pyenv-reqs.txt && touch $PYENV_DIR/.complete $WS/pyenv.fresh; }' > $WS/pyenv.log 2>&1" || failed=1
         # A fresh install's time on this host, for slow_host.
         if (( ! failed )) && [ -n "$POD_HOST" ] && on_pod "test -f $WS/pyenv.fresh" < /dev/null 2> /dev/null; then
             printf '%s\t%s\t%s\n' "$(date '+%F %T')" "$POD_HOST" "$(( $(date +%s) - t0 ))" >> "$RP/host_installs.tsv"
@@ -2301,26 +2364,10 @@ setup() {
     local started=$(date +%s) x pkg flags build=() cached=() jobs=()
     # Every step checks its own status: `set -e` does not act inside the condition this runs in. A
     # step that fails on the connection (ssh's 255) loses the pod; any other failure ends the run.
-    # The published inputs need nothing else: they start at once. Then the source, which the data
-    # builds and the Python environment need: from GitHub at datacenter speed (the commit is
-    # published), the Mac's archive if that fails.
+    # The published inputs need nothing else: they start at once (at SSH, in reach).
     if [ -n "$EARLY_FETCH" ]; then jobs+=("$EARLY_FETCH"); else fetch_published & jobs+=($!); fi
-    local members
-    members=$(printf "gam-$C/%s " crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md "${srcpaths[@]}")
-    if on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && curl -fsSL --retry 3 https://codeload.github.com/SauersML/gam/tar.gz/$C |
-            tar -xz --strip-components=1 -C $WS/src $members" < /dev/null 2> /dev/null; then
-        say "source ${C:0:12} from GitHub"
-    else
-    git -C "$MAC_GAM" archive "$C" crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md "${srcpaths[@]}" |
-        gzip -1 | on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && gzip -dc | tar -x -C $WS/src" || return 1
-    fi
-    # Inputs, data, models and rsync (for syncing outputs) arrive while the toolchain and builds do.
-    { upload_inputs && build_pile; } & jobs+=($!)
-    build_fineweb & jobs+=($!)
-    fetch_models & jobs+=($!)
-    python_env & jobs+=($!)
-    on_pod 'S=$(command -v sudo || true); command -v rsync > /dev/null || { $S apt-get update -qq && $S apt-get install -y -qq rsync; } > /dev/null 2>&1' & jobs+=($!)
-    # The pod downloads published binaries itself; the Mac sends only what it alone holds.
+    # The pod downloads published binaries itself (in the background: vpd-pricing-n2048's waited
+    # 6 minutes behind a source download on a slow host); the Mac sends only what it alone holds.
     local have="" assets=()
     [ ${#examples[@]} -eq 0 ] && [ ${#tests[@]} -eq 0 ] || have=$(published_assets)
     for x in "${examples[@]}"; do
@@ -2334,9 +2381,43 @@ setup() {
         exit 1
     fi
     if [ ${#assets[@]} -gt 0 ]; then
-        on_pod "cd $WS/bin && for n in ${assets[*]}; do curl -fsSL --retry 3 -o \$n $ASSETS/$KEY.\$n && chmod +x \$n || exit 1; done" < /dev/null || return 1
-        say "${assets[*]} from rp-run-bin ($KEY), downloaded by the pod"
+        { on_pod "mkdir -p $WS/bin && cd $WS/bin && for n in ${assets[*]}; do curl -fsSL --retry 3 -o \$n $ASSETS/$KEY.\$n && chmod +x \$n || exit 1; done" < /dev/null &&
+            say "${assets[*]} from rp-run-bin ($KEY), downloaded by the pod"; } & jobs+=($!)
     fi
+    # The source. A run that compiles nothing needs only the paths COMMAND, the data builds and the
+    # Python environment name (srcpaths: about 0.2 MB), sent from the Mac; a compile takes the whole
+    # commit from GitHub at datacenter speed (141 MB), the Mac's archive if that fails.
+    local members slim=""
+    if (( ! NEED_RUST )) && [ ${#build[@]} -eq 0 ]; then
+        slim=1
+        if [ ${#srcpaths[@]} -gt 0 ]; then
+            git -C "$MAC_GAM" archive "$C" "${srcpaths[@]}" | gzip -1 > "$TMP/src.tgz" &&
+                (( $(stat -f %z "$TMP/src.tgz") <= UPLOAD_MAX_MB << 20 )) || slim=""
+        fi
+    fi
+    if [ -n "$slim" ]; then
+        if [ ${#srcpaths[@]} -gt 0 ]; then
+            on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && gzip -dc | tar -x -C $WS/src" < "$TMP/src.tgz" || return 1
+            say "source ${C:0:12}: ${srcpaths[*]} ($(( $(stat -f %z "$TMP/src.tgz") >> 10 )) KB) from the Mac"
+        else
+            on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME" < /dev/null || return 1
+        fi
+    else
+    members=$(printf "gam-$C/%s " crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md "${srcpaths[@]}")
+    if on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && curl -fsSL --retry 3 https://codeload.github.com/SauersML/gam/tar.gz/$C |
+            tar -xz --strip-components=1 -C $WS/src $members" < /dev/null 2> /dev/null; then
+        say "source ${C:0:12} from GitHub"
+    else
+    git -C "$MAC_GAM" archive "$C" crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md "${srcpaths[@]}" |
+        gzip -1 | on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && gzip -dc | tar -x -C $WS/src" || return 1
+    fi
+    fi
+    # Inputs, data, models and rsync (for syncing outputs) arrive while the toolchain and builds do.
+    { upload_inputs && build_pile; } & jobs+=($!)
+    build_fineweb & jobs+=($!)
+    fetch_models & jobs+=($!)
+    if [ -n "$EARLY_PYENV" ]; then jobs+=("$EARLY_PYENV"); else python_env & jobs+=($!); fi
+    on_pod 'S=$(command -v sudo || true); command -v rsync > /dev/null || { $S apt-get update -qq && $S apt-get install -y -qq rsync; } > /dev/null 2>&1' & jobs+=($!)
     if (( NEED_RUST )) || [ ${#build[@]} -gt 0 ]; then
         on_pod "[ -x ~/.cargo/bin/cargo ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain $CHANNEL" > /dev/null || return 1
     fi
