@@ -88,6 +88,10 @@ impl Compensation {
         let mut mlps = Vec::with_capacity(explanation.layers.len());
         let mut nodes = Vec::with_capacity(explanation.layers.len());
         for (l, layer) in explanation.layers.iter().enumerate() {
+            // An MLP the explanation leaves to `M` (`library_mdl::scoped`) has nothing to compensate.
+            if layer.functions.is_empty() {
+                continue;
+            }
             let out = operator(&flat, &format!("library.l{l}.mlp.out"))?;
             // The activations are the node the output map reads (a term of the MLP's output, beside
             // the terms of its read–write ties).

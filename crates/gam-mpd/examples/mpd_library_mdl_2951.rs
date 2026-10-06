@@ -17,6 +17,10 @@
 //! the held-out file's rows and the training sequences are the training file's first rows. `gpu` is the single-precision device (CUDA in f32 storage, or the Apple GPU). The
 //! fit is checkpointed in `OUT/checkpoint.bin` after every epoch, with its trajectory readable in
 //! `OUT/checkpoint.json`; rerunning the same command resumes it.
+//!
+//! With `blocks` (block `2l` layer `l`'s attention, `2l + 1` its MLP), the explanation is of those
+//! blocks alone and `M` everywhere else (`library_mdl::scoped`): the fast loop for comparing method
+//! changes, F against N for one block before a whole-model run.
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     engine::{log_to_stderr, sha256},
@@ -40,6 +44,9 @@ struct Settings {
     training_sequences: usize,
     context: usize,
     held_out: [usize; 2],
+    /// The blocks the explanation explains, when not all of them.
+    #[serde(default)]
+    blocks: Option<Vec<usize>>,
     /// A Hugging Face checkpoint's token rows (absent for an engine export, which holds its own).
     #[serde(default)]
     windows: Option<Windows>,
@@ -145,6 +152,10 @@ fn main() -> Result<(), String> {
     let native = split_sites(&program)?;
     let layers = layer_nodes(&native, layer_count)?;
     let explanation = library_mdl::explanation(&native, &layers)?;
+    let explanation = match &settings.blocks {
+        Some(blocks) => library_mdl::scoped(&explanation, blocks)?,
+        None => explanation,
+    };
     explanation.artifact.validate_coverage(&native)?;
     // A checkpoint there must be this fit's (export, sequences, program, groups, shared
     // parameters) before anything is written.
@@ -161,6 +172,7 @@ fn main() -> Result<(), String> {
         "held_out_sequences": [first, end],
         "context": settings.context,
         "groups": explanation.groups.len(),
+        "blocks": settings.blocks,
         "identity": identity,
     });
     log::info!("library run: {provenance}");

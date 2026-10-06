@@ -71,6 +71,11 @@
 //! test and every removal comparison score the same experiments, and `M`'s targets for them are
 //! made on the device whenever a batch is scored (`interchange::targets`).
 //!
+//! An explanation of some blocks only ([`scoped`]) is `M` everywhere else: its library holds the
+//! trainable operators and prior groups of those blocks alone, so only they are charged, and every
+//! experiment runs `P`'s blocks exactly there and `M`'s elsewhere (no other hybrid would differ from
+//! `M`), with the patch drawn as above over all `2L` blocks.
+//!
 //! # The fit
 //!
 //! Each step draws one weight sample `θ = μ + σ ⊙ ε` (`ε` standard normal), runs a batch's
@@ -631,6 +636,70 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
     Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference })
 }
 
+/// The prior groups of each of `explanation`'s `2L` blocks (block `2l` layer `l`'s attention,
+/// `2l + 1` its MLP), from its layers' heads and functions.
+fn block_groups(explanation: &Explanation) -> Vec<Vec<usize>> {
+    explanation
+        .layers
+        .iter()
+        .flat_map(|layer| {
+            let attention = layer.heads.iter().flat_map(|(planes, values)| planes.iter().chain(values)).copied().collect();
+            [attention, layer.functions.iter().flatten().copied().collect()]
+        })
+        .collect()
+}
+
+/// Which of `explanation`'s `2L` blocks its library explains: those holding a trainable operator.
+fn scope(explanation: &Explanation) -> Vec<bool> {
+    let trainable: std::collections::BTreeSet<usize> = explanation.trainable.iter().copied().collect();
+    block_groups(explanation).iter().map(|groups| groups.iter().any(|g| explanation.groups[*g].cells.iter().any(|c| trainable.contains(&c.operator)))).collect()
+}
+
+/// `explanation` restricted to `blocks` (block `2l` layer `l`'s attention, `2l + 1` its MLP): `M`
+/// everywhere else. Only those blocks' prior groups and their operators stay trainable and charged;
+/// the other blocks' library operators keep `M`'s values and no experiment runs them (module note).
+/// A group in two blocks (a share across them) is refused.
+pub fn scoped(explanation: &Explanation, blocks: &[usize]) -> Result<Explanation, String> {
+    let per_block = block_groups(explanation);
+    if blocks.is_empty() || blocks.iter().any(|b| *b >= per_block.len()) {
+        return Err(format!("blocks {blocks:?} of {}", per_block.len()));
+    }
+    let mut block_of = vec![None; explanation.groups.len()];
+    for (b, groups) in per_block.iter().enumerate() {
+        for g in groups {
+            if block_of[*g].replace(b).is_some_and(|other| other != b) {
+                return Err(format!("{}: a group in two blocks", explanation.groups[*g].name));
+            }
+        }
+    }
+    // Old group index to new, for the kept groups in order.
+    let mut kept = vec![None; explanation.groups.len()];
+    let mut count = 0;
+    for (g, block) in block_of.iter().enumerate() {
+        if block.is_some_and(|b| blocks.contains(&b)) {
+            kept[g] = Some(count);
+            count += 1;
+        }
+    }
+    let renumber = |ids: &[usize]| -> Vec<usize> { ids.iter().filter_map(|g| kept[*g]).collect() };
+    let groups: Vec<Group> = explanation.groups.iter().zip(&kept).filter(|(_, k)| k.is_some()).map(|(g, _)| g.clone()).collect();
+    let mut trainable: Vec<usize> = groups.iter().flat_map(|g| g.cells.iter().map(|c| c.operator)).collect();
+    trainable.sort_unstable();
+    trainable.dedup();
+    let layers = explanation
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(l, layer)| Layer {
+            sites: layer.sites.clone(),
+            heads: if blocks.contains(&(2 * l)) { layer.heads.iter().map(|(planes, values)| (renumber(planes), renumber(values))).collect() } else { Vec::new() },
+            functions: if blocks.contains(&(2 * l + 1)) { layer.functions.iter().map(|f| renumber(f)).collect() } else { Vec::new() },
+        })
+        .collect();
+    let reference = explanation.reference.iter().zip(&kept).filter(|(_, k)| k.is_some()).map(|(r, _)| *r).collect();
+    Ok(Explanation { trainable, groups, layers, removed: renumber(&explanation.removed), reference, ..explanation.clone() })
+}
+
 // ------------------------------------------------------------------------------------- posterior
 
 /// Per prior group, sums over draws of the sampled-label gradient `u` (`interchange::sampled_label`)
@@ -765,6 +834,46 @@ impl Posterior {
         let mut posterior = Self { mean, log_sd, active: vec![true; explanation.groups.len()], membership, spans, initial };
         posterior.remove(&explanation.removed);
         Ok(posterior)
+    }
+
+    /// The posterior over parameter arrays `mean` whose entries' prior groups are `membership`
+    /// (one id array per mean array, ids below `groups`, every group holding an entry), every group
+    /// in the explanation, at [`Posterior::new`]'s start: each group's `v⁰_G` the mean square of its
+    /// starting means, and its standard deviations `√(v⁰_G / N)` for `tokens` training tokens `N`.
+    /// A parameterization that is not a library explanation (the toy accounts of
+    /// `mpd_toy_gate_2951`) is priced by this posterior's code length.
+    pub fn from_parts(mean: Vec<Array2<f64>>, membership: Vec<Array2<u32>>, groups: usize, tokens: usize) -> Result<Self, String> {
+        if membership.len() != mean.len() || membership.iter().zip(&mean).any(|(ids, m)| ids.dim() != m.dim()) {
+            return Err("one group array per mean array, of its shape, required".into());
+        }
+        if tokens == 0 {
+            return Err("no training tokens".into());
+        }
+        let mut squares = vec![(0.0, 0.0); groups];
+        let mut spans: Vec<Range<usize>> = vec![usize::MAX..0; mean.len()];
+        for ((values, ids), span) in mean.iter().zip(&membership).zip(&mut spans) {
+            for (value, id) in values.iter().zip(ids.iter()) {
+                let g = *id as usize;
+                let entry = squares.get_mut(g).ok_or_else(|| format!("group {g} of {groups}"))?;
+                entry.0 += 1.0;
+                entry.1 += value * value;
+                *span = span.start.min(g)..span.end.max(g + 1);
+            }
+        }
+        if let Some(g) = squares.iter().position(|(count, sum)| !(*count > 0.0 && *sum > 0.0 && sum.is_finite())) {
+            return Err(format!("group {g} holds no entry or starts at zero, and has no scale"));
+        }
+        let log_sd = membership
+            .iter()
+            .map(|ids| {
+                ids.mapv(|id| {
+                    let (count, sum) = squares[id as usize];
+                    0.5 * (sum / count / tokens as f64).ln()
+                })
+            })
+            .collect();
+        let initial = squares.iter().map(|(count, sum)| sum / count).collect();
+        Ok(Self { mean, log_sd, active: vec![true; groups], membership, spans, initial })
     }
 
     fn moments(&self) -> Vec<Moments> {
@@ -1309,6 +1418,9 @@ struct Scorer {
     mlps: Vec<Mlp>,
     /// Each trainable operator's position in `Explanation::trainable`.
     position: BTreeMap<usize, usize>,
+    /// The blocks the explanation explains ([`scope`]), when not all of them ([`scoped`]): every
+    /// experiment runs `P` exactly there.
+    scope: Option<Vec<bool>>,
 }
 
 impl Scorer {
@@ -1323,7 +1435,8 @@ impl Scorer {
         let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
         let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
-        Ok(Self { experiments, mlps, position })
+        let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
+        Ok(Self { experiments, mlps, position, scope })
     }
 
     fn layers(&self) -> usize {
@@ -1336,7 +1449,13 @@ impl Scorer {
 
     /// The batch's experiments from `draw`: the fixed collection's for that batch.
     fn experiments(&self, draw: &Draw, sequences: &[Vec<u32>]) -> Result<Vec<Experiment>, String> {
-        draw.experiments(sequences, self.experiments.variables(), 2 * self.layers())
+        let mut experiments = draw.experiments(sequences, self.experiments.variables(), 2 * self.layers())?;
+        if let Some(scope) = &self.scope {
+            for e in &mut experiments {
+                e.explained.clone_from(scope);
+            }
+        }
+        Ok(experiments)
     }
 
     /// The explanation on `experiments` (on `batch`) with the posterior on the device: at its
@@ -1536,15 +1655,20 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_p
             nonzero_per_token: 0.0,
             resolved_per_token: 0.0,
         });
+        // A layer whose MLP the explanation leaves to `M` ([`scoped`]) has no functions to count.
+        if layer.functions.is_empty() {
+            gates.push(None);
+            continue;
+        }
         let codes = d.upload_indices(&vec![law_of(mlp.law).code(); surviving.len()]).map_err(error)?;
         let alive = d.upload_indices(&surviving).map_err(error)?;
-        gates.push((alive, codes, variances(&mlp.gate)?, mlp.up.as_ref().map(variances).transpose()?));
+        gates.push(Some((alive, codes, variances(&mlp.gate)?, mlp.up.as_ref().map(variances).transpose()?)));
     }
     let mut rows = 0usize;
     for chunk in sequences.chunks(settings.batch_sequences) {
         let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
         let trace = program.forward(&family)?;
-        for ((count, mlp), (alive, codes, gate, up)) in out.iter_mut().zip(&scorer.mlps).zip(&gates) {
+        for ((count, mlp), (alive, codes, gate, up)) in out.iter_mut().zip(&scorer.mlps).zip(&gates).filter_map(|(pair, gates)| gates.as_ref().map(|g| (pair, g))) {
             let x = trace.value(mlp.input)?;
             let mut squares = d.empty(x.rows(), x.cols()).map_err(error)?;
             d.hadamard(&mut squares, x, x, false).map_err(error)?;
@@ -1977,9 +2101,9 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) 
     Ok((progress, moments))
 }
 
-/// The posterior of a fit checkpoint of `explanation` (`OUT/checkpoint.bin`, [`fit`]): its means,
-/// log standard deviations and active groups, for reading a fit that is still running.
-pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Posterior, String> {
+/// A checkpoint of `explanation` read whole: the posterior (means, log standard deviations and
+/// active groups) and the start it holds ([`checkpoint_start`]).
+fn read_checkpoint(explanation: &Explanation, path: &Path) -> Result<(Posterior, Start), String> {
     #[derive(Deserialize)]
     struct Header {
         tokens: usize,
@@ -1987,6 +2111,8 @@ pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Po
         active: Vec<bool>,
         #[serde(default)]
         precision: Option<[Precision; CHECKPOINT_ARRAYS]>,
+        step: i32,
+        epoch: usize,
     }
     let (header, mut reader, payload_bytes): (Header, _, _) = checkpoint_header(path)?;
     let precision = Precision::of_payload(header.precision);
@@ -1997,16 +2123,54 @@ pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Po
     if checkpoint_payload_bytes(&header.shapes, precision) != Some(payload_bytes) {
         return Err(format!("{}: a checkpoint of the wrong size", path.display()));
     }
-    for i in 0..header.shapes.len() {
+    let mut state = Vec::with_capacity(header.shapes.len());
+    for (i, shape) in header.shapes.iter().enumerate() {
         read_checkpoint_array(&mut reader, &mut posterior.mean[i], precision[0])?;
         read_checkpoint_array(&mut reader, &mut posterior.log_sd[i], precision[1])?;
-        let mut state = Array2::zeros(header.shapes[i]);
-        for precision in &precision[2..] {
-            read_checkpoint_array(&mut reader, &mut state, *precision)?;
+        let mut moments: [Array2<f64>; 3] = std::array::from_fn(|_| Array2::zeros(*shape));
+        for (array, precision) in moments.iter_mut().zip(&precision[2..]) {
+            read_checkpoint_array(&mut reader, array, *precision)?;
         }
+        state.push(moments);
     }
     posterior.active = header.active;
-    Ok(posterior)
+    let start = Start {
+        mean: posterior.mean.clone(),
+        log_sd: posterior.log_sd.clone(),
+        active: posterior.active.clone(),
+        state: Some(state),
+        steps: u64::try_from(header.step).map_err(error)?,
+        epoch: header.epoch,
+    };
+    Ok((posterior, start))
+}
+
+/// The posterior of a fit checkpoint of `explanation` (`OUT/checkpoint.bin`, [`fit`]): its means,
+/// log standard deviations and active groups, for reading a fit that is still running.
+pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Posterior, String> {
+    read_checkpoint(explanation, path).map(|(posterior, _)| posterior)
+}
+
+/// Where [`fit_from`] starts in place of `M`: per trainable operator (in `Explanation::trainable`
+/// order) the posterior means and log standard deviations, which prior groups are in the
+/// explanation (a removed group's entries are zeroed), and, to continue an optimizer, IVON's state
+/// per operator as a checkpoint holds it (the gradient's momentum, the curvature estimate and the
+/// gradient's second moment) after `steps` steps. Without a
+/// state, IVON starts at the curvature at which its standard deviations are the posterior's
+/// (`DevicePosterior::new`). `epoch` is the next epoch, whose batches' weight noise the fit draws.
+pub struct Start {
+    pub mean: Vec<Array2<f64>>,
+    pub log_sd: Vec<Array2<f64>>,
+    pub active: Vec<bool>,
+    pub state: Option<Vec<[Array2<f64>; 3]>>,
+    pub steps: u64,
+    pub epoch: usize,
+}
+
+/// The start a fit checkpoint of `explanation` holds: its posterior, IVON's state, the steps taken
+/// and the next epoch. [`fit_from`] continues from it exactly as resuming the checkpoint would.
+pub fn checkpoint_start(explanation: &Explanation, path: &Path) -> Result<Start, String> {
+    read_checkpoint(explanation, path).map(|(_, start)| start)
 }
 
 /// Fit the library explanation of `native` to its interchange experiments on the training
@@ -2023,6 +2187,24 @@ pub fn fit(
     export: &str,
     checkpoint: Option<&Path>,
     prior: Option<&mut (dyn PriorTerm + 'static)>,
+) -> Result<Fit, String> {
+    fit_from(device, native, explanation, sequences, held, settings, export, checkpoint, prior, None)
+}
+
+/// [`fit`] from `start` in place of `M` when one is given (a checkpoint's [`checkpoint_start`], a
+/// posterior whose groups no checkpoint has, or a start set from the curvature). A checkpoint of
+/// this fit, when one exists, is resumed and `start` is not used.
+pub fn fit_from(
+    device: &Device,
+    native: &OperatorProgram,
+    explanation: &Explanation,
+    sequences: &[Vec<u32>],
+    held: &[Vec<u32>],
+    settings: &Settings,
+    export: &str,
+    checkpoint: Option<&Path>,
+    prior: Option<&mut (dyn PriorTerm + 'static)>,
+    start: Option<Start>,
 ) -> Result<Fit, String> {
     settings.validate()?;
     let mut prior = prior;
@@ -2072,6 +2254,21 @@ pub fn fit(
     // needs).
     let subset = &held[..settings.batch_sequences.clamp(2, held.len())];
     let mut resumed = None;
+    if let Some(start) = start {
+        let shapes: Vec<(usize, usize)> = posterior.mean.iter().map(Array2::dim).collect();
+        let fits = |arrays: &[Array2<f64>]| arrays.iter().map(Array2::dim).eq(shapes.iter().copied());
+        let state_fits = start.state.as_ref().is_none_or(|state| state.len() == shapes.len() && state.iter().zip(&shapes).all(|(m, d)| m.iter().all(|a| a.dim() == *d)));
+        if !fits(&start.mean) || !fits(&start.log_sd) || start.active.len() != posterior.active.len() || !state_fits {
+            return Err("a start of another explanation".into());
+        }
+        posterior.mean = start.mean;
+        posterior.log_sd = start.log_sd;
+        posterior.remove(&(0..start.active.len()).filter(|g| !start.active[*g]).collect::<Vec<_>>());
+        progress.active = posterior.active.clone();
+        progress.epoch = start.epoch;
+        progress.step = i32::try_from(start.steps).map_err(error)?;
+        resumed = start.state;
+    }
     if let Some(path) = checkpoint.filter(|p| p.exists()) {
         let (loaded, moments) = load_checkpoint(path, &progress, &mut posterior)?;
         progress = loaded;
@@ -2946,6 +3143,46 @@ mod tests {
     }
 
     #[test]
+    fn a_scoped_explanation_charges_and_runs_its_blocks_alone() {
+        let (native, layers, _, sequences) = tiny("library_scoped", "relu");
+        let full = explanation(&native, &layers).unwrap();
+        // Layer 1's MLP alone (block 3).
+        let explanation = scoped(&full, &[3]).unwrap();
+        let functions = &full.layers[1].functions;
+        assert_eq!(explanation.groups.len(), functions.iter().map(Vec::len).sum::<usize>());
+        assert!(explanation.groups.iter().all(|g| g.name.starts_with("library.l1.mlp.")));
+        assert!(explanation.trainable.iter().all(|op| explanation.artifact.program.operators[*op].name.starts_with("library.l1.mlp.")));
+        assert_eq!(scope(&explanation), vec![false, false, false, true]);
+        assert_eq!(explanation.layers[1].functions.len(), functions.len());
+        assert!(explanation.layers[0].functions.is_empty() && explanation.layers.iter().all(|l| l.heads.is_empty()));
+        assert!(scoped(&full, &[4]).is_err() && scoped(&full, &[]).is_err());
+        let settings = settings();
+        let device = Device::host();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
+        assert!(experiments.iter().all(|e| e.explained == [false, false, false, true]));
+        assert!(experiments.iter().any(|e| e.patch.is_some()));
+        // At its start the scoped library is M in every experiment; weight noise in its block
+        // alone costs data, and only its layer's functions are counted.
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        let cycled: Vec<Vec<u32>> = sequences.iter().cycle().take(96).cloned().collect();
+        let evaluation = held_out(&mut scorer, &explanation, (&posterior, &device_posterior), &cycled, &settings, 72, None).unwrap();
+        for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]).flatten() {
+            assert!(bits.abs() < 1e-10, "the scoped start diverges from the model by {bits} bits per token");
+        }
+        assert!(evaluation.data_bits_per_token > 0.0, "weight noise in the block costs data");
+        assert_eq!(evaluation.layers[0].functions, 0);
+        assert_eq!(evaluation.layers[1].functions, functions.len());
+        // The scoped fit converges with the block's groups alone.
+        let (train, held) = sequences.split_at(4);
+        let fit = fit(&device, &native, &explanation, train, held, &settings, "tiny", None, None).unwrap();
+        assert_eq!(fit.posterior.active.len(), explanation.groups.len());
+        assert!(fit.report.objective_bits.is_finite());
+    }
+
+    #[test]
     fn the_starting_library_matches_the_model_in_every_experiment() {
         let (native, layers, _, sequences) = tiny("library_experiments", "relu");
         let explanation = explanation(&native, &layers).unwrap();
@@ -3360,6 +3597,52 @@ mod tests {
         assert_eq!(progress.identity, expected.identity);
         assert!(std::io::Seek::stream_position(reader.get_mut()).unwrap() <= 64 * 1024);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_fit_from_the_start_a_checkpoint_holds_is_the_fit_resumed_from_it() {
+        let (native, layers, _, sequences) = tiny("library_fit_from", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let settings = settings();
+        let device = Device::host();
+        let (train, held) = sequences.split_at(4);
+        let finished_path = std::env::temp_dir().join(format!("library_fit_from_{}.bin", std::process::id()));
+        let finished = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&finished_path), None).unwrap();
+        // The finished fit's checkpoint reopened, so that it trains again from its posterior and
+        // IVON's state, with convergence judged afresh.
+        let bytes = std::fs::read(&finished_path).unwrap();
+        let length = usize::try_from(u64::from_le_bytes(bytes[..8].try_into().unwrap())).unwrap();
+        let mut header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + length]).unwrap();
+        header["done"] = serde_json::Value::Bool(false);
+        header["previous"] = serde_json::Value::Null;
+        let header = serde_json::to_vec(&header).unwrap();
+        let path = std::env::temp_dir().join(format!("library_fit_from_reopened_{}.bin", std::process::id()));
+        std::fs::write(&path, [&(header.len() as u64).to_le_bytes()[..], &header, &bytes[8 + length..]].concat()).unwrap();
+        let start = checkpoint_start(&explanation, &path).unwrap();
+        assert_eq!(start.epoch, finished.report.epochs.len());
+        let resumed = fit(&device, &native, &explanation, train, held, &settings, "tiny", Some(&path), None).unwrap();
+        let started = fit_from(&device, &native, &explanation, train, held, &settings, "tiny", None, None, Some(start)).unwrap();
+        for file in [&finished_path, &path] {
+            for extension in ["bin", "json", "artifact.bin", "removals.jsonl"] {
+                let written = file.with_extension(extension);
+                if written.exists() {
+                    std::fs::remove_file(written).unwrap();
+                }
+            }
+        }
+        let trained = &resumed.report.epochs[finished.report.epochs.len()..];
+        assert!(!trained.is_empty(), "the reopened checkpoint trains");
+        assert_eq!(trained.len(), started.report.epochs.len());
+        for (a, b) in trained.iter().zip(&started.report.epochs) {
+            assert_eq!(a.epoch, b.epoch);
+            assert_eq!(a.objective_bits.to_bits(), b.objective_bits.to_bits(), "epoch {}", a.epoch);
+        }
+        assert_eq!(started.posterior.mean, resumed.posterior.mean);
+        assert_eq!(started.posterior.log_sd, resumed.posterior.log_sd);
+        assert_eq!(started.posterior.active, resumed.posterior.active);
+        // A start of another explanation is refused.
+        let other = Start { mean: Vec::new(), log_sd: Vec::new(), active: vec![true], state: None, steps: 0, epoch: 0 };
+        assert!(fit_from(&device, &native, &explanation, train, held, &settings, "tiny", None, None, Some(other)).is_err());
     }
 
     #[test]
