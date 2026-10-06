@@ -17,7 +17,7 @@ use super::artifact::Artifact;
 use super::device_program::DeviceProgram;
 use super::device_program_tests::{devices, fixture_sized, noise};
 use super::interchange::{Batch, Experiment, FixedHead, Interchange, Model, Patch, ReadVariable, Site, Value, census, evaluate, reads, sample, sites, targets, values};
-use super::interchange::{BlockEngine, Edits};
+use super::interchange::{BlockEngine, Edits, FACTORS, Part};
 use super::device_program::DeviceTrace;
 use super::operator_program::{FamilyInputs, Operator, OperatorProgram, SequenceLayout, SlotValues, exact_precision};
 use super::resident_causal_fit::fixed_head_target::Head;
@@ -692,5 +692,126 @@ fn m_runs_the_same_whatever_explanation_it_is_compared_with() {
     assert_eq!(made[0].len(), made[1].len());
     for (a, b) in made[0].iter().zip(&made[1]) {
         assert!(a.0 == b.0 && a.1 == b.1, "M's targets depend on the explanation");
+    }
+}
+
+/// Random ReLU parts of the tiny export's two MLP blocks (1 and 3) at width `width`: per block one
+/// that fires on nearly every row (bias 1, small read) and one that never fires (bias −100).
+fn random_parts(width: usize, seed: u64) -> Vec<Part> {
+    use rand::RngExt;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut vector = |scale: f64| (0..width).map(|_| scale * (rng.random::<f64>() - 0.5)).collect::<Vec<f64>>();
+    let mut out = Vec::new();
+    for block in [1, 3] {
+        for bias in [1.0, -100.0] {
+            out.push(Part { block, read: vector(0.2), bias, write: vector(2.0) });
+        }
+    }
+    out
+}
+
+/// Edits of parts (`Patch::Part`) on the starting library of the tiny export `dir`, an exact copy
+/// of `M`: each part at each factor in `FACTORS`, under `P` alone and under a hybrid running `M`
+/// at the edited block, scores zero against `M` (both models add the same write, computed from
+/// the same read, to the same stream), with the gradient's reverse through the edits too; an edit
+/// of a firing part changes `M`'s own prediction, one of a part that never fires does not.
+fn the_starting_library_explains_m_under_every_part_edit(dir: std::path::PathBuf) {
+    let imported = crate::import::import_language_model(&dir, 6, 12).expect("the tiny export imports");
+    std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+    let native = split_sites(&imported.program).expect("the native sites");
+    let layers = layer_nodes(&native, 2).expect("the layers");
+    let explanation = crate::library_mdl::explanation(&native, &layers).expect("the library");
+    let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+    let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+    let mut devices = vec![Device::host()];
+    devices.extend(Device::accelerator(gam_gpu::GpuPolicy::Auto).expect("a device probe"));
+    for device in devices {
+        let variables = reads(&native, &layers).expect("the reads");
+        let mut x = Interchange::new(&device, &native, &layers, &explanation.artifact, &explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
+        let width = BlockEngine::width(&x.models().0);
+        x.set_parts(random_parts(width, 3)).expect("the parts");
+        let batch = Batch::new(sequences[..3].to_vec(), sequences[3..].to_vec()).expect("the batch");
+        let mut experiments = Vec::new();
+        for part in 0..4 {
+            for factor in 0..FACTORS.len() {
+                let base = (part + factor) % 3;
+                let block = x.parts()[part].block;
+                let hybrid: Vec<bool> = (0..4).map(|b| b != block).collect();
+                experiments.push(Experiment { base, source: base, explained: vec![true; 4], patch: None, position: 0 });
+                experiments.push(Experiment { base, source: base, explained: vec![true; 4], patch: Some(Patch::Part { part, factor }), position: 1 + (part + 3 * factor) % 11 });
+                experiments.push(Experiment { base, source: base, explained: hybrid, patch: Some(Patch::Part { part, factor }), position: 2 });
+            }
+        }
+        let counts = census(&experiments, x.variables());
+        assert_eq!((counts["remove_part"], counts["amplify_part"]), (8, 24), "{counts:?}");
+        for gradient in [false, true] {
+            let bits = x.evaluate(&batch, &experiments, gradient).expect("evaluate").bits;
+            assert!(bits.iter().flatten().all(|b| b.abs() <= 1e-9), "{}: {bits:?}", device.name());
+        }
+        let made = x.targets(&batch, &experiments).expect("targets").host(&device).expect("host");
+        for (i, triple) in experiments.chunks(3).enumerate() {
+            let (clean, edited) = (&made[3 * i].1, &made[3 * i + 1].1);
+            let at = triple[1].position;
+            let Some(Patch::Part { part, factor }) = triple[1].patch else { panic!("an edit") };
+            let changed = clean[at..].iter().zip(edited).any(|(a, b)| (a - b).abs() > 1e-9);
+            assert_eq!(changed, part % 2 == 0 && FACTORS[factor] != 1.0, "{:?}: M changes only under an edit of a firing part", triple[1]);
+        }
+    }
+}
+
+#[test]
+fn the_starting_gelu_library_explains_m_under_every_part_edit() {
+    the_starting_library_explains_m_under_every_part_edit(crate::test_support::tiny_export("interchange_parts_gelu", 2));
+}
+
+#[test]
+fn the_starting_qwen3_library_explains_m_under_every_part_edit() {
+    the_starting_library_explains_m_under_every_part_edit(crate::test_support::tiny_qwen3_export("interchange_parts_qwen3", 2));
+}
+
+/// An edit of a part on `M` is the hand computation: through layer 0's MLP block of the tiny
+/// Qwen3 export, the stream after the block moves by exactly `(α − 1)·relu(g·x + c)·u` at the
+/// edited row (`x` `M`'s own read there) and nowhere else, for every factor.
+#[test]
+fn an_edit_of_a_part_on_m_adds_its_scaled_write() {
+    let dir = crate::test_support::tiny_qwen3_export("interchange_parts_hand", 2);
+    let imported = crate::import::import_language_model(&dir, 6, 12).expect("the tiny export imports");
+    std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+    let native = split_sites(&imported.program).expect("the native sites");
+    let layers = layer_nodes(&native, 2).expect("the layers");
+    let explanation = crate::library_mdl::explanation(&native, &layers).expect("the library");
+    let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+    let sequence: Vec<u32> = tokens[..12].to_vec();
+    let d = Device::host();
+    let variables = reads(&native, &layers).expect("the reads");
+    let mut x = Interchange::new(&d, &native, &layers, &explanation.artifact, &explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
+    let width = BlockEngine::width(&x.models().0);
+    x.set_parts(random_parts(width, 4)).expect("the parts");
+    let (m, _) = x.models();
+    let sites = m.part_sites().expect("M's part sites");
+    let (read, _) = sites.nodes(1).expect("layer 0's MLP holds parts");
+    let part = &x.parts()[0];
+    let (ranges, tok) = (vec![0..12], vec![sequence.as_slice()]);
+    let mut entering = d.zeros(12, width).expect("zeros");
+    m.forward(0, &mut entering, &ranges, &tok, None, false).expect("attention");
+    let mut plain = d.copy(&entering).expect("copy");
+    let trace = m.forward(1, &mut plain, &ranges, &tok, None, true).expect("the MLP").expect("a tape");
+    let normed = d.download(trace.value(read).expect("the read")).expect("download");
+    let plain = d.download(&plain).expect("download");
+    for (factor, alpha) in FACTORS.iter().enumerate() {
+        let row = 3 + factor;
+        let edits = Edits::with_parts(&d, &[], m.values(), &[(row, 0, factor)], Some(sites)).expect("the edits");
+        let mut edited = d.copy(&entering).expect("copy");
+        m.forward(1, &mut edited, &ranges, &tok, Some(&edits), false).expect("the edited MLP");
+        let moved = d.download(&edited).expect("download") - &plain;
+        let pre: f64 = normed.row(row).iter().zip(&part.read).map(|(a, b)| a * b).sum::<f64>() + part.bias;
+        assert!(pre > 0.0, "the part fires at row {row}");
+        let scale = moved.iter().chain(plain.iter()).fold(0.0f64, |m, v| m.max(v.abs()));
+        for r in 0..12 {
+            for c in 0..width {
+                let want = if r == row { (alpha - 1.0) * pre * part.write[c] } else { 0.0 };
+                assert!((moved[[r, c]] - want).abs() <= 1e-12 * scale, "factor {alpha}, row {r}, column {c}: moved {} against {want}", moved[[r, c]]);
+            }
+        }
     }
 }

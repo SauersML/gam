@@ -79,10 +79,12 @@ fn error(e: impl std::fmt::Display) -> String {
 /// One model's sites, checked against its program: the stream entering each block, each block's
 /// read, the dense operators that receive gradients, per block, and where it holds each read
 /// variable's value.
+#[derive(Clone)]
 struct Sites {
     entries: Vec<usize>,
     trainable: Vec<Vec<usize>>,
     values: Vec<Value>,
+    parts: PartSites,
 }
 
 impl Sites {
@@ -119,7 +121,7 @@ impl Sites {
         if values.iter().any(|v| v.block >= blocks) || values.iter().flat_map(|v| &v.sites).any(|s| s.node >= hidden || widths[s.node] != s.width || s.columns.is_empty() || s.columns.end > s.width) {
             return Err(error("a read variable's value outside the program or its node"));
         }
-        Ok(Self { entries, trainable: per_block, values })
+        Ok(Self { entries, trainable: per_block, values, parts: PartSites::default() })
     }
 }
 
@@ -164,11 +166,30 @@ impl<'a> Model<'a> {
 /// (`run_check::layer_nodes` of the native program `artifact` was made from): the arguments of
 /// [`Model::new`]. `Artifact::native` gives `M`'s.
 pub fn sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorProgram, Vec<usize>, Vec<usize>), String> {
+    let (flat, entries, reads, _) = flat_sites(artifact, layers)?;
+    Ok((flat, entries, reads))
+}
+
+/// [`sites`] with, per block, where `artifact` applies edits of parts ([`PartSites`]): for layer
+/// `l`'s MLP (block `2l + 1`) its read and the MLP's output (the native `mlp` node or the node
+/// that replaced it), none for an attention block or an MLP output the artifact does not hold.
+fn flat_sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorProgram, Vec<usize>, Vec<usize>, Vec<Option<(usize, usize)>>), String> {
     let (flat, roots) = mapped_inlined(&artifact.program)?;
     let at = |native: usize| artifact.place(native).map(|n| roots[n]).ok_or_else(|| error(format!("native node {native} is not held")));
-    let entries = layers.iter().flat_map(|l| [l.stream, l.attended]).map(at).collect::<Result<_, _>>()?;
-    let reads = layers.iter().flat_map(|l| [l.normed_stream, l.normed]).map(at).collect::<Result<_, _>>()?;
-    Ok((flat, entries, reads))
+    let entries: Vec<usize> = layers.iter().flat_map(|l| [l.stream, l.attended]).map(at).collect::<Result<_, _>>()?;
+    let reads: Vec<usize> = layers.iter().flat_map(|l| [l.normed_stream, l.normed]).map(at).collect::<Result<_, _>>()?;
+    let blocks = entries.len();
+    let parts = layers
+        .iter()
+        .enumerate()
+        .flat_map(|(l, layer)| {
+            let b = 2 * l + 1;
+            let end = if b + 1 < blocks { entries[b + 1] } else { flat.nodes.len() };
+            let out = at(layer.mlp).ok().filter(|o| *o > reads[b] && *o <= end);
+            [None, out.map(|o| (reads[b], o))]
+        })
+        .collect();
+    Ok((flat, entries, reads, parts))
 }
 
 /// The program of the flat program `flat` through its head's hidden node (the final normed
@@ -225,19 +246,69 @@ fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<ReadVar
 /// A patch: one read variable (an index into the variables), or the distinct read variables
 /// `variables` (ascending, all at one block) jointly. A joint read patch shows what single ones
 /// miss: many reads that matter little one at a time and much together.
+///
+/// An edit of a part (`Part`): part `part` (an index into the parts, [`Interchange::set_parts`])
+/// with its write scaled by `FACTORS[factor]` at the experiment's position. It patches no read
+/// variable and has no source.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Patch {
     Read { variable: usize },
     Reads { variables: Vec<usize> },
+    Part { part: usize, factor: usize },
 }
 
 impl Patch {
-    /// The patched variables.
+    /// The patched variables (none for an edit of a part).
     pub fn variables(&self) -> &[usize] {
         match self {
             Self::Read { variable } => std::slice::from_ref(variable),
             Self::Reads { variables } => variables,
+            Self::Part { .. } => &[],
         }
+    }
+}
+
+/// A part of the explanation that edits act on: an MLP function `relu(g·x + c) u` of MLP block
+/// `block` (block `2l + 1` is layer `l`'s MLP), reading the block's read `x` (the normed stream)
+/// through `g` (`read`) and `c` (`bias`) and writing `u` (`write`) into the block's output, as
+/// `P`'s posterior mean holds it (a transcoder feature, `library_transcoder`).
+///
+/// An edit of a part is one fixed function of a block's read, so it is defined identically on `M`
+/// and on `P`: scaling the part's write by `α` adds `(α − 1)·relu(g·x + c)·u` to the block's
+/// output at the edited row, `x` being that model's own read there. On `P` at its posterior mean
+/// it is exactly `P` with the part's write scaled by `α` (`α = 0` removes the part); on `M` it
+/// tests the claim that `M`'s MLP output holds the part's write `u` with the coefficient `P`
+/// computes from `M`'s own input, so that subtracting it changes `M` as removing the part changes
+/// `P`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Part {
+    pub block: usize,
+    pub read: Vec<f64>,
+    pub bias: f64,
+    pub write: Vec<f64>,
+}
+
+/// The factors `α` an edit of a part scales its write by: 0 removes the part, 0.5 halves it, 2
+/// and 3 amplify it.
+pub const FACTORS: [f64; 4] = [0.0, 0.5, 2.0, 3.0];
+
+/// Where a model applies edits of parts: per block, for an MLP block, the node its parts read
+/// (the block's read) and the node their writes add to (the MLP's output), and the parts.
+#[derive(Clone, Debug, Default)]
+pub struct PartSites {
+    nodes: Vec<Option<(usize, usize)>>,
+    parts: Arc<Vec<Part>>,
+}
+
+impl PartSites {
+    /// The parts.
+    pub fn parts(&self) -> &[Part] {
+        &self.parts
+    }
+
+    /// Block `block`'s node its parts read and the node their writes add to, if it has parts.
+    pub fn nodes(&self, block: usize) -> Option<(usize, usize)> {
+        self.nodes.get(block).copied().flatten()
     }
 }
 
@@ -254,9 +325,16 @@ pub struct Experiment {
 }
 
 impl Experiment {
-    /// The patched block of the variables `values` (none for an unpatched experiment).
-    fn block(&self, values: &[Value]) -> Result<Option<usize>, String> {
+    /// The patched block of the variables `values` or of the parts `parts` (none for an unpatched
+    /// experiment).
+    fn block(&self, values: &[Value], parts: &[Part]) -> Result<Option<usize>, String> {
         let Some(patch) = &self.patch else { return Ok(None) };
+        if let Patch::Part { part, factor } = patch {
+            if *factor >= FACTORS.len() {
+                return Err(error("an edit's factor outside FACTORS"));
+            }
+            return parts.get(*part).map(|p| Some(p.block)).ok_or_else(|| error("an edit of an unknown part"));
+        }
         let chosen = patch.variables();
         let block = |i: &usize| values.get(*i).map(|v| v.block).ok_or_else(|| error("a patch of an unknown variable"));
         let first = block(chosen.first().ok_or_else(|| error("a joint read patch of no variable"))?)?;
@@ -346,7 +424,7 @@ pub fn subset(rng: &mut impl RngExt, candidates: &[usize]) -> Vec<usize> {
 /// The realized count of each family among `experiments`: clean with `P` alone, clean under a
 /// hybrid, single read patches of attention and of MLP variables, and joint read patches.
 pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMap<&'static str, usize> {
-    let mut counts: BTreeMap<&'static str, usize> = ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint"].into_iter().map(|k| (k, 0)).collect();
+    let mut counts: BTreeMap<&'static str, usize> = ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint", "remove_part", "amplify_part"].into_iter().map(|k| (k, 0)).collect();
     for e in experiments {
         let family = match &e.patch {
             None if e.explained.iter().all(|x| *x) => "clean_alone",
@@ -354,6 +432,8 @@ pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMa
             Some(Patch::Read { variable }) if variables.get(*variable).is_some_and(|v| v.block % 2 == 0) => "read_attention",
             Some(Patch::Read { .. }) => "read_mlp",
             Some(Patch::Reads { .. }) => "read_joint",
+            Some(Patch::Part { factor: 0, .. }) => "remove_part",
+            Some(Patch::Part { .. }) => "amplify_part",
         };
         *counts.entry(family).or_default() += 1;
     }
@@ -640,6 +720,43 @@ fn call_rule(program: &OperatorProgram, outer: &[usize], node: usize) -> Option<
 /// node's columns that keep the base's entries and that take the source's.
 pub struct Edits {
     nodes: BTreeMap<usize, Patches>,
+    writes: BTreeMap<usize, Writes>,
+}
+
+/// The edits of parts at one block's output node ([`Edits`]): per edit its row, the part's read
+/// `g`, bias `c` and write `u`, and `α − 1`; the node the parts read; and, kept between a call's
+/// passes, per edit the slope `(α − 1)·1[g·x + c > 0]` of its forward and the cotangent `u·ḡ` of
+/// its coefficient in the reverse.
+struct Writes {
+    read: usize,
+    rows: Vec<usize>,
+    gates: ndarray::Array2<f64>,
+    biases: Vec<f64>,
+    outs: ndarray::Array2<f64>,
+    scales: Vec<f64>,
+    slopes: RefCell<Vec<f64>>,
+    carried: RefCell<Vec<f64>>,
+}
+
+impl Writes {
+    /// Add `rows` (one per edit, in the edits' order) to the edited rows of `t`, each round of
+    /// distinct rows at once ([`rounds`]).
+    fn add(&self, d: &Device, t: &mut Tensor, rows: ndarray::Array2<f64>) -> Result<(), String> {
+        let added = d.upload(rows.view()).map_err(error)?;
+        for round in rounds(&self.rows) {
+            let at = single(round.iter().map(|i| self.rows[*i]));
+            let mut value = d.gather_ranges(t, &at).map_err(error)?;
+            let part = picked(d, &added, &round)?;
+            d.axpy(&mut value, 1.0, part.as_ref().unwrap_or(&added)).map_err(error)?;
+            d.scatter_ranges(t, &at, &value).map_err(error)?;
+        }
+        Ok(())
+    }
+
+    /// The edited rows of `t` on the host.
+    fn rows_of(&self, d: &Device, t: &Tensor) -> Result<ndarray::Array2<f64>, String> {
+        d.download(&d.gather_ranges(t, &single(self.rows.iter().copied())).map_err(error)?).map_err(error)
+    }
 }
 
 /// One node's patches ([`Edits`]) in the order of their (patched row, source row): the patched
@@ -684,8 +801,40 @@ fn picked(d: &Device, t: &Tensor, round: &[usize]) -> Result<Option<Tensor>, Str
 
 impl Edits {
     /// The patches of a call at block rows `patches` (the patched row, the source's row, and the
-    /// variables), at the sites `values` of the model that runs the call.
-    fn new(d: &Device, patches: &[(usize, usize, &[usize])], values: &[Value]) -> Result<Self, String> {
+    /// variables), at the sites `values` of the model that runs the call, and its edits of parts
+    /// `edits` (the edited row, the part and the index of its factor in [`FACTORS`]) at the
+    /// model's part sites `sites`.
+    pub(crate) fn with_parts(d: &Device, patches: &[(usize, usize, &[usize])], values: &[Value], edits: &[(usize, usize, usize)], sites: Option<&PartSites>) -> Result<Self, String> {
+        let mut writes: BTreeMap<usize, (usize, Vec<(usize, &Part, f64)>)> = BTreeMap::new();
+        for (row, part, factor) in edits {
+            let sites = sites.ok_or_else(|| error("an edit of a part in a model without part sites"))?;
+            let p = sites.parts.get(*part).ok_or_else(|| error("an edit of an unknown part"))?;
+            let alpha = *FACTORS.get(*factor).ok_or_else(|| error("an edit's factor outside FACTORS"))?;
+            let (read, out) = sites.nodes.get(p.block).copied().flatten().ok_or_else(|| error(format!("block {}: no part sites", p.block)))?;
+            writes.entry(out).or_insert_with(|| (read, Vec::new())).1.push((*row, p, alpha - 1.0));
+        }
+        let writes = writes
+            .into_iter()
+            .map(|(out, (read, list))| {
+                let width = list[0].1.read.len();
+                if list.iter().any(|(_, p, _)| p.read.len() != width || p.write.len() != width) {
+                    return Err(error("parts of one block differ in width"));
+                }
+                let gates = ndarray::Array2::from_shape_fn((list.len(), width), |(i, c)| list[i].1.read[c]);
+                let outs = ndarray::Array2::from_shape_fn((list.len(), width), |(i, c)| list[i].1.write[c]);
+                let rows = list.iter().map(|(r, _, _)| *r).collect();
+                let biases = list.iter().map(|(_, p, _)| p.bias).collect();
+                let scales: Vec<f64> = list.iter().map(|(_, _, s)| *s).collect();
+                let k = scales.len();
+                Ok((out, Writes { read, rows, gates, biases, outs, scales, slopes: RefCell::new(vec![0.0; k]), carried: RefCell::new(vec![0.0; k]) }))
+            })
+            .collect::<Result<_, String>>()?;
+        let mut out = Self::patches(d, patches, values)?;
+        out.writes = writes;
+        Ok(out)
+    }
+
+    fn patches(d: &Device, patches: &[(usize, usize, &[usize])], values: &[Value]) -> Result<Self, String> {
         let mut masks: BTreeMap<(usize, usize, usize), Vec<f64>> = BTreeMap::new();
         for (row, source, variables) in patches {
             for v in *variables {
@@ -709,12 +858,42 @@ impl Edits {
             let (keep, take) = (d.upload_vec(rows.len(), width, keep).map_err(error)?, d.upload_vec(rows.len(), width, take).map_err(error)?);
             nodes.insert(node, Patches { rows, sources, keep, take });
         }
-        Ok(Self { nodes })
+        Ok(Self { nodes, writes: BTreeMap::new() })
     }
 
-    /// The nodes the call edits.
+    /// The nodes the call edits, with the nodes edited parts read (whose cotangents take the
+    /// edits' share).
     pub fn nodes(&self) -> BTreeSet<usize> {
-        self.nodes.keys().copied().collect()
+        self.nodes.keys().chain(self.writes.keys()).copied().chain(self.writes.values().map(|w| w.read)).collect()
+    }
+
+    /// Whether the forward pass changes node `node`'s value (a read of parts only is not changed).
+    pub fn changes(&self, node: usize) -> bool {
+        self.nodes.contains_key(&node) || self.writes.contains_key(&node)
+    }
+
+    /// The node the edits of parts at node `node` read, if any.
+    pub fn read_of(&self, node: usize) -> Option<usize> {
+        self.writes.get(&node).map(|w| w.read)
+    }
+
+    /// The edits of parts at node `node` on its value `value` (the call's rows), `read` the value
+    /// of the node the parts read: each edited row adds `(α − 1)·relu(g·x + c)·u`, `x` its row of
+    /// `read`; the slopes are kept for the transpose.
+    pub fn write(&self, d: &Device, node: usize, value: &mut Tensor, read: &Tensor) -> Result<(), String> {
+        let Some(w) = self.writes.get(&node) else { return Ok(()) };
+        let x = w.rows_of(d, read)?;
+        let mut added = ndarray::Array2::zeros((w.rows.len(), value.cols()));
+        let mut slopes = vec![0.0; w.rows.len()];
+        for i in 0..w.rows.len() {
+            let pre = x.row(i).dot(&w.gates.row(i)) + w.biases[i];
+            if pre > 0.0 {
+                slopes[i] = w.scales[i];
+                added.row_mut(i).assign(&(&w.outs.row(i) * (w.scales[i] * pre)));
+            }
+        }
+        *w.slopes.borrow_mut() = slopes;
+        w.add(d, value, added)
     }
 
     /// Node `node`'s value `value` (the call's rows in order) with each patched row's patched
@@ -740,7 +919,20 @@ impl Edits {
     /// The transpose of [`Edits::apply`] on node `node`'s cotangent `g`: each patched row keeps
     /// `ḡ ⊙ (1 − m)` and its source row receives `ḡ ⊙ m`, every patched row read before any row
     /// is written and the sources' shares added in order, each round of distinct rows at once.
+    ///
+    /// An edit of a part leaves its output node's cotangent as it is and keeps the cotangent `u·ḡ`
+    /// of its coefficient there; at the node the part reads (later in the reverse), the edited row
+    /// receives `(α − 1)·1[g·x + c > 0]·(u·ḡ)·g`.
     pub fn transpose(&self, d: &Device, node: usize, g: &mut Tensor) -> Result<(), String> {
+        if let Some(w) = self.writes.get(&node) {
+            let rows = w.rows_of(d, g)?;
+            *w.carried.borrow_mut() = (0..w.rows.len()).map(|i| rows.row(i).dot(&w.outs.row(i))).collect();
+        }
+        for w in self.writes.values().filter(|w| w.read == node) {
+            let (slopes, carried) = (w.slopes.borrow(), w.carried.borrow());
+            let added = ndarray::Array2::from_shape_fn((w.rows.len(), g.cols()), |(i, c)| slopes[i] * carried[i] * w.gates[[i, c]]);
+            w.add(d, g, added)?;
+        }
         let Some(p) = self.nodes.get(&node) else { return Ok(()) };
         let read = d.gather_ranges(g, &single(p.rows.iter().copied())).map_err(error)?;
         let mut base = d.empty(p.rows.len(), g.cols()).map_err(error)?;
@@ -786,6 +978,11 @@ pub trait BlockEngine {
 
     /// Where the model holds each read variable's value ([`values`]): the nodes its edits name.
     fn values(&self) -> &[Value];
+
+    /// Where the model applies edits of parts, and the parts ([`PartSites`]); none by default.
+    fn part_sites(&self) -> Option<&PartSites> {
+        None
+    }
 
     fn forward(
         &self,
@@ -884,6 +1081,10 @@ impl BlockEngine for Model<'_> {
         &self.sites.values
     }
 
+    fn part_sites(&self) -> Option<&PartSites> {
+        Some(&self.sites.parts)
+    }
+
     fn forward(
         &self,
         block: usize,
@@ -895,12 +1096,14 @@ impl BlockEngine for Model<'_> {
     ) -> Result<Option<DeviceTrace>, String> {
         let d = self.program.device();
         let entry = if block == 0 { None } else { Some((self.entry(block), gather(d, stream, ranges)?)) };
-        let edited = edits.map(Edits::nodes).unwrap_or_default();
         let edit = |n: usize, trace: &DeviceTrace| -> Result<Option<Tensor>, String> {
             match edits {
-                Some(edits) if edited.contains(&n) => {
+                Some(edits) if edits.changes(n) => {
                     let mut value = d.copy(trace.value(n)?).map_err(error)?;
                     edits.apply(d, n, &mut value)?;
+                    if let Some(read) = edits.read_of(n) {
+                        edits.write(d, n, &mut value, trace.value(read)?)?;
+                    }
                     Ok(Some(value))
                 }
                 _ => Ok(None),
@@ -962,11 +1165,17 @@ struct Path<'t> {
     end: usize,
     position: usize,
     patch: Option<(usize, &'t [usize], usize)>,
+    /// An edit of a part: its block, the part and the index of its factor.
+    edit: Option<(usize, usize, usize)>,
 }
 
 impl<'t> Path<'t> {
     fn patched(&self, block: usize) -> Option<(&'t [usize], usize)> {
         self.patch.filter(|(b, _, _)| *b == block).map(|(_, variables, source)| (variables, source))
+    }
+
+    fn edited(&self, block: usize) -> Option<(usize, usize)> {
+        self.edit.filter(|(b, _, _)| *b == block).map(|(_, part, factor)| (part, factor))
     }
 }
 
@@ -1007,7 +1216,7 @@ impl<'t> Plan<'t> {
                     continue;
                 }
                 let limit = other.end.min(path.end);
-                let shared = (0..limit).find(|&b| other.explained[b] != path.explained[b] || other.patched(b).is_some() || path.patched(b).is_some()).unwrap_or(limit);
+                let shared = (0..limit).find(|&b| other.explained[b] != path.explained[b] || other.patched(b).is_some() || path.patched(b).is_some() || other.edited(b).is_some() || path.edited(b).is_some()).unwrap_or(limit);
                 if best.is_none_or(|(_, k)| shared > k) {
                     best = Some((l, shared));
                 }
@@ -1056,6 +1265,19 @@ impl<'t> Plan<'t> {
         }
         Ok(out)
     }
+
+    /// The edits of parts applied at `block`, as rows of a call over `lanes` (in order): the
+    /// edited row, the part and the index of its factor.
+    fn writes(&self, block: usize, lanes: &[usize]) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        for (i, &l) in lanes.iter().enumerate() {
+            let path = &self.paths[self.lanes[l].path];
+            if let Some((part, factor)) = path.edited(block) {
+                out.push((i * self.length + path.position, part, factor));
+            }
+        }
+        out
+    }
 }
 
 /// What a call of a forward pass keeps for the reverse passes (module note): its tape, or the rows
@@ -1078,11 +1300,11 @@ struct Call<T> {
 /// The edits of the call at block `block` over `lanes` run by `engine` ([`Plan::patches`] at its
 /// sites), none when nothing there is patched.
 fn edits<E: BlockEngine>(engine: &E, plan: &Plan, block: usize, lanes: &[usize]) -> Result<Option<Edits>, String> {
-    let patches = plan.patches(block, lanes)?;
-    if patches.is_empty() {
+    let (patches, writes) = (plan.patches(block, lanes)?, plan.writes(block, lanes));
+    if patches.is_empty() && writes.is_empty() {
         return Ok(None);
     }
-    Ok(Some(Edits::new(engine.device(), &patches, engine.values())?))
+    Ok(Some(Edits::with_parts(engine.device(), &patches, engine.values(), &writes, engine.part_sites())?))
 }
 
 /// Run `plan` on the engines `[P, M]` (module note): block by block, the lanes forking there copy
@@ -1235,22 +1457,28 @@ pub struct Targets {
 /// block run by `M` when `native`, else by each experiment's hybrid: per patched experiment its
 /// source's path (to its patched block) and its base's path; per experiment the index of its base's
 /// path.
-fn paths<'t>(batch: &'t Batch, experiments: &'t [Experiment], values: &[Value], native: Option<&'t [bool]>, blocks: usize) -> Result<(Vec<Path<'t>>, Vec<usize>), String> {
+fn paths<'t>(batch: &'t Batch, experiments: &'t [Experiment], values: &[Value], parts: &[Part], native: Option<&'t [bool]>, blocks: usize) -> Result<(Vec<Path<'t>>, Vec<usize>), String> {
     let (mut paths, mut bases) = (Vec::with_capacity(2 * experiments.len()), Vec::with_capacity(experiments.len()));
     for e in experiments {
         check(e, batch, blocks)?;
         let explained = native.unwrap_or(&e.explained);
-        let patch = match (&e.patch, e.block(values)?) {
+        let (patch, edit) = match (&e.patch, e.block(values, parts)?) {
+            (Some(Patch::Part { part, factor }), Some(block)) => (None, Some((block, *part, *factor))),
             (Some(patch), Some(block)) => {
-                paths.push(Path { tokens: &batch.source[e.source], explained, end: block + 1, position: 0, patch: None });
-                Some((block, patch.variables(), paths.len() - 1))
+                paths.push(Path { tokens: &batch.source[e.source], explained, end: block + 1, position: 0, patch: None, edit: None });
+                (Some((block, patch.variables(), paths.len() - 1)), None)
             }
-            _ => None,
+            _ => (None, None),
         };
         bases.push(paths.len());
-        paths.push(Path { tokens: &batch.base[e.base], explained, end: blocks, position: e.position, patch });
+        paths.push(Path { tokens: &batch.base[e.base], explained, end: blocks, position: e.position, patch, edit });
     }
     Ok((paths, bases))
+}
+
+/// The parts of `engine`'s edits (none without part sites).
+fn parts_of<E: BlockEngine>(engine: &E) -> &[Part] {
+    engine.part_sites().map_or(&[], PartSites::parts)
 }
 
 /// Per experiment, the rows of `stream` its base's path ends on, from the experiment's position on.
@@ -1264,7 +1492,7 @@ pub fn targets<E: BlockEngine>(m: &E, head: &FixedHead, batch: &Batch, experimen
     let d = m.device();
     let blocks = m.blocks();
     let native = vec![false; blocks];
-    let (paths, bases) = paths(batch, experiments, m.values(), Some(&native), blocks)?;
+    let (paths, bases) = paths(batch, experiments, m.values(), parts_of(m), Some(&native), blocks)?;
     let plan = Plan::new(paths, batch.length);
     let (stream, _) = run([m, m], &plan, false)?;
     let rows = outputs(&plan, &bases, experiments);
@@ -1679,7 +1907,7 @@ pub fn evaluate_labelled<E: BlockEngine>(
             return Err(error("a target of other rows than its experiment's"));
         }
     }
-    let (paths, bases) = paths(batch, experiments, p.values(), None, blocks)?;
+    let (paths, bases) = paths(batch, experiments, p.values(), parts_of(p), None, blocks)?;
     let plan = Plan::new(paths, length);
     let arithmetic = p.arithmetic();
     let (stream, calls) = run([p, m], &plan, gradient || labels.is_some())?;
@@ -1797,8 +2025,8 @@ impl Interchange {
         tile_rows: usize,
     ) -> Result<Self, String> {
         let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
-        let (m_flat, m_streams, m_reads) = sites(&Artifact::native(native)?, layers)?;
-        let (p_flat, p_streams, p_reads) = sites(explanation, layers)?;
+        let (m_flat, m_streams, m_reads, m_parts) = flat_sites(&Artifact::native(native)?, layers)?;
+        let (p_flat, p_streams, p_reads, p_parts) = flat_sites(explanation, layers)?;
         let (m_prefix, p_prefix) = (prefix(&m_flat)?, prefix(&p_flat)?);
         let mut m = DeviceProgram::compile_values_bounded(device, &m_prefix, numeric_bytes)?;
         m.set_arithmetic(arithmetic);
@@ -1811,9 +2039,40 @@ impl Interchange {
         let head = FixedHead::new(device, &m_flat, &p_flat, tile_rows)?;
         let m_values = values(native, &Artifact::native(native)?, layers, &variables)?;
         let p_values = values(native, explanation, layers, &variables)?;
-        let m_sites = Arc::new(Sites::new(&m, &m_flat, m_streams, m_reads, &[], m_values)?);
-        let p_sites = Arc::new(Sites::new(&p, &p_flat, p_streams, p_reads, trainable, p_values)?);
+        let mut m_sites = Sites::new(&m, &m_flat, m_streams, m_reads, &[], m_values)?;
+        let mut p_sites = Sites::new(&p, &p_flat, p_streams, p_reads, trainable, p_values)?;
+        m_sites.parts.nodes = m_parts;
+        p_sites.parts.nodes = p_parts;
+        let (m_sites, p_sites) = (Arc::new(m_sites), Arc::new(p_sites));
         Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), kept: RefCell::new(None) })
+    }
+
+    /// The parts that edits of parts act on ([`Part`], [`Patch::Part`]), the same for `M` and `P`:
+    /// each in an MLP block both models hold the output of, reading and writing the stream's
+    /// width. A fit sets them from `P`'s posterior mean.
+    pub fn set_parts(&mut self, parts: Vec<Part>) -> Result<(), String> {
+        let width = self.m.widths()[self.m_sites.entries[0]];
+        for p in &parts {
+            let held = |s: &Sites| s.parts.nodes.get(p.block).copied().flatten().is_some();
+            if !held(&self.m_sites) || !held(&self.p_sites) {
+                return Err(error(format!("block {}: a part outside an MLP block both models hold", p.block)));
+            }
+            if p.read.len() != width || p.write.len() != width {
+                return Err(error("a part's read or write is not of the stream's width"));
+            }
+        }
+        let parts = Arc::new(parts);
+        for sites in [&mut self.m_sites, &mut self.p_sites] {
+            let mut next = (**sites).clone();
+            next.parts.parts = Arc::clone(&parts);
+            *sites = Arc::new(next);
+        }
+        Ok(())
+    }
+
+    /// The parts ([`Interchange::set_parts`]).
+    pub fn parts(&self) -> &[Part] {
+        &self.m_sites.parts.parts
     }
 
     /// `M` and `P` as the free functions of this module take them.
@@ -1974,7 +2233,7 @@ mod tests {
             let batch = Batch::new(sequences[..3].to_vec(), sequences[3..].to_vec()).expect("the batch");
             let experiments = sample(&mut StdRng::seed_from_u64(5), 3, ic.variables(), 4, 12).expect("the draw");
             let (m, p) = ic.models();
-            let (paths, bases) = paths(&batch, &experiments, p.values(), None, 4).expect("the paths");
+            let (paths, bases) = paths(&batch, &experiments, p.values(), &[], None, 4).expect("the paths");
             let plan = Plan::new(paths, 12);
             let (stream, calls) = run([&p, &m], &plan, true).expect("the forward pass");
             let rows = outputs(&plan, &bases, &experiments);
@@ -2014,7 +2273,7 @@ mod tests {
         let take = ndarray::array![[1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let keep = take.mapv(|m: f64| 1.0 - m);
         let patches = Patches { rows: rows.clone(), sources: sources.clone(), keep: d.upload(keep.view()).unwrap(), take: d.upload(take.view()).unwrap() };
-        let edits = Edits { nodes: BTreeMap::from([(7, patches)]) };
+        let edits = Edits { nodes: BTreeMap::from([(7, patches)]), writes: BTreeMap::new() };
         let start = ndarray::Array2::from_shape_fn((6, 3), |(r, c)| 1.0 + r as f64 * 0.37 - c as f64 * 1.9);
         // Applied one at a time, every source read first.
         let mut applied = start.clone();
@@ -2123,7 +2382,7 @@ mod tests {
         let experiments = sample(&mut StdRng::seed_from_u64(3), 3, ic.variables(), 4, 12).expect("the draw");
         // The exact diagonal.
         let (m, p) = ic.models();
-        let (paths, bases) = paths(&batch, &experiments, p.values(), None, 4).expect("the paths");
+        let (paths, bases) = paths(&batch, &experiments, p.values(), &[], None, 4).expect("the paths");
         let plan = Plan::new(paths, 12);
         let (stream, calls) = run([&p, &m], &plan, true).expect("the forward pass");
         let rows = outputs(&plan, &bases, &experiments);
