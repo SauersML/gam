@@ -1,66 +1,114 @@
-"""F on held-out edits = description bits / N_train + mean gap KL(M_e || P_e) (bits/token), per method,
-from the result files there are now; one figure per model: x = description bits (log), y = gap."""
-import json, os
+"""F on held-out edits per explanation, on the one shared experiment manifest only.
+
+A point is drawn only for an explanation scored by the edits driver on the shared,
+explanation-independent operations (swap, zero, scale, push), with one seed and the same held-out
+rows, from one binary (c7fa7f6dc5): EDITS files under ~/mpd-data/compare/new_ops/c7/<arm>/. An
+explanation without such a score (VPD until it is scored on the manifest, a fit without a
+checkpoint) is listed in the table with no number and is not drawn; a clean-text error never stands
+in for an edit gap.
+
+Description bits, one convention for every explanation: KL(q || p) of every described group (the
+fit's divergence: features, threshold groups, sink vectors), plus 32 bits per real for every executed
+fixed piece that is not one of M's own tensors (a transcoder block's b_dec). M's own tensors that an
+explanation runs unchanged (attention, embeddings, norms) are charged to no explanation.
+F on edits = description bits / N + mean gap, N the fit's scored training tokens.
+
+usage: f_edits.py [OUT.png]"""
+import json, os, sys, glob, textwrap
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.ticker
-L = lambda p: json.load(open(p)) if os.path.exists(p) else None
-Q = '/Users/user/mpd-data/runpod/sparseimport-all28-n2p22b/out'
-V = '/Users/user/mpd-data/runpod/compare-vpd4l-tc4096-n2p24/out'
-D = '/Users/user/mpd-data/scratch/compare/tc'
+from safetensors import safe_open
+
+C7 = '/Users/user/mpd-data/compare/new_ops/c7'
+RP = '/Users/user/mpd-data/runpod'
+L = lambda p: json.load(open(p)) if p and os.path.exists(p) else None
 
 
-def gap_rs(r):  # mean gap over the edit experiments' scored tokens (all families but clean), and clean
-    f = r['families']
-    tok = sum(v['tokens'] for k, v in f.items() if k != 'clean')
-    return sum(v['mean_bits_per_token'] * v['tokens'] for k, v in f.items() if k != 'clean') / tok, f['clean']['mean_bits_per_token']
+def manifest_gap(r):
+    """Mean gap over every scored token of the shared operations, its by-effect bins, and the
+    per-family records (with any diagnostic fields the driver adds)."""
+    fams = {k: v for k, v in r['families'].items() if k != 'clean'}
+    tok = sum(v['tokens'] for v in fams.values())
+    gap = sum(v['mean_bits_per_token'] * v['tokens'] for v in fams.values()) / tok
+    bins = {}
+    for v in fams.values():
+        for b in v.get('by_effect', []):
+            key = str(b['effect_bits_at_edited_token'])
+            n = b['experiments']
+            acc = bins.setdefault(key, [0, 0.0])
+            acc[0] += n
+            acc[1] += b['mean_bits_per_token'] * n
+    return gap, {k: (n, s / n) for k, (n, s) in bins.items() if n}, r['families']
 
 
-def gap_py(r):
-    n = r['pooled_remove']['tokens'] + r['pooled_amplify']['tokens']
-    return (r['pooled_remove']['mean_bits_per_token'] * r['pooled_remove']['tokens'] + r['pooled_amplify']['mean_bits_per_token'] * r['pooled_amplify']['tokens']) / n, r['pooled_clean']['mean_bits_per_token']
+def fixed_bits(out):
+    """32 bits per real of each transcoder layer's fixed output bias (not M's tensor)."""
+    reals = 0
+    for f in glob.glob(f'{out}/transcoder_l*.safetensors'):
+        with safe_open(f, 'np') as sf:
+            reals += int(np.prod(sf.get_slice('bias').get_shape()))
+    return 32 * reals
+
+
+def latest(fit_dir):
+    h = L(f'{fit_dir}/checkpoint.json')
+    return h
 
 
 rows = []
-qh = L(f'{Q}/checkpoint.json')
-best = max(qh['epochs'], key=lambda e: -e['held_out']['objective_bits_per_token'])
-for name, desc, r, act in (('Qwen3 transcoders as built (f>=1e-3, 28,545)', qh['start']['divergence_bits'], L(f'{Q}/EDITS_as_is_all.json') or L(f'{Q}/EDITS_as_is.json'), [l['nonzero_per_token'] for l in qh['start']['layers'] if l['functions']]),
-                           (f"Qwen3 ours, fitted (epoch {best['epoch']})", best['held_out']['divergence_bits'], L(f'{Q}/EDITS_fit_best_all.json') or L(f'{Q}/EDITS_fit_best.json'), [l['nonzero_per_token'] for l in best['held_out']['layers'] if l['functions']])):
-    g, c = gap_rs(r)
-    rows.append({'model': 'Qwen3-0.6B', 'method': name, 'N_train': qh['tokens'], 'description_bits': desc, 'gap_edits': g, 'gap_clean': c, 'F_edits': desc / qh['tokens'] + g, 'active_per_token_mean': float(np.mean(act))})
-vh = L(f'{V}/checkpoint.json')
-N = vh['tokens']
-r_tc = L('/Users/user/mpd-data/compare/vpd4l_tc4096_mac/EDITS_as_is_all.json')
-g, c = gap_rs(r_tc) if r_tc else gap_py(L(f'{D}/edit_vpd4l-relu4096.json'))
-rows.append({'model': 'vpd4l', 'method': 'transcoders as built (4096/layer)', 'N_train': N, 'description_bits': vh['start']['divergence_bits'], 'gap_edits': g, 'gap_clean': c, 'F_edits': vh['start']['divergence_bits'] / N + g, 'active_per_token_mean': float(np.mean([l['nonzero_per_token'] for l in vh['start']['layers'] if l['functions']])), 'gap_source': 'driver' if r_tc else 'python'})
-e = vh['epochs'][-1]['held_out']
-rows.append({'model': 'vpd4l', 'method': f"ours, fitted (epoch {vh['epochs'][-1]['epoch']}, clean gap only)", 'N_train': N, 'description_bits': e['divergence_bits'], 'gap_edits': None, 'gap_clean': e['mean_bits_per_token'], 'F_edits': None, 'active_per_token_mean': float(np.mean([l['nonzero_per_token'] for l in e['layers'] if l['functions']]))})
-for name, f, act in (('VPD, all sites (CI uncharged, gates read M; KL(q||p) of vpd-pricing-n2p24b, attention included)', 'edit_vpd.json', 213.4), ):
-    g, c = gap_py(L(f'{D}/{f}'))
-    rows.append({'model': 'vpd4l', 'method': name, 'caveat': 'CI uncharged, gates read M (favourable to VPD); the fair point (CI inside P, on P activations, charged) comes from vpdstart', 'N_train': 2 ** 24, 'description_bits': 11.4e6, 'gap_edits': g, 'gap_clean': c, 'F_edits': 11.4e6 / 2 ** 24 + g, 'active_per_token_mean': act / 4})
+# vpd4l: transcoders as built (priced by the threshold-group fit's Laplace start, the same
+# explanation), and the two fits' best checkpoints.
+thr2 = latest(f'{RP}/compare-vpd4l-tc4096-thr2/out')
+arms = [('vpd4l', 'transcoders as built (4,096 per layer, priced at its Laplace start)', f'{C7}/vpd4l_as_is', 'EDITS_as_is_ops.json',
+         thr2['start'] if thr2 else None, thr2['tokens'] if thr2 else None, f'{RP}/compare-vpd4l-tc4096-thr2/out')]
+for name, label in (('compare-vpd4l-tc4096-thr2', 'ours, fitted by F (read patches)'), ('compare-vpd4l-tc4096-thr-edits', 'ours, fitted by F (read patches and the shared operations)')):
+    h = latest(f'{RP}/{name}/out')
+    best = L(f'{C7}/{name}/checkpoint.best.json')
+    rec = None
+    if h and best and h['epochs']:
+        e = best['best'][1] if best.get('best') else max(best['epoch'] - 1, 0)
+        rec = next((x['held_out'] for x in h['epochs'] if x['epoch'] == e), None)
+        label += f' (epoch {e})'
+    arms.append(('vpd4l', label, f'{C7}/{name}', 'EDITS_thr_best_ops.json', rec, h['tokens'] if h else None, f'{RP}/{name}/out'))
+arms.append(('Qwen3-0.6B', 'transcoders as built (f >= 1e-3, 28,545 features)', f'{C7}/qwen3_as_is', 'EDITS_as_is_ops.json', None, None, f'{C7}/qwen3_as_is'))
+for model, label, d, f, rec, N, out in arms:
+    r = L(f'{d}/{f}')
+    row = {'model': model, 'method': label, 'edits': f'{d}/{f}' if r else None}
+    if r:
+        row['gap'], row['gap_by_effect'], row['families'] = manifest_gap(r)
+    if rec and N:
+        row['description_bits'] = rec['divergence_bits'] + fixed_bits(out)
+        row['N'] = N
+        row['active_per_token'] = [l['nonzero_per_token'] for l in rec['layers'] if l['functions']]
+        if r:
+            row['F_edits'] = row['description_bits'] / N + row['gap']
+    rows.append(row)
+for label in ('VPD as published (retrospective: its causal-importance network reads M, bidirectional)', 'VPD autonomous (prefix-causal, its network reads P; vpdstart)'):
+    rows.append({'model': 'vpd4l', 'method': label, 'edits': None, 'note': 'not yet scored on the shared manifest'})
 json.dump(rows, open('/Users/user/mpd-data/compare/f_edits_table.json', 'w'), indent=1)
 for r in rows:
-    print(r['model'], '|', r['method'], '| desc', f"{r['description_bits']:.3g}", '| gap edits', r['gap_edits'] and round(r['gap_edits'], 3), '| clean', round(r['gap_clean'], 3), '| F_edits', r['F_edits'] and round(r['F_edits'], 3), '| active/token/layer', round(r['active_per_token_mean'], 1))
-plt.rcParams.update({'font.size': 14})
-fig, axes = plt.subplots(1, 2, figsize=(15, 6), facecolor='white')
-for ax, model in zip(axes, ('vpd4l', 'Qwen3-0.6B')):
-    for r in rows:
-        if r['model'] != model:
-            continue
-        y = r['gap_edits'] if r['gap_edits'] is not None else r['gap_clean']
-        ax.scatter([r['description_bits']], [y], s=80, color='#4c72b0' if 'ours' in r['method'] else '#c44e52' if 'VPD' in r['method'] else '#8172b2')
-        ax.annotate(f"{r['method'].split(' (')[0]}{' (CI uncharged, gates read M)' if 'VPD' in r['method'] else ''}\n{r['active_per_token_mean']:.0f} active/token/layer", (r['description_bits'], y), textcoords='offset points', xytext=(8, 6), fontsize=11)
-    ax.set_xscale('log')
-    ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
-    ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f'{v / 1e6:.0f}M'))
-    ax.set_xlim(5e6, 6e7)
-    ax.set_xlabel('description bits, KL(q||p) (log scale)')
-    ax.set_xticks([5e6, 1e7, 2e7, 5e7])
-    ax.set_ylabel('held-out edit gap KL(M_e || P_e), bits/token')
-    ax.set_title(model)
-    ax.spines[['top', 'right']].set_visible(False)
-    ax.set_ylim(bottom=0)
-fig.tight_layout()
-fig.savefig('/Users/user/mpd-data/figures/compare/f_edits_description_vs_gap.png', dpi=120, facecolor='white')
+    print(r['model'], '|', r['method'], '| gap', r.get('gap') and round(r['gap'], 3), '| description', r.get('description_bits') and f"{r['description_bits']:.4g}",
+          '| F on edits', r.get('F_edits') and round(r['F_edits'], 3), '| bins', {k: (n, round(g, 3)) for k, (n, g) in (r.get('gap_by_effect') or {}).items()}, r.get('note', ''))
+if len(sys.argv) > 1:
+    plt.rcParams.update({'font.size': 14})
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6.5), facecolor='white')
+    for ax, model in zip(axes, ('vpd4l', 'Qwen3-0.6B')):
+        pts = [r for r in rows if r['model'] == model and r.get('gap') is not None and r.get('description_bits')]
+        for r in pts:
+            ax.scatter([r['description_bits']], [r['gap']], s=80, color='#4c72b0' if r['method'].startswith('ours') else '#8172b2')
+            act = '/'.join(f'{a:.0f}' for a in r['active_per_token'])
+            ax.annotate('\n'.join(textwrap.wrap(r['method'], 38)) + f'\nactive per token by layer: {act}', (r['description_bits'], r['gap']), textcoords='offset points', xytext=(8, 6), fontsize=10)
+        ax.set_xscale('log')
+        ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f'{v / 1e6:g}M'))
+        ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+        ax.set_xlabel('description bits (log scale)')
+        ax.set_ylabel('mean gap on the shared operations, bits/token')
+        ax.set_title(model if pts else f'{model}: no explanation scored and priced yet')
+        ax.spines[['top', 'right']].set_visible(False)
+        ax.set_ylim(bottom=0)
+    fig.tight_layout()
+    fig.savefig(sys.argv[1], dpi=120, facecolor='white')
+    print('wrote', sys.argv[1])
