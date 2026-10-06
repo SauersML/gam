@@ -89,6 +89,24 @@ impl VpdPart {
         }
     }
 
+    /// The derivative of [`VpdPart::edit`] in the read along `dx`, `J(x) dx`: for a slice of
+    /// `W_down`, `(α − 1)(v·(φ'(z) ⊙ W_fc dx)) u`; for a slice of `W_fc`,
+    /// `W_down[φ'(z') ⊙ (W_fc dx + (α − 1)(v·dx) u) − φ'(z) ⊙ W_fc dx]` (`z`, `z'` as in
+    /// [`VpdPart::pullback`]).
+    #[must_use]
+    pub fn tangent(&self, mlp: &Mlp, x: ArrayView1<f64>, alpha: f64, dx: ArrayView1<f64>) -> Array1<f64> {
+        let (pre, moved_in) = (mlp.read.dot(&x), mlp.read.dot(&dx));
+        let slope = |z: &Array1<f64>| z.mapv(|t| mlp.law.derivative(t));
+        match self.map {
+            Map::Down => &self.u * ((alpha - 1.0) * self.v.dot(&(slope(&pre) * &moved_in))),
+            Map::Up => {
+                let moved = &pre + &(&self.u * ((alpha - 1.0) * self.v.dot(&x)));
+                let shifted = &moved_in + &(&self.u * ((alpha - 1.0) * self.v.dot(&dx)));
+                mlp.write.dot(&(slope(&moved) * &shifted - slope(&pre) * &moved_in))
+            }
+        }
+    }
+
     /// The pullback of [`VpdPart::edit`] in the read: `J(x)ᵀ ḡ` for the output's cotangent `ḡ`.
     /// With `z = W_fc x` and `φ'` the law's derivative: for a slice of `W_down`,
     /// `(α − 1)(u·ḡ) W_fcᵀ(φ'(z) ⊙ v)`; for a slice of `W_fc`, with `z' = z + (α − 1)(v·x) u` and
@@ -121,6 +139,12 @@ impl Slice {
     #[must_use]
     pub fn edit(&self, x: ArrayView1<f64>, alpha: f64) -> Array1<f64> {
         self.part.edit(&self.mlp, x, alpha)
+    }
+
+    /// [`VpdPart::tangent`] with the part's own layer's MLP.
+    #[must_use]
+    pub fn tangent(&self, x: ArrayView1<f64>, alpha: f64, dx: ArrayView1<f64>) -> Array1<f64> {
+        self.part.tangent(&self.mlp, x, alpha, dx)
     }
 
     /// [`VpdPart::pullback`] with the part's own layer's MLP.
@@ -328,7 +352,8 @@ mod tests {
     /// maps are sums of four slices each, every slice of either map at every factor of
     /// `interchange::FACTORS` moves the output at a random read by exactly the output of the edited
     /// MLP less the original's (1e-12 of the output's scale), α = 1 moves nothing, and under the
-    /// smooth laws the pullback matches central differences (1e-6).
+    /// smooth laws the pullback matches central differences (1e-6) and the tangent is its
+    /// transpose (1e-12).
     #[test]
     fn a_parts_edit_is_its_slices_weight_edit_on_m() {
         let (d, hidden, slices) = (5, 7, 4);
@@ -361,6 +386,10 @@ mod tests {
                         if law != Law::Relu {
                             let cotangent = Array1::from_shape_fn(d, |c| 0.3 + 0.1 * c as f64);
                             let pulled = part.pullback(&mlp, x.view(), alpha, cotangent.view());
+                            // The tangent is the pullback's transpose: ḡ·(J dx) = (Jᵀ ḡ)·dx.
+                            let dx = Array1::from_shape_fn(d, |c| 0.7 - 0.2 * c as f64);
+                            let (forward, backward) = (part.tangent(&mlp, x.view(), alpha, dx.view()).dot(&cotangent), pulled.dot(&dx));
+                            assert!((forward - backward).abs() <= 1e-12 * (1.0 + backward.abs()), "{law:?} {map:?} slice {i} at α {alpha}: tangent {forward} against pullback {backward}");
                             for c in 0..d {
                                 let h = 1e-5;
                                 let (mut up, mut down) = (x.clone(), x.clone());
