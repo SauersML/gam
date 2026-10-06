@@ -1654,6 +1654,7 @@ impl PriorTerm for Mixture {
         let (blocks, heads): (Vec<usize>, Vec<usize>) = live.into_iter().partition(|&t| self.is_block(t));
         let mut learned = vec![Vec::new(); self.targets.len()];
         let (mut value, mut gradient) = (0.0, BTreeMap::new());
+        let timed = std::time::Instant::now();
         if !heads.is_empty() {
             // The key-value groups' terms on the host, at their operators' sample.
             let operators = self.operators_of(&heads);
@@ -1669,11 +1670,15 @@ impl PriorTerm for Mixture {
                 gradient.insert(i, device.upload(g.view()).map_err(error)?);
             }
         }
+        let host_seconds = timed.elapsed().as_secs_f64();
         if !blocks.is_empty() {
             if self.plan.0.as_ref().is_none_or(|layout| layout.active != posterior.active) {
                 self.plan = Plan(Some(self.layout(device, posterior, &blocks)?));
             }
             let (nats, on_device) = self.blocks_on_device(device, device_posterior, key, &mut learned)?;
+            if let Some(layout) = &self.plan.0 {
+                log::debug!("mixture term: {} key-value targets on the host in {host_seconds:.4} s; {} block targets, {} pairs, {} table rows, {} slots on the device in {:.4} s", heads.len(), blocks.len(), layout.pairs, layout.rows, layout.slots.len(), timed.elapsed().as_secs_f64() - host_seconds);
+            }
             value += nats;
             for (i, g) in on_device {
                 match gradient.get_mut(&i) {
