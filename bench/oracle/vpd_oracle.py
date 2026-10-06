@@ -238,10 +238,12 @@ class Table:
         self._near[key] = out
         return out
 
-    def text(self, ctx: int, upto: int, mark: int) -> str:
-        """The context's tokens up to `upto` (inclusive) with token `mark` set off by double brackets."""
+    def text(self, ctx: int, upto: int, mark: int, width: int = 0) -> str:
+        """The context's tokens up to `upto` (inclusive) with token `mark` set off by double brackets
+        (with width > 0, only the `width` tokens before the mark)."""
         ids = self.tokens[ctx, : upto + 1].tolist()
-        return self.tok.decode(ids[:mark]) + "⟦" + self.tok.decode([ids[mark]]) + "⟧" + self.tok.decode(ids[mark + 1 :])
+        first = max(0, mark - width) if width else 0
+        return self.tok.decode(ids[first:mark]) + "⟦" + self.tok.decode([ids[mark]]) + "⟧" + self.tok.decode(ids[mark + 1 :])
 
     def piece(self, token: int) -> str:
         return json.dumps(self.tok.decode([int(token)]))
@@ -460,7 +462,9 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
 
 
 def exemplars(table: Table, ex: dict, n: int = 3) -> str:
-    """The subcomponent's n most active measured contexts other than the example's, as marked text."""
+    """The subcomponent's n most active measured contexts other than the example's, as marked text, each
+    the 24 tokens before its peak (whole contexts made a weights + texts arm's prompts two to three times
+    longer and its steps 2x slower)."""
     meta, d = table.sites[(ex["layer"], ex["kind"])]
     act = d["activity"][ex["c"]].float()
     peak = float(act.abs().max())
@@ -469,7 +473,7 @@ def exemplars(table: Table, ex: dict, n: int = 3) -> str:
         if j == ex["j"] or len(lines) == n:
             continue
         p = int(d["position"][ex["c"], j])
-        lines.append(f"- {table.text(int(d['contexts'][ex['c'], j]), p, p)!r} (level {level(float(act[j, p]), peak)})")
+        lines.append(f"- {table.text(int(d['contexts'][ex['c'], j]), p, p, width=24)!r} (level {level(float(act[j, p]), peak)})")
     return "On other texts the component is most active at the marked tokens:\n" + "\n".join(lines)
 
 
