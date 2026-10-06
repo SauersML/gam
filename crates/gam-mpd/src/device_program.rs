@@ -120,6 +120,12 @@ enum Step {
         left: usize,
         right: usize,
     },
+    /// `inside`'s rows at `positions`, `outside`'s elsewhere (`Node::Select`).
+    Select {
+        inside: usize,
+        outside: usize,
+        positions: Vec<u32>,
+    },
     RmsNorm {
         input: usize,
         epsilon: f64,
@@ -176,6 +182,7 @@ fn step_arguments(step: &Step) -> Vec<usize> {
         Step::Affine { terms, .. } => terms.iter().map(|t| t.0).collect(),
         Step::Pointwise { input, .. } | Step::Gain { input, .. } | Step::RmsNorm { input, .. } | Step::Readout { input } | Step::Transposed { input, .. } => vec![*input],
         Step::Hadamard { left, right } => vec![*left, *right],
+        Step::Select { inside, outside, .. } => vec![*inside, *outside],
         Step::Attend { query, key, value, .. } => vec![*query, *key, *value],
         Step::Concat { parts } => parts.clone(),
     }
@@ -249,6 +256,7 @@ struct PreparedBatch {
     ids: BTreeMap<usize, Arc<Indices>>,
     blocks: usize,
     rotations: Arc<Vec<(Rotary, Tensor, Tensor)>>,
+    positions: Arc<Vec<u32>>,
 }
 
 /// A fused group's buffers in a trace (`device_heads`): `P`, `N` and `G` when its queries and
@@ -290,6 +298,29 @@ pub struct DeviceTrace {
     blocks: usize,
     /// Per rotary configuration, `(cos, sin)` per row and plane.
     rotations: Arc<Vec<(Rotary, Tensor, Tensor)>>,
+    /// Per row its position in its sequence (empty without a layout).
+    positions: Arc<Vec<u32>>,
+}
+
+/// The rows of `trace` whose position is one of `positions` (`Step::Select`).
+fn selected(trace: &DeviceTrace, positions: &[u32]) -> Result<Vec<usize>, String> {
+    if trace.positions.len() != trace.rows {
+        return Err("device: a select step needs a sequence layout".to_string());
+    }
+    Ok(trace.positions.iter().enumerate().filter(|(_, p)| positions.binary_search(p).is_ok()).map(|(row, _)| row).collect())
+}
+
+/// `outside` with its `rows` replaced by `inside`'s (a zero `inside` when absent).
+fn select_rows(d: &Device, rows: &[usize], inside: Option<&Tensor>, outside: &Tensor) -> Result<Tensor, String> {
+    let mut out = d.copy(outside).map_err(error)?;
+    for &row in rows {
+        let part = match inside {
+            Some(inside) => d.rows_of(inside, row, 1).map_err(error)?,
+            None => d.zeros(1, outside.cols()).map_err(error)?,
+        };
+        d.set_rows(&mut out, row, &part).map_err(error)?;
+    }
+    Ok(out)
 }
 
 impl DeviceTrace {
@@ -594,6 +625,7 @@ impl DeviceProgram {
                     Step::Pointwise { input: *input, codes: device.upload_indices(&codes).map_err(error)? }
                 }
                 Node::Hadamard { left, right } => Step::Hadamard { left: *left, right: *right },
+                Node::Select { inside, outside, positions } => Step::Select { inside: *inside, outside: *outside, positions: positions.clone() },
                 Node::RmsNorm { input, epsilon } => Step::RmsNorm { input: *input, epsilon: *epsilon },
                 Node::Attend { query, key, value, scale, rotary, causal } => {
                     if let Some(r) = rotary
@@ -1057,7 +1089,8 @@ impl DeviceProgram {
                 }
             }
         }
-        let saved = Arc::new(PreparedBatch { rows: family.rows, layout: family.layout.clone(), tokens, ids, blocks, rotations: Arc::new(rotations) });
+        let positions = Arc::new(family.layout.as_ref().map(|l| l.position.clone()).unwrap_or_default());
+        let saved = Arc::new(PreparedBatch { rows: family.rows, layout: family.layout.clone(), tokens, ids, blocks, rotations: Arc::new(rotations), positions });
         *cached = Some(Arc::clone(&saved));
         Ok(saved)
     }
@@ -1400,6 +1433,7 @@ impl DeviceProgram {
             ids: batch.ids.clone(),
             blocks: batch.blocks,
             rotations: Arc::clone(&batch.rotations),
+            positions: Arc::clone(&batch.positions),
         };
         for (index, step) in self.steps.iter().enumerate() {
             if Some(index) == entry {
@@ -1486,6 +1520,10 @@ impl DeviceProgram {
                     let mut out = d.empty(rows, width).map_err(error)?;
                     d.hadamard(&mut out, trace.value(*left)?, trace.value(*right)?, false).map_err(error)?;
                     value(out)
+                }
+                Step::Select { inside, outside, positions } => {
+                    let chosen = selected(&trace, positions)?;
+                    value(select_rows(d, &chosen, Some(trace.value(*inside)?), trace.value(*outside)?)?)
                 }
                 Step::RmsNorm { input, epsilon } => value(d.rms_norm(trace.value(*input)?, *epsilon).map_err(error)?),
                 Step::Attend { query, key, value: v, scale, rotary, causal } => {
@@ -1996,6 +2034,12 @@ impl DeviceProgram {
                         add(&mut g, *right, gr)?;
                     }
                 }
+                Step::Select { inside, outside, positions } => {
+                    let chosen = selected(trace, positions)?;
+                    let zero = d.zeros(trace.rows, cot.cols()).map_err(error)?;
+                    add(&mut g, *inside, select_rows(d, &chosen, Some(&cot), &zero)?)?;
+                    add(&mut g, *outside, select_rows(d, &chosen, None, &cot)?)?;
+                }
                 Step::RmsNorm { input, epsilon } => {
                     let term = d
                         .rms_norm_backward(trace.value(*input)?, &cot, *epsilon)
@@ -2433,6 +2477,14 @@ impl DeviceProgram {
                         Some(out)
                     }
                     None => None,
+                },
+                Step::Select { inside, outside, positions } => match (dv[*inside].as_ref(), dv[*outside].as_ref()) {
+                    (None, None) => None,
+                    (di, dout) => {
+                        let chosen = selected(trace, positions)?;
+                        let zero = d.zeros(rows, width).map_err(error)?;
+                        Some(select_rows(d, &chosen, di, dout.unwrap_or(&zero))?)
+                    }
                 },
                 Step::Hadamard { left, right } => match (dv[*left].as_ref(), dv[*right].as_ref()) {
                     (None, None) => None,

@@ -7,9 +7,10 @@
 //! The features that fire on those tokens at `M`'s MLP input are kept (`OUT/kept.safetensors`);
 //! the library explanation with that layer's MLP replaced by them is run, and `OUT/CHECK.json`
 //! holds the largest difference between the library block's output and the full transcoder's own
-//! reconstruction `Σ_i relu(g_i·x + c_i) u_i + b` at the block's input, against the
-//! reconstruction's largest entry, and the count of kept functions that are off (exactly zero) per
-//! token.
+//! reconstruction `Σ_i relu(g_i·x + c_i) u_i + b` at the block's input (`M`'s own MLP output at
+//! each sequence's first token, where the block runs `M`'s MLP), against the reconstruction's
+//! largest entry, and the count of kept functions that are off (exactly zero) per token after the
+//! first.
 use gam_gpu::tensor::Device;
 use gam_mpd::{
     engine::log_to_stderr,
@@ -55,13 +56,20 @@ fn main() -> Result<(), String> {
     let place = |n: usize| explanation.artifact.place(n).ok_or_else(|| format!("native node {n} has no place"));
     let x = &trace.values[place(layers[layer].normed)?];
     let mlp = &trace.values[place(layers[layer].mlp)?];
-    let reference = full.reconstruction(x)?;
+    let mut reference = full.reconstruction(x)?;
+    let native_trace = native.execute(&family, false).map_err(|e| e.to_string())?;
+    let first: Vec<bool> = family.layout.as_ref().ok_or("a layout")?.position.iter().map(|&p| p == 0).collect();
+    for (row, &first) in first.iter().enumerate() {
+        if first {
+            reference.row_mut(row).assign(&native_trace.values[layers[layer].mlp].row(row));
+        }
+    }
     let scale = reference.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
     let difference = reference.iter().zip(mlp).fold(0.0_f64, |a, (r, m)| a.max((r - m).abs()));
     // The library's input to the block, against M's own (every other block is M's at the start).
-    let native_x = native.execute(&family, false).map_err(|e| e.to_string())?.values[layers[layer].normed].clone();
+    let native_x = native_trace.values[layers[layer].normed].clone();
     let input_difference = native_x.iter().zip(x).fold(0.0_f64, |a, (p, q)| a.max((p - q).abs()));
-    let tokens = sequences.len() * context;
+    let tokens = sequences.len() * (context - 1);
     let fired: u64 = counts[&layer].iter().sum();
     let record = json!({
         "layer": layer,

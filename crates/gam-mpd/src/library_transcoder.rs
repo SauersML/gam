@@ -11,10 +11,16 @@
 //! token where its pre-activation is not positive, so per token most functions contribute nothing:
 //! the sparsity is the functions' own, not a penalty.
 //!
-//! Only features that fire on the training sample are kept ([`firing`]): a feature whose
-//! pre-activation is not positive on any training token adds exactly zero to the MLP's output on
-//! every clean training input at the starting point, so dropping it leaves the start unchanged
-//! there. The kept features are written once in the library's layout ([`write_kept`]): `gate`
+//! The first token of a sequence is outside a transcoder's domain: Qwen3's attention sink, where
+//! the MLP's input is small (norm 2.4 at layer 14, against 33 elsewhere), M's MLP output is tiny
+//! (norm 0.25) and the transcoder fires about 54,000 features with a relative error of about 3,000.
+//! So the block runs `M`'s own MLP at position 0 (its operators, fixed and not described) and the
+//! transcoder's features at every other position ([`Node::Select`]).
+//!
+//! Only features that fire on the training sample at positions after the first are kept
+//! ([`firing`]): a feature whose pre-activation is not positive on any such token adds exactly zero
+//! to the block's output on every clean training input at the starting point, so dropping it
+//! leaves the start unchanged there. The kept features are written once in the library's layout ([`write_kept`]): `gate`
 //! `k × d`, `gate_bias` `k × 1`, `out` `d × k` (`W_dec`'s kept rows transposed) and `bias` `d × 1`
 //! in the transcoder's own storage type (bfloat16 reals copied bit for bit), and `features` (the
 //! kept features' indices in the transcoder, as float32, exact below 2^24). The library's operators
@@ -170,9 +176,10 @@ pub fn kept_features(path: &Path) -> Result<Vec<usize>, String> {
     Ok(file.vector("features", k).map_err(error)?.iter().map(|&f| f as usize).collect())
 }
 
-/// Per transcoder layer, on how many tokens of `sequences` each feature fires (its pre-activation
-/// `g_i·x + c_i` is positive) at `M`'s own MLP input `x`, from `M` run on `device`, `batch`
-/// sequences at a time. The counts are float32 sums of zeros and ones, exact below 2^24 tokens.
+/// Per transcoder layer, on how many tokens of `sequences` after each one's first (where the block
+/// runs `M`'s own MLP, module note) each feature fires (its pre-activation `g_i·x + c_i` is
+/// positive) at `M`'s own MLP input `x`, from `M` run on `device`, `batch` sequences at a time.
+/// The counts are float32 sums of zeros and ones, exact below 2^24 tokens.
 pub fn firing(device: &Device, native: &OperatorProgram, layers: &[LayerNodes], transcoders: &BTreeMap<usize, Transcoder>, sequences: &[Vec<u32>], batch: usize) -> Result<BTreeMap<usize, Vec<u64>>, String> {
     let mut program = DeviceProgram::compile(device, native)?;
     program.set_arithmetic(if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 });
@@ -201,7 +208,8 @@ pub fn firing(device: &Device, native: &OperatorProgram, layers: &[LayerNodes], 
             // ReLU's slope: one where the pre-activation is positive, zero elsewhere.
             let fired = d.law_slopes(&ones, &z, &codes, gelu_tanh_constant()).map_err(error)?;
             drop((z, ones));
-            let tokens = d.upload_vec(1, fired.rows(), vec![1.0; fired.rows()]).map_err(error)?;
+            let positions = &family.layout.as_ref().ok_or("a sequence layout")?.position;
+            let tokens = d.upload_vec(1, fired.rows(), positions.iter().map(|&p| if p == 0 { 0.0 } else { 1.0 }).collect()).map_err(error)?;
             d.gemm(counts, 1.0, &tokens, Op::N, &fired, Op::N, 1.0, program.arithmetic()).map_err(error)?;
         }
     }
@@ -209,6 +217,41 @@ pub fn firing(device: &Device, native: &OperatorProgram, layers: &[LayerNodes], 
         .into_iter()
         .map(|(l, _, _, counts, _)| Ok((l, d.download(&counts).map_err(error)?.iter().map(|&c| c.round() as u64).collect())))
         .collect()
+}
+
+/// `M`'s MLP at a layer: its gate map (and bias), its law per unit group, its up map (and bias)
+/// when gated, and its down map.
+struct NativeMlp {
+    gate: Operator,
+    gate_bias: Option<Operator>,
+    laws: Vec<Law>,
+    up: Option<(Operator, Option<Operator>)>,
+    down: Operator,
+}
+
+fn native_mlp(native: &OperatorProgram, layer: &LayerNodes, l: usize) -> Result<NativeMlp, String> {
+    let affine = |node: usize| -> Result<(Operator, Option<Operator>), String> {
+        match &native.nodes[node] {
+            Node::Affine { terms, bias } if terms.len() == 1 && terms[0].0 == layer.normed => {
+                Ok((native.operators[terms[0].1].as_ref().clone(), bias.map(|b| native.operators[b].as_ref().clone())))
+            }
+            other => Err(format!("layer {l}: an MLP map is {other:?}")),
+        }
+    };
+    let (pointwise, up) = match &native.nodes[layer.active] {
+        Node::Hadamard { left, right } => (*left, Some(affine(*right)?)),
+        Node::Pointwise { .. } => (layer.active, None),
+        other => return Err(format!("layer {l}: the MLP's activation is {other:?}")),
+    };
+    let Node::Pointwise { input, laws } = &native.nodes[pointwise] else {
+        return Err(format!("layer {l}: the MLP's law is not one pointwise node"));
+    };
+    let (gate, gate_bias) = affine(*input)?;
+    let down = match &native.nodes[layer.mlp] {
+        Node::Affine { terms, bias: None } if terms.len() == 1 && terms[0].0 == layer.active => native.operators[terms[0].1].as_ref().clone(),
+        other => return Err(format!("layer {l}: the MLP's output map is {other:?}")),
+    };
+    Ok(NativeMlp { gate, gate_bias, laws: laws.clone(), up, down })
 }
 
 /// The native operator applied to `input` by the first affine node reading it.
@@ -243,27 +286,46 @@ pub fn mlp(native: &OperatorProgram, artifact: Artifact, layer: &LayerNodes, l: 
     }
     let units = Interface::uniform(k, 1, LabelKind::Unit, 0).map_err(error)?;
     let name = format!("library.l{l}.mlp");
+    let sink = native_mlp(native, layer, l)?;
     let source = format!("transcoder.l{l}");
     let provenance = || Provenance::derived(&[&Provenance::native(&source)], "transcoder import".into());
     let stored = |part: &str, rows: usize, cols: usize| file.stored(part, rows, cols).map_err(error);
     let base = artifact.program.operators.len();
-    let operators = vec![
+    let mut operators = vec![
         Operator::stored(format!("{name}.gate"), units.clone(), input.clone(), stored("gate", k, d)?, provenance()).map_err(error)?,
         Operator::stored(format!("{name}.gate_bias"), units.clone(), Interface::constant(), stored("gate_bias", k, 1)?, provenance()).map_err(error)?,
         Operator::stored(format!("{name}.out"), output.clone(), units, stored("out", d, k)?, provenance()).map_err(error)?,
         Operator::stored(format!("{name}.bias"), output, Interface::constant(), stored("bias", d, 1)?, provenance()).map_err(error)?,
     ];
-    let rule = Rule {
-        name: name.clone(),
-        inputs: vec![input],
-        nodes: vec![
-            Node::Param { index: 0 },
-            Node::Affine { terms: vec![(0, base)], bias: Some(base + 1) },
-            Node::Pointwise { input: 1, laws: vec![Law::Relu; k] },
-            Node::Affine { terms: vec![(2, base + 2)], bias: Some(base + 3) },
-        ],
-        output: 3,
+    let mut nodes = vec![
+        Node::Param { index: 0 },
+        Node::Affine { terms: vec![(0, base)], bias: Some(base + 1) },
+        Node::Pointwise { input: 1, laws: vec![Law::Relu; k] },
+        Node::Affine { terms: vec![(2, base + 2)], bias: Some(base + 3) },
+    ];
+    // M's own MLP, for position 0: its operators copied under `m_` names (no prior group reads
+    // them, so they stay fixed), its laws as M has them.
+    let mut copy = |op: &Operator, part: &str| -> usize {
+        let mut op = op.clone();
+        op.name = format!("{name}.m_{part}");
+        operators.push(op);
+        base + operators.len() - 1
     };
+    let gate = copy(&sink.gate, "gate");
+    let gate_bias = sink.gate_bias.as_ref().map(|b| copy(b, "gate_bias"));
+    nodes.push(Node::Affine { terms: vec![(0, gate)], bias: gate_bias });
+    nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: sink.laws.clone() });
+    let mut active = nodes.len() - 1;
+    if let Some((up, up_bias)) = &sink.up {
+        let (up, up_bias) = (copy(up, "up"), up_bias.as_ref().map(|b| copy(b, "up_bias")));
+        nodes.push(Node::Affine { terms: vec![(0, up)], bias: up_bias });
+        nodes.push(Node::Hadamard { left: active, right: nodes.len() - 1 });
+        active = nodes.len() - 1;
+    }
+    let down = copy(&sink.down, "down");
+    nodes.push(Node::Affine { terms: vec![(active, down)], bias: None });
+    nodes.push(Node::Select { inside: nodes.len() - 1, outside: 3, positions: vec![0] });
+    let rule = Rule { name: name.clone(), inputs: vec![input], output: nodes.len() - 1, nodes };
     let mut owners = Vec::with_capacity(3 * k);
     for (i, &f) in features.iter().enumerate() {
         for (part, tensor, rows, cols, transposed) in [("gate", "W_enc", i..i + 1, 0..d, false), ("gate_bias", "b_enc", i..i + 1, 0..1, false), ("out", "W_dec", 0..d, i..i + 1, true)] {
@@ -320,9 +382,11 @@ mod tests {
     }
 
     /// On the tiny Qwen3 decoder with layer 1's MLP replaced by a transcoder's firing features: the
-    /// library's MLP output is the transcoder's reconstruction at the MLP's input (to float64
-    /// rounding), every dropped feature is off on every token, and every kept feature's gate,
-    /// gate bias and output are the file's reals; the device's firing counts are the host's.
+    /// library's MLP output is `M`'s own MLP output at each sequence's first token and the
+    /// transcoder's reconstruction at every other (to float64 rounding), every dropped feature is
+    /// off on every token after the first, and every kept feature's gate, gate bias and output are
+    /// the file's reals; the device's firing counts (first tokens left out) are the host's, and the
+    /// device's forward and reverse through the block's position select are the host's.
     #[test]
     fn a_transcoder_layer_is_its_reconstruction_with_the_dead_features_dropped() {
         let dir = std::env::temp_dir().join(format!("library_transcoder_{}", std::process::id()));
@@ -344,7 +408,8 @@ mod tests {
         let encoder = transcoder.matrix("W_enc").unwrap().matrix();
         let c = ndarray::Array1::from(transcoder.vector("b_enc", features).unwrap());
         let pre = x.dot(&encoder.t()) + &c;
-        let expected: Vec<u64> = (0..features).map(|f| pre.column(f).iter().filter(|&&t| t > 0.0).count() as u64).collect();
+        let first: Vec<bool> = family.layout.as_ref().unwrap().position.iter().map(|&p| p == 0).collect();
+        let expected: Vec<u64> = (0..features).map(|f| pre.column(f).iter().zip(&first).filter(|(t, first)| **t > 0.0 && !**first).count() as u64).collect();
         let mut transcoders = BTreeMap::new();
         transcoders.insert(1, transcoder);
         let counts = firing(&Device::host(), &native, &layers, &transcoders, &sequences, 2).unwrap();
@@ -374,10 +439,43 @@ mod tests {
         let mlp = trace.values[place(layers[1].mlp)].clone();
         let input = trace.values[place(layers[1].normed)].clone();
         assert_eq!(input, x, "layer 0 is M's, so the transcoder reads M's input");
-        let reference = transcoders[&1].reconstruction(&x).unwrap();
+        let mut reference = transcoders[&1].reconstruction(&x).unwrap();
+        let native_mlp = native.execute(&family, false).unwrap().values[layers[1].mlp].clone();
+        for (row, &first) in first.iter().enumerate() {
+            if first {
+                reference.row_mut(row).assign(&native_mlp.row(row));
+            }
+        }
         let scale = reference.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
         let difference = reference.iter().zip(&mlp).fold(0.0_f64, |a, (r, m)| a.max((r - m).abs()));
-        assert!(difference <= 1e-12 * scale, "the library's MLP differs from the transcoder by {difference} (scale {scale})");
+        assert!(difference <= 1e-12 * scale, "the library's MLP differs from M's at first tokens and the transcoder elsewhere by {difference} (scale {scale})");
+        // The select node survives the artifact's code.
+        let decoded = crate::artifact::Artifact::from_bytes(&explanation.artifact.to_bytes().unwrap(), &explanation.artifact.program.declarations).unwrap();
+        assert!(decoded.program.nodes == explanation.artifact.program.nodes && decoded.program.rules.iter().zip(&explanation.artifact.program.rules).all(|(a, b)| a.nodes == b.nodes));
+        // The device's forward and reverse through the select against the host's, on the flat
+        // program: the block's output, and the cotangent at its input of a cotangent seeded there.
+        let (flat, roots) = crate::artifact_device::mapped_inlined(&explanation.artifact.program).unwrap();
+        let (input_node, output_node) = (roots[place(layers[1].normed)], roots[place(layers[1].mlp)]);
+        let host_trace = flat.execute(&family, false).unwrap();
+        let mut rng = StdRng::seed_from_u64(9);
+        let seed = ndarray::Array2::from_shape_fn(host_trace.values[output_node].dim(), |_| rng.random::<f64>() - 0.5);
+        let host_cotangent = crate::derivatives::vjp_seeded(&flat, &family, &host_trace, BTreeMap::from([(output_node, seed.clone())]), None).unwrap()[input_node].clone().unwrap();
+        for device in crate::device_program_tests::devices() {
+            let tolerance = if device.float64() { 1e-12 } else { 1e-4 };
+            let mut program = DeviceProgram::compile(&device, &flat).unwrap();
+            program.set_arithmetic(if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 });
+            let trace = program.forward(&family).unwrap();
+            let forward = device.download(trace.value(output_node).unwrap()).unwrap();
+            let difference = forward.iter().zip(&host_trace.values[output_node]).fold(0.0_f64, |a, (p, q)| a.max((p - q).abs()));
+            assert!(difference <= tolerance * scale, "{}: the device's block output differs by {difference}", device.name());
+            let zero = device.zeros(family.rows, program.widths()[program.hidden()]).unwrap();
+            let extra = BTreeMap::from([(output_node, device.upload(seed.view()).unwrap())]);
+            let cotangents = program.vjp_seeded(&trace, zero, extra, &[input_node], if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 }).unwrap();
+            let device_cotangent = device.download(&cotangents[&input_node]).unwrap();
+            let size = host_cotangent.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+            let difference = device_cotangent.iter().zip(&host_cotangent).fold(0.0_f64, |a, (p, q)| a.max((p - q).abs()));
+            assert!(difference <= tolerance * size, "{}: the device's cotangent through the select differs by {difference} (size {size})", device.name());
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

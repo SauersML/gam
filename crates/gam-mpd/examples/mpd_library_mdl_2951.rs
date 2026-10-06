@@ -25,8 +25,9 @@
 //! changes, F against N for one block before a whole-model run.
 //!
 //! With `transcoders` (`{"dir": D, "layers": [l, ...]}`, `D/layer_{l}.safetensors` circuit-tracer
-//! transcoder files), those layers' MLPs are the transcoders' features (`library_transcoder`): the
-//! features that fire on the training sequences at `M`'s MLP inputs are written to
+//! transcoder files), those layers' MLPs are the transcoders' features (`library_transcoder`, with
+//! `M`'s own MLP at each sequence's first token): the features that fire on the training
+//! sequences' later tokens at `M`'s MLP inputs are written to
 //! `OUT/transcoder_l{l}.safetensors` (kept from an earlier run of the same command), with their
 //! counts in `OUT/TRANSCODERS.json`; every other layer keeps `M`'s own MLP functions.
 use gam_gpu::{GpuPolicy, tensor::Device};
@@ -92,7 +93,8 @@ fn transcoder_files(device: &Device, native: &OperatorProgram, layers: &[LayerNo
         .map(|&l| Ok((l, library_transcoder::Transcoder::open(&settings.dir.join(format!("layer_{l}.safetensors")))?)))
         .collect::<Result<BTreeMap<_, _>, String>>()?;
     let counts = library_transcoder::firing(device, native, layers, &transcoders, train, batch)?;
-    let tokens: usize = train.iter().map(Vec::len).sum();
+    // Tokens after each sequence's first, where the transcoders run (the first runs M's MLP).
+    let tokens: usize = train.iter().map(|s| s.len() - 1).sum();
     let mut record = Vec::new();
     for (l, transcoder) in &transcoders {
         let kept: Vec<usize> = (0..transcoder.features).filter(|&f| counts[l][f] > 0).collect();
@@ -105,7 +107,7 @@ fn transcoder_files(device: &Device, native: &OperatorProgram, layers: &[LayerNo
             "active_per_token": fired as f64 / tokens as f64,
             "tokens": tokens,
         }));
-        log::info!("transcoder layer {l}: {} of {} features fire on {tokens} training tokens, {:.2} per token", kept.len(), transcoder.features, fired as f64 / tokens as f64);
+        log::info!("transcoder layer {l}: {} of {} features fire on {tokens} training tokens after the first, {:.2} per token", kept.len(), transcoder.features, fired as f64 / tokens as f64);
     }
     save(&out.join("TRANSCODERS.json"), &json!({"layers": record, "seconds": started.elapsed().as_secs_f64()}))?;
     Ok(files)

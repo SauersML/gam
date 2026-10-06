@@ -343,7 +343,8 @@ impl Structure {
                 | Node::Concat { .. }
                 | Node::Gain { .. }
                 | Node::Attend { .. }
-                | Node::RmsNorm { .. } => {}
+                | Node::RmsNorm { .. }
+                | Node::Select { .. } => {}
             }
         }
         if let Some(op) = trainable.iter().find(|op| !uses.contains_key(op)) {
@@ -495,6 +496,8 @@ impl Structure {
                 Node::Concat { parts } => parts.iter().flat_map(|p| zero[*p].iter().cloned()).collect(),
                 Node::Gain { input, .. } | Node::RmsNorm { input, .. } => zero[*input].clone(),
                 Node::Attend { value, .. } => zero[*value].clone(),
+                // Zero only where both inputs are; claimed for no column.
+                Node::Select { .. } => vec![Kill::none(); w],
                 Node::Param { .. } | Node::Call { .. } => return Err(error("a call in the flat program")),
             };
             if z.len() != w {
@@ -621,6 +624,12 @@ impl Structure {
                             unread[*p][i].meet(&u[offset + i], &Kill::none(), None);
                         }
                         offset += self.widths[*p];
+                    }
+                }
+                Node::Select { inside, outside, .. } => {
+                    for (i, ui) in u.iter().enumerate() {
+                        unread[*inside][i].meet(ui, &Kill::none(), None);
+                        unread[*outside][i].meet(ui, &Kill::none(), None);
                     }
                 }
                 Node::Gain { input, .. } => {

@@ -919,9 +919,20 @@ pub enum Node {
     /// `x A` for an operator `A` whose columns are this node's interface: an operator read in its
     /// transposed orientation (a tied unembedding), paid once.
     Transposed { input: usize, operator: usize },
+    /// Per row, `inside`'s row where the row's position in its sequence (the family's layout) is
+    /// one of `positions` (increasing), `outside`'s row elsewhere: an exact path at fixed positions,
+    /// such as the first token (an attention sink) run by `M`'s own block while a library's
+    /// functions run every other token. The two inputs share one interface.
+    Select { inside: usize, outside: usize, positions: Vec<u32> },
 }
 
-const NODE_KINDS: usize = 18;
+const NODE_KINDS: usize = 19;
+
+/// The rows of `inputs` whose position in their sequence is one of `positions` ([`Node::Select`]).
+pub(crate) fn selected_rows(inputs: &FamilyInputs, positions: &[u32]) -> Result<Vec<usize>, ProgramError> {
+    let layout = inputs.layout.as_ref().ok_or_else(|| ProgramError::Input("a select node needs a sequence layout".to_string()))?;
+    Ok(layout.position.iter().enumerate().filter(|(_, p)| positions.binary_search(p).is_ok()).map(|(row, _)| row).collect())
+}
 
 /// A rotary position embedding: plane `i` of a query or key at position `m` turned by
 /// `m base^{-2i/dims}`. `half_split` pairs coordinate `i` with `i + dims/2` (rotate-half); otherwise
@@ -1040,6 +1051,7 @@ impl Node {
             Self::Attend { .. } => 15,
             Self::RmsNorm { .. } => 16,
             Self::Transposed { .. } => 17,
+            Self::Select { .. } => 18,
         }
     }
 
@@ -1060,6 +1072,7 @@ impl Node {
                 std::iter::once(*weights).chain(payloads.iter().map(|(_, node)| *node)).collect()
             }
             Self::Pointwise { input, .. } | Self::Readout { input, .. } => vec![*input],
+            Self::Select { inside, outside, .. } => vec![*inside, *outside],
         }
     }
 
@@ -2023,6 +2036,21 @@ impl OperatorProgram {
                 Ok((out, radius))
             }
             Node::RmsNorm { input, epsilon } => Ok(rms_norm(value(*input), band(*input), *epsilon)),
+            Node::Select { inside, outside, positions } => {
+                let selected = selected_rows(inputs, positions)?;
+                let pick = |a: &Array2<f64>, b: &Array2<f64>| {
+                    let mut out = b.clone();
+                    for &row in &selected {
+                        out.row_mut(row).assign(&a.row(row));
+                    }
+                    out
+                };
+                let radius = match (band(*inside), band(*outside)) {
+                    (Some(a), Some(b)) => Some(pick(a, b)),
+                    _ => None,
+                };
+                Ok((pick(value(*inside), value(*outside)), radius))
+            }
             Node::Transposed { input, operator } => {
                 let a = self.operators[*operator].matrix_cow();
                 let x = value(*input);
@@ -2628,6 +2656,12 @@ fn interface_of(index: usize, node: &Node, out: &[Interface], scope: &Scope<'_>)
             }
             op.cols.clone()
         }
+        Node::Select { inside, outside, positions } => {
+            if out[*inside] != out[*outside] || positions.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(ProgramError::Interface(format!("select node {index}: its inputs' interfaces differ or its positions do not increase")));
+            }
+            out[*inside].clone()
+        }
         Node::Outer { left, right } => {
             let (l, r) = (&out[*left], &out[*right]);
             let groups = l
@@ -2697,6 +2731,10 @@ pub fn remap_node(node: &mut Node, nodes: &[usize], operators: &[usize], bases: 
         Node::Transposed { input, operator } => {
             *input = nodes[*input];
             *operator = operators[*operator];
+        }
+        Node::Select { inside, outside, .. } => {
+            *inside = nodes[*inside];
+            *outside = nodes[*outside];
         }
         Node::Attend { query, key, value, .. } => {
             *query = nodes[*query];
@@ -3223,6 +3261,15 @@ fn encode_node(out: &mut BitString, node: &Node, index: usize, code: &NodeCode<'
             encode_fixed_index(out, *input, refs)?;
             encode_fixed_index(out, *operator, ops)?;
         }
+        Node::Select { inside, outside, positions } => {
+            encode_fixed_index(out, *inside, refs)?;
+            encode_fixed_index(out, *outside, refs)?;
+            // The prefix integer code starts at 1: the count and each position are sent plus one.
+            encode_prefix_integer(out, positions.len() as u64 + 1)?;
+            for p in positions {
+                encode_prefix_integer(out, u64::from(*p) + 1)?;
+            }
+        }
     }
     Ok(())
 }
@@ -3326,7 +3373,13 @@ fn decode_node(reader: &mut BitReader<'_>, index: usize, code: &NodeCode<'_>, in
             let (_, reals) = read_lattice(reader, &[])?;
             Node::RmsNorm { input, epsilon: *reals.first().ok_or_else(|| ProgramError::Code("an rms norm without epsilon".to_string()))? }
         }
-        _ => Node::Transposed { input: decode_fixed_index(reader, refs)?, operator: decode_fixed_index(reader, ops)? },
+        17 => Node::Transposed { input: decode_fixed_index(reader, refs)?, operator: decode_fixed_index(reader, ops)? },
+        _ => {
+            let (inside, outside) = (decode_fixed_index(reader, refs)?, decode_fixed_index(reader, refs)?);
+            let count = decode_prefix_integer(reader)? - 1;
+            let positions = (0..count).map(|_| u32::try_from(decode_prefix_integer(reader)? - 1).map_err(|e| ProgramError::Code(e.to_string()))).collect::<Result<_, _>>()?;
+            Node::Select { inside, outside, positions }
+        }
     })
 }
 

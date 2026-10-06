@@ -162,6 +162,20 @@ pub fn jvp_seeded(
                 }
                 out
             }),
+            Node::Select { inside, outside, positions } => {
+                let selected = crate::operator_program::selected_rows(inputs, positions)?;
+                match (tangent_of(&dv, *inside), tangent_of(&dv, *outside)) {
+                    (None, None) => None,
+                    (di, dout) => {
+                        let mut out = dout.unwrap_or_else(zero);
+                        let di = di.unwrap_or_else(zero);
+                        for &row in &selected {
+                            out.row_mut(row).assign(&di.row(row));
+                        }
+                        Some(out)
+                    }
+                }
+            }
             Node::Hadamard { left, right } => {
                 let (dl, dr) = (tangent_of(&dv, *left), tangent_of(&dv, *right));
                 match (dl, dr) {
@@ -430,6 +444,16 @@ pub(crate) fn vjp_seeded(
             Node::Hadamard { left, right } => {
                 add(&mut g, *left, &cot * value(*right));
                 add(&mut g, *right, &cot * value(*left));
+            }
+            Node::Select { inside, outside, positions } => {
+                let selected = crate::operator_program::selected_rows(inputs, positions)?;
+                let (mut to_inside, mut to_outside) = (Array2::<f64>::zeros(cot.dim()), cot);
+                for &row in &selected {
+                    to_inside.row_mut(row).assign(&to_outside.row(row));
+                    to_outside.row_mut(row).fill(0.0);
+                }
+                add(&mut g, *inside, to_inside);
+                add(&mut g, *outside, to_outside);
             }
             Node::Readout { input, basis } => add(&mut g, *input, program.bases[*basis].read_transpose(&program.declarations, &cot)?),
             Node::Concat { parts } => {
