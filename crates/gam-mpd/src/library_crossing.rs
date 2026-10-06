@@ -245,6 +245,39 @@ pub fn read_through(explanation: &Explanation, call: &Call, writers: &[&Writer],
     Ok(out)
 }
 
+/// `explanation` with the heads of two writers of different layers made one head function
+/// (`library_sharing`): the later key-value group reads the earlier's query–key function
+/// (`share_query_key`, each query head in its order) and its value map moved by the transport
+/// between their output projections, scaled by the least-squares scale of the two value maps
+/// (`share_value`). With a body called through each of the two heads, the head and the functions
+/// it feeds are then one unit of computation at both sites.
+pub fn share_writers(explanation: &Explanation, first: &Writer, second: &Writer) -> Result<Explanation, String> {
+    use crate::library_sharing::{self, Member};
+    let (early, late) = if first.layer < second.layer { (first, second) } else if second.layer < first.layer { (second, first) } else { return Err("the two heads share a layer".into()) };
+    let groups = library_sharing::key_values(explanation)?;
+    let group_of = |w: &Writer| -> Result<((usize, usize), usize), String> {
+        groups
+            .iter()
+            .find_map(|(&(l, g), kv)| (l == w.layer).then(|| kv.heads.iter().any(|(h, _)| *h == w.head).then_some(((l, g), kv.heads.len()))).flatten())
+            .ok_or_else(|| format!("head {}.{} in no key-value group", w.layer, w.head))
+    };
+    let ((source, width), (target, other)) = (group_of(early)?, group_of(late)?);
+    if width != other {
+        return Err("key-value groups of different widths".into());
+    }
+    let members = [Member { layer: source.0, group: source.1, queries: (0..width).collect() }, Member { layer: target.0, group: target.1, queries: (0..width).collect() }];
+    let shared = library_sharing::share_query_key(explanation, &members)?;
+    let transport = library_sharing::transports(&shared, target, &[source])?.into_iter().next().ok_or("no transport")?;
+    let program = &shared.artifact.program;
+    let values = library_sharing::key_values(&shared)?;
+    let value = |key: (usize, usize)| -> Result<Array2<f64>, String> { Ok(program.operators[values.get(&key).ok_or("a key-value group")?.value].matrix()) };
+    let moved = transport.matrix.dot(&value(source)?);
+    let own = value(target)?;
+    let norm = moved.iter().map(|v| v * v).sum::<f64>();
+    let scale = if norm > 0.0 { own.iter().zip(&moved).map(|(a, b)| a * b).sum::<f64>() / norm } else { 1.0 };
+    library_sharing::share_value(&shared, target, source, scale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +351,32 @@ mod tests {
         program.operators[gate] = Arc::new(dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values, source.provenance.clone()).unwrap());
         let (a, b) = (outputs(&reference), outputs(&edited));
         assert!(a.iter().zip(&b).all(|(x, y)| (x - y).abs() <= 1e-9 * scale), "the edit is the native edit");
+    }
+
+    #[test]
+    fn two_copies_of_a_head_become_one_head_function() {
+        let (native, layers, family) = tiny("crossing_share");
+        let mut start = explanation(&native, &layers).unwrap();
+        // Layer 1's head 0 a copy of layer 0's: its query, key, value and output projection.
+        let program = &mut start.artifact.program;
+        let copy = |program: &mut OperatorProgram, from: &str, to: &str| {
+            let (f, t) = (operator_index(program, from).unwrap(), operator_index(program, to).unwrap());
+            let source = Arc::clone(&program.operators[t]);
+            program.operators[t] = Arc::new(dense(source.name.clone(), source.rows.clone(), source.cols.clone(), program.operators[f].matrix(), source.provenance.clone()).unwrap());
+        };
+        for part in ["q", "k", "v"] {
+            let name = |l: usize| if part == "q" { format!("library.l{l}.h0.q") } else { format!("library.l{l}.kv0.{part}") };
+            copy(program, &name(0), &name(1));
+        }
+        copy(program, "blocks.0.o0", "blocks.1.o0");
+        let all = writers(&native, &layers, 1).unwrap();
+        let (first, second) = (all.iter().find(|w| (w.layer, w.head) == (0, 0)).unwrap(), all.iter().find(|w| (w.layer, w.head) == (1, 0)).unwrap());
+        let shared = share_writers(&start, first, second).unwrap();
+        let outputs = |e: &Explanation| e.artifact.execute(&family).unwrap().values[e.artifact.program.output].clone();
+        let (a, b) = (outputs(&start), outputs(&shared));
+        let scale = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(a.iter().zip(&b).all(|(x, y)| (x - y).abs() <= 1e-9 * scale), "one head function computes both copies");
+        assert!(shared.groups.len() < start.groups.len(), "the later head's maps leave the library");
+        Posterior::new(&shared, 72).unwrap();
     }
 }
