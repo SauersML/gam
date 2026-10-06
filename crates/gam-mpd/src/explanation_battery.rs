@@ -586,8 +586,9 @@ pub fn model(export_dir: &Path, factors: Option<&[Factors]>) -> Result<(Model, A
 
 /// `M` followed by VPD's causal-importance network `ci` of the sites `factors` (module note); its
 /// output nodes per site, in `M`'s order of the sites. The network's weights are released as their
-/// operators are made.
-fn importance_model(export_dir: &Path, factors: &[Factors], ci: CiNetwork) -> Result<(Model, Vec<usize>), String> {
+/// operators are made. VPD's network attends over every position (`causal` false); with `causal`
+/// no position reads a later one.
+fn importance_model(export_dir: &Path, factors: &[Factors], ci: CiNetwork, causal: bool) -> Result<(Model, Vec<usize>), String> {
     let export = Export::open(export_dir)?;
     let config = Config::of(&export)?;
     let (mut b, layout) = build(&export, &config, None)?;
@@ -633,7 +634,7 @@ fn importance_model(export_dir: &Path, factors: &[Factors], ci: CiNetwork) -> Re
                 Ok(b.node(Node::Affine { terms: vec![(h, op)], bias: None }))
             };
             let (q, k, v) = (map(&block.q, "q")?, map(&block.k, "k")?, map(&block.v, "v")?);
-            let read = b.node(Node::Attend { query: q, key: k, value: v, scale: Scale::InverseSqrt(head_dim as u32), rotary: Some(rotary), causal: false });
+            let read = b.node(Node::Attend { query: q, key: k, value: v, scale: Scale::InverseSqrt(head_dim as u32), rotary: Some(rotary), causal });
             let o = b.dense(&format!("ci.{i}.o{j}"), &stream, &head, block.o.slice(s![.., rows]).to_owned())?;
             terms.push((read, o));
         }
@@ -1039,7 +1040,7 @@ impl Vpd {
     pub fn new(device: &Device, export: &Path, decomposition: Decomposition, numeric_bytes: usize) -> Result<Self, String> {
         let Decomposition { sites: factors, ci } = decomposition;
         let (importance, outputs) = {
-            let (built, outputs) = importance_model(export, &factors, ci)?;
+            let (built, outputs) = importance_model(export, &factors, ci, false)?;
             (Side::compile(device, &built.program, numeric_bytes)?, outputs)
         };
         let (m, m_layout, unembedding) = {
@@ -2083,6 +2084,90 @@ fn read_pricing_posterior(path: &Path, shapes_of: &[Array2<f64>]) -> Result<Vec<
     let mut values = bytes.chunks_exact(4).map(|c| f64::from(f32::from_le_bytes(c.try_into().expect("four bytes"))));
     let mut next = |dim: (usize, usize)| Array2::from_shape_fn(dim, |_| values.next().expect("sized above"));
     Ok(shapes_of.iter().map(|m| (next(m.dim()), next(m.dim()))).collect())
+}
+
+/// Where VPD's masks come from, measured (the fair baseline): held-out `KL(M ‖ VPD)` in bits per
+/// token at VPD's own weights (the remainder dropped) and the subcomponents active (mask above
+/// zero) per token per layer, with the masks of its causal-importance network computed from
+/// `M`'s clean activations (`m_clean`, VPD's setting); from them with the network's attention
+/// causal (`causal`), so no position's mask reads a later position; with every mask 1
+/// (`all_on`); and from VPD's own activations by `k` rounds of `masks ← CI(the sites' inputs of
+/// VPD run with masks)` from every mask 1 (`own_k`), which reads nothing of `M`. The network
+/// reads every site's input at once (one input projection over all the sites) and attends over
+/// every position, so VPD on its own activations has no single pass: a layer's masks read later
+/// layers' inputs, and position `t`'s read position `t + 1`'s, whose first sites' input is the
+/// next token's embedding.
+pub fn vpd_mask_sources(vpd: &Vpd, export: &Path, decomposition: &Path, held_out: &[Vec<u32>], batch: usize, rounds: usize, numeric_bytes: usize) -> Result<Value, String> {
+    let d = vpd.e.program.device().clone();
+    let layers = vpd.layers();
+    let (causal, causal_outputs) = {
+        let Decomposition { sites, ci } = Decomposition::load(decomposition)?;
+        let (built, outputs) = importance_model(export, &sites, ci, true)?;
+        (Side::compile(&d, &built.program, numeric_bytes)?, outputs)
+    };
+    let arithmetic = vpd.e.program.arithmetic();
+    let names: Vec<String> = ["m_clean", "causal", "all_on"].iter().map(|s| s.to_string()).chain((1..=rounds).map(|k| format!("own_{k}"))).collect();
+    let mut kl = vec![0.0; names.len()];
+    let mut active = vec![vec![0.0; layers]; names.len()];
+    let mut tokens = 0usize;
+    let masks_of = |trace: &DeviceTrace, outputs: &[usize]| -> Result<Vec<Tensor>, String> { outputs.iter().map(|n| Ok(d.copy(trace.value(*n)?).map_err(error)?)).collect() };
+    for chunk in held_out.chunks(batch) {
+        let views: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
+        let family = sequence_family(&views)?;
+        let length = views[0].len();
+        tokens += family.rows;
+        let (_, m_streams) = streams(&vpd.m, &family, |_| BTreeMap::new())?;
+        let m_hidden = vpd.m.hidden_of(&family, &m_streams[layers])?;
+        // VPD run with `masks` (δ = 0), scored as setting `k`: its trace.
+        let mut score = |k: usize, masks: &[Tensor]| -> Result<DeviceTrace, String> {
+            let mut given = BTreeMap::new();
+            for (s, &(_, _, width)) in vpd.sites.iter().enumerate() {
+                given.insert(vpd.layout.masks[s], d.copy(&masks[s]).map_err(error)?);
+                given.insert(vpd.layout.deltas[s], d.zeros(family.rows, width).map_err(error)?);
+            }
+            let trace = vpd.e.program.forward_given(&family, given)?;
+            let (nats, _) = divergence_and_seed(&d, &m_hidden, trace.value(vpd.e.hidden)?, &vpd.e.head, length, false, arithmetic)?;
+            kl[k] += nats;
+            let g: Vec<Array2<f64>> = masks.iter().map(|m| d.download(m).map_err(error)).collect::<Result<_, _>>()?;
+            let (_, per_layer) = active_counts(&g, &vpd.sites, layers);
+            for (acc, counts) in active[k].iter_mut().zip(per_layer) {
+                *acc += counts.iter().sum::<f64>();
+            }
+            Ok(trace)
+        };
+        score(0, &masks_of(&vpd.importance.forward(&family)?, &vpd.outputs)?)?;
+        score(1, &masks_of(&causal.forward(&family)?, &causal_outputs)?)?;
+        let ones: Vec<Tensor> = vpd.sites.iter().map(|&(_, c, _)| d.upload(Array2::<f64>::ones((family.rows, c)).view()).map_err(error)).collect::<Result<_, _>>()?;
+        let mut trace = score(2, &ones)?;
+        for k in 0..rounds {
+            // The network on VPD's own inputs to the sites: `M`'s inputs replaced by them.
+            let inputs: BTreeMap<usize, Tensor> =
+                vpd.layout.inputs.iter().zip(&vpd.m_layout.inputs).map(|(own, m)| Ok((*m, d.copy(trace.value(*own)?).map_err(error)?))).collect::<Result<_, String>>()?;
+            let ci = vpd.importance.forward_edited(&family, BTreeMap::new(), &std::collections::BTreeSet::new(), |_, _| Ok(()), |node, _| {
+                inputs.get(&node).map(|v| d.copy(v).map_err(error)).transpose()
+            })?;
+            let masks = masks_of(&ci, &vpd.outputs)?;
+            drop(ci);
+            trace = score(3 + k, &masks)?;
+        }
+    }
+    let rows = tokens as f64;
+    Ok(Value::Object(
+        names
+            .iter()
+            .enumerate()
+            .map(|(k, name)| {
+                (
+                    name.clone(),
+                    json!({
+                        "kl_bits_per_token": kl[k] / rows / LN_2,
+                        "active_per_token": active[k].iter().sum::<f64>() / rows,
+                        "active_per_token_per_layer": active[k].iter().map(|a| a / rows).collect::<Vec<f64>>(),
+                    }),
+                )
+            })
+            .collect(),
+    ))
 }
 
 fn d_copy(d: &Device, t: &Tensor) -> Result<Tensor, String> {

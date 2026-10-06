@@ -4,6 +4,11 @@
 //! EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT]
 //! EXPORT SETTINGS.json OUT.json host|gpu vpd DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu price DECOMPOSITION [START]
+//! EXPORT SETTINGS.json OUT.json host|gpu masks DECOMPOSITION
+//!
+//! `masks` measures where VPD's masks come from (`explanation_battery::vpd_mask_sources`): held-out
+//! KL with masks from `M`'s activations, from them through a causal network, with every mask 1,
+//! and from VPD's own activations by three fixed-point rounds.
 //!
 //! `price` prices VPD's decomposition in the library's code length
 //! (`explanation_battery::vpd_pricing`) on the settings' `training_sequences` and writes the
@@ -195,7 +200,7 @@ fn circuits(device: &Device, export: &Path, layers: &[gam_mpd::run_check::LayerN
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price DECOMPOSITION [START]";
+    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price DECOMPOSITION [START] | masks DECOMPOSITION";
     let (export, settings_path, out, mode, kind, extra, more) = match &args[..] {
         [e, s, o, m, k] => (e, s, o, m, k.as_str(), None, None),
         [e, s, o, m, k, a] => (e, s, o, m, k.as_str(), Some(Path::new(a)), None),
@@ -261,6 +266,15 @@ fn main() -> Result<(), String> {
             save(&report)?;
             report["interchange"] = battery::vpd_interchange(&vpd, bases, sources, settings.batch_sequences, settings.seed, &settings.worst_of)?;
         }
+        report["seconds"] = json!(started.elapsed().as_secs_f64());
+        save(&report)?;
+        log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
+        return Ok(());
+    }
+    if kind == "masks" {
+        let decomposition = extra.ok_or(usage)?;
+        let vpd = Vpd::new(&device, export, Decomposition::load(decomposition)?, settings.numeric_bytes)?;
+        report["mask_sources"] = battery::vpd_mask_sources(&vpd, export, decomposition, bases, settings.batch_sequences, 3, settings.numeric_bytes)?;
         report["seconds"] = json!(started.elapsed().as_secs_f64());
         save(&report)?;
         log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
