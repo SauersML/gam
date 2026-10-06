@@ -15,12 +15,17 @@ negative and the tokens it then raises (w < 0) and lowers (w > 0). Tokens are th
 holds; the listed ones are ranked by unigram frequency p_t times effect: p_t a_t for reading, and
 p_X (w_X - E_p[w]), the first-order change of X's probability under p, for writing.
 
+Values. For the oracle's effect questions (the lens value of the asked tokens), the file also holds
+{site}.write (r per subcomponent), {site}.write_centre and {site}.write_scale (the mean and standard
+deviation of w over the data's tokens) and unembed (g_f * e_X for every token), in float16 and float32.
+
 Baseline. A removal question at a marked token t asks about the change of a next token X: the lens
 predicts the logit change -a_t w_X (alpha 0) or +0.5 a_t w_X (alpha 1.5), with w centred over the tokens;
 q(up) = sigmoid(beta s), s that change over its scale (|a| over the read lens's spread, w over the write
 lens's), one beta fitted by maximum likelihood on the trained layers' questions and scored on the held-out
 layer, beside the no-input reader's log score on the same questions (and their product of experts).
 
+  vpd_lens.py values --lens LENS --uv UV --data PILE.npy      add the values to an existing lens file
   vpd_lens.py build --uv UV | --functions LIBRARY/functions.safetensors --data PILE.npy --out LENS.safetensors [--k 8]
   vpd_lens.py baseline --labels HELDOUT --relations HELDOUT_REL --uv UV --data PILE.npy --nothing RUN --out OUT.json
 """
@@ -108,6 +113,23 @@ class Lens:
 
 
 @torch.no_grad()
+def values(lens: Lens, out: dict) -> None:
+    """The write lens's values (see the module's Values): r, the mean and spread of w over the data's
+    tokens, and the unembedding through the final norm's gain."""
+    vocab = torch.nonzero(lens.seen).reshape(-1)
+    out["unembed"] = lens.Ef.half()
+    for layer in range(lens.t.n_layer):
+        for kind in KINDS:
+            r = lens.write_dirs(layer, kind)
+            if r is None:
+                continue
+            w = r @ lens.Ef[vocab].T
+            out[f"{site(layer, kind)}.write"] = r.half()
+            out[f"{site(layer, kind)}.write_centre"] = w.mean(1)
+            out[f"{site(layer, kind)}.write_scale"] = w.std(1)
+
+
+@torch.no_grad()
 def build(args):
     lens = Lens(Path(args.uv), Path(args.data))
     vocab = torch.nonzero(lens.seen).reshape(-1)
@@ -136,7 +158,15 @@ def build(args):
             for name, val in (("pos_read", pos_read), ("neg_read", neg_read), ("up", up), ("down", down)):
                 out[f"{n}.{name}"] = val
             print(json.dumps({"site": n, "subcomponents": C}), flush=True)
+    values(lens, out)
     save_file(out, args.out)
+
+
+@torch.no_grad()
+def add_values(args):
+    out = dict(load_file(args.lens))
+    values(Lens(Path(args.uv), Path(args.data)), out)
+    save_file(out, args.lens)
 
 
 @torch.no_grad()
@@ -320,12 +350,15 @@ def main():
     for a in ("--labels", "--relations", "--uv", "--data", "--nothing", "--out"):
         s.add_argument(a, required=True)
     s.add_argument("--examples", type=int, default=3000)
+    v = sub.add_parser("values")
+    for a in ("--lens", "--uv", "--data"):
+        v.add_argument(a, required=True)
     args = ap.parse_args()
     torch.set_grad_enabled(False)
     if args.command == "build" and args.functions:
         build_library(args)
     else:
-        {"build": build, "baseline": baseline}[args.command](args)
+        {"build": build, "baseline": baseline, "values": add_values}[args.command](args)
 
 
 if __name__ == "__main__":

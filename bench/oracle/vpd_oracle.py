@@ -223,6 +223,15 @@ class Table:
     def piece(self, token: int) -> str:
         return json.dumps(self.tok.decode([int(token)]))
 
+    def lens_value(self, layer: int, kind: str, c: int, token: int) -> float | None:
+        """vpd_lens.py's write lens of one token: (w_X - mean over tokens) / std over tokens, w_X =
+        r . (g_f * e_X) (positive activity raises tokens with positive values); None without a write."""
+        n = site_name(layer, kind)
+        if self.lens is None or f"{n}.write" not in self.lens:
+            return None
+        w = float(self.lens[f"{n}.write"][c].float() @ self.lens["unembed"][int(token)].float())
+        return (w - float(self.lens[f"{n}.write_centre"][c])) / float(self.lens[f"{n}.write_scale"][c])
+
 
 def effect_index(table: Table, keys: list) -> list[np.ndarray]:
     """Per effect stratum, the (site, subcomponent, context) triples whose removal KL falls in it."""
@@ -236,10 +245,17 @@ def effect_index(table: Table, keys: list) -> list[np.ndarray]:
     return [np.concatenate(p) for p in per]
 
 
-def examples(table: Table, layers: set[int], count: int, seed: int, stratified: bool = True, per_component: int = 1) -> list[dict]:
-    """`count` questions, the kinds in turn (those the table's relations support). With per_component K
-    > 1, each subcomponent an effect question draws is asked about at K of its strongest contexts (the
-    drawn one and K - 1 others, in the following questions of that kind)."""
+def examples(table: Table, layers: set[int], count: int, seed: int, stratified: bool = True, per_component: int = 1,
+             only: tuple[str, ...] = (), rule: bool = False) -> list[dict]:
+    """`count` questions, the kinds in turn (those the table's relations support, or `only` those). With
+    per_component K > 1, each subcomponent an effect question draws is asked about at K of its strongest
+    contexts (the drawn one and K - 1 others, in the following questions of that kind).
+
+    rule (a sanity check of the reader, not a measurement): direction questions about a token from the
+    subcomponent's lens text (its 8 raised or 8 lowered tokens), answered by the rule the text states:
+    the probability goes up iff (edit sign) * (stated activity sign) * (+1 raised, -1 lowered) > 0, the
+    edit sign -1 for removal and +1 for 1.5 times stronger. A reader that cannot learn this from those
+    inputs has a bug."""
     rng = random.Random(seed)
     pending: dict[str, list] = {"direction": [], "top": []}
     keys = [k for k in table.sites if k[0] in layers]
@@ -252,6 +268,12 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
     if "attribution" in table.rel:
         kinds.append("attribution")
         att = table.rel["attribution"]
+    if only:
+        assert set(only) <= set(kinds), (only, kinds)
+        kinds = [k for k in kinds if k in only]
+    if rule:
+        assert kinds == ["direction"] and table.lens is not None, "the rule check asks direction questions with a lens"
+        keys = [k for k in keys if int(table.lens[f"{site_name(*k)}.up"][0, 0]) >= 0]  # sites with a write lens
     index = effect_index(table, keys) if stratified else None
     out = []
     while len(out) < count:
@@ -289,9 +311,17 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             p = int(d["position"][c, j])
             edit, side, r = rng.choice(["ablate", "amplify"]), rng.choice(["up", "down"]), rng.randrange(10)
             verb = "removed" if edit == "ablate" else "made 1.5 times stronger"
+            token, answer = int(d[f"{side}_ids_{edit}"][c, j, r]), 0 if float(d[f"{side}_dp_{edit}"][c, j, r]) > 0 else 1
+            if rule:
+                a_sign = int(math.copysign(1, a_here)) if level(a_here, peak) > 0 else 0
+                if a_sign == 0:
+                    continue
+                listed = table.lens[f"{site_name(layer, kind)}.{side}"][c]
+                token = int(listed[rng.randrange(int((listed >= 0).sum()))])
+                answer = 0 if (-1 if edit == "ablate" else 1) * a_sign * (1 if side == "up" else -1) > 0 else 1
             ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=["up", "down"],
-                      answer=0 if float(d[f"{side}_dp_{edit}"][c, j, r]) > 0 else 1, edit=edit, option_ids=[int(d[f"{side}_ids_{edit}"][c, j, r])],
-                      question=here + f"If the component is {verb}, does the probability that the next token after the marked token is {table.piece(d[f'{side}_ids_{edit}'][c, j, r])} go up or go down?")
+                      answer=answer, edit=edit, option_ids=[token],
+                      question=here + f"If the component is {verb}, does the probability that the next token after the marked token is {table.piece(token)} go up or go down?")
         elif q == "top":
             p = int(d["position"][c, j])
             truth = int(d["up_ids_ablate"][c, j, 0])
@@ -424,6 +454,10 @@ def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
         info += "\nIts weights read through the token embeddings and the unembedding (no measurement):\n"
         if ex["c"] >= 0:
             info += lens_text(table, ex["layer"], ex["kind"], ex["c"])
+            values = [table.lens_value(ex["layer"], ex["kind"], ex["c"], t) for t in ex.get("option_ids", [])] if ex["kind_q"] in ("direction", "top") else []
+            if values and values[0] is not None:
+                info += "\nIts write's lens value (standard deviations over tokens; positive activity raises tokens with positive values) for " + ", ".join(
+                    f"{table.piece(t)}: {v:+.1f}" for t, v in zip(ex["option_ids"], values)) + "."
         else:
             info += "\n".join(lens_text(table, l, k, c, f"C{i + 1}", reads=False) for i, (l, k, c, _, _) in enumerate(ex["candidates"]))
     text = table.text(ex["context"], ex["position"], ex["position"])
@@ -541,7 +575,7 @@ def train(args):
     torch.manual_seed(args.seed)
     held = {int(x) for x in args.heldout_layers.split(",") if x}
     table = table_of(args)
-    data = examples(table, {0, 1, 2, 3} - held, args.examples, args.seed, per_component=args.per_component)
+    data = examples(table, {0, 1, 2, 3} - held, args.examples, args.seed, per_component=args.per_component, only=tuple(args.questions.split(",")) if args.questions else (), rule=args.rule)
     oracle = Oracle(args.base, args.lora_rank, args.inject, dev)
     if args.init:  # warm start: an earlier run's adapter and maps (same base model); new kinds' maps start fresh
         oracle.load(Path(args.init))
@@ -582,20 +616,24 @@ def evaluate(args):
     rows = []
     for split, layers in (("heldout_layers", held), ("trained_layers", {0, 1, 2, 3} - held)):
         for distribution in ("natural", "stratified"):
-            data = examples(table, layers, args.examples, args.seed + 1, stratified=distribution == "stratified")
+            data = examples(table, layers, args.examples, args.seed + 1, stratified=distribution == "stratified",
+                            only=tuple(config["questions"].split(",")) if config.get("questions") else (), rule=config.get("rule", False))
             for s in range(0, len(data), config["batch"]):
                 batch = data[s : s + config["batch"]]
                 lq, valid = oracle.log_q(table, batch, config["condition"])
                 oracle.hook.set(None)
-                for ex, score in zip(batch, log_scores(lq, valid, batch).tolist()):
+                best = lq.argmax(-1).tolist()
+                for ex, score, guess in zip(batch, log_scores(lq, valid, batch).tolist(), best):
                     rows.append({"split": split, "distribution": distribution, "question": ex["kind_q"], "stratum": ex["stratum"], "layer": ex["layer"], "kind": ex["kind"],
-                                 "c": ex["c"], "context": ex["context"], "log_score": score, "options": len(ex["options"])})
+                                 "c": ex["c"], "context": ex["context"], "log_score": score, "options": len(ex["options"]), "correct": int(guess == ex["answer"])})
     (Path(args.run) / f"eval_{Path(args.labels).name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     summary = {}
     for split in ("heldout_layers", "trained_layers"):
         for q in QUESTIONS:
-            v = [r["log_score"] for r in rows if r["split"] == split and r["question"] == q and r["distribution"] == "natural"]
-            summary[f"{split}/{q}"] = float(np.mean(v)) if v else None
+            v = [r for r in rows if r["split"] == split and r["question"] == q and r["distribution"] == "natural"]
+            if v:
+                summary[f"{split}/{q}"] = float(np.mean([r["log_score"] for r in v]))
+                summary[f"{split}/{q}/accuracy"] = float(np.mean([r["correct"] for r in v]))
     print(json.dumps({"condition": config["condition"], **summary}))
 
 
@@ -622,6 +660,9 @@ def compare(args):
                     suffix = "" if distribution == "natural" else "/stratified" + ("" if k is None else (f"/kl{STRATA[k]:g}-{STRATA[k + 1]:g}" if q != "edge" else ("/strong" if k == 1 else "/near_zero")))
                     table[f"{condition}/{split}/{q}{suffix}"] = {"examples": len(d), "log_score_nats": float(np.mean([a for a, _ in pairs])),
                                                                 "gain_over_nothing_nats": float(d.mean()), "standard_error_nats": float(d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else None}
+                    hits = [r["correct"] for r in rows if "correct" in r and r["split"] == split and r["question"] == q and r["distribution"] == distribution and (k is None or r["stratum"] == k)]
+                    if hits:
+                        table[f"{condition}/{split}/{q}{suffix}"]["accuracy"] = float(np.mean(hits))
     Path(args.out).write_text(json.dumps(table, indent=1))
     print(json.dumps(table, indent=1))
 
@@ -646,6 +687,8 @@ def main():
     t.add_argument("--examples", type=int, default=65536)
     t.add_argument("--init", help="an earlier run to start from (its adapter and maps)")
     t.add_argument("--per-component", type=int, default=1, help="effect questions per drawn subcomponent, at its strongest contexts")
+    t.add_argument("--questions", default="", help="only these question kinds, comma-separated (default: all the relations support)")
+    t.add_argument("--rule", action="store_true", help="the reader sanity check: direction questions answered by the lens rule (see examples)")
     t.add_argument("--batch", type=int, default=16)
     t.add_argument("--lr", type=float, default=1e-4)
     t.add_argument("--lora-rank", type=int, default=64)
