@@ -1101,8 +1101,7 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
         for lane in plan.lanes.iter().filter(|l| l.start == b) {
             if let Some(parent) = lane.parent {
                 let rows = plan.lanes[parent].rows.clone();
-                let copied = d.rows_of(&stream, rows.start, rows.len()).map_err(error)?;
-                d.set_rows(&mut stream, lane.rows.start, &copied).map_err(error)?;
+                d.copy_rows_within(&mut stream, lane.rows.start, rows.start, rows.len()).map_err(error)?;
             }
         }
         for side in 0..2 {
@@ -1205,9 +1204,10 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
                 for lane in plan.lanes.iter().rev().filter(|l| l.start == b) {
                     if let Some(parent) = lane.parent {
                         let rows = plan.lanes[parent].rows.clone();
-                        let mut total = d.rows_of(&pass.cotangent, rows.start, rows.len()).map_err(error)?;
-                        d.axpy(&mut total, 1.0, &d.rows_of(&pass.cotangent, lane.rows.start, lane.rows.len()).map_err(error)?).map_err(error)?;
-                        d.set_rows(&mut pass.cotangent, rows.start, &total).map_err(error)?;
+                        if lane.rows.len() != rows.len() {
+                            return Err(error("a lane returns rows to a parent of another length"));
+                        }
+                        d.axpy_rows_within(&mut pass.cotangent, rows.start, 1.0, lane.rows.start, rows.len()).map_err(error)?;
                     }
                 }
             }
@@ -1588,9 +1588,7 @@ fn spread(d: &Device, buffer: usize, rows: &[Range<usize>], seed: &Tensor, weigh
     let mut cotangent = d.zeros(buffer, seed.cols()).map_err(error)?;
     let mut at = 0;
     for r in rows {
-        let mut total = d.rows_of(&cotangent, r.start, r.len()).map_err(error)?;
-        d.axpy(&mut total, weight, &d.rows_of(seed, at, r.len()).map_err(error)?).map_err(error)?;
-        d.set_rows(&mut cotangent, r.start, &total).map_err(error)?;
+        d.axpy_rows(&mut cotangent, r.start, weight, (seed, at), r.len()).map_err(error)?;
         at += r.len();
     }
     Ok(cotangent)

@@ -148,6 +148,46 @@ fn sampled_head_lookup_matches_full_pullback_in_both_orientations() {
 /// row's is zero); and over rows of one hidden vector against classes spanning several of CUDA's
 /// swept chunks (the last narrower than a block), the draws of each of a few sets of classes fall
 /// within five binomial standard errors of the set's softmax probability.
+/// `axpy_rows`, `axpy_rows_within` and `copy_rows_within` against the copies, axpys and writes they
+/// replace, bit for bit.
+fn row_moves_match_their_compositions(d: &Device) {
+    let (a, b) = (up(d, &matrix(9, 13, 21, 2.0)), up(d, &matrix(7, 13, 22, 1.5)));
+    let mut y = d.copy(&a).unwrap();
+    d.axpy_rows(&mut y, 2, -0.375, (&b, 3), 4).unwrap();
+    let mut expected = d.copy(&a).unwrap();
+    let mut total = d.rows_of(&a, 2, 4).unwrap();
+    d.axpy(&mut total, -0.375, &d.rows_of(&b, 3, 4).unwrap()).unwrap();
+    d.set_rows(&mut expected, 2, &total).unwrap();
+    assert_eq!(d.download(&y).unwrap(), d.download(&expected).unwrap(), "{} axpy_rows", d.name());
+    let mut t = d.copy(&a).unwrap();
+    d.axpy_rows_within(&mut t, 5, 1.0, 1, 3).unwrap();
+    let mut expected = d.copy(&a).unwrap();
+    let mut total = d.rows_of(&a, 5, 3).unwrap();
+    d.axpy(&mut total, 1.0, &d.rows_of(&a, 1, 3).unwrap()).unwrap();
+    d.set_rows(&mut expected, 5, &total).unwrap();
+    assert_eq!(d.download(&t).unwrap(), d.download(&expected).unwrap(), "{} axpy_rows_within", d.name());
+    let mut t = d.copy(&a).unwrap();
+    d.copy_rows_within(&mut t, 0, 6, 3).unwrap();
+    let mut expected = d.copy(&a).unwrap();
+    d.set_rows(&mut expected, 0, &d.rows_of(&a, 6, 3).unwrap()).unwrap();
+    assert_eq!(d.download(&t).unwrap(), d.download(&expected).unwrap(), "{} copy_rows_within", d.name());
+    assert!(d.copy_rows_within(&mut t, 2, 3, 2).is_err(), "overlapping rows are refused");
+}
+
+#[test]
+fn row_moves_are_the_copies_and_axpys_they_replace() {
+    row_moves_match_their_compositions(&Device::host());
+    if let Some(wide) = accelerator() {
+        row_moves_match_their_compositions(&wide.with_storage(gam_gpu::tensor::Storage::F32).expect("CUDA holds f32"));
+        row_moves_match_their_compositions(&wide);
+    }
+    if cfg!(target_os = "macos")
+        && let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault")
+    {
+        row_moves_match_their_compositions(&metal);
+    }
+}
+
 #[test]
 fn a_drawn_head_sweep_draws_each_class_with_its_softmax_probability() {
     let (rows, classes, width) = (6000, 3940, 8);

@@ -562,6 +562,14 @@ fn float64_only(what: &str, tensors: &[&Tensor]) -> Result<(), GpuError> {
     Ok(())
 }
 
+/// Rows `at..at + rows` and `from..from + rows` lie in `t` and apart.
+fn apart(t: &Tensor, at: usize, from: usize, rows: usize) -> Result<(), GpuError> {
+    if at + rows > t.rows || from + rows > t.rows || (at < from + rows && from < at + rows) {
+        return Err(shape(format!("rows {from}..{} onto rows {at}..{} of {:?}", from + rows, at + rows, t.dim())));
+    }
+    Ok(())
+}
+
 fn same(a: &Tensor, b: &Tensor, what: &str) -> Result<(), GpuError> {
     if a.dim() != b.dim() {
         return Err(shape(format!("{what}: {:?} against {:?}", a.dim(), b.dim())));
@@ -2207,6 +2215,76 @@ impl Device {
         }
     }
 
+    /// Rows `at..at + rows` of `y` plus `alpha` times rows `from..from + rows` of `x`, in place: each
+    /// entry the one [`Device::axpy`] makes of the rows copied out ([`Device::rows_of`]) and written
+    /// back ([`Device::set_rows`]), in one pass.
+    pub fn axpy_rows(&self, y: &mut Tensor, at: usize, alpha: f64, (x, from): (&Tensor, usize), rows: usize) -> Result<(), GpuError> {
+        if x.cols != y.cols || at + rows > y.rows || from + rows > x.rows {
+            return Err(shape(format!("{rows} rows from row {from} of {:?} into row {at} of {:?}", x.dim(), y.dim())));
+        }
+        let (to, source, n) = (at * y.cols, from * x.cols, rows * y.cols);
+        match &*self.backend {
+            Backend::Host => {
+                for (yv, xv) in host_mut(y)?[to..to + n].iter_mut().zip(&host(x)?[source..source + n]) {
+                    *yv += alpha * xv;
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.axpy_rows(y, to, alpha, (x, source), n),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => {
+                let mut total = self.rows_of(y, at, rows)?;
+                self.axpy(&mut total, alpha, &self.rows_of(x, from, rows)?)?;
+                self.set_rows(y, at, &total)
+            }
+        }
+    }
+
+    /// [`Device::axpy_rows`] within one tensor: its rows `at..at + rows` plus `alpha` times its rows
+    /// `from..from + rows`, the two ranges apart.
+    pub fn axpy_rows_within(&self, t: &mut Tensor, at: usize, alpha: f64, from: usize, rows: usize) -> Result<(), GpuError> {
+        apart(t, at, from, rows)?;
+        let (to, source, n) = (at * t.cols, from * t.cols, rows * t.cols);
+        match &*self.backend {
+            Backend::Host => {
+                let values = host_mut(t)?;
+                for i in 0..n {
+                    values[to + i] += alpha * values[source + i];
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.rows_within(t, (to, source, n), Some(alpha)),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => {
+                let mut total = self.rows_of(t, at, rows)?;
+                self.axpy(&mut total, alpha, &self.rows_of(t, from, rows)?)?;
+                self.set_rows(t, at, &total)
+            }
+        }
+    }
+
+    /// Rows `from..from + rows` of `t` copied over its rows `to..to + rows`, the two ranges apart:
+    /// [`Device::rows_of`] and [`Device::set_rows`] in one pass.
+    pub fn copy_rows_within(&self, t: &mut Tensor, to: usize, from: usize, rows: usize) -> Result<(), GpuError> {
+        apart(t, to, from, rows)?;
+        let (at, source, n) = (to * t.cols, from * t.cols, rows * t.cols);
+        match &*self.backend {
+            Backend::Host => {
+                host_mut(t)?.copy_within(source..source + n, at);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.rows_within(t, (at, source, n), None),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => {
+                let copied = self.rows_of(t, from, rows)?;
+                self.set_rows(t, to, &copied)
+            }
+        }
+    }
+
     /// Copy `part` into columns `start..` of every row of `t`, without arithmetic.
     /// This preserves literal bits and never executes a host fallback.
     pub fn set_columns(&self, t: &mut Tensor, start: usize, part: &Tensor) -> Result<(), GpuError> {
@@ -3201,6 +3279,18 @@ __device__ double block_max(double v, double* shared) {
 
 extern "C" __global__ void axpy(u64 n, double alpha, const double* x, double* y) {
     GRID_STRIDE(i, n) y[i] += alpha * x[i];
+}
+
+extern "C" __global__ void axpy_rows(u64 n, double alpha, const double* x, u64 from, double* y, u64 at) {
+    GRID_STRIDE(i, n) y[at + i] += alpha * x[from + i];
+}
+
+extern "C" __global__ void axpy_within(u64 n, double alpha, u64 from, u64 at, double* t) {
+    GRID_STRIDE(i, n) t[at + i] += alpha * t[from + i];
+}
+
+extern "C" __global__ void copy_within(u64 n, u64 from, u64 at, double* t) {
+    GRID_STRIDE(i, n) t[at + i] = t[from + i];
 }
 
 extern "C" __global__ void axpy_from(u64 n, double alpha, const double* y, const double* x, double* out) {
@@ -5377,6 +5467,44 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             unsafe { self.stream.launch_builder(&f).arg(&n).arg(&alpha).input(x, storage)?.output(y, storage)?.launch(cfg_elements(n)) }
                 .gpu_ctx("tensor axpy")
                 .map(|_| ())
+        }
+
+        /// [`super::Device::axpy_rows`]: `n` entries of `y` from entry `at`, plus `alpha` times
+        /// those of `x` from entry `from`.
+        pub(super) fn axpy_rows(&self, y: &mut Tensor, at: usize, alpha: f64, (x, from): (&Tensor, usize), n: usize) -> Result<(), GpuError> {
+            let storage = y.storage();
+            if storage == Storage::Bf16 {
+                return Err(shape("rows added in bfloat16 storage".to_string()));
+            }
+            let f = self.kernel("axpy_rows", storage)?;
+            let (n, from, at) = (n as u64, from as u64, at as u64);
+            // SAFETY: the ranges lie in their buffers (checked by the caller), in `storage` (`input`).
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&alpha).input(x, storage)?.arg(&from).output(y, storage)?.arg(&at).launch(cfg_elements(n)) }
+                .gpu_ctx("tensor axpy_rows")
+                .map(|_| ())
+        }
+
+        /// [`super::Device::axpy_rows_within`] (`alpha`) and [`super::Device::copy_rows_within`]
+        /// (none): `n` entries of `t` from entry `at`, from its `n` entries from entry `from`.
+        pub(super) fn rows_within(&self, t: &mut Tensor, (at, from, n): (usize, usize, usize), alpha: Option<f64>) -> Result<(), GpuError> {
+            let storage = t.storage();
+            if storage == Storage::Bf16 {
+                return Err(shape("rows moved in bfloat16 storage".to_string()));
+            }
+            let (n, from, at) = (n as u64, from as u64, at as u64);
+            let launched = match alpha {
+                Some(alpha) => {
+                    let f = self.kernel("axpy_within", storage)?;
+                    // SAFETY: both ranges lie in the buffer and apart (checked by the caller).
+                    unsafe { self.stream.launch_builder(&f).arg(&n).arg(&alpha).arg(&from).arg(&at).output(t, storage)?.launch(cfg_elements(n)) }
+                }
+                None => {
+                    let f = self.kernel("copy_within", storage)?;
+                    // SAFETY: as above.
+                    unsafe { self.stream.launch_builder(&f).arg(&n).arg(&from).arg(&at).output(t, storage)?.launch(cfg_elements(n)) }
+                }
+            };
+            launched.gpu_ctx("tensor rows_within").map(|_| ())
         }
 
         pub(super) fn axpy_from(&self, out: &mut Tensor, y: &Tensor, alpha: f64, x: &Tensor) -> Result<(), GpuError> {
