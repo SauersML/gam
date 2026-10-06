@@ -79,6 +79,27 @@ pub struct Ivon {
     pub beta2: f64,
 }
 
+/// IVON's state a device posterior starts from ([`DevicePosterior::new`]); none: the momentum and
+/// second moment zero and the curvature at which IVON's standard deviations are the posterior's.
+pub enum State<'a> {
+    /// Per operator the gradient's momentum, the curvature estimate and the gradient's second
+    /// moment (a checkpoint's).
+    Saved(&'a [[Array2<f64>; 3]]),
+    /// Per operator the curvature estimate, the momentum and the second moment zero (a Laplace
+    /// start): the zeros are made on the device, not sent from the host.
+    Curvature(&'a [Array2<f64>]),
+}
+
+impl State<'_> {
+    /// The operators it holds a state for.
+    fn len(&self) -> usize {
+        match self {
+            Self::Saved(moments) => moments.len(),
+            Self::Curvature(curvature) => curvature.len(),
+        }
+    }
+}
+
 /// A posterior's host arrays ([`DevicePosterior::from_parts`]).
 pub struct Parts<'a> {
     pub operators: &'a [usize],
@@ -185,7 +206,7 @@ impl DevicePosterior {
     /// gradient's momentum, the curvature estimate and the gradient's second moment; when `None`,
     /// the moments zero and the curvature at which the posterior's standard deviations are IVON's)
     /// after `steps` steps.
-    pub fn new(fitting: &Device, explanation: &Explanation, posterior: &Posterior, tokens: f64, moments: Option<&[[Array2<f64>; 3]]>, steps: u64) -> Result<Self, String> {
+    pub fn new(fitting: &Device, explanation: &Explanation, posterior: &Posterior, tokens: f64, moments: Option<State<'_>>, steps: u64) -> Result<Self, String> {
         let shapes: Vec<(usize, usize)> = posterior.mean.iter().map(Array2::dim).collect();
         if shapes.len() != explanation.trainable.len() {
             return Err(error("one posterior array per trainable operator required"));
@@ -198,7 +219,7 @@ impl DevicePosterior {
     /// The posterior of the trainable operators `parts.operators` of a program, each entry in group
     /// `parts.groups[i][entry]` (row-major) of `parts.count`, for `tokens` training tokens on
     /// `fitting`, with IVON's state `moments` (see [`DevicePosterior::new`]) after `steps` steps.
-    pub fn from_parts(fitting: &Device, parts: &Parts<'_>, tokens: f64, moments: Option<&[[Array2<f64>; 3]]>, steps: u64) -> Result<Self, String> {
+    pub fn from_parts(fitting: &Device, parts: &Parts<'_>, tokens: f64, moments: Option<State<'_>>, steps: u64) -> Result<Self, String> {
         let wide = match fitting.with_storage(Storage::F64) {
             Ok(wide) => wide,
             Err(GpuError::NoDeviceKernel { .. }) => fitting.clone(),
@@ -217,7 +238,7 @@ impl DevicePosterior {
         };
         let shapes: Vec<(usize, usize)> = parts.mean.iter().map(Array2::dim).collect();
         let sizes_agree = parts.log_sd.iter().map(Array2::dim).eq(shapes.iter().copied()) && parts.groups.iter().map(Vec::len).eq(shapes.iter().map(|(r, c)| r * c));
-        if shapes.len() != parts.operators.len() || !sizes_agree || moments.is_some_and(|m| m.len() != shapes.len()) || parts.rotations.len() != shapes.len() {
+        if shapes.len() != parts.operators.len() || !sizes_agree || moments.as_ref().is_some_and(|m| m.len() != shapes.len()) || parts.rotations.len() != shapes.len() {
             return Err(error("one posterior array, group list and rotation per trainable operator required"));
         }
         if parts.groups.iter().flatten().any(|g| *g as usize >= parts.count) {
@@ -229,38 +250,43 @@ impl DevicePosterior {
         // Without a state, the curvature `h = 1 / (N σ²) − δ` at which IVON's standard deviation
         // `1 / √(N (h + δ))` is the posterior's, `δ = 1 / (N v_G)` at each group's variance (zero
         // where the posterior is wider than the prior: `h` is nonnegative, `Device::posterior_ivon`).
-        let start = match moments {
-            Some(_) => None,
-            None => {
-                let mut sums = vec![(0.0, 0.0); parts.count];
-                for ((mean, log_sd), groups) in parts.mean.iter().zip(parts.log_sd).zip(parts.groups) {
-                    for ((mu, s), g) in mean.iter().zip(log_sd.iter()).zip(groups) {
-                        if *s != f64::NEG_INFINITY {
-                            sums[*g as usize].0 += 1.0;
-                            sums[*g as usize].1 += mu * mu + (2.0 * s).exp();
-                        }
+        // Each operator's state is made and sent one operator at a time, its zeros on the device.
+        let mut sums = vec![(0.0, 0.0); parts.count];
+        if moments.is_none() {
+            for ((mean, log_sd), groups) in parts.mean.iter().zip(parts.log_sd).zip(parts.groups) {
+                for ((mu, s), g) in mean.iter().zip(log_sd.iter()).zip(groups) {
+                    if *s != f64::NEG_INFINITY {
+                        sums[*g as usize].0 += 1.0;
+                        sums[*g as usize].1 += mu * mu + (2.0 * s).exp();
                     }
                 }
-                let curvature = |log_sd: &Array2<f64>, groups: &[u32]| -> Array2<f64> {
-                    let (rows, cols) = log_sd.dim();
-                    Array2::from_shape_fn((rows, cols), |(r, c)| {
-                        let (s, (n, second)) = (log_sd[[r, c]], sums[groups[r * cols + c] as usize]);
-                        if s == f64::NEG_INFINITY { 0.0 } else { (1.0 / (tokens * (2.0 * s).exp()) - n / (tokens * second)).max(0.0) }
-                    })
-                };
-                Some(parts.log_sd.iter().zip(parts.groups).map(|(log_sd, groups)| [Array2::zeros(log_sd.dim()), curvature(log_sd, groups), Array2::zeros(log_sd.dim())]).collect::<Vec<_>>())
             }
+        }
+        let start = |log_sd: &Array2<f64>, groups: &[u32]| -> Array2<f64> {
+            let (rows, cols) = log_sd.dim();
+            Array2::from_shape_fn((rows, cols), |(r, c)| {
+                let (s, (n, second)) = (log_sd[[r, c]], sums[groups[r * cols + c] as usize]);
+                if s == f64::NEG_INFINITY { 0.0 } else { (1.0 / (tokens * (2.0 * s).exp()) - n / (tokens * second)).max(0.0) }
+            })
         };
-        let moments = moments.or(start.as_deref());
         let up = |m: &Array2<f64>| master.upload(m.view()).map_err(error);
         let moment = |m: &Array2<f64>| narrow.upload(m.view()).map_err(error);
+        let state = |i: usize| -> Result<[Tensor; 3], String> {
+            let (rows, cols) = shapes[i];
+            let zero = |d: &Device| d.zeros(rows, cols).map_err(error);
+            Ok(match &moments {
+                Some(State::Saved(m)) => [moment(&m[i][0])?, up(&m[i][1])?, up(&m[i][2])?],
+                Some(State::Curvature(h)) => [zero(&narrow)?, up(&h[i])?, zero(&master)?],
+                None => [zero(&narrow)?, up(&start(&parts.log_sd[i], &parts.groups[i]))?, zero(&master)?],
+            })
+        };
         let mut out = Self {
             sums: wide.zeros(parts.count, 3).map_err(error)?,
             variance: wide.zeros(parts.count, 1).map_err(error)?,
             divergence: wide.zeros(parts.count, 1).map_err(error)?,
-            mean: parts.mean.iter().zip(parts.rotations).map(|(m, r)| up(&r.as_ref().map_or_else(|| m.clone(), |r| r.undo(m)))).collect::<Result<_, _>>()?,
+            mean: parts.mean.iter().zip(parts.rotations).map(|(m, r)| match r { Some(r) => up(&r.undo(m)), None => up(m) }).collect::<Result<_, _>>()?,
             log_sd: parts.log_sd.iter().map(up).collect::<Result<_, _>>()?,
-            moments: moments.ok_or_else(|| error("no posterior state"))?.iter().map(|m| Ok([moment(&m[0])?, up(&m[1])?, up(&m[2])?])).collect::<Result<_, String>>()?,
+            moments: (0..shapes.len()).map(state).collect::<Result<_, String>>()?,
             groups: parts.groups.iter().zip(&shapes).map(|(ids, shape)| master.group_map(ids, *shape).map_err(error)).collect::<Result<_, _>>()?,
             average: Vec::new(),
             averaged: 0,

@@ -197,7 +197,7 @@
 
 use crate::{
     artifact::{Argument, Artifact, Callee, Owner},
-    device_posterior::{DevicePosterior, Ivon},
+    device_posterior::{DevicePosterior, Ivon, State},
     device_program::{gelu_tanh_constant, law_of},
     interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable, Targets},
     library_compensation::Compensation,
@@ -2919,7 +2919,7 @@ pub fn fit_from(
     }
     let resumed_seconds = progress.seconds;
     let fresh = resumed.is_none();
-    let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, resumed.as_deref(), u64::try_from(progress.step).map_err(error)?)?;
+    let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, resumed.as_deref().map(State::Saved), u64::try_from(progress.step).map_err(error)?)?;
     let trust = if settings.trust_rate { settings.rate } else { 1.0 };
     device_posterior.set_arm(trust, settings.line_search);
     drop(resumed);
@@ -2936,8 +2936,10 @@ pub fn fit_from(
     }
     if fresh {
         let timed = Instant::now();
-        let moments = laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens)?;
-        device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, Some(&moments), 0)?;
+        let curvature = laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens)?;
+        // The unit-information start's state goes before the Laplace start's is made.
+        drop(device_posterior);
+        device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, Some(State::Curvature(&curvature)), 0)?;
         device_posterior.set_arm(trust, settings.line_search);
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
@@ -3208,7 +3210,7 @@ pub fn fit_from(
 /// Gauss–Newton diagonal per token. Each entry's deviation becomes `σ² = 1 / (N h + 1 / v_G)`, the
 /// minimum in `σ` of the data term's Gauss–Newton model `½ N h σ²` plus `KL(q ‖ p)`, instead of the
 /// epochs IVON's curvature average needs to fall from the start's `1 / v_G` to `h`. Returns IVON's
-/// state per operator: zero momentum, curvature `h`, zero second moment.
+/// curvature `h` per operator (its momentum and second moment start at zero, `State::Curvature`).
 fn laplace_start(
     scorer: &mut Scorer,
     posterior: &mut Posterior,
@@ -3217,7 +3219,7 @@ fn laplace_start(
     sequences: &[Vec<u32>],
     settings: &Settings,
     tokens: usize,
-) -> Result<Vec<[Array2<f64>; 3]>, String> {
+) -> Result<Vec<Array2<f64>>, String> {
     let device = scorer.experiments.models().1.program.device().clone();
     // `Σ_b u_b ⊙ u_b` summed on the device, in float64 where it holds float64, and read once.
     let wide = match device.with_storage(Storage::F64) {
@@ -3262,7 +3264,7 @@ fn laplace_start(
             }
         });
     }
-    Ok(curvature.into_iter().map(|h| [Array2::zeros(h.dim()), h.clone(), Array2::zeros(h.dim())]).collect())
+    Ok(curvature)
 }
 
 /// The noise stream of the removal estimates' weight samples: one no epoch draws (training takes
