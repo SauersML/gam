@@ -857,6 +857,57 @@ mod tests {
     /// variance is the empirical-Bayes value at the posterior mean `μ̄` (not at the iterate),
     /// stays within 10% of its start (the iterate-charged variance grew 35% per epoch on vpd4l), and the curvature-free entries' `μ̄` go to zero against the prior
     /// scale `√v_G`.
+    /// A line step on a quadratic data term `D(μ) = ½ a Σ (μ − t)²` (gradient `a (μ − t)` per
+    /// token, measured exactly at the iterate) lands on the minimum along its direction of
+    /// `D + Σ δ μ² / 2`: the parabola through the two measurements is exact.
+    #[test]
+    fn a_line_step_on_a_quadratic_lands_on_the_minimum_along_its_direction() {
+        const R: usize = 16;
+        let device = Device::host();
+        let tokens = 1000.0;
+        let a = 3.0;
+        let target = Array2::from_shape_fn((1, R), |(_, i)| 0.2 + 0.05 * i as f64);
+        let mean = Array2::from_elem((1, R), 0.1);
+        let log_sd = Array2::from_elem((1, R), -4.0);
+        let groups = vec![vec![0u32; R]];
+        let parts = Parts { operators: &[0], mean: std::slice::from_ref(&mean), log_sd: std::slice::from_ref(&log_sd), groups: &groups, count: 1, rotations: &[None] };
+        let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens, None, 0).unwrap();
+        posterior.set_arm(1.0, true);
+        let ivon = Ivon { rate: 0.1, beta1: 0.9, beta2: 0.75 };
+        let data = |mu: &Array2<f64>| 0.5 * a * mu.iter().zip(&target).map(|(m, t)| (m - t) * (m - t)).sum::<f64>();
+        let factor = device.upload(Array2::from_elem((1, R), a.sqrt()).view()).unwrap();
+        for step in 0..2 {
+            let mu = device.download(&posterior.mean[0]).unwrap();
+            let gradient = Array2::from_shape_fn((1, R), |(_, i)| a * (mu[(0, i)] - target[(0, i)]));
+            let gradients = BTreeMap::from([(0, device.upload(gradient.view()).unwrap())]);
+            let factors = BTreeMap::from([(0, device.copy(&factor).unwrap())]);
+            posterior.step(&gradients, 1.0, (&factors, 1.0), &ivon).unwrap();
+            let trial = posterior.line_trial().expect("a pending line step");
+            let delta = 1.0 / (tokens * posterior.variances().unwrap()[0]);
+            let state = posterior.line_state.as_ref().unwrap();
+            let (start, d) = (device.download(&state.before[0]).unwrap(), device.download(&state.directions[0]).unwrap());
+            posterior.place_line(0.0).unwrap();
+            let zero = data(&device.download(&posterior.mean[0]).unwrap());
+            posterior.place_line(trial).unwrap();
+            let moved = data(&device.download(&posterior.mean[0]).unwrap());
+            let report = posterior.finish_line(zero, moved, ivon.beta2).unwrap();
+            let slope: f64 = start.iter().zip(&d).zip(&target).map(|((m, x), t)| (a * (m - t) + delta * m) * x).sum();
+            let curvature: f64 = d.iter().map(|x| (a + delta) * x * x).sum();
+            if step == 0 {
+                // The first step has one gradient, no measured spread, no direction.
+                assert_eq!(report.eta, 0.0);
+                continue;
+            }
+            let exact = (slope / curvature).clamp(0.0, 2.0 * trial);
+            assert!(curvature > 0.0 && exact > 0.0, "no descent along d: slope {slope}, curvature {curvature}");
+            assert!((report.eta - exact).abs() <= 1e-9 * exact, "η {} against the minimum {exact}", report.eta);
+            let landed = device.download(&posterior.mean[0]).unwrap();
+            for ((x, m), dx) in landed.iter().zip(&start).zip(&d) {
+                assert!((x - (m - exact * dx)).abs() <= 1e-12, "the iterate is not at the step");
+            }
+        }
+    }
+
     #[test]
     fn the_variance_is_charged_at_the_averaged_mean_and_stays_bounded() {
         const R: usize = 64;
