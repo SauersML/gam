@@ -324,8 +324,8 @@ pub struct DeviceTrace {
     positions: Arc<Vec<u32>>,
     /// Per affine node and argument it read sparsely, the argument's columns it read ([`Active`]).
     active: BTreeMap<(usize, usize), Active>,
-    /// Bfloat16 copies of node values the reverse passes' products read ([`DeviceTrace::rounded_value`]),
-    /// kept until [`DeviceTrace::release_rounded`].
+    /// Bfloat16 copies of node values a bfloat16 forward pass's and the reverse passes' products read
+    /// ([`DeviceTrace::rounded_value`]), kept until [`DeviceTrace::release_rounded`].
     rounded: Mutex<BTreeMap<usize, Arc<Tensor>>>,
 }
 
@@ -413,7 +413,8 @@ impl DeviceTrace {
                 Slot::Empty | Slot::Alias(_) | Slot::Shared(_) => 0,
             })
             .sum();
-        slots + self.buffers.iter().map(Tensor::bytes).sum::<usize>()
+        let rounded = self.rounded.lock().map_or(0, |r| r.values().map(|t| t.bytes()).sum::<usize>());
+        slots + self.buffers.iter().map(Tensor::bytes).sum::<usize>() + rounded
     }
 
     /// The program's node count.
@@ -1662,7 +1663,10 @@ impl DeviceProgram {
                             let active = self.active(&trace, (index, *argument, *operator), hooks.before(*argument))?;
                             let out = match &active {
                                 Some((Some(ids), dead)) => self.sparse_product(trace.value(*argument)?, (ids, dead), *operator, (rows, width))?,
-                                _ => self.product(trace.value(*argument)?, *operator, false, (rows, width), self.arithmetic)?,
+                                _ => {
+                                    let rounded = self.forward_operand(&trace, *argument, *operator)?;
+                                    self.product(rounded.as_deref().map_or(trace.value(*argument), Ok)?, *operator, false, (rows, width), self.arithmetic)?
+                                }
                             };
                             let active = active.map(|(ids, _)| ids);
                             if let Some(active) = active {
@@ -1756,7 +1760,19 @@ impl DeviceProgram {
             let gathered = d.gather_rows(table, ids).map_err(error)?;
             d.axpy(out, 1.0, &gathered).map_err(error)
         } else {
-            self.add_product(out, trace.value(argument)?, operator, false, self.arithmetic)
+            let rounded = self.forward_operand(trace, argument, operator)?;
+            self.add_product(out, rounded.as_deref().map_or(trace.value(argument), Ok)?, operator, false, self.arithmetic)
+        }
+    }
+
+    /// Node `argument`'s value as the forward's operand of `operator`'s product: in bfloat16 an f32
+    /// value's copy, rounded once on the trace ([`DeviceTrace::rounded_value`]) where `operator` is
+    /// held dense or low-rank, so the call's reverse passes read the same copy rather than rounding
+    /// the value again; `None` (the value itself) otherwise, identity and diagonal terms included.
+    fn forward_operand(&self, trace: &DeviceTrace, argument: usize, operator: usize) -> Result<Option<Arc<Tensor>>, String> {
+        match self.held(operator, Role::Product)? {
+            Held::Dense(_) | Held::LowRank(..) => trace.rounded_value(argument, self.arithmetic),
+            _ => Ok(None),
         }
     }
 
@@ -1775,7 +1791,8 @@ impl DeviceProgram {
         let heads = &group.heads;
         let rotations = Arc::clone(&trace.rotations);
         let turn = turn(&rotations, heads.rotary)?;
-        let p = device_heads::project(d, heads, &group.stacked, trace.value(heads.input)?, self.arithmetic).map_err(error)?;
+        let rounded = trace.rounded_value(heads.input, self.arithmetic)?;
+        let p = device_heads::project(d, heads, &group.stacked, rounded.as_deref().map_or(trace.value(heads.input), Ok)?, self.arithmetic).map_err(error)?;
         let projections = Self::offer_blocks(trace, heads, (Buffer::Projections, p), edit)?;
         let normed = match &heads.norms {
             Some(norms) => {
