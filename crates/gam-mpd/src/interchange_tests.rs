@@ -982,7 +982,7 @@ fn a_head_removal_zeroes_its_output_in_both_models() {
 /// it scores zero against `M` (both models record the same activations and recompute the same
 /// norm), it changes `M`'s prediction, and with `P` applying no edit it scores `KL(M_e ‖ M)` above
 /// zero; drawn cuts run from an earlier block's part to a later one's, with another source; its
-/// reverse pass is refused.
+/// reverse pass runs.
 #[test]
 fn a_cut_connection_is_the_same_path_patch_in_both_models() {
     use super::interchange::Family;
@@ -1009,7 +1009,8 @@ fn a_cut_connection_is_the_same_path_patch_in_both_models() {
     assert_eq!(census(&experiments, x.variables())["cut_connection"], 3);
     let bits = x.evaluate(&batch, &experiments, false).expect("evaluate").bits;
     assert!(bits.iter().flatten().all(|b| b.abs() <= 1e-9), "{bits:?}");
-    assert!(x.evaluate(&batch, &experiments, true).is_err(), "a cut connection has no reverse pass");
+    let bits = x.evaluate(&batch, &experiments, true).expect("the reverse pass through the cuts").bits;
+    assert!(bits.iter().flatten().all(|b| b.abs() <= 1e-9), "{bits:?}");
     let made = x.targets(&batch, &experiments).expect("targets").host(&d).expect("host");
     for pair in 0..3 {
         let (plain, edited, at) = (&made[2 * pair].1, &made[2 * pair + 1].1, experiments[2 * pair + 1].position);

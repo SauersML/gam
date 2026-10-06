@@ -350,8 +350,7 @@ pub fn parts_of(program: &OperatorProgram, layers: usize) -> Result<Vec<Part>, S
 /// subset of the parts firing at a row of one block at once (as [`subset`] draws a joint read
 /// patch's: a single part's removal moves `M` little); removing a head; and cutting a connection
 /// between two parts; swapping a part's activation for its value on the source sequence; removing
-/// a part, or a head, at every row from the position on ([`Interchange::draw_edits`]; scored, not trained: it has
-/// no reverse pass).
+/// a part, or a head, at every row from the position on ([`Interchange::draw_edits`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Family {
@@ -414,10 +413,34 @@ impl Norm {
         Some(Self { entry, epsilon: *epsilon, gain: g.diag().to_vec(), bias })
     }
 
+    fn scale(&self, s: &[f64]) -> f64 {
+        1.0 / (s.iter().map(|v| v * v).sum::<f64>() / s.len() as f64 + self.epsilon).sqrt()
+    }
+
     fn apply(&self, s: &[f64]) -> Vec<f64> {
-        let r = 1.0 / (s.iter().map(|v| v * v).sum::<f64>() / s.len() as f64 + self.epsilon).sqrt();
+        let r = self.scale(s);
         s.iter().enumerate().map(|(k, v)| self.gain[k] * v * r + self.bias.as_ref().map_or(0.0, |b| b[k])).collect()
     }
+
+    /// The cotangent of `s` from the cotangent `w` of `N(s)`: `r γ ⊙ w − (r³/d) s Σ_k γ_k w_k s_k`.
+    fn pullback(&self, s: &[f64], w: &[f64]) -> Vec<f64> {
+        let r = self.scale(s);
+        let along: f64 = s.iter().zip(w).zip(&self.gain).map(|((v, w), g)| g * w * v).sum::<f64>() * r * r * r / s.len() as f64;
+        s.iter().zip(w).zip(&self.gain).map(|((v, w), g)| r * g * w - along * v).collect()
+    }
+}
+
+/// Add `rows` (one per entry of `at`) to the rows `at` of `t`, each round of distinct rows at once.
+fn add_rows(d: &Device, t: &mut Tensor, at: &[usize], rows: &ndarray::Array2<f64>) -> Result<(), String> {
+    let added = d.upload(rows.view()).map_err(error)?;
+    for round in rounds(at) {
+        let ranges = single(round.iter().map(|i| at[*i]));
+        let mut h = d.gather_ranges(t, &ranges).map_err(error)?;
+        let part = picked(d, &added, &round)?;
+        d.axpy(&mut h, 1.0, part.as_ref().unwrap_or(&added)).map_err(error)?;
+        d.scatter_ranges(t, &ranges, &h).map_err(error)?;
+    }
+    Ok(())
 }
 
 /// A part's activation `relu(g·x + c)` at a read `x`.
@@ -426,13 +449,30 @@ fn activation(part: &Part, x: &[f64]) -> f64 {
 }
 
 /// The cut connections' steps at one block of a call ([`Edits`]): per probe its row, cut, role (0
-/// the base, 1 the source) and part, whose activation it records; per cut its row, cut and parts.
+/// the base, 1 the source) and part, whose activation it records; per cut its row, cut and parts,
+/// with the forward's streams `s` and `s + δ` at its row (for the reverse), and the reverse's
+/// cotangent of the stream entering the block at the cuts' rows, which the block's reverse adds to
+/// the entering stream's ([`Edits::add_entering`]).
 struct Cuts {
     read: usize,
     norm: Option<Norm>,
     probes: Vec<(usize, usize, usize, usize)>,
     cuts: Vec<(usize, usize, usize, usize)>,
+    streams: RefCell<Vec<(Vec<f64>, Vec<f64>)>>,
+    entering: RefCell<Option<ndarray::Array2<f64>>>,
 }
+
+/// A cut connection's record in a plan: its `from` part's activations on the base and on the
+/// source (the forward's), and per reverse pass the cotangent of their difference, which `to`'s
+/// block leaves and `from`'s block, later in the same pass, takes (first in, first out: every pass
+/// reverses the calls in the same order).
+#[derive(Default)]
+pub(crate) struct Record {
+    activations: [f64; 2],
+    carried: std::collections::VecDeque<f64>,
+}
+
+pub(crate) type Records = std::rc::Rc<RefCell<BTreeMap<usize, Record>>>;
 
 impl PartSites {
     /// The parts.
@@ -887,7 +927,7 @@ pub struct Edits {
     /// `from`'s block for `to`'s block, which a later call runs (shared by a plan's calls).
     cuts: BTreeMap<usize, Cuts>,
     parts: Arc<Vec<Part>>,
-    recorded: Option<std::rc::Rc<RefCell<BTreeMap<usize, [f64; 2]>>>>,
+    recorded: Option<Records>,
 }
 
 /// The edits of parts at one block's output node ([`Edits`]): per edit its row, the part's read
@@ -979,7 +1019,7 @@ impl Edits {
         values: &[Value],
         edits: &[(usize, Edit)],
         sites: Option<&PartSites>,
-        recorded: Option<std::rc::Rc<RefCell<BTreeMap<usize, [f64; 2]>>>>,
+        recorded: Option<Records>,
     ) -> Result<Self, String> {
         let mut writes: BTreeMap<usize, (usize, Vec<(usize, usize, &Part, f64)>)> = BTreeMap::new();
         let mut zeroed = Vec::new();
@@ -993,7 +1033,7 @@ impl Edits {
                 let block = sites.parts.get(part).ok_or_else(|| error("a cut of an unknown part"))?.block;
                 let (read, out) = sites.nodes.get(block).copied().flatten().ok_or_else(|| error(format!("block {block}: no part sites")))?;
                 let norm = sites.norms.get(block).cloned().flatten();
-                cuts.entry(out).or_insert_with(|| Cuts { read, norm, probes: Vec::new(), cuts: Vec::new() });
+                cuts.entry(out).or_insert_with(|| Cuts { read, norm, probes: Vec::new(), cuts: Vec::new(), streams: RefCell::new(Vec::new()), entering: RefCell::new(None) });
                 Ok(out)
             };
             let (part, factor, from) = match edit {
@@ -1089,10 +1129,23 @@ impl Edits {
         Ok(Self { nodes, writes: BTreeMap::new(), cuts: BTreeMap::new(), parts: Arc::new(Vec::new()), recorded: None })
     }
 
-    /// The nodes the call edits, with the nodes edited parts read (whose cotangents take the
-    /// edits' share).
+    /// The nodes the call edits, with the nodes edited parts and cuts' probes read (whose
+    /// cotangents take the edits' share).
     pub fn nodes(&self) -> BTreeSet<usize> {
-        self.nodes.keys().chain(self.writes.keys()).chain(self.cuts.keys()).copied().chain(self.writes.values().map(|w| w.read)).collect()
+        let probed = self.cuts.values().filter(|c| !c.probes.is_empty()).map(|c| c.read);
+        self.nodes.keys().chain(self.writes.keys()).chain(self.cuts.keys()).copied().chain(self.writes.values().map(|w| w.read)).chain(probed).collect()
+    }
+
+    /// Add the cuts' cotangents of the stream entering the block ([`Edits::transpose`]) to its
+    /// cotangent `entering` (the call's rows), once per reverse pass.
+    pub fn add_entering(&self, d: &Device, entering: &mut Tensor) -> Result<(), String> {
+        for c in self.cuts.values() {
+            if let Some(rows) = c.entering.borrow_mut().take() {
+                let at: Vec<usize> = c.cuts.iter().map(|p| p.0).collect();
+                add_rows(d, entering, &at, &rows)?;
+            }
+        }
+        Ok(())
     }
 
     /// Whether the forward pass changes node `node`'s value (a read of parts only is not changed).
@@ -1116,7 +1169,7 @@ impl Edits {
                 let x = rows(value_of(c.read)?, &at)?;
                 for (k, (_, cut, role, part)) in c.probes.iter().enumerate() {
                     let a = activation(&self.parts[*part], x.row(k).as_slice().ok_or_else(|| error("a row"))?);
-                    recorded.borrow_mut().entry(*cut).or_insert([f64::NAN; 2])[*role] = a;
+                    recorded.borrow_mut().entry(*cut).or_default().activations[*role] = a;
                 }
             }
             let at: Vec<usize> = c.cuts.iter().map(|p| p.0).collect();
@@ -1124,14 +1177,17 @@ impl Edits {
                 let norm = c.norm.as_ref().ok_or_else(|| error("a cut connection at a block whose input norm is not an RMS norm with a gain"))?;
                 let streams = rows(value_of(norm.entry)?, &at)?;
                 let mut added = ndarray::Array2::zeros((at.len(), value.cols()));
+                let mut kept = Vec::with_capacity(at.len());
                 for (k, (_, cut, from, to)) in c.cuts.iter().enumerate() {
-                    let [a, source] = recorded.borrow().get(cut).copied().ok_or_else(|| error("a cut connection whose activations were not recorded"))?;
+                    let [a, source] = recorded.borrow().get(cut).map(|r| r.activations).ok_or_else(|| error("a cut connection whose activations were not recorded"))?;
                     let (from, to) = (&self.parts[*from], &self.parts[*to]);
                     let s = streams.row(k).to_vec();
                     let moved: Vec<f64> = s.iter().zip(&from.write).map(|(v, u)| v + (source - a) * u).collect();
                     let change = activation(to, &norm.apply(&moved)) - activation(to, &norm.apply(&s));
                     added.row_mut(k).iter_mut().zip(&to.write).for_each(|(v, u)| *v = change * u);
+                    kept.push((s, moved));
                 }
+                *c.streams.borrow_mut() = kept;
                 let added = d.upload(added.view()).map_err(error)?;
                 for round in rounds(&at) {
                     let rows = single(round.iter().map(|i| at[*i]));
@@ -1184,9 +1240,58 @@ impl Edits {
     /// An edit of a part leaves its output node's cotangent as it is and keeps the cotangent `u·ḡ`
     /// of its coefficient there; at the node the part reads (later in the reverse), the edited row
     /// receives `(α − 1)·1[g·x + c > 0]·(u·ḡ)·g`.
+    ///
+    /// A cut leaves its output node's cotangent as it is. With `t = u_B·ḡ` at its row and `y = s +
+    /// δ`, the cotangent of `s` (the stream entering the block) is `J_N(y)ᵀ(t 1[pre′ > 0] g_B) −
+    /// J_N(s)ᵀ(t 1[pre > 0] g_B)`, which the block's reverse adds to the entering stream's, and the
+    /// cotangent of `a′ − a` is `u_A·J_N(y)ᵀ(t 1[pre′ > 0] g_B)`, which the plan's record carries to
+    /// `from`'s block: there the source's row of the read takes it times `1[a′ > 0] g_A` and the
+    /// base's row minus it times `1[a > 0] g_A`.
     pub fn transpose(&self, d: &Device, node: usize, g: &mut Tensor) -> Result<(), String> {
-        if self.cuts.contains_key(&node) {
-            return Err(error("a cut connection has no reverse pass: it scores explanations, it does not train them"));
+        if let Some(c) = self.cuts.get(&node).filter(|c| !c.cuts.is_empty()) {
+            let norm = c.norm.as_ref().ok_or_else(|| error("a cut connection at a block whose input norm is not an RMS norm with a gain"))?;
+            let recorded = self.recorded.as_ref().ok_or_else(|| error("a cut connection outside a plan"))?;
+            let at: Vec<usize> = c.cuts.iter().map(|p| p.0).collect();
+            let rows = d.download(&d.gather_ranges(g, &single(at.iter().copied())).map_err(error)?).map_err(error)?;
+            let streams = c.streams.borrow();
+            let mut entering = ndarray::Array2::zeros((at.len(), g.cols()));
+            for (k, (_, cut, from, to)) in c.cuts.iter().enumerate() {
+                let (s, y) = streams.get(k).ok_or_else(|| error("a cut's reverse before its forward"))?;
+                let (from, to) = (&self.parts[*from], &self.parts[*to]);
+                let t: f64 = rows.row(k).iter().zip(&to.write).map(|(a, b)| a * b).sum();
+                let through = |x: &[f64]| -> Vec<f64> {
+                    let slope = if activation(to, &norm.apply(x)) > 0.0 { t } else { 0.0 };
+                    norm.pullback(x, &to.read.iter().map(|g| g * slope).collect::<Vec<_>>())
+                };
+                let (moved, plain) = (through(y), through(s));
+                entering.row_mut(k).iter_mut().zip(moved.iter().zip(&plain)).for_each(|(e, (a, b))| *e = a - b);
+                let carried: f64 = moved.iter().zip(&from.write).map(|(a, b)| a * b).sum();
+                recorded.borrow_mut().get_mut(cut).ok_or_else(|| error("a cut connection whose activations were not recorded"))?.carried.push_back(carried);
+            }
+            *c.entering.borrow_mut() = Some(entering);
+        }
+        for c in self.cuts.values().filter(|c| c.read == node && !c.probes.is_empty()) {
+            let recorded = self.recorded.as_ref().ok_or_else(|| error("a cut connection outside a plan"))?;
+            let mut taken: BTreeMap<usize, f64> = BTreeMap::new();
+            let mut added = ndarray::Array2::zeros((c.probes.len(), g.cols()));
+            for (k, (_, cut, role, part)) in c.probes.iter().enumerate() {
+                let mut records = recorded.borrow_mut();
+                let record = records.get_mut(cut).ok_or_else(|| error("a cut connection whose activations were not recorded"))?;
+                let carried = match taken.get(cut) {
+                    Some(v) => *v,
+                    None => {
+                        let v = record.carried.pop_front().ok_or_else(|| error("a cut's probe reversed before its cut"))?;
+                        taken.insert(*cut, v);
+                        v
+                    }
+                };
+                if record.activations[*role] > 0.0 {
+                    let sign = if *role == 1 { 1.0 } else { -1.0 };
+                    added.row_mut(k).iter_mut().zip(&self.parts[*part].read).for_each(|(v, g)| *v = sign * carried * g);
+                }
+            }
+            let at: Vec<usize> = c.probes.iter().map(|p| p.0).collect();
+            add_rows(d, g, &at, &added)?;
         }
         if let Some(w) = self.writes.get(&node) {
             let rows = w.rows_of(d, g, &w.rows)?;
@@ -1404,11 +1509,14 @@ impl BlockEngine for Model<'_> {
             }
         };
         let mut nodes = self.program.vjp_values_dense_edited(tape, seeds, &keep, &self.sites.trainable[block], arithmetic, (&edited, &mut hook), gradient)?;
-        let entering = if block > 0 {
+        let mut entering = if block > 0 {
             nodes.remove(&self.entry(block)).ok_or_else(|| error("no cotangent of a block's entering stream"))?
         } else {
             d.zeros(ranges.iter().map(ExactSizeIterator::len).sum(), cotangent.cols()).map_err(error)?
         };
+        if let Some(edits) = edits {
+            edits.add_entering(d, &mut entering)?;
+        }
         scatter(d, cotangent, ranges, &entering)
     }
 
@@ -1488,7 +1596,7 @@ struct Plan<'t> {
     holder: Vec<usize>,
     length: usize,
     /// Per cut connection the activations its probes record ([`Edits::write`]).
-    recorded: std::rc::Rc<RefCell<BTreeMap<usize, [f64; 2]>>>,
+    recorded: Records,
 }
 
 impl<'t> Plan<'t> {
