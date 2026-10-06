@@ -1269,9 +1269,6 @@ impl Posterior {
 pub struct Settings {
     /// Base sequences per step.
     pub batch_sequences: usize,
-    /// The decay of the gradient's momentum `m`. The curvature estimate averages over one epoch's
-    /// batches and sets `σ`; each step's length along IVON's direction is measured (module note).
-    pub beta1: f64,
     /// The seed of the weight noise and of the experiments' draws.
     pub seed: u64,
     /// The device's numeric buffers for operators (each of the native and the explanation).
@@ -1299,7 +1296,8 @@ pub struct Settings {
 #[serde(deny_unknown_fields)]
 struct SettingsRecord {
     batch_sequences: usize,
-    beta1: f64,
+    #[serde(default)]
+    beta1: Option<serde::de::IgnoredAny>,
     seed: u64,
     numeric_bytes: usize,
     head_tile_rows: usize,
@@ -1331,7 +1329,7 @@ struct SettingsRecord {
 
 impl From<SettingsRecord> for Settings {
     fn from(r: SettingsRecord) -> Self {
-        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some()), ("preconditioned", r.preconditioned.is_some()), ("half_factor", r.half_factor.is_some()), ("one_sample", r.one_sample.is_some()), ("rotated", r.rotated.is_some())];
+        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some()), ("preconditioned", r.preconditioned.is_some()), ("half_factor", r.half_factor.is_some()), ("one_sample", r.one_sample.is_some()), ("rotated", r.rotated.is_some()), ("beta1", r.beta1.is_some())];
         for (key, present) in retired {
             if present {
                 log::info!("library settings: the retired key `{key}` is ignored");
@@ -1339,7 +1337,6 @@ impl From<SettingsRecord> for Settings {
         }
         Settings {
             batch_sequences: r.batch_sequences,
-            beta1: r.beta1,
             seed: r.seed,
             numeric_bytes: r.numeric_bytes,
             head_tile_rows: r.head_tile_rows,
@@ -1352,7 +1349,6 @@ impl From<SettingsRecord> for Settings {
 impl Settings {
     fn validate(&self) -> Result<(), String> {
         if self.batch_sequences == 0
-            || !(0.0..1.0).contains(&self.beta1)
             || self.numeric_bytes == 0
             || self.head_tile_rows == 0
         {
@@ -1876,6 +1872,60 @@ fn line_measurement(
         seconds[k + 1] = clock.elapsed().as_secs_f64();
     }
     Ok((values, targets, seconds))
+}
+
+/// The gradient-noise scale `B = tr(P Σ) / ‖∇F‖²_P` in batches, from IVON's state as it stands
+/// (McCandlish et al. 2018's simple noise scale, with IVON's preconditioner `P = 1 / (h + δ)`). Per
+/// live entry, the momentum `m` and the gradient's second moment `p`, bias-corrected by the
+/// momentum's weight `W` (`DevicePosterior::momentum_weights`), give one batch's gradient variance
+/// `σ² = p̄ − m̄²` and the momentum's own `V = σ² / (n − 1)` (`n = W² / W2` gradients); the
+/// squared signal of the full gradient `m̄ + δ μ̄` is its square less `V`. `None` before the
+/// momentum averages more than one gradient, or when no signal is measured above the noise.
+fn gradient_noise_scale(device_posterior: &DevicePosterior, posterior: &Posterior, tokens: f64) -> Result<Option<f64>, String> {
+    let (w, w2) = device_posterior.momentum_weights();
+    let n = if w2 > 0.0 { w * w / w2 } else { 0.0 };
+    if !(n > 1.0 && w > 0.0) {
+        return Ok(None);
+    }
+    let variances = device_posterior.variances()?;
+    let (mut noise, mut signal) = (0.0, 0.0);
+    for i in 0..posterior.mean.len() {
+        let (mean, log_sd, [momentum, curvature, power]) = device_posterior.operator(i)?;
+        for ((((mu, s), m), (h, p)), group) in mean.iter().zip(&log_sd).zip(&momentum).zip(curvature.iter().zip(&power)).zip(posterior.membership[i].iter()) {
+            let v = variances[*group as usize];
+            if *s == f64::NEG_INFINITY || !(v > 0.0) {
+                continue;
+            }
+            let delta = 1.0 / (tokens * v);
+            let (m, p) = (m / w, p / w);
+            let spread = (p - m * m).max(0.0);
+            let full = m + delta * mu;
+            let precondition = 1.0 / (h.max(0.0) + delta);
+            noise += precondition * spread;
+            signal += precondition * (full * full - spread / (n - 1.0));
+        }
+    }
+    Ok((signal > 0.0 && noise.is_finite()).then(|| noise / signal))
+}
+
+/// The momentum's decay for a gradient-noise scale of `scale` batches (one batch a step): the
+/// window at which the momentum's average direction has noise equal to its signal,
+/// `β₁ = (B − 1) / (B + 1)`, at least 0 and at most an epoch's running mean `1 − 1 / batches`.
+/// With a step's gradient `∇F + ξ` (`ξ` of covariance `Σ`), the momentum `m̄` averages `n_eff =
+/// (1 + β₁) / (1 − β₁)` gradients in effect, so its noise is `tr(P Σ) / n_eff` against the signal
+/// `‖∇F‖²_P`: equal at `n_eff = B`. That is the critical point of the gain a step makes along its
+/// direction: in the Gauss–Newton model the expected gain of the best step along `m̄` is the
+/// noise-free gain times `1 / (1 + B / n_eff)`, so below `n_eff = B` each doubling of the window
+/// nearly doubles a step's gain, and above it the gain is within a factor two of its limit while
+/// the average reaches further back to gradients taken at older iterates. The measured line step
+/// takes the step's length along whatever direction results, so the window sets only the
+/// direction's noise.
+fn momentum_decay(scale: f64, batches: usize) -> f64 {
+    let ceiling = 1.0 - 1.0 / batches.max(2) as f64;
+    if !(scale.is_finite() && scale > 1.0) {
+        return if scale.is_finite() { 0.0 } else { ceiling };
+    }
+    ((scale - 1.0) / (scale + 1.0)).min(ceiling)
 }
 
 /// A running mean of bits over scored tokens.
@@ -2783,8 +2833,11 @@ pub fn fit_from(
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
     device_posterior.set_epoch_ratio(settings.epoch_ratio);
-    // The curvature estimate averages over one epoch's batches: each batch weighs about once.
-    let ivon = Ivon { beta1: settings.beta1, beta2: 1.0 - 1.0 / draws.len() as f64 };
+    // The curvature estimate averages over one epoch's batches: each batch weighs about once. The
+    // momentum's decay is set each step (`momentum_decay`): a running mean until an epoch has
+    // measured the gradient-noise scale, then the rule's.
+    let mut ivon = Ivon { beta1: 0.0, beta2: 1.0 - 1.0 / draws.len() as f64 };
+    let mut measured_decay: Option<f64> = None;
     // Each group's size, whose `½ ln |G|` an active group's variance costs.
     let sizes: Vec<f64> = explanation.groups.iter().map(|g| g.cells.iter().map(|c| (c.rows.len() * c.cols.len()) as f64).sum()).collect();
     // The fit's thread streams the checkpoint off the device to the writer thread, which finishes
@@ -2902,6 +2955,7 @@ pub fn fit_from(
             // sums (the first antithetic half's, `antithetic_step`).
             let factor_weight = weight * scored as f64 / factor.tokens as f64;
             let posterior_started = Instant::now();
+            ivon.beta1 = measured_decay.unwrap_or(1.0 - 1.0 / (b + 1) as f64);
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &ivon)?;
             let posterior_seconds = posterior_started.elapsed().as_secs_f64();
             if settings.epoch_ratio {
@@ -2926,6 +2980,15 @@ pub fn fit_from(
             }
             let prior_note = if prior.is_some() { format!(" (prior: {prior_seconds:.3} s)") } else { String::new() };
             log::info!("library step {epoch}.{b}: {:.6} bits per scored token, {:.2} s{prior_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
+        }
+        // The next epoch's momentum decay from the noise scale this epoch's state measures.
+        match gradient_noise_scale(&device_posterior, &posterior, tokens as f64)? {
+            Some(scale) => {
+                let decay = momentum_decay(scale, draws.len());
+                log::info!("library momentum after epoch {epoch}: gradient-noise scale {scale:.4e} batches, β₁ {decay:.6} (was {:.6})", ivon.beta1);
+                measured_decay = Some(decay);
+            }
+            None => log::info!("library momentum after epoch {epoch}: no noise scale measured, β₁ stays a running mean"),
         }
         for ((code_length, data), prior_nats) in device_posterior.code_lengths(&code)?.into_iter().zip(datas).zip(priors) {
             let description = code_length + subset_code + explanation.fixed_nats + prior_nats;
@@ -3903,7 +3966,6 @@ mod tests {
     fn settings() -> Settings {
         Settings {
             batch_sequences: 2,
-            beta1: 0.9,
             seed: 3,
             numeric_bytes: 1 << 26,
             head_tile_rows: 64,
@@ -4145,7 +4207,7 @@ mod tests {
     fn a_device_step_is_the_host_step() {
         let (native, layers, _, _) = tiny("library_device_step", "gelu_tanh");
         let explanation = explanation(&native, &layers).unwrap();
-        let (device, settings) = (Device::host(), settings());
+        let device = Device::host();
         let mut posterior = Posterior::new(&explanation, 72).unwrap();
         let mut rng = StdRng::seed_from_u64(5);
         for log_sd in &mut posterior.log_sd {
@@ -4159,7 +4221,7 @@ mod tests {
         let gradients: Vec<Array2<f64>> = posterior.mean.iter().map(|m| m.mapv(|_| rng.random::<f64>() - 0.5)).collect();
         let factors: Vec<Array2<f64>> = posterior.mean.iter().map(|m| m.mapv(|_| rng.random::<f64>() - 0.5)).collect();
         let up = |values: &[Array2<f64>]| -> BTreeMap<usize, Tensor> { explanation.trainable.iter().zip(values).map(|(op, g)| (*op, device.upload(g.view()).unwrap())).collect() };
-        let ivon = Ivon { beta1: settings.beta1, beta2: 0.75 };
+        let ivon = Ivon { beta1: 0.9, beta2: 0.75 };
         device_posterior.step(&up(&gradients), scale, (&up(&factors), square), &ivon).unwrap();
         let mut stepped = posterior.clone();
         device_posterior.download(&mut stepped).unwrap();

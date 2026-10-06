@@ -116,7 +116,7 @@ fn arm(device: &Device, (native, start): (&gam_mpd::operator_program::OperatorPr
     }
     let begin = if checkpoint == Path::new("native") { None } else { Some(library_mdl::checkpoint_start(start, checkpoint)?) };
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
-    let steps = library_mixture::Steps { rate: 0.05, beta1: fit.beta1, beta2: 0.999, epsilon: 1e-8 };
+    let steps = library_mixture::Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 };
     let mut mixture = library_mixture::Mixture::new(start, width, steps)?;
     let fitted = library_mdl::fit_from(device, native, start, train, held_out, fit, &settings.export_sha256, Some(&out.join("checkpoint.bin")), Some(&mut mixture), begin)?;
     save(&out.join("REPORT.json"), &serde_json::to_value(&fitted.report).map_err(|e| e.to_string())?)?;
@@ -209,7 +209,7 @@ fn main() -> Result<(), String> {
     };
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     let fit = &settings.fit;
-    let steps = library_mixture::Steps { rate: 0.05, beta1: fit.beta1, beta2: 0.999, epsilon: 1e-8 };
+    let steps = library_mixture::Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 };
     let mut mixture = library_mixture::Mixture::new(&base, width, steps)?;
     let dir = out.join("soft");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;

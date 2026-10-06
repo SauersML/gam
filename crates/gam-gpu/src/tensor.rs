@@ -2888,7 +2888,9 @@ fn swept_chunk(rows: usize) -> usize {
 /// One step of [`Device::posterior_ivon`]: the factor turning the given gradient into the data
 /// term's gradient per token, the factor turning the Gauss–Newton factor's square into the
 /// curvature estimate per token, the tokens `N`, the momentum's and the curvature's decays, and
-/// the step's number from 1.
+/// the momentum's weights after this step's update, `weights = (W, W2)`: the sum and the sum of
+/// squares of the weights its gradients carry (`W ← β₁ W + (1 − β₁)`, `W2 ← β₁² W2 + (1 − β₁)²`
+/// from zero), which hold whatever `β₁` each step used ([`PosteriorStep::weights_after`]).
 #[derive(Clone, Copy, Debug)]
 pub struct PosteriorStep {
     pub gradient_scale: f64,
@@ -2896,24 +2898,34 @@ pub struct PosteriorStep {
     pub tokens: f64,
     pub beta1: f64,
     pub beta2: f64,
-    pub step: u64,
+    pub weights: (f64, f64),
 }
 
 impl PosteriorStep {
-    /// The momentum's bias correction `1 − β₁ᵗ`.
+    /// The momentum's weights `(W, W2)` after a step with decay `beta1` from `weights`.
+    #[must_use]
+    pub fn weights_after((w, w2): (f64, f64), beta1: f64) -> (f64, f64) {
+        (beta1 * w + (1.0 - beta1), beta1 * beta1 * w2 + (1.0 - beta1) * (1.0 - beta1))
+    }
+
+    /// The momentum's weights after `steps` steps of a constant `beta1` from zero.
+    #[must_use]
+    pub fn constant_weights(beta1: f64, steps: u64) -> (f64, f64) {
+        (0..steps).fold((0.0, 0.0), |w, _| Self::weights_after(w, beta1))
+    }
+
+    /// The momentum's bias correction `W` (`1 − β₁ᵗ` for a constant `β₁`).
     fn correction(&self) -> f64 {
-        let exponent = i32::try_from(self.step.max(1)).unwrap_or(i32::MAX);
-        1.0 - self.beta1.powi(exponent)
+        self.weights.0
     }
 
     /// The factor `1 / (n − 1)` turning the spread `p̄ − m̄²` of the bias-corrected gradient moments
-    /// into the variance of the momentum `m̄` ([`Device::posterior_ivon`]), with
-    /// `n = (1 + β₁)(1 − β₁ᵗ)² / ((1 − β₁)(1 − β₁²ᵗ))` the momentum's effective number of gradients;
-    /// negative while `n ≤ 1`, when the gradients give no spread.
+    /// into the variance of the momentum `m̄` ([`Device::posterior_ivon`]), with `n = W² / W2` the
+    /// momentum's effective number of gradients (`(1 + β₁)(1 − β₁ᵗ)² / ((1 − β₁)(1 − β₁²ᵗ))` for a
+    /// constant `β₁`); negative while `n ≤ 1`, when the gradients give no spread.
     fn noise_scale(&self) -> f64 {
-        let t = i32::try_from(self.step.max(1)).unwrap_or(i32::MAX / 2).min(i32::MAX / 2);
-        let b = self.beta1;
-        let n = (1.0 + b) * (1.0 - b.powi(t)).powi(2) / ((1.0 - b) * (1.0 - b.powi(2 * t)));
+        let (w, w2) = self.weights;
+        let n = if w2 > 0.0 { w * w / w2 } else { 0.0 };
         if n > 1.0 { 1.0 / (n - 1.0) } else { -1.0 }
     }
 }

@@ -473,7 +473,7 @@ fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>, begin
     }
     // Reuse by gradient among the accepted bodies: the fit with the mixture prior over bodies
     // (OUT/soft{n}); its dominant components made exact by merges, each hardening one transaction.
-    let steps = library_mixture::Steps { rate: 0.05, beta1: run.fit.beta1, beta2: 0.999, epsilon: 1e-8 };
+    let steps = library_mixture::Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 };
     for round in 0.. {
         let mut mixture = library_bodies::BodyMixture::new(&explanation, steps)?;
         let warmed = warm(&explanation, &current)?;
@@ -534,7 +534,6 @@ fn main() -> Result<(), String> {
             let sequences: Vec<Vec<u32>> = tokens.chunks(CONTEXT).map(<[u32]>::to_vec).collect();
             let fit = library_mdl::Settings {
                 batch_sequences: 32,
-                beta1: 0.9,
                 seed: 1,
                 numeric_bytes: 1 << 28,
                 head_tile_rows: 64,

@@ -168,6 +168,9 @@ pub struct DevicePosterior {
     /// The training tokens `N` (the data term's weight) and the steps taken.
     tokens: f64,
     steps: u64,
+    /// The momentum's weights `(W, W2)` (`PosteriorStep::weights`), kept whatever `β₁` each step
+    /// used.
+    momentum_weights: (f64, f64),
     /// Per operator, the host `μ` and `s` its device values were last set from
     /// ([`DevicePosterior::set_values`]) while no step or restore has changed them since, held as
     /// the posterior's own shared arrays (no copy): a later `set_values` sends only the operators
@@ -303,6 +306,9 @@ impl DevicePosterior {
             wide,
             tokens,
             steps,
+            // A posterior resumed after `steps` steps of the fixed `β₁ = 0.9` fits used before the
+            // rule (`library_mdl::momentum_decay`).
+            momentum_weights: PosteriorStep::constant_weights(0.9, steps),
             uploaded: Vec::new(),
         };
         out.average = out.mean.iter().map(|m| out.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
@@ -462,6 +468,13 @@ impl DevicePosterior {
         self.steps
     }
 
+    /// The momentum's weights `(W, W2)`: its bias correction `W` and effective number of
+    /// gradients `W² / W2`.
+    #[must_use]
+    pub fn momentum_weights(&self) -> (f64, f64) {
+        self.momentum_weights
+    }
+
     /// Writes the posterior means into `program`'s trainable operators (rounded to its storage).
     /// Trainable operator `op`'s position, and its means and log standard deviations.
     fn entries(&self, op: usize) -> Result<(usize, &Tensor, &Tensor), String> {
@@ -563,6 +576,7 @@ impl DevicePosterior {
         }
         self.uploaded.clear();
         self.steps += 1;
+        self.momentum_weights = PosteriorStep::weights_after(self.momentum_weights, ivon.beta1);
         // The kernel takes IVON's full direction from the iterate kept here.
         let before: Vec<Tensor> = self.mean.iter().map(|m| self.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
         let mut sums = self.wide.zeros(self.group_count(), 5).map_err(error)?;
@@ -577,7 +591,7 @@ impl DevicePosterior {
             let (missing_gradient, missing_factor) = (zero(gradients.get(&op))?, zero(factor.0.get(&op))?);
             let gradient = gradients.get(&op).or(missing_gradient.as_ref()).ok_or_else(|| error("no gradient"))?;
             let draw = factor.0.get(&op).or(missing_factor.as_ref()).ok_or_else(|| error("no Gauss–Newton factor"))?;
-            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, beta1: ivon.beta1, beta2: ivon.beta2, step: self.steps };
+            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, beta1: ivon.beta1, beta2: ivon.beta2, weights: self.momentum_weights };
             let [momentum, curvature, power] = &mut self.moments[i];
             self.fitting
                 .posterior_ivon((&mut self.mean[i], &mut self.log_sd[i]), [momentum, curvature, power], (gradient, draw), (&self.groups[i], &self.variance), &mut self.sums, &step)

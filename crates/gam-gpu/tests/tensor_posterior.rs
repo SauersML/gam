@@ -64,7 +64,7 @@ fn case(axis: GroupAxis) -> Case {
     }
     // The gradient's momentum, a positive curvature estimate and the gradient's second moment.
     let moments = [matrix(rows, cols, 3, 0.1, 0.0), matrix(rows, cols, 4, 0.5, 1.0), matrix(rows, cols, 5, 0.01, 0.02)];
-    let step = PosteriorStep { gradient_scale: 1.5, factor_scale: 0.25, tokens: 50.0, beta1: 0.9, beta2: 0.999, step: 7 };
+    let step = PosteriorStep { gradient_scale: 1.5, factor_scale: 0.25, tokens: 50.0, beta1: 0.9, beta2: 0.999, weights: PosteriorStep::constant_weights(0.9, 7) };
     let (gradient, factor) = (matrix(rows, cols, 7, 3.0, 0.0), matrix(rows, cols, 8, 2.0, 0.0));
     Case { mean, log_sd, moments, sample: (0x1234_5678_9abc_def0, 42), gradient, factor, groups, count: 8, step }
 }
@@ -84,7 +84,7 @@ fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 
     }
     let variance: Vec<f64> = before.iter().map(|b| if b[0] > 0.0 { b[1] / b[0] } else { 0.0 }).collect();
     let (b1, b2, n) = (c.step.beta1, c.step.beta2, c.step.tokens);
-    let t = c.step.step as i32;
+    let t = 7;
     let c1 = 1.0 - b1.powi(t);
     // The momentum's effective number of gradients, and the factor from the moments' spread to its
     // variance.
@@ -336,7 +336,7 @@ fn settled(fit: &Device, wide: &Device, steps: u64) -> (f64, Vec<f64>) {
             let theta = mu[(0, i)] + sd[(0, i)] * f64::from(posterior_normal(11, t, i as u64));
             h * (theta - a) + s * f64::from(posterior_normal(12, t, i as u64))
         });
-        let step = PosteriorStep { gradient_scale: 1.0, factor_scale: 1.0, tokens, beta1: 0.9, beta2: 1.0 - 1.0 / 64.0, step: t };
+        let step = PosteriorStep { gradient_scale: 1.0, factor_scale: 1.0, tokens, beta1: 0.9, beta2: 1.0 - 1.0 / 64.0, weights: PosteriorStep::constant_weights(0.9, t) };
         let mut sums = wide.zeros(1, 3).unwrap();
         fit.posterior_ivon((&mut mean, &mut log_sd), [&mut momentum, &mut curvature, &mut power], (&up(gradient), &factor), (&groups, &variance), &mut sums, &step).unwrap();
         let full = fit.download(&mean).unwrap();
