@@ -7,9 +7,10 @@
 //! start at `M`), `artifact:PATH` (a fit's posterior-mean artifact) or `checkpoint:PATH` (a fit's
 //! checkpoint: its means, standard deviations and removed groups). The library is fitted with the
 //! mixture prior over its parameter blocks (each MLP function's gate, up and output vectors, each
-//! key-value group's query–key maps and value map; `K` candidates per target; OUT/soft); every
-//! candidate holding more than half of its target's weight is made exact (a tie of a row or a
-//! column, a shared query–key function, a shared value map). The library without and with the exact
+//! key-value group's query–key maps and value map; at most `K` candidates per target; OUT/soft);
+//! every candidate holding more than half of its target's weight whose equality is predicted to
+//! lower `F` is made exact (a tie of a row or a column, a shared query–key function, a shared value
+//! map; OUT/PROPOSAL.json lists them). The library without and with the exact
 //! sharing (OUT/base, OUT/moved) is then fitted to convergence on the same experiments from the
 //! soft fit's posterior means, and the sharing is accepted when the moved library's code length `F`
 //! is the smaller.
@@ -98,17 +99,18 @@ fn main() -> Result<(), String> {
     // Both libraries start from the soft fit's posterior means and removals.
     let mut base = library_sharing::warm(&base, &library_mdl::posterior_mean(&base, &soft.posterior)?)?;
     base.removed = (0..soft.posterior.active.len()).filter(|g| !soft.posterior.active[*g]).collect();
-    let dominant = mixture.dominant(&soft.posterior)?;
-    log::info!("{} targets' mixtures are dominated by one candidate", dominant.len());
-    let listed: Vec<Value> = dominant
+    let proposals = mixture.proposals(&soft.posterior)?;
+    let kept = mixture.targets.iter().filter(|t| !t.components.is_empty()).count();
+    log::info!("{kept} targets keep a mixture; {} dominant candidates are predicted to lower F when made exact", proposals.len());
+    let listed: Vec<Value> = proposals
         .iter()
-        .map(|(t, j)| {
+        .map(|(t, j, saving)| {
             let target = &mixture.targets[*t];
-            json!({"target": target.kind, "candidate": target.components[*j].write, "scale": target.components[*j].scale, "weights": target.weights().unwrap_or_default(), "choices": target.choices})
+            json!({"target": target.kind, "candidate": target.components[*j].write, "scale": target.components[*j].scale, "weights": target.weights().unwrap_or_default(), "choices": target.choices, "predicted_saving_bits": saving / std::f64::consts::LN_2})
         })
         .collect();
     let moved = mixture.harden(&base, &soft.posterior)?;
-    let proposal = json!({"exact": listed, "choice_bits": moved.fixed_nats / std::f64::consts::LN_2});
+    let proposal = json!({"targets": mixture.targets.len(), "kept": kept, "exact": listed, "choice_bits": moved.fixed_nats / std::f64::consts::LN_2});
     moved.artifact.validate_coverage(&native)?;
     save(&out.join("PROPOSAL.json"), &proposal)?;
     let mut fits = Vec::new();

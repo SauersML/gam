@@ -888,6 +888,20 @@ impl Mixture {
         Ok(saved - 0.5 * misfit - (target.choices as f64).ln())
     }
 
+    /// The dominant components ([`Mixture::dominant`]) that making exact is predicted to lower `F`
+    /// by, with the predicted saving in nats (module note, # Hardening).
+    pub fn proposals(&self, posterior: &Posterior) -> Result<Vec<(usize, usize, f64)>, String> {
+        let costs = posterior.costs();
+        let mut out = Vec::new();
+        for (t, j) in self.dominant(posterior)? {
+            let saving = self.hardening_saving(t, j, posterior, &costs)?;
+            if saving > 0.0 {
+                out.push((t, j, saving));
+            }
+        }
+        Ok(out)
+    }
+
     /// The targets whose one candidate holds more than half of the mixture weight, with it.
     pub fn dominant(&self, posterior: &Posterior) -> Result<Vec<(usize, usize)>, String> {
         let mut out = Vec::new();
@@ -923,11 +937,10 @@ impl Mixture {
         // An MLP block takes part in one exact sharing per hardening: as a target or as a source.
         let mut taken: Vec<Write> = Vec::new();
         let mut nats = 0.0;
-        let costs = posterior.costs();
-        for (t, j) in self.dominant(posterior)? {
+        for (t, j, _) in self.proposals(posterior)? {
             let target = &self.targets[t];
             let (own, source) = (Write::of(target.kind), target.components[j].write);
-            if taken.contains(&own) || taken.contains(&source) || self.hardening_saving(t, j, posterior, &costs)? <= 0.0 {
+            if taken.contains(&own) || taken.contains(&source) {
                 continue;
             }
             let least_squares = |g: &Array1<f64>, s: &Array1<f64>| if s.dot(s) > 0.0 { Some(g.dot(s) / s.dot(s)) } else { None };
