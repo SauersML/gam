@@ -61,7 +61,10 @@
 //! the posterior's description charges, and away from a stationary posterior it changes the
 //! description at first order). For the same reason it adds the data term's first-order change from
 //! that step, `Σ_b g_b · Δ` over the surviving entries, with `Σ_b g_b` in the MLPs' output maps
-//! summed in the passes that measure the estimates ([`Curvature`]).
+//! summed in the passes that measure the estimates ([`Curvature`]), and the step's second-order
+//! terms, its own and its coupling with the deleted outputs, under compensation's curvature model
+//! (`Compensation::moved_quadratic`); the deleted units then enter with their measured estimates
+//! whole, not scaled by the compensated share (logged beside as `predicted_share_bits`).
 //!
 //! # The search
 //!
@@ -1019,7 +1022,16 @@ pub fn round(
                 dot
             })
             .sum();
-        let predicted = span.iter().map(|u| u.data).sum::<f64>() + moved + description;
+        // The change actually applied: the deleted units' measured estimates without the
+        // compensated share, the data gradient along the move, and the move's own and coupling
+        // terms under compensation's curvature model.
+        let plain: f64 = span.iter().map(|u| u.roots.iter().map(|g| data_rise[*g]).sum::<f64>() / u.roots.len() as f64).sum();
+        let quadratic = match compensation {
+            Some(c) => c.moved_quadratic(posterior, &proposed, &groups)?,
+            None => 0.0,
+        };
+        let predicted = plain + moved + quadratic + description;
+        let shared = span.iter().map(|u| u.data).sum::<f64>() + moved + description;
         // With the Gauss–Newton cross terms between the units, without compensation.
         let roots: Vec<(usize, f64)> = span.iter().flat_map(|u| u.roots.iter().map(|r| (*r, 1.0 / u.roots.len() as f64))).collect();
         let joint = curvature.joint(&roots) + deleted;
@@ -1027,7 +1039,7 @@ pub fn round(
         let kind = if high - low == units.len() { "whole" } else if high - low == 1 { "single" } else { "split" };
         journal.write(json!({
             "event": "proposal", "kind": kind, "units": high - low, "first_unit": low, "groups": groups, "layers": names(&groups),
-            "predicted_bits": predicted / LN_2, "joint_plain_bits": joint / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
+            "predicted_bits": predicted / LN_2, "predicted_share_bits": shared / LN_2, "move_quadratic_bits": quadratic / LN_2, "joint_plain_bits": joint / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
             "description_bits": description / LN_2, "description_deleted_bits": deleted / LN_2, "compensation_slope_bits": moved / LN_2,
             "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(), "trial_seconds": trial_seconds,
         }))?;

@@ -290,6 +290,60 @@ impl Compensation {
         Ok((root, decomposition, floor))
     }
 
+    /// The data term's change from `trial`'s move `Δ` of the surviving output columns of
+    /// `posterior` with the groups `removed` deleted, in the terms that involve `Δ`, under the
+    /// curvature `G ⊗ C` (module note): per output coordinate `r`,
+    /// `c_r (½ Δ_rᵀ G_RR Δ_r − Δ_rᵀ G_RK U_K,r)`. With the deleted outputs' own terms (measured
+    /// for the removal alone) and the data gradient along `Δ`, the second-order change of the
+    /// move actually applied.
+    pub fn moved_quadratic(&self, posterior: &Posterior, trial: &Posterior, removed: &[usize]) -> Result<f64, String> {
+        let gone: BTreeSet<usize> = removed.iter().copied().collect();
+        let mut total = 0.0;
+        for mlp in &self.mlps {
+            let groups = |i: usize| mlp.functions[i].iter().copied().chain(match mlp.outputs[i] {
+                Output::Tied { group, .. } => Some(group),
+                Output::Column(_) => None,
+            });
+            let alive = |i: &usize| groups(*i).all(|g| posterior.active[g]);
+            let hit = |i: &usize| groups(*i).any(|g| gone.contains(&g));
+            let (deleted, kept): (Vec<usize>, Vec<usize>) = (0..mlp.functions.len()).filter(alive).partition(hit);
+            let surviving: Vec<usize> = kept.into_iter().filter(|i| matches!(mlp.outputs[*i], Output::Column(_))).collect();
+            if deleted.is_empty() || surviving.is_empty() {
+                continue;
+            }
+            let (_, curvature) = Self::scales(mlp, posterior, &Self::columns(mlp, posterior));
+            let (before, after) = (&posterior.mean[mlp.output], &trial.mean[mlp.output]);
+            // `Δ` and `U_K` as rows, one per function.
+            let column = |i: usize| match mlp.outputs[i] {
+                Output::Column(column) => Some(column),
+                Output::Tied { .. } => None,
+            };
+            let mut moves = Array2::zeros((surviving.len(), before.nrows()));
+            for (mut row, i) in moves.rows_mut().into_iter().zip(&surviving) {
+                let c = column(*i).ok_or_else(|| error("a survivor without its own column"))?;
+                row.assign(&(&after.column(c) - &before.column(c)));
+            }
+            let mut deleted_outputs = Array2::zeros((deleted.len(), before.nrows()));
+            for (mut row, i) in deleted_outputs.rows_mut().into_iter().zip(&deleted) {
+                match mlp.outputs[*i] {
+                    Output::Column(c) => row.assign(&before.column(c)),
+                    Output::Tied { scale, gate, row: read, .. } => row.assign(&(&posterior.mean[gate].row(read) * posterior.mean[scale][[0, 0]])),
+                }
+            }
+            let own = fast_ab(&mlp.gram.select(Axis(0), &surviving).select(Axis(1), &surviving), &moves);
+            let cross = fast_ab(&mlp.gram.select(Axis(0), &surviving).select(Axis(1), &deleted), &deleted_outputs);
+            for (r, c) in curvature.iter().enumerate() {
+                let (mut quadratic, mut coupling) = (0.0, 0.0);
+                for j in 0..surviving.len() {
+                    quadratic += moves[[j, r]] * own[[j, r]];
+                    coupling += moves[[j, r]] * cross[[j, r]];
+                }
+                total += c * (0.5 * quadratic - coupling);
+            }
+        }
+        Ok(total)
+    }
+
     /// The MLPs' output maps whose surviving columns a proposal moves (indices into
     /// `Explanation::trainable`).
     #[must_use]
