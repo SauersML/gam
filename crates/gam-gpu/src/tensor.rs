@@ -2093,6 +2093,34 @@ impl Device {
         }
     }
 
+    /// Each mean `μ` rounded to the nearest multiple of `2^⌊log2 σ⌋`, `σ = exp(s)`, into `out` (a
+    /// removed entry, `s = −∞`, keeps its mean): the posterior mean to the precision the posterior
+    /// resolves (`library_mdl::Posterior::rounded`). Formed in float64 from the stored values on
+    /// CUDA and the host (the step a power of two, so the result is exact in the storage); in f32
+    /// on the Apple GPU.
+    pub fn round_to_deviation(&self, out: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor)) -> Result<(), GpuError> {
+        same(out, mean, "rounded mean")?;
+        same(out, log_sd, "rounded mean's log standard deviation")?;
+        match &*self.backend {
+            Backend::Host => {
+                let (mv, sv) = (host(mean)?, host(log_sd)?);
+                for (i, t) in host_mut(out)?.iter_mut().enumerate() {
+                    *t = if sv[i].is_finite() {
+                        let step = (sv[i] / std::f64::consts::LN_2).floor().exp2();
+                        (mv[i] / step).round() * step
+                    } else {
+                        mv[i]
+                    };
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.round_to_deviation(out, (mean, log_sd)),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.round_to_deviation(out, (mean, log_sd)),
+        }
+    }
+
     pub fn reparameterize(&self, theta: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {
         same(theta, mean, "reparameterized mean")?;
         same(theta, log_sd, "reparameterized log standard deviation")?;
@@ -3708,6 +3736,28 @@ __device__ double entry_sqrt(double x) { return sqrt(x); }
 template <typename T>
 __device__ void reparameterize_body(u64 n, u64 key, u64 stream, const T* mean, const T* log_sd, T* theta) {
     GRID_STRIDE(i, n) theta[i] = mean[i] + entry_exp(log_sd[i]) * (T)posterior_normal(key, stream, i);
+}
+
+// `Device::round_to_deviation`, in float64 whatever the storage: the step is an exact power of
+// two (ldexp), and the rounded value is held exactly in the storage of the mean it rounds.
+template <typename T>
+__device__ void round_to_deviation_body(u64 n, const T* mean, const T* log_sd, T* out) {
+    GRID_STRIDE(i, n) {
+        double mu = (double)mean[i], s = (double)log_sd[i];
+        if (isfinite(s)) {
+            double step = ldexp(1.0, (int)floor(s / 0.6931471805599453));
+            mu = round(mu / step) * step;
+        }
+        out[i] = (T)mu;
+    }
+}
+
+extern "C" __global__ void round_to_deviation_f64(u64 n, const double* mean, const double* log_sd, double* out) {
+    round_to_deviation_body<double>(n, mean, log_sd, out);
+}
+
+extern "C" __global__ void round_to_deviation_f32(u64 n, const float* mean, const float* log_sd, float* out) {
+    round_to_deviation_body<float>(n, mean, log_sd, out);
 }
 
 extern "C" __global__ void reparameterize_f64(u64 n, u64 key, u64 stream, const double* mean, const double* log_sd, double* theta) {
@@ -5632,6 +5682,15 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
             }
         }
 
+        pub(super) fn round_to_deviation(&self, out: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor)) -> Result<(), GpuError> {
+            let (n, storage) = (out.len() as u64, out.storage());
+            let f = self.posterior_kernel("round_to_deviation", storage)?;
+            // SAFETY: three equal-length buffers in one storage, checked by the caller and `input`.
+            unsafe { self.stream.launch_builder(&f).arg(&n).input(mean, storage)?.input(log_sd, storage)?.output(out, storage)?.launch(cfg_elements(n)) }
+                .gpu_ctx("tensor round_to_deviation")
+                .map(|_| ())
+        }
+
         pub(super) fn reparameterize(&self, theta: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {
             let n = theta.len() as u64;
             if let Data::CudaBf16(out) = &mut theta.data {
@@ -6629,6 +6688,18 @@ inline void column_add(device float* sums, uint g, float a, float b, float c) {
     }
 }
 
+// `Device::round_to_deviation` in f32.
+kernel void t_round_to_deviation(device const float* mean [[buffer(0)]], device const float* log_sd [[buffer(1)]], device float* rounded [[buffer(2)]],
+                                 constant Posterior& p [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.n) return;
+    float mu = mean[i], s = log_sd[i];
+    if (isfinite(s)) {
+        float step = ldexp(1.0f, int(floor(s / 0.6931471805599453f)));
+        mu = round(mu / step) * step;
+    }
+    rounded[i] = mu;
+}
+
 kernel void t_reparameterize(device const float* mean [[buffer(0)]], device const float* log_sd [[buffer(1)]], device float* theta [[buffer(2)]],
                              constant Posterior& p [[buffer(3)]], uint i [[thread_position_in_grid]]) {
     if (i < p.n) theta[i] = mean[i] + exp(log_sd[i]) * posterior_normal(p.key, p.stream, i);
@@ -6796,6 +6867,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
         "t_fill_entries",
         "t_adam",
         "t_softmax_stats",
+        "t_round_to_deviation",
         "t_reparameterize",
         "t_posterior_ivon",
         "t_group_moments",
@@ -7330,6 +7402,10 @@ kernel void t_attention_sums(device const float* out [[buffer(0)]], device const
             p.n = u32_of(map.rows * map.cols)?;
             (p.axis, p.cols, p.chunks) = (map.code(), u32_of(map.cols.max(1))?, u32_of(map.chunks())?);
             self.stream.dispatch(kernel, buffers, &p, spread(map.threads()))
+        }
+
+        pub(super) fn round_to_deviation(&self, out: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor)) -> Result<(), GpuError> {
+            self.posterior("t_round_to_deviation", &[whole(buffer(mean)?), whole(buffer(log_sd)?), whole(buffer(out)?)], out.len(), Posterior::default())
         }
 
         pub(super) fn reparameterize(&self, theta: &mut Tensor, (mean, log_sd): (&Tensor, &Tensor), (key, stream): (u64, u64)) -> Result<(), GpuError> {

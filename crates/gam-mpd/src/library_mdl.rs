@@ -1505,10 +1505,9 @@ fn held_out(
     let (mut clean, mut patched) = (vec![Mean::default(); blocks], vec![Mean::default(); blocks]);
     let (mut read, mut joint, mut sampled, mut adaptive) = (Mean::default(), Mean::default(), Mean::default(), Mean::default());
     let (mut at_mean, mut at_rounded) = (Mean::default(), Mean::default());
-    let rounded = posterior.rounded();
     let size = |e: &Experiment| e.explained.iter().filter(|x| **x).count();
     // Each batch's directions and `M`'s targets are made once; the mean, the sample and the rounded
-    // posterior are scored against them, and the rounded posterior goes to the device once.
+    // posterior (rounded on the device) are scored against them.
     let mut made = Vec::new();
     for (b, (draw, experiments)) in held_out_experiments(scorer, sequences, settings)?.into_iter().enumerate() {
         let batch = draw.batch(sequences)?;
@@ -1536,7 +1535,7 @@ fn held_out(
         }
         made.push((batch, experiments, design, targets));
     }
-    scorer.experiments.load(&rounded.mean)?;
+    device_posterior.rounded_into(scorer.experiments.explanation_mut())?;
     for (batch, experiments, design, targets) in &made {
         let evaluation = scorer.experiments.evaluate_resident(batch, experiments, design, targets, false)?;
         if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
@@ -3138,6 +3137,27 @@ mod tests {
                 let gap = a.iter().zip(b).fold(0.0_f64, |m, (x, y)| m.max((x - y).abs() / (1.0 + y.abs())));
                 assert!(gap < 1e-12, "the device step's {field} differs from the host step's by {gap}");
             }
+        }
+    }
+
+    #[test]
+    fn the_device_rounds_the_posterior_as_the_host_does() {
+        let (native, layers, _, _) = tiny("library_rounded", "gelu");
+        let explanation = explanation(&native, &layers).unwrap();
+        let mut posterior = Posterior::new(&explanation, 72).unwrap();
+        let mut rng = StdRng::seed_from_u64(5);
+        for log_sd in &mut posterior.log_sd {
+            log_sd.mapv_inplace(|s| s + 6.0 * (rng.random::<f64>() - 0.5));
+        }
+        posterior.remove(&[0]);
+        let device = Device::host();
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings()).unwrap();
+        device_posterior.rounded_into(scorer.experiments.explanation_mut()).unwrap();
+        let rounded = posterior.rounded();
+        for (i, op) in explanation.trainable.iter().enumerate() {
+            let held = device.download(scorer.experiments.explanation_mut().dense(*op).unwrap()).unwrap();
+            assert_eq!(held, rounded.mean[i], "operator {i}");
         }
     }
 

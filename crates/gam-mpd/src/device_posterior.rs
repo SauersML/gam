@@ -246,6 +246,19 @@ impl DevicePosterior {
         program.refresh_fused()
     }
 
+    /// Writes the rounded posterior means (each `μ` to the nearest multiple of `2^⌊log2 σ⌋`,
+    /// `Posterior::rounded`) into `program`'s trainable operators (rounded to its storage).
+    pub fn rounded_into(&self, program: &mut DeviceProgram) -> Result<(), String> {
+        for (i, &op) in self.operators.iter().enumerate() {
+            let mut rounded = self.fitting.empty(self.mean[i].rows(), self.mean[i].cols()).map_err(error)?;
+            self.fitting.round_to_deviation(&mut rounded, (&self.mean[i], &self.log_sd[i])).map_err(error)?;
+            let bf16 = program.dense(op).is_ok_and(|held| held.storage() == Storage::Bf16);
+            let value = if bf16 { self.fitting.bf16_copy(&rounded).map_err(error)? } else { rounded };
+            program.replace_dense_parameter(op, value)?;
+        }
+        program.refresh_fused()
+    }
+
     /// Writes the weight sample of `key` into `program`'s trainable operators (operator `i` in
     /// `Explanation::trainable` order draws stream `i`); in place where the program holds the
     /// operator in one role, replaced where it also holds a column copy (a bias).
