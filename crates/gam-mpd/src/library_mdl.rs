@@ -3133,6 +3133,7 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
     let (mut seconds, started) = ([0.0_f64; 5], Instant::now());
     let device = scorer.experiments.models().1.program.device().clone();
     let mut sums: BTreeMap<usize, Tensor> = BTreeMap::new();
+    let mut pending = Vec::new();
     for (b, draw) in draws.iter().enumerate() {
         let key = noise_seed(settings.seed, stream, b);
         let mut timed = Instant::now();
@@ -3154,7 +3155,7 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
         let evaluation = scorer.experiments.evaluate_labelled(&batch, &experiments, Some(&targets), true, Some(&uniforms))?;
         let factor = evaluation.factor.ok_or("no Gauss–Newton factor")?;
         lap(3, &mut timed);
-        posterior.add_removal((&evaluation.gradient, LN_2), &factor.gradient, key, &mut curvature)?;
+        posterior.add_removal((&evaluation.gradient, LN_2), &factor.gradient, key, &mut curvature, &mut pending)?;
         lap(4, &mut timed);
         for op in moved {
             let Some(g) = evaluation.gradient.get(op) else { continue };
@@ -3166,6 +3167,7 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
             }
         }
     }
+    posterior.read_removal(&mut pending, &mut curvature)?;
     for (op, sum) in &sums {
         curvature.gradient.insert(scorer.at(*op)?, device.download(sum).map_err(error)? * LN_2);
     }

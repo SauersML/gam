@@ -65,6 +65,10 @@ pub struct LineReport {
     pub slope: f64,
 }
 
+/// The batches whose removal sums wait on the device before they are read
+/// ([`DevicePosterior::add_removal`]): about 45 MB of sums on vpd4l's 29,184 groups.
+pub const REMOVAL_READS: usize = 64;
+
 fn error(e: impl std::fmt::Display) -> String {
     format!("device posterior: {e}")
 }
@@ -727,8 +731,10 @@ impl DevicePosterior {
     /// trainable operator by id, on the device), times `nats`, and `u` a draw of the Gauss–Newton
     /// factor at `θ`, per group `g_G · θ_G` and `u_G · θ_G` over the group's live entries,
     /// summed on the device and read as one row per group; an operator neither reaches adds
-    /// nothing.
-    pub fn add_removal(&self, (g, nats): (&BTreeMap<usize, Tensor>, f64), u: &BTreeMap<usize, Tensor>, key: u64, curvature: &mut Curvature) -> Result<(), String> {
+    /// nothing. The sums wait on the device in `pending` and are read [`REMOVAL_READS`] batches at
+    /// a time ([`DevicePosterior::read_removal`]), so the device sums one batch while the host
+    /// prepares the next.
+    pub fn add_removal(&self, (g, nats): (&BTreeMap<usize, Tensor>, f64), u: &BTreeMap<usize, Tensor>, key: u64, curvature: &mut Curvature, pending: &mut Vec<(Tensor, Tensor, f64)>) -> Result<(), String> {
         let groups = self.group_count();
         let (mut slopes, mut forms) = (self.wide.zeros(groups, 3).map_err(error)?, self.wide.zeros(groups, 3).map_err(error)?);
         for (i, op) in self.operators.iter().enumerate() {
@@ -744,9 +750,22 @@ impl DevicePosterior {
                 self.fitting.group_curvature((x, &theta, &self.log_sd[i]), &self.groups[i], sums).map_err(error)?;
             }
         }
-        let slope: Vec<f64> = self.wide.download(&slopes).map_err(error)?.column(1).iter().map(|s| nats * s).collect();
-        let dot: Vec<f64> = self.wide.download(&forms).map_err(error)?.column(1).to_vec();
-        curvature.add_batch(&slope, &dot)
+        pending.push((slopes, forms, nats));
+        if pending.len() >= REMOVAL_READS {
+            self.read_removal(pending, curvature)?;
+        }
+        Ok(())
+    }
+
+    /// The batches' sums waiting in `pending` ([`DevicePosterior::add_removal`]) read into
+    /// `curvature` in the order they were made.
+    pub fn read_removal(&self, pending: &mut Vec<(Tensor, Tensor, f64)>, curvature: &mut Curvature) -> Result<(), String> {
+        for (slopes, forms, nats) in pending.drain(..) {
+            let slope: Vec<f64> = self.wide.download(&slopes).map_err(error)?.column(1).iter().map(|s| nats * s).collect();
+            let dot: Vec<f64> = self.wide.download(&forms).map_err(error)?.column(1).to_vec();
+            curvature.add_batch(&slope, &dot)?;
+        }
+        Ok(())
     }
 
     /// Rows for `steps` steps' code lengths ([`DevicePosterior::code_length_into`]) of a posterior
