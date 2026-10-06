@@ -528,6 +528,8 @@ fn main() -> Result<(), String> {
                 deterministic: false,
                 line_search: false,
                 half_factor: false,
+                one_sample: false,
+                factorized: false,
                 epochs: None,
             };
             let base = library_mdl::explanation(&native, &layers)?;

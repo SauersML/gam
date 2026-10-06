@@ -1330,6 +1330,15 @@ pub struct Settings {
     /// precision, for half the factor pass. The A/B's outcome deletes this field.
     #[serde(default)]
     pub half_factor: bool,
+    /// The one-sample arm: a training step scores all its experiments at the one weight sample of
+    /// its key, with no antithetic halves (`antithetic_step`, 24dd28d270). The A/B's outcome
+    /// deletes this field.
+    #[serde(default)]
+    pub one_sample: bool,
+    /// The factorized arm: the posterior's noise along each operator's own axes, with no rotation
+    /// (`rotations`, f80fd69565). The A/B's outcome deletes this field.
+    #[serde(default)]
+    pub factorized: bool,
     /// When set, the fit ends once its epoch count (counted from `M`, a start's epochs included)
     /// reaches this, with no removal round: a comparison of arms at one budget of steps.
     #[serde(default)]
@@ -1777,18 +1786,19 @@ fn noise_seed(seed: u64, epoch: usize, batch: usize) -> u64 {
 /// noise is `(H_A − H_B) σ ε` over the halves `A` and `B` rather than `(H_A + H_B) σ ε`, which
 /// cancels within the step, where IVON's noise filter measures what remains. The products are one
 /// scoring's of the whole batch. A batch of one base is scored at the sample of `key` alone. With
-/// `half_factor` (`Settings::half_factor`) the factor is the first half's alone.
+/// `half_factor` (`Settings::half_factor`) the factor is the first half's alone; with `one_sample`
+/// (`Settings::one_sample`) every experiment is scored at the sample of `key`.
 /// Returns the experiments in the order of their bits.
 fn antithetic_step(
     scorer: &mut Scorer,
     (device, device_posterior): (&Device, &DevicePosterior),
     batch: &Batch,
     experiments: Vec<Experiment>,
-    (key, half_factor): (u64, bool),
+    (key, half_factor, one_sample): (u64, bool, bool),
 ) -> Result<(Vec<Experiment>, Vec<Vec<f64>>, BTreeMap<usize, Tensor>, interchange::Factor), String> {
     let half = batch.base.len() / 2;
     let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.into_iter().partition(|e| e.base < half);
-    if first.is_empty() || second.is_empty() {
+    if one_sample || first.is_empty() || second.is_empty() {
         let all: Vec<Experiment> = first.into_iter().chain(second).collect();
         let (bits, gradients, factor) = scorer.score_device(device_posterior, batch, &all, Some(key), (true, true))?;
         return Ok((all, bits, gradients, factor.ok_or("no Gauss–Newton factor")?));
@@ -2864,7 +2874,7 @@ pub fn fit_from(
         let timed = Instant::now();
         // A prior term prices entries one by one along their own axes, and re-chooses the operators
         // it reads every epoch (`PriorTerm::epoch`): a fit with one keeps the factorized posterior.
-        posterior.rotations = if prior.is_some() { vec![None; posterior.mean.len()] } else { rotations(&mut scorer, explanation, &posterior, sequences, settings)? };
+        posterior.rotations = if prior.is_some() || settings.factorized { vec![None; posterior.mean.len()] } else { rotations(&mut scorer, explanation, &posterior, sequences, settings)? };
         let (layout, matrices) = rotation_layout(&posterior.rotations);
         progress.rotations = layout;
         progress.rotation_orders = matrices.iter().map(|m| m.nrows()).collect();
@@ -2960,7 +2970,7 @@ pub fn fit_from(
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
             let key = noise_seed(settings.seed, epoch + 1, b);
-            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, (key, settings.half_factor))?;
+            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, (key, settings.half_factor, settings.one_sample))?;
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
@@ -3850,6 +3860,8 @@ mod tests {
             deterministic: false,
             line_search: false,
             half_factor: false,
+            one_sample: false,
+            factorized: false,
             epochs: None,
         }
     }
