@@ -1076,7 +1076,7 @@ WS=/workspace/runs/$NAME
 # measured (SSH_UP, at least ten pods) plus the median, the wait a replacement pod typically costs;
 # 300 s until ten are measured. 107 pods answered in 8-56 s (median 26 s); the six that took longer
 # never answered, and each held a paid GPU for 300 s.
-SSH_UP=$RP/ssh_up.tsv BAD_IPS=$RP/bad_ips
+SSH_UP=$RP/ssh_up.tsv
 ssh_wait() {
     cut -f3 "$SSH_UP" 2> /dev/null | sort -n | awk '{ a[NR] = $1 } END { print (NR >= 10 ? a[NR] + a[int((NR + 1) / 2)] : 300) }'
 }
@@ -1098,7 +1098,7 @@ ssh_wait() {
 AUTO=0
 rank_auto() {
     local stats
-    stats=$(awk -F'\t' 'NR > 1 && $10 != "ended" && $10 != "" && $10 != "discarded" && $11 != "host failed before" && $11 != "data center failed before" {
+    stats=$(awk -F'\t' 'NR > 1 && $10 != "ended" && $10 != "" && $10 != "discarded" && $11 != "host failed before" && $11 != "data center failed before" && $11 != "SSH address failed before" {
                 o = $4 "|" $5; c = $5; n[o]++; nc[c]++
                 if ($10 != "worked") { m[o]++; w[o] += $9; mc[c]++; wc[c] += $9 }
             }
@@ -1771,9 +1771,12 @@ trap 'exit 129' HUP
 attempt_end() {  # OUTCOME DETAIL [dc]
     [ -n "$POD" ] && [ -z "$ATTEMPT_DONE" ] && (( ! GUEST )) || return 0
     ATTEMPT_DONE=1
-    [ -f "$ATTEMPTS" ] || printf 'date\trun\tpod\tgpu\tcloud\thost\tdatacenter\tprice\tseconds\toutcome\tdetail\n' > "$ATTEMPTS"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$NAME" "$POD" "$ATTEMPT_GPU" "${ATTEMPT_KIND%%:*}" \
-        "${POD_HOST:--}" "${POD_DC:--}" "${PRICE:--}" "$(( $(date +%s) - ${CREATED:-$(date +%s)} ))" "$1" "${2:-}" >> "$ATTEMPTS"
+    [ -f "$ATTEMPTS" ] || printf 'date\trun\tpod\tgpu\tcloud\thost\tdatacenter\tprice\tseconds\toutcome\tdetail\taddress\n' > "$ATTEMPTS"
+    # The pod's public SSH address (column 12, "-" when none appeared), which unit_risk weighs like
+    # its host and data center; rows written before it have eleven columns.
+    head -n 1 "$ATTEMPTS" | grep -q $'\taddress$' || sed -i '' '1s/$/\taddress/' "$ATTEMPTS"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$NAME" "$POD" "$ATTEMPT_GPU" "${ATTEMPT_KIND%%:*}" \
+        "${POD_HOST:--}" "${POD_DC:--}" "${PRICE:--}" "$(( $(date +%s) - ${CREATED:-$(date +%s)} ))" "$1" "${2:-}" "${IP:--}" >> "$ATTEMPTS"
 }
 
 # The offer tried after KIND|GPU in OFFERS that this launch has not spent, as KIND|PRICE|GPU, or
@@ -1800,29 +1803,32 @@ next_offer() {  # KIND GPU
 # statistics. One failure in a data center with successes no longer bans it (12:19 10-06: one
 # missing SSH address put CA-MTL-1, 4 successes before, on a permanent list and 10 pods were
 # rejected). Prints the reason to discard the pod, or nothing (the last offer is always kept).
-unit_risk() {  # HOST DC KIND PRICE GPU
+unit_risk() {  # HOST DC KIND PRICE GPU [ADDRESS]
     local next c cn
     next=$(next_offer "$3" "$5")
     [ -n "$next" ] || return 0
     c=$(awk -F'|' -v o="$3|$5" '$1 "|" $2 == o && $3 != "-" { print $3 }' <<< "${OFFER_PER:-}")
     cn=$(awk -F'|' -v o="$(cut -d'|' -f1,3 <<< "$next")" '$1 "|" $2 == o && $3 != "-" { print $3 }' <<< "${OFFER_PER:-}")
     [ -n "$c" ] && [ -n "$cn" ] || { c=$4; cn=$(cut -d'|' -f2 <<< "$next"); }
-    awk -F'\t' -v h="$1" -v d="$2" -v cl="${3%%:*}" -v c="$c" -v cn="$cn" -v nx="$next" -v w0="$(ssh_wait)" -v L="$CAP_SECONDS" '
-        NR > 1 && $10 != "" && $10 != "ended" && $10 != "discarded" && $11 != "host failed before" && $11 != "data center failed before" {
+    awk -F'\t' -v h="$1" -v d="$2" -v a="${6:-}" -v cl="${3%%:*}" -v c="$c" -v cn="$cn" -v nx="$next" -v w0="$(ssh_wait)" -v L="$CAP_SECONDS" '
+        NR > 1 && $10 != "" && $10 != "ended" && $10 != "discarded" && $11 != "host failed before" && $11 != "data center failed before" && $11 != "SSH address failed before" {
             fail = ($10 != "worked"); N[$5]++; M[$5] += fail; U[$5] += fail * $9
             if (h != "" && $6 == h) { nh++; mh += fail; wh += fail * $9 }
             if (d != "" && d != "-" && $7 == d) { nd++; md += fail; wd += fail * $9 }
+            if (a != "" && a != "-" && $12 == a) { na++; ma += fail; wa += fail * $9 }
             o = $4 "|" $5; no[o]++; mo[o] += fail; wo[o] += fail * $9
         }
         END {
             F = (M[cl] + 1) / (N[cl] + 2); V = (U[cl] + w0) / (M[cl] + 1)
             fh = (mh + 2 * F) / (nh + 2); fd = (md + 2 * F) / (nd + 2)
+            fa = (ma + 2 * F) / (na + 2)
             if (fh >= fd) { f = fh; W = (wh + V) / (mh + 1) } else { f = fd; W = (wd + V) / (md + 1) }
+            if (fa > f) { f = fa; W = (wa + V) / (ma + 1) }
             split(nx, q, "|"); k = q[1]; sub(/:.*/, "", k); on = q[3] "|" k
             Fn = (M[k] + 1) / (N[k] + 2); Vn = (U[k] + w0) / (M[k] + 1)
             fn = (mo[on] + 2 * Fn) / (no[on] + 2); Wn = (wo[on] + Vn) / (mo[on] + 1)
             this = c * (1 + f / (1 - f) * W / L); other = cn * (1 + fn / (1 - fn) * Wn / L)
-            if (this > other) printf "failure probability %.2f (host %d of %d attempts failed, data center %d of %d) makes it cost %.4f against %.4f for the next offer, %s %s", f, mh, nh, md, nd, this, other, q[3], q[1]
+            if (this > other) printf "failure probability %.2f (host %d of %d attempts failed, data center %d of %d, address %d of %d) makes it cost %.4f against %.4f for the next offer, %s %s", f, mh, nh, md, nd, ma, na, this, other, q[3], q[1]
         }' "$ATTEMPTS"
 }
 
@@ -1890,17 +1896,18 @@ reach() {
         # Every 2 s: the address appears 8-56 s after creation, and each second waited is paid.
         [ -n "$IP" ] || sleep 2
     done
-    # An address whose pods never answered SSH (two hosts behind 80.15.7.37 each held a GPU for
-    # 300 s) is left at once.
-    if grep -qxF "$IP" "$BAD_IPS" 2> /dev/null; then
-        say "SSH address $IP never answered before"
-        REACH_WHY="SSH address failed before" REACH_DC=""
+    # An address whose pods failed before (two hosts behind 80.15.7.37 each held a GPU for 300 s
+    # without answering SSH) is left when its record in ATTEMPTS makes the pod cost more per token
+    # in expectation than the next offer (unit_risk, with the address), never for one failure.
+    local risk
+    if risk=$(unit_risk "${POD_HOST:-}" "${POD_DC:-}" "$ATTEMPT_KIND" "$PRICE" "$ATTEMPT_GPU" "$IP") && [ -n "$risk" ]; then
+        say "SSH address $IP: $risk"
+        REACH_WHY="riskier than the next offer: $risk" REACH_DC=""
         return 1
     fi
     until on_pod true < /dev/null 2> /dev/null; do
         if (( $(date +%s) - CREATED >= limit )); then
-            echo "$IP" >> "$BAD_IPS"
-            say "SSH to $IP:$PORT not answering after $limit s (the slowest pod measured plus the median); $IP recorded"
+            say "SSH to $IP:$PORT not answering after $limit s (the slowest pod measured plus the median)"
             REACH_WHY="SSH not answering" REACH_DC=dc
             return 1
         fi
@@ -2168,6 +2175,8 @@ launch() {
         elif ! reach; then
             say "host $host failed to come up; deleting pod $POD"
             why=("setup failed" "${REACH_WHY:-no SSH}" $REACH_DC)
+            # Left by unit_risk's choice, not a failure of the pod.
+            [[ ${REACH_WHY:-} != "riskier than the next offer"* ]] || why=("discarded" "$REACH_WHY")
         elif ! own_timer; then
             say "the pod's own cap is not armed; deleting pod $POD"
             why=("setup failed" "own cap not armed")
@@ -2198,7 +2207,7 @@ launch() {
         reap "$POD" || exit 1
         POD="" IP="" PORT=""
         case ${why[1]} in
-            "riskier than the next offer"*|"host slow before"|"SSH address failed before") spent[$kind|$gpu]=1 ;;
+            "riskier than the next offer"*|"host slow before") spent[$kind|$gpu]=1 ;;
             *)  DISCARDED=$(( ${DISCARDED:-0} + 1 ))
                 (( DISCARDED <= DISCARDS )) || { say "$DISCARDS pods discarded on failing hosts; giving up"; exit 1; } ;;
         esac
