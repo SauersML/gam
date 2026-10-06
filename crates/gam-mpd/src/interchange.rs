@@ -603,7 +603,47 @@ fn call_rule(program: &OperatorProgram, outer: &[usize], node: usize) -> Option<
 /// whose patched entries take the source row's (both rows of the call), with the 0/1 masks of the
 /// node's columns that keep the base's entries and that take the source's.
 pub struct Edits {
-    nodes: BTreeMap<usize, Vec<(usize, usize, Tensor, Tensor)>>,
+    nodes: BTreeMap<usize, Patches>,
+}
+
+/// One node's patches ([`Edits`]) in the order of their (patched row, source row): the patched
+/// rows, the source rows, and one row per patch of the 0/1 masks of the node's columns that keep
+/// the patched row's entries and that take the source's.
+struct Patches {
+    rows: Vec<usize>,
+    sources: Vec<usize>,
+    keep: Tensor,
+    take: Tensor,
+}
+
+/// The positions of `rows` split into rounds of distinct rows, in order: the `k`-th occurrence of
+/// a row is in round `k`, so writing (or adding to) each round's rows at once does what writing
+/// them one at a time in order does.
+fn rounds(rows: &[usize]) -> Vec<Vec<usize>> {
+    let mut seen: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let k = seen.entry(*row).or_insert(0);
+        if out.len() <= *k {
+            out.push(Vec::new());
+        }
+        out[*k].push(i);
+        *k += 1;
+    }
+    out
+}
+
+/// One-row ranges at `rows`.
+fn single(rows: impl IntoIterator<Item = usize>) -> Vec<Range<usize>> {
+    rows.into_iter().map(|r| r..r + 1).collect()
+}
+
+/// The rows `round` of `t`, or `None` when the round is every row of `t` in order (`t` itself).
+fn picked(d: &Device, t: &Tensor, round: &[usize]) -> Result<Option<Tensor>, String> {
+    if round.len() == t.rows() && round.iter().enumerate().all(|(i, r)| i == *r) {
+        return Ok(None);
+    }
+    Ok(Some(d.gather_ranges(t, &single(round.iter().copied())).map_err(error)?))
 }
 
 impl Edits {
@@ -619,11 +659,19 @@ impl Edits {
                 }
             }
         }
-        let mut nodes: BTreeMap<usize, Vec<(usize, usize, Tensor, Tensor)>> = BTreeMap::new();
+        let mut grouped: BTreeMap<usize, (Vec<usize>, Vec<usize>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
         for ((node, row, source), take) in masks {
-            let keep = take.iter().map(|m| 1.0 - m).collect();
-            let (keep, take) = (d.upload_vec(1, take.len(), keep).map_err(error)?, d.upload_vec(1, take.len(), take).map_err(error)?);
-            nodes.entry(node).or_default().push((row, source, keep, take));
+            let entry = grouped.entry(node).or_default();
+            entry.0.push(row);
+            entry.1.push(source);
+            entry.2.extend(take.iter().map(|m| 1.0 - m));
+            entry.3.extend(take);
+        }
+        let mut nodes = BTreeMap::new();
+        for (node, (rows, sources, keep, take)) in grouped {
+            let width = keep.len() / rows.len();
+            let (keep, take) = (d.upload_vec(rows.len(), width, keep).map_err(error)?, d.upload_vec(rows.len(), width, take).map_err(error)?);
+            nodes.insert(node, Patches { rows, sources, keep, take });
         }
         Ok(Self { nodes })
     }
@@ -635,38 +683,44 @@ impl Edits {
 
     /// Node `node`'s value `value` (the call's rows in order) with each patched row's patched
     /// entries replaced by its source row's: `h ⊙ (1 − m) + s ⊙ m`, both products exact, every
-    /// source row read before any row is written.
+    /// source row read before any row is written, the patches applied as one at a time in order
+    /// (a patched row repeated takes its later patches on top of its earlier ones), each round of
+    /// distinct patched rows at once.
     pub fn apply(&self, d: &Device, node: usize, value: &mut Tensor) -> Result<(), String> {
-        let Some(patches) = self.nodes.get(&node) else { return Ok(()) };
-        let sources = patches.iter().map(|(_, s, _, _)| d.rows_of(value, *s, 1).map_err(error)).collect::<Result<Vec<_>, _>>()?;
-        for ((row, _, keep, take), s) in patches.iter().zip(&sources) {
-            let h = d.rows_of(value, *row, 1).map_err(error)?;
-            let mut out = d.zeros(1, value.cols()).map_err(error)?;
-            d.scale_columns(&mut out, &h, keep, false).map_err(error)?;
-            d.scale_columns(&mut out, s, take, true).map_err(error)?;
-            d.set_rows(value, *row, &out).map_err(error)?;
+        let Some(p) = self.nodes.get(&node) else { return Ok(()) };
+        let sources = d.gather_ranges(value, &single(p.sources.iter().copied())).map_err(error)?;
+        for round in rounds(&p.rows) {
+            let rows = single(round.iter().map(|i| p.rows[*i]));
+            let h = d.gather_ranges(value, &rows).map_err(error)?;
+            let (keep, take, from) = (picked(d, &p.keep, &round)?, picked(d, &p.take, &round)?, picked(d, &sources, &round)?);
+            let mut out = d.empty(round.len(), value.cols()).map_err(error)?;
+            d.hadamard(&mut out, &h, keep.as_ref().unwrap_or(&p.keep), false).map_err(error)?;
+            d.hadamard(&mut out, from.as_ref().unwrap_or(&sources), take.as_ref().unwrap_or(&p.take), true).map_err(error)?;
+            d.scatter_ranges(value, &rows, &out).map_err(error)?;
         }
         Ok(())
     }
 
     /// The transpose of [`Edits::apply`] on node `node`'s cotangent `g`: each patched row keeps
-    /// `ḡ ⊙ (1 − m)` and its source row receives `ḡ ⊙ m`.
+    /// `ḡ ⊙ (1 − m)` and its source row receives `ḡ ⊙ m`, every patched row read before any row
+    /// is written and the sources' shares added in order, each round of distinct rows at once.
     pub fn transpose(&self, d: &Device, node: usize, g: &mut Tensor) -> Result<(), String> {
-        let Some(patches) = self.nodes.get(&node) else { return Ok(()) };
-        let rows = patches.iter().map(|(r, _, _, _)| d.rows_of(g, *r, 1).map_err(error)).collect::<Result<Vec<_>, _>>()?;
-        let mut parts = Vec::with_capacity(patches.len());
-        for ((row, source, keep, take), gr) in patches.iter().zip(&rows) {
-            let mut base = d.zeros(1, g.cols()).map_err(error)?;
-            d.scale_columns(&mut base, gr, keep, false).map_err(error)?;
-            d.set_rows(g, *row, &base).map_err(error)?;
-            let mut part = d.zeros(1, g.cols()).map_err(error)?;
-            d.scale_columns(&mut part, gr, take, false).map_err(error)?;
-            parts.push((*source, part));
+        let Some(p) = self.nodes.get(&node) else { return Ok(()) };
+        let read = d.gather_ranges(g, &single(p.rows.iter().copied())).map_err(error)?;
+        let mut base = d.empty(p.rows.len(), g.cols()).map_err(error)?;
+        d.hadamard(&mut base, &read, &p.keep, false).map_err(error)?;
+        let mut part = d.empty(p.rows.len(), g.cols()).map_err(error)?;
+        d.hadamard(&mut part, &read, &p.take, false).map_err(error)?;
+        for round in rounds(&p.rows) {
+            let written = picked(d, &base, &round)?;
+            d.scatter_ranges(g, &single(round.iter().map(|i| p.rows[*i])), written.as_ref().unwrap_or(&base)).map_err(error)?;
         }
-        for (source, part) in parts {
-            let mut total = d.rows_of(g, source, 1).map_err(error)?;
-            d.axpy(&mut total, 1.0, &part).map_err(error)?;
-            d.set_rows(g, source, &total).map_err(error)?;
+        for round in rounds(&p.sources) {
+            let sources = single(round.iter().map(|i| p.sources[*i]));
+            let mut total = d.gather_ranges(g, &sources).map_err(error)?;
+            let added = picked(d, &part, &round)?;
+            d.axpy(&mut total, 1.0, added.as_ref().unwrap_or(&part)).map_err(error)?;
+            d.scatter_ranges(g, &sources, &total).map_err(error)?;
         }
         Ok(())
     }
@@ -1626,6 +1680,43 @@ mod tests {
         test_support::tiny_export,
     };
     use rand::{SeedableRng, rngs::StdRng};
+
+    /// Batched edits against one patch at a time, with a patched row repeated (2), a source
+    /// repeated (4) and a source that is also a patched row (2), on the host: equal bit for bit.
+    #[test]
+    fn batched_edits_do_what_one_patch_at_a_time_does() {
+        let d = Device::host();
+        let (rows, sources) = (vec![1, 2, 2, 3], vec![4, 0, 4, 2]);
+        let take = ndarray::array![[1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let keep = take.mapv(|m: f64| 1.0 - m);
+        let patches = Patches { rows: rows.clone(), sources: sources.clone(), keep: d.upload(keep.view()).unwrap(), take: d.upload(take.view()).unwrap() };
+        let edits = Edits { nodes: BTreeMap::from([(7, patches)]) };
+        let start = ndarray::Array2::from_shape_fn((6, 3), |(r, c)| 1.0 + r as f64 * 0.37 - c as f64 * 1.9);
+        // Applied one at a time, every source read first.
+        let mut applied = start.clone();
+        let read: Vec<_> = sources.iter().map(|s| start.row(*s).to_owned()).collect();
+        for (i, row) in rows.iter().enumerate() {
+            let next = &applied.row(*row) * &keep.row(i) + &read[i] * &take.row(i);
+            applied.row_mut(*row).assign(&next);
+        }
+        let mut value = d.upload(start.view()).unwrap();
+        edits.apply(&d, 7, &mut value).unwrap();
+        assert_eq!(d.download(&value).unwrap(), applied);
+        // The transpose one at a time: every patched row read first, then the sources' shares.
+        let mut transposed = start.clone();
+        let read: Vec<_> = rows.iter().map(|r| start.row(*r).to_owned()).collect();
+        for (i, row) in rows.iter().enumerate() {
+            transposed.row_mut(*row).assign(&(&read[i] * &keep.row(i)));
+        }
+        for (i, source) in sources.iter().enumerate() {
+            let next = &transposed.row(*source) + &(&read[i] * &take.row(i));
+            transposed.row_mut(*source).assign(&next);
+        }
+        let mut g = d.upload(start.view()).unwrap();
+        edits.transpose(&d, 7, &mut g).unwrap();
+        assert_eq!(d.download(&g).unwrap(), transposed);
+        assert_eq!(rounds(&[2, 1, 2, 2, 1]), vec![vec![0, 1], vec![2, 4], vec![3]]);
+    }
 
     /// Kept targets ([`Interchange::keep_targets`]) are the targets made by `M` bit for bit, and so
     /// is every score against them, on the host and on the accelerator when there is one; a budget
