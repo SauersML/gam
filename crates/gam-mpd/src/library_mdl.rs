@@ -86,8 +86,13 @@
 //! the step's forward pass, and `E[ĥ]` is that diagonal. The reparameterization estimate
 //! `g ε / σ` of the Hessian's diagonal carries every other weight's noise through the off-diagonal
 //! terms (on vpd4l, eight draws showed no signal). `h` is the estimates' average over the last
-//! epoch's batches (`β₂ = 1 − 1/B` for `B` training batches), starting from the
-//! unit-information curvature `1 / v_G`. Under the approximation `h ≥ 0`, and the approximated
+//! epoch's batches (`β₂ = 1 − 1/B` for `B` training batches), starting from the Laplace start
+//! (`laplace_start`): one pass over the collection at a weight sample of the unit-information
+//! posterior (`σ² = v_G / N`) draws every batch's factor, `h = Σ_b u_b ⊙ u_b / N`, and
+//! `σ² = 1 / (N h + 1 / v_G)`. From the unit-information curvature `1 / v_G` instead, `h` fell by
+//! one e-fold per epoch toward the measured curvature, and `F` by a fixed 1.87e7 bits per epoch
+//! for 10 epochs (vpd4l, `N = 2^16`; 17 epochs at `2^24`). Under the approximation `h ≥ 0`, and
+//! the approximated
 //! objective is stationary in `σ` at `σ = 1 / √(N (h + δ))`, `δ = 1 / (N v_G)` the group prior's
 //! precision per token, so `σ² ≤ v_G`. That stationary point is implicit (`h` is an expectation
 //! under `q`, and `v_G` depends on `σ`); setting `σ` from the running `h` and the current `v_G` at
@@ -2079,8 +2084,15 @@ pub fn fit(
         log::info!("library fit resumed at epoch {} from {}", progress.epoch, path.display());
     }
     let resumed_seconds = progress.seconds;
+    let fresh = resumed.is_none();
     let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, resumed.as_deref(), u64::try_from(progress.step).map_err(error)?)?;
     drop(resumed);
+    if fresh {
+        let timed = Instant::now();
+        let moments = laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens)?;
+        device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, Some(&moments), 0)?;
+        log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
+    }
     // The curvature estimate averages over one epoch's batches: each batch weighs about once.
     let ivon = Ivon { rate: settings.rate, beta1: settings.beta1, beta2: 1.0 - 1.0 / draws.len() as f64 };
     // Each group's size, whose `½ ln |G|` an active group's variance costs.
@@ -2285,6 +2297,48 @@ pub fn fit(
         },
         posterior,
     })
+}
+
+/// The Laplace start of a fresh fit. One pass over the training collection draws every batch's
+/// sampled-label factor `u_b` at a weight sample of the unit-information start, and
+/// `h = Σ_b u_b ⊙ u_b / N` (the batches' estimates `B / N · u_b ⊙ u_b`, averaged) estimates the
+/// Gauss–Newton diagonal per token. Each entry's deviation becomes `σ² = 1 / (N h + 1 / v_G)`, the
+/// minimum in `σ` of the data term's Gauss–Newton model `½ N h σ²` plus `KL(q ‖ p)`, instead of the
+/// epochs IVON's curvature average needs to fall from the start's `1 / v_G` to `h`. Returns IVON's
+/// state per operator: zero momentum, curvature `h`, zero second moment.
+fn laplace_start(
+    scorer: &mut Scorer,
+    posterior: &mut Posterior,
+    device_posterior: &DevicePosterior,
+    draws: &[Draw],
+    sequences: &[Vec<u32>],
+    settings: &Settings,
+    tokens: usize,
+) -> Result<Vec<[Array2<f64>; 3]>, String> {
+    let mut curvature: Vec<Array2<f64>> = posterior.mean.iter().map(|m| Array2::zeros(m.dim())).collect();
+    for (b, draw) in draws.iter().enumerate() {
+        let batch = draw.batch(sequences)?;
+        let experiments = scorer.experiments(draw, sequences)?;
+        scorer.prefetch(&draws[(b + 1) % draws.len()], sequences)?;
+        let (_, _, factor) = scorer.score_device(device_posterior, &batch, &experiments, Some(noise_seed(settings.seed, 0, b)), &format!("train_{b}"), true)?;
+        let device = scorer.experiments.models().1.program.device();
+        for (op, u) in &factor.ok_or("no Gauss–Newton factor")?.gradient {
+            let u = device.download(u).map_err(error)?;
+            curvature[scorer.at(*op)?].zip_mut_with(&u, |h, u| *h += u * u);
+        }
+    }
+    let variance: Vec<f64> = posterior.moments().iter().map(|m| if m.count > 0.0 { m.second / m.count } else { 0.0 }).collect();
+    let n = tokens as f64;
+    for (i, h) in curvature.iter_mut().enumerate() {
+        h.mapv_inplace(|square| square / n);
+        ndarray::Zip::from(&mut posterior.log_sd[i]).and(&*h).and(&posterior.membership[i]).for_each(|s, h, group| {
+            let v = variance[*group as usize];
+            if *s != f64::NEG_INFINITY && v > 0.0 {
+                *s = -0.5 * (n * h + 1.0 / v).ln();
+            }
+        });
+    }
+    Ok(curvature.into_iter().map(|h| [Array2::zeros(h.dim()), h.clone(), Array2::zeros(h.dim())]).collect())
 }
 
 /// The removal estimates' [`Curvature`]: one draw of the sampled-label gradient per training batch
