@@ -28,8 +28,9 @@
 //! `F`, the held-out evaluation, the removal comparisons) takes its data term and its description
 //! at that one `q`; only the steps' gradients and their data terms
 //! (`library_mdl::Epoch::data_bits`) are at samples around the iterate. The iterate's optimizer
-//! noise is not part of `q`: where the data's curvature is small, `σ² ≈ v_G`, and charging the iterate's random walk within `±σ` to `v_G = mean(μ² + σ²)` grew
-//! `v_G` without bound (vpd4l at `N = 2^16`: `Σ v_G` 356 → 1.4e4 over 12 epochs).
+//! noise is not part of `q`: where the data's curvature is small, `σ² ≈ v_G`, and charging the
+//! iterate's random walk within `±σ` to `v_G = mean(μ² + σ²)` grew `v_G` without bound (vpd4l at
+//! `N = 2^16`: `Σ v_G` 356 → 1.4e4 over 12 epochs).
 
 use crate::{
     device_program::DeviceProgram,
