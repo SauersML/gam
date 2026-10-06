@@ -205,12 +205,14 @@ extern "C" __global__ void scale_rows(u64 n, unsigned int cols, const float* fac
 }
 
 // Round to nearest even bfloat16 (the high 16 bits of the float); NaN stays a quiet NaN.
+__device__ unsigned short bf16_of(float x) {
+    unsigned int bits = __float_as_uint(x);
+    return (bits & 0x7fffffffu) > 0x7f800000u ? (unsigned short)((bits >> 16) | 0x40u)
+                                              : (unsigned short)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+
 extern "C" __global__ void to_bf16(u64 n, const float* x, unsigned short* y) {
-    GRID_STRIDE(i, n) {
-        unsigned int bits = __float_as_uint(x[i]);
-        y[i] = (bits & 0x7fffffffu) > 0x7f800000u ? (unsigned short)((bits >> 16) | 0x40u)
-                                                  : (unsigned short)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
-    }
+    GRID_STRIDE(i, n) y[i] = bf16_of(x[i]);
 }
 
 __device__ float law_value(unsigned int code, float t, float c) {
@@ -303,28 +305,48 @@ extern "C" __global__ void rotate_planes(unsigned int rows, unsigned int cols, u
 // and head-major order (row `(b·heads + h)·length + l` for row `b·length + l`): `merge` = 0 copies
 // row-major to head-major, 1 back. The first `2·planes` columns of each head turn by the tables
 // (`rows × planes`, pairing as `rotate_planes`, `sign` −1 backwards) on the way.
+// One value of `heads_permute` (`i` its entry in the head-major order) and its place in `out`.
+__device__ float permuted(u64 i, unsigned int cols, unsigned int start, unsigned int heads, unsigned int width, unsigned int length,
+                          unsigned int planes, int half_split, double sign, int merge, const float* x, const float* cosines, const float* sines, u64* to) {
+    unsigned int j = (unsigned int)(i % width);
+    u64 t = i / width;
+    unsigned int l = (unsigned int)(t % length);
+    t /= length;
+    unsigned int h = (unsigned int)(t % heads);
+    u64 r = (t / heads) * length + l;
+    u64 wide = r * cols + start + (u64)h * width, narrow = i - j;
+    const float* src = x + (merge ? narrow : wide);
+    float v = src[j];
+    if (j < 2 * planes) {
+        unsigned int p = half_split ? (j < planes ? j : j - planes) : j / 2;
+        int first = half_split ? j < planes : (j % 2) == 0;
+        unsigned int partner = half_split ? (first ? j + planes : j - planes) : (first ? j + 1 : j - 1);
+        float c = cosines[r * planes + p], s = (float)sign * sines[r * planes + p];
+        float o = src[partner];
+        v = first ? c * v - s * o : s * o + c * v;
+    }
+    *to = (merge ? wide : narrow) + j;
+    return v;
+}
+
+// `heads_permute`'s split (merge = 0) written in bfloat16 (`bf16_of`), for products that read it so.
+extern "C" __global__ void heads_permute_bf16(unsigned int rows, unsigned int cols, unsigned int start, unsigned int heads, unsigned int width,
+                                              unsigned int length, unsigned int planes, int half_split, double sign,
+                                              const float* x, const float* cosines, const float* sines, unsigned short* out) {
+    GRID_STRIDE(i, (u64)rows * heads * width) {
+        u64 to;
+        float v = permuted(i, cols, start, heads, width, length, planes, half_split, sign, 0, x, cosines, sines, &to);
+        out[to] = bf16_of(v);
+    }
+}
+
 extern "C" __global__ void heads_permute(unsigned int rows, unsigned int cols, unsigned int start, unsigned int heads, unsigned int width,
                                          unsigned int length, unsigned int planes, int half_split, double sign, int merge,
                                          const float* x, const float* cosines, const float* sines, float* out) {
     GRID_STRIDE(i, (u64)rows * heads * width) {
-        unsigned int j = (unsigned int)(i % width);
-        u64 t = i / width;
-        unsigned int l = (unsigned int)(t % length);
-        t /= length;
-        unsigned int h = (unsigned int)(t % heads);
-        u64 r = (t / heads) * length + l;
-        u64 wide = r * cols + start + (u64)h * width, narrow = i - j;
-        const float* src = x + (merge ? narrow : wide);
-        float v = src[j];
-        if (j < 2 * planes) {
-            unsigned int p = half_split ? (j < planes ? j : j - planes) : j / 2;
-            int first = half_split ? j < planes : (j % 2) == 0;
-            unsigned int partner = half_split ? (first ? j + planes : j - planes) : (first ? j + 1 : j - 1);
-            float c = cosines[r * planes + p], s = (float)sign * sines[r * planes + p];
-            float o = src[partner];
-            v = first ? c * v - s * o : s * o + c * v;
-        }
-        out[(merge ? wide : narrow) + j] = v;
+        u64 to;
+        float v = permuted(i, cols, start, heads, width, length, planes, half_split, sign, merge, x, cosines, sines, &to);
+        out[to] = v;
     }
 }
 
@@ -361,6 +383,19 @@ extern "C" __global__ void softmax_backward(unsigned int rows, unsigned int cols
     for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) partial += a[c] * dr[c];
     float mean = block_sum(partial, shared);
     for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) out[(u64)r * cols + c] = a[c] * (dr[c] - mean);
+}
+
+// `softmax_backward` written in bfloat16 (`bf16_of`), for products that read it so.
+extern "C" __global__ void softmax_backward_bf16(unsigned int rows, unsigned int cols, const float* alpha, const float* d, unsigned short* out) {
+    __shared__ float shared[WARPS];
+    unsigned int r = blockIdx.x;
+    if (r >= rows) return;
+    const float* a = alpha + (u64)r * cols;
+    const float* dr = d + (u64)r * cols;
+    float partial = 0.0f;
+    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) partial += a[c] * dr[c];
+    float mean = block_sum(partial, shared);
+    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) out[(u64)r * cols + c] = bf16_of(a[c] * (dr[c] - mean));
 }
 
 // Per row its probabilities in place and (log partition, Σ p log p) in double.

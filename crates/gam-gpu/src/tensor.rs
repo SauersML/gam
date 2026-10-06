@@ -1552,6 +1552,17 @@ impl Device {
         }
     }
 
+    /// [`Device::softmax_backward`] in bfloat16, each value the one [`Device::bf16_copy`] makes of
+    /// the f32 map, written so as it is computed (CUDA f32 storage; elsewhere the map and its copy).
+    pub fn softmax_backward_bf16(&self, alpha: &Tensor, d: &Tensor) -> Result<Tensor, GpuError> {
+        same(alpha, d, "softmax backward")?;
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if alpha.storage() == Storage::F32 => engine.softmax_backward_bf16(alpha, d),
+            _ => self.bf16_copy(&self.softmax_backward(alpha, d)?),
+        }
+    }
+
     /// Per row, `KL(softmax(target) ‖ softmax(logits))` and, in place of `logits`, its cotangent
     /// `q − p`; a row whose `scored` flag is zero has zero of both. Returns the KL per row.
     pub fn kl_rows(&self, target: &Tensor, logits: &mut Tensor, scored: Option<&Indices>) -> Result<Vec<f64>, GpuError> {
@@ -2307,6 +2318,29 @@ impl Device {
         let mut out = self.empty(rows * heads, width)?;
         self.heads(x, &mut out, (start, heads, width, rows / blocks), turn, inverse, false)?;
         Ok(out)
+    }
+
+    /// [`Device::split_heads`] in bfloat16, each value the one [`Device::bf16_copy`] makes of the f32
+    /// split, written so as it is computed (CUDA f32 storage; elsewhere the split and its copy).
+    pub fn split_heads_bf16(&self, x: &Tensor, start: usize, heads: usize, width: usize, blocks: usize, turn: Option<(&Tensor, &Tensor, bool)>, inverse: bool) -> Result<Tensor, GpuError> {
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if x.storage() == Storage::F32 => {
+                let rows = x.rows;
+                if blocks == 0 || rows % blocks != 0 || start.checked_add(heads.saturating_mul(width)).is_none_or(|end| end > x.cols) {
+                    return Err(shape(format!("{heads} heads of {width} from column {start} of {:?} in {blocks} blocks", x.dim())));
+                }
+                let planes = turn.map_or(0, |(cos, _, _)| cos.cols);
+                if let Some((cos, sin, _)) = turn {
+                    same(cos, sin, "rotation tables")?;
+                    if cos.rows != rows || 2 * planes > width {
+                        return Err(shape(format!("{:?} rotation tables on {rows} rows of {width}-wide heads", cos.dim())));
+                    }
+                }
+                engine.split_heads_bf16(x, (start, heads, width, rows / blocks, planes), turn, inverse)
+            }
+            _ => self.bf16_copy(&self.split_heads(x, start, heads, width, blocks, turn, inverse)?),
+        }
     }
 
     /// [`Device::split_heads`]' inverse: the head-major `x` (`blocks·heads·L × width`) written into
@@ -5720,6 +5754,56 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(&causal).arg(&start).arg(&period).output(scores, storage)?.launch(launch) }
                 .gpu_ctx("tensor softmax_rows")
                 .map(|_| ())
+        }
+
+        pub(super) fn softmax_backward_bf16(&self, alpha: &Tensor, d: &Tensor) -> Result<Tensor, GpuError> {
+            let mut out = self.unset16(alpha.rows, alpha.cols)?;
+            let (rows, cols) = (alpha.rows as u32, alpha.cols as u32);
+            let f = self.kernel("softmax_backward_bf16", Storage::F32)?;
+            let Data::CudaBf16(o) = &mut out.data else { return Err(shape("a bfloat16 output".to_string())) };
+            // SAFETY: one block per row of equal-shape f32 buffers and a bfloat16 output of their shape.
+            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&cols).input(alpha, Storage::F32)?.input(d, Storage::F32)?.arg(o).launch(cfg_rows(alpha.rows)) }
+                .gpu_ctx("tensor softmax_backward_bf16")?;
+            Ok(out)
+        }
+
+        /// [`super::Device::split_heads_bf16`]: `heads_permute`'s split written in bfloat16.
+        pub(super) fn split_heads_bf16(&self, x: &Tensor, (start, heads, width, length, planes): (usize, usize, usize, usize, usize), turn: Option<(&Tensor, &Tensor, bool)>, inverse: bool) -> Result<Tensor, GpuError> {
+            let rows = x.rows;
+            let mut out = self.unset16(rows * heads, width)?;
+            if rows == 0 || heads == 0 || width == 0 {
+                return Ok(out);
+            }
+            let n = (rows * heads * width) as u64;
+            let half_split = i32::from(turn.is_some_and(|(_, _, h)| h));
+            let (rows32, cols, start, heads, width, length, planes) = (rows as u32, x.cols as u32, start as u32, heads as u32, width as u32, length as u32, planes as u32);
+            let sign: f64 = if inverse { -1.0 } else { 1.0 };
+            // Without a rotation the tables are never read; `x` stands in for them.
+            let (cos, sin) = turn.map_or((x, x), |(c, s, _)| (c, s));
+            let f = self.kernel("heads_permute_bf16", Storage::F32)?;
+            let Data::CudaBf16(o) = &mut out.data else { return Err(shape("a bfloat16 output".to_string())) };
+            // SAFETY: shapes checked by the caller: `x` holds `rows × cols` f32 values, the tables
+            // `rows × planes` when `planes > 0`, and the output `rows·heads·width` halves.
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(&rows32)
+                    .arg(&cols)
+                    .arg(&start)
+                    .arg(&heads)
+                    .arg(&width)
+                    .arg(&length)
+                    .arg(&planes)
+                    .arg(&half_split)
+                    .arg(&sign)
+                    .input(x, Storage::F32)?
+                    .input(cos, Storage::F32)?
+                    .input(sin, Storage::F32)?
+                    .arg(o)
+                    .launch(cfg_elements(n))
+            }
+            .gpu_ctx("tensor split_heads_bf16")?;
+            Ok(out)
         }
 
         pub(super) fn softmax_backward(&self, alpha: &Tensor, d: &Tensor) -> Result<Tensor, GpuError> {

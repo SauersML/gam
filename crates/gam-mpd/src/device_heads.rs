@@ -350,13 +350,24 @@ fn step(heads: &Heads, blocks: usize, length: usize) -> usize {
 
 /// Key heads `first..first + n`'s queries and keys (from `qk`, queries then keys) and values (from
 /// `P`), head-major and turned.
-fn split(d: &Device, heads: &Heads, (qk, p): (&Tensor, &Tensor), (first, n): (usize, usize), blocks: usize, turn: Turn<'_>) -> Result<(Tensor, Tensor, Tensor), GpuError> {
+fn split(d: &Device, heads: &Heads, (qk, p): (&Tensor, &Tensor), (first, n): (usize, usize), blocks: usize, turn: Turn<'_>, values: Arithmetic) -> Result<(Tensor, Tensor, Tensor), GpuError> {
     let (w, g) = (heads.width, heads.group());
     Ok((
         d.split_heads(qk, first * g * w, n * g, w, blocks, turn, false)?,
         d.split_heads(qk, (heads.heads + first) * w, n, w, blocks, turn, false)?,
-        d.split_heads(p, (heads.heads + heads.keys + first) * w, n, w, blocks, None, false)?,
+        split_operand(d, p, ((heads.heads + heads.keys + first) * w, n, w, blocks), values)?,
     ))
+}
+
+/// Heads of `x` ([`Device::split_heads`], unturned) as the products of `arithmetic` read them: in
+/// bfloat16 an f32 split written rounded ([`Device::split_heads_bf16`]), the values each product
+/// would otherwise round it to.
+fn split_operand(d: &Device, x: &Tensor, (start, heads, width, blocks): (usize, usize, usize, usize), arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
+    if arithmetic == Arithmetic::Bf16 && x.storage() == Storage::F32 {
+        d.split_heads_bf16(x, start, heads, width, blocks, None, false)
+    } else {
+        d.split_heads(x, start, heads, width, blocks, None, false)
+    }
 }
 
 /// The weights `softmax(c q kᵀ)` of `batch` (sequence, key head) blocks.
@@ -409,7 +420,7 @@ fn attend_by(d: &Device, heads: &Heads, (qk, p): (&Tensor, &Tensor), blocks: usi
     let mut a = d.zeros(rows, heads.heads * heads.width)?;
     for first in (0..heads.keys).step_by(step) {
         let n = step.min(heads.keys - first);
-        let (q, k, v) = split(d, heads, (qk, p), (first, n), blocks, turn)?;
+        let (q, k, v) = split(d, heads, (qk, p), (first, n), blocks, turn, arithmetic)?;
         let alpha = weights(d, heads, (&q, &k), blocks * n, arithmetic)?;
         let mut out = d.empty(q.rows(), heads.width)?;
         d.gemm_batched(blocks * n, &mut out, 1.0, &alpha, Op::N, &v, Op::N, 0.0, arithmetic)?;
@@ -430,13 +441,6 @@ pub(crate) fn backward(
     arithmetic: (Arithmetic, Arithmetic),
 ) -> Result<Tensor, GpuError> {
     backward_by(d, (heads, stacked), (p, gained, g_a), blocks, turn, arithmetic, step(heads, blocks, p.rows() / blocks))
-}
-
-/// `t` as the products of `arithmetic` read it: in bfloat16 an f32 tensor rounded once, which each
-/// product reading it takes as it is (each would otherwise round it again, to the same values);
-/// otherwise `t` itself.
-fn operand(d: &Device, t: Tensor, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
-    if arithmetic == Arithmetic::Bf16 && t.storage() == Storage::F32 { d.bf16_copy(&t) } else { Ok(t) }
 }
 
 /// [`backward`], `step` key heads at a time.
@@ -462,14 +466,14 @@ fn backward_by(
     for first in (0..heads.keys).step_by(step) {
         let n = step.min(heads.keys - first);
         let batch = blocks * n;
-        let (q, k, v) = split(d, heads, (qk, p), (first, n), blocks, turn)?;
-        let cot = operand(d, d.split_heads(g_a, first * g * w, n * g, w, blocks, None, false)?, arithmetic)?;
+        let (q, k, v) = split(d, heads, (qk, p), (first, n), blocks, turn, arithmetic)?;
+        let cot = split_operand(d, g_a, (first * g * w, n * g, w, blocks), arithmetic)?;
         let alpha = weights(d, heads, (&q, &k), batch, forward)?;
         let mut dalpha = d.empty(alpha.rows(), alpha.cols())?;
         d.gemm_batched(batch, &mut dalpha, 1.0, &cot, Op::N, &v, Op::T, 0.0, arithmetic)?;
         let mut gv = d.empty(v.rows(), w)?;
         d.gemm_batched(batch, &mut gv, 1.0, &alpha, Op::T, &cot, Op::N, 0.0, arithmetic)?;
-        let ds = operand(d, d.softmax_backward(&alpha, &dalpha)?, arithmetic)?;
+        let ds = if arithmetic == Arithmetic::Bf16 && alpha.storage() == Storage::F32 { d.softmax_backward_bf16(&alpha, &dalpha)? } else { d.softmax_backward(&alpha, &dalpha)? };
         drop((alpha, dalpha));
         let mut gq = d.empty(q.rows(), w)?;
         d.gemm_batched(batch, &mut gq, heads.scale, &ds, Op::N, &k, Op::N, 0.0, arithmetic)?;

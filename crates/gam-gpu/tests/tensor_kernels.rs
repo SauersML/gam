@@ -188,6 +188,33 @@ fn row_moves_are_the_copies_and_axpys_they_replace() {
     }
 }
 
+/// `split_heads_bf16` and `softmax_backward_bf16` against the f32 operations and the `bf16_copy` of
+/// their results, bit for bit, with and without a rotation.
+fn bf16_outputs_match_their_copies(d: &Device) {
+    let (blocks, length, heads, width, planes) = (2, 5, 3, 8, 3);
+    let x = up(d, &matrix(blocks * length, heads * width + 4, 31, 2.0));
+    let (cos, sin) = (up(d, &matrix(blocks * length, planes, 32, 1.0)), up(d, &matrix(blocks * length, planes, 33, 1.0)));
+    for (what, turn) in [("unturned", None), ("interleaved", Some((&cos, &sin, false))), ("half split", Some((&cos, &sin, true)))] {
+        for inverse in [false, true] {
+            let split = d.split_heads_bf16(&x, 4, heads, width, blocks, turn, inverse).unwrap();
+            let expected = d.bf16_copy(&d.split_heads(&x, 4, heads, width, blocks, turn, inverse).unwrap()).unwrap();
+            assert_eq!(down(d, &split), down(d, &expected), "{} split {what}, inverse {inverse}", d.name());
+        }
+    }
+    let (alpha, cot) = (up(d, &matrix(7, 19, 34, 1.0)), up(d, &matrix(7, 19, 35, 3.0)));
+    let map = d.softmax_backward_bf16(&alpha, &cot).unwrap();
+    let expected = d.bf16_copy(&d.softmax_backward(&alpha, &cot).unwrap()).unwrap();
+    assert_eq!(down(d, &map), down(d, &expected), "{} softmax backward", d.name());
+}
+
+#[test]
+fn bfloat16_outputs_are_the_copies_of_the_f32_ones() {
+    bf16_outputs_match_their_copies(&Device::host());
+    if let Some(wide) = accelerator() {
+        bf16_outputs_match_their_copies(&wide.with_storage(gam_gpu::tensor::Storage::F32).expect("CUDA holds f32"));
+    }
+}
+
 #[test]
 fn a_drawn_head_sweep_draws_each_class_with_its_softmax_probability() {
     let (rows, classes, width) = (6000, 3940, 8);
