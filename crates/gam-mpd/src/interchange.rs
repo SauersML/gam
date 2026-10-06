@@ -45,6 +45,15 @@
 //! of the call it edits ([`Edits`]). The reverse pass runs the blocks backwards, the cotangents of
 //! the patched entries moving to the sources' rows.
 //!
+//! Attention is causal, so a patched or edited path's rows before its position `t₀` equal those of
+//! the path it forked from at every block both run alike (the same hybrid, no edit of the other):
+//! a lane holding such a path is a suffix lane (`Lane::prefix`). At an MLP block (odd), whose rules
+//! act on each row alone, its call takes only its rows from `t₀` on, as one-row sequences at their
+//! positions, and its rows before `t₀` are copied from that path's lane after the block; the
+//! reverse pass adds their cotangents to that lane's rows before the block's reverse, through which
+//! they reach the parameters as the copied rows' own computation would. An attention block takes
+//! the whole lane, its rows before `t₀` serving as keys and values of the later ones.
+//!
 //! A block's reverse needs its forward's tape (the block's intermediate values), which holds many
 //! times the rows of the stream entering it. A call keeps its tape while the tapes kept so far,
 //! with room for the reverse passes' gradients, the cotangents and one block run again, fit in the
@@ -1490,6 +1499,26 @@ fn family(tokens: &[&[u32]]) -> FamilyInputs {
     FamilyInputs { rows: ids.len(), slots: vec![SlotValues::Tokens(ids)], layout: Some(SequenceLayout { sequence, position }) }
 }
 
+/// The family of a call's rows: whole sequences, or where a range holds a sequence's rows from a
+/// position on (a suffix lane at an MLP block, [`Plan::range`]), every row its own sequence at its
+/// position (an MLP block's rules act on each row alone, `Node::Select` reads the position).
+fn ranges_family(block: usize, ranges: &[Range<usize>], tokens: &[&[u32]]) -> Result<FamilyInputs, String> {
+    if ranges.iter().zip(tokens).all(|(r, t)| r.len() == t.len()) {
+        return Ok(family(tokens));
+    }
+    if block % 2 == 0 {
+        return Err(error("an attention block's call over part of a sequence"));
+    }
+    let rows: usize = ranges.iter().map(ExactSizeIterator::len).sum();
+    let (mut ids, mut position) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
+    for (r, t) in ranges.iter().zip(tokens) {
+        let start = t.len().checked_sub(r.len()).ok_or_else(|| error("a range longer than its sequence"))?;
+        ids.extend_from_slice(&t[start..]);
+        position.extend(start as u32..t.len() as u32);
+    }
+    Ok(FamilyInputs { rows, slots: vec![SlotValues::Tokens(ids)], layout: Some(SequenceLayout { sequence: (0..rows as u32).collect(), position }) })
+}
+
 /// The reference engine: the model's resident-value program, one block a span
 /// ([`DeviceProgram::forward_span`], [`DeviceProgram::vjp_values_dense_edited`]) on the call's rows
 /// gathered into one tensor.
@@ -1543,7 +1572,7 @@ impl BlockEngine for Model<'_> {
             }
         };
         let end = self.end(block);
-        let trace = self.program.forward_span(&family(tokens), entry, end, edit)?;
+        let trace = self.program.forward_span(&ranges_family(block, ranges, tokens)?, entry, end, edit)?;
         scatter(d, stream, ranges, trace.value(end)?)?;
         Ok(keep.then_some(trace))
     }
@@ -1632,6 +1661,24 @@ impl<'t> Path<'t> {
     fn edited(&self, block: usize) -> Option<Edit> {
         self.edits.iter().find(|(b, _)| *b == block).map(|(_, edit)| *edit)
     }
+
+    /// Whether the path changes a row before `row` at `block`: a patch or a part's edit at its
+    /// position, an operation or a cut's read at its row (a cut's probe records a value and changes
+    /// none).
+    fn changes_before(&self, block: usize, row: usize) -> bool {
+        self.patched(block).is_some() && self.position < row
+            || self.edits.iter().filter(|(b, _)| *b == block).any(|(_, edit)| match edit {
+                Edit::Fixed { .. } => self.position < row,
+                Edit::Op { at, .. } | Edit::CutRead { at, .. } => *at < row,
+                Edit::Probe { .. } => false,
+                Edit::OpAt { .. } => true,
+            })
+    }
+
+    /// Whether the path changes no row at any block (a clean experiment's).
+    fn clean(&self) -> bool {
+        self.patch.is_none() && self.edits.is_empty()
+    }
 }
 
 /// One lane of rows in the stream buffer: the blocks `start..end` of path `path` (whose blocks
@@ -1642,6 +1689,9 @@ struct Lane {
     end: usize,
     parent: Option<usize>,
     rows: Range<usize>,
+    /// For a suffix lane (module note), the path whose rows before `t₀` it shares at every block it
+    /// runs, and `t₀` (its own path's position).
+    prefix: Option<(usize, usize)>,
 }
 
 /// The lanes of a set of paths, sharing prefixes: a path forks from a lane of the same sequence at
@@ -1659,8 +1709,10 @@ struct Plan<'t> {
 
 impl<'t> Plan<'t> {
     fn new(paths: Vec<Path<'t>>, length: usize) -> Self {
+        // The longest paths first; among them a clean path, then the later positions first, so a path
+        // forks from one whose rows before its position are its own (`Lane::prefix`).
         let mut order: Vec<usize> = (0..paths.len()).collect();
-        order.sort_by_key(|p| std::cmp::Reverse(paths[*p].end));
+        order.sort_by_key(|p| (std::cmp::Reverse(paths[*p].end), !paths[*p].clean(), std::cmp::Reverse(paths[*p].position)));
         let mut lanes: Vec<Lane> = Vec::new();
         let mut holder = vec![usize::MAX; paths.len()];
         for p in order {
@@ -1691,11 +1743,85 @@ impl<'t> Plan<'t> {
                     let start = parent.map_or(0, |(_, k)| k);
                     let rows = lanes.len() * length..(lanes.len() + 1) * length;
                     holder[p] = lanes.len();
-                    lanes.push(Lane { path: p, start, end: path.end, parent: parent.map(|(l, _)| l), rows });
+                    lanes.push(Lane { path: p, start, end: path.end, parent: parent.map(|(l, _)| l), rows, prefix: None });
                 }
             }
         }
+        // A forked lane shares its rows before its position with the path it forked from while
+        // both run the same hybrid and that path changes no row before that position (every edit
+        // acts from its path's position on); that path's lane at each block is an earlier lane.
+        for l in 0..lanes.len() {
+            let (lane, path) = (&lanes[l], &paths[lanes[l].path]);
+            let Some(parent) = lane.parent else { continue };
+            let (twin, t0) = (lanes[parent].path, path.position);
+            let other = &paths[twin];
+            let alike = (lane.start..lane.end).all(|b| other.explained[b] == path.explained[b] && !other.changes_before(b, t0));
+            if t0 > 0 && other.tokens == path.tokens && other.end >= lane.end && alike {
+                lanes[l].prefix = Some((twin, t0));
+            }
+        }
         Self { paths, lanes, holder, length, recorded: std::rc::Rc::new(RefCell::new(BTreeMap::new())) }
+    }
+
+    /// Lane `l`'s rows a call at `block` takes: from its position on for a suffix lane at an MLP
+    /// block (module note), else all.
+    fn range(&self, l: usize, block: usize) -> Range<usize> {
+        let lane = &self.lanes[l];
+        match lane.prefix {
+            Some((_, t0)) if block % 2 == 1 => lane.rows.start + t0..lane.rows.end,
+            _ => lane.rows.clone(),
+        }
+    }
+
+    /// The row of a call at `block` over `lanes` (each taking [`Plan::range`]) holding row `row` of
+    /// lane `l`'s sequence.
+    fn row_of(&self, block: usize, lanes: &[usize], l: usize, row: usize) -> Result<usize, String> {
+        let mut offset = 0;
+        for &x in lanes {
+            let range = self.range(x, block);
+            if x == l {
+                let first = range.start - self.lanes[x].rows.start;
+                if row < first || row >= self.length {
+                    return Err(error("a row before its lane's rows in a call"));
+                }
+                return Ok(offset + row - first);
+            }
+            offset += range.len();
+        }
+        Err(error("a lane outside its call"))
+    }
+
+    /// After block `block` (an MLP block), each suffix lane running it takes its rows before its
+    /// position from its twin path's lane, in lane order (a twin's own rows are complete first).
+    fn copy_prefixes(&self, d: &Device, stream: &mut Tensor, block: usize) -> Result<(), String> {
+        if block % 2 == 0 {
+            return Ok(());
+        }
+        for lane in self.lanes.iter().filter(|l| (l.start..l.end).contains(&block)) {
+            if let Some((twin, t0)) = lane.prefix {
+                let from = self.lanes[self.lane(twin, block)].rows.start;
+                d.copy_rows_within(stream, lane.rows.start, from, t0).map_err(error)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Before the reverse of a call at `block` (an MLP block) over `lanes`, each suffix lane's
+    /// cotangents of its rows before its position move to its twin's lane, the later lanes first
+    /// (a twin passes on what it received).
+    fn return_prefixes(&self, d: &Device, cotangent: &mut Tensor, block: usize, lanes: &[usize]) -> Result<(), String> {
+        if block % 2 == 0 {
+            return Ok(());
+        }
+        let mut suffix: Vec<usize> = lanes.iter().copied().filter(|l| self.lanes[*l].prefix.is_some()).collect();
+        suffix.sort_unstable();
+        for l in suffix.into_iter().rev() {
+            let Some((twin, t0)) = self.lanes[l].prefix else { continue };
+            let (at, to) = (self.lanes[l].rows.start, self.lanes[self.lane(twin, block)].rows.start);
+            d.axpy_rows_within(cotangent, to, 1.0, at, t0).map_err(error)?;
+            d.set_rows(cotangent, at, &d.zeros(t0, cotangent.cols()).map_err(error)?).map_err(error)?;
+        }
+        Ok(())
     }
 
     /// The lane holding path `p`'s rows at block `block`.
@@ -1710,13 +1836,12 @@ impl<'t> Plan<'t> {
     /// The patches applied at `block`, as rows of a call over `lanes` (in order): the patched row,
     /// the source's row, and the variables.
     fn patches(&self, block: usize, lanes: &[usize]) -> Result<Vec<(usize, usize, &'t [usize])>, String> {
-        let at = |l: usize| lanes.iter().position(|x| *x == l).map(|i| i * self.length);
         let mut out = Vec::new();
         for &l in lanes {
             let path = &self.paths[self.lanes[l].path];
             if let Some((variables, source)) = path.patched(block) {
-                let row = at(l).ok_or_else(|| error("a patched lane outside its call"))? + path.position;
-                let source = at(self.lane(source, block)).ok_or_else(|| error("a patch's source outside its call"))? + path.position;
+                let row = self.row_of(block, lanes, l, path.position)?;
+                let source = self.row_of(block, lanes, self.lane(source, block), path.position)?;
                 out.push((row, source, variables));
             }
         }
@@ -1727,7 +1852,7 @@ impl<'t> Plan<'t> {
     /// (in order): the edited row and the edit.
     fn writes(&self, block: usize, lanes: &[usize]) -> Result<Vec<(usize, Edit)>, String> {
         let mut out = Vec::new();
-        for (i, &l) in lanes.iter().enumerate() {
+        for &l in lanes {
             let path = &self.paths[self.lanes[l].path];
             for (_, edit) in path.edits.iter().filter(|(b, _)| *b == block) {
                 let at = match edit {
@@ -1737,17 +1862,14 @@ impl<'t> Plan<'t> {
                 let edit = match edit {
                     Edit::Op { site, operation, at, source } => {
                         let from = match operation {
-                            Operation::Swap => {
-                                let lane = self.lane(*source, block);
-                                lanes.iter().position(|x| *x == lane).ok_or_else(|| error("a swap's donor outside its call"))? * self.length + at
-                            }
-                            _ => i * self.length + at,
+                            Operation::Swap => self.row_of(block, lanes, self.lane(*source, block), *at)?,
+                            _ => self.row_of(block, lanes, l, *at)?,
                         };
                         Edit::OpAt { site: *site, operation: *operation, from }
                     }
                     other => *other,
                 };
-                out.push((i * self.length + at, edit));
+                out.push((self.row_of(block, lanes, l, at)?, edit));
             }
         }
         Ok(out)
@@ -1807,7 +1929,7 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
             if lanes.is_empty() {
                 continue;
             }
-            let ranges: Vec<Range<usize>> = lanes.iter().map(|l| plan.lanes[*l].rows.clone()).collect();
+            let ranges: Vec<Range<usize>> = lanes.iter().map(|l| plan.range(*l, b)).collect();
             let tokens: Vec<&[u32]> = lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
             let edits = edits(engines[side], plan, b, &lanes)?;
             let kept_here = match budget {
@@ -1831,6 +1953,7 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
             };
             calls.push(Call { block: b, side, lanes, edits, kept: kept_here });
         }
+        plan.copy_prefixes(d, &mut stream, b)?;
     }
     Ok((stream, calls))
 }
@@ -1869,7 +1992,7 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
     let width = passes.first().map(|p| p.cotangent.cols()).ok_or_else(|| error("a reverse pass of no cotangent"))?;
     for (index, call) in calls.iter().enumerate().rev() {
         let b = call.block;
-        let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.lanes[*l].rows.clone()).collect();
+        let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.range(*l, b)).collect();
         let recomputed;
         let tape = match call.kept.as_ref().ok_or_else(|| error("a call kept nothing for the reverse pass"))? {
             Kept::Tape(tape) => tape,
@@ -1893,6 +2016,7 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
             }
         };
         for pass in passes.iter_mut() {
+            plan.return_prefixes(d, &mut pass.cotangent, b, &call.lanes)?;
             engines[call.side].reverse(b, tape, &mut pass.cotangent, &ranges, call.edits.as_ref(), (&mut *pass.gradient, pass.arithmetic))?;
         }
         E::release(tape);
@@ -3235,12 +3359,14 @@ mod tests {
                 }
             }
             for call in calls.iter().filter(|c| c.block == b) {
-                let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.lanes[*l].rows.clone()).collect();
+                let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.range(*l, b)).collect();
                 let Some(Kept::Tape(tape)) = &call.kept else { panic!("a call kept no tape") };
                 let model = if call.side == 0 { &p } else { &m };
                 model.tangent(b, tape, &mut t, &ranges, call.edits.as_ref(), if call.side == 0 { &tangents } else { &none }).expect("the tangent");
             }
+            plan.copy_prefixes(&device, &mut t, b).expect("the prefixes");
         }
+        assert!(plan.lanes.iter().any(|l| l.prefix.is_some()), "some lane runs its MLP blocks from its position on");
         let projected: f64 = device.download(&t).expect("download").iter().zip(device.download(&seed).expect("download").iter()).map(|(a, b)| a * b).sum();
         assert!(projected.abs() > 1e-6, "the tangent reaches the scored rows: {projected}");
         assert!((projected - along).abs() <= 1e-10 * projected.abs().max(along.abs()), "tangent pass {projected}, reverse pass {along}");

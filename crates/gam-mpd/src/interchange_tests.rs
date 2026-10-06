@@ -616,9 +616,10 @@ impl BlockEngine for Counting<'_> {
 #[test]
 fn a_patched_experiment_reuses_its_base_below_the_patched_block() {
     // Base 0 clean under hybrid h runs blocks 0..4; its patched experiment (the same hybrid,
-    // patched at block 2) runs only blocks 2..4; a second clean experiment on base 0 under h runs
-    // nothing of its own; base 1 runs 0..4 and the source (another sequence) 0..3: 13 block runs of
-    // a sequence, against 19 without sharing. The scores equal the reference engine's.
+    // patched at block 2 at position 3) runs only blocks 2..4, its MLP block 3 on its rows from
+    // position 3 on (a suffix lane); a second clean experiment on base 0 under h runs nothing of
+    // its own; base 1 runs 0..4 and the source (another sequence) 0..3: 13 block runs of a
+    // sequence less 3 rows, against 19 without sharing. The scores equal the reference engine's.
     let f = fixture();
     let read = f.variables.iter().position(|v| v.block == 2).expect("an attention variable of layer 1");
     let hybrid = vec![true, false, true, true];
@@ -632,7 +633,7 @@ fn a_patched_experiment_reuses_its_base_below_the_patched_block() {
     let (cm, cp) = models(&f, &programs);
     let (cm, cp) = (Counting { model: cm, rows: std::cell::Cell::new(0), budget: usize::MAX }, Counting { model: cp, rows: std::cell::Cell::new(0), budget: usize::MAX });
     let counted = evaluate(&cm, &cp, &programs.head, &f.batch, &targets, &experiments, true).expect("evaluate");
-    assert_eq!(cm.rows.get() + cp.rows.get(), 13 * LENGTH);
+    assert_eq!(cm.rows.get() + cp.rows.get(), 13 * LENGTH - 3);
     assert_eq!(counted.bits, reference.bits);
     for (op, g) in &reference.gradient {
         assert_eq!(device.download(g).expect("gradient"), device.download(&counted.gradient[op]).expect("gradient"));
@@ -643,8 +644,9 @@ fn a_patched_experiment_reuses_its_base_below_the_patched_block() {
 fn blocks_run_again_in_the_reverse_pass_give_the_kept_tapes_gradient() {
     // The experiments of the sharing test (lanes forking at a patch, a source run to its patched
     // block): with no budget for tapes every call keeps only the rows entering it and runs its
-    // block again in the reverse pass, so the 13 block runs of a sequence run twice; the scores
-    // and the gradient equal those of the kept tapes bit for bit.
+    // block again in the reverse pass, so the 13 block runs of a sequence (less 3 rows of the
+    // patched lane's MLP block) run twice; the scores and the gradient equal those of the kept
+    // tapes bit for bit.
     let f = fixture();
     let read = f.variables.iter().position(|v| v.block == 2).expect("an attention variable of layer 1");
     let hybrid = vec![true, false, true, true];
@@ -658,7 +660,7 @@ fn blocks_run_again_in_the_reverse_pass_give_the_kept_tapes_gradient() {
     let (cm, cp) = models(&f, &programs);
     let (cm, cp) = (Counting { model: cm, rows: std::cell::Cell::new(0), budget: 0 }, Counting { model: cp, rows: std::cell::Cell::new(0), budget: 0 });
     let again = evaluate(&cm, &cp, &programs.head, &f.batch, &targets, &experiments, true).expect("evaluate");
-    assert_eq!(cm.rows.get() + cp.rows.get(), 2 * 13 * LENGTH);
+    assert_eq!(cm.rows.get() + cp.rows.get(), 2 * (13 * LENGTH - 3));
     assert_eq!(again.bits, kept.bits);
     assert_eq!(again.gradient.len(), kept.gradient.len());
     for (op, g) in &kept.gradient {
