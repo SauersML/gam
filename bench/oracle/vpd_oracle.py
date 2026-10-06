@@ -168,6 +168,8 @@ class Table:
         head_vectors(self.uv)
         self.lens = load_file(str(lens)) if lens is not None else None
         self.layers = sorted({layer for layer, _ in self.sites})
+        # The model's depth: a label table of some layers states it (qwen_labels.py), VPD's covers all 4.
+        self.depth = max([m.get("model_layers", 0) for m, _ in self.sites.values()] + [max(self.layers) + 1])
         # Per kind, the widths of its read and write vectors (V is [d_read, C], U is [C, d_write]).
         self.dims = {kind: (int(self.uv[f"{site_name(layer, kind)}.V"].shape[0]), int(self.uv[f"{site_name(layer, kind)}.U"].shape[1])) for layer, kind in self.sites}
         self.features = Features(feature_examples) if feature_examples is not None else None
@@ -264,7 +266,7 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
     rule (a sanity check of the reader, not a measurement): direction questions about a token from the
     subcomponent's lens text (its 8 raised or 8 lowered tokens), answered by the rule the text states:
     the probability goes up iff (edit sign) * (stated activity sign) * (+1 raised, -1 lowered) > 0, the
-    edit sign -1 for removal and +1 for 1.5 times stronger. A reader that cannot learn this from those
+    edit sign -1 for removal and +1 for amplification. A reader that cannot learn this from those
     inputs has a bug."""
     rng = random.Random(seed)
     pending: dict[str, list] = {"direction": [], "top": []}
@@ -320,7 +322,7 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
         elif q == "direction":
             p = int(d["position"][c, j])
             edit, side, r = rng.choice(["ablate", "amplify"]), rng.choice(["up", "down"]), rng.randrange(10)
-            verb = "removed" if edit == "ablate" else "made 1.5 times stronger"
+            verb = "removed" if edit == "ablate" else f"made {meta.get('amplify', 1.5):g} times stronger"
             token, answer = int(d[f"{side}_ids_{edit}"][c, j, r]), 0 if float(d[f"{side}_dp_{edit}"][c, j, r]) > 0 else 1
             if rule:
                 a_sign = int(math.copysign(1, a_here)) if level(a_here, peak) > 0 else 0
@@ -450,7 +452,7 @@ def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
     lens = condition.endswith("_lens")
     public = condition.endswith("examples")
     condition = base(condition)
-    n = len(table.layers)
+    n = table.depth
     if ex["c"] >= 0:
         before = f"A component of a {n}-layer language model: layer {ex['layer']}, {ex['kind']}. Its vectors, then those of related components:"
     else:
@@ -481,7 +483,7 @@ def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
 
 
 class Oracle(torch.nn.Module):
-    def __init__(self, base: str, lora_rank: int, inject: int, dev, dims: dict):
+    def __init__(self, base: str, lora_rank: int, inject: int, dev, dims: dict, depth: int = 4):
         super().__init__()
         from peft import LoraConfig, get_peft_model
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -491,9 +493,9 @@ class Oracle(torch.nn.Module):
         dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
         model = AutoModelForCausalLM.from_pretrained(base, dtype=dtype).to(dev)
         self.model = get_peft_model(model, LoraConfig(r=lora_rank, lora_alpha=lora_rank, target_modules="all-linear", lora_dropout=0.0))
-        width = model.config.hidden_size
+        width = self.width = model.config.hidden_size
         self.maps = torch.nn.ModuleDict({f"{k}_{side}": torch.nn.Linear(dims[k][i], width) for k in KINDS if k in dims for i, side in enumerate(("read", "write"))}).to(dev)
-        self.magnitude = Magnitude(width, 4).to(dev)
+        self.magnitude = Magnitude(width, depth).to(dev)
         self.hook = Injection(1.0, inject)
         model.model.layers[inject].register_forward_hook(self.hook)
         self.inject = inject
@@ -515,7 +517,8 @@ class Oracle(torch.nn.Module):
         maps = {k: v for k, v in state["maps"].items() if k in own and own[k].shape == v.shape}
         missing = self.maps.load_state_dict(maps, strict=False).missing_keys
         assert all(k.split(".")[0].rsplit("_", 1)[0] in ("head", "function") for k in missing), missing
-        self.magnitude.load_state_dict(state["magnitude"])
+        own = self.magnitude.state_dict()  # the layer embedding of another depth (another model) starts fresh
+        self.magnitude.load_state_dict({k: v for k, v in state["magnitude"].items() if own[k].shape == v.shape}, strict=False)
 
     def encode(self, before: str, after: str, thinking: bool = False) -> tuple[list[int], list[int]]:
         marker = "\u0000V\u0000"
@@ -529,7 +532,7 @@ class Oracle(torch.nn.Module):
         """The hook's batch: per row its slots' read and write vectors at its placeholder positions, each
         through its own map; withheld and empty slots receive nothing."""
         rows, cols, vecs, roles, mags, keeps, layers = [], [], [], [], [], [], []
-        width = self.maps["q_proj_read"].out_features
+        width = self.width
         for b, (items, where) in enumerate(zip(rows_slots, places)):
             for s in range(SLOTS):
                 for h, side in enumerate(("read", "write")):
@@ -592,7 +595,7 @@ def train(args):
     held = {int(x) for x in args.heldout_layers.split(",") if x}
     table = table_of(args)
     data = examples(table, set(table.layers) - held, args.examples, args.seed, per_component=args.per_component, only=tuple(args.questions.split(",")) if args.questions else (), rule=args.rule)
-    oracle = Oracle(args.base, args.lora_rank, args.inject, dev, table.dims)
+    oracle = Oracle(args.base, args.lora_rank, args.inject, dev, table.dims, table.depth)
     if args.init:  # warm start: an earlier run's adapter and maps (same base model); new kinds' maps start fresh
         oracle.load(Path(args.init))
     oracle.model.base_model.model.gradient_checkpointing_enable()
@@ -625,7 +628,7 @@ def evaluate(args):
     dev = device()
     config = json.loads((Path(args.run) / "config.json").read_text())
     table = table_of(args)
-    oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev, table.dims)
+    oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev, table.dims, table.depth)
     oracle.load(Path(args.run))
     oracle.model.eval()
     held = {int(x) for x in config["heldout_layers"].split(",") if x}
