@@ -1470,6 +1470,65 @@ impl<'a> Library<'a> {
         Ok(out)
     }
 
+    /// [`Library::couplings`] of many readers: the MLP readers of one MLP share each writer block's
+    /// product (readers' read rows times the block's write directions, one matrix product per
+    /// route and writer instead of one per reader); heads are taken one by one.
+    pub fn couplings_of(&self, readers: &[usize]) -> Result<Vec<Couplings>, String> {
+        let (head_columns, mlp_columns) = self.columns();
+        let total = self.functions().len();
+        let mut out: Vec<Option<Couplings>> = (0..readers.len()).map(|_| None).collect();
+        let mut by_block: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+        for (k, &f) in readers.iter().enumerate() {
+            match self.place(f)?.1 {
+                Ok(_) => out[k] = Some(self.couplings(f)?),
+                Err((b, i)) => by_block.entry(b).or_default().push((k, i)),
+            }
+        }
+        for (b, members) in by_block {
+            let block = &self.mlps[b];
+            let site = 2 * block.layer + 1;
+            let gain = &self.sites[site].gain;
+            let rows = |m: &Array2<f64>| Array2::from_shape_fn((members.len(), m.ncols()), |(r, c)| m[[members[r].1, c]] * gain[c]);
+            let mut routes = vec![rows(&block.gate)];
+            if let Some((_, up)) = &block.up {
+                routes.push(rows(up));
+            }
+            let mut mlp: Vec<Vec<(usize, Array1<f64>)>> = vec![Vec::new(); members.len()];
+            for (wb, writer) in self.mlps.iter().enumerate() {
+                if 2 * writer.layer + 2 > site {
+                    continue;
+                }
+                let mut c = Array2::<f64>::zeros((members.len(), writer.out.ncols()));
+                for r in &routes {
+                    c += &r.dot(&writer.out).mapv(f64::abs);
+                }
+                for (m, (_, i)) in members.iter().enumerate() {
+                    let mut row = c.row(m).to_owned();
+                    if wb == b {
+                        row[*i] = f64::NAN;
+                    }
+                    mlp[m].push((mlp_columns[wb], row));
+                }
+            }
+            let mut heads: Vec<Vec<(usize, usize, Vec<Array2<f64>>)>> = vec![Vec::new(); members.len()];
+            for (l, layer_heads) in self.layer_heads.iter().enumerate() {
+                if 2 * l + 1 > site {
+                    continue;
+                }
+                for (c, &h) in layer_heads.iter().enumerate() {
+                    let products: Vec<Array2<f64>> = routes.iter().map(|r| r.dot(&self.heads[h].output)).collect();
+                    for m in 0..members.len() {
+                        heads[m].push((head_columns[l] + c, h, products.iter().map(|p| p.row(m).insert_axis(Axis(0)).to_owned()).collect()));
+                    }
+                }
+            }
+            for ((k, _), (mlp, heads)) in members.iter().zip(mlp.into_iter().zip(heads)) {
+                out[*k] = Some(Couplings { site, mlp, heads, total });
+            }
+        }
+        out.into_iter().map(|c| c.ok_or_else(|| "a reader without couplings".to_string())).collect()
+    }
+
     /// For each (writer, MLP reader) pair, the change of the reader's activation at every row of
     /// `sequence` when the writer's write is taken out of the reader's reads alone (the path patch
     /// of [`Library::path_patched`] before anything after the reader runs).
@@ -2264,6 +2323,15 @@ mod tests {
                 let best = dp.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).expect("a token").0;
                 assert!(e.up[0].0 == best || (dp[e.up[0].0] - dp[best]).abs() < 1e-12, "row {r}: top token");
                 assert!((e.up[0].1 - dp[e.up[0].0]).abs() < 1e-9);
+            }
+            // Batched couplings equal one reader's.
+            let readers: Vec<usize> = vec![0, mlp_reader, mlp_reader + 1, functions.len() - 1];
+            let reads = library.edited(&sequences[..1], &[Edit { sequence: 0, rows: vec![5], ..Edit::default() }], &super::Activity::All, true, true).expect("reads");
+            let (act, heads_at, inverses) = (reads.activity.expect("a"), reads.heads.expect("h"), reads.inverses.expect("i"));
+            let head_rows: Vec<_> = heads_at.iter().map(|h| h.row(0)).collect();
+            for (f, batched) in readers.iter().zip(library.couplings_of(&readers).expect("couplings")) {
+                let (one, many) = (library.couplings(*f).expect("couplings").score(act.row(0), &head_rows, inverses.row(0)), batched.score(act.row(0), &head_rows, inverses.row(0)));
+                assert!(one.iter().zip(&many).all(|(a, b)| (a.is_nan() && b.is_nan()) || (a - b).abs() < 1e-9 * (1.0 + a.abs())), "reader {f}");
             }
             // Two copies with different edits in one call equal their separate calls.
             let edits = [Edit { sequence: 1, add: vec![], scale: vec![(0, 0.0)], rows: vec![3, 11] }, Edit { sequence: 0, add: vec![], scale: vec![(functions.len() - 1, 2.0)], rows: vec![7] }];

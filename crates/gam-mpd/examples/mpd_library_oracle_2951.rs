@@ -616,8 +616,8 @@ fn main() -> Result<(), String> {
         let heads: Vec<Array2<f64>> = (0..head_parts[0].len()).map(|h| stack(&head_parts.iter().map(|p| p[h].clone()).collect::<Vec<_>>())).collect::<Result<_, String>>()?;
         let mut edits = Vec::new();
         let mut asked = Vec::new();
-        for (g, &b) in group.iter().enumerate() {
-            let couplings = library.couplings(b)?;
+        let all_couplings = library.couplings_of(group)?;
+        for (g, (&b, couplings)) in group.iter().zip(&all_couplings).enumerate() {
             for j in 0..j_count {
                 let r = g * j_count + j;
                 let head_rows: Vec<_> = heads.iter().map(|h| h.row(r)).collect();
