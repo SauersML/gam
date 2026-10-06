@@ -188,14 +188,14 @@ impl<'a> Model<'a> {
 /// (`run_check::layer_nodes` of the native program `artifact` was made from): the arguments of
 /// [`Model::new`]. `Artifact::native` gives `M`'s.
 pub fn sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorProgram, Vec<usize>, Vec<usize>), String> {
-    let (flat, entries, reads, _, _) = flat_sites(artifact, layers)?;
+    let (flat, entries, reads, _, _, _) = flat_sites(artifact, layers)?;
     Ok((flat, entries, reads))
 }
 
 /// [`sites`] with, per block, where `artifact` applies edits of parts ([`PartSites`]): for layer
 /// `l`'s MLP (block `2l + 1`) its read and the MLP's output (the native `mlp` node or the node
 /// that replaced it), none for an attention block or an MLP output the artifact does not hold.
-fn flat_sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorProgram, Vec<usize>, Vec<usize>, Vec<Option<(usize, usize)>>, Vec<Option<usize>>), String> {
+fn flat_sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorProgram, Vec<usize>, Vec<usize>, Vec<Option<(usize, usize)>>, Vec<Option<usize>>, Vec<Option<usize>>), String> {
     let (flat, roots) = mapped_inlined(&artifact.program)?;
     let at = |native: usize| artifact.place(native).map(|n| roots[n]).ok_or_else(|| error(format!("native node {native} is not held")));
     let entries: Vec<usize> = layers.iter().flat_map(|l| [l.stream, l.attended]).map(at).collect::<Result<_, _>>()?;
@@ -218,7 +218,17 @@ fn flat_sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorPro
         .flat_map(|(l, layer)| layer.reads.iter().map(move |r| (l, *r)))
         .map(|(l, r)| at(r).ok().filter(|n| *n > reads[2 * l] && *n < entries[2 * l + 1]))
         .collect();
-    Ok((flat, entries, reads, parts, heads))
+    // Per block, for an MLP block, its hidden activations (the down projection's input), when held.
+    let actives = layers
+        .iter()
+        .enumerate()
+        .flat_map(|(l, layer)| {
+            let b = 2 * l + 1;
+            let end = if b + 1 < blocks { entries[b + 1] } else { flat.nodes.len() };
+            [None, at(layer.active).ok().filter(|n| *n > reads[b] && *n <= end)]
+        })
+        .collect();
+    Ok((flat, entries, reads, parts, heads, actives))
 }
 
 /// The program of the flat program `flat` through its head's hidden node (the final normed
@@ -341,6 +351,15 @@ pub struct Part {
     pub write: Vec<f64>,
 }
 
+/// A native lift of the parts ([`Interchange::fit_lift`]): per part the reader `r` of `M`'s MLP
+/// hidden activations whose `rᵀh` fits the part's activation by least squares (none where `M`
+/// does not hold them), and the fit's `R²`.
+#[derive(Clone, Debug)]
+pub struct Lift {
+    pub readers: Vec<Option<Vec<f64>>>,
+    pub r2: Vec<f64>,
+}
+
 /// The factors `α` an edit of a part scales its write by: 0 removes the part, 0.5 halves it, 2
 /// and 3 amplify it.
 pub const FACTORS: [f64; 4] = [0.0, 0.5, 2.0, 3.0];
@@ -411,6 +430,12 @@ pub struct PartSites {
     norms: Vec<Option<Norm>>,
     /// The fixed parts ([`Interchange::set_fixed_parts`]).
     fixed: Arc<Vec<Slice>>,
+    /// Per block, for an MLP block, the node of its hidden activations `h` (the down projection's
+    /// input), when the model holds it.
+    actives: Vec<Option<usize>>,
+    /// The parts' lift ([`Interchange::set_lift`], `M`'s alone): per part a reader `r` of `h`, so
+    /// that the model reads a part's activation as `rᵀh` and its edit is a weight edit of its own.
+    lift: Option<Arc<Vec<Option<Vec<f64>>>>>,
 }
 
 /// A block's input norm `N(s) = γ ⊙ s · (mean(s²) + ε)^{-1/2} + β` of the stream `s` entering it
@@ -1014,6 +1039,8 @@ struct FixedWrites {
 /// its coefficient in the reverse.
 struct Writes {
     read: usize,
+    /// The activations are the reads' values themselves (a lifted part's `rᵀh`), not their ReLU.
+    linear: bool,
     rows: Vec<usize>,
     /// Per edit the row its activation is read at (its own row, or a swap's source row).
     from: Vec<usize>,
@@ -1099,7 +1126,7 @@ impl Edits {
         sites: Option<&PartSites>,
         recorded: Option<Records>,
     ) -> Result<Self, String> {
-        let mut writes: BTreeMap<usize, (usize, Vec<(usize, usize, &Part, f64)>)> = BTreeMap::new();
+        let mut writes: BTreeMap<usize, (usize, bool, Vec<(usize, usize, Part, f64)>)> = BTreeMap::new();
         let mut zeroed = Vec::new();
         let mut cuts: BTreeMap<usize, Cuts> = BTreeMap::new();
         let mut fixed: BTreeMap<usize, FixedWrites> = BTreeMap::new();
@@ -1147,10 +1174,23 @@ impl Edits {
             };
             let p = sites.parts.get(*part).ok_or_else(|| error("an edit of an unknown part"))?;
             let (read, out) = sites.nodes.get(p.block).copied().flatten().ok_or_else(|| error(format!("block {}: no part sites", p.block)))?;
-            let list = &mut writes.entry(out).or_insert_with(|| (read, Vec::new())).1;
+            // A lifted model reads the part's activation as `rᵀh` from its hidden activations.
+            let (read, linear, p) = match &sites.lift {
+                Some(lift) => {
+                    let reader = lift.get(*part).and_then(Option::as_ref).ok_or_else(|| error(format!("part {part}: no lift")))?;
+                    let active = sites.actives.get(p.block).copied().flatten().ok_or_else(|| error(format!("block {}: no hidden activations to lift from", p.block)))?;
+                    (active, true, Part { block: p.block, index: p.index, read: reader.clone(), bias: 0.0, write: p.write.clone() })
+                }
+                None => (read, false, p.clone()),
+            };
+            let group = writes.entry(out).or_insert_with(|| (read, linear, Vec::new()));
+            if group.0 != read || group.1 != linear {
+                return Err(error("lifted and own parts edited at one block"));
+            }
+            let list = &mut group.2;
             match from {
                 Some(from) => {
-                    list.push((*row, from, p, 1.0));
+                    list.push((*row, from, p.clone(), 1.0));
                     list.push((*row, *row, p, -1.0));
                 }
                 None => list.push((*row, *row, p, FACTORS.get(factor).ok_or_else(|| error("an edit's factor outside FACTORS"))? - 1.0)),
@@ -1158,19 +1198,19 @@ impl Edits {
         }
         let writes = writes
             .into_iter()
-            .map(|(out, (read, list))| {
-                let width = list[0].2.read.len();
-                if list.iter().any(|(_, _, p, _)| p.read.len() != width || p.write.len() != width) {
+            .map(|(out, (read, linear, list))| {
+                let (reads, width) = (list[0].2.read.len(), list[0].2.write.len());
+                if list.iter().any(|(_, _, p, _)| p.read.len() != reads || p.write.len() != width) {
                     return Err(error("parts of one block differ in width"));
                 }
-                let gates = ndarray::Array2::from_shape_fn((list.len(), width), |(i, c)| list[i].2.read[c]);
+                let gates = ndarray::Array2::from_shape_fn((list.len(), reads), |(i, c)| list[i].2.read[c]);
                 let outs = ndarray::Array2::from_shape_fn((list.len(), width), |(i, c)| list[i].2.write[c]);
                 let rows = list.iter().map(|(r, _, _, _)| *r).collect();
                 let from = list.iter().map(|(_, f, _, _)| *f).collect();
                 let biases = list.iter().map(|(_, _, p, _)| p.bias).collect();
                 let scales: Vec<f64> = list.iter().map(|(_, _, _, s)| *s).collect();
                 let k = scales.len();
-                Ok((out, Writes { read, rows, from, gates, biases, outs, scales, slopes: RefCell::new(vec![0.0; k]), carried: RefCell::new(vec![0.0; k]) }))
+                Ok((out, Writes { read, linear, rows, from, gates, biases, outs, scales, slopes: RefCell::new(vec![0.0; k]), carried: RefCell::new(vec![0.0; k]) }))
             })
             .collect::<Result<_, String>>()?;
         let mut out = Self::patches(d, patches, values, &zeroed)?;
@@ -1305,7 +1345,7 @@ impl Edits {
         let mut slopes = vec![0.0; w.rows.len()];
         for i in 0..w.rows.len() {
             let pre = x.row(i).dot(&w.gates.row(i)) + w.biases[i];
-            if pre > 0.0 {
+            if pre > 0.0 || w.linear {
                 slopes[i] = w.scales[i];
                 added.row_mut(i).assign(&(&w.outs.row(i) * (w.scales[i] * pre)));
             }
@@ -2650,8 +2690,8 @@ impl Interchange {
         tile_rows: usize,
     ) -> Result<Self, String> {
         let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
-        let (m_flat, m_streams, m_reads, m_parts, m_heads) = flat_sites(&Artifact::native(native)?, layers)?;
-        let (p_flat, p_streams, p_reads, p_parts, p_heads) = flat_sites(explanation, layers)?;
+        let (m_flat, m_streams, m_reads, m_parts, m_heads, m_actives) = flat_sites(&Artifact::native(native)?, layers)?;
+        let (p_flat, p_streams, p_reads, p_parts, p_heads, p_actives) = flat_sites(explanation, layers)?;
         let (m_prefix, p_prefix) = (prefix(&m_flat)?, prefix(&p_flat)?);
         let mut m = DeviceProgram::compile_values_bounded(device, &m_prefix, numeric_bytes)?;
         m.set_arithmetic(arithmetic);
@@ -2667,7 +2707,8 @@ impl Interchange {
         let mut m_sites = Sites::new(&m, &m_flat, m_streams, m_reads, &[], m_values)?;
         let mut p_sites = Sites::new(&p, &p_flat, p_streams, p_reads, trainable, p_values)?;
         let head_blocks: Vec<usize> = layers.iter().enumerate().flat_map(|(l, layer)| layer.reads.iter().map(move |_| 2 * l)).collect();
-        for (sites, nodes, heads, program, flat) in [(&mut m_sites, m_parts, m_heads, &m, &m_flat), (&mut p_sites, p_parts, p_heads, &p, &p_flat)] {
+        for (sites, nodes, heads, program, flat, actives) in [(&mut m_sites, m_parts, m_heads, &m, &m_flat, m_actives), (&mut p_sites, p_parts, p_heads, &p, &p_flat, p_actives)] {
+            sites.parts.actives = actives;
             sites.parts.norms = nodes.iter().enumerate().map(|(b, n)| n.and_then(|(read, _)| Norm::of(flat, read, sites.entries[b]))).collect();
             sites.parts.nodes = nodes;
             sites.parts.heads = heads.into_iter().map(|n| n.map(|n| (n, program.widths()[n]))).collect();
@@ -2728,6 +2769,100 @@ impl Interchange {
     /// The fixed parts ([`Interchange::set_fixed_parts`]).
     pub fn fixed_parts(&self) -> &[Slice] {
         &self.m_sites.parts.fixed
+    }
+
+    /// A native lift of the parts ([`Lift`]) fitted on `sequences` (`batch` at a time) on `M`'s
+    /// own runs: per MLP block with parts, over the tokens after each sequence's first (where the
+    /// transcoder features run), one Gram `HᵀH` of `M`'s hidden activations `h` and `HᵀA` of the
+    /// parts' activations `a = relu(g·x + c)` at `M`'s read, the readers `R = (HᵀH)⁺ HᵀA` (the
+    /// minimum-norm least-squares solution, `decompose::pseudo_inverse_solve`) and per part `R² =
+    /// 1 − Σ(a − rᵀh)² / Σ(a − ā)²` from the same sums.
+    pub fn fit_lift(&self, sequences: &[Vec<u32>], batch: usize) -> Result<Lift, String> {
+        let (m, _) = self.models();
+        let d = m.device();
+        let parts = self.parts();
+        let mut by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (i, p) in parts.iter().enumerate() {
+            by_block.entry(p.block).or_default().push(i);
+        }
+        let sites = &self.m_sites.parts;
+        let last = by_block.keys().copied().max().ok_or_else(|| error("a lift needs parts"))?;
+        // Per block: HᵀH, HᵀA, Σa, Σa², and the tokens.
+        let mut sums: BTreeMap<usize, (ndarray::Array2<f64>, ndarray::Array2<f64>, Vec<f64>, Vec<f64>, usize)> = BTreeMap::new();
+        let gates: BTreeMap<usize, Tensor> = by_block
+            .iter()
+            .map(|(b, chosen)| {
+                let width = parts[chosen[0]].read.len();
+                let g = ndarray::Array2::from_shape_fn((chosen.len(), width), |(i, c)| parts[chosen[i]].read[c]);
+                Ok((*b, d.upload(g.view()).map_err(error)?))
+            })
+            .collect::<Result<_, String>>()?;
+        for chunk in sequences.chunks(batch.max(1)) {
+            let length = chunk.first().map_or(0, Vec::len);
+            if length < 2 || chunk.iter().any(|s| s.len() != length) {
+                return Err(error("a lift needs sequences of one length of two tokens or more"));
+            }
+            let ranges: Vec<Range<usize>> = (0..chunk.len()).map(|i| i * length..(i + 1) * length).collect();
+            let later: Vec<Range<usize>> = (0..chunk.len()).map(|i| i * length + 1..(i + 1) * length).collect();
+            let tokens: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
+            let mut stream = d.zeros(chunk.len() * length, BlockEngine::width(&m)).map_err(error)?;
+            for b in 0..=last {
+                let wanted = by_block.get(&b);
+                let Some(trace) = m.forward(b, &mut stream, &ranges, &tokens, None, wanted.is_some())? else { continue };
+                let chosen = wanted.ok_or_else(|| error("a kept block without parts"))?;
+                let (read, _) = sites.nodes.get(b).copied().flatten().ok_or_else(|| error(format!("block {b}: no parts")))?;
+                let active = sites.actives.get(b).copied().flatten().ok_or_else(|| error(format!("block {b}: no hidden activations to lift from")))?;
+                let x = d.gather_ranges(trace.value(read)?, &later).map_err(error)?;
+                let h = d.gather_ranges(trace.value(active)?, &later).map_err(error)?;
+                let (n, hidden) = (h.rows(), h.cols());
+                let mut pre = d.zeros(n, chosen.len()).map_err(error)?;
+                d.gemm(&mut pre, 1.0, &x, Op::N, &gates[&b], Op::T, 0.0, m.arithmetic()).map_err(error)?;
+                let mut a = d.download(&pre).map_err(error)?;
+                for (j, i) in chosen.iter().enumerate() {
+                    a.column_mut(j).mapv_inplace(|v| (v + parts[*i].bias).max(0.0));
+                }
+                let at = d.upload(a.view()).map_err(error)?;
+                let mut hh = d.zeros(hidden, hidden).map_err(error)?;
+                d.gemm(&mut hh, 1.0, &h, Op::T, &h, Op::N, 0.0, m.arithmetic()).map_err(error)?;
+                let mut ha = d.zeros(hidden, chosen.len()).map_err(error)?;
+                d.gemm(&mut ha, 1.0, &h, Op::T, &at, Op::N, 0.0, m.arithmetic()).map_err(error)?;
+                let entry = sums.entry(b).or_insert_with(|| (ndarray::Array2::zeros((hidden, hidden)), ndarray::Array2::zeros((hidden, chosen.len())), vec![0.0; chosen.len()], vec![0.0; chosen.len()], 0));
+                entry.0 += &d.download(&hh).map_err(error)?;
+                entry.1 += &d.download(&ha).map_err(error)?;
+                for (j, column) in a.columns().into_iter().enumerate() {
+                    entry.2[j] += column.sum();
+                    entry.3[j] += column.iter().map(|v| v * v).sum::<f64>();
+                }
+                entry.4 += n;
+            }
+        }
+        let mut readers: Vec<Option<Vec<f64>>> = vec![None; parts.len()];
+        let mut r2 = vec![f64::NAN; parts.len()];
+        for (b, (hh, ha, sum, square, n)) in sums {
+            let r = gam_linalg::decompose::pseudo_inverse_solve(hh.view(), ha.view()).map_err(error)?;
+            for (j, i) in by_block[&b].iter().enumerate() {
+                let (rj, hj) = (r.column(j), ha.column(j));
+                let residual = square[j] - 2.0 * rj.dot(&hj) + rj.dot(&hh.dot(&rj));
+                let total = square[j] - sum[j] * sum[j] / n as f64;
+                r2[*i] = if total > 0.0 { 1.0 - residual / total } else { f64::NAN };
+                readers[*i] = Some(rj.to_vec());
+            }
+        }
+        Ok(Lift { readers, r2 })
+    }
+
+    /// `M` reads each part's activation through the lift's reader (`rᵀh` of its hidden
+    /// activations, [`Interchange::fit_lift`]): an edit of a part scaling its write by `α` is then
+    /// the weight edit `D + (α − 1) u rᵀ` of `M`'s down projection `D` at the row, a change of `M`'s
+    /// own weights; `P` keeps its own part.
+    pub fn set_lift(&mut self, lift: &Lift) -> Result<(), String> {
+        if lift.readers.len() != self.parts().len() {
+            return Err(error("a lift of other parts"));
+        }
+        let mut next = (*self.m_sites).clone();
+        next.parts.lift = Some(Arc::new(lift.readers.clone()));
+        self.m_sites = Arc::new(next);
+        Ok(())
     }
 
     /// `P` applies no edits of parts from now on, `M` still does: with `P` = `M`

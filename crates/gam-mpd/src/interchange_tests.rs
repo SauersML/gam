@@ -1254,3 +1254,80 @@ fn the_reverse_of_every_edit_is_the_transpose_of_its_tangent() {
     }
 }
 
+
+/// The native lift ([`Interchange::fit_lift`]) on the tiny Qwen3 decoder with layer 1's MLP a
+/// transcoder's 64 features: the readers solve the normal equations of the least squares of the
+/// parts' activations on `M`'s hidden activations over the tokens after each sequence's first
+/// (`Hᵀ(A − H R) = 0` against the host's values), each `R²` is the fit's, and after
+/// [`Interchange::set_lift`] an edit of a part on `M` adds `(α − 1)(rᵀh)u` at the row (the weight
+/// edit `D + (α − 1) u rᵀ` of `M`'s down projection there) and nothing elsewhere.
+#[test]
+fn the_lift_reads_parts_from_m_hidden_activations() {
+    use super::interchange::parts_of;
+    let export = crate::test_support::tiny_qwen3_export("interchange_lift", 2);
+    let imported = crate::import::import_language_model(&export, 6, 12).expect("the tiny export imports");
+    std::fs::remove_dir_all(&export).expect("the tiny export is removed");
+    let native = split_sites(&imported.program).expect("the native sites");
+    let layers = layer_nodes(&native, 2).expect("the layers");
+    let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+    let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+    let dir = std::env::temp_dir().join(format!("interchange_lift_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a directory");
+    let (full, kept) = (dir.join("layer_1.safetensors"), dir.join("kept_1.safetensors"));
+    crate::test_support::transcoder_file(&full, 64, 8, 3);
+    crate::library_transcoder::Transcoder::open(&full).expect("the file").write_kept(&(0..64).collect::<Vec<_>>(), &[0.0; 8], &kept).expect("kept");
+    let explanation = crate::library_mdl::explanation_with(&native, &layers, &std::collections::BTreeMap::from([(1, kept)])).expect("the library");
+    std::fs::remove_dir_all(&dir).expect("the directory is removed");
+    let d = Device::host();
+    let mut x = Interchange::new(&d, &native, &layers, &explanation.artifact, &explanation.trainable, explanation.reads.clone(), 1 << 30, 64).expect("the experiments");
+    let parts = parts_of(&explanation.artifact.program, 2).expect("the parts");
+    x.set_parts(parts.clone()).expect("the parts");
+    let lift = x.fit_lift(&sequences, 4).expect("the lift");
+    // The host's values over the tokens after each sequence's first.
+    let family = crate::library_mdl::sequence_family(&sequences.iter().map(Vec::as_slice).collect::<Vec<_>>()).expect("the family");
+    let values = native.execute(&family, false).expect("M on the host").values;
+    let rows: Vec<usize> = (0..sequences.len()).flat_map(|n| (1..12).map(move |t| n * 12 + t)).collect();
+    let h = values[layers[1].active].select(ndarray::Axis(0), &rows);
+    let xs = values[layers[1].normed].select(ndarray::Axis(0), &rows);
+    let mut checked = 0;
+    for (i, p) in parts.iter().enumerate() {
+        let r = ndarray::Array1::from(lift.readers[i].clone().expect("a reader"));
+        let a = (xs.dot(&ndarray::Array1::from(p.read.clone())) + p.bias).mapv(|v| v.max(0.0));
+        if a.iter().all(|v| *v == 0.0) {
+            continue;
+        }
+        let residual = &a - &h.dot(&r);
+        let normal = h.t().dot(&residual);
+        let scale = h.t().dot(&a).iter().fold(1e-12f64, |m, v| m.max(v.abs()));
+        assert!(normal.iter().all(|v| v.abs() <= 1e-8 * scale), "part {i}: the normal equations' residual {normal:?}");
+        let mean = a.mean().expect("a mean");
+        let r2 = 1.0 - residual.dot(&residual) / a.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>();
+        assert!((r2 - lift.r2[i]).abs() <= 1e-8, "part {i}: R² {} against {r2}", lift.r2[i]);
+        checked += 1;
+    }
+    assert!(checked > 10, "{checked} firing parts checked");
+    x.set_lift(&lift).expect("the lift");
+    let (m, _) = x.models();
+    let sites = m.part_sites().expect("M's edit sites");
+    let (_, out) = sites.nodes(3).expect("layer 1's MLP");
+    let (ranges, tok) = (vec![0..12], vec![sequences[0].as_slice()]);
+    let width = BlockEngine::width(&m);
+    let mut entering = d.zeros(12, width).expect("zeros");
+    for b in 0..3 {
+        m.forward(b, &mut entering, &ranges, &tok, None, false).expect("a block");
+    }
+    let plain = m.forward(3, &mut d.copy(&entering).expect("copy"), &ranges, &tok, None, true).expect("the MLP").expect("a tape");
+    let plain = d.download(plain.value(out).expect("the output")).expect("download");
+    let (part, row, factor) = (1, 6, 3);
+    let edits = Edits::with_parts(&d, &[], m.values(), &[(row, Edit::Part { part, factor })], Some(sites), None).expect("the edits");
+    let edited = m.forward(3, &mut d.copy(&entering).expect("copy"), &ranges, &tok, Some(&edits), true).expect("the edited MLP").expect("a tape");
+    let moved = d.download(edited.value(out).expect("the output")).expect("download") - &plain;
+    let coefficient = (FACTORS[factor] - 1.0) * values[layers[1].active].row(row).dot(&ndarray::Array1::from(lift.readers[part].clone().expect("a reader")));
+    let scale = plain.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+    for r in 0..12 {
+        for c in 0..width {
+            let want = if r == row { coefficient * parts[part].write[c] } else { 0.0 };
+            assert!((moved[[r, c]] - want).abs() <= 1e-12 * scale, "row {r}, column {c}: moved {} against {want}", moved[[r, c]]);
+        }
+    }
+}
