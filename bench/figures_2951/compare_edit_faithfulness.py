@@ -72,6 +72,7 @@ def panel(ax, models, title):
 panel(a2, [('VPD, all sites', load(f'{D}/edit_vpd.json'), fams_py, '#c44e52'),
            ('VPD, attention exact', load(f'{D}/edit_vpd_mlp.json'), fams_py, '#dd8452'),
            ('transcoders as built', pick('/Users/user/mpd-data/compare/vpd4l_tc4096_mac/EDITS_as_is_all.json', '/Users/user/mpd-data/compare/vpd4l_tc4096_mac/EDITS_as_is.json'), fams_rs, '#8172b2'),
+           ('transcoders as built (Python)', None if os.path.exists('/Users/user/mpd-data/compare/vpd4l_tc4096_mac/EDITS_as_is_all.json') else load(f'{D}/edit_vpd4l-relu4096.json'), fams_py, '#8172b2'),
            ('ours, fitted by F', load(ours['edits']) if ours and ours.get('edits') else None, fams_rs, '#4c72b0')], 'vpd4l: edit faithfulness (dots: edited token)')
 Q = '/Users/user/mpd-data/runpod/sparseimport-all28-n2p22b/out'
 panel(a3, [('transcoders as built', pick(f'{Q}/EDITS_as_is_all.json', f'{Q}/EDITS_as_is.json'), fams_rs, '#8172b2'),
