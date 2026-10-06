@@ -213,6 +213,11 @@ struct EditSettings {
     /// operators, its transcoder feature through the kept file), in float32.
     #[serde(default)]
     functions: Option<String>,
+    /// When set, `M` reads each part through its native lift fitted on the first this many
+    /// training sequences (`Interchange::fit_lift`): an edit of a part is then the weight edit
+    /// `D + (α − 1) u rᵀ` of `M`'s down projection, and each record and family reports the lift's R².
+    #[serde(default)]
+    lift_sequences: Option<usize>,
 }
 
 /// The parts in the oracle's names (`EditSettings::functions`), a safetensors file.
@@ -253,7 +258,7 @@ fn edit_faithfulness(
     (native, layers): (&OperatorProgram, &[LayerNodes]),
     explanation: &library_mdl::Explanation,
     identity: &library_mdl::Identity,
-    held_out: &[Vec<u32>],
+    (train, held_out): (&[Vec<u32>], &[Vec<u32>]),
     settings: &EditSettings,
     out: &Path,
 ) -> Result<(), String> {
@@ -279,6 +284,16 @@ fn edit_faithfulness(
     let count = parts.len();
     experiments.set_parts(parts.clone())?;
     log::info!("edits: {count} parts, {} held-out sequences, {:.0} s to compile", end - first, started.elapsed().as_secs_f64());
+    let lift = match settings.lift_sequences {
+        Some(n) => {
+            let lift = experiments.fit_lift(&train[..n.min(train.len())], settings.batch_sequences)?;
+            experiments.set_lift(&lift)?;
+            log::info!("edits: lift fitted on {n} training sequences, mean R² {:.3} ({:.0} s)", mean_finite(&lift.r2), started.elapsed().as_secs_f64());
+            Some(lift)
+        }
+        None => None,
+    };
+    let lifted = |chosen: &[usize]| -> Option<Vec<f64>> { lift.as_ref().map(|l| chosen.iter().map(|i| l.r2[*i]).collect()) };
     let mut rng = rand::rngs::StdRng::seed_from_u64(settings.seed);
     let family = |e: &interchange::Experiment| match &e.patch {
         None => "clean",
@@ -313,6 +328,9 @@ fn edit_faithfulness(
     drop(experiments);
     let mut reference = interchange::Interchange::new(device, native, layers, &gam_mpd::artifact::Artifact::native(native)?, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     reference.set_parts(parts.clone())?;
+    if let Some(lift) = &lift {
+        reference.set_lift(lift)?;
+    }
     reference.unedited_explanation();
     // An edit's evidence grows with how much it moves M: per family, the gaps of the edits whose
     // effect at the edited token KL(M_e ‖ M) falls in each bin (bits).
@@ -324,6 +342,7 @@ fn edit_faithfulness(
     // implementation of the same edit (bench/oracle/qwen_labels.py) can be checked against it.
     let part_of = |i: &usize| parts.get(*i).map(|p| json!([(p.block - 1) / 2, p.index]));
     let mut records = String::new();
+    let mut lift_r2: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
     for (b, batch, drawn, gaps) in &batches {
         for ((e, bits), gap) in drawn.iter().zip(&reference.evaluate(batch, drawn, false)?.bits).zip(gaps) {
             let (chosen, factor): (Vec<usize>, Option<usize>) = match &e.patch {
@@ -338,7 +357,11 @@ fn edit_faithfulness(
                 "sequence": first + b * settings.batch_sequences + e.base, "position": e.position, "family": family(e),
                 "parts": chosen.iter().filter_map(part_of).collect::<Vec<_>>(), "factor": factor.and_then(|f| interchange::FACTORS.get(f).copied()),
                 "effect_bits_at_edited_token": bits.first(), "gap_bits_at_edited_token": gap.first(),
+                "lift_r2": lifted(&chosen),
             }).to_string());
+            if let Some(r2) = lifted(&chosen) {
+                lift_r2.entry(family(e)).or_default().extend(r2.into_iter().filter(|v| v.is_finite()));
+            }
             records.push('\n');
             let entry = effects.entry(family(e)).or_default();
             entry.0.extend_from_slice(bits);
@@ -365,7 +388,17 @@ fn edit_faithfulness(
         let ((effect_mean, effect_p99), (effect_edited_mean, effect_edited_p99)) = (summary(&mut effect_all), summary(&mut effect_edited));
         // Experiments on M's own objects (clean text, heads) ask every explanation the same
         // question; edits of parts ask each explanation about its own parts.
-        let objects = if matches!(family, "clean" | "remove_head" | "remove_head_from" | "read") { "native" } else { "own_parts" };
+        // Evidence: experiments on M's own objects (clean text, heads), and edits of parts that are
+        // weight edits of M through the lift, ask every explanation a question about M; the other
+        // edits of parts inject the explanation's own part into M.
+        let lifted_family = matches!(family, "remove_part" | "amplify_part" | "remove_parts" | "remove_part_from" | "swap_part");
+        let objects = if matches!(family, "clean" | "remove_head" | "remove_head_from" | "read") {
+            "native"
+        } else if lift.is_some() && lifted_family {
+            "native_lifted"
+        } else {
+            "injected"
+        };
         let bins: Vec<Value> = (0..=BINS.len())
             .filter_map(|bin| {
                 let (all, at, effect) = binned.get(&(family, bin))?;
@@ -379,6 +412,7 @@ fn edit_faithfulness(
             family.into(),
             json!({
                 "objects": objects,
+                "lift_r2_mean": lift_r2.get(family).map(|v| mean_finite(v)),
                 "by_effect": bins,
                 "experiments": count, "tokens": tokens,
                 "mean_bits_per_token": mean, "p99_bits_per_token": p99, "edited_token_mean_bits": edited_mean, "edited_token_p99_bits": edited_p99,
@@ -389,6 +423,7 @@ fn edit_faithfulness(
     let report = json!({
         "checkpoint": settings.checkpoint,
         "parts": count,
+        "lift": lift.as_ref().map(|l| json!({"sequences": settings.lift_sequences, "r2_mean": mean_finite(&l.r2), "r2_by_layer": r2_by_layer(&parts, &l.r2)})),
         "sequences": settings.sequences,
         "edits_per_sequence": settings.edits_per_sequence,
         "seed": settings.seed,
@@ -399,6 +434,21 @@ fn edit_faithfulness(
     });
     log::info!("edits: {report}");
     save(&out.join(format!("EDITS_{}.json", settings.name)), &report)
+}
+
+/// The mean of the finite values (a part that never fires has no R²).
+fn mean_finite(values: &[f64]) -> f64 {
+    let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    finite.iter().sum::<f64>() / finite.len().max(1) as f64
+}
+
+/// Per layer the parts' mean lift R².
+fn r2_by_layer(parts: &[interchange::Part], r2: &[f64]) -> Value {
+    let mut by: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+    for (p, v) in parts.iter().zip(r2) {
+        by.entry((p.block - 1) / 2).or_default().push(*v);
+    }
+    json!(by.iter().map(|(l, v)| (l.to_string(), json!(mean_finite(v)))).collect::<serde_json::Map<_, _>>())
 }
 
 fn save(path: &Path, value: &Value) -> Result<(), String> {
@@ -487,7 +537,7 @@ fn main() -> Result<(), String> {
     library_mdl::check_checkpoint(&checkpoint, &identity)?;
     if let Some(file) = edits {
         let settings: EditSettings = serde_json::from_slice(&std::fs::read(file).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        return edit_faithfulness(&device, (&native, &layers), &explanation, &identity, held_out, &settings, out);
+        return edit_faithfulness(&device, (&native, &layers), &explanation, &identity, (&train, held_out), &settings, out);
     }
     if read_artifact {
         let artifact = library_mdl::checkpoint_artifact(&explanation, &checkpoint, library_mdl::Literals::of(&device))?;
