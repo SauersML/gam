@@ -644,6 +644,7 @@ impl Mixture {
     /// Re-choose every target's candidates at `posterior` (module note). A gate's candidates are
     /// scored `d` at a time, so the scores held at once are no larger than the gate operator.
     pub fn choose(&mut self, explanation: &Explanation, posterior: &Posterior) -> Result<(), String> {
+        use rayon::prelude::*;
         // MLP blocks: per layer and kind, the targets' posterior rows against every candidate, `d`
         // candidates at a time.
         let d = self.embedding.nrows();
@@ -685,20 +686,27 @@ impl Mixture {
                     block.column_mut(k - start).assign(&self.vector(writes[k], &means)?);
                 }
                 let (cross, norm) = (fast_ab(&weighted, &block), fast_ab(&precision, &block.mapv(|v| v * v)));
-                for (slot, &t) in rows.iter().enumerate() {
+                // Each target's `K` best so far and this block's, merged in parallel over targets.
+                let width = self.width;
+                best.par_iter_mut().zip(&rows).for_each(|(kept, &t)| {
                     let i = match self.targets[t].kind {
                         Kind::Gate { function, .. } | Kind::Up { function, .. } | Kind::Output { function, .. } => function,
-                        Kind::QueryKey { .. } | Kind::Value { .. } => continue,
+                        Kind::QueryKey { .. } | Kind::Value { .. } => return,
                     };
                     for k in 0..end - start {
                         if norm[[i, k]] > 0.0 {
-                            best[slot].push((-cross[[i, k]] * cross[[i, k]] / norm[[i, k]], cross[[i, k]] / norm[[i, k]], start + k));
+                            kept.push((-cross[[i, k]] * cross[[i, k]] / norm[[i, k]], cross[[i, k]] / norm[[i, k]], start + k));
                         }
                     }
-                    best[slot].sort_by(|a, b| a.0.total_cmp(&b.0));
-                    best[slot].truncate(self.width);
-                }
+                    if kept.len() > width {
+                        kept.select_nth_unstable_by(width, |a, b| a.0.total_cmp(&b.0));
+                        kept.truncate(width);
+                    }
+                });
                 start = end;
+            }
+            for kept in &mut best {
+                kept.sort_by(|a, b| a.0.total_cmp(&b.0));
             }
             let deviations = |i: usize| -> Result<&Array2<f64>, String> { posterior.log_sd.get(i).ok_or_else(|| "a posterior deviation".to_string()) };
             let mut adopted = Vec::with_capacity(rows.len());
