@@ -266,6 +266,10 @@ pub struct Explanation {
     /// the group when the explanation starts from moved values (a warm start), so the scale code
     /// is decodable from `M` and the explanation's structure.
     pub reference: Vec<f64>,
+    /// `M`'s read variables (`interchange::reads`): fixed by `M` and the library made at it, and
+    /// kept by every explanation derived from that one, so a fit reads them here rather than
+    /// building the library again.
+    pub reads: Vec<interchange::ReadVariable>,
 }
 
 /// Per group of `groups`, the mean square of `program`'s values over its cells. A group whose
@@ -711,7 +715,8 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
     trainable.sort_unstable();
     artifact.owners = owners;
     let reference = mean_squares(&artifact.program, &groups);
-    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference })
+    let reads = interchange::reads_of(native, &artifact, out.len())?;
+    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference, reads })
 }
 
 /// The prior groups of each of `explanation`'s `2L` blocks (block `2l` layer `l`'s attention,
@@ -1680,7 +1685,7 @@ impl Scorer {
     /// value of each, so every explanation of the model is asked the same questions.
     fn new(device: &Device, native: &OperatorProgram, explanation: &Explanation, settings: &Settings) -> Result<Self, String> {
         let sites: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
-        let reads = interchange::reads(native, &sites)?;
+        let reads = explanation.reads.clone();
         let mut experiments =
             Interchange::new(device, native, &sites, &explanation.artifact, &explanation.trainable, reads, settings.numeric_bytes, settings.head_tile_rows)?;
         // Every scoring of the fit (its steps, held-out evaluations and removal comparisons) is of

@@ -417,16 +417,26 @@ impl FixedHead {
 /// The library's ownership map (`Artifact::owners`) names the native operator and rows each of its
 /// read rows replaces.
 pub fn reads(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Vec<ReadVariable>, String> {
-    let start = crate::library_mdl::explanation(native, layers)?;
-    let program = &start.artifact.program;
+    Ok(crate::library_mdl::explanation(native, layers)?.reads)
+}
+
+/// [`reads`] from `start`, the library explanation of `native`'s `blocks` layers as
+/// `library_mdl::explanation` makes it (its program and its owners).
+pub(crate) fn reads_of(native: &OperatorProgram, start: &crate::artifact::Artifact, blocks: usize) -> Result<Vec<ReadVariable>, String> {
+    let program = &start.program;
     let named: BTreeMap<&str, usize> = native.operators.iter().enumerate().map(|(i, op)| (op.name.as_str(), i)).collect();
-    library_reads(program, layers.len())?
+    // Each library operator's read-map owners, in the ownership map's order.
+    let mut owners: HashMap<&str, Vec<&crate::artifact::Owner>> = HashMap::new();
+    for owner in start.owners.iter().filter(|o| READS.contains(&o.role.as_str())) {
+        owners.entry(owner.operator.as_str()).or_default().push(owner);
+    }
+    library_reads(program, blocks)?
         .into_iter()
         .map(|v| {
             let mut parts: Vec<(usize, Range<usize>)> = Vec::new();
             for (op, rows) in &v.parts {
                 let name = &program.operators[*op].name;
-                for owner in start.artifact.owners.iter().filter(|o| &o.operator == name && READS.contains(&o.role.as_str())) {
+                for owner in owners.get(name.as_str()).into_iter().flatten() {
                     let (from, to) = (rows.start.max(owner.rows.start), rows.end.min(owner.rows.end));
                     if from >= to {
                         continue;

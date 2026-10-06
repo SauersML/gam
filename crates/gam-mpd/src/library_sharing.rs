@@ -421,7 +421,7 @@ pub fn share_query_key(explanation: &Explanation, members: &[Member]) -> Result<
         }
     }
     let removed = explanation.removed.iter().filter_map(|g| index.get(g).copied()).collect();
-    Ok(Explanation { artifact, trainable, groups, layers, removed, fixed_nats: explanation.fixed_nats, reference })
+    Ok(Explanation { artifact, trainable, groups, layers, removed, fixed_nats: explanation.fixed_nats, reference, reads: explanation.reads.clone() })
 }
 
 /// The value transport from one key-value group to another (module note): `T`, the source query
