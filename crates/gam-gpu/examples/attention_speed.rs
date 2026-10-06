@@ -1,6 +1,6 @@
 //! Time `Device::causal_attention` and its reverse on CUDA at the fit's shapes: vpd4l (6 heads of
 //! 128, each with its own keys and values, 32 sequences) and Qwen3-0.6B (16 query heads over 8
-//! key-value heads of 128, 8 sequences), each at 512 and 1024 positions. A line per shape: the mean
+//! key-value heads of 128, 8 sequences), each at 256, 512, 1024 and 2048 positions. A line per shape: the mean
 //! device seconds per call of the forward and of the reverse (one warm call, then a timed loop
 //! between synchronizations), their rates in TFLOP/s, and the fraction of PEAK, the card's f32 rate
 //! in TFLOP/s (the kernels multiply in f32 on the CUDA cores; RTX 4090: 82.6). Operations are
@@ -44,7 +44,7 @@ fn main() -> Result<(), String> {
     println!("{}", d.name());
     let shapes = [("vpd4l", HeadLayout { queries: 6, keys: 6, width: 128 }, 32), ("qwen3-0.6b", HeadLayout { queries: 16, keys: 8, width: 128 }, 8)];
     for (name, layout, count) in shapes {
-        for length in [512, 1024] {
+        for length in [256, 512, 1024, 2048] {
             let rows = count * length;
             let sequences: Vec<_> = (0..count).map(|s| s * length..(s + 1) * length).collect();
             let y = d.upload(matrix(rows, layout.columns(), 1, 2.0).view()).map_err(|e| e.to_string())?;
