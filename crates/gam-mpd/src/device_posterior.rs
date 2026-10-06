@@ -807,6 +807,25 @@ impl DevicePosterior {
         self.refresh()
     }
 
+    /// Removes trainable operator `i`'s entries at the row-major positions `at` (a removal decided
+    /// outside the library's search, such as a VPD subcomponent no training token reaches): the
+    /// iterate and its average `μ̄` zero and `s = −∞`, which a step leaves alone
+    /// ([`Device::posterior_ivon`]); [`DevicePosterior::settle`] then takes the groups' variances
+    /// and divergences.
+    pub fn remove_entries(&mut self, i: usize, at: &[u32]) -> Result<(), String> {
+        if at.is_empty() {
+            return Ok(());
+        }
+        if i >= self.mean.len() {
+            return Err(error("no such trainable operator"));
+        }
+        self.uploaded.clear();
+        let at = self.fitting.upload_indices(at).map_err(error)?;
+        self.fitting.fill_entries(&mut self.mean[i], &at, 0.0).map_err(error)?;
+        self.fitting.fill_entries(&mut self.average[i], &at, 0.0).map_err(error)?;
+        self.fitting.fill_entries(&mut self.log_sd[i], &at, f64::NEG_INFINITY).map_err(error)
+    }
+
     /// The posterior's mean `held`, the iterate `iterate` it averages and the steps `averaged` it
     /// averages over, restored exactly from a checkpoint ([`DevicePosterior::operator`],
     /// [`DevicePosterior::iterate`]): the fit goes on as if it had not stopped.
