@@ -636,7 +636,8 @@ impl DeviceProgram {
                         OperatorBody::Identity => 0,
                         OperatorBody::Diagonal { values, .. } => values.len(),
                         OperatorBody::LowRank { left, right, .. } => left.len().checked_add(right.len()).ok_or("operator size overflow")?,
-                        OperatorBody::Dense { values, .. } => operator.diagonal().map_or(values.len(), |d| d.len()),
+                        // The size from the shape: reading stored reals here would widen and keep them.
+                        OperatorBody::Dense { values, .. } => operator.diagonal().map_or_else(|| values.shape().0 * values.shape().1, |d| d.len()),
                     },
                 };
                 total = total.checked_add(count.checked_mul(8).ok_or("operator byte overflow")?).ok_or("operator byte overflow")?;
