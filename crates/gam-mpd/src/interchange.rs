@@ -179,7 +179,7 @@ pub fn prefix(flat: &OperatorProgram) -> Result<OperatorProgram, String> {
 
 /// One read variable at block `block`: rows `rows` of each operator `operator` applied to the
 /// block's read (`parts`), whose value is those rows of the operator's output. [`reads`] gives
-/// `M`'s, as native operators; a library's own ([`library_reads`]) are its operators. A gated MLP
+/// `M`'s, as native operators; a library's own (`library_reads`) are its operators. A gated MLP
 /// function reads through two operators, its gate's and its up map's rows.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReadVariable {
@@ -414,7 +414,7 @@ impl FixedHead {
 
 /// The read variables every explanation of the split native program `native` with its `layers` is
 /// asked about: `M`'s functions, in the order of the library started at `M`
-/// (`library_mdl::explanation`, [`library_reads`]), each part an operator of `native` and its rows.
+/// (`library_mdl::explanation`, `library_reads`), each part an operator of `native` and its rows.
 /// The library's ownership map (`Artifact::owners`) names the native operator and rows each of its
 /// read rows replaces.
 pub fn reads(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Vec<ReadVariable>, String> {
@@ -1275,7 +1275,7 @@ fn outputs(plan: &Plan, bases: &[usize], experiments: &[Experiment]) -> Vec<Rang
 }
 
 /// `M`'s targets for `experiments` on `batch`: `M` on every base and source, the patched runs
-/// forking from their base's clean run at the patched block ([`Plan`]).
+/// forking from their base's clean run at the patched block (`Plan`).
 pub fn targets<E: BlockEngine>(m: &E, head: &FixedHead, batch: &Batch, experiments: &[Experiment]) -> Result<Targets, String> {
     let d = m.device();
     let blocks = m.blocks();

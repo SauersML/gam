@@ -12,6 +12,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+#[cfg(unix)]
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 
@@ -68,16 +69,21 @@ fn main() -> Result<(), String> {
             }
         }
     } else {
+        #[cfg(not(unix))]
+        return Err(format!("{address}: a Unix socket address on a platform without Unix sockets; give HOST:PORT"));
         // A socket file left by an earlier server is replaced.
-        if Path::new(address).exists() {
-            std::fs::remove_file(address).map_err(|e| format!("{address}: {e}"))?;
-        }
-        let listener = UnixListener::bind(address).map_err(|e| format!("{address}: {e}"))?;
-        eprintln!("listening on {address}");
-        for stream in listener.incoming() {
-            match stream {
-                Ok(s) => serve(&mut session, s).unwrap_or_else(|e| eprintln!("{e}")),
-                Err(e) => eprintln!("connection: {e}"),
+        #[cfg(unix)]
+        {
+            if Path::new(address).exists() {
+                std::fs::remove_file(address).map_err(|e| format!("{address}: {e}"))?;
+            }
+            let listener = UnixListener::bind(address).map_err(|e| format!("{address}: {e}"))?;
+            eprintln!("listening on {address}");
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => serve(&mut session, s).unwrap_or_else(|e| eprintln!("{e}")),
+                    Err(e) => eprintln!("connection: {e}"),
+                }
             }
         }
     }
