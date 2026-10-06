@@ -2156,8 +2156,9 @@ pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Po
 /// explanation (a removed group's entries are zeroed), and, to continue an optimizer, IVON's state
 /// per operator as a checkpoint holds it (the gradient's momentum, the curvature estimate and the
 /// gradient's second moment) after `steps` steps. Without a
-/// state, IVON starts at the curvature at which its standard deviations are the posterior's
-/// (`DevicePosterior::new`). `epoch` is the next epoch, whose batches' weight noise the fit draws.
+/// state, the fit makes the Laplace start (`laplace_start`) from the start's means: its standard
+/// deviations and IVON's curvature come from one pass at a sample of the given posterior. `epoch`
+/// is the next epoch, whose batches' weight noise the fit draws.
 pub struct Start {
     pub mean: Vec<Array2<f64>>,
     pub log_sd: Vec<Array2<f64>>,
