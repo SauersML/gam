@@ -243,6 +243,7 @@ fn edit_faithfulness(
         Some(interchange::Patch::Cut { .. }) => "cut_connection",
         Some(interchange::Patch::Parts { .. }) => "remove_parts",
         Some(interchange::Patch::Swap { .. }) => "swap_part",
+        Some(interchange::Patch::PartFrom { .. }) => "remove_part_from",
         Some(_) => "read",
     };
     // Per family: every scored token's bits, the edited tokens' bits, and the experiments.
