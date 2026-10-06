@@ -713,6 +713,17 @@ impl DevicePosterior {
         self.averaged
     }
 
+    /// The line arm's ratio of the joint curvature to the diagonal one, and the steps it averages.
+    #[must_use]
+    pub fn line_ratio(&self) -> (f64, u64) {
+        (self.ratio, self.ratio_steps)
+    }
+
+    /// The line arm's ratio and its steps, restored from a checkpoint.
+    pub fn set_line_ratio(&mut self, (ratio, steps): (f64, u64)) {
+        (self.ratio, self.ratio_steps) = (ratio, steps);
+    }
+
     /// Trainable operator `i`'s state on the host as the device holds it, one operator at a time
     /// (a checkpoint streams them rather than holding every operator's state at once): `μ`, `s`
     /// and IVON's state, all along the operator's rotated axes where it has a rotation.

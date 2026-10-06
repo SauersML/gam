@@ -2073,6 +2073,11 @@ fn rotations(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posteri
 
 /// Where a fit stands at the end of an epoch: with the posterior and the optimizer's moments, all a
 /// fit needs to continue exactly as if it had not stopped.
+/// The line arm's ratio before any step ([`Progress::ratio`]).
+fn unit_ratio() -> (f64, u64) {
+    (1.0, 0)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Progress {
     identity: Identity,
@@ -2087,6 +2092,15 @@ struct Progress {
     /// The steps the posterior's mean averages IVON's iterate over ([`DevicePosterior::averaged`]).
     #[serde(default)]
     averaged: u64,
+    /// The line arm's ratio of the joint curvature to the diagonal one and the steps it averages
+    /// ([`DevicePosterior::line_ratio`]).
+    #[serde(default = "unit_ratio")]
+    ratio: (f64, u64),
+    /// The best epoch since the objective last changed: its mean per-batch estimate and the epoch,
+    /// whose posterior is the checkpoint beside the fit's with extension `best.bin` (the removal
+    /// round starts from it).
+    #[serde(default)]
+    best: Option<(f64, usize)>,
     epochs: Vec<Epoch>,
     removals: Vec<Removal>,
     /// The last epoch's per-batch objective estimates, when convergence is being judged.
@@ -2432,6 +2446,7 @@ impl Snapshot {
         let precision = posterior.storages().map(Precision::of);
         progress.precision = Some(precision);
         progress.averaged = posterior.averaged();
+        progress.ratio = posterior.line_ratio();
         let bytes = checkpoint_payload_bytes(&progress.shapes, precision, &progress.rotation_orders).ok_or("a checkpoint too large to address")?;
         let (header, json) = (serde_json::to_vec(progress).map_err(error)?, serde_json::to_vec_pretty(progress).map_err(error)?);
         // One operator's arrays wait while the writer writes the one before.
@@ -2755,6 +2770,8 @@ pub fn fit_from(
         epoch: 0,
         step: 0,
         averaged: 0,
+        ratio: unit_ratio(),
+        best: None,
         epochs: Vec::new(),
         removals: Vec::new(),
         previous: None,
@@ -2835,7 +2852,10 @@ pub fn fit_from(
     // average with the steps they span: it goes on as the fit that was not stopped.
     if let Some(held) = held_means.take() {
         match held_iterate.take() {
-            Some((iterate, averaged)) => device_posterior.restore(&held, &iterate, averaged)?,
+            Some((iterate, averaged)) => {
+                device_posterior.restore(&held, &iterate, averaged)?;
+                device_posterior.set_line_ratio(progress.ratio);
+            }
             None => device_posterior.restore_means(&held)?,
         }
     }
@@ -2883,7 +2903,13 @@ pub fn fit_from(
     }
     // The posterior at the end of the epoch with the lowest mean per-batch estimate of `F` since
     // the objective last changed (a start or a removal), with that mean.
-    let mut best: Option<(f64, Posterior)> = None;
+    // The best epoch's posterior, written whole where the removal round can read it back: beside
+    // the fit's checkpoint, or for a fit without one a file of its own, removed at the end.
+    static FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let best_path = checkpoint.map_or_else(
+        || std::env::temp_dir().join(format!("library_best_{}_{}.bin", std::process::id(), FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed))),
+        |path| path.with_extension("best.bin"),
+    );
     while !progress.done {
         let epoch = progress.epoch;
         let epoch_started = Instant::now();
@@ -3009,16 +3035,20 @@ pub fn fit_from(
         // The descent stops at the first epoch whose mean improvement over the last, paired batch
         // by batch, is not positive, and the removal round starts from the best epoch's
         // posterior (the lowest mean per-batch estimate since the objective last changed).
-        if best.as_ref().is_none_or(|(b, _)| mean_estimate < *b) {
-            best = Some((mean_estimate, posterior.clone()));
+        let is_best = progress.best.is_none_or(|(b, _)| mean_estimate < b);
+        if is_best {
+            progress.best = Some((mean_estimate, epoch));
         }
         if budget {
             progress.done = true;
         } else if improvement.is_some_and(|i| i <= 0.0) {
-            if let Some((bits, kept)) = best.take() {
+            if let Some((bits, at)) = progress.best.take() {
                 log::info!("library fit stops after epoch {epoch}: back to the best epoch's posterior ({:.6e} bits)", bits / LN_2);
-                posterior = kept;
-                device_posterior.set_values(&posterior)?;
+                if at != epoch {
+                    writer.wait()?;
+                    posterior = checkpoint_posterior(explanation, &best_path)?;
+                    device_posterior.set_values(&posterior)?;
+                }
             }
             let log = checkpoint.map(|path| path.with_extension("removals.jsonl"));
             let evidence = Evidence { draws: &draws, sequences, settings };
@@ -3031,9 +3061,18 @@ pub fn fit_from(
             progress.removals.push(removal);
             // The objective changed discretely: convergence is judged afresh.
             progress.previous = None;
+        } else if is_best {
+            // The best posterior so far, kept on disk rather than as a copy on the host.
+            let mut kept = progress.clone();
+            kept.active = posterior.active.clone();
+            Snapshot::save(&mut kept, &device_posterior, &best_path, &mut writer)?;
         }
         progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
         save(&mut progress, &posterior, &device_posterior, &mut writer)?;
+    }
+    writer.wait()?;
+    if best_path.exists() {
+        std::fs::remove_file(&best_path).map_err(error)?;
     }
     // A fit ended by its budget of epochs has no removal round: its last epoch's estimate.
     let objective_bits = progress.removals.last().map(|r| r.after_bits).or_else(|| settings.epochs.and(progress.epochs.last()).map(|e| e.objective_bits)).unwrap_or(f64::NAN);
@@ -4328,6 +4367,8 @@ mod tests {
             epoch: 4,
             step: 17,
             averaged: 3,
+            ratio: (1.5, 2),
+            best: Some((7.0, 3)),
             epochs: Vec::new(),
             removals: Vec::new(),
             previous: Some(vec![1.0, 2.0]),
