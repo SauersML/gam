@@ -1069,11 +1069,13 @@ impl Device {
     /// (every |a_kj| < 2^e_j) and split into `slices` int8 slices, `a_kj = 2^(e_j − 7) Σ_s a_s,kj
     /// 2^(−7s) + r_kj` with `|r_kj| < 2^(e_j − 7 slices)`; the slice products with `s + t <
     /// slices` are exact in int32 (rows · 127² < 2^31) and added in float64. Per entry the
-    /// result is within `(slices + 4) · rows · 2^(e_i + e_j − 7 slices)` of the exact sum (the
-    /// truncation `2 · 2^(e_i + e_j − 7 slices)` per row, the products left out at most
-    /// `1.01 (slices + 1)` of it, the float64 additions below one more), and `2^(e_i + e_j) < 4
-    /// max_k |a_ki| max_k |a_kj| ≤ 4 √(G_ii G_jj)`: with 9 slices and up to 2^14 rows this is below
-    /// `γ_rows √(G_ii G_jj)`, the bound of a float64 product's own rounding. `Ok(false)` where
+    /// result is within `(slices + 3) · rows · 2^(e_i + e_j − 7 slices) + γ_p Σ_k |a_ki a_kj|` of
+    /// the exact sum, `p` the products added (25 for 9 slices): the truncation is at most
+    /// `2 · 2^(e_i + e_j − 7 slices)` per row, the products left out at most `1.01 (slices + 1)` of
+    /// it, and an entry's slices share its sign, so the added products' magnitudes sum to at most
+    /// `Σ_k |a_ki a_kj|`. Since `2^(e_i + e_j) < 4 max_k |a_ki| max_k |a_kj| ≤ 4 √(G_ii G_jj)`, with
+    /// 9 slices and up to 2^14 rows the whole is below `γ_rows √(G_ii G_jj)`, which bounds a
+    /// float64 product's own rounding as well (Cauchy–Schwarz). `Ok(false)` where
     /// there is no such path (the host, the Apple GPU, or `a` not f32), for the caller's float64
     /// product. Rows above 2^17 are refused (the int32 sums could overflow).
     pub fn gram_split(&self, c: &mut Tensor, a: &Tensor, slices: usize) -> Result<bool, GpuError> {

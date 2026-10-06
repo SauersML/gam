@@ -465,7 +465,9 @@ fn the_split_gram_lies_within_its_bound_and_is_timed_against_the_float64_product
     for i in 0..cols {
         for j in 0..cols {
             let exact = exact_dot(a.column(i), a.column(j));
-            let bound = (slices + 4) as f64 * rows as f64 * 2f64.powi(exponent(i) + exponent(j) - 7 * slices as i32);
+            let magnitude: f64 = a.column(i).iter().zip(a.column(j).iter()).map(|(x, y)| (x * y).abs()).sum();
+            let pairs = (0..slices).map(|s| slices.saturating_sub(2 * s)).sum::<usize>();
+            let bound = (slices + 4) as f64 * rows as f64 * 2f64.powi(exponent(i) + exponent(j) - 7 * slices as i32) + gamma(pairs + 1) * magnitude;
             assert!((c[[i, j]] - exact).abs() <= bound, "entry ({i}, {j}): {} against {exact}, bound {bound}", c[[i, j]]);
         }
     }
