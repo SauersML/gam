@@ -323,6 +323,13 @@ pub trait PriorTerm {
     /// Its value in nats at the weight sample `theta` (its operators', by trainable index) of
     /// `posterior`, its gradient in `theta`, and with `learn` one step of its own parameters.
     fn sample(&mut self, posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String>;
+    /// [`PriorTerm::sample`] at the weight sample of `key` of `device_posterior` (the draws of
+    /// [`DevicePosterior::sample_into`]), its gradient by trainable index on `device`. `posterior`
+    /// holds the groups' activity and the operators' shapes; a term without a form on the device
+    /// moves its operators' values into it ([`host_term`]).
+    fn sample_device(&mut self, device: &Device, device_posterior: &DevicePosterior, posterior: &mut Posterior, key: u64, learn: bool) -> Result<(f64, BTreeMap<usize, Tensor>), String> {
+        host_term(self, device, device_posterior, posterior, key, learn)
+    }
     /// The nats of the parameters it sends.
     fn cost(&self, posterior: &Posterior) -> Result<f64, String>;
     /// Its state, for a checkpoint, and its state restored from one.
@@ -332,7 +339,7 @@ pub trait PriorTerm {
 
 /// The weight sample of `key` (`DevicePosterior::sample_into`'s draws) of `posterior`'s trainable
 /// operators `operators`, on the host.
-fn host_sample(posterior: &Posterior, operators: &[usize], key: u64) -> BTreeMap<usize, Array2<f64>> {
+pub(crate) fn host_sample(posterior: &Posterior, operators: &[usize], key: u64) -> BTreeMap<usize, Array2<f64>> {
     operators
         .par_iter()
         .map(|&i| {
@@ -341,6 +348,22 @@ fn host_sample(posterior: &Posterior, operators: &[usize], key: u64) -> BTreeMap
             (i, &posterior.mean[i] + &posterior.noise(i, &epsilon))
         })
         .collect()
+}
+
+/// [`PriorTerm::sample`] of `prior` at the weight sample of `key` of `device_posterior`, on the
+/// host: its operators' means and deviations come off the device into `posterior`, the sample is
+/// drawn there ([`host_sample`]), and the gradient goes back up.
+pub fn host_term<P: PriorTerm + ?Sized>(prior: &mut P, device: &Device, device_posterior: &DevicePosterior, posterior: &mut Posterior, key: u64, learn: bool) -> Result<(f64, BTreeMap<usize, Tensor>), String> {
+    let operators = prior.operators();
+    for &i in &operators {
+        let (mean, log_sd) = device_posterior.values(i)?;
+        posterior.mean[i] = mean;
+        posterior.log_sd[i] = log_sd;
+    }
+    let theta = host_sample(posterior, &operators, key);
+    let (value, gradient) = prior.sample(posterior, &theta, learn)?;
+    let gradient = gradient.into_iter().map(|(i, g)| Ok((i, device.upload(g.view()).map_err(error)?))).collect::<Result<_, String>>()?;
+    Ok((value, gradient))
 }
 
 /// `prior`'s value with the parameters it sends, in nats, at the weight sample of `key` of
@@ -2858,9 +2881,6 @@ pub fn fit_from(
         {
             prior.epoch(explanation, &posterior)?;
         }
-        // Selection may change the required operators each epoch. Only these means and
-        // deviations cross to the host per step for the current CPU prior implementation.
-        let prior_operators = prior.as_deref().map(PriorTerm::operators).unwrap_or_default();
         // Which groups are active changes only at a removal.
         let subset_code = posterior.subset_nats();
         // Each step's code length of the groups' posteriors, summed on the device and read once
@@ -2887,32 +2907,26 @@ pub fn fit_from(
             device_posterior.code_length_into(&mut code, b)?;
             // The prior term at the same weight sample; its gradient joins the data term's, which
             // the step weighs by `scale` in nats.
-            // The prior's seconds moving values between the device and the host, and computing.
-            let mut prior_seconds = (0.0, 0.0);
+            // The prior's term at the sample on the device (`PriorTerm::sample_device`), and its
+            // seconds.
+            let mut prior_seconds = 0.0;
             let prior_nats = match prior.as_deref_mut() {
                 Some(prior) => {
-                    let moving = Instant::now();
-                    for &i in &prior_operators {
-                        let (mean, log_sd) = device_posterior.values(i)?;
-                        posterior.mean[i] = mean;
-                        posterior.log_sd[i] = log_sd;
-                    }
-                    prior_seconds.0 += moving.elapsed().as_secs_f64();
-                    let computing = Instant::now();
-                    let (nats, extra) = prior_term(prior, &posterior, key, true)?;
-                    prior_seconds.1 += computing.elapsed().as_secs_f64();
-                    let moving = Instant::now();
+                    let timed = Instant::now();
+                    let (nats, extra) = prior.sample_device(device, &device_posterior, &mut posterior, key, true)?;
                     for (i, g) in extra {
                         let op = explanation.trainable[i];
-                        let uploaded = device.upload((g / (scale * LN_2)).view()).map_err(error)?;
                         match gradients.get_mut(&op) {
-                            Some(total) => device.axpy(total, 1.0, &uploaded).map_err(error)?,
+                            Some(total) => device.axpy(total, 1.0 / (scale * LN_2), &g).map_err(error)?,
                             None => {
-                                gradients.insert(op, uploaded);
+                                let mut scaled = device.zeros(g.rows(), g.cols()).map_err(error)?;
+                                device.axpy(&mut scaled, 1.0 / (scale * LN_2), &g).map_err(error)?;
+                                gradients.insert(op, scaled);
                             }
                         }
                     }
-                    prior_seconds.0 += moving.elapsed().as_secs_f64();
+                    let nats = nats + prior.cost(&posterior)?;
+                    prior_seconds = timed.elapsed().as_secs_f64();
                     nats
                 }
                 None => 0.0,
@@ -2921,7 +2935,7 @@ pub fn fit_from(
             priors.push(prior_nats);
             progress.step += 1;
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, weight), &ivon)?;
-            let prior_note = if prior.is_some() { format!(" (prior: {:.2} s moving, {:.2} s computing)", prior_seconds.0, prior_seconds.1) } else { String::new() };
+            let prior_note = if prior.is_some() { format!(" (prior: {prior_seconds:.3} s)") } else { String::new() };
             log::info!("library step {epoch}.{b}: {:.6} bits per scored token, {:.2} s{prior_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
         }
         for ((code_length, data), prior_nats) in device_posterior.code_lengths(&code)?.into_iter().zip(datas).zip(priors) {

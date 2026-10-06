@@ -51,6 +51,14 @@
 //! and cannot be reconstructed from a parent sample alone. This is a conservative literal charge; the other parameter costs remain the existing
 //! asymptotic estimates. A removed target sends nothing.
 //!
+//! In a fit the blocks' term runs on the device (`PriorTerm::sample_device`): the weight sample of
+//! every block a term reads is drawn into one table of rows (an output vector turned to a row),
+//! the targets' and candidates' rows gathered, the scaled residuals `r_j = g − c_j u_j` and their
+//! sums of squares `‖r_j‖²`, `u_j · r_j` and `‖g‖²` formed there, and only these per-target scalars
+//! come to the host, which forms the term ([`scalar_term`]) and each row's coefficients; the
+//! gradient, `α g + Σ_j β_j r_j` in a target and `γ_j r_j` in a candidate, is summed per row on
+//! the device. Key-value groups' terms, few and gauged, are formed on the host.
+//!
 //! The sample gradient treats `v` and the epoch's gauges as fixed hyperparameters. Recomputing
 //! `v` from the posterior is an adaptive update, not the optimum of the mixture objective:
 //! the Gaussian-only empirical-Bayes identity does not cancel the mixture's derivative through
@@ -84,10 +92,12 @@
 //! `F` falls after the fit re-converges.
 
 use crate::{
+    device_posterior::DevicePosterior,
     library_mdl::{Explanation, Posterior, PriorTerm},
     library_sharing::{self, Tie},
     operator_program::OperatorProgram,
 };
+use gam_gpu::tensor::{Arithmetic, Device, Indices, Op, Storage, Tensor};
 use gam_linalg::faer_ndarray::fast_ab;
 use gam_math::categorical::{log_softmax, log_sum_exp};
 use ndarray::{Array1, Array2, ArrayView1};
@@ -251,6 +261,107 @@ pub fn term(g: ArrayView1<'_, f64>, writes: &[(ArrayView1<'_, f64>, f64)], logit
     Ok(Term { value, target, writes: out_writes, scales, logits: logits_derivative, log_variance: log_variance_derivative })
 }
 
+/// [`term`] of a target whose entries share one variance `v`, from its sample's sums of squares
+/// alone: `‖g‖²`, and per component `‖r_j‖²` and `u_j · r_j` of its scaled residual
+/// `r_j = g − c_j u_j`, in `d` coordinates. Its derivative in `g` is `target · g + Σ_j residuals_j r_j`,
+/// in `u_j` `writes_j r_j`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Scalars {
+    pub value: f64,
+    pub target: f64,
+    pub residuals: Vec<f64>,
+    pub writes: Vec<f64>,
+    pub scales: Vec<f64>,
+    pub logits: Vec<f64>,
+    pub log_variance: f64,
+}
+
+/// [`Scalars`] of a target sample with `‖g‖² = gg`, `‖r_j‖² = rr_j` and `u_j · r_j = ur_j` against
+/// the components' scales `c_j`, the logits `z` (the zero component's first), `ln s²` and the
+/// groups' variance `v`, in `d` coordinates ([`term`] with `v` the same for every entry).
+pub fn scalar_term(gg: f64, (rr, ur): (&[f64], &[f64]), scales: &[f64], logits: &[f64], log_variance: f64, v: f64, d: usize) -> Result<Scalars, String> {
+    if logits.len() != rr.len() + 1 || ur.len() != rr.len() || scales.len() != rr.len() || !(v > 0.0) || !log_variance.is_finite() {
+        return Err("a mixture term needs one logit per component and the zero's, and a positive variance".into());
+    }
+    let d = d as f64;
+    let s2 = log_variance.exp();
+    let pi = log_softmax(logits).map_err(error)?;
+    let zero = -0.5 * d * (2.0 * PI * v).ln() - gg / (2.0 * v);
+    let mut ell = vec![pi[0]];
+    for (j, r) in rr.iter().enumerate() {
+        ell.push(pi[j + 1] - 0.5 * d * (2.0 * PI * s2).ln() - r / (2.0 * s2) - zero);
+    }
+    let value = -log_sum_exp(&ell).map_err(error)?;
+    let w: Vec<f64> = log_softmax(&ell).map_err(error)?.into_iter().map(f64::exp).collect();
+    let mut target = 0.0;
+    let (mut residuals, mut writes, mut scale_derivatives) = (Vec::with_capacity(rr.len()), Vec::with_capacity(rr.len()), Vec::with_capacity(rr.len()));
+    let mut log_variance_derivative = 0.0;
+    for j in 0..rr.len() {
+        let wj = w[j + 1];
+        target -= wj / v;
+        residuals.push(wj / s2);
+        writes.push(-wj * scales[j] / s2);
+        scale_derivatives.push(-wj * ur[j] / s2);
+        log_variance_derivative += wj * (0.5 * d - rr[j] / (2.0 * s2));
+    }
+    let logits_derivative = pi.iter().zip(&w).map(|(p, w)| p.exp() - w).collect();
+    Ok(Scalars { value, target, residuals, writes, scales: scale_derivatives, logits: logits_derivative, log_variance: log_variance_derivative })
+}
+
+/// The epoch's layout of the blocks' term on the device ([`Mixture::sample_device`]), built at the
+/// first step after the components or the groups' activity change.
+struct Layout {
+    active: Vec<bool>,
+    /// The rows of the table: per block operator read (trainable index), whether its blocks are
+    /// its columns, its first row and its count of blocks; the token rows follow at `rows`.
+    segments: Vec<(usize, bool, usize, usize)>,
+    rows: usize,
+    tokens: Option<Tensor>,
+    d: usize,
+    /// Per target with components, in order: its index and its first pair (its components'
+    /// pairs follow in order).
+    targets: Vec<(usize, usize)>,
+    pairs: usize,
+    /// Per pair, the table rows of its target and its candidate, and its scale `c` (`pairs × 1`).
+    target_rows: Indices,
+    candidate_rows: Indices,
+    scales: Tensor,
+    /// Per target, its table row.
+    first_rows: Indices,
+    /// The pairs whose candidate is a parameter's (not a token row), in pair order, and per pair
+    /// its place among them.
+    parameter_pairs: Option<Indices>,
+    parameter_place: Vec<Option<usize>>,
+    /// The sources' count (targets, then pairs, then parameter pairs) and the destination rows'.
+    sources: usize,
+    destinations: usize,
+    /// Per slot `m`, the `m`-th source of each destination with more than `m` (destinations in
+    /// decreasing count, so the slot's destinations are the first).
+    slots: Vec<Indices>,
+    /// Per segment with a destination, the place of each of its rows among the destinations
+    /// (`destinations` for none).
+    scatter: Vec<(usize, Indices)>,
+    eye: Tensor,
+    ones_row: Tensor,
+    ones_column: Tensor,
+}
+
+/// [`Layout`] held by a [`Mixture`]: not saved, and rebuilt by a copy.
+#[derive(Default)]
+struct Plan(Option<Layout>);
+
+impl Clone for Plan {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+impl std::fmt::Debug for Plan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Plan(laid out)" } else { "Plan(none)" })
+    }
+}
+
 /// Adam's moments of one parameter.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 struct Moment {
@@ -306,6 +417,11 @@ pub struct Mixture {
     #[serde(skip)]
     embedding: Array2<f64>,
     cells: Vec<Vec<(usize, Vec<usize>, std::ops::Range<usize>)>>,
+    /// Per trainable index, its operator in the program (`Explanation::trainable`).
+    #[serde(skip)]
+    trainable: Vec<usize>,
+    #[serde(skip)]
+    plan: Plan,
 }
 
 fn operator_index(program: &OperatorProgram, name: &str) -> Result<usize, String> {
@@ -402,7 +518,7 @@ impl Mixture {
             cells.push(Vec::new());
         }
         let moments = targets.iter().map(|_| vec![Moment::default(); 2]).collect();
-        Ok(Self { targets, width, steps, taken: 0, moments, gates, outputs, ups, key_values, values, embedding, cells })
+        Ok(Self { targets, width, steps, taken: 0, moments, gates, outputs, ups, key_values, values, embedding, cells, trainable: explanation.trainable.clone(), plan: Plan::default() })
     }
 
     /// The maps of key-value group `group` of layer `layer`.
@@ -1211,12 +1327,12 @@ impl Mixture {
     }
 }
 
-impl PriorTerm for Mixture {
-    fn operators(&self) -> Vec<usize> {
-        // Only the selected conditional factors need per-step host samples. Candidate
-        // selection itself sees the complete posterior at the epoch boundary.
+impl Mixture {
+    /// The operators the terms of `targets` read (trainable indices).
+    fn operators_of(&self, targets: &[usize]) -> Vec<usize> {
         let mut out = Vec::new();
-        for (t, target) in self.targets.iter().enumerate().filter(|(_, t)| !t.components.is_empty()) {
+        for &t in targets {
+            let target = &self.targets[t];
             match target.kind {
                 Kind::Gate { .. } | Kind::Up { .. } | Kind::Output { .. } => {
                     out.extend(self.place(Write::of(target.kind)).map(|p| p.0));
@@ -1247,18 +1363,15 @@ impl PriorTerm for Mixture {
         out
     }
 
-    fn epoch(&mut self, explanation: &Explanation, posterior: &Posterior) -> Result<(), String> {
-        self.choose(explanation, posterior)
-    }
-
-    fn sample(&mut self, posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String> {
+    /// The terms of `targets` at `theta` on the host: their sum, its gradient in the operators'
+    /// samples, and each target's derivatives in its own parameters into `learned`.
+    fn host_terms(&self, targets: &[usize], posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>, learned: &mut [Vec<f64>]) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String> {
         use rayon::prelude::*;
         // Each target's term and derivatives on its own (in parallel), then summed in target order.
-        let found: Vec<Option<(f64, Vec<Piece>, Vec<f64>)>> = (0..self.targets.len()).into_par_iter().map(|t| self.target_term(t, posterior, theta)).collect::<Result<_, String>>()?;
+        let found: Vec<Option<(f64, Vec<Piece>, Vec<f64>)>> = targets.par_iter().map(|&t| self.target_term(t, posterior, theta)).collect::<Result<_, String>>()?;
         let mut value = 0.0;
         let mut gradient: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
-        let mut learned = vec![Vec::new(); self.targets.len()];
-        for (t, found) in found.into_iter().enumerate() {
+        for (&t, found) in targets.iter().zip(found) {
             let Some((term, pieces, own)) = found else { continue };
             value += term;
             for piece in pieces {
@@ -1276,6 +1389,293 @@ impl PriorTerm for Mixture {
                 }
             }
             learned[t] = own;
+        }
+        Ok((value, gradient))
+    }
+
+    /// Whether target `t` is a block's (not a key-value group's).
+    fn is_block(&self, t: usize) -> bool {
+        matches!(self.targets[t].kind, Kind::Gate { .. } | Kind::Up { .. } | Kind::Output { .. })
+    }
+
+    /// The table row of a block or token row in `rows` (a segment's first row per operator, the
+    /// token rows' places).
+    fn table_row(&self, write: Write, segments: &BTreeMap<usize, usize>, tokens: &BTreeMap<usize, usize>) -> Result<usize, String> {
+        match write {
+            Write::Token(token) => tokens.get(&token).copied().ok_or_else(|| "a token row outside the layout".to_string()),
+            Write::Output { function, .. } | Write::Gate { function, .. } | Write::Up { function, .. } => Ok(segments.get(&self.place(write)?.0).ok_or("a block outside the layout")? + function),
+            Write::QueryKey { .. } | Write::Value { .. } => Err("a key-value group is no MLP block".into()),
+        }
+    }
+
+    /// The layout of the block targets `blocks` (each with components) on `device` ([`Layout`]).
+    fn layout(&self, device: &Device, posterior: &Posterior, blocks: &[usize]) -> Result<Layout, String> {
+        // The operators read, each its rows (gate, up) or its columns (output) as table rows.
+        let mut read: Vec<Write> = Vec::new();
+        for &t in blocks {
+            read.push(Write::of(self.targets[t].kind));
+            read.extend(self.targets[t].components.iter().map(|c| c.write));
+        }
+        let mut operators: Vec<(usize, bool)> = read.iter().filter(|w| !matches!(w, Write::Token(_))).map(|&w| self.place(w)).collect::<Result<_, _>>()?;
+        operators.sort_unstable();
+        operators.dedup();
+        let (mut segments, mut first) = (Vec::new(), BTreeMap::new());
+        let mut rows = 0;
+        let mut d = None;
+        for (i, column) in operators {
+            let (r, c) = posterior.mean[i].dim();
+            let (count, width) = if column { (c, r) } else { (r, c) };
+            if d.is_some_and(|d| d != width) {
+                return Err("the mixture's blocks differ in length".into());
+            }
+            d = Some(width);
+            segments.push((i, column, rows, count));
+            first.insert(i, rows);
+            rows += count;
+        }
+        let d = d.ok_or("no block in the layout")?;
+        let mut tokens: Vec<usize> = read.iter().filter_map(|w| if let Write::Token(t) = w { Some(*t) } else { None }).collect();
+        tokens.sort_unstable();
+        tokens.dedup();
+        let token_rows: BTreeMap<usize, usize> = tokens.iter().enumerate().map(|(k, t)| (*t, rows + k)).collect();
+        let upload = |a: &Array2<f64>| device.upload(a.view()).map_err(error);
+        let indices = |v: &[usize]| -> Result<Indices, String> { device.upload_indices(&v.iter().map(|&x| u32::try_from(x).map_err(error)).collect::<Result<Vec<_>, _>>()?).map_err(error) };
+        let token_table = if tokens.is_empty() { None } else { Some(upload(&Array2::from_shape_fn((tokens.len(), d), |(k, c)| self.embedding[[c, tokens[k]]]))?) };
+        // The pairs, target by target.
+        let (mut targets, mut target_rows, mut candidate_rows, mut scales, mut first_rows) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut parameter_pairs, mut parameter_place) = (Vec::new(), Vec::new());
+        for &t in blocks {
+            let target = &self.targets[t];
+            let own = self.table_row(Write::of(target.kind), &first, &token_rows)?;
+            targets.push((t, target_rows.len()));
+            first_rows.push(own);
+            for component in &target.components {
+                let row = self.table_row(component.write, &first, &token_rows)?;
+                parameter_place.push((row < rows).then(|| {
+                    parameter_pairs.push(target_rows.len());
+                    parameter_pairs.len() - 1
+                }));
+                target_rows.push(own);
+                candidate_rows.push(row);
+                scales.push(component.scale);
+            }
+        }
+        let pairs = target_rows.len();
+        // Each destination row's sources: a target's own row (coefficient α) and its residuals
+        // (β); a parameter candidate's row its residual (γ).
+        let mut incoming: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (k, &(_, start)) in targets.iter().enumerate() {
+            let sources = incoming.entry(first_rows[k]).or_default();
+            sources.push(k);
+            let end = targets.get(k + 1).map_or(pairs, |next| next.1);
+            sources.extend((start..end).map(|p| targets.len() + p));
+        }
+        for (q, &p) in parameter_pairs.iter().enumerate() {
+            incoming.entry(candidate_rows[p]).or_default().push(targets.len() + pairs + q);
+        }
+        let mut order: Vec<(usize, Vec<usize>)> = incoming.into_iter().collect();
+        order.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+        let most = order.first().map_or(0, |o| o.1.len());
+        let slots = (0..most).map(|m| indices(&order.iter().take_while(|o| o.1.len() > m).map(|o| o.1[m]).collect::<Vec<_>>())).collect::<Result<Vec<_>, _>>()?;
+        let place: BTreeMap<usize, usize> = order.iter().enumerate().map(|(k, o)| (o.0, k)).collect();
+        let destinations = order.len();
+        let mut scatter = Vec::new();
+        for (s, &(_, _, start, count)) in segments.iter().enumerate() {
+            let at: Vec<usize> = (start..start + count).map(|r| place.get(&r).copied().unwrap_or(destinations)).collect();
+            if at.iter().any(|&a| a < destinations) {
+                scatter.push((s, indices(&at)?));
+            }
+        }
+        Ok(Layout {
+            active: posterior.active.clone(),
+            segments,
+            rows,
+            tokens: token_table,
+            d,
+            targets,
+            pairs,
+            target_rows: indices(&target_rows)?,
+            candidate_rows: indices(&candidate_rows)?,
+            scales: device.upload_vec(pairs, 1, scales).map_err(error)?,
+            first_rows: indices(&first_rows)?,
+            parameter_pairs: if parameter_pairs.is_empty() { None } else { Some(indices(&parameter_pairs)?) },
+            parameter_place,
+            sources: first_rows.len() + pairs + parameter_pairs.len(),
+            destinations,
+            slots,
+            scatter,
+            eye: upload(&Array2::eye(d))?,
+            ones_row: upload(&Array2::ones((1, d)))?,
+            ones_column: upload(&Array2::ones((d, 1)))?,
+        })
+    }
+
+    /// The block targets' term at the weight sample of `key` on `device` (module note): its value
+    /// and gradient by trainable index, each target's derivatives in its own parameters into
+    /// `learned`.
+    fn blocks_on_device(&self, device: &Device, device_posterior: &DevicePosterior, key: u64, learned: &mut [Vec<f64>]) -> Result<(f64, BTreeMap<usize, Tensor>), String> {
+        let layout = self.plan.0.as_ref().ok_or("the blocks' term has no layout")?;
+        let arithmetic = if device.storage() == Storage::F64 { Arithmetic::F64 } else { Arithmetic::F32 };
+        let (d, pairs) = (layout.d, layout.pairs);
+        // The table: every block read at the sample (an output's column turned to a row), then the
+        // token rows.
+        let mut table = device.zeros(layout.rows + layout.tokens.as_ref().map_or(0, Tensor::rows), d).map_err(error)?;
+        for &(i, column, start, count) in &layout.segments {
+            let op = self.trainable[i];
+            if column {
+                let mut sample = device.zeros(d, count).map_err(error)?;
+                device_posterior.sample_block(op, &mut sample, (0, 0), key)?;
+                let mut turned = device.zeros(count, d).map_err(error)?;
+                device.gemm(&mut turned, 1.0, &sample, Op::T, &layout.eye, Op::N, 0.0, arithmetic).map_err(error)?;
+                device.set_rows(&mut table, start, &turned).map_err(error)?;
+            } else {
+                device_posterior.sample_block(op, &mut table, (start, 0), key)?;
+            }
+        }
+        if let Some(tokens) = &layout.tokens {
+            device.set_rows(&mut table, layout.rows, tokens).map_err(error)?;
+        }
+        // Per pair, the target's row `g`, the candidate's `u` and the scaled residual `r = g − c u`.
+        let g = device.gather_rows(&table, &layout.target_rows).map_err(error)?;
+        let u = device.gather_rows(&table, &layout.candidate_rows).map_err(error)?;
+        let spread = |column: &Tensor, rows: usize| -> Result<Tensor, String> {
+            let mut out = device.zeros(rows, d).map_err(error)?;
+            device.gemm(&mut out, 1.0, column, Op::N, &layout.ones_row, Op::N, 0.0, arithmetic).map_err(error)?;
+            Ok(out)
+        };
+        let mut r = device.copy(&g).map_err(error)?;
+        {
+            let mut scaled = device.zeros(pairs, d).map_err(error)?;
+            device.hadamard(&mut scaled, &spread(&layout.scales, pairs)?, &u, false).map_err(error)?;
+            device.axpy(&mut r, -1.0, &scaled).map_err(error)?;
+        }
+        let sums = |a: &Tensor, b: &Tensor| -> Result<Vec<f64>, String> {
+            let mut product = device.zeros(pairs, d).map_err(error)?;
+            device.hadamard(&mut product, a, b, false).map_err(error)?;
+            let mut out = device.zeros(pairs, 1).map_err(error)?;
+            device.gemm(&mut out, 1.0, &product, Op::N, &layout.ones_column, Op::N, 0.0, arithmetic).map_err(error)?;
+            Ok(device.download(&out).map_err(error)?.into_iter().collect())
+        };
+        let (rr, ur, gg) = (sums(&r, &r)?, sums(&u, &r)?, sums(&g, &g)?);
+        drop((g, u));
+        // The terms and each source row's coefficient: per target α, per pair β, per parameter
+        // pair γ.
+        let variances = device_posterior.variances()?;
+        let count = layout.targets.len();
+        let mut coefficients = vec![0.0; layout.sources];
+        let mut value = 0.0;
+        for (k, &(t, start)) in layout.targets.iter().enumerate() {
+            let target = &self.targets[t];
+            let n = target.components.len();
+            let logits: Vec<f64> = std::iter::once(target.zero_logit).chain(target.components.iter().map(|c| c.logit)).collect();
+            let scales: Vec<f64> = target.components.iter().map(|c| c.scale).collect();
+            let v = variances[*target.groups.first().ok_or("a block target without its group")?];
+            let found = scalar_term(gg[start], (&rr[start..start + n], &ur[start..start + n]), &scales, &logits, target.log_variance, v, d)?;
+            value += found.value;
+            coefficients[k] = found.target;
+            for j in 0..n {
+                coefficients[count + start + j] = found.residuals[j];
+                if let Some(q) = layout.parameter_place[start + j] {
+                    coefficients[count + pairs + q] = found.writes[j];
+                }
+            }
+            let mut own = vec![found.logits[0]];
+            for j in 0..n {
+                own.extend([found.logits[j + 1], found.scales[j]]);
+            }
+            own.push(found.log_variance);
+            learned[t] = own;
+        }
+        // The weighted sources, then each destination row's sum, slot by slot.
+        let mut sources = device.zeros(layout.sources, d).map_err(error)?;
+        device.set_rows(&mut sources, 0, &device.gather_rows(&table, &layout.first_rows).map_err(error)?).map_err(error)?;
+        drop(table);
+        device.set_rows(&mut sources, count, &r).map_err(error)?;
+        if let Some(parameter_pairs) = &layout.parameter_pairs {
+            device.set_rows(&mut sources, count + pairs, &device.gather_rows(&r, parameter_pairs).map_err(error)?).map_err(error)?;
+        }
+        drop(r);
+        let mut weighted = device.zeros(layout.sources, d).map_err(error)?;
+        device.hadamard(&mut weighted, &spread(&device.upload_vec(layout.sources, 1, coefficients).map_err(error)?, layout.sources)?, &sources, false).map_err(error)?;
+        drop(sources);
+        let mut rows = device.zeros(layout.destinations + 1, d).map_err(error)?;
+        for slot in &layout.slots {
+            let mut prefix = device.rows_of(&rows, 0, slot.len()).map_err(error)?;
+            device.axpy(&mut prefix, 1.0, &device.gather_rows(&weighted, slot).map_err(error)?).map_err(error)?;
+            device.set_rows(&mut rows, 0, &prefix).map_err(error)?;
+        }
+        let mut gradient = BTreeMap::new();
+        for (s, at) in &layout.scatter {
+            let (i, column, _, count) = layout.segments[*s];
+            let own = device.gather_rows(&rows, at).map_err(error)?;
+            let g = if column {
+                let mut g = device.zeros(d, count).map_err(error)?;
+                device.gemm(&mut g, 1.0, &layout.eye, Op::N, &own, Op::T, 0.0, arithmetic).map_err(error)?;
+                g
+            } else {
+                own
+            };
+            gradient.insert(i, g);
+        }
+        Ok((value, gradient))
+    }
+}
+
+impl PriorTerm for Mixture {
+    fn operators(&self) -> Vec<usize> {
+        // Only the selected conditional factors need per-step samples. Candidate selection itself
+        // sees the complete posterior at the epoch boundary.
+        self.operators_of(&(0..self.targets.len()).filter(|&t| !self.targets[t].components.is_empty()).collect::<Vec<_>>())
+    }
+
+    fn epoch(&mut self, explanation: &Explanation, posterior: &Posterior) -> Result<(), String> {
+        self.plan = Plan::default();
+        self.choose(explanation, posterior)
+    }
+
+    fn sample(&mut self, posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String> {
+        let mut learned = vec![Vec::new(); self.targets.len()];
+        let found = self.host_terms(&(0..self.targets.len()).collect::<Vec<_>>(), posterior, theta, &mut learned)?;
+        if learn {
+            self.learn(&learned);
+        }
+        Ok(found)
+    }
+
+    fn sample_device(&mut self, device: &Device, device_posterior: &DevicePosterior, posterior: &mut Posterior, key: u64, learn: bool) -> Result<(f64, BTreeMap<usize, Tensor>), String> {
+        let live: Vec<usize> = (0..self.targets.len()).filter(|&t| !self.targets[t].components.is_empty() && self.active(t, posterior)).collect();
+        let (blocks, heads): (Vec<usize>, Vec<usize>) = live.into_iter().partition(|&t| self.is_block(t));
+        let mut learned = vec![Vec::new(); self.targets.len()];
+        let (mut value, mut gradient) = (0.0, BTreeMap::new());
+        if !heads.is_empty() {
+            // The key-value groups' terms on the host, at their operators' sample.
+            let operators = self.operators_of(&heads);
+            for &i in &operators {
+                let (mean, log_sd) = device_posterior.values(i)?;
+                posterior.mean[i] = mean;
+                posterior.log_sd[i] = log_sd;
+            }
+            let theta = crate::library_mdl::host_sample(posterior, &operators, key);
+            let (nats, host) = self.host_terms(&heads, posterior, &theta, &mut learned)?;
+            value += nats;
+            for (i, g) in host {
+                gradient.insert(i, device.upload(g.view()).map_err(error)?);
+            }
+        }
+        if !blocks.is_empty() {
+            if self.plan.0.as_ref().is_none_or(|layout| layout.active != posterior.active) {
+                self.plan = Plan(Some(self.layout(device, posterior, &blocks)?));
+            }
+            let (nats, on_device) = self.blocks_on_device(device, device_posterior, key, &mut learned)?;
+            value += nats;
+            for (i, g) in on_device {
+                match gradient.get_mut(&i) {
+                    Some(total) => device.axpy(total, 1.0, &g).map_err(error)?,
+                    None => {
+                        gradient.insert(i, g);
+                    }
+                }
+            }
         }
         if learn {
             self.learn(&learned);
@@ -1334,6 +1734,7 @@ impl PriorTerm for Mixture {
         }
         // Validate before moving the embedding: a rejected checkpoint leaves all state intact.
         restored.embedding = std::mem::take(&mut self.embedding);
+        restored.trainable = std::mem::take(&mut self.trainable);
         *self = restored;
         Ok(())
     }
@@ -1366,6 +1767,24 @@ impl PriorTerm for Priors {
             for (i, g) in part {
                 match gradient.get_mut(&i) {
                     Some(sum) => *sum += &g,
+                    None => {
+                        gradient.insert(i, g);
+                    }
+                }
+            }
+        }
+        Ok((total, gradient))
+    }
+
+    fn sample_device(&mut self, device: &Device, device_posterior: &DevicePosterior, posterior: &mut Posterior, key: u64, learn: bool) -> Result<(f64, BTreeMap<usize, Tensor>), String> {
+        let mut total = 0.0;
+        let mut gradient: BTreeMap<usize, Tensor> = BTreeMap::new();
+        for prior in &mut self.0 {
+            let (value, part) = prior.sample_device(device, device_posterior, posterior, key, learn)?;
+            total += value;
+            for (i, g) in part {
+                match gradient.get_mut(&i) {
+                    Some(sum) => device.axpy(sum, 1.0, &g).map_err(error)?,
                     None => {
                         gradient.insert(i, g);
                     }
@@ -1745,6 +2164,71 @@ mod tests {
             let central = (at(h) - at(-h)) / (2.0 * h);
             let found = gradient[&i][entry];
             assert!((found - central).abs() <= 1e-6 * (1.0 + central.abs()), "operator {i} {entry:?}: {found} against {central}");
+        }
+    }
+
+    #[test]
+    fn the_scalar_term_is_the_term_at_one_variance() {
+        let d = 9;
+        let at = |stream: u64| Array1::from_shape_fn(d, |k| f64::from(posterior_normal(3, stream, k as u64)));
+        let g = at(0);
+        let writes = [at(1), &g * 0.9 + &at(2) * 0.05, at(3)];
+        let scales = [0.4, 1.1, -0.7];
+        let logits = [0.2, -0.3, 0.6, 0.1];
+        let (log_variance, v) = (-1.3, 0.8);
+        let views: Vec<(ArrayView1<'_, f64>, f64)> = writes.iter().zip(scales).map(|(u, c)| (u.view(), c)).collect();
+        let full = term(g.view(), &views, &logits, log_variance, Array1::from_elem(d, v).view()).unwrap();
+        let residuals: Vec<Array1<f64>> = writes.iter().zip(scales).map(|(u, c)| &g - &(u * c)).collect();
+        let rr: Vec<f64> = residuals.iter().map(|r| r.dot(r)).collect();
+        let ur: Vec<f64> = writes.iter().zip(&residuals).map(|(u, r)| u.dot(r)).collect();
+        let found = scalar_term(g.dot(&g), (&rr, &ur), &scales, &logits, log_variance, v, d).unwrap();
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * (1.0 + b.abs());
+        assert!(close(found.value, full.value));
+        let target = residuals.iter().zip(&found.residuals).fold(&g * found.target, |sum, (r, b)| sum + r * *b);
+        assert!(target.iter().zip(&full.target).all(|(a, b)| close(*a, *b)), "the target's derivative");
+        for (j, r) in residuals.iter().enumerate() {
+            assert!((r * found.writes[j]).iter().zip(&full.writes[j]).all(|(a, b)| close(*a, *b)), "a candidate's derivative");
+            assert!(close(found.scales[j], full.scales[j]));
+        }
+        assert!(found.logits.iter().zip(&full.logits).all(|(a, b)| close(*a, *b)));
+        assert!(close(found.log_variance, full.log_variance));
+    }
+
+    #[test]
+    fn the_blocks_term_on_the_device_is_the_host_term() {
+        use crate::device_posterior::DevicePosterior;
+        let (explanation, posterior, mut mixture) = head_fixture("library_mixture_device");
+        mixture.choose(&explanation, &posterior).unwrap();
+        // Planted components of every block kind and candidate: a gate reading an earlier output,
+        // gate and token row, a second gate reading the same output, an output two earlier ones.
+        let plant = |mixture: &mut Mixture, kind: Kind, writes: &[(Write, f64, f64)]| {
+            let t = mixture.targets.iter().position(|t| t.kind == kind).unwrap();
+            let target = &mut mixture.targets[t];
+            target.components = writes.iter().map(|&(write, scale, logit)| Component { write, scale, logit, gauge: Vec::new(), assignment: Vec::new(), transport: None }).collect();
+            target.zero_logit = 0.3;
+            target.log_variance = -4.0;
+            mixture.moments[t] = vec![Moment::default(); 2 + 2 * writes.len()];
+        };
+        plant(&mut mixture, Kind::Gate { layer: 1, function: 5 }, &[(Write::Output { layer: 0, function: 3 }, 0.8, 0.1), (Write::Gate { layer: 0, function: 2 }, -0.5, -0.2), (Write::Token(7), 1.2, 0.0)]);
+        plant(&mut mixture, Kind::Gate { layer: 1, function: 6 }, &[(Write::Output { layer: 0, function: 3 }, 0.4, 0.5)]);
+        plant(&mut mixture, Kind::Output { layer: 1, function: 2 }, &[(Write::Output { layer: 0, function: 3 }, 1.1, 0.2), (Write::Output { layer: 0, function: 1 }, 0.3, -0.1)]);
+        assert!(mixture.targets.iter().any(|t| matches!(t.kind, Kind::QueryKey { .. }) && !t.components.is_empty()), "a key-value group's term on the host too");
+        let device = Device::host();
+        let resident = DevicePosterior::new(&device, &explanation, &posterior, 1e6, None, 0).unwrap();
+        let mut host = mixture.clone();
+        let theta = draw(&host, &posterior, 9);
+        let (value, gradient) = host.sample(&posterior, &theta, true).unwrap();
+        let (on_device, moved) = mixture.sample_device(&device, &resident, &mut posterior.clone(), 9, true).unwrap();
+        assert!((on_device - value).abs() <= 1e-9 * (1.0 + value.abs()), "the value {on_device} against {value}");
+        assert_eq!(moved.keys().collect::<Vec<_>>(), gradient.keys().collect::<Vec<_>>());
+        for (i, g) in &gradient {
+            let scale = g.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+            let found = device.download(&moved[i]).unwrap();
+            assert!(found.iter().zip(g.iter()).all(|(a, b)| (a - b).abs() <= 1e-9 * (1.0 + scale)), "operator {i}'s gradient");
+        }
+        // One step of the mixture's own parameters from the same derivatives.
+        for (a, b) in mixture.targets.iter().zip(&host.targets) {
+            assert!((a.zero_logit - b.zero_logit).abs() < 1e-12 && a.components.iter().zip(&b.components).all(|(x, y)| (x.logit - y.logit).abs() < 1e-12));
         }
     }
 
