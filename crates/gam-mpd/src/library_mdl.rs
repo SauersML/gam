@@ -4622,6 +4622,42 @@ mod tests {
         }
     }
 
+    /// The budget's step terms on the tiny decoder with ReLU functions: the derivative of the
+    /// batch's expected parts per token in a gate mean of the last layer (whose count no later
+    /// layer's input carries) matches the change of the count itself under that mean's tangent,
+    /// central differences of `complexity_terms` with the posterior moved along it (relative 1e-5).
+    #[test]
+    fn the_budget_terms_derivative_matches_the_counts_tangent() {
+        let (native, layers, _, sequences) = tiny("library_budget_tangent", "relu");
+        let explanation = explanation(&native, &layers).unwrap();
+        let settings = settings();
+        let device = Device::host();
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let batch = draws[0].batch(&sequences).unwrap();
+        let key = training_key(settings.seed, 0, 0);
+        let mut terms_at = |posterior: &Posterior| {
+            let device_posterior = DevicePosterior::new(&device, &explanation, posterior, 72.0, None, 0).unwrap();
+            complexity_terms(&mut scorer, &device_posterior, &explanation, &posterior.active, &batch, key).unwrap()
+        };
+        let (count, terms) = terms_at(&posterior);
+        assert!(count > 0.0);
+        // The last layer's gate: its trainable index is the largest among the gates' terms whose
+        // derivative has the shape of a gate (more than one column).
+        let (i, gradient, _) = terms.iter().filter(|(_, m, _)| m.ncols() > 1).max_by_key(|(i, _, _)| *i).unwrap();
+        let (r, c) = gradient.indexed_iter().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).unwrap().0;
+        assert!(gradient[[r, c]] != 0.0);
+        let h = 1e-6;
+        let moved = |delta: f64| {
+            let mut p = posterior.clone();
+            p.mean[*i][[r, c]] += delta;
+            p
+        };
+        let numeric = (terms_at(&moved(h)).0 - terms_at(&moved(-h)).0) / (2.0 * h);
+        assert!((numeric - gradient[[r, c]]).abs() <= 1e-5 * (1.0 + numeric.abs()), "∂Ê/∂μ {} against the count's tangent {numeric}", gradient[[r, c]]);
+    }
+
     /// A budget that never binds (`K = ∞`, or `K` far above any count, where `λ` stays 0) leaves
     /// the fit bit for bit; a finite one records `K`, `Ê[k]` and `λ` in every epoch.
     #[test]
