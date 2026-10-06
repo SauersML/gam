@@ -398,6 +398,20 @@ fn library_operator(name: &str, rows: Interface, cols: Interface, values: Array2
         .map_err(error)
 }
 
+/// [`library_operator`] holding `source`'s reals as they are: where a checkpoint stores them
+/// (`DenseValues::stored`), the library's operator reads them there too, with no float64 copy on
+/// the host.
+fn library_copy(name: &str, rows: Interface, cols: Interface, source: &Operator) -> Result<Operator, String> {
+    match &source.body {
+        OperatorBody::Dense { values, present, .. } if present.iter().all(|p| *p) && values.stored().is_some() => {
+            let stored = values.stored().cloned().ok_or("stored reals")?;
+            let provenance = Provenance::derived(&[&Provenance::native(&source.name)], "library initialization".into());
+            Operator::stored(name, rows, cols, stored, provenance).map_err(error)
+        }
+        _ => library_operator(name, rows, cols, source.matrix(), &source.name),
+    }
+}
+
 /// The native operator of a bias-free affine node reading `input` alone.
 fn single_map(native: &OperatorProgram, node: usize, input: usize) -> Result<Arc<Operator>, String> {
     match &native.nodes[node] {
@@ -451,9 +465,9 @@ fn gated_mlp(native: &OperatorProgram, artifact: Artifact, layer: &LayerNodes, l
     let name = format!("library.l{l}.mlp");
     let base = artifact.program.operators.len();
     let mut operators = vec![
-        library_operator(&format!("{name}.gate"), units.clone(), gate.cols.clone(), gate.matrix(), &gate.name)?,
-        library_operator(&format!("{name}.up"), units.clone(), up.cols.clone(), up.matrix(), &up.name)?,
-        library_operator(&format!("{name}.out"), down.rows.clone(), units.clone(), down.matrix(), &down.name)?,
+        library_copy(&format!("{name}.gate"), units.clone(), gate.cols.clone(), &gate)?,
+        library_copy(&format!("{name}.up"), units.clone(), up.cols.clone(), &up)?,
+        library_copy(&format!("{name}.out"), down.rows.clone(), units.clone(), &down)?,
     ];
     let owners = mlp_owners(&name, units.width(), &gate, gate_bias.as_deref(), Some((&up, up_bias.as_deref())), &down);
     let mut bias = |values: Option<Arc<Operator>>, part: &str, source: &str| -> Result<Option<usize>, String> {
@@ -552,7 +566,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
             let coordinates = Interface::uniform(q.rows.width(), 1, LabelKind::Unit, 0).map_err(error)?;
             let name = format!("library.l{l}.h{h}");
             let base = artifact.program.operators.len();
-            let mut operators = vec![library_operator(&format!("{name}.q"), coordinates.clone(), q.cols.clone(), q.matrix(), &q.name)?];
+            let mut operators = vec![library_copy(&format!("{name}.q"), coordinates.clone(), q.cols.clone(), &q)?];
             // Query heads that read one key and value in `M` read one key map and one value map:
             // one posterior, every head's use in its gradient, one divergence.
             let group = groups.iter().position(|g| g.0 == key && g.1 == value);
@@ -560,8 +574,8 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
                 Some(g) => (index_of(&artifact.program, &format!("{}.k", groups[g].2))?, index_of(&artifact.program, &format!("{}.v", groups[g].2))?),
                 None => {
                     let shared = format!("library.l{l}.kv{}", groups.len());
-                    operators.push(library_operator(&format!("{shared}.k"), coordinates.clone(), k.cols.clone(), k.matrix(), &k.name)?);
-                    operators.push(library_operator(&format!("{shared}.v"), v.rows.clone(), v.cols.clone(), v.matrix(), &v.name)?);
+                    operators.push(library_copy(&format!("{shared}.k"), coordinates.clone(), k.cols.clone(), &k)?);
+                    operators.push(library_copy(&format!("{shared}.v"), v.rows.clone(), v.cols.clone(), &v)?);
                     (base + 1, base + 2)
                 }
             };
@@ -631,8 +645,8 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
         owners.extend(mlp_owners(&name, units.width(), &up, up_bias.map(|b| native.operators[b].as_ref()), None, &down));
         let base = artifact.program.operators.len();
         let mut operators = vec![
-            library_operator(&format!("{name}.gate"), units.clone(), up.cols.clone(), up.matrix(), &up.name)?,
-            library_operator(&format!("{name}.out"), down.rows.clone(), units.clone(), down.matrix(), &down.name)?,
+            library_copy(&format!("{name}.gate"), units.clone(), up.cols.clone(), &up)?,
+            library_copy(&format!("{name}.out"), down.rows.clone(), units.clone(), &down)?,
         ];
         // A gate bias only where `M` has one, so a bias-free MLP still maps 0 to 0.
         let gate_bias = match up_bias {
@@ -3314,6 +3328,33 @@ mod tests {
         import::import_language_model,
         run_check::{layer_nodes, split_sites},
     };
+
+    /// A library operator copied from a stored native operator reads the checkpoint's reals where
+    /// they are, the same reals as a copy of the native operator's float64 values; from an operator
+    /// held on the host, it holds them on the host.
+    #[test]
+    fn a_library_copy_of_a_stored_operator_keeps_it_stored() {
+        let (rows, cols) = (3usize, 4usize);
+        let values: Vec<f32> = (0..rows * cols).map(|i| i as f32 * 0.375 - 1.5).collect();
+        let header = format!(r#"{{"w":{{"dtype":"F32","shape":[{rows},{cols}],"data_offsets":[0,{}]}}}}"#, 4 * rows * cols);
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        values.iter().for_each(|v| bytes.extend_from_slice(&v.to_le_bytes()));
+        let path = std::env::temp_dir().join(format!("library_copy_{}.safetensors", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let file = crate::safetensors::SafetensorsFile::open(&path).unwrap();
+        let (r, c) = (Interface::native(rows).unwrap(), Interface::native(cols).unwrap());
+        let native = Operator::stored("w", r.clone(), c.clone(), file.stored("w", rows, cols).unwrap(), Provenance::native("w")).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let copy = library_copy("library.w", r.clone(), c.clone(), &native).unwrap();
+        let held = library_operator("library.w", r.clone(), c.clone(), native.matrix(), "w").unwrap();
+        let OperatorBody::Dense { values: copied, .. } = &copy.body else { panic!("a dense copy") };
+        assert!(copied.stored().is_some(), "the copy reads the checkpoint");
+        assert_eq!(copy, held, "the same operator as a float64 copy");
+        let from_host = library_copy("library.w", r, c, &held).unwrap();
+        let OperatorBody::Dense { values: hosted, .. } = &from_host.body else { panic!("a dense copy") };
+        assert!(hosted.stored().is_none() && from_host.matrix() == held.matrix());
+    }
 
     /// `KL(M_e ‖ P_e)` per scored token in bits for `experiments` on `batch` at the explanation's
     /// host values `theta`, and with `gradient` the gradient of its sum in every trainable
