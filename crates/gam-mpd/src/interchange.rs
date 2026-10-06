@@ -1919,6 +1919,30 @@ impl<'t> Plan<'t> {
 
     /// The patches applied at `block`, as rows of a call over `lanes` (in order): the patched row,
     /// the source's row, and the variables.
+    /// Whether the reverse passes through block `block` of lane `l` reach anything they
+    /// differentiate: a block at or below it on the lane's rows (its own from its start, then its
+    /// parent's below the fork, and a suffix lane's twin's, which hold its rows before its
+    /// position) that `P` runs or a patch or an edit acts on. Where none does, the cotangent there
+    /// only flows through `M`'s blocks, which hold nothing trainable, to the stream's entry, so
+    /// [`run`] keeps no tape for the call and [`run_reverse`] does not reverse it.
+    fn reaches_trainable(&self, l: usize, block: usize) -> bool {
+        let lane = &self.lanes[l];
+        let path = &self.paths[lane.path];
+        let top = block.min(lane.end.saturating_sub(1));
+        if (lane.start..=top).any(|c| path.explained[c] || path.patched(c).is_some() || path.edits.iter().any(|(b, _)| *b == c)) {
+            return true;
+        }
+        if let Some((twin, _)) = lane.prefix
+            && self.reaches_trainable(self.lane(twin, top), top)
+        {
+            return true;
+        }
+        match lane.parent {
+            Some(parent) if lane.start > 0 => self.reaches_trainable(parent, lane.start - 1),
+            _ => false,
+        }
+    }
+
     fn patches(&self, block: usize, lanes: &[usize]) -> Result<Vec<(usize, usize, &'t [usize])>, String> {
         let mut out = Vec::new();
         for &l in lanes {
@@ -2017,8 +2041,15 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
             let before = plan.before(b, &lanes)?;
             let tokens: Vec<&[u32]> = lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
             let edits = edits(engines[side], plan, b, &lanes)?;
+            // An `M` call none of whose lanes' cotangents reach anything trainable is not reversed
+            // (`Plan::reaches_trainable`): its forward keeps nothing.
+            let reversed = side == 0 || edits.is_some() || lanes.iter().any(|&l| plan.reaches_trainable(l, b));
             let kept_here = match budget {
                 None => {
+                    engines[side].forward_before(b, &mut stream, (&ranges, &before), &tokens, edits.as_ref(), false)?;
+                    None
+                }
+                Some(_) if !reversed => {
                     engines[side].forward_before(b, &mut stream, (&ranges, &before), &tokens, edits.as_ref(), false)?;
                     None
                 }
@@ -2079,11 +2110,14 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
         let b = call.block;
         let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.range(*l)).collect();
         let recomputed;
-        let tape = match call.kept.as_ref().ok_or_else(|| error("a call kept nothing for the reverse pass"))? {
-            Kept::Tape(tape) => tape,
+        // A call that kept nothing is one `run` found the reverse cannot reach anything trainable
+        // through; its forks still return their rows below.
+        let tape = match call.kept.as_ref() {
+            None => None,
+            Some(Kept::Tape(tape)) => Some(tape),
             // The block's forward again, from the rows that entered it (laid out one lane after
             // another) with the same patches, keeping its tape.
-            Kept::Entering(entering) => {
+            Some(Kept::Entering(entering)) => {
                 let mut local = Vec::with_capacity(ranges.len());
                 let mut at = 0;
                 for r in &ranges {
@@ -2097,14 +2131,18 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
                 };
                 let tokens: Vec<&[u32]> = call.lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
                 recomputed = engines[call.side].forward_before(b, &mut rows, (&local, &plan.before(b, &call.lanes)?), &tokens, call.edits.as_ref(), true)?.ok_or_else(|| error("a call kept no tape"))?;
-                &recomputed
+                Some(&recomputed)
             }
         };
         for pass in passes.iter_mut() {
             plan.return_prefixes(d, &mut pass.cotangent, b, &call.lanes)?;
-            engines[call.side].reverse(b, tape, &mut pass.cotangent, &ranges, call.edits.as_ref(), (&mut *pass.gradient, pass.arithmetic))?;
+            if let Some(tape) = tape {
+                engines[call.side].reverse(b, tape, &mut pass.cotangent, &ranges, call.edits.as_ref(), (&mut *pass.gradient, pass.arithmetic))?;
+            }
         }
-        E::release(tape);
+        if let Some(tape) = tape {
+            E::release(tape);
+        }
         // Once both sides of the block are reversed, the forks made there return their rows, the
         // later lanes first (a lane forked from a lane forked at the same block returns through it).
         if index == 0 || calls[index - 1].block != b {
