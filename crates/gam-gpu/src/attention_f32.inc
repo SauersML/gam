@@ -23,8 +23,9 @@
 //
 // Macros: DEVICE (a function the kernels call), UNROLL (a loop of a fixed count, unrolled), GLOBAL, SHARED, CONSTANT (address spaces), BARRIER(), SHUFFLE_XOR(v, lane mask), EXP2,
 // LOG2, FMA, FMAX, NEG_INF, POS_INF, f4 (four floats) with F4(a, b, c, d), LOAD4(p), STORE4(p, v),
-// COPY4(shared dst, global src) (may complete later), COPY_COMMIT(), COPY_WAIT() (every copy issued
-// has landed), u32, u64, and MAX_SEQUENCES.
+// COPY4(shared dst, global src) (may complete later), COPY_COMMIT() (closes a group of copies),
+// COPY_WAIT() (every copy issued has landed), COPY_WAIT_ONE() (every group but the newest has),
+// u32, u64, and MAX_SEQUENCES.
 
 struct Sequences {
     u32 count;
@@ -204,8 +205,9 @@ DEVICE void sums_body(u32 rows, u32 hq, u32 w, GLOBAL const float* out, GLOBAL c
 // NT compute threads form KG = BK / TK key groups of CG = NT / KG lanes: thread (g, c) holds keys
 // g + KG i (i < TK), their transposed scores Sᵀ = K Qᵀ and dPᵀ = V dOᵀ at rows c + CG j (j < BQ / CG),
 // and dK, dV at columns 4c + 4 CG m.. (m < D / (4 CG)). Pᵀ and dSᵀ go through shared memory to the
-// threads that contract them with dO and Q. Shared memory: (2 BK + 2 BQ) (D + 4) + 2 BK (BQ + 4) +
-// 2 BQ floats.
+// threads that contract them with dO and Q. The next tile's queries load into a second buffer while
+// this tile's products run, its cotangents while dK forms. Shared memory: (2 BK + 3 BQ) (D + 4) +
+// 2 BK (BQ + 4) + 2 BQ floats.
 template <int D, int BK, int BQ, int NT, int TK>
 DEVICE void keys_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, float scale, GLOBAL const float* y, GLOBAL const float* lse, GLOBAL const float* ga,
                       GLOBAL const float* dsum, GLOBAL float* gy, u32 pair, u32 tile, u32 t, u32 threads, SHARED float* smem) {
@@ -220,7 +222,7 @@ DEVICE void keys_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, floa
     SHARED float* sk = smem;
     SHARED float* sv = sk + BK * TILE_STRIDE(D);
     SHARED float* sq = sv + BK * TILE_STRIDE(D);
-    SHARED float* sdo = sq + BQ * TILE_STRIDE(D);
+    SHARED float* sdo = sq + 2u * BQ * TILE_STRIDE(D);
     SHARED float* sp = sdo + BQ * TILE_STRIDE(D);
     SHARED float* sds = sp + BK * (BQ + 4u);
     SHARED float* srow = sds + BK * (BQ + 4u);
@@ -228,9 +230,16 @@ DEVICE void keys_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, floa
     const bool computes = t < NT;
     const u32 g = t / CG, c = t % CG;
 
+    // Step s reads query head kv·group + s / per_head, rows from (first + s mod per_head) BQ.
     load_tile<D>(sk, y + (u64)(start + k0) * stride + (hq + kv) * w, stride, BK, min((u32)BK, length - k0), w, t, threads);
     load_tile<D>(sv, y + (u64)(start + k0) * stride + (hq + hk + kv) * w, stride, BK, min((u32)BK, length - k0), w, t, threads);
-    COPY_COMMIT();
+    {
+        const u32 q0 = first * BQ;
+        load_tile<D>(sq, y + (u64)(start + q0) * stride + kv * group * w, stride, BQ, min((u32)BQ, length - q0), w, t, threads);
+        COPY_COMMIT();
+        load_tile<D>(sdo, ga + (u64)(start + q0) * reads + kv * group * w, reads, BQ, min((u32)BQ, length - q0), w, t, threads);
+        COPY_COMMIT();
+    }
 
     float dk[TK][DP], dv[TK][DP];
     UNROLL for (u32 i = 0; i < TK; ++i)
@@ -238,38 +247,49 @@ DEVICE void keys_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, floa
     for (u32 step = 0; step < steps; ++step) {
         const u32 h = kv * group + step / per_head, q0 = (first + step % per_head) * BQ;
         const u32 valid = min((u32)BQ, length - q0);
-        // The previous step's contractions are done with the tiles about to be replaced.
+        const bool more = step + 1u < steps;
+        SHARED float* sqs = sq + (step & 1u) * BQ * TILE_STRIDE(D);
+        // This tile's queries have landed (its cotangents, the newest copies, may not have); the
+        // previous step's contractions are done with the buffers about to be replaced.
+        COPY_WAIT_ONE();
         BARRIER();
-        load_tile<D>(sq, y + (u64)(start + q0) * stride + h * w, stride, BQ, valid, w, t, threads);
-        load_tile<D>(sdo, ga + (u64)(start + q0) * reads + h * w, reads, BQ, valid, w, t, threads);
-        COPY_COMMIT();
+        if (more) {
+            const u32 nh = kv * group + (step + 1u) / per_head, nq0 = (first + (step + 1u) % per_head) * BQ;
+            load_tile<D>(sq + ((step + 1u) & 1u) * BQ * TILE_STRIDE(D), y + (u64)(start + nq0) * stride + nh * w, stride, BQ, min((u32)BQ, length - nq0), w, t, threads);
+            COPY_COMMIT();
+        }
         // Rows past the sequence weigh nothing (an infinite log partition).
         for (u32 r = t; r < BQ; r += threads) {
             const bool inside = r < valid;
             srow[r] = inside ? lse[(u64)(start + q0 + r) * hq + h] * 1.4426950408889634f : POS_INF;
             srow[BQ + r] = inside ? dsum[(u64)(start + q0 + r) * hq + h] : 0.0f;
         }
-        COPY_WAIT();
-        BARRIER();
+        float st[TK][QP], dpt[TK][QP];
         if (computes) {
-            float st[TK][QP], dpt[TK][QP];
             UNROLL for (u32 i = 0; i < TK; ++i)
                 UNROLL for (u32 j = 0; j < QP; ++j) st[i][j] = dpt[i][j] = 0.0f;
             for (u32 d = 0; d < D; d += 4u) {
-                f4 kr[TK], vr[TK], qr[QP], dor[QP];
-                UNROLL for (u32 i = 0; i < TK; ++i) {
-                    kr[i] = LOAD4(sk + (g + KG * i) * TILE_STRIDE(D) + d);
-                    vr[i] = LOAD4(sv + (g + KG * i) * TILE_STRIDE(D) + d);
-                }
-                UNROLL for (u32 j = 0; j < QP; ++j) {
-                    qr[j] = LOAD4(sq + (c + CG * j) * TILE_STRIDE(D) + d);
-                    dor[j] = LOAD4(sdo + (c + CG * j) * TILE_STRIDE(D) + d);
-                }
+                f4 kr[TK], qr[QP];
+                UNROLL for (u32 i = 0; i < TK; ++i) kr[i] = LOAD4(sk + (g + KG * i) * TILE_STRIDE(D) + d);
+                UNROLL for (u32 j = 0; j < QP; ++j) qr[j] = LOAD4(sqs + (c + CG * j) * TILE_STRIDE(D) + d);
                 UNROLL for (u32 i = 0; i < TK; ++i)
-                    UNROLL for (u32 j = 0; j < QP; ++j) {
-                        st[i][j] = FMA(kr[i].w, qr[j].w, FMA(kr[i].z, qr[j].z, FMA(kr[i].y, qr[j].y, FMA(kr[i].x, qr[j].x, st[i][j]))));
-                        dpt[i][j] = FMA(vr[i].w, dor[j].w, FMA(vr[i].z, dor[j].z, FMA(vr[i].y, dor[j].y, FMA(vr[i].x, dor[j].x, dpt[i][j]))));
-                    }
+                    UNROLL for (u32 j = 0; j < QP; ++j) st[i][j] = FMA(kr[i].w, qr[j].w, FMA(kr[i].z, qr[j].z, FMA(kr[i].y, qr[j].y, FMA(kr[i].x, qr[j].x, st[i][j]))));
+            }
+        }
+        // This tile's cotangents (the next tile's queries, if issued, are the newest copies).
+        if (more) {
+            COPY_WAIT_ONE();
+        } else {
+            COPY_WAIT();
+        }
+        BARRIER();
+        if (computes) {
+            for (u32 d = 0; d < D; d += 4u) {
+                f4 vr[TK], dor[QP];
+                UNROLL for (u32 i = 0; i < TK; ++i) vr[i] = LOAD4(sv + (g + KG * i) * TILE_STRIDE(D) + d);
+                UNROLL for (u32 j = 0; j < QP; ++j) dor[j] = LOAD4(sdo + (c + CG * j) * TILE_STRIDE(D) + d);
+                UNROLL for (u32 i = 0; i < TK; ++i)
+                    UNROLL for (u32 j = 0; j < QP; ++j) dpt[i][j] = FMA(vr[i].w, dor[j].w, FMA(vr[i].z, dor[j].z, FMA(vr[i].y, dor[j].y, FMA(vr[i].x, dor[j].x, dpt[i][j]))));
             }
             // Pᵀ and dSᵀ; a key after a row weighs nothing for it.
             UNROLL for (u32 i = 0; i < TK; ++i)
@@ -282,24 +302,41 @@ DEVICE void keys_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, floa
         }
         BARRIER();
         if (computes) {
-            // dV += Pᵀ dO and dK += dSᵀ Q, the tile's rows contracted.
+            // dV += Pᵀ dO, the tile's rows contracted.
             for (u32 r = 0; r < BQ; r += 4u) {
-                f4 pr[TK], sr[TK];
-                UNROLL for (u32 i = 0; i < TK; ++i) {
-                    pr[i] = LOAD4(sp + (g + KG * i) * (BQ + 4u) + r);
-                    sr[i] = LOAD4(sds + (g + KG * i) * (BQ + 4u) + r);
-                }
+                f4 pr[TK];
+                UNROLL for (u32 i = 0; i < TK; ++i) pr[i] = LOAD4(sp + (g + KG * i) * (BQ + 4u) + r);
                 UNROLL for (u32 rr = 0; rr < 4u; ++rr) {
                     UNROLL for (u32 n = 0; n < DP / 4u; ++n) {
                         const f4 dov = LOAD4(sdo + (r + rr) * TILE_STRIDE(D) + 4u * c + 4u * CG * n);
-                        const f4 qv = LOAD4(sq + (r + rr) * TILE_STRIDE(D) + 4u * c + 4u * CG * n);
                         UNROLL for (u32 i = 0; i < TK; ++i) {
                             const float p = rr == 0u ? pr[i].x : rr == 1u ? pr[i].y : rr == 2u ? pr[i].z : pr[i].w;
-                            const float s = rr == 0u ? sr[i].x : rr == 1u ? sr[i].y : rr == 2u ? sr[i].z : sr[i].w;
                             dv[i][4u * n] = FMA(p, dov.x, dv[i][4u * n]);
                             dv[i][4u * n + 1u] = FMA(p, dov.y, dv[i][4u * n + 1u]);
                             dv[i][4u * n + 2u] = FMA(p, dov.z, dv[i][4u * n + 2u]);
                             dv[i][4u * n + 3u] = FMA(p, dov.w, dv[i][4u * n + 3u]);
+                        }
+                    }
+                }
+            }
+        }
+        // Every thread is done with this tile's cotangents: the next tile's load into their buffer.
+        BARRIER();
+        if (more) {
+            const u32 nh = kv * group + (step + 1u) / per_head, nq0 = (first + (step + 1u) % per_head) * BQ;
+            load_tile<D>(sdo, ga + (u64)(start + nq0) * reads + nh * w, reads, BQ, min((u32)BQ, length - nq0), w, t, threads);
+            COPY_COMMIT();
+        }
+        if (computes) {
+            // dK += dSᵀ Q, the tile's rows contracted.
+            for (u32 r = 0; r < BQ; r += 4u) {
+                f4 sr[TK];
+                UNROLL for (u32 i = 0; i < TK; ++i) sr[i] = LOAD4(sds + (g + KG * i) * (BQ + 4u) + r);
+                UNROLL for (u32 rr = 0; rr < 4u; ++rr) {
+                    UNROLL for (u32 n = 0; n < DP / 4u; ++n) {
+                        const f4 qv = LOAD4(sqs + (r + rr) * TILE_STRIDE(D) + 4u * c + 4u * CG * n);
+                        UNROLL for (u32 i = 0; i < TK; ++i) {
+                            const float s = rr == 0u ? sr[i].x : rr == 1u ? sr[i].y : rr == 2u ? sr[i].z : sr[i].w;
                             dk[i][4u * n] = FMA(s, qv.x, dk[i][4u * n]);
                             dk[i][4u * n + 1u] = FMA(s, qv.y, dk[i][4u * n + 1u]);
                             dk[i][4u * n + 2u] = FMA(s, qv.z, dk[i][4u * n + 2u]);
@@ -329,8 +366,9 @@ DEVICE void keys_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, floa
 // The queries' cotangents: a block of BR query rows (of one query head of one sequence) sweeps the
 // key tiles up to its last row, as the forward's block does: thread (g, c) holds rows g + RG i, their
 // scores and dP = dO Vᵀ at keys c + CG j, and dQ at columns 4c + 4 CG m..; dS goes through shared
-// memory to the threads that contract it with K. Shared memory: (2 BR + 2 BC) (D + 4) + BR (BC + 4)
-// floats.
+// memory to the threads that contract it with K. Key tiles are double-buffered (the next loads
+// while this one's products run), the value tile loads while the scores form. Shared memory:
+// (2 BR + 3 BC) (D + 4) + BR (BC + 4) floats.
 template <int D, int BR, int BC, int NT, int TR>
 DEVICE void queries_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, float scale, GLOBAL const float* y, GLOBAL const float* lse, GLOBAL const float* ga,
                          GLOBAL const float* dsum, GLOBAL float* gy, u32 pair, u32 tile, u32 t, u32 threads, SHARED float* smem) {
@@ -348,7 +386,7 @@ DEVICE void queries_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, f
     SHARED float* sq = smem;
     SHARED float* sdo = sq + BR * TILE_STRIDE(D);
     SHARED float* sk = sdo + BR * TILE_STRIDE(D);
-    SHARED float* sv = sk + BC * TILE_STRIDE(D);
+    SHARED float* sv = sk + 2u * BC * TILE_STRIDE(D);
     SHARED float* sds = sv + BC * TILE_STRIDE(D);
     const u32 keys = min(q0 + BR, length), key_tiles = (keys + BC - 1u) / BC;
     const u32 valid = min((u32)BR, length - q0);
@@ -357,6 +395,9 @@ DEVICE void queries_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, f
 
     load_tile<D>(sq, y + (u64)(start + q0) * stride + head * w, stride, BR, valid, w, t, threads);
     load_tile<D>(sdo, ga + (u64)(start + q0) * reads + head * w, reads, BR, valid, w, t, threads);
+    load_tile<D>(sk, yk, stride, BC, min((u32)BC, keys), w, t, threads);
+    COPY_COMMIT();
+    load_tile<D>(sv, yv, stride, BC, min((u32)BC, keys), w, t, threads);
     COPY_COMMIT();
     float lse2[TR], dr[TR], dq[TR][DP];
     UNROLL for (u32 i = 0; i < TR; ++i) {
@@ -368,31 +409,42 @@ DEVICE void queries_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, f
     }
     for (u32 kt = 0; kt < key_tiles; ++kt) {
         const u32 k0 = kt * BC;
+        const bool more = kt + 1u < key_tiles;
+        SHARED float* sks = sk + (kt & 1u) * BC * TILE_STRIDE(D);
+        // This tile's keys have landed (its values, the newest copies, may not have); the previous
+        // tile's products are done with the buffers about to be replaced.
+        COPY_WAIT_ONE();
         BARRIER();
-        load_tile<D>(sk, yk + (u64)k0 * stride, stride, BC, min((u32)BC, keys - k0), w, t, threads);
-        load_tile<D>(sv, yv + (u64)k0 * stride, stride, BC, min((u32)BC, keys - k0), w, t, threads);
-        COPY_COMMIT();
-        COPY_WAIT();
-        BARRIER();
+        if (more) {
+            load_tile<D>(sk + ((kt + 1u) & 1u) * BC * TILE_STRIDE(D), yk + (u64)(k0 + BC) * stride, stride, BC, min((u32)BC, keys - k0 - BC), w, t, threads);
+            COPY_COMMIT();
+        }
+        float s[TR][KP], dp[TR][KP];
         if (computes) {
-            float s[TR][KP], dp[TR][KP];
             UNROLL for (u32 i = 0; i < TR; ++i)
                 UNROLL for (u32 j = 0; j < KP; ++j) s[i][j] = dp[i][j] = 0.0f;
             for (u32 d = 0; d < D; d += 4u) {
-                f4 qr[TR], dor[TR], kr[KP], vr[KP];
-                UNROLL for (u32 i = 0; i < TR; ++i) {
-                    qr[i] = LOAD4(sq + (g + RG * i) * TILE_STRIDE(D) + d);
-                    dor[i] = LOAD4(sdo + (g + RG * i) * TILE_STRIDE(D) + d);
-                }
-                UNROLL for (u32 j = 0; j < KP; ++j) {
-                    kr[j] = LOAD4(sk + (c + CG * j) * TILE_STRIDE(D) + d);
-                    vr[j] = LOAD4(sv + (c + CG * j) * TILE_STRIDE(D) + d);
-                }
+                f4 qr[TR], kr[KP];
+                UNROLL for (u32 i = 0; i < TR; ++i) qr[i] = LOAD4(sq + (g + RG * i) * TILE_STRIDE(D) + d);
+                UNROLL for (u32 j = 0; j < KP; ++j) kr[j] = LOAD4(sks + (c + CG * j) * TILE_STRIDE(D) + d);
                 UNROLL for (u32 i = 0; i < TR; ++i)
-                    UNROLL for (u32 j = 0; j < KP; ++j) {
-                        s[i][j] = FMA(qr[i].w, kr[j].w, FMA(qr[i].z, kr[j].z, FMA(qr[i].y, kr[j].y, FMA(qr[i].x, kr[j].x, s[i][j]))));
-                        dp[i][j] = FMA(dor[i].w, vr[j].w, FMA(dor[i].z, vr[j].z, FMA(dor[i].y, vr[j].y, FMA(dor[i].x, vr[j].x, dp[i][j]))));
-                    }
+                    UNROLL for (u32 j = 0; j < KP; ++j) s[i][j] = FMA(qr[i].w, kr[j].w, FMA(qr[i].z, kr[j].z, FMA(qr[i].y, kr[j].y, FMA(qr[i].x, kr[j].x, s[i][j]))));
+            }
+        }
+        // This tile's values (the next tile's keys, if issued, are the newest copies).
+        if (more) {
+            COPY_WAIT_ONE();
+        } else {
+            COPY_WAIT();
+        }
+        BARRIER();
+        if (computes) {
+            for (u32 d = 0; d < D; d += 4u) {
+                f4 dor[TR], vr[KP];
+                UNROLL for (u32 i = 0; i < TR; ++i) dor[i] = LOAD4(sdo + (g + RG * i) * TILE_STRIDE(D) + d);
+                UNROLL for (u32 j = 0; j < KP; ++j) vr[j] = LOAD4(sv + (c + CG * j) * TILE_STRIDE(D) + d);
+                UNROLL for (u32 i = 0; i < TR; ++i)
+                    UNROLL for (u32 j = 0; j < KP; ++j) dp[i][j] = FMA(dor[i].w, vr[j].w, FMA(dor[i].z, vr[j].z, FMA(dor[i].y, vr[j].y, FMA(dor[i].x, vr[j].x, dp[i][j]))));
             }
             // dS = P ∘ (dP − D); a key after a row weighs nothing for it.
             UNROLL for (u32 i = 0; i < TR; ++i)
@@ -402,7 +454,12 @@ DEVICE void queries_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, f
                     sds[(g + RG * i) * (BC + 4u) + c + CG * j] = p * (dp[i][j] - dr[i]);
                 }
         }
+        // Every thread is done with this tile's values: the next tile's load into their buffer.
         BARRIER();
+        if (more) {
+            load_tile<D>(sv, yv + (u64)(k0 + BC) * stride, stride, BC, min((u32)BC, keys - k0 - BC), w, t, threads);
+            COPY_COMMIT();
+        }
         if (computes) {
             // dQ += dS K, the tile's keys contracted.
             for (u32 k = 0; k < BC; k += 4u) {
@@ -410,7 +467,7 @@ DEVICE void queries_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, f
                 UNROLL for (u32 i = 0; i < TR; ++i) sr[i] = LOAD4(sds + (g + RG * i) * (BC + 4u) + k);
                 UNROLL for (u32 kk = 0; kk < 4u; ++kk) {
                     UNROLL for (u32 n = 0; n < DP / 4u; ++n) {
-                        const f4 kv4 = LOAD4(sk + (k + kk) * TILE_STRIDE(D) + 4u * c + 4u * CG * n);
+                        const f4 kv4 = LOAD4(sks + (k + kk) * TILE_STRIDE(D) + 4u * c + 4u * CG * n);
                         UNROLL for (u32 i = 0; i < TR; ++i) {
                             const float s = kk == 0u ? sr[i].x : kk == 1u ? sr[i].y : kk == 2u ? sr[i].z : sr[i].w;
                             dq[i][4u * n] = FMA(s, kv4.x, dq[i][4u * n]);

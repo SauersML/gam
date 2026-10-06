@@ -3987,6 +3987,7 @@ __device__ __forceinline__ void COPY4(float* dst, const float* src) {
 }
 #define COPY_COMMIT() asm volatile("cp.async.commit_group;" ::: "memory")
 #define COPY_WAIT() asm volatile("cp.async.wait_group 0;" ::: "memory")
+#define COPY_WAIT_ONE() asm volatile("cp.async.wait_group 1;" ::: "memory")
 "#;
 
     /// Attention's kernels on CUDA: blockIdx.x + blockIdx.z gridDim.x is the (sequence, head) pair,
@@ -4997,8 +4998,8 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
             unsafe { self.stream.launch_builder(&sums).arg(&n).arg(&hq).arg(&width).arg(slice32(out)?).arg(slice32(ga)?).arg(slice32_mut(&mut dsum)?).launch(cfg_elements((rows * layout.queries) as u64 * 32)) }
                 .gpu_ctx("attention backward sums")?;
             let ((key_rows, key_queries, key_threads, _), (query_rows, query_keys, query_threads, _)) = (ATTENTION_KEYS, ATTENTION_QUERIES);
-            let keys_shared = ((2 * key_rows + 2 * key_queries) * (padded + 4) + 2 * key_rows * (key_queries + 4) + 2 * key_queries) * 4;
-            let queries_shared = ((2 * query_rows + 2 * query_keys) * (padded + 4) + query_rows * (query_keys + 4)) * 4;
+            let keys_shared = ((2 * key_rows + 3 * key_queries) * (padded + 4) + 2 * key_rows * (key_queries + 4) + 2 * key_queries) * 4;
+            let queries_shared = ((2 * query_rows + 3 * query_keys) * (padded + 4) + query_rows * (query_keys + 4)) * 4;
             let (keys_kernel, queries_kernel) = (self.attention_kernel(w, "attention_backward_keys", keys_shared)?, self.attention_kernel(w, "attention_backward_queries", queries_shared)?);
             // The two passes write every row of the sequences.
             let mut gy = self.attention_output((rows, columns), sequences)?;
@@ -6808,6 +6809,7 @@ typedef float4 f4;
 #define COPY4(dst, src) (*((threadgroup float4*)(dst)) = *((device const float4*)(src)))
 #define COPY_COMMIT()
 #define COPY_WAIT()
+#define COPY_WAIT_ONE()
 typedef uint u32;
 typedef ulong u64;
 #define MAX_SEQUENCES 480
@@ -6834,7 +6836,7 @@ kernel void t_attention_forward_##D(device const float* y [[buffer(0)]], device 
 kernel void t_attention_keys_##D(device const float* y [[buffer(0)]], device const float* lse [[buffer(1)]], device const float* ga [[buffer(2)]], \
     device const float* dsum [[buffer(3)]], device float* gy [[buffer(4)]], constant AttentionParams& p [[buffer(5)]], \
     uint group [[threadgroup_position_in_grid]], uint groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]]) { \
-    threadgroup float smem[(2 * 16 + 2 * 8) * TILE_STRIDE(D) + 2 * 16 * (8 + 4) + 2 * 8]; \
+    threadgroup float smem[(2 * 16 + 3 * 8) * TILE_STRIDE(D) + 2 * 16 * (8 + 4) + 2 * 8]; \
     for (uint item = group; item < p.items; item += groups) { \
         keys_body<D, 16, 8, 128, 1>(p.sequences, p.hq, p.hk, p.w, p.scale, y, lse, ga, dsum, gy, item % p.pairs, item / p.pairs, t, 256u, smem); \
         threadgroup_barrier(mem_flags::mem_threadgroup); \
@@ -6843,7 +6845,7 @@ kernel void t_attention_keys_##D(device const float* y [[buffer(0)]], device con
 kernel void t_attention_queries_##D(device const float* y [[buffer(0)]], device const float* lse [[buffer(1)]], device const float* ga [[buffer(2)]], \
     device const float* dsum [[buffer(3)]], device float* gy [[buffer(4)]], constant AttentionParams& p [[buffer(5)]], \
     uint group [[threadgroup_position_in_grid]], uint groups [[threadgroups_per_grid]], uint t [[thread_index_in_threadgroup]]) { \
-    threadgroup float smem[(2 * 16 + 2 * 8) * TILE_STRIDE(D) + 16 * (8 + 4)]; \
+    threadgroup float smem[(2 * 16 + 3 * 8) * TILE_STRIDE(D) + 16 * (8 + 4)]; \
     for (uint item = group; item < p.items; item += groups) { \
         queries_body<D, 16, 8, 128, 1>(p.sequences, p.hq, p.hk, p.w, p.scale, y, lse, ga, dsum, gy, item % p.pairs, item / p.pairs, t, 256u, smem); \
         threadgroup_barrier(mem_flags::mem_threadgroup); \
