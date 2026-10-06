@@ -575,7 +575,8 @@ fn main() -> Result<(), String> {
             let base = match from.split_once(':') {
                 None if from == "native" => start,
                 Some(("checkpoint", path)) => {
-                    let posterior = library_mdl::checkpoint_posterior(&start, Path::new(path))?;
+                    // Entry by entry along the operators' own axes, as the bodies read it.
+                    let posterior = library_mdl::checkpoint_posterior(&start, Path::new(path))?.factorized();
                     let mut base = library_sharing::warm(&start, &library_mdl::posterior_mean(&start, &posterior)?)?;
                     base.removed = (0..posterior.active.len()).filter(|g| !posterior.active[*g]).collect();
                     base

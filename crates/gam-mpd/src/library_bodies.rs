@@ -2271,7 +2271,7 @@ pub fn carried(parent: &Explanation, posterior: &Posterior, child: &Explanation,
             }
         });
     }
-    Ok(crate::library_mdl::Start { mean: fresh.mean, log_sd, active: fresh.active, state: None, steps: 0, epoch: 0 })
+    Ok(crate::library_mdl::Start { mean: fresh.mean, log_sd, active: fresh.active, state: None, steps: 0, epoch: 0, rotations: Vec::new() })
 }
 
 #[cfg(test)]
@@ -2934,5 +2934,3 @@ mod tests {
         assert_eq!(carried.active, fresh.active);
     }
 }
-
-

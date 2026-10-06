@@ -2380,7 +2380,9 @@ impl Device {
                     if w[g] == 0.0 {
                         continue;
                     }
-                    let exponent = (v[g] / v0[g]).log2().round();
+                    // In the log domain: a ratio of finite positive variances can overflow where its
+                    // logarithm does not.
+                    let exponent = (v[g].log2() - v0[g].log2()).round();
                     let bits = if exponent.is_finite() {
                         // |exponent| <= 2098 for finite positive variances: inside i64.
                         let x = exponent as i64;
@@ -4094,7 +4096,7 @@ extern "C" __global__ void group_code_length(u64 n, u64 slot, const double* dive
         bool live = g < n && weight[g] != 0.0;
         double b = 0.0;
         if (live) {
-            double exponent = round(log2(variance[g] / initial[g]));
+            double exponent = round(log2(variance[g]) - log2(initial[g]));
             double bits = __longlong_as_double(0x7ff0000000000000LL);
             if (isfinite(exponent)) {
                 long long x = (long long)exponent;
@@ -7012,7 +7014,7 @@ kernel void t_group_code_length(device const float* divergence [[buffer(0)]], de
     bool live = i < p.n && weight[i] != 0.0f;
     float b = 0.0f;
     if (live) {
-        float exponent = round(log2(variance[i] / initial[i]));
+        float exponent = round(log2(variance[i]) - log2(initial[i]));
         float bits = INFINITY;
         if (isfinite(exponent)) {
             int x = int(exponent);

@@ -147,7 +147,8 @@ fn main() -> Result<(), String> {
         return Err("the export holds fewer training sequences than asked for".into());
     }
     let explanation = library_mdl::explanation(&native, &layers)?;
-    let posterior = library_mdl::checkpoint_posterior(&explanation, Path::new(checkpoint))?;
+    // Entry by entry along the operators' own axes, as the objective below samples it.
+    let posterior = library_mdl::checkpoint_posterior(&explanation, Path::new(checkpoint))?.factorized();
     let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
     let reads = interchange::reads(&native, &sites)?;
     let mut ic = Interchange::new(&device, &native, &sites, &explanation.artifact, &explanation.trainable, reads, settings.fit.numeric_bytes, settings.fit.head_tile_rows)?;

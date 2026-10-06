@@ -234,7 +234,8 @@ fn main() -> Result<(), String> {
     let explanation = library_mdl::explanation(&native, &layers)?;
     let posterior = match from.split_once(':') {
         None if from == "native" => library_mdl::Posterior::new(&explanation, 2 * train.len() * settings.context)?,
-        Some(("checkpoint", path)) => library_mdl::checkpoint_posterior(&explanation, Path::new(path))?,
+        // Entry by entry along the operators' own axes, as the estimators below read it.
+        Some(("checkpoint", path)) => library_mdl::checkpoint_posterior(&explanation, Path::new(path))?.factorized(),
         _ => return Err(USAGE.into()),
     };
     let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();

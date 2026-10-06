@@ -25,6 +25,11 @@
 //!
 //! # The code length
 //!
+//! The posterior is Gaussian, independent across prior groups and, within each group, independent
+//! along its operator's rotated axes ([`Rotation`]): the eigenvectors of the operator's input's
+//! second moment, along which the Gauss–Newton matrix of a row's weights is diagonal in its
+//! Kronecker factorization, so the posterior can resolve correlated input coordinates jointly.
+//!
 //! The library's parameters `θ` are partitioned into prior groups `G`: a key-value group's rotary
 //! plane (the plane's rows of the shared key and of every query head's query), its value
 //! coordinate (one row of the shared value), an MLP function's gate `(g_i, c_i)`, its up direction `b_i` when gated, and its output `u_i`. With the posterior `q(θ) = Π_j N(μ_j, σ_j²)` and the
@@ -36,23 +41,37 @@
 //! sums `KL(M_e ‖ P_e)` of the next-token distributions over every token of every training
 //! experiment `e` (below), so the data term's weight is the number of scored tokens `N` and no
 //! tradeoff weight exists. `N` is the amount of `M`'s behaviour the explanation is asked to
-//! explain; it is the one choice left, and results are reported along it. Each prior variance is chosen by empirical Bayes in closed form,
-//! `v_G = (1/|G|) Σ_{j∈G} (μ_j² + σ_j²)`, which makes `KL(q_G ‖ p_G) = ½ (|G| ln v_G − Σ_{j∈G}
-//! ln σ_j²)` with derivatives `μ_j / v_G` in `μ_j` and `σ_j² / v_G − 1` in `ln σ_j`. An active
-//! group sends its variance at the precision of a parameter estimated from `|G|` values,
-//! `½ log2 |G|` bits (the two-part code's parameter precision), after its scale: the integer
-//! exponent `round(log2(v_G / v⁰_G))` relative to the variance `v⁰_G` of the group's native
-//! starting values, which every decoder has from `M`, in the Elias δ code of its signed index
+//! explain; it is the one choice left, and results are reported along it. The fit's steps use each
+//! prior variance's Gaussian-only empirical-Bayes value `v_G = (1/|G|) Σ_{j∈G} (μ_j² + σ_j²)`, the
+//! minimizer of `KL(q_G ‖ p_G)` alone, at which `KL(q_G ‖ p_G) = ½ (|G| ln v_G − ln det Σ_G)` (`Σ_G`
+//! the group's posterior covariance) with derivatives `μ_j / v_G` in `μ_j` and `σ_j² / v_G − 1` in
+//! `ln σ_j`. The code length charges each group at `v_G` itself: a variance in the bin of a cheaper
+//! scale exponent could shorten `KL(q_G ‖ p_G) + L_scale`, so `v_G` is not that sum's minimizer, and
+//! `F` is the code length at `v_G`. With a mixture prior
+//! (`library_mixture`) the variance minimizing the mixture's divergence weights each sample by the
+//! Gaussian component's responsibility; the fit keeps the Gaussian-only value as an adaptively
+//! updated hyperparameter, so the reported `F` is the code length at that variance, not its minimum
+//! over the variance. An active group sends its variance at the precision of a parameter estimated
+//! from `|G|` values, `½ log2 |G|` bits (the two-part code's asymptotic cost of a parameter's
+//! precision, a regular model's approximation rather than an exact code for an arbitrary real),
+//! after its scale: the integer exponent `round(log2(v_G / v⁰_G))` relative to the group's
+//! reference variance `v⁰_G` (`Explanation::reference`: the mean square of `M`'s values over its
+//! cells, which every decoder has from `M` and the explanation's structure; [`mean_squares`]), in
+//! the Elias δ code of its signed index
 //! (`L_scale`; the precision prices the fraction, the scale the exponent, since `(μ, σ) → (a μ, a
 //! σ)` leaves `KL` unchanged). Which groups are in the explanation is sent once in the enumerative
 //! subset code, `L_subset = L_int(k + 1) + ⌈log2 C(n, k)⌉` bits for `k` of `n` groups. A group the data does not inform
 //! sits at its prior with zero divergence and posterior mean zero, so the null is recovered;
 //! removing it from the explanation is a discrete step of the same `F`.
 //!
-//! Weight noise costs data only on the tokens where a function is active, so a ReLU-gated function
-//! that is exactly zero elsewhere can keep imprecise, cheap weights: the code length rewards
-//! functions that are inactive on most inputs without any sparsity penalty, when the native
-//! activation is ReLU. This inactive-region argument does not apply to GELU or SiLU.
+//! Weight noise costs data only on the tokens where a function's sampled value is nonzero. A
+//! ReLU-gated function is zero on a token for every weight sample only where its preactivation is
+//! nonpositive over the whole posterior; with a preactivation `Z ~ N(m, s²)` under the weight noise,
+//! `E[ReLU(Z)²] = (m² + s²) Φ(m/s) + m s φ(m/s)`, so a negative mean alone does not make the
+//! function inactive. Where the mean lies many standard deviations below zero, the function's
+//! weights stay imprecise and cheap at little data cost: the code length rewards functions inactive
+//! on most inputs without any sparsity penalty, when the native activation is ReLU. The argument
+//! does not apply to GELU or SiLU, which are nonzero at every finite preactivation.
 //!
 //! # The experiments
 //!
@@ -120,7 +139,7 @@
 //! gradient in `μ`: under IVON the means settle long before the curvature `h`, and so `σ`, has
 //! finished its epoch-scale decay, which only `F` sees.
 //!
-//! A converged fit then removes groups (`library_removal`): first every group without effect on
+//! Once the stopping criterion holds, the fit removes groups (`library_removal`): first every group without effect on
 //! any experiment (a rotary plane of a head with no value coordinate left, the gate of a function
 //! whose output is removed), found exactly from the program's structure; then units of groups (a
 //! group with those its removal silences) ranked by their second-order removal effect (below),
@@ -133,7 +152,7 @@
 //! both sides of every comparison, on the fixed collection: acceptance never increases that
 //! realization of the sampled `F`, whose expectation over the posterior it estimates without
 //! bounding. Every proposal and its outcome go to a JSON-lines log next to the checkpoint. The fit
-//! alternates converging and removing; it stops when a round accepts nothing, which says the search
+//! alternates descending and removing; it stops when a round accepts nothing, which says the search
 //! found no removal, not that none exists.
 //!
 //! The removal search orders its proposals by each group's second-order removal effect: the rise of
@@ -180,6 +199,7 @@ use crate::{
     run_check::{LayerNodes, head_projection},
 };
 use gam_gpu::tensor::{Device, Op, Storage, Tensor};
+use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
 use gam_runtime::warm_start::Fingerprinter;
 use ndarray::Array2;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -238,23 +258,52 @@ pub struct Explanation {
     pub reference: Vec<f64>,
 }
 
-/// Per group of `groups`, the mean square of `program`'s values over its cells.
+/// Per group of `groups`, the mean square of `program`'s values over its cells. A group whose
+/// values are all zero takes the mean square of its operators' entries in the groups that are not,
+/// and `1` where those are all zero too: either is fixed by `program` and the groups before
+/// decoding, so every group has a positive reference.
 pub fn mean_squares(program: &OperatorProgram, groups: &[Group]) -> Vec<f64> {
     let mut matrices: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
-    groups
-        .iter()
-        .map(|group| {
-            let (mut count, mut sum) = (0.0, 0.0);
-            for cell in &group.cells {
-                let matrix = matrices.entry(cell.operator).or_insert_with(|| program.operators[cell.operator].matrix());
-                for &row in &cell.rows {
-                    for col in cell.cols.clone() {
-                        sum += matrix[[row, col]] * matrix[[row, col]];
-                        count += 1.0;
-                    }
+    for group in groups {
+        for cell in &group.cells {
+            matrices.entry(cell.operator).or_insert_with(|| program.operators[cell.operator].matrix());
+        }
+    }
+    let squares = |cells: &[Cells]| -> (f64, f64) {
+        let (mut count, mut sum) = (0.0, 0.0);
+        for cell in cells {
+            let matrix = &matrices[&cell.operator];
+            for &row in &cell.rows {
+                for col in cell.cols.clone() {
+                    sum += matrix[[row, col]] * matrix[[row, col]];
+                    count += 1.0;
                 }
             }
-            if count > 0.0 { sum / count } else { 0.0 }
+        }
+        (count, sum)
+    };
+    let own: Vec<(f64, f64)> = groups.iter().map(|group| squares(&group.cells)).collect();
+    // Per operator, the count and sum of squares of its entries in groups that are not all zero.
+    let mut operators: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
+    for (group, (_, sum)) in groups.iter().zip(&own) {
+        if *sum > 0.0 {
+            for cell in &group.cells {
+                let (count, total) = squares(std::slice::from_ref(cell));
+                let entry = operators.entry(cell.operator).or_default();
+                entry.0 += count;
+                entry.1 += total;
+            }
+        }
+    }
+    groups
+        .iter()
+        .zip(&own)
+        .map(|(group, &(count, sum))| {
+            if sum > 0.0 {
+                return sum / count;
+            }
+            let (n, total) = group.cells.iter().filter_map(|c| operators.get(&c.operator)).fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+            if total > 0.0 { total / n } else { 1.0 }
         })
         .collect()
 }
@@ -283,13 +332,9 @@ fn host_sample(posterior: &Posterior, operators: &[usize], key: u64) -> BTreeMap
     operators
         .par_iter()
         .map(|&i| {
-            let (mean, log_sd) = (&posterior.mean[i], &posterior.log_sd[i]);
-            let cols = mean.ncols();
-            let theta = Array2::from_shape_fn(mean.dim(), |(r, c)| {
-                let s = log_sd[[r, c]];
-                if s == f64::NEG_INFINITY { mean[[r, c]] } else { mean[[r, c]] + s.exp() * f64::from(gam_gpu::tensor::posterior_normal(key, i as u64, (r * cols + c) as u64)) }
-            });
-            (i, theta)
+            let cols = posterior.mean[i].ncols();
+            let epsilon = Array2::from_shape_fn(posterior.mean[i].dim(), |(r, c)| f64::from(gam_gpu::tensor::posterior_normal(key, i as u64, (r * cols + c) as u64)));
+            (i, &posterior.mean[i] + &posterior.noise(i, &epsilon))
         })
         .collect()
 }
@@ -722,13 +767,92 @@ impl Curvature {
     }
 }
 
-/// The factorized Gaussian posterior over the library's parameters, and which groups are active.
+/// A rotation of one trainable operator's posterior noise inside its prior groups. The operator's
+/// posterior is Gaussian with mean `μ`; its noise is `(σ̃ ⊙ ε) Rᵀ` (`Columns`: `R` orthogonal,
+/// `cols × cols`, every group of the operator holding whole rows) or `R (σ̃ ⊙ ε)` (`Rows`: `R`
+/// `rows × rows`, every group holding whole columns), `ε` standard normal and `σ̃` the standard
+/// deviations along the rotated axes. Each group's covariance is then `R diag(σ̃²) Rᵀ` over its
+/// row (column), so its trace and determinant, and with them `KL(q_G ‖ p_G)` against the group's
+/// isotropic prior, are those of `diag(σ̃²)`: a rotation changes the family of posteriors, not the
+/// code length's form. Operators reading the same input share one matrix (`Arc`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rotation {
+    pub side: Side,
+    pub matrix: Arc<Array2<f64>>,
+}
+
+/// Which axes of an operator a [`Rotation`] turns: its columns (each row's noise is `(σ̃ ⊙ ε) Rᵀ`)
+/// or its rows (each column's noise is `R (σ̃ ⊙ ε)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Side {
+    Columns,
+    Rows,
+}
+
+impl Rotation {
+    /// `x`, an array along the rotated axes, along the operator's own axes.
+    #[must_use]
+    pub fn apply(&self, x: &Array2<f64>) -> Array2<f64> {
+        match self.side {
+            Side::Columns => fast_abt(x, &*self.matrix),
+            Side::Rows => fast_ab(&*self.matrix, x),
+        }
+    }
+
+    /// `x`, an array along the operator's own axes, along the rotated axes: [`Rotation::apply`]'s
+    /// inverse, and the map of a gradient from the operator's axes to the rotated ones.
+    #[must_use]
+    pub fn undo(&self, x: &Array2<f64>) -> Array2<f64> {
+        match self.side {
+            Side::Columns => fast_ab(x, &*self.matrix),
+            Side::Rows => fast_atb(&*self.matrix, x),
+        }
+    }
+
+    /// Per entry along the operator's own axes, the variance of noise whose variances along the
+    /// rotated axes are `variances`.
+    #[must_use]
+    pub fn marginal(&self, variances: &Array2<f64>) -> Array2<f64> {
+        let squares = self.matrix.mapv(|v| v * v);
+        match self.side {
+            Side::Columns => fast_abt(variances, &squares),
+            Side::Rows => fast_ab(&squares, variances),
+        }
+    }
+}
+
+/// The distinct matrices of `rotations` in order of first use, and per operator its side and the
+/// index of its matrix among them.
+pub(crate) fn rotation_layout(rotations: &[Option<Rotation>]) -> (Vec<Option<(Side, usize)>>, Vec<Arc<Array2<f64>>>) {
+    let mut matrices: Vec<Arc<Array2<f64>>> = Vec::new();
+    let layout = rotations
+        .iter()
+        .map(|rotation| {
+            rotation.as_ref().map(|r| {
+                let at = matrices.iter().position(|m| Arc::ptr_eq(m, &r.matrix)).unwrap_or_else(|| {
+                    matrices.push(Arc::clone(&r.matrix));
+                    matrices.len() - 1
+                });
+                (r.side, at)
+            })
+        })
+        .collect();
+    (layout, matrices)
+}
+
+/// The Gaussian posterior over the library's parameters, independent across prior groups and,
+/// within each, independent along its operator's rotated axes ([`Rotation`]), and which groups are
+/// active.
 #[derive(Clone, Debug)]
 pub struct Posterior {
-    /// Per trainable operator (in `Explanation::trainable` order), the posterior means `μ`.
+    /// Per trainable operator (in `Explanation::trainable` order), the posterior means `μ`, along
+    /// the operator's own axes.
     pub mean: Vec<Array2<f64>>,
-    /// The posterior standard deviations' logarithms `ln σ`.
+    /// The logarithms `ln σ̃` of the posterior standard deviations along each operator's rotated
+    /// axes (its own axes where it has no rotation).
     pub log_sd: Vec<Array2<f64>>,
+    /// Per trainable operator, the rotation of its noise, if any.
+    pub rotations: Vec<Option<Rotation>>,
     /// Per group, whether it is in the explanation; a removed group's parameters are exactly zero.
     pub active: Vec<bool>,
     /// Per trainable operator, each entry's group.
@@ -743,11 +867,13 @@ pub struct Posterior {
 /// The bits of a group's variance scale (module note): the integer exponent
 /// `round(log2(v_G / v⁰_G))` in the Elias δ code of its signed index.
 fn scale_bits(variance: f64, initial: f64) -> f64 {
-    let exponent = (variance / initial).log2().round();
-    if !exponent.is_finite() {
+    // In the log domain: a ratio of finite positive variances can overflow where its logarithm
+    // does not.
+    let exponent = (variance.log2() - initial.log2()).round();
+    if !(variance > 0.0 && initial > 0.0) || !exponent.is_finite() {
         return f64::INFINITY;
     }
-    // A finite ratio of finite positive variances has |exponent| ≤ 2098, well inside i64.
+    // Finite positive variances have |exponent| ≤ 2098, well inside i64.
     match crate::codec::signed_codeword_argument(exponent as i64).and_then(crate::codec::elias_delta_len_bits) {
         Ok(bits) => bits as f64,
         Err(_) => f64::INFINITY,
@@ -815,8 +941,23 @@ impl Posterior {
         if explanation.removed.iter().any(|g| *g >= explanation.groups.len()) {
             return Err("a removed group the explanation does not have".into());
         }
-        if let Some(g) = (0..squares.len()).find(|g| !explanation.removed.contains(g) && !(squares[*g].1 > 0.0 && squares[*g].1.is_finite())) {
-            return Err(format!("{}: a group starting at zero has no scale", explanation.groups[g].name));
+        if let Some(g) = (0..squares.len()).find(|g| !squares[*g].1.is_finite()) {
+            return Err(format!("{}: a group starting at a nonfinite value", explanation.groups[g].name));
+        }
+        if explanation.reference.len() != explanation.groups.len() {
+            return Err("one reference variance per prior group required".into());
+        }
+        // A group starting at zero is valid: its deviations start from its reference variance,
+        // which `M` fixes for every group (`Explanation::reference`).
+        for (g, group) in explanation.groups.iter().enumerate() {
+            if explanation.removed.contains(&g) || squares[g].1 > 0.0 {
+                continue;
+            }
+            let reference = explanation.reference[g];
+            if !(reference > 0.0 && reference.is_finite()) {
+                return Err(format!("{}: a group starting at zero without a reference variance", group.name));
+            }
+            squares[g].1 = squares[g].0 * reference;
         }
         let log_sd = membership
             .iter()
@@ -827,11 +968,9 @@ impl Posterior {
                 })
             })
             .collect();
-        if explanation.reference.len() != explanation.groups.len() {
-            return Err("one reference variance per prior group required".into());
-        }
         let initial = explanation.reference.clone();
-        let mut posterior = Self { mean, log_sd, active: vec![true; explanation.groups.len()], membership, spans, initial };
+        let rotations = vec![None; mean.len()];
+        let mut posterior = Self { mean, log_sd, rotations, active: vec![true; explanation.groups.len()], membership, spans, initial };
         posterior.remove(&explanation.removed);
         Ok(posterior)
     }
@@ -873,7 +1012,8 @@ impl Posterior {
             })
             .collect();
         let initial = squares.iter().map(|(count, sum)| sum / count).collect();
-        Ok(Self { mean, log_sd, active: vec![true; groups], membership, spans, initial })
+        let rotations = vec![None; mean.len()];
+        Ok(Self { mean, log_sd, rotations, active: vec![true; groups], membership, spans, initial })
     }
 
     fn moments(&self) -> Vec<Moments> {
@@ -916,18 +1056,22 @@ impl Posterior {
         if curvature.quadratic.len() != self.active.len() {
             return Err("a curvature of another explanation".into());
         }
-        // Per group, `u_G · μ_G` and `Σ u_j² σ_j²` of this draw.
+        // Per group, `u_G · μ_G` and `Σ u_j² σ_j²` of this draw, the second along the operator's
+        // rotated axes (a rotation stays inside each group, so the group's entries are the same
+        // positions along both).
         let partial: Vec<(Range<usize>, Vec<(f64, f64)>)> = (0..self.mean.len())
             .into_par_iter()
             .map(|i| {
                 let span = self.spans[i].clone();
+                let rotated = self.rotations[i].as_ref().map(|r| r.undo(&u[i]));
+                let along = rotated.as_ref().unwrap_or(&u[i]);
                 let mut local = vec![(0.0, 0.0); span.len()];
-                for (((g, mu), s), group) in u[i].iter().zip(self.mean[i].iter()).zip(self.log_sd[i].iter()).zip(self.membership[i].iter()) {
+                for ((((g, r), mu), s), group) in u[i].iter().zip(along.iter()).zip(self.mean[i].iter()).zip(self.log_sd[i].iter()).zip(self.membership[i].iter()) {
                     let at = *group as usize;
                     if self.active[at] {
                         let entry = &mut local[at - span.start];
                         entry.0 += g * mu;
-                        entry.1 += g * g * (2.0 * s).exp();
+                        entry.1 += r * r * (2.0 * s).exp();
                     }
                 }
                 (span, local)
@@ -1016,10 +1160,11 @@ impl Posterior {
     #[must_use]
     pub fn rounded(&self) -> Self {
         let mut out = self.clone();
-        for (mean, log_sd) in out.mean.iter_mut().zip(&self.log_sd) {
-            ndarray::Zip::from(mean).and(log_sd).for_each(|mu, s| {
-                if s.is_finite() {
-                    let step = (s / LN_2).floor().exp2();
+        for (i, mean) in out.mean.iter_mut().enumerate() {
+            let variances = self.marginal_variances(i);
+            ndarray::Zip::from(mean).and(&variances).for_each(|mu, v| {
+                if *v > 0.0 && v.is_finite() {
+                    let step = (0.5 * v.ln() / LN_2).floor().exp2();
                     *mu = (*mu / step).round() * step;
                 }
             });
@@ -1032,6 +1177,55 @@ impl Posterior {
         self.costs().iter().sum::<f64>() + self.subset_nats()
     }
 
+
+    /// Operator `i`'s noise for standard normal draws `epsilon` along its rotated axes: `σ̃ ⊙ ε`
+    /// along its own axes (zero in removed groups, whose `σ̃` is zero).
+    #[must_use]
+    pub fn noise(&self, i: usize, epsilon: &Array2<f64>) -> Array2<f64> {
+        let mut scaled = epsilon.clone();
+        ndarray::Zip::from(&mut scaled).and(&self.log_sd[i]).for_each(|e, s| *e *= s.exp());
+        match &self.rotations[i] {
+            Some(rotation) => rotation.apply(&scaled),
+            None => scaled,
+        }
+    }
+
+    /// Operator `i`'s marginal posterior variances along its own axes.
+    #[must_use]
+    pub fn marginal_variances(&self, i: usize) -> Array2<f64> {
+        let variances = self.log_sd[i].mapv(|s| (2.0 * s).exp());
+        match &self.rotations[i] {
+            Some(rotation) => rotation.marginal(&variances),
+            None => variances,
+        }
+    }
+
+    /// Operator `i`'s means along its rotated axes, where its `ln σ̃` are (its own axes where it has
+    /// no rotation).
+    #[must_use]
+    pub fn rotated_mean(&self, i: usize) -> std::borrow::Cow<'_, Array2<f64>> {
+        match &self.rotations[i] {
+            Some(rotation) => std::borrow::Cow::Owned(rotation.undo(&self.mean[i])),
+            None => std::borrow::Cow::Borrowed(&self.mean[i]),
+        }
+    }
+
+    /// The posterior factorized along every operator's own axes, with this one's means and
+    /// marginal variances and no rotation: the view of a reader that treats entries one by one. Its
+    /// divergence is at most this posterior's (a group's `ln det` is at most the sum of its
+    /// marginals' logarithms, so the factorized view has the larger entropy), and equal where no
+    /// operator is rotated.
+    #[must_use]
+    pub fn factorized(&self) -> Self {
+        let mut out = self.clone();
+        for i in 0..out.mean.len() {
+            if self.rotations[i].is_some() {
+                out.log_sd[i] = self.marginal_variances(i).mapv(|v| 0.5 * v.ln());
+            }
+        }
+        out.rotations = vec![None; out.mean.len()];
+        out
+    }
 
     /// The posterior means with every removed group zeroed.
     pub fn means(&self) -> Vec<Array2<f64>> {
@@ -1233,7 +1427,7 @@ pub struct Report {
     pub epochs: Vec<Epoch>,
     pub removals: Vec<Removal>,
     pub active_groups: usize,
-    /// `F` of the converged fit, in bits.
+    /// `F` where the fit stopped, in bits.
     pub objective_bits: f64,
     pub seconds: f64,
 }
@@ -1664,6 +1858,11 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_p
         let alive = d.upload_indices(&surviving).map_err(error)?;
         gates.push(Some((alive, codes, variances(&mlp.gate)?, mlp.up.as_ref().map(variances).transpose()?)));
     }
+    // Each distinct rotation of a map's input axes on the device once (`rotation_layout`; the
+    // fit's rotations turn columns).
+    let (layout, matrices) = rotation_layout(&posterior.rotations);
+    let uploaded = matrices.iter().map(|m| d.upload(m.view()).map_err(error)).collect::<Result<Vec<_>, _>>()?;
+    let rotations: Vec<Option<&Tensor>> = layout.iter().map(|entry| entry.filter(|(side, _)| *side == Side::Columns).map(|(_, at)| &uploaded[at])).collect();
     let mut rows = 0usize;
     for chunk in sequences.chunks(settings.batch_sequences) {
         let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
@@ -1672,15 +1871,27 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_p
             let x = trace.value(mlp.input)?;
             let mut squares = d.empty(x.rows(), x.cols()).map_err(error)?;
             d.hadamard(&mut squares, x, x, false).map_err(error)?;
-            // `s²` of each function's value at every token: `Σ_j σ²_j x_j²` plus the bias's `σ²`.
-            let noise = |(weights, bias): &(Tensor, Tensor)| -> Result<Tensor, String> {
+            // `s²` of each function's value at every token: `Σ_k σ̃²_k x̃_k²` plus the bias's `σ²`,
+            // `x̃` the input along the map's rotated axes (`x R`; `x` itself without a rotation).
+            let noise = |map: &Map, (weights, bias): &(Tensor, Tensor)| -> Result<Tensor, String> {
+                let rotated = match rotations[scorer.at(map.operator)?] {
+                    Some(matrix) => {
+                        let mut along = d.empty(x.rows(), x.cols()).map_err(error)?;
+                        d.gemm(&mut along, 1.0, x, Op::N, matrix, Op::N, 0.0, program.arithmetic()).map_err(error)?;
+                        let mut squared = d.empty(x.rows(), x.cols()).map_err(error)?;
+                        d.hadamard(&mut squared, &along, &along, false).map_err(error)?;
+                        Some(squared)
+                    }
+                    None => None,
+                };
+                let squares = rotated.as_ref().unwrap_or(&squares);
                 let mut s2 = d.empty(x.rows(), weights.rows()).map_err(error)?;
                 d.gemm(&mut s2, 1.0, &squares, Op::N, weights, Op::T, 0.0, program.arithmetic()).map_err(error)?;
                 d.add_row(&mut s2, 1.0, bias).map_err(error)?;
                 Ok(s2)
             };
             let (z, a) = (trace.value(mlp.gate.node)?, trace.value(mlp.activation)?);
-            let sz2 = noise(gate)?;
+            let sz2 = noise(&mlp.gate, gate)?;
             let mut sums = wide.zeros(1, 3).map_err(error)?;
             match (&mlp.up, up) {
                 (Some(map), Some(variances)) => {
@@ -1690,7 +1901,7 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_p
                     let mut value = d.empty(a.rows(), a.cols()).map_err(error)?;
                     d.hadamard(&mut value, a, y, false).map_err(error)?;
                     let slope = d.law_slopes(y, z, codes, gelu_tanh_constant()).map_err(error)?;
-                    d.resolved_counts((&value, &slope, a), (&sz2, Some(&noise(variances)?)), alive, &mut sums).map_err(error)?;
+                    d.resolved_counts((&value, &slope, a), (&sz2, Some(&noise(map, variances)?)), alive, &mut sums).map_err(error)?;
                 }
                 _ => {
                     let ones = d.broadcast_rows(&d.upload_vec(1, z.cols(), vec![1.0; z.cols()]).map_err(error)?, z.rows()).map_err(error)?;
@@ -1709,6 +1920,74 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_p
         count.resolved_per_token /= rows as f64;
     }
     Ok(out)
+}
+
+/// Each trainable operator's rotation ([`Rotation`]): where every prior group on the operator holds
+/// whole rows and `P`'s program reads it as a term of an affine node, the eigenvectors of the second
+/// moment `E[x xᵀ]` of that term's input `x` over `sequences`, `P` at `posterior`'s mean. Along those
+/// axes the Gauss–Newton matrix of a row's weights, `E[x xᵀ]` times the row's output factor in its
+/// Kronecker factorization, is diagonal, so independent noise along them pays only for the
+/// directions the data resolve. Operators reading one input share its matrix.
+fn rotations(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterior, sequences: &[Vec<u32>], settings: &Settings) -> Result<Vec<Option<Rotation>>, String> {
+    let sites: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+    let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
+    let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
+    let columns: Vec<usize> = posterior.mean.iter().map(Array2::ncols).collect();
+    let mut whole_rows: Vec<bool> = columns.iter().map(|c| *c > 1).collect();
+    for group in &explanation.groups {
+        for cell in &group.cells {
+            let i = position[&cell.operator];
+            whole_rows[i] &= cell.cols == (0..columns[i]);
+        }
+    }
+    // Each operator's input as an affine term; one read by different inputs takes none.
+    let mut inputs: Vec<Option<Option<usize>>> = vec![None; columns.len()];
+    for node in &flat.nodes {
+        if let Node::Affine { terms, .. } = node {
+            for (x, op) in terms {
+                if let Some(&i) = position.get(op) {
+                    inputs[i] = match inputs[i] {
+                        None => Some(Some(*x)),
+                        Some(Some(seen)) if seen == *x => Some(Some(seen)),
+                        _ => Some(None),
+                    };
+                }
+            }
+        }
+    }
+    let read: Vec<Option<usize>> = inputs.iter().zip(&whole_rows).map(|(input, whole)| if *whole { input.flatten() } else { None }).collect();
+    let mut nodes: Vec<usize> = read.iter().flatten().copied().collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+    if nodes.is_empty() {
+        return Ok(vec![None; columns.len()]);
+    }
+    scorer.experiments.load(&posterior.mean)?;
+    let program = scorer.experiments.models().1.program;
+    let device = program.device();
+    // `Σ x xᵀ` accumulates on the device in the program's arithmetic: any orthogonal `R` gives a
+    // valid posterior (its eigenvectors are taken in float64 from the downloaded sum), so the
+    // accumulation's rounding moves the axes, not the code length's validity.
+    let mut grams: BTreeMap<usize, Tensor> = BTreeMap::new();
+    for chunk in sequences.chunks(settings.batch_sequences) {
+        let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+        let trace = program.forward(&family)?;
+        for &node in &nodes {
+            let x = trace.value(node)?;
+            let gram = match grams.entry(node) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(device.zeros(x.cols(), x.cols()).map_err(error)?),
+            };
+            device.gemm(gram, 1.0, x, Op::T, x, Op::N, 1.0, program.arithmetic()).map_err(error)?;
+        }
+    }
+    let mut matrices: BTreeMap<usize, Arc<Array2<f64>>> = BTreeMap::new();
+    for (node, gram) in grams {
+        let gram = device.download(&gram).map_err(error)?;
+        let vectors = gam_linalg::decompose::eigh(gram.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(error)?.vectors;
+        matrices.insert(node, Arc::new(vectors));
+    }
+    Ok(read.iter().map(|node| node.map(|n| Rotation { side: Side::Columns, matrix: Arc::clone(&matrices[&n]) })).collect())
 }
 
 /// Where a fit stands at the end of an epoch: with the posterior and the optimizer's moments, all a
@@ -1742,6 +2021,13 @@ struct Progress {
     /// The prior term's state, when the fit has one.
     #[serde(default)]
     prior: Option<serde_json::Value>,
+    /// Per trainable operator its rotation's side and matrix ([`rotation_layout`]), and each
+    /// distinct matrix's order: the matrices follow the operators' arrays in the payload, in
+    /// float64.
+    #[serde(default)]
+    rotations: Vec<Option<(Side, usize)>>,
+    #[serde(default)]
+    rotation_orders: Vec<usize>,
     /// The precision of the payload's `μ`, `ln σ`, momentum, curvature and gradient second-moment
     /// arrays: the storage the
     /// device posterior holds each in; none for a checkpoint written in float64 throughout.
@@ -1768,10 +2054,58 @@ pub struct Identity {
     pub sharing: String,
     /// What else defines the explanation: the values of its fixed operators that are not `M`'s
     /// tensors (a tie's selection and scatter, a transport, a merged body's unit scales), the
-    /// ownership map with its factors, the layers' groups and sites, the trainable operators, and
-    /// each group's scale reference. A checkpoint that names none is of another identity.
+    /// trainable operators' starting values, the ownership map with its factors, the layers' groups
+    /// and sites, the trainable operators, and each group's scale reference. A checkpoint that names
+    /// none is of another identity.
     #[serde(default)]
     pub definition: String,
+}
+
+/// The explanation-only fields of a fit's identity: its prior groups, its shared-parameter map and
+/// what else defines it ([`Identity`]).
+fn explanation_identity(explanation: &Explanation) -> (String, String, String) {
+    let mut groups = Fingerprinter::new();
+    groups.absorb_str(b"removed", &format!("{:?}", explanation.removed));
+    groups.absorb_u64(b"fixed", explanation.fixed_nats.to_bits());
+    for group in &explanation.groups {
+        groups.absorb_str(b"group", &group.name);
+        for cell in &group.cells {
+            groups.absorb_str(b"cells", &format!("{}|{:?}|{:?}", cell.operator, cell.rows, cell.cols));
+        }
+    }
+    let mut sharing = Fingerprinter::new();
+    let explained = &explanation.artifact.program;
+    let bodies = std::iter::once(("program".to_string(), &explained.nodes)).chain(explained.rules.iter().map(|r| (r.name.clone(), &r.nodes)));
+    let mut uses: BTreeMap<usize, Vec<String>> = explanation.trainable.iter().map(|op| (*op, Vec::new())).collect();
+    for (body, nodes) in bodies {
+        for (n, node) in nodes.iter().enumerate() {
+            for op in node.operators() {
+                if let Some(list) = uses.get_mut(&op) {
+                    list.push(format!("{body}:{n}"));
+                }
+            }
+        }
+    }
+    for (op, list) in &uses {
+        sharing.absorb_str(b"uses", &format!("{op}|{}", list.join(",")));
+    }
+    let mut definition = Fingerprinter::new();
+    let trainable: std::collections::BTreeSet<usize> = explanation.trainable.iter().copied().collect();
+    for (i, op) in explained.operators.iter().enumerate() {
+        // A fixed operator derived rather than taken from `M`, and every trainable operator's
+        // starting values (two explanations of one shape warmed differently are different fits).
+        if trainable.contains(&i) || !op.provenance.derivation.is_empty() {
+            definition.absorb_str(b"fixed", &op.name);
+            let values: Vec<u8> = op.matrix().iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            definition.absorb_bytes(b"values", &values);
+        }
+    }
+    definition.absorb_str(b"owners", &format!("{:?}", explanation.artifact.owners));
+    definition.absorb_str(b"layers", &format!("{:?}", explanation.layers));
+    definition.absorb_str(b"trainable", &format!("{:?}", explanation.trainable));
+    let reference: Vec<u8> = explanation.reference.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+    definition.absorb_bytes(b"reference", &reference);
+    (groups.finalize().to_hex(), sharing.finalize().to_hex(), definition.finalize().to_hex())
 }
 
 fn program_structure(hasher: &mut Fingerprinter, tag: &[u8], program: &OperatorProgram) {
@@ -1802,53 +2136,8 @@ pub fn identity(export: &str, native: &OperatorProgram, explanation: &Explanatio
     let mut program = Fingerprinter::new();
     program_structure(&mut program, b"native", native);
     program_structure(&mut program, b"explanation", &explanation.artifact.program);
-    let mut groups = Fingerprinter::new();
-    groups.absorb_str(b"removed", &format!("{:?}", explanation.removed));
-    groups.absorb_u64(b"fixed", explanation.fixed_nats.to_bits());
-    for group in &explanation.groups {
-        groups.absorb_str(b"group", &group.name);
-        for cell in &group.cells {
-            groups.absorb_str(b"cells", &format!("{}|{:?}|{:?}", cell.operator, cell.rows, cell.cols));
-        }
-    }
-    let mut sharing = Fingerprinter::new();
-    let explained = &explanation.artifact.program;
-    let bodies = std::iter::once(("program".to_string(), &explained.nodes)).chain(explained.rules.iter().map(|r| (r.name.clone(), &r.nodes)));
-    let mut uses: BTreeMap<usize, Vec<String>> = explanation.trainable.iter().map(|op| (*op, Vec::new())).collect();
-    for (body, nodes) in bodies {
-        for (n, node) in nodes.iter().enumerate() {
-            for op in node.operators() {
-                if let Some(list) = uses.get_mut(&op) {
-                    list.push(format!("{body}:{n}"));
-                }
-            }
-        }
-    }
-    for (op, list) in &uses {
-        sharing.absorb_str(b"uses", &format!("{op}|{}", list.join(",")));
-    }
-    let mut definition = Fingerprinter::new();
-    let trainable: std::collections::BTreeSet<usize> = explanation.trainable.iter().copied().collect();
-    for (i, op) in explained.operators.iter().enumerate() {
-        if !trainable.contains(&i) && !op.provenance.derivation.is_empty() {
-            definition.absorb_str(b"fixed", &op.name);
-            let values: Vec<u8> = op.matrix().iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-            definition.absorb_bytes(b"values", &values);
-        }
-    }
-    definition.absorb_str(b"owners", &format!("{:?}", explanation.artifact.owners));
-    definition.absorb_str(b"layers", &format!("{:?}", explanation.layers));
-    definition.absorb_str(b"trainable", &format!("{:?}", explanation.trainable));
-    let reference: Vec<u8> = explanation.reference.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-    definition.absorb_bytes(b"reference", &reference);
-    Identity {
-        export: export.to_string(),
-        tokens: tokens.finalize().to_hex(),
-        program: program.finalize().to_hex(),
-        groups: groups.finalize().to_hex(),
-        sharing: sharing.finalize().to_hex(),
-        definition: definition.finalize().to_hex(),
-    }
+    let (groups, sharing, definition) = explanation_identity(explanation);
+    Identity { export: export.to_string(), tokens: tokens.finalize().to_hex(), program: program.finalize().to_hex(), groups, sharing, definition }
 }
 
 /// Read only the length-delimited JSON header. Neither identity checks nor restoration need a
@@ -1949,12 +2238,55 @@ impl Precision {
 }
 
 /// The payload bytes of a checkpoint of operators of `shapes` with arrays in `precision`.
-fn checkpoint_payload_bytes(shapes: &[(usize, usize)], precision: [Precision; CHECKPOINT_ARRAYS]) -> Option<u64> {
+fn checkpoint_payload_bytes(shapes: &[(usize, usize)], precision: [Precision; CHECKPOINT_ARRAYS], rotation_orders: &[usize]) -> Option<u64> {
     let per_cell = precision.iter().map(|p| p.bytes() as u64).sum::<u64>();
-    shapes.iter().try_fold(0_u64, |total, &(rows, cols)| {
+    let arrays = shapes.iter().try_fold(0_u64, |total, &(rows, cols)| {
         let cells = u64::try_from(rows).ok()?.checked_mul(u64::try_from(cols).ok()?)?;
         total.checked_add(cells.checked_mul(per_cell)?)
-    })
+    })?;
+    rotation_orders.iter().try_fold(arrays, |total, &k| total.checked_add(u64::try_from(k).ok()?.checked_mul(u64::try_from(k).ok()?)?.checked_mul(8)?))
+}
+
+/// The rotations of a checkpoint's operators: its distinct matrices, of `orders`, read from
+/// `reader` in float64, attached as `layout` says (each operator's side and matrix).
+fn read_rotations(reader: &mut impl Read, layout: &[Option<(Side, usize)>], orders: &[usize], shapes: &[(usize, usize)]) -> Result<Vec<Option<Rotation>>, String> {
+    let mut matrices = Vec::with_capacity(orders.len());
+    for &k in orders {
+        let mut matrix = Array2::zeros((k, k));
+        read_checkpoint_array(reader, &mut matrix, Precision::F64)?;
+        matrices.push(Arc::new(matrix));
+    }
+    if layout.is_empty() {
+        return Ok(vec![None; shapes.len()]);
+    }
+    if layout.len() != shapes.len() {
+        return Err("a rotation layout of another explanation".into());
+    }
+    layout
+        .iter()
+        .zip(shapes)
+        .map(|(entry, &(rows, cols))| {
+            entry
+                .map(|(side, at)| {
+                    let matrix = matrices.get(at).ok_or("a rotation beyond the checkpoint's matrices")?;
+                    let order = if side == Side::Columns { cols } else { rows };
+                    if matrix.nrows() != order {
+                        return Err("a rotation of another order than its operator's axes".to_string());
+                    }
+                    Ok(Rotation { side, matrix: Arc::clone(matrix) })
+                })
+                .transpose()
+        })
+        .collect()
+}
+
+/// `posterior`'s means, read along each operator's rotated axes, turned to its own axes.
+fn along_own_axes(posterior: &mut Posterior) {
+    for (mean, rotation) in posterior.mean.iter_mut().zip(&posterior.rotations) {
+        if let Some(r) = rotation {
+            *mean = r.apply(mean);
+        }
+    }
 }
 
 /// Decode in fixed-size byte tiles directly into the destination, including nonstandard array
@@ -2021,13 +2353,17 @@ impl Snapshot {
     fn take(progress: &mut Progress, posterior: &DevicePosterior) -> Result<Self, String> {
         let precision = posterior.storages().map(Precision::of);
         progress.precision = Some(precision);
-        let bytes = checkpoint_payload_bytes(&progress.shapes, precision).ok_or("a checkpoint too large to address")?;
+        let bytes = checkpoint_payload_bytes(&progress.shapes, precision, &progress.rotation_orders).ok_or("a checkpoint too large to address")?;
         let mut payload = Vec::with_capacity(usize::try_from(bytes).map_err(error)?);
         for i in 0..progress.shapes.len() {
             let (mean, log_sd, [momentum, curvature, power]) = posterior.operator(i)?;
             for (array, precision) in [&mean, &log_sd, &momentum, &curvature, &power].into_iter().zip(precision) {
                 write_checkpoint_array(&mut payload, array, precision)?;
             }
+        }
+        // The rotations' distinct matrices, as the header's layout lists them.
+        for matrix in rotation_layout(posterior.rotations()).1 {
+            write_checkpoint_array(&mut payload, &matrix, Precision::F64)?;
         }
         Ok(Self { header: serde_json::to_vec(progress).map_err(error)?, json: serde_json::to_vec_pretty(progress).map_err(error)?, payload })
     }
@@ -2084,7 +2420,7 @@ impl Drop for Writer {
 
 /// Restore a checkpoint of this fit into `posterior`, with IVON's state per operator, or refuse one
 /// of another fit.
-fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) -> Result<(Progress, Vec<[Array2<f64>; 3]>), String> {
+fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) -> Result<(Progress, Vec<[Array2<f64>; 3]>, Vec<Array2<f64>>), String> {
     let (progress, mut reader, payload_bytes): (Progress, _, _) = checkpoint_header(path)?;
     check_checkpoint_identity(path, &progress.identity, &expected.identity)?;
     let same_settings =
@@ -2097,7 +2433,7 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) 
         return Err(format!("{}: a checkpoint of another fit", path.display()));
     }
     let precision = Precision::of_payload(progress.precision);
-    if checkpoint_payload_bytes(&progress.shapes, precision) != Some(payload_bytes)
+    if checkpoint_payload_bytes(&progress.shapes, precision, &progress.rotation_orders) != Some(payload_bytes)
         || posterior.mean.len() != progress.shapes.len()
         || posterior.log_sd.len() != progress.shapes.len()
         || posterior.mean.iter().zip(&progress.shapes).any(|(array, shape)| array.dim() != *shape)
@@ -2116,33 +2452,54 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) 
         }
         moments.push(next);
     }
+    posterior.rotations = read_rotations(&mut reader, &progress.rotations, &progress.rotation_orders, &progress.shapes)?;
     if reader.read(&mut [0_u8; 1]).map_err(error)? != 0 {
         return Err(format!("{}: a checkpoint of the wrong size", path.display()));
     }
+    // The checkpoint holds the means along each operator's rotated axes, as the device does.
+    let held = posterior.mean.clone();
+    along_own_axes(posterior);
     posterior.active = progress.active.clone();
-    Ok((progress, moments))
+    Ok((progress, moments, held))
 }
 
-/// A checkpoint of `explanation` read whole: the posterior (means, log standard deviations and
-/// active groups) and the start it holds ([`checkpoint_start`]).
+/// A checkpoint of `explanation` read whole: the posterior (means along the operators' own axes,
+/// log standard deviations, rotations and active groups) and the start it holds
+/// ([`checkpoint_start`]); a checkpoint whose identity names another explanation is refused.
 fn read_checkpoint(explanation: &Explanation, path: &Path) -> Result<(Posterior, Start), String> {
     #[derive(Deserialize)]
     struct Header {
+        identity: Identity,
         tokens: usize,
         shapes: Vec<(usize, usize)>,
         active: Vec<bool>,
         #[serde(default)]
         precision: Option<[Precision; CHECKPOINT_ARRAYS]>,
+        #[serde(default)]
+        rotations: Vec<Option<(Side, usize)>>,
+        #[serde(default)]
+        rotation_orders: Vec<usize>,
         step: i32,
         epoch: usize,
     }
     let (header, mut reader, payload_bytes): (Header, _, _) = checkpoint_header(path)?;
+    // The checkpoint must be a fit of this explanation: the same groups, shared parameters,
+    // starting values and correspondence to `M` (the identity's explanation-only fields).
+    let (groups, sharing, definition) = explanation_identity(explanation);
+    let differing: Vec<&str> = [("groups", header.identity.groups == groups), ("sharing", header.identity.sharing == sharing), ("definition", header.identity.definition == definition)]
+        .into_iter()
+        .filter(|(_, same)| !same)
+        .map(|(field, _)| field)
+        .collect();
+    if !differing.is_empty() {
+        return Err(format!("{}: a checkpoint of another explanation (its {} differ)", path.display(), differing.join(", ")));
+    }
     let precision = Precision::of_payload(header.precision);
     let mut posterior = Posterior::new(explanation, header.tokens)?;
     if header.shapes != posterior.mean.iter().map(Array2::dim).collect::<Vec<_>>() || header.active.len() != posterior.active.len() {
         return Err(format!("{}: a checkpoint of another explanation", path.display()));
     }
-    if checkpoint_payload_bytes(&header.shapes, precision) != Some(payload_bytes) {
+    if checkpoint_payload_bytes(&header.shapes, precision, &header.rotation_orders) != Some(payload_bytes) {
         return Err(format!("{}: a checkpoint of the wrong size", path.display()));
     }
     let mut state = Vec::with_capacity(header.shapes.len());
@@ -2155,20 +2512,26 @@ fn read_checkpoint(explanation: &Explanation, path: &Path) -> Result<(Posterior,
         }
         state.push(moments);
     }
+    posterior.rotations = read_rotations(&mut reader, &header.rotations, &header.rotation_orders, &header.shapes)?;
+    // The start keeps the means as the device held them; the posterior reads them along the
+    // operators' own axes.
+    let held = posterior.mean.clone();
+    along_own_axes(&mut posterior);
     posterior.active = header.active;
     let start = Start {
-        mean: posterior.mean.clone(),
+        mean: held,
         log_sd: posterior.log_sd.clone(),
         active: posterior.active.clone(),
         state: Some(state),
         steps: u64::try_from(header.step).map_err(error)?,
         epoch: header.epoch,
+        rotations: posterior.rotations.clone(),
     };
     Ok((posterior, start))
 }
 
 /// The posterior of a fit checkpoint of `explanation` (`OUT/checkpoint.bin`, [`fit`]): its means,
-/// log standard deviations and active groups, for reading a fit that is still running.
+/// log standard deviations, rotations and active groups, for reading a fit that is still running.
 pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Posterior, String> {
     read_checkpoint(explanation, path).map(|(posterior, _)| posterior)
 }
@@ -2180,7 +2543,10 @@ pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Po
 /// gradient's second moment) after `steps` steps. Without a
 /// state, the fit makes the Laplace start (`laplace_start`) from the start's means: its standard
 /// deviations and IVON's curvature come from one pass at a sample of the given posterior. `epoch`
-/// is the next epoch, whose batches' weight noise the fit draws.
+/// is the next epoch, whose batches' weight noise the fit draws. `rotations`, per operator, are
+/// the axes the deviations and the state are along and the means are held along (as a device holds
+/// them, [`Rotation`]); empty for a start along the operators' own axes. The fit keeps a start's
+/// rotations.
 pub struct Start {
     pub mean: Vec<Array2<f64>>,
     pub log_sd: Vec<Array2<f64>>,
@@ -2188,6 +2554,7 @@ pub struct Start {
     pub state: Option<Vec<[Array2<f64>; 3]>>,
     pub steps: u64,
     pub epoch: usize,
+    pub rotations: Vec<Option<Rotation>>,
 }
 
 /// The start a fit checkpoint of `explanation` holds: its posterior, IVON's state, the steps taken
@@ -2272,28 +2639,42 @@ pub fn fit_from(
         full_seconds: 0.0,
         prior: None,
         precision: None,
+        rotations: Vec::new(),
+        rotation_orders: Vec::new(),
     };
     // The fixed held-out subset: the first batch of held-out bases (at least the two a source
     // needs).
     let subset = &held[..settings.batch_sequences.clamp(2, held.len())];
-    let mut resumed = None;
+    let (mut resumed, mut held_means, mut from_start) = (None, None, false);
     if let Some(start) = start {
         let shapes: Vec<(usize, usize)> = posterior.mean.iter().map(Array2::dim).collect();
         let fits = |arrays: &[Array2<f64>]| arrays.iter().map(Array2::dim).eq(shapes.iter().copied());
         let state_fits = start.state.as_ref().is_none_or(|state| state.len() == shapes.len() && state.iter().zip(&shapes).all(|(m, d)| m.iter().all(|a| a.dim() == *d)));
-        if !fits(&start.mean) || !fits(&start.log_sd) || start.active.len() != posterior.active.len() || !state_fits {
+        let rotations_fit = start.rotations.is_empty() || start.rotations.len() == shapes.len();
+        if !fits(&start.mean) || !fits(&start.log_sd) || start.active.len() != posterior.active.len() || !state_fits || !rotations_fit {
             return Err("a start of another explanation".into());
         }
+        // The start's own rotations, along which its deviations and state are and its means held.
+        posterior.rotations = if start.rotations.is_empty() { vec![None; shapes.len()] } else { start.rotations };
+        if posterior.rotations.iter().any(Option::is_some) {
+            held_means = Some(start.mean.clone());
+        }
         posterior.mean = start.mean;
+        along_own_axes(&mut posterior);
         posterior.log_sd = start.log_sd;
         posterior.remove(&(0..start.active.len()).filter(|g| !start.active[*g]).collect::<Vec<_>>());
+        let (layout, matrices) = rotation_layout(&posterior.rotations);
+        progress.rotations = layout;
+        progress.rotation_orders = matrices.iter().map(|m| m.nrows()).collect();
         progress.active = posterior.active.clone();
         progress.epoch = start.epoch;
         progress.step = i32::try_from(start.steps).map_err(error)?;
         resumed = start.state;
+        from_start = true;
     }
     if let Some(path) = checkpoint.filter(|p| p.exists()) {
-        let (loaded, moments) = load_checkpoint(path, &progress, &mut posterior)?;
+        let (loaded, moments, held) = load_checkpoint(path, &progress, &mut posterior)?;
+        held_means = Some(held);
         progress = loaded;
         match (prior.as_deref_mut(), &progress.prior) {
             (Some(prior), Some(state)) => prior.load(state)?,
@@ -2302,11 +2683,24 @@ pub fn fit_from(
         }
         resumed = Some(moments);
         log::info!("library fit resumed at epoch {} from {}", progress.epoch, path.display());
+    } else if !from_start {
+        let timed = Instant::now();
+        // A prior term prices entries one by one along their own axes, and re-chooses the operators
+        // it reads every epoch (`PriorTerm::epoch`): a fit with one keeps the factorized posterior.
+        posterior.rotations = if prior.is_some() { vec![None; posterior.mean.len()] } else { rotations(&mut scorer, explanation, &posterior, sequences, settings)? };
+        let (layout, matrices) = rotation_layout(&posterior.rotations);
+        progress.rotations = layout;
+        progress.rotation_orders = matrices.iter().map(|m| m.nrows()).collect();
+        log::info!("library rotations: {} operators share {} matrices, {:.1} s", posterior.rotations.iter().flatten().count(), matrices.len(), timed.elapsed().as_secs_f64());
     }
     let resumed_seconds = progress.seconds;
     let fresh = resumed.is_none();
     let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, resumed.as_deref(), u64::try_from(progress.step).map_err(error)?)?;
     drop(resumed);
+    // A resumed fit holds exactly the device's means of the checkpoint.
+    if let Some(held) = held_means.take() {
+        device_posterior.restore_means(&held)?;
+    }
     if fresh {
         let timed = Instant::now();
         let moments = laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens)?;
@@ -2530,7 +2924,7 @@ pub fn fit_from(
 
 /// The Laplace start of a fresh fit. One pass over the training collection draws every batch's
 /// sampled-label factor `u_b` at a weight sample of the unit-information start, and
-/// `h = Σ_b u_b ⊙ u_b / N` (the batches' estimates `B / N · u_b ⊙ u_b`, averaged) estimates the
+/// `h = Σ_b u_b ⊙ u_b / N` (along each operator's rotated axes, `u_b R`, where it has a rotation) (the batches' estimates `B / N · u_b ⊙ u_b`, averaged) estimates the
 /// Gauss–Newton diagonal per token. Each entry's deviation becomes `σ² = 1 / (N h + 1 / v_G)`, the
 /// minimum in `σ` of the data term's Gauss–Newton model `½ N h σ²` plus `KL(q ‖ p)`, instead of the
 /// epochs IVON's curvature average needs to fall from the start's `1 / v_G` to `h`. Returns IVON's
@@ -2560,7 +2954,9 @@ fn laplace_start(
         device_posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
         let factor = scorer.experiments.sampled_label_resident(&batch, &experiments, &uniforms(key, &batch, &experiments))?;
         for (op, u) in &factor {
-            let u = wide.convert(u).map_err(error)?;
+            // Along the operator's rotated axes, where its deviations and IVON's curvature are.
+            let rotated = device_posterior.along_rotated_axes(*op, u)?;
+            let u = wide.convert(rotated.as_ref().unwrap_or(u)).map_err(error)?;
             match sums.get_mut(op) {
                 Some(sum) => wide.hadamard(sum, &u, &u, true).map_err(error)?,
                 None => {
@@ -3410,6 +3806,171 @@ mod tests {
         }
     }
 
+    /// `posterior` of `explanation` with a random rotation on every operator whose groups hold
+    /// whole rows, one matrix per column count.
+    fn rotated(explanation: &Explanation, posterior: &mut Posterior, rng: &mut StdRng) {
+        let mut whole: Vec<bool> = posterior.mean.iter().map(|m| m.ncols() > 1).collect();
+        for group in &explanation.groups {
+            for cell in &group.cells {
+                let i = explanation.trainable.iter().position(|t| *t == cell.operator).unwrap();
+                whole[i] &= cell.cols == (0..posterior.mean[i].ncols());
+            }
+        }
+        let mut matrices: BTreeMap<usize, Arc<Array2<f64>>> = BTreeMap::new();
+        for (i, rotation) in posterior.rotations.iter_mut().enumerate() {
+            if whole[i] {
+                let k = posterior.mean[i].ncols();
+                let matrix = matrices.entry(k).or_insert_with(|| {
+                    let a = Array2::from_shape_fn((k, k), |_| rng.random::<f64>() - 0.5);
+                    let symmetric = &a + &a.t();
+                    Arc::new(gam_linalg::decompose::eigh(symmetric.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).unwrap().vectors)
+                });
+                *rotation = Some(Rotation { side: Side::Columns, matrix: Arc::clone(matrix) });
+            }
+        }
+        assert!(posterior.rotations.iter().any(Option::is_some), "the tiny library has row groups");
+    }
+
+    #[test]
+    fn a_rotated_posterior_s_factorized_view_keeps_its_means_and_marginals_and_costs_no_more() {
+        let (native, layers, _, _) = tiny("library_factorized", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let mut posterior = Posterior::new(&explanation, 72).unwrap();
+        let mut rng = StdRng::seed_from_u64(11);
+        for log_sd in &mut posterior.log_sd {
+            log_sd.mapv_inplace(|s| s + 0.6 * (rng.random::<f64>() - 0.5));
+        }
+        rotated(&explanation, &mut posterior, &mut rng);
+        let factorized = posterior.factorized();
+        assert!(factorized.rotations.iter().all(Option::is_none));
+        assert_eq!(factorized.mean, posterior.mean);
+        for i in 0..posterior.mean.len() {
+            let (a, b) = (factorized.marginal_variances(i), posterior.marginal_variances(i));
+            assert!(a.iter().zip(&b).all(|(x, y)| (x - y).abs() <= 1e-12 * y.abs()));
+            // The rotated means pair with the rotated deviations: `Σ μ̃²` is `Σ μ²` row by row.
+            let rotated_mean = posterior.rotated_mean(i);
+            for (r, row) in rotated_mean.rows().into_iter().enumerate() {
+                let own: f64 = posterior.mean[i].row(r).iter().map(|v| v * v).sum();
+                assert!((row.iter().map(|v| v * v).sum::<f64>() - own).abs() <= 1e-12 * own.max(1.0));
+            }
+        }
+        // A group's `ln det` is at most the sum of its marginals' logarithms (Hadamard), so the
+        // factorized view's entropy is the larger and its divergence the smaller.
+        for (a, b) in factorized.divergences().iter().zip(&posterior.divergences()) {
+            assert!(*a <= b + 1e-9 * b.abs().max(1.0));
+        }
+        assert!(factorized.divergences().iter().sum::<f64>() < posterior.divergences().iter().sum::<f64>());
+    }
+
+    #[test]
+    fn a_rotated_posterior_samples_and_steps_along_its_axes() {
+        let (native, layers, _, _) = tiny("library_rotated", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let (device, settings) = (Device::host(), settings());
+        let mut posterior = Posterior::new(&explanation, 72).unwrap();
+        let mut rng = StdRng::seed_from_u64(9);
+        for log_sd in &mut posterior.log_sd {
+            log_sd.mapv_inplace(|s| s + 0.6 * (rng.random::<f64>() - 0.5));
+        }
+        let unrotated = posterior.divergences();
+        rotated(&explanation, &mut posterior, &mut rng);
+        // A rotation inside each group leaves every group's divergence as it was.
+        for (a, b) in posterior.divergences().iter().zip(&unrotated) {
+            assert!((a - b).abs() <= 1e-12 * b.abs().max(1.0));
+        }
+        // Marginal variances are the diagonal of R diag(σ̃²) Rᵀ, row by row.
+        for (i, rotation) in posterior.rotations.iter().enumerate() {
+            let Some(rotation) = rotation else { continue };
+            let marginal = posterior.marginal_variances(i);
+            let row = posterior.log_sd[i].row(0).mapv(|s| (2.0 * s).exp());
+            let r = &*rotation.matrix;
+            let full = r.dot(&Array2::from_diag(&row)).dot(&r.t());
+            for c in 0..row.len() {
+                assert!((marginal[[0, c]] - full[[c, c]]).abs() <= 1e-12 * full[[c, c]]);
+            }
+        }
+        // The device writes the host's weight sample into the program.
+        let tokens = 72.0;
+        let mut device_posterior = DevicePosterior::new(&device, &explanation, &posterior, tokens, None, 0).unwrap();
+        let sites: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let reads = interchange::reads(&native, &sites).unwrap();
+        let mut ic = Interchange::new(&device, &native, &sites, &explanation.artifact, &explanation.trainable, reads, 1 << 30, 64).unwrap();
+        device_posterior.sample_into(ic.explanation_mut(), 17).unwrap();
+        let host = host_sample(&posterior, &(0..posterior.mean.len()).collect::<Vec<_>>(), 17);
+        for (i, op) in explanation.trainable.iter().enumerate() {
+            let sampled = device.download(ic.models().1.program.dense(*op).unwrap()).unwrap();
+            let gap = sampled.iter().zip(&host[&i]).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+            assert!(gap <= 1e-12, "operator {i}: the device's sample differs from the host's by {gap}");
+        }
+        // One IVON step equals the host step taken along the rotated axes.
+        let (scale, square) = (3.0, 0.2);
+        let gradients: Vec<Array2<f64>> = posterior.mean.iter().map(|m| m.mapv(|_| rng.random::<f64>() - 0.5)).collect();
+        let factors: Vec<Array2<f64>> = posterior.mean.iter().map(|m| m.mapv(|_| rng.random::<f64>() - 0.5)).collect();
+        let up = |values: &[Array2<f64>]| -> BTreeMap<usize, Tensor> { explanation.trainable.iter().zip(values).map(|(op, g)| (*op, device.upload(g.view()).unwrap())).collect() };
+        let ivon = Ivon { rate: settings.rate, beta1: settings.beta1, beta2: 0.75 };
+        device_posterior.step(&up(&gradients), scale, (&up(&factors), square), &ivon).unwrap();
+        let mut stepped = posterior.clone();
+        device_posterior.download(&mut stepped).unwrap();
+        let variance: Vec<f64> = posterior.moments().iter().map(|m| m.second / m.count).collect();
+        let mut reference = posterior.clone();
+        for i in 0..reference.mean.len() {
+            let along = |x: &Array2<f64>| posterior.rotations[i].as_ref().map_or_else(|| x.clone(), |r| r.undo(x));
+            let (mut mean, factor) = (along(&posterior.mean[i]), along(&factors[i]));
+            for ((r, c), mu) in mean.indexed_iter_mut() {
+                let delta = 1.0 / (tokens * variance[posterior.membership[i][[r, c]] as usize]);
+                let sd = posterior.log_sd[i][[r, c]].exp();
+                let h0 = (1.0 / (tokens * sd * sd) - delta).max(0.0);
+                let d = square * factor[[r, c]] * factor[[r, c]] - h0;
+                let h = h0 + (1.0 - ivon.beta2) * d + 0.5 * (1.0 - ivon.beta2).powi(2) * d * d / (h0 + delta);
+                // A first step's momentum is one gradient, which gives no spread: the filtered
+                // gradient is zero and the mean moves by the prior's pull alone.
+                *mu -= (ivon.rate * (delta * *mu) / (h + delta)).clamp(-sd, sd);
+                reference.log_sd[i][[r, c]] = -0.5 * (tokens * (h + delta)).ln();
+            }
+            reference.mean[i] = posterior.rotations[i].as_ref().map_or(mean.clone(), |r| r.apply(&mean));
+        }
+        for (field, (device_values, host_values)) in [("μ", (&stepped.mean, &reference.mean)), ("ln σ", (&stepped.log_sd, &reference.log_sd))] {
+            for (a, b) in device_values.iter().zip(host_values) {
+                let gap = a.iter().zip(b).fold(0.0_f64, |m, (x, y)| m.max((x - y).abs() / (1.0 + y.abs())));
+                assert!(gap < 1e-12, "the rotated device step's {field} differs from the host step's by {gap}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_variance_scale_far_from_its_reference_has_a_finite_code() {
+        // Finite variances whose ratio overflows still have a finite scale code.
+        assert!(scale_bits(1e300, 1e-300).is_finite());
+        assert_eq!(scale_bits(1.0, 1.0), scale_bits(1.2, 1.0));
+    }
+
+
+    #[test]
+    fn a_group_starting_at_zero_has_a_reference_and_starts_from_it() {
+        let (native, layers, _, _) = tiny("library_zero_group", "gelu_tanh");
+        let mut explanation = explanation(&native, &layers).unwrap();
+        // Zero the first MLP function's output column.
+        let output = explanation.layers[0].functions[0].last().copied().unwrap();
+        let cell = explanation.groups[output].cells[0].clone();
+        let program = &mut explanation.artifact.program;
+        let source = &program.operators[cell.operator];
+        let mut values = source.matrix();
+        values.column_mut(cell.cols.start).fill(0.0);
+        program.operators[cell.operator] = Arc::new(Operator::dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values.clone(), exact_precision(values.iter().copied()).unwrap(), source.provenance.clone()).unwrap());
+        // Made at these values, the zeroed group takes its operator's other entries' mean square.
+        let others: Vec<f64> = values.columns().into_iter().enumerate().filter(|(c, _)| *c != cell.cols.start).flat_map(|(_, col)| col.to_vec()).collect();
+        let inherited = others.iter().map(|v| v * v).sum::<f64>() / others.len() as f64;
+        let made = mean_squares(&explanation.artifact.program, &explanation.groups);
+        assert!((made[output] - inherited).abs() <= 1e-12 * inherited);
+        assert!(made.iter().all(|r| *r > 0.0));
+        // Started at zero, the group's deviations come from its reference, and it costs finitely.
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        assert_eq!(posterior.initial[output], explanation.reference[output]);
+        assert!((posterior.log_sd[explanation.trainable.iter().position(|t| *t == cell.operator).unwrap()][[cell.rows[0], cell.cols.start]] - 0.5 * (explanation.reference[output] / 72.0).ln()).abs() < 1e-12);
+        assert!(posterior.divergences()[output].is_finite());
+    }
+
+
     #[test]
     fn the_device_rounds_the_posterior_as_the_host_does() {
         let (native, layers, _, _) = tiny("library_rounded", "gelu");
@@ -3531,6 +4092,7 @@ mod tests {
         let posterior = Posterior {
             mean: shapes.iter().map(|&dim| Array2::from_elem(dim, -7.0)).collect(),
             log_sd: shapes.iter().map(|&dim| Array2::from_elem(dim, -8.0)).collect(),
+            rotations: vec![None; shapes.len()],
             active: vec![true, true],
             membership: Vec::new(),
             spans: Vec::new(),
@@ -3562,6 +4124,8 @@ mod tests {
             full_seconds: 1.0,
             prior: None,
             precision: None,
+            rotations: Vec::new(),
+            rotation_orders: Vec::new(),
         };
         // The wire format: length-prefixed JSON, then `CHECKPOINT_ARRAYS` row-major f64 arrays per
         // operator. This fixture is independent of the streaming decoder and requires no GPU.
@@ -3584,7 +4148,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("library_checkpoint_stream_{}.bin", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
         let pointers: Vec<_> = posterior.mean.iter().chain(&posterior.log_sd).map(|array| array.as_ptr()).collect();
-        let (progress, moments) = load_checkpoint(&path, &expected, &mut posterior).unwrap();
+        let (progress, moments, _) = load_checkpoint(&path, &expected, &mut posterior).unwrap();
         assert_eq!(serde_json::to_value(&progress).unwrap(), serde_json::to_value(&expected).unwrap());
         assert_eq!(posterior.active, expected.active);
         assert_eq!(pointers, posterior.mean.iter().chain(&posterior.log_sd).map(|array| array.as_ptr()).collect::<Vec<_>>());
@@ -3632,9 +4196,10 @@ mod tests {
         other.settings.seed += 1;
         assert!(load_checkpoint(&path, &other, &mut posterior.clone()).unwrap_err().contains("another fit"));
         let (wide, device) = ([Precision::F64; CHECKPOINT_ARRAYS], [Precision::F32, Precision::F32, Precision::Bf16, Precision::F32, Precision::F32]);
-        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], wide), Some(9 * 40));
-        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], device), Some(9 * 18));
-        assert_eq!(checkpoint_payload_bytes(&[(usize::MAX, usize::MAX)], wide), None);
+        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], wide, &[]), Some(9 * 40));
+        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], device, &[]), Some(9 * 18));
+        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], device, &[2]), Some(9 * 18 + 4 * 8));
+        assert_eq!(checkpoint_payload_bytes(&[(usize::MAX, usize::MAX)], wide, &[]), None);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -3694,7 +4259,7 @@ mod tests {
         assert_eq!(started.posterior.log_sd, resumed.posterior.log_sd);
         assert_eq!(started.posterior.active, resumed.posterior.active);
         // A start of another explanation is refused.
-        let other = Start { mean: Vec::new(), log_sd: Vec::new(), active: vec![true], state: None, steps: 0, epoch: 0 };
+        let other = Start { mean: Vec::new(), log_sd: Vec::new(), active: vec![true], state: None, steps: 0, epoch: 0, rotations: Vec::new() };
         assert!(fit_from(&device, &native, &explanation, train, held, &settings, "tiny", None, None, Some(other)).is_err());
     }
 
@@ -3723,7 +4288,14 @@ mod tests {
         let (key, _) = key_value(&tied.artifact.program, 0, 0);
         let rule = tied.artifact.program.rules.iter_mut().find(|r| r.name == "library.l0.h1").unwrap();
         rule.nodes[2] = Node::Affine { terms: vec![(0, key)], bias: None };
+        // The same shape from other starting values: a warmed explanation is another fit.
+        let mut warmed = explanation.clone();
+        let op = warmed.trainable[0];
+        let source = &warmed.artifact.program.operators[op];
+        let values = source.matrix().mapv(|v| v * 1.5);
+        warmed.artifact.program.operators[op] = Arc::new(Operator::dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values.clone(), exact_precision(values.iter().copied()).unwrap(), source.provenance.clone()).unwrap());
         for (other, field) in [
+            (identity("tiny", &native, &warmed, train, held), "definition"),
             (identity("another", &native, &explanation, train, held), "export"),
             (identity("tiny", &native, &explanation, &swapped, held), "tokens"),
             (identity("tiny", &native, &shared, train, held), "program"),
@@ -3752,6 +4324,9 @@ mod tests {
             assert!(refusal.contains("definition"), "{refusal}");
         }
         assert!(super::fit(&device, &native, &explanation, train, held, &settings, "another", Some(&checkpoint), None).is_err());
+        // The reader refuses a checkpoint of another explanation too, and reads its own exactly.
+        assert!(checkpoint_posterior(&warmed, &checkpoint).unwrap_err().contains("definition"));
+        assert_eq!(checkpoint_posterior(&explanation, &checkpoint).unwrap().means(), fit.posterior.means());
         std::fs::remove_file(&checkpoint).unwrap();
         std::fs::remove_file(checkpoint.with_extension("json")).unwrap();
         std::fs::remove_file(checkpoint.with_extension("artifact.bin")).unwrap();

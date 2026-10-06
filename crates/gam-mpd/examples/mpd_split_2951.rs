@@ -165,7 +165,7 @@ fn split_start(base: &Explanation, split: &Explanation, start: &Start, units: &[
             return Err(format!("{}: {:?} against {dim:?}", name(split, i), m.dim()));
         }
     }
-    Ok(Start { mean, log_sd, active, state: None, steps: 0, epoch: start.epoch })
+    Ok(Start { mean, log_sd, active, state: None, steps: 0, epoch: start.epoch, rotations: start.rotations.clone() })
 }
 
 fn main() -> Result<(), String> {

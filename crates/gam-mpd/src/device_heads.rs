@@ -710,7 +710,8 @@ mod tests {
             let mean: Vec<Array2<f64>> = trainable.iter().map(|&op| program.operators[op].matrix().mapv(|x| 1.2 * x + 0.01)).collect();
             let log_sd: Vec<Array2<f64>> = mean.iter().map(|m| m.mapv(|_| 0.05_f64.ln())).collect();
             let groups: Vec<Vec<u32>> = mean.iter().map(|m| vec![0; m.len()]).collect();
-            let parts = Parts { operators: &trainable, mean: &mean, log_sd: &log_sd, groups: &groups, count: 1 };
+            let unrotated = vec![None; trainable.len()];
+            let parts = Parts { operators: &trainable, mean: &mean, log_sd: &log_sd, groups: &groups, count: 1, rotations: &unrotated };
             let posterior = DevicePosterior::from_parts(&device, &parts, 100.0, None, 0).expect("posterior");
             for key in [3, 4] {
                 posterior.sample_into(&mut fused, key).expect("fused sample");

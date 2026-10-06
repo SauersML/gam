@@ -734,7 +734,8 @@ pub struct Unit {
     pub predicted: f64,
 }
 
-/// Per group, the posterior's summaries: `Σ μ²/σ²` (the data estimate's twice), the mean `|μ|` and
+/// Per group, the posterior's summaries: `Σ μ̃²/σ̃²` along its operators' rotated axes, where the
+/// deviations `σ̃` are (`μᵀ Σ⁻¹ μ` over the group, the data estimate's twice), the mean `|μ|` and
 /// the root mean square `σ` over its active parameters.
 struct Summary {
     signal: f64,
@@ -744,6 +745,7 @@ struct Summary {
 
 fn summaries(explanation: &Explanation, posterior: &Posterior) -> Result<Vec<Summary>, String> {
     let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
+    let rotated: Vec<_> = (0..posterior.mean.len()).map(|i| posterior.rotated_mean(i)).collect();
     explanation
         .groups
         .par_iter()
@@ -758,7 +760,7 @@ fn summaries(explanation: &Explanation, posterior: &Posterior) -> Result<Vec<Sum
                             continue;
                         }
                         let variance = (2.0 * s).exp();
-                        signal += mu * mu / variance;
+                        signal += rotated[i][[r, c]].powi(2) / variance;
                         abs += mu.abs();
                         square += variance;
                         count += 1.0;
