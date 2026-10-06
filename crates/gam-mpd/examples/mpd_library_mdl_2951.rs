@@ -32,7 +32,9 @@
 //! `KL(M_e ‖ P_e)` in bits per token: the mean and 99th percentile over every scored token (from the
 //! edited token on) and over the edited tokens alone, with the clean experiments' as `clean`; and
 //! next to it, over the same tokens, the edit's effect on the model `KL(M_e ‖ M)` (`effect_*`), the
-//! size of the change the explanation is asked to predict, and the gaps again in bins of the
+//! size of the change the explanation is asked to predict, the edit-ignoring baseline
+//! `KL(M_e ‖ P)` (`ignoring_*`: P's clean prediction against M's edited outcome, which a gap must
+//! beat for the explanation to predict the edit at all), and the gaps again in bins of the
 //! effect at the edited token (`by_effect`: below 0.01, 0.01–0.1, 0.1–1 and above 1 bits), so a
 //! comparison can rest on the edits that change `M`.
 //!
@@ -320,6 +322,17 @@ fn edit_faithfulness(
     }
     // The edits' effect on M, KL(M_e ‖ M), over the same tokens: the same experiments with P = M
     // applying no edit.
+    // The edit-ignoring baseline: P's clean prediction against M's edited outcome, KL(M_e ‖ P),
+    // over the same tokens (the same experiments with P applying no edit).
+    experiments.unedited_explanation();
+    let mut ignoring: BTreeMap<&str, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for (_, batch, drawn, _) in &batches {
+        for (e, bits) in drawn.iter().zip(&experiments.evaluate(batch, drawn, false)?.bits) {
+            let entry = ignoring.entry(family(e)).or_default();
+            entry.0.extend_from_slice(bits);
+            entry.1.extend(bits.first());
+        }
+    }
     drop(experiments);
     let mut reference = interchange::Interchange::new(device, native, layers, &gam_mpd::artifact::Artifact::native(native)?, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     reference.set_directions(interchange::DIRECTIONS, settings.seed);
@@ -366,6 +379,8 @@ fn edit_faithfulness(
     for (family, (mut all, mut edited, count)) in scores {
         let (tokens, (mean, p99), (edited_mean, edited_p99)) = (all.len(), summary(&mut all), summary(&mut edited));
         let (mut effect_all, mut effect_edited) = effects.remove(family).unwrap_or_default();
+        let (mut ignored_all, mut ignored_edited) = ignoring.remove(family).unwrap_or_default();
+        let ((ignored_mean, ignored_p99), (ignored_edited_mean, _)) = (summary(&mut ignored_all), summary(&mut ignored_edited));
         let ((effect_mean, effect_p99), (effect_edited_mean, effect_edited_p99)) = (summary(&mut effect_all), summary(&mut effect_edited));
         let bins: Vec<Value> = (0..=BINS.len())
             .filter_map(|bin| {
@@ -383,6 +398,7 @@ fn edit_faithfulness(
                 "experiments": count, "tokens": tokens,
                 "mean_bits_per_token": mean, "p99_bits_per_token": p99, "edited_token_mean_bits": edited_mean, "edited_token_p99_bits": edited_p99,
                 "effect_mean_bits_per_token": effect_mean, "effect_p99_bits_per_token": effect_p99, "effect_edited_token_mean_bits": effect_edited_mean, "effect_edited_token_p99_bits": effect_edited_p99,
+                "ignoring_mean_bits_per_token": ignored_mean, "ignoring_p99_bits_per_token": ignored_p99, "ignoring_edited_token_mean_bits": ignored_edited_mean,
             }),
         );
     }
