@@ -2216,6 +2216,7 @@ mod tests {
         let device = Device::host();
         let resident = DevicePosterior::new(&device, &explanation, &posterior, 1e6, None, 0).unwrap();
         let mut host = mixture.clone();
+        let before = mixture.clone();
         let theta = draw(&host, &posterior, 9);
         let (value, gradient) = host.sample(&posterior, &theta, true).unwrap();
         let (on_device, moved) = mixture.sample_device(&device, &resident, &mut posterior.clone(), 9, true).unwrap();
@@ -2229,6 +2230,18 @@ mod tests {
         // One step of the mixture's own parameters from the same derivatives.
         for (a, b) in mixture.targets.iter().zip(&host.targets) {
             assert!((a.zero_logit - b.zero_logit).abs() < 1e-12 && a.components.iter().zip(&b.components).all(|(x, y)| (x.logit - y.logit).abs() < 1e-12));
+        }
+        // On a single-precision device (CUDA or the Apple GPU), within f32's rounding.
+        if let Some(gpu) = Device::single_precision(gam_gpu::GpuPolicy::Auto).expect("single-precision device") {
+            let resident = DevicePosterior::new(&gpu, &explanation, &posterior, 1e6, None, 0).unwrap();
+            let mut fresh = before;
+            let (on_gpu, moved) = fresh.sample_device(&gpu, &resident, &mut posterior.clone(), 9, false).unwrap();
+            assert!((on_gpu - value).abs() <= 1e-3 * (1.0 + value.abs()), "the value {on_gpu} against {value} on {}", gpu.name());
+            for (i, g) in &gradient {
+                let scale = g.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+                let found = gpu.download(&moved[i]).unwrap();
+                assert!(found.iter().zip(g.iter()).all(|(a, b)| (a - b).abs() <= 1e-3 * (1.0 + scale)), "operator {i}'s gradient on {}", gpu.name());
+            }
         }
     }
 
