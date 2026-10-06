@@ -1367,6 +1367,12 @@ pub struct Settings {
     /// two, instead of splitting the bases between them (`antithetic_step`).
     #[serde(default)]
     pub full_antithetic: bool,
+    /// The arm whose head sweep forms the reverse passes' seeds (`Σ π e` and the Fisher probe's
+    /// pull-back) in bfloat16 against a bfloat16 copy of the head, as the reverse passes run
+    /// (`interchange::factor_arithmetic`); the log partitions, and so `F`, stay f32. Off by default;
+    /// its A/B decides.
+    #[serde(default)]
+    pub seed_bf16: bool,
 }
 
 /// [`Settings`] as configs and checkpoints hold them, unknown keys refused, and the keys of steps
@@ -1396,6 +1402,8 @@ struct SettingsRecord {
     families: Vec<interchange::Family>,
     #[serde(default)]
     full_antithetic: bool,
+    #[serde(default)]
+    seed_bf16: bool,
     #[serde(default)]
     rate: Option<serde::de::IgnoredAny>,
     #[serde(default)]
@@ -1432,6 +1440,7 @@ impl From<SettingsRecord> for Settings {
             epochs: r.epochs,
             families: r.families,
             full_antithetic: r.full_antithetic,
+            seed_bf16: r.seed_bf16,
         }
     }
 }
@@ -1812,6 +1821,9 @@ impl Scorer {
         // one fixed collection of experiments, so `M`'s targets are kept on the host while the
         // process's memory budget admits them.
         experiments.keep_targets(gam_runtime::resource::MemoryGovernor::global());
+        if settings.seed_bf16 {
+            experiments.set_seed_bf16()?;
+        }
         let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
         let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
@@ -4271,6 +4283,7 @@ mod tests {
             epochs: None,
             families: Vec::new(),
             full_antithetic: false,
+            seed_bf16: false,
         }
     }
 

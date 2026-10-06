@@ -2028,7 +2028,7 @@ impl Device {
         expected: Option<&mut Tensor>,
         arithmetic: Arithmetic,
     ) -> Result<Vec<f64>, GpuError> {
-        self.head_sweep(hidden, (head, transposed), scored, expected, None, arithmetic)
+        self.head_sweep(hidden, (head, transposed), scored, expected, None, (arithmetic, None))
     }
 
     /// [`Device::head_log_partition`] (the head and whether it is transposed as one argument)
@@ -2052,7 +2052,24 @@ impl Device {
         probe: (u64, &mut Tensor),
         arithmetic: Arithmetic,
     ) -> Result<Vec<f64>, GpuError> {
-        self.head_sweep(hidden, head, scored, Some(expected), Some(probe), arithmetic)
+        self.head_sweep(hidden, head, scored, Some(expected), Some(probe), (arithmetic, None))
+    }
+
+    /// [`Device::head_log_partition`] with `expected` and, with `probe`, as
+    /// [`Device::head_log_partition_probed`], the products that form `expected` and the probe (the
+    /// seeds of reverse passes) reading `seed_head`, the head (classes × width) in bfloat16, and
+    /// each chunk's weights rounded, in bfloat16 on CUDA f32 storage; the log partitions are the f32
+    /// sweep's. Elsewhere `seed_head` is not read.
+    pub fn head_log_partition_seeded(
+        &self,
+        hidden: &Tensor,
+        (head, seed_head): (&Tensor, &Tensor),
+        scored: Option<&Indices>,
+        expected: &mut Tensor,
+        probe: Option<(u64, &mut Tensor)>,
+        arithmetic: Arithmetic,
+    ) -> Result<Vec<f64>, GpuError> {
+        self.head_sweep(hidden, (head, false), scored, Some(expected), probe, (arithmetic, Some(seed_head)))
     }
 
     /// [`Device::head_log_partition`] and [`Device::head_log_partition_probed`].
@@ -2063,8 +2080,13 @@ impl Device {
         scored: Option<&Indices>,
         expected: Option<&mut Tensor>,
         probe: Option<(u64, &mut Tensor)>,
-        arithmetic: Arithmetic,
+        (arithmetic, seed_head): (Arithmetic, Option<&Tensor>),
     ) -> Result<Vec<f64>, GpuError> {
+        if let Some(seed) = seed_head
+            && (seed.dim() != head.dim() || transposed)
+        {
+            return Err(shape(format!("a {:?} seed head for a {:?} head (transposed {transposed})", seed.dim(), head.dim())));
+        }
         let (rows, width) = hidden.dim();
         let classes = if transposed { head.cols } else { head.rows };
         let head_width = if transposed { head.rows } else { head.cols };
@@ -2087,7 +2109,7 @@ impl Device {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) if hidden.storage() == Storage::F32 => {
                 let chunk = swept_chunk(rows);
-                engine.head_log_partition(hidden, (head, transposed), scored, (expected, probe), (chunk, arithmetic))
+                engine.head_log_partition(hidden, (head, transposed), scored, (expected, probe), (chunk, arithmetic, seed_head))
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(_) => {
@@ -2184,7 +2206,7 @@ impl Device {
                     return Err(shape(format!("a {:?} head (transposed {transposed}) on {:?} rows", head.dim(), hidden.dim())));
                 }
                 let chunk = swept_chunk(hidden.rows);
-                engine.head_log_partition_into(hidden, (head, transposed), scored, (expected, None), out, (chunk, arithmetic))
+                engine.head_log_partition_into(hidden, (head, transposed), scored, (expected, None), out, (chunk, arithmetic, None))
             }
             _ => {
                 let values = self.head_log_partition(hidden, head, transposed, scored, expected, arithmetic)?;
@@ -6631,7 +6653,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             head: (&Tensor, bool),
             scored: Option<&Indices>,
             outputs: (Option<&mut Tensor>, Option<(u64, &mut Tensor)>),
-            settings: (usize, Arithmetic),
+            settings: (usize, Arithmetic, Option<&Tensor>),
         ) -> Result<Vec<f64>, GpuError> {
             let mut out = self.zeros(hidden.rows)?;
             self.head_log_partition_into(hidden, head, scored, outputs, &mut out, settings)?;
@@ -6653,7 +6675,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             scored: Option<&Indices>,
             (mut expected, mut probe): (Option<&mut Tensor>, Option<(u64, &mut Tensor)>),
             out: &mut CudaSlice<f64>,
-            (chunk, arithmetic): (usize, Arithmetic),
+            (chunk, arithmetic, seed_head): (usize, Arithmetic, Option<&Tensor>),
         ) -> Result<(), GpuError> {
             let (rows, width) = hidden.dim();
             let classes = if transposed { head.cols } else { head.rows };
@@ -6666,6 +6688,16 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                 (None, Data::CudaBf16(h)) if half => Factor::Half(h),
                 (None, Data::CudaBf16(_)) => return Err(shape(format!("a bfloat16 head takes Arithmetic::Bf16, not {arithmetic:?}"))),
                 (None, _) => Factor::Single(slice32(head)?),
+            };
+            // The seeds' products (`expected`, the probe) read the seed head in bfloat16 when given,
+            // each chunk's weights rounded; the logits stay in `arithmetic`.
+            let (seed_compute, seed_half) = if seed_head.is_some() { compute_of(Arithmetic::Bf16, &self.name)? } else { (compute, half) };
+            let seed_factor = match seed_head {
+                Some(t) => match &t.data {
+                    Data::CudaBf16(h) => Factor::Half(h),
+                    other => return Err(mismatch(other)),
+                },
+                None => head_factor,
             };
             let hidden_factor = match &rounded_hidden {
                 Some(r) => Factor::Half(r),
@@ -6737,7 +6769,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                     }
                     // Column-major outᵀ (width × rows) += E_chunkᵀ (width × count) · Pᵀ (count × rows).
                     let (head_op, head_ld) = if transposed { (t, classes) } else { (n_op, width) };
-                    let rounded = if half { Some(self.round_half(&logits, 0, rows * count)?) } else { None };
+                    let rounded = if seed_half { Some(self.round_half(&logits, 0, rows * count)?) } else { None };
                     let weights = match &rounded {
                         Some(r) => Factor::Half(r),
                         None => Factor::Single(&logits),
@@ -6747,10 +6779,10 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                             ops: (head_op, n_op),
                             dims: (width, rows, count),
                             scale: (1.0, if index == 0 { 0.0 } else { 1.0 }),
-                            a: (head_factor, if transposed { start } else { start * width }, head_ld),
+                            a: (seed_factor, if transposed { start } else { start * width }, head_ld),
                             b: (weights, 0, count),
                             c: (slice32_mut(out)?, 0, width),
-                            compute,
+                            compute: seed_compute,
                         },
                         1,
                         (0, 0, 0),
@@ -6767,7 +6799,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                     // Column-major probedᵀ (width × rows) += E_chunkᵀ (width × count) · Wᵀ (count ×
                     // rows), W the chunk's signed roots (rounded to bfloat16 as the exponentials are).
                     let (head_op, head_ld) = if transposed { (t, classes) } else { (n_op, width) };
-                    let rounded = if half { Some(self.round_half(&roots, 0, rows * count)?) } else { None };
+                    let rounded = if seed_half { Some(self.round_half(&roots, 0, rows * count)?) } else { None };
                     let weights = match &rounded {
                         Some(r) => Factor::Half(r),
                         None => Factor::Single(&roots),
@@ -6777,10 +6809,10 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                             ops: (head_op, n_op),
                             dims: (width, rows, count),
                             scale: (1.0, if index == 0 { 0.0 } else { 1.0 }),
-                            a: (head_factor, if transposed { start } else { start * width }, head_ld),
+                            a: (seed_factor, if transposed { start } else { start * width }, head_ld),
                             b: (weights, 0, count),
                             c: (slice32_mut(probed)?, 0, width),
-                            compute,
+                            compute: seed_compute,
                         },
                         1,
                         (0, 0, 0),

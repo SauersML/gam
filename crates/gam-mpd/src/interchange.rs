@@ -2659,6 +2659,14 @@ impl Interchange {
         *self.kept.get_mut() = Some(TargetStore { governor: governor.clone(), batches: HashMap::new(), disk: DiskTargets::new() });
     }
 
+    /// The head sweep forms the reverse passes' seeds in bfloat16 against a bfloat16 copy of the head
+    /// from now on (`library_mdl::Settings::seed_bf16`).
+    pub fn set_seed_bf16(&mut self) -> Result<(), String> {
+        let half = self.m.device().bf16_copy(&self.head.resident.embedding).map_err(error)?;
+        self.head.resident.seed_half = Some(half);
+        Ok(())
+    }
+
     /// `P`'s program, so that a fit writes each weight sample into its resident parameters.
     pub fn program_mut(&mut self) -> &mut DeviceProgram {
         &mut self.p

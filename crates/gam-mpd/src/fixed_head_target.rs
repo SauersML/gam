@@ -399,6 +399,9 @@ impl Teacher {
 
 pub(crate) struct ResidentHead {
     pub embedding: Tensor,
+    /// The embedding in bfloat16 for the reverse passes' seeds (`Settings::seed_bf16`): the sweep
+    /// forms `Σ π e` and the probe's pull-back against it ([`Device::head_log_partition_seeded`]).
+    pub seed_half: Option<Tensor>,
     pub ones: Tensor,
     pub tile_rows: usize,
     /// The hidden width as one column block (row dots).
@@ -408,6 +411,7 @@ impl ResidentHead {
     pub fn new(d: &Device, head: &Head, tile_rows: usize) -> Result<Self, String> {
         Ok(Self {
             embedding: d.upload(head.embedding()).map_err(error)?,
+            seed_half: None,
             ones: d
                 .upload(Array2::ones((head.embedding().ncols(), 1)).view())
                 .map_err(error)?,
@@ -572,6 +576,15 @@ impl ResidentHead {
         let dots = d.block_products(hidden, &target.mu, &self.width).map_err(error)?;
         let mut probed = None;
         let partitions = match (probe, seed.as_mut()) {
+            (probe, Some(seed)) if self.seed_half.is_some() => {
+                let half = self.seed_half.as_ref().ok_or("a seed head")?;
+                let mut out = probe.map(|_| d.empty(hidden.rows(), hidden.cols())).transpose().map_err(error)?;
+                let partitions = d
+                    .head_log_partition_seeded(hidden, (&self.embedding, half), flags.as_ref(), seed, probe.zip(out.as_mut()), arithmetic)
+                    .map_err(error)?;
+                probed = out;
+                partitions
+            }
             (Some(key), Some(seed)) => {
                 let mut out = d.empty(hidden.rows(), hidden.cols()).map_err(error)?;
                 let partitions = d
