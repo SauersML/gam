@@ -3,8 +3,10 @@
 //!
 //! A model of the decoder family (the native model `M`, or a library explanation `P` of it) is a
 //! token embedding, then per layer an attention block and an MLP block, then a final norm. Each
-//! block reads the residual stream through an RMS norm with a gain (its read, which an experiment
-//! may patch), and adds its output to the stream.
+//! block reads the residual stream through an RMS norm with a gain (its read), and adds its output
+//! to the stream. An experiment's patches edit the values of the read maps' nodes (a head's query,
+//! key or value, an MLP's gate or input), which are column blocks of the stacked products
+//! (`interchange::Edits`).
 //!
 //! * Attention: one product of the read with the stacked query, key and value maps (each key and
 //!   value map once, however many query heads read it), the queries' and keys' per-head norms and
@@ -43,16 +45,20 @@ fn error(e: impl std::fmt::Display) -> String {
     format!("decoder: {e}")
 }
 
-/// A stacked operator: its row blocks, each an operator of the program and its first row.
+/// A stacked operator: its row blocks, each an operator of the program and its first row; and
+/// per node of the program applying one of them, the columns of the stacked product that are its
+/// value (several nodes applying one operator share them).
 #[derive(Clone, Debug)]
 struct Stack {
     parts: Vec<(usize, usize, usize)>,
     rows: usize,
     cols: usize,
+    sites: BTreeMap<usize, Range<usize>>,
 }
 
 impl Stack {
-    fn new(program: &OperatorProgram, ops: &[usize]) -> Result<Self, String> {
+    /// The stack of `ops` (each once), applied by the nodes of `applied` (node, operator).
+    fn new(program: &OperatorProgram, ops: &[usize], applied: &[(usize, usize)]) -> Result<Self, String> {
         let mut parts = Vec::with_capacity(ops.len());
         let mut rows = 0;
         let cols = ops.first().map(|op| program.operators[*op].cols.width()).ok_or_else(|| error("an empty stack"))?;
@@ -64,7 +70,12 @@ impl Stack {
             parts.push((op, rows, r));
             rows += r;
         }
-        Ok(Self { parts, rows, cols })
+        let mut sites = BTreeMap::new();
+        for &(node, op) in applied {
+            let &(_, at, r) = parts.iter().find(|(o, _, _)| *o == op).ok_or_else(|| error(format!("node {node} applies an operator outside its stack")))?;
+            sites.insert(node, at..at + r);
+        }
+        Ok(Self { parts, rows, cols, sites })
     }
 
     fn values(&self, program: &OperatorProgram) -> Result<Array2<f64>, String> {
@@ -136,8 +147,7 @@ pub struct Decoder {
     /// Per rotary configuration, the angles of positions `0..span` (span × planes), grown to the
     /// longest sequence seen.
     angles: Mutex<Vec<(Rotary, usize, Arc<(Tensor, Tensor)>)>>,
-    /// Where the program holds each read variable's value (`interchange::values`); the decoder
-    /// does not yet apply edits there, so a patched experiment is refused.
+    /// Where the program holds each read variable's value (`interchange::values`).
     values: Vec<Value>,
 }
 
@@ -217,14 +227,14 @@ fn through_barrier(program: &OperatorProgram, n: usize) -> usize {
     }
 }
 
-/// A query's or key's projection from `read`, through its per-head norm when it has one: the
-/// projection's operator, and the norm's gain operator and ε.
-fn projection(program: &OperatorProgram, n: usize, read: usize) -> Result<(usize, Option<(usize, f64)>), String> {
+/// A query's or key's projection from `read`, through its per-head norm when it has one: the node
+/// applying the projection's operator, the operator, and the norm's gain operator and ε.
+fn projection(program: &OperatorProgram, n: usize, read: usize) -> Result<(usize, usize, Option<(usize, f64)>), String> {
     if let Some((input, op)) = single(program, n)
         && input == read
         && !diagonal(&program.operators[op])
     {
-        return Ok((op, None));
+        return Ok((n, op, None));
     }
     let (normed, gain) = single(program, n).ok_or_else(|| error(format!("node {n} is not a projection")))?;
     let Node::RmsNorm { input, epsilon } = program.nodes[normed] else { return Err(error(format!("node {n} is not a normed projection"))) };
@@ -232,7 +242,7 @@ fn projection(program: &OperatorProgram, n: usize, read: usize) -> Result<(usize
     if from != read || !diagonal(&program.operators[gain]) {
         return Err(error(format!("node {n} is not a normed projection of read {read}")));
     }
-    Ok((op, Some((gain, epsilon))))
+    Ok((input, op, Some((gain, epsilon))))
 }
 
 impl Decoder {
@@ -445,6 +455,51 @@ impl Decoder {
         Ok((self.device.gather_rows(&table.0, &ids).map_err(error)?, self.device.gather_rows(&table.1, &ids).map_err(error)?))
     }
 
+    /// `edits` applied to the values of `stack`'s nodes they name, which are column blocks of the
+    /// stacked product `value` (the call's rows); with `transpose`, their transpose to its
+    /// cotangent. Nodes applying one operator share their columns, computed once: an edit of one
+    /// of them must edit them all (a key or value map that several query heads' calls apply is
+    /// one variable, `interchange::values`), and is applied once.
+    fn edit(&self, edits: Option<&Edits>, stack: &Stack, value: &mut Tensor, transpose: bool) -> Result<(), String> {
+        let Some(edits) = edits else { return Ok(()) };
+        let d = &self.device;
+        let edited = edits.nodes();
+        let mut done: Vec<Range<usize>> = Vec::new();
+        for &node in &edited {
+            let Some(columns) = stack.sites.get(&node) else { continue };
+            if done.contains(columns) {
+                continue;
+            }
+            if let Some((other, _)) = stack.sites.iter().find(|(n, c)| *c == columns && !edited.contains(n)) {
+                return Err(error(format!("an edit of node {node} but not of node {other}, which applies the same operator")));
+            }
+            done.push(columns.clone());
+            let mut part = d.columns_of(value, columns.clone()).map_err(error)?;
+            if transpose {
+                edits.transpose(d, node, &mut part)?;
+            } else {
+                edits.apply(d, node, &mut part)?;
+            }
+            d.set_columns(value, columns.start, &part).map_err(error)?;
+        }
+        Ok(())
+    }
+
+    /// Refuses `edits` that name a node no stack of the decoder computes.
+    fn edited(&self, edits: Option<&Edits>) -> Result<(), String> {
+        let Some(edits) = edits else { return Ok(()) };
+        let held = |n: usize| {
+            self.blocks.iter().any(|b| match b {
+                Block::Attention(a) => a.projections.sites.contains_key(&n),
+                Block::Mlp(m) => m.input.sites.contains_key(&n),
+            })
+        };
+        match edits.nodes().into_iter().find(|n| !held(*n)) {
+            Some(n) => Err(error(format!("an edit of node {n}, which no projection or MLP input map applies"))),
+            None => Ok(()),
+        }
+    }
+
     /// Whether `stack` holds a trainable operator.
     fn trains(&self, stack: &Stack) -> bool {
         stack.parts.iter().any(|(op, _, _)| self.trainable.contains(op))
@@ -489,6 +544,7 @@ fn attention(program: &OperatorProgram, stream: usize, read_node: usize, end: us
     let (mut queries, mut keys, mut values) = (Vec::new(), Vec::<usize>::new(), Vec::<usize>::new());
     let (mut q_norms, mut k_norms) = (Vec::new(), Vec::new());
     let (mut output, mut group_of) = (Vec::new(), Vec::new());
+    let mut applied = Vec::new();
     let mut shape = None;
     for &(term, through) in terms {
         let attend = through_barrier(program, term);
@@ -496,9 +552,14 @@ fn attention(program: &OperatorProgram, stream: usize, read_node: usize, end: us
         if !causal {
             return Err(error("an attention that is not causal"));
         }
-        let (q, q_norm) = projection(program, query, read_node)?;
-        let (k, k_norm) = projection(program, key, read_node)?;
-        let (v, None) = projection(program, value, read_node)? else { return Err(error("a normed value")) };
+        let (q_node, q, q_norm) = projection(program, query, read_node)?;
+        let (k_node, k, k_norm) = projection(program, key, read_node)?;
+        let (v_node, v, None) = projection(program, value, read_node)? else { return Err(error("a normed value")) };
+        for applies in [(q_node, q), (k_node, k), (v_node, v)] {
+            if !applied.contains(&applies) {
+                applied.push(applies);
+            }
+        }
         if *shape.get_or_insert((scale.value().to_bits(), rotary)) != (scale.value().to_bits(), rotary) {
             return Err(error("heads with different scales or rotations"));
         }
@@ -534,7 +595,7 @@ fn attention(program: &OperatorProgram, stream: usize, read_node: usize, end: us
         _ => return Err(error("some heads normed and others not")),
     };
     let ops: Vec<usize> = queries.iter().chain(&keys).chain(&values).copied().collect();
-    let projections = Stack::new(program, &ops)?;
+    let projections = Stack::new(program, &ops, &applied)?;
     let width = projections.rows / (heads + 2 * kv);
     if projections.parts.iter().any(|(_, _, r)| *r != width) {
         return Err(error("heads of different widths"));
@@ -571,10 +632,10 @@ fn mlp(program: &OperatorProgram, stream: usize, read_node: usize, end: usize, l
             _ => Err(error(format!("node {n} is not a map of read {read_node}"))),
         }
     };
-    let (ops, bias, gated) = match &program.nodes[active] {
+    let (ops, bias, gated, applied) = match &program.nodes[active] {
         Node::Pointwise { input, laws } if laws.iter().all(|l| *l == Law::GeluTanh) => {
             let (op, bias) = input_of(*input)?;
-            (vec![op], bias, false)
+            (vec![op], bias, false, vec![(*input, op)])
         }
         Node::Hadamard { left, right } => {
             let (pointwise, linear) = match (&program.nodes[*left], &program.nodes[*right]) {
@@ -590,11 +651,11 @@ fn mlp(program: &OperatorProgram, stream: usize, read_node: usize, end: usize, l
             if gate_bias.is_some() || up_bias.is_some() {
                 return Err(error("a gated MLP with biases"));
             }
-            (vec![gate, up], None, true)
+            (vec![gate, up], None, true, vec![(*input, gate), (linear, up)])
         }
         _ => return Err(error("an MLP law other than GELU (tanh) or gated SiLU")),
     };
-    Ok(Mlp { gain, epsilon, input: Stack::new(program, &ops)?, bias, gated, output, last })
+    Ok(Mlp { gain, epsilon, input: Stack::new(program, &ops, &applied)?, bias, gated, output, last })
 }
 
 impl BlockEngine for Decoder {
@@ -629,9 +690,7 @@ impl BlockEngine for Decoder {
         edits: Option<&Edits>,
         keep: bool,
     ) -> Result<Option<Tape>, String> {
-        if edits.is_some() {
-            return Err(error("the decoder does not patch read variables"));
-        }
+        self.edited(edits)?;
         let d = &self.device;
         let x = if block == 0 {
             let ids: Vec<u32> = tokens.iter().flat_map(|t| t.iter().copied()).collect();
@@ -653,6 +712,7 @@ impl BlockEngine for Decoder {
             Block::Attention(a) => {
                 let mut p = d.empty(x.rows(), a.projections.rows).map_err(error)?;
                 d.gemm(&mut p, 1.0, &read, Op::N, &w.input, Op::T, 0.0, arithmetic).map_err(error)?;
+                self.edit(edits, &a.projections, &mut p, false)?;
                 let angles = rotary.map(|r| self.angles(r, ranges)).transpose()?;
                 let rotation = angles.as_ref().zip(rotary).map(|((c, s), r)| (c, s, r.half_split));
                 let norm = w.norms.as_ref().zip(a.norms.as_ref()).map(|(g, (_, e))| (g, *e));
@@ -666,6 +726,7 @@ impl BlockEngine for Decoder {
             Block::Mlp(m) => {
                 let mut pre = d.empty(x.rows(), m.input.rows).map_err(error)?;
                 d.gemm(&mut pre, 1.0, &read, Op::N, &w.input, Op::T, 0.0, arithmetic).map_err(error)?;
+                self.edit(edits, &m.input, &mut pre, false)?;
                 let active = if m.gated { d.swiglu(&pre, half) } else { d.gelu_tanh(&pre, w.bias.as_ref(), half) }.map_err(error)?;
                 d.gemm(&mut out, 1.0, &active, Op::N, &w.output, Op::T, 1.0, arithmetic).map_err(error)?;
                 let last = match (&w.last, m.last) {
@@ -692,9 +753,7 @@ impl BlockEngine for Decoder {
         edits: Option<&Edits>,
         gradient: &mut BTreeMap<usize, Tensor>,
     ) -> Result<(), String> {
-        if edits.is_some() {
-            return Err(error("the decoder does not patch read variables"));
-        }
+        self.edited(edits)?;
         let d = &self.device;
         let w = &self.weights[block];
         let mut g = self.gather(cotangent, ranges)?;
@@ -707,12 +766,15 @@ impl BlockEngine for Decoder {
             (Block::Attention(a), Inner::Attention { head_scales, heads, angles, attended, sequences }) => {
                 let mut projections = d.empty(rows, a.projections.rows).map_err(error)?;
                 d.gemm(&mut projections, 1.0, &tape.read, Op::N, &w.input, Op::T, 0.0, arithmetic).map_err(error)?;
+                self.edit(edits, &a.projections, &mut projections, false)?;
                 let mut g_attended = d.empty(rows, a.layout.queries * a.layout.width).map_err(error)?;
                 d.gemm(&mut g_attended, 1.0, &g, Op::N, &w.output, Op::N, 0.0, arithmetic).map_err(error)?;
                 let g_heads = d.causal_attention_backward(heads, a.layout, sequences, a.scale, (&attended.0, &attended.1), &g_attended).map_err(error)?;
                 let rotation = angles.as_ref().zip(a.rotary).map(|((c, s), r)| (c, s, r.half_split));
                 let norm = w.norms.as_ref().zip(head_scales.as_ref());
-                let g_p = operand(d.heads_rope_backward(&projections, a.layout, norm, rotation, &g_heads).map_err(error)?)?;
+                let mut g_p = d.heads_rope_backward(&projections, a.layout, norm, rotation, &g_heads).map_err(error)?;
+                self.edit(edits, &a.projections, &mut g_p, true)?;
+                let g_p = operand(g_p)?;
                 if self.trains(&a.projections) {
                     let mut stacked = d.empty(a.projections.rows, a.projections.cols).map_err(error)?;
                     d.gemm(&mut stacked, 1.0, &g_p, Op::T, &tape.read, Op::N, 0.0, arithmetic).map_err(error)?;
@@ -723,6 +785,7 @@ impl BlockEngine for Decoder {
             (Block::Mlp(m), Inner::Mlp { out }) => {
                 let mut pre = d.empty(rows, m.input.rows).map_err(error)?;
                 d.gemm(&mut pre, 1.0, &tape.read, Op::N, &w.input, Op::T, 0.0, arithmetic).map_err(error)?;
+                self.edit(edits, &m.input, &mut pre, false)?;
                 let active = if m.gated { d.swiglu(&pre, half) } else { d.gelu_tanh(&pre, w.bias.as_ref(), half) }.map_err(error)?;
                 if let (Some((residual, k)), Some(gain)) = (out, &w.last) {
                     let mut g_residual = d.zeros(rows, self.width).map_err(error)?;
@@ -738,7 +801,9 @@ impl BlockEngine for Decoder {
                     d.gemm(&mut g_output, 1.0, g_out, Op::T, &active, Op::N, 0.0, arithmetic).map_err(error)?;
                     add(d, gradient, m.output, g_output)?;
                 }
-                let g_pre = operand(if m.gated { d.swiglu_backward(&pre, &g_active) } else { d.gelu_tanh_backward(&pre, w.bias.as_ref(), &g_active) }.map_err(error)?)?;
+                let mut g_pre = if m.gated { d.swiglu_backward(&pre, &g_active) } else { d.gelu_tanh_backward(&pre, w.bias.as_ref(), &g_active) }.map_err(error)?;
+                self.edit(edits, &m.input, &mut g_pre, true)?;
+                let g_pre = operand(g_pre)?;
                 if self.trains(&m.input) {
                     let mut stacked = d.empty(m.input.rows, m.input.cols).map_err(error)?;
                     d.gemm(&mut stacked, 1.0, &g_pre, Op::T, &tape.read, Op::N, 0.0, arithmetic).map_err(error)?;
@@ -780,12 +845,13 @@ mod tests {
     use super::*;
     use crate::{
         import::import_language_model,
-        interchange::{self, Model},
+        interchange::{self, Batch, Experiment, Interchange, Model, Patch},
         library_mdl,
         operator_program::SlotValues,
         run_check::{layer_nodes, split_sites},
         test_support::{tiny_export, tiny_qwen3_export},
     };
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     /// Both engines in `arithmetic`, every block forward and then backward on two sequences: the
     /// final streams, every trainable operator's gradient and the embedding's cotangent agree
@@ -872,5 +938,74 @@ mod tests {
         for arithmetic in [Arithmetic::Bf16, Arithmetic::F32, Arithmetic::Tf32x3] {
             parity(tiny_qwen3_export(&format!("decoder_qwen3_{arithmetic:?}"), 2), arithmetic);
         }
+    }
+
+    /// Every family of experiments (clean alone, clean under a hybrid, a read patch, a joint read
+    /// patch) scored by an interchange whose models run on the decoder in float64 on the host and
+    /// by one running their programs: the per-token divergences and the gradient agree to
+    /// float64's rounding (`1e-9` of the largest), so the decoder computes what the programs do,
+    /// the edits of patched values and their transposes included.
+    fn interchange_parity(dir: std::path::PathBuf) {
+        let (bases, length) = (3, 12);
+        let imported = import_language_model(&dir, 2 * bases, length).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        let native = split_sites(&imported.program).unwrap();
+        let layers = layer_nodes(&native, 2).unwrap();
+        let explanation = library_mdl::explanation(&native, &layers).unwrap();
+        let variables = interchange::reads(&native, &layers).unwrap();
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
+        let rows: Vec<Vec<u32>> = tokens.chunks(length).map(<[u32]>::to_vec).collect();
+        let batch = Batch::new(rows[..bases].to_vec(), rows[bases..2 * bases].to_vec()).unwrap();
+        let trainable = &explanation.trainable;
+        let mut rng = StdRng::seed_from_u64(3);
+        let moved: Vec<Array2<f64>> = trainable.iter().map(|op| explanation.artifact.program.operators[*op].matrix().mapv(|v| v * (1.0 + 0.1 * (2.0 * rng.random::<f64>() - 1.0)))).collect();
+        let host = Device::host();
+        let make = || {
+            let mut x = Interchange::new(&host, &native, &layers, &explanation.artifact, trainable, variables.clone(), usize::MAX, 4096).unwrap();
+            x.load(&moved).unwrap();
+            x
+        };
+        let (reference, mut fused) = (make(), make());
+        assert!(fused.fuse(Arithmetic::F64).unwrap(), "P runs on the decoder");
+        let blocks = 2 * layers.len();
+        let at_block = |b: usize| -> Vec<usize> { (0..variables.len()).filter(|i| variables[*i].block == b).collect() };
+        for family in ["clean_alone", "clean_hybrid", "read", "read_joint"] {
+            let experiments: Vec<Experiment> = (0..bases)
+                .map(|n| {
+                    let (explained, patch) = match family {
+                        "clean_alone" => (vec![true; blocks], None),
+                        "clean_hybrid" => (interchange::hybrid(&mut rng, blocks), None),
+                        _ => {
+                            let candidates = at_block(rng.random_range(0..blocks));
+                            let patch = if family == "read_joint" {
+                                Patch::Reads { variables: interchange::subset(&mut rng, &candidates) }
+                            } else {
+                                Patch::Read { variable: candidates[rng.random_range(0..candidates.len())] }
+                            };
+                            (interchange::hybrid(&mut rng, blocks), Some(patch))
+                        }
+                    };
+                    let position = if patch.is_some() { rng.random_range(0..length) } else { 0 };
+                    Experiment { base: n, source: n, explained, patch, position }
+                })
+                .collect();
+            let (expected, found) = (reference.evaluate(&batch, &experiments, true).unwrap(), fused.evaluate(&batch, &experiments, true).unwrap());
+            let (a, b): (Vec<f64>, Vec<f64>) = (expected.bits.concat(), found.bits.concat());
+            let scale = a.iter().fold(1e-3_f64, |m, v| m.max(v.abs()));
+            let difference = a.iter().zip(&b).fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()));
+            assert!(difference <= 1e-9 * scale, "{family}: divergences differ by {difference} of {scale}");
+            let (mut difference, mut norm) = (0.0, 0.0);
+            for (g, c) in expected.gradient.iter().zip(&found.gradient) {
+                difference += (g - c).mapv(|v| v * v).sum();
+                norm += g.mapv(|v| v * v).sum();
+            }
+            assert!(norm > 0.0 && difference.sqrt() <= 1e-9 * norm.sqrt(), "{family}: gradients differ by {} of {}", difference.sqrt(), norm.sqrt());
+        }
+    }
+
+    #[test]
+    fn the_decoder_scores_every_family_as_the_programs_do() {
+        interchange_parity(tiny_export("decoder_families_gelu", 2));
+        interchange_parity(tiny_qwen3_export("decoder_families_qwen3", 2));
     }
 }
