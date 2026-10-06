@@ -222,7 +222,7 @@
 
 use crate::{
     artifact::{Argument, Artifact, Callee, Owner},
-    device_posterior::{DevicePosterior, Ivon, State},
+    device_posterior::{CurvatureNoise, DevicePosterior, Ivon, State},
     device_program::{gelu_tanh_constant, law_of},
     interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable, Targets},
     library_compensation::Compensation,
@@ -1394,6 +1394,12 @@ pub struct Settings {
     /// `interchange::Interchange::draw_ops`). Empty (the default) is `read` alone.
     #[serde(default)]
     pub families: Vec<interchange::Family>,
+    /// A/B arm, to be deleted with the losing arm after its paired test: when set, the curvature
+    /// average's gain `1 − β₂` of each operator is the Kalman gain of the drift and draw noise its
+    /// last epoch measured (`device_posterior::CurvatureNoise`), in place of `β₂ = 1 − 1/B` for
+    /// every operator and epoch (`B` the training batches).
+    #[serde(default)]
+    pub measured_beta2: bool,
 }
 
 /// [`Settings`] as configs and checkpoints hold them, unknown keys refused, and the keys of steps
@@ -1425,6 +1431,8 @@ struct SettingsRecord {
     epochs: Option<usize>,
     #[serde(default)]
     families: Vec<interchange::Family>,
+    #[serde(default)]
+    measured_beta2: bool,
     #[serde(default)]
     full_antithetic: Option<serde::de::IgnoredAny>,
     #[serde(default)]
@@ -1468,6 +1476,7 @@ impl From<SettingsRecord> for Settings {
             head_tile_rows: r.head_tile_rows,
             epochs: r.epochs,
             families: r.families,
+            measured_beta2: r.measured_beta2,
         }
     }
 }
@@ -2428,6 +2437,10 @@ struct Progress {
     /// The prior term's state, when the fit has one.
     #[serde(default)]
     prior: Option<serde_json::Value>,
+    /// The curvature average's measured gains, when the fit measures them
+    /// ([`DevicePosterior::curvature_noise`], `Settings::measured_beta2`).
+    #[serde(default)]
+    noise: Option<Vec<CurvatureNoise>>,
     /// The precision of each of the payload's arrays per operator ([`CHECKPOINT_ARRAYS`] of them,
     /// or [`LEGACY_ARRAYS`]): the storage the device posterior holds each in; none for a checkpoint
     /// written in float64 throughout, in the legacy layout.
@@ -2771,6 +2784,7 @@ impl Snapshot {
         progress.ratio = posterior.line_ratio();
         progress.slope = posterior.line_slope();
         progress.weights = Some(posterior.momentum_weights().to_vec());
+        progress.noise = posterior.curvature_noise();
         progress.momentum_weights = None;
         let bytes = checkpoint_payload_bytes(&progress.shapes, &precision).ok_or("a checkpoint too large to address")?;
         let (header, json) = (serde_json::to_vec(progress).map_err(error)?, serde_json::to_vec_pretty(progress).map_err(error)?);
@@ -2946,6 +2960,8 @@ fn read_checkpoint(explanation: &Explanation, path: &Path) -> Result<(Posterior,
         momentum_weights: Option<(f64, f64)>,
         #[serde(default)]
         prior: Option<serde_json::Value>,
+        #[serde(default)]
+        noise: Option<Vec<CurvatureNoise>>,
     }
     let (header, mut reader, payload_bytes): (Header, _, _) = checkpoint_header(path)?;
     // The checkpoint must be a fit of this explanation: the same groups, shared parameters,
@@ -2981,7 +2997,7 @@ fn read_checkpoint(explanation: &Explanation, path: &Path) -> Result<(Posterior,
         mean: held.into_iter().map(Shared::into_array).collect(),
         log_sd: posterior.log_sd.iter().map(|s| (**s).clone()).collect(),
         active: posterior.active.clone(),
-        state: Some(Optimizer { moments, iterate, averaged: header.averaged, steps, weights, ratio: header.ratio, slope: header.slope, prior: header.prior }),
+        state: Some(Optimizer { moments, iterate, averaged: header.averaged, steps, weights, ratio: header.ratio, slope: header.slope, prior: header.prior, noise: header.noise }),
         epoch: header.epoch,
     };
     Ok((posterior, start))
@@ -3017,6 +3033,7 @@ pub struct Optimizer {
     pub ratio: (f64, u64),
     pub slope: (f64, f64, u64),
     pub prior: Option<serde_json::Value>,
+    pub noise: Option<Vec<CurvatureNoise>>,
 }
 
 /// Where [`fit_from`] starts in place of `M`: per trainable operator (in `Explanation::trainable`
@@ -3125,6 +3142,7 @@ pub fn fit_from(
         evaluation_seconds: 0.0,
         full_seconds: 0.0,
         prior: None,
+        noise: None,
         precision: None,
     };
     // The fixed held-out subset: the first batch of held-out bases (at least the two a source
@@ -3194,7 +3212,7 @@ pub fn fit_from(
         }
         let steps = u64::try_from(progress.step).map_err(error)?;
         let weights = saved_weights(progress.weights.clone(), progress.momentum_weights, steps, progress.shapes.len());
-        resumed = Some(Optimizer { moments, iterate, averaged: progress.averaged, steps, weights, ratio: progress.ratio, slope: progress.slope, prior: progress.prior.clone() });
+        resumed = Some(Optimizer { moments, iterate, averaged: progress.averaged, steps, weights, ratio: progress.ratio, slope: progress.slope, prior: progress.prior.clone(), noise: progress.noise.clone() });
         log::info!("library fit resumed at epoch {} from {}", progress.epoch, path.display());
     } else if let Some(state) = resumed.as_ref().and_then(|resumed| resumed.prior.as_ref()) {
         // A start's prior state: the fit's prior term continues from it, as from its checkpoint.
@@ -3210,6 +3228,7 @@ pub fn fit_from(
     // A resumed fit holds exactly the device's means of the checkpoint, the iterate they average
     // with the steps they span, and the line step's averages: it goes on as the fit that was not
     // stopped.
+    let saved_noise = resumed.as_ref().and_then(|resumed| resumed.noise.clone());
     if let (Some(resumed), Some(held)) = (resumed.take(), held_means.take()) {
         device_posterior.restore(&held, &resumed.iterate, resumed.averaged)?;
         device_posterior.set_line_ratio(resumed.ratio);
@@ -3234,6 +3253,11 @@ pub fn fit_from(
     // variance about `2 / B` per entry: the batch size sets how many draws the average holds, not
     // what it estimates.
     let ivon = Ivon { beta1: MOMENTUM_DECAY, beta2: 1.0 - 1.0 / draws.len() as f64 };
+    // The A/B arm's measured gains, from the Laplace start's curvature (one draw per training
+    // batch) or a resumed fit's models.
+    if settings.measured_beta2 {
+        device_posterior.measure_curvature_noise(explanation, fresh.then_some(draws.len() as f64), saved_noise)?;
+    }
     // The fit's thread streams the checkpoint off the device to the writer thread, which finishes
     // writing it while the device trains on ([`Snapshot`]). The current explanation is read from
     // the checkpoint where it is wanted ([`checkpoint_artifact`]): a posterior-mean artifact made
@@ -3350,6 +3374,7 @@ pub fn fit_from(
             let prior_note = if prior.is_some() { format!(" (prior: {prior_seconds:.3} s)") } else { String::new() };
             log::info!("library step {epoch}.{b}: data {:.6} bits per scored token at the iterate's samples, {:.2} s{prior_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
         }
+        device_posterior.end_noise_epoch(1.0 - ivon.beta2)?;
         let count = draws.len() as f64;
         // The end-of-epoch posterior scored on the whole collection at the draws every snapshot
         // shares: the estimates the stop and the best epoch are decided on (module note).
@@ -4454,6 +4479,7 @@ mod tests {
             head_tile_rows: 64,
             epochs: None,
             families: Vec::new(),
+            measured_beta2: false,
         }
     }
 
@@ -5096,6 +5122,7 @@ mod tests {
             evaluation_seconds: 2.0,
             full_seconds: 1.0,
             prior: None,
+            noise: None,
             precision: precision.clone(),
         };
         // The wire format: length-prefixed JSON, then each operator's arrays row-major in their

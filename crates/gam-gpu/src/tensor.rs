@@ -2858,6 +2858,69 @@ impl Device {
         }
     }
 
+    /// The innovations of the curvature draws for measuring their noise and the curvature's drift
+    /// (`gam_mpd`'s measured curvature gain): per live entry of a group below `sums.rows()`, the
+    /// draw [`Device::posterior_ivon`] averages into the curvature, `y = c u² + r` (`c` the factor's
+    /// scale, `u` the Gauss–Newton factor, `r` the prior curvature, an absent one zero), its
+    /// innovation `e = y − h` against the curvature `h` before the step goes to `innovation`, and,
+    /// unless `first`, with `e₋` the innovation the step before stored there and `K` that step's
+    /// gain (its `1 − β₂`), the draws' difference `Δy = e − (1 − K) e₋` adds `(Δy e₋, Δy², h²)` into
+    /// the entry's group's row of `sums` (groups × 3). (`h = h₋ + K e₋`, so `y₋ = h + (1 − K) e₋`
+    /// and `Δy = y − y₋`.) A removed entry (`s = −∞`) is left. Inputs in the curvature's storage.
+    pub fn curvature_innovation(
+        &self,
+        (factor, prior): (Option<&Tensor>, Option<&Tensor>),
+        (curvature, log_sd): (&Tensor, &Tensor),
+        innovation: &mut Tensor,
+        groups: &GroupMap,
+        sums: &mut Tensor,
+        (factor_scale, gain, first): (f64, f64, bool),
+    ) -> Result<(), GpuError> {
+        groups.check(curvature, "curvature innovation")?;
+        same(curvature, log_sd, "curvature innovation log standard deviation")?;
+        same(curvature, innovation, "curvature innovation")?;
+        for (input, what) in [(factor, "curvature innovation factor"), (prior, "curvature innovation prior curvature")] {
+            if let Some(input) = input {
+                same(curvature, input, what)?;
+            }
+        }
+        if sums.cols != 3 {
+            return Err(shape(format!("{:?} sums for {} entries", sums.dim(), curvature.len())));
+        }
+        if !(factor_scale.is_finite() && (0.0..=1.0).contains(&gain)) {
+            return Err(shape(format!("a factor scale {factor_scale} and a gain {gain}")));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (us, rs) = (factor.map(host).transpose()?, prior.map(host).transpose()?);
+                let (hs, log_sds, ids) = (host(curvature)?, host(log_sd)?, host_indices(&groups.ids)?);
+                let count = sums.rows;
+                let (es, totals) = (host_mut(innovation)?, host_mut(sums)?);
+                for i in 0..hs.len() {
+                    let g = groups.group(ids, i) as usize;
+                    if g >= count || log_sds[i] == f64::NEG_INFINITY {
+                        continue;
+                    }
+                    let u = us.map_or(0.0, |v| v[i]);
+                    let y = factor_scale * u * u + rs.map_or(0.0, |v| v[i]);
+                    let fresh = y - hs[i];
+                    if !first {
+                        let change = fresh - (1.0 - gain) * es[i];
+                        totals[3 * g] += change * es[i];
+                        totals[3 * g + 1] += change * change;
+                        totals[3 * g + 2] += hs[i] * hs[i];
+                    }
+                    es[i] = fresh;
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.curvature_innovation((factor, prior), (curvature, log_sd), innovation, groups, sums, (factor_scale, gain, first)),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.curvature_innovation((factor, prior), (curvature, log_sd), innovation, groups, sums, (factor_scale, gain, first)),
+        }
+    }
+
     /// The end of a step ([`Device::posterior_ivon`]): the mean moved along the step's direction,
     /// `μ ← μ − η d` (each entry as [`Device::axpy`] makes it), the average moved toward it,
     /// `μ̄ ← μ̄ + w (μ − μ̄)` (as [`Device::move_toward`]), and each live entry's
@@ -4565,6 +4628,41 @@ extern "C" __global__ void posterior_ivon_f32(u64 n, u64 cols, unsigned int axis
     unsigned int inputs, const float* gradient, const float* factor, const float* prior, const unsigned int* groups, const double* variance, const float* mean, float* log_sd,
     float* momentum, float* curvature, float* direction, double* sums) {
     posterior_ivon_body<float>(n, cols, axis, chunks, count, scale, fscale, tokens, beta1, beta2, c0, c1, inputs, gradient, factor, prior, groups, variance, mean, log_sd, momentum, curvature, direction, sums);
+}
+
+// `Device::curvature_innovation`: per live entry of a group below `count`, the step's curvature
+// draw y = c u² + r (c `fscale`, `inputs` 2 with a factor and 4 with a prior curvature, an absent
+// one zero, as `posterior_ivon` forms it), its innovation e = y − h stored, and unless `first`,
+// with e₋ the stored innovation and K `gain`, Δy = e − (1 − K) e₋ adding (Δy e₋, Δy², h²) into its
+// group's row of `sums` (groups × 3).
+template <typename T>
+__device__ void curvature_innovation_body(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double fscale, double gain, unsigned int inputs, unsigned int first,
+    const T* factor, const T* prior, const T* curvature, const T* log_sd, const unsigned int* groups, T* innovation, double* sums) {
+    const T square = (T)fscale, keep = (T)(1.0 - gain), zero = (T)0;
+    const bool drawn = (inputs & 2u) != 0u, priced = (inputs & 4u) != 0u, add = first == 0u;
+    segments_reduce<3>(n, cols, axis, chunks, groups, count, false, false, sums, [&](u64 i, unsigned int, double* e) -> bool {
+        if (log_sd[i] == (T)NEG_INF) return false;
+        T ui = drawn ? factor[i] : zero, h = curvature[i];
+        T estimate = square * ui * ui + (priced ? prior[i] : zero);
+        T fresh = estimate - h;
+        if (add) {
+            T before = innovation[i];
+            T change = fresh - keep * before;
+            e[0] = (double)change * (double)before; e[1] = (double)change * (double)change; e[2] = (double)h * (double)h;
+        }
+        innovation[i] = fresh;
+        return add;
+    });
+}
+
+extern "C" __global__ void curvature_innovation_f64(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double fscale, double gain, unsigned int inputs, unsigned int first,
+    const double* factor, const double* prior, const double* curvature, const double* log_sd, const unsigned int* groups, double* innovation, double* sums) {
+    curvature_innovation_body<double>(n, cols, axis, chunks, count, fscale, gain, inputs, first, factor, prior, curvature, log_sd, groups, innovation, sums);
+}
+
+extern "C" __global__ void curvature_innovation_f32(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, double fscale, double gain, unsigned int inputs, unsigned int first,
+    const float* factor, const float* prior, const float* curvature, const float* log_sd, const unsigned int* groups, float* innovation, double* sums) {
+    curvature_innovation_body<float>(n, cols, axis, chunks, count, fscale, gain, inputs, first, factor, prior, curvature, log_sd, groups, innovation, sums);
 }
 
 // `Device::posterior_finish`: μ ← μ + (−η) d (as `axpy` makes it), μ̄ ← μ̄ + w (μ − μ̄) (as
@@ -6601,6 +6699,41 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             unsafe { builder.launch(cfg_elements(groups.blocks() as u64)) }.gpu_ctx("tensor posterior_ivon").map(|_| ())
         }
 
+        pub(super) fn curvature_innovation(
+            &self,
+            (factor, prior): (Option<&Tensor>, Option<&Tensor>),
+            (curvature, log_sd): (&Tensor, &Tensor),
+            innovation: &mut Tensor,
+            groups: &super::GroupMap,
+            sums: &mut Tensor,
+            (factor_scale, gain, first): (f64, f64, bool),
+        ) -> Result<(), GpuError> {
+            let (n, storage) = (curvature.len() as u64, curvature.storage());
+            let f = self.posterior_kernel("curvature_innovation", storage)?;
+            let inputs = (u32::from(factor.is_some()) << 1) | (u32::from(prior.is_some()) << 2);
+            let (count, first) = (sums.rows as u64, u32::from(first));
+            let (cols, axis, chunks) = (groups.cols as u64, groups.reduce_code(), groups.chunks() as u64);
+            // An absent input goes as a null pointer, which the kernel does not read (`inputs`).
+            let absent = 0u64;
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&n).arg(&cols).arg(&axis).arg(&chunks).arg(&count).arg(&factor_scale).arg(&gain).arg(&inputs).arg(&first);
+            for input in [factor, prior] {
+                match input {
+                    Some(t) => {
+                        builder.input(t, storage)?;
+                    }
+                    None => {
+                        builder.arg(&absent);
+                    }
+                }
+            }
+            builder.input(curvature, storage)?.input(log_sd, storage)?.arg(index_slice(&groups.layout)?).output(innovation, storage)?.arg(slice_mut(sums)?);
+            // SAFETY: equal-length entry buffers in the curvature's storage, a null pointer only for
+            // an input `inputs` marks absent, float64 sums of `count` rows (three columns), ids per
+            // the map's axis; ids at or beyond `count` are left.
+            unsafe { builder.launch(cfg_elements(groups.blocks() as u64)) }.gpu_ctx("tensor curvature_innovation").map(|_| ())
+        }
+
         pub(super) fn posterior_finish(
             &self,
             (mean, direction, eta): (&mut Tensor, &Tensor, f64),
@@ -7714,6 +7847,40 @@ kernel void t_posterior_ivon(device const float* gradient [[buffer(0)]], device 
     }
 }
 
+// `Device::curvature_innovation`, one SIMD group per segment of the group map: per live entry of a
+// group below `p.count`, the step's curvature draw y = `p.fscale` u² + r (`p.inputs` 2 with a factor
+// and 4 with a prior curvature, an absent one zero, 8 on a first step) as `t_posterior_ivon` forms
+// it, its innovation e = y − h stored, and unless first, with e₋ the stored innovation and K
+// `p.scale`, (Δy e₋, Δy², h²) for Δy = e − (1 − K) e₋ into its group's row of `sums` by the
+// segment's first lane.
+kernel void t_curvature_innovation(device const float* factor [[buffer(0)]], device const float* prior [[buffer(1)]], device const float* curvature [[buffer(2)]],
+                                   device const float* log_sd [[buffer(3)]], device const uint* layout [[buffer(4)]], device float* innovation [[buffer(5)]],
+                                   device float* sums [[buffer(6)]], constant Posterior& p [[buffer(7)]], uint i [[thread_position_in_grid]]) {
+    uint s = i / 32u, lane = i % 32u;
+    if (s >= p.chunks) return;
+    uint g = layout[p.chunks + 1u + s];
+    if (g >= p.count) return;
+    bool drawn = (p.inputs & 2u) != 0u, priced = (p.inputs & 4u) != 0u, first = (p.inputs & 8u) != 0u;
+    uint off = layout[s], size = layout[s + 1u] - off, length = segment_length(p, size);
+    float a = 0.0f, b = 0.0f, c = 0.0f;
+    for (uint k = lane; k < length; k += 32u) {
+        uint e = segment_entry(layout, p, off, size, k);
+        if (log_sd[e] == -INFINITY) continue;
+        float ui = drawn ? factor[e] : 0.0f, h = curvature[e];
+        float estimate = p.fscale * ui * ui + (priced ? prior[e] : 0.0f);
+        float fresh = estimate - h;
+        if (!first) {
+            float before = innovation[e], change = fresh - (1.0f - p.scale) * before;
+            a += change * before; b += change * change; c += h * h;
+        }
+        innovation[e] = fresh;
+    }
+    a = simd_sum(a); b = simd_sum(b); c = simd_sum(c);
+    if (!first && lane == 0u) {
+        sums[3 * g] += a; sums[3 * g + 1] += b; sums[3 * g + 2] += c;
+    }
+}
+
 kernel void t_group_moments(device const float* mean [[buffer(0)]], device const float* log_sd [[buffer(1)]], device const uint* layout [[buffer(2)]],
                             device float* sums [[buffer(3)]], constant Posterior& p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
     uint s = i / 32u, lane = i % 32u;
@@ -7867,6 +8034,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device const fl
         "t_round_to_deviation",
         "t_reparameterize",
         "t_posterior_ivon",
+        "t_curvature_innovation",
         "t_group_moments",
         "t_group_curvature",
         "t_group_code_length",
@@ -8311,6 +8479,35 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device const fl
                 whole(buffer(direction)?),
             ];
             self.grouped("t_posterior_ivon", &buffers, groups, p)
+        }
+
+        pub(super) fn curvature_innovation(
+            &self,
+            (factor, prior): (Option<&Tensor>, Option<&Tensor>),
+            (curvature, log_sd): (&Tensor, &Tensor),
+            innovation: &mut Tensor,
+            groups: &super::GroupMap,
+            sums: &mut Tensor,
+            (factor_scale, gain, first): (f64, f64, bool),
+        ) -> Result<(), GpuError> {
+            let p = Posterior {
+                count: u32_of(sums.rows)?,
+                fscale: factor_scale as f32,
+                scale: gain as f32,
+                inputs: (u32::from(factor.is_some()) << 1) | (u32::from(prior.is_some()) << 2) | (u32::from(first) << 3),
+                ..Posterior::default()
+            };
+            // An absent input's slot is bound to the curvature, which the kernel does not read there.
+            let buffers = [
+                whole(buffer(factor.unwrap_or(curvature))?),
+                whole(buffer(prior.unwrap_or(curvature))?),
+                whole(buffer(curvature)?),
+                whole(buffer(log_sd)?),
+                whole(index_buffer(&groups.layout)?),
+                whole(buffer(innovation)?),
+                whole(buffer(sums)?),
+            ];
+            self.grouped("t_curvature_innovation", &buffers, groups, p)
         }
 
         pub(super) fn group_moments(&self, (mean, log_sd): (&Tensor, &Tensor), groups: &super::GroupMap, sums: &mut Tensor) -> Result<(), GpuError> {

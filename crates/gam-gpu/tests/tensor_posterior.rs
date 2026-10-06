@@ -1262,3 +1262,73 @@ fn prior_variances_on_every_accelerator_match_the_host() {
         priors_against_host(&wide);
     }
 }
+
+/// Two steps of the curvature draws' innovations (`Device::curvature_innovation`) on each axis's
+/// case, with the second step's curvature, factor and prior curvature its own: the first stores
+/// `e₋ = c u² + r − h` and adds nothing; the second stores `e` and adds `(Δy e₋, Δy², h²)` per group,
+/// `Δy = e − (1 − K) e₋`; removed entries (group 4) and those of groups at or beyond the sums' rows
+/// (7) are left. Returns the innovations and the sums.
+fn innovations(fit: &Device, wide: &Device, c: &Case, gain: f64) -> (Array2<f64>, Array2<f64>) {
+    let up = |m: &Array2<f64>| fit.upload(m.view()).unwrap();
+    let (rows, cols) = c.mean.dim();
+    let groups = fit.group_map(&c.groups, (rows, cols)).unwrap();
+    let log_sd = up(&c.log_sd);
+    let mut innovation = fit.zeros(rows, cols).unwrap();
+    let mut sums = wide.zeros(c.count - 1, 3).unwrap();
+    let scale = c.step.factor_scale;
+    fit.curvature_innovation((Some(&up(&c.factor)), Some(&up(&c.prior))), (&up(&c.moments[1]), &log_sd), &mut innovation, &groups, &mut sums, (scale, gain, true)).unwrap();
+    assert!(wide.download(&sums).unwrap().iter().all(|v| *v == 0.0), "a first step adds nothing");
+    let (curvature, factor, prior) = (matrix(rows, cols, 11, 0.5, 1.0), matrix(rows, cols, 9, 2.0, 0.0), matrix(rows, cols, 10, 0.5, 0.0));
+    fit.curvature_innovation((Some(&up(&factor)), None), (&up(&curvature), &log_sd), &mut innovation, &groups, &mut sums, (scale, gain, false)).unwrap();
+    // The prior curvature enters a later step's draws as the first's did.
+    fit.curvature_innovation((None, Some(&up(&prior))), (&up(&curvature), &log_sd), &mut innovation, &groups, &mut sums, (scale, gain, false)).unwrap();
+    (fit.download(&innovation).unwrap(), wide.download(&sums).unwrap())
+}
+
+#[test]
+fn the_curvature_innovations_follow_their_formulas_on_every_backend() {
+    let host = Device::host();
+    let gain = 0.125;
+    for axis in AXES {
+        let c = case(axis);
+        let (rows, cols) = c.mean.dim();
+        let (curvature, factor, prior) = (matrix(rows, cols, 11, 0.5, 1.0), matrix(rows, cols, 9, 2.0, 0.0), matrix(rows, cols, 10, 0.5, 0.0));
+        let scale = c.step.factor_scale;
+        let mut expected_sums = Array2::<f64>::zeros((c.count - 1, 3));
+        let mut expected = Array2::<f64>::zeros((rows, cols));
+        for (i, &g) in c.groups.iter().enumerate() {
+            let at = (i / cols, i % cols);
+            let g = g as usize;
+            if g >= c.count - 1 || c.log_sd[at] == f64::NEG_INFINITY {
+                continue;
+            }
+            let first = scale * c.factor[at] * c.factor[at] + c.prior[at] - c.moments[1][at];
+            let second = scale * factor[at] * factor[at] - curvature[at];
+            let third = prior[at] - curvature[at];
+            for (before, after) in [(first, second), (second, third)] {
+                let change = after - (1.0 - gain) * before;
+                expected_sums[(g, 0)] += change * before;
+                expected_sums[(g, 1)] += change * change;
+                expected_sums[(g, 2)] += curvature[at] * curvature[at];
+            }
+            expected[at] = third;
+        }
+        let (innovation, sums) = innovations(&host, &host, &c, gain);
+        close("host innovations", &innovation, &expected, 1e-15);
+        close("host innovation sums", &sums, &expected_sums, 1e-12);
+        let mut devices: Vec<(Device, Device)> = Vec::new();
+        if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
+            devices.push((wide.with_storage(Storage::F32).expect("CUDA holds f32"), wide));
+        }
+        if let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault") {
+            devices.push((metal.clone(), metal));
+        }
+        // Each term is a chain within `CHAIN` of its magnitude; a group sums at most 260 of them
+        // (the columns case's pairs of 130 rows), twice.
+        for (fit, wide) in &devices {
+            let (found, found_sums) = innovations(fit, wide, &c, gain);
+            close(&format!("{} innovations", fit.name()), &found, &innovation, CHAIN);
+            close(&format!("{} innovation sums", fit.name()), &found_sums, &sums, 520.0 * (CHAIN + 520.0 * U));
+        }
+    }
+}

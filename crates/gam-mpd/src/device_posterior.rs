@@ -68,6 +68,105 @@ pub struct Ivon {
     pub beta2: f64,
 }
 
+/// The curvature average's gain measured from its draws (`library_mdl::Settings::measured_beta2`),
+/// per trainable operator: each entry's draw `y_t = c u² + r` of its curvature
+/// ([`Device::posterior_ivon`]) as a local-level model, `y_t = h_t + v_t` with draw noise of
+/// variance `R` and `h_t = h_{t−1} + w_t` with drift of variance `Q` per step, both relative to
+/// `h²` and pooled over the operator's entries. With the average `h̄_t = h̄_{t−1} + K_t e_t`
+/// (`K_t = 1 − β₂` the step's gain, `e_t = y_t − h̄_{t−1}` its innovation), the draws'
+/// difference `Δy_t = y_t − y_{t−1} = e_t − (1 − K_{t−1}) e_{t−1}` gives `E[Δy_t e_{t−1}] = −R` and
+/// `E[Δy_t²] = Q + 2R` whatever the gains and the average's error (`v_{t−1}` is the only term
+/// `e_{t−1}` and `Δy_t` share), so an epoch's sums `(Σ Δy e₋, Σ Δy², Σ h̄²)`
+/// ([`Device::curvature_innovation`]) estimate `R / h² = −Σ Δy e₋ / Σ h̄²` and
+/// `Q / h² = Σ Δy² / Σ h̄² − 2 R / h²`, each projected onto the nonnegative values. The next
+/// epoch's steps take the Kalman gain of that model, `P⁻ = P + Q`, `K = P⁻ / (P⁻ + R)`,
+/// `P ← (1 − K) P⁻` (`P` the average's error variance): the minimum-variance linear average of
+/// the draws under the model, which tends to the steady gain `K*` of `K*² / (1 − K*) = Q / R`
+/// where the curvature drifts (`Q > 0`) and is the plain mean of the draws since the start,
+/// `K_t = 1 / (n₀ + t)` from a start averaging `n₀` draws, where it does not (`Q = 0`). Before
+/// the first epoch's measurement the gain is the constant one of [`Ivon::beta2`]; at that
+/// measurement the error after the epoch follows from the start's (`R / n₀`) under the measured
+/// model. The model of an epoch is carried into the next with the error its own gains left, the
+/// error's start under the old model decaying as `(1 − K)²` per step.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CurvatureNoise {
+    /// `(Q / h², R / h²)` the last epoch measured; none before the first measurement.
+    pub model: Option<(f64, f64)>,
+    /// The average's error variance relative to `h²` after the last step, under `model`.
+    pub error: f64,
+    /// The last step's gain.
+    pub gain: f64,
+    /// The draws the start's curvature averages (the Laplace start's: one per training batch);
+    /// none for a start whose error is not known, whose error is then the constant gain's steady
+    /// one.
+    pub start_draws: Option<f64>,
+    /// The epoch's steps, and those whose innovations were summed (a step after none, or after its
+    /// operator was set anew, has no previous innovation).
+    pub taken: u64,
+    pub counted: u64,
+}
+
+impl CurvatureNoise {
+    /// The next step's gain: the model's Kalman gain, or `constant` before a model (or where the
+    /// model leaves no gain: no drift, no draw noise and no error).
+    #[must_use]
+    pub fn next_gain(&mut self, constant: f64) -> f64 {
+        self.taken += 1;
+        let Some((drift, draw)) = self.model else { return constant };
+        let predicted = self.error + drift;
+        let gain = predicted / (predicted + draw);
+        if !(gain > 0.0 && gain <= 1.0) {
+            return constant;
+        }
+        self.error = (1.0 - gain) * predicted;
+        gain
+    }
+
+    /// The model from an epoch's sums `(Σ Δy e₋, Σ Δy², Σ h̄²)` (none without a summed step or a
+    /// curvature), its error after the epoch when the epoch's gain was the constant `constant`, and
+    /// the epoch's counts reset.
+    pub fn end_epoch(&mut self, [along, square, scale]: [f64; 3], constant: f64) -> Option<(f64, f64)> {
+        let (taken, counted) = (self.taken, self.counted);
+        (self.taken, self.counted) = (0, 0);
+        if counted == 0 || !(scale > 0.0) || !(along.is_finite() && square.is_finite() && scale.is_finite()) {
+            return None;
+        }
+        let draw = (-along / scale).max(0.0);
+        let drift = (square / scale - 2.0 * draw).max(0.0);
+        if self.model.is_none() {
+            // The constant gain's error recursion `P ← (1 − K)² (P + Q) + K² R` from the start's.
+            let k = constant;
+            let steady = ((1.0 - k).powi(2) * drift + k * k * draw) / (k * (2.0 - k));
+            let start = self.start_draws.map_or(steady, |n| draw / n);
+            self.error = steady + (1.0 - k).powf(2.0 * taken as f64) * (start - steady);
+        }
+        self.model = Some((drift, draw));
+        Some((drift, draw))
+    }
+
+    /// The steady gain `K*` of a model, `K*² / (1 − K*) = Q / R`: 1 without draw noise.
+    #[must_use]
+    pub fn steady_gain((drift, draw): (f64, f64)) -> f64 {
+        if draw > 0.0 {
+            let ratio = drift / draw;
+            0.5 * (-ratio + (ratio * ratio + 4.0 * ratio).sqrt())
+        } else {
+            1.0
+        }
+    }
+}
+
+/// The measured gain's device state ([`DevicePosterior::measure_curvature_noise`]): per operator
+/// its model, its entries' groups numbered within it, the epoch's sums per such group (groups × 3,
+/// [`Device::curvature_innovation`]), and the previous step's innovations (none before a first
+/// step, after a restart and for an operator set anew).
+struct Noise {
+    models: Vec<CurvatureNoise>,
+    maps: Vec<GroupMap>,
+    sums: Vec<Tensor>,
+    innovations: Vec<Option<Tensor>>,
+}
+
 /// IVON's state a device posterior starts from ([`DevicePosterior::new`]); none: the momentum zero
 /// and the curvature at which IVON's standard deviations are the posterior's.
 pub enum State<'a> {
@@ -142,6 +241,8 @@ pub struct DevicePosterior {
     /// whose arrays are not these ([`Shared::same`]; a removal trial shares the operators it does
     /// not change, and a write to a shared array copies it).
     uploaded: Vec<Option<(Shared, Shared)>>,
+    /// The curvature average's measured gain, when on ([`CurvatureNoise`]).
+    noise: Option<Noise>,
 }
 
 /// Each trainable operator's entries' groups, row-major.
@@ -301,6 +402,7 @@ impl DevicePosterior {
             tokens,
             steps,
             uploaded: Vec::new(),
+            noise: None,
         };
         out.average = out.mean.iter().map(|m| out.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
         out.refresh()?;
@@ -502,7 +604,26 @@ impl DevicePosterior {
             let [momentum, curvature] = &mut self.moments[i];
             let mut direction = self.fitting.empty(self.mean[i].rows(), self.mean[i].cols()).map_err(error)?;
             let inputs = (gradients.get(&op), factor.0.get(&op), prior.get(&op));
-            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, beta1: ivon.beta1, beta2: ivon.beta2, weight: self.weights[i] };
+            // With the measured gain, the draws' innovations against the curvature before the
+            // step, and the step's gain from the operator's model.
+            let mut beta2 = ivon.beta2;
+            if let Some(noise) = self.noise.as_mut() {
+                let first = noise.innovations[i].is_none();
+                if first {
+                    noise.innovations[i] = Some(self.fitting.zeros(self.mean[i].rows(), self.mean[i].cols()).map_err(error)?);
+                }
+                let innovation = noise.innovations[i].as_mut().ok_or("an innovation array")?;
+                let model = &mut noise.models[i];
+                self.fitting
+                    .curvature_innovation((inputs.1, inputs.2), (&*curvature, &self.log_sd[i]), innovation, &noise.maps[i], &mut noise.sums[i], (factor.1, model.gain, first))
+                    .map_err(error)?;
+                if !first {
+                    model.counted += 1;
+                }
+                model.gain = model.next_gain(1.0 - ivon.beta2);
+                beta2 = 1.0 - model.gain;
+            }
+            let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, beta1: ivon.beta1, beta2, weight: self.weights[i] };
             self.fitting
                 .posterior_ivon((&self.mean[i], &mut self.log_sd[i]), [momentum, curvature], inputs, (&self.groups[i], &self.variance), (&mut direction, &mut sums), &step)
                 .map_err(error)?;
@@ -548,6 +669,56 @@ impl DevicePosterior {
             }
         }
         self.wide.group_divergence(&mut self.sums, self.reference.as_ref(), &mut self.variance, &mut self.divergence).map_err(error)
+    }
+
+    /// Turns on the curvature average's measured gain ([`CurvatureNoise`],
+    /// `library_mdl::Settings::measured_beta2`) for `explanation`'s posterior: `start_draws` the
+    /// draws the curvature's start averages (none where not known), or `saved`, a checkpoint's
+    /// models, one per trainable operator. The first step after has no previous innovation.
+    pub fn measure_curvature_noise(&mut self, explanation: &Explanation, start_draws: Option<f64>, saved: Option<Vec<CurvatureNoise>>) -> Result<(), String> {
+        let shapes: Vec<(usize, usize)> = self.mean.iter().map(|m| (m.rows(), m.cols())).collect();
+        let (mut maps, mut sums) = (Vec::with_capacity(shapes.len()), Vec::with_capacity(shapes.len()));
+        for (ids, shape) in membership(explanation, &shapes)?.iter().zip(&shapes) {
+            let mut own = ids.clone();
+            own.sort_unstable();
+            own.dedup();
+            let numbered: Vec<u32> = ids.iter().map(|g| own.partition_point(|x| x < g) as u32).collect();
+            maps.push(self.fitting.group_map(&numbered, *shape).map_err(error)?);
+            sums.push(self.wide.zeros(own.len(), 3).map_err(error)?);
+        }
+        let models = match saved {
+            Some(models) if models.len() == shapes.len() => models,
+            Some(_) => return Err(error("one curvature noise model per trainable operator required")),
+            None => vec![CurvatureNoise { start_draws, ..CurvatureNoise::default() }; shapes.len()],
+        };
+        self.noise = Some(Noise { models, maps, sums, innovations: shapes.iter().map(|_| None).collect() });
+        Ok(())
+    }
+
+    /// The measured gain's models ([`CurvatureNoise`]), when on.
+    #[must_use]
+    pub fn curvature_noise(&self) -> Option<Vec<CurvatureNoise>> {
+        self.noise.as_ref().map(|noise| noise.models.clone())
+    }
+
+    /// The end of an epoch for the measured gain: per operator the model from the epoch's sums
+    /// ([`CurvatureNoise::end_epoch`], `constant` the gain before a model), logged with its steady
+    /// gain, and the sums zeroed. Nothing when off.
+    pub fn end_noise_epoch(&mut self, constant: f64) -> Result<(), String> {
+        let Some(noise) = self.noise.as_mut() else { return Ok(()) };
+        for (i, op) in self.operators.iter().enumerate() {
+            let terms = self.wide.download(&noise.sums[i]).map_err(error)?;
+            let total = |k: usize| terms.column(k).sum();
+            match noise.models[i].end_epoch([total(0), total(1), total(2)], constant) {
+                Some((drift, draw)) => {
+                    let steady = CurvatureNoise::steady_gain((drift, draw));
+                    log::info!("library curvature noise, operator {op}: R/h² {draw:.4e}, Q/h² {drift:.4e}, steady gain K* {steady:.4e} (β₂ {:.6}), last gain {:.4e}", 1.0 - steady, noise.models[i].gain);
+                }
+                None => log::info!("library curvature noise, operator {op}: not measured this epoch"),
+            }
+            noise.sums[i] = self.wide.zeros(terms.nrows(), 3).map_err(error)?;
+        }
+        Ok(())
     }
 
     /// The number of prior groups.
@@ -647,6 +818,9 @@ impl DevicePosterior {
             self.log_sd[i] = self.fitting.upload(posterior.log_sd[i].view()).map_err(error)?;
             self.moments[i][0] = self.fitting.zeros(rows, cols).map_err(error)?;
             self.weights[i] = 0.0;
+            if let Some(noise) = self.noise.as_mut() {
+                noise.innovations[i] = None;
+            }
             self.uploaded[i] = Some((posterior.mean[i].clone(), posterior.log_sd[i].clone()));
         }
         self.restart()
@@ -946,5 +1120,94 @@ mod tests {
             assert!((value - expected).abs() <= bound, "({r}, {c}): {value} against {expected}");
             assert!((alone[[r, c]] - plus[[r, c]] * scale).abs() <= 1e-12 * (plus[[r, c]] * scale).abs(), "({r}, {c}) without a twin");
         }
+    }
+
+    /// The measured gain's model from a synthetic local-level stream (`CurvatureNoise`): 16384
+    /// entries, each its own group, with curvature `h_t = h_{t−1} + w_t` (`Var w = Q`, from 4) and
+    /// draws `y_t = h_t + v_t` (`Var v = R`), averaged at the constant gain `K₀ = 1/64` over 1000
+    /// steps as the step's kernel averages them, their innovations summed by
+    /// `Device::curvature_innovation`. The entries are independent, so the per-entry estimates
+    /// `R̂_i = −Σ_t Δy e₋ / T` and `Q̂_i = Σ_t (Δy² + 2 Δy e₋) / T` (`T` the summed steps) have
+    /// means within four standard errors across entries of `R` and `Q`, and the pooled model is
+    /// `(Q, R) T n / Σ h̄²` within the same errors scaled alike.
+    #[test]
+    fn the_measured_gain_recovers_a_local_level_model() {
+        let host = Device::host();
+        let (side, steps, constant) = (128usize, 1000u64, 1.0 / 64.0);
+        let n = side * side;
+        let (drift, draw): (f64, f64) = (8e-4, 4e-2);
+        let ids: Vec<u32> = (0..n as u32).collect();
+        let groups = host.group_map(&ids, (side, side)).unwrap();
+        let log_sd = host.zeros(side, side).unwrap();
+        let (mut level, mut average) = (vec![4.0; n], vec![4.0; n]);
+        let mut innovation = host.zeros(side, side).unwrap();
+        let mut sums = host.zeros(n, 3).unwrap();
+        let mut model = CurvatureNoise::default();
+        for t in 0..steps {
+            let mut y = vec![0.0; n];
+            for i in 0..n {
+                level[i] += drift.sqrt() * f64::from(posterior_normal(21, t, i as u64));
+                y[i] = level[i] + draw.sqrt() * f64::from(posterior_normal(22, t, i as u64));
+            }
+            let (draws, curvature) = (host.upload_vec(side, side, y.clone()).unwrap(), host.upload_vec(side, side, average.clone()).unwrap());
+            host.curvature_innovation((None, Some(&draws)), (&curvature, &log_sd), &mut innovation, &groups, &mut sums, (1.0, model.gain, t == 0)).unwrap();
+            if t > 0 {
+                model.counted += 1;
+            }
+            model.gain = model.next_gain(constant);
+            assert_eq!(model.gain, constant, "no model: the constant gain");
+            for i in 0..n {
+                average[i] += model.gain * (y[i] - average[i]);
+            }
+        }
+        let terms = host.download(&sums).unwrap();
+        let summed = (steps - 1) as f64;
+        let mean_and_error = |v: Vec<f64>| -> (f64, f64) {
+            let k = v.len() as f64;
+            let mean = v.iter().sum::<f64>() / k;
+            (mean, (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (k - 1.0) / k).sqrt())
+        };
+        let (r, r_error) = mean_and_error(terms.column(0).iter().map(|a| -a / summed).collect());
+        let (q, q_error) = mean_and_error(terms.column(0).iter().zip(terms.column(1)).map(|(a, b)| (b + 2.0 * a) / summed).collect());
+        assert!((r - draw).abs() <= 4.0 * r_error, "R̂ {r} ± {r_error} against {draw}");
+        assert!((q - drift).abs() <= 4.0 * q_error && q_error < 0.25 * drift, "Q̂ {q} ± {q_error} against {drift}");
+        let total = |k: usize| terms.column(k).sum();
+        let scale = summed * n as f64 / total(2);
+        let (q_model, r_model) = model.end_epoch([total(0), total(1), total(2)], constant).unwrap();
+        assert!((r_model - draw * scale).abs() <= 4.0 * r_error * scale, "R/h² {r_model} against {}", draw * scale);
+        assert!((q_model - drift * scale).abs() <= 4.0 * q_error * scale, "Q/h² {q_model} against {}", drift * scale);
+        assert_eq!((model.taken, model.counted), (0, 0), "the epoch's counts reset");
+    }
+
+    /// The measured gain's Kalman recursion: without drift and from a start of `n₀` draws (error
+    /// `R / n₀`) the gains are the plain mean's, `1 / (n₀ + t)`; with drift they tend to the steady
+    /// gain `K*` of `K*² / (1 − K*) = Q / R`; and a constant-gain epoch's error is the recursion
+    /// `P ← (1 − K)² (P + Q) + K² R` from the start's, as the model it measured gives it.
+    #[test]
+    fn the_measured_gain_is_the_kalman_gain_of_its_model() {
+        let mut plain = CurvatureNoise { model: Some((0.0, 0.5)), error: 0.5 / 10.0, ..CurvatureNoise::default() };
+        for t in 1..=50 {
+            let gain = plain.next_gain(0.3);
+            assert!((gain - 1.0 / (10.0 + f64::from(t))).abs() <= 1e-14, "step {t}: {gain}");
+        }
+        let (drift, draw) = (1e-3, 0.4);
+        let mut drifting = CurvatureNoise { model: Some((drift, draw)), error: draw / 10.0, ..CurvatureNoise::default() };
+        let mut gain = 0.0;
+        for _ in 0..20_000 {
+            gain = drifting.next_gain(0.3);
+        }
+        let steady = CurvatureNoise::steady_gain((drift, draw));
+        assert!((gain - steady).abs() <= 1e-12 && (steady * steady / (1.0 - steady) - drift / draw).abs() <= 1e-15, "{gain} against {steady}");
+        let (constant, taken, start_draws) = (1.0 / 64.0, 37u64, 64.0);
+        let mut measured = CurvatureNoise { start_draws: Some(start_draws), taken, counted: taken - 1, ..CurvatureNoise::default() };
+        let h = 3.0;
+        let model = measured.end_epoch([-draw * h, (drift + 2.0 * draw) * h, h], constant).unwrap();
+        assert!((model.0 - drift).abs() <= 1e-15 && (model.1 - draw).abs() <= 1e-15, "{model:?}");
+        let mut error = draw / start_draws;
+        for _ in 0..taken {
+            error = (1.0 - constant).powi(2) * (error + drift) + constant * constant * draw;
+        }
+        assert!((measured.error - error).abs() <= 1e-12 * error, "{} against {error}", measured.error);
+        assert!(CurvatureNoise::default().end_epoch([0.0, 0.0, 1.0], constant).is_none(), "no summed step");
     }
 }
