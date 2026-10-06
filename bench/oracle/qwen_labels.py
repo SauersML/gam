@@ -3,13 +3,9 @@ MLP functions (parts) on the real model M, under the edit families the fit and t
 driver use (interchange's Patch::Part, PartFrom and Parts), in vpd_labels.py's schema so vpd_oracle.py
 reads it.
 
-A part i of layer l's MLP has an activity a_i and writes a_i u_i. Two definitions of a_i on M (`--read`,
-recorded in each site's meta):
-  transcoder  a_i = relu(v_i . x + b_i), x M's own MLP input (the normed residual entering the MLP);
-  native      a_i = r_i . h, h M's own MLP hidden vector (the down projection's input), so the edit is
-              a weight edit of M's down projection, W_down + (alpha - 1) u_i r_i^T at the edited rows
-              (the functions file then holds .R [d_ff, C], the native lift).
-Its edit with factor alpha adds (alpha - 1) a_i u_i to M's MLP output at the edited rows (alpha = 0
+A part i of layer l's MLP reads a_i = relu(v_i . x + b_i) from M's own MLP input x (the normed residual
+entering the MLP) and writes a_i u_i: Patch::Part's definition, the same on M and on P. Its edit with
+factor alpha adds (alpha - 1) a_i u_i to M's MLP output at the edited rows (alpha = 0
 removes the part, alpha = 2 amplifies it), every later computation run again (no linear
 approximation). Families (`--family`, recorded):
   row    Patch::Part: the part at the context's peak p only;
@@ -33,11 +29,11 @@ Per part and context (p = the position of largest activity, after the first toke
 
 Functions: `vpd_lens.py functions` (a transcoder library's start) or mpd_library_mdl_2951's export
 (EditSettings.functions, the fit's posterior mean), per layer l h.{l}.mlp.function.U [C, d], .V [d, C],
-.bias [C] (.index [C]: the part's row in the layer's operators; .R [d_ff, C] for --read native).
+.bias [C] (.index [C]: the part's row in the layer's operators).
 
   qwen_labels.py labels --model SNAPSHOT --functions F --tokens WINDOWS.u32 --out DIR [--offset 0] [--pool 2048]
                  [--top 16] [--random 16] [--layers 0,1,...] [--limit N] [--rows 64] [--seed 0]
-                 [--family row|from|parts] [--read transcoder|native]
+                 [--family row|from|parts]
   qwen_labels.py parity --model SNAPSHOT --functions F --tokens WINDOWS.u32 --held-out FIRST --layers K
                  --records OUT/EDITS_{name}.experiments.jsonl
       the same edits as the Rust driver's records (Patch::Part, PartFrom, Parts), on M cut to its first
@@ -70,13 +66,12 @@ def device() -> torch.device:
 
 
 class Edit:
-    """A forward hook on one layer's MLP. Per batch row r its parts (k of them: reads V [R, k, d] or
-    R [R, k, d_ff] and biases b [R, k], writes U [R, k, d]); it records each part's activity at every
-    position, and when `scale` is set adds scale[r] * sum_k a_rk(t) u_rk to the MLP's output at the
-    rows `rows` [R, T] (a boolean mask) marks."""
+    """A forward hook on one layer's MLP. Per batch row r its parts (k of them: reads V [R, k, d] and
+    biases b [R, k], writes U [R, k, d]); it records each part's activity at every position, and when
+    `scale` is set adds scale[r] * sum_k a_rk(t) u_rk to the MLP's output at the rows `rows` [R, T]
+    (a 0/1 mask) marks."""
 
-    def __init__(self, read: str = "transcoder"):
-        self.read = read
+    def __init__(self):
         self.V = self.b = self.U = self.rows = self.scale = None
         self.activity = None
 
@@ -84,11 +79,7 @@ class Edit:
         if self.V is None:
             return output
         x = args[0].to(self.V.dtype)
-        if self.read == "native":
-            h = module.act_fn(module.gate_proj(args[0])) * module.up_proj(args[0])
-            a = torch.einsum("rtf,rkf->rkt", h.to(self.V.dtype), self.V)
-        else:
-            a = torch.relu(torch.einsum("rtd,rkd->rkt", x, self.V) + self.b[:, :, None])
+        a = torch.relu(torch.einsum("rtd,rkd->rkt", x, self.V) + self.b[:, :, None])
         self.activity = a
         if self.scale is None:
             return output
@@ -105,16 +96,9 @@ def load_model(snapshot: str, dev: torch.device, dtype, layers: int | None = Non
     return AutoModelForCausalLM.from_pretrained(snapshot, config=config, dtype=dtype).to(dev).eval()
 
 
-def parts_of(fn: dict, layer: int, read: str, dev, dtype, limit: int = 0):
+def parts_of(fn: dict, layer: int, dev, dtype):
     n = f"h.{layer}.mlp.function"
-    C = fn[f"{n}.U"].shape[0] if not limit else min(limit, fn[f"{n}.U"].shape[0])
-    U = fn[f"{n}.U"][:C].to(dev, dtype)
-    if read == "native":
-        assert f"{n}.R" in fn, f"--read native needs {n}.R (the native lift)"
-        V, b = fn[f"{n}.R"][:, :C].T.to(dev, dtype), torch.zeros(C, device=dev, dtype=dtype)
-    else:
-        V, b = fn[f"{n}.V"][:, :C].T.to(dev, dtype), fn[f"{n}.bias"][:C].to(dev, dtype)
-    return U, V, b  # V [C, d_in]
+    return fn[f"{n}.U"].to(dev, dtype), fn[f"{n}.V"].T.to(dev, dtype), fn[f"{n}.bias"].to(dev, dtype)  # U [C, d], V [C, d], b [C]
 
 
 @torch.no_grad()
@@ -124,7 +108,7 @@ def labels(args):
     torch.backends.cuda.matmul.allow_tf32 = False
     model = load_model(args.model, dev, torch.float32)
     layers_all = model.model.layers
-    hooks = [Edit(args.read) for _ in layers_all]
+    hooks = [Edit() for _ in layers_all]
     for layer, h in zip(layers_all, hooks):
         layer.mlp.register_forward_hook(h)
     fn = load_file(args.functions)
@@ -135,7 +119,7 @@ def labels(args):
     out.mkdir(parents=True, exist_ok=True)
     save_file({"rows": torch.arange(args.offset, args.offset + args.pool, dtype=torch.int64), "tokens": ids.to(torch.int32).cpu()}, str(out / "contexts.safetensors"))
     # Every part of each layer (the parts family removes all those active at p); the first `--limit` are asked about.
-    parts = {l: parts_of(fn, l, args.read, dev, torch.float32) for l in layers}
+    parts = {l: parts_of(fn, l, dev, torch.float32) for l in layers}
 
     # The clean pass: every part's activity on every pool row; its peak after the first token (the attention sink).
     peaks = {l: torch.empty(args.pool, parts[l][0].shape[0], device=dev) for l in layers}
@@ -224,7 +208,7 @@ def labels(args):
             rec["parts"] = torch.cat([torch.nn.functional.pad(x, (0, width - x.shape[1]), value=-1) for x in together]).reshape(C, K, width).to(torch.int32)
         save_file({k: v.contiguous() for k, v in rec.items()}, str(out / f"site_{tag}.safetensors"))
         meta = {"site": f"h.{l}.mlp.function", "layer": l, "subcomponents": C, "top": args.top, "random": args.random, "pool_offset": args.offset, "pool": args.pool,
-                "alphas": dict(ALPHAS), "amplify": dict(ALPHAS)["amplify"], "family": args.family, "read": args.read, "edit_from": 1 if args.family == "from" else None,
+                "alphas": dict(ALPHAS), "amplify": dict(ALPHAS)["amplify"], "family": args.family, "edit": "Patch::Part's", "edit_from": 1 if args.family == "from" else None,
                 "seconds": time.time() - started, "seed": args.seed, "functions": str(args.functions), "model": str(args.model), "model_layers": len(layers_all)}
         (out / f"site_{tag}.json").write_text(json.dumps(meta))
         print(json.dumps({"site": meta["site"], "parts": C, "seconds": round(meta["seconds"], 1), "median_effect_bits_ablate": float(rec["effect_ablate"].median())}), flush=True)
@@ -236,7 +220,7 @@ def parity(args):
     at the edited token, in bits, against the driver's."""
     dev, dtype = torch.device("cpu"), torch.float64
     model = load_model(args.model, dev, dtype, args.layers)
-    hooks = [Edit(args.read) for _ in model.model.layers]
+    hooks = [Edit() for _ in model.model.layers]
     for layer, h in zip(model.model.layers, hooks):
         layer.mlp.register_forward_hook(h)
     fn = load_file(args.functions)
@@ -250,7 +234,7 @@ def parity(args):
         n = f"h.{layer}.mlp.function"
         index = fn[f"{n}.index"].round().long().tolist()
         cols = [index.index(p[1]) for p in r["parts"]]
-        U, V, b = parts_of(fn, layer, args.read, dev, dtype)
+        U, V, b = parts_of(fn, layer, dev, dtype)
         ids = torch.from_numpy(windows[args.held_out + r["sequence"]].astype(np.int64))[None]
         p = r["position"]
         hook = hooks[layer]
@@ -288,7 +272,6 @@ def main():
     a.add_argument("--rows", type=int, default=64)
     a.add_argument("--seed", type=int, default=0)
     a.add_argument("--family", default="row", choices=("row", "from", "parts"))
-    a.add_argument("--read", default="transcoder", choices=("transcoder", "native"))
     p = sub.add_parser("parity")
     p.add_argument("--model", required=True)
     p.add_argument("--functions", required=True)
@@ -297,7 +280,6 @@ def main():
     p.add_argument("--held-out", type=int, required=True, help="the driver's settings held_out[0]: the windows row of its held-out sequence 0")
     p.add_argument("--layers", type=int, default=None, help="the driver's settings layers (M cut to its first K blocks)")
     p.add_argument("--records", required=True)
-    p.add_argument("--read", default="transcoder", choices=("transcoder", "native"))
     p.add_argument("--tolerance", type=float, default=1e-6)
     args = ap.parse_args()
     {"labels": labels, "parity": parity}[args.command](args)
