@@ -1004,12 +1004,15 @@ pub fn round(
                 return Err(error("a nonfinite removal objective"));
             }
             let removed_now = active - base.active.iter().filter(|a| **a).count();
-            let predicted = rest[..k].iter().map(|u| u.data).sum::<f64>() - groups.iter().map(|g| costs[*g]).sum::<f64>() + subset_change(removed_now + groups.len())?
-                - subset_change(removed_now)?;
+            let description = -groups.iter().map(|g| costs[*g]).sum::<f64>() + subset_change(removed_now + groups.len())? - subset_change(removed_now)?;
+            let predicted = rest[..k].iter().map(|u| u.data).sum::<f64>() + description;
+            // With the Gauss–Newton cross terms between the units, without compensation.
+            let roots: Vec<(usize, f64)> = rest[..k].iter().flat_map(|u| u.roots.iter().map(|r| (*r, 1.0 / u.roots.len() as f64))).collect();
+            let joint = curvature.joint(&roots) + description;
             let accepted = evaluation.complete && change <= 0.0;
             journal.write(json!({
                 "event": "proposal", "kind": kind, "units": k, "groups": groups, "layers": names(&groups),
-                "predicted_bits": predicted / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
+                "predicted_bits": predicted / LN_2, "joint_plain_bits": joint / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
                 "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(), "trial_seconds": trial_seconds,
             }))?;
             evaluations.push((groups.len(), change / LN_2));
@@ -1226,7 +1229,7 @@ mod tests {
     /// The removal estimates of `posterior` on the evidence ([`Curvature`]): per batch `b`, one
     /// forward pass at its sample ([`sample`] with key `b`), reversed for the divergence's
     /// gradient `g_b` and for a sampled-label draw `u_b`, and per group `g_b,G · θ_b,G` and
-    /// `(u_b,G · θ_b,G)²` over its live entries, the data term weighted by `weight`.
+    /// `u_b,G · θ_b,G` over its live entries, the data term weighted by `weight`.
     fn measured(ic: &mut Interchange, explanation: &Explanation, posterior: &Posterior, evidence: &[Evidence], weight: f64, rng: &mut StdRng) -> Curvature {
         use rand::RngExt;
         let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
@@ -1261,8 +1264,9 @@ mod tests {
                     .collect()
             };
             let slope: Vec<f64> = dots(&evaluation.gradient).iter().map(|s| weight * LN_2 * s).collect();
-            let form: Vec<f64> = dots(&factor.gradient).iter().map(|u| weight * u * u).collect();
-            curvature.add_batch(&slope, &form).expect("the batch");
+            // The data term weighted by `weight` has `√weight u_b` for its factor.
+            let dot: Vec<f64> = dots(&factor.gradient).iter().map(|u| weight.sqrt() * u).collect();
+            curvature.add_batch(&slope, &dot).expect("the batch");
         }
         curvature
     }

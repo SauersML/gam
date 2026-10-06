@@ -159,23 +159,24 @@
 //! alternates descending and removing; it stops when a round accepts nothing, which says the search
 //! found no removal, not that none exists.
 //!
-//! The removal search orders its proposals by each group's second-order removal effect on the
-//! objective it is accepted on: the change of the data term at the batches' own weight samples
-//! when the group's entries of each sample become exactly zero, less the description it saves.
-//! With `θ_b` the sample batch `b` is scored at, `g_b` the batch's data gradient there and `H_b` its
-//! Gauss–Newton matrix (the Hessian of `Σ KL(M_e ‖ P_e)` where `P_e`'s predictions equal `M_e`'s),
-//! the batch's change is `δ_bG = −g_b,G · θ_b,G + ½ θ_b,Gᵀ H_b θ_b,G`, and the estimate is its sum
-//! over the batches, `Σ_b δ_bG` ([`Curvature`]). Both are measured at `θ_b`, one forward pass per
-//! training batch reversed twice (`interchange::evaluate_labelled`): once for `g_b`, and once for a
-//! draw `u_b` of the gradient of `Σ log P_e(y)` with every `y` drawn from `P_e` itself, whose
+//! The removal search orders its proposals by each group's second-order removal effect: the change
+//! of the data term at weight samples of the posterior when the group's entries of each sample
+//! become exactly zero, less the description it saves. With `θ_b` batch `b`'s sample, `g_b` the
+//! batch's data gradient there and `H_b` its Gauss–Newton matrix (the Hessian of `Σ KL(M_e ‖ P_e)`
+//! where `P_e`'s predictions equal `M_e`'s), the batch's change is
+//! `δ_bG = −g_b,G · θ_b,G + ½ θ_b,Gᵀ H_b θ_b,G`, and the estimate is its sum over the batches,
+//! `Σ_b δ_bG` ([`Curvature`]). Both are measured at `θ_b`, one forward pass per training batch
+//! reversed twice (`interchange::evaluate_labelled`): once for `g_b`, and once for a draw `u_b` of
+//! the gradient of `Σ log P_e(y)` with every `y` drawn from `P_e` itself, whose
 //! `E[(u_b,G · θ_b,G)²] = θ_b,Gᵀ H_b θ_b,G`. Over the noise of `θ_b`, `E[δ_bG]` is to second order
 //! `−g_G · μ_G + ½ μ_Gᵀ H μ_G − ½ Σ_{j∈G} H_jj σ_j²` at the mean, the change of the expected data
-//! term; measured at the mean instead, the slope `g_G · μ_G` is that of another point than the one
-//! acceptance scores, and its error does not average out over the batches. The batches' spread of
-//! `δ_bG` is kept with the sum. The form `θ_Gᵀ H θ_G` keeps the couplings between a group's
-//! parameters (an output vector's direction against the downstream metric) that a diagonal
-//! curvature drops. A deletion is a finite step and the fit is not shown to be stationary, so the
-//! estimate orders proposals; the exact evaluation decides them.
+//! term. The samples are drawn on a noise stream of their own: acceptance scores other samples, so
+//! a removal ranked first because its estimate fell low on these draws is not also measured on them.
+//! Kept per batch, `u_b,G · θ_b,G` gives a set of groups its cross terms,
+//! `½ (Σ_G u_b,G · θ_b,G)²` ([`Curvature::joint`]). The form `θ_Gᵀ H θ_G` keeps the couplings
+//! between a group's parameters (an output vector's direction against the downstream metric) that a
+//! diagonal curvature drops. A deletion is a finite step and the fit is not shown to be stationary,
+//! so the estimate orders proposals; the exact evaluation decides them.
 //!
 //! # Evaluation
 //!
@@ -780,37 +781,64 @@ pub fn scoped(explanation: &Explanation, blocks: &[usize]) -> Result<Explanation
 // ------------------------------------------------------------------------------------- posterior
 
 /// Per prior group, the removal estimates over the batches of the fixed collection: with `θ_b` the
-/// weight sample batch `b` is scored at (the removal seeds'), `g_b` the data term's gradient there
+/// weight sample of batch `b` on the ranking's own noise stream, `g_b` the data term's gradient there
 /// in nats and `u_b` a draw of the sampled-label gradient there (`interchange::sampled_label`),
-/// each batch's second-order change of its data term when the group's entries of `θ_b` become
-/// zero, `δ_bG = −g_b,G · θ_b,G + ½ (u_b,G · θ_b,G)²` (module note): their sum over the batches
-/// and the sum of their squares.
+/// `s_bG = g_b,G · θ_b,G` and `d_bG = u_b,G · θ_b,G`, and each batch's second-order change of its
+/// data term when the group's entries of `θ_b` become zero, `δ_bG = −s_bG + ½ d_bG²` (module note):
+/// the sums of `δ_bG`, of its square and of `s_bG` over the batches, and every batch's `d_bG` (in
+/// float32), which give a set of groups its Gauss–Newton cross terms ([`Curvature::joint`]).
 #[derive(Clone, Debug)]
 pub struct Curvature {
     pub(crate) rise: Vec<f64>,
     pub(crate) square: Vec<f64>,
-    pub(crate) batches: usize,
+    pub(crate) slope: Vec<f64>,
+    pub(crate) dots: Vec<Vec<f32>>,
 }
 
 impl Curvature {
     /// No batches yet, for `groups` prior groups.
     #[must_use]
     pub fn new(groups: usize) -> Self {
-        Self { rise: vec![0.0; groups], square: vec![0.0; groups], batches: 0 }
+        Self { rise: vec![0.0; groups], square: vec![0.0; groups], slope: vec![0.0; groups], dots: Vec::new() }
     }
 
-    /// Adds one batch: per group `g_b,G · θ_b,G` in nats (`slope`) and `(u_b,G · θ_b,G)²` (`form`).
-    pub fn add_batch(&mut self, slope: &[f64], form: &[f64]) -> Result<(), String> {
-        if slope.len() != self.rise.len() || form.len() != self.rise.len() {
+    /// The batches added.
+    #[must_use]
+    pub fn batches(&self) -> usize {
+        self.dots.len()
+    }
+
+    /// Adds one batch: per group `s_bG` in nats (`slope`) and `d_bG` (`dot`).
+    pub fn add_batch(&mut self, slope: &[f64], dot: &[f64]) -> Result<(), String> {
+        if slope.len() != self.rise.len() || dot.len() != self.rise.len() {
             return Err("a batch of another explanation".into());
         }
-        for (g, (s, q)) in slope.iter().zip(form).enumerate() {
-            let change = -s + 0.5 * q;
+        for (g, (s, d)) in slope.iter().zip(dot).enumerate() {
+            let change = -s + 0.5 * d * d;
             self.rise[g] += change;
             self.square[g] += change * change;
+            self.slope[g] += s;
         }
-        self.batches += 1;
+        self.dots.push(dot.iter().map(|d| *d as f32).collect());
         Ok(())
+    }
+
+    /// The second-order change of the data term when `weights` (group, weight) are taken from
+    /// every batch's sample together, `Σ_b (−Σ_G w_G s_bG + ½ (Σ_G w_G d_bG)²)`: with unit weights,
+    /// the removal of the groups with the Gauss–Newton cross terms between them; a unit removed
+    /// through any of its `k` roots enters as each root with weight `1/k`.
+    #[must_use]
+    pub fn joint(&self, weights: &[(usize, f64)]) -> f64 {
+        let linear: f64 = weights.iter().map(|(g, w)| w * self.slope[*g]).sum();
+        let quadratic: f64 = self
+            .dots
+            .iter()
+            .map(|dots| {
+                let d: f64 = weights.iter().map(|(g, w)| w * f64::from(dots[*g])).sum();
+                d * d
+            })
+            .sum();
+        -linear + 0.5 * quadratic
     }
 
     /// Per group, the standard error of the summed estimate from the spread of its batches'
@@ -818,11 +846,11 @@ impl Curvature {
     /// than two batches).
     #[must_use]
     pub fn spread(&self) -> Vec<f64> {
-        let b = self.batches as f64;
+        let b = self.batches() as f64;
         self.rise
             .iter()
             .zip(&self.square)
-            .map(|(sum, square)| if self.batches < 2 { 0.0 } else { (b * (square - sum * sum / b).max(0.0) / (b - 1.0)).sqrt() })
+            .map(|(sum, square)| if self.batches() < 2 { 0.0 } else { (b * (square - sum * sum / b).max(0.0) / (b - 1.0)).sqrt() })
             .collect()
     }
 }
@@ -3165,15 +3193,20 @@ fn laplace_start(
     Ok(curvature.into_iter().map(|h| [Array2::zeros(h.dim()), h.clone(), Array2::zeros(h.dim())]).collect())
 }
 
-/// The removal estimates' [`Curvature`]: per training batch of the fixed collection, at the weight
-/// sample the batch is scored at under the removal seeds ([`expected_divergence`]), the data term's
+/// The noise stream of the removal estimates' weight samples: one no epoch draws (training takes
+/// `1, 2, …`, the removal's evaluations `0`), so a removal is accepted on samples its ranking did
+/// not see.
+const RANKING_STREAM: usize = usize::MAX;
+
+/// The removal estimates' [`Curvature`]: per training batch of the fixed collection, at the batch's
+/// weight sample on the noise stream `stream` (the fit's: [`RANKING_STREAM`]), the data term's
 /// gradient and one draw of the sampled-label gradient (module note), each batch's group sums made
 /// on the device (`DevicePosterior::add_removal`).
-fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings) -> Result<Curvature, String> {
-    let mut rng = StdRng::seed_from_u64(noise_seed(settings.seed, 0, draws.len()));
+fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings, stream: usize) -> Result<Curvature, String> {
+    let mut rng = StdRng::seed_from_u64(noise_seed(settings.seed, stream, draws.len()));
     let mut curvature = Curvature::new(posterior.group_count());
     for (b, draw) in draws.iter().enumerate() {
-        let key = noise_seed(settings.seed, 0, b);
+        let key = noise_seed(settings.seed, stream, b);
         posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
         let batch = draw.batch(sequences)?;
         let experiments = scorer.experiments(draw, sequences)?;
@@ -3286,7 +3319,7 @@ fn remove(
     let timed = Instant::now();
     let compensation = Compensation::new(&mut scorer.experiments, explanation, posterior, sequences, settings.batch_sequences)?;
     let compensated = timed.elapsed().as_secs_f64();
-    let curvature = removal_curvature(scorer, device_posterior, draws, sequences, settings)?;
+    let curvature = removal_curvature(scorer, device_posterior, draws, sequences, settings, RANKING_STREAM)?;
     log::info!("library removal setup: compensation Gram {compensated:.1} s, curvature {:.1} s", timed.elapsed().as_secs_f64() - compensated);
     let mut objective = |trial: &Posterior, accepted: Option<&Evaluation>| -> Result<Evaluation, String> {
         let rest = trial.description() + fixed;
@@ -3922,36 +3955,44 @@ mod tests {
 
     #[test]
     fn the_removal_estimate_predicts_a_small_removal_on_the_batches_samples() {
-        // One MLP output group with its means and deviations scaled by ε: removing it zeroes a
+        // Two MLP output groups with their means and deviations scaled by ε: removing them zeroes a
         // step of size ε at each batch's weight sample, and the estimate measured at those samples,
         // Σ_b (−g_b,G · θ_b,G + ½ (u_b,G · θ_b,G)²), predicts the change of the data term that
-        // acceptance scores on the same samples up to terms of relative size ε.
+        // acceptance scores on the same samples up to terms of relative size ε; for both groups
+        // together with the cross terms between them (`Curvature::joint`).
         let (native, layers, _, sequences) = tiny("library_curvature", "gelu");
         let explanation = explanation(&native, &layers).unwrap();
         let settings = settings();
         let mut posterior = Posterior::new(&explanation, 1000).unwrap();
-        let group = *explanation.layers[0].functions[1].last().unwrap();
+        let groups = [*explanation.layers[0].functions[1].last().unwrap(), *explanation.layers[0].functions[2].last().unwrap()];
         let epsilon: f64 = 1e-2;
         let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
-        for cell in &explanation.groups[group].cells {
-            let i = position[&cell.operator];
-            for &r in &cell.rows {
-                for c in cell.cols.clone() {
-                    posterior.mean[i][[r, c]] *= epsilon;
-                    posterior.log_sd[i][[r, c]] += epsilon.ln();
+        for group in groups {
+            for cell in &explanation.groups[group].cells {
+                let i = position[&cell.operator];
+                for &r in &cell.rows {
+                    for c in cell.cols.clone() {
+                        posterior.mean[i][[r, c]] *= epsilon;
+                        posterior.log_sd[i][[r, c]] += epsilon.ln();
+                    }
                 }
             }
         }
         let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let mut device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 1000.0, None, 0).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
-        let curvature = removal_curvature(&mut scorer, &device_posterior, &draws, &sequences, &settings).unwrap();
-        assert_eq!(curvature.batches, draws.len());
-        let predicted = posterior.removal_data(&curvature)[group];
+        // On the evaluation's own samples, where the estimate is of the change it scores.
+        let curvature = removal_curvature(&mut scorer, &device_posterior, &draws, &sequences, &settings, 0).unwrap();
+        assert_eq!(curvature.batches(), draws.len());
         let mut evaluate = |removed: &[usize]| expected_divergence(&mut scorer, &mut device_posterior, &posterior, &draws, &sequences, removed, &settings, None, None).unwrap().total();
-        let exact = evaluate(&[group]) - evaluate(&[]);
-        assert!(exact != 0.0 && (predicted - exact).abs() <= 0.1 * exact.abs(), "predicted {predicted:e} nats, exact {exact:e}");
-        assert!(curvature.spread()[group].is_finite());
+        let kept = evaluate(&[]);
+        let rise = posterior.removal_data(&curvature);
+        for (removed, predicted) in [(vec![groups[0]], rise[groups[0]]), (groups.to_vec(), curvature.joint(&[(groups[0], 1.0), (groups[1], 1.0)]))] {
+            let exact = evaluate(&removed) - kept;
+            assert!(exact != 0.0 && (predicted - exact).abs() <= 0.1 * exact.abs(), "{removed:?}: predicted {predicted:e} nats, exact {exact:e}");
+        }
+        assert!((curvature.joint(&[(groups[0], 1.0)]) - rise[groups[0]]).abs() <= 1e-6 * rise[groups[0]].abs());
+        assert!(curvature.spread()[groups[0]].is_finite());
     }
 
     #[test]

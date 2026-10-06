@@ -584,7 +584,7 @@ impl DevicePosterior {
     /// Adds one batch to `curvature` (`library_mdl`'s module note): with `θ` the weight sample
     /// [`DevicePosterior::sample_into`] draws under `key`, `g` the batch's data gradient at `θ` (per
     /// trainable operator by id, on the device), times `nats`, and `u` a draw of the Gauss–Newton
-    /// factor at `θ`, per group `g_G · θ_G` and `(u_G · θ_G)²` over the group's live entries,
+    /// factor at `θ`, per group `g_G · θ_G` and `u_G · θ_G` over the group's live entries,
     /// summed on the device and read as one row per group; an operator neither reaches adds
     /// nothing.
     pub fn add_removal(&self, (g, nats): (&BTreeMap<usize, Tensor>, f64), u: &BTreeMap<usize, Tensor>, key: u64, curvature: &mut Curvature) -> Result<(), String> {
@@ -606,8 +606,8 @@ impl DevicePosterior {
             }
         }
         let slope: Vec<f64> = self.wide.download(&slopes).map_err(error)?.column(1).iter().map(|s| nats * s).collect();
-        let form: Vec<f64> = self.wide.download(&forms).map_err(error)?.column(1).iter().map(|d| d * d).collect();
-        curvature.add_batch(&slope, &form)
+        let dot: Vec<f64> = self.wide.download(&forms).map_err(error)?.column(1).to_vec();
+        curvature.add_batch(&slope, &dot)
     }
 
     /// Rows for `steps` steps' code lengths ([`DevicePosterior::code_length_into`]) of a posterior
