@@ -2165,10 +2165,14 @@ impl Device {
     /// step uses the Gauss–Newton matrix in its place. The step is therefore IVON's step for the
     /// objective with that curvature, not for the exact one. With `N = step.tokens`, `v` the entry's
     /// group variance (`variance`, groups × 1), `δ = 1 / (N v)` the prior's precision per token and
-    /// `λ = h + δ` the total precision per token: `m ← β₁ m + (1 − β₁) g`, and IVON's update of the
-    /// total precision `λ ← λ (1 + x + ½ x²)` with `x = (1 − β₂)(ĥ + δ − λ) / λ`, which keeps `λ`
-    /// positive for any estimate, written in `h` as
-    /// `h ← β₂ h + (1 − β₂) ĥ + ½ (1 − β₂)² (h − ĥ)² / (h + δ)`;
+    /// `λ = h + δ` the total precision per token: `m ← β₁ m + (1 − β₁) g`, and the curvature the
+    /// running average `h ← β₂ h + (1 − β₂) ĥ` of the estimates, unbiased for the Gauss–Newton
+    /// diagonal. IVON's update `λ ← λ (1 + x + ½ x²)`, `x = (1 − β₂)(ĥ + δ − λ) / λ`, adds
+    /// `½ (1 − β₂)² (ĥ − h)² / (h + δ)` to keep `λ` positive for a Hessian estimate of either sign;
+    /// a Gauss–Newton estimate is never negative, and that term's mean `½ (1 − β₂) Var(ĥ) / (h + δ)`
+    /// raised `h` without bound under one batch's heavy-tailed `ĥ = u² / n` (vpd4l, `N = 2^16`:
+    /// one batch's outlying estimate multiplied `h` and the description rose from 25 to 152 bits
+    /// per scored token in one epoch);
     /// `μ ← μ − α ĝ / (h + δ)`, the move held within one posterior standard deviation `σ` (a
     /// trust region), and `s = −½ ln(N (h + δ))`. `ĝ` is the estimate of the full gradient
     /// `ḡ + δ μ` per token (the data term's mean gradient `ḡ` plus the prior's exact pull) filtered
@@ -2186,9 +2190,9 @@ impl Device {
     /// contain. Most of a sampled gradient is the other weights' noise carried through the
     /// Hessian's off-diagonal terms; the unfiltered momentum walked the means away from `M` and
     /// raised `F`. Before the gradients give a spread (`n ≤ 1`: the first step, or `β₁ = 0`), `V`
-    /// is unknown and `ĝ = 0`: the mean stays. Under the approximation `ĥ ≥ 0`, so an `h ≥ 0` stays nonnegative
-    /// (`β₂ h + (1 − β₂) ĥ ≥ 0` and the last term is nonnegative; rounding keeps it, since
-    /// `|fl(ĥ − h)| ≤ h` when `ĥ < h`), and `σ² = 1 / (N (h + δ)) ≤ v`: the standard deviation at
+    /// is unknown and `ĝ = 0`: the mean stays. Under the approximation `ĥ ≥ 0`, so an `h ≥ 0` stays
+    /// nonnegative (`β₂ h + (1 − β₂) ĥ ≥ 0`; rounding keeps it, since `|fl(ĥ − h)| ≤ h` when
+    /// `ĥ < h`), and `σ² = 1 / (N (h + δ)) ≤ v`: the standard deviation at
     /// which the approximated `N E_q[ℓ] + KL(q ‖ p)` is stationary for the curvature `h` and the
     /// variance `v`. Both depend on the posterior (`h` is an expectation under `q`, `v` is the
     /// empirical-Bayes variance), so the exact stationary point solves implicit equations; this
@@ -2243,7 +2247,7 @@ impl Device {
                     let full = m + delta * mu;
                     let signal = if noise_scale >= 0.0 && full * full > noise { full - noise / full } else { 0.0 };
                     let (h, d) = (hs[i], curvature - hs[i]);
-                    hs[i] = h + (1.0 - b2) * d + 0.5 * (1.0 - b2) * (1.0 - b2) * d * d / (h + delta);
+                    hs[i] = h + (1.0 - b2) * d;
                     means[i] = mu - (step.rate * signal / (hs[i] + delta)).clamp(-sd, sd);
                     log_sds[i] = -0.5 * (step.tokens * (hs[i] + delta)).ln();
                     totals[3 * g] += 1.0;
@@ -3966,7 +3970,7 @@ __device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chun
         T noise = (q > (T)0 ? q : (T)0) * v1, full = m + delta * mu;
         T signal = known && full * full > noise ? full - noise / full : (T)0;
         T h = curvature[i], d = square * ui * ui - h;
-        T h1 = h + o2 * d + (T)0.5 * o2 * o2 * d * d / (h + delta);
+        T h1 = h + o2 * d;
         T move = alpha * signal / (h1 + delta);
         mu -= move > sd ? sd : (move < -sd ? -sd : move);
         T s = (T)(-0.5 * log(tokens * ((double)h1 + (double)delta)));
@@ -4016,7 +4020,7 @@ __device__ void posterior_ivon_mixed(u64 n, u64 cols, unsigned int axis, u64 chu
         float m = m1 * k1, noise = fmaxf(p1 * k1 - m * m, 0.0f) * v1, full = m + delta * mu;
         float signal = known && full * full > noise ? full - noise / full : 0.0f;
         float h = curvature[i], d = square * ui * ui - h;
-        float h1 = h + o2 * d + 0.5f * o2 * o2 * d * d / (h + delta);
+        float h1 = h + o2 * d;
         mu -= fminf(fmaxf(alpha * signal / (h1 + delta), -sd), sd);
         float s = (float)(-0.5 * log(tokens * ((double)h1 + (double)delta)));
         entry_store(momentum + i, m1); power[i] = p1; curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
@@ -6921,7 +6925,7 @@ inline void ivon_entry(uint i, uint g, device const float* gradient, device cons
     float m = m1 / p.c1, noise = max(p1 / p.c1 - m * m, 0.0f) * p.noise, full = m + delta * mu;
     float signal = p.noise >= 0.0f && full * full > noise ? full - noise / full : 0.0f;
     float o2 = 1.0f - p.beta2, h = curvature[i], d = p.fscale * ui * ui - h;
-    float h1 = h + o2 * d + 0.5f * o2 * o2 * d * d / (h + delta);
+    float h1 = h + o2 * d;
     mu -= clamp(p.rate * signal / (h1 + delta), -sd, sd);
     float s = -0.5f * log(p.tokens * (h1 + delta));
     momentum[i] = m1; power[i] = p1; curvature[i] = h1; mean[i] = mu; log_sd[i] = s;

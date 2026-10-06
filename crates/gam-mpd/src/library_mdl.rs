@@ -3892,7 +3892,7 @@ mod tests {
                 let sd = posterior.log_sd[i][[r, c]].exp();
                 let h0 = (1.0 / (tokens * sd * sd) - delta).max(0.0);
                 let d = square * factors[i][[r, c]] * factors[i][[r, c]] - h0;
-                let h = h0 + (1.0 - ivon.beta2) * d + 0.5 * (1.0 - ivon.beta2).powi(2) * d * d / (h0 + delta);
+                let h = h0 + (1.0 - ivon.beta2) * d;
                 // A first step's momentum is one gradient, which gives no spread: the gradient's
                 // noise is unknown, the filtered gradient is zero and the mean stays.
                 reference.log_sd[i][[r, c]] = -0.5 * (tokens * (h + delta)).ln();
@@ -4021,7 +4021,7 @@ mod tests {
                 let sd = posterior.log_sd[i][[r, c]].exp();
                 let h0 = (1.0 / (tokens * sd * sd) - delta).max(0.0);
                 let d = square * factor[[r, c]] * factor[[r, c]] - h0;
-                let h = h0 + (1.0 - ivon.beta2) * d + 0.5 * (1.0 - ivon.beta2).powi(2) * d * d / (h0 + delta);
+                let h = h0 + (1.0 - ivon.beta2) * d;
                 // A first step's momentum is one gradient, which gives no spread: the gradient's
                 // noise is unknown, the filtered gradient is zero and the mean stays.
                 reference.log_sd[i][[r, c]] = -0.5 * (tokens * (h + delta)).ln();

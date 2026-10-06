@@ -110,7 +110,7 @@ fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 
         let signal = if full * full > noise { full - noise / full } else { 0.0 };
         let estimate = c.step.factor_scale * c.factor[at] * c.factor[at];
         let (h, d) = (moments[1][at], estimate - moments[1][at]);
-        let curvature = h + (1.0 - b2) * d + 0.5 * (1.0 - b2) * (1.0 - b2) * d * d / (h + delta);
+        let curvature = h + (1.0 - b2) * d;
         moments[0][at] = momentum;
         moments[1][at] = curvature;
         moments[2][at] = power;
