@@ -3433,8 +3433,8 @@ pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Exp
 }
 
 /// The posterior a fresh fit starts from on `sequences` under `settings` ([`fit`]): the
-/// unit-information posterior at `M`'s values, its operators' rotations, and the Laplace start's
-/// deviations from one sampled-label pass (`laplace_start`).
+/// unit-information posterior at `M`'s values, its operators' rotations with `Settings::rotated`,
+/// and the Laplace start's deviations from one sampled-label pass (`laplace_start`).
 pub fn start_posterior(device: &Device, native: &OperatorProgram, explanation: &Explanation, sequences: &[Vec<u32>], settings: &Settings) -> Result<Posterior, String> {
     settings.validate()?;
     let length = sequences.first().map_or(0, Vec::len);
@@ -3445,7 +3445,9 @@ pub fn start_posterior(device: &Device, native: &OperatorProgram, explanation: &
         tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
     }
     let mut posterior = Posterior::new(explanation, tokens)?;
-    posterior.rotations = rotations(&mut scorer, explanation, &posterior, sequences, settings)?;
+    if settings.rotated {
+        posterior.rotations = rotations(&mut scorer, explanation, &posterior, sequences, settings)?;
+    }
     let device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, None, 0)?;
     laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens)?;
     Ok(posterior)
