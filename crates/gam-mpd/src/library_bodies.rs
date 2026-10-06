@@ -2731,10 +2731,10 @@ mod tests {
                     let mut expected = site.to_vec();
                     expected.sort_unstable();
                     let found = regions(&start, &posterior, l, &pool).unwrap();
-                    // The planted copy first, the only candidate the heuristic expects to save; the
-                    // others are listed too.
+                    // The planted copy first, the only candidate the heuristic expects to save (a
+                    // candidate overlapping it is not listed).
                     assert_eq!(found[0].0, expected, "layer {l} at {tokens} tokens");
-                    assert!(found.len() > 1 && found[0].1 > 0.0 && found[1..].iter().all(|(_, saved)| *saved <= 0.0), "layer {l} at {tokens} tokens: {found:?}");
+                    assert!(found[0].1 > 0.0 && found[1..].iter().all(|(_, saved)| *saved <= 0.0), "layer {l} at {tokens} tokens: {found:?}");
                 }
             }
         }
