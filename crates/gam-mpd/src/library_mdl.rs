@@ -4700,7 +4700,8 @@ mod tests {
     /// A resumed fit is the uninterrupted one bit for bit also where the step has moved IVON's
     /// iterate (the tiny fit above stops before it moves: fewer than `RATIO_DRAWS` draws) and on a
     /// transcoder block (ReLU features with fixed biases, `M`'s MLP at each sequence's first
-    /// token through its `Node::Select`), on the host and on the accelerator when there is one:
+    /// token through its `Node::Select`) whose experiments include edits of its parts (every
+    /// family of `Settings::families`), on the host and on the accelerator when there is one:
     /// eight epochs of the tiny Qwen3 decoder with layer 1's MLP 64 transcoder features, stopped
     /// in the sixth epoch's second step after the iterate has moved, resume to the uninterrupted
     /// fit's final checkpoint (means, deviations, IVON's state, the iterate and the steps its
@@ -4721,7 +4722,8 @@ mod tests {
         crate::test_support::transcoder_file(&full, 64, 8, 3);
         crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..64).collect::<Vec<_>>(), &kept_path).unwrap();
         let explanation = explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
-        let settings = Settings { epochs: Some(8), ..settings() };
+        use interchange::Family;
+        let settings = Settings { epochs: Some(8), families: vec![Family::Read, Family::RemovePart, Family::AmplifyPart], ..settings() };
         let (train, held) = sequences.split_at(4);
         let batches = (train.len() / settings.batch_sequences) as u64;
         let groups = explanation.groups.len();
