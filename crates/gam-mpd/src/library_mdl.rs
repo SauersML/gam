@@ -1314,20 +1314,6 @@ pub struct Settings {
     pub numeric_bytes: usize,
     /// Rows of vocabulary logits formed at once.
     pub head_tile_rows: usize,
-    /// The half-factor arm: a training step draws the Gauss–Newton factor from its first
-    /// antithetic half's experiments alone (`antithetic_step`), with the curvature estimate per
-    /// token of those tokens. A draw's squared factor `u ⊙ u` has a relative standard deviation
-    /// near √2 per entry however many tokens `u` sums (each entry of `u` is a sum of independent
-    /// zero-mean terms, close to normal), so half the tokens give an estimate of about the same
-    /// precision, for half the factor pass; the step scales it by the step's scored tokens over
-    /// the factor's. The A/B's outcome deletes this field.
-    #[serde(default)]
-    pub half_factor: bool,
-    /// The one-sample arm: a training step scores all its experiments at the one weight sample of
-    /// its key, with no antithetic halves (`antithetic_step`, 24dd28d270). The A/B's outcome
-    /// deletes this field.
-    #[serde(default)]
-    pub one_sample: bool,
     /// The rotated arm, off by default: the posterior's noise along the eigenvectors of each
     /// operator's input second moment (`rotations`, f80fd69565) in place of its own axes. Its A/B
     /// (fitperf-arms-ab: vpd4l, N = 2^20, RTX 4090, 3 epochs) measured F after epoch 2 at 24.99e6
@@ -1346,8 +1332,8 @@ pub struct Settings {
 /// [`Settings`] as configs and checkpoints hold them, unknown keys refused, and the keys of steps
 /// the fit no longer has accepted and dropped: `rate` (IVON's fixed fraction of the Newton step,
 /// replaced by the measured line step), `trust_rate`, `line_search`, `split_filter`,
-/// `deterministic` (the 2^16 and 2^24 A/B arms) and `decoder`, so that configs and checkpoints
-/// written before still read.
+/// `deterministic` (the 2^16 and 2^24 A/B arms), `decoder`, `half_factor` (now the step's) and
+/// `one_sample`, so that configs and checkpoints written before still read.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettingsRecord {
@@ -1356,10 +1342,6 @@ struct SettingsRecord {
     seed: u64,
     numeric_bytes: usize,
     head_tile_rows: usize,
-    #[serde(default)]
-    half_factor: bool,
-    #[serde(default)]
-    one_sample: bool,
     #[serde(default)]
     rotated: bool,
     #[serde(default)]
@@ -1376,11 +1358,15 @@ struct SettingsRecord {
     deterministic: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     decoder: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    half_factor: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    one_sample: Option<serde::de::IgnoredAny>,
 }
 
 impl From<SettingsRecord> for Settings {
     fn from(r: SettingsRecord) -> Self {
-        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some())];
+        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some()), ("half_factor", r.half_factor.is_some()), ("one_sample", r.one_sample.is_some())];
         for (key, present) in retired {
             if present {
                 log::info!("library settings: the retired key `{key}` is ignored");
@@ -1392,8 +1378,6 @@ impl From<SettingsRecord> for Settings {
             seed: r.seed,
             numeric_bytes: r.numeric_bytes,
             head_tile_rows: r.head_tile_rows,
-            half_factor: r.half_factor,
-            one_sample: r.one_sample,
             rotated: r.rotated,
             epochs: r.epochs,
         }
@@ -1846,48 +1830,45 @@ fn training_key(seed: u64, batch: usize) -> u64 {
 
 /// A training step's scoring with antithetic weight noise inside the step: the batch's bases split
 /// in two, the first half's experiments scored at the weight sample of `key` and the second half's
-/// at its negation (`gam_gpu::tensor::ANTITHETIC`: `ε` and `−ε`), with the gradient and the
-/// Gauss–Newton factor summed over both. Each half's sample is one of the posterior, so the step's
-/// estimate of `F` and of its gradient keep their expectations; the gradient's term linear in the
-/// noise is `(H_A − H_B) σ ε` over the halves `A` and `B` rather than `(H_A + H_B) σ ε`, which
-/// cancels within the step, where IVON's noise filter measures what remains. The products are one
-/// scoring's of the whole batch. A batch of one base is scored at the sample of `key` alone. With
-/// `half_factor` (`Settings::half_factor`) the factor is the first half's alone; with `one_sample`
-/// (`Settings::one_sample`) every experiment is scored at the sample of `key`.
+/// at its negation (`gam_gpu::tensor::ANTITHETIC`: `ε` and `−ε`), with the gradients summed over
+/// both. Each half's sample is one of the posterior, so the step's estimate of `F` and of its
+/// gradient keep their expectations; the gradient's term linear in the noise is
+/// `(H_A − H_B) σ ε` over the halves `A` and `B` rather than `(H_A + H_B) σ ε`, which cancels
+/// within the step, where IVON's noise filter measures what remains. The products are one
+/// scoring's of the whole batch. A batch of one base is scored at the sample of `key` alone.
+///
+/// The Gauss–Newton factor is the first half's alone, its curvature estimate per token of the
+/// tokens it sums. Each entry of a draw `u` is a sum of independent zero-mean terms, one per
+/// token, close to normal, so `u_i²` has a relative standard deviation near √2 however many tokens
+/// it sums: half the tokens estimate the curvature about as precisely, for half the factor pass.
+/// Its A/B (fitperf-halffactor-ab2: vpd4l, N = 2^20, RTX 4090, 3 epochs, seeds 1-2) measured F
+/// after epoch 2 at 25.45e6 and 24.09e6 bits against 25.73e6 and 24.81e6 with both halves'
+/// factors, and 7% less wall time per step.
 /// Returns the experiments in the order of their bits.
 fn antithetic_step(
     scorer: &mut Scorer,
     (device, device_posterior): (&Device, &DevicePosterior),
     batch: &Batch,
     experiments: Vec<Experiment>,
-    (key, half_factor, one_sample): (u64, bool, bool),
+    key: u64,
 ) -> Result<(Vec<Experiment>, Vec<Vec<f64>>, BTreeMap<usize, Tensor>, interchange::Factor), String> {
     let half = batch.base.len() / 2;
     let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.into_iter().partition(|e| e.base < half);
-    if one_sample || first.is_empty() || second.is_empty() {
+    if first.is_empty() || second.is_empty() {
         let all: Vec<Experiment> = first.into_iter().chain(second).collect();
         let (bits, gradients, factor) = scorer.score_device(device_posterior, batch, &all, Some(key), (true, true))?;
         return Ok((all, bits, gradients, factor.ok_or("no Gauss–Newton factor")?));
     }
     let (mut bits, mut gradients, factor) = scorer.score_device(device_posterior, batch, &first, Some(key), (true, true))?;
-    let mut factor = factor.ok_or("no Gauss–Newton factor")?;
-    // With `Settings::half_factor` the second half draws no factor.
-    let (other_bits, other_gradients, other_factor) = scorer.score_device(device_posterior, batch, &second, Some(key ^ gam_gpu::tensor::ANTITHETIC), (true, !half_factor))?;
-    let add = |total: &mut BTreeMap<usize, Tensor>, more: BTreeMap<usize, Tensor>| -> Result<(), String> {
-        for (op, g) in more {
-            match total.get_mut(&op) {
-                Some(sum) => device.axpy(sum, 1.0, &g).map_err(error)?,
-                None => {
-                    total.insert(op, g);
-                }
+    let factor = factor.ok_or("no Gauss–Newton factor")?;
+    let (other_bits, other_gradients, _) = scorer.score_device(device_posterior, batch, &second, Some(key ^ gam_gpu::tensor::ANTITHETIC), (true, false))?;
+    for (op, g) in other_gradients {
+        match gradients.get_mut(&op) {
+            Some(sum) => device.axpy(sum, 1.0, &g).map_err(error)?,
+            None => {
+                gradients.insert(op, g);
             }
         }
-        Ok(())
-    };
-    add(&mut gradients, other_gradients)?;
-    if let Some(other) = other_factor {
-        add(&mut factor.gradient, other.gradient)?;
-        factor.tokens += other.tokens;
     }
     bits.extend(other_bits);
     Ok((first.into_iter().chain(second).collect(), bits, gradients, factor))
@@ -1895,19 +1876,19 @@ fn antithetic_step(
 
 /// A line step's measurement: the bits of `experiments` on `batch` at the iterate's weight samples
 /// of `key`, as [`antithetic_step`] draws them (the first half of the bases at `key`, the second
-/// at its negation, or all at `key` with `one_sample`), with no gradient, at `η = 0, η₀, 2η₀`
+/// at its negation), with no gradient, at `η = 0, η₀, 2η₀`
 /// along the pending step's direction (`DevicePosterior::place_line`, `finish_line`). `M`'s
 /// targets are made once per half for the three.
 fn line_measurement(
     scorer: &mut Scorer,
     posterior: &mut DevicePosterior,
     (batch, experiments): (&Batch, &[Experiment]),
-    (key, one_sample): (u64, bool),
+    key: u64,
     trial: f64,
 ) -> Result<[f64; 3], String> {
     let half = batch.base.len() / 2;
     let (first, second): (Vec<Experiment>, Vec<Experiment>) = experiments.iter().cloned().partition(|e| e.base < half);
-    let halves = if one_sample || first.is_empty() || second.is_empty() { vec![(experiments.to_vec(), key)] } else { vec![(first, key), (second, key ^ gam_gpu::tensor::ANTITHETIC)] };
+    let halves = if first.is_empty() || second.is_empty() { vec![(experiments.to_vec(), key)] } else { vec![(first, key), (second, key ^ gam_gpu::tensor::ANTITHETIC)] };
     let targets = halves.iter().map(|(part, _)| scorer.experiments.targets(batch, part)).collect::<Result<Vec<_>, _>>()?;
     let mut values = [0.0; 3];
     for (k, value) in values.iter_mut().enumerate() {
@@ -3071,7 +3052,7 @@ pub fn fit_from(
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
             let key = training_key(settings.seed, b);
-            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, (key, settings.half_factor, settings.one_sample))?;
+            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key)?;
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
@@ -3111,7 +3092,7 @@ pub fn fit_from(
             priors.push(prior_nats);
             progress.step += 1;
             // The factor's scale: its square estimates the curvature per token of the tokens it
-            // sums (all the step's but with `Settings::half_factor`).
+            // sums (the first antithetic half's, `antithetic_step`).
             let factor_weight = weight * scored as f64 / factor.tokens as f64;
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &ivon)?;
             if let Some(trial) = device_posterior.line_trial() {
@@ -3119,7 +3100,7 @@ pub fn fit_from(
                 // 2η₀ (`DevicePosterior::finish_line`).
                 let other = (b + 1) % draws.len();
                 let (other_batch, other_experiments) = (draws[other].batch(sequences)?, scorer.experiments(&draws[other], sequences)?);
-                let bits = line_measurement(&mut scorer, &mut device_posterior, (&other_batch, &other_experiments), (training_key(settings.seed, other), settings.one_sample), trial)?;
+                let bits = line_measurement(&mut scorer, &mut device_posterior, (&other_batch, &other_experiments), training_key(settings.seed, other), trial)?;
                 let line = device_posterior.finish_line(bits.map(|b| weight * LN_2 * b), ivon.beta2)?;
                 log::info!(
                     "library line step {epoch}.{b}: η {:.4e} (trial {trial:.4e}); data slope down d per token: measured {:.4e}, the step's own gradient {:.4e}; data curvature along d: measured {:.4e}, one Gauss–Newton draw {:.4e}, diagonal Σ h d² {:.4e}",
@@ -4031,8 +4012,6 @@ mod tests {
             seed: 3,
             numeric_bytes: 1 << 26,
             head_tile_rows: 64,
-            half_factor: false,
-            one_sample: false,
             rotated: false,
             epochs: None,
         }
@@ -4197,7 +4176,7 @@ mod tests {
             for (b, draw) in draws.iter().enumerate() {
                 let batch = draw.batch(&sequences).unwrap();
                 let experiments = scorer.experiments(draw, &sequences).unwrap();
-                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, (training_key(settings.seed, b), settings.half_factor, settings.one_sample)).unwrap();
+                let (_, bits, _, _) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, training_key(settings.seed, b)).unwrap();
                 estimates.push(bits.iter().flatten().sum::<f64>());
             }
             estimates
