@@ -744,28 +744,3 @@ fn column_reads_and_writes_agree_with_the_host() {
         }
     }
 }
-
-/// The seeded sweep (`head_log_partition_seeded`, CUDA f32): its log partitions are the f32 sweep's
-/// bit for bit, its expected rows within bfloat16 rounding of the f32 sweep's (each term `π e` with
-/// both rounded, so within `2^-7 max |e|`), and its probe within `2^-6` of the f32 probe's norm.
-#[test]
-fn a_seeded_sweep_keeps_the_partitions_and_rounds_the_seeds() {
-    let Some(wide) = accelerator().filter(|_| cfg!(target_os = "linux")) else { return };
-    let d = wide.with_storage(gam_gpu::tensor::Storage::F32).expect("CUDA holds f32");
-    let (rows, classes, width) = (37, 3001, 24);
-    let single = |m: Array2<f64>| m.mapv(|v| f64::from(v as f32));
-    let head_values = single(matrix(classes, width, 42, 0.5));
-    let (hidden, head) = (up(&d, &single(matrix(rows, width, 41, 1.0))), up(&d, &head_values));
-    let half = d.bf16_copy(&head).unwrap();
-    let (mut expected, mut probed) = (d.zeros(rows, width).unwrap(), d.zeros(rows, width).unwrap());
-    let partitions = d.head_log_partition_probed(&hidden, (&head, false), None, &mut expected, (7, &mut probed), Arithmetic::F32).unwrap();
-    let (mut seeded_expected, mut seeded_probe) = (d.zeros(rows, width).unwrap(), d.zeros(rows, width).unwrap());
-    let seeded = d.head_log_partition_seeded(&hidden, (&head, &half), None, &mut seeded_expected, Some((7, &mut seeded_probe)), Arithmetic::F32).unwrap();
-    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-    assert_eq!(bits(&seeded), bits(&partitions), "the log partitions");
-    let largest = head_values.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-    assert_within("seeded expected rows", &down(&d, &seeded_expected), &down(&d, &expected), |_, _| 2f64.powi(-7) * largest);
-    let (a, b) = (down(&d, &seeded_probe), down(&d, &probed));
-    let norm = |m: &Array2<f64>| m.iter().map(|v| v * v).sum::<f64>().sqrt();
-    assert!(norm(&(&a - &b)) <= 2f64.powi(-6) * norm(&b), "seeded probe off by {} of {}", norm(&(&a - &b)), norm(&b));
-}

@@ -1968,7 +1968,7 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
 /// 0/1/2 at 44.10/29.00/24.15 and 44.78/29.78/23.21 M bits with the data term's reverse in
 /// bfloat16, against 45.04/30.75/24.99 and 43.37/29.51/25.03 in f32, and 0.1231 s per step against
 /// 0.1315.
-fn factor_arithmetic(d: &Device, arithmetic: Arithmetic) -> Arithmetic {
+pub(crate) fn factor_arithmetic(d: &Device, arithmetic: Arithmetic) -> Arithmetic {
     if d.storage() == Storage::F32 && d.with_storage(Storage::Bf16).is_ok() { Arithmetic::Bf16 } else { arithmetic }
 }
 
@@ -2949,14 +2949,6 @@ impl Interchange {
     /// otherwise repeated at every scoring.
     pub fn keep_targets(&mut self, governor: &MemoryGovernor) {
         *self.kept.get_mut() = Some(TargetStore { governor: governor.clone(), batches: HashMap::new(), disk: DiskTargets::new() });
-    }
-
-    /// The head sweep forms the reverse passes' seeds in bfloat16 against a bfloat16 copy of the head
-    /// from now on (`library_mdl::Settings::seed_bf16`).
-    pub fn set_seed_bf16(&mut self) -> Result<(), String> {
-        let half = self.m.device().bf16_copy(&self.head.resident.embedding).map_err(error)?;
-        self.head.resident.seed_half = Some(half);
-        Ok(())
     }
 
     /// `P`'s program, so that a fit writes each weight sample into its resident parameters.

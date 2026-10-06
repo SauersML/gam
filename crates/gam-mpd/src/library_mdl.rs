@@ -233,7 +233,7 @@ use crate::{
     },
     run_check::{LayerNodes, head_projection},
 };
-use gam_gpu::tensor::{Arithmetic, Device, Op, Storage, Tensor};
+use gam_gpu::tensor::{Device, Op, Storage, Tensor};
 use gam_runtime::warm_start::Fingerprinter;
 use ndarray::Array2;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -1393,19 +1393,6 @@ pub struct Settings {
     /// `interchange::Interchange::draw_ops`). Empty (the default) is `read` alone.
     #[serde(default)]
     pub families: Vec<interchange::Family>,
-    /// The arm whose head sweep forms the reverse passes' seeds (`Σ π e` and the Fisher probe's
-    /// pull-back) in bfloat16 against a bfloat16 copy of the head, as the reverse passes run
-    /// (`interchange::factor_arithmetic`); the log partitions, and so `F`, stay f32. Off by default;
-    /// its A/B decides.
-    #[serde(default)]
-    pub seed_bf16: bool,
-    /// The arm whose training steps evaluate `P` (its forward and its head's logits) in bfloat16
-    /// (CUDA), the gradient's reverse passes in bfloat16 as always. Every evaluation without a
-    /// gradient stays in f32: the snapshot estimates the stop and the best epoch are decided on,
-    /// held-out scoring and removal comparisons. An epoch's running estimates (`Epoch::estimates`,
-    /// `objective_bits`) are the steps' own, so in bfloat16. Off by default; its A/B decides.
-    #[serde(default)]
-    pub train_bf16: bool,
 }
 
 /// [`Settings`] as configs and checkpoints hold them, unknown keys refused, and the keys of steps
@@ -1413,9 +1400,11 @@ pub struct Settings {
 /// replaced by the line step), `trust_rate`, `line_search`, `split_filter`,
 /// `deterministic` (the 2^16 and 2^24 A/B arms), `decoder`, `half_factor` (now the step's),
 /// `one_sample`, `rotated` (the rotated posterior of f80fd69565, which its A/B in 1a8361c2c8
-/// retired), and `cross_fit` and `full_antithetic` (4948bbc723's cross-fitted mean step and
+/// retired), `cross_fit` and `full_antithetic` (4948bbc723's cross-fitted mean step and
 /// 5759e6a350's scoring of the whole batch at both antithetic samples, which their paired A/Bs
-/// retired), so that configs and checkpoints written before still read.
+/// retired), and `seed_bf16` and `train_bf16` (the bfloat16 arms of fitperf-seedab: every
+/// evaluation with a gradient now runs in the reverse passes' arithmetic, `Scorer::reversed`), so
+/// that configs and checkpoints written before still read.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettingsRecord {
@@ -1438,9 +1427,9 @@ struct SettingsRecord {
     #[serde(default)]
     full_antithetic: Option<serde::de::IgnoredAny>,
     #[serde(default)]
-    seed_bf16: bool,
+    seed_bf16: Option<serde::de::IgnoredAny>,
     #[serde(default)]
-    train_bf16: bool,
+    train_bf16: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     cross_fit: Option<serde::de::IgnoredAny>,
     #[serde(default)]
@@ -1465,7 +1454,7 @@ struct SettingsRecord {
 
 impl From<SettingsRecord> for Settings {
     fn from(r: SettingsRecord) -> Self {
-        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some()), ("preconditioned", r.preconditioned.is_some()), ("half_factor", r.half_factor.is_some()), ("one_sample", r.one_sample.is_some()), ("rotated", r.rotated.is_some()), ("beta1", r.beta1.is_some()), ("epoch_ratio", r.epoch_ratio.is_some()), ("momentum_rule", r.momentum_rule.is_some()), ("cross_fit", r.cross_fit.is_some()), ("full_antithetic", r.full_antithetic.is_some())];
+        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some()), ("preconditioned", r.preconditioned.is_some()), ("half_factor", r.half_factor.is_some()), ("one_sample", r.one_sample.is_some()), ("rotated", r.rotated.is_some()), ("beta1", r.beta1.is_some()), ("epoch_ratio", r.epoch_ratio.is_some()), ("momentum_rule", r.momentum_rule.is_some()), ("cross_fit", r.cross_fit.is_some()), ("full_antithetic", r.full_antithetic.is_some()), ("seed_bf16", r.seed_bf16.is_some()), ("train_bf16", r.train_bf16.is_some())];
         for (key, present) in retired {
             if present {
                 log::info!("library settings: the retired key `{key}` is ignored");
@@ -1478,8 +1467,6 @@ impl From<SettingsRecord> for Settings {
             head_tile_rows: r.head_tile_rows,
             epochs: r.epochs,
             families: r.families,
-            seed_bf16: r.seed_bf16,
-            train_bf16: r.train_bf16,
         }
     }
 }
@@ -1840,11 +1827,30 @@ struct Scorer {
     /// Each batch's drawn edits (by its seed and bases), drawn once: a draw runs `M` on the batch
     /// to find the parts firing there, and a fit asks for a batch's experiments many times.
     edits: std::cell::RefCell<BTreeMap<(u64, Vec<usize>), Vec<(usize, Patch, usize)>>>,
-    /// A training step's evaluation runs `P` in bfloat16 (`Settings::train_bf16`).
-    train_bf16: bool,
 }
 
 impl Scorer {
+    /// `f` on the experiments with `P` evaluating, its forward and its head's logits, in the reverse
+    /// passes' arithmetic (`interchange::factor_arithmetic`: bfloat16 on CUDA in f32), `P`'s own
+    /// restored after, error or not. Every evaluation of `P` with a gradient or a Gauss–Newton draw
+    /// (a training step, the Laplace start's pass, the removal curvature) runs there; every scoring
+    /// without one (the snapshot the stop and the best epoch are decided on, held-out scoring,
+    /// removal comparisons) in `P`'s own, so an epoch's running estimates (`Epoch::estimates`) are
+    /// the steps' own. On vpd4l at N = 2^20 (fitperf-seedab, RTX 4090) bfloat16 steps took 66 ms
+    /// against 96 and reached a lower snapshot `F` at every epoch of seed 1.
+    fn reversed<R>(&mut self, f: impl FnOnce(&mut Interchange) -> R) -> R {
+        let own = self.experiments.program_mut().arithmetic();
+        let step = interchange::factor_arithmetic(self.experiments.program_mut().device(), own);
+        if step != own {
+            self.experiments.program_mut().set_arithmetic(step);
+        }
+        let out = f(&mut self.experiments);
+        if step != own {
+            self.experiments.program_mut().set_arithmetic(own);
+        }
+        out
+    }
+
     /// The experiments of `explanation` against `M`, the split native program `native`: the read
     /// variables patched are `M`'s functions (`interchange::reads`), each model patching its own
     /// value of each, so every explanation of the model is asked the same questions.
@@ -1857,14 +1863,11 @@ impl Scorer {
         // one fixed collection of experiments, so `M`'s targets are kept on the host while the
         // process's memory budget admits them.
         experiments.keep_targets(gam_runtime::resource::MemoryGovernor::global());
-        if settings.seed_bf16 {
-            experiments.set_seed_bf16()?;
-        }
         let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
         let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
-        Ok(Self { experiments, mlps, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), train_bf16: settings.train_bf16 })
+        Ok(Self { experiments, mlps, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()) })
     }
 
     /// With push among the families, the scorer with the pushed directions set from the seed and
@@ -1957,18 +1960,11 @@ impl Scorer {
             (true, Some(seed)) => Some(probe_key(seed)),
             _ => None,
         };
-        // With `train_bf16` a step (a gradient) runs `P` in bfloat16, then `P` returns to its own
-        // arithmetic, error or not.
-        let own = self.experiments.program_mut().arithmetic();
-        let bf16 = gradient && self.train_bf16;
-        if bf16 {
-            self.experiments.program_mut().set_arithmetic(Arithmetic::Bf16);
-        }
-        let evaluation = self.experiments.evaluate_probed(batch, experiments, Some(targets), gradient, probe);
-        if bf16 {
-            self.experiments.program_mut().set_arithmetic(own);
-        }
-        let evaluation = evaluation?;
+        let evaluation = if gradient {
+            self.reversed(|e| e.evaluate_probed(batch, experiments, Some(targets), gradient, probe))?
+        } else {
+            self.experiments.evaluate_probed(batch, experiments, Some(targets), gradient, probe)?
+        };
         if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
             return Err("nonfinite explanation divergence".into());
         }
@@ -3497,7 +3493,7 @@ fn laplace_sums(scorer: &mut Scorer, device_posterior: &DevicePosterior, draws: 
         // gradient.
         let key = noise_seed(settings.seed, 0, b);
         device_posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
-        let factor = scorer.experiments.fisher_probe_resident(&batch, &experiments, probe_key(key))?;
+        let factor = scorer.reversed(|e| e.fisher_probe_resident(&batch, &experiments, probe_key(key)))?;
         for (op, u) in &factor {
             let u = wide.convert(u).map_err(error)?;
             match sums.get_mut(op) {
@@ -3581,7 +3577,7 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
         lap(2, &mut timed);
         // One forward pass at the batch's sample, reversed twice: the divergence's gradient (in
         // bits) and a draw of the Gauss–Newton factor.
-        let evaluation = scorer.experiments.evaluate_probed(&batch, &experiments, Some(&targets), true, Some(probe_key(key)))?;
+        let evaluation = scorer.reversed(|e| e.evaluate_probed(&batch, &experiments, Some(&targets), true, Some(probe_key(key))))?;
         let factor = evaluation.factor.ok_or("no Gauss–Newton factor")?;
         lap(3, &mut timed);
         posterior.add_removal((&evaluation.gradient, LN_2), &factor.gradient, key, &mut curvature, &mut pending)?;
@@ -4425,8 +4421,6 @@ mod tests {
             head_tile_rows: 64,
             epochs: None,
             families: Vec::new(),
-            seed_bf16: false,
-            train_bf16: false,
         }
     }
 

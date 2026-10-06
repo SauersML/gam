@@ -399,9 +399,10 @@ impl Teacher {
 
 pub(crate) struct ResidentHead {
     pub embedding: Tensor,
-    /// The embedding in bfloat16 for the reverse passes' seeds (`Settings::seed_bf16`): the sweep
-    /// forms `Σ π e` and the probe's pull-back against it ([`Device::head_log_partition_seeded`]).
-    pub seed_half: Option<Tensor>,
+    /// The embedding in bfloat16 (CUDA in f32), which a sweep in bfloat16 (a training step's,
+    /// `library_mdl::Scorer::evaluate_device`) reads as it is in place of rounding the embedding at
+    /// every call.
+    pub half: Option<Tensor>,
     pub ones: Tensor,
     pub tile_rows: usize,
     /// The hidden width as one column block (row dots).
@@ -409,9 +410,11 @@ pub(crate) struct ResidentHead {
 }
 impl ResidentHead {
     pub fn new(d: &Device, head: &Head, tile_rows: usize) -> Result<Self, String> {
+        let embedding = d.upload(head.embedding()).map_err(error)?;
+        let half = if d.storage() == Storage::F32 && d.with_storage(Storage::Bf16).is_ok() { Some(d.bf16_copy(&embedding).map_err(error)?) } else { None };
         Ok(Self {
-            embedding: d.upload(head.embedding()).map_err(error)?,
-            seed_half: None,
+            embedding,
+            half,
             ones: d
                 .upload(Array2::ones((head.embedding().ncols(), 1)).view())
                 .map_err(error)?,
@@ -575,22 +578,17 @@ impl ResidentHead {
         // device) finds it made and the scoring waits on the device once.
         let dots = d.block_products(hidden, &target.mu, &self.width).map_err(error)?;
         let mut probed = None;
+        let embedding = match (&self.half, arithmetic) {
+            (Some(half), Arithmetic::Bf16) => half,
+            _ => &self.embedding,
+        };
         let partitions = match (probe, seed.as_mut()) {
-            (probe, Some(seed)) if self.seed_half.is_some() => {
-                let half = self.seed_half.as_ref().ok_or("a seed head")?;
-                let mut out = probe.map(|_| d.empty(hidden.rows(), hidden.cols())).transpose().map_err(error)?;
-                let partitions = d
-                    .head_log_partition_seeded(hidden, (&self.embedding, half), flags.as_ref(), seed, probe.zip(out.as_mut()), arithmetic)
-                    .map_err(error)?;
-                probed = out;
-                partitions
-            }
             (Some(key), Some(seed)) => {
                 let mut out = d.empty(hidden.rows(), hidden.cols()).map_err(error)?;
                 let partitions = d
                     .head_log_partition_probed(
                         hidden,
-                        (&self.embedding, false),
+                        (embedding, false),
                         flags.as_ref(),
                         seed,
                         (key, &mut out),
@@ -603,7 +601,7 @@ impl ResidentHead {
             (_, seed) => d
                 .head_log_partition(
                     hidden,
-                    &self.embedding,
+                    embedding,
                     false,
                     flags.as_ref(),
                     seed,
