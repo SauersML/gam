@@ -934,9 +934,9 @@ impl BlockEngine for Model<'_> {
                 None => Ok(()),
             }
         };
-        let nodes = self.program.vjp_values_dense_edited(tape, seeds, &keep, &self.sites.trainable[block], arithmetic, (&edited, &mut hook), gradient)?;
+        let mut nodes = self.program.vjp_values_dense_edited(tape, seeds, &keep, &self.sites.trainable[block], arithmetic, (&edited, &mut hook), gradient)?;
         let entering = if block > 0 {
-            d.copy(nodes.get(&self.entry(block)).ok_or_else(|| error("no cotangent of a block's entering stream"))?).map_err(error)?
+            nodes.remove(&self.entry(block)).ok_or_else(|| error("no cotangent of a block's entering stream"))?
         } else {
             d.zeros(ranges.iter().map(ExactSizeIterator::len).sum(), cotangent.cols()).map_err(error)?
         };

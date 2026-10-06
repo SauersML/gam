@@ -1992,6 +1992,11 @@ impl DeviceProgram {
                 }
                 Step::Readout { input } | Step::Gain { input, .. } | Step::Transposed { input, .. } | Step::Pointwise { input, .. } | Step::RmsNorm { input, .. }
                     if !needed[*input] => {}
+                // An unkept readout's cotangent is its input's term as it is; a kept one stays too.
+                Step::Readout { input } if !keep.contains(&index) => {
+                    add(&mut g, *input, cot)?;
+                    continue;
+                }
                 Step::Readout { input } => add(&mut g, *input, d.copy(&cot).map_err(error)?)?,
                 Step::Gain { input, factor } => {
                     let mut term = d.zeros(cot.rows(), cot.cols()).map_err(error)?;
