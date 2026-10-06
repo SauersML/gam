@@ -204,6 +204,22 @@ pub struct Readout {
     pub participation: [f64; 4],
 }
 
+/// One copy of [`Library::edited`]: a sequence, the functions whose writes it scales with their
+/// factors, and the rows read.
+#[derive(Clone, Debug)]
+pub struct Edit {
+    pub sequence: usize,
+    pub scale: Vec<(usize, f64)>,
+    pub rows: Vec<usize>,
+}
+
+/// [`Library::edited`]'s reads: per read row (copies in order, each copy's rows in order) the final
+/// stream before the final norm (reads × width) and every function's activity (reads × functions).
+pub struct Edited {
+    pub last: Array2<f64>,
+    pub activity: Option<Array2<f64>>,
+}
+
 // ------------------------------------------------------------------------------ the explanation
 
 /// A read of the residual stream: its native norm's input node, gain and epsilon.
@@ -988,6 +1004,135 @@ impl<'a> Library<'a> {
         Ok(())
     }
 
+    /// Runs of the explanation with functions' writes scaled: copy `k` is `sequences[edits[k].sequence]`
+    /// (all of one length) with each function `f` of `edits[k].scale` ([`Library::functions`]'s
+    /// order) writing `α_f` times its own write at every position (an MLP function's `α h_i u_i`
+    /// through its activation, a head's `α W_O,h z_h` through its read; `α = 1` is the explanation,
+    /// `α = 0` the function's removal) and every later computation run on the edited values, all
+    /// copies in one forward pass. Per read row of each copy (`edits[k].rows`, in order): the final
+    /// stream before the final norm and, with `activity`, every function's activity there (an MLP
+    /// function's activation `h_i`, a head's output norm `‖W_O,h z_h‖`).
+    pub fn edited(&self, sequences: &[Vec<u32>], edits: &[Edit], activity: bool) -> Result<Edited, String> {
+        let length = sequences.first().map_or(0, Vec::len);
+        if edits.is_empty() || length == 0 || edits.iter().any(|e| e.sequence >= sequences.len() || e.rows.iter().any(|r| *r >= length)) {
+            return Err("edits of rows inside the sequences required".into());
+        }
+        let copies: Vec<&[u32]> = edits.iter().map(|e| sequences[e.sequence].as_slice()).collect();
+        let family = sequence_family(&copies)?;
+        let rows = family.rows;
+        // Per edited node (an MLP's activations, a head's read), the factor of every value.
+        let mut masks: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+        for (k, edit) in edits.iter().enumerate() {
+            for &(f, alpha) in &edit.scale {
+                let (node, column, width) = match self.place(f)?.1 {
+                    Ok(h) => (self.observed[self.head_paths + 6 * h + 2], None, self.heads[h].output.ncols()),
+                    Err((b, i)) => (self.observed[self.mlp_paths[b]], Some(i), self.mlps[b].gate.nrows()),
+                };
+                let mask = masks.entry(node).or_insert_with(|| Array2::ones((rows, width)));
+                let mut span = mask.slice_mut(s![k * length..(k + 1) * length, ..]);
+                match column {
+                    Some(i) => span.column_mut(i).mapv_inplace(|v| v * alpha),
+                    None => span.mapv_inplace(|v| v * alpha),
+                }
+            }
+        }
+        let masks: BTreeMap<usize, Tensor> = masks.into_iter().map(|(n, m)| Ok((n, self.model.upload(m.view()).map_err(error)?))).collect::<Result<_, String>>()?;
+        let edit = |node: usize, trace: &DeviceTrace| -> Result<Option<Tensor>, String> {
+            let Some(mask) = masks.get(&node) else { return Ok(None) };
+            let value = trace.value(node)?;
+            let mut out = self.model.zeros(value.rows(), value.cols()).map_err(error)?;
+            self.model.hadamard(&mut out, value, mask, false).map_err(error)?;
+            Ok(Some(out))
+        };
+        let trace = self.program.forward_edited(&family, BTreeMap::new(), &BTreeSet::new(), |_, _| Ok(()), edit)?;
+        let read: Vec<u32> = edits.iter().enumerate().flat_map(|(k, e)| e.rows.iter().map(move |r| (k * length + r) as u32)).collect();
+        let indices = self.model.upload_indices(&read).map_err(error)?;
+        let gather = |node: usize| -> Result<Array2<f64>, String> { self.model.download(&self.model.gather_rows(trace.value(node)?, &indices).map_err(error)?).map_err(error) };
+        let last = gather(self.observed[self.sites.len()])?;
+        let activity = if activity {
+            let (head_columns, mlp_columns) = self.columns();
+            let mut out = Array2::<f64>::zeros((read.len(), self.functions().len()));
+            for (l, members) in self.layer_heads.iter().enumerate() {
+                for (c, &h) in members.iter().enumerate() {
+                    let written = self.write(h, &gather(self.observed[self.head_paths + 6 * h + 2])?);
+                    out.column_mut(head_columns[l] + c).assign(&written.map_axis(Axis(1), |row| row.dot(&row).sqrt()));
+                }
+            }
+            for (b, block) in self.mlps.iter().enumerate() {
+                out.slice_mut(s![.., mlp_columns[b]..mlp_columns[b] + block.gate.nrows()]).assign(&gather(self.observed[self.mlp_paths[b]])?);
+            }
+            Some(out)
+        } else {
+            None
+        };
+        Ok(Edited { last, activity })
+    }
+
+    /// Each function's write at one row of a run of `sequence`: functions × width
+    /// ([`Library::functions`]'s order), with the final stream's `1/r` there.
+    pub fn writes_at(&self, sequence: &[u32], row: usize) -> Result<(Array2<f64>, f64), String> {
+        let pass = self.pass(&[sequence])?;
+        let mut out = Array2::<f64>::zeros((self.functions().len(), self.unembedding.ncols()));
+        let (head_columns, mlp_columns) = self.columns();
+        for (l, members) in self.layer_heads.iter().enumerate() {
+            for (c, &h) in members.iter().enumerate() {
+                out.row_mut(head_columns[l] + c).assign(&self.heads[h].output.dot(&pass.head[h][2].row(row)));
+            }
+        }
+        for (b, block) in self.mlps.iter().enumerate() {
+            for i in 0..block.gate.nrows() {
+                out.row_mut(mlp_columns[b] + i).assign(&(&block.out.column(i) * pass.mlp[b].0[[row, i]]));
+            }
+        }
+        Ok((out, pass.inverse_final[row]))
+    }
+
+    /// The unembedding row of token `t` with the final norm's gain (`γ_f ⊙ e_t`).
+    #[must_use]
+    pub fn unembedding_row(&self, t: usize) -> ArrayView1<'_, f64> {
+        self.unembedding.row(t)
+    }
+
+    /// The functions' maps, per layer and kind, as named arrays (shape, row-major values): an MLP's
+    /// gate directions `g_i` (functions × width, read on the normed stream `x̂`), gate biases
+    /// `c_i`, write directions `u_i` (functions × width) and, when gated, up directions; a layer's
+    /// heads' query, key and value maps (heads × head width × width, on `x̂`) and output maps
+    /// (heads × width × head width).
+    #[must_use]
+    pub fn maps(&self) -> Vec<(String, Vec<usize>, Vec<f64>)> {
+        let mut out = Vec::new();
+        for (l, members) in self.layer_heads.iter().enumerate() {
+            if !members.is_empty() {
+                for key in ["query", "key", "value", "output"] {
+                    let map = |b: &HeadBlock| -> Array2<f64> {
+                        match key {
+                            "query" => b.query.map.clone(),
+                            "key" => b.key.map.clone(),
+                            "value" => b.value.clone(),
+                            _ => b.output.clone(),
+                        }
+                    };
+                    let (r, c) = map(&self.heads[members[0]]).dim();
+                    let values: Vec<f64> = members.iter().flat_map(|h| map(&self.heads[*h]).iter().copied().collect::<Vec<_>>()).collect();
+                    out.push((format!("h.{l}.attn.head.{key}"), vec![members.len(), r, c], values));
+                }
+            }
+            for block in self.mlps.iter().filter(|b| b.layer == l) {
+                let rows = |a: &Array2<f64>| (vec![a.nrows(), a.ncols()], a.iter().copied().collect());
+                let (shape, values) = rows(&block.gate);
+                out.push((format!("h.{l}.mlp.function.gate"), shape, values));
+                out.push((format!("h.{l}.mlp.function.bias"), vec![block.bias.len()], block.bias.to_vec()));
+                let (shape, values) = rows(&block.out.t().to_owned());
+                out.push((format!("h.{l}.mlp.function.write"), shape, values));
+                if let Some((_, up)) = &block.up {
+                    let (shape, values) = rows(up);
+                    out.push((format!("h.{l}.mlp.function.up"), shape, values));
+                }
+            }
+        }
+        out
+    }
+
     /// Every function in the order of attribution columns: per layer its heads, then its MLP
     /// functions.
     #[must_use]
@@ -1594,6 +1739,59 @@ mod tests {
             assert!(largest(&library.run(&sequences, &zero).expect("run").last, &base.last) > 1e-6);
             let log_p = library.log_probabilities(&base.last).expect("log probabilities");
             assert!(log_p.outer_iter().all(|row| (row.mapv(f64::exp).sum() - 1.0).abs() < 1e-12));
+        }
+    }
+
+    /// A copy of [`Library::edited`] scaling a head's write equals the run with its read scaled, one
+    /// scaling an MLP function's write equals the run with that activation scaled, and copies in one
+    /// call equal their separate calls.
+    #[test]
+    fn scaled_writes_match_scaled_values() {
+        use super::Edit;
+        for dir in [tiny_export("readout_scaled_gelu", 2), tiny_qwen3_export("readout_scaled_gated", 2)] {
+            let imported = import_language_model(&dir, 6, 12).expect("tiny export");
+            std::fs::remove_dir_all(dir).expect("remove the tiny export");
+            let native = split_sites(&imported.program).expect("split sites");
+            let layers = layer_nodes(&native, 2).expect("layer nodes");
+            let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+            let sequences: Vec<Vec<u32>> = tokens.chunks(12).take(2).map(<[u32]>::to_vec).collect();
+            let artifact = library_mdl::explanation(&native, &layers).expect("library").artifact;
+            let host = Device::host();
+            let library = Library::new(&host, &host, &native, &layers, &artifact, 1 << 30, 64).expect("library on the host");
+            let functions = library.functions();
+            let all: Vec<usize> = (0..12).collect();
+            let largest = |a: &ndarray::Array2<f64>, b: &ndarray::Array2<f64>| (a - b).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            let none = std::collections::BTreeMap::new();
+            let clean = library.edited(&sequences[..1], &[Edit { sequence: 0, scale: vec![], rows: all.clone() }], true).expect("clean");
+            let base = library.run(&sequences[..1], &none).expect("run");
+            assert!(largest(&clean.last, &base.last) < 1e-12, "an unedited copy is not the run");
+            let alpha = 0.37;
+            for (h, (layer, head)) in library.heads().into_iter().enumerate() {
+                let f = functions.iter().position(|g| g.name == format!("L{layer}.H{head}")).expect("a head's column");
+                let scaled = library.edited(&sequences[..1], &[Edit { sequence: 0, scale: vec![(f, alpha)], rows: all.clone() }], false).expect("edited");
+                let direct = library.run(&sequences[..1], &[(h, &base.reads[h] * alpha)].into()).expect("run");
+                assert!(largest(&scaled.last, &direct.last) < 1e-10, "head {h}: {}", largest(&scaled.last, &direct.last));
+                assert!(largest(&scaled.last, &base.last) > 1e-8, "head {h}: the edit changed nothing");
+            }
+            let activity = clean.activity.expect("activity");
+            for (b, f) in [(0, 3), (1, 5)] {
+                let (first, _) = functions.iter().enumerate().find(|(_, g)| g.layer == b && matches!(g.kind, super::Kind::Mlp)).expect("an MLP function");
+                let count = functions.iter().filter(|g| g.layer == b && matches!(g.kind, super::Kind::Mlp)).count();
+                let mut values = activity.slice(ndarray::s![.., first..first + count]).to_owned();
+                values.column_mut(f).mapv_inplace(|v| v * alpha);
+                let direct = library.run_with(&sequences[..1], &none, &[(b, values)].into()).expect("run");
+                let scaled = library.edited(&sequences[..1], &[Edit { sequence: 0, scale: vec![(first + f, alpha)], rows: all.clone() }], false).expect("edited");
+                assert!(largest(&scaled.last, &direct.last) < 1e-10, "MLP {b} function {f}: {}", largest(&scaled.last, &direct.last));
+            }
+            // Two copies with different edits in one call equal their separate calls.
+            let edits = [Edit { sequence: 1, scale: vec![(0, 0.0)], rows: vec![3, 11] }, Edit { sequence: 0, scale: vec![(functions.len() - 1, 2.0)], rows: vec![7] }];
+            let joint = library.edited(&sequences, &edits, true).expect("joint");
+            let one = library.edited(&sequences, &edits[..1], true).expect("first");
+            let two = library.edited(&sequences, &edits[1..], true).expect("second");
+            let stacked = ndarray::concatenate(ndarray::Axis(0), &[one.last.view(), two.last.view()]).expect("stack");
+            assert!(largest(&joint.last, &stacked) < 1e-12);
+            let stacked = ndarray::concatenate(ndarray::Axis(0), &[one.activity.as_ref().expect("a").view(), two.activity.as_ref().expect("a").view()]).expect("stack");
+            assert!(largest(joint.activity.as_ref().expect("a"), &stacked) < 1e-12);
         }
     }
 
