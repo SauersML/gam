@@ -45,8 +45,20 @@ export CARGO_BUILD_JOBS=${SLURM_CPUS_PER_TASK:-16}
 export RUSTFLAGS="-C target-cpu=znver3"
 which=(--examples)
 [ $# -gt 0 ] && which=($(printf -- '--example %s ' "$@"))
+# Each named example builds in the package whose crate holds it (gam-mpd's when none is named).
+packages=(-p gam-mpd)
+if [ $# -gt 0 ]; then
+    packages=()
+    for e in "$@"; do
+        f=$(ls crates/*/examples/"$e".rs crates/*/examples/"$e"/main.rs 2> /dev/null | head -n 1)
+        [ -n "$f" ] || { echo "no example $e under crates/*/examples" >&2; exit 1; }
+        d=${f#crates/}; d=${d%%/*}
+        packages+=(-p "$(sed -n 's/^name *= *"\(.*\)"/\1/p' "crates/$d/Cargo.toml" | head -n 1)")
+    done
+    packages=($(printf '%s\n' "${packages[@]}" | paste - - | sort -u | tr '\t' '\n'))
+fi
 echo "== $(date '+%F %T') building ${*:-every example} at $C with $CARGO_BUILD_JOBS jobs"
-time cargo build --release -p gam-mpd "${which[@]}" 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading)' | tail -n 40
+time cargo build --release "${packages[@]}" "${which[@]}" 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading)' | tail -n 40
 dest=$HOME/mpd-bin/$D
 mkdir -p "$dest"
 [ -f "$dest/COMMIT" ] || echo "$C" > "$dest/COMMIT"
