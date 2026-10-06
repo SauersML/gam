@@ -61,6 +61,10 @@
 #       bench/vpd_2951/vpd_engine_export_pile.py, and every tensor checked against the Mac's
 #       export.json, which then replaces the pod's.
 # Other cargo commands (`cargo test -p gam-gpu ...`) run as given in WS/src.
+# RP_PYENV=NAME gives COMMAND the Python environment pinned in bench/runpod/pyenv/NAME.txt (python and
+# python3 are its own; built on the pod by uv while the inputs upload, once per pod and pinned set),
+# and RP_HF_MODELS="ORG/NAME[@REVISION] ..." downloads those models into the pod's Hugging Face cache
+# (HF_HOME) first, so code that loads them by name finds them there.
 # RP_EXAMPLES="X Y" builds further examples for a script that runs them through $MPD_BIN;
 # RP_DISK_GB=N sets the container disk (default: 30 GB, 60 for a dev pod, plus twice the inputs
 # and models); RP_ENV="K=V ..." adds environment (RUST_LOG is forwarded when set); RP_MIN_RAM_GB=N
@@ -1208,9 +1212,29 @@ done
 # The container disk: the toolchain and a release build of the workspace (measured under 20 GB;
 # a dev pod also builds the test profile, a second target directory), with room for the inputs,
 # the models fetched and the outputs (as large again as the inputs).
+# A Python environment (RP_PYENV=NAME: the pinned set bench/runpod/pyenv/NAME.txt at the commit,
+# whose first line states its installed size, measured) and Hugging Face models the pod fetches by
+# name (RP_HF_MODELS="ORG/NAME[@REVISION] ...", their sizes from Hugging Face's listing).
+pyenv_kb=0 models_kb=0 PYENV_REQS="" PYENV_DIR=""
+if [ -n "${RP_PYENV:-}" ]; then
+    [[ $RP_PYENV =~ ^[A-Za-z0-9._-]+$ ]] || { echo "rp-run: RP_PYENV names a file under bench/runpod/pyenv/" >&2; exit 2; }
+    PYENV_REQS=$(git -C "$MAC_GAM" show "$C:bench/runpod/pyenv/$RP_PYENV.txt" 2> /dev/null) || { echo "rp-run: no bench/runpod/pyenv/$RP_PYENV.txt at ${C:0:12}" >&2; exit 2; }
+    gb=$(sed -nE '1s/^# installed size: ([0-9]+) GB.*/\1/p' <<< "$PYENV_REQS")
+    [ -n "$gb" ] || { echo "rp-run: bench/runpod/pyenv/$RP_PYENV.txt must state its installed size on its first line (# installed size: N GB)" >&2; exit 2; }
+    pyenv_kb=$(( gb * 1048576 ))
+    # One environment per pinned set, shared by the runs on a pod.
+    PYENV_DIR=/workspace/pyenv/$(shasum <<< "$PYENV_REQS" | cut -c1-12)
+fi
+for m in ${RP_HF_MODELS:-}; do
+    repo=${m%@*} rev=main
+    [[ $m == *@* ]] && rev=${m#*@}
+    b=$(curl -fsS --max-time 30 "https://huggingface.co/api/models/$repo/revision/$rev?blobs=true" | jq -e '[.siblings[].size // 0] | add') ||
+        { echo "rp-run: Hugging Face lists no model $repo at $rev" >&2; exit 2; }
+    models_kb=$(( models_kb + b / 1024 ))
+done
 base=30
 [ "$MODE" = dev ] && base=60
-DISK=$(( base + (2 * (upload_kb + hf_kb) + data_kb + 1048575) / 1048576 ))
+DISK=$(( base + (2 * (upload_kb + hf_kb) + data_kb + pyenv_kb + models_kb + 1048575) / 1048576 ))
 # A command whose outputs outgrow that (a fit's checkpoints and kept targets) states its own.
 if [ -n "${RP_DISK_GB:-}" ]; then
     [[ $RP_DISK_GB =~ ^[0-9]+$ ]] && (( RP_DISK_GB >= DISK )) || { echo "rp-run: RP_DISK_GB must be a whole number of GB, at least $DISK" >&2; exit 2; }
@@ -1807,7 +1831,9 @@ fetch_models() {
         [[ $p =~ models--([^/]+)--([^/]+)/snapshots/([0-9a-f]+)$ ]]
         repo=${BASH_REMATCH[1]}/${BASH_REMATCH[2]} rev=${BASH_REMATCH[3]}
         list=$(cd "$p" && find . -type f -o -type l | sed 's|^\./||' | tr '\n' ' ')
-        new_conn "set -e; d=$WS/hf/$repo/$rev; for f in $list; do mkdir -p \"\$d/\$(dirname \$f)\"; curl -fsSL --retry 3 -o \"\$d/\$f\" https://huggingface.co/$repo/resolve/$rev/\$f; done" || return 1
+        # The files in parallel (a model's weight shards are several GB each).
+        new_conn "set -e; d=$WS/hf/$repo/$rev; for f in $list; do mkdir -p \"\$d/\$(dirname \$f)\"; done
+            printf '%s\\n' $list | xargs -P 8 -I{} curl -fsSL --retry 3 -o \"\$d/{}\" https://huggingface.co/$repo/resolve/$rev/{}" || return 1
         say "fetched $repo@${rev:0:12} on the pod"
     done
 }
@@ -1823,12 +1849,41 @@ pydeps() {
         PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install -q \$U \"numpy>=2\" pyarrow huggingface_hub tokenizers >> /workspace/pydeps.log 2>&1 && touch /workspace/.pydeps; }"'
 }
 
+# The Python environment and the named models, built on the pod while the inputs upload: uv (pod-wide)
+# installs the pinned set into PYENV_DIR once per pod (other runs with the same set wait, then use
+# it); the models download in parallel into the pod-wide Hugging Face cache (/workspace/hf-home,
+# HF_HOME for COMMAND) by Hugging Face's own client at its high-performance setting. Measured on a
+# GitHub Actions runner: the oracle set resolves in 3 s and installs in 52 s (10 GB); Qwen3-1.7B
+# (3.9 GB) downloads in 26 s. A failure other than a lost connection refuses the run.
+python_env() {
+    local started=$(date +%s) m repo rev pids=() p failed=0
+    [ -n "$PYENV_DIR" ] || [ -n "${RP_HF_MODELS:-}" ] || return 0
+    # Over the shared connection: the uploads hold the separate ones sshd allows.
+    local STEP_CONN=on_pod
+    data_step "installing uv" 'command -v uv > /dev/null || [ -x ~/.local/bin/uv ] || curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null 2>&1' || return 1
+    for m in ${RP_HF_MODELS:-}; do
+        repo=${m%@*} rev=main
+        [[ $m == *@* ]] && rev=${m#*@}
+        data_step "downloading $repo@$rev" "export PATH=\$HOME/.local/bin:\$PATH UV_CACHE_DIR=/workspace/.uv-cache HF_HOME=/workspace/hf-home HF_XET_HIGH_PERFORMANCE=1
+            uvx -q --from huggingface_hub hf download $repo --revision $rev > $WS/model-${repo//\//--}.log 2>&1" & pids+=($!)
+    done
+    if [ -n "$PYENV_DIR" ]; then
+        data_step "installing the Python environment $RP_PYENV ($WS/pyenv.log)" "export PATH=\$HOME/.local/bin:\$PATH UV_CACHE_DIR=/workspace/.uv-cache
+            mkdir -p /workspace/pyenv && flock /workspace/pyenv/.lock bash -c '[ -f $PYENV_DIR/.complete ] || {
+                rm -rf $PYENV_DIR && uv venv -q --python 3.12 $PYENV_DIR && uv pip install -q --python $PYENV_DIR/bin/python -r $WS/src/bench/runpod/pyenv/$RP_PYENV.txt && touch $PYENV_DIR/.complete; }' > $WS/pyenv.log 2>&1" || failed=1
+    fi
+    for p in "${pids[@]}"; do wait "$p" || failed=1; done
+    (( ! failed )) || return 1
+    echo $(( $(date +%s) - started )) >> "$TMP/data_s"
+    say "Python environment ${RP_PYENV:-none} and models ${RP_HF_MODELS:-none} ready in $(( $(date +%s) - started )) s"
+}
+
 # A build on the pod: a lost connection (ssh's 255) loses the pod; any other failure, or files
 # that differ from their recorded sha256s, refuses the run (TMP/refused).
 data_step() {  # WHAT COMMAND...
     local what=$1 rc
     shift
-    new_conn "$@"
+    ${STEP_CONN:-new_conn} "$@"
     rc=$?
     (( rc == 0 )) && return 0
     (( rc == 255 )) || { say "$what failed; refusing to run"; touch "$TMP/refused"; }
@@ -1977,6 +2032,7 @@ setup() {
     { upload_inputs && build_pile; } & jobs+=($!)
     build_fineweb & jobs+=($!)
     fetch_models & jobs+=($!)
+    python_env & jobs+=($!)
     on_pod 'S=$(command -v sudo || true); command -v rsync > /dev/null || { $S apt-get update -qq && $S apt-get install -y -qq rsync; } > /dev/null 2>&1' & jobs+=($!)
     # The pod downloads published binaries itself; the Mac sends only what it alone holds.
     local have="" assets=()
@@ -2148,6 +2204,8 @@ run_command() {
         echo "export PATH=\$HOME/.cargo/bin:$WS/bin:/usr/local/cuda/bin:\$PATH"
         echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
         echo "export MPD_BIN=$WS/bin"
+        [ -z "$PYENV_DIR" ] || echo "export VIRTUAL_ENV=$PYENV_DIR PATH=$PYENV_DIR/bin:\$PATH"
+        [ -z "$PYENV_DIR" ] && [ -z "${RP_HF_MODELS:-}" ] || echo "export HF_HOME=/workspace/hf-home"
         echo 'echo "# $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader), $(nvidia-smi | grep -o "CUDA Version: [0-9.]*")"'
         echo "cd $WS/src"
         echo "$cmd"
