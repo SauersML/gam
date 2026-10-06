@@ -9,9 +9,9 @@
 //!
 //! With `start:PATH` the driver runs one arm of a paired comparison: the fit continues the
 //! checkpoint at PATH exactly (its posterior, optimizer state, rotations, removals and epoch,
-//! `library_mdl::checkpoint_start`) with the mixture prior of `K` candidates per target for the
-//! settings' budget of epochs (`fit.epochs`), on the same batches and weight noise as every other
-//! arm of that checkpoint. `K = 0` is the control: no target keeps a candidate, so the prior is the
+//! `library_mdl::checkpoint_start`), or with `start:native` makes its own Laplace start at `M`,
+//! with the mixture prior of `K` candidates per target for the settings' budget of epochs
+//! (`fit.epochs`), on the same batches and weight noise as every other arm of that start. `K = 0` is the control: no target keeps a candidate, so the prior is the
 //! groups' Gaussian alone, through the same code. OUT/REPORT.json holds the arm's fit,
 //! OUT/PROPOSAL.json what the mixture keeps and the dominant components predicted to lower `F`
 //! when made exact, counted by kind, and OUT/SUMMARY.json `F` per epoch and held out.
@@ -74,11 +74,11 @@ fn arm(device: &Device, (native, start): (&gam_mpd::operator_program::OperatorPr
     if fit.epochs.is_none() {
         return Err("a paired arm needs the settings' budget of epochs (fit.epochs)".into());
     }
-    let begin = library_mdl::checkpoint_start(start, checkpoint)?;
+    let begin = if checkpoint == Path::new("native") { None } else { Some(library_mdl::checkpoint_start(start, checkpoint)?) };
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
     let steps = library_mixture::Steps { rate: 0.05, beta1: fit.beta1, beta2: 0.999, epsilon: 1e-8 };
     let mut mixture = library_mixture::Mixture::new(start, width, steps)?;
-    let fitted = library_mdl::fit_from(device, native, start, train, held_out, fit, &settings.export_sha256, Some(&out.join("checkpoint.bin")), Some(&mut mixture), Some(begin))?;
+    let fitted = library_mdl::fit_from(device, native, start, train, held_out, fit, &settings.export_sha256, Some(&out.join("checkpoint.bin")), Some(&mut mixture), begin)?;
     save(&out.join("REPORT.json"), &serde_json::to_value(&fitted.report).map_err(|e| e.to_string())?)?;
     let mut kept: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for target in &mixture.targets {
