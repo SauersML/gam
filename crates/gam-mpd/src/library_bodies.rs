@@ -82,9 +82,25 @@
 //! (`library_readout`), [`regions`] groups them greedily by a heuristic count of the parameters a
 //! rewrite of the union saves at the posterior's resolution, and orders the groups by it; the
 //! count decides no rewrite (the code length does).
+//!
+//! # Reuse by gradient
+//!
+//! A body's parameters in the explanation `g` (its units' gate rows, biases, up rows and output
+//! columns) take the prior `p(g) = π_0 N(g; 0, v₀ I) + Σ_j π_j N(g; T_j(θ_j), s² I)`
+//! ([`BodyMixture`]) in place of its groups' Gaussian `N(0, diag v)`: a component per earlier body
+//! of the same law it aligns to with evidence, centred on that body's parameters `θ_j` moved by the
+//! epoch's alignment `T_j` (the units' matching, `A`, `C` and, gated, the up scales `α`), with no
+//! further scale. As in `library_mixture`, the fit's sample estimates `−E_q[ln r(g)]` with
+//! `r = p / N(g; 0, diag v)`, whose expectation cancels the groups' Gaussian from the divergence, so
+//! the objective does not depend on `v`; each epoch sets the base variance at its stationary point
+//! under `library_mixture`'s bound, `v₀ = E_q‖g‖² / D` over the `D` entries, and the logits and
+//! `ln s²` are learned by Adam, each moment's bias corrected by its own age. A target's components
+//! are earlier bodies, so the product of the targets' mixtures is a joint density; a dominant
+//! component is made exact by a merge ([`BodyMixture::harden`]).
 
 use crate::{
     library_mdl::{Cells, Explanation, Group, Posterior},
+    library_mixture::Moment,
     operator_program::{Interface, LabelKind, Law, Node, Operator, OperatorProgram, Provenance, Rule, exact_precision, remap_node},
 };
 use gam_linalg::decompose::svd;
@@ -1675,6 +1691,11 @@ pub struct BodyTarget {
     pub components: Vec<BodyComponent>,
     /// `ln s²`.
     pub log_variance: f64,
+    /// `ln v₀`, the base component's variance, set with the components at an epoch; none in a
+    /// state from before the base was the mixture's own, until the target's next sample sets it
+    /// as an epoch would.
+    #[serde(default)]
+    pub log_base: Option<f64>,
 }
 
 impl BodyTarget {
@@ -1685,13 +1706,6 @@ impl BodyTarget {
     }
 }
 
-/// Adam's moments of one parameter.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-struct Moment {
-    first: f64,
-    second: f64,
-}
-
 /// The Adam moments [`BodyMixture`]'s step keeps per component: its logit.
 const MOMENTS_PER_COMPONENT: usize = 1;
 
@@ -1700,11 +1714,12 @@ const MOMENTS_PER_COMPONENT: usize = 1;
 pub struct BodyMixture {
     pub targets: Vec<BodyTarget>,
     steps: crate::library_mixture::Steps,
-    taken: u64,
-    /// Per target, Adam's moments of its zero logit, then per component its logit, then its `ln s²`.
+    /// Per target, Adam's moments of its zero logit, then per component its logit, then its `ln s²`,
+    /// each with its age.
     moments: Vec<Vec<Moment>>,
     layouts: BTreeMap<String, Layout>,
-    /// Each target body's groups' cells (trainable index, rows, columns), for their variances.
+    /// Each target body's groups' cells (trainable index, rows, columns); their operators are among
+    /// those it reads.
     cells: BTreeMap<usize, Vec<(usize, Vec<usize>, std::ops::Range<usize>)>>,
 }
 
@@ -1728,30 +1743,34 @@ impl BodyMixture {
                 });
             }
         }
-        let targets: Vec<BodyTarget> = bodies.iter().enumerate().map(|(t, (_, body))| BodyTarget { body: body.clone(), choices: t, zero_logit: 0.0, components: Vec::new(), log_variance: 0.0 }).collect();
+        let targets: Vec<BodyTarget> = bodies.iter().enumerate().map(|(t, (_, body))| BodyTarget { body: body.clone(), choices: t, zero_logit: 0.0, components: Vec::new(), log_variance: 0.0, log_base: None }).collect();
         let moments = targets.iter().map(|_| vec![Moment::default(); 2]).collect();
-        Ok(Self { targets, steps, taken: 0, moments, layouts, cells })
-    }
-
-    /// Each group's empirical-Bayes variance `v_G` at `posterior`.
-    fn variance(&self, group: usize, posterior: &Posterior) -> f64 {
-        let (mut count, mut second) = (0.0, 0.0);
-        for (i, rows, cols) in self.cells.get(&group).map(Vec::as_slice).unwrap_or_default() {
-            for &r in rows {
-                for c in cols.clone() {
-                    let (m, s) = (posterior.mean[*i][[r, c]], posterior.log_sd[*i][[r, c]]);
-                    count += 1.0;
-                    second += m * m + (2.0 * s).exp();
-                }
-            }
-        }
-        second / count
+        Ok(Self { targets, steps, moments, layouts, cells })
     }
 
     /// The entries of target `t` in the explanation at `posterior`.
     fn live(&self, t: usize, posterior: &Posterior) -> Result<Vec<Entry>, String> {
         let layout = self.layouts.get(&self.targets[t].body).ok_or("a target's layout")?;
         Ok(layout.entries.iter().filter(|e| posterior.active[e.group]).copied().collect())
+    }
+
+    /// Target `t`'s `ln v₀` at `posterior`, `v₀ = E_q‖g‖² / D` over its `D` live entries (module
+    /// note, # Reuse by gradient); none without a live entry of positive second moment.
+    fn base(&self, t: usize, posterior: &Posterior) -> Result<Option<f64>, String> {
+        let live = self.live(t, posterior)?;
+        let second: f64 = live.iter().map(|e| posterior.mean[e.operator][[e.row, e.col]].powi(2) + (2.0 * posterior.log_sd[e.operator][[e.row, e.col]]).exp()).sum();
+        Ok((second > 0.0).then(|| (second / live.len() as f64).ln()))
+    }
+
+    /// Each target with components but no base variance (a state from before the base was the
+    /// mixture's own) given the `v₀` its epoch sets, at `posterior`.
+    fn settle_bases(&mut self, posterior: &Posterior) -> Result<(), String> {
+        for t in 0..self.targets.len() {
+            if self.targets[t].log_base.is_none() && !self.targets[t].components.is_empty() {
+                self.targets[t].log_base = self.base(t, posterior)?;
+            }
+        }
+        Ok(())
     }
 
     /// Component `component`'s prediction of the target entries `entries` from its body's values
@@ -1835,27 +1854,20 @@ impl BodyMixture {
     }
 
     /// One Adam step of the mixture's own parameters along `gradients` (per target, in the moments'
-    /// order).
+    /// order), each corrected by its own moment's age.
     fn learn(&mut self, gradients: &[Vec<f64>]) {
-        self.taken += 1;
-        let crate::library_mixture::Steps { rate, beta1, beta2, epsilon } = self.steps;
-        let (c1, c2) = (1.0 - beta1.powf(self.taken as f64), 1.0 - beta2.powf(self.taken as f64));
+        let steps = self.steps;
         for (t, gradient) in gradients.iter().enumerate() {
             if gradient.is_empty() {
                 continue;
             }
-            let step = |moment: &mut Moment, value: &mut f64, g: f64| {
-                moment.first = beta1 * moment.first + (1.0 - beta1) * g;
-                moment.second = beta2 * moment.second + (1.0 - beta2) * g * g;
-                *value -= rate * (moment.first / c1) / ((moment.second / c2).sqrt() + epsilon);
-            };
             let (target, moments) = (&mut self.targets[t], &mut self.moments[t]);
-            step(&mut moments[0], &mut target.zero_logit, gradient[0]);
+            moments[0].step(steps, &mut target.zero_logit, gradient[0]);
             for (j, component) in target.components.iter_mut().enumerate() {
-                step(&mut moments[1 + j], &mut component.logit, gradient[1 + j]);
+                moments[1 + j].step(steps, &mut component.logit, gradient[1 + j]);
             }
             let last = moments.len() - 1;
-            step(&mut moments[last], &mut target.log_variance, gradient[gradient.len() - 1]);
+            moments[last].step(steps, &mut target.log_variance, gradient[gradient.len() - 1]);
         }
     }
 }
@@ -1896,7 +1908,8 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
 
     /// Every target's components re-chosen at `posterior`: each earlier body of the same law the
     /// target aligns to with evidence, with its alignment and up scales; a component kept keeps its
-    /// logit and scale.
+    /// logit and its moment, a new one starts at the zero logit with a moment of age zero; a target
+    /// with components takes its base variance `v₀ = E_q‖g‖² / D` (module note, # Reuse by gradient).
     fn epoch(&mut self, explanation: &Explanation, posterior: &Posterior) -> Result<(), String> {
         let values: BTreeMap<String, BodyValues> =
             self.targets.iter().map(|t| Ok((t.body.clone(), body_values(explanation, posterior, &t.body)?))).collect::<Result<_, String>>()?;
@@ -1931,11 +1944,17 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
             moments.push(*self.moments[t].last().ok_or("moments")?);
             self.targets[t].components = components;
             self.moments[t] = moments;
+            if !self.targets[t].components.is_empty() {
+                self.targets[t].log_base = self.base(t, posterior)?;
+            }
         }
         Ok(())
     }
 
     fn sample(&mut self, posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String> {
+        self.settle_bases(posterior)?;
+        // The groups' variances `v` as the fit charges them.
+        let variances = posterior.variances();
         let mut value = 0.0;
         let mut gradient: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
         let mut learned = vec![Vec::new(); self.targets.len()];
@@ -1946,11 +1965,12 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
                 continue;
             }
             let g = Array1::from_iter(entries.iter().map(|e| theta.get(&e.operator).map_or(0.0, |m| m[[e.row, e.col]])));
-            let v = Array1::from_iter(entries.iter().map(|e| self.variance(e.group, posterior)));
+            let v = Array1::from_iter(entries.iter().map(|e| variances[e.group]));
             let predictions = target.components.iter().map(|c| self.predicted(c, &entries, theta)).collect::<Result<Vec<_>, _>>()?;
             let writes: Vec<(ndarray::ArrayView1<'_, f64>, f64)> = predictions.iter().map(|p| (p.view(), 1.0)).collect();
             let logits: Vec<f64> = std::iter::once(target.zero_logit).chain(target.components.iter().map(|c| c.logit)).collect();
-            let found = crate::library_mixture::term(g.view(), &writes, &logits, target.log_variance, v.view())?;
+            let log_base = target.log_base.ok_or("a body target without its base variance")?;
+            let found = crate::library_mixture::term(g.view(), &writes, &logits, target.log_variance, log_base, v.view())?;
             value += found.value;
             for (k, e) in entries.iter().enumerate() {
                 let shape = theta.get(&e.operator).ok_or("a target's sample")?.dim();
@@ -1972,9 +1992,9 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
 
     /// Per target with components: its `K` components among its `n` earlier bodies (`ln C(n, K)`
     /// nats); each component's matching of the target's live units to the earlier body's
-    /// (`Alignment::matching_nats`); and its `K` logits, its variance and every component's gauge (its alignment's
-    /// fitted entries and, gated, its up scales), each at the precision of a value estimated from
-    /// the target's live entries (`½ ln |G|` nats).
+    /// (`Alignment::matching_nats`); and its `K` logits, its variance `s²`, its base variance `v₀`
+    /// and every component's gauge (its alignment's fitted entries and, gated, its up scales), each
+    /// at the precision of a value estimated from the target's live entries (`½ ln |G|` nats).
     fn cost(&self, posterior: &Posterior) -> Result<f64, String> {
         use statrs::function::gamma::ln_gamma;
         let mut total = 0.0;
@@ -1989,7 +2009,7 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
                 total += component.alignment.matching_nats();
                 gauges += (component.alignment.gauge + if component.up_scales.iter().any(|a| *a != 1.0) { component.up_scales.len() } else { 0 }) as f64;
             }
-            total += ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0) + (k + 1.0 + gauges) * 0.5 * size.ln();
+            total += ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0) + (k + 2.0 + gauges) * 0.5 * size.ln();
         }
         Ok(total)
     }
@@ -2003,7 +2023,7 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
     /// shape, and each component an earlier body (the order that makes the product of the targets'
     /// mixtures a joint density) whose alignment and up scales fit the two bodies' widths.
     fn load(&mut self, value: &serde_json::Value) -> Result<(), String> {
-        let restored: BodyMixture = serde_json::from_value(value.clone()).map_err(error)?;
+        let mut restored: BodyMixture = serde_json::from_value(value.clone()).map_err(error)?;
         let other = || "a checkpoint's body mixture of another explanation".to_string();
         if restored.layouts != self.layouts || restored.cells != self.cells || restored.targets.len() != self.targets.len() || restored.moments.len() != restored.targets.len() {
             return Err(other());
@@ -2020,6 +2040,13 @@ impl crate::library_mdl::PriorTerm for BodyMixture {
                 if a.units.len() != units || a.input.dim() != (k_c, k) || a.output.dim() != (k_out, k_out_c) || component.up_scales.len() != units || !a.matching_nats().is_finite() {
                     return Err(other());
                 }
+            }
+        }
+        // A state from before each moment kept its own age corrected every moment by one count of
+        // the steps taken (`taken`): each moment takes that count as its age.
+        if let Some(taken) = value.get("taken").and_then(serde_json::Value::as_u64) {
+            for moment in restored.moments.iter_mut().flatten() {
+                moment.age = taken;
             }
         }
         *self = restored;
@@ -2787,6 +2814,33 @@ mod tests {
         let group = moved["layouts"][first.body.as_str()]["entries"][0]["group"].as_u64().unwrap();
         moved["layouts"][first.body.as_str()]["entries"][0]["group"] = serde_json::json!(group + 1);
         assert!(fresh.load(&moved).is_err());
+    }
+
+    #[test]
+    fn a_body_component_chosen_late_takes_a_fresh_adams_first_step() {
+        use crate::library_mdl::PriorTerm;
+        let (native, layers, _, _) = tiny("bodies_late_moment", "gelu_tanh", false);
+        let mut start = explanation(&native, &layers).unwrap();
+        planted(&mut start, false);
+        let (one, _) = rewrite(&start, 0, &SITE0).unwrap();
+        let (two, _) = rewrite(&one, 1, &SITE1).unwrap();
+        let posterior = Posterior::new(&two, 72).unwrap();
+        let steps = crate::library_mixture::Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 };
+        let mut mixture = BodyMixture::new(&two, steps).unwrap();
+        // Many steps of the second body's zero logit and `ln s²` before it has a component.
+        for _ in 0..2000 {
+            mixture.learn(&[Vec::new(), vec![0.3, 0.3]]);
+        }
+        mixture.epoch(&two, &posterior).unwrap();
+        assert_eq!(mixture.targets[1].components.len(), 1);
+        let ages: Vec<u64> = mixture.moments[1].iter().map(|m| m.age).collect();
+        assert_eq!(ages, vec![2000, 0, 2000], "the new component's moment starts at age zero");
+        let before = mixture.targets[1].components[0].logit;
+        let (mut fresh, mut expected) = (crate::library_mixture::Moment::default(), before);
+        fresh.step(steps, &mut expected, 0.3);
+        mixture.learn(&[Vec::new(), vec![0.3, 0.3, 0.3]]);
+        assert_eq!(mixture.targets[1].components[0].logit, expected, "its first step is a fresh Adam's");
+        assert!((before - expected - steps.rate).abs() < 1e-6, "a fresh first step moves by the rate");
     }
 
     #[test]
