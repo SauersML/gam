@@ -4,7 +4,7 @@
 #
 #   rp-run NAME GPU_TYPE[,GPU_TYPE...] HOURS -- COMMAND...      run COMMAND on one pod
 #   rp-run dev NAME [GPU_TYPE[,GPU_TYPE...] [HOURS]] [-- PATH...] a pod held for development
-#   rp-run extend NAME HOURS                                      extend a held pod's cap by HOURS
+#   rp-run extend NAME HOURS                                      extend a run's or a held pod's cap by HOURS
 #   rp-run stop NAME                                              end a run or a held pod now
 #   rp-run batch SPEC                                             launch every run SPEC lists, at once
 #   rp-run status                                                 one line per running pod
@@ -966,10 +966,24 @@ for line in open(sys.argv[1]):
         read -r pod price owner <<< "$h"
         kill -0 "$owner" 2> /dev/null || { echo "rp-run: the process holding $2 is gone" >&2; exit 2; }
         budget "$(awk -v p="$price" -v h="$3" 'BEGIN { printf "%.2f", p * h }')" "this extension"
+        was=$(cat "$ACTIVE/.$pod.deadline" 2> /dev/null || echo 0)
         echo "$3" > "$RP/$2/EXTEND"
-        while [ -f "$RP/$2/EXTEND" ]; do sleep 1; done
-        echo "rp-run: $2 ($pod) now held until $(date -r "$(cat "$ACTIVE/.$pod.deadline")" '+%F %T')" >&2
-        exit 0 ;;
+        # The runner takes it within seconds (hold() for a dev pod, extend_loop for a run); one that
+        # does not (a run still before its pod answers SSH, or a runner from before extend_loop)
+        # leaves it, and nothing changes.
+        for i in $(seq 90); do [ -f "$RP/$2/EXTEND" ] || break; sleep 1; done
+        if [ -f "$RP/$2/EXTEND" ]; then
+            rm -f "$RP/$2/EXTEND"
+            echo "rp-run: $2's runner did not take the extension within 90 s (a run whose pod does not answer SSH yet, or a runner started before runs could be extended); its cap stays at $(date -r "$was" '+%F %T')" >&2
+            exit 1
+        fi
+        now=$(cat "$ACTIVE/.$pod.deadline" 2> /dev/null || echo "$was")
+        if (( now > was )); then
+            echo "rp-run: $2 ($pod) now runs until $(date -r "$now" '+%F %T')" >&2
+            exit 0
+        fi
+        echo "rp-run: $2's runner could not move the pod's own deletion timer; its cap stays at $(date -r "$was" '+%F %T') (rp-run.log)" >&2
+        exit 1 ;;
     dev)
         MODE=dev
         shift
@@ -2490,8 +2504,34 @@ fetch_binaries() {
 }
 
 # The source, binaries, inputs, data, models and the outputs synced so far, on the current pod.
+# A run's extensions (rp-run extend NAME HOURS) while its pod lives, moved as hold() moves a held
+# pod's: the pod's own deletion timer (arm), the watcher's deadline (active/.POD.deadline) and the
+# run's estimate in its record. A background loop, since the runner waits on the command; the
+# runner reads the moved deadline back before it relaunches.
+extend_loop() {
+    local h d now n g k p c o e m rest
+    while [ -f "$ACTIVE/$POD" ]; do
+        if [ -f "$OUT/EXTEND" ]; then
+            h=$(cat "$OUT/EXTEND") now=$(date +%s)
+            d=$(( $(cat "$ACTIVE/.$POD.deadline") + $(awk -v h="$h" 'BEGIN { printf "%d", h * 3600 }') ))
+            if arm $(( d - now )); then
+                read -r n g k p c o e m rest < "$ACTIVE/$POD"
+                e=$(awk -v e="$e" -v p="$PRICE" -v h="$h" 'BEGIN { printf "%.2f", e + p * h }')
+                printf '%s %s %s %s %s %s %s %s %s\n' "$n" "$g" "$k" "$p" "$c" "$o" "$e" "$m" "${rest:-}" > "$ACTIVE/$POD"
+                echo "$d" > "$ACTIVE/.$POD.deadline"
+                say "extended by $h h: the run's cap is now $(date -r "$d" '+%F %T')"
+            else
+                say "could not move the pod's own deletion timer; the cap stays at $(date -r "$(cat "$ACTIVE/.$POD.deadline")" '+%F %T')"
+            fi
+            rm -f "$OUT/EXTEND"
+        fi
+        sleep 2
+    done
+}
+
 setup() {
     local started=$(date +%s) x pkg flags build=() cached=() jobs=()
+    if [ "$MODE" = run ] && (( ! GUEST )); then rm -f "$OUT/EXTEND"; extend_loop & fi
     # Every step checks its own status: `set -e` does not act inside the condition this runs in. A
     # step that fails on the connection (ssh's 255) loses the pod; any other failure ends the run.
     # The published inputs need nothing else: they start at once (at SSH, in reach).
@@ -2861,6 +2901,11 @@ case $MODE in
         attempt=1
         until launch && setup && run_command; do
             [ ! -f "$OUT/STOP" ] || exit 1
+            # An extension (extend_loop) moved the cap and the estimate in the lost pod's files.
+            if [ -n "$POD" ] && [ -f "$ACTIVE/.$POD.deadline" ] && (( ! GUEST )); then
+                DEADLINE=$(cat "$ACTIVE/.$POD.deadline")
+                ESTIMATE=$(awk '{ print $7 }' "$ACTIVE/$POD" 2> /dev/null || echo "$ESTIMATE")
+            fi
             # A pod deleted by anyone but this runner (an API delete, rp-run stop, its own cap) ends
             # the run; only a pod its host lost (exited by RunPod, or unreachable) is replaced.
             if [ -n "$POD" ] && deleted "$POD"; then
