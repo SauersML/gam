@@ -204,7 +204,7 @@ fn main() -> Result<(), String> {
         "patched_blocks": experiments.iter().filter_map(|e| match &e.patch {
             Some(Patch::Read { variable }) => Some(variables[*variable].block),
             Some(Patch::Reads { variables: chosen }) => chosen.first().map(|v| variables[*v].block),
-            Some(Patch::Part { .. } | Patch::Head { .. } | Patch::Cut { .. } | Patch::Parts { .. } | Patch::Swap { .. } | Patch::PartFrom { .. } | Patch::HeadFrom { .. } | Patch::FixedPart { .. } | Patch::Ops { .. }) | None => None,
+            Some(Patch::FixedPart { .. } | Patch::Ops { .. }) | None => None,
         }).collect::<Vec<_>>(),
         "compile_seconds": compile_seconds,
         "free_bytes_compiled": free_compiled,

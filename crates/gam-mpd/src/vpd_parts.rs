@@ -300,7 +300,7 @@ mod tests {
         for part in 0..2 {
             for (factor, alpha) in FACTORS.iter().enumerate() {
                 let row = 3 + factor;
-                let edits = Edits::with_parts(&d, &[], m.values(), &[(row, Edit::Fixed { part, factor })], Some(sites), None).expect("the edits");
+                let edits = Edits::with_parts(&d, &[], m.values(), &[(row, Edit::Fixed { part, factor })], Some(sites)).expect("the edits");
                 let mut edited = d.copy(&entering).expect("copy");
                 m.forward(1, &mut edited, &ranges, &tok, Some(&edits), false).expect("the edited MLP");
                 let moved = d.download(&edited).expect("download") - &plain;

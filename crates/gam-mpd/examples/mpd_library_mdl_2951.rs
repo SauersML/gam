@@ -23,12 +23,12 @@
 //! With `edits EDITS.json`, nothing is fitted: edit faithfulness. The explanation (the posterior mean
 //! of the checkpoint `OUT/{checkpoint}`, or with no checkpoint the library as built, the transcoder
 //! features as they are) is scored on held-out sequences `sequences` (a range of the held-out rows)
-//! under edits of its parts (`interchange::Interchange::sample_edits`: per sequence its clean
-//! experiment and `edits_per_sequence` edits, each of a family in `families`, `remove_part`,
-//! `amplify_part`, `remove_parts` (a random subset of the parts firing at a row of one block),
-//! `swap_part` (a part's activation from the next held-out sequence), `remove_head` or
-//! `cut_connection` (its source the next held-out sequence),
-//! applied identically to `M` and to `P`). `OUT/EDITS_{name}.json` holds per family
+//! under experiments drawn from the seed alone, the same for every explanation
+//! (`interchange::Interchange::sample_ops`: per sequence its clean experiment and
+//! `edits_per_sequence` experiments, each of a family in `families`: `swap` (sites' values from the
+//! next held-out sequence), `zero`, `scale` and `push` (a seeded direction at a site's typical
+//! norm), each of one to sixteen operations on sites `M` and every explanation share, at one row,
+//! onward or at every row), applied identically to `M` and to `P`. `OUT/EDITS_{name}.json` holds per family
 //! `KL(M_e ‖ P_e)` in bits per token: the mean and 99th percentile over every scored token (from the
 //! edited token on) and over the edited tokens alone, with the clean experiments' as `clean`; and
 //! next to it, over the same tokens, the edit's effect on the model `KL(M_e ‖ M)` (`effect_*`), the
@@ -357,7 +357,6 @@ fn edit_faithfulness(
     }
     let mut experiments = interchange::Interchange::new(device, native, layers, &artifact, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     let count = parts.len();
-    experiments.set_parts(parts.clone())?;
     // VPD's subcomponents as fixed parts, and its causal-importance network for drawing them.
     let (slices, vpd) = match &settings.vpd {
         Some(v) => {
@@ -384,14 +383,6 @@ fn edit_faithfulness(
         Some(interchange::Patch::Ops { family: interchange::Family::Zero, .. }) => "zero",
         Some(interchange::Patch::Ops { family: interchange::Family::Scale, .. }) => "scale",
         Some(interchange::Patch::Ops { family: interchange::Family::Push, .. }) => "push",
-        Some(interchange::Patch::Part { factor: 0, .. }) => "remove_part",
-        Some(interchange::Patch::Part { .. }) => "amplify_part",
-        Some(interchange::Patch::Head { .. }) => "remove_head",
-        Some(interchange::Patch::Cut { .. }) => "cut_connection",
-        Some(interchange::Patch::Parts { .. }) => "remove_parts",
-        Some(interchange::Patch::Swap { .. }) => "swap_part",
-        Some(interchange::Patch::PartFrom { .. }) => "remove_part_from",
-        Some(interchange::Patch::HeadFrom { .. }) => "remove_head_from",
         Some(interchange::Patch::FixedPart { factor: 0, .. }) => "remove_subcomponent",
         Some(interchange::Patch::FixedPart { .. }) => "amplify_subcomponent",
         Some(_) => "read",
@@ -422,7 +413,6 @@ fn edit_faithfulness(
     // applying no edit.
     drop(experiments);
     let mut reference = interchange::Interchange::new(device, native, layers, &gam_mpd::artifact::Artifact::native(native)?, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
-    reference.set_parts(parts.clone())?;
     reference.set_fixed_parts(slices.clone())?;
     reference.set_directions(DIRECTIONS, settings.seed);
     reference.measure_typical(&typical_batch)?;
@@ -435,18 +425,12 @@ fn edit_faithfulness(
     // Per experiment (one JSON line each): its held-out sequence, edited position, family, parts
     // as (layer, row in the layer), factor, effect at the edited token and gap there, so another
     // implementation of the same edit (bench/oracle/qwen_labels.py) can be checked against it.
-    let part_of = |i: &usize| parts.get(*i).map(|p| json!([(p.block - 1) / 2, p.index]));
     let mut records = String::new();
     for (b, batch, drawn, gaps) in &batches {
         for ((e, bits), gap) in drawn.iter().zip(&reference.evaluate(batch, drawn, false)?.bits).zip(gaps) {
-            let (chosen, factor): (Vec<usize>, Option<usize>) = match &e.patch {
-                Some(interchange::Patch::Part { part, factor }) => (vec![*part], Some(*factor)),
-                Some(interchange::Patch::PartFrom { part, factor }) => (vec![*part], Some(*factor)),
-                Some(interchange::Patch::Parts { parts: chosen, factor }) => (chosen.clone(), Some(*factor)),
-                Some(interchange::Patch::Swap { part }) => (vec![*part], None),
-                Some(interchange::Patch::Cut { from, to }) => (vec![*from, *to], None),
-                Some(interchange::Patch::FixedPart { factor, .. }) => (Vec::new(), Some(*factor)),
-                _ => (Vec::new(), None),
+            let factor = match &e.patch {
+                Some(interchange::Patch::FixedPart { factor, .. }) => Some(*factor),
+                _ => None,
             };
             // A subcomponent as (layer, VPD's site, its index there).
             let subcomponent = match &e.patch {
@@ -459,7 +443,7 @@ fn edit_faithfulness(
             };
             records.push_str(&json!({
                 "sequence": first + b * settings.batch_sequences + e.base, "position": e.position, "family": family(e), "ops": ops,
-                "parts": chosen.iter().filter_map(part_of).collect::<Vec<_>>(), "subcomponent": subcomponent, "factor": factor.and_then(|f| interchange::FACTORS.get(f).copied()),
+                "subcomponent": subcomponent, "factor": factor.and_then(|f| interchange::FACTORS.get(f).copied()),
                 "effect_bits_at_edited_token": bits.first(), "gap_bits_at_edited_token": gap.first(),
             }).to_string());
             records.push('\n');

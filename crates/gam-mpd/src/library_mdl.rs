@@ -1383,9 +1383,10 @@ pub struct Settings {
     #[serde(default)]
     pub epochs: Option<usize>,
     /// The families of each base's patched experiment, one drawn uniformly per base
-    /// (`interchange::Family`): `read` (a read patch, `interchange::sample`), `remove_part` and
-    /// `amplify_part` (edits of the starting library's parts, `interchange::Interchange::draw_edits`).
-    /// Empty (the default) is `read` alone.
+    /// (`interchange::Family`): `read` (a read patch, `interchange::sample`), `swap`, `zero` and
+    /// `scale` (operations on sites every explanation shares with `M`,
+    /// `interchange::Interchange::draw_ops`). Empty (the default) is `read` alone. The families left
+    /// out (`push`, and any the edits driver scores) are the held-out operation types.
     #[serde(default)]
     pub families: Vec<interchange::Family>,
     /// A/B arm, to be deleted with the losing arm after its paired test: when set, each step
@@ -1870,13 +1871,10 @@ impl Scorer {
         let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
-        // Edits act on the starting library's parts, fixed through the fit: `M`'s targets for an
-        // edit depend on them, and the experiments stay one fixed collection.
-        if settings.families.contains(&interchange::Family::CutConnection) {
-            return Err("library fit: cut_connection scores explanations and has no reverse pass to train them".into());
-        }
-        if settings.families.iter().any(|f| *f != interchange::Family::Read) {
-            experiments.set_parts(interchange::parts_of(&explanation.artifact.program, sites.len())?)?;
+        // A push's size is its site's typical norm, which the edits driver measures; the fit's
+        // families leave it out.
+        if settings.families.contains(&interchange::Family::Push) {
+            return Err("library fit: push is a held-out operation type (the edits driver scores it)".into());
         }
         Ok(Self { experiments, mlps, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), train_bf16: settings.train_bf16 })
     }
@@ -1903,13 +1901,14 @@ impl Scorer {
             let drawn = match cached {
                 Some(drawn) => drawn,
                 None => {
-                    let batch = draw.batch(sequences)?;
+                    let length = draw.bases.first().map_or(0, |b| sequences[*b].len());
                     let mut drawn: Vec<(usize, Patch, usize)> = Vec::new();
                     for (n, &base) in draw.bases.iter().enumerate() {
                         let mut rng = StdRng::seed_from_u64(splitmix64_hash(splitmix64_hash(draw.seed ^ 0xED17) ^ splitmix64_hash(base as u64)));
                         let family = self.families[rng.random_range(0..self.families.len())];
                         if family != interchange::Family::Read {
-                            drawn.extend(self.experiments.draw_edits(&mut rng, &batch, &[(n, family)])?.into_iter().map(|(patch, position)| (n, patch, position)));
+                            let (patch, position) = self.experiments.draw_ops(&mut rng, family, length)?;
+                            drawn.push((n, patch, position));
                         }
                     }
                     self.edits.borrow_mut().insert(key, drawn.clone());
@@ -2221,7 +2220,7 @@ fn held_out_on(
                     match patch {
                         Patch::Read { .. } => read.add(bits),
                         Patch::Reads { .. } => joint.add(bits),
-                        Patch::Part { .. } | Patch::Head { .. } | Patch::Cut { .. } | Patch::Parts { .. } | Patch::Swap { .. } | Patch::PartFrom { .. } | Patch::HeadFrom { .. } | Patch::FixedPart { .. } | Patch::Ops { .. } => {}
+                        Patch::FixedPart { .. } | Patch::Ops { .. } => {}
                     }
                 }
             }
@@ -5419,13 +5418,12 @@ mod tests {
         assert!((counts[1].nonzero_per_token - later).abs() <= 1e-12 * later, "layer 1 counts {} functions per token, the tokens after the first {later}", counts[1].nonzero_per_token);
     }
 
-    /// With edit families (`Settings::families`), each base's patched experiment is a read patch
-    /// or an edit of one of the starting library's parts, its family drawn from the batch's seed
-    /// (the same collection on every call): on the tiny Qwen3 decoder with layer 1's MLP 64
-    /// transcoder features, both kinds appear, every edit is of a layer-1 part after the first
-    /// token, and a two-epoch fit on them ends with a finite objective.
+    /// With operation families (`Settings::families`), each base's patched experiment is a read
+    /// patch or operations on shared sites, its family drawn from the batch's seed (the same
+    /// collection on every call): on the tiny Qwen3 decoder with layer 1's MLP 64 transcoder
+    /// features, both kinds appear, and a two-epoch fit on them ends with a finite objective.
     #[test]
-    fn a_fit_samples_edits_of_parts_among_its_families() {
+    fn a_fit_samples_operations_among_its_families() {
         let export = crate::test_support::tiny_qwen3_export("library_fit_edits", 2);
         let imported = import_language_model(&export, 6, 12).unwrap();
         std::fs::remove_dir_all(&export).unwrap();
@@ -5441,7 +5439,7 @@ mod tests {
         let explanation = explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         use interchange::Family;
-        let settings = Settings { families: vec![Family::Read, Family::RemovePart, Family::AmplifyPart], epochs: Some(2), ..settings() };
+        let settings = Settings { families: vec![Family::Read, Family::Swap, Family::Zero, Family::Scale], epochs: Some(2), ..settings() };
         let device = Device::host();
         let scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
         let (train, held) = sequences.split_at(4);
@@ -5451,9 +5449,9 @@ mod tests {
             assert_eq!(experiments, scorer.experiments(&draw, train).unwrap(), "one fixed collection");
             for e in &experiments {
                 match &e.patch {
-                    Some(Patch::Part { part, .. }) => {
+                    Some(Patch::Ops { ops, .. }) => {
                         kinds.1 += 1;
-                        assert!(scorer.experiments.parts()[*part].block == 3 && e.position >= 1, "{e:?}");
+                        assert!(!ops.is_empty() && e.position < 12, "{e:?}");
                     }
                     Some(_) => kinds.0 += 1,
                     None => {}
@@ -5538,7 +5536,7 @@ mod tests {
         crate::library_transcoder::Transcoder::open(&full).unwrap().write_kept(&(0..64).collect::<Vec<_>>(), &[0.0; 8], &kept_path).unwrap();
         let explanation = explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
         use interchange::Family;
-        let settings = Settings { epochs: Some(8), families: vec![Family::Read, Family::RemovePart, Family::AmplifyPart], ..settings() };
+        let settings = Settings { epochs: Some(8), families: vec![Family::Read, Family::Swap, Family::Zero, Family::Scale], ..settings() };
         let (train, held) = sequences.split_at(4);
         let batches = (train.len() / settings.batch_sequences) as u64;
         let groups = explanation.groups.len();
