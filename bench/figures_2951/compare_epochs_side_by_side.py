@@ -41,7 +41,9 @@ def thresholds(path):
     out = []
     for i in range(len(shapes) - 1):
         (k, d), (k2, one) = shapes[i], shapes[i + 1]
-        if k == k2 and one == 1 and d > 1 and k > 1:
+        # A gate [k, d] and its bias [k, 1]; an output map [d, k] and a sink [d, 1] share the same
+        # first dimension, the model width, which is excluded.
+        if k == k2 and one == 1 and d > 1 and k > 1 and k not in (768, 1024):
             out.append(round(float(np.median(means[i + 1][:, 0] / np.linalg.norm(means[i], axis=1))), 3))
     return h['epoch'], out
 
