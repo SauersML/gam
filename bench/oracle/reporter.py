@@ -12,8 +12,9 @@ parameter_output (a component's action on a probe state: the pair (x, P x)).
 
 Injection (the activation oracle's hook, as in nl_probes/utils/steering_hooks.py
 get_hf_activation_steering_hook and the release's ao_config: hook layer 1, placeholder " ?", coefficient
-1): the user turn begins with one placeholder token per packet vector; after decoder layer `hook_layer`
-the residual r at a placeholder becomes r + ||r|| c v / ||v||. The normalization removes the vector's
+1): the user turn begins with one placeholder token per packet vector; after decoder layer 1 (--inject 1),
+or after the vector's own layer (--inject own: the layer its packet entry names, a component's own place
+in the model it is read from), the residual r at a placeholder becomes r + ||r|| c v / ||v||. The normalization removes the vector's
 magnitude, which is evidence (a response of size 1 and one of size 10 differ), so a learned term is added
 there too: an embedding of the vector's role and layer and a small network of its log norm and zero flag,
 initialized to zero so the reporter starts as the released oracle.
@@ -132,11 +133,12 @@ class Magnitude(torch.nn.Module):
 
 
 class Injection:
-    """A forward hook on decoder layer `hook_layer`: per batch row, at its placeholder positions, the
-    norm-matched vectors plus the magnitude term (module note)."""
+    """A forward hook on one decoder layer (`index`): per batch row, at the placeholder positions of the
+    vectors injected after that layer, the norm-matched vectors plus the magnitude term (module note)."""
 
-    def __init__(self, coefficient: float):
+    def __init__(self, coefficient: float, index: int):
         self.coefficient = coefficient
+        self.index = index
         self.batch = None
 
     def set(self, batch):
@@ -146,7 +148,11 @@ class Injection:
         resid = output[0] if isinstance(output, tuple) else output
         if self.batch is None or resid.shape[1] <= 1:
             return output
-        rows, cols, unit, extra, active = self.batch
+        rows, cols, unit, extra, active, at = self.batch
+        here = at == self.index
+        if not bool(here.any()):
+            return output
+        rows, cols, unit, extra, active = rows[here], cols[here], unit[here], extra[here], active[here]
         original = resid[rows, cols]
         norms = original.norm(dim=-1, keepdim=True)
         steered = original + extra.to(resid.dtype)
@@ -244,7 +250,7 @@ def collate(examples, shard: Shard, encoder: Encoder, condition: str, partners: 
 
 
 class Reporter:
-    def __init__(self, base: str, adapter: str | None, lora_rank: int, hook_layer: int, coefficient: float, dev):
+    def __init__(self, base: str, adapter: str | None, lora_rank: int, inject: str, coefficient: float, dev):
         from peft import LoraConfig, PeftModel, get_peft_model
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -258,10 +264,14 @@ class Reporter:
             self.model = get_peft_model(model, LoraConfig(r=lora_rank, lora_alpha=lora_rank, target_modules="all-linear", lora_dropout=0.0))
         config = model.config
         self.magnitude = Magnitude(config.hidden_size, config.num_hidden_layers).to(dev)
-        self.injection = Injection(coefficient)
         self.encoder = Encoder(self.tokenizer)
         layers = self.model.get_base_model().model.layers
-        layers[hook_layer].register_forward_hook(self.injection)
+        # Each vector enters after one decoder layer: a fixed layer (the released oracle's is 1), or with
+        # inject = "own" the layer its packet entry names (a component's own layer).
+        self.inject = inject
+        self.injections = [Injection(coefficient, i) for i in range(len(layers))]
+        for layer, hook in zip(layers, self.injections):
+            layer.register_forward_hook(hook)
 
     def parameters(self):
         return [p for p in self.model.parameters() if p.requires_grad] + list(self.magnitude.parameters())
@@ -269,12 +279,15 @@ class Reporter:
     def log_q(self, ids, mask, last, injection, valid, k):
         rows, cols, unit, (roles, layers, log_norm, zero), keep = injection
         extra = self.magnitude(roles, layers, log_norm, zero)
-        self.injection.set((rows, cols, unit, extra, keep))
+        at = layers.clamp(max=len(self.injections) - 1) if self.inject == "own" else torch.full_like(layers, int(self.inject))
+        for hook in self.injections:
+            hook.set((rows, cols, unit, extra, keep, at))
         inner = self.model.get_base_model()
         try:
             hidden = inner.model(input_ids=ids, attention_mask=mask).last_hidden_state
         finally:
-            self.injection.set(None)
+            for hook in self.injections:
+                hook.set(None)
         # The output layer only at each row's last prompt position, only on the letters.
         final = hidden[torch.arange(ids.shape[0], device=self.dev), last]
         logits = torch.nn.functional.linear(final, inner.lm_head.weight[self.encoder.letters[:k]]).float()
@@ -290,7 +303,7 @@ def train(args):
     dev = device()
     torch.manual_seed(args.seed)
     shard = Shard(Path(args.shard))
-    reporter = Reporter(args.base, args.adapter, args.lora_rank, args.hook_layer, args.coefficient, dev)
+    reporter = Reporter(args.base, args.adapter, args.lora_rank, args.inject, args.coefficient, dev)
     train_set, test_set = shard.split("train"), shard.split("test")
     partners = {**shuffled_sources(train_set, args.seed), **shuffled_sources(test_set, args.seed + 1)}
     optimizer = torch.optim.AdamW(reporter.parameters(), lr=args.lr, weight_decay=0.0)
@@ -312,7 +325,7 @@ def train(args):
         log.flush()
     scores = evaluate(reporter, shard, test_set, args.condition, partners, args.batch, dev)
     (out / "test.jsonl").write_text("".join(json.dumps(s) + "\n" for s in scores))
-    summary = {"condition": args.condition, "base": args.base, "adapter": args.adapter, "steps": args.steps, "lr": args.lr, "batch": args.batch, "seed": args.seed,
+    summary = {"condition": args.condition, "inject": args.inject, "base": args.base, "adapter": args.adapter, "steps": args.steps, "lr": args.lr, "batch": args.batch, "seed": args.seed,
                "test_examples": len(scores), "test_log_score_nats": float(np.mean([s["log_score"] for s in scores])), "seconds": time.time() - started}
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
     print(json.dumps(summary))
@@ -335,7 +348,9 @@ def compare(args):
     runs = {}
     for d in args.runs:
         summary = json.loads((Path(d) / "summary.json").read_text())
-        runs[summary["condition"]] = {r["id"]: r["log_score"] for r in read_jsonl(Path(d) / "test.jsonl")}
+        inject = summary.get("inject", "1")
+        name = summary["condition"] if inject == "1" else f"{summary['condition']}@{inject}"
+        runs[name] = {r["id"]: r["log_score"] for r in read_jsonl(Path(d) / "test.jsonl")}
     if "transcript" not in runs:
         raise SystemExit("compare needs the transcript run")
     base = runs["transcript"]
@@ -414,7 +429,7 @@ def main():
     t.add_argument("--base", required=True)
     t.add_argument("--adapter")
     t.add_argument("--lora-rank", type=int, default=16, help="a new adapter's rank (ignored with --adapter, whose own configuration holds)")
-    t.add_argument("--hook-layer", type=int, default=1)
+    t.add_argument("--inject", default="1", help="the decoder layer after which vectors enter (the released oracle's: 1), or 'own': each vector's own packet layer")
     t.add_argument("--coefficient", type=float, default=1.0)
     t.add_argument("--shard", required=True)
     t.add_argument("--condition", required=True, choices=CONDITIONS)
