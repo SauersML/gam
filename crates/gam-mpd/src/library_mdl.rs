@@ -1624,8 +1624,15 @@ impl Scorer {
     fn new(device: &Device, native: &OperatorProgram, explanation: &Explanation, settings: &Settings) -> Result<Self, String> {
         let sites: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
         let reads = interchange::reads(native, &sites)?;
-        let experiments =
+        let mut experiments =
             Interchange::new(device, native, &sites, &explanation.artifact, &explanation.trainable, reads, settings.numeric_bytes, settings.head_tile_rows)?;
+        // `MPD_ENGINE=decoder` runs `M` and `P` on the fused decoder engines with f32 products
+        // (`Interchange::fuse`): the decoder's gate, its throughput against the programs' in the
+        // same fit. The gate's outcome deletes one of the two.
+        if std::env::var("MPD_ENGINE").as_deref() == Ok("decoder") {
+            let fused = experiments.fuse(gam_gpu::tensor::Arithmetic::F32)?;
+            log::info!("library engine: decoder (P fused: {fused})");
+        }
         let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
         let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
