@@ -1,1 +1,1 @@
-{"export_sha256": "1de210e36728dbb52bc53920f40cbc3e3d8a3f70352e9785221d7e36ff632fe1", "context": 512, "held_out": [1024, 1028], "batch": 16, "numeric_bytes": 4000000000, "tile_rows": 1024}
+{"export_sha256": "1de210e36728dbb52bc53920f40cbc3e3d8a3f70352e9785221d7e36ff632fe1", "context": 512, "held_out": [1024, 1028], "batch": 16, "numeric_bytes": 8000000000, "tile_rows": 1024}
