@@ -1046,6 +1046,52 @@ impl Device {
         }
     }
 
+    /// Over the entries of the columns `alive` marks (1), at every row: `(1, v ≠ 0, |v| > √(s²
+    /// max(σ²_z, 0) + φ² max(σ²_y, 0)))` added into row 0 of `sums` (1 × 3, float64 where the
+    /// device holds it), `v` a function's value, `s` its slope against its input's posterior
+    /// noise `σ²_z`, and with a second input (`noise_y`, a gated law) `φ` the value's other factor
+    /// and its noise `σ²_y`: the entries counted, those nonzero, and those whose value exceeds its
+    /// posterior noise. Every rows × functions input is in one storage.
+    pub fn resolved_counts(
+        &self,
+        (value, slope, phi): (&Tensor, &Tensor, &Tensor),
+        (noise_z, noise_y): (&Tensor, Option<&Tensor>),
+        alive: &Indices,
+        sums: &mut Tensor,
+    ) -> Result<(), GpuError> {
+        for (t, what) in [(slope, "slope"), (phi, "factor"), (noise_z, "input noise")].into_iter().chain(noise_y.map(|t| (t, "second noise"))) {
+            same(value, t, what)?;
+        }
+        if alive.len != value.cols || sums.dim() != (1, 3) {
+            return Err(shape(format!("{} column flags and {:?} sums for {:?} values", alive.len, sums.dim(), value.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (v, s, p, z, flags, cols) = (host(value)?, host(slope)?, host(phi)?, host(noise_z)?, host_indices(alive)?, value.cols);
+                let y = noise_y.map(host).transpose()?;
+                let (mut count, mut nonzero, mut resolved) = (0.0, 0.0, 0.0);
+                for i in 0..v.len() {
+                    if flags[i % cols] == 0 {
+                        continue;
+                    }
+                    let noise = s[i] * s[i] * z[i].max(0.0) + y.map_or(0.0, |y| p[i] * p[i] * y[i].max(0.0));
+                    count += 1.0;
+                    nonzero += f64::from(u8::from(v[i] != 0.0));
+                    resolved += f64::from(u8::from(v[i].abs() > noise.sqrt()));
+                }
+                let totals = host_mut(sums)?;
+                totals[0] += count;
+                totals[1] += nonzero;
+                totals[2] += resolved;
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.resolved_counts((value, slope, phi), (noise_z, noise_y), alive, sums),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.resolved_counts((value, slope, phi), (noise_z, noise_y), alive, sums),
+        }
+    }
+
     /// `x[r, :] ← x[r, :] + α row` for every row (`row` is `1 × cols`).
     pub fn add_row(&self, x: &mut Tensor, alpha: f64, row: &Tensor) -> Result<(), GpuError> {
         if row.rows != 1 || row.cols != x.cols {
@@ -3989,6 +4035,36 @@ extern "C" __global__ void group_code_length(u64 n, u64 slot, const double* dive
     }
 }
 
+// `Device::resolved_counts`: every entry into row 0, those of dead columns not live.
+template <typename T>
+__device__ void resolved_counts_body(u64 n, u64 cols, int gated, const T* value, const T* slope, const T* phi, const T* noise_z, const T* noise_y,
+    const unsigned int* alive, double* sums) {
+    WARP_STRIDE(i, n) {
+        bool live = i < n && alive[i % cols] != 0u;
+        double a = 0.0, b = 0.0, c = 0.0;
+        if (live) {
+            double v = (double)value[i], s = (double)slope[i];
+            double noise = s * s * fmax((double)noise_z[i], 0.0);
+            if (gated) {
+                double p = (double)phi[i];
+                noise += p * p * fmax((double)noise_y[i], 0.0);
+            }
+            a = 1.0; b = v != 0.0 ? 1.0 : 0.0; c = fabs(v) > sqrt(noise) ? 1.0 : 0.0;
+        }
+        group_add(sums, 0u, live, a, b, c);
+    }
+}
+
+extern "C" __global__ void resolved_counts_f64(u64 n, u64 cols, int gated, const double* value, const double* slope, const double* phi, const double* noise_z,
+    const double* noise_y, const unsigned int* alive, double* sums) {
+    resolved_counts_body<double>(n, cols, gated, value, slope, phi, noise_z, noise_y, alive, sums);
+}
+
+extern "C" __global__ void resolved_counts_f32(u64 n, u64 cols, int gated, const float* value, const float* slope, const float* phi, const float* noise_z,
+    const float* noise_y, const unsigned int* alive, double* sums) {
+    resolved_counts_body<float>(n, cols, gated, value, slope, phi, noise_z, noise_y, alive, sums);
+}
+
 extern "C" __global__ void group_divergence(u64 n, double* sums, double* variance, double* divergence) {
     GRID_STRIDE(g, n) {
         double count = sums[3 * g], second = sums[3 * g + 1], log_variance = sums[3 * g + 2];
@@ -5830,6 +5906,25 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
             unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor group_code_length").map(|_| ())
         }
 
+        pub(super) fn resolved_counts(
+            &self,
+            (value, slope, phi): (&Tensor, &Tensor, &Tensor),
+            (noise_z, noise_y): (&Tensor, Option<&Tensor>),
+            alive: &Indices,
+            sums: &mut Tensor,
+        ) -> Result<(), GpuError> {
+            let (n, cols, storage) = (value.len() as u64, value.cols as u64, value.storage());
+            let gated = i32::from(noise_y.is_some());
+            let f = self.posterior_kernel("resolved_counts", storage)?;
+            let mut builder = self.stream.launch_builder(&f);
+            builder.arg(&n).arg(&cols).arg(&gated).input(value, storage)?.input(slope, storage)?.input(phi, storage)?.input(noise_z, storage)?;
+            // Without a second input its noise is never read; the first stands in for it.
+            builder.input(noise_y.unwrap_or(noise_z), storage)?.arg(index_slice(alive)?).arg(slice_mut(sums)?);
+            // SAFETY: equal-length entry buffers and one flag per column, checked by the caller; a
+            // float64 1 × 3 sum.
+            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("tensor resolved_counts").map(|_| ())
+        }
+
         pub(super) fn group_divergence(&self, sums: &mut Tensor, variance: &mut Tensor, divergence: &mut Tensor) -> Result<(), GpuError> {
             let n = variance.len() as u64;
             let f = self.function("group_divergence")?;
@@ -6831,6 +6926,22 @@ kernel void t_group_code_length(device const float* divergence [[buffer(0)]], de
     group_add(sums, p.count, live, live ? 1.0f : 0.0f, b, 0.0f);
 }
 
+// `Device::resolved_counts` in f32, one thread per entry; `p.count` columns, `p.key.x` nonzero
+// when there is a second input.
+kernel void t_resolved_counts(device const float* value [[buffer(0)]], device const float* slope [[buffer(1)]], device const float* phi [[buffer(2)]],
+                              device const float* noise_z [[buffer(3)]], device const float* noise_y [[buffer(4)]], device const uint* alive [[buffer(5)]],
+                              device float* sums [[buffer(6)]], constant Posterior& p [[buffer(7)]], uint i [[thread_position_in_grid]]) {
+    bool live = i < p.n && alive[i % p.count] != 0u;
+    float a = 0.0f, b = 0.0f, c = 0.0f;
+    if (live) {
+        float v = value[i], s = slope[i];
+        float noise = s * s * max(noise_z[i], 0.0f);
+        if (p.key.x != 0u) noise += phi[i] * phi[i] * max(noise_y[i], 0.0f);
+        a = 1.0f; b = v != 0.0f ? 1.0f : 0.0f; c = fabs(v) > sqrt(noise) ? 1.0f : 0.0f;
+    }
+    group_add(sums, 0u, live, a, b, c);
+}
+
 kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* variance [[buffer(1)]], device float* divergence [[buffer(2)]],
                                constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
     ELEMENTS {
@@ -6873,6 +6984,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
         "t_group_moments",
         "t_group_curvature",
         "t_group_code_length",
+        "t_resolved_counts",
         "t_group_divergence",
         "t_select_sets",
         "t_box_charge",
@@ -7475,6 +7587,26 @@ kernel void t_attention_sums(device const float* out [[buffer(0)]], device const
                 whole(buffer(sums)?),
             ];
             self.posterior("t_group_code_length", &buffers, divergence.len(), p)
+        }
+
+        pub(super) fn resolved_counts(
+            &self,
+            (value, slope, phi): (&Tensor, &Tensor, &Tensor),
+            (noise_z, noise_y): (&Tensor, Option<&Tensor>),
+            alive: &Indices,
+            sums: &mut Tensor,
+        ) -> Result<(), GpuError> {
+            let p = Posterior { count: u32_of(value.cols)?, key: [u32::from(noise_y.is_some()), 0], ..Posterior::default() };
+            let buffers = [
+                whole(buffer(value)?),
+                whole(buffer(slope)?),
+                whole(buffer(phi)?),
+                whole(buffer(noise_z)?),
+                whole(buffer(noise_y.unwrap_or(noise_z))?),
+                whole(index_buffer(alive)?),
+                whole(buffer(sums)?),
+            ];
+            self.posterior("t_resolved_counts", &buffers, value.len(), p)
         }
 
         pub(super) fn group_divergence(&self, sums: &mut Tensor, variance: &mut Tensor, divergence: &mut Tensor) -> Result<(), GpuError> {

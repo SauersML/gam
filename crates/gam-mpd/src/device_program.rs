@@ -146,11 +146,11 @@ struct Head {
 }
 
 /// The constant of the tanh GELU as the CPU forms it (`operator_program`'s `gelu_tanh`).
-fn gelu_tanh_constant() -> f64 {
+pub(crate) fn gelu_tanh_constant() -> f64 {
     std::f64::consts::FRAC_2_SQRT_PI * std::f64::consts::FRAC_1_SQRT_2
 }
 
-fn law_of(law: Law) -> PointwiseLaw {
+pub(crate) fn law_of(law: Law) -> PointwiseLaw {
     match law {
         Law::Relu => PointwiseLaw::Relu,
         Law::Identity => PointwiseLaw::Identity,

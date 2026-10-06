@@ -399,3 +399,56 @@ fn removal_sums_on_cuda_match_the_host() {
     removal_sums_against_host(&narrow, &wide);
     removal_sums_against_host(&wide, &wide);
 }
+
+/// `resolved_counts` of a gated and an ungated layer on `fit` (sums on `wide`): values, slopes and
+/// noises from the case's arrays, a dead column, and exact zeros in the values.
+fn resolved_counts_on(fit: &Device, wide: &Device) -> [Array2<f64>; 2] {
+    let c = case();
+    let mut value = c.mean.clone();
+    value.row_mut(1).fill(0.0);
+    let (slope, phi, noise_z, noise_y) = (c.gradient.clone(), c.factor.clone(), c.log_sd.mapv(|s| if s.is_finite() { (2.0 * s).exp() } else { 0.0 }), c.moments[0].clone());
+    let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
+    let alive = fit.upload_indices(&(0..value.ncols()).map(|j| u32::from(j % 7 != 3)).collect::<Vec<_>>()).unwrap();
+    let mut gated = wide.zeros(1, 3).unwrap();
+    fit.resolved_counts((&up(&value), &up(&slope), &up(&phi)), (&up(&noise_z), Some(&up(&noise_y))), &alive, &mut gated).unwrap();
+    let mut plain = wide.zeros(1, 3).unwrap();
+    fit.resolved_counts((&up(&value), &up(&slope), &up(&value)), (&up(&noise_z), None), &alive, &mut plain).unwrap();
+    [wide.download(&gated).unwrap(), wide.download(&plain).unwrap()]
+}
+
+fn resolved_counts_against_host(fit: &Device, wide: &Device) {
+    let host = Device::host();
+    let expected = resolved_counts_on(&host, &host);
+    // An entry within f32 rounding of its noise may fall either way: allow a few.
+    for (k, (actual, expected)) in resolved_counts_on(fit, wide).iter().zip(&expected).enumerate() {
+        assert_eq!(actual[(0, 0)], expected[(0, 0)], "layer {k}: entries counted");
+        assert_eq!(actual[(0, 1)], expected[(0, 1)], "layer {k}: nonzero entries");
+        assert!((actual[(0, 2)] - expected[(0, 2)]).abs() <= 2.0, "layer {k}: resolved {} against {}", actual[(0, 2)], expected[(0, 2)]);
+    }
+}
+
+#[test]
+fn resolved_counts_on_the_host_count_their_entries() {
+    let host = Device::host();
+    let [gated, plain] = resolved_counts_on(&host, &host);
+    let c = case();
+    let alive = (0..c.mean.ncols()).filter(|j| j % 7 != 3).count() * c.mean.nrows();
+    assert_eq!(gated[(0, 0)], alive as f64);
+    assert_eq!(plain[(0, 0)], alive as f64);
+    assert!(gated[(0, 1)] < alive as f64 && gated[(0, 2)] <= gated[(0, 1)] && plain[(0, 2)] <= plain[(0, 1)]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn resolved_counts_on_the_apple_gpu_match_the_host() {
+    let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
+    resolved_counts_against_host(&metal, &metal);
+}
+
+#[test]
+fn resolved_counts_on_cuda_match_the_host() {
+    let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
+    let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
+    resolved_counts_against_host(&narrow, &wide);
+    resolved_counts_against_host(&wide, &wide);
+}

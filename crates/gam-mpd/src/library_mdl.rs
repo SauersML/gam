@@ -154,6 +154,7 @@
 use crate::{
     artifact::{Argument, Artifact, Callee, Owner},
     device_posterior::{DevicePosterior, Ivon},
+    device_program::{gelu_tanh_constant, law_of},
     interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable, Targets},
     library_compensation::Compensation,
     library_removal::{self, Search},
@@ -1491,76 +1492,81 @@ fn held_out(
 }
 
 /// Per layer, the survivors of `posterior` and its functions' activity on `sequences` at the
-/// posterior mean (`LayerCount`).
+/// posterior mean (`LayerCount`), counted on the device (`Device::resolved_counts`).
 fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_posterior): (&Posterior, &DevicePosterior), sequences: &[Vec<u32>], settings: &Settings) -> Result<Vec<LayerCount>, String> {
     device_posterior.mean_into(scorer.experiments.explanation_mut())?;
     let variance = |op: usize| -> Result<Array2<f64>, String> { Ok(posterior.log_sd[scorer.at(op)?].mapv(|s| (2.0 * s).exp())) };
     let (_, p) = scorer.experiments.models();
     let (program, d) = (p.program, p.program.device());
+    // The counts are summed in float64 where the device holds it.
+    let wide = match d.with_storage(Storage::F64) {
+        Ok(wide) => wide,
+        Err(_) => d.clone(),
+    };
     let active = |g: &usize| posterior.active[*g];
     let mut out = Vec::with_capacity(scorer.layers());
-    // Per map its weights' posterior variances on the device and its bias's (zero without one).
-    let variances = |map: &Map| -> Result<(Tensor, Vec<f64>), String> {
+    // Per map its weights' posterior variances and its bias's (zero without one), on the device.
+    let variances = |map: &Map| -> Result<(Tensor, Tensor), String> {
         let weights = d.upload(variance(map.operator)?.view()).map_err(error)?;
         let bias = match map.bias {
             Some(b) => variance(b)?.column(0).to_vec(),
             None => vec![0.0; program.widths()[map.node]],
         };
-        Ok((weights, bias))
+        Ok((weights, d.upload_vec(1, bias.len(), bias).map_err(error)?))
     };
+    // Per layer its surviving functions' flags, its law per function, and its maps' variances.
     let mut gates = Vec::with_capacity(scorer.layers());
     for (layer, mlp) in explanation.layers.iter().zip(&scorer.mlps) {
-        let surviving: Vec<bool> = layer.functions.iter().map(|groups| groups.iter().all(active)).collect();
+        let surviving: Vec<u32> = layer.functions.iter().map(|groups| u32::from(groups.iter().all(active))).collect();
         out.push(LayerCount {
             heads: layer.heads.iter().filter(|(_, values)| values.iter().any(active)).count(),
             planes: layer.heads.iter().map(|(planes, _)| planes.iter().filter(|g| active(g)).count()).sum(),
             values: layer.heads.iter().map(|(_, values)| values.iter().filter(|g| active(g)).count()).sum(),
-            functions: surviving.iter().filter(|s| **s).count(),
+            functions: surviving.iter().filter(|s| **s == 1).count(),
             nonzero_per_token: 0.0,
             resolved_per_token: 0.0,
         });
-        gates.push((surviving, variances(&mlp.gate)?, mlp.up.as_ref().map(variances).transpose()?));
+        let codes = d.upload_indices(&vec![law_of(mlp.law).code(); surviving.len()]).map_err(error)?;
+        let alive = d.upload_indices(&surviving).map_err(error)?;
+        gates.push((alive, codes, variances(&mlp.gate)?, mlp.up.as_ref().map(variances).transpose()?));
     }
     let mut rows = 0usize;
     for chunk in sequences.chunks(settings.batch_sequences) {
         let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
         let trace = program.forward(&family)?;
-        for ((count, mlp), (surviving, gate, up)) in out.iter_mut().zip(&scorer.mlps).zip(&gates) {
-            let x = d.download(trace.value(mlp.input)?).map_err(error)?;
-            let squares = d.upload(x.mapv(|v| v * v).view()).map_err(error)?;
+        for ((count, mlp), (alive, codes, gate, up)) in out.iter_mut().zip(&scorer.mlps).zip(&gates) {
+            let x = trace.value(mlp.input)?;
+            let mut squares = d.empty(x.rows(), x.cols()).map_err(error)?;
+            d.hadamard(&mut squares, x, x, false).map_err(error)?;
             // `s²` of each function's value at every token: `Σ_j σ²_j x_j²` plus the bias's `σ²`.
-            let noise = |(weights, bias): &(Tensor, Vec<f64>)| -> Result<Array2<f64>, String> {
-                let mut s2 = d.zeros(x.nrows(), surviving.len()).map_err(error)?;
+            let noise = |(weights, bias): &(Tensor, Tensor)| -> Result<Tensor, String> {
+                let mut s2 = d.empty(x.rows(), weights.rows()).map_err(error)?;
                 d.gemm(&mut s2, 1.0, &squares, Op::N, weights, Op::T, 0.0, program.arithmetic()).map_err(error)?;
-                let mut s2 = d.download(&s2).map_err(error)?;
-                s2.rows_mut().into_iter().for_each(|mut row| row.iter_mut().zip(bias).for_each(|(v, b)| *v += b));
+                d.add_row(&mut s2, 1.0, bias).map_err(error)?;
                 Ok(s2)
             };
+            let (z, a) = (trace.value(mlp.gate.node)?, trace.value(mlp.activation)?);
             let sz2 = noise(gate)?;
-            let z = d.download(trace.value(mlp.gate.node)?).map_err(error)?;
-            let a = d.download(trace.value(mlp.activation)?).map_err(error)?;
-            let gated = match (&mlp.up, up) {
-                (Some(map), Some(variances)) => Some((d.download(trace.value(map.node)?).map_err(error)?, noise(variances)?)),
-                _ => None,
-            };
-            let (nonzero, resolved) = (0..x.nrows())
-                .into_par_iter()
-                .map(|t| {
-                    let (mut nonzero, mut resolved) = (0usize, 0usize);
-                    for (i, alive) in surviving.iter().enumerate() {
-                        if *alive {
-                            let (zi, phi) = (z[[t, i]], a[[t, i]]);
-                            let (yi, sy2) = gated.as_ref().map_or((1.0, 0.0), |(y, sy2)| (y[[t, i]], sy2[[t, i]]));
-                            let slope = mlp.law.derivative(zi) * yi;
-                            nonzero += usize::from(phi * yi != 0.0);
-                            resolved += usize::from((phi * yi).abs() > (slope * slope * sz2[[t, i]].max(0.0) + phi * phi * sy2.max(0.0)).sqrt());
-                        }
-                    }
-                    (nonzero, resolved)
-                })
-                .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-            count.nonzero_per_token += nonzero as f64;
-            count.resolved_per_token += resolved as f64;
+            let mut sums = wide.zeros(1, 3).map_err(error)?;
+            match (&mlp.up, up) {
+                (Some(map), Some(variances)) => {
+                    // A gated law: the value φ(z) y, its slope φ'(z) y against the gate's noise and
+                    // φ(z) against the up direction's.
+                    let y = trace.value(map.node)?;
+                    let mut value = d.empty(a.rows(), a.cols()).map_err(error)?;
+                    d.hadamard(&mut value, a, y, false).map_err(error)?;
+                    let slope = d.law_slopes(y, z, codes, gelu_tanh_constant()).map_err(error)?;
+                    d.resolved_counts((&value, &slope, a), (&sz2, Some(&noise(variances)?)), alive, &mut sums).map_err(error)?;
+                }
+                _ => {
+                    let ones = d.broadcast_rows(&d.upload_vec(1, z.cols(), vec![1.0; z.cols()]).map_err(error)?, z.rows()).map_err(error)?;
+                    let slope = d.law_slopes(&ones, z, codes, gelu_tanh_constant()).map_err(error)?;
+                    d.resolved_counts((a, &slope, a), (&sz2, None), alive, &mut sums).map_err(error)?;
+                }
+            }
+            let sums = wide.download(&sums).map_err(error)?;
+            count.nonzero_per_token += sums[[0, 1]];
+            count.resolved_per_token += sums[[0, 2]];
         }
         rows += family.rows;
     }
