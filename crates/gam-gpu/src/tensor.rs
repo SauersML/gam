@@ -3116,15 +3116,22 @@ fn philox(key: u64, stream: u64, index: u64) -> [u32; 4] {
     c
 }
 
+/// The key bit that negates a draw: keys `k` and `k ^ ANTITHETIC` draw `ε` and `−ε`
+/// ([`posterior_normal`]), an antithetic pair whose members are each standard normal.
+pub const ANTITHETIC: u64 = 1 << 63;
+
 /// The standard normal draw `index` of `(key, stream)`: Box–Muller in f32 on the first two words of
-/// `philox`, `√(−2 ln u₁) cos(2π u₂)` with `u₁ = (w₀ + ½) 2⁻³²` and `u₂ = w₁ 2⁻³²`. Every backend
-/// computes it alike (up to its f32 `log` and `cos`), so a draw is regenerated from its counter.
+/// `philox` (keyed by `key` without its [`ANTITHETIC`] bit), `√(−2 ln u₁) cos(2π u₂)` with
+/// `u₁ = (w₀ + ½) 2⁻³²` and `u₂ = w₁ 2⁻³²`, negated when `key` has the [`ANTITHETIC`] bit. Every
+/// backend computes it alike (up to its f32 `log` and `cos`), so a draw is regenerated from its
+/// counter.
 #[must_use]
 pub fn posterior_normal(key: u64, stream: u64, index: u64) -> f32 {
-    let w = philox(key, stream, index);
+    let w = philox(key & !ANTITHETIC, stream, index);
     let scale = 2.328_306_4e-10_f32;
     let (u1, u2) = ((w[0] as f32 + 0.5) * scale, w[1] as f32 * scale);
-    (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+    let z = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
+    if key & ANTITHETIC == 0 { z } else { -z }
 }
 
 fn host_softmax(z: &[f64]) -> Vec<f64> {
@@ -3824,10 +3831,11 @@ extern "C" __global__ void softmax_quadratic(unsigned int rows, unsigned int col
 }
 
 // The standard normal draw `index` of (key, stream): Philox4x32-10, then Box–Muller in float
-// (`posterior_normal` on the host).
+// (`posterior_normal` on the host), negated for a key with its top (antithetic) bit set.
 __device__ float posterior_normal(u64 key, u64 stream, u64 index) {
     unsigned int c0 = (unsigned int)index, c1 = (unsigned int)(index >> 32), c2 = (unsigned int)stream, c3 = (unsigned int)(stream >> 32);
-    unsigned int k0 = (unsigned int)key, k1 = (unsigned int)(key >> 32);
+    unsigned int k0 = (unsigned int)key, k1 = (unsigned int)(key >> 32) & 0x7FFFFFFFu;
+    float sign = (key >> 63) ? -1.0f : 1.0f;
     for (int round = 0; round < 10; ++round) {
         if (round > 0) { k0 += 0x9E3779B9u; k1 += 0xBB67AE85u; }
         unsigned int hi0 = __umulhi(0xD2511F53u, c0), lo0 = 0xD2511F53u * c0;
@@ -3835,7 +3843,7 @@ __device__ float posterior_normal(u64 key, u64 stream, u64 index) {
         c0 = hi1 ^ c1 ^ k0; c1 = lo1; c2 = hi0 ^ c3 ^ k1; c3 = lo0;
     }
     float u1 = ((float)c0 + 0.5f) * 2.3283064e-10f, u2 = (float)c1 * 2.3283064e-10f;
-    return sqrtf(-2.0f * logf(u1)) * cosf(6.28318530717958647692f * u2);
+    return sign * (sqrtf(-2.0f * logf(u1)) * cosf(6.28318530717958647692f * u2));
 }
 
 // The math of an entry type: float entries in float, double in double.
@@ -6848,9 +6856,11 @@ kernel void t_box_charge(device const float* z [[buffer(0)]], device const float
 }
 
 // The standard normal draw `index` of (key, stream): Philox4x32-10, then Box–Muller
-// (`posterior_normal` on the host; indices fit 32 bits here).
+// (`posterior_normal` on the host; indices fit 32 bits here), negated for a key with its top
+// (antithetic) bit set.
 inline float posterior_normal(uint2 key, uint2 stream, uint index) {
-    uint c0 = index, c1 = 0u, c2 = stream.x, c3 = stream.y, k0 = key.x, k1 = key.y;
+    uint c0 = index, c1 = 0u, c2 = stream.x, c3 = stream.y, k0 = key.x, k1 = key.y & 0x7FFFFFFFu;
+    float sign = (key.y >> 31) != 0u ? -1.0f : 1.0f;
     for (int round = 0; round < 10; ++round) {
         if (round > 0) { k0 += 0x9E3779B9u; k1 += 0xBB67AE85u; }
         uint hi0 = mulhi(0xD2511F53u, c0), lo0 = 0xD2511F53u * c0;
@@ -6858,7 +6868,7 @@ inline float posterior_normal(uint2 key, uint2 stream, uint index) {
         c0 = hi1 ^ c1 ^ k0; c1 = lo1; c2 = hi0 ^ c3 ^ k1; c3 = lo0;
     }
     float u1 = (float(c0) + 0.5f) * 2.3283064e-10f, u2 = float(c1) * 2.3283064e-10f;
-    return sqrt(-2.0f * log(u1)) * cos(6.28318530717958647692f * u2);
+    return sign * (sqrt(-2.0f * log(u1)) * cos(6.28318530717958647692f * u2));
 }
 
 // The parameters of the posterior kernels (Rust `Posterior`).

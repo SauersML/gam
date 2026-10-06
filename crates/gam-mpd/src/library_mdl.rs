@@ -1715,6 +1715,15 @@ fn noise_seed(seed: u64, epoch: usize, batch: usize) -> u64 {
     seed.wrapping_add((epoch as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)).wrapping_add((batch as u64).wrapping_mul(0x8CB9_2BA7_2F3D_8DD7))
 }
 
+/// The weight noise of training step `batch` of `epoch`: the steps pair up, the second of a pair
+/// drawing the first's noise negated (`gam_gpu::tensor::ANTITHETIC`). Each draw alone is a sample
+/// of the posterior, so every step's estimate of `F` and its gradient keep their expectations; the
+/// gradient's term linear in the noise, `H σ ε`, enters a pair's two steps with opposite signs and
+/// cancels in IVON's momentum, which averages over about `1 / (1 − β₁)` steps.
+fn step_seed(seed: u64, epoch: usize, batch: usize) -> u64 {
+    if batch % 2 == 1 { noise_seed(seed, epoch, batch - 1) ^ gam_gpu::tensor::ANTITHETIC } else { noise_seed(seed, epoch, batch) }
+}
+
 /// A running mean of bits over scored tokens.
 #[derive(Clone, Copy, Debug, Default)]
 struct Mean {
@@ -2781,7 +2790,7 @@ pub fn fit_from(
             let step_started = Instant::now();
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
-            let key = noise_seed(settings.seed, epoch + 1, b);
+            let key = step_seed(settings.seed, epoch + 1, b);
             let (bits, mut gradients, factor) = scorer.score_device(&device_posterior, &batch, &experiments, Some(key), true)?;
             let factor = factor.ok_or("no Gauss–Newton factor")?;
             for (e, bits) in experiments.iter().zip(&bits) {
@@ -3942,6 +3951,22 @@ mod tests {
                 assert!(gap < 1e-12, "the rotated device step's {field} differs from the host step's by {gap}");
             }
         }
+    }
+
+    #[test]
+    fn paired_training_steps_draw_antithetic_noise() {
+        for b in [0, 2, 6] {
+            let (first, second) = (step_seed(7, 3, b), step_seed(7, 3, b + 1));
+            assert_ne!(first, second);
+            for i in 0..256 {
+                assert_eq!(gam_gpu::tensor::posterior_normal(second, 5, i), -gam_gpu::tensor::posterior_normal(first, 5, i));
+            }
+        }
+        // A key and its antithetic twin each draw a standard normal.
+        let draws: Vec<f64> = (0..20_000).map(|i| f64::from(gam_gpu::tensor::posterior_normal(step_seed(7, 3, 1), 0, i))).collect();
+        let mean = draws.iter().sum::<f64>() / draws.len() as f64;
+        let variance = draws.iter().map(|z| (z - mean).powi(2)).sum::<f64>() / draws.len() as f64;
+        assert!(mean.abs() < 0.03 && (variance - 1.0).abs() < 0.05, "{mean} {variance}");
     }
 
     #[test]

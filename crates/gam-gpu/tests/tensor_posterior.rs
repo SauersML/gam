@@ -10,7 +10,7 @@
 //! A group sum of `n` such terms adds `γ_n` of the summed magnitudes.
 
 use gam_gpu::GpuPolicy;
-use gam_gpu::tensor::{Device, GroupAxis, PosteriorStep, Storage, Tensor, posterior_normal};
+use gam_gpu::tensor::{ANTITHETIC, Device, GroupAxis, PosteriorStep, Storage, Tensor, posterior_normal};
 use ndarray::Array2;
 
 const U: f64 = 1.0 / 16_777_216.0;
@@ -174,6 +174,29 @@ fn draws_are_standard_normal() {
     assert_ne!(posterior_normal(3, 9, 0), posterior_normal(3, 10, 0));
     assert_ne!(posterior_normal(3, 9, 0), posterior_normal(4, 9, 0));
     assert_ne!(posterior_normal(3, 9, 0), posterior_normal(3, 9, 1 << 32));
+}
+
+#[test]
+fn an_antithetic_key_draws_the_negated_noise_on_every_backend() {
+    let key = 0x1234_5678_9ABC_DEF0_u64;
+    for i in [0, 1, 77, 1 << 33] {
+        assert_eq!(posterior_normal(key ^ ANTITHETIC, 9, i), -posterior_normal(key, 9, i));
+    }
+    let (mean, log_sd) = (Array2::from_elem((6, 7), 0.5), Array2::from_shape_fn((6, 7), |(r, c)| -1.0 + 0.1 * (r + c) as f64));
+    let mut devices = vec![Device::host()];
+    devices.extend(Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault"));
+    for d in devices {
+        let up = |a: &Array2<f64>| d.upload(a.view()).unwrap();
+        let (m, s) = (up(&mean), up(&log_sd));
+        let (mut plus, mut minus) = (d.zeros(6, 7).unwrap(), d.zeros(6, 7).unwrap());
+        d.reparameterize(&mut plus, (&m, &s), (key, 4)).unwrap();
+        d.reparameterize(&mut minus, (&m, &s), (key ^ ANTITHETIC, 4)).unwrap();
+        // The pair's samples sum to twice the mean.
+        let (plus, minus) = (d.download(&plus).unwrap(), d.download(&minus).unwrap());
+        for (p, q) in plus.iter().zip(&minus) {
+            assert!((p + q - 1.0).abs() < 1e-6, "{}: {p} and {q}", d.name());
+        }
+    }
 }
 
 #[test]
