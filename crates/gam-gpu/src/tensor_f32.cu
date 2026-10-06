@@ -833,13 +833,23 @@ extern "C" __global__ void split_slices(unsigned int rows, unsigned int cols, un
     }
 }
 
-// g (n × n row-major float64) += 2^(e_i + e_j - 14 - 7 shift) (c_ij, plus c_ji when `both`), c the
-// column-major n × n exact int32 product a_sᵀ a_t of two slices (shift = s + t).
-extern "C" __global__ void split_combine(unsigned int n, int shift, unsigned int both, const int* c, const int* e, double* g) {
-    GRID_STRIDE(i, (u64)n * n) {
-        unsigned int r = (unsigned int)(i / n), col = (unsigned int)(i % n);
-        double v = (double)c[r + (u64)col * n];
-        if (both) v += (double)c[col + (u64)r * n];
-        g[i] += ldexp(v, e[r] + e[col] - 14 - 7 * shift);
+// g (n × n row-major float64) += 2^(e_i + e_j - 15 - 7 shift) (c_ij + c_ji), c the column-major
+// n × n int32 sum of one shift's slice products (twice each a_sᵀ a_t with s < t, once a_sᵀ a_s),
+// whose symmetric part is the shift's whole sum Σ_{s+t=shift} a_sᵀ a_t; the halving is exact. 32 × 32
+// tiles through shared memory, so both c_ij and c_ji are read along their columns.
+extern "C" __global__ void split_combine(unsigned int n, int shift, const int* c, const int* e, double* g) {
+    __shared__ int tile[32][33];
+    unsigned int r0 = blockIdx.y * 32, c0 = blockIdx.x * 32;
+    for (unsigned int y = threadIdx.y; y < 32; y += blockDim.y) {
+        unsigned int r = r0 + threadIdx.x, col = c0 + y;
+        tile[y][threadIdx.x] = (r < n && col < n) ? c[r + (u64)col * n] : 0;
+    }
+    __syncthreads();
+    for (unsigned int y = threadIdx.y; y < 32; y += blockDim.y) {
+        unsigned int r = r0 + y, col = c0 + threadIdx.x;
+        if (r < n && col < n) {
+            double v = (double)tile[threadIdx.x][y] + (double)c[col + (u64)r * n];
+            g[(u64)r * n + col] += ldexp(v, e[r] + e[col] - 15 - 7 * shift);
+        }
     }
 }
