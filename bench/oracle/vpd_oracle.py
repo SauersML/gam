@@ -23,7 +23,8 @@ Questions (a choice among labelled options; q = the softmax of the oracle's logi
                 |v . x| over its measured contexts; the token is the context's peak or uniform, half each;
   direction     removing (alpha 0) or amplifying (alpha 1.5) it: does a listed next token's probability
                 at the marked token rise or fall (a token from the 10 rising and 10 falling most there);
-  top           which of 4 tokens gains most probability when it is removed;
+  top           which of 4 tokens gains most probability when it is removed: the most raised one and 3
+                of the 10 its removal lowers most there;
   continuation  multiplied by alpha (2, 4 or 8, stated), how the model continues greedily after its
                 strongest peak: the amplified continuation, the unedited one (the answer when they agree)
                 and one from another subcomponent;
@@ -74,7 +75,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from reporter import Injection, Magnitude  # noqa: E402
 
-KINDS = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")
+KINDS = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj", "head", "function")  # VPD's sites, then the library's
 LABELS = "ABCDEFGHIJ"
 CONDITIONS = ("graph", "weights", "activity", "nothing", "graph_lens", "weights_lens")
 QUESTIONS = ("activity", "direction", "top", "continuation", "edge", "attribution")
@@ -97,7 +98,36 @@ def device() -> torch.device:
 
 
 def site_name(layer: int, kind: str) -> str:
-    return f"h.{layer}.{'mlp' if kind in ('c_fc', 'down_proj') else 'attn'}.{kind}"
+    return f"h.{layer}.{'mlp' if kind in ('c_fc', 'down_proj', 'function') else 'attn'}.{kind}"
+
+
+def top_pair(M: torch.Tensor, iterations: int = 200) -> tuple[float, torch.Tensor, torch.Tensor]:
+    """The largest singular value of M and its unit left and right vectors (sigma, l, r), by power
+    iteration on M^T M from a fixed start (matrix products only: no decomposition routine)."""
+    r = torch.ones(M.shape[1], dtype=torch.float64) / math.sqrt(M.shape[1])
+    M = M.double()
+    for _ in range(iterations):
+        r = M.T @ (M @ r)
+        r = r / r.norm()
+    l = M @ r
+    sigma = float(l.norm())
+    return sigma, (l / max(sigma, 1e-300)).float(), r.float()
+
+
+def head_vectors(uv: dict) -> None:
+    """A library's heads as two vectors each, beside its MLP functions' {site}.U and {site}.V: the
+    write U = sigma l of the OV map W_O W_V's top singular pair (the residual direction it writes most,
+    scaled by its gain) and the read V = the query-side vector of W_Q^T W_K's top pair (the residual
+    direction its attention reads at the destination; rotary positions left out)."""
+    for key in [k for k in uv if k.endswith(".attn.head.query")]:
+        n = key.removesuffix(".query")
+        Q, K, Vv, O = uv[f"{n}.query"].float(), uv[f"{n}.key"].float(), uv[f"{n}.value"].float(), uv[f"{n}.output"].float()
+        U, V = [], []
+        for h in range(Q.shape[0]):
+            sigma, l, _ = top_pair(O[h] @ Vv[h])
+            U.append(sigma * l)
+            V.append(top_pair(Q[h].T @ K[h])[1])
+        uv[f"{n}.U"], uv[f"{n}.V"] = torch.stack(U), torch.stack(V, 1)
 
 
 def stratum(kl: float) -> int:
@@ -125,7 +155,8 @@ class Table:
         for meta_path in sorted(root.glob("site_*.json")):
             meta = json.loads(meta_path.read_text())
             self.sites[(meta["layer"], meta["site"].split(".")[-1])] = (meta, load_file(str(meta_path.with_suffix(".safetensors"))))
-        self.uv = load_file(str(uv_path))
+        self.uv = load_file(str(uv_path))  # VPD's subcomponents, or a library's functions.safetensors
+        head_vectors(self.uv)
         self.lens = load_file(str(lens)) if lens is not None else None
         self.tok = tokenizers.Tokenizer.from_file(str(tokenizer))
         self.rel = {}
@@ -260,9 +291,12 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
         elif q == "top":
             p = int(d["position"][c, j])
             truth = int(d["up_ids_ablate"][c, j, 0])
-            other = rng.choice([x for x in range(len(contexts)) if x != j])
-            pool = [int(x) for x in d["up_ids_ablate"][c, other].tolist() if int(x) != truth]
-            options = [truth] + (rng.sample(pool, 3) if len(pool) >= 3 else pool + [truth + 1] * (3 - len(pool)))
+            # Distractors: tokens its removal lowers here (likely in this context, so the text alone does not
+            # tell them apart; the direction of its effect does).
+            pool = [int(x) for x in d["down_ids_ablate"][c, j].tolist() if int(x) != truth]
+            if len(pool) < 3:
+                continue
+            options = [truth] + rng.sample(pool, 3)
             order = list(range(4))
             rng.shuffle(order)
             ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=[table.piece(options[i]) for i in order],
@@ -358,6 +392,9 @@ def lens_text(table: Table, layer: int, kind: str, c: int, name: str = "It", rea
     L = table.lens
     n = site_name(layer, kind)
     words = lambda key: ", ".join(table.piece(int(t)) for t in L[f"{n}.{key}"][c].tolist() if t >= 0)  # noqa: E731
+    if kind == "head":
+        attends = f"{name} attends from tokens like {words('attn_from')} to tokens like {words('attn_to')}. " if reads else f"{name}: "
+        return attends + f"Its strongest copying: from tokens like {words('pos_read')} it raises {words('up')} and lowers {words('down')} (from tokens like {words('neg_read')} the reverse)."
     head = f"{name} is positive on tokens like {words('pos_read')}; negative on tokens like {words('neg_read')}. " if reads else f"{name}: "
     if int(L[f"{n}.up"][c, 0]) < 0:
         return head + ("It changes" if reads else "changes") + " attention scores (no direct write)."
@@ -403,7 +440,8 @@ class Oracle(torch.nn.Module):
         model = AutoModelForCausalLM.from_pretrained(base, dtype=dtype).to(dev)
         self.model = get_peft_model(model, LoraConfig(r=lora_rank, lora_alpha=lora_rank, target_modules="all-linear", lora_dropout=0.0))
         width = model.config.hidden_size
-        dims = {"q_proj": (768, 768), "k_proj": (768, 768), "v_proj": (768, 768), "o_proj": (768, 768), "c_fc": (768, 3072), "down_proj": (3072, 768)}
+        dims = {"q_proj": (768, 768), "k_proj": (768, 768), "v_proj": (768, 768), "o_proj": (768, 768), "c_fc": (768, 3072), "down_proj": (3072, 768),
+                "head": (768, 768), "function": (768, 768)}
         self.maps = torch.nn.ModuleDict({f"{k}_{side}": torch.nn.Linear(dims[k][i], width) for k in KINDS for i, side in enumerate(("read", "write"))}).to(dev)
         self.magnitude = Magnitude(width, 4).to(dev)
         self.hook = Injection(1.0, inject)
@@ -422,7 +460,8 @@ class Oracle(torch.nn.Module):
         inner = self.model.get_base_model()
         self.model = PeftModel.from_pretrained(inner, str(run / "adapter"), is_trainable=True)
         state = torch.load(run / "maps.pt")
-        self.maps.load_state_dict(state["maps"])
+        missing = self.maps.load_state_dict(state["maps"], strict=False).missing_keys  # a VPD run read on a library: its kinds' maps start fresh
+        assert all(k.split(".")[0].rsplit("_", 1)[0] in ("head", "function") for k in missing), missing
         self.magnitude.load_state_dict(state["magnitude"])
 
     def encode(self, before: str, after: str, thinking: bool = False) -> tuple[list[int], list[int]]:
@@ -500,6 +539,8 @@ def train(args):
     table = table_of(args)
     data = examples(table, {0, 1, 2, 3} - held, args.examples, args.seed, per_component=args.per_component)
     oracle = Oracle(args.base, args.lora_rank, args.inject, dev)
+    if args.init:  # warm start: an earlier run's adapter and maps (same base model); new kinds' maps start fresh
+        oracle.load(Path(args.init))
     oracle.model.base_model.model.gradient_checkpointing_enable()
     oracle.model.base_model.model.config.use_cache = False
     oracle.model.train()  # checkpointing acts only in training mode (no dropout in Qwen3 or the adapter)
@@ -599,6 +640,7 @@ def main():
     t.add_argument("--out", required=True)
     t.add_argument("--heldout-layers", default="2")
     t.add_argument("--examples", type=int, default=65536)
+    t.add_argument("--init", help="an earlier run to start from (its adapter and maps)")
     t.add_argument("--per-component", type=int, default=1, help="effect questions per drawn subcomponent, at its strongest contexts")
     t.add_argument("--batch", type=int, default=16)
     t.add_argument("--lr", type=float, default=1e-4)

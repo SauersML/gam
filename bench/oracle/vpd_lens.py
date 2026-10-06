@@ -21,7 +21,7 @@ q(up) = sigmoid(beta s), s that change over its scale (|a| over the read lens's 
 lens's), one beta fitted by maximum likelihood on the trained layers' questions and scored on the held-out
 layer, beside the no-input reader's log score on the same questions (and their product of experts).
 
-  vpd_lens.py build --uv UV --data PILE.npy --out LENS.safetensors [--k 8]
+  vpd_lens.py build --uv UV | --functions LIBRARY/functions.safetensors --data PILE.npy --out LENS.safetensors [--k 8]
   vpd_lens.py baseline --labels HELDOUT --relations HELDOUT_REL --uv UV --data PILE.npy --nothing RUN --out OUT.json
 """
 
@@ -52,10 +52,11 @@ def site(layer: int, kind: str) -> str:
 class Lens:
     """The target's weights and the subcomponents' vectors, with the write and read lenses."""
 
-    def __init__(self, uv_path: Path, data: Path):
+    def __init__(self, uv_path: Path | None, data: Path):
         self.t = VM.load_target("cpu")
-        d = load_file(str(uv_path))
-        self.uv = {n: (d[f"{n}.U"].float(), d[f"{n}.V"].float()) for n in VM.site_names()}
+        if uv_path is not None:
+            d = load_file(str(uv_path))
+            self.uv = {n: (d[f"{n}.U"].float(), d[f"{n}.V"].float()) for n in VM.site_names()}
         E = self.t.wte.float()
         self.E = E
         self.Ef = E * self.t.ln_f.float()  # the unembedding through the final norm's gain
@@ -135,6 +136,57 @@ def build(args):
             for name, val in (("pos_read", pos_read), ("neg_read", neg_read), ("up", up), ("down", down)):
                 out[f"{n}.{name}"] = val
             print(json.dumps({"site": n, "subcomponents": C}), flush=True)
+    save_file(out, args.out)
+
+
+@torch.no_grad()
+def build_library(args):
+    """The lens of a library (readout's functions.safetensors): an MLP function i writes h_i u_i (write
+    direction u_i, read through its pre-activation v_i . x + b_i on each token alone, x through the MLP
+    norm); a head is read through the top singular pairs of its OV map W_O W_V (copying: from source
+    tokens along the right vector, writing along the left) and of W_Q^T W_K (attention: from destination
+    tokens along the left vector to source tokens along the right; rotary positions left out)."""
+    from vpd_oracle import top_pair
+
+    lens = Lens(None, Path(args.data))
+    lib = load_file(args.functions)
+    vocab = torch.nonzero(lens.seen).reshape(-1)
+    f = lens.freq[vocab]
+    Ef = lens.Ef[vocab]
+    k = args.k
+    out = {}
+
+    def ranked(a: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:  # [R, T] -> top positive, top negative token ids
+        return vocab[(a * f).topk(k, dim=1).indices].to(torch.int32), vocab[(-a * f).topk(k, dim=1).indices].to(torch.int32)
+
+    def written(r: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:  # [R, 768] write directions -> raised, lowered
+        w = r @ Ef.T
+        w = w - (w * f).sum(1, keepdim=True) / f.sum()
+        return ranked(w)
+
+    for layer in range(lens.t.n_layer):
+        n = f"h.{layer}.mlp.function"
+        U, V = lib[f"{n}.U"].float(), lib[f"{n}.V"].float()
+        bias = lib[f"{n}.bias"].float() if f"{n}.bias" in lib else torch.zeros(U.shape[0])
+        x = lens.Er[vocab] * lens.t.norms[2 * layer + 1].float()
+        parts = {key: [] for key in ("pos_read", "neg_read", "up", "down")}
+        for s0 in range(0, U.shape[0], 512):
+            rows = torch.arange(s0, min(U.shape[0], s0 + 512))
+            for key, val in zip(("pos_read", "neg_read"), ranked((x @ V[:, rows] + bias[rows]).T)):
+                parts[key].append(val)
+            for key, val in zip(("up", "down"), written(U[rows])):
+                parts[key].append(val)
+        out.update({f"{n}.{key}": torch.cat(v) for key, v in parts.items()})
+        n = f"h.{layer}.attn.head"
+        Q, K, Vv, O = (lib[f"{n}.{x_}"].float() for x_ in ("query", "key", "value", "output"))
+        x = lens.Er[vocab] * lens.t.norms[2 * layer].float()
+        ov = [top_pair(O[h] @ Vv[h]) for h in range(Q.shape[0])]
+        qk = [top_pair(Q[h].T @ K[h]) for h in range(Q.shape[0])]
+        out[f"{n}.pos_read"], out[f"{n}.neg_read"] = ranked((x @ torch.stack([r for _, _, r in ov], 1)).T)
+        out[f"{n}.up"], out[f"{n}.down"] = written(torch.stack([left for _, left, _ in ov]))
+        out[f"{n}.attn_from"], _ = ranked((x @ torch.stack([left for _, left, _ in qk], 1)).T)
+        out[f"{n}.attn_to"], _ = ranked((x @ torch.stack([r for _, _, r in qk], 1)).T)
+        print(json.dumps({"layer": layer, "functions": U.shape[0], "heads": Q.shape[0]}), flush=True)
     save_file(out, args.out)
 
 
@@ -258,7 +310,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)
     b = sub.add_parser("build")
-    b.add_argument("--uv", required=True)
+    b.add_argument("--uv", help="VPD's subcomponents (export_uv)")
+    b.add_argument("--functions", help="a library's functions.safetensors (readout's oracle input), in place of --uv")
     b.add_argument("--data", required=True)
     b.add_argument("--out", required=True)
     b.add_argument("--k", type=int, default=8)
@@ -268,7 +321,10 @@ def main():
     s.add_argument("--examples", type=int, default=3000)
     args = ap.parse_args()
     torch.set_grad_enabled(False)
-    {"build": build, "baseline": baseline}[args.command](args)
+    if args.command == "build" and args.functions:
+        build_library(args)
+    else:
+        {"build": build, "baseline": baseline}[args.command](args)
 
 
 if __name__ == "__main__":
