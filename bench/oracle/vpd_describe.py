@@ -298,13 +298,26 @@ def policy_step(oracle: Oracle, table: Table, episodes: "Episodes", convs, place
     return total
 
 
-def components(table: Table, layers: set[int], count: int, rng: random.Random):
+def components(table: Table, layers: set[int], count: int, rng: random.Random, keep=lambda c: True):
+    """`count` subcomponents (layer, kind, table index) of `layers` that `keep` admits."""
     keys = [k for k in table.sites if k[0] in layers]
     out = []
-    for _ in range(count):
+    while len(out) < count:
         layer, kind = keys[rng.randrange(len(keys))]
-        out.append((layer, kind, rng.randrange(table.sites[(layer, kind)][0]["subcomponents"])))
+        c = rng.randrange(table.sites[(layer, kind)][0]["subcomponents"])
+        if keep(c):
+            out.append((layer, kind, c))
     return out
+
+
+def split(config: dict, table: Table, side: str):
+    """The answer run's held-out split: its held-out layers, or with heldout_every its held-out
+    subcomponents (table index a multiple of it) in every layer; (layers, keep) for `side`."""
+    every = config.get("heldout_every", 0)
+    if every:
+        return set(table.layers), ((lambda c: c % every == 0) if side == "heldout" else (lambda c: c % every != 0))
+    held = {int(x) for x in config["heldout_layers"].split(",") if x}
+    return (held if side == "heldout" else set(table.layers) - held), (lambda c: True)
 
 
 def train(args):
@@ -316,7 +329,7 @@ def train(args):
     oracle.load(run)
     target = Target(dev, load_uv(dev, Path(args.uv)), table)
     episodes = Episodes(oracle, table, target, config["condition"], args)
-    held = {int(x) for x in config["heldout_layers"].split(",") if x}
+    trained, keep = split(config, table, "trained")
     optimizer = torch.optim.AdamW(oracle.trainable(), lr=args.lr, weight_decay=0.0)
     rng = random.Random(args.seed)
     out = Path(args.out)
@@ -326,7 +339,7 @@ def train(args):
     for step in range(args.steps):
         if args.hours and time.time() - started > 3600 * args.hours:
             break  # the run's time budget: stop and save the policy as it is
-        comps = [c for c in components(table, set(table.layers) - held, args.components, rng) for _ in range(args.group)]
+        comps = [c for c in components(table, trained, args.components, rng, keep) for _ in range(args.group)]
         oracle.model.eval()
         oracle.model.base_model.model.gradient_checkpointing_disable()  # sampling keeps its cache
         convs, places, own, descriptions, texts, calls = episodes.roll(comps)
@@ -360,8 +373,8 @@ def evaluate(args):
     oracle.load(run)
     target = Target(dev, load_uv(dev, Path(args.uv)), table)
     episodes = Episodes(oracle, table, target, config["condition"], argparse.Namespace(turns=args.turns, tokens=args.tokens))
-    held = {int(x) for x in config["heldout_layers"].split(",") if x}
-    comps = components(table, held, args.count, random.Random(args.seed))
+    heldout, keep = split(config, table, "heldout")
+    comps = components(table, heldout, args.count, random.Random(args.seed), keep)
     rows = []
     for s in range(0, len(comps), args.micro):
         chunk = comps[s : s + args.micro]
