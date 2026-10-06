@@ -2458,28 +2458,32 @@ impl DeviceProgram {
             return Ok(());
         }
         let held = self.held(operator, Role::Product)?;
-        if g[argument].is_none() {
+        // A fresh cotangent's first term writes it whole into an unset buffer (β = 0, a scale
+        // written fresh, the identity's copy) instead of adding into zeros, a memset pass each; the
+        // values are the same, an exact −0 the term makes kept where zeros turned it to +0.
+        let fresh = g[argument].is_none();
+        if fresh {
             if matches!(held, Held::Identity) {
-                // Zeros plus the cotangent, in one pass.
                 g[argument] = Some(d.scaled(1.0, cot).map_err(error)?);
                 return Ok(());
             }
-            g[argument] = Some(d.zeros(rows, self.widths[argument]).map_err(error)?);
+            g[argument] = Some(d.empty(rows, self.widths[argument]).map_err(error)?);
         }
+        let beta = if fresh { 0.0 } else { 1.0 };
         let target = g[argument].as_mut().ok_or("device: cotangent slot")?;
         match held {
             Held::Identity => d.axpy(target, 1.0, cot).map_err(error),
-            Held::Diagonal(diag) => d.scale_columns(target, cot, diag, true).map_err(error),
+            Held::Diagonal(diag) => d.scale_columns(target, cot, diag, !fresh).map_err(error),
             Held::Dense(a) => {
                 let rounded = self.rounded_operator(a, arithmetic)?;
-                d.gemm(target, 1.0, self.operand(cot, half, arithmetic)?, Op::N, rounded.as_deref().unwrap_or(a), Op::N, 1.0, arithmetic).map_err(error)
+                d.gemm(target, 1.0, self.operand(cot, half, arithmetic)?, Op::N, rounded.as_deref().unwrap_or(a), Op::N, beta, arithmetic).map_err(error)
             }
             Held::LowRank(left, right) => {
                 // g (L R) = (g L) R.
                 let (rounded_left, rounded_right) = (self.rounded_operator(left, arithmetic)?, self.rounded_operator(right, arithmetic)?);
                 let mut middle = d.empty(cot.rows(), left.cols()).map_err(error)?;
                 d.gemm(&mut middle, 1.0, self.operand(cot, half, arithmetic)?, Op::N, rounded_left.as_deref().unwrap_or(left), Op::N, 0.0, arithmetic).map_err(error)?;
-                d.gemm(target, 1.0, &middle, Op::N, rounded_right.as_deref().unwrap_or(right), Op::N, 1.0, arithmetic).map_err(error)
+                d.gemm(target, 1.0, &middle, Op::N, rounded_right.as_deref().unwrap_or(right), Op::N, beta, arithmetic).map_err(error)
             }
             Held::Table(_) | Held::Column(_) => Err("device: an operator held in the wrong role".to_string()),
         }
@@ -2530,12 +2534,14 @@ impl DeviceProgram {
         if !needed[heads.input] {
             return Ok(());
         }
-        if grads[heads.input].is_none() {
-            grads[heads.input] = Some(d.zeros(trace.rows, self.widths[heads.input]).map_err(error)?);
+        // As `pull_term`: a fresh cotangent is written whole (β = 0) rather than added into zeros.
+        let fresh = grads[heads.input].is_none();
+        if fresh {
+            grads[heads.input] = Some(d.empty(trace.rows, self.widths[heads.input]).map_err(error)?);
         }
         let weights = self.rounded_operator(&group.stacked.weights, arithmetic)?;
         let target = grads[heads.input].as_mut().ok_or("device: cotangent slot")?;
-        d.gemm(target, 1.0, self.operand(&g_p, &mut half_p, arithmetic)?, Op::N, weights.as_deref().unwrap_or(&group.stacked.weights), Op::N, 1.0, arithmetic).map_err(error)
+        d.gemm(target, 1.0, self.operand(&g_p, &mut half_p, arithmetic)?, Op::N, weights.as_deref().unwrap_or(&group.stacked.weights), Op::N, if fresh { 0.0 } else { 1.0 }, arithmetic).map_err(error)
     }
 
     /// Resident cotangents for explicitly trainable dense operators, including

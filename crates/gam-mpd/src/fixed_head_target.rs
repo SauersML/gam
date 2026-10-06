@@ -569,8 +569,10 @@ impl ResidentHead {
             .map(|s| d.upload_indices(&s.iter().map(|v| u32::from(*v)).collect::<Vec<_>>()))
             .transpose()
             .map_err(error)?;
+        // The sweep writes every row of the seed (its first chunk's product with β = 0 on CUDA, row
+        // tiles elsewhere), so it starts unset.
         let mut seed = if gradient {
-            Some(d.zeros(hidden.rows(), hidden.cols()).map_err(error)?)
+            Some(d.empty(hidden.rows(), hidden.cols()).map_err(error)?)
         } else {
             None
         };
