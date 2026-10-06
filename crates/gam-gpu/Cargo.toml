@@ -35,6 +35,11 @@ objc2-metal = "0.3.2"
 # kernel's throughput on the matrix units.
 objc2-metal-performance-shaders = { version = "0.3.2", default-features = false, features = ["std", "MPSCore", "MPSCoreTypes", "MPSKernel", "MPSMatrix", "MPSMatrixMultiplication"] }
 
+# Its own main reads `--require` (tests/cuda_device.rs).
+[[test]]
+name = "cuda_device"
+harness = false
+
 [dev-dependencies]
 gam-workspace-hack = { path = "../gam-workspace-hack" }
 gam-problem = { path = "../gam-problem" }
