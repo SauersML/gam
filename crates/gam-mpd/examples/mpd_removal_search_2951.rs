@@ -1,22 +1,18 @@
-//! The removal step of a library fit (`gam_mpd::library_mdl`, #2951) run on one checkpoint with
-//! each search of `library_removal`: the previous prefix search (groups in increasing `KL_G`, the
-//! longest prefix bisection finds that does not increase `F`) and the ranked search (groups without
-//! effect first, then units ranked by their predicted change of `F`, in galloping segments). Both
-//! score the fit's own training collection at the fit's weight noise, with least-squares
-//! compensation, and are evaluated on the held-out sequences before and after.
+//! The removal step of a library fit (`gam_mpd::library_mdl`, #2951) run on one checkpoint: the
+//! search of `library_removal` (groups without effect first, then units ranked by their predicted
+//! change of `F`, in segments) scores the fit's own training collection at the fit's weight noise,
+//! with compensation, and is evaluated on the held-out sequences before and after.
 //!
-//! EXPORT SETTINGS.json CHECKPOINT OUT host|gpu [prefix|ranked]
+//! EXPORT SETTINGS.json CHECKPOINT OUT host|gpu
 //!
 //! `EXPORT` and `SETTINGS.json` are the fit's (`mpd_library_mdl_2951`, an engine export);
-//! `CHECKPOINT` is its `checkpoint.bin` (or a copy). `OUT` receives `REPORT.json`, each search's
-//! log (`prefix.removals.jsonl`, `ranked.removals.jsonl`) and `M`'s targets (`targets/`). A sixth
-//! argument runs that search alone.
+//! `CHECKPOINT` is its `checkpoint.bin` (or a copy). `OUT` receives `REPORT.json`, the search's
+//! log (`ranked.removals.jsonl`) and `M`'s targets (`targets/`).
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     engine::{log_to_stderr, sha256},
     import::import_language_model,
     library_mdl::{self, Step},
-    library_removal::Search,
     operator_program::SlotValues,
     run_check::{layer_nodes, split_sites},
 };
@@ -24,7 +20,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::{path::Path, time::Instant};
 
-const USAGE: &str = "EXPORT SETTINGS.json CHECKPOINT OUT host|gpu [prefix|ranked]";
+const USAGE: &str = "EXPORT SETTINGS.json CHECKPOINT OUT host|gpu";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,11 +39,7 @@ fn error(e: impl std::fmt::Display) -> String {
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (export, settings_path, checkpoint, out, mode, only) = match &args[..] {
-        [a, b, c, d, e] => (a, b, c, d, e, None),
-        [a, b, c, d, e, f] => (a, b, c, d, e, Some(f.as_str())),
-        _ => return Err(USAGE.into()),
-    };
+    let [export, settings_path, checkpoint, out, mode] = &args[..] else { return Err(USAGE.into()) };
     let (export, settings_path, checkpoint, out) = (Path::new(export), Path::new(settings_path), Path::new(checkpoint), Path::new(out));
     let settings: Settings = serde_json::from_slice(&std::fs::read(settings_path).map_err(error)?).map_err(error)?;
     if sha256(&export.join("export.json"))? != settings.export_sha256 {
@@ -82,10 +74,8 @@ fn main() -> Result<(), String> {
     let start = library_mdl::checkpoint_posterior(&explanation, checkpoint)?;
     std::fs::create_dir_all(out).map_err(error)?;
     let mut runs = serde_json::Map::new();
-    if only.is_some_and(|o| o != "prefix" && o != "ranked") {
-        return Err(USAGE.into());
-    }
-    for (name, search) in [("prefix", Search::Prefix), ("ranked", Search::Ranked)].into_iter().filter(|(name, _)| only.is_none_or(|o| o == *name)) {
+    let name = "ranked";
+    {
         let started = Instant::now();
         let mut posterior = start.clone();
         let log = out.join(format!("{name}.removals.jsonl"));
@@ -93,7 +83,6 @@ fn main() -> Result<(), String> {
             sequences: &train,
             held,
             settings: &settings.fit,
-            search,
             log: Some(&log),
         };
         let (removal, before, after) = library_mdl::removal_step(&device, &native, &explanation, &mut posterior, step)?;

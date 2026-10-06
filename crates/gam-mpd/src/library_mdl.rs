@@ -195,7 +195,7 @@ use crate::{
     device_program::{gelu_tanh_constant, law_of},
     interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable, Targets},
     library_compensation::Compensation,
-    library_removal::{self, Search},
+    library_removal,
     operator_program::{
         FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, Provenance, Rule, SequenceLayout, SlotValues,
         exact_precision,
@@ -2982,7 +2982,7 @@ pub fn fit_from(
             best = None;
             let log = checkpoint.map(|path| path.with_extension("removals.jsonl"));
             let evidence = Evidence { draws: &draws, sequences, settings };
-            let removal = remove(&mut scorer, &mut device_posterior, &mut posterior, &evidence, explanation, prior.as_deref_mut(), Search::Ranked, log.as_deref())?;
+            let removal = remove(&mut scorer, &mut device_posterior, &mut posterior, &evidence, explanation, prior.as_deref_mut(), log.as_deref())?;
             log::info!("library removal after epoch {epoch}: {} of {} candidates, {} without effect", removal.removed, removal.candidates, removal.dead);
             // The removed groups' entries are exactly zero with `ln σ = −∞`, which the device step
             // leaves alone; the objective left its last trial on the device.
@@ -3149,7 +3149,7 @@ struct Evidence<'a> {
     settings: &'a Settings,
 }
 
-/// The removal step (`library_removal`) of `search` on `posterior`, scored by `F` on the round's
+/// The removal step (`library_removal`) on `posterior`, scored by `F` on the round's
 /// fixed `evidence`, compensated in the MLPs it deletes functions of (`library_compensation`),
 /// logged to `log`.
 fn remove(
@@ -3159,7 +3159,6 @@ fn remove(
     evidence: &Evidence,
     explanation: &Explanation,
     prior: Option<&mut (dyn PriorTerm + 'static)>,
-    search: Search,
     log: Option<&Path>,
 ) -> Result<Removal, String> {
     let mut prior = prior;
@@ -3169,16 +3168,15 @@ fn remove(
     let mut objective = |trial: &Posterior| -> Result<f64, String> {
         Ok(expected_divergence(scorer, device_posterior, trial, draws, sequences, &[], settings, prior.as_deref_mut())? + trial.description() + fixed)
     };
-    library_removal::round(search, explanation, posterior, Some(&compensation), &curvature, &mut objective, log)
+    library_removal::round(explanation, posterior, Some(&compensation), &curvature, &mut objective, log)
 }
 
 /// A removal step run on a posterior outside a fit ([`removal_step`]): the fit's training and
-/// held-out sequences and settings, and the search with its log.
+/// held-out sequences and settings, and the search's log.
 pub struct Step<'a> {
     pub sequences: &'a [Vec<u32>],
     pub held: &'a [Vec<u32>],
     pub settings: &'a Settings,
-    pub search: Search,
     pub log: Option<&'a Path>,
 }
 
@@ -3186,7 +3184,7 @@ pub struct Step<'a> {
 /// collection, weight noise, compensation and acceptance, with the held-out evaluation before and
 /// after.
 pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Explanation, posterior: &mut Posterior, step: Step) -> Result<(Removal, HeldOut, HeldOut), String> {
-    let Step { sequences, held, settings, search, log } = step;
+    let Step { sequences, held, settings, log } = step;
     settings.validate()?;
     let length = sequences.first().map_or(0, Vec::len);
     let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
@@ -3202,7 +3200,7 @@ pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Exp
     let before = evaluate(&mut scorer, posterior)?;
     let evidence = Evidence { draws: &draws, sequences, settings };
     let mut device_posterior = DevicePosterior::new(device, explanation, posterior, tokens as f64, None, 0)?;
-    let removal = remove(&mut scorer, &mut device_posterior, posterior, &evidence, explanation, None, search, log)?;
+    let removal = remove(&mut scorer, &mut device_posterior, posterior, &evidence, explanation, None, log)?;
     let after = evaluate(&mut scorer, posterior)?;
     Ok((removal, before, after))
 }
