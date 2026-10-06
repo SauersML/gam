@@ -2703,8 +2703,9 @@ mod tests {
         // with chance (1 - p)^96).
         let sequences: Vec<Vec<u32>> = sequences.iter().cycle().take(96).cloned().collect();
         let evaluation = held_out(&mut scorer, &explanation, (&posterior, &device_posterior), &sequences, &settings, 72, None).unwrap();
-        for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
-            let bits = bits.expect("every cut and the read patches are drawn");
+        // Every family the held-out sample drew (which hybrid sizes it holds depends on its seed).
+        assert!(evaluation.read_patch.is_some() && evaluation.clean.iter().chain(&evaluation.patched).filter(|b| b.is_some()).count() >= 2);
+        for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]).flatten() {
             assert!(bits.abs() < 1e-10, "the starting library diverges from the model by {bits} bits per token");
         }
         for (count, layer) in evaluation.layers.iter().zip(&explanation.layers) {
@@ -2976,8 +2977,9 @@ mod tests {
         // with chance (1 - p)^96).
         let sequences: Vec<Vec<u32>> = sequences.iter().cycle().take(96).cloned().collect();
         let evaluation = held_out(&mut scorer, &explanation, (&posterior, &device_posterior), &sequences, &settings, 72, None).unwrap();
-        for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
-            let bits = bits.expect("every cut and the read patches are drawn");
+        // Every family the held-out sample drew (which hybrid sizes it holds depends on its seed).
+        assert!(evaluation.read_patch.is_some() && evaluation.clean.iter().chain(&evaluation.patched).filter(|b| b.is_some()).count() >= 2);
+        for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]).flatten() {
             assert!(bits.abs() < 1e-10, "the starting library diverges from the model by {bits} bits per token");
         }
         assert!(evaluation.data_bits_per_token > 0.0, "weight noise costs data");
