@@ -1633,6 +1633,10 @@ impl Scorer {
             let fused = experiments.fuse(gam_gpu::tensor::Arithmetic::F32)?;
             log::info!("library engine: decoder (P fused: {fused})");
         }
+        // Every scoring of the fit (its steps, held-out evaluations and removal comparisons) is of
+        // one fixed collection of experiments, so `M`'s targets are kept on the host while the
+        // process's memory budget admits them.
+        experiments.keep_targets(gam_runtime::resource::MemoryGovernor::global());
         let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
         let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();

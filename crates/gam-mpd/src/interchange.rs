@@ -63,10 +63,11 @@ use crate::{
     run_check::LayerNodes,
 };
 use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, Storage, Tensor};
+use gam_runtime::resource::{Governed, MemoryGovernor};
 use rand::RngExt;
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ops::Range,
     sync::Arc,
 };
@@ -1311,6 +1312,99 @@ pub fn targets<E: BlockEngine>(m: &E, head: &FixedHead, batch: &Batch, experimen
     Ok(Targets { rows: out, teacher: None })
 }
 
+/// The exact identity of a batch's experiments, which alone decides `M`'s targets for them (with
+/// how `M` runs, [`Execution`]): the base and source tokens and every experiment.
+#[derive(PartialEq, Eq, Hash)]
+struct Identity {
+    base: Vec<Vec<u32>>,
+    source: Vec<Vec<u32>>,
+    experiments: Vec<Experiment>,
+}
+
+/// `M`'s targets of one batch's experiments held on the host, each value as the device held it
+/// (f32 values for f32 and bfloat16 storage, float64 for float64), so that putting them back
+/// ([`HostTargets::restore`]) gives the same targets bit for bit.
+struct HostTargets {
+    rows: Vec<KeptTarget>,
+    teacher: Option<Execution>,
+}
+
+struct KeptTarget {
+    mu: KeptValues,
+    shape: (usize, usize),
+    storage: Storage,
+    entropy: Vec<f64>,
+    head: Arc<Head>,
+    scored: Option<Vec<bool>>,
+}
+
+enum KeptValues {
+    Single(Vec<f32>),
+    Double(Vec<f64>),
+}
+
+impl HostTargets {
+    /// The host bytes `targets` take when kept, with their identity's tokens.
+    fn bytes(targets: &Targets, identity: &Identity) -> usize {
+        let tokens: usize = identity.base.iter().chain(&identity.source).map(Vec::len).sum();
+        let rows: usize = targets
+            .rows
+            .iter()
+            .map(|t| {
+                let value = if t.mu.storage() == Storage::F64 { 8 } else { 4 };
+                value * t.mu.len() + 8 * t.entropy.len() + t.scored.as_ref().map_or(0, Vec::len)
+            })
+            .sum();
+        4 * tokens + rows
+    }
+
+    /// `targets` (on the device `d`) on the host.
+    fn of(d: &Device, targets: &Targets) -> Result<Self, String> {
+        let rows = targets
+            .rows
+            .iter()
+            .map(|t| {
+                let values = d.download(&t.mu).map_err(error)?;
+                let shape = values.dim();
+                let storage = t.mu.storage();
+                let mu = match storage {
+                    Storage::F64 => KeptValues::Double(values.into_iter().collect()),
+                    // f32 and bfloat16 values are f32 values: narrowing their widened copies is exact.
+                    Storage::F32 | Storage::Bf16 => KeptValues::Single(values.iter().map(|v| *v as f32).collect()),
+                };
+                Ok(KeptTarget { mu, shape, storage, entropy: t.entropy.clone(), head: Arc::clone(&t.head), scored: t.scored.clone() })
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(Self { rows, teacher: targets.teacher })
+    }
+
+    /// The kept targets on the device `d` again, each `μ` in the storage it was made in.
+    fn restore(&self, d: &Device) -> Result<Targets, String> {
+        let rows = self
+            .rows
+            .iter()
+            .map(|t| {
+                let values = match &t.mu {
+                    KeptValues::Single(v) => v.iter().map(|x| f64::from(*x)).collect(),
+                    KeptValues::Double(v) => v.clone(),
+                };
+                let held = if d.storage() == t.storage { d.clone() } else { d.with_storage(t.storage).map_err(error)? };
+                let mu = held.upload_vec(t.shape.0, t.shape.1, values).map_err(error)?;
+                Ok(Target { mu: Arc::new(mu), entropy: t.entropy.clone(), head: Arc::clone(&t.head), scored: t.scored.clone() })
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(Targets { rows, teacher: self.teacher })
+    }
+}
+
+/// The targets an [`Interchange`] keeps on the host once [`Interchange::keep_targets`] asked for
+/// it, by the exact identity of each batch's experiments, each batch's bytes reserved from
+/// `governor` for as long as they are held.
+struct TargetStore {
+    governor: MemoryGovernor,
+    batches: HashMap<Identity, Governed<HostTargets>>,
+}
+
 impl Targets {
     /// Per experiment its rows' `μ` and `Σ p log p`, on the host.
     pub fn host(&self, d: &Device) -> Result<Vec<(ndarray::Array2<f64>, Vec<f64>)>, String> {
@@ -1501,6 +1595,8 @@ pub struct Interchange {
     candidate: Option<RefCell<Decoder>>,
     fuse_asked: bool,
     stale: Cell<bool>,
+    /// `M`'s targets kept on the host ([`Interchange::keep_targets`]); none until asked for.
+    kept: RefCell<Option<TargetStore>>,
 }
 
 impl Interchange {
@@ -1537,7 +1633,7 @@ impl Interchange {
         let p_values = values(native, explanation, layers, &variables)?;
         let m_sites = Arc::new(Sites::new(&m, &m_flat, m_streams, m_reads, &[], m_values)?);
         let p_sites = Arc::new(Sites::new(&p, &p_flat, p_streams, p_reads, trainable, p_values)?);
-        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), prefixes: (m_prefix, p_prefix), teacher: None, candidate: None, fuse_asked: false, stale: Cell::new(false) })
+        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), prefixes: (m_prefix, p_prefix), teacher: None, candidate: None, fuse_asked: false, stale: Cell::new(false), kept: RefCell::new(None) })
     }
 
     /// Run each model on its fused engine from now on, its products in `arithmetic`
@@ -1608,12 +1704,38 @@ impl Interchange {
         &self.variables
     }
 
-    /// `M`'s targets for `experiments` on `batch` ([`targets`]), on `M`'s engine.
+    /// `M`'s targets for `experiments` on `batch` ([`targets`]), on `M`'s engine. Once
+    /// [`Interchange::keep_targets`] asked for it, targets made for a batch are kept on the host
+    /// while the process's memory budget admits them, and the same experiments on the same tokens
+    /// are given those back (bit for bit) instead of running `M` again.
     pub fn targets(&self, batch: &Batch, experiments: &[Experiment]) -> Result<Targets, String> {
         let teacher = self.teacher();
+        let execution = teacher.execution();
+        let mut store = self.kept.try_borrow_mut().map_err(error)?;
+        let identity = store.as_ref().map(|_| Identity { base: batch.base.clone(), source: batch.source.clone(), experiments: experiments.to_vec() });
+        if let (Some(store), Some(identity)) = (store.as_ref(), identity.as_ref())
+            && let Some(kept) = store.batches.get(identity)
+            && kept.teacher == Some(execution)
+        {
+            return kept.restore(self.m.device());
+        }
         let mut made = targets(&teacher, &self.head, batch, experiments)?;
-        made.teacher = Some(teacher.execution());
+        made.teacher = Some(execution);
+        if let (Some(store), Some(identity)) = (store.as_mut(), identity) {
+            store.batches.remove(&identity);
+            if let Ok(reservation) = store.governor.try_reserve(HostTargets::bytes(&made, &identity), "interchange: M's targets of a batch kept on the host") {
+                store.batches.insert(identity, reservation.bind(HostTargets::of(self.m.device(), &made)?));
+            }
+        }
         Ok(made)
+    }
+
+    /// Keep `M`'s targets on the host from now on ([`Interchange::targets`]), each batch's while
+    /// `governor`'s budget admits it (made on the device each time otherwise): for a fit that
+    /// scores one fixed collection of experiments again and again, where `M`'s forward pass is
+    /// otherwise repeated at every scoring.
+    pub fn keep_targets(&mut self, governor: &MemoryGovernor) {
+        *self.kept.get_mut() = Some(TargetStore { governor: governor.clone(), batches: HashMap::new() });
     }
 
     /// `P`'s program, so that a fit writes each weight sample into its resident parameters.
@@ -1708,6 +1830,58 @@ mod tests {
         test_support::tiny_export,
     };
     use rand::{SeedableRng, rngs::StdRng};
+
+    /// Kept targets ([`Interchange::keep_targets`]) are the targets made by `M` bit for bit, and so
+    /// is every score against them, on the host and on the accelerator when there is one; a budget
+    /// that does not admit a batch's targets keeps none and still gives them.
+    #[test]
+    fn kept_targets_are_the_made_targets_bit_for_bit() {
+        let dir = tiny_export("interchange_kept_targets", 2);
+        let imported = import_language_model(&dir, 6, 12).expect("the tiny export imports");
+        std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+        let native = split_sites(&imported.program).expect("the native sites");
+        let layers = layer_nodes(&native, 2).expect("the layers");
+        let explanation = library_mdl::explanation(&native, &layers).expect("the library");
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let blocks: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let mut devices = vec![Device::host()];
+        devices.extend(Device::accelerator(gam_gpu::GpuPolicy::Auto).expect("a device probe"));
+        for (d, device) in devices.into_iter().enumerate() {
+            let made = |budget: Option<usize>| {
+                let variables = reads(&native, &blocks).expect("the reads");
+                let mut ic = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
+                if let Some(budget) = budget {
+                    ic.keep_targets(&MemoryGovernor::with_budget_bytes(budget));
+                }
+                ic
+            };
+            let batch = Batch::new(sequences[..3].to_vec(), sequences[3..].to_vec()).expect("the batch");
+            let experiments = sample(&mut StdRng::seed_from_u64(3), 3, made(None).variables(), 4, 12).expect("the draw");
+            let other = sample(&mut StdRng::seed_from_u64(4), 3, made(None).variables(), 4, 12).expect("the draw");
+            let fresh = made(None);
+            let reference = fresh.targets(&batch, &experiments).expect("the targets");
+            let scores = |ic: &Interchange, targets: &Targets| ic.evaluate_resident(&batch, &experiments, targets, false).expect("a score").bits;
+            let bits = |values: Vec<(ndarray::Array2<f64>, Vec<f64>)>| -> Vec<Vec<u64>> {
+                values.into_iter().map(|(mu, entropy)| mu.iter().chain(&entropy).map(|v| v.to_bits()).collect()).collect()
+            };
+            let score_bits = |scores: Vec<Vec<f64>>| -> Vec<Vec<u64>> { scores.into_iter().map(|s| s.into_iter().map(f64::to_bits).collect()).collect() };
+            let expected = bits(reference.host(&device).expect("download"));
+            let expected_scores = scores(&fresh, &reference);
+            for (budget, kept) in [(1 << 34, 2), (0, 0)] {
+                let ic = made(Some(budget));
+                for _ in 0..2 {
+                    let targets = ic.targets(&batch, &experiments).expect("the targets");
+                    assert_eq!(bits(targets.host(&device).expect("download")), expected, "device {d}, budget {budget}: the targets");
+                    assert_eq!(score_bits(scores(&ic, &targets)), score_bits(expected_scores.clone()), "device {d}, budget {budget}: the scores");
+                    // Other experiments on the same tokens are another identity.
+                    let targets = ic.targets(&batch, &other).expect("the targets");
+                    assert_eq!(bits(targets.host(&device).expect("download")), bits(fresh.targets(&batch, &other).expect("the targets").host(&device).expect("download")));
+                }
+                assert_eq!(ic.kept.borrow().as_ref().map(|s| s.batches.len()), Some(kept), "device {d}, budget {budget}: the batches kept");
+            }
+        }
+    }
 
     /// The squared Gauss–Newton factor ([`Factor`]) estimates the diagonal of `Σ_r J_rᵀ F_r J_r`
     /// over a batch's scored rows `r`, `F_r = diag p_r − p_r p_rᵀ` at `P`'s prediction `p_r`. The
