@@ -3644,6 +3644,19 @@ __device__ void group_add(double* sums, unsigned int g, bool live, double a, dou
 // they are made). Blocks stride whole, so every lane of a warp runs every iteration (`group_add`).
 #define WARP_STRIDE(i, n) for (u64 base_ = (u64)blockIdx.x * blockDim.x, i = base_ + threadIdx.x; base_ < (n); base_ += (u64)gridDim.x * blockDim.x, i = base_ + threadIdx.x)
 
+// A posterior entry's per-entry transcendentals in its masters' type: the prior precision per token
+// `δ = 1 / (N v_G)`, IVON's log deviation `s = −½ ln(N (h + δ))` and the variance `exp(2s)` a
+// group sum adds (in double either way). For f32 masters they run in float, within a few ulps as
+// on the Apple GPU (`exp`, `log` and the division under the safe math modes): GeForce and L40
+// cards run double at 1/64 of the float rate, and per entry these were most of the posterior
+// kernels' time. For float64 masters they stay double.
+__device__ __forceinline__ float prior_precision(float, double tokens, double variance) { return 1.0f / ((float)tokens * (float)variance); }
+__device__ __forceinline__ double prior_precision(double, double tokens, double variance) { return 1.0 / (tokens * variance); }
+__device__ __forceinline__ float log_deviation(float precision, double tokens) { return -0.5f * logf((float)tokens * precision); }
+__device__ __forceinline__ double log_deviation(double precision, double tokens) { return -0.5 * log(tokens * precision); }
+__device__ __forceinline__ double variance_of(float s) { return (double)expf(2.0f * s); }
+__device__ __forceinline__ double variance_of(double s) { return exp(2.0 * s); }
+
 // Entry i's group under an operator's group map (`GroupMap`): its row's id (axis 0), its column's
 // (axis 1) or its own (axis 2).
 __device__ unsigned int group_of(const unsigned int* ids, unsigned int axis, u64 cols, u64 i) {
@@ -3695,7 +3708,7 @@ __device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chun
     const bool known = spread >= 0.0;
     group_reduce(n, cols, axis, chunks, groups, count, sums, [&](u64 i, unsigned int g, double& a, double& b, double& c) -> bool {
         if (log_sd[i] == (T)NEG_INF) return false;
-        T delta = (T)(1.0 / (tokens * variance[g])), mu = mean[i];
+        T delta = prior_precision((T)0, tokens, variance[g]), mu = mean[i];
         T gi = weight * gradient[i], ui = factor[i];
         T m1 = b1 * momentum[i] + o1 * gi, p1 = b1 * power[i] + o1 * gi * gi;
         T m = m1 * k1, q = p1 * k1 - m * m;
@@ -3704,9 +3717,9 @@ __device__ void posterior_ivon_body(u64 n, u64 cols, unsigned int axis, u64 chun
         T h = curvature[i], d = square * ui * ui - h;
         T h1 = h + o2 * d;
         mu -= signal / (h1 + delta);
-        T s = (T)(-0.5 * log(tokens * ((double)h1 + (double)delta)));
+        T s = log_deviation(h1 + delta, tokens);
         momentum[i] = m1; power[i] = p1; curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
-        a = 1.0; b = (double)mu * (double)mu + exp(2.0 * (double)s); c = 2.0 * (double)s;
+        a = 1.0; b = (double)mu * (double)mu + variance_of(s); c = 2.0 * (double)s;
         return true;
     });
 }
@@ -3745,7 +3758,7 @@ __device__ void posterior_ivon_mixed(u64 n, u64 cols, unsigned int axis, u64 chu
     const bool known = spread >= 0.0;
     group_reduce(n, cols, axis, chunks, groups, count, sums, [&](u64 i, unsigned int g, double& a, double& b, double& c) -> bool {
         if (log_sd[i] == (float)NEG_INF) return false;
-        float delta = (float)(1.0 / (tokens * variance[g])), mu = mean[i];
+        float delta = prior_precision(0.0f, tokens, variance[g]), mu = mean[i];
         float gi = weight * entry_load(gradient[i]), ui = entry_load(factor[i]);
         float m1 = b1 * entry_load(momentum[i]) + o1 * gi, p1 = b1 * power[i] + o1 * gi * gi;
         float m = m1 * k1, noise = fmaxf(p1 * k1 - m * m, 0.0f) * v1, full = m + delta * mu;
@@ -3753,9 +3766,9 @@ __device__ void posterior_ivon_mixed(u64 n, u64 cols, unsigned int axis, u64 chu
         float h = curvature[i], d = square * ui * ui - h;
         float h1 = h + o2 * d;
         mu -= signal / (h1 + delta);
-        float s = (float)(-0.5 * log(tokens * ((double)h1 + (double)delta)));
+        float s = log_deviation(h1 + delta, tokens);
         entry_store(momentum + i, m1); power[i] = p1; curvature[i] = h1; mean[i] = mu; log_sd[i] = s;
-        a = 1.0; b = (double)mu * (double)mu + exp(2.0 * (double)s); c = 2.0 * (double)s;
+        a = 1.0; b = (double)mu * (double)mu + variance_of(s); c = 2.0 * (double)s;
         return true;
     });
 }
@@ -3774,8 +3787,8 @@ template <typename T>
 __device__ void group_moments_body(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, const T* mean, const T* log_sd, const unsigned int* groups, double* sums) {
     group_reduce(n, cols, axis, chunks, groups, count, sums, [&](u64 i, unsigned int, double& a, double& b, double& c) -> bool {
         if (log_sd[i] == (T)NEG_INF) return false;
-        double mu = (double)mean[i], s = (double)log_sd[i];
-        a = 1.0; b = mu * mu + exp(2.0 * s); c = 2.0 * s;
+        double mu = (double)mean[i];
+        a = 1.0; b = mu * mu + variance_of(log_sd[i]); c = 2.0 * (double)log_sd[i];
         return true;
     });
 }
@@ -3794,8 +3807,8 @@ template <typename T, typename U>
 __device__ void group_curvature_body(u64 n, u64 cols, unsigned int axis, u64 chunks, u64 count, const U* factor, const T* mean, const T* log_sd, const unsigned int* groups, double* sums) {
     group_reduce(n, cols, axis, chunks, groups, count, sums, [&](u64 i, unsigned int, double& a, double& b, double& c) -> bool {
         if (log_sd[i] == (T)NEG_INF) return false;
-        double u = (double)entry_load(factor[i]), s = (double)log_sd[i];
-        a = 1.0; b = u * (double)mean[i]; c = u * u * exp(2.0 * s);
+        double u = (double)entry_load(factor[i]);
+        a = 1.0; b = u * (double)mean[i]; c = u * u * variance_of(log_sd[i]);
         return true;
     });
 }
