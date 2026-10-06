@@ -442,6 +442,9 @@ pub struct Layer {
     /// A transcoder layer's group of its MLP block's output at each sequence's first token
     /// (`library_transcoder`, `library.l{l}.mlp.sink`), part of the MLP block.
     pub sink: Option<usize>,
+    /// A transcoder layer's groups of its MLP's gate biases, held apart from the gate rows (one per
+    /// biased map), part of the MLP block.
+    pub thresholds: Vec<usize>,
 }
 
 /// A library operator: dense, every block present, its reals exactly representable.
@@ -739,7 +742,7 @@ pub fn explanation_with(native: &OperatorProgram, layers: &[LayerNodes], transco
     let program = &artifact.program;
     let mut groups = Vec::new();
     let mut trainable = Vec::new();
-    let mut out: Vec<Layer> = layers.iter().map(|sites| Layer { sites: sites.clone(), heads: Vec::new(), functions: Vec::new(), sink: None }).collect();
+    let mut out: Vec<Layer> = layers.iter().map(|sites| Layer { sites: sites.clone(), heads: Vec::new(), functions: Vec::new(), sink: None, thresholds: Vec::new() }).collect();
     // Per key-value group, a group per rotary plane holding the plane's rows of the shared key
     // and of every query head's query, and a group per value coordinate of the shared value.
     let mut heads: Vec<Vec<Option<(Vec<usize>, Vec<usize>)>>> = layers.iter().map(|l| vec![None; l.reads.len()]).collect();
@@ -788,6 +791,7 @@ pub fn explanation_with(native: &OperatorProgram, layers: &[LayerNodes], transco
                 groups.push(Group { name: format!("{name}.f{i}.{part}"), cells });
             }
             if let (true, Some(b)) = (apart, bias) {
+                layer.thresholds.push(groups.len());
                 groups.push(Group { name: format!("{name}.{part}_bias"), cells: vec![Cells { operator: b, rows: (0..functions).collect(), cols: 0..1 }] });
             }
             trainable.push(map);
@@ -819,7 +823,7 @@ fn block_groups(explanation: &Explanation) -> Vec<Vec<usize>> {
         .iter()
         .flat_map(|layer| {
             let attention = layer.heads.iter().flat_map(|(planes, values)| planes.iter().chain(values)).copied().collect();
-            [attention, layer.functions.iter().flatten().chain(&layer.sink).copied().collect()]
+            [attention, layer.functions.iter().flatten().chain(&layer.sink).chain(&layer.thresholds).copied().collect()]
         })
         .collect()
 }
@@ -870,6 +874,7 @@ pub fn scoped(explanation: &Explanation, blocks: &[usize]) -> Result<Explanation
             heads: if blocks.contains(&(2 * l)) { layer.heads.iter().map(|(planes, values)| (renumber(planes), renumber(values))).collect() } else { Vec::new() },
             functions: if blocks.contains(&(2 * l + 1)) { layer.functions.iter().map(|f| renumber(f)).collect() } else { Vec::new() },
             sink: if blocks.contains(&(2 * l + 1)) { layer.sink.and_then(|g| kept[g]) } else { None },
+            thresholds: if blocks.contains(&(2 * l + 1)) { renumber(&layer.thresholds) } else { Vec::new() },
         })
         .collect();
     let reference = explanation.reference.iter().zip(&kept).filter(|(_, k)| k.is_some()).map(|(r, _)| *r).collect();
@@ -2569,7 +2574,8 @@ fn layers_definition(layers: &[Layer]) -> String {
         .iter()
         .map(|layer| {
             let sink = layer.sink.map_or(String::new(), |group| format!(", sink: Some({group})"));
-            format!("Layer {{ sites: {:?}, heads: {:?}, functions: {:?}{sink} }}", layer.sites, layer.heads, layer.functions)
+            let thresholds = if layer.thresholds.is_empty() { String::new() } else { format!(", thresholds: {:?}", layer.thresholds) };
+            format!("Layer {{ sites: {:?}, heads: {:?}, functions: {:?}{sink}{thresholds} }}", layer.sites, layer.heads, layer.functions)
         })
         .collect();
     format!("[{}]", each.join(", "))
@@ -3987,14 +3993,14 @@ mod tests {
         let layers: Vec<super::Layer> = sites
             .iter()
             .enumerate()
-            .map(|(l, sites)| super::Layer { sites: sites.clone(), heads: vec![(vec![l, 1], vec![2])], functions: vec![vec![3, 4], vec![l]], sink: None })
+            .map(|(l, sites)| super::Layer { sites: sites.clone(), heads: vec![(vec![l, 1], vec![2])], functions: vec![vec![3, 4], vec![l]], sink: None, thresholds: Vec::new() })
             .collect();
         // `Layer`'s derived debug form before the sink field is today's without that field.
-        assert_eq!(super::layers_definition(&layers), format!("{layers:?}").replace(", sink: None", ""));
+        assert_eq!(super::layers_definition(&layers), format!("{layers:?}").replace(", sink: None, thresholds: []", ""));
         assert!(!super::layers_definition(&layers).contains("sink"));
         let mut sunk = layers.clone();
         sunk[1].sink = Some(7);
-        assert_eq!(super::layers_definition(&sunk), format!("{sunk:?}").replace(", sink: None", ""));
+        assert_eq!(super::layers_definition(&sunk), format!("{sunk:?}").replace(", sink: None", "").replace(", thresholds: []", ""));
         assert_ne!(super::layers_definition(&sunk), super::layers_definition(&layers));
     }
 

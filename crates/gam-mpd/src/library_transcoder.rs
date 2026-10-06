@@ -418,6 +418,14 @@ mod tests {
         explanation.artifact.validate_coverage(&native).unwrap();
         assert_eq!(explanation.layers[1].functions.len(), kept.len());
         assert!(explanation.layers[1].functions.iter().all(|f| f.len() == 2), "a gate and an output group per function");
+        // The block's thresholds are one group of the layer (75a2712a6c), kept, with the block, by an
+        // explanation of that block alone: its gate-bias operator stays trainable.
+        let bias = explanation.artifact.program.operators.iter().position(|op| op.name == "library.l1.mlp.gate_bias").unwrap();
+        assert_eq!(explanation.layers[1].thresholds.len(), 1, "one threshold group");
+        let block = library_mdl::scoped(&explanation, &[3]).unwrap();
+        assert!(block.trainable.contains(&bias), "the scoped block's thresholds are trainable");
+        assert_eq!(block.layers[1].thresholds.len(), 1);
+        assert!(block.groups[block.layers[1].thresholds[0]].cells.iter().all(|c| c.operator == bias));
         let program = &explanation.artifact.program;
         let index = |name: &str| program.operators.iter().position(|op| op.name == name).unwrap();
         let (gate, out) = (program.operators[index("library.l1.mlp.gate")].matrix(), program.operators[index("library.l1.mlp.out")].matrix());
