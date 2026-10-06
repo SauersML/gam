@@ -33,14 +33,19 @@ Questions (a choice among labelled options; q = the softmax of the oracle's logi
                 strong edges and the near-zero ones as measured;
   attribution   at a marked token where the model predicts X: which of 4 listed subcomponents (given as
                 vectors, a candidate's slot) raises X most (the largest fall of log p(X) when removed).
-Effect questions (direction, top) are drawn by effect stratum (the decade of the removal KL at the peak:
+Effect questions (direction, top) state the subcomponent's signed activity level at the marked token
+(-9 to +9 of its largest |activity|; where it is active is the activity question's subject, what it does
+there is theirs) and are drawn by effect stratum (the decade of the removal KL at the peak:
 below 1e-5, then decades to 1e-1 and above), equal shares, or from the natural distribution.
 
 Conditions at matched capacity (same base, adapter, maps, examples, order, steps; every placeholder
 present, those a condition withholds receive nothing): graph (the subcomponent's vectors and its
 neighbourhood), weights (its vectors alone), activity (no vectors; its three most active other contexts
 as text with the peak token marked and its level), nothing. Candidates of an attribution question are
-shown as vectors in graph and weights, named by site in every condition.
+shown as vectors in graph and weights, named by site in every condition. graph_lens and weights_lens
+add, as text, vpd_lens.py's readout of the weights (the tokens on which the subcomponent is positive and
+negative, and the tokens its write then raises and lowers through the unembedding; for an attribution
+question, each candidate's), from Table's --lens file.
 
 Held out: subcomponents of --heldout-layers (never trained on) on held-out texts (the held-out runs), and
 trained layers on held-out texts.
@@ -71,7 +76,7 @@ from reporter import Injection, Magnitude  # noqa: E402
 
 KINDS = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")
 LABELS = "ABCDEFGHIJ"
-CONDITIONS = ("graph", "weights", "activity", "nothing")
+CONDITIONS = ("graph", "weights", "activity", "nothing", "graph_lens", "weights_lens")
 QUESTIONS = ("activity", "direction", "top", "continuation", "edge", "attribution")
 BINS = 10
 NEIGHBOURS = 4  # per direction
@@ -112,7 +117,7 @@ def edge_level(rel: float) -> int:
 class Table:
     """A label run (vpd_labels.py), its relations (vpd_relations.py), the vectors, the tokenizer."""
 
-    def __init__(self, root: Path, uv_path: Path, relations: Path | None = None, tokenizer: Path = TOKENIZER):
+    def __init__(self, root: Path, uv_path: Path, relations: Path | None = None, tokenizer: Path = TOKENIZER, lens: Path | None = None):
         import tokenizers
 
         self.tokens = load_file(str(root / "contexts.safetensors"))["tokens"].long()
@@ -121,6 +126,7 @@ class Table:
             meta = json.loads(meta_path.read_text())
             self.sites[(meta["layer"], meta["site"].split(".")[-1])] = (meta, load_file(str(meta_path.with_suffix(".safetensors"))))
         self.uv = load_file(str(uv_path))
+        self.lens = load_file(str(lens)) if lens is not None else None
         self.tok = tokenizers.Tokenizer.from_file(str(tokenizer))
         self.rel = {}
         self.offsets = None
@@ -195,9 +201,12 @@ def effect_index(table: Table, keys: list) -> list[np.ndarray]:
     return [np.concatenate(p) for p in per]
 
 
-def examples(table: Table, layers: set[int], count: int, seed: int, stratified: bool = True) -> list[dict]:
-    """`count` questions, the kinds in turn (those the table's relations support)."""
+def examples(table: Table, layers: set[int], count: int, seed: int, stratified: bool = True, per_component: int = 1) -> list[dict]:
+    """`count` questions, the kinds in turn (those the table's relations support). With per_component K
+    > 1, each subcomponent an effect question draws is asked about at K of its strongest contexts (the
+    drawn one and K - 1 others, in the following questions of that kind)."""
     rng = random.Random(seed)
+    pending: dict[str, list] = {"direction": [], "top": []}
     keys = [k for k in table.sites if k[0] in layers]
     kinds = ["activity", "direction", "top"]
     if "continuations" in table.rel:
@@ -218,14 +227,25 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
         j = rng.randrange(meta["top"] + meta["random"])
         if q in ("direction", "top") and index is not None:
             pool = index[(len(out) // len(kinds)) % len(index)]
-            if len(pool):
+            if pending[q]:
+                k, c, j = pending[q].pop()
+                layer, kind = keys[k]
+                meta, d = table.sites[(layer, kind)]
+            elif len(pool):
                 k, c, j = (int(x) for x in pool[rng.randrange(len(pool))])
                 layer, kind = keys[k]
                 meta, d = table.sites[(layer, kind)]
+                if per_component > 1:
+                    others = [x for x in range(meta["top"]) if x != j]
+                    pending[q] = [(k, c, x) for x in rng.sample(others, min(per_component - 1, len(others)))]
         ex = {"layer": layer, "kind": kind, "c": c, "kind_q": q, "j": j, "stratum": -1, "candidates": []}
         contexts = d["contexts"][c].long()
         act = d["activity"][c].float()
         peak = float(act.abs().max())
+        here = ""
+        if q in ("direction", "top"):  # an effect question states the activity there (an input-side measurement, not its answer)
+            a_here = float(act[j, int(d["position"][c, j])])
+            here = f"At the marked token its activity is {int(math.copysign(level(a_here, peak), a_here)):+d} (9 is its largest |activity| over its texts). "
         if q == "activity":
             p = int(d["position"][c, j]) if rng.random() < 0.5 else rng.randrange(act.shape[1])
             ex.update(context=int(contexts[j]), position=p, options=[str(b) for b in range(BINS)], answer=level(float(act[j, p]), peak),
@@ -235,8 +255,8 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             edit, side, r = rng.choice(["ablate", "amplify"]), rng.choice(["up", "down"]), rng.randrange(10)
             verb = "removed" if edit == "ablate" else "made 1.5 times stronger"
             ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=["up", "down"],
-                      answer=0 if float(d[f"{side}_dp_{edit}"][c, j, r]) > 0 else 1,
-                      question=f"If the component is {verb}, does the probability that the next token after the marked token is {table.piece(d[f'{side}_ids_{edit}'][c, j, r])} go up or go down?")
+                      answer=0 if float(d[f"{side}_dp_{edit}"][c, j, r]) > 0 else 1, edit=edit, option_ids=[int(d[f"{side}_ids_{edit}"][c, j, r])],
+                      question=here + f"If the component is {verb}, does the probability that the next token after the marked token is {table.piece(d[f'{side}_ids_{edit}'][c, j, r])} go up or go down?")
         elif q == "top":
             p = int(d["position"][c, j])
             truth = int(d["up_ids_ablate"][c, j, 0])
@@ -246,7 +266,7 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             order = list(range(4))
             rng.shuffle(order)
             ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=[table.piece(options[i]) for i in order],
-                      answer=order.index(0), question="If the component is removed, which of these next tokens after the marked token gains the most probability?")
+                      answer=order.index(0), edit="ablate", option_ids=[int(options[i]) for i in order], question=here + "If the component is removed, which of these next tokens after the marked token gains the most probability?")
         elif q == "continuation":
             cont = table.rel["continuations"]
             g = table.gid(layer, kind, c)
@@ -308,8 +328,14 @@ def exemplars(table: Table, ex: dict, n: int = 3) -> str:
     return "On other texts the component is most active at the marked tokens:\n" + "\n".join(lines)
 
 
+def base(condition: str) -> str:
+    """The condition's vector input (a *_lens condition adds the lens text to graph's or weights')."""
+    return condition.removesuffix("_lens")
+
+
 def slots(table: Table, ex: dict, condition: str) -> list[tuple]:
     """The example's subcomponents in slot order: (layer, kind, index, log magnitude, role prefix, shown)."""
+    condition = base(condition)
     out = []
     if ex["c"] >= 0:
         v, u = table.vectors(ex["layer"], ex["kind"], ex["c"])
@@ -326,8 +352,21 @@ def slots(table: Table, ex: dict, condition: str) -> list[tuple]:
     return out[:SLOTS]
 
 
+def lens_text(table: Table, layer: int, kind: str, c: int, name: str = "It") -> str:
+    """vpd_lens.py's readout of one subcomponent (weights only), stated per sign of its activity."""
+    L = table.lens
+    n = site_name(layer, kind)
+    words = lambda key: ", ".join(table.piece(int(t)) for t in L[f"{n}.{key}"][c].tolist() if t >= 0)  # noqa: E731
+    if int(L[f"{n}.up"][c, 0]) < 0:
+        return f"{name} changes attention scores (no direct write); it is positive on tokens like {words('pos_read')} and negative on tokens like {words('neg_read')}."
+    return (f"{name} is positive on tokens like {words('pos_read')}; then it raises {words('up')} and lowers {words('down')}. "
+            f"It is negative on tokens like {words('neg_read')}; then it raises {words('down')} and lowers {words('up')}.")
+
+
 def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
     """The user turn around the placeholders: (before, after)."""
+    lens = condition.endswith("_lens")
+    condition = base(condition)
     if ex["c"] >= 0:
         before = f"A component of a 4-layer language model: layer {ex['layer']}, {ex['kind']}. Its vectors, then those of related components:"
     else:
@@ -339,6 +378,12 @@ def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
         info += "\nAfter its own two vectors come those of its most strongly related components, in this order:\n" + "\n".join(lines)
     if ex["kind_q"] == "attribution":
         info += "\nThe listed components' vectors come in the order C1, C2, C3, C4."
+    if lens:
+        info += "\nIts weights read through the token embeddings and the unembedding (no measurement):\n"
+        if ex["c"] >= 0:
+            info += lens_text(table, ex["layer"], ex["kind"], ex["c"])
+        else:
+            info += "\n".join(lens_text(table, l, k, c, f"C{i + 1}") for i, (l, k, c, _, _) in enumerate(ex["candidates"]))
     text = table.text(ex["context"], ex["position"], ex["position"])
     listing = "\n".join(f"{LABELS[k]}. {o}" for k, o in enumerate(ex["options"]))
     after = f"{info}\nText: {text!r}\n{ex['question']}\n{listing}\nAnswer with the letter."
@@ -444,7 +489,7 @@ def log_scores(log_q, valid, batch) -> torch.Tensor:
 
 
 def table_of(args) -> Table:
-    return Table(Path(args.labels), Path(args.uv), Path(args.relations) if args.relations else None, Path(args.tokenizer))
+    return Table(Path(args.labels), Path(args.uv), Path(args.relations) if args.relations else None, Path(args.tokenizer), Path(args.lens) if args.lens else None)
 
 
 def train(args):
@@ -452,7 +497,7 @@ def train(args):
     torch.manual_seed(args.seed)
     held = {int(x) for x in args.heldout_layers.split(",") if x}
     table = table_of(args)
-    data = examples(table, {0, 1, 2, 3} - held, args.examples, args.seed)
+    data = examples(table, {0, 1, 2, 3} - held, args.examples, args.seed, per_component=args.per_component)
     oracle = Oracle(args.base, args.lora_rank, args.inject, dev)
     oracle.model.base_model.model.gradient_checkpointing_enable()
     oracle.model.base_model.model.config.use_cache = False
@@ -544,6 +589,7 @@ def main():
         p.add_argument("--uv", required=True)
         p.add_argument("--relations", help="vpd_relations.py's output for these labels")
         p.add_argument("--tokenizer", default=str(TOKENIZER), help="the target's tokenizer.json")
+        p.add_argument("--lens", help="vpd_lens.py build's output (the *_lens conditions)")
         p.add_argument("--seed", type=int, default=0)
     t = sub.choices["train"]
     t.add_argument("--base", required=True)
@@ -552,6 +598,7 @@ def main():
     t.add_argument("--out", required=True)
     t.add_argument("--heldout-layers", default="2")
     t.add_argument("--examples", type=int, default=65536)
+    t.add_argument("--per-component", type=int, default=1, help="effect questions per drawn subcomponent, at its strongest contexts")
     t.add_argument("--batch", type=int, default=16)
     t.add_argument("--lr", type=float, default=1e-4)
     t.add_argument("--lora-rank", type=int, default=64)

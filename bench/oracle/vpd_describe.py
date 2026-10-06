@@ -311,7 +311,7 @@ def train(args):
     config = json.loads((run / "config.json").read_text())
     oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev)
     oracle.load(run)
-    table = Table(Path(args.labels), Path(args.uv), Path(args.relations) if args.relations else None, Path(args.tokenizer))
+    table = Table(Path(args.labels), Path(args.uv), Path(args.relations) if args.relations else None, Path(args.tokenizer), Path(args.lens) if args.lens else None)
     target = Target(dev, load_uv(dev, Path(args.uv)), table)
     episodes = Episodes(oracle, table, target, config["condition"], args)
     held = {int(x) for x in config["heldout_layers"].split(",") if x}
@@ -355,7 +355,7 @@ def evaluate(args):
     config = json.loads((run / "config.json").read_text())
     oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev)
     oracle.load(run)
-    table = Table(Path(args.labels), Path(args.uv), Path(args.relations) if args.relations else None, Path(args.tokenizer))
+    table = Table(Path(args.labels), Path(args.uv), Path(args.relations) if args.relations else None, Path(args.tokenizer), Path(args.lens) if args.lens else None)
     target = Target(dev, load_uv(dev, Path(args.uv)), table)
     episodes = Episodes(oracle, table, target, config["condition"], argparse.Namespace(turns=args.turns, tokens=args.tokens))
     held = {int(x) for x in config["heldout_layers"].split(",") if x}
@@ -380,6 +380,7 @@ def main():
         p.add_argument("--relations", help="vpd_relations.py's output for these labels (the measured neighbourhoods)")
         p.add_argument("--tokenizer", default=str(Path.home() / "mpd-data/vpd/t-9d2b8f02/tokenizer.json"))
         p.add_argument("--reward", required=True, help="codelength.py serve's HOST:PORT")
+        p.add_argument("--lens", help="vpd_lens.py build's output (an answer run of a *_lens condition)")
         p.add_argument("--turns", type=int, default=4, help="tool calls an episode may make")
         p.add_argument("--tokens", type=int, default=768, help="tokens one turn may generate")
         p.add_argument("--micro", type=int, default=8)
