@@ -167,6 +167,63 @@ pub fn slices(export: &Path, decomposition: &Path) -> Result<Vec<Slice>, String>
     Ok(parts.into_iter().map(|part| Slice { mlp: Arc::clone(&mlps[part.layer]), part }).collect())
 }
 
+/// Layer `layer`'s neurons of `M`'s MLP `mlp` as slices of its down map, from `M`'s own weights:
+/// neuron `j` is `u = W_down[:, j]`, `v = e_j`, so its edit is `(α − 1) φ(w_j·x) W_down[:, j]`
+/// (`w_j` row `j` of `W_fc`) on each model's own read `x`; the slices sum to `W_down`.
+#[must_use]
+pub fn neuron_slices(mlp: &Arc<Mlp>, layer: usize) -> Vec<Slice> {
+    let hidden = mlp.write.ncols();
+    (0..hidden)
+        .map(|j| {
+            let mut v = Array1::zeros(hidden);
+            v[j] = 1.0;
+            Slice { part: VpdPart { block: 2 * layer + 1, layer, map: Map::Down, index: j, u: mlp.write.column(j).to_owned(), v }, mlp: Arc::clone(mlp) }
+        })
+        .collect()
+}
+
+/// `count` random rank-one slices of layer `layer`'s MLP map `map`, drawn from `seed`: unit `u`
+/// and `v` uniform on their spheres (normalized standard normal draws,
+/// `gam_gpu::tensor::posterior_normal` under `seed`, streams `2i` and `2i + 1` for slice `i`), scaled by the map's top
+/// singular value `s` (the Rayleigh quotient of power iteration on `WᵀW` from a fixed start, until
+/// it changes by at most 1e-12 relative, at most 1000 steps), so the edit is `W + (α − 1) s u vᵀ`: a weight
+/// edit of `M` at the size of the map's largest direction, independent of any explanation.
+#[must_use]
+pub fn random_slices_of(mlp: &Arc<Mlp>, layer: usize, map: Map, count: usize, seed: u64) -> Vec<Slice> {
+    let w = match map {
+        Map::Up => &mlp.read,
+        Map::Down => &mlp.write,
+    };
+    let mut x = Array1::from_elem(w.ncols(), 1.0 / (w.ncols() as f64).sqrt());
+    let mut top = 0.0;
+    for _ in 0..1000 {
+        // The Rayleigh quotient `xᵀ WᵀW x` of the unit `x`, whose error is quadratic in `x`'s.
+        let y = w.t().dot(&w.dot(&x));
+        let (estimate, norm) = (x.dot(&y).max(0.0).sqrt(), y.dot(&y).sqrt());
+        if norm == 0.0 {
+            break;
+        }
+        x = y / norm;
+        let settled = (estimate - top).abs() <= 1e-12 * estimate;
+        top = estimate;
+        if settled {
+            break;
+        }
+    }
+    // Standard normal draws keyed by `seed`, one stream per slice and side (`posterior_normal`).
+    let unit = |n: usize, stream: u64| {
+        let a = Array1::from_shape_fn(n, |i| f64::from(gam_gpu::tensor::posterior_normal(seed, stream, i as u64)));
+        let norm = a.dot(&a).sqrt();
+        a / norm
+    };
+    (0..count)
+        .map(|index| {
+            let (u, v) = (unit(w.nrows(), 2 * index as u64) * top, unit(w.ncols(), 2 * index as u64 + 1));
+            Slice { part: VpdPart { block: 2 * layer + 1, layer, map, index, u, v }, mlp: Arc::clone(mlp) }
+        })
+        .collect()
+}
+
 /// A tensor of an engine export (`export.json` and its float64 files), as the battery reads it.
 fn tensor(dir: &Path, record: &serde_json::Value, name: &str) -> Result<Array2<f64>, String> {
     let dims: Vec<usize> = record["files"][name]["shape"]
@@ -265,6 +322,41 @@ mod tests {
     use crate::operator_program::SlotValues;
     use crate::run_check::{layer_nodes, split_sites};
     use gam_gpu::tensor::Device;
+
+    /// An MLP's neuron slices sum to its down map: removing every neuron (α = 0) moves the output by
+    /// exactly minus the output (1e-12), and each neuron's edit is its activation times its column.
+    /// A random slice is a rank-one map of the down map's top singular value (`‖u‖ ‖v‖` equal to it,
+    /// checked against the largest `‖W x‖` over the power iteration's own direction).
+    #[test]
+    fn neuron_slices_sum_to_the_down_map_and_random_slices_have_its_scale() {
+        let mut rng = StdRng::seed_from_u64(3);
+        let mut normal = |rows: usize, cols: usize| Array2::from_shape_fn((rows, cols), |_| rng.random::<f64>() - 0.5);
+        let mlp = Arc::new(Mlp { read: normal(7, 5), write: normal(5, 7), law: Law::GeluTanh });
+        let x = normal(5, 1).column(0).to_owned();
+        let neurons = neuron_slices(&mlp, 0);
+        assert_eq!(neurons.len(), 7);
+        let total = neurons.iter().fold(Array1::<f64>::zeros(5), |acc, n| acc + n.edit(x.view(), 0.0));
+        let output = mlp.output(x.view());
+        for (a, b) in total.iter().zip(&output) {
+            assert!((a + b).abs() <= 1e-12 * output.iter().fold(1.0_f64, |m, v| m.max(v.abs())), "{a} against −{b}");
+        }
+        let slices = random_slices_of(&mlp, 0, Map::Down, 3, 9);
+        let top = {
+            let svd_like = mlp.write.t().dot(&mlp.write);
+            // The largest eigenvalue of WᵀW by many power steps from a different start.
+            let mut y = Array1::from_shape_fn(7, |i| 1.0 + i as f64);
+            for _ in 0..5000 {
+                let z = svd_like.dot(&y);
+                y = &z / z.dot(&z).sqrt();
+            }
+            svd_like.dot(&y).dot(&y).sqrt()
+        };
+        for s in &slices {
+            let scale = s.part.u.dot(&s.part.u).sqrt() * s.part.v.dot(&s.part.v).sqrt();
+            assert!((scale - top).abs() <= 1e-9 * top, "‖u‖‖v‖ {scale} against the top singular value {top}");
+        }
+        assert_ne!(slices[0].part.v, slices[1].part.v, "independent draws");
+    }
 
     /// The tiny Qwen3 export's model and its starting library (an exact copy of `M`), with its
     /// sequences of 12 tokens.
