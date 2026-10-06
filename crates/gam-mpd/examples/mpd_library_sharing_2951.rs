@@ -14,7 +14,13 @@
 //! (`fit.epochs`), on the same batches and weight noise as every other arm of that start. `K = 0` is the control: no target keeps a candidate, so the prior is the
 //! groups' Gaussian alone, through the same code. OUT/REPORT.json holds the arm's fit,
 //! OUT/PROPOSAL.json what the mixture keeps and the dominant components predicted to lower `F`
-//! when made exact, counted by kind, and OUT/SUMMARY.json `F` per epoch and held out.
+//! when made exact, counted by kind, and OUT/SUMMARY.json `F` per epoch (with each step's
+//! estimate, for a paired standard error between arms) and held out.
+//!
+//! With `moved:PATH` the arm is the control's (`K = 0`) on the explanation in which the sharing a
+//! soft arm's checkpoint at PATH (a `start:` arm of `K` candidates) predicts to lower `F` is made
+//! exact (`Mixture::harden` at that checkpoint's posterior and mixture), started at `M` by its own
+//! Laplace start; OUT/HARDENED.json lists what was made exact, counted by kind.
 //!
 //! Otherwise: The library is fitted with the
 //! mixture prior over its parameter blocks (each MLP function's gate, up and output vectors, each
@@ -68,6 +74,40 @@ fn sharing_kind(target: library_mixture::Kind, write: library_mixture::Write) ->
     }
 }
 
+/// `start` with the sharing that the soft arm's checkpoint at `path` (its posterior and the state
+/// of its mixture of `width` candidates) predicts to lower `F` made exact; OUT/HARDENED.json lists
+/// it (module note).
+fn hardened((native, start): (&gam_mpd::operator_program::OperatorProgram, &library_mdl::Explanation), path: &Path, width: usize, out: &Path) -> Result<library_mdl::Explanation, String> {
+    use library_mdl::PriorTerm;
+    use std::io::Read;
+    let posterior = library_mdl::checkpoint_posterior(start, path)?;
+    // The checkpoint's header: its length, then its JSON, which holds the mixture's state.
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut prefix = [0_u8; 8];
+    file.read_exact(&mut prefix).map_err(|e| e.to_string())?;
+    let mut header = vec![0_u8; usize::try_from(u64::from_le_bytes(prefix)).map_err(|e| e.to_string())?];
+    file.read_exact(&mut header).map_err(|e| e.to_string())?;
+    let header: Value = serde_json::from_slice(&header).map_err(|e| e.to_string())?;
+    let mut mixture = library_mixture::Mixture::new(start, width, library_mixture::Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 })?;
+    mixture.load(header.get("prior").filter(|p| !p.is_null()).ok_or("a checkpoint without a mixture's state")?)?;
+    let proposals = mixture.proposals(&posterior)?;
+    let mut exact: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let listed: Vec<Value> = proposals
+        .iter()
+        .map(|(t, j, saving)| {
+            let target = &mixture.targets[*t];
+            *exact.entry(sharing_kind(target.kind, target.components[*j].write)).or_default() += 1;
+            json!({"target": target.kind, "candidate": target.components[*j].write, "scale": target.components[*j].scale, "predicted_saving_bits": saving / std::f64::consts::LN_2})
+        })
+        .collect();
+    let moved = mixture.harden(start, &posterior)?;
+    moved.artifact.validate_coverage(native)?;
+    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    save(&out.join("HARDENED.json"), &json!({"from": path.display().to_string(), "proposals_by_kind": exact, "choice_bits": moved.fixed_nats / std::f64::consts::LN_2, "trainable": moved.trainable.len(), "groups": moved.groups.len(), "proposals": listed}))?;
+    log::info!("hardened {} proposals by kind {exact:?}; {} groups (of {})", proposals.len(), moved.groups.len(), start.groups.len());
+    Ok(moved)
+}
+
 /// One arm of a paired comparison from a checkpoint (module note).
 fn arm(device: &Device, (native, start): (&gam_mpd::operator_program::OperatorProgram, &library_mdl::Explanation), (train, held_out): (&[Vec<u32>], &[Vec<u32>]), settings: &Settings, (checkpoint, out, width): (&Path, &Path, usize)) -> Result<(), String> {
     let fit = &settings.fit;
@@ -97,7 +137,7 @@ fn arm(device: &Device, (native, start): (&gam_mpd::operator_program::OperatorPr
         })
         .collect();
     save(&out.join("PROPOSAL.json"), &json!({"targets": mixture.targets.len(), "kept_by_kind": kept, "exact_by_kind": exact, "exact": listed}))?;
-    let epochs: Vec<Value> = fitted.report.epochs.iter().map(|e| json!({"epoch": e.epoch, "objective_bits": e.objective_bits, "data_bits": e.data_bits, "description_bits": e.description_bits, "held_out_objective_bits_per_token": e.held_out.objective_bits_per_token})).collect();
+    let epochs: Vec<Value> = fitted.report.epochs.iter().map(|e| json!({"epoch": e.epoch, "objective_bits": e.objective_bits, "data_bits": e.data_bits, "description_bits": e.description_bits, "held_out_objective_bits_per_token": e.held_out.objective_bits_per_token, "estimates": e.estimates})).collect();
     let summary = json!({
         "export_sha256": settings.export_sha256,
         "from": format!("start:{}", checkpoint.display()),
@@ -151,6 +191,10 @@ fn main() -> Result<(), String> {
     let start = library_mdl::explanation(&native, &layers)?;
     if let Some(path) = from.strip_prefix("start:") {
         return arm(&device, (&native, &start), (&train, held_out), &settings, (Path::new(path), out, width));
+    }
+    if let Some(path) = from.strip_prefix("moved:") {
+        let moved = hardened((&native, &start), Path::new(path), width, out)?;
+        return arm(&device, (&native, &moved), (&train, held_out), &settings, (Path::new("native"), out, 0));
     }
     let base = match from.split_once(':') {
         None if from == "native" => start,

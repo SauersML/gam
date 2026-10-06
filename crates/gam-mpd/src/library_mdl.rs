@@ -1444,6 +1444,10 @@ pub struct Epoch {
     /// sequence when the schedule ran it (module note).
     pub held_out: HeldOut,
     pub held_out_full: Option<HeldOut>,
+    /// Each step's estimate of `F` in bits, in batch order: two fits on the same batches are
+    /// compared batch by batch, with a paired standard error.
+    #[serde(default)]
+    pub estimates: Vec<f64>,
 }
 
 /// One removal step.
@@ -3093,6 +3097,7 @@ pub fn fit_from(
         let to_bits = |nats: f64| nats / LN_2;
         let record = Epoch {
             epoch,
+            estimates: estimates.iter().map(|e| to_bits(*e)).collect(),
             objective_bits: to_bits(estimates.iter().sum::<f64>() / count),
             data_bits: to_bits(data_sum / count),
             description_bits: to_bits(description_sum / count),
