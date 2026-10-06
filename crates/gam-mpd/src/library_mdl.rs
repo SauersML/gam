@@ -93,7 +93,12 @@
 //! under `q`, and `v_G` depends on `σ`); setting `σ` from the running `h` and the current `v_G` at
 //! every step is an online approximation to it, so `σ` has no step size; the mean takes the
 //! preconditioned
-//! step `α (m + δ μ) / (h + δ)` along the gradient's momentum `m`. The posterior stays on the
+//! step `α (ĝ + δ μ) / (h + δ)`, `ĝ` the gradient's momentum filtered by its own measured noise
+//! (`Device::posterior_ivon`): a sampled gradient is mostly the other weights' noise carried
+//! through the Hessian's off-diagonal terms, and with the momentum unfiltered the mean's steps
+//! walked it away from `M` and raised `F` (vpd4l, `N = 2^16`: from the Laplace posterior at `M`,
+//! `F` rose from 147 to 356 bits per scored token over the first epoch with the curvature held
+//! fixed, and fell to 54 with the means held fixed). The posterior stays on the
 //! device through an epoch (`device_posterior`): the sample is written into the explanation's
 //! program, the gradient stays where the reverse pass left it, and the IVON step and the groups'
 //! divergences run there; the host holds it between epochs, for the
@@ -1608,7 +1613,8 @@ struct Progress {
     /// The prior term's state, when the fit has one.
     #[serde(default)]
     prior: Option<serde_json::Value>,
-    /// The precision of the payload's `μ`, `ln σ`, momentum and curvature arrays: the storage the
+    /// The precision of the payload's `μ`, `ln σ`, momentum, curvature and gradient second-moment
+    /// arrays: the storage the
     /// device posterior holds each in; none for a checkpoint written in float64 throughout.
     #[serde(default)]
     precision: Option<[Precision; CHECKPOINT_ARRAYS]>,
@@ -1754,8 +1760,9 @@ fn check_checkpoint_identity(path: &Path, found: &Identity, identity: &Identity)
 }
 
 /// The arrays a checkpoint holds per trainable operator: `μ`, `ln σ` and IVON's state (the
-/// gradient's momentum and the curvature estimate), each little-endian in its [`Precision`].
-const CHECKPOINT_ARRAYS: usize = 4;
+/// gradient's momentum, the curvature estimate and the gradient's second moment), each
+/// little-endian in its [`Precision`].
+const CHECKPOINT_ARRAYS: usize = 5;
 
 /// The precision a checkpoint array is written in: the storage the device holds it in, so that
 /// writing and reading it is exact.
@@ -1851,8 +1858,9 @@ struct Snapshot {
     /// The progress, as the payload's header and as the readable copy.
     header: Vec<u8>,
     json: Vec<u8>,
-    /// Per trainable operator `μ`, `ln σ` and IVON's state (the gradient's momentum and the
-    /// curvature estimate), each in the storage the device holds it in (`Progress::precision`).
+    /// Per trainable operator `μ`, `ln σ` and IVON's state (the gradient's momentum, the curvature
+    /// estimate and the gradient's second moment), each in the storage the device holds it in
+    /// (`Progress::precision`).
     payload: Vec<u8>,
 }
 
@@ -1865,8 +1873,8 @@ impl Snapshot {
         let bytes = checkpoint_payload_bytes(&progress.shapes, precision).ok_or("a checkpoint too large to address")?;
         let mut payload = Vec::with_capacity(usize::try_from(bytes).map_err(error)?);
         for i in 0..progress.shapes.len() {
-            let (mean, log_sd, [momentum, curvature]) = posterior.operator(i)?;
-            for (array, precision) in [&mean, &log_sd, &momentum, &curvature].into_iter().zip(precision) {
+            let (mean, log_sd, [momentum, curvature, power]) = posterior.operator(i)?;
+            for (array, precision) in [&mean, &log_sd, &momentum, &curvature, &power].into_iter().zip(precision) {
                 write_checkpoint_array(&mut payload, array, precision)?;
             }
         }
@@ -1925,7 +1933,7 @@ impl Drop for Writer {
 
 /// Restore a checkpoint of this fit into `posterior`, with IVON's state per operator, or refuse one
 /// of another fit.
-fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) -> Result<(Progress, Vec<[Array2<f64>; 2]>), String> {
+fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) -> Result<(Progress, Vec<[Array2<f64>; 3]>), String> {
     let (progress, mut reader, payload_bytes): (Progress, _, _) = checkpoint_header(path)?;
     check_checkpoint_identity(path, &progress.identity, &expected.identity)?;
     let same_settings =
@@ -3043,12 +3051,12 @@ mod tests {
             for ((r, c), mu) in reference.mean[i].indexed_iter_mut() {
                 let delta = 1.0 / (tokens * variance[posterior.membership[i][[r, c]] as usize]);
                 let sd = posterior.log_sd[i][[r, c]].exp();
-                let g = scale * gradients[i][[r, c]];
                 let h0 = (1.0 / (tokens * sd * sd) - delta).max(0.0);
                 let d = square * factors[i][[r, c]] * factors[i][[r, c]] - h0;
                 let h = h0 + (1.0 - ivon.beta2) * d + 0.5 * (1.0 - ivon.beta2).powi(2) * d * d / (h0 + delta);
-                let momentum = (1.0 - ivon.beta1) * g;
-                *mu -= (ivon.rate * (momentum / (1.0 - ivon.beta1) + delta * *mu) / (h + delta)).clamp(-sd, sd);
+                // A first step's momentum is one gradient, which gives no spread: the filtered
+                // gradient is zero and the mean moves by the prior's pull alone.
+                *mu -= (ivon.rate * (delta * *mu) / (h + delta)).clamp(-sd, sd);
                 reference.log_sd[i][[r, c]] = -0.5 * (tokens * (h + delta)).ln();
             }
         }
@@ -3280,9 +3288,9 @@ mod tests {
         other = expected.clone();
         other.settings.seed += 1;
         assert!(load_checkpoint(&path, &other, &mut posterior.clone()).unwrap_err().contains("another fit"));
-        let (wide, device) = ([Precision::F64; CHECKPOINT_ARRAYS], [Precision::F32, Precision::F32, Precision::Bf16, Precision::F32]);
-        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], wide), Some(9 * 32));
-        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], device), Some(9 * 14));
+        let (wide, device) = ([Precision::F64; CHECKPOINT_ARRAYS], [Precision::F32, Precision::F32, Precision::Bf16, Precision::F32, Precision::F32]);
+        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], wide), Some(9 * 40));
+        assert_eq!(checkpoint_payload_bytes(&[(2, 3), (0, 2), (3, 1)], device), Some(9 * 18));
         assert_eq!(checkpoint_payload_bytes(&[(usize::MAX, usize::MAX)], wide), None);
         std::fs::remove_file(path).unwrap();
     }

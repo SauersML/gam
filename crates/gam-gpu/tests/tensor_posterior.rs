@@ -34,7 +34,7 @@ fn matrix(rows: usize, cols: usize, seed: u64, scale: f64, shift: f64) -> Array2
 struct Case {
     mean: Array2<f64>,
     log_sd: Array2<f64>,
-    moments: [Array2<f64>; 2],
+    moments: [Array2<f64>; 3],
     sample: (u64, u64),
     gradient: Array2<f64>,
     factor: Array2<f64>,
@@ -62,8 +62,8 @@ fn case(axis: GroupAxis) -> Case {
             log_sd[(i / cols, i % cols)] = f64::NEG_INFINITY;
         }
     }
-    // The gradient's momentum, and a positive curvature estimate.
-    let moments = [matrix(rows, cols, 3, 0.1, 0.0), matrix(rows, cols, 4, 0.5, 1.0)];
+    // The gradient's momentum, a positive curvature estimate and the gradient's second moment.
+    let moments = [matrix(rows, cols, 3, 0.1, 0.0), matrix(rows, cols, 4, 0.5, 1.0), matrix(rows, cols, 5, 0.01, 0.02)];
     let step = PosteriorStep { gradient_scale: 1.5, factor_scale: 0.25, tokens: 50.0, rate: 0.1, beta1: 0.9, beta2: 0.999, step: 7 };
     let (gradient, factor) = (matrix(rows, cols, 7, 3.0, 0.0), matrix(rows, cols, 8, 2.0, 0.0));
     Case { mean, log_sd, moments, sample: (0x1234_5678_9abc_def0, 42), gradient, factor, groups, count: 8, step }
@@ -71,7 +71,7 @@ fn case(axis: GroupAxis) -> Case {
 
 /// The formulas, entry by entry: the sample, the stepped posterior and moments, and the group sums
 /// `(n, Σ μ² + σ², Σ 2s)` before and after the step, from the sums before.
-fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 2], Vec<[f64; 3]>, Vec<[f64; 3]>) {
+fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 3], Vec<[f64; 3]>, Vec<[f64; 3]>) {
     let mut before = vec![[0.0; 3]; c.count];
     for (i, g) in c.groups.iter().enumerate() {
         let (mu, s) = (c.mean.as_slice().unwrap()[i], c.log_sd.as_slice().unwrap()[i]);
@@ -84,7 +84,12 @@ fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 
     }
     let variance: Vec<f64> = before.iter().map(|b| if b[0] > 0.0 { b[1] / b[0] } else { 0.0 }).collect();
     let (b1, b2, n) = (c.step.beta1, c.step.beta2, c.step.tokens);
-    let c1 = 1.0 - b1.powi(c.step.step as i32);
+    let t = c.step.step as i32;
+    let c1 = 1.0 - b1.powi(t);
+    // The momentum's effective number of gradients, and the factor from the moments' spread to its
+    // variance.
+    let effective = (1.0 + b1) * c1 * c1 / ((1.0 - b1) * (1.0 - b1.powi(2 * t)));
+    let spread = 1.0 / (effective - 1.0);
     let mut theta = c.mean.clone();
     let (mut mean, mut log_sd, mut moments) = (c.mean.clone(), c.log_sd.clone(), c.moments.clone());
     let mut after = vec![[0.0; 3]; c.count];
@@ -99,12 +104,16 @@ fn reference(c: &Case) -> (Array2<f64>, Array2<f64>, Array2<f64>, [Array2<f64>; 
         let (sd, gr) = (s.exp(), c.step.gradient_scale * c.gradient[at]);
         let delta = 1.0 / (n * variance[*g as usize]);
         let momentum = b1 * moments[0][at] + (1.0 - b1) * gr;
+        let power = b1 * moments[2][at] + (1.0 - b1) * gr * gr;
+        let (m, noise) = (momentum / c1, (power / c1 - (momentum / c1).powi(2)).max(0.0) * spread);
+        let signal = if m * m > noise { m - noise / m } else { 0.0 };
         let estimate = c.step.factor_scale * c.factor[at] * c.factor[at];
         let (h, d) = (moments[1][at], estimate - moments[1][at]);
         let curvature = h + (1.0 - b2) * d + 0.5 * (1.0 - b2) * (1.0 - b2) * d * d / (h + delta);
         moments[0][at] = momentum;
         moments[1][at] = curvature;
-        mean[at] = mu - (c.step.rate * (momentum / c1 + delta * mu) / (curvature + delta)).clamp(-sd, sd);
+        moments[2][at] = power;
+        mean[at] = mu - (c.step.rate * (signal + delta * mu) / (curvature + delta)).clamp(-sd, sd);
         log_sd[at] = -0.5 * (n * (curvature + delta)).ln();
         let a = &mut after[*g as usize];
         a[0] += 1.0;
@@ -131,8 +140,8 @@ fn run(fit: &Device, wide: &Device, c: &Case) -> (Array2<f64>, Array2<f64>, Arra
     wide.group_divergence(&mut sums, &mut variance, &mut divergence).unwrap();
     assert!(wide.download(&sums).unwrap().iter().all(|v| *v == 0.0), "the sums are zeroed");
     let (gradient, factor) = (up(fit, &c.gradient), up(fit, &c.factor));
-    let [momentum, curvature] = &mut moments[..] else { unreachable!() };
-    fit.posterior_ivon((&mut mean, &mut log_sd), [momentum, curvature], (&gradient, &factor), (&groups, &variance), &mut sums, &c.step).unwrap();
+    let [momentum, curvature, power] = &mut moments[..] else { unreachable!() };
+    fit.posterior_ivon((&mut mean, &mut log_sd), [momentum, curvature, power], (&gradient, &factor), (&groups, &variance), &mut sums, &c.step).unwrap();
     let down = |t: &Tensor| fit.download(t).unwrap();
     let down_wide = |t: &Tensor| wide.download(t).unwrap();
     (fit.download(&theta).unwrap(), down(&mean), down(&log_sd), moments.iter().map(down).collect(), before, down_wide(&sums), down_wide(&divergence))
@@ -295,7 +304,7 @@ fn bfloat16_momentum(fit: &Device, half: &Device, wide: &Device, mut c: Case) {
     let down = |t: &Tensor| fit.download(t).expect("download");
     for gradient_storage in [fit, half] {
         let (mut m, mut s) = (up(fit, &c.mean), up(fit, &c.log_sd));
-        let (mut momentum, mut curvature) = (up(half, &c.moments[0]), up(fit, &c.moments[1]));
+        let (mut momentum, mut curvature, mut power) = (up(half, &c.moments[0]), up(fit, &c.moments[1]), up(fit, &c.moments[2]));
         let groups = fit.group_map(&c.groups, c.mean.dim()).expect("groups");
         let mut sample = half.zeros(c.mean.nrows(), c.mean.ncols()).expect("sample");
         fit.reparameterize(&mut sample, (&m, &s), c.sample).expect("bfloat16 sample");
@@ -304,12 +313,13 @@ fn bfloat16_momentum(fit: &Device, half: &Device, wide: &Device, mut c: Case) {
         let (mut variance, mut divergence) = (wide.zeros(c.count, 1).expect("variance"), wide.zeros(c.count, 1).expect("divergence"));
         wide.group_divergence(&mut sums, &mut variance, &mut divergence).expect("group divergence");
         let (gradient, factor) = (up(gradient_storage, &c.gradient), up(gradient_storage, &c.factor));
-        fit.posterior_ivon((&mut m, &mut s), [&mut momentum, &mut curvature], (&gradient, &factor), (&groups, &variance), &mut sums, &c.step).expect("bfloat16 step");
+        fit.posterior_ivon((&mut m, &mut s), [&mut momentum, &mut curvature, &mut power], (&gradient, &factor), (&groups, &variance), &mut sums, &c.step).expect("bfloat16 step");
         close("bfloat16 sample", &down(&sample), &theta.mapv(bf16), 2f64.powi(-8));
         close("mean", &down(&m), &mean, CHAIN);
         close("log sd", &down(&s), &log_sd, CHAIN);
         close("bfloat16 momentum", &down(&momentum), &moments[0].mapv(bf16), 2f64.powi(-8));
         close("curvature", &down(&curvature), &moments[1], CHAIN);
+        close("gradient second moment", &down(&power), &moments[2], CHAIN);
         close("sums after", &wide.download(&sums).expect("sums"), &after, CHAIN);
         // A bfloat16 copy widens back to the values it holds.
         assert_eq!(down(&fit.convert(&momentum).expect("widen")), down(&momentum));

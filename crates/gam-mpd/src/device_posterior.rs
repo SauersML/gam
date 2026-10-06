@@ -1,5 +1,6 @@
 //! The library fit's posterior resident on the device (#2951): the means `μ`, log standard
-//! deviations `s`, the gradient's momentum and the curvature estimate of every trainable operator
+//! deviations `s`, the gradient's momentum, the curvature estimate and the gradient's second
+//! moment (which measures the momentum's noise, [`Device::posterior_ivon`]) of every trainable operator
 //! stay on the device from step to step, so a step moves no parameter between host and device.
 //!
 //! A step writes the weight sample `θ = μ + exp(s) ε` into the explanation's program
@@ -9,7 +10,7 @@
 //! pass left on the device and a draw of the Gauss–Newton factor (`interchange::Factor`, a second
 //! reverse pass from labels drawn from the explanation's own predictions), which also sums each
 //! prior group's new moments; the groups' variances and divergences follow from those sums
-//! ([`Device::group_divergence`]). The posterior and the curvature are held in the fitting storage
+//! ([`Device::group_divergence`]). The posterior, the curvature and the gradient's second moment are held in the fitting storage
 //! (f32 on CUDA and the Apple GPU, float64 on the host); the momentum in bfloat16 where the masters
 //! are f32 on CUDA (rounded once as it is stored, its update computed in f32), else in the fitting
 //! storage; the group sums in float64 where the backend holds it (CUDA, the host). The objective is
@@ -67,12 +68,13 @@ pub struct DevicePosterior {
     wide: Device,
     fitting: Device,
     /// Per trainable operator (`Explanation::trainable` order): its id, `μ`, `s`, IVON's state
-    /// (the gradient's momentum, then the curvature estimate) and its entries' groups (one id per
+    /// (the gradient's momentum, the curvature estimate, the gradient's second moment) and its
+    /// entries' groups (one id per
     /// row or column where the groups are rows or columns).
     operators: Vec<usize>,
     mean: Vec<Tensor>,
     log_sd: Vec<Tensor>,
-    moments: Vec<[Tensor; 2]>,
+    moments: Vec<[Tensor; 3]>,
     groups: Vec<GroupMap>,
     /// Per group `(n, Σ μ² + σ², Σ 2s)` being summed, its variance and its divergence in nats.
     sums: Tensor,
@@ -111,9 +113,10 @@ fn membership(explanation: &Explanation, shapes: &[(usize, usize)]) -> Result<Ve
 impl DevicePosterior {
     /// `posterior` of `explanation` for `tokens` training tokens on `fitting` (the device whose
     /// storage the explanation's program runs in), with IVON's state per operator (`moments`: the
-    /// gradient's momentum and the curvature estimate; when `None`, momentum zero and the
-    /// curvature at which the posterior's standard deviations are IVON's) after `steps` steps.
-    pub fn new(fitting: &Device, explanation: &Explanation, posterior: &Posterior, tokens: f64, moments: Option<&[[Array2<f64>; 2]]>, steps: u64) -> Result<Self, String> {
+    /// gradient's momentum, the curvature estimate and the gradient's second moment; when `None`,
+    /// the moments zero and the curvature at which the posterior's standard deviations are IVON's)
+    /// after `steps` steps.
+    pub fn new(fitting: &Device, explanation: &Explanation, posterior: &Posterior, tokens: f64, moments: Option<&[[Array2<f64>; 3]]>, steps: u64) -> Result<Self, String> {
         let shapes: Vec<(usize, usize)> = posterior.mean.iter().map(Array2::dim).collect();
         if shapes.len() != explanation.trainable.len() {
             return Err(error("one posterior array per trainable operator required"));
@@ -126,7 +129,7 @@ impl DevicePosterior {
     /// The posterior of the trainable operators `parts.operators` of a program, each entry in group
     /// `parts.groups[i][entry]` (row-major) of `parts.count`, for `tokens` training tokens on
     /// `fitting`, with IVON's state `moments` (see [`DevicePosterior::new`]) after `steps` steps.
-    pub fn from_parts(fitting: &Device, parts: &Parts<'_>, tokens: f64, moments: Option<&[[Array2<f64>; 2]]>, steps: u64) -> Result<Self, String> {
+    pub fn from_parts(fitting: &Device, parts: &Parts<'_>, tokens: f64, moments: Option<&[[Array2<f64>; 3]]>, steps: u64) -> Result<Self, String> {
         let wide = match fitting.with_storage(Storage::F64) {
             Ok(wide) => wide,
             Err(GpuError::NoDeviceKernel { .. }) => fitting.clone(),
@@ -176,7 +179,7 @@ impl DevicePosterior {
                         if s == f64::NEG_INFINITY { 0.0 } else { (1.0 / (tokens * (2.0 * s).exp()) - n / (tokens * second)).max(0.0) }
                     })
                 };
-                Some(parts.log_sd.iter().zip(parts.groups).map(|(log_sd, groups)| [Array2::zeros(log_sd.dim()), curvature(log_sd, groups)]).collect::<Vec<_>>())
+                Some(parts.log_sd.iter().zip(parts.groups).map(|(log_sd, groups)| [Array2::zeros(log_sd.dim()), curvature(log_sd, groups), Array2::zeros(log_sd.dim())]).collect::<Vec<_>>())
             }
         };
         let moments = moments.or(start.as_deref());
@@ -188,7 +191,7 @@ impl DevicePosterior {
             divergence: wide.zeros(parts.count, 1).map_err(error)?,
             mean: parts.mean.iter().map(up).collect::<Result<_, _>>()?,
             log_sd: parts.log_sd.iter().map(up).collect::<Result<_, _>>()?,
-            moments: moments.ok_or_else(|| error("no posterior state"))?.iter().map(|m| Ok([moment(&m[0])?, up(&m[1])?])).collect::<Result<_, String>>()?,
+            moments: moments.ok_or_else(|| error("no posterior state"))?.iter().map(|m| Ok([moment(&m[0])?, up(&m[1])?, up(&m[2])?])).collect::<Result<_, String>>()?,
             groups: parts.groups.iter().zip(&shapes).map(|(ids, shape)| master.group_map(ids, *shape).map_err(error)).collect::<Result<_, _>>()?,
             operators: parts.operators.to_vec(),
             fitting: fitting.clone(),
@@ -297,9 +300,9 @@ impl DevicePosterior {
             let gradient = gradients.get(&op).or(missing_gradient.as_ref()).ok_or_else(|| error("no gradient"))?;
             let draw = factor.0.get(&op).or(missing_factor.as_ref()).ok_or_else(|| error("no Gauss–Newton factor"))?;
             let step = PosteriorStep { gradient_scale: scale, factor_scale: factor.1, tokens: self.tokens, rate: ivon.rate, beta1: ivon.beta1, beta2: ivon.beta2, step: self.steps };
-            let [momentum, curvature] = &mut self.moments[i];
+            let [momentum, curvature, power] = &mut self.moments[i];
             self.fitting
-                .posterior_ivon((&mut self.mean[i], &mut self.log_sd[i]), [momentum, curvature], (gradient, draw), (&self.groups[i], &self.variance), &mut self.sums, &step)
+                .posterior_ivon((&mut self.mean[i], &mut self.log_sd[i]), [momentum, curvature, power], (gradient, draw), (&self.groups[i], &self.variance), &mut self.sums, &step)
                 .map_err(error)?;
         }
         self.wide.group_divergence(&mut self.sums, &mut self.variance, &mut self.divergence).map_err(error)
@@ -389,10 +392,10 @@ impl DevicePosterior {
 
     /// The posterior's means and log standard deviations into `posterior`, and IVON's state per
     /// operator.
-    pub fn download(&self, posterior: &mut Posterior) -> Result<Vec<[Array2<f64>; 2]>, String> {
+    pub fn download(&self, posterior: &mut Posterior) -> Result<Vec<[Array2<f64>; 3]>, String> {
         self.values_into(posterior)?;
         let down = |t: &Tensor| self.fitting.download(t).map_err(error);
-        self.moments.iter().map(|m| Ok([down(&m[0])?, down(&m[1])?])).collect()
+        self.moments.iter().map(|m| Ok([down(&m[0])?, down(&m[1])?, down(&m[2])?])).collect()
     }
 
     /// The posterior's means and log standard deviations into `posterior`; IVON's state stays on
@@ -425,22 +428,23 @@ impl DevicePosterior {
         Ok((self.fitting.download(&self.mean[i]).map_err(error)?, self.fitting.download(&self.log_sd[i]).map_err(error)?))
     }
 
-    /// The storage of the means, the log standard deviations, the gradient's momentum and the
-    /// curvature estimate (every operator's alike), in which a checkpoint keeps them.
+    /// The storage of the means, the log standard deviations, the gradient's momentum, the
+    /// curvature estimate and the gradient's second moment (every operator's alike), in which a
+    /// checkpoint keeps them.
     #[must_use]
-    pub fn storages(&self) -> [Storage; 4] {
+    pub fn storages(&self) -> [Storage; 5] {
         match (self.mean.first(), self.log_sd.first(), self.moments.first()) {
-            (Some(mean), Some(log_sd), Some([momentum, curvature])) => [mean.storage(), log_sd.storage(), momentum.storage(), curvature.storage()],
-            _ => [self.fitting.storage(); 4],
+            (Some(mean), Some(log_sd), Some([momentum, curvature, power])) => [mean.storage(), log_sd.storage(), momentum.storage(), curvature.storage(), power.storage()],
+            _ => [self.fitting.storage(); 5],
         }
     }
 
     /// Trainable operator `i`'s `μ`, `s` and IVON's state on the host, one operator at a time (a
     /// checkpoint streams them rather than holding every operator's state at once).
-    pub fn operator(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>, [Array2<f64>; 2]), String> {
+    pub fn operator(&self, i: usize) -> Result<(Array2<f64>, Array2<f64>, [Array2<f64>; 3]), String> {
         let down = |t: &Tensor| self.fitting.download(t).map_err(error);
         let m = self.moments.get(i).ok_or_else(|| error("no such trainable operator"))?;
-        Ok((down(&self.mean[i])?, down(&self.log_sd[i])?, [down(&m[0])?, down(&m[1])?]))
+        Ok((down(&self.mean[i])?, down(&self.log_sd[i])?, [down(&m[0])?, down(&m[1])?, down(&m[2])?]))
     }
 
 }
