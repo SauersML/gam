@@ -1305,13 +1305,12 @@ impl HostTargets {
             .rows
             .iter()
             .map(|t| {
-                let values = d.download(&t.mu).map_err(error)?;
-                let shape = values.dim();
+                let shape = (t.mu.rows(), t.mu.cols());
                 let storage = t.mu.storage();
                 let mu = match storage {
-                    Storage::F64 => KeptValues::Double(values.into_iter().collect()),
-                    // f32 and bfloat16 values are f32 values: narrowing their widened copies is exact.
-                    Storage::F32 | Storage::Bf16 => KeptValues::Single(values.iter().map(|v| *v as f32).collect()),
+                    Storage::F64 => KeptValues::Double(d.download(&t.mu).map_err(error)?.into_iter().collect()),
+                    // f32 and bfloat16 values are f32 values, read as they are (`Device::download_f32`).
+                    Storage::F32 | Storage::Bf16 => KeptValues::Single(d.download_f32(&t.mu).map_err(error)?),
                 };
                 Ok(KeptTarget { mu, shape, storage, entropy: t.entropy.clone(), head: Arc::clone(&t.head), scored: t.scored.clone() })
             })

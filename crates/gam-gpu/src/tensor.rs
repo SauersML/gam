@@ -795,6 +795,33 @@ impl Device {
         Ok(Tensor { rows, cols, data })
     }
 
+    /// `t`'s values as f32, row-major ([`Device::upload_f32`]'s inverse): read as they are where the
+    /// device holds f32 (CUDA f32 storage, the Apple GPU), with no widening to float64 and narrowing
+    /// back; bfloat16 values widen to f32 exactly and float64 values round to f32.
+    pub fn download_f32(&self, t: &Tensor) -> Result<Vec<f32>, GpuError> {
+        match &t.data {
+            #[cfg(target_os = "linux")]
+            Data::Cuda32(slice) => match &*self.backend {
+                Backend::Cuda(engine) => {
+                    let mut values = engine.download(slice)?;
+                    values.truncate(t.len());
+                    Ok(values)
+                }
+                _ => Err(foreign()),
+            },
+            #[cfg(target_os = "macos")]
+            Data::Metal(buffer) => match &*self.backend {
+                Backend::Metal(engine) => {
+                    let mut values: Vec<f32> = engine.stream.read(buffer)?;
+                    values.truncate(t.len());
+                    Ok(values)
+                }
+                _ => Err(foreign()),
+            },
+            _ => Ok(self.download(t)?.iter().map(|v| *v as f32).collect()),
+        }
+    }
+
     /// A `rows × cols` tensor from row-major f32 `values` ([`Device::upload_vec`]), sent as they are
     /// where the device holds f32 (CUDA f32 storage, the Apple GPU): no widening and narrowing pass.
     pub fn upload_f32(&self, rows: usize, cols: usize, values: &[f32]) -> Result<Tensor, GpuError> {
