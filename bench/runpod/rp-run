@@ -511,7 +511,7 @@ unbuilt_in() {  # LISTING
 # Whether POD is ours: its id in REGISTRY (or LEDGER.tsv), and, when the API still knows it, its
 # name mpd2951-... .
 registered() { grep -q "^$1	" "$REGISTRY" 2> /dev/null || cut -f7 "$LEDGER" 2> /dev/null | grep -qx "$1"; }
-owned() {
+owned() {  # POD; 0 ours, 1 not ours, 2 unknown (RunPod gave no answer: the Mac offline, an outage)
     local r
     registered "$1" || return 1
     # Thunder instances are on the user's own account and carry no name the runner sets.
@@ -520,7 +520,7 @@ owned() {
     case $(status_of "$r") in
         404) return 0 ;;
         200) jq -e '(.name // "") | startswith("mpd2951-")' <<< "$(body_of "$r")" > /dev/null ;;
-        *) return 1 ;;
+        *) return 2 ;;
     esac
 }
 
@@ -546,7 +546,14 @@ reap() {  # POD [cap]
         echo "rp-run: pod $pod kept: run process $(holders "$pod" | paste -sd ' ' -) still uses it" >&2
         return 0
     fi
-    if ! owned "$pod"; then
+    # An unanswered ownership query (the Mac offline at 13:40 10-06) is asked again for 10 minutes;
+    # unanswered still, the pod and its record stay and reap fails, so no run relaunches beside it.
+    local o waited=0
+    while owned "$pod"; o=$?; (( o == 2 )); do
+        (( waited < 600 )) || { echo "rp-run: RunPod does not answer about pod $pod after 10 minutes; its record stays" >&2; return 1; }
+        sleep 30; waited=$(( waited + 30 ))
+    done
+    if (( o == 1 )); then
         echo "rp-run: pod $pod is not ours (not named mpd2951- or not created by rp-run); not deleting it, dropping its record" >&2
         rm -f "$rec" "$ACTIVE/.$pod".*
         return 0
@@ -3005,6 +3012,17 @@ run_command() {
             say "pod $POD is $state"
             break
         fi
+        # RunPod itself unanswered (UNKNOWN: the Mac offline, as at 13:40 10-06, when a pod was
+        # called unreachable and relaunched while it ran on): wait, counting no miss, until it
+        # answers or the run's cap is near. Only a pod RunPod reports running that SSH cannot reach
+        # counts toward its loss.
+        if [ "$state" = UNKNOWN ]; then
+            [ -n "$DEADLINE" ] && (( $(date +%s) + 60 > DEADLINE )) && { say "RunPod unanswered and the cap is near"; break; }
+            (( ${offline_said:-0} )) || { say "RunPod does not answer (the Mac offline?); waiting, the pod is not counted lost"; offline_said=1; }
+            sleep 15
+            continue
+        fi
+        offline_said=0
         misses=$(( misses + 1 ))
         (( misses <= 10 )) || { say "pod $POD unreachable"; break; }
         sleep 15
