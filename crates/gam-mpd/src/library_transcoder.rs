@@ -20,7 +20,7 @@
 //! Only features that fire on the training sample at positions after the first are kept
 //! ([`firing`]): a feature whose pre-activation is not positive on any such token adds exactly zero
 //! to the block's output on every clean training input at the starting point, so dropping it
-//! leaves the start unchanged there. The kept features are written once in the library's layout ([`write_kept`]): `gate`
+//! leaves the start unchanged there. The kept features are written once in the library's layout ([`Transcoder::write_kept`]): `gate`
 //! `k × d`, `gate_bias` `k × 1`, `out` `d × k` (`W_dec`'s kept rows transposed) and `bias` `d × 1`
 //! in the transcoder's own storage type (bfloat16 reals copied bit for bit), and `features` (the
 //! kept features' indices in the transcoder, as float32, exact below 2^24). The library's operators
