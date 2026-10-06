@@ -750,13 +750,28 @@ impl Device {
         }
     }
 
+    /// A `rows × cols` tensor of `values` in the device's storage, made from the view directly: a
+    /// device holding f32 or bfloat16 takes them narrowed in one pass, and one holding float64 takes
+    /// a contiguous view as it is, with no float64 copy on the host in between.
     pub fn upload(&self, values: ArrayView2<'_, f64>) -> Result<Tensor, GpuError> {
         let (rows, cols) = values.dim();
-        let flat: Vec<f64> = match values.as_slice() {
-            Some(s) => s.to_vec(),
-            None => values.iter().copied().collect(),
+        let data = match &*self.backend {
+            Backend::Host => Data::Host(values.iter().copied().collect()),
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if self.storage == Storage::F32 => Data::Cuda32(engine.upload(&values.iter().map(|v| *v as f32).collect::<Vec<f32>>())?),
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if self.storage == Storage::Bf16 => {
+                Data::CudaBf16(engine.upload(&values.iter().map(|v| bf16_bits(*v as f32) as u16).collect::<Vec<u16>>())?)
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => match values.as_slice() {
+                Some(contiguous) => Data::Cuda(engine.upload(contiguous)?),
+                None => Data::Cuda(engine.upload(&values.iter().copied().collect::<Vec<f64>>())?),
+            },
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => Data::Metal(engine.stream.upload(&values.iter().map(|v| *v as f32).collect::<Vec<f32>>())?),
         };
-        self.upload_vec(rows, cols, flat)
+        Ok(Tensor { rows, cols, data })
     }
 
     /// A `rows × cols` tensor from row-major `values`.
