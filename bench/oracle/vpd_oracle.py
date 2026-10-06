@@ -317,7 +317,10 @@ def slots(table: Table, ex: dict, condition: str) -> list[tuple]:
     if ex["kind_q"] == "attribution":
         out += [(l, k, c, 0.0, "up_", condition in ("graph", "weights")) for l, k, c, _, _ in ex["candidates"]]
     elif ex["kind_q"] == "edge":
-        out += [(l, k, c, math.log(max(s, 1e-30)), "up_", condition == "graph") for l, k, c, s, _ in ex["candidates"]]
+        # The cut edge's writer carries its own log ||u|| ||v||: its measured effect is the answer.
+        for l, k, c, _, _ in ex["candidates"]:
+            v, u = table.vectors(l, k, c)
+            out.append((l, k, c, math.log(float(u.norm() * v.norm())), "up_", condition == "graph"))
     if ex["c"] >= 0 and ex["kind_q"] != "edge":
         out += [(l, k, c, math.log(max(s, 1e-30)), f"{d}_", condition == "graph") for l, k, c, s, d in table.neighbours(ex["layer"], ex["kind"], ex["c"])]
     return out[:SLOTS]
