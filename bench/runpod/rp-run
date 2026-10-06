@@ -1956,6 +1956,11 @@ attach() {  # POD
 # Signals wait while a pod is created, so none can end the run between its creation and its record.
 launch() {
     local kind price gpu r code left host
+    # Offers whose pod landed on a host, data center or address that failed before: RunPod's stock of
+    # that offer is that machine for now (frontier-gn-n32768-line6 got host l5bnouhrol1e three times
+    # running), so this launch does not ask for it again, and such a discard, which costs seconds,
+    # does not count against DISCARDS.
+    local -A spent=()
     # A listed run relaunches only while still listed; a small run's approval covers its whole cap.
     [ "$APPROVAL" = auto ] || approved "$NAME" || { say "approval for $NAME withdrawn; not launching a pod"; exit 3; }
     POD="" IP="" PORT="" EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" EARLY_BINS="" PROBE_A=""
@@ -1970,6 +1975,7 @@ launch() {
     API_FAILED=0
     until [ -n "$POD" ]; do
     while IFS='|' read -r kind price gpu <&3; do
+        [ -z "${spent[$kind|$gpu]:-}" ] || continue
         left=$(( ${DEADLINE:-$(( $(date +%s) + CAP_SECONDS ))} - $(date +%s) ))
         (( left > 0 )) || { say "no time left under the HOURS cap"; exit 1; }
         trap '' INT TERM HUP
@@ -2076,8 +2082,11 @@ launch() {
         echo discarded > "$ACTIVE/.$POD.end"
         reap "$POD" || exit 1
         POD="" IP="" PORT=""
-        DISCARDED=$(( ${DISCARDED:-0} + 1 ))
-        (( DISCARDED <= DISCARDS )) || { say "$DISCARDS pods discarded on failing hosts; giving up"; exit 1; }
+        case ${why[1]} in
+            "host failed before"|"data center failed before"|"host slow before"|"SSH address failed before") spent[$kind|$gpu]=1 ;;
+            *)  DISCARDED=$(( ${DISCARDED:-0} + 1 ))
+                (( DISCARDED <= DISCARDS )) || { say "$DISCARDS pods discarded on failing hosts; giving up"; exit 1; } ;;
+        esac
         # The failed host (or data center) is now skipped: the offers are ranked again with this
         # attempt's record and tried from the best, so a community card that failed on one host is
         # tried on another while it stays cheaper in expectation than a secure one.
