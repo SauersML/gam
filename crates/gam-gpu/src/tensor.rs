@@ -425,11 +425,11 @@ impl GroupMap {
     }
 
     /// The threads a CUDA reduction over the map runs: one block of 256 (the kernels' `BLOCK`) per
-    /// segment (`segments_reduce`), or per 4 segments of one column each (`columns_reduce`'s
+    /// segment (`segments_reduce`), or per 8 segments of one column each (`columns_reduce`'s
     /// `COLUMNS`).
     #[cfg(target_os = "linux")]
     fn blocks(&self) -> usize {
-        if self.single_columns() { 256 * self.segments.div_ceil(4) } else { 256 * self.segments }
+        if self.single_columns() { 256 * self.segments.div_ceil(8) } else { 256 * self.segments }
     }
 
     /// Whether every segment is one column: column groups of one column each (an MLP's output
@@ -4219,12 +4219,12 @@ __device__ unsigned int group_of(const unsigned int* ids, unsigned int axis, u64
 // each goes through the shuffles its warp takes (real warp w those of column w / (R / 32)), and lane
 // 0 of warp l adds the warps' sums in warp order: every group's sums are the ones its own block adds,
 // while a warp reads and writes runs of COLUMNS adjacent columns instead of one entry of each of 32
-// rows. Four columns a block keep six blocks on a multiprocessor (eight left three, and the tiles ran
-// at half the row-grouped operators' rate). `body(i, g, v)` puts entry i's N terms in v and says whether to add them;
+// rows. Eight columns a block read whole 32-byte sectors; four (f97524b178) kept more blocks on a
+// multiprocessor but read half sectors, and ran IVON on an MLP's columns at 364 µs against 270. `body(i, g, v)` puts entry i's N terms in v and says whether to add them;
 // with `every` it also runs on the entries of a group at or beyond `count` (whose sums are not
 // added); with `counted` a group's sums are added only when the first is positive. Every block runs
 // the same rows and synchronizations.
-#define COLUMNS 4
+#define COLUMNS 8
 template <int N, typename F>
 __device__ void columns_reduce(u64 n, u64 cols, u64 segments, const unsigned int* layout, u64 count, bool every, bool counted, double* sums, F body) {
     const unsigned int R = BLOCK / COLUMNS, VW = R / 32;
