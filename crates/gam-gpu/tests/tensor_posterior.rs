@@ -647,6 +647,52 @@ fn cuda_single_column_groups_reduce_as_their_transposes() {
     single_columns_match_their_transposes(&wide, &wide, &wide);
 }
 
+/// Samples gathered and run together ([`Device::run_samples`]) against each written by its own
+/// `reparameterize_block`, bit for bit: two operators whole and both into blocks of a stacked
+/// output, on `fit` with outputs in `out`'s storage.
+fn gathered_samples_match_their_own(fit: &Device, out: &Device) {
+    let c = case(GroupAxis::Rows);
+    let (rows, cols) = c.mean.dim();
+    let up = |a: &Array2<f64>| fit.upload(a.view()).unwrap();
+    let operators = [(up(&c.mean), up(&c.log_sd)), (up(&c.moments[0]), up(&(&c.log_sd * 0.5)))];
+    let key = 0x0123_4567_89ab_cdef;
+    let mut whole: Vec<Tensor> = (0..2).map(|_| out.zeros(rows, cols).unwrap()).collect();
+    let mut stack = out.zeros(2 * rows + 1, cols + 3).unwrap();
+    let mut samples = fit.samples(key);
+    for (i, ((mean, log_sd), theta)) in operators.iter().zip(&mut whole).enumerate() {
+        // SAFETY: every tensor lives past run_samples below, and nothing reads them before it.
+        unsafe { fit.add_sample(&mut samples, theta, (0, 0), (mean, log_sd), i as u64 + 3) }.unwrap();
+    }
+    for (i, (mean, log_sd)) in operators.iter().enumerate() {
+        // SAFETY: as above.
+        unsafe { fit.add_sample(&mut samples, &mut stack, (i * rows + 1, 2), (mean, log_sd), i as u64 + 3) }.unwrap();
+    }
+    fit.run_samples(samples).unwrap();
+    let mut expected_stack = out.zeros(2 * rows + 1, cols + 3).unwrap();
+    for (i, ((mean, log_sd), theta)) in operators.iter().zip(&whole).enumerate() {
+        let mut expected = out.zeros(rows, cols).unwrap();
+        fit.reparameterize_block(&mut expected, (0, 0), (mean, log_sd), (key, i as u64 + 3)).unwrap();
+        assert_eq!(out.download(theta).unwrap(), out.download(&expected).unwrap(), "{} operator {i} whole", fit.name());
+        fit.reparameterize_block(&mut expected_stack, (i * rows + 1, 2), (mean, log_sd), (key, i as u64 + 3)).unwrap();
+    }
+    assert_eq!(out.download(&stack).unwrap(), out.download(&expected_stack).unwrap(), "{} stacked blocks", fit.name());
+}
+
+#[test]
+fn gathered_samples_are_the_ones_each_writes_alone() {
+    let host = Device::host();
+    gathered_samples_match_their_own(&host, &host);
+    if let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") {
+        let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
+        gathered_samples_match_their_own(&narrow, &narrow);
+        gathered_samples_match_their_own(&narrow, &wide.with_storage(Storage::Bf16).expect("CUDA holds bfloat16"));
+        gathered_samples_match_their_own(&wide, &wide);
+    }
+    if let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault") {
+        gathered_samples_match_their_own(&metal, &metal);
+    }
+}
+
 #[test]
 fn removal_sums_on_the_host_match_their_formulas() {
     let host = Device::host();

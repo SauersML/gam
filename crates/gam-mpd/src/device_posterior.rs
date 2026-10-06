@@ -537,11 +537,18 @@ impl DevicePosterior {
     }
 
     /// [`DevicePosterior::sample_into`] around `means`.
+    ///
+    /// The operators held in place and the stacks' blocks are gathered and written together
+    /// ([`Device::run_samples`]); an operator replaced (a bias's column copy) is written first.
     fn sample_of(&self, program: &mut DeviceProgram, key: u64, means: &[Tensor]) -> Result<(), String> {
+        let mut samples = self.fitting.samples(key);
         for (i, &op) in self.operators.iter().enumerate() {
             let parts = (&means[i], &self.log_sd[i]);
             if let Ok(theta) = program.dense_mut(op) {
-                self.fitting.reparameterize(theta, parts, (key, i as u64)).map_err(error)?;
+                // SAFETY: the operator's copy and the masters stay in place until run_samples below,
+                // and nothing enqueued before it reads the copy (a replacement copies only its own
+                // value, the restacking only operators it does not write through the callback).
+                unsafe { self.fitting.add_sample(&mut samples, theta, (0, 0), parts, i as u64) }.map_err(error)?;
             } else {
                 let (rows, cols) = (means[i].rows(), means[i].cols());
                 let mut theta = self.fitting.zeros(rows, cols).map_err(error)?;
@@ -550,12 +557,15 @@ impl DevicePosterior {
             }
         }
         program.refresh_fused_with(&mut |op, stack, at| {
-            if !self.operators.contains(&op) {
+            let Some(i) = self.operators.iter().position(|o| *o == op) else {
                 return Ok(false);
-            }
-            self.block_of(op, stack, at, key, means)?;
+            };
+            // SAFETY: the stack (the group's own, copied first when shared) and the masters stay in
+            // place until run_samples below, and the restacking reads no block it writes here.
+            unsafe { self.fitting.add_sample(&mut samples, stack, at, (&means[i], &self.log_sd[i]), i as u64) }.map_err(error)?;
             Ok(true)
-        })
+        })?;
+        self.fitting.run_samples(samples).map_err(error)
     }
 
     /// One IVON step: `gradients` holds per trainable operator (by id) the gradient of the batch's

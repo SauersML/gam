@@ -569,6 +569,15 @@ fn same(a: &Tensor, b: &Tensor, what: &str) -> Result<(), GpuError> {
     Ok(())
 }
 
+/// Weight samples of one key gathered to be written together ([`Device::samples`],
+/// [`Device::add_sample`], [`Device::run_samples`]). On CUDA, per sample: its output's storage, and
+/// its output (at its block's first entry), mean and log standard deviation addresses, entries,
+/// columns, output row stride and stream.
+pub struct Samples {
+    key: u64,
+    jobs: Vec<(Storage, [u64; 7])>,
+}
+
 /// The bfloat16 nearest `x` (ties to even), as its 16 bits; a NaN stays a quiet NaN.
 fn bf16_bits(x: f32) -> u32 {
     let bits = x.to_bits();
@@ -2400,6 +2409,55 @@ impl Device {
         }
     }
 
+    /// An empty set of weight samples of `key` ([`Device::add_sample`]).
+    #[must_use]
+    pub fn samples(&self, key: u64) -> Samples {
+        Samples { key, jobs: Vec::new() }
+    }
+
+    /// [`Device::reparameterize_block`] with `samples`' key, gathered into `samples`: on CUDA it is
+    /// written when [`Device::run_samples`] runs them, every sample of one output storage by one
+    /// launch (a sample's own launch costs more than its entries for an operator of the sizes a
+    /// library holds); elsewhere it is written now. Each entry is the one
+    /// [`Device::reparameterize_block`] writes.
+    ///
+    /// # Safety
+    ///
+    /// On CUDA, until `run_samples` runs `samples`, `out`, `mean` and `log_sd` stay allocated (none
+    /// is dropped or replaced), and nothing enqueued reads `out`'s block or writes `mean` or
+    /// `log_sd`.
+    // SAFETY: the contract above is the caller's; this records addresses, and run_samples writes
+    // through them.
+    pub unsafe fn add_sample(&self, samples: &mut Samples, out: &mut Tensor, (row, col): (usize, usize), (mean, log_sd): (&Tensor, &Tensor), stream: u64) -> Result<(), GpuError> {
+        same(mean, log_sd, "sampled log standard deviation")?;
+        if row + mean.rows > out.rows || col + mean.cols > out.cols {
+            return Err(shape(format!("a {:?} sample at ({row}, {col}) of {:?}", mean.dim(), out.dim())));
+        }
+        if mean.len() == 0 {
+            return Ok(());
+        }
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => {
+                let job = engine.sample_job(out, (row * out.cols + col, out.cols), (mean, log_sd), stream)?;
+                samples.jobs.push(job);
+                Ok(())
+            }
+            _ => self.reparameterize_block(out, (row, col), (mean, log_sd), (samples.key, stream)),
+        }
+    }
+
+    /// Writes the samples gathered in `samples` ([`Device::add_sample`]).
+    pub fn run_samples(&self, samples: Samples) -> Result<(), GpuError> {
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.run_samples(samples.key, &samples.jobs),
+            // Elsewhere every sample was written as it was gathered.
+            _ if samples.jobs.is_empty() => Ok(()),
+            _ => Err(shape("samples gathered on another device".to_string())),
+        }
+    }
+
     /// One step of the improved variational online Newton method (IVON; Shen et al., ICML 2024,
     /// arXiv 2402.17641, Algorithm 1) on the factorized Gaussian posterior `N(μ, exp(s)²)`, with the
     /// data term's curvature taken in the Gauss–Newton approximation, and each entry's new
@@ -3799,6 +3857,49 @@ __device__ unsigned short bf16_round(float x) {
 // read without rounding it again (`reparameterize_body`'s block).
 extern "C" __global__ void reparameterize_bf16(u64 n, u64 cols, u64 stride, u64 key, u64 stream, const float* mean, const float* log_sd, unsigned short* theta) {
     GRID_STRIDE(i, n) theta[(i / cols) * stride + i % cols] = bf16_round(mean[i] + expf(log_sd[i]) * posterior_normal(key, stream, i));
+}
+
+// `Device::run_samples`: several samples of one key in one launch. `table` holds per sample eight
+// words: its output (at its block's first entry), mean and log standard deviation addresses, its
+// columns, its output's row stride, its stream, and its first entry in the launch's numbering (the
+// samples' entries one after another, `total` in all). Launch entry g is entry g − first of the
+// last sample whose first entry is at most g, written as its own launch writes it.
+__device__ const unsigned long long* sample_of_entry(u64 samples, const u64* table, u64 g) {
+    u64 lo = 0, hi = samples;
+    while (hi - lo > 1) {
+        u64 mid = (lo + hi) / 2;
+        if (table[8 * mid + 6] <= g) lo = mid; else hi = mid;
+    }
+    return table + 8 * lo;
+}
+
+template <typename T>
+__device__ void reparameterize_many_body(u64 samples, const u64* table, u64 total, u64 key) {
+    GRID_STRIDE(g, total) {
+        const u64* job = sample_of_entry(samples, table, g);
+        u64 i = g - job[6], cols = job[3];
+        const T* mean = (const T*)job[1];
+        const T* log_sd = (const T*)job[2];
+        ((T*)job[0])[(i / cols) * job[4] + i % cols] = mean[i] + entry_exp(log_sd[i]) * (T)posterior_normal(key, job[5], i);
+    }
+}
+
+extern "C" __global__ void reparameterize_many_f64(u64 samples, const u64* table, u64 total, u64 key) {
+    reparameterize_many_body<double>(samples, table, total, key);
+}
+
+extern "C" __global__ void reparameterize_many_f32(u64 samples, const u64* table, u64 total, u64 key) {
+    reparameterize_many_body<float>(samples, table, total, key);
+}
+
+extern "C" __global__ void reparameterize_many_bf16(u64 samples, const u64* table, u64 total, u64 key) {
+    GRID_STRIDE(g, total) {
+        const u64* job = sample_of_entry(samples, table, g);
+        u64 i = g - job[6], cols = job[3];
+        const float* mean = (const float*)job[1];
+        const float* log_sd = (const float*)job[2];
+        ((unsigned short*)job[0])[(i / cols) * job[4] + i % cols] = bf16_round(mean[i] + expf(log_sd[i]) * posterior_normal(key, job[5], i));
+    }
 }
 
 // Adds a live entry's (1, μ² + σ², 2s) to its group's row of `sums`: once per warp when every live
@@ -5799,6 +5900,52 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 Data::Host(_) => return Err(foreign()),
             };
             launched.gpu_ctx("tensor reparameterize").map(|_| ())
+        }
+
+        /// [`super::Device::add_sample`]'s record of one sample: its output's storage, and its
+        /// output address at entry `at` (rows `stride` apart), its masters' addresses, entries,
+        /// columns, row stride and stream.
+        pub(super) fn sample_job(&self, out: &mut Tensor, (at, stride): (usize, usize), (mean, log_sd): (&Tensor, &Tensor), stream: u64) -> Result<(Storage, [u64; 7]), GpuError> {
+            let address = |t: &Tensor, masters: Storage| -> Result<u64, GpuError> {
+                let (pointer, record) = match (&t.data, masters) {
+                    (Data::Cuda(s), Storage::F64) => s.device_ptr(&self.stream),
+                    (Data::Cuda32(s), Storage::F32) => s.device_ptr(&self.stream),
+                    (other, _) => return Err(mismatch(other)),
+                };
+                drop(record);
+                Ok(pointer)
+            };
+            let (storage, masters, base, bytes) = match &out.data {
+                Data::CudaBf16(s) => (Storage::Bf16, Storage::F32, s.device_ptr(&self.stream).0, 2),
+                Data::Cuda32(s) => (Storage::F32, Storage::F32, s.device_ptr(&self.stream).0, 4),
+                Data::Cuda(s) => (Storage::F64, Storage::F64, s.device_ptr(&self.stream).0, 8),
+                Data::Host(_) => return Err(foreign()),
+            };
+            let job = [base + bytes * at as u64, address(mean, masters)?, address(log_sd, masters)?, mean.len() as u64, mean.cols as u64, stride as u64, stream];
+            Ok((storage, job))
+        }
+
+        /// [`super::Device::run_samples`]: per output storage, one launch of every sample in it.
+        pub(super) fn run_samples(&self, key: u64, jobs: &[(Storage, [u64; 7])]) -> Result<(), GpuError> {
+            for (storage, name) in [(Storage::F64, "reparameterize_many_f64"), (Storage::F32, "reparameterize_many_f32"), (Storage::Bf16, "reparameterize_many_bf16")] {
+                let mut table = Vec::new();
+                let mut total = 0u64;
+                for (_, [out, mean, log_sd, entries, cols, stride, stream]) in jobs.iter().filter(|(s, _)| *s == storage) {
+                    table.extend([*out, *mean, *log_sd, *cols, *stride, *stream, total, 0]);
+                    total += entries;
+                }
+                if total == 0 {
+                    continue;
+                }
+                let samples = (table.len() / 8) as u64;
+                let table = self.stream.clone_htod(&table).gpu_ctx("tensor sample table")?;
+                let f = self.function(name)?;
+                // SAFETY: the table's addresses are the samples' live buffers (`Device::add_sample`'s
+                // contract), each output block inside its tensor and each pair of masters of its
+                // sample's entries (checked as each was gathered).
+                unsafe { self.stream.launch_builder(&f).arg(&samples).arg(&table).arg(&total).arg(&key).launch(cfg_elements(total)) }.gpu_ctx("tensor run_samples")?;
+            }
+            Ok(())
         }
 
         pub(super) fn posterior_ivon(
