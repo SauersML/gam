@@ -28,13 +28,22 @@
 //! `attribution_contexts` contexts: X the most probable next token, proposals the `2·proposals`
 //! functions whose write at that position has the largest direct effect on X's logit through the
 //! final norm, used only to choose what to measure, and each one's exact removal change of
-//! log p(X)). `functions.safetensors` holds the functions' maps (`Library::maps`).
+//! log p(X)), `upstream` (at each of a function B's first `contexts` contexts, at its peak, the
+//! `proposals` functions writing into what B reads whose write contributes most to B's reads
+//! there, `Σ_route ‖R (γ ⊙ w_A(p))‖ / r(p)`, used only to choose what to measure, and each one's
+//! exact removal change of B's activity at p, strongest first) and `edges` (at B's strongest
+//! context: path patches, `Library::path_patched`, of its two strongest measured upstream
+//! neighbours and of its weakest measured proposal: the change of B's activity at p, and of the
+//! next-token distribution there). `functions.safetensors` holds the functions' maps
+//! (`Library::maps`).
 //!
 //! EXPORT SETTINGS.json OUT_DIR [ARTIFACT]
 //!
 //! `SETTINGS.json`: `{context, pool: [start, end), top, random, steps, contexts, k, proposals,
-//! attribution_contexts, positions, batch, numeric_bytes, tile_rows, seed, limit}` (`limit` > 0:
-//! only each site's first `limit` functions, a smoke test).
+//! attribution_contexts, positions, batch, numeric_bytes, tile_rows, seed, limit, parts}` (`limit` >
+//! 0: only each site's first `limit` functions; `parts`: which of labels, downstream, attribution,
+//! upstream and edges to write, the labels with the relations' continuations; the contexts, chosen
+//! by `seed`, are the same in every run of one pool).
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     artifact::Artifact,
@@ -74,6 +83,7 @@ struct Settings {
     tile_rows: usize,
     seed: u64,
     limit: usize,
+    parts: Vec<String>,
 }
 
 fn error(e: impl std::fmt::Display) -> String {
@@ -126,6 +136,10 @@ fn i16s(shape: Vec<usize>, values: impl IntoIterator<Item = i64>) -> Array {
     Array { dtype: "I16", shape, bytes: values.into_iter().flat_map(|v| (v as i16).to_le_bytes()).collect() }
 }
 
+fn i8s(shape: Vec<usize>, values: impl IntoIterator<Item = i64>) -> Array {
+    Array { dtype: "I8", shape, bytes: values.into_iter().map(|v| v as i8 as u8).collect() }
+}
+
 fn i64s(shape: Vec<usize>, values: impl IntoIterator<Item = i64>) -> Array {
     Array { dtype: "I64", shape, bytes: values.into_iter().flat_map(i64::to_le_bytes).collect() }
 }
@@ -176,6 +190,7 @@ fn save(path: &Path, arrays: BTreeMap<String, Array>) -> Result<(), String> {
         let width = match a.dtype {
             "I64" => 8,
             "F32" | "I32" => 4,
+            "I8" => 1,
             _ => 2,
         };
         if a.shape.iter().product::<usize>() * width != a.bytes.len() {
@@ -275,6 +290,11 @@ fn main() -> Result<(), String> {
         _ => return Err("EXPORT SETTINGS.json OUT_DIR [ARTIFACT]".into()),
     };
     let settings: Settings = serde_json::from_slice(&std::fs::read(settings_path).map_err(error)?).map_err(error)?;
+    let known = ["labels", "downstream", "attribution", "upstream", "edges"];
+    if let Some(p) = settings.parts.iter().find(|p| !known.contains(&p.as_str())) {
+        return Err(format!("unknown part {p}"));
+    }
+    let wants = |part: &str| settings.parts.iter().any(|p| p == part);
     let out = Path::new(out);
     std::fs::create_dir_all(out).map_err(error)?;
     let started = Instant::now();
@@ -375,6 +395,15 @@ fn main() -> Result<(), String> {
     let peak_of: Vec<f64> = (0..total).map(|f| peaks.row(f).iter().fold(0.0_f64, |m, v| m.max(f64::from(*v))).max(f64::from(f32::MIN_POSITIVE))).collect();
     log::info!("contexts in {:.0} s", started.elapsed().as_secs_f64());
 
+    let j_count = settings.contexts.min(kk);
+    let k = settings.k;
+    let steps = settings.steps;
+    let pcount = settings.proposals.min(total);
+    let (mut u_ids, mut u_delta) = (vec![-1i64; total * j_count * pcount], vec![0.0f64; total * j_count * pcount]);
+    if wants("edges") && !wants("upstream") {
+        return Err("edges are chosen from the upstream measurements: ask for both".into());
+    }
+    if wants("labels") {
     // Effects of α = 0 and 1.5 at each (function, context)'s peak.
     let pairs: Vec<(usize, usize)> = chosen.iter().flat_map(|f| (0..kk).map(move |j| (*f, j))).collect();
     let mut effect: BTreeMap<String, Vec<f64>> = BTreeMap::new();
@@ -453,7 +482,6 @@ fn main() -> Result<(), String> {
     }
 
     // Relations: continuations.
-    let steps = settings.steps;
     let mut cont: BTreeMap<String, Array> = BTreeMap::new();
     for (a, key) in [(0usize, "clean".to_string())].into_iter().chain(RELATION_ALPHAS.iter().enumerate().map(|(i, a)| (i + 2, format!("alpha_{a}")))) {
         let mut values = vec![-1i64; total * steps];
@@ -466,15 +494,16 @@ fn main() -> Result<(), String> {
     }
     save(&out.join("relations_continuations.safetensors"), cont)?;
 
+    }
+
+    if wants("downstream") {
     // Downstream: the exact change of every later function's activity at the peak on removal.
-    let j_count = settings.contexts.min(kk);
     let down_pairs: Vec<(usize, usize)> = chosen.iter().flat_map(|f| (0..j_count).map(move |j| (*f, j))).collect();
     let removed: Vec<Edit> = down_pairs.iter().map(|(f, j)| Edit { sequence: contexts[*f][*j], scale: vec![(*f, 0.0)], rows: vec![position[*f][*j]] }).collect();
     let unedited: Vec<Edit> = down_pairs.iter().map(|(f, j)| Edit { sequence: contexts[*f][*j], scale: vec![], rows: vec![position[*f][*j]] }).collect();
     let (_, edited_act) = run_edits(&library, &pool, &removed, settings.batch, true)?;
     let (_, clean_act) = run_edits(&library, &pool, &unedited, settings.batch, true)?;
     let (edited_act, clean_act) = (edited_act.ok_or("activity")?, clean_act.ok_or("activity")?);
-    let k = settings.k;
     let (mut d_ids, mut d_delta, mut d_rel) = (vec![-1i64; total * j_count * k], vec![0.0f64; total * j_count * k], vec![0.0f64; total * j_count * k]);
     let mut strongest = Vec::new();
     for (r, (f, j)) in down_pairs.iter().enumerate() {
@@ -498,6 +527,9 @@ fn main() -> Result<(), String> {
     strongest.sort_by(f64::total_cmp);
     log::info!("downstream in {:.0} s (median strongest relative change {:.3e})", started.elapsed().as_secs_f64(), strongest.get(strongest.len() / 2).copied().unwrap_or(f64::NAN));
 
+    }
+
+    if wants("attribution") {
     // Attribution: exact removal change of log p(X) for the functions with the largest direct effect.
     let proposals = (2 * settings.proposals).min(total);
     let mut att_rng = StdRng::seed_from_u64(settings.seed);
@@ -540,10 +572,122 @@ fn main() -> Result<(), String> {
         .into(),
     )?;
     log::info!("attribution in {:.0} s", started.elapsed().as_secs_f64());
+    }
+
+    if wants("upstream") {
+    // Upstream: at each of B's first contexts, at its peak, proposals among the functions writing
+    // into what B reads, ranked by their write's exact contribution to B's reads at that row
+    // (Σ over B's read maps of ‖R (γ ⊙ w_A(p))‖ / r(p)), used only to choose what to measure; each
+    // proposal's exact removal change of B's activity at p, strongest first.
+    let entry = |a: usize| 2 * functions[a].layer + if matches!(functions[a].kind, Kind::Head) { 1 } else { 2 };
+    let reads = |b: usize| 2 * functions[b].layer + if matches!(functions[b].kind, Kind::Head) { 0 } else { 1 };
+    let mut by_row: BTreeMap<(usize, usize), Vec<(usize, usize)>> = BTreeMap::new();
+    for &b in &chosen {
+        for j in 0..j_count {
+            by_row.entry((contexts[b][j], position[b][j])).or_default().push((b, j));
+        }
+    }
+    for ((s, p), readers) in &by_row {
+        let (writes, _, inverses) = library.writes_and_reads_at(&pool[*s], *p)?;
+        let mut edits = vec![Edit { sequence: *s, scale: vec![], rows: vec![*p] }];
+        let mut asked: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+        for &(b, j) in readers {
+            let (site, maps) = library.read_maps(b)?;
+            let mut score = vec![0.0f64; total];
+            for map in &maps {
+                let read = writes.dot(&map.t());
+                for (a, row) in read.outer_iter().enumerate() {
+                    score[a] += row.dot(&row).sqrt() * inverses[site];
+                }
+            }
+            for (a, v) in score.iter_mut().enumerate() {
+                if a == b || entry(a) > reads(b) {
+                    *v = -1.0;
+                }
+            }
+            let proposed: Vec<usize> = top_k(score.iter().copied(), pcount).into_iter().filter(|a| score[*a] >= 0.0).collect();
+            edits.extend(proposed.iter().map(|a| Edit { sequence: *s, scale: vec![(*a, 0.0)], rows: vec![*p] }));
+            asked.push((b, j, proposed));
+        }
+        let (_, act) = run_edits(&library, &pool, &edits, settings.batch, true)?;
+        let act = act.ok_or("activity")?;
+        let mut at = 1;
+        for (b, j, proposed) in asked {
+            let mut measured: Vec<(usize, f64)> = proposed.iter().enumerate().map(|(i, a)| (*a, act[[at + i, b]] - act[[0, b]])).collect();
+            at += proposed.len();
+            measured.sort_by(|x, y| y.1.abs().total_cmp(&x.1.abs()));
+            for (i, (a, d)) in measured.into_iter().enumerate() {
+                u_ids[(b * j_count + j) * pcount + i] = a as i64;
+                u_delta[(b * j_count + j) * pcount + i] = d;
+            }
+        }
+    }
+    save(&out.join("relations_upstream.safetensors"), [("ids".into(), i32s(vec![total, j_count, pcount], u_ids.clone())), ("delta".into(), f32s(vec![total, j_count, pcount], u_delta.clone()))].into())?;
+    log::info!("upstream in {:.0} s", started.elapsed().as_secs_f64());
+
+    }
+
+    if wants("edges") {
+    // Edges: at each reader's strongest context, path patches of its two strongest measured upstream
+    // neighbours and of its weakest measured proposal (a near-zero edge).
+    let e_count = 3;
+    let mut e_ids = vec![-1i64; total * e_count];
+    let mut e_strong = vec![0i64; total * e_count];
+    let (mut e_act, mut e_kl, mut e_next) = (vec![f64::NAN; total * e_count], vec![f64::NAN; total * e_count], vec![f64::NAN; total * e_count]);
+    let (mut e_up, mut e_down) = (vec![-1i64; total * e_count * TOP], vec![-1i64; total * e_count * TOP]);
+    let (mut e_up_dp, mut e_down_dp) = (vec![0.0f64; total * e_count * TOP], vec![0.0f64; total * e_count * TOP]);
+    for &b in &chosen {
+        let base = b * j_count * pcount;
+        let measured: Vec<(usize, f64)> = (0..pcount).filter(|i| u_ids[base + i] >= 0).map(|i| (u_ids[base + i] as usize, u_delta[base + i])).collect();
+        if measured.len() < 2 {
+            continue;
+        }
+        let weakest = measured.iter().min_by(|x, y| x.1.abs().total_cmp(&y.1.abs())).map(|x| x.0).unwrap_or(measured[0].0);
+        let picks = [(measured[0].0, 1), (measured[1].0, 1), (weakest, 0)];
+        let (s, p) = (contexts[b][0], position[b][0]);
+        for (e, (a, strong)) in picks.iter().enumerate() {
+            let patched = library.path_patched(&pool[s..=s], *a, b, None)?;
+            let at = b * e_count + e;
+            e_ids[at] = *a as i64;
+            e_strong[at] = *strong;
+            e_act[at] = patched.after[p] - patched.before[p];
+            let lp = log_p(&library, &ndarray::stack(Axis(0), &[patched.base.row(p), patched.last.row(p)]).map_err(error)?)?;
+            let (c, e_) = (lp.row(0), lp.row(1));
+            e_kl[at] = c.iter().zip(e_.iter()).map(|(c, e)| c.exp() * (c - e)).sum::<f64>();
+            e_next[at] = if p + 1 < t { e_[pool[s][p + 1] as usize] - c[pool[s][p + 1] as usize] } else { f64::NAN };
+            let dp: Vec<f64> = e_.iter().zip(c.iter()).map(|(e, c)| e.exp() - c.exp()).collect();
+            for (i, v) in top_k(dp.iter().copied(), TOP).into_iter().enumerate() {
+                e_up[at * TOP + i] = v as i64;
+                e_up_dp[at * TOP + i] = dp[v];
+            }
+            for (i, v) in top_k(dp.iter().map(|v| -v), TOP).into_iter().enumerate() {
+                e_down[at * TOP + i] = v as i64;
+                e_down_dp[at * TOP + i] = dp[v];
+            }
+        }
+    }
+    save(
+        &out.join("relations_edges.safetensors"),
+        [
+            ("activity".into(), f32s(vec![total, 1, e_count], e_act)),
+            ("kl".into(), f32s(vec![total, 1, e_count], e_kl)),
+            ("next".into(), f32s(vec![total, 1, e_count], e_next)),
+            ("ids".into(), i32s(vec![total, 1, e_count], e_ids)),
+            ("strong".into(), i8s(vec![total, 1, e_count], e_strong)),
+            ("up_ids".into(), i32s(vec![total, 1, e_count, TOP], e_up)),
+            ("down_ids".into(), i32s(vec![total, 1, e_count, TOP], e_down)),
+            ("up_dp".into(), f32s(vec![total, 1, e_count, TOP], e_up_dp)),
+            ("down_dp".into(), f32s(vec![total, 1, e_count, TOP], e_down_dp)),
+        ]
+        .into(),
+    )?;
+    log::info!("edges in {:.0} s", started.elapsed().as_secs_f64());
+    }
+
     let offsets: serde_json::Map<String, Value> = sites.iter().map(|s| (s.0.clone(), json!(s.3))).collect();
     let meta = json!({
         "alphas": RELATION_ALPHAS, "steps": steps, "contexts": j_count, "k": k, "proposals": settings.proposals, "site_offsets": offsets, "total": total,
-        "labels": out.display().to_string(), "parts": ["continuations", "downstream", "attribution"], "seconds": started.elapsed().as_secs_f64(),
+        "labels": out.display().to_string(), "parts": settings.parts, "seconds": started.elapsed().as_secs_f64(),
         "source_revision": option_env!("GAM_BUILD_GIT_SHA"),
     });
     std::fs::write(out.join("relations.json"), serde_json::to_vec(&meta).map_err(error)?).map_err(error)?;

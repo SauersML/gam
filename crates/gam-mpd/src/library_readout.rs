@@ -220,6 +220,18 @@ pub struct Edited {
     pub activity: Option<Array2<f64>>,
 }
 
+/// One path patch's per-row results ([`Library::path_patched`]).
+pub struct PathPatch {
+    /// The change of the reader's write (rows × width).
+    pub change: Array2<f64>,
+    /// The reader's activity before and after the patch.
+    pub before: Array1<f64>,
+    pub after: Array1<f64>,
+    /// The final streams before the final norm, patched and of the run.
+    pub last: Array2<f64>,
+    pub base: Array2<f64>,
+}
+
 // ------------------------------------------------------------------------------ the explanation
 
 /// A read of the residual stream: its native norm's input node, gain and epsilon.
@@ -702,18 +714,29 @@ impl<'a> Library<'a> {
         Err(format!("no function {function}"))
     }
 
-    /// The measured effect of one edge, by path patching: writer `writer`'s write taken out of
-    /// reader `reader`'s reads only (of its read `route` alone, numbered as in
-    /// [`Library::contributions`], or of every read), the reader recomputed from them (an MLP
-    /// function through its gate and law, a head through its attention, each with its own norm at
-    /// the stream's actual RMS) and everything after it run. Returns the mean over the rows of
-    /// `sequences` of the reader's output change (`|Δh| ‖u‖`, a head's `‖W_O Δz‖`) and of
-    /// `KL(P ‖ P′)` of the next-token distributions in bits.
+    /// The measured effect of one edge, by path patching ([`Library::path_patched`]). Returns the
+    /// mean over the rows of `sequences` of the reader's output change (`|Δh| ‖u‖`, a head's
+    /// `‖W_O Δz‖`) and of `KL(P ‖ P′)` of the next-token distributions in bits.
     pub fn path_patch(&self, sequences: &[Vec<u32>], writer: usize, reader: usize, route: Option<usize>) -> Result<[f64; 2], String> {
+        let patched = self.path_patched(sequences, writer, reader, route)?;
+        let rows = patched.change.nrows() as f64;
+        let output = patched.change.outer_iter().map(|row| row.dot(&row).sqrt()).sum::<f64>() / rows;
+        let (base, edited) = (self.log_probabilities(&patched.base)?, self.log_probabilities(&patched.last)?);
+        let kl: f64 = base.outer_iter().zip(edited.outer_iter()).map(|(p, q)| p.iter().zip(q.iter()).map(|(a, b)| a.exp() * (a - b)).sum::<f64>()).sum();
+        Ok([output, kl / rows / std::f64::consts::LN_2])
+    }
+
+    /// One edge by path patching: writer `writer`'s write taken out of reader `reader`'s reads only
+    /// (of its read `route` alone, numbered as in [`Library::contributions`], or of every read), the
+    /// reader recomputed from them (an MLP function through its gate and law, a head through its
+    /// attention, each with its own norm at the stream's actual RMS) and everything after it run.
+    /// Per row of `sequences`: the change of the reader's write, its activity before and after (an
+    /// MLP function's `h_i`, a head's `‖W_O,h z_h‖`), and the final streams before the final norm
+    /// of the run and of the patched run.
+    pub fn path_patched(&self, sequences: &[Vec<u32>], writer: usize, reader: usize, route: Option<usize>) -> Result<PathPatch, String> {
         let refs: Vec<&[u32]> = sequences.iter().map(Vec::as_slice).collect();
         let pass = self.pass(&refs)?;
         let length = sequences.first().map_or(0, Vec::len);
-        let rows = pass.rows as f64;
         let (written, write) = self.place(writer)?;
         let (layer, read) = self.place(reader)?;
         let site = if read.is_ok() { 2 * layer } else { 2 * layer + 1 };
@@ -734,13 +757,13 @@ impl<'a> Library<'a> {
         let x = pass.streams[site].to_owned();
         let patched = &x - &w;
         let takes = |r: usize| route.is_none_or(|k| k == r);
-        let (output, run) = match read {
+        let norms = |a: &Array2<f64>| a.map_axis(Axis(1), |row| row.dot(&row).sqrt());
+        let (change, activity, run) = match read {
             Ok(h) => {
                 let pick = |r: usize| if takes(r) { &patched } else { &x };
                 let (z, _) = self.head_on(h, pick(0), pick(1), pick(2), length);
-                let change = self.write(h, &(&z - &pass.head[h][2]));
-                let output = change.outer_iter().map(|row| row.dot(&row).sqrt()).sum::<f64>() / rows;
-                (output, self.run_with(sequences, &[(h, z)].into(), &BTreeMap::new())?)
+                let (old, new) = (self.write(h, &pass.head[h][2].to_owned()), self.write(h, &z));
+                ((&new - &old), [norms(&old), norms(&new)], self.run_with(sequences, &[(h, z)].into(), &BTreeMap::new())?)
             }
             Err((b, i)) => {
                 let block = &self.mlps[b];
@@ -757,16 +780,41 @@ impl<'a> Library<'a> {
                     }
                     _ => gate.mapv(|g| block.law.apply(g)),
                 };
-                let size = block.out.column(i).dot(&block.out.column(i)).sqrt();
-                let output = (&h - &pass.mlp[b].0.column(i)).iter().map(|d| d.abs()).sum::<f64>() * size / rows;
+                let old = pass.mlp[b].0.column(i).to_owned();
+                let u = block.out.column(i);
+                let change = Array2::from_shape_fn((pass.rows, u.len()), |(r, c)| (h[r] - old[r]) * u[c]);
                 let mut activations = pass.mlp[b].0.to_owned();
                 activations.column_mut(i).assign(&h);
-                (output, self.run_with(sequences, &BTreeMap::new(), &[(b, activations)].into())?)
+                (change, [old, h], self.run_with(sequences, &BTreeMap::new(), &[(b, activations)].into())?)
             }
         };
-        let (base, patched) = (self.log_probabilities(&pass.last.to_owned())?, self.log_probabilities(&run.last)?);
-        let kl: f64 = base.outer_iter().zip(patched.outer_iter()).map(|(p, q)| p.iter().zip(q.iter()).map(|(a, b)| a.exp() * (a - b)).sum::<f64>()).sum();
-        Ok([output, kl / rows / std::f64::consts::LN_2])
+        let [before, after] = activity;
+        Ok(PathPatch { change, before, after, last: run.last, base: pass.last.into_owned() })
+    }
+
+    /// The reader `f`'s read maps in residual coordinates with its norm's gain folded in (routes ×
+    /// rows of the map × width: an MLP function's gate and up direction, a head's query, key and
+    /// value maps, as in [`Library::contributions`]), and the read site (`2l` a layer's attention,
+    /// `2l + 1` its MLP).
+    pub fn read_maps(&self, f: usize) -> Result<(usize, Vec<Array2<f64>>), String> {
+        let (layer, kind) = self.place(f)?;
+        let site = if kind.is_ok() { 2 * layer } else { 2 * layer + 1 };
+        let gain = &self.sites[site].gain;
+        let maps = match kind {
+            Ok(h) => {
+                let block = &self.heads[h];
+                [&block.query.map, &block.key.map, &block.value].iter().map(|m| *m * &gain.view().insert_axis(Axis(0))).collect()
+            }
+            Err((b, i)) => {
+                let block = &self.mlps[b];
+                let mut maps = vec![(&block.gate.row(i) * gain).insert_axis(Axis(0))];
+                if let Some((_, up)) = &block.up {
+                    maps.push((&up.row(i) * gain).insert_axis(Axis(0)));
+                }
+                maps
+            }
+        };
+        Ok((site, maps))
     }
 
     /// The exact contribution of each writer's write to each reader's reads on `sequences` (of one
@@ -1071,6 +1119,12 @@ impl<'a> Library<'a> {
     /// Each function's write at one row of a run of `sequence`: functions × width
     /// ([`Library::functions`]'s order), with the final stream's `1/r` there.
     pub fn writes_at(&self, sequence: &[u32], row: usize) -> Result<(Array2<f64>, f64), String> {
+        let (writes, inverse, _) = self.writes_and_reads_at(sequence, row)?;
+        Ok((writes, inverse))
+    }
+
+    /// [`Library::writes_at`] with each read site's `1/r` at the row.
+    pub fn writes_and_reads_at(&self, sequence: &[u32], row: usize) -> Result<(Array2<f64>, f64, Vec<f64>), String> {
         let pass = self.pass(&[sequence])?;
         let mut out = Array2::<f64>::zeros((self.functions().len(), self.unembedding.ncols()));
         let (head_columns, mlp_columns) = self.columns();
@@ -1084,7 +1138,7 @@ impl<'a> Library<'a> {
                 out.row_mut(mlp_columns[b] + i).assign(&(&block.out.column(i) * pass.mlp[b].0[[row, i]]));
             }
         }
-        Ok((out, pass.inverse_final[row]))
+        Ok((out, pass.inverse_final[row], pass.inverse.iter().map(|v| v[row]).collect()))
     }
 
     /// The unembedding row of token `t` with the final norm's gain (`γ_f ⊙ e_t`).
