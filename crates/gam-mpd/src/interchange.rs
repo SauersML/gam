@@ -1866,12 +1866,12 @@ impl Interchange {
     }
 
     /// Load `P`'s trainable operators, in the order given to [`Interchange::new`].
-    pub fn load(&mut self, values: &[ndarray::Array2<f64>]) -> Result<(), String> {
+    pub fn load<A: std::borrow::Borrow<ndarray::Array2<f64>>>(&mut self, values: &[A]) -> Result<(), String> {
         if values.len() != self.trainable.len() {
             return Err(error("one value per trainable operator required"));
         }
         for (&op, value) in self.trainable.iter().zip(values) {
-            let tensor = self.p.device().upload(value.view()).map_err(error)?;
+            let tensor = self.p.device().upload(value.borrow().view()).map_err(error)?;
             self.p.replace_dense_parameter(op, tensor)?;
         }
         self.p.refresh_fused()

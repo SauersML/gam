@@ -807,7 +807,7 @@ impl Mixture {
             let precision = log_sd.mapv(|s| (-2.0 * s).exp());
             let weighted = &mu * &precision;
             let writes = self.candidates(kind, posterior, explanation)?;
-            let means = |i: usize| -> Result<&Array2<f64>, String> { posterior.mean.get(i).ok_or_else(|| "a posterior mean".to_string()) };
+            let means = |i: usize| -> Result<&Array2<f64>, String> { posterior.mean.get(i).map(|m| &**m).ok_or_else(|| "a posterior mean".to_string()) };
             // Per target its best candidates so far: (−(Σ μ u/σ²)² / Σ u²/σ², scale, candidate).
             let mut best: Vec<Vec<(f64, f64, usize)>> = vec![Vec::new(); rows.len()];
             let mut start = 0;
@@ -840,7 +840,7 @@ impl Mixture {
             for kept in &mut best {
                 kept.sort_by(|a, b| a.0.total_cmp(&b.0));
             }
-            let deviations = |i: usize| -> Result<&Array2<f64>, String> { posterior.log_sd.get(i).ok_or_else(|| "a posterior deviation".to_string()) };
+            let deviations = |i: usize| -> Result<&Array2<f64>, String> { posterior.log_sd.get(i).map(|s| &**s).ok_or_else(|| "a posterior deviation".to_string()) };
             let mut adopted = Vec::with_capacity(rows.len());
             for (slot, &t) in rows.iter().enumerate() {
                 let i = match self.targets[t].kind {
@@ -877,10 +877,10 @@ impl Mixture {
             }
             let maps = self.key_value(layer, group)?;
             let live = self.live_planes(maps, posterior);
-            let means = |m: &GroupMaps| -> (Vec<&Array2<f64>>, &Array2<f64>) { (m.queries.iter().map(|&q| &posterior.mean[q]).collect(), &posterior.mean[m.key]) };
+            let means = |m: &GroupMaps| -> (Vec<&Array2<f64>>, &Array2<f64>) { (m.queries.iter().map(|&q| &*posterior.mean[q]).collect(), &*posterior.mean[m.key]) };
             let (q1, k1) = means(maps);
             let mu = Self::group_vector(maps, &live, &q1, k1);
-            let sd = Self::group_vector(maps, &live, &maps.queries.iter().map(|&q| &posterior.log_sd[q]).collect::<Vec<_>>(), &posterior.log_sd[maps.key]);
+            let sd = Self::group_vector(maps, &live, &maps.queries.iter().map(|&q| &*posterior.log_sd[q]).collect::<Vec<_>>(), &posterior.log_sd[maps.key]);
             let precision = sd.mapv(|s| (-2.0 * s).exp());
             // A plane's rotation keeps the sum of its rows' variances; its scale multiplies a
             // query's by `s²` and a key's by `1 / s²`.
@@ -933,7 +933,7 @@ impl Mixture {
             let found = library_sharing::transports(explanation, (layer, group), &sources.iter().map(|s| s.0).collect::<Vec<_>>())?;
             let mut scored = Vec::new();
             for (((l, g), value), transport) in sources.into_iter().zip(found) {
-                let u = Self::rows_vector(&live, &transport.matrix.dot(&posterior.mean[value]));
+                let u = Self::rows_vector(&live, &transport.matrix.dot(&*posterior.mean[value]));
                 let (cross, norm) = ((&mu * &precision).dot(&u), (&u * &u * &precision).sum());
                 if norm > 0.0 {
                     // `Var((T V_s)_kc) = Σ_r T_kr² σ²_rc`.
@@ -966,7 +966,7 @@ impl Mixture {
                 let squared: Vec<(Array2<f64>, f64)> = component.gauge.iter().map(|(r, s)| (r.mapv(|x| x * x), s * s)).collect();
                 let turn = |m: &Array2<f64>, gauge: &[(Array2<f64>, f64)], query: bool| library_sharing::turn(m, &maps.planes, gauge, query, false);
                 let queries = |values: &dyn Fn(usize) -> Array2<f64>, gauge: &[(Array2<f64>, f64)]| -> Vec<Array2<f64>> { component.assignment.iter().map(|&q| turn(&values(other.queries[q]), gauge, true)).collect() };
-                let (mean, var) = (queries(&|i| posterior.mean[i].clone(), &component.gauge), queries(&variance, &squared));
+                let (mean, var) = (queries(&|i| (*posterior.mean[i]).clone(), &component.gauge), queries(&variance, &squared));
                 Ok((
                     Self::group_vector(maps, &live, &mean.iter().collect::<Vec<_>>(), &turn(&posterior.mean[other.key], &component.gauge, false)),
                     Self::group_vector(maps, &live, &var.iter().collect::<Vec<_>>(), &turn(&variance(other.key), &squared, false)),
@@ -976,15 +976,15 @@ impl Mixture {
                 let (maps, source) = (self.value(layer, group)?, self.value(l, g)?.value);
                 let transport = component.transport.as_ref().ok_or("a value map's candidate without its transport")?;
                 let live = Self::live_rows(maps, posterior);
-                Ok((Self::rows_vector(&live, &transport.dot(&posterior.mean[source])), Self::rows_vector(&live, &transport.mapv(|x| x * x).dot(&variance(source)))))
+                Ok((Self::rows_vector(&live, &transport.dot(&*posterior.mean[source])), Self::rows_vector(&live, &transport.mapv(|x| x * x).dot(&variance(source)))))
             }
             (_, write) => {
-                let means = |i: usize| -> Result<&Array2<f64>, String> { posterior.mean.get(i).ok_or_else(|| "a posterior mean".to_string()) };
+                let means = |i: usize| -> Result<&Array2<f64>, String> { posterior.mean.get(i).map(|m| &**m).ok_or_else(|| "a posterior mean".to_string()) };
                 let mean = self.vector(write, &means)?.to_owned();
                 let var = match write {
                     Write::Token(_) => Array1::zeros(mean.len()),
                     write => {
-                        let deviations = |i: usize| -> Result<&Array2<f64>, String> { posterior.log_sd.get(i).ok_or_else(|| "a posterior deviation".to_string()) };
+                        let deviations = |i: usize| -> Result<&Array2<f64>, String> { posterior.log_sd.get(i).map(|s| &**s).ok_or_else(|| "a posterior deviation".to_string()) };
                         self.vector(write, &deviations)?.mapv(|s| (2.0 * s).exp())
                     }
                 };
@@ -1002,8 +1002,8 @@ impl Mixture {
         let variance = |i: usize| posterior.log_sd[i].mapv(|s| (2.0 * s).exp());
         let (mean, var) = match target.kind {
             Kind::Gate { .. } | Kind::Up { .. } | Kind::Output { .. } => {
-                let means = |i: usize| -> Result<&Array2<f64>, String> { posterior.mean.get(i).ok_or_else(|| "a posterior mean".to_string()) };
-                let deviations = |i: usize| -> Result<&Array2<f64>, String> { posterior.log_sd.get(i).ok_or_else(|| "a posterior deviation".to_string()) };
+                let means = |i: usize| -> Result<&Array2<f64>, String> { posterior.mean.get(i).map(|m| &**m).ok_or_else(|| "a posterior mean".to_string()) };
+                let deviations = |i: usize| -> Result<&Array2<f64>, String> { posterior.log_sd.get(i).map(|s| &**s).ok_or_else(|| "a posterior deviation".to_string()) };
                 (self.vector(Write::of(target.kind), &means)?.to_owned(), self.vector(Write::of(target.kind), &deviations)?.mapv(|s| (2.0 * s).exp()))
             }
             Kind::QueryKey { layer, group } => {
@@ -1011,7 +1011,7 @@ impl Mixture {
                 let live = self.live_planes(maps, posterior);
                 let queries: Vec<Array2<f64>> = maps.queries.iter().map(|&q| variance(q)).collect();
                 (
-                    Self::group_vector(maps, &live, &maps.queries.iter().map(|&q| &posterior.mean[q]).collect::<Vec<_>>(), &posterior.mean[maps.key]),
+                    Self::group_vector(maps, &live, &maps.queries.iter().map(|&q| &*posterior.mean[q]).collect::<Vec<_>>(), &posterior.mean[maps.key]),
                     Self::group_vector(maps, &live, &queries.iter().collect::<Vec<_>>(), &variance(maps.key)),
                 )
             }
@@ -1677,8 +1677,8 @@ impl PriorTerm for Mixture {
             let operators = self.operators_of(&heads);
             for &i in &operators {
                 let (mean, log_sd) = device_posterior.values(i)?;
-                posterior.mean[i] = mean;
-                posterior.log_sd[i] = log_sd;
+                posterior.mean[i] = mean.into();
+                posterior.log_sd[i] = log_sd.into();
             }
             let theta = crate::library_mdl::host_sample(posterior, &operators, key);
             let (nats, host) = self.host_terms(&heads, posterior, &theta, &mut learned)?;
@@ -1954,14 +1954,14 @@ mod tests {
         }
         let selected = mixture.operators();
         assert!(selected.len() <= 6, "one target and at most two parent Q/K pairs");
-        let theta = selected.iter().map(|&i| (i, posterior.mean[i].clone())).collect();
+        let theta = selected.iter().map(|&i| (i, (*posterior.mean[i]).clone())).collect();
         let (value, gradient) = mixture.sample(&posterior, &theta, false).unwrap();
         assert!(value.is_finite());
         assert!(gradient.keys().all(|i| selected.contains(i)));
         mixture.choose(&explanation, &posterior).unwrap();
         let reselected = mixture.operators();
         assert!(reselected.len() > selected.len());
-        let theta = reselected.iter().map(|&i| (i, posterior.mean[i].clone())).collect();
+        let theta = reselected.iter().map(|&i| (i, (*posterior.mean[i]).clone())).collect();
         assert!(mixture.sample(&posterior, &theta, false).unwrap().0.is_finite());
     }
 

@@ -350,7 +350,7 @@ pub(crate) fn host_sample(posterior: &Posterior, operators: &[usize], key: u64) 
         .map(|&i| {
             let cols = posterior.mean[i].ncols();
             let epsilon = Array2::from_shape_fn(posterior.mean[i].dim(), |(r, c)| f64::from(gam_gpu::tensor::posterior_normal(key, i as u64, (r * cols + c) as u64)));
-            (i, &posterior.mean[i] + &posterior.noise(i, &epsilon))
+            (i, &*posterior.mean[i] + &posterior.noise(i, &epsilon))
         })
         .collect()
 }
@@ -362,8 +362,8 @@ pub fn host_term<P: PriorTerm + ?Sized>(prior: &mut P, device: &Device, device_p
     let operators = prior.operators();
     for &i in &operators {
         let (mean, log_sd) = device_posterior.values(i)?;
-        posterior.mean[i] = mean;
-        posterior.log_sd[i] = log_sd;
+        posterior.mean[i] = mean.into();
+        posterior.log_sd[i] = log_sd.into();
     }
     let theta = host_sample(posterior, &operators, key);
     let (value, gradient) = prior.sample(posterior, &theta, learn)?;
@@ -876,19 +876,68 @@ impl Curvature {
 /// others, and which groups are active.
 #[derive(Clone, Debug)]
 pub struct Posterior {
-    /// Per trainable operator (in `Explanation::trainable` order), the posterior means `μ`.
-    pub mean: Vec<Array2<f64>>,
-    /// The logarithms `ln σ` of the posterior standard deviations.
-    pub log_sd: Vec<Array2<f64>>,
+    /// Per trainable operator (in `Explanation::trainable` order), the posterior means `μ`, each
+    /// operator's array shared copy-on-write ([`Shared`]): a copy of the posterior (a removal
+    /// trial) shares every operator it does not change.
+    pub mean: Vec<Shared>,
+    /// The logarithms `ln σ` of the posterior standard deviations, shared alike.
+    pub log_sd: Vec<Shared>,
     /// Per group, whether it is in the explanation; a removed group's parameters are exactly zero.
     pub active: Vec<bool>,
-    /// Per trainable operator, each entry's group.
-    membership: Vec<Array2<u32>>,
+    /// Per trainable operator, each entry's group (fixed by the explanation, shared by every copy).
+    membership: Arc<Vec<Array2<u32>>>,
     /// Per trainable operator, the range of its groups' indices.
     spans: Vec<Range<usize>>,
     /// Per group, the reference variance `v⁰_G` against which its variance's scale is sent
     /// (`Explanation::reference`).
     initial: Vec<f64>,
+}
+
+/// One operator's posterior array, shared copy-on-write: a clone shares it, and a write through
+/// `DerefMut` copies it first when it is shared, so two posteriors hold the same `Shared` exactly
+/// when that operator's values are the same ([`Shared::same`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shared(Arc<Array2<f64>>);
+
+impl Shared {
+    /// Whether `self` and `other` are one array (a copy neither has written since), so their
+    /// values are equal without reading them.
+    #[must_use]
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// The array, copied only when it is shared.
+    #[must_use]
+    pub fn into_array(self) -> Array2<f64> {
+        Arc::try_unwrap(self.0).unwrap_or_else(|shared| (*shared).clone())
+    }
+}
+
+impl std::borrow::Borrow<Array2<f64>> for Shared {
+    fn borrow(&self) -> &Array2<f64> {
+        &self.0
+    }
+}
+
+impl From<Array2<f64>> for Shared {
+    fn from(values: Array2<f64>) -> Self {
+        Self(Arc::new(values))
+    }
+}
+
+impl std::ops::Deref for Shared {
+    type Target = Array2<f64>;
+    fn deref(&self) -> &Array2<f64> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Shared {
+    /// The array to write, copied first if another posterior shares it.
+    fn deref_mut(&mut self) -> &mut Array2<f64> {
+        Arc::make_mut(&mut self.0)
+    }
 }
 
 /// The bits of a group's variance scale (module note): the integer exponent
@@ -994,9 +1043,11 @@ impl Posterior {
                     0.5 * (sum / count / tokens as f64).ln()
                 })
             })
+            .map(Shared::from)
             .collect();
         let initial = explanation.reference.clone();
-        let mut posterior = Self { mean, log_sd, active: vec![true; explanation.groups.len()], membership, spans, initial };
+        let mean = mean.into_iter().map(Shared::from).collect();
+        let mut posterior = Self { mean, log_sd, active: vec![true; explanation.groups.len()], membership: Arc::new(membership), spans, initial };
         posterior.remove(&explanation.removed);
         Ok(posterior)
     }
@@ -1036,9 +1087,11 @@ impl Posterior {
                     0.5 * (sum / count / tokens as f64).ln()
                 })
             })
+            .map(Shared::from)
             .collect();
         let initial = squares.iter().map(|(count, sum)| sum / count).collect();
-        Ok(Self { mean, log_sd, active: vec![true; groups], membership, spans, initial })
+        let mean = mean.into_iter().map(Shared::from).collect();
+        Ok(Self { mean, log_sd, active: vec![true; groups], membership: Arc::new(membership), spans, initial })
     }
 
     fn moments(&self) -> Vec<Moments> {
@@ -1126,7 +1179,7 @@ impl Posterior {
         let mut out = self.clone();
         for (i, mean) in out.mean.iter_mut().enumerate() {
             let variances = self.marginal_variances(i);
-            ndarray::Zip::from(mean).and(&variances).for_each(|mu, v| {
+            ndarray::Zip::from(&mut **mean).and(&variances).for_each(|mu, v| {
                 if *v > 0.0 && v.is_finite() {
                     let step = (0.5 * v.ln() / LN_2).floor().exp2();
                     *mu = (*mu / step).round() * step;
@@ -1147,7 +1200,7 @@ impl Posterior {
     #[must_use]
     pub fn noise(&self, i: usize, epsilon: &Array2<f64>) -> Array2<f64> {
         let mut scaled = epsilon.clone();
-        ndarray::Zip::from(&mut scaled).and(&self.log_sd[i]).for_each(|e, s| *e *= s.exp());
+        ndarray::Zip::from(&mut scaled).and(&*self.log_sd[i]).for_each(|e, s| *e *= s.exp());
         scaled
     }
 
@@ -1161,9 +1214,9 @@ impl Posterior {
     pub fn means(&self) -> Vec<Array2<f64>> {
         self.mean
             .iter()
-            .zip(&self.membership)
+            .zip(self.membership.iter())
             .map(|(mean, membership)| {
-                let mut out = mean.clone();
+                let mut out = (**mean).clone();
                 ndarray::Zip::from(&mut out).and(membership).for_each(|v, g| {
                     if !self.active[*g as usize] {
                         *v = 0.0;
@@ -1180,8 +1233,11 @@ impl Posterior {
             self.active[*g] = false;
         }
         let active = &self.active;
-        self.mean.par_iter_mut().zip(self.log_sd.par_iter_mut()).zip(self.membership.par_iter()).for_each(|((mean, log_sd), membership)| {
-            ndarray::Zip::from(mean).and(log_sd).and(membership).for_each(|m, s, g| {
+        // Only the operators holding a removed group are written: a copy of the posterior (a
+        // removal trial) shares every other operator with its source.
+        let touched: Vec<bool> = self.spans.iter().map(|span| groups.iter().any(|g| span.contains(g))).collect();
+        self.mean.par_iter_mut().zip(self.log_sd.par_iter_mut()).zip(self.membership.par_iter()).zip(touched.par_iter()).filter(|(_, touched)| **touched).for_each(|(((mean, log_sd), membership), _)| {
+            ndarray::Zip::from(&mut **mean).and(&mut **log_sd).and(membership).for_each(|m, s, g| {
                 if !active[*g as usize] {
                     *m = 0.0;
                     *s = f64::NEG_INFINITY;
@@ -2462,7 +2518,7 @@ fn load_checkpoint(path: &Path, expected: &Progress, posterior: &mut Posterior) 
     }
     let held = posterior.mean.clone();
     posterior.active = progress.active.clone();
-    Ok((progress, moments, held, iterates))
+    Ok((progress, moments, held.into_iter().map(Shared::into_array).collect(), iterates))
 }
 
 /// A checkpoint of `explanation` read whole: the posterior (means, log standard deviations and
@@ -2496,7 +2552,7 @@ fn read_checkpoint(explanation: &Explanation, path: &Path) -> Result<(Posterior,
     }
     let precision = Precision::of_payload(header.precision);
     let mut posterior = Posterior::new(explanation, header.tokens)?;
-    if header.shapes != posterior.mean.iter().map(Array2::dim).collect::<Vec<_>>() || header.active.len() != posterior.active.len() {
+    if header.shapes != posterior.mean.iter().map(|m| m.dim()).collect::<Vec<_>>() || header.active.len() != posterior.active.len() {
         return Err(format!("{}: a checkpoint of another explanation", path.display()));
     }
     if checkpoint_payload_bytes(&header.shapes, precision) != Some(payload_bytes) {
@@ -2518,8 +2574,8 @@ fn read_checkpoint(explanation: &Explanation, path: &Path) -> Result<(Posterior,
     let held = posterior.mean.clone();
     posterior.active = header.active;
     let start = Start {
-        mean: held,
-        log_sd: posterior.log_sd.clone(),
+        mean: held.into_iter().map(Shared::into_array).collect(),
+        log_sd: posterior.log_sd.iter().map(|s| (**s).clone()).collect(),
         active: posterior.active.clone(),
         state: Some(state),
         iterate: Some((iterates, header.averaged)),
@@ -2624,12 +2680,12 @@ pub fn fit_from(
     }
     log::info!("library training collection: {tokens} scored tokens, families {families:?}");
     let mut posterior = Posterior::new(explanation, tokens)?;
-    let parameters = posterior.mean.iter().map(Array2::len).sum();
+    let parameters = posterior.mean.iter().map(|m| m.len()).sum();
     let mut progress = Progress {
         identity: identity(export, native, explanation, sequences, held),
         settings: settings.clone(),
         tokens,
-        shapes: posterior.mean.iter().map(Array2::dim).collect(),
+        shapes: posterior.mean.iter().map(|m| m.dim()).collect(),
         start: None,
         epoch: 0,
         step: 0,
@@ -2655,7 +2711,7 @@ pub fn fit_from(
     // IVON's iterate and the steps its average spans, where the means are that average.
     let mut held_iterate: Option<(Vec<Array2<f64>>, u64)> = None;
     if let Some(start) = start {
-        let shapes: Vec<(usize, usize)> = posterior.mean.iter().map(Array2::dim).collect();
+        let shapes: Vec<(usize, usize)> = posterior.mean.iter().map(|m| m.dim()).collect();
         let fits = |arrays: &[Array2<f64>]| arrays.iter().map(Array2::dim).eq(shapes.iter().copied());
         let state_fits = start.state.as_ref().is_none_or(|state| state.len() == shapes.len() && state.iter().zip(&shapes).all(|(m, d)| m.iter().all(|a| a.dim() == *d)));
         let iterate_fits = start.iterate.as_ref().is_none_or(|(iterate, _)| fits(iterate));
@@ -2666,8 +2722,8 @@ pub fn fit_from(
             held_means = Some(start.mean.clone());
         }
         held_iterate = start.iterate;
-        posterior.mean = start.mean;
-        posterior.log_sd = start.log_sd;
+        posterior.mean = start.mean.into_iter().map(Shared::from).collect();
+        posterior.log_sd = start.log_sd.into_iter().map(Shared::from).collect();
         posterior.remove(&(0..start.active.len()).filter(|g| !start.active[*g]).collect::<Vec<_>>());
         progress.active = posterior.active.clone();
         progress.epoch = start.epoch;
@@ -2955,8 +3011,10 @@ pub fn fit_from(
         save(&mut progress, &posterior, &device_posterior, &mut writer)?;
     }
     writer.wait()?;
-    if best_path.exists() {
-        std::fs::remove_file(&best_path).map_err(error)?;
+    for written in [best_path.clone(), best_path.with_extension("json")] {
+        if written.exists() {
+            std::fs::remove_file(&written).map_err(error)?;
+        }
     }
     // A fit ended by its budget of epochs has no removal round: its last epoch's estimate.
     let objective_bits = progress.removals.last().map(|r| r.after_bits).or_else(|| settings.epochs.and(progress.epochs.last()).map(|e| e.objective_bits)).unwrap_or(f64::NAN);
@@ -3048,7 +3106,7 @@ fn laplace_start(
             None => Array2::zeros(posterior.mean[i].dim()),
         };
         h.mapv_inplace(|square| square / n);
-        ndarray::Zip::from(&mut posterior.log_sd[i]).and(&h).and(&posterior.membership[i]).for_each(|s, h, group| {
+        ndarray::Zip::from(&mut *posterior.log_sd[i]).and(&h).and(&posterior.membership[i]).for_each(|s, h, group| {
             let v = variance[*group as usize];
             if *s != f64::NEG_INFINITY && v > 0.0 {
                 *s = -0.5 * (n * h + 1.0 / v).ln();
@@ -3467,7 +3525,7 @@ mod tests {
             .into_par_iter()
             .map(|i| {
                 let (mut mean, mut log_sd) = (data[i].clone(), Array2::zeros(data[i].dim()));
-                ndarray::Zip::from(&mut mean).and(&mut log_sd).and(&noise[i]).and(&posterior.mean[i]).and(&posterior.log_sd[i]).and(&posterior.membership[i]).for_each(
+                ndarray::Zip::from(&mut mean).and(&mut log_sd).and(&noise[i]).and(&*posterior.mean[i]).and(&*posterior.log_sd[i]).and(&posterior.membership[i]).for_each(
                     |gm, gs, e, mu, s, group| {
                         let v = variance[*group as usize];
                         if v > 0.0 {
@@ -3602,7 +3660,7 @@ mod tests {
         assert!(difference <= 1e-12 * scale, "the starting library differs from the native model by {difference}");
         let posterior = Posterior::new(&explanation, 72).unwrap();
         let cells: usize = explanation.groups.iter().flat_map(|g| &g.cells).map(|c| c.rows.len() * c.cols.len()).sum();
-        assert_eq!(cells, posterior.mean.iter().map(Array2::len).sum::<usize>(), "the groups partition the parameters");
+        assert_eq!(cells, posterior.mean.iter().map(|m| m.len()).sum::<usize>(), "the groups partition the parameters");
         let settings = settings();
         let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 72.0, None, 0).unwrap();
@@ -3855,7 +3913,7 @@ mod tests {
             assert!(difference <= 1e-12 * scale, "the starting library differs from the native model by {difference}");
             let posterior = Posterior::new(&explanation, 72).unwrap();
             let cells: usize = explanation.groups.iter().flat_map(|g| &g.cells).map(|c| c.rows.len() * c.cols.len()).sum();
-            assert_eq!(cells, posterior.mean.iter().map(Array2::len).sum::<usize>(), "the groups partition the parameters");
+            assert_eq!(cells, posterior.mean.iter().map(|m| m.len()).sum::<usize>(), "the groups partition the parameters");
             // `M`'s MLPs have no bias, so neither do the library's: a zero input still maps to zero.
             for l in 0..2 {
                 assert!(operator_named(&explanation.artifact.program, &format!("library.l{l}.mlp.gate_bias")).is_none());
@@ -4056,7 +4114,7 @@ mod tests {
         let last = posterior.mean.len() - 1;
         for (i, at) in [(0, (0, 0)), (1, (3, 5)), (2, (1, 2)), (last, (2, 7))] {
             let h = 1e-6;
-            let central = |posterior: &Posterior, field: fn(&mut Posterior) -> &mut Vec<Array2<f64>>| {
+            let central = |posterior: &Posterior, field: fn(&mut Posterior) -> &mut Vec<Shared>| {
                 let (mut up, mut down) = (posterior.clone(), posterior.clone());
                 field(&mut up)[i][at] += h;
                 field(&mut down)[i][at] -= h;
@@ -4110,7 +4168,7 @@ mod tests {
         }
         for (field, (device_values, host_values)) in [("μ", (&stepped.mean, &reference.mean)), ("ln σ", (&stepped.log_sd, &reference.log_sd))] {
             for (a, b) in device_values.iter().zip(host_values) {
-                let gap = a.iter().zip(b).fold(0.0_f64, |m, (x, y)| m.max((x - y).abs() / (1.0 + y.abs())));
+                let gap = a.iter().zip(b.iter()).fold(0.0_f64, |m, (x, y)| m.max((x - y).abs() / (1.0 + y.abs())));
                 assert!(gap < 1e-12, "the device step's {field} differs from the host step's by {gap}");
             }
         }
@@ -4167,7 +4225,7 @@ mod tests {
         let rounded = posterior.rounded();
         for (i, op) in explanation.trainable.iter().enumerate() {
             let held = device.download(scorer.experiments.explanation_mut().dense(*op).unwrap()).unwrap();
-            assert_eq!(held, rounded.mean[i], "operator {i}");
+            assert_eq!(held, *rounded.mean[i], "operator {i}");
         }
     }
 
@@ -4269,10 +4327,10 @@ mod tests {
     fn checkpoint_fixture() -> (Progress, Posterior, Vec<u8>) {
         let shapes = vec![(2, 3), (0, 2), (3, 1)];
         let posterior = Posterior {
-            mean: shapes.iter().map(|&dim| Array2::from_elem(dim, -7.0)).collect(),
-            log_sd: shapes.iter().map(|&dim| Array2::from_elem(dim, -8.0)).collect(),
+            mean: shapes.iter().map(|&dim| Array2::from_elem(dim, -7.0).into()).collect(),
+            log_sd: shapes.iter().map(|&dim| Array2::from_elem(dim, -8.0).into()).collect(),
             active: vec![true, true],
-            membership: Vec::new(),
+            membership: Arc::new(Vec::new()),
             spans: Vec::new(),
             initial: Vec::new(),
         };
@@ -4332,7 +4390,7 @@ mod tests {
         assert_eq!(posterior.active, expected.active);
         assert_eq!(pointers, posterior.mean.iter().chain(&posterior.log_sd).map(|array| array.as_ptr()).collect::<Vec<_>>());
         for i in 0..progress.shapes.len() {
-            for (field, array) in [&posterior.mean[i], &posterior.log_sd[i]].into_iter().chain(&moments[i]).chain([&iterates[i]]).enumerate() {
+            for (field, array) in [&*posterior.mean[i], &*posterior.log_sd[i]].into_iter().chain(&moments[i]).chain([&iterates[i]]).enumerate() {
                 for (cell, value) in array.iter().enumerate() {
                     assert_eq!(*value, (100 * i + 10 * field + cell) as f64 + 0.25);
                 }
@@ -4516,6 +4574,34 @@ mod tests {
         assert_eq!(resumed.posterior.mean, uninterrupted.posterior.mean);
         assert_eq!(resumed.posterior.log_sd, uninterrupted.posterior.log_sd);
         assert_eq!(resumed.posterior.active, uninterrupted.posterior.active);
+    }
+
+    /// A removal trial (a copy of the posterior with groups removed) shares every operator the
+    /// removed groups do not touch with its source, and copies only those they do; the device's
+    /// upload of the trial sends only those, and its values equal a full upload's bit for bit.
+    #[test]
+    fn a_removal_trial_shares_the_operators_it_does_not_change() {
+        let (native, layers, _, _) = tiny("library_trial_sharing", "gelu_tanh");
+        let explanation = explanation(&native, &layers).unwrap();
+        let posterior = Posterior::new(&explanation, 1000).unwrap();
+        let group = explanation.groups.len() - 1;
+        let mut trial = posterior.clone();
+        trial.remove(&[group]);
+        let touched: Vec<bool> = explanation.trainable.iter().map(|op| explanation.groups[group].cells.iter().any(|c| c.operator == *op)).collect();
+        assert!(touched.iter().any(|t| *t) && touched.iter().any(|t| !*t));
+        for (i, touched) in touched.iter().enumerate() {
+            assert_eq!(!trial.mean[i].same(&posterior.mean[i]), *touched, "operator {i}'s mean");
+            assert_eq!(!trial.log_sd[i].same(&posterior.log_sd[i]), *touched, "operator {i}'s deviations");
+        }
+        let device = Device::host();
+        let mut sent = DevicePosterior::new(&device, &explanation, &posterior, 1000.0, None, 0).unwrap();
+        sent.set_values(&posterior).unwrap();
+        sent.set_values(&trial).unwrap();
+        let fresh = DevicePosterior::new(&device, &explanation, &trial, 1000.0, None, 0).unwrap();
+        for i in 0..explanation.trainable.len() {
+            let ((a, b), (c, e)) = (sent.values(i).unwrap(), fresh.values(i).unwrap());
+            assert!(a.iter().chain(b.iter()).zip(c.iter().chain(e.iter())).all(|(x, y)| x.to_bits() == y.to_bits()), "operator {i}");
+        }
     }
 
     #[test]

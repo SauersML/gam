@@ -28,14 +28,14 @@
 
 use crate::{
     device_program::DeviceProgram,
-    library_mdl::{Curvature, Explanation, Posterior},
+    library_mdl::{Curvature, Explanation, Posterior, Shared},
 };
 use gam_gpu::{
     gpu_error::GpuError,
     tensor::{Device, GroupMap, PosteriorStep, Storage, Tensor},
 };
 use ndarray::Array2;
-use std::collections::BTreeMap;
+use std::{borrow::Borrow, collections::BTreeMap};
 
 /// A line step measured on its batch ([`DevicePosterior::finish_line`]): the step's direction
 /// `d` per operator and the iterate `before` it starts from, and along `d` the data term's slope
@@ -111,10 +111,10 @@ impl State<'_> {
 }
 
 /// A posterior's host arrays ([`DevicePosterior::from_parts`]).
-pub struct Parts<'a> {
+pub struct Parts<'a, A: Borrow<Array2<f64>> = Array2<f64>> {
     pub operators: &'a [usize],
-    pub mean: &'a [Array2<f64>],
-    pub log_sd: &'a [Array2<f64>],
+    pub mean: &'a [A],
+    pub log_sd: &'a [A],
     pub groups: &'a [Vec<u32>],
     pub count: usize,
 }
@@ -169,15 +169,11 @@ pub struct DevicePosterior {
     tokens: f64,
     steps: u64,
     /// Per operator, the host `μ` and `s` its device values were last set from
-    /// ([`DevicePosterior::set_values`]) while no step or restore has changed them since: a later
-    /// `set_values` sends only the operators whose values differ in some bit (a removal trial
-    /// changes a few operators of many).
-    uploaded: Vec<Option<(Array2<f64>, Array2<f64>)>>,
-}
-
-/// Whether two host arrays hold the same values bit for bit (`-0.0` differs from `0.0`).
-fn same_bits(a: &Array2<f64>, b: &Array2<f64>) -> bool {
-    a.dim() == b.dim() && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+    /// ([`DevicePosterior::set_values`]) while no step or restore has changed them since, held as
+    /// the posterior's own shared arrays (no copy): a later `set_values` sends only the operators
+    /// whose arrays are not these ([`Shared::same`]; a removal trial shares the operators it does
+    /// not change, and a write to a shared array copies it).
+    uploaded: Vec<Option<(Shared, Shared)>>,
 }
 
 /// Each trainable operator's entries' groups, row-major.
@@ -212,7 +208,7 @@ impl DevicePosterior {
     /// the moments zero and the curvature at which the posterior's standard deviations are IVON's)
     /// after `steps` steps.
     pub fn new(fitting: &Device, explanation: &Explanation, posterior: &Posterior, tokens: f64, moments: Option<State<'_>>, steps: u64) -> Result<Self, String> {
-        let shapes: Vec<(usize, usize)> = posterior.mean.iter().map(Array2::dim).collect();
+        let shapes: Vec<(usize, usize)> = posterior.mean.iter().map(|m| m.dim()).collect();
         if shapes.len() != explanation.trainable.len() {
             return Err(error("one posterior array per trainable operator required"));
         }
@@ -224,7 +220,7 @@ impl DevicePosterior {
     /// The posterior of the trainable operators `parts.operators` of a program, each entry in group
     /// `parts.groups[i][entry]` (row-major) of `parts.count`, for `tokens` training tokens on
     /// `fitting`, with IVON's state `moments` (see [`DevicePosterior::new`]) after `steps` steps.
-    pub fn from_parts(fitting: &Device, parts: &Parts<'_>, tokens: f64, moments: Option<State<'_>>, steps: u64) -> Result<Self, String> {
+    pub fn from_parts<A: Borrow<Array2<f64>>>(fitting: &Device, parts: &Parts<'_, A>, tokens: f64, moments: Option<State<'_>>, steps: u64) -> Result<Self, String> {
         let wide = match fitting.with_storage(Storage::F64) {
             Ok(wide) => wide,
             Err(GpuError::NoDeviceKernel { .. }) => fitting.clone(),
@@ -241,8 +237,8 @@ impl DevicePosterior {
         } else {
             fitting.clone()
         };
-        let shapes: Vec<(usize, usize)> = parts.mean.iter().map(Array2::dim).collect();
-        let sizes_agree = parts.log_sd.iter().map(Array2::dim).eq(shapes.iter().copied()) && parts.groups.iter().map(Vec::len).eq(shapes.iter().map(|(r, c)| r * c));
+        let shapes: Vec<(usize, usize)> = parts.mean.iter().map(|m| m.borrow().dim()).collect();
+        let sizes_agree = parts.log_sd.iter().map(|s| s.borrow().dim()).eq(shapes.iter().copied()) && parts.groups.iter().map(Vec::len).eq(shapes.iter().map(|(r, c)| r * c));
         if shapes.len() != parts.operators.len() || !sizes_agree || moments.as_ref().and_then(State::len).is_some_and(|n| n != shapes.len()) {
             return Err(error("one posterior array and group list per trainable operator required"));
         }
@@ -259,7 +255,7 @@ impl DevicePosterior {
         let mut sums = vec![(0.0, 0.0); parts.count];
         if moments.is_none() {
             for ((mean, log_sd), groups) in parts.mean.iter().zip(parts.log_sd).zip(parts.groups) {
-                for ((mu, s), g) in mean.iter().zip(log_sd.iter()).zip(groups) {
+                for ((mu, s), g) in mean.borrow().iter().zip(log_sd.borrow().iter()).zip(groups) {
                     if *s != f64::NEG_INFINITY {
                         sums[*g as usize].0 += 1.0;
                         sums[*g as usize].1 += mu * mu + (2.0 * s).exp();
@@ -282,15 +278,15 @@ impl DevicePosterior {
             Ok(match &moments {
                 Some(State::Saved(m)) => [moment(&m[i][0])?, up(&m[i][1])?, up(&m[i][2])?],
                 Some(State::Zero) => [zero(&narrow)?, zero(&master)?, zero(&master)?],
-                None => [zero(&narrow)?, up(&start(&parts.log_sd[i], &parts.groups[i]))?, zero(&master)?],
+                None => [zero(&narrow)?, up(&start(parts.log_sd[i].borrow(), &parts.groups[i]))?, zero(&master)?],
             })
         };
         let mut out = Self {
             sums: wide.zeros(parts.count, 3).map_err(error)?,
             variance: wide.zeros(parts.count, 1).map_err(error)?,
             divergence: wide.zeros(parts.count, 1).map_err(error)?,
-            mean: parts.mean.iter().map(up).collect::<Result<_, _>>()?,
-            log_sd: parts.log_sd.iter().map(up).collect::<Result<_, _>>()?,
+            mean: parts.mean.iter().map(|m| up(m.borrow())).collect::<Result<_, _>>()?,
+            log_sd: parts.log_sd.iter().map(|s| up(s.borrow())).collect::<Result<_, _>>()?,
             moments: (0..shapes.len()).map(state).collect::<Result<_, String>>()?,
             groups: parts.groups.iter().zip(&shapes).map(|(ids, shape)| master.group_map(ids, *shape).map_err(error)).collect::<Result<_, _>>()?,
             average: Vec::new(),
@@ -731,8 +727,8 @@ impl DevicePosterior {
     /// the device.
     pub fn values_into(&self, posterior: &mut Posterior) -> Result<(), String> {
         for i in 0..self.mean.len() {
-            posterior.mean[i] = self.host_mean(i)?;
-            posterior.log_sd[i] = self.fitting.download(&self.log_sd[i]).map_err(error)?;
+            posterior.mean[i] = self.host_mean(i)?.into();
+            posterior.log_sd[i] = self.fitting.download(&self.log_sd[i]).map_err(error)?.into();
         }
         Ok(())
     }
@@ -747,7 +743,7 @@ impl DevicePosterior {
         }
         self.uploaded.resize_with(self.mean.len(), || None);
         for i in 0..self.mean.len() {
-            if self.uploaded[i].as_ref().is_some_and(|(m, s)| same_bits(m, &posterior.mean[i]) && same_bits(s, &posterior.log_sd[i])) {
+            if self.uploaded[i].as_ref().is_some_and(|(m, s)| m.same(&posterior.mean[i]) && s.same(&posterior.log_sd[i])) {
                 continue;
             }
             self.mean[i] = self.fitting.upload(posterior.mean[i].view()).map_err(error)?;

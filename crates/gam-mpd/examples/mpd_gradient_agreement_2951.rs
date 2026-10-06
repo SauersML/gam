@@ -275,7 +275,7 @@ fn main() -> Result<(), String> {
         let targets = ic.targets(&batch, &experiments)?;
         let noise: Vec<Array2<f64>> = shapes.iter().map(|dim| standard_normal(&mut rng, *dim)).collect();
         let sample = |sign: f64| -> Vec<Array2<f64>> {
-            posterior.mean.iter().zip(&sd).zip(&noise).map(|((mu, s), e)| Zip::from(mu).and(s).and(e).map_collect(|m, s, e| m + sign * s * e)).collect()
+            posterior.mean.iter().zip(&sd).zip(&noise).map(|((mu, s), e)| Zip::from(&**mu).and(s).and(e).map_collect(|m, s, e| m + sign * s * e)).collect()
         };
         let d = ic.models().1.program.device().clone();
         ic.load(&sample(1.0))?;

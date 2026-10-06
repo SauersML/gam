@@ -175,7 +175,7 @@ fn main() -> Result<(), String> {
         Ok(explanation) => {
             let variables = interchange::reads(&native, &layers)?;
             let posterior = library_mdl::Posterior::new(&explanation, tokens)?;
-            let shapes: Vec<usize> = posterior.mean.iter().map(Array2::len).collect();
+            let shapes: Vec<usize> = posterior.mean.iter().map(|m| m.len()).collect();
             let mut groups: Vec<Vec<u32>> = shapes.iter().map(|n| vec![0; *n]).collect();
             let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
             for (g, group) in explanation.groups.iter().enumerate() {
@@ -189,7 +189,7 @@ fn main() -> Result<(), String> {
                     }
                 }
             }
-            let start = Start { mean: posterior.mean.clone(), log_sd: posterior.log_sd.clone(), groups, count: explanation.groups.len() };
+            let start = Start { mean: posterior.mean.iter().map(|m| (**m).clone()).collect(), log_sd: posterior.log_sd.iter().map(|s| (**s).clone()).collect(), groups, count: explanation.groups.len() };
             (explanation.artifact, explanation.trainable, variables, start, "library")
         }
         Err(reason) => {

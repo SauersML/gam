@@ -273,8 +273,8 @@ fn fit(target: &dyn Target, native: &[Array2<f64>], account: &Account, batches: 
                 let mut sample = host.zeros(mean.nrows(), mean.ncols()).map_err(|e| e.to_string())?;
                 host.reparameterize(&mut sample, (&upload(&mean)?, &upload(&log_sd)?), (key, *i as u64)).map_err(|e| e.to_string())?;
                 theta.push(host.download(&sample).map_err(|e| e.to_string())?);
-                posterior.mean[*i] = mean;
-                posterior.log_sd[*i] = log_sd;
+                posterior.mean[*i] = mean.into();
+                posterior.log_sd[*i] = log_sd.into();
             }
             let description = posterior.description();
             let w = account.assemble(&theta);

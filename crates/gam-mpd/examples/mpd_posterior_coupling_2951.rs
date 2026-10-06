@@ -240,7 +240,7 @@ fn main() -> Result<(), String> {
             s.activation += &h.t().dot(&h);
             // `s_i = φ'(z_i) (u_i · δ)` for every token and function: δ U with U the output map
             // (d × units).
-            let weighted = &z.mapv(|t| m.law.derivative(t)) * &delta.dot(&posterior.mean[m.output]);
+            let weighted = &z.mapv(|t| m.law.derivative(t)) * &delta.dot(&*posterior.mean[m.output]);
             s.weight += &weighted.t().dot(&weighted);
             s.rows += delta.nrows() as f64;
         }

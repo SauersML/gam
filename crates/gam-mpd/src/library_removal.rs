@@ -1035,7 +1035,7 @@ pub fn round(
             .iter()
             .map(|(i, g)| {
                 let mut dot = 0.0;
-                ndarray::Zip::from(g).and(&proposed.mean[*i]).and(&posterior.mean[*i]).and(&proposed.log_sd[*i]).for_each(|g, after, before, s| {
+                ndarray::Zip::from(g).and(&*proposed.mean[*i]).and(&*posterior.mean[*i]).and(&*proposed.log_sd[*i]).for_each(|g, after, before, s| {
                     if *s != f64::NEG_INFINITY {
                         dot += g * (after - before);
                     }

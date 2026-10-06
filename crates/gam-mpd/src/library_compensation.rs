@@ -248,7 +248,7 @@ impl Compensation {
     /// variance `v_j = (1/|G|) Σ (μ² + σ²)`, and per output coordinate the data term's curvature
     /// per unit of activation energy `c_r` estimated over the functions `alive` (module note).
     fn scales(mlp: &Mlp, posterior: &Posterior, alive: &[usize]) -> (Vec<f64>, Array1<f64>) {
-        let means = &posterior.mean[mlp.output];
+        let means = &*posterior.mean[mlp.output];
         let variances = posterior.marginal_variances(mlp.output);
         let mut prior = vec![0.0; mlp.functions.len()];
         let mut precision = Array1::<f64>::zeros(means.nrows());
@@ -511,7 +511,7 @@ impl Compensation {
             let weights = |f: &dyn Fn(f64, f64) -> f64| Array2::from_shape_fn((values.len(), curvature.len()), |(k, r)| f(values[k], curvature[r]));
             let numerator = fast_ab(&squares, &weights(&|e, c| e / (1.0 + c * e)));
             let denominator = fast_ab(&squares, &weights(&|e, c| 1.0 / (1.0 + c * e)));
-            let means = &posterior.mean[mlp.output];
+            let means = &*posterior.mean[mlp.output];
             for (a, i) in alive.iter().enumerate() {
                 let Output::Column(column) = mlp.outputs[*i] else { continue };
                 let diagonal = prior[*i] * mlp.gram[[*i, *i]];
@@ -718,8 +718,8 @@ mod tests {
             super::Output::Tied { .. } => None,
         }
         .expect("an own output column");
-        let means = &posterior.mean[mlp.output];
-        let moved = &trial.mean[mlp.output] - means;
+        let means = &*posterior.mean[mlp.output];
+        let moved = &*trial.mean[mlp.output] - means;
         let delta = Array2::from_shape_fn((surviving.len(), means.nrows()), |(a, r)| moved[[r, column(surviving[a])]]);
         let deleted = means.column(column(1)).to_owned();
         let g_rr = mlp.gram.select(Axis(0), &surviving).select(Axis(1), &surviving);
@@ -741,7 +741,7 @@ mod tests {
             log_sd.mapv_inplace(|s| s - 0.5 * (tokens / 1000.0).ln());
         }
         let least = compensation.proposal(&sharp, &[output]).expect("the least-squares proposal");
-        let norm = |p: &Posterior| (&p.mean[mlp.output] - means).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let norm = |p: &Posterior| (&*p.mean[mlp.output] - means).iter().map(|v| v * v).sum::<f64>().sqrt();
         assert!(norm(&trial) < norm(&least), "the posterior mode moved the outputs {} and least squares {}", norm(&trial), norm(&least));
         // The shares are in [0, 1], and the nearly copied function's is below the others'.
         let shares = compensation.unexplained(&posterior).expect("the shares");

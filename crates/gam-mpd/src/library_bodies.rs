@@ -2268,19 +2268,19 @@ pub fn edit_native(explanation: &Explanation, owner: &crate::artifact::Owner, de
 pub fn carried(parent: &Explanation, posterior: &Posterior, child: &Explanation, tokens: usize) -> Result<crate::library_mdl::Start, String> {
     let fresh = Posterior::new(child, tokens)?;
     let names: BTreeMap<&str, usize> = parent.trainable.iter().enumerate().map(|(j, op)| (parent.artifact.program.operators[*op].name.as_str(), j)).collect();
-    let mut log_sd = fresh.log_sd.clone();
+    let mut log_sd: Vec<Array2<f64>> = fresh.log_sd.iter().map(|s| (**s).clone()).collect();
     for (i, op) in child.trainable.iter().enumerate() {
         let Some(&j) = names.get(child.artifact.program.operators[*op].name.as_str()) else { continue };
         if posterior.log_sd[j].dim() != log_sd[i].dim() {
             continue;
         }
-        ndarray::Zip::from(&mut log_sd[i]).and(&posterior.log_sd[j]).for_each(|own, inherited| {
+        ndarray::Zip::from(&mut log_sd[i]).and(&*posterior.log_sd[j]).for_each(|own, inherited| {
             if own.is_finite() && inherited.is_finite() {
                 *own = *inherited;
             }
         });
     }
-    Ok(crate::library_mdl::Start { mean: fresh.mean, log_sd, active: fresh.active, state: None, iterate: None, steps: 0, epoch: 0 })
+    Ok(crate::library_mdl::Start { mean: fresh.mean.into_iter().map(crate::library_mdl::Shared::into_array).collect(), log_sd, active: fresh.active, state: None, iterate: None, steps: 0, epoch: 0 })
 }
 
 #[cfg(test)]
@@ -2849,7 +2849,7 @@ mod tests {
             // At the means the component's centre is the target itself (the gauge and, gated, the
             // non-unit up scales of the planted copy relate them exactly): the relation the mixture
             // fits is the one the merge compiles.
-            let means: BTreeMap<usize, Array2<f64>> = mixture.operators().into_iter().map(|i| (i, posterior.mean[i].clone())).collect();
+            let means: BTreeMap<usize, Array2<f64>> = mixture.operators().into_iter().map(|i| (i, (*posterior.mean[i]).clone())).collect();
             let entries = mixture.live(1, &posterior).unwrap();
             let centre = mixture.predicted(&mixture.targets[1].components[0], &entries, &means).unwrap();
             let target = Array1::from_iter(entries.iter().map(|e| means[&e.operator][[e.row, e.col]]));
@@ -2932,7 +2932,7 @@ mod tests {
             let name = &program.operators[*op].name;
             let (got, own) = (&carried.log_sd[i], &fresh.log_sd[i]);
             if name.starts_with(&call.body) || name.starts_with(&call.name) {
-                assert_eq!(got, own, "{name} is new and starts fresh");
+                assert_eq!(**got, **own, "{name} is new and starts fresh");
             } else {
                 let j = start.trainable.iter().position(|t| start.artifact.program.operators[*t].name == *name).unwrap();
                 for (g, (o, p)) in got.iter().zip(own.iter().zip(parent.log_sd[j].iter())) {
