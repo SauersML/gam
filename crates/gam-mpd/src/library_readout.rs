@@ -697,6 +697,28 @@ impl<'a> Library<'a> {
         Ok(logits)
     }
 
+    /// [`Library::log_probabilities`] with the vocabulary-wide product on the products device (in
+    /// its arithmetic) and each row normalized in float64 on the host.
+    pub fn log_probabilities_wide(&self, last: &Array2<f64>) -> Result<Array2<f64>, String> {
+        let vocabulary = self.unembedding.nrows();
+        let mut out = Array2::<f64>::zeros((last.nrows(), vocabulary));
+        for start in (0..last.nrows()).step_by(self.tile_rows) {
+            let n = self.tile_rows.min(last.nrows() - start);
+            let rows = last.slice(s![start..start + n, ..]);
+            let block = self.wide.upload(rows).map_err(error)?;
+            let mut products = self.wide.zeros(n, vocabulary).map_err(error)?;
+            self.wide.gemm(&mut products, 1.0, &block, Op::N, &self.unembedding_table, Op::T, 0.0, arithmetic(self.wide)).map_err(error)?;
+            let mut logits = self.wide.download(&products).map_err(error)?;
+            for (mut row, x) in logits.outer_iter_mut().zip(rows.outer_iter()) {
+                row *= rms_scale(x, self.final_site.epsilon);
+                let values = gam_math::categorical::log_softmax(row.as_slice().ok_or("a contiguous row")?).map_err(error)?;
+                row.assign(&Array1::from(values));
+            }
+            out.slice_mut(s![start..start + n, ..]).assign(&logits);
+        }
+        Ok(out)
+    }
+
     /// A function's place: its layer, and its head (an index into the heads) or its MLP (an index
     /// into the MLPs) and function.
     fn place(&self, function: usize) -> Result<(usize, Result<usize, (usize, usize)>), String> {
@@ -1068,23 +1090,37 @@ impl<'a> Library<'a> {
         let copies: Vec<&[u32]> = edits.iter().map(|e| sequences[e.sequence].as_slice()).collect();
         let family = sequence_family(&copies)?;
         let rows = family.rows;
-        // Per edited node (an MLP's activations, a head's read), the factor of every value.
-        let mut masks: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+        // Per edited node (an MLP's activations, a head's read): a table of factor rows (row 0 all
+        // ones, then one per copy that edits the node) and each copy's row, gathered on the device
+        // into the factor of every value.
+        let mut tables: BTreeMap<usize, (Vec<Array1<f64>>, Vec<u32>)> = BTreeMap::new();
         for (k, edit) in edits.iter().enumerate() {
             for &(f, alpha) in &edit.scale {
                 let (node, column, width) = match self.place(f)?.1 {
                     Ok(h) => (self.observed[self.head_paths + 6 * h + 2], None, self.heads[h].output.ncols()),
                     Err((b, i)) => (self.observed[self.mlp_paths[b]], Some(i), self.mlps[b].gate.nrows()),
                 };
-                let mask = masks.entry(node).or_insert_with(|| Array2::ones((rows, width)));
-                let mut span = mask.slice_mut(s![k * length..(k + 1) * length, ..]);
+                let (table, row_of) = tables.entry(node).or_insert_with(|| (vec![Array1::ones(width)], vec![0; edits.len()]));
+                if row_of[k] == 0 {
+                    table.push(Array1::ones(width));
+                    row_of[k] = (table.len() - 1) as u32;
+                }
+                let row = &mut table[row_of[k] as usize];
                 match column {
-                    Some(i) => span.column_mut(i).mapv_inplace(|v| v * alpha),
-                    None => span.mapv_inplace(|v| v * alpha),
+                    Some(i) => row[i] *= alpha,
+                    None => row.mapv_inplace(|v| v * alpha),
                 }
             }
         }
-        let masks: BTreeMap<usize, Tensor> = masks.into_iter().map(|(n, m)| Ok((n, self.model.upload(m.view()).map_err(error)?))).collect::<Result<_, String>>()?;
+        let masks: BTreeMap<usize, Tensor> = tables
+            .into_iter()
+            .map(|(node, (table, row_of))| {
+                let table = ndarray::stack(Axis(0), &table.iter().map(|r| r.view()).collect::<Vec<_>>()).map_err(error)?;
+                let index: Vec<u32> = (0..rows).map(|r| row_of[r / length]).collect();
+                let table = self.model.upload(table.view()).map_err(error)?;
+                Ok((node, self.model.gather_rows(&table, &self.model.upload_indices(&index).map_err(error)?).map_err(error)?))
+            })
+            .collect::<Result<_, String>>()?;
         let edit = |node: usize, trace: &DeviceTrace| -> Result<Option<Tensor>, String> {
             let Some(mask) = masks.get(&node) else { return Ok(None) };
             let value = trace.value(node)?;

@@ -216,7 +216,7 @@ fn save(path: &Path, arrays: BTreeMap<String, Array>) -> Result<(), String> {
 
 /// Per row of `last` the next-token log-probabilities.
 fn log_p(library: &Library, last: &Array2<f64>) -> Result<Array2<f64>, String> {
-    library.log_probabilities(last)
+    library.log_probabilities_wide(last)
 }
 
 /// The indices of the `k` largest values of `score`, descending.
@@ -596,11 +596,15 @@ fn main() -> Result<(), String> {
             by_row.entry((contexts[b][j], position[b][j])).or_default().push((b, j));
         }
     }
-    for ((s, p), readers) in &by_row {
+    // Proposals per row (one pass each); the measurements of many rows run together, in batches.
+    let mut edits: Vec<Edit> = Vec::new();
+    let mut asked: Vec<(usize, usize, usize, Vec<usize>)> = Vec::new();
+    let groups: Vec<(&(usize, usize), &Vec<(usize, usize)>)> = by_row.iter().collect();
+    for (g, ((s, p), readers)) in groups.iter().enumerate() {
         let (writes, _, inverses) = library.writes_and_reads_at(&pool[*s], *p)?;
-        let mut edits = vec![Edit { sequence: *s, scale: vec![], rows: vec![*p] }];
-        let mut asked: Vec<(usize, usize, Vec<usize>)> = Vec::new();
-        for &(b, j) in readers {
+        let clean = edits.len();
+        edits.push(Edit { sequence: *s, scale: vec![], rows: vec![*p] });
+        for &(b, j) in readers.iter() {
             let (site, maps) = library.read_maps(b)?;
             let mut score = vec![0.0f64; total];
             for map in &maps {
@@ -615,14 +619,20 @@ fn main() -> Result<(), String> {
                 }
             }
             let proposed: Vec<usize> = top_k(score.iter().copied(), pcount).into_iter().filter(|a| score[*a] >= 0.0).collect();
+            asked.push((b, j, clean, proposed.clone()));
             edits.extend(proposed.iter().map(|a| Edit { sequence: *s, scale: vec![(*a, 0.0)], rows: vec![*p] }));
-            asked.push((b, j, proposed));
+        }
+        if edits.len() < 16 * settings.batch.max(1) && g + 1 < groups.len() {
+            continue;
         }
         let (_, act) = run_edits(&library, &pool, &edits, settings.batch, true)?;
         let act = act.ok_or("activity")?;
-        let mut at = 1;
-        for (b, j, proposed) in asked {
-            let mut measured: Vec<(usize, f64)> = proposed.iter().enumerate().map(|(i, a)| (*a, act[[at + i, b]] - act[[0, b]])).collect();
+        let mut at = 0;
+        for (b, j, clean, proposed) in asked.drain(..) {
+            if at <= clean {
+                at = clean + 1;
+            }
+            let mut measured: Vec<(usize, f64)> = proposed.iter().enumerate().map(|(i, a)| (*a, act[[at + i, b]] - act[[clean, b]])).collect();
             at += proposed.len();
             measured.sort_by(|x, y| y.1.abs().total_cmp(&x.1.abs()));
             for (i, (a, d)) in measured.into_iter().enumerate() {
@@ -630,6 +640,7 @@ fn main() -> Result<(), String> {
                 u_delta[(b * j_count + j) * pcount + i] = d;
             }
         }
+        edits.clear();
     }
     save(&out.join("relations_upstream.safetensors"), [("ids".into(), i32s(vec![total, j_count, pcount], u_ids.clone())), ("delta".into(), f32s(vec![total, j_count, pcount], u_delta.clone()))].into())?;
     log::info!("upstream in {:.0} s", started.elapsed().as_secs_f64());
