@@ -296,7 +296,9 @@ pub fn hybrid_of(rng: &mut impl RngExt, blocks: usize, k: usize) -> Vec<bool> {
 ///
 /// * the clean experiment's hybrid: with probability ½ `P` alone (every block `P`'s: the
 ///   explanation as delivered), else a hybrid drawn by [`hybrid`] (`P`'s parts in `M`'s place);
-/// * the patched experiment, under the same hybrid: its block uniform over the `blocks` blocks;
+/// * the patched experiment, under the same hybrid: its block uniform over the blocks holding a
+///   read variable (every block of `M`'s own functions; a transcoder's block holds none,
+///   `library_transcoder`, and a base has no patched experiment when no block holds one);
 ///   with probability ½ a read patch of one of the block's `variables`, uniform among them, else
 ///   a joint read patch of a random subset of them ([`subset`]); its position uniform over the
 ///   `length` positions.
@@ -309,13 +311,18 @@ pub fn sample(rng: &mut impl RngExt, sequences: usize, variables: &[ReadVariable
     for (i, v) in variables.iter().enumerate() {
         at_block.get_mut(v.block).ok_or_else(|| error("a read variable outside the blocks"))?.push(i);
     }
-    if blocks == 0 || length == 0 || at_block.iter().any(Vec::is_empty) {
-        return Err(error("every block needs a read variable to patch, and sequences need tokens"));
+    if blocks == 0 || length == 0 {
+        return Err(error("experiments need blocks, and sequences need tokens"));
     }
+    let readable: Vec<usize> = (0..blocks).filter(|b| !at_block[*b].is_empty()).collect();
     let mut out = Vec::with_capacity(2 * sequences);
     for n in 0..sequences {
         let explained = if rng.random_range(0..2) == 0 { vec![true; blocks] } else { hybrid(rng, blocks) };
-        let candidates = &at_block[rng.random_range(0..blocks)];
+        if readable.is_empty() {
+            out.push(Experiment { base: n, source: n, explained, patch: None, position: 0 });
+            continue;
+        }
+        let candidates = &at_block[readable[rng.random_range(0..readable.len())]];
         let patch = if rng.random_range(0..2) == 0 {
             Patch::Read { variable: candidates[rng.random_range(0..candidates.len())] }
         } else {

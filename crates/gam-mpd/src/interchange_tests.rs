@@ -354,8 +354,13 @@ fn sampling_draws_each_family_with_its_stated_weight() {
     assert!(experiments.iter().any(|e| e.explained.windows(2).any(|w| !w[0] && w[1])));
     let positions: std::collections::BTreeSet<usize> = experiments.iter().filter(|e| e.patch.is_some()).map(|e| e.position).collect();
     assert_eq!(positions, (0..9).collect());
-    // A block without a read variable cannot be patched.
-    assert!(sample(&mut rand::rngs::StdRng::seed_from_u64(11), 2, &variables[3..], 6, 9).is_err());
+    // A block without a read variable is never patched (block 0's variables left out).
+    let partial = sample(&mut rand::rngs::StdRng::seed_from_u64(11), 600, &variables[3..], 6, 9).expect("sample");
+    assert_eq!(partial.len(), 1200);
+    assert!(partial.iter().filter_map(|e| e.patch.as_ref()).flat_map(|p| p.variables()).all(|v| variables[*v + 3].block > 0));
+    // No block holding a read variable: only the clean experiments.
+    let clean = sample(&mut rand::rngs::StdRng::seed_from_u64(11), 5, &[], 6, 9).expect("sample");
+    assert!(clean.len() == 5 && clean.iter().all(|e| e.patch.is_none()));
 }
 
 #[test]
