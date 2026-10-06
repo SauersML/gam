@@ -416,13 +416,7 @@ impl Decoder {
         if covers(ranges, t.rows()) {
             return d.copy(t).map_err(error);
         }
-        let mut out = d.zeros(ranges.iter().map(ExactSizeIterator::len).sum(), t.cols()).map_err(error)?;
-        let mut at = 0;
-        for r in ranges {
-            d.set_rows(&mut out, at, &d.rows_of(t, r.start, r.len()).map_err(error)?).map_err(error)?;
-            at += r.len();
-        }
-        Ok(out)
+        d.gather_ranges(t, ranges).map_err(error)
     }
 
     fn scatter(&self, t: &mut Tensor, ranges: &[Range<usize>], values: Tensor) -> Result<(), String> {
@@ -431,12 +425,7 @@ impl Decoder {
             *t = values;
             return Ok(());
         }
-        let mut at = 0;
-        for r in ranges {
-            d.set_rows(t, r.start, &d.rows_of(&values, at, r.len()).map_err(error)?).map_err(error)?;
-            at += r.len();
-        }
-        Ok(())
+        d.scatter_ranges(t, ranges, &values).map_err(error)
     }
 
     /// The rotary angles of the call's rows (each range a sequence from position 0), from a table

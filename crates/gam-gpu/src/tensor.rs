@@ -40,6 +40,10 @@ use ndarray::{Array2, ArrayView2, ArrayViewMut2, Axis, Slice, linalg::general_ma
 use rayon::prelude::*;
 use std::sync::Arc;
 
+/// The row ranges one CUDA launch of [`Device::gather_ranges`] or [`Device::scatter_ranges`] moves
+/// (passed by value: a kernel's parameters hold 4 KB).
+pub const ROW_RANGES: usize = 320;
+
 /// How a product reads an operand.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Op {
@@ -2429,6 +2433,53 @@ impl Device {
         }
     }
 
+    /// Rows `ranges` of `t` (f32 on CUDA), stacked in order: a decoder call's rows of its stream
+    /// buffer, on CUDA in one launch per [`ROW_RANGES`] ranges with the ranges passed by value.
+    pub fn gather_ranges(&self, t: &Tensor, ranges: &[std::ops::Range<usize>]) -> Result<Tensor, GpuError> {
+        if ranges.iter().any(|r| r.end > t.rows) {
+            return Err(shape(format!("rows {ranges:?} of {} rows", t.rows)));
+        }
+        let rows = ranges.iter().map(ExactSizeIterator::len).sum();
+        let mut out = self.empty(rows, t.cols)?;
+        let mut at = 0;
+        let moves: Vec<(usize, usize, usize)> = ranges.iter().map(|r| { at += r.len(); (r.start, at - r.len(), r.len()) }).collect();
+        self.copy_ranges(t, &mut out, &moves)?;
+        Ok(out)
+    }
+
+    /// `values`' rows, in order, written to rows `ranges` of `t` ([`Device::gather_ranges`]'s
+    /// inverse).
+    pub fn scatter_ranges(&self, t: &mut Tensor, ranges: &[std::ops::Range<usize>], values: &Tensor) -> Result<(), GpuError> {
+        let rows: usize = ranges.iter().map(ExactSizeIterator::len).sum();
+        if ranges.iter().any(|r| r.end > t.rows) || values.dim() != (rows, t.cols) {
+            return Err(shape(format!("{:?} values for rows {ranges:?} of {:?}", values.dim(), t.dim())));
+        }
+        let mut at = 0;
+        let moves: Vec<(usize, usize, usize)> = ranges.iter().map(|r| { at += r.len(); (at - r.len(), r.start, r.len()) }).collect();
+        self.copy_ranges(values, t, &moves)
+    }
+
+    /// Rows `from..from + length` of `x` copied to rows `to..` of `y`, per move (equal columns).
+    fn copy_ranges(&self, x: &Tensor, y: &mut Tensor, moves: &[(usize, usize, usize)]) -> Result<(), GpuError> {
+        if x.cols != y.cols {
+            return Err(shape(format!("rows of {:?} into {:?}", x.dim(), y.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (cols, xv) = (x.cols, host(x)?.to_vec());
+                let yv = host_mut(y)?;
+                for &(from, to, length) in moves {
+                    yv[to * cols..(to + length) * cols].copy_from_slice(&xv[from * cols..(from + length) * cols]);
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.copy_ranges(x, y, moves),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => moves.iter().try_for_each(|&(from, to, length)| self.set_rows(y, to, &self.rows_of(x, from, length)?)),
+        }
+    }
+
     /// Each row of `x` RMS-normed and scaled by the gain row `gain`: `y = x k g` with `k = 1/√(mean
     /// x² + ε)`; `y` (rows × d) in bfloat16 when `bf16` (CUDA; the host rounds its float64 values
     /// alike), and `k` (rows × 1). A decoder layer's block read (`gam_mpd::decoder`).
@@ -4201,6 +4252,19 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
         Ok((table, tiles as u32))
     }
 
+    /// `decoder.cu`'s `RowRanges`: the moves of one `copy_ranges` launch.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RowRanges {
+        count: u32,
+        from: [u32; super::ROW_RANGES],
+        to: [u32; super::ROW_RANGES],
+        length: [u32; super::ROW_RANGES],
+    }
+
+    // SAFETY: plain u32s laid out as the kernel's parameter struct.
+    unsafe impl DeviceRepr for RowRanges {}
+
     /// The width the attention kernels pad heads of `width` columns to.
     fn attention_width(width: usize) -> Result<usize, GpuError> {
         match width {
@@ -4954,6 +5018,23 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
         }
 
         /// A bfloat16 tensor's buffer left unset for a kernel that writes every value.
+        pub(super) fn copy_ranges(&self, x: &Tensor, y: &mut Tensor, moves: &[(usize, usize, usize)]) -> Result<(), GpuError> {
+            let cols = u32_of(x.cols)?;
+            let f = self.decoder("copy_ranges")?;
+            for chunk in moves.chunks(super::ROW_RANGES) {
+                let mut table = RowRanges { count: u32_of(chunk.len())?, from: [0; super::ROW_RANGES], to: [0; super::ROW_RANGES], length: [0; super::ROW_RANGES] };
+                for (i, &(from, to, length)) in chunk.iter().enumerate() {
+                    (table.from[i], table.to[i], table.length[i]) = (u32_of(from)?, u32_of(to)?, u32_of(length)?);
+                }
+                let longest = chunk.iter().map(|m| m.2 * x.cols).max().unwrap_or(0) as u64;
+                let blocks = longest.div_ceil(u64::from(BLOCK)).clamp(1, 4096) as u32;
+                let cfg = LaunchConfig { grid_dim: (blocks, table.count.max(1), 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
+                // SAFETY: every move's rows lie in its buffer (checked by the caller).
+                unsafe { self.stream.launch_builder(&f).arg(&table).arg(&cols).arg(slice32(x)?).arg(slice32_mut(y)?).launch(cfg) }.gpu_ctx("decoder copy_ranges")?;
+            }
+            Ok(())
+        }
+
         fn unset16(&self, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
             // SAFETY: as `unset32`.
             let data = Data::CudaBf16(unsafe { self.stream.alloc::<u16>((rows * cols).max(1)) }.gpu_ctx("tensor alloc")?);

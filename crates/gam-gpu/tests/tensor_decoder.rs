@@ -238,3 +238,27 @@ fn split_products_match_the_host_on_cuda() {
         }
     }
 }
+
+/// A call's rows gathered from a stream buffer and scattered back (`Device::gather_ranges`,
+/// `scatter_ranges`), exactly, with more ranges than one CUDA launch takes; on the host always.
+#[test]
+fn row_ranges_move_exactly() {
+    let devices: Vec<Device> = std::iter::once(Device::host()).chain(cuda()).collect();
+    let x = matrix(2000, 7, 41, 1.0);
+    let mut ranges: Vec<std::ops::Range<usize>> = vec![30..41, 3..10, 0..2];
+    ranges.extend((0..400).map(|i| 1000 + 2 * i..1001 + 2 * i));
+    for dev in &devices {
+        let t = dev.upload(x.view()).unwrap();
+        let gathered = dev.download(&dev.gather_ranges(&t, &ranges).unwrap()).unwrap();
+        let expected: Vec<f64> = ranges.iter().flat_map(|r| x.rows().into_iter().skip(r.start).take(r.len()).flat_map(|row| row.to_vec())).collect();
+        assert_eq!(gathered.iter().copied().collect::<Vec<_>>(), expected, "gathered rows");
+        let mut back = dev.zeros(2000, 7).unwrap();
+        dev.scatter_ranges(&mut back, &ranges, &dev.upload(gathered.view()).unwrap()).unwrap();
+        let back = dev.download(&back).unwrap();
+        for r in &ranges {
+            for i in r.clone() {
+                assert_eq!(back.row(i), x.row(i), "row {i} scattered back");
+            }
+        }
+    }
+}

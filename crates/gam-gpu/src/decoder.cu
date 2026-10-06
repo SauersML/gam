@@ -228,3 +228,23 @@ extern "C" __global__ void tf32_split(u64 n, const float* x, float* big, float* 
         small[i] = (v != v || isinf(v)) ? 0.0f : v - b;
     }
 }
+
+#define ROW_RANGES 320
+// The moves of one launch: rows from[i]..from[i] + length[i] of x go to rows to[i].. of y.
+struct RowRanges {
+    unsigned int count;
+    unsigned int from[ROW_RANGES];
+    unsigned int to[ROW_RANGES];
+    unsigned int length[ROW_RANGES];
+};
+
+// Rows of x copied into y (cols columns each), move blockIdx.y of `ranges`, the blocks striding
+// over its entries.
+extern "C" __global__ void copy_ranges(const RowRanges ranges, unsigned int cols, const float* x, float* y) {
+    unsigned int m = blockIdx.y;
+    if (m >= ranges.count) return;
+    u64 n = (u64)ranges.length[m] * cols;
+    const float* source = x + (u64)ranges.from[m] * cols;
+    float* target = y + (u64)ranges.to[m] * cols;
+    for (u64 i = (u64)blockIdx.x * BLOCK + threadIdx.x; i < n; i += (u64)gridDim.x * BLOCK) target[i] = source[i];
+}
