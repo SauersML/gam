@@ -2459,7 +2459,10 @@ impl Device {
                 Ok(())
             }
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.copy_ranges(x, y, moves),
+            Backend::Cuda(engine) if x.storage() == Storage::F32 && y.storage() == Storage::F32 => engine.copy_ranges(x, y, moves),
+            // Float64 and bfloat16 rows move one range at a time.
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(_) => moves.iter().try_for_each(|&(from, to, length)| self.set_rows(y, to, &self.rows_of(x, from, length)?)),
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => moves.iter().try_for_each(|&(from, to, length)| self.set_rows(y, to, &self.rows_of(x, from, length)?)),
         }

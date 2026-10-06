@@ -748,22 +748,12 @@ pub trait BlockEngine {
 
 /// The ranges' rows of `t` stacked in order.
 fn gather(d: &Device, t: &Tensor, ranges: &[Range<usize>]) -> Result<Tensor, String> {
-    let mut out = d.zeros(ranges.iter().map(ExactSizeIterator::len).sum(), t.cols()).map_err(error)?;
-    let mut at = 0;
-    for r in ranges {
-        d.set_rows(&mut out, at, &d.rows_of(t, r.start, r.len()).map_err(error)?).map_err(error)?;
-        at += r.len();
-    }
-    Ok(out)
+    d.gather_ranges(t, ranges).map_err(error)
 }
 
 /// `values`' rows written back to the ranges' rows of `t`, in order.
 fn scatter(d: &Device, t: &mut Tensor, ranges: &[Range<usize>], values: &Tensor) -> Result<(), String> {
-    let mut at = 0;
-    for r in ranges {
-        d.set_rows(t, r.start, &d.rows_of(values, at, r.len()).map_err(error)?).map_err(error)?;
-        at += r.len();
-    }
+    d.scatter_ranges(t, ranges, values).map_err(error)?;
     Ok(())
 }
 
