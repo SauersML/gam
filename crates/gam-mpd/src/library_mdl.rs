@@ -3621,8 +3621,8 @@ mod tests {
         use crate::library_sharing::{Member, share_query_key, share_value};
         let (native, layers, _, sequences) = tiny_qwen3("library_group_gradient");
         let start = explanation(&native, &layers).unwrap();
-        // Layer 1's query heads read layer 0's query-key maps, swapped, and its value map is layer
-        // 0's through the output projections' transport.
+        // Layer 1's query heads read layer 0's query-key maps, swapped (unscaled: the heads norm
+        // their queries), and its value map is layer 0's through the output projections' transport.
         let shared = share_query_key(&start, &[Member { layer: 0, group: 0, queries: vec![0, 1] }, Member { layer: 1, group: 0, queries: vec![1, 0] }]).unwrap();
         let explanation = share_value(&shared, (1, 0), (0, 0), 0.7).unwrap();
         let settings = settings();
@@ -3638,7 +3638,6 @@ mod tests {
             (at("library.l0.h0.q"), (1, 3)),
             (at("library.l0.h1.q"), (2, 5)),
             (at("library.l0.kv0.k"), (0, 6)),
-            (at("library.l1.h0.q_shared_scale"), (0, 0)),
             (at("library.l0.kv0.v"), (3, 2)),
             (at("library.l1.kv0.v_from_l0_kv0.scale"), (0, 0)),
         ];

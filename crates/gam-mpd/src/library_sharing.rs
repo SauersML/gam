@@ -306,8 +306,9 @@ pub fn share_query_key(explanation: &Explanation, members: &[Member]) -> Result<
     let (owner_queries, owner_key) = (owner.queries(), owner.key);
     let name = |op: usize| program.operators[op].name.clone();
     // Each member keeps its native owners, now read through the shared maps; a member's query
-    // through its head's scale. Where `M` norms each head's query (Qwen3) the scale acts after the
-    // norm, as a gain does, and the query map itself is the owner's.
+    // through its head's scale. Where `M` norms each head's query (Qwen3) a scale would act after
+    // the norm, as a gain does, which no native query map can carry: the member reads the shared
+    // query map unscaled (`c ≡ 1`), and the query map itself is the owner's.
     let mut moves: Vec<(String, String, Option<String>)> = Vec::new();
     for (m, group) in members.iter().zip(&found).skip(1) {
         for ((h, head), &j) in group.heads.iter().zip(&m.queries) {
@@ -350,7 +351,8 @@ pub fn share_query_key(explanation: &Explanation, members: &[Member]) -> Result<
         program.operators[*op] = Arc::new(dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values / n, provenance.clone())?);
     }
     // Every other member's query head reads the shared maps, its query scaled by its own `c` (a
-    // 1 × 1 operator, broadcast over the query's coordinates by a fixed column of ones).
+    // 1 × 1 operator, broadcast over the query's coordinates by a fixed column of ones); a head
+    // that norms its query reads them unscaled (above).
     let coordinates = program.operators[owner_key].rows.clone();
     let one = Interface::uniform(1, 1, LabelKind::Unit, 0).map_err(error)?;
     let mut retired = Vec::new();
@@ -359,6 +361,13 @@ pub fn share_query_key(explanation: &Explanation, members: &[Member]) -> Result<
         retired.push(group.key);
         for ((h, head), &j) in group.heads.iter().zip(&m.queries) {
             retired.push(head.query);
+            let normed = !matches!(program.rules[head.rule].nodes[program.rules[head.rule].output], Node::Attend { query: 1, .. });
+            if normed {
+                let rule = &mut program.rules[head.rule];
+                rule.nodes[1] = Node::Affine { terms: vec![(0, owner_queries[j])], bias: None };
+                rule.nodes[2] = Node::Affine { terms: vec![(0, owner_key)], bias: None };
+                continue;
+            }
             let scale = program.operators.len();
             let name = format!("library.l{}.h{h}.q_shared_scale", m.layer);
             program.operators.push(Arc::new(dense(name.clone(), one.clone(), Interface::constant(), Array2::ones((1, 1)), provenance.clone())?));
