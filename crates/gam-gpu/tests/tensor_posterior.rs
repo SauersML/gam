@@ -888,8 +888,8 @@ fn a_move_toward_is_the_copy_and_axpys_it_replaces() {
     }
 }
 
-/// CUDA's reduction over groups of one column each (four adjacent columns per block, or eight from
-/// 4096 such groups; group c is 7c mod cols, one column each while 7 does not divide cols) against the same entries transposed and grouped by rows, which the
+/// CUDA's reduction over groups of one column each (four adjacent columns per block, or 32 from
+/// 8192 such groups; group c is 7c mod cols, one column each while 7 does not divide cols) against the same entries transposed and grouped by rows, which the
 /// per-segment reduction takes in the same order: every group sum, and every entry the kernels
 /// write, bit for bit. 600 rows (two full passes of a block and part of a third) and `cols` columns
 /// in a shuffled group order (full tiles of columns not adjacent in group order, and part of one),
@@ -948,7 +948,7 @@ fn single_columns_match_their_transposes(fit: &Device, wide: &Device, cols: usiz
 fn cuda_single_column_groups_reduce_as_their_transposes() {
     let Some(wide) = Device::accelerator(GpuPolicy::Auto).expect("a probe that does not fault") else { return };
     let narrow = wide.with_storage(Storage::F32).expect("CUDA holds f32");
-    for cols in [22, 4100] {
+    for cols in [22, 8194] {
         single_columns_match_their_transposes(&narrow, &wide, cols);
         single_columns_match_their_transposes(&wide, &wide, cols);
     }
