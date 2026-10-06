@@ -136,37 +136,6 @@ mod linux {
             Ok(Arc::clone(self.lock_modules().entry(key).or_insert(module)))
         }
 
-        /// [`Self::get_or_compile`] with NVRTC's virtual architecture made architecture-specific
-        /// where the device has such features (`compute_90a` on a capability-9.0 device: the
-        /// warpgroup products exist only there); the module then loads only on that architecture.
-        pub fn get_or_compile_specific<S>(
-            &self,
-            ctx: &Arc<CudaContext>,
-            key: K,
-            label: &'static str,
-            source: S,
-        ) -> Result<Arc<CudaModule>, GpuError>
-        where
-            S: FnOnce(K) -> String,
-        {
-            if let Some(module) = self.lock_modules().get(&key) {
-                return Ok(Arc::clone(module));
-            }
-            require_cudarc_library(CudarcLibrary::Nvrtc)?;
-            let mut opts = nvrtc_compile_options()?;
-            if let Some(runtime) = crate::device_runtime::GpuRuntime::resolve(crate::global_policy())? {
-                let capability = &runtime.selected_device().capability;
-                if (capability.compute_major, capability.compute_minor) == (9, 0) {
-                    opts.arch = Some("compute_90a");
-                }
-            }
-            let ptx = compile_ptx_with_opts(source(key), opts).gpu_ctx_with(|err| format!("{label} NVRTC compile failed (key={key}): {err}"))?;
-            let module = ctx
-                .load_module(ptx)
-                .gpu_ctx_with(|err| format!("{label} module load failed (key={key}): {err}"))?;
-            Ok(Arc::clone(self.lock_modules().entry(key).or_insert(module)))
-        }
-
         /// The module map. A panic elsewhere while the lock was held cannot
         /// leave it inconsistent (the guarded sections only read or insert an
         /// `Arc`), so a poisoned lock is recovered rather than bypassed.

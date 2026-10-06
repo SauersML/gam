@@ -2,11 +2,12 @@
 //! 128, each with its own keys and values, 32 sequences) and Qwen3-0.6B (16 query heads over 8
 //! key-value heads of 128, 8 sequences), each at 512 and 1024 positions. A line per shape: the mean
 //! device seconds per call of the forward and of the reverse (one warm call, then a timed loop
-//! between synchronizations), their rates in TFLOP/s, and the fraction of PEAK, the card's dense
-//! bfloat16 tensor-core rate with f32 accumulation in TFLOP/s (RTX 4090: 165.2; H100 SXM: 989.4).
-//! Operations are counted as the products a causal attention needs: the forward 4 w Σ T(T + 1)/2
-//! per query head (scores and values), the reverse 2.5 times that (scores again, the weights'
-//! cotangent, and the queries', keys' and values' cotangents).
+//! between synchronizations), their rates in TFLOP/s, and the fraction of PEAK, the card's f32 rate
+//! in TFLOP/s (the kernels multiply in f32 on the CUDA cores; RTX 4090: 82.6). Operations are
+//! counted as the products a causal attention needs: the forward 4 w Σ T(T + 1)/2 per query head
+//! (scores and values), the reverse 2.5 times that (scores again, the weights' cotangent, and the
+//! queries', keys' and values' cotangents; the reverse's two passes form the scores and the weights'
+//! cotangent each, which this count does not credit).
 //! `cargo run --release -p gam-gpu --example attention_speed -- PEAK`.
 
 use gam_gpu::GpuPolicy;
@@ -46,8 +47,7 @@ fn main() -> Result<(), String> {
         for length in [512, 1024] {
             let rows = count * length;
             let sequences: Vec<_> = (0..count).map(|s| s * length..(s + 1) * length).collect();
-            let p = d.upload(matrix(rows, layout.columns(), 1, 2.0).view()).map_err(|e| e.to_string())?;
-            let (y, _) = d.heads_rope(&p, layout, None, None, true).map_err(|e| e.to_string())?;
+            let y = d.upload(matrix(rows, layout.columns(), 1, 2.0).view()).map_err(|e| e.to_string())?;
             let ga = d.upload(matrix(rows, layout.queries * layout.width, 2, 1.0).view()).map_err(|e| e.to_string())?;
             let scale = 1.0 / (layout.width as f64).sqrt();
             let (out, lse) = d.causal_attention(&y, layout, &sequences, scale).map_err(|e| e.to_string())?;

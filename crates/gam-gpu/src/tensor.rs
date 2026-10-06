@@ -36,7 +36,7 @@
 
 use crate::gpu_error::GpuError;
 use crate::GpuPolicy;
-use ndarray::{Array2, ArrayView2, ArrayViewMut2, Axis, Slice, linalg::general_mat_mul};
+use ndarray::{Array2, ArrayView2, ArrayViewMut2, Axis, linalg::general_mat_mul};
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -64,17 +64,6 @@ pub enum Arithmetic {
     /// its operands alike, while CUDA float64 storage and the Apple GPU run it as `F32`, more
     /// precise than asked.
     Bf16,
-    /// Each operand as two TF32 terms, its nearest TF32 value `big` and the remainder `small`, and
-    /// the three products `big·big + big·small + small·big` summed with f32 accumulation (the
-    /// remainders' product, below `2⁻²²` of each term, is left out): within about `2⁻²⁰` of the
-    /// exact product per term, at a third of the tensor cores' TF32 rate. A bfloat16 copy is
-    /// exact in TF32 and has no remainder. The host rounds alike; CUDA float64 storage and the
-    /// Apple GPU run it as `F32`.
-    Tf32x3,
-    /// As [`Arithmetic::Tf32x3`] with bfloat16 terms (`hi`, and `lo` the remainder rounded to
-    /// bfloat16): within about `2⁻¹⁵` of the exact product per term, at a third of the bfloat16
-    /// rate.
-    Bf16x3,
 }
 
 /// How a tensor holds its values.
@@ -93,10 +82,7 @@ pub enum Storage {
 }
 
 impl Arithmetic {
-    /// The unit roundoff of the operands' rounding; for a split arithmetic, half its bound on a
-    /// term's error relative to the term's magnitude (the remainders' product left out, each
-    /// remainder's own rounding, which the tensor cores may truncate in TF32, and the operands'
-    /// rounding to f32).
+    /// The unit roundoff of the operands' rounding.
     #[must_use]
     pub fn unit_roundoff(self) -> f64 {
         match self {
@@ -104,18 +90,6 @@ impl Arithmetic {
             Self::F32 => f64::from(f32::EPSILON) / 2.0,
             Self::Tf32 => 2f64.powi(-11),
             Self::Bf16 => 2f64.powi(-8),
-            Self::Tf32x3 => 2f64.powi(-20),
-            Self::Bf16x3 => 2f64.powi(-15),
-        }
-    }
-
-    /// The arithmetic of each of a split arithmetic's three products, and `None` for any other.
-    #[must_use]
-    pub fn split(self) -> Option<Self> {
-        match self {
-            Self::Tf32x3 => Some(Self::Tf32),
-            Self::Bf16x3 => Some(Self::Bf16),
-            _ => None,
         }
     }
 }
@@ -467,12 +441,11 @@ fn bf16_bits(x: f32) -> u32 {
     if x.is_nan() { (bits >> 16) | 0x40 } else { (bits + 0x7fff + ((bits >> 16) & 1)) >> 16 }
 }
 
-/// Rounds `x` to `arithmetic`'s operand precision (a split arithmetic's operands are f32; its
-/// terms are rounded by its part's arithmetic, [`Arithmetic::split`]).
+/// Rounds `x` to `arithmetic`'s operand precision.
 fn round_operand(x: f64, arithmetic: Arithmetic) -> f64 {
     match arithmetic {
         Arithmetic::F64 => x,
-        Arithmetic::F32 | Arithmetic::Tf32x3 | Arithmetic::Bf16x3 => f64::from(x as f32),
+        Arithmetic::F32 => f64::from(x as f32),
         Arithmetic::Tf32 => {
             // Round the f32 value's 23-bit mantissa to 10 bits, to nearest even.
             let bits = (x as f32).to_bits();
@@ -2354,22 +2327,20 @@ impl Device {
     }
 
     /// An attention layer's projections `p` (rows × the queries', keys' and values' heads, each of
-    /// `layout.width` columns, in that order) as its attention reads them, in bfloat16 when `bf16`
-    /// (CUDA; the host rounds alike) and f32 otherwise: each query
+    /// `layout.width` columns, in that order) as its attention reads them (f32 on CUDA): each query
     /// and key head RMS-normed and scaled by its row of `norm`'s gains (`(queries + keys) × width`)
     /// when given, then turned by its row's rotary angles (`rotation`: cosines and sines, rows ×
     /// planes, and whether planes pair rotate-half); values as they are. With a norm, its scales
     /// per row and query or key head (rows × (queries + keys)).
-    pub fn heads_rope(&self, p: &Tensor, layout: HeadLayout, norm: Option<(&Tensor, f64)>, rotation: Option<(&Tensor, &Tensor, bool)>, bf16: bool) -> Result<(Tensor, Option<Tensor>), GpuError> {
+    pub fn heads_rope(&self, p: &Tensor, layout: HeadLayout, norm: Option<(&Tensor, f64)>, rotation: Option<(&Tensor, &Tensor, bool)>) -> Result<(Tensor, Option<Tensor>), GpuError> {
         layout.check(p, norm.map(|n| n.0), rotation)?;
         match &*self.backend {
             Backend::Host => {
                 let (y, k) = host_heads(p, layout, norm.map(|(g, e)| (host(g), e)), rotation, None)?;
-                let y = if bf16 { y.iter().map(|v| round_operand(*v, Arithmetic::Bf16)).collect() } else { y };
                 Ok((Tensor { rows: p.rows, cols: p.cols, data: Data::Host(y) }, k))
             }
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.heads_rope(p, layout, norm, rotation, bf16),
+            Backend::Cuda(engine) => engine.heads_rope(p, layout, norm, rotation),
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
         }
@@ -2393,21 +2364,20 @@ impl Device {
         }
     }
 
-    /// Causal attention on [`Device::heads_rope`]'s output `y` over `sequences`, disjoint row ranges
-    /// of `y`, each one sequence: per query head, `softmax(scale q kᵀ)` over the positions of its
-    /// key-value head up to its own in its sequence (query heads in order share key-value heads in
-    /// equal consecutive groups) times their values. Returns the heads side by side (rows ×
-    /// queries·width, bfloat16: the output map's operand) and each row's log partition per query
-    /// head, `log Σⱼ exp(scale qᵢ·kⱼ)` (rows × queries, f32), which the reverse reads; rows outside
-    /// every sequence are zeros. The weights are rounded to bfloat16 before the values' product
-    /// reads them (the host rounds alike). On CUDA the scores never leave the chip
-    /// (`attention.cu`).
+    /// Causal attention on the heads `y` (rows × the queries', keys' and values' heads, each of
+    /// `layout.width` columns, in that order) over `sequences`, disjoint row ranges of `y`, each one
+    /// sequence: per query head, `softmax(scale q kᵀ)` over the positions of its key-value head up
+    /// to its own in its sequence (query heads in order share key-value heads in equal consecutive
+    /// groups) times their values. Returns the heads side by side (rows × queries·width) and each
+    /// row's log partition per query head, `log Σⱼ exp(scale qᵢ·kⱼ)` (rows × queries), which the
+    /// reverse reads; rows outside every sequence are zeros. The GPUs compute in f32 (CUDA's
+    /// storage must be f32) by tiles that keep every score on the chip (`attention_f32.inc`), the
+    /// host in float64.
     pub fn causal_attention(&self, y: &Tensor, layout: HeadLayout, sequences: &[std::ops::Range<usize>], scale: f64) -> Result<(Tensor, Tensor), GpuError> {
         layout.check_attention(y, sequences)?;
         match &*self.backend {
             Backend::Host => {
                 let (a, lse, _) = host_attention(host(y)?, layout, (y.rows, sequences), scale, None);
-                let a = a.iter().map(|v| round_operand(*v, Arithmetic::Bf16)).collect();
                 Ok((Tensor { rows: y.rows, cols: layout.queries * layout.width, data: Data::Host(a) }, Tensor { rows: y.rows, cols: layout.queries, data: Data::Host(lse) }))
             }
             #[cfg(target_os = "linux")]
@@ -2438,8 +2408,8 @@ impl Device {
     }
 
     /// A gated MLP's activations from its two input products `h` (rows × 2m: the gates' m columns,
-    /// then the inputs'): `silu(gate) · input`, rows × m, in bfloat16 when `bf16` and f32 otherwise.
-    pub fn swiglu(&self, h: &Tensor, bf16: bool) -> Result<Tensor, GpuError> {
+    /// then the inputs'): `silu(gate) · input`, rows × m in bfloat16.
+    pub fn swiglu(&self, h: &Tensor) -> Result<Tensor, GpuError> {
         if h.cols % 2 != 0 {
             return Err(shape(format!("{:?} gated inputs", h.dim())));
         }
@@ -2450,13 +2420,12 @@ impl Device {
                 let a = (0..h.rows * m).map(|i| {
                     let (r, j) = (i / m, i % m);
                     let (g, u) = (hv[r * 2 * m + j], hv[r * 2 * m + m + j]);
-                    let a = g / (1.0 + (-g).exp()) * u;
-                    if bf16 { round_operand(a, Arithmetic::Bf16) } else { a }
+                    round_operand(g / (1.0 + (-g).exp()) * u, Arithmetic::Bf16)
                 });
                 Ok(Tensor { rows: h.rows, cols: m, data: Data::Host(a.collect()) })
             }
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.swiglu(h, bf16),
+            Backend::Cuda(engine) => engine.swiglu(h),
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
         }
@@ -2488,23 +2457,20 @@ impl Device {
         }
     }
 
-    /// GELU in its tanh form ([`PointwiseLaw::GeluTanh`]) of `h` plus the bias row `bias`, rows × m,
-    /// in bfloat16 when `bf16` and f32 otherwise.
-    pub fn gelu_tanh(&self, h: &Tensor, bias: Option<&Tensor>, bf16: bool) -> Result<Tensor, GpuError> {
+    /// GELU in its tanh form ([`PointwiseLaw::GeluTanh`]) of `h` plus the bias row `bias`, rows × m
+    /// in bfloat16.
+    pub fn gelu_tanh(&self, h: &Tensor, bias: Option<&Tensor>) -> Result<Tensor, GpuError> {
         if bias.is_some_and(|b| b.dim() != (1, h.cols)) {
             return Err(shape(format!("a bias for {:?} inputs", h.dim())));
         }
         match &*self.backend {
             Backend::Host => {
                 let (hv, b) = (host(h)?, bias.map(host).transpose()?);
-                let a = (0..h.len()).map(|i| {
-                    let a = host_gelu_tanh(hv[i] + b.map_or(0.0, |b| b[i % h.cols])).0;
-                    if bf16 { round_operand(a, Arithmetic::Bf16) } else { a }
-                });
+                let a = (0..h.len()).map(|i| round_operand(host_gelu_tanh(hv[i] + b.map_or(0.0, |b| b[i % h.cols])).0, Arithmetic::Bf16));
                 Ok(Tensor { rows: h.rows, cols: h.cols, data: Data::Host(a.collect()) })
             }
             #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => engine.gelu_tanh(h, bias, bf16),
+            Backend::Cuda(engine) => engine.gelu_tanh(h, bias),
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => Err(GpuError::NoDeviceKernel { reason: "the decoder kernels run on the host or CUDA".to_string() }),
         }
@@ -2807,16 +2773,10 @@ fn host_heads(
 }
 
 /// The host's [`Device::causal_attention`] of `y` (`rows` rows, `sequences` of them attending
-/// within themselves): its output, log partitions and, with `ga`, its cotangent in `y`; the weights
-/// rounded to bfloat16 as the device rounds them.
-fn host_attention(y: &[f64], layout: HeadLayout, rows: (usize, &[std::ops::Range<usize>]), scale: f64, ga: Option<&[f64]>) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    host_attention_rounded(y, layout, rows, scale, ga, Arithmetic::Bf16)
-}
-
-/// [`host_attention`] with the weights rounded to `weights` (float64 leaves them exact). Each
-/// (sequence, key-value head) runs on its own thread: it alone writes its rows' columns of that
+/// within themselves), in float64: its output, log partitions and, with `ga`, its cotangent in `y`.
+/// Each (sequence, key-value head) runs on its own thread: it alone writes its rows' columns of that
 /// head and of its query heads.
-fn host_attention_rounded(y: &[f64], layout: HeadLayout, (rows, sequences): (usize, &[std::ops::Range<usize>]), scale: f64, ga: Option<&[f64]>, weights: Arithmetic) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+fn host_attention(y: &[f64], layout: HeadLayout, (rows, sequences): (usize, &[std::ops::Range<usize>]), scale: f64, ga: Option<&[f64]>) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let (w, columns, group) = (layout.width, layout.columns(), layout.queries / layout.keys);
     let reads = layout.queries * w;
     let at = |r: usize, column: usize| y[r * columns + column];
@@ -2840,7 +2800,7 @@ fn host_attention_rounded(y: &[f64], layout: HeadLayout, (rows, sequences): (usi
                     let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                     let total: f64 = scores.iter().map(|s| (s - m).exp()).sum();
                     lse[i * group + local] = m + total.ln();
-                    let p: Vec<f64> = scores.iter().map(|s| round_operand((s - m).exp() / total, weights)).collect();
+                    let p: Vec<f64> = scores.iter().map(|s| (s - m).exp() / total).collect();
                     for t in 0..w {
                         a[(i * group + local) * w + t] = (0..=i).map(|j| p[j] * at(base + j, v0 + t)).sum();
                     }
@@ -2984,12 +2944,6 @@ fn host_softmax_stats(z: &[f64]) -> (f64, f64) {
     (m, z.iter().map(|v| (v - m).exp()).sum())
 }
 
-/// Block `i` of `v`'s equal blocks of `dims`, as `op` reads it.
-fn block_view(v: &[f64], i: usize, dims: (usize, usize), op: Op) -> Result<ArrayView2<'_, f64>, GpuError> {
-    let v = ArrayView2::from_shape(dims, &v[i * dims.0 * dims.1..(i + 1) * dims.0 * dims.1]).map_err(|e| shape(e.to_string()))?;
-    Ok(if op == Op::T { v.reversed_axes() } else { v })
-}
-
 fn host_gemm(
     batch: usize,
     ab: (usize, usize),
@@ -3001,22 +2955,14 @@ fn host_gemm(
     c: &mut [f64],
     arithmetic: Arithmetic,
 ) -> Result<(), GpuError> {
-    let lowered = |v: &[f64], unit: Arithmetic| -> Vec<f64> { v.iter().map(|x| round_operand(*x, unit)).collect() };
-    // The products summed into c, each a pair of operands as rounded: one, or a split
-    // arithmetic's three (the remainders' product first, as CUDA sums them).
-    let pairs: Vec<(Vec<f64>, Vec<f64>)> = match arithmetic.split() {
-        Some(unit) => {
-            let terms = |v: &[f64]| -> (Vec<f64>, Vec<f64>) {
-                let whole = lowered(v, Arithmetic::F32);
-                let first = lowered(&whole, unit);
-                let rest = whole.iter().zip(&first).map(|(x, h)| round_operand(x - h, unit)).collect();
-                (first, rest)
-            };
-            let ((a1, a2), (b1, b2)) = (terms(a), terms(b));
-            vec![(a2, b1.clone()), (a1.clone(), b2), (a1, b1)]
-        }
-        None if arithmetic == Arithmetic::F64 => vec![(a.to_vec(), b.to_vec())],
-        None => vec![(lowered(a, arithmetic), lowered(b, arithmetic))],
+    let lowered = |v: &[f64]| -> Vec<f64> { v.iter().map(|x| round_operand(*x, arithmetic)).collect() };
+    let (a_low, b_low);
+    let (a, b) = if arithmetic == Arithmetic::F64 {
+        (a, b)
+    } else {
+        a_low = lowered(a);
+        b_low = lowered(b);
+        (&a_low[..], &b_low[..])
     };
     let size = cb.0 * cb.1;
     if size == 0 {
@@ -3025,15 +2971,14 @@ fn host_gemm(
     // The products of a batch, and row blocks of each product, run on the rayon pool: the gemm
     // library's own threading stops at four threads. Each entry's sum is the same either way.
     c.par_chunks_mut(size).take(batch).enumerate().try_for_each(|(i, c)| -> Result<(), GpuError> {
-        let products = pairs.iter().map(|(a, b)| Ok((block_view(a, i, ab, ta)?, block_view(b, i, bb, tb)?))).collect::<Result<Vec<_>, GpuError>>()?;
+        let av = ArrayView2::from_shape(ab, &a[i * ab.0 * ab.1..(i + 1) * ab.0 * ab.1]).map_err(|e| shape(e.to_string()))?;
+        let bv = ArrayView2::from_shape(bb, &b[i * bb.0 * bb.1..(i + 1) * bb.0 * bb.1]).map_err(|e| shape(e.to_string()))?;
         let mut cv = ArrayViewMut2::from_shape(cb, c).map_err(|e| shape(e.to_string()))?;
+        let av = if ta == Op::T { av.reversed_axes() } else { av };
+        let bv = if tb == Op::T { bv.reversed_axes() } else { bv };
         let rows = cb.0.div_ceil(rayon::current_num_threads()).max(1);
-        cv.axis_chunks_iter_mut(Axis(0), rows).into_par_iter().enumerate().for_each(|(chunk, mut cv)| {
-            let at = chunk * rows;
-            for (t, (av, bv)) in products.iter().enumerate() {
-                let av = av.slice_axis(Axis(0), Slice::from(at..at + cv.nrows()));
-                general_mat_mul(alpha, &av, bv, if t == 0 { beta } else { 1.0 }, &mut cv);
-            }
+        cv.axis_chunks_iter_mut(Axis(0), rows).into_par_iter().zip(av.axis_chunks_iter(Axis(0), rows)).for_each(|(mut cv, av)| {
+            general_mat_mul(alpha, &av, &bv, beta, &mut cv);
             if arithmetic != Arithmetic::F64 {
                 cv.mapv_inplace(|x| f64::from(x as f32));
             }
@@ -3943,29 +3888,72 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
     /// The decoder layer's fused kernels (`decoder.cu`), compiled on first use.
     const KERNELS_DECODER: &str = include_str!("decoder.cu");
 
-    /// The tiled causal attention, forward and reverse (`attention.cu`), compiled on first use per
-    /// head width.
-    const KERNELS_ATTENTION: &str = include_str!("attention.cu");
+    /// The definitions `attention_f32.inc` takes from its backend, in CUDA. Copies into shared
+    /// memory are cp.async's (`COPY_WAIT` waits for all a thread issued).
+    const ATTENTION: &str = r#"
+typedef unsigned int u32;
+typedef unsigned long long u64;
+#define DEVICE __device__ __forceinline__
+#define UNROLL _Pragma("unroll")
+#define GLOBAL
+#define SHARED
+#define CONSTANT const
+#define BARRIER() __syncthreads()
+#define SHUFFLE_XOR(v, m) __shfl_xor_sync(0xffffffffu, (v), (m))
+#define EXP2(x) exp2f(x)
+#define LOG2(x) log2f(x)
+#define FMA(a, b, c) fmaf((a), (b), (c))
+#define FMAX(a, b) fmaxf((a), (b))
+#define NEG_INF (-__int_as_float(0x7f800000))
+#define POS_INF (__int_as_float(0x7f800000))
+struct __align__(16) f4 { float x, y, z, w; };
+__device__ __forceinline__ f4 F4(float a, float b, float c, float d) { f4 v; v.x = a; v.y = b; v.z = c; v.w = d; return v; }
+#define LOAD4(p) (*(const f4*)(p))
+#define STORE4(p, v) (*(f4*)(p) = (v))
+__device__ __forceinline__ void COPY4(float* dst, const float* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"((unsigned int)__cvta_generic_to_shared(dst)), "l"(src) : "memory");
+}
+#define COPY_COMMIT() asm volatile("cp.async.commit_group;" ::: "memory")
+#define COPY_WAIT() asm volatile("cp.async.wait_group 0;" ::: "memory")
+"#;
 
-    /// An attention block of query rows (the forward, the queries' cotangents): its warps (16 rows
-    /// each) and the key rows it takes at a time in the forward and in the reverse. Measured on an
-    /// RTX 4090 at the fit's shapes (attention_speed): 4 warps beat 2 and 8, and 32 keys beat 16
-    /// and 64 in the forward (4 blocks share a multiprocessor), 64 keys beat 32 in the reverse.
-    const ATTENTION_ROWS: (usize, usize, usize) = (4, 32, 64);
+    /// Attention's kernels on CUDA: blockIdx.x + blockIdx.z gridDim.x is the (sequence, head) pair,
+    /// blockIdx.y the tile (the longest sweep first); the tile shapes come from [`ATTENTION_FORWARD`],
+    /// [`ATTENTION_KEYS`] and [`ATTENTION_QUERIES`] as `FORWARD`, `KEYS` and `QUERIES`.
+    const ATTENTION_KERNELS: &str = r#"
+extern "C" __global__ void __launch_bounds__(256) attention_forward(const Sequences sequences, u32 hq, u32 hk, u32 w, float scale_log2, const float* __restrict__ y, float* __restrict__ out, float* __restrict__ lse) {
+    extern __shared__ __align__(16) float smem[];
+    forward_body<HEAD_D, FORWARD>(sequences, hq, hk, w, scale_log2, y, out, lse, blockIdx.z * gridDim.x + blockIdx.x, blockIdx.y, threadIdx.x, blockDim.x, smem);
+}
+extern "C" __global__ void attention_backward_sums(u32 rows, u32 hq, u32 w, const float* __restrict__ out, const float* __restrict__ ga, float* __restrict__ dsum) {
+    sums_body(rows, hq, w, out, ga, dsum, blockIdx.x * blockDim.x + threadIdx.x, gridDim.x * blockDim.x);
+}
+extern "C" __global__ void __launch_bounds__(256) attention_backward_keys(const Sequences sequences, u32 hq, u32 hk, u32 w, float scale, const float* __restrict__ y, const float* __restrict__ lse, const float* __restrict__ ga, const float* __restrict__ dsum, float* __restrict__ gy) {
+    extern __shared__ __align__(16) float smem[];
+    keys_body<HEAD_D, KEYS>(sequences, hq, hk, w, scale, y, lse, ga, dsum, gy, blockIdx.z * gridDim.x + blockIdx.x, blockIdx.y, threadIdx.x, blockDim.x, smem);
+}
+extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(const Sequences sequences, u32 hq, u32 hk, u32 w, float scale, const float* __restrict__ y, const float* __restrict__ lse, const float* __restrict__ ga, const float* __restrict__ dsum, float* __restrict__ gy) {
+    extern __shared__ __align__(16) float smem[];
+    queries_body<HEAD_D, QUERIES>(sequences, hq, hk, w, scale, y, lse, ga, dsum, gy, blockIdx.z * gridDim.x + blockIdx.x, blockIdx.y, threadIdx.x, blockDim.x, smem);
+}
+"#;
 
-    /// An attention block of key rows (the keys' and values' cotangents): its warps (16 keys each)
-    /// and the query rows it takes at a time (8 and 32 beat 4 and 64, and 8 and 16, on the RTX 4090).
-    const ATTENTION_KEYS: (usize, usize) = (8, 32);
+    /// The forward's block on CUDA: query rows, keys at a time, threads, rows per thread (64 rows of
+    /// 32 lanes' row groups, each thread 2 rows × 4 keys of the scores and 2 rows × 16 columns of
+    /// the output: 77 KB of shared memory, one block of 8 warps per multiprocessor on the 4090).
+    const ATTENTION_FORWARD: (usize, usize, usize, usize) = (64, 32, 256, 2);
 
-    /// A Hopper forward block's warpgroups (64 query rows each) and the key rows it takes at a time
-    /// (`attention.cu`'s warpgroup products).
-    const ATTENTION_HOPPER: (usize, usize) = (2, 128);
+    /// The keys' reverse's block: key rows, query rows at a time, threads, keys per thread.
+    const ATTENTION_KEYS: (usize, usize, usize, usize) = (32, 32, 256, 2);
+
+    /// The queries' reverse's block: query rows, keys at a time, threads, rows per thread.
+    const ATTENTION_QUERIES: (usize, usize, usize, usize) = (32, 32, 256, 1);
 
     /// The sequences one attention launch takes (they are passed by value: a kernel's parameters
     /// hold 4 KB).
     const ATTENTION_SEQUENCES: usize = 480;
 
-    /// `attention.cu`'s `Sequences`.
+    /// `attention_f32.inc`'s `Sequences`.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct AttentionSequences {
@@ -4178,7 +4166,6 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             Arithmetic::F32 => Ok((cublasComputeType_t::CUBLAS_COMPUTE_32F, false)),
             Arithmetic::Tf32 => Ok((cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32, false)),
             Arithmetic::Bf16 => Ok((cublasComputeType_t::CUBLAS_COMPUTE_32F, true)),
-            Arithmetic::Tf32x3 | Arithmetic::Bf16x3 => Err(shape(format!("{arithmetic:?} runs as three products of its terms"))),
         }
     }
 
@@ -4604,9 +4591,6 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             if m == 0 || n == 0 {
                 return Ok(());
             }
-            if let Some(unit) = arithmetic.split() {
-                return self.gemm_split(batch, (m, n, k), (alpha, beta), (a, ta), (b, tb), c, unit);
-            }
             let (compute, half) = compute_of(arithmetic, &self.name)?;
             let valid = |t: &Tensor| match &t.data {
                 Data::Cuda32(_) => Ok(()),
@@ -4659,60 +4643,6 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
         /// `t` (f32) as a bfloat16 tensor.
         pub(super) fn bf16_copy(&self, t: &Tensor) -> Result<Tensor, GpuError> {
             Ok(Tensor { rows: t.rows, cols: t.cols, data: Data::CudaBf16(self.round_half(slice32(t)?, 0, t.len())?) })
-        }
-
-        /// A split arithmetic's product (`Arithmetic::split` gives `unit`, its parts' arithmetic):
-        /// each f32 operand as its two terms, the three products summed into `c`, the remainders'
-        /// first. A bfloat16 operand is exact in either unit and has no remainder.
-        fn gemm_split(
-            &self,
-            batch: usize,
-            dims: (usize, usize, usize),
-            (alpha, beta): (f64, f64),
-            (a, ta): (&Tensor, Op),
-            (b, tb): (&Tensor, Op),
-            c: &mut Tensor,
-            unit: Arithmetic,
-        ) -> Result<(), GpuError> {
-            let ((a_first, a_rest), (b_first, b_rest)) = (self.terms(a, unit)?, self.terms(b, unit)?);
-            let (a1, b1) = (a_first.as_ref().unwrap_or(a), b_first.as_ref().unwrap_or(b));
-            let mut scale = beta;
-            if let Some(a2) = &a_rest {
-                self.gemm32(batch, dims, (alpha, scale), (a2, ta), (b1, tb), c, unit)?;
-                scale = 1.0;
-            }
-            if let Some(b2) = &b_rest {
-                self.gemm32(batch, dims, (alpha, scale), (a1, ta), (b2, tb), c, unit)?;
-                scale = 1.0;
-            }
-            self.gemm32(batch, dims, (alpha, scale), (a1, ta), (b1, tb), c, unit)
-        }
-
-        /// An operand's two terms in `unit` (`bf16_split` or `tf32_split`, `decoder.cu`): the first
-        /// (`None` where it is the operand itself) and the remainder (`None` where there is none).
-        /// A bfloat16 operand is its own first term in bfloat16, and widened to f32 in TF32.
-        fn terms(&self, t: &Tensor, unit: Arithmetic) -> Result<(Option<Tensor>, Option<Tensor>), GpuError> {
-            let half = unit == Arithmetic::Bf16;
-            if matches!(t.data, Data::CudaBf16(_)) {
-                return Ok((if half { None } else { Some(self.convert_to(t, Storage::F32)?) }, None));
-            }
-            let n = t.len() as u64;
-            let (mut first, mut rest) = if half {
-                (self.unset16(t.rows, t.cols)?, self.unset16(t.rows, t.cols)?)
-            } else {
-                (self.unset32(t.rows, t.cols)?, self.unset32(t.rows, t.cols)?)
-            };
-            let f = self.decoder(if half { "bf16_split" } else { "tf32_split" })?;
-            let mut builder = self.stream.launch_builder(&f);
-            builder.arg(&n).arg(slice32(t)?);
-            match (&mut first.data, &mut rest.data) {
-                (Data::CudaBf16(h), Data::CudaBf16(l)) => builder.arg(h).arg(l),
-                (Data::Cuda32(h), Data::Cuda32(l)) => builder.arg(h).arg(l),
-                (other, _) => return Err(mismatch(other)),
-            };
-            // SAFETY: three buffers of `n` values.
-            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("decoder operand terms")?;
-            Ok((Some(first), Some(rest)))
         }
 
         /// Decoder kernel `name` (`decoder.cu`), its module compiled on first use.
@@ -4787,9 +4717,8 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             layout: super::HeadLayout,
             norm: Option<(&Tensor, f64)>,
             rotation: Option<(&Tensor, &Tensor, bool)>,
-            bf16: bool,
         ) -> Result<(Tensor, Option<Tensor>), GpuError> {
-            let mut y = if bf16 { self.unset16(p.rows, p.cols)? } else { self.unset32(p.rows, p.cols)? };
+            let mut y = self.unset32(p.rows, p.cols)?;
             let mut rstd = match norm {
                 Some(_) => Some(self.unset32(p.rows, layout.queries + layout.keys)?),
                 None => None,
@@ -4810,11 +4739,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 Some((c, s, _)) => builder.arg(slice32(c)?).arg(slice32(s)?),
                 None => builder.arg(&null).arg(&null),
             };
-            match &mut y.data {
-                Data::CudaBf16(h) => builder.arg(&null).arg(h),
-                Data::Cuda32(s) => builder.arg(s).arg(&null),
-                other => return Err(mismatch(other)),
-            };
+            builder.arg(slice32_mut(&mut y)?);
             match rstd.as_mut() {
                 Some(r) => builder.arg(slice32_mut(r)?),
                 None => builder.arg(&null),
@@ -4859,30 +4784,26 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             Ok(gp)
         }
 
-        /// Attention kernel `name` (`attention.cu`) for heads of `width` columns, its module compiled
-        /// on first use per device and width, allowed `shared` bytes of dynamic shared memory.
+        /// Attention kernel `name` (`attention_f32.inc`) for heads of `width` columns, its module
+        /// compiled on first use per device and width, allowed `shared` bytes of dynamic shared memory.
         fn attention_kernel(&self, width: usize, name: &'static str, shared: usize) -> Result<CudaFunction, GpuError> {
             static MODULES: std::sync::OnceLock<crate::device_cache::KeyedPtxModuleCache<usize>> = std::sync::OnceLock::new();
-            let ((rows_warps, forward_keys, rows_keys), (keys_warps, keys_rows), (groups, hopper_keys)) = (ATTENTION_ROWS, ATTENTION_KEYS, ATTENTION_HOPPER);
+            let tuple = |(a, b, c, d): (usize, usize, usize, usize)| format!("{a}, {b}, {c}, {d}");
             let source = |_| {
                 format!(
-                    "#define HEAD_W {width}\n#define ROWS_WARPS {rows_warps}\n#define FORWARD_KEYS {forward_keys}\n#define ROWS_KEYS {rows_keys}\n#define KEYS_WARPS {keys_warps}\n#define KEYS_ROWS {keys_rows}\n#define HOPPER_GROUPS {groups}\n#define HOPPER_KEYS {hopper_keys}\n#define MAX_SEQUENCES {ATTENTION_SEQUENCES}\n{KERNELS_ATTENTION}"
+                    "#define HEAD_W {width}\n#define HEAD_D {}\n#define FORWARD {}\n#define KEYS {}\n#define QUERIES {}\n#define MAX_SEQUENCES {ATTENTION_SEQUENCES}\n{ATTENTION}{}{ATTENTION_KERNELS}",
+                    attention_width(width).unwrap_or(128),
+                    tuple(ATTENTION_FORWARD),
+                    tuple(ATTENTION_KEYS),
+                    tuple(ATTENTION_QUERIES),
+                    include_str!("attention_f32.inc")
                 )
             };
-            let module = MODULES.get_or_init(crate::device_cache::KeyedPtxModuleCache::new).get_or_compile_specific(&self.ctx, (self.ctx.ordinal() << 16) | width, "attention", source)?;
+            let module = MODULES.get_or_init(crate::device_cache::KeyedPtxModuleCache::new).get_or_compile(&self.ctx, (self.ctx.ordinal() << 16) | width, "attention", source)?;
             let f = module.load_function(name).gpu_ctx_with(|e| format!("attention kernel {name}: {e}"))?;
             let bytes = i32::try_from(shared).map_err(|_| shape(format!("{shared} bytes of shared memory")))?;
             f.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes).gpu_ctx("attention shared memory")?;
             Ok(f)
-        }
-
-        /// Whether the device is a Hopper one (compute capability 9.0), whose attention multiplies
-        /// by warpgroups.
-        fn hopper(&self) -> Result<bool, GpuError> {
-            use cudarc::driver::sys::CUdevice_attribute::{CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR};
-            let major = self.ctx.attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR).gpu_ctx("device capability")?;
-            let minor = self.ctx.attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR).gpu_ctx("device capability")?;
-            Ok((major, minor) == (9, 0))
         }
 
         /// One attention launch over `sequences` (at most [`ATTENTION_SEQUENCES`]) with `heads` heads
@@ -4904,106 +4825,96 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             Ok(Some((table, LaunchConfig { grid_dim, block_dim: (u32_of(threads)?, 1, 1), shared_mem_bytes: u32_of(shared)? })))
         }
 
+        /// An f32 tensor's buffer for a kernel that writes the rows of `sequences`: left unset when they
+        /// cover every row, zeros otherwise.
+        fn attention_output(&self, (rows, cols): (usize, usize), sequences: &[std::ops::Range<usize>]) -> Result<Tensor, GpuError> {
+            if sequences.iter().map(ExactSizeIterator::len).sum::<usize>() == rows {
+                self.unset32(rows, cols)
+            } else {
+                Ok(Tensor { rows, cols, data: Data::Cuda32(self.zeros32(rows * cols)?) })
+            }
+        }
+
         pub(super) fn causal_attention(&self, y: &Tensor, layout: super::HeadLayout, sequences: &[std::ops::Range<usize>], scale: f64) -> Result<(Tensor, Tensor), GpuError> {
-            let Data::CudaBf16(yh) = &y.data else { return Err(mismatch(&y.data)) };
             let (w, padded) = (layout.width, attention_width(layout.width)?);
-            // Hopper multiplies by warpgroups (64 rows each); the others by warps (16 rows each).
-            let ((name, threads, tile), shared) = if self.hopper()? {
-                let (groups, keys) = ATTENTION_HOPPER;
-                (("attention_forward_sm90", 128 * groups, 64 * groups), (64 * groups + 4 * keys) * padded * 2 + 1024)
-            } else {
-                let (warps, keys, _) = ATTENTION_ROWS;
-                (("attention_forward", 32 * warps, 16 * warps), (16 * warps + 2 * keys) * padded * 2)
-            };
-            let f = self.attention_kernel(w, name, shared)?;
-            // Rows outside every sequence are zeros.
-            let covered = sequences.iter().map(ExactSizeIterator::len).sum::<usize>() == y.rows;
-            let (n_out, n_lse) = (y.rows * layout.queries * w, y.rows * layout.queries);
-            // SAFETY: when the sequences cover every row, the kernel writes every value.
-            let (mut out, mut lse) = if covered {
-                unsafe { (self.stream.alloc::<u16>(n_out.max(1)).gpu_ctx("tensor alloc")?, self.stream.alloc::<f32>(n_lse.max(1)).gpu_ctx("tensor alloc")?) }
-            } else {
-                (self.zeros16(n_out)?, self.zeros32(n_lse)?)
-            };
-            let (hq, hk, scale_log2) = (u32_of(layout.queries)?, u32_of(layout.keys)?, (scale * std::f64::consts::LOG2_E) as f32);
+            let (rows, keys, threads, _) = ATTENTION_FORWARD;
+            let shared = ((rows + 2 * keys) * (padded + 4) + rows * (keys + 4)) * 4;
+            let f = self.attention_kernel(w, "attention_forward", shared)?;
+            let mut out = self.attention_output((y.rows, layout.queries * w), sequences)?;
+            let mut lse = self.attention_output((y.rows, layout.queries), sequences)?;
+            let (hq, hk, width, scale_log2) = (u32_of(layout.queries)?, u32_of(layout.keys)?, u32_of(w)?, (scale * std::f64::consts::LOG2_E) as f32);
             let longest = sequences.iter().map(ExactSizeIterator::len).max().unwrap_or(0);
             let group = layout.queries / layout.keys;
             for chunk in sequences.chunks(ATTENTION_SEQUENCES) {
-                let Some((table, cfg)) = self.attention_config(chunk, layout.queries, (threads, tile, shared), (longest * 4 * padded, group))? else { continue };
+                // A chunk of pairs streams its key-value heads' keys and values (f32).
+                let Some((table, cfg)) = self.attention_config(chunk, layout.queries, (threads, rows, shared), (longest * 8 * padded, group))? else { continue };
                 // SAFETY: the table's sequences are disjoint row ranges of y (checked by the caller);
                 // each block writes its own query rows of `out` and `lse`.
-                unsafe { self.stream.launch_builder(&f).arg(&table).arg(&hq).arg(&hk).arg(&scale_log2).arg(yh).arg(&mut out).arg(&mut lse).launch(cfg) }.gpu_ctx("attention forward")?;
+                unsafe { self.stream.launch_builder(&f).arg(&table).arg(&hq).arg(&hk).arg(&width).arg(&scale_log2).arg(slice32(y)?).arg(slice32_mut(&mut out)?).arg(slice32_mut(&mut lse)?).launch(cfg) }
+                    .gpu_ctx("attention forward")?;
             }
-            Ok((Tensor { rows: y.rows, cols: layout.queries * w, data: Data::CudaBf16(out) }, Tensor { rows: y.rows, cols: layout.queries, data: Data::Cuda32(lse) }))
+            Ok((out, lse))
         }
 
         pub(super) fn causal_attention_backward(&self, y: &Tensor, layout: super::HeadLayout, sequences: &[std::ops::Range<usize>], scale: f64, (out, lse): (&Tensor, &Tensor), ga: &Tensor) -> Result<Tensor, GpuError> {
-            let (Data::CudaBf16(yh), Data::CudaBf16(outh)) = (&y.data, &out.data) else { return Err(mismatch(&out.data)) };
             let (w, padded) = (layout.width, attention_width(layout.width)?);
             let (rows, columns) = (y.rows, y.cols);
-            // D = Σ dO·O per row and query head, and dO as the products' bfloat16 operand.
-            let mut ga16 = self.unset16(rows, layout.queries * w)?;
+            let (n, hq, hk, width, scale32) = (u32_of(rows)?, u32_of(layout.queries)?, u32_of(layout.keys)?, u32_of(w)?, scale as f32);
+            // D = Σ dO·O per row and query head.
             let mut dsum = self.unset32(rows, layout.queries)?;
             let sums = self.attention_kernel(w, "attention_backward_sums", 0)?;
-            let (n, hq, hk) = (u32_of(rows)?, u32_of(layout.queries)?, u32_of(layout.keys)?);
             // SAFETY: rows × hq·w outputs and cotangents, rows × hq sums; one warp per (row, head).
-            unsafe {
-                self.stream
-                    .launch_builder(&sums)
-                    .arg(&n)
-                    .arg(&hq)
-                    .arg(outh)
-                    .arg(slice32(ga)?)
-                    .arg(match &mut ga16.data {
-                        Data::CudaBf16(h) => h,
-                        other => return Err(mismatch(other)),
-                    })
-                    .arg(slice32_mut(&mut dsum)?)
-                    .launch(cfg_elements((rows * layout.queries) as u64 * 32))
-            }
-            .gpu_ctx("attention backward sums")?;
-            let Data::CudaBf16(ga16h) = &ga16.data else { return Err(mismatch(&ga16.data)) };
-            let ((rows_warps, _, rows_keys), (keys_warps, keys_rows)) = (ATTENTION_ROWS, ATTENTION_KEYS);
-            let keys_shared = (2 * 16 * keys_warps + 4 * keys_rows) * padded * 2;
-            let rows_shared = (2 * 16 * rows_warps + 4 * rows_keys) * padded * 2;
-            let (keys_kernel, rows_kernel) = (self.attention_kernel(w, "attention_backward_keys", keys_shared)?, self.attention_kernel(w, "attention_backward_queries", rows_shared)?);
-            // The two passes write every row of the sequences; rows outside them keep zeros.
-            let covered: usize = sequences.iter().map(ExactSizeIterator::len).sum();
-            let mut gy = if covered == rows { self.unset32(rows, columns)? } else { Tensor { rows, cols: columns, data: Data::Cuda32(self.zeros32(rows * columns)?) } };
-            let scale32 = scale as f32;
+            unsafe { self.stream.launch_builder(&sums).arg(&n).arg(&hq).arg(&width).arg(slice32(out)?).arg(slice32(ga)?).arg(slice32_mut(&mut dsum)?).launch(cfg_elements((rows * layout.queries) as u64 * 32)) }
+                .gpu_ctx("attention backward sums")?;
+            let ((key_rows, key_queries, key_threads, _), (query_rows, query_keys, query_threads, _)) = (ATTENTION_KEYS, ATTENTION_QUERIES);
+            let keys_shared = ((2 * key_rows + 2 * key_queries) * (padded + 4) + 2 * key_rows * (key_queries + 4) + 2 * key_queries) * 4;
+            let queries_shared = ((2 * query_rows + 2 * query_keys) * (padded + 4) + query_rows * (query_keys + 4)) * 4;
+            let (keys_kernel, queries_kernel) = (self.attention_kernel(w, "attention_backward_keys", keys_shared)?, self.attention_kernel(w, "attention_backward_queries", queries_shared)?);
+            // The two passes write every row of the sequences.
+            let mut gy = self.attention_output((rows, columns), sequences)?;
             let longest = sequences.iter().map(ExactSizeIterator::len).max().unwrap_or(0);
             let group = layout.queries / layout.keys;
             // A key block streams its group's queries and their cotangents; a query block its keys
-            // and values.
+            // and values (f32).
             let passes = [
-                (&keys_kernel, layout.keys, (32 * keys_warps, 16 * keys_warps, keys_shared), (group * longest * 4 * padded, 1), "attention backward keys"),
-                (&rows_kernel, layout.queries, (32 * rows_warps, 16 * rows_warps, rows_shared), (longest * 4 * padded, group), "attention backward queries"),
+                (&keys_kernel, layout.keys, (key_threads, key_rows, keys_shared), (group * longest * 8 * padded, 1), "attention backward keys"),
+                (&queries_kernel, layout.queries, (query_threads, query_rows, queries_shared), (longest * 8 * padded, group), "attention backward queries"),
             ];
             for chunk in sequences.chunks(ATTENTION_SEQUENCES) {
                 for (f, heads, block, streamed, what) in passes {
                     let Some((table, cfg)) = self.attention_config(chunk, heads, block, streamed)? else { continue };
                     // SAFETY: as the forward; the keys' pass writes its key rows' key and value columns,
                     // the queries' pass its query rows' query columns.
-                    unsafe { self.stream.launch_builder(f).arg(&table).arg(&hq).arg(&hk).arg(&scale32).arg(yh).arg(slice32(lse)?).arg(ga16h).arg(slice32(&dsum)?).arg(slice32_mut(&mut gy)?).launch(cfg) }.gpu_ctx(what)?;
+                    unsafe {
+                        self.stream
+                            .launch_builder(f)
+                            .arg(&table)
+                            .arg(&hq)
+                            .arg(&hk)
+                            .arg(&width)
+                            .arg(&scale32)
+                            .arg(slice32(y)?)
+                            .arg(slice32(lse)?)
+                            .arg(slice32(ga)?)
+                            .arg(slice32(&dsum)?)
+                            .arg(slice32_mut(&mut gy)?)
+                            .launch(cfg)
+                    }
+                    .gpu_ctx(what)?;
                 }
             }
             Ok(gy)
         }
 
-        pub(super) fn swiglu(&self, h: &Tensor, bf16: bool) -> Result<Tensor, GpuError> {
+        pub(super) fn swiglu(&self, h: &Tensor) -> Result<Tensor, GpuError> {
             let m = h.cols / 2;
-            let mut a = if bf16 { self.unset16(h.rows, m)? } else { self.unset32(h.rows, m)? };
-            let (rows, width, null) = (h.rows as u64, u32_of(m)?, 0u64);
+            let mut a = self.unset16(h.rows, m)?;
+            let (rows, width) = (h.rows as u64, u32_of(m)?);
             let f = self.decoder("swiglu")?;
-            let mut builder = self.stream.launch_builder(&f);
-            builder.arg(&rows).arg(&width).arg(slice32(h)?);
-            match &mut a.data {
-                Data::CudaBf16(out) => builder.arg(&null).arg(out),
-                Data::Cuda32(out) => builder.arg(out).arg(&null),
-                other => return Err(mismatch(other)),
-            };
+            let Data::CudaBf16(out) = &mut a.data else { return Err(mismatch(&a.data)) };
             // SAFETY: rows × 2m inputs, rows × m outputs.
-            unsafe { builder.launch(cfg_elements(rows * m as u64)) }.gpu_ctx("decoder swiglu")?;
+            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&width).arg(slice32(h)?).arg(out).launch(cfg_elements(rows * m as u64)) }
+                .gpu_ctx("decoder swiglu")?;
             Ok(a)
         }
 
@@ -5020,8 +4931,8 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             Ok(gh)
         }
 
-        pub(super) fn gelu_tanh(&self, h: &Tensor, bias: Option<&Tensor>, bf16: bool) -> Result<Tensor, GpuError> {
-            let mut a = if bf16 { self.unset16(h.rows, h.cols)? } else { self.unset32(h.rows, h.cols)? };
+        pub(super) fn gelu_tanh(&self, h: &Tensor, bias: Option<&Tensor>) -> Result<Tensor, GpuError> {
+            let mut a = self.unset16(h.rows, h.cols)?;
             let (rows, width, null) = (h.rows as u64, u32_of(h.cols)?, 0u64);
             let f = self.decoder("gelu_tanh")?;
             let mut builder = self.stream.launch_builder(&f);
@@ -5030,11 +4941,8 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 Some(b) => builder.arg(slice32(b)?),
                 None => builder.arg(&null),
             };
-            match &mut a.data {
-                Data::CudaBf16(out) => builder.arg(&null).arg(out),
-                Data::Cuda32(out) => builder.arg(out).arg(&null),
-                other => return Err(mismatch(other)),
-            };
+            let Data::CudaBf16(out) = &mut a.data else { return Err(mismatch(&a.data)) };
+            builder.arg(out);
             // SAFETY: rows × m inputs and outputs, m biases.
             unsafe { builder.launch(cfg_elements(h.len() as u64)) }.gpu_ctx("decoder gelu_tanh")?;
             Ok(a)
@@ -6708,6 +6616,8 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device float* v
 
     /// The definitions `attention_f32.inc` takes from its backend, in Metal.
     const ATTENTION: &str = r#"
+#define DEVICE inline
+#define UNROLL _Pragma("unroll")
 #define GLOBAL device
 #define SHARED threadgroup
 #define CONSTANT constant
@@ -7558,13 +7468,12 @@ mod decoder_reference_tests {
             let gp = host.heads_rope_backward(&host_tensor(rows, layout.columns(), p.clone()), layout, Some((&gain_tensor, &k)), Some((&cos, &sin, half)), &host_tensor(rows, layout.columns(), gy.clone())).unwrap();
             agrees("heads", &p, &dir, host_values(&gp), |p| forward(p).0.iter().zip(&gy).map(|(a, b)| a * b).sum());
         }
-        // Attention with exact weights, grouped queries, two sequences of unequal lengths and a row
-        // outside both.
+        // Attention, grouped queries, two sequences of unequal lengths and a row outside both.
         let layout = HeadLayout { queries: 4, keys: 2, width: 3 };
         let (rows, sequences) = (11, [0..4, 5..11]);
         let (y, ga, dir) = (values(rows * layout.columns(), 10), values(rows * 4 * 3, 11), values(rows * layout.columns(), 12));
-        let (_, _, gy) = host_attention_rounded(&y, layout, (rows, &sequences), 0.7, Some(&ga), Arithmetic::F64);
-        let attention = |y: &[f64]| host_attention_rounded(y, layout, (rows, &sequences), 0.7, None, Arithmetic::F64).0.iter().zip(&ga).map(|(a, b)| a * b).sum();
+        let (_, _, gy) = host_attention(&y, layout, (rows, &sequences), 0.7, Some(&ga));
+        let attention = |y: &[f64]| host_attention(y, layout, (rows, &sequences), 0.7, None).0.iter().zip(&ga).map(|(a, b)| a * b).sum();
         agrees("attention", &y, &dir, &gy, attention);
         // The activations.
         for (x, slope) in values(9, 13).iter().map(|x| (3.0 * x, host_gelu_tanh(3.0 * x).1)) {
