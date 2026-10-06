@@ -30,7 +30,7 @@
 
 use super::operator_program::{Node, OperatorBody, OperatorProgram, Rotary};
 use gam_gpu::gpu_error::GpuError;
-use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
+use gam_gpu::tensor::{Arithmetic, Device, Op, Storage, Tensor};
 use std::collections::BTreeSet;
 
 /// The most attention weights a fused group forms at once (sequences × heads × positions²); more
@@ -432,6 +432,13 @@ pub(crate) fn backward(
     backward_by(d, (heads, stacked), (p, gained, g_a), blocks, turn, arithmetic, step(heads, blocks, p.rows() / blocks))
 }
 
+/// `t` as the products of `arithmetic` read it: in bfloat16 an f32 tensor rounded once, which each
+/// product reading it takes as it is (each would otherwise round it again, to the same values);
+/// otherwise `t` itself.
+fn operand(d: &Device, t: Tensor, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
+    if arithmetic == Arithmetic::Bf16 && t.storage() == Storage::F32 { d.bf16_copy(&t) } else { Ok(t) }
+}
+
 /// [`backward`], `step` key heads at a time.
 fn backward_by(
     d: &Device,
@@ -456,13 +463,13 @@ fn backward_by(
         let n = step.min(heads.keys - first);
         let batch = blocks * n;
         let (q, k, v) = split(d, heads, (qk, p), (first, n), blocks, turn)?;
-        let cot = d.split_heads(g_a, first * g * w, n * g, w, blocks, None, false)?;
+        let cot = operand(d, d.split_heads(g_a, first * g * w, n * g, w, blocks, None, false)?, arithmetic)?;
         let alpha = weights(d, heads, (&q, &k), batch, forward)?;
         let mut dalpha = d.empty(alpha.rows(), alpha.cols())?;
         d.gemm_batched(batch, &mut dalpha, 1.0, &cot, Op::N, &v, Op::T, 0.0, arithmetic)?;
         let mut gv = d.empty(v.rows(), w)?;
         d.gemm_batched(batch, &mut gv, 1.0, &alpha, Op::T, &cot, Op::N, 0.0, arithmetic)?;
-        let ds = d.softmax_backward(&alpha, &dalpha)?;
+        let ds = operand(d, d.softmax_backward(&alpha, &dalpha)?, arithmetic)?;
         drop((alpha, dalpha));
         let mut gq = d.empty(q.rows(), w)?;
         d.gemm_batched(batch, &mut gq, heads.scale, &ds, Op::N, &k, Op::N, 0.0, arithmetic)?;
