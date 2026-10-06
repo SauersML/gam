@@ -122,6 +122,7 @@ def convert(run, request):
         "rule": report["rule"],
         "predictor": {"python": report["predictor_python"]},
         "location": location,
+        "key_terms": report.get("key_terms", []),
         "notes": "\n\n".join(f"{k.replace('_', ' ').upper()}: {report[k]}" for k in ("information_used", "mechanism", "predicted_effects")) +
                  f"\n\nEDIT, EXPECTED: {report['edit']['expected']}\n\nFrozen oracle report sha256 {frozen['sha256']}",
     }

@@ -84,6 +84,8 @@ pub enum PatchValue {
     Mean { sequences: Vec<Vec<u32>> },
     /// The value plus `vector`.
     Add { vector: Vec<f64> },
+    /// `vector` itself at every patched row.
+    Set { vector: Vec<f64> },
 }
 
 /// A patch of one site at chosen rows (module note).
@@ -260,6 +262,26 @@ pub enum Request {
         weights: bool,
         #[serde(default)]
         scope: Scope,
+    },
+    /// Single-model localization on option items: per site (scope), the margin of each item's
+    /// choice over its runner-up when the site is set to zero or to its mean over reference
+    /// sequences at every position, and how many items change their choice.
+    SweepOptions {
+        model: String,
+        items: Vec<OptionItem>,
+        #[serde(default)]
+        mean_over: Option<Vec<Vec<u32>>>,
+        #[serde(default)]
+        scope: Scope,
+    },
+    /// A site's mean value at the last token of prompts `a` and of prompts `b`, the unit
+    /// direction of their difference, and each prompt's projection on it (an activation
+    /// statistic, to be tested by patches along the direction).
+    Directions {
+        model: String,
+        sites: Vec<Site>,
+        a: Vec<Vec<u32>>,
+        b: Vec<Vec<u32>>,
     },
     /// Writes `W(α) − W` of every edited operator to `directory/<operator>.f64` (float64,
     /// little-endian, row-major) and lists them with their shapes.
@@ -795,6 +817,7 @@ impl Session {
             PatchValue::Zero => (Local::Zero, rows.iter().map(|_| None).collect()),
             PatchValue::Scale { factor } => (Local::Scale(*factor), rows.iter().map(|_| None).collect()),
             PatchValue::Add { vector } => (Local::Add(Array1::from(vector.clone())), rows.iter().map(|_| None).collect()),
+            PatchValue::Set { vector } => (Local::Fixed, rows.iter().map(|_| Some(Array1::from(vector.clone()))).collect()),
             PatchValue::Mean { sequences: reference } => {
                 let every: Vec<Vec<usize>> = reference.iter().map(|t| (0..t.len()).collect()).collect();
                 let measured = self.measure(model, reference, &every, &Intervention { edits: edits.to_vec(), patches: vec![] }, &[node])?;
@@ -857,6 +880,8 @@ impl Session {
             Request::CrossedOptions { model, pairs, a0, a1 } => self.crossed_options(model, pairs, a0, a1),
             Request::LocalizeOptions { model, reference, items, weights, scope } => self.localize_options(model, reference, items, *weights, scope),
             Request::Delta { model, edits, directory } => self.delta_files(model, edits, directory),
+            Request::SweepOptions { model, items, mean_over, scope } => self.sweep_options(model, items, mean_over.as_deref(), scope),
+            Request::Directions { model, sites, a, b } => self.directions(model, sites, a, b),
             Request::Run(r) => self.run(r),
             Request::Crossed { model, pairs, a0, a1 } => self.crossed(model, pairs, a0, a1),
             Request::Generate { model, tokens, steps, edits, stop } => self.generate(model, tokens, *steps, edits, *stop),
@@ -1339,9 +1364,13 @@ fn summary(v: &[f64]) -> Value {
 
 impl Session {
     /// Per item, each option's summed log-probability after the prompt (module note).
+    /// Per item, each option's summed log-probability after the prompt. A patch's positions
+    /// count within the prompt (negative from the prompt's end), so one patch reaches the same
+    /// prompt token under every option.
     pub fn option_log_probabilities(&mut self, model: &str, items: &[OptionItem], intervention: &Intervention) -> Result<Vec<Vec<f64>>, String> {
         let mut sequences = Vec::new();
         let mut positions = Vec::new();
+        let mut prompts = Vec::new();
         for item in items {
             if item.prompt.is_empty() || item.options.iter().any(Vec::is_empty) {
                 return Err("an option item needs a prompt and nonempty options".into());
@@ -1351,9 +1380,25 @@ impl Session {
                 tokens.extend_from_slice(option);
                 positions.push((item.prompt.len() - 1..tokens.len() - 1).collect::<Vec<_>>());
                 sequences.push(tokens);
+                prompts.push(item.prompt.len());
             }
         }
-        let logits = self.logits_at(model, &sequences, &positions, intervention)?;
+        let mut patches = Vec::new();
+        for patch in &intervention.patches {
+            match &patch.positions {
+                None => patches.push(patch.clone()),
+                Some(list) => {
+                    let chosen: Vec<usize> = patch.sequences.clone().unwrap_or_else(|| (0..sequences.len()).collect());
+                    for s in chosen {
+                        let length = *prompts.get(s).ok_or_else(|| format!("patch of sequence {s} of {}", sequences.len()))?;
+                        let absolute = list.iter().map(|p| resolve(*p, length).map(|q| q as i64)).collect::<Result<Vec<_>, _>>()?;
+                        patches.push(Patch { sequences: Some(vec![s]), positions: Some(absolute), ..patch.clone() });
+                    }
+                }
+            }
+        }
+        let intervention = Intervention { edits: intervention.edits.clone(), patches };
+        let logits = self.logits_at(model, &sequences, &positions, &intervention)?;
         let mut flat = Vec::with_capacity(sequences.len());
         for ((tokens, list), rows) in sequences.iter().zip(&positions).zip(&logits) {
             let mut total = 0.0;
@@ -1491,6 +1536,81 @@ impl Session {
             "differing_items": differing.len(), "items": items.len(), "choices": choices,
             "mean_margin_model_nats": mean(&y_model), "mean_margin_reference_nats": mean(&y_reference), "swaps": rows,
         }))
+    }
+
+    fn sweep_options(&mut self, model: &str, items: &[OptionItem], mean_over: Option<&[Vec<u32>]>, scope: &Scope) -> Result<Value, String> {
+        let clean = self.option_log_probabilities(model, items, &Intervention::default())?;
+        // Each item's choice and runner-up under the model as it is.
+        let ranked: Vec<(usize, usize)> = clean
+            .iter()
+            .map(|lp| {
+                let mut order: Vec<usize> = (0..lp.len()).collect();
+                order.sort_by(|a, b| lp[*b].total_cmp(&lp[*a]));
+                (order[0], *order.get(1).unwrap_or(&order[0]))
+            })
+            .collect();
+        let margin = |lp: &[Vec<f64>]| -> Vec<f64> { lp.iter().zip(&ranked).map(|(l, (c, v))| l[*c] - l[*v]).collect() };
+        let base = margin(&clean);
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+        let sites = self.swap_sites(model, scope)?;
+        // Each site's mean over every position of the reference sequences, from one measurement.
+        let means: Option<Vec<Array1<f64>>> = match mean_over {
+            Some(reference) => {
+                let nodes = sites.iter().map(|site| self.model(model)?.node(site)).collect::<Result<Vec<_>, _>>()?;
+                let every: Vec<Vec<usize>> = reference.iter().map(|t| (0..t.len()).collect()).collect();
+                let measured = self.measure(model, reference, &every, &Intervention::default(), &nodes)?;
+                let count = every.iter().map(Vec::len).sum::<usize>().max(1) as f64;
+                Some(
+                    (0..nodes.len())
+                        .map(|k| {
+                            let rows: Vec<&Array1<f64>> = measured.recorded.iter().flat_map(|r| r[k].iter()).collect();
+                            rows.iter().fold(Array1::zeros(rows.first().map_or(0, |v| v.len())), |acc, v| acc + *v) / count
+                        })
+                        .collect(),
+                )
+            }
+            None => None,
+        };
+        let mut rows = Vec::new();
+        for (k, site) in sites.into_iter().enumerate() {
+            let value = match &means {
+                Some(m) => PatchValue::Set { vector: m[k].to_vec() },
+                None => PatchValue::Zero,
+            };
+            let patch = Patch { site: site.clone(), sequences: None, positions: None, coordinates: None, direction: None, value };
+            let lp = self.option_log_probabilities(model, items, &Intervention { edits: vec![], patches: vec![patch] })?;
+            let after = margin(&lp);
+            let flips: Vec<usize> = lp.iter().zip(&ranked).enumerate().filter(|(_, (l, (c, _)))| argmax(l) != Some(*c)).map(|(i, _)| i).collect();
+            rows.push(json!({"site": format!("{site:?}"), "margin_change_nats": mean(&after) - mean(&base), "flipped_items": flips,
+                "margins": after}));
+        }
+        Ok(json!({"choices": ranked, "margins": base, "sites": rows}))
+    }
+
+    fn directions(&mut self, model: &str, sites: &[Site], a: &[Vec<u32>], b: &[Vec<u32>]) -> Result<Value, String> {
+        if a.is_empty() || b.is_empty() {
+            return Err("two nonempty groups of prompts".into());
+        }
+        let nodes = sites.iter().map(|site| self.model(model)?.node(site)).collect::<Result<Vec<_>, _>>()?;
+        let group = |session: &mut Session, prompts: &[Vec<u32>]| -> Result<Vec<Vec<Array1<f64>>>, String> {
+            let last: Vec<Vec<usize>> = prompts.iter().map(|p| resolve(-1, p.len()).map(|q| vec![q])).collect::<Result<_, _>>()?;
+            let measured = session.measure(model, prompts, &last, &Intervention::default(), &nodes)?;
+            // Per site, each prompt's value at its last token.
+            Ok((0..nodes.len()).map(|k| measured.recorded.iter().map(|r| r[k][0].clone()).collect()).collect())
+        };
+        let (va, vb) = (group(self, a)?, group(self, b)?);
+        let mut out = Vec::new();
+        for (k, site) in sites.iter().enumerate() {
+            let average = |v: &[Array1<f64>]| v.iter().fold(Array1::<f64>::zeros(v[0].len()), |acc, x| acc + x) / v.len() as f64;
+            let difference = average(&va[k]) - average(&vb[k]);
+            let norm = difference.dot(&difference).sqrt();
+            let direction = if norm > 0.0 { &difference / norm } else { difference.clone() };
+            let project = |v: &[Array1<f64>]| v.iter().map(|x| x.dot(&direction)).collect::<Vec<_>>();
+            let typical = va[k].iter().chain(&vb[k]).map(|x| x.dot(x).sqrt()).sum::<f64>() / (va[k].len() + vb[k].len()) as f64;
+            out.push(json!({"site": format!("{site:?}"), "difference_norm": norm, "typical_norm": typical,
+                "projections_a": project(&va[k]), "projections_b": project(&vb[k]), "direction": direction.to_vec()}));
+        }
+        Ok(json!({"sites": out}))
     }
 
     fn delta_files(&mut self, model: &str, edits: &[Edit], directory: &str) -> Result<Value, String> {

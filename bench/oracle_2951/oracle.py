@@ -34,6 +34,9 @@ Edit (native parameter edit W(alpha) = W + (alpha - 1) P, alpha = 1 is the model
   Operator names: blocks.L.qH, blocks.L.kG, blocks.L.vG, blocks.L.oH, blocks.L.c_fc, blocks.L.gate_proj
   (gated MLPs), blocks.L.down_proj. q/k/v rows read the normed residual; o and down_proj write it.
 
+Saved directions (oracle directions --save NAME) are used as "direction": "@NAME_0" in patches and edits.
+In chat-item commands, patch positions count within the prompt (negative from the prompt's end).
+
 Patch (activation patching at a site):
   {"site": S, "value": V, "positions": [-1], "sequences": [0], "coordinates": [..] | "direction": [..]}
     S: {"kind": "stream"|"middle"|"attention"|"mlp"|"neurons", "layer": l} or {"kind": "head", "layer": l, "head": h}
@@ -42,7 +45,7 @@ Patch (activation patching at a site):
     V: {"kind": "source", "text": "...", "model": "base", "positions": [..]}  value from another run
          (default: the same model under the same edits on the same sequence; "model" alone = other model, same text)
        {"kind": "zero"} | {"kind": "scale", "factor": f} | {"kind": "mean", "sequences": [{"text": ...}, ...]}
-       | {"kind": "add", "vector": [...]}
+       | {"kind": "add", "vector": [...]} | {"kind": "set", "vector": [...]}
     positions: default every position; negative counts from the end.
 """
 
@@ -124,7 +127,9 @@ class Session:
         if isinstance(obj, dict):
             out = {}
             for k, v in obj.items():
-                if k == "text":
+                if k in ("direction", "vector") and isinstance(v, str) and v.startswith("@"):
+                    out[k] = self.load_vector(v[1:])
+                elif k == "text":
                     out["tokens"] = self.encode(v)
                 elif k == "sequences" and isinstance(v, list) and v and isinstance(v[0], (str, dict)):
                     out[k] = [self.encode(x) if isinstance(x, str) else self.tokens_in(x)["tokens"] for x in v]
@@ -132,6 +137,23 @@ class Session:
                     out[k] = self.tokens_in(v)
             return out
         return obj
+
+    def vector_path(self, name):
+        if not name.replace("_", "").replace("-", "").isalnum():
+            raise SystemExit(f"a vector name is letters, digits, - and _: {name!r}")
+        d = os.path.join(os.path.dirname(os.path.abspath(os.environ.get("ORACLE_SESSION", "."))), "vectors")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, name + ".json")
+
+    def save_vector(self, name, vector):
+        json.dump(vector, open(self.vector_path(name), "w"))
+
+    def load_vector(self, name):
+        return json.load(open(self.vector_path(name)))
+
+    def prompts(self, texts):
+        """User messages as chat prompts when the models have a chat template, else plain texts."""
+        return [self.chat(t) if self.template is not None else self.encode(t) for t in texts]
 
     def corpus(self, start, count, context):
         path = self.config["corpus"]
@@ -383,6 +405,36 @@ def cmd_localize_options(sess, a):
               f"{a.model} loses {r['model_loses_nats']:+.3f} ({r['model_flips']} flips)")
 
 
+def cmd_sweep_options(sess, a):
+    items = parse_json(a.items)
+    payload = {"op": "sweep_options", "model": a.model, "items": [sess.option_item(it) for it in items],
+               "scope": {"heads": a.heads, "layers": [int(x) for x in a.layers.split(",")] if a.layers else None}}
+    if a.mean_rows:
+        payload["mean_over"] = sess.corpus(a.mean_start, a.mean_rows, 128)
+    out = sess.request(payload)
+    print("choices (option index, runner-up) per item: " + ", ".join(f"{i}:{c}>{v}" for i, (c, v) in enumerate(out["choices"])))
+    print(f"clean margins (nats): {', '.join(f'{m:.2f}' for m in out['margins'])}")
+    what = "set to its mean over corpus text" if a.mean_rows else "set to zero"
+    print(f"each site {what} at every position; mean margin change and the items whose choice changes:")
+    rows = sorted(out["sites"], key=lambda r: r["margin_change_nats"])
+    for r in rows[: a.rows]:
+        print(f"  {r['site']}: margin {r['margin_change_nats']:+.2f} nats, choice changes on items {r['flipped_items']}")
+
+
+def cmd_directions(sess, a):
+    sites = parse_json(a.sites)
+    out = sess.request({"op": "directions", "model": a.model, "sites": sites, "a": sess.prompts(parse_json(a.a)), "b": sess.prompts(parse_json(a.b))})
+    for k, r in enumerate(out["sites"]):
+        pa, pb = np.array(r["projections_a"]), np.array(r["projections_b"])
+        line = (f"{r['site']}: |mean(a) - mean(b)| {r['difference_norm']:.3f} (typical value norm {r['typical_norm']:.3f}); "
+                f"projections a {pa.mean():+.3f} +- {pa.std():.3f}, b {pb.mean():+.3f} +- {pb.std():.3f}")
+        if a.save:
+            name = f"{a.save}_{k}"
+            sess.save_vector(name, r["direction"])
+            line += f"; direction saved as @{name}"
+        print(line)
+
+
 def cmd_unembed(sess, a):
     payload = {"op": "unembed", "model": a.model, "top": a.top}
     if a.vector:
@@ -472,6 +524,14 @@ def main(argv=None):
     s.add_argument("--rows", type=int, default=20)
     s.add_argument("--heads", action="store_true", help="also each head (slow: one run per head)"); s.add_argument("--layers", help="comma list of layers")
     s.set_defaults(f=cmd_localize_options)
+    s = sub.add_parser("sweep-options", help="single model: each layer's attention/MLP (or head) ablated, effect on chat-item choices")
+    s.add_argument("model"); s.add_argument("--items", required=True); s.add_argument("--heads", action="store_true"); s.add_argument("--layers")
+    s.add_argument("--mean-rows", type=int, default=0, help="ablate to the mean over this many corpus rows (default: zero)")
+    s.add_argument("--mean-start", type=int, default=0); s.add_argument("--rows", type=int, default=20); s.set_defaults(f=cmd_sweep_options)
+    s = sub.add_parser("directions", help="mean difference of sites' values at the prompt's last token between two prompt groups")
+    s.add_argument("model"); s.add_argument("--sites", required=True, help='JSON list of sites'); s.add_argument("--a", required=True, help="JSON list of texts")
+    s.add_argument("--b", required=True); s.add_argument("--save", help="save each site's unit direction as @NAME_k for patches and edits")
+    s.set_defaults(f=cmd_directions)
     s = sub.add_parser("raw", help="send one request in the server's JSON"); s.add_argument("request"); s.set_defaults(f=cmd_raw)
     a = p.parse_args(argv)
     sess = None if a.cmd == "help-interventions" else Session()
