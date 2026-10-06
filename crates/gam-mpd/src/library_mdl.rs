@@ -1320,7 +1320,8 @@ pub struct Settings {
     /// token of those tokens. A draw's squared factor `u ⊙ u` has a relative standard deviation
     /// near √2 per entry however many tokens `u` sums (each entry of `u` is a sum of independent
     /// zero-mean terms, close to normal), so half the tokens give an estimate of about the same
-    /// precision, for half the factor pass. The A/B's outcome deletes this field.
+    /// precision, for half the factor pass; the step scales it by the step's scored tokens over
+    /// the factor's. The A/B's outcome deletes this field.
     #[serde(default)]
     pub half_factor: bool,
     /// The one-sample arm: a training step scores all its experiments at the one weight sample of
@@ -3036,7 +3037,10 @@ pub fn fit_from(
             datas.push(data);
             priors.push(prior_nats);
             progress.step += 1;
-            device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, weight), &ivon)?;
+            // The factor's scale: its square estimates the curvature per token of the tokens it
+            // sums (all the step's but with `Settings::half_factor`).
+            let factor_weight = weight * scored as f64 / factor.tokens as f64;
+            device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &ivon)?;
             if let Some(trial) = device_posterior.line_trial() {
                 // The line step's measurement: the batch's data term at the step's draws around the
                 // iterate where the step started and moved by the trial step, both at the
