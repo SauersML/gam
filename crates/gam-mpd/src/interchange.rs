@@ -394,7 +394,7 @@ impl FixedHead {
             return Err(error("positive head tile rows required"));
         }
         let resident = ResidentHead::new(device, &head, tile_rows)?;
-        let width = device.column_blocks(&[head.embedding.ncols()]).map_err(error)?;
+        let width = device.column_blocks(&[head.embedding().ncols()]).map_err(error)?;
         Ok(Self { head: Arc::new(head), resident, width })
     }
 

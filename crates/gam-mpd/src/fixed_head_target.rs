@@ -5,10 +5,10 @@
 //! projection/reduction ordering and cancellation in logZ-mu.h+c can change rounding.
 use crate::{
     device_program::DeviceProgram,
-    operator_program::{FamilyInputs, Node, OperatorBody, OperatorProgram},
+    operator_program::{FamilyInputs, Node, Operator, OperatorBody, OperatorProgram},
 };
 use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, Storage, Tensor};
-use ndarray::Array2;
+use ndarray::{Array2, ArrayView2};
 use std::sync::{Arc, Mutex};
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -16,7 +16,14 @@ fn error(e: impl std::fmt::Display) -> String {
 
 pub(crate) struct Head {
     pub hidden: usize,
-    pub embedding: Array2<f64>, // classes x hidden
+    table: Table,
+}
+
+/// A head's table, classes × hidden: the operator it was read from (read transposed where the
+/// head is the tied embedding), shared with the program rather than copied.
+struct Table {
+    operator: Arc<Operator>,
+    transposed: bool,
 }
 impl Head {
     pub fn of(source: &OperatorProgram) -> Result<Self, String> {
@@ -60,19 +67,23 @@ impl Head {
                 "fixed head requires a final contiguous hidden/head/readout boundary".into(),
             );
         }
-        let embedding = if transposed {
-            values.t().to_owned()
-        } else {
-            values.clone()
-        };
-        Ok(Self { hidden, embedding })
+        Ok(Self { hidden, table: Table { operator: Arc::clone(op), transposed } })
+    }
+    /// The head's table, classes × hidden.
+    pub fn embedding(&self) -> ArrayView2<'_, f64> {
+        match &self.table.operator.body {
+            OperatorBody::Dense { values, .. } if self.table.transposed => values.t(),
+            OperatorBody::Dense { values, .. } => values.view(),
+            // `Head::of` reads dense heads alone.
+            _ => ArrayView2::from(&[] as &[[f64; 0]]),
+        }
     }
     pub fn same(&self, other: &Self) -> bool {
-        self.embedding.dim() == other.embedding.dim()
+        self.embedding().dim() == other.embedding().dim()
             && self
-                .embedding
+                .embedding()
                 .iter()
-                .zip(other.embedding.iter())
+                .zip(other.embedding().iter())
                 .all(|(a, b)| a.to_bits() == b.to_bits())
     }
     pub fn prefix(&self, source: &OperatorProgram) -> OperatorProgram {
@@ -166,14 +177,14 @@ impl Teacher {
             prefix.set_arithmetic(Arithmetic::F32);
         }
         if head
-            .embedding
+            .embedding()
             .len()
             .checked_mul(8)
             .is_none_or(|n| n > numeric_bytes)
         {
             return Err("fixed head exceeds teacher numeric budget".into());
         }
-        let embedding = device.upload(head.embedding.view()).map_err(error)?;
+        let embedding = device.upload(head.embedding()).map_err(error)?;
         Ok(Self {
             device: device.clone(),
             prefix,
@@ -196,14 +207,14 @@ impl Teacher {
             return Err("invalid compact teacher row domain".into());
         }
         let rows = inputs.rows;
-        let width = self.head.embedding.ncols();
-        let classes = self.head.embedding.nrows();
+        let width = self.head.embedding().ncols();
+        let classes = self.head.embedding().nrows();
         let planned = self
             .prefix
             .operator_numeric_bytes()?
             .checked_add(
                 self.head
-                    .embedding
+                    .embedding()
                     .len()
                     .checked_mul(8)
                     .ok_or("head bytes overflow")?,
@@ -396,13 +407,13 @@ pub(crate) struct ResidentHead {
 impl ResidentHead {
     pub fn new(d: &Device, head: &Head, tile_rows: usize) -> Result<Self, String> {
         Ok(Self {
-            embedding: d.upload(head.embedding.view()).map_err(error)?,
+            embedding: d.upload(head.embedding()).map_err(error)?,
             ones: d
-                .upload(Array2::ones((head.embedding.ncols(), 1)).view())
+                .upload(Array2::ones((head.embedding().ncols(), 1)).view())
                 .map_err(error)?,
             tile_rows,
             width: d
-                .column_blocks(&[head.embedding.ncols()])
+                .column_blocks(&[head.embedding().ncols()])
                 .map_err(error)?,
         })
     }
@@ -604,23 +615,26 @@ impl ResidentHead {
 mod tests {
     use super::*;
     
+    /// A head over node `hidden` whose table, classes × hidden, is `values`.
+    fn head(hidden: usize, values: Array2<f64>) -> Head {
+        let (classes, width) = values.dim();
+        let precision = crate::operator_program::exact_precision(values.iter().copied()).expect("a finite table");
+        let (rows, cols) = (crate::operator_program::Interface::native(classes).expect("rows"), crate::operator_program::Interface::native(width).expect("columns"));
+        let operator = Operator::dense("head", rows, cols, values, precision, crate::operator_program::Provenance::native("head")).expect("a dense head");
+        Head { hidden, table: Table { operator: Arc::new(operator), transposed: false } }
+    }
+
     #[test]
     fn target_head_sharing_preserves_labels_and_rejects_incompatible_head() {
         let device = Device::host();
         let first = Target {
             mu: Arc::new(device.zeros(2, 2).expect("mu")),
             entropy: vec![0., 0.],
-            head: Arc::new(Head {
-                hidden: 0,
-                embedding: Array2::eye(2),
-            }),
+            head: Arc::new(head(0, Array2::eye(2))),
             scored: None,
         };
         let independent = Target {
-            head: Arc::new(Head {
-                hidden: 4,
-                embedding: Array2::eye(2),
-            }),
+            head: Arc::new(head(4, Array2::eye(2))),
             ..first.clone()
         };
         assert!(!Arc::ptr_eq(&first.head, &independent.head));
@@ -631,10 +645,7 @@ mod tests {
         assert!(Arc::ptr_eq(&independent.mu, &shared.mu));
         assert_eq!(shared.entropy, independent.entropy);
         let incompatible = Target {
-            head: Arc::new(Head {
-                hidden: 0,
-                embedding: Array2::zeros((2, 2)),
-            }),
+            head: Arc::new(head(0, Array2::zeros((2, 2)))),
             ..first.clone()
         };
         assert!(incompatible.with_shared_head(&first).is_err());

@@ -2070,7 +2070,7 @@ fn extremes(scores: &Array1<f64>, top: usize) -> (Vec<Scored>, Vec<Scored>) {
 /// the split native program and `layers` its sites (`run_check::layer_nodes`).
 pub fn describe(native: &OperatorProgram, layers: &[crate::run_check::LayerNodes], explanation: &Explanation, calls: &[Call], top: usize) -> Result<Vec<CallReading>, String> {
     let head = crate::resident_causal_fit::fixed_head_target::Head::of(native)?;
-    let unembedding = &head.embedding;
+    let unembedding = head.embedding();
     let (final_gain, _) = norm_of(native, head.hidden)?;
     let feature = native.nodes.iter().position(|n| matches!(n, Node::Feature { .. })).ok_or("no token feature")?;
     let embedding = native

@@ -619,7 +619,7 @@ impl<'a> Library<'a> {
         let layer_heads = (0..layers.len()).map(|l| (0..heads.len()).filter(|h| heads[*h].layer == l).collect()).collect();
         let head = Head::of(native)?;
         let resident = ResidentHead::new(model, &head, tile_rows)?;
-        let Head { hidden, embedding: mut unembedding, .. } = head;
+        let (hidden, mut unembedding) = (head.hidden, head.embedding().to_owned());
         let final_site = site(native, hidden)?;
         unembedding.axis_iter_mut(Axis(0)).for_each(|mut row| row *= &final_site.gain);
         let unembedding_mean = unembedding.mean_axis(Axis(0)).ok_or("an empty vocabulary")?;

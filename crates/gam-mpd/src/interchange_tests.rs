@@ -159,7 +159,7 @@ fn native(f: &Fixture, tokens: &[u32], patch: Option<HostPatch<'_>>) -> (Array2<
 
 /// Per row `KL(softmax(E a) ‖ softmax(E b))` in bits.
 fn kl_bits(head: &Head, a: &Array2<f64>, b: &Array2<f64>) -> Vec<f64> {
-    let (za, zb) = (a.dot(&head.embedding.t()), b.dot(&head.embedding.t()));
+    let (za, zb) = (a.dot(&head.embedding().t()), b.dot(&head.embedding().t()));
     za.outer_iter()
         .zip(zb.outer_iter())
         .map(|(ra, rb)| categorical_kl_from_logits(&ra.to_vec(), &rb.to_vec()).expect("finite logits") / std::f64::consts::LN_2)
