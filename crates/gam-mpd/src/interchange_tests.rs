@@ -699,7 +699,8 @@ fn m_runs_the_same_whatever_explanation_it_is_compared_with() {
 
 /// Operations on shared sites ([`Patch::Ops`], [`Interchange::sample_ops`]) on the scoped starting
 /// library of the tiny Qwen3 export (its MLPs P's, an exact copy of M's; its attention M's): every
-/// family (swap from a donor, zeroing, scaling, pushing a direction) at one row, onward and at
+/// family (swap from a donor, zeroing, scaling, pushing a direction, cutting a connection, a gated
+/// neuron's and a rank-one slice's weight edit) at one row, onward and at
 /// every row, with one to many operations, scores zero against M with and without the reverse
 /// pass, the draws reach several operations at once, and with P applying no edit most experiments
 /// move M.
@@ -723,10 +724,11 @@ fn operations_on_shared_sites_are_the_same_on_both_models() {
     let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
     x.set_directions(8, 1);
     x.measure_typical(&batch).expect("the typical norms");
-    let families = [Family::Swap, Family::Zero, Family::Scale, Family::Push, Family::Cut];
-    let experiments = x.sample_ops(&mut rand::rngs::StdRng::seed_from_u64(3), &batch, &families, 12, &[1, 2, 0], false).expect("the draw");
+    x.set_weight_edits(crate::vpd_parts::mlps_of(&native, &blocks).expect("M's MLPs"), 4, 2).expect("the weight edits");
+    let families = [Family::Swap, Family::Zero, Family::Scale, Family::Push, Family::Cut, Family::Neuron, Family::RankOne];
+    let experiments = x.sample_ops(&mut rand::rngs::StdRng::seed_from_u64(3), &batch, &families, 24, &[1, 2, 0], false).expect("the draw");
     let counts = census(&experiments, x.variables());
-    assert!(families.iter().all(|f| counts[format!("{f:?}").to_lowercase().as_str()] > 0), "{counts:?}");
+    assert!(families.iter().all(|f| counts[serde_json::to_value(f).expect("a family's name").as_str().expect("a name")] > 0), "{counts:?}");
     assert!(experiments.iter().any(|e| matches!(&e.patch, Some(Patch::Ops { ops, .. }) if ops.len() > 2)), "several operations at once");
     for gradient in [false, true] {
         let bits = x.evaluate(&batch, &experiments, gradient).expect("evaluate").bits;

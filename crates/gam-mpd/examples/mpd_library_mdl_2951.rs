@@ -369,6 +369,16 @@ fn edit_faithfulness(
     };
     let slice_of: BTreeMap<(usize, bool, usize), usize> = slices.iter().enumerate().map(|(i, s)| ((s.part.layer, s.part.map == vpd_parts::Map::Down, s.part.index), i)).collect();
     experiments.set_fixed_parts(slices.clone())?;
+    // Weight edits of M's MLPs, the same for every explanation: seeded neurons and rank-one slices,
+    // and VPD's subcomponents (when given) as one more source of rank-one slices.
+    let weights = |x: &mut interchange::Interchange| -> Result<(), String> {
+        if settings.families.iter().any(|f| matches!(f, interchange::Family::Neuron | interchange::Family::RankOne)) {
+            x.set_weight_edits(vpd_parts::mlps_of(native, layers)?, interchange::WEIGHT_EDITS, settings.seed)?;
+            x.add_weight_edits(interchange::Family::RankOne, slices.clone())?;
+        }
+        Ok(())
+    };
+    weights(&mut experiments)?;
     log::info!("edits: {count} parts, {} held-out sequences, {:.0} s to compile", end - first, started.elapsed().as_secs_f64());
     let mut rng = rand::rngs::StdRng::seed_from_u64(settings.seed);
     // Operations on shared sites push seeded directions at each site's typical norm, measured on
@@ -384,8 +394,9 @@ fn edit_faithfulness(
         Some(interchange::Patch::Ops { family: interchange::Family::Scale, .. }) => "scale",
         Some(interchange::Patch::Ops { family: interchange::Family::Push, .. }) => "push",
         Some(interchange::Patch::Ops { family: interchange::Family::Cut, .. }) => "cut",
-        Some(interchange::Patch::FixedPart { factor: 0, .. }) => "remove_subcomponent",
-        Some(interchange::Patch::FixedPart { .. }) => "amplify_subcomponent",
+        Some(interchange::Patch::FixedPart { .. }) => "rank_one",
+        Some(interchange::Patch::Ops { family: interchange::Family::Neuron, .. }) => "neuron",
+        Some(interchange::Patch::Ops { family: interchange::Family::RankOne, .. }) => "rank_one",
         Some(_) => "read",
     };
     // Per family: every scored token's bits, the edited tokens' bits, and the experiments.
@@ -415,6 +426,7 @@ fn edit_faithfulness(
     drop(experiments);
     let mut reference = interchange::Interchange::new(device, native, layers, &gam_mpd::artifact::Artifact::native(native)?, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     reference.set_fixed_parts(slices.clone())?;
+    weights(&mut reference)?;
     reference.set_directions(interchange::DIRECTIONS, settings.seed);
     reference.measure_typical(&typical_batch)?;
     reference.unedited_explanation();

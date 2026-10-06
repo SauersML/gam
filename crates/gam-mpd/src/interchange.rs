@@ -374,6 +374,10 @@ pub enum Operation {
     /// `N(s + o(x′) − o(x))` at the row (`s` the stream entering it, `N` its input norm, recomputed),
     /// and nothing else changes.
     Cut { to: usize },
+    /// A weight edit of `M`'s MLP at the site (an MLP's output): fixed part `part`
+    /// ([`Interchange::set_weight_edits`], a neuron or a rank-one slice of `M`'s MLP) scaled by
+    /// `FACTORS[factor]`, its change a function of each model's own read added at the row.
+    Slice { part: usize, factor: usize },
 }
 
 /// The factors a scale operation multiplies its site's value by.
@@ -381,6 +385,10 @@ pub const SCALES: [f64; 4] = [0.0, 0.5, 2.0, 3.0];
 
 /// The seeded unit directions a push draws from ([`Interchange::set_directions`]).
 pub const DIRECTIONS: usize = 64;
+
+/// The neurons and the random rank-one slices per layer the weight-edit families draw from
+/// ([`Interchange::set_weight_edits`]).
+pub const WEIGHT_EDITS: usize = 64;
 
 /// The sizes of a pushed direction, in units of its site's typical norm.
 pub const SIZES: [f64; 3] = [0.5, 1.0, 2.0];
@@ -457,7 +465,7 @@ pub fn parts_of(program: &OperatorProgram, layers: usize) -> Result<Vec<Part>, S
 
 /// The families of patched experiments: a read patch, single or joint ([`sample`]), and
 /// operations on shared sites ([`Interchange::sample_ops`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Family {
     Read,
@@ -468,6 +476,10 @@ pub enum Family {
     Scale,
     Push,
     Cut,
+    /// Weight edits of `M`'s MLPs ([`Interchange::set_weight_edits`]): a neuron removed or scaled,
+    /// or a rank-one slice of an MLP map (seeded random slices, VPD's subcomponents) scaled.
+    Neuron,
+    RankOne,
 }
 
 /// Where a model applies edits of parts: per block, for an MLP block, the node its parts read
@@ -629,6 +641,11 @@ impl Experiment {
     }
 }
 
+/// The SplitMix64 of `seed` and `index` together: one seed per stream.
+fn splitmix(seed: u64, index: u64) -> u64 {
+    gam_linalg::utils::splitmix64_hash(gam_linalg::utils::splitmix64_hash(seed) ^ index)
+}
+
 /// A hybrid of `blocks` blocks: its size `k` uniform in `1..=blocks`, then a uniform set of `k`
 /// blocks running `P` (module note).
 pub fn hybrid(rng: &mut impl RngExt, blocks: usize) -> Vec<bool> {
@@ -706,7 +723,7 @@ pub fn subset(rng: &mut impl RngExt, candidates: &[usize]) -> Vec<usize> {
 /// The realized count of each family among `experiments`: clean with `P` alone, clean under a
 /// hybrid, single read patches of attention and of MLP variables, and joint read patches.
 pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMap<&'static str, usize> {
-    let mut counts: BTreeMap<&'static str, usize> = ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint", "remove_subcomponent", "amplify_subcomponent", "swap", "zero", "scale", "push", "cut"].into_iter().map(|k| (k, 0)).collect();
+    let mut counts: BTreeMap<&'static str, usize> = ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint", "remove_subcomponent", "amplify_subcomponent", "swap", "zero", "scale", "push", "cut", "neuron", "rank_one"].into_iter().map(|k| (k, 0)).collect();
     for e in experiments {
         let family = match &e.patch {
             None if e.explained.iter().all(|x| *x) => "clean_alone",
@@ -719,6 +736,8 @@ pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMa
             Some(Patch::Ops { family: Family::Scale, .. }) => "scale",
             Some(Patch::Ops { family: Family::Push, .. }) => "push",
             Some(Patch::Ops { family: Family::Cut, .. }) => "cut",
+            Some(Patch::Ops { family: Family::Neuron, .. }) => "neuron",
+            Some(Patch::Ops { family: Family::RankOne, .. }) => "rank_one",
             Some(Patch::Ops { .. }) => "ops",
             Some(Patch::FixedPart { factor: 0, .. }) => "remove_subcomponent",
             Some(Patch::FixedPart { .. }) => "amplify_subcomponent",
@@ -1105,6 +1124,14 @@ impl Edits {
                             entry.1.push(unit.iter().map(|u| size * norm * u).collect());
                         }
                         Operation::Cut { .. } => return Err(error("a cut without its probes")),
+                        Operation::Slice { part, factor } => {
+                            let slice = sites.fixed.get(*part).ok_or_else(|| error("an edit of an unknown fixed part"))?;
+                            let (read, out) = sites.nodes.get(slice.block()).copied().flatten().ok_or_else(|| error(format!("block {}: no part sites", slice.block())))?;
+                            let alpha = *FACTORS.get(*factor).ok_or_else(|| error("an edit's factor outside FACTORS"))?;
+                            let entry = fixed.entry(out).or_insert_with(|| FixedWrites { read, rows: Vec::new(), edits: Vec::new(), inputs: RefCell::new(None), carried: RefCell::new(None) });
+                            entry.rows.push(*row);
+                            entry.edits.push((slice.clone(), alpha));
+                        }
                     }
                 }
                 Edit::Op { .. } => return Err(error("an operation without its call's rows")),
@@ -2652,6 +2679,8 @@ pub struct Interchange {
     trainable: Vec<usize>,
     /// `M`'s targets kept on the host ([`Interchange::keep_targets`]); none until asked for.
     kept: RefCell<Option<TargetStore>>,
+    /// Per weight-edit family its fixed parts ([`Interchange::set_weight_edits`]).
+    weight_edits: BTreeMap<Family, Vec<usize>>,
 }
 
 impl Interchange {
@@ -2700,7 +2729,7 @@ impl Interchange {
             sites.parts.head_blocks.clone_from(&head_blocks);
         }
         let (m_sites, p_sites) = (Arc::new(m_sites), Arc::new(p_sites));
-        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), kept: RefCell::new(None) })
+        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), kept: RefCell::new(None), weight_edits: BTreeMap::new() })
     }
 
     /// The fixed parts that edits of fixed parts act on ([`Patch::FixedPart`]: VPD's MLP
@@ -2725,6 +2754,40 @@ impl Interchange {
             next.parts.fixed = Arc::clone(&fixed);
             *sites = Arc::new(next);
         }
+        Ok(())
+    }
+
+    /// The weight edits the `neuron` and `rank_one` families draw from, added to the fixed parts:
+    /// per layer of `M`'s MLPs `mlps` (`vpd_parts::mlps_of`), `per_layer` of its neurons (distinct,
+    /// uniform, `vpd_parts::neuron_slices`) and `per_layer` seeded random rank-one slices, half of
+    /// the gate's (or read map's), half of the down map's (`vpd_parts::random_slices_of`), all
+    /// drawn from `seed`: the same for every explanation.
+    pub fn set_weight_edits(&mut self, mlps: Vec<crate::vpd_parts::Mlp>, per_layer: usize, seed: u64) -> Result<(), String> {
+        use crate::vpd_parts::{Map, neuron_slices, random_slices_of};
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed);
+        let (mut neurons, mut slices) = (Vec::new(), Vec::new());
+        for (layer, mlp) in mlps.into_iter().enumerate() {
+            let mlp = Arc::new(mlp);
+            let all = neuron_slices(&mlp, layer);
+            let chosen = hybrid_of(&mut rng, all.len(), per_layer);
+            neurons.extend(all.into_iter().zip(chosen).filter(|(_, c)| *c).map(|(s, _)| s));
+            let half = per_layer / 2;
+            slices.extend(random_slices_of(&mlp, layer, Map::Up, half, splitmix(seed, 2 * layer as u64)));
+            slices.extend(random_slices_of(&mlp, layer, Map::Down, per_layer - half, splitmix(seed, 2 * layer as u64 + 1)));
+        }
+        self.add_weight_edits(Family::Neuron, neurons)?;
+        self.add_weight_edits(Family::RankOne, slices)
+    }
+
+    /// `slices` added to the fixed parts as weight edits of `family` (`neuron` or `rank_one`): a
+    /// source of them, such as VPD's subcomponents for `rank_one`.
+    pub fn add_weight_edits(&mut self, family: Family, slices: Vec<Slice>) -> Result<(), String> {
+        let mut all = self.fixed_parts().to_vec();
+        let first = all.len();
+        all.extend(slices);
+        let last = all.len();
+        self.set_fixed_parts(all)?;
+        self.weight_edits.entry(family).or_default().extend(first..last);
         Ok(())
     }
 
@@ -2826,6 +2889,27 @@ impl Interchange {
     /// One experiment's operations of `family` on sequences of `length` tokens and its position, as
     /// [`Interchange::sample_ops`] draws them.
     pub fn draw_ops(&self, rng: &mut impl RngExt, family: Family, length: usize) -> Result<(Patch, usize), String> {
+        if matches!(family, Family::Neuron | Family::RankOne) {
+            // k weight edits, k = 2^u (u uniform in 0..=4), distinct, uniform among the family's;
+            // each removes or scales its part by a factor uniform in FACTORS; the rows as below.
+            let pool = self.weight_edits.get(&family).map(Vec::as_slice).unwrap_or_default();
+            if pool.is_empty() || length < 2 {
+                return Err(error(format!("{family:?}: no weight edits (Interchange::set_weight_edits), or sequences under two tokens")));
+            }
+            let k = (1usize << rng.random_range(0..=4)).min(pool.len());
+            let chosen = hybrid_of(rng, pool.len(), k);
+            let (position, onward) = match rng.random_range(0..3) {
+                0 => (rng.random_range(1..length), false),
+                1 => (rng.random_range(1..length), true),
+                _ => (0, true),
+            };
+            let mut ops = Vec::with_capacity(k);
+            for (part, _) in pool.iter().zip(&chosen).filter(|(_, c)| **c) {
+                let layer = (self.fixed_parts()[*part].block() - 1) / 2;
+                ops.push(SiteOp { site: SharedSite::Mlp(layer), operation: Operation::Slice { part: *part, factor: rng.random_range(0..FACTORS.len()) }, onward });
+            }
+            return Ok((Patch::Ops { family, ops }, position));
+        }
         let directions = self.m_sites.parts.directions.len();
         let blocks = self.m_sites.entries.len();
         let sites: Vec<SharedSite> = self
@@ -2837,7 +2921,7 @@ impl Interchange {
                 Family::Push => !matches!(s, SharedSite::Head(_)) && self.m_sites.parts.typical.contains_key(s),
                 // A cut starts at an attention's or an MLP's output before the last block.
                 Family::Cut => matches!(s, SharedSite::Attention(_) | SharedSite::Mlp(_)) && s.block(&self.m_sites.parts.head_blocks).is_some_and(|b| b + 1 < blocks),
-                Family::Read => false,
+                Family::Read | Family::Neuron | Family::RankOne => false,
             })
             .collect();
         if sites.is_empty() || length < 2 || (family == Family::Push && directions == 0) {
@@ -2866,7 +2950,7 @@ impl Interchange {
                     }
                     Operation::Cut { to }
                 }
-                Family::Read => return Err(error("a read patch is not an operation")),
+                Family::Read | Family::Neuron | Family::RankOne => return Err(error("not an operation on a site")),
             };
             ops.push(SiteOp { site: *site, operation, onward });
         }
@@ -3308,6 +3392,8 @@ mod tests {
         let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
         ic.set_directions(4, 2);
         ic.measure_typical(&batch).expect("the typical norms");
+        ic.set_weight_edits(crate::vpd_parts::mlps_of(&native, &blocks).expect("M's MLPs"), 2, 5).expect("the weight edits");
+        let (neuron, rank_one) = (ic.weight_edits[&Family::Neuron][0], ic.weight_edits[&Family::RankOne][1]);
         let e = |base: usize, source: usize, family: Family, ops: Vec<SiteOp>, position: usize| Experiment { base, source, explained: vec![true; 4], patch: Some(Patch::Ops { family, ops }), position };
         let op = |site: SharedSite, operation: Operation, onward: bool| SiteOp { site, operation, onward };
         let experiments = vec![
@@ -3316,6 +3402,8 @@ mod tests {
             e(2, 2, Family::Scale, vec![op(SharedSite::Mlp(1), Operation::Scale(3), true)], 0),
             e(0, 0, Family::Push, vec![op(SharedSite::Stream(1), Operation::Push { direction: 1, size: 2 }, false)], 6),
             e(1, 2, Family::Cut, vec![op(SharedSite::Mlp(0), Operation::Cut { to: 3 }, true), op(SharedSite::Attention(0), Operation::Cut { to: 2 }, false)], 4),
+            e(2, 2, Family::Neuron, vec![op(SharedSite::Mlp((ic.fixed_parts()[neuron].block() - 1) / 2), Operation::Slice { part: neuron, factor: 0 }, true)], 5),
+            e(0, 0, Family::RankOne, vec![op(SharedSite::Mlp((ic.fixed_parts()[rank_one].block() - 1) / 2), Operation::Slice { part: rank_one, factor: 3 }, false)], 7),
             // Layer 1's slices, whose read depends on P's layer-0 MLP: the up map's amplified, the
             // down map's removed.
             Experiment { base: 2, source: 2, explained: vec![true; 4], patch: Some(Patch::FixedPart { part: 2, factor: 3, block: 3 }), position: 5 },
