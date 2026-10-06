@@ -1882,10 +1882,10 @@ mod tests {
         // collection leaves most deviations near the prior's, where no copy pays for its choice
         // (1da5445a19), so the term may be zero there; the mixture's choices are tested below at a
         // narrow posterior.
-        let start = &fitted.report.start;
-        let description = start.divergence_bits + start.variance_bits + start.choice_bits + start.prior_bits;
-        let assembled = start.data_bits_per_token + description / fitted.report.scored_tokens as f64;
-        assert!(start.prior_bits.is_finite() && (start.objective_bits_per_token - assembled).abs() <= 1e-9 * start.objective_bits_per_token.abs(), "F holds the mixture's term");
+        let at_start = &fitted.report.start;
+        let description = at_start.divergence_bits + at_start.variance_bits + at_start.choice_bits + at_start.prior_bits;
+        let assembled = at_start.data_bits_per_token + description / fitted.report.scored_tokens as f64;
+        assert!(at_start.prior_bits.is_finite() && (at_start.objective_bits_per_token - assembled).abs() <= 1e-9 * at_start.objective_bits_per_token.abs(), "F holds the mixture's term");
         // The fit removes the copies this random model does not need; the weights are learned at the
         // start, every group in, from samples of its posterior.
         let all_in = crate::library_mdl::Posterior::new(&start, NARROW).unwrap();
