@@ -2372,14 +2372,21 @@ pub fn fit_from(
             device_posterior.code_length_into(&mut code, b)?;
             // The prior term at the same weight sample; its gradient joins the data term's, which
             // the step weighs by `scale` in nats.
+            // The prior's seconds moving values between the device and the host, and computing.
+            let mut prior_seconds = (0.0, 0.0);
             let prior_nats = match prior.as_deref_mut() {
                 Some(prior) => {
+                    let moving = Instant::now();
                     for &i in &prior_operators {
                         let (mean, log_sd) = device_posterior.values(i)?;
                         posterior.mean[i] = mean;
                         posterior.log_sd[i] = log_sd;
                     }
+                    prior_seconds.0 += moving.elapsed().as_secs_f64();
+                    let computing = Instant::now();
                     let (nats, extra) = prior_term(prior, &posterior, key, true)?;
+                    prior_seconds.1 += computing.elapsed().as_secs_f64();
+                    let moving = Instant::now();
                     for (i, g) in extra {
                         let op = explanation.trainable[i];
                         let uploaded = device.upload((g / (scale * LN_2)).view()).map_err(error)?;
@@ -2390,6 +2397,7 @@ pub fn fit_from(
                             }
                         }
                     }
+                    prior_seconds.0 += moving.elapsed().as_secs_f64();
                     nats
                 }
                 None => 0.0,
@@ -2398,7 +2406,8 @@ pub fn fit_from(
             priors.push(prior_nats);
             progress.step += 1;
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, weight), &ivon)?;
-            log::info!("library step {epoch}.{b}: {:.6} bits per scored token, {:.2} s", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
+            let prior_note = if prior.is_some() { format!(" (prior: {:.2} s moving, {:.2} s computing)", prior_seconds.0, prior_seconds.1) } else { String::new() };
+            log::info!("library step {epoch}.{b}: {:.6} bits per scored token, {:.2} s{prior_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
         }
         for ((code_length, data), prior_nats) in device_posterior.code_lengths(&code)?.into_iter().zip(datas).zip(priors) {
             let description = code_length + subset_code + explanation.fixed_nats + prior_nats;
