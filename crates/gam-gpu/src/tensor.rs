@@ -4156,10 +4156,11 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
 }
 "#;
 
-    /// The forward's block on CUDA: query rows, keys at a time, threads, rows per thread (64 rows of
-    /// 32 lanes' row groups, each thread 2 rows × 4 keys of the scores and 2 rows × 16 columns of
-    /// the output: 77 KB of shared memory, one block of 8 warps per multiprocessor on the 4090).
-    const ATTENTION_FORWARD: (usize, usize, usize, usize) = (64, 32, 256, 2);
+    /// The forward's block on CUDA: query rows, keys at a time, threads, rows per thread, and the
+    /// columns of a key chunk (and rows of a value chunk). Each of the 128 threads holds 8 rows × 8
+    /// keys of the scores and 8 rows × 8 columns of the output, so a four-float shared load feeds
+    /// sixteen fused multiply-adds; 88 KB of shared memory, one block per multiprocessor.
+    const ATTENTION_FORWARD: (usize, usize, usize, usize, usize) = (64, 128, 128, 8, 16);
 
     /// The keys' reverse's block: key rows, query rows at a time, threads, keys per thread.
     const ATTENTION_KEYS: (usize, usize, usize, usize) = (32, 32, 256, 2);
@@ -5065,11 +5066,12 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
         fn attention_kernel(&self, width: usize, name: &'static str, shared: usize) -> Result<CudaFunction, GpuError> {
             static MODULES: std::sync::OnceLock<crate::device_cache::KeyedPtxModuleCache<usize>> = std::sync::OnceLock::new();
             let tuple = |(a, b, c, d): (usize, usize, usize, usize)| format!("{a}, {b}, {c}, {d}");
+            let (r, k, n, tr, dc) = ATTENTION_FORWARD;
             let source = |_| {
                 format!(
                     "#define HEAD_W {width}\n#define HEAD_D {}\n#define FORWARD {}\n#define KEYS {}\n#define QUERIES {}\n#define MAX_SEQUENCES {ATTENTION_SEQUENCES}\n{ATTENTION}{}{ATTENTION_KERNELS}",
                     attention_width(width).unwrap_or(128),
-                    tuple(ATTENTION_FORWARD),
+                    format!("{r}, {k}, {n}, {tr}, {dc}"),
                     tuple(ATTENTION_KEYS),
                     tuple(ATTENTION_QUERIES),
                     include_str!("attention_f32.inc")
@@ -5113,8 +5115,8 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
 
         pub(super) fn causal_attention(&self, y: &Tensor, layout: super::HeadLayout, sequences: &[std::ops::Range<usize>], scale: f64) -> Result<(Tensor, Tensor), GpuError> {
             let (w, padded) = (layout.width, attention_width(layout.width)?);
-            let (rows, keys, threads, _) = ATTENTION_FORWARD;
-            let shared = ((rows + 2 * keys) * (padded + 4) + rows * (keys + 4)) * 4;
+            let (rows, keys, threads, _, chunk) = ATTENTION_FORWARD;
+            let shared = (rows * (padded + 4) + 2 * (keys * (chunk + 4)).max(chunk * (padded + 4)) + rows * (keys + 4)) * 4;
             let f = self.attention_kernel(w, "attention_forward", shared)?;
             let mut out = self.attention_output((y.rows, layout.queries * w), sequences)?;
             let mut lse = self.attention_output((y.rows, layout.queries), sequences)?;
@@ -7028,8 +7030,8 @@ typedef ulong u64;
     /// Attention's kernels on the Apple GPU: each threadgroup takes the items `group`, `group +
     /// groups`, ...; item `i` is (sequence, head) pair `i mod pairs` and tile `i / pairs` (the longest
     /// sweeps first). Tiles fit the 32 KB of threadgroup memory: the forward's blocks hold 16 query
-    /// rows and take 16 keys at a time; the reverse's 16 key rows and 8 query rows at a time, or 16
-    /// query rows and 8 keys.
+    /// rows and take 64 keys at a time (64 threads of 4 rows × 4 keys); the reverse's 16 key rows and
+    /// 8 query rows at a time, or 16 query rows and 8 keys.
     const ATTENTION_KERNELS: &str = r#"
 struct AttentionParams { uint hq; uint hk; uint w; float scale; uint pairs; uint items; uint rows; uint unused; Sequences sequences; };
 
@@ -7037,9 +7039,9 @@ struct AttentionParams { uint hq; uint hk; uint w; float scale; uint pairs; uint
 kernel void t_attention_forward_##D(device const float* y [[buffer(0)]], device float* out [[buffer(1)]], device float* lse [[buffer(2)]], \
     constant AttentionParams& p [[buffer(3)]], uint group [[threadgroup_position_in_grid]], uint groups [[threadgroups_per_grid]], \
     uint t [[thread_index_in_threadgroup]]) { \
-    threadgroup float smem[(16 + 2 * 16) * TILE_STRIDE(D) + 16 * (16 + 4)]; \
+    threadgroup float smem[FORWARD_FLOATS(D, 16, 64, 16)]; \
     for (uint item = group; item < p.items; item += groups) { \
-        forward_body<D, 16, 16, 256, 1>(p.sequences, p.hq, p.hk, p.w, p.scale * 1.4426950408889634f, y, out, lse, item % p.pairs, item / p.pairs, t, 256u, smem); \
+        forward_body<D, 16, 64, 64, 4, 16>(p.sequences, p.hq, p.hk, p.w, p.scale * 1.4426950408889634f, y, out, lse, item % p.pairs, item / p.pairs, t, 256u, smem); \
         threadgroup_barrier(mem_flags::mem_threadgroup); \
     } \
 } \

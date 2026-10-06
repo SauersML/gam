@@ -55,6 +55,24 @@ DEVICE void load_tile(SHARED float* tile, GLOBAL const float* src, u64 stride, u
     }
 }
 
+// Rows [0, rows) and columns [0, C) of a matrix at `src` (`stride` floats between rows) into the
+// shared tile `dst` (`dst_stride` floats between rows); rows from `valid` on and columns from `w` on
+// are zeros. Threads `t` of `threads` share the copies.
+template <int C>
+DEVICE void load_block(SHARED float* dst, u32 dst_stride, GLOBAL const float* src, u64 stride, u32 rows, u32 valid, u32 w, u32 t, u32 threads) {
+    for (u32 i = t; i < rows * (C / 4); i += threads) {
+        u32 r = i / (C / 4), c = (i % (C / 4)) * 4u;
+        SHARED float* d = dst + r * dst_stride + c;
+        if (r < valid && c + 4u <= w && (w & 3u) == 0u) {
+            COPY4(d, src + (u64)r * stride + c);
+        } else {
+            float v[4];
+            for (u32 k = 0; k < 4u; ++k) v[k] = r < valid && c + k < w ? src[(u64)r * stride + c + k] : 0.0f;
+            STORE4(d, F4(v[0], v[1], v[2], v[3]));
+        }
+    }
+}
+
 // The maximum and the sum over the `group` consecutive lanes holding a row (a power of two ≤ 32).
 DEVICE float lane_max(float v, u32 group) {
     for (u32 o = 1u; o < group; o <<= 1) v = FMAX(v, SHUFFLE_XOR(v, o));
@@ -70,12 +88,19 @@ DEVICE float lane_sum(float v, u32 group) {
 // its last row. Its NT compute threads form RG = BR / TR row groups of CG = NT / RG lanes: thread
 // (g, c) holds rows g + RG i (i < TR), the scores of keys c + CG j (j < BC / CG) and the output
 // columns 4c + 4 CG m.. (m < D / (4 CG)) of its rows, so a row's statistics live in its CG lanes.
-// The value tile loads while the scores form; the next key tile while the values' product runs.
-// Shared memory: (BR + 2 BC) (D + 4) + BR (BC + 4) floats.
-template <int D, int BR, int BC, int NT, int TR>
+// With TR and BC / CG near 8 every shared load of four floats feeds about sixteen fused multiply-adds,
+// which is what keeps the f32 units busy. The queries stay in shared memory; each key tile streams
+// through two buffers in chunks of DC columns (the scores accumulate over them), then the value tile
+// in chunks of DC rows, each chunk loading while the one before is multiplied. Shared memory:
+// BR (D + 4) + 2 max(BC (DC + 4), DC (D + 4)) + BR (BC + 4) floats.
+#define FORWARD_CHUNK(D, BC, DC) ((BC) * ((DC) + 4) > (DC) * ((D) + 4) ? (BC) * ((DC) + 4) : (DC) * ((D) + 4))
+#define FORWARD_FLOATS(D, BR, BC, DC) ((BR) * ((D) + 4) + 2 * FORWARD_CHUNK(D, BC, DC) + (BR) * ((BC) + 4))
+
+template <int D, int BR, int BC, int NT, int TR, int DC>
 DEVICE void forward_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, float scale_log2, GLOBAL const float* y, GLOBAL float* out, GLOBAL float* lse,
                          u32 pair, u32 tile, u32 t, u32 threads, SHARED float* smem) {
-    constexpr u32 RG = BR / TR, CG = NT / RG, KP = BC / CG, DP = D / CG;
+    constexpr u32 RG = BR / TR, CG = NT / RG, KP = BC / CG, DP = D / CG, NK = D / DC, NV = BC / DC;
+    constexpr u32 CHUNK = FORWARD_CHUNK(D, BC, DC);
     if (pair >= sequences.count * hq) return;
     const u32 head = pair % hq, sequence = pair / hq;
     const u32 start = sequences.start[sequence], length = sequences.length[sequence];
@@ -86,88 +111,99 @@ DEVICE void forward_body(CONSTANT Sequences& sequences, u32 hq, u32 hk, u32 w, f
     GLOBAL const float* yk = y + (u64)start * stride + (hq + kv) * w;
     GLOBAL const float* yv = y + (u64)start * stride + (hq + hk + kv) * w;
     SHARED float* sq = smem;
-    SHARED float* sk = sq + BR * TILE_STRIDE(D);
-    SHARED float* sv = sk + BC * TILE_STRIDE(D);
-    SHARED float* sp = sv + BC * TILE_STRIDE(D);
+    SHARED float* sbuf = sq + BR * TILE_STRIDE(D);
+    SHARED float* sp = sbuf + 2u * CHUNK;
     const u32 keys = min(q0 + BR, length), key_tiles = (keys + BC - 1u) / BC;
     const bool computes = t < NT;
     const u32 g = t / CG, c = t % CG;
 
+    // Chunk u of key tile kt: u < NK the keys' columns [u DC, (u + 1) DC), else the values' rows
+    // [(u − NK) DC, ...); every chunk goes to buffer (its number in the block's sequence) mod 2.
     load_tile<D>(sq, y + (u64)(start + q0) * stride + head * w, stride, BR, min((u32)BR, length - q0), w, t, threads);
-    load_tile<D>(sk, yk, stride, BC, min((u32)BC, keys), w, t, threads);
+    load_block<DC>(sbuf, DC + 4u, yk, stride, BC, min((u32)BC, keys), w, t, threads);
     COPY_COMMIT();
 
-    float m[TR], l[TR], o[TR][DP];
+    float m[TR], l[TR], o[TR][DP], s[TR][KP];
     UNROLL for (u32 i = 0; i < TR; ++i) {
         m[i] = NEG_INF;
         l[i] = 0.0f;
         UNROLL for (u32 d = 0; d < DP; ++d) o[i][d] = 0.0f;
     }
+    u32 chunk = 0;
     for (u32 kt = 0; kt < key_tiles; ++kt) {
-        const u32 k0 = kt * BC;
-        COPY_WAIT();
-        BARRIER();
-        load_tile<D>(sv, yv + (u64)k0 * stride, stride, BC, min((u32)BC, keys - k0), w, t, threads);
-        COPY_COMMIT();
-        float s[TR][KP];
-        if (computes) {
-            UNROLL for (u32 i = 0; i < TR; ++i)
-                UNROLL for (u32 j = 0; j < KP; ++j) s[i][j] = 0.0f;
-            for (u32 d = 0; d < D; d += 4u) {
-                f4 qv[TR], kvv[KP];
-                UNROLL for (u32 i = 0; i < TR; ++i) qv[i] = LOAD4(sq + (g + RG * i) * TILE_STRIDE(D) + d);
-                UNROLL for (u32 j = 0; j < KP; ++j) kvv[j] = LOAD4(sk + (c + CG * j) * TILE_STRIDE(D) + d);
-                UNROLL for (u32 i = 0; i < TR; ++i)
-                    UNROLL for (u32 j = 0; j < KP; ++j) s[i][j] = FMA(qv[i].w, kvv[j].w, FMA(qv[i].z, kvv[j].z, FMA(qv[i].y, kvv[j].y, FMA(qv[i].x, kvv[j].x, s[i][j]))));
+        const u32 k0 = kt * BC, valid_keys = min((u32)BC, keys - k0);
+        UNROLL for (u32 i = 0; i < TR; ++i)
+            UNROLL for (u32 j = 0; j < KP; ++j) s[i][j] = 0.0f;
+        for (u32 u = 0; u < NK + NV; ++u, ++chunk) {
+            COPY_WAIT();
+            BARRIER();
+            // The next chunk: this tile's, or the next tile's first.
+            SHARED float* next = sbuf + ((chunk + 1u) & 1u) * CHUNK;
+            if (u + 1u < NK) {
+                load_block<DC>(next, DC + 4u, yk + (u64)k0 * stride + (u + 1u) * DC, stride, BC, valid_keys, w > (u + 1u) * DC ? w - (u + 1u) * DC : 0u, t, threads);
+            } else if (u + 1u < NK + NV) {
+                const u32 r0 = (u + 1u - NK) * DC;
+                load_block<D>(next, D + 4u, yv + (u64)(k0 + r0) * stride, stride, DC, valid_keys > r0 ? min((u32)DC, valid_keys - r0) : 0u, w, t, threads);
+            } else if (kt + 1u < key_tiles) {
+                load_block<DC>(next, DC + 4u, yk + (u64)(k0 + BC) * stride, stride, BC, min((u32)BC, keys - k0 - BC), w, t, threads);
             }
-            // Scores in base-2 units; keys after a row's position, or past the sequence, weigh nothing.
-            UNROLL for (u32 i = 0; i < TR; ++i) {
-                const u32 row = q0 + g + RG * i;
-                float mx = m[i];
-                UNROLL for (u32 j = 0; j < KP; ++j) {
-                    const u32 key = k0 + c + CG * j;
-                    s[i][j] = key > row || key >= length ? NEG_INF : s[i][j] * scale_log2;
-                    mx = FMAX(mx, s[i][j]);
-                }
-                mx = lane_max(mx, CG);
-                const float base = mx == NEG_INF ? 0.0f : mx;
-                const float alpha = EXP2(m[i] - base);
-                m[i] = mx;
-                l[i] *= alpha;
-                UNROLL for (u32 d = 0; d < DP; ++d) o[i][d] *= alpha;
-                UNROLL for (u32 j = 0; j < KP; ++j) {
-                    const float p = EXP2(s[i][j] - base);
-                    l[i] += p;
-                    sp[(g + RG * i) * (BC + 4u) + c + CG * j] = p;
-                }
-            }
-        }
-        COPY_WAIT();
-        BARRIER();
-        if (kt + 1u < key_tiles) {
-            const u32 next = k0 + BC;
-            load_tile<D>(sk, yk + (u64)next * stride, stride, BC, min((u32)BC, keys - next), w, t, threads);
             COPY_COMMIT();
-        }
-        if (computes) {
-            for (u32 k = 0; k < BC; k += 4u) {
-                f4 pv[TR];
-                UNROLL for (u32 i = 0; i < TR; ++i) pv[i] = LOAD4(sp + (g + RG * i) * (BC + 4u) + k);
-                UNROLL for (u32 kk = 0; kk < 4u; ++kk) {
-                    UNROLL for (u32 n = 0; n < DP / 4u; ++n) {
-                        const f4 vv = LOAD4(sv + (k + kk) * TILE_STRIDE(D) + 4u * c + 4u * CG * n);
-                        UNROLL for (u32 i = 0; i < TR; ++i) {
-                            const float p = kk == 0u ? pv[i].x : kk == 1u ? pv[i].y : kk == 2u ? pv[i].z : pv[i].w;
-                            o[i][4u * n] = FMA(p, vv.x, o[i][4u * n]);
-                            o[i][4u * n + 1u] = FMA(p, vv.y, o[i][4u * n + 1u]);
-                            o[i][4u * n + 2u] = FMA(p, vv.z, o[i][4u * n + 2u]);
-                            o[i][4u * n + 3u] = FMA(p, vv.w, o[i][4u * n + 3u]);
+            SHARED float* cur = sbuf + (chunk & 1u) * CHUNK;
+            if (u < NK) {
+                if (computes) {
+                    for (u32 d = 0; d < DC; d += 4u) {
+                        f4 qv[TR], kvv[KP];
+                        UNROLL for (u32 i = 0; i < TR; ++i) qv[i] = LOAD4(sq + (g + RG * i) * TILE_STRIDE(D) + u * DC + d);
+                        UNROLL for (u32 j = 0; j < KP; ++j) kvv[j] = LOAD4(cur + (c + CG * j) * (DC + 4u) + d);
+                        UNROLL for (u32 i = 0; i < TR; ++i)
+                            UNROLL for (u32 j = 0; j < KP; ++j) s[i][j] = FMA(qv[i].w, kvv[j].w, FMA(qv[i].z, kvv[j].z, FMA(qv[i].y, kvv[j].y, FMA(qv[i].x, kvv[j].x, s[i][j]))));
+                    }
+                }
+                if (u + 1u == NK && computes) {
+                    // The tile's weights: scores in base-2 units; keys after a row's position, or past
+                    // the sequence, weigh nothing.
+                    UNROLL for (u32 i = 0; i < TR; ++i) {
+                        const u32 row = q0 + g + RG * i;
+                        float mx = m[i];
+                        UNROLL for (u32 j = 0; j < KP; ++j) {
+                            const u32 key = k0 + c + CG * j;
+                            s[i][j] = key > row || key >= length ? NEG_INF : s[i][j] * scale_log2;
+                            mx = FMAX(mx, s[i][j]);
+                        }
+                        mx = lane_max(mx, CG);
+                        const float base = mx == NEG_INF ? 0.0f : mx;
+                        const float alpha = EXP2(m[i] - base);
+                        m[i] = mx;
+                        l[i] *= alpha;
+                        UNROLL for (u32 d = 0; d < DP; ++d) o[i][d] *= alpha;
+                        UNROLL for (u32 j = 0; j < KP; ++j) {
+                            const float p = EXP2(s[i][j] - base);
+                            l[i] += p;
+                            sp[(g + RG * i) * (BC + 4u) + c + CG * j] = p;
+                        }
+                    }
+                }
+            } else if (computes && (u - NK) * DC < valid_keys) {
+                // The values' rows of this chunk against the weights' columns.
+                const u32 r0 = (u - NK) * DC;
+                for (u32 k = 0; k < DC; k += 4u) {
+                    f4 pv[TR];
+                    UNROLL for (u32 i = 0; i < TR; ++i) pv[i] = LOAD4(sp + (g + RG * i) * (BC + 4u) + r0 + k);
+                    UNROLL for (u32 kk = 0; kk < 4u; ++kk) {
+                        UNROLL for (u32 n = 0; n < DP / 4u; ++n) {
+                            const f4 vv = LOAD4(cur + (k + kk) * TILE_STRIDE(D) + 4u * c + 4u * CG * n);
+                            UNROLL for (u32 i = 0; i < TR; ++i) {
+                                const float p = kk == 0u ? pv[i].x : kk == 1u ? pv[i].y : kk == 2u ? pv[i].z : pv[i].w;
+                                o[i][4u * n] = FMA(p, vv.x, o[i][4u * n]);
+                                o[i][4u * n + 1u] = FMA(p, vv.y, o[i][4u * n + 1u]);
+                                o[i][4u * n + 2u] = FMA(p, vv.z, o[i][4u * n + 2u]);
+                                o[i][4u * n + 3u] = FMA(p, vv.w, o[i][4u * n + 3u]);
+                            }
                         }
                     }
                 }
             }
         }
-        BARRIER();
     }
     if (!computes) return;
     const u32 reads = hq * w;
