@@ -115,10 +115,14 @@ def top_pair(M: torch.Tensor, iterations: int = 200) -> tuple[float, torch.Tenso
 
 
 def head_vectors(uv: dict) -> None:
-    """A library's heads as two vectors each, beside its MLP functions' {site}.U and {site}.V: the
+    """A library's MLP functions as {site}.U (write rows) and {site}.V (gate rows, transposed), and its
+    heads as two vectors each: the
     write U = sigma l of the OV map W_O W_V's top singular pair (the residual direction it writes most,
     scaled by its gain) and the read V = the query-side vector of W_Q^T W_K's top pair (the residual
     direction its attention reads at the destination; rotary positions left out)."""
+    for key in [k for k in uv if k.endswith(".mlp.function.write") and k.replace(".write", ".U") not in uv]:
+        n = key.removesuffix(".write")  # readout's earlier files: the function's write rows and gate rows
+        uv[f"{n}.U"], uv[f"{n}.V"] = uv[f"{n}.write"], uv[f"{n}.gate"].T.contiguous()
     for key in [k for k in uv if k.endswith(".attn.head.query")]:
         n = key.removesuffix(".query")
         Q, K, Vv, O = uv[f"{n}.query"].float(), uv[f"{n}.key"].float(), uv[f"{n}.value"].float(), uv[f"{n}.output"].float()

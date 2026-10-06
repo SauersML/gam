@@ -146,10 +146,11 @@ def build_library(args):
     norm); a head is read through the top singular pairs of its OV map W_O W_V (copying: from source
     tokens along the right vector, writing along the left) and of W_Q^T W_K (attention: from destination
     tokens along the left vector to source tokens along the right; rotary positions left out)."""
-    from vpd_oracle import top_pair
+    from vpd_oracle import head_vectors, top_pair
 
     lens = Lens(None, Path(args.data))
     lib = load_file(args.functions)
+    head_vectors(lib)  # the functions' U and V also from readout's earlier write and gate names
     vocab = torch.nonzero(lens.seen).reshape(-1)
     f = lens.freq[vocab]
     Ef = lens.Ef[vocab]
