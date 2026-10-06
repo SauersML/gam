@@ -479,4 +479,39 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// A removal step on the tiny Qwen3 decoder with layer 1's MLP as a transcoder block (fixed
+    /// output bias, `M`'s MLP selected at the first token), from the Laplace start: it runs through
+    /// the compensation and the search, and never raises `F` on the training collection.
+    #[test]
+    fn a_removal_step_runs_on_a_transcoder_block() {
+        let dir = std::env::temp_dir().join(format!("library_transcoder_removal_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let export = crate::test_support::tiny_qwen3_export("library_transcoder_removal", 2);
+        let imported = import_language_model(&export, 6, 12).unwrap();
+        std::fs::remove_dir_all(&export).unwrap();
+        let native = split_sites(&imported.program).unwrap();
+        let layers = layer_nodes(&native, 2).unwrap();
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let (train, held) = sequences.split_at(sequences.len() - 2);
+        let path = dir.join("layer_1.safetensors");
+        crate::test_support::transcoder_file(&path, 64, 8, 3);
+        let transcoders = BTreeMap::from([(1, Transcoder::open(&path).unwrap())]);
+        let counts = firing(&Device::host(), &native, &layers, &transcoders, train, 2).unwrap();
+        let kept: Vec<usize> = (0..64).filter(|&f| counts[&1][f] > 0).collect();
+        let kept_path = dir.join("kept_1.safetensors");
+        transcoders[&1].write_kept(&kept, &kept_path).unwrap();
+        let explanation = library_mdl::explanation_with(&native, &layers, &BTreeMap::from([(1, kept_path)])).unwrap();
+        let settings: library_mdl::Settings = serde_json::from_value(serde_json::json!({"batch_sequences": 2, "seed": 3, "numeric_bytes": 1 << 26, "head_tile_rows": 64})).unwrap();
+        let device = Device::host();
+        let mut posterior = library_mdl::start_posterior(&device, &native, &explanation, train, &settings).unwrap();
+        let active = posterior.active.iter().filter(|a| **a).count();
+        let step = library_mdl::Step { sequences: train, held, settings: &settings, log: None };
+        let (removal, before, after) = library_mdl::removal_step(&device, &native, &explanation, &mut posterior, step).unwrap();
+        assert!(removal.after_bits <= removal.before_bits, "the removal raised F from {} to {} bits", removal.before_bits, removal.after_bits);
+        assert_eq!(posterior.active.iter().filter(|a| **a).count(), active - removal.removed);
+        assert!(before.objective_bits_per_token.is_finite() && after.objective_bits_per_token.is_finite());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
