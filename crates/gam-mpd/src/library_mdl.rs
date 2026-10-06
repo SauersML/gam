@@ -2960,6 +2960,11 @@ pub fn fit_from(
         device_posterior.values_into(&mut posterior)?;
         progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
         save(&mut progress, &posterior, &device_posterior, &mut writer)?;
+        // The start's own checkpoint beside the fit's (extension `start.bin`), kept whatever the
+        // descent does next: a valid posterior to begin other fits or a removal round from.
+        if let Some(path) = checkpoint {
+            Snapshot::save(&mut progress, &device_posterior, &path.with_extension("start.bin"), &mut writer)?;
+        }
     }
     // The posterior at the end of the epoch with the lowest mean per-batch estimate of `F` since
     // the objective last changed (a start or a removal), with that mean.
