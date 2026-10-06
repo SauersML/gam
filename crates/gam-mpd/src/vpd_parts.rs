@@ -26,25 +26,63 @@ fn error(e: impl std::fmt::Display) -> String {
     format!("vpd parts: {e}")
 }
 
-/// One layer's MLP of `M`: `out = write · φ(read · x)`.
+/// One layer's MLP of `M`: `out = write · h(x)`, `h(x) = φ(read · x)`, or for a gated MLP
+/// (Qwen3's SwiGLU) `h(x) = φ(read · x) ⊙ (up · x)`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mlp {
-    /// `W_fc` (hidden × d).
+    /// `W_fc` (hidden × d), the gate of a gated MLP.
     pub read: Array2<f64>,
     /// `W_down` (d × hidden).
     pub write: Array2<f64>,
     pub law: Law,
+    /// A gated MLP's up map `W_up` (hidden × d).
+    pub up: Option<Array2<f64>>,
 }
 
 impl Mlp {
-    /// `φ(W_fc x + shift)`, the hidden activations at the read `x` with the pre-activations moved by
-    /// `shift`.
+    /// The gate's multiplier `W_up x` at the read `x` (ones for an ungated MLP).
+    fn gain(&self, x: ArrayView1<f64>) -> Array1<f64> {
+        match &self.up {
+            Some(up) => up.dot(&x),
+            None => Array1::ones(self.read.nrows()),
+        }
+    }
+
+    /// Its tangent `W_up dx` (zero for an ungated MLP).
+    fn gain_tangent(&self, dx: ArrayView1<f64>) -> Array1<f64> {
+        match &self.up {
+            Some(up) => up.dot(&dx),
+            None => Array1::zeros(self.read.nrows()),
+        }
+    }
+
+    /// `φ(W_fc x + shift) ⊙ (W_up x)`, the hidden activations at the read `x` with the
+    /// pre-activations moved by `shift`.
     fn hidden(&self, x: ArrayView1<f64>, shift: Option<&Array1<f64>>) -> Array1<f64> {
         let mut pre = self.read.dot(&x);
         if let Some(shift) = shift {
             pre += shift;
         }
-        pre.mapv(|t| self.law.apply(t))
+        pre.mapv(|t| self.law.apply(t)) * self.gain(x)
+    }
+
+    /// The tangent of [`Mlp::hidden`] along `dx` with the pre-activations at `pre` and moving by
+    /// `dpre`: `φ'(pre) ⊙ dpre ⊙ (W_up x) + φ(pre) ⊙ (W_up dx)`.
+    fn hidden_tangent(&self, x: ArrayView1<f64>, pre: &Array1<f64>, dpre: &Array1<f64>, dx: ArrayView1<f64>) -> Array1<f64> {
+        pre.mapv(|t| self.law.derivative(t)) * dpre * self.gain(x) + pre.mapv(|t| self.law.apply(t)) * self.gain_tangent(dx)
+    }
+
+    /// The read's cotangent from the hidden activations' cotangent `w` at pre-activations `pre`
+    /// (whose own dependence on the read is `W_fc x` plus what `extra` adds): `W_fcᵀ(φ'(pre) ⊙ w ⊙
+    /// (W_up x)) + W_upᵀ(φ(pre) ⊙ w)`, and `φ'(pre) ⊙ w ⊙ (W_up x)` (the pre-activations'
+    /// cotangent).
+    fn hidden_pullback(&self, x: ArrayView1<f64>, pre: &Array1<f64>, w: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
+        let through = pre.mapv(|t| self.law.derivative(t)) * w * self.gain(x);
+        let mut back = self.read.t().dot(&through);
+        if let Some(up) = &self.up {
+            back += &up.t().dot(&(pre.mapv(|t| self.law.apply(t)) * w));
+        }
+        (back, through)
     }
 
     /// The block's output at the read `x`.
@@ -89,39 +127,39 @@ impl VpdPart {
         }
     }
 
-    /// The derivative of [`VpdPart::edit`] in the read along `dx`, `J(x) dx`: for a slice of
-    /// `W_down`, `(α − 1)(v·(φ'(z) ⊙ W_fc dx)) u`; for a slice of `W_fc`,
-    /// `W_down[φ'(z') ⊙ (W_fc dx + (α − 1)(v·dx) u) − φ'(z) ⊙ W_fc dx]` (`z`, `z'` as in
+    /// The derivative of [`VpdPart::edit`] in the read along `dx`, `J(x) dx`, with `h'` the hidden
+    /// activations' tangent ([`Mlp::hidden_tangent`], the product rule for a gated MLP): for a
+    /// slice of `W_down`, `(α − 1)(v·h'(z; W_fc dx)) u`; for a slice of `W_fc`,
+    /// `W_down[h'(z'; W_fc dx + (α − 1)(v·dx) u) − h'(z; W_fc dx)]` (`z`, `z'` as in
     /// [`VpdPart::pullback`]).
     #[must_use]
     pub fn tangent(&self, mlp: &Mlp, x: ArrayView1<f64>, alpha: f64, dx: ArrayView1<f64>) -> Array1<f64> {
         let (pre, moved_in) = (mlp.read.dot(&x), mlp.read.dot(&dx));
-        let slope = |z: &Array1<f64>| z.mapv(|t| mlp.law.derivative(t));
         match self.map {
-            Map::Down => &self.u * ((alpha - 1.0) * self.v.dot(&(slope(&pre) * &moved_in))),
+            Map::Down => &self.u * ((alpha - 1.0) * self.v.dot(&mlp.hidden_tangent(x, &pre, &moved_in, dx))),
             Map::Up => {
                 let moved = &pre + &(&self.u * ((alpha - 1.0) * self.v.dot(&x)));
                 let shifted = &moved_in + &(&self.u * ((alpha - 1.0) * self.v.dot(&dx)));
-                mlp.write.dot(&(slope(&moved) * &shifted - slope(&pre) * &moved_in))
+                mlp.write.dot(&(mlp.hidden_tangent(x, &moved, &shifted, dx) - mlp.hidden_tangent(x, &pre, &moved_in, dx)))
             }
         }
     }
 
-    /// The pullback of [`VpdPart::edit`] in the read: `J(x)ᵀ ḡ` for the output's cotangent `ḡ`.
-    /// With `z = W_fc x` and `φ'` the law's derivative: for a slice of `W_down`,
-    /// `(α − 1)(u·ḡ) W_fcᵀ(φ'(z) ⊙ v)`; for a slice of `W_fc`, with `z' = z + (α − 1)(v·x) u` and
-    /// `r = W_downᵀ ḡ`, `W_fcᵀ((φ'(z') − φ'(z)) ⊙ r) + (α − 1)(u·(φ'(z') ⊙ r)) v`.
+    /// The pullback of [`VpdPart::edit`] in the read: `J(x)ᵀ ḡ` for the output's cotangent `ḡ`,
+    /// the transpose of [`VpdPart::tangent`] ([`Mlp::hidden_pullback`]): for a slice of `W_down`,
+    /// the hidden activations' cotangent is `(α − 1)(u·ḡ) v`; for a slice of `W_fc`, with
+    /// `z' = z + (α − 1)(v·x) u` and `r = W_downᵀ ḡ`, the pullback of `r` at `z'` less that at `z`,
+    /// plus `(α − 1)(u·ρ) v` with `ρ` the pre-activations' cotangent at `z'`.
     #[must_use]
     pub fn pullback(&self, mlp: &Mlp, x: ArrayView1<f64>, alpha: f64, cotangent: ArrayView1<f64>) -> Array1<f64> {
         let pre = mlp.read.dot(&x);
-        let slope = |z: &Array1<f64>| z.mapv(|t| mlp.law.derivative(t));
         match self.map {
-            Map::Down => mlp.read.t().dot(&(slope(&pre) * &self.v)) * ((alpha - 1.0) * self.u.dot(&cotangent)),
+            Map::Down => mlp.hidden_pullback(x, &pre, &(&self.v * ((alpha - 1.0) * self.u.dot(&cotangent)))).0,
             Map::Up => {
                 let moved = &pre + &(&self.u * ((alpha - 1.0) * self.v.dot(&x)));
                 let r = mlp.write.t().dot(&cotangent);
-                let (after, before) = (slope(&moved) * &r, slope(&pre) * &r);
-                mlp.read.t().dot(&(&after - &before)) + &self.v * ((alpha - 1.0) * self.u.dot(&after))
+                let ((after, rho), (before, _)) = (mlp.hidden_pullback(x, &moved, &r), mlp.hidden_pullback(x, &pre, &r));
+                after - before + &self.v * ((alpha - 1.0) * self.u.dot(&rho))
             }
         }
     }
@@ -224,6 +262,47 @@ pub fn random_slices_of(mlp: &Arc<Mlp>, layer: usize, map: Map, count: usize, se
         .collect()
 }
 
+/// `M`'s MLP of every layer from its split native program `native` with its `layers`
+/// (`run_check::layer_nodes`): the down map applied to the hidden activations, which are the law of
+/// the read map's output (`W_fc`) or, for a gated MLP, the law of the gate's output times the up
+/// map's (`LayerNodes::pre`). Refused for an MLP with biases.
+pub fn mlps_of(native: &crate::operator_program::OperatorProgram, layers: &[crate::run_check::LayerNodes]) -> Result<Vec<Mlp>, String> {
+    use crate::operator_program::Node;
+    let map_of = |node: usize, input: usize| -> Result<Array2<f64>, String> {
+        match native.nodes.get(node) {
+            Some(Node::Affine { terms, bias: None }) if terms.len() == 1 && terms[0].0 == input => Ok(native.operators[terms[0].1].matrix()),
+            other => Err(error(format!("node {node} is not a bias-free map of node {input}: {other:?}"))),
+        }
+    };
+    let law_of = |node: usize| -> Result<(Law, usize), String> {
+        match native.nodes.get(node) {
+            Some(Node::Pointwise { input, laws }) if laws.windows(2).all(|w| w[0] == w[1]) && !laws.is_empty() => Ok((laws[0], *input)),
+            other => Err(error(format!("node {node} is not one law of a node: {other:?}"))),
+        }
+    };
+    layers
+        .iter()
+        .enumerate()
+        .map(|(l, layer)| {
+            let write = map_of(layer.mlp, layer.active)?;
+            let (read, law, up) = match native.nodes.get(layer.active) {
+                Some(Node::Hadamard { left, right }) => {
+                    let (law, gate) = law_of(*left)?;
+                    (map_of(gate, layer.normed)?, law, Some(map_of(*right, layer.normed)?))
+                }
+                _ => {
+                    let (law, pre) = law_of(layer.active)?;
+                    (map_of(pre, layer.normed)?, law, None)
+                }
+            };
+            if write.dim() != (read.ncols(), read.nrows()) || up.as_ref().is_some_and(|u| u.dim() != read.dim()) {
+                return Err(error(format!("layer {l}: the MLP's maps disagree in shape")));
+            }
+            Ok(Mlp { read, write, law, up })
+        })
+        .collect()
+}
+
 /// A tensor of an engine export (`export.json` and its float64 files), as the battery reads it.
 fn tensor(dir: &Path, record: &serde_json::Value, name: &str) -> Result<Array2<f64>, String> {
     let dims: Vec<usize> = record["files"][name]["shape"]
@@ -265,7 +344,7 @@ pub fn load(export: &Path, decomposition: &Path) -> Result<(Vec<Mlp>, Vec<VpdPar
             if write.dim() != (read.ncols(), read.nrows()) {
                 return Err(error(format!("layer {l}: W_fc {:?} and W_down {:?}", read.dim(), write.dim())));
             }
-            Ok(Mlp { read, write, law })
+            Ok(Mlp { read, write, law, up: None })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut parts = Vec::new();
@@ -304,7 +383,7 @@ pub(crate) fn random_slices(width: usize, seed: u64) -> Vec<Slice> {
     let mut normal = |rows: usize, cols: usize, scale: f64| Array2::from_shape_fn((rows, cols), |_| scale * (rng.random::<f64>() - 0.5));
     let mut out = Vec::new();
     for layer in [0, 1] {
-        let mlp = Arc::new(Mlp { read: normal(6, width, 1.0), write: normal(width, 6, 1.0), law: Law::GeluTanh });
+        let mlp = Arc::new(Mlp { read: normal(6, width, 1.0), write: normal(width, 6, 1.0), law: Law::GeluTanh, up: None });
         let (up, down) = ((normal(1, 6, 2.0), normal(1, width, 2.0)), (normal(1, width, 2.0), normal(1, 6, 2.0)));
         for (map, (u, v)) in [(Map::Up, up), (Map::Down, down)] {
             let part = VpdPart { block: 2 * layer + 1, layer, map, index: 0, u: u.row(0).to_owned(), v: v.row(0).to_owned() };
@@ -327,11 +406,40 @@ mod tests {
     /// exactly minus the output (1e-12), and each neuron's edit is its activation times its column.
     /// A random slice is a rank-one map of the down map's top singular value (`‖u‖ ‖v‖` equal to it,
     /// checked against the largest `‖W x‖` over the power iteration's own direction).
+    /// A gated MLP's slices (`h = φ(W_fc x) ⊙ (W_up x)`, SiLU): each edit is its slice's weight
+    /// edit of the MLP (1e-12), and its tangent and pullback are transposes of each other (1e-12),
+    /// for slices of either map at several factors.
+    #[test]
+    fn a_gated_mlps_slices_are_weight_edits_and_their_derivatives_transpose() {
+        let mut rng = StdRng::seed_from_u64(31);
+        let mut normal = |rows: usize, cols: usize| Array2::from_shape_fn((rows, cols), |_| rng.random::<f64>() - 0.5);
+        let mlp = Arc::new(Mlp { read: normal(7, 5), write: normal(5, 7), law: Law::Silu, up: Some(normal(7, 5)) });
+        let (x, dx, g) = (normal(1, 5).row(0).to_owned(), normal(1, 5).row(0).to_owned(), normal(1, 5).row(0).to_owned());
+        let output = |m: &Mlp| m.output(x.view());
+        let mut slices = neuron_slices(&mlp, 0);
+        slices.extend(random_slices_of(&mlp, 0, Map::Up, 3, 4));
+        slices.extend(random_slices_of(&mlp, 0, Map::Down, 3, 5));
+        for slice in &slices {
+            let piece = slice.part.u.clone().insert_axis(ndarray::Axis(1)).dot(&slice.part.v.clone().insert_axis(ndarray::Axis(0)));
+            for alpha in [0.0, 0.5, 3.0] {
+                let edited = match slice.part.map {
+                    Map::Up => Mlp { read: &mlp.read + &(&piece * (alpha - 1.0)), ..(*mlp).clone() },
+                    Map::Down => Mlp { write: &mlp.write + &(&piece * (alpha - 1.0)), ..(*mlp).clone() },
+                };
+                let (want, got) = (output(&edited) - output(&mlp), slice.edit(x.view(), alpha));
+                let scale = want.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+                assert!(want.iter().zip(&got).all(|(a, b)| (a - b).abs() <= 1e-12 * scale), "{:?} {} at {alpha}", slice.part.map, slice.part.index);
+                let (forward, backward) = (slice.tangent(x.view(), alpha, dx.view()).dot(&g), slice.pullback(x.view(), alpha, g.view()).dot(&dx));
+                assert!((forward - backward).abs() <= 1e-12 * (1.0 + backward.abs()), "{:?} {} at {alpha}: tangent {forward}, pullback {backward}", slice.part.map, slice.part.index);
+            }
+        }
+    }
+
     #[test]
     fn neuron_slices_sum_to_the_down_map_and_random_slices_have_its_scale() {
         let mut rng = StdRng::seed_from_u64(3);
         let mut normal = |rows: usize, cols: usize| Array2::from_shape_fn((rows, cols), |_| rng.random::<f64>() - 0.5);
-        let mlp = Arc::new(Mlp { read: normal(7, 5), write: normal(5, 7), law: Law::GeluTanh });
+        let mlp = Arc::new(Mlp { read: normal(7, 5), write: normal(5, 7), law: Law::GeluTanh, up: None });
         let x = normal(5, 1).column(0).to_owned();
         let neurons = neuron_slices(&mlp, 0);
         assert_eq!(neurons.len(), 7);
@@ -457,7 +565,7 @@ mod tests {
         let (up_u, up_v, down_u, down_v) = (normal(slices, hidden), normal(d, slices), normal(slices, d), normal(hidden, slices));
         let x = normal(d, 1).column(0).to_owned();
         for law in [Law::GeluTanh, Law::Gelu, Law::Relu] {
-            let mlp = Mlp { read: up_v.dot(&up_u).t().to_owned(), write: down_v.dot(&down_u).t().to_owned(), law };
+            let mlp = Mlp { read: up_v.dot(&up_u).t().to_owned(), write: down_v.dot(&down_u).t().to_owned(), law, up: None };
             let base = mlp.output(x.view());
             for (map, u, v) in [(Map::Up, &up_u, &up_v), (Map::Down, &down_u, &down_v)] {
                 for i in 0..slices {
