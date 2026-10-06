@@ -1924,17 +1924,30 @@ upload_inputs() {
 }
 
 # The Hugging Face snapshots COMMAND names, downloaded by the pod at their revisions.
-# The published inputs, from rp-run-data on GitHub, eight at a time, checked against their sha256.
+# The published inputs, from rp-run-data on GitHub, checked against their sha256s: sixteen requests
+# at a time, a file over FETCH_PIECE bytes in byte ranges of that size written in place. From a
+# datacenter (a GitHub Actions runner) one connection fetched a 2.0 GB asset in 25 s, eight ranges
+# written in place in 6.5 to 8.7 s.
+FETCH_PIECE=$(( 128 << 20 ))
 fetch_published() {
     [ ${#fetched[@]} -gt 0 ] || return 0
-    local started=$(date +%s) sums
+    local started=$(date +%s) sums sha f size k jobs="" total=0
     sums=$(printf '%s\n' "${fetched[@]}" | awk '{ sha = $1; $1 = ""; sub(/^ /, ""); print sha "  " $0 }')
-    printf '%s\n' "${fetched[@]}" | on_pod "cd $WS/mpd-data 2> /dev/null || mkdir -p $WS/mpd-data && cd $WS/mpd-data
-        while read -r sha rel; do mkdir -p \"\$(dirname \"\$rel\")\"; printf '%s %s\\n' \"\$sha\" \"\$rel\"; done |
-            xargs -P 8 -L 1 sh -c 'curl -fsSL --retry 3 -o \"\$1\" $DATA_ASSETS/\$0'" || return 1
+    for e in "${fetched[@]}"; do
+        read -r sha f <<< "$e"
+        size=$(stat -L -f %z "$MAC_DATA/$f")
+        total=$(( total + size ))
+        if (( size > FETCH_PIECE )); then
+            for (( k = 0; k * FETCH_PIECE < size; k++ )); do jobs+="$sha $f $(( k * FETCH_PIECE )) $(( (k + 1) * FETCH_PIECE - 1 )) $size"$'\n'; done
+        else
+            jobs+="$sha $f - - $size"$'\n'
+        fi
+    done
+    printf '%s' "$jobs" | on_pod "mkdir -p $WS/mpd-data && cd $WS/mpd-data && tee .fetch.jobs | while read -r sha rel a b size; do mkdir -p \"\$(dirname \"\$rel\")\"; [ \"\$a\" = - ] || truncate -s \$size \"\$rel\"; done &&
+        xargs -P 16 -L 1 sh -c 'if [ \"\$2\" = - ]; then curl -fsSL --retry 3 -o \"\$1\" $DATA_ASSETS/\$0; else curl -fsSL --retry 3 -r \$2-\$3 $DATA_ASSETS/\$0 | dd of=\"\$1\" bs=4M iflag=fullblock oflag=seek_bytes seek=\$2 conv=notrunc status=none; fi' < .fetch.jobs && rm -f .fetch.jobs" || return 1
     on_pod "cd $WS/mpd-data && sha256sum -c --quiet" <<< "$sums" || { say "a downloaded input differs from its sha256; refusing to run"; touch "$TMP/refused"; return 1; }
     echo $(( $(date +%s) - started )) >> "$TMP/upload_s"
-    say "downloaded ${#fetched[@]} published inputs, $(( $(printf '%s\n' "${fetched[@]}" | while read -r _ f; do stat -L -f %z "$MAC_DATA/$f"; done | awk '{ s += $1 } END { print int(s / 1048576) }') )) MB, in $(( $(date +%s) - started )) s"
+    say "downloaded ${#fetched[@]} published inputs, $(( total >> 20 )) MB, in $(( $(date +%s) - started )) s"
 }
 
 fetch_models() {
