@@ -1383,8 +1383,8 @@ pub struct Settings {
     #[serde(default)]
     pub epochs: Option<usize>,
     /// The families of each base's patched experiment, one drawn uniformly per base
-    /// (`interchange::Family`): `read` (a read patch, `interchange::sample`), `swap`, `zero` and
-    /// `scale` (operations on sites every explanation shares with `M`,
+    /// (`interchange::Family`): `read` (a read patch, `interchange::sample`), `swap`, `zero`,
+    /// `scale` and `cut` (operations on sites every explanation shares with `M`,
     /// `interchange::Interchange::draw_ops`). Empty (the default) is `read` alone. The families left
     /// out (`push`, and any the edits driver scores) are the held-out operation types.
     #[serde(default)]

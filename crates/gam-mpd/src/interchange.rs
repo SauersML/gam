@@ -235,6 +235,9 @@ fn flat_sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorPro
             shared.insert(SharedSite::Head(h), *node);
         }
     }
+    for (b, read) in reads.iter().enumerate() {
+        shared.insert(SharedSite::Input(b), *read);
+    }
     for (l, layer) in layers.iter().enumerate() {
         if let Some(node) = at(layer.attention).ok().filter(|n| *n > reads[2 * l] && *n < entries[2 * l + 1]) {
             shared.insert(SharedSite::Attention(l), node);
@@ -315,8 +318,8 @@ pub enum Patch {
 
 /// A site every explanation shares with `M`, each model holding it at its own node: the stream
 /// after block `b` (block `2l` is layer `l`'s attention, `2l + 1` its MLP), head `h`'s attention
-/// output (heads numbered layer by layer), layer `l`'s attention output (the `o` site's) and its
-/// MLP output.
+/// output (heads numbered layer by layer), layer `l`'s attention output (the `o` site's), its MLP
+/// output, and block `b`'s read (its normed input).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SharedSite {
@@ -324,6 +327,9 @@ pub enum SharedSite {
     Head(usize),
     Attention(usize),
     Mlp(usize),
+    /// Block `b`'s read: its normed input (a layer's heads' query, key and value input, or its
+    /// MLP's input).
+    Input(usize),
 }
 
 impl SharedSite {
@@ -334,6 +340,7 @@ impl SharedSite {
             SharedSite::Head(h) => heads.get(*h).copied(),
             SharedSite::Attention(l) => Some(2 * l),
             SharedSite::Mlp(l) => Some(2 * l + 1),
+            SharedSite::Input(b) => Some(*b),
         }
     }
 }
