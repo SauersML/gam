@@ -119,7 +119,11 @@ class Runner:
         return self.inner.norm(h)
 
     def log_probs(self, h: torch.Tensor) -> torch.Tensor:
-        return torch.log_softmax(self.model.lm_head(h).float(), dim=-1)
+        """Log-probabilities from the float32 logits, normalized in float64 where the device has it (not on
+        Apple's GPU): in float32 the normalization over 151,936 tokens leaves a KL floor near 1e-7 nats
+        (measured against oracle.rs), far above what the forward pass's own rounding contributes."""
+        wide = torch.float32 if self.dev.type == "mps" else torch.float64
+        return torch.log_softmax(self.model.lm_head(h).to(wide), dim=-1)
 
 
 def parse_layers(text: str, count: int) -> list[int]:
