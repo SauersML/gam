@@ -10,9 +10,11 @@ placeholders) and, thinking on, may call two tools on the target model before it
   restore_target()  removes every edit.
 Its final reply's text after "Description:" is the description (empty if absent).
 
-Reward: -[L(description) + L(behaviour | description)] in bits, from codelength.py's service (the
-description under the frozen prior model, the subcomponent's measured activity levels and next-token
-directions under the frozen text-only reader).
+Reward: -S(z) = -[L(z) + sum over experiments (x, a) of KL(p_M(. | x, a) || R(. | z, x, a))] in bits,
+from codelength.py's service: z under the frozen prior model, and how far a frozen text-only reader R,
+given z, the text and the edit in words, is from M's next-token distribution under no edit, removal and
+doubling of the subcomponent at the peak of its strongest and other contexts (a row-edit table,
+vpd_labels.py --edit row; --labels must be one). The no-description reader is the baseline.
 
 GRPO. Per subcomponent, G episodes sampled at temperature 1; advantage (r - mean) / std within its group
 (0 when the group's rewards are equal); loss = -mean over episodes of advantage x (mean log-probability

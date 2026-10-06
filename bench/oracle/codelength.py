@@ -1,23 +1,23 @@
-"""The description reward of the oracle (#2951): the two-part code length, in bits, of a subcomponent's
-measured behaviour (vpd_labels.py's table for VPD's vpd4l decomposition) given a description:
+"""The description score of the oracle (#2951): a description z of one of VPD's vpd4l subcomponents,
+scored by how well a frozen text-only reader R, given z alone, predicts the model M's next-token
+distributions under edits of the subcomponent, plus the description's own length:
 
-  L(description)   -log2 of the description under a frozen prior model (the oracle's own base model,
-                   read as the answer to a fixed request to describe a component), so a long or unlikely
-                   description pays for itself;
-  L(behaviour | description) under a frozen text-only reader, -log2 q summed over
-    activity       in each of the subcomponent's measured contexts (its `--top` strongest and `--others`
-                   others), the text listed one native token per line, each followed by a tab and the
-                   subcomponent's activity level there on 0-9 (floor(10 |a| / a_max), 9 at most; a_max its
-                   largest |v . x| over its measured contexts), each level read after everything listed
-                   before it (a sequential code in one teacher-forced pass per context);
-    directions     at the peak of each of its strongest contexts: the 10 next tokens whose probability
-                   rises most and the 10 that fall most when it is removed (alpha 0), in a seeded order,
-                   each followed by " up" or " down".
-The oracle's reward is -[L(description) + L(behaviour | description)]; L(behaviour | nothing) is
-reported beside it (the empty description, with no description bits). The description comes first in
-every reader prompt, so a reader with prefix caching reads it once per subcomponent.
+  S(z) = L(z) + sum over (x, a) of KL(p_M(. | x, a) || R(. | z, x, a))   in bits,
 
-  codelength.py score --labels DIR --items D.jsonl --reader-backend vllm --reader Qwen/Qwen3-8B
+  L(z)       -log2 of z under a frozen prior model (read as the answer to a fixed request to describe a
+             component), so a long or unlikely description pays for itself;
+  (x, a)     the experiments: contexts x, the subcomponent's `--top` strongest and `--others` other
+             contexts of a row-edit label table (vpd_labels.py --edit row), each cut at its peak p, times
+             the edits a: none, removal at p and doubling at p (M's weight edit W + (alpha - 1) u v^T at
+             row p, alpha 0 and 2), so cases where the edit changes nothing count as well;
+  p_M        M's next-token distribution at p under a, computed here (vpd_labels.Model);
+  R(t | ...) R's probability of answering with token t's text and then ending its turn (so different
+             tokens are disjoint answers), over M's `--candidates` most probable tokens S, and
+             R(other) = 1 - sum over S, the rest; KL over S and the rest.
+The reward of a description is -S(z); S(none) = sum KL(p_M || R(. | no description)) is reported beside
+it (no description, no L), and saved_bits = S(none) - S(z).
+
+  codelength.py score --labels ROW_TABLE --uv UV --items D.jsonl --reader-backend vllm --reader Qwen/Qwen3-8B
                       --prior-backend vllm --prior Qwen/Qwen3-1.7B --out OUT.jsonl
   codelength.py serve ... --listen HOST:PORT     ({"op": "score", "items": [...]} -> {"ok": {"results": [...]}})
 D.jsonl lines {"id", "component": [layer, kind, index], "description"}.
@@ -39,59 +39,77 @@ from safetensors.numpy import load_file
 
 import reader as R
 
-BINS = 10
 LN2 = math.log(2.0)
 TOKENIZER = Path.home() / "mpd-data/vpd/t-9d2b8f02/tokenizer.json"
+EDITS = (("none", None), ("removed", 0.0), ("made 2 times stronger", 2.0))
 
-ACTIVATION_PROMPT = (
-    "A component of a language model is described as follows.\n\nDescription: {description}\n\n"
-    "Below is a text, one token per line. After each token, write a tab and the component's activity at that "
-    "token on a scale of 0 to 9 (0: inactive; 9: its largest activity)."
-)
-DIRECTION_PROMPT = (
-    "A component of a language model is described as follows.\n\nDescription: {description}\n\n"
-    "The model reads the text below. If this component is removed, the model's probability of each listed next "
-    "token changes. For each token, write whether its probability goes up or down.\n\nText: {text}"
+NEXT_PROMPT = (
+    "A component of a 4-layer language model is described as follows.\n\nDescription: {description}\n\n"
+    "The model reads the text below{edit}. Answer with the model's most likely next token after the text, "
+    "and nothing else.\n\nText: {text}"
 )
 PRIOR_PROMPT = "Describe what this component of a language model responds to and what it does."
 
 
-class Labels:
-    """A vpd_labels.py run, by subcomponent, with the target's tokens as strings."""
+class Behaviour:
+    """A row-edit label table (contexts and peaks) and the target M, giving per subcomponent its
+    experiments: (text up to the peak, the edit in words, M's candidate tokens' texts, their
+    probabilities, the rest's probability)."""
 
-    def __init__(self, root: Path, top: int, others: int, tokenizer: Path = TOKENIZER):
+    def __init__(self, root: Path, uv: Path, top: int, others: int, candidates: int, tokenizer: Path = TOKENIZER):
         import tokenizers
+        import torch
+        from vpd_labels import Model, load_uv
 
+        self.torch = torch
         self.root = root
-        self.top, self.others = top, others
+        self.top, self.others, self.candidates = top, others, candidates
         self.tokens = load_file(str(root / "contexts.safetensors"))["tokens"]
         self.tok = tokenizers.Tokenizer.from_file(str(tokenizer))
         self.meta = {}
         for path in root.glob("site_*.json"):
             m = json.loads(path.read_text())
+            assert m.get("edit") == "row", f"{path}: a row-edit table (vpd_labels.py --edit row) is required"
             self.meta[(m["layer"], m["site"].split(".")[-1])] = (m, path.with_suffix(".safetensors"))
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = Model(dev)
+        self.uv = load_uv(dev, uv)
 
     @lru_cache(maxsize=4)
     def site(self, layer: int, kind: str) -> dict:
         return load_file(str(self.meta[(layer, kind)][1]))
 
-    def piece(self, token: int) -> str:
-        return self.tok.decode([int(token)])
-
-    def record(self, layer: int, kind: str, c: int) -> dict:
+    @lru_cache(maxsize=4096)
+    def experiments(self, layer: int, kind: str, c: int) -> tuple:
+        """c is the subcomponent's index in the table (its subcomponent number in `subcomponents`)."""
+        torch = self.torch
         d = self.site(layer, kind)
-        top = self.meta[(layer, kind)][0]["top"]
-        chosen = list(range(min(self.top, top))) + list(range(top, top + self.others))
-        act = d["activity"][c].astype(np.float64)
-        peak = np.abs(act).max()
-        levels = np.zeros(act.shape, dtype=np.int64) if peak <= 0 else np.clip(np.floor(BINS * np.abs(act) / peak), 0, BINS - 1).astype(np.int64)
-        contexts = d["contexts"][c]
-        return {
-            "activity": [([self.piece(t) for t in self.tokens[int(contexts[j])]], levels[j]) for j in chosen],
-            "directions": [(self.tok.decode(self.tokens[int(contexts[j]), : int(d["position"][c, j]) + 1].tolist()),
-                            [self.piece(t) for t in d["up_ids_ablate"][c, j]], [self.piece(t) for t in d["down_ids_ablate"][c, j]])
-                           for j in range(min(self.top, top))],
-        }
+        meta = self.meta[(layer, kind)][0]
+        chosen = list(range(min(self.top, meta["top"]))) + list(range(meta["top"], meta["top"] + self.others))
+        name = f"h.{layer}.{'mlp' if kind in ('c_fc', 'down_proj') else 'attn'}.{kind}"
+        U, V = self.uv[name]
+        sub = int(d["subcomponents"][c])
+        dev = self.model.dev
+        rows = torch.tensor([int(d["contexts"][c, j]) for j in chosen], device=dev)
+        pos = torch.tensor([int(d["position"][c, j]) for j in chosen], device=dev)
+        ids = torch.from_numpy(self.tokens[rows.cpu().numpy()].astype(np.int64)).to(dev)
+        entering, final = self.model.clean(ids)
+        at = torch.arange(len(chosen), device=dev)
+        out = []
+        for words, alpha in EDITS:
+            if alpha is None:
+                lp = self.model.log_probs(final[at, pos])
+            else:
+                edit = (name, V[:, sub][None].expand(len(chosen), -1), U[sub][None].expand(len(chosen), -1), torch.full((len(chosen),), alpha - 1.0, device=dev), pos, pos + 1)
+                h, _ = self.model.from_layer(layer, entering[layer], edit)
+                lp = self.model.log_probs(h[at, pos])
+            p = lp.exp().double().cpu().numpy()
+            for r in range(len(chosen)):
+                top = np.argsort(-p[r])[: self.candidates]
+                text = self.tok.decode(ids[r, : int(pos[r]) + 1].tolist())
+                said = "" if alpha is None else f", with this component {words} at its last token"
+                out.append((text, said, tuple(self.tok.decode([int(t)]) for t in top), tuple(float(x) for x in p[r, top]), float(max(0.0, 1.0 - p[r, top].sum()))))
+        return tuple(out)
 
 
 class Prompts:
@@ -99,11 +117,7 @@ class Prompts:
 
     def __init__(self, tokenizer):
         self.tok = tokenizer
-        enc = lambda s: tokenizer.encode(s, add_special_tokens=False)  # noqa: E731
-        self.enc = enc
-        self.digits = [enc(str(b))[0] for b in range(BINS)]
-        self.tab, self.newline = enc("\t")[0], enc("\n")[0]
-        self.up, self.down = enc(" up")[0], enc(" down")[0]
+        self.enc = lambda s: tokenizer.encode(s, add_special_tokens=False)  # noqa: E731
 
     def chat(self, user: str, answer_ids: list[int]) -> tuple[list[int], int]:
         marker = "\u0000ANSWER\u0000"
@@ -112,25 +126,11 @@ class Prompts:
         a = self.enc(head)
         return a + answer_ids + self.enc(tail), len(a)
 
-    def activity(self, description: str, pieces: list[str], levels) -> tuple[list[int], list[int]]:
-        answer, scored = [], []
-        for piece, b in zip(pieces, levels.tolist()):
-            answer += self.enc(piece) + [self.tab]
-            scored.append(len(answer))
-            answer += [self.digits[b], self.newline]
-        ids, start = self.chat(ACTIVATION_PROMPT.format(description=description or "(none)"), answer)
-        return ids, [start + j for j in scored]
-
-    def directions(self, description: str, text: str, up: list[str], down: list[str], rng) -> tuple[list[int], list[int]]:
-        items = [(p, self.up) for p in up] + [(p, self.down) for p in down]
-        items = [items[i] for i in rng.permutation(len(items))]
-        answer, scored = [], []
-        for piece, word in items:
-            answer += self.enc(piece)
-            scored.append(len(answer))
-            answer += [word, self.newline]
-        ids, start = self.chat(DIRECTION_PROMPT.format(description=description or "(none)", text=text), answer)
-        return ids, [start + j for j in scored]
+    def answer(self, description: str, text: str, edit: str, candidate: str) -> tuple[list[int], list[int]]:
+        """The candidate's text as the reader's whole answer: its tokens and the end of the turn scored."""
+        answer = self.enc(candidate)
+        ids, start = self.chat(NEXT_PROMPT.format(description=description or "(none)", edit=edit, text=text), answer)
+        return ids, list(range(start, start + len(answer) + 1))
 
     def prior(self, description: str) -> tuple[list[int], list[int]]:
         answer = self.enc(description)
@@ -138,45 +138,49 @@ class Prompts:
         return ids, list(range(start, start + len(answer)))
 
 
-def score(reader, prior, labels: Labels, items: list[dict]) -> list[dict]:
+def kl_bits(p: tuple, rest: float, log_q: list[float]) -> float:
+    """KL(p || q) in bits over the candidates and the rest, q(rest) = 1 - sum q (at least 1e-9)."""
+    q = np.exp(np.array(log_q))
+    q_rest = max(1e-9, 1.0 - float(q.sum()))
+    p_ = np.array(p)
+    keep = p_ > 0
+    kl = float((p_[keep] * (np.log(p_[keep]) - np.log(np.maximum(q[keep], 1e-300)))).sum())
+    if rest > 0:
+        kl += rest * (math.log(rest) - math.log(q_rest))
+    return kl / LN2
+
+
+def score(reader, prior, behaviour: Behaviour, items: list[dict]) -> list[dict]:
     """Bits per item (module note), and each component's no-description bits once per call."""
     rp, pp = Prompts(reader.tokenizer), Prompts(prior.tokenizer)
-    jobs: list[tuple[object, str, list[int], list[int]]] = []
-    components = sorted({tuple(it["component"]) for it in items})
-    for comp in components:
-        for part, ids, at in parts(rp, labels, comp, ""):
-            jobs.append((("nothing", comp), part, ids, at))
-    for i, it in enumerate(items):
-        for part, ids, at in parts(rp, labels, tuple(it["component"]), it["description"]):
-            jobs.append((i, part, ids, at))
+    jobs: list[tuple[object, int, list[int], list[int]]] = []
+    exps: dict[tuple, tuple] = {}
+    keyed = [(("nothing", tuple(c)), "", tuple(c)) for c in sorted({tuple(it["component"]) for it in items})] + [(i, it["description"], tuple(it["component"])) for i, it in enumerate(items)]
+    for key, description, comp in keyed:
+        exps[comp] = behaviour.experiments(int(comp[0]), str(comp[1]), int(comp[2]))
+        for e, (text, edit, cands, _, _) in enumerate(exps[comp]):
+            for cand in cands:
+                jobs.append((key, e, *rp.answer(description, text, edit, cand)))
     lps = reader.token_log_probs([j[2] for j in jobs], [j[3] for j in jobs])
+    per: dict[tuple, list[float]] = {}
+    for (key, e, _, _), lp in zip(jobs, lps):
+        per.setdefault((key, e), []).append(float(lp.sum()))
     prior_jobs = [(i, *pp.prior(it["description"])) for i, it in enumerate(items) if it["description"]]
     prior_lps = prior.token_log_probs([j[1] for j in prior_jobs], [j[2] for j in prior_jobs]) if prior_jobs else []
-    bits: dict[object, dict[str, float]] = {}
-    for (key, part, _, _), lp in zip(jobs, lps):
-        bits.setdefault(key, {"description": 0.0, "activity": 0.0, "directions": 0.0})[part] += float(-lp.sum() / LN2)
-    for (i, _, _), lp in zip(prior_jobs, prior_lps):
-        bits[i]["description"] = float(-lp.sum() / LN2)
+    description_bits = {i: float(-lp.sum() / LN2) for (i, _, _), lp in zip(prior_jobs, prior_lps)}
+
+    def behaviour_bits(key, comp) -> float:
+        return sum(kl_bits(p, rest, per[(key, e)]) for e, (_, _, _, p, rest) in enumerate(exps[comp]))
+
     out = []
     for i, it in enumerate(items):
-        b = bits[i]
-        b["total"] = b["description"] + b["activity"] + b["directions"]
-        base = bits[("nothing", tuple(it["component"]))]
-        nothing = base["activity"] + base["directions"]
-        out.append({"id": it.get("id"), "component": list(it["component"]), "bits": b, "nothing_bits": nothing, "reward": -b["total"], "saved_bits": nothing - b["total"]})
+        comp = tuple(it["component"])
+        b = {"description": description_bits.get(i, 0.0), "behaviour": behaviour_bits(i, comp)}
+        b["total"] = b["description"] + b["behaviour"]
+        nothing = behaviour_bits(("nothing", comp), comp)
+        out.append({"id": it.get("id"), "component": list(comp), "bits": b, "nothing_bits": nothing, "reward": -b["total"], "saved_bits": nothing - b["total"],
+                    "experiments": len(exps[comp])})
     return out
-
-
-def parts(prompts: Prompts, labels: Labels, comp: tuple, description: str):
-    layer, kind, c = int(comp[0]), str(comp[1]), int(comp[2])
-    rec = labels.record(layer, kind, c)
-    rng = np.random.default_rng([layer, c])
-    for pieces, levels in rec["activity"]:
-        ids, at = prompts.activity(description, pieces, levels)
-        yield "activity", ids, at
-    for text, up, down in rec["directions"]:
-        ids, at = prompts.directions(description, text, up, down, rng)
-        yield "directions", ids, at
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -206,7 +210,9 @@ def backend(kind: str, model: str, args, share: float):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["score", "serve"])
-    ap.add_argument("--labels", required=True)
+    ap.add_argument("--labels", required=True, help="a row-edit label table (vpd_labels.py --edit row)")
+    ap.add_argument("--uv", required=True, help="VPD's subcomponents (uv.safetensors)")
+    ap.add_argument("--candidates", type=int, default=16, help="M's most probable next tokens scored one by one (the rest pooled)")
     ap.add_argument("--tokenizer", default=str(TOKENIZER), help="the target's tokenizer.json")
     ap.add_argument("--reader-backend", required=True, choices=["vllm", "transformers"])
     ap.add_argument("--reader", required=True)
@@ -226,16 +232,16 @@ def main():
     args = ap.parse_args()
     reader = backend(args.reader_backend, args.reader, args, args.gpu_memory_utilization)
     prior = reader if (args.prior, args.prior_backend) == (args.reader, args.reader_backend) else backend(args.prior_backend, args.prior, args, args.prior_gpu_memory_utilization)
-    labels = Labels(Path(args.labels), args.top, args.others, Path(args.tokenizer))
+    behaviour = Behaviour(Path(args.labels), Path(args.uv), args.top, args.others, args.candidates, Path(args.tokenizer))
     if args.command == "serve":
         host, sep, port = args.listen.rpartition(":")
         server = socketserver.TCPServer((host, int(port)), _Handler) if sep and port.isdigit() else socketserver.UnixStreamServer(args.listen, _Handler)
-        server.reader, server.prior, server.labels = reader, prior, labels
+        server.reader, server.prior, server.labels = reader, prior, behaviour
         print(f"code-length scorer: reader {R.describe(reader)}, prior {R.describe(prior)}, listening on {args.listen}", file=sys.stderr, flush=True)
         server.serve_forever()
     items = [json.loads(line) for line in open(args.items) if line.strip()]
     start = time.time()
-    rows = score(reader, prior, labels, items)
+    rows = score(reader, prior, behaviour, items)
     with open(args.out, "w") as f:
         for r in rows:
             f.write(json.dumps({**r, "reader": R.describe(reader), "prior": R.describe(prior)}) + "\n")
