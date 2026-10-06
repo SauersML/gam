@@ -1280,7 +1280,7 @@ if [ ${#uploads[@]} -gt 0 ]; then
 fi
 # Published inputs ("SHA256 REL") are downloaded by the pod; the rest go up from the Mac, at most
 # UPLOAD_MAX_MB of them.
-fetched=() unpublished_kb=0
+fetched=() unpublished_kb=0 FETCH_BYTES=0
 if [ ${#files[@]} -gt 0 ]; then
     kept=()
     for f in "${files[@]}"; do
@@ -1293,6 +1293,7 @@ if [ ${#files[@]} -gt 0 ]; then
         fi
     done
     files=("${kept[@]}")
+    FETCH_BYTES=$(for e in "${fetched[@]}"; do stat -L -f %z "$MAC_DATA/${e#* }"; done | awk '{ s += $1 } END { print s + 0 }')
     if (( unpublished_kb > UPLOAD_MAX_MB * 1024 )); then
         # A Pile export is published whole (the pod then downloads it instead of building it).
         echo "rp-run: $(( unpublished_kb / 1024 )) MB of inputs would go up from the Mac (at most $UPLOAD_MAX_MB MB); publish them once (public inputs only), then launch: rp-run publish $(printf "$MAC_DATA/%s " "${uploads[@]}" $(printf 'engine/%s\n' "${pile[@]}" | sort -u))" >&2
@@ -1392,7 +1393,7 @@ TMP=$(mktemp -d /tmp/rp-run.XXXXXX)
 ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$TMP/key"
 chmod 600 "$TMP/key"
 KEYS="$( [ -f "$TMP/key.pub" ] && cat "$TMP/key.pub")"$'\n'"$(cat ~/.ssh/runpod_ed25519.pub)"
-POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0 GUEST=0
+POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0 GUEST=0 EARLY_FETCH="" POD_HOST=""
 SSH=(ssh -F none -i "$TMP/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ForwardX11=no
      -o UserKnownHostsFile="$TMP/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20
      -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o LogLevel=ERROR)
@@ -1554,6 +1555,11 @@ reach() {
         sleep 5
     done
     say "ssh $SSH_USER@$IP -p $PORT up after $(( $(date +%s) - CREATED )) s"
+    # The published inputs start downloading now, while the pod's checks run (setup waits for them;
+    # a pod the checks discard takes its partial download with it).
+    if [ ${#fetched[@]} -gt 0 ] && [ -z "$EARLY_FETCH" ]; then
+        fetch_published & EARLY_FETCH=$!
+    fi
 }
 
 # The pod's own cap. A RunPod pod's timer starts with its container (dockerStartCmd: runpodctl with
@@ -1695,7 +1701,8 @@ launch() {
     local kind price gpu r code left host
     # A listed run relaunches only while still listed; a small run's approval covers its whole cap.
     [ "$APPROVAL" = auto ] || approved "$NAME" || { say "approval for $NAME withdrawn; not launching a pod"; exit 3; }
-    POD="" IP="" PORT=""
+    POD="" IP="" PORT="" EARLY_FETCH=""
+    rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
     host=$(find_host)
     if [ -n "$host" ] && attach "$host"; then
         return 0
@@ -1760,8 +1767,11 @@ launch() {
         say "pod $POD: ${gpu#thunder:}, $kind at \$$PRICE/h, host ${host:-?}"
         SSH_USER=root
         [ "$(provider_of "$POD")" = runpod ] || SSH_USER=ubuntu
+        POD_HOST=$host
         if [ -n "$host" ] && grep -qx "$host" "$BAD_HOSTS" 2> /dev/null; then
             say "host $host failed before; deleting pod $POD"
+        elif slow_host "$host"; then
+            say "host $host downloaded at $(awk -F'\t' -v h="$host" '$2 == h { r = $3 } END { print r }' "$RP/host_rates.tsv") MB/s before, too slow for this run's $(( FETCH_BYTES >> 20 )) MB of inputs; deleting pod $POD"
         elif ! reach; then
             [ -z "$host" ] || echo "$host" >> "$BAD_HOSTS"
             say "host $host recorded as failing; deleting pod $POD"
@@ -1780,6 +1790,8 @@ launch() {
             break
         fi
         [ -z "$IP" ] || on_pod -O exit > /dev/null 2>&1 || true
+        [ -z "$EARLY_FETCH" ] || { kill "$EARLY_FETCH" 2> /dev/null || true; wait "$EARLY_FETCH" 2> /dev/null || true; EARLY_FETCH=""; }
+        rm -f "$TMP/upload_s" "$TMP/refused"
         echo discarded > "$ACTIVE/.$POD.end"
         reap "$POD" || exit 1
         POD="" IP="" PORT=""
@@ -1948,6 +1960,25 @@ fetch_published() {
     on_pod "cd $WS/mpd-data && sha256sum -c --quiet" <<< "$sums" || { say "a downloaded input differs from its sha256; refusing to run"; touch "$TMP/refused"; return 1; }
     echo $(( $(date +%s) - started )) >> "$TMP/upload_s"
     say "downloaded ${#fetched[@]} published inputs, $(( total >> 20 )) MB, in $(( $(date +%s) - started )) s"
+    # The host's download rate (MB/s), for slow_host; only downloads large enough to measure it.
+    if [ -n "$POD_HOST" ] && (( total > FETCH_PIECE )); then
+        printf '%s\t%s\t%s\n' "$(date '+%F %T')" "$POD_HOST" "$(awk -v b="$total" -v t="$(( $(date +%s) - started ))" 'BEGIN { printf "%.1f", b / 1048576 / (t > 0 ? t : 1) }')" >> "$RP/host_rates.tsv"
+    fi
+}
+
+# Whether HOST's measured download rate would cost this run more than another pod: its inputs
+# (FETCH_BYTES) at HOST's last measured rate take longer than DISCARD_S (a new pod's boot and
+# checks, measured 23-34 s to SSH plus about 10 s of checks) plus the same inputs at the median rate
+# of every host measured (at least three).
+DISCARD_S=40
+slow_host() {  # HOST
+    [ -n "$1" ] && (( FETCH_BYTES > FETCH_PIECE )) && [ -f "$RP/host_rates.tsv" ] || return 1
+    local mine med
+    mine=$(awk -F'\t' -v h="$1" '$2 == h { r = $3 } END { print r }' "$RP/host_rates.tsv")
+    [ -n "$mine" ] || return 1
+    med=$(cut -f3 "$RP/host_rates.tsv" | sort -n | awk '{ a[NR] = $1 } END { if (NR >= 3) print a[int((NR + 1) / 2)] }')
+    [ -n "$med" ] || return 1
+    awk -v b="$FETCH_BYTES" -v r="$mine" -v m="$med" -v d="$DISCARD_S" 'BEGIN { mb = b / 1048576; exit !(mb / r > d + mb / m) }'
 }
 
 fetch_models() {
@@ -2155,8 +2186,7 @@ setup() {
     # The published inputs need nothing else: they start at once. Then the source, which the data
     # builds and the Python environment need: from GitHub at datacenter speed (the commit is
     # published), the Mac's archive if that fails.
-    rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
-    fetch_published & jobs+=($!)
+    if [ -n "$EARLY_FETCH" ]; then jobs+=("$EARLY_FETCH"); else fetch_published & jobs+=($!); fi
     local members
     members=$(printf "gam-$C/%s " crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md "${srcpaths[@]}")
     if on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && curl -fsSL --retry 3 https://codeload.github.com/SauersML/gam/tar.gz/$C |
