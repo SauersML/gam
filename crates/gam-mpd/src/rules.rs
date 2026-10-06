@@ -14,11 +14,6 @@
 //!   `Z`'s first `k` directions: the score is `λ` wherever the current token is the previous one.
 //! * **copy** ([`copy_prediction`]): an output head writes what its value head read, through the norm
 //!   gains, `O = λ diag(g / g_f) V⁺`, so the logits rise for the token the head attended to.
-//!
-//! [`match_alignment`] and [`copy_alignment`] say how much of a head's own circuit a rule's body
-//! accounts for, before anything is priced, and [`match_energy`] how much of it a match on given
-//! content planes explains; [`match_scale`] and [`copy_scale`] are the bindings'
-//! least-squares scales.
 
 use gam_linalg::decompose::{eigh, pseudo_inverse};
 use gam_linalg::roundoff::SymmetricAssembly;

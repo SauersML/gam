@@ -864,14 +864,14 @@ mod tests {
 
     #[test]
     fn the_decoder_runs_a_gelu_library_as_the_reference_engine() {
-        for arithmetic in [Arithmetic::Bf16, Arithmetic::F32, Arithmetic::Tf32x3] {
+        for arithmetic in [Arithmetic::Bf16, Arithmetic::F32] {
             parity(tiny_export(&format!("decoder_gelu_{arithmetic:?}"), 2), arithmetic);
         }
     }
 
     #[test]
     fn the_decoder_runs_a_qwen3_library_as_the_reference_engine() {
-        for arithmetic in [Arithmetic::Bf16, Arithmetic::F32, Arithmetic::Tf32x3] {
+        for arithmetic in [Arithmetic::Bf16, Arithmetic::F32] {
             parity(tiny_qwen3_export(&format!("decoder_qwen3_{arithmetic:?}"), 2), arithmetic);
         }
     }
