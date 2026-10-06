@@ -2696,10 +2696,13 @@ pub fn fit_from(
     }
     if fresh {
         let timed = Instant::now();
-        let curvature = laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens)?;
-        // The unit-information start's state goes before the Laplace start's is made.
+        let sums = laplace_sums(&mut scorer, &device_posterior, &draws, sequences, settings)?;
+        // The unit-information start's state goes before the Laplace start's is made, which
+        // takes its deviations and curvature one operator at a time.
         drop(device_posterior);
-        device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, Some(State::Curvature(&curvature)), 0)?;
+        device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, Some(State::Zero), 0)?;
+        laplace_start(&scorer, &mut posterior, sums, tokens, |i, log_sd, h| device_posterior.set_start(i, log_sd, h))?;
+        device_posterior.settle()?;
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
     // The curvature estimate averages over one epoch's batches: each batch weighs about once.
@@ -2975,17 +2978,10 @@ pub fn fit_from(
 /// `h = Σ_b u_b ⊙ u_b / N` (the batches' estimates `B / N · u_b ⊙ u_b`, averaged) estimates the
 /// Gauss–Newton diagonal per token. Each entry's deviation becomes `σ² = 1 / (N h + 1 / v_G)`, the
 /// minimum in `σ` of the data term's Gauss–Newton model `½ N h σ²` plus `KL(q ‖ p)`, instead of the
-/// epochs IVON's curvature average needs to fall from the start's `1 / v_G` to `h`. Returns IVON's
-/// curvature `h` per operator (its momentum and second moment start at zero, `State::Curvature`).
-fn laplace_start(
-    scorer: &mut Scorer,
-    posterior: &mut Posterior,
-    device_posterior: &DevicePosterior,
-    draws: &[Draw],
-    sequences: &[Vec<u32>],
-    settings: &Settings,
-    tokens: usize,
-) -> Result<Vec<Array2<f64>>, String> {
+/// epochs IVON's curvature average needs to fall from the start's `1 / v_G` to `h`. Returns the
+/// batches' sums `Σ_b u_b ⊙ u_b` per operator (by id), on the device they were summed on;
+/// [`laplace_start`] reads them one operator at a time.
+fn laplace_sums(scorer: &mut Scorer, device_posterior: &DevicePosterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings) -> Result<(Device, BTreeMap<usize, Tensor>), String> {
     let device = scorer.experiments.models().1.program.device().clone();
     // `Σ_b u_b ⊙ u_b` summed on the device, in float64 where it holds float64, and read once.
     let wide = match device.with_storage(Storage::F64) {
@@ -3013,22 +3009,41 @@ fn laplace_start(
             }
         }
     }
-    let mut curvature: Vec<Array2<f64>> = posterior.mean.iter().map(|m| Array2::zeros(m.dim())).collect();
-    for (op, sum) in &sums {
-        curvature[scorer.at(*op)?] = wide.download(sum).map_err(error)?;
+    Ok((wide, sums))
+}
+
+/// The Laplace start from the batches' sums ([`laplace_sums`]), one operator at a time: its
+/// curvature `h` read off the device, its deviations set from it in `posterior`, and both handed
+/// to `set` (the device posterior's [`DevicePosterior::set_start`]) before the next operator's are
+/// read, so no more than one operator's curvature is on the host.
+fn laplace_start(
+    scorer: &Scorer,
+    posterior: &mut Posterior,
+    (wide, sums): (Device, BTreeMap<usize, Tensor>),
+    tokens: usize,
+    mut set: impl FnMut(usize, &Array2<f64>, &Array2<f64>) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut at = BTreeMap::new();
+    for (op, sum) in sums {
+        at.insert(scorer.at(op)?, sum);
     }
     let variance: Vec<f64> = posterior.moments().iter().map(|m| if m.count > 0.0 { m.second / m.count } else { 0.0 }).collect();
     let n = tokens as f64;
-    for (i, h) in curvature.iter_mut().enumerate() {
+    for i in 0..posterior.mean.len() {
+        let mut h = match at.remove(&i) {
+            Some(sum) => wide.download(&sum).map_err(error)?,
+            None => Array2::zeros(posterior.mean[i].dim()),
+        };
         h.mapv_inplace(|square| square / n);
-        ndarray::Zip::from(&mut posterior.log_sd[i]).and(&*h).and(&posterior.membership[i]).for_each(|s, h, group| {
+        ndarray::Zip::from(&mut posterior.log_sd[i]).and(&h).and(&posterior.membership[i]).for_each(|s, h, group| {
             let v = variance[*group as usize];
             if *s != f64::NEG_INFINITY && v > 0.0 {
                 *s = -0.5 * (n * h + 1.0 / v).ln();
             }
         });
+        set(i, &posterior.log_sd[i], &h)?;
     }
-    Ok(curvature)
+    Ok(())
 }
 
 /// The noise stream of the removal estimates' weight samples: one no epoch draws (training takes
@@ -3258,7 +3273,8 @@ pub fn start_posterior(device: &Device, native: &OperatorProgram, explanation: &
     }
     let mut posterior = Posterior::new(explanation, tokens)?;
     let device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, None, 0)?;
-    laplace_start(&mut scorer, &mut posterior, &device_posterior, &draws, sequences, settings, tokens)?;
+    let sums = laplace_sums(&mut scorer, &device_posterior, &draws, sequences, settings)?;
+    laplace_start(&scorer, &mut posterior, sums, tokens, |_, _, _| Ok(()))?;
     Ok(posterior)
 }
 

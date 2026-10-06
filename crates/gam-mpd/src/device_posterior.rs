@@ -88,17 +88,18 @@ pub enum State<'a> {
     /// Per operator the gradient's momentum, the curvature estimate and the gradient's second
     /// moment (a checkpoint's).
     Saved(&'a [[Array2<f64>; 3]]),
-    /// Per operator the curvature estimate, the momentum and the second moment zero (a Laplace
-    /// start): the zeros are made on the device, not sent from the host.
-    Curvature(&'a [Array2<f64>]),
+    /// The momentum, the curvature and the second moment zero, made on the device: a start whose
+    /// deviations and curvature are then set one operator at a time ([`DevicePosterior::set_start`],
+    /// the Laplace start).
+    Zero,
 }
 
 impl State<'_> {
-    /// The operators it holds a state for.
-    fn len(&self) -> usize {
+    /// The operators it holds a state for, when it holds one per operator.
+    fn len(&self) -> Option<usize> {
         match self {
-            Self::Saved(moments) => moments.len(),
-            Self::Curvature(curvature) => curvature.len(),
+            Self::Saved(moments) => Some(moments.len()),
+            Self::Zero => None,
         }
     }
 }
@@ -228,7 +229,7 @@ impl DevicePosterior {
         };
         let shapes: Vec<(usize, usize)> = parts.mean.iter().map(Array2::dim).collect();
         let sizes_agree = parts.log_sd.iter().map(Array2::dim).eq(shapes.iter().copied()) && parts.groups.iter().map(Vec::len).eq(shapes.iter().map(|(r, c)| r * c));
-        if shapes.len() != parts.operators.len() || !sizes_agree || moments.as_ref().is_some_and(|m| m.len() != shapes.len()) {
+        if shapes.len() != parts.operators.len() || !sizes_agree || moments.as_ref().and_then(State::len).is_some_and(|n| n != shapes.len()) {
             return Err(error("one posterior array and group list per trainable operator required"));
         }
         if parts.groups.iter().flatten().any(|g| *g as usize >= parts.count) {
@@ -266,7 +267,7 @@ impl DevicePosterior {
             let zero = |d: &Device| d.zeros(rows, cols).map_err(error);
             Ok(match &moments {
                 Some(State::Saved(m)) => [moment(&m[i][0])?, up(&m[i][1])?, up(&m[i][2])?],
-                Some(State::Curvature(h)) => [zero(&narrow)?, up(&h[i])?, zero(&master)?],
+                Some(State::Zero) => [zero(&narrow)?, zero(&master)?, zero(&master)?],
                 None => [zero(&narrow)?, up(&start(&parts.log_sd[i], &parts.groups[i]))?, zero(&master)?],
             })
         };
@@ -758,6 +759,27 @@ impl DevicePosterior {
             *mean = self.fitting.upload(values.view()).map_err(error)?;
         }
         self.restart()
+    }
+
+    /// Operator `i`'s deviations `log_sd` (along its rotated axes) and IVON's curvature
+    /// `curvature`, set one operator at a time after a start from [`State::Zero`], so no more than
+    /// one operator's start is on the host; [`DevicePosterior::settle`] then takes the groups'
+    /// variances and divergences at them.
+    pub fn set_start(&mut self, i: usize, log_sd: &Array2<f64>, curvature: &Array2<f64>) -> Result<(), String> {
+        let shape = self.log_sd.get(i).map(|t| (t.rows(), t.cols())).ok_or_else(|| error("no such trainable operator"))?;
+        if log_sd.dim() != shape || curvature.dim() != shape {
+            return Err(error("a start of another shape"));
+        }
+        self.log_sd[i] = self.fitting.upload(log_sd.view()).map_err(error)?;
+        self.moments[i][1] = self.fitting.upload(curvature.view()).map_err(error)?;
+        Ok(())
+    }
+
+    /// The groups' variances and divergences at the posterior the starts set
+    /// ([`DevicePosterior::set_start`]).
+    pub fn settle(&mut self) -> Result<(), String> {
+        self.sums = self.wide.zeros(self.sums.rows(), 3).map_err(error)?;
+        self.refresh()
     }
 
     /// The posterior's mean `held`, the iterate `iterate` it averages and the steps `averaged` it
