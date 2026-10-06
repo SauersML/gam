@@ -35,6 +35,9 @@ struct Settings {
     training_sequences: usize,
     context: usize,
     held_out: [usize; 2],
+    /// The blocks a scoped fit explains (`library_mdl::scoped`), as `mpd_library_mdl_2951` reads them.
+    #[serde(default)]
+    blocks: Option<Vec<usize>>,
     fit: library_mdl::Settings,
 }
 
@@ -80,6 +83,10 @@ fn main() -> Result<(), String> {
     let native = split_sites(&imported.program)?;
     let layers = layer_nodes(&native, layer_count)?;
     let explanation = library_mdl::explanation(&native, &layers)?;
+    let explanation = match &settings.blocks {
+        Some(blocks) => library_mdl::scoped(&explanation, blocks)?,
+        None => explanation,
+    };
     // `start`: the posterior a fresh fit starts from, built here.
     let start = if checkpoint == Path::new("start") {
         library_mdl::start_posterior(&device, &native, &explanation, &train, &settings.fit)?
