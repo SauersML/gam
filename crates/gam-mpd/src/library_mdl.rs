@@ -4687,32 +4687,36 @@ mod tests {
         }
     }
 
-    /// A budget below the free fit's count pulls the expected parts per token down: on the tiny
-    /// decoder with ReLU functions (gated parts), after the same epochs the fit with `K` at half
-    /// the gated count's share has a positive multiplier and fewer expected parts per token than
-    /// the free fit's.
+    /// A tiny gated library meets its budget: on the tiny decoder with ReLU functions (gated
+    /// parts), with `K` at the heads plus half the gated share of the free fit's count, dual ascent
+    /// raises `λ` from zero and the expected parts per token settle at `K`: over the last 20 of 120
+    /// epochs their mean is within three standard errors (from the epochs' own spread) of `K` and
+    /// far below the free fit's (measured: free 19.7, `K` 11.86, last 20 epochs 11.80 ± 0.27, `λ`
+    /// settled near 18.9 nats per part per token).
     #[test]
-    fn a_binding_budget_lowers_the_expected_parts_per_token() {
+    fn a_tiny_gated_library_meets_its_budget() {
         let (native, layers, _, sequences) = tiny("library_budget_binds", "relu");
         let explanation = explanation(&native, &layers).unwrap();
         let (train, held) = sequences.split_at(4);
-        let run = |budget: f64| {
+        let run = |budget: f64, epochs: usize| {
             let mut settings = settings();
-            settings.epochs = Some(6);
+            settings.epochs = Some(epochs);
             settings.budget = Some(budget);
             fit(&Device::host(), &native, &explanation, train, held, &settings, "tiny", None, None).unwrap()
         };
-        let free = run(1e9);
+        let free = run(1e9, 6);
         let free_parts = free.report.epochs.last().and_then(|e| e.expected_parts).unwrap();
         // The heads count whole; the budget asks for half of the rest.
         let heads: usize = explanation.layers.iter().map(|l| l.heads.len()).sum();
         let limit = heads as f64 + 0.5 * (free_parts - heads as f64);
-        let bound = run(limit);
+        let bound = run(limit, 120);
+        let tail: Vec<f64> = bound.report.epochs.iter().rev().take(20).map(|e| e.expected_parts.unwrap()).collect();
+        let mean = tail.iter().sum::<f64>() / tail.len() as f64;
+        let spread = (tail.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (tail.len() - 1) as f64 / tail.len() as f64).sqrt();
         let last = bound.report.epochs.last().unwrap();
         assert!(last.multiplier.is_some_and(|l| l > 0.0), "the multiplier stayed at zero over the budget");
-        let parts = last.expected_parts.unwrap();
-        eprintln!("free {free_parts}, budget {limit}, bound {parts}, λ {:?}", last.multiplier);
-        assert!(parts < free_parts, "the budget left {parts} parts per token against the free fit's {free_parts}");
+        assert!((mean - limit).abs() <= 3.0 * spread, "the last 20 epochs' mean {mean} ± {spread} parts per token against the budget {limit}");
+        assert!(mean < limit + 0.5 * (free_parts - limit), "{mean} parts per token is not below the free fit's {free_parts}");
     }
 
     fn settings() -> Settings {
