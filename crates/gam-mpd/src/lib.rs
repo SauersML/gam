@@ -94,7 +94,7 @@ pub mod explanation_battery;
 #[cfg(test)]
 mod interchange_tests;
 
-/// Measured interventions on native models for an investigator (#2951).
+// Measured interventions on native models for an investigator (#2951).
 pub mod oracle;
 #[cfg(test)]
 mod oracle_tests;

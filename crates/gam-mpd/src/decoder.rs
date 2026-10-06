@@ -1,5 +1,5 @@
 //! A decoder model's blocks as fixed computations on the device (#2951): the
-//! [`interchange::BlockEngine`] the experiments run on, in place of the general program executor.
+//! [`crate::interchange::BlockEngine`] the experiments run on, in place of the general program executor.
 //!
 //! A model of the decoder family (the native model `M`, or a library explanation `P` of it) is a
 //! token embedding, then per layer an attention block and an MLP block, then a final norm. Each
