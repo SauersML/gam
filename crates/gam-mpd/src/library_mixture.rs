@@ -2528,16 +2528,38 @@ mod tests {
         for (a, b) in mixture.targets.iter().zip(&host.targets) {
             assert!((a.zero_logit - b.zero_logit).abs() < 1e-12 && a.components.iter().zip(&b.components).all(|(x, y)| (x.logit - y.logit).abs() < 1e-12));
         }
-        // On a single-precision device (CUDA or the Apple GPU), within f32's rounding.
+        // On a single-precision device (CUDA or the Apple GPU), within f32's rounding. The samples
+        // and each pair row's residual `r = g − c u` round by up to `2 u (1 + |c|) L` (`u` f32's
+        // unit roundoff, `L` the largest sample), which the term multiplies by up to `1 / s²` into
+        // a target's row and `|c| / s²` into a candidate's: a near-exact copy (the planted query–key
+        // copy) has `s²` near its posterior variance, so this rounding is not small against its
+        // gradient. Each entry of an operator is within the sum of those over the components of the
+        // targets that read it, beyond `10⁻³` of the gradient's scale.
         if let Some(gpu) = Device::single_precision(gam_gpu::GpuPolicy::Auto).expect("single-precision device") {
             let resident = DevicePosterior::new(&gpu, &explanation, &posterior, 1e6, None, 0).unwrap();
             let mut fresh = before;
             let (on_gpu, moved) = fresh.sample_device(&gpu, &resident, &mut posterior.clone(), 9, false).unwrap();
             assert!((on_gpu - value).abs() <= 1e-3 * (1.0 + value.abs()), "the value {on_gpu} against {value} on {}", gpu.name());
+            let unit = f64::from(f32::EPSILON) / 2.0;
+            let largest = theta.values().flat_map(|m| m.iter()).fold(0.0_f64, |m, x| m.max(x.abs()));
+            // Per operator, the sum over the targets that read it (as target or candidate).
+            let amplified = |i: usize| -> f64 {
+                let mut total = 0.0;
+                for (t, target) in fresh.targets.iter().enumerate() {
+                    if fresh.operators_of(&[t]).contains(&i) {
+                        for c in &target.components {
+                            total += 2.0 * (1.0 + c.scale.abs()) * c.scale.abs().max(1.0) / target.log_variance.exp();
+                        }
+                    }
+                }
+                total
+            };
             for (i, g) in &gradient {
                 let scale = g.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
                 let found = gpu.download(&moved[i]).unwrap();
-                assert!(found.iter().zip(g.iter()).all(|(a, b)| (a - b).abs() <= 1e-3 * (1.0 + scale)), "operator {i}'s gradient on {}", gpu.name());
+                let bound = 1e-3 * (1.0 + scale) + 2.0 * unit * largest * amplified(*i);
+                let worst = found.iter().zip(g.iter()).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+                assert!(worst <= bound, "operator {i}'s gradient on {}: {worst:e} beyond {bound:e}", gpu.name());
             }
         }
     }
