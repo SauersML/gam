@@ -29,7 +29,9 @@
 //! `M`'s own MLP at each sequence's first token): the features that fire on the training
 //! sequences' later tokens at `M`'s MLP inputs are written to
 //! `OUT/transcoder_l{l}.safetensors` (kept from an earlier run of the same command), with their
-//! counts in `OUT/TRANSCODERS.json`; every other layer keeps `M`'s own MLP functions.
+//! counts in `OUT/TRANSCODERS.json`; every other layer keeps `M`'s own MLP functions. With
+//! `min_frequency`, only features firing on at least that fraction of the counted tokens are kept,
+//! counted on the first `count_sequences` training sequences when given.
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     engine::{log_to_stderr, sha256},
@@ -82,6 +84,12 @@ struct Transcoders {
     /// few bits, rules out features below about 1e-3 at N = 2^22 (toygate, 10-06).
     #[serde(default)]
     min_frequency: Option<f64>,
+    /// Count the firing on the first this many training sequences (all of them when absent): the
+    /// count reads every feature of every layer (28 × 163,840 for Qwen3-0.6B), so on a 2^24-token
+    /// training set it costs about four times a 2^22-token one, and a frequency of 1e-4 is already
+    /// counted to within a few percent from 2^22 tokens (about 420 firings).
+    #[serde(default)]
+    count_sequences: Option<usize>,
 }
 
 /// Per transcoder layer its kept file in `out`: the features that fire on `train` at `M`'s MLP
@@ -98,6 +106,7 @@ fn transcoder_files(device: &Device, native: &OperatorProgram, layers: &[LayerNo
         .iter()
         .map(|&l| Ok((l, library_transcoder::Transcoder::open(&settings.dir.join(format!("layer_{l}.safetensors")))?)))
         .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let train = &train[..settings.count_sequences.map_or(train.len(), |n| n.min(train.len()))];
     let counts = library_transcoder::firing(device, native, layers, &transcoders, train, batch)?;
     // Tokens after each sequence's first, where the transcoders run (the first runs M's MLP).
     let tokens: usize = train.iter().map(|s| s.len() - 1).sum();
