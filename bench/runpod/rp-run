@@ -1861,7 +1861,7 @@ launch() {
         if [ -n "$host" ] && grep -qx "$host" "$BAD_HOSTS" 2> /dev/null; then
             say "host $host failed before; deleting pod $POD"
         elif slow_host "$host"; then
-            say "host $host downloaded at $(awk -F'\t' -v h="$host" '$2 == h { r = $3 } END { print r }' "$RP/host_rates.tsv") MB/s before, too slow for this run's $(( FETCH_BYTES >> 20 )) MB of inputs; deleting pod $POD"
+            say "host $host was slow before (download $(awk -F'\t' -v h="$host" '$2 == h { r = $3 } END { print r }' "$RP/host_rates.tsv" 2> /dev/null) MB/s, Python install $(awk -F'\t' -v h="$host" '$2 == h { r = $3 } END { print r }' "$RP/host_installs.tsv" 2> /dev/null) s): another pod costs less; deleting pod $POD"
         elif ! reach; then
             [ -z "$host" ] || echo "$host" >> "$BAD_HOSTS"
             say "host $host recorded as failing; deleting pod $POD"
@@ -2069,14 +2069,22 @@ for line in sys.stdin:
     fi
 }
 
-# Whether HOST's measured download rate would cost this run more than another pod: its inputs
+# Whether HOST would cost this run more than another pod. A run with a Python environment: the host's
+# last fresh install took longer than DISCARD_S plus the median install of every host measured (at
+# least three). Its inputs
 # (FETCH_BYTES) at HOST's last measured rate take longer than DISCARD_S (a new pod's boot and
 # checks, measured 23-34 s to SSH plus about 10 s of checks) plus the same inputs at the median rate
 # of every host measured (at least three).
 DISCARD_S=40
 slow_host() {  # HOST
-    [ -n "$1" ] && (( FETCH_BYTES > FETCH_PIECE )) && [ -f "$RP/host_rates.tsv" ] || return 1
     local mine med
+    # A run with a Python environment: the host's last fresh install against the median install.
+    if [ -n "$1" ] && [ -n "$PYENV_DIR" ] && [ -f "$RP/host_installs.tsv" ]; then
+        mine=$(awk -F'\t' -v h="$1" '$2 == h { r = $3 } END { print r }' "$RP/host_installs.tsv")
+        med=$(cut -f3 "$RP/host_installs.tsv" | sort -n | awk '{ a[NR] = $1 } END { if (NR >= 3) print a[int((NR + 1) / 2)] }')
+        [ -n "$mine" ] && [ -n "$med" ] && (( mine > DISCARD_S + med )) && return 0
+    fi
+    [ -n "$1" ] && (( FETCH_BYTES > FETCH_PIECE )) && [ -f "$RP/host_rates.tsv" ] || return 1
     mine=$(awk -F'\t' -v h="$1" '$2 == h { r = $3 } END { print r }' "$RP/host_rates.tsv")
     [ -n "$mine" ] || return 1
     med=$(cut -f3 "$RP/host_rates.tsv" | sort -n | awk '{ a[NR] = $1 } END { if (NR >= 3) print a[int((NR + 1) / 2)] }')
@@ -2127,9 +2135,14 @@ python_env() {
             uvx -q --from huggingface_hub hf download $repo --revision $rev > $WS/model-${repo//\//--}.log 2>&1" & pids+=($!)
     done
     if [ -n "$PYENV_DIR" ]; then
+        local t0=$(date +%s)
         data_step "installing the Python environment $RP_PYENV ($WS/pyenv.log)" "export PATH=\$HOME/.local/bin:\$PATH UV_CACHE_DIR=/workspace/.uv-cache
             mkdir -p /workspace/pyenv && flock /workspace/pyenv/.lock bash -c '[ -f $PYENV_DIR/.complete ] || {
-                rm -rf $PYENV_DIR && uv venv -q --python 3.12 $PYENV_DIR && uv pip install -q --python $PYENV_DIR/bin/python -r $WS/src/bench/runpod/pyenv/$RP_PYENV.txt && touch $PYENV_DIR/.complete; }' > $WS/pyenv.log 2>&1" || failed=1
+                rm -rf $PYENV_DIR && uv venv -q --python 3.12 $PYENV_DIR && uv pip install -q --python $PYENV_DIR/bin/python -r $WS/src/bench/runpod/pyenv/$RP_PYENV.txt && touch $PYENV_DIR/.complete $WS/pyenv.fresh; }' > $WS/pyenv.log 2>&1" || failed=1
+        # A fresh install's time on this host, for slow_host.
+        if (( ! failed )) && [ -n "$POD_HOST" ] && on_pod "test -f $WS/pyenv.fresh" < /dev/null 2> /dev/null; then
+            printf '%s\t%s\t%s\n' "$(date '+%F %T')" "$POD_HOST" "$(( $(date +%s) - t0 ))" >> "$RP/host_installs.tsv"
+        fi
     fi
     for p in "${pids[@]}"; do wait "$p" || failed=1; done
     (( ! failed )) || return 1
