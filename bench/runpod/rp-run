@@ -1297,7 +1297,11 @@ for x in "${examples[@]}"; do
 done
 # FineWeb shards to build: "DIR|FILE_INDEX|DOCUMENTS|CONTEXTS|SHA256SUM-LINES" (the files the
 # command names, documents.u32 and offsets.u64; every window length when it names the directory).
-fw_plan=() pile_plan=() data_kb=0
+# A shard whose files (with meta.json) are assets of rp-run-data under the release's sha256s is
+# downloaded instead ("SHA256 REL SHA256" in fw_fetched, sizes in fetch_size); a shard built on the
+# pod is also built whole on a free GitHub Actions runner and published there (fw_publish, below).
+fw_plan=() pile_plan=() data_kb=0 fw_fetched=() fw_publish=()
+declare -A fetch_size
 if [ ${#fineweb[@]} -gt 0 ]; then
     git -C "$MAC_GAM" cat-file -e "$C:bench/mpd_qwen3_fineweb_2951.py" 2> /dev/null || { echo "rp-run: ${C:0:12} has no bench/mpd_qwen3_fineweb_2951.py to build FineWeb shards with" >&2; exit 2; }
     srcpaths+=(bench/mpd_qwen3_fineweb_2951.py)
@@ -1318,6 +1322,21 @@ if [ ${#fineweb[@]} -gt 0 ]; then
         [ -n "$ts" ] || ts=${all%% *}
         ts=$(tr ' ' '\n' <<< "$ts" | sed '/^$/d' | sort -nu | tr '\n' ',' | sed 's/,$//')
         check="documents.u32 offsets.u64 $(tr ',' '\n' <<< "$ts" | sed 's/.*/windows_T&.u32/' | tr '\n' ' ')"
+        have_all=1
+        for f in $check meta.json; do
+            sha=$(jq -r --arg f "$f" '.files[$f] // empty' <<< "$entry")
+            [ -n "$sha" ] && grep -qx "$sha" <<< "$DATA_HAVE" || { have_all=0; break; }
+        done
+        if (( have_all )); then
+            for f in $check meta.json; do
+                sha=$(jq -r --arg f "$f" '.files[$f]' <<< "$entry")
+                fw_fetched+=("$sha qwen3_fineweb/$d/$f $sha")
+                fetch_size["qwen3_fineweb/$d/$f"]=$(jq -r --arg f "$f" '.sizes[$f]' <<< "$entry")
+                data_kb=$(( data_kb + ${fetch_size["qwen3_fineweb/$d/$f"]} / 1024 ))
+            done
+            continue
+        fi
+        fw_publish+=("$d|$(jq -r '.file_index' <<< "$entry")|$(jq -r '.documents' <<< "$entry")|${all% }|$(jq -r '.files | to_entries[] | "\(.value)  \(.key)"' <<< "$entry" | tr '\n' ';')")
         sums=""
         for f in $check; do
             sha=$(jq -r --arg f "$f" '.files[$f] // empty' <<< "$entry")
@@ -1328,7 +1347,7 @@ if [ ${#fineweb[@]} -gt 0 ]; then
         fw_plan+=("$d|$(jq -r '.file_index' <<< "$entry")|$(jq -r '.documents' <<< "$entry")|$ts|$sums")
     done
     # The largest source file is on the pod's disk while its shard is built.
-    data_kb=$(( data_kb + $(curl -sS -X POST -H 'Content-Type: application/json' --max-time 60 \
+    [ ${#fw_plan[@]} -eq 0 ] || data_kb=$(( data_kb + $(curl -sS -X POST -H 'Content-Type: application/json' --max-time 60 \
         -d "$(jq -c '{paths: [.[] | .source_file] | unique}' "$CONTENTS")" \
         https://huggingface.co/api/datasets/HuggingFaceFW/fineweb/paths-info/9bb295ddab0e05d785b879661af7260fed5140fc |
         jq '[.[].size] | max' ) / 1024 ))
@@ -1399,6 +1418,27 @@ if [ ${#files[@]} -gt 0 ]; then
         echo "rp-run: $(( unpublished_kb / 1024 )) MB of inputs would go up from the Mac (at most $UPLOAD_MAX_MB MB); publish them once (public inputs only), then launch: rp-run publish $(printf "$MAC_DATA/%s " "${uploads[@]}" $(printf 'engine/%s\n' "${pile[@]}" | sort -u))" >&2
         exit 2
     fi
+fi
+for e in "${fw_fetched[@]}"; do
+    fetched+=("$e")
+    read -r _ f _ <<< "$e"
+    FETCH_BYTES=$(( FETCH_BYTES + fetch_size[$f] ))
+done
+# Each shard the pod tokenizes is tokenized once more, whole (every window length), on a free GitHub
+# Actions runner at the same commit, checked against the release's sha256s and published to
+# rp-run-data by gha-run.yml's data step, so later runs download it. One dispatch per shard in 6 h
+# ($RP/fineweb_publish/SHARD's time); the dispatch runs in the background.
+if [ ${#fw_publish[@]} -gt 0 ] && [ -z "${RP_DRY:-}" ] && [ -z "${RP_ESTIMATE_ONLY:-}" ]; then
+    mkdir -p "$RP/fineweb_publish"
+    for e in "${fw_publish[@]}"; do
+        IFS='|' read -r d k n ts sums <<< "$e"
+        m=$RP/fineweb_publish/$d
+        [ -f "$m" ] && (( $(date +%s) - $(stat -f %m "$m") < 21600 )) && continue
+        touch "$m"
+        lines=$(tr ';' '\n' <<< "$sums" | sed '/^$/d' | sed "s/.*/'&'/" | tr '\n' ' ')
+        cmd="python3 -m pip install -q 'numpy>=2' pyarrow huggingface_hub tokenizers && python3 bench/mpd_qwen3_fineweb_2951.py --file $k --documents $n --context ${ts//,/ } --out \$OUT/shard --workers 4 && cd \$OUT/shard && printf '%s\\n' $lines| sha256sum -c --quiet && mkdir -p \$OUT/rp-run-data && for f in *; do mv \"\$f\" \"\$OUT/rp-run-data/\$(sha256sum \"\$f\" | cut -c1-64)\"; done"
+        ( GHA_REF=$C "${SELF%/*}/gha-run" "fineweb-publish-$d" -- "$cmd" >> "$RP/fineweb_publish/dispatch.log" 2>&1 & )
+    done
 fi
 hf_kb=0
 for p in "${hf[@]}"; do
@@ -1476,6 +1516,7 @@ if [ -n "${RP_DRY:-}" ]; then
     built=$( for e in "${fw_plan[@]}"; do IFS='|' read -r d k n ts _ <<< "$e"; printf 'qwen3_fineweb/%s (FineWeb file %s, %s documents, contexts %s) ' "$d" "$k" "$n" "$ts"; done
              for e in "${pile_plan[@]}"; do read -r x b m <<< "$e"; printf 'engine/%s (from %s and %s Pile train rows) ' "$x" "$b" "$m"; done )
     echo "built:    ${built:-none}"
+    echo "publish:  $( for e in "${fw_publish[@]}"; do printf 'qwen3_fineweb/%s ' "${e%%|*}"; done )(tokenized whole on GitHub Actions and published to rp-run-data, once per 6 h)"
     if (( NEED_RUST )); then
         echo "source:   crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md ${srcpaths[*]:-} (from GitHub)"
     else
@@ -2116,7 +2157,7 @@ fetch_published() {
     sums=$(printf '%s\n' "${fetched[@]}" | awk '{ print $3 "  " $2 }')
     for e in "${fetched[@]}"; do
         read -r asset f sha <<< "$e"
-        size=$(stat -L -f %z "$MAC_DATA/$f") to=$f
+        size=${fetch_size[$f]:-$(stat -L -f %z "$MAC_DATA/$f")} to=$f
         # An encoded asset lands beside its file and is widened into it.
         case $asset in
             *.u16) size=$(( size / 4 )) to=$f.u16 widen+="$f.u16 $f <u2"$'\n' ;;

@@ -184,6 +184,28 @@ jobs:
           fi
           exit "$rc"
 
+      # Data a command leaves under $OUT/rp-run-data (public-derived only: a FineWeb shard that
+      # rp-run asked for), each file named by its sha256, goes up as an asset of the prerelease
+      # rp-run-data, which pods then download instead of building it; it then leaves $OUT, so the
+      # artifact does not carry it.
+      - name: Publish data (assets SHA256 of the prerelease rp-run-data)
+        if: inputs.command != '' && steps.command.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ -d out/rp-run-data ] || exit 0
+          gh release view rp-run-data -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
+            gh release create rp-run-data -R "$GITHUB_REPOSITORY" --prerelease --title "rp-run data" \
+              --notes "Public inputs of #2951's GPU runs (VPD's public weights, exports derived from them, public datasets), one asset per file named by its sha256, for pods to download." || true
+          have=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/tags/rp-run-data" --jq '.assets[].name')
+          for f in out/rp-run-data/*; do
+            name=$(basename "$f")
+            [ "$(sha256sum "$f" | cut -c1-64)" = "$name" ] || { echo "$name is not its file's sha256"; exit 1; }
+            grep -qx "$name" <<< "$have" || gh release upload rp-run-data -R "$GITHUB_REPOSITORY" "$f"
+          done
+          rm -rf out/rp-run-data
+
       - uses: actions/cache/save@v4
         if: always() && steps.cache.outputs.cache-hit != 'true' && (inputs.cache == '' || startsWith(inputs.name, 'cache-'))
         with:
