@@ -540,6 +540,7 @@ fn main() -> Result<(), String> {
                 epochs: None,
                 families: Vec::new(),
                 measured_beta2: false,
+                budget: None,
             };
             let base = library_mdl::explanation(&native, &layers)?;
             let run = Run {

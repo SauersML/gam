@@ -1405,6 +1405,13 @@ pub struct Settings {
     /// every operator and epoch (`B` the training batches).
     #[serde(default)]
     pub measured_beta2: bool,
+    /// The declared per-token execution budget `K`: the fit minimizes `F` subject to
+    /// `E_q[k(x)] ≤ K`, `k(x)` the parts executed on a token (`library_complexity`), by dual
+    /// ascent on its multiplier `λ`. Bits and parts per token have no derivable exchange rate (a
+    /// receiver can compute the trace, so `k` is not a code length of anything it needs), so the
+    /// budget is a declared constraint, not a term of `F`. None (the default) is no budget.
+    #[serde(default)]
+    pub budget: Option<f64>,
 }
 
 /// [`Settings`] as configs and checkpoints hold them, unknown keys refused, and the keys of steps
@@ -1436,6 +1443,8 @@ struct SettingsRecord {
     epochs: Option<usize>,
     #[serde(default)]
     families: Vec<interchange::Family>,
+    #[serde(default)]
+    budget: Option<f64>,
     #[serde(default)]
     measured_beta2: bool,
     #[serde(default)]
@@ -1482,6 +1491,7 @@ impl From<SettingsRecord> for Settings {
             epochs: r.epochs,
             families: r.families,
             measured_beta2: r.measured_beta2,
+            budget: r.budget,
         }
     }
 }
@@ -1491,6 +1501,7 @@ impl Settings {
         if self.batch_sequences == 0
             || self.numeric_bytes == 0
             || self.head_tile_rows == 0
+            || self.budget.is_some_and(|k| !(k >= 0.0))
         {
             return Err("invalid library fit settings".into());
         }
@@ -1586,6 +1597,15 @@ pub struct Epoch {
     /// sequence when the schedule ran it (module note).
     pub held_out: HeldOut,
     pub held_out_full: Option<HeldOut>,
+    /// With a budget (`Settings::budget`): `K`, the epoch's mean over its steps of the expected
+    /// parts executed per token `Ê[k]` (at each step's weight sample around the iterate), and the
+    /// multiplier `λ` (nats of `F` per part per token) at the epoch's end.
+    #[serde(default)]
+    pub budget: Option<f64>,
+    #[serde(default)]
+    pub expected_parts: Option<f64>,
+    #[serde(default)]
+    pub multiplier: Option<f64>,
 }
 
 /// One removal step.
@@ -2067,6 +2087,71 @@ fn part_targets(scorer: &Scorer, batch: &Batch, experiments: Vec<Experiment>) ->
     Ok((parts.into_iter().flatten().collect(), targets))
 }
 
+/// The batch's expected parts executed per token under the posterior (`library_complexity`) and,
+/// per gated MLP (a ReLU law without an up map), its gate's and its threshold's derivatives of
+/// that mean `(trainable index, ∂Ê/∂μ, ∂Ê/∂σ²)`. The layers' inputs come from one forward of `P`
+/// on the batch's bases at the step's weight sample `key` around the iterate; the gate's own
+/// entries are integrated exactly at the iterate's means and deviations. Every surviving function
+/// of another law and every attention head with a surviving value executes on every token and
+/// counts one; a gated layer's fixed positions (where its block's output is not its functions',
+/// `library_transcoder`'s first token) count nothing of it.
+fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, explanation: &Explanation, active: &[bool], batch: &Batch, key: u64) -> Result<(f64, Vec<(usize, Array2<f64>, Array2<f64>)>), String> {
+    device_posterior.iterate_into(scorer.experiments.explanation_mut(), key)?;
+    let family = sequence_family(&batch.base.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+    let (_, p) = scorer.experiments.models();
+    let (program, d) = (p.program, p.program.device());
+    let trace = program.forward(&family)?;
+    let positions = &family.layout.as_ref().ok_or("a sequence layout")?.position;
+    let rows = family.rows;
+    let alive = |g: &usize| active[*g];
+    let mut count = 0.0;
+    let mut terms = Vec::new();
+    for (l, (layer, mlp)) in explanation.layers.iter().zip(&scorer.mlps).enumerate() {
+        count += (layer.heads.iter().filter(|(_, values)| values.iter().any(alive)).count() * rows) as f64;
+        if layer.functions.is_empty() {
+            continue;
+        }
+        let surviving: Vec<bool> = layer.functions.iter().map(|groups| groups.iter().all(alive)).collect();
+        if mlp.law != Law::Relu || mlp.up.is_some() {
+            count += (surviving.iter().filter(|s| **s).count() * rows) as f64;
+            continue;
+        }
+        let rule = explanation.artifact.program.rules.iter().find(|r| r.name == format!("library.l{l}.mlp"));
+        let fixed: Vec<u32> = rule
+            .and_then(|r| r.nodes.iter().find_map(|n| match n {
+                Node::Select { positions, .. } => Some(positions.clone()),
+                _ => None,
+            }))
+            .unwrap_or_default();
+        let kept: Vec<usize> = (0..rows).filter(|r| !fixed.contains(&positions[*r])).collect();
+        let x = d.download(trace.value(mlp.input)?).map_err(|e| e.to_string())?.select(ndarray::Axis(0), &kept);
+        let i = scorer.at(mlp.gate.operator)?;
+        let mean = device_posterior.iterate(i)?;
+        let variance = device_posterior.values(i)?.1.mapv(|s| (2.0 * s).exp());
+        let bias = match mlp.gate.bias {
+            Some(b) => {
+                let j = scorer.at(b)?;
+                Some((j, device_posterior.iterate(j)?.column(0).to_owned(), device_posterior.values(j)?.1.column(0).mapv(|s| (2.0 * s).exp())))
+            }
+            None => None,
+        };
+        let expected = crate::library_complexity::expected(&crate::library_complexity::Gate {
+            x: x.view(),
+            mean: mean.view(),
+            variance: variance.view(),
+            bias: bias.as_ref().map(|(_, m, v)| (m.view(), v.view())),
+            alive: &surviving,
+        })?;
+        count += expected.count;
+        let per = 1.0 / rows as f64;
+        terms.push((i, expected.mean * per, expected.variance * per));
+        if let Some((j, _, _)) = bias {
+            terms.push((j, expected.bias_mean.insert_axis(ndarray::Axis(1)) * per, expected.bias_variance.insert_axis(ndarray::Axis(1)) * per));
+        }
+    }
+    Ok((count / rows as f64, terms))
+}
+
 /// Returns the experiments in the order of their bits.
 fn antithetic_step(
     scorer: &mut Scorer,
@@ -2422,6 +2507,9 @@ struct Progress {
     best: Option<(f64, usize)>,
     epochs: Vec<Epoch>,
     removals: Vec<Removal>,
+    /// The budget's multiplier `λ` (`Settings::budget`), carried across a resume.
+    #[serde(default)]
+    multiplier: f64,
     /// The last epoch's snapshot, its per-batch estimates of `F` in nats, when convergence is being
     /// judged.
     previous: Option<Vec<f64>>,
@@ -3139,6 +3227,7 @@ pub fn fit_from(
         best: None,
         epochs: Vec::new(),
         removals: Vec::new(),
+        multiplier: 0.0,
         previous: None,
         collection: COLLECTION,
         active: posterior.active.clone(),
@@ -3323,6 +3412,8 @@ pub fn fit_from(
         // estimate of `F` (`Epoch::data_bits`); the snapshot below scores `F`.
         let mut data_sum = 0.0;
         let (mut clean, mut patched) = (Mean::default(), Mean::default());
+        // The steps' expected parts executed per token and their count (`Settings::budget`).
+        let mut parts = (0.0, 0usize);
         for (b, draw) in draws.iter().enumerate() {
             let step_started = Instant::now();
             let batch = draw.batch(sequences)?;
@@ -3368,6 +3459,51 @@ pub fn fit_from(
                 }
                 prior_seconds = timed.elapsed().as_secs_f64();
             }
+            // The execution budget (`Settings::budget`, `library_complexity`): the step descends
+            // the Lagrangian `F + λ (E_q[k] − K)`. `λ ∂Ê/∂μ` joins the data gradient (in its units,
+            // as the prior term's does), and by Price's theorem `∂E_q[f]/∂σ² = ½ E_q[∂²f]` the
+            // term's expected curvature per token `2 λ ∂Ê/∂σ² / N` joins the step's curvature.
+            // Then `λ ← max(0, λ + η_λ (Ê − K))` with `η_λ = λ̂ / (K B)`: `λ̂ = |⟨g_F, g_k⟩| / |g_k|²`
+            // is the multiplier at which the term's gradient cancels the data gradient's
+            // component along `g_k = ∂Ê/∂μ` (both measured on this step), so a relative violation
+            // held for one pass of the `B` batches moves `λ` by about `λ̂` times it.
+            let mut parts_note = String::new();
+            if let Some(limit) = settings.budget.filter(|k| k.is_finite()) {
+                let (expected, terms) = complexity_terms(&mut scorer, &device_posterior, explanation, &posterior.active, &batch, key)?;
+                parts.0 += expected;
+                parts.1 += 1;
+                let lambda = progress.multiplier;
+                let (mut along, mut square) = (0.0, 0.0);
+                for (i, mean, variance) in &terms {
+                    let op = explanation.trainable[*i];
+                    if let Some(g) = gradients.get(&op) {
+                        let data = device.download(g).map_err(error)?;
+                        along += data.iter().zip(mean.iter()).map(|(a, b)| a * b).sum::<f64>() * scale * LN_2;
+                    }
+                    square += mean.iter().map(|v| v * v).sum::<f64>();
+                    let pull = mean.mapv(|v| lambda * v / (scale * LN_2));
+                    let pull = device.upload(pull.view()).map_err(error)?;
+                    match gradients.get_mut(&op) {
+                        Some(total) => device.axpy(total, 1.0, &pull).map_err(error)?,
+                        None => {
+                            gradients.insert(op, pull);
+                        }
+                    }
+                    let bend = variance.mapv(|v| 2.0 * lambda * v / tokens as f64);
+                    let bend = device.upload(bend.view()).map_err(error)?;
+                    match prior_curvature.get_mut(&op) {
+                        Some(total) => device.axpy(total, 1.0, &bend).map_err(error)?,
+                        None => {
+                            prior_curvature.insert(op, bend);
+                        }
+                    }
+                }
+                if square > 0.0 && limit > 0.0 {
+                    let rate = (along.abs() / square) / (limit * draws.len() as f64);
+                    progress.multiplier = (lambda + rate * (expected - limit)).max(0.0);
+                }
+                parts_note = format!(", parts per token {expected:.4} (K {limit}), λ {:.4e}", progress.multiplier);
+            }
             progress.step += 1;
             // The factor's scale: its square estimates the curvature per token of the tokens it
             // sums (one antithetic half's, `antithetic_step`).
@@ -3378,7 +3514,7 @@ pub fn fit_from(
             let (eta, rho, draws_averaged, ratio) = device_posterior.step_state();
             log::info!("library line step {epoch}.{b}: η {eta:.4e}, ρ̄ {rho:.4e} over {draws_averaged} draws, r̄ {ratio:.4e}; posterior step {posterior_seconds:.3} s");
             let prior_note = if prior.is_some() { format!(" (prior: {prior_seconds:.3} s)") } else { String::new() };
-            log::info!("library step {epoch}.{b}: data {:.6} bits per scored token at the iterate's samples, {:.2} s{prior_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
+            log::info!("library step {epoch}.{b}: data {:.6} bits per scored token at the iterate's samples, {:.2} s{prior_note}{parts_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
         }
         device_posterior.end_noise_epoch(1.0 - ivon.beta2)?;
         let count = draws.len() as f64;
@@ -3425,6 +3561,9 @@ pub fn fit_from(
             } else {
                 None
             },
+            budget: settings.budget,
+            expected_parts: settings.budget.map(|_| parts.0 / parts.1.max(1) as f64),
+            multiplier: settings.budget.map(|_| progress.multiplier),
         };
         log::info!("library fit epoch {epoch}: {record:?}");
         let (log_sd, magnitude, variances) = posterior.spread();
@@ -4488,6 +4627,7 @@ mod tests {
             epochs: None,
             families: Vec::new(),
             measured_beta2: false,
+            budget: None,
         }
     }
 
@@ -5121,6 +5261,7 @@ mod tests {
             best: Some((7.0, 3)),
             epochs: Vec::new(),
             removals: Vec::new(),
+            multiplier: 0.0,
             previous: Some(vec![1.0, 2.0]),
             collection: COLLECTION,
             active: vec![false, true],
