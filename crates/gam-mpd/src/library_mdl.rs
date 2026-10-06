@@ -159,15 +159,20 @@
 //! alternates descending and removing; it stops when a round accepts nothing, which says the search
 //! found no removal, not that none exists.
 //!
-//! The removal search orders its proposals by each group's second-order removal effect: the rise of
-//! the expected data term when the group's means and noise become exactly zero, less the description
-//! it saves. Expanding the data term `D` about the posterior mean `μ`, with `g` its gradient there
-//! and `H` its Gauss–Newton matrix (the Hessian of `Σ KL(M_e ‖ P_e)` where `P_e`'s predictions equal
-//! `M_e`'s), the rise is `−g_G · μ_G + ½ μ_Gᵀ H μ_G − ½ Σ_{j∈G} H_jj σ_j²`. Both are measured on the
-//! fixed collection at the posterior mean, one forward pass per training batch reversed twice
-//! (`interchange::evaluate_labelled`): once for `g`, and once for a draw `u` of the gradient of
-//! `Σ log P_e(y)` with every `y` drawn from `P_e` itself, whose `E[(u_G · μ_G)²] = μ_Gᵀ H μ_G` and
-//! `E[u_j²] = H_jj` ([`Curvature`]). The form `μ_Gᵀ H μ_G` keeps the couplings between a group's
+//! The removal search orders its proposals by each group's second-order removal effect on the
+//! objective it is accepted on: the change of the data term at the batches' own weight samples
+//! when the group's entries of each sample become exactly zero, less the description it saves.
+//! With `θ_b` the sample batch `b` is scored at, `g_b` the batch's data gradient there and `H_b` its
+//! Gauss–Newton matrix (the Hessian of `Σ KL(M_e ‖ P_e)` where `P_e`'s predictions equal `M_e`'s),
+//! the batch's change is `δ_bG = −g_b,G · θ_b,G + ½ θ_b,Gᵀ H_b θ_b,G`, and the estimate is its sum
+//! over the batches, `Σ_b δ_bG` ([`Curvature`]). Both are measured at `θ_b`, one forward pass per
+//! training batch reversed twice (`interchange::evaluate_labelled`): once for `g_b`, and once for a
+//! draw `u_b` of the gradient of `Σ log P_e(y)` with every `y` drawn from `P_e` itself, whose
+//! `E[(u_b,G · θ_b,G)²] = θ_b,Gᵀ H_b θ_b,G`. Over the noise of `θ_b`, `E[δ_bG]` is to second order
+//! `−g_G · μ_G + ½ μ_Gᵀ H μ_G − ½ Σ_{j∈G} H_jj σ_j²` at the mean, the change of the expected data
+//! term; measured at the mean instead, the slope `g_G · μ_G` is that of another point than the one
+//! acceptance scores, and its error does not average out over the batches. The batches' spread of
+//! `δ_bG` is kept with the sum. The form `θ_Gᵀ H θ_G` keeps the couplings between a group's
 //! parameters (an output vector's direction against the downstream metric) that a diagonal
 //! curvature drops. A deletion is a finite step and the fit is not shown to be stationary, so the
 //! estimate orders proposals; the exact evaluation decides them.
@@ -195,7 +200,7 @@ use crate::{
     device_program::{gelu_tanh_constant, law_of},
     interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable, Targets},
     library_compensation::Compensation,
-    library_removal,
+    library_removal::{self, Evaluation},
     operator_program::{
         FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorBody, OperatorProgram, Provenance, Rule, SequenceLayout, SlotValues,
         exact_precision,
@@ -774,23 +779,51 @@ pub fn scoped(explanation: &Explanation, blocks: &[usize]) -> Result<Explanation
 
 // ------------------------------------------------------------------------------------- posterior
 
-/// Per prior group, sums over draws of the sampled-label gradient `u` (`interchange::sampled_label`)
-/// at the posterior mean, each draw weighted by the data term's weight on its tokens: `Σ (u_G · μ_G)²`,
-/// the Gauss–Newton quadratic form of the group's means, and `Σ Σ_{j∈G} u_j² σ_j²`, that of its
-/// noise; and over the same batches `Σ g_G · μ_G`, the data term's gradient `g` at the mean along
-/// the group's means (module note).
+/// Per prior group, the removal estimates over the batches of the fixed collection: with `θ_b` the
+/// weight sample batch `b` is scored at (the removal seeds'), `g_b` the data term's gradient there
+/// in nats and `u_b` a draw of the sampled-label gradient there (`interchange::sampled_label`),
+/// each batch's second-order change of its data term when the group's entries of `θ_b` become
+/// zero, `δ_bG = −g_b,G · θ_b,G + ½ (u_b,G · θ_b,G)²` (module note): their sum over the batches
+/// and the sum of their squares.
 #[derive(Clone, Debug)]
 pub struct Curvature {
-    pub(crate) quadratic: Vec<f64>,
-    pub(crate) noise: Vec<f64>,
-    pub(crate) slope: Vec<f64>,
+    pub(crate) rise: Vec<f64>,
+    pub(crate) square: Vec<f64>,
+    pub(crate) batches: usize,
 }
 
 impl Curvature {
-    /// No draws yet, for `groups` prior groups.
+    /// No batches yet, for `groups` prior groups.
     #[must_use]
     pub fn new(groups: usize) -> Self {
-        Self { quadratic: vec![0.0; groups], noise: vec![0.0; groups], slope: vec![0.0; groups] }
+        Self { rise: vec![0.0; groups], square: vec![0.0; groups], batches: 0 }
+    }
+
+    /// Adds one batch: per group `g_b,G · θ_b,G` in nats (`slope`) and `(u_b,G · θ_b,G)²` (`form`).
+    pub fn add_batch(&mut self, slope: &[f64], form: &[f64]) -> Result<(), String> {
+        if slope.len() != self.rise.len() || form.len() != self.rise.len() {
+            return Err("a batch of another explanation".into());
+        }
+        for (g, (s, q)) in slope.iter().zip(form).enumerate() {
+            let change = -s + 0.5 * q;
+            self.rise[g] += change;
+            self.square[g] += change * change;
+        }
+        self.batches += 1;
+        Ok(())
+    }
+
+    /// Per group, the standard error of the summed estimate from the spread of its batches'
+    /// estimates, `√(B s²)` with `s²` their sample variance over the `B` batches (zero with fewer
+    /// than two batches).
+    #[must_use]
+    pub fn spread(&self) -> Vec<f64> {
+        let b = self.batches as f64;
+        self.rise
+            .iter()
+            .zip(&self.square)
+            .map(|(sum, square)| if self.batches < 2 { 0.0 } else { (b * (square - sum * sum / b).max(0.0) / (b - 1.0)).sqrt() })
+            .collect()
     }
 }
 
@@ -1073,90 +1106,11 @@ impl Posterior {
         out
     }
 
-    /// Adds one draw `u` of the sampled-label gradient at the posterior mean (per trainable operator,
-    /// in `Explanation::trainable` order; `interchange::sampled_label`) to `curvature`, its terms
-    /// weighted by `weight`, the data term's weight on the draw's tokens.
-    pub fn add_curvature(&self, u: &[Array2<f64>], weight: f64, curvature: &mut Curvature) -> Result<(), String> {
-        if u.len() != self.mean.len() || u.iter().zip(&self.mean).any(|(a, b)| a.dim() != b.dim()) {
-            return Err("one gradient per trainable operator, of its shape, required".into());
-        }
-        if curvature.quadratic.len() != self.active.len() {
-            return Err("a curvature of another explanation".into());
-        }
-        // Per group, `u_G · μ_G` and `Σ u_j² σ_j²` of this draw, the second along the operator's
-        // rotated axes (a rotation stays inside each group, so the group's entries are the same
-        // positions along both).
-        let partial: Vec<(Range<usize>, Vec<(f64, f64)>)> = (0..self.mean.len())
-            .into_par_iter()
-            .map(|i| {
-                let span = self.spans[i].clone();
-                let rotated = self.rotations[i].as_ref().map(|r| r.undo(&u[i]));
-                let along = rotated.as_ref().unwrap_or(&u[i]);
-                let mut local = vec![(0.0, 0.0); span.len()];
-                for ((((g, r), mu), s), group) in u[i].iter().zip(along.iter()).zip(self.mean[i].iter()).zip(self.log_sd[i].iter()).zip(self.membership[i].iter()) {
-                    let at = *group as usize;
-                    if self.active[at] {
-                        let entry = &mut local[at - span.start];
-                        entry.0 += g * mu;
-                        entry.1 += r * r * (2.0 * s).exp();
-                    }
-                }
-                (span, local)
-            })
-            .collect();
-        let mut draw = vec![(0.0, 0.0); self.active.len()];
-        for (span, local) in partial {
-            for (g, (dot, noise)) in span.zip(local) {
-                draw[g].0 += dot;
-                draw[g].1 += noise;
-            }
-        }
-        for (g, (dot, noise)) in draw.into_iter().enumerate() {
-            curvature.quadratic[g] += weight * dot * dot;
-            curvature.noise[g] += weight * noise;
-        }
-        Ok(())
-    }
-
-    /// Adds the data term's gradient `g` in nats at the posterior mean on one batch (per trainable
-    /// operator, in `Explanation::trainable` order), weighted by `weight`, to `curvature`'s
-    /// `Σ g_G · μ_G`.
-    pub fn add_slope(&self, g: &[Array2<f64>], weight: f64, curvature: &mut Curvature) -> Result<(), String> {
-        if g.len() != self.mean.len() || g.iter().zip(&self.mean).any(|(a, b)| a.dim() != b.dim()) {
-            return Err("one gradient per trainable operator, of its shape, required".into());
-        }
-        if curvature.slope.len() != self.active.len() {
-            return Err("a curvature of another explanation".into());
-        }
-        let partial: Vec<(Range<usize>, Vec<f64>)> = (0..self.mean.len())
-            .into_par_iter()
-            .map(|i| {
-                let span = self.spans[i].clone();
-                let mut local = vec![0.0; span.len()];
-                for ((gradient, mu), group) in g[i].iter().zip(self.mean[i].iter()).zip(self.membership[i].iter()) {
-                    let at = *group as usize;
-                    if self.active[at] {
-                        local[at - span.start] += gradient * mu;
-                    }
-                }
-                (span, local)
-            })
-            .collect();
-        for (span, local) in partial {
-            for (at, dot) in span.zip(local) {
-                curvature.slope[at] += weight * dot;
-            }
-        }
-        Ok(())
-    }
-
-    /// Per group, the second-order rise of the expected data term in nats when it alone is removed,
-    /// `−g_G · μ_G + ½ μ_Gᵀ H μ_G − ½ Σ_{j∈G} H_jj σ_j²` (module note), from `curvature` (zero for a
-    /// removed group): a proposal score, not a bound on the finite change.
+    /// Per group, its second-order data change on removal summed over the batches,
+    /// `Σ_b δ_bG` (module note, [`Curvature`]), and zero for a removed group: a proposal score,
+    /// not a bound on the finite change.
     pub fn removal_data(&self, curvature: &Curvature) -> Vec<f64> {
-        (0..self.active.len())
-            .map(|g| if self.active[g] { -curvature.slope[g] + 0.5 * curvature.quadratic[g] - 0.5 * curvature.noise[g] } else { 0.0 })
-            .collect()
+        (0..self.active.len()).map(|g| if self.active[g] { curvature.rise[g] } else { 0.0 }).collect()
     }
 
     /// Over the active groups' entries, the mean `ln σ` (along the rotated axes) and the mean `|μ|`,
@@ -3111,32 +3065,38 @@ fn laplace_start(
     Ok(curvature.into_iter().map(|h| [Array2::zeros(h.dim()), h.clone(), Array2::zeros(h.dim())]).collect())
 }
 
-/// The removal estimates' [`Curvature`]: one draw of the sampled-label gradient per training batch
-/// of the fixed collection, at the mean of `posterior` (module note), each draw's group sums made
-/// on the device (`DevicePosterior::add_curvature`).
+/// The removal estimates' [`Curvature`]: per training batch of the fixed collection, at the weight
+/// sample the batch is scored at under the removal seeds ([`expected_divergence`]), the data term's
+/// gradient and one draw of the sampled-label gradient (module note), each batch's group sums made
+/// on the device (`DevicePosterior::add_removal`).
 fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings) -> Result<Curvature, String> {
-    posterior.mean_into(scorer.experiments.explanation_mut())?;
     let mut rng = StdRng::seed_from_u64(noise_seed(settings.seed, 0, draws.len()));
     let mut curvature = Curvature::new(posterior.group_count());
-    for draw in draws {
+    for (b, draw) in draws.iter().enumerate() {
+        let key = noise_seed(settings.seed, 0, b);
+        posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
         let batch = draw.batch(sequences)?;
         let experiments = scorer.experiments(draw, sequences)?;
         let targets = scorer.experiments.targets(&batch, &experiments)?;
         let rows: usize = experiments.iter().map(|e| batch.length() - e.position).sum();
         let uniforms: Vec<f64> = (0..rows).map(|_| rng.random::<f64>()).collect();
-        // One forward pass at the mean, reversed twice: the divergence's gradient (in bits) and a
-        // draw of the Gauss–Newton factor.
+        // One forward pass at the batch's sample, reversed twice: the divergence's gradient (in
+        // bits) and a draw of the Gauss–Newton factor.
         let evaluation = scorer.experiments.evaluate_labelled(&batch, &experiments, Some(&targets), true, Some(&uniforms))?;
         let factor = evaluation.factor.ok_or("no Gauss–Newton factor")?;
-        posterior.add_curvature(&factor.gradient, 1.0, &mut curvature)?;
-        posterior.add_slope(&evaluation.gradient, LN_2, &mut curvature)?;
+        posterior.add_removal((&evaluation.gradient, LN_2), &factor.gradient, key, &mut curvature)?;
     }
     Ok(curvature)
 }
 
 /// `E_q[D]` over every training batch in nats, one weight sample per batch from the removal seeds,
 /// with the groups `removed` (and the already removed ones) zeroed, on the fixed collection; with
-/// `prior`, plus its value at each batch's sample, averaged, and the parameters it sends.
+/// `prior`, plus its value at each batch's sample, averaged, and the parameters it sends. Returned
+/// per batch (each with its share of the prior's value), the prior's cost as the rest. With
+/// `against`, an accepted posterior's per-batch values and the decrease of the rest of `F` other
+/// than the prior's cost from it, the batches stop once their paired differences settle the
+/// comparison against a rise of `F` (`library_removal::settled`), and the evaluation is
+/// incomplete.
 fn expected_divergence(
     scorer: &mut Scorer,
     device_posterior: &mut DevicePosterior,
@@ -3146,7 +3106,8 @@ fn expected_divergence(
     removed: &[usize],
     settings: &Settings,
     prior: Option<&mut (dyn PriorTerm + 'static)>,
-) -> Result<f64, String> {
+    against: Option<(&[f64], f64)>,
+) -> Result<Evaluation, String> {
     let timed = Instant::now();
     // The removal objective's trial arrives with its groups removed: no copy of it.
     let trial = if removed.is_empty() {
@@ -3161,7 +3122,8 @@ fn expected_divergence(
     device_posterior.set_values(&trial)?;
     let uploaded = timed.elapsed().as_secs_f64();
     let mut prior = prior;
-    let (mut bits, mut prior_nats) = (0.0, 0.0);
+    let cost = prior.as_deref().map_or(Ok(0.0), |p| p.cost(&trial))?;
+    let mut batches = Vec::with_capacity(draws.len());
     let (mut preparing, mut targeting) = (0.0, 0.0);
     for (b, draw) in draws.iter().enumerate() {
         // Removal zeroes entries, so the remaining entries see the same noise as the full posterior.
@@ -3174,21 +3136,29 @@ fn expected_divergence(
         let targets = scorer.experiments.targets(&batch, &experiments)?;
         targeting += started.elapsed().as_secs_f64();
         let scored = scorer.evaluate_device(device_posterior, (&batch, &experiments), Some(key), &targets, false)?.0;
-        bits += scored.iter().flatten().sum::<f64>();
+        let mut nats = scored.iter().flatten().sum::<f64>() * LN_2;
         if let Some(prior) = prior.as_deref_mut() {
-            prior_nats += prior.sample(&trial, &host_sample(&trial, &prior.operators(), key), false)?.0;
+            nats += prior.sample(&trial, &host_sample(&trial, &prior.operators(), key), false)?.0 / draws.len() as f64;
+        }
+        batches.push(nats);
+        if let Some((accepted, budget)) = against {
+            let differences: Vec<f64> = batches.iter().zip(accepted).map(|(t, a)| t - a).collect();
+            if library_removal::settled(&differences, draws.len(), budget - cost) {
+                break;
+            }
         }
     }
-    let cost = prior.as_deref().map_or(Ok(0.0), |p| p.cost(&trial))?;
     let total = timed.elapsed().as_secs_f64();
     log::info!(
-        "library removal evaluation: {total:.2} s: trial clone {cloned:.2} s, set_values {:.2} s, {} batches {:.2} s (experiments {preparing:.2} s, targets {targeting:.2} s, scoring {:.2} s)",
+        "library removal evaluation: {total:.2} s: trial clone {cloned:.2} s, set_values {:.2} s, {} of {} batches {:.2} s (experiments {preparing:.2} s, targets {targeting:.2} s, scoring {:.2} s)",
         uploaded - cloned,
+        batches.len(),
         draws.len(),
         total - uploaded,
         total - uploaded - preparing - targeting
     );
-    Ok(bits * LN_2 + prior_nats / draws.len() as f64 + cost)
+    let complete = batches.len() == draws.len();
+    Ok(Evaluation { batches, rest: cost, complete })
 }
 
 /// A removal round's fixed evidence: the training batches of the sequences under the fit's
@@ -3218,8 +3188,12 @@ fn remove(
     let compensated = timed.elapsed().as_secs_f64();
     let curvature = removal_curvature(scorer, device_posterior, draws, sequences, settings)?;
     log::info!("library removal setup: compensation Gram {compensated:.1} s, curvature {:.1} s", timed.elapsed().as_secs_f64() - compensated);
-    let mut objective = |trial: &Posterior| -> Result<f64, String> {
-        Ok(expected_divergence(scorer, device_posterior, trial, draws, sequences, &[], settings, prior.as_deref_mut())? + trial.description() + fixed)
+    let mut objective = |trial: &Posterior, accepted: Option<&Evaluation>| -> Result<Evaluation, String> {
+        let rest = trial.description() + fixed;
+        let against = accepted.map(|a| (a.batches.as_slice(), a.rest - rest));
+        let mut evaluation = expected_divergence(scorer, device_posterior, trial, draws, sequences, &[], settings, prior.as_deref_mut(), against)?;
+        evaluation.rest += rest;
+        Ok(evaluation)
     };
     library_removal::round(explanation, posterior, Some(&compensation), &curvature, &mut objective, log)
 }
@@ -3814,43 +3788,37 @@ mod tests {
     }
 
     #[test]
-    fn the_sampled_label_curvature_predicts_the_data_term_to_second_order() {
-        // At the library's start P is M on every experiment, so the data term and its gradient vanish
-        // at the mean and its Hessian there is the Gauss–Newton matrix H. Shrinking one MLP output
-        // group's mean by ε raises the data term by ½ ε² μ_Gᵀ H μ_G, which the sampled-label draws
-        // of the removal estimates measure.
+    fn the_removal_estimate_predicts_a_small_removal_on_the_batches_samples() {
+        // One MLP output group with its means and deviations scaled by ε: removing it zeroes a
+        // step of size ε at each batch's weight sample, and the estimate measured at those samples,
+        // Σ_b (−g_b,G · θ_b,G + ½ (u_b,G · θ_b,G)²), predicts the change of the data term that
+        // acceptance scores on the same samples up to terms of relative size ε.
         let (native, layers, _, sequences) = tiny("library_curvature", "gelu");
         let explanation = explanation(&native, &layers).unwrap();
         let settings = settings();
-        let posterior = Posterior::new(&explanation, 1000).unwrap();
-        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
-        let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 1000.0, None, 0).unwrap();
-        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let mut posterior = Posterior::new(&explanation, 1000).unwrap();
         let group = *explanation.layers[0].functions[1].last().unwrap();
-        let rounds = 96;
-        let mut quadratic = 0.0;
-        for k in 0..rounds {
-            let labels = Settings { seed: settings.seed + 1 + k, ..settings.clone() };
-            quadratic += removal_curvature(&mut scorer, &device_posterior, &draws, &sequences, &labels).unwrap().quadratic[group] / rounds as f64;
-        }
-        let epsilon = 1e-2;
-        let mut shrunk = posterior.means();
+        let epsilon: f64 = 1e-2;
         let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         for cell in &explanation.groups[group].cells {
+            let i = position[&cell.operator];
             for &r in &cell.rows {
                 for c in cell.cols.clone() {
-                    shrunk[position[&cell.operator]][[r, c]] *= 1.0 - epsilon;
+                    posterior.mean[i][[r, c]] *= epsilon;
+                    posterior.log_sd[i][[r, c]] += epsilon.ln();
                 }
             }
         }
-        let mut exact = 0.0;
-        for draw in &draws {
-            let experiments = scorer.experiments(draw, &sequences).unwrap();
-            let (bits, _) = score(&mut scorer, &draw.batch(&sequences).unwrap(), &experiments, &shrunk, false).unwrap();
-            exact += bits.iter().flatten().sum::<f64>() * LN_2;
-        }
-        let predicted = 0.5 * epsilon * epsilon * quadratic;
-        assert!(exact > 0.0 && (predicted - exact).abs() <= 0.25 * exact, "predicted {predicted:e} nats, exact {exact:e}");
+        let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
+        let mut device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 1000.0, None, 0).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let curvature = removal_curvature(&mut scorer, &device_posterior, &draws, &sequences, &settings).unwrap();
+        assert_eq!(curvature.batches, draws.len());
+        let predicted = posterior.removal_data(&curvature)[group];
+        let mut evaluate = |removed: &[usize]| expected_divergence(&mut scorer, &mut device_posterior, &posterior, &draws, &sequences, removed, &settings, None, None).unwrap().total();
+        let exact = evaluate(&[group]) - evaluate(&[]);
+        assert!(exact != 0.0 && (predicted - exact).abs() <= 0.1 * exact.abs(), "predicted {predicted:e} nats, exact {exact:e}");
+        assert!(curvature.spread()[group].is_finite());
     }
 
     #[test]
@@ -3880,7 +3848,7 @@ mod tests {
         }
         assert!(read_patches > 0, "the collection must hold read patches of removed functions");
         let mut device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 1.0, None, 0).unwrap();
-        let actual = expected_divergence(&mut scorer, &mut device_posterior, &posterior, &draws, &sequences, &removed, &settings, None).unwrap();
+        let actual = expected_divergence(&mut scorer, &mut device_posterior, &posterior, &draws, &sequences, &removed, &settings, None, None).unwrap().total();
         let reference = reference_bits * LN_2;
         assert!((actual - reference).abs() < 1e-10 * reference.abs().max(1.0), "removal must score the fixed collection");
     }

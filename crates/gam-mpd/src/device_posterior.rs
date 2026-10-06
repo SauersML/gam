@@ -543,49 +543,33 @@ impl DevicePosterior {
         self.variance.rows()
     }
 
-    /// Adds one draw `u` of the sampled-label gradient at the posterior mean (per trainable operator
-    /// by id, on the device; an operator the draw does not reach adds nothing) to `curvature`, its
-    /// terms weighted by `weight`: per group `(u_G · μ_G)²` and `Σ_{j∈G} u_j² σ_j²` over the group's
-    /// live entries (`Posterior::add_curvature`), summed on the device and read as one row per group.
-    pub fn add_curvature(&self, u: &BTreeMap<usize, Tensor>, weight: f64, curvature: &mut Curvature) -> Result<(), String> {
+    /// Adds one batch to `curvature` (`library_mdl`'s module note): with `θ` the weight sample
+    /// [`DevicePosterior::sample_into`] draws under `key`, `g` the batch's data gradient at `θ` (per
+    /// trainable operator by id, on the device), times `nats`, and `u` a draw of the Gauss–Newton
+    /// factor at `θ`, per group `g_G · θ_G` and `(u_G · θ_G)²` over the group's live entries,
+    /// summed on the device and read as one row per group; an operator neither reaches adds
+    /// nothing.
+    pub fn add_removal(&self, (g, nats): (&BTreeMap<usize, Tensor>, f64), u: &BTreeMap<usize, Tensor>, key: u64, curvature: &mut Curvature) -> Result<(), String> {
         let groups = self.group_count();
-        if curvature.quadratic.len() != groups {
-            return Err(error("a curvature of another explanation"));
-        }
-        let mut sums = self.wide.zeros(groups, 3).map_err(error)?;
+        let (mut slopes, mut forms) = (self.wide.zeros(groups, 3).map_err(error)?, self.wide.zeros(groups, 3).map_err(error)?);
         for (i, op) in self.operators.iter().enumerate() {
-            let Some(draw) = u.get(op) else { continue };
-            // The draw along the operator's rotated axes, where its means and deviations live
-            // (`u · μ` is the same along either; `Σ u² σ²` is a sum along the rotated axes).
-            let rotated = self.undone(i, draw)?;
-            self.fitting.group_curvature((rotated.as_ref().unwrap_or(draw), &self.average[i], &self.log_sd[i]), &self.groups[i], &mut sums).map_err(error)?;
+            let (gradient, draw) = (g.get(op), u.get(op));
+            if gradient.is_none() && draw.is_none() {
+                continue;
+            }
+            // The sample along the rotated axes, where the means and deviations are, as
+            // `sample_into` draws it; `x · θ` is the same along either axes.
+            let mut theta = self.fitting.zeros(self.mean[i].rows(), self.mean[i].cols()).map_err(error)?;
+            self.fitting.reparameterize(&mut theta, (&self.average[i], &self.log_sd[i]), (key, i as u64)).map_err(error)?;
+            for (x, sums) in [(gradient, &mut slopes), (draw, &mut forms)] {
+                let Some(x) = x else { continue };
+                let rotated = self.undone(i, x)?;
+                self.fitting.group_curvature((rotated.as_ref().unwrap_or(x), &theta, &self.log_sd[i]), &self.groups[i], sums).map_err(error)?;
+            }
         }
-        for (g, row) in self.wide.download(&sums).map_err(error)?.rows().into_iter().enumerate() {
-            curvature.quadratic[g] += weight * row[1] * row[1];
-            curvature.noise[g] += weight * row[2];
-        }
-        Ok(())
-    }
-
-    /// Adds the data term's gradient `g` at the posterior mean (per trainable operator by id, on the
-    /// device; an operator it does not reach adds nothing), weighted by `weight`, to `curvature`'s
-    /// per-group `g_G · μ_G` over the group's live entries (`Posterior::add_slope`).
-    pub fn add_slope(&self, g: &BTreeMap<usize, Tensor>, weight: f64, curvature: &mut Curvature) -> Result<(), String> {
-        let groups = self.group_count();
-        if curvature.slope.len() != groups {
-            return Err(error("a curvature of another explanation"));
-        }
-        let mut sums = self.wide.zeros(groups, 3).map_err(error)?;
-        for (i, op) in self.operators.iter().enumerate() {
-            let Some(gradient) = g.get(op) else { continue };
-            // Along the rotated axes, where the means live (`g · μ` is the same along either).
-            let rotated = self.undone(i, gradient)?;
-            self.fitting.group_curvature((rotated.as_ref().unwrap_or(gradient), &self.average[i], &self.log_sd[i]), &self.groups[i], &mut sums).map_err(error)?;
-        }
-        for (at, row) in self.wide.download(&sums).map_err(error)?.rows().into_iter().enumerate() {
-            curvature.slope[at] += weight * row[1];
-        }
-        Ok(())
+        let slope: Vec<f64> = self.wide.download(&slopes).map_err(error)?.column(1).iter().map(|s| nats * s).collect();
+        let form: Vec<f64> = self.wide.download(&forms).map_err(error)?.column(1).iter().map(|d| d * d).collect();
+        curvature.add_batch(&slope, &form)
     }
 
     /// Rows for `steps` steps' code lengths ([`DevicePosterior::code_length_into`]) of a posterior

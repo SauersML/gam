@@ -40,11 +40,12 @@
 //!
 //! A unit is a group with the groups its removal kills, transitively (removals only add zeros):
 //! the gate, up direction and output of an MLP function form one unit, since removing any of them
-//! silences the function. Each group's change of the expected data term when its entries become
-//! exactly zero is estimated to second order about the posterior mean,
-//! `−g_G · μ_G + ½ μ_Gᵀ H μ_G − ½ Σ_{j∈G} H_jj σ_j²` ([`Posterior::removal_data`]), with `g` the data
-//! term's gradient at the mean and `H` its Gauss–Newton matrix, both measured on the fixed collection
-//! in the same passes ([`Curvature`], `library_mdl`'s module note); the description falls by the
+//! silences the function. Each group's change of the data term when its entries become exactly
+//! zero is estimated to second order at the weight samples the evaluation below scores each batch
+//! at, `Σ_b (−g_b,G · θ_b,G + ½ θ_b,Gᵀ H_b θ_b,G)` ([`Posterior::removal_data`]), with `θ_b` batch
+//! `b`'s sample, `g_b` its data gradient there and `H_b` its Gauss–Newton matrix, measured on the
+//! fixed collection in the same passes ([`Curvature`], with the spread of the batches' terms;
+//! `library_mdl`'s module note); the description falls by the
 //! group's cost (`KL_G`, its variance's precision and scale) and the code of which groups are active
 //! changes with their count. A unit's prediction is the mean of its roots' data estimates (each
 //! root's removal silences the same functions; for an MLP function under compensation, times the
@@ -75,6 +76,16 @@
 //! its expectation over the posterior is estimated, not bounded, by it, and a proposal chosen on the
 //! same draws can fit their particulars. A round that accepts nothing found no removal that lowers
 //! the realized `F`; it does not show that none exists.
+//!
+//! A proposal is scored batch by batch against the accepted posterior on the same samples: with
+//! `d_b` the paired difference of batch `b`'s data term and `r` the fall of the rest of `F` (the
+//! description), the proposal lowers `F` when `Σ_b d_b ≤ r`. After `k` of `n` batches, if even the
+//! smallest difference seen so far on each of the `n − k` remaining batches would leave
+//! `Σ_{b≤k} d_b + (n − k) min_{b≤k} d_b > r`, the evaluation stops and the proposal is rejected
+//! ([`settled`]); the range needs two differences, so at least two batches are scored. This
+//! extrapolates the observed range and does not bound the remaining batches: an early rejection can
+//! be wrong, and its change in the log is the observed mean difference extrapolated to the `n`
+//! batches. Acceptance always scores every batch.
 //!
 //! Every proposal and its outcome are written as one JSON line to the round's log, with every
 //! active group's posterior summaries and every unit's prediction at the start of the round.
@@ -808,22 +819,70 @@ impl Journal {
     }
 }
 
+/// An evaluation of `F` in nats on the fixed collection: per training batch its data term, and the
+/// rest of `F`; `complete` when every batch was scored, otherwise the batches scored before the
+/// evaluation was settled (module note, [`settled`]).
+#[derive(Clone, Debug)]
+pub struct Evaluation {
+    pub batches: Vec<f64>,
+    pub rest: f64,
+    pub complete: bool,
+}
+
+impl Evaluation {
+    /// `F` of a complete evaluation.
+    #[must_use]
+    pub fn total(&self) -> f64 {
+        self.batches.iter().sum::<f64>() + self.rest
+    }
+
+    /// The change of `F` from the complete evaluation `from` on the same batches: exact when this
+    /// one is complete, otherwise the paired differences' mean over the scored batches times the
+    /// number of batches, plus the change of the rest.
+    #[must_use]
+    pub fn change(&self, from: &Self) -> f64 {
+        if self.complete {
+            return self.total() - from.total();
+        }
+        let paired: f64 = self.batches.iter().zip(&from.batches).map(|(t, a)| t - a).sum();
+        paired * from.batches.len() as f64 / self.batches.len().max(1) as f64 + self.rest - from.rest
+    }
+}
+
+/// Whether the paired per-batch `differences` scored so far of `n` batches settle a rejection
+/// against `budget`, the fall of the rest of `F` (module note): at least two differences, and their
+/// sum plus the smallest of them on each remaining batch above `budget`.
+#[must_use]
+pub fn settled(differences: &[f64], n: usize, budget: f64) -> bool {
+    let k = differences.len();
+    if k < 2 || k >= n {
+        return false;
+    }
+    let low = differences.iter().copied().fold(f64::INFINITY, f64::min);
+    differences.iter().sum::<f64>() + (n - k) as f64 * low > budget
+}
+
 /// One removal round on `posterior` (module note) with `objective` the exact `F` in nats of a
-/// trial posterior on the fixed collection, compensated by `compensation` when given, logged to
-/// `log` when given. `posterior` becomes the accepted one.
+/// trial posterior on the fixed collection, given the accepted posterior's complete evaluation to
+/// stop early against (module note), compensated by `compensation` when given, logged to `log`
+/// when given. `posterior` becomes the accepted one.
 pub fn round(
     explanation: &Explanation,
     posterior: &mut Posterior,
     compensation: Option<&Compensation>,
     curvature: &Curvature,
-    objective: &mut dyn FnMut(&Posterior) -> Result<f64, String>,
+    objective: &mut dyn FnMut(&Posterior, Option<&Evaluation>) -> Result<Evaluation, String>,
     log: Option<&Path>,
 ) -> Result<Removal, String> {
     let started = Instant::now();
     let structure = Structure::new(explanation)?;
     let mut journal = Journal::open(log)?;
     let candidates = posterior.active.iter().filter(|a| **a).count();
-    let before = objective(posterior)?;
+    let mut accepted_evaluation = objective(posterior, None)?;
+    if !accepted_evaluation.complete {
+        return Err(error("an incomplete evaluation of the starting posterior"));
+    }
+    let before = accepted_evaluation.total();
     let mut current = before;
     let mut evaluations: Vec<(usize, f64)> = Vec::new();
     // The groups removed as without effect, and each rejected unit's first group with its own
@@ -848,17 +907,19 @@ pub fn round(
         removed.remove(&dead);
         // The data term cannot change: the prediction is the description's change.
         let predicted = removed.description() - posterior.description();
-        let change = objective(&removed)? - current;
-        let accepted = change <= 0.0;
+        let evaluation = objective(&removed, Some(&accepted_evaluation))?;
+        let change = evaluation.change(&accepted_evaluation);
+        let accepted = evaluation.complete && change <= 0.0;
         journal.write(json!({
             "event": "proposal", "kind": "dead", "groups": dead, "layers": names(&dead),
-            "predicted_bits": predicted / LN_2, "measured_bits": change / LN_2,
+            "predicted_bits": predicted / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
             "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(),
         }))?;
         evaluations.push((dead.len(), change / LN_2));
         if accepted {
             *posterior = removed;
             current += change;
+            accepted_evaluation = evaluation;
             dead_removed = dead.len();
         }
     }
@@ -866,6 +927,7 @@ pub fn round(
     let divergences = posterior.divergences();
     let summary = summaries(explanation, posterior)?;
     let data_rise = posterior.removal_data(curvature);
+    let data_spread = curvature.spread();
     let mut units = structure.units(&posterior.active)?;
     let (total, active) = (posterior.active.len(), posterior.active.iter().filter(|a| **a).count());
     let subset = subset_nats(total, active)?;
@@ -898,7 +960,7 @@ pub fn round(
         "groups": (0..posterior.active.len()).filter(|g| posterior.active[*g]).map(|g| json!({
             "id": g, "name": explanation.groups[g].name, "layer": layer(&explanation.groups[g].name),
             "size": explanation.groups[g].cells.iter().map(|c| c.rows.len() * c.cols.len()).sum::<usize>(),
-            "kl_bits": divergences[g] / LN_2, "cost_bits": costs[g] / LN_2, "signal": summary[g].signal, "data_rise_bits": data_rise[g] / LN_2,
+            "kl_bits": divergences[g] / LN_2, "cost_bits": costs[g] / LN_2, "signal": summary[g].signal, "data_rise_bits": data_rise[g] / LN_2, "data_rise_spread_bits": data_spread[g] / LN_2,
             "mean_abs_mu": summary[g].mean_abs, "rms_sigma": summary[g].rms_sd,
         })).collect::<Vec<Value>>(),
         "units": units.iter().map(|u| json!({"groups": u.groups, "roots": u.roots, "predicted_bits": u.predicted / LN_2})).collect::<Vec<Value>>(),
@@ -925,7 +987,9 @@ pub fn round(
             groups.sort_unstable();
             Ok(groups)
         };
-        let mut changes: BTreeMap<usize, f64> = BTreeMap::new();
+        // Per tested prefix length, its change of `F` and its evaluation.
+        let mut changes: BTreeMap<usize, (f64, Evaluation)> = BTreeMap::new();
+        let from = &accepted_evaluation;
         // The last accepted proposal's trial: the searches return the length they last accepted,
         // so it is the next posterior and is not solved again.
         let mut kept: Option<(usize, Posterior)> = None;
@@ -934,33 +998,43 @@ pub fn round(
             let groups = proposal(k)?;
             let proposed = trial(base, &groups)?;
             let trial_seconds = timed.elapsed().as_secs_f64();
-            let change = objective(&proposed)? - current;
+            let evaluation = objective(&proposed, Some(from))?;
+            let change = evaluation.change(from);
             if !change.is_finite() {
                 return Err(error("a nonfinite removal objective"));
             }
             let removed_now = active - base.active.iter().filter(|a| **a).count();
             let predicted = rest[..k].iter().map(|u| u.data).sum::<f64>() - groups.iter().map(|g| costs[*g]).sum::<f64>() + subset_change(removed_now + groups.len())?
                 - subset_change(removed_now)?;
+            let accepted = evaluation.complete && change <= 0.0;
             journal.write(json!({
                 "event": "proposal", "kind": kind, "units": k, "groups": groups, "layers": names(&groups),
-                "predicted_bits": predicted / LN_2, "measured_bits": change / LN_2,
-                "accepted": change <= 0.0, "seconds": timed.elapsed().as_secs_f64(), "trial_seconds": trial_seconds,
+                "predicted_bits": predicted / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
+                "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(), "trial_seconds": trial_seconds,
             }))?;
             evaluations.push((groups.len(), change / LN_2));
-            changes.insert(k, change);
-            if change <= 0.0 {
+            changes.insert(k, (change, evaluation));
+            if accepted {
                 kept = Some((k, proposed));
             }
-            Ok(change <= 0.0)
+            Ok(accepted)
         };
         let accepted = if tail { gallop(rest.len(), true, &mut test)? } else { gallop_down(safe, &mut test)? };
+        // The change of `F` from the accepted prefix to the next length, exact when both
+        // evaluations are complete (before the accepted prefix's evaluation is taken).
+        let blocked = changes.get(&(accepted + 1)).map(|(after, evaluation)| {
+            let (before, complete) = changes.get(&accepted).map_or((0.0, true), |(c, e)| (*c, e.complete));
+            (after - before, complete && evaluation.complete)
+        });
         if accepted > 0 {
             let next = match kept.take() {
                 Some((k, proposed)) if k == accepted => proposed,
                 _ => trial(base, &proposal(accepted)?)?,
             };
             *posterior = next;
-            current += changes[&accepted];
+            let (change, evaluation) = changes.remove(&accepted).ok_or_else(|| error("an accepted prefix without its evaluation"))?;
+            current += change;
+            accepted_evaluation = evaluation;
         }
         if accepted == rest.len() {
             break;
@@ -970,12 +1044,12 @@ pub fn round(
             continue;
         }
         // The unit the segment ended on: its own effect on top of the accepted prefix.
+        let (marginal, complete) = blocked.ok_or_else(|| error("a segment ended on an untested unit"))?;
         let blocked = &rest[accepted];
-        let marginal = changes[&(accepted + 1)] - changes.get(&accepted).copied().unwrap_or(0.0);
         singles.push((blocked.groups[0], marginal / LN_2));
         journal.write(json!({
             "event": "proposal", "kind": "blocked", "units": 1, "groups": blocked.groups, "layers": names(&blocked.groups),
-            "predicted_bits": blocked.predicted / LN_2, "measured_bits": marginal / LN_2, "accepted": false, "seconds": 0.0,
+            "predicted_bits": blocked.predicted / LN_2, "measured_bits": marginal / LN_2, "complete": complete, "accepted": false, "seconds": 0.0,
         }))?;
         rest = &rest[accepted + 1..];
         while rest.first().is_some_and(|u| u.groups.iter().all(|g| !posterior.active[*g])) {
@@ -1109,6 +1183,7 @@ mod tests {
     fn stationary(explanation: &Explanation, posterior: &Posterior) -> Curvature {
         let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         let mut curvature = Curvature::new(explanation.groups.len());
+        let mut rise = vec![0.0; explanation.groups.len()];
         for (g, group) in explanation.groups.iter().enumerate() {
             let entries: Vec<(f64, f64)> = group
                 .cells
@@ -1118,39 +1193,75 @@ mod tests {
                 .filter(|(_, variance)| *variance > 0.0)
                 .collect();
             let prior = entries.iter().map(|(mu, variance)| mu * mu + variance).sum::<f64>() / entries.len().max(1) as f64;
+            // `−g_G · μ_G + ½ μ_Gᵀ H μ_G − ½ Σ_{j∈G} H_jj σ_j²` at the mean, as one batch.
             for (mu, variance) in entries {
                 let h = 1.0 / variance - 1.0 / prior;
-                curvature.quadratic[g] += h * mu * mu;
-                curvature.noise[g] += h * variance;
-                curvature.slope[g] -= mu * mu / prior;
+                rise[g] += mu * mu / prior + 0.5 * h * mu * mu - 0.5 * h * variance;
             }
         }
+        let slope: Vec<f64> = rise.iter().map(|r| -r).collect();
+        curvature.add_batch(&slope, &vec![0.0; rise.len()]).expect("one batch");
         curvature
     }
 
-    /// The measured curvature and gradient of `posterior` on the evidence: one forward pass per
-    /// batch at the posterior mean, reversed for the divergence's gradient and for a sampled-label
-    /// draw, weighted by `weight`.
+    /// Batch `key`'s weight sample of `posterior`, each live entry `μ + σ ε` with `ε` the posterior
+    /// noise stream `(key, operator, entry)`.
+    fn sample(posterior: &Posterior, key: u64) -> Vec<Array2<f64>> {
+        posterior
+            .mean
+            .iter()
+            .zip(&posterior.log_sd)
+            .enumerate()
+            .map(|(i, (mean, log_sd))| {
+                let cols = mean.ncols();
+                Array2::from_shape_fn(mean.dim(), |(r, c)| {
+                    let s = log_sd[[r, c]];
+                    if s == f64::NEG_INFINITY { mean[[r, c]] } else { mean[[r, c]] + s.exp() * f64::from(posterior_normal(key, i as u64, (r * cols + c) as u64)) }
+                })
+            })
+            .collect()
+    }
+
+    /// The removal estimates of `posterior` on the evidence ([`Curvature`]): per batch `b`, one
+    /// forward pass at its sample ([`sample`] with key `b`), reversed for the divergence's
+    /// gradient `g_b` and for a sampled-label draw `u_b`, and per group `g_b,G · θ_b,G` and
+    /// `(u_b,G · θ_b,G)²` over its live entries, the data term weighted by `weight`.
     fn measured(ic: &mut Interchange, explanation: &Explanation, posterior: &Posterior, evidence: &[Evidence], weight: f64, rng: &mut StdRng) -> Curvature {
         use rand::RngExt;
-        ic.load(&posterior.means()).expect("the means load");
+        let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         let mut curvature = Curvature::new(explanation.groups.len());
-        for e in evidence {
+        for (b, e) in evidence.iter().enumerate() {
+            let theta = sample(posterior, b as u64);
+            ic.load(&theta).expect("the sample loads");
             let rows: usize = e.experiments.iter().map(|x| e.batch.length() - x.position).sum();
             let uniforms: Vec<f64> = (0..rows).map(|_| rng.random::<f64>()).collect();
             let evaluation = ic.evaluate_labelled(&e.batch, &e.experiments, Some(&e.targets), true, Some(&uniforms)).expect("the labelled evaluation");
             let factor = evaluation.factor.expect("the Gauss–Newton factor");
             let d = ic.models().1.program.device();
-            let host = |gradient: &BTreeMap<usize, gam_gpu::tensor::Tensor>| -> Vec<Array2<f64>> {
+            let dots = |gradient: &BTreeMap<usize, gam_gpu::tensor::Tensor>| -> Vec<f64> {
+                let host: BTreeMap<usize, Array2<f64>> = gradient.iter().map(|(op, g)| (*op, d.download(g).expect("the download"))).collect();
                 explanation
-                    .trainable
+                    .groups
                     .iter()
-                    .zip(&posterior.mean)
-                    .map(|(op, mean)| gradient.get(op).map_or_else(|| Array2::zeros(mean.dim()), |g| d.download(g).expect("the download")))
+                    .map(|group| {
+                        let mut dot = 0.0;
+                        for cell in &group.cells {
+                            let (Some(x), i) = (host.get(&cell.operator), position[&cell.operator]) else { continue };
+                            for &r in &cell.rows {
+                                for c in cell.cols.clone() {
+                                    if posterior.log_sd[i][[r, c]] != f64::NEG_INFINITY {
+                                        dot += x[[r, c]] * theta[i][[r, c]];
+                                    }
+                                }
+                            }
+                        }
+                        dot
+                    })
                     .collect()
             };
-            posterior.add_curvature(&host(&factor.gradient), weight, &mut curvature).expect("the draw");
-            posterior.add_slope(&host(&evaluation.gradient), weight * LN_2, &mut curvature).expect("the gradient");
+            let slope: Vec<f64> = dots(&evaluation.gradient).iter().map(|s| weight * LN_2 * s).collect();
+            let form: Vec<f64> = dots(&factor.gradient).iter().map(|u| weight * u * u).collect();
+            curvature.add_batch(&slope, &form).expect("the batch");
         }
         curvature
     }
@@ -1282,9 +1393,9 @@ mod tests {
         let start_active = start.active.clone();
         // F: the description plus a data cost for each removed group other than the free ones.
         let free: BTreeSet<usize> = planes.iter().copied().chain([first, last]).collect();
-        let mut objective = |trial: &Posterior| -> Result<f64, String> {
+        let mut objective = |trial: &Posterior, _: Option<&Evaluation>| -> Result<Evaluation, String> {
             let data = (0..trial.active.len()).filter(|g| start_active[*g] && !trial.active[*g] && !free.contains(g)).count() as f64 * 1e6;
-            Ok(data + trial.description())
+            Ok(Evaluation { batches: Vec::new(), rest: data + trial.description(), complete: true })
         };
         let log = std::env::temp_dir().join(format!("gam_mpd_removal_continue_{}.jsonl", std::process::id()));
         let curvature = stationary(&explanation, &start);
@@ -1331,26 +1442,22 @@ mod tests {
         let tokens = 1_000_000.0;
         let scored: usize = evidence.iter().flat_map(|e| &e.experiments).map(|e| 12 - e.position).sum();
         let weight = tokens / scored as f64;
-        let objective = |ic: &mut Interchange, posterior: &Posterior| -> Result<f64, String> {
-            let mut bits = 0.0;
+        // Scored batch by batch against an accepted evaluation, stopping as the fit's does.
+        let objective = |ic: &mut Interchange, posterior: &Posterior, against: Option<&Evaluation>| -> Result<Evaluation, String> {
+            let rest = posterior.description();
+            let mut batches = Vec::new();
             for (b, e) in evidence.iter().enumerate() {
-                let theta: Vec<Array2<f64>> = posterior
-                    .mean
-                    .iter()
-                    .zip(&posterior.log_sd)
-                    .enumerate()
-                    .map(|(i, (mean, log_sd))| {
-                        let cols = mean.ncols();
-                        Array2::from_shape_fn(mean.dim(), |(r, c)| {
-                            let s = log_sd[[r, c]];
-                            if s == f64::NEG_INFINITY { mean[[r, c]] } else { mean[[r, c]] + s.exp() * f64::from(posterior_normal(b as u64, i as u64, (r * cols + c) as u64)) }
-                        })
-                    })
-                    .collect();
-                ic.load(&theta)?;
-                bits += ic.evaluate_resident(&e.batch, &e.experiments, &e.targets, false)?.bits.iter().flatten().sum::<f64>();
+                ic.load(&sample(posterior, b as u64))?;
+                batches.push(weight * ic.evaluate_resident(&e.batch, &e.experiments, &e.targets, false)?.bits.iter().flatten().sum::<f64>() * LN_2);
+                if let Some(a) = against {
+                    let differences: Vec<f64> = batches.iter().zip(&a.batches).map(|(t, x)| t - x).collect();
+                    if settled(&differences, evidence.len(), a.rest - rest) {
+                        break;
+                    }
+                }
             }
-            Ok(weight * bits * LN_2 + posterior.description())
+            let complete = batches.len() == evidence.len();
+            Ok(Evaluation { batches, rest, complete })
         };
         let mut posterior = Posterior::new(&explanation, tokens as usize).expect("the posterior");
         // Planted groups without effect: the planes of a head without values, and the gates of five
@@ -1364,7 +1471,8 @@ mod tests {
         let start = posterior.clone();
         let compensation = Compensation::new(&mut ic, &explanation, &start, &sequences, 2).expect("the compensation");
         let curvature = measured(&mut ic, &explanation, &start, &evidence, weight, &mut rng);
-        let ranked = round(&explanation, &mut posterior, Some(&compensation), &curvature, &mut |p: &Posterior| objective(&mut ic, p), None).expect("the ranked search");
+        let ranked = round(&explanation, &mut posterior, Some(&compensation), &curvature, &mut |p: &Posterior, a: Option<&Evaluation>| objective(&mut ic, p, a), None)
+            .expect("the ranked search");
         for g in &planted {
             assert!(!posterior.active[*g], "{} survived", explanation.groups[*g].name);
         }
@@ -1380,7 +1488,7 @@ mod tests {
         let first = (0..divergences.len()).filter(|g| start.active[*g] && !planted.contains(g)).min_by(|a, b| divergences[*a].total_cmp(&divergences[*b])).unwrap();
         let without_dead = removed(&start, &planted);
         let alone = compensation.proposal(&without_dead, &[first]).unwrap();
-        assert!(objective(&mut ic, &alone).unwrap() > objective(&mut ic, &without_dead).unwrap(), "the first group is needed");
+        assert!(objective(&mut ic, &alone, None).unwrap().total() > objective(&mut ic, &without_dead, None).unwrap().total(), "the first group is needed");
         assert!(posterior.active[first]);
         assert!(ranked.removed >= planted.len());
         // The removals beyond the groups without effect were accepted on one weight sample per
@@ -1389,20 +1497,7 @@ mod tests {
         let mut fresh = |p: &Posterior, key: u64| -> f64 {
             let mut bits = 0.0;
             for e in &evidence {
-                let theta: Vec<Array2<f64>> = p
-                    .mean
-                    .iter()
-                    .zip(&p.log_sd)
-                    .enumerate()
-                    .map(|(i, (mean, log_sd))| {
-                        let cols = mean.ncols();
-                        Array2::from_shape_fn(mean.dim(), |(r, c)| {
-                            let s = log_sd[[r, c]];
-                            if s == f64::NEG_INFINITY { mean[[r, c]] } else { mean[[r, c]] + s.exp() * f64::from(posterior_normal(key, i as u64, (r * cols + c) as u64)) }
-                        })
-                    })
-                    .collect();
-                ic.load(&theta).unwrap();
+                ic.load(&sample(p, key)).unwrap();
                 bits += ic.evaluate_resident(&e.batch, &e.experiments, &e.targets, false).unwrap().bits.iter().flatten().sum::<f64>();
             }
             weight * bits * LN_2 + p.description()
@@ -1411,6 +1506,23 @@ mod tests {
             let (kept, searched) = (fresh(&dead_only, key), fresh(&posterior, key));
             assert!(searched < kept, "on fresh noise {key} the searched posterior scores {searched} nats against {kept}");
         }
+    }
+
+    #[test]
+    fn an_evaluation_stops_once_the_observed_range_cannot_lower_f() {
+        // Ten batches against a fall of 5 in the rest of F: differences 2 and 4 leave at least
+        // 6 + 8 × 2 = 22 > 5.
+        assert!(settled(&[2.0, 4.0], 10, 5.0));
+        // One difference has no range; a negative one keeps the total open (1 + 8 × (−1) ≤ 5);
+        // with every batch scored there is nothing to settle.
+        assert!(!settled(&[100.0], 10, 5.0));
+        assert!(!settled(&[2.0, -1.0], 10, 5.0));
+        assert!(!settled(&[2.0, 4.0], 2, 0.0));
+        // The change of a stopped evaluation extrapolates its paired differences' mean: (1 + 2) / 2
+        // per batch over 4 batches, and the rest's change −1.
+        let from = Evaluation { batches: vec![1.0; 4], rest: 10.0, complete: true };
+        assert_eq!(Evaluation { batches: vec![2.0, 3.0], rest: 9.0, complete: false }.change(&from), 5.0);
+        assert_eq!(Evaluation { batches: vec![2.0, 3.0, 1.0, 1.0], rest: 9.0, complete: true }.change(&from), 2.0);
     }
 
     #[test]
