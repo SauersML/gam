@@ -1062,3 +1062,39 @@ fn a_joint_removal_of_parts_is_each_removal_at_once() {
         }
     }
 }
+
+/// A swap of a part's activation (`Patch::Swap`) on the starting library of the tiny Qwen3 export,
+/// an exact copy of `M`, its source another sequence: it scores zero against `M` with and without
+/// the gradient's reverse, and changes `M`'s prediction exactly for a firing part.
+#[test]
+fn a_swap_of_a_part_is_the_same_on_both_models() {
+    let dir = crate::test_support::tiny_qwen3_export("interchange_swaps", 2);
+    let imported = crate::import::import_language_model(&dir, 6, 12).expect("the tiny export imports");
+    std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+    let native = split_sites(&imported.program).expect("the native sites");
+    let layers = layer_nodes(&native, 2).expect("the layers");
+    let explanation = crate::library_mdl::explanation(&native, &layers).expect("the library");
+    let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+    let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+    let d = Device::host();
+    let variables = reads(&native, &layers).expect("the reads");
+    let mut x = Interchange::new(&d, &native, &layers, &explanation.artifact, &explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
+    let width = BlockEngine::width(&x.models().0);
+    x.set_parts(random_parts(width, 7)).expect("the parts");
+    let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
+    let swap = |base: usize, part: usize, position: usize| Experiment { base, source: (base + 1) % 3, explained: vec![true; 4], patch: Some(Patch::Swap { part }), position };
+    let clean = |base: usize| Experiment { base, source: base, explained: vec![true; 4], patch: None, position: 0 };
+    let experiments = vec![clean(0), swap(0, 0, 3), clean(1), swap(1, 2, 7), clean(2), swap(2, 1, 5)];
+    assert_eq!(census(&experiments, x.variables())["swap_part"], 3);
+    for gradient in [false, true] {
+        let bits = x.evaluate(&batch, &experiments, gradient).expect("evaluate").bits;
+        assert!(bits.iter().flatten().all(|b| b.abs() <= 1e-9), "{bits:?}");
+    }
+    let made = x.targets(&batch, &experiments).expect("targets").host(&d).expect("host");
+    for pair in 0..3 {
+        let (plain, edited, e) = (&made[2 * pair].1, &made[2 * pair + 1].1, &experiments[2 * pair + 1]);
+        let Some(Patch::Swap { part }) = e.patch else { panic!("a swap") };
+        let changed = plain[e.position..].iter().zip(edited).any(|(a, b)| (a - b).abs() > 1e-9);
+        assert_eq!(changed, part % 2 == 0, "{e:?}: M changes only under a swap of a firing part");
+    }
+}

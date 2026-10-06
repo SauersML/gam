@@ -263,7 +263,10 @@ fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<ReadVar
 /// the experiment's position, nothing else changing: the path patch of the connection, the
 /// substitution made inside `to`'s read alone ([`Edits`]). The other edits patch no read variable
 /// and have no source. A joint edit (`Parts`): the distinct parts `parts` (ascending, of one
-/// block) each scaled by `FACTORS[factor]` at once, as one edit of each at the same row.
+/// block) each scaled by `FACTORS[factor]` at once, as one edit of each at the same row. A swap of
+/// a part's activation (`Swap`): `(a(x′) − a(x))·u` added to the part's block output at the row,
+/// `a` the part's activation read on the model's own stream on the source `x′` and on the base `x`
+/// there (the transcoder features' read patch, which `M`'s read variables do not hold).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Patch {
     Read { variable: usize },
@@ -272,6 +275,7 @@ pub enum Patch {
     Head { head: usize },
     Cut { from: usize, to: usize },
     Parts { parts: Vec<usize>, factor: usize },
+    Swap { part: usize },
 }
 
 impl Patch {
@@ -280,7 +284,7 @@ impl Patch {
         match self {
             Self::Read { variable } => std::slice::from_ref(variable),
             Self::Reads { variables } => variables,
-            Self::Part { .. } | Self::Head { .. } | Self::Cut { .. } | Self::Parts { .. } => &[],
+            Self::Part { .. } | Self::Head { .. } | Self::Cut { .. } | Self::Parts { .. } | Self::Swap { .. } => &[],
         }
     }
 }
@@ -341,7 +345,7 @@ pub fn parts_of(program: &OperatorProgram, layers: usize) -> Result<Vec<Part>, S
 /// part (`FACTORS[0]`); scaling a part's write by one of the other factors; removing a random
 /// subset of the parts firing at a row of one block at once (as [`subset`] draws a joint read
 /// patch's: a single part's removal moves `M` little); removing a head; and cutting a connection
-/// between two parts ([`Interchange::draw_edits`]; scored, not trained: it has
+/// between two parts; swapping a part's activation for its value on the source sequence ([`Interchange::draw_edits`]; scored, not trained: it has
 /// no reverse pass).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -352,6 +356,7 @@ pub enum Family {
     RemoveHead,
     CutConnection,
     RemoveParts,
+    SwapPart,
 }
 
 /// Where a model applies edits of parts: per block, for an MLP block, the node its parts read
@@ -461,6 +466,9 @@ impl Experiment {
         if let Patch::Head { head } = patch {
             return heads.get(*head).map(|b| Some(*b)).ok_or_else(|| error("a removal of an unknown head"));
         }
+        if let Patch::Swap { part } = patch {
+            return parts.get(*part).map(|p| Some(p.block)).ok_or_else(|| error("a swap of an unknown part"));
+        }
         if let Patch::Part { part, factor } = patch {
             if *factor >= FACTORS.len() {
                 return Err(error("an edit's factor outside FACTORS"));
@@ -564,7 +572,7 @@ pub fn subset(rng: &mut impl RngExt, candidates: &[usize]) -> Vec<usize> {
 /// The realized count of each family among `experiments`: clean with `P` alone, clean under a
 /// hybrid, single read patches of attention and of MLP variables, and joint read patches.
 pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMap<&'static str, usize> {
-    let mut counts: BTreeMap<&'static str, usize> = ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint", "remove_part", "amplify_part", "remove_head", "cut_connection", "remove_parts"].into_iter().map(|k| (k, 0)).collect();
+    let mut counts: BTreeMap<&'static str, usize> = ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint", "remove_part", "amplify_part", "remove_head", "cut_connection", "remove_parts", "swap_part"].into_iter().map(|k| (k, 0)).collect();
     for e in experiments {
         let family = match &e.patch {
             None if e.explained.iter().all(|x| *x) => "clean_alone",
@@ -577,6 +585,7 @@ pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMa
             Some(Patch::Head { .. }) => "remove_head",
             Some(Patch::Cut { .. }) => "cut_connection",
             Some(Patch::Parts { .. }) => "remove_parts",
+            Some(Patch::Swap { .. }) => "swap_part",
         };
         *counts.entry(family).or_default() += 1;
     }
@@ -879,6 +888,8 @@ pub struct Edits {
 struct Writes {
     read: usize,
     rows: Vec<usize>,
+    /// Per edit the row its activation is read at (its own row, or a swap's source row).
+    from: Vec<usize>,
     gates: ndarray::Array2<f64>,
     biases: Vec<f64>,
     outs: ndarray::Array2<f64>,
@@ -890,10 +901,10 @@ struct Writes {
 impl Writes {
     /// Add `rows` (one per edit, in the edits' order) to the edited rows of `t`, each round of
     /// distinct rows at once ([`rounds`]).
-    fn add(&self, d: &Device, t: &mut Tensor, rows: ndarray::Array2<f64>) -> Result<(), String> {
+    fn add(&self, d: &Device, t: &mut Tensor, rows: ndarray::Array2<f64>, targets: &[usize]) -> Result<(), String> {
         let added = d.upload(rows.view()).map_err(error)?;
-        for round in rounds(&self.rows) {
-            let at = single(round.iter().map(|i| self.rows[*i]));
+        for round in rounds(targets) {
+            let at = single(round.iter().map(|i| targets[*i]));
             let mut value = d.gather_ranges(t, &at).map_err(error)?;
             let part = picked(d, &added, &round)?;
             d.axpy(&mut value, 1.0, part.as_ref().unwrap_or(&added)).map_err(error)?;
@@ -903,8 +914,8 @@ impl Writes {
     }
 
     /// The edited rows of `t` on the host.
-    fn rows_of(&self, d: &Device, t: &Tensor) -> Result<ndarray::Array2<f64>, String> {
-        d.download(&d.gather_ranges(t, &single(self.rows.iter().copied())).map_err(error)?).map_err(error)
+    fn rows_of(&self, d: &Device, t: &Tensor, rows: &[usize]) -> Result<ndarray::Array2<f64>, String> {
+        d.download(&d.gather_ranges(t, &single(rows.iter().copied())).map_err(error)?).map_err(error)
     }
 }
 
@@ -961,7 +972,7 @@ impl Edits {
         sites: Option<&PartSites>,
         recorded: Option<std::rc::Rc<RefCell<BTreeMap<usize, [f64; 2]>>>>,
     ) -> Result<Self, String> {
-        let mut writes: BTreeMap<usize, (usize, Vec<(usize, &Part, f64)>)> = BTreeMap::new();
+        let mut writes: BTreeMap<usize, (usize, Vec<(usize, usize, &Part, f64)>)> = BTreeMap::new();
         let mut zeroed = Vec::new();
         let mut cuts: BTreeMap<usize, Cuts> = BTreeMap::new();
         for (row, edit) in edits {
@@ -976,8 +987,11 @@ impl Edits {
                 cuts.entry(out).or_insert_with(|| Cuts { read, norm, probes: Vec::new(), cuts: Vec::new() });
                 Ok(out)
             };
-            let (part, factor) = match edit {
-                Edit::Part { part, factor } => (part, factor),
+            let (part, factor, from) = match edit {
+                Edit::Part { part, factor } => (part, *factor, None),
+                // A swap: the part's activation read at the source's row, less the base's.
+                Edit::SwapAt { part, from } => (part, usize::MAX, Some(*from)),
+                Edit::Swap { .. } => return Err(error("a swap without its source's row")),
                 Edit::Probe { cut, part, role, .. } => {
                     let out = at_block(&mut cuts, *part)?;
                     cuts.get_mut(&out).ok_or_else(|| error("a cut's block"))?.probes.push((*row, *cut, *role, *part));
@@ -995,24 +1009,31 @@ impl Edits {
                 }
             };
             let p = sites.parts.get(*part).ok_or_else(|| error("an edit of an unknown part"))?;
-            let alpha = *FACTORS.get(*factor).ok_or_else(|| error("an edit's factor outside FACTORS"))?;
             let (read, out) = sites.nodes.get(p.block).copied().flatten().ok_or_else(|| error(format!("block {}: no part sites", p.block)))?;
-            writes.entry(out).or_insert_with(|| (read, Vec::new())).1.push((*row, p, alpha - 1.0));
+            let list = &mut writes.entry(out).or_insert_with(|| (read, Vec::new())).1;
+            match from {
+                Some(from) => {
+                    list.push((*row, from, p, 1.0));
+                    list.push((*row, *row, p, -1.0));
+                }
+                None => list.push((*row, *row, p, FACTORS.get(factor).ok_or_else(|| error("an edit's factor outside FACTORS"))? - 1.0)),
+            }
         }
         let writes = writes
             .into_iter()
             .map(|(out, (read, list))| {
-                let width = list[0].1.read.len();
-                if list.iter().any(|(_, p, _)| p.read.len() != width || p.write.len() != width) {
+                let width = list[0].2.read.len();
+                if list.iter().any(|(_, _, p, _)| p.read.len() != width || p.write.len() != width) {
                     return Err(error("parts of one block differ in width"));
                 }
-                let gates = ndarray::Array2::from_shape_fn((list.len(), width), |(i, c)| list[i].1.read[c]);
-                let outs = ndarray::Array2::from_shape_fn((list.len(), width), |(i, c)| list[i].1.write[c]);
-                let rows = list.iter().map(|(r, _, _)| *r).collect();
-                let biases = list.iter().map(|(_, p, _)| p.bias).collect();
-                let scales: Vec<f64> = list.iter().map(|(_, _, s)| *s).collect();
+                let gates = ndarray::Array2::from_shape_fn((list.len(), width), |(i, c)| list[i].2.read[c]);
+                let outs = ndarray::Array2::from_shape_fn((list.len(), width), |(i, c)| list[i].2.write[c]);
+                let rows = list.iter().map(|(r, _, _, _)| *r).collect();
+                let from = list.iter().map(|(_, f, _, _)| *f).collect();
+                let biases = list.iter().map(|(_, _, p, _)| p.bias).collect();
+                let scales: Vec<f64> = list.iter().map(|(_, _, _, s)| *s).collect();
                 let k = scales.len();
-                Ok((out, Writes { read, rows, gates, biases, outs, scales, slopes: RefCell::new(vec![0.0; k]), carried: RefCell::new(vec![0.0; k]) }))
+                Ok((out, Writes { read, rows, from, gates, biases, outs, scales, slopes: RefCell::new(vec![0.0; k]), carried: RefCell::new(vec![0.0; k]) }))
             })
             .collect::<Result<_, String>>()?;
         let mut out = Self::patches(d, patches, values, &zeroed)?;
@@ -1113,7 +1134,7 @@ impl Edits {
             }
         }
         let Some(w) = self.writes.get(&node) else { return Ok(()) };
-        let x = w.rows_of(d, value_of(w.read)?)?;
+        let x = w.rows_of(d, value_of(w.read)?, &w.from)?;
         let mut added = ndarray::Array2::zeros((w.rows.len(), value.cols()));
         let mut slopes = vec![0.0; w.rows.len()];
         for i in 0..w.rows.len() {
@@ -1124,7 +1145,7 @@ impl Edits {
             }
         }
         *w.slopes.borrow_mut() = slopes;
-        w.add(d, value, added)
+        w.add(d, value, added, &w.rows)
     }
 
     /// Node `node`'s value `value` (the call's rows in order) with each patched row's patched
@@ -1159,13 +1180,13 @@ impl Edits {
             return Err(error("a cut connection has no reverse pass: it scores explanations, it does not train them"));
         }
         if let Some(w) = self.writes.get(&node) {
-            let rows = w.rows_of(d, g)?;
+            let rows = w.rows_of(d, g, &w.rows)?;
             *w.carried.borrow_mut() = (0..w.rows.len()).map(|i| rows.row(i).dot(&w.outs.row(i))).collect();
         }
         for w in self.writes.values().filter(|w| w.read == node) {
             let (slopes, carried) = (w.slopes.borrow(), w.carried.borrow());
             let added = ndarray::Array2::from_shape_fn((w.rows.len(), g.cols()), |(i, c)| slopes[i] * carried[i] * w.gates[[i, c]]);
-            w.add(d, g, added)?;
+            w.add(d, g, added, &w.from)?;
         }
         let Some(p) = self.nodes.get(&node) else { return Ok(()) };
         let read = d.gather_ranges(g, &single(p.rows.iter().copied())).map_err(error)?;
@@ -1410,6 +1431,10 @@ pub(crate) enum Edit {
     /// or the source (1), and its change to `to`'s read (`Patch::Cut`).
     Probe { cut: usize, part: usize, role: usize, at: usize },
     Cut { cut: usize, from: usize, to: usize },
+    /// A swap of part `part`'s activation from the source's path `source`, and as a call's edit,
+    /// from the call's row `from`.
+    Swap { part: usize, source: usize },
+    SwapAt { part: usize, from: usize },
 }
 
 impl<'t> Path<'t> {
@@ -1513,7 +1538,7 @@ impl<'t> Plan<'t> {
 
     /// The edits applied at `block` (of parts, heads' removals), as rows of a call over `lanes`
     /// (in order): the edited row and the edit.
-    fn writes(&self, block: usize, lanes: &[usize]) -> Vec<(usize, Edit)> {
+    fn writes(&self, block: usize, lanes: &[usize]) -> Result<Vec<(usize, Edit)>, String> {
         let mut out = Vec::new();
         for (i, &l) in lanes.iter().enumerate() {
             let path = &self.paths[self.lanes[l].path];
@@ -1522,10 +1547,18 @@ impl<'t> Plan<'t> {
                     Edit::Probe { at, .. } => *at,
                     _ => path.position,
                 };
-                out.push((i * self.length + at, *edit));
+                let edit = match edit {
+                    Edit::Swap { part, source } => {
+                        let lane = self.lane(*source, block);
+                        let k = lanes.iter().position(|x| *x == lane).ok_or_else(|| error("a swap's source outside its call"))?;
+                        Edit::SwapAt { part: *part, from: k * self.length + path.position }
+                    }
+                    other => *other,
+                };
+                out.push((i * self.length + at, edit));
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -1549,7 +1582,7 @@ struct Call<T> {
 /// The edits of the call at block `block` over `lanes` run by `engine` ([`Plan::patches`] at its
 /// sites), none when nothing there is patched.
 fn edits<E: BlockEngine>(engine: &E, plan: &Plan, block: usize, lanes: &[usize]) -> Result<Option<Edits>, String> {
-    let (patches, writes) = (plan.patches(block, lanes)?, plan.writes(block, lanes));
+    let (patches, writes) = (plan.patches(block, lanes)?, plan.writes(block, lanes)?);
     if patches.is_empty() && writes.is_empty() {
         return Ok(None);
     }
@@ -1714,6 +1747,10 @@ fn paths<'t>(batch: &'t Batch, experiments: &'t [Experiment], values: &[Value], 
         let (patch, edits) = match (&e.patch, e.block(values, parts, heads)?) {
             (Some(Patch::Part { part, factor }), Some(block)) => (None, vec![(block, Edit::Part { part: *part, factor: *factor })]),
             (Some(Patch::Head { head }), Some(block)) => (None, vec![(block, Edit::Head { head: *head })]),
+            (Some(Patch::Swap { part }), Some(block)) => {
+                paths.push(Path { tokens: &batch.source[e.source], explained, end: block + 1, position: 0, patch: None, edits: Vec::new() });
+                (None, vec![(block, Edit::Swap { part: *part, source: paths.len() - 1 })])
+            }
             (Some(Patch::Parts { parts: chosen, factor }), Some(block)) => (None, chosen.iter().map(|part| (block, Edit::Part { part: *part, factor: *factor })).collect()),
             (Some(Patch::Cut { from, to }), Some(block)) => {
                 // The source runs to `from`'s block, where its probe records `from`'s activation.
@@ -2422,6 +2459,7 @@ impl Interchange {
             Head(usize, usize),
             Part(usize, usize, usize),
             Parts(usize, usize),
+            Swap(usize, usize),
             Cut(usize, usize, usize),
         }
         let mut drawn = Vec::with_capacity(slots.len());
@@ -2446,6 +2484,14 @@ impl Interchange {
                     let block = held[rng.random_range(0..held.len())];
                     let factor = if *family == Family::RemovePart { 0 } else { rng.random_range(1..FACTORS.len()) };
                     drawn.push(Drawn::Part(position, factor, silent(rng, block)));
+                    wanted.push((*n, block, position));
+                }
+                Family::SwapPart => {
+                    if held.is_empty() {
+                        return Err(error("a swap of a part, but no parts"));
+                    }
+                    let block = held[rng.random_range(0..held.len())];
+                    drawn.push(Drawn::Swap(position, silent(rng, block)));
                     wanted.push((*n, block, position));
                 }
                 Family::RemoveParts => {
@@ -2485,6 +2531,7 @@ impl Interchange {
             out.push(match d {
                 Drawn::Head(head, position) => (Patch::Head { head }, position),
                 Drawn::Part(position, factor, silent) => (Patch::Part { part: choose(rng, silent, next()?), factor }, position),
+                Drawn::Swap(position, silent) => (Patch::Swap { part: choose(rng, silent, next()?) }, position),
                 Drawn::Parts(position, silent) => {
                     // A uniform subset of the firing parts (the drawn one when none fires).
                     let firing = next()?;
@@ -2522,7 +2569,7 @@ impl Interchange {
             for _ in 0..per_base {
                 let (patch, position) = edits.next().ok_or_else(|| error("an edit not drawn"))?;
                 // A cut connection takes the `from` part's write on the next base sequence.
-                let source = if matches!(patch, Patch::Cut { .. }) { (n + 1) % batch.base.len() } else { n };
+                let source = if matches!(patch, Patch::Cut { .. } | Patch::Swap { .. }) { (n + 1) % batch.base.len() } else { n };
                 out.push(Experiment { base: n, source, explained: explained.clone(), patch: Some(patch), position });
             }
             out.push(Experiment { base: n, source: n, explained, patch: None, position: 0 });
