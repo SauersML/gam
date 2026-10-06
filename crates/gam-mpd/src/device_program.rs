@@ -234,6 +234,13 @@ pub struct DeviceProgram {
 /// (a few) take the dense product, and their cotangent is zero.
 type Active = Option<Arc<Indices>>;
 
+/// Per node, its cotangent when it is zero off a few columns and held on those only, `(ids, part)`
+/// with `part` of `rows × |ids|`: a ReLU node read sparsely by its only reader ([`Active`]), whose
+/// cotangent is that reader's pull on the columns it read, and the ReLU's input when the ReLU is its
+/// only reader (`DeviceProgram::reverse_packed`). A transcoder block's reverse thus never forms a
+/// `rows × k` cotangent.
+type Packed = BTreeMap<usize, (Arc<Indices>, Tensor)>;
+
 /// A group of sibling heads and its stacked operators.
 struct Fused {
     heads: Heads,
@@ -2050,7 +2057,11 @@ impl DeviceProgram {
                 }
             }
         }
-        Ok(self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut BTreeMap::new())?.0)
+        let (mut kept, _, packed) = self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut BTreeMap::new())?;
+        for (node, (ids, part)) in packed {
+            kept.insert(node, self.unpack(trace.rows, node, &ids, &part)?);
+        }
+        Ok(kept)
     }
 
     /// Reverse resident-value expressions from explicitly declared node seeds.
@@ -2067,7 +2078,11 @@ impl DeviceProgram {
         if self.head.operator.is_some() {
             return Err("device: values VJP requires resident-value compilation".into());
         }
-        Ok(self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut BTreeMap::new())?.0)
+        let (mut kept, _, packed) = self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut BTreeMap::new())?;
+        for (node, (ids, part)) in packed {
+            kept.insert(node, self.unpack(trace.rows, node, &ids, &part)?);
+        }
+        Ok(kept)
     }
 
     /// The reverse pass from `seeds` down to the lowest node of `keep`; at each node of `edited`,
@@ -2082,7 +2097,7 @@ impl DeviceProgram {
         edited: &BTreeSet<usize>,
         hook: &mut dyn FnMut(usize, &mut Tensor) -> Result<(), String>,
         parameters: &mut BTreeMap<usize, Tensor>,
-    ) -> Result<(BTreeMap<usize, Tensor>, BTreeMap<usize, Tensor>), String> {
+    ) -> Result<(BTreeMap<usize, Tensor>, BTreeMap<usize, Tensor>, Packed), String> {
         if keep
             .iter()
             .chain(seeds.keys())
@@ -2100,7 +2115,7 @@ impl DeviceProgram {
             }
         }
         let Some(first) = keep.iter().copied().min() else {
-            return Ok((BTreeMap::new(), BTreeMap::new()));
+            return Ok((BTreeMap::new(), BTreeMap::new(), BTreeMap::new()));
         };
         let d = &self.device;
         // A group that ran fused reverses fused unless a cotangent is wanted or seeded inside it.
@@ -2118,6 +2133,8 @@ impl DeviceProgram {
         // A frozen node's cotangent is wanted only when it is kept.
         let needed: Vec<bool> = (0..self.steps.len()).map(|n| keep.contains(&n) || trace.frozen.as_ref().is_none_or(|f| !f[n])).collect();
         let (mut kept, mut rounded) = (BTreeMap::new(), BTreeMap::new());
+        // Cotangents held on a few columns only ([`Packed`]), and those of the kept nodes.
+        let (mut packed, mut packed_kept): (Packed, Packed) = (BTreeMap::new(), BTreeMap::new());
         // Adds `term` into node `n`'s cotangent.
         let add = |g: &mut Vec<Option<Tensor>>, n: usize, term: Tensor| -> Result<(), String> {
             match g[n].as_mut() {
@@ -2135,6 +2152,18 @@ impl DeviceProgram {
             Ok(())
         };
         for index in (first..self.steps.len()).rev() {
+            if let Some((ids, part)) = packed.remove(&index) {
+                if index != first {
+                    self.reverse_packed(trace, index, (&ids, &part), (&mut g, &needed, &mut packed), (edited, &seeded), arithmetic)?;
+                }
+                if keep.contains(&index) {
+                    packed_kept.insert(index, (ids, part));
+                }
+                if index == first {
+                    break;
+                }
+                continue;
+            }
             let Some(mut cot) = g[index].take() else { continue };
             if edited.contains(&index) {
                 hook(index, &mut cot)?;
@@ -2177,14 +2206,20 @@ impl DeviceProgram {
                 Step::Gain { input, factor } => add(&mut g, *input, d.scaled(*factor, &cot).map_err(error)?)?,
                 Step::Head | Step::Feature { .. } | Step::Raw { .. } | Step::Constant { .. } => {}
                 Step::Affine { terms, .. } => {
-                    let nonzero = self.cotangent_columns(trace, index, (edited, &seeded));
                     for (argument, operator) in terms {
                         // A cotangent of the argument kept or edited is the dense one.
                         let observed = keep.contains(argument) || edited.contains(argument);
-                        match (self.reverse_active(trace, (index, *argument), (edited, &seeded)), &nonzero) {
-                            (Some(ids), _) if needed[*argument] && !observed => self.pull_sparse(&mut g, trace.rows, (&cot, &mut half), (*argument, *operator), &ids, arithmetic)?,
-                            (_, Some(ids)) if needed[*argument] && !matches!(self.steps[*argument], Step::Feature { .. }) => {
-                                self.pull_rows(&mut g, trace.rows, &cot, (*argument, *operator), ids, arithmetic)?;
+                        match self.reverse_active(trace, (index, *argument), (edited, &seeded)) {
+                            Some(ids) if needed[*argument] && !observed => {
+                                let part = self.columns_pull(trace.rows, (&cot, &mut half), *operator, &ids, arithmetic)?;
+                                // Held packed when this node is the argument's only reader and nothing
+                                // seeds it, so no other term reaches it; else added in place.
+                                if self.sole[*argument] == Some(index) && !seeded.contains(argument) {
+                                    packed.insert(*argument, (ids, part));
+                                } else {
+                                    let target = slot(&mut g, *argument, trace.rows).and_then(|()| g[*argument].as_mut().ok_or_else(|| "device: cotangent slot".to_string()))?;
+                                    d.scatter_columns(target, &ids, &part, true).map_err(error)?;
+                                }
                             }
                             _ => self.pull_term((&mut g, &needed), trace.rows, (&cot, &mut half), *argument, *operator, arithmetic)?,
                         }
@@ -2262,7 +2297,82 @@ impl DeviceProgram {
                 rounded.extend(half.map(|h| (index, h)));
             }
         }
-        Ok((kept, rounded))
+        Ok((kept, rounded, packed_kept))
+    }
+
+    /// Node `index`'s reverse rule from its packed cotangent `part` on columns `ids` ([`Packed`]):
+    /// a ReLU node's (an exactly-zero node read sparsely) makes its input's cotangent on the same
+    /// columns, `part ⊙ relu′(z)` (`z`'s other columns take no cotangent: the law's slope is zero
+    /// there on every row `part`'s columns are not), held packed again when the ReLU is that node's
+    /// only reader and nothing seeds or edits it; an affine node's pulls `part A_ids` (the rows `ids`
+    /// of each operator held dense) into its arguments, or the dense pull of `part` scattered.
+    fn reverse_packed(
+        &self,
+        trace: &DeviceTrace,
+        index: usize,
+        (ids, part): (&Arc<Indices>, &Tensor),
+        (g, needed, packed): (&mut [Option<Tensor>], &[bool], &mut Packed),
+        (edited, seeded): (&BTreeSet<usize>, &BTreeSet<usize>),
+        arithmetic: Arithmetic,
+    ) -> Result<(), String> {
+        let d = &self.device;
+        let rows = trace.rows;
+        match &self.steps[index] {
+            Step::Pointwise { input, .. } if self.exact_zeros[index] => {
+                if !needed[*input] {
+                    return Ok(());
+                }
+                let z = d.gather_columns(trace.value(*input)?, ids).map_err(error)?;
+                let codes = d.upload_indices(&vec![law_of(Law::Relu).code(); ids.len()]).map_err(error)?;
+                let term = d.law_slopes(part, &z, &codes, gelu_tanh_constant()).map_err(error)?;
+                if self.sole[*input] == Some(index) && !seeded.contains(input) && !edited.contains(input) && matches!(self.steps[*input], Step::Affine { .. }) {
+                    packed.insert(*input, (Arc::clone(ids), term));
+                } else {
+                    if g[*input].is_none() {
+                        g[*input] = Some(d.zeros(rows, self.widths[*input]).map_err(error)?);
+                    }
+                    let target = g[*input].as_mut().ok_or("device: cotangent slot")?;
+                    d.scatter_columns(target, ids, &term, true).map_err(error)?;
+                }
+                Ok(())
+            }
+            Step::Affine { terms, .. } => {
+                let round = |t: Tensor| if arithmetic == Arithmetic::Bf16 && t.storage() == Storage::F32 { d.bf16_copy(&t) } else { Ok(t) };
+                let c = round(d.copy(part).map_err(error)?).map_err(error)?;
+                for (argument, operator) in terms {
+                    if !needed[*argument] || matches!(self.steps[*argument], Step::Feature { .. }) {
+                        continue;
+                    }
+                    if g[*argument].is_none() {
+                        g[*argument] = Some(d.zeros(rows, self.widths[*argument]).map_err(error)?);
+                    }
+                    match self.held(*operator, Role::Product)? {
+                        Held::Dense(a) if a.storage() != Storage::Bf16 => {
+                            if ids.is_empty() {
+                                continue;
+                            }
+                            let a = round(d.gather_rows(a, ids).map_err(error)?).map_err(error)?;
+                            let target = g[*argument].as_mut().ok_or("device: cotangent slot")?;
+                            d.gemm(target, 1.0, &c, Op::N, &a, Op::N, 1.0, arithmetic).map_err(error)?;
+                        }
+                        _ => {
+                            let dense = self.unpack(rows, index, ids, part)?;
+                            self.pull_term((g, needed), rows, (&dense, &mut None), *argument, *operator, arithmetic)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(format!("device: node {index} holds a packed cotangent")),
+        }
+    }
+
+    /// Node `node`'s dense cotangent from its packed one: `part` on columns `ids`, zero elsewhere.
+    fn unpack(&self, rows: usize, node: usize, ids: &Indices, part: &Tensor) -> Result<Tensor, String> {
+        let d = &self.device;
+        let mut dense = d.zeros(rows, self.widths[node]).map_err(error)?;
+        d.scatter_columns(&mut dense, ids, part, false).map_err(error)?;
+        Ok(dense)
     }
 
     /// `cot` as an operand of a product in `arithmetic`: in bfloat16 an f32 cotangent rounded once
@@ -2310,55 +2420,19 @@ impl DeviceProgram {
         trace.active.get(&(node, argument)).cloned().flatten()
     }
 
-    /// The columns where affine node `node`'s cotangent can be nonzero, when they are a known few:
-    /// `node` is read only by a ReLU node whose only reader read it sparsely ([`Active`]) with a
-    /// cotangent zero on its dead rows, and nothing seeds or edits the cotangents between. The ReLU's
-    /// slope is zero off its nonzero columns on the other rows, so `node`'s cotangent is zero there.
-    fn cotangent_columns(&self, trace: &DeviceTrace, node: usize, (edited, seeded): (&BTreeSet<usize>, &BTreeSet<usize>)) -> Option<Arc<Indices>> {
-        let relu = self.sole[node]?;
-        if !self.exact_zeros[relu] || !matches!(self.steps[relu], Step::Pointwise { input, .. } if input == node) {
-            return None;
-        }
-        if [node, relu].iter().any(|n| edited.contains(n) || seeded.contains(n)) {
-            return None;
-        }
-        self.reverse_active(trace, (self.sole[relu]?, relu), (edited, seeded))
-    }
-
-    /// [`DeviceProgram::pull_term`] when the cotangent is zero off its columns `ids`
-    /// ([`DeviceProgram::cotangent_columns`]): `cot A` from those columns of `cot` and rows of `A`.
-    fn pull_rows(&self, g: &mut [Option<Tensor>], rows: usize, cot: &Tensor, (argument, operator): (usize, usize), ids: &Indices, arithmetic: Arithmetic) -> Result<(), String> {
+    /// [`DeviceProgram::pull_term`]'s cotangent for a term read sparsely ([`Active`]), on columns
+    /// `ids` only: `cot A_ids`, `rows × |ids|`. The other columns' terms are left out; the
+    /// argument's law has slope zero there on every row the cotangent is not zero, so its input's
+    /// cotangent is the dense pass's.
+    fn columns_pull(&self, rows: usize, (cot, half): (&Tensor, &mut Option<Tensor>), operator: usize, ids: &Indices, arithmetic: Arithmetic) -> Result<Tensor, String> {
         let d = &self.device;
-        let Held::Dense(a) = self.held(operator, Role::Product)? else { return Err("device: a sparse product of an operator not held dense".into()) };
-        if g[argument].is_none() {
-            g[argument] = Some(d.zeros(rows, self.widths[argument]).map_err(error)?);
-        }
         if ids.is_empty() {
-            return Ok(());
-        }
-        let round = |t: Tensor| if arithmetic == Arithmetic::Bf16 && t.storage() == Storage::F32 { d.bf16_copy(&t) } else { Ok(t) };
-        let c = round(d.gather_columns(cot, ids).map_err(error)?).map_err(error)?;
-        let a = round(d.gather_rows(a, ids).map_err(error)?).map_err(error)?;
-        let target = g[argument].as_mut().ok_or("device: cotangent slot")?;
-        d.gemm(target, 1.0, &c, Op::N, &a, Op::N, 1.0, arithmetic).map_err(error)
-    }
-
-    /// [`DeviceProgram::pull_term`] for a term read sparsely ([`Active`]): `cot A` on columns `ids`
-    /// only. The other columns' terms are left out; the argument's law has slope zero there on every
-    /// row the cotangent is not zero, so its input's cotangent is the dense pass's.
-    fn pull_sparse(&self, g: &mut [Option<Tensor>], rows: usize, (cot, half): (&Tensor, &mut Option<Tensor>), (argument, operator): (usize, usize), ids: &Indices, arithmetic: Arithmetic) -> Result<(), String> {
-        let d = &self.device;
-        if g[argument].is_none() {
-            g[argument] = Some(d.zeros(rows, self.widths[argument]).map_err(error)?);
-        }
-        if ids.is_empty() {
-            return Ok(());
+            return d.zeros(rows, 0).map_err(error);
         }
         let a = self.gathered_operand(operator, ids, arithmetic)?;
         let mut part = d.empty(rows, ids.len()).map_err(error)?;
         d.gemm(&mut part, 1.0, self.operand(cot, half, arithmetic)?, Op::N, &a, Op::N, 0.0, arithmetic).map_err(error)?;
-        let target = g[argument].as_mut().ok_or("device: cotangent slot")?;
-        d.scatter_columns(target, ids, &part, true).map_err(error)
+        Ok(part)
     }
 
     fn pull_term(&self, (g, needed): (&mut [Option<Tensor>], &[bool]), rows: usize, (cot, half): (&Tensor, &mut Option<Tensor>), argument: usize, operator: usize, arithmetic: Arithmetic) -> Result<(), String> {
@@ -2576,7 +2650,7 @@ impl DeviceProgram {
         gradients: &mut BTreeMap<usize, Tensor>,
     ) -> Result<BTreeMap<usize, Tensor>, String> {
         let seeded: BTreeSet<usize> = seeds.keys().copied().collect();
-        let (mut nodes, mut rounded) = self.reverse_seeds(trace, seeds, retained, arithmetic, edited, hook, gradients)?;
+        let (mut nodes, mut rounded, packed) = self.reverse_seeds(trace, seeds, retained, arithmetic, edited, hook, gradients)?;
         // One scalar constant is uploaded; all reductions and gradient arrays stay
         // on the device. Reuse the same broadcast across every column occurrence.
         let has_columns = gradients.keys().any(|op| self.operators.contains_key(&(*op, Role::Column)));
@@ -2585,29 +2659,43 @@ impl DeviceProgram {
             Some(self.device.broadcast_rows(&one, trace.rows).map_err(error)?)
         } else { None };
         for (node, step) in self.steps.iter().enumerate() {
+            if let (Some((ids, part)), Step::Affine { terms, bias }) = (packed.get(&node), step) {
+                // A packed cotangent ([`Packed`]): only its columns' rows of the operators and of the
+                // bias have a gradient.
+                let d = &self.device;
+                let c = if arithmetic == Arithmetic::Bf16 && part.storage() == Storage::F32 { d.bf16_copy(part).map_err(error)? } else { d.copy(part).map_err(error)? };
+                for (input, op) in terms {
+                    let Some(gradient) = gradients.get_mut(op) else { continue };
+                    if gradient.storage() == Storage::Bf16 || matches!(self.steps[*input], Step::Feature { .. }) {
+                        let dense = self.unpack(trace.rows, node, ids, part)?;
+                        let x = trace.rounded_value(*input, arithmetic)?;
+                        d.gemm(gradient, 1.0, self.operand(&dense, &mut None, arithmetic)?, Op::T, x.as_deref().map_or(trace.value(*input), Ok)?, Op::N, 1.0, arithmetic).map_err(error)?;
+                    } else if !ids.is_empty() {
+                        let mut rows = d.empty(ids.len(), gradient.cols()).map_err(error)?;
+                        let x = trace.rounded_value(*input, arithmetic)?;
+                        d.gemm(&mut rows, 1.0, &c, Op::T, x.as_deref().map_or(trace.value(*input), Ok)?, Op::N, 0.0, arithmetic).map_err(error)?;
+                        d.scatter_rows(gradient, ids, &rows, true).map_err(error)?;
+                    }
+                }
+                if let Some(gradient) = bias.and_then(|op| gradients.get_mut(&op)).filter(|_| !ids.is_empty()) {
+                    let mut rows = d.empty(ids.len(), 1).map_err(error)?;
+                    d.gemm(&mut rows, 1.0, &c, Op::T, ones.as_ref().ok_or("device: missing column reduction workspace")?, Op::N, 0.0, arithmetic).map_err(error)?;
+                    d.scatter_rows(gradient, ids, &rows, true).map_err(error)?;
+                }
+                if keep.contains(&node) {
+                    nodes.insert(node, self.unpack(trace.rows, node, ids, part)?);
+                }
+                continue;
+            }
             let Some(cot) = nodes.get(&node) else {
                 continue;
             };
             let mut half = rounded.remove(&node);
             if let Step::Affine { terms, .. } = step {
-                let nonzero = self.cotangent_columns(trace, node, (edited, &seeded));
                 for (input, op) in terms {
                     let active = self.reverse_active(trace, (node, *input), (edited, &seeded));
                     if let Some(gradient) = gradients.get_mut(op) {
                         match active {
-                            // Only the rows of the cotangent's nonzero columns have a gradient.
-                            None if nonzero.is_some() && gradient.storage() != Storage::Bf16 && !matches!(self.steps[*input], Step::Feature { .. }) => {
-                                let ids = nonzero.as_ref().ok_or("device: cotangent columns")?;
-                                if !ids.is_empty() {
-                                    let d = &self.device;
-                                    let c = d.gather_columns(cot, ids).map_err(error)?;
-                                    let c = if arithmetic == Arithmetic::Bf16 && c.storage() == Storage::F32 { d.bf16_copy(&c).map_err(error)? } else { c };
-                                    let mut part = d.empty(ids.len(), gradient.cols()).map_err(error)?;
-                                    let x = trace.rounded_value(*input, arithmetic)?;
-                                    d.gemm(&mut part, 1.0, &c, Op::T, x.as_deref().map_or(trace.value(*input), Ok)?, Op::N, 0.0, arithmetic).map_err(error)?;
-                                    d.scatter_rows(gradient, ids, &part, true).map_err(error)?;
-                                }
-                            }
                             // Only the columns read have a nonzero gradient (`cotᵀ x`, x zero elsewhere
                             // on the rows the cotangent is not zero).
                             Some(ids) if gradient.storage() != Storage::Bf16 => {
