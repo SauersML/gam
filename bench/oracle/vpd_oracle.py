@@ -295,6 +295,13 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
     clean and edited continuations; its edits act at the marked token only, or from it on."""
     rng = random.Random(seed)
     ok = (lambda c: True) if not held else ((lambda c: c % held == 0) if side == "heldout" else (lambda c: c % held != 0))
+
+    def respects(layer: int, c: int) -> bool:  # a component inside this side of the split
+        return layer in layers and ok(c)
+
+    def respects_gid(g: int) -> bool:
+        layer_, _, c_ = table.site_of(g)
+        return respects(layer_, c_)
     pending: dict[str, list] = {"direction": [], "top": [], "effect": []}
     keys = [k for k in table.sites if k[0] in layers]
     kinds = ["activity", "direction", "top"]
@@ -305,7 +312,7 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
         kinds.append("continuation")
     if "edges" in table.rel:
         kinds.append("edge")
-        edge_rows = [r for r in torch.nonzero(table.rel["edges"]["ids"][:, 0, 0] >= 0).reshape(-1).tolist() if table.site_of(r)[0] in layers]
+        edge_rows = [r for r in torch.nonzero(table.rel["edges"]["ids"][:, 0, 0] >= 0).reshape(-1).tolist() if respects_gid(r)]
     if "attribution" in table.rel:
         kinds.append("attribution")
         att = table.rel["attribution"]
@@ -339,7 +346,7 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
                     others = [x for x in range(meta["top"]) if x != j]
                     pending.setdefault(q, [])
                     pending[q] = [(k, c, x) for x in rng.sample(others, min(per_component - 1, len(others)))]
-        if not ok(c):
+        if q not in ("edge", "attribution") and not respects(layer, c):
             continue
         ex = {"layer": layer, "kind": kind, "c": c, "kind_q": q, "j": j, "stratum": -1, "candidates": []}
         contexts = d["contexts"][c].long()
@@ -397,21 +404,14 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             j = rng.randrange(J)
             edit, family = rng.choice(["ablate", "amplify"]), rng.choice(["row", "from"])
             edited, clean = d[f"cont_{family}_{edit}"][c, j].tolist(), d["cont_clean"][c, j].tolist()
-            other = clean
-            for _ in range(20):
-                other = d["cont_clean"][rng.randrange(d["cont_clean"].shape[0]), 0].tolist()
-                if other not in (edited, clean):
-                    break
             text = lambda ids: json.dumps(table.tok.decode([i for i in ids if i >= 0]))  # noqa: E731
-            options = [f"changed to {text(edited)}"] if edited != clean else []
-            options = [o for o in options] + [f"unchanged: {text(clean)}", f"changed to {text(other)}"]
-            answer_text = options[0]
-            rng.shuffle(options)
+            # The same two options whatever the answer (their number and wording carry nothing of it).
+            options = [f"No, it stays {text(clean)}", "Yes, it changes"]
             p = int(d["position"][c, j])
             verb = "removed" if edit == "ablate" else f"made {meta.get('amplify', 1.5):g} times stronger"
             span = "at the marked token only" if family == "row" else "from the marked token on (every later token too)"
-            ex.update(context=int(contexts[j]), position=p, j=j, options=options, answer=options.index(answer_text), edit=edit, family=family,
-                      question=f"If the component is {verb} {span}, how does the model continue the text after the marked token (greedy decoding, {len(clean)} tokens)?")
+            ex.update(context=int(contexts[j]), position=p, j=j, options=options, answer=int(edited != clean), edit=edit, family=family,
+                      question=f"If the component is {verb} {span}, does the model's greedy continuation of the text after the marked token ({len(clean)} tokens) change?")
         elif q == "continuation":
             cont = table.rel["continuations"]
             g = table.gid(layer, kind, c)
@@ -419,16 +419,11 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
                 continue  # not measured (a partial relations run)
             alpha = rng.choice([2, 4, 8])
             amp, clean = cont[f"alpha_{alpha}"][g].tolist(), cont["clean"][g].tolist()
-            other = amp
-            while other in (amp, clean) or other[0] < 0:
-                other = cont["clean"][rng.randrange(cont["clean"].shape[0])].tolist()
             text = lambda ids: json.dumps(table.tok.decode([i for i in ids if i >= 0]))  # noqa: E731
-            options = [amp] + ([clean] if clean != amp else []) + [other]
-            order = list(range(len(options)))
-            rng.shuffle(order)
+            options = [f"No, it stays {text(clean)}", "Yes, it changes"]  # the same two options whatever the answer
             p = int(d["position"][c, 0])
-            ex.update(context=int(contexts[0]), position=p, j=0, options=[text(options[i]) for i in order], answer=order.index(0),
-                      question=f"If the component is made {alpha} times stronger, how does the model continue the text after the marked token (greedy decoding)?")
+            ex.update(context=int(contexts[0]), position=p, j=0, options=options, answer=int(amp != clean),
+                      question=f"If the component is made {alpha} times stronger, does the model's greedy continuation of the text after the marked token change?")
         elif q == "edge":
             g = edge_rows[rng.randrange(len(edge_rows))]
             layer, kind, c = table.site_of(g)
@@ -436,6 +431,8 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             e = table.rel["edges"]
             which = 2 if rng.random() < 1 / 3 else rng.randrange(2)  # a third near-zero edges
             a_gid = int(e["ids"][g, 0, which])
+            if a_gid < 0 or not respects_gid(a_gid):
+                continue  # the cut writer must be on this side of the split too
             rel = float(e["activity"][g, 0, which]) / max(float(table.peak[g]), 1e-30)
             al, ak, ac = table.site_of(a_gid)
             p = int(d["position"][c, 0])
@@ -446,7 +443,11 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             r = rng.randrange(att["delta"].shape[0])
             ids, delta = att["ids"][r].tolist(), att["delta"][r].tolist()
             best = int(np.argmin(delta))
-            rest = [i for i in range(len(ids)) if i != best]
+            if ids[best] < 0 or not respects_gid(int(ids[best])):
+                continue  # the answer must be on this side of the split
+            rest = [i for i in range(len(ids)) if i != best and ids[i] >= 0 and respects_gid(int(ids[i]))]
+            if len(rest) < 3:
+                continue
             chosen = [best] + rng.sample(rest, 3)
             order = list(range(4))
             rng.shuffle(order)
@@ -457,6 +458,8 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
                       question=f"At the marked token the model predicts {table.piece(att['token'][r])} next. Which of the listed components raises that prediction most?")
         if row and ex.get("edit") and ex["c"] >= 0:
             ex["effect"] = float(d[f"effect_{ex['edit']}"][ex["c"], ex["j"]])  # KL(M_e || M) at the edited token, bits
+        named = ([(ex["layer"], ex["c"])] if ex["c"] >= 0 else []) + [(l_, c_) for l_, _, c_, _, _ in ex["candidates"]]
+        assert all(respects(l_, c_) for l_, c_ in named), ("a question names a component outside its split", q, named)
         out.append(ex)
     return out
 
