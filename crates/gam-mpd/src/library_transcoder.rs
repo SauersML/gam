@@ -32,7 +32,7 @@ use crate::{
     run_check::LayerNodes,
     safetensors::{SafetensorsFile, Stored, StoredFloat, StoredType},
 };
-use gam_gpu::tensor::{Device, Op, Tensor};
+use gam_gpu::tensor::{Arithmetic, Device, Op, Tensor};
 use std::{
     collections::BTreeMap,
     io::Write,
@@ -174,7 +174,8 @@ pub fn kept_features(path: &Path) -> Result<Vec<usize>, String> {
 /// `g_i·x + c_i` is positive) at `M`'s own MLP input `x`, from `M` run on `device`, `batch`
 /// sequences at a time. The counts are float32 sums of zeros and ones, exact below 2^24 tokens.
 pub fn firing(device: &Device, native: &OperatorProgram, layers: &[LayerNodes], transcoders: &BTreeMap<usize, Transcoder>, sequences: &[Vec<u32>], batch: usize) -> Result<BTreeMap<usize, Vec<u64>>, String> {
-    let program = DeviceProgram::compile(device, native)?;
+    let mut program = DeviceProgram::compile(device, native)?;
+    program.set_arithmetic(if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 });
     let d = program.device();
     let code = law_of(Law::Relu).code();
     // Per layer its encoder (`F × d`, the device's storage), bias row and counts.
