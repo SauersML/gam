@@ -274,6 +274,15 @@ fn bf16_outputs_match_their_copies(d: &Device) {
         assert_eq!(down(d, &scores), down(d, &expected), "{} softmax, causal {causal}", d.name());
         assert_eq!(down(d, &half), down(d, &d.bf16_copy(&expected).unwrap()), "{} softmax's bfloat16 copy, causal {causal}", d.name());
     }
+    let (normed, half) = d.rms_norm_both(&x, 1e-5).unwrap();
+    let expected = d.rms_norm(&x, 1e-5).unwrap();
+    assert_eq!(down(d, &normed), down(d, &expected), "{} rms_norm_both's values", d.name());
+    assert_eq!(down(d, &half), down(d, &d.bf16_copy(&expected).unwrap()), "{} rms_norm_both's bfloat16 copy", d.name());
+    let codes = d.upload_indices(&(0..x.cols()).map(|c| [0u32, 1, 2, 3, 4, 5][c % 6]).collect::<Vec<_>>()).unwrap();
+    let (laws, half) = d.law_values_both(&x, &codes, 0.7978845608028654).unwrap();
+    let expected = d.law_values(&x, &codes, 0.7978845608028654).unwrap();
+    assert_eq!(down(d, &laws), down(d, &expected), "{} law_values_both's values", d.name());
+    assert_eq!(down(d, &half), down(d, &d.bf16_copy(&expected).unwrap()), "{} law_values_both's bfloat16 copy", d.name());
 }
 
 #[test]
@@ -742,5 +751,20 @@ fn column_reads_and_writes_agree_with_the_host() {
             }
             assert_eq!(down(&device, &t), expected, "{}: scatter rows (accumulate {accumulate})", device.name());
         }
+    }
+}
+
+/// `upload_f32_overlapped` (CUDA: a second stream and a landing buffer) gives the values
+/// `upload_f32` does, for uploads of several sizes in turn: one longer than a staging buffer, and
+/// more than the landing buffers, a later one landing where an earlier one did.
+#[test]
+fn overlapped_uploads_are_the_uploads() {
+    let Some(wide) = accelerator().filter(|_| cfg!(target_os = "linux")) else { return };
+    let d = wide.with_storage(gam_gpu::tensor::Storage::F32).expect("CUDA holds f32");
+    for (i, (rows, cols)) in [(3, 5), (700, 1100), (2, 2), (3000, 1500), (17, 1), (700, 1100)].into_iter().enumerate() {
+        let values: Vec<f32> = (0..rows * cols).map(|k| ((k * 7919 + i) % 1009) as f32 - 504.5).collect();
+        let overlapped = d.upload_f32_overlapped(rows, cols, &values).unwrap();
+        let plain = d.upload_f32(rows, cols, &values).unwrap();
+        assert_eq!(down(&d, &overlapped), down(&d, &plain), "upload {i} of {rows}x{cols}");
     }
 }

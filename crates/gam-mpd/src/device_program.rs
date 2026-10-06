@@ -397,6 +397,20 @@ impl DeviceTrace {
         Ok(Some(copy))
     }
 
+    /// Keep `copy` as node `n`'s bfloat16 copy (`DeviceTrace::rounded_value`): one its producer
+    /// wrote beside the value.
+    fn keep_rounded(&self, n: usize, copy: Tensor) -> Result<(), String> {
+        self.rounded.lock().map_err(|_| "device: poisoned rounding cache".to_string())?.insert(n, Arc::new(copy));
+        Ok(())
+    }
+
+    /// Drop node `n`'s bfloat16 copy, its value replaced.
+    fn forget_rounded(&self, n: usize) {
+        if let Ok(mut rounded) = self.rounded.lock() {
+            rounded.remove(&n);
+        }
+    }
+
     /// Drop the bfloat16 copies `DeviceTrace::rounded_value` made (their memory is the reverse's
     /// for one call only).
     pub fn release_rounded(&self) {
@@ -1120,6 +1134,7 @@ impl DeviceProgram {
     /// gains, biases and tables keep the program's storage. A trainable operator's later values
     /// are written in bfloat16 too (`device_posterior::DevicePosterior`).
     pub fn hold_bf16(&mut self) -> Result<(), String> {
+        self.rounded.get_mut().map_err(|_| "device: poisoned rounding cache".to_string())?.clear();
         let d = self.device.clone();
         for held in self.operators.values_mut() {
             if let Held::Dense(a) = held.held.as_ref()
@@ -1293,14 +1308,18 @@ impl DeviceProgram {
         match self.held(op, Role::Product)? {
             Held::Identity => d.axpy(out, 1.0, x).map_err(error),
             Held::Diagonal(diag) => d.scale_columns(out, x, diag, true).map_err(error),
-            Held::Dense(a) => d.gemm(out, 1.0, x, Op::N, a, if transposed { Op::N } else { Op::T }, 1.0, arithmetic).map_err(error),
+            Held::Dense(a) => {
+                let rounded = self.rounded_operator(a, arithmetic)?;
+                d.gemm(out, 1.0, x, Op::N, rounded.as_deref().unwrap_or(a), if transposed { Op::N } else { Op::T }, 1.0, arithmetic).map_err(error)
+            }
             Held::LowRank(left, right) => {
                 // x (L R)ᵀ = (x Rᵀ) Lᵀ;  x (L R) = (x L) R.
                 let (first, first_op, second, second_op) = if transposed { (left, Op::N, right, Op::N) } else { (right, Op::T, left, Op::T) };
+                let (rounded_first, rounded_second) = (self.rounded_operator(first, arithmetic)?, self.rounded_operator(second, arithmetic)?);
                 let inner = if transposed { left.cols() } else { right.rows() };
                 let mut middle = d.empty(x.rows(), inner).map_err(error)?;
-                d.gemm(&mut middle, 1.0, x, Op::N, first, first_op, 0.0, arithmetic).map_err(error)?;
-                d.gemm(out, 1.0, &middle, Op::N, second, second_op, 1.0, arithmetic).map_err(error)
+                d.gemm(&mut middle, 1.0, x, Op::N, rounded_first.as_deref().unwrap_or(first), first_op, 0.0, arithmetic).map_err(error)?;
+                d.gemm(out, 1.0, &middle, Op::N, rounded_second.as_deref().unwrap_or(second), second_op, 1.0, arithmetic).map_err(error)
             }
             Held::Table(_) | Held::Column(_) => Err("device: an operator held in the wrong role".to_string()),
         }
@@ -1313,8 +1332,9 @@ impl DeviceProgram {
         let d = &self.device;
         Ok(match self.held(op, Role::Product)? {
             Held::Dense(a) => {
+                let rounded = self.rounded_operator(a, arithmetic)?;
                 let mut out = d.empty(rows, width).map_err(error)?;
-                d.gemm(&mut out, 1.0, x, Op::N, a, if transposed { Op::N } else { Op::T }, 0.0, arithmetic).map_err(error)?;
+                d.gemm(&mut out, 1.0, x, Op::N, rounded.as_deref().unwrap_or(a), if transposed { Op::N } else { Op::T }, 0.0, arithmetic).map_err(error)?;
                 out
             }
             Held::Diagonal(diag) => {
@@ -1593,7 +1613,6 @@ impl DeviceProgram {
         reuse: Reuse<'_>,
         span: Span,
     ) -> Result<DeviceTrace, String> {
-        self.rounded.lock().map_err(|_| "device: poisoned rounding cache".to_string())?.clear();
         let d = &self.device;
         for &(amplitude, mask) in gated {
             if mask >= amplitude
@@ -1712,8 +1731,11 @@ impl DeviceProgram {
                 },
                 Step::Constant { operator } => value(d.broadcast_rows(self.column(*operator)?, rows).map_err(error)?),
                 Step::Affine { terms, bias } => {
-                    // The first term's product is the output, written whole (`product`).
-                    let (mut out, rest) = match terms.split_first() {
+                    // The first term's product is the output, written whole (`product`); an identity
+                    // first term with a dense second is one product onto the identity's argument.
+                    let (mut out, rest) = match self.onto_identity(&trace, terms)? {
+                        Some(out) => (out, &terms[2..]),
+                        None => match terms.split_first() {
                         Some(((argument, operator), rest)) if !matches!(self.steps[*argument], Step::Feature { .. }) => {
                             let active = self.active(&trace, (index, *argument, *operator), hooks.before(*argument))?;
                             let out = match &active {
@@ -1731,7 +1753,7 @@ impl DeviceProgram {
                         }
                         Some(((argument, operator), rest)) => (self.term(&trace, (*argument, *operator), (rows, width))?, rest),
                         None => (d.zeros(rows, width).map_err(error)?, &terms[..]),
-                    };
+                    }};
                     for (argument, operator) in rest {
                         self.add_term(&mut out, &trace, *argument, *operator)?;
                     }
@@ -1739,6 +1761,11 @@ impl DeviceProgram {
                         d.add_row(&mut out, 1.0, self.column(*b)?).map_err(error)?;
                     }
                     value(out)
+                }
+                Step::Pointwise { input, codes } if !hook && trace.value(*input).is_ok_and(|x| self.rounds_on_write(index, x)) => {
+                    let (values, half) = d.law_values_both(trace.value(*input)?, codes, gelu_tanh_constant()).map_err(error)?;
+                    trace.keep_rounded(index, half)?;
+                    value(values)
                 }
                 Step::Pointwise { input, codes } => value(d.law_values(trace.value(*input)?, codes, gelu_tanh_constant()).map_err(error)?),
                 Step::Gain { input, factor } => value(d.scaled(*factor, trace.value(*input)?).map_err(error)?),
@@ -1750,6 +1777,11 @@ impl DeviceProgram {
                 Step::Select { inside, outside, positions } => {
                     let chosen = selected(&trace, positions)?;
                     value(select_rows(d, &chosen, Some(trace.value(*inside)?), trace.value(*outside)?)?)
+                }
+                Step::RmsNorm { input, epsilon } if !hook && trace.value(*input).is_ok_and(|x| self.rounds_on_write(index, x)) => {
+                    let (values, half) = d.rms_norm_both(trace.value(*input)?, *epsilon).map_err(error)?;
+                    trace.keep_rounded(index, half)?;
+                    value(values)
                 }
                 Step::RmsNorm { input, epsilon } => value(d.rms_norm(trace.value(*input)?, *epsilon).map_err(error)?),
                 Step::Attend { query, key, value: v, scale, rotary, causal } => {
@@ -1793,6 +1825,7 @@ impl DeviceProgram {
                     return Err(format!("device: edited node {index} has {:?}, expected {rows} x {width}", replacement.dim()));
                 }
                 trace.slots[index] = Slot::Value(replacement);
+                trace.forget_rounded(index);
             }
             if let Some(&(_, mask)) = gated.iter().find(|(amplitude, _)| *amplitude == index) {
                 let decided = decide(index, &trace)?;
@@ -1822,6 +1855,35 @@ impl DeviceProgram {
         }
     }
 
+    /// An affine node's first two terms `(x, I) + (y, A)`, the identity's then a dense operator's,
+    /// as one product onto `x` (`Device::gemm_onto`: `y Aᵀ + x`), where the identity's copy of `x`
+    /// and the product added into it took two passes; `None` for other terms.
+    fn onto_identity(&self, trace: &DeviceTrace, terms: &[(usize, usize)]) -> Result<Option<Tensor>, String> {
+        let [(x, identity), (y, operator), ..] = terms else { return Ok(None) };
+        let feature = |n: usize| matches!(self.steps[n], Step::Feature { .. });
+        if feature(*x) || feature(*y) || !matches!(self.held(*identity, Role::Product)?, Held::Identity) {
+            return Ok(None);
+        }
+        let Held::Dense(a) = self.held(*operator, Role::Product)? else { return Ok(None) };
+        let rounded = self.forward_operand(trace, *y, *operator)?;
+        let y = rounded.as_deref().map_or(trace.value(*y), Ok)?;
+        let weights = self.rounded_operator(a, self.arithmetic)?;
+        Ok(Some(self.device.gemm_onto(1.0, (y, Op::N), (weights.as_deref().unwrap_or(a), Op::T), trace.value(*x)?, self.arithmetic).map_err(error)?))
+    }
+
+    /// Whether node `n` (made from `input`) writes its bfloat16 copy in the same pass
+    /// (`Device::law_values_both`, `Device::rms_norm_both`): a bfloat16 forward on CUDA in f32 where
+    /// a dense or low-rank product or a fused group's projection reads it, which would round it
+    /// (`DeviceProgram::forward_operand`).
+    fn rounds_on_write(&self, n: usize, input: &Tensor) -> bool {
+        if self.arithmetic != Arithmetic::Bf16 || input.storage() != Storage::F32 || self.device.with_storage(Storage::Bf16).is_err() {
+            return false;
+        }
+        let dense = |op: usize| matches!(self.held(op, Role::Product), Ok(Held::Dense(_) | Held::LowRank(..)));
+        self.steps.iter().any(|step| matches!(step, Step::Affine { terms, .. } if terms.iter().any(|(argument, op)| *argument == n && dense(*op))))
+            || self.fused.iter().any(|group| group.live && group.heads.input == n)
+    }
+
     /// Node `argument`'s value as the forward's operand of `operator`'s product: in bfloat16 an f32
     /// value's copy, rounded once on the trace ([`DeviceTrace::rounded_value`]) where `operator` is
     /// held dense or low-rank, so the call's reverse passes read the same copy rather than rounding
@@ -1849,7 +1911,8 @@ impl DeviceProgram {
         let rotations = Arc::clone(&trace.rotations);
         let turn = turn(&rotations, heads.rotary)?;
         let rounded = trace.rounded_value(heads.input, self.arithmetic)?;
-        let p = device_heads::project(d, heads, &group.stacked, rounded.as_deref().map_or(trace.value(heads.input), Ok)?, self.arithmetic).map_err(error)?;
+        let weights = self.rounded_operator(&group.stacked.weights, self.arithmetic)?;
+        let p = device_heads::project(d, heads, (weights.as_deref().unwrap_or(&group.stacked.weights), group.stacked.biases.as_ref()), rounded.as_deref().map_or(trace.value(heads.input), Ok)?, self.arithmetic).map_err(error)?;
         let projections = Self::offer_blocks(trace, heads, (Buffer::Projections, p), edit)?;
         let normed = match &heads.norms {
             Some(norms) => {
@@ -2465,12 +2528,13 @@ impl DeviceProgram {
         half.as_ref().ok_or_else(|| "device: a rounded cotangent".to_string())
     }
 
-    /// Operator array `a` as an operand of a reverse product in `arithmetic`: in bfloat16 an f32
-    /// array rounded once after each forward pass and kept (`rounded`), so the reverse passes of
-    /// one forward pass (the data term's and the Gauss–Newton factor's) and every product in them
-    /// read one copy (each would otherwise round it again, to the same values); otherwise `None`.
-    /// Only an array this program holds (an operator or a stacked group's), whose place is fixed
-    /// until a write, which empties the copies.
+    /// Operator array `a` as an operand of a product in `arithmetic`: in bfloat16 an f32 array
+    /// rounded once and kept (`rounded`) until the program's next write of its operators (a weight
+    /// sample: `dense_mut`, `replace_dense_parameter`, `refresh`, `refresh_fused_with`, `hold_bf16`
+    /// each empty the copies), so every forward and reverse product between two writes reads one
+    /// copy (each would otherwise round it again, to the same values); otherwise `None`. Only an
+    /// array this program holds (an operator or a stacked group's), whose place is fixed until a
+    /// write.
     fn rounded_operator(&self, a: &Tensor, arithmetic: Arithmetic) -> Result<Option<Arc<Tensor>>, String> {
         if arithmetic != Arithmetic::Bf16 || a.storage() != Storage::F32 {
             return Ok(None);

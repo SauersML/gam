@@ -367,8 +367,10 @@ pub enum GroupAxis {
 /// warp (SIMD group) sums each segment's entries in a fixed order and adds them to its group's row
 /// once. No sum is atomic, so the sums are the same on every run.
 /// One-column segments from which CUDA reduces 32 a block (`GroupMap::reduce_code`): 256 blocks,
-/// two a multiprocessor on a 128-multiprocessor card. Fewer keep four a block, so a small operator
-/// still fills the card (f97524b178: eight columns left 384 blocks on 3072).
+/// two a multiprocessor on a 128-multiprocessor card. Fewer take eight a block: on vpd4l's 3072
+/// columns an RTX 4090 ran posterior_ivon at 270 µs a launch with eight (a4d6618ae7) against 364
+/// with four (9cde71ec8e, f97524b178's), the four columns' half sectors costing more than their
+/// extra blocks gained.
 #[cfg(target_os = "linux")]
 const WIDE_SEGMENTS: usize = 256 * 32;
 
@@ -431,12 +433,13 @@ impl GroupMap {
     }
 
     /// The threads a CUDA reduction over the map runs: one block of 256 (the kernels' `BLOCK`) per
-    /// segment (`segments_reduce`), per 4 or 8 segments of one column each (`columns_reduce`), or
+    /// segment (`segments_reduce`), per 8 or 32 segments of one column each (`columns_reduce`,
+    /// `tiles_reduce`), or
     /// one thread per segment of a single entry (`entries_reduce`).
     #[cfg(target_os = "linux")]
     fn blocks(&self) -> usize {
         match self.reduce_code() {
-            3 => 256 * self.segments.div_ceil(4),
+            3 => 256 * self.segments.div_ceil(8),
             4 => self.segments,
             5 => 256 * self.segments.div_ceil(32),
             _ => 256 * self.segments,
@@ -457,9 +460,9 @@ impl GroupMap {
     }
 
     /// The axis as CUDA's group reductions take it: [`GroupMap::code`]; for a map of one-column
-    /// segments 3 (`columns_reduce`, four columns a block), or 5 from [`WIDE_SEGMENTS`] of them
-    /// (`tiles_reduce`, 32 columns a block: a warp reads 128 adjacent bytes of a row, where four
-    /// columns a block read 16 of each of eight rows); 4 for a map of one-entry segments (one thread
+    /// segments 3 (`columns_reduce`, eight columns a block), or 5 from [`WIDE_SEGMENTS`] of them
+    /// (`tiles_reduce`, 32 columns a block: a warp reads 128 adjacent bytes of a row, where eight
+    /// columns a block read 32 of each of four rows); 4 for a map of one-entry segments (one thread
     /// each, where a block of 256 took each). Every code adds each group's sums in the same order,
     /// so the sums do not depend on it.
     #[cfg(target_os = "linux")]
@@ -921,6 +924,21 @@ impl Device {
         }
     }
 
+    /// [`Device::upload_f32`] whose host-to-device copy runs beside the kernels queued before it
+    /// (CUDA f32: a second stream copies into a landing buffer, the stream then copies on the device
+    /// into the tensor, waiting for the first copy only there): for values a later kernel reads, as
+    /// a batch's restored targets are. Elsewhere [`Device::upload_f32`].
+    pub fn upload_f32_overlapped(&self, rows: usize, cols: usize, values: &[f32]) -> Result<Tensor, GpuError> {
+        if values.len() != rows * cols {
+            return Err(shape(format!("{} values for {rows}x{cols}", values.len())));
+        }
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if self.storage == Storage::F32 => Ok(Tensor { rows, cols, data: Data::Cuda32(engine.upload_overlapped(values)?) }),
+            _ => self.upload_f32(rows, cols, values),
+        }
+    }
+
     /// An operator's prior-group ids `ids` (one per entry, row-major, of a `rows × cols` operator)
     /// held compactly ([`GroupMap`]): one id per row where every row is one group, else one per
     /// column where every column is one group, else one per entry.
@@ -1108,6 +1126,37 @@ impl Device {
     /// `c ← α op(a) op(b) + β c` in `arithmetic`.
     pub fn gemm(&self, c: &mut Tensor, alpha: f64, a: &Tensor, ta: Op, b: &Tensor, tb: Op, beta: f64, arithmetic: Arithmetic) -> Result<(), GpuError> {
         self.gemm_batched(1, c, alpha, a, ta, b, tb, beta, arithmetic)
+    }
+
+    /// `alpha op(a) op(b) + addend` as a new tensor (`addend` m × n, `op(a)` m × k, `op(b)` k × n),
+    /// `addend` only read: on CUDA in f32 storage one product (cublasLt's D = α A B + C, C a matrix
+    /// of its own; [`Arithmetic::Bf16`] rounds f32 operands as [`Device::gemm`] does); elsewhere
+    /// `addend`'s copy and [`Device::gemm`] into it with β = 1.
+    pub fn gemm_onto(&self, alpha: f64, (a, ta): (&Tensor, Op), (b, tb): (&Tensor, Op), addend: &Tensor, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
+        let (m, k) = match ta {
+            Op::N => (a.rows, a.cols),
+            Op::T => (a.cols, a.rows),
+        };
+        let (kb, n) = match tb {
+            Op::N => (b.rows, b.cols),
+            Op::T => (b.cols, b.rows),
+        };
+        if k != kb || addend.dim() != (m, n) {
+            return Err(shape(format!("op(a) {m}x{k}, op(b) {kb}x{n}, addend {:?}", addend.dim())));
+        }
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if addend.storage() == Storage::F32 && arithmetic.split().is_none() && k > 0 => {
+                let mut out = self.empty(m, n)?;
+                engine.gemm_onto((m, n, k), alpha, (a, ta), (b, tb), (addend, &mut out), arithmetic)?;
+                Ok(out)
+            }
+            _ => {
+                let mut out = self.scaled(1.0, addend)?;
+                self.gemm(&mut out, alpha, a, ta, b, tb, 1.0, arithmetic)?;
+                Ok(out)
+            }
+        }
     }
 
     /// [`Device::gemm`] on each of `batch` equal row blocks of `a`, `b` and `c` at once: block `i`
@@ -1559,6 +1608,37 @@ impl Device {
     /// `x / √(mean(x²) + ε)` per row.
     pub fn rms_norm(&self, x: &Tensor, epsilon: f64) -> Result<Tensor, GpuError> {
         self.rms(RmsMode::Value, x, None, epsilon)
+    }
+
+    /// [`Device::rms_norm`] and the values' bfloat16 copy, written in one pass on CUDA in f32
+    /// (`rms_both`); elsewhere the values and [`Device::bf16_copy`] of them.
+    pub fn rms_norm_both(&self, x: &Tensor, epsilon: f64) -> Result<(Tensor, Tensor), GpuError> {
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if x.storage() == Storage::F32 => engine.rms_both(x, epsilon),
+            _ => {
+                let values = self.rms_norm(x, epsilon)?;
+                let half = self.bf16_copy(&values)?;
+                Ok((values, half))
+            }
+        }
+    }
+
+    /// [`Device::law_values`] and the values' bfloat16 copy, written in one pass on CUDA in f32
+    /// (`laws_both`); elsewhere the values and [`Device::bf16_copy`] of them.
+    pub fn law_values_both(&self, x: &Tensor, codes: &Indices, c: f64) -> Result<(Tensor, Tensor), GpuError> {
+        if codes.len != x.cols {
+            return Err(shape(format!("{} law codes for {} columns", codes.len, x.cols)));
+        }
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) if x.storage() == Storage::F32 => engine.laws_both(x, codes, c),
+            _ => {
+                let values = self.law_values(x, codes, c)?;
+                let half = self.bf16_copy(&values)?;
+                Ok((values, half))
+            }
+        }
     }
 
     /// The cotangent of [`Device::rms_norm`] at `x` given the output's `g`.
@@ -4366,14 +4446,14 @@ __device__ unsigned int group_of(const unsigned int* ids, unsigned int axis, u64
 // each goes through the shuffles its warp takes (real warp w those of column w / (R / 32)), and lane
 // 0 of warp l adds the warps' sums in warp order: every group's sums are the ones its own block adds,
 // while a warp reads and writes runs of COLUMNS adjacent columns instead of one entry of each of 32
-// rows. Four columns a block keep six blocks on a multiprocessor (eight left three, and the tiles ran
-// at half the row-grouped operators' rate). `body(i, g, v)` puts entry i's N terms in v and says whether to add them;
+// rows. Eight columns a block read whole 32-byte sectors: on vpd4l's 3072 columns an RTX 4090 ran
+// posterior_ivon at 270 µs a launch with eight against 364 with four (f97524b178's). `body(i, g, v)` puts entry i's N terms in v and says whether to add them;
 // with `every` it also runs on the entries of a group at or beyond `count` (whose sums are not
 // added); with `counted` a group's sums are added only when the first is positive. Every block runs
 // the same rows and synchronizations.
 // Its shared arrays come from `pool` (N · BLOCK + N · 8 · BLOCK / 32 doubles), which
 // `segments_reduce` declares once for every path.
-#define COLUMNS 4
+#define COLUMNS 8
 template <int N, typename F>
 __device__ void columns_reduce(u64 n, u64 cols, u64 segments, const unsigned int* layout, u64 count, bool every, bool counted, double* sums, double* pool, F body) {
     const unsigned int R = BLOCK / COLUMNS, VW = R / 32;
@@ -4920,6 +5000,12 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
         capture_workspace: std::sync::Mutex<Option<CudaSlice<u8>>>,
         /// The pinned buffers uploads pass through ([`Engine::upload`]).
         staging: std::sync::Mutex<Staging>,
+        /// cublasLt's handle, workspace and plans ([`Engine::gemm_onto`]).
+        lt: std::sync::Mutex<Lt>,
+        /// The stream overlapped uploads copy on, and the device buffers they land in first
+        /// ([`Engine::upload_overlapped`]).
+        copies: Arc<CudaStream>,
+        landing: std::sync::Mutex<Landing>,
     }
 
     /// The cuBLAS workspace captured products use.
@@ -4935,6 +5021,110 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
         buffers: Vec<(PinnedHostSlice<u8>, Option<CudaEvent>)>,
         next: usize,
     }
+
+    /// cublasLt's handle, its workspace (grown to what a chosen algorithm asks, at most
+    /// `CAPTURE_WORKSPACE`, the engine's bound on cuBLAS's) and a product's plan per shape, types and
+    /// compute ([`Engine::gemm_onto`]).
+    struct Lt {
+        handle: cudarc::cublaslt::sys::cublasLtHandle_t,
+        workspace: Option<CudaSlice<u8>>,
+        plans: HashMap<LtKey, LtPlan>,
+    }
+
+    // SAFETY: the handle and the plans' descriptors are used only under the engine's lock on them.
+    unsafe impl Send for Lt {}
+
+    impl Lt {
+        fn new() -> Result<Self, GpuError> {
+            Ok(Self { handle: cudarc::cublaslt::result::create_handle().gpu_ctx("tensor cublasLt handle")?, workspace: None, plans: HashMap::new() })
+        }
+    }
+
+    impl Drop for Lt {
+        fn drop(&mut self) {
+            self.plans.clear();
+            // SAFETY: the handle was made by `Lt::new` and is destroyed once, after its plans.
+            if let Err(e) = unsafe { cudarc::cublaslt::result::destroy_handle(self.handle) } {
+                log::error!("tensor cublasLt handle: {e}");
+            }
+        }
+    }
+
+    /// A product's shape as cublasLt takes it (column-major): op(A) and op(B) transposed, m, n, k,
+    /// the leading dimensions of A, B and C, whether A and B are bfloat16, and the compute type.
+    type LtKey = (bool, bool, usize, usize, usize, usize, usize, usize, bool, bool, u32);
+
+    /// A cublasLt product's descriptor, its layouts of A, B and C (also D's) and the algorithm
+    /// its heuristic chose, made once per [`LtKey`].
+    struct LtPlan {
+        desc: cudarc::cublaslt::sys::cublasLtMatmulDesc_t,
+        layouts: [cudarc::cublaslt::sys::cublasLtMatrixLayout_t; 3],
+        heuristic: cudarc::cublaslt::sys::cublasLtMatmulHeuristicResult_t,
+    }
+
+    impl LtPlan {
+        fn new(handle: cudarc::cublaslt::sys::cublasLtHandle_t, key: LtKey) -> Result<Self, GpuError> {
+            use cudarc::cublaslt::{result as lt, sys};
+            let (transa, transb, m, n, k, lda, ldb, ldc, half_a, half_b, compute) = key;
+            let compute = if compute == cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32 as u32 { sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32 } else { sys::cublasComputeType_t::CUBLAS_COMPUTE_32F };
+            let real = sys::cudaDataType::CUDA_R_32F;
+            let kind = |half: bool| if half { sys::cudaDataType::CUDA_R_16BF } else { real };
+            let wide = |x: usize| u64::try_from(x).map_err(|_| shape(format!("a cublasLt dimension {x}")));
+            let lead = |x: usize| i64::try_from(x).map_err(|_| shape(format!("a cublasLt leading dimension {x}")));
+            // SAFETY: every handle below is made here and destroyed once by `LtPlan`'s drop, which
+            // owns it from the moment it exists (an error drops the plan built so far).
+            unsafe {
+                let mut plan = Self { desc: lt::create_matmul_desc(compute, real).gpu_ctx("tensor cublasLt descriptor")?, layouts: [std::ptr::null_mut(); 3], heuristic: std::mem::zeroed() };
+                for (attribute, transposed) in [(sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, transa), (sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, transb)] {
+                    let flag = i32::from(transposed);
+                    lt::set_matmul_desc_attribute(plan.desc, attribute, (&flag) as *const i32 as *const _, std::mem::size_of::<i32>()).gpu_ctx("tensor cublasLt transpose")?;
+                }
+                // Stored shapes: A is m × k (k × m transposed), B k × n (n × k), C and D m × n.
+                let (a_rows, a_cols) = if transa { (k, m) } else { (m, k) };
+                let (b_rows, b_cols) = if transb { (n, k) } else { (k, n) };
+                plan.layouts[0] = lt::create_matrix_layout(kind(half_a), wide(a_rows)?, wide(a_cols)?, lead(lda)?).gpu_ctx("tensor cublasLt layout")?;
+                plan.layouts[1] = lt::create_matrix_layout(kind(half_b), wide(b_rows)?, wide(b_cols)?, lead(ldb)?).gpu_ctx("tensor cublasLt layout")?;
+                plan.layouts[2] = lt::create_matrix_layout(real, wide(m)?, wide(n)?, lead(ldc)?).gpu_ctx("tensor cublasLt layout")?;
+                let preference = lt::create_matmul_pref().gpu_ctx("tensor cublasLt preference")?;
+                let bound = CAPTURE_WORKSPACE as u64;
+                let chosen = lt::set_matmul_pref_attribute(preference, sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, (&bound) as *const u64 as *const _, std::mem::size_of::<u64>())
+                    .and_then(|()| lt::get_matmul_algo_heuristic(handle, plan.desc, plan.layouts[0], plan.layouts[1], plan.layouts[2], plan.layouts[2], preference));
+                let destroyed = lt::destroy_matmul_pref(preference);
+                plan.heuristic = chosen.gpu_ctx("tensor cublasLt heuristic")?;
+                destroyed.gpu_ctx("tensor cublasLt preference")?;
+                Ok(plan)
+            }
+        }
+    }
+
+    impl Drop for LtPlan {
+        fn drop(&mut self) {
+            use cudarc::cublaslt::result as lt;
+            // SAFETY: each handle was made by `LtPlan::new` (null where it was not reached).
+            unsafe {
+                for layout in self.layouts.into_iter().filter(|l| !l.is_null()) {
+                    if let Err(e) = lt::destroy_matrix_layout(layout) {
+                        log::error!("tensor cublasLt layout: {e}");
+                    }
+                }
+                if let Err(e) = lt::destroy_matmul_desc(self.desc) {
+                    log::error!("tensor cublasLt descriptor: {e}");
+                }
+            }
+        }
+    }
+
+    /// [`Engine::upload_overlapped`]'s device buffers, in turn: each lands one upload on the copy
+    /// stream and keeps the event recorded after the stream's copy out of it, which the copy stream
+    /// waits for before landing the next one there.
+    #[derive(Default)]
+    struct Landing {
+        buffers: Vec<(CudaSlice<u8>, Option<CudaEvent>)>,
+        next: usize,
+    }
+
+    /// [`Landing`]'s buffers.
+    const LANDINGS: usize = 4;
 
     /// [`Staging`]'s buffers and their bytes: an upload longer than one buffer passes through several.
     const STAGES: usize = 16;
@@ -5155,6 +5345,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             static MODULE: crate::device_cache::PtxModuleCache = crate::device_cache::PtxModuleCache::new();
             let module = Arc::clone(MODULE.get_or_compile(&ctx, "tensor", KERNELS)?);
             let every_row = stream.alloc_zeros::<u32>(1).gpu_ctx("tensor alloc")?;
+            let copies = ctx.new_stream().gpu_ctx("tensor copy stream")?;
             Ok(Self {
                 name,
                 ctx,
@@ -5172,6 +5363,9 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                 capturing: AtomicBool::new(false),
                 capture_workspace: std::sync::Mutex::new(None),
                 staging: std::sync::Mutex::new(Staging::default()),
+                copies,
+                landing: std::sync::Mutex::new(Landing::default()),
+                lt: std::sync::Mutex::new(Lt::new()?),
             })
         }
 
@@ -5247,8 +5441,64 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             let mut out = unsafe { self.stream.alloc::<T>(values.len()) }.gpu_ctx("tensor alloc")?;
             // SAFETY: `values` is `size_of_val(values)` initialized bytes of plain data (`DeviceRepr`).
             let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) };
-            let mut staging = self.staging.lock().map_err(|_| shape("poisoned upload staging".to_string()))?;
             let (dst, record) = out.device_ptr_mut(&self.stream);
+            self.staged(&self.stream, dst, bytes)?;
+            drop(record);
+            Ok(out)
+        }
+
+        /// [`Engine::upload`] copied on the engine's second stream (`copies`) into a landing buffer
+        /// ([`Landing`]), then on the stream into the new slice: the host-to-device copy runs beside
+        /// the kernels queued before it, and the stream waits for it only where it takes the slice.
+        pub(super) fn upload_overlapped<T: DeviceRepr + ValidAsZeroBits>(&self, values: &[T]) -> Result<CudaSlice<T>, GpuError> {
+            self.host_transfer()?;
+            if values.is_empty() {
+                return self.stream.alloc_zeros::<T>(1).gpu_ctx("tensor alloc");
+            }
+            // SAFETY: `values` is `size_of_val(values)` initialized bytes of plain data (`DeviceRepr`).
+            let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) };
+            let mut landing = self.landing.lock().map_err(|_| shape("poisoned upload landing".to_string()))?;
+            let turn = landing.next;
+            landing.next = (turn + 1) % LANDINGS;
+            if landing.buffers.get(turn).is_none_or(|(buffer, _)| buffer.len() < bytes.len()) {
+                // A landing buffer of at least these bytes, made on the stream and valid on every
+                // stream once the stream has reached it (rare: the first upload of each size up).
+                let buffer = self.stream.alloc_zeros::<u8>(bytes.len()).gpu_ctx("tensor landing alloc")?;
+                self.stream.synchronize().gpu_ctx("tensor landing alloc")?;
+                if landing.buffers.len() == turn {
+                    landing.buffers.push((buffer, None));
+                } else {
+                    landing.buffers[turn] = (buffer, None);
+                }
+            }
+            let (buffer, last) = &mut landing.buffers[turn];
+            if let Some(event) = last.take() {
+                self.copies.wait(&event).gpu_ctx("tensor landing wait")?;
+            }
+            {
+                let (landed, record) = buffer.device_ptr(&self.copies);
+                self.staged(&self.copies, landed, bytes)?;
+                drop(record);
+            }
+            let arrived = self.copies.record_event(None).gpu_ctx("tensor landing event")?;
+            self.stream.wait(&arrived).gpu_ctx("tensor landing wait")?;
+            // SAFETY: the copy below writes all of its values before any kernel reads them.
+            let mut out = unsafe { self.stream.alloc::<T>(values.len()) }.gpu_ctx("tensor alloc")?;
+            {
+                let (dst, record) = out.device_ptr_mut(&self.stream);
+                let (src, src_record) = buffer.device_ptr(&self.stream);
+                // SAFETY: both hold at least `bytes.len()` bytes; the stream waited for the landing.
+                unsafe { cudarc::driver::result::memcpy_dtod_async(dst, src, bytes.len(), self.stream.cu_stream()) }.gpu_ctx("tensor landing copy")?;
+                drop((record, src_record));
+            }
+            *last = Some(self.stream.record_event(None).gpu_ctx("tensor landing event")?);
+            Ok(out)
+        }
+
+        /// `bytes` into device memory at `dst` on `stream`, through the pinned staging buffers in
+        /// turn ([`Staging`]): each waits for its last copy before it is written again.
+        fn staged(&self, stream: &CudaStream, dst: u64, bytes: &[u8]) -> Result<(), GpuError> {
+            let mut staging = self.staging.lock().map_err(|_| shape("poisoned upload staging".to_string()))?;
             for (index, piece) in bytes.chunks(STAGE_BYTES).enumerate() {
                 let turn = staging.next;
                 staging.next = (turn + 1) % STAGES;
@@ -5265,11 +5515,10 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                 host.copy_from_slice(piece);
                 // SAFETY: `dst` holds `bytes.len()` bytes, this piece's at `index * STAGE_BYTES`; the
                 // pinned buffer is not written again before `last`, recorded after the copy, completes.
-                unsafe { cudarc::driver::result::memcpy_htod_async(dst + (index * STAGE_BYTES) as u64, host, self.stream.cu_stream()) }.gpu_ctx("tensor upload")?;
-                *last = Some(self.stream.record_event(None).gpu_ctx("tensor upload event")?);
+                unsafe { cudarc::driver::result::memcpy_htod_async(dst + (index * STAGE_BYTES) as u64, host, stream.cu_stream()) }.gpu_ctx("tensor upload")?;
+                *last = Some(stream.record_event(None).gpu_ctx("tensor upload event")?);
             }
-            drop(record);
-            Ok(out)
+            Ok(())
         }
 
         pub(super) fn download<T: DeviceRepr>(&self, slice: &CudaSlice<T>) -> Result<Vec<T>, GpuError> {
@@ -5608,6 +5857,58 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                 compute,
             };
             self.gemm_ex(product, batch, (stride_b, stride_a, stride_c))
+        }
+
+        /// `out ← α op(a) op(b) + addend` (f32 storage, one block): cublasLt's D = α A B + C, C a
+        /// matrix of its own, one product where `addend`'s copy into `out` and `gemm32` with β = 1
+        /// took two passes. The operands as `gemm32` reads them (an f32 one rounded to bfloat16 in
+        /// Arithmetic::Bf16), its compute type and its column-major view (Dᵀ = op(B)ᵀ op(A)ᵀ + Cᵀ).
+        pub(super) fn gemm_onto(&self, (m, n, k): (usize, usize, usize), alpha: f64, (a, ta): (&Tensor, Op), (b, tb): (&Tensor, Op), (addend, out): (&Tensor, &mut Tensor), arithmetic: Arithmetic) -> Result<(), GpuError> {
+            if m == 0 || n == 0 {
+                return Ok(());
+            }
+            let (compute, half) = compute_of(arithmetic, &self.name)?;
+            let valid = |t: &Tensor| match &t.data {
+                Data::Cuda32(_) => Ok(()),
+                Data::CudaBf16(_) if half => Ok(()),
+                Data::CudaBf16(_) => Err(shape(format!("a bfloat16 operand takes Arithmetic::Bf16, not {arithmetic:?}"))),
+                other => Err(mismatch(other)),
+            };
+            valid(a)?;
+            valid(b)?;
+            let (rounded_a, rounded_b) = if half { (self.half_of(a)?, self.half_of(b)?) } else { (None, None) };
+            let (fb, fa) = (pick(b, &rounded_b)?, pick(a, &rounded_a)?);
+            let bf16 = |f: &Factor<'_>| matches!(f, Factor::Half(_));
+            let key: LtKey = (tb == Op::T, ta == Op::T, n, m, k, b.cols, a.cols, addend.cols, bf16(&fb), bf16(&fa), compute as u32);
+            let mut lt = self.lt.lock().map_err(|_| shape("poisoned cublasLt plans".to_string()))?;
+            if !lt.plans.contains_key(&key) {
+                let plan = LtPlan::new(lt.handle, key)?;
+                lt.plans.insert(key, plan);
+            }
+            let needed = lt.plans.get(&key).map_or(0, |p| p.heuristic.workspaceSize);
+            if lt.workspace.as_ref().is_none_or(|w| w.len() < needed.max(1)) {
+                lt.workspace = Some(self.stream.alloc_zeros::<u8>(needed.max(1)).gpu_ctx("tensor cublasLt workspace")?);
+            }
+            let (alpha, one) = (alpha as f32, 1.0_f32);
+            let plan = lt.plans.get(&key).ok_or_else(|| shape("a cublasLt plan".to_string()))?;
+            let workspace = lt.workspace.as_ref().ok_or_else(|| shape("a cublasLt workspace".to_string()))?;
+            let (pa, _, record_a) = pointer(fb, 0, &self.stream);
+            let (pb, _, record_b) = pointer(fa, 0, &self.stream);
+            let (pc, record_c) = slice32(addend)?.device_ptr(&self.stream);
+            let (pw, record_w) = workspace.device_ptr(&self.stream);
+            let (pd, record_d) = slice32_mut(out)?.device_ptr_mut(&self.stream);
+            // SAFETY: the plan's layouts are these operands' shapes and leading dimensions (checked
+            // by the caller against the buffers); the workspace holds what the algorithm asks; the
+            // pointers outlive the call (their records drop after it).
+            let product = unsafe {
+                cudarc::cublaslt::result::matmul(
+                    lt.handle, plan.desc, (&alpha) as *const f32 as *const _, (&one) as *const f32 as *const _,
+                    pa as *const _, plan.layouts[0], pb as *const _, plan.layouts[1], pc as *const _, plan.layouts[2], pd as *mut _, plan.layouts[2],
+                    &plan.heuristic.algo, pw as *mut _, needed, self.stream.cu_stream() as _,
+                )
+            };
+            drop((record_a, record_b, record_c, record_w, record_d));
+            product.gpu_ctx("tensor cublasLt product")
         }
 
         /// An f32 tensor rounded to bfloat16 into a temporary (`None` for any other storage).
@@ -6187,6 +6488,52 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             }
             .gpu_ctx("tensor laws")?;
             Ok(out)
+        }
+
+        pub(super) fn laws_both(&self, x: &Tensor, codes: &Indices, c: f64) -> Result<(Tensor, Tensor), GpuError> {
+            let mut out = self.output(Storage::F32, x.rows, x.cols)?;
+            let mut half = self.unset16(x.rows, x.cols)?;
+            let (n, cols) = (x.len() as u64, x.cols as u32);
+            let f = self.kernel("laws_both", Storage::F32)?;
+            let Data::CudaBf16(h) = &mut half.data else { return Err(shape("a bfloat16 output".to_string())) };
+            // SAFETY: equal-length f32 buffers and a bfloat16 one of their length; `codes` holds one
+            // code per column.
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(&n)
+                    .arg(&cols)
+                    .input(x, Storage::F32)?
+                    .arg(index_slice(codes)?)
+                    .arg(&c)
+                    .output(&mut out, Storage::F32)?
+                    .arg(h)
+                    .launch(cfg_elements(n))
+            }
+            .gpu_ctx("tensor laws_both")?;
+            Ok((out, half))
+        }
+
+        pub(super) fn rms_both(&self, x: &Tensor, epsilon: f64) -> Result<(Tensor, Tensor), GpuError> {
+            let mut out = self.output(Storage::F32, x.rows, x.cols)?;
+            let mut half = self.unset16(x.rows, x.cols)?;
+            let (rows, cols) = (x.rows as u32, x.cols as u32);
+            let f = self.kernel("rms_both", Storage::F32)?;
+            let Data::CudaBf16(h) = &mut half.data else { return Err(shape("a bfloat16 output".to_string())) };
+            // SAFETY: one block per row of equal-shape f32 buffers and a bfloat16 one of their shape.
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(&rows)
+                    .arg(&cols)
+                    .arg(&epsilon)
+                    .input(x, Storage::F32)?
+                    .output(&mut out, Storage::F32)?
+                    .arg(h)
+                    .launch(cfg_rows(x.rows))
+            }
+            .gpu_ctx("tensor rms_both")?;
+            Ok((out, half))
         }
 
         pub(super) fn rms(&self, mode: RmsMode, x: &Tensor, g: Option<&Tensor>, epsilon: f64) -> Result<Tensor, GpuError> {

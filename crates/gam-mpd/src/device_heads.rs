@@ -407,10 +407,10 @@ fn halves(d: &Device, x: &Tensor, (start, heads, width, blocks): (usize, usize, 
 }
 
 /// `P = x Wᵀ` plus the stacked biases, `x` the input's value (module note).
-pub(crate) fn project(d: &Device, heads: &Heads, stacked: &Stacked, x: &Tensor, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
+pub(crate) fn project(d: &Device, heads: &Heads, (weights, biases): (&Tensor, Option<&Tensor>), x: &Tensor, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
     let mut p = d.empty(x.rows(), heads.columns())?;
-    d.gemm(&mut p, 1.0, x, Op::N, &stacked.weights, Op::T, 0.0, arithmetic)?;
-    if let Some(b) = &stacked.biases {
+    d.gemm(&mut p, 1.0, x, Op::N, weights, Op::T, 0.0, arithmetic)?;
+    if let Some(b) = biases {
         d.add_row(&mut p, 1.0, b)?;
     }
     Ok(p)
@@ -1092,7 +1092,7 @@ mod tests {
             let stacked = Stacked::upload(&d, &program, heads).expect("stacked");
             let (cos, sin) = (d.upload(table(false).view()).expect("cos"), d.upload(table(true).view()).expect("sin"));
             let turn = Some((&cos, &sin, r.half_split));
-            let p = project(&d, heads, &stacked, &d.upload(cpu.values[heads.input].view()).expect("x"), Arithmetic::F64).expect("P");
+            let p = project(&d, heads, (&stacked.weights, stacked.biases.as_ref()), &d.upload(cpu.values[heads.input].view()).expect("x"), Arithmetic::F64).expect("P");
             let g_a = d.upload(Array2::from_shape_fn((rows, heads.heads * heads.width), |(i, j)| noise(3000 + i * 31 + j)).view()).expect("g_A");
             let once = d.download(&attend_by(&d, heads, (&p, &p), SEQUENCES, turn, Arithmetic::F64, heads.keys).expect("once")).expect("once");
             let turns = d.download(&attend_by(&d, heads, (&p, &p), SEQUENCES, turn, Arithmetic::F64, 1).expect("in turn")).expect("in turn");

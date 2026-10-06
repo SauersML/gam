@@ -273,6 +273,35 @@ extern "C" __global__ void laws(u64 n, unsigned int cols, const float* x, const 
     }
 }
 
+// `laws`' values, each also written rounded (`bf16_of`) to `half`: a bfloat16 product's operand
+// made in the same pass (`Device::law_values_both`).
+extern "C" __global__ void laws_both(u64 n, unsigned int cols, const float* x, const unsigned int* codes, double c, float* out, unsigned short* half) {
+    float cf = (float)c;
+    GRID_STRIDE(i, n) {
+        float v = law_value(codes[i % cols], x[i], cf);
+        out[i] = v;
+        half[i] = bf16_of(v);
+    }
+}
+
+// `rms`'s values (mode 0), each also written rounded (`bf16_of`) to `half` (`Device::rms_norm_both`).
+extern "C" __global__ void rms_both(unsigned int rows, unsigned int cols, double epsilon, const float* x, float* out, unsigned short* half) {
+    __shared__ float shared[WARPS];
+    unsigned int r = blockIdx.x;
+    if (r >= rows) return;
+    const float* xr = x + (u64)r * cols;
+    float squares = 0.0f;
+    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) squares += xr[c] * xr[c];
+    float n = (float)cols;
+    float mean = block_sum(squares, shared) / n;
+    float scale = 1.0f / sqrtf(mean + (float)epsilon);
+    for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) {
+        float v = xr[c] * scale;
+        out[(u64)r * cols + c] = v;
+        half[(u64)r * cols + c] = bf16_of(v);
+    }
+}
+
 // mode 0: value; 1: cotangent given g; 2: tangent along g.
 extern "C" __global__ void rms(unsigned int rows, unsigned int cols, int mode, double epsilon, const float* x, const float* g, float* out) {
     __shared__ float shared[WARPS];

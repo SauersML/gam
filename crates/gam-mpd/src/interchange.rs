@@ -141,6 +141,9 @@ impl Sites {
 pub struct Model<'a> {
     pub program: &'a DeviceProgram,
     sites: Arc<Sites>,
+    /// `M`'s prefixes kept across scorings ([`PrefixStore`]), for the teacher of an
+    /// [`Interchange`] that keeps them.
+    prefixes: Option<&'a RefCell<PrefixStore>>,
 }
 
 impl<'a> Model<'a> {
@@ -151,7 +154,7 @@ impl<'a> Model<'a> {
     /// before the stream entering it except token features, so that one block runs from that
     /// stream alone. `values` says where the model holds each read variable's value ([`values`]).
     pub fn new(program: &'a DeviceProgram, flat: &OperatorProgram, entries: Vec<usize>, reads: Vec<usize>, trainable: &[usize], values: Vec<Value>) -> Result<Self, String> {
-        Ok(Self { program, sites: Arc::new(Sites::new(program, flat, entries, reads, trainable, values)?) })
+        Ok(Self { program, sites: Arc::new(Sites::new(program, flat, entries, reads, trainable, values)?), prefixes: None })
     }
 
     fn blocks(&self) -> usize {
@@ -1343,6 +1346,12 @@ pub trait BlockEngine {
     /// The precision of the products.
     fn arithmetic(&self) -> Arithmetic;
 
+    /// The prefixes of this engine's runs kept across scorings ([`PrefixStore`]): `M`'s, as an
+    /// [`Interchange`] keeps them; none by default.
+    fn prefixes(&self) -> Option<&RefCell<PrefixStore>> {
+        None
+    }
+
     /// Where the model holds each read variable's value ([`values`]): the nodes its edits name.
     fn values(&self) -> &[Value];
 
@@ -1486,6 +1495,10 @@ impl BlockEngine for Model<'_> {
 
     fn arithmetic(&self) -> Arithmetic {
         self.program.arithmetic()
+    }
+
+    fn prefixes(&self) -> Option<&RefCell<PrefixStore>> {
+        self.prefixes
     }
 
     fn values(&self) -> &[Value] {
@@ -1828,6 +1841,50 @@ impl<'t> Plan<'t> {
         }
     }
 
+    /// Per lane, the last block of its prefix [`run`] may keep and restore ([`PrefixStore`]): a whole
+    /// lane (from block 0, no parent, no twin) through the blocks before anything trainable reaches
+    /// it (`Plan::reaches_trainable`: `M` runs them, no patch or edit acts there), and before the
+    /// first block another lane reads its rows at (a lane forking from it, a suffix lane's twin, a
+    /// patch's source, an operation's donor), which needs them there. None for any other lane.
+    fn prefix_ends(&self) -> Vec<Option<usize>> {
+        let mut ends: Vec<Option<usize>> = (0..self.lanes.len())
+            .map(|l| {
+                let lane = &self.lanes[l];
+                if lane.start != 0 || lane.parent.is_some() || lane.prefix.is_some() {
+                    return None;
+                }
+                (lane.start..lane.end).take_while(|&b| !self.reaches_trainable(l, b)).last()
+            })
+            .collect();
+        // A lane read at block `c` keeps its prefix only through block c − 1.
+        let mut before = |l: usize, c: usize| {
+            ends[l] = match (ends[l], c.checked_sub(1)) {
+                (Some(k), Some(limit)) => Some(k.min(limit)),
+                _ => None,
+            };
+        };
+        for lane in &self.lanes {
+            if let Some(parent) = lane.parent {
+                before(parent, lane.start);
+            }
+            let path = &self.paths[lane.path];
+            for c in lane.start..lane.end {
+                if let Some((twin, _)) = lane.prefix {
+                    before(self.lane(twin, c), c);
+                }
+                if let Some((_, source)) = path.patched(c) {
+                    before(self.lane(source, c), c);
+                }
+                for (_, edit) in path.edits.iter().filter(|(b, _)| *b == c) {
+                    if let Edit::Op { source, .. } = edit {
+                        before(self.lane(*source, c), c);
+                    }
+                }
+            }
+        }
+        ends
+    }
+
     fn patches(&self, block: usize, lanes: &[usize]) -> Result<Vec<(usize, usize, &'t [usize])>, String> {
         let mut out = Vec::new();
         for &l in lanes {
@@ -1910,6 +1967,19 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
     let mut calls = Vec::new();
     let budget = if keep { Some(engines[0].tape_budget(stream.rows())?) } else { None };
     let (mut kept, mut largest) = (0usize, 0usize);
+    // `M`'s prefixes kept across scorings (`PrefixStore`), where `P` and `M` are two engines (not a
+    // run of `M` alone, its targets') and the stream holds f32: a lane whose prefix is kept skips
+    // its calls through the prefix's last block and takes the kept rows after it.
+    let store = if std::ptr::eq(engines[0], engines[1]) || stream.storage() != Storage::F32 { None } else { engines[1].prefixes() };
+    let ends = if store.is_some() { plan.prefix_ends() } else { vec![None; plan.lanes.len()] };
+    let key = |l: usize, k: usize| (plan.paths[plan.lanes[l].path].tokens.to_vec(), k);
+    let restored: Vec<bool> = match store {
+        Some(store) => {
+            let store = store.borrow();
+            (0..plan.lanes.len()).map(|l| ends[l].is_some_and(|k| store.rows.contains_key(&key(l, k)))).collect()
+        }
+        None => vec![false; plan.lanes.len()],
+    };
     for b in 0..blocks {
         for lane in plan.lanes.iter().filter(|l| l.start == b) {
             if let Some(parent) = lane.parent {
@@ -1918,7 +1988,10 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
             }
         }
         for side in 0..2 {
-            let lanes: Vec<usize> = (0..plan.lanes.len()).filter(|&l| (plan.lanes[l].start..plan.lanes[l].end).contains(&b) && plan.paths[plan.lanes[l].path].explained[b] == (side == 0)).collect();
+            let lanes: Vec<usize> = (0..plan.lanes.len())
+                .filter(|&l| (plan.lanes[l].start..plan.lanes[l].end).contains(&b) && plan.paths[plan.lanes[l].path].explained[b] == (side == 0))
+                .filter(|&l| !(restored[l] && ends[l].is_some_and(|k| b <= k)))
+                .collect();
             if lanes.is_empty() {
                 continue;
             }
@@ -1953,6 +2026,20 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
                 }
             };
             calls.push(Call { block: b, side, lanes, edits, kept: kept_here });
+        }
+        if let Some(store) = store {
+            for l in (0..plan.lanes.len()).filter(|&l| ends[l] == Some(b)) {
+                let rows = plan.lanes[l].rows.clone();
+                if restored[l] {
+                    let store = store.borrow();
+                    let values = store.rows.get(&key(l, b)).ok_or_else(|| error("a kept prefix gone"))?;
+                    let held = d.upload_f32(rows.len(), width, values).map_err(error)?;
+                    d.set_rows(&mut stream, rows.start, &held).map_err(error)?;
+                } else {
+                    let values = d.download_f32(&d.rows_of(&stream, rows.start, rows.len()).map_err(error)?).map_err(error)?;
+                    store.borrow_mut().keep(key(l, b), values);
+                }
+            }
         }
         plan.copy_prefixes(d, &mut stream, b)?;
     }
@@ -2220,7 +2307,8 @@ impl HostTargets {
             .map(|t| {
                 let held = if d.storage() == t.storage { d.clone() } else { d.with_storage(t.storage).map_err(error)? };
                 let mu = match &t.mu {
-                    KeptValues::Single(v) => held.upload_f32(t.shape.0, t.shape.1, v),
+                    // Copied beside the kernels queued before it (the batch's other half's reverse).
+                    KeptValues::Single(v) => held.upload_f32_overlapped(t.shape.0, t.shape.1, v),
                     KeptValues::Double(v) => held.upload_vec(t.shape.0, t.shape.1, v.clone()),
                 }
                 .map_err(error)?;
@@ -2437,6 +2525,25 @@ impl Drop for DiskTargets {
 /// The targets an [`Interchange`] keeps on the host once [`Interchange::keep_targets`] asked for
 /// it, by the exact identity of each batch's experiments, each batch's bytes reserved from
 /// `governor` for as long as they are held, and those the budget does not admit on local disk.
+/// `M`'s prefixes kept on the host while the governor admits them: per whole lane of a scoring, its
+/// stream rows after the last block `M` runs on it before a patch, an edit, a `P` block or another
+/// lane's read reaches it (`Plan::prefix_ends`), by its tokens and that block. `M` is fixed, so those
+/// rows are the same at every scoring of the collection; [`run`] restores them in place of running
+/// the blocks again. Rows of f32 streams only.
+pub struct PrefixStore {
+    governor: MemoryGovernor,
+    rows: HashMap<(Vec<u32>, usize), Governed<Vec<f32>>>,
+}
+
+impl PrefixStore {
+    fn keep(&mut self, key: (Vec<u32>, usize), values: Vec<f32>) {
+        let bytes = 4 * (values.len() + key.0.len());
+        if let Ok(reservation) = self.governor.try_reserve(bytes, "interchange: M's prefix rows kept on the host") {
+            self.rows.insert(key, reservation.bind(values));
+        }
+    }
+}
+
 struct TargetStore {
     governor: MemoryGovernor,
     batches: HashMap<Identity, Governed<HostTargets>>,
@@ -2682,6 +2789,8 @@ pub struct Interchange {
     trainable: Vec<usize>,
     /// `M`'s targets kept on the host ([`Interchange::keep_targets`]); none until asked for.
     kept: RefCell<Option<TargetStore>>,
+    /// `M`'s prefixes kept on the host ([`PrefixStore`]), with the targets.
+    prefixes: Option<RefCell<PrefixStore>>,
 }
 
 impl Interchange {
@@ -2730,7 +2839,7 @@ impl Interchange {
             sites.parts.head_blocks.clone_from(&head_blocks);
         }
         let (m_sites, p_sites) = (Arc::new(m_sites), Arc::new(p_sites));
-        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), kept: RefCell::new(None) })
+        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), kept: RefCell::new(None), prefixes: None })
     }
 
     /// The shared sites both models hold ([`SharedSite`]).
@@ -2896,7 +3005,7 @@ impl Interchange {
 
     /// `M` and `P` as the free functions of this module take them.
     pub fn models(&self) -> (Model<'_>, Model<'_>) {
-        (Model { program: &self.m, sites: Arc::clone(&self.m_sites) }, Model { program: &self.p, sites: Arc::clone(&self.p_sites) })
+        (Model { program: &self.m, sites: Arc::clone(&self.m_sites), prefixes: self.prefixes.as_ref() }, Model { program: &self.p, sites: Arc::clone(&self.p_sites), prefixes: None })
     }
 
     /// `P`'s program, to write its trainable operators on the device (`device_posterior`).
@@ -2954,6 +3063,7 @@ impl Interchange {
     /// otherwise repeated at every scoring.
     pub fn keep_targets(&mut self, governor: &MemoryGovernor) {
         *self.kept.get_mut() = Some(TargetStore { governor: governor.clone(), batches: HashMap::new(), disk: DiskTargets::new() });
+        self.prefixes = Some(RefCell::new(PrefixStore { governor: governor.clone(), rows: HashMap::new() }));
     }
 
     /// `P`'s program, so that a fit writes each weight sample into its resident parameters.
