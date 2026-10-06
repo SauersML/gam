@@ -3954,13 +3954,6 @@ mod tests {
     /// sink field existed (so earlier checkpoints keep their identity), and a sink when there is one.
     #[test]
     fn a_layer_without_a_sink_is_defined_as_before_the_sink_field() {
-        #[derive(Debug)]
-        #[allow(dead_code)]
-        struct Layer {
-            sites: crate::run_check::LayerNodes,
-            heads: Vec<(Vec<usize>, Vec<usize>)>,
-            functions: Vec<Vec<usize>>,
-        }
         let export = crate::test_support::tiny_qwen3_export("layers_definition", 2);
         let imported = crate::import::import_language_model(&export, 2, 6).unwrap();
         std::fs::remove_dir_all(&export).unwrap();
@@ -3971,8 +3964,9 @@ mod tests {
             .enumerate()
             .map(|(l, sites)| super::Layer { sites: sites.clone(), heads: vec![(vec![l, 1], vec![2])], functions: vec![vec![3, 4], vec![l]], sink: None })
             .collect();
-        let before: Vec<Layer> = layers.iter().map(|l| Layer { sites: l.sites.clone(), heads: l.heads.clone(), functions: l.functions.clone() }).collect();
-        assert_eq!(super::layers_definition(&layers), format!("{before:?}"));
+        // `Layer`'s derived debug form before the sink field is today's without that field.
+        assert_eq!(super::layers_definition(&layers), format!("{layers:?}").replace(", sink: None", ""));
+        assert!(!super::layers_definition(&layers).contains("sink"));
         let mut sunk = layers.clone();
         sunk[1].sink = Some(7);
         assert_eq!(super::layers_definition(&sunk), format!("{sunk:?}").replace(", sink: None", ""));
