@@ -3593,7 +3593,7 @@ mod cuda {
     use cudarc::cublas::sys::{cublasComputeType_t, cublasGemmAlgo_t, cublasMath_t, cublasOperation_t, cudaDataType_t};
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
     use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
-    use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, LaunchArgs, LaunchConfig, PushKernelArg, SyncOnDrop, ValidAsZeroBits};
+    use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, LaunchArgs, LaunchConfig, PinnedHostSlice, PushKernelArg, SyncOnDrop, ValidAsZeroBits};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -4934,10 +4934,36 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
         /// cuBLAS's workspace inside captures (a recorded product may not allocate), kept for the
         /// engine's life since every graph's products read it.
         capture_workspace: std::sync::Mutex<Option<CudaSlice<u8>>>,
+        /// The pinned buffers uploads pass through ([`Engine::upload`]).
+        staging: std::sync::Mutex<Staging>,
     }
 
     /// The cuBLAS workspace captured products use.
     const CAPTURE_WORKSPACE: usize = 32 << 20;
+
+    /// Pinned host buffers an upload's bytes pass through ([`Engine::upload`]), in turn: a copy from
+    /// pageable memory synchronizes the stream before it starts, so every upload waited for all the
+    /// queued kernels and the device idled until the host queued more; a copy from pinned memory is
+    /// queued as a kernel is. Each buffer keeps the event recorded after its last copy, waited for
+    /// before the buffer is written again.
+    #[derive(Default)]
+    struct Staging {
+        buffers: Vec<(PinnedHostSlice<u8>, Option<CudaEvent>)>,
+        next: usize,
+    }
+
+    /// [`Staging`]'s buffers and their bytes: an upload longer than one buffer passes through several.
+    const STAGES: usize = 16;
+    const STAGE_BYTES: usize = 4 << 20;
+
+    impl Drop for Staging {
+        /// A buffer is freed only after its last copy finished.
+        fn drop(&mut self) {
+            for event in self.buffers.iter().filter_map(|(_, e)| e.as_ref()) {
+                let _ = event.synchronize();
+            }
+        }
+    }
 
     #[derive(Default)]
     struct SplitWorkspace {
@@ -5158,6 +5184,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                 split_workspace: std::sync::Mutex::new(SplitWorkspace::default()),
                 capturing: AtomicBool::new(false),
                 capture_workspace: std::sync::Mutex::new(None),
+                staging: std::sync::Mutex::new(Staging::default()),
             })
         }
 
@@ -5229,7 +5256,33 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             if values.is_empty() {
                 return self.stream.alloc_zeros::<T>(1).gpu_ctx("tensor alloc");
             }
-            self.stream.clone_htod(values).gpu_ctx("tensor upload")
+            // SAFETY: the staged copies below write all of its values before any kernel reads them.
+            let mut out = unsafe { self.stream.alloc::<T>(values.len()) }.gpu_ctx("tensor alloc")?;
+            // SAFETY: `values` is `size_of_val(values)` initialized bytes of plain data (`DeviceRepr`).
+            let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) };
+            let mut staging = self.staging.lock().map_err(|_| shape("poisoned upload staging".to_string()))?;
+            let (dst, record) = out.device_ptr_mut(&self.stream);
+            for (index, piece) in bytes.chunks(STAGE_BYTES).enumerate() {
+                let turn = staging.next;
+                staging.next = (turn + 1) % STAGES;
+                if staging.buffers.len() == turn {
+                    // SAFETY: a buffer's bytes are written before a copy reads them.
+                    let buffer = unsafe { self.ctx.alloc_pinned::<u8>(STAGE_BYTES) }.gpu_ctx("tensor pinned alloc")?;
+                    staging.buffers.push((buffer, None));
+                }
+                let (buffer, last) = &mut staging.buffers[turn];
+                if let Some(event) = last.take() {
+                    event.synchronize().gpu_ctx("tensor upload staging")?;
+                }
+                let host = &mut buffer.as_mut_slice().gpu_ctx("tensor upload staging")?[..piece.len()];
+                host.copy_from_slice(piece);
+                // SAFETY: `dst` holds `bytes.len()` bytes, this piece's at `index * STAGE_BYTES`; the
+                // pinned buffer is not written again before `last`, recorded after the copy, completes.
+                unsafe { cudarc::driver::result::memcpy_htod_async(dst + (index * STAGE_BYTES) as u64, host, self.stream.cu_stream()) }.gpu_ctx("tensor upload")?;
+                *last = Some(self.stream.record_event(None).gpu_ctx("tensor upload event")?);
+            }
+            drop(record);
+            Ok(out)
         }
 
         pub(super) fn download<T: DeviceRepr>(&self, slice: &CudaSlice<T>) -> Result<Vec<T>, GpuError> {
