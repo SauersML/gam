@@ -545,7 +545,10 @@ fn line_terms_are_the_group_curvatures_they_replace() {
         line_terms_match_the_curvatures(&narrow, &half, &wide);
         line_terms_match_the_curvatures(&wide, &wide, &wide);
     }
-    if let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault") {
+    // On Linux the single-precision device is CUDA's f32 storage, whose sums are no float64 tensor.
+    if cfg!(target_os = "macos")
+        && let Some(metal) = Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault")
+    {
         line_terms_match_the_curvatures(&metal, &metal, &metal);
     }
 }
