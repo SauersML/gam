@@ -1475,7 +1475,9 @@ pub fn evaluate<E: BlockEngine>(m: &E, p: &E, head: &FixedHead, batch: &Batch, t
 /// [`evaluate`] of `experiments` on `batch`, with the scores only when `targets` are
 /// given, and with `labels` also a draw of the Gauss–Newton factor ([`Factor`]), each scored row's
 /// label drawn with its entry of `labels` (rows in experiment order): a second reverse pass through
-/// the same forward pass, seeded at every scored token by [`sampled_label_seed`].
+/// the same forward pass, seeded at every scored token by `Σ q e − e_y`. With the divergence's
+/// gradient the head's one sweep of the vocabulary makes both seeds, which share `Σ q e`
+/// (`Device::head_log_partition_drawn`); without it, [`sampled_label_seed`] sweeps for the labels.
 pub fn evaluate_labelled<E: BlockEngine>(
     (m, p): (&E, &E),
     head: &FixedHead,
@@ -1509,6 +1511,7 @@ pub fn evaluate_labelled<E: BlockEngine>(
     let spread = |seed: &Tensor, weight: f64| spread(d, stream.rows(), &rows, seed, weight);
     let mut bits = Vec::new();
     let mut total = BTreeMap::new();
+    let mut drawn = None;
     if let Some(targets) = targets {
         let mut mu = d.zeros(hidden.rows(), width).map_err(error)?;
         let mut entropy = Vec::with_capacity(hidden.rows());
@@ -1519,7 +1522,8 @@ pub fn evaluate_labelled<E: BlockEngine>(
             at += r.len();
         }
         let target = Target { mu: Arc::new(mu), entropy, head: Arc::clone(&head.head), scored: None };
-        let (nats, seed) = head.resident.score(d, &hidden, &target, gradient, arithmetic)?;
+        let (nats, seed, draws) = head.resident.score(d, &hidden, &target, gradient, labels.filter(|_| gradient), arithmetic)?;
+        drawn = draws;
         bits.reserve(experiments.len());
         let mut at = 0;
         for r in &rows {
@@ -1533,9 +1537,13 @@ pub fn evaluate_labelled<E: BlockEngine>(
     }
     let factor = match labels {
         Some(uniforms) => {
-            // The label draw's logits, its seed and the pass in the factor's arithmetic.
+            // The pass (and a label draw of its own: its logits and its seed) in the factor's
+            // arithmetic.
             let factor = factor_arithmetic(d, arithmetic);
-            let seed = sampled_label_seed(d, &hidden, &head.resident.embedding, head.resident.tile_rows.max(1), uniforms, factor)?;
+            let seed = match drawn {
+                Some(seed) => seed,
+                None => sampled_label_seed(d, &hidden, &head.resident.embedding, head.resident.tile_rows.max(1), uniforms, factor)?,
+            };
             let mut u = BTreeMap::new();
             run_reverse([p, m], &plan, &calls, spread(&seed, 1.0)?, &mut u, factor)?;
             Some(Factor { gradient: u, tokens: hidden.rows() })
@@ -1878,7 +1886,9 @@ mod tests {
     /// over a batch's scored rows `r`, `F_r = diag p_r − p_r p_rᵀ` at `P`'s prediction `p_r`. The
     /// exact diagonal is `Σ_r Σ_c p_rc (J_rᵀ (p_r − e_c))²`: one reverse pass per row and class
     /// through the same forward pass, seeded at that row alone. The draws' mean of `u²` must lie
-    /// within five standard errors of it, for each operator's trace and for its largest entry.
+    /// within five standard errors of it, for each operator's trace and for its largest entry: for
+    /// the labels drawn by their own sweep, and for those drawn in the divergence's sweep with its
+    /// gradient.
     #[test]
     fn the_squared_factor_estimates_the_gauss_newton_diagonal() {
         let dir = tiny_export("interchange_factor", 2);
@@ -1930,37 +1940,44 @@ mod tests {
             }
         }
         // The draws.
-        let draws = 400;
-        let mut sums: BTreeMap<usize, (ndarray::Array2<f64>, ndarray::Array2<f64>, f64, f64)> = BTreeMap::new();
-        let mut rng = StdRng::seed_from_u64(7);
-        for _ in 0..draws {
-            let uniforms: Vec<f64> = (0..hidden.nrows()).map(|_| rng.random::<f64>()).collect();
-            let evaluation = ic.evaluate_labelled(&batch, &experiments, None, false, Some(&uniforms)).expect("a draw");
-            let factor = evaluation.factor.expect("the factor");
-            assert_eq!(factor.tokens, hidden.nrows());
-            for (op, u) in factor.gradient {
-                let squared = device.download(&u).expect("download").mapv(|v| v * v);
-                let trace = squared.sum();
-                let entry = sums.entry(op).or_insert_with(|| (ndarray::Array2::zeros(squared.dim()), ndarray::Array2::zeros(squared.dim()), 0.0, 0.0));
-                entry.0 += &squared;
-                entry.1 += &squared.mapv(|v| v * v);
-                entry.2 += trace;
-                entry.3 += trace * trace;
+        let targets = ic.targets(&batch, &experiments).expect("the targets");
+        for fused in [false, true] {
+            let draws = 400;
+            let mut sums: BTreeMap<usize, (ndarray::Array2<f64>, ndarray::Array2<f64>, f64, f64)> = BTreeMap::new();
+            let mut rng = StdRng::seed_from_u64(7);
+            for _ in 0..draws {
+                let uniforms: Vec<f64> = (0..hidden.nrows()).map(|_| rng.random::<f64>()).collect();
+                let evaluation = if fused {
+                    ic.evaluate_labelled(&batch, &experiments, Some(&targets), true, Some(&uniforms))
+                } else {
+                    ic.evaluate_labelled(&batch, &experiments, None, false, Some(&uniforms))
+                };
+                let factor = evaluation.expect("a draw").factor.expect("the factor");
+                assert_eq!(factor.tokens, hidden.nrows());
+                for (op, u) in factor.gradient {
+                    let squared = device.download(&u).expect("download").mapv(|v| v * v);
+                    let trace = squared.sum();
+                    let entry = sums.entry(op).or_insert_with(|| (ndarray::Array2::zeros(squared.dim()), ndarray::Array2::zeros(squared.dim()), 0.0, 0.0));
+                    entry.0 += &squared;
+                    entry.1 += &squared.mapv(|v| v * v);
+                    entry.2 += trace;
+                    entry.3 += trace * trace;
+                }
             }
-        }
-        let n = draws as f64;
-        let check = |what: String, sum: f64, square: f64, expected: f64| {
-            let mean = sum / n;
-            let error = ((square / n - mean * mean) / (n - 1.0)).max(0.0).sqrt();
-            assert!((mean - expected).abs() <= 5.0 * error + 1e-12 * expected.abs(), "{what}: mean {mean:e} of the draws against {expected:e} (standard error {error:e})");
-        };
-        assert_eq!(sums.keys().collect::<Vec<_>>(), exact.keys().collect::<Vec<_>>(), "the same operators receive the factor");
-        for (op, expected) in &exact {
-            let (sum, square, trace, trace_square) = &sums[op];
-            let name = &explanation.artifact.program.operators[*op].name;
-            check(format!("{name} trace"), *trace, *trace_square, expected.sum());
-            let (at, largest) = expected.indexed_iter().fold(((0, 0), 0.0), |best, (at, v)| if *v > best.1 { (at, *v) } else { best });
-            check(format!("{name} entry {at:?}"), sum[at], square[at], largest);
+            let n = draws as f64;
+            let check = |what: String, sum: f64, square: f64, expected: f64| {
+                let mean = sum / n;
+                let error = ((square / n - mean * mean) / (n - 1.0)).max(0.0).sqrt();
+                assert!((mean - expected).abs() <= 5.0 * error + 1e-12 * expected.abs(), "{what}: mean {mean:e} of the draws against {expected:e} (standard error {error:e})");
+            };
+            assert_eq!(sums.keys().collect::<Vec<_>>(), exact.keys().collect::<Vec<_>>(), "the same operators receive the factor");
+            for (op, expected) in &exact {
+                let (sum, square, trace, trace_square) = &sums[op];
+                let name = &explanation.artifact.program.operators[*op].name;
+                check(format!("{name} trace (fused {fused})"), *trace, *trace_square, expected.sum());
+                let (at, largest) = expected.indexed_iter().fold(((0, 0), 0.0), |best, (at, v)| if *v > best.1 { (at, *v) } else { best });
+                check(format!("{name} entry {at:?} (fused {fused})"), sum[at], square[at], largest);
+            }
         }
     }
 }

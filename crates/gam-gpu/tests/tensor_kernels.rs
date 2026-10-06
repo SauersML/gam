@@ -142,6 +142,72 @@ fn sampled_head_lookup_matches_full_pullback_in_both_orientations() {
     }
 }
 
+/// A drawn head sweep (`Device::head_log_partition_drawn`) on the host, a CUDA device in float64
+/// and in f32 storage, and the Apple GPU: its partitions and expected rows are the undrawn sweep's;
+/// each scored row's draw is its expected row less one class's head row, rounded once (an unscored
+/// row's is zero); and over rows of one hidden vector against classes spanning several of CUDA's
+/// swept chunks (the last narrower than a block), the draws of each of a few sets of classes fall
+/// within five binomial standard errors of the set's softmax probability.
+#[test]
+fn a_drawn_head_sweep_draws_each_class_with_its_softmax_probability() {
+    let (rows, classes, width) = (6000, 3940, 8);
+    let mut devices = vec![Device::host()];
+    devices.extend(accelerator());
+    devices.extend(Device::single_precision(GpuPolicy::Auto).expect("a probe that does not fault").filter(|d| !d.float64()));
+    // f32 values, so every device holds the same ones.
+    let single = |m: Array2<f64>| m.mapv(|v| f64::from(v as f32));
+    let vector = single(matrix(1, width, 5, 3.0));
+    let hidden = Array2::from_shape_fn((rows, width), |(_, j)| vector[[0, j]]);
+    let embedding = single(matrix(classes, width, 9, 0.7));
+    let uniforms = single(matrix(rows, 1, 13, 0.5).mapv(|v| v + 0.5));
+    let flags: Vec<u32> = (0..rows as u32).map(|r| u32::from(r % 7 != 3)).collect();
+    let logits = embedding.dot(&vector.row(0));
+    let top = logits.fold(f64::NEG_INFINITY, |a, b| a.max(*b));
+    let weights = logits.mapv(|z| (z - top).exp());
+    let q = &weights / weights.sum();
+    let mut order: Vec<usize> = (0..classes).collect();
+    order.sort_by(|a, b| q[*b].total_cmp(&q[*a]));
+    let set = |name: String, member: &dyn Fn(usize) -> bool| (name, (0..classes).map(member).collect::<Vec<bool>>());
+    let mut sets: Vec<(String, Vec<bool>)> = order[..4].iter().map(|&c| set(format!("class {c}"), &|k| k == c)).collect();
+    sets.extend((0..5).map(|m| set(format!("classes {m} mod 5"), &|k| k % 5 == m)));
+    sets.extend([(0, 1000), (1000, 2560), (2560, 3840), (3840, classes)].map(|(a, b)| set(format!("classes {a}..{b}"), &|k| a <= k && k < b)));
+    for device in &devices {
+        let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
+        let (h, e, u) = (up(device, &hidden), up(device, &embedding), up(device, &uniforms));
+        let f = device.upload_indices(&flags).expect("flags");
+        let mut plain = device.zeros(rows, width).expect("zeros");
+        let partitions = device.head_log_partition(&h, &e, false, Some(&f), Some(&mut plain), arithmetic).expect("the sweep");
+        let (mut mean, mut draws) = (device.zeros(rows, width).expect("zeros"), device.zeros(rows, width).expect("zeros"));
+        let drawn = device.head_log_partition_drawn(&h, (&e, false), Some(&f), &mut mean, (&u, &mut draws), arithmetic).expect("the drawn sweep");
+        let name = device.name();
+        assert_eq!(drawn, partitions, "{name}: the partitions");
+        let (mean, draws) = (down(device, &mean), down(device, &draws));
+        assert_eq!(mean, down(device, &plain), "{name}: the expected rows");
+        let mut counts = vec![0usize; classes];
+        for r in 0..rows {
+            if flags[r] == 0 {
+                assert!(draws.row(r).iter().all(|v| *v == 0.0), "{name} row {r}: an unscored row's draw");
+                continue;
+            }
+            let gap = |c: usize| (0..width).map(|j| (mean[[r, j]] - draws[[r, j]] - embedding[[c, j]]).powi(2)).sum::<f64>();
+            let label = (0..classes).min_by(|a, b| gap(*a).total_cmp(&gap(*b))).expect("a class");
+            for j in 0..width {
+                let exact = mean[[r, j]] - embedding[[label, j]];
+                let band = if device.float64() { 0.0 } else { exact.abs() / 16_777_216.0 };
+                assert!((draws[[r, j]] - exact).abs() <= band, "{name} row {r}: draw {} against {exact} less class {label}", draws[[r, j]]);
+            }
+            counts[label] += 1;
+        }
+        let scored = flags.iter().filter(|f| **f != 0).count() as f64;
+        for (set, members) in &sets {
+            let p: f64 = (0..classes).filter(|c| members[*c]).map(|c| q[c]).sum();
+            let n = (0..classes).filter(|c| members[*c]).map(|c| counts[c]).sum::<usize>() as f64;
+            let error = (scored * p * (1.0 - p)).sqrt();
+            assert!((n - scored * p).abs() <= 5.0 * error + 1.0, "{name}: {set} drawn {n} times against {} (standard error {error})", scored * p);
+        }
+    }
+}
+
 fn down(device: &Device, t: &Tensor) -> Array2<f64> {
     device.download(t).expect("download")
 }

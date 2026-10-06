@@ -894,7 +894,7 @@ impl<'a> Library<'a> {
         drop(full);
         let score = |trace: &DeviceTrace, copies: usize, target: &Target| -> Result<Vec<f64>, String> {
             let selected = self.model.gather_rows(trace.value(hidden)?, &selection(copies)?).map_err(error)?;
-            Ok(resident.score(self.model, &selected, target, false, arithmetic)?.0)
+            Ok(resident.score(self.model, &selected, target, false, None, arithmetic)?.0)
         };
         let base = score(&self.program.forward(&family)?, 1, &target)?;
         let pass = self.pass(&refs)?;

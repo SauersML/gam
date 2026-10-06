@@ -406,24 +406,34 @@ impl ResidentHead {
                 .map_err(error)?,
         })
     }
-    /// Per-row compact KL; with `gradient`, the hidden seed. Logit and seed products run in
-    /// `arithmetic`.
+    /// Per-row compact KL; with `gradient`, the hidden seed; with `draw` as well (one uniform per
+    /// row), the hidden cotangent of `−log q_y` for a label `y` drawn per row from `P`'s softmax `q`
+    /// with its uniform, `Σ_c q_c e_c − e_y`, made from the seed's own products
+    /// ([`Device::head_log_partition_drawn`]). Logit and seed products run in `arithmetic`.
     pub fn score(
         &self,
         d: &Device,
         hidden: &Tensor,
         target: &Target,
         gradient: bool,
+        draw: Option<&[f64]>,
         arithmetic: Arithmetic,
-    ) -> Result<(Vec<f64>, Option<Tensor>), String> {
+    ) -> Result<(Vec<f64>, Option<Tensor>, Option<Tensor>), String> {
+        if draw.is_some_and(|u| !gradient || u.len() != hidden.rows()) {
+            return Err("a drawn label needs the gradient and one uniform per row".into());
+        }
         if hidden.storage() == Storage::F32 {
-            return self.swept(d, hidden, target, gradient, arithmetic);
+            return self.swept(d, hidden, target, gradient, draw, arithmetic);
         }
         let mut losses = Vec::with_capacity(hidden.rows());
         let mut seed = if gradient {
             Some(d.zeros(hidden.rows(), hidden.cols()).map_err(error)?)
         } else {
             None
+        };
+        let mut draws = match draw {
+            Some(_) => Some(d.empty(hidden.rows(), hidden.cols()).map_err(error)?),
+            None => None,
         };
         for start in (0..hidden.rows()).step_by(self.tile_rows) {
             let n = self.tile_rows.min(hidden.rows() - start);
@@ -497,12 +507,19 @@ impl ResidentHead {
                     arithmetic,
                 )
                 .map_err(error)?;
+                if let (Some(draws), Some(uniforms)) = (draws.as_mut(), draw) {
+                    let uniforms = d.upload_vec(n, 1, uniforms[start..start + n].to_vec()).map_err(error)?;
+                    let drawn = d
+                        .sampled_head_cotangent(&q, &projected, &self.embedding, false, &uniforms, flags.as_ref())
+                        .map_err(error)?;
+                    d.set_rows(draws, start, &drawn).map_err(error)?;
+                }
                 d.axpy(&mut projected, -1., &mu).map_err(error)?;
                 // Target creation masks BOTH p and q, so unscored projected seeds are zero.
                 d.set_rows(seed, start, &projected).map_err(error)?;
             }
         }
-        Ok((losses, seed))
+        Ok((losses, seed, draws))
     }
     /// [`Self::score`] in f32 storage: the vocabulary is swept without forming the logits
     /// ([`Device::head_log_partition`]), which also returns the seed's `E^T q`.
@@ -512,8 +529,9 @@ impl ResidentHead {
         hidden: &Tensor,
         target: &Target,
         gradient: bool,
+        draw: Option<&[f64]>,
         arithmetic: Arithmetic,
-    ) -> Result<(Vec<f64>, Option<Tensor>), String> {
+    ) -> Result<(Vec<f64>, Option<Tensor>, Option<Tensor>), String> {
         let flags = target
             .scored
             .as_ref()
@@ -525,16 +543,35 @@ impl ResidentHead {
         } else {
             None
         };
-        let partitions = d
-            .head_log_partition(
-                hidden,
-                &self.embedding,
-                false,
-                flags.as_ref(),
-                seed.as_mut(),
-                arithmetic,
-            )
-            .map_err(error)?;
+        let mut draws = None;
+        let partitions = match (draw, seed.as_mut()) {
+            (Some(uniforms), Some(seed)) => {
+                let uniforms = d.upload_vec(uniforms.len(), 1, uniforms.to_vec()).map_err(error)?;
+                let mut out = d.empty(hidden.rows(), hidden.cols()).map_err(error)?;
+                let partitions = d
+                    .head_log_partition_drawn(
+                        hidden,
+                        (&self.embedding, false),
+                        flags.as_ref(),
+                        seed,
+                        (&uniforms, &mut out),
+                        arithmetic,
+                    )
+                    .map_err(error)?;
+                draws = Some(out);
+                partitions
+            }
+            (_, seed) => d
+                .head_log_partition(
+                    hidden,
+                    &self.embedding,
+                    false,
+                    flags.as_ref(),
+                    seed,
+                    arithmetic,
+                )
+                .map_err(error)?,
+        };
         let dots = d
             .download(
                 &d.block_products(hidden, &target.mu, &self.width)
@@ -559,7 +596,7 @@ impl ResidentHead {
             // Unscored rows of both E^T q and mu are zero.
             d.axpy(seed, -1., &target.mu).map_err(error)?;
         }
-        Ok((losses, seed))
+        Ok((losses, seed, draws))
     }
 }
 

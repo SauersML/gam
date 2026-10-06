@@ -3410,8 +3410,8 @@ mod tests {
         let target = Teacher::new(&device, &native, 16, 1 << 26).unwrap().target(&family, None).unwrap();
         let prefix = crate::device_program::DeviceProgram::compile_values(&device, &head.prefix(&changed)).unwrap();
         let trace = prefix.forward(&family).unwrap();
-        let (compact, _) =
-            ResidentHead::new(&device, &head, 16).unwrap().score(&device, trace.value(prefix.hidden()).unwrap(), &target, false, Arithmetic::F64).unwrap();
+        let (compact, _, _) =
+            ResidentHead::new(&device, &head, 16).unwrap().score(&device, trace.value(prefix.hidden()).unwrap(), &target, false, None, Arithmetic::F64).unwrap();
         assert_eq!(compact.len(), full.len());
         assert!(full.iter().sum::<f64>() > 1e-3, "the scaled MLP moves the distributions");
         for (row, (a, b)) in compact.iter().zip(&full).enumerate() {

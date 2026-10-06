@@ -1719,11 +1719,52 @@ impl Device {
         expected: Option<&mut Tensor>,
         arithmetic: Arithmetic,
     ) -> Result<Vec<f64>, GpuError> {
+        self.head_sweep(hidden, (head, transposed), scored, expected, None, arithmetic)
+    }
+
+    /// [`Device::head_log_partition`] (the head and whether it is transposed as one argument)
+    /// with `expected`, drawing as well one label `y_r` per row from the row's softmax `q_r` with
+    /// its uniform `uniforms[r]` (rows × 1), and writing into `draws` (rows × width)
+    /// `Σ_c q_rc e_c − e_{y_r}`, the gradient of `−log q_{y_r}` in `hidden_r`, from the same
+    /// products (zero on an unscored row). The host and the Apple GPU draw by the inverse
+    /// distribution function in class order ([`Device::sampled_head_cotangent`]). CUDA f32 storage
+    /// never holds a row's whole softmax, so it draws in two stages: in each swept chunk a candidate
+    /// class with probability proportional to its exponential (by a uniform derived from the row's
+    /// and the chunk), and after the sweep one chunk with probability proportional to its share of
+    /// the partition (by the row's uniform), whose candidate is the label; each class is then drawn
+    /// with its softmax probability. The head is f32 or float64, as the hidden rows are.
+    pub fn head_log_partition_drawn(
+        &self,
+        hidden: &Tensor,
+        head: (&Tensor, bool),
+        scored: Option<&Indices>,
+        expected: &mut Tensor,
+        draw: (&Tensor, &mut Tensor),
+        arithmetic: Arithmetic,
+    ) -> Result<Vec<f64>, GpuError> {
+        self.head_sweep(hidden, head, scored, Some(expected), Some(draw), arithmetic)
+    }
+
+    /// [`Device::head_log_partition`] and [`Device::head_log_partition_drawn`].
+    fn head_sweep(
+        &self,
+        hidden: &Tensor,
+        (head, transposed): (&Tensor, bool),
+        scored: Option<&Indices>,
+        expected: Option<&mut Tensor>,
+        draw: Option<(&Tensor, &mut Tensor)>,
+        arithmetic: Arithmetic,
+    ) -> Result<Vec<f64>, GpuError> {
         let (rows, width) = hidden.dim();
         let classes = if transposed { head.cols } else { head.rows };
         let head_width = if transposed { head.rows } else { head.cols };
         if head_width != width || classes == 0 || scored.is_some_and(|s| s.len != rows) || expected.as_ref().is_some_and(|e| e.dim() != (rows, width)) {
             return Err(shape(format!("a {:?} head (transposed {transposed}) on {:?} rows", head.dim(), hidden.dim())));
+        }
+        if let Some((uniforms, draws)) = &draw {
+            if uniforms.dim() != (rows, 1) || draws.dim() != (rows, width) || expected.is_none() {
+                return Err(shape(format!("{:?} uniforms and {:?} draws for {:?} rows", uniforms.dim(), draws.dim(), hidden.dim())));
+            }
         }
         if rows == 0 {
             return Ok(Vec::new());
@@ -1731,12 +1772,12 @@ impl Device {
         match &*self.backend {
             Backend::Host => {
                 let flags = scored.map(host_indices).transpose()?;
-                self.head_log_partition_tiled(hidden, head, transposed, flags, expected, arithmetic)
+                self.head_log_partition_tiled(hidden, (head, transposed), flags, expected, draw, arithmetic)
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) if hidden.storage() == Storage::F32 => {
                 let chunk = swept_chunk(rows);
-                engine.head_log_partition(hidden, (head, transposed), scored, expected, (chunk, arithmetic))
+                engine.head_log_partition(hidden, (head, transposed), scored, (expected, draw), (chunk, arithmetic))
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(_) => {
@@ -1746,6 +1787,9 @@ impl Device {
                 let stats = self.softmax_stats_rows(&mut logits, scored)?;
                 if let Some(out) = expected {
                     self.gemm(out, 1.0, &logits, Op::N, head, back, 0.0, arithmetic)?;
+                    if let Some((uniforms, draws)) = draw {
+                        *draws = self.sampled_head_cotangent(&logits, out, head, transposed, uniforms, scored)?;
+                    }
                 }
                 Ok(stats.iter().map(|s| s[0]).collect())
             }
@@ -1756,21 +1800,21 @@ impl Device {
                     _ => Err(foreign()),
                 });
                 let flags = flags.transpose()?;
-                self.head_log_partition_tiled(hidden, head, transposed, flags, expected, arithmetic)
+                self.head_log_partition_tiled(hidden, (head, transposed), flags, expected, draw, arithmetic)
             }
         }
     }
 
-    /// [`Device::head_log_partition`] in row tiles whose logits fill about 32 MB (the size of
-    /// CUDA's swept chunks), through this device's own products and softmax statistics; `flags`
+    /// [`Device::head_sweep`] in row tiles whose logits fill about 32 MB (the size of CUDA's swept
+    /// chunks), through this device's own products, softmax statistics and label draws; `flags`
     /// are the scored rows' flags.
     fn head_log_partition_tiled(
         &self,
         hidden: &Tensor,
-        head: &Tensor,
-        transposed: bool,
+        (head, transposed): (&Tensor, bool),
         flags: Option<&[u32]>,
         mut expected: Option<&mut Tensor>,
+        mut draw: Option<(&Tensor, &mut Tensor)>,
         arithmetic: Arithmetic,
     ) -> Result<Vec<f64>, GpuError> {
         let (rows, width) = hidden.dim();
@@ -1788,6 +1832,11 @@ impl Device {
             if let Some(out) = expected.as_deref_mut() {
                 let mut mean = self.zeros(n, width)?;
                 self.gemm(&mut mean, 1.0, &logits, Op::N, head, back, 0.0, arithmetic)?;
+                if let Some((uniforms, draws)) = draw.as_mut() {
+                    let uniforms = self.rows_of(uniforms, start, n)?;
+                    let drawn = self.sampled_head_cotangent(&logits, &mean, head, transposed, &uniforms, part.as_ref())?;
+                    self.set_rows(draws, start, &drawn)?;
+                }
                 self.set_rows(out, start, &mean)?;
             }
             partitions.extend(stats.iter().map(|s| s[0]));
@@ -1821,7 +1870,7 @@ impl Device {
                     return Err(shape(format!("a {:?} head (transposed {transposed}) on {:?} rows", head.dim(), hidden.dim())));
                 }
                 let chunk = swept_chunk(hidden.rows);
-                engine.head_log_partition_into(hidden, (head, transposed), scored, expected, out, (chunk, arithmetic))
+                engine.head_log_partition_into(hidden, (head, transposed), scored, (expected, None), out, (chunk, arithmetic))
             }
             _ => {
                 let values = self.head_log_partition(hidden, head, transposed, scored, expected, arithmetic)?;
@@ -6155,24 +6204,26 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
             hidden: &Tensor,
             head: (&Tensor, bool),
             scored: Option<&Indices>,
-            expected: Option<&mut Tensor>,
+            outputs: (Option<&mut Tensor>, Option<(&Tensor, &mut Tensor)>),
             settings: (usize, Arithmetic),
         ) -> Result<Vec<f64>, GpuError> {
             let mut out = self.zeros(hidden.rows)?;
-            self.head_log_partition_into(hidden, head, scored, expected, &mut out, settings)?;
+            self.head_log_partition_into(hidden, head, scored, outputs, &mut out, settings)?;
             let mut values = self.download(&out)?;
             values.truncate(hidden.rows);
             Ok(values)
         }
 
         /// The swept log partitions into `out` (one double per row), left on the device: no
-        /// host transfer, so a captured step can record it.
+        /// host transfer, so a captured step can record it. With a draw (its uniforms and its
+        /// output), each chunk's launch of `head_chunk` also draws each row's candidate there, and
+        /// `head_draw` picks among them after the sweep (`Device::head_log_partition_drawn`).
         pub(super) fn head_log_partition_into(
             &self,
             hidden: &Tensor,
             (head, transposed): (&Tensor, bool),
             scored: Option<&Indices>,
-            mut expected: Option<&mut Tensor>,
+            (mut expected, draw): (Option<&mut Tensor>, Option<(&Tensor, &mut Tensor)>),
             out: &mut CudaSlice<f64>,
             (chunk, arithmetic): (usize, Arithmetic),
         ) -> Result<(), GpuError> {
@@ -6193,6 +6244,21 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
                 None => Factor::Single(slice32(hidden)?),
             };
             let chunk = chunk.clamp(1, classes.max(1));
+            let chunks = classes.div_ceil(chunk);
+            // A draw's candidate and log mass per row and chunk.
+            let cells = if draw.is_some() { rows * chunks } else { 1 };
+            // SAFETY: with a draw, each chunk's launch writes its column of both before `head_draw`
+            // reads them; without one, no kernel touches them.
+            let mut candidates = unsafe { self.stream.alloc::<u32>(cells) }.gpu_ctx("tensor alloc")?;
+            // SAFETY: as `candidates`.
+            let mut masses = unsafe { self.stream.alloc::<f64>(cells) }.gpu_ctx("tensor alloc")?;
+            // SAFETY: read only with a draw, which passes its own uniforms instead.
+            let no_uniforms = unsafe { self.stream.alloc::<f32>(1) }.gpu_ctx("tensor alloc")?;
+            let uniforms = match &draw {
+                Some((u, _)) => slice32(*u)?,
+                None => &no_uniforms,
+            };
+            let (drawn, chunks32) = (i32::from(draw.is_some()), chunks as u32);
             let mut logits = self.zeros32(rows * chunk)?;
             let mut largest = self.zeros32(rows)?;
             let (n_rows, lowest) = (rows as u64, f64::NEG_INFINITY);
@@ -6225,11 +6291,13 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
                     1,
                     (0, 0, 0),
                 )?;
-                let count32 = count as u32;
-                // SAFETY: one block per row of the rows × count logits; per-row state of length rows.
+                let (count32, start32, index32) = (count as u32, start as u32, index as u32);
+                // SAFETY: one block per row of the rows × count logits; per-row state of length rows;
+                // with a draw, rows × chunks candidates and masses and one uniform per row.
                 unsafe {
                     self.stream.launch_builder(&chunk_kernel).arg(&rows32).arg(&count32).arg(&mut logits).arg(&mut largest)
-                        .arg(&mut sums).arg(&mut factor).arg(&want).launch(cfg_rows(rows))
+                        .arg(&mut sums).arg(&mut factor).arg(&want).arg(uniforms).arg(&start32).arg(&index32).arg(&chunks32)
+                        .arg(&mut candidates).arg(&mut masses).arg(&drawn).launch(cfg_rows(rows))
                 }
                 .gpu_ctx("tensor head_chunk")?;
                 if let Some(out) = expected.as_deref_mut() {
@@ -6271,10 +6339,22 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
             // SAFETY: per-row state of length rows; `mean` is rows × width when `want`.
             unsafe {
                 self.stream.launch_builder(&finish).arg(&rows32).arg(&width32).arg(&largest).arg(&sums).arg(flags).arg(&use_flags)
-                    .arg(&want).arg(mean).arg(out).launch(cfg_rows(rows))
+                    .arg(&want).arg(&mut *mean).arg(out).launch(cfg_rows(rows))
             }
-            .gpu_ctx("tensor head_finish")
-            .map(|_| ())
+            .gpu_ctx("tensor head_finish")?;
+            if let Some((_, draws)) = draw {
+                let pick = self.kernel("head_draw", Storage::F32)?;
+                let (classes32, transposed32) = (classes as u32, i32::from(transposed));
+                // SAFETY: rows × chunks candidates and masses, all written by the sweep; `mean` and
+                // `draws` are rows × width, the head classes × width (or transposed), f32.
+                unsafe {
+                    self.stream.launch_builder(&pick).arg(&rows32).arg(&chunks32).arg(&classes32).arg(&width32).arg(uniforms)
+                        .arg(&candidates).arg(&masses).arg(flags).arg(&use_flags).arg(&*mean).arg(slice32(head)?).arg(&transposed32)
+                        .arg(slice32_mut(draws)?).launch(cfg_rows(rows))
+                }
+                .gpu_ctx("tensor head_draw")?;
+            }
+            Ok(())
         }
     }
 }
