@@ -194,6 +194,19 @@ fn mlp_law(rule: &Rule, gate: usize) -> Result<Law, String> {
     Ok(law)
 }
 
+/// The layer of a call named `library.l{layer}.call{c}`.
+fn site_layer(call: &str) -> Result<usize, String> {
+    call.strip_prefix("library.l").and_then(|r| r.split_once('.')).and_then(|(l, _)| l.parse().ok()).ok_or_else(|| format!("{call} is not a call's name"))
+}
+
+/// The node an MLP rule's gate reads: the MLP's input.
+fn mlp_input(rule: &Rule, gate: usize) -> Result<usize, String> {
+    match &rule.nodes[applying(rule, gate)?] {
+        Node::Affine { terms, .. } => Ok(terms[0].0),
+        other => Err(format!("{}: its gate node is {other:?}", rule.name)),
+    }
+}
+
 /// The next body number: one past the largest `i` of a rule `library.body{i}`.
 fn next_body(program: &OperatorProgram) -> usize {
     program.rules.iter().filter_map(|r| r.name.strip_prefix("library.body")?.parse::<usize>().ok()).map(|i| i + 1).max().unwrap_or(0)
@@ -2143,12 +2156,11 @@ pub fn edit_native(explanation: &Explanation, owner: &crate::artifact::Owner, de
     };
     let mut gate_values = gate.clone();
     let mut out_values = out_map.clone();
-    let (mut read_values, mut write_values) = (program.operators[read].matrix(), program.operators[write].matrix());
+    let mut write_values = program.operators[write].matrix();
     match owner.role.as_str() {
         "gate" | "up" => {
             gate_values = widen(&gate, owner.role == "gate");
             up = up.map(|u| widen(&u, owner.role == "up"));
-            read_values = ndarray::concatenate(Axis(0), &[read_values.view(), delta.view()]).map_err(error)?;
         }
         "out" => {
             let mut wider = Array2::zeros((k_out + 1, m));
@@ -2173,7 +2185,10 @@ pub fn edit_native(explanation: &Explanation, owner: &crate::artifact::Owner, de
     let up = up.map(|u| dense(format!("{copy}.up"), h.clone(), z.clone(), u, provenance.clone())).transpose()?.map(|op| index(&mut added, op));
     let up_bias = up_bias.map(|b| dense(format!("{copy}.up_bias"), h.clone(), Interface::constant(), b, provenance.clone())).transpose()?.map(|op| index(&mut added, op));
     let out_op = index(&mut added, dense(format!("{copy}.out"), y.clone(), h, out_values, provenance.clone())?);
-    let read_op = index(&mut added, dense(format!("{}.read_edited", owner.site), z.clone(), program.operators[read].cols.clone(), read_values, provenance.clone())?);
+    // The edit's input coordinate reads the MLP's input directly (whatever the call's read binding
+    // reads through), labelled after the call's own coordinates.
+    let stream = program.operators[operator_index(program, &format!("library.l{}.mlp.gate", site_layer(&owner.site)?))?].cols.clone();
+    let edit_read = if wider_in { Some(index(&mut added, dense(format!("{}.read_edit", owner.site), Interface::uniform(1, 1, LabelKind::Unit, k as u32).map_err(error)?, stream, delta.clone(), provenance.clone())?)) } else { None };
     let write_op = index(&mut added, dense(format!("{}.write_edited", owner.site), program.operators[write].rows.clone(), y, write_values, provenance)?);
     program.operators.extend(added.into_iter().map(Arc::new));
     let law = match &program.rules[body_rule].nodes[2] {
@@ -2187,21 +2202,44 @@ pub fn edit_native(explanation: &Explanation, owner: &crate::artifact::Owner, de
     }
     nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, out_op)], bias: None });
     insert_first_rule(program, Rule { name: copy, inputs: vec![z], output: nodes.len() - 1, nodes });
-    // The call reads, applies and writes through the copy; its rule moved down by one.
+    // The call applies the copy and writes through the edited write binding; for a read edit it
+    // reads `[z, Δ · x]`, the two nodes placed before it. Its rule moved down by one.
+    let (ops, bases, rules): (Vec<usize>, Vec<usize>, Vec<usize>) = ((0..program.operators.len()).collect(), (0..program.bases.len()).collect(), (0..program.rules.len()).collect());
+    let mlp_gate = operator_index(program, &format!("library.l{}.mlp.gate", site_layer(&owner.site)?))?;
     let rule = &mut program.rules[site.rule + 1];
-    let z_node = match &rule.nodes[site.node] {
-        Node::Call { arguments, .. } => *arguments.first().ok_or("a call without an argument")?,
-        other => return Err(format!("{}: node {} is {other:?}", rule.name, site.node)),
-    };
-    if let Node::Affine { terms, .. } = &mut rule.nodes[z_node] {
-        terms[0].1 = read_op;
+    let input = mlp_input(rule, mlp_gate)?;
+    let mut call = site.node;
+    if let Some(edit_read) = edit_read {
+        let z_node = match &rule.nodes[call] {
+            Node::Call { arguments, .. } => *arguments.first().ok_or("a call without an argument")?,
+            other => return Err(format!("{}: node {call} is {other:?}", rule.name)),
+        };
+        let map: Vec<usize> = (0..rule.nodes.len()).map(|n| if n < call { n } else { n + 2 }).collect();
+        let mut nodes = Vec::with_capacity(rule.nodes.len() + 2);
+        for (n, node) in rule.nodes.iter().enumerate() {
+            if n == call {
+                nodes.push(Node::Affine { terms: vec![(input, edit_read)], bias: None });
+                nodes.push(Node::Concat { parts: vec![z_node, call] });
+            }
+            let mut node = node.clone();
+            remap_node(&mut node, &map, &ops, &bases, &rules);
+            if n == call
+                && let Node::Call { arguments, .. } = &mut node
+            {
+                arguments[0] = call + 1;
+            }
+            nodes.push(node);
+        }
+        rule.nodes = nodes;
+        rule.output = map[rule.output];
+        call += 2;
     }
-    if let Node::Call { rule: called, .. } = &mut rule.nodes[site.node] {
+    if let Node::Call { rule: called, .. } = &mut rule.nodes[call] {
         *called = 0;
     }
     let output = rule.output;
     if let Node::Affine { terms, .. } = &mut rule.nodes[output]
-        && let Some(term) = terms.iter_mut().find(|t| t.0 == site.node)
+        && let Some(term) = terms.iter_mut().find(|t| t.0 == call)
     {
         term.1 = write_op;
     }

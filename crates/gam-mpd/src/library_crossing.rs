@@ -294,5 +294,18 @@ mod tests {
         }
         let subset = crate::codec::subset_code_len_bits(all.len(), 1).unwrap() as f64 * std::f64::consts::LN_2;
         assert!((through.fixed_nats - rewritten.fixed_nats - subset).abs() < 1e-12);
+        // A native edit of a gate row read through the head (in any direction, also outside the
+        // head's writes) is the native library's edit.
+        let owner = through.artifact.owners.iter().find(|o| o.site == call.name && o.role == "gate" && o.native_rows == (5..6)).unwrap().clone();
+        let delta = Array2::from_shape_fn((1, owner.native_cols.len()), |_| rng.random::<f64>() - 0.5);
+        let edited = crate::library_bodies::edit_native(&through, &owner, &delta).unwrap();
+        let mut reference = start.clone();
+        let program = &mut reference.artifact.program;
+        let mut values = program.operators[gate].matrix();
+        values.row_mut(5).scaled_add(1.0, &delta.row(0));
+        let source = Arc::clone(&program.operators[gate]);
+        program.operators[gate] = Arc::new(dense(source.name.clone(), source.rows.clone(), source.cols.clone(), values, source.provenance.clone()).unwrap());
+        let (a, b) = (outputs(&reference), outputs(&edited));
+        assert!(a.iter().zip(&b).all(|(x, y)| (x - y).abs() <= 1e-9 * scale), "the edit is the native edit");
     }
 }
