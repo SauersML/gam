@@ -3954,24 +3954,43 @@ extern "C" __global__ void reparameterize_bf16(u64 n, u64 cols, u64 stride, u64 
 // columns, its output's row stride, its stream, and its first entry in the launch's numbering (the
 // samples' entries one after another, `total` in all). Launch entry g is entry g − first of the
 // last sample whose first entry is at most g, written as its own launch writes it.
-__device__ const unsigned long long* sample_of_entry(u64 samples, const u64* table, u64 g) {
+__device__ u64 sample_at(u64 samples, const u64* table, u64 g) {
     u64 lo = 0, hi = samples;
     while (hi - lo > 1) {
         u64 mid = (lo + hi) / 2;
         if (table[8 * mid + 6] <= g) lo = mid; else hi = mid;
     }
-    return table + 8 * lo;
+    return lo;
+}
+
+// Runs `body(job, i)` on every entry of the launch, `job` its sample's eight words and `i` its entry
+// in the sample: a block's consecutive entries per pass, the sample of its first found once
+// (`sample_at`, thread 0) and each thread's from there forward, since a block's entries span one
+// sample or a few (a search per entry made the launch three times its memory time).
+template <typename F>
+__device__ void each_sample_entry(u64 samples, const u64* table, u64 total, F body) {
+    __shared__ u64 first;
+    for (u64 base = (u64)blockIdx.x * blockDim.x; base < total; base += (u64)gridDim.x * blockDim.x) {
+        if (threadIdx.x == 0) first = sample_at(samples, table, base);
+        __syncthreads();
+        u64 g = base + threadIdx.x;
+        if (g < total) {
+            u64 j = first;
+            while (j + 1 < samples && table[8 * (j + 1) + 6] <= g) j++;
+            body(table + 8 * j, g - table[8 * j + 6]);
+        }
+        __syncthreads();
+    }
 }
 
 template <typename T>
 __device__ void reparameterize_many_body(u64 samples, const u64* table, u64 total, u64 key) {
-    GRID_STRIDE(g, total) {
-        const u64* job = sample_of_entry(samples, table, g);
-        u64 i = g - job[6], cols = job[3];
+    each_sample_entry(samples, table, total, [&](const u64* job, u64 i) {
+        u64 cols = job[3];
         const T* mean = (const T*)job[1];
         const T* log_sd = (const T*)job[2];
         ((T*)job[0])[(i / cols) * job[4] + i % cols] = mean[i] + entry_exp(log_sd[i]) * (T)posterior_normal(key, job[5], i);
-    }
+    });
 }
 
 extern "C" __global__ void reparameterize_many_f64(u64 samples, const u64* table, u64 total, u64 key) {
@@ -3983,13 +4002,12 @@ extern "C" __global__ void reparameterize_many_f32(u64 samples, const u64* table
 }
 
 extern "C" __global__ void reparameterize_many_bf16(u64 samples, const u64* table, u64 total, u64 key) {
-    GRID_STRIDE(g, total) {
-        const u64* job = sample_of_entry(samples, table, g);
-        u64 i = g - job[6], cols = job[3];
+    each_sample_entry(samples, table, total, [&](const u64* job, u64 i) {
+        u64 cols = job[3];
         const float* mean = (const float*)job[1];
         const float* log_sd = (const float*)job[2];
         ((unsigned short*)job[0])[(i / cols) * job[4] + i % cols] = bf16_round(mean[i] + expf(log_sd[i]) * posterior_normal(key, job[5], i));
-    }
+    });
 }
 
 // Adds a live entry's (1, μ² + σ², 2s) to its group's row of `sums`: once per warp when every live
