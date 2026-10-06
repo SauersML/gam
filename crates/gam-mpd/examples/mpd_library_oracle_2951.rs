@@ -35,7 +35,7 @@
 //! context: path patches, `Library::path_patched`, of its two strongest measured upstream
 //! neighbours and of its weakest measured proposal: the change of B's activity at p, and of the
 //! next-token distribution there). `functions.safetensors` holds the functions' maps
-//! (`Library::maps`).
+//! (`Library::maps`), an MLP site's also as VPD's `{site}.U` and `{site}.V`.
 //!
 //! EXPORT SETTINGS.json OUT_DIR [ARTIFACT]
 //!
@@ -331,6 +331,15 @@ fn main() -> Result<(), String> {
     save(&out.join("contexts.safetensors"), [("rows".into(), i64s(vec![pool.len()], (settings.pool[0]..settings.pool[1]).map(|r| r as i64))), ("tokens".into(), i32s(vec![pool.len(), t], pool.iter().flatten().map(|v| i64::from(*v))))].into())?;
     let mut maps = BTreeMap::new();
     for (name, shape, values) in library.maps() {
+        // An MLP function's read and write vectors also under VPD's names: `{site}.V` (width ×
+        // functions, its gate directions as columns) and `{site}.U` (functions × width, its writes).
+        if let Some(site) = name.strip_suffix(".gate") {
+            let (c, d) = (shape[0], shape[1]);
+            maps.insert(format!("{site}.V"), f32s(vec![d, c], (0..d * c).map(|x| values[(x % c) * d + x / c])));
+        }
+        if let Some(site) = name.strip_suffix(".write") {
+            maps.insert(format!("{site}.U"), f32s(shape.clone(), values.iter().copied()));
+        }
         maps.insert(name, f32s(shape, values));
     }
     save(&out.join("functions.safetensors"), maps)?;
