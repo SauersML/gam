@@ -2792,11 +2792,34 @@ impl DeviceProgram {
     /// tangent reaches it. Products run in `arithmetic`.
     pub fn jvp(&self, trace: &DeviceTrace, tangents: &BTreeMap<usize, Array2<f64>>, arithmetic: Arithmetic) -> Result<Option<Tensor>, String> {
         self.linear_operator()?;
+        self.jvp_span(trace, None, self.head.hidden, tangents, arithmetic, |_, _, _| Ok(()))
+    }
+
+    /// [`Self::jvp`] of a span's trace ([`Self::forward_span`]) to node `end`, from the stream
+    /// `entry` entering it with that stream's tangent (none from the program's start); `hook(node,
+    /// t, dv)` may change each node's tangent `t` after its rule (an edit's tangent), reading the
+    /// tangents `dv` of the nodes before it.
+    pub fn jvp_span(
+        &self,
+        trace: &DeviceTrace,
+        entry: Option<(usize, Tensor)>,
+        end: usize,
+        tangents: &BTreeMap<usize, Array2<f64>>,
+        arithmetic: Arithmetic,
+        mut hook: impl FnMut(usize, &mut Option<Tensor>, &[Option<Tensor>]) -> Result<(), String>,
+    ) -> Result<Option<Tensor>, String> {
         let d = &self.device;
         let rows = trace.rows;
         let upload = |m: &Array2<f64>| d.upload(m.view()).map_err(error);
         let mut dv: Vec<Option<Tensor>> = (0..self.steps.len()).map(|_| None).collect();
-        for index in 0..=self.head.hidden {
+        let start = match entry {
+            Some((node, tangent)) => {
+                dv[node] = Some(tangent);
+                node + 1
+            }
+            None => 0,
+        };
+        for index in start..=end {
             let width = self.widths[index];
             let t = match &self.steps[index] {
                 Step::Concat { .. } | Step::Readout { .. } => return Err("device: resident Concat/readout derivatives are unsupported".into()),
@@ -2889,9 +2912,11 @@ impl DeviceProgram {
                     }
                 }
             };
+            let mut t = t;
+            hook(index, &mut t, &dv)?;
             dv[index] = t;
         }
-        Ok(dv[self.head.hidden].take())
+        Ok(dv[end].take())
     }
 
     fn attend_tangent(

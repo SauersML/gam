@@ -159,6 +159,27 @@ impl<'a> Model<'a> {
     fn end(&self, b: usize) -> usize {
         if b + 1 < self.blocks() { self.entry(b + 1) } else { self.program.hidden() }
     }
+
+    /// The forward tangent of block `block` on rows `ranges` of the stream's tangent
+    /// `stream` (replaced by the tangent of the stream after the block), from its forward's
+    /// `tape`, with each operator in `tangents` moving along its entry and `edits`' tangents
+    /// ([`Edits::tangent`]); the exact directional derivative the reverse pass is the transpose of.
+    #[cfg(test)]
+    pub(crate) fn tangent(&self, block: usize, tape: &DeviceTrace, stream: &mut Tensor, ranges: &[Range<usize>], edits: Option<&Edits>, tangents: &BTreeMap<usize, ndarray::Array2<f64>>) -> Result<(), String> {
+        let d = self.program.device();
+        let rows: usize = ranges.iter().map(ExactSizeIterator::len).sum();
+        let entry = if block == 0 { None } else { Some((self.entry(block), gather(d, stream, ranges)?)) };
+        let widths = self.program.widths();
+        let out = self.program.jvp_span(tape, entry, self.end(block), tangents, self.program.arithmetic(), |n, t, dv| match edits {
+            Some(edits) => edits.tangent(d, n, t, dv, (rows, widths[n])),
+            None => Ok(()),
+        })?;
+        let out = match out {
+            Some(t) => t,
+            None => d.zeros(rows, stream.cols()).map_err(error)?,
+        };
+        scatter(d, stream, ranges, &out)
+    }
 }
 
 /// The flat program of `artifact` (`mapped_inlined`), and per block (each layer's attention, then
@@ -426,7 +447,6 @@ impl Norm {
     }
 
     /// The tangent of `N(s)` along `ds`: `γ ⊙ (r ds + s dr)`, `dr = −r³ (s·ds)/d`.
-    #[cfg(test)]
     pub(crate) fn tangent(&self, s: &[f64], ds: &[f64]) -> Vec<f64> {
         let r = self.scale(s);
         let dr = -r * r * r * s.iter().zip(ds).map(|(a, b)| a * b).sum::<f64>() / s.len() as f64;
@@ -486,6 +506,8 @@ struct Cuts {
 pub(crate) struct Record {
     activations: [f64; 2],
     carried: std::collections::VecDeque<f64>,
+    /// The activations' tangents in a forward tangent pass ([`Edits::tangent`]).
+    tangents: [f64; 2],
 }
 
 pub(crate) type Records = std::rc::Rc<RefCell<BTreeMap<usize, Record>>>;
@@ -1257,6 +1279,77 @@ impl Edits {
             d.hadamard(&mut out, &h, keep.as_ref().unwrap_or(&p.keep), false).map_err(error)?;
             d.hadamard(&mut out, from.as_ref().unwrap_or(&sources), take.as_ref().unwrap_or(&p.take), true).map_err(error)?;
             d.scatter_ranges(value, &rows, &out).map_err(error)?;
+        }
+        Ok(())
+    }
+
+    /// The tangent of node `node` (`t`, `None` for zero; `shape` its rows and width) under the
+    /// call's edits, from the tangents `dv` of the nodes before it and the forward's state: the
+    /// masks applied to it; each write's `s 1[g·x + c > 0] (g·dx) u` at its row, `dx` the read's
+    /// tangent at the row it reads; a probe's activation tangent `1[a > 0] g·dx` recorded; a cut's
+    /// `(1[pre′ > 0] g_B·N′(y)(ds + (da′ − da) u_A) − 1[pre > 0] g_B·N′(s) ds) u_B` at its row.
+    pub fn tangent(&self, d: &Device, node: usize, t: &mut Option<Tensor>, dv: &[Option<Tensor>], (rows, width): (usize, usize)) -> Result<(), String> {
+        if let Some(value) = t.as_mut() {
+            self.apply(d, node, value)?;
+        }
+        let row_of = |n: usize, at: &[usize]| -> Result<Option<ndarray::Array2<f64>>, String> {
+            match dv.get(n).and_then(Option::as_ref) {
+                Some(x) => Ok(Some(d.download(&d.gather_ranges(x, &single(at.iter().copied())).map_err(error)?).map_err(error)?)),
+                None => Ok(None),
+            }
+        };
+        if let Some(c) = self.cuts.get(&node) {
+            let recorded = self.recorded.as_ref().ok_or_else(|| error("a cut connection outside a plan"))?;
+            let at: Vec<usize> = c.probes.iter().map(|p| p.0).collect();
+            if !at.is_empty() {
+                let dx = row_of(c.read, &at)?;
+                for (k, (_, cut, role, part)) in c.probes.iter().enumerate() {
+                    let mut records = recorded.borrow_mut();
+                    let record = records.entry(*cut).or_default();
+                    record.tangents[*role] = match &dx {
+                        Some(dx) if record.activations[*role] > 0.0 => dx.row(k).iter().zip(&self.parts[*part].read).map(|(a, b)| a * b).sum(),
+                        _ => 0.0,
+                    };
+                }
+            }
+            let at: Vec<usize> = c.cuts.iter().map(|p| p.0).collect();
+            if !at.is_empty() {
+                let norm = c.norm.as_ref().ok_or_else(|| error("a cut connection at a block whose input norm is not an RMS norm with a gain"))?;
+                let ds = row_of(norm.entry, &at)?;
+                let streams = c.streams.borrow();
+                let mut added = ndarray::Array2::zeros((at.len(), width));
+                for (k, (_, cut, from, to)) in c.cuts.iter().enumerate() {
+                    let (s, y) = streams.get(k).ok_or_else(|| error("a cut's tangent before its forward"))?;
+                    let [da, da2] = recorded.borrow().get(cut).map(|r| r.tangents).ok_or_else(|| error("a cut connection whose activations were not recorded"))?;
+                    let (from, to) = (&self.parts[*from], &self.parts[*to]);
+                    let dsk: Vec<f64> = match &ds {
+                        Some(ds) => ds.row(k).to_vec(),
+                        None => vec![0.0; s.len()],
+                    };
+                    let dy: Vec<f64> = dsk.iter().zip(&from.write).map(|(v, u)| v + (da2 - da) * u).collect();
+                    let through = |x: &[f64], dx: &[f64]| -> f64 {
+                        if activation(to, &norm.apply(x)) > 0.0 { norm.tangent(x, dx).iter().zip(&to.read).map(|(a, b)| a * b).sum() } else { 0.0 }
+                    };
+                    let change = through(y, &dy) - through(s, &dsk);
+                    added.row_mut(k).iter_mut().zip(&to.write).for_each(|(v, u)| *v = change * u);
+                }
+                let value = match t {
+                    Some(value) => value,
+                    None => t.insert(d.zeros(rows, width).map_err(error)?),
+                };
+                add_rows(d, value, &at, &added)?;
+            }
+        }
+        if let Some(w) = self.writes.get(&node)
+            && let Some(dx) = row_of(w.read, &w.from)?
+        {
+            let slopes = w.slopes.borrow();
+            let added = ndarray::Array2::from_shape_fn((w.rows.len(), width), |(i, c)| slopes[i] * dx.row(i).dot(&w.gates.row(i)) * w.outs[[i, c]]);
+            let value = match t {
+                Some(value) => value,
+                None => t.insert(d.zeros(rows, width).map_err(error)?),
+            };
+            add_rows(d, value, &w.rows, &added)?;
         }
         Ok(())
     }
@@ -3139,4 +3232,81 @@ mod tests {
             }
         }
     }
+
+    /// The forward tangents through blocks and edits ([`Model::tangent`], `run_tangent`) of a
+    /// batch with an amplification, a swap, a removal from a position on, a head's removal from a
+    /// position on and a cut connection, on the scoped starting library of the tiny Qwen3 export
+    /// (its MLPs P's, its attention M's; random parts at both MLPs): for random tangents `v` of P's
+    /// operators and a random cotangent `ḡ` of the scored rows, `⟨ḡ, J v⟩` from the tangent pass
+    /// equals `Σ ⟨∇, v⟩` from the reverse pass to 1e-10 relative (host, float64).
+    #[test]
+    fn the_reverse_pass_is_the_transpose_of_the_tangent_pass() {
+        use rand::RngExt;
+        let dir = crate::test_support::tiny_qwen3_export("interchange_tangent", 2);
+        let imported = import_language_model(&dir, 6, 12).expect("the tiny export imports");
+        std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+        let native = split_sites(&imported.program).expect("the native sites");
+        let layers = layer_nodes(&native, 2).expect("the layers");
+        let explanation = library_mdl::scoped(&library_mdl::explanation(&native, &layers).expect("the library"), &[1, 3]).expect("scoped");
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let device = Device::host();
+        let blocks: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let variables = reads(&native, &blocks).expect("the reads");
+        let mut ic = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
+        let width = ic.models().0.width();
+        let mut rng = StdRng::seed_from_u64(21);
+        let parts: Vec<Part> = [1usize, 3].iter().map(|b| Part { block: *b, index: 0, read: (0..width).map(|_| 0.2 * (rng.random::<f64>() - 0.5)).collect(), bias: 1.0, write: (0..width).map(|_| 2.0 * (rng.random::<f64>() - 0.5)).collect() }).collect();
+        ic.set_parts(parts).expect("the parts");
+        let head = ic.heads().iter().position(|(_, held)| *held).expect("a head both models hold");
+        let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
+        let e = |base: usize, source: usize, patch: Patch, position: usize| Experiment { base, source, explained: vec![true; 4], patch: Some(patch), position };
+        let experiments = vec![
+            e(0, 0, Patch::Part { part: 0, factor: 3 }, 3),
+            e(1, 2, Patch::Swap { part: 1 }, 5),
+            e(2, 2, Patch::PartFrom { part: 0, factor: 0 }, 7),
+            e(0, 0, Patch::HeadFrom { head }, 2),
+            e(1, 0, Patch::Cut { from: 0, to: 1 }, 6),
+        ];
+        let (m, p) = ic.models();
+        let (paths, bases) = paths(&batch, &experiments, p.values(), engine_parts(&p), None, 4).expect("the paths");
+        let plan = Plan::new(paths, 12);
+        let (stream, calls) = run([&p, &m], &plan, true).expect("the forward pass");
+        let rows = outputs(&plan, &bases, &experiments);
+        let scored: usize = rows.iter().map(ExactSizeIterator::len).sum();
+        let seed_values = ndarray::Array2::from_shape_fn((scored, stream.cols()), |_| rng.random::<f64>() - 0.5);
+        let seed = spread(&device, stream.rows(), &rows, &device.upload(seed_values.view()).expect("upload"), 1.0).expect("the seed");
+        let mut gradient = BTreeMap::new();
+        run_reverse([&p, &m], &plan, &calls, &mut [Pass { cotangent: device.copy(&seed).expect("copy"), gradient: &mut gradient, arithmetic: Arithmetic::F64 }]).expect("the reverse pass");
+        let tangents: BTreeMap<usize, ndarray::Array2<f64>> = explanation
+            .trainable
+            .iter()
+            .map(|op| {
+                let shape = p.program.dense(*op).expect("a dense operator").dim();
+                (*op, ndarray::Array2::from_shape_fn(shape, |_| rng.random::<f64>() - 0.5))
+            })
+            .collect();
+        let along: f64 = tangents.iter().map(|(op, v)| device.download(&gradient[op]).expect("download").iter().zip(v).map(|(a, b)| a * b).sum::<f64>()).sum();
+        // The tangent pass: block by block, the lanes forking there copying their parent's rows.
+        let mut t = device.zeros(stream.rows(), stream.cols()).expect("zeros");
+        let none = BTreeMap::new();
+        for b in 0..4 {
+            for lane in plan.lanes.iter().filter(|l| l.start == b) {
+                if let Some(parent) = lane.parent {
+                    let from = plan.lanes[parent].rows.clone();
+                    device.copy_rows_within(&mut t, lane.rows.start, from.start, from.len()).expect("a fork");
+                }
+            }
+            for call in calls.iter().filter(|c| c.block == b) {
+                let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.lanes[*l].rows.clone()).collect();
+                let Some(Kept::Tape(tape)) = &call.kept else { panic!("a call kept no tape") };
+                let model = if call.side == 0 { &p } else { &m };
+                model.tangent(b, tape, &mut t, &ranges, call.edits.as_ref(), if call.side == 0 { &tangents } else { &none }).expect("the tangent");
+            }
+        }
+        let projected: f64 = device.download(&t).expect("download").iter().zip(device.download(&seed).expect("download").iter()).map(|(a, b)| a * b).sum();
+        assert!(projected.abs() > 1e-6, "the tangent reaches the scored rows: {projected}");
+        assert!((projected - along).abs() <= 1e-10 * projected.abs().max(along.abs()), "tangent pass {projected}, reverse pass {along}");
+    }
+
 }
