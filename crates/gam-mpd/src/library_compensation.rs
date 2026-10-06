@@ -424,6 +424,68 @@ impl Compensation {
         Ok(Some(Change { output: mlp.output, columns: columns.collect(), scales: root, rows: change }))
     }
 
+    /// Per function alive at `posterior` with its own output column, its groups and the change in
+    /// nats that compensating its deletion alone adds to the deletion's own: the data gradient
+    /// `gradient` (summed over the batches, in nats, per output map by index into
+    /// `Explanation::trainable`) along the move `Δ`, the move's own and coupling terms under the
+    /// curvature `G ⊗ C` ([`Compensation::moved_quadratic`]), and the move's change of the
+    /// survivors' Gaussian prior, `Σ_j (μ_j · Δ_j + ½ ‖Δ_j‖²) / v_j`. For all functions at once
+    /// from one eigendecomposition `S = V^½ G_AA V^½ = Q diag(e) Qᵀ` over the alive functions `A`:
+    /// with `M_r = G_AA + Λ_r = V^-½ (S + I/c_r) V^-½` and `w = M_r⁻¹ e_i`, the move of deleting
+    /// `i` is `Δ_r = −u_ir w_R / w_i` (the Schur complement), and every term reduces to
+    /// `T_0 = (Q ⊙ Q) D_r`, `T_2 = (Q ⊙ Q) D_r²` and `Q (D_r ⊙ Qᵀ V^½ g)`, `Q (D_r ⊙ Qᵀ V^-½ μ)`
+    /// with `D_rk = c_r / (1 + c_r e_k)`. Eigenvalues below the rounding floor are taken as zero
+    /// here, where the proposal leaves its move along them unchanged: a ranking estimate.
+    pub fn applied(&self, posterior: &Posterior, gradient: &BTreeMap<usize, Array2<f64>>) -> Result<Vec<(Vec<usize>, f64)>, String> {
+        let mut out = Vec::new();
+        for mlp in &self.mlps {
+            let alive = Self::columns(mlp, posterior);
+            let (prior, curvature) = Self::scales(mlp, posterior, &alive);
+            let alive: Vec<usize> = alive.into_iter().filter(|i| prior[*i] > 0.0).collect();
+            if alive.len() < 2 {
+                continue;
+            }
+            let (root, decomposition, floor) = self.scaled(mlp, &alive, &prior)?;
+            let values = decomposition.values.mapv(|e| if e > floor { e } else { 0.0 });
+            let q = &decomposition.vectors;
+            let (n, d) = (alive.len(), curvature.len());
+            let means = &posterior.mean[mlp.output];
+            let column = |i: usize| match mlp.outputs[i] {
+                Output::Column(c) => c,
+                Output::Tied { .. } => usize::MAX,
+            };
+            // Per alive function (row) and output coordinate: its mean output and summed gradient.
+            let mu = Array2::from_shape_fn((n, d), |(a, r)| means[[r, column(alive[a])]]);
+            let zero = Array2::zeros(means.dim());
+            let g_map = gradient.get(&mlp.output).unwrap_or(&zero);
+            let g = Array2::from_shape_fn((n, d), |(a, r)| g_map[[r, column(alive[a])]]);
+            let dk = Array2::from_shape_fn((n, d), |(k, r)| curvature[r] / (1.0 + curvature[r] * values[k]));
+            let squares = q.mapv(|x| x * x);
+            let t0 = fast_ab(&squares, &dk);
+            let t2 = fast_ab(&squares, &dk.mapv(|x| x * x));
+            let scaled_g = Array2::from_shape_fn((n, d), |(a, r)| root[a] * g[[a, r]]);
+            let scaled_mu = Array2::from_shape_fn((n, d), |(a, r)| mu[[a, r]] / root[a]);
+            let t1 = fast_ab(q, &(&fast_atb(q, &scaled_g) * &dk));
+            let t3 = fast_ab(q, &(&fast_atb(q, &scaled_mu) * &dk));
+            for (a, i) in alive.iter().enumerate() {
+                let (v, gii) = (prior[*i], mlp.gram[[*i, *i]]);
+                let mut extra = 0.0;
+                for (r, c) in curvature.iter().enumerate() {
+                    let (u, t) = (mu[[a, r]], t0[[a, r]]);
+                    if *c <= 0.0 || t <= 0.0 {
+                        continue;
+                    }
+                    let slope = u * (g[[a, r]] - t1[[a, r]] / (v.sqrt() * t));
+                    let quadratic = -0.5 * u * u * (c * gii - c / (v * t) + t2[[a, r]] / (v * t * t));
+                    let prior_move = -u * (v.sqrt() * t3[[a, r]] - u * t) / (v * t) + 0.5 * u * u * (t2[[a, r]] - t * t) / (v * t * t);
+                    extra += slope + quadratic + prior_move;
+                }
+                out.push((mlp.functions[*i].clone(), extra));
+            }
+        }
+        Ok(out)
+    }
+
     /// Per function alive at `posterior` with its own output column, its groups and the share of
     /// its removal's data rise that remains after compensation, the others of its MLP surviving.
     /// Deleting function `i` alone, the compensation of coordinate `r` leaves
@@ -575,6 +637,43 @@ mod tests {
         let own: f64 = curvature.iter().zip(posterior.mean[mlp.output].column(column)).map(|(c, u)| c * u * u).sum::<f64>() * mlp.gram[[1, 1]];
         let moved = compensation.moved_quadratic(&posterior, &trial, &[output]).unwrap();
         assert!(own > 0.0 && (moved + 0.5 * own).abs() <= 1e-6 * own, "moved {moved:e}, own {own:e}");
+    }
+
+    #[test]
+    fn the_applied_estimate_is_the_compensated_deletions_own() {
+        // For one function, what compensating its deletion adds (Compensation::applied, from one
+        // eigendecomposition over every function) equals the same terms of the proposal that
+        // deletes it: the gradient along the move, Compensation::moved_quadratic, and the move's
+        // change of the survivors' Gaussian prior.
+        use rand::{RngExt, SeedableRng, rngs::StdRng};
+        let (native, explanation, sequences) = tiny("library_compensation_applied");
+        let posterior = Posterior::new(&explanation, 1000).expect("the posterior");
+        let device = Device::host();
+        let sites: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let reads = interchange::reads(&native, &sites).expect("the reads");
+        let mut ic = Interchange::new(&device, &native, &sites, &explanation.artifact, &explanation.trainable, reads, 1 << 30, 64).expect("the experiments");
+        let compensation = Compensation::new(&mut ic, &explanation, &posterior, &sequences, 2).expect("the compensation");
+        let mlp = &compensation.mlps[0];
+        let mut rng = StdRng::seed_from_u64(3);
+        let gradient: BTreeMap<usize, ndarray::Array2<f64>> = [(mlp.output, posterior.mean[mlp.output].mapv(|_| rng.random::<f64>() - 0.5))].into_iter().collect();
+        let applied = compensation.applied(&posterior, &gradient).expect("the estimates");
+        let (prior, _) = Compensation::scales(mlp, &posterior, &Compensation::columns(mlp, &posterior));
+        let function = 2;
+        let removed = mlp.functions[function].clone();
+        let trial = compensation.proposal(&posterior, &removed).expect("the proposal");
+        let (before, after) = (&posterior.mean[mlp.output], &trial.mean[mlp.output]);
+        let (mut slope, mut prior_move) = (0.0, 0.0);
+        for j in Compensation::columns(mlp, &posterior).into_iter().filter(|j| *j != function) {
+            let super::Output::Column(c) = mlp.outputs[j] else { continue };
+            for r in 0..before.nrows() {
+                let delta = after[[r, c]] - before[[r, c]];
+                slope += gradient[&mlp.output][[r, c]] * delta;
+                prior_move += (before[[r, c]] * delta + 0.5 * delta * delta) / prior[j];
+            }
+        }
+        let direct = slope + compensation.moved_quadratic(&posterior, &trial, &removed).unwrap() + prior_move;
+        let estimate = applied.iter().find(|(groups, _)| *groups == removed).expect("the function's estimate").1;
+        assert!(direct.abs() > 0.0 && (estimate - direct).abs() <= 1e-6 * direct.abs(), "applied {estimate:e}, direct {direct:e}");
     }
 
     #[test]

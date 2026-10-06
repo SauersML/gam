@@ -48,10 +48,14 @@
 //! `library_mdl`'s module note); the description falls by the
 //! group's cost (`KL_G`, its variance's precision and scale) and the code of which groups are active
 //! changes with their count. A unit's prediction is the mean of its roots' data estimates (each
-//! root's removal silences the same functions; for an MLP function under compensation, times the
-//! share of its activations' energy the surviving functions do not reproduce,
-//! `Compensation::unexplained`) minus the cost of all its groups, plus the change of the subset
-//! code when it alone is removed. Deletion is a finite step, so the prediction is a
+//! root's removal silences the same functions; for an MLP function under compensation, plus what
+//! compensating its deletion alone adds: the data gradient along the move, the move's own and
+//! coupling terms, and its change of the survivors' prior, `Compensation::applied`) minus the cost
+//! of all its groups, plus the change of the subset code when it alone is removed. Scaling the
+//! estimate by the share of the function's activations the survivors do not reproduce instead
+//! (`Compensation::unexplained`) assumes a stationary posterior; on vpd4l's trained library at
+//! N = 2^24 (unify's k0) it ranked first functions whose compensated deletion raised `F` (l1.f2028:
+//! +131k bits uncompensated, about +4.5k compensated, against a cost of 5.5k). Deletion is a finite step, so the prediction is a
 //! proposal order and nothing more: every unit is ranked by it, most negative first, and only the
 //! exact evaluation below decides.
 //!
@@ -63,8 +67,7 @@
 //! that step, `Σ_b g_b · Δ` over the surviving entries, with `Σ_b g_b` in the MLPs' output maps
 //! summed in the passes that measure the estimates ([`Curvature`]), and the step's second-order
 //! terms, its own and its coupling with the deleted outputs, under compensation's curvature model
-//! (`Compensation::moved_quadratic`); the deleted units then enter with their measured estimates
-//! whole, not scaled by the compensated share (logged beside as `predicted_share_bits`).
+//! (`Compensation::moved_quadratic`), with the deleted units' measured estimates whole.
 //!
 //! # The search
 //!
@@ -969,18 +972,17 @@ pub fn round(
         fewer.insert(m, c);
         Ok(c)
     };
-    // Compensation leaves of a function's data rise only the share of its activations the
-    // surviving functions do not reproduce.
-    let mut share = vec![1.0; posterior.active.len()];
+    // What compensating a function's deletion alone adds to its measured estimate.
+    let mut applied = vec![0.0; posterior.active.len()];
     if let Some(c) = compensation {
-        for (groups, s) in c.unexplained(posterior)? {
+        for (groups, extra) in c.applied(posterior, &curvature.gradient)? {
             for g in groups {
-                share[g] = s;
+                applied[g] = extra;
             }
         }
     }
     for unit in &mut units {
-        unit.data = unit.roots.iter().map(|g| data_rise[*g] * share[*g]).sum::<f64>() / unit.roots.len() as f64;
+        unit.data = unit.roots.iter().map(|g| data_rise[*g] + applied[*g]).sum::<f64>() / unit.roots.len() as f64;
         unit.predicted = unit.data - unit.groups.iter().map(|g| costs[*g]).sum::<f64>() + subset_change(unit.groups.len())?;
     }
     journal.write(json!({
@@ -1039,16 +1041,15 @@ pub fn round(
                 dot
             })
             .sum();
-        // The change actually applied: the deleted units' measured estimates without the
-        // compensated share, the data gradient along the move, and the move's own and coupling
-        // terms under compensation's curvature model.
+        // The change actually applied: the deleted units' measured estimates, the data gradient
+        // along the move, and the move's own and coupling terms under compensation's curvature
+        // model.
         let plain: f64 = span.iter().map(|u| u.roots.iter().map(|g| data_rise[*g]).sum::<f64>() / u.roots.len() as f64).sum();
         let quadratic = match compensation {
             Some(c) => c.moved_quadratic(posterior, &proposed, &groups)?,
             None => 0.0,
         };
         let predicted = plain + moved + quadratic + description;
-        let shared = span.iter().map(|u| u.data).sum::<f64>() + moved + description;
         // With the Gauss–Newton cross terms between the units, without compensation.
         let roots: Vec<(usize, f64)> = span.iter().flat_map(|u| u.roots.iter().map(|r| (*r, 1.0 / u.roots.len() as f64))).collect();
         let joint = curvature.joint(&roots) + deleted;
@@ -1056,7 +1057,7 @@ pub fn round(
         let kind = if high - low == units.len() { "whole" } else if high - low == 1 { "single" } else { "split" };
         journal.write(json!({
             "event": "proposal", "kind": kind, "units": high - low, "first_unit": low, "groups": groups, "layers": names(&groups),
-            "predicted_bits": predicted / LN_2, "predicted_share_bits": shared / LN_2, "move_quadratic_bits": quadratic / LN_2, "joint_plain_bits": joint / LN_2, "measured_bits": change / LN_2, "batches": evaluation.scored(), "complete": evaluation.complete,
+            "predicted_bits": predicted / LN_2, "ranked_bits": (span.iter().map(|u| u.data).sum::<f64>() + deleted) / LN_2, "move_quadratic_bits": quadratic / LN_2, "joint_plain_bits": joint / LN_2, "measured_bits": change / LN_2, "batches": evaluation.scored(), "complete": evaluation.complete,
             "description_bits": description / LN_2, "description_deleted_bits": deleted / LN_2, "compensation_slope_bits": moved / LN_2,
             "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(), "trial_seconds": trial_seconds,
         }))?;
@@ -1436,14 +1437,14 @@ mod tests {
         assert_eq!(dead_size, planted.len());
         let description = (removed(&start, &planted).description() - start.description()) / LN_2;
         assert!((dead_change - description).abs() <= 1e-9 * ranked.before_bits.abs(), "the data term moved by {} bits", dead_change - description);
-        // The active group of least `KL_G` outside the planted ones is needed (removing it alone,
-        // compensated, raises F), and the search keeps it.
+        // The active group of least `KL_G` outside the planted ones is needed: removing it alone,
+        // compensated, raises F. A range is accepted on its total, so the search may still remove
+        // it with others whose removal lowers F by more.
         let divergences = start.divergences();
         let first = (0..divergences.len()).filter(|g| start.active[*g] && !planted.contains(g)).min_by(|a, b| divergences[*a].total_cmp(&divergences[*b])).unwrap();
         let without_dead = removed(&start, &planted);
         let alone = compensation.proposal(&without_dead, &[first]).unwrap();
         assert!(objective(&mut ic, &alone, None).unwrap().total() > objective(&mut ic, &without_dead, None).unwrap().total(), "the first group is needed");
-        assert!(posterior.active[first]);
         assert!(ranked.removed >= planted.len());
         // The removals beyond the groups without effect were accepted on one weight sample per
         // batch; they also lower `F` on samples they were not chosen on.
