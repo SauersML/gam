@@ -4625,13 +4625,17 @@ extern "C" __global__ void __launch_bounds__(256) attention_backward_queries(con
         }
 
         pub(super) fn copy<T: DeviceRepr + ValidAsZeroBits>(&self, slice: &CudaSlice<T>) -> Result<CudaSlice<T>, GpuError> {
-            let mut out = self.stream.alloc_zeros::<T>(slice.len().max(1)).gpu_ctx("tensor alloc")?;
+            // SAFETY: the copy writes every value before any is read (an empty slice's one value is
+            // never read).
+            let mut out = unsafe { self.stream.alloc::<T>(slice.len().max(1)) }.gpu_ctx("tensor alloc")?;
             self.stream.memcpy_dtod(slice, &mut out).gpu_ctx("tensor copy")?;
             Ok(out)
         }
 
         pub(super) fn copy_range<T: DeviceRepr + ValidAsZeroBits>(&self, slice: &CudaSlice<T>, lo: usize, hi: usize) -> Result<CudaSlice<T>, GpuError> {
-            let mut out = self.stream.alloc_zeros::<T>((hi - lo).max(1)).gpu_ctx("tensor alloc")?;
+            // SAFETY: the copy writes every value before any is read (an empty range's one value is
+            // never read).
+            let mut out = unsafe { self.stream.alloc::<T>((hi - lo).max(1)) }.gpu_ctx("tensor alloc")?;
             if hi > lo {
                 self.stream.memcpy_dtod(&slice.slice(lo..hi), &mut out).gpu_ctx("tensor row copy")?;
             }

@@ -1132,12 +1132,36 @@ impl DeviceProgram {
                 // x (L R)ᵀ = (x Rᵀ) Lᵀ;  x (L R) = (x L) R.
                 let (first, first_op, second, second_op) = if transposed { (left, Op::N, right, Op::N) } else { (right, Op::T, left, Op::T) };
                 let inner = if transposed { left.cols() } else { right.rows() };
-                let mut middle = d.zeros(x.rows(), inner).map_err(error)?;
+                let mut middle = d.empty(x.rows(), inner).map_err(error)?;
                 d.gemm(&mut middle, 1.0, x, Op::N, first, first_op, 0.0, arithmetic).map_err(error)?;
                 d.gemm(out, 1.0, &middle, Op::N, second, second_op, 1.0, arithmetic).map_err(error)
             }
             Held::Table(_) | Held::Column(_) => Err("device: an operator held in the wrong role".to_string()),
         }
+    }
+
+    /// `x op(A)` ([`DeviceProgram::add_product`]) as a new `rows × width` tensor: where `A` is held
+    /// dense or diagonal, one pass writes it whole into an unset output (`Device::empty`, no
+    /// zeroing pass ahead of it); otherwise it is added into zeros.
+    fn product(&self, x: &Tensor, op: usize, transposed: bool, (rows, width): (usize, usize), arithmetic: Arithmetic) -> Result<Tensor, String> {
+        let d = &self.device;
+        Ok(match self.held(op, Role::Product)? {
+            Held::Dense(a) => {
+                let mut out = d.empty(rows, width).map_err(error)?;
+                d.gemm(&mut out, 1.0, x, Op::N, a, if transposed { Op::N } else { Op::T }, 0.0, arithmetic).map_err(error)?;
+                out
+            }
+            Held::Diagonal(diag) => {
+                let mut out = d.empty(rows, width).map_err(error)?;
+                d.scale_columns(&mut out, x, diag, false).map_err(error)?;
+                out
+            }
+            _ => {
+                let mut out = d.zeros(rows, width).map_err(error)?;
+                self.add_product(&mut out, x, op, transposed, arithmetic)?;
+                out
+            }
+        })
     }
 
     fn column(&self, op: usize) -> Result<&Tensor, String> {
@@ -1420,8 +1444,14 @@ impl DeviceProgram {
                 },
                 Step::Constant { operator } => value(d.broadcast_rows(self.column(*operator)?, rows).map_err(error)?),
                 Step::Affine { terms, bias } => {
-                    let mut out = d.zeros(rows, width).map_err(error)?;
-                    for (argument, operator) in terms {
+                    // The first term's product is the output, written whole (`product`).
+                    let (mut out, rest) = match terms.split_first() {
+                        Some(((argument, operator), rest)) if !matches!(self.steps[*argument], Step::Feature { .. }) => {
+                            (self.product(trace.value(*argument)?, *operator, false, (rows, width), self.arithmetic)?, rest)
+                        }
+                        _ => (d.zeros(rows, width).map_err(error)?, &terms[..]),
+                    };
+                    for (argument, operator) in rest {
                         self.add_term(&mut out, &trace, *argument, *operator)?;
                     }
                     if let Some(b) = bias {
@@ -1448,7 +1478,7 @@ impl DeviceProgram {
                         value(super::device_attention::forward(d, (&q, &k, v), trace.blocks, *scale, *causal, self.arithmetic).map_err(error)?)
                     } else {
                         let alpha = self.attention(&trace, &q, &k, *scale, *causal)?;
-                        let mut out = d.zeros(rows, v.cols()).map_err(error)?;
+                        let mut out = d.empty(rows, v.cols()).map_err(error)?;
                         d.gemm_batched(trace.blocks, &mut out, 1.0, &alpha, Op::N, v, Op::N, 0.0, self.arithmetic).map_err(error)?;
                         value(out)
                     }
@@ -1466,11 +1496,7 @@ impl DeviceProgram {
                     }
                     value(out)
                 }
-                Step::Transposed { input, operator } => {
-                    let mut out = d.zeros(rows, width).map_err(error)?;
-                    self.add_product(&mut out, trace.value(*input)?, *operator, true, self.arithmetic)?;
-                    value(out)
-                }
+                Step::Transposed { input, operator } => value(self.product(trace.value(*input)?, *operator, true, (rows, width), self.arithmetic)?),
             }};
             if hook && let Slot::Value(value) = &mut slot {
                 before(index, value)?;
@@ -1636,7 +1662,7 @@ impl DeviceProgram {
         let Held::Dense(a) = self.held(self.linear_operator()?, Role::Product)? else {
             return Err("device: the head is not dense".to_string());
         };
-        let mut part = d.zeros(cotangent.rows(), self.widths[self.head.hidden]).map_err(error)?;
+        let mut part = d.empty(cotangent.rows(), self.widths[self.head.hidden]).map_err(error)?;
         let op = if self.head.transposed { Op::T } else { Op::N };
         d.gemm(&mut part, 1.0, cotangent, Op::N, a, op, 0.0, arithmetic).map_err(error)?;
         d.set_rows(g_hidden, start, &part).map_err(error)
@@ -2005,7 +2031,7 @@ impl DeviceProgram {
             Held::Dense(a) => d.gemm(target, 1.0, cot, Op::N, a, Op::N, 1.0, arithmetic).map_err(error),
             Held::LowRank(left, right) => {
                 // g (L R) = (g L) R.
-                let mut middle = d.zeros(cot.rows(), left.cols()).map_err(error)?;
+                let mut middle = d.empty(cot.rows(), left.cols()).map_err(error)?;
                 d.gemm(&mut middle, 1.0, cot, Op::N, left, Op::N, 0.0, arithmetic).map_err(error)?;
                 d.gemm(target, 1.0, &middle, Op::N, right, Op::N, 1.0, arithmetic).map_err(error)
             }
@@ -2037,14 +2063,14 @@ impl DeviceProgram {
         if !needed[heads.input] && wanted.is_empty() {
             return Ok(());
         }
-        let mut g_a = d.zeros(trace.rows, heads.heads * heads.width).map_err(error)?;
+        let mut g_a = d.empty(trace.rows, heads.heads * heads.width).map_err(error)?;
         d.gemm(&mut g_a, 1.0, cot, Op::N, &group.stacked.reads, Op::N, 0.0, arithmetic).map_err(error)?;
         let turn = turn(&trace.rotations, heads.rotary)?;
         let gained = buffers.normed.map(|(_, gained)| &trace.buffers[gained]);
         let g_p = device_heads::backward(d, (heads, &group.stacked), (&trace.buffers[buffers.projections], gained), &g_a, trace.blocks, turn, (self.arithmetic, arithmetic)).map_err(error)?;
         if !wanted.is_empty() {
             let x = trace.value(heads.input)?;
-            let mut stacked = d.zeros(heads.columns(), x.cols()).map_err(error)?;
+            let mut stacked = d.empty(heads.columns(), x.cols()).map_err(error)?;
             d.gemm(&mut stacked, 1.0, &g_p, Op::T, x, Op::N, 0.0, arithmetic).map_err(error)?;
             for (i, op) in wanted {
                 let rows = d.rows_of(&stacked, i * heads.width, heads.width).map_err(error)?;
