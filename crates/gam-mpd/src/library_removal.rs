@@ -59,7 +59,9 @@
 //! deleted groups' costs, the subset code, and what moving the compensated survivors' means does
 //! to their own costs, which a unit's ranking leaves out (compensation is a step of the means that
 //! the posterior's description charges, and away from a stationary posterior it changes the
-//! description at first order).
+//! description at first order). For the same reason it adds the data term's first-order change from
+//! that step, `Σ_b g_b · Δ` over the surviving entries, with `Σ_b g_b` in the MLPs' output maps
+//! summed in the passes that measure the estimates ([`Curvature`]).
 //!
 //! # The search
 //!
@@ -1013,7 +1015,22 @@ pub fn round(
             // the part the deleted groups' costs and the subset code make.
             let description = proposed.description() - base.description();
             let deleted = -groups.iter().map(|g| costs[*g]).sum::<f64>() + subset_change(removed_now + groups.len())? - subset_change(removed_now)?;
-            let predicted = rest[..k].iter().map(|u| u.data).sum::<f64>() + description;
+            // The data term's first-order change from the compensation's move of the surviving
+            // means, `Σ_b g_b · Δ` over the entries both posteriors keep.
+            let moved: f64 = curvature
+                .gradient
+                .iter()
+                .map(|(i, g)| {
+                    let mut dot = 0.0;
+                    ndarray::Zip::from(g).and(&proposed.mean[*i]).and(&base.mean[*i]).and(&proposed.log_sd[*i]).for_each(|g, after, before, s| {
+                        if *s != f64::NEG_INFINITY {
+                            dot += g * (after - before);
+                        }
+                    });
+                    dot
+                })
+                .sum();
+            let predicted = rest[..k].iter().map(|u| u.data).sum::<f64>() + moved + description;
             // With the Gauss–Newton cross terms between the units, without compensation.
             let roots: Vec<(usize, f64)> = rest[..k].iter().flat_map(|u| u.roots.iter().map(|r| (*r, 1.0 / u.roots.len() as f64))).collect();
             let joint = curvature.joint(&roots) + deleted;
@@ -1021,7 +1038,7 @@ pub fn round(
             journal.write(json!({
                 "event": "proposal", "kind": kind, "units": k, "groups": groups, "layers": names(&groups),
                 "predicted_bits": predicted / LN_2, "joint_plain_bits": joint / LN_2, "measured_bits": change / LN_2, "batches": evaluation.batches.len(), "complete": evaluation.complete,
-                "description_bits": description / LN_2, "description_deleted_bits": deleted / LN_2,
+                "description_bits": description / LN_2, "description_deleted_bits": deleted / LN_2, "compensation_slope_bits": moved / LN_2,
                 "accepted": accepted, "seconds": timed.elapsed().as_secs_f64(), "trial_seconds": trial_seconds,
             }))?;
             evaluations.push((groups.len(), change / LN_2));

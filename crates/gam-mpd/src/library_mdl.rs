@@ -798,13 +798,16 @@ pub struct Curvature {
     pub(crate) square: Vec<f64>,
     pub(crate) slope: Vec<f64>,
     pub(crate) dots: Vec<Vec<f32>>,
+    /// Per trainable operator asked for (by index into `Explanation::trainable`), `Σ_b g_b` in nats:
+    /// the first-order change of the data term when its means move.
+    pub(crate) gradient: BTreeMap<usize, Array2<f64>>,
 }
 
 impl Curvature {
     /// No batches yet, for `groups` prior groups.
     #[must_use]
     pub fn new(groups: usize) -> Self {
-        Self { rise: vec![0.0; groups], square: vec![0.0; groups], slope: vec![0.0; groups], dots: Vec::new() }
+        Self { rise: vec![0.0; groups], square: vec![0.0; groups], slope: vec![0.0; groups], dots: Vec::new(), gradient: BTreeMap::new() }
     }
 
     /// The batches added.
@@ -3318,10 +3321,13 @@ const RANKING_STREAM: usize = usize::MAX;
 /// The removal estimates' [`Curvature`]: per training batch of the fixed collection, at the batch's
 /// weight sample on the noise stream `stream` (the fit's: [`RANKING_STREAM`]), the data term's
 /// gradient and one draw of the sampled-label gradient (module note), each batch's group sums made
-/// on the device (`DevicePosterior::add_removal`).
-fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings, stream: usize) -> Result<Curvature, String> {
+/// on the device (`DevicePosterior::add_removal`); for the operators `moved` (by id), the data
+/// gradient summed over the batches on the device.
+fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[Draw], sequences: &[Vec<u32>], settings: &Settings, stream: usize, moved: &[usize]) -> Result<Curvature, String> {
     let mut rng = StdRng::seed_from_u64(noise_seed(settings.seed, stream, draws.len()));
     let mut curvature = Curvature::new(posterior.group_count());
+    let device = scorer.experiments.models().1.program.device().clone();
+    let mut sums: BTreeMap<usize, Tensor> = BTreeMap::new();
     for (b, draw) in draws.iter().enumerate() {
         let key = noise_seed(settings.seed, stream, b);
         posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
@@ -3335,6 +3341,18 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
         let evaluation = scorer.experiments.evaluate_labelled(&batch, &experiments, Some(&targets), true, Some(&uniforms))?;
         let factor = evaluation.factor.ok_or("no Gauss–Newton factor")?;
         posterior.add_removal((&evaluation.gradient, LN_2), &factor.gradient, key, &mut curvature)?;
+        for op in moved {
+            let Some(g) = evaluation.gradient.get(op) else { continue };
+            match sums.get_mut(op) {
+                Some(sum) => device.axpy(sum, 1.0, g).map_err(error)?,
+                None => {
+                    sums.insert(*op, device.copy(g).map_err(error)?);
+                }
+            }
+        }
+    }
+    for (op, sum) in &sums {
+        curvature.gradient.insert(scorer.at(*op)?, device.download(sum).map_err(error)? * LN_2);
     }
     Ok(curvature)
 }
@@ -3436,7 +3454,8 @@ fn remove(
     let timed = Instant::now();
     let compensation = Compensation::new(&mut scorer.experiments, explanation, posterior, sequences, settings.batch_sequences)?;
     let compensated = timed.elapsed().as_secs_f64();
-    let curvature = removal_curvature(scorer, device_posterior, draws, sequences, settings, RANKING_STREAM)?;
+    let moved: Vec<usize> = compensation.outputs().iter().map(|i| explanation.trainable[*i]).collect();
+    let curvature = removal_curvature(scorer, device_posterior, draws, sequences, settings, RANKING_STREAM, &moved)?;
     log::info!("library removal setup: compensation Gram {compensated:.1} s, curvature {:.1} s", timed.elapsed().as_secs_f64() - compensated);
     let mut objective = |trial: &Posterior, accepted: Option<&Evaluation>| -> Result<Evaluation, String> {
         let rest = trial.description() + fixed;
@@ -4117,7 +4136,7 @@ mod tests {
         let mut device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 1000.0, None, 0).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         // On the evaluation's own samples, where the estimate is of the change it scores.
-        let curvature = removal_curvature(&mut scorer, &device_posterior, &draws, &sequences, &settings, 0).unwrap();
+        let curvature = removal_curvature(&mut scorer, &device_posterior, &draws, &sequences, &settings, 0, &[]).unwrap();
         assert_eq!(curvature.batches(), draws.len());
         let mut evaluate = |removed: &[usize]| expected_divergence(&mut scorer, &mut device_posterior, &posterior, &draws, &sequences, removed, &settings, None, None).unwrap().total();
         let kept = evaluate(&[]);

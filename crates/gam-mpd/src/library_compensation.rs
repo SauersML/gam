@@ -278,6 +278,13 @@ impl Compensation {
         Ok((root, decomposition, floor))
     }
 
+    /// The MLPs' output maps whose surviving columns a proposal moves (indices into
+    /// `Explanation::trainable`).
+    #[must_use]
+    pub fn outputs(&self) -> Vec<usize> {
+        self.mlps.iter().map(|mlp| mlp.output).collect()
+    }
+
     /// `posterior` with the groups `removed` removed and, in every MLP that loses functions it had,
     /// its surviving functions' outputs moved to the posterior mode of the compensation (module
     /// note). Each MLP's compensation reads `posterior` alone and moves only its own output
