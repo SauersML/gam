@@ -3343,4 +3343,62 @@ mod tests {
         assert!((projected - along).abs() <= 1e-10 * projected.abs().max(along.abs()), "tangent pass {projected}, reverse pass {along}");
     }
 
+
+    /// Swaps and cuts take the donor's values from each model's own run of the donor, never `M`'s:
+    /// with `P` the scoped starting library of the tiny Qwen3 export with its MLPs perturbed (so `P`
+    /// differs from `M`), swapping the whole stream after block 1 from the donor at every row makes
+    /// `P_e` and `M_e` the two models' clean runs of the donor from block 2 on, so the swap scores
+    /// as the donor's clean experiment does (1e-12); and a cut's donor record in `P`'s run is `P`'s
+    /// own MLP output on the donor at the row (a run of `P` alone), which differs from `M`'s.
+    #[test]
+    fn swaps_and_cuts_read_each_models_own_donor_run() {
+        use rand::RngExt;
+        let dir = crate::test_support::tiny_qwen3_export("interchange_own_donor", 2);
+        let imported = import_language_model(&dir, 6, 12).expect("the tiny export imports");
+        std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+        let native = split_sites(&imported.program).expect("the native sites");
+        let layers = layer_nodes(&native, 2).expect("the layers");
+        let explanation = library_mdl::scoped(&library_mdl::explanation(&native, &layers).expect("the library"), &[1, 3]).expect("scoped");
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let device = Device::host();
+        let blocks: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let variables = reads(&native, &blocks).expect("the reads");
+        let mut ic = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
+        let mut rng = StdRng::seed_from_u64(41);
+        let program = &explanation.artifact.program;
+        let perturbed: Vec<ndarray::Array2<f64>> = explanation.trainable.iter().map(|op| program.operators[*op].matrix().mapv(|v| v * (1.0 + 0.3 * (rng.random::<f64>() - 0.5)))).collect();
+        ic.load(&perturbed).expect("a P that differs from M");
+        let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
+        // Base 0 with donor 1 (`batch.source[1]` is the donor's sequence): the whole stream after
+        // block 1 swapped at every row, against the donor's clean experiment.
+        let donor = Batch::new(vec![batch.base[0].clone(), batch.source[1].clone()], vec![batch.source[1].clone(), batch.source[1].clone()]).expect("the batch");
+        let swap = Experiment { base: 0, source: 1, explained: vec![true; 4], patch: Some(Patch::Ops { family: Family::Swap, ops: vec![SiteOp { site: SharedSite::Stream(1), operation: Operation::Swap, onward: true }] }), position: 0 };
+        let clean = Experiment { base: 1, source: 1, explained: vec![true; 4], patch: None, position: 0 };
+        let bits = ic.evaluate(&donor, &[swap, clean], false).expect("evaluate").bits;
+        assert!(bits[1].iter().sum::<f64>() > 1e-6, "P differs from M on the donor");
+        for (a, b) in bits[0].iter().zip(&bits[1]) {
+            assert!((a - b).abs() <= 1e-12 * b.abs().max(1.0), "the swap scores {a}, the donor's clean run {b}");
+        }
+        // A cut from layer 0's MLP output into block 3's read at row 5: the donor record in P's run.
+        let cut = Experiment { base: 0, source: 1, explained: vec![true; 4], patch: Some(Patch::Ops { family: Family::Cut, ops: vec![SiteOp { site: SharedSite::Mlp(0), operation: Operation::Cut { to: 3 }, onward: false }] }), position: 5 };
+        let (m, p) = ic.models();
+        let (paths, _) = paths(&batch, std::slice::from_ref(&cut), p.values(), engine_heads(&p), None, 4).expect("the paths");
+        let plan = Plan::new(paths, 12);
+        run([&p, &m], &plan, false).expect("the forward pass");
+        let recorded = plan.recorded.borrow().get(&0).map(|r| r.values[1].clone()).expect("the donor's record");
+        let own = |model: &Model| -> Vec<f64> {
+            let mut stream = device.zeros(12, BlockEngine::width(model)).expect("zeros");
+            let tok = vec![batch.source[1].as_slice()];
+            model.forward(0, &mut stream, &[0..12], &tok, None, false).expect("attention");
+            let trace = model.forward(1, &mut stream, &[0..12], &tok, None, true).expect("the MLP").expect("a tape");
+            let (node, _) = model.part_sites().expect("edit sites").shared[&SharedSite::Mlp(0)];
+            device.download(trace.value(node).expect("the MLP output")).expect("download").row(5).to_vec()
+        };
+        let (from_p, from_m) = (own(&p), own(&m));
+        let scale = from_p.iter().fold(1.0f64, |a, v| a.max(v.abs()));
+        assert!(recorded.iter().zip(&from_p).all(|(a, b)| (a - b).abs() <= 1e-12 * scale), "the record is P's own donor value");
+        assert!(from_p.iter().zip(&from_m).any(|(a, b)| (a - b).abs() > 1e-6 * scale), "P's donor value differs from M's");
+    }
+
 }
