@@ -1136,6 +1136,24 @@ impl Posterior {
             .collect()
     }
 
+    /// Over the active groups' entries, the mean `ln σ` (along the rotated axes) and the mean `|μ|`,
+    /// and over the active groups, the sum of the empirical-Bayes variances `v_G`: what moves
+    /// `Σ_G KL(q_G ‖ p_G) = ½ Σ_G (|G| ln v_G − Σ_{j∈G} ln σ_j²)` between epochs.
+    pub fn spread(&self) -> (f64, f64, f64) {
+        let (mut entries, mut log_sd, mut magnitude) = (0.0, 0.0, 0.0);
+        for i in 0..self.mean.len() {
+            for ((mu, s), group) in self.mean[i].iter().zip(self.log_sd[i].iter()).zip(self.membership[i].iter()) {
+                if self.active[*group as usize] {
+                    entries += 1.0;
+                    log_sd += s;
+                    magnitude += mu.abs();
+                }
+            }
+        }
+        let variances = self.moments().iter().zip(&self.active).filter(|(_, a)| **a).map(|(m, _)| m.second / m.count).sum();
+        (log_sd / entries, magnitude / entries, variances)
+    }
+
     /// Per group, `KL(q_G ‖ p_G)` in nats (zero for a removed group).
     pub fn divergences(&self) -> Vec<f64> {
         self.moments().iter().zip(&self.active).map(|(m, active)| if *active { m.divergence() } else { 0.0 }).collect()
@@ -2812,6 +2830,9 @@ pub fn fit_from(
         progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
         save(&mut progress, &posterior, &device_posterior, &mut writer)?;
     }
+    // The posterior at the end of the epoch with the lowest mean per-batch estimate of `F` since
+    // the objective last changed (a start or a removal), with that mean.
+    let mut best: Option<(f64, Posterior)> = None;
     while !progress.done {
         let epoch = progress.epoch;
         let epoch_started = Instant::now();
@@ -2896,6 +2917,7 @@ pub fn fit_from(
             description_sum += description;
         }
         let count = draws.len() as f64;
+        let mean_estimate = estimates.iter().sum::<f64>() / count;
         let (improvement, standard_error) = match &progress.previous {
             Some(before) => {
                 let differences: Vec<f64> = before.iter().zip(&estimates).map(|(a, b)| a - b).collect();
@@ -2936,13 +2958,28 @@ pub fn fit_from(
             },
         };
         log::info!("library fit epoch {epoch}: {record:?}");
+        let (log_sd, magnitude, variances) = posterior.spread();
+        log::info!("library posterior after epoch {epoch}: mean ln σ {log_sd:.5}, mean |μ| {magnitude:.6e}, Σ v_G {variances:.6e}");
         progress.epochs.push(record);
         progress.previous = Some(estimates);
         progress.epoch += 1;
         // Converged when the improvement is within its standard error either way: an epoch that
         // raised `F` by more than its standard error is a move, not a fixed point.
         let converged = matches!((improvement, standard_error), (Some(i), Some(se)) if i.abs() <= se);
-        if converged {
+        // An epoch that raised `F` by more than its standard error ends the descent at the best
+        // epoch: the posterior goes back to it and the removal round starts from there.
+        let worse = matches!((improvement, standard_error), (Some(i), Some(se)) if i < -se);
+        if worse {
+            if let Some((bits, kept)) = best.take() {
+                log::info!("library fit epoch {epoch} raised F: back to the best epoch's posterior ({:.6e} bits)", bits / LN_2);
+                posterior = kept;
+                device_posterior.set_values(&posterior)?;
+            }
+        } else if best.as_ref().is_none_or(|(b, _)| mean_estimate < *b) {
+            best = Some((mean_estimate, posterior.clone()));
+        }
+        if converged || worse {
+            best = None;
             let log = checkpoint.map(|path| path.with_extension("removals.jsonl"));
             let evidence = Evidence { draws: &draws, sequences, settings };
             let removal = remove(&mut scorer, &mut device_posterior, &mut posterior, &evidence, explanation, prior.as_deref_mut(), Search::Ranked, log.as_deref())?;
