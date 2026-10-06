@@ -337,6 +337,8 @@ pub enum Family {
 pub struct PartSites {
     nodes: Vec<Option<(usize, usize)>>,
     parts: Arc<Vec<Part>>,
+    /// The model applies no edits of parts ([`Interchange::unedited_explanation`]).
+    unedited: bool,
 }
 
 impl PartSites {
@@ -847,6 +849,9 @@ impl Edits {
         let mut writes: BTreeMap<usize, (usize, Vec<(usize, &Part, f64)>)> = BTreeMap::new();
         for (row, part, factor) in edits {
             let sites = sites.ok_or_else(|| error("an edit of a part in a model without part sites"))?;
+            if sites.unedited {
+                continue;
+            }
             let p = sites.parts.get(*part).ok_or_else(|| error("an edit of an unknown part"))?;
             let alpha = *FACTORS.get(*factor).ok_or_else(|| error("an edit's factor outside FACTORS"))?;
             let (read, out) = sites.nodes.get(p.block).copied().flatten().ok_or_else(|| error(format!("block {}: no part sites", p.block)))?;
@@ -2107,6 +2112,15 @@ impl Interchange {
             *sites = Arc::new(next);
         }
         Ok(())
+    }
+
+    /// `P` applies no edits of parts from now on, `M` still does: with `P` = `M`
+    /// (`Artifact::native`), an edit's score is then `KL(M_e ‖ M)`, the size of the change the edit
+    /// makes to `M`, over the same tokens as its `KL(M_e ‖ P_e)`.
+    pub fn unedited_explanation(&mut self) {
+        let mut next = (*self.p_sites).clone();
+        next.parts.unedited = true;
+        self.p_sites = Arc::new(next);
     }
 
     /// The parts ([`Interchange::set_parts`]).

@@ -756,6 +756,18 @@ fn the_starting_library_explains_m_under_every_part_edit(dir: std::path::PathBuf
             let changed = clean[at..].iter().zip(edited).any(|(a, b)| (a - b).abs() > 1e-9);
             assert_eq!(changed, part % 2 == 0 && FACTORS[factor] != 1.0, "{:?}: M changes only under an edit of a firing part", triple[1]);
         }
+        // With P applying no edit, an edit scores KL(M_e ‖ M): positive for a firing part where
+        // P_e runs P's block, zero for a silent one, under a hybrid running M's block there (M's
+        // block applies the edit in either run) and for the clean experiments.
+        x.unedited_explanation();
+        let effects = x.evaluate(&batch, &experiments, false).expect("evaluate").bits;
+        for (e, bits) in experiments.iter().zip(&effects) {
+            let sum: f64 = bits.iter().sum();
+            match e.patch {
+                Some(Patch::Part { part, .. }) if part % 2 == 0 && e.explained[x.parts()[part].block] => assert!(sum > 1e-9, "{e:?}: {sum}"),
+                _ => assert!(sum.abs() <= 1e-9, "{e:?}: {sum}"),
+            }
+        }
     }
 }
 

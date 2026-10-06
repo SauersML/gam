@@ -27,7 +27,9 @@
 //! experiment and `edits_per_sequence` edits, each of a family in `families`, `remove_part` or
 //! `amplify_part`, applied identically to `M` and to `P`). `OUT/EDITS_{name}.json` holds per family
 //! `KL(M_e ‖ P_e)` in bits per token: the mean and 99th percentile over every scored token (from the
-//! edited token on) and over the edited tokens alone, with the clean experiments' as `clean`.
+//! edited token on) and over the edited tokens alone, with the clean experiments' as `clean`; and
+//! next to it, over the same tokens, the edit's effect on the model `KL(M_e ‖ M)` (`effect_*`), the
+//! size of the change the explanation is asked to predict.
 //!
 //! With `blocks` (block `2l` layer `l`'s attention, `2l + 1` its MLP), the explanation is of those
 //! blocks alone and `M` everywhere else (`library_mdl::scoped`): the fast loop for comparing method
@@ -222,28 +224,44 @@ fn edit_faithfulness(
     let mut experiments = interchange::Interchange::new(device, native, layers, &artifact, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     let parts = interchange::parts_of(&artifact.program, layers.len())?;
     let count = parts.len();
-    experiments.set_parts(parts)?;
+    experiments.set_parts(parts.clone())?;
     log::info!("edits: {count} parts, {} held-out sequences, {:.0} s to compile", end - first, started.elapsed().as_secs_f64());
     let mut rng = rand::rngs::StdRng::seed_from_u64(settings.seed);
+    let family = |e: &interchange::Experiment| match &e.patch {
+        None => "clean",
+        Some(interchange::Patch::Part { factor: 0, .. }) => "remove_part",
+        Some(interchange::Patch::Part { .. }) => "amplify_part",
+        Some(_) => "read",
+    };
     // Per family: every scored token's bits, the edited tokens' bits, and the experiments.
     let mut scores: BTreeMap<&str, (Vec<f64>, Vec<f64>, usize)> = BTreeMap::new();
+    let mut batches = Vec::new();
     for (b, chunk) in held_out[first..end].chunks(settings.batch_sequences).enumerate() {
         let batch = interchange::Batch::new(chunk.to_vec(), chunk.to_vec())?;
         let drawn = experiments.sample_edits(&mut rng, &batch, &settings.families, settings.edits_per_sequence, false)?;
         let scored = experiments.evaluate(&batch, &drawn, false)?;
         for (e, bits) in drawn.iter().zip(&scored.bits) {
-            let family = match &e.patch {
-                None => "clean",
-                Some(interchange::Patch::Part { factor: 0, .. }) => "remove_part",
-                Some(interchange::Patch::Part { .. }) => "amplify_part",
-                Some(_) => "read",
-            };
-            let entry = scores.entry(family).or_default();
+            let entry = scores.entry(family(e)).or_default();
             entry.0.extend_from_slice(bits);
             entry.1.extend(bits.first());
             entry.2 += 1;
         }
+        batches.push((batch, drawn));
         log::info!("edits: batch {b} scored ({:.0} s)", started.elapsed().as_secs_f64());
+    }
+    // The edits' effect on M, KL(M_e ‖ M), over the same tokens: the same experiments with P = M
+    // applying no edit.
+    drop(experiments);
+    let mut reference = interchange::Interchange::new(device, native, layers, &gam_mpd::artifact::Artifact::native(native)?, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
+    reference.set_parts(parts)?;
+    reference.unedited_explanation();
+    let mut effects: BTreeMap<&str, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for (batch, drawn) in &batches {
+        for (e, bits) in drawn.iter().zip(&reference.evaluate(batch, drawn, false)?.bits) {
+            let entry = effects.entry(family(e)).or_default();
+            entry.0.extend_from_slice(bits);
+            entry.1.extend(bits.first());
+        }
     }
     let summary = |values: &mut Vec<f64>| {
         values.sort_by(f64::total_cmp);
@@ -254,9 +272,15 @@ fn edit_faithfulness(
     let mut families = serde_json::Map::new();
     for (family, (mut all, mut edited, count)) in scores {
         let (tokens, (mean, p99), (edited_mean, edited_p99)) = (all.len(), summary(&mut all), summary(&mut edited));
+        let (mut effect_all, mut effect_edited) = effects.remove(family).unwrap_or_default();
+        let ((effect_mean, effect_p99), (effect_edited_mean, effect_edited_p99)) = (summary(&mut effect_all), summary(&mut effect_edited));
         families.insert(
             family.into(),
-            json!({"experiments": count, "tokens": tokens, "mean_bits_per_token": mean, "p99_bits_per_token": p99, "edited_token_mean_bits": edited_mean, "edited_token_p99_bits": edited_p99}),
+            json!({
+                "experiments": count, "tokens": tokens,
+                "mean_bits_per_token": mean, "p99_bits_per_token": p99, "edited_token_mean_bits": edited_mean, "edited_token_p99_bits": edited_p99,
+                "effect_mean_bits_per_token": effect_mean, "effect_p99_bits_per_token": effect_p99, "effect_edited_token_mean_bits": effect_edited_mean, "effect_edited_token_p99_bits": effect_edited_p99,
+            }),
         );
     }
     let report = json!({
