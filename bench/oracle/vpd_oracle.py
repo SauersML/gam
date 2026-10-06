@@ -389,6 +389,7 @@ def train(args):
     oracle = Oracle(args.base, args.lora_rank, args.inject, dev)
     oracle.model.base_model.model.gradient_checkpointing_enable()
     oracle.model.base_model.model.config.use_cache = False
+    oracle.model.train()  # checkpointing acts only in training mode (no dropout in Qwen3 or the adapter)
     optimizer = torch.optim.AdamW(oracle.trainable(), lr=args.lr, weight_decay=0.0)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
