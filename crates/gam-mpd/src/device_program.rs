@@ -2119,13 +2119,17 @@ impl DeviceProgram {
         trainable: &[usize],
         arithmetic: Arithmetic,
     ) -> Result<(BTreeMap<usize, Tensor>, BTreeMap<usize, Tensor>), String> {
-        self.vjp_values_dense_edited(trace, seeds, keep, trainable, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()))
+        let mut gradients = BTreeMap::new();
+        let nodes = self.vjp_values_dense_edited(trace, seeds, keep, trainable, arithmetic, (&BTreeSet::new(), &mut |_, _| Ok(())), &mut gradients)?;
+        Ok((nodes, gradients))
     }
 
     /// [`Self::vjp_values_dense`] of a forward pass whose nodes `edited` were edited: at each,
     /// `hook` maps the cotangent of the edited value to that of the value the node computed (the
     /// transpose of the edit) before the node's own rule reads it; the hook keeps any other part
-    /// of the edit's transpose itself (`interchange`).
+    /// of the edit's transpose itself (`interchange`). The operators' gradients are added into
+    /// `gradients`, an operator's entry made zero where it has none (a pass's sums over its calls,
+    /// each added in place by its products), and the kept nodes' cotangents returned.
     pub fn vjp_values_dense_edited(
         &self,
         trace: &DeviceTrace,
@@ -2133,9 +2137,9 @@ impl DeviceProgram {
         keep: &[usize],
         trainable: &[usize],
         arithmetic: Arithmetic,
-        edited: &BTreeSet<usize>,
-        hook: &mut dyn FnMut(usize, &mut Tensor) -> Result<(), String>,
-    ) -> Result<(BTreeMap<usize, Tensor>, BTreeMap<usize, Tensor>), String> {
+        (edited, hook): (&BTreeSet<usize>, &mut dyn FnMut(usize, &mut Tensor) -> Result<(), String>),
+        gradients: &mut BTreeMap<usize, Tensor>,
+    ) -> Result<BTreeMap<usize, Tensor>, String> {
         if self.head.operator.is_some() {
             return Err("device: dense values VJP requires resident-value compilation".into());
         }
@@ -2143,7 +2147,6 @@ impl DeviceProgram {
         if requested.len() != trainable.len() {
             return Err("device: duplicate trainable operator".into());
         }
-        let mut gradients = BTreeMap::new();
         for &op in &requested {
             if self
                 .operators
@@ -2162,7 +2165,14 @@ impl DeviceProgram {
             }
             // Dense literals may be executed by an exact diagonal fast path;
             // their parameter space still contains every matrix entry.
-            gradients.insert(op, self.device.zeros(held.source.rows.width(), held.source.cols.width()).map_err(error)?);
+            let shape = (held.source.rows.width(), held.source.cols.width());
+            match gradients.get(&op) {
+                Some(sum) if sum.dim() != shape => return Err("device: a gradient sum of another shape".into()),
+                Some(_) => {}
+                None => {
+                    gradients.insert(op, self.device.zeros(shape.0, shape.1).map_err(error)?);
+                }
+            }
         }
         // A group that ran fused, none of whose members is kept, seeded or edited and none of whose
         // projection biases is trainable, reverses fused and adds its projections' gradients itself
@@ -2203,7 +2213,7 @@ impl DeviceProgram {
                 retained.push(node);
             }
         }
-        let (mut nodes, mut rounded) = self.reverse_seeds(trace, seeds, &retained, arithmetic, edited, hook, &mut gradients)?;
+        let (mut nodes, mut rounded) = self.reverse_seeds(trace, seeds, &retained, arithmetic, edited, hook, gradients)?;
         // One scalar constant is uploaded; all reductions and gradient arrays stay
         // on the device. Reuse the same broadcast across every column occurrence.
         let has_columns = requested.iter().any(|op| self.operators.contains_key(&(*op, Role::Column)));
@@ -2239,7 +2249,7 @@ impl DeviceProgram {
             }
         }
         nodes.retain(|node, _| keep.contains(node));
-        Ok((nodes, gradients))
+        Ok(nodes)
     }
 
     fn attend_cotangent(

@@ -898,15 +898,7 @@ impl BlockEngine for Model<'_> {
                 None => Ok(()),
             }
         };
-        let (nodes, gradients) = self.program.vjp_values_dense_edited(tape, seeds, &keep, &self.sites.trainable[block], arithmetic, &edited, &mut hook)?;
-        for (op, g) in gradients {
-            match gradient.get_mut(&op) {
-                Some(total) => d.axpy(total, 1.0, &g).map_err(error)?,
-                None => {
-                    gradient.insert(op, g);
-                }
-            }
-        }
+        let nodes = self.program.vjp_values_dense_edited(tape, seeds, &keep, &self.sites.trainable[block], arithmetic, (&edited, &mut hook), gradient)?;
         let entering = if block > 0 {
             d.copy(nodes.get(&self.entry(block)).ok_or_else(|| error("no cotangent of a block's entering stream"))?).map_err(error)?
         } else {
