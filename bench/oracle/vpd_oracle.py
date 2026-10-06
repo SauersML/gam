@@ -329,12 +329,11 @@ class Oracle(torch.nn.Module):
         for b, (t, _) in enumerate(enc):
             ids[b, : len(t)] = torch.tensor(t)
             mask[b, : len(t)] = 1
+        # The hook stays set until the caller is done with this batch (after its backward pass), so
+        # checkpointed layers inject again when they are recomputed.
         self.hook.set(self.injection(table, [(ex["layer"], ex["kind"], ex["c"]) for ex in batch], condition, [places for _, places in enc]))
         inner = self.model.get_base_model()
-        try:
-            hidden = inner.model(input_ids=ids.to(self.dev), attention_mask=mask.to(self.dev)).last_hidden_state
-        finally:
-            self.hook.set(None)
+        hidden = inner.model(input_ids=ids.to(self.dev), attention_mask=mask.to(self.dev)).last_hidden_state
         last = mask.sum(1) - 1
         k = max(len(ex["options"]) for ex in batch)
         logits = torch.nn.functional.linear(hidden[torch.arange(len(batch), device=self.dev), last.to(self.dev)], inner.lm_head.weight[self.letters[:k]]).float()
@@ -354,6 +353,8 @@ def train(args):
     table = Table(Path(args.labels), Path(args.uv), Path(args.graph) if args.graph else None)
     data = examples(table, {0, 1, 2, 3} - held, args.examples, args.seed)
     oracle = Oracle(args.base, args.lora_rank, args.inject, dev)
+    oracle.model.base_model.model.gradient_checkpointing_enable()
+    oracle.model.base_model.model.config.use_cache = False
     optimizer = torch.optim.AdamW(oracle.trainable(), lr=args.lr, weight_decay=0.0)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -365,6 +366,7 @@ def train(args):
         loss = -log_scores(log_q, valid, batch).mean()
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        oracle.hook.set(None)
         torch.nn.utils.clip_grad_norm_(oracle.trainable(), 1.0)
         optimizer.step()
         log.write(json.dumps({"step": step, "loss_nats": float(loss.detach()), "seconds": time.time() - started}) + "\n")
@@ -389,6 +391,7 @@ def evaluate(args):
         for s in range(0, len(data), config["batch"]):
             batch = data[s : s + config["batch"]]
             lq, valid = oracle.log_q(table, batch, config["condition"])
+            oracle.hook.set(None)
             for ex, score in zip(batch, log_scores(lq, valid, batch).tolist()):
                 rows.append({"split": split, "question": ex["kind_q"], "layer": ex["layer"], "kind": ex["kind"], "c": ex["c"], "context": ex["context"], "log_score": score})
     (Path(args.run) / f"eval_{Path(args.labels).name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
