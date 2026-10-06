@@ -21,6 +21,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 
 C7 = '/Users/user/mpd-data/compare/new_ops/c7'
 RP = '/Users/user/mpd-data/runpod'
@@ -94,6 +95,9 @@ if len(sys.argv) > 1 and points:
         ax.plot([p['active'], p['executed']], [p['gap'], p['gap']], color=c, lw=1)
         ax.annotate('\n'.join(textwrap.wrap(p['label'], 34)) + f"\n{p['description_bits'] / 1e6:.1f}M bits", (p['executed'], p['gap']), textcoords='offset points', xytext=(8, 4), fontsize=10)
     ax.set_xscale('log')
+    ax.set_xlim(100, 1e5)
+    ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f'{v:,.0f}'))
     ax.set_xlabel('parts executed per token, rank-one units (filled); active (open)')
     ax.set_ylabel('held-out edit KL(M_e || P_e), bits/token')
     ax.set_ylim(bottom=0)
