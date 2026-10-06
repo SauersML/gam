@@ -2662,6 +2662,11 @@ mod tests {
         let settings = settings();
         let mut scorer = Scorer::new(&Device::host(), &native, &explanation, &settings).unwrap();
         let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 72.0, None, 0).unwrap();
+        // Every cut and a read patch must be drawn: each held-out base draws one clean and one
+        // patched experiment, and six bases leave some of the families out, so the six token
+        // rows are cycled into 96 bases (a family drawn with chance p per experiment is missed
+        // with chance (1 - p)^96).
+        let sequences: Vec<Vec<u32>> = sequences.iter().cycle().take(96).cloned().collect();
         let evaluation = held_out(&mut scorer, &explanation, (&posterior, &device_posterior), &sequences, &settings, 72, None).unwrap();
         for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
             let bits = bits.expect("every cut and the read patches are drawn");
@@ -2930,6 +2935,11 @@ mod tests {
         let posterior = Posterior::new(&explanation, 72).unwrap();
         let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
         let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        // Every cut and a read patch must be drawn: each held-out base draws one clean and one
+        // patched experiment, and six bases leave some of the families out, so the six token
+        // rows are cycled into 96 bases (a family drawn with chance p per experiment is missed
+        // with chance (1 - p)^96).
+        let sequences: Vec<Vec<u32>> = sequences.iter().cycle().take(96).cloned().collect();
         let evaluation = held_out(&mut scorer, &explanation, (&posterior, &device_posterior), &sequences, &settings, 72, None).unwrap();
         for bits in evaluation.clean.iter().chain(&evaluation.patched).chain([&evaluation.read_patch]) {
             let bits = bits.expect("every cut and the read patches are drawn");
