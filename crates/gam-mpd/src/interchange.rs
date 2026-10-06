@@ -1058,14 +1058,12 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
     Ok((stream, calls))
 }
 
-/// The products' precision of the reverse passes (the data term's gradient and the sampled-label
-/// factor): bfloat16 on CUDA in f32 storage (whose bfloat16 tensor cores run at least twice its
-/// f32 rate), else the forward's `arithmetic`. The forward pass and the scores, the objective,
-/// keep the forward's arithmetic, so `F` is unchanged. Each pass's result is one Monte Carlo draw:
-/// the gradient at one weight sample, whose noise from the sample dominates its entries, and the
-/// factor, whose square estimates the Gauss–Newton diagonal with a relative standard deviation near
-/// one; bfloat16 operands move their entries by a few percent (`Interchange::fuse`), differently
-/// at every sample.
+/// The products' precision of the sampled-label factor's reverse pass: bfloat16 on CUDA in f32
+/// storage (whose bfloat16 tensor cores run at least twice its f32 rate), else the forward's
+/// `arithmetic`. The factor is one label draw, whose square estimates the Gauss–Newton diagonal
+/// with a relative standard deviation near one per entry; bfloat16 operands move each entry by a
+/// few percent, which adds about a percent to that variance. The data term's gradient, which
+/// IVON's mean follows, keeps the forward's arithmetic.
 fn factor_arithmetic(d: &Device, arithmetic: Arithmetic) -> Arithmetic {
     if d.storage() == Storage::F32 && d.with_storage(Storage::Bf16).is_ok() { Arithmetic::Bf16 } else { arithmetic }
 }
@@ -1532,7 +1530,7 @@ pub fn evaluate_labelled<E: BlockEngine>(
         }
         if gradient {
             let seed = seed.ok_or_else(|| error("the head returned no cotangent"))?;
-            run_reverse([p, m], &plan, &calls, spread(&seed, 1.0 / std::f64::consts::LN_2)?, &mut total, factor_arithmetic(d, arithmetic))?;
+            run_reverse([p, m], &plan, &calls, spread(&seed, 1.0 / std::f64::consts::LN_2)?, &mut total, arithmetic)?;
         }
     }
     let factor = match labels {
