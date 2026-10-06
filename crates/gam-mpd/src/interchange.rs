@@ -2666,6 +2666,8 @@ pub struct Scored {
     /// The gradient of the sum of `bits` in each trainable operator, in the order they were given
     /// (empty when not asked for).
     pub gradient: Vec<ndarray::Array2<f64>>,
+    /// The forward pass's work ([`Work`]).
+    pub work: Work,
 }
 
 /// `M` and `P` compiled for interchange experiments, with the head they share and `P`'s read
@@ -2997,7 +2999,7 @@ impl Interchange {
         let targets = self.targets(batch, experiments)?;
         let evaluation = self.evaluate_resident(batch, experiments, &targets, gradient)?;
         if !gradient {
-            return Ok(Scored { bits: evaluation.bits, gradient: Vec::new() });
+            return Ok(Scored { bits: evaluation.bits, gradient: Vec::new(), work: evaluation.work });
         }
         let d = self.p.device();
         let gradient = self
@@ -3014,7 +3016,7 @@ impl Interchange {
         if gradient.iter().any(|g| g.iter().any(|v| !v.is_finite())) {
             return Err(error("a nonfinite parameter gradient"));
         }
-        Ok(Scored { bits: evaluation.bits, gradient })
+        Ok(Scored { bits: evaluation.bits, gradient, work: evaluation.work })
     }
 }
 
