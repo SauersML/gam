@@ -21,9 +21,9 @@ on the policy that sampled it, so the probability ratio is 1 and needs no clippi
 GRPOTrainer is not used: the policy reads vectors injected into its residual stream at per-example
 placeholders, which neither TRL's generation nor vLLM's can carry, so the objective is written out here.
 
-  vpd_describe.py train --answer RUN --labels TRAIN_LABELS --uv UV --graph GRAPH --reward HOST:PORT
+  vpd_describe.py train --answer RUN --labels TRAIN_LABELS --uv UV --relations REL --reward HOST:PORT
                         --steps N --out DIR [--components 4] [--group 8] [--turns 4] [--tokens 768] [--lr 1e-5]
-  vpd_describe.py evaluate --policy DIR --labels HELDOUT_LABELS --uv UV --graph GRAPH --reward HOST:PORT
+  vpd_describe.py evaluate --policy DIR --labels HELDOUT_LABELS --uv UV --relations REL --reward HOST:PORT
                         [--count 256]   (one description per held-out-layer subcomponent, scored)
 """
 
@@ -46,7 +46,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "vpd_2951"))
 import vpd_model as VM  # noqa: E402
 from vpd_labels import Model, load_uv  # noqa: E402
-from vpd_oracle import Oracle, Table, device, site_name  # noqa: E402
+from vpd_oracle import SLOTS, Oracle, Table, device, site_name, slots  # noqa: E402
 
 TOOLS = [
     {"type": "function", "function": {"name": "edit_target", "description": "Edit the target model: W <- W + (alpha - 1) u v^T for one subcomponent (alpha 0 removes it, 2 doubles it). Edits compose. Returns how the current edits change the next-token predictions at the studied component's strongest contexts.",
@@ -165,19 +165,23 @@ class Episodes:
         self.template = lambda before, after: tok.apply_chat_template([{"role": "user", "content": before + marker + after + INSTRUCTION}], tools=TOOLS,
                                                                        add_generation_prompt=True, enable_thinking=True, tokenize=False).split(marker)
 
+    def example(self, comp) -> dict:
+        layer, kind, c = comp
+        return {"layer": layer, "kind": kind, "c": c, "kind_q": "describe", "context": int(self.table.sites[(layer, kind)][1]["contexts"][c, 0]), "position": 0, "j": -1,
+                "question": "", "options": [], "candidates": [], "stratum": -1}
+
+    def slots(self, comp) -> list[tuple]:
+        return slots(self.table, self.example(comp), self.condition)
+
     def prompt(self, comp) -> tuple[list[int], list[int]]:
         from vpd_oracle import prompt as base_prompt
 
-        layer, kind, c = comp
-        ex = {"layer": layer, "kind": kind, "c": c, "context": int(self.table.sites[(layer, kind)][1]["contexts"][c, 0]), "position": 0, "j": -1,
-              "question": "", "options": []}
-        before, after = base_prompt(self.table, ex, self.condition)
+        before, after = base_prompt(self.table, self.example(comp), self.condition)
         after = after.split("\nText:")[0]  # the subcomponent and its neighbourhood, no question text
         head, tail = self.template(before, after)
         enc = self.oracle.tokenizer.encode
         a = enc(head, add_special_tokens=False)
-        slots = 2 + 2 * self.table.k
-        return a + [self.oracle.placeholder] * slots + enc(tail, add_special_tokens=False), list(range(len(a), len(a) + slots))
+        return a + [self.oracle.placeholder] * (2 * SLOTS) + enc(tail, add_special_tokens=False), list(range(len(a), len(a) + 2 * SLOTS))
 
     def batch_inputs(self, convs, places):
         width = max(len(c) for c in convs)
@@ -208,7 +212,7 @@ class Episodes:
             if not live:
                 break
             ids, mask, shifted = self.batch_inputs([convs[r] for r in live], [places[r] for r in live])
-            o.hook.set(o.injection(self.table, [comps[r] for r in live], self.condition, shifted))
+            o.hook.set(o.injection(self.table, [self.slots(comps[r]) for r in live], shifted))
             try:
                 gen = o.model.generate(input_ids=ids, attention_mask=mask, max_new_tokens=args.tokens, do_sample=True, temperature=1.0, top_p=1.0,
                                        eos_token_id=self.end, pad_token_id=self.end)
@@ -251,7 +255,7 @@ class Episodes:
         return convs, places, own, [description_of(t) for t in texts], texts, calls
 
 
-def policy_step(oracle: Oracle, table: Table, condition: str, convs, places, own, comps, advantage, micro: int) -> float:
+def policy_step(oracle: Oracle, table: Table, episodes: "Episodes", convs, places, own, comps, advantage, micro: int) -> float:
     """Accumulate the GRPO gradient: -sum_e advantage_e x (mean log-probability of episode e's own
     tokens) / episodes, micro-batch by micro-batch. The injection hook stays set until each micro-batch's
     backward pass ends, so recomputed (checkpointed) layers inject as the forward did; the output layer
@@ -273,7 +277,7 @@ def policy_step(oracle: Oracle, table: Table, condition: str, convs, places, own
             mask[r, : len(c)] = 1
             weight[r, : len(w)] = torch.tensor(w, dtype=torch.float32)
         ids, mask, weight = ids.to(oracle.dev), mask.to(oracle.dev), weight.to(oracle.dev)
-        oracle.hook.set(oracle.injection(table, ms, condition, ps))
+        oracle.hook.set(oracle.injection(table, [episodes.slots(m) for m in ms], ps))
         try:
             hidden = oracle.model.base_model.model.model(input_ids=ids, attention_mask=mask).last_hidden_state[:, :-1]
             rows, cols = (weight[:, 1:] > 0).nonzero(as_tuple=True)
@@ -308,7 +312,7 @@ def train(args):
     config = json.loads((run / "config.json").read_text())
     oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev)
     oracle.load(run)
-    table = Table(Path(args.labels), Path(args.uv), Path(args.graph) if args.graph else None)
+    table = Table(Path(args.labels), Path(args.uv), Path(args.relations) if args.relations else None, Path(args.tokenizer))
     target = Target(dev, load_uv(dev, Path(args.uv)), table)
     episodes = Episodes(oracle, table, target, config["condition"], args)
     held = {int(x) for x in config["heldout_layers"].split(",") if x}
@@ -331,7 +335,7 @@ def train(args):
         oracle.model.base_model.model.gradient_checkpointing_enable()
         oracle.model.base_model.model.config.use_cache = False
         optimizer.zero_grad(set_to_none=True)
-        loss = policy_step(oracle, table, config["condition"], convs, places, own, comps, advantage, args.micro)
+        loss = policy_step(oracle, table, episodes, convs, places, own, comps, advantage, args.micro)
         torch.nn.utils.clip_grad_norm_(oracle.trainable(), 1.0)
         optimizer.step()
         log.write(json.dumps({"step": step, "mean_reward_bits": float(rewards.mean()), "best_reward_bits": float(rewards.max()), "loss": loss,
@@ -350,7 +354,7 @@ def evaluate(args):
     config = json.loads((run / "config.json").read_text())
     oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev)
     oracle.load(run)
-    table = Table(Path(args.labels), Path(args.uv), Path(args.graph) if args.graph else None)
+    table = Table(Path(args.labels), Path(args.uv), Path(args.relations) if args.relations else None, Path(args.tokenizer))
     target = Target(dev, load_uv(dev, Path(args.uv)), table)
     episodes = Episodes(oracle, table, target, config["condition"], argparse.Namespace(turns=args.turns, tokens=args.tokens))
     held = {int(x) for x in config["heldout_layers"].split(",") if x}
@@ -372,7 +376,8 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("--labels", required=True)
         p.add_argument("--uv", required=True)
-        p.add_argument("--graph")
+        p.add_argument("--relations", help="vpd_relations.py's output for these labels (the measured neighbourhoods)")
+        p.add_argument("--tokenizer", default=str(Path.home() / "mpd-data/vpd/t-9d2b8f02/tokenizer.json"))
         p.add_argument("--reward", required=True, help="codelength.py serve's HOST:PORT")
         p.add_argument("--turns", type=int, default=4, help="tool calls an episode may make")
         p.add_argument("--tokens", type=int, default=768, help="tokens one turn may generate")

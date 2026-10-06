@@ -1,48 +1,53 @@
-"""The oracle on VPD's decomposition of vpd4l (#2951), answer mode: Qwen3 with a LoRA reads one rank-one
-subcomponent u v^T of the 4-layer Pile model (its two vectors, through learned linear maps, injected at
-placeholder tokens with reporter.py's hook) and answers questions whose answers are exact measurements
-(vpd_labels.py), trained on the proper log score.
+"""The oracle on VPD's decomposition of vpd4l (#2951), answer mode: Qwen3 with a LoRA reads rank-one
+subcomponents u v^T of the 4-layer Pile model (their two vectors, through learned linear maps, injected
+at placeholder tokens with reporter.py's hook) and answers questions whose answers are exact native
+measurements (vpd_labels.py, vpd_relations.py), trained on the proper log score.
 
 Input of a subcomponent. Its site (layer, kind) in words; its read vector v and write vector u, each
 mapped by a learned linear map of its own space (per kind and side: q, k, v read the normed residual and
 write a head space; o reads the heads' concatenation and writes the residual; c_fc reads the normed
 residual and writes the MLP's hidden layer; down_proj reads that and writes the residual) to the
-oracle's hidden width, and injected after decoder layer `--inject` at two placeholder tokens: the
-residual r there becomes r + ||r|| m / ||m|| (m the mapped vector) plus a learned embedding of the
-vector's role and of log ||u|| ||v|| (reporter.Magnitude: u v^T fixes only the product of the norms).
+oracle's hidden width, injected after decoder layer `--inject` at two placeholder tokens: the residual r
+there becomes r + ||r|| m / ||m|| (m the mapped vector) plus a learned embedding of the slot's role and
+of a log magnitude (reporter.Magnitude): log ||u|| ||v|| for a subcomponent itself (u v^T fixes only the
+product of the norms), log of the measured effect for a neighbour.
 
-Questions (each a choice among labelled options; q = the softmax of the oracle's logits on the letters;
-loss -sum_k p_k ln q_k with p the measured answer, one-hot here):
-  activity    at a marked token of a text: the subcomponent's activity there on the 0-9 scale of its
-              largest |v . x| over its measured contexts (floor(10 |a| / peak), 9 at most); the marked
-              token is the context's peak or a uniformly drawn position, half each;
-  direction   removing (alpha 0) or amplifying (alpha 1.5) the subcomponent: does the probability of a
-              listed next token at the marked position rise or fall (a token drawn from the 10 that rise
-              most and the 10 that fall most there; the subcomponent's top contexts only, where its
-              effects exceed the arithmetic's floor);
-  top         which of 4 tokens rises most in probability when the subcomponent is removed (the measured
-              top one and 3 drawn from other contexts' lists).
-  which_upstream  (readers, with a graph) which of its 4 strongest upstream writers contributes most to
-              its activity at its peak in a context: the largest reduction of |a_B| when that edge is
-              cut by path patching (vpd_graph.py);
-  edge_cut    (readers, with a graph) cutting the edge from one of those writers: does a listed next
-              token's probability at the peak rise or fall.
-Graph neighbourhood. With --graph, every example carries its subcomponent's k strongest residual
-neighbours (upstream writers of a reader, downstream readers of a writer; vpd_graph.py), each as two more
-placeholders (the neighbour's read and write vectors through their own maps, the magnitude term carrying
-the log of the edge's strength) and, in the graph condition, a line naming each neighbour's site and
-strength. Edge questions name their candidates' sites in every condition.
+Neighbourhood (context, chosen by measured effect, vpd_relations.py): on the subcomponent's strongest
+texts, the upstream subcomponents whose removal most changes its activity at its peak and the downstream
+ones whose activity most depends on it (their mean |change| relative to the reader's own peak |activity|,
+over the measured contexts); the 4 strongest of each, each as two more placeholders.
+
+Questions (a choice among labelled options; q = the softmax of the oracle's logits on the letters; loss
+-ln q(measured answer)):
+  activity      at a marked token: the subcomponent's activity level there, 0-9 of its largest
+                |v . x| over its measured contexts; the token is the context's peak or uniform, half each;
+  direction     removing (alpha 0) or amplifying (alpha 1.5) it: does a listed next token's probability
+                at the marked token rise or fall (a token from the 10 rising and 10 falling most there);
+  top           which of 4 tokens gains most probability when it is removed;
+  continuation  multiplied by alpha (2, 4 or 8, stated), how the model continues greedily after its
+                strongest peak: the amplified continuation, the unedited one (the answer when they agree)
+                and one from another subcomponent;
+  edge          cutting one measured upstream neighbour's write out of what this subcomponent reads (path
+                patch): how its activity at the peak changes, relative to its own peak: falls or rises
+                strongly (by more than 0.25), slightly (0.05 to 0.25), or barely (less than 0.05); the
+                strong edges and the near-zero ones as measured;
+  attribution   at a marked token where the model predicts X: which of 4 listed subcomponents (given as
+                vectors, a candidate's slot) raises X most (the largest fall of log p(X) when removed).
+Effect questions (direction, top) are drawn by effect stratum (the decade of the removal KL at the peak:
+below 1e-5, then decades to 1e-1 and above), equal shares, or from the natural distribution.
+
 Conditions at matched capacity (same base, adapter, maps, examples, order, steps; every placeholder
-always present, those a condition withholds receive nothing): graph (the subcomponent's vectors and its
+present, those a condition withholds receive nothing): graph (the subcomponent's vectors and its
 neighbourhood), weights (its vectors alone), activity (no vectors; its three most active other contexts
-as text with their peak token marked and its 0-9 level), nothing.
+as text with the peak token marked and its level), nothing. Candidates of an attribution question are
+shown as vectors in graph and weights, named by site in every condition.
 
-Held out: subcomponents of --heldout-layers (never trained on) on held-out texts (the held-out label run),
-and trained layers on held-out texts.
+Held out: subcomponents of --heldout-layers (never trained on) on held-out texts (the held-out runs), and
+trained layers on held-out texts.
 
-  vpd_oracle.py train --base MODEL --labels TRAIN_DIR --uv UV [--graph GRAPH_DIR] --condition C --steps N --out DIR
+  vpd_oracle.py train --base MODEL --labels TRAIN --relations TRAIN_REL --uv UV --condition C --steps N --out DIR
                       [--heldout-layers 2] [--examples 65536] [--batch 16] [--lr 1e-4] [--lora-rank 64]
-  vpd_oracle.py evaluate --run DIR --labels HELDOUT_DIR --uv UV [--graph GRAPH_DIR] [--examples 4096]
+  vpd_oracle.py evaluate --run DIR --labels HELDOUT --relations HELDOUT_REL --uv UV [--examples 4096]
   vpd_oracle.py compare --runs DIR... --eval eval_<labels>.jsonl --out SUMMARY.json
 """
 
@@ -67,10 +72,15 @@ from reporter import Injection, Magnitude  # noqa: E402
 KINDS = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")
 LABELS = "ABCDEFGHIJ"
 CONDITIONS = ("graph", "weights", "activity", "nothing")
-# reporter.Magnitude's role embedding indices: own read, own write, a neighbour's read, a neighbour's write.
-ROLE = {"read": 4, "write": 5, "neighbour_read": 1, "neighbour_write": 3}
+QUESTIONS = ("activity", "direction", "top", "continuation", "edge", "attribution")
 BINS = 10
+NEIGHBOURS = 4  # per direction
+SLOTS = 1 + 2 * NEIGHBOURS  # subcomponents per example: itself, then neighbours or candidates
 TOKENIZER = Path.home() / "mpd-data/vpd/t-9d2b8f02/tokenizer.json"
+# reporter.Magnitude's role embedding indices for the slots.
+ROLE = {"read": 4, "write": 5, "up_read": 1, "up_write": 3, "down_read": 0, "down_write": 2}
+STRATA = (0.0, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, float("inf"))
+EDGE_LEVELS = ("falls strongly", "falls slightly", "barely changes", "rises slightly", "rises strongly")
 
 
 def device() -> torch.device:
@@ -85,70 +95,96 @@ def site_name(layer: int, kind: str) -> str:
     return f"h.{layer}.{'mlp' if kind in ('c_fc', 'down_proj') else 'attn'}.{kind}"
 
 
-class Table:
-    """A label run's sites (vpd_labels.py output) and the decomposition's vectors."""
-
-    def __init__(self, root: Path, uv_path: Path, graph: Path | None = None, tokenizer: Path = TOKENIZER):
-        import tokenizers
-
-        self.root = root
-        self.graph, self.k, self.offsets = None, 0, None
-        if graph is not None:
-            self.graph = load_file(str(graph / "graph.safetensors"))
-            meta = json.loads((graph / "graph.json").read_text())
-            self.k, self.offsets = meta["k"], meta["site_offsets"]
-        self.tokens = load_file(str(root / "contexts.safetensors"))["tokens"].long()
-        self.sites = {}
-        for meta_path in sorted(root.glob("site_*.json")):
-            meta = json.loads(meta_path.read_text())
-            kind = meta["site"].split(".")[-1]
-            self.sites[(meta["layer"], kind)] = (meta, load_file(str(meta_path.with_suffix(".safetensors"))))
-        self.uv = load_file(str(uv_path))
-        self.tok = tokenizers.Tokenizer.from_file(str(tokenizer))
-
-    def vectors(self, layer: int, kind: str, c: int) -> tuple[torch.Tensor, torch.Tensor]:
-        name = site_name(layer, kind)
-        return self.uv[f"{name}.V"][:, c], self.uv[f"{name}.U"][c]
-
-    def site_of(self, gid: int) -> tuple[int, str, int]:
-        """(layer, kind, index) of a global subcomponent id (vpd_graph.Ids)."""
-        name = max((n for n, o in self.offsets.items() if o <= gid), key=lambda n: self.offsets[n])
-        return int(name.split(".")[1]), name.split(".")[-1], gid - self.offsets[name]
-
-    def neighbours(self, layer: int, kind: str, c: int) -> list[tuple[int, str, int, float]]:
-        """The k strongest residual neighbours: (layer, kind, index, strength), strongest first."""
-        if self.graph is None:
-            return []
-        name = site_name(layer, kind)
-        key = f"{name}.up_ids" if f"{name}.up_ids" in self.graph else f"{name}.down_ids"
-        if key not in self.graph:
-            return []
-        ids = self.graph[key][c].tolist()
-        strength = self.graph[key.replace("_ids", "_strength")][c].tolist()
-        return [(*self.site_of(int(g)), float(s)) for g, s in zip(ids, strength)]
-
-    def text(self, ctx: int, upto: int, mark: int) -> str:
-        """The context's tokens up to `upto` (inclusive) with token `mark` set off by double brackets."""
-        ids = self.tokens[ctx, : upto + 1].tolist()
-        return self.tok.decode(ids[:mark]) + "⟦" + self.tok.decode([ids[mark]]) + "⟧" + self.tok.decode(ids[mark + 1 :])
+def stratum(kl: float) -> int:
+    return int(min(len(STRATA) - 2, np.searchsorted(STRATA, kl, side="right") - 1))
 
 
 def level(a: float, peak: float) -> int:
     return 0 if peak <= 0 else min(BINS - 1, int(math.floor(BINS * abs(a) / peak)))
 
 
-# Effect strata: the decade of KL(clean || removed) at the context's peak (nats). Single subcomponents
-# mostly change little (median 3e-4 at their strongest contexts), so effect questions are drawn equally
-# from each stratum when stratified: a known one-sixth below 1e-5 and as many above 1e-1.
-STRATA = (0.0, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, float("inf"))
+def edge_level(rel: float) -> int:
+    if abs(rel) < 0.05:
+        return 2
+    return (0 if rel <= -0.25 else 1) if rel < 0 else (3 if rel < 0.25 else 4)
 
 
-def stratum(kl: float) -> int:
-    return int(np.searchsorted(STRATA, kl, side="right") - 1)
+class Table:
+    """A label run (vpd_labels.py), its relations (vpd_relations.py), the vectors, the tokenizer."""
+
+    def __init__(self, root: Path, uv_path: Path, relations: Path | None = None, tokenizer: Path = TOKENIZER):
+        import tokenizers
+
+        self.tokens = load_file(str(root / "contexts.safetensors"))["tokens"].long()
+        self.sites = {}
+        for meta_path in sorted(root.glob("site_*.json")):
+            meta = json.loads(meta_path.read_text())
+            self.sites[(meta["layer"], meta["site"].split(".")[-1])] = (meta, load_file(str(meta_path.with_suffix(".safetensors"))))
+        self.uv = load_file(str(uv_path))
+        self.tok = tokenizers.Tokenizer.from_file(str(tokenizer))
+        self.rel = {}
+        self.offsets = None
+        if relations is not None:
+            meta = json.loads((relations / "relations.json").read_text())
+            self.offsets = meta["site_offsets"]
+            for part in ("upstream", "downstream", "edges", "attribution", "continuations"):
+                path = relations / f"relations_{part}.safetensors"
+                if path.exists():
+                    self.rel[part] = load_file(str(path))
+            self.peak = torch.zeros(meta["total"])
+            for (layer, kind), (_, d) in self.sites.items():
+                o = self.offsets[site_name(layer, kind)]
+                self.peak[o : o + d["activity"].shape[0]] = d["activity"].float().abs().amax((1, 2))
+        self._near: dict = {}
+
+    def gid(self, layer: int, kind: str, c: int) -> int:
+        return self.offsets[site_name(layer, kind)] + c
+
+    def site_of(self, gid: int) -> tuple[int, str, int]:
+        name = max((n for n, o in self.offsets.items() if o <= gid), key=lambda n: self.offsets[n])
+        return int(name.split(".")[1]), name.split(".")[-1], gid - self.offsets[name]
+
+    def vectors(self, layer: int, kind: str, c: int) -> tuple[torch.Tensor, torch.Tensor]:
+        name = site_name(layer, kind)
+        return self.uv[f"{name}.V"][:, c], self.uv[f"{name}.U"][c]
+
+    def neighbours(self, layer: int, kind: str, c: int) -> list[tuple[int, str, int, float, str]]:
+        """Up to 4 upstream and 4 downstream measured neighbours: (layer, kind, index, mean relative
+        effect, "up" | "down"), strongest first in each direction."""
+        if self.offsets is None:
+            return []
+        key = (layer, kind, c)
+        if key in self._near:
+            return self._near[key]
+        g = self.gid(layer, kind, c)
+        out = []
+        for part, sign in (("upstream", "up"), ("downstream", "down")):
+            if part not in self.rel:
+                continue
+            J = self.rel[part]["ids"].shape[1]
+            ids = self.rel[part]["ids"][g].reshape(-1)
+            vals = (self.rel[part]["delta"][g].reshape(-1) / max(float(self.peak[g]), 1e-30)) if part == "upstream" else self.rel[part]["relative"][g].reshape(-1)
+            # Mean over the measured contexts of the relative change (absent in a context: no change kept).
+            total: dict[int, float] = {}
+            for i, v in zip(ids.tolist(), vals.abs().tolist()):
+                if i >= 0 and i != g:
+                    total[i] = total.get(i, 0.0) + v / J
+            best = sorted(total.items(), key=lambda kv: -kv[1])[:NEIGHBOURS]
+            out += [(*self.site_of(i), v, sign) for i, v in best]
+        self._near[key] = out
+        return out
+
+    def text(self, ctx: int, upto: int, mark: int) -> str:
+        """The context's tokens up to `upto` (inclusive) with token `mark` set off by double brackets."""
+        ids = self.tokens[ctx, : upto + 1].tolist()
+        return self.tok.decode(ids[:mark]) + "⟦" + self.tok.decode([ids[mark]]) + "⟧" + self.tok.decode(ids[mark + 1 :])
+
+    def piece(self, token: int) -> str:
+        return json.dumps(self.tok.decode([int(token)]))
 
 
 def effect_index(table: Table, keys: list) -> list[np.ndarray]:
-    """Per stratum, the (site, subcomponent, context) triples whose removal KL falls in it."""
+    """Per effect stratum, the (site, subcomponent, context) triples whose removal KL falls in it."""
     per = [[] for _ in STRATA[:-1]]
     for k, key in enumerate(keys):
         kl = table.sites[key][1]["kl_ablate"].numpy()
@@ -160,88 +196,101 @@ def effect_index(table: Table, keys: list) -> list[np.ndarray]:
 
 
 def examples(table: Table, layers: set[int], count: int, seed: int, stratified: bool = True) -> list[dict]:
-    """`count` questions, the kinds in turn. Activity questions: subcomponents uniform over `layers`'
-    sites. Effect questions (direction, top): with `stratified`, the (subcomponent, context) drawn
-    equally from each effect stratum; without, uniform over subcomponents and their measured contexts
-    (the natural distribution). Each example records its stratum."""
+    """`count` questions, the kinds in turn (those the table's relations support)."""
     rng = random.Random(seed)
     keys = [k for k in table.sites if k[0] in layers]
+    kinds = ["activity", "direction", "top"]
+    if "continuations" in table.rel:
+        kinds.append("continuation")
+    if "edges" in table.rel:
+        kinds.append("edge")
+        edge_rows = [r for r in torch.nonzero(table.rel["edges"]["ids"][:, 0, 0] >= 0).reshape(-1).tolist() if table.site_of(r)[0] in layers]
+    if "attribution" in table.rel:
+        kinds.append("attribution")
+        att = table.rel["attribution"]
     index = effect_index(table, keys) if stratified else None
     out = []
     while len(out) < count:
+        q = kinds[len(out) % len(kinds)]
         layer, kind = keys[rng.randrange(len(keys))]
         meta, d = table.sites[(layer, kind)]
         c = rng.randrange(meta["subcomponents"])
-        effect_j = rng.randrange(meta["top"] + meta["random"])
-        if index is not None and len(out) % 3 in (1, 2):
-            pool = index[(len(out) // 3) % len(index)]
+        j = rng.randrange(meta["top"] + meta["random"])
+        if q in ("direction", "top") and index is not None:
+            pool = index[(len(out) // len(kinds)) % len(index)]
             if len(pool):
-                k, c, effect_j = (int(x) for x in pool[rng.randrange(len(pool))])
+                k, c, j = (int(x) for x in pool[rng.randrange(len(pool))])
                 layer, kind = keys[k]
                 meta, d = table.sites[(layer, kind)]
+        ex = {"layer": layer, "kind": kind, "c": c, "kind_q": q, "j": j, "stratum": -1, "candidates": []}
         contexts = d["contexts"][c].long()
-        act = d["activity"][c].float()  # [K, T]
+        act = d["activity"][c].float()
         peak = float(act.abs().max())
-        top = meta["top"]
-        name = site_name(layer, kind)
-        patched = table.graph is not None and f"{name}.patch_activity" in table.graph
-        which = len(out) % (5 if patched else 3)
-        base = {"layer": layer, "kind": kind, "c": c, "stratum": stratum(float(d["kl_ablate"][c, effect_j])) if which in (1, 2) else -1}
-        if which == 0:
-            j = rng.randrange(len(contexts))
+        if q == "activity":
             p = int(d["position"][c, j]) if rng.random() < 0.5 else rng.randrange(act.shape[1])
-            answer = level(float(act[j, p]), peak)
-            out.append({**base, "kind_q": "activity", "context": int(contexts[j]), "position": p, "j": j,
-                        "question": "How active is the component at the marked token, on a scale from 0 (inactive) to 9 (its largest activity)?",
-                        "options": [str(b) for b in range(BINS)], "answer": answer})
-        elif which == 1:
-            j = effect_j
+            ex.update(context=int(contexts[j]), position=p, options=[str(b) for b in range(BINS)], answer=level(float(act[j, p]), peak),
+                      question="How active is the component at the marked token, on a scale from 0 (inactive) to 9 (its largest activity)?")
+        elif q == "direction":
             p = int(d["position"][c, j])
-            edit = rng.choice(["ablate", "amplify"])
-            side = rng.choice(["up", "down"])
-            r = rng.randrange(10)
-            token = int(d[f"{side}_ids_{edit}"][c, j, r])
-            dp = float(d[f"{side}_dp_{edit}"][c, j, r])
+            edit, side, r = rng.choice(["ablate", "amplify"]), rng.choice(["up", "down"]), rng.randrange(10)
             verb = "removed" if edit == "ablate" else "made 1.5 times stronger"
-            word = table.tok.decode([token])
-            out.append({**base, "kind_q": "direction", "context": int(contexts[j]), "position": p, "j": j,
-                        "question": f"If the component is {verb}, does the probability that the next token after the marked token is {json.dumps(word)} go up or go down?",
-                        "options": ["up", "down"], "answer": 0 if dp > 0 else 1})
-        elif which in (3, 4):
-            g = table.graph
-            J = g[f"{name}.patch_activity"].shape[1]
-            j = rng.randrange(J)
-            p = int(d["position"][c, j])
-            ups = table.neighbours(layer, kind, c)[: g[f"{name}.patch_activity"].shape[2]]
-            names = [f"N{i + 1} (layer {l}, {k})" for i, (l, k, _, _) in enumerate(ups)]
-            if which == 3:
-                sign = 1.0 if float(act[j, p]) >= 0 else -1.0
-                support = [-sign * float(x) for x in g[f"{name}.patch_activity"][c, j]]
-                out.append({**base, "kind_q": "which_upstream", "context": int(contexts[j]), "position": p, "j": j,
-                            "question": "At the marked token, which of these upstream components contributes most to this component's activity?",
-                            "options": names, "answer": int(np.argmax(support))})
-            else:
-                i = rng.randrange(len(ups))
-                side = rng.choice(["up", "down"])
-                r = rng.randrange(10)
-                token = int(g[f"{name}.patch_{side}_ids"][c, j, i, r])
-                dp = float(g[f"{name}.patch_{side}_dp"][c, j, i, r])
-                out.append({**base, "kind_q": "edge_cut", "context": int(contexts[j]), "position": p, "j": j,
-                            "question": f"If the connection from {names[i]} to this component is cut (its write removed from what this component reads), does the probability that the next token after the marked token is {json.dumps(table.tok.decode([token]))} go up or go down?",
-                            "options": ["up", "down"], "answer": 0 if dp > 0 else 1})
-        else:
-            j = effect_j
+            ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=["up", "down"],
+                      answer=0 if float(d[f"{side}_dp_{edit}"][c, j, r]) > 0 else 1,
+                      question=f"If the component is {verb}, does the probability that the next token after the marked token is {table.piece(d[f'{side}_ids_{edit}'][c, j, r])} go up or go down?")
+        elif q == "top":
             p = int(d["position"][c, j])
             truth = int(d["up_ids_ablate"][c, j, 0])
             other = rng.choice([x for x in range(len(contexts)) if x != j])
             pool = [int(x) for x in d["up_ids_ablate"][c, other].tolist() if int(x) != truth]
-            distractors = rng.sample(pool, 3) if len(pool) >= 3 else pool + [truth + 1] * (3 - len(pool))
-            options = [truth] + distractors
+            options = [truth] + (rng.sample(pool, 3) if len(pool) >= 3 else pool + [truth + 1] * (3 - len(pool)))
             order = list(range(4))
             rng.shuffle(order)
-            out.append({**base, "kind_q": "top", "context": int(contexts[j]), "position": p, "j": j,
-                        "question": "If the component is removed, which of these next tokens after the marked token gains the most probability?",
-                        "options": [json.dumps(table.tok.decode([options[i]])) for i in order], "answer": order.index(0)})
+            ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=[table.piece(options[i]) for i in order],
+                      answer=order.index(0), question="If the component is removed, which of these next tokens after the marked token gains the most probability?")
+        elif q == "continuation":
+            cont = table.rel["continuations"]
+            g = table.gid(layer, kind, c)
+            if int(cont["clean"][g, 0]) < 0:
+                continue  # not measured (a partial relations run)
+            alpha = rng.choice([2, 4, 8])
+            amp, clean = cont[f"alpha_{alpha}"][g].tolist(), cont["clean"][g].tolist()
+            other = amp
+            while other in (amp, clean) or other[0] < 0:
+                other = cont["clean"][rng.randrange(cont["clean"].shape[0])].tolist()
+            text = lambda ids: json.dumps(table.tok.decode([i for i in ids if i >= 0]))  # noqa: E731
+            options = [amp] + ([clean] if clean != amp else []) + [other]
+            order = list(range(len(options)))
+            rng.shuffle(order)
+            p = int(d["position"][c, 0])
+            ex.update(context=int(contexts[0]), position=p, j=0, options=[text(options[i]) for i in order], answer=order.index(0),
+                      question=f"If the component is made {alpha} times stronger, how does the model continue the text after the marked token (greedy decoding)?")
+        elif q == "edge":
+            g = edge_rows[rng.randrange(len(edge_rows))]
+            layer, kind, c = table.site_of(g)
+            meta, d = table.sites[(layer, kind)]
+            e = table.rel["edges"]
+            which = 2 if rng.random() < 1 / 3 else rng.randrange(2)  # a third near-zero edges
+            a_gid = int(e["ids"][g, 0, which])
+            rel = float(e["activity"][g, 0, which]) / max(float(table.peak[g]), 1e-30)
+            al, ak, ac = table.site_of(a_gid)
+            p = int(d["position"][c, 0])
+            ex.update(layer=layer, kind=kind, c=c, j=0, context=int(d["contexts"][c, 0]), position=p, options=list(EDGE_LEVELS), answer=edge_level(rel),
+                      candidates=[(al, ak, ac, abs(rel), "up")], stratum=int(e["strong"][g, 0, which]),
+                      question=f"If the write of the upstream component C1 (layer {al}, {ak}) is removed from what this component reads at the marked token (everything else unchanged), how does this component's activity there change?")
+        else:
+            r = rng.randrange(att["delta"].shape[0])
+            ids, delta = att["ids"][r].tolist(), att["delta"][r].tolist()
+            best = int(np.argmin(delta))
+            rest = [i for i in range(len(ids)) if i != best]
+            chosen = [best] + rng.sample(rest, 3)
+            order = list(range(4))
+            rng.shuffle(order)
+            cands = [table.site_of(int(ids[chosen[i]])) for i in order]
+            ctx, p = int(att["context"][r]), int(att["position"][r])
+            ex.update(layer=-1, kind="", c=-1, j=-1, context=ctx, position=p, options=[f"C{i + 1} (layer {l}, {k})" for i, (l, k, _) in enumerate(cands)],
+                      candidates=[(l, k, cc, 1.0, "up") for l, k, cc in cands], answer=order.index(0),
+                      question=f"At the marked token the model predicts {table.piece(att['token'][r])} next. Which of the listed components raises that prediction most?")
+        out.append(ex)
     return out
 
 
@@ -259,15 +308,34 @@ def exemplars(table: Table, ex: dict, n: int = 3) -> str:
     return "On other texts the component is most active at the marked tokens:\n" + "\n".join(lines)
 
 
+def slots(table: Table, ex: dict, condition: str) -> list[tuple]:
+    """The example's subcomponents in slot order: (layer, kind, index, log magnitude, role prefix, shown)."""
+    out = []
+    if ex["c"] >= 0:
+        v, u = table.vectors(ex["layer"], ex["kind"], ex["c"])
+        out.append((ex["layer"], ex["kind"], ex["c"], math.log(float(u.norm() * v.norm())), "", condition in ("graph", "weights")))
+    if ex["kind_q"] == "attribution":
+        out += [(l, k, c, 0.0, "up_", condition in ("graph", "weights")) for l, k, c, _, _ in ex["candidates"]]
+    elif ex["kind_q"] == "edge":
+        out += [(l, k, c, math.log(max(s, 1e-30)), "up_", condition == "graph") for l, k, c, s, _ in ex["candidates"]]
+    if ex["c"] >= 0 and ex["kind_q"] != "edge":
+        out += [(l, k, c, math.log(max(s, 1e-30)), f"{d}_", condition == "graph") for l, k, c, s, d in table.neighbours(ex["layer"], ex["kind"], ex["c"])]
+    return out[:SLOTS]
+
+
 def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
     """The user turn around the placeholders: (before, after)."""
-    before = f"A component of a 4-layer language model: layer {ex['layer']}, {ex['kind']}. Its vectors:"
-    info = "\n" + exemplars(table, ex) if condition == "activity" else ""
-    if condition == "graph":
-        near = table.neighbours(ex["layer"], ex["kind"], ex["c"])
-        direction = "upstream components it reads from" if ex["kind"] in ("q_proj", "k_proj", "v_proj", "c_fc") else "downstream components that read it"
-        lines = [f"N{i + 1}: layer {l}, {k}, strength {s:.3g}" for i, (l, k, _, s) in enumerate(near)]
-        info += f"\nAfter its own two vectors come those of its strongest {direction}, in this order:\n" + "\n".join(lines)
+    if ex["c"] >= 0:
+        before = f"A component of a 4-layer language model: layer {ex['layer']}, {ex['kind']}. Its vectors, then those of related components:"
+    else:
+        before = "Components of a 4-layer language model. Their vectors:"
+    info = "\n" + exemplars(table, ex) if condition == "activity" and ex["c"] >= 0 else ""
+    if condition == "graph" and ex["c"] >= 0 and ex["kind_q"] not in ("edge", "attribution"):
+        lines = [f"N{i + 1}: layer {l}, {k}, {'upstream: its removal changes this component by' if d == 'up' else 'downstream: depends on this component by'} {s:.2g} of its peak"
+                 for i, (l, k, _, s, d) in enumerate(table.neighbours(ex["layer"], ex["kind"], ex["c"]))]
+        info += "\nAfter its own two vectors come those of its most strongly related components, in this order:\n" + "\n".join(lines)
+    if ex["kind_q"] == "attribution":
+        info += "\nThe listed components' vectors come in the order C1, C2, C3, C4."
     text = table.text(ex["context"], ex["position"], ex["position"])
     listing = "\n".join(f"{LABELS[k]}. {o}" for k, o in enumerate(ex["options"]))
     after = f"{info}\nText: {text!r}\n{ex['question']}\n{listing}\nAnswer with the letter."
@@ -298,52 +366,6 @@ class Oracle(torch.nn.Module):
     def trainable(self):
         return [p for p in self.model.parameters() if p.requires_grad] + list(self.maps.parameters()) + list(self.magnitude.parameters())
 
-    def encode(self, before: str, after: str, slots: int) -> tuple[list[int], list[int]]:
-        marker = "\u0000V\u0000"
-        text = self.tokenizer.apply_chat_template([{"role": "user", "content": before + marker + after}], add_generation_prompt=True, enable_thinking=False, tokenize=False)
-        head, tail = text.split(marker)
-        a = self.tokenizer.encode(head, add_special_tokens=False)
-        b = self.tokenizer.encode(tail, add_special_tokens=False)
-        return a + [self.placeholder] * slots + b, list(range(len(a), len(a) + slots))
-
-    def injection(self, table: Table, components: list[tuple[int, str, int]], condition: str, places: list[list[int]]):
-        """The hook's batch for rows each reading one subcomponent (layer, kind, index) at its
-        placeholder positions `places[row]`: its read and write vectors, then its neighbours', each
-        through its own map; the condition decides which are shown (module note)."""
-        rows, cols, vecs, roles, mags, keeps, layers = [], [], [], [], [], [], []
-        for b, ((layer0, kind0, c0), slots) in enumerate(zip(components, places)):
-            near = table.neighbours(layer0, kind0, c0)
-            items = [(layer0, kind0, c0, None, "")] + [(l, k, c, s, "neighbour_") for l, k, c, s in near]
-            filled = 0
-            for layer, kind, c, strength, who in items:
-                v, u = table.vectors(layer, kind, c)
-                scale = math.log(float(u.norm() * v.norm())) if strength is None else math.log(max(strength, 1e-30))
-                shown = condition in ("graph", "weights") if strength is None else condition == "graph"
-                for side, vec in (("read", v), ("write", u)):
-                    rows.append(b)
-                    cols.append(slots[filled])
-                    filled += 1
-                    vecs.append(self.maps[f"{kind}_{side}"](vec.to(self.dev)))
-                    roles.append(ROLE[who + side])
-                    mags.append(scale)
-                    keeps.append(1.0 if shown else 0.0)
-                    layers.append(layer)
-            for _ in range(filled, len(slots)):  # a subcomponent with fewer neighbours: empty slots
-                rows.append(b)
-                cols.append(slots[filled])
-                filled += 1
-                vecs.append(torch.zeros(self.maps["q_proj_read"].out_features, device=self.dev))
-                roles.append(ROLE["neighbour_read"])
-                mags.append(0.0)
-                keeps.append(0.0)
-                layers.append(layer0)
-        keep = torch.tensor(keeps, device=self.dev)
-        unit = torch.nn.functional.normalize(torch.stack(vecs), dim=-1) * keep[:, None]
-        logn = torch.tensor(mags, device=self.dev) * keep
-        extra = self.magnitude(torch.tensor(roles, device=self.dev), torch.tensor(layers, device=self.dev), logn, 1.0 - keep)
-        at = torch.full((len(rows),), self.inject, device=self.dev)
-        return (torch.tensor(rows, device=self.dev), torch.tensor(cols, device=self.dev), unit, extra, keep, at)
-
     def load(self, run: Path):
         """An answer-mode run's adapter, maps and magnitude term (trainable)."""
         from peft import PeftModel
@@ -354,9 +376,47 @@ class Oracle(torch.nn.Module):
         self.maps.load_state_dict(state["maps"])
         self.magnitude.load_state_dict(state["magnitude"])
 
+    def encode(self, before: str, after: str, thinking: bool = False) -> tuple[list[int], list[int]]:
+        marker = "\u0000V\u0000"
+        text = self.tokenizer.apply_chat_template([{"role": "user", "content": before + marker + after}], add_generation_prompt=True, enable_thinking=thinking, tokenize=False)
+        head, tail = text.split(marker)
+        a = self.tokenizer.encode(head, add_special_tokens=False)
+        b = self.tokenizer.encode(tail, add_special_tokens=False)
+        return a + [self.placeholder] * (2 * SLOTS) + b, list(range(len(a), len(a) + 2 * SLOTS))
+
+    def injection(self, table: Table, rows_slots: list[list[tuple]], places: list[list[int]]):
+        """The hook's batch: per row its slots' read and write vectors at its placeholder positions, each
+        through its own map; withheld and empty slots receive nothing."""
+        rows, cols, vecs, roles, mags, keeps, layers = [], [], [], [], [], [], []
+        width = self.maps["q_proj_read"].out_features
+        for b, (items, where) in enumerate(zip(rows_slots, places)):
+            for s in range(SLOTS):
+                for h, side in enumerate(("read", "write")):
+                    rows.append(b)
+                    cols.append(where[2 * s + h])
+                    if s < len(items):
+                        layer, kind, c, mag, prefix, shown = items[s]
+                        v, u = table.vectors(layer, kind, c)
+                        vecs.append(self.maps[f"{kind}_{side}"]((v if side == "read" else u).to(self.dev)))
+                        roles.append(ROLE[prefix + side])
+                        mags.append(mag)
+                        keeps.append(1.0 if shown else 0.0)
+                        layers.append(layer)
+                    else:
+                        vecs.append(torch.zeros(width, device=self.dev))
+                        roles.append(ROLE["up_" + side])
+                        mags.append(0.0)
+                        keeps.append(0.0)
+                        layers.append(0)
+        keep = torch.tensor(keeps, device=self.dev)
+        unit = torch.nn.functional.normalize(torch.stack(vecs), dim=-1) * keep[:, None]
+        logn = torch.tensor(mags, device=self.dev) * keep
+        extra = self.magnitude(torch.tensor(roles, device=self.dev), torch.tensor(layers, device=self.dev), logn, 1.0 - keep)
+        at = torch.full((len(rows),), self.inject, device=self.dev)
+        return (torch.tensor(rows, device=self.dev), torch.tensor(cols, device=self.dev), unit, extra, keep, at)
+
     def log_q(self, table: Table, batch: list[dict], condition: str):
-        slots = 2 + 2 * table.k
-        enc = [self.encode(*prompt(table, ex, condition), slots) for ex in batch]
+        enc = [self.encode(*prompt(table, ex, condition)) for ex in batch]
         width = max(len(ids) for ids, _ in enc)
         ids = torch.zeros(len(batch), width, dtype=torch.long)
         mask = torch.zeros(len(batch), width, dtype=torch.long)
@@ -365,7 +425,7 @@ class Oracle(torch.nn.Module):
             mask[b, : len(t)] = 1
         # The hook stays set until the caller is done with this batch (after its backward pass), so
         # checkpointed layers inject again when they are recomputed.
-        self.hook.set(self.injection(table, [(ex["layer"], ex["kind"], ex["c"]) for ex in batch], condition, [places for _, places in enc]))
+        self.hook.set(self.injection(table, [slots(table, ex, condition) for ex in batch], [places for _, places in enc]))
         inner = self.model.get_base_model()
         hidden = inner.model(input_ids=ids.to(self.dev), attention_mask=mask.to(self.dev)).last_hidden_state
         last = mask.sum(1) - 1
@@ -380,11 +440,15 @@ def log_scores(log_q, valid, batch) -> torch.Tensor:
     return log_q.gather(-1, answers[:, None])[:, 0]
 
 
+def table_of(args) -> Table:
+    return Table(Path(args.labels), Path(args.uv), Path(args.relations) if args.relations else None, Path(args.tokenizer))
+
+
 def train(args):
     dev = device()
     torch.manual_seed(args.seed)
     held = {int(x) for x in args.heldout_layers.split(",") if x}
-    table = Table(Path(args.labels), Path(args.uv), Path(args.graph) if args.graph else None, Path(args.tokenizer))
+    table = table_of(args)
     data = examples(table, {0, 1, 2, 3} - held, args.examples, args.seed)
     oracle = Oracle(args.base, args.lora_rank, args.inject, dev)
     oracle.model.base_model.model.gradient_checkpointing_enable()
@@ -418,7 +482,8 @@ def evaluate(args):
     config = json.loads((Path(args.run) / "config.json").read_text())
     oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev)
     oracle.load(Path(args.run))
-    table = Table(Path(args.labels), Path(args.uv), Path(args.graph) if args.graph else None, Path(args.tokenizer))
+    oracle.model.eval()
+    table = table_of(args)
     held = {int(x) for x in config["heldout_layers"].split(",") if x}
     rows = []
     for split, layers in (("heldout_layers", held), ("trained_layers", {0, 1, 2, 3} - held)):
@@ -430,11 +495,11 @@ def evaluate(args):
                 oracle.hook.set(None)
                 for ex, score in zip(batch, log_scores(lq, valid, batch).tolist()):
                     rows.append({"split": split, "distribution": distribution, "question": ex["kind_q"], "stratum": ex["stratum"], "layer": ex["layer"], "kind": ex["kind"],
-                                 "c": ex["c"], "context": ex["context"], "log_score": score})
+                                 "c": ex["c"], "context": ex["context"], "log_score": score, "options": len(ex["options"])})
     (Path(args.run) / f"eval_{Path(args.labels).name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     summary = {}
     for split in ("heldout_layers", "trained_layers"):
-        for q in ("activity", "direction", "top", "which_upstream", "edge_cut"):
+        for q in QUESTIONS:
             v = [r["log_score"] for r in rows if r["split"] == split and r["question"] == q and r["distribution"] == "natural"]
             summary[f"{split}/{q}"] = float(np.mean(v)) if v else None
     print(json.dumps({"condition": config["condition"], **summary}))
@@ -442,27 +507,27 @@ def evaluate(args):
 
 def compare(args):
     """Per split and question: each condition's mean log score and its paired gain over `nothing`
-    (the same examples in every run: evaluate draws them from the same seed), with standard errors."""
+    (the same examples in every run: evaluate draws them from the same seed), with standard errors;
+    effect questions also per stratum, edge questions per strong and near-zero edges."""
     runs = {}
     for d in args.runs:
         config = json.loads((Path(d) / "config.json").read_text())
-        rows = [json.loads(line) for line in open(Path(d) / args.eval)]
-        runs[config["condition"]] = rows
+        runs[config["condition"]] = [json.loads(line) for line in open(Path(d) / args.eval)]
     base = runs["nothing"]
     table = {}
     groups = [("natural", None), ("stratified", None)] + [("stratified", k) for k in range(len(STRATA) - 1)]
     for condition, rows in runs.items():
         for split in ("heldout_layers", "trained_layers"):
-            for q in ("activity", "direction", "top", "which_upstream", "edge_cut"):
+            for q in QUESTIONS:
                 for distribution, k in groups:
                     pairs = [(r["log_score"], b["log_score"]) for r, b in zip(rows, base)
                              if r["split"] == split and r["question"] == q and r["distribution"] == distribution and (k is None or r["stratum"] == k)]
-                    if not pairs or (k is not None and q == "activity"):
+                    if not pairs or (k is not None and q in ("activity", "continuation", "attribution")):
                         continue
                     d = np.array([a - b for a, b in pairs])
-                    name = f"{condition}/{split}/{q}" + ("" if distribution == "natural" else f"/stratified" + ("" if k is None else f"/kl{STRATA[k]:g}-{STRATA[k + 1]:g}"))
-                    table[name] = {"examples": len(d), "log_score_nats": float(np.mean([a for a, _ in pairs])),
-                                   "gain_over_nothing_nats": float(d.mean()), "standard_error_nats": float(d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else None}
+                    suffix = "" if distribution == "natural" else "/stratified" + ("" if k is None else (f"/kl{STRATA[k]:g}-{STRATA[k + 1]:g}" if q != "edge" else ("/strong" if k == 1 else "/near_zero")))
+                    table[f"{condition}/{split}/{q}{suffix}"] = {"examples": len(d), "log_score_nats": float(np.mean([a for a, _ in pairs])),
+                                                                "gain_over_nothing_nats": float(d.mean()), "standard_error_nats": float(d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else None}
     Path(args.out).write_text(json.dumps(table, indent=1))
     print(json.dumps(table, indent=1))
 
@@ -470,12 +535,15 @@ def compare(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)
-    t = sub.add_parser("train")
+    for name in ("train", "evaluate"):
+        p = sub.add_parser(name)
+        p.add_argument("--labels", required=True)
+        p.add_argument("--uv", required=True)
+        p.add_argument("--relations", help="vpd_relations.py's output for these labels")
+        p.add_argument("--tokenizer", default=str(TOKENIZER), help="the target's tokenizer.json")
+        p.add_argument("--seed", type=int, default=0)
+    t = sub.choices["train"]
     t.add_argument("--base", required=True)
-    t.add_argument("--labels", required=True)
-    t.add_argument("--uv", required=True)
-    t.add_argument("--graph", help="vpd_graph.py's output for these labels (neighbourhoods and edge labels)")
-    t.add_argument("--tokenizer", default=str(TOKENIZER), help="the target's tokenizer.json")
     t.add_argument("--condition", required=True, choices=CONDITIONS)
     t.add_argument("--steps", type=int, required=True)
     t.add_argument("--out", required=True)
@@ -485,15 +553,9 @@ def main():
     t.add_argument("--lr", type=float, default=1e-4)
     t.add_argument("--lora-rank", type=int, default=64)
     t.add_argument("--inject", type=int, default=1)
-    t.add_argument("--seed", type=int, default=0)
-    e = sub.add_parser("evaluate")
+    e = sub.choices["evaluate"]
     e.add_argument("--run", required=True)
-    e.add_argument("--labels", required=True)
-    e.add_argument("--uv", required=True)
-    e.add_argument("--graph", help="vpd_graph.py's output for these labels")
-    e.add_argument("--tokenizer", default=str(TOKENIZER), help="the target's tokenizer.json")
     e.add_argument("--examples", type=int, default=4096)
-    e.add_argument("--seed", type=int, default=0)
     c = sub.add_parser("compare")
     c.add_argument("--runs", nargs="+", required=True)
     c.add_argument("--eval", required=True, help="the evaluation file name inside each run, eval_<labels dir name>.jsonl")

@@ -18,7 +18,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
-QUESTIONS = {"activity": "activity\nlevel", "direction": "token up\nor down", "top": "most raised\ntoken", "which_upstream": "which input\ndrives it", "edge_cut": "cut edge:\ntoken up/down"}
+QUESTIONS = {"activity": "activity\nlevel", "direction": "token up\nor down", "top": "most raised\ntoken", "continuation": "amplified\ncontinuation",
+             "edge": "cut edge:\nactivity change", "attribution": "which raises\nthe prediction"}
 ARMS = (("graph", "weights + graph", "#1f5fa8"), ("weights", "weights", "#6aa0d8"), ("activity", "activity on other texts", "#c0504d"))
 
 
