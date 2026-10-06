@@ -1,0 +1,81 @@
+{
+  "artifact": null,
+  "artifact_sha256": null,
+  "export": "/Users/user/mpd-data/engine/vpd4l_clean4096",
+  "heads": {
+    "copy": "L3.H5",
+    "induction": "L2.H4",
+    "previous": "L1.H1"
+  },
+  "model_device": "Apple M5 Pro (Metal, f32)",
+  "predictions": [
+    {
+      "fraction": 0.984375,
+      "held": 63,
+      "left": "|change| at t-1",
+      "left_mean": 2.082424960317853,
+      "name": "previous selects t-1",
+      "right": "max |change| at t-2, t-4",
+      "right_mean": 0.6848126380111164,
+      "statement": "substituting the token at t-1 changes the previous-token head's write at t more than substituting it at t-2 or t-4",
+      "targets": 64
+    },
+    {
+      "fraction": 0.984375,
+      "held": 63,
+      "left": "min |change| at j, j+1",
+      "left_mean": 4.138831774481245,
+      "name": "induction selects j, j+1",
+      "right": "max |change| at j-2, j+3",
+      "right_mean": 1.1869574264089873,
+      "statement": "substituting the token at j or j+1 changes the induction head's write at t more than substituting it at j-2 or j+3",
+      "targets": 64
+    },
+    {
+      "fraction": 0.96875,
+      "held": 62,
+      "left": "attention drop, key",
+      "left_mean": 0.5515458961937456,
+      "name": "induction key reads previous",
+      "right": "attention drop, query",
+      "right_mean": 0.1744945689775332,
+      "statement": "the previous-token head's write from another passage in the induction head's key read lowers its attention to j+1 more than in its query read",
+      "targets": 64
+    },
+    {
+      "fraction": 0.984375,
+      "held": 63,
+      "left": "drop, zero at t",
+      "left_mean": 1.4380789172316477,
+      "name": "induction writes next",
+      "right": "drop, zero at t-5",
+      "right_mean": 0.011072317978547144,
+      "statement": "the induction head's read set to zero at t lowers log p(x_{j+1}) at t more than at t-5",
+      "targets": 64
+    },
+    {
+      "fraction": 0.9375,
+      "held": 60,
+      "left": "|change|, value",
+      "left_mean": 2.258501283633661,
+      "name": "copy value reads induction",
+      "right": "|change|, query",
+      "right_mean": 0.9772522874679214,
+      "statement": "the induction head's write from another passage in the copy head's value read changes its write at t more than in its query read",
+      "targets": 64
+    },
+    {
+      "fraction": 0.71875,
+      "held": 46,
+      "left": "drop, zero at t",
+      "left_mean": 0.08446063538405647,
+      "name": "copy writes next",
+      "right": "drop, zero at t-5",
+      "right_mean": 0.0,
+      "statement": "the copy head's read set to zero at t lowers log p(x_{j+1}) at t more than at t-5",
+      "targets": 64
+    }
+  ],
+  "source_revision": null,
+  "targets": 64
+}
