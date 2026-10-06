@@ -1849,6 +1849,7 @@ launch() {
     fi
     POD="" IP="" PORT="" GUEST=0
     # The first pod must be in stock now; a replacement waits for stock while time remains.
+    API_FAILED=0
     until [ -n "$POD" ]; do
     while IFS='|' read -r kind price gpu <&3; do
         left=$(( ${DEADLINE:-$(( $(date +%s) + CAP_SECONDS ))} - $(date +%s) ))
@@ -1901,6 +1902,8 @@ launch() {
         trap 'exit 143' TERM
         trap 'exit 129' HUP
         if [ -z "$POD" ]; then
+            # A server error that is not a stock answer may pass (RunPod's "Something went wrong").
+            if [[ $code == 5* ]] && ! grep -qE 'no instances currently available|does not have the resources' <<< "$(body_of "$r")"; then API_FAILED=1; fi
             say "no $gpu on ${kind%%:*} ($code): $(body_of "$r" | head -c 200)"
             continue
         fi
@@ -1944,6 +1947,15 @@ launch() {
         (( DISCARDED <= DISCARDS )) || { say "$DISCARDS pods discarded on failing hosts; giving up"; exit 1; }
     done 3<<< "$OFFERS"
     if [ -z "$POD" ]; then
+        # The first pod: offers RunPod refused with an error rather than a stock answer are asked
+        # again, at most three times, 10 s apart (frontier-gn-n128-ab2-trust-s1 ended on one while
+        # its batch's other nine pods started).
+        if [ -z "$DEADLINE" ] && (( API_FAILED && ${API_RETRIES:=0} < 3 )); then
+            API_RETRIES=$(( API_RETRIES + 1 )) API_FAILED=0
+            say "RunPod answered with an error, not a stock answer; asking again in 10 s ($API_RETRIES of 3)"
+            sleep 10
+            continue
+        fi
         [ -n "$DEADLINE" ] || { say "none of $GPU in stock on a working host"; exit 1; }
         (( $(date +%s) + 600 < DEADLINE )) || { say "none of $GPU in stock and less than 10 minutes left"; exit 1; }
         sleep 60
