@@ -361,24 +361,35 @@ impl DevicePosterior {
     }
 
     /// Sets the step's preconditioner along each operator's input axis from `factors` (per
-    /// operator the eigenvectors of its input's second moment, its columns' axis, or none): see
-    /// [`Direction`]. The curvature along `U` starts at the diagonal model's, `h (U ∘ U)`, the
-    /// momentum and the gradient's second moment at zero. A resumed fit sets them afresh.
-    pub fn set_directions(&mut self, factors: &[Option<std::sync::Arc<Array2<f64>>>]) -> Result<(), String> {
+    /// operator the eigenvectors `U` of its input's second moment `A`, its columns' axis, and their
+    /// eigenvalues `λ` per token, or none): see [`Direction`]. The curvature along `U` starts at
+    /// the Kronecker model's diagonal there, `h̃_rk = g_r λ_k`, with each row's output factor
+    /// `g_r = Σ_j h_rj / Σ_k λ_k` from the diagonal curvature `h_rj ≈ g_r A_jj` (`Σ_j A_jj = Σ_k λ_k`):
+    /// the diagonal's own value along `U`, `h (U ∘ U)`, keeps its underpricing of the
+    /// directions entries share (the mean activation's eigenvalue is about `n mean(a)²` against the
+    /// diagonal's `mean(a²)`), which an average of a few draws per step would correct only over
+    /// an epoch. The momentum and the gradient's second moment start at zero. A resumed fit sets
+    /// them afresh.
+    pub fn set_directions(&mut self, factors: &[Option<std::sync::Arc<crate::library_mdl::InputFactor>>]) -> Result<(), String> {
         if factors.len() != self.mean.len() {
             return Err(error("one input factor per trainable operator required"));
         }
         self.directions = Vec::with_capacity(factors.len());
         for (i, factor) in factors.iter().enumerate() {
             let (rows, cols) = (self.mean[i].rows(), self.mean[i].cols());
-            let Some(factor) = factor.as_ref().filter(|f| f.dim() == (cols, cols)) else {
+            let Some(factor) = factor.as_ref().filter(|f| f.vectors.dim() == (cols, cols) && f.values.len() == cols) else {
                 self.directions.push(None);
                 continue;
             };
-            let matrix = self.fitting.upload(factor.view()).map_err(error)?;
-            let squared = self.fitting.upload(factor.mapv(|u| u * u).view()).map_err(error)?;
-            let mut curvature = self.fitting.zeros(rows, cols).map_err(error)?;
-            self.fitting.gemm(&mut curvature, 1.0, &self.moments[i][1], Op::N, &squared, Op::N, 0.0, self.arithmetic()).map_err(error)?;
+            let matrix = self.fitting.upload(factor.vectors.view()).map_err(error)?;
+            let trace: f64 = factor.values.iter().sum();
+            if !(trace > 0.0) {
+                self.directions.push(None);
+                continue;
+            }
+            let diagonal = self.fitting.download(&self.moments[i][1]).map_err(error)?;
+            let output: Vec<f64> = diagonal.rows().into_iter().map(|row| row.sum() / trace).collect();
+            let curvature = self.fitting.upload(Array2::from_shape_fn((rows, cols), |(r, k)| output[r] * factor.values[k]).view()).map_err(error)?;
             let moments = [self.fitting.zeros(rows, cols).map_err(error)?, curvature, self.fitting.zeros(rows, cols).map_err(error)?];
             self.directions.push(Some(Direction {
                 matrix,
@@ -929,7 +940,10 @@ mod tests {
         let run = |factor: Option<Array2<f64>>| -> Vec<Array2<f64>> {
             let mut posterior = DevicePosterior::from_parts(&device, &parts, 500.0, None, 0).unwrap();
             if let Some(u) = factor {
-                posterior.set_directions(&[Some(std::sync::Arc::new(u))]).unwrap();
+                // Eigenvalues whose Kronecker start equals the diagonal's: every entry of the
+                // starting curvature is the same, so `g_r λ_k = h_rk` along any `U`.
+                let values = vec![1.0; C];
+                posterior.set_directions(&[Some(std::sync::Arc::new(crate::library_mdl::InputFactor { vectors: u, values }))]).unwrap();
             }
             let mut iterates = Vec::new();
             for t in 0..3u64 {

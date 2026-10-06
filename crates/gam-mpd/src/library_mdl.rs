@@ -1296,7 +1296,7 @@ impl Settings {
 /// input share its matrix. The input side of the step's preconditioner
 /// (`DevicePosterior::set_directions`): an MLP's output map is included, its input the
 /// functions' activations.
-fn input_factors(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterior, sequences: &[Vec<u32>], settings: &Settings) -> Result<Vec<Option<Arc<Array2<f64>>>>, String> {
+fn input_factors(scorer: &mut Scorer, explanation: &Explanation, posterior: &Posterior, sequences: &[Vec<u32>], settings: &Settings) -> Result<Vec<Option<Arc<InputFactor>>>, String> {
     let sites: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
     let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
     let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
@@ -1331,8 +1331,10 @@ fn input_factors(scorer: &mut Scorer, explanation: &Explanation, posterior: &Pos
     // valid posterior (its eigenvectors are taken in float64 from the downloaded sum), so the
     // accumulation's rounding moves the axes, not the code length's validity.
     let mut grams: BTreeMap<usize, Tensor> = BTreeMap::new();
+    let mut tokens = 0usize;
     for chunk in sequences.chunks(settings.batch_sequences) {
         let family = sequence_family(&chunk.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+        tokens += family.rows;
         let trace = program.forward(&family)?;
         for &node in &nodes {
             let x = trace.value(node)?;
@@ -1343,13 +1345,21 @@ fn input_factors(scorer: &mut Scorer, explanation: &Explanation, posterior: &Pos
             device.gemm(gram, 1.0, x, Op::T, x, Op::N, 1.0, program.arithmetic()).map_err(error)?;
         }
     }
-    let mut matrices: BTreeMap<usize, Arc<Array2<f64>>> = BTreeMap::new();
+    let mut matrices: BTreeMap<usize, Arc<InputFactor>> = BTreeMap::new();
     for (node, gram) in grams {
         let gram = device.download(&gram).map_err(error)?;
-        let vectors = gam_linalg::decompose::eigh(gram.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(error)?.vectors;
-        matrices.insert(node, Arc::new(vectors));
+        let eigen = gam_linalg::decompose::eigh(gram.view(), gam_linalg::roundoff::SymmetricAssembly::Mirrored, None).map_err(error)?;
+        let values = eigen.values.iter().map(|v| v.max(0.0) / tokens.max(1) as f64).collect();
+        matrices.insert(node, Arc::new(InputFactor { vectors: eigen.vectors, values }));
     }
     Ok(read.iter().map(|node| node.map(|n| Arc::clone(&matrices[&n]))).collect())
+}
+
+/// An operator's input factor ([`input_factors`]): the eigenvectors of its input's second moment
+/// (columns) and its eigenvalues per token.
+pub struct InputFactor {
+    pub vectors: Array2<f64>,
+    pub values: Vec<f64>,
 }
 
 /// One layer's survivors and activity on the held-out sequences at the posterior mean.
