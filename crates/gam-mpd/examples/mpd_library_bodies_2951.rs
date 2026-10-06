@@ -3,6 +3,7 @@
 //!
 //! gate OUT [SCOREBOARD.tsv]
 //! model EXPORT SETTINGS.json FROM OUT host|gpu [SCOREBOARD.tsv]
+//! regions EXPORT CHECKPOINT OUT
 //!
 //! `gate` is the fast regression gate: a toy decoder (two layers, width 16, 32 GELU units per MLP,
 //! 48 tokens; 4096 training and 32 held-out sequences of 16 random tokens) whose MLPs both
@@ -40,6 +41,10 @@
 //! 4. reuse by gradient among the accepted bodies: the fit with the mixture prior over bodies
 //!    (`library_bodies::BodyMixture`; OUT/soft{n}), its dominant components merged
 //!    (`library_bodies::BodyMixture::harden`), each hardening one transaction.
+//!
+//! `regions` lists the regions through heads (step 2) at the posterior of a library fit's
+//! checkpoint of the export, without fitting (OUT/REGIONS.json): what a `model` run from that
+//! checkpoint would first propose.
 //!
 //! OUT/SUMMARY.json: per stage `F` and the held-out evaluation (KL per token by experiment family),
 //! the regions, the bodies with their calls and the native functions each replaced, the alignments
@@ -281,6 +286,19 @@ fn extract(explanation: &Explanation, region: &Region) -> Result<(Explanation, C
     })
 }
 
+/// Layer `l`'s functions whose groups are all in the explanation at `posterior`.
+fn live(base: &Explanation, posterior: &library_mdl::Posterior, l: usize) -> Vec<usize> {
+    (0..base.layers[l].functions.len()).filter(|i| base.layers[l].functions[*i].iter().all(|g| posterior.active[*g])).collect()
+}
+
+/// The regions among layer `l`'s functions `pool` that read only one set of heads' writes at
+/// `posterior` (`library_crossing::regions_through`): per region its heads, the number of heads its
+/// MLP may read, and its functions.
+fn through_heads((native, layers): (&OperatorProgram, &[LayerNodes]), base: &Explanation, posterior: &library_mdl::Posterior, l: usize, pool: &[usize]) -> Result<Vec<(Vec<library_crossing::Writer>, usize, Vec<usize>)>, String> {
+    let writers = library_crossing::writers(native, layers, l)?;
+    Ok(library_crossing::regions_through(base, posterior, &writers, l, pool)?.into_iter().map(|(set, region)| (set.iter().map(|w| writers[*w].clone()).collect(), writers.len(), region)).collect())
+}
+
 /// The method (module note) from `base`; with `planted`, the gate's planted units per layer.
 fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>, begin: Option<library_mdl::Start>) -> Result<(), String> {
     let mut summary = json!({"stages": [], "decisions": []});
@@ -295,12 +313,11 @@ fn method(run: &Run, base: Explanation, planted: Option<&[Vec<usize>; 2]>, begin
     let posterior = &fitted.posterior.clone();
     let (mut regions, mut candidates, mut through) = (Vec::new(), Vec::new(), Vec::new());
     for l in 0..run.layers.len() {
-        let pool: Vec<usize> = (0..base.layers[l].functions.len()).filter(|i| base.layers[l].functions[*i].iter().all(|g| posterior.active[*g])).collect();
-        let writers = library_crossing::writers(&run.native, &run.layers, l)?;
+        let pool = live(&base, posterior, l);
         let mut taken = Vec::new();
-        for (set, region) in library_crossing::regions_through(&base, posterior, &writers, l, &pool)? {
+        for (writers, choices, region) in through_heads((&run.native, &run.layers), &base, posterior, l, &pool)? {
             taken.extend(region.iter().copied());
-            through.push((l, set.iter().map(|w| writers[*w].clone()).collect::<Vec<_>>(), writers.len(), region));
+            through.push((l, writers, choices, region));
         }
         if run.grown {
             let rest: Vec<usize> = pool.into_iter().filter(|i| !taken.contains(i)).collect();
@@ -592,6 +609,24 @@ fn main() -> Result<(), String> {
             let run = Run { model, grown: false, scoreboard, device, native, layers, held: sequences[first..end].to_vec(), train, fit: settings.fit, digest: settings.export_sha256, out: out.to_path_buf() };
             method(&run, base, None, begin)
         }
-        _ => Err("gate OUT [SCOREBOARD.tsv] | model EXPORT SETTINGS.json FROM OUT host|gpu [SCOREBOARD.tsv]".into()),
+        Some("regions") => {
+            let [_, export, checkpoint, out] = &args[..] else { return Err("regions EXPORT CHECKPOINT OUT".into()) };
+            let imported = import_language_model(Path::new(export), 1, 1)?;
+            let layer_count = imported.record["config"]["n_layers"].as_u64().ok_or("config.n_layers")? as usize;
+            let native = split_sites(&imported.program)?;
+            let layers = layer_nodes(&native, layer_count)?;
+            let start = library_mdl::explanation(&native, &layers)?;
+            let posterior = library_mdl::checkpoint_posterior(&start, Path::new(checkpoint))?;
+            let mut listed = Vec::new();
+            for l in 0..layers.len() {
+                let pool = live(&start, &posterior, l);
+                let found = through_heads((&native, &layers), &start, &posterior, l, &pool)?;
+                log::info!("regions: layer {l}, {} live functions, {} regions through heads", pool.len(), found.len());
+                listed.push(json!({"layer": l, "live": pool.len(), "regions": found.iter().map(|(ws, _, r)| json!({"heads": ws.iter().map(|w| [w.layer, w.head]).collect::<Vec<_>>(), "functions": r})).collect::<Vec<_>>()}));
+            }
+            std::fs::create_dir_all(out).map_err(error)?;
+            save(&Path::new(out).join("REGIONS.json"), &json!({"checkpoint": checkpoint, "layers": listed}))
+        }
+        _ => Err("gate OUT [SCOREBOARD.tsv] | model EXPORT SETTINGS.json FROM OUT host|gpu [SCOREBOARD.tsv] | regions EXPORT CHECKPOINT OUT".into()),
     }
 }
