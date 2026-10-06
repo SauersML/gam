@@ -46,7 +46,9 @@ as text with the peak token marked and its level), nothing. Candidates of an att
 shown as vectors in graph and weights, named by site in every condition. graph_lens and weights_lens
 add, as text, vpd_lens.py's readout of the weights (the tokens on which the subcomponent is positive and
 negative, and the tokens its write then raises and lowers through the unembedding; for an attribution
-question, each candidate's), from Table's --lens file.
+question, each candidate's), from Table's --lens file. For a library warm-started from public
+transcoders, weights_examples adds to weights, and examples gives alone, the transcoder feature's public
+top-activating examples and logits (transcoder_examples.py; --feature-examples, --transcoders).
 
 Held out: subcomponents of --heldout-layers (never trained on) on held-out texts (the held-out runs), and
 trained layers on held-out texts.
@@ -77,7 +79,7 @@ from reporter import Injection, Magnitude  # noqa: E402
 
 KINDS = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj", "head", "function")  # VPD's sites, then the library's
 LABELS = "ABCDEFGHIJ"
-CONDITIONS = ("graph", "weights", "activity", "nothing", "graph_lens", "weights_lens")
+CONDITIONS = ("graph", "weights", "activity", "nothing", "graph_lens", "weights_lens", "weights_examples", "examples")
 QUESTIONS = ("activity", "direction", "top", "continuation", "edge", "attribution")
 BINS = 10
 NEIGHBOURS = 4  # per direction
@@ -151,8 +153,11 @@ def edge_level(rel: float) -> int:
 class Table:
     """A label run (vpd_labels.py), its relations (vpd_relations.py), the vectors, the tokenizer."""
 
-    def __init__(self, root: Path, uv_path: Path, relations: Path | None = None, tokenizer: Path = TOKENIZER, lens: Path | None = None):
+    def __init__(self, root: Path, uv_path: Path, relations: Path | None = None, tokenizer: Path = TOKENIZER, lens: Path | None = None,
+                 feature_examples: Path | None = None, transcoders: Path | None = None):
         import tokenizers
+
+        from transcoder_examples import Features, kept
 
         self.tokens = load_file(str(root / "contexts.safetensors"))["tokens"].long()
         self.sites = {}
@@ -162,6 +167,11 @@ class Table:
         self.uv = load_file(str(uv_path))  # VPD's subcomponents, or a library's functions.safetensors
         head_vectors(self.uv)
         self.lens = load_file(str(lens)) if lens is not None else None
+        self.layers = sorted({layer for layer, _ in self.sites})
+        # Per kind, the widths of its read and write vectors (V is [d_read, C], U is [C, d_write]).
+        self.dims = {kind: (int(self.uv[f"{site_name(layer, kind)}.V"].shape[0]), int(self.uv[f"{site_name(layer, kind)}.U"].shape[1])) for layer, kind in self.sites}
+        self.features = Features(feature_examples) if feature_examples is not None else None
+        self.kept = kept(transcoders) if transcoders is not None else None
         self.tok = tokenizers.Tokenizer.from_file(str(tokenizer))
         self.rel = {}
         self.offsets = None
@@ -397,8 +407,8 @@ def exemplars(table: Table, ex: dict, n: int = 3) -> str:
 
 
 def base(condition: str) -> str:
-    """The condition's vector input (a *_lens condition adds the lens text to graph's or weights')."""
-    return condition.removesuffix("_lens")
+    """The condition's vector input (a *_lens or *_examples condition adds text to graph's or weights')."""
+    return condition.removesuffix("_lens").removesuffix("_examples")
 
 
 def slots(table: Table, ex: dict, condition: str) -> list[tuple]:
@@ -438,11 +448,13 @@ def lens_text(table: Table, layer: int, kind: str, c: int, name: str = "It", rea
 def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
     """The user turn around the placeholders: (before, after)."""
     lens = condition.endswith("_lens")
+    public = condition.endswith("examples")
     condition = base(condition)
+    n = len(table.layers)
     if ex["c"] >= 0:
-        before = f"A component of a 4-layer language model: layer {ex['layer']}, {ex['kind']}. Its vectors, then those of related components:"
+        before = f"A component of a {n}-layer language model: layer {ex['layer']}, {ex['kind']}. Its vectors, then those of related components:"
     else:
-        before = "Components of a 4-layer language model. Their vectors:"
+        before = f"Components of a {n}-layer language model. Their vectors:"
     info = "\n" + exemplars(table, ex) if condition == "activity" and ex["c"] >= 0 else ""
     if condition == "graph" and ex["c"] >= 0 and ex["kind_q"] not in ("edge", "attribution"):
         lines = [f"N{i + 1}: layer {l}, {k}, {'upstream: its removal changes this component by' if d == 'up' else 'downstream: depends on this component by'} {s:.2g} of its peak"
@@ -450,6 +462,8 @@ def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
         info += "\nAfter its own two vectors come those of its most strongly related components, in this order:\n" + "\n".join(lines)
     if ex["kind_q"] == "attribution":
         info += "\nThe listed components' vectors come in the order C1, C2, C3, C4."
+    if public and ex["c"] >= 0:
+        info += "\n" + table.features.text(ex["layer"], table.kept[ex["layer"]][ex["c"]])
     if lens:
         info += "\nIts weights read through the token embeddings and the unembedding (no measurement):\n"
         if ex["c"] >= 0:
@@ -467,7 +481,7 @@ def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
 
 
 class Oracle(torch.nn.Module):
-    def __init__(self, base: str, lora_rank: int, inject: int, dev):
+    def __init__(self, base: str, lora_rank: int, inject: int, dev, dims: dict):
         super().__init__()
         from peft import LoraConfig, get_peft_model
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -478,9 +492,7 @@ class Oracle(torch.nn.Module):
         model = AutoModelForCausalLM.from_pretrained(base, dtype=dtype).to(dev)
         self.model = get_peft_model(model, LoraConfig(r=lora_rank, lora_alpha=lora_rank, target_modules="all-linear", lora_dropout=0.0))
         width = model.config.hidden_size
-        dims = {"q_proj": (768, 768), "k_proj": (768, 768), "v_proj": (768, 768), "o_proj": (768, 768), "c_fc": (768, 3072), "down_proj": (3072, 768),
-                "head": (768, 768), "function": (768, 768)}
-        self.maps = torch.nn.ModuleDict({f"{k}_{side}": torch.nn.Linear(dims[k][i], width) for k in KINDS for i, side in enumerate(("read", "write"))}).to(dev)
+        self.maps = torch.nn.ModuleDict({f"{k}_{side}": torch.nn.Linear(dims[k][i], width) for k in KINDS if k in dims for i, side in enumerate(("read", "write"))}).to(dev)
         self.magnitude = Magnitude(width, 4).to(dev)
         self.hook = Injection(1.0, inject)
         model.model.layers[inject].register_forward_hook(self.hook)
@@ -498,7 +510,10 @@ class Oracle(torch.nn.Module):
         inner = self.model.get_base_model()
         self.model = PeftModel.from_pretrained(inner, str(run / "adapter"), is_trainable=True)
         state = torch.load(run / "maps.pt")
-        missing = self.maps.load_state_dict(state["maps"], strict=False).missing_keys  # a VPD run read on a library: its kinds' maps start fresh
+        # A VPD run read on a library: maps of kinds it lacks, or of another width (another model), start fresh.
+        own = self.maps.state_dict()
+        maps = {k: v for k, v in state["maps"].items() if k in own and own[k].shape == v.shape}
+        missing = self.maps.load_state_dict(maps, strict=False).missing_keys
         assert all(k.split(".")[0].rsplit("_", 1)[0] in ("head", "function") for k in missing), missing
         self.magnitude.load_state_dict(state["magnitude"])
 
@@ -567,7 +582,8 @@ def log_scores(log_q, valid, batch) -> torch.Tensor:
 
 
 def table_of(args) -> Table:
-    return Table(Path(args.labels), Path(args.uv), Path(args.relations) if args.relations else None, Path(args.tokenizer), Path(args.lens) if args.lens else None)
+    return Table(Path(args.labels), Path(args.uv), Path(args.relations) if args.relations else None, Path(args.tokenizer), Path(args.lens) if args.lens else None,
+                 Path(args.feature_examples) if args.feature_examples else None, Path(args.transcoders) if args.transcoders else None)
 
 
 def train(args):
@@ -575,8 +591,8 @@ def train(args):
     torch.manual_seed(args.seed)
     held = {int(x) for x in args.heldout_layers.split(",") if x}
     table = table_of(args)
-    data = examples(table, {0, 1, 2, 3} - held, args.examples, args.seed, per_component=args.per_component, only=tuple(args.questions.split(",")) if args.questions else (), rule=args.rule)
-    oracle = Oracle(args.base, args.lora_rank, args.inject, dev)
+    data = examples(table, set(table.layers) - held, args.examples, args.seed, per_component=args.per_component, only=tuple(args.questions.split(",")) if args.questions else (), rule=args.rule)
+    oracle = Oracle(args.base, args.lora_rank, args.inject, dev, table.dims)
     if args.init:  # warm start: an earlier run's adapter and maps (same base model); new kinds' maps start fresh
         oracle.load(Path(args.init))
     oracle.model.base_model.model.gradient_checkpointing_enable()
@@ -608,13 +624,13 @@ def train(args):
 def evaluate(args):
     dev = device()
     config = json.loads((Path(args.run) / "config.json").read_text())
-    oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev)
+    table = table_of(args)
+    oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev, table.dims)
     oracle.load(Path(args.run))
     oracle.model.eval()
-    table = table_of(args)
     held = {int(x) for x in config["heldout_layers"].split(",") if x}
     rows = []
-    for split, layers in (("heldout_layers", held), ("trained_layers", {0, 1, 2, 3} - held)):
+    for split, layers in (("heldout_layers", held), ("trained_layers", set(table.layers) - held)):
         for distribution in ("natural", "stratified"):
             data = examples(table, layers, args.examples, args.seed + 1, stratified=distribution == "stratified",
                             only=tuple(config["questions"].split(",")) if config.get("questions") else (), rule=config.get("rule", False))
@@ -677,6 +693,8 @@ def main():
         p.add_argument("--relations", help="vpd_relations.py's output for these labels")
         p.add_argument("--tokenizer", default=str(TOKENIZER), help="the target's tokenizer.json")
         p.add_argument("--lens", help="vpd_lens.py build's output (the *_lens conditions)")
+        p.add_argument("--feature-examples", help="public transcoder features/ directory (the *examples conditions)")
+        p.add_argument("--transcoders", help="the library's fit OUT holding transcoder_l*.safetensors (its functions' transcoder indices)")
         p.add_argument("--seed", type=int, default=0)
     t = sub.choices["train"]
     t.add_argument("--base", required=True)

@@ -309,9 +309,9 @@ def train(args):
     dev = device()
     run = Path(args.answer)
     config = json.loads((run / "config.json").read_text())
-    oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev)
-    oracle.load(run)
     table = Table(Path(args.labels), Path(args.uv), Path(args.relations) if args.relations else None, Path(args.tokenizer), Path(args.lens) if args.lens else None)
+    oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev, table.dims)
+    oracle.load(run)
     target = Target(dev, load_uv(dev, Path(args.uv)), table)
     episodes = Episodes(oracle, table, target, config["condition"], args)
     held = {int(x) for x in config["heldout_layers"].split(",") if x}
@@ -324,7 +324,7 @@ def train(args):
     for step in range(args.steps):
         if args.hours and time.time() - started > 3600 * args.hours:
             break  # the run's time budget: stop and save the policy as it is
-        comps = [c for c in components(table, {0, 1, 2, 3} - held, args.components, rng) for _ in range(args.group)]
+        comps = [c for c in components(table, set(table.layers) - held, args.components, rng) for _ in range(args.group)]
         oracle.model.eval()
         oracle.model.base_model.model.gradient_checkpointing_disable()  # sampling keeps its cache
         convs, places, own, descriptions, texts, calls = episodes.roll(comps)
@@ -353,9 +353,9 @@ def evaluate(args):
     dev = device()
     run = Path(args.policy)
     config = json.loads((run / "config.json").read_text())
-    oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev)
-    oracle.load(run)
     table = Table(Path(args.labels), Path(args.uv), Path(args.relations) if args.relations else None, Path(args.tokenizer), Path(args.lens) if args.lens else None)
+    oracle = Oracle(config["base"], config["lora_rank"], config["inject"], dev, table.dims)
+    oracle.load(run)
     target = Target(dev, load_uv(dev, Path(args.uv)), table)
     episodes = Episodes(oracle, table, target, config["condition"], argparse.Namespace(turns=args.turns, tokens=args.tokens))
     held = {int(x) for x in config["heldout_layers"].split(",") if x}
