@@ -50,7 +50,7 @@ packages=(-p gam-mpd)
 if [ $# -gt 0 ]; then
     packages=()
     for e in "$@"; do
-        f=$(ls crates/*/examples/"$e".rs crates/*/examples/"$e"/main.rs 2> /dev/null | head -n 1)
+        f=$(ls crates/*/examples/"$e".rs crates/*/examples/"$e"/main.rs 2> /dev/null | head -n 1 || true)
         [ -n "$f" ] || { echo "no example $e under crates/*/examples" >&2; exit 1; }
         d=${f#crates/}; d=${d%%/*}
         packages+=(-p "$(sed -n 's/^name *= *"\(.*\)"/\1/p' "crates/$d/Cargo.toml" | head -n 1)")
