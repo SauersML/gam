@@ -436,6 +436,9 @@ pub struct Layer {
     pub heads: Vec<(Vec<usize>, Vec<usize>)>,
     /// Per MLP function, its groups: its gate's, its up direction's when gated, and its output's.
     pub functions: Vec<Vec<usize>>,
+    /// A transcoder layer's group of its MLP block's output at each sequence's first token
+    /// (`library_transcoder`, `library.l{l}.mlp.sink`), part of the MLP block.
+    pub sink: Option<usize>,
 }
 
 /// A library operator: dense, every block present, its reals exactly representable.
@@ -733,7 +736,7 @@ pub fn explanation_with(native: &OperatorProgram, layers: &[LayerNodes], transco
     let program = &artifact.program;
     let mut groups = Vec::new();
     let mut trainable = Vec::new();
-    let mut out: Vec<Layer> = layers.iter().map(|sites| Layer { sites: sites.clone(), heads: Vec::new(), functions: Vec::new() }).collect();
+    let mut out: Vec<Layer> = layers.iter().map(|sites| Layer { sites: sites.clone(), heads: Vec::new(), functions: Vec::new(), sink: None }).collect();
     // Per key-value group, a group per rotary plane holding the plane's rows of the shared key
     // and of every query head's query, and a group per value coordinate of the shared value.
     let mut heads: Vec<Vec<Option<(Vec<usize>, Vec<usize>)>>> = layers.iter().map(|l| vec![None; l.reads.len()]).collect();
@@ -780,6 +783,11 @@ pub fn explanation_with(native: &OperatorProgram, layers: &[LayerNodes], transco
             groups.push(Group { name: format!("{name}.f{i}.out"), cells: vec![Cells { operator: output, rows: (0..d).collect(), cols: i..i + 1 }] });
         }
         trainable.push(output);
+        if let Some(sink) = operator_named(program, &format!("{name}.sink")) {
+            layer.sink = Some(groups.len());
+            groups.push(Group { name: format!("{name}.sink"), cells: vec![Cells { operator: sink, rows: (0..d).collect(), cols: 0..1 }] });
+            trainable.push(sink);
+        }
     }
     trainable.sort_unstable();
     artifact.owners = owners;
@@ -796,7 +804,7 @@ fn block_groups(explanation: &Explanation) -> Vec<Vec<usize>> {
         .iter()
         .flat_map(|layer| {
             let attention = layer.heads.iter().flat_map(|(planes, values)| planes.iter().chain(values)).copied().collect();
-            [attention, layer.functions.iter().flatten().copied().collect()]
+            [attention, layer.functions.iter().flatten().chain(&layer.sink).copied().collect()]
         })
         .collect()
 }
@@ -846,6 +854,7 @@ pub fn scoped(explanation: &Explanation, blocks: &[usize]) -> Result<Explanation
             sites: layer.sites.clone(),
             heads: if blocks.contains(&(2 * l)) { layer.heads.iter().map(|(planes, values)| (renumber(planes), renumber(values))).collect() } else { Vec::new() },
             functions: if blocks.contains(&(2 * l + 1)) { layer.functions.iter().map(|f| renumber(f)).collect() } else { Vec::new() },
+            sink: if blocks.contains(&(2 * l + 1)) { layer.sink.and_then(|g| kept[g]) } else { None },
         })
         .collect();
     let reference = explanation.reference.iter().zip(&kept).filter(|(_, k)| k.is_some()).map(|(r, _)| *r).collect();
@@ -1530,12 +1539,11 @@ pub const EVALUATION_SHARE: f64 = 0.1;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Epoch {
     pub epoch: usize,
-    /// Mean over the epoch's steps of the objective estimate, and of its data and description
-    /// parts, in bits: each step's at the posterior before its step, so the mean is no estimate of
-    /// `F` at one posterior (the log's record of the descent).
-    pub objective_bits: f64,
+    /// Mean over the epoch's steps of the data term over the training collection at each step's
+    /// weight samples around the iterate (the optimizer's state, not the reported posterior), in
+    /// bits: the log's record of the descent, at no one posterior and with no description. `F` of
+    /// one posterior, its data term and description at the same `q`, is the snapshot's.
     pub data_bits: f64,
-    pub description_bits: f64,
     /// The snapshot's estimate of `F` at the end-of-epoch posterior, the mean of its per-batch
     /// estimates on the whole training collection at fixed draws, and the snapshot's seconds
     /// (module note): what the stop and the best epoch are decided on.
@@ -1558,10 +1566,6 @@ pub struct Epoch {
     /// sequence when the schedule ran it (module note).
     pub held_out: HeldOut,
     pub held_out_full: Option<HeldOut>,
-    /// Each step's estimate of `F` in bits, in batch order: two fits on the same batches are
-    /// compared batch by batch, with a paired standard error.
-    #[serde(default)]
-    pub estimates: Vec<f64>,
 }
 
 /// One removal step.
@@ -3139,8 +3143,6 @@ pub fn fit_from(
     // variance about `2 / B` per entry: the batch size sets how many draws the average holds, not
     // what it estimates.
     let ivon = Ivon { beta1: MOMENTUM_DECAY, beta2: 1.0 - 1.0 / draws.len() as f64 };
-    // Each group's size, whose `½ ln |G|` an active group's variance costs.
-    let sizes: Vec<f64> = explanation.groups.iter().map(|g| g.cells.iter().map(|c| (c.rows.len() * c.cols.len()) as f64).sum()).collect();
     // The fit's thread streams the checkpoint off the device to the writer thread, which finishes
     // writing it while the device trains on ([`Snapshot`]). The current explanation is read from
     // the checkpoint where it is wanted ([`checkpoint_artifact`]): a posterior-mean artifact made
@@ -3194,14 +3196,9 @@ pub fn fit_from(
         {
             prior.epoch(explanation, &posterior)?;
         }
-        // Which groups are active changes only at a removal.
-        let subset_code = posterior.subset_nats();
-        // Each step's code length of the groups' posteriors, summed on the device and read once
-        // the epoch's steps are done.
-        let mut code = device_posterior.code_length(&posterior.active, &sizes, draws.len())?;
-        let (mut datas, mut priors) = (Vec::with_capacity(draws.len()), Vec::with_capacity(draws.len()));
-        let mut estimates = Vec::with_capacity(draws.len());
-        let (mut data_sum, mut description_sum) = (0.0, 0.0);
+        // The steps' data terms at their samples around the iterate: the descent's record, no
+        // estimate of `F` (`Epoch::data_bits`); the snapshot below scores `F`.
+        let mut data_sum = 0.0;
         let (mut clean, mut patched) = (Mean::default(), Mean::default());
         for (b, draw) in draws.iter().enumerate() {
             let step_started = Instant::now();
@@ -3214,10 +3211,7 @@ pub fn fit_from(
             }
             let scored = bits.iter().map(Vec::len).sum::<usize>();
             let (scale, weight) = batch_weights(draws.len(), tokens);
-            let data = scale * LN_2 * bits.iter().flatten().sum::<f64>();
-            // `Σ_G KL_G` and the active groups' variances' scales at the posterior the sample was drawn
-            // from.
-            device_posterior.code_length_into(&mut code, b)?;
+            data_sum += scale * LN_2 * bits.iter().flatten().sum::<f64>();
             // The prior term at the step's two antithetic samples, around the iterate as the data
             // step's (`PriorTerm::sample_device`), and its seconds: its value and gradient averaged
             // over the pair, the gradient joining the data term's (which the step weighs by `scale`
@@ -3227,37 +3221,30 @@ pub fn fit_from(
             // the step's one step of them.
             let mut prior_seconds = 0.0;
             let mut prior_curvature = BTreeMap::new();
-            let prior_nats = match prior.as_deref_mut() {
-                Some(prior) => {
-                    let timed = Instant::now();
-                    let (twin_nats, twin) = prior.sample_device(device, &device_posterior, &mut posterior, key ^ gam_gpu::tensor::ANTITHETIC, false)?;
-                    let (own_nats, own) = prior.sample_device(device, &device_posterior, &mut posterior, key, true)?;
-                    let mut reached: Vec<usize> = own.keys().chain(twin.keys()).copied().collect();
-                    reached.sort_unstable();
-                    reached.dedup();
-                    for i in reached {
-                        let op = explanation.trainable[i];
-                        let (plus, minus) = (own.get(&i), twin.get(&i));
-                        prior_curvature.insert(op, device_posterior.stein_curvature(i, (plus, minus), key)?);
-                        for g in [plus, minus].into_iter().flatten() {
-                            match gradients.get_mut(&op) {
-                                Some(total) => device.axpy(total, 0.5 / (scale * LN_2), g).map_err(error)?,
-                                None => {
-                                    let mut scaled = device.zeros(g.rows(), g.cols()).map_err(error)?;
-                                    device.axpy(&mut scaled, 0.5 / (scale * LN_2), g).map_err(error)?;
-                                    gradients.insert(op, scaled);
-                                }
+            if let Some(prior) = prior.as_deref_mut() {
+                let timed = Instant::now();
+                let (_, twin) = prior.sample_device(device, &device_posterior, &mut posterior, key ^ gam_gpu::tensor::ANTITHETIC, false)?;
+                let (_, own) = prior.sample_device(device, &device_posterior, &mut posterior, key, true)?;
+                let mut reached: Vec<usize> = own.keys().chain(twin.keys()).copied().collect();
+                reached.sort_unstable();
+                reached.dedup();
+                for i in reached {
+                    let op = explanation.trainable[i];
+                    let (plus, minus) = (own.get(&i), twin.get(&i));
+                    prior_curvature.insert(op, device_posterior.stein_curvature(i, (plus, minus), key)?);
+                    for g in [plus, minus].into_iter().flatten() {
+                        match gradients.get_mut(&op) {
+                            Some(total) => device.axpy(total, 0.5 / (scale * LN_2), g).map_err(error)?,
+                            None => {
+                                let mut scaled = device.zeros(g.rows(), g.cols()).map_err(error)?;
+                                device.axpy(&mut scaled, 0.5 / (scale * LN_2), g).map_err(error)?;
+                                gradients.insert(op, scaled);
                             }
                         }
                     }
-                    let nats = 0.5 * (own_nats + twin_nats) + prior.cost(&posterior)?;
-                    prior_seconds = timed.elapsed().as_secs_f64();
-                    nats
                 }
-                None => 0.0,
-            };
-            datas.push(data);
-            priors.push(prior_nats);
+                prior_seconds = timed.elapsed().as_secs_f64();
+            }
             progress.step += 1;
             // The factor's scale: its square estimates the curvature per token of the tokens it
             // sums (one antithetic half's, or the whole batch's under the full arm,
@@ -3269,16 +3256,7 @@ pub fn fit_from(
             let (eta, rho, draws_averaged, ratio) = device_posterior.step_state();
             log::info!("library line step {epoch}.{b}: η {eta:.4e}, ρ̄ {rho:.4e} over {draws_averaged} draws, r̄ {ratio:.4e}; posterior step {posterior_seconds:.3} s");
             let prior_note = if prior.is_some() { format!(" (prior: {prior_seconds:.3} s)") } else { String::new() };
-            log::info!("library step {epoch}.{b}: {:.6} bits per scored token, {:.2} s{prior_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
-        }
-        for ((code_length, data), prior_nats) in device_posterior.code_lengths(&code)?.into_iter().zip(datas).zip(priors) {
-            let description = code_length + subset_code + explanation.fixed_nats + prior_nats;
-            if !description.is_finite() {
-                return Err("a nonfinite posterior divergence".into());
-            }
-            estimates.push(data + description);
-            data_sum += data;
-            description_sum += description;
+            log::info!("library step {epoch}.{b}: data {:.6} bits per scored token at the iterate's samples, {:.2} s{prior_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
         }
         let count = draws.len() as f64;
         // The end-of-epoch posterior scored on the whole collection at the draws every snapshot
@@ -3299,10 +3277,7 @@ pub fn fit_from(
         let to_bits = |nats: f64| nats / LN_2;
         let record = Epoch {
             epoch,
-            estimates: estimates.iter().map(|e| to_bits(*e)).collect(),
-            objective_bits: to_bits(estimates.iter().sum::<f64>() / count),
             data_bits: to_bits(data_sum / count),
-            description_bits: to_bits(description_sum / count),
             snapshot_bits: to_bits(snapshot_mean),
             snapshot_seconds,
             improvement_bits: improvement.map(to_bits),
@@ -4102,7 +4077,7 @@ mod tests {
         let report = &fit.report;
         assert_eq!(report.removals.last().unwrap().removed, 0, "the fit ends when no removal is accepted");
         assert!(report.removals.iter().all(|r| r.after_bits <= r.before_bits), "a removal never increases the objective");
-        assert!(report.epochs.iter().all(|e| e.objective_bits.is_finite() && e.held_out.objective_bits_per_token.is_finite()));
+        assert!(report.epochs.iter().all(|e| e.snapshot_bits.is_finite() && e.data_bits.is_finite() && e.held_out.objective_bits_per_token.is_finite()));
         let fitted = posterior_mean(&explanation, &fit.posterior).unwrap();
         fitted.validate_coverage(&native).unwrap();
         // After training, both query heads still read one key and one value map, moved from M's.
@@ -4862,7 +4837,7 @@ mod tests {
     }
 
     #[test]
-    fn the_device_code_length_is_the_host_description() {
+    fn the_device_variances_are_the_hosts() {
         let (native, layers, _, _) = tiny("library_code_length", "gelu");
         let explanation = explanation(&native, &layers).unwrap();
         let mut posterior = Posterior::new(&explanation, 72).unwrap();
@@ -4873,18 +4848,10 @@ mod tests {
         }
         posterior.remove(&[1]);
         let device_posterior = DevicePosterior::new(&Device::host(), &explanation, &posterior, 72.0, None, 0).unwrap();
-        let sizes: Vec<f64> = explanation.groups.iter().map(|g| g.cells.iter().map(|c| (c.rows.len() * c.cols.len()) as f64).sum()).collect();
-        let mut code = device_posterior.code_length(&posterior.active, &sizes, 2).unwrap();
-        device_posterior.code_length_into(&mut code, 1).unwrap();
-        // The device's variances are the host's (`Posterior::variances`), and its code length the
-        // host's description without the subset code.
+        // The device's variances are the host's (`Posterior::variances`).
         for (g, (device, host)) in device_posterior.variances().unwrap().iter().zip(posterior.variances()).enumerate() {
             assert!((device - host).abs() <= 1e-12 * host.abs(), "group {g}: v_G {device} on the device against {host}");
         }
-        let expected: f64 = posterior.costs().iter().sum();
-        let lengths = device_posterior.code_lengths(&code).unwrap();
-        assert_eq!(lengths[0], 0.0, "an untouched step's row stays zero");
-        assert!(expected.is_finite() && (lengths[1] - expected).abs() <= 1e-12 * expected.abs(), "{} against {expected}", lengths[1]);
     }
 
     #[test]
@@ -5170,7 +5137,7 @@ mod tests {
         assert_eq!(trained.len(), started.report.epochs.len());
         for (a, b) in trained.iter().zip(&started.report.epochs) {
             assert_eq!(a.epoch, b.epoch);
-            assert_eq!(a.objective_bits.to_bits(), b.objective_bits.to_bits(), "epoch {}", a.epoch);
+            assert_eq!((a.data_bits.to_bits(), a.snapshot_bits.to_bits()), (b.data_bits.to_bits(), b.snapshot_bits.to_bits()), "epoch {}", a.epoch);
         }
         assert_eq!(started.posterior.mean, resumed.posterior.mean);
         assert_eq!(started.posterior.log_sd, resumed.posterior.log_sd);
@@ -5346,7 +5313,7 @@ mod tests {
         }
         assert_eq!(resumed.report.epochs.len(), uninterrupted.report.epochs.len());
         for (a, b) in resumed.report.epochs.iter().zip(&uninterrupted.report.epochs) {
-            assert_eq!(a.objective_bits.to_bits(), b.objective_bits.to_bits(), "epoch {}", a.epoch);
+            assert_eq!((a.data_bits.to_bits(), a.snapshot_bits.to_bits()), (b.data_bits.to_bits(), b.snapshot_bits.to_bits()), "epoch {}", a.epoch);
         }
         assert_eq!(resumed.report.removals.len(), uninterrupted.report.removals.len());
         assert_eq!(resumed.posterior.mean, uninterrupted.posterior.mean);
@@ -5411,7 +5378,7 @@ mod tests {
             assert_eq!(a.state, b.state, "device {d}: IVON's state, the iterate and the steps its average spans");
             assert_eq!(resumed.report.epochs.len(), uninterrupted.report.epochs.len());
             for (x, y) in resumed.report.epochs.iter().zip(&uninterrupted.report.epochs) {
-                assert_eq!(x.objective_bits.to_bits(), y.objective_bits.to_bits(), "device {d}: epoch {}", x.epoch);
+                assert_eq!((x.data_bits.to_bits(), x.snapshot_bits.to_bits()), (y.data_bits.to_bits(), y.snapshot_bits.to_bits()), "device {d}: epoch {}", x.epoch);
             }
         }
         std::fs::remove_dir_all(&dir).unwrap();
@@ -5524,7 +5491,7 @@ mod tests {
         assert_eq!(report.families.values().sum::<usize>(), 2 * 4, "two experiments per training base");
         assert_eq!(report.removals.last().unwrap().removed, 0, "the fit ends when no removal is accepted");
         assert!(report.removals.iter().all(|r| r.after_bits <= r.before_bits), "a removal never increases the objective");
-        assert!(report.epochs.iter().all(|e| e.objective_bits.is_finite() && e.held_out.objective_bits_per_token.is_finite()));
+        assert!(report.epochs.iter().all(|e| e.snapshot_bits.is_finite() && e.data_bits.is_finite() && e.held_out.objective_bits_per_token.is_finite()));
         let artifact = posterior_mean(&explanation, &fit.posterior).unwrap();
         artifact.validate_coverage(&native).unwrap();
         let (start, end) = (explanation.artifact.program.real_count(), artifact.program.real_count());

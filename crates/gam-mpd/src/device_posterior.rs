@@ -23,8 +23,12 @@
 //! (`μ̄ ← μ̄ + w (μ − μ̄)`, `w = max(1/t, 1 − β₂)`, `t` the steps since the posterior was last set,
 //! `1 / (1 − β₂)` the epoch's batches): the steps move the iterate, sampled at `μ + σ ε`, while
 //! `v_G`, `KL(q_G ‖ p_G)`, the reported and checkpointed posterior and every evaluation take `μ̄`.
-//! The iterate's optimizer noise is not part of `q`: where the data's curvature is small,
-//! `σ² ≈ v_G`, and charging the iterate's random walk within `±σ` to `v_G = mean(μ² + σ²)` grew
+//! The iterate is the optimizer's state, and `v_G` the empirical-Bayes variance of the reported
+//! `q` (mean `μ̄`): every score that is reported or decides anything (the epochs' snapshots of
+//! `F`, the held-out evaluation, the removal comparisons) takes its data term and its description
+//! at that one `q`; only the steps' gradients and their data terms
+//! (`library_mdl::Epoch::data_bits`) are at samples around the iterate. The iterate's optimizer
+//! noise is not part of `q`: where the data's curvature is small, `σ² ≈ v_G`, and charging the iterate's random walk within `±σ` to `v_G = mean(μ² + σ²)` grew
 //! `v_G` without bound (vpd4l at `N = 2^16`: `Σ v_G` 356 → 1.4e4 over 12 epochs).
 
 use crate::{
@@ -86,14 +90,6 @@ pub struct Parts<'a, A: Borrow<Array2<f64>> = Array2<f64>> {
     pub groups: &'a [Vec<u32>],
     pub count: usize,
     pub reference: Option<&'a [f64]>,
-}
-
-/// The per-group constants of a posterior's code length and one row per step for its values
-/// ([`DevicePosterior::code_length`]).
-pub struct CodeLength {
-    weight: Tensor,
-    constant: Tensor,
-    rows: Tensor,
 }
 
 /// The posterior of a library explanation's trainable operators, on the device.
@@ -599,31 +595,6 @@ impl DevicePosterior {
             curvature.add_batch(&slope, &dot)?;
         }
         Ok(())
-    }
-
-    /// Rows for `steps` steps' code lengths ([`DevicePosterior::code_length_into`]) of a posterior
-    /// whose groups are `active`, of `sizes` entries.
-    pub fn code_length(&self, active: &[bool], sizes: &[f64], steps: usize) -> Result<CodeLength, String> {
-        let column = |values: Vec<f64>| self.wide.upload_vec(values.len(), 1, values).map_err(error);
-        Ok(CodeLength {
-            weight: column(active.iter().map(|a| f64::from(u8::from(*a))).collect())?,
-            constant: column(sizes.iter().map(|n| 0.5 * n.ln()).collect())?,
-            rows: self.wide.zeros(steps, 3).map_err(error)?,
-        })
-    }
-
-    /// Adds the code length in nats of the groups' posteriors as they stand into row `step` of
-    /// `code`: over the active groups `G`, `KL(q_G ‖ p_G) + ½ ln |G|` and `ln 2` times the bits of
-    /// `v_G`'s scale against `v⁰_G` (`library_mdl`'s description without its subset code; no bits
-    /// for a posterior without references, [`Parts`]), summed on the device
-    /// ([`Device::group_code_length`]).
-    pub fn code_length_into(&self, code: &mut CodeLength, step: usize) -> Result<(), String> {
-        self.wide.group_code_length(&self.divergence, (&code.weight, &code.constant), &mut code.rows, step).map_err(error)
-    }
-
-    /// Each step's code length in nats, read at once.
-    pub fn code_lengths(&self, code: &CodeLength) -> Result<Vec<f64>, String> {
-        Ok(self.wide.download(&code.rows).map_err(error)?.column(1).to_vec())
     }
 
     /// Per group, its prior variance `v_G` at the posterior as it stands

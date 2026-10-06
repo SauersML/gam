@@ -137,7 +137,7 @@ fn arm(device: &Device, (native, start): (&gam_mpd::operator_program::OperatorPr
         })
         .collect();
     save(&out.join("PROPOSAL.json"), &json!({"targets": mixture.targets.len(), "kept_by_kind": kept, "exact_by_kind": exact, "exact": listed}))?;
-    let epochs: Vec<Value> = fitted.report.epochs.iter().map(|e| json!({"epoch": e.epoch, "objective_bits": e.objective_bits, "data_bits": e.data_bits, "description_bits": e.description_bits, "held_out_objective_bits_per_token": e.held_out.objective_bits_per_token, "estimates": e.estimates})).collect();
+    let epochs: Vec<Value> = fitted.report.epochs.iter().map(|e| json!({"epoch": e.epoch, "snapshot_bits": e.snapshot_bits, "data_bits": e.data_bits, "held_out_objective_bits_per_token": e.held_out.objective_bits_per_token})).collect();
     let summary = json!({
         "export_sha256": settings.export_sha256,
         "from": format!("start:{}", checkpoint.display()),
