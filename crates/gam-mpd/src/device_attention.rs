@@ -29,6 +29,99 @@ impl Segment {
     }
 }
 
+/// The length every segment's keys share, when they do: a call of whole sequences and suffix lanes
+/// of one sequence length (every run reaches its sequence's end). The segments then run as that many
+/// sequences at once ([`Whole`]).
+pub(crate) fn common_length(segments: &[Segment]) -> Option<usize> {
+    let length = segments.first()?.length();
+    segments.iter().all(|s| s.length() == length).then_some(length)
+}
+
+/// Whether the attention of sequences of `length` in `rows` runs in query tiles rather than with
+/// every sequence's weights at once: a sequence longer than 1024 positions or more than 8M weights.
+pub(crate) fn tiles(rows: usize, length: usize) -> bool {
+    length > 1024 || rows.saturating_mul(length) > 8 * 1024 * 1024
+}
+
+/// Segments of one length as whole sequences: their keys' rows gathered one sequence after another
+/// (`keys`), each segment's own rows there (`own`, after its earlier positions) and in the call
+/// (`rows`), and the earlier positions' rows there (`earlier`) with the call's rows holding them.
+pub(crate) struct Whole {
+    pub(crate) keys: Vec<Range<usize>>,
+    pub(crate) own: Vec<Range<usize>>,
+    pub(crate) rows: Vec<Range<usize>>,
+    pub(crate) earlier: Vec<(Range<usize>, Vec<Range<usize>>)>,
+}
+
+impl Whole {
+    pub(crate) fn of(segments: &[Segment], length: usize) -> Self {
+        let keys = segments.iter().flat_map(Segment::keys).collect();
+        let own = segments.iter().enumerate().map(|(i, s)| i * length + s.first..(i + 1) * length).collect();
+        let rows = segments.iter().map(|s| s.rows.clone()).collect();
+        let earlier = segments.iter().enumerate().filter(|(_, s)| s.first > 0).map(|(i, s)| (i * length..i * length + s.first, s.before.clone())).collect();
+        Self { keys, own, rows, earlier }
+    }
+
+    /// The whole sequences' outputs `all` at the call's rows (`rows` of them): each segment's own.
+    pub(crate) fn outputs(&self, d: &Device, all: &Tensor, rows: usize) -> Result<Tensor, GpuError> {
+        let mut out = d.zeros(rows, all.cols())?;
+        d.scatter_ranges(&mut out, &self.rows, &d.gather_ranges(all, &self.own)?)?;
+        Ok(out)
+    }
+
+    /// A cotangent of the call's rows as one of the whole sequences': each segment's own rows'
+    /// where its own rows are there, zero at its earlier positions (their queries are its twin's).
+    pub(crate) fn spread(&self, d: &Device, cot: &Tensor) -> Result<Tensor, GpuError> {
+        let mut all = d.zeros(self.keys.iter().map(ExactSizeIterator::len).sum(), cot.cols())?;
+        d.scatter_ranges(&mut all, &self.own, &d.gather_ranges(cot, &self.rows)?)?;
+        Ok(all)
+    }
+
+    /// The whole sequences' cotangent `all` of their keys' rows at the call's rows (`rows` of them):
+    /// each segment's own rows' as they are, its earlier positions' added into the rows holding
+    /// them (another segment's own rows, segment by segment).
+    pub(crate) fn gather_back(&self, d: &Device, all: &Tensor, rows: usize) -> Result<Tensor, GpuError> {
+        let mut out = d.zeros(rows, all.cols())?;
+        d.scatter_ranges(&mut out, &self.rows, &d.gather_ranges(all, &self.own)?)?;
+        for (at, before) in &self.earlier {
+            add_rows(d, &mut out, before, &d.rows_of(all, at.start, at.len())?)?;
+        }
+        Ok(out)
+    }
+}
+
+/// The attention of `blocks` sequences with every sequence's weights at once (the full-matrix
+/// route), its products in `arithmetic`.
+fn forward_whole(d: &Device, (q, k, v): Values<'_>, blocks: usize, scale: f64, causal: bool, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
+    let length = q.rows() / blocks;
+    let mut alpha = d.empty(q.rows(), length)?;
+    d.gemm_batched(blocks, &mut alpha, scale, q, Op::N, k, Op::T, 0.0, arithmetic)?;
+    d.softmax_rows(&mut alpha, causal)?;
+    let mut out = d.empty(q.rows(), v.cols())?;
+    d.gemm_batched(blocks, &mut out, 1.0, &alpha, Op::N, v, Op::N, 0.0, arithmetic)?;
+    Ok(out)
+}
+
+/// [`forward_whole`]'s cotangents of the queries, keys and values: the weights again in the
+/// forward's arithmetic `forward`, the products in `arithmetic`.
+fn backward_whole(d: &Device, (q, k, v): Values<'_>, cot: &Tensor, blocks: usize, scale: f64, causal: bool, (forward, arithmetic): (Arithmetic, Arithmetic)) -> Result<Triple, GpuError> {
+    let length = q.rows() / blocks;
+    let mut alpha = d.empty(q.rows(), length)?;
+    d.gemm_batched(blocks, &mut alpha, scale, q, Op::N, k, Op::T, 0.0, forward)?;
+    d.softmax_rows(&mut alpha, causal)?;
+    let mut dalpha = d.empty(q.rows(), length)?;
+    d.gemm_batched(blocks, &mut dalpha, 1.0, cot, Op::N, v, Op::T, 0.0, arithmetic)?;
+    let mut gv = d.empty(v.rows(), v.cols())?;
+    d.gemm_batched(blocks, &mut gv, 1.0, &alpha, Op::T, cot, Op::N, 0.0, arithmetic)?;
+    let ds = d.softmax_backward(&alpha, &dalpha)?;
+    drop((alpha, dalpha));
+    let mut gq = d.empty(q.rows(), q.cols())?;
+    d.gemm_batched(blocks, &mut gq, scale, &ds, Op::N, k, Op::N, 0.0, arithmetic)?;
+    let mut gk = d.empty(k.rows(), k.cols())?;
+    d.gemm_batched(blocks, &mut gk, scale, &ds, Op::T, q, Op::N, 0.0, arithmetic)?;
+    Ok((gq, gk, gv))
+}
+
 /// `values` added into `target`'s rows `ranges` (in order; ranges of several segments may share
 /// rows, each segment's addition in turn).
 pub(crate) fn add_rows(d: &Device, target: &mut Tensor, ranges: &[Range<usize>], values: &Tensor) -> Result<(), GpuError> {
@@ -40,6 +133,16 @@ pub(crate) fn add_rows(d: &Device, target: &mut Tensor, ranges: &[Range<usize>],
 /// [`forward`] over `segments`: each segment's queries against its keys and values, the earlier
 /// positions' from its `before` rows.
 pub(crate) fn forward_segments(d: &Device, (q, k, v): Values<'_>, segments: &[Segment], scale: f64, causal: bool, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
+    // Segments of one length run as whole sequences at once where their weights fit (`tiles`): a
+    // few launches for the call instead of several for each segment's every query tile.
+    if let Some(length) = common_length(segments)
+        && !tiles(segments.len() * length, length)
+    {
+        let whole = Whole::of(segments, length);
+        let (qs, ks, vs) = (d.gather_ranges(q, &whole.keys)?, d.gather_ranges(k, &whole.keys)?, d.gather_ranges(v, &whole.keys)?);
+        let all = forward_whole(d, (&qs, &ks, &vs), segments.len(), scale, causal, arithmetic)?;
+        return whole.outputs(d, &all, q.rows());
+    }
     let mut out = d.zeros(q.rows(), v.cols())?;
     for s in segments {
         let keys = s.keys();
@@ -60,6 +163,16 @@ pub(crate) fn forward_segments(d: &Device, (q, k, v): Values<'_>, segments: &[Se
 /// [`backward`] over `segments`: the keys' and values' cotangents of every segment added into
 /// the rows holding them (its own and its `before` rows).
 pub(crate) fn backward_segments(d: &Device, (q, k, v): Values<'_>, cot: &Tensor, segments: &[Segment], scale: f64, causal: bool, (forward, arithmetic): (Arithmetic, Arithmetic)) -> Result<Triple, GpuError> {
+    // As `forward_segments`: whole sequences at once, the cotangent on each segment's own rows; the
+    // queries' cotangent at a segment's earlier positions is zero (no output there is its own).
+    if let Some(length) = common_length(segments)
+        && !tiles(segments.len() * length, length)
+    {
+        let whole = Whole::of(segments, length);
+        let (qs, ks, vs) = (d.gather_ranges(q, &whole.keys)?, d.gather_ranges(k, &whole.keys)?, d.gather_ranges(v, &whole.keys)?);
+        let (gq, gk, gv) = backward_whole(d, (&qs, &ks, &vs), &whole.spread(d, cot)?, segments.len(), scale, causal, (forward, arithmetic))?;
+        return Ok((whole.outputs(d, &gq, q.rows())?, whole.gather_back(d, &gk, k.rows())?, whole.gather_back(d, &gv, v.rows())?));
+    }
     let (mut gq, mut gk, mut gv) = (d.zeros(q.rows(), q.cols())?, d.zeros(k.rows(), k.cols())?, d.zeros(v.rows(), v.cols())?);
     for s in segments {
         let keys = s.keys();

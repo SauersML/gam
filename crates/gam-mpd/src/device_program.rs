@@ -1934,8 +1934,7 @@ impl DeviceProgram {
     /// Whether the attention of `blocks` sequences in `rows` runs in query tiles
     /// ([`super::device_attention`]) rather than with every block's weights at once.
     fn tiled(rows: usize, blocks: usize) -> bool {
-        let length = rows / blocks;
-        length > 1024 || rows.saturating_mul(length) > 8 * 1024 * 1024
+        super::device_attention::tiles(rows, rows / blocks)
     }
 
     fn tile_attention(trace: &DeviceTrace) -> bool {

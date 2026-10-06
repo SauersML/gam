@@ -30,7 +30,7 @@
 
 use super::operator_program::{Node, OperatorBody, OperatorProgram, Rotary};
 use gam_gpu::gpu_error::GpuError;
-use super::device_attention::{Segment, add_rows};
+use super::device_attention::{Segment, Whole, add_rows, common_length};
 use gam_gpu::tensor::{Arithmetic, Device, Op, Storage, Tensor};
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -470,6 +470,15 @@ fn segment_step(heads: &Heads, s: &Segment) -> usize {
 /// [`attend`] over `segments` (`device_attention::Segment`): each segment's queries against its
 /// keys and values, the earlier positions' from its `before` rows; its reads written to its rows.
 pub(crate) fn attend_segments(d: &Device, heads: &Heads, (qk, p): (&Tensor, &Tensor), segments: &[Segment], turn: Turn<'_>, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
+    // Segments of one length run as whole sequences at once ([`attend`], its key heads in steps that
+    // bound the weights): a few launches for the call instead of a pass of them for each segment.
+    if let Some(length) = common_length(segments) {
+        let whole = Whole::of(segments, length);
+        let (qk_all, p_all) = (d.gather_ranges(qk, &whole.keys)?, d.gather_ranges(p, &whole.keys)?);
+        let turned = turn_at(d, turn, &whole.keys)?;
+        let all = attend(d, heads, (&qk_all, &p_all), segments.len(), turned.as_ref().map(|(c, s, h)| (c, s, *h)), arithmetic)?;
+        return whole.outputs(d, &all, p.rows());
+    }
     let (w, g) = (heads.width, heads.group());
     let mut a = d.zeros(p.rows(), heads.heads * w)?;
     for s in segments {
@@ -509,6 +518,16 @@ pub(crate) fn backward_segments(
     (forward, arithmetic): (Arithmetic, Arithmetic),
 ) -> Result<Tensor, GpuError> {
     let rows = p.rows();
+    // As `attend_segments`: whole sequences at once ([`backward`]), the cotangent on each segment's
+    // own rows; `P`'s cotangent of a segment's earlier positions is added into its twin's rows.
+    if let Some(length) = common_length(segments) {
+        let whole = Whole::of(segments, length);
+        let p_all = d.gather_ranges(p, &whole.keys)?;
+        let gained_all = gained.map(|g| d.gather_ranges(g, &whole.keys)).transpose()?;
+        let turned = turn_at(d, turn, &whole.keys)?;
+        let g_all = backward(d, (heads, stacked), (&p_all, gained_all.as_ref()), &whole.spread(d, g_a)?, segments.len(), turned.as_ref().map(|(c, s, h)| (c, s, *h)), (forward, arithmetic))?;
+        return whole.gather_back(d, &g_all, rows);
+    }
     let (w, g) = (heads.width, heads.group());
     let mut g_p = d.zeros(rows, heads.columns())?;
     let mut g_g = match (&heads.norms, gained) {
