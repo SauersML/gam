@@ -88,6 +88,25 @@ impl VpdPart {
             }
         }
     }
+
+    /// The pullback of [`VpdPart::edit`] in the read: `J(x)ᵀ ḡ` for the output's cotangent `ḡ`.
+    /// With `z = W_fc x` and `φ'` the law's derivative: for a slice of `W_down`,
+    /// `(α − 1)(u·ḡ) W_fcᵀ(φ'(z) ⊙ v)`; for a slice of `W_fc`, with `z' = z + (α − 1)(v·x) u` and
+    /// `r = W_downᵀ ḡ`, `W_fcᵀ((φ'(z') − φ'(z)) ⊙ r) + (α − 1)(u·(φ'(z') ⊙ r)) v`.
+    #[must_use]
+    pub fn pullback(&self, mlp: &Mlp, x: ArrayView1<f64>, alpha: f64, cotangent: ArrayView1<f64>) -> Array1<f64> {
+        let pre = mlp.read.dot(&x);
+        let slope = |z: &Array1<f64>| z.mapv(|t| mlp.law.derivative(t));
+        match self.map {
+            Map::Down => mlp.read.t().dot(&(slope(&pre) * &self.v)) * ((alpha - 1.0) * self.u.dot(&cotangent)),
+            Map::Up => {
+                let moved = &pre + &(&self.u * ((alpha - 1.0) * self.v.dot(&x)));
+                let r = mlp.write.t().dot(&cotangent);
+                let (after, before) = (slope(&moved) * &r, slope(&pre) * &r);
+                mlp.read.t().dot(&(&after - &before)) + &self.v * ((alpha - 1.0) * self.u.dot(&after))
+            }
+        }
+    }
 }
 
 /// A part with `M`'s MLP of its layer, what an edit of it reads (`interchange::Patch::Slice`).
@@ -102,6 +121,12 @@ impl Slice {
     #[must_use]
     pub fn edit(&self, x: ArrayView1<f64>, alpha: f64) -> Array1<f64> {
         self.part.edit(&self.mlp, x, alpha)
+    }
+
+    /// [`VpdPart::pullback`] with the part's own layer's MLP.
+    #[must_use]
+    pub fn pullback(&self, x: ArrayView1<f64>, alpha: f64, cotangent: ArrayView1<f64>) -> Array1<f64> {
+        self.part.pullback(&self.mlp, x, alpha, cotangent)
     }
 
     /// The MLP block whose read it reads and whose output it adds to.
@@ -196,7 +221,8 @@ mod tests {
     /// On `M`, a part's edit is the weight edit `W + (α − 1) u_i vᵢᵀ` of its map: for an MLP whose
     /// maps are sums of four slices each, every slice of either map at every factor of
     /// `interchange::FACTORS` moves the output at a random read by exactly the output of the edited
-    /// MLP less the original's (1e-12 of the output's scale), and α = 1 moves nothing.
+    /// MLP less the original's (1e-12 of the output's scale), α = 1 moves nothing, and under the
+    /// smooth laws the pullback matches central differences (1e-6).
     #[test]
     fn a_parts_edit_is_its_slices_weight_edit_on_m() {
         let (d, hidden, slices) = (5, 7, 4);
@@ -224,6 +250,19 @@ mod tests {
                         }
                         if alpha == 1.0 {
                             assert!(got.iter().all(|v| *v == 0.0), "α = 1 moves the output");
+                        }
+                        // The pullback against central differences of `ḡ·edit` (smooth laws).
+                        if law != Law::Relu {
+                            let cotangent = Array1::from_shape_fn(d, |c| 0.3 + 0.1 * c as f64);
+                            let pulled = part.pullback(&mlp, x.view(), alpha, cotangent.view());
+                            for c in 0..d {
+                                let h = 1e-5;
+                                let (mut up, mut down) = (x.clone(), x.clone());
+                                up[c] += h;
+                                down[c] -= h;
+                                let numeric = (part.edit(&mlp, up.view(), alpha) - part.edit(&mlp, down.view(), alpha)).dot(&cotangent) / (2.0 * h);
+                                assert!((pulled[c] - numeric).abs() <= 1e-6 * (1.0 + numeric.abs()), "{law:?} {map:?} slice {i} at α {alpha}, column {c}: {} against {numeric}", pulled[c]);
+                            }
                         }
                     }
                 }
