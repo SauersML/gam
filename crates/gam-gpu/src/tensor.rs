@@ -3854,10 +3854,10 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
     /// The f32 twins of [`KERNELS`] (module note), one name and parameter list per kernel.
     const KERNELS_F32: &str = include_str!("tensor_f32.cu");
 
-    /// The split products' operand terms and the row moves (`decoder.cu`), compiled on first use.
-    const KERNELS_DECODER: &str = include_str!("decoder.cu");
+    /// The split products' operand terms and the row moves (`split_moves.cu`), compiled on first use.
+    const KERNELS_SPLIT_MOVES: &str = include_str!("split_moves.cu");
 
-    /// `decoder.cu`'s `RowRanges`: the moves of one `copy_ranges` launch.
+    /// `split_moves.cu`'s `RowRanges`: the moves of one `copy_ranges` launch.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct RowRanges {
@@ -3880,10 +3880,10 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
         /// The f32 twins, compiled on first use, and the functions loaded from them.
         module32: std::sync::OnceLock<Arc<CudaModule>>,
         functions32: std::sync::Mutex<HashMap<&'static str, CudaFunction>>,
-        /// `decoder.cu`'s kernels (the split products' operand terms, the row moves), compiled on first
+        /// `split_moves.cu`'s kernels (the split products' operand terms, the row moves), compiled on first
         /// use, and the functions loaded from them.
-        module_decoder: std::sync::OnceLock<Arc<CudaModule>>,
-        functions_decoder: std::sync::Mutex<HashMap<&'static str, CudaFunction>>,
+        module_split_moves: std::sync::OnceLock<Arc<CudaModule>>,
+        functions_split_moves: std::sync::Mutex<HashMap<&'static str, CudaFunction>>,
         checked_interval_module: crate::device_cache::PtxModuleCache,
         /// The row flags of a call that scores every row (never read).
         every_row: CudaSlice<u32>,
@@ -3985,7 +3985,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
     }
 
     fn u32_of(n: usize) -> Result<u32, GpuError> {
-        u32::try_from(n).map_err(|_| shape(format!("{n} exceeds a decoder kernel's 32-bit indices")))
+        u32::try_from(n).map_err(|_| shape(format!("{n} exceeds a split or move kernel's 32-bit indices")))
     }
 
     fn i32_of(n: usize) -> Result<i32, GpuError> {
@@ -4091,8 +4091,8 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 module,
                 module32: std::sync::OnceLock::new(),
                 functions32: std::sync::Mutex::new(HashMap::new()),
-                module_decoder: std::sync::OnceLock::new(),
-                functions_decoder: std::sync::Mutex::new(HashMap::new()),
+                module_split_moves: std::sync::OnceLock::new(),
+                functions_split_moves: std::sync::Mutex::new(HashMap::new()),
                 checked_interval_module: crate::device_cache::PtxModuleCache::new(),
                 every_row,
                 gemm_workspace: std::sync::Mutex::new(F32Workspace::default()),
@@ -4564,7 +4564,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             self.gemm32(batch, dims, (alpha, scale), (a1, ta), (b1, tb), c, unit)
         }
 
-        /// An operand's two terms in `unit` (`bf16_split` or `tf32_split`, `decoder.cu`): the first
+        /// An operand's two terms in `unit` (`bf16_split` or `tf32_split`, `split_moves.cu`): the first
         /// (`None` where it is the operand itself) and the remainder (`None` where there is none).
         /// A bfloat16 operand is its own first term in bfloat16, and widened to f32 in TF32.
         fn terms(&self, t: &Tensor, unit: Arithmetic) -> Result<(Option<Tensor>, Option<Tensor>), GpuError> {
@@ -4578,7 +4578,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
             } else {
                 (self.unset32(t.rows, t.cols)?, self.unset32(t.rows, t.cols)?)
             };
-            let f = self.decoder(if half { "bf16_split" } else { "tf32_split" })?;
+            let f = self.split_moves(if half { "bf16_split" } else { "tf32_split" })?;
             let mut builder = self.stream.launch_builder(&f);
             builder.arg(&n).arg(slice32(t)?);
             match (&mut first.data, &mut rest.data) {
@@ -4587,27 +4587,27 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
                 (other, _) => return Err(mismatch(other)),
             };
             // SAFETY: three buffers of `n` values.
-            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("decoder operand terms")?;
+            unsafe { builder.launch(cfg_elements(n)) }.gpu_ctx("split operand terms")?;
             Ok((Some(first), Some(rest)))
         }
 
-        /// Kernel `name` of `decoder.cu`, its module compiled on first use.
-        fn decoder(&self, name: &'static str) -> Result<CudaFunction, GpuError> {
-            let mut loaded = self.functions_decoder.lock().map_err(|_| shape("poisoned decoder kernel table".to_string()))?;
+        /// Kernel `name` of `split_moves.cu`, its module compiled on first use.
+        fn split_moves(&self, name: &'static str) -> Result<CudaFunction, GpuError> {
+            let mut loaded = self.functions_split_moves.lock().map_err(|_| shape("poisoned split and move kernel table".to_string()))?;
             if let Some(f) = loaded.get(name) {
                 return Ok(f.clone());
             }
-            let module = match self.module_decoder.get() {
+            let module = match self.module_split_moves.get() {
                 Some(module) => module,
                 None => {
                     static MODULES: std::sync::OnceLock<crate::device_cache::KeyedPtxModuleCache<usize>> = std::sync::OnceLock::new();
                     let compiled = MODULES
                         .get_or_init(crate::device_cache::KeyedPtxModuleCache::new)
-                        .get_or_compile(&self.ctx, self.ctx.ordinal(), "decoder", |_| KERNELS_DECODER.to_string())?;
-                    self.module_decoder.get_or_init(|| compiled)
+                        .get_or_compile(&self.ctx, self.ctx.ordinal(), "split_moves", |_| KERNELS_SPLIT_MOVES.to_string())?;
+                    self.module_split_moves.get_or_init(|| compiled)
                 }
             };
-            let f = module.load_function(name).gpu_ctx_with(|e| format!("decoder kernel {name}: {e}"))?;
+            let f = module.load_function(name).gpu_ctx_with(|e| format!("split or move kernel {name}: {e}"))?;
             loaded.insert(name, f.clone());
             Ok(f)
         }
@@ -4622,7 +4622,7 @@ extern "C" __global__ void group_divergence(u64 n, double* sums, double* varianc
         /// A bfloat16 tensor's buffer left unset for a kernel that writes every value.
         pub(super) fn copy_ranges(&self, x: &Tensor, y: &mut Tensor, moves: &[(usize, usize, usize)]) -> Result<(), GpuError> {
             let cols = u32_of(x.cols)?;
-            let f = self.decoder("copy_ranges")?;
+            let f = self.split_moves("copy_ranges")?;
             for chunk in moves.chunks(super::ROW_RANGES) {
                 let mut table = RowRanges { count: u32_of(chunk.len())?, from: [0; super::ROW_RANGES], to: [0; super::ROW_RANGES], length: [0; super::ROW_RANGES] };
                 for (i, &(from, to, length)) in chunk.iter().enumerate() {

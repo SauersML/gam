@@ -1,5 +1,5 @@
 // The operand terms of the split products (`Arithmetic::Tf32x3`, `Arithmetic::Bf16x3`) and the row
-// moves of `Device::gather_ranges` and `Device::scatter_ranges` (`tensor::cuda::decoder`'s module).
+// moves of `Device::gather_ranges` and `Device::scatter_ranges` (`tensor::cuda`'s `split_moves` module).
 #define BLOCK 256
 typedef unsigned long long u64;
 
