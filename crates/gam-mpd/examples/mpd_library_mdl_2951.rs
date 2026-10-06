@@ -56,12 +56,14 @@ use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     engine::{log_to_stderr, sha256},
     import::{hugging_face_language_model, hugging_face_language_model_prefix, import_language_model},
+    explanation_battery::{Decomposition, Vpd},
     interchange, library_mdl, library_transcoder,
     operator_program::{OperatorProgram, SlotValues},
+    vpd_parts,
     run_check::{LayerNodes, layer_nodes, split_sites},
 };
 use gam_runtime::warm_start::Fingerprinter;
-use rand::SeedableRng;
+use rand::{RngExt, SeedableRng};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -213,11 +215,65 @@ struct EditSettings {
     /// operators, its transcoder feature through the kept file), in float32.
     #[serde(default)]
     functions: Option<String>,
+    /// VPD's MLP subcomponents as edits (`vpd_parts`), when set.
+    #[serde(default)]
+    vpd: Option<VpdEdits>,
     /// When set, `M` reads each part through its native lift fitted on the first this many
     /// training sequences (`Interchange::fit_lift`): an edit of a part is then the weight edit
     /// `D + (α − 1) u rᵀ` of `M`'s down projection, and each record and family reports the lift's R².
     #[serde(default)]
     lift_sequences: Option<usize>,
+}
+
+/// Edits of VPD's MLP subcomponents (`EditSettings::vpd`): `export` is `M`'s engine export (its
+/// MLPs) and `decomposition` VPD's exported decomposition (its subcomponents and causal-importance
+/// network). Per held-out sequence `per_sequence` edits are drawn: a layer uniform over the
+/// layers, a map uniform over the MLP's two (`W_fc`, `W_down`), a position uniform after the
+/// attention sink, the factor 0 or (with probability ½) uniform over the others, and a
+/// subcomponent uniform over those with causal importance above zero on `M` at that token plus one
+/// drawn uniformly from the map's. Each scales the subcomponent's slice of `M`'s weight
+/// (`interchange::Patch::FixedPart`), a real weight edit of `M` applied as the same function of
+/// each model's own MLP read, so it asks every explanation the same question: its families
+/// (`remove_subcomponent`, `amplify_subcomponent`) are `native`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VpdEdits {
+    export: PathBuf,
+    decomposition: PathBuf,
+    per_sequence: usize,
+}
+
+/// Per held-out sequence of `batch` its edits of VPD's subcomponents ([`VpdEdits`]): `vpd`'s causal
+/// importances on `M`, `slices` the fixed parts' positions by (layer, whether of `W_down`, index
+/// in VPD's site), `blocks` the model's blocks.
+fn vpd_edits(
+    rng: &mut rand::rngs::StdRng,
+    batch: &interchange::Batch,
+    (vpd, slices): (&Vpd, &BTreeMap<(usize, bool, usize), usize>),
+    per_sequence: usize,
+    blocks: usize,
+) -> Result<Vec<interchange::Experiment>, String> {
+    let views: Vec<&[u32]> = batch.base.iter().map(Vec::as_slice).collect();
+    let importances = vpd.importances(&library_mdl::sequence_family(&views)?)?;
+    let length = batch.length();
+    let mut out = Vec::new();
+    for base in 0..batch.base.len() {
+        for _ in 0..per_sequence {
+            let layer = rng.random_range(0..vpd.layers());
+            let down = rng.random_bool(0.5);
+            let position = rng.random_range(1..length);
+            let factor = if rng.random_bool(0.5) { 0 } else { rng.random_range(1..interchange::FACTORS.len()) };
+            // Per layer the sites are the attention's four maps, then `W_fc` and `W_down`.
+            let g = importances.get(6 * layer + if down { 5 } else { 4 }).ok_or("edits: a layer without MLP sites")?;
+            let row = g.row(base * length + position);
+            let mut candidates: Vec<usize> = row.iter().enumerate().filter(|(_, v)| **v > 0.0).map(|(i, _)| i).collect();
+            candidates.push(rng.random_range(0..row.len()));
+            let index = candidates[rng.random_range(0..candidates.len())];
+            let Some(&part) = slices.get(&(layer, down, index)) else { continue };
+            out.push(interchange::Experiment { base, source: base, explained: vec![true; blocks], patch: Some(interchange::Patch::FixedPart { part, factor, block: 2 * layer + 1 }), position });
+        }
+    }
+    Ok(out)
 }
 
 /// The parts in the oracle's names (`EditSettings::functions`), a safetensors file.
@@ -283,6 +339,18 @@ fn edit_faithfulness(
     let mut experiments = interchange::Interchange::new(device, native, layers, &artifact, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     let count = parts.len();
     experiments.set_parts(parts.clone())?;
+    // VPD's subcomponents as fixed parts, and its causal-importance network for drawing them.
+    let (slices, vpd) = match &settings.vpd {
+        Some(v) => {
+            let slices = vpd_parts::slices(&v.export, &v.decomposition)?;
+            let vpd = Vpd::new(device, &v.export, Decomposition::load(&v.decomposition)?, settings.numeric_bytes)?;
+            log::info!("edits: {} VPD MLP subcomponents", slices.len());
+            (slices, Some(vpd))
+        }
+        None => (Vec::new(), None),
+    };
+    let slice_of: BTreeMap<(usize, bool, usize), usize> = slices.iter().enumerate().map(|(i, s)| ((s.part.layer, s.part.map == vpd_parts::Map::Down, s.part.index), i)).collect();
+    experiments.set_fixed_parts(slices.clone())?;
     log::info!("edits: {count} parts, {} held-out sequences, {:.0} s to compile", end - first, started.elapsed().as_secs_f64());
     let lift = match settings.lift_sequences {
         Some(n) => {
@@ -305,6 +373,8 @@ fn edit_faithfulness(
         Some(interchange::Patch::Swap { .. }) => "swap_part",
         Some(interchange::Patch::PartFrom { .. }) => "remove_part_from",
         Some(interchange::Patch::HeadFrom { .. }) => "remove_head_from",
+        Some(interchange::Patch::FixedPart { factor: 0, .. }) => "remove_subcomponent",
+        Some(interchange::Patch::FixedPart { .. }) => "amplify_subcomponent",
         Some(_) => "read",
     };
     // Per family: every scored token's bits, the edited tokens' bits, and the experiments.
@@ -312,7 +382,10 @@ fn edit_faithfulness(
     let mut batches = Vec::new();
     for (b, chunk) in held_out[first..end].chunks(settings.batch_sequences).enumerate() {
         let batch = interchange::Batch::new(chunk.to_vec(), chunk.to_vec())?;
-        let drawn = experiments.sample_edits(&mut rng, &batch, &settings.families, settings.edits_per_sequence, false)?;
+        let mut drawn = experiments.sample_edits(&mut rng, &batch, &settings.families, settings.edits_per_sequence, false)?;
+        if let (Some(vpd), Some(v)) = (&vpd, &settings.vpd) {
+            drawn.extend(vpd_edits(&mut rng, &batch, (vpd, &slice_of), v.per_sequence, 2 * layers.len())?);
+        }
         let scored = experiments.evaluate(&batch, &drawn, false)?;
         for (e, bits) in drawn.iter().zip(&scored.bits) {
             let entry = scores.entry(family(e)).or_default();
@@ -328,6 +401,7 @@ fn edit_faithfulness(
     drop(experiments);
     let mut reference = interchange::Interchange::new(device, native, layers, &gam_mpd::artifact::Artifact::native(native)?, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     reference.set_parts(parts.clone())?;
+    reference.set_fixed_parts(slices.clone())?;
     if let Some(lift) = &lift {
         reference.set_lift(lift)?;
     }
@@ -351,11 +425,17 @@ fn edit_faithfulness(
                 Some(interchange::Patch::Parts { parts: chosen, factor }) => (chosen.clone(), Some(*factor)),
                 Some(interchange::Patch::Swap { part }) => (vec![*part], None),
                 Some(interchange::Patch::Cut { from, to }) => (vec![*from, *to], None),
+                Some(interchange::Patch::FixedPart { factor, .. }) => (Vec::new(), Some(*factor)),
                 _ => (Vec::new(), None),
+            };
+            // A subcomponent as (layer, VPD's site, its index there).
+            let subcomponent = match &e.patch {
+                Some(interchange::Patch::FixedPart { part, .. }) => slices.get(*part).map(|s| json!([s.part.layer, if s.part.map == vpd_parts::Map::Down { "mlp.down_proj" } else { "mlp.c_fc" }, s.part.index])),
+                _ => None,
             };
             records.push_str(&json!({
                 "sequence": first + b * settings.batch_sequences + e.base, "position": e.position, "family": family(e),
-                "parts": chosen.iter().filter_map(part_of).collect::<Vec<_>>(), "factor": factor.and_then(|f| interchange::FACTORS.get(f).copied()),
+                "parts": chosen.iter().filter_map(part_of).collect::<Vec<_>>(), "subcomponent": subcomponent, "factor": factor.and_then(|f| interchange::FACTORS.get(f).copied()),
                 "effect_bits_at_edited_token": bits.first(), "gap_bits_at_edited_token": gap.first(),
                 "lift_r2": lifted(&chosen),
             }).to_string());
@@ -392,7 +472,7 @@ fn edit_faithfulness(
         // weight edits of M through the lift, ask every explanation a question about M; the other
         // edits of parts inject the explanation's own part into M.
         let lifted_family = matches!(family, "remove_part" | "amplify_part" | "remove_parts" | "remove_part_from" | "swap_part");
-        let objects = if matches!(family, "clean" | "remove_head" | "remove_head_from" | "read") {
+        let objects = if matches!(family, "clean" | "remove_head" | "remove_head_from" | "read" | "remove_subcomponent" | "amplify_subcomponent") {
             "native"
         } else if lift.is_some() && lifted_family {
             "native_lifted"
