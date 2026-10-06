@@ -16,11 +16,13 @@
 //! The method, each fit to convergence on the same fixed native experiments:
 //! 1. the library is fitted (OUT/base);
 //! 2. among each MLP's functions in the explanation where it starts (`M`'s, or a checkpoint's
-//!    survivors), the regions are the groups a count of the parameters a rewrite saves at the
-//!    posterior's resolution expects to save (`library_bodies::regions`, which lists every
-//!    candidate; the others are recorded and not proposed), and, of the functions left, those
-//!    reading only one head's writes (`library_crossing::regions_through`: a head and the
-//!    functions it feeds, across the attention/MLP boundary);
+//!    survivors), the regions are those reading only one head's writes
+//!    (`library_crossing::regions_through`: a head and the functions it feeds, across the
+//!    attention/MLP boundary; linear in the MLP's width) and, of the functions left, in the gate
+//!    only, the groups a count of the parameters a rewrite saves at the posterior's resolution
+//!    expects to save (`library_bodies::regions`, which lists every candidate; the others are
+//!    recorded and not proposed). That search evaluates on the order of `n⁴` unions of an MLP's `n`
+//!    functions, so at a model's width only the regions through a head are proposed;
 //! 3. every region is rewritten as a call of its own body from the same start
 //!    (`library_bodies::rewrite`), a region through a head reading through it
 //!    (`library_crossing::read_through`), and fitted (OUT/rewritten);
@@ -173,6 +175,8 @@ fn toy(dir: &Path) -> Result<[Vec<usize>; 2], String> {
 struct Run {
     /// The model's name in the scoreboard, and the scoreboard a fitted stage appends its row to.
     model: String,
+    /// Whether the grown regions are searched (module note: the gate's width only).
+    grown: bool,
     scoreboard: Option<PathBuf>,
     device: Device,
     native: OperatorProgram,
@@ -271,18 +275,20 @@ fn method(run: &Run, base: Explanation, posterior: Option<library_mdl::Posterior
     let (mut regions, mut candidates, mut through) = (Vec::new(), Vec::new(), Vec::new());
     for l in 0..run.layers.len() {
         let pool: Vec<usize> = (0..base.layers[l].functions.len()).filter(|i| base.layers[l].functions[*i].iter().all(|g| posterior.active[*g])).collect();
-        let mut taken = Vec::new();
-        for (region, saving) in library_bodies::regions(&base, &posterior, l, &pool)? {
-            candidates.push(json!({"layer": l, "functions": region, "saving": saving}));
-            if saving > 0.0 {
-                taken.extend(region.iter().copied());
-                regions.push((l, region));
-            }
-        }
-        let rest: Vec<usize> = pool.into_iter().filter(|i| !taken.contains(i)).collect();
         let writers = library_crossing::writers(&run.native, &run.layers, l)?;
-        for (w, region) in library_crossing::regions_through(&base, &posterior, &writers, l, &rest)? {
+        let mut taken = Vec::new();
+        for (w, region) in library_crossing::regions_through(&base, &posterior, &writers, l, &pool)? {
+            taken.extend(region.iter().copied());
             through.push((l, writers[w].clone(), writers.len(), region));
+        }
+        if run.grown {
+            let rest: Vec<usize> = pool.into_iter().filter(|i| !taken.contains(i)).collect();
+            for (region, saving) in library_bodies::regions(&base, &posterior, l, &rest)? {
+                candidates.push(json!({"layer": l, "functions": region, "saving": saving}));
+                if saving > 0.0 {
+                    regions.push((l, region));
+                }
+            }
         }
     }
     summary["candidates"] = json!(candidates);
@@ -411,6 +417,7 @@ fn main() -> Result<(), String> {
             let base = library_mdl::explanation(&native, &layers)?;
             let run = Run {
                 model: "bodies toy".to_string(),
+                grown: true,
                 scoreboard,
                 device: Device::host(),
                 digest: sha256(&out.join("toy").join("export.json"))?,
@@ -468,7 +475,7 @@ fn main() -> Result<(), String> {
             };
             std::fs::create_dir_all(out).map_err(error)?;
             let model = export.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let run = Run { model, scoreboard, device, native, layers, held: sequences[first..end].to_vec(), train, fit: settings.fit, digest: settings.export_sha256, out: out.to_path_buf() };
+            let run = Run { model, grown: false, scoreboard, device, native, layers, held: sequences[first..end].to_vec(), train, fit: settings.fit, digest: settings.export_sha256, out: out.to_path_buf() };
             method(&run, base, posterior, None)
         }
         _ => Err("gate OUT [SCOREBOARD.tsv] | model EXPORT SETTINGS.json FROM OUT host|gpu [SCOREBOARD.tsv]".into()),
