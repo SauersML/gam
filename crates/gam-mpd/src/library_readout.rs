@@ -205,19 +205,47 @@ pub struct Readout {
 }
 
 /// One copy of [`Library::edited`]: a sequence, the functions whose writes it scales with their
-/// factors, and the rows read.
-#[derive(Clone, Debug)]
+/// factors, the MLP functions whose activations it shifts (one value per row of the sequence; at most
+/// one per MLP of a copy), and the rows read.
+#[derive(Clone, Debug, Default)]
 pub struct Edit {
     pub sequence: usize,
     pub scale: Vec<(usize, f64)>,
+    pub add: Vec<(usize, Vec<f64>)>,
     pub rows: Vec<usize>,
 }
 
+/// What [`Library::edited`] reads at each read row besides the final stream.
+#[derive(Clone, Debug)]
+pub enum Activity {
+    None,
+    /// Every function's activity (reads × functions).
+    All,
+    /// One function's activity per copy (reads × 1).
+    Own(Vec<usize>),
+}
+
 /// [`Library::edited`]'s reads: per read row (copies in order, each copy's rows in order) the final
-/// stream before the final norm (reads × width) and every function's activity (reads × functions).
+/// stream before the final norm, on the host and on the device, the activities asked for, and on
+/// request each head's read (per head, reads × head width) and each read site's `1/r` (reads ×
+/// sites).
 pub struct Edited {
     pub last: Array2<f64>,
+    pub last_device: Tensor,
     pub activity: Option<Array2<f64>>,
+    pub heads: Option<Vec<Array2<f64>>>,
+    pub inverses: Option<Array2<f64>>,
+}
+
+/// One edited row's next-token change against its clean row ([`Library::token_effects`]):
+/// `KL(clean ‖ edited)` in nats, the change of log p of a given next token, and the `top` tokens
+/// whose probability rises and falls most, each with its change of probability and of log p.
+#[derive(Clone, Debug)]
+pub struct TokenEffects {
+    pub kl: f64,
+    pub next: f64,
+    pub up: Vec<(usize, f64, f64)>,
+    pub down: Vec<(usize, f64, f64)>,
 }
 
 /// One path patch's per-row results ([`Library::path_patched`]).
@@ -230,6 +258,37 @@ pub struct PathPatch {
     /// The final streams before the final norm, patched and of the run.
     pub last: Array2<f64>,
     pub base: Array2<f64>,
+}
+
+/// A reader's exact couplings to every function writing before it reads ([`Library::couplings`]).
+pub struct Couplings {
+    site: usize,
+    /// Per MLP writer block: its first column and `Σ_route ‖R u_a‖` per function.
+    mlp: Vec<(usize, Array1<f64>)>,
+    /// Per head writer: its column, its index, and per route `R W_O,h`.
+    heads: Vec<(usize, usize, Vec<Array2<f64>>)>,
+    total: usize,
+}
+
+impl Couplings {
+    /// Each function's write's exact contribution to the reader's reads at one row,
+    /// `Σ_route ‖R w_a‖ / r` (−1 for a function that does not write before the reader reads):
+    /// `activity` every function's activity there, `heads` each head's read there, `inverses`
+    /// each read site's `1/r` there.
+    #[must_use]
+    pub fn score(&self, activity: ArrayView1<f64>, heads: &[ArrayView1<f64>], inverses: ArrayView1<f64>) -> Vec<f64> {
+        let inverse = inverses[self.site];
+        let mut out = vec![-1.0; self.total];
+        for (first, c) in &self.mlp {
+            for (i, v) in c.iter().enumerate() {
+                out[first + i] = (activity[first + i] * v).abs() * inverse;
+            }
+        }
+        for (column, h, maps) in &self.heads {
+            out[*column] = maps.iter().map(|m| m.dot(&heads[*h]).mapv(|x| x * x).sum().sqrt()).sum::<f64>() * inverse;
+        }
+        out
+    }
 }
 
 // ------------------------------------------------------------------------------ the explanation
@@ -473,6 +532,8 @@ pub struct Library<'a> {
     unembedding: Array2<f64>,
     unembedding_mean: Array1<f64>,
     unembedding_table: Tensor,
+    /// The same on the model's device (the edited runs' vocabulary-wide products).
+    unembedding_model: Tensor,
     /// The input embedding (vocabulary × width), and the head (the unembedding after the final
     /// norm) on the model's device, which scores the explanation's distributions against `M`'s.
     embedding: Array2<f64>,
@@ -563,6 +624,7 @@ impl<'a> Library<'a> {
         unembedding.axis_iter_mut(Axis(0)).for_each(|mut row| row *= &final_site.gain);
         let unembedding_mean = unembedding.mean_axis(Axis(0)).ok_or("an empty vocabulary")?;
         let unembedding_table = wide.upload(unembedding.view()).map_err(error)?;
+        let unembedding_model = model.upload(unembedding.view()).map_err(error)?;
         let feature = native.nodes.iter().position(|n| matches!(n, Node::Feature { .. })).ok_or("no token feature")?;
         let embedding = native
             .nodes
@@ -608,6 +670,7 @@ impl<'a> Library<'a> {
             unembedding,
             unembedding_mean,
             unembedding_table,
+            unembedding_model,
             embedding,
             resident,
             program: compiled,
@@ -1078,28 +1141,40 @@ impl<'a> Library<'a> {
     /// (all of one length) with each function `f` of `edits[k].scale` ([`Library::functions`]'s
     /// order) writing `α_f` times its own write at every position (an MLP function's `α h_i u_i`
     /// through its activation, a head's `α W_O,h z_h` through its read; `α = 1` is the explanation,
-    /// `α = 0` the function's removal) and every later computation run on the edited values, all
-    /// copies in one forward pass. Per read row of each copy (`edits[k].rows`, in order): the final
-    /// stream before the final norm and, with `activity`, every function's activity there (an MLP
-    /// function's activation `h_i`, a head's output norm `‖W_O,h z_h‖`).
-    pub fn edited(&self, sequences: &[Vec<u32>], edits: &[Edit], activity: bool) -> Result<Edited, String> {
+    /// `α = 0` the function's removal), each MLP function of `edits[k].add` with its activation
+    /// shifted by the given value at each row, and every later computation run on the edited
+    /// values, all copies in one forward pass. Per read row of each copy (`edits[k].rows`, in order):
+    /// the final stream before the final norm and what `activity`, `heads` and `inverses` ask for
+    /// ([`Edited`]; an MLP function's activity is its activation `h_i`, a head's its output norm
+    /// `‖W_O,h z_h‖`). The edits' factors and shifts are formed on the device from one row per
+    /// editing copy.
+    pub fn edited(&self, sequences: &[Vec<u32>], edits: &[Edit], activity: &Activity, heads: bool, inverses: bool) -> Result<Edited, String> {
         let length = sequences.first().map_or(0, Vec::len);
-        if edits.is_empty() || length == 0 || edits.iter().any(|e| e.sequence >= sequences.len() || e.rows.iter().any(|r| *r >= length)) {
+        if edits.is_empty() || length == 0 || edits.iter().any(|e| e.sequence >= sequences.len() || e.rows.iter().any(|r| *r >= length) || e.add.iter().any(|(_, v)| v.len() != length)) {
             return Err("edits of rows inside the sequences required".into());
+        }
+        if let Activity::Own(own) = activity
+            && own.len() != edits.len()
+        {
+            return Err("one function per copy required".into());
         }
         let copies: Vec<&[u32]> = edits.iter().map(|e| sequences[e.sequence].as_slice()).collect();
         let family = sequence_family(&copies)?;
         let rows = family.rows;
-        // Per edited node (an MLP's activations, a head's read): a table of factor rows (row 0 all
-        // ones, then one per copy that edits the node) and each copy's row, gathered on the device
-        // into the factor of every value.
+        let node_of = |f: usize| -> Result<(usize, Option<usize>, usize), String> {
+            Ok(match self.place(f)?.1 {
+                Ok(h) => (self.observed[self.head_paths + 6 * h + 2], None, self.heads[h].output.ncols()),
+                Err((b, i)) => (self.observed[self.mlp_paths[b]], Some(i), self.mlps[b].gate.nrows()),
+            })
+        };
+        // Per edited node: a table of factor rows (row 0 all ones, then one per copy that scales
+        // the node) and each copy's row; a table of one-hot rows (row 0 zero, then one per copy
+        // that shifts the node) with the shifts per row.
         let mut tables: BTreeMap<usize, (Vec<Array1<f64>>, Vec<u32>)> = BTreeMap::new();
+        let mut shifts: BTreeMap<usize, (Vec<Array1<f64>>, Vec<u32>, Array2<f64>)> = BTreeMap::new();
         for (k, edit) in edits.iter().enumerate() {
             for &(f, alpha) in &edit.scale {
-                let (node, column, width) = match self.place(f)?.1 {
-                    Ok(h) => (self.observed[self.head_paths + 6 * h + 2], None, self.heads[h].output.ncols()),
-                    Err((b, i)) => (self.observed[self.mlp_paths[b]], Some(i), self.mlps[b].gate.nrows()),
-                };
+                let (node, column, width) = node_of(f)?;
                 let (table, row_of) = tables.entry(node).or_insert_with(|| (vec![Array1::ones(width)], vec![0; edits.len()]));
                 if row_of[k] == 0 {
                     table.push(Array1::ones(width));
@@ -1111,45 +1186,316 @@ impl<'a> Library<'a> {
                     None => row.mapv_inplace(|v| v * alpha),
                 }
             }
+            for (f, values) in &edit.add {
+                let (node, Some(i), width) = node_of(*f)? else { return Err("only an MLP function's activation is shifted".into()) };
+                let (table, row_of, by_row) = shifts.entry(node).or_insert_with(|| (vec![Array1::zeros(width)], vec![0; edits.len()], Array2::zeros((rows, 1))));
+                if row_of[k] != 0 {
+                    return Err("one shifted function per MLP of a copy".into());
+                }
+                let mut one = Array1::zeros(width);
+                one[i] = 1.0;
+                table.push(one);
+                row_of[k] = (table.len() - 1) as u32;
+                by_row.slice_mut(s![k * length..(k + 1) * length, 0]).assign(&ArrayView1::from(values.as_slice()));
+            }
         }
-        let masks: BTreeMap<usize, Tensor> = tables
-            .into_iter()
-            .map(|(node, (table, row_of))| {
-                let table = ndarray::stack(Axis(0), &table.iter().map(|r| r.view()).collect::<Vec<_>>()).map_err(error)?;
-                let index: Vec<u32> = (0..rows).map(|r| row_of[r / length]).collect();
-                let table = self.model.upload(table.view()).map_err(error)?;
-                Ok((node, self.model.gather_rows(&table, &self.model.upload_indices(&index).map_err(error)?).map_err(error)?))
+        let gathered = |table: &[Array1<f64>], row_of: &[u32]| -> Result<Tensor, String> {
+            let table = ndarray::stack(Axis(0), &table.iter().map(|r| r.view()).collect::<Vec<_>>()).map_err(error)?;
+            let index: Vec<u32> = (0..rows).map(|r| row_of[r / length]).collect();
+            let table = self.model.upload(table.view()).map_err(error)?;
+            self.model.gather_rows(&table, &self.model.upload_indices(&index).map_err(error)?).map_err(error)
+        };
+        let masks: BTreeMap<usize, Tensor> = tables.iter().map(|(node, (table, row_of))| Ok((*node, gathered(table, row_of)?))).collect::<Result<_, String>>()?;
+        let addends: BTreeMap<usize, Tensor> = shifts
+            .iter()
+            .map(|(node, (table, row_of, by_row))| {
+                let hot = gathered(table, row_of)?;
+                let width = table[0].len();
+                let mut spread = self.model.zeros(rows, width).map_err(error)?;
+                let ones = self.model.upload(Array2::<f64>::ones((1, width)).view()).map_err(error)?;
+                self.model.gemm(&mut spread, 1.0, &self.model.upload(by_row.view()).map_err(error)?, Op::N, &ones, Op::N, 0.0, arithmetic(self.model)).map_err(error)?;
+                let mut out = self.model.zeros(rows, width).map_err(error)?;
+                self.model.hadamard(&mut out, &spread, &hot, false).map_err(error)?;
+                Ok((*node, out))
             })
             .collect::<Result<_, String>>()?;
         let edit = |node: usize, trace: &DeviceTrace| -> Result<Option<Tensor>, String> {
-            let Some(mask) = masks.get(&node) else { return Ok(None) };
+            let (mask, addend) = (masks.get(&node), addends.get(&node));
+            if mask.is_none() && addend.is_none() {
+                return Ok(None);
+            }
             let value = trace.value(node)?;
-            let mut out = self.model.zeros(value.rows(), value.cols()).map_err(error)?;
-            self.model.hadamard(&mut out, value, mask, false).map_err(error)?;
+            let mut out = match mask {
+                Some(mask) => {
+                    let mut out = self.model.zeros(value.rows(), value.cols()).map_err(error)?;
+                    self.model.hadamard(&mut out, value, mask, false).map_err(error)?;
+                    out
+                }
+                None => self.model.copy(value).map_err(error)?,
+            };
+            if let Some(addend) = addend {
+                self.model.axpy(&mut out, 1.0, addend).map_err(error)?;
+            }
             Ok(Some(out))
         };
         let trace = self.program.forward_edited(&family, BTreeMap::new(), &BTreeSet::new(), |_, _| Ok(()), edit)?;
         let read: Vec<u32> = edits.iter().enumerate().flat_map(|(k, e)| e.rows.iter().map(move |r| (k * length + r) as u32)).collect();
         let indices = self.model.upload_indices(&read).map_err(error)?;
-        let gather = |node: usize| -> Result<Array2<f64>, String> { self.model.download(&self.model.gather_rows(trace.value(node)?, &indices).map_err(error)?).map_err(error) };
-        let last = gather(self.observed[self.sites.len()])?;
-        let activity = if activity {
-            let (head_columns, mlp_columns) = self.columns();
-            let mut out = Array2::<f64>::zeros((read.len(), self.functions().len()));
-            for (l, members) in self.layer_heads.iter().enumerate() {
-                for (c, &h) in members.iter().enumerate() {
-                    let written = self.write(h, &gather(self.observed[self.head_paths + 6 * h + 2])?);
-                    out.column_mut(head_columns[l] + c).assign(&written.map_axis(Axis(1), |row| row.dot(&row).sqrt()));
+        let gather_device = |node: usize| -> Result<Tensor, String> { self.model.gather_rows(trace.value(node)?, &indices).map_err(error) };
+        let gather = |node: usize| -> Result<Array2<f64>, String> { self.model.download(&gather_device(node)?).map_err(error) };
+        let last_device = gather_device(self.observed[self.sites.len()])?;
+        let last = self.model.download(&last_device).map_err(error)?;
+        let head_reads: Option<Vec<Array2<f64>>> = if heads || matches!(activity, Activity::All) {
+            Some((0..self.heads.len()).map(|h| gather(self.observed[self.head_paths + 6 * h + 2])).collect::<Result<_, String>>()?)
+        } else {
+            None
+        };
+        let (head_columns, mlp_columns) = self.columns();
+        let activity = match activity {
+            Activity::None => None,
+            Activity::All => {
+                let mut out = Array2::<f64>::zeros((read.len(), self.functions().len()));
+                let reads = head_reads.as_ref().ok_or("head reads")?;
+                for (l, members) in self.layer_heads.iter().enumerate() {
+                    for (c, &h) in members.iter().enumerate() {
+                        let written = self.write(h, &reads[h]);
+                        out.column_mut(head_columns[l] + c).assign(&written.map_axis(Axis(1), |row| row.dot(&row).sqrt()));
+                    }
                 }
+                for (b, block) in self.mlps.iter().enumerate() {
+                    out.slice_mut(s![.., mlp_columns[b]..mlp_columns[b] + block.gate.nrows()]).assign(&gather(self.observed[self.mlp_paths[b]])?);
+                }
+                Some(out)
             }
-            for (b, block) in self.mlps.iter().enumerate() {
-                out.slice_mut(s![.., mlp_columns[b]..mlp_columns[b] + block.gate.nrows()]).assign(&gather(self.observed[self.mlp_paths[b]])?);
+            Activity::Own(own) => {
+                // Per copy one function: the reads of each node at the copies that ask it.
+                let mut out = Array2::<f64>::zeros((read.len(), 1));
+                let starts: Vec<usize> = edits.iter().scan(0, |at, e| {
+                    let start = *at;
+                    *at += e.rows.len();
+                    Some(start)
+                }).collect();
+                let mut by_node: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+                for (k, f) in own.iter().enumerate() {
+                    by_node.entry(node_of(*f)?.0).or_default().push(k);
+                }
+                for (node, ks) in by_node {
+                    let picked: Vec<u32> = ks.iter().flat_map(|k| (0..edits[*k].rows.len()).map(move |j| (k, j))).map(|(k, j)| read[starts[*k] + j]).collect();
+                    let values = self.model.download(&self.model.gather_rows(trace.value(node)?, &self.model.upload_indices(&picked).map_err(error)?).map_err(error)?).map_err(error)?;
+                    let mut at = 0;
+                    for k in ks {
+                        let f = own[k];
+                        for j in 0..edits[k].rows.len() {
+                            let row = values.row(at);
+                            out[[starts[k] + j, 0]] = match self.place(f)?.1 {
+                                Ok(h) => {
+                                    let w = self.heads[h].output.dot(&row);
+                                    w.dot(&w).sqrt()
+                                }
+                                Err((_, i)) => row[i],
+                            };
+                            at += 1;
+                        }
+                    }
+                }
+                Some(out)
+            }
+        };
+        let inverses = if inverses {
+            let mut out = Array2::<f64>::zeros((read.len(), self.sites.len()));
+            for (i, site) in self.sites.iter().enumerate() {
+                let x = gather(self.observed[i])?;
+                out.column_mut(i).assign(&x.map_axis(Axis(1), |row| rms_scale(row, site.epsilon)));
             }
             Some(out)
         } else {
             None
         };
-        Ok(Edited { last, activity })
+        Ok(Edited { last, last_device, activity, heads: if heads { head_reads } else { None }, inverses })
+    }
+
+    /// Per row of `edited` (rows × width, final streams before the final norm on the model's
+    /// device) against the same row of `clean`: `KL(clean ‖ edited)` of the next-token
+    /// distributions, the change of log p of `next[r]` (NaN where none), and the `top` tokens whose
+    /// probability rises most and falls most. The vocabulary-wide work runs on the model's device;
+    /// the selected tokens' values are recomputed in float64 on the host from the downloaded rows.
+    pub fn token_effects(&self, edited: &Tensor, clean: &Tensor, next: &[Option<usize>], top: usize) -> Result<Vec<TokenEffects>, String> {
+        let device = self.model;
+        let n = edited.rows();
+        if clean.rows() != n || next.len() != n {
+            return Err("one clean row and one next token per edited row required".into());
+        }
+        let vocabulary = self.unembedding.nrows();
+        let logits = |x: &Tensor| -> Result<Tensor, String> {
+            let normed = device.rms_norm(x, self.final_site.epsilon).map_err(error)?;
+            let mut out = device.zeros(n, vocabulary).map_err(error)?;
+            device.gemm(&mut out, 1.0, &normed, Op::N, &self.unembedding_model, Op::T, 0.0, arithmetic(device)).map_err(error)?;
+            Ok(out)
+        };
+        let (le, lc) = (logits(edited)?, logits(clean)?);
+        let mut change = device.copy(&le).map_err(error)?;
+        let kl = device.kl_rows(&lc, &mut change, None).map_err(error)?;
+        // `change` now holds p_edited − p_clean.
+        let pick = |t: &mut Tensor| -> Result<Vec<Vec<usize>>, String> {
+            let mut chosen = vec![Vec::with_capacity(top); n];
+            for _ in 0..top.min(vocabulary) {
+                let best = device.argmax_rows(t).map_err(error)?;
+                let positions: Vec<u32> = best.iter().enumerate().map(|(r, c)| u32::try_from(r * vocabulary + c).map_err(error)).collect::<Result<_, _>>()?;
+                device.fill_entries(t, &device.upload_indices(&positions).map_err(error)?, f64::NEG_INFINITY).map_err(error)?;
+                for (r, c) in best.into_iter().enumerate() {
+                    chosen[r].push(c);
+                }
+            }
+            Ok(chosen)
+        };
+        let mut falling = device.zeros(n, vocabulary).map_err(error)?;
+        device.axpy(&mut falling, -1.0, &change).map_err(error)?;
+        let up = pick(&mut change)?;
+        let down = pick(&mut falling)?;
+        // Host float64: each row's log partition from the device logits' stable statistics, then the
+        // selected tokens' log-probabilities from the rows themselves.
+        let partition = |mut l: Tensor| -> Result<Vec<f64>, String> { Ok(device.softmax_stats_rows(&mut l, None).map_err(error)?.into_iter().map(|[z, _]| z).collect()) };
+        let (ze, zc) = (partition(le)?, partition(lc)?);
+        let (xe, xc) = (device.download(edited).map_err(error)?, device.download(clean).map_err(error)?);
+        let mut out = Vec::with_capacity(n);
+        for r in 0..n {
+            let (ie, ic) = (rms_scale(xe.row(r), self.final_site.epsilon), rms_scale(xc.row(r), self.final_site.epsilon));
+            let log_p = |t: usize| -> (f64, f64) { (self.unembedding.row(t).dot(&xe.row(r)) * ie - ze[r], self.unembedding.row(t).dot(&xc.row(r)) * ic - zc[r]) };
+            let entry = |t: usize| {
+                let (e, c) = log_p(t);
+                (t, e.exp() - c.exp(), e - c)
+            };
+            out.push(TokenEffects {
+                kl: kl[r],
+                next: next[r].map_or(f64::NAN, |t| {
+                    let (e, c) = log_p(t);
+                    e - c
+                }),
+                up: up[r].iter().map(|t| entry(*t)).collect(),
+                down: down[r].iter().map(|t| entry(*t)).collect(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Each function's direct effect on token `token`'s logit at one row through the final norm at
+    /// the row's actual RMS, `w_a · (γ_f ⊙ e_token) / r_f`: `activity` every function's activity
+    /// there, `heads` each head's read there, `last` the final stream there (a direct path only,
+    /// used to choose what to measure).
+    #[must_use]
+    pub fn direct_effects(&self, activity: ArrayView1<f64>, heads: &[ArrayView1<f64>], token: usize, last: ArrayView1<f64>) -> Vec<f64> {
+        let inverse = rms_scale(last, self.final_site.epsilon);
+        let direction = self.unembedding.row(token);
+        let (head_columns, mlp_columns) = self.columns();
+        let mut out = vec![0.0; self.functions().len()];
+        for (l, members) in self.layer_heads.iter().enumerate() {
+            for (c, &h) in members.iter().enumerate() {
+                out[head_columns[l] + c] = self.heads[h].output.dot(&heads[h]).dot(&direction) * inverse;
+            }
+        }
+        for (b, block) in self.mlps.iter().enumerate() {
+            let coupling = block.out.t().dot(&direction);
+            for (i, c) in coupling.iter().enumerate() {
+                out[mlp_columns[b] + i] = activity[mlp_columns[b] + i] * c * inverse;
+            }
+        }
+        out
+    }
+
+    /// The most probable next token of each row of `last` (final streams before the final norm, on
+    /// the model's device).
+    pub fn argmax_tokens(&self, last: &Tensor) -> Result<Vec<usize>, String> {
+        let device = self.model;
+        let normed = device.rms_norm(last, self.final_site.epsilon).map_err(error)?;
+        let mut logits = device.zeros(last.rows(), self.unembedding.nrows()).map_err(error)?;
+        device.gemm(&mut logits, 1.0, &normed, Op::N, &self.unembedding_model, Op::T, 0.0, arithmetic(device)).map_err(error)?;
+        device.argmax_rows(&logits).map_err(error)
+    }
+
+    /// Reader `reader`'s exact couplings to every function writing before it reads: per MLP writer
+    /// `Σ_route ‖R u_a‖`, per head writer `R W_O,h` for each read map `R` (the reader's maps with
+    /// its norm's gain, [`Library::read_maps`]); [`Couplings::score`] turns them into each
+    /// writer's contribution at a row.
+    pub fn couplings(&self, reader: usize) -> Result<Couplings, String> {
+        let (site, maps) = self.read_maps(reader)?;
+        let (head_columns, mlp_columns) = self.columns();
+        let enters = |layer: usize, head: bool| 2 * layer + if head { 1 } else { 2 };
+        let mut mlp = Vec::new();
+        for (b, block) in self.mlps.iter().enumerate() {
+            if enters(block.layer, false) > site {
+                continue;
+            }
+            let mut c = Array1::<f64>::zeros(block.out.ncols());
+            for map in &maps {
+                let read = map.dot(&block.out);
+                c += &read.map_axis(Axis(0), |col| col.dot(&col).sqrt());
+            }
+            mlp.push((mlp_columns[b], c));
+        }
+        let mut heads = Vec::new();
+        for (l, members) in self.layer_heads.iter().enumerate() {
+            for (c, &h) in members.iter().enumerate() {
+                if enters(l, true) > site || head_columns[l] + c == reader {
+                    continue;
+                }
+                heads.push((head_columns[l] + c, h, maps.iter().map(|m| m.dot(&self.heads[h].output)).collect()));
+            }
+        }
+        let total = self.functions().len();
+        let mut out = Couplings { site, mlp, heads, total };
+        // The reader itself is not its own writer.
+        for (first, c) in &mut out.mlp {
+            if (*first..*first + c.len()).contains(&reader) {
+                c[reader - *first] = f64::NAN;
+            }
+        }
+        Ok(out)
+    }
+
+    /// For each (writer, MLP reader) pair, the change of the reader's activation at every row of
+    /// `sequence` when the writer's write is taken out of the reader's reads alone (the path patch
+    /// of [`Library::path_patched`] before anything after the reader runs).
+    pub fn path_shifts(&self, sequence: &[u32], pairs: &[(usize, usize)]) -> Result<Vec<Vec<f64>>, String> {
+        let pass = self.pass(&[sequence])?;
+        pairs
+            .iter()
+            .map(|&(writer, reader)| {
+                let (written, write) = self.place(writer)?;
+                let (layer, read) = self.place(reader)?;
+                let Err((b, i)) = read else { return Err("an MLP reader required".into()) };
+                let site = 2 * layer + 1;
+                let before = match write {
+                    Ok(_) => 2 * written + 1 <= site,
+                    Err(_) => 2 * written + 2 <= site,
+                };
+                if !before {
+                    return Err("the writer does not write before the reader reads".into());
+                }
+                let w = match write {
+                    Ok(h) => self.write(h, &pass.head[h][2].to_owned()),
+                    Err((wb, wi)) => {
+                        let (h, u) = (pass.mlp[wb].0.column(wi), self.mlps[wb].out.column(wi));
+                        Array2::from_shape_fn((pass.rows, u.len()), |(r, c)| h[r] * u[c])
+                    }
+                };
+                let patched = &pass.streams[site].to_owned() - &w;
+                let block = &self.mlps[b];
+                let place = &self.sites[site];
+                let read_of = |row: ArrayView1<f64>, bias: f64| -> Array1<f64> {
+                    let direction = &row * &place.gain;
+                    patched.outer_iter().map(|x| direction.dot(&x) * rms_scale(x, place.epsilon) + bias).collect()
+                };
+                let gate = read_of(block.gate.row(i), block.bias[i]);
+                let h = match (&block.up, &pass.mlp[b].2) {
+                    (Some((_, up)), Some(_)) => {
+                        let up = read_of(up.row(i), block.up_bias[i]);
+                        Array1::from_shape_fn(gate.len(), |r| block.law.apply(gate[r]) * up[r])
+                    }
+                    _ => gate.mapv(|g| block.law.apply(g)),
+                };
+                Ok((&h - &pass.mlp[b].0.column(i)).to_vec())
+            })
+            .collect()
     }
 
     /// Each function's write at one row of a run of `sequence`: functions × width
@@ -1852,13 +2198,13 @@ mod tests {
             let all: Vec<usize> = (0..12).collect();
             let largest = |a: &ndarray::Array2<f64>, b: &ndarray::Array2<f64>| (a - b).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
             let none = std::collections::BTreeMap::new();
-            let clean = library.edited(&sequences[..1], &[Edit { sequence: 0, scale: vec![], rows: all.clone() }], true).expect("clean");
+            let clean = library.edited(&sequences[..1], &[Edit { sequence: 0, add: vec![], scale: vec![], rows: all.clone() }], &super::Activity::All, false, false).expect("clean");
             let base = library.run(&sequences[..1], &none).expect("run");
             assert!(largest(&clean.last, &base.last) < 1e-12, "an unedited copy is not the run");
             let alpha = 0.37;
             for (h, (layer, head)) in library.heads().into_iter().enumerate() {
                 let f = functions.iter().position(|g| g.name == format!("L{layer}.H{head}")).expect("a head's column");
-                let scaled = library.edited(&sequences[..1], &[Edit { sequence: 0, scale: vec![(f, alpha)], rows: all.clone() }], false).expect("edited");
+                let scaled = library.edited(&sequences[..1], &[Edit { sequence: 0, add: vec![], scale: vec![(f, alpha)], rows: all.clone() }], &super::Activity::None, false, false).expect("edited");
                 let direct = library.run(&sequences[..1], &[(h, &base.reads[h] * alpha)].into()).expect("run");
                 assert!(largest(&scaled.last, &direct.last) < 1e-10, "head {h}: {}", largest(&scaled.last, &direct.last));
                 assert!(largest(&scaled.last, &base.last) > 1e-8, "head {h}: the edit changed nothing");
@@ -1870,14 +2216,37 @@ mod tests {
                 let mut values = activity.slice(ndarray::s![.., first..first + count]).to_owned();
                 values.column_mut(f).mapv_inplace(|v| v * alpha);
                 let direct = library.run_with(&sequences[..1], &none, &[(b, values)].into()).expect("run");
-                let scaled = library.edited(&sequences[..1], &[Edit { sequence: 0, scale: vec![(first + f, alpha)], rows: all.clone() }], false).expect("edited");
+                let scaled = library.edited(&sequences[..1], &[Edit { sequence: 0, add: vec![], scale: vec![(first + f, alpha)], rows: all.clone() }], &super::Activity::None, false, false).expect("edited");
                 assert!(largest(&scaled.last, &direct.last) < 1e-10, "MLP {b} function {f}: {}", largest(&scaled.last, &direct.last));
             }
+            // A shifted activation equals the path patch it realizes, the token effects match the
+            // host's log-probabilities, and the own activity is the function's column.
+            let mlp_reader = functions.iter().position(|g| g.layer == 1 && matches!(g.kind, super::Kind::Mlp)).expect("a layer-1 MLP function") + 2;
+            for writer in [0, functions.iter().position(|g| g.layer == 0 && matches!(g.kind, super::Kind::Mlp)).expect("a layer-0 MLP function") + 4] {
+                let shift = library.path_shifts(&sequences[0], &[(writer, mlp_reader)]).expect("shift").remove(0);
+                let shifted = library.edited(&sequences[..1], &[Edit { sequence: 0, scale: vec![], add: vec![(mlp_reader, shift)], rows: all.clone() }], &super::Activity::Own(vec![mlp_reader]), false, false).expect("edited");
+                let patched = library.path_patched(&sequences[..1], writer, mlp_reader, None).expect("path patch");
+                assert!(largest(&shifted.last, &patched.last) < 1e-10, "writer {writer}: {}", largest(&shifted.last, &patched.last));
+                let own = shifted.activity.expect("own");
+                assert!(own.column(0).iter().zip(patched.after.iter()).all(|(a, b)| (a - b).abs() < 1e-10), "own activity");
+            }
+            let removed = library.edited(&sequences[..1], &[Edit { sequence: 0, add: vec![], scale: vec![(0, 0.0)], rows: all.clone() }], &super::Activity::None, false, false).expect("edited");
+            let effects = library.token_effects(&removed.last_device, &clean.last_device, &vec![Some(3); 12], 4).expect("effects");
+            let (lp_e, lp_c) = (library.log_probabilities(&removed.last).expect("lp"), library.log_probabilities(&clean.last).expect("lp"));
+            for (r, e) in effects.iter().enumerate() {
+                let kl: f64 = lp_c.row(r).iter().zip(lp_e.row(r).iter()).map(|(c, e)| c.exp() * (c - e)).sum();
+                assert!((e.kl - kl).abs() < 1e-9 * (1.0 + kl), "row {r}: kl {} against {kl}", e.kl);
+                assert!((e.next - (lp_e[[r, 3]] - lp_c[[r, 3]])).abs() < 1e-9);
+                let dp: Vec<f64> = lp_e.row(r).iter().zip(lp_c.row(r).iter()).map(|(e, c)| e.exp() - c.exp()).collect();
+                let best = dp.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).expect("a token").0;
+                assert!(e.up[0].0 == best || (dp[e.up[0].0] - dp[best]).abs() < 1e-12, "row {r}: top token");
+                assert!((e.up[0].1 - dp[e.up[0].0]).abs() < 1e-9);
+            }
             // Two copies with different edits in one call equal their separate calls.
-            let edits = [Edit { sequence: 1, scale: vec![(0, 0.0)], rows: vec![3, 11] }, Edit { sequence: 0, scale: vec![(functions.len() - 1, 2.0)], rows: vec![7] }];
-            let joint = library.edited(&sequences, &edits, true).expect("joint");
-            let one = library.edited(&sequences, &edits[..1], true).expect("first");
-            let two = library.edited(&sequences, &edits[1..], true).expect("second");
+            let edits = [Edit { sequence: 1, add: vec![], scale: vec![(0, 0.0)], rows: vec![3, 11] }, Edit { sequence: 0, add: vec![], scale: vec![(functions.len() - 1, 2.0)], rows: vec![7] }];
+            let joint = library.edited(&sequences, &edits, &super::Activity::All, false, false).expect("joint");
+            let one = library.edited(&sequences, &edits[..1], &super::Activity::All, false, false).expect("first");
+            let two = library.edited(&sequences, &edits[1..], &super::Activity::All, false, false).expect("second");
             let stacked = ndarray::concatenate(ndarray::Axis(0), &[one.last.view(), two.last.view()]).expect("stack");
             assert!(largest(&joint.last, &stacked) < 1e-12);
             let stacked = ndarray::concatenate(ndarray::Axis(0), &[one.activity.as_ref().expect("a").view(), two.activity.as_ref().expect("a").view()]).expect("stack");

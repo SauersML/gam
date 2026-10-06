@@ -50,7 +50,7 @@ use gam_mpd::{
     engine::log_to_stderr,
     import::import_language_model,
     library_mdl,
-    library_readout::{Edit, Kind, Library},
+    library_readout::{Activity, Edit, Kind, Library},
     operator_program::{OperatorProgram, SlotValues},
     run_check::{LayerNodes, layer_nodes, split_sites},
 };
@@ -214,11 +214,6 @@ fn save(path: &Path, arrays: BTreeMap<String, Array>) -> Result<(), String> {
 
 // ------------------------------------------------------------------------------------- helpers
 
-/// Per row of `last` the next-token log-probabilities.
-fn log_p(library: &Library, last: &Array2<f64>) -> Result<Array2<f64>, String> {
-    library.log_probabilities_wide(last)
-}
-
 /// The indices of the `k` largest values of `score`, descending.
 fn top_k(score: impl Iterator<Item = f64>, k: usize) -> Vec<usize> {
     let values: Vec<f64> = score.collect();
@@ -233,20 +228,23 @@ fn top_k(score: impl Iterator<Item = f64>, k: usize) -> Vec<usize> {
     order
 }
 
-/// A run of edited copies in batches of `batch`: per edit, its read rows' final streams.
-fn run_edits(library: &Library, sequences: &[Vec<u32>], edits: &[Edit], batch: usize, activity: bool) -> Result<(Array2<f64>, Option<Array2<f64>>), String> {
-    let mut lasts = Vec::new();
-    let mut acts = Vec::new();
-    for chunk in edits.chunks(batch.max(1)) {
-        let e = library.edited(sequences, chunk, activity)?;
-        lasts.push(e.last);
-        if let Some(a) = e.activity {
-            acts.push(a);
-        }
+/// The clean final streams of the pool's rows `at` ((sequence, position) pairs) on the model's device.
+fn clean_rows(model: &Device, clean: &Array2<f32>, t: usize, at: &[(usize, usize)]) -> Result<gam_gpu::tensor::Tensor, String> {
+    let rows = Array2::from_shape_fn((at.len(), clean.ncols()), |(r, c)| f64::from(clean[[at[r].0 * t + at[r].1, c]]));
+    model.upload(rows.view()).map_err(error)
+}
+
+/// Per edit (each reading one row), its next-token change against the clean row: the edits run
+/// in batches of `batch`, `next` the token whose log p change is read (none: NaN).
+fn effects(library: &Library, model: &Device, pool: &[Vec<u32>], clean: &Array2<f32>, edits: &[Edit], next: &[Option<usize>], top: usize, batch: usize) -> Result<Vec<gam_mpd::library_readout::TokenEffects>, String> {
+    let t = pool[0].len();
+    let mut out = Vec::with_capacity(edits.len());
+    for (chunk, next) in edits.chunks(batch.max(1)).zip(next.chunks(batch.max(1))) {
+        let e = library.edited(pool, chunk, &Activity::None, false, false)?;
+        let at: Vec<(usize, usize)> = chunk.iter().map(|e| (e.sequence, e.rows[0])).collect();
+        out.extend(library.token_effects(&e.last_device, &clean_rows(model, clean, t, &at)?, next, top)?);
     }
-    let last = ndarray::concatenate(Axis(0), &lasts.iter().map(|a| a.view()).collect::<Vec<_>>()).map_err(error)?;
-    let activity = if activity { Some(ndarray::concatenate(Axis(0), &acts.iter().map(|a| a.view()).collect::<Vec<_>>()).map_err(error)?) } else { None };
-    Ok((last, activity))
+    Ok(out)
 }
 
 /// Greedy continuations of `steps` tokens: per job (function or none, α, sequence, last prefix
@@ -267,14 +265,12 @@ fn greedy(library: &Library, pool: &[Vec<u32>], jobs: &[(Option<usize>, f64, usi
             let edits: Vec<Edit> = chunk
                 .iter()
                 .enumerate()
-                .map(|(k, (f, alpha, _, p))| Edit { sequence: k, scale: f.map(|f| vec![(f, *alpha)]).unwrap_or_default(), rows: vec![p + step] })
+                .map(|(k, (f, alpha, _, p))| Edit { sequence: k, scale: f.map(|f| vec![(f, *alpha)]).unwrap_or_default(), add: vec![], rows: vec![p + step] })
                 .collect();
-            let last = library.edited(&buffers, &edits, false)?.last;
-            let lp = log_p(library, &last)?;
-            for (k, (_, _, _, p)) in chunk.iter().enumerate() {
-                let next = top_k(lp.row(k).iter().copied(), 1)[0] as u32;
-                buffers[k][p + step + 1] = next;
-                out[c * batch.max(1) + k].push(next);
+            let last = library.edited(&buffers, &edits, &Activity::None, false, false)?.last_device;
+            for (k, ((_, _, _, p), next)) in chunk.iter().zip(library.argmax_tokens(&last)?).enumerate() {
+                buffers[k][p + step + 1] = next as u32;
+                out[c * batch.max(1) + k].push(next as u32);
             }
         }
     }
@@ -351,8 +347,8 @@ fn main() -> Result<(), String> {
     let mut clean_last = Array2::<f32>::zeros((pool.len() * t, 0));
     let mut lasts = Vec::new();
     for start in (0..pool.len()).step_by(scan_batch) {
-        let edits: Vec<Edit> = (start..(start + scan_batch).min(pool.len())).map(|s| Edit { sequence: s, scale: vec![], rows: all_rows.clone() }).collect();
-        let e = library.edited(&pool, &edits, true)?;
+        let edits: Vec<Edit> = (start..(start + scan_batch).min(pool.len())).map(|s| Edit { sequence: s, rows: all_rows.clone(), ..Edit::default() }).collect();
+        let e = library.edited(&pool, &edits, &Activity::All, false, false)?;
         let a = e.activity.ok_or("activity")?;
         for (k, edit) in edits.iter().enumerate() {
             let rows = a.slice(ndarray::s![k * t..(k + 1) * t, ..]);
@@ -366,7 +362,6 @@ fn main() -> Result<(), String> {
         clean_last = ndarray::concatenate(Axis(0), &lasts.iter().map(|a| a.view()).collect::<Vec<_>>()).map_err(error)?;
     }
     drop(lasts);
-    let clean_row = |s: usize, p: usize| clean_last.row(s * t + p).mapv(f64::from);
     log::info!("clean scan in {:.0} s", started.elapsed().as_secs_f64());
 
     // Contexts per function: the top ones by peak |activity|, then uniform others.
@@ -389,8 +384,8 @@ fn main() -> Result<(), String> {
     let mut activity = vec![vec![vec![0.0f32; t]; kk]; total];
     let needed: Vec<usize> = wanted.keys().copied().collect();
     for chunk in needed.chunks(scan_batch) {
-        let edits: Vec<Edit> = chunk.iter().map(|s| Edit { sequence: *s, scale: vec![], rows: all_rows.clone() }).collect();
-        let a = library.edited(&pool, &edits, true)?.activity.ok_or("activity")?;
+        let edits: Vec<Edit> = chunk.iter().map(|s| Edit { sequence: *s, rows: all_rows.clone(), ..Edit::default() }).collect();
+        let a = library.edited(&pool, &edits, &Activity::All, false, false)?.activity.ok_or("activity")?;
         for (k, s) in chunk.iter().enumerate() {
             for (f, j) in &wanted[s] {
                 for p in 0..t {
@@ -418,26 +413,19 @@ fn main() -> Result<(), String> {
     let mut effect: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut effect_ids: BTreeMap<String, Vec<i64>> = BTreeMap::new();
     for (alpha_name, alpha) in ALPHAS {
-        let edits: Vec<Edit> = pairs.iter().map(|(f, j)| Edit { sequence: contexts[*f][*j], scale: vec![(*f, alpha)], rows: vec![position[*f][*j]] }).collect();
-        let (last, _) = run_edits(&library, &pool, &edits, settings.batch, false)?;
-        let lp_e = log_p(&library, &last)?;
-        let clean_rows = Array2::from_shape_fn((pairs.len(), last.ncols()), |(r, c)| f64::from(clean_last[[contexts[pairs[r].0][pairs[r].1] * t + position[pairs[r].0][pairs[r].1], c]]));
-        let lp_c = log_p(&library, &clean_rows)?;
+        let edits: Vec<Edit> = pairs.iter().map(|(f, j)| Edit { sequence: contexts[*f][*j], scale: vec![(*f, alpha)], rows: vec![position[*f][*j]], ..Edit::default() }).collect();
+        let next_tokens: Vec<Option<usize>> = pairs.iter().map(|(f, j)| (position[*f][*j] + 1 < t).then(|| pool[contexts[*f][*j]][position[*f][*j] + 1] as usize)).collect();
+        let measured = effects(&library, &model, &pool, &clean_last, &edits, &next_tokens, TOP, settings.batch)?;
         let (mut kl, mut next) = (Vec::new(), Vec::new());
         let (mut up_ids, mut down_ids, mut up_dp, mut up_dl, mut down_dp, mut down_dl) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for (r, (f, j)) in pairs.iter().enumerate() {
-            let (e, c) = (lp_e.row(r), lp_c.row(r));
-            kl.push(c.iter().zip(e.iter()).map(|(c, e)| c.exp() * (c - e)).sum::<f64>());
-            let p = position[*f][*j];
-            next.push(if p + 1 < t { e[pool[contexts[*f][*j]][p + 1] as usize] - c[pool[contexts[*f][*j]][p + 1] as usize] } else { f64::NAN });
-            let dp: Vec<f64> = e.iter().zip(c.iter()).map(|(e, c)| e.exp() - c.exp()).collect();
-            let up = top_k(dp.iter().copied(), TOP);
-            let down = top_k(dp.iter().map(|v| -v), TOP);
-            for (ids, dps, dls, list) in [(&mut up_ids, &mut up_dp, &mut up_dl, &up), (&mut down_ids, &mut down_dp, &mut down_dl, &down)] {
-                for &i in list {
+        for m in &measured {
+            kl.push(m.kl);
+            next.push(m.next);
+            for (ids, dps, dls, list) in [(&mut up_ids, &mut up_dp, &mut up_dl, &m.up), (&mut down_ids, &mut down_dp, &mut down_dl, &m.down)] {
+                for &(i, dp, dl) in list {
                     ids.push(i as i64);
-                    dps.push(dp[i]);
-                    dls.push(e[i] - c[i]);
+                    dps.push(dp);
+                    dls.push(dl);
                 }
             }
         }
@@ -508,11 +496,13 @@ fn main() -> Result<(), String> {
     if wants("downstream") {
     // Downstream: the exact change of every later function's activity at the peak on removal.
     let down_pairs: Vec<(usize, usize)> = chosen.iter().flat_map(|f| (0..j_count).map(move |j| (*f, j))).collect();
-    let removed: Vec<Edit> = down_pairs.iter().map(|(f, j)| Edit { sequence: contexts[*f][*j], scale: vec![(*f, 0.0)], rows: vec![position[*f][*j]] }).collect();
-    let unedited: Vec<Edit> = down_pairs.iter().map(|(f, j)| Edit { sequence: contexts[*f][*j], scale: vec![], rows: vec![position[*f][*j]] }).collect();
-    let (_, edited_act) = run_edits(&library, &pool, &removed, settings.batch, true)?;
-    let (_, clean_act) = run_edits(&library, &pool, &unedited, settings.batch, true)?;
-    let (edited_act, clean_act) = (edited_act.ok_or("activity")?, clean_act.ok_or("activity")?);
+    let removed: Vec<Edit> = down_pairs.iter().map(|(f, j)| Edit { sequence: contexts[*f][*j], scale: vec![(*f, 0.0)], rows: vec![position[*f][*j]], ..Edit::default() }).collect();
+    let unedited: Vec<Edit> = down_pairs.iter().map(|(f, j)| Edit { sequence: contexts[*f][*j], rows: vec![position[*f][*j]], ..Edit::default() }).collect();
+    let activities = |edits: &[Edit]| -> Result<Array2<f64>, String> {
+        let parts: Vec<Array2<f64>> = edits.chunks(settings.batch.max(1)).map(|c| library.edited(&pool, c, &Activity::All, false, false)?.activity.ok_or_else(|| "activity".to_string())).collect::<Result<_, String>>()?;
+        ndarray::concatenate(Axis(0), &parts.iter().map(|a| a.view()).collect::<Vec<_>>()).map_err(error)
+    };
+    let (edited_act, clean_act) = (activities(&removed)?, activities(&unedited)?);
     let (mut d_ids, mut d_delta, mut d_rel) = (vec![-1i64; total * j_count * k], vec![0.0f64; total * j_count * k], vec![0.0f64; total * j_count * k]);
     let mut strongest = Vec::new();
     for (r, (f, j)) in down_pairs.iter().enumerate() {
@@ -544,26 +534,39 @@ fn main() -> Result<(), String> {
     let mut att_rng = StdRng::seed_from_u64(settings.seed);
     let (mut a_ctx, mut a_pos, mut a_tok, mut a_ids, mut a_direct, mut a_delta) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let lower = 16.min(t.saturating_sub(2));
+    let mut places: Vec<(usize, usize)> = Vec::new();
     for s in 0..settings.attribution_contexts.min(pool.len()) {
         let mut candidates: Vec<usize> = (lower..t - 1).collect();
         candidates.shuffle(&mut att_rng);
-        for &p in candidates.iter().take(settings.positions) {
-            let lp_c = log_p(&library, &clean_row(s, p).insert_axis(Axis(0)))?;
-            let x = top_k(lp_c.row(0).iter().copied(), 1)[0];
-            let (writes, inverse) = library.writes_at(&pool[s], p)?;
-            let direction = library.unembedding_row(x);
-            let direct: Vec<f64> = writes.outer_iter().map(|w| w.dot(&direction) * inverse).collect();
+        places.extend(candidates.iter().take(settings.positions).map(|p| (s, *p)));
+    }
+    for chunk in places.chunks(settings.batch.max(1)) {
+        // The clean reads at the chunk's rows: X, every function's activity and each head's read.
+        let reads: Vec<Edit> = chunk.iter().map(|(s, p)| Edit { sequence: *s, rows: vec![*p], ..Edit::default() }).collect();
+        let clean = library.edited(&pool, &reads, &Activity::All, true, false)?;
+        let x_tokens = library.argmax_tokens(&clean.last_device)?;
+        let (act, heads) = (clean.activity.ok_or("activity")?, clean.heads.ok_or("head reads")?);
+        let mut edits = Vec::new();
+        let mut asked = Vec::new();
+        for (r, (s, p)) in chunk.iter().enumerate() {
+            let head_rows: Vec<_> = heads.iter().map(|h| h.row(r)).collect();
+            let direct = library.direct_effects(act.row(r), &head_rows, x_tokens[r], clean.last.row(r));
             let best = top_k(direct.iter().map(|v| v.abs()), proposals);
-            let edits: Vec<Edit> = best.iter().map(|f| Edit { sequence: s, scale: vec![(*f, 0.0)], rows: vec![p] }).collect();
-            let (last, _) = run_edits(&library, &pool, &edits, settings.batch, false)?;
-            let lp_e = log_p(&library, &last)?;
+            edits.extend(best.iter().map(|f| Edit { sequence: *s, scale: vec![(*f, 0.0)], rows: vec![*p], ..Edit::default() }));
+            asked.push((*s, *p, x_tokens[r], best, direct));
+        }
+        let next: Vec<Option<usize>> = asked.iter().flat_map(|(_, _, x, best, _)| best.iter().map(move |_| Some(*x))).collect();
+        let measured = effects(&library, &model, &pool, &clean_last, &edits, &next, 0, settings.batch)?;
+        let mut at = 0;
+        for (s, p, x, best, direct) in asked {
             a_ctx.push(s as i64);
             a_pos.push(p as i64);
             a_tok.push(x as i64);
-            for (r, f) in best.iter().enumerate() {
+            for f in &best {
                 a_ids.push(*f as i64);
                 a_direct.push(direct[*f]);
-                a_delta.push(lp_e[[r, x]] - lp_c[[0, x]]);
+                a_delta.push(measured[at].next);
+                at += 1;
             }
         }
     }
@@ -588,59 +591,59 @@ fn main() -> Result<(), String> {
     // into what B reads, ranked by their write's exact contribution to B's reads at that row
     // (Σ over B's read maps of ‖R (γ ⊙ w_A(p))‖ / r(p)), used only to choose what to measure; each
     // proposal's exact removal change of B's activity at p, strongest first.
-    let entry = |a: usize| 2 * functions[a].layer + if matches!(functions[a].kind, Kind::Head) { 1 } else { 2 };
-    let reads = |b: usize| 2 * functions[b].layer + if matches!(functions[b].kind, Kind::Head) { 0 } else { 1 };
     let mut by_row: BTreeMap<(usize, usize), Vec<(usize, usize)>> = BTreeMap::new();
     for &b in &chosen {
         for j in 0..j_count {
             by_row.entry((contexts[b][j], position[b][j])).or_default().push((b, j));
         }
     }
-    // Proposals per row (one pass each); the measurements of many rows run together, in batches.
-    let mut edits: Vec<Edit> = Vec::new();
-    let mut asked: Vec<(usize, usize, usize, Vec<usize>)> = Vec::new();
-    let groups: Vec<(&(usize, usize), &Vec<(usize, usize)>)> = by_row.iter().collect();
-    for (g, ((s, p), readers)) in groups.iter().enumerate() {
-        let (writes, _, inverses) = library.writes_and_reads_at(&pool[*s], *p)?;
-        let clean = edits.len();
-        edits.push(Edit { sequence: *s, scale: vec![], rows: vec![*p] });
-        for &(b, j) in readers.iter() {
-            let (site, maps) = library.read_maps(b)?;
-            let mut score = vec![0.0f64; total];
-            for map in &maps {
-                let read = writes.dot(&map.t());
-                for (a, row) in read.outer_iter().enumerate() {
-                    score[a] += row.dot(&row).sqrt() * inverses[site];
-                }
-            }
-            for (a, v) in score.iter_mut().enumerate() {
-                if a == b || entry(a) > reads(b) {
-                    *v = -1.0;
-                }
-            }
-            let proposed: Vec<usize> = top_k(score.iter().copied(), pcount).into_iter().filter(|a| score[*a] >= 0.0).collect();
-            asked.push((b, j, clean, proposed.clone()));
-            edits.extend(proposed.iter().map(|a| Edit { sequence: *s, scale: vec![(*a, 0.0)], rows: vec![*p] }));
+    // Readers in chunks: the clean reads at their rows in batches, each reader's couplings once,
+    // its proposals at each row, and every measurement in batches.
+    let readers: Vec<usize> = chosen.clone();
+    for group in readers.chunks((4 * settings.batch.max(1) / j_count.max(1)).max(1)) {
+        let rows: Vec<(usize, usize)> = group.iter().flat_map(|b| (0..j_count).map(move |j| (*b, j))).map(|(b, j)| (contexts[b][j], position[b][j])).collect();
+        let reads: Vec<Edit> = rows.iter().map(|(s, p)| Edit { sequence: *s, rows: vec![*p], ..Edit::default() }).collect();
+        let mut act_parts = Vec::new();
+        let mut head_parts: Vec<Vec<Array2<f64>>> = Vec::new();
+        let mut inverse_parts = Vec::new();
+        for c in reads.chunks(settings.batch.max(1)) {
+            let e = library.edited(&pool, c, &Activity::All, true, true)?;
+            act_parts.push(e.activity.ok_or("activity")?);
+            head_parts.push(e.heads.ok_or("head reads")?);
+            inverse_parts.push(e.inverses.ok_or("inverses")?);
         }
-        if edits.len() < 16 * settings.batch.max(1) && g + 1 < groups.len() {
-            continue;
+        let stack = |parts: &[Array2<f64>]| ndarray::concatenate(Axis(0), &parts.iter().map(|a| a.view()).collect::<Vec<_>>()).map_err(error);
+        let act = stack(&act_parts)?;
+        let inverses = stack(&inverse_parts)?;
+        let heads: Vec<Array2<f64>> = (0..head_parts[0].len()).map(|h| stack(&head_parts.iter().map(|p| p[h].clone()).collect::<Vec<_>>())).collect::<Result<_, String>>()?;
+        let mut edits = Vec::new();
+        let mut asked = Vec::new();
+        for (g, &b) in group.iter().enumerate() {
+            let couplings = library.couplings(b)?;
+            for j in 0..j_count {
+                let r = g * j_count + j;
+                let head_rows: Vec<_> = heads.iter().map(|h| h.row(r)).collect();
+                let score = couplings.score(act.row(r), &head_rows, inverses.row(r));
+                let proposed: Vec<usize> = top_k(score.iter().map(|v| if v.is_nan() { -1.0 } else { *v }), pcount).into_iter().filter(|a| score[*a] >= 0.0 && *a != b).collect();
+                edits.extend(proposed.iter().map(|a| Edit { sequence: rows[r].0, scale: vec![(*a, 0.0)], rows: vec![rows[r].1], ..Edit::default() }));
+                asked.push((b, j, r, proposed));
+            }
         }
-        let (_, act) = run_edits(&library, &pool, &edits, settings.batch, true)?;
-        let act = act.ok_or("activity")?;
+        let own: Vec<usize> = asked.iter().flat_map(|(b, _, _, proposed)| proposed.iter().map(move |_| *b)).collect();
+        let mut measured = Vec::with_capacity(edits.len());
+        for (c, o) in edits.chunks(settings.batch.max(1)).zip(own.chunks(settings.batch.max(1))) {
+            measured.extend(library.edited(&pool, c, &Activity::Own(o.to_vec()), false, false)?.activity.ok_or("activity")?.column(0).to_vec());
+        }
         let mut at = 0;
-        for (b, j, clean, proposed) in asked.drain(..) {
-            if at <= clean {
-                at = clean + 1;
-            }
-            let mut measured: Vec<(usize, f64)> = proposed.iter().enumerate().map(|(i, a)| (*a, act[[at + i, b]] - act[[clean, b]])).collect();
+        for (b, j, r, proposed) in asked {
+            let mut changes: Vec<(usize, f64)> = proposed.iter().enumerate().map(|(i, a)| (*a, measured[at + i] - act[[r, b]])).collect();
             at += proposed.len();
-            measured.sort_by(|x, y| y.1.abs().total_cmp(&x.1.abs()));
-            for (i, (a, d)) in measured.into_iter().enumerate() {
+            changes.sort_by(|x, y| y.1.abs().total_cmp(&x.1.abs()));
+            for (i, (a, d)) in changes.into_iter().enumerate() {
                 u_ids[(b * j_count + j) * pcount + i] = a as i64;
                 u_delta[(b * j_count + j) * pcount + i] = d;
             }
         }
-        edits.clear();
     }
     save(&out.join("relations_upstream.safetensors"), [("ids".into(), i32s(vec![total, j_count, pcount], u_ids.clone())), ("delta".into(), f32s(vec![total, j_count, pcount], u_delta.clone()))].into())?;
     log::info!("upstream in {:.0} s", started.elapsed().as_secs_f64());
@@ -656,6 +659,9 @@ fn main() -> Result<(), String> {
     let (mut e_act, mut e_kl, mut e_next) = (vec![f64::NAN; total * e_count], vec![f64::NAN; total * e_count], vec![f64::NAN; total * e_count]);
     let (mut e_up, mut e_down) = (vec![-1i64; total * e_count * TOP], vec![-1i64; total * e_count * TOP]);
     let (mut e_up_dp, mut e_down_dp) = (vec![0.0f64; total * e_count * TOP], vec![0.0f64; total * e_count * TOP]);
+    // Per reader its picks; MLP readers' path patches as activation shifts (one pass per context),
+    // measured in batches; heads' path patches directly.
+    let mut by_context: BTreeMap<usize, Vec<(usize, usize, usize, i64)>> = BTreeMap::new();
     for &b in &chosen {
         let base = b * j_count * pcount;
         let measured: Vec<(usize, f64)> = (0..pcount).filter(|i| u_ids[base + i] >= 0).map(|i| (u_ids[base + i] as usize, u_delta[base + i])).collect();
@@ -663,26 +669,55 @@ fn main() -> Result<(), String> {
             continue;
         }
         let weakest = measured.iter().min_by(|x, y| x.1.abs().total_cmp(&y.1.abs())).map(|x| x.0).unwrap_or(measured[0].0);
-        let picks = [(measured[0].0, 1), (measured[1].0, 1), (weakest, 0)];
-        let (s, p) = (contexts[b][0], position[b][0]);
-        for (e, (a, strong)) in picks.iter().enumerate() {
-            let patched = library.path_patched(&pool[s..=s], *a, b, None)?;
-            let at = b * e_count + e;
-            e_ids[at] = *a as i64;
-            e_strong[at] = *strong;
-            e_act[at] = patched.after[p] - patched.before[p];
-            let lp = log_p(&library, &ndarray::stack(Axis(0), &[patched.base.row(p), patched.last.row(p)]).map_err(error)?)?;
-            let (c, e_) = (lp.row(0), lp.row(1));
-            e_kl[at] = c.iter().zip(e_.iter()).map(|(c, e)| c.exp() * (c - e)).sum::<f64>();
-            e_next[at] = if p + 1 < t { e_[pool[s][p + 1] as usize] - c[pool[s][p + 1] as usize] } else { f64::NAN };
-            let dp: Vec<f64> = e_.iter().zip(c.iter()).map(|(e, c)| e.exp() - c.exp()).collect();
-            for (i, v) in top_k(dp.iter().copied(), TOP).into_iter().enumerate() {
-                e_up[at * TOP + i] = v as i64;
-                e_up_dp[at * TOP + i] = dp[v];
-            }
-            for (i, v) in top_k(dp.iter().map(|v| -v), TOP).into_iter().enumerate() {
-                e_down[at * TOP + i] = v as i64;
-                e_down_dp[at * TOP + i] = dp[v];
+        for (e, (a, strong)) in [(measured[0].0, 1), (measured[1].0, 1), (weakest, 0)].into_iter().enumerate() {
+            by_context.entry(contexts[b][0]).or_default().push((b, e, a, strong));
+        }
+    }
+    let mut record = |b: usize, e: usize, a: usize, strong: i64, change: f64, m: &gam_mpd::library_readout::TokenEffects| {
+        let at = b * e_count + e;
+        e_ids[at] = a as i64;
+        e_strong[at] = strong;
+        e_act[at] = change;
+        e_kl[at] = m.kl;
+        e_next[at] = m.next;
+        for (i, (v, dp, _)) in m.up.iter().enumerate() {
+            e_up[at * TOP + i] = *v as i64;
+            e_up_dp[at * TOP + i] = *dp;
+        }
+        for (i, (v, dp, _)) in m.down.iter().enumerate() {
+            e_down[at * TOP + i] = *v as i64;
+            e_down_dp[at * TOP + i] = *dp;
+        }
+    };
+    let mut pending: Vec<(Edit, Option<usize>, (usize, usize, usize, i64, f64))> = Vec::new();
+    let contexts_list: Vec<usize> = by_context.keys().copied().collect();
+    for (ci, s) in contexts_list.iter().enumerate() {
+        let picks = &by_context[s];
+        let mlp: Vec<&(usize, usize, usize, i64)> = picks.iter().filter(|(b, ..)| matches!(functions[*b].kind, Kind::Mlp)).collect();
+        let shifts = library.path_shifts(&pool[*s], &mlp.iter().map(|(b, _, a, _)| (*a, *b)).collect::<Vec<_>>())?;
+        for ((b, e, a, strong), shift) in mlp.into_iter().zip(shifts) {
+            let p = position[*b][0];
+            let change = shift[p];
+            let next = (p + 1 < t).then(|| pool[*s][p + 1] as usize);
+            pending.push((Edit { sequence: *s, add: vec![(*b, shift)], rows: vec![p], ..Edit::default() }, next, (*b, *e, *a, *strong, change)));
+        }
+        for (b, e, a, strong) in picks.iter().filter(|(b, ..)| matches!(functions[*b].kind, Kind::Head)) {
+            let p = position[*b][0];
+            let patched = library.path_patched(&pool[*s..=*s], *a, *b, None)?;
+            let rows = model.upload(ndarray::stack(Axis(0), &[patched.last.row(p), patched.base.row(p)]).map_err(error)?.view()).map_err(error)?;
+            let (edited_row, clean_row) = (model.rows_of(&rows, 0, 1).map_err(error)?, model.rows_of(&rows, 1, 1).map_err(error)?);
+            let next = (p + 1 < t).then(|| pool[*s][p + 1] as usize);
+            let m = library.token_effects(&edited_row, &clean_row, &[next], TOP)?.remove(0);
+            record(*b, *e, *a, *strong, patched.after[p] - patched.before[p], &m);
+        }
+        if pending.len() >= settings.batch.max(1) || ci + 1 == contexts_list.len() {
+            let edits: Vec<Edit> = pending.iter().map(|x| x.0.clone()).collect();
+            let next: Vec<Option<usize>> = pending.iter().map(|x| x.1).collect();
+            if !edits.is_empty() {
+                let measured = effects(&library, &model, &pool, &clean_last, &edits, &next, TOP, settings.batch)?;
+                for ((_, _, (b, e, a, strong, change)), m) in pending.drain(..).zip(measured) {
+                    record(b, e, a, strong, change, &m);
+                }
             }
         }
     }
