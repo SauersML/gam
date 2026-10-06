@@ -17,6 +17,7 @@ gam-gpu = { path = "../gam-gpu", version = "=0.3.157" }
 gam-linalg = { path = "../gam-linalg", version = "=0.3.157" }
 gam-math = { path = "../gam-math", version = "=0.3.157" }
 gam-runtime = { path = "../gam-runtime", version = "=0.3.157" }
+libc = "0.2"
 log = "0.4.29"
 memmap2 = "0.9.10"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }

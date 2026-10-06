@@ -68,6 +68,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     ops::Range,
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -1255,7 +1256,7 @@ pub fn targets<E: BlockEngine>(m: &E, head: &FixedHead, batch: &Batch, experimen
 
 /// The exact identity of a batch's experiments, which alone decides `M`'s targets for them: the
 /// base and source tokens and every experiment.
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct Identity {
     base: Vec<Vec<u32>>,
     source: Vec<Vec<u32>>,
@@ -1337,12 +1338,180 @@ impl HostTargets {
     }
 }
 
+impl HostTargets {
+    /// The kept targets as bytes (little-endian): per row its shape, storage and `μ` as held, its
+    /// entropies and its scored flags. Every row's head is the interchange's, which a read puts
+    /// back.
+    fn encode(&self) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        let word = |out: &mut Vec<u8>, n: usize| out.extend_from_slice(&(n as u64).to_le_bytes());
+        word(&mut out, self.rows.len());
+        for t in &self.rows {
+            word(&mut out, t.shape.0);
+            word(&mut out, t.shape.1);
+            out.push(match t.storage {
+                Storage::F64 => 0,
+                Storage::F32 => 1,
+                Storage::Bf16 => 2,
+            });
+            match &t.mu {
+                KeptValues::Single(v) => {
+                    out.push(0);
+                    word(&mut out, v.len());
+                    v.iter().for_each(|x| out.extend_from_slice(&x.to_le_bytes()));
+                }
+                KeptValues::Double(v) => {
+                    out.push(1);
+                    word(&mut out, v.len());
+                    v.iter().for_each(|x| out.extend_from_slice(&x.to_le_bytes()));
+                }
+            }
+            word(&mut out, t.entropy.len());
+            t.entropy.iter().for_each(|x| out.extend_from_slice(&x.to_le_bytes()));
+            match &t.scored {
+                Some(flags) => {
+                    out.push(1);
+                    word(&mut out, flags.len());
+                    out.extend(flags.iter().map(|f| u8::from(*f)));
+                }
+                None => out.push(0),
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`HostTargets::encode`]'s bytes back, each row with `head`.
+    fn decode(bytes: &[u8], head: &Arc<Head>) -> Result<Self, String> {
+        let mut r = Reader { bytes, at: 0 };
+        let count = r.word()?;
+        let mut rows = Vec::with_capacity(count);
+        for _ in 0..count {
+            let shape = (r.word()?, r.word()?);
+            let storage = match r.take(1)?[0] {
+                0 => Storage::F64,
+                1 => Storage::F32,
+                2 => Storage::Bf16,
+                _ => return Err(error("a kept targets file of an unknown storage")),
+            };
+            let kind = r.take(1)?[0];
+            let n = r.word()?;
+            let mu = match kind {
+                0 => KeptValues::Single(r.take(4 * n)?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
+                1 => KeptValues::Double(r.doubles(n)?),
+                _ => return Err(error("a kept targets file of an unknown value kind")),
+            };
+            let n = r.word()?;
+            let entropy = r.doubles(n)?;
+            let scored = match r.take(1)?[0] {
+                1 => {
+                    let n = r.word()?;
+                    Some(r.take(n)?.iter().map(|f| *f != 0).collect())
+                }
+                _ => None,
+            };
+            rows.push(KeptTarget { mu, shape, storage, entropy, head: Arc::clone(head), scored });
+        }
+        if r.at != bytes.len() {
+            return Err(error("a kept targets file longer than its rows"));
+        }
+        Ok(Self { rows })
+    }
+}
+
+/// A cursor over a kept targets file's bytes.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        let part = self.bytes.get(self.at..self.at + n).ok_or_else(|| error("a kept targets file ends early"))?;
+        self.at += n;
+        Ok(part)
+    }
+
+    fn word(&mut self) -> Result<usize, String> {
+        let b = self.take(8)?;
+        usize::try_from(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])).map_err(error)
+    }
+
+    fn doubles(&mut self, n: usize) -> Result<Vec<f64>, String> {
+        Ok(self.take(8 * n)?.chunks_exact(8).map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])).collect())
+    }
+}
+
+/// Bytes free to this process on the file system holding `dir`, and its size.
+#[cfg(unix)]
+fn disk_space(dir: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `statvfs` fills `stat` when it returns 0.
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `statvfs` returned 0, so `stat` is written.
+    let stat = unsafe { stat.assume_init() };
+    let bytes = |blocks: u128| u64::try_from(blocks * stat.f_frsize as u128).unwrap_or(u64::MAX);
+    Some((bytes(stat.f_bavail as u128), bytes(stat.f_blocks as u128)))
+}
+
+/// Off Unix there is no free-space query here, so nothing is written to disk.
+#[cfg(not(unix))]
+fn disk_space(dir: &std::path::Path) -> Option<(u64, u64)> {
+    std::fs::metadata(dir).ok().and(None)
+}
+
+/// Kept targets the memory budget does not admit, on local disk: one file per batch in a directory
+/// of this store's own (removed with it), written while the file system keeps a tenth of its size
+/// and at least 8 GiB free beside them (room for the run's checkpoints and logs); a batch that
+/// does not fit is made on the device each time.
+struct DiskTargets {
+    dir: PathBuf,
+    files: HashMap<Identity, PathBuf>,
+}
+
+impl DiskTargets {
+    fn new() -> Option<Self> {
+        static STORES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("mpd-targets-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(Self { dir, files: HashMap::new() })
+    }
+
+    /// `kept` written for `identity` when the disk has room for its `bytes`.
+    fn keep(&mut self, identity: Identity, kept: &HostTargets) -> Result<(), String> {
+        let bytes = kept.encode()?;
+        let Some((free, total)) = disk_space(&self.dir) else { return Ok(()) };
+        if free < bytes.len() as u64 + (total / 10).max(8 << 30) {
+            return Ok(());
+        }
+        let path = self.dir.join(format!("{}.targets", self.files.len()));
+        let partial = path.with_extension("partial");
+        std::fs::write(&partial, &bytes).map_err(error)?;
+        std::fs::rename(&partial, &path).map_err(error)?;
+        self.files.insert(identity, path);
+        Ok(())
+    }
+}
+
+impl Drop for DiskTargets {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            log::warn!("interchange: kept targets at {} not removed: {e}", self.dir.display());
+        }
+    }
+}
+
 /// The targets an [`Interchange`] keeps on the host once [`Interchange::keep_targets`] asked for
 /// it, by the exact identity of each batch's experiments, each batch's bytes reserved from
-/// `governor` for as long as they are held.
+/// `governor` for as long as they are held, and those the budget does not admit on local disk.
 struct TargetStore {
     governor: MemoryGovernor,
     batches: HashMap<Identity, Governed<HostTargets>>,
+    disk: Option<DiskTargets>,
 }
 
 impl Targets {
@@ -1597,22 +1766,30 @@ impl Interchange {
 
     /// `M`'s targets for `experiments` on `batch` ([`targets`]), on `M`'s engine. Once
     /// [`Interchange::keep_targets`] asked for it, targets made for a batch are kept on the host
-    /// while the process's memory budget admits them, and the same experiments on the same tokens
-    /// are given those back (bit for bit) instead of running `M` again.
+    /// while the process's memory budget admits them, on local disk while it has room
+    /// ([`DiskTargets`]), and the same experiments on the same tokens are given those back (bit for
+    /// bit) instead of running `M` again.
     pub fn targets(&self, batch: &Batch, experiments: &[Experiment]) -> Result<Targets, String> {
         let teacher = self.models().0;
         let mut store = self.kept.try_borrow_mut().map_err(error)?;
         let identity = store.as_ref().map(|_| Identity { base: batch.base.clone(), source: batch.source.clone(), experiments: experiments.to_vec() });
-        if let (Some(store), Some(identity)) = (store.as_ref(), identity.as_ref())
-            && let Some(kept) = store.batches.get(identity)
-        {
-            return kept.restore(self.m.device());
+        if let (Some(store), Some(identity)) = (store.as_ref(), identity.as_ref()) {
+            if let Some(kept) = store.batches.get(identity) {
+                return kept.restore(self.m.device());
+            }
+            if let Some(path) = store.disk.as_ref().and_then(|disk| disk.files.get(identity)) {
+                return HostTargets::decode(&std::fs::read(path).map_err(error)?, &self.head.head)?.restore(self.m.device());
+            }
         }
         let made = targets(&teacher, &self.head, batch, experiments)?;
         if let (Some(store), Some(identity)) = (store.as_mut(), identity) {
             store.batches.remove(&identity);
             if let Ok(reservation) = store.governor.try_reserve(HostTargets::bytes(&made, &identity), "interchange: M's targets of a batch kept on the host") {
                 store.batches.insert(identity, reservation.bind(HostTargets::of(self.m.device(), &made)?));
+            } else if let Some(disk) = store.disk.as_mut()
+                && made.rows.iter().all(|t| Arc::ptr_eq(&t.head, &self.head.head))
+            {
+                disk.keep(identity, &HostTargets::of(self.m.device(), &made)?)?;
             }
         }
         Ok(made)
@@ -1623,7 +1800,7 @@ impl Interchange {
     /// scores one fixed collection of experiments again and again, where `M`'s forward pass is
     /// otherwise repeated at every scoring.
     pub fn keep_targets(&mut self, governor: &MemoryGovernor) {
-        *self.kept.get_mut() = Some(TargetStore { governor: governor.clone(), batches: HashMap::new() });
+        *self.kept.get_mut() = Some(TargetStore { governor: governor.clone(), batches: HashMap::new(), disk: DiskTargets::new() });
     }
 
     /// `P`'s program, so that a fit writes each weight sample into its resident parameters.
@@ -1786,6 +1963,10 @@ mod tests {
                     assert_eq!(bits(targets.host(&device).expect("download")), bits(fresh.targets(&batch, &other).expect("the targets").host(&device).expect("download")));
                 }
                 assert_eq!(ic.kept.borrow().as_ref().map(|s| s.batches.len()), Some(kept), "device {d}, budget {budget}: the batches kept");
+                // A budget that admits nothing keeps both batches on disk, read back bit for bit above.
+                let on_disk = ic.kept.borrow().as_ref().and_then(|s| s.disk.as_ref().map(|disk| disk.files.len()));
+                let room = disk_space(&std::env::temp_dir()).is_some_and(|(free, total)| free > (total / 10).max(8 << 30) + (1 << 30));
+                assert!(!room || on_disk == Some(2 - kept), "device {d}, budget {budget}: {on_disk:?} batches on disk");
             }
         }
     }
