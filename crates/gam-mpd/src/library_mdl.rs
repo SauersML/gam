@@ -134,13 +134,16 @@
 //! prior's). That stationary point is implicit (`h` is an expectation under `q`, and `v_G` depends
 //! on `σ`); setting `σ` from the running `h` and the current `v_G` at every step is an online
 //! approximation to it, so `σ` has no step size. The mean moves along IVON's direction
-//! `d = G / (h⁺ + δ)`, `G = m / W + δ μ` the full gradient's estimate (the bias-corrected momentum
-//! `m / W` of the data term's gradients plus the prior's exact `δ μ`; `Device::posterior_ivon`),
-//! by the minimum along `d` of `F`'s Gauss–Newton model (`DevicePosterior::step`): the slope
-//! `G · d` times the epoch's ratio of an unbiased slope along the previous direction to that
-//! direction's own gradient's slope (`G · d` counts the momentum's noise as descent), over the
-//! curvature along `d` with the epoch-averaged ratio of the Gauss–Newton factor's curvature along
-//! `d` to the diagonal's. A prior term (`PriorTerm`) is evaluated at both of the step's antithetic
+//! `d = G / (h₀⁺ + δ)`, `h₀` the curvature before the step's own Gauss–Newton draw enters it and
+//! `G = m / W + δ μ` the full gradient's estimate (the bias-corrected momentum `m / W` of the data
+//! term's gradients plus the prior's exact `δ μ`; `Device::posterior_ivon`), by the minimum along
+//! `d` of `F`'s local Gauss–Newton quadratic model, not of `F` along the line
+//! (`DevicePosterior::step`): the slope `G · d` times the epoch's ratio of an unbiased slope along
+//! the previous direction to that direction's own gradient's slope (`G · d` counts the momentum's
+//! noise as descent), over the curvature along `d` with the epoch-averaged ratio of the
+//! Gauss–Newton factor's curvature along `d` to the diagonal's, an average over directions that
+//! change from step to step which stabilizes the length rather than measuring the current
+//! direction's ratio. A prior term (`PriorTerm`) is evaluated at both of the step's antithetic
 //! samples: its mean gradient joins the data term's in the momentum, and the antithetic Stein
 //! estimate of its diagonal curvature (`DevicePosterior::stein_curvature`) joins `ĥ`. The
 //! posterior stays on the
