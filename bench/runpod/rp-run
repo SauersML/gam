@@ -1498,7 +1498,7 @@ TMP=$(mktemp -d /tmp/rp-run.XXXXXX)
 ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$TMP/key"
 chmod 600 "$TMP/key"
 KEYS="$( [ -f "$TMP/key.pub" ] && cat "$TMP/key.pub")"$'\n'"$(cat ~/.ssh/runpod_ed25519.pub)"
-POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0 GUEST=0 EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" PROBE_A="" MED_RATE="" POD_HOST=""
+POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0 GUEST=0 EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" EARLY_BINS="" PROBE_A="" MED_RATE="" POD_HOST=""
 SSH=(ssh -F none -i "$TMP/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ForwardX11=no
      -o UserKnownHostsFile="$TMP/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20
      -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o LogLevel=ERROR)
@@ -1685,6 +1685,10 @@ reach() {
     if [ ${#fetched[@]} -gt 0 ] && [ -z "$EARLY_FETCH" ]; then
         fetch_published & EARLY_FETCH=$!
     fi
+    # So do the published binaries (planned before the first pod).
+    if (( BIN_PLANNED )) && [ ${#BIN_ASSETS[@]} -gt 0 ] && [ -z "$EARLY_BINS" ]; then
+        fetch_binaries & EARLY_BINS=$!
+    fi
     # So do the Python environment and the models (19-106 s), which need nothing from the checks,
     # rsync (for syncing outputs; apt-get takes about 5 s), and gpu_in_use's five samples (5 s).
     if { [ -n "$PYENV_DIR" ] || [ -n "${RP_HF_MODELS:-}" ]; } && [ -z "$EARLY_PYENV" ]; then
@@ -1836,7 +1840,7 @@ launch() {
     local kind price gpu r code left host
     # A listed run relaunches only while still listed; a small run's approval covers its whole cap.
     [ "$APPROVAL" = auto ] || approved "$NAME" || { say "approval for $NAME withdrawn; not launching a pod"; exit 3; }
-    POD="" IP="" PORT="" EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" PROBE_A=""
+    POD="" IP="" PORT="" EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" EARLY_BINS="" PROBE_A=""
     rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
     host=$(find_host)
     if [ -n "$host" ] && attach "$host"; then
@@ -1930,6 +1934,7 @@ launch() {
         [ -z "$EARLY_FETCH" ] || { kill "$EARLY_FETCH" 2> /dev/null || true; wait "$EARLY_FETCH" 2> /dev/null || true; EARLY_FETCH=""; }
         [ -z "$EARLY_PYENV" ] || { kill "$EARLY_PYENV" 2> /dev/null || true; wait "$EARLY_PYENV" 2> /dev/null || true; EARLY_PYENV=""; }
         [ -z "$EARLY_RSYNC" ] || { kill "$EARLY_RSYNC" 2> /dev/null || true; wait "$EARLY_RSYNC" 2> /dev/null || true; EARLY_RSYNC=""; }
+        [ -z "$EARLY_BINS" ] || { kill "$EARLY_BINS" 2> /dev/null || true; wait "$EARLY_BINS" 2> /dev/null || true; EARLY_BINS=""; }
         rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
         echo discarded > "$ACTIVE/.$POD.end"
         reap "$POD" || exit 1
@@ -2397,6 +2402,36 @@ build_binaries() {
     fi
 }
 
+# Where each binary comes from: BIN_ASSETS from rp-run-bin (the pod downloads them), BIN_CACHED
+# from the Mac's cache, BIN_BUILD compiled on the pod (only when GitHub Actions has failed). Planned
+# once, before the first pod: build_binaries saw every binary published or cached, so a listing
+# that lacks one is GitHub's API failing for the moment (published_assets prints nothing then),
+# asked again before the run is refused.
+BIN_PLANNED=0 BIN_ASSETS=() BIN_CACHED=() BIN_BUILD=()
+plan_binaries() {
+    local have="" x try
+    (( ! BIN_PLANNED )) || return 0
+    BIN_ASSETS=() BIN_CACHED=() BIN_BUILD=()
+    for try in 1 2 3 4 5; do
+        [ ${#examples[@]} -eq 0 ] && [ ${#tests[@]} -eq 0 ] || have=$(published_assets)
+        [ -z "$(unbuilt_in "$have")" ] && break
+        sleep $(( 2 * try ))
+    done
+    for x in "${examples[@]}"; do
+        if grep -qx "$KEY.$x" <<< "$have"; then BIN_ASSETS+=("$x"); elif [ -x "$CACHE/$x" ]; then BIN_CACHED+=("$x"); else BIN_BUILD+=("$x"); fi
+    done
+    for x in "${tests[@]}"; do
+        if grep -qx "$KEY.test-${x#*:}" <<< "$have"; then BIN_ASSETS+=("test-${x#*:}"); elif [ -x "$CACHE/test-${x#*:}" ]; then BIN_CACHED+=("test-${x#*:}"); else BIN_BUILD+=("test:$x"); fi
+    done
+    BIN_PLANNED=1
+}
+# The published binaries, downloaded by the pod all at once (parity-q-968cd0d756's four 86 MB test
+# binaries took 26 s one after another).
+fetch_binaries() {
+    on_pod "mkdir -p $WS/bin && cd $WS/bin && printf '%s\n' ${BIN_ASSETS[*]} | xargs -P 8 -I{} sh -c 'curl -fsSL --retry 3 -o {} $ASSETS/$KEY.{} && chmod +x {}'" < /dev/null || return 1
+    say "${BIN_ASSETS[*]} from rp-run-bin ($KEY), downloaded by the pod"
+}
+
 # The source, binaries, inputs, data, models and the outputs synced so far, on the current pod.
 setup() {
     local started=$(date +%s) x pkg flags build=() cached=() jobs=()
@@ -2404,31 +2439,14 @@ setup() {
     # step that fails on the connection (ssh's 255) loses the pod; any other failure ends the run.
     # The published inputs need nothing else: they start at once (at SSH, in reach).
     if [ -n "$EARLY_FETCH" ]; then jobs+=("$EARLY_FETCH"); else fetch_published & jobs+=($!); fi
-    # The pod downloads published binaries itself (in the background: vpd-pricing-n2048's waited
-    # 6 minutes behind a source download on a slow host); the Mac sends only what it alone holds.
-    local have="" assets=() try
-    # build_binaries saw every binary published or cached before the pod existed: a listing that
-    # lacks one now is GitHub's API failing for the moment (published_assets prints nothing then),
-    # asked again before the run is refused.
-    for try in 1 2 3 4 5; do
-        [ ${#examples[@]} -eq 0 ] && [ ${#tests[@]} -eq 0 ] || have=$(published_assets)
-        [ -z "$(unbuilt_in "$have")" ] && break
-        sleep $(( 2 * try ))
-    done
-    for x in "${examples[@]}"; do
-        if grep -qx "$KEY.$x" <<< "$have"; then assets+=("$x"); elif [ -x "$CACHE/$x" ]; then cached+=("$x"); else build+=("$x"); fi
-    done
-    for x in "${tests[@]}"; do
-        if grep -qx "$KEY.test-${x#*:}" <<< "$have"; then assets+=("test-${x#*:}"); elif [ -x "$CACHE/test-${x#*:}" ]; then cached+=("test-${x#*:}"); else build+=("test:$x"); fi
-    done
+    plan_binaries
+    for x in "${BIN_BUILD[@]}"; do build+=("$x"); done
+    for x in "${BIN_CACHED[@]}"; do cached+=("$x"); done
     if [ ${#build[@]} -gt 0 ] && [ "$MODE" = run ] && [ -z "${FALLBACK_BUILD:-}" ]; then
         say "${build[*]} not built: a GPU pod compiles only when GitHub Actions has failed"
         exit 1
     fi
-    if [ ${#assets[@]} -gt 0 ]; then
-        { on_pod "mkdir -p $WS/bin && cd $WS/bin && for n in ${assets[*]}; do curl -fsSL --retry 3 -o \$n $ASSETS/$KEY.\$n && chmod +x \$n || exit 1; done" < /dev/null &&
-            say "${assets[*]} from rp-run-bin ($KEY), downloaded by the pod"; } & jobs+=($!)
-    fi
+    if [ -n "$EARLY_BINS" ]; then jobs+=("$EARLY_BINS"); elif [ ${#BIN_ASSETS[@]} -gt 0 ]; then fetch_binaries & jobs+=($!); fi
     # The source. A run that compiles nothing needs only the paths COMMAND, the data builds and the
     # Python environment name (srcpaths: about 0.2 MB), sent from the Mac; a compile takes the whole
     # commit from GitHub at datacenter speed (141 MB), the Mac's archive if that fails.
@@ -2782,6 +2800,7 @@ hold() {
 case $MODE in
     run)
         build_binaries
+        plan_binaries
         attempt=1
         until launch && setup && run_command; do
             [ ! -f "$OUT/STOP" ] || exit 1
