@@ -2221,7 +2221,14 @@ impl DeviceProgram {
                 retained.push(node);
             }
         }
-        let (mut nodes, mut rounded) = self.reverse_seeds(trace, seeds, &retained, arithmetic, edited, hook, gradients)?;
+        // A fused group's reverse adds to the projections among this call's trainable operators
+        // alone. The gradient sums are shared by every block a pass reverses, and a block run by
+        // another program (`M`'s, in a hybrid) numbers its operators its own way: its head
+        // projections must not meet the slots of `P`'s operators of the same indices.
+        let mut own: BTreeMap<usize, Tensor> = requested.iter().filter_map(|op| gradients.remove(op).map(|t| (*op, t))).collect();
+        let reversed = self.reverse_seeds(trace, seeds, &retained, arithmetic, edited, hook, &mut own);
+        gradients.extend(own);
+        let (mut nodes, mut rounded) = reversed?;
         // One scalar constant is uploaded; all reductions and gradient arrays stay
         // on the device. Reuse the same broadcast across every column occurrence.
         let has_columns = requested.iter().any(|op| self.operators.contains_key(&(*op, Role::Column)));

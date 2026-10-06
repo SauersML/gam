@@ -2343,6 +2343,37 @@ mod tests {
     }
 
     #[test]
+    fn a_library_with_each_kind_of_exact_sharing_fits() {
+        use crate::{import::import_language_model, library_mdl::{Settings, explanation, fit}, library_sharing::{Member, RowSource}, operator_program::SlotValues, run_check::{layer_nodes, split_sites}};
+        let dir = crate::test_support::tiny_export("library_mixture_exact_fits", 2);
+        let imported = import_language_model(&dir, 6, 12).expect("import");
+        std::fs::remove_dir_all(dir).unwrap();
+        let native = split_sites(&imported.program).expect("split");
+        let start = explanation(&native, &layer_nodes(&native, 2).expect("layers")).expect("explanation");
+        let settings = Settings { batch_sequences: 2, beta1: 0.9, seed: 3, numeric_bytes: 1 << 26, head_tile_rows: 64, epochs: Some(1) };
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let (train, held) = sequences.split_at(4);
+        // Every kind the mixture makes exact. A write tied to an earlier write once failed here:
+        // the fused heads of a block run by `M` took `P`'s gradient slot of the same operator
+        // index for one of their projections.
+        let kinds = [
+            ("read of an earlier write", library_sharing::tie(&start, &[Tie { source: (0, 3), target: (1, 5), scale: 0.8 }])),
+            ("read of an earlier read", library_sharing::tie_row(&start, "gate", (1, 6), RowSource::Row { layer: 0, part: "gate", function: 2 }, -0.5)),
+            ("read of a token's embedding row", library_sharing::tie_row(&start, "gate", (1, 7), RowSource::Token(5), 1.2)),
+            ("write of an earlier write", library_sharing::tie_column(&start, (1, 2), (0, 4), 1.1)),
+            ("shared query-key function", library_sharing::share_query_key(&start, &[Member { layer: 0, group: 0, queries: vec![0] }, Member { layer: 1, group: 0, queries: vec![0] }])),
+            ("shared value map", library_sharing::share_value(&start, (1, 0), (0, 0), 0.7)),
+        ];
+        for (kind, shared) in kinds {
+            let shared = shared.unwrap_or_else(|e| panic!("{kind}: {e}"));
+            let mut control = Mixture::new(&shared, 0, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
+            let fitted = fit(&gam_gpu::tensor::Device::host(), &native, &shared, train, held, &settings, "tiny", None, Some(&mut control)).unwrap_or_else(|e| panic!("{kind}: {e}"));
+            assert!(fitted.report.objective_bits.is_finite(), "{kind}: F");
+        }
+    }
+
+    #[test]
     fn exact_copies_of_ties_functions_and_heads_are_found_by_their_weights_and_made_exact() {
         use crate::{import::import_language_model, library_mdl::{Settings, explanation, fit}, operator_program::{Provenance, SlotValues, exact_precision}, run_check::{layer_nodes, split_sites}};
         use gam_gpu::tensor::Device;
