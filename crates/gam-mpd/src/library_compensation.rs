@@ -229,6 +229,38 @@ impl Compensation {
         trial.remove(removed);
         Ok(trial)
     }
+
+    /// Per function alive at `posterior` with its own output column, its groups and the share of
+    /// its activations' energy on `P`'s states that the other such functions of its MLP do not
+    /// reproduce: `1 − G_iR G_RR⁺ G_Ri / G_ii = 1 / (G_ii (G_AA⁺)_ii)` (the Schur complement), `A`
+    /// those functions and `R` the others, over the eigenvectors of `G_AA` a proposal resolves.
+    /// When the downstream metric does not depend on which function is active, compensation scales
+    /// the data rise of deleting function `i` by this share.
+    pub fn unexplained(&self, posterior: &Posterior) -> Result<Vec<(Vec<usize>, f64)>, String> {
+        let terms = self.rows as f64 * f64::EPSILON / 2.0;
+        if terms >= 1.0 {
+            return Err(error("too many rows for the rounding bound"));
+        }
+        let gamma = terms / (1.0 - terms);
+        let mut out = Vec::new();
+        for mlp in &self.mlps {
+            let alive: Vec<usize> = (0..mlp.functions.len())
+                .filter(|i| matches!(mlp.outputs[*i], Output::Column(_)) && mlp.functions[*i].iter().all(|g| posterior.active[*g]))
+                .collect();
+            if alive.is_empty() {
+                continue;
+            }
+            let gram = mlp.gram.select(Axis(0), &alive).select(Axis(1), &alive);
+            let decomposition = eigh(gram.view(), SymmetricAssembly::Mirrored, None).map_err(error)?;
+            let floor = decomposition.band + gamma * gram.diag().sum();
+            let inverse = decomposition.map(|lambda| if lambda > floor { 1.0 / lambda } else { 0.0 });
+            for (k, i) in alive.iter().enumerate() {
+                let energy = gram[[k, k]] * inverse[[k, k]];
+                out.push((mlp.functions[*i].clone(), if energy > 1.0 { 1.0 / energy } else { 1.0 }));
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
