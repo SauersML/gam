@@ -277,57 +277,93 @@ impl Teacher {
         let trace = self.prefix.forward(inputs)?;
         let mut mu = self.device.zeros(rows, width).map_err(error)?;
         let mut entropy = Vec::with_capacity(rows);
-        for start in (0..rows).step_by(self.tile_rows) {
-            let n = self.tile_rows.min(rows - start);
-            let hidden = self
-                .device
-                .rows_of(trace.value(self.prefix.hidden())?, start, n)
-                .map_err(error)?;
-            let mut probabilities = self.device.zeros(n, classes).map_err(error)?;
-            self.device
-                .gemm(
-                    &mut probabilities,
-                    1.,
-                    &hidden,
-                    Op::N,
-                    &self.embedding,
-                    Op::T,
-                    0.,
-                    Arithmetic::F64,
-                )
-                .map_err(error)?;
+        let teacher_hidden = trace.value(self.prefix.hidden())?;
+        // f32 storage (the Apple GPU) has no float64 product: the classes are swept as in
+        // ResidentHead::score, mu is the log partition's gradient, and the negative entropy is
+        // h.mu - logZ.
+        if teacher_hidden.storage() == Storage::F32 {
             let flags = scored
                 .map(|s| {
-                    self.device.upload_indices(
-                        &s[start..start + n]
-                            .iter()
-                            .map(|v| u32::from(*v))
-                            .collect::<Vec<_>>(),
-                    )
+                    self.device
+                        .upload_indices(&s.iter().map(|v| u32::from(*v)).collect::<Vec<_>>())
                 })
                 .transpose()
                 .map_err(error)?;
-            let stats = self
+            let partitions = self
                 .device
-                .softmax_stats_rows(&mut probabilities, flags.as_ref())
-                .map_err(error)?;
-            let mut projected = self.device.zeros(n, width).map_err(error)?;
-            self.device
-                .gemm(
-                    &mut projected,
-                    1.,
-                    &probabilities,
-                    Op::N,
+                .head_log_partition(
+                    teacher_hidden,
                     &self.embedding,
-                    Op::N,
-                    0.,
-                    Arithmetic::F64,
+                    false,
+                    flags.as_ref(),
+                    Some(&mut mu),
+                    Arithmetic::F32,
                 )
                 .map_err(error)?;
-            self.device
-                .set_rows(&mut mu, start, &projected)
+            let blocks = self.device.column_blocks(&[width]).map_err(error)?;
+            let dots = self
+                .device
+                .download(
+                    &self
+                        .device
+                        .block_products(teacher_hidden, &mu, &blocks)
+                        .map_err(error)?,
+                )
                 .map_err(error)?;
-            entropy.extend(stats.into_iter().map(|s| s[1]));
+            entropy.extend((0..rows).map(|r| dots[(r, 0)] - partitions[r]));
+        } else {
+            for start in (0..rows).step_by(self.tile_rows) {
+                let n = self.tile_rows.min(rows - start);
+                let hidden = self
+                    .device
+                    .rows_of(teacher_hidden, start, n)
+                    .map_err(error)?;
+                let mut probabilities = self.device.zeros(n, classes).map_err(error)?;
+                self.device
+                    .gemm(
+                        &mut probabilities,
+                        1.,
+                        &hidden,
+                        Op::N,
+                        &self.embedding,
+                        Op::T,
+                        0.,
+                        Arithmetic::F64,
+                    )
+                    .map_err(error)?;
+                let flags = scored
+                    .map(|s| {
+                        self.device.upload_indices(
+                            &s[start..start + n]
+                                .iter()
+                                .map(|v| u32::from(*v))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .transpose()
+                    .map_err(error)?;
+                let stats = self
+                    .device
+                    .softmax_stats_rows(&mut probabilities, flags.as_ref())
+                    .map_err(error)?;
+                let mut projected = self.device.zeros(n, width).map_err(error)?;
+                self.device
+                    .gemm(
+                        &mut projected,
+                        1.,
+                        &probabilities,
+                        Op::N,
+                        &self.embedding,
+                        Op::N,
+                        0.,
+                        Arithmetic::F64,
+                    )
+                    .map_err(error)?;
+                self.device
+                    .set_rows(&mut mu, start, &projected)
+                    .map_err(error)?;
+                entropy.extend(stats.into_iter().map(|s| s[1]));
+            }
         }
         *retained = retained
             .checked_add(
