@@ -352,15 +352,16 @@ def slots(table: Table, ex: dict, condition: str) -> list[tuple]:
     return out[:SLOTS]
 
 
-def lens_text(table: Table, layer: int, kind: str, c: int, name: str = "It") -> str:
-    """vpd_lens.py's readout of one subcomponent (weights only), stated per sign of its activity."""
+def lens_text(table: Table, layer: int, kind: str, c: int, name: str = "It", reads: bool = True) -> str:
+    """vpd_lens.py's readout of one subcomponent (weights only), stated per sign of its activity (its
+    write alone with reads=False)."""
     L = table.lens
     n = site_name(layer, kind)
     words = lambda key: ", ".join(table.piece(int(t)) for t in L[f"{n}.{key}"][c].tolist() if t >= 0)  # noqa: E731
+    head = f"{name} is positive on tokens like {words('pos_read')}; negative on tokens like {words('neg_read')}. " if reads else f"{name}: "
     if int(L[f"{n}.up"][c, 0]) < 0:
-        return f"{name} changes attention scores (no direct write); it is positive on tokens like {words('pos_read')} and negative on tokens like {words('neg_read')}."
-    return (f"{name} is positive on tokens like {words('pos_read')}; then it raises {words('up')} and lowers {words('down')}. "
-            f"It is negative on tokens like {words('neg_read')}; then it raises {words('down')} and lowers {words('up')}.")
+        return head + ("It changes" if reads else "changes") + " attention scores (no direct write)."
+    return head + ("Positive" if reads else "positive") + f" activity raises {words('up')} and lowers {words('down')} (negative activity the reverse)."
 
 
 def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
@@ -383,7 +384,7 @@ def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
         if ex["c"] >= 0:
             info += lens_text(table, ex["layer"], ex["kind"], ex["c"])
         else:
-            info += "\n".join(lens_text(table, l, k, c, f"C{i + 1}") for i, (l, k, c, _, _) in enumerate(ex["candidates"]))
+            info += "\n".join(lens_text(table, l, k, c, f"C{i + 1}", reads=False) for i, (l, k, c, _, _) in enumerate(ex["candidates"]))
     text = table.text(ex["context"], ex["position"], ex["position"])
     listing = "\n".join(f"{LABELS[k]}. {o}" for k, o in enumerate(ex["options"]))
     after = f"{info}\nText: {text!r}\n{ex['question']}\n{listing}\nAnswer with the letter."
