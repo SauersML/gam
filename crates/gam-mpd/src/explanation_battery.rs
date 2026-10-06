@@ -2272,8 +2272,9 @@ fn read_pricing_posterior(path: &Path, shapes_of: &[Array2<f64>]) -> Result<Vec<
 /// zero) per token per layer, with the masks of its causal-importance network computed from
 /// `M`'s clean activations (`m_clean`, VPD's setting); from them with the network's attention
 /// causal (`causal`), so no position's mask reads a later position; with every mask 1
-/// (`all_on`); and from VPD's own activations by `k` rounds of `masks ← CI(the sites' inputs of
-/// VPD run with masks)` from every mask 1 (`own_k`), which reads nothing of `M`. The network
+/// (`all_on`); from VPD's own activations by `k` rounds of `masks ← CI(the sites' inputs of
+/// VPD run with masks)` from every mask 1 (`own_k`), which reads nothing of `M`; and one such
+/// round through the causal network (`own_causal_1`), autonomous and causal. The network
 /// reads every site's input at once (one input projection over all the sites) and attends over
 /// every position, so VPD on its own activations has no single pass: a layer's masks read later
 /// layers' inputs, and position `t`'s read position `t + 1`'s, whose first sites' input is the
@@ -2287,7 +2288,7 @@ pub fn vpd_mask_sources(vpd: &Vpd, export: &Path, decomposition: &Path, held_out
         (Side::compile(&d, &built.program, numeric_bytes)?, outputs)
     };
     let arithmetic = vpd.e.program.arithmetic();
-    let names: Vec<String> = ["m_clean", "causal", "all_on"].iter().map(|s| s.to_string()).chain((1..=rounds).map(|k| format!("own_{k}"))).collect();
+    let names: Vec<String> = ["m_clean", "causal", "all_on", "own_causal_1"].iter().map(|s| s.to_string()).chain((1..=rounds).map(|k| format!("own_{k}"))).collect();
     let mut kl = vec![0.0; names.len()];
     let mut active = vec![vec![0.0; layers]; names.len()];
     let mut tokens = 0usize;
@@ -2324,12 +2325,17 @@ pub fn vpd_mask_sources(vpd: &Vpd, export: &Path, decomposition: &Path, held_out
             // The network on VPD's own inputs to the sites: `M`'s inputs replaced by them.
             let inputs: BTreeMap<usize, Tensor> =
                 vpd.layout.inputs.iter().zip(&vpd.m_layout.inputs).map(|(own, m)| Ok((*m, d.copy(trace.value(*own)?).map_err(error)?))).collect::<Result<_, String>>()?;
-            let ci = vpd.importance.forward_edited(&family, BTreeMap::new(), &std::collections::BTreeSet::new(), |_, _| Ok(()), |node, _| {
-                inputs.get(&node).map(|v| d.copy(v).map_err(error)).transpose()
-            })?;
-            let masks = masks_of(&ci, &vpd.outputs)?;
-            drop(ci);
-            trace = score(3 + k, &masks)?;
+            let replaced = |network: &DeviceProgram, outputs: &[usize]| -> Result<Vec<Tensor>, String> {
+                let ci = network.forward_edited(&family, BTreeMap::new(), &std::collections::BTreeSet::new(), |_, _| Ok(()), |node, _| {
+                    inputs.get(&node).map(|v| d.copy(v).map_err(error)).transpose()
+                })?;
+                masks_of(&ci, outputs)
+            };
+            if k == 0 {
+                score(3, &replaced(&causal, &causal_outputs)?)?;
+            }
+            let masks = replaced(&vpd.importance, &vpd.outputs)?;
+            trace = score(4 + k, &masks)?;
         }
     }
     let rows = tokens as f64;
