@@ -498,14 +498,13 @@ fn main() -> Result<(), String> {
     let down_pairs: Vec<(usize, usize)> = chosen.iter().flat_map(|f| (0..j_count).map(move |j| (*f, j))).collect();
     let removed: Vec<Edit> = down_pairs.iter().map(|(f, j)| Edit { sequence: contexts[*f][*j], scale: vec![(*f, 0.0)], rows: vec![position[*f][*j]], ..Edit::default() }).collect();
     let unedited: Vec<Edit> = down_pairs.iter().map(|(f, j)| Edit { sequence: contexts[*f][*j], rows: vec![position[*f][*j]], ..Edit::default() }).collect();
-    let activities = |edits: &[Edit]| -> Result<Array2<f64>, String> {
-        let parts: Vec<Array2<f64>> = edits.chunks(settings.batch.max(1)).map(|c| library.edited(&pool, c, &Activity::All, false, false)?.activity.ok_or_else(|| "activity".to_string())).collect::<Result<_, String>>()?;
-        ndarray::concatenate(Axis(0), &parts.iter().map(|a| a.view()).collect::<Vec<_>>()).map_err(error)
-    };
-    let (edited_act, clean_act) = (activities(&removed)?, activities(&unedited)?);
     let (mut d_ids, mut d_delta, mut d_rel) = (vec![-1i64; total * j_count * k], vec![0.0f64; total * j_count * k], vec![0.0f64; total * j_count * k]);
     let mut strongest = Vec::new();
-    for (r, (f, j)) in down_pairs.iter().enumerate() {
+    // In batches, so the activities held are a batch's (rows × functions), not the whole table's.
+    for (chunk, (removed, unedited)) in down_pairs.chunks(settings.batch.max(1)).zip(removed.chunks(settings.batch.max(1)).zip(unedited.chunks(settings.batch.max(1)))) {
+    let edited_act = library.edited(&pool, removed, &Activity::All, false, false)?.activity.ok_or("activity")?;
+    let clean_act = library.edited(&pool, unedited, &Activity::All, false, false)?.activity.ok_or("activity")?;
+    for (r, (f, j)) in chunk.iter().enumerate() {
         let delta: Vec<f64> = (0..total).map(|g| if later(*f, g) { edited_act[[r, g]] - clean_act[[r, g]] } else { 0.0 }).collect();
         let rel: Vec<f64> = delta.iter().zip(&peak_of).map(|(d, p)| d / p).collect();
         let best = top_k(rel.iter().map(|v| v.abs()), k);
@@ -518,6 +517,7 @@ fn main() -> Result<(), String> {
         if *j == 0 {
             strongest.push(best.first().map_or(0.0, |g| rel[*g].abs()));
         }
+    }
     }
     save(
         &out.join("relations_downstream.safetensors"),
