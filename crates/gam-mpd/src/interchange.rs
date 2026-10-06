@@ -238,6 +238,9 @@ fn flat_sites(artifact: &Artifact, layers: &[LayerNodes]) -> Result<(OperatorPro
     for (b, read) in reads.iter().enumerate() {
         shared.insert(SharedSite::Input(b), *read);
     }
+    if entries.first().is_some_and(|e| reads.first().is_some_and(|r| e < r)) {
+        shared.insert(SharedSite::Embedding, entries[0]);
+    }
     for (l, layer) in layers.iter().enumerate() {
         if let Some(node) = at(layer.attention).ok().filter(|n| *n > reads[2 * l] && *n < entries[2 * l + 1]) {
             shared.insert(SharedSite::Attention(l), node);
@@ -319,7 +322,7 @@ pub enum Patch {
 /// A site every explanation shares with `M`, each model holding it at its own node: the stream
 /// after block `b` (block `2l` is layer `l`'s attention, `2l + 1` its MLP), head `h`'s attention
 /// output (heads numbered layer by layer), layer `l`'s attention output (the `o` site's), its MLP
-/// output, and block `b`'s read (its normed input).
+/// output, block `b`'s read (its normed input), and the tokens' embeddings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SharedSite {
@@ -330,6 +333,8 @@ pub enum SharedSite {
     /// Block `b`'s read: its normed input (a layer's heads' query, key and value input, or its
     /// MLP's input).
     Input(usize),
+    /// The tokens' embeddings, the stream entering block 0 (a swap there swaps the token).
+    Embedding,
 }
 
 impl SharedSite {
@@ -341,6 +346,7 @@ impl SharedSite {
             SharedSite::Attention(l) => Some(2 * l),
             SharedSite::Mlp(l) => Some(2 * l + 1),
             SharedSite::Input(b) => Some(*b),
+            SharedSite::Embedding => Some(0),
         }
     }
 }
