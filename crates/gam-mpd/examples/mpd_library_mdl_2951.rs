@@ -23,18 +23,25 @@
 //! With `blocks` (block `2l` layer `l`'s attention, `2l + 1` its MLP), the explanation is of those
 //! blocks alone and `M` everywhere else (`library_mdl::scoped`): the fast loop for comparing method
 //! changes, F against N for one block before a whole-model run.
+//!
+//! With `transcoders` (`{"dir": D, "layers": [l, ...]}`, `D/layer_{l}.safetensors` circuit-tracer
+//! transcoder files), those layers' MLPs are the transcoders' features (`library_transcoder`): the
+//! features that fire on the training sequences at `M`'s MLP inputs are written to
+//! `OUT/transcoder_l{l}.safetensors` (kept from an earlier run of the same command), with their
+//! counts in `OUT/TRANSCODERS.json`; every other layer keeps `M`'s own MLP functions.
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     engine::{log_to_stderr, sha256},
     import::{hugging_face_language_model, hugging_face_language_model_prefix, import_language_model},
-    library_mdl,
+    library_mdl, library_transcoder,
     operator_program::{OperatorProgram, SlotValues},
-    run_check::{layer_nodes, split_sites},
+    run_check::{LayerNodes, layer_nodes, split_sites},
 };
 use gam_runtime::warm_start::Fingerprinter;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -57,7 +64,51 @@ struct Settings {
     /// tokens, for measuring per-layer costs. All blocks when absent.
     #[serde(default)]
     layers: Option<usize>,
+    /// Layers whose MLPs are transcoder features, and the directory of the transcoder files.
+    #[serde(default)]
+    transcoders: Option<Transcoders>,
     fit: library_mdl::Settings,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Transcoders {
+    dir: PathBuf,
+    layers: Vec<usize>,
+}
+
+/// Per transcoder layer its kept file in `out`: the features that fire on `train` at `M`'s MLP
+/// inputs, counted on `device` once and kept for a resumed run, with the counts in
+/// `out/TRANSCODERS.json`.
+fn transcoder_files(device: &Device, native: &OperatorProgram, layers: &[LayerNodes], settings: &Transcoders, train: &[Vec<u32>], batch: usize, out: &Path) -> Result<BTreeMap<usize, PathBuf>, String> {
+    let files: BTreeMap<usize, PathBuf> = settings.layers.iter().map(|&l| (l, out.join(format!("transcoder_l{l}.safetensors")))).collect();
+    if files.values().all(|f| f.exists()) {
+        return Ok(files);
+    }
+    let started = Instant::now();
+    let transcoders = settings
+        .layers
+        .iter()
+        .map(|&l| Ok((l, library_transcoder::Transcoder::open(&settings.dir.join(format!("layer_{l}.safetensors")))?)))
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let counts = library_transcoder::firing(device, native, layers, &transcoders, train, batch)?;
+    let tokens: usize = train.iter().map(Vec::len).sum();
+    let mut record = Vec::new();
+    for (l, transcoder) in &transcoders {
+        let kept: Vec<usize> = (0..transcoder.features).filter(|&f| counts[l][f] > 0).collect();
+        transcoder.write_kept(&kept, &files[l])?;
+        let fired: u64 = counts[l].iter().sum();
+        record.push(json!({
+            "layer": l,
+            "features": transcoder.features,
+            "kept": kept.len(),
+            "active_per_token": fired as f64 / tokens as f64,
+            "tokens": tokens,
+        }));
+        log::info!("transcoder layer {l}: {} of {} features fire on {tokens} training tokens, {:.2} per token", kept.len(), transcoder.features, fired as f64 / tokens as f64);
+    }
+    save(&out.join("TRANSCODERS.json"), &json!({"layers": record, "seconds": started.elapsed().as_secs_f64()}))?;
+    Ok(files)
 }
 
 #[derive(Deserialize)]
@@ -165,7 +216,13 @@ fn main() -> Result<(), String> {
     // The imported program's operators the split replaced are not read again.
     drop(program);
     let layers = layer_nodes(&native, layer_count)?;
-    let explanation = library_mdl::explanation(&native, &layers)?;
+    let explanation = match &settings.transcoders {
+        Some(transcoders) => {
+            let files = transcoder_files(&device, &native, &layers, transcoders, &train, settings.fit.batch_sequences, out)?;
+            library_mdl::explanation_with(&native, &layers, &files)?
+        }
+        None => library_mdl::explanation(&native, &layers)?,
+    };
     let explanation = match &settings.blocks {
         Some(blocks) => library_mdl::scoped(&explanation, blocks)?,
         None => explanation,

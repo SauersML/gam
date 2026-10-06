@@ -544,6 +544,13 @@ fn index_of(program: &OperatorProgram, name: &str) -> Result<usize, String> {
 /// The library explanation of the split native language model `native` (`run_check::split_sites`)
 /// with its `layers` (`run_check::layer_nodes`), at its starting point (module note).
 pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Explanation, String> {
+    explanation_with(native, layers, &BTreeMap::new())
+}
+
+/// [`explanation`] with the MLPs of the layers in `transcoders` replaced by the transcoder features
+/// each one's kept file holds (`library_transcoder::mlp`): a function `relu(g·x + c) u` per kept
+/// feature, `M`'s own MLP functions in every other layer.
+pub fn explanation_with(native: &OperatorProgram, layers: &[LayerNodes], transcoders: &BTreeMap<usize, std::path::PathBuf>) -> Result<Explanation, String> {
     let mut artifact = Artifact::native(native)?;
     let mut planes = Vec::new();
     let mut owners = Vec::new();
@@ -623,6 +630,12 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes]) -> Result<Ex
             }
         }
         planes.extend(groups.into_iter().map(|(_, _, shared, heads, pairs, values)| (l, shared, heads, pairs, values)));
+        if let Some(kept) = transcoders.get(&l) {
+            let (built, more) = crate::library_transcoder::mlp(native, artifact, layer, l, kept)?;
+            artifact = built;
+            owners.extend(more);
+            continue;
+        }
         if let Node::Hadamard { left, right } = native.nodes[layer.active] {
             let (built, more) = gated_mlp(native, artifact, layer, l, left, right)?;
             artifact = built;

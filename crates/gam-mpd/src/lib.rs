@@ -58,6 +58,8 @@ pub mod library_crossing;
 pub mod library_compensation;
 // The removal search: groups without effect first, then units ranked by their predicted change of F.
 pub mod library_removal;
+// Transcoder features as the library's MLP functions: relu(g·x + c) u per feature that fires.
+pub mod library_transcoder;
 // Its posterior resident on the device: sample, Adam step and group divergences without transfers.
 pub mod device_posterior;
 

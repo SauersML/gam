@@ -431,8 +431,12 @@ pub(crate) fn reads_of(native: &OperatorProgram, start: &crate::artifact::Artifa
     for owner in start.owners.iter().filter(|o| READS.contains(&o.role.as_str())) {
         owners.entry(owner.operator.as_str()).or_default().push(owner);
     }
+    // Library operators whose read owners are not operators of `M` (a transcoder's features,
+    // `library_transcoder`): their read variables have no value in `M` to patch.
+    let foreign: std::collections::HashSet<&str> = start.owners.iter().filter(|o| READS.contains(&o.role.as_str()) && !named.contains_key(o.native.as_str())).map(|o| o.operator.as_str()).collect();
     library_reads(program, blocks)?
         .into_iter()
+        .filter(|v| !v.parts.iter().all(|(op, _)| foreign.contains(program.operators[*op].name.as_str())))
         .map(|v| {
             let mut parts: Vec<(usize, Range<usize>)> = Vec::new();
             for (op, rows) in &v.parts {
