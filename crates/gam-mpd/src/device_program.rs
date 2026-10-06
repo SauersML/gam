@@ -1483,7 +1483,7 @@ impl DeviceProgram {
                     value(out)
                 }
                 Step::Hadamard { left, right } => {
-                    let mut out = d.zeros(rows, width).map_err(error)?;
+                    let mut out = d.empty(rows, width).map_err(error)?;
                     d.hadamard(&mut out, trace.value(*left)?, trace.value(*right)?, false).map_err(error)?;
                     value(out)
                 }
@@ -1657,7 +1657,7 @@ impl DeviceProgram {
     fn attention(&self, trace: &DeviceTrace, q: &Tensor, k: &Tensor, scale: f64, causal: bool) -> Result<Tensor, String> {
         let d = &self.device;
         let length = trace.rows / trace.blocks;
-        let mut scores = d.zeros(trace.rows, length).map_err(error)?;
+        let mut scores = d.empty(trace.rows, length).map_err(error)?;
         d.gemm_batched(trace.blocks, &mut scores, scale, q, Op::N, k, Op::T, 0.0, self.arithmetic).map_err(error)?;
         d.softmax_rows(&mut scores, causal).map_err(error)?;
         Ok(scores)
@@ -1984,13 +1984,13 @@ impl DeviceProgram {
                             || (needed[n] && !matches!(self.steps[n], Step::Raw { .. } | Step::Constant { .. }))
                     };
                     if wanted(*left) {
-                        let mut gl = d.zeros(trace.rows, self.widths[*left]).map_err(error)?;
+                        let mut gl = d.empty(trace.rows, self.widths[*left]).map_err(error)?;
                         d.hadamard(&mut gl, &cot, trace.value(*right)?, false)
                             .map_err(error)?;
                         add(&mut g, *left, gl)?;
                     }
                     if wanted(*right) {
-                        let mut gr = d.zeros(trace.rows, self.widths[*right]).map_err(error)?;
+                        let mut gr = d.empty(trace.rows, self.widths[*right]).map_err(error)?;
                         d.hadamard(&mut gr, &cot, trace.value(*left)?, false)
                             .map_err(error)?;
                         add(&mut g, *right, gr)?;
@@ -2343,15 +2343,15 @@ impl DeviceProgram {
         let alpha = self.attention(trace, &q, &k, scale, causal)?;
         let v = trace.value(value)?;
         let length = trace.rows / blocks;
-        let mut dalpha = d.zeros(trace.rows, length).map_err(error)?;
+        let mut dalpha = d.empty(trace.rows, length).map_err(error)?;
         d.gemm_batched(blocks, &mut dalpha, 1.0, cot, Op::N, v, Op::T, 0.0, arithmetic).map_err(error)?;
-        let mut gv = d.zeros(trace.rows, v.cols()).map_err(error)?;
+        let mut gv = d.empty(trace.rows, v.cols()).map_err(error)?;
         d.gemm_batched(blocks, &mut gv, 1.0, &alpha, Op::T, cot, Op::N, 0.0, arithmetic).map_err(error)?;
         let ds = d.softmax_backward(&alpha, &dalpha).map_err(error)?;
         drop((alpha, dalpha));
-        let mut gq = d.zeros(trace.rows, q.cols()).map_err(error)?;
+        let mut gq = d.empty(trace.rows, q.cols()).map_err(error)?;
         d.gemm_batched(blocks, &mut gq, scale, &ds, Op::N, &k, Op::N, 0.0, arithmetic).map_err(error)?;
-        let mut gk = d.zeros(trace.rows, k.cols()).map_err(error)?;
+        let mut gk = d.empty(trace.rows, k.cols()).map_err(error)?;
         d.gemm_batched(blocks, &mut gk, scale, &ds, Op::T, &q, Op::N, 0.0, arithmetic).map_err(error)?;
         let (gq, gk) = match rotary {
             None => (gq, gk),
@@ -2511,7 +2511,7 @@ impl DeviceProgram {
         }
         let dalpha = d.softmax_backward(&alpha, &ds).map_err(error)?;
         let v = trace.value(value)?;
-        let mut out = d.zeros(trace.rows, v.cols()).map_err(error)?;
+        let mut out = d.empty(trace.rows, v.cols()).map_err(error)?;
         d.gemm_batched(blocks, &mut out, 1.0, &dalpha, Op::N, v, Op::N, 0.0, arithmetic).map_err(error)?;
         if let Some(dvv) = dv[value].as_ref() {
             d.gemm_batched(blocks, &mut out, 1.0, &alpha, Op::N, dvv, Op::N, 1.0, arithmetic).map_err(error)?;

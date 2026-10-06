@@ -362,7 +362,7 @@ fn split(d: &Device, heads: &Heads, (qk, p): (&Tensor, &Tensor), (first, n): (us
 /// The weights `softmax(c q kᵀ)` of `batch` (sequence, key head) blocks.
 fn weights(d: &Device, heads: &Heads, (q, k): (&Tensor, &Tensor), batch: usize, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
     let length = k.rows() / batch;
-    let mut scores = d.zeros(q.rows(), length)?;
+    let mut scores = d.empty(q.rows(), length)?;
     d.gemm_batched(batch, &mut scores, heads.scale, q, Op::N, k, Op::T, 0.0, arithmetic)?;
     d.softmax_rows(&mut scores, heads.causal)?;
     Ok(scores)
@@ -370,7 +370,7 @@ fn weights(d: &Device, heads: &Heads, (q, k): (&Tensor, &Tensor), batch: usize, 
 
 /// `P = x Wᵀ` plus the stacked biases, `x` the input's value (module note).
 pub(crate) fn project(d: &Device, heads: &Heads, stacked: &Stacked, x: &Tensor, arithmetic: Arithmetic) -> Result<Tensor, GpuError> {
-    let mut p = d.zeros(x.rows(), heads.columns())?;
+    let mut p = d.empty(x.rows(), heads.columns())?;
     d.gemm(&mut p, 1.0, x, Op::N, &stacked.weights, Op::T, 0.0, arithmetic)?;
     if let Some(b) = &stacked.biases {
         d.add_row(&mut p, 1.0, b)?;
@@ -392,7 +392,7 @@ pub(crate) fn normalize(d: &Device, heads: &Heads, p: &Tensor, epsilon: f64) -> 
 /// `G`, `N` times every query's and key's gain.
 pub(crate) fn gain(d: &Device, stacked: &Stacked, n: &Tensor) -> Result<Tensor, GpuError> {
     let gains = stacked.gains.as_ref().ok_or_else(|| GpuError::DriverCallFailed { reason: "head norms without gains".into() })?;
-    let mut g = d.zeros(n.rows(), n.cols())?;
+    let mut g = d.empty(n.rows(), n.cols())?;
     d.scale_columns(&mut g, n, gains, false)?;
     Ok(g)
 }
@@ -411,7 +411,7 @@ fn attend_by(d: &Device, heads: &Heads, (qk, p): (&Tensor, &Tensor), blocks: usi
         let n = step.min(heads.keys - first);
         let (q, k, v) = split(d, heads, (qk, p), (first, n), blocks, turn)?;
         let alpha = weights(d, heads, (&q, &k), blocks * n, arithmetic)?;
-        let mut out = d.zeros(q.rows(), heads.width)?;
+        let mut out = d.empty(q.rows(), heads.width)?;
         d.gemm_batched(blocks * n, &mut out, 1.0, &alpha, Op::N, &v, Op::N, 0.0, arithmetic)?;
         d.merge_heads(&out, &mut a, first * heads.group() * heads.width, n * heads.group(), blocks, None, false)?;
     }
@@ -458,15 +458,15 @@ fn backward_by(
         let (q, k, v) = split(d, heads, (qk, p), (first, n), blocks, turn)?;
         let cot = d.split_heads(g_a, first * g * w, n * g, w, blocks, None, false)?;
         let alpha = weights(d, heads, (&q, &k), batch, forward)?;
-        let mut dalpha = d.zeros(alpha.rows(), alpha.cols())?;
+        let mut dalpha = d.empty(alpha.rows(), alpha.cols())?;
         d.gemm_batched(batch, &mut dalpha, 1.0, &cot, Op::N, &v, Op::T, 0.0, arithmetic)?;
-        let mut gv = d.zeros(v.rows(), w)?;
+        let mut gv = d.empty(v.rows(), w)?;
         d.gemm_batched(batch, &mut gv, 1.0, &alpha, Op::T, &cot, Op::N, 0.0, arithmetic)?;
         let ds = d.softmax_backward(&alpha, &dalpha)?;
         drop((alpha, dalpha));
-        let mut gq = d.zeros(q.rows(), w)?;
+        let mut gq = d.empty(q.rows(), w)?;
         d.gemm_batched(batch, &mut gq, heads.scale, &ds, Op::N, &k, Op::N, 0.0, arithmetic)?;
-        let mut gk = d.zeros(k.rows(), w)?;
+        let mut gk = d.empty(k.rows(), w)?;
         d.gemm_batched(batch, &mut gk, heads.scale, &ds, Op::T, &q, Op::N, 0.0, arithmetic)?;
         let target = g_g.as_mut().unwrap_or(&mut g_p);
         d.merge_heads(&gq, target, first * g * w, n * g, blocks, turn, true)?;
@@ -474,7 +474,7 @@ fn backward_by(
         d.merge_heads(&gv, &mut g_p, (heads.heads + heads.keys + first) * w, n, blocks, None, false)?;
     }
     if let (Some(g_g), Some(norms), Some(gains)) = (g_g, &heads.norms, &stacked.gains) {
-        let mut g_n = d.zeros(rows, heads.normed_columns())?;
+        let mut g_n = d.empty(rows, heads.normed_columns())?;
         d.scale_columns(&mut g_n, &g_g, gains, false)?;
         let per_head = rows * (heads.heads + heads.keys);
         let g_qk = d.rms_norm_backward(&queries_and_keys(d, heads, p, true)?, &g_n.reshape(per_head, w)?, norms.epsilon)?;
