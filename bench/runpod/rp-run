@@ -2152,8 +2152,11 @@ setup() {
     local started=$(date +%s) x pkg flags build=() cached=() jobs=()
     # Every step checks its own status: `set -e` does not act inside the condition this runs in. A
     # step that fails on the connection (ssh's 255) loses the pod; any other failure ends the run.
-    # The source first: the data builds run its scripts.
-    # From GitHub at datacenter speed (the commit is published); the Mac's archive if that fails.
+    # The published inputs need nothing else: they start at once. Then the source, which the data
+    # builds and the Python environment need: from GitHub at datacenter speed (the commit is
+    # published), the Mac's archive if that fails.
+    rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
+    fetch_published & jobs+=($!)
     local members
     members=$(printf "gam-$C/%s " crates Cargo.toml Cargo.lock rust-toolchain.toml src build.rs bench/cargo_benches docs/rust-library-surface.md "${srcpaths[@]}")
     if on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && curl -fsSL --retry 3 https://codeload.github.com/SauersML/gam/tar.gz/$C |
@@ -2164,9 +2167,7 @@ setup() {
         gzip -1 | on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && gzip -dc | tar -x -C $WS/src" || return 1
     fi
     # Inputs, data, models and rsync (for syncing outputs) arrive while the toolchain and builds do.
-    rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
     { upload_inputs && build_pile; } & jobs+=($!)
-    fetch_published & jobs+=($!)
     build_fineweb & jobs+=($!)
     fetch_models & jobs+=($!)
     python_env & jobs+=($!)
