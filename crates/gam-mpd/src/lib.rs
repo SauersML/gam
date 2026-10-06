@@ -91,6 +91,8 @@ pub mod native_control;
 // Interchange experiments of causal abstraction on the device: cuts, read and complement patches.
 pub mod interchange;
 pub mod explanation_battery;
+// VPD's MLP subcomponents as parts that edits act on.
+pub mod vpd_parts;
 #[cfg(test)]
 mod interchange_tests;
 
