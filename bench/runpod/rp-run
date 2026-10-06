@@ -1494,7 +1494,7 @@ TMP=$(mktemp -d /tmp/rp-run.XXXXXX)
 ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$TMP/key"
 chmod 600 "$TMP/key"
 KEYS="$( [ -f "$TMP/key.pub" ] && cat "$TMP/key.pub")"$'\n'"$(cat ~/.ssh/runpod_ed25519.pub)"
-POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0 GUEST=0 EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" PROBE_A="" PROBE_T=0 POD_HOST=""
+POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0 GUEST=0 EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" PROBE_A="" MED_RATE="" POD_HOST=""
 SSH=(ssh -F none -i "$TMP/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ForwardX11=no
      -o UserKnownHostsFile="$TMP/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20
      -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o LogLevel=ERROR)
@@ -1655,7 +1655,8 @@ reach() {
             [ -n "$PORT" ] || IP=""
             [ -n "$IP" ] && jq 'del(.env)' <<< "$b" >> "$OUT/pod.json"
         fi
-        [ -n "$IP" ] || sleep 5
+        # Every 2 s: the address appears 8-56 s after creation, and each second waited is paid.
+        [ -n "$IP" ] || sleep 2
     done
     # An address whose pods never answered SSH (two hosts behind 80.15.7.37 each held a GPU for
     # 300 s) is left at once.
@@ -1685,8 +1686,8 @@ reach() {
     fi
     on_pod 'S=$(command -v sudo || true); command -v rsync > /dev/null || { $S apt-get update -qq && $S apt-get install -y -qq rsync; } > /dev/null 2>&1' < /dev/null & EARLY_RSYNC=$!
     on_pod "mkdir -p $WS && for i in 1 2 3 4 5; do nvidia-smi --query-gpu=utilization.gpu,memory.free,power.limit,power.default_limit --format=csv,noheader,nounits | head -n 1; sleep 1; done > $WS/.gpu-probe.part; mv $WS/.gpu-probe.part $WS/.gpu-probe" < /dev/null > /dev/null 2>&1 &
-    # The first sample of the host's receive rate (fetch_too_slow takes the second after the checks).
-    PROBE_A="" PROBE_T=$(date +%s)
+    # The first sample of the host's receive rate (fetch_too_slow takes the next after the checks).
+    PROBE_A=""
     [ -z "$EARLY_FETCH" ] || PROBE_A=$(probe_bytes) || PROBE_A=""
 }
 
@@ -1989,6 +1990,18 @@ f.write(np.frombuffer(sys.stdin.buffer.read(), dtype="<f4").astype("<f8").tobyte
 upload_inputs() {
     [ ${#files[@]} -gt 0 ] || return 0
     local streams=8 started=$(date +%s) share f size i k piece best total=0 parts=() narrow="" saved=0 py=$MAC_DATA/venv/bin/python
+    # Under SMALL_UPLOAD bytes in all: one tar over the shared connection. Eight new connections
+    # took 4 s to send two files of 0 MB (fitperf-phases-n2048); the Mac sends 1.5-3 MB/s on one
+    # connection, so below 8 MB one stream finishes within that.
+    for f in "${files[@]}"; do total=$(( total + $(stat -L -f %z "$MAC_DATA/$f") )); done
+    if (( total < SMALL_UPLOAD )); then
+        COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C "$MAC_DATA" -chf - "${files[@]}" | gzip -1 |
+            on_pod "mkdir -p $WS/mpd-data && gzip -dc | tar -x -C $WS/mpd-data" || return 1
+        echo $(( $(date +%s) - started )) >> "$TMP/upload_s"
+        say "uploaded ${#files[@]} files, $(( total >> 10 )) KB, in $(( $(date +%s) - started )) s over the shared connection"
+        return 0
+    fi
+    total=0
     # The float64 files that go up as float32, with their sha256s.
     if [ -x "$py" ]; then
         narrow=$(cd "$MAC_DATA" && printf '%s\n' "${files[@]}" | grep '[.]f64$' | xargs "$py" -c "$NARROW_CHECK" "" 2> /dev/null || true)
@@ -2072,7 +2085,7 @@ upload_inputs() {
 # at a time, a file over FETCH_PIECE bytes in byte ranges of that size written in place. From a
 # datacenter (a GitHub Actions runner) one connection fetched a 2.0 GB asset in 25 s, eight ranges
 # written in place in 6.5 to 8.7 s.
-FETCH_PIECE=$(( 128 << 20 ))
+FETCH_PIECE=$(( 128 << 20 )) SMALL_UPLOAD=$(( 8 << 20 ))
 fetch_published() {
     [ ${#fetched[@]} -gt 0 ] || return 0
     local started=$(date +%s) sums asset sha f to size k jobs="" total=0 widen=""
@@ -2135,34 +2148,43 @@ slow_host() {  # HOST
 }
 
 # Whether the inputs still downloading on this new pod would take longer to finish than a new pod
-# takes to boot and fetch them all (slow_host's rule, at the rate measured now): the bytes the pod
-# received from SSH (reach's sample) through the checks, at least PROBE_S seconds. The rate is
-# recorded for slow_host. vpd-pricing-n2048's host fetched 2.8 GB at 8.4 MB/s (329 s) where the
+# takes to boot and fetch them all (slow_host's rule, at the rate measured now). The rate is the
+# bytes the pod received from SSH (reach's sample) through the checks; it counts the download's
+# start-up, so it understates the rate, and a host it clears is cleared. A host it does not clear is
+# measured again over PROBE_S seconds of the running download and judged on that. The rate judged
+# is recorded for slow_host. vpd-pricing-n2048's host fetched 2.8 GB at 8.4 MB/s (329 s) where the
 # median host took 55 s.
 PROBE_S=3
-# The pod's bytes in its run's inputs (KB) and its bytes received on every interface but lo: the
-# host's download rate, which a Python environment installing at the same time shares.
+# The pod's bytes in its run's inputs (KB), its bytes received on every interface but lo (the
+# host's download rate, which a Python environment installing at the same time shares), and its
+# clock (s).
 probe_bytes() {
-    on_pod "du -sk $WS/mpd-data 2> /dev/null | cut -f1; cat /proc/net/dev" < /dev/null |
-        awk 'NR == 1 { d = $1; next } /:/ { sub(/^ +/, ""); split($0, a, /: */); split(a[2], f, / +/); if (a[1] != "lo") s += f[1] } END { print d + 0, s + 0 }'
+    on_pod "du -sk $WS/mpd-data 2> /dev/null | cut -f1; date +%s.%N; cat /proc/net/dev" < /dev/null |
+        awk 'NR == 1 { d = $1; next } NR == 2 { t = $1; next } /:/ { sub(/^ +/, ""); split($0, a, /: */); split(a[2], f, / +/); if (a[1] != "lo") s += f[1] } END { print d + 0, s + 0, t + 0 }'
+}
+# Exit 0 when samples A and B (probe_bytes lines) show the inputs left would take longer than a new
+# pod; prints the rate (MB/s).
+too_slow() {  # A B
+    awk -v a="$1" -v b="$2" -v total="$FETCH_BYTES" -v m="$MED_RATE" -v d="$DISCARD_S" 'BEGIN {
+        split(a, x, " "); split(b, y, " ")
+        r = (y[3] > x[3] && y[2] > x[2]) ? (y[2] - x[2]) / 1048576 / (y[3] - x[3]) : 0
+        printf "%.1f\n", r
+        mb = total / 1048576; rest = mb - y[1] / 1024
+        exit !(r > 0 && rest > 0 && rest / r > d + mb / m) }'
 }
 fetch_too_slow() {
-    local med a=$PROBE_A b t rate
-    [ -n "$EARLY_FETCH" ] && kill -0 "$EARLY_FETCH" 2> /dev/null && (( FETCH_BYTES > FETCH_PIECE )) || return 1
-    med=$(cut -f3 "$RP/host_rates.tsv" 2> /dev/null | sort -n | awk '{ a[NR] = $1 } END { if (NR >= 3) print a[int((NR + 1) / 2)] }')
-    [ -n "$med" ] || return 1
-    [ -n "$a" ] || return 1
-    t=$(( $(date +%s) - PROBE_T ))
-    (( t >= PROBE_S )) || { sleep $(( PROBE_S - t )); t=$PROBE_S; }
-    kill -0 "$EARLY_FETCH" 2> /dev/null || return 1
+    local b c rate
+    [ -n "$EARLY_FETCH" ] && kill -0 "$EARLY_FETCH" 2> /dev/null && (( FETCH_BYTES > FETCH_PIECE )) && [ -n "$PROBE_A" ] || return 1
+    MED_RATE=$(cut -f3 "$RP/host_rates.tsv" 2> /dev/null | sort -n | awk '{ a[NR] = $1 } END { if (NR >= 3) print a[int((NR + 1) / 2)] }')
+    [ -n "$MED_RATE" ] || return 1
     b=$(probe_bytes) || return 1
-    t=$(( $(date +%s) - PROBE_T ))
-    rate=$(awk -v a="$a" -v b="$b" -v t="$t" 'BEGIN { split(a, x, " "); split(b, y, " "); printf "%.1f", (y[2] - x[2]) / 1048576 / t }')
-    awk -v b="$b" -v total="$FETCH_BYTES" -v r="$rate" -v m="$med" -v d="$DISCARD_S" \
-        'BEGIN { split(b, y, " "); mb = total / 1048576; rest = mb - y[1] / 1024; exit !(rest > 0 && r > 0 && rest / r > d + mb / m) }' || return 1
+    too_slow "$PROBE_A" "$b" > /dev/null || return 1
+    sleep "$PROBE_S"
+    kill -0 "$EARLY_FETCH" 2> /dev/null || return 1
+    c=$(probe_bytes) || return 1
+    rate=$(too_slow "$b" "$c") || return 1
     [ -z "$POD_HOST" ] || printf '%s\t%s\t%s\n' "$(date '+%F %T')" "$POD_HOST" "$rate" >> "$RP/host_rates.tsv"
-    say "host ${POD_HOST:-?} receives $rate MB/s: the $(( FETCH_BYTES >> 20 )) MB of inputs would take longer than a new pod ($DISCARD_S s) at the median host's $med MB/s; recorded"
-    return 0
+    say "host ${POD_HOST:-?} receives $rate MB/s: the $(( FETCH_BYTES >> 20 )) MB of inputs would take longer than a new pod ($DISCARD_S s) at the median host's $MED_RATE MB/s; recorded"
 }
 
 fetch_models() {
