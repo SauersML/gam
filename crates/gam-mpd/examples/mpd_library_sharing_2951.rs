@@ -4,8 +4,19 @@
 //! EXPORT SETTINGS.json FROM OUT host|gpu K
 //!
 //! SETTINGS.json is the library fit's (`mpd_library_mdl_2951`). FROM is `native` (the library's
-//! start at `M`), `artifact:PATH` (a fit's posterior-mean artifact) or `checkpoint:PATH` (a fit's
-//! checkpoint: its means, standard deviations and removed groups). The library is fitted with the
+//! start at `M`), `artifact:PATH` (a fit's posterior-mean artifact), `checkpoint:PATH` (a fit's
+//! checkpoint: its means, standard deviations and removed groups) or `start:PATH`.
+//!
+//! With `start:PATH` the driver runs one arm of a paired comparison: the fit continues the
+//! checkpoint at PATH exactly (its posterior, optimizer state, rotations, removals and epoch,
+//! `library_mdl::checkpoint_start`) with the mixture prior of `K` candidates per target for the
+//! settings' budget of epochs (`fit.epochs`), on the same batches and weight noise as every other
+//! arm of that checkpoint. `K = 0` is the control: no target keeps a candidate, so the prior is the
+//! groups' Gaussian alone, through the same code. OUT/REPORT.json holds the arm's fit,
+//! OUT/PROPOSAL.json what the mixture keeps and the dominant components predicted to lower `F`
+//! when made exact, counted by kind, and OUT/SUMMARY.json `F` per epoch and held out.
+//!
+//! Otherwise: The library is fitted with the
 //! mixture prior over its parameter blocks (each MLP function's gate, up and output vectors, each
 //! key-value group's query–key maps and value map; at most `K` candidates per target; OUT/soft);
 //! every candidate holding more than half of its target's weight whose equality is predicted to
@@ -39,6 +50,67 @@ struct Settings {
 
 fn save(path: &Path, value: &Value) -> Result<(), String> {
     std::fs::write(path, serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+/// The kind of sharing a component of `target` would make exact: a tie of a read to an earlier
+/// write, read or token row, of a write to an earlier write, or a shared query–key function or
+/// value map.
+fn sharing_kind(target: library_mixture::Kind, write: library_mixture::Write) -> &'static str {
+    use library_mixture::{Kind, Write};
+    match (target, write) {
+        (Kind::Gate { .. }, Write::Output { .. }) => "tie: read of an earlier write",
+        (Kind::Gate { .. } | Kind::Up { .. }, Write::Gate { .. } | Write::Up { .. }) => "tie: read of an earlier read",
+        (Kind::Gate { .. } | Kind::Up { .. }, Write::Token(_)) => "tie: read of a token's embedding",
+        (Kind::Output { .. }, _) => "tie: write of an earlier write",
+        (Kind::QueryKey { .. }, _) => "shared query-key function",
+        (Kind::Value { .. }, _) => "shared value map",
+        (Kind::Gate { .. } | Kind::Up { .. }, _) => "tie: read of an earlier write",
+    }
+}
+
+/// One arm of a paired comparison from a checkpoint (module note).
+fn arm(device: &Device, (native, start): (&gam_mpd::operator_program::OperatorProgram, &library_mdl::Explanation), (train, held_out): (&[Vec<u32>], &[Vec<u32>]), settings: &Settings, (checkpoint, out, width): (&Path, &Path, usize)) -> Result<(), String> {
+    let fit = &settings.fit;
+    if fit.epochs.is_none() {
+        return Err("a paired arm needs the settings' budget of epochs (fit.epochs)".into());
+    }
+    let begin = library_mdl::checkpoint_start(start, checkpoint)?;
+    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    let steps = library_mixture::Steps { rate: 0.05, beta1: fit.beta1, beta2: 0.999, epsilon: 1e-8 };
+    let mut mixture = library_mixture::Mixture::new(start, width, steps)?;
+    let fitted = library_mdl::fit_from(device, native, start, train, held_out, fit, &settings.export_sha256, Some(&out.join("checkpoint.bin")), Some(&mut mixture), Some(begin))?;
+    save(&out.join("REPORT.json"), &serde_json::to_value(&fitted.report).map_err(|e| e.to_string())?)?;
+    let mut kept: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for target in &mixture.targets {
+        for component in &target.components {
+            *kept.entry(sharing_kind(target.kind, component.write)).or_default() += 1;
+        }
+    }
+    let proposals = mixture.proposals(&fitted.posterior)?;
+    let mut exact: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let listed: Vec<Value> = proposals
+        .iter()
+        .map(|(t, j, saving)| {
+            let target = &mixture.targets[*t];
+            *exact.entry(sharing_kind(target.kind, target.components[*j].write)).or_default() += 1;
+            json!({"target": target.kind, "candidate": target.components[*j].write, "scale": target.components[*j].scale, "weights": target.weights().unwrap_or_default(), "choices": target.choices, "predicted_saving_bits": saving / std::f64::consts::LN_2})
+        })
+        .collect();
+    save(&out.join("PROPOSAL.json"), &json!({"targets": mixture.targets.len(), "kept_by_kind": kept, "exact_by_kind": exact, "exact": listed}))?;
+    let epochs: Vec<Value> = fitted.report.epochs.iter().map(|e| json!({"epoch": e.epoch, "objective_bits": e.objective_bits, "data_bits": e.data_bits, "description_bits": e.description_bits, "held_out_objective_bits_per_token": e.held_out.objective_bits_per_token})).collect();
+    let summary = json!({
+        "export_sha256": settings.export_sha256,
+        "from": format!("start:{}", checkpoint.display()),
+        "candidates": width,
+        "objective_bits": fitted.report.objective_bits,
+        "start": &fitted.report.start,
+        "end": &fitted.report.end,
+        "epochs": epochs,
+        "kept_by_kind": kept,
+        "exact_by_kind": exact,
+    });
+    log::info!("sharing arm summary: {summary}");
+    save(&out.join("SUMMARY.json"), &summary)
 }
 
 fn main() -> Result<(), String> {
@@ -77,6 +149,9 @@ fn main() -> Result<(), String> {
         return Err("the export holds fewer training sequences than asked for".into());
     }
     let start = library_mdl::explanation(&native, &layers)?;
+    if let Some(path) = from.strip_prefix("start:") {
+        return arm(&device, (&native, &start), (&train, held_out), &settings, (Path::new(path), out, width));
+    }
     let base = match from.split_once(':') {
         None if from == "native" => start,
         Some(("artifact", path)) => library_sharing::warm(&start, &Artifact::from_bytes(&std::fs::read(path).map_err(|e| e.to_string())?, &native.declarations)?)?,

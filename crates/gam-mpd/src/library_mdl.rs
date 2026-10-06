@@ -1294,6 +1294,10 @@ pub struct Settings {
     /// place of the step `α` (`DevicePosterior::line_step`).
     #[serde(default)]
     pub line_search: bool,
+    /// When set, the fit ends once its epoch count (counted from `M`, a start's epochs included)
+    /// reaches this, with no removal round: a comparison of arms at one budget of steps.
+    #[serde(default)]
+    pub epochs: Option<usize>,
 }
 
 impl Settings {
@@ -2990,13 +2994,16 @@ pub fn fit_from(
         progress.epochs.push(record);
         progress.previous = Some(estimates);
         progress.epoch += 1;
+        let budget = settings.epochs.is_some_and(|last| progress.epoch >= last);
         // The descent stops at the first epoch whose mean improvement over the last, paired batch
         // by batch, is not positive, and the removal round starts from the best epoch's
         // posterior (the lowest mean per-batch estimate since the objective last changed).
         if best.as_ref().is_none_or(|(b, _)| mean_estimate < *b) {
             best = Some((mean_estimate, posterior.clone()));
         }
-        if improvement.is_some_and(|i| i <= 0.0) {
+        if budget {
+            progress.done = true;
+        } else if improvement.is_some_and(|i| i <= 0.0) {
             if let Some((bits, kept)) = best.take() {
                 log::info!("library fit stops after epoch {epoch}: back to the best epoch's posterior ({:.6e} bits)", bits / LN_2);
                 posterior = kept;
@@ -3017,7 +3024,8 @@ pub fn fit_from(
         progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
         save(&mut progress, &posterior, &device_posterior, &mut writer)?;
     }
-    let objective_bits = progress.removals.last().map_or(f64::NAN, |r| r.after_bits);
+    // A fit ended by its budget of epochs has no removal round: its last epoch's estimate.
+    let objective_bits = progress.removals.last().map(|r| r.after_bits).or_else(|| settings.epochs.and(progress.epochs.last()).map(|e| e.objective_bits)).unwrap_or(f64::NAN);
     let end = held_out(&mut scorer, explanation, (&posterior, &device_posterior), held, settings, tokens, prior.as_deref_mut())?;
     log::info!("library end: {end:?}");
     writer.wait()?;
@@ -3727,6 +3735,7 @@ mod tests {
             split_filter: false,
             deterministic: false,
             line_search: false,
+            epochs: None,
         }
     }
 

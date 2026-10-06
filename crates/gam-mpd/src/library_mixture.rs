@@ -766,6 +766,13 @@ impl Mixture {
     /// scored `d` at a time, so the scores held at once are no larger than the gate operator.
     pub fn choose(&mut self, explanation: &Explanation, posterior: &Posterior) -> Result<(), String> {
         use rayon::prelude::*;
+        // No candidates: every target keeps the groups' Gaussian prior alone (a control arm).
+        if self.width == 0 {
+            for target in &mut self.targets {
+                target.components.clear();
+            }
+            return Ok(());
+        }
         // MLP blocks: per layer and kind, the targets' posterior rows against every candidate, `d`
         // candidates at a time.
         let d = self.embedding.nrows();
@@ -2368,7 +2375,7 @@ mod tests {
             let values = program.operators[from].matrix();
             replace(program, to, values);
         }
-        let settings = Settings { batch_sequences: 2, rate: 0.1, beta1: 0.9, seed: 3, numeric_bytes: 1 << 26, head_tile_rows: 64, trust_rate: false, split_filter: false, deterministic: false, line_search: false };
+        let settings = Settings { batch_sequences: 2, rate: 0.1, beta1: 0.9, seed: 3, numeric_bytes: 1 << 26, head_tile_rows: 64, trust_rate: false, split_filter: false, deterministic: false, line_search: false, epochs: None };
         let mut mixture = Mixture::new(&start, 2, Steps { rate: 0.05, beta1: 0.9, beta2: 0.999, epsilon: 1e-8 }).unwrap();
         let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("tokens") };
         let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
