@@ -744,7 +744,41 @@ approved() {
     return 1
 }
 
+# Orphans: RUNNING pods named mpd2951- that rp-run created (REGISTRY), up more than 10 minutes,
+# that no live run holds (no record in active/, or a record whose run and packed runs have all
+# ended). Each is deleted and entered in the ledger (end "orphaned"). Every invocation but a
+# watcher's sweeps once, before it makes any pod of its own: at 13:40 10-06 a pod whose runner had
+# dropped its record ran on unheld for 40 minutes at $0.74/h.
+sweep_orphans() {
+    local r id name created price gpu start now rec hours dollars
+    r=$(api GET "$REST/pods?includeMachine=true" 2> /dev/null) || return 0
+    [ "$(status_of "$r")" = 200 ] || return 0
+    now=$(date +%s)
+    while IFS=$'\t' read -r id name created price gpu; do
+        [ -n "$id" ] && [[ $name == mpd2951-* ]] && registered "$id" || continue
+        start=$(date -j -u -f '%Y-%m-%d %H:%M:%S' "${created:0:19}" +%s 2> /dev/null) || continue
+        (( now - start > 600 )) || continue
+        rec=$ACTIVE/$id
+        if [ -f "$rec" ]; then
+            [ -z "$(holders "$id")" ] || continue
+            echo "rp-run: ORPHAN pod $id (${name#mpd2951-}) is ours and no live run holds it; deleting it" >&2
+            echo orphaned > "$ACTIVE/.$id.end"
+            reap "$id" cap || true
+        else
+            echo "rp-run: ORPHAN pod $id (${name#mpd2951-}) is ours with no record and no run, up $(( (now - start) / 60 )) minutes; deleting it" >&2
+            api DELETE "$REST/pods/$id" > /dev/null 2>&1 || continue
+            hours=$(awk -v a="$start" -v b="$(date +%s)" 'BEGIN { printf "%.4f", (b - a) / 3600 }')
+            dollars=$(awk -v h="$hours" -v p="$price" 'BEGIN { printf "%.4f", h * p }')
+            until mkdir "$RP/.ledger.lock" 2> /dev/null; do sleep 1; done
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\t-\t-\torphaned\t-\t-\n' "$(date '+%F %T')" "${name#mpd2951-}" "$gpu" - "$hours" "$dollars" "$id" >> "$LEDGER"
+            rmdir "$RP/.ledger.lock"
+        fi
+    done < <(jq -r '.[] | select(.desiredStatus == "RUNNING") | [.id, (.name // ""), (.createdAt // ""), (.costPerHr // 0), (.machine.gpuTypeId // .gpu.id // "?")] | @tsv' <<< "$(body_of "$r")" 2> /dev/null)
+    return 0
+}
+
 MODE=run
+[ "${1:-}" = --watch ] || sweep_orphans
 case ${1:-} in
     status)
         [ $# -eq 1 ] || usage
@@ -820,11 +854,13 @@ case ${1:-} in
             [ -n "$id" ] || continue
             rec=$ACTIVE/$id name=${pname#mpd2951-} owner="not ours" kind="" mode="" left=- last="" flag="" setup=- util=$(cat "$utils/$id" 2> /dev/null || true)
             [[ $pname == mpd2951-* ]] && registered "$id" && owner="ours, unheld"
+            if [ "$owner" = "ours, unheld" ] && [ ! -f "$rec" ]; then flag+="ORPHAN "; fi
             if [ -f "$rec" ]; then
                 read -r name _ kind _ c _ _ mode _ _ wait_s _ < "$rec"
                 # Seconds from the pod's creation to its command (counting, + , while it sets up).
                 if [ -n "${wait_s:-}" ]; then setup=${wait_s}s; else setup="$(( now - c ))s+"; (( now - c > SETUP_FAIL )) && flag+="SETUP "; fi
                 owner=$(cat "$ACTIVE/.$id.owner" 2> /dev/null || echo -)
+                if [ -z "$(holders "$id")" ]; then flag+="ORPHAN "; fi
                 [ -f "$ACTIVE/.$id.deadline" ] && left=$(awk -v d="$(cat "$ACTIVE/.$id.deadline")" -v n="$now" 'BEGIN { printf "%.1f", (d - n) / 3600 }')
                 for f in "$RP/$name/run.log" "$RP/$name/rp-run.log"; do
                     last=$(grep -v '^[[:space:]]*$' "$f" 2> /dev/null | tail -n 1 | cut -c1-90 || true)
