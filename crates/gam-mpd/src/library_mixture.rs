@@ -605,6 +605,17 @@ impl Mixture {
         gauge as f64 * 64.0 * std::f64::consts::LN_2 + if component.assignment.len() > 1 { ln_gamma(component.assignment.len() as f64 + 1.0) } else { 0.0 }
     }
 
+    /// A candidate's divergence saving alone ([`Mixture::admit`]) at scale `c`, from the target's
+    /// means, variances and prior variances per entry and the candidate's mean vector and total
+    /// variance, with the best `s²`.
+    fn saving((mean, variance, v): (ArrayView1<'_, f64>, ArrayView1<'_, f64>, ArrayView1<'_, f64>), (u, u_variance): (ArrayView1<'_, f64>, f64), c: f64) -> (f64, f64) {
+        let second: Array1<f64> = &mean * &mean + &variance;
+        let base: f64 = second.iter().zip(&v).map(|(e, v)| e / (2.0 * v) - 0.5).sum::<f64>();
+        let residual = (&mean - &(&u * c)).mapv(|r| r * r).sum() + variance.sum() + c * c * u_variance;
+        let s2 = residual / mean.len() as f64;
+        (base + v.iter().map(|v| 0.5 * (v / s2).ln()).sum::<f64>(), s2)
+    }
+
     /// The candidates target `t` keeps (module note, # Candidates): each candidate's gain alone at
     /// `posterior`, `Σ_k [½ ln(v_k / s²) − ½ + E[g_k²] / (2 v_k)]` with `s² = E‖g − c u‖² / D`
     /// (the divergence it saves when its component takes the whole weight at the best `s²`), from
@@ -612,16 +623,10 @@ impl Mixture {
     /// candidate's mean vector and total variance; in decreasing gain, a candidate is kept while
     /// its gain exceeds what keeping it adds to the mixture's own code length.
     fn admit(&self, t: usize, posterior: &Posterior, (mean, variance, v): (ArrayView1<'_, f64>, ArrayView1<'_, f64>, ArrayView1<'_, f64>), candidates: Vec<(Choice, Array1<f64>, f64)>) -> Result<(Vec<Choice>, f64), String> {
-        let entries = mean.len() as f64;
-        let second: Array1<f64> = &mean * &mean + &variance;
-        let base: f64 = second.iter().zip(&v).map(|(e, v)| e / (2.0 * v) - 0.5).sum::<f64>();
         let mut gains: Vec<(f64, f64, Choice)> = candidates
             .into_iter()
             .map(|(choice, u, u_variance)| {
-                let c = choice.scale;
-                let residual = (&mean - &(&u * c)).mapv(|r| r * r).sum() + variance.sum() + c * c * u_variance;
-                let s2 = residual / entries;
-                let gain = base + v.iter().map(|v| 0.5 * (v / s2).ln()).sum::<f64>();
+                let (gain, s2) = Self::saving((mean, variance, v), (u.view(), u_variance), choice.scale);
                 (gain, s2, choice)
             })
             .filter(|(gain, s2, _)| gain.is_finite() && *s2 > 0.0)
@@ -1805,6 +1810,18 @@ mod tests {
         let weights = mixture.targets[t].weights().unwrap();
         assert!(weights[1 + copy] > 0.5, "the copy's weight dominates its mixture: {weights:?}");
         assert!(mixture.dominant(&posterior).unwrap().contains(&(t, copy)));
+        // The sampled term, once the copy holds the weight, is the closed-form saving it was kept
+        // for, negated.
+        let means = |i: usize| -> Result<&Array2<f64>, String> { Ok(&posterior.mean[i]) };
+        let deviations = |i: usize| -> Result<&Array2<f64>, String> { Ok(&posterior.log_sd[i]) };
+        let own = Write::Up { layer: 1, function: 6 };
+        let (mean, variance) = (mixture.vector(own, &means).unwrap().to_owned(), mixture.vector(own, &deviations).unwrap().mapv(|s| (2.0 * s).exp()));
+        let v = Array1::from_elem(mean.len(), group_variance(&mixture.cells[t], &posterior));
+        let (u, tau) = mixture.component_moments(t, copy, &posterior).unwrap();
+        let (saving, _) = Mixture::saving((mean.view(), variance.view(), v.view()), (u.view(), tau.sum()), mixture.targets[t].components[copy].scale);
+        let sampled = (0..400_u64).map(|key| mixture.target_term(t, &posterior, &draw(&mixture, &posterior, 1000 + key)).unwrap().unwrap().0).sum::<f64>() / 400.0;
+        let held = -weights[1 + copy].ln();
+        assert!((sampled + saving).abs() <= 0.05 * saving.abs() + held + 0.5, "sampled term {sampled} against the saving {saving}");
         // Of the dominant components only those whose equality saves code length are made exact.
         let hardened = mixture.harden(&start, &posterior).unwrap();
         let (before, after) = (start.artifact.execute(&imported.family).unwrap(), hardened.artifact.execute(&imported.family).unwrap());
