@@ -1279,11 +1279,6 @@ pub struct Settings {
     pub numeric_bytes: usize,
     /// Rows of vocabulary logits formed at once.
     pub head_tile_rows: usize,
-    /// `M` and `P` run on the fused decoder engines with f32 products (`Interchange::fuse`) in
-    /// place of the operator programs: the decoder's gate, its throughput against the programs' in
-    /// the same fit. The gate's outcome deletes one of the two engines and this field.
-    #[serde(default)]
-    pub decoder: bool,
     /// The A/B arms at `N = 2^16` (`DevicePosterior::set_arm`): the mean's move clamped to `±α σ`
     /// in place of `±σ`; the data momentum filtered alone with `δ μ` added exactly (98386f5d88's
     /// step); and every step's gradient taken at the iterate itself, with no weight noise, `σ` from
@@ -1645,10 +1640,6 @@ impl Scorer {
         let reads = interchange::reads(native, &sites)?;
         let mut experiments =
             Interchange::new(device, native, &sites, &explanation.artifact, &explanation.trainable, reads, settings.numeric_bytes, settings.head_tile_rows)?;
-        if settings.decoder {
-            let fused = experiments.fuse(gam_gpu::tensor::Arithmetic::F32)?;
-            log::info!("library engine: decoder (P fused: {fused})");
-        }
         // Every scoring of the fit (its steps, held-out evaluations and removal comparisons) is of
         // one fixed collection of experiments, so `M`'s targets are kept on the host while the
         // process's memory budget admits them.
@@ -3685,7 +3676,6 @@ mod tests {
             seed: 3,
             numeric_bytes: 1 << 26,
             head_tile_rows: 64,
-            decoder: false,
             trust_rate: false,
             split_filter: false,
             deterministic: false,

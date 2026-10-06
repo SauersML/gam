@@ -13,8 +13,8 @@
 //! clean and one patched experiment per base (`interchange::sample`, seed 1). The programs run on
 //! the single-precision device (CUDA in f32 storage, else the Apple GPU), with f32 products.
 //!
-//! A step, as the fit takes it: the weight sample written into `P` (into the decoder's operands
-//! on the decoder engine, into the program's operators and fused stacks otherwise), `M`'s clean runs
+//! A step, as the fit takes it: the weight sample written into `P` (its operators and fused
+//! stacks), `M`'s clean runs
 //! (`interchange::targets`), the experiments with the gradient (`interchange::evaluate`), the
 //! description `Σ_G KL_G`, and the IVON step (`Device::posterior_ivon`); none of the parameters
 //! leave the device. The step runs `REPS` times after one warm-up, each part timed to a device
@@ -24,12 +24,11 @@
 use gam_gpu::{GpuPolicy, tensor::Device};
 use gam_mpd::{
     artifact::Artifact,
-    decoder::Decoder,
     device_posterior::{DevicePosterior, Ivon, Parts},
     device_program::DeviceProgram,
     engine::log_to_stderr,
     import::{hugging_face_language_model, import_language_model},
-    interchange::{self, Batch, BlockEngine, FixedHead, Model, ReadVariable},
+    interchange::{self, Batch, FixedHead, Model, ReadVariable},
     library_mdl,
     operator_program::{OperatorProgram, SlotValues},
     run_check::{layer_nodes, split_sites},
@@ -116,93 +115,12 @@ fn medians(seconds: &BTreeMap<&'static str, Vec<f64>>) -> Value {
     Value::Object(out)
 }
 
-/// The median seconds of `part` over `reps` runs after one, synchronized.
-fn median(device: &Device, reps: usize, mut part: impl FnMut() -> Result<(), String>) -> Result<f64, String> {
-    part()?;
-    device.synchronize().map_err(error)?;
-    let mut seconds = Vec::with_capacity(reps);
-    for _ in 0..reps {
-        let started = Instant::now();
-        part()?;
-        device.synchronize().map_err(error)?;
-        seconds.push(started.elapsed().as_secs_f64());
-    }
-    seconds.sort_by(f64::total_cmp);
-    Ok(seconds[seconds.len() / 2])
-}
-
-/// Each kernel class of a decoder layer timed alone on `sequences` × `length` rows: its products in
-/// each arithmetic (TFLOPS of the product computed, not of the split's three), attention forward
-/// and reverse (TFLOPS), the norms, rotation and activation (GB/s of the values they read and
-/// write), and the device's bfloat16 product ceiling.
-fn classes(device: &Device, decoder: &Decoder, sequences: usize, length: usize, reps: usize) -> Result<Value, String> {
-    use gam_gpu::tensor::{Arithmetic, Op};
-    let shape = decoder.layer_shape().ok_or("no decoder layer")?;
-    let rows = sequences * length;
-    // Bfloat16 products read bfloat16 copies, as the decoder's operands are in that arithmetic; the
-    // others read f32.
-    let operand = |r: usize, c: usize, arithmetic: Arithmetic| -> Result<gam_gpu::tensor::Tensor, String> {
-        let t = device.zeros(r, c).map_err(error)?;
-        if arithmetic == Arithmetic::Bf16 { device.bf16_copy(&t).map_err(error) } else { Ok(t) }
-    };
-    let product = |m: usize, k: usize, n: usize, arithmetic: Arithmetic| -> Result<Value, String> {
-        let (a, b) = (operand(m, k, arithmetic)?, operand(n, k, arithmetic)?);
-        let mut c = device.empty(m, n).map_err(error)?;
-        let t = median(device, reps, || device.gemm(&mut c, 1.0, &a, Op::N, &b, Op::T, 0.0, arithmetic).map_err(error))?;
-        Ok(json!({"seconds": t, "tflops": 2.0 * (m * k * n) as f64 / t / 1e12}))
-    };
-    let side = 8192;
-    let ceiling = product(side, side, side, Arithmetic::Bf16)?;
-    let (d, layout) = (shape.width, shape.heads);
-    let reads = layout.queries * layout.width;
-    let m = if shape.gated { shape.mlp_inputs / 2 } else { shape.mlp_inputs };
-    let mut products = serde_json::Map::new();
-    for arithmetic in [Arithmetic::Bf16, Arithmetic::F32, Arithmetic::Tf32, Arithmetic::Tf32x3, Arithmetic::Bf16x3] {
-        let classes = json!({
-            "projections": product(rows, d, shape.projections, arithmetic)?,
-            "output": product(rows, reads, d, arithmetic)?,
-            "mlp_inputs": product(rows, d, shape.mlp_inputs, arithmetic)?,
-            "mlp_output": product(rows, m, d, arithmetic)?,
-        });
-        products.insert(format!("{arithmetic:?}"), classes);
-    }
-    let ranges: Vec<std::ops::Range<usize>> = (0..sequences).map(|i| i * length..(i + 1) * length).collect();
-    let (heads, _) = device.heads_rope(&device.zeros(rows, layout.columns()).map_err(error)?, layout, None, None).map_err(error)?;
-    let flops = 2.0 * 2.0 * rows as f64 * (length as f64 / 2.0) * layout.width as f64 * layout.queries as f64;
-    let mut kept = None;
-    let forward = median(device, reps, || {
-        kept = Some(device.causal_attention(&heads, layout, &ranges, shape.scale).map_err(error)?);
-        Ok(())
-    })?;
-    let (out, lse) = kept.ok_or("no attention output")?;
-    let g = device.zeros(rows, reads).map_err(error)?;
-    let reverse = median(device, reps, || device.causal_attention_backward(&heads, layout, &ranges, shape.scale, (&out, &lse), &g).map(|_| ()).map_err(error))?;
-    let x = device.zeros(rows, d).map_err(error)?;
-    let gain = device.upload_vec(1, d, vec![1.0; d]).map_err(error)?;
-    let norm = median(device, reps, || device.rms_gain(&x, &gain, shape.epsilon, true).map(|_| ()).map_err(error))?;
-    let p = device.zeros(rows, layout.columns()).map_err(error)?;
-    let rope = median(device, reps, || device.heads_rope(&p, layout, None, None).map(|_| ()).map_err(error))?;
-    let h = device.zeros(rows, shape.mlp_inputs).map_err(error)?;
-    let activation = median(device, reps, || if shape.gated { device.swiglu(&h, true) } else { device.gelu_tanh(&h, None, true) }.map(|_| ()).map_err(error))?;
-    let bandwidth = |t: f64, bytes: usize| json!({"seconds": t, "gb_per_s": bytes as f64 / t / 1e9});
-    Ok(json!({
-        "rows": rows,
-        "ceiling_bf16_product": ceiling,
-        "products": Value::Object(products),
-        "attention": {"forward": {"seconds": forward, "tflops": flops / forward / 1e12}, "reverse": {"seconds": reverse, "tflops": 2.5 * flops / reverse / 1e12}},
-        "rms_gain": bandwidth(norm, rows * d * (4 + 2)),
-        "heads_rope": bandwidth(rope, rows * layout.columns() * (4 + 4)),
-        "activation": bandwidth(activation, rows * (shape.mlp_inputs * 4 + m * 2)),
-    }))
-}
-
 fn main() -> Result<(), String> {
     log_to_stderr();
     // `products=f32|tf32|bf16|tf32x3|bf16x3` (f32 by default) sets the arithmetic of both
-    // programs' products, or of the decoders' with `engine=decoder`, which runs the experiments'
-    // blocks on the fixed decoder computations (`gam_mpd::decoder`) instead of the programs.
+    // programs' products.
     let (settings, args): (Vec<String>, Vec<String>) = std::env::args().skip(1).partition(|a| a.contains('='));
-    let (mut products, mut fixed) = (gam_gpu::tensor::Arithmetic::F32, false);
+    let mut products = gam_gpu::tensor::Arithmetic::F32;
     for setting in &settings {
         match setting.as_str() {
             "products=f32" => products = gam_gpu::tensor::Arithmetic::F32,
@@ -210,12 +128,10 @@ fn main() -> Result<(), String> {
             "products=bf16" => products = gam_gpu::tensor::Arithmetic::Bf16,
             "products=tf32x3" => products = gam_gpu::tensor::Arithmetic::Tf32x3,
             "products=bf16x3" => products = gam_gpu::tensor::Arithmetic::Bf16x3,
-            "engine=program" => fixed = false,
-            "engine=decoder" => fixed = true,
             other => return Err(format!("unknown setting {other}")),
         }
     }
-    let usage = "MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS [LAYERS]] [products=f32|tf32|bf16|tf32x3|bf16x3] [engine=program|decoder]";
+    let usage = "MODEL SEQUENCES CONTEXT REPS OUT [WINDOWS [LAYERS]] [products=f32|tf32|bf16|tf32x3|bf16x3]";
     let (model, rest) = args.split_first().ok_or(usage)?;
     let [sequences, context, reps, out, windows @ ..] = rest else {
         return Err(usage.into());
@@ -294,13 +210,10 @@ fn main() -> Result<(), String> {
     let mut p_program = DeviceProgram::compile_values_bounded(&device, &interchange::prefix(&p_flat)?, usize::MAX)?;
     p_program.set_arithmetic(products);
     p_program.prepare_dense_parameters(&trainable)?;
-    // Bfloat16 products read bfloat16 copies of the weights (`DeviceProgram::hold_bf16`); the
-    // decoder engine keeps P's sample in f32 and splits it into two bfloat16 terms itself.
+    // Bfloat16 products read bfloat16 copies of the weights (`DeviceProgram::hold_bf16`).
     if products == gam_gpu::tensor::Arithmetic::Bf16 {
         m_program.hold_bf16()?;
-        if !fixed {
-            p_program.hold_bf16()?;
-        }
+        p_program.hold_bf16()?;
     }
     // Where the experiments cannot be scored (a head the compact targets do not take), the posterior
     // parts are timed alone, from a zero gradient on the device.
@@ -321,15 +234,6 @@ fn main() -> Result<(), String> {
         Model::new(program, flat, streams.to_vec(), reads.to_vec(), trainable, values.to_vec())
     }
     let sites = (&p_flat, &p_streams[..], &p_reads[..], &trainable[..], &p_values[..]);
-    let decoders = if fixed {
-        let (m_prefix, p_prefix) = (interchange::prefix(&m_flat)?, interchange::prefix(&p_flat)?);
-        let m_ends = (&m_streams[..], &m_reads[..], m_program.hidden());
-        let m = Decoder::new(&device, &m_prefix, m_ends, &[])?.with_arithmetic(products).with_values(m_values.clone());
-        Some((m, Decoder::new(&device, &p_prefix, (&p_streams[..], &p_reads[..], p_program.hidden()), &trainable)?.with_arithmetic(products).with_values(p_values.clone())))
-    } else {
-        None
-    };
-    let mut decoders = decoders;
 
     // The device path.
     let mut device_seconds: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
@@ -342,29 +246,17 @@ fn main() -> Result<(), String> {
         let mut posterior = DevicePosterior::from_parts(&device, &parts, tokens as f64, None, 0)?;
         for step in 0..=reps {
             let s = &mut device_seconds;
-            // The decoder engine takes the sample straight into its operands; the program engine into
-            // its operators and fused stacks.
-            timed(&device, s, "sample_loaded", || match decoders.as_mut() {
-                Some((_, p)) => posterior.sample_into_decoder(p, step as u64),
-                None => posterior.sample_into(&mut p_program, step as u64),
-            })?;
+            timed(&device, s, "sample_loaded", || posterior.sample_into(&mut p_program, step as u64))?;
             // The step's evaluation: the gradient and a draw of the Gauss–Newton factor (a second
             // reverse pass through the same forward pass), with its scored tokens.
             let mut draws = StdRng::seed_from_u64(step as u64);
             let uniforms: Vec<f64> = (0..experiments.iter().map(|e| context - e.position).sum::<usize>()).map(|_| draws.random::<f64>()).collect();
             let (gradient, factor, labelled) = match &scoring {
                 Some((head, m)) => {
-                    let evaluation = match &decoders {
-                        Some((m, p)) => {
-                            let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments))?;
-                            timed(&device, s, "evaluate", || interchange::evaluate_labelled((m, p), head, (&batch, &experiments), Some(&targets), true, Some(&uniforms)))?
-                        }
-                        None => {
-                            let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments))?;
-                            let p = p_model(&p_program, sites)?;
-                            timed(&device, s, "evaluate", || interchange::evaluate_labelled((m, &p), head, (&batch, &experiments), Some(&targets), true, Some(&uniforms)))?
-                        }
-                    };
+                    let targets = timed(&device, s, "teacher", || interchange::targets(m, head, &batch, &experiments))?;
+                    let p = p_model(&p_program, sites)?;
+                    let evaluation =
+                        timed(&device, s, "evaluate", || interchange::evaluate_labelled((m, &p), head, (&batch, &experiments), Some(&targets), true, Some(&uniforms)))?;
                     let tokens = evaluation.bits.iter().map(Vec::len).sum::<usize>();
                     mean_bits = Some(evaluation.bits.iter().flatten().sum::<f64>() / tokens as f64);
                     let factor = evaluation.factor.ok_or("no Gauss–Newton factor")?;
@@ -379,50 +271,10 @@ fn main() -> Result<(), String> {
             timed(&device, s, "posterior_step", || posterior.step(&gradient, scale, (&factor, 1.0 / labelled as f64), &ivon))?;
         }
     }
-    // The decoder's blocks alone, forward with tapes then reverse, on the bases (no head, no
-    // patches): the engine's own time and product rate.
-    let blocks_seconds = match &decoders {
-        Some((_, p)) => {
-            let mut seconds: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
-            let length = context;
-            let ranges: Vec<std::ops::Range<usize>> = (0..sequences).map(|i| i * length..(i + 1) * length).collect();
-            let tokens: Vec<&[u32]> = rows[..sequences].iter().map(Vec::as_slice).collect();
-            let mut gradient = BTreeMap::new();
-            for _ in 0..=reps {
-                let s = &mut seconds;
-                let mut stream = device.zeros(sequences * length, p.width()).map_err(error)?;
-                let tapes = timed(&device, s, "blocks_forward", || {
-                    (0..p.blocks()).map(|b| p.forward(b, &mut stream, &ranges, &tokens, None, true)?.ok_or_else(|| "no tape".to_string())).collect::<Result<Vec<_>, String>>()
-                })?;
-                let mut cotangent = device.copy(&stream).map_err(error)?;
-                timed(&device, s, "blocks_reverse", || {
-                    for (b, tape) in tapes.iter().enumerate().rev() {
-                        p.reverse(b, tape, &mut cotangent, &ranges, None, (&mut gradient, p.arithmetic()))?;
-                    }
-                    Ok(())
-                })?;
-            }
-            let (forward, reverse) = p.product_flops(sequences * length, length);
-            let medians = medians(&seconds);
-            let rate = |part: &str, flops: f64| medians[part].as_f64().map(|t| flops / t / 1e12);
-            Some(json!({"seconds": medians, "forward_tflops": rate("blocks_forward", forward), "reverse_tflops": rate("blocks_reverse", reverse), "forward_flops": forward, "reverse_flops": reverse}))
-        }
-        None => None,
-    };
-    // Each kernel class alone at the layer's shapes, and the device's bfloat16 product ceiling (a
-    // product of 8192-square operands: its tiles fill every multiprocessor many times over, so its
-    // rate is the products' attainable one), for comparing devices.
-    let classes = match &decoders {
-        Some((_, p)) => Some(classes(&device, p, sequences, context, reps)?),
-        None => None,
-    };
     let report = json!({
-        "kernel_classes": classes,
-        "decoder_blocks": blocks_seconds,
         "model": model.display().to_string(),
         "explanation": kind,
         "products": format!("{products:?}"),
-        "engine": if fixed { "decoder" } else { "program" },
         "fused_head_groups": [m_program.fused_groups(), p_program.fused_groups()],
         "scored": scoring.is_some(),
         "mean_bits_per_token": mean_bits,

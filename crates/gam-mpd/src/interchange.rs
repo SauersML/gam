@@ -55,7 +55,6 @@
 
 use crate::{
     artifact::Artifact,
-    decoder::{self, Decoder},
     artifact_device::{mapped_inlined, mapped_inlined_observed},
     device_program::{DeviceProgram, DeviceTrace},
     operator_program::{FamilyInputs, Node, OperatorProgram, SequenceLayout, SlotValues},
@@ -66,7 +65,7 @@ use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, Storage, Tensor};
 use gam_runtime::resource::{Governed, MemoryGovernor};
 use rand::RngExt;
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     ops::Range,
     sync::Arc,
@@ -81,7 +80,6 @@ fn error(e: impl std::fmt::Display) -> String {
 /// variable's value.
 struct Sites {
     entries: Vec<usize>,
-    reads: Vec<usize>,
     trainable: Vec<Vec<usize>>,
     values: Vec<Value>,
 }
@@ -120,7 +118,7 @@ impl Sites {
         if values.iter().any(|v| v.block >= blocks) || values.iter().flat_map(|v| &v.sites).any(|s| s.node >= hidden || widths[s.node] != s.width || s.columns.is_empty() || s.columns.end > s.width) {
             return Err(error("a read variable's value outside the program or its node"));
         }
-        Ok(Self { entries, reads, trainable: per_block, values })
+        Ok(Self { entries, trainable: per_block, values })
     }
 }
 
@@ -1127,128 +1125,9 @@ fn check(e: &Experiment, batch: &Batch, blocks: usize) -> Result<(), String> {
 
 /// `M`'s compact statistics for a batch's experiments, per experiment from its position on: the
 /// targets every score of `P` on them is measured against ([`targets`]). They do not depend on `P`;
-/// a fit makes them on the device whenever it scores a batch. [`Interchange::targets`] records how
-/// `M` ran ([`Execution`]), and [`Interchange::evaluate_labelled`] refuses targets made another way.
+/// a fit makes them on the device whenever it scores a batch.
 pub struct Targets {
     rows: Vec<Target>,
-    teacher: Option<Execution>,
-}
-
-/// How one model's blocks run in the experiments: its program block by block, or its fused decoder
-/// ([`Decoder`]), and the arithmetic of the products outside the blocks (the head, the patches).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Execution {
-    Program(Arithmetic),
-    Fused(Arithmetic),
-}
-
-/// One model's engine in the experiments: its program block by block, or its fused decoder. Each
-/// model of an [`Interchange`] takes its own, so `M`'s blocks and targets run the same way whatever
-/// explanation they are compared with.
-pub enum Engine<'a> {
-    Program(Model<'a>),
-    Fused(&'a Decoder),
-}
-
-/// A tape of an [`Engine`].
-pub enum EngineTape {
-    Program(DeviceTrace),
-    Fused(decoder::Tape),
-}
-
-impl Engine<'_> {
-    /// How it runs.
-    #[must_use]
-    pub fn execution(&self) -> Execution {
-        match self {
-            Self::Program(m) => Execution::Program(BlockEngine::arithmetic(m)),
-            Self::Fused(d) => Execution::Fused(BlockEngine::arithmetic(*d)),
-        }
-    }
-}
-
-impl BlockEngine for Engine<'_> {
-    type Tape = EngineTape;
-
-    fn device(&self) -> &Device {
-        match self {
-            Self::Program(m) => BlockEngine::device(m),
-            Self::Fused(d) => BlockEngine::device(*d),
-        }
-    }
-
-    fn width(&self) -> usize {
-        match self {
-            Self::Program(m) => BlockEngine::width(m),
-            Self::Fused(d) => BlockEngine::width(*d),
-        }
-    }
-
-    fn blocks(&self) -> usize {
-        match self {
-            Self::Program(m) => BlockEngine::blocks(m),
-            Self::Fused(d) => BlockEngine::blocks(*d),
-        }
-    }
-
-    fn arithmetic(&self) -> Arithmetic {
-        match self {
-            Self::Program(m) => BlockEngine::arithmetic(m),
-            Self::Fused(d) => BlockEngine::arithmetic(*d),
-        }
-    }
-
-    fn values(&self) -> &[Value] {
-        match self {
-            Self::Program(m) => BlockEngine::values(m),
-            Self::Fused(d) => BlockEngine::values(*d),
-        }
-    }
-
-    fn forward(
-        &self,
-        block: usize,
-        stream: &mut Tensor,
-        ranges: &[Range<usize>],
-        tokens: &[&[u32]],
-        edits: Option<&Edits>,
-        keep: bool,
-    ) -> Result<Option<EngineTape>, String> {
-        Ok(match self {
-            Self::Program(m) => BlockEngine::forward(m, block, stream, ranges, tokens, edits, keep)?.map(EngineTape::Program),
-            Self::Fused(d) => BlockEngine::forward(*d, block, stream, ranges, tokens, edits, keep)?.map(EngineTape::Fused),
-        })
-    }
-
-    fn reverse(
-        &self,
-        block: usize,
-        tape: &EngineTape,
-        cotangent: &mut Tensor,
-        ranges: &[Range<usize>],
-        edits: Option<&Edits>,
-        sums: (&mut BTreeMap<usize, Tensor>, Arithmetic),
-    ) -> Result<(), String> {
-        match (self, tape) {
-            (Self::Program(m), EngineTape::Program(t)) => BlockEngine::reverse(m, block, t, cotangent, ranges, edits, sums),
-            (Self::Fused(d), EngineTape::Fused(t)) => BlockEngine::reverse(*d, block, t, cotangent, ranges, edits, sums),
-            _ => Err(error("a tape of another engine")),
-        }
-    }
-
-    fn tape_bytes(tape: &EngineTape) -> usize {
-        match tape {
-            EngineTape::Program(t) => <Model<'_> as BlockEngine>::tape_bytes(t),
-            EngineTape::Fused(t) => <Decoder as BlockEngine>::tape_bytes(t),
-        }
-    }
-
-    fn gradient_bytes(&self) -> Result<usize, String> {
-        match self {
-            Self::Program(m) => BlockEngine::gradient_bytes(m),
-            Self::Fused(d) => BlockEngine::gradient_bytes(*d),
-        }
-    }
 }
 
 /// The paths of `experiments` on `batch` over the read variables of `values` (their blocks), every
@@ -1297,11 +1176,11 @@ pub fn targets<E: BlockEngine>(m: &E, head: &FixedHead, batch: &Batch, experimen
         out.push(Target { mu: Arc::new(mu), entropy: all.entropy[at..at + r.len()].to_vec(), head: Arc::clone(&head.head), scored: None });
         at += r.len();
     }
-    Ok(Targets { rows: out, teacher: None })
+    Ok(Targets { rows: out })
 }
 
-/// The exact identity of a batch's experiments, which alone decides `M`'s targets for them (with
-/// how `M` runs, [`Execution`]): the base and source tokens and every experiment.
+/// The exact identity of a batch's experiments, which alone decides `M`'s targets for them: the
+/// base and source tokens and every experiment.
 #[derive(PartialEq, Eq, Hash)]
 struct Identity {
     base: Vec<Vec<u32>>,
@@ -1314,7 +1193,6 @@ struct Identity {
 /// ([`HostTargets::restore`]) gives the same targets bit for bit.
 struct HostTargets {
     rows: Vec<KeptTarget>,
-    teacher: Option<Execution>,
 }
 
 struct KeptTarget {
@@ -1363,7 +1241,7 @@ impl HostTargets {
                 Ok(KeptTarget { mu, shape, storage, entropy: t.entropy.clone(), head: Arc::clone(&t.head), scored: t.scored.clone() })
             })
             .collect::<Result<_, String>>()?;
-        Ok(Self { rows, teacher: targets.teacher })
+        Ok(Self { rows })
     }
 
     /// The kept targets on the device `d` again, each `μ` in the storage it was made in.
@@ -1381,7 +1259,7 @@ impl HostTargets {
                 Ok(Target { mu: Arc::new(mu), entropy: t.entropy.clone(), head: Arc::clone(&t.head), scored: t.scored.clone() })
             })
             .collect::<Result<_, String>>()?;
-        Ok(Targets { rows, teacher: self.teacher })
+        Ok(Targets { rows })
     }
 }
 
@@ -1582,16 +1460,6 @@ pub struct Interchange {
     head: FixedHead,
     variables: Vec<ReadVariable>,
     trainable: Vec<usize>,
-    /// `M`'s and `P`'s programs through their hidden nodes, which [`Interchange::fuse`] compiles.
-    prefixes: (OperatorProgram, OperatorProgram),
-    /// Once [`Interchange::fuse`] asked for fused engines, `M`'s when `M` is of the decoder family
-    /// and `P`'s when `P` is, each decided by its own program alone; a model without one runs its
-    /// program. `P`'s is refreshed from `P`'s program before an evaluation that follows a write to
-    /// it (`stale`).
-    teacher: Option<Decoder>,
-    candidate: Option<RefCell<Decoder>>,
-    fuse_asked: bool,
-    stale: Cell<bool>,
     /// `M`'s targets kept on the host ([`Interchange::keep_targets`]); none until asked for.
     kept: RefCell<Option<TargetStore>>,
 }
@@ -1630,54 +1498,7 @@ impl Interchange {
         let p_values = values(native, explanation, layers, &variables)?;
         let m_sites = Arc::new(Sites::new(&m, &m_flat, m_streams, m_reads, &[], m_values)?);
         let p_sites = Arc::new(Sites::new(&p, &p_flat, p_streams, p_reads, trainable, p_values)?);
-        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), prefixes: (m_prefix, p_prefix), teacher: None, candidate: None, fuse_asked: false, stale: Cell::new(false), kept: RefCell::new(None) })
-    }
-
-    /// Run each model on its fused engine from now on, its products in `arithmetic`
-    /// (`Decoder::with_arithmetic`), where the device holds f32 or is the host (whose decoder rounds
-    /// as `arithmetic` says) and the model is of the decoder family, each decided by its own
-    /// program: `M`'s execution does not depend on the explanation it is compared with. Returns
-    /// whether `P` runs fused. Not the default: in bfloat16 the decoder's products differ from the
-    /// program engine by as much as the divergence itself (`mpd_engine_parity_2951`, vpd4l on an
-    /// RTX 4090: up to 0.045 bits per token against means of 0.02 to 0.05, gradients 6 to 8% off).
-    pub fn fuse(&mut self, arithmetic: Arithmetic) -> Result<bool, String> {
-        if self.fuse_asked || (self.p.device().float64() && !self.p.device().is_host()) {
-            return Ok(self.candidate.is_some());
-        }
-        self.fuse_asked = true;
-        let device = self.p.device();
-        match Decoder::new(device, &self.prefixes.0, (&self.m_sites.entries, &self.m_sites.reads, self.m.hidden()), &[]) {
-            Ok(engine) => self.teacher = Some(engine.with_arithmetic(arithmetic).with_values(self.m_sites.values.clone())),
-            Err(reason) => log::info!("interchange: M runs its program ({reason})"),
-        }
-        match Decoder::new(device, &self.prefixes.1, (&self.p_sites.entries, &self.p_sites.reads, self.p.hidden()), &self.trainable).map(|d| d.with_arithmetic(arithmetic).with_values(self.p_sites.values.clone())) {
-            Ok(mut engine) => {
-                engine.refresh(&self.p)?;
-                self.candidate = Some(RefCell::new(engine));
-                self.stale.set(false);
-            }
-            Err(reason) => log::info!("interchange: P runs its program ({reason})"),
-        }
-        Ok(self.candidate.is_some())
-    }
-
-    /// Whether `P` runs on its fused engine.
-    pub fn fused(&self) -> bool {
-        self.candidate.is_some()
-    }
-
-    /// `M`'s engine.
-    fn teacher(&self) -> Engine<'_> {
-        match &self.teacher {
-            Some(engine) => Engine::Fused(engine),
-            None => Engine::Program(self.models().0),
-        }
-    }
-
-    /// How `M` runs: the execution every target of this interchange is made with.
-    #[must_use]
-    pub fn teacher_execution(&self) -> Execution {
-        self.teacher().execution()
+        Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), kept: RefCell::new(None) })
     }
 
     /// `M` and `P` as the free functions of this module take them.
@@ -1687,7 +1508,6 @@ impl Interchange {
 
     /// `P`'s program, to write its trainable operators on the device (`device_posterior`).
     pub fn explanation_mut(&mut self) -> &mut DeviceProgram {
-        self.stale.set(true);
         &mut self.p
     }
 
@@ -1706,18 +1526,15 @@ impl Interchange {
     /// while the process's memory budget admits them, and the same experiments on the same tokens
     /// are given those back (bit for bit) instead of running `M` again.
     pub fn targets(&self, batch: &Batch, experiments: &[Experiment]) -> Result<Targets, String> {
-        let teacher = self.teacher();
-        let execution = teacher.execution();
+        let teacher = self.models().0;
         let mut store = self.kept.try_borrow_mut().map_err(error)?;
         let identity = store.as_ref().map(|_| Identity { base: batch.base.clone(), source: batch.source.clone(), experiments: experiments.to_vec() });
         if let (Some(store), Some(identity)) = (store.as_ref(), identity.as_ref())
             && let Some(kept) = store.batches.get(identity)
-            && kept.teacher == Some(execution)
         {
             return kept.restore(self.m.device());
         }
-        let mut made = targets(&teacher, &self.head, batch, experiments)?;
-        made.teacher = Some(execution);
+        let made = targets(&teacher, &self.head, batch, experiments)?;
         if let (Some(store), Some(identity)) = (store.as_mut(), identity) {
             store.batches.remove(&identity);
             if let Ok(reservation) = store.governor.try_reserve(HostTargets::bytes(&made, &identity), "interchange: M's targets of a batch kept on the host") {
@@ -1737,7 +1554,6 @@ impl Interchange {
 
     /// `P`'s program, so that a fit writes each weight sample into its resident parameters.
     pub fn program_mut(&mut self) -> &mut DeviceProgram {
-        self.stale.set(true);
         &mut self.p
     }
 
@@ -1749,23 +1565,7 @@ impl Interchange {
 
     /// [`evaluate_labelled`] of `P` as it is held, the gradients left on the device.
     pub fn evaluate_labelled(&self, batch: &Batch, experiments: &[Experiment], targets: Option<&Targets>, gradient: bool, labels: Option<&[f64]>) -> Result<Evaluation, String> {
-        let teacher = self.teacher();
-        if let Some(made) = targets.and_then(|t| t.teacher)
-            && made != teacher.execution()
-        {
-            return Err(error(format!("targets made with M run as {made:?}, compared with M run as {:?}", teacher.execution())));
-        }
-        let held;
-        let p = match &self.candidate {
-            Some(engine) => {
-                if self.stale.replace(false) {
-                    engine.try_borrow_mut().map_err(error)?.refresh(&self.p)?;
-                }
-                held = engine.try_borrow().map_err(error)?;
-                Engine::Fused(&*held)
-            }
-            None => Engine::Program(self.models().1),
-        };
+        let (teacher, p) = self.models();
         evaluate_labelled((&teacher, &p), &self.head, (batch, experiments), targets, gradient, labels)
     }
 
@@ -1785,7 +1585,6 @@ impl Interchange {
             let tensor = self.p.device().upload(value.view()).map_err(error)?;
             self.p.replace_dense_parameter(op, tensor)?;
         }
-        self.stale.set(true);
         self.p.refresh_fused()
     }
 

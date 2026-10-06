@@ -27,7 +27,6 @@
 //! `v_G` without bound (vpd4l at `N = 2^16`: `Σ v_G` 356 → 1.4e4 over 12 epochs).
 
 use crate::{
-    decoder::Decoder,
     device_program::DeviceProgram,
     library_mdl::{Curvature, Explanation, Posterior, Rotation, Side},
 };
@@ -395,8 +394,8 @@ impl DevicePosterior {
     }
 
     /// Trainable operator `op`'s weight sample of `key` (the draws [`DevicePosterior::sample_into`]
-    /// writes) into the block of `out` at `(row, col)`, a stacked operand such as a fused group's
-    /// or a decoder's: written in place, no copy of the operator ([`Device::reparameterize_block`]).
+    /// writes) into the block of `out` at `(row, col)`, a stacked operand such as a fused group's:
+    /// written in place, no copy of the operator ([`Device::reparameterize_block`]).
     /// An operator with a rotation is sampled along its rotated axes, turned to its own, and written
     /// whole.
     pub fn sample_block(&self, op: usize, out: &mut Tensor, at: (usize, usize), key: u64) -> Result<(), String> {
@@ -432,16 +431,6 @@ impl DevicePosterior {
             let fixed = self.fitting.broadcast_rows(&row_of, value.rows()).map_err(error)?;
             self.fitting.reparameterize_block(out, (row, col), (&value, &fixed), (0, 0)).map_err(error)
         }
-    }
-
-    /// Trainable operator `op`'s posterior means into rows `row..` of `out` (in `out`'s storage),
-    /// whose columns are the operator's.
-    pub fn mean_rows(&self, op: usize, out: &mut Tensor, row: usize) -> Result<(), String> {
-        let (i, mean, _) = self.entries(op)?;
-        let rotated = self.applied(i, mean)?;
-        let mean = rotated.as_ref().unwrap_or(mean);
-        let value = if out.storage() == Storage::Bf16 { self.fitting.bf16_copy(mean) } else { self.fitting.copy(mean) }.map_err(error)?;
-        self.fitting.set_rows(out, row, &value).map_err(error)
     }
 
     /// Writes the posterior means into `program`'s trainable operators and their stacks.
@@ -531,18 +520,6 @@ impl DevicePosterior {
             self.block_of(op, stack, at, key, means)?;
             Ok(true)
         })
-    }
-
-    /// Writes the weight sample of `key` (the draws of [`DevicePosterior::sample_into`]) straight
-    /// into `decoder`'s operands ([`Decoder::write_trainable`]): no program holds it, and nothing is
-    /// copied.
-    pub fn sample_into_decoder(&self, decoder: &mut Decoder, key: u64) -> Result<(), String> {
-        decoder.write_trainable(&mut |op, operand, at| self.sample_block(op, operand, at, key))
-    }
-
-    /// Writes the posterior means into `decoder`'s operands.
-    pub fn mean_into_decoder(&self, decoder: &mut Decoder) -> Result<(), String> {
-        decoder.write_trainable(&mut |op, operand, (row, _)| self.mean_rows(op, operand, row))
     }
 
     /// One IVON step: `gradients` holds per trainable operator (by id) the gradient of the batch's

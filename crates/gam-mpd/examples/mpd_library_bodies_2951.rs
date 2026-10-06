@@ -523,7 +523,6 @@ fn main() -> Result<(), String> {
                 seed: 1,
                 numeric_bytes: 1 << 28,
                 head_tile_rows: 64,
-                decoder: false,
                 trust_rate: false,
                 split_filter: false,
                 deterministic: false,
