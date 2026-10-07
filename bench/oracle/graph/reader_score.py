@@ -43,8 +43,10 @@ measured value of the English.
                         --items ITEMS.jsonl --out OUT.json [--N 16777216]
   reader_score.py serve --model Qwen/Qwen3-8B --target qwen3-0.6b --listen HOST:PORT
 P.jsonl lines {"id", "source"[, "valid"]}; an invalid program is read as the empty program (design.txt).
-serve answers JSON lines {"op": "score", "programs": [...], "items": [...], "N": int} with
-{"ok": {"results": [...], "reader": ..., "items_per_second": ...}}.
+serve answers JSON lines {"op": "score", "programs": [...], "items": [...], "N": int[, "baselines": true]}
+(every program on the same items) and {"op": "score_many", "jobs": [{"program", "items", "N"}, ...][,
+"baselines": false]} (RL: each program on its own items, baselines off by default) with
+{"ok": {"results": [...], "reader": ...}}.
 """
 
 from __future__ import annotations
@@ -420,10 +422,13 @@ class _Handler(socketserver.StreamRequestHandler):
             start = time.time()
             try:
                 request = json.loads(line)
-                if request.get("op") != "score":
-                    raise ValueError(f"unknown op {request.get('op')!r} (have score)")
                 s = self.server.scorer
-                results = s.score(request["programs"], request["items"], int(request.get("N", N_DEFAULT)), bool(request.get("baselines", True)))
+                if request.get("op") == "score":
+                    results = s.score(request["programs"], request["items"], int(request.get("N", N_DEFAULT)), bool(request.get("baselines", True)))
+                elif request.get("op") == "score_many":  # one job per program, each with its own items and N
+                    results = [s.score([j["program"]], j["items"], int(j.get("N", N_DEFAULT)), bool(request.get("baselines", False)))[0] for j in request["jobs"]]
+                else:
+                    raise ValueError(f"unknown op {request.get('op')!r} (have score, score_many)")
                 reply = {"ok": {"results": results, "reader": s.backend.describe()}}
             except Exception as e:  # the reply carries the failure; the service keeps running
                 reply = {"error": f"{type(e).__name__}: {e}"}
