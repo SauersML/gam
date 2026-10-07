@@ -15,6 +15,9 @@ output 735) is the induction step: its key reads layer 1's write, its value carr
 copy, and its output writes it; and that layer 3 (output 806) writes it again after its value reads
 layer 2. Layer 0's subcomponents also cost a lot here; these measurements do not show their role, so
 the program only lets their write reach the later layers.
+Left to their averages: the MLP subcomponents, although some cost a lot when removed (layer 1 c_fc
+2103: 9.6 bits, layer 0 c_fc 53: 7.3, layer 0 down_proj 3257: 2.3, layer 1 down_proj 1217: 2.2, layer
+3 down_proj 3532: 0.6). The claim is that what they contribute here barely depends on the prompt.
 """
 from mech import node, edges, PD, embed, logits
 
