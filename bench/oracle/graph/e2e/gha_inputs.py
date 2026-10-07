@@ -20,6 +20,9 @@ def main() -> None:
         sha, size, mtime, rel = line.split("\t")
         f = data / rel
         # the cache line that matches the file as it is now (size and modification time)
+        # a VPD decomposition's causal-importance network (ci.*) is not an input of the checker
+        if Path(rel).name.startswith("ci."):
+            continue
         if any(rel == p or rel.startswith(p.rstrip("/") + "/") for p in prefixes) and f.exists() \
                 and str(f.stat().st_size) == size and str(int(f.stat().st_mtime)) == mtime:
             latest[rel] = sha
