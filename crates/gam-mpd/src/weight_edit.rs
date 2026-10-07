@@ -419,18 +419,14 @@ mod tests {
         assert!(ignored > 1e-4, "the edit moves M ({ignored})");
     }
 
-    /// An exact decomposition into gated slices (`library_vpd` on the tiny export, VPD's factors set
-    /// to every column slice of each map, `V = I` and `U = Wᵀ`, one component per layer at the
-    /// attention's input carrying every q, k, v and o slice and one at the MLP's input carrying every
-    /// c_fc and down slice, each always on): `P` computes `M` (0 bits, 1e-9), and no operator of `P`
-    /// holds a block of `M`'s maps. Native edits compile through the maps' uses
-    /// (`library_vpd::uses`): edits of layer 1's head-0 query, head 1's block of o, c_fc and down each
-    /// score 0 bits on the decomposition and move `M`; without the uses each is not applicable.
-    #[test]
-    fn edits_reach_an_exact_gated_slice_decomposition_through_its_uses() {
-        let dir = crate::test_support::tiny_export("weight_edit_vpd", 2);
+    /// The tiny export decomposed exactly into gated slices (`library_vpd`; VPD's factors `V = I`,
+    /// `U = Wᵀ` for every map, every gate always on): per layer one component at the attention's
+    /// input (every q, k, v and o slice) and one at the MLP's input (every c_fc and down slice), or
+    /// with `split` two of each listing each other as candidates (gate sharing).
+    fn exact_slices(tag: &str, split: bool) -> (Setup, Vec<LayerNodes>) {
+        let dir = crate::test_support::tiny_export(tag, 2);
         let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("export.json")).expect("export.json")).expect("the record");
-        let factors = std::env::temp_dir().join(format!("gam_mpd_weight_edit_vpd_factors_{}", std::process::id()));
+        let factors = std::env::temp_dir().join(format!("gam_mpd_{tag}_factors_{}", std::process::id()));
         std::fs::create_dir_all(&factors).expect("the factors' directory");
         let (mut files, mut sites) = (serde_json::Map::new(), Vec::new());
         let mut write = |name: String, values: Array2<f64>| {
@@ -451,9 +447,23 @@ mod tests {
                 sites.push(site);
                 slices[usize::from(k >= 4)].extend((0..c).map(|i| [6 * l + k, i]));
             }
-            for (stage, slices) in slices.into_iter().enumerate() {
-                // Width 10⁻³: the gate Φ(z/w) at z ≥ 1 is 1 in float64, so the decomposition is exact.
-                components.push(serde_json::json!({"read": {"own": [6 * l + 4 * stage, 0]}, "tau": -1.0, "width": 1e-3, "slices": slices}));
+            // Width 10⁻³: the gate Φ(z/w) at z ≥ 1 is 1 in float64, so the decomposition is exact
+            // (a shared own gate's width on the squared norm is 2·10⁻⁶, its threshold −1).
+            let [attention, mlp] = slices;
+            if split {
+                // Per stage two components, each listing the other: q, k and o slices with v; the
+                // first half of c_fc and of down with the second.
+                let (a1, a2): (Vec<[usize; 2]>, Vec<[usize; 2]>) = attention.into_iter().partition(|[site, _]| site % 6 != 2);
+                let (m1, m2): (Vec<[usize; 2]>, Vec<[usize; 2]>) = mlp.into_iter().partition(|[site, i]| *i < if site % 6 == 4 { 4 } else { 8 });
+                let first = components.len();
+                for (k, (read, slices)) in [(0, a1), (2, a2), (4, m1), (4, m2)].into_iter().enumerate() {
+                    let other = first + (k ^ 1);
+                    components.push(serde_json::json!({"read": {"own": [6 * l + read, 0]}, "tau": -1.0, "width": 1e-3, "slices": slices, "candidates": [other]}));
+                }
+            } else {
+                for (stage, slices) in [attention, mlp].into_iter().enumerate() {
+                    components.push(serde_json::json!({"read": {"own": [6 * l + 4 * stage, 0]}, "tau": -1.0, "width": 1e-3, "slices": slices}));
+                }
             }
         }
         std::fs::write(factors.join("export.json"), serde_json::json!({"config": {"sites": sites}, "files": files}).to_string()).expect("the factors' record");
@@ -470,6 +480,47 @@ mod tests {
         let blocks = explanation.layers.iter().map(|l| l.sites.clone()).collect();
         let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
         let s = Setup { native, blocks, explanation, batch };
+        (s, layers)
+    }
+
+    /// Gate sharing (`library_vpd`, components that list candidates): on the exact decomposition
+    /// with two components per stage, each on its own gate, `P` scores 0 bits, and each shared
+    /// stage's record lists its components' candidates, own first. With the second component's
+    /// gate shut (threshold −10⁹ on the squared norm) and that component assigned to it, `P` loses
+    /// the component; assigning it to the first component's gate (a part of their summed rank,
+    /// gated on the norm of both reads) makes `P` exact again.
+    #[test]
+    fn a_shared_stage_moves_components_between_gates() {
+        let (s, _) = exact_slices("weight_edit_share", true);
+        assert_eq!(s.explanation.shares.len(), 4, "two shared stages per layer");
+        assert!(s.explanation.shares.iter().all(|share| share.candidates == vec![vec![0, 1], vec![1, 0]]), "{:?}", s.explanation.shares);
+        let exact = bits(&s, &s.native, &s.explanation.artifact);
+        assert!(exact.abs() <= 1e-9, "the shared decomposition scores {exact} bits");
+        let set = |artifact: &mut Artifact, name: &str, values: Array2<f64>| {
+            let at = named(&artifact.program, name).unwrap().expect("an operator");
+            let old = Arc::clone(&artifact.program.operators[at]);
+            let precision = exact_precision(values.iter().copied()).expect("a precision");
+            artifact.program.operators[at] = Arc::new(Operator::dense(old.name.clone(), old.rows.clone(), old.cols.clone(), values, precision, old.provenance.clone()).expect("an operator"));
+        };
+        let mut shut = s.explanation.artifact.clone();
+        set(&mut shut, "library.l1.mlp.fc.threshold", ndarray::array![[-1.0], [-1e9]]);
+        let lost = bits(&s, &s.native, &shut);
+        assert!(lost > 1e-4, "the second component on its shut gate is off ({lost} bits)");
+        set(&mut shut, "library.l1.mlp.fc.assign", ndarray::array![[1.0, 1.0], [0.0, 0.0]]);
+        let moved = bits(&s, &s.native, &shut);
+        assert!(moved.abs() <= 1e-9, "both components on the first gate: {moved} bits");
+    }
+
+    /// An exact decomposition into gated slices (`library_vpd` on the tiny export, VPD's factors set
+    /// to every column slice of each map, `V = I` and `U = Wᵀ`, one component per layer at the
+    /// attention's input carrying every q, k, v and o slice and one at the MLP's input carrying every
+    /// c_fc and down slice, each always on): `P` computes `M` (0 bits, 1e-9), and no operator of `P`
+    /// holds a block of `M`'s maps. Native edits compile through the maps' uses
+    /// (`library_vpd::uses`): edits of layer 1's head-0 query, head 1's block of o, c_fc and down each
+    /// score 0 bits on the decomposition and move `M`; without the uses each is not applicable.
+    #[test]
+    fn edits_reach_an_exact_gated_slice_decomposition_through_its_uses() {
+        let (s, layers) = exact_slices("weight_edit_vpd", false);
         let exact = bits(&s, &s.native, &s.explanation.artifact);
         assert!(exact.abs() <= 1e-9, "the decomposition scores {exact} bits");
         let mut artifact = s.explanation.artifact.clone();

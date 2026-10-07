@@ -274,6 +274,17 @@ pub struct Group {
     pub cells: Vec<Cells>,
 }
 
+/// A stage of gated components that share gates (`library_vpd`): the assignment operator
+/// `operator` (by name; gates × components, each component's column its assignment over the
+/// gates, relaxed in training and 0/1 at evaluation) and per component its candidate gates, its
+/// own first: the gates its assignment may move to, so a part of any rank forms where components
+/// come to share a gate, and leaves where one moves away.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Share {
+    pub operator: String,
+    pub candidates: Vec<Vec<usize>>,
+}
+
 /// The library explanation of a language model: the artifact at its starting point, its trainable
 /// operators, its prior groups and its layers.
 #[derive(Clone, Debug)]
@@ -299,6 +310,8 @@ pub struct Explanation {
     /// kept by every explanation derived from that one, so a fit reads them here rather than
     /// building the library again.
     pub reads: Vec<interchange::ReadVariable>,
+    /// The stages whose components share gates (`library_vpd`'s gate sharing; [`Share`]).
+    pub shares: Vec<Share>,
 }
 
 /// Per group of `groups`, the mean square of `program`'s values over its cells. A group whose
@@ -820,7 +833,7 @@ pub fn explanation_with(native: &OperatorProgram, layers: &[LayerNodes], transco
     artifact.owners = owners;
     let reference = mean_squares(&artifact.program, &groups);
     let reads = interchange::reads_of(native, &artifact, out.len())?;
-    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference, reads })
+    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference, reads, shares: Vec::new() })
 }
 
 /// The prior groups of each of `explanation`'s `2L` blocks (block `2l` layer `l`'s attention,
@@ -2903,6 +2916,10 @@ fn explanation_identity(explanation: &Explanation) -> (String, String, String) {
     definition.absorb_str(b"owners", &format!("{:?}", explanation.artifact.owners));
     definition.absorb_str(b"layers", &layers_definition(&explanation.layers));
     definition.absorb_str(b"trainable", &format!("{:?}", explanation.trainable));
+    // Only where some stage shares gates, so explanations without one keep their identity.
+    if !explanation.shares.is_empty() {
+        definition.absorb_str(b"shares", &format!("{:?}", explanation.shares));
+    }
     let reference: Vec<u8> = explanation.reference.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
     definition.absorb_bytes(b"reference", &reference);
     (groups.finalize().to_hex(), sharing.finalize().to_hex(), definition.finalize().to_hex())

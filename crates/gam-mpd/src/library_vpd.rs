@@ -37,7 +37,7 @@
 use crate::{
     artifact::{Argument, Artifact, Callee, Owner},
     explanation_battery::{KINDS, Kind, load_factors},
-    library_mdl::{Cells, Explanation, Group, Layer, mean_squares},
+    library_mdl::{Cells, Explanation, Group, Layer, Share, mean_squares},
     operator_program::{FamilyInputs, Interface, LabelKind, Node, Operator, OperatorProgram, Provenance, Rule, Trace, exact_precision},
     run_check::LayerNodes,
 };
@@ -69,6 +69,10 @@ struct Component {
     #[serde(default)]
     width: Option<f64>,
     slices: Vec<[usize; 2]>,
+    /// Other components of its stage (indices into the arm's list) whose gates it may move to
+    /// during the fit (gate sharing, `library_mdl::Share`); empty keeps it on its own gate.
+    #[serde(default)]
+    candidates: Vec<usize>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +140,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
         Read::Direction { site, .. } => *site,
     };
     let mut artifact = Artifact::native(native)?;
+    let mut shares = Vec::new();
     // Per layer and stage, the components gated there.
     let mut at: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
     for (b, c) in components.iter().enumerate() {
@@ -148,12 +153,37 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
     let direction = components.iter().any(|c| matches!(c.read, Read::Direction { .. }));
     let interfaces = native.interfaces().map_err(error)?;
     let node_interface = |node: usize| -> Result<Interface, String> { interfaces.get(node).cloned().ok_or_else(|| error(format!("no node {node}"))) };
+    // A stage is shared where any of its components lists candidates (gate sharing).
+    let is_shared = |comps: &[usize]| comps.iter().any(|&b| !components[b].candidates.is_empty());
+    // Its record: per component its candidate gates, its own first, as positions in the stage.
+    let share_of = |prefix: &str, comps: &[usize]| -> Result<Share, String> {
+        let position: BTreeMap<usize, usize> = comps.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+        let candidates = comps
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| {
+                let mut list = vec![i];
+                for c in &components[b].candidates {
+                    let at = *position.get(c).ok_or_else(|| error(format!("component {b}: candidate {c} is not in its stage")))?;
+                    if !list.contains(&at) {
+                        list.push(at);
+                    }
+                }
+                Ok(list)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Share { operator: format!("{prefix}.assign"), candidates })
+    };
     for (l, layer) in layers.iter().enumerate() {
         let name = format!("library.l{l}");
         let site = |kind: Kind| KINDS.len() * l + KINDS.iter().position(|k| *k == kind).unwrap_or(0);
         let slices_on = |b: usize, s: usize| -> Vec<usize> { components[b].slices.iter().filter(|[t, _]| *t == s).map(|[_, i]| *i).collect() };
         // ---------------------------------------------------------------- the attention's input stage
         let a_comps = at.get(&(l, 0)).cloned().unwrap_or_default();
+        let attn_shared = is_shared(&a_comps);
+        if attn_shared {
+            shares.push(share_of(&format!("{name}.attn"), &a_comps)?);
+        }
         let (q, k, v) = (site(Kind::Query), site(Kind::Key), site(Kind::Value));
         // The stacked read: per component its q, k, v slices in that order; each slice's row.
         let mut read_rows: Vec<(usize, usize)> = Vec::new();
@@ -195,7 +225,15 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
         let gate_ops = |prefix: &str, comps: &[usize], cols: &Interface| -> Result<Vec<Operator>, String> {
             let count = comps.len();
             let mut ops = Vec::new();
+            let share = is_shared(comps);
             match direction {
+                false if share => {
+                    // Shared own gates read the squared norm of their components' reads: gate m's
+                    // pre-activation Σ_b A_mb ‖V_bᵀx‖² − τ_m|τ_m|, which at a 0/1 assignment is on
+                    // exactly where the norm of its members' reads exceeds τ_m.
+                    ops.push(dense(&format!("{prefix}.assign"), units(count)?, units(count)?, Array2::eye(count))?);
+                    ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| -components[comps[b]].tau * components[comps[b]].tau.abs()))?);
+                }
                 false => {
                     ops.push(Operator::identity(format!("{prefix}.gate_identity"), units(count)?));
                     ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| -components[comps[b]].tau))?);
@@ -215,13 +253,46 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                 }
             }
             let widths = comps.iter().map(|&b| components[b].width.filter(|w| w.is_finite() && *w > 0.0).ok_or_else(|| error(format!("component {b}: no positive gate width in the start file (rerun mpd_battery_2951 start)")))).collect::<Result<Vec<f64>, String>>()?;
-            ops.push(dense(&format!("{prefix}.width"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| widths[b]))?);
+            // A shared own gate's width on the squared norm has the norm's slope at the threshold:
+            // d‖·‖²/d‖·‖ = 2τ there (2w for a threshold below one width).
+            let width = |b: usize| if share && !direction { 2.0 * widths[b] * components[comps[b]].tau.max(widths[b]) } else { widths[b] };
+            ops.push(dense(&format!("{prefix}.width"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| width(b)))?);
+            if share && direction {
+                ops.push(dense(&format!("{prefix}.assign"), units(count)?, units(count)?, Array2::eye(count))?);
+            }
             Ok(ops)
         };
         // The attention input stage's nodes from `input` (node 0 of a rule's nodes so far): the
         // stacked read, the gate, the gate's width, the gated activations; returns (gated node,
         // gate node, width node).
-        let stage_nodes = |nodes: &mut Vec<Node>, input: usize, (read, gate_a, gate_b, soft): (usize, usize, usize, usize)| -> (usize, usize, usize) {
+        let stage_nodes = |nodes: &mut Vec<Node>, input: usize, (read, gate_a, gate_b, soft): (usize, usize, usize, usize), assign: Option<usize>| -> (usize, usize, usize) {
+            // A shared stage (`assign`, gates × components): the gates' pre-activations and widths,
+            // then each component's own, z_b = Σ_m A_mb z_m and w_b = Σ_m A_mb w_m (a 0/1
+            // assignment gives each component its gate's), before the reads.
+            if let Some(assign) = assign {
+                let (a, z) = if direction {
+                    nodes.push(Node::Affine { terms: vec![(input, gate_a)], bias: Some(gate_b) });
+                    (None, nodes.len() - 1)
+                } else {
+                    nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
+                    let a = nodes.len() - 1;
+                    nodes.push(Node::GroupNorm { input: a });
+                    nodes.push(Node::Hadamard { left: a + 1, right: a + 1 });
+                    nodes.push(Node::Affine { terms: vec![(a + 2, assign)], bias: Some(gate_b) });
+                    (Some(a), nodes.len() - 1)
+                };
+                nodes.push(Node::Constant { operator: soft });
+                let w = nodes.len() - 1;
+                nodes.push(Node::Transposed { input: z, operator: assign });
+                nodes.push(Node::Transposed { input: w, operator: assign });
+                let (zb, wb) = (nodes.len() - 2, nodes.len() - 1);
+                let a = a.unwrap_or_else(|| {
+                    nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
+                    nodes.len() - 1
+                });
+                nodes.push(Node::Gated { value: a, gate: zb, scale: Some(wb) });
+                return (nodes.len() - 1, zb, wb);
+            }
             // A direction gate and its width come before the reads they gate, so each row reads
             // only its components on (`DeviceProgram`'s gated reads); an own gate reads them.
             let (a, z, s) = if direction {
@@ -261,11 +332,20 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                 }
                 (base, base + 1, base + 2, base + 3)
             } else {
-                let gate_names = if direction { ("direction", "threshold") } else { ("gate_identity", "threshold") };
+                let gate_names = match (direction, attn_shared) {
+                    (true, _) => ("direction", "threshold"),
+                    (false, true) => ("assign", "threshold"),
+                    (false, false) => ("gate_identity", "threshold"),
+                };
                 (shared(&artifact, "read")?, shared(&artifact, gate_names.0)?, shared(&artifact, gate_names.1)?, shared(&artifact, "width")?)
             };
+            let assign = match (attn_shared, h) {
+                (false, _) => None,
+                (true, 0) => Some(if direction { base + 4 } else { base + 1 }),
+                (true, _) => Some(shared(&artifact, "assign")?),
+            };
             let mut nodes = vec![Node::Param { index: 0 }];
-            let (gated, _, _) = stage_nodes(&mut nodes, 0, (read_op, gate_a, gate_b, soft));
+            let (gated, _, _) = stage_nodes(&mut nodes, 0, (read_op, gate_a, gate_b, soft), assign);
             let mut projections = Vec::new();
             for (j, (s, picked)) in selections.iter().enumerate() {
                 let rows = head_rows([query, key, value][j])?;
@@ -324,14 +404,19 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
             let (mut gate_parts, mut soft_parts) = (Vec::new(), Vec::new());
             let carried: Vec<usize> = o_carriers.iter().filter(|b| a_comps.contains(b)).map(|b| a_comps.iter().position(|a| a == b).unwrap_or(0)).collect();
             if !carried.is_empty() {
-                let gate_names = if direction { ("direction", "threshold") } else { ("gate_identity", "threshold") };
+                let gate_names = match (direction, attn_shared) {
+                    (true, _) => ("direction", "threshold"),
+                    (false, true) => ("assign", "threshold"),
+                    (false, false) => ("gate_identity", "threshold"),
+                };
                 let stage_ops = (
                     index_of(&artifact.program, &format!("{name}.attn.read"))?,
                     index_of(&artifact.program, &format!("{name}.attn.{}", gate_names.0))?,
                     index_of(&artifact.program, &format!("{name}.attn.{}", gate_names.1))?,
                     index_of(&artifact.program, &format!("{name}.attn.width"))?,
                 );
-                let (_, z, s) = stage_nodes(&mut nodes, heads, stage_ops);
+                let assign = if attn_shared { Some(index_of(&artifact.program, &format!("{name}.attn.assign"))?) } else { None };
+                let (_, z, s) = stage_nodes(&mut nodes, heads, stage_ops, assign);
                 operators.push(dense(&format!("{name}.o.select_gate"), units(carried.len())?, units(a_comps.len())?, selection(&carried, a_comps.len()))?);
                 nodes.push(Node::Affine { terms: vec![(z, base + operators.len() - 1)], bias: None });
                 gate_parts.push(nodes.len() - 1);
@@ -343,6 +428,9 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                 let own_first = carried.len();
                 operators.push(dense(&format!("{name}.o.select_own"), units(o_own.len())?, units(o_carriers.len())?, selection(&(own_first..o_carriers.len()).collect::<Vec<_>>(), o_carriers.len()))?);
                 let select = base + operators.len() - 1;
+                if is_shared(&o_own) {
+                    return Err(error(format!("layer {l}: gate sharing at the o stage is not built (only at the attention's and the MLP's inputs)")));
+                }
                 let mut gates = gate_ops(&format!("{name}.o"), &o_own, &concat)?;
                 let first = base + operators.len();
                 operators.append(&mut gates);
@@ -411,7 +499,11 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
         let mut gates = gate_ops(&format!("{name}.mlp.fc"), &f_comps, &h2_interface)?;
         operators.append(&mut gates);
         let mut nodes = vec![Node::Param { index: 0 }];
-        let (gated, z_f, s_f) = stage_nodes(&mut nodes, 0, (base, base + 4, base + 5, base + 6));
+        let fc_assign = is_shared(&f_comps).then(|| if direction { base + 7 } else { base + 4 });
+        if fc_assign.is_some() {
+            shares.push(share_of(&format!("{name}.mlp.fc"), &f_comps)?);
+        }
+        let (gated, z_f, s_f) = stage_nodes(&mut nodes, 0, (base, base + 4, base + 5, base + 6), fc_assign);
         nodes.push(Node::Affine { terms: vec![(gated, base + 1)], bias: None });
         nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: laws.clone() });
         let act = nodes.len() - 1;
@@ -433,6 +525,9 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
             let own_first = carried.len();
             operators.push(dense(&format!("{name}.mlp.dn_select_own"), units(d_own.len())?, units(dn_carriers.len())?, selection(&(own_first..dn_carriers.len()).collect::<Vec<_>>(), dn_carriers.len()))?);
             let select = base + operators.len() - 1;
+            if is_shared(&d_own) {
+                return Err(error(format!("layer {l}: gate sharing at the down stage is not built (only at the attention's and the MLP's inputs)")));
+            }
             let mut gates = gate_ops(&format!("{name}.mlp.dn"), &d_own, &up_rows)?;
             let first = base + operators.len();
             operators.append(&mut gates);
@@ -457,7 +552,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
         let rule = Rule { name: format!("{name}.mlp"), inputs: vec![h2_interface.clone()], output: nodes.len() - 1, nodes };
         artifact = artifact.replace_block(&format!("{name}.mlp"), Callee::New(rule), vec![Argument::Native(h2)], layer.mlp, operators)?;
     }
-    groups_of(artifact, layers, direction)
+    Ok(Explanation { shares, ..groups_of(artifact, layers, direction)? })
 }
 
 /// The prior groups, trainable operators and layers of the built artifact (module note).
@@ -608,11 +703,9 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool) -> Resu
     trainable.sort_unstable();
     trainable.dedup();
     let reference = mean_squares(&artifact.program, &groups);
-    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference, reads: Vec::new() })
+    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference, reads: Vec::new(), shares: Vec::new() })
 }
 
-/// The gate and width nodes of a write-side stage from their parts (carried, then own): the part
-/// itself when one, else their concatenation.
 /// The uses of `M`'s maps in an explanation [`explanation`] built (`artifact::Owner::uses`), where
 /// each map is a sum of gated slices no single operator holds: per layer, each head's q, k and v map
 /// (the head rule's input into the node writing the head's projection), each head's block of the o
@@ -685,6 +778,8 @@ pub fn uses(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact
     Ok(out)
 }
 
+/// The gate and width nodes of a write-side stage from their parts (carried, then own): the part
+/// itself when one, else their concatenation.
 fn joined(nodes: &mut Vec<Node>, gates: Vec<usize>, softs: Vec<usize>) -> (usize, usize) {
     if gates.len() == 1 {
         return (gates[0], softs[0]);
