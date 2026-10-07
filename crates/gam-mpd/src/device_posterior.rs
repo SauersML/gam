@@ -854,6 +854,21 @@ impl DevicePosterior {
         Ok((self.mean.get(i).ok_or_else(|| error("no such trainable operator"))?, self.log_sd.get(i).ok_or_else(|| error("no such trainable operator"))?))
     }
 
+    /// Pins operators' means: each `(i, values)` sets trainable operator `i`'s iterate and its
+    /// average to `values`, its deviations and IVON's state as they are, and the groups' variances
+    /// and divergences follow (an exact explanation's slices, `library_mdl::Mix`).
+    pub fn pin(&mut self, pinned: &[(usize, Array2<f64>)]) -> Result<(), String> {
+        for (i, values) in pinned {
+            let mean = self.mean.get_mut(*i).ok_or_else(|| error("no such trainable operator"))?;
+            *mean = self.fitting.upload(values.view()).map_err(error)?;
+            self.average[*i] = self.fitting.copy(&self.mean[*i]).map_err(error)?;
+            if let Some(u) = self.uploaded.get_mut(*i) {
+                *u = None;
+            }
+        }
+        self.refresh()
+    }
+
     /// Trainable operator `i`'s iterate before the pending move and its log standard deviations on
     /// the device ([`Self::iterate_and_log_sd`] on the move's old side).
     pub fn previous_and_log_sd(&self, i: usize) -> Result<(&Tensor, &Tensor), String> {

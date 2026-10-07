@@ -290,8 +290,11 @@ pub struct Share {
 /// `Q = Cayley(S) = (I + S)⁻¹ (I − S)`, `S` skew (`n(n − 1)/2` free entries), so their sum `U Vᵀ` is
 /// the same at every `S`: the parts rotate within the group and the explanation stays exact by
 /// construction. Each slice's read is a row of an operator and its write a column of one or more
-/// (one block of its rows per attention head; [`Place`]); the fit writes them from the slices'
-/// start values and `S`, and chains their gradients to `S` ([`Scorer::take_mixing_gradients`]).
+/// (one block of its rows per attention head; [`Place`]). The fit pins the posterior means of every
+/// mixed operator to its start values with each group's slices rotated by its `Q`
+/// ([`Scorer::pin_mixings`]): the slices' deviations, and so their description, follow the data as
+/// any group's, while their means move only with `S`. It chains the operators' gradients to `S`
+/// ([`Scorer::take_mixing_gradients`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mix {
     /// Per slice of the group its places, every slice's in one order ([`Place::key`]).
@@ -415,32 +418,6 @@ impl Mixing {
         self.gradient += &cayley_gradient(&self.skew, &rotation, &in_rotation)?;
         Ok(())
     }
-}
-
-/// `artifact` with the explanation's mixings at the skews `skews` (one per [`Explanation::mixes`],
-/// as a checkpoint or a report keeps them): every mixed slice rotated within its group.
-pub fn mixed_artifact(explanation: &Explanation, mut artifact: Artifact, skews: &[Vec<Vec<f64>>]) -> Result<Artifact, String> {
-    if skews.len() != explanation.mixes.len() {
-        return Err(format!("{} skews for {} mixing groups", skews.len(), explanation.mixes.len()));
-    }
-    let mut values: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
-    for mix in &explanation.mixes {
-        for place in mix.slices.iter().flatten() {
-            let op = place.key().0;
-            values.entry(op).or_insert_with(|| artifact.program.operators[op].matrix());
-        }
-    }
-    for (mix, skew) in explanation.mixes.iter().zip(skews) {
-        let mut mixing = Mixing::of(&explanation.artifact.program, mix)?;
-        mixing.skew = skew_of(skew, mix.slices.len())?;
-        mixing.write(&mut values)?;
-    }
-    for (op, values) in values {
-        let old = Arc::clone(&artifact.program.operators[op]);
-        let precision = exact_precision(values.iter().copied()).map_err(error)?;
-        artifact.program.operators[op] = Arc::new(Operator::dense(old.name.clone(), old.rows.clone(), old.cols.clone(), values, precision, old.provenance.clone()).map_err(error)?);
-    }
-    Ok(artifact)
 }
 
 /// A saved skew (rows) as an `n × n` skew matrix, refused unless it is one.
@@ -2062,10 +2039,6 @@ pub struct Report {
     pub literals: Literals,
     pub epochs: Vec<Epoch>,
     pub removals: Vec<Removal>,
-    /// The mixings' skews at the end ([`Mix`]), when the explanation has any; the reported artifact
-    /// holds its slices rotated by them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mixings: Option<Vec<Vec<Vec<f64>>>>,
     pub active_groups: usize,
     /// `F` where the fit stopped, in bits.
     pub objective_bits: f64,
@@ -2121,12 +2094,7 @@ impl Fit {
     /// fit's evaluations ran with (`Report::literals`), so it is the artifact the held-out
     /// evaluation scored.
     pub fn artifact(&self, explanation: &Explanation) -> Result<Artifact, String> {
-        let artifact = posterior_mean(explanation, &self.representative())?;
-        let artifact = match &self.report.mixings {
-            Some(skews) => mixed_artifact(explanation, artifact, skews)?,
-            None => artifact,
-        };
-        self.report.literals.apply(artifact)
+        self.report.literals.apply(posterior_mean(explanation, &self.representative())?)
     }
 }
 
@@ -2272,9 +2240,6 @@ impl Mlp {
     }
 }
 
-/// A gated stage's slice with no prior group (an exact explanation's fixed slice), always active.
-const FIXED: usize = usize::MAX;
-
 /// A stage of gated components (`library_vpd`), whose gate node is `z = input·Aᵀ + c` in the flat
 /// program (`A` the identity over the components' read norms for an own gate, the gate rows `g`
 /// for a direction gate): its input node, the threshold operator `c` and the direction operator
@@ -2313,10 +2278,7 @@ impl GatedStage {
             let mut row = 0;
             let mut out = Vec::new();
             for group in program.operators[op].rows.groups() {
-                // A fixed slice (an exact explanation's, `library_vpd`'s mixing) has no read group:
-                // it is always in its component ([`FIXED`]).
-                let fixed = !explanation.trainable.contains(&op);
-                out.push((row..row + group.width).map(|r| read_group.get(&(op, r)).copied().or(fixed.then_some(FIXED)).ok_or_else(|| format!("{name}: no read group of row {r}"))).collect::<Result<Vec<_>, _>>()?);
+                out.push((row..row + group.width).map(|r| read_group.get(&(op, r)).copied().ok_or_else(|| format!("{name}: no read group of row {r}"))).collect::<Result<Vec<_>, _>>()?);
                 row += group.width;
             }
             Ok(out)
@@ -2385,7 +2347,7 @@ impl GatedStage {
 
     /// Per component its active slices, its rank in rank-one equivalents.
     fn ranks(&self, active: &[bool]) -> Vec<f64> {
-        self.slices.iter().map(|groups| groups.iter().filter(|g| **g == FIXED || active[**g]).count() as f64).collect()
+        self.slices.iter().map(|groups| groups.iter().filter(|g| active[**g]).count() as f64).collect()
     }
 }
 
@@ -2423,13 +2385,10 @@ struct Scorer {
     /// assignment at the step's relaxed assignment (`complexity_terms`).
     assignment_budget: Vec<(usize, Array2<f64>)>,
     /// The explanation's orthogonal mixings ([`Mixing`]), every mixed operator's values with each
-    /// group's slices at their start, the mixings' version and the version last written into `P`'s
-    /// program, and the step size of their next step ([`Scorer::step_mixings`]; none before the
-    /// first).
+    /// group's slices at their start, and the step size of the mixings' next step
+    /// ([`Scorer::step_mixings`]; none before the first).
     mixings: Vec<Mixing>,
     mixed: BTreeMap<usize, Array2<f64>>,
-    mix_version: u64,
-    mix_written: Option<u64>,
     mix_step: Option<f64>,
 }
 
@@ -2469,10 +2428,10 @@ impl Scorer {
         // takes gradients for them.
         let mixings = explanation.mixes.iter().map(|mix| Mixing::of(&explanation.artifact.program, mix)).collect::<Result<Vec<_>, String>>()?;
         let mixed: BTreeMap<usize, Array2<f64>> = explanation.mixes.iter().flat_map(|m| m.slices.iter().flatten()).map(|p| p.key().0).map(|op| (op, explanation.artifact.program.operators[op].matrix())).collect();
-        if mixed.keys().any(|op| explanation.trainable.contains(op)) {
-            return Err("a mixed operator is trainable: an exact explanation's slices are fixed".into());
+        if mixed.keys().any(|op| !explanation.trainable.contains(op)) {
+            return Err("a mixed operator outside the posterior: its slices' means are pinned there".into());
         }
-        let differentiated: Vec<usize> = explanation.trainable.iter().copied().chain(assignments.iter().map(|a| a.operator)).chain(mixed.keys().copied()).collect();
+        let differentiated: Vec<usize> = explanation.trainable.iter().copied().chain(assignments.iter().map(|a| a.operator)).collect();
         let mut experiments =
             Interchange::new(device, native, &sites, &explanation.artifact, &differentiated, reads, settings.numeric_bytes, settings.head_tile_rows)?;
         // Every scoring of the fit (its steps, held-out evaluations and removal comparisons) is of
@@ -2488,7 +2447,7 @@ impl Scorer {
         let hard_gates = stages.iter().flatten().filter(|s| !position.contains_key(&s.width)).map(|s| (s.width, s.threshold, program.operators[s.width].rows.width())).collect();
         let scoring = explanation.scoring;
         let thresholds = stages.iter().flatten().map(|s| (s.threshold, program.operators[s.threshold].rows.width())).collect();
-        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new(), mixings, mixed, mix_version: 0, mix_written: None, mix_step: None };
+        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new(), mixings, mixed, mix_step: None };
         scorer.train_gates(None)?;
         Ok(scorer)
     }
@@ -2543,7 +2502,6 @@ impl Scorer {
             (Gates::Relaxed, Values::Previous(_)) => Relaxation::Previous,
             (Gates::Relaxed, _) => Relaxation::Soft,
         })?;
-        self.write_mixings()?;
         let program = self.experiments.explanation_mut();
         match values {
             Values::Mean => posterior.mean_into(program)?,
@@ -2702,9 +2660,6 @@ impl Scorer {
         for a in &self.assignments {
             map.remove(&a.operator);
         }
-        for op in self.mixed.keys() {
-            map.remove(op);
-        }
     }
 
     /// The budget's pull on the assignments (`Settings::budget`): `factor` times the count's
@@ -2791,28 +2746,24 @@ impl Scorer {
         Ok(())
     }
 
-    /// Writes the mixed operators into `P`'s program at the mixings' skews, unless they are there.
-    fn write_mixings(&mut self) -> Result<(), String> {
-        if self.mixings.is_empty() || self.mix_written == Some(self.mix_version) {
+    /// Pins the posterior means of the mixed operators ([`Mix`]): their start values with each group's
+    /// slices rotated by its `Q` at its skew.
+    fn pin_mixings(&self, posterior: &mut DevicePosterior) -> Result<(), String> {
+        if self.mixings.is_empty() {
             return Ok(());
         }
         let mut values = self.mixed.clone();
         for mixing in &self.mixings {
             mixing.write(&mut values)?;
         }
-        let device = self.experiments.models().1.program.device().clone();
-        for (op, values) in values {
-            let tensor = device.upload(values.view()).map_err(error)?;
-            self.experiments.explanation_mut().replace_dense_parameter(op, tensor)?;
-        }
-        self.experiments.explanation_mut().refresh_fused()?;
-        self.mix_written = Some(self.mix_version);
-        Ok(())
+        let pinned = values.into_iter().map(|(op, v)| Ok((self.at(op)?, v))).collect::<Result<Vec<_>, String>>()?;
+        posterior.pin(&pinned)
     }
 
-    /// Takes the mixed operators' gradients out of a training pass's `gradients` (and its factor's),
-    /// chained to the mixings' skews ([`Mixing::gather`]).
-    fn take_mixing_gradients(&mut self, gradients: &mut BTreeMap<usize, Tensor>, factor: Option<&mut interchange::Factor>) -> Result<(), String> {
+    /// Takes the mixed operators' gradients out of a training pass's `gradients`, chained to the
+    /// mixings' skews ([`Mixing::gather`]): their means move only with the skews. Their factor draws
+    /// stay, so their deviations follow the data's curvature.
+    fn take_mixing_gradients(&mut self, gradients: &mut BTreeMap<usize, Tensor>) -> Result<(), String> {
         if self.mixings.is_empty() {
             return Ok(());
         }
@@ -2821,11 +2772,6 @@ impl Scorer {
         for op in self.mixed.keys() {
             if let Some(g) = gradients.remove(op) {
                 host.insert(*op, device.download(&g).map_err(error)?);
-            }
-        }
-        if let Some(f) = factor {
-            for op in self.mixed.keys() {
-                f.gradient.remove(op);
             }
         }
         for mixing in &mut self.mixings {
@@ -2856,7 +2802,6 @@ impl Scorer {
             m.previous = Some(m.skew.clone());
             m.skew.scaled_add(-step * scale, &m.gradient);
         }
-        self.mix_version += 1;
     }
 
     fn accept_mixings(&mut self) {
@@ -2875,7 +2820,6 @@ impl Scorer {
             }
         }
         if reverted {
-            self.mix_version += 1;
             if let Some(step) = self.mix_step.as_mut() {
                 *step *= 0.5;
             }
@@ -2895,7 +2839,6 @@ impl Scorer {
             m.skew = skew_of(skew, m.mix.slices.len())?;
             m.previous = None;
         }
-        self.mix_version += 1;
         Ok(())
     }
 
@@ -3489,9 +3432,9 @@ fn antithetic_step(scorer: &mut Scorer, (device, device_posterior): (&Device, &D
         let targets = scorer.experiments.targets(batch, part)?;
         let mut terms = scorer.terms(device_posterior, (batch, part, &targets), (Values::Iterate(key), Gates::Relaxed), (true, probed.then(|| probe_key(key))))?;
         scorer.take_assignment_gradients(&mut terms.gradient, terms.factor.as_mut(), true)?;
-        scorer.take_mixing_gradients(&mut terms.gradient, terms.factor.as_mut())?;
+        scorer.take_mixing_gradients(&mut terms.gradient)?;
         if let Some(on) = terms.all_on.as_mut() {
-            scorer.take_mixing_gradients(&mut on.gradient, on.factor.as_mut())?;
+            scorer.take_mixing_gradients(&mut on.gradient)?;
         }
         Ok(terms)
     };
@@ -4477,10 +4420,6 @@ pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Po
 /// running fit holds, read from its last save.
 pub fn checkpoint_artifact(explanation: &Explanation, path: &Path, literals: Literals) -> Result<Artifact, String> {
     let mut artifact = literals.apply(posterior_mean(explanation, &checkpoint_posterior(explanation, path)?)?)?;
-    // The mixed slices at the checkpoint's skews.
-    if let Some(saved) = saved_mixings(path)? {
-        artifact = mixed_artifact(explanation, artifact, &saved)?;
-    }
     // The shared stages' assignments as an evaluation holds them: each component on its gate.
     if let Some(saved) = saved_assignments(path)? {
         if saved.len() != explanation.shares.len() {
@@ -5058,6 +4997,7 @@ pub fn fit_from(
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &prior_curvature, &ivon)?;
             scorer.step_assignments(weight * LN_2);
             scorer.step_mixings(weight * LN_2);
+            scorer.pin_mixings(&mut device_posterior)?;
             let posterior_seconds = posterior_started.elapsed().as_secs_f64();
             let (eta, rho, draws_averaged, ratio) = device_posterior.step_state();
             log::info!("library line step {epoch}.{b}: η {eta:.4e}, ρ̄ {rho:.4e} over {draws_averaged} draws, r̄ {ratio:.4e}, trust {:.3e}; posterior step {posterior_seconds:.3} s", device_posterior.trust());
@@ -5242,7 +5182,6 @@ pub fn fit_from(
             seconds: resumed_seconds + started.elapsed().as_secs_f64(),
             epochs: progress.epochs,
             removals: progress.removals,
-            mixings: scorer.saved_mixings(),
         },
         posterior,
     })
@@ -6337,8 +6276,8 @@ mod tests {
     }
 
     /// [`learned_tiny`], with `mixing` exact (`library_vpd`'s mixing): in each layer the q slices
-    /// 0–2, the c_fc slices in threes and the down slices in fours mixed orthogonally, every slice
-    /// fixed.
+    /// 0–2, the c_fc slices in threes and the down slices in fours mixed orthogonally, every slice's
+    /// mean pinned.
     fn learned_tiny_mixed(tag: &str, mixing: bool) -> (OperatorProgram, Explanation, Vec<Vec<u32>>) {
         let dir = crate::test_support::tiny_export(tag, 2);
         let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("export.json")).unwrap()).unwrap();
@@ -6521,18 +6460,18 @@ mod tests {
         assert!(!explanation.mixes.is_empty() && explanation.mixes.iter().all(|m| m.slices.len() > 1));
         let (device, settings) = (Device::host(), settings());
         let posterior = Posterior::new(&explanation, 72).unwrap();
-        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        let mut device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
         let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
         let targets = scorer.experiments.targets(&batch, &experiments).unwrap();
-        let score = |scorer: &mut Scorer| {
-            let alone = scorer.pass(&device_posterior, (&batch, &experiments, &targets), (Values::Mean, Gates::Hard, false), (false, None)).unwrap().bits;
-            let on = scorer.all_on_pass(&device_posterior, (&batch, &experiments), (Values::Mean, Gates::Hard), (false, None)).unwrap().unwrap().bits;
+        let score = |scorer: &mut Scorer, device_posterior: &DevicePosterior| {
+            let alone = scorer.pass(device_posterior, (&batch, &experiments, &targets), (Values::Mean, Gates::Hard, false), (false, None)).unwrap().bits;
+            let on = scorer.all_on_pass(device_posterior, (&batch, &experiments), (Values::Mean, Gates::Hard), (false, None)).unwrap().unwrap().bits;
             (alone, on.iter().flatten().fold(0.0f64, |m, b| m.max(b.abs())))
         };
-        let (unmixed, on) = score(&mut scorer);
+        let (unmixed, on) = score(&mut scorer, &device_posterior);
         assert!(on <= 1e-9, "the unmixed all-on experiment: {on} bits");
         let mut rng = StdRng::seed_from_u64(5);
         for m in &mut scorer.mixings {
@@ -6543,8 +6482,8 @@ mod tests {
             let gap = (q.t().dot(&q) - Array2::<f64>::eye(n)).iter().fold(0.0f64, |a, v| a.max(v.abs()));
             assert!(gap <= 1e-12, "QᵀQ − I {gap}");
         }
-        scorer.mix_version += 1;
-        let (mixed, on) = score(&mut scorer);
+        scorer.pin_mixings(&mut device_posterior).unwrap();
+        let (mixed, on) = score(&mut scorer, &device_posterior);
         assert!(on <= 1e-9, "the mixed all-on experiment: {on} bits");
         let moved = unmixed.iter().flatten().zip(mixed.iter().flatten()).fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
         assert!(moved > 1e-6, "the gated parts moved by {moved}");
@@ -6557,7 +6496,7 @@ mod tests {
         let (native, explanation, sequences) = learned_tiny_mixed("library_mixing_gradient", true);
         let (device, settings) = (Device::host(), settings());
         let posterior = Posterior::new(&explanation, 72).unwrap();
-        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        let mut device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
         let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let batch = draws[0].batch(&sequences).unwrap();
@@ -6566,13 +6505,13 @@ mod tests {
         // A group of the second layer's c_fc slices, at a skew away from zero.
         let k = scorer.mixings.iter().rposition(|m| m.slices_len() == 3).unwrap();
         let start = Array2::from_shape_fn((3, 3), |(i, j)| [[0.0, 0.3, -0.2], [-0.3, 0.0, 0.4], [0.2, -0.4, 0.0]][i][j]);
-        let value = |scorer: &mut Scorer, skew: &Array2<f64>, gradient: bool| {
+        let mut value = |scorer: &mut Scorer, skew: &Array2<f64>, gradient: bool| {
             scorer.mixings[k].skew = skew.clone();
-            scorer.mix_version += 1;
+            scorer.pin_mixings(&mut device_posterior).unwrap();
             scorer.clear_mixing_gradients();
             let mut evaluation = scorer.pass(&device_posterior, (&batch, &experiments, &targets), (Values::Mean, Gates::Relaxed, false), (gradient, None)).unwrap();
             if gradient {
-                scorer.take_mixing_gradients(&mut evaluation.gradient, None).unwrap();
+                scorer.take_mixing_gradients(&mut evaluation.gradient).unwrap();
             }
             evaluation.bits.iter().flatten().sum::<f64>()
         };

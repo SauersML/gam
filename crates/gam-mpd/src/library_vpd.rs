@@ -27,9 +27,10 @@
 //! `(u_i, v_i)` become `U Q`, `V Q` with `Q` orthogonal (`library_mdl::Mix`, `Q = Cayley(S)`, `S`
 //! skew, which the fit trains), so their sum is the same at every `Q` and a component's slices
 //! rotate within their groups. With any mixing group the explanation is exact by construction:
-//! every slice is fixed (its read and write operators hold no prior group and are not trained),
-//! the parts change only by their groups' rotations and their gates, and with slices summing to
-//! `M`'s maps every part on is `M`.
+//! every slice's mean is pinned (`library_mdl` sets the means of the read and write operators to
+//! the slices rotated by their groups' `Q`, unmixed slices at their start; their deviations, and
+//! so their description, still follow the data), the parts change only by their groups' rotations
+//! and their gates, and with slices summing to `M`'s maps every part on at the mean is `M`.
 //!
 //! The gate ([`Gate`](crate::library_vpd::Gate)). Every Gated node's scale is its stage's operator `{stage}.width` (one
 //! entry per component), read as a constant:
@@ -725,9 +726,8 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
     }
     // Each shared component's gate is a choice among its candidates: ln K nats to send.
     let choices: f64 = shares.iter().flat_map(|s| s.candidates.iter()).map(|c| (c.len() as f64).ln()).sum();
-    let exact = !mixing.is_empty();
     let mixes = mixing.iter().map(|group| mix_of(&artifact.program, &held, group)).collect::<Result<Vec<_>, String>>()?;
-    let built = groups_of(artifact, layers, gate, exact)?;
+    let built = groups_of(artifact, layers, gate)?;
     let scoring = match gate {
         Gate::Hard => crate::library_mdl::GateScoring::Compiled,
         Gate::Learned => crate::library_mdl::GateScoring::Hard,
@@ -774,7 +774,7 @@ fn mix_of(program: &OperatorProgram, held: &BTreeMap<(usize, usize), Vec<(String
 }
 
 /// The prior groups, trainable operators and layers of the built artifact (module note).
-fn groups_of(artifact: Artifact, layers: &[LayerNodes], gate: Gate, exact: bool) -> Result<Explanation, String> {
+fn groups_of(artifact: Artifact, layers: &[LayerNodes], gate: Gate) -> Result<Explanation, String> {
     let program = &artifact.program;
     let named = |name: &str| index_of(program, name);
     let mut groups: Vec<Group> = Vec::new();
@@ -788,9 +788,7 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], gate: Gate, exact: bool)
         let heads = layers[l].reads.len();
         // The attention input stage: each stacked read row with its write columns in every head.
         let read = named(&format!("{name}.attn.read"))?;
-        if !exact {
-            trainable.push(read);
-        }
+        trainable.push(read);
         let mut per_component: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         let stacked = program.operators[read].rows.clone();
         let mut row = 0;
@@ -804,7 +802,7 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], gate: Gate, exact: bool)
             column_in.push((j, counters[j]));
             counters[j] += 1;
         }
-        for (b, group) in stacked.groups().iter().enumerate().filter(|_| !exact) {
+        for (b, group) in stacked.groups().iter().enumerate() {
             for _ in 0..group.width {
                 let (j, c) = column_in[row];
                 let mut cells = vec![];
@@ -819,15 +817,13 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], gate: Gate, exact: bool)
                 row += 1;
             }
         }
-        for h in (0..heads).filter(|_| !exact) {
+        for h in 0..heads {
             for part in ["q", "k", "v"] {
                 trainable.push(named(&format!("{name}.h{h}.{part}"))?);
             }
         }
         // The o slices: read rows and write columns; per carrier its component index in the stage.
-        if let Ok(o_read) = named(&format!("{name}.o.read"))
-            && !exact
-        {
+        if let Ok(o_read) = named(&format!("{name}.o.read")) {
             let o_write = named(&format!("{name}.o.write"))?;
             trainable.extend([o_read, o_write]);
             let o_groups = program.operators[o_read].rows.clone();
@@ -876,11 +872,9 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], gate: Gate, exact: bool)
             continue;
         }
         let (fc_read, fc_write, dn_read, dn_write) = (named(&format!("{name}.mlp.fc_read"))?, named(&format!("{name}.mlp.fc_write"))?, named(&format!("{name}.mlp.dn_read"))?, named(&format!("{name}.mlp.dn_write"))?);
-        if !exact {
-            trainable.extend([fc_read, fc_write, dn_read, dn_write]);
-        }
+        trainable.extend([fc_read, fc_write, dn_read, dn_write]);
         let mut r = 0;
-        for (b, group) in program.operators[fc_read].rows.clone().groups().iter().enumerate().filter(|_| !exact) {
+        for (b, group) in program.operators[fc_read].rows.clone().groups().iter().enumerate() {
             let mut mine = Vec::new();
             for _ in 0..group.width {
                 groups.push(Group { name: format!("{name}.mlp.c{b}.fc{r}.read"), cells: vec![Cells { operator: fc_read, rows: vec![r], cols: 0..cols_of(fc_read) }] });
@@ -892,7 +886,7 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], gate: Gate, exact: bool)
             layer.functions.push(mine);
         }
         let mut r = 0;
-        for (k, group) in program.operators[dn_read].rows.clone().groups().iter().enumerate().filter(|_| !exact) {
+        for (k, group) in program.operators[dn_read].rows.clone().groups().iter().enumerate() {
             let mut mine = Vec::new();
             for _ in 0..group.width {
                 groups.push(Group { name: format!("{name}.mlp.k{k}.dn{r}.read"), cells: vec![Cells { operator: dn_read, rows: vec![r], cols: 0..cols_of(dn_read) }] });
