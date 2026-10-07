@@ -609,6 +609,7 @@ def main():
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--split", default="train")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--row-range", default="", help="A:B, draw texts from rows A..B-1 only (e.g. vpd4l Pile rows 0:3584 train, 3584:4096 held out)")
     ap.add_argument("--per-behavior", type=int, default=64, help="prefixes per behavior (--behaviors)")
     ap.add_argument("--transcoders", default="", help="circuit-tracer transcoder directory (layer_{l}.safetensors)")
     ap.add_argument("--tc-layers", default="", help="layers whose transcoder features are asked about, e.g. 3,9,14,20,25")
@@ -636,7 +637,8 @@ def main():
                 windows = np.load(args.windows, mmap_mode="r")
             else:
                 windows = np.memmap(args.windows, dtype="<u4", mode="r").reshape(-1, 128)
-            order = np.random.default_rng(args.seed + 1).permutation(len(windows))
+            lo, hi = (int(x) for x in args.row_range.split(":")) if args.row_range else (0, len(windows))
+            order = lo + np.random.default_rng(args.seed + 1).permutation(hi - lo)  # disjoint ranges keep splits apart
             for s in range(args.offset, args.offset + args.texts, args.batch):
                 Tn = lengths[(s // args.batch) % len(lengths)]
                 rows = order[s : s + args.batch]
