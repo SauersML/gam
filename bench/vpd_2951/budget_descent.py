@@ -395,6 +395,35 @@ if RESID:
             s_R = 0.1 * (X[n] @ W.T).norm(dim=-1).pow(2).mean().sqrt()
             RES[n] = {'tau': (3 * s_R).clone().requires_grad_(), 's': s_R, 'rank': float(min(W.shape)),
                       'ls': torch.full((W.shape[1], W.shape[0]), math.log(1e-3 * W.abs().mean().item()), device=dev).requires_grad_()}
+def residual(n, x):
+    """Map n's residual part on its input x: R = W^T - V U (or its posterior sample), gated on ||x R||."""
+    R = RES[n]['sample'] if RES[n].get('sample') is not None else T.site(n).W.T - assembled(n)
+    out = x @ R
+    for b, kind, G, a in state['entry'].get(n, ()):
+        idx = torch.tensor([b], device=out.device)
+        if kind == 'noop':
+            continue
+        if kind == 'swap':
+            c1, c2 = (torch.arange(h * HD, (h + 1) * HD, device=out.device) for h in G)
+            out = out.index_add(0, idx, (x[b][..., c2] @ R[c2] - x[b][..., c1] @ R[c1])[None])
+        elif kind == 'in':
+            out = out.index_add(0, idx, (a * (x[b][..., G] @ R[G]))[None])
+        else:
+            out = out.index_add(0, idx, (a * (x[b] @ R[:, G]) @ torch.eye(out.shape[-1], device=out.device)[G])[None])
+    if state['drop_R']:
+        out = out.index_fill(0, torch.tensor(state['drop_R'], device=out.device), 0.0)
+    if state['mode'] == 'all':
+        return out * 0.0 if state.get('drop_leftover') else out
+    z = (out.norm(dim=-1) - RES[n]['tau']) / RES[n]['s']
+    hard = (z > 0).float()
+    state['hard'].append(hard.reshape(-1) * RES[n]['rank'])
+    state['resid_on'].setdefault(n, []).append(hard.mean().item())
+    if state['mode'] == 'hard':
+        return out * hard[..., None]
+    phi = 0.5 * (1 + torch.erf(z / SQ2))
+    state['soft'].append(phi.reshape(-1) * RES[n]['rank'])
+    return out * phi[..., None]
+
 del X
 
 state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}, 'resid_on': {}, 'wedits_M': {}, 'wedits_P': {}, 'entry': {}, 'force_on': [], 'drop_R': []}
@@ -815,35 +844,6 @@ if attn:
                 SHARE_A[l] = {'cand_v': cand_v, 'cand_o': cand_o, 'L_v': L_v.requires_grad_(), 'L_o': L_o.requires_grad_(),
                               't': A[v]['tau'].detach().clone().requires_grad_(), 's': A[v]['s'].clone()}
         del cap
-
-def residual(n, x):
-    """Map n's residual part on its input x: R = W^T - V U (or its posterior sample), gated on ||x R||."""
-    R = RES[n]['sample'] if RES[n].get('sample') is not None else T.site(n).W.T - assembled(n)
-    out = x @ R
-    for b, kind, G, a in state['entry'].get(n, ()):
-        idx = torch.tensor([b], device=out.device)
-        if kind == 'noop':
-            continue
-        if kind == 'swap':
-            c1, c2 = (torch.arange(h * HD, (h + 1) * HD, device=out.device) for h in G)
-            out = out.index_add(0, idx, (x[b][..., c2] @ R[c2] - x[b][..., c1] @ R[c1])[None])
-        elif kind == 'in':
-            out = out.index_add(0, idx, (a * (x[b][..., G] @ R[G]))[None])
-        else:
-            out = out.index_add(0, idx, (a * (x[b] @ R[:, G]) @ torch.eye(out.shape[-1], device=out.device)[G])[None])
-    if state['drop_R']:
-        out = out.index_fill(0, torch.tensor(state['drop_R'], device=out.device), 0.0)
-    if state['mode'] == 'all':
-        return out * 0.0 if state.get('drop_leftover') else out
-    z = (out.norm(dim=-1) - RES[n]['tau']) / RES[n]['s']
-    hard = (z > 0).float()
-    state['hard'].append(hard.reshape(-1) * RES[n]['rank'])
-    state['resid_on'].setdefault(n, []).append(hard.mean().item())
-    if state['mode'] == 'hard':
-        return out * hard[..., None]
-    phi = 0.5 * (1 + torch.erf(z / SQ2))
-    state['soft'].append(phi.reshape(-1) * RES[n]['rank'])
-    return out * phi[..., None]
 
 def kl_bits(lm, lp):
     pm = F.log_softmax(lm.float(), -1); pp = F.log_softmax(lp.float(), -1)
