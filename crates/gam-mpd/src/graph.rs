@@ -33,6 +33,7 @@
 //! Every run is the host's float64 execution of the blocks `Library` holds for the start library
 //! (`library_mdl::explanation`), which equals `M`.
 use crate::{
+    interchange::{self, Operation, SharedSite, SiteOp},
     library_readout::Library,
     operator_program::{Law, Rotary, rms_scale},
     tiled_attention::{probabilities, rotate},
@@ -613,6 +614,8 @@ pub struct Execution {
     pub log_probabilities: Array2<f64>,
     pub writes: Vec<Option<Array2<f64>>>,
     recorded: Option<(Vec<Vec<Array1<f64>>>, Vec<Array1<f64>>, Vec<Array1<f64>>)>,
+    /// Per (unit, route slot) its normed input, at the sites `Interventions::record` lists.
+    pub normed: BTreeMap<(usize, usize), Array2<f64>>,
 }
 
 fn project(x: &Array2<f64>, map: &Array2<f64>, norm: Option<&(Array1<f64>, f64)>) -> Array2<f64> {
@@ -626,13 +629,17 @@ fn project(x: &Array2<f64>, map: &Array2<f64>, norm: Option<&(Array1<f64>, f64)>
     out
 }
 
-/// Heads `heads` of `layer` on their query, key and value inputs (residual streams). With
-/// `record`, each head's mean attention-weighted normalized value input as well.
-fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3], spans: &[(usize, usize)], record: bool) -> (Array2<f64>, Vec<Array1<f64>>) {
+/// Heads `heads` of `layer` on their query, key and value inputs (residual streams), `normed`
+/// applied to each normed input (route slot, value). With `record`, each head's mean
+/// attention-weighted normalized value input as well.
+fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3], spans: &[(usize, usize)], record: bool, normed: &mut dyn FnMut(usize, &mut Array2<f64>)) -> (Array2<f64>, Vec<Array1<f64>>) {
     let norm = &layer.attention;
-    let (q_hat, k_hat) = (norm.apply(inputs[0]), norm.apply(inputs[1]));
+    let (mut q_hat, mut k_hat) = (norm.apply(inputs[0]), norm.apply(inputs[1]));
     let v_unit = norm.unit(inputs[2]);
-    let v_hat = &v_unit * &norm.gain.view().insert_axis(Axis(0));
+    let mut v_hat = &v_unit * &norm.gain.view().insert_axis(Axis(0));
+    normed(0, &mut q_hat);
+    normed(1, &mut k_hat);
+    normed(2, &mut v_hat);
     let (rows, d) = v_hat.dim();
     let mut out = Array2::<f64>::zeros((rows, d));
     let mut recorded = Vec::new();
@@ -711,12 +718,21 @@ fn stand_in(weights: &Weights, stats: &Stats, block: &Block) -> Array1<f64> {
 /// With `record`, `M`'s stand-in inputs are measured on the way (every unit must compute and read
 /// the actual stream).
 pub fn execute(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, scored: &[usize], swaps: &BTreeMap<usize, Array2<f64>>, record: bool) -> Result<Execution, String> {
+    execute_with(weights, stats, circuit, batch, scored, swaps, record, &Interventions::default())
+}
+
+/// [`execute`] under the row interventions `ops` (site operations, [`Interventions`]): after a
+/// site, writers' writes scaled or swapped and vectors pushed into the stream; at a site, its
+/// units' normed inputs scaled, pushed or swapped and cut writers read on the donor.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_with(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, scored: &[usize], swaps: &BTreeMap<usize, Array2<f64>>, record: bool, ops: &Interventions) -> Result<Execution, String> {
     let (rows, d) = (batch.tokens.len(), weights.width());
     let vocabulary = weights.embedding.nrows();
     if let Some(t) = batch.tokens.iter().find(|t| **t as usize >= vocabulary) {
         return Err(format!("token {t} outside the vocabulary of {vocabulary}"));
     }
     let embed = weights.embedding.select(Axis(0), &batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>());
+    let units = circuit.units.len();
     let mut embed_standin = Array1::<f64>::zeros(d);
     for (&t, &f) in &stats.tokens {
         embed_standin.scaled_add(f, &weights.embedding.row(t as usize));
@@ -724,10 +740,16 @@ pub fn execute(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batc
     let standins: Vec<Array1<f64>> = if record { vec![Array1::zeros(d); circuit.units.len()] } else { circuit.units.iter().map(|u| stand_in(weights, stats, &u.block)).collect() };
     let mut order: Vec<usize> = (0..circuit.units.len()).collect();
     order.sort_by_key(|&u| circuit.units[u].block.site());
-    // The actual stream and the stand-in stream entering the current site.
-    let mut stream = embed.clone();
-    let mut standin_stream = embed_standin.clone();
-    let mut writes: Vec<Option<Array2<f64>>> = vec![None; circuit.units.len()];
+    // The actual stream and the stand-in stream entering the current site, every unit's write and
+    // the per-row factors of the stand-ins interventions scaled (`embed`'s last).
+    let mut st = Streams {
+        stream: embed.clone(),
+        standin_stream: Array2::from_shape_fn((rows, d), |(_, c)| embed_standin[c]),
+        embed,
+        writes: vec![None; units],
+        factors: vec![None; units + 1],
+    };
+    let mut normed_kept = BTreeMap::new();
     let (mut head_stats, mut mlp_stats) = (vec![vec![Array1::<f64>::zeros(d); 0]; weights.layers.len()], vec![Array1::<f64>::zeros(d); weights.layers.len()]);
     let mut active_stats: Vec<Array1<f64>> = (0..weights.layers.len()).map(|l| Array1::zeros(weights.neurons(l))).collect();
     if record {
@@ -735,27 +757,21 @@ pub fn execute(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batc
             head_stats[l] = vec![Array1::zeros(d); layer.heads.len()];
         }
     }
-    let delta = |w: Writer, writes: &[Option<Array2<f64>>]| -> Option<Array2<f64>> {
-        match w {
-            Writer::Embed => Some(&embed - &embed_standin.view().insert_axis(Axis(0))),
-            Writer::Unit(u) => writes[u].as_ref().map(|a| a - &standins[u].view().insert_axis(Axis(0))),
-        }
-    };
-    let input = |incoming: &Incoming, stream: &Array2<f64>, standin_stream: &Array1<f64>, writes: &[Option<Array2<f64>>]| -> Array2<f64> {
+    let input = |incoming: &Incoming, st: &Streams| -> Array2<f64> {
         match incoming {
             Incoming::AllBut(cut) => {
-                let mut x = stream.clone();
+                let mut x = st.stream.clone();
                 for &w in cut {
-                    if let Some(dw) = delta(w, writes) {
+                    if let Some(dw) = st.delta(w, &embed_standin, &standins) {
                         x -= &dw;
                     }
                 }
                 x
             }
             Incoming::Only(kept) => {
-                let mut x = Array2::from_shape_fn((rows, d), |(_, c)| standin_stream[c]);
+                let mut x = st.standin_stream.clone();
                 for &w in kept {
-                    if let Some(dw) = delta(w, writes) {
+                    if let Some(dw) = st.delta(w, &embed_standin, &standins) {
                         x += &dw;
                     }
                 }
@@ -763,6 +779,7 @@ pub fn execute(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batc
             }
         }
     };
+    ops.after(None, &mut st, &embed_standin, &standins)?;
     let mut at = 0;
     while at < order.len() {
         let site = circuit.units[order[at]].block.site();
@@ -773,14 +790,16 @@ pub fn execute(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batc
                 continue;
             }
             if let Some(value) = swaps.get(&u) {
-                writes[u] = Some(value.clone());
+                st.writes[u] = Some(value.clone());
                 continue;
             }
             let routes = unit.block.routes();
-            let inputs: Vec<Array2<f64>> = routes.iter().map(|r| input(&unit.routes[r.slot()], &stream, &standin_stream, &writes)).collect();
-            writes[u] = Some(match &unit.block {
+            let mut inputs: Vec<Array2<f64>> = routes.iter().map(|r| input(&unit.routes[r.slot()], &st)).collect();
+            ops.cut_inputs(site, unit, routes, &mut inputs, &st)?;
+            let mut normed = |slot: usize, x: &mut Array2<f64>| ops.normed(site, u, slot, x, &mut normed_kept);
+            let write = match &unit.block {
                 Block::Heads { layer, heads } => {
-                    let (w, recorded) = heads_write(&weights.layers[*layer], heads, [&inputs[0], &inputs[1], &inputs[2]], &batch.spans, record);
+                    let (w, recorded) = heads_write(&weights.layers[*layer], heads, [&inputs[0], &inputs[1], &inputs[2]], &batch.spans, record, &mut normed);
                     for (h, r) in heads.iter().zip(recorded) {
                         head_stats[*layer][*h] = r;
                     }
@@ -789,7 +808,9 @@ pub fn execute(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batc
                 Block::Neurons { layer, neurons } => {
                     let lw = &weights.layers[*layer];
                     let mlp = lw.mlp.as_ref().ok_or("a neuron block without an MLP")?;
-                    let active = neurons_active(mlp, neurons, &lw.mlp_norm.apply(&inputs[0]));
+                    let mut x_hat = lw.mlp_norm.apply(&inputs[0]);
+                    normed(0, &mut x_hat);
+                    let active = neurons_active(mlp, neurons, &x_hat);
                     if record {
                         mlp_stats[*layer] = lw.mlp_norm.unit(&inputs[0]).mean_axis(Axis(0)).ok_or("no rows")?;
                         let mean = active.mean_axis(Axis(0)).ok_or("no rows")?;
@@ -799,20 +820,22 @@ pub fn execute(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batc
                     }
                     active.dot(&mlp.out.select(Axis(1), neurons).t())
                 }
-            });
+            };
+            st.writes[u] = Some(write);
         }
         for &u in &order[at..end] {
-            match &writes[u] {
-                Some(w) => stream += w,
-                None => stream += &standins[u].view().insert_axis(Axis(0)),
+            match &st.writes[u] {
+                Some(w) => st.stream += w,
+                None => st.stream += &standins[u].view().insert_axis(Axis(0)),
             }
-            standin_stream += &standins[u];
+            st.standin_stream += &standins[u];
         }
+        ops.after(Some(site), &mut st, &embed_standin, &standins)?;
         at = end;
     }
-    let last = input(&circuit.logits, &stream, &standin_stream, &writes).select(Axis(0), scored);
+    let last = input(&circuit.logits, &st).select(Axis(0), scored);
     let log_probabilities = log_probabilities(weights, &last)?;
-    Ok(Execution { log_probabilities, writes, recorded: record.then_some((head_stats, mlp_stats, active_stats)) })
+    Ok(Execution { log_probabilities, writes: st.writes, recorded: record.then_some((head_stats, mlp_stats, active_stats)), normed: normed_kept })
 }
 
 /// Next-token log-probabilities of final streams (rows × width) through the final norm (its own
@@ -941,6 +964,10 @@ pub enum Experiment {
     /// The edge from `from` to `to` (a node, `None` the logits) on `route` cut: the reader gets the
     /// writer's stand-in write.
     Cut { from: Writer, to: Option<usize>, route: Route, declared: bool },
+    /// Operations on sites `M` and every program share (`interchange::SiteOp`: heads', attentions'
+    /// and MLPs' outputs, the embeddings, the stream after a block, a block's normed input; swaps
+    /// and cuts read the donor, the prompt's counterfactual), [`Interventions`].
+    Sites { draw: SiteDraw },
 }
 
 impl Experiment {
@@ -954,6 +981,14 @@ impl Experiment {
             Self::Swap { .. } => "swap",
             Self::Cut { declared: true, .. } => "cut_declared",
             Self::Cut { declared: false, .. } => "cut_undeclared",
+            Self::Sites { draw } => match draw.family {
+                interchange::Family::Swap => "site_swap",
+                interchange::Family::Zero => "site_zero",
+                interchange::Family::Scale => "site_scale",
+                interchange::Family::Push => "site_push",
+                interchange::Family::Cut => "site_cut",
+                interchange::Family::Read => "site_read",
+            },
         }
     }
 
@@ -974,6 +1009,7 @@ impl Experiment {
             },
             Self::Swap { node: n } => format!("{}'s output replaced by its output on another prompt", node(*n)),
             Self::Cut { from, to, route, .. } => format!("the connection {} >> {}.{route:?} cut (the reader gets its average)", writer(from), to.map_or("logits".to_string(), node)),
+            Self::Sites { draw } => describe_sites(draw),
         }
     }
 }
@@ -983,7 +1019,7 @@ impl Experiment {
 /// program's pieces and pieces it omits, half of those among the four omitted heads first in
 /// `strongest`, heads by measured removal effect), rank-one perturbations, node swaps, edge cuts
 /// (declared edges and undeclared pairs).
-pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usize, seed: u64, strongest: &[(usize, usize)]) -> Vec<Experiment> {
+pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usize, seed: u64, strongest: &[(usize, usize)], sites: &[SiteDraw]) -> Vec<Experiment> {
     let mut out = vec![Experiment::Clean];
     if counterfactual {
         out.push(Experiment::Counterfactual);
@@ -1033,8 +1069,12 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
     }
     for k in 0..count {
         let rng = if k % 2 == 0 { &mut fixed } else { &mut aimed };
-        let kind = if k % 2 == 0 { ["edit_uniform", "rank_one"][rng.random_range(0..2)] } else { kinds[rng.random_range(0..kinds.len())] };
+        // The behavior's half: uniform weight edits, rank-one perturbations and (when a pool of drawn
+        // site operations is given, a manifest's) site operations, a third each.
+        let fixed_kinds: &[&str] = if sites.is_empty() { &["edit_uniform", "rank_one"] } else { &["edit_uniform", "rank_one", "sites"] };
+        let kind = if k % 2 == 0 { fixed_kinds[rng.random_range(0..fixed_kinds.len())] } else { kinds[rng.random_range(0..kinds.len())] };
         out.push(match kind {
+            "sites" => Experiment::Sites { draw: sites[rng.random_range(0..sites.len())].clone() },
             "edit_uniform" => Experiment::Edit { edit: random_edit(rng, None), aimed: false },
             "edit_aimed" => {
                 let own = !graph.blocks.is_empty() && (omitted.is_empty() || rng.random_bool(0.5));
@@ -1105,6 +1145,453 @@ impl Weights {
     }
 }
 
+// ------------------------------------------------------------------------------ site operations
+
+/// The mutable state of a run (`execute_with`): the actual stream and the stand-in stream entering
+/// the current site, `embed`'s actual write, every unit's actual write (`None` while it writes its
+/// stand-in), and per writer (units, then `embed`) the per-row factor interventions scaled its
+/// stand-in by (`None`: 1 at every row).
+struct Streams {
+    stream: Array2<f64>,
+    standin_stream: Array2<f64>,
+    embed: Array2<f64>,
+    writes: Vec<Option<Array2<f64>>>,
+    factors: Vec<Option<Array1<f64>>>,
+}
+
+impl Streams {
+    fn slot(&self, w: Writer) -> usize {
+        match w {
+            Writer::Embed => self.writes.len(),
+            Writer::Unit(u) => u,
+        }
+    }
+
+    /// Writer `w`'s stand-in write at every row (rows × width).
+    fn standin(&self, w: Writer, embed_standin: &Array1<f64>, standins: &[Array1<f64>]) -> Array2<f64> {
+        let s = match w {
+            Writer::Embed => embed_standin,
+            Writer::Unit(u) => &standins[u],
+        };
+        let rows = self.stream.nrows();
+        let mut out = Array2::from_shape_fn((rows, s.len()), |(_, c)| s[c]);
+        if let Some(f) = &self.factors[self.slot(w)] {
+            out *= &f.view().insert_axis(Axis(1));
+        }
+        out
+    }
+
+    /// Writer `w`'s actual write minus its stand-in write, `None` for a unit writing its stand-in.
+    fn delta(&self, w: Writer, embed_standin: &Array1<f64>, standins: &[Array1<f64>]) -> Option<Array2<f64>> {
+        let actual = match w {
+            Writer::Embed => &self.embed,
+            Writer::Unit(u) => self.writes[u].as_ref()?,
+        };
+        Some(actual - &self.standin(w, embed_standin, standins))
+    }
+
+    /// Writer `w`'s actual write, `None` for a unit writing its stand-in.
+    fn actual_mut(&mut self, w: Writer) -> Option<&mut Array2<f64>> {
+        match w {
+            Writer::Embed => Some(&mut self.embed),
+            Writer::Unit(u) => self.writes[u].as_mut(),
+        }
+    }
+}
+
+/// What happens after a site ([`Interventions`]).
+#[derive(Clone, Debug)]
+enum After {
+    /// The writers' writes, actual and stand-in, times the factor at the rows.
+    Scale(Vec<Writer>, Vec<usize>, f64),
+    /// The writers' actual writes at the rows replaced by their writes on the donor (stand-ins do
+    /// not depend on the prompt).
+    Swap(Vec<Writer>, Vec<usize>),
+    /// The vector added to the stream at the rows, the actual and the stand-in stream alike, so
+    /// every later reader of either model receives it.
+    Push(Vec<usize>, Array1<f64>),
+}
+
+/// What happens to every normed input of a site's units ([`Interventions`]).
+#[derive(Clone, Debug)]
+enum OnInput {
+    Scale(Vec<usize>, f64),
+    Push(Vec<usize>, Array1<f64>),
+    /// The normed input at the rows replaced by the same unit's on the donor.
+    Swap(Vec<usize>),
+}
+
+/// The same circuit's run on the donor sequences: `embed`'s write, every unit's write, and the
+/// normed inputs at the sites an input swap names.
+#[derive(Clone, Debug)]
+pub struct Donor {
+    embed: Array2<f64>,
+    writes: Vec<Option<Array2<f64>>>,
+    normed: BTreeMap<(usize, usize), Array2<f64>>,
+}
+
+/// Row interventions of one run: site operations (`interchange::SiteOp`) resolved against a
+/// circuit's units and a batch's rows ([`Interventions::resolve`]), applied identically to `M`
+/// and the program by [`execute_with`]. A writer site's operation acts on the pieces' writes,
+/// actual and stand-in alike (a stand-in is the piece applied to its average input, so its output
+/// scales and moves with the piece's); an operation on the stream after block `b` acts on every
+/// writer up to `b`; an operation on a block's input acts on each of its units' normed inputs; a cut
+/// gives the readers of block `to` the writers' values on the donor.
+#[derive(Clone, Debug, Default)]
+pub struct Interventions {
+    after: Vec<(Option<usize>, After)>,
+    inputs: Vec<(usize, OnInput)>,
+    /// Readers at a site: the writers' writes on the donor in place of their actual writes at the
+    /// rows, through the routes that read the writers' actual writes.
+    cuts: Vec<(usize, Vec<Writer>, Vec<usize>)>,
+    donor: Option<Donor>,
+    /// Sites whose units' normed inputs a run keeps (`Execution::normed`).
+    record: BTreeSet<usize>,
+}
+
+impl Interventions {
+    /// The operations after `point` (a site, `None` before every site, on `embed`).
+    fn after(&self, point: Option<usize>, st: &mut Streams, embed_standin: &Array1<f64>, standins: &[Array1<f64>]) -> Result<(), String> {
+        for (_, op) in self.after.iter().filter(|(p, _)| *p == point) {
+            match op {
+                After::Scale(writers, rows, f) => {
+                    for &w in writers {
+                        let standin = st.standin(w, embed_standin, standins);
+                        let slot = st.slot(w);
+                        let n = st.stream.nrows();
+                        let factors = st.factors[slot].get_or_insert_with(|| Array1::ones(n));
+                        for &r in rows {
+                            factors[r] *= f;
+                        }
+                        for &r in rows {
+                            let contribution = match st.actual_mut(w) {
+                                Some(a) => {
+                                    let old = a.row(r).to_owned();
+                                    a.row_mut(r).mapv_inplace(|v| v * f);
+                                    old
+                                }
+                                None => standin.row(r).to_owned(),
+                            };
+                            st.stream.row_mut(r).scaled_add(f - 1.0, &contribution);
+                            st.standin_stream.row_mut(r).scaled_add(f - 1.0, &standin.row(r));
+                        }
+                    }
+                }
+                After::Swap(writers, rows) => {
+                    let donor = self.donor.as_ref().ok_or("a swap without a donor run")?;
+                    for &w in writers {
+                        let value = match w {
+                            Writer::Embed => Some(&donor.embed),
+                            Writer::Unit(u) => donor.writes.get(u).and_then(Option::as_ref),
+                        };
+                        let (Some(value), Some(actual)) = (value.cloned(), st.actual_mut(w)) else { continue };
+                        let mut change = Array2::<f64>::zeros(actual.dim());
+                        for &r in rows {
+                            change.row_mut(r).assign(&(&value.row(r) - &actual.row(r)));
+                            actual.row_mut(r).assign(&value.row(r));
+                        }
+                        st.stream += &change;
+                    }
+                }
+                After::Push(rows, v) => {
+                    for &r in rows {
+                        st.stream.row_mut(r).scaled_add(1.0, v);
+                        st.standin_stream.row_mut(r).scaled_add(1.0, v);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Unit `unit`'s route inputs at `site` (one per route of `routes`) under the cuts into it: a
+    /// writer it reads actually (an edge kept) is read on the donor at the cut rows.
+    fn cut_inputs(&self, site: usize, unit: &Unit, routes: &[Route], inputs: &mut [Array2<f64>], st: &Streams) -> Result<(), String> {
+        for (_, writers, rows) in self.cuts.iter().filter(|(to, _, _)| *to == site) {
+            let donor = self.donor.as_ref().ok_or("a cut without a donor run")?;
+            for &w in writers {
+                let (actual, value) = match w {
+                    Writer::Embed => (Some(&st.embed), Some(&donor.embed)),
+                    Writer::Unit(u) => (st.writes[u].as_ref(), donor.writes.get(u).and_then(Option::as_ref)),
+                };
+                let (Some(actual), Some(value)) = (actual, value) else { continue };
+                for (x, route) in inputs.iter_mut().zip(routes) {
+                    let reads = match &unit.routes[route.slot()] {
+                        Incoming::AllBut(cut) => !cut.contains(&w),
+                        Incoming::Only(kept) => kept.contains(&w),
+                    };
+                    if reads {
+                        for &r in rows {
+                            x.row_mut(r).scaled_add(1.0, &(&value.row(r) - &actual.row(r)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Unit `u`'s normed input on route slot `slot` at `site` under the input operations there,
+    /// kept in `kept` when the site is recorded.
+    fn normed(&self, site: usize, u: usize, slot: usize, x: &mut Array2<f64>, kept: &mut BTreeMap<(usize, usize), Array2<f64>>) {
+        for (_, op) in self.inputs.iter().filter(|(s, _)| *s == site) {
+            match op {
+                OnInput::Scale(rows, f) => rows.iter().for_each(|&r| x.row_mut(r).mapv_inplace(|v| v * f)),
+                OnInput::Push(rows, v) => rows.iter().for_each(|&r| x.row_mut(r).scaled_add(1.0, v)),
+                OnInput::Swap(rows) => {
+                    if let Some(value) = self.donor.as_ref().and_then(|d| d.normed.get(&(u, slot))) {
+                        rows.iter().for_each(|&r| x.row_mut(r).assign(&value.row(r)));
+                    }
+                }
+            }
+        }
+        if self.record.contains(&site) {
+            kept.insert((u, slot), x.clone());
+        }
+    }
+
+    /// Whether the operations read a donor run (swaps and cuts).
+    pub fn needs_donor(draw: &SiteDraw) -> bool {
+        draw.ops.iter().any(|o| matches!(o.operation, Operation::Swap | Operation::Cut { .. }))
+    }
+
+    /// The sites whose normed inputs the donor run must keep (input swaps).
+    pub fn donor_record(draw: &SiteDraw, weights: &Weights) -> BTreeSet<usize> {
+        draw.ops.iter().filter(|o| o.operation == Operation::Swap).filter_map(|o| match o.site {
+            SharedSite::Input(b) if b < 2 * weights.layers.len() => Some(b),
+            _ => None,
+        }).collect()
+    }
+
+    /// A donor-run's interventions: none, its normed inputs at `record` kept.
+    pub fn recording(record: BTreeSet<usize>) -> Self {
+        Self { record, ..Self::default() }
+    }
+
+    /// `draw`'s operations on `circuit` (split by [`Circuit::split_heads`] at the heads it names)
+    /// over `batch`'s rows, with the donor run `donor` when it swaps or cuts.
+    pub fn resolve(draw: &SiteDraw, circuit: &Circuit, weights: &Weights, batch: &Batch, units: &SiteUnits, donor: Option<&Execution>, donor_batch: Option<&Batch>) -> Result<Self, String> {
+        let blocks = 2 * weights.layers.len();
+        let mut out = Self::default();
+        if let (Some(run), Some(b)) = (donor, donor_batch) {
+            let tokens: Vec<usize> = b.tokens.iter().map(|t| *t as usize).collect();
+            out.donor = Some(Donor { embed: weights.embedding.select(Axis(0), &tokens), writes: run.writes.clone(), normed: run.normed.clone() });
+        }
+        let heads_at = |pred: &dyn Fn(&Block) -> bool| -> Vec<Writer> { circuit.units.iter().enumerate().filter(|(_, u)| pred(&u.block)).map(|(i, _)| Writer::Unit(i)).collect() };
+        for op in &draw.ops {
+            let rows = op_rows(batch, draw.position, draw.length, op.onward);
+            let (point, writers): (Option<usize>, Vec<Writer>) = match op.site {
+                SharedSite::Head(h) => {
+                    let (l, hh) = head_of(weights, h)?;
+                    (Some(2 * l), heads_at(&|b| matches!(b, Block::Heads { layer, heads } if *layer == l && heads.as_slice() == [hh])))
+                }
+                SharedSite::Attention(l) => (Some(2 * l), heads_at(&|b| matches!(b, Block::Heads { layer, .. } if *layer == l))),
+                SharedSite::Mlp(l) => (Some(2 * l + 1), heads_at(&|b| matches!(b, Block::Neurons { layer, .. } if *layer == l))),
+                SharedSite::Embedding => (None, vec![Writer::Embed]),
+                SharedSite::Stream(b) => (Some(b), [Writer::Embed].into_iter().chain(heads_at(&|x| x.site() <= b)).collect()),
+                SharedSite::Input(_) => (None, Vec::new()),
+            };
+            if let SharedSite::Head(h) = op.site
+                && writers.len() != 1
+            {
+                return Err(format!("head {h} is not its own unit (split the circuit first)"));
+            }
+            if point.is_some_and(|p| p >= blocks) {
+                return Err(format!("{:?} past the last block", op.site));
+            }
+            let push = |direction: usize, size: usize| -> Result<Array1<f64>, String> {
+                let v = units.directions.get(direction).ok_or_else(|| format!("no pushed direction {direction}"))?;
+                let typical = units.typical.get(&op.site).ok_or_else(|| format!("no typical norm of {:?}", op.site))?;
+                let scale = interchange::SIZES.get(size).ok_or("no such push size")? * typical;
+                if v.len() != weights.width() {
+                    return Err("a pushed direction of another width".into());
+                }
+                Ok(Array1::from_iter(v.iter().map(|x| x * scale)))
+            };
+            let factor = |i: usize| interchange::SCALES.get(i).copied().ok_or_else(|| format!("no scale {i}"));
+            match (op.site, op.operation) {
+                (SharedSite::Input(b), operation) => {
+                    if b >= blocks {
+                        return Err(format!("input {b} past the last block"));
+                    }
+                    out.inputs.push((
+                        b,
+                        match operation {
+                            Operation::Scale(i) => OnInput::Scale(rows, factor(i)?),
+                            Operation::Push { direction, size } => OnInput::Push(rows, push(direction, size)?),
+                            Operation::Swap => OnInput::Swap(rows),
+                            Operation::Cut { .. } => return Err("a cut from a block's input".into()),
+                        },
+                    ));
+                }
+                (_, Operation::Scale(i)) => out.after.push((point, After::Scale(writers, rows, factor(i)?))),
+                (_, Operation::Push { direction, size }) => out.after.push((point, After::Push(rows, push(direction, size)?))),
+                (_, Operation::Swap) => out.after.push((point, After::Swap(writers, rows))),
+                (_, Operation::Cut { to }) => {
+                    if to >= blocks || point.is_some_and(|p| p >= to) {
+                        return Err(format!("a cut from {:?} into block {to}", op.site));
+                    }
+                    out.cuts.push((to, writers, rows));
+                }
+            }
+        }
+        if out.donor.is_none() && (!out.cuts.is_empty() || out.after.iter().any(|(_, a)| matches!(a, After::Swap(..))) || out.inputs.iter().any(|(_, i)| matches!(i, OnInput::Swap(_)))) {
+            return Err("swaps and cuts need a donor run".into());
+        }
+        Ok(out)
+    }
+}
+
+/// Head `h` numbered layer by layer (`SharedSite::Head`) as (layer, head).
+fn head_of(weights: &Weights, h: usize) -> Result<(usize, usize), String> {
+    let mut rest = h;
+    for (l, layer) in weights.layers.iter().enumerate() {
+        if rest < layer.heads.len() {
+            return Ok((l, rest));
+        }
+        rest -= layer.heads.len();
+    }
+    Err(format!("no head {h}"))
+}
+
+/// The rows an operation drawn at `position` for sequences of `length` tokens acts on in each of
+/// `batch`'s sequences: the position mapped onto a sequence of `n` tokens as
+/// `1 + (position − 1)(n − 1) / (length − 1)` (position 0, the attention sink, stays 0), alone or
+/// with every row after it (`onward`).
+pub fn op_rows(batch: &Batch, position: usize, length: usize, onward: bool) -> Vec<usize> {
+    let mut out = Vec::new();
+    for &(start, n) in &batch.spans {
+        let p = if position == 0 || n == 1 || length <= 1 { 0 } else { (1 + (position - 1) * (n - 1) / (length - 1)).min(n - 1) };
+        if onward {
+            out.extend(start + p..start + n);
+        } else {
+            out.push(start + p);
+        }
+    }
+    out
+}
+
+impl Circuit {
+    /// The circuit with each of `heads` (layer, head) its own unit, computing and routed as its unit
+    /// was (a unit's heads compute independently of each other, so no output changes): the units a
+    /// head's site operation acts on. Split units keep their index for the first part; the rest
+    /// are appended, and every route reading the unit reads all of its parts.
+    pub fn split_heads(&self, heads: &BTreeSet<(usize, usize)>) -> Circuit {
+        let mut out = self.clone();
+        let mut parts: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for u in 0..self.units.len() {
+            let Block::Heads { layer, heads: hs } = &self.units[u].block else { continue };
+            let singled: Vec<usize> = hs.iter().copied().filter(|h| heads.contains(&(*layer, *h))).collect();
+            if singled.is_empty() || hs.len() == 1 {
+                continue;
+            }
+            let rest: Vec<usize> = hs.iter().copied().filter(|h| !singled.contains(h)).collect();
+            let mut groups: Vec<Vec<usize>> = singled.into_iter().map(|h| vec![h]).collect();
+            if !rest.is_empty() {
+                groups.push(rest);
+            }
+            out.units[u].block = Block::Heads { layer: *layer, heads: groups[0].clone() };
+            for g in &groups[1..] {
+                parts.entry(u).or_default().push(out.units.len());
+                let mut unit = self.units[u].clone();
+                unit.block = Block::Heads { layer: *layer, heads: g.clone() };
+                out.units.push(unit);
+            }
+        }
+        let widen = |incoming: &mut Incoming| {
+            let set = match incoming {
+                Incoming::Only(s) | Incoming::AllBut(s) => s,
+            };
+            for (u, more) in &parts {
+                if set.contains(&Writer::Unit(*u)) {
+                    set.extend(more.iter().map(|&m| Writer::Unit(m)));
+                }
+            }
+        };
+        for unit in &mut out.units {
+            unit.routes.iter_mut().for_each(widen);
+        }
+        widen(&mut out.logits);
+        out
+    }
+}
+
+/// One drawn site-operation experiment: its family, operations and position, drawn for sequences
+/// of `length` tokens ([`op_rows`] maps the position onto each prompt).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SiteDraw {
+    pub family: interchange::Family,
+    pub ops: Vec<SiteOp>,
+    pub position: usize,
+    pub length: usize,
+}
+
+/// What site operations are drawn from and measured in: each site's typical norm (the unit of a
+/// push, `Interchange::measure_typical`), the pushed directions (`interchange::seeded_directions`),
+/// and the pool of drawn experiments the uniform half takes from (a manifest's).
+#[derive(Clone, Debug, Default)]
+pub struct SiteUnits {
+    pub typical: BTreeMap<SharedSite, f64>,
+    pub directions: Vec<Vec<f64>>,
+    pub pool: Vec<SiteDraw>,
+}
+
+impl SiteUnits {
+    /// The experiments of an immutable experiment manifest (`mpd_library_mdl_2951`'s `Manifest`,
+    /// e.g. `~/mpd-data/compare/manifest/MANIFEST_vpd4l_s1.json`) drawn on sequences of `length`
+    /// tokens of a model of width `width`: its typical norms, its pushed directions (stored, or
+    /// seeded from its seed as `Interchange::set_directions` draws them), and every experiment of
+    /// operations on shared sites in its order.
+    pub fn manifest(path: &std::path::Path, length: usize, width: usize) -> Result<Self, String> {
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?).map_err(|e| format!("{}: {e}", path.display()))?;
+        let typical: Vec<(SharedSite, f64)> = serde_json::from_value(value["typical"].clone()).map_err(|e| format!("manifest typical: {e}"))?;
+        let stored: Vec<Vec<f64>> = serde_json::from_value(value.get("push").cloned().unwrap_or(serde_json::Value::Array(Vec::new()))).map_err(|e| format!("manifest push: {e}"))?;
+        let seed = value["seed"].as_u64().ok_or("manifest seed")?;
+        let directions = if stored.is_empty() { interchange::seeded_directions(interchange::DIRECTIONS, width, seed) } else { stored };
+        let batches: Vec<Vec<interchange::Experiment>> = serde_json::from_value(value["experiments"].clone()).map_err(|e| format!("manifest experiments: {e}"))?;
+        let pool = batches
+            .into_iter()
+            .flatten()
+            .filter_map(|e| match e.patch {
+                Some(interchange::Patch::Ops { family, ops }) => Some(SiteDraw { family, ops, position: e.position, length }),
+                _ => None,
+            })
+            .collect();
+        Ok(Self { typical: typical.into_iter().collect(), directions, pool })
+    }
+}
+
+/// Site operations in words (the reader's description; the same for `M` and every program).
+fn describe_sites(draw: &SiteDraw) -> String {
+    let block = |b: usize| format!("layer {}'s {}", b / 2, if b % 2 == 0 { "attention" } else { "MLP" });
+    let site = |s: &SharedSite| match s {
+        SharedSite::Head(h) => format!("the output of head {h} (heads numbered layer by layer)"),
+        SharedSite::Attention(l) => format!("the output of layer {l}'s attention (all its heads)"),
+        SharedSite::Mlp(l) => format!("the output of L[{l}].mlp"),
+        SharedSite::Embedding => "the token embeddings".to_string(),
+        SharedSite::Stream(b) => format!("the residual stream after {}", block(*b)),
+        SharedSite::Input(b) => format!("the normalized input of {}", block(*b)),
+    };
+    let ops: Vec<String> = draw
+        .ops
+        .iter()
+        .map(|o| match o.operation {
+            Operation::Scale(i) if interchange::SCALES[i] == 0.0 => format!("{} set to zero", site(&o.site)),
+            Operation::Scale(i) => format!("{} times {}", site(&o.site), interchange::SCALES[i]),
+            Operation::Push { size, .. } => format!("{} plus a fixed random direction of {} times its typical size", site(&o.site), interchange::SIZES[size]),
+            Operation::Swap => format!("{} replaced by its value on the counterfactual text", site(&o.site)),
+            Operation::Cut { to } => format!("{} reads {} as computed on the counterfactual text", block(to), site(&o.site)),
+        })
+        .collect();
+    let onward = draw.ops.first().is_some_and(|o| o.onward);
+    let rows = match (draw.position, onward) {
+        (0, true) => "at every token".to_string(),
+        (p, true) => format!("from the token {:.0}% of the way into the text on", 100.0 * p as f64 / draw.length.max(1) as f64),
+        (p, false) => format!("at the token {:.0}% of the way into the text", 100.0 * p as f64 / draw.length.max(1) as f64),
+    };
+    format!("{}: {}", rows, ops.join("; "))
+}
+
 // ------------------------------------------------------------------------------ behaviors
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1163,6 +1650,8 @@ pub struct Checker {
     /// Heads by their measured removal effect on `M` (mean `KL(M ‖ M without the head)` at the
     /// targets), strongest first; measured on first use.
     strongest: Option<Vec<(usize, usize)>>,
+    /// The units and pool of site operations (`SiteUnits::manifest`); empty draws none.
+    pub sites: SiteUnits,
 }
 
 /// Every score term (bits) and the counts behind them.
@@ -1234,7 +1723,7 @@ impl Checker {
             donors.extend(group.iter().enumerate().map(|(k, &i)| (i, group[(k + 1) % group.len()])));
         }
         donors.sort_unstable();
-        Ok(Self { weights, behavior, stats, clean: (batch, rows), counterfactual, donors, cache: BTreeMap::new(), strongest: None })
+        Ok(Self { weights, behavior, stats, clean: (batch, rows), counterfactual, donors, cache: BTreeMap::new(), strongest: None, sites: SiteUnits::default() })
     }
 
     /// The experiment's key for `M`'s cache: what it does to which pieces.
@@ -1288,6 +1777,7 @@ impl Checker {
                     let rows = scored_rows(&base, &targets)?;
                     Ok(execute(&self.weights, &self.stats, &circuit, &base, &rows, &[(*node, value)].into(), false)?.log_probabilities)
                 }
+                Experiment::Sites { draw } => self.sites_outcome(&circuit, draw),
                 _ => Ok(execute(&self.weights, &self.stats, &circuit, batch, rows, &BTreeMap::new(), false)?.log_probabilities),
             }
         })();
@@ -1320,7 +1810,7 @@ impl Checker {
             Err(e) => (Graph::empty(), false, Some(e)),
         };
         let strongest = self.strongest()?;
-        let experiments = sample(&self.weights, &graph, self.counterfactual.is_some(), count, seed, &strongest);
+        let experiments = sample(&self.weights, &graph, self.counterfactual.is_some(), count, seed, &strongest, &self.sites.pool);
         let circuit = graph.program(&self.weights, edges);
         let mut per_family: BTreeMap<String, Family> = BTreeMap::new();
         let mut total = (0.0, 0usize);
@@ -1384,6 +1874,62 @@ impl Checker {
         let order: Vec<(usize, usize)> = effects.into_iter().map(|(k, _)| k).collect();
         self.strongest = Some(order.clone());
         Ok(order)
+    }
+
+    /// Whether every prompt has a counterfactual of its own length: the donor of site operations.
+    fn counterfactual_donors(&self) -> bool {
+        self.behavior.prompts.iter().all(|p| p.counterfactual.as_ref().is_some_and(|c| c.token_ids.len() == p.token_ids.len()))
+    }
+
+    /// A site operation's base sequences, their scored rows and the donor sequences: every prompt
+    /// with its counterfactual, else (when the counterfactuals differ in length) the prompts with a
+    /// same-length prompt as donor, as node swaps take them; no donor when the operations read none.
+    fn site_batches(&self, donor: bool) -> Result<(Batch, Vec<usize>, Option<Batch>), String> {
+        let prompts = &self.behavior.prompts;
+        let all: Vec<Vec<u32>> = prompts.iter().map(|p| p.token_ids.clone()).collect();
+        if !donor || self.counterfactual_donors() {
+            let base = Batch::new(&all)?;
+            let rows = self.clean.1.clone();
+            let donor = if donor { Some(Batch::new(&prompts.iter().map(|p| p.counterfactual.as_ref().map(|c| c.token_ids.clone()).unwrap_or_default()).collect::<Vec<_>>())?) } else { None };
+            return Ok((base, rows, donor));
+        }
+        if self.donors.is_empty() {
+            return Err("site operations with a donor need same-length counterfactuals or two prompts of one length".into());
+        }
+        let base = Batch::new(&self.donors.iter().map(|(i, _)| prompts[*i].token_ids.clone()).collect::<Vec<_>>())?;
+        let donors = Batch::new(&self.donors.iter().map(|(_, j)| prompts[*j].token_ids.clone()).collect::<Vec<_>>())?;
+        let targets: Vec<(usize, &[usize])> = self.donors.iter().enumerate().map(|(k, (i, _))| (k, prompts[*i].target_positions.as_slice())).collect();
+        let rows = scored_rows(&base, &targets)?;
+        Ok((base, rows, Some(donors)))
+    }
+
+    /// `circuit` under site operations `draw` ([`Interventions`]): its log-probabilities at the
+    /// scored rows.
+    fn sites_outcome(&self, circuit: &Circuit, draw: &SiteDraw) -> Result<Array2<f64>, String> {
+        let heads: BTreeSet<(usize, usize)> = draw.ops.iter().filter_map(|o| if let SharedSite::Head(h) = o.site { head_of(&self.weights, h).ok() } else { None }).collect();
+        let circuit = circuit.split_heads(&heads);
+        let (base, rows, donor) = self.site_batches(Interventions::needs_donor(draw))?;
+        let donor_run = match &donor {
+            Some(b) => Some(execute_with(&self.weights, &self.stats, &circuit, b, &[], &BTreeMap::new(), false, &Interventions::recording(Interventions::donor_record(draw, &self.weights)))?),
+            None => None,
+        };
+        let ops = Interventions::resolve(draw, &circuit, &self.weights, &base, &self.sites, donor_run.as_ref(), donor.as_ref())?;
+        Ok(execute_with(&self.weights, &self.stats, &circuit, &base, &rows, &BTreeMap::new(), false, &ops)?.log_probabilities)
+    }
+
+    /// An experiment's scored tokens as (prompt, position), in its rows' order: a node swap's and a
+    /// donor-reading site operation's without same-length counterfactuals are the prompts with a
+    /// same-length donor; a counterfactual's positions are the prompt's.
+    pub fn rows_of(&self, e: &Experiment) -> Vec<(usize, usize)> {
+        let subset = match e {
+            Experiment::Swap { .. } => true,
+            Experiment::Sites { draw } => Interventions::needs_donor(draw) && !self.counterfactual_donors(),
+            _ => false,
+        };
+        if subset {
+            return self.swap_targets();
+        }
+        self.behavior.prompts.iter().enumerate().flat_map(|(i, p)| p.target_positions.iter().map(move |&t| (i, t))).collect()
     }
 
     /// Each swapped prompt with its donor.

@@ -463,6 +463,83 @@ pub fn parts_of(program: &OperatorProgram, layers: usize) -> Result<Vec<Part>, S
     Ok(out)
 }
 
+/// `count` unit directions of width `width` drawn from `seed` (each coordinate standard normal,
+/// then normalized): the directions [`Operation::Push`] adds ([`Interchange::set_directions`]),
+/// the same for every model.
+pub fn seeded_directions(count: usize, width: usize, seed: u64) -> Vec<Vec<f64>> {
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed);
+    let mut normal = || -> f64 {
+        let (u, v): (f64, f64) = (rng.random::<f64>().max(f64::MIN_POSITIVE), rng.random());
+        (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+    };
+    (0..count)
+        .map(|_| {
+            let v: Vec<f64> = (0..width).map(|_| normal()).collect();
+            let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            v.into_iter().map(|x| x / norm).collect()
+        })
+        .collect()
+}
+
+/// One experiment's operations of `family` on sequences of `length` tokens and its position
+/// ([`Interchange::draw_ops`]), over the shared sites `shared` (ascending), `head_blocks` each
+/// head's block, `typical` the sites' typical norms, `directions` pushed directions and `blocks`
+/// blocks: what a model outside an [`Interchange`] (the graph checker, `graph`) draws from.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_site_ops(rng: &mut impl RngExt, family: Family, length: usize, shared: &[SharedSite], head_blocks: &[usize], typical: &BTreeMap<SharedSite, f64>, directions: usize, blocks: usize) -> Result<(Patch, usize), String> {
+    let sites: Vec<SharedSite> = shared
+        .iter()
+        .copied()
+        .filter(|s| match family {
+            Family::Swap | Family::Scale => true,
+            Family::Zero => !matches!(s, SharedSite::Stream(_)),
+            Family::Push => !matches!(s, SharedSite::Head(_)) && typical.contains_key(s),
+            // A cut starts at an attention's or an MLP's output before the last block.
+            Family::Cut => matches!(s, SharedSite::Attention(_) | SharedSite::Mlp(_)) && s.block(head_blocks).is_some_and(|b| b + 1 < blocks),
+            Family::Read => false,
+        })
+        .collect();
+    if sites.is_empty() || length == 0 || (family == Family::Push && directions == 0) {
+        return Err(error(format!("{family:?}: no site to operate on, or empty sequences")));
+    }
+    let k = (1usize << rng.random_range(0..=4)).min(sites.len());
+    let chosen = hybrid_of(rng, sites.len(), k);
+    // A one-token sequence (a real-valued toy's input, `bench/toys_2951`) is edited at its
+    // token; the draw is made all the same, so longer sequences draw as before.
+    let (position, onward) = match rng.random_range(0..3) {
+        _ if length == 1 => (0, true),
+        0 => (rng.random_range(1..length), false),
+        1 => (rng.random_range(1..length), true),
+        _ => (0, true),
+    };
+    let mut ops = Vec::with_capacity(k);
+    let every = family == Family::Cut && rng.random_range(0..2) == 0;
+    for (site, _) in sites.iter().zip(&chosen).filter(|(_, c)| **c) {
+        let operation = match family {
+            Family::Swap => Operation::Swap,
+            Family::Zero => Operation::Scale(0),
+            Family::Scale => Operation::Scale(rng.random_range(1..SCALES.len())),
+            Family::Push => Operation::Push { direction: rng.random_range(0..directions), size: rng.random_range(0..SIZES.len()) },
+            // A cut into one later block uniform after its site's, or (half of the experiments)
+            // into every later block's read, so the whole rest of the model sees the site's
+            // donor value; one cut into each block's read.
+            Family::Cut => {
+                let from = site.block(&head_blocks).ok_or_else(|| error("a cut at an unknown site"))?;
+                let targets: Vec<usize> = if every { (from + 1..blocks).collect() } else { vec![rng.random_range(from + 1..blocks)] };
+                for to in targets {
+                    if !ops.iter().any(|o: &SiteOp| o.operation == Operation::Cut { to }) {
+                        ops.push(SiteOp { site: *site, operation: Operation::Cut { to }, onward });
+                    }
+                }
+                continue;
+            }
+            Family::Read => return Err(error("a read patch is not an operation on a site")),
+        };
+        ops.push(SiteOp { site: *site, operation, onward });
+    }
+    Ok((Patch::Ops { family, ops }, position))
+}
+
 /// The families of patched experiments: a read patch, single or joint ([`sample`]), and
 /// operations on shared sites ([`Interchange::sample_ops`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
@@ -2924,19 +3001,7 @@ impl Interchange {
     /// normal, then normalized): the directions [`Operation::Push`] adds, the same for every model.
     pub fn set_directions(&mut self, count: usize, seed: u64) {
         let width = self.m.widths()[self.m_sites.entries[0]];
-        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed);
-        let mut normal = || -> f64 {
-            let (u, v): (f64, f64) = (rng.random::<f64>().max(f64::MIN_POSITIVE), rng.random());
-            (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
-        };
-        let directions: Vec<Vec<f64>> = (0..count)
-            .map(|_| {
-                let v: Vec<f64> = (0..width).map(|_| normal()).collect();
-                let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-                v.into_iter().map(|x| x / norm).collect()
-            })
-            .collect();
-        self.set_push_directions(directions);
+        self.set_push_directions(seeded_directions(count, width, seed));
     }
 
     /// `directions` as the directions [`Operation::Push`] adds (index `i` the `i`-th), the same for
@@ -3025,59 +3090,8 @@ impl Interchange {
     /// One experiment's operations of `family` on sequences of `length` tokens and its position, as
     /// [`Interchange::sample_ops`] draws them.
     pub fn draw_ops(&self, rng: &mut impl RngExt, family: Family, length: usize) -> Result<(Patch, usize), String> {
-        let directions = self.m_sites.parts.directions.len();
-        let blocks = self.m_sites.entries.len();
-        let sites: Vec<SharedSite> = self
-            .shared_sites()
-            .into_iter()
-            .filter(|s| match family {
-                Family::Swap | Family::Scale => true,
-                Family::Zero => !matches!(s, SharedSite::Stream(_)),
-                Family::Push => !matches!(s, SharedSite::Head(_)) && self.m_sites.parts.typical.contains_key(s),
-                // A cut starts at an attention's or an MLP's output before the last block.
-                Family::Cut => matches!(s, SharedSite::Attention(_) | SharedSite::Mlp(_)) && s.block(&self.m_sites.parts.head_blocks).is_some_and(|b| b + 1 < blocks),
-                Family::Read => false,
-            })
-            .collect();
-        if sites.is_empty() || length == 0 || (family == Family::Push && directions == 0) {
-            return Err(error(format!("{family:?}: no site to operate on, or empty sequences")));
-        }
-        let k = (1usize << rng.random_range(0..=4)).min(sites.len());
-        let chosen = hybrid_of(rng, sites.len(), k);
-        // A one-token sequence (a real-valued toy's input, `bench/toys_2951`) is edited at its
-        // token; the draw is made all the same, so longer sequences draw as before.
-        let (position, onward) = match rng.random_range(0..3) {
-            _ if length == 1 => (0, true),
-            0 => (rng.random_range(1..length), false),
-            1 => (rng.random_range(1..length), true),
-            _ => (0, true),
-        };
-        let mut ops = Vec::with_capacity(k);
-        let every = family == Family::Cut && rng.random_range(0..2) == 0;
-        for (site, _) in sites.iter().zip(&chosen).filter(|(_, c)| **c) {
-            let operation = match family {
-                Family::Swap => Operation::Swap,
-                Family::Zero => Operation::Scale(0),
-                Family::Scale => Operation::Scale(rng.random_range(1..SCALES.len())),
-                Family::Push => Operation::Push { direction: rng.random_range(0..directions), size: rng.random_range(0..SIZES.len()) },
-                // A cut into one later block uniform after its site's, or (half of the experiments)
-                // into every later block's read, so the whole rest of the model sees the site's
-                // donor value; one cut into each block's read.
-                Family::Cut => {
-                    let from = site.block(&self.m_sites.parts.head_blocks).ok_or_else(|| error("a cut at an unknown site"))?;
-                    let targets: Vec<usize> = if every { (from + 1..blocks).collect() } else { vec![rng.random_range(from + 1..blocks)] };
-                    for to in targets {
-                        if !ops.iter().any(|o: &SiteOp| o.operation == Operation::Cut { to }) {
-                            ops.push(SiteOp { site: *site, operation: Operation::Cut { to }, onward });
-                        }
-                    }
-                    continue;
-                }
-                Family::Read => return Err(error("a read patch is not an operation on a site")),
-            };
-            ops.push(SiteOp { site: *site, operation, onward });
-        }
-        Ok((Patch::Ops { family, ops }, position))
+        let parts = &self.m_sites.parts;
+        draw_site_ops(rng, family, length, &self.shared_sites(), &parts.head_blocks, &parts.typical, parts.directions.len(), self.m_sites.entries.len())
     }
 
     /// `P` applies no edits of parts from now on, `M` still does: with `P` = `M`
