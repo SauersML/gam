@@ -47,17 +47,19 @@ def patch(model, dev, beh: dict, out: Path):
     H, D, layers = cfg.num_attention_heads, cfg.head_dim, cfg.num_hidden_layers
     prompts = [p for p in beh["prompts"] if p.get("counterfactual")]
     T = max(len(p["token_ids"]) for p in prompts)
-    state = {"record": False, "head": None, "mlp": None}
+    state = {"record": False, "heads": None, "mlp": None}
     saved_o, saved_mlp = {}, {}
 
     def pre_o(layer):
         def hook(module, args):
             if state["record"]:
                 saved_o[layer] = args[0].clone()
-            elif state["head"] is not None and state["head"][0] == layer:
-                h = state["head"][1]
+            elif state["heads"] == layer:  # copy r of the batch gets head r's clean input
                 x = args[0].clone()
-                x[..., h * D : (h + 1) * D] = saved_o[layer][..., h * D : (h + 1) * D]
+                n = x.shape[0] // H
+                x5, s4 = x.view(H, n, x.shape[1], H, D), saved_o[layer].view(n, x.shape[1], H, D)
+                for r in range(H):
+                    x5[r, :, :, r] = s4[:, :, r]
                 return (x,)
         return hook
 
@@ -76,7 +78,7 @@ def patch(model, dev, beh: dict, out: Path):
     # KL sums over target tokens: index 0 the unpatched counterfactual, then every head, then every MLP
     sums = torch.zeros(1 + layers * H + layers, dtype=torch.float64)
     count = 0
-    chunk = max(1, TOKENS // T)
+    chunk = max(1, TOKENS // (T * H))  # the head pass runs H copies of a chunk at once
     for s in range(0, len(prompts), chunk):
         part = prompts[s : s + chunk]
 
@@ -91,28 +93,29 @@ def patch(model, dev, beh: dict, out: Path):
         rows = torch.tensor([i for i, p in enumerate(part) for _ in p["target_positions"]], device=dev)
         cols = torch.tensor([t for p in part for t in p["target_positions"]], device=dev)
 
-        def log_probs(ids):
-            hidden = model.model(ids).last_hidden_state[rows, cols]
+        def log_probs(ids, copies=1):
+            n = len(part)
+            r = torch.cat([rows + c * n for c in range(copies)])
+            hidden = model.model(ids.repeat(copies, 1)).last_hidden_state[r, cols.repeat(copies)]
             return torch.log_softmax(model.lm_head(hidden).float(), -1)
 
-        state.update(record=True, head=None, mlp=None)
+        state.update(record=True, heads=None, mlp=None)
         lp_clean = log_probs(clean)
         state["record"] = False
         p_clean = lp_clean.exp()
 
-        def kl(lp):
-            return ((p_clean * (lp_clean - lp)).sum(-1).sum() / math.log(2)).item()
+        def kl(lp, copies=1):
+            per = (p_clean.repeat(copies, 1) * (lp_clean.repeat(copies, 1) - lp)).sum(-1) / math.log(2)
+            return per.view(copies, -1).sum(1).cpu().double()
 
-        sums[0] += kl(log_probs(counterfactual))
-        k = 1
+        sums[0] += kl(log_probs(counterfactual))[0]
         for l in range(layers):
-            for h in range(H):
-                state.update(head=(l, h), mlp=None)
-                sums[k] += kl(log_probs(counterfactual))
-                k += 1
+            state.update(heads=l, mlp=None)
+            sums[1 + l * H : 1 + (l + 1) * H] += kl(log_probs(counterfactual, H), H)
+        k = 1 + layers * H
         for l in range(layers):
-            state.update(head=None, mlp=l)
-            sums[k] += kl(log_probs(counterfactual))
+            state.update(heads=None, mlp=l)
+            sums[k] += kl(log_probs(counterfactual))[0]
             k += 1
         state.update(mlp=None)
         count += len(rows)
