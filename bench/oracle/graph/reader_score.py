@@ -1,7 +1,8 @@
 """The reader term of the graph oracle's score (#2951, design.txt section 2): the measured ground truth for
-a program's English. A frozen reader LM (Qwen3-8B) reads the program's whole text (code, docstrings and
-comments) and, for each scored experiment e on the target model M and each target token, predicts M's
-next-token distribution under e. The reader cannot run the code. The reader term is the KL divergence from
+a program's English. A frozen reader LM (Qwen3-8B) reads the program's explanation, the plain English the
+oracle writes after its code (never the code, its comments or its docstrings, which are the oracle's
+working notes), and, for each scored experiment e on the target model M and each target token, predicts
+M's next-token distribution under e. The reader term is the KL divergence from
 M_e's measured distribution to the reader's prediction, in bits, summed over the scored (experiment, target
 token) pairs and scaled to the behaviour's declared size N (N times the mean over the scored pairs).
 
@@ -15,12 +16,12 @@ over the K candidates and "other".
 
 Reader prompt (the reader's chat template, thinking off):
   system     SYSTEM
-  user       INSTRUCTIONS (the program text in a python block and the task), then the item: the experiment
+  user       INSTRUCTIONS (the explanation and the task), then the item: the experiment
              in words, M's clean candidates with their clean probabilities and the clean rest
   assistant  the text M reads, verbatim and unmarked (so the reader's natural continuation is the answer);
              the answer slot is the position after it
 The reader's probability of a candidate is its probability of continuing the text with that candidate.
-The program part comes first: CachedReader runs it once and repeats its key/value cache across the
+The explanation comes first: CachedReader runs it once and repeats its key/value cache across the
 program's items.
 - Qwen3 targets share the reader's tokenizer: the text is M's own token ids and every candidate is one
   reader token, so the candidates are disjoint and q(other) = 1 - sum q(candidates) exactly.
@@ -34,15 +35,15 @@ program's items.
 q(other) and corrected candidates are floored at K * 2^-24, the rounding scale of a sum of K float32
 probabilities.
 
-Baselines, scored on the same items: the empty program (the reader alone, the same prompt with an empty
-program block) and the program's code with every docstring, string statement and comment removed
-(`strip_english`). english_saved_bits = N (mean bits of the code alone - mean bits of the program): the
-measured value of the English.
+Baseline, scored on the same items: no explanation (the reader alone, the same prompt with an empty
+explanation). english_saved_bits = N (mean bits without an explanation - mean bits with the program's):
+the measured value of the English.
 
   reader_score.py score --model Qwen/Qwen3-8B --target vpd4l --programs P.jsonl
                         --items ITEMS.jsonl --out OUT.json [--N 16777216]
   reader_score.py serve --model Qwen/Qwen3-8B --target qwen3-0.6b --listen HOST:PORT
-P.jsonl lines {"id", "source"[, "valid"]}; an invalid program is read as the empty program (design.txt).
+P.jsonl lines {"id", "explanation"[, "source", "valid"]}; the reader reads "explanation" alone (missing: none);
+an invalid program is read as no explanation (design.txt).
 serve answers JSON lines {"op": "score", "programs": [...], "items": [...], "N": int[, "baselines": true]}
 (every program on the same items) and {"op": "score_many", "jobs": [{"program", "items", "N"}, ...][,
 "baselines": false]} (RL: each program on its own items, baselines off by default) with
@@ -52,15 +53,12 @@ serve answers JSON lines {"op": "score", "programs": [...], "items": [...], "N":
 from __future__ import annotations
 
 import argparse
-import ast
 import hashlib
-import io
 import json
 import math
 import socketserver
 import sys
 import time
-import tokenize
 from pathlib import Path
 
 import numpy as np
@@ -72,15 +70,12 @@ FLOAT32_EPS = 2.0**-24
 
 SYSTEM = "You predict the measured behaviour of a language model, the target model, under experiments on its computation."
 
-INSTRUCTIONS = """The program below explains how the target model produces a behaviour. It is written with the `mech` library:
-- L[l].head[h] is attention head h of layer l (its query, key, value and output weights). L[l].mlp[i, j] are neurons i and j of the MLP of layer l (their input and output weights). PD.vpd[l].<matrix>[i] is subcomponent i of the parameter decomposition of that weight matrix of layer l. PD.tc[l][f] is transcoder feature f of layer l.
-- node(...) groups pieces of the weights into one node. `a >> b.key` states that the output of node a reaches the key input of node b; the inputs are query, key and value for heads and input for MLP pieces. embed is the token embedding and logits is the output.
-- The comments and docstrings state what the nodes compute and how the target model's output depends on them.
+INSTRUCTIONS = """The explanation below says how the target model produces a behaviour: which parts of its computation matter, what each does, and how they connect. Layer l's attention head h is written L{l}.H{h}; a decomposition subcomponent is a rank-one part of one weight matrix.
 
-Program:
-```python
-{source}
-```
+Explanation:
+<<<
+{explanation}
+>>>
 
 {task}
 
@@ -163,28 +158,8 @@ def words(e: dict) -> str:
     raise ValueError(f"experiment kind {kind!r}")
 
 
-def strip_english(source: str) -> str:
-    """The program's code without its English: every string expression statement (docstrings included)
-    and every comment removed. A program that does not parse loses its comments only, and one that does
-    not tokenize stays as it is."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        try:
-            return tokenize.untokenize([t for t in tokenize.generate_tokens(io.StringIO(source).readline) if t.type != tokenize.COMMENT])
-        except tokenize.TokenError:  # not even tokenizable: the text as it is
-            return source
-    for node in ast.walk(tree):
-        body = getattr(node, "body", None)
-        if isinstance(body, list):
-            kept = [s for s in body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str))]
-            if len(kept) != len(body):
-                node.body = kept or [ast.Expr(ast.Constant(...))]
-    return ast.unparse(tree)
-
-
 class Prompter:
-    """Token ids of the reader prompt: prefix(source) is shared by a program's items; item(it) follows it
+    """Token ids of the reader prompt: prefix(explanation) is shared by a program's items; item(it) follows it
     and ends with the text M reads (the answer slot is after it); candidates(it) are the candidates'
     reader tokens."""
 
@@ -210,8 +185,8 @@ class Prompter:
             text = text.replace(special, "")
         return text
 
-    def prefix(self, source: str) -> list[int]:
-        return self.template(self.head) + self.enc(INSTRUCTIONS.replace("{task}", TASK).replace("{source}", source))
+    def prefix(self, explanation: str) -> list[int]:
+        return self.template(self.head) + self.enc(INSTRUCTIONS.replace("{task}", TASK).replace("{explanation}", explanation))
 
     def item(self, it: dict) -> list[int]:
         listing = "\n".join(f"{json.dumps(c['text'], ensure_ascii=False)} {c['clean']:.3g}" for c in it["candidates"])
@@ -431,12 +406,12 @@ class Scorer:
         return out
 
     def score(self, programs: list[dict], items: list[dict], N: int = N_DEFAULT, baselines: bool = True) -> list[dict]:
-        """Per program: reader_error_bits (N times the mean bits per item), and with baselines the empty
-        program's and the code-alone bits and english_saved_bits. Items of experiments the reader cannot be
-        told (UNDESCRIBED: a random direction it never sees) are left out."""
+        """Per program: reader_error_bits (N times the mean bits per item) from its explanation alone, and
+        with baselines the bits without an explanation and english_saved_bits. Items of experiments the
+        reader cannot be told (UNDESCRIBED: a random direction it never sees) are left out."""
         items = [it for it in items if it.get("family") not in UNDESCRIBED]
-        texts = [(p["source"] if p.get("valid", True) else "") for p in programs]
-        extra = ([""] + [strip_english(t) for t in texts]) if baselines else []
+        texts = [(p.get("explanation") or "") if p.get("valid", True) else "" for p in programs]
+        extra = [""] if baselines else []
         bits = self.bits(texts + extra, items)
         fams = sorted({it.get("family", "all") for it in items})
         out = []
@@ -448,14 +423,11 @@ class Scorer:
                  "per_item": [round(float(x), 6) for x in b],
                  "per_item_q_other": [round(self.rest.get(self.key(texts[i], it), float("nan")), 6) for it in items]}
             if baselines:
-                empty, code = bits[len(texts)], bits[len(texts) + 1 + i]
+                empty = bits[len(texts)]
                 r["empty_mean_bits_per_item"] = float(empty.mean())
-                r["code_only_mean_bits_per_item"] = float(code.mean())
-                r["english_saved_bits"] = N * float(code.mean() - b.mean())
-                r["program_saved_bits"] = N * float(empty.mean() - b.mean())
+                r["english_saved_bits"] = N * float(empty.mean() - b.mean())
                 r["per_family_empty"] = {f: float(np.mean([empty[j] for j, it in enumerate(items) if it.get("family", "all") == f])) for f in fams}
                 r["per_item_empty"] = [round(float(x), 6) for x in empty]
-                r["per_item_code_only"] = [round(float(x), 6) for x in code]
             out.append(r)
         return out
 
@@ -512,7 +484,7 @@ def main():
     start = time.time()
     results = scorer.score(programs, items, args.N, not args.no_baselines)
     seconds = time.time() - start
-    texts = len(programs) * (3 if not args.no_baselines else 1)
+    texts = len(programs) + (0 if args.no_baselines else 1)
     summary = {"reader": scorer.backend.describe(), "target": args.target, "programs": len(programs), "items": len(items), "seconds": seconds,
                "item_reads_per_second": texts * len(items) / seconds, "item_ids": [it.get("id") for it in items],
                "item_words": [words(it["experiment"]) for it in items], "results": results}

@@ -185,7 +185,7 @@ def report(args):
     n = d["items"]
     lines = [f"reader {d['reader']}, {n} items, {d['seconds']:.0f} s, {d['item_reads_per_second']:.2f} item reads/s"]
     for k, r in rows.items():
-        lines.append(f"{k:28s} {r['mean_bits_per_item']:.4f} bits/item  code alone {r.get('code_only_mean_bits_per_item', float('nan')):.4f}  "
+        lines.append(f"{k:28s} {r['mean_bits_per_item']:.4f} bits/item  "
                      f"empty {r.get('empty_mean_bits_per_item', float('nan')):.4f}  per family " + json.dumps({f: round(v, 3) for f, v in r["per_family"].items()}))
 
     def paired(a, b):
@@ -195,9 +195,8 @@ def report(args):
 
     for k, r in rows.items():
         if "per_item_empty" in r:
-            bits[f"{k}:empty"], bits[f"{k}:code_alone"] = np.array(r["per_item_empty"]), np.array(r["per_item_code_only"])
+            bits[f"{k}:empty"] = np.array(r["per_item_empty"])
             lines.append(paired(f"{k}:empty", k))
-            lines.append(paired(f"{k}:code_alone", k))
     names = [k for k in rows if not k.endswith("_paraphrase")]
     for i, a in enumerate(names):  # every pair of programs
         for b in names[i + 1:]:
@@ -207,8 +206,8 @@ def report(args):
             lines.append(paired(k, k[: -len("_paraphrase")]))
     for k, r in rows.items():
         if "english_saved_bits" in r:
-            lines.append(f"{k:28s} English saves {(r['code_only_mean_bits_per_item'] - r['mean_bits_per_item']):+.4f} bits/item, program saves "
-                         f"{(r['empty_mean_bits_per_item'] - r['mean_bits_per_item']):+.4f} bits/item over the empty program")
+            lines.append(f"{k:28s} the explanation saves {(r['empty_mean_bits_per_item'] - r['mean_bits_per_item']):+.4f} bits/item "
+                         f"over no explanation")
     if "item_words" in d:  # per experiment (its words), every program's mean bits
         groups: dict[str, list[int]] = {}
         for j, w in enumerate(d["item_words"]):
@@ -251,7 +250,7 @@ def throughput(args):
                       "clean_other": float(p[8]), "other": float(p[8])})
     examples = sorted((HERE / "examples").glob("*.py"))
     programs = [{"id": str(j), "source": f"# variant {j}\n" + examples[j % len(examples)].read_text()} for j in range(args.programs)]
-    prefix = np.mean([len(sc.prompter.prefix(p["source"])) for p in programs])
+    prefix = np.mean([len(sc.prompter.prefix(p.get("explanation", ""))) for p in programs])
     suffix = np.mean([len(sc.prompter.item(it)) for it in items])
     start = time.time()
     sc.score(programs[:1], items[:2], baselines=False)  # warm up

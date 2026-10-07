@@ -274,13 +274,19 @@ def test_prompt():
          "counterfactual": None}]}
     text = prompt.render(behavior, prompts=1, shots=1)
     assert "' red green blue . red green' -> ' blue' 0.90, ' red' 0.05" in text
-    assert "PD.tc[l][i, ...]" in text and "PD.vpd" not in text.split("Example program")[0]
+    reference = text.split("Example answer")[0]
+    assert "PD.tc[l][i, ...]" in reference and "PD.vpd" not in reference and "L[l].mlp" not in reference
+    assert "after the block" in reference and "nobody else reads them" in reference
     induction = dict(behavior, family="induction_random")
-    shots = prompt.examples(induction, 9)
-    assert shots and all(not e["family"].startswith("induction") and e["split"] == "train" for _, e, _ in shots)
-    assert prompt.examples(behavior, 1)[0][0] == "qwen3_induction_heads"
+    assert all(not e["family"].startswith("induction") and e["split"] == "train" for _, e, _, _ in prompt.examples(induction, 9))
+    name, entry, source, explanation = prompt.examples(behavior, 1)[0]
+    assert name == "qwen3_induction_heads" and "```" not in explanation and explanation in text
+    answer = "notes\n```python\nfrom mech import node, L\nh = node(L[2].head[4])  # copies\n```\n\nExplanation: L2.H4 copies it.\n"
+    assert prompt.split_answer(answer) == ("from mech import node, L\nh = node(L[2].head[4])  # copies\n", "L2.H4 copies it.")
     assert prompt.program_of("x\n```python\nfrom mech import node\n```\n") == "from mech import node\n"
-
+    assert prompt.explanation_of("no code") == "" and prompt.program_of("no code") == "no code"
+    broken = "```python\nx = (\n```\ntext"  # no block parses: the whole answer, no explanation
+    assert prompt.split_answer(broken) == (broken, "")
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

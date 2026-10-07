@@ -97,8 +97,9 @@ class Checker:
         return self.request({"op": "behavior", "path": str(path)})
 
     def score(self, program, experiments=32, seed=0, routing="edges", N=None, reader=True, reader_top=8, stand_in="input"):
-        """Every score term (design.txt section 5). `program` is Python source or an IR dict. An untraceable
-        source is scored as the empty program, flagged invalid. The reader term comes from the reader_score
+        """Every score term (design.txt section 5). `program` is Python source, an IR dict, or {"source",
+        "explanation"} (the oracle's answer split by prompt.split_answer); the reader reads the explanation
+        alone (none when absent). An untraceable source is scored as the empty program, flagged invalid. The reader term comes from the reader_score
         server at GRAPH_READER (host:port); without one it is left out (reader_error_bits None) and the items
         are returned for a later reader pass."""
         return self.score_batch([program], experiments, seed, routing, N, reader, reader_top, stand_in)[0]
@@ -117,13 +118,17 @@ class Checker:
         return [self.finish(ir, a, reader) for ir, a in zip(irs, answer["scores"])]
 
     def ir(self, program):
-        if not isinstance(program, str):
+        """The IR of a program (source, IR, or {"source", "explanation"}), carrying its explanation."""
+        if isinstance(program, dict) and "nodes" in program:
             return program
+        source, explanation = (program, "") if isinstance(program, str) else (program["source"], program.get("explanation") or "")
         try:
-            return trace(program, self.model)
+            ir = trace(source, self.model)
         except Exception as e:  # the tracer's error is the program's error
-            return {"model": self.model, "nodes": [], "edges": [], "python_tokens": 0, "token_types": 0,
-                    "source": program, "valid": False, "error": f"{type(e).__name__}: {e}"}
+            ir = {"model": self.model, "nodes": [], "edges": [], "python_tokens": 0, "token_types": 0,
+                  "source": source, "valid": False, "error": f"{type(e).__name__}: {e}"}
+        ir["explanation"] = explanation
+        return ir
 
     def finish(self, ir, answer, reader):
         """Adds the reader term to one program's checker answer."""
@@ -134,12 +139,13 @@ class Checker:
             address = os.environ.get("GRAPH_READER")
             if address:
                 result = reader_request(address, {"op": "score", "N": int(answer["N"]), "items": items,
-                                                  "programs": [{"id": "p", "source": ir.get("source", ""), "valid": ir.get("valid", True)}]})
+                                                  "programs": [{"id": "p", "explanation": ir.get("explanation", ""), "valid": ir.get("valid", True)}]})
                 answer["reader"] = result
                 answer["reader_error_bits"] = result["reader_error_bits"]
                 answer["total_bits"] += answer["reader_error_bits"]
             else:
                 answer["items"] = items
+                answer["explanation"] = ir.get("explanation", "")  # what a later reader pass reads
         return answer
 
     def texts(self, items):

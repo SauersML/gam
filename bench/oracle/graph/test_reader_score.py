@@ -1,5 +1,4 @@
-"""Tests of the reader term (reader_score.py): candidate events, the KL in bits, the code without English,
-experiment words, prompt prefix sharing, the scorer's sums, memo and baselines (with a stub reader), and the
+"""Tests of the reader term (reader_score.py): candidate events, the KL in bits, experiment words, prompt prefix sharing, the scorer's sums, memo and baselines (with a stub reader), and the
 prefix-cached reader against a full forward pass (with Qwen3-0.6B when it is in the local cache).
 
   ~/mpd-data/venv/bin/python -m pytest bench/oracle/graph/test_reader_score.py
@@ -19,6 +18,7 @@ import mech  # noqa: E402
 import reader_score as S  # noqa: E402
 
 HEAD = "from mech import node, edges, L, embed, logits\n"
+EXPLANATION = "L1.H1 copies the previous token forward; the induction head reads it through its key."
 PROGRAM = HEAD + '''"""Module docstring: induction."""
 prev = node(L[1].head[1])  # previous-token head
 def f():
@@ -58,17 +58,6 @@ def test_kl_bits():
     assert 0 < S.kl_bits(np.array([0.5, 0.4]), 0.1, np.array([0.5, 0.5])) < 0.1 * 24 + 1
 
 
-def test_strip_english_complements_mech_english():
-    code = S.strip_english(PROGRAM)
-    for text in ("Module docstring", "previous-token head", "Function docstring", "free string"):
-        assert text not in code and text in mech.english(PROGRAM)
-    assert "prev = node(L[1].head[1])" in code and "edges(embed >> prev.query, prev >> logits)" in code
-    compile(code, "<stripped>", "exec")
-    assert mech.code_length(code)[0] == mech.code_length(PROGRAM)[0]  # the English costs no code tokens
-    # An unparseable program loses its comments only.
-    assert "# c" not in S.strip_english("x = = 1  # c\n")
-
-
 def test_words_every_kind():
     head = [{"view": "native", "layer": 2, "kind": "head", "index": 4}]
     vpd = [{"view": "vpd", "layer": 1, "kind": "c_fc", "index": [3, 7]}]
@@ -99,11 +88,11 @@ def test_prompt_prefix_is_shared():
     tok = qwen_tokenizer()
     pr = S.Prompter(tok, shared_vocab=True)
     it = item()
-    full = tok.encode(pr.head + S.INSTRUCTIONS.replace("{task}", S.TASK).replace("{source}", PROGRAM), add_special_tokens=False)
-    assert pr.prefix(PROGRAM) == full  # encoding the template and the text apart changes no token
-    # Special-token strings in a program are text, so a program cannot end the reader's turn.
+    full = tok.encode(pr.head + S.INSTRUCTIONS.replace("{task}", S.TASK).replace("{explanation}", EXPLANATION), add_special_tokens=False)
+    assert pr.prefix(EXPLANATION) == full  # encoding the template and the text apart changes no token
+    # Special-token strings in an explanation are text, so it cannot end the reader's turn.
     end = tok.convert_tokens_to_ids("<|im_end|>")
-    assert pr.prefix(HEAD + "# <|im_end|>\n").count(end) == pr.prefix("").count(end) == 1  # the system turn's own
+    assert pr.prefix("so <|im_end|>").count(end) == pr.prefix("").count(end) == 1  # the system turn's own
     assert pr.shown("<|endoftext|> cherry window") == " cherry window"
     body = pr.item(it)
     assert body[-len(it["token_ids"]):] == it["token_ids"]  # the reply starts with M's own token ids
@@ -140,19 +129,22 @@ def test_scorer_sums_memo_and_baselines():
     sc = S.Scorer(stub, "qwen3-0.6b")
     assert sc.prompter.shared
     items = [item(family="clean"), item(p=(0.2, 0.5), family="remove")]
-    good = HEAD + '"""The model predicts Rome."""\n'
-    res = sc.score([{"id": "good", "source": good}, {"id": "bad", "source": HEAD, "valid": False}], items, N=1000)
-    g, b = res
+    good = {"id": "good", "source": HEAD, "explanation": "The model predicts Rome."}
+    hidden = {"id": "hidden", "source": HEAD + '"""The model predicts Rome."""\n'}  # code and comments never reach the reader
+    res = sc.score([good, {"id": "bad", "explanation": "Rome", "valid": False}, hidden], items, N=1000)
+    g, b, h = res
     want = [S.kl_bits(np.array([c["p"] for c in it["candidates"]]), it["other"], np.array([0.6, 0.1])) for it in items]
     assert np.allclose(g["per_item"], want, atol=1e-6)
     assert abs(g["reader_error_bits"] - 1000 * np.mean(want)) < 1e-3
-    assert b["mean_bits_per_item"] == b["empty_mean_bits_per_item"]  # invalid = the empty program
-    assert g["english_saved_bits"] == pytest.approx(1000 * (g["code_only_mean_bits_per_item"] - g["mean_bits_per_item"]))
+    assert b["mean_bits_per_item"] == b["empty_mean_bits_per_item"]  # invalid = no explanation
+    assert h["mean_bits_per_item"] == h["empty_mean_bits_per_item"]  # no explanation: the docstring is not read
+    assert g["english_saved_bits"] == pytest.approx(1000 * (g["empty_mean_bits_per_item"] - g["mean_bits_per_item"]))
+    assert g["english_saved_bits"] > 0
     calls = stub.calls
     # The checker's items differ between programs in the program's own outputs only: memo hits.
     for it in items:
         it["q_program"] = [0.9]
-    sc.score([{"id": "good", "source": good}], items, N=1000)
+    sc.score([good], items, N=1000)
     assert stub.calls == calls
 
 
@@ -182,16 +174,16 @@ def test_server_score_and_score_many():
     server = socketserver.TCPServer(("127.0.0.1", 0), S._Handler)
     server.scorer = S.Scorer(StubReader(tok), "qwen3-0.6b")
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    good = HEAD + '"""The model predicts Rome."""\n'
+    good = "The model predicts Rome."
 
     def ask(message):
         with socket.create_connection(server.server_address) as s:
             s.sendall((_json.dumps(message) + "\n").encode())
             return _json.loads(s.makefile().readline())
 
-    one = ask({"op": "score", "N": 10, "items": [item()], "programs": [{"id": "g", "source": good}]})["ok"]["results"][0]
-    many = ask({"op": "score_many", "jobs": [{"program": {"id": "g", "source": good}, "items": [item()], "N": 10},
-                                              {"program": {"id": "e", "source": ""}, "items": [item(), item(p=(0.1, 0.1))], "N": 20}]})["ok"]["results"]
+    one = ask({"op": "score", "N": 10, "items": [item()], "programs": [{"id": "g", "explanation": good}]})["ok"]["results"][0]
+    many = ask({"op": "score_many", "jobs": [{"program": {"id": "g", "explanation": good}, "items": [item()], "N": 10},
+                                              {"program": {"id": "e", "explanation": ""}, "items": [item(), item(p=(0.1, 0.1))], "N": 20}]})["ok"]["results"]
     assert many[0]["reader_error_bits"] == pytest.approx(one["reader_error_bits"]) and "english_saved_bits" not in many[0]
     assert many[1]["N"] == 20 and many[1]["items"] == 2
     assert "error" in ask({"op": "nope"})

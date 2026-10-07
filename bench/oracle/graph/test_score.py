@@ -56,3 +56,13 @@ def test_reader_items(checker):
     for it in items:
         assert len(it["candidates"]) == 5 and all(0.0 <= c["p"] <= 1.0 for c in it["candidates"])
         assert it["text"] and abs(sum(c["p"] for c in it["candidates"]) + it["other"] - 1.0) < 1e-6
+
+
+def test_ir_carries_explanation():
+    import types
+
+    fake = types.SimpleNamespace(model="vpd4l")
+    ir = score.Checker.ir(fake, {"source": "from mech import L\n", "explanation": "L2.H4 copies the token."})
+    assert ir["valid"] and ir["explanation"] == "L2.H4 copies the token."
+    assert score.Checker.ir(fake, "from mech import L\n")["explanation"] == ""
+    assert score.Checker.ir(fake, ir) is ir
