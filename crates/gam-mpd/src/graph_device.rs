@@ -51,18 +51,27 @@ const KEPT_REFERENCE_BYTES: usize = 2 << 30;
 
 static DEVICE: OnceLock<Mutex<DeviceState>> = OnceLock::new();
 
-/// The one thread that touches the device. Device calls convert values on the rayon pool; a
-/// rayon worker holding the device lock that waits on that work can steal another run, which then
-/// waits on the lock its own thread holds (a deadlock seen on vpd4l). Every device entry point
-/// therefore runs on this single-thread pool: callers wait in `install`, the device serves one
-/// call at a time, and its own nested parallel work runs inline.
+/// The one thread that touches the device: a single-thread pool, so the device serves one call at
+/// a time and its own nested parallel work (gam_gpu converts values on the rayon pool) runs inline
+/// there.
 static WORKER: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 
 /// `f` on the device's thread with the device state, or `None` when no device is set.
+///
+/// No caller may run other rayon work while it waits. A rayon worker that waited in `install`
+/// stole other jobs meanwhile; a stolen run that needed the counterfactual run this very worker was
+/// computing (`Checker::referenced`'s `OnceLock`) then waited on itself forever (the server hung at
+/// 0% CPU, seen by g-mech on vpd4l). A worker therefore hands the call to a plain scoped thread and
+/// joins it, which blocks without stealing; a thread outside the pool waits in `install` directly,
+/// which does not steal either.
 fn on_device<T: Send>(f: impl FnOnce(&mut DeviceState) -> T + Send) -> Option<T> {
     let state = DEVICE.get()?;
     let pool = WORKER.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(1).thread_name(|_| "graph-device".into()).build().ok()).as_ref()?;
-    pool.install(|| state.lock().ok().map(|mut s| f(&mut s)))
+    let call = || pool.install(|| state.lock().ok().map(|mut s| f(&mut s)));
+    if rayon::current_thread_index().is_none() {
+        return call();
+    }
+    std::thread::scope(|scope| scope.spawn(call).join().ok().flatten())
 }
 
 impl DeviceState {
