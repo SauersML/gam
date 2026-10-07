@@ -953,9 +953,10 @@ impl Experiment {
 
 /// The checker's draw of `count` experiments beyond clean (and counterfactual when the prompts
 /// have them): weight edits (half uniform over pieces at random granularity, half aimed at the
-/// program's pieces and pieces it omits), rank-one perturbations, node swaps, edge cuts (declared
-/// edges and undeclared pairs).
-pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usize, seed: u64) -> Vec<Experiment> {
+/// program's pieces and pieces it omits, half of those among the four omitted heads first in
+/// `strongest`, heads by measured removal effect), rank-one perturbations, node swaps, edge cuts
+/// (declared edges and undeclared pairs).
+pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usize, seed: u64, strongest: &[(usize, usize)]) -> Vec<Experiment> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut out = vec![Experiment::Clean];
     if counterfactual {
@@ -964,6 +965,8 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
     let layers = weights.layers.len();
     let factors = [0.0, 0.5, 2.0];
     let omitted = graph.complement(weights);
+    let declared = |l: usize, h: usize| graph.blocks.iter().any(|b| matches!(b, Block::Heads { layer, heads } if *layer == l && heads.contains(&h)));
+    let strong: Vec<Block> = strongest.iter().filter(|(l, h)| !declared(*l, *h)).take(4).map(|&(layer, h)| Block::Heads { layer, heads: vec![h] }).collect();
     let random_edit = |rng: &mut StdRng, block: Option<&Block>| -> WeightEdit {
         let factor = factors[rng.random_range(0..factors.len())];
         let block = match block {
@@ -1004,7 +1007,13 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
             "edit_uniform" => Experiment::Edit { edit: random_edit(&mut rng, None), aimed: false },
             "edit_aimed" => {
                 let own = !graph.blocks.is_empty() && (omitted.is_empty() || rng.random_bool(0.5));
-                let pool = if own { &graph.blocks } else { &omitted };
+                let pool = if own {
+                    &graph.blocks
+                } else if !strong.is_empty() && rng.random_bool(0.5) {
+                    &strong
+                } else {
+                    &omitted
+                };
                 let block = pool[rng.random_range(0..pool.len())].clone();
                 Experiment::Edit { edit: random_edit(&mut rng, Some(&block)), aimed: true }
             }
@@ -1120,6 +1129,9 @@ pub struct Checker {
     /// Per prompt with a same-length donor: (prompt, donor).
     donors: Vec<(usize, usize)>,
     cache: BTreeMap<String, Array2<f64>>,
+    /// Heads by their measured removal effect on `M` (mean `KL(M ‖ M without the head)` at the
+    /// targets), strongest first; measured on first use.
+    strongest: Option<Vec<(usize, usize)>>,
 }
 
 /// Every score term (bits) and the counts behind them.
@@ -1191,7 +1203,7 @@ impl Checker {
             donors.extend(group.iter().enumerate().map(|(k, &i)| (i, group[(k + 1) % group.len()])));
         }
         donors.sort_unstable();
-        Ok(Self { weights, behavior, stats, clean: (batch, rows), counterfactual, donors, cache: BTreeMap::new() })
+        Ok(Self { weights, behavior, stats, clean: (batch, rows), counterfactual, donors, cache: BTreeMap::new(), strongest: None })
     }
 
     /// The experiment's key for `M`'s cache: what it does to which pieces.
@@ -1206,6 +1218,7 @@ impl Checker {
                 };
                 format!("cut {from} {} {route:?}", to.map_or("logits".to_string(), block))
             }
+            Experiment::Edit { edit, .. } => format!("edit {}", serde_json::to_string(edit).unwrap_or_default()),
             other => serde_json::to_string(other).unwrap_or_default(),
         }
     }
@@ -1274,7 +1287,8 @@ impl Checker {
             Ok(g) => (g, true, None),
             Err(e) => (Graph::empty(), false, Some(e)),
         };
-        let experiments = sample(&self.weights, &graph, self.counterfactual.is_some(), count, seed);
+        let strongest = self.strongest()?;
+        let experiments = sample(&self.weights, &graph, self.counterfactual.is_some(), count, seed, &strongest);
         let circuit = graph.program(&self.weights, edges);
         let mut per_family: BTreeMap<String, Family> = BTreeMap::new();
         let mut total = (0.0, 0usize);
@@ -1317,6 +1331,27 @@ impl Checker {
             per_family,
         };
         Ok((score, outcomes))
+    }
+
+    /// Heads by measured removal effect, strongest first (cached).
+    pub fn strongest(&mut self) -> Result<Vec<(usize, usize)>, String> {
+        if let Some(s) = &self.strongest {
+            return Ok(s.clone());
+        }
+        let graph = Graph::empty();
+        let clean = self.model_outcome(&graph, &Experiment::Clean)?;
+        let mut effects = Vec::new();
+        for l in 0..self.weights.layers.len() {
+            for h in 0..self.weights.layers[l].heads.len() {
+                let removed = self.model_outcome(&graph, &Experiment::Edit { edit: WeightEdit::Head { layer: l, head: h, factor: 0.0 }, aimed: true })?;
+                let kl = kl_bits(&clean, &removed);
+                effects.push(((l, h), kl.iter().sum::<f64>() / kl.len().max(1) as f64));
+            }
+        }
+        effects.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let order: Vec<(usize, usize)> = effects.into_iter().map(|(k, _)| k).collect();
+        self.strongest = Some(order.clone());
+        Ok(order)
     }
 
     /// Each swapped prompt with its donor.
