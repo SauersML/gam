@@ -318,7 +318,7 @@ def main():
         groups = sampler(prompts, args.samples, adapter, step)
         t1 = time.time()
         texts = [[pol.tok.decode(c, skip_special_tokens=True) for c in g] for g in groups]
-        items = [{"source": program_of(t), "behavior": b} for b, ts in zip(chosen, texts) for t in ts]
+        items = [{"source": program_of(t), "behavior": b, "seed": step} for b, ts in zip(chosen, texts) for t in ts]
         scores = score(items)
         t2 = time.time()
         S = np.array([s["total_bits"] for s in scores], dtype=float).reshape(len(chosen), args.samples)

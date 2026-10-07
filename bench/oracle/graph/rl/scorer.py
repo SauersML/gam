@@ -39,12 +39,27 @@ def mock(items: list[dict]) -> list[dict]:
     return out
 
 
+_CHECKERS = {}
+
+
 def checker(items: list[dict]) -> list[dict]:
+    """score.py's Checker, one long-lived server per target model; the reader term when GRAPH_READER
+    (reader_score.py serve's HOST:PORT) is set. Programs of one behavior and step share the experiments'
+    seed, so a group's scores differ by the programs only."""
     import score
 
-    if hasattr(score, "score_many"):
-        return score.score_many(items)
-    return [score.score(it["source"], it["behavior"]) for it in items]
+    out = []
+    for it in items:
+        b = it["behavior"]
+        c = _CHECKERS.get(b["model"])
+        if c is None:
+            c = _CHECKERS[b["model"]] = score.Checker(b["model"])
+            c.loaded = None
+        if c.loaded != b["path"]:
+            c.behavior(b["path"])
+            c.loaded = b["path"]
+        out.append(c.score(it["source"], seed=it.get("seed", 0)))
+    return out
 
 
 SCORERS = {"mock": mock, "checker": checker}
