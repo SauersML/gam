@@ -59,13 +59,11 @@ def test_whole_site():
     assert [p["index"] for n in ir["nodes"] for p in n["pieces"]] == [None, None, None]
 
 
-def test_standin_and_attn():
-    ir = mech.trace_inline(HEAD.replace("logits", "logits, standin") + "standin('position')\nh = node(L[2].attn)\n",
-                           "vpd4l")
-    assert ir["valid"] and ir["standin"] == "position", ir["error"]
+def test_attn():
+    ir = mech.trace_inline(HEAD + "h = node(L[2].attn)\n", "vpd4l")
+    assert ir["valid"] and ir["standin"] == "counterfactual", ir["error"]
     assert ir["nodes"][0]["pieces"] == [{"view": "native", "layer": 2, "kind": "head", "index": None}]
-    assert "choose one of" in invalid("from mech import standin\nstandin('mean')\n")
-    assert "once per program" in invalid("from mech import standin\nstandin('global')\nstandin('position')\n")
+    assert "mech has no 'standin'" in invalid("from mech import standin\n")
 
 
 def test_tracer_speed():

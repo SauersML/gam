@@ -367,9 +367,6 @@ def source_of(ir: dict, behavior: dict, facts_of: dict[str, dict], score: dict |
     used |= {e["from"] for e in ir["edges"] if e["from"] == "embed"} | {e["to"] for e in ir["edges"] if e["to"] == "logits"}
     order = [x for x in ("node", "edges", "L", "PD", "embed", "logits") if x in used]
     out = ['"""' + "\n".join(lines) + '\n"""', f"from mech import {', '.join(order)}", ""]
-    if ir.get("standin") not in (None, "counterfactual"):
-        out[1] = out[1].replace("from mech import ", "from mech import standin, ")
-        out += [f"standin({ir['standin']!r})", ""]
     for n in ir["nodes"]:
         f = facts_of.get(n["id"])
         if f:

@@ -27,8 +27,7 @@ Indices may be ints, slices or ranges; a site without indices (L[3].mlp) is all 
 edge (writer: a node or embed; reader: a route handle, a node = all of its reads, or logits) and
 `edges(...)` lists them. node(L[1].head[1], rule=attend(offset=1)) replaces a head's query and key by
 an attention rule (attend(offset=k), attend(query=tokens, key=shift(tokens, 1)), attend(first=True)).
-`standin(mode)` says what undeclared pieces carry: "counterfactual" (default:
-the model's values on the prompt's counterfactual), "global" or "position" (averages). Comments and docstrings are free text: the English of the explanation.
+Undeclared pieces and edges carry the model's values on the prompt's counterfactual. Comments and docstrings are free text: the English of the explanation.
 
 trace(source, model) checks a program and runs it in a sandboxed child process, returning the IR the
 checker reads (design.txt section 5); code_length counts its Python tokens; english extracts its
@@ -60,9 +59,8 @@ QWEN3 = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "qwen3-1.7b": "Qwen/Qwen3-1.7B", "qwen
 VIEWS = ("native", "vpd", "library", "transcoder")
 SITES = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")
 ROUTES = ("query", "key", "value", "input")
-EXPORTS = ("node", "edges", "L", "PD", "embed", "logits", "standin", "attend", "tokens", "shift")
+EXPORTS = ("node", "edges", "L", "PD", "embed", "logits", "attend", "tokens", "shift")
 ATTRIBUTES = ("head", "attn", "mlp", "vpd", "lib", "tc", "query", "key", "value", "input") + SITES
-STANDINS = ("counterfactual", "global", "position")
 LIBRARY_ARM = "grouped_own"  # the arm of decomp's start that PD.lib addresses
 DEFAULT_STANDIN = "counterfactual"
 
@@ -149,7 +147,6 @@ class _Program:
         self.shape = shapes(model)
         self.nodes: list[Node] = []
         self.edges: dict[tuple, Edge] = {}
-        self.standin: str | None = None
 
 
 def _shape() -> dict | None:
@@ -505,18 +502,6 @@ def node(*pieces, rule=None) -> Node:
     return made
 
 
-def standin(mode: str) -> None:
-    """What every undeclared piece and edge carries (once per program): "counterfactual" (the default:
-    the model's own values on the prompt's counterfactual), "global" (its average over the behavior's
-    prompts) or "position" (its average per token position)."""
-    if mode not in STANDINS:
-        raise MechError(f"standin({mode!r}): choose one of {', '.join(STANDINS)}")
-    if _PROGRAM is not None:
-        if _PROGRAM.standin not in (None, mode):
-            raise MechError("standin() may be set once per program")
-        _PROGRAM.standin = mode
-
-
 def edges(*declared) -> None:
     """Lists the program's edges (each `writer >> reader` is declared where it is written)."""
     for e in (f for d in declared for f in (d if isinstance(d, (list, tuple)) else (d,))):  # edges([...]) too
@@ -694,7 +679,7 @@ def _validate(program: _Program, namespace: dict, ir: dict) -> None:
                 if o != n.id:
                     raise MechError(f"{Piece(p.view, p.layer, p.kind, (i,)).name()} is in nodes {o} and {n.id}; "
                                     f"a piece belongs to one node")
-    ir["standin"] = program.standin or DEFAULT_STANDIN
+    ir["standin"] = DEFAULT_STANDIN
     ir["nodes"] = [{"id": n.id, "pieces": [p.ir() for p in n.pieces], "rule": n.rule and n.rule.ir}
                    for n in program.nodes]
     ir["edges"] = [{"from": "embed" if e.src is embed else e.src.id,
