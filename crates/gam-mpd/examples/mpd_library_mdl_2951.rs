@@ -336,7 +336,14 @@ fn draw_weights(native: &OperatorProgram, family: &WeightFamily, seed: u64) -> R
     use rand::RngExt;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ 0x5745_4947_4854);
     let pool: Vec<usize> = native.operators.iter().enumerate().filter(|(_, op)| op.name.starts_with("blocks.") && op.rows.width() > 1 && op.cols.width() > 1 && op.diagonal().is_none()).map(|(i, _)| i).collect();
-    if pool.is_empty() {
+    // A map stored per head (q0, q1, ...) is one tensor: tensors are drawn uniformly, then one of
+    // their blocks, so the many per-head blocks do not crowd out the MLPs' maps.
+    let mut tensors: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for &i in &pool {
+        tensors.entry(native.operators[i].name.trim_end_matches(|c: char| c.is_ascii_digit())).or_default().push(i);
+    }
+    let tensors: Vec<Vec<usize>> = tensors.into_values().collect();
+    if tensors.is_empty() {
         return Err("edits: no map of M to edit".into());
     }
     let normal = |rng: &mut rand::rngs::StdRng, n: usize| -> Vec<f64> {
@@ -351,7 +358,8 @@ fn draw_weights(native: &OperatorProgram, family: &WeightFamily, seed: u64) -> R
     };
     let mut out = Vec::with_capacity(family.edits);
     for _ in 0..family.edits {
-        let op = &native.operators[pool[rng.random_range(0..pool.len())]];
+        let blocks = &tensors[rng.random_range(0..tensors.len())];
+        let op = &native.operators[blocks[rng.random_range(0..blocks.len())]];
         let (r, c) = (op.rows.width(), op.cols.width());
         let operator = op.name.clone();
         if rng.random_range(0..2) == 0 {
@@ -673,7 +681,8 @@ fn edit_faithfulness(
 
 /// Native weight edits of `M`'s maps (`EditSettings::weights`), the same for every explanation,
 /// drawn once into the manifest (`draw_weights`): per edit one map of a layer (an operator of `M`
-/// whose name starts with `blocks.`, neither a vector nor a norm's diagonal), uniformly, and either
+/// whose name starts with `blocks.`, neither a vector nor a norm's diagonal; a map stored per head
+/// is one tensor, of which one head's block is drawn), tensors uniformly, and either
 /// `k = 2^u` of its rows or of its columns (`u` uniform in `0..=4`) scaled by a factor of `SCALES`,
 /// or a rank-one push `s ‖W‖_F / √min(r, c) · u vᵀ` with `u`, `v` seeded unit directions and `s`
 /// of `SIZES`. Each is compiled into `M` and into `P` (`weight_edit::compile`: `M` computes with
