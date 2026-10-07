@@ -20,7 +20,7 @@
 //! at the block's input takes that gate's column (a fixed selection of the gate's columns).
 //!
 //! Training uses the expected gate: each stage holds a fixed operator `{stage}.softness` (one
-//! entry per component, zero in the program as built, so evaluation is the hard gate `H(z)`) that
+//! entry per component, [`HARD`] in the program as built, so evaluation is the hard gate) that
 //! `library_mdl` sets to the threshold's posterior deviation `σ_b` for a pass with a gradient, with
 //! the threshold at its mean there, so the gate is `Φ(z_b / σ_b)`, the step `H` integrated exactly
 //! over the threshold's posterior, and the gate's threshold and direction take gradients.
@@ -40,6 +40,12 @@ use crate::{
 use ndarray::Array2;
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::Path};
+
+/// The softness of the hard gate: `Φ(z / s)` at `s = 10⁻³⁰` (a normal float32) is `H(z)` for every
+/// `|z| > 10⁻²⁹`, and ½ at `z = 0`, where an own gate's read `V_bᵀx` is zero and so is the
+/// component's output. At `s = 0` the gate `z / s` is undefined at `z = 0`: a component with
+/// `τ_b = 0` on a row whose read is zero (an MLP whose components are all off) made the forward NaN.
+pub const HARD: f64 = 1e-30;
 
 fn error(e: impl std::fmt::Display) -> String {
     format!("library vpd: {e}")
@@ -206,7 +212,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                     ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), c)?);
                 }
             }
-            ops.push(dense(&format!("{prefix}.softness"), units(count)?, Interface::constant(), Array2::zeros((count, 1)))?);
+            ops.push(dense(&format!("{prefix}.softness"), units(count)?, Interface::constant(), Array2::from_elem((count, 1), HARD))?);
             Ok(ops)
         };
         // The attention input stage's nodes from `input` (node 0 of a rule's nodes so far): the

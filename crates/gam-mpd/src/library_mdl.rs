@@ -2035,7 +2035,7 @@ impl Scorer {
     /// With `posterior`, each gated stage's softness set to its threshold's posterior deviation
     /// `σ_b` and the threshold to its iterate's mean, so the stage's gates are `Φ(z_b / σ_b)`, the
     /// hard gate integrated exactly over the threshold's posterior (`library_vpd`), for a pass
-    /// with a gradient; with none, the softness back to zero, the hard gate `H(z_b)` every other
+    /// with a gradient; with none, the softness back to `library_vpd::HARD`, the hard gate every other
     /// evaluation scores.
     fn soften(&mut self, posterior: Option<&DevicePosterior>) -> Result<(), String> {
         if self.soft.is_empty() {
@@ -2047,7 +2047,7 @@ impl Scorer {
                     let j = self.at(threshold)?;
                     (posterior.values(j)?.1.mapv(f64::exp), Some(posterior.iterate(j)?))
                 }
-                None => (Array2::zeros((count, 1)), None),
+                None => (Array2::from_elem((count, 1), crate::library_vpd::HARD), None),
             };
             let program = self.experiments.explanation_mut();
             let device = program.device().clone();
