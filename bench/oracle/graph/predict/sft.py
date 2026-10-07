@@ -185,7 +185,37 @@ def evaluate(model, tok, heldout, per_type, batch, max_tokens, dev):
         mean = sum(bits) / len(bits)
         se = (sum((x - mean) ** 2 for x in bits) / max(1, len(bits) - 1) / len(bits)) ** 0.5
         out[kind] = {"questions": len(bits), "bits_per_question": mean, "se": se, "bits_per_answer_token": sum(bits) / sum(count)}
+        # Knowing M beyond the format: the bits of the measured answer minus the bits of the "no change"
+        # answer (the clean distribution or continuation the question states, with KL 0) on the same
+        # question; negative = the oracle prefers what M does. Reported over all questions and over those
+        # whose measured answer differs from no change.
+        pairs = [(i, q, nc) for i, q in enumerate(qs) if (nc := no_change_answer(q)) is not None]
+        if pairs:
+            alt = [dict(q, answer=nc) for _, q, nc in pairs]
+            alt_bits = []
+            for s in range(0, len(alt), batch):
+                ids, labels, mask = collate(tok, alt[s : s + batch], max_tokens, dev)
+                alt_bits += answer_bits(model, ids, labels, mask)[0].tolist()
+            true_bits = [bits[i] for i, _, _ in pairs]
+            d = [t - a for t, a in zip(true_bits, alt_bits)]
+            moved = [x for x, (_, q, _) in zip(d, pairs) if changed(q)]
+            mean_se = lambda v: (sum(v) / len(v), (sum((x - sum(v) / len(v)) ** 2 for x in v) / max(1, len(v) - 1) / len(v)) ** 0.5) if v else (None, None)  # noqa: E731
+            out[kind]["measured_minus_no_change_bits"], out[kind]["measured_minus_no_change_se"] = mean_se(d)
+            out[kind]["changed_questions"] = len(moved)
+            out[kind]["changed_measured_minus_no_change_bits"], out[kind]["changed_measured_minus_no_change_se"] = mean_se(moved)
     return out
+
+
+def no_change_answer(q):
+    """The answer M would give if the intervention did nothing, in the answer's own format (None when the
+    question states no clean outcome): the stated clean distribution with KL 0, or the clean continuation."""
+    lines = q["input"].split("\n")
+    if q["type"] in ("edit", "cut", "swap", "prompt"):
+        clean = next((l[len("<clean> "):] for l in lines if l.startswith("<clean> ")), None)
+        return None if clean is None else clean + "\nKL 0.000 bits"
+    if q["type"] == "continue":
+        return next((l[len("<clean_continuation> "):] for l in lines if l.startswith("<clean_continuation> ")), None)
+    return None
 
 
 def main():
