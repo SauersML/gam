@@ -664,16 +664,18 @@ impl DevicePosterior {
     }
 
     /// The trust region's ratio test on a tested move: `ratio` is the measured decrease of the
-    /// objective over the model's prediction. Where the model overstated the gain (`ratio < ¼`,
-    /// a rise included) the factor on the step's length falls to a quarter; where it held
-    /// (`ratio > ¾`) it doubles, up to one, the model's own length. A move whose measured change
-    /// is within its standard error says nothing and leaves it. The trust factor starts at one
-    /// and is not checkpointed. A line step from averaged ratios can overshoot when the curvature
+    /// objective over the model's prediction. Where the move raised the objective (`ratio < 0`)
+    /// the factor on the step's length falls to a quarter; where the model held (`ratio > ¾`) it
+    /// doubles, up to one, the model's own length; a smaller decrease leaves it. A small step's
+    /// ratio is the true slope over the model's estimate of it, and the estimate runs high: with
+    /// the factor also cut below `ratio < ¼` it fell to 2.4e-4 in 536 steps, every move a
+    /// decrease (decomp-vpd4l-i, vpd4l grouped direction gates with learned widths, 1c27e2831b).
+    /// The trust factor starts at one and is not checkpointed. A line step from averaged ratios can overshoot when the curvature
     /// jumps: on vpd4l grouped direction gates (decomp-vpd4l-h, 591bb575c2) η rose from about
     /// 2e-4 to 3.7e-2 in the third epoch and the epoch diverged (clean KL 3.67 → 8.54) despite 511
     /// rejected moves.
     pub fn trust_update(&mut self, ratio: f64) {
-        if ratio < 0.25 {
+        if ratio < 0.0 {
             self.trust *= 0.25;
         } else if ratio > 0.75 {
             self.trust = (2.0 * self.trust).min(1.0);
