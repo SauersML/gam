@@ -34,8 +34,8 @@ Write ONE Python file that explains how the model produces the behavior below. I
 - writer >> reader declares an edge, listed in edges(...). The writer is a node or embed; the reader is
   node.query, node.key or node.value (attention), node.input or the node itself (all of its reads), or
   logits. Writers must come before readers.
-- Every piece you do not declare is replaced by its average over the behavior's prompts, and every
-  edge you do not declare carries the writer's average write.
+- Anything you do not declare behaves as it would on the counterfactual prompt, so declare the pieces
+  and connections that carry the information that decides the answer.
 - The score, in bits (lower is better), adds: the code's Python tokens; the error of the program
   against the model under random experiments applied identically to both (prompt edits, weight edits,
   node value swaps, edge cuts); and the error of a reader that predicts the model from the program's
