@@ -754,6 +754,44 @@ fn column_reads_and_writes_agree_with_the_host() {
     }
 }
 
+/// `row_lists`, `sampled_product`, `listed_product` and `transpose` on every device against the
+/// host's definitions: per row the columns of the groups whose mask entry is not zero (a NaN
+/// counts), `x Aᵀ` at exactly those entries and zero elsewhere, `v A` from the listed entries of
+/// `v` alone, and `tᵀ`. The values are small integers, so every sum is exact in float32 too and
+/// each device gives the definition bit for bit.
+#[test]
+fn row_lists_and_their_products_agree_with_the_host() {
+    let (rows, k, m) = (7, 5, 3);
+    let widths = [1usize, 2, 1, 3, 1];
+    let starts: Vec<u32> = std::iter::once(0).chain(widths.iter().scan(0u32, |s, &w| { *s += w as u32; Some(*s) })).collect();
+    let n = *starts.last().unwrap() as usize;
+    let mut mask = Array2::from_shape_fn((rows, widths.len()), |(r, g)| if (r + 2 * g) % 3 == 0 { 0.5 } else { 0.0 });
+    mask[[4, 1]] = f64::NAN;
+    mask.row_mut(6).fill(0.0);
+    let on = |r: usize, c: usize| {
+        let g = (0..widths.len()).find(|&g| (starts[g] as usize..starts[g + 1] as usize).contains(&c)).unwrap();
+        mask[[r, g]] != 0.0
+    };
+    let x = Array2::from_shape_fn((rows, k), |(r, t)| ((r * 3 + t * 5) % 7) as f64 - 3.0);
+    let a = Array2::from_shape_fn((n, k), |(c, t)| ((c * 2 + t * 3) % 5) as f64 - 2.0);
+    let v = Array2::from_shape_fn((rows, n), |(r, c)| ((r + c * 4) % 9) as f64 - 4.0);
+    let b = Array2::from_shape_fn((n, m), |(c, j)| ((c * 5 + j) % 7) as f64 - 3.0);
+    let sampled = Array2::from_shape_fn((rows, n), |(r, c)| if on(r, c) { x.row(r).dot(&a.row(c)) } else { 0.0 });
+    let listed = Array2::from_shape_fn((rows, m), |(r, j)| (0..n).filter(|&c| on(r, c)).map(|c| v[[r, c]] * b[[c, j]]).sum::<f64>());
+    for device in every_device() {
+        let lists = device.row_lists(&up(&device, &mask), &starts).expect("row lists");
+        assert_eq!((lists.dim(), lists.len()), ((rows, n), (0..rows).flat_map(|r| (0..n).map(move |c| (r, c))).filter(|&(r, c)| on(r, c)).count()), "{}", device.name());
+        assert_eq!(down(&device, &device.sampled_product(&up(&device, &x), &up(&device, &a), &lists).expect("sampled")), sampled, "{}: sampled product", device.name());
+        assert_eq!(down(&device, &device.listed_product(&up(&device, &v), &lists, &up(&device, &b)).expect("listed")), listed, "{}: listed product", device.name());
+        assert_eq!(down(&device, &device.transpose(&up(&device, &v)).expect("transpose")), v.t(), "{}: transpose", device.name());
+        let none = device.row_lists(&up(&device, &Array2::zeros((rows, widths.len()))), &starts).expect("no lists");
+        assert!(none.is_empty());
+        assert_eq!(down(&device, &device.sampled_product(&up(&device, &x), &up(&device, &a), &none).expect("sampled")), Array2::<f64>::zeros((rows, n)));
+        assert_eq!(down(&device, &device.listed_product(&up(&device, &v), &none, &up(&device, &b)).expect("listed")), Array2::<f64>::zeros((rows, m)));
+        assert!(device.row_lists(&up(&device, &mask), &starts[1..]).is_err());
+    }
+}
+
 /// `upload_f32_overlapped` (CUDA: a second stream and a landing buffer) gives the values
 /// `upload_f32` does, for uploads of several sizes in turn: one longer than a staging buffer, and
 /// more than the landing buffers, a later one landing where an earlier one did.

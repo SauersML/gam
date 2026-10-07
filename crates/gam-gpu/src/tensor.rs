@@ -349,6 +349,37 @@ pub struct Indices {
     data: IndexData,
 }
 
+/// Per row of a `rows × cols` value, the columns it lists ([`Device::row_lists`]): row `r`'s are
+/// `columns[offsets[r]..offsets[r + 1]]`, increasing, and `row_of` holds each listed entry's row.
+/// A product reading or writing only these entries ([`Device::sampled_product`],
+/// [`Device::listed_product`]) takes each row's own columns, not the batch's union of them.
+pub struct RowLists {
+    rows: usize,
+    cols: usize,
+    offsets: Indices,
+    columns: Indices,
+    row_of: Indices,
+}
+
+impl RowLists {
+    /// The listed entries over all rows.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.columns.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.columns.len == 0
+    }
+
+    /// The rows and columns of the value it lists entries of.
+    #[must_use]
+    pub fn dim(&self) -> (usize, usize) {
+        (self.rows, self.cols)
+    }
+}
+
 /// Which of an operator's coordinates its prior-group ids index ([`GroupMap`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GroupAxis {
@@ -1541,6 +1572,115 @@ impl Device {
             Backend::Metal(engine) => self.download(&engine.nonzero_columns(x, &self.upload_indices(rows)?)?)?.iter().copied().collect(),
         };
         Ok(flags.iter().enumerate().filter(|(_, f)| **f != 0.0).map(|(c, _)| c as u32).collect())
+    }
+
+    /// Per row of `mask` (rows × groups), the columns `starts[g]..starts[g + 1]` of every group `g`
+    /// whose entry is not zero (a NaN counts): a gate's components turned on in each row, spread
+    /// over the columns of the value it gates (`starts` increasing from 0, one more than the
+    /// groups). CUDA counts and fills the lists on the device, reading back one count a row.
+    pub fn row_lists(&self, mask: &Tensor, starts: &[u32]) -> Result<RowLists, GpuError> {
+        if starts.len() != mask.cols + 1 || starts.first() != Some(&0) || starts.windows(2).any(|w| w[0] > w[1]) {
+            return Err(shape(format!("{} group starts for {} groups", starts.len(), mask.cols)));
+        }
+        let cols = starts[mask.cols] as usize;
+        let rows = u32::try_from(mask.rows).map_err(|_| shape(format!("{} rows of row lists", mask.rows)))?;
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => {
+                let starts = self.upload_indices(starts)?;
+                let counts = self.download(&engine.row_counts(mask, &starts)?)?;
+                let mut offsets = Vec::with_capacity(mask.rows + 1);
+                offsets.push(0u32);
+                for &n in &counts {
+                    let next = u64::from(offsets[offsets.len() - 1]) + n as u64;
+                    offsets.push(u32::try_from(next).map_err(|_| shape(format!("{next} listed entries")))?);
+                }
+                let entries = offsets[mask.rows] as usize;
+                let offsets = self.upload_indices(&offsets)?;
+                let (columns, row_of) = engine.row_fill(mask, &starts, &offsets, entries)?;
+                Ok(RowLists { rows: mask.rows, cols, offsets, columns, row_of })
+            }
+            _ => {
+                let m = self.download(mask)?;
+                let (mut offsets, mut columns, mut row_of) = (vec![0u32], Vec::new(), Vec::new());
+                for (r, row) in (0..rows).zip(m.rows()) {
+                    for (g, &v) in row.iter().enumerate() {
+                        if v != 0.0 {
+                            columns.extend(starts[g]..starts[g + 1]);
+                            row_of.extend(std::iter::repeat_n(r, (starts[g + 1] - starts[g]) as usize));
+                        }
+                    }
+                    offsets.push(u32::try_from(columns.len()).map_err(|_| shape(format!("{} listed entries", columns.len())))?);
+                }
+                Ok(RowLists { rows: mask.rows, cols, offsets: self.upload_indices(&offsets)?, columns: self.upload_indices(&columns)?, row_of: self.upload_indices(&row_of)? })
+            }
+        }
+    }
+
+    /// `x Aᵀ` (`x` rows × k, `A` n × k) at the entries `lists` holds, zero at every other: each
+    /// listed entry `(r, c)` is `Σ_t x[r, t] A[c, t]`, summed in the tensors' own precision
+    /// (a product read only where a gate is on, or a cotangent wanted only there).
+    pub fn sampled_product(&self, x: &Tensor, a: &Tensor, lists: &RowLists) -> Result<Tensor, GpuError> {
+        if x.cols != a.cols || lists.dim() != (x.rows, a.rows) || x.storage() != a.storage() || x.storage() == Storage::Bf16 {
+            return Err(shape(format!("a sampled product of {:?} and {:?} at {:?} lists", x.dim(), a.dim(), lists.dim())));
+        }
+        let mut out = self.zeros(x.rows, a.rows)?;
+        match &*self.backend {
+            Backend::Host => {
+                let (xv, av, k, n) = (host(x)?, host(a)?, x.cols, a.rows);
+                let (columns, row_of) = (host_indices(&lists.columns)?, host_indices(&lists.row_of)?);
+                let o = host_mut(&mut out)?;
+                for (&c, &r) in columns.iter().zip(row_of) {
+                    let (r, c) = (r as usize, c as usize);
+                    o[r * n + c] = xv[r * k..(r + 1) * k].iter().zip(&av[c * k..(c + 1) * k]).map(|(p, q)| p * q).sum();
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.sampled_product(x, a, lists, &mut out)?,
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.sampled_product(x, a, lists, &mut out)?,
+        }
+        Ok(out)
+    }
+
+    /// `v A` (`v` rows × n read only at the entries `lists` holds, `A` n × m): row `r` is
+    /// `Σ_c v[r, c] A[c, :]` over its listed columns `c`, summed in the tensors' own precision.
+    pub fn listed_product(&self, v: &Tensor, lists: &RowLists, a: &Tensor) -> Result<Tensor, GpuError> {
+        if lists.dim() != v.dim() || v.cols != a.rows || v.storage() != a.storage() || v.storage() == Storage::Bf16 {
+            return Err(shape(format!("a listed product of {:?} at {:?} lists and {:?}", v.dim(), lists.dim(), a.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (vv, av, n, m) = (host(v)?, host(a)?, v.cols, a.cols);
+                let (offsets, columns) = (host_indices(&lists.offsets)?, host_indices(&lists.columns)?);
+                let mut out = vec![0.0; v.rows * m];
+                for (r, row) in out.chunks_mut(m.max(1)).take(v.rows).enumerate() {
+                    for (j, o) in row.iter_mut().enumerate() {
+                        *o = columns[offsets[r] as usize..offsets[r + 1] as usize].iter().map(|&c| vv[r * n + c as usize] * av[c as usize * m + j]).sum();
+                    }
+                }
+                Ok(Tensor { rows: v.rows, cols: m, data: Data::Host(out) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.listed_product(v, lists, a),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.listed_product(v, lists, a),
+        }
+    }
+
+    /// `tᵀ`.
+    pub fn transpose(&self, t: &Tensor) -> Result<Tensor, GpuError> {
+        match &*self.backend {
+            Backend::Host => {
+                let v = host(t)?;
+                let out = (0..t.len()).map(|i| v[(i % t.rows) * t.cols + i / t.rows]).collect();
+                Ok(Tensor { rows: t.cols, cols: t.rows, data: Data::Host(out) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.transpose(t),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.transpose(t),
+        }
     }
 
     /// `out[r, j] = t[r, ids[j]]`: columns `ids` of `t`, in order.
@@ -3764,6 +3904,61 @@ extern "C" __global__ void nonzero_columns(u64 n, unsigned int nr, const double*
         }
         out[c] = any;
     }
+}
+
+// Per row r of a rows × groups mask, the columns its groups other than zero span (a NaN counts):
+// Σ (starts[g + 1] − starts[g]) over those g.
+extern "C" __global__ void row_counts(unsigned int rows, unsigned int groups, const double* mask, const unsigned int* starts, double* out) {
+    GRID_STRIDE(r, rows) {
+        unsigned int n = 0;
+        for (unsigned int g = 0; g < groups; ++g) {
+            if (mask[r * groups + g] != 0.0) n += starts[g + 1] - starts[g];
+        }
+        out[r] = (double)n;
+    }
+}
+
+// Row r's listed columns from offsets[r] on, increasing, each with its row.
+extern "C" __global__ void row_fill(unsigned int rows, unsigned int groups, const double* mask, const unsigned int* starts, const unsigned int* offsets, unsigned int* columns, unsigned int* row_of) {
+    GRID_STRIDE(r, rows) {
+        unsigned int e = offsets[r];
+        for (unsigned int g = 0; g < groups; ++g) {
+            if (mask[r * groups + g] == 0.0) continue;
+            for (unsigned int c = starts[g]; c < starts[g + 1]; ++c) { columns[e] = c; row_of[e] = (unsigned int)r; ++e; }
+        }
+    }
+}
+
+// out[r, c] = Σ_t x[r, t] a[c, t] at each listed entry (c = columns[e], r = row_of[e]); one warp
+// an entry, its lanes striding t and summing by shuffles. Other entries of out are left as they are.
+extern "C" __global__ void sampled_product(u64 entries, unsigned int k, unsigned int n, const double* x, const double* a, const unsigned int* columns, const unsigned int* row_of, double* out) {
+    u64 lane = threadIdx.x & 31u, warps = ((u64)gridDim.x * blockDim.x) >> 5;
+    for (u64 e = ((u64)blockIdx.x * blockDim.x + threadIdx.x) >> 5; e < entries; e += warps) {
+        u64 r = row_of[e], c = columns[e];
+        double s = 0.0;
+        for (u64 t = lane; t < k; t += 32) s += x[r * k + t] * a[c * k + t];
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) out[r * n + c] = s;
+    }
+}
+
+// out[r, j] = Σ v[r, c] a[c, j] over row r's listed columns c (v rows × n, a n × m), over the
+// total = rows × m entries of out.
+extern "C" __global__ void listed_product(u64 total, unsigned int m, unsigned int n, const double* v, const double* a, const unsigned int* offsets, const unsigned int* columns, double* out) {
+    GRID_STRIDE(i, total) {
+        u64 r = i / m, j = i % m;
+        double s = 0.0;
+        for (unsigned int e = offsets[r]; e < offsets[r + 1]; ++e) {
+            u64 c = columns[e];
+            s += v[r * n + c] * a[c * m + j];
+        }
+        out[i] = s;
+    }
+}
+
+// out = tᵀ over its n = rows × cols entries (t rows × cols).
+extern "C" __global__ void transpose(u64 n, unsigned int rows, unsigned int cols, const double* t, double* out) {
+    GRID_STRIDE(i, n) out[i] = t[(i % rows) * cols + i / rows];
 }
 
 // `out[r, j] = t[r, ids[j]]` over the n = rows × m entries of out.
@@ -6423,6 +6618,105 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             Ok(out)
         }
 
+        pub(super) fn row_counts(&self, mask: &Tensor, starts: &Indices) -> Result<Tensor, GpuError> {
+            let storage = mask.storage();
+            if storage == Storage::Bf16 {
+                return Err(shape("row lists of a bfloat16 mask".to_string()));
+            }
+            let mut out = self.output(storage, 1, mask.rows)?;
+            let (rows, groups) = (u32_of(mask.rows)?, u32_of(mask.cols)?);
+            let f = self.kernel("row_counts", storage)?;
+            // SAFETY: `starts` holds groups + 1 increasing columns (checked by the caller).
+            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&groups).input(mask, storage)?.arg(index_slice(starts)?).output(&mut out, storage)?.launch(cfg_elements(u64::from(rows))) }
+                .gpu_ctx("tensor row_counts")?;
+            Ok(out)
+        }
+
+        pub(super) fn row_fill(&self, mask: &Tensor, starts: &Indices, offsets: &Indices, entries: usize) -> Result<(Indices, Indices), GpuError> {
+            let storage = mask.storage();
+            let (rows, groups) = (u32_of(mask.rows)?, u32_of(mask.cols)?);
+            let (mut columns, mut row_of) = (self.stream.alloc_zeros::<u32>(entries.max(1)).gpu_ctx("tensor alloc")?, self.stream.alloc_zeros::<u32>(entries.max(1)).gpu_ctx("tensor alloc")?);
+            let f = self.kernel("row_fill", storage)?;
+            // SAFETY: `offsets` are the prefix sums of row_counts' counts, so each row writes inside
+            // its own `entries`-long span.
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(&rows)
+                    .arg(&groups)
+                    .input(mask, storage)?
+                    .arg(index_slice(starts)?)
+                    .arg(index_slice(offsets)?)
+                    .arg(&mut columns)
+                    .arg(&mut row_of)
+                    .launch(cfg_elements(u64::from(rows)))
+            }
+            .gpu_ctx("tensor row_fill")?;
+            Ok((Indices { len: entries, data: IndexData::Cuda(columns) }, Indices { len: entries, data: IndexData::Cuda(row_of) }))
+        }
+
+        pub(super) fn sampled_product(&self, x: &Tensor, a: &Tensor, lists: &super::RowLists, out: &mut Tensor) -> Result<(), GpuError> {
+            if lists.is_empty() {
+                return Ok(());
+            }
+            let storage = x.storage();
+            let (entries, k, n) = (lists.len() as u64, u32_of(x.cols)?, u32_of(a.rows)?);
+            let f = self.kernel("sampled_product", storage)?;
+            // SAFETY: the lists' entries are inside out (rows × n); x and a hold k columns.
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(&entries)
+                    .arg(&k)
+                    .arg(&n)
+                    .input(x, storage)?
+                    .input(a, storage)?
+                    .arg(index_slice(&lists.columns)?)
+                    .arg(index_slice(&lists.row_of)?)
+                    .output(out, storage)?
+                    .launch(cfg_elements(entries * 32))
+            }
+            .gpu_ctx("tensor sampled_product")
+            .map(|_| ())
+        }
+
+        pub(super) fn listed_product(&self, v: &Tensor, lists: &super::RowLists, a: &Tensor) -> Result<Tensor, GpuError> {
+            let storage = v.storage();
+            let mut out = self.output(storage, v.rows, a.cols)?;
+            let (total, m, n) = (out.len() as u64, u32_of(a.cols)?, u32_of(v.cols)?);
+            let f = self.kernel("listed_product", storage)?;
+            // SAFETY: offsets has rows + 1 entries, the columns inside v's n columns (a's rows).
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(&total)
+                    .arg(&m)
+                    .arg(&n)
+                    .input(v, storage)?
+                    .input(a, storage)?
+                    .arg(index_slice(&lists.offsets)?)
+                    .arg(index_slice(&lists.columns)?)
+                    .output(&mut out, storage)?
+                    .launch(cfg_elements(total))
+            }
+            .gpu_ctx("tensor listed_product")?;
+            Ok(out)
+        }
+
+        pub(super) fn transpose(&self, t: &Tensor) -> Result<Tensor, GpuError> {
+            let storage = t.storage();
+            if storage == Storage::Bf16 {
+                return Err(shape("transpose of a bfloat16 tensor".to_string()));
+            }
+            let mut out = self.output(storage, t.cols, t.rows)?;
+            let (n, rows, cols) = (t.len() as u64, u32_of(t.rows)?, u32_of(t.cols)?);
+            let f = self.kernel("transpose", storage)?;
+            // SAFETY: out holds the n values of t.
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&rows).arg(&cols).input(t, storage)?.output(&mut out, storage)?.launch(cfg_elements(n)) }
+                .gpu_ctx("tensor transpose")?;
+            Ok(out)
+        }
+
         pub(super) fn gather_columns(&self, t: &Tensor, ids: &Indices) -> Result<Tensor, GpuError> {
             let storage = t.storage();
             if storage == Storage::Bf16 {
@@ -7568,6 +7862,41 @@ kernel void t_nonzero_columns(device const float* x [[buffer(0)]], device const 
     }
 }
 
+// out[r, c] = Σ_t x[r, t] a[c, t] at each of the p.n listed entries (c = columns[e], r = row_of[e]);
+// p.cols = k, p.extra = out's columns.
+kernel void t_sampled_product(device const float* x [[buffer(0)]], device const float* a [[buffer(1)]], device const uint* columns [[buffer(2)]],
+                              device const uint* row_of [[buffer(3)]], device float* out [[buffer(4)]], constant P& p [[buffer(5)]],
+                              uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        uint r = row_of[i], c = columns[i];
+        float s = 0.0f;
+        for (uint t = 0; t < p.cols; ++t) s += x[r * p.cols + t] * a[c * p.cols + t];
+        out[r * p.extra + c] = s;
+    }
+}
+
+// out[r, j] = Σ v[r, c] a[c, j] over row r's listed columns c, over the p.n = rows × m entries;
+// p.cols = m, p.extra = v's columns.
+kernel void t_listed_product(device const float* v [[buffer(0)]], device const float* a [[buffer(1)]], device const uint* offsets [[buffer(2)]],
+                             device const uint* columns [[buffer(3)]], device float* out [[buffer(4)]], constant P& p [[buffer(5)]],
+                             uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        uint r = i / p.cols, j = i % p.cols;
+        float s = 0.0f;
+        for (uint e = offsets[r]; e < offsets[r + 1]; ++e) {
+            uint c = columns[e];
+            s += v[r * p.extra + c] * a[c * p.cols + j];
+        }
+        out[i] = s;
+    }
+}
+
+// out = tᵀ over its p.n entries (t p.rows × p.cols).
+kernel void t_transpose(device const float* t [[buffer(0)]], device float* out [[buffer(1)]], constant P& p [[buffer(2)]],
+                        uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS out[i] = t[(i % p.rows) * p.cols + i / p.rows];
+}
+
 // out[r, j] = t[r, ids[j]] over the n = rows × m (p.extra) entries; p.cols = t's columns.
 kernel void t_gather_columns(device const float* t [[buffer(0)]], device const uint* ids [[buffer(1)]], device float* out [[buffer(2)]],
                              constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
@@ -8341,6 +8670,9 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device const fl
         "t_fisher_probe",
         "t_block_products",
         "t_gate_function",
+        "t_sampled_product",
+        "t_listed_product",
+        "t_transpose",
         "t_softmax_quadratic",
         "t_argmax_rows",
         "t_fill_entries",
@@ -8556,6 +8888,30 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device const fl
             let out = self.tensor(ids.len, table.cols)?;
             let p = P { cols: u32_of(table.cols)?, ..P::default() };
             self.elements("t_gather_rows", &[whole(buffer(table)?), whole(index_buffer(ids)?), whole(buffer(&out)?)], out.len(), p)?;
+            Ok(out)
+        }
+
+        pub(super) fn sampled_product(&self, x: &Tensor, a: &Tensor, lists: &super::RowLists, out: &mut Tensor) -> Result<(), GpuError> {
+            if lists.is_empty() {
+                return Ok(());
+            }
+            u32_of(x.len().max(a.len()).max(x.rows.saturating_mul(a.rows)))?;
+            let p = P { cols: u32_of(x.cols)?, extra: u32_of(a.rows)?, ..P::default() };
+            self.elements("t_sampled_product", &[whole(buffer(x)?), whole(buffer(a)?), whole(index_buffer(&lists.columns)?), whole(index_buffer(&lists.row_of)?), whole(buffer(out)?)], lists.len(), p)
+        }
+
+        pub(super) fn listed_product(&self, v: &Tensor, lists: &super::RowLists, a: &Tensor) -> Result<Tensor, GpuError> {
+            let out = self.tensor(v.rows, a.cols)?;
+            u32_of(v.len().max(a.len()))?;
+            let p = P { cols: u32_of(a.cols)?, extra: u32_of(v.cols)?, ..P::default() };
+            self.elements("t_listed_product", &[whole(buffer(v)?), whole(buffer(a)?), whole(index_buffer(&lists.offsets)?), whole(index_buffer(&lists.columns)?), whole(buffer(&out)?)], out.len(), p)?;
+            Ok(out)
+        }
+
+        pub(super) fn transpose(&self, t: &Tensor) -> Result<Tensor, GpuError> {
+            let out = self.tensor(t.cols, t.rows)?;
+            let p = P { rows: u32_of(t.rows)?, cols: u32_of(t.cols)?, ..P::default() };
+            self.elements("t_transpose", &[whole(buffer(t)?), whole(buffer(&out)?)], t.len(), p)?;
             Ok(out)
         }
 

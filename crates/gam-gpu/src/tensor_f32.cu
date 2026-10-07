@@ -594,6 +594,61 @@ extern "C" __global__ void gate_function(u64 n, unsigned int code, const float* 
     }
 }
 
+// Per row r of a rows × groups mask, the columns its groups other than zero span (a NaN counts):
+// Σ (starts[g + 1] − starts[g]) over those g (exact in float below 2^24).
+extern "C" __global__ void row_counts(unsigned int rows, unsigned int groups, const float* mask, const unsigned int* starts, float* out) {
+    GRID_STRIDE(r, rows) {
+        unsigned int n = 0;
+        for (unsigned int g = 0; g < groups; ++g) {
+            if (mask[r * groups + g] != 0.0f) n += starts[g + 1] - starts[g];
+        }
+        out[r] = (float)n;
+    }
+}
+
+// Row r's listed columns from offsets[r] on, increasing, each with its row.
+extern "C" __global__ void row_fill(unsigned int rows, unsigned int groups, const float* mask, const unsigned int* starts, const unsigned int* offsets, unsigned int* columns, unsigned int* row_of) {
+    GRID_STRIDE(r, rows) {
+        unsigned int e = offsets[r];
+        for (unsigned int g = 0; g < groups; ++g) {
+            if (mask[r * groups + g] == 0.0f) continue;
+            for (unsigned int c = starts[g]; c < starts[g + 1]; ++c) { columns[e] = c; row_of[e] = (unsigned int)r; ++e; }
+        }
+    }
+}
+
+// out[r, c] = Σ_t x[r, t] a[c, t] at each listed entry (c = columns[e], r = row_of[e]); one warp
+// an entry, its lanes striding t and summing by shuffles. Other entries of out are left as they are.
+extern "C" __global__ void sampled_product(u64 entries, unsigned int k, unsigned int n, const float* x, const float* a, const unsigned int* columns, const unsigned int* row_of, float* out) {
+    u64 lane = threadIdx.x & 31u, warps = ((u64)gridDim.x * blockDim.x) >> 5;
+    for (u64 e = ((u64)blockIdx.x * blockDim.x + threadIdx.x) >> 5; e < entries; e += warps) {
+        u64 r = row_of[e], c = columns[e];
+        float s = 0.0f;
+        for (u64 t = lane; t < k; t += 32) s += x[r * k + t] * a[c * k + t];
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) out[r * n + c] = s;
+    }
+}
+
+// out[r, j] = Σ v[r, c] a[c, j] over row r's listed columns c (v rows × n, a n × m), over the
+// total = rows × m entries of out.
+extern "C" __global__ void listed_product(u64 total, unsigned int m, unsigned int n, const float* v, const float* a, const unsigned int* offsets, const unsigned int* columns, float* out) {
+    GRID_STRIDE(i, total) {
+        u64 r = i / m, j = i % m;
+        float s = 0.0f;
+        for (unsigned int e = offsets[r]; e < offsets[r + 1]; ++e) {
+            u64 c = columns[e];
+            s += v[r * n + c] * a[c * m + j];
+        }
+        out[i] = s;
+    }
+}
+
+// out = tᵀ over its n = rows × cols entries (t rows × cols).
+extern "C" __global__ void transpose(u64 n, unsigned int rows, unsigned int cols, const float* t, float* out) {
+    GRID_STRIDE(i, n) out[i] = t[(i % rows) * cols + i / rows];
+}
+
 extern "C" __global__ void block_products(u64 n, unsigned int cols, unsigned int blocks,
     const float* left, const float* right, const unsigned int* offsets, float* out) {
     GRID_STRIDE(i, n) {
