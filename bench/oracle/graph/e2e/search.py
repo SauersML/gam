@@ -250,9 +250,9 @@ def main() -> None:
                     print(msg, flush=True)
                     logf.write(msg + "\n")
                     logf.flush()
-                start = [unit_of(t) for t in a.start.split(",")] if a.start else None
+                start_units = [unit_of(t) for t in a.start.split(",")] if a.start else None
                 partial = out / f"{stem}.partial.json"
-                found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start, a.mlp_view,
+                found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start_units, a.mlp_view,
                                lambda state: partial.write_text(json.dumps(state, indent=1)), objective_of(a.objective))
                 heldout = pool.score([found["source"]], a.experiments, a.heldout_seed)[0]
                 found.update(units=[name(u) for u in found["units"]], heldout=heldout, calls=pool.calls - start, stand_in=a.stand_in, checker=Path(str(score.BINARY)).name,

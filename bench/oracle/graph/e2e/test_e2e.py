@@ -207,3 +207,27 @@ def test_vpd_units_take_the_strongest_subcomponents():
     (vpd,) = [n for n in ir["nodes"] if n["pieces"][0]["view"] == "vpd"]
     got = {p["kind"]: p["index"] for p in vpd["pieces"]}
     assert got == {"c_fc": [53, 726], "down_proj": [607, 1149, 3257]}
+
+
+def test_search_main_writes_its_result(tmp_path, monkeypatch):
+    """search.py end to end with the fake pool: the result file holds the units, both scores and the
+    checker calls (a shadowed variable once lost every MATS result at this last step)."""
+    import search
+    behavior = tmp_path / "x.y.json"
+    behavior.write_text(json.dumps({"id": "x.y", "model": "vpd4l", "prompts": []}))
+
+    class Pool(FakePool):
+        def __init__(self, *a, **k):
+            super().__init__()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(search, "Pool", Pool)
+    monkeypatch.setattr(e2e, "record", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", ["search.py", str(behavior), "--mode", "addition", "--min-neurons", "384",
+                                      "--start", "h1_1", "--out", str(tmp_path / "out")])
+    search.main()
+    r = json.loads((tmp_path / "out" / "x.y.addition.json").read_text())
+    assert "h1_1" in r["units"] and "h2_4" in r["units"] and r["calls"] > 0
+    assert r["heldout"]["total_bits"] == r["score"]["total_bits"]
