@@ -479,8 +479,7 @@ def number_successor(tok, rng):
 
 
 NUMWORDS = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split()
-ORDINALS = ("first second third fourth fifth sixth seventh eighth ninth tenth eleventh twelfth thirteenth fourteenth fifteenth "
-            "sixteenth seventeenth eighteenth nineteenth twentieth").split()
+ORDINALS = "first second third fourth fifth sixth seventh eighth ninth tenth eleventh twelfth".split()  # later ordinals split into several tokens
 
 
 LIST_TEMPLATES = ["{L},", "Here is the order: {L},", "She said them in order: {L},", "Sequence: {L},"]
@@ -511,7 +510,7 @@ def word_successor(tok, rng):
     return [Variant("cardinal", "Number-word succession: a run of number words; the next word continues the count.",
                     sequence_items(NUMWORDS, rng, False, ["The number after {X} is", "Count on from {X}: the next one is"])),
             Variant("ordinal", "Ordinal succession: a run of ordinal words; the next word continues the order.",
-                    sequence_items(ORDINALS, rng, False, ["The one after the {X} is the"]))]
+                    sequence_items(ORDINALS, rng, False, ["The one after the {X} is the"], n=600))]
 
 
 DAYS = "Monday Tuesday Wednesday Thursday Friday Saturday Sunday".split()
@@ -868,17 +867,20 @@ BOX_ITEMS = "apple pen ball key coin ring cup book hat shoe watch card".split()
 def entity_binding(tok, rng):
     """Entity tracking: recall which container an object was put in."""
     items = words(tok, BOX_ITEMS)
-    v = Variant("boxes", "Entity binding: three objects are each placed in a lettered box; asked for one object's box, the answer is its letter. The counterfactual swaps the boxes of the queried object and another.")
-    for _ in range(200):
-        objs = rng.sample(items, 3)
-        boxes = rng.sample("ABCDEFG", 3)
-        q = rng.randrange(3)
-        o = rng.choice([i for i in range(3) if i != q])
-        alt = list(boxes)
-        alt[q], alt[o] = alt[o], alt[q]
-        f = lambda bs: " ".join(f"The {x} is in box {b}." for x, b in zip(objs, bs)) + f" The {objs[q]} is in box"
-        v.items.append(Item(f(boxes), " " + boxes[q], f(alt), " " + alt[q]))
-    return [v]
+    out = []
+    for n in (2, 3):
+        v = Variant(f"boxes{n}", f"Entity binding: {n} objects are each placed in a lettered box; asked for one object's box, the answer is its letter. The counterfactual swaps the boxes of the queried object and another.")
+        for _ in range(200):
+            objs = rng.sample(items, n)
+            boxes = rng.sample("ABCDEFG", n)
+            q = rng.randrange(n)
+            o = rng.choice([i for i in range(n) if i != q])
+            alt = list(boxes)
+            alt[q], alt[o] = alt[o], alt[q]
+            f = lambda bs: " ".join(f"The {x} is in box {b}." for x, b in zip(objs, bs)) + f" The {objs[q]} is in box"
+            v.items.append(Item(f(boxes), " " + boxes[q], f(alt), " " + alt[q]))
+        out.append(v)
+    return out
 
 
 @family
@@ -886,11 +888,11 @@ def first_letter(tok, rng):
     """The first letter of a word."""
     ws = words(tok, NOUNS)
     v = Variant("starts_with", "Spelling: the first letter of a quoted word; the counterfactual quotes a word with another first letter.")
-    for _ in range(200):
+    for _ in range(400):
         a, b = rng.sample(ws, 2)
         if a[0] == b[0]:
             continue
-        t = 'The word "{w}" starts with the letter'
+        t = rng.choice(['The word "{w}" starts with the letter', 'The first letter of the word "{w}" is the letter'])
         v.items.append(Item(t.format(w=a), " " + a[0], t.format(w=b), " " + b[0]))
     return [v]
 
