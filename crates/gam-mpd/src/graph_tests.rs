@@ -606,3 +606,21 @@ fn weights_read_from_the_native_program_are_the_librarys() {
         }
     }
 }
+
+#[test]
+fn device_path_pads_sequences_of_different_lengths() {
+    let f = fixture("graph_device_lengths");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    // Six sequences of four lengths.
+    let sequences: Vec<Vec<u32>> = f.sequences.iter().zip([12, 7, 9, 12, 5, 9]).map(|(s, n)| s[..n].to_vec()).collect();
+    let batch = Batch::new(&sequences).expect("batch");
+    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
+    let circuit = Graph::parse(&full_program(), &weights).expect("full").model(&weights);
+    let host = execute(&weights, &circuit, &batch, &rows, &BTreeMap::new()).expect("host");
+    let mut state = crate::graph_device::DeviceState::new(Device::host());
+    let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: None, ops: &crate::graph::Interventions::default() };
+    let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+    let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
+    assert!(kl < 1e-9, "KL(host ‖ device) over sequences of different lengths = {kl:e} bits");
+}

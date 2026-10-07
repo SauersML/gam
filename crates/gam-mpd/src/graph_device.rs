@@ -438,11 +438,18 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
     let e = |e: GpuError| e.to_string();
     let (rows, width) = (job.tokens.len(), weights.width());
     let arithmetic = s.arithmetic();
-    // The sequences grouped by length: each group's attention runs as whole sequences at once.
-    let mut by_length: BTreeMap<usize, Vec<Segment>> = BTreeMap::new();
-    for &(start, length) in job.spans {
-        by_length.entry(length).or_default().push(Segment { rows: start..start + length, first: 0, before: Vec::new() });
-    }
+    // Attention runs on every sequence padded at its end to the longest one's length, all at once
+    // (whole sequences of one length); causal attention keeps a real position from reading a pad.
+    // `padded` is each row's place there (`None` when every sequence has one length).
+    let longest = job.spans.iter().map(|s| s.1).max().unwrap_or(0);
+    let sequences = job.spans.len();
+    let padded = if job.spans.iter().all(|s| s.1 == longest) {
+        None
+    } else {
+        let places: Vec<u32> = job.spans.iter().enumerate().flat_map(|(n, &(_, length))| (0..length).map(move |p| (n * longest + p) as u32)).collect();
+        Some(s.device.upload_indices(&places).map_err(e)?)
+    };
+    let segments: Vec<Segment> = (0..sequences).map(|n| Segment { rows: n * longest..(n + 1) * longest, first: 0, before: Vec::new() }).collect();
     let positions: Vec<u32> = job.spans.iter().flat_map(|&(_, length)| 0..length as u32).collect();
     let table = s.ensure(weights.embedding.view()).map_err(e)?;
     let ids = s.device.upload_indices(job.tokens).map_err(e)?;
@@ -541,11 +548,18 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                             q = s.device.rotate(&q, cos, sin, r.half_split, false).map_err(e)?;
                             k = s.device.rotate(&k, cos, sin, r.half_split, false).map_err(e)?;
                         }
-                        let mut z = s.device.zeros(rows, v.cols()).map_err(e)?;
-                        for group in by_length.values() {
-                            let part = forward_segments(&s.device, (&q, &k, &v), group, hw.scale, hw.causal, arithmetic).map_err(e)?;
-                            s.device.axpy(&mut z, 1.0, &part).map_err(e)?;
-                        }
+                        let z = match &padded {
+                            None => forward_segments(&s.device, (&q, &k, &v), &segments, hw.scale, hw.causal, arithmetic).map_err(e)?,
+                            Some(places) => {
+                                let pad = |x: &Tensor| -> Result<Tensor, GpuError> {
+                                    let mut out = s.device.zeros(sequences * longest, x.cols())?;
+                                    s.device.scatter_rows(&mut out, places, x, false)?;
+                                    Ok(out)
+                                };
+                                let all = forward_segments(&s.device, (&pad(&q).map_err(e)?, &pad(&k).map_err(e)?, &pad(&v).map_err(e)?), &segments, hw.scale, hw.causal, arithmetic).map_err(e)?;
+                                s.device.gather_rows(&all, places).map_err(e)?
+                            }
+                        };
                         if let Some(c) = captured.as_mut() {
                             c.reads[*layer][h] = s.device.download(&z).map_err(e)?;
                         }
