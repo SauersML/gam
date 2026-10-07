@@ -479,3 +479,17 @@ fn widths_are_chosen_and_charged() {
     assert!(w.cost_bits <= w.numbers as f64 * 0.5 * score.n.log2() + 1e-9);
     assert!(w.bits.is_none_or(|b| crate::graph::WIDTHS.contains(&b) && w.scales > 0));
 }
+
+/// A score holds its own M outcomes: a cache budget that keeps none of them still scores, and
+/// scores as a large one does.
+#[test]
+fn a_tiny_cache_still_scores() {
+    let (weights, sequences) = model("graph_sites_tiny_cache");
+    let mut small = Checker::new(weights.clone(), behavior(&sequences)).expect("checker");
+    small.cache_bytes = 1;
+    let mut large = Checker::new(weights, behavior(&sequences)).expect("checker");
+    let empty = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    let (a, _) = small.score(&empty, 12, 2, true, None).expect("small cache");
+    let (b, _) = large.score(&empty, 12, 2, true, None).expect("large cache");
+    assert_eq!(a.exec_error_bits, b.exec_error_bits);
+}

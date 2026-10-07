@@ -3323,6 +3323,9 @@ impl Checker {
     /// (the edit applied once on top), runs in parallel threads. Returns each program's widths.
     fn measure_runs(&mut self, plan: Plan, measured: &mut [Option<(Vec<f64>, Option<Candidates>)>]) -> Result<Vec<Vec<Width>>, String> {
         let Plan { runs, groups, parsed, circuits, models, n, top, clean } = plan;
+        // M's outcomes of this score, held until it ends: the cache's byte budget may drop some
+        // while later groups add theirs.
+        let mut outcomes: BTreeMap<String, Arc<Array2<f64>>> = BTreeMap::new();
         for members in groups.values() {
             let restore = match &runs[members[0]].1 {
                 Experiment::Edit { edit, .. } => Some(edit.apply(&mut self.weights)?),
@@ -3337,23 +3340,27 @@ impl Checker {
                     }
                 }
                 let this = &*self;
-                let compute = |&r: &usize| -> Result<Option<(String, Arc<Array2<f64>>)>, String> {
+                // Each outcome with whether it is new to the cache.
+                let compute = |&r: &usize| -> Result<(String, Arc<Array2<f64>>, bool), String> {
                     let (i, e, key) = &runs[r];
                     this.prewarm(e)?;
-                    if this.cache.contains_key(key) {
-                        return Ok(None);
+                    if let Some(m) = this.cache.get(key) {
+                        return Ok((key.clone(), m.clone(), false));
                     }
                     if let Some(m) = this.disk_get(key) {
-                        return Ok(Some((key.clone(), Arc::new(m))));
+                        return Ok((key.clone(), Arc::new(m), true));
                     }
                     let m = this.run(&models[*i], e)?;
                     this.disk_put(key, &m);
-                    Ok(Some((key.clone(), Arc::new(m))))
+                    Ok((key.clone(), Arc::new(m), true))
                 };
                 // One run alone goes on this thread, so its products spread over the pool (par_dot).
-                let made: Vec<Option<(String, Arc<Array2<f64>>)>> = if missing.len() == 1 { missing.iter().map(compute).collect::<Result<_, String>>()? } else { missing.par_iter().map(compute).collect::<Result<_, String>>()? };
-                for (key, m) in made.into_iter().flatten() {
-                    self.keep(key, m);
+                let made: Vec<(String, Arc<Array2<f64>>, bool)> = if missing.len() == 1 { missing.iter().map(compute).collect::<Result<_, String>>()? } else { missing.par_iter().map(compute).collect::<Result<_, String>>()? };
+                for (key, m, new) in made {
+                    if new {
+                        self.keep(key.clone(), m.clone());
+                    }
+                    outcomes.insert(key, m);
                 }
                 Ok(())
             })();
@@ -3388,7 +3395,7 @@ impl Checker {
                     let this = &*self;
                     let score_p = |&r: &usize| -> Result<(usize, Vec<f64>, Option<Candidates>), String> {
                         let (i, e, key) = &runs[r];
-                        let m = this.cache.get(key).ok_or("M's outcome went missing")?;
+                        let m = outcomes.get(key).ok_or("M's outcome went missing")?;
                         let p = this.run(&circuits[*i], e)?;
                         let kl = kl_bits(m, &p);
                         let candidates = clean.map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
