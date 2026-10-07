@@ -9,13 +9,9 @@
 //! EXPORT SETTINGS.json OUT.json host|gpu lookahead DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu site_edits DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu start DECOMPOSITION
-//! EXPORT SETTINGS.json OUT.json host|gpu fit DECOMPOSITION START
 //!
 //! `price_charged` prices VPD's causal-importance network beside its subcomponents
 //! (`vpd_pricing` with `charge`).
-//!
-//! `fit` is our fit started from VPD's decomposition, autonomous and causal
-//! (`explanation_battery::vpd_fit`), every mean free; START is a `price` posterior.
 //!
 //! `lookahead` tests whether VPD's masks read the future (`explanation_battery::vpd_lookahead`):
 //! 16 cuts per held-out row, 3 counterfactual futures each, VPD's network and a causal control.
@@ -291,27 +287,6 @@ fn main() -> Result<(), String> {
             save(&report)?;
             report["interchange"] = battery::vpd_interchange(&vpd, bases, sources, settings.batch_sequences, settings.seed, &settings.worst_of)?;
         }
-        report["seconds"] = json!(started.elapsed().as_secs_f64());
-        save(&report)?;
-        log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
-        return Ok(());
-    }
-    if kind == "fit" {
-        // Our fit from VPD's decomposition (`explanation_battery::vpd_fit`): START is a pricing
-        // posterior of the subcomponents (`price`'s OUT.posterior.f32).
-        let decomposition = extra.ok_or(usage)?;
-        let start = more.ok_or(usage)?;
-        let vpd = Vpd::new(&device, export, Decomposition::load(decomposition)?, settings.numeric_bytes)?;
-        let train: Vec<Vec<u32>> = all_rows[..first].iter().chain(&all_rows[end..]).take(training).cloned().collect();
-        if training == 0 || train.len() != training {
-            return Err("the fit needs training_sequences rows outside the held-out ones".into());
-        }
-        let mut progress = report.clone();
-        let posterior = Path::new(out).with_extension("posterior.f32");
-        report["fit"] = battery::vpd_fit(&vpd, export, decomposition, (&train, bases), (settings.batch_sequences, settings.seed, 40), (start, &posterior), |state| {
-            progress["fit"] = state.clone();
-            save(&progress)
-        })?;
         report["seconds"] = json!(started.elapsed().as_secs_f64());
         save(&report)?;
         log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
