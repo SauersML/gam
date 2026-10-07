@@ -256,7 +256,7 @@ class CachedReader:
 
     name = "cached"
 
-    def __init__(self, model: str, batch_tokens: int, max_batch: int, seed: int = 0, device: str | None = None):
+    def __init__(self, model: str, batch_tokens: int, max_batch: int, seed: int = 0, device: str | None = None, dtype: str | None = None):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -265,7 +265,7 @@ class CachedReader:
         self.batch_tokens, self.max_batch = batch_tokens, max_batch
         self.tokenizer = AutoTokenizer.from_pretrained(model)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        dtype = torch.float32 if self.device.type == "cpu" else torch.bfloat16
+        dtype = getattr(torch, dtype) if dtype else (torch.float32 if self.device.type == "cpu" else torch.bfloat16)
         # Loaded straight onto a GPU (device_map, which needs accelerate), so the host needs little memory.
         import importlib.util
 
@@ -474,8 +474,9 @@ def main():
     ap.add_argument("--batch-tokens", type=int, default=65536, help="tokens per forward pass, the shared prefix counted per sequence (memory)")
     ap.add_argument("--max-batch", type=int, default=32, help="sequences per forward pass")
     ap.add_argument("--device", help="cuda, mps or cpu (default: cuda when present, else cpu)")
+    ap.add_argument("--dtype", choices=["float32", "bfloat16"], help="default: bfloat16 on a GPU, float32 on the CPU")
     args = ap.parse_args()
-    scorer = Scorer(CachedReader(args.model, args.batch_tokens, args.max_batch, args.seed, args.device), args.target)
+    scorer = Scorer(CachedReader(args.model, args.batch_tokens, args.max_batch, args.seed, args.device, args.dtype), args.target)
     if args.command == "serve":
         host, sep, port = args.listen.rpartition(":")
         server = socketserver.TCPServer((host, int(port)), _Handler) if sep and port.isdigit() else socketserver.UnixStreamServer(args.listen, _Handler)
