@@ -137,7 +137,8 @@ if len(sys.argv) > 1 and points:
     for p in points:
         attn = [f"+ {p['attention_bits'] / 1e6:.1f}M bits for M's attention it runs"] if p.get('attention_bits') else (["+ M's attention it runs (pricing pending)"] if p.get('runs_m_attention') else [])
         bits = p.get('description_note') or f"{p['description_bits'] / 1e6:.1f}M bits"
-        texts.append(textwrap.wrap(p['label'], 44) + textwrap.wrap(bits, 44) + attn)
+        edges = [f"{p['edges_on']:,.0f} edges on per token"] if p.get('edges_on') is not None else []
+        texts.append(textwrap.wrap(p['label'], 44) + textwrap.wrap(bits, 44) + attn + edges)
     # Labels in one column right of the axes, each centred at its point's gap where room allows: a
     # pass down from the highest point keeps each label below the one above it, a pass up from zero
     # keeps the column above the axis; heights in text lines (about 40 to the axis' height).
