@@ -2304,9 +2304,9 @@ impl Candidates {
     }
 }
 
-/// The byte budget of `M`'s cached outcomes: `GRAPH_CACHE_GIB` GiB (4 when unset).
+/// The byte budget of `M`'s cached outcomes: `GRAPH_CACHE_GIB` GiB (2 when unset).
 fn cache_budget() -> usize {
-    let gib: f64 = std::env::var("GRAPH_CACHE_GIB").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+    let gib: f64 = std::env::var("GRAPH_CACHE_GIB").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
     (gib * f64::from(1u32 << 30)) as usize
 }
 
@@ -2816,44 +2816,63 @@ impl Checker {
             };
             self.set_edit(&runs[members[0]].1.clone());
             let result = (|| -> Result<(), String> {
-                // M once per key not yet cached, in parallel.
-                let mut missing: Vec<usize> = Vec::new();
+                // At most CHUNK distinct experiments at a time: their counterfactual runs under site
+                // operations (about 200 MB each on vpd4l) are dropped between chunks.
+                const CHUNK: usize = 8;
+                let mut order: Vec<&str> = Vec::new();
+                let mut chunks: Vec<Vec<usize>> = Vec::new();
                 for &r in members {
-                    if !self.cache.contains_key(&runs[r].2) && !missing.iter().any(|&m| runs[m].2 == runs[r].2) {
-                        missing.push(r);
+                    let k = runs[r].2.as_str();
+                    let at = order.iter().position(|x| *x == k).unwrap_or_else(|| {
+                        order.push(k);
+                        order.len() - 1
+                    });
+                    if chunks.len() <= at / CHUNK {
+                        chunks.push(Vec::new());
                     }
+                    chunks[at / CHUNK].push(r);
                 }
-                let this = &*self;
-                let made: Vec<(String, Arc<Array2<f64>>)> = missing
-                    .par_iter()
-                    .map(|&r| {
-                        let key = &runs[r].2;
-                        if let Some(m) = this.disk_get(key) {
-                            return Ok((key.clone(), Arc::new(m)));
+                for members in &chunks {
+                    // M once per key not yet cached, in parallel.
+                    let mut missing: Vec<usize> = Vec::new();
+                    for &r in members {
+                        if !self.cache.contains_key(&runs[r].2) && !missing.iter().any(|&m| runs[m].2 == runs[r].2) {
+                            missing.push(r);
                         }
-                        let m = this.run(&models[runs[r].0], &runs[r].1)?;
-                        this.disk_put(key, &m);
-                        Ok((key.clone(), Arc::new(m)))
-                    })
-                    .collect::<Result<_, String>>()?;
-                let fresh: BTreeMap<String, Arc<Array2<f64>>> = made.iter().cloned().collect();
-                let this = &*self;
-                let scored: Vec<(usize, Vec<f64>, Option<Candidates>)> = members
-                    .par_iter()
-                    .map(|&r| {
-                        let (i, e, key) = &runs[r];
-                        let m = fresh.get(key).or_else(|| this.cache.get(key)).ok_or("M's outcome went missing")?;
-                        let p = this.run(&circuits[*i], e)?;
-                        let kl = kl_bits(m, &p);
-                        let candidates = clean.as_ref().map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
-                        Ok((r, kl, candidates))
-                    })
-                    .collect::<Result<_, String>>()?;
-                for (key, m) in made {
-                    self.keep(key, m);
-                }
-                for (r, kl, candidates) in scored {
-                    measured[r] = Some((kl, candidates));
+                    }
+                    let this = &*self;
+                    let made: Vec<(String, Arc<Array2<f64>>)> = missing
+                        .par_iter()
+                        .map(|&r| {
+                            let key = &runs[r].2;
+                            if let Some(m) = this.disk_get(key) {
+                                return Ok((key.clone(), Arc::new(m)));
+                            }
+                            let m = this.run(&models[runs[r].0], &runs[r].1)?;
+                            this.disk_put(key, &m);
+                            Ok((key.clone(), Arc::new(m)))
+                        })
+                        .collect::<Result<_, String>>()?;
+                    let fresh: BTreeMap<String, Arc<Array2<f64>>> = made.iter().cloned().collect();
+                    let this = &*self;
+                    let scored: Vec<(usize, Vec<f64>, Option<Candidates>)> = members
+                        .par_iter()
+                        .map(|&r| {
+                            let (i, e, key) = &runs[r];
+                            let m = fresh.get(key).or_else(|| this.cache.get(key)).ok_or("M's outcome went missing")?;
+                            let p = this.run(&circuits[*i], e)?;
+                            let kl = kl_bits(m, &p);
+                            let candidates = clean.as_ref().map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
+                            Ok((r, kl, candidates))
+                        })
+                        .collect::<Result<_, String>>()?;
+                    for (key, m) in made {
+                        self.keep(key, m);
+                    }
+                    for (r, kl, candidates) in scored {
+                        measured[r] = Some((kl, candidates));
+                    }
+                    self.site_references.lock().map_err(|e| e.to_string())?.clear();
                 }
                 Ok(())
             })();
