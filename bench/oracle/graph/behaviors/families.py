@@ -70,7 +70,7 @@ def ioi(tok, rng):
     templates = [
         ("store", "When {A} and {B} went to the {place}, {S} gave a {obj} to"),
         ("argument", "Then, {A} and {B} had a long argument. Afterwards {S} said to"),
-        ("work", "{A} and {B} were working at the {place}. {S} decided to give a {obj} to"),
+        ("work", "Today {A} and {B} were working at the {place}. {S} decided to give a {obj} to"),
     ]
     out = []
     for vname, t in templates:
@@ -106,6 +106,32 @@ def induction_random(tok, rng):
                                 " " + " ".join(alt) + " ." + " " + " ".join(alt[:k]), " " + spare))
         out.append(v)
     return out
+
+
+PHRASES = ["Yesterday the {a} found a {b} under the old {c} near the river.",
+           "My aunt keeps a {a} and a {b} in the {c} behind her house.",
+           "The museum shows a {a} made of {b} next to a broken {c}.",
+           "Every winter we bring the {a} inside and cover the {b} with a {c}.",
+           "He painted the {a} blue and hung a {b} above the {c}."]
+FILLERS = ["Nobody knew why.", "It rained all day.", "Then the bell rang.", "We talked about it for hours.", "Later that week, people repeated the story."]
+
+
+@family
+def induction_phrase(tok, rng):
+    """Induction on a repeated natural sentence whose slots hold random nouns: the repeat copies the noun."""
+    ws = words(tok, NOUNS)
+    v = Variant("sentence", "Induction on a repeated sentence: a sentence with random nouns in its slots is repeated after a filler sentence; at a slot the next word is the noun from the first copy.")
+    for _ in range(160):
+        t = rng.choice(PHRASES)
+        a, b, c, d = rng.sample(ws, 4)
+        slot = rng.choice(["b", "c"])
+        fill = dict(a=a, b=b, c=c)
+        alt = dict(fill, **{slot: d})
+        cut = lambda f: t[:t.index("{" + slot + "}")].format(**f)
+        filler = rng.choice(FILLERS)
+        v.items.append(Item(t.format(**fill) + " " + filler + " " + cut(fill).rstrip(), " " + fill[slot],
+                            t.format(**alt) + " " + filler + " " + cut(alt).rstrip(), " " + d))
+    return [v]
 
 
 SURNAMES = ("Zalinski Montague Okafor Brennan Castellano Whitfield Abernathy Kowalczyk Delacroix Featherstone Hargreaves "
@@ -295,8 +321,9 @@ def pronoun_gender(tok, rng):
     """A pronoun referring to a named person matches the name's usual gender."""
     f, m = words(tok, NAMES_F), words(tok, NAMES_M)
     out = []
-    for vname, t in [("because", "{N} went to the {place} because"), ("said", "After {N} finished the work at the {place},"),
-                     ("thinks", "{N} looked tired at the {place}, so I asked if")]:
+    # names never open the text: a text-initial name lacks the leading space and splits differently
+    for vname, t in [("because", "Yesterday {N} went to the {place} because"), ("said", "After {N} finished the work at the {place},"),
+                     ("thinks", "That day {N} looked tired at the {place}, so I asked if")]:
         v = Variant(vname, "Gendered pronoun: the next word is the pronoun for the named person; the counterfactual swaps the name's gender.")
         for _ in range(200):
             a, b = rng.choice(f), rng.choice(m)
@@ -324,7 +351,7 @@ def bracket_close(tok, rng):
         # counterfactual: a minus sign replaces the inner opening bracket, so one bracket fewer is open
         v1.items.append(Item(f"y = ({a} {op1} ({b} {op2} {c}", "))", f"y = ({a} {op1} -{b} {op2} {c}", ")"))
         n = [rng.randrange(1, 10) for _ in range(4)]
-        v2.items.append(Item(f"x = [{n[0]}, [{n[1]}, [{n[2]}, {n[3]}", "]]]", f"x = [{n[0]}, [{n[1]}, -{n[2]}, {n[3]}", "]]"))
+        v2.items.append(Item(f"x = [{n[0]}, {n[1]}, [{n[2]}, {n[3]}", "]]", f"x = [{n[0]}, {n[1]}, -{n[2]}, {n[3]}", "]"))
         f1, f2 = rng.sample(["max", "min", "abs", "len", "sum", "int", "str", "round"], 2)
         v3.items.append(Item(f"value = {f1}({f2}({a}, {b}", "))", f"value = {f1}({f2}({a}), {b}", ")"))
     return [v1, v2, v3]
@@ -611,13 +638,15 @@ def object_color(tok, rng):
 def list_copy(tok, rng):
     """Copy a named position from a short list."""
     ws = words(tok, NOUNS)
-    v1 = Variant("first", "List indexing: given a list of four words, the first word.")
-    v2 = Variant("last", "List indexing: given a list of four words, the last word.")
-    for _ in range(96):
-        l = rng.sample(ws, 5)
-        a = l[:4]
-        b1 = [l[4]] + a[1:]
-        b2 = a[:3] + [l[4]]
+    v1 = Variant("first", "List indexing: given a list of four words, the first word; the counterfactual swaps the first word with another, so the same words appear.")
+    v2 = Variant("last", "List indexing: given a list of four words, the last word; the counterfactual swaps the last word with another, so the same words appear.")
+    for _ in range(160):
+        a = rng.sample(ws, 4)
+        k = rng.randrange(1, 4)
+        b1 = list(a)
+        b1[0], b1[k] = b1[k], b1[0]
+        b2 = list(a)
+        b2[3], b2[k - 1] = b2[k - 1], b2[3]
         f = lambda xs, pos: f"List: {', '.join(xs)}.\nThe {pos} word in the list is"
         v1.items.append(Item(f(a, "first"), " " + a[0], f(b1, "first"), " " + b1[0]))
         v2.items.append(Item(f(a, "last"), " " + a[3], f(b2, "last"), " " + b2[3]))
