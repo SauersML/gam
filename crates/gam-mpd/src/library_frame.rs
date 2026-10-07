@@ -654,7 +654,8 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
         std::fs::write(out.join("start.json"), arms.to_string()).map_err(error)?;
         summary.push(json!({"frame": name, "components": own.len(), "sites": sites.len(), "fitting_rows": fitting.rows}));
     }
-    summary.push(unit_start(native, layers, &value, &dir.join("heads_neurons"))?);
+    summary.push(unit_start(native, layers, &value, &dir.join("heads_neurons"), false)?);
+    summary.push(unit_start(native, layers, &value, &dir.join("axes"), true)?);
     Ok(json!(summary))
 }
 
@@ -714,17 +715,22 @@ impl Units {
     }
 }
 
-/// The per-unit start, the baseline the frame starts are compared to, in `dir`: per head one
+/// The per-unit start, the baseline the frame starts are compared to, in `dir`, or with `axes` the
+/// privileged-axes start in its own `dir` (an MLP under the identity law cut along c_fc's input
+/// columns and down_proj's output rows, the input and output coordinate axes, each slice its own
+/// component, arms `per_slice_own` and `per_slice_own_shared`): per head one
 /// component (its q, k and v rows and its o columns, each head's block cut by its exact SVD), per
 /// MLP neuron one (its c_fc row and down_proj column), arms `per_slice_own` (every slice its own
 /// component, an o or down_proj slice gated on its own read), `grouped_own` and
 /// `grouped_direction` (the grouped components gated by their first read slice, in units of its
 /// spread). Gates start at `τ = 0`, widths the reads' spreads on the fitting rows, as for the
 /// frames. Heads must own their keys and values (no grouped-query sharing).
-fn unit_start(native: &OperatorProgram, layers: &[LayerNodes], value: &dyn Fn(usize) -> Result<Array2<f64>, String>, dir: &Path) -> Result<Value, String> {
+fn unit_start(native: &OperatorProgram, layers: &[LayerNodes], value: &dyn Fn(usize) -> Result<Array2<f64>, String>, dir: &Path, axes: bool) -> Result<Value, String> {
     std::fs::create_dir_all(dir).map_err(error)?;
     let (mut sites, mut files) = (Vec::new(), serde_json::Map::new());
     let (mut per_slice, mut grouped, mut direction) = (Vec::new(), Vec::new(), Vec::new());
+    // The shared arm's candidates, by index in `per_slice` (the privileged-axes start).
+    let mut shared: Vec<(usize, Vec<usize>)> = Vec::new();
     for (l, layer) in layers.iter().enumerate() {
         let site = |k: usize| KINDS.len() * l + k;
         let heads = layer.reads.len();
@@ -752,9 +758,24 @@ fn unit_start(native: &OperatorProgram, layers: &[LayerNodes], value: &dyn Fn(us
             }
             units[3].cut(&wo, 0..wo.nrows(), h * hd..(h + 1) * hd, h)?;
         }
-        for n in 0..up.nrows() {
-            units[4].cut(&up, n..n + 1, 0..up.ncols(), n)?;
-            units[5].cut(&down, 0..down.nrows(), n..n + 1, n)?;
+        let Node::Pointwise { laws, .. } = &native.nodes[layer.active] else {
+            return Err(error(format!("layer {l}: the MLP activation is not one pointwise law")));
+        };
+        // Under the identity law no axis of the hidden space is privileged; the privileged-axes
+        // start then cuts c_fc along its input columns and down_proj along its output rows.
+        let by_axes = axes && laws.iter().all(|law| *law == Law::Identity);
+        if by_axes {
+            for j in 0..up.ncols() {
+                units[4].cut(&up, 0..up.nrows(), j..j + 1, j)?;
+            }
+            for i in 0..down.nrows() {
+                units[5].cut(&down, i..i + 1, 0..down.ncols(), i)?;
+            }
+        } else {
+            for n in 0..up.nrows() {
+                units[4].cut(&up, n..n + 1, 0..up.ncols(), n)?;
+                units[5].cut(&down, 0..down.nrows(), n..n + 1, n)?;
+            }
         }
         let shapes = [
             (wq.nrows(), wq.ncols()),
@@ -801,8 +822,27 @@ fn unit_start(native: &OperatorProgram, layers: &[LayerNodes], value: &dyn Fn(us
             grouped.push(component(json!({"own": first}), spread(norms.iter().copied()), &slices));
             direction.push(component(direction_read(&x, read_of(0, first[1]).view(), first[0]), 1.0, &slices));
         }
+        // The MLP on its privileged axes: every input-column and output-row slice its own
+        // component; in the shared arm each column slice may take the gates of the columns whose
+        // reads move with its own, and each row slice may follow a column's gate (a part spanning
+        // both maps, the pairing found by the fit, not given).
+        if by_axes {
+            let first = per_slice.len();
+            let ins: Vec<usize> = (0..layer_sites[4].v.ncols()).collect();
+            let outs: Vec<usize> = (0..layer_sites[5].v.ncols()).collect();
+            for &i in &ins {
+                per_slice.push(component(json!({"own": [site(4), i]}), own_width(&h2, read_of(4, i).view(), 1.0), &[[site(4), i]]));
+            }
+            for &i in &outs {
+                per_slice.push(component(json!({"own": [site(5), i]}), own_width(&hidden, read_of(5, i).view(), 1.0), &[[site(5), i]]));
+            }
+            let up_magnitudes = h2.dot(&layer_sites[4].v).mapv(f64::abs);
+            shared.extend(candidates(&up_magnitudes, first).into_iter().enumerate().map(|(i, c)| (first + i, c)));
+            let first_down = first + ins.len();
+            shared.extend(following(&hidden.dot(&layer_sites[5].v).mapv(f64::abs), &up_magnitudes, first).into_iter().enumerate().map(|(i, c)| (first_down + i, c)));
+        }
         // The MLP: per neuron its c_fc row and down_proj column.
-        for n in 0..up.nrows() {
+        for n in (0..up.nrows()).filter(|_| !by_axes) {
             let (ins, outs) = (units[4].of(n), units[5].of(n));
             for &i in &ins {
                 per_slice.push(component(json!({"own": [site(4), i]}), own_width(&h2, read_of(4, i).view(), 1.0), &[[site(4), i]]));
@@ -826,8 +866,18 @@ fn unit_start(native: &OperatorProgram, layers: &[LayerNodes], value: &dyn Fn(us
             sites.push(name);
         }
     }
-    std::fs::write(dir.join("export.json"), json!({"config": {"sites": sites, "frame": "heads_neurons"}, "files": files}).to_string()).map_err(error)?;
-    let arms = json!([{"arm": "per_slice_own", "components": per_slice}, {"arm": "grouped_own", "components": grouped}, {"arm": "grouped_direction", "components": direction}]);
+    let name = if axes { "axes" } else { "heads_neurons" };
+    std::fs::write(dir.join("export.json"), json!({"config": {"sites": sites, "frame": name}, "files": files}).to_string()).map_err(error)?;
+    let mut per_slice_shared = per_slice.clone();
+    for (b, c) in shared {
+        per_slice_shared[b]["candidates"] = json!(c);
+    }
+    let arms = json!([
+        {"arm": "per_slice_own", "components": per_slice},
+        {"arm": "per_slice_own_shared", "components": per_slice_shared},
+        {"arm": "grouped_own", "components": grouped},
+        {"arm": "grouped_direction", "components": direction}
+    ]);
     std::fs::write(dir.join("start.json"), arms.to_string()).map_err(error)?;
-    Ok(json!({"frame": "heads_neurons", "components": grouped.len(), "slices": per_slice.len(), "sites": sites.len()}))
+    Ok(json!({"frame": name, "components": grouped.len(), "slices": per_slice.len(), "sites": sites.len()}))
 }
