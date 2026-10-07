@@ -1,8 +1,10 @@
 """Supervised prediction training of the graph oracle (#2951): Qwen3-8B with LoRA adapters learns to write
 the measured answers of generate.py's causal questions about the target model (Qwen3-0.6B).
 
-Example = the question text, then "<answer>\n", then the answer text and the end-of-text token; the loss
-is the answer tokens' negative log-likelihood (the question tokens are context only). Batches draw a
+Example = Qwen3's chat template with the question as the user turn (thinking off), then the answer text and
+<|im_end|> as the assistant turn (--format raw: the question, "<answer>\n", the answer and end-of-text, the
+first run's format); the loss is the answer tokens' negative log-likelihood (the question is context only).
+The adapters are saved as OUT/adapters.safetensors and as a PEFT directory OUT/peft (vLLM / g-rl's --init). Batches draw a
 question type uniformly, then a question of that type (the mixture over types), so rare and common types
 train equally; within a type, --changed-share of the draws come from the questions whose measured answer
 differs from no change (most edits of single pieces move M by under 0.1 bits). LoRA: every linear map of every block (q, k, v, o, gate, up, down), W x + (alpha / r) B A x,
@@ -64,6 +66,26 @@ def wrap(model, rank, alpha):
     return adapters
 
 
+def save_peft(adapters_path, out_dir, base: str, rank: int, alpha: float):
+    """The adapters as a PEFT LoRA directory (adapter_config.json, adapter_model.safetensors) for vLLM and
+    g-rl's loop: lora_A = A [r, in], lora_B = B [out, r], scaling lora_alpha / r, as here."""
+    from safetensors.torch import load_file, save_file
+
+    state = load_file(str(adapters_path))
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tensors = {}
+    for key, value in state.items():
+        name, which = key.rsplit(".", 1)
+        tensors[f"base_model.model.{name}.lora_{which}.weight"] = value.contiguous()
+    save_file(tensors, str(out_dir / "adapter_model.safetensors"), metadata={"format": "pt"})
+    config = {"peft_type": "LORA", "task_type": "CAUSAL_LM", "base_model_name_or_path": base, "r": rank, "lora_alpha": alpha,
+              "lora_dropout": 0.0, "target_modules": list(TARGETS), "bias": "none", "fan_in_fan_out": False, "modules_to_save": None,
+              "inference_mode": True, "init_lora_weights": True, "use_rslora": False, "use_dora": False, "layers_to_transform": None,
+              "rank_pattern": {}, "alpha_pattern": {}}
+    (out_dir / "adapter_config.json").write_text(json.dumps(config, indent=1))
+
+
 def load(pattern):
     by_type = {}
     for path in sorted(glob.glob(pattern)):
@@ -85,9 +107,24 @@ def changed(q) -> bool:
     return True
 
 
+FORMAT = {"name": "chat"}  # "chat": Qwen3's chat template (user turn = question, thinking off); "raw": question + SEP
+
+
+def prompt_text(tok, q) -> str:
+    """The oracle's context for a question: Qwen3's chat template with the question as the user turn and
+    thinking off (the format g-rl's program training uses), or the first run's raw format."""
+    if FORMAT["name"] == "raw":
+        return q["input"] + SEP
+    return tok.apply_chat_template([{"role": "user", "content": q["input"]}], tokenize=False, add_generation_prompt=True, enable_thinking=False)
+
+
+def end_id(tok) -> int:
+    return tok.eos_token_id if FORMAT["name"] == "raw" else tok.convert_tokens_to_ids("<|im_end|>")
+
+
 def encode(tok, q, max_tokens):
-    prompt = tok(q["input"] + SEP, add_special_tokens=False)["input_ids"]
-    answer = tok(q["answer"], add_special_tokens=False)["input_ids"] + [tok.eos_token_id]
+    prompt = tok(prompt_text(tok, q), add_special_tokens=False)["input_ids"]
+    answer = tok(q["answer"], add_special_tokens=False)["input_ids"] + [end_id(tok)]
     prompt = prompt[-max(1, max_tokens - len(answer)) :]  # keep the question's end (the question line)
     return prompt, answer
 
@@ -153,7 +190,13 @@ def main():
     ap.add_argument("--changed-share", type=float, default=0.5,
                     help="share of each type's draws taken from its questions whose measured answer differs from no change")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--format", default="chat", choices=("chat", "raw"))
+    ap.add_argument("--export-peft", default="", help="only convert OUT/adapters.safetensors to OUT/peft (no training)")
     args = ap.parse_args()
+    FORMAT["name"] = args.format
+    if args.export_peft:
+        save_peft(Path(args.export_peft), Path(args.out), args.model, args.rank, args.alpha)
+        return
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     started = time.time()
@@ -221,6 +264,7 @@ def main():
     from safetensors.torch import save_file
 
     save_file({f"{k}.{n}": getattr(a, n).detach().cpu().contiguous() for k, a in adapters.items() for n in ("A", "B")}, str(out / "adapters.safetensors"))
+    save_peft(out / "adapters.safetensors", out / "peft", args.model, args.rank, args.alpha)
     trained = evaluate(model, tok, heldout, args.eval_per_type, args.batch, args.max_tokens, dev)
     result = {"steps": step, "base": base, "trained": trained,
               "gain_bits_per_question": {k: base[k]["bits_per_question"] - trained[k]["bits_per_question"] for k in trained},
