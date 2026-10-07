@@ -37,6 +37,8 @@ def candidates(directories: list[Path]):
                 s = r.get("score") or r["heldout"]
                 behavior = r.get("behavior") or ".".join(path.stem.split(".")[:2])
                 yield behavior, s["total_bits"] / s.get("N", 2**24), r["source"]
+            elif "source" in r and "total" in r:  # r1.py's best programs (total in bits per scored token)
+                yield r["behavior"], r["total"], r["source"]
             elif "programs" in r:  # a sweep file: its programs' sources are the reference programs, not stored
                 continue
 
@@ -82,6 +84,7 @@ def main() -> None:
     ap.add_argument("results", type=Path, nargs="+")
     ap.add_argument("--model", default="vpd4l")
     ap.add_argument("--out", type=Path, default=RUNS / "atlas_vpd4l")
+    ap.add_argument("--title", default="Pieces each behavior's best program uses")
     a = ap.parse_args()
     shapes = mech.shapes(a.model)
     best = best_programs([d.expanduser() for d in a.results])
@@ -108,12 +111,12 @@ def main() -> None:
         for (x, y), k in pairs.most_common():
             if k >= 2:
                 f.write(f"connection\t{x} >> {y}\t{k}\t{','.join(b for b, es in edges.items() if (x, y) in es)}\n")
-    figure(rows, columns, Path(f"{a.out}.png") if a.out.parent != RUNS else FIGURES / f"{a.out.name}.png")
+    figure(rows, columns, Path(f"{a.out}.png") if a.out.parent != RUNS else FIGURES / f"{a.out.name}.png", a.title)
     print(f"{len(rows)} behaviors; {sum(1 for k in use.values() if k >= 2)} pieces and {sum(1 for k in pairs.values() if k >= 2)} "
           f"connections recur; {a.out}.tsv")
 
 
-def figure(rows: dict, columns: list[str], out: Path) -> None:
+def figure(rows: dict, columns: list[str], out: Path, title: str = "Pieces each behavior's best program uses") -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -138,7 +141,7 @@ def figure(rows: dict, columns: list[str], out: Path) -> None:
     ax.set_yticks([y - 0.5 for y in range(1, len(rows))], minor=True)
     ax.grid(which="minor", color="white", linewidth=3)
     ax.tick_params(which="minor", length=0)
-    ax.set_title("Pieces each behavior's best program uses", loc="left")
+    ax.set_title(title, loc="left", fontsize=24)
     fig.tight_layout()
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=110)
