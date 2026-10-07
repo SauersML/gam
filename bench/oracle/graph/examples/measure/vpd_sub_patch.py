@@ -1,0 +1,204 @@
+"""Which VPD subcomponents of vpd4l carry a behavior's answer, and how many of each block pay for
+themselves (for R2's VPD-view programs). For every subcomponent i at every site, the counterfactual
+run gets i's clean contribution in place of its own ((x_clean . v_i - x . v_i) u_i added at the site,
+every position) and recovery = KL(M_clean || M_cf) - KL(M_clean || M_patched), bits per target token.
+Then per block (a layer's attention: q/k/v/o_proj; its MLP: c_fc/down_proj) the top-k subcomponents
+by recovery are patched together for k = 1, 2, 4, ..., and the k minimizing KL + their opaque price
+((d_in + d_out) weights x 1/2 log2 N bits / N per token, N = 2^24) is the block's best k.
+With --programs DIR, writes DIR/vpd4l_<behavior>_vpd.py: one node per block with a paying k, every
+causal edge among them (embed into each, each into the logits), and a docstring of the measurements.
+
+  MPD_MEM_GIB=6 mem-lease 6 ~/mpd-data/venv/bin/python vpd_sub_patch.py OUT_DIR BEHAVIOR.json [...] [--programs DIR]
+"""
+
+import argparse
+import json
+import math
+import sys
+import textwrap
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # bench/oracle
+import vpd_labels as VL  # noqa: E402
+import vpd_model as VM  # noqa: E402
+
+N = 2**24
+REPLICAS = 16
+ATTN, MLP = ("q_proj", "k_proj", "v_proj", "o_proj"), ("c_fc", "down_proj")
+
+
+def site_name(l: int, kind: str) -> str:
+    return f"h.{l}.{'mlp' if kind in MLP else 'attn'}.{kind}"
+
+
+class Runner:
+    def __init__(self):
+        self.dev = VL.device()
+        self.t = VL.Model(self.dev).t
+        self.uv = VL.load_uv(self.dev, Path.home() / "mpd-data/oracle/vpd/uv.safetensors")
+
+    def layer(self, i: int, x, patches: dict, clean: dict | None, reps: int, record: dict | None = None):
+        """Layer i on residual x (reps copies of the batch); patches: {(i, kind): [idx tensor per copy]}
+        set those subcomponents' contributions to the clean run's (clean: its site inputs)."""
+        t = self.t
+        H, D = t.n_head, t.hd
+        Bx, L, _ = x.shape
+        n = Bx // reps
+
+        def site(kind, h):
+            out = t.site(site_name(i, kind))(h)
+            if record is not None:
+                record[(i, kind)] = h
+            for r, idx in enumerate(patches.get((i, kind), [])):
+                if len(idx):
+                    U, V = self.uv[site_name(i, kind)]
+                    sl = slice(r * n, (r + 1) * n)
+                    out[sl] = out[sl] + ((clean[(i, kind)] - h[sl]) @ V[:, idx]) @ U[idx]
+            return out
+
+        h = VM.rms(x, t.norms[2 * i], t.eps)
+        q = site("q_proj", h).view(Bx, L, H, D).transpose(1, 2)
+        k = site("k_proj", h).view(Bx, L, H, D).transpose(1, 2)
+        v = site("v_proj", h).view(Bx, L, H, D).transpose(1, 2)
+        q, k = t._rope(q, L), t._rope(k, L)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(Bx, L, -1)
+        x = x + site("o_proj", y)
+        hid = VM.gelu_tanh(site("c_fc", VM.rms(x, t.norms[2 * i + 1], t.eps)))
+        return x + site("down_proj", hid)
+
+    def forward(self, x, start: int, patches: dict, clean: dict | None, rows, cols, reps: int = 1,
+                record: dict | None = None):
+        """Log-probabilities at the targets, from layer `start` on (x: the residual entering it)."""
+        t = self.t
+        for i in range(start, t.n_layer):
+            x = self.layer(i, x, patches, clean, reps, record)
+        n = x.shape[0] // reps
+        r = torch.cat([rows + c * n for c in range(reps)])
+        return torch.log_softmax((VM.rms(x, t.ln_f, t.eps)[r, cols.repeat(reps)] @ t.wte.T).float(), -1)
+
+
+@torch.no_grad()
+def measure(run: Runner, beh: dict) -> dict:
+    t, dev = run.t, run.dev
+    prompts = [p for p in beh["prompts"] if p.get("counterfactual")]
+    T = max(len(p["token_ids"]) for p in prompts)
+
+    def batch(key):
+        ids = torch.zeros(len(prompts), T, dtype=torch.long)
+        for i, p in enumerate(prompts):
+            x = (p if key == "clean" else p["counterfactual"])["token_ids"]
+            ids[i, : len(x)] = torch.tensor(x)
+        return ids.to(dev)
+
+    clean_ids, cf_ids = batch("clean"), batch("cf")
+    rows = torch.tensor([i for i, p in enumerate(prompts) for _ in p["target_positions"]], device=dev)
+    cols = torch.tensor([c for p in prompts for c in p["target_positions"]], device=dev)
+    clean = {}
+    lp_clean = run.forward(t.wte[clean_ids], 0, {}, None, rows, cols, record=clean)
+    p_clean = lp_clean.exp()
+    entering = [t.wte[cf_ids]]  # the counterfactual residual entering each layer
+    for i in range(t.n_layer - 1):
+        entering.append(run.layer(i, entering[-1], {}, None, 1))
+
+    def kl(lp, reps):
+        per = (p_clean.repeat(reps, 1) * (lp_clean.repeat(reps, 1) - lp)).sum(-1) / math.log(2)
+        return per.view(reps, -1).mean(1)
+
+    base = kl(run.forward(entering[0], 0, {}, None, rows, cols), 1).item()
+    recovery = {}
+    for l in range(t.n_layer):
+        for kind in ATTN + MLP:
+            U, _ = run.uv[site_name(l, kind)]
+            count, out = U.shape[0], []
+            for s in range(0, count, REPLICAS):
+                sets = [torch.tensor([i], device=dev) for i in range(s, min(s + REPLICAS, count))]
+                x = entering[l].repeat(len(sets), 1, 1)
+                out += (base - kl(run.forward(x, l, {(l, kind): sets}, clean, rows, cols, len(sets)), len(sets))).tolist()
+            recovery[f"{l}.{kind}"] = out
+    d, m = t.wte.shape[1], run.uv[site_name(0, "c_fc")][0].shape[1]
+    price = {k: (d + (m if k in MLP else d)) * 0.5 * math.log2(N) / N for k in ATTN + MLP}
+    blocks = {}
+    for l in range(t.n_layer):
+        for name, kinds in (("attn", ATTN), ("mlp", MLP)):
+            ranked = sorted(((recovery[f"{l}.{k}"][i], k, i) for k in kinds for i in range(len(recovery[f"{l}.{k}"]))),
+                            reverse=True)
+            curve, k = [], 1
+            while k <= len(ranked):
+                top = ranked[:k]
+                sets = {(l, kind): [torch.tensor([i for _, kk, i in top if kk == kind], device=dev, dtype=torch.long)]
+                        for kind in kinds}
+                left = kl(run.forward(entering[l], l, sets, clean, rows, cols), 1).item()
+                cost = sum(price[kk] for _, kk, _ in top)
+                curve.append({"k": k, "kl_bits": left, "opaque_bits_per_token": cost, "total": left + cost})
+                k *= 2
+            best = min(curve, key=lambda c: c["total"])
+            chosen = ranked[: best["k"]] if best["total"] < base else []
+            blocks[f"{l}.{name}"] = {"curve": curve, "best": best,
+                                     "chosen": {kk: sorted(i for _, k2, i in chosen if k2 == kk) for kk in kinds},
+                                     "recovered_alone": sum(r for r, _, _ in chosen)}
+    return {"behavior": beh["id"], "base_bits": base, "price": price, "recovery": recovery, "blocks": blocks}
+
+
+def program(table: dict, beh: dict) -> str:
+    """One node per block with chosen subcomponents; every causal edge among them."""
+    nodes = []
+    for key, b in table["blocks"].items():
+        l, name = int(key.split(".")[0]), key.split(".")[1]
+        pieces = {k: v for k, v in b["chosen"].items() if v}
+        if pieces:
+            nodes.append((l, name, pieces, b))
+    nodes.sort(key=lambda n: (n[0], n[1] == "mlp"))
+    reads = lambda ps: any(k in ps for k in ("q_proj", "k_proj", "v_proj", "c_fc"))  # noqa: E731
+    writes = lambda ps: any(k in ps for k in ("o_proj", "down_proj"))  # noqa: E731
+    pos = lambda n: 2 * n[0] + (n[1] == "mlp")  # noqa: E731
+    name = lambda n: f"{n[1]}{n[0]}"  # noqa: E731
+    listed = "; ".join(f"layer {l} {nm}: {sum(map(len, ps.values()))} subcomponents ({', '.join(f'{len(v)} {k}' for k, v in ps.items())}), "
+                       f"leaving {b['best']['kl_bits']:.2f} bits when patched together" for l, nm, ps, b in nodes)
+    doc = (f"Behavior {beh['id']} (vpd4l, VPD's subcomponents; M's top token is right on {100 * beh['model_accuracy']:.0f}% of "
+           f"the targets): {beh['description']}\n\n"
+           f"Nodes: per layer's attention and MLP, the VPD subcomponents whose clean contribution, patched into the "
+           f"counterfactual run, recovers the most of the {table['base_bits']:.2f} bits per target between the clean and "
+           f"counterfactual answers, as many as pay for their opaque price (1/2 log2 N bits per weight, N = 2^24): "
+           f"{listed}. The program lets every write among them reach every later read.")
+    head, tail = doc.split("\n\n")
+    out = ['"""' + "\n".join(textwrap.wrap(head, 100)) + "\n\n" + "\n".join(textwrap.wrap(tail, 100)) + '\n"""',
+           "from mech import node, edges, PD, embed, logits", ""]
+    for n in nodes:
+        l, _, ps, _ = n
+        body = ", ".join(f"PD.vpd[{l}].{k}[{', '.join(map(str, v))}]" for k, v in ps.items())
+        out.append(f"{name(n)} = node(")
+        out += [f"    {row}" for row in textwrap.wrap(body, 96, break_long_words=False)]
+        out.append(")")
+    wires = [f"embed >> {name(n)}" for n in nodes if reads(n[2])]
+    for a in nodes:
+        for b in nodes:
+            if pos(a) < pos(b) and writes(a[2]) and reads(b[2]):
+                wires.append(f"{name(a)} >> {name(b)}")
+    wires += [f"{name(n)} >> logits" for n in nodes if writes(n[2])]
+    out += ["", "edges("] + [f"    {w}," for w in wires] + [")", ""]
+    return "\n".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("out_dir", type=Path)
+    ap.add_argument("behaviors", nargs="+", type=Path)
+    ap.add_argument("--programs", type=Path)
+    a = ap.parse_args()
+    a.out_dir.mkdir(parents=True, exist_ok=True)
+    run = Runner()
+    for path in a.behaviors:
+        beh = json.loads(path.read_text())
+        table = measure(run, beh)
+        (a.out_dir / f"vpdpatch_{beh['id']}.json").write_text(json.dumps(table))
+        print(beh["id"], "base", round(table["base_bits"], 3),
+              {k: (b["best"]["k"], round(b["best"]["total"], 2)) for k, b in table["blocks"].items()}, flush=True)
+        if a.programs:
+            (a.programs / f"vpd4l_{beh['id'].replace('.', '_')}_vpd.py").write_text(program(table, beh))
+
+
+if __name__ == "__main__":
+    main()
