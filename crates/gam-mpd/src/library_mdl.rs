@@ -2783,11 +2783,13 @@ struct Progress {
     #[serde(default)]
     multiplier: f64,
     /// The budget's balance value `λ̄`, the running mean over one pass of each step's `λ̂`, and
-    /// whether the budget has bound (`Settings::budget`).
+    /// whether the budget has bound and the steps since (`Settings::budget`).
     #[serde(default)]
     balance: f64,
     #[serde(default)]
     engaged: bool,
+    #[serde(default)]
+    balance_steps: u64,
     /// The last epoch's snapshot, its per-batch estimates of `F` in nats, when convergence is being
     /// judged.
     previous: Option<Vec<f64>>,
@@ -3501,6 +3503,7 @@ pub fn fit_from(
         multiplier: 0.0,
         balance: 0.0,
         engaged: false,
+        balance_steps: 0,
         previous: None,
         collection: COLLECTION,
         active: posterior.active.clone(),
@@ -3739,7 +3742,9 @@ pub fn fit_from(
             // `λ̂ = max(0, −⟨g_F, g_k⟩) / |g_k|²` (`g_k = ∂Ê/∂μ`, both measured on the step) is the
             // multiplier at which the term's gradient cancels F's push on the count: descending
             // `g_F` raises `Ê` iff `⟨g_F, g_k⟩ < 0`, and where F lowers the count on its own no
-            // multiplier is needed. `λ̄` is its running mean over one pass of the `B` batches. From
+            // multiplier is needed. `λ̄` is its running mean over one pass of the `B` batches (the
+            // plain mean of the steps since the budget bound, until there are `B` of them: one
+            // step's `λ̂` is often 0 and swings 40-fold from step to step). From
             // the first step that finds `Ê > K` on, `λ = λ̄ Ê / K`, applied on the step itself: above
             // the budget the term outweighs F's push and the count falls, below it F's push wins
             // and the count rises, and the only point where the descent holds the count still
@@ -3766,10 +3771,10 @@ pub fn fit_from(
                 let measured = if square > 0.0 { (-along).max(0.0) / square } else { 0.0 };
                 if !progress.engaged && expected > limit {
                     progress.engaged = true;
-                    progress.balance = measured;
                 }
                 let lambda = if progress.engaged && limit > 0.0 {
-                    progress.balance += (measured - progress.balance) / draws.len() as f64;
+                    progress.balance_steps += 1;
+                    progress.balance += (measured - progress.balance) / progress.balance_steps.min(draws.len() as u64) as f64;
                     progress.balance * expected / limit
                 } else {
                     0.0
@@ -5664,6 +5669,7 @@ mod tests {
             multiplier: 0.0,
             balance: 0.0,
             engaged: false,
+            balance_steps: 0,
             previous: Some(vec![1.0, 2.0]),
             collection: COLLECTION,
             active: vec![false, true],
