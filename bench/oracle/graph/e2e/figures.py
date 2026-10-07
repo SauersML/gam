@@ -81,9 +81,13 @@ def best(directory: Path | None, behavior: str, key: str = "score") -> float | N
     return min(found) if found else None
 
 
-def compare(sweep: Path, search: Path | None, oracle: Path | None, out: Path) -> Path:
+def compare(sweeps: list[Path], search: Path | None, oracle: Path | None, out: Path, title: str | None = None) -> Path:
+    """Later sweep directories override earlier ones for the same behavior."""
+    files = {}
+    for sweep in sweeps:
+        files.update({p.name: p for p in sorted(sweep.glob("*.json"))})
     rows = []
-    for path in sorted(sweep.glob("*.json")):
+    for path in sorted(files.values(), key=lambda p: p.name):
         r = json.loads(path.read_text())
         progs = r.get("programs", {})
         per = lambda n: progs[n]["total_bits"] / progs[n].get("N", 2**24) if "total_bits" in progs.get(n, {}) else None
@@ -98,8 +102,9 @@ def compare(sweep: Path, search: Path | None, oracle: Path | None, out: Path) ->
     ax.set_yticks(range(len(rows)), [row[0] for row in rows], fontsize=15)
     ax.invert_yaxis()
     ax.set_xlabel("total score, bits per scored token (lower is better)")
-    ax.set_title("Score per behavior: empty, hand-written, search, oracle", loc="left")
-    ax.legend(frameon=False, loc="lower right", fontsize=17)
+    ax.set_title(title or "Score per behavior: empty, hand-written, search, oracle", loc="left")
+    ax.set_xlim(left=0)
+    ax.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.09 - 1.2 / (0.55 * len(rows) + 2.5)), ncol=4, fontsize=17)
     fig.tight_layout()
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=110)
@@ -142,7 +147,8 @@ def main() -> None:
     t.add_argument("--out", type=Path)
     t.add_argument("--title")
     c = sub.add_parser("compare")
-    c.add_argument("--sweep", type=Path, required=True)
+    c.add_argument("--sweep", type=Path, nargs="+", required=True)
+    c.add_argument("--title")
     c.add_argument("--search", type=Path)
     c.add_argument("--oracle", type=Path)
     c.add_argument("--out", type=Path, default=FIGURES / "score_per_behavior.png")
@@ -160,7 +166,7 @@ def main() -> None:
         labels = dict(kv.split("=", 1) for kv in a.names)
         print(terms(results, a.behavior, labels, a.out or FIGURES / f"terms_{a.behavior}.png", a.title))
     else:
-        print(compare(a.sweep, a.search, a.oracle, a.out))
+        print(compare(a.sweep, a.search, a.oracle, a.out, a.title))
 
 
 if __name__ == "__main__":
