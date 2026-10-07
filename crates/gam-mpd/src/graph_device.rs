@@ -5,14 +5,14 @@
 //! runs; a weight edit marks the matrices it touches, which the next run uploads again.
 //!
 //! Covered: native heads (with head norms, rotary, grouped keys and values, attend rules), MLP
-//! neurons (plain or gated), VPD's views of MLPs and attentions (subcomponents and remainders),
-//! swaps, counterfactual and average stand-ins, site operations, `Reference` captures. Anything else
-//! (a transcoder block, attention blocks, operations on a VPD-view attention's heads) returns `None`
-//! and runs on the host.
+//! neurons (plain or gated), transcoder features, VPD's views of MLPs and attentions
+//! (subcomponents and remainders), swaps, counterfactual and average stand-ins, site operations,
+//! `Reference` captures. Anything else (attention blocks, operations on a VPD-view attention's
+//! heads) returns `None` and runs on the host.
 use crate::{
     device_attention::{Segment, forward_segments},
     device_program::{gelu_tanh_constant, law_of},
-    graph::{After, Block, Circuit, Execution, Incoming, Interventions, OnInput, Reference, Weights, Writer},
+    graph::{After, Block, Circuit, Execution, Incoming, Interventions, OnInput, Reference, Stored, Weights, Writer},
     operator_program::Rotary,
 };
 use gam_gpu::{
@@ -31,7 +31,7 @@ pub(crate) struct DeviceState {
     resident: HashMap<(usize, usize, usize), Tensor>,
     /// The resident copies' keys, oldest first (past [`RESIDENT_BYTES`] the oldest go).
     uploaded: Vec<(usize, usize, usize)>,
-    /// Heads' maps stacked into one matrix (`heads_together`), by the stacked copies' keys and
+    /// Heads' maps stacked into one matrix ([`DeviceState::stacked`]), by the maps' keys and
     /// whether they stack as rows; dropped whenever a weight edit drops resident copies.
     stacks: HashMap<(Vec<Key>, bool), Tensor>,
     references: Vec<(u64, BTreeMap<(Field, usize, usize), Tensor>)>,
@@ -96,10 +96,10 @@ impl DeviceState {
     }
 
     /// The key of host matrix `m`'s resident copy, uploaded when absent or edited since.
-    fn ensure(&mut self, m: ArrayView2<f64>) -> Result<Key, GpuError> {
+    fn ensure<A: Element>(&mut self, m: ArrayView2<A>) -> Result<Key, GpuError> {
         let key = (m.as_ptr() as usize, m.nrows(), m.ncols());
         if !self.resident.contains_key(&key) {
-            let t = self.device.upload(m)?;
+            let t = A::upload(&self.device, m)?;
             self.resident.insert(key, t);
             self.uploaded.retain(|k| self.resident.contains_key(k) && *k != key);
             self.uploaded.push(key);
@@ -157,35 +157,44 @@ impl DeviceState {
         self.resident.get(&key).ok_or_else(|| GpuError::DriverCallFailed { reason: "a resident matrix went missing".into() })
     }
 
-    /// Heads' maps `maps` (one shape) stacked as rows, or side by side as columns (output maps),
-    /// built from the resident per-head copies and kept until a weight edit drops those.
-    fn stacked(&mut self, maps: &[&Array2<f64>], along_rows: bool) -> Result<Tensor, GpuError> {
-        let keys: Vec<Key> = maps.iter().map(|m| self.ensure(m.view())).collect::<Result<_, _>>()?;
+    /// Heads' maps `maps` (one shape) stacked as rows, or side by side as columns (output maps):
+    /// joined on the host and uploaded once (no per-head copies on the device), kept by the maps'
+    /// addresses until a weight edit drops every stack.
+    fn stacked(&mut self, maps: &[&Stored], along_rows: bool) -> Result<Tensor, GpuError> {
+        let keys: Vec<Key> = maps.iter().map(|m| (m.as_ptr() as usize, m.nrows(), m.ncols())).collect();
         if let Some(t) = self.stacks.get(&(keys.clone(), along_rows)) {
             return self.device.copy(t);
         }
-        let (r, c) = maps.first().map(|m| m.dim()).ok_or_else(|| GpuError::DriverCallFailed { reason: "no maps to stack".into() })?;
-        let built = if along_rows {
-            let mut out = self.device.zeros(r * maps.len(), c)?;
-            for (i, k) in keys.iter().enumerate() {
-                self.device.set_rows(&mut out, i * r, self.get(*k)?)?;
-            }
-            out
-        } else {
-            // Output columns side by side: stack their transposes as rows, then transpose.
-            let mut out = self.device.zeros(c * maps.len(), r)?;
-            for (i, k) in keys.iter().enumerate() {
-                let t = self.device.transpose(self.get(*k)?)?;
-                self.device.set_rows(&mut out, i * c, &t)?;
-            }
-            self.device.transpose(&out)?
-        };
+        let views: Vec<_> = maps.iter().map(|m| m.view()).collect();
+        let joined = ndarray::concatenate(ndarray::Axis(if along_rows { 0 } else { 1 }), &views).map_err(|e| GpuError::DriverCallFailed { reason: format!("heads' maps of different shapes: {e}") })?;
+        let built = f32::upload(&self.device, joined.view())?;
         self.stacks.insert((keys, along_rows), self.device.copy(&built)?);
         Ok(built)
     }
 }
 
 type Key = (usize, usize, usize);
+
+/// A host element type the device uploads: float64 (vectors, VPD factors, runs' arrays) or float32
+/// (stored weights, sent as they are).
+trait Element: Copy {
+    fn upload(d: &Device, m: ArrayView2<Self>) -> Result<Tensor, GpuError>;
+}
+
+impl Element for f64 {
+    fn upload(d: &Device, m: ArrayView2<f64>) -> Result<Tensor, GpuError> {
+        d.upload(m)
+    }
+}
+
+impl Element for f32 {
+    fn upload(d: &Device, m: ArrayView2<f32>) -> Result<Tensor, GpuError> {
+        match m.as_slice() {
+            Some(values) => d.upload_f32(m.nrows(), m.ncols(), values),
+            None => d.upload_f32(m.nrows(), m.ncols(), &m.iter().copied().collect::<Vec<_>>()),
+        }
+    }
+}
 
 /// A host vector as a `1 × n` row view.
 fn row(v: &Array1<f64>) -> ArrayView2<'_, f64> {
@@ -201,7 +210,7 @@ pub fn use_device(device: Device) -> bool {
 /// A weight edit is about to change host matrix `m` (in place or by replacing it): every resident
 /// copy of that shape is dropped, so neither `m` nor a matrix later allocated at a reused address
 /// reads a stale copy.
-pub(crate) fn edited(m: &Array2<f64>) {
+pub(crate) fn edited<A>(m: &Array2<A>) {
     let dim = m.dim();
     on_device(|s| {
         s.resident.retain(|k, _| (k.1, k.2) != dim);
@@ -233,11 +242,11 @@ fn dot_on(s: &mut DeviceState, a: &Array2<f64>, b: ArrayView2<f64>) -> Option<Ar
 }
 
 /// `last · Uᵀ` on the device with `U` (the unembedding, never edited) resident.
-pub(crate) fn logits(last: &Array2<f64>, unembedding: &Array2<f64>) -> Option<Array2<f64>> {
+pub(crate) fn logits(last: &Array2<f64>, unembedding: &Stored) -> Option<Array2<f64>> {
     on_device(|s| logits_on(s, last, unembedding)).flatten()
 }
 
-fn logits_on(s: &mut DeviceState, last: &Array2<f64>, unembedding: &Array2<f64>) -> Option<Array2<f64>> {
+fn logits_on(s: &mut DeviceState, last: &Array2<f64>, unembedding: &Stored) -> Option<Array2<f64>> {
     let u = s.ensure(unembedding.view()).ok()?;
     let d = &s.device;
     let x = d.upload(last.view()).ok()?;
@@ -315,7 +324,19 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
                 let outputs = s.stacked(&lw.heads.iter().map(|h| &h.output).collect::<Vec<_>>(), false).map_err(e)?;
                 w = sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&outputs), o, *rest, &z).map_err(e)?;
             }
-            Block::Features { .. } => return Err("a block the device path does not cover".into()),
+            Block::Features { layer, features, rest } => {
+                s.ensure_reference(r, (Field::Input, *layer, 0))?;
+                let x_hat = s.device.copy(s.reference(r, (Field::Input, *layer, 0))?).map_err(e)?;
+                let named = features_write(s, weights, *layer, features, &x_hat)?;
+                w = if *rest {
+                    s.ensure_reference(r, (Field::Mlp, *layer, 0))?;
+                    let mut all = s.device.copy(s.reference(r, (Field::Mlp, *layer, 0))?).map_err(e)?;
+                    s.device.axpy(&mut all, -1.0, &named).map_err(e)?;
+                    all
+                } else {
+                    named
+                };
+            }
         }
         out.push(w);
     }
@@ -325,12 +346,11 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
 /// `circuit` run on the process's device ([`use_device`]), or `None` when there is none or the
 /// circuit holds a block the device path does not cover.
 pub(crate) fn run(weights: &Weights, circuit: &Circuit, job: &Run) -> Option<Result<Execution, String>> {
-    // No transcoder features; a VPD-view attention's heads attend together (alike) and operations
-    // on them run on the host.
+    // A VPD-view attention's heads attend together (alike) and operations on them run on the
+    // host.
     let covered = |b: &Block| match b {
-        Block::Heads { .. } | Block::Neurons { .. } | Block::Slices { .. } => true,
+        Block::Heads { .. } | Block::Neurons { .. } | Block::Slices { .. } | Block::Features { .. } => true,
         Block::AttnSlices { layer, .. } => weights.layers.get(*layer).is_some_and(|lw| lw.heads.first().is_some_and(|first| lw.heads.iter().all(|h| alike(h, first, false)))),
-        Block::Features { .. } => false,
     };
     if !circuit.units.iter().all(|u| covered(&u.block)) || !job.ops.head_reads.is_empty() || !job.ops.record_reads.is_empty() {
         return None;
@@ -633,7 +653,7 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                     let mut out = s.device.zeros(rows, width).map_err(e)?;
                     for &h in heads {
                         let hw = &lw.heads[h];
-                        let project = |s: &mut DeviceState, x: &Tensor, map: &Array2<f64>, norm: Option<&(Array1<f64>, f64)>| -> Result<Tensor, GpuError> {
+                        let project = |s: &mut DeviceState, x: &Tensor, map: &Stored, norm: Option<&(Array1<f64>, f64)>| -> Result<Tensor, GpuError> {
                             let w = s.ensure(map.view())?;
                             let mut p = s.device.zeros(rows, map.nrows())?;
                             s.device.gemm(&mut p, 1.0, x, Op::N, s.get(w)?, Op::T, 0.0, arithmetic)?;
@@ -716,7 +736,25 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                     }
                     write
                 }
-                _ => return Err("a block the device path does not cover".into()),
+                Block::Features { layer, features, rest } => {
+                    let lw = &weights.layers[*layer];
+                    let unit_x = s.device.rms_norm(&inputs[0].1, lw.mlp_norm.epsilon).map_err(e)?;
+                    let gain = s.ensure(row(&lw.mlp_norm.gain)).map_err(e)?;
+                    let mut x_hat = s.device.zeros(rows, width).map_err(e)?;
+                    s.device.scale_columns(&mut x_hat, &unit_x, s.get(gain).map_err(e)?, false).map_err(e)?;
+                    normed(&s.device, ops, (site, u, 0), &mut x_hat, &mut kept).map_err(e)?;
+                    let named = features_write(s, weights, *layer, features, &x_hat)?;
+                    if *rest {
+                        // The MLP less the named features: every other feature and the error.
+                        let mlp = lw.mlp.as_ref().ok_or("a transcoder on a layer without an MLP")?;
+                        let (mut all, _) = neuron_writes(s, mlp, &x_hat, None).map_err(e)?;
+                        s.device.axpy(&mut all, -1.0, &named).map_err(e)?;
+                        all
+                    } else {
+                        named
+                    }
+                }
+                Block::Slices { .. } | Block::AttnSlices { .. } => return Err("a VPD block outside its site's pass".into()),
             };
             st.writes[u] = Some(write);
         }
@@ -733,7 +771,10 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
     let last = st.input(&s.device, &circuit.logits).map_err(e)?;
     let picked = s.device.upload_indices(&job.scored.iter().map(|&r| r as u32).collect::<Vec<_>>()).map_err(e)?;
     let last = s.device.gather_rows(&last, &picked).map_err(e)?;
-    let normed_last = s.device.rms_norm(&last, weights.final_norm.epsilon).map_err(e)?;
+    let unit_last = s.device.rms_norm(&last, weights.final_norm.epsilon).map_err(e)?;
+    let gain = s.ensure(row(&weights.final_norm.gain)).map_err(e)?;
+    let mut normed_last = s.device.zeros(job.scored.len(), width).map_err(e)?;
+    s.device.scale_columns(&mut normed_last, &unit_last, s.get(gain).map_err(e)?, false).map_err(e)?;
     let u = s.ensure(weights.unembedding.view()).map_err(e)?;
     let mut logits = s.device.zeros(job.scored.len(), weights.unembedding.nrows()).map_err(e)?;
     s.device.gemm(&mut logits, 1.0, &normed_last, Op::N, s.get(u).map_err(e)?, Op::T, 0.0, arithmetic).map_err(e)?;
@@ -841,7 +882,7 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
         // heads, the output columns side by side.
         let mut maps = Vec::with_capacity(4);
         for (along_rows, map) in [(true, 0), (true, 1), (true, 2), (false, 3)] {
-            let per_head: Vec<&Array2<f64>> = lw.heads.iter().map(|h| [&h.query, &*h.key, &*h.value, &h.output][map]).collect();
+            let per_head: Vec<&Stored> = lw.heads.iter().map(|h| [&h.query, &*h.key, &*h.value, &h.output][map]).collect();
             maps.push(s.stacked(&per_head, along_rows).map_err(e)?);
         }
         let x_ref = reference(s, Field::AttentionInput, layer)?;
@@ -916,7 +957,7 @@ fn heads_together_on(s: &mut DeviceState, lw: &crate::graph::LayerWeights, heads
     let first = &lw.heads[heads[0]];
     let (n, width, rows) = (heads.len(), first.query.nrows(), normed[0].rows());
     let arithmetic = s.arithmetic();
-    let project = |s: &mut DeviceState, x: &Tensor, maps: Vec<&Array2<f64>>| -> Result<Tensor, GpuError> {
+    let project = |s: &mut DeviceState, x: &Tensor, maps: Vec<&Stored>| -> Result<Tensor, GpuError> {
         let w = s.stacked(&maps, true)?;
         let mut p = s.device.zeros(rows, w.rows())?;
         s.device.gemm(&mut p, 1.0, x, Op::N, &w, Op::T, 0.0, arithmetic)?;
@@ -995,10 +1036,10 @@ fn neuron_writes(s: &mut DeviceState, mlp: &crate::graph::MlpWeights, x_hat: &Te
         Some(p) => {
             let d = &s.device;
             let up = match &mlp.up {
-                Some(u) => Some((d.upload(u.select(ndarray::Axis(0), p).view())?, d.upload(row(&mlp.up_bias.select(ndarray::Axis(0), p)))?)),
+                Some(u) => Some((f32::upload(d, u.select(ndarray::Axis(0), p).view())?, d.upload(row(&mlp.up_bias.select(ndarray::Axis(0), p)))?)),
                 None => None,
             };
-            (None, Some((d.upload(mlp.gate.select(ndarray::Axis(0), p).view())?, d.upload(mlp.out.select(ndarray::Axis(1), p).view())?, d.upload(row(&mlp.bias.select(ndarray::Axis(0), p)))?, up)))
+            (None, Some((f32::upload(d, mlp.gate.select(ndarray::Axis(0), p).view())?, f32::upload(d, mlp.out.select(ndarray::Axis(1), p).view())?, d.upload(row(&mlp.bias.select(ndarray::Axis(0), p)))?, up)))
         }
     };
     let s = &*s;
@@ -1029,9 +1070,32 @@ fn neuron_writes(s: &mut DeviceState, mlp: &crate::graph::MlpWeights, x_hat: &Te
     Ok((write, active))
 }
 
+/// Transcoder features `features` of `layer`'s MLP on its normed inputs `x_hat` (`graph::Features`):
+/// `relu(x̂ Gᵀ + c) U`, the features' encoder rows `G`, biases `c` and decoder rows `U` gathered on
+/// the host and uploaded for this run.
+fn features_write(s: &mut DeviceState, weights: &Weights, layer: usize, features: &[usize], x_hat: &Tensor) -> Result<Tensor, String> {
+    let e = |e: GpuError| e.to_string();
+    let t = weights.transcoders.get(&layer).ok_or_else(|| format!("layer {layer} has no transcoder"))?;
+    let (rows, width, arithmetic) = (x_hat.rows(), weights.width(), s.arithmetic());
+    let d = &s.device;
+    let mut out = d.zeros(rows, width).map_err(e)?;
+    if features.is_empty() {
+        return Ok(out);
+    }
+    let (g, c, u) = t.stacked(features, width)?;
+    let (g, c, u) = (d.upload(g.view()).map_err(e)?, d.upload(row(&c)).map_err(e)?, d.upload(u.view()).map_err(e)?);
+    let mut h = d.zeros(rows, features.len()).map_err(e)?;
+    d.gemm(&mut h, 1.0, x_hat, Op::N, &g, Op::T, 0.0, arithmetic).map_err(e)?;
+    d.add_row(&mut h, 1.0, &c).map_err(e)?;
+    let codes = d.upload_indices(&vec![law_of(crate::operator_program::Law::Relu).code(); features.len()]).map_err(e)?;
+    let active = d.law_values(&h, &codes, gelu_tanh_constant()).map_err(e)?;
+    d.gemm(&mut out, 1.0, &active, Op::N, &u, Op::N, 0.0, arithmetic).map_err(e)?;
+    Ok(out)
+}
+
 /// A matrix `W` of a VPD view: a host matrix (kept resident) or a device tensor (stacked head maps).
 enum Matrix<'a> {
-    Host(&'a Array2<f64>),
+    Host(&'a Stored),
     Device(&'a Tensor),
 }
 

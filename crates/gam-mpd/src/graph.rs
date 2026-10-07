@@ -165,18 +165,33 @@ impl Norm {
     }
 }
 
+/// A stored weight matrix: float32. Every model the checker reads stores float32 or bfloat16
+/// weights, so float32 holds them exactly at half the memory of float64; an edit rounds its result
+/// to float32, as the device computes anyway. The host executor widens to float64 to multiply.
+pub type Stored = Array2<f32>;
+
+/// A stored matrix (or view) widened to float64.
+pub(crate) fn wide(m: ndarray::ArrayView2<f32>) -> Array2<f64> {
+    m.mapv(f64::from)
+}
+
+/// `m += d`, added in float64 and rounded to float32.
+fn add_wide(mut m: ndarray::ArrayViewMut2<f32>, d: ndarray::ArrayView2<f64>) {
+    m.zip_mut_with(&d, |w, x| *w = (f64::from(*w) + x) as f32);
+}
+
 /// One head: its query and key maps with their head norms, its value map (head width × width,
 /// reading the normed stream) and its output columns (width × head width).
 #[derive(Clone, Debug)]
 pub struct HeadWeights {
-    pub query: Array2<f64>,
+    pub query: Stored,
     pub query_norm: Option<(Array1<f64>, f64)>,
     /// The key and value maps, one allocation for the heads of a key/value group (grouped-query
     /// attention); an edit of one head's map gives that head its own copy (`Arc::make_mut`).
-    pub key: Arc<Array2<f64>>,
+    pub key: Arc<Stored>,
     pub key_norm: Option<(Array1<f64>, f64)>,
-    pub value: Arc<Array2<f64>>,
-    pub output: Array2<f64>,
+    pub value: Arc<Stored>,
+    pub output: Stored,
     pub scale: f64,
     pub rotary: Option<Rotary>,
     pub causal: bool,
@@ -185,7 +200,7 @@ pub struct HeadWeights {
 impl HeadWeights {
     /// Map `m` (0 query, 1 key, 2 value, 3 output) for an in-place change: a key or value map the
     /// head shares is copied for it first.
-    fn map_mut(&mut self, m: usize) -> &mut Array2<f64> {
+    fn map_mut(&mut self, m: usize) -> &mut Stored {
         match m {
             0 => &mut self.query,
             1 => Arc::make_mut(&mut self.key),
@@ -198,11 +213,11 @@ impl HeadWeights {
 /// One MLP: `h = φ(G x̂ + b)` (times `U x̂ + c` when gated), written by `D h`.
 #[derive(Clone, Debug)]
 pub struct MlpWeights {
-    pub gate: Array2<f64>,
+    pub gate: Stored,
     pub bias: Array1<f64>,
-    pub up: Option<Array2<f64>>,
+    pub up: Option<Stored>,
     pub up_bias: Array1<f64>,
-    pub out: Array2<f64>,
+    pub out: Stored,
     pub law: Law,
 }
 
@@ -214,14 +229,15 @@ pub struct LayerWeights {
     pub mlp: Option<MlpWeights>,
 }
 
-/// `M`'s weights on the host: per layer its blocks, the final norm's epsilon, the unembedding with
-/// the final norm's gain folded in (vocabulary × width) and the embedding (vocabulary × width).
+/// `M`'s weights on the host: per layer its blocks, the final norm (applied with its gain before
+/// the unembedding), the unembedding (vocabulary × width) and the embedding (vocabulary × width),
+/// one matrix when the model ties them.
 #[derive(Clone, Debug)]
 pub struct Weights {
     pub layers: Vec<LayerWeights>,
     pub final_norm: Norm,
-    pub unembedding: Array2<f64>,
-    pub embedding: Array2<f64>,
+    pub unembedding: Arc<Stored>,
+    pub embedding: Arc<Stored>,
     /// Per layer with a transcoder view, its features (`attach_transcoders`).
     pub transcoders: BTreeMap<usize, Features>,
     /// Per layer with a VPD view of its MLP, VPD's subcomponents of `c_fc` and `down_proj`
@@ -268,12 +284,12 @@ fn sliced_parts(u: &Array2<f64>, v: &Array2<f64>, w: &Array2<f64>, picked: &[usi
 /// A layer's heads as the four native matrices VPD decomposes: the query, key and value maps
 /// stacked over heads (heads × head width, by width) and the output columns side by side.
 fn attention_maps(layer: &LayerWeights) -> [Array2<f64>; 4] {
-    let stack = |f: &dyn Fn(&HeadWeights) -> &Array2<f64>| {
+    let stack = |f: &dyn Fn(&HeadWeights) -> &Stored| {
         let views: Vec<_> = layer.heads.iter().map(|h| f(h).view()).collect();
-        ndarray::concatenate(Axis(0), &views).expect("heads of one width")
+        wide(ndarray::concatenate(Axis(0), &views).expect("heads of one width").view())
     };
     let outputs: Vec<_> = layer.heads.iter().map(|h| h.output.view()).collect();
-    [stack(&|h| &h.query), stack(&|h| &*h.key), stack(&|h| &*h.value), ndarray::concatenate(Axis(1), &outputs).expect("heads of one width")]
+    [stack(&|h| &h.query), stack(&|h| &*h.key), stack(&|h| &*h.value), wide(ndarray::concatenate(Axis(1), &outputs).expect("heads of one width").view())]
 }
 
 /// VPD's subcomponents of one MLP's two matrices (`explanation_battery::Factors`): subcomponent `i`
@@ -293,13 +309,13 @@ impl VpdMlp {
     /// The hidden pre-activation `c_fc` subcomponents `fc` write from normed inputs `x_hat`
     /// (rows × hidden); with `rest` every other subcomponent and the remainder, `W x̂ − Σ`.
     fn fc(&self, mlp: &MlpWeights, fc: &[usize], rest: bool, x_hat: &Array2<f64>) -> Array2<f64> {
-        sliced_parts(&self.fc_u, &self.fc_v, &mlp.gate, fc, rest, x_hat)
+        sliced_parts(&self.fc_u, &self.fc_v, &wide(mlp.gate.view()), fc, rest, x_hat)
     }
 
     /// The residual write of `down_proj` subcomponents `down` from hidden activations `h`; with
     /// `rest` every other subcomponent and the remainder.
     fn down(&self, mlp: &MlpWeights, down: &[usize], rest: bool, h: &Array2<f64>) -> Array2<f64> {
-        sliced_parts(&self.down_u, &self.down_v, &mlp.out, down, rest, h)
+        sliced_parts(&self.down_u, &self.down_v, &wide(mlp.out.view()), down, rest, h)
     }
 }
 
@@ -315,6 +331,19 @@ pub struct Features {
 }
 
 impl Features {
+    /// Features `features`' encoder rows (features × width), biases and decoder rows (features ×
+    /// width), loaded by [`Weights::load_features`].
+    pub(crate) fn stacked(&self, features: &[usize], width: usize) -> Result<(Array2<f64>, Array1<f64>, Array2<f64>), String> {
+        let (mut g, mut c, mut u) = (Array2::zeros((features.len(), width)), Array1::zeros(features.len()), Array2::zeros((features.len(), width)));
+        for (i, f) in features.iter().enumerate() {
+            let (gi, ci, ui) = self.rows.get(f).ok_or_else(|| format!("feature {f} not loaded (Weights::load_features)"))?;
+            g.row_mut(i).assign(gi);
+            c[i] = *ci;
+            u.row_mut(i).assign(ui);
+        }
+        Ok((g, c, u))
+    }
+
     /// The write of features `features` on normed inputs `x_hat` (rows × width).
     fn write(&self, features: &[usize], x_hat: &Array2<f64>) -> Result<Array2<f64>, String> {
         let mut out = Array2::<f64>::zeros(x_hat.dim());
@@ -328,8 +357,11 @@ impl Features {
 }
 
 impl Weights {
-    /// `M`'s blocks with no decomposition views attached.
-    pub fn new(layers: Vec<LayerWeights>, final_norm: Norm, unembedding: Array2<f64>, embedding: Array2<f64>) -> Self {
+    /// `M`'s blocks with no decomposition views attached; a tied unembedding (equal to the
+    /// embedding) is kept once.
+    pub fn new(layers: Vec<LayerWeights>, final_norm: Norm, unembedding: Stored, embedding: Stored) -> Self {
+        let embedding = Arc::new(embedding);
+        let unembedding = if unembedding == *embedding { embedding.clone() } else { Arc::new(unembedding) };
         Self { layers, final_norm, unembedding, embedding, transcoders: BTreeMap::new(), vpd: BTreeMap::new(), vpd_attention: BTreeMap::new(), library: BTreeMap::new() }
     }
 
@@ -467,9 +499,10 @@ impl Weights {
             let Node::RmsNorm { epsilon, .. } = native.nodes[rms] else { return Err(format!("node {normed} does not read an RMS norm")) };
             Ok(Norm { gain: native.operators[gain].matrix().diag().to_owned(), epsilon })
         };
-        let map = |node: usize, input: usize| -> Result<(Array2<f64>, Option<Array1<f64>>), String> {
+        let narrow = |m: Array2<f64>| m.mapv(|v| v as f32);
+        let map = |node: usize, input: usize| -> Result<(Stored, Option<Array1<f64>>), String> {
             match &native.nodes[node] {
-                Node::Affine { terms, bias } if terms.len() == 1 && terms[0].0 == input => Ok((native.operators[terms[0].1].matrix(), bias.map(|b| native.operators[b].matrix().column(0).to_owned()))),
+                Node::Affine { terms, bias } if terms.len() == 1 && terms[0].0 == input => Ok((narrow(native.operators[terms[0].1].matrix()), bias.map(|b| native.operators[b].matrix().column(0).to_owned()))),
                 other => Err(format!("node {node} is not an affine map of node {input}: {other:?}")),
             }
         };
@@ -486,8 +519,8 @@ impl Weights {
             let Node::Affine { terms: outputs, .. } = &native.nodes[layer.attention] else { return Err(format!("layer {l}: the attention output is not a map")) };
             let mut heads = Vec::with_capacity(layer.reads.len());
             // A key/value group's heads read one key and one value node: one map each.
-            let mut shared: BTreeMap<usize, Arc<Array2<f64>>> = BTreeMap::new();
-            let mut map_of = |node: usize, x: usize| -> Result<Arc<Array2<f64>>, String> {
+            let mut shared: BTreeMap<usize, Arc<Stored>> = BTreeMap::new();
+            let mut map_of = |node: usize, x: usize| -> Result<Arc<Stored>, String> {
                 if let Some(m) = shared.get(&node) {
                     return Ok(m.clone());
                 }
@@ -498,7 +531,7 @@ impl Weights {
             for (h, &read) in layer.reads.iter().enumerate() {
                 let Node::Attend { query, key, value, scale, rotary, causal } = native.nodes[read].clone() else { return Err(format!("layer {l} head {h}: the read is not an attention")) };
                 let x = layer.normed_stream;
-                let output = outputs.iter().find(|(n, _)| *n == read).map(|(_, op)| native.operators[*op].matrix()).ok_or_else(|| format!("layer {l} head {h}: no output columns"))?;
+                let output = outputs.iter().find(|(n, _)| *n == read).map(|(_, op)| narrow(native.operators[*op].matrix())).ok_or_else(|| format!("layer {l} head {h}: no output columns"))?;
                 heads.push(HeadWeights {
                     query: map(crate::run_check::head_projection(native, query), x)?.0,
                     query_norm: head_norm(query)?,
@@ -543,8 +576,7 @@ impl Weights {
         }
         let head = crate::resident_causal_fit::fixed_head_target::Head::of(native)?;
         let final_norm = norm_of(head.hidden)?;
-        let mut unembedding = head.embedding().to_owned();
-        unembedding.axis_iter_mut(Axis(0)).for_each(|mut row| row *= &final_norm.gain);
+        let unembedding = head.embedding().mapv(|v| v as f32);
         let feature = native.nodes.iter().position(|n| matches!(n, Node::Feature { .. })).ok_or("no token feature")?;
         let embedding = native
             .nodes
@@ -554,7 +586,7 @@ impl Weights {
                 _ => None,
             })
             .ok_or("no token embedding")?;
-        let embedding = if embedding.nrows() == unembedding.ncols() { embedding.t().to_owned() } else { embedding };
+        let embedding = if embedding.nrows() == unembedding.ncols() { narrow(embedding.t().to_owned()) } else { narrow(embedding) };
         Ok(Self::new(out, final_norm, unembedding, embedding))
     }
 
@@ -1191,7 +1223,7 @@ impl Graph {
                     let mut values: Vec<usize> = Vec::new();
                     for &h in heads {
                         count += all[h].output.len();
-                        if !values.iter().any(|&k| all[k].value == all[h].value) {
+                        if !values.iter().any(|&k| Arc::ptr_eq(&all[k].value, &all[h].value) || all[k].value == all[h].value) {
                             values.push(h);
                             count += all[h].value.len();
                         }
@@ -1203,7 +1235,7 @@ impl Graph {
                     for &h in heads {
                         let w = &all[h];
                         count += w.query.len() + w.output.len() + w.query_norm.as_ref().map_or(0, |(g, _)| g.len());
-                        if !keys.iter().any(|&k| all[k].key == w.key && all[k].value == w.value) {
+                        if !keys.iter().any(|&k| (Arc::ptr_eq(&all[k].key, &w.key) || all[k].key == w.key) && (Arc::ptr_eq(&all[k].value, &w.value) || all[k].value == w.value)) {
                             keys.push(h);
                             count += w.key.len() + w.value.len() + w.key_norm.as_ref().map_or(0, |(g, _)| g.len());
                         }
@@ -1322,7 +1354,7 @@ impl Reference {
                 let mut out = Array2::<f64>::zeros((rows, weights.width()));
                 for &h in heads {
                     let z = self.reads.get(*layer).and_then(|r| r.get(h)).ok_or("a head the reference did not record")?;
-                    out += &par_dot(z, weights.layers[*layer].heads[h].output.t());
+                    out += &par_dot(z, wide(weights.layers[*layer].heads[h].output.view()).t());
                 }
                 Ok(out)
             }
@@ -1334,9 +1366,9 @@ impl Reference {
                 if 2 * neurons.len() > n {
                     let inside: BTreeSet<usize> = neurons.iter().copied().collect();
                     let rest: Vec<usize> = (0..n).filter(|i| !inside.contains(i)).collect();
-                    Ok(&self.mlp[*layer] - &active.select(Axis(1), &rest).dot(&mlp.out.select(Axis(1), &rest).t()))
+                    Ok(&self.mlp[*layer] - &active.select(Axis(1), &rest).dot(&wide(mlp.out.select(Axis(1), &rest).view()).t()))
                 } else {
-                    Ok(active.select(Axis(1), neurons).dot(&mlp.out.select(Axis(1), neurons).t()))
+                    Ok(active.select(Axis(1), neurons).dot(&wide(mlp.out.select(Axis(1), neurons).view()).t()))
                 }
             }
             Block::Slices { layer, down, rest, .. } => {
@@ -1406,8 +1438,8 @@ impl Execution {
     }
 }
 
-fn project(x: &Array2<f64>, map: &Array2<f64>, norm: Option<&(Array1<f64>, f64)>) -> Array2<f64> {
-    let mut out = par_dot(x, map.t());
+fn project(x: &Array2<f64>, map: &Stored, norm: Option<&(Array1<f64>, f64)>) -> Array2<f64> {
+    let mut out = par_dot(x, wide(map.view()).t());
     if let Some((gain, epsilon)) = norm {
         for mut row in out.outer_iter_mut() {
             let r = rms_scale(row.view(), *epsilon);
@@ -1430,7 +1462,7 @@ fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3],
     let mut reads = Vec::new();
     for &h in heads {
         let w = &layer.heads[h];
-        let (q, k, v) = (project(&q_hat, &w.query, w.query_norm.as_ref()), project(&k_hat, &*w.key, w.key_norm.as_ref()), par_dot(&v_hat, w.value.t()));
+        let (q, k, v) = (project(&q_hat, &w.query, w.query_norm.as_ref()), project(&k_hat, &w.key, w.key_norm.as_ref()), par_dot(&v_hat, wide(w.value.view()).t()));
         let mut z = Array2::<f64>::zeros(v.dim());
         for (n, &(start, length)) in spans.iter().enumerate() {
             let positions: Vec<u32> = (0..length as u32).collect();
@@ -1448,7 +1480,7 @@ fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3],
             }
             z.slice_mut(s![span.clone(), ..]).assign(&a.dot(&v.slice(s![span, ..])));
         }
-        out += &par_dot(&z, w.output.t());
+        out += &par_dot(&z, wide(w.output.view()).t());
         if capture {
             reads.push(z);
         }
@@ -1478,18 +1510,18 @@ fn block_attention(a: &mut Array2<f64>, blocks: &[[usize; 4]]) {
 
 /// Neurons `neurons` of an MLP on the normed stream `x_hat` (rows × width).
 fn neurons_write(mlp: &MlpWeights, neurons: &[usize], x_hat: &Array2<f64>) -> Array2<f64> {
-    par_dot(&neurons_active(mlp, neurons, x_hat), mlp.out.select(Axis(1), neurons).t())
+    par_dot(&neurons_active(mlp, neurons, x_hat), wide(mlp.out.select(Axis(1), neurons).view()).t())
 }
 
 /// The activations of neurons `neurons` (rows × neurons).
 fn neurons_active(mlp: &MlpWeights, neurons: &[usize], x_hat: &Array2<f64>) -> Array2<f64> {
-    let gate = mlp.gate.select(Axis(0), neurons);
+    let gate = wide(mlp.gate.select(Axis(0), neurons).view());
     let mut h = par_dot(x_hat, gate.t());
     let bias = mlp.bias.select(Axis(0), neurons);
     h += &bias.view().insert_axis(Axis(0));
     h.mapv_inplace(|g| mlp.law.apply(g));
     if let Some(up) = &mlp.up {
-        let mut u = par_dot(x_hat, up.select(Axis(0), neurons).t());
+        let mut u = par_dot(x_hat, wide(up.select(Axis(0), neurons).view()).t());
         u += &mlp.up_bias.select(Axis(0), neurons).view().insert_axis(Axis(0));
         h *= &u;
     }
@@ -1551,7 +1583,7 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
     if let Some(t) = batch.tokens.iter().find(|t| **t as usize >= vocabulary) {
         return Err(format!("token {t} outside the vocabulary of {vocabulary}"));
     }
-    let embed = weights.embedding.select(Axis(0), &batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>());
+    let embed = wide(weights.embedding.select(Axis(0), &batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>()).view());
     let units = circuit.units.len();
     // The device runs what it covers (`graph_device`, stand-ins assembled there); everything else
     // runs here.
@@ -1628,7 +1660,7 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
                 Block::Slices { fc, rest, .. } => Ok(vpd.fc(mlp, fc, *rest, x)),
                 _ => Err("a VPD-view MLP unit of another block".to_string()),
             };
-            let mut pre_ref = x_ref.dot(&mlp.gate.t());
+            let mut pre_ref = x_ref.dot(&wide(mlp.gate.view()).t());
             pre_ref += &mlp.bias.view().insert_axis(Axis(0));
             let mut deltas: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
             for &u in &slices {
@@ -1780,7 +1812,7 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
                     let mut x_hat = lw.mlp_norm.apply(&inputs[0]);
                     normed(0, &mut x_hat);
                     let active = neurons_active(mlp, neurons, &x_hat);
-                    let write = par_dot(&active, mlp.out.select(Axis(1), neurons).t());
+                    let write = par_dot(&active, wide(mlp.out.select(Axis(1), neurons).view()).t());
                     if let Some(c) = captured.as_mut() {
                         if neurons.len() != mlp.gate.nrows() {
                             return Err("a capture needs each MLP whole in one unit".into());
@@ -1836,11 +1868,20 @@ fn par_dot(a: &Array2<f64>, b: ndarray::ArrayView2<f64>) -> Array2<f64> {
 pub use crate::graph_device::use_device;
 
 /// Next-token log-probabilities of final streams (rows × width) through the final norm (its own
-/// RMS) and the unembedding, normalized in float64.
+/// RMS, its gain) and the unembedding, normalized in float64.
 pub fn log_probabilities(weights: &Weights, last: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let mut logits = match crate::graph_device::logits(last, &weights.unembedding) {
+    let gained = last * &weights.final_norm.gain.view().insert_axis(Axis(0));
+    let mut logits = match crate::graph_device::logits(&gained, &weights.unembedding) {
         Some(l) => l,
-        None => par_dot(last, weights.unembedding.t()),
+        None => {
+            // Widened a block of the vocabulary at a time (Qwen3's whole unembedding is 1.2 GB in
+            // float64).
+            let mut out = Array2::<f64>::zeros((gained.nrows(), weights.unembedding.nrows()));
+            for (mut o, u) in out.axis_chunks_iter_mut(Axis(1), 8192).zip(weights.unembedding.axis_chunks_iter(Axis(0), 8192)) {
+                o.assign(&par_dot(&gained, wide(u).t()));
+            }
+            out
+        }
     };
     for (mut row, x) in logits.outer_iter_mut().zip(last.outer_iter()) {
         row *= rms_scale(x, weights.final_norm.epsilon);
@@ -1890,7 +1931,7 @@ pub enum WeightEdit {
 }
 
 impl WeightEdit {
-    fn matrix<'a>(weights: &'a mut Weights, layer: usize, head: Option<usize>, matrix: Matrix) -> Result<&'a mut Array2<f64>, String> {
+    fn matrix<'a>(weights: &'a mut Weights, layer: usize, head: Option<usize>, matrix: Matrix) -> Result<&'a mut Stored, String> {
         let lw = weights.layers.get_mut(layer).ok_or("no such layer")?;
         let m = match (head, matrix) {
             (Some(h), m) => {
@@ -1952,15 +1993,15 @@ impl WeightEdit {
                 if d.dim() != m.dim() {
                     return Err("VPD factors of another shape than the matrix".into());
                 }
-                *m += &d;
+                add_wide(m.view_mut(), d.view());
             }
-            Self::Head { factor, .. } => *m *= *factor,
+            Self::Head { factor, .. } => m.mapv_inplace(|w| (f64::from(w) * factor) as f32),
             Self::Neurons { neurons, factor, .. } => {
                 for &i in neurons {
                     if i >= m.ncols() {
                         return Err(format!("neuron {i} out of range"));
                     }
-                    m.column_mut(i).mapv_inplace(|v| v * factor);
+                    m.column_mut(i).mapv_inplace(|w| (f64::from(w) * factor) as f32);
                 }
             }
             Self::RankOne { u, v, .. } => {
@@ -1969,7 +2010,7 @@ impl WeightEdit {
                 }
                 for (i, ui) in u.iter().enumerate() {
                     for (j, vj) in v.iter().enumerate() {
-                        m[[i, j]] += ui * vj;
+                        m[[i, j]] = (f64::from(m[[i, j]]) + ui * vj) as f32;
                     }
                 }
             }
@@ -2021,7 +2062,7 @@ impl WeightEdit {
                 return Err("VPD attention factors of another shape than the heads' maps".into());
             }
             at += if matrix == Matrix::Output { m.ncols() } else { m.nrows() };
-            *m += &part;
+            add_wide(m.view_mut(), part);
         }
         let (first, saved) = heads.first().cloned().ok_or("a layer without heads")?;
         Ok(Restore { layer, head: Some(first), matrix, saved, factors: None, shared: Vec::new(), heads: heads.into_iter().skip(1).collect(), attention: Some((map, saved_u)), maps })
@@ -2030,7 +2071,7 @@ impl WeightEdit {
 
 /// Every head's key and value maps of `layer` before an edit of `matrix` changes them (none for
 /// other matrices): [`Restore`] puts these back so a key/value group shares one map again.
-fn key_value_maps(weights: &Weights, layer: usize, matrix: Matrix) -> Vec<(Arc<Array2<f64>>, Arc<Array2<f64>>)> {
+fn key_value_maps(weights: &Weights, layer: usize, matrix: Matrix) -> Vec<(Arc<Stored>, Arc<Stored>)> {
     match (matrix, weights.layers.get(layer)) {
         (Matrix::Key | Matrix::Value, Some(lw)) => lw.heads.iter().map(|w| (w.key.clone(), w.value.clone())).collect(),
         _ => Vec::new(),
@@ -2042,16 +2083,16 @@ pub struct Restore {
     layer: usize,
     head: Option<usize>,
     matrix: Matrix,
-    saved: Array2<f64>,
+    saved: Stored,
     /// A subcomponent edit's VPD factors before it (`down_proj`'s when true).
     factors: Option<(bool, Array2<f64>)>,
     /// The heads sharing the edited key or value matrix, edited alike.
     shared: Vec<usize>,
     /// Further heads' maps before an attention subcomponent edit, and its factors' `U`.
-    heads: Vec<(usize, Array2<f64>)>,
+    heads: Vec<(usize, Stored)>,
     attention: Option<(usize, Array2<f64>)>,
     /// A key or value edit's heads' maps before it (`key_value_maps`), restored as they were shared.
-    maps: Vec<(Arc<Array2<f64>>, Arc<Array2<f64>>)>,
+    maps: Vec<(Arc<Stored>, Arc<Stored>)>,
 }
 
 impl Restore {
@@ -2297,7 +2338,7 @@ pub fn sample(weights: &Weights, counterfactual: bool, count: usize, seed: u64, 
                 };
                 let probe = weights.clone_matrix(layer, head, matrix);
                 // u vᵀ of Frobenius norm half the matrix's, unit random directions.
-                let size = 0.5 * probe.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let size = 0.5 * probe.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>().sqrt();
                 let mut unit = |n: usize| -> Vec<f64> {
                     let v: Vec<f64> = (0..n).map(|_| rng.random::<f64>() - 0.5).collect();
                     let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt().max(f64::MIN_POSITIVE);
@@ -2314,7 +2355,7 @@ pub fn sample(weights: &Weights, counterfactual: bool, count: usize, seed: u64, 
 }
 
 impl Weights {
-    fn clone_matrix(&self, layer: usize, head: Option<usize>, matrix: Matrix) -> Array2<f64> {
+    fn clone_matrix(&self, layer: usize, head: Option<usize>, matrix: Matrix) -> Stored {
         let lw = &self.layers[layer];
         match (head, matrix) {
             (Some(h), Matrix::Query) => lw.heads[h].query.clone(),
@@ -2348,6 +2389,13 @@ fn quantize_row(mut row: ndarray::ArrayViewMut1<f64>, bits: u32) {
         let step = top / steps;
         row.mapv_inplace(|x| (x / step).round() * step);
     }
+}
+
+/// [`quantize_row`] of a stored row, in float64 and rounded back to float32.
+fn quantize_stored(mut row: ndarray::ArrayViewMut1<f32>, bits: u32) {
+    let mut wide_row = row.mapv(f64::from);
+    quantize_row(wide_row.view_mut(), bits);
+    row.zip_mut_with(&wide_row, |w, x| *w = *x as f32);
 }
 
 /// The weights a quantization replaced, to put back.
@@ -2449,9 +2497,9 @@ impl Weights {
                         device_head_edited(w);
                         out.heads.push((*layer, h, w.clone()));
                         for m in [&mut w.query, Arc::make_mut(&mut w.key), Arc::make_mut(&mut w.value)] {
-                            m.rows_mut().into_iter().for_each(|r| quantize_row(r, bits));
+                            m.rows_mut().into_iter().for_each(|r| quantize_stored(r, bits));
                         }
-                        w.output.columns_mut().into_iter().for_each(|c| quantize_row(c, bits));
+                        w.output.columns_mut().into_iter().for_each(|c| quantize_stored(c, bits));
                     }
                 }
                 Block::Neurons { layer, neurons } => {
@@ -2459,11 +2507,11 @@ impl Weights {
                     device_mlp_edited(mlp);
                     out.mlps.push((*layer, mlp.clone()));
                     for &i in neurons {
-                        quantize_row(mlp.gate.row_mut(i), bits);
+                        quantize_stored(mlp.gate.row_mut(i), bits);
                         if let Some(up) = mlp.up.as_mut() {
-                            quantize_row(up.row_mut(i), bits);
+                            quantize_stored(up.row_mut(i), bits);
                         }
-                        quantize_row(mlp.out.column_mut(i), bits);
+                        quantize_stored(mlp.out.column_mut(i), bits);
                     }
                 }
                 Block::Slices { layer, fc, down, .. } => {
@@ -2478,9 +2526,9 @@ impl Weights {
                         if indices.contains(&u.nrows()) {
                             // The remainder W − Σ U Vᵀ (out × in, as w): its rows quantized.
                             let all = u.t().dot(&v.t());
-                            let mut rest = &*w - &all;
+                            let mut rest = wide(w.view()) - &all;
                             rest.rows_mut().into_iter().for_each(|r| quantize_row(r, bits));
-                            *w = all + rest;
+                            *w = (all + rest).mapv(|x| x as f32);
                         }
                         let count = u.nrows();
                         for &i in indices.iter().filter(|&&i| i < count) {
@@ -2495,7 +2543,7 @@ impl Weights {
                             if change.dim() != w.dim() {
                                 return Err("VPD factors of another shape than the matrix".into());
                             }
-                            *w += &change;
+                            add_wide(w.view_mut(), change.view());
                         }
                     }
                 }
@@ -2541,7 +2589,7 @@ impl Weights {
                             if part.dim() != dim {
                                 return Err("VPD attention factors of another shape than the heads' maps".into());
                             }
-                            *w.map_mut(m) += &part;
+                            add_wide(w.map_mut(m).view_mut(), part.view());
                             at += width;
                         }
                     }
@@ -2876,7 +2924,7 @@ impl Interventions {
         let mut out = Self::default();
         if let (Some(run), Some(b)) = (donor, donor_batch) {
             let tokens: Vec<usize> = b.tokens.iter().map(|t| *t as usize).collect();
-            out.donor = Some(Donor { embed: weights.embedding.select(Axis(0), &tokens), writes: run.writes.clone(), normed: run.normed.clone(), reads: run.reads.clone() });
+            out.donor = Some(Donor { embed: wide(weights.embedding.select(Axis(0), &tokens).view()), writes: run.writes.clone(), normed: run.normed.clone(), reads: run.reads.clone() });
         }
         let heads_at = |pred: &dyn Fn(&Block) -> bool| -> Vec<Writer> { circuit.units.iter().enumerate().filter(|(_, u)| pred(&u.block)).map(|(i, _)| Writer::Unit(i)).collect() };
         for op in &draw.ops {
@@ -3101,7 +3149,7 @@ impl SiteUnits {
         let later: Vec<usize> = batch.spans.iter().flat_map(|&(start, n)| start + 1..start + n).collect();
         let typical = |x: &Array2<f64>| -> f64 { (later.iter().map(|&r| x.row(r).dot(&x.row(r))).sum::<f64>() / later.len().max(1) as f64).sqrt() };
         let mut out = BTreeMap::new();
-        let mut stream = weights.embedding.select(Axis(0), &batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>());
+        let mut stream = wide(weights.embedding.select(Axis(0), &batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>()).view());
         out.insert(SharedSite::Embedding, typical(&stream));
         let (_, head_blocks) = Self::shared(weights);
         for b in 0..blocks {
@@ -3652,10 +3700,11 @@ impl Checker {
         }
         let prompts = fnv(0xcbf2_9ce4_8422_2325, &mut words.into_iter());
         let w = &self.weights;
-        let mut sample: Vec<f64> = w.embedding.row(0).to_vec();
-        sample.extend(w.unembedding.row(w.unembedding.nrows() - 1).iter());
+        let mut sample: Vec<f64> = w.embedding.row(0).iter().map(|&v| f64::from(v)).collect();
+        sample.extend(w.unembedding.row(w.unembedding.nrows() - 1).iter().map(|&v| f64::from(v)));
+        sample.extend(w.final_norm.gain.iter());
         for l in &w.layers {
-            sample.extend(l.mlp.iter().flat_map(|m| m.out.row(0).to_vec()));
+            sample.extend(l.mlp.iter().flat_map(|m| m.out.row(0).to_vec()).map(f64::from));
         }
         let h = fnv(prompts, &mut sample.iter().map(|v| v.to_bits()).chain(key.bytes().map(u64::from)));
         Some(std::path::Path::new(&dir).join(format!("{}_{prompts:016x}", self.behavior.id)).join(format!("{h:016x}.f64")))

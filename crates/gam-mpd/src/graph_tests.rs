@@ -271,7 +271,8 @@ fn transcoder_features_write_the_transcoder_and_the_rest_is_exact() {
     let expected = t.reconstruction(&x_hat).expect("reconstruction") - &b.view().insert_axis(ndarray::Axis(0));
     let got = run.writes[0].clone().expect("the node computes");
     let gap = (&got - &expected).iter().fold(0.0f64, |a, v| a.max(v.abs()));
-    assert!(gap < 1e-9, "feature writes differ from the transcoder by {gap:e}");
+    // The checker stores weights in float32; the start library's come from float64 arithmetic.
+    assert!(gap < 1e-6, "feature writes differ from the transcoder by {gap:e}");
     // One view per site; features in range.
     let mut both = program.clone();
     both.nodes.push(NodeIr { id: "n".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "mlp".into(), index: Some(Index::One(0)) }], rule: None });
@@ -305,7 +306,7 @@ fn attention_block_hides_the_prefix_like_running_the_suffix_alone() {
 fn exact_vpd(weights: &Weights) -> crate::graph::VpdMlp {
     let mlp = weights.layers[1].mlp.as_ref().expect("an MLP");
     let n = mlp.gate.nrows();
-    crate::graph::VpdMlp { fc_u: ndarray::Array2::eye(n), fc_v: mlp.gate.t().to_owned(), down_u: mlp.out.t().to_owned(), down_v: ndarray::Array2::eye(n) }
+    crate::graph::VpdMlp { fc_u: ndarray::Array2::eye(n), fc_v: crate::graph::wide(mlp.gate.t()), down_u: crate::graph::wide(mlp.out.t()), down_v: ndarray::Array2::eye(n) }
 }
 
 #[test]
@@ -358,7 +359,7 @@ fn vpd_mlp_view_reads_the_hidden_stream_through_its_edges() {
         let r = crate::operator_program::rms_scale(row.view(), lw.mlp_norm.epsilon);
         row.zip_mut_with(&lw.mlp_norm.gain, |v, g| *v *= r * g);
     }
-    let mut active = x_hat.dot(&mlp.gate.t()) + &mlp.bias.view().insert_axis(ndarray::Axis(0));
+    let mut active = x_hat.dot(&crate::graph::wide(mlp.gate.t())) + &mlp.bias.view().insert_axis(ndarray::Axis(0));
     active.mapv_inplace(|t| mlp.law.apply(t));
     let patched = library.log_probabilities(&library.run_with(&f.sequences, &BTreeMap::new(), &[(1, active)].into()).expect("patched").last).expect("log p");
     let kl = max(&kl_bits(&patched, &run_of(&cut, true)));
@@ -380,8 +381,8 @@ fn vpd_attention_view_reads_queries_keys_values_through_its_edges() {
     // One subcomponent per output coordinate of q, k, v and per input coordinate of o (exact).
     let lw = &weights.layers[1];
     let stack = |m: &dyn Fn(&crate::graph::HeadWeights) -> ndarray::Array2<f64>| ndarray::concatenate(ndarray::Axis(0), &lw.heads.iter().map(m).collect::<Vec<_>>().iter().map(|a| a.view()).collect::<Vec<_>>()).expect("stack");
-    let (wq, wk, wv) = (stack(&|h| h.query.clone()), stack(&|h| ndarray::Array2::clone(&h.key)), stack(&|h| ndarray::Array2::clone(&h.value)));
-    let wo = ndarray::concatenate(ndarray::Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack");
+    let (wq, wk, wv) = (stack(&|h| crate::graph::wide(h.query.view())), stack(&|h| crate::graph::wide(h.key.view())), stack(&|h| crate::graph::wide(h.value.view())));
+    let wo = crate::graph::wide(ndarray::concatenate(ndarray::Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack").view());
     let exact_in = |w: &ndarray::Array2<f64>| (ndarray::Array2::eye(w.nrows()), w.t().to_owned());
     weights.vpd_attention.insert(1, crate::graph::VpdAttention { q: exact_in(&wq), k: exact_in(&wk), v: exact_in(&wv), o: (wo.t().to_owned(), ndarray::Array2::eye(wo.ncols())) });
     let piece = |layer: usize, view: &str, kind: &str, index: Option<Index>| PieceIr { view: view.into(), layer, kind: kind.into(), index };
@@ -437,10 +438,10 @@ fn library_parts_resolve_to_their_vpd_subcomponents() {
     weights.vpd.insert(1, vpd);
     let lw = &weights.layers[1];
     let width: usize = lw.heads.iter().map(|h| h.query.nrows()).sum();
-    let wo = ndarray::concatenate(ndarray::Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack");
+    let wo = crate::graph::wide(ndarray::concatenate(ndarray::Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack").view());
     let eye_in = |rows: usize, w: ndarray::Array2<f64>| (ndarray::Array2::eye(rows), w);
     let stack = |m: &dyn Fn(&crate::graph::HeadWeights) -> ndarray::Array2<f64>| ndarray::concatenate(ndarray::Axis(0), &lw.heads.iter().map(m).collect::<Vec<_>>().iter().map(|a| a.view()).collect::<Vec<_>>()).expect("stack").t().to_owned();
-    let attention = crate::graph::VpdAttention { q: eye_in(width, stack(&|h| h.query.clone())), k: eye_in(width, stack(&|h| ndarray::Array2::clone(&h.key))), v: eye_in(width, stack(&|h| ndarray::Array2::clone(&h.value))), o: (wo.t().to_owned(), ndarray::Array2::eye(width)) };
+    let attention = crate::graph::VpdAttention { q: eye_in(width, stack(&|h| crate::graph::wide(h.query.view()))), k: eye_in(width, stack(&|h| crate::graph::wide(h.key.view()))), v: eye_in(width, stack(&|h| crate::graph::wide(h.value.view()))), o: (wo.t().to_owned(), ndarray::Array2::eye(width)) };
     weights.vpd_attention.insert(1, attention);
     // Layer 1: attention part 0 = every q, k, v subcomponent, part 1 = every o one; MLP part 0 = c_fc, part 1 = down_proj.
     let slices = |site: usize, n: usize| (0..n).map(|i| serde_json::json!([site, i])).collect::<Vec<_>>();
@@ -560,7 +561,7 @@ fn device_site_operations_on_the_host_backend_are_the_host_run() {
         donor_batch.reference = batch.reference.clone().filter(|_| !circuit.is_model());
         let recording = Interventions { record: (0..4).collect(), ..Interventions::default() };
         let donor_run = execute_with(&weights, &circuit, &donor_batch, &[], &BTreeMap::new(), &recording).expect("donor run");
-        let embed = weights.embedding.select(ndarray::Axis(0), &cf_batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>());
+        let embed = crate::graph::wide(weights.embedding.select(ndarray::Axis(0), &cf_batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>()).view());
         let donor = Donor { embed, writes: donor_run.writes.clone(), normed: donor_run.normed.clone(), reads: BTreeMap::new() };
         let push = ndarray::Array1::from_shape_fn(weights.width(), |c| 0.3 * (c as f64 + 1.0).sin());
         let ops = Interventions {
@@ -594,12 +595,12 @@ fn weights_read_from_the_native_program_are_the_librarys() {
         let f = fixture_of(dir);
         let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
         let (a, b) = (Weights::of(&library), Weights::from_native(&f.native, &f.layers).expect("native weights"));
-        let same = |x: &ndarray::Array2<f64>, y: &ndarray::Array2<f64>| x.dim() == y.dim() && x.iter().zip(y.iter()).all(|(p, q)| p == q);
+        let same = |x: &crate::graph::Stored, y: &crate::graph::Stored| x.dim() == y.dim() && x.iter().zip(y.iter()).all(|(p, q)| p == q);
         assert!(same(&a.embedding, &b.embedding) && same(&a.unembedding, &b.unembedding) && a.final_norm.gain == b.final_norm.gain, "{tag}: embeddings");
         for (la, lb) in a.layers.iter().zip(&b.layers) {
             assert!(la.attention.gain == lb.attention.gain && la.mlp_norm.gain == lb.mlp_norm.gain, "{tag}: norms");
             for (ha, hb) in la.heads.iter().zip(&lb.heads) {
-                assert!(same(&ha.query, &hb.query) && same(&ha.key, &hb.key) && same(&ha.value, &hb.value) && same(&ha.output, &hb.output) && ha.query_norm == hb.query_norm && ha.key_norm == hb.key_norm && ha.scale == hb.scale, "{tag}: heads");
+                assert!(same(&ha.query, &hb.query) && same(&*ha.key, &*hb.key) && same(&*ha.value, &*hb.value) && same(&ha.output, &hb.output) && ha.query_norm == hb.query_norm && ha.key_norm == hb.key_norm && ha.scale == hb.scale, "{tag}: heads");
             }
             let (ma, mb) = (la.mlp.as_ref().expect("mlp"), lb.mlp.as_ref().expect("mlp"));
             assert!(same(&ma.gate, &mb.gate) && same(&ma.out, &mb.out) && ma.bias == mb.bias && ma.up_bias == mb.up_bias && ma.law == mb.law && ma.up.as_ref().map(|u| u.dim()) == mb.up.as_ref().map(|u| u.dim()), "{tag}: MLPs");
@@ -694,7 +695,7 @@ fn a_ruled_node_attends_by_its_rule_with_its_own_value_and_output() {
     let a = crate::graph::HeadRule::Offset(1).pattern(&f.sequences[0]);
     let mut replace = BTreeMap::new();
     for (h, w) in lw.heads.iter().enumerate() {
-        let v = x_hat.dot(&w.value.t());
+        let v = x_hat.dot(&crate::graph::wide(w.value.t()));
         let mut z = ndarray::Array2::<f64>::zeros(v.dim());
         for s in 0..f.sequences.len() {
             let span = s * length..(s + 1) * length;
@@ -750,11 +751,11 @@ fn device_path_runs_vpd_views_as_the_host() {
     let lw = &weights.layers[1];
     let mlp = lw.mlp.as_ref().expect("an MLP");
     let hidden = mlp.gate.nrows();
-    let (fc_u, fc_v) = partial(&mlp.gate, hidden - 5, 0.7);
-    let (down_u, down_v) = (mlp.out.t().slice(s![..hidden - 4, ..]).to_owned() * 0.6, Array2::<f64>::eye(hidden).slice(s![.., ..hidden - 4]).to_owned());
-    let stack = |m: &dyn Fn(&crate::graph::HeadWeights) -> &Array2<f64>| ndarray::concatenate(Axis(0), &lw.heads.iter().map(|h| m(h).view()).collect::<Vec<_>>()).expect("stack");
+    let (fc_u, fc_v) = partial(&crate::graph::wide(mlp.gate.view()), hidden - 5, 0.7);
+    let (down_u, down_v) = (crate::graph::wide(mlp.out.t().slice(s![..hidden - 4, ..])) * 0.6, Array2::<f64>::eye(hidden).slice(s![.., ..hidden - 4]).to_owned());
+    let stack = |m: &dyn Fn(&crate::graph::HeadWeights) -> &crate::graph::Stored| crate::graph::wide(ndarray::concatenate(Axis(0), &lw.heads.iter().map(|h| m(h).view()).collect::<Vec<_>>()).expect("stack").view());
     let (wq, wk, wv) = (stack(&|h| &h.query), stack(&|h| &*h.key), stack(&|h| &*h.value));
-    let wo = ndarray::concatenate(Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack");
+    let wo = crate::graph::wide(ndarray::concatenate(Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack").view());
     let o = (wo.t().slice(s![..wo.ncols() - 3, ..]).to_owned() * 0.5, Array2::<f64>::eye(wo.ncols()).slice(s![.., ..wo.ncols() - 3]).to_owned());
     let attention = crate::graph::VpdAttention { q: partial(&wq, wq.nrows() - 2, 0.8), k: partial(&wk, wk.nrows() - 3, 0.9), v: partial(&wv, wv.nrows() - 1, 0.6), o };
     weights.vpd.insert(1, crate::graph::VpdMlp { fc_u, fc_v, down_u, down_v });
@@ -801,4 +802,34 @@ fn device_path_runs_vpd_views_as_the_host() {
     let clean = execute(&weights, &graph.model(&weights), &plain, &rows, &BTreeMap::new()).expect("M").log_probabilities;
     let open = execute(&weights, &graph.program(&weights, true), &with_reference, &rows, &BTreeMap::new()).expect("program").log_probabilities;
     assert!(max(&kl_bits(&clean, &open)) > 1e-6, "the program equals M");
+}
+
+#[test]
+fn device_path_runs_transcoder_features_as_the_host() {
+    let f = fixture("graph_device_transcoder");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let mut weights = Weights::of(&library);
+    let dir = std::env::temp_dir().join(format!("gam_mpd_graph_device_tc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    crate::test_support::transcoder_file(&dir.join("layer_1.safetensors"), 6, 8, 5);
+    assert_eq!(weights.attach_transcoders(&dir).expect("attach"), 1);
+    let mut program = full_program();
+    let m1 = program.nodes.iter().position(|n| n.id == "m1").expect("m1");
+    program.nodes[m1].pieces = vec![PieceIr { view: "transcoder".into(), layer: 1, kind: "feature".into(), index: Some(Index::Many(vec![0, 2, 3])) }];
+    program.edges.retain(|e| !(e.from == "a0" && e.to == "m1"));
+    let graph = Graph::parse(&program, &weights).expect("parse");
+    weights.load_features(&graph).expect("features");
+    let cf = counterfactuals(&f.sequences);
+    let plain = Batch::new(&f.sequences).expect("batch");
+    let mut with_reference = plain.clone();
+    with_reference.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    let rows: Vec<usize> = (0..plain.tokens.len()).collect();
+    let mut state = crate::graph_device::DeviceState::new(Device::host());
+    for (name, circuit, batch) in [("model", graph.model(&weights), &plain), ("edges", graph.program(&weights, true), &with_reference), ("nodes", graph.program(&weights, false), &with_reference)] {
+        let host = execute(&weights, &circuit, batch, &rows, &BTreeMap::new()).expect("host");
+        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &crate::graph::Interventions::default() };
+        let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+        let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
+        assert!(kl < 1e-9, "{name}: KL(host ‖ device) with transcoder features = {kl:e} bits");
+    }
 }

@@ -2383,11 +2383,13 @@ mod tests {
 }
 
 impl Library<'_> {
-    /// The library's blocks as host matrices, for the graph checker (`graph::Weights`); the
-    /// unembedding carries the final norm's gain.
+    /// The library's blocks as host matrices, for the graph checker (`graph::Weights`, float32):
+    /// the unembedding without the final norm's gain, which the checker applies (the library's
+    /// carries it; a zero gain's column is zero).
     pub(crate) fn graph_weights(&self) -> crate::graph::Weights {
         use crate::graph::{HeadWeights, LayerWeights, MlpWeights, Norm, Weights};
         let norm = |s: &Site| Norm { gain: s.gain.clone(), epsilon: s.epsilon };
+        let narrow = |m: &Array2<f64>| m.mapv(|v| v as f32);
         let layers = (0..self.layer_heads.len())
             .map(|l| LayerWeights {
                 attention: norm(&self.sites[2 * l]),
@@ -2395,13 +2397,18 @@ impl Library<'_> {
                     .iter()
                     .map(|&h| {
                         let b = &self.heads[h];
-                        HeadWeights { query: b.query.map.clone(), query_norm: b.query.norm.clone(), key: std::sync::Arc::new(b.key.map.clone()), key_norm: b.key.norm.clone(), value: std::sync::Arc::new(b.value.clone()), output: b.output.clone(), scale: b.scale, rotary: b.rotary, causal: b.causal }
+                        HeadWeights { query: narrow(&b.query.map), query_norm: b.query.norm.clone(), key: std::sync::Arc::new(narrow(&b.key.map)), key_norm: b.key.norm.clone(), value: std::sync::Arc::new(narrow(&b.value)), output: narrow(&b.output), scale: b.scale, rotary: b.rotary, causal: b.causal }
                     })
                     .collect(),
                 mlp_norm: norm(&self.sites[2 * l + 1]),
-                mlp: self.mlps.iter().find(|b| b.layer == l).map(|b| MlpWeights { gate: b.gate.clone(), bias: b.bias.clone(), up: b.up.as_ref().map(|(_, m)| m.clone()), up_bias: b.up_bias.clone(), out: b.out.clone(), law: b.law }),
+                mlp: self.mlps.iter().find(|b| b.layer == l).map(|b| MlpWeights { gate: narrow(&b.gate), bias: b.bias.clone(), up: b.up.as_ref().map(|(_, m)| narrow(m)), up_bias: b.up_bias.clone(), out: narrow(&b.out), law: b.law }),
             })
             .collect();
-        Weights::new(layers, norm(&self.final_site), self.unembedding.clone(), self.embedding.clone())
+        let gain = &self.final_site.gain;
+        let mut unembedding = self.unembedding.clone();
+        for mut r in unembedding.outer_iter_mut() {
+            r.zip_mut_with(gain, |u, g| *u = if *g == 0.0 { 0.0 } else { *u / g });
+        }
+        Weights::new(layers, norm(&self.final_site), narrow(&unembedding), narrow(&self.embedding))
     }
 }

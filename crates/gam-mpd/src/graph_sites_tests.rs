@@ -401,9 +401,10 @@ fn attention_subcomponent_edits_split_over_heads() {
             let (now, was) = if map == 0 { (&weights.layers[0].heads[h].query, &before.layers[0].heads[h].query) } else { (&weights.layers[0].heads[h].output, &before.layers[0].heads[h].output) };
             let gap = now.indexed_iter().map(|((r, c), x)| {
                 let (row, col) = if map == 0 { (h * dh + r, c) } else { (r, h * dh + c) };
-                (x - was[[r, c]] - delta(row, col)).abs()
+                (f64::from(*x) - f64::from(was[[r, c]]) - delta(row, col)).abs()
             }).fold(0.0f64, f64::max);
-            assert!(gap < 1e-12, "map {map} head {h}: off by {gap:e}");
+            // The edited weights are stored in float32.
+            assert!(gap < 1e-6, "map {map} head {h}: off by {gap:e}");
         }
         restore.restore(&mut weights).expect("restore");
         for h in 0..heads {
@@ -446,9 +447,9 @@ fn quantization_rounds_rows_and_restores() {
     let before = weights.clone();
     let blocks = vec![(crate::graph::Block::Heads { layer: 0, heads: vec![0] }, Some(2)), (crate::graph::Block::Neurons { layer: 1, neurons: vec![0, 3] }, Some(1))];
     let restore = weights.quantize(&blocks).expect("quantize");
-    let distinct = |row: ndarray::ArrayView1<f64>| {
-        let mut v: Vec<f64> = row.to_vec();
-        v.sort_by(f64::total_cmp);
+    let distinct = |row: ndarray::ArrayView1<f32>| {
+        let mut v: Vec<f32> = row.to_vec();
+        v.sort_by(f32::total_cmp);
         v.dedup();
         v.len()
     };
