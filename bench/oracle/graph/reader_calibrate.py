@@ -10,8 +10,9 @@ clean top-K candidates and their probabilities under the experiment (reader_scor
 It also prints the mean measured effect of each removal on the repeated token, the facts the true
 docstrings state.
 
-`programs` writes the calibration programs: g-mech's native induction example as written, the same code
-with its English replaced by measured facts (true), and the same code with false English (wrong).
+`programs` writes the calibration programs: g-mech's vpd4l induction examples as written (examples/
+index.json), the circuit's heads with measured removal facts as English (true_measured, facts from
+disjoint prompts), and the same code with false English (wrong).
 
   reader_calibrate.py measure --out ITEMS.jsonl [--prompts 8] [--targets 4] [--heads all|L.H,...]
   reader_calibrate.py programs --out PROGRAMS.jsonl
@@ -153,9 +154,11 @@ def measure(args):
 
 
 def programs(args):
-    native = (HERE / "examples" / "vpd4l_induction_native.py").read_text()
+    index = json.loads((HERE / "examples" / "index.json").read_text())
     facts = json.loads(Path(args.facts).read_text())["mean_p_repeat"] if args.facts else None
-    rows = [{"id": "native_example", "source": native}, {"id": "wrong", "source": WRONG}]
+    rows = [{"id": name, "source": (HERE / "examples" / f"{name}.py").read_text()} for name, e in sorted(index.items())
+            if e["model"] == "vpd4l" and e["family"].startswith("induction")]
+    rows.append({"id": "wrong", "source": WRONG})
     if facts:
         named = ["L1H1", "L2H4", "L3H5"]
         rest = sorted((k for k in facts if k not in named and k != "clean"), key=lambda k: facts[k])
