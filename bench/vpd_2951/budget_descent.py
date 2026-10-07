@@ -20,7 +20,8 @@ Starts:
   vpdgroup  as vpd, with each down_proj slice tied to the gate of the c_fc slice of its layer whose
        firing is nearest its own (below)
 Gate arms (DESCENT_ARM): own (above); dir, a separate signed gate direction per slice; router, a
-small causal router per layer added to the own read; router_pure, the router alone (below).
+small causal router per layer added to the own read; router_pure, the router alone; share, learned
+gate sharing across the slices of a layer (below).
 Objective (DESCENT_F=1): F, the bits-back code length per training token (below); otherwise KL alone.
 Dual step (DESCENT_DUAL): measured (default, library_mdl's rule, below) or fixed (lambda <- lambda +
 0.01 log(E[k] / K) on the loss KL + lambda log E[k], the first runs' rule).
@@ -151,9 +152,51 @@ if ARM in ('router', 'router_pure'):
                     r = (X[n] @ P[n]['V']).abs() * P[n]['U'].norm(dim=1)
                     R[n] = torch.linalg.lstsq(H.cpu().double(), r.cpu().double()).solution.float().to(dev).requires_grad_()
         ROUTER[l] = R
+# DESCENT_ARM=share: learned gate sharing. Each MLP layer has a dictionary of DESCENT_GATES (default 512)
+# gate directions g_m with thresholds t_m on the layer's own input x; slice j of either map fires when
+# its assigned gate does, g_{a_j}.x > t_{a_j}, so the slices sharing a gate form one part of any rank
+# (it counts its slices, rank-one equivalents). The assignment is relaxed in training (slice j's gate
+# is sum_m softmax(L_j)_m Phi((g_m.x - t_m)/s_m)) and hardened (argmax L_j) at evaluation. Start: the
+# own-read firing of the start's slices on M's fit tokens, clustered by spherical k-means into the
+# gates (slices that never fire stay off); each gate's direction is the least-squares fit of its
+# members' mean firing from x, its threshold the quantile that matches their mean rate, its noise
+# scale 0.1 x the spread of g.x, and L_j is 8 at the slice's cluster and 0 elsewhere.
+SHARE = {}
+if ARM == 'share':
+    n_gates = int(os.environ.get('DESCENT_GATES', '512'))
+    with torch.no_grad():
+        for l in range(4):
+            fc, dn = f'h.{l}.mlp.c_fc', f'h.{l}.mlp.down_proj'
+            on = lambda m: (((X[m] @ P[m]['V']).abs() * P[m]['U'].norm(dim=1)) > P[m]['tau']).float()
+            Fm = torch.cat([on(fc), on(dn)], 1)
+            alive = (Fm.sum(0) > 0).float()
+            Fn = Fm / Fm.norm(dim=0).clamp_min(1e-9)
+            live = torch.nonzero(alive).squeeze(1)
+            centers = Fn[:, live[torch.randperm(live.numel(), device=dev)[:n_gates]]]
+            for _ in range(10):
+                assign = (Fn.T @ centers).argmax(1)
+                sums = torch.zeros(Fn.shape[0], centers.shape[1], device=dev).index_add_(1, assign, Fn * alive)
+                filled = sums.norm(dim=0) > 0
+                centers = torch.where(filled, sums / sums.norm(dim=0).clamp_min(1e-9), centers)
+            assign = (Fn.T @ centers).argmax(1)
+            size = torch.zeros(centers.shape[1], device=dev).index_add_(0, assign, alive)
+            rate = torch.zeros(Fm.shape[0], centers.shape[1], device=dev).index_add_(1, assign, Fm * alive) / size.clamp_min(1)
+            x = X[fc]; xm = x.mean(0)
+            Xc = (x - xm).cpu().double().numpy(); Rc = (rate - rate.mean(0)).cpu().double().numpy()
+            XtX = Xc.T @ Xc
+            G = torch.tensor(sl.solve(XtX + 1e-6 * np.trace(XtX) / XtX.shape[0] * np.eye(XtX.shape[0]), Xc.T @ Rc, assume_a='pos'), dtype=torch.float32, device=dev)
+            read = x @ G
+            mean_rate = rate.mean(0).clamp(1e-4, 1 - 1e-4)
+            tg = torch.stack([torch.quantile(read[:, m], 1 - mean_rate[m]) for m in range(G.shape[1])])
+            sg = 0.1 * read.std(0).clamp_min(1e-9)
+            L = torch.zeros(Fm.shape[1], G.shape[1], device=dev); L[torch.arange(Fm.shape[1], device=dev), assign] = 8.0
+            Cf = P[fc]['V'].shape[1]
+            SHARE[l] = {'G': G.requires_grad_(), 'tg': tg.requires_grad_(), 'sg': sg, 'L': L.requires_grad_(), 'alive': alive,
+                        'cols': {fc: slice(0, Cf), dn: slice(Cf, Fm.shape[1])}}
+            print(f'layer {l}: {int(alive.sum())} of {Fm.shape[1]} slices fire; {int((size > 0).sum())} gates used, largest part {int(size.max())}', flush=True)
 del X
 
-state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}}
+state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}, 'share': {}}
 SQ2 = math.sqrt(2)
 def make(n):
     st = T.site(n); p = P[n]; grp = GROUP.get(n); mult = MULT.get(n)
@@ -166,6 +209,20 @@ def make(n):
         c = x @ p['V']
         if state['mode'] == 'all':
             return c @ p['U']
+        if ARM == 'share':
+            S = SHARE[layer]
+            if n.endswith('c_fc'):
+                zg = (x @ S['G'] - S['tg']) / S['sg']
+                state['share'][layer] = ((zg > 0).float(), 0.5 * (1 + torch.erf(zg / SQ2)))
+            hg, pg = state['share'][layer]
+            cols = S['cols'][n]; alive = S['alive'][cols]; Lc = S['L'][cols]
+            hard = hg[..., Lc.argmax(1)] * alive
+            state['hard'].append(hard.sum(-1).reshape(-1))
+            if state['mode'] == 'hard':
+                return (c * hard) @ p['U']
+            soft = pg @ (torch.softmax(Lc, 1) * alive[:, None]).T
+            state['soft'].append(soft.sum(-1).reshape(-1))
+            return (c * soft) @ p['U']
         read = x @ p['G'] if ARM == 'dir' else c.abs() * p['U'].norm(dim=1)
         if router is not None:
             if n.endswith('c_fc'):
@@ -223,6 +280,15 @@ def evaluate():
         lp = run(ids, 'all'); r['kl_all_on'].append(kl_bits(lm, lp).mean().item())
     out = {k: float(np.mean(v)) for k, v in r.items() if k != 'per_map'}
     out['per_map'] = [round(float(x), 2) for x in np.mean(r['per_map'], 0)]
+    if SHARE:
+        # Parts under the hardened assignment: per layer, the gates used and their ranks (slices).
+        out['parts'] = []
+        for l, S in SHARE.items():
+            ranks = torch.zeros(S['L'].shape[1], device=dev).index_add_(0, S['L'].argmax(1), S['alive'])
+            ranks = ranks[ranks > 0]
+            out['parts'].append({'gates': int(ranks.numel()), 'mean_rank': round(ranks.mean().item(), 2),
+                                 'median_rank': float(ranks.median().item()), 'max_rank': int(ranks.max().item()),
+                                 'rank_1': int((ranks == 1).sum().item())})
     return out
 
 # Every trained tensor as (container, key, scale): Adam steps of 0.3% of the scale per step, the
@@ -237,6 +303,10 @@ if gate == 'ramp':
     for n in mlp:
         P[n]['lw'] = P[n]['s'].log().clone().requires_grad_()
     slots += [(P[n], 'lw', 10 / 3) for n in mlp]
+for l, S in SHARE.items():
+    # gate directions by 0.3% of their root mean square, thresholds by 1% of their noise scale x 10,
+    # assignment logits by 0.02 per step
+    slots += [(S, 'G', rms(S['G'])), (S, 'tg', 100 / 3 * S['sg'].mean().item()), (S, 'L', 20 / 3)]
 for l, R in ROUTER.items():
     slots.append((R, 'G1', rms(R['G1'])))
     slots += [(R, n, rms(R[n]) or P[n]['s'].mean().item()) for n in R if n != 'G1']
