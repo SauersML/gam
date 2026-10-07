@@ -1132,6 +1132,15 @@ def description_bits():
             v = e.mean(d_)
             total = total + 0.5 * (mu.shape[d_] * torch.log(v).sum() - 2 * ls.sum()) + 0.5 * math.log(mu.shape[d_]) * v.numel()
             continue
+        if key in ('tau', 't', 'lw'):
+            # Thresholds and widths are locations, not zero-centred: their prior N(m, v) has its mean m fitted
+            # too (described in (1/2) ln n nats), v = mean((mu - m)^2 + sigma^2) at its optimum. Under
+            # N(0, v) a tensor's thresholds, all near one value tau_0, had v ~ tau_0^2, which pushed every
+            # sigma toward tau_0 (sigma / RMS(mu) 0.53 after 1,220 steps on the whole model) and fired
+            # random gates at the sampled parameters.
+            v = ((mu - mu.mean()).pow(2) + (2 * ls).exp()).mean()
+            total = total + 0.5 * (mu.numel() * torch.log(v) - 2 * ls.sum()) + 0.5 * math.log(mu.numel())
+            continue
         v = e.mean()
         total = total + 0.5 * (mu.numel() * torch.log(v) - 2 * ls.sum())
     for Rn in RES.values():
