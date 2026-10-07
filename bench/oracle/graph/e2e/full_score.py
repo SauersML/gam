@@ -78,47 +78,48 @@ def main() -> None:
         command += ["--device", a.device]
     if a.batch_tokens:
         command += ["--batch-tokens", str(a.batch_tokens)]
-    server = subprocess.Popen(command, stderr=open(a.results.with_suffix(".reader.log"), "w"))
-    try:
-        for _ in range(1800):
-            try:
-                socket.create_connection(("127.0.0.1", a.port)).close()
-                break
-            except OSError:
-                if server.poll() is not None:
-                    sys.exit(f"the reader server exited ({a.results.with_suffix('.reader.log')})")
-                time.sleep(1)
-        lines = []
-        for name, r in results.items():
-            stem = a.items / f"{a.behavior}.{name}"
-            if name.startswith("_") or not Path(f"{stem}.items.jsonl").exists() or "reader" in r:
-                continue
+    for name, r in results.items():
+        stem = a.items / f"{a.behavior}.{name}"
+        if name.startswith("_") or not Path(f"{stem}.items.jsonl").exists() or "reader" in r:
+            continue
+        # a fresh server per program: the reader's memory grows across requests (Qwen3-1.7B on MPS passed
+        # 19 GiB on the second program)
+        server = subprocess.Popen(command, stderr=open(a.results.with_suffix(f".reader.{name}.log"), "w"))
+        try:
+            for _ in range(1800):
+                try:
+                    socket.create_connection(("127.0.0.1", a.port)).close()
+                    break
+                except OSError:
+                    if server.poll() is not None:
+                        sys.exit(f"the reader server exited ({a.results.with_suffix(f'.reader.{name}.log')})")
+                    time.sleep(1)
             items = [json.loads(l) for l in Path(f"{stem}.items.jsonl").read_text().splitlines() if l.strip()]
             program = json.loads(Path(f"{stem}.program.jsonl").read_text())
             t = time.time()
             sample = subsample(items, a.per_program)
             reply = ask(a.port, {"op": "score", "programs": [program], "items": sample, "N": int(r["N"])})
-            reader = reply["results"][0]
-            share = defaultdict(int)
-            for it in items:
-                share[it.get("family", "all")] += 1
-            sampled = defaultdict(list)
-            for it, bits in zip(sample, reader["per_item"]):
-                sampled[it.get("family", "all")].append(bits)
-            mean = sum(share[f] / len(items) * sum(v) / len(v) for f, v in sampled.items())
-            reader["reader_error_bits"] = r["N"] * mean
-            r["reader"] = {k: v for k, v in reader.items() if k != "per_item"} | {"items_scored": min(len(items), a.per_program),
-                                                                               "items_total": len(items), "seconds": time.time() - t,
-                                                                               "model": a.model}
-            r["reader_error_bits"] = reader["reader_error_bits"]
-            r["total_bits"] = r["exec_error_bits"] + r["code_bits"] + r["opaque_bits"] + r["reader_error_bits"]
-            lines.append(e2e.status_line(a.target, a.behavior, f"{name}+reader:{a.model.split('/')[-1]}", r, r.get("stand_in")))
-            print(name, {k: round(r[k] / r["N"], 4) for k in ("total_bits", "exec_error_bits", "opaque_bits", "code_bits", "reader_error_bits")},
-                  "english saved/N", round(reader.get("english_saved_bits", float("nan")) / r["N"], 4), flush=True)
-            e2e.record(lines[-1:])
-            out.write_text(json.dumps(results, indent=1))
-    finally:
-        server.terminate()
+        finally:
+            server.terminate()
+            server.wait()
+        reader = reply["results"][0]
+        share = defaultdict(int)
+        for it in items:
+            share[it.get("family", "all")] += 1
+        sampled = defaultdict(list)
+        for it, bits in zip(sample, reader["per_item"]):
+            sampled[it.get("family", "all")].append(bits)
+        mean = sum(share[f] / len(items) * sum(v) / len(v) for f, v in sampled.items())
+        reader["reader_error_bits"] = r["N"] * mean
+        r["reader"] = {k: v for k, v in reader.items() if k != "per_item"} | {"items_scored": min(len(items), a.per_program),
+                                                                           "items_total": len(items), "seconds": time.time() - t,
+                                                                           "model": a.model}
+        r["reader_error_bits"] = reader["reader_error_bits"]
+        r["total_bits"] = r["exec_error_bits"] + r["code_bits"] + r["opaque_bits"] + r["reader_error_bits"]
+        e2e.record([e2e.status_line(a.target, a.behavior, f"{name}+reader:{a.model.split('/')[-1]}", r, r.get("stand_in"))])
+        print(name, {k: round(r[k] / r["N"], 4) for k in ("total_bits", "exec_error_bits", "opaque_bits", "code_bits", "reader_error_bits")},
+              "english saved/N", round(reader.get("english_saved_bits", float("nan")) / r["N"], 4), flush=True)
+        out.write_text(json.dumps(results, indent=1))
 
 
 if __name__ == "__main__":
