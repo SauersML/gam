@@ -573,9 +573,9 @@ pub(crate) fn backward_segments(
             d.merge_heads(&gv, &mut on_values, (heads.heads + heads.keys + first) * w, n, 1, None, false)?;
         }
         let target = g_g.as_mut().unwrap_or(&mut g_p);
-        add_rows(d, target, &own, &on_queries)?;
-        add_rows(d, target, &keys, &on_keys)?;
-        add_rows(d, &mut g_p, &keys, &on_values)?;
+        add_rows(d, target, &own, (&on_queries, 0))?;
+        add_rows(d, target, &keys, (&on_keys, 0))?;
+        add_rows(d, &mut g_p, &keys, (&on_values, 0))?;
     }
     if let (Some(g_g), Some(norms), Some(gains)) = (g_g, &heads.norms, &stacked.gains) {
         let mut g_n = d.empty(rows, heads.normed_columns())?;

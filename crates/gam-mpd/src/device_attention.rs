@@ -84,7 +84,7 @@ impl Whole {
         let mut out = d.zeros(rows, all.cols())?;
         d.scatter_ranges(&mut out, &self.rows, &d.gather_ranges(all, &self.own)?)?;
         for (at, before) in &self.earlier {
-            add_rows(d, &mut out, before, &d.rows_of(all, at.start, at.len())?)?;
+            add_rows(d, &mut out, before, (all, at.start))?;
         }
         Ok(out)
     }
@@ -122,12 +122,17 @@ fn backward_whole(d: &Device, (q, k, v): Values<'_>, cot: &Tensor, blocks: usize
     Ok((gq, gk, gv))
 }
 
-/// `values` added into `target`'s rows `ranges` (in order; ranges of several segments may share
-/// rows, each segment's addition in turn).
-pub(crate) fn add_rows(d: &Device, target: &mut Tensor, ranges: &[Range<usize>], values: &Tensor) -> Result<(), GpuError> {
-    let mut rows = d.gather_ranges(target, ranges)?;
-    d.axpy(&mut rows, 1.0, values)?;
-    d.scatter_ranges(target, ranges, &rows)
+/// `values`' rows from `from` on added into `target`'s rows `ranges`, in order (ranges of several
+/// segments may share rows, each segment's addition in turn): one `Device::axpy_rows` per range, the
+/// sums a gather, an addition and a scatter of the rows made (four launches each, one per segment
+/// of every attention's reverse).
+pub(crate) fn add_rows(d: &Device, target: &mut Tensor, ranges: &[Range<usize>], (values, from): (&Tensor, usize)) -> Result<(), GpuError> {
+    let mut at = from;
+    for range in ranges {
+        d.axpy_rows(target, range.start, 1.0, (values, at), range.len())?;
+        at += range.len();
+    }
+    Ok(())
 }
 
 /// [`forward`] over `segments`: each segment's queries against its keys and values, the earlier
@@ -194,8 +199,8 @@ pub(crate) fn backward_segments(d: &Device, (q, k, v): Values<'_>, cot: &Tensor,
             d.gemm(&mut value_grad, 1.0, &p, Op::T, &cb, Op::N, 1.0, arithmetic)?;
             d.set_rows(&mut gq, s.rows.start + start, &query_grad)?;
         }
-        add_rows(d, &mut gk, &keys, &key_grad)?;
-        add_rows(d, &mut gv, &keys, &value_grad)?;
+        add_rows(d, &mut gk, &keys, (&key_grad, 0))?;
+        add_rows(d, &mut gv, &keys, (&value_grad, 0))?;
     }
     Ok((gq, gk, gv))
 }
