@@ -80,10 +80,42 @@ def figure(runs, path):
     fig.savefig(path, dpi=150, facecolor="white")
 
 
+def kl_figure(name, r, path):
+    """Per held-out set (panels) and question type: KL(M_e || answer) in bits for the base oracle, the trained
+    oracle and the no-change answer on the same questions (log scale)."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams.update({"font.size": 14, "axes.spines.top": False, "axes.spines.right": False})
+    base, trained = r["kl"].get("base", {}), r["kl"].get("trained", {})
+    sets = [s for s in trained if trained[s]]
+    fig, axes = plt.subplots(1, len(sets), figsize=(5.5 * len(sets), 5), facecolor="white", squeeze=False)
+    for ax, s in zip(axes[0], sets):
+        types = sorted(trained[s])
+        x = range(len(types))
+        rows = [("base oracle", [base.get(s, {}).get(k, {}).get("kl_bits", float("nan")) for k in types], "#9aa5b1"),
+                ("no change", [trained[s][k].get("no_change_kl_bits", float("nan")) for k in types], "#e0a458"),
+                ("trained oracle", [trained[s][k]["kl_bits"] for k in types], "#2b6cb0")]
+        for j, (label, vals, color) in enumerate(rows):
+            ax.bar([i + (j - 1) * 0.27 for i in x], vals, width=0.27, color=color, label=label)
+        ax.set_yscale("log")
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(types, rotation=30)
+        n = min(trained[s][k]["questions"] for k in types)
+        ax.set_title(f"{s} (n >= {n} per type)")
+        ax.set_ylabel("KL(M_e || answer), bits")
+    axes[0][0].legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, facecolor="white")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", action="append", required=True)
     ap.add_argument("--figure", default="")
+    ap.add_argument("--kl-figure", default="", help="eval_kl bars of the first run (base, trained, no change)")
     args = ap.parse_args()
     runs = {}
     for spec in args.run:
@@ -91,6 +123,10 @@ def main():
         runs[name or Path(d).name] = read(Path(d))
     for name, r in runs.items():
         print(table(name, r))
+    if args.kl_figure:
+        name, r = next(iter(runs.items()))
+        kl_figure(name, r, args.kl_figure)
+        print("figure", args.kl_figure)
     if args.figure:
         figure(runs, args.figure)
         print("figure", args.figure)
