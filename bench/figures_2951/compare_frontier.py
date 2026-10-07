@@ -124,23 +124,41 @@ for p in points:
     print(f"{p['label']}: executed {p['executed']}, active {p['active']:.0f}, gap {p['gap']:.3f}, description {p['description_bits'] / 1e6:.2f}M bits")
 if len(sys.argv) > 1 and points:
     plt.rcParams.update({'font.size': 14})
-    fig, ax = plt.subplots(figsize=(11, 7), facecolor='white')
+    fig, ax = plt.subplots(figsize=(15, 7.5), facecolor='white')
     colors = ['#8172b2', '#4c72b0', '#55a868', '#c44e52', '#dd8452', '#937860', '#da8bc3']
-    for p, c in zip(points, colors * 3):
+    texts = []
+    for p in points:
+        attn = [f"+ {p['attention_bits'] / 1e6:.1f}M bits for M's attention it runs"] if p.get('attention_bits') else (["+ M's attention it runs (pricing pending)"] if p.get('runs_m_attention') else [])
+        bits = p.get('description_note') or f"{p['description_bits'] / 1e6:.1f}M bits"
+        texts.append(textwrap.wrap(p['label'], 44) + textwrap.wrap(bits, 44) + attn)
+    # Labels in one column right of the axes, each centred at its point's gap where room allows: a
+    # pass down from the highest point keeps each label below the one above it, a pass up from zero
+    # keeps the column above the axis; heights in text lines (about 40 to the axis' height).
+    top = max(p['gap'] for p in points) * 1.1
+    line = top / 40
+    order = sorted(range(len(points)), key=lambda i: -points[i]['gap'])
+    placed, below = {}, None
+    for i in order:
+        y = points[i]['gap'] if below is None else min(points[i]['gap'], below[0] - line * (below[1] + len(texts[i]) + 1) / 2)
+        placed[i], below = y, (y, len(texts[i]))
+    above = None
+    for i in reversed(order):
+        y = max(placed[i], line * len(texts[i]) / 2) if above is None else max(placed[i], above[0] + line * (above[1] + len(texts[i]) + 1) / 2)
+        placed[i], above = y, (y, len(texts[i]))
+    for i, (p, c) in enumerate(zip(points, colors * 3)):
         ax.scatter([p['executed']], [p['gap']], s=90, color=c)
         ax.scatter([p['active']], [p['gap']], s=90, facecolors='none', edgecolors=c)
         ax.plot([p['active'], p['executed']], [p['gap'], p['gap']], color=c, lw=1)
-        attn = f"\n+ {p['attention_bits'] / 1e6:.1f}M bits for M's attention it runs" if p.get('attention_bits') else ("\n+ M's attention it runs (pricing pending)" if p.get('runs_m_attention') else '')
-        bits = p.get('description_note') or f"{p['description_bits'] / 1e6:.1f}M bits"
-        ax.annotate('\n'.join(textwrap.wrap(p['label'], 34) + textwrap.wrap(bits, 34)) + attn, (p['executed'], p['gap']), textcoords='offset points', xytext=(8, 4), fontsize=10)
+        ax.annotate('\n'.join(texts[i]), (p['executed'], p['gap']), xytext=(6e5, placed[i]), textcoords='data', va='center', fontsize=10, color=c,
+                    arrowprops=dict(arrowstyle='-', lw=0.6, color=c))
     ax.set_xscale('log')
     ax.set_xlim(30, 5e5)
+    ax.set_ylim(0, max(top, max(placed[i] + line * len(texts[i]) / 2 for i in placed)))
     ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
     ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f'{v:,.0f}'))
     ax.set_xlabel('parts executed per token, rank-one units (filled); active (open)')
     ax.set_ylabel('held-out edit KL(M_e || P_e), bits/token')
-    ax.set_ylim(bottom=0)
     ax.spines[['top', 'right']].set_visible(False)
     fig.tight_layout()
-    fig.savefig(sys.argv[1], dpi=120, facecolor='white')
+    fig.savefig(sys.argv[1], dpi=120, facecolor='white', bbox_inches='tight')
     print('wrote', sys.argv[1])
