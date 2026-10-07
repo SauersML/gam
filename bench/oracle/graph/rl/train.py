@@ -449,6 +449,7 @@ def main():
     ap.add_argument("--eval-seed", type=int, default=1_000_003, help="the evaluation's experiment seed (training steps use their index)")
     ap.add_argument("--experiments", type=int, default=32, help="experiments per training score (fewer: cheaper, same expectation, more variance)")
     ap.add_argument("--eval-experiments", type=int, default=32, help="experiments per evaluation score")
+    ap.add_argument("--eval-behaviors", type=int, default=0, help="evaluate a fixed random subset of this many behaviors per set (0: all)")
     ap.add_argument("--uniform-seeds", type=int, default=0, help="training draws experiments from step mod M (the checker's uniform_seeds: M's outcomes cached after M steps); the evaluation never")
     ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the empty, full and search programs in evaluation")
     ap.add_argument("--seed", type=int, default=0)
@@ -480,6 +481,8 @@ def main():
     root = Path(args.behaviors)
     pool, heldout_prompts = split_prompts(behaviors(root, args.model, "train"), args.prompt_holdout, out / "behaviors")
     sets = {"heldout_behaviors": behaviors(root, args.model, "heldout"), "heldout_prompts": heldout_prompts}
+    if args.eval_behaviors:  # one fixed subset per set, the same at every evaluation
+        sets = {k: random.Random(args.seed).sample(v, min(args.eval_behaviors, len(v))) for k, v in sets.items()}
     adapter = out / "adapter"
     if args.mode == "eval":
         pol.save(adapter)
