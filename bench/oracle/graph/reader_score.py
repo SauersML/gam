@@ -240,11 +240,20 @@ def disjoint(keys: list, p: list[float]) -> np.ndarray:
     return np.array([q[k] / counts[k] for k in norm])
 
 
+# Experiment families whose intervention the reader's words cannot state: a random rank-one weight change
+# and a push along a random direction reach the reader as "a random change of size s", so two draws with
+# different outcomes give it the same input and no explanation can predict either (an irreducible error).
+UNDESCRIBED = {"rank_one", "site_push"}
+
+
 def kl_bits(p: np.ndarray, p_other: float, q: np.ndarray) -> float:
-    """KL(p || q) in bits over the K candidates and "other", q(other) = 1 - sum q; q floored at K 2^-24."""
+    """KL(p || q) in bits over the K candidates and "other", q(other) = 1 - sum q. Every one of the K + 1
+    probabilities is floored at K 2^-24 and the K + 1 are renormalized to sum to 1, so q is a distribution
+    and the KL is never negative."""
     floor = len(q) * FLOAT32_EPS
-    q = np.maximum(q, floor)
-    q_other = max(1.0 - float(q.sum()), floor)
+    full = np.maximum(np.append(q, 1.0 - float(q.sum())), floor)
+    full /= full.sum()
+    q, q_other = full[:-1], float(full[-1])
     keep = p > 0
     kl = float((p[keep] * (np.log(p[keep]) - np.log(q[keep]))).sum())
     if p_other > 0:
@@ -423,7 +432,9 @@ class Scorer:
 
     def score(self, programs: list[dict], items: list[dict], N: int = N_DEFAULT, baselines: bool = True) -> list[dict]:
         """Per program: reader_error_bits (N times the mean bits per item), and with baselines the empty
-        program's and the code-alone bits and english_saved_bits."""
+        program's and the code-alone bits and english_saved_bits. Items of experiments the reader cannot be
+        told (UNDESCRIBED: a random direction it never sees) are left out."""
+        items = [it for it in items if it.get("family") not in UNDESCRIBED]
         texts = [(p["source"] if p.get("valid", True) else "") for p in programs]
         extra = ([""] + [strip_english(t) for t in texts]) if baselines else []
         bits = self.bits(texts + extra, items)
