@@ -2161,21 +2161,25 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
                 let (from, to, route) = declared_edges[rng.random_range(0..declared_edges.len())];
                 Experiment::Cut { from, to, route, declared: true }
             }
-            _ => {
-                // An undeclared pair among embed, the nodes and the logits, in causal order.
-                let readers: Vec<Option<usize>> = (0..graph.blocks.len()).map(Some).chain([None]).collect();
-                let to = readers[rng.random_range(0..readers.len())];
-                let site = to.map_or(2 * layers, |r| graph.blocks[r].site());
-                let writers: Vec<Writer> = [Writer::Embed].into_iter().chain((0..graph.blocks.len()).filter(|&w| graph.blocks[w].site() < site).map(Writer::Unit)).collect();
-                let from = writers[rng.random_range(0..writers.len())];
-                let routes = to.map_or(&[Route::Input][..], |r| graph.blocks[r].routes());
-                let route = routes[rng.random_range(0..routes.len())];
-                let declared = declared_edges.contains(&(from, to, route));
-                Experiment::Cut { from, to, route, declared }
-            }
+            _ => cut_draw(graph, layers, rng),
         });
     }
     out
+}
+
+/// A cut of a pair among `embed`, the program's nodes and the logits, in causal order, uniform
+/// over readers, then writers before them, then routes (an undeclared pair, or a declared edge
+/// when the draw lands on one).
+fn cut_draw(graph: &Graph, layers: usize, rng: &mut StdRng) -> Experiment {
+    let readers: Vec<Option<usize>> = (0..graph.blocks.len()).map(Some).chain([None]).collect();
+    let to = readers[rng.random_range(0..readers.len())];
+    let site = to.map_or(2 * layers, |r| graph.blocks[r].site());
+    let writers: Vec<Writer> = [Writer::Embed].into_iter().chain((0..graph.blocks.len()).filter(|&w| graph.blocks[w].site() < site).map(Writer::Unit)).collect();
+    let from = writers[rng.random_range(0..writers.len())];
+    let routes = to.map_or(&[Route::Input][..], |r| graph.blocks[r].routes());
+    let route = routes[rng.random_range(0..routes.len())];
+    let declared = graph.edges.contains(&(from, to, route));
+    Experiment::Cut { from, to, route, declared }
 }
 
 impl Weights {
@@ -3329,6 +3333,67 @@ impl Checker {
                 let key = self.model_key(graph, &e);
                 runs.push((i, e, key));
                 drawn[i] += 1;
+            }
+        }
+        // An undeclared cut takes the strongest of three drawn undeclared cuts (the drawn one and two
+        // more): strength is M's mean KL(M ‖ M_cut) at the targets, measured (cached, in parallel),
+        // so the aimed half tests the omitted connections that carry the most.
+        let mut contest: Vec<(usize, Vec<(Experiment, String)>)> = Vec::new();
+        let first: Vec<usize> = drawn.iter().scan(0, |at, d| { let f = *at; *at += d; Some(f) }).collect();
+        for (r, (i, e, key)) in runs.iter().enumerate() {
+            if let Experiment::Cut { declared: false, .. } = e {
+                let graph = &parsed[*i].0;
+                // Seeded by the run's place among its program's draws, so a program draws the same
+                // entrants alone or in a batch.
+                let k = (r - first[*i]) as u64;
+                let mut rng = StdRng::seed_from_u64(seed ^ 0xC0_7C07 ^ k.wrapping_mul(0x9E37_79B9));
+                let mut entrants = vec![(e.clone(), key.clone())];
+                for _ in 0..2 {
+                    let c = cut_draw(graph, self.weights.layers.len(), &mut rng);
+                    if matches!(c, Experiment::Cut { declared: false, .. }) && !entrants.iter().any(|(x, _)| *x == c) {
+                        let k = self.model_key(graph, &c);
+                        entrants.push((c, k));
+                    }
+                }
+                if entrants.len() > 1 {
+                    contest.push((r, entrants));
+                }
+            }
+        }
+        if !contest.is_empty() {
+            let clean_m = self.model_outcome(&Graph::empty(), &Experiment::Clean)?;
+            let mut wanted: Vec<(usize, Experiment, String)> = Vec::new();
+            for (r, entrants) in &contest {
+                for (e, k) in entrants {
+                    if !self.cache.contains_key(k) && !wanted.iter().any(|w| w.2 == *k) {
+                        wanted.push((runs[*r].0, e.clone(), k.clone()));
+                    }
+                }
+            }
+            let this = &*self;
+            let made: Vec<(String, Arc<Array2<f64>>)> = wanted
+                .par_iter()
+                .map(|(i, e, k)| -> Result<(String, Arc<Array2<f64>>), String> {
+                    if let Some(m) = this.disk_get(k) {
+                        return Ok((k.clone(), Arc::new(m)));
+                    }
+                    let m = this.run(&models[*i], e)?;
+                    this.disk_put(k, &m);
+                    Ok((k.clone(), Arc::new(m)))
+                })
+                .collect::<Result<_, String>>()?;
+            for (k, m) in made {
+                self.keep(k, m);
+            }
+            for (r, entrants) in contest {
+                let strength = |k: &String| self.cache.get(k).map_or(f64::NEG_INFINITY, |m| {
+                    let kl = kl_bits(&clean_m, m);
+                    kl.iter().sum::<f64>() / kl.len().max(1) as f64
+                });
+                if let Some((e, k)) = entrants.into_iter().max_by(|a, b| strength(&a.1).total_cmp(&strength(&b.1))) {
+                    runs[r].1 = e;
+                    runs[r].2 = k;
+                }
             }
         }
         // Runs grouped by the weight edit they apply (none first).
