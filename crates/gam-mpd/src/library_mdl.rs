@@ -2023,7 +2023,9 @@ impl GatedStage {
             }
             let assign = operator_named(flat, &format!("{prefix}.assign"));
             let component_gate = match assign {
-                Some(a) => flat.nodes.iter().position(|n| matches!(n, Node::Transposed { input, operator } if *input == gate && *operator == a)).ok_or_else(|| format!("{prefix}: no gate through the assignment"))?,
+                // The first node through the assignment: the gates' pre-activations (its own
+                // stage's, or with the followed stage's components after them) to each component.
+                Some(a) => flat.nodes.iter().position(|n| matches!(n, Node::Transposed { operator, .. } if *operator == a)).ok_or_else(|| format!("{prefix}: no gate through the assignment"))?,
                 None => gate,
             };
             stages.push(Self { input, threshold, direction, slices, component_gate, assign });
@@ -2494,6 +2496,9 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
         let Some(mlp) = mlp else {
             // Gated components (`library_vpd`): each counts its rank where its gate is on, on the
             // device (`gated_expected`).
+            // The previous stage's per-component pre-activations and variances, which a stage whose
+            // components follow its components reads.
+            let mut followed: Option<(Tensor, Tensor)> = None;
             for stage in &scorer.stages[l] {
                 let rank = stage.ranks(active);
                 let j = scorer.at(stage.threshold)?;
@@ -2516,7 +2521,9 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
                     Some(op) => Some(scorer.assignments.iter().find(|a| a.operator == op).ok_or("a shared stage without its assignment")?.values(relaxation)),
                     None => None,
                 };
-                let (expected, gate_terms, assigned) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1), &rank, assign.as_ref())?;
+                let extra = followed.as_ref().map(|(m, s2)| (m, s2));
+                let (expected, gate_terms, assigned, components) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1), &rank, (assign.as_ref(), extra))?;
+                followed = Some(components);
                 if let (Some(op), Some(g)) = (stage.assign, assigned) {
                     assignment_terms.push((op, g * per));
                 }
@@ -2588,6 +2595,11 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
 /// norms its input holds) and variances `s²`, and each component takes `m A` and `s² (A ⊙ A)`,
 /// as its Gated node does; the gates' derivatives gather the components' through `A`, and the
 /// count's derivative in `A` itself is returned (summed over the rows; none for an unshared stage).
+/// A stage whose components may follow the previous stage's (`library_vpd`'s down components
+/// following c_fc components) has an assignment whose rows past its own gates are those
+/// components, read from `extra` (their per-component pre-activations and variances, the fourth
+/// return of the previous stage's call); the followed stage's thresholds take no pull through
+/// its followers here.
 fn gated_expected(
     d: &Device,
     arithmetic: gam_gpu::tensor::Arithmetic,
@@ -2595,24 +2607,35 @@ fn gated_expected(
     gate: Option<(&Tensor, &Tensor)>,
     (bias_mean, bias_variance): (&[f64], &[f64]),
     rank: &[f64],
-    assign: Option<&Array2<f64>>,
-) -> Result<(crate::library_complexity::Expected, Option<(Tensor, Tensor)>, Option<Array2<f64>>), String> {
+    (assign, extra): (Option<&Array2<f64>>, Option<(&Tensor, &Tensor)>),
+) -> Result<(crate::library_complexity::Expected, Option<(Tensor, Tensor)>, Option<Array2<f64>>, (Tensor, Tensor)), String> {
     use gam_gpu::tensor::GateFunction;
     let rows = input.rows();
     let parts = rank.len();
     let gates = bias_mean.len();
     let row = |values: &[f64]| d.upload_vec(1, values.len(), values.to_vec()).map_err(error);
-    // The assignment and its entries' squares, on the device.
-    let shared = match assign {
-        Some(a) => {
-            if a.dim() != (gates, parts) {
-                return Err(format!("library budget: an assignment of {:?} for {gates} gates and {parts} components", a.dim()));
+    // The assignment and its entries' squares, on the device: its rows over the stage's own gates
+    // (`shared`), and in a stage whose components may follow the previous stage's components
+    // (cross-stage sharing: the assignment's rows past the stage's gates) those rows with the
+    // previous stage's per-component pre-activations and variances `extra` (`cross`).
+    let upload = |a: ndarray::ArrayView2<f64>| -> Result<(Tensor, Tensor), String> { Ok((d.upload(a).map_err(error)?, d.upload(a.mapv(|v| v * v).view()).map_err(error)?)) };
+    let (shared, cross) = match assign {
+        Some(a) if a.dim() == (gates, parts) => (Some(upload(a.view())?), None),
+        Some(a) if a.ncols() == parts && a.nrows() > gates => {
+            let (m_extra, s2_extra) = extra.ok_or("library budget: a cross-stage assignment without the previous stage's components")?;
+            if m_extra.cols() != a.nrows() - gates {
+                return Err(format!("library budget: {} rows past the gates for {} components of the previous stage", a.nrows() - gates, m_extra.cols()));
             }
-            Some((d.upload(a.view()).map_err(error)?, d.upload(a.mapv(|v| v * v).view()).map_err(error)?))
+            let (bottom, bottom2) = upload(a.slice(ndarray::s![gates.., ..]))?;
+            (Some(upload(a.slice(ndarray::s![..gates, ..]))?), Some((bottom, bottom2, m_extra, s2_extra)))
         }
+        Some(a) => return Err(format!("library budget: an assignment of {:?} for {gates} gates and {parts} components", a.dim())),
         None if gates != parts => return Err(format!("library budget: {gates} thresholds for {parts} components")),
-        None => None,
+        None => (None, None),
     };
+    // An own gate pools its members' read norms through the assignment only where the stage's
+    // components share the stage's own gates.
+    let pooled = shared.is_some() && cross.is_none();
     // m = x μ_gᵀ + μ_c and s² = x² σ²_gᵀ + σ²_c (a direction gate), or m = ‖V_bᵀx‖ + μ_c and
     // s² = σ²_c (an own gate; through the assignment, m = n Aᵀ + μ_c), per gate.
     let squares = match gate {
@@ -2638,12 +2661,12 @@ fn gated_expected(
                 return Err(format!("library budget: {} read norms for {parts} components", input.cols()));
             }
             let m = match &shared {
-                Some((a, _)) => {
+                Some((a, _)) if pooled => {
                     let mut m = d.empty(rows, gates).map_err(error)?;
                     d.gemm(&mut m, 1.0, input, Op::N, a, Op::T, 0.0, arithmetic).map_err(error)?;
                     m
                 }
-                None => d.copy(input).map_err(error)?,
+                _ => d.copy(input).map_err(error)?,
             };
             (m, d.zeros(rows, gates).map_err(error)?)
         }
@@ -2657,6 +2680,10 @@ fn gated_expected(
             let (mut mb, mut s2b) = (d.empty(rows, parts).map_err(error)?, d.empty(rows, parts).map_err(error)?);
             d.gemm(&mut mb, 1.0, &m_gate, Op::N, a, Op::N, 0.0, arithmetic).map_err(error)?;
             d.gemm(&mut s2b, 1.0, &s2_gate, Op::N, a2, Op::N, 0.0, arithmetic).map_err(error)?;
+            if let Some((bottom, bottom2, m_extra, s2_extra)) = &cross {
+                d.gemm(&mut mb, 1.0, m_extra, Op::N, bottom, Op::N, 1.0, arithmetic).map_err(error)?;
+                d.gemm(&mut s2b, 1.0, s2_extra, Op::N, bottom2, Op::N, 1.0, arithmetic).map_err(error)?;
+            }
             (mb, s2b)
         }
         None => (d.copy(&m_gate).map_err(error)?, d.copy(&s2_gate).map_err(error)?),
@@ -2692,8 +2719,17 @@ fn gated_expected(
             let (mut direct, mut varied) = (d.empty(gates, parts).map_err(error)?, d.empty(gates, parts).map_err(error)?);
             d.gemm(&mut direct, 1.0, &m_gate, Op::T, &slope, Op::N, 0.0, arithmetic).map_err(error)?;
             d.gemm(&mut varied, 1.0, &s2_gate, Op::T, &spread, Op::N, 0.0, arithmetic).map_err(error)?;
-            let mut total = d.download(&direct).map_err(error)? + d.download(&varied).map_err(error)? * host;
-            if gate.is_none() {
+            let mut total = d.download(&direct).map_err(error)? + d.download(&varied).map_err(error)? * &host.slice(ndarray::s![..gates, ..]);
+            if let Some((_, _, m_extra, s2_extra)) = &cross {
+                // The rows past the gates: the previous stage's components followed.
+                let followed = host.nrows() - gates;
+                let (mut direct, mut varied) = (d.empty(followed, parts).map_err(error)?, d.empty(followed, parts).map_err(error)?);
+                d.gemm(&mut direct, 1.0, m_extra, Op::T, &slope, Op::N, 0.0, arithmetic).map_err(error)?;
+                d.gemm(&mut varied, 1.0, s2_extra, Op::T, &spread, Op::N, 0.0, arithmetic).map_err(error)?;
+                let bottom = d.download(&direct).map_err(error)? + d.download(&varied).map_err(error)? * &host.slice(ndarray::s![gates.., ..]);
+                total = ndarray::concatenate(ndarray::Axis(0), &[total.view(), bottom.view()]).map_err(error)?;
+            }
+            if pooled && gate.is_none() {
                 let mut pooled = d.empty(gates, parts).map_err(error)?;
                 d.gemm(&mut pooled, 1.0, &slope_gate, Op::T, input, Op::N, 0.0, arithmetic).map_err(error)?;
                 total += &d.download(&pooled).map_err(error)?;
@@ -2722,7 +2758,7 @@ fn gated_expected(
         None => None,
     };
     let expected = crate::library_complexity::Expected { count, rows, mean: Array2::zeros((gates, 0)), variance: Array2::zeros((gates, 0)), bias_mean, bias_variance };
-    Ok((expected, gate_terms, assigned))
+    Ok((expected, gate_terms, assigned, (m, s2)))
 }
 
 /// The test of the posterior's pending move (`DevicePosterior::pending_divergence`) on this step's

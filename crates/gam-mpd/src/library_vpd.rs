@@ -222,10 +222,11 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
         let stacked = grouped(&widths)?;
         let r_a = read_rows.len();
         let v_a = Array2::from_shape_fn((r_a, d), |(r, j)| factors[read_rows[r].0].v[[j, read_rows[r].1]]);
-        let gate_ops = |prefix: &str, comps: &[usize], cols: &Interface| -> Result<Vec<Operator>, String> {
+        // `share`: the components share the stage's gates (an assignment, own gates on the squared
+        // norm of their members' reads).
+        let gate_ops = |prefix: &str, comps: &[usize], cols: &Interface, share: bool| -> Result<Vec<Operator>, String> {
             let count = comps.len();
             let mut ops = Vec::new();
-            let share = is_shared(comps);
             match direction {
                 false if share => {
                     // Shared own gates read the squared norm of their components' reads: gate m's
@@ -323,7 +324,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
             let shared = |artifact: &Artifact, part: &str| index_of(&artifact.program, &format!("{name}.attn.{part}"));
             let (read_op, gate_a, gate_b, soft) = if h == 0 {
                 operators.push(dense(&format!("{name}.attn.read"), stacked.clone(), x_interface.clone(), v_a.clone())?);
-                let mut gates = gate_ops(&format!("{name}.attn"), &a_comps, &x_interface)?;
+                let mut gates = gate_ops(&format!("{name}.attn"), &a_comps, &x_interface, attn_shared)?;
                 operators.append(&mut gates);
                 for (s, picked) in &selections {
                     if !picked.is_empty() {
@@ -431,7 +432,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                 if is_shared(&o_own) {
                     return Err(error(format!("layer {l}: gate sharing at the o stage is not built (only at the attention's and the MLP's inputs)")));
                 }
-                let mut gates = gate_ops(&format!("{name}.o"), &o_own, &concat)?;
+                let mut gates = gate_ops(&format!("{name}.o"), &o_own, &concat, false)?;
                 let first = base + operators.len();
                 operators.append(&mut gates);
                 if direction {
@@ -496,7 +497,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
             dense(&format!("{name}.mlp.dn_read"), dn_stacked.clone(), up_rows.clone(), Array2::from_shape_fn((dn_rows.len(), hidden), |(r, j)| factors[dn].v[[j, dn_rows[r]]]))?,
             dense(&format!("{name}.mlp.dn_write"), out_rows.clone(), dn_stacked.clone(), Array2::from_shape_fn((out_rows.width(), dn_rows.len()), |(r, c)| factors[dn].u[[dn_rows[c], r]]))?,
         ];
-        let mut gates = gate_ops(&format!("{name}.mlp.fc"), &f_comps, &h2_interface)?;
+        let mut gates = gate_ops(&format!("{name}.mlp.fc"), &f_comps, &h2_interface, is_shared(&f_comps))?;
         operators.append(&mut gates);
         let mut nodes = vec![Node::Param { index: 0 }];
         let fc_assign = is_shared(&f_comps).then(|| if direction { base + 7 } else { base + 4 });
@@ -525,10 +526,11 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
             let own_first = carried.len();
             operators.push(dense(&format!("{name}.mlp.dn_select_own"), units(d_own.len())?, units(dn_carriers.len())?, selection(&(own_first..dn_carriers.len()).collect::<Vec<_>>(), dn_carriers.len()))?);
             let select = base + operators.len() - 1;
-            if is_shared(&d_own) {
-                return Err(error(format!("layer {l}: gate sharing at the down stage is not built (only at the attention's and the MLP's inputs)")));
-            }
-            let mut gates = gate_ops(&format!("{name}.mlp.dn"), &d_own, &up_rows)?;
+            // Down components with candidates follow a c_fc component's gate or keep their own
+            // (cross-stage sharing: parts spanning the read and the write maps, as descent's share
+            // arm, d6ad2537cb); their own gates stay unshared among themselves.
+            let follows = is_shared(&d_own);
+            let mut gates = gate_ops(&format!("{name}.mlp.dn"), &d_own, &up_rows, false)?;
             let first = base + operators.len();
             operators.append(&mut gates);
             if direction {
@@ -538,9 +540,47 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                 nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, select)], bias: None });
                 nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, first)], bias: Some(first + 1) });
             }
-            gate_parts.push(nodes.len() - 1);
+            let z_own = nodes.len() - 1;
             nodes.push(Node::Constant { operator: first + 2 });
-            soft_parts.push(nodes.len() - 1);
+            let s_own = nodes.len() - 1;
+            if follows {
+                // The assignment over the down components' own gates, then the c_fc components'
+                // (`{name}.mlp.dn.assign`, (D + F) × D, its own gate at the start); each down
+                // component takes z_b = Σ_m A_mb z_m over both, and its width the same way.
+                let (count, fcount) = (d_own.len(), f_comps.len());
+                let mut start = Array2::zeros((count + fcount, count));
+                for b in 0..count {
+                    start[[b, b]] = 1.0;
+                }
+                operators.push(dense(&format!("{name}.mlp.dn.assign"), concat_interface(&[units(count)?, units(fcount)?])?, units(count)?, start)?);
+                let assign = base + operators.len() - 1;
+                nodes.push(Node::Concat { parts: vec![z_own, z_f] });
+                nodes.push(Node::Concat { parts: vec![s_own, s_f] });
+                let (all_z, all_s) = (nodes.len() - 2, nodes.len() - 1);
+                nodes.push(Node::Transposed { input: all_z, operator: assign });
+                gate_parts.push(nodes.len() - 1);
+                nodes.push(Node::Transposed { input: all_s, operator: assign });
+                soft_parts.push(nodes.len() - 1);
+                let position: BTreeMap<usize, usize> = f_comps.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+                let candidates = d_own
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &b)| {
+                        let mut list = vec![i];
+                        for c in &components[b].candidates {
+                            let at = count + *position.get(c).ok_or_else(|| error(format!("down component {b}: candidate {c} is not a c_fc component of its layer")))?;
+                            if !list.contains(&at) {
+                                list.push(at);
+                            }
+                        }
+                        Ok(list)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                shares.push(Share { operator: format!("{name}.mlp.dn.assign"), candidates });
+            } else {
+                gate_parts.push(z_own);
+                soft_parts.push(s_own);
+            }
         }
         let (z, s) = joined(&mut nodes, gate_parts, soft_parts);
         let a_dn = late.unwrap_or_else(|| {
@@ -960,9 +1000,14 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
             spans.push(first..first + w);
             first += w;
         }
+        // The stage's own gates; a component assigned past them follows a component of the previous
+        // stage (cross-stage sharing), which the caller fills in. Own gates pool their members'
+        // reads only where the assignment is over the stage's own gates alone.
+        let own = threshold.nrows();
+        let pooled = assign.as_ref().is_some_and(|a| a.nrows() == own);
         let z: Vec<Array1<f64>> = match (&directions, &assign) {
-            (Some(g), _) => (0..threshold.nrows()).map(|m| x.dot(&g.row(m)) + threshold[[m, 0]]).collect(),
-            (None, Some(assign)) => {
+            (Some(g), _) => (0..own).map(|m| x.dot(&g.row(m)) + threshold[[m, 0]]).collect(),
+            (None, Some(assign)) if pooled => {
                 let squares: Vec<Array1<f64>> = spans.iter().map(|r| a.slice(s![.., r.clone()]).map_axis(Axis(1), |row| row.dot(&row))).collect();
                 (0..threshold.nrows())
                     .map(|m| {
@@ -974,10 +1019,13 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
                     })
                     .collect()
             }
-            (None, None) => spans.iter().zip(threshold.column(0)).map(|(r, t)| a.slice(s![.., r.clone()]).map_axis(Axis(1), |row| row.dot(&row).sqrt()) + *t).collect(),
+            (None, _) => spans.iter().zip(threshold.column(0)).map(|(r, t)| a.slice(s![.., r.clone()]).map_axis(Axis(1), |row| row.dot(&row).sqrt()) + *t).collect(),
         };
-        let tau = |m: usize| if assign.is_some() && directions.is_none() { -threshold[[m, 0]].signum() * threshold[[m, 0]].abs().sqrt() } else { -threshold[[m, 0]] };
-        let out = gate_of.iter().map(|&m| (z[m].iter().map(|v| *v > 0.0).collect(), tau(m), directions.as_ref().map(|g| g.row(m).to_vec()))).collect();
+        let tau = |m: usize| if pooled && directions.is_none() { -threshold[[m, 0]].signum() * threshold[[m, 0]].abs().sqrt() } else { -threshold[[m, 0]] };
+        let out = gate_of
+            .iter()
+            .map(|&m| if m < own { (z[m].iter().map(|v| *v > 0.0).collect(), tau(m), directions.as_ref().map(|g| g.row(m).to_vec())) } else { (vec![false; x.nrows()], f64::NAN, None) })
+            .collect();
         let mut reports = Vec::new();
         for (m, zm) in z.iter().enumerate() {
             let members: Vec<usize> = (0..count).filter(|b| gate_of[*b] == m).collect();
@@ -1128,8 +1176,25 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
             }
             let (stage_gates, reports) = gates(&act, &dn_read.select(Axis(0), &own_rows), &own_widths, &format!("{name}.mlp.dn"))?;
             reported.extend(reports.into_iter().map(|(members, on, k)| (format!("{name}.mlp.dn"), members.iter().map(|i| d_own[*i]).collect(), on, k)));
+            // A down component assigned past the down gates follows a c_fc component: its gate,
+            // and its part's (the c_fc component's gate's) membership.
+            let follows: Vec<Option<usize>> = match index_of(&artifact.program, &format!("{name}.mlp.dn.assign")) {
+                Ok(op) => {
+                    let a = artifact.program.operators[op].matrix();
+                    (0..d_own.len()).map(|b| a.column(b).iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map(|(m, _)| m).filter(|m| *m >= d_own.len()).map(|m| m - d_own.len())).collect()
+                }
+                Err(_) => vec![None; d_own.len()],
+            };
             for (i, g) in stage_gates.into_iter().enumerate() {
-                set_gate(&mut parts[d_own[i]], export(dn), g);
+                match follows[i] {
+                    Some(c) => {
+                        set_gate(&mut parts[d_own[i]], export(fc), f_gates[c].clone());
+                        if let Some(part) = reported.iter_mut().find(|(stage, members, _, _)| *stage == format!("{name}.mlp.fc") && members.contains(&f_comps[c])) {
+                            part.1.push(d_own[i]);
+                        }
+                    }
+                    None => set_gate(&mut parts[d_own[i]], export(dn), g),
+                }
             }
         }
         for (i, g) in f_gates.into_iter().enumerate() {

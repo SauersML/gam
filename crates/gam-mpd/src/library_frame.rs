@@ -311,7 +311,8 @@ fn pursuit(x: ndarray::ArrayView1<f64>, atoms: &Array2<f64>, bits_per_atom: f64)
 }
 
 /// The gates a component of the shared arm may move to, its own first (library_vpd's gate sharing;
-/// as descent's share arm, d6ad2537cb).
+/// as descent's share arm, d6ad2537cb): a component of the attention's or the MLP's input its
+/// stage's, a down component the MLP's input components'.
 const CANDIDATES: usize = 8;
 
 /// Per component of a stage (the columns of `magnitudes`, its read's magnitude on each fitting row),
@@ -319,14 +320,7 @@ const CANDIDATES: usize = 8;
 /// read magnitudes are most correlated with its own over the rows (the components likeliest to fire
 /// together), as indices from `first`, the stage's first component in the arm.
 fn candidates(magnitudes: &Array2<f64>, first: usize) -> Vec<Vec<usize>> {
-    let n = magnitudes.nrows().max(1) as f64;
-    let mut z = magnitudes.clone();
-    for mut column in z.columns_mut() {
-        let mean = column.sum() / n;
-        column.mapv_inplace(|v| v - mean);
-        let sd = (column.dot(&column) / n).sqrt();
-        column.mapv_inplace(|v| if sd > 0.0 { v / sd } else { 0.0 });
-    }
+    let z = standardized(magnitudes);
     let correlation = fast_ata(&z);
     (0..z.ncols())
         .map(|b| {
@@ -336,6 +330,37 @@ fn candidates(magnitudes: &Array2<f64>, first: usize) -> Vec<Vec<usize>> {
             others.into_iter().map(|j| first + j).collect()
         })
         .collect()
+}
+
+/// Per own-gated down component (the columns of `down`, its read's magnitude on each fitting
+/// row), its candidates among the MLP's input components (the columns of `up`, from `first`): the
+/// `CANDIDATES − 1` whose read magnitudes are most correlated with its own, whose gates it may
+/// follow (library_vpd's cross-stage sharing, a part spanning c_fc and down slices).
+fn following(down: &Array2<f64>, up: &Array2<f64>, first: usize) -> Vec<Vec<usize>> {
+    let (zd, zu) = (standardized(down), standardized(up));
+    let correlation = zd.t().dot(&zu);
+    (0..zd.ncols())
+        .map(|b| {
+            let mut others: Vec<usize> = (0..zu.ncols()).collect();
+            others.sort_by(|i, j| correlation[[b, *j]].total_cmp(&correlation[[b, *i]]).then(i.cmp(j)));
+            others.truncate(CANDIDATES - 1);
+            others.into_iter().map(|j| first + j).collect()
+        })
+        .collect()
+}
+
+/// `magnitudes` with each column centred and scaled to unit variance over the rows (zero where a
+/// column is constant).
+fn standardized(magnitudes: &Array2<f64>) -> Array2<f64> {
+    let n = magnitudes.nrows().max(1) as f64;
+    let mut z = magnitudes.clone();
+    for mut column in z.columns_mut() {
+        let mean = column.sum() / n;
+        column.mapv_inplace(|v| v - mean);
+        let sd = (column.dot(&column) / n).sqrt();
+        column.mapv_inplace(|v| if sd > 0.0 { v / sd } else { 0.0 });
+    }
+    z
 }
 
 /// The frame of `kind` for a space of `rows` and its dual: the sparse dual for a sparse frame, the
@@ -434,8 +459,8 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
         std::fs::create_dir_all(&out).map_err(error)?;
         let (mut sites, mut files) = (Vec::new(), serde_json::Map::new());
         let (mut own, mut direction) = (Vec::new(), Vec::new());
-        // The shared arm's candidates: per shareable stage (the attention's input, the MLP's
-        // input) its components' candidate gates, by their index in `own`.
+        // The shared arm's candidates: per shareable stage (the attention's input, the MLP's input,
+        // and the down atoms following the MLP's input) its components' candidates, by index in `own`.
         let mut shared: Vec<(usize, Vec<usize>)> = Vec::new();
         for (l, layer) in layers.iter().enumerate() {
             let site = |k: usize| KINDS.len() * l + k;
@@ -536,7 +561,11 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
             if let Some((ups, downs, Some((up_dual, down_dual)))) = &mlp {
                 let hidden = value(layer.active)?;
                 let first = own.len();
-                shared.extend(candidates(&h2.dot(&up_dual.t()).mapv(f64::abs), first).into_iter().enumerate().map(|(i, c)| (first + i, c)));
+                let up_magnitudes = h2.dot(&up_dual.t()).mapv(f64::abs);
+                shared.extend(candidates(&up_magnitudes, first).into_iter().enumerate().map(|(i, c)| (first + i, c)));
+                // The down atoms, after the c_fc atoms: each may follow a c_fc atom's gate.
+                let first_down = first + *ups;
+                shared.extend(following(&hidden.dot(&down_dual.t()).mapv(f64::abs), &up_magnitudes, first).into_iter().enumerate().map(|(i, c)| (first_down + i, c)));
                 for i in 0..*ups {
                     own.push(component(json!({"own": [site(4), i]}), own_width(&h2, up_dual.row(i), 1.0), &[[site(4), i]]));
                     direction.push(component(direction_read(&h2, up_dual.row(i), site(4)), 1.0, &[[site(4), i]]));
@@ -566,8 +595,8 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
         }
         let record = json!({"config": {"sites": sites, "frame": name, "redundancy": REDUNDANCY, "seed": seed}, "files": files});
         std::fs::write(out.join("export.json"), record.to_string()).map_err(error)?;
-        // The shared arm: the own arm with candidates at the stages where components can share
-        // gates (library_vpd builds those stages shared; the o and down stages keep own gates).
+        // The shared arm: the own arm with candidates where components can share gates (library_vpd
+        // builds those stages shared; the o stage keeps own gates).
         let mut own_shared = own.clone();
         for (b, c) in shared {
             own_shared[b]["candidates"] = json!(c);
