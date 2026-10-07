@@ -116,10 +116,11 @@ X = site_inputs(torch.tensor(tok[0:16, :512].astype(np.int64), device=dev))
 vpdlike = start in ('vpd', 'vpdgroup')
 # Starts: svd, vpd, vpdgroup, neuron (the privileged axis: each MLP neuron's c_fc row and down_proj
 # column one exact part under one gate on its own pre-activation).
-if vpdlike and str(VPD_DIR).endswith('.pth'):
+# VPD's slices are read for the VPD starts' MLP maps and for the heads (DESCENT_SITES=all, any start).
+if (vpdlike or attn) and str(VPD_DIR).endswith('.pth'):
     raw = torch.load(str(VPD_DIR), map_location='cpu', weights_only=True, mmap=True)
     load = lambda k: raw['_components.' + k.rsplit('.', 1)[0].replace('.', '-') + '.' + k.rsplit('.', 1)[1]].float().to(dev)
-elif vpdlike:
+elif vpdlike or attn:
     shapes = {k: v['shape'] for k, v in json.load(open(VPD_DIR / 'export.json'))['files'].items()}
     load = lambda k: torch.tensor(np.fromfile(VPD_DIR / f'{k}.f64', dtype='<f8').reshape(shapes[k]), dtype=torch.float32, device=dev)
 def frame(F, W):
