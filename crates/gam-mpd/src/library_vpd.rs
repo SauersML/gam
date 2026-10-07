@@ -377,6 +377,15 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
         let up_rows = node_interface(pre)?;
         let h2 = layer.normed;
         let h2_interface = node_interface(h2)?;
+        if f_comps.is_empty() && d_own.is_empty() {
+            // No component in the MLP (an attention-only model's zero MLP): the block adds zero.
+            let out_rows = node_interface(layer.mlp)?;
+            let zero = dense(&format!("{name}.mlp.zero"), out_rows.clone(), Interface::constant(), Array2::zeros((out_rows.width(), 1)))?;
+            let base = artifact.program.operators.len();
+            let rule = Rule { name: format!("{name}.mlp"), inputs: vec![h2_interface.clone()], output: 1, nodes: vec![Node::Param { index: 0 }, Node::Constant { operator: base }] };
+            artifact = artifact.replace_block(&format!("{name}.mlp"), Callee::New(rule), vec![Argument::Native(h2)], layer.mlp, vec![zero])?;
+            continue;
+        }
         let fc_rows: Vec<usize> = f_comps.iter().flat_map(|&b| slices_on(b, fc)).collect();
         let fc_widths: Vec<usize> = f_comps.iter().map(|&b| slices_on(b, fc).len()).collect();
         if fc_widths.iter().any(|w| *w == 0) || f_comps.is_empty() {
@@ -535,7 +544,11 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool) -> Resu
             }
         }
         layer.components.push(thresholds);
-        // The MLP: per carrier of c_fc and down slices, its groups.
+        // The MLP: per carrier of c_fc and down slices, its groups (none for an MLP with no
+        // component, which adds zero).
+        if named(&format!("{name}.mlp.zero")).is_ok() {
+            continue;
+        }
         let (fc_read, fc_write, dn_read, dn_write) = (named(&format!("{name}.mlp.fc_read"))?, named(&format!("{name}.mlp.fc_write"))?, named(&format!("{name}.mlp.dn_read"))?, named(&format!("{name}.mlp.dn_write"))?);
         trainable.extend([fc_read, fc_write, dn_read, dn_write]);
         let mut r = 0;
@@ -645,6 +658,10 @@ pub fn uses(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact
             }
         }
         let body = rule(&format!("{name}.mlp"))?;
+        // An MLP with no component adds zero: no slice of c_fc or down is P's.
+        if !body.nodes.iter().any(|n| matches!(n, Node::Pointwise { .. })) {
+            continue;
+        }
         let Node::Pointwise { input: pre, .. } = native.nodes[layer.active] else { return Err(error(format!("layer {l}: the MLP activation is not one pointwise law"))) };
         let fc = map_of(pre, layer.normed)?;
         out.push(owner(body, fc, 0..fc.cols.width(), "gate", (0, applying(body, &format!("{name}.mlp.fc_write"))?)));

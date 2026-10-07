@@ -1832,7 +1832,7 @@ impl Mlp {
     /// None for a layer whose MLP is gated components with no one gate map (`library_vpd`).
     fn of(flat: &OperatorProgram, l: usize) -> Result<Option<Self>, String> {
         let name = format!("library.l{l}.mlp");
-        if operator_named(flat, &format!("{name}.gate")).is_none() && operator_named(flat, &format!("{name}.fc_read")).is_some() {
+        if operator_named(flat, &format!("{name}.gate")).is_none() && operator_named(flat, &format!("library.l{l}.attn.read")).is_some() {
             return Ok(None);
         }
         let (gate, input) = Map::of(flat, &format!("{name}.gate"))?;
@@ -1927,12 +1927,15 @@ impl GatedStage {
         if o.len() > carried {
             stage(&format!("{name}.o"), o[carried..].to_vec())?;
         }
-        let mut up = blocks(index_of(program, &format!("{name}.mlp.fc_read"))?)?;
-        let down = blocks(index_of(program, &format!("{name}.mlp.dn_read"))?)?;
-        let carried = carry(&mut up, &format!("{name}.mlp.dn_select_gate"), &down)?;
-        stage(&format!("{name}.mlp.fc"), up)?;
-        if down.len() > carried {
-            stage(&format!("{name}.mlp.dn"), down[carried..].to_vec())?;
+        // An MLP with no component (`{name}.mlp.zero`) has no stage.
+        if let Some(fc_read) = operator_named(program, &format!("{name}.mlp.fc_read")) {
+            let mut up = blocks(fc_read)?;
+            let down = blocks(index_of(program, &format!("{name}.mlp.dn_read"))?)?;
+            let carried = carry(&mut up, &format!("{name}.mlp.dn_select_gate"), &down)?;
+            stage(&format!("{name}.mlp.fc"), up)?;
+            if down.len() > carried {
+                stage(&format!("{name}.mlp.dn"), down[carried..].to_vec())?;
+            }
         }
         Ok(stages)
     }
