@@ -430,11 +430,11 @@ impl ResidentHead {
         if !matches!(arithmetic, Arithmetic::Bf16) || self.embedding.storage() != Storage::F32 {
             return Ok(&self.embedding);
         }
-        if self.half.get().is_none() {
-            let copy = d.bf16_copy(&self.embedding).map_err(error)?;
-            let _ = self.half.set(copy);
+        if let Some(half) = self.half.get() {
+            return Ok(half);
         }
-        self.half.get().ok_or_else(|| "the head's bfloat16 copy".to_string())
+        let copy = d.bf16_copy(&self.embedding).map_err(error)?;
+        Ok(self.half.get_or_init(|| copy))
     }
     /// Per-row compact KL; with `gradient`, the hidden seed; with the probe key `probe` as well,
     /// each row's Fisher probe under it at `P`'s softmax `q` pulled back to the hidden row,

@@ -5602,8 +5602,10 @@ mod tests {
 
     /// A prior term whose cost rises by `rise` nats at every epoch after the first (its structure
     /// chosen afresh, `PriorTerm::epoch`), so each epoch's snapshot of `F` is above the one before:
-    /// the fit stops after its second epoch and goes back to the first.
+    /// the fit stops after its second epoch and goes back to the first. Its `stop`, which never
+    /// stops the fit, checks the explanation, posterior and samples it is given.
     struct Rising {
+        stop: Stop,
         epochs: u64,
         rise: f64,
     }
@@ -5612,22 +5614,24 @@ mod tests {
         fn operators(&self) -> Vec<usize> {
             Vec::new()
         }
-        fn epoch(&mut self, _: &Explanation, _: &Posterior) -> Result<(), String> {
+        fn epoch(&mut self, explanation: &Explanation, posterior: &Posterior) -> Result<(), String> {
+            self.stop.epoch(explanation, posterior)?;
             self.epochs += 1;
             Ok(())
         }
-        fn sample(&mut self, posterior: &Posterior, _: &BTreeMap<usize, Array2<f64>>, _: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String> {
-            Ok((self.cost(posterior)?, BTreeMap::new()))
+        fn sample(&mut self, posterior: &Posterior, theta: &BTreeMap<usize, Array2<f64>>, learn: bool) -> Result<(f64, BTreeMap<usize, Array2<f64>>), String> {
+            let (nats, gradients) = self.stop.sample(posterior, theta, learn)?;
+            Ok((nats + self.rise * self.epochs as f64, gradients))
         }
-        fn cost(&self, _: &Posterior) -> Result<f64, String> {
-            Ok(self.rise * self.epochs as f64)
+        fn cost(&self, posterior: &Posterior) -> Result<f64, String> {
+            Ok(self.stop.cost(posterior)? + self.rise * self.epochs as f64)
         }
         fn save(&self) -> Result<serde_json::Value, String> {
-            Ok(serde_json::json!({ "epochs": self.epochs }))
+            Ok(serde_json::json!({ "epochs": self.epochs, "stop": self.stop.save()? }))
         }
         fn load(&mut self, value: &serde_json::Value) -> Result<(), String> {
             self.epochs = value["epochs"].as_u64().ok_or("a saved epoch count")?;
-            Ok(())
+            self.stop.load(&value["stop"])
         }
     }
 
@@ -5640,7 +5644,7 @@ mod tests {
         let (native, layers, _, sequences) = tiny("library_best_prior", "gelu_tanh");
         let explanation = explanation(&native, &layers).unwrap();
         let (train, held) = sequences.split_at(4);
-        let mut prior = Rising { epochs: 0, rise: 1e6 };
+        let mut prior = Rising { stop: Stop { groups: explanation.groups.len(), steps: 0, stop: None }, epochs: 0, rise: 1e6 };
         let fitted = fit(&Device::host(), &native, &explanation, train, held, &settings(), "tiny", None, Some(&mut prior)).unwrap();
         let (epochs, removals) = (&fitted.report.epochs, &fitted.report.removals);
         assert!(epochs.len() >= 2 && !removals.is_empty(), "{} epochs, {} removal rounds", epochs.len(), removals.len());
